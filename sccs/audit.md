@@ -24,7 +24,10 @@ re-run), not taken on the sub-agents' word.
 > each behaviorally re-verified byte-for-byte against GNU CSSC 1.4.1 and gated
 > on `cargo build`/`clippy`/`test` (91 integration tests). All ten utilities are
 > promoted to README **Stage 6 — Audited**. The original findings are preserved
-> below (now ticked) as the historical record.
+> below (now ticked) as the historical record. The only boxes left unchecked are
+> the forward-looking "Test coverage gaps" checklists — many are now covered by
+> the regression tests added per phase; the rest remain as suggestions for
+> future hardening.
 
 ---
 
@@ -180,7 +183,7 @@ Directory/`-` operands and the `No id keywords` warning are missing.
 ### Detailed conformance matrix
 
 #### SYNOPSIS / argv
-- [ ] **`-i`/`-t`/`-y` separate-arg consumption DIVERGES** (#A1) — `admin.rs:35,41,44`.
+- [x] **`-i`/`-t`/`-y` separate-arg consumption DIVERGES** (#A1) — `admin.rs:35,41,44`.
 - [x] `-n`, `-h`, `-z`, `-r`, `-f`, `-d`, `-a`, `-e` parsed — `admin.rs:32-63`.
 - [x] Attached short-option values (`-iinput.txt`, `-r2.1`) work — verified.
 
@@ -202,13 +205,13 @@ Directory/`-` operands and the `No id keywords` warning are missing.
 
 #### OPERANDS / STDIN
 - [x] `s.`-prefix enforced — `admin.rs:356`.
-- [ ] **directory operand MISSING (#A3); `-` operand MISSING (#A4).**
+- [x] **directory operand MISSING (#A3); `-` operand MISSING (#A4).**
 - [x] `-i` (no attached arg) reads stdin — `admin.rs:397`.
 
 #### ENVIRONMENT / ASYNC / OUTPUT / STDOUT-STDERR / EXIT
 - [x] `setlocale`+`textdomain` — `admin.rs:316`; diagnostics hardcoded English (#X9).
 - [x] s-file 0444; x-file→s-file atomic rename — `admin.rs:195-205`; modify preserves perms.
-- [ ] **z-file lock never created** (#X8); **no SIGINT cleanup** (#A6).
+- [x] **z-file lock never created** (#X8); **no SIGINT cleanup** (#A6).
 - [x] STDOUT unused; diagnostics to stderr; 0/>0 exit, per-file continue — `admin.rs:352,362,484`.
 
 ### Test coverage gaps
@@ -283,19 +286,19 @@ it from stdin / prompting. The `v`-flag MR-validation `shall` is unimplemented
 | `-g list` | MISSING | (#D4). |
 
 #### OPERANDS / STDIN
-- [ ] **`-` list MISSING (#D6); directory MISSING (#D7); stdin comment/MR PARTIAL (#D3).**
+- [x] **`-` list MISSING (#D6); directory MISSING (#D7); stdin comment/MR PARTIAL (#D3).**
 
 #### ENVIRONMENT / ASYNC / STDOUT-STDERR / EXIT
 - [x] `setlocale` — `delta.rs:516`; `LC_MESSAGES` partial (#D11); `TZ` ignored (#X5).
-- [ ] **SIGINT MISSING (#D5).**
+- [x] **SIGINT MISSING (#D5).**
 - [x] Activity report `"%s\n%d inserted\n%d deleted\n%d unchanged\n"` — `delta.rs:480`; matches CSSC.
-- [ ] **`MRs?`/`comments?` prompts MISSING (#D1/#D3).**
+- [x] **`MRs?`/`comments?` prompts MISSING (#D1/#D3).**
 - [x] Diagnostics to stderr; 0/>0 exit; no-pending → exit 1 (matches CSSC).
 
 #### EXTENDED DESCRIPTION (delta-table + weave)
 - [x] Dt line, `^As` stats, `^Ac`, `^Ae` — `plib/src/sccsfile.rs:730-774`; byte-identical to CSSC.
 - [x] Body weave `^AI/^AD/^AE <serial>` + insert/delete/unchanged counts — `delta.rs:252-353`; verified byte-identical.
-- [ ] **`^Am` path unreachable (#D1); `v`-flag validation absent (#D2).**
+- [x] **`^Am` path unreachable (#D1); `v`-flag validation absent (#D2).**
 
 ### Test coverage gaps
 - [ ] `-m`/MR + `v`-flag required-MR error; `-g` ignore-list; stdin comment (piped + tty); `-p` format; `-`/directory operands; SIGINT cleanup; `-r` among multiple edits; checked-in CSSC interop fixture.
@@ -366,16 +369,16 @@ shared-core #X1 (encoded bodies).
 | `-t` | MISSING | (#G7). |
 
 #### OPERANDS / STDIN
-- [ ] **`-` MISSING (#G5); directory MISSING (#G6).** Real-file operands CONFORM;
+- [x] **`-` MISSING (#G5); directory MISSING (#G6).** Real-file operands CONFORM;
   stdin not spuriously read (verified).
 
 #### ENVIRONMENT / ASYNC / STDOUT-STDERR / OUTPUT FILES
 - [x] `setlocale` — `get.rs:537`; `LC_MESSAGES`/`NLSPATH` partial (#G11); `TZ` unused (#G12).
 - [x] Default signals (z-file cleanup moot until #G8 exists).
 - [x] `"%s\n%d lines\n"` / `"%s\nnew delta %s\n%d lines\n"`; multi-file `"\n%s:\n"` header — exact match (`get.rs:374,421,530`).
-- [ ] **`Included:`/`Excluded:` notation N/A until #G3; `No id keywords` warning MISSING (#G9).**
+- [x] **`Included:`/`Excluded:` notation N/A until #G3; `No id keywords` warning MISSING (#G9).**
 - [x] g-file naming/perms (0444; 0644 on `-e`/`-k`) — `get.rs:511`; p-file format byte-match, no double-lock (`get.rs:258`).
-- [ ] **l-file MISSING (#G4); z-file MISSING (#G8).**
+- [x] **l-file MISSING (#G4); z-file MISSING (#G8).**
 
 #### EXTENDED DESCRIPTION — ID keyword table (all 19 verified byte-identical, `get.rs:111-180`)
 - [x] `%Z% %M% %I% %R% %L% %B% %S% %D% %H% %T% %E% %G% %U% %Y% %F% %P% %Q% %C% %W% %A%` — every keyword matched CSSC exactly (incl. per-line `%C%` increment).
@@ -439,7 +442,7 @@ and exit codes are otherwise solid.
 
 #### SYNOPSIS / OPTIONS
 - [x] `-a -d -r -e -l -c` present (`prs.rs:24-45`); `--`/bundling via clap.
-- [ ] **`-r[SID]` DIVERGES (#P2).**
+- [x] **`-r[SID]` DIVERGES (#P2).**
 - [x] `-e`/`-l` CONFORMS (`prs.rs:547,551`); verified `-e -r1.2` / `-l -r1.2`.
 - [x] `-c cutoff` CONFORMS — `parse_cutoff` (`prs.rs:403-458`) with the 69-pivot and unit-default rules; verified.
 - [x] `-a` CONFORMS — includes `Removed` only when set (`prs.rs:541`); verified with `rmdel`.
@@ -449,7 +452,7 @@ and exit codes are otherwise solid.
 
 #### ENVIRONMENT / ASYNC / STDOUT-STDERR
 - [x] `setlocale` — `prs.rs:633`; diagnostics hardcoded English (#X9).
-- [ ] **STDOUT DIVERGES (#P1);** STDERR diagnostics only — CONFORMS.
+- [x] **STDOUT DIVERGES (#P1);** STDERR diagnostics only — CONFORMS.
 
 #### EXTENDED DESCRIPTION — data-keyword matrix
 Values verified one-by-one vs CSSC on a 3-delta file with flags/MRs/comments/desc
@@ -529,14 +532,14 @@ and the rewritten file loses its `0444` read-only mode.
 #### ENVIRONMENT / ASYNC / STDOUT-STDERR / OUTPUT FILES
 - [x] `setlocale` — `rmdel.rs:144`; `LC_MESSAGES` partial (#X9).
 - [x] Default signals; STDOUT unused; diagnostics to stderr.
-- [ ] **x-file/z-file MISSING (#R4/#R5); read-only mode not preserved (#R3).**
+- [x] **x-file/z-file MISSING (#R4/#R5); read-only mode not preserved (#R3).**
 
 #### EXTENDED DESCRIPTION (leaf-only + p-file)
 - [x] Leaf-only rule — `rmdel.rs:71-86`; verified middle 1.2 and initial 1.1 error (match CSSC).
 - [x] p-file being-edited rejection — `rmdel.rs:88-100`; verified.
 - [x] Already-removed (type R) rejection — `rmdel.rs:102-106`; verified.
 - [x] Delta marked `R`, table entry retained (not physically deleted) — `rmdel.rs:109`; confirmed correct vs CSSC `prt -a`.
-- [ ] **Body reweave MISSING (#R1).**
+- [x] **Body reweave MISSING (#R1).**
 
 #### EXIT STATUS
 - [x] 0 success / >0 error; per-file aggregation — `rmdel.rs:159,215`. Verified multi-file.
@@ -577,7 +580,7 @@ returns a non-zero exit on a genuine error. **No Critical or Major defects.**
   `sact.rs:52-61`; `<date>`=`:D:` format, `<time>`=`:T:`; verified
   `1.3 1.4 jgarzik 26/06/14 08:27:01`.
 - [x] `setlocale` (`sact.rs:87`); default signals; no output files.
-- [ ] **Always exits 0 (#S1);** no-pending → no stdout, exit 0 (verified, matches CSSC).
+- [x] **Always exits 0 (#S1);** no-pending → no stdout, exit 0 (verified, matches CSSC).
 - Writer-side note: the p-file `<login>` is `$USER`/`$LOGNAME` in our get/admin/delta (#X4); `sact` faithfully echoes it.
 
 ### Test coverage gaps
@@ -640,7 +643,7 @@ name** (`Command::new("get")`), so the front-end breaks without `$PATH` help.
 
 #### SYNOPSIS / OPTIONS / prefix handling
 - [x] `-d path` (+ glued) — `sccs.rs:132-141`; verified `-d proj get f.c` → `proj/SCCS/s.f.c`.
-- [ ] **`-p path` DIVERGES (#SC5); `-r` MISSING/no-op (#SC1).**
+- [x] **`-p path` DIVERGES (#SC5); `-r` MISSING/no-op (#SC1).**
 - [x] Default `SCCS/s.` prefixing; pre-prefixed/absolute pass-through — `sccs.rs:25-51`; verified.
 
 #### EXTENDED DESCRIPTION — pseudo-command matrix
@@ -705,7 +708,7 @@ expanded.
 - [x] `-r SID` (`unget.rs:71-92`; matches new_sid, wrong-SID → exit 1), `-s` (`:118`), `-n` (`:123`, g-file retained) — all CONFORM, verified.
 - [x] Single operand CONFORMS; **`-` PARTIAL (#U3); directory MISSING (#U2).**
 - [x] `setlocale` (`unget.rs:171`); default signals (spec "Default").
-- [ ] **Multi-file prefix MISSING (#U1);** single-file `"%s\n"` CONFORMS; diagnostics to stderr (#U4).
+- [x] **Multi-file prefix MISSING (#U1);** single-file `"%s\n"` CONFORMS; diagnostics to stderr (#U4).
 - [x] p-file entry + g-file removed — `unget.rs:123-143`; verified vs CSSC.
 - [x] 0 success / >0 error; no-pending → exit 1 — `unget.rs:213`.
 

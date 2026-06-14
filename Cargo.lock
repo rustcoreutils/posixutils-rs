@@ -1969,6 +1969,7 @@ version = "0.7.0"
 dependencies = [
  "clap",
  "gettext-rs",
+ "libc",
  "plib",
  "tempfile",
 ]

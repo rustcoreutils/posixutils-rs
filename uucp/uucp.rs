@@ -13,10 +13,9 @@
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use posixutils_uucp::common::{
-    expand_local_path, expand_remote_path, generate_job_id, is_local_system, parse_path_spec,
-    send_mail, send_remote_mail, ssh_fetch_file, ssh_send_file, Job,
+    current_login, expand_local_path, expand_remote_path, generate_job_id, is_local_system,
+    parse_path_spec, send_mail, send_remote_mail, ssh_fetch_file, ssh_send_file, Job,
 };
-use std::env;
 use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
@@ -59,13 +58,19 @@ struct Args {
 
 fn main() -> ExitCode {
     setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs").unwrap();
-    bind_textdomain_codeset("posixutils-rs", "UTF-8").unwrap();
+    textdomain("posixutils-rs").ok();
+    bind_textdomain_codeset("posixutils-rs", "UTF-8").ok();
 
     let args = Args::parse();
 
     // -d is the default, -f overrides it
     let create_dirs = !args.no_create_dirs;
+
+    // A single job ID for this invocation: it is persisted under -r and printed
+    // by -j. For an immediate (synchronous) transfer the ID is informational —
+    // the copy completes before uucp exits, so there is no queued job for uustat
+    // to query or kill.
+    let job_id = generate_job_id();
 
     // Split files into sources and destination
     let mut files = args.files.clone();
@@ -78,7 +83,17 @@ fn main() -> ExitCode {
 
     // Check for unsupported routing (system!system!path)
     if dest_path.contains('!') {
-        eprintln!("uucp: route specification not supported");
+        eprintln!("uucp: {}", gettext("route specification not supported"));
+        return ExitCode::from(1);
+    }
+
+    // Reject a destination pathname containing an encoded <newline> (POSIX
+    // FUTURE DIRECTIONS, Austin Group Defect 251).
+    if dest_path.contains('\n') {
+        eprintln!(
+            "uucp: {}",
+            gettext("destination pathname contains a newline")
+        );
         return ExitCode::from(1);
     }
 
@@ -87,7 +102,8 @@ fn main() -> ExitCode {
         && (dest_path.contains('*') || dest_path.contains('?') || dest_path.contains('['))
     {
         eprintln!(
-            "uucp: warning: wildcard expansion not supported for remote paths: {}",
+            "uucp: {}: {}",
+            gettext("warning: wildcard expansion not supported for remote paths"),
             dest_path
         );
     }
@@ -111,7 +127,7 @@ fn main() -> ExitCode {
 
         // Check for unsupported routing
         if src_path.contains('!') {
-            eprintln!("uucp: route specification not supported");
+            eprintln!("uucp: {}", gettext("route specification not supported"));
             return ExitCode::from(1);
         }
 
@@ -122,7 +138,8 @@ fn main() -> ExitCode {
             && (src_path.contains('*') || src_path.contains('?') || src_path.contains('['))
         {
             eprintln!(
-                "uucp: warning: wildcard expansion not supported for remote paths: {}",
+                "uucp: {}: {}",
+                gettext("warning: wildcard expansion not supported for remote paths"),
                 src_path
             );
         }
@@ -162,7 +179,9 @@ fn main() -> ExitCode {
 
             if job.is_none() {
                 let request = format!("{} -> {}", source_spec, dest_spec);
-                job = Some(Job::new(system, "uucp", &request));
+                let mut j = Job::new(system, "uucp", &request);
+                j.id = job_id.clone();
+                job = Some(j);
             }
         } else {
             // Execute transfer immediately
@@ -195,7 +214,7 @@ fn main() -> ExitCode {
             // Send notification to remote user if -n specified
             if let Some(ref user) = args.notify_user {
                 if !dest_is_local {
-                    let current_user = env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+                    let current_user = current_login();
                     let msg = format!("File {} sent from {}", final_dest, current_user);
                     let _ = send_remote_mail(&dest_system, user, "uucp file received", &msg);
                 }
@@ -206,7 +225,7 @@ fn main() -> ExitCode {
     // Handle queued job
     if let Some(j) = job {
         if let Err(e) = j.save() {
-            eprintln!("uucp: failed to queue job: {}", e);
+            eprintln!("uucp: {}: {}", gettext("failed to queue job"), e);
             return ExitCode::from(1);
         }
         if args.print_job_id {
@@ -219,14 +238,14 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
-    // Print job ID if requested (for immediate execution, generate one)
+    // Print the (informational) job ID for an immediate transfer if requested.
     if args.print_job_id {
-        println!("{}", generate_job_id());
+        println!("{}", job_id);
     }
 
     // Send mail to requester if -m specified and successful
     if args.mail_requester {
-        let current_user = env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+        let current_user = current_login();
         let _ = send_mail(
             &current_user,
             "uucp complete",

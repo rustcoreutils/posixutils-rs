@@ -1,16 +1,21 @@
-plib/src/sccsfile.rs
-Comment on lines +1638 to +1642
-        if let Ok(list) = lock.try_lock() {
-            for c in list.iter() {
-                unsafe {
-                    libc::unlink(c.as_ptr());
-                }
-Copilot commented 2 hours ago
+uucp/audit.md
+  implementation.
+- `shell_escape` is the security-critical helper and is sound; SSH command
+  construction consistently quotes interpolated values.
+</content>
+Copilot commented 14 minutes ago
 Copilot
 Copilot
 AI
-2 hours ago
-High
-sigint_cleanup_handler calls Mutex::try_lock() from inside a SIGINT handler. Rust’s standard Mutex (pthread mutex) operations are not async-signal-safe, so this can deadlock or exhibit undefined behavior if SIGINT arrives while the mutex is held or while the allocator/runtime is in an inconsistent state. The handler should avoid any locking or non-async-signal-safe Rust code paths; consider using an async-signal-safe data structure (e.g., a preallocated lock-free ring of C string pointers) or switching to a design where the handler only sets an atomic flag / writes to a self-pipe and cleanup happens in normal control flow.
+14 minutes ago
+Medium
+The audit document appears to include an accidental </content> sentinel at the end, which is not valid Markdown and will render as stray text in the published audit.
 
+Suggested changeset 1 (1)
+uucp/audit.md
+Original file line number	Diff line number	Diff line change
+   implementation.
+ - `shell_escape` is the security-critical helper and is sound; SSH command
+   construction consistently quotes interpolated values.
+ </content>
 Copilot uses AI. Check for mistakes.

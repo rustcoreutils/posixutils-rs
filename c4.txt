@@ -1,0 +1,29 @@
+uucp/tests/uustat/mod.rs
+Comment on lines +291 to +297
+    let output = std::process::Command::new(get_binary_path("uustat"))
+        .args(["-k", "deadbeef01"])
+        .env("UUCP_SPOOL", &env.spool_dir)
+        .env("USER", "nonexistent_owner_xyz")
+        .current_dir(&env.test_dir)
+        .output()
+        .expect("Failed to run uustat");
+Copilot commented 15 minutes ago
+Copilot
+Copilot
+AI
+15 minutes ago
+Medium
+This new integration test asserts on an English substring in stderr, but uustat diagnostics are now routed through gettext() and may be localized based on the host locale/message catalogs. Pinning the locale for the subprocess (e.g., LC_ALL=C) avoids test flakiness.
+
+Suggested changeset 1 (1)
+uucp/tests/uustat/mod.rs
+Original file line number	Diff line number	Diff line change
+         .args(["-k", "deadbeef01"])
+         .env("UUCP_SPOOL", &env.spool_dir)
+         .env("USER", "nonexistent_owner_xyz")
+         .env("LC_ALL", "C")
+         .current_dir(&env.test_dir)
+         .output()
+         .expect("Failed to run uustat");
+Copilot uses AI. Check for mistakes.
+

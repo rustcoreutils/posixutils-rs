@@ -93,6 +93,9 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] test
  - [x] true
  - [x] unget (SCCS)
+ - [x] uucp (UUCP)
+ - [x] uustat (UUCP)
+ - [x] uux (UUCP)
  - [x] val (SCCS)
  - [x] vi (Editors)
  - [x] what (SCCS)
@@ -169,9 +172,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] unexpand
  - [x] uniq
  - [x] unlink
- - [x] uucp (UUCP)
- - [x] uustat (UUCP)
- - [x] uux (UUCP)
  - [x] wc
  - [x] who
  - [x] write

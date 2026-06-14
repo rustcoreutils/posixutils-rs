@@ -59,6 +59,27 @@ pub fn spool_dir() -> PathBuf {
     sys_spool
 }
 
+/// Return the login name of the real user (`getpwuid(getuid())`), used to record
+/// and authorize job ownership. Falls back to `$LOGNAME`/`$USER` then
+/// `"unknown"` only when the passwd lookup fails. Unlike `$USER` alone this is
+/// not trivially spoofable via the environment.
+pub fn current_login() -> String {
+    let uid = unsafe { libc::getuid() };
+    if let Some(user) = plib::user::get_by_uid(uid) {
+        if !user.name.is_empty() {
+            return user.name;
+        }
+    }
+    env::var("LOGNAME")
+        .or_else(|_| env::var("USER"))
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+/// Whether the invoking process runs with real uid 0 (root).
+pub fn is_root() -> bool {
+    unsafe { libc::getuid() == 0 }
+}
+
 /// Generate a unique job ID
 pub fn generate_job_id() -> String {
     let now = SystemTime::now()
@@ -165,7 +186,7 @@ pub struct Job {
 impl Job {
     /// Create a new job
     pub fn new(system: &str, command: &str, request: &str) -> Self {
-        let user = env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+        let user = current_login();
         Job {
             id: generate_job_id(),
             user,

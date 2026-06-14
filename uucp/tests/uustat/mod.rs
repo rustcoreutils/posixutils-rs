@@ -265,3 +265,51 @@ fn test_uustat_rejuvenate_job() {
     let output = env.run_uustat(&["-q"]);
     assert!(stdout_str(&output).contains("rejuvhost"));
 }
+
+#[test]
+fn test_uustat_kill_foreign_job_denied() {
+    // A job owned by another user cannot be killed: ownership is checked against
+    // the real login (getpwuid(getuid())), not a spoofable $USER. Skip when
+    // running as root, which may legitimately remove any job.
+    if posixutils_uucp::common::is_root() {
+        return;
+    }
+
+    let env = SpoolEnv::new("uustat_kill_foreign");
+
+    // Hand-craft a job owned by a clearly foreign user.
+    let sysdir = env.spool_dir.join("remhost");
+    fs::create_dir_all(&sysdir).unwrap();
+    let job_path = sysdir.join("J.deadbeef01");
+    fs::write(
+        &job_path,
+        "id=deadbeef01\nuser=nonexistent_owner_xyz\nsystem=remhost\ncommand=uucp\nrequest=x -> y\n",
+    )
+    .unwrap();
+
+    // Even spoofing $USER to match the owner must not help.
+    let output = std::process::Command::new(get_binary_path("uustat"))
+        .args(["-k", "deadbeef01"])
+        .env("UUCP_SPOOL", &env.spool_dir)
+        .env("USER", "nonexistent_owner_xyz")
+        // Pin the locale so the stderr substring assertion below is stable
+        // regardless of the host's locale / installed message catalogs.
+        .env("LC_ALL", "C")
+        .current_dir(&env.test_dir)
+        .output()
+        .expect("Failed to run uustat");
+
+    assert!(
+        !output.status.success(),
+        "killing a foreign-owned job should be denied"
+    );
+    assert!(
+        stderr_str(&output).contains("permission denied"),
+        "expected permission-denied diagnostic, got: {}",
+        stderr_str(&output)
+    );
+    assert!(
+        job_path.exists(),
+        "the foreign-owned job must not have been removed"
+    );
+}

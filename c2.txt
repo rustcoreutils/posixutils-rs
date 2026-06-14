@@ -1,24 +1,20 @@
-sccs/get.rs
-        59
+uucp/uux.rs
+Comment on lines +415 to +421
+    // Exec-host-side path of the produced file (the command ran `cd work_dir`,
+    // so a relative redirect target lives under work_dir).
+    let exec_path = if out_file.path.starts_with('/') {
+        out_file.path.clone()
+    } else {
+        format!("{}/{}", work_dir, out_file.path)
     };
-
-    Some((year, month, day, hour, min, sec))
-Copilot commented 2 hours ago
+Copilot commented 14 minutes ago
 Copilot
 Copilot
 AI
-2 hours ago
-Medium
-parse_cutoff accepts out-of-range date/time fields (e.g., month 00/13+, minute 99) because it only checks digit count. That can make -c behave nonsensically instead of rejecting invalid input as an error. Add basic range validation before returning Some(...) so callers can surface an Invalid cutoff date error.
+14 minutes ago
+High
+deliver_output() currently assumes the produced file is at out_file.path on the exec host when out_file.path is absolute. If the redirect is adjusted to write a work-dir-local basename for cross-system delivery (so paths are interpreted on the target system only), the exec-host-side path should likewise be computed from that basename under work_dir when delivery is required.
 
 Suggested changeset 1 (1)
-sccs/get.rs
-Original file line number	Diff line number	Diff line change
-         59
-     };
-     if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 59 {
-         return None;
-     }
-     Some((year, month, day, hour, min, sec))
- }
+uucp/uux.rs
 Copilot uses AI. Check for mistakes.

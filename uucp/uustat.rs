@@ -12,9 +12,8 @@
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use posixutils_uucp::common::{find_job, list_jobs, spool_dir};
+use posixutils_uucp::common::{current_login, find_job, is_root, list_jobs, spool_dir};
 use std::collections::HashMap;
-use std::env;
 use std::process::ExitCode;
 
 /// uustat - uucp status inquiry and job control
@@ -43,8 +42,8 @@ struct Args {
 
 fn main() -> ExitCode {
     setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs").unwrap();
-    bind_textdomain_codeset("posixutils-rs", "UTF-8").unwrap();
+    textdomain("posixutils-rs").ok();
+    bind_textdomain_codeset("posixutils-rs", "UTF-8").ok();
 
     let args = Args::parse();
 
@@ -62,55 +61,68 @@ fn main() -> ExitCode {
             *counts.entry(job.system.clone()).or_insert(0) += 1;
         }
         for (system, count) in counts {
-            println!("{}: {} job(s) queued", system, count);
+            println!("{}: {} {}", system, count, gettext("job(s) queued"));
         }
     } else if let Some(jid) = args.kill_job {
         match find_job(&jid) {
             Some(job) => {
-                // Check ownership
-                let current_user = env::var("USER").unwrap_or_default();
-                let is_root = current_user == "root";
+                // Check ownership against the real login (not a spoofable $USER).
+                let current_user = current_login();
+                let privileged = is_root();
 
-                if job.user != current_user && !is_root {
-                    eprintln!("uustat: permission denied to kill job {}", jid);
+                if job.user != current_user && !privileged {
+                    eprintln!(
+                        "uustat: {} {}",
+                        gettext("permission denied to kill job:"),
+                        jid
+                    );
                     return ExitCode::from(1);
                 }
 
                 if let Err(e) = job.delete() {
-                    eprintln!("uustat: failed to delete job {}: {}", jid, e);
+                    eprintln!("uustat: {} {}: {}", gettext("failed to delete job"), jid, e);
                     return ExitCode::from(1);
                 }
             }
             None => {
-                eprintln!("uustat: job {} not found", jid);
+                eprintln!("uustat: {} {}", gettext("job not found:"), jid);
                 return ExitCode::from(1);
             }
         }
     } else if let Some(jid) = args.rejuvenate_job {
         match find_job(&jid) {
             Some(job) => {
-                // Check ownership
-                let current_user = env::var("USER").unwrap_or_default();
-                let is_root = current_user == "root";
+                // Check ownership against the real login (not a spoofable $USER).
+                let current_user = current_login();
+                let privileged = is_root();
 
-                if job.user != current_user && !is_root {
-                    eprintln!("uustat: permission denied to rejuvenate job {}", jid);
+                if job.user != current_user && !privileged {
+                    eprintln!(
+                        "uustat: {} {}",
+                        gettext("permission denied to rejuvenate job:"),
+                        jid
+                    );
                     return ExitCode::from(1);
                 }
 
                 if let Err(e) = job.rejuvenate() {
-                    eprintln!("uustat: failed to rejuvenate job {}: {}", jid, e);
+                    eprintln!(
+                        "uustat: {} {}: {}",
+                        gettext("failed to rejuvenate job"),
+                        jid,
+                        e
+                    );
                     return ExitCode::from(1);
                 }
             }
             None => {
-                eprintln!("uustat: job {} not found", jid);
+                eprintln!("uustat: {} {}", gettext("job not found:"), jid);
                 return ExitCode::from(1);
             }
         }
     } else {
         // Default: list current user's jobs, or filter by -s/-u
-        let current_user = env::var("USER").unwrap_or_default();
+        let current_user = current_login();
         let user = args.user.as_deref().unwrap_or_else(|| {
             if args.system.is_none() {
                 &current_user

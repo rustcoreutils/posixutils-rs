@@ -7,14 +7,19 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::ffi::CString;
-use std::path::{Component, Path};
+use std::ffi::{CStr, CString, OsString};
+use std::io;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use errno::{errno, set_errno, Errno};
+use gettextrs::gettext;
+use plib::diag;
 
-const _POSIX_PATH_MAX: usize = 255;
-const _POSIX_NAME_MAX: usize = 14;
+// Minimum values from XBD <limits.h> (Minimum Values).
+const POSIX_PATH_MAX: usize = 256;
+const POSIX_NAME_MAX: usize = 14;
 
 #[derive(Parser)]
 #[command(version, about = gettext("pathchk - check pathnames"))]
@@ -22,7 +27,6 @@ struct Args {
     #[arg(
         short,
         long,
-        group = "mode",
         help = gettext(
             "Instead of performing checks based on the underlying file system, \
              perform portable, POSIX-compliant checks"
@@ -32,124 +36,179 @@ struct Args {
 
     #[arg(
         short = 'P',
-        group = "mode",
         help = gettext(
-            "Instead of performing checks based on the underlying file system, \
-             check each component in pathname for basic validity"
+            "Write a diagnostic for each pathname that contains a component \
+             beginning with '-' or is empty"
         )
     )]
     basic: bool,
 
     #[arg(help = gettext("The pathnames to be checked"))]
-    pathnames: Vec<String>,
+    pathnames: Vec<OsString>,
 }
 
-fn check_path_basic(pathname: &str) -> Result<(), &'static str> {
+/// Iterate the non-empty components of a pathname (operating on raw bytes,
+/// so that "." / ".." and encoding are preserved verbatim).
+fn components(pathname: &[u8]) -> impl Iterator<Item = &[u8]> {
+    pathname.split(|&b| b == b'/').filter(|s| !s.is_empty())
+}
+
+/// A byte is in the POSIX portable filename character set if it is an ASCII
+/// alphanumeric or one of period, underscore, or hyphen-minus.
+fn is_portable_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')
+}
+
+/// `-P` checks: empty pathname, or any component whose first character is a
+/// <hyphen-minus>.
+fn check_path_basic(pathname: &[u8]) -> Result<(), String> {
     if pathname.is_empty() {
-        return Err("empty pathname");
+        return Err(gettext("empty pathname"));
     }
 
-    for component in Path::new(pathname).components() {
-        if let Component::Normal(filename) = component {
-            if filename.to_string_lossy().starts_with("-") {
-                return Err("filename begins with -");
-            }
+    for comp in components(pathname) {
+        if comp.first() == Some(&b'-') {
+            return Err(gettext("a component begins with '-'"));
         }
     }
 
     Ok(())
 }
 
+/// `None` for a limit means the filesystem reports it as indeterminate
+/// (`pathconf` returned -1 with errno unchanged); that length check is skipped.
 fn check_path_limits(
-    pathname: &str,
-    max_path: usize,
-    max_name: usize,
-    check_ascii: bool,
-) -> Result<(), &'static str> {
-    if pathname.len() > max_path {
-        return Err("pathname too long");
+    pathname: &[u8],
+    max_path: Option<usize>,
+    max_name: Option<usize>,
+    portable_charset: bool,
+) -> Result<(), String> {
+    if let Some(max_path) = max_path {
+        if pathname.len() > max_path {
+            return Err(gettext("pathname too long"));
+        }
     }
 
-    for component in Path::new(pathname).components() {
-        if let Component::Normal(filename) = component {
-            if filename.len() > max_name {
-                return Err("filename too long");
+    for comp in components(pathname) {
+        if let Some(max_name) = max_name {
+            if comp.len() > max_name {
+                return Err(gettext("component too long"));
             }
-            if check_ascii && !filename.is_ascii() {
-                return Err("filename contains non-portable characters");
-            }
+        }
+        if portable_charset && !comp.iter().all(|&b| is_portable_byte(b)) {
+            return Err(gettext("component contains non-portable characters"));
         }
     }
 
     Ok(())
 }
 
-// find the first existing directory in the path
-fn find_fshandle(pathname: &str) -> Result<String, &'static str> {
-    let mut path = Path::new(pathname);
-    let mut fsh = String::new();
+/// Query a `pathconf` limit. Returns `Ok(Some(n))` for a defined limit,
+/// `Ok(None)` when the limit is indeterminate (the call returns -1 but leaves
+/// errno unchanged), and `Err` on a genuine error (-1 with errno set).
+fn query_pathconf(c: &CStr, name: libc::c_int) -> Result<Option<usize>, String> {
+    set_errno(Errno(0));
+    // SAFETY: `c` is a valid NUL-terminated C string for the lifetime of the call.
+    let value = unsafe { libc::pathconf(c.as_ptr(), name) };
+    if value >= 0 {
+        return Ok(Some(value as usize));
+    }
+    let err = errno();
+    if err.0 == 0 {
+        Ok(None) // indeterminate / no limit
+    } else {
+        Err(format!(
+            "{}: {}",
+            gettext("cannot query path limits"),
+            io::Error::from(err)
+        ))
+    }
+}
 
-    while !path.exists() {
-        match path.parent() {
-            Some(parent) => {
-                fsh = parent.to_string_lossy().to_string();
-                path = parent;
-            }
-            None => {
-                fsh = path.to_string_lossy().to_string();
-                break;
-            }
+/// Find the deepest existing ancestor of `pathname` (the path itself if it
+/// exists). Never returns an empty path: an empty parent resolves to the
+/// current directory.
+fn find_fshandle(pathname: &[u8]) -> PathBuf {
+    let mut cur: &Path = Path::new(std::ffi::OsStr::from_bytes(pathname));
+
+    loop {
+        if cur.exists() {
+            return if cur.as_os_str().is_empty() {
+                PathBuf::from(".")
+            } else {
+                cur.to_path_buf()
+            };
+        }
+        match cur.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => cur = parent,
+            _ => return PathBuf::from("."),
         }
     }
-
-    Ok(fsh)
 }
 
-fn check_path_posix(pathname: &str) -> Result<(), &'static str> {
-    check_path_limits(pathname, _POSIX_PATH_MAX, _POSIX_NAME_MAX, true)
-}
-
-fn check_path_fs(pathname: &str) -> Result<(), &'static str> {
-    let fsh = find_fshandle(pathname)?;
-    let fsh = CString::new(fsh).unwrap();
-
-    let path_max = unsafe { libc::pathconf(fsh.as_ptr(), libc::_PC_PATH_MAX) };
-    if path_max < 0 {
-        return Err("pathconf error(path length)");
-    }
-    let name_max = unsafe { libc::pathconf(fsh.as_ptr(), libc::_PC_NAME_MAX) };
-    if name_max < 0 {
-        return Err("pathconf error(name length)");
+/// Verify that an existing directory has search (execute) permission for the
+/// calling process. Best-effort: only the deepest existing directory in the
+/// path is checked.
+fn check_searchable(fsh: &Path) -> Result<(), String> {
+    if !fsh.is_dir() {
+        return Ok(());
     }
 
-    check_path_limits(pathname, path_max as usize, name_max as usize, false)
+    let c = CString::new(fsh.as_os_str().as_bytes())
+        .map_err(|_| gettext("pathname contains a NUL byte"))?;
+
+    // SAFETY: `c` is a valid NUL-terminated C string for the lifetime of the call.
+    let rc = unsafe { libc::access(c.as_ptr(), libc::X_OK) };
+    if rc != 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EACCES) {
+        return Err(gettext("directory is not searchable"));
+    }
+
+    Ok(())
 }
 
-fn check_path(args: &Args, pathname: &str) -> Result<(), &'static str> {
+fn check_path_posix(pathname: &[u8]) -> Result<(), String> {
+    check_path_limits(pathname, Some(POSIX_PATH_MAX), Some(POSIX_NAME_MAX), true)
+}
+
+fn check_path_fs(pathname: &[u8]) -> Result<(), String> {
+    let fsh = find_fshandle(pathname);
+    let c = CString::new(fsh.as_os_str().as_bytes())
+        .map_err(|_| gettext("pathname contains a NUL byte"))?;
+
+    let path_max = query_pathconf(&c, libc::_PC_PATH_MAX)?;
+    let name_max = query_pathconf(&c, libc::_PC_NAME_MAX)?;
+
+    check_path_limits(pathname, path_max, name_max, false)?;
+    check_searchable(&fsh)
+}
+
+fn check_path(args: &Args, pathname: &[u8]) -> Result<(), String> {
+    // -p replaces the file-system checks with portable checks; otherwise the
+    // default file-system checks apply.
     if args.portable {
-        check_path_posix(pathname)
-    } else if args.basic {
-        check_path_basic(pathname)
+        check_path_posix(pathname)?;
     } else {
-        check_path_fs(pathname)
+        check_path_fs(pathname)?;
     }
+
+    // -P is additive: it applies on top of whichever check ran above.
+    if args.basic {
+        check_path_basic(pathname)?;
+    }
+
+    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    diag::init_locale("pathchk");
 
     let args = Args::parse();
 
-    let mut exit_code = 0;
-
     for pathname in &args.pathnames {
-        if let Err(e) = check_path(&args, pathname) {
-            exit_code = 1;
-            eprintln!("{}: {}", pathname, e);
+        if let Err(msg) = check_path(&args, pathname.as_bytes()) {
+            diag::error(&format!("{}: {}", pathname.to_string_lossy(), msg));
         }
     }
 
-    std::process::exit(exit_code)
+    std::process::exit(diag::exit_status())
 }

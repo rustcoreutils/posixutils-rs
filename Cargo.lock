@@ -1824,6 +1824,7 @@ name = "posixutils-pathnames"
 version = "0.7.0"
 dependencies = [
  "clap",
+ "errno",
  "gettext-rs",
  "libc",
  "plib",

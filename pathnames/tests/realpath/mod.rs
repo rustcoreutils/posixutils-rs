@@ -168,3 +168,93 @@ fn realpath_args_quiet() {
     realpath_test(&["-e", "-q", "foobar"], "", "", 1);
     realpath_test(&["-e", "--quiet", "foobar"], "", "", 1);
 }
+
+use std::os::unix::fs::symlink;
+use std::path::PathBuf;
+
+fn fresh_dir(name: &str) -> PathBuf {
+    let base = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    base
+}
+
+// #R1/#R2: default mode and -E must resolve symbolic-link components.
+#[test]
+fn realpath_resolves_symlink() {
+    let base = fresh_dir("realpath_resolves_symlink");
+    std::fs::create_dir(base.join("real")).unwrap();
+    symlink("real", base.join("link")).unwrap();
+
+    let expected = format!(
+        "{}\n",
+        std::fs::canonicalize(base.join("real"))
+            .unwrap()
+            .to_str()
+            .unwrap()
+    );
+    let link = base.join("link");
+    let link = link.to_str().unwrap();
+
+    realpath_test(&[link], &expected, "", 0);
+    realpath_test(&["-E", link], &expected, "", 0);
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+// #R2: -E expands a symlink to a missing target whose parent exists.
+#[test]
+fn realpath_e_dangling_with_existing_parent() {
+    let base = fresh_dir("realpath_e_dangling_ok");
+    let target = base.join("nofile");
+    symlink(&target, base.join("dangling")).unwrap();
+
+    let cbase = std::fs::canonicalize(&base).unwrap();
+    let expected = format!("{}\n", cbase.join("nofile").to_str().unwrap());
+    let dangling = base.join("dangling");
+
+    realpath_test(&["-E", dangling.to_str().unwrap()], &expected, "", 0);
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+// #R2: -E errors when the expanded target's own parent does not exist.
+#[test]
+fn realpath_e_dangling_missing_parent_errors() {
+    let base = fresh_dir("realpath_e_dangling_err");
+    symlink(base.join("nofile/foo"), base.join("danglemd")).unwrap();
+
+    let danglemd = base.join("danglemd");
+    realpath_test(&["-E", "-q", danglemd.to_str().unwrap()], "", "", 1);
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+// #R2: -E with a trailing slash on a regular file is "Not a directory".
+#[test]
+fn realpath_e_trailing_slash_on_file_errors() {
+    let base = fresh_dir("realpath_e_trailing_slash");
+    std::fs::write(base.join("regfile"), b"x").unwrap();
+
+    let p = format!("{}/", base.join("regfile").to_str().unwrap());
+    realpath_test(&["-E", "-q", &p], "", "", 1);
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+// #R9: an embedded newline in the resolved path is treated as an error.
+#[test]
+fn realpath_newline_is_error() {
+    let base = fresh_dir("realpath_newline");
+    let nl_dir = base.join("a\nb");
+    std::fs::create_dir(&nl_dir).unwrap();
+
+    realpath_test(
+        &[nl_dir.to_str().unwrap()],
+        "",
+        "realpath: result contains a newline character\n",
+        1,
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}

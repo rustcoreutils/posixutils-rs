@@ -50,12 +50,14 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] ar (Development)
  - [x] at (cron cat.)
  - [x] awk
+ - [x] basename
  - [x] batch (cron cat.)
  - [x] bc
  - [x] cat
  - [x] cmp
  - [x] crontab (cron cat.)
  - [x] dd
+ - [x] dirname
  - [x] ed (Editors)
  - [x] ex (Editors)
  - [x] expr
@@ -75,6 +77,8 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] ngettext (i18n)
  - [x] nm (Development)
  - [x] od
+ - [x] pathchk
+ - [x] realpath
  - [x] split
  - [x] strings
  - [x] strip (Development)
@@ -97,7 +101,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
 
  - [x] admin (SCCS)
  - [x] asa
- - [x] basename
  - [x] c99 (Development)
  - [x] cal
  - [x] cflow (Development)
@@ -112,7 +115,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] delta (SCCS)
  - [x] diff
  - [x] df
- - [x] dirname
  - [x] du
  - [x] echo
  - [x] expand
@@ -139,7 +141,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] prs (SCCS)
  - [x] ps
  - [x] readlink
- - [x] realpath
  - [x] rm
  - [x] rmdel (SCCS)
  - [x] rmdir
@@ -196,7 +197,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] newgrp
  - [x] nice
  - [x] nohup
- - [x] pathchk
  - [x] pwd
  - [x] renice
  - [x] sleep

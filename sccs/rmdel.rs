@@ -37,7 +37,7 @@ fn get_current_user() -> String {
 fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
     // Check if it's a valid s-file
     if !paths::is_sfile(sfile) {
-        eprintln!("{}: not an SCCS file", sfile.display());
+        eprintln!("{}: {}", sfile.display(), gettext("not an SCCS file"));
         return Ok(false);
     }
 
@@ -46,7 +46,7 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
     let _zlock = match ZLock::acquire(sfile) {
         Ok(z) => z,
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-            eprintln!("{}: being edited", sfile.display());
+            eprintln!("{}: {}", sfile.display(), gettext("being edited"));
             return Ok(false);
         }
         Err(e) => return Err(e),
@@ -66,7 +66,13 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
     let delta_idx = match delta_idx {
         Some(idx) => idx,
         None => {
-            eprintln!("{}: SID {} not found", sfile.display(), sid);
+            eprintln!(
+                "{}: {} {} {}",
+                sfile.display(),
+                gettext("SID"),
+                sid,
+                gettext("not found")
+            );
             return Ok(false);
         }
     };
@@ -94,8 +100,9 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
 
     if !(is_delta_author || owns_sfile || owns_dir) {
         eprintln!(
-            "{}: you are not permitted to remove delta {}",
+            "{}: {} {}",
             sfile.display(),
+            gettext("you are not permitted to remove delta"),
             sid
         );
         return Ok(false);
@@ -111,9 +118,11 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
 
     if has_successors {
         eprintln!(
-            "{}: delta {} is not a leaf delta (has successors)",
+            "{}: {} {} {}",
             sfile.display(),
-            sid
+            gettext("delta"),
+            sid,
+            gettext("is not a leaf delta (has successors)")
         );
         return Ok(false);
     }
@@ -125,7 +134,13 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
         if let Ok(entries) = parse_pfile(&contents) {
             for entry in &entries {
                 if &entry.old_sid == sid || &entry.new_sid == sid {
-                    eprintln!("{}: delta {} is being edited", sfile.display(), sid);
+                    eprintln!(
+                        "{}: {} {} {}",
+                        sfile.display(),
+                        gettext("delta"),
+                        sid,
+                        gettext("is being edited")
+                    );
                     return Ok(false);
                 }
             }
@@ -134,7 +149,13 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
 
     // Check delta type - can't remove already removed delta
     if sccs.header.deltas[delta_idx].delta_type == DeltaType::Removed {
-        eprintln!("{}: delta {} is already removed", sfile.display(), sid);
+        eprintln!(
+            "{}: {} {} {}",
+            sfile.display(),
+            gettext("delta"),
+            sid,
+            gettext("is already removed")
+        );
         return Ok(false);
     }
 
@@ -206,7 +227,7 @@ fn main() -> ExitCode {
     let sid: Sid = match args.sid.parse() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("Invalid SID '{}': {}", args.sid, e);
+            eprintln!("{} '{}': {}", gettext("Invalid SID"), args.sid, e);
             return ExitCode::FAILURE;
         }
     };

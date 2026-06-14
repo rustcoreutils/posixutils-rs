@@ -166,7 +166,7 @@ const VALID_FLAG_CHARS: &[char] = &[
 
 fn parse_flag(flag_str: &str) -> Result<SccsFlag, String> {
     if flag_str.is_empty() {
-        return Err("Empty flag".to_string());
+        return Err(gettext("Empty flag"));
     }
 
     let flag_char = flag_str.chars().next().unwrap();
@@ -180,7 +180,7 @@ fn parse_flag(flag_str: &str) -> Result<SccsFlag, String> {
     // letters to SccsFlag::Unknown for lossless reads of existing files, but
     // admin must not write a malformed flag from a bad -f argument.
     if !VALID_FLAG_CHARS.contains(&flag_char) {
-        return Err(format!("Unrecognized flag '{}'", flag_char));
+        return Err(format!("{} '{}'", gettext("Unrecognized flag"), flag_char));
     }
 
     let flag = SccsFlag::parse(flag_char, value).map_err(|e| e.to_string())?;
@@ -188,7 +188,12 @@ fn parse_flag(flag_str: &str) -> Result<SccsFlag, String> {
     // Spec caps ceiling/floor at 9999.
     match &flag {
         SccsFlag::Ceiling(n) | SccsFlag::Floor(n) if *n > 9999 => {
-            return Err(format!("value '{}' out of range (max 9999)", n));
+            return Err(format!(
+                "{} '{}' {}",
+                gettext("value"),
+                n,
+                gettext("out of range (max 9999)")
+            ));
         }
         _ => {}
     }
@@ -283,7 +288,7 @@ fn create_new_sccs_file(path: &Path, params: NewFileParams) -> io::Result<()> {
     if !sid.is_trunk() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "Initial SID must be a trunk SID (no branch component)",
+            gettext("Initial SID must be a trunk SID (no branch component)"),
         ));
     }
 
@@ -306,7 +311,12 @@ fn create_new_sccs_file(path: &Path, params: NewFileParams) -> io::Result<()> {
 
     // Warn (non-fatal) when a text body has no SCCS id keyword, matching cssc.
     if !encoded && !content_has_id_keyword(&content) {
-        eprintln!("admin: warning: {}: No id keywords.", path.display());
+        eprintln!(
+            "admin: {}: {}: {}",
+            gettext("warning"),
+            path.display(),
+            gettext("No id keywords.")
+        );
     }
 
     let body_lines: Vec<String> = if encoded {
@@ -396,9 +406,11 @@ fn check_sccs_file(path: &Path) -> io::Result<bool> {
                 let computed = plib::sccsfile::compute_checksum(&data[content_start..]);
                 if computed != sccs.header.checksum {
                     eprintln!(
-                        "{}: checksum error: stored {}, computed {}",
+                        "{}: {} {}, {} {}",
                         path.display(),
+                        gettext("checksum error: stored"),
                         sccs.header.checksum,
+                        gettext("computed"),
                         computed
                     );
                     return Ok(false);
@@ -541,7 +553,10 @@ fn main() -> ExitCode {
     // -m requires the v flag (spec: "the application shall ensure that the v
     // flag is set"). Diagnose using cssc-compatible wording.
     if !mr_numbers.is_empty() && !setting_v_flag {
-        eprintln!("admin: MRs not enabled with 'v' flag, can't use 'm' keyword.");
+        eprintln!(
+            "admin: {}",
+            gettext("MRs not enabled with 'v' flag, can't use 'm' keyword.")
+        );
         return ExitCode::FAILURE;
     }
 
@@ -635,8 +650,9 @@ fn main() -> ExitCode {
             // v flag set on create requires MR numbers via -m.
             if setting_v_flag && mr_numbers.is_empty() {
                 eprintln!(
-                    "admin: {}: MR number(s) must be supplied.",
-                    file_path.display()
+                    "admin: {}: {}",
+                    file_path.display(),
+                    gettext("MR number(s) must be supplied.")
                 );
                 exit_code = ExitCode::FAILURE;
                 continue;

@@ -82,7 +82,7 @@ fn validate_file(args: &Args, file_path: &PathBuf, diags: &mut Vec<String>) -> u
 
     // Check if it's a valid s-file name
     if !paths::is_sfile(file_path) {
-        diags.push("not an SCCS file".to_string());
+        diags.push(gettext("not an SCCS file"));
         return ERR_CANNOT_OPEN;
     }
 
@@ -111,7 +111,7 @@ fn validate_file(args: &Args, file_path: &PathBuf, diags: &mut Vec<String>) -> u
             let body = data.get(content_start..).unwrap_or(&[]);
             let computed = plib::sccsfile::compute_checksum(body);
             if computed != sccs.header.checksum {
-                diags.push("corrupted SCCS file (checksum error)".to_string());
+                diags.push(gettext("corrupted SCCS file (checksum error)"));
                 errors |= ERR_CORRUPTED_FILE;
             }
         }
@@ -123,12 +123,22 @@ fn validate_file(args: &Args, file_path: &PathBuf, diags: &mut Vec<String>) -> u
             Ok(sid) => {
                 // Check if SID exists in the file
                 if sccs.find_delta_by_sid(&sid).is_none() {
-                    diags.push(format!("SID {} does not exist", sid));
+                    diags.push(format!(
+                        "{} {} {}",
+                        gettext("SID"),
+                        sid,
+                        gettext("does not exist")
+                    ));
                     errors |= ERR_SID_NOT_FOUND;
                 }
             }
             Err(e) => {
-                diags.push(format!("SID {} is invalid or ambiguous", sid_str));
+                diags.push(format!(
+                    "{} {} {}",
+                    gettext("SID"),
+                    sid_str,
+                    gettext("is invalid or ambiguous")
+                ));
                 errors |= e;
             }
         }
@@ -144,7 +154,7 @@ fn validate_file(args: &Args, file_path: &PathBuf, diags: &mut Vec<String>) -> u
             });
 
         if &actual_name != expected_name {
-            diags.push("%M%, -m mismatch".to_string());
+            diags.push(gettext("%M%, -m mismatch"));
             errors |= ERR_M_MISMATCH;
         }
     }
@@ -154,7 +164,7 @@ fn validate_file(args: &Args, file_path: &PathBuf, diags: &mut Vec<String>) -> u
         let actual_type = sccs.module_type().unwrap_or("");
 
         if actual_type != expected_type {
-            diags.push("%Y%, -y mismatch".to_string());
+            diags.push(gettext("%Y%, -y mismatch"));
             errors |= ERR_Y_MISMATCH;
         }
     }

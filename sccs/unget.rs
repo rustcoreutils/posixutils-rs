@@ -42,14 +42,18 @@ fn get_current_user() -> String {
 fn unget_file(sfile: &Path, args: &Args, show_header: bool) -> io::Result<bool> {
     // Check if it's a valid s-file
     if !paths::is_sfile(sfile) {
-        eprintln!("{}: not an SCCS file", sfile.display());
+        eprintln!("{}: {}", sfile.display(), gettext("not an SCCS file"));
         return Ok(false);
     }
 
     // Check if p-file exists
     let pfile = paths::pfile_from_sfile(sfile);
     if !pfile.exists() {
-        eprintln!("{}: no outstanding delta for current user", sfile.display());
+        eprintln!(
+            "{}: {}",
+            sfile.display(),
+            gettext("no outstanding delta for current user")
+        );
         return Ok(false);
     }
 
@@ -59,7 +63,11 @@ fn unget_file(sfile: &Path, args: &Args, show_header: bool) -> io::Result<bool> 
         parse_pfile(&contents).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     if entries.is_empty() {
-        eprintln!("{}: no outstanding delta for current user", sfile.display());
+        eprintln!(
+            "{}: {}",
+            sfile.display(),
+            gettext("no outstanding delta for current user")
+        );
         return Ok(false);
     }
 
@@ -94,15 +102,18 @@ fn unget_file(sfile: &Path, args: &Args, show_header: bool) -> io::Result<bool> 
         None => {
             if let Some(ref sid) = target_sid {
                 eprintln!(
-                    "{}: SID {} not found for user {}",
+                    "{}: {} {} {} {}",
                     sfile.display(),
+                    gettext("SID"),
                     sid,
+                    gettext("not found for user"),
                     current_user
                 );
             } else {
                 eprintln!(
-                    "{}: no outstanding delta for user {}",
+                    "{}: {} {}",
                     sfile.display(),
+                    gettext("no outstanding delta for user"),
                     current_user
                 );
             }

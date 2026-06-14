@@ -87,7 +87,9 @@ fn find_pfile_entry(sfile_path: &Path, requested_sid: Option<&Sid>) -> io::Resul
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!(
-                "No outstanding get -e (no p-file for {})",
+                "{} ({} {})",
+                gettext("No outstanding get -e"),
+                gettext("no p-file for"),
                 sfile_path.display()
             ),
         ));
@@ -105,7 +107,7 @@ fn find_pfile_entry(sfile_path: &Path, requested_sid: Option<&Sid>) -> io::Resul
     if user_entries.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("No outstanding get -e by user {}", user),
+            format!("{} {}", gettext("No outstanding get -e by user"), user),
         ));
     }
 
@@ -118,7 +120,7 @@ fn find_pfile_entry(sfile_path: &Path, requested_sid: Option<&Sid>) -> io::Resul
         }
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("No edit pending for SID {}", sid),
+            format!("{} {}", gettext("No edit pending for SID"), sid),
         ));
     }
 
@@ -131,21 +133,29 @@ fn find_pfile_entry(sfile_path: &Path, requested_sid: Option<&Sid>) -> io::Resul
     Err(io::Error::new(
         io::ErrorKind::InvalidInput,
         format!(
-            "Multiple edits pending by user {}; use -r to specify SID",
-            user
+            "{} {}{}",
+            gettext("Multiple edits pending by user"),
+            user,
+            gettext("; use -r to specify SID")
         ),
     ))
 }
 
 /// Read g-file content
 fn read_gfile(sfile_path: &Path) -> io::Result<Vec<String>> {
-    let gfile_path = paths::gfile_from_sfile(sfile_path)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid s-file name"))?;
+    let gfile_path = paths::gfile_from_sfile(sfile_path).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, gettext("Invalid s-file name"))
+    })?;
 
     if !gfile_path.exists() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("g-file {} not found", gfile_path.display()),
+            format!(
+                "{} {} {}",
+                gettext("g-file"),
+                gfile_path.display(),
+                gettext("not found")
+            ),
         ));
     }
 
@@ -555,7 +565,7 @@ fn gather_mrs(
         None => {
             if v_set && !stdin_consumed {
                 if stdin_is_tty() {
-                    print!("MRs? ");
+                    print!("{}", gettext("MRs? "));
                     io::stdout().flush().ok();
                 }
                 Some(read_stdin_line())
@@ -627,7 +637,7 @@ fn gather_comment(args: &Args, stdin_consumed: bool) -> String {
                 String::new()
             } else {
                 if stdin_is_tty() {
-                    print!("comments? ");
+                    print!("{}", gettext("comments? "));
                     io::stdout().flush().ok();
                 }
                 read_stdin_line()
@@ -668,7 +678,7 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
         .as_ref()
         .map(|s| s.parse())
         .transpose()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid SID"))?;
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, gettext("Invalid SID")))?;
 
     let pfile_entry = find_pfile_entry(sfile_path, requested_sid.as_ref())?;
 
@@ -679,7 +689,7 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
     // Find the base delta
     let base_delta = sccs
         .find_delta_by_sid(&pfile_entry.old_sid)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Base SID not found"))?;
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, gettext("Base SID not found")))?;
     let base_serial = base_delta.serial;
 
     // Read g-file
@@ -735,9 +745,9 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
         print_normal_diff(&base_lines, &new_lines, &diff_ops);
     }
     if !args.silent {
-        println!("{} inserted", new_delta.stats.inserted);
-        println!("{} deleted", new_delta.stats.deleted);
-        println!("{} unchanged", new_delta.stats.unchanged);
+        println!("{} {}", new_delta.stats.inserted, gettext("inserted"));
+        println!("{} {}", new_delta.stats.deleted, gettext("deleted"));
+        println!("{} {}", new_delta.stats.unchanged, gettext("unchanged"));
     }
 
     // Apply diff to body

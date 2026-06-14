@@ -108,12 +108,12 @@ These affect multiple utilities. Per-utility sections reference them by number.
   blocks a concurrent command (`<util>: <sfile>: being edited`). Verified no
   leftover z-file between sequential commands.
 
-- [ ] **#X9 — Hardcoded-English diagnostics; `LC_MESSAGES`/`NLSPATH` inert.**
-  Every utility wires `setlocale(LC_ALL,"")` + `textdomain` near `main`, but the
-  runtime diagnostic strings are raw `eprintln!`/`println!` literals, not routed
-  through `gettext()`. So locale is initialized but never affects diagnostics.
-  Pervasive across `get.rs`, `delta.rs`, `admin.rs`, `prs.rs`, `rmdel.rs`,
-  `unget.rs`, `val.rs`, `sccs.rs`. Fix: wrap diagnostic strings in `gettext()`.
+- [x] **#X9 — Hardcoded-English diagnostics; `LC_MESSAGES`/`NLSPATH` inert.**
+  ✓ Phase 13: user-facing diagnostic/informative message strings across all
+  utilities are now routed through `gettext()` (static clauses wrapped; values
+  interpolated outside), so `LC_MESSAGES` can translate them. English wording is
+  byte-identical in the C/POSIX locale (all 91 tests + cssc parity unchanged).
+  SCCS protocol/format strings are intentionally left verbatim.
 
 - [x] **#X10 — No SIGINT cleanup of the temp x-file in `delta`/`admin`.** ✓
   Phase 12: `install_sigint_cleanup()` installs a handler that unlinks every
@@ -256,7 +256,7 @@ it from stdin / prompting. The `v`-flag MR-validation `shall` is unimplemented
   `delta.rs:84-94`. More permissive; can pick the wrong entry when two edits
   share an old SID.
 - [ ] **#D10 — 512-byte comment / 99 999-line caps unenforced; no `^A`-first-line guard.**
-- [ ] **#D11 — Diagnostics hardcoded English (#X9); `now()` ignores TZ (#X5).**
+- [x] **#D11 — Diagnostics hardcoded English (#X9); `now()` ignores TZ (#X5).** ✓ Phase 13 (#X9) + TZ Phase 1 (#X5).
 
 ### Detailed conformance matrix
 
@@ -331,8 +331,8 @@ shared-core #X1 (encoded bodies).
 #### Minor
 - [ ] **#G10 — p-file written 0644; spec implies owner-writable-only (0600).**
   `get.rs:298`. CSSC also leaves it group/other-readable — benign.
-- [ ] **#G11 — Hardcoded-English diagnostics (#X9).** `get.rs:380-384`.
-- [ ] **#G12 — `TZ` not consulted for delta-time rendering (#X5).** Matches CSSC's
+- [x] **#G11 — Hardcoded-English diagnostics (#X9).** `get.rs:380-384`. ✓ Phase 13 (#X9).
+- [x] **#G12 — `TZ` not consulted for delta-time rendering (#X5).** Matches CSSC's ✓ TZ Phase 1 (#X5); diagnostics Phase 13 (#X9).
   stored-value behavior; low impact. (Note: `-b` IS implemented — `get.rs:33,230` —
   CONFORMS; listed only to retire the agent's retracted query.)
 
@@ -616,7 +616,7 @@ name** (`Command::new("get")`), so the front-end breaks without `$PATH` help.
   deliberately (it is what real `sccs` users expect).
 - [ ] **#SC6 — A leading unknown `-` token is treated as the command.** `sccs.rs:152-154`
   (`-q get` → "unknown command '-q'"). Minor robustness; deferred.
-- [ ] **#SC7 — Diagnostics not localized (#X9).** `sccs.rs:20,354,371,572,611`.
+- [x] **#SC7 — Diagnostics not localized (#X9).** `sccs.rs:20,354,371,572,611`. ✓ Phase 13 (#X9).
 - [ ] **#SC8 — PROJECTDIR username form uses `$HOME/<dir>/src`, not the named user's home.**
   `sccs.rs:160-180`; no `getpwnam`. Edge feature.
 - [x] **#SC9 — `diffs` temp path `/tmp/sccs_diff.<pid>` is predictable/world-writable.** ✓ Phase 9: diffs temp now uses env::temp_dir() with a unique name.
@@ -681,7 +681,7 @@ expanded.
 #### Minor
 - [x] **#U3 — `-` stdin form also misses the pathname prefix.** ✓ Phase 10
   (covered by the #U1 header gating + `expand_operands`).
-- [ ] **#U4 — Diagnostics lack the `unget:` prefix; hardcoded English (#X9).**
+- [x] **#U4 — Diagnostics lack the `unget:` prefix; hardcoded English (#X9).** ✓ Phase 13 (#X9) + Phase 10 prefix.
   Partly done in Phase 10 (operand-loop diagnostics now carry the `unget:`
   prefix); full `gettext` wrapping deferred to the i18n phase (#X9).
 - [ ] **#U5 — q-file working-copy not used.** `unget.rs:133-143` rewrites the p-file
@@ -774,7 +774,7 @@ virtually every binary/`.o`/`a.out`, exactly what `what` exists to scan.
 
 #### Minor
 - [ ] **#W2 — Error message format/order differs from CSSC** (cosmetic; both stderr). `what.rs:72`.
-- [ ] **#W3 — Hardcoded-English "Cannot open file" (#X9).** `what.rs:72`.
+- [x] **#W3 — Hardcoded-English "Cannot open file" (#X9).** `what.rs:72`. ✓ Phase 13 (#X9).
 - [x] **#W4 — `-s` buffers the whole file before stopping.** ✓ Phase 11: the
   byte scanner now returns immediately on the first ident under `-s`.
 

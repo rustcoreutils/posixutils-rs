@@ -327,12 +327,12 @@ fn find_target_delta<'a>(
         None => {
             // No SID specified: get trunk head
             sccs.get_trunk_head()
-                .ok_or_else(|| "No deltas in file".to_string())
+                .ok_or_else(|| gettext("No deltas in file"))
         }
         Some(sid_str) => {
             let sid: Sid = sid_str
                 .parse()
-                .map_err(|_| format!("Invalid SID: {}", sid_str))?;
+                .map_err(|_| format!("{}: {}", gettext("Invalid SID"), sid_str))?;
 
             // Try exact match first
             if let Some(delta) = sccs.find_delta_by_sid(&sid) {
@@ -349,14 +349,20 @@ fn find_target_delta<'a>(
                     .filter(|d| d.sid.rel == sid.rel && d.sid.is_trunk())
                     .max_by(|a, b| a.sid.cmp(&b.sid));
 
-                matching.ok_or_else(|| format!("No delta found for release {}", sid.rel))
+                matching
+                    .ok_or_else(|| format!("{} {}", gettext("No delta found for release"), sid.rel))
             } else if sid.lev != 0 && sid.br == 0 && sid.seq == 0 {
                 // R.L specified - exact trunk match
                 sccs.find_delta_by_sid(&sid)
-                    .ok_or_else(|| format!("SID {} not found", sid))
+                    .ok_or_else(|| format!("{} {} {}", gettext("SID"), sid, gettext("not found")))
             } else {
                 // Full SID - must match exactly
-                Err(format!("SID {} not found", sid))
+                Err(format!(
+                    "{} {} {}",
+                    gettext("SID"),
+                    sid,
+                    gettext("not found")
+                ))
             }
         }
     }
@@ -372,7 +378,9 @@ fn find_top_delta<'a>(
     let release: Option<u16> = match requested_sid {
         None => None,
         Some(s) => {
-            let sid: Sid = s.parse().map_err(|_| format!("Invalid SID: {}", s))?;
+            let sid: Sid = s
+                .parse()
+                .map_err(|_| format!("{}: {}", gettext("Invalid SID"), s))?;
             Some(sid.rel)
         }
     };
@@ -404,8 +412,8 @@ fn find_top_delta<'a>(
             ka.cmp(&kb)
         })
         .ok_or_else(|| match release {
-            Some(r) => format!("No delta found for release {}", r),
-            None => "No deltas in file".to_string(),
+            Some(r) => format!("{} {}", gettext("No delta found for release"), r),
+            None => gettext("No deltas in file"),
         })
 }
 
@@ -441,14 +449,20 @@ fn compute_new_sid(sccs: &SccsFile, target: &DeltaEntry, create_branch: bool) ->
 fn check_pfile_lock(sfile_path: &Path, new_sid: &Sid) -> Result<(), String> {
     let pfile_path = paths::pfile_from_sfile(sfile_path);
     if pfile_path.exists() {
-        let contents =
-            fs::read_to_string(&pfile_path).map_err(|e| format!("Cannot read p-file: {}", e))?;
+        let contents = fs::read_to_string(&pfile_path)
+            .map_err(|e| format!("{}: {}", gettext("Cannot read p-file"), e))?;
 
-        for entry in
-            plib::sccsfile::parse_pfile(&contents).map_err(|e| format!("Invalid p-file: {}", e))?
+        for entry in plib::sccsfile::parse_pfile(&contents)
+            .map_err(|e| format!("{}: {}", gettext("Invalid p-file"), e))?
         {
             if entry.new_sid == *new_sid {
-                return Err(format!("SID {} is being edited by {}", new_sid, entry.user));
+                return Err(format!(
+                    "{} {} {} {}",
+                    gettext("SID"),
+                    new_sid,
+                    gettext("is being edited by"),
+                    entry.user
+                ));
             }
         }
     }
@@ -723,7 +737,7 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
         let cutoff = parse_cutoff(cutoff_str).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("Invalid cutoff date: '{}'", cutoff_str),
+                format!("{}: '{}'", gettext("Invalid cutoff date"), cutoff_str),
             )
         })?;
         applied_set.retain(|&serial| {
@@ -785,7 +799,7 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
 
         writeln!(output_stream, "{}", target_sid)?;
         if let Some(ref ns) = new_sid {
-            writeln!(output_stream, "new delta {}", ns)?;
+            writeln!(output_stream, "{} {}", gettext("new delta"), ns)?;
         }
 
         if !included_serials.is_empty() {
@@ -838,7 +852,7 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
             io::stdout().write_all(&raw)?;
         } else {
             let gfile_path = paths::gfile_from_sfile(sfile_path).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "Invalid s-file name")
+                io::Error::new(io::ErrorKind::InvalidInput, gettext("Invalid s-file name"))
             })?;
             fs::write(&gfile_path, &raw)?;
             let mode = if args.edit { 0o644 } else { 0o444 };
@@ -864,7 +878,7 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
             } else {
                 &mut io::stdout()
             };
-            writeln!(output_stream, "{} lines", line_count)?;
+            writeln!(output_stream, "{} {}", line_count, gettext("lines"))?;
         }
 
         return Ok(true);
@@ -965,8 +979,9 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
         }
     } else {
         // Write to g-file
-        let gfile_path = paths::gfile_from_sfile(sfile_path)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid s-file name"))?;
+        let gfile_path = paths::gfile_from_sfile(sfile_path).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, gettext("Invalid s-file name"))
+        })?;
 
         let mut file = File::create(&gfile_path)?;
         for line in &lines {
@@ -999,7 +1014,7 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
         } else {
             &mut io::stdout()
         };
-        writeln!(output_stream, "{} lines", line_count)?;
+        writeln!(output_stream, "{} {}", line_count, gettext("lines"))?;
     }
 
     Ok(true)

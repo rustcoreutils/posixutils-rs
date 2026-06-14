@@ -606,7 +606,7 @@ fn delta_after_cutoff(delta: &DeltaEntry, cutoff: (u16, u8, u8, u8, u8, u8)) -> 
 fn prs_file(sfile: &Path, args: &Args) -> io::Result<bool> {
     // Check if it's a valid s-file
     if !paths::is_sfile(sfile) {
-        eprintln!("{}: not an SCCS file", sfile.display());
+        eprintln!("{}: {}", sfile.display(), gettext("not an SCCS file"));
         return Ok(false);
     }
 

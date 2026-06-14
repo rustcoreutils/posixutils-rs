@@ -14,10 +14,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, ExitCode};
 
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 
 fn usage() -> ! {
-    eprintln!("usage: sccs [-r] [-d path] [-p path] command [options...] [operands...]");
+    eprintln!(
+        "{}",
+        gettext("usage: sccs [-r] [-d path] [-p path] command [options...] [operands...]")
+    );
     process::exit(2);
 }
 
@@ -429,7 +432,7 @@ fn main() -> ExitCode {
                 .map(|s| &s[2..]);
 
             if sid_opt.is_none() {
-                eprintln!("sccs: fix requires -r SID");
+                eprintln!("sccs: {}", gettext("fix requires -r SID"));
                 return ExitCode::FAILURE;
             }
 
@@ -506,12 +509,18 @@ fn main() -> ExitCode {
                 // info: report the full p-file detail
                 // (old-SID new-SID user date time).
                 if info.is_empty() {
-                    println!("Nothing being edited.");
+                    println!("{}", gettext("Nothing being edited."));
                 } else {
                     for e in &info {
                         println!(
-                            "{}: being edited: {} {} {} {} {}",
-                            e.gfile, e.old_sid, e.new_sid, e.user, e.date, e.time
+                            "{}: {} {} {} {} {} {}",
+                            e.gfile,
+                            gettext("being edited:"),
+                            e.old_sid,
+                            e.new_sid,
+                            e.user,
+                            e.date,
+                            e.time
                         );
                     }
                 }
@@ -640,7 +649,7 @@ fn main() -> ExitCode {
         }
 
         _ => {
-            eprintln!("sccs: unknown command '{}'", command);
+            eprintln!("sccs: {} '{}'", gettext("unknown command"), command);
             ExitCode::FAILURE
         }
     }

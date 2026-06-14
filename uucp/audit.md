@@ -98,12 +98,14 @@ None.
   by `uustat` to obtain the status or terminate a job." Fix: for `uucp`, print
   the queued job's ID only when a job is actually created (i.e. effectively only
   meaningful under `-r`); for `uux`, document that the ID is informational only.
-- [ ] **#G3 — Current-user identity and `uustat` ownership checks use `$USER`,
-  not `getpwuid(getuid())`.** `common.rs:168` (`Job::new`), `uustat.rs:71,93`.
-  The `-k`/`-r` ownership guard ("the killed request belongs to the person
-  invoking `uustat` unless that user is privileged") is therefore spoofable via
-  the environment, and the recorded job owner is whatever `$USER` claims. Fix:
-  resolve the real login from the passwd database; treat root via `getuid()==0`.
+- [x] **#G3 — Current-user identity and `uustat` ownership checks use `$USER`,
+  not `getpwuid(getuid())`.** ✓ Phase 2: added `common::current_login()`
+  (`getpwuid(getuid())` via `plib::user::get_by_uid`, env only as fallback) and
+  `common::is_root()` (`getuid()==0`). The `Job` owner, the `uustat -k`/`-r`
+  ownership guard, and the mail recipients now use them. Verified: the recorded
+  owner ignores a spoofed `USER=evil`, and a foreign-owned job cannot be killed
+  even when `$USER` is spoofed to match (new `test_uustat_kill_foreign_job_denied`,
+  root-guarded).
 - [ ] **#UC2 — Remote `~user` is not expanded; `shell_escape` makes a remote
   `~` literal.** `common.rs:84-90` (`expand_remote_path`) only rewrites `~/` →
   PUBDIR for remote targets; a remote `~user/path` is passed through unchanged
@@ -120,7 +122,7 @@ None.
 
 - [x] **#G1 — hardcoded-English diagnostics** (above). ✓ Phase 1.
 - [x] **#G2 — `.unwrap()` on locale setup** (above). ✓ Phase 1.
-- [ ] **#G3 — `$USER`-based identity / ownership** (above).
+- [x] **#G3 — `$USER`-based identity / ownership** (above). ✓ Phase 2.
 - [x] **`shell_escape` is correct and is used on every value interpolated into an
   `ssh`/remote shell command** — `common.rs:26-39`, exercised at
   `common.rs:368,383,416,482-487` and `uux.rs:265,307,374`. Unit tests cover
@@ -214,7 +216,7 @@ None.
 ### STDOUT / exit / ownership
 - [x] Per-job output includes ≥ job ID, user, remote system (`jobid\tuser\tsystem`) — `uustat.rs:127`. CONFORMS (format unspecified; required fields present).
 - [x] 0 success / >0 error; missing job under `-k`/`-r` → exit 1 — `uustat.rs:84-87,106-109`.
-- [ ] Ownership check via `$USER` (#G3).
+- [x] Ownership check via `$USER` (#G3). ✓ Phase 2: real-login + root.
 - [ ] Diagnostics hardcoded English (#G1).
 - Note: because immediate `uucp`/`uux` transfers create no persistent job, the default listing and `-q` are usually empty in practice — only `uucp -r` populates the spool, and those jobs never run (Architecture divergences). This is consistent and not a defect, but means `uustat` is mostly vestigial in the minimal design.
 
@@ -265,7 +267,7 @@ list/kill/rejuvenate/filter/conflicts). Gaps that map to findings:
 - [ ] No test asserts `LC_MESSAGES` affects diagnostics (#G1) — expected to fail
   until diagnostics are `gettext()`-wrapped.
 - [ ] No test pins the `-j` job-ID semantics for immediate vs `-r` transfers (#UC1).
-- [ ] No test exercises `-k`/`-r` ownership enforcement across users (#G3).
+- [x] No test exercises `-k`/`-r` ownership enforcement across users (#G3). ✓ Phase 2.
 - [ ] No test for remote `~user` expansion (#UC2).
 
 ## Suggested PR groupings

@@ -13,10 +13,9 @@
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use posixutils_uucp::common::{
-    expand_remote_path, generate_job_id, is_local_system, parse_path_spec, send_mail, shell_escape,
-    ssh_exec, ssh_fetch_file, ssh_send_file,
+    current_login, expand_remote_path, generate_job_id, is_local_system, parse_path_spec,
+    send_mail, shell_escape, ssh_exec, ssh_fetch_file, ssh_send_file,
 };
-use std::env;
 use std::io::{self, Read};
 use std::process::ExitCode;
 
@@ -126,7 +125,7 @@ fn main() -> ExitCode {
 
             // Send mail notification on failure unless -n
             if !args.no_notify {
-                let user = env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+                let user = current_login();
                 let msg = format!("uux command failed: {}\nError: {}", cmd_str, e);
                 let _ = send_mail(&user, "uux job failed", &msg);
             }

@@ -13,10 +13,9 @@
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use posixutils_uucp::common::{
-    expand_local_path, expand_remote_path, generate_job_id, is_local_system, parse_path_spec,
-    send_mail, send_remote_mail, ssh_fetch_file, ssh_send_file, Job,
+    current_login, expand_local_path, expand_remote_path, generate_job_id, is_local_system,
+    parse_path_spec, send_mail, send_remote_mail, ssh_fetch_file, ssh_send_file, Job,
 };
-use std::env;
 use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
@@ -197,7 +196,7 @@ fn main() -> ExitCode {
             // Send notification to remote user if -n specified
             if let Some(ref user) = args.notify_user {
                 if !dest_is_local {
-                    let current_user = env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+                    let current_user = current_login();
                     let msg = format!("File {} sent from {}", final_dest, current_user);
                     let _ = send_remote_mail(&dest_system, user, "uucp file received", &msg);
                 }
@@ -228,7 +227,7 @@ fn main() -> ExitCode {
 
     // Send mail to requester if -m specified and successful
     if args.mail_requester {
-        let current_user = env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+        let current_user = current_login();
         let _ = send_mail(
             &current_user,
             "uucp complete",

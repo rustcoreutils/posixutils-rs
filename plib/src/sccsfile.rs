@@ -26,10 +26,13 @@
 //! - Body: Interleaved delta content with ^AI/^AD/^AE control records
 
 use std::collections::HashSet;
+use std::ffi::CString;
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 // =============================================================================
 // Constants
@@ -354,14 +357,122 @@ pub struct SccsDateTime {
     pub second: u8,
 }
 
+/// Return the login name of the real user, as SCCS requires for recording
+/// the author of a delta. Uses `getpwuid(getuid())` (the real uid), matching
+/// historical SCCS / CSSC behavior, and falls back to the `LOGNAME`/`USER`
+/// environment and finally `"unknown"` only when the passwd lookup fails.
+pub fn real_login_name() -> String {
+    let uid = unsafe { libc::getuid() };
+    if let Some(user) = crate::user::get_by_uid(uid) {
+        if !user.name.is_empty() {
+            return user.name;
+        }
+    }
+    std::env::var("LOGNAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+/// Decode an SCCS-uuencoded body back to raw bytes. `lines` are the body text
+/// records (of the applied set) in order; decoding uses the historical
+/// `uuencode` mapping (6-bit value `v` encoded as `v + 0x20`, space for zero),
+/// and a count-0 line terminates the stream.
+pub fn uudecode_sccs(lines: &[String]) -> Vec<u8> {
+    fn dec(c: u8) -> u8 {
+        c.wrapping_sub(0x20) & 0x3f
+    }
+    let mut out = Vec::new();
+    for line in lines {
+        let b = line.as_bytes();
+        if b.is_empty() {
+            continue;
+        }
+        let count = dec(b[0]) as usize;
+        if count == 0 {
+            break; // terminator line
+        }
+        let data = &b[1..];
+        let mut produced = 0;
+        let mut i = 0;
+        while produced < count {
+            let c0 = dec(*data.get(i).unwrap_or(&0x20));
+            let c1 = dec(*data.get(i + 1).unwrap_or(&0x20));
+            let c2 = dec(*data.get(i + 2).unwrap_or(&0x20));
+            let c3 = dec(*data.get(i + 3).unwrap_or(&0x20));
+            if produced < count {
+                out.push((c0 << 2) | (c1 >> 4));
+                produced += 1;
+            }
+            if produced < count {
+                out.push((c1 << 4) | (c2 >> 2));
+                produced += 1;
+            }
+            if produced < count {
+                out.push((c2 << 6) | c3);
+                produced += 1;
+            }
+            i += 4;
+            if i >= data.len() {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Encode raw bytes into SCCS-uuencoded body text lines (45 bytes per line),
+/// terminated by a count-0 line, matching historical SCCS / CSSC output.
+pub fn uuencode_sccs(data: &[u8]) -> Vec<String> {
+    fn enc(v: u8) -> u8 {
+        (v & 0x3f) + 0x20
+    }
+    let mut lines = Vec::new();
+    for chunk in data.chunks(45) {
+        let mut line = Vec::with_capacity(1 + chunk.len().div_ceil(3) * 4);
+        line.push(enc(chunk.len() as u8));
+        for grp in chunk.chunks(3) {
+            let b0 = grp[0];
+            let b1 = *grp.get(1).unwrap_or(&0);
+            let b2 = *grp.get(2).unwrap_or(&0);
+            line.push(enc(b0 >> 2));
+            line.push(enc((b0 << 4) | (b1 >> 4)));
+            line.push(enc((b1 << 2) | (b2 >> 6)));
+            line.push(enc(b2));
+        }
+        // Bytes are all in 0x20..=0x5f, so this is always valid UTF-8.
+        lines.push(String::from_utf8(line).unwrap());
+    }
+    lines.push(" ".to_string()); // count-0 terminator
+    lines
+}
+
 impl SccsDateTime {
-    /// Create current date/time
+    /// Create current date/time in the local timezone (honoring `TZ`).
     pub fn now() -> Self {
         use std::time::{SystemTime, UNIX_EPOCH};
-        let duration = SystemTime::now()
+        let secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap_or_default();
-        Self::from_unix_timestamp(duration.as_secs() as i64)
+            .unwrap_or_default()
+            .as_secs() as libc::time_t;
+
+        // SCCS records local wall-clock time; `localtime_r` consults `TZ`
+        // (it behaves as if `tzset()` had been called).
+        unsafe {
+            let mut tm: libc::tm = std::mem::zeroed();
+            if !libc::localtime_r(&secs, &mut tm).is_null() {
+                return Self {
+                    year: ((tm.tm_year + 1900) % 100) as u16,
+                    month: (tm.tm_mon + 1) as u8,
+                    day: tm.tm_mday as u8,
+                    hour: tm.tm_hour as u8,
+                    minute: tm.tm_min as u8,
+                    second: tm.tm_sec as u8,
+                };
+            }
+        }
+
+        // Fallback: UTC if localtime_r is unavailable.
+        Self::from_unix_timestamp(secs as i64)
     }
 
     /// Create from Unix timestamp
@@ -634,6 +745,32 @@ impl SccsFlag {
             SccsFlag::MrValidation(s) => s.clone().unwrap_or_default(),
             SccsFlag::Unknown(_, s) => s.clone(),
         }
+    }
+
+    /// Human-readable description of this flag for the `prs` `:FL:` data
+    /// keyword, matching historical SCCS / CSSC output. Value-bearing flags
+    /// render as `name<tab>value`. Returns `None` for the `e` (encoded) flag,
+    /// which is not part of the `:FL:` listing.
+    pub fn prs_fl_line(&self) -> Option<String> {
+        let s = match self {
+            SccsFlag::BranchEnabled => "branch".to_string(),
+            SccsFlag::Ceiling(n) => format!("ceiling\t{}", n),
+            SccsFlag::DefaultSid(sid) => format!("default SID\t{}", sid),
+            SccsFlag::Encoded(_) => return None,
+            SccsFlag::Floor(n) => format!("floor\t{}", n),
+            SccsFlag::IdKeywordError(_) => "id keywd err/warn".to_string(),
+            SccsFlag::JointEdit => "joint edit".to_string(),
+            SccsFlag::LockedReleases(_) => {
+                format!("locked releases\t{}", self.value_string())
+            }
+            SccsFlag::ModuleName(s) => format!("module\t{}", s),
+            SccsFlag::NullDelta => "null delta".to_string(),
+            SccsFlag::QText(s) => format!("csect name\t{}", s),
+            SccsFlag::ModuleType(s) => format!("type\t{}", s),
+            SccsFlag::MrValidation(s) => format!("validate MRs\t{}", s.clone().unwrap_or_default()),
+            SccsFlag::Unknown(c, val) => format!("{}\t{}", c, val),
+        };
+        Some(s)
     }
 }
 
@@ -920,9 +1057,85 @@ impl SccsFile {
         output
     }
 
+    /// Remove a (leaf) delta: mark its delta-table entry as `Removed` and
+    /// reweave the body so the delta's footprint is undone, matching historical
+    /// SCCS / CSSC `rmdel`. The delta's own inserted block (`^AI s … ^AE s`) is
+    /// dropped in full (control lines and text); each block it deleted
+    /// (`^AD s … ^AE s`) has its control lines dropped but the wrapped text
+    /// restored (un-deleted). The delta-table entry is retained (type `R`) so
+    /// the SID cannot be reused. Callers must ensure the delta is a leaf.
+    pub fn remove_delta(&mut self, serial: u16) {
+        if let Some(d) = self.header.deltas.iter_mut().find(|d| d.serial == serial) {
+            d.delta_type = DeltaType::Removed;
+        }
+
+        let old = std::mem::take(&mut self.body);
+        let mut result = Vec::with_capacity(old.len());
+        let mut i = 0;
+        while i < old.len() {
+            match &old[i] {
+                // Drop this delta's entire insert block, text included.
+                BodyRecord::Insert(s) if *s == serial => {
+                    i += 1;
+                    let mut depth = 0usize;
+                    while i < old.len() {
+                        match &old[i] {
+                            BodyRecord::Insert(_) | BodyRecord::Delete(_) => depth += 1,
+                            BodyRecord::End(_) => {
+                                if depth == 0 {
+                                    i += 1; // consume the matching End and stop
+                                    break;
+                                }
+                                depth -= 1;
+                            }
+                            BodyRecord::Text(_) => {}
+                        }
+                        i += 1;
+                    }
+                }
+                // Drop this delta's delete markers but keep the wrapped text.
+                BodyRecord::Delete(s) if *s == serial => {
+                    i += 1;
+                    let mut depth = 0usize;
+                    while i < old.len() {
+                        match &old[i] {
+                            BodyRecord::Insert(_) | BodyRecord::Delete(_) => {
+                                depth += 1;
+                                result.push(old[i].clone());
+                            }
+                            BodyRecord::End(_) => {
+                                if depth == 0 {
+                                    i += 1; // drop the matching End and stop
+                                    break;
+                                }
+                                depth -= 1;
+                                result.push(old[i].clone());
+                            }
+                            BodyRecord::Text(_) => result.push(old[i].clone()),
+                        }
+                        i += 1;
+                    }
+                }
+                _ => {
+                    result.push(old[i].clone());
+                    i += 1;
+                }
+            }
+        }
+        self.body = result;
+    }
+
     // =========================================================================
     // Flag Access
     // =========================================================================
+
+    /// Whether the body is uuencoded (the `e` flag is set non-zero).
+    pub fn is_encoded(&self) -> bool {
+        self.header
+            .flags
+            .iter()
+            .any(|f| matches!(f, SccsFlag::Encoded(n) if *n != 0))
+    }
 
     /// Check if branch flag is set
     pub fn branch_enabled(&self) -> bool {
@@ -1369,6 +1582,172 @@ pub fn compute_checksum(data: &[u8]) -> u16 {
 }
 
 // =============================================================================
+// SIGINT temp-file cleanup registry
+// =============================================================================
+
+/// Maximum number of transient files registered for SIGINT cleanup at once. A
+/// mutating SCCS command holds at most a couple (the z-file lock and one x-file
+/// temporary), so this bound is generous.
+const MAX_CLEANUP: usize = 32;
+
+/// Async-signal-safe slot array of paths to unlink on SIGINT. Each non-null
+/// entry points at the NUL-terminated bytes of a [`CString`] kept alive in
+/// `CLEANUP_OWNED`. The signal handler reads ONLY this array (atomic loads plus
+/// `unlink`/`_exit`, all async-signal-safe) — it never locks a mutex or
+/// allocates.
+static CLEANUP_SLOTS: [AtomicPtr<libc::c_char>; MAX_CLEANUP] =
+    [const { AtomicPtr::new(std::ptr::null_mut()) }; MAX_CLEANUP];
+
+/// Normal-execution bookkeeping that owns the registered `CString`s (so the raw
+/// pointers stored in `CLEANUP_SLOTS` stay valid) and records each one's slot.
+/// This mutex is locked ONLY from normal control flow (register/unregister) and
+/// is NEVER touched by the signal handler.
+static CLEANUP_OWNED: OnceLock<Mutex<Vec<(usize, CString)>>> = OnceLock::new();
+
+fn cleanup_owned() -> &'static Mutex<Vec<(usize, CString)>> {
+    CLEANUP_OWNED.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Convert a path into a NUL-terminated C string for async-signal-safe
+/// `unlink`. Returns `None` if the path contains an interior NUL.
+fn path_to_cstring(path: &Path) -> Option<CString> {
+    use std::os::unix::ffi::OsStrExt;
+    CString::new(path.as_os_str().as_bytes()).ok()
+}
+
+/// Register `path` to be unlinked on SIGINT.
+pub fn register_cleanup(path: &Path) {
+    let cstr = match path_to_cstring(path) {
+        Some(c) => c,
+        None => return,
+    };
+    // The pointer into the CString's heap buffer stays valid after the CString
+    // is moved into the owned list (moving the `Box<[u8]>` does not relocate the
+    // allocation).
+    let ptr = cstr.as_ptr() as *mut libc::c_char;
+
+    if let Ok(mut owned) = cleanup_owned().lock() {
+        for (i, slot) in CLEANUP_SLOTS.iter().enumerate() {
+            if slot.load(Ordering::Acquire).is_null() {
+                slot.store(ptr, Ordering::Release);
+                owned.push((i, cstr));
+                return;
+            }
+        }
+        // No free slot: the temp simply isn't covered by signal cleanup (it is
+        // still removed by normal-flow unregister / RAII). Not expected in
+        // practice.
+    }
+}
+
+/// Remove `path` from the SIGINT cleanup registry (e.g. after a successful
+/// rename, when the temporary no longer exists).
+pub fn unregister_cleanup(path: &Path) {
+    let cstr = match path_to_cstring(path) {
+        Some(c) => c,
+        None => return,
+    };
+    if let Ok(mut owned) = cleanup_owned().lock() {
+        if let Some(pos) = owned.iter().position(|(_, c)| *c == cstr) {
+            let slot_idx = owned[pos].0;
+            // Clear the slot FIRST (Release) so the handler can no longer read
+            // the pointer, THEN drop the owning CString (freeing the buffer).
+            CLEANUP_SLOTS[slot_idx].store(std::ptr::null_mut(), Ordering::Release);
+            owned.remove(pos);
+        }
+    }
+}
+
+/// SIGINT handler: unlink every registered path and exit non-zero. Performs
+/// ONLY async-signal-safe operations — atomic loads from `CLEANUP_SLOTS`,
+/// `unlink`, and `_exit` — with no mutex acquisition or allocation.
+extern "C" fn sigint_cleanup_handler(_sig: libc::c_int) {
+    for slot in CLEANUP_SLOTS.iter() {
+        let p = slot.load(Ordering::Acquire);
+        if !p.is_null() {
+            unsafe {
+                libc::unlink(p as *const libc::c_char);
+            }
+        }
+    }
+    unsafe {
+        libc::_exit(130);
+    }
+}
+
+/// Install the SIGINT handler that unlinks all registered temp/lock files and
+/// exits with status 130. Idempotent enough to call once at the start of a
+/// mutating command's `main`.
+pub fn install_sigint_cleanup() {
+    // Ensure the owned registry exists before the handler can fire.
+    let _ = cleanup_owned();
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            sigint_cleanup_handler as *const () as libc::sighandler_t,
+        );
+    }
+}
+
+// =============================================================================
+// Z-file lock (per-command exclusive mutation lock)
+// =============================================================================
+
+/// RAII guard for the SCCS z-file lock.
+///
+/// SCCS commands that mutate an s-file create a transient read-only z-file
+/// (e.g. `z.foo` for `s.foo`) containing the locking process's PID. It is held
+/// only for the duration of a single command invocation and removed when the
+/// guard is dropped, preventing two commands from modifying the same s-file
+/// concurrently. (This is distinct from the long-lived p-file edit lock.)
+///
+/// The z-file is created with `O_EXCL` semantics
+/// (`OpenOptions::create_new(true)`): if another process already holds the
+/// lock, [`ZLock::acquire`] fails with [`io::ErrorKind::AlreadyExists`] and the
+/// caller should diagnose the s-file as being edited / locked and skip it. The
+/// z-file path is registered with the SIGINT cleanup registry so an interrupt
+/// removes it.
+pub struct ZLock {
+    zfile: std::path::PathBuf,
+}
+
+impl ZLock {
+    /// Acquire the z-file lock for `sfile`. On success the caller holds the
+    /// lock until the returned guard is dropped. Fails with
+    /// [`io::ErrorKind::AlreadyExists`] if another process already holds it.
+    pub fn acquire(sfile: &Path) -> io::Result<ZLock> {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+
+        let zfile = paths::zfile_from_sfile(sfile);
+
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&zfile)?;
+
+        // Record the locking PID, matching historical SCCS / CSSC.
+        writeln!(f, "{}", std::process::id())?;
+        f.flush()?;
+
+        // SCCS z-files are read-only (r--r--r--).
+        std::fs::set_permissions(&zfile, std::fs::Permissions::from_mode(0o444))?;
+
+        // Ensure SIGINT removes the lock.
+        register_cleanup(&zfile);
+
+        Ok(ZLock { zfile })
+    }
+}
+
+impl Drop for ZLock {
+    fn drop(&mut self) {
+        unregister_cleanup(&self.zfile);
+        let _ = std::fs::remove_file(&self.zfile);
+    }
+}
+
+// =============================================================================
 // Path Utilities
 // =============================================================================
 
@@ -1471,6 +1850,50 @@ pub mod paths {
         let name = sfile.file_name()?.to_str()?;
         name.strip_prefix("s.").map(|s| s.to_string())
     }
+
+    /// Expand SCCS file operands per POSIX, returning the flat list of paths to
+    /// process in order:
+    /// - a lone `-` operand reads pathnames from standard input, one per line;
+    /// - a directory operand (named directly or via stdin) expands to its
+    ///   `s.*` members (sorted; non-SCCS files silently ignored);
+    /// - every other operand passes through verbatim, so the caller can still
+    ///   diagnose an explicitly named non-SCCS file.
+    pub fn expand_operands(operands: &[PathBuf]) -> Vec<PathBuf> {
+        use std::io::BufRead;
+
+        fn push(p: PathBuf, out: &mut Vec<PathBuf>) {
+            if p.is_dir() {
+                if let Ok(entries) = std::fs::read_dir(&p) {
+                    let mut members: Vec<PathBuf> = entries
+                        .flatten()
+                        .map(|e| e.path())
+                        .filter(|q| is_sfile(q))
+                        .collect();
+                    members.sort();
+                    out.extend(members);
+                }
+            } else {
+                out.push(p);
+            }
+        }
+
+        let mut out = Vec::new();
+        if operands.len() == 1 && operands[0].as_os_str() == "-" {
+            let stdin = std::io::stdin();
+            for line in stdin.lock().lines().map_while(Result::ok) {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                push(PathBuf::from(trimmed), &mut out);
+            }
+        } else {
+            for op in operands {
+                push(op.clone(), &mut out);
+            }
+        }
+        out
+    }
 }
 
 // =============================================================================
@@ -1504,17 +1927,32 @@ impl PfileEntry {
         let user = parts[2].to_string();
         let datetime = SccsDateTime::parse(parts[3], parts.get(4).unwrap_or(&"00:00:00"))?;
 
-        // Parse optional -i and -x
+        // Parse optional -i and -x, accepting both the attached form (`-i1.2`,
+        // as written by SCCS / CSSC) and the separated form (`-i 1.2`).
         let mut included = None;
         let mut excluded = None;
         let mut i = 5;
         while i < parts.len() {
-            if parts[i] == "-i" && i + 1 < parts.len() {
-                included = Some(parts[i + 1].to_string());
-                i += 2;
-            } else if parts[i] == "-x" && i + 1 < parts.len() {
-                excluded = Some(parts[i + 1].to_string());
-                i += 2;
+            if let Some(rest) = parts[i].strip_prefix("-i") {
+                if !rest.is_empty() {
+                    included = Some(rest.to_string());
+                    i += 1;
+                } else if i + 1 < parts.len() {
+                    included = Some(parts[i + 1].to_string());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            } else if let Some(rest) = parts[i].strip_prefix("-x") {
+                if !rest.is_empty() {
+                    excluded = Some(rest.to_string());
+                    i += 1;
+                } else if i + 1 < parts.len() {
+                    excluded = Some(parts[i + 1].to_string());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
             } else {
                 i += 1;
             }
@@ -1537,10 +1975,10 @@ impl PfileEntry {
             self.old_sid, self.new_sid, self.user, self.datetime
         );
         if let Some(ref inc) = self.included {
-            line.push_str(&format!(" -i {}", inc));
+            line.push_str(&format!(" -i{}", inc));
         }
         if let Some(ref exc) = self.excluded {
-            line.push_str(&format!(" -x {}", exc));
+            line.push_str(&format!(" -x{}", exc));
         }
         line
     }
@@ -1569,6 +2007,111 @@ mod tests {
         assert_eq!("1.1".parse::<Sid>().unwrap(), Sid::trunk(1, 1));
         assert_eq!("1.2.3.4".parse::<Sid>().unwrap(), Sid::new(1, 2, 3, 4));
         assert_eq!("2".parse::<Sid>().unwrap(), Sid::new(2, 0, 0, 0));
+    }
+
+    #[test]
+    fn test_uuencode_decode_roundtrip() {
+        // Exact CSSC encoding for this input (space-for-zero uuencode).
+        let data = b"\x00\x01hello";
+        let enc = uuencode_sccs(data);
+        assert_eq!(enc[0], "'  %H96QL;P  ");
+        assert_eq!(enc[1], " "); // count-0 terminator
+        assert_eq!(uudecode_sccs(&enc), data);
+
+        // Round-trip a range of binary payloads of varying lengths.
+        for len in [0usize, 1, 2, 3, 44, 45, 46, 90, 137] {
+            let payload: Vec<u8> = (0..len).map(|i| (i * 31 + 7) as u8).collect();
+            let lines = uuencode_sccs(&payload);
+            assert_eq!(uudecode_sccs(&lines), payload, "len={}", len);
+        }
+    }
+
+    #[test]
+    fn test_prs_fl_line_canonical() {
+        assert_eq!(
+            SccsFlag::BranchEnabled.prs_fl_line().as_deref(),
+            Some("branch")
+        );
+        assert_eq!(
+            SccsFlag::ModuleName("mod".into()).prs_fl_line().as_deref(),
+            Some("module\tmod")
+        );
+        assert_eq!(
+            SccsFlag::ModuleType("ty".into()).prs_fl_line().as_deref(),
+            Some("type\tty")
+        );
+        assert_eq!(
+            SccsFlag::QText("Q".into()).prs_fl_line().as_deref(),
+            Some("csect name\tQ")
+        );
+        assert_eq!(
+            SccsFlag::MrValidation(None).prs_fl_line().as_deref(),
+            Some("validate MRs\t")
+        );
+        // The encoded flag is not part of the :FL: listing.
+        assert_eq!(SccsFlag::Encoded(0).prs_fl_line(), None);
+    }
+
+    #[test]
+    fn test_remove_delta_reweaves_body() {
+        // Body for: 1.1 inserts a,b,c; 1.2 (serial 2) deletes b and inserts X.
+        let mut f = SccsFile {
+            body: vec![
+                BodyRecord::Insert(1),
+                BodyRecord::Text("a".into()),
+                BodyRecord::Delete(2),
+                BodyRecord::Text("b".into()),
+                BodyRecord::End(2),
+                BodyRecord::Insert(2),
+                BodyRecord::Text("X".into()),
+                BodyRecord::End(2),
+                BodyRecord::Text("c".into()),
+                BodyRecord::End(1),
+            ],
+            ..Default::default()
+        };
+        f.header.deltas.push(DeltaEntry {
+            serial: 2,
+            ..Default::default()
+        });
+
+        f.remove_delta(2);
+
+        // Removing serial 2 reverts to 1.1: insert block dropped, deletion undone.
+        assert_eq!(
+            f.body,
+            vec![
+                BodyRecord::Insert(1),
+                BodyRecord::Text("a".into()),
+                BodyRecord::Text("b".into()),
+                BodyRecord::Text("c".into()),
+                BodyRecord::End(1),
+            ]
+        );
+        // Delta-table entry retained as Removed.
+        assert_eq!(
+            f.find_delta_by_serial(2).unwrap().delta_type,
+            DeltaType::Removed
+        );
+    }
+
+    #[test]
+    fn test_real_login_name_nonempty() {
+        // Must resolve a name from the passwd database (real uid) regardless of
+        // a spoofed/empty USER/LOGNAME environment; never the empty string.
+        let name = real_login_name();
+        assert!(!name.is_empty());
+    }
+
+    #[test]
+    fn test_now_local_time_fields_in_range() {
+        // now() must produce valid wall-clock fields (TZ-aware via localtime_r).
+        let dt = SccsDateTime::now();
+        assert!(dt.month >= 1 && dt.month <= 12);
+        assert!(dt.day >= 1 && dt.day <= 31);
+        assert!(dt.hour <= 23);
+        assert!(dt.minute <= 59);
+        assert!(dt.second <= 60);
     }
 
     #[test]

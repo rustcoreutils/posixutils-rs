@@ -61,7 +61,7 @@ fn admin_create_new_file_stdin() {
         args: vec![sfile.to_string_lossy().into(), "-i".into()],
         stdin_data: String::from("hello\nworld\n"),
         expected_out: String::new(),
-        expected_err: String::new(),
+        expected_err: format!("admin: warning: {}: No id keywords.\n", sfile.display()),
         expected_exit_code: 0,
     });
 
@@ -97,7 +97,7 @@ fn admin_create_new_file_from_file() {
         ],
         stdin_data: String::new(),
         expected_out: String::new(),
-        expected_err: String::new(),
+        expected_err: format!("admin: warning: {}: No id keywords.\n", sfile.display()),
         expected_exit_code: 0,
     });
 
@@ -163,7 +163,7 @@ fn admin_recompute_checksum() {
         args: vec![sfile.to_string_lossy().into(), "-i".into()],
         stdin_data: String::from("test content\n"),
         expected_out: String::new(),
-        expected_err: String::new(),
+        expected_err: format!("admin: warning: {}: No id keywords.\n", sfile.display()),
         expected_exit_code: 0,
     });
 
@@ -203,7 +203,7 @@ fn admin_create_with_initial_sid() {
         args: vec![sfile.to_string_lossy().into(), "-i".into(), "-r2.1".into()],
         stdin_data: String::from("content\n"),
         expected_out: String::new(),
-        expected_err: String::new(),
+        expected_err: format!("admin: warning: {}: No id keywords.\n", sfile.display()),
         expected_exit_code: 0,
     });
 
@@ -225,7 +225,7 @@ fn admin_create_with_comment() {
         ],
         stdin_data: String::from("content\n"),
         expected_out: String::new(),
-        expected_err: String::new(),
+        expected_err: format!("admin: warning: {}: No id keywords.\n", sfile.display()),
         expected_exit_code: 0,
     });
 
@@ -237,4 +237,169 @@ fn admin_create_with_comment() {
         content.contains("My custom comment"),
         "Comment should be in file"
     );
+}
+
+#[test]
+fn admin_bare_i_then_operand() {
+    // #A1: bare -i must NOT consume the following operand; the operand names
+    // the s-file and the body is read from stdin.
+    let tmp = TempDir::new().unwrap();
+    let sfile = tmp.path().join("s.bare");
+
+    run_test(TestPlan {
+        cmd: String::from("admin"),
+        args: vec!["-i".into(), sfile.to_string_lossy().into()],
+        stdin_data: String::from("%I%\n"),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    assert!(sfile.exists(), "s-file should be created from stdin");
+}
+
+#[test]
+fn admin_reject_invalid_flag() {
+    // #A2: an unrecognized -f flag letter is rejected (non-zero exit).
+    let tmp = TempDir::new().unwrap();
+    let sfile = tmp.path().join("s.badflag");
+
+    let plan = TestPlan {
+        cmd: String::from("admin"),
+        args: vec!["-i".into(), "-fZ".into(), sfile.to_string_lossy().into()],
+        stdin_data: String::from("%I%\n"),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 1,
+    };
+
+    run_test_with_checker(plan, |_plan: &TestPlan, output: &Output| {
+        assert!(!output.status.success(), "invalid flag must fail");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("Unrecognized flag"),
+            "stderr should report unrecognized flag, got: {stderr}"
+        );
+        assert!(!sfile.exists(), "s-file must not be created on flag error");
+    });
+}
+
+#[test]
+fn admin_ceiling_out_of_range() {
+    // #A8: ceiling/floor flag values above 9999 are rejected.
+    let tmp = TempDir::new().unwrap();
+    let sfile = tmp.path().join("s.ceil");
+
+    let plan = TestPlan {
+        cmd: String::from("admin"),
+        args: vec![
+            "-i".into(),
+            "-fc10000".into(),
+            sfile.to_string_lossy().into(),
+        ],
+        stdin_data: String::from("%I%\n"),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 1,
+    };
+
+    run_test_with_checker(plan, |_plan: &TestPlan, output: &Output| {
+        assert!(!output.status.success(), "out-of-range ceiling must fail");
+    });
+}
+
+#[test]
+fn admin_no_id_keyword_warning() {
+    // #A9: a text body with no %X% id keyword triggers a warning to stderr.
+    let tmp = TempDir::new().unwrap();
+    let sfile = tmp.path().join("s.noid");
+
+    run_test(TestPlan {
+        cmd: String::from("admin"),
+        args: vec!["-i".into(), sfile.to_string_lossy().into()],
+        stdin_data: String::from("plain text\n"),
+        expected_out: String::new(),
+        expected_err: format!("admin: warning: {}: No id keywords.\n", sfile.display()),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn admin_id_keyword_no_warning() {
+    // #A9: a body containing %I% suppresses the warning.
+    let tmp = TempDir::new().unwrap();
+    let sfile = tmp.path().join("s.withkw");
+
+    run_test(TestPlan {
+        cmd: String::from("admin"),
+        args: vec!["-i".into(), sfile.to_string_lossy().into()],
+        stdin_data: String::from("%I%\n"),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn admin_m_without_v_flag() {
+    // #A7: -m without the v flag is a diagnostic error.
+    let tmp = TempDir::new().unwrap();
+    let sfile = tmp.path().join("s.m");
+
+    let plan = TestPlan {
+        cmd: String::from("admin"),
+        args: vec!["-i".into(), "-mBUG1".into(), sfile.to_string_lossy().into()],
+        stdin_data: String::from("%I%\n"),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 1,
+    };
+
+    run_test_with_checker(plan, |_plan: &TestPlan, output: &Output| {
+        assert!(!output.status.success(), "-m without v must fail");
+    });
+}
+
+#[test]
+fn admin_v_flag_requires_m() {
+    // #A7: v flag set on create without -m is a diagnostic error.
+    let tmp = TempDir::new().unwrap();
+    let sfile = tmp.path().join("s.v");
+
+    let plan = TestPlan {
+        cmd: String::from("admin"),
+        args: vec!["-i".into(), "-fv".into(), sfile.to_string_lossy().into()],
+        stdin_data: String::from("%I%\n"),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 1,
+    };
+
+    run_test_with_checker(plan, |_plan: &TestPlan, output: &Output| {
+        assert!(!output.status.success(), "v flag without -m must fail");
+    });
+}
+
+#[test]
+fn admin_m_with_v_flag() {
+    // #A7: -m together with -fv succeeds and records the MR.
+    let tmp = TempDir::new().unwrap();
+    let sfile = tmp.path().join("s.mv");
+
+    run_test(TestPlan {
+        cmd: String::from("admin"),
+        args: vec![
+            "-i".into(),
+            "-fv".into(),
+            "-mBUG42".into(),
+            sfile.to_string_lossy().into(),
+        ],
+        stdin_data: String::from("%I%\n"),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    let content = fs::read_to_string(&sfile).unwrap();
+    assert!(content.contains("BUG42"), "MR number should be recorded");
 }

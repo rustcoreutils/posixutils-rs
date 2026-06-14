@@ -11,12 +11,13 @@
 
 use std::fs;
 use std::io::{self, BufRead};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::sccsfile::{parse_pfile, paths, DeltaType, SccsFile, Sid};
+use plib::sccsfile::{parse_pfile, paths, DeltaType, SccsFile, Sid, ZLock};
 
 /// rmdel - remove a delta from an SCCS file
 #[derive(Parser)]
@@ -30,17 +31,26 @@ struct Args {
 }
 
 fn get_current_user() -> String {
-    std::env::var("LOGNAME")
-        .or_else(|_| std::env::var("USER"))
-        .unwrap_or_else(|_| "unknown".to_string())
+    plib::sccsfile::real_login_name()
 }
 
 fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
     // Check if it's a valid s-file
     if !paths::is_sfile(sfile) {
-        eprintln!("{}: not an SCCS file", sfile.display());
+        eprintln!("{}: {}", sfile.display(), gettext("not an SCCS file"));
         return Ok(false);
     }
+
+    // Acquire the per-command z-file lock around the read-modify-write. If
+    // another SCCS command already holds it, report and skip.
+    let _zlock = match ZLock::acquire(sfile) {
+        Ok(z) => z,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            eprintln!("{}: {}", sfile.display(), gettext("being edited"));
+            return Ok(false);
+        }
+        Err(e) => return Err(e),
+    };
 
     // Parse the SCCS file
     let mut sccs = match SccsFile::from_path(sfile) {
@@ -56,15 +66,45 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
     let delta_idx = match delta_idx {
         Some(idx) => idx,
         None => {
-            eprintln!("{}: SID {} not found", sfile.display(), sid);
+            eprintln!(
+                "{}: {} {} {}",
+                sfile.display(),
+                gettext("SID"),
+                sid,
+                gettext("not found")
+            );
             return Ok(false);
         }
     };
 
-    // Check ownership - user must own the delta
+    // Check ownership.  Per POSIX, removal of a delta is restricted to:
+    //   1. the user who made the delta,
+    //   2. the owner of the SCCS file, or
+    //   3. the owner of the directory containing the SCCS file.
     let current_user = get_current_user();
-    if sccs.header.deltas[delta_idx].user != current_user {
-        eprintln!("{}: you do not own delta {}", sfile.display(), sid);
+    let current_uid = unsafe { libc::getuid() };
+
+    let is_delta_author = sccs.header.deltas[delta_idx].user == current_user;
+
+    let owns_sfile = fs::metadata(sfile)
+        .map(|m| m.uid() == current_uid)
+        .unwrap_or(false);
+
+    let dir = sfile
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let owns_dir = fs::metadata(dir)
+        .map(|m| m.uid() == current_uid)
+        .unwrap_or(false);
+
+    if !(is_delta_author || owns_sfile || owns_dir) {
+        eprintln!(
+            "{}: {} {}",
+            sfile.display(),
+            gettext("you are not permitted to remove delta"),
+            sid
+        );
         return Ok(false);
     }
 
@@ -78,9 +118,11 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
 
     if has_successors {
         eprintln!(
-            "{}: delta {} is not a leaf delta (has successors)",
+            "{}: {} {} {}",
             sfile.display(),
-            sid
+            gettext("delta"),
+            sid,
+            gettext("is not a leaf delta (has successors)")
         );
         return Ok(false);
     }
@@ -92,7 +134,13 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
         if let Ok(entries) = parse_pfile(&contents) {
             for entry in &entries {
                 if &entry.old_sid == sid || &entry.new_sid == sid {
-                    eprintln!("{}: delta {} is being edited", sfile.display(), sid);
+                    eprintln!(
+                        "{}: {} {} {}",
+                        sfile.display(),
+                        gettext("delta"),
+                        sid,
+                        gettext("is being edited")
+                    );
                     return Ok(false);
                 }
             }
@@ -101,20 +149,46 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
 
     // Check delta type - can't remove already removed delta
     if sccs.header.deltas[delta_idx].delta_type == DeltaType::Removed {
-        eprintln!("{}: delta {} is already removed", sfile.display(), sid);
+        eprintln!(
+            "{}: {} {} {}",
+            sfile.display(),
+            gettext("delta"),
+            sid,
+            gettext("is already removed")
+        );
         return Ok(false);
     }
 
-    // Mark delta as removed
-    sccs.header.deltas[delta_idx].delta_type = DeltaType::Removed;
+    // Capture the original s-file mode so we can restore the SCCS read-only
+    // (r--r--r--) permissions after the rewrite.
+    let orig_mode = fs::metadata(sfile).map(|m| m.permissions().mode()).ok();
+
+    // Mark delta as removed and reweave the body so its footprint is undone.
+    let serial = sccs.header.deltas[delta_idx].serial;
+    sccs.remove_delta(serial);
 
     // Write the modified file back
     let contents = sccs.to_bytes();
 
-    // Write atomically (to temp file then rename)
-    let tmp_path = sfile.with_extension("tmp");
-    fs::write(&tmp_path, contents)?;
-    fs::rename(&tmp_path, sfile)?;
+    // Write atomically via the canonical x-file, then rename over the s-file.
+    // Register the x-file for SIGINT cleanup around the write+rename.
+    let tmp_path = paths::xfile_from_sfile(sfile);
+    plib::sccsfile::register_cleanup(&tmp_path);
+    let res = (|| -> io::Result<()> {
+        fs::write(&tmp_path, contents)?;
+
+        // Restore the SCCS read-only mode (preserve the original, else 0444).
+        let mode = orig_mode.unwrap_or(0o444);
+        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(mode))?;
+
+        fs::rename(&tmp_path, sfile)?;
+        Ok(())
+    })();
+    plib::sccsfile::unregister_cleanup(&tmp_path);
+    if res.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    res?;
 
     Ok(true)
 }
@@ -145,13 +219,15 @@ fn main() -> ExitCode {
     textdomain("posixutils-rs").ok();
     bind_textdomain_codeset("posixutils-rs", "UTF-8").ok();
 
+    plib::sccsfile::install_sigint_cleanup();
+
     let args = Args::parse();
 
     // Parse the SID
     let sid: Sid = match args.sid.parse() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("Invalid SID '{}': {}", args.sid, e);
+            eprintln!("{} '{}': {}", gettext("Invalid SID"), args.sid, e);
             return ExitCode::FAILURE;
         }
     };

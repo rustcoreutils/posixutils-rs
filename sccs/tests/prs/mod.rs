@@ -151,6 +151,176 @@ fn prs_specific_sid() {
     );
 }
 
+/// Build a multi-delta s-file: initial admin -i, then one get -e + delta.
+fn create_multi_delta_file(tmp: &TempDir) -> std::path::PathBuf {
+    let sfile = tmp.path().join("s.multi");
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("admin"),
+            args: vec![
+                sfile.to_string_lossy().into(),
+                "-i".into(),
+                "-yinitial".into(),
+            ],
+            stdin_data: String::from("a\nb\nc\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_p: &TestPlan, o: &Output| assert!(o.status.success()),
+    );
+
+    let gfile = tmp.path().join("multi");
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("get"),
+            args: vec!["-e".into(), sfile.to_string_lossy().into()],
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_p: &TestPlan, o: &Output| assert!(o.status.success()),
+    );
+    std::fs::write(&gfile, "a\nb\nc\nd\n").unwrap();
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("delta"),
+            args: vec!["-ysecond".into(), sfile.to_string_lossy().into()],
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_p: &TestPlan, o: &Output| assert!(o.status.success()),
+    );
+
+    sfile
+}
+
+/// #P1: each delta's :I: must be on its own line; output ends with a newline.
+#[test]
+fn prs_trailing_newline_per_delta() {
+    let tmp = TempDir::new().unwrap();
+    let sfile = create_multi_delta_file(&tmp);
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("prs"),
+            args: vec![
+                "-e".into(),
+                "-r".into(),
+                "-d:I:".into(),
+                sfile.to_string_lossy().into(),
+            ],
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_p: &TestPlan, o: &Output| {
+            assert!(o.status.success());
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            assert_eq!(stdout, "1.2\n1.1\n", "each SID newline-terminated");
+        },
+    );
+}
+
+/// #P2: bare -r selects the most recent delta (trunk head).
+#[test]
+fn prs_r_optional_argument() {
+    let tmp = TempDir::new().unwrap();
+    let sfile = create_multi_delta_file(&tmp);
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("prs"),
+            args: vec!["-r".into(), "-d:I:".into(), sfile.to_string_lossy().into()],
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_p: &TestPlan, o: &Output| {
+            assert!(o.status.success());
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            assert_eq!(stdout, "1.2\n", "bare -r selects trunk head");
+        },
+    );
+}
+
+/// #P4: :GB: reconstructs the gotten body of the latest delta.
+#[test]
+fn prs_gotten_body() {
+    let tmp = TempDir::new().unwrap();
+    let sfile = create_multi_delta_file(&tmp);
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("prs"),
+            args: vec!["-d:GB:".into(), sfile.to_string_lossy().into()],
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_p: &TestPlan, o: &Output| {
+            assert!(o.status.success());
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            assert_eq!(stdout, "a\nb\nc\nd\n\n", "latest body, M-format");
+        },
+    );
+}
+
+/// #P7: "::" prints verbatim; only recognized keywords are substituted.
+#[test]
+fn prs_literal_double_colon() {
+    let tmp = TempDir::new().unwrap();
+    let sfile = create_sccs_file(&tmp, "test", "content\n");
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("prs"),
+            args: vec!["-da::b".into(), sfile.to_string_lossy().into()],
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_p: &TestPlan, o: &Output| {
+            assert!(o.status.success());
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            assert_eq!(stdout, "a::b\n", "double colon is literal");
+        },
+    );
+}
+
+/// #P6: unset boundary/locked keywords print "none".
+#[test]
+fn prs_unset_keywords_none() {
+    let tmp = TempDir::new().unwrap();
+    let sfile = create_sccs_file(&tmp, "test", "content\n");
+
+    for kw in ["LK", "FB", "CB", "Ds"] {
+        run_test_with_checker(
+            TestPlan {
+                cmd: String::from("prs"),
+                args: vec![format!("-d:{}:", kw), sfile.to_string_lossy().into()],
+                stdin_data: String::new(),
+                expected_out: String::new(),
+                expected_err: String::new(),
+                expected_exit_code: 0,
+            },
+            |_p: &TestPlan, o: &Output| {
+                assert!(o.status.success());
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                assert_eq!(stdout, "none\n", "unset keyword prints none");
+            },
+        );
+    }
+}
+
 #[test]
 fn prs_filename() {
     let tmp = TempDir::new().unwrap();

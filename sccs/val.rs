@@ -19,6 +19,7 @@ use plib::sccsfile::{paths, SccsFile, Sid};
 
 // Exit status bit masks per POSIX
 const ERR_MISSING_FILE: u8 = 0x80;
+const ERR_UNKNOWN_OPTION: u8 = 0x40;
 const ERR_CORRUPTED_FILE: u8 = 0x20;
 const ERR_CANNOT_OPEN: u8 = 0x10;
 const ERR_SID_INVALID: u8 = 0x08;
@@ -42,7 +43,7 @@ struct Args {
     #[arg(short = 'y', value_name = "TYPE", help = gettext("Compare type with %Y% keyword"))]
     type_name: Option<String>,
 
-    #[arg(required = true, help = gettext("SCCS files to validate (use - for stdin)"))]
+    #[arg(help = gettext("SCCS files to validate (use - for stdin)"))]
     files: Vec<PathBuf>,
 }
 
@@ -71,15 +72,17 @@ fn validate_sid(sid_str: &str) -> Result<Sid, u8> {
     Ok(sid)
 }
 
-/// Validate a single SCCS file
-fn validate_file(args: &Args, file_path: &PathBuf) -> u8 {
+/// Validate a single SCCS file.
+///
+/// Any discrepancy strings (the `<unspecified string>` of the POSIX output
+/// format) are pushed onto `diags` rather than written directly, so that the
+/// caller can format them for either command-line or standard-input mode.
+fn validate_file(args: &Args, file_path: &PathBuf, diags: &mut Vec<String>) -> u8 {
     let mut errors: u8 = 0;
 
     // Check if it's a valid s-file name
     if !paths::is_sfile(file_path) {
-        if !args.silent {
-            println!("{}: not an SCCS file", file_path.display());
-        }
+        diags.push(gettext("not an SCCS file"));
         return ERR_CANNOT_OPEN;
     }
 
@@ -87,9 +90,7 @@ fn validate_file(args: &Args, file_path: &PathBuf) -> u8 {
     let sccs = match SccsFile::from_path(file_path) {
         Ok(s) => s,
         Err(e) => {
-            if !args.silent {
-                println!("{}: {}", file_path.display(), e);
-            }
+            diags.push(e.to_string());
             // Determine if it's "cannot open" or "corrupted"
             if file_path.exists() {
                 return ERR_CORRUPTED_FILE;
@@ -105,15 +106,12 @@ fn validate_file(args: &Args, file_path: &PathBuf) -> u8 {
         let newline_pos = data.iter().position(|&b| b == b'\n').unwrap_or(data.len());
         let content_start = newline_pos + 1;
 
-        if content_start < data.len() {
-            let computed = plib::sccsfile::compute_checksum(&data[content_start..]);
+        // A header-only file (no body) still has a checksum to verify.
+        if content_start <= data.len() {
+            let body = data.get(content_start..).unwrap_or(&[]);
+            let computed = plib::sccsfile::compute_checksum(body);
             if computed != sccs.header.checksum {
-                if !args.silent {
-                    println!(
-                        "{}: corrupted SCCS file (checksum error)",
-                        file_path.display()
-                    );
-                }
+                diags.push(gettext("corrupted SCCS file (checksum error)"));
                 errors |= ERR_CORRUPTED_FILE;
             }
         }
@@ -125,20 +123,22 @@ fn validate_file(args: &Args, file_path: &PathBuf) -> u8 {
             Ok(sid) => {
                 // Check if SID exists in the file
                 if sccs.find_delta_by_sid(&sid).is_none() {
-                    if !args.silent {
-                        println!("{}: SID {} does not exist", file_path.display(), sid);
-                    }
+                    diags.push(format!(
+                        "{} {} {}",
+                        gettext("SID"),
+                        sid,
+                        gettext("does not exist")
+                    ));
                     errors |= ERR_SID_NOT_FOUND;
                 }
             }
             Err(e) => {
-                if !args.silent {
-                    println!(
-                        "{}: SID {} is invalid or ambiguous",
-                        file_path.display(),
-                        sid_str
-                    );
-                }
+                diags.push(format!(
+                    "{} {} {}",
+                    gettext("SID"),
+                    sid_str,
+                    gettext("is invalid or ambiguous")
+                ));
                 errors |= e;
             }
         }
@@ -154,9 +154,7 @@ fn validate_file(args: &Args, file_path: &PathBuf) -> u8 {
             });
 
         if &actual_name != expected_name {
-            if !args.silent {
-                println!("{}: %M%, -m mismatch", file_path.display());
-            }
+            diags.push(gettext("%M%, -m mismatch"));
             errors |= ERR_M_MISMATCH;
         }
     }
@@ -166,9 +164,7 @@ fn validate_file(args: &Args, file_path: &PathBuf) -> u8 {
         let actual_type = sccs.module_type().unwrap_or("");
 
         if actual_type != expected_type {
-            if !args.silent {
-                println!("{}: %Y%, -y mismatch", file_path.display());
-            }
+            diags.push(gettext("%Y%, -y mismatch"));
             errors |= ERR_Y_MISMATCH;
         }
     }
@@ -181,8 +177,21 @@ fn main() -> ExitCode {
     textdomain("posixutils-rs").ok();
     bind_textdomain_codeset("posixutils-rs", "UTF-8").ok();
 
-    let args = Args::parse();
+    // Parse the command line manually so that an unknown or duplicate
+    // keyletter yields the 0x40 exit bit rather than clap's default exit(2).
+    let args = match Args::try_parse_from(std::env::args_os()) {
+        Ok(a) => a,
+        Err(e) => {
+            // --help / --version are not errors; let clap print and exit 0.
+            use clap::error::ErrorKind;
+            if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
+                e.exit();
+            }
+            return ExitCode::from(ERR_UNKNOWN_OPTION);
+        }
+    };
 
+    // Missing file argument.
     if args.files.is_empty() {
         return ExitCode::from(ERR_MISSING_FILE);
     }
@@ -203,34 +212,52 @@ fn main() -> ExitCode {
                 continue;
             }
 
-            // Parse the line as arguments
-            // Note: POSIX says no shell expansions are applied
+            // Parse the line as arguments.
+            // Note: POSIX says no shell expansions are applied.
             let mut line_args = vec!["val".to_string()];
             line_args.extend(line.split_whitespace().map(String::from));
 
-            // Re-parse args for this line
+            // Re-parse args for this line. An unknown or duplicate keyletter
+            // contributes the 0x40 bit to this line's aggregate code.
             match Args::try_parse_from(&line_args) {
                 Ok(line_parsed) => {
                     for file in &line_parsed.files {
-                        let file_errors = validate_file(&line_parsed, file);
+                        let mut diags: Vec<String> = Vec::new();
+                        let file_errors = validate_file(&line_parsed, file, &mut diags);
                         if file_errors != 0 {
-                            println!("{}", line);
-                            println!();
+                            // POSIX format for stdin mode:
+                            //   "%s\n\n %s: %s\n", <input>, <pathname>, <string>
+                            // i.e. the input line, a blank line, then a
+                            // SPACE-indented "pathname: discrepancy".
+                            print!("{}\n\n", line);
+                            if !line_parsed.silent {
+                                for diag in &diags {
+                                    println!(" {}: {}", file.display(), diag);
+                                }
+                            }
                         }
                         exit_code |= file_errors;
                     }
                 }
                 Err(_) => {
-                    println!("{}", line);
-                    println!();
-                    // Unknown option would be 0x40, but clap handles this
+                    // Unknown or duplicate keyletter on this input line.
+                    print!("{}\n\n", line);
+                    exit_code |= ERR_UNKNOWN_OPTION;
                 }
             }
         }
     } else {
         // Process files from command line
         for file in &args.files {
-            exit_code |= validate_file(&args, file);
+            let mut diags: Vec<String> = Vec::new();
+            let file_errors = validate_file(&args, file, &mut diags);
+            if !args.silent {
+                // Command-line format: "%s: %s\n", <pathname>, <string>
+                for diag in &diags {
+                    println!("{}: {}", file.display(), diag);
+                }
+            }
+            exit_code |= file_errors;
         }
     }
 

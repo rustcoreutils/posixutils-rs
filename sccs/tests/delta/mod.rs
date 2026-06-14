@@ -18,14 +18,18 @@ fn setup_sccs_file(tmp: &TempDir, name: &str, content: &str) -> (PathBuf, PathBu
     let pfile = tmp.path().join(format!("p.{}", name));
     let gfile = tmp.path().join(name);
 
-    // Create SCCS file
-    run_test(TestPlan {
+    // Create SCCS file. admin warns "No id keywords." on stderr when the body
+    // has no %X% keyword (these fixtures use plain content), so tolerate stderr.
+    let plan = TestPlan {
         cmd: String::from("admin"),
         args: vec![sfile.to_string_lossy().into(), "-i".into()],
         stdin_data: String::from(content),
         expected_out: String::new(),
         expected_err: String::new(),
         expected_exit_code: 0,
+    };
+    run_test_with_checker(plan, |_plan: &TestPlan, output: &Output| {
+        assert!(output.status.success(), "admin create should succeed");
     });
 
     (sfile, pfile, gfile)
@@ -257,4 +261,249 @@ fn delta_comment_in_file() {
         content.contains("My test comment"),
         "Comment should be stored in SCCS file"
     );
+}
+
+// Run admin to set a flag on an existing s-file, ignoring stderr/stdout.
+fn admin_set_flag(sfile: &Path, flag: &str) {
+    let plan = TestPlan {
+        cmd: String::from("admin"),
+        args: vec![format!("-f{}", flag), sfile.to_string_lossy().into()],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    };
+    run_test_with_checker(plan, |_plan: &TestPlan, output: &Output| {
+        assert!(output.status.success(), "admin -f{} should succeed", flag);
+    });
+}
+
+#[test]
+fn delta_records_mr_with_v_flag() {
+    let tmp = TempDir::new().unwrap();
+    let (sfile, _pfile, gfile) = setup_sccs_file(&tmp, "mr", "a\n");
+    admin_set_flag(&sfile, "v");
+
+    get_for_editing(&sfile);
+    fs::write(&gfile, "a\nb\n").unwrap();
+
+    let plan = TestPlan {
+        cmd: String::from("delta"),
+        args: vec![
+            "-ydelta".into(),
+            "-mbug123 bug456".into(),
+            sfile.to_string_lossy().into(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    };
+    run_test_with_checker(plan, |_plan: &TestPlan, output: &Output| {
+        assert!(output.status.success(), "delta -m should succeed");
+    });
+
+    let content = fs::read_to_string(&sfile).unwrap();
+    assert!(content.contains("\x01m bug123"), "should record ^Am bug123");
+    assert!(content.contains("\x01m bug456"), "should record ^Am bug456");
+}
+
+#[test]
+fn delta_v_flag_requires_mr() {
+    let tmp = TempDir::new().unwrap();
+    let (sfile, pfile, gfile) = setup_sccs_file(&tmp, "needmr", "a\n");
+    admin_set_flag(&sfile, "v");
+
+    get_for_editing(&sfile);
+    fs::write(&gfile, "a\nb\n").unwrap();
+
+    // No -m and empty stdin: must fail without committing.
+    let plan = TestPlan {
+        cmd: String::from("delta"),
+        args: vec!["-ydelta".into(), sfile.to_string_lossy().into()],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 1,
+    };
+    run_test_with_checker(plan, |_plan: &TestPlan, output: &Output| {
+        assert!(
+            !output.status.success(),
+            "delta must fail when v flag set and no MR supplied"
+        );
+    });
+
+    // Edit must NOT have been committed: p-file still present, still SID 1.1.
+    assert!(pfile.exists(), "p-file should remain after aborted delta");
+    let content = fs::read_to_string(&sfile).unwrap();
+    let delta_lines = content.matches("\x01d ").count();
+    assert_eq!(delta_lines, 1, "no new delta should be recorded");
+}
+
+#[test]
+fn delta_comment_from_stdin() {
+    let tmp = TempDir::new().unwrap();
+    let (sfile, _pfile, gfile) = setup_sccs_file(&tmp, "stdincmt", "a\n");
+
+    get_for_editing(&sfile);
+    fs::write(&gfile, "a\nb\n").unwrap();
+
+    // No -y: comment is read from (non-tty) stdin.
+    let plan = TestPlan {
+        cmd: String::from("delta"),
+        args: vec![sfile.to_string_lossy().into()],
+        stdin_data: String::from("stdin comment line\n"),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    };
+    run_test_with_checker(plan, |_plan: &TestPlan, output: &Output| {
+        assert!(output.status.success(), "delta should succeed");
+    });
+
+    let content = fs::read_to_string(&sfile).unwrap();
+    assert!(
+        content.contains("\x01c stdin comment line"),
+        "comment should come from stdin"
+    );
+}
+
+#[test]
+fn delta_g_records_ignored() {
+    let tmp = TempDir::new().unwrap();
+    let (sfile, _pfile, gfile) = setup_sccs_file(&tmp, "ignore", "l1\n");
+
+    // Build up deltas 1.2 (serial 2) and 1.3 (serial 3).
+    get_for_editing(&sfile);
+    fs::write(&gfile, "l1\nl2\n").unwrap();
+    run_delta(&sfile, "c1");
+    get_for_editing(&sfile);
+    fs::write(&gfile, "l1\nl2\nl3\n").unwrap();
+    run_delta(&sfile, "c2");
+
+    // New delta ignoring SID 1.2 (serial 2).
+    get_for_editing(&sfile);
+    fs::write(&gfile, "l1\nl2\nl3\nl4\n").unwrap();
+    let plan = TestPlan {
+        cmd: String::from("delta"),
+        args: vec![
+            "-yc3".into(),
+            "-g1.2".into(),
+            sfile.to_string_lossy().into(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    };
+    run_test_with_checker(plan, |_plan: &TestPlan, output: &Output| {
+        assert!(output.status.success(), "delta -g should succeed");
+    });
+
+    let content = fs::read_to_string(&sfile).unwrap();
+    assert!(content.contains("\x01g 2"), "should record ^Ag 2");
+}
+
+#[test]
+fn delta_p_normal_diff_format() {
+    let tmp = TempDir::new().unwrap();
+    let (sfile, _pfile, gfile) = setup_sccs_file(&tmp, "pdiff", "l1\nl2\nl3\n");
+
+    get_for_editing(&sfile);
+    fs::write(&gfile, "l1\nL2\nl3\n").unwrap();
+
+    let plan = TestPlan {
+        cmd: String::from("delta"),
+        args: vec![
+            "-yc".into(),
+            "-p".into(),
+            "-s".into(),
+            sfile.to_string_lossy().into(),
+        ],
+        stdin_data: String::new(),
+        // With -s the only stdout is the -p diff in normal format.
+        expected_out: String::from("2c2\n< l2\n---\n> L2\n"),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    };
+    run_test(plan);
+}
+
+#[test]
+fn delta_p_append_does_not_panic() {
+    let tmp = TempDir::new().unwrap();
+    let (sfile, _pfile, gfile) = setup_sccs_file(&tmp, "pappend", "l1\nl2\n");
+
+    get_for_editing(&sfile);
+    fs::write(&gfile, "l1\nl2\nl3\nl4\n").unwrap();
+
+    let plan = TestPlan {
+        cmd: String::from("delta"),
+        args: vec![
+            "-yc".into(),
+            "-p".into(),
+            "-s".into(),
+            sfile.to_string_lossy().into(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::from("2a3,4\n> l3\n> l4\n"),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    };
+    run_test(plan);
+}
+
+// z-file (per-command lock) is removed after a successful delta, and a
+// pre-existing z-file blocks the mutation (#X8 / #D5).
+#[test]
+fn delta_zfile_removed_after_command() {
+    let tmp = TempDir::new().unwrap();
+    let (sfile, _pfile, gfile) = setup_sccs_file(&tmp, "zclean", "a\n");
+
+    let zfile = tmp.path().join("z.zclean");
+
+    get_for_editing(&sfile);
+    assert!(
+        !zfile.exists(),
+        "z-file must not persist after get -e returns"
+    );
+
+    fs::write(&gfile, "a\nb\n").unwrap();
+    run_delta(&sfile, "add");
+    assert!(
+        !zfile.exists(),
+        "z-file must be removed after delta returns"
+    );
+}
+
+#[test]
+fn delta_blocked_by_existing_zfile() {
+    let tmp = TempDir::new().unwrap();
+    let (sfile, _pfile, gfile) = setup_sccs_file(&tmp, "zlock", "a\n");
+
+    get_for_editing(&sfile);
+    fs::write(&gfile, "a\nb\n").unwrap();
+
+    // Simulate another command holding the per-command z-file lock.
+    let zfile = tmp.path().join("z.zlock");
+    fs::write(&zfile, "99999\n").unwrap();
+
+    let plan = TestPlan {
+        cmd: String::from("delta"),
+        args: vec!["-yblocked".into(), sfile.to_string_lossy().into()],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 1,
+    };
+    run_test_with_checker(plan, |_plan: &TestPlan, output: &Output| {
+        assert!(
+            !output.status.success(),
+            "delta must fail while z-file lock is held"
+        );
+    });
+
+    // Our manually-created lock must be left intact (delta must not remove a
+    // lock it did not create).
+    assert!(zfile.exists(), "foreign z-file must not be removed");
 }

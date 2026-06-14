@@ -10,7 +10,7 @@
 //! unget - undo a previous get of an SCCS file
 
 use std::fs;
-use std::io::{self, BufRead};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -36,22 +36,24 @@ struct Args {
 }
 
 fn get_current_user() -> String {
-    std::env::var("LOGNAME")
-        .or_else(|_| std::env::var("USER"))
-        .unwrap_or_else(|_| "unknown".to_string())
+    plib::sccsfile::real_login_name()
 }
 
-fn unget_file(sfile: &Path, args: &Args) -> io::Result<bool> {
+fn unget_file(sfile: &Path, args: &Args, show_header: bool) -> io::Result<bool> {
     // Check if it's a valid s-file
     if !paths::is_sfile(sfile) {
-        eprintln!("{}: not an SCCS file", sfile.display());
+        eprintln!("{}: {}", sfile.display(), gettext("not an SCCS file"));
         return Ok(false);
     }
 
     // Check if p-file exists
     let pfile = paths::pfile_from_sfile(sfile);
     if !pfile.exists() {
-        eprintln!("{}: no outstanding delta for current user", sfile.display());
+        eprintln!(
+            "{}: {}",
+            sfile.display(),
+            gettext("no outstanding delta for current user")
+        );
         return Ok(false);
     }
 
@@ -61,7 +63,11 @@ fn unget_file(sfile: &Path, args: &Args) -> io::Result<bool> {
         parse_pfile(&contents).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     if entries.is_empty() {
-        eprintln!("{}: no outstanding delta for current user", sfile.display());
+        eprintln!(
+            "{}: {}",
+            sfile.display(),
+            gettext("no outstanding delta for current user")
+        );
         return Ok(false);
     }
 
@@ -96,15 +102,18 @@ fn unget_file(sfile: &Path, args: &Args) -> io::Result<bool> {
         None => {
             if let Some(ref sid) = target_sid {
                 eprintln!(
-                    "{}: SID {} not found for user {}",
+                    "{}: {} {} {} {}",
                     sfile.display(),
+                    gettext("SID"),
                     sid,
+                    gettext("not found for user"),
                     current_user
                 );
             } else {
                 eprintln!(
-                    "{}: no outstanding delta for user {}",
+                    "{}: {} {}",
                     sfile.display(),
+                    gettext("no outstanding delta for user"),
                     current_user
                 );
             }
@@ -114,8 +123,13 @@ fn unget_file(sfile: &Path, args: &Args) -> io::Result<bool> {
 
     let entry = entries.remove(entry_idx);
 
-    // Output the SID being ungot (unless silent)
+    // Output the SID being ungot (unless silent). When more than one file (or a
+    // directory or standard input) is named, each SID is preceded by a
+    // "\n%s:\n" pathname header.
     if !args.silent {
+        if show_header {
+            println!("\n{}:", sfile.display());
+        }
         println!("{}", entry.new_sid);
     }
 
@@ -176,36 +190,19 @@ fn main() -> ExitCode {
 
     let mut success = true;
 
-    // Check if reading from stdin
-    if args.files.len() == 1 && args.files[0].to_string_lossy() == "-" {
-        let stdin = io::stdin();
-        for line in stdin.lock().lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(_) => continue,
-            };
+    // A pathname header precedes each SID when more than one file is named, or a
+    // directory or standard input is named.
+    let is_stdin = args.files.len() == 1 && args.files[0].as_os_str() == "-";
+    let has_dir = args.files.iter().any(|f| f.is_dir());
+    let files = paths::expand_operands(&args.files);
+    let show_header = is_stdin || has_dir || files.len() > 1;
 
-            let path = PathBuf::from(line.trim());
-            if !path.exists() {
-                continue;
-            }
-
-            match unget_file(&path, &args) {
-                Ok(ok) => success = success && ok,
-                Err(e) => {
-                    eprintln!("{}: {}", path.display(), e);
-                    success = false;
-                }
-            }
-        }
-    } else {
-        for file in &args.files {
-            match unget_file(file, &args) {
-                Ok(ok) => success = success && ok,
-                Err(e) => {
-                    eprintln!("{}: {}", file.display(), e);
-                    success = false;
-                }
+    for file in &files {
+        match unget_file(file, &args, show_header) {
+            Ok(ok) => success = success && ok,
+            Err(e) => {
+                eprintln!("unget: {}: {}", file.display(), e);
+                success = false;
             }
         }
     }

@@ -8,6 +8,7 @@
 //
 
 use plib::testing::{run_test, run_test_with_checker, TestPlan};
+use std::fs;
 use std::process::Output;
 use tempfile::TempDir;
 
@@ -86,6 +87,34 @@ fn sact_with_pending_edit() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             assert!(stdout.contains("1.1"), "should show old SID");
             assert!(stdout.contains("1.2"), "should show new SID");
+        },
+    );
+}
+
+#[test]
+fn sact_corrupt_pfile_nonzero_exit() {
+    let tmp = TempDir::new().unwrap();
+    let sfile = create_sccs_file(&tmp, "test", "content\n");
+
+    // Write a corrupt p-file (alongside the s-file as p.<name>).
+    let pfile = tmp.path().join("p.test");
+    fs::write(&pfile, "this is not a valid p-file line\n").unwrap();
+
+    // A corrupt p-file must surface as a non-zero exit status.
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("sact"),
+            args: vec![sfile.to_string_lossy().into()],
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan: &TestPlan, output: &Output| {
+            assert!(
+                !output.status.success(),
+                "corrupt p-file should yield non-zero exit"
+            );
         },
     );
 }

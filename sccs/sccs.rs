@@ -14,11 +14,114 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, ExitCode};
 
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 
 fn usage() -> ! {
-    eprintln!("usage: sccs [-r] [-d path] [-p path] command [options...] [operands...]");
+    eprintln!(
+        "{}",
+        gettext("usage: sccs [-r] [-d path] [-p path] command [options...] [operands...]")
+    );
     process::exit(2);
+}
+
+/// Partition `args` into options destined for the delta phase and options
+/// destined for the get phase of a delget/deledit, plus the shared file
+/// operands.
+///
+/// Routing is decided by the option *letter* (the character immediately after
+/// the leading '-'), per the SCCS spec partitions, rather than by substring
+/// matching of the whole token.  An option letter may legitimately route to
+/// both phases (e.g. -s).  File operands (tokens not starting with '-') and
+/// any unrecognized options are appended to both phases so the underlying
+/// utility can diagnose them.
+fn split_delget_opts<'a>(
+    args: &[&'a str],
+    delta_letters: &str,
+    get_letters: &str,
+) -> (Vec<&'a str>, Vec<&'a str>) {
+    let mut delta_opts = Vec::new();
+    let mut get_opts = Vec::new();
+
+    for &a in args {
+        if let Some(rest) = a.strip_prefix('-') {
+            let letter = rest.chars().next();
+            match letter {
+                Some(c) => {
+                    let to_delta = delta_letters.contains(c);
+                    let to_get = get_letters.contains(c);
+                    if to_delta {
+                        delta_opts.push(a);
+                    }
+                    if to_get {
+                        get_opts.push(a);
+                    }
+                    if !to_delta && !to_get {
+                        // Unknown option: let both phases see it (and diagnose).
+                        delta_opts.push(a);
+                        get_opts.push(a);
+                    }
+                }
+                None => {
+                    // A bare "-" operand.
+                    delta_opts.push(a);
+                    get_opts.push(a);
+                }
+            }
+        } else {
+            // File operand: needed by both phases.
+            delta_opts.push(a);
+            get_opts.push(a);
+        }
+    }
+
+    (delta_opts, get_opts)
+}
+
+/// Resolve a sibling SCCS utility relative to the directory of the running
+/// executable.  Falls back to the bare command name (resolved via $PATH) when
+/// the sibling cannot be located next to us.
+fn sibling(cmd: &str) -> PathBuf {
+    if let Ok(exe) = env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join(cmd);
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+    PathBuf::from(cmd)
+}
+
+/// Look up a user's home directory from the passwd database (for the
+/// `PROJECTDIR=<username>` form, where that user's home is examined for a
+/// `src`/`source` directory).
+fn user_home_dir(name: &str) -> Option<PathBuf> {
+    use std::ffi::{CStr, CString};
+    let cname = CString::new(name).ok()?;
+    unsafe {
+        let pw = libc::getpwnam(cname.as_ptr());
+        if pw.is_null() || (*pw).pw_dir.is_null() {
+            return None;
+        }
+        let dir = CStr::from_ptr((*pw).pw_dir).to_str().ok()?;
+        Some(PathBuf::from(dir))
+    }
+}
+
+/// Drop elevated privileges by resetting the effective user/group ids to the
+/// real ones.  This is a no-op when sccs is not installed setuid/setgid, and
+/// the correct behavior for `sccs -r` when it is.
+fn drop_privileges() {
+    unsafe {
+        if libc::setgid(libc::getgid()) != 0 {
+            eprintln!("sccs: setgid: {}", std::io::Error::last_os_error());
+            process::exit(1);
+        }
+        if libc::setuid(libc::getuid()) != 0 {
+            eprintln!("sccs: setuid: {}", std::io::Error::last_os_error());
+            process::exit(1);
+        }
+    }
 }
 
 /// Convert a file operand to SCCS file path
@@ -55,13 +158,23 @@ fn to_gfile(file: &str, root_dir: &Path) -> PathBuf {
     root_dir.join(file)
 }
 
-/// Get list of files being edited (from p-files in SCCS directory)
+/// One editing record, mirroring a p-file entry:
+/// (g-file, old-SID, new-SID, user, date, time).
+struct EditInfo {
+    gfile: String,
+    old_sid: String,
+    new_sid: String,
+    user: String,
+    date: String,
+    time: String,
+}
+
 fn get_editing_info(
     root_dir: &Path,
     sccs_dir: &str,
     branch_only: bool,
     user_filter: Option<&str>,
-) -> Vec<(String, String, String)> {
+) -> Vec<EditInfo> {
     let mut results = Vec::new();
 
     let sccs_path = root_dir.join(sccs_dir);
@@ -76,13 +189,16 @@ fn get_editing_info(
                         for line in contents.lines() {
                             let parts: Vec<&str> = line.split_whitespace().collect();
                             if parts.len() >= 5 {
-                                let sid = parts[1];
+                                let old_sid = parts[0];
+                                let new_sid = parts[1];
                                 let user = parts[2];
+                                let date = parts[3];
+                                let time = parts[4];
 
                                 // Filter by branch
                                 if branch_only {
                                     // Branch SIDs have 4 components (R.L.B.S)
-                                    if sid.matches('.').count() < 3 {
+                                    if new_sid.matches('.').count() < 3 {
                                         continue;
                                     }
                                 }
@@ -95,7 +211,14 @@ fn get_editing_info(
                                 }
 
                                 let gfile = name_str.strip_prefix("p.").unwrap().to_string();
-                                results.push((gfile, sid.to_string(), user.to_string()));
+                                results.push(EditInfo {
+                                    gfile,
+                                    old_sid: old_sid.to_string(),
+                                    new_sid: new_sid.to_string(),
+                                    user: user.to_string(),
+                                    date: date.to_string(),
+                                    time: time.to_string(),
+                                });
                             }
                         }
                     }
@@ -162,18 +285,15 @@ fn main() -> ExitCode {
         if let Ok(projectdir) = env::var("PROJECTDIR") {
             if projectdir.starts_with('/') {
                 root_dir = PathBuf::from(projectdir);
-            } else {
-                // Treat as username - look for their src or source directory
-                if let Ok(home) = env::var("HOME") {
-                    let src = PathBuf::from(&home).join(&projectdir).join("src");
-                    let source = PathBuf::from(&home).join(&projectdir).join("source");
-                    if src.is_dir() {
-                        root_dir = src;
-                    } else if source.is_dir() {
-                        root_dir = source;
-                    } else {
-                        root_dir = PathBuf::from(projectdir);
-                    }
+            } else if let Some(home) = user_home_dir(&projectdir) {
+                // Treat as a user name: examine that user's home directory for a
+                // `src` or `source` subdirectory.
+                let src = home.join("src");
+                let source = home.join("source");
+                if src.is_dir() {
+                    root_dir = src;
+                } else if source.is_dir() {
+                    root_dir = source;
                 }
             }
         }
@@ -216,34 +336,9 @@ fn main() -> ExitCode {
         }
 
         "delget" => {
-            // delta then get
-            let delta_opts: Vec<&str> = remaining_args
-                .iter()
-                .filter(|a| {
-                    a.starts_with("-m")
-                        || a.starts_with("-p")
-                        || a.starts_with("-r")
-                        || a.starts_with("-s")
-                        || a.starts_with("-y")
-                        || !a.starts_with("-")
-                })
-                .copied()
-                .collect();
-            let get_opts: Vec<&str> = remaining_args
-                .iter()
-                .filter(|a| {
-                    a.starts_with("-b")
-                        || a.starts_with("-c")
-                        || a.starts_with("-e")
-                        || a.starts_with("-i")
-                        || a.starts_with("-k")
-                        || a.starts_with("-l")
-                        || a.starts_with("-s")
-                        || a.starts_with("-x")
-                        || !a.starts_with("-")
-                })
-                .copied()
-                .collect();
+            // delta then get.  Per spec: -m -p -r -s -y -> delta;
+            // -b -c -e -i -k -l -s -x -> get.
+            let (delta_opts, get_opts) = split_delget_opts(&remaining_args, "mprsy", "bceiklsx");
 
             let code = run_sccs_command(
                 "delta",
@@ -260,33 +355,9 @@ fn main() -> ExitCode {
         }
 
         "deledit" => {
-            // delta then get -e
-            let delta_opts: Vec<&str> = remaining_args
-                .iter()
-                .filter(|a| {
-                    a.starts_with("-m")
-                        || a.starts_with("-p")
-                        || a.starts_with("-r")
-                        || a.starts_with("-s")
-                        || a.starts_with("-y")
-                        || !a.starts_with("-")
-                })
-                .copied()
-                .collect();
-            let get_opts: Vec<&str> = remaining_args
-                .iter()
-                .filter(|a| {
-                    a.starts_with("-b")
-                        || a.starts_with("-c")
-                        || a.starts_with("-i")
-                        || a.starts_with("-k")
-                        || a.starts_with("-l")
-                        || a.starts_with("-s")
-                        || a.starts_with("-x")
-                        || !a.starts_with("-")
-                })
-                .copied()
-                .collect();
+            // delta then get -e.  Same partition as delget, but the get phase
+            // is forced into -e mode, so -e is not routed from the argv here.
+            let (delta_opts, get_opts) = split_delget_opts(&remaining_args, "mprsy", "bciklsx");
 
             let code = run_sccs_command(
                 "delta",
@@ -336,7 +407,13 @@ fn main() -> ExitCode {
                 let init_arg = format!("-i{}", gfile.display());
                 cmd_args.push(&init_arg);
 
-                let status = Command::new("admin").args(&cmd_args).arg(&sfile).status();
+                if use_real_uid {
+                    drop_privileges();
+                }
+                let status = Command::new(sibling("admin"))
+                    .args(&cmd_args)
+                    .arg(&sfile)
+                    .status();
 
                 match status {
                     Ok(s) if s.success() => {
@@ -368,7 +445,7 @@ fn main() -> ExitCode {
                 .map(|s| &s[2..]);
 
             if sid_opt.is_none() {
-                eprintln!("sccs: fix requires -r SID");
+                eprintln!("sccs: {}", gettext("fix requires -r SID"));
                 return ExitCode::FAILURE;
             }
 
@@ -381,8 +458,12 @@ fn main() -> ExitCode {
             for file in &files {
                 let sfile = to_sfile(file, &root_dir, &sccs_dir);
 
+                if use_real_uid {
+                    drop_privileges();
+                }
+
                 // Get the version being fixed
-                let status = Command::new("get")
+                let status = Command::new(sibling("get"))
                     .arg("-k")
                     .arg(format!("-r{}", sid_opt.unwrap()))
                     .arg(&sfile)
@@ -395,7 +476,7 @@ fn main() -> ExitCode {
                 }
 
                 // Remove the delta
-                let status = Command::new("rmdel")
+                let status = Command::new(sibling("rmdel"))
                     .arg(format!("-r{}", sid_opt.unwrap()))
                     .arg(&sfile)
                     .status();
@@ -420,11 +501,7 @@ fn main() -> ExitCode {
                 } else if let Some(stripped) = arg.strip_prefix("-u") {
                     user_filter = Some(stripped.to_string());
                 } else if *arg == "-U" {
-                    user_filter = Some(
-                        env::var("LOGNAME")
-                            .or_else(|_| env::var("USER"))
-                            .unwrap_or_default(),
-                    );
+                    user_filter = Some(plib::sccsfile::real_login_name());
                 }
             }
 
@@ -437,17 +514,27 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             } else if command == "tell" {
-                for (file, _sid, _user) in &info {
-                    println!("{}", file);
+                for e in &info {
+                    println!("{}", e.gfile);
                 }
                 ExitCode::SUCCESS
             } else {
-                // info
+                // info: report the full p-file detail
+                // (old-SID new-SID user date time).
                 if info.is_empty() {
-                    println!("Nothing being edited.");
+                    println!("{}", gettext("Nothing being edited."));
                 } else {
-                    for (file, sid, user) in &info {
-                        println!("{}: being edited: {} {}", file, sid, user);
+                    for e in &info {
+                        println!(
+                            "{}: {} {} {} {} {} {}",
+                            e.gfile,
+                            gettext("being edited:"),
+                            e.old_sid,
+                            e.new_sid,
+                            e.user,
+                            e.date,
+                            e.time
+                        );
                     }
                 }
                 ExitCode::SUCCESS
@@ -458,7 +545,7 @@ fn main() -> ExitCode {
             // Remove files that can be recreated from SCCS
             let branch_only = remaining_args.contains(&"-b");
             let info = get_editing_info(&root_dir, &sccs_dir, branch_only, None);
-            let editing: Vec<&str> = info.iter().map(|(f, _, _)| f.as_str()).collect();
+            let editing: Vec<&str> = info.iter().map(|e| e.gfile.as_str()).collect();
 
             // Find g-files in current directory
             if let Ok(entries) = fs::read_dir(&root_dir) {
@@ -517,20 +604,26 @@ fn main() -> ExitCode {
                 diff_opts.push("-c");
             }
 
-            for file in &files {
+            if use_real_uid {
+                drop_privileges();
+            }
+
+            for (idx, file) in files.iter().enumerate() {
                 let sfile = to_sfile(file, &root_dir, &sccs_dir);
                 let gfile = to_gfile(file, &root_dir);
 
-                // Get SCCS version to temp file
-                let tmp = format!("/tmp/sccs_diff.{}", std::process::id());
-                let mut get_cmd = Command::new("get");
+                // Get SCCS version to a temp file in the system temp directory.
+                // Include the pid and a per-file index to reduce predictability
+                // and avoid collisions when diffing multiple files.
+                let tmp = env::temp_dir().join(format!("sccs_diff.{}.{}", std::process::id(), idx));
+                let mut get_cmd = Command::new(sibling("get"));
                 get_cmd.args(&get_opts).arg("-p").arg("-s").arg(&sfile);
 
                 let output = get_cmd.output();
                 if let Ok(o) = output {
                     fs::write(&tmp, &o.stdout).ok();
 
-                    // Run diff
+                    // Run diff (a system tool, not an SCCS sibling).
                     Command::new("diff")
                         .args(&diff_opts)
                         .arg(&tmp)
@@ -569,7 +662,7 @@ fn main() -> ExitCode {
         }
 
         _ => {
-            eprintln!("sccs: unknown command '{}'", command);
+            eprintln!("sccs: {} '{}'", gettext("unknown command"), command);
             ExitCode::FAILURE
         }
     }
@@ -581,7 +674,7 @@ fn run_sccs_command(
     args: &[&str],
     root_dir: &Path,
     sccs_dir: &str,
-    _use_real_uid: bool,
+    use_real_uid: bool,
 ) -> ExitCode {
     // Separate options from file operands
     let (opts, files): (Vec<&str>, Vec<&str>) = args.iter().partition(|a| a.starts_with("-"));
@@ -592,7 +685,12 @@ fn run_sccs_command(
         .map(|f| to_sfile(f, root_dir, sccs_dir))
         .collect();
 
-    let mut command = Command::new(cmd);
+    // When -r was requested, drop to the real uid/gid before spawning.
+    if use_real_uid {
+        drop_privileges();
+    }
+
+    let mut command = Command::new(sibling(cmd));
     command.args(extra_opts);
     command.args(&opts);
     for sfile in &sfiles {

@@ -142,7 +142,8 @@ fn get_for_editing() {
         args: vec![sfile.to_string_lossy().into(), "-i".into()],
         stdin_data: String::from("content\n"),
         expected_out: String::new(),
-        expected_err: String::new(),
+        // admin warns when the body has no %X% id keyword.
+        expected_err: format!("admin: warning: {}: No id keywords.\n", sfile.display()),
         expected_exit_code: 0,
     });
 
@@ -213,4 +214,143 @@ fn get_version_1_1_from_branched() {
         ],
         "line1\nline2\nline3\n",
     );
+}
+
+#[test]
+fn get_exclude_top_delta() {
+    // -x1.3 excludes the most recent delta; the result matches version 1.2.
+    let fixture = fixture_path("s.multi");
+    run_get_test_stdout_only(
+        vec![
+            "-p".into(),
+            "-x1.3".into(),
+            fixture.to_string_lossy().into(),
+        ],
+        "line1\nline2\nline3\nline4\n",
+    );
+}
+
+#[test]
+fn get_include_excluded_notation() {
+    // -x writes an "Excluded:" notation to the info stream (stderr under -p).
+    let fixture = fixture_path("s.multi");
+    let plan = TestPlan {
+        cmd: String::from("get"),
+        args: vec![
+            "-p".into(),
+            "-x1.3".into(),
+            fixture.to_string_lossy().into(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    };
+    run_test_with_checker(plan, |_plan: &TestPlan, output: &Output| {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("Excluded:\n1.3"),
+            "stderr should contain Excluded notation, got: {stderr}"
+        );
+    });
+}
+
+#[test]
+fn get_cutoff_excludes_newer_deltas() {
+    // -c cutoff between delta 1.2 (22:24:57) and 1.3 (22:25:05) drops 1.3.
+    let fixture = fixture_path("s.multi");
+    run_get_test_stdout_only(
+        vec![
+            "-p".into(),
+            "-c251212222500".into(),
+            fixture.to_string_lossy().into(),
+        ],
+        "line1\nline2\nline3\nline4\n",
+    );
+}
+
+#[test]
+fn get_cutoff_invalid_field_rejected() {
+    // An out-of-range cutoff field (month 13) must be rejected as an error
+    // rather than silently filtering nonsensically.
+    let fixture = fixture_path("s.multi");
+    let plan = TestPlan {
+        cmd: String::from("get"),
+        args: vec![
+            "-p".into(),
+            "-c251312".into(),
+            fixture.to_string_lossy().into(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 1,
+    };
+    run_test_with_checker(plan, |_plan: &TestPlan, output: &Output| {
+        assert!(
+            !output.status.success(),
+            "invalid -c cutoff should fail, exit was {:?}",
+            output.status.code()
+        );
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            err.contains("Invalid cutoff date"),
+            "expected 'Invalid cutoff date' diagnostic, got: {err}"
+        );
+    });
+}
+
+#[test]
+fn get_lfile_to_stdout() {
+    // -L writes the delta summary table to standard output.
+    let fixture = fixture_path("s.multi");
+    let plan = TestPlan {
+        cmd: String::from("get"),
+        args: vec!["-L".into(), fixture.to_string_lossy().into()],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    };
+    run_test_with_checker(plan, |_plan: &TestPlan, output: &Output| {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Status line: three status columns, a space, the SID, a tab, then
+        // date-time and login.
+        assert!(
+            stdout.contains("    1.3\t25/12/12 22:25:05 jgarzik\n"),
+            "l-file summary line mismatch, got: {stdout}"
+        );
+        assert!(
+            stdout.contains("\tmodified line2\n"),
+            "l-file comment line missing, got: {stdout}"
+        );
+    });
+}
+
+#[test]
+fn get_top_delta_in_release() {
+    // -t accesses the most recently created delta in release 1 (1.3).
+    let fixture = fixture_path("s.multi");
+    let plan = TestPlan {
+        cmd: String::from("get"),
+        args: vec![
+            "-p".into(),
+            "-t".into(),
+            "-r1".into(),
+            fixture.to_string_lossy().into(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::from("line1\nmodified-line2\nline3\nline4\n"),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    };
+    run_test_with_checker(plan, |plan: &TestPlan, output: &Output| {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(stdout, plan.expected_out, "stdout mismatch");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("1.3"),
+            "top SID should be 1.3, got: {stderr}"
+        );
+    });
 }

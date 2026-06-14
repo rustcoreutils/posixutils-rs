@@ -92,6 +92,22 @@ fn sibling(cmd: &str) -> PathBuf {
     PathBuf::from(cmd)
 }
 
+/// Look up a user's home directory from the passwd database (for the
+/// `PROJECTDIR=<username>` form, where that user's home is examined for a
+/// `src`/`source` directory).
+fn user_home_dir(name: &str) -> Option<PathBuf> {
+    use std::ffi::{CStr, CString};
+    let cname = CString::new(name).ok()?;
+    unsafe {
+        let pw = libc::getpwnam(cname.as_ptr());
+        if pw.is_null() || (*pw).pw_dir.is_null() {
+            return None;
+        }
+        let dir = CStr::from_ptr((*pw).pw_dir).to_str().ok()?;
+        Some(PathBuf::from(dir))
+    }
+}
+
 /// Drop elevated privileges by resetting the effective user/group ids to the
 /// real ones.  This is a no-op when sccs is not installed setuid/setgid, and
 /// the correct behavior for `sccs -r` when it is.
@@ -269,18 +285,15 @@ fn main() -> ExitCode {
         if let Ok(projectdir) = env::var("PROJECTDIR") {
             if projectdir.starts_with('/') {
                 root_dir = PathBuf::from(projectdir);
-            } else {
-                // Treat as username - look for their src or source directory
-                if let Ok(home) = env::var("HOME") {
-                    let src = PathBuf::from(&home).join(&projectdir).join("src");
-                    let source = PathBuf::from(&home).join(&projectdir).join("source");
-                    if src.is_dir() {
-                        root_dir = src;
-                    } else if source.is_dir() {
-                        root_dir = source;
-                    } else {
-                        root_dir = PathBuf::from(projectdir);
-                    }
+            } else if let Some(home) = user_home_dir(&projectdir) {
+                // Treat as a user name: examine that user's home directory for a
+                // `src` or `source` subdirectory.
+                let src = home.join("src");
+                let source = home.join("source");
+                if src.is_dir() {
+                    root_dir = src;
+                } else if source.is_dir() {
+                    root_dir = source;
                 }
             }
         }

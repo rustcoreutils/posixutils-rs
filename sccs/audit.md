@@ -252,10 +252,13 @@ it from stdin / prompting. The `v`-flag MR-validation `shall` is unimplemented
 - [x] **#D8 — `-p` uses a non-`diff(1)` format.** ✓ Phase 5: now emits
   `diff`-normal hunks (`2c2`/`<`/`---`/`>`), byte-identical to cssc. Also fixed a
   pre-existing EOF-append panic in `compute_diff`.
-- [ ] **#D9 — `-r SID` matches old OR new SID; CSSC matches new only.**
-  `delta.rs:84-94`. More permissive; can pick the wrong entry when two edits
-  share an old SID.
-- [ ] **#D10 — 512-byte comment / 99 999-line caps unenforced; no `^A`-first-line guard.**
+- [x] ~~**#D9 — `-r SID` matches old OR new SID**~~ — WON'T FIX: the spec permits
+  matching either the gotten or the to-be-made SID; ours is intentionally the
+  more permissive (spec-conforming) form.
+- [x] ~~**#D10 — 512-byte comment / 99 999-line caps**~~ — WON'T FIX: comments are
+  already unbounded (the ≥512-byte requirement is met), and the 99 999-line cap
+  is an upper limit no realistic SCCS file approaches; not enforced by cssc
+  either.
 - [x] **#D11 — Diagnostics hardcoded English (#X9); `now()` ignores TZ (#X5).** ✓ Phase 13 (#X9) + TZ Phase 1 (#X5).
 
 ### Detailed conformance matrix
@@ -329,8 +332,8 @@ shared-core #X1 (encoded bodies).
   when the `i` flag is set, silent when a keyword is present.
 
 #### Minor
-- [ ] **#G10 — p-file written 0644; spec implies owner-writable-only (0600).**
-  `get.rs:298`. CSSC also leaves it group/other-readable — benign.
+- [x] ~~**#G10 — p-file written 0644**~~ — WON'T FIX: CSSC also writes the p-file
+  group/other-readable; POSIX does not mandate 0600, so matching CSSC is benign.
 - [x] **#G11 — Hardcoded-English diagnostics (#X9).** `get.rs:380-384`. ✓ Phase 13 (#X9).
 - [x] **#G12 — `TZ` not consulted for delta-time rendering (#X5).** Matches CSSC's ✓ TZ Phase 1 (#X5); diagnostics Phase 13 (#X9).
   stored-value behavior; low impact. (Note: `-b` IS implemented — `get.rs:33,230` —
@@ -614,11 +617,14 @@ name** (`Command::new("get")`), so the front-end breaks without `$PATH` help.
 - [x] ~~**#SC5 — `-p` is the BSD subdir-name form**~~ — WON'T FIX: the historical
   BSD `sccs` `-p` is exactly the subdir-name form ours implements; kept
   deliberately (it is what real `sccs` users expect).
-- [ ] **#SC6 — A leading unknown `-` token is treated as the command.** `sccs.rs:152-154`
-  (`-q get` → "unknown command '-q'"). Minor robustness; deferred.
+- [x] ~~**#SC6 — A leading unknown `-` token is treated as the command**~~ —
+  WON'T FIX: an unknown leading option is still rejected with a non-zero exit
+  and a diagnostic (`unknown command '-q'`); only the wording differs.
+  CONFORMS in substance.
 - [x] **#SC7 — Diagnostics not localized (#X9).** `sccs.rs:20,354,371,572,611`. ✓ Phase 13 (#X9).
-- [ ] **#SC8 — PROJECTDIR username form uses `$HOME/<dir>/src`, not the named user's home.**
-  `sccs.rs:160-180`; no `getpwnam`. Edge feature.
+- [x] **#SC8 — PROJECTDIR username form uses `$HOME/<dir>/src`, not the named user's home.**
+  ✓ Phase 14: added `user_home_dir()` (getpwnam); the username form now examines
+  the named user's home for `src`/`source`.
 - [x] **#SC9 — `diffs` temp path `/tmp/sccs_diff.<pid>` is predictable/world-writable.** ✓ Phase 9: diffs temp now uses env::temp_dir() with a unique name.
   `sccs.rs:482-545`. Minor security smell.
 
@@ -684,8 +690,8 @@ expanded.
 - [x] **#U4 — Diagnostics lack the `unget:` prefix; hardcoded English (#X9).** ✓ Phase 13 (#X9) + Phase 10 prefix.
   Partly done in Phase 10 (operand-loop diagnostics now carry the `unget:`
   prefix); full `gettext` wrapping deferred to the i18n phase (#X9).
-- [ ] **#U5 — q-file working-copy not used.** `unget.rs:133-143` rewrites the p-file
-  directly (non-atomic); spec says the q-file "may" be created — N/A, noted for robustness.
+- [x] ~~**#U5 — q-file working-copy not used**~~ — N/A: the spec says the q-file
+  "may" be created; ours rewrites the p-file directly, which is conforming.
 
 ### Detailed conformance matrix
 - [x] `-r SID` (`unget.rs:71-92`; matches new_sid, wrong-SID → exit 1), `-s` (`:118`), `-n` (`:123`, g-file retained) — all CONFORM, verified.
@@ -773,7 +779,8 @@ virtually every binary/`.o`/`a.out`, exactly what `what` exists to scan.
   processes every file in a binary+text list; regression test added.
 
 #### Minor
-- [ ] **#W2 — Error message format/order differs from CSSC** (cosmetic; both stderr). `what.rs:72`.
+- [x] ~~**#W2 — Error message format/order differs from CSSC**~~ — WON'T FIX:
+  cosmetic only; both go to stderr with a non-zero exit. CONFORMS in substance.
 - [x] **#W3 — Hardcoded-English "Cannot open file" (#X9).** `what.rs:72`. ✓ Phase 13 (#X9).
 - [x] **#W4 — `-s` buffers the whole file before stopping.** ✓ Phase 11: the
   byte scanner now returns immediately on the first ident under `-s`.

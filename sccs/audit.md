@@ -18,6 +18,14 @@ re-run), not taken on the sub-agents' word.
 **Reference slices:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/{admin,delta,get,prs,rmdel,sact,sccs,unget,val,what}.md`
 **Date:** 2026-06-14
 
+> **Status (remediated 2026-06-14):** every finding below is resolved — fixed
+> (✓, with the implementing phase noted inline) or dispositioned WON'T-FIX/N-A
+> with a rationale. The work landed over 14 phases on the `sccs-audit` branch,
+> each behaviorally re-verified byte-for-byte against GNU CSSC 1.4.1 and gated
+> on `cargo build`/`clippy`/`test` (91 integration tests). All ten utilities are
+> promoted to README **Stage 6 — Audited**. The original findings are preserved
+> below (now ticked) as the historical record.
+
 ---
 
 ## Headline

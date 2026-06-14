@@ -47,6 +47,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
 
 ## Stage 6 - Audited
 
+ - [x] admin (SCCS)
  - [x] ar (Development)
  - [x] at (cron cat.)
  - [x] awk
@@ -57,6 +58,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] cmp
  - [x] crontab (cron cat.)
  - [x] dd
+ - [x] delta (SCCS)
  - [x] dirname
  - [x] ed (Editors)
  - [x] ex (Editors)
@@ -65,6 +67,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] file
  - [x] find
  - [x] gencat (i18n)
+ - [x] get (SCCS)
  - [x] gettext (i18n)
  - [x] iconv (i18n)
  - [x] lex (Development)
@@ -78,14 +81,21 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] nm (Development)
  - [x] od
  - [x] pathchk
+ - [x] prs (SCCS)
  - [x] realpath
+ - [x] rmdel (SCCS)
+ - [x] sact (SCCS)
+ - [x] sccs (SCCS)
  - [x] split
  - [x] strings
  - [x] strip (Development)
  - [x] tee
  - [x] test
  - [x] true
+ - [x] unget (SCCS)
+ - [x] val (SCCS)
  - [x] vi (Editors)
+ - [x] what (SCCS)
  - [x] xgettext (i18n)
  - [x] yacc (Development)
 
@@ -99,7 +109,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
 
 ## Stage 3 - Test coverage
 
- - [x] admin (SCCS)
  - [x] asa
  - [x] c99 (Development)
  - [x] cal
@@ -112,7 +121,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] ctags (Development)
  - [x] cut
  - [x] cxref (Development)
- - [x] delta (SCCS)
  - [x] diff
  - [x] df
  - [x] du
@@ -120,7 +128,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] expand
  - [x] fold
  - [x] fuser
- - [x] get (SCCS)
  - [x] getconf
  - [x] grep
  - [x] head
@@ -138,14 +145,10 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] pax
  - [x] pr
  - [x] printf
- - [x] prs (SCCS)
  - [x] ps
  - [x] readlink
  - [x] rm
- - [x] rmdel (SCCS)
  - [x] rmdir
- - [x] sact (SCCS)
- - [x] sccs (SCCS)
  - [x] sed
  - [x] sh
  - [x] sort
@@ -164,15 +167,12 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] uudecode (uue)
  - [x] uuencode (uue)
  - [x] unexpand
- - [x] unget (SCCS)
  - [x] uniq
  - [x] unlink
  - [x] uucp (UUCP)
  - [x] uustat (UUCP)
  - [x] uux (UUCP)
- - [x] val (SCCS)
  - [x] wc
- - [x] what (SCCS)
  - [x] who
  - [x] write
  - [x] xargs

@@ -8,7 +8,7 @@
 //
 
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
-use std::{iter, process::exit};
+use std::{cell::Cell, iter, rc::Rc};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UTF32Variant {
@@ -26,6 +26,7 @@ pub fn to_ucs4<I: Iterator<Item = u8> + 'static>(
     omit_invalid: bool,
     suppress_error: bool,
     variant: UTF32Variant,
+    had_error: Rc<Cell<bool>>,
 ) -> Box<dyn Iterator<Item = u32>> {
     let mut buffer = Vec::with_capacity(4);
     let mut variant = variant;
@@ -72,14 +73,14 @@ pub fn to_ucs4<I: Iterator<Item = u8> + 'static>(
             buffer.clear();
 
             if code_point >= 0x110000 {
+                if omit_invalid {
+                    continue;
+                }
+                had_error.set(true);
                 if !suppress_error {
                     eprintln!("Error: Invalid code point U+{:X}", code_point);
                 }
-                if omit_invalid {
-                    continue;
-                } else {
-                    return None;
-                }
+                return None;
             }
 
             return Some(code_point);
@@ -94,7 +95,11 @@ pub fn from_ucs4<I: Iterator<Item = u32> + 'static>(
     omit_invalid: bool,
     suppress_error: bool,
     variant: UTF32Variant,
+    had_error: Rc<Cell<bool>>,
 ) -> Box<dyn Iterator<Item = u8>> {
+    // The generic `UTF-32` form is endianness-ambiguous, so a leading U+FEFF
+    // byte-order mark is emitted; the explicit LE/BE forms write none.
+    let emit_bom = variant == UTF32Variant::UTF32;
     let variant = match variant {
         UTF32Variant::UTF32LE => UTF32Variant::UTF32LE,
         UTF32Variant::UTF32BE => UTF32Variant::UTF32BE,
@@ -105,6 +110,14 @@ pub fn from_ucs4<I: Iterator<Item = u32> + 'static>(
                 UTF32Variant::UTF32BE
             }
         }
+    };
+
+    let bom = if emit_bom {
+        let mut b = [0u8; 4];
+        write_u32(&mut b, BOM, variant);
+        b.to_vec()
+    } else {
+        Vec::new()
     };
 
     let mut code_point = input.peekable();
@@ -123,12 +136,12 @@ pub fn from_ucs4<I: Iterator<Item = u32> + 'static>(
                 if cp > 0x10FFFF {
                     if omit_invalid {
                         continue;
-                    } else {
-                        if !suppress_error {
-                            eprintln!("Error: Invalid Unicode code point U+{:X}", cp);
-                        }
-                        exit(1);
                     }
+                    had_error.set(true);
+                    if !suppress_error {
+                        eprintln!("Error: Invalid Unicode code point U+{:X}", cp);
+                    }
+                    return None;
                 }
                 write_u32(&mut buf, cp, variant); // Write code point to buffer
                 idx = 0;
@@ -137,7 +150,7 @@ pub fn from_ucs4<I: Iterator<Item = u32> + 'static>(
         }
     });
 
-    Box::new(iter)
+    Box::new(bom.into_iter().chain(iter))
 }
 
 #[inline]

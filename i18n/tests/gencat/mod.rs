@@ -24,6 +24,18 @@ fn gencat_test(args: &[&str], expected_output: Vec<u8>, expected_error: Vec<u8>)
     })
 }
 
+fn gencat_test_stdin(args: &[&str], stdin_data: Vec<u8>, expected_output: Vec<u8>) {
+    let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
+    run_test_u8(TestPlanU8 {
+        cmd: String::from("gencat"),
+        args: str_args,
+        stdin_data,
+        expected_out: expected_output,
+        expected_err: Vec::new(),
+        expected_exit_code: 0,
+    })
+}
+
 #[test]
 fn gencat_empty_message_file() {
     let cargo_manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -74,6 +86,35 @@ fn gencat_sets_and_messagess() {
         expected_output,
         Vec::new(),
     );
+}
+
+// GC-12: a `-` msgfile operand reads the message source from standard input.
+// Feeding the same source via stdin must produce the same catalog as the file.
+#[test]
+fn gencat_msgfile_from_stdin() {
+    let cargo_manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let msg_file = cargo_manifest_dir.join("tests/gencat/sets_and_messages.msg");
+
+    #[cfg(not(target_os = "macos"))]
+    let expected_cat_file =
+        cargo_manifest_dir.join("tests/gencat/sets_and_messages_gnu_catfile.cat");
+    #[cfg(target_os = "macos")]
+    let expected_cat_file =
+        cargo_manifest_dir.join("tests/gencat/sets_and_messages_osx_catfile.cat");
+
+    let mut stdin_data: Vec<u8> = Vec::new();
+    File::open(&msg_file)
+        .unwrap()
+        .read_to_end(&mut stdin_data)
+        .unwrap();
+
+    let mut expected_output: Vec<u8> = Vec::new();
+    File::open(&expected_cat_file)
+        .unwrap()
+        .read_to_end(&mut expected_output)
+        .unwrap();
+
+    gencat_test_stdin(&["-", "-"], stdin_data, expected_output);
 }
 
 #[test]

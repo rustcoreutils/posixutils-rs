@@ -30,8 +30,11 @@ struct Args {
     #[arg(short = 'd', long = "domain", help = gettext("Use TEXTDOMAIN as the text domain for translating MSGID"))]
     domain: Option<String>,
 
-    #[arg(short = 'e', help = gettext("Enable interpretation of some escape sequences"))]
+    #[arg(short = 'e', help = gettext("Process C-language escape sequences in MSGID operands"))]
     expand_escapes: bool,
+
+    #[arg(short = 'E', conflicts_with = "expand_escapes", help = gettext("Do not process C-language escape sequences in MSGID operands"))]
+    no_expand_escapes: bool,
 
     #[arg(short, long, action = clap::ArgAction::HelpLong, help = gettext("Print help"))]
     help: Option<bool>,
@@ -39,14 +42,8 @@ struct Args {
     #[arg(short = 'V', long, action = clap::ArgAction::Version, help = gettext("Print version"))]
     version: Option<bool>,
 
-    #[arg(help = gettext("Singular form (MSGID1)"))]
-    msgid1: String,
-
-    #[arg(help = gettext("Plural form (MSGID2)"))]
-    msgid2: String,
-
-    #[arg(help = gettext("Count for plural selection"))]
-    count: String,
+    #[arg(help = gettext("[textdomain] msgid msgid_plural n"))]
+    args: Vec<String>,
 }
 
 fn main() {
@@ -59,42 +56,80 @@ fn main() {
 
     let args = Args::parse();
 
-    // Parse the count
-    let count: u64 = match args.count.parse() {
-        Ok(n) => n,
-        Err(_) => {
-            eprintln!("ngettext: invalid count: {}", args.count);
+    // Operands: `[textdomain] msgid msgid_plural n`.
+    let (operand_domain, msgid1, msgid2, count_str): (Option<&str>, &str, &str, &str) = match args
+        .args
+        .len()
+    {
+        3 => (None, &args.args[0], &args.args[1], &args.args[2]),
+        4 => (
+            Some(args.args[0].as_str()),
+            &args.args[1],
+            &args.args[2],
+            &args.args[3],
+        ),
+        _ => {
+            eprintln!("{}", gettext("ngettext: usage: ngettext [-e|-E] [-d textdomain] [textdomain] msgid msgid_plural n"));
             exit(1);
         }
     };
 
-    // Get the domain
-    let domain = args
-        .domain
-        .clone()
-        .or_else(|| std::env::var("TEXTDOMAIN").ok())
-        .unwrap_or_else(|| "messages".to_string());
-
-    // Look up the message
-    let mut lookup = MessageLookup::new();
-
-    let translated = lookup
-        .ngettext(&domain, &args.msgid1, &args.msgid2, count)
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            // Fallback: use simple Germanic plural rule
-            if count == 1 {
-                args.msgid1.clone()
-            } else {
-                args.msgid2.clone()
-            }
-        });
-
-    let output = if args.expand_escapes {
-        expand_escapes(&translated)
-    } else {
-        translated
+    // Parse the count (POSIX: as if by strtoul, base 10).
+    let count: u64 = match count_str.parse() {
+        Ok(n) => n,
+        Err(_) => {
+            eprintln!("ngettext: invalid count: {}", count_str);
+            exit(1);
+        }
     };
 
-    println!("{}", output);
+    let domain = resolve_domain(operand_domain, &args.domain);
+
+    // Escapes (if any) apply to the msgid operands.
+    let key1 = if args.expand_escapes {
+        expand_escapes(msgid1)
+    } else {
+        msgid1.to_string()
+    };
+    let key2 = if args.expand_escapes {
+        expand_escapes(msgid2)
+    } else {
+        msgid2.to_string()
+    };
+
+    // Germanic default used both as the catalog-miss fallback and when the text
+    // domain is NULL (no catalog lookup).
+    let germanic = || {
+        if count == 1 {
+            key1.clone()
+        } else {
+            key2.clone()
+        }
+    };
+
+    let output = match domain {
+        Some(domain) => MessageLookup::new()
+            .ngettext(&domain, &key1, &key2, count)
+            .unwrap_or_else(germanic),
+        None => germanic(),
+    };
+
+    // No trailing newline is appended.
+    print!("{}", output);
+}
+
+/// Resolve the text domain in decreasing precedence: operand `textdomain`, the
+/// `-d` option, then `TEXTDOMAIN`. Returns `None` for a NULL text domain.
+fn resolve_domain(operand: Option<&str>, opt_domain: &Option<String>) -> Option<String> {
+    if let Some(d) = operand {
+        if !d.is_empty() {
+            return Some(d.to_string());
+        }
+    }
+    if let Some(d) = opt_domain {
+        if !d.is_empty() {
+            return Some(d.clone());
+        }
+    }
+    std::env::var("TEXTDOMAIN").ok().filter(|d| !d.is_empty())
 }

@@ -62,11 +62,17 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] false
  - [x] file
  - [x] find
+ - [x] gencat (i18n)
+ - [x] gettext (i18n)
+ - [x] iconv (i18n)
  - [x] lex (Development)
+ - [x] locale (i18n)
  - [x] m4
  - [x] make
  - [x] man
  - [x] more
+ - [x] msgfmt (i18n)
+ - [x] ngettext (i18n)
  - [x] nm (Development)
  - [x] od
  - [x] split
@@ -76,6 +82,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] test
  - [x] true
  - [x] vi (Editors)
+ - [x] xgettext (i18n)
  - [x] yacc (Development)
 
 ## Stage 5 - Fully Translated to 2+ languages
@@ -111,24 +118,18 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] expand
  - [x] fold
  - [x] fuser
- - [x] gencat (i18n)
  - [x] get (SCCS)
  - [x] getconf
- - [x] gettext (i18n)
  - [x] grep
  - [x] head
- - [x] iconv (i18n)
  - [x] join
  - [x] link
- - [x] locale (i18n)
  - [x] localedef (i18n)
  - [x] logger
  - [x] ls
  - [x] mailx
  - [x] mkdir
- - [x] msgfmt (i18n)
  - [x] mv
- - [x] ngettext (i18n)
  - [x] nl
  - [x] paste
  - [x] patch
@@ -178,7 +179,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] ipcs (IPC)
  - [x] kill
  - [x] lp
- - [x] xgettext (i18n)
  - [x] zcat (compress cat.)
 
 ## Stage 2 - Feature-complete and POSIX compliant

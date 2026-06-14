@@ -25,6 +25,111 @@ fn iconv_test(args: &[&str], input: Vec<u8>, expected_output: Vec<u8>, expected_
     })
 }
 
+fn iconv_test_exit(
+    args: &[&str],
+    input: Vec<u8>,
+    expected_output: Vec<u8>,
+    expected_error: Vec<u8>,
+    expected_exit_code: i32,
+) {
+    let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
+    run_test_u8(TestPlanU8 {
+        cmd: String::from("iconv"),
+        args: str_args,
+        stdin_data: input,
+        expected_out: expected_output,
+        expected_err: expected_error,
+        expected_exit_code,
+    })
+}
+
+// Invalid input bytes: 'A', a lone UTF-8 lead byte 0xC3 followed by '(' (not a
+// valid continuation byte), then 'B'.
+const INVALID_UTF8: &[u8] = &[b'A', 0xC3, b'(', b'B'];
+
+// IC-1/IC-2: an unconvertible character without `-c` must yield a non-zero exit
+// status (POSIX: ">0 An error occurred"), report it on stderr, and must not
+// abort via a process exit from inside a codec iterator.
+#[test]
+fn iconv_invalid_without_c_flag_exits_nonzero() {
+    iconv_test_exit(
+        &["-f", "UTF-8", "-t", "ASCII"],
+        INVALID_UTF8.to_vec(),
+        b"A".to_vec(),
+        b"Error: Invalid 2-byte UTF-8 sequence\n".to_vec(),
+        1,
+    );
+}
+
+// `-c` (omit) handles the invalid character, so the conversion succeeds: exit 0
+// and no diagnostics. The presence of `-c` is what changes the exit status here.
+#[test]
+fn iconv_invalid_with_c_flag_exits_zero() {
+    iconv_test_exit(
+        &["-c", "-f", "UTF-8", "-t", "ASCII"],
+        INVALID_UTF8.to_vec(),
+        b"A(B".to_vec(),
+        Vec::new(),
+        0,
+    );
+}
+
+// IC-4: `-s` suppresses only the stderr message; it must not affect the exit
+// status nor silently truncate to a success. Without `-c` the error still
+// yields a non-zero exit, but with empty stderr.
+#[test]
+fn iconv_invalid_with_s_flag_suppresses_message_but_exits_nonzero() {
+    iconv_test_exit(
+        &["-s", "-f", "UTF-8", "-t", "ASCII"],
+        INVALID_UTF8.to_vec(),
+        b"A".to_vec(),
+        Vec::new(),
+        1,
+    );
+}
+
+// IC-5: codeset names are matched case-insensitively and common aliases are
+// accepted (e.g. `utf8`, `US-ASCII`), so the names printed by `-l` round-trip
+// through `-f`/`-t`.
+#[test]
+fn iconv_codeset_aliases_and_case_insensitive() {
+    iconv_test(
+        &["-f", "utf8", "-t", "us-ascii"],
+        b"hello".to_vec(),
+        b"hello".to_vec(),
+        Vec::new(),
+    );
+}
+
+// IC-6: the generic `UTF-16`/`UTF-32` output forms (no explicit endianness)
+// must begin with a U+FEFF byte-order mark; the explicit LE/BE forms must not.
+#[test]
+fn iconv_generic_utf16_output_has_bom() {
+    let le_bom = cfg!(target_endian = "little");
+    let mut expected = if le_bom {
+        vec![0xFF, 0xFE]
+    } else {
+        vec![0xFE, 0xFF]
+    };
+    expected.extend(if le_bom { [b'A', 0x00] } else { [0x00, b'A'] });
+    iconv_test(
+        &["-f", "UTF-8", "-t", "UTF-16"],
+        b"A".to_vec(),
+        expected,
+        Vec::new(),
+    );
+}
+
+#[test]
+fn iconv_explicit_utf16le_output_has_no_bom() {
+    iconv_test(
+        &["-f", "UTF-8", "-t", "UTF-16LE"],
+        b"A".to_vec(),
+        vec![b'A', 0x00],
+        Vec::new(),
+    );
+}
+
 #[test]
 #[ignore]
 fn iconv_no_flag_data_input() {

@@ -20,7 +20,7 @@ fn test_ngettext_singular() {
             String::from("1"),
         ],
         stdin_data: String::new(),
-        expected_out: String::from("One file\n"),
+        expected_out: String::from("One file"), // GT-2: no trailing newline
         expected_err: String::new(),
         expected_exit_code: 0,
     });
@@ -37,7 +37,7 @@ fn test_ngettext_plural_zero() {
             String::from("0"),
         ],
         stdin_data: String::new(),
-        expected_out: String::from("%d files\n"),
+        expected_out: String::from("%d files"),
         expected_err: String::new(),
         expected_exit_code: 0,
     });
@@ -54,7 +54,7 @@ fn test_ngettext_plural_many() {
             String::from("5"),
         ],
         stdin_data: String::new(),
-        expected_out: String::from("%d items\n"),
+        expected_out: String::from("%d items"),
         expected_err: String::new(),
         expected_exit_code: 0,
     });
@@ -72,7 +72,26 @@ fn test_ngettext_expand_escapes() {
             String::from("1"),
         ],
         stdin_data: String::new(),
-        expected_out: String::from("One\nfile\n"),
+        expected_out: String::from("One\nfile"),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+}
+
+/// NG-1: the optional `[textdomain]` operand is accepted (4-operand form),
+/// matching the spec synopsis `[textdomain] msgid msgid_plural n`.
+#[test]
+fn test_ngettext_optional_textdomain_operand() {
+    run_test(TestPlan {
+        cmd: String::from("ngettext"),
+        args: vec![
+            String::from("mail"),
+            String::from("recipient"),
+            String::from("recipients"),
+            String::from("1"),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::from("recipient"),
         expected_err: String::new(),
         expected_exit_code: 0,
     });
@@ -89,7 +108,7 @@ fn test_ngettext_large_number() {
             String::from("1000000"),
         ],
         stdin_data: String::new(),
-        expected_out: String::from("%d messages\n"),
+        expected_out: String::from("%d messages"),
         expected_err: String::new(),
         expected_exit_code: 0,
     });

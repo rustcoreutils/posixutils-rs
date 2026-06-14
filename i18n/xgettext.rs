@@ -73,8 +73,7 @@ struct Args {
             * If KEYWORD_SPEC is of the form id:argnum then xgettext shall treat the argnum-th argument of a call to the function or macro id as the msgid argument, \
             where argnum 1 is the first argument.\n\
             * If KEYWORD_SPEC is of the form id:argnum1,argnum2 then xgettext shall treat strings in the argnum1-th argument \
-            and in the argnum2-th argument of a call to the function or macro id as the msgid and msgid_plural arguments, respectively."),
-        default_value = "gettext"
+            and in the argnum2-th argument of a call to the function or macro id as the msgid and msgid_plural arguments, respectively.")
     )]
     keyword_spec: Vec<String>,
 
@@ -91,7 +90,7 @@ struct Args {
     pathname: Option<PathBuf>,
 
     #[arg(
-        short = 'X',
+        short = 'x',
         help = gettext("\
             Specify a file containing strings that shall not be extracted from the input files. \
             The format of EXCLUDE_FILE is identical to that of a dot-po file. However, \
@@ -279,6 +278,44 @@ impl KeywordSpec {
                 msgid_plural_arg: Some(3),
                 msgctxt_arg: None,
             },
+            // `_l` (per-locale) variants: the trailing locale_t argument does
+            // not shift the msgid position, so these mirror their base forms.
+            KeywordSpec {
+                name: "gettext_l".to_string(),
+                msgid_arg: 1,
+                msgid_plural_arg: None,
+                msgctxt_arg: None,
+            },
+            KeywordSpec {
+                name: "ngettext_l".to_string(),
+                msgid_arg: 1,
+                msgid_plural_arg: Some(2),
+                msgctxt_arg: None,
+            },
+            KeywordSpec {
+                name: "dgettext_l".to_string(),
+                msgid_arg: 2,
+                msgid_plural_arg: None,
+                msgctxt_arg: None,
+            },
+            KeywordSpec {
+                name: "dngettext_l".to_string(),
+                msgid_arg: 2,
+                msgid_plural_arg: Some(3),
+                msgctxt_arg: None,
+            },
+            KeywordSpec {
+                name: "dcgettext_l".to_string(),
+                msgid_arg: 2,
+                msgid_plural_arg: None,
+                msgctxt_arg: None,
+            },
+            KeywordSpec {
+                name: "dcngettext_l".to_string(),
+                msgid_arg: 2,
+                msgid_plural_arg: Some(3),
+                msgctxt_arg: None,
+            },
         ]
     }
 }
@@ -329,6 +366,10 @@ pub struct Walker {
     extract_all: bool,
     exclude_msgids: Vec<String>,
     messages: HashMap<MessageKey, Message>,
+    /// Keys in first-extracted order, so output preserves extraction order
+    /// (POSIX: "The msgid values shall be in the same order that the strings
+    /// are extracted").
+    order: Vec<MessageKey>,
 }
 
 impl Walker {
@@ -367,6 +408,7 @@ impl Walker {
             extract_all,
             exclude_msgids,
             messages: HashMap::new(),
+            order: Vec::new(),
         }
     }
 
@@ -551,6 +593,7 @@ impl Walker {
                 existing.msgid_plural = msg.msgid_plural;
             }
         } else {
+            self.order.push(key.clone());
             self.messages.insert(key, msg);
         }
     }
@@ -910,36 +953,50 @@ impl Walker {
     }
 }
 
-impl std::fmt::Display for Walker {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut vec: Vec<_> = self.messages.iter().collect();
-        vec.sort_by(|a, b| a.0.cmp(b.0));
-        for (_, msg) in vec {
+impl Walker {
+    /// Render the extracted messages as .po text, in extraction order, skipping
+    /// any key in `exclude` (used by `-j` to drop msgids already present in the
+    /// existing file).
+    fn render(&self, exclude: &std::collections::HashSet<MessageKey>) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        for key in &self.order {
+            if exclude.contains(key) {
+                continue;
+            }
+            let msg = &self.messages[key];
+
             // Write location comments
             for line in &msg.locations {
-                writeln!(f, "#: {}", line)?;
+                let _ = writeln!(out, "#: {}", line);
             }
 
             // Write msgctxt if present
             if let Some(ref ctx) = msg.msgctxt {
-                writeln!(f, "msgctxt {}", Self::escape(ctx))?;
+                let _ = writeln!(out, "msgctxt {}", Self::escape(ctx));
             }
 
             // Write msgid
-            writeln!(f, "msgid {}", Self::escape(&msg.msgid))?;
+            let _ = writeln!(out, "msgid {}", Self::escape(&msg.msgid));
 
             // Write msgid_plural and msgstr[n] if plural form
             if let Some(ref plural) = msg.msgid_plural {
-                writeln!(f, "msgid_plural {}", Self::escape(plural))?;
-                writeln!(f, "msgstr[0] \"\"")?;
-                writeln!(f, "msgstr[1] \"\"")?;
+                let _ = writeln!(out, "msgid_plural {}", Self::escape(plural));
+                let _ = writeln!(out, "msgstr[0] \"\"");
+                let _ = writeln!(out, "msgstr[1] \"\"");
             } else {
-                writeln!(f, "msgstr \"\"")?;
+                let _ = writeln!(out, "msgstr \"\"");
             }
 
-            writeln!(f)?;
+            let _ = writeln!(out);
         }
-        Ok(())
+        out
+    }
+}
+
+impl std::fmt::Display for Walker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.render(&std::collections::HashSet::new()))
     }
 }
 
@@ -985,7 +1042,17 @@ fn unescape_pot_string(s: &str) -> String {
     result
 }
 
-/// Parse a .pot file and extract msgid strings for exclusion
+/// Unescape a quoted `"..."` PO string value, or `None` if not so quoted.
+fn unquote_po_value(rest: &str) -> Option<String> {
+    let value = rest.trim();
+    if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
+        Some(unescape_pot_string(&value[1..value.len() - 1]))
+    } else {
+        None
+    }
+}
+
+/// Parse a .po file and extract msgid strings for exclusion
 fn parse_exclude_file(path: &PathBuf) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let content = read_to_string(path)?;
     let mut msgids = Vec::new();
@@ -993,10 +1060,7 @@ fn parse_exclude_file(path: &PathBuf) -> Result<Vec<String>, Box<dyn std::error:
     for line in content.lines() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix("msgid ") {
-            // Extract the string value
-            let value = rest.trim();
-            if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
-                let unescaped = unescape_pot_string(&value[1..value.len() - 1]);
+            if let Some(unescaped) = unquote_po_value(rest) {
                 if !unescaped.is_empty() {
                     msgids.push(unescaped);
                 }
@@ -1007,13 +1071,70 @@ fn parse_exclude_file(path: &PathBuf) -> Result<Vec<String>, Box<dyn std::error:
     Ok(msgids)
 }
 
-/// Parse existing .pot file for -j (join) option
+/// Parse existing .po file for the -j (join) option.
 fn parse_existing_pot(path: &PathBuf) -> Result<String, Box<dyn std::error::Error>> {
     if path.exists() {
         Ok(read_to_string(path)?)
     } else {
         Ok(String::new())
     }
+}
+
+/// Collect the (msgctxt, msgid) keys already present in an existing .po file, so
+/// `-j` can omit newly extracted duplicates.
+fn parse_existing_keys(content: &str) -> std::collections::HashSet<MessageKey> {
+    // The field whose value the current run of quoted continuation lines extends.
+    enum Field {
+        Ctxt,
+        Id,
+    }
+
+    let mut keys = std::collections::HashSet::new();
+    let mut pending_ctxt: Option<String> = None;
+    let mut cur: Option<Field> = None;
+    let mut buf = String::new();
+
+    for line in content.lines() {
+        let line = line.trim();
+
+        // A bare quoted string continues the multi-line value of the open field.
+        if cur.is_some() && line.starts_with('"') {
+            if let Some(v) = unquote_po_value(line) {
+                buf.push_str(&v);
+            }
+            continue;
+        }
+
+        // Any other line closes the open field; commit its accumulated value.
+        match cur.take() {
+            Some(Field::Ctxt) => pending_ctxt = Some(std::mem::take(&mut buf)),
+            Some(Field::Id) => {
+                keys.insert(MessageKey {
+                    msgctxt: pending_ctxt.take(),
+                    msgid: std::mem::take(&mut buf),
+                });
+            }
+            None => {}
+        }
+
+        if let Some(rest) = line.strip_prefix("msgctxt ") {
+            buf = unquote_po_value(rest).unwrap_or_default();
+            cur = Some(Field::Ctxt);
+        } else if let Some(rest) = line.strip_prefix("msgid ") {
+            buf = unquote_po_value(rest).unwrap_or_default();
+            cur = Some(Field::Id);
+        }
+    }
+
+    // Commit a field left open at end of input.
+    if let Some(Field::Id) = cur {
+        keys.insert(MessageKey {
+            msgctxt: pending_ctxt.take(),
+            msgid: buf,
+        });
+    }
+
+    keys
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -1062,27 +1183,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        match path.extension().and_then(OsStr::to_str) {
-            Some("rs") => {
-                let content = read_to_string(path)?;
-                walker.process_rust_file(content, path_str)?;
-            }
-            Some("c") | Some("h") => {
-                let file = File::open(path)?;
-                let mut reader = BufReader::new(file);
-                let mut content = Vec::new();
-                reader.read_to_end(&mut content)?;
-                if let Err(e) = walker.process_c_file(&content, path_str, &mut streams) {
-                    eprintln!("xgettext: {}", e);
-                    exit(1);
-                }
-            }
-            _ => {
-                eprintln!(
-                    "xgettext: {}: {}",
-                    path_str,
-                    gettext("unsupported file type")
-                );
+        // `.rs` operands are parsed with the Rust grammar (a posixutils
+        // extension beyond the spec's "C-language source files", used for this
+        // project's own build tooling). Every other operand — including files
+        // with no extension — is treated as C source, since the spec restricts
+        // operands by content, not by file-name extension.
+        if path.extension().and_then(OsStr::to_str) == Some("rs") {
+            let content = read_to_string(path)?;
+            walker.process_rust_file(content, path_str)?;
+        } else {
+            let file = File::open(path)?;
+            let mut reader = BufReader::new(file);
+            let mut content = Vec::new();
+            reader.read_to_end(&mut content)?;
+            if let Err(e) = walker.process_c_file(&content, path_str, &mut streams) {
+                eprintln!("xgettext: {}", e);
                 exit(1);
             }
         }
@@ -1090,23 +1205,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     walker.sort();
 
+    // POSIX: the default output file is `messages.po` (or `default-domain.po`).
     let output_path = args
         .pathname
         .unwrap_or_else(|| current_dir().unwrap())
-        .join(format!("{}.pot", args.default_domain));
+        .join(format!("{}.po", args.default_domain));
 
-    // Handle -j (join) option
+    // Handle -j (join): keep the existing file's content and drop any newly
+    // extracted msgid that already appears there (duplicates are omitted).
     let existing_content = if args.join {
         parse_existing_pot(&output_path)?
     } else {
         String::new()
     };
+    let exclude_keys = if args.join {
+        parse_existing_keys(&existing_content)
+    } else {
+        std::collections::HashSet::new()
+    };
 
-    let new_content = format!("{}", walker);
+    let new_content = walker.render(&exclude_keys);
 
     let final_content = if args.join && !existing_content.is_empty() {
-        // Simple join: prepend existing content
-        // A more sophisticated implementation would merge and deduplicate
         format!("{}{}", existing_content, new_content)
     } else {
         new_content
@@ -1125,6 +1245,32 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     // KeywordSpec parsing tests
+    #[test]
+    fn test_defaults_include_l_variants() {
+        // XG-6: the `_l` (per-locale) keyword variants are recognized.
+        let names: Vec<String> = KeywordSpec::defaults()
+            .into_iter()
+            .map(|k| k.name)
+            .collect();
+        for expected in [
+            "gettext_l",
+            "ngettext_l",
+            "dgettext_l",
+            "dngettext_l",
+            "dcgettext_l",
+            "dcngettext_l",
+        ] {
+            assert!(names.contains(&expected.to_string()), "missing {expected}");
+        }
+        // An `_l` variant mirrors its base form's msgid position.
+        let ng_l = KeywordSpec::defaults()
+            .into_iter()
+            .find(|k| k.name == "ngettext_l")
+            .unwrap();
+        assert_eq!(ng_l.msgid_arg, 1);
+        assert_eq!(ng_l.msgid_plural_arg, Some(2));
+    }
+
     #[test]
     fn test_keyword_spec_simple() {
         let spec = KeywordSpec::parse("gettext").unwrap();

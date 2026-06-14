@@ -106,6 +106,29 @@ impl MessageLookup {
         "C".to_string()
     }
 
+    /// The ordered list of locales to try for a lookup. When `LANGUAGE` (XSI)
+    /// is set and the effective locale is not the C/POSIX locale, its
+    /// colon-separated entries take priority, with the effective locale last.
+    fn locales_to_try() -> Vec<String> {
+        let primary = Self::get_current_locale();
+        if primary != "C" && primary != "POSIX" {
+            if let Ok(languages) = env::var("LANGUAGE") {
+                if !languages.is_empty() {
+                    let mut list: Vec<String> = languages
+                        .split(':')
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                        .collect();
+                    if !list.contains(&primary) {
+                        list.push(primary);
+                    }
+                    return list;
+                }
+            }
+        }
+        vec![primary]
+    }
+
     /// Get the text domain from environment or default
     pub fn get_text_domain() -> String {
         env::var("TEXTDOMAIN").unwrap_or_else(|_| "messages".to_string())
@@ -181,6 +204,22 @@ impl MessageLookup {
     fn find_mo_file(&self, domain: &str, locale: &str) -> Option<PathBuf> {
         let variants = Self::get_locale_variants(locale);
 
+        // NLSPATH (XSI) is a colon-separated list of file-path templates and
+        // takes precedence over TEXTDOMAINDIR / the default directories.
+        if let Ok(nlspath) = env::var("NLSPATH") {
+            if !nlspath.is_empty() {
+                for template in nlspath.split(':').filter(|t| !t.is_empty()) {
+                    for variant in &variants {
+                        let path =
+                            PathBuf::from(expand_nlspath_template(template, domain, variant));
+                        if path.exists() {
+                            return Some(path);
+                        }
+                    }
+                }
+            }
+        }
+
         for base_path in &self.search_paths {
             for variant in &variants {
                 // Standard path: {base}/{locale}/LC_MESSAGES/{domain}.mo
@@ -231,46 +270,49 @@ impl MessageLookup {
         None
     }
 
-    /// Look up a message
-    pub fn gettext(&mut self, domain: &str, msgid: &str) -> Option<&str> {
-        let locale = Self::get_current_locale();
-
-        if let Some(catalog) = self.load_catalog(domain, &locale) {
-            catalog.gettext(msgid)
-        } else {
-            None
+    /// Look up a message, trying each locale (LANGUAGE priority list) in turn.
+    pub fn gettext(&mut self, domain: &str, msgid: &str) -> Option<String> {
+        for locale in Self::locales_to_try() {
+            if let Some(catalog) = self.load_catalog(domain, &locale) {
+                if let Some(t) = catalog.gettext(msgid) {
+                    return Some(t.to_string());
+                }
+            }
         }
+        None
     }
 
-    /// Look up a message with context
-    pub fn pgettext(&mut self, domain: &str, msgctxt: &str, msgid: &str) -> Option<&str> {
-        let locale = Self::get_current_locale();
-
-        if let Some(catalog) = self.load_catalog(domain, &locale) {
-            catalog.pgettext(msgctxt, msgid)
-        } else {
-            None
+    /// Look up a message with context.
+    pub fn pgettext(&mut self, domain: &str, msgctxt: &str, msgid: &str) -> Option<String> {
+        for locale in Self::locales_to_try() {
+            if let Some(catalog) = self.load_catalog(domain, &locale) {
+                if let Some(t) = catalog.pgettext(msgctxt, msgid) {
+                    return Some(t.to_string());
+                }
+            }
         }
+        None
     }
 
-    /// Look up a plural message
+    /// Look up a plural message.
     pub fn ngettext(
         &mut self,
         domain: &str,
         msgid: &str,
         msgid_plural: &str,
         n: u64,
-    ) -> Option<&str> {
-        let locale = Self::get_current_locale();
-
-        if let Some(catalog) = self.load_catalog(domain, &locale) {
-            catalog.ngettext(msgid, msgid_plural, n)
-        } else {
-            None
+    ) -> Option<String> {
+        for locale in Self::locales_to_try() {
+            if let Some(catalog) = self.load_catalog(domain, &locale) {
+                if let Some(t) = catalog.ngettext(msgid, msgid_plural, n) {
+                    return Some(t.to_string());
+                }
+            }
         }
+        None
     }
 
-    /// Look up a plural message with context
+    /// Look up a plural message with context.
     pub fn npgettext(
         &mut self,
         domain: &str,
@@ -278,15 +320,56 @@ impl MessageLookup {
         msgid: &str,
         msgid_plural: &str,
         n: u64,
-    ) -> Option<&str> {
-        let locale = Self::get_current_locale();
+    ) -> Option<String> {
+        for locale in Self::locales_to_try() {
+            if let Some(catalog) = self.load_catalog(domain, &locale) {
+                if let Some(t) = catalog.npgettext(msgctxt, msgid, msgid_plural, n) {
+                    return Some(t.to_string());
+                }
+            }
+        }
+        None
+    }
+}
 
-        if let Some(catalog) = self.load_catalog(domain, &locale) {
-            catalog.npgettext(msgctxt, msgid, msgid_plural, n)
-        } else {
-            None
+/// Expand an `NLSPATH` template, substituting `%N` (domain), `%L` (locale),
+/// `%l` (language), `%t` (territory), `%c` (codeset), and `%%` (a literal `%`).
+fn expand_nlspath_template(template: &str, domain: &str, locale: &str) -> String {
+    let (base, _modifier) = match locale.split_once('@') {
+        Some((b, m)) => (b, Some(m)),
+        None => (locale, None),
+    };
+    let (lang_terr, codeset) = match base.split_once('.') {
+        Some((lt, c)) => (lt, Some(c)),
+        None => (base, None),
+    };
+    let (language, territory) = match lang_terr.split_once('_') {
+        Some((l, t)) => (l, Some(t)),
+        None => (lang_terr, None),
+    };
+
+    let mut out = String::with_capacity(template.len());
+    let mut chars = template.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('N') => out.push_str(domain),
+            Some('L') => out.push_str(locale),
+            Some('l') => out.push_str(language),
+            Some('t') => out.push_str(territory.unwrap_or("")),
+            Some('c') => out.push_str(codeset.unwrap_or("")),
+            Some('%') => out.push('%'),
+            Some(other) => {
+                out.push('%');
+                out.push(other);
+            }
+            None => out.push('%'),
         }
     }
+    out
 }
 
 impl Default for MessageLookup {
@@ -335,46 +418,42 @@ pub fn expand_escapes(s: &str) -> String {
                     chars.next();
                     result.push('\x0b'); // vertical tab
                 }
-                Some('0') => {
-                    // Octal escape
-                    chars.next();
-                    let mut value = 0u8;
+                // Octal escape: \N, \NN, or \NNN (no leading zero required). A
+                // value of 0 (e.g. `\0`) produces a NUL, not nothing.
+                Some(&d) if ('0'..='7').contains(&d) => {
+                    let mut value: u16 = 0;
                     for _ in 0..3 {
                         match chars.peek() {
-                            Some(d @ '0'..='7') => {
-                                value = value * 8 + (*d as u8 - b'0');
+                            Some(&c) if ('0'..='7').contains(&c) => {
+                                value = value * 8 + (c as u16 - '0' as u16);
                                 chars.next();
                             }
                             _ => break,
                         }
                     }
-                    if value != 0 {
-                        result.push(value as char);
-                    }
+                    result.push(char::from(value as u8));
                 }
                 Some('x') => {
-                    // Hex escape
+                    // Hex escape: \xh or \xhh. \x00 produces a NUL.
                     chars.next();
                     let mut value = 0u8;
-                    for _ in 0..2 {
+                    let mut digits = 0;
+                    while digits < 2 {
                         match chars.peek() {
-                            Some(d @ '0'..='9') => {
-                                value = value * 16 + (*d as u8 - b'0');
+                            Some(&c) if c.is_ascii_hexdigit() => {
+                                value = value * 16 + c.to_digit(16).unwrap() as u8;
                                 chars.next();
-                            }
-                            Some(d @ 'a'..='f') => {
-                                value = value * 16 + (*d as u8 - b'a' + 10);
-                                chars.next();
-                            }
-                            Some(d @ 'A'..='F') => {
-                                value = value * 16 + (*d as u8 - b'A' + 10);
-                                chars.next();
+                                digits += 1;
                             }
                             _ => break,
                         }
                     }
-                    if value != 0 {
-                        result.push(value as char);
+                    if digits > 0 {
+                        result.push(char::from(value));
+                    } else {
+                        // Not a valid hex escape; keep the literal characters.
+                        result.push('\\');
+                        result.push('x');
                     }
                 }
                 Some('c') => {
@@ -428,6 +507,14 @@ mod tests {
     fn test_expand_escapes_hex() {
         assert_eq!(expand_escapes("\\x41"), "A");
         assert_eq!(expand_escapes("\\x61"), "a");
+    }
+
+    #[test]
+    fn test_expand_escapes_octal_without_leading_zero() {
+        // GT-8: \NNN octal does not require a leading zero; \101 == 'A'.
+        assert_eq!(expand_escapes("\\101\\102"), "AB");
+        assert_eq!(expand_escapes("\\0"), "\u{0}");
+        assert_eq!(expand_escapes("\\x00"), "\u{0}");
     }
 
     #[test]

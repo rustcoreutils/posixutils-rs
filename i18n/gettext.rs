@@ -29,10 +29,13 @@ struct Args {
     #[arg(short = 'd', long = "domain", help = gettext("Use TEXTDOMAIN as the text domain for translating MSGID"))]
     domain: Option<String>,
 
-    #[arg(short = 'e', help = gettext("Enable interpretation of some escape sequences"))]
+    #[arg(short = 'e', help = gettext("Process C-language escape sequences in MSGID"))]
     expand_escapes: bool,
 
-    #[arg(short = 'n', help = gettext("Suppress trailing newline"))]
+    #[arg(short = 'E', conflicts_with = "expand_escapes", help = gettext("Do not process C-language escape sequences in MSGID"))]
+    no_expand_escapes: bool,
+
+    #[arg(short = 'n', help = gettext("Do not append a trailing newline (with -s)"))]
     no_newline: bool,
 
     #[arg(short = 's', help = gettext("Behave like echo command (interpret multiple MSGIDs)"))]
@@ -64,78 +67,75 @@ fn main() {
         return;
     }
 
-    // Parse positional arguments to determine domain and msgid
-    let (domain, msgids) = match args.args.len() {
+    // Non-`-s` form: `[textdomain] msgid` (exactly one msgid).
+    let (operand_domain, msgid): (Option<&str>, &str) = match args.args.len() {
         0 => {
-            eprintln!("gettext: missing arguments");
+            eprintln!("{}", gettext("gettext: missing message"));
             exit(1);
         }
-        1 => {
-            // Single argument: use TEXTDOMAIN env var or -d option
-            let domain = args
-                .domain
-                .clone()
-                .or_else(|| std::env::var("TEXTDOMAIN").ok())
-                .unwrap_or_else(|| "messages".to_string());
-            (domain, vec![args.args[0].clone()])
-        }
+        1 => (None, &args.args[0]),
+        2 => (Some(args.args[0].as_str()), &args.args[1]),
         _ => {
-            // Two or more arguments: first is domain, rest are msgids
-            // Unless -d was specified, then all are msgids
-            if args.domain.is_some() {
-                (args.domain.clone().unwrap(), args.args.clone())
-            } else {
-                (args.args[0].clone(), args.args[1..].to_vec())
-            }
+            eprintln!("{}", gettext("gettext: too many arguments"));
+            exit(1);
         }
     };
 
-    // Look up and print the message(s)
-    let mut lookup = MessageLookup::new();
+    let domain = resolve_domain(operand_domain, &args.domain);
+    // Escapes (if any) are applied to the operand, which is both the lookup key
+    // and the fallback when the catalog has no entry.
+    let key = if args.expand_escapes {
+        expand_escapes(msgid)
+    } else {
+        msgid.to_string()
+    };
 
-    for (i, msgid) in msgids.iter().enumerate() {
-        let translated = lookup
-            .gettext(&domain, msgid)
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| msgid.clone());
+    // A NULL text domain (none of operand/-d/TEXTDOMAIN) returns the msgid
+    // directly, with no catalog lookup.
+    let output = match domain {
+        Some(domain) => MessageLookup::new()
+            .gettext(&domain, &key)
+            .unwrap_or_else(|| key.clone()),
+        None => key,
+    };
 
-        let output = if args.expand_escapes {
-            expand_escapes(&translated)
-        } else {
-            translated
-        };
-
-        if i > 0 {
-            print!(" ");
-        }
-        print!("{}", output);
-    }
-
-    if !args.no_newline {
-        println!();
-    }
+    // The non-`-s` form does not append a trailing newline.
+    print!("{}", output);
 }
 
-/// Shell mode: behave like echo, translating each argument
-fn shell_mode(args: &Args) {
-    let domain = args
-        .domain
-        .clone()
-        .or_else(|| std::env::var("TEXTDOMAIN").ok())
-        .unwrap_or_else(|| "messages".to_string());
+/// Resolve the text domain, in decreasing precedence: the operand `textdomain`,
+/// the `-d` option, then the `TEXTDOMAIN` environment variable. Returns `None`
+/// (a NULL text domain) when none is available.
+fn resolve_domain(operand: Option<&str>, opt_domain: &Option<String>) -> Option<String> {
+    if let Some(d) = operand {
+        if !d.is_empty() {
+            return Some(d.to_string());
+        }
+    }
+    if let Some(d) = opt_domain {
+        if !d.is_empty() {
+            return Some(d.clone());
+        }
+    }
+    std::env::var("TEXTDOMAIN").ok().filter(|d| !d.is_empty())
+}
 
+/// Shell mode (`-s`): translate each msgid operand and write them separated by a
+/// single space, appending a newline unless `-n` is given.
+fn shell_mode(args: &Args) {
+    let domain = resolve_domain(None, &args.domain);
     let mut lookup = MessageLookup::new();
 
     for (i, msgid) in args.args.iter().enumerate() {
-        let translated = lookup
-            .gettext(&domain, msgid)
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| msgid.clone());
-
-        let output = if args.expand_escapes {
-            expand_escapes(&translated)
+        // With -s the default is -E (no escape processing) unless -e is given.
+        let key = if args.expand_escapes {
+            expand_escapes(msgid)
         } else {
-            translated
+            msgid.clone()
+        };
+        let output = match &domain {
+            Some(domain) => lookup.gettext(domain, &key).unwrap_or_else(|| key.clone()),
+            None => key,
         };
 
         if i > 0 {

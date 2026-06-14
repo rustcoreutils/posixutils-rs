@@ -51,7 +51,7 @@ fn test_xgettext_no_arg() {
 
 #[test]
 fn test_xgettext() {
-    let output_file = "messages.pot";
+    let output_file = "messages.po";
     xgettext_test(
         &["tests/xgettext/test_gettext.rs"],
         output_file,
@@ -62,7 +62,7 @@ fn test_xgettext() {
 
 #[test]
 fn test_xgettext_domain() {
-    let output_file = "domain.pot";
+    let output_file = "domain.po";
     xgettext_test(
         &["-d", "domain", "tests/xgettext/test_gettext.rs"],
         output_file,
@@ -80,7 +80,7 @@ fn test_xgettext_pathname() {
             temp_dir.path().to_str().unwrap(),
             "tests/xgettext/test_gettext.rs",
         ],
-        temp_dir.path().join("messages.pot"),
+        temp_dir.path().join("messages.po"),
         "tests/xgettext/test_gettext_no_lines.pot",
     );
 }
@@ -96,7 +96,7 @@ fn test_xgettext_domain_pathname() {
             temp_dir.path().to_str().unwrap(),
             "tests/xgettext/test_gettext.rs",
         ],
-        temp_dir.path().join("domain.pot"),
+        temp_dir.path().join("domain.po"),
         "tests/xgettext/test_gettext_no_lines.pot",
     );
 }
@@ -111,7 +111,7 @@ fn test_xgettext_pathname_lines() {
             temp_dir.path().to_str().unwrap(),
             "tests/xgettext/test_gettext.rs",
         ],
-        temp_dir.path().join("messages.pot"),
+        temp_dir.path().join("messages.po"),
         "tests/xgettext/test_gettext.pot",
     );
 }
@@ -126,8 +126,25 @@ fn test_clap() {
             temp_dir.path().to_str().unwrap(),
             "tests/xgettext/test_clap.rs",
         ],
-        temp_dir.path().join("messages.pot"),
+        temp_dir.path().join("messages.po"),
         "tests/xgettext/test_clap.pot",
+    );
+}
+
+/// XG-5: an operand with no file-name extension is treated as C source (the
+/// spec restricts operands by content, not extension), not rejected.
+#[test]
+fn test_xgettext_no_extension_operand() {
+    let temp_dir = tempdir().expect("Unable to create temporary directory");
+    xgettext_test(
+        &[
+            "-n",
+            "-p",
+            temp_dir.path().to_str().unwrap(),
+            "tests/xgettext/test_c_noext",
+        ],
+        temp_dir.path().join("messages.po"),
+        "tests/xgettext/test_c_noext.pot",
     );
 }
 
@@ -141,7 +158,7 @@ fn test_xgettext_ngettext() {
             temp_dir.path().to_str().unwrap(),
             "tests/xgettext/test_ngettext.rs",
         ],
-        temp_dir.path().join("messages.pot"),
+        temp_dir.path().join("messages.po"),
         "tests/xgettext/test_ngettext.pot",
     );
 }
@@ -156,7 +173,7 @@ fn test_xgettext_pgettext() {
             temp_dir.path().to_str().unwrap(),
             "tests/xgettext/test_pgettext.rs",
         ],
-        temp_dir.path().join("messages.pot"),
+        temp_dir.path().join("messages.po"),
         "tests/xgettext/test_pgettext.pot",
     );
 }
@@ -171,7 +188,7 @@ fn test_xgettext_npgettext() {
             temp_dir.path().to_str().unwrap(),
             "tests/xgettext/test_npgettext.rs",
         ],
-        temp_dir.path().join("messages.pot"),
+        temp_dir.path().join("messages.po"),
         "tests/xgettext/test_npgettext.pot",
     );
 }
@@ -186,7 +203,7 @@ fn test_xgettext_c_file() {
             temp_dir.path().to_str().unwrap(),
             "tests/xgettext/test_c.c",
         ],
-        temp_dir.path().join("messages.pot"),
+        temp_dir.path().join("messages.po"),
         "tests/xgettext/test_c.pot",
     );
 }

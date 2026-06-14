@@ -54,6 +54,9 @@ pub struct PoEntry {
     pub is_fuzzy: bool,
     /// Whether this entry is obsolete (#~ ...)
     pub is_obsolete: bool,
+    /// The domain this entry belongs to, set by a preceding `domain` directive.
+    /// `None` means the default domain (`messages`).
+    pub domain: Option<String>,
 }
 
 impl PoEntry {
@@ -118,12 +121,24 @@ impl From<std::io::Error> for PoError {
     }
 }
 
+/// Does a line start the `domain domainname` directive (rather than, e.g., a
+/// `msgid` that merely begins with "domain")?
+fn is_domain_directive(line: &str) -> bool {
+    if let Some(rest) = line.strip_prefix("domain") {
+        rest.is_empty() || rest.starts_with([' ', '\t', '"'])
+    } else {
+        false
+    }
+}
+
 /// Parser for .po files
 pub struct PoParser<R> {
     reader: BufReader<R>,
     line_number: usize,
     current_line: String,
     peeked: Option<String>,
+    /// Domain set by the most recent `domain` directive (`None` = default).
+    current_domain: Option<String>,
 }
 
 impl<R: Read> PoParser<R> {
@@ -134,6 +149,7 @@ impl<R: Read> PoParser<R> {
             line_number: 0,
             current_line: String::new(),
             peeked: None,
+            current_domain: None,
         }
     }
 
@@ -142,14 +158,31 @@ impl<R: Read> PoParser<R> {
         let mut po_file = PoFile::default();
 
         while let Some(entry) = self.parse_entry()? {
-            if entry.is_header() {
-                po_file.header = Some(entry);
-            } else {
-                po_file.entries.push(entry);
+            // Keep header entries in the entry list (tagged with their domain so
+            // each domain's header is emitted) while also exposing the first one
+            // via `header` for charset()/plural_forms().
+            if entry.is_header() && po_file.header.is_none() {
+                po_file.header = Some(entry.clone());
             }
+            po_file.entries.push(entry);
         }
 
         Ok(po_file)
+    }
+
+    /// Parse the domain name from a `domain` directive line.
+    fn parse_domain_name(&mut self, line: &str) -> Result<String, PoError> {
+        let rest = line["domain".len()..].trim();
+        if rest.starts_with('"') {
+            self.parse_quoted_string(rest)
+        } else if rest.is_empty() {
+            Err(PoError::Parse(
+                self.line_number,
+                "expected domain name".to_string(),
+            ))
+        } else {
+            Ok(rest.to_string())
+        }
     }
 
     /// Read the next line, handling the peeked line
@@ -201,10 +234,12 @@ impl<R: Read> PoParser<R> {
 
             if let Some(rest) = line.strip_prefix('#') {
                 self.parse_comment(&mut entry, rest);
-            } else if line.starts_with("msgctxt")
-                || line.starts_with("msgid")
-                || line.starts_with("domain")
-            {
+            } else if is_domain_directive(&line) {
+                // A `domain` directive opens a new section: record the domain
+                // for the entries that follow.
+                self.current_domain = Some(self.parse_domain_name(&line)?);
+                continue;
+            } else if line.starts_with("msgctxt") || line.starts_with("msgid") {
                 self.unread_line(line);
                 break;
             } else {
@@ -219,6 +254,12 @@ impl<R: Read> PoParser<R> {
                 break;
             }
 
+            // A `domain` directive ends this entry and opens a new section; leave
+            // it unread so the next entry picks it up.
+            if is_domain_directive(line) {
+                break;
+            }
+
             // Check if this is the start of a new entry
             if line.starts_with('#')
                 && !entry.msgid.is_empty()
@@ -229,10 +270,7 @@ impl<R: Read> PoParser<R> {
 
             let line = self.next_line()?.unwrap();
 
-            if line.starts_with("domain ") {
-                // Domain directive - skip for now
-                continue;
-            } else if let Some(rest) = line.strip_prefix('#') {
+            if let Some(rest) = line.strip_prefix('#') {
                 self.parse_comment(&mut entry, rest);
             } else if let Some(rest) = line.strip_prefix("msgctxt") {
                 entry.msgctxt = Some(self.parse_string_value(rest)?);
@@ -272,6 +310,9 @@ impl<R: Read> PoParser<R> {
         if entry.msgstr.is_empty() {
             entry.msgstr.push(String::new());
         }
+
+        // Tag with the domain in effect when this entry was parsed.
+        entry.domain = self.current_domain.clone();
 
         Ok(Some(entry))
     }
@@ -370,11 +411,46 @@ impl<R: Read> PoParser<R> {
                         Some('r') => result.push('\r'),
                         Some('\\') => result.push('\\'),
                         Some('"') => result.push('"'),
-                        Some('0') => result.push('\0'),
+                        Some('a') => result.push('\u{07}'),
+                        Some('b') => result.push('\u{08}'),
+                        Some('f') => result.push('\u{0C}'),
+                        Some('v') => result.push('\u{0B}'),
+                        // Octal escape: \o, \oo, or \ooo (this digit included).
+                        Some(d @ '0'..='7') => {
+                            let mut value = d.to_digit(8).unwrap();
+                            for _ in 0..2 {
+                                match chars.peek() {
+                                    Some(&c) if c.is_digit(8) => {
+                                        value = value * 8 + c.to_digit(8).unwrap();
+                                        chars.next();
+                                    }
+                                    _ => break,
+                                }
+                            }
+                            result.push(char::from(value as u8));
+                        }
+                        // Hex escape: \xh or \xhh.
+                        Some('x') => {
+                            let mut value: u32 = 0;
+                            let mut digits = 0;
+                            while digits < 2 {
+                                match chars.peek() {
+                                    Some(&c) if c.is_ascii_hexdigit() => {
+                                        value = value * 16 + c.to_digit(16).unwrap();
+                                        chars.next();
+                                        digits += 1;
+                                    }
+                                    _ => break,
+                                }
+                            }
+                            if digits == 0 {
+                                return Err(PoError::InvalidEscape(self.line_number, 'x'));
+                            }
+                            result.push(char::from(value as u8));
+                        }
                         Some(c) => {
-                            // Unknown escape - keep as-is
-                            result.push('\\');
-                            result.push(c);
+                            // Unknown escape sequence is an error.
+                            return Err(PoError::InvalidEscape(self.line_number, c));
                         }
                     }
                 }
@@ -417,7 +493,8 @@ impl PoFile {
         parser.parse()
     }
 
-    /// Get the charset from the header
+    /// Get the charset from the header, accepting both the `Content-Type:
+    /// ...; charset=...` form and the bare `charset=...` header line.
     pub fn charset(&self) -> Option<&str> {
         self.header.as_ref().and_then(|h| {
             h.msgstr.first().and_then(|s| {
@@ -428,6 +505,8 @@ impl PoFile {
                                 return Some(charset.trim());
                             }
                         }
+                    } else if let Some(charset) = line.trim().strip_prefix("charset=") {
+                        return Some(charset.trim());
                     }
                 }
                 None
@@ -562,6 +641,53 @@ msgstr "Linea1\nLinea2\tTabulado"
         let po = PoFile::parse(input).unwrap();
         assert_eq!(po.entries[0].msgid, "Line1\nLine2\tTabbed");
         assert_eq!(po.entries[0].msgstr[0], "Linea1\nLinea2\tTabulado");
+    }
+
+    #[test]
+    fn test_parse_domain_directive() {
+        let input = r#"
+msgid "Hello"
+msgstr "Hola"
+
+domain "other"
+
+msgid "Bye"
+msgstr "Adios"
+"#;
+        let po = PoFile::parse(input).unwrap();
+        assert_eq!(po.entries.len(), 2);
+        // First entry is in the default domain; second in "other".
+        let hello = po.entries.iter().find(|e| e.msgid == "Hello").unwrap();
+        let bye = po.entries.iter().find(|e| e.msgid == "Bye").unwrap();
+        assert_eq!(hello.domain, None);
+        assert_eq!(bye.domain, Some("other".to_string()));
+    }
+
+    #[test]
+    fn test_escape_octal_hex_and_control() {
+        // \a \b \f \v controls, \101 octal ('A'), \x42 hex ('B').
+        let input = "msgid \"x\"\nmsgstr \"\\a\\b\\f\\v\\101\\x42\"\n";
+        let po = PoFile::parse(input).unwrap();
+        assert_eq!(
+            po.entries[0].msgstr[0],
+            "\u{07}\u{08}\u{0C}\u{0B}AB".to_string()
+        );
+    }
+
+    #[test]
+    fn test_unknown_escape_is_error() {
+        let input = "msgid \"x\"\nmsgstr \"a\\qb\"\n";
+        assert!(matches!(
+            PoFile::parse(input),
+            Err(PoError::InvalidEscape(_, 'q'))
+        ));
+    }
+
+    #[test]
+    fn test_bare_charset_header() {
+        let input = "msgid \"\"\nmsgstr \"\"\n\"charset=UTF-8\\n\"\n";
+        let po = PoFile::parse(input).unwrap();
+        assert_eq!(po.charset(), Some("UTF-8"));
     }
 
     #[test]

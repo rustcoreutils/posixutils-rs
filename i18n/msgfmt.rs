@@ -55,7 +55,7 @@ struct Args {
     #[arg(short = 'V', long, action = clap::ArgAction::Version, help = gettext("Print version"))]
     version: Option<bool>,
 
-    #[arg(required = true, help = gettext("Input .po files"))]
+    #[arg(help = gettext("Input .po files"))]
     files: Vec<PathBuf>,
 }
 
@@ -93,10 +93,28 @@ fn main() {
 
     let args = Args::parse();
 
+    // POSIX: at least one pathname operand is required, but report it as a
+    // usage diagnostic rather than a clap argument error.
+    if args.files.is_empty() {
+        eprintln!("{}", gettext("msgfmt: no input file given"));
+        exit(1);
+    }
+
+    // The spec's checks apply only when both -c and -v are given; with just one
+    // of them the behavior is unspecified, so we run no abnormality checks.
+    let run_checks = args.check && args.verbose;
+
     let mut exit_code = 0;
-    let mut all_messages: HashMap<String, String> = HashMap::new();
-    let mut header_entry: Option<String> = None;
+    // Messages accumulated per output domain. The default domain is "messages".
+    let mut domains: HashMap<String, HashMap<String, String>> = HashMap::new();
+    // Domains in first-seen order, for stable output.
+    let mut domain_order: Vec<String> = Vec::new();
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
+
+    // Statistics for -v output (header entries excluded).
+    let mut n_translated = 0usize;
+    let mut n_untranslated = 0usize;
+    let mut n_fuzzy = 0usize;
 
     // Process each input file
     for input_path in &args.files {
@@ -121,15 +139,20 @@ fn main() {
             }
         };
 
-        // Process header
-        if let Some(ref hdr) = po.header {
-            if !hdr.msgstr.is_empty() {
-                header_entry = Some(hdr.msgstr[0].clone());
-            }
-        }
-
-        // Process entries
+        // Process entries (headers are tagged per domain and flow through here
+        // as the empty-msgid entry).
         for entry in po.all_entries() {
+            // Tally translation statistics (excluding the header entry).
+            if !entry.is_header() {
+                if entry.is_fuzzy {
+                    n_fuzzy += 1;
+                } else if entry.msgstr.iter().all(|s| s.is_empty()) {
+                    n_untranslated += 1;
+                } else {
+                    n_translated += 1;
+                }
+            }
+
             // Skip fuzzy entries unless -f is specified
             if entry.is_fuzzy && !args.include_fuzzy {
                 if args.verbose {
@@ -148,10 +171,16 @@ fn main() {
                 continue;
             }
 
-            // Validation checks (-c)
-            if args.check {
+            // Abnormality checks (only when both -c and -v are given).
+            if run_checks {
                 validate_entry(&path, entry, &mut diagnostics);
             }
+
+            let domain = entry.domain.clone().unwrap_or_else(default_domain);
+            if !domains.contains_key(&domain) {
+                domain_order.push(domain.clone());
+            }
+            let messages = domains.entry(domain).or_default();
 
             // Add to messages
             if entry.is_plural() {
@@ -163,16 +192,11 @@ fn main() {
                 );
                 // Value is null-separated plural forms
                 let value = entry.msgstr.join("\0");
-                all_messages.insert(key, value);
+                messages.insert(key, value);
             } else if !entry.msgstr.is_empty() {
-                all_messages.insert(entry.msgid.clone(), entry.msgstr[0].clone());
+                messages.insert(entry.msgid.clone(), entry.msgstr[0].clone());
             }
         }
-    }
-
-    // Add header entry
-    if let Some(header) = header_entry {
-        all_messages.insert(String::new(), header);
     }
 
     // Print diagnostics
@@ -187,17 +211,73 @@ fn main() {
         exit_code = 1;
     }
 
+    // -v: print translation statistics.
+    if args.verbose {
+        print_statistics(n_translated, n_fuzzy, n_untranslated);
+    }
+
     // Generate output
     if exit_code == 0 || !args.check {
-        let output_path = get_output_path(&args);
-
-        if let Err(e) = write_mo_file(&output_path, &all_messages) {
-            eprintln!("msgfmt: {}: {}", output_path.display(), e);
-            exit_code = 1;
+        if let Some(ref output) = args.output {
+            // -o: all `domain` directives are ignored; everything is written to
+            // the single named output file.
+            let mut merged: HashMap<String, String> = HashMap::new();
+            for domain in &domain_order {
+                if let Some(messages) = domains.get(domain) {
+                    for (k, v) in messages {
+                        merged.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            let output_path = apply_suffix(output.clone(), args.add_suffix);
+            if let Err(e) = write_mo_file(&output_path, &merged) {
+                eprintln!("msgfmt: {}: {}", output_path.display(), e);
+                exit_code = 1;
+            }
+        } else {
+            // One messages object file per domain, named after the domain.
+            for domain in &domain_order {
+                let messages = &domains[domain];
+                let output_path = domain_output_path(domain, args.add_suffix);
+                if let Err(e) = write_mo_file(&output_path, messages) {
+                    eprintln!("msgfmt: {}: {}", output_path.display(), e);
+                    exit_code = 1;
+                }
+            }
         }
     }
 
     exit(exit_code);
+}
+
+/// The default domain name when no `domain` directive applies.
+fn default_domain() -> String {
+    "messages".to_string()
+}
+
+/// Output path for a domain when `-o` is not given. POSIX leaves the choice of
+/// `domainname` vs `domainname.mo` implementation-defined when `-S` is absent;
+/// we use the bare domain name so that `-S` has an observable effect (it appends
+/// the `.mo` suffix).
+fn domain_output_path(domain: &str, add_suffix: bool) -> PathBuf {
+    apply_suffix(PathBuf::from(domain), add_suffix)
+}
+
+/// Append the `.mo` suffix to `path` when `-S` is set and it does not already
+/// end in `.mo`.
+fn apply_suffix(path: PathBuf, add_suffix: bool) -> PathBuf {
+    if !add_suffix {
+        return path;
+    }
+    // Pathnames are arbitrary bytes on Unix; operate on the raw OsString so a
+    // non-UTF-8 path is preserved exactly rather than mangled by lossy decoding.
+    use std::os::unix::ffi::OsStrExt;
+    if path.as_os_str().as_bytes().ends_with(b".mo") {
+        return path;
+    }
+    let mut os = path.into_os_string();
+    os.push(".mo");
+    PathBuf::from(os)
 }
 
 /// Find an input file, searching directories if needed
@@ -216,82 +296,94 @@ fn find_input_file(path: &PathBuf, directories: &[PathBuf]) -> PathBuf {
     path.clone()
 }
 
-/// Get the output file path
-fn get_output_path(args: &Args) -> PathBuf {
-    if let Some(ref output) = args.output {
-        return output.clone();
+/// Does the `c-format`/`no-c-format` flag set make this entry c-format? The
+/// last of the two flags to appear wins (POSIX/GNU semantics).
+fn is_c_format(flags: &[String]) -> bool {
+    let mut active = false;
+    for flag in flags {
+        match flag.as_str() {
+            "c-format" => active = true,
+            "no-c-format" => active = false,
+            _ => {}
+        }
     }
-
-    // Derive from first input file
-    let mut output = args.files[0].clone();
-    output.set_extension("mo");
-
-    if args.add_suffix && !output.to_string_lossy().ends_with(".mo") {
-        let name = output.to_string_lossy().to_string() + ".mo";
-        output = PathBuf::from(name);
-    }
-
-    output
+    active
 }
 
-/// Validate a PO entry
+/// True if exactly one of `a`/`b` starts with a newline, or exactly one ends
+/// with a newline (the abnormality the spec describes).
+fn boundary_newline_mismatch(a: &str, b: &str) -> bool {
+    (a.starts_with('\n') != b.starts_with('\n')) || (a.ends_with('\n') != b.ends_with('\n'))
+}
+
+/// Validate a PO entry, recording genuine abnormalities as errors (affecting the
+/// exit status) and softer findings as warnings. Only called when both -c and
+/// -v are given.
 fn validate_entry(
     path: &std::path::Path,
     entry: &posixutils_i18n::gettext_lib::po_file::PoEntry,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let file = path.display().to_string();
+    if entry.is_header() {
+        return;
+    }
 
-    // Check for mismatched newlines
-    let msgid_newlines = entry.msgid.matches('\n').count();
+    let is_plural = entry.is_plural();
+    let c_format = is_c_format(&entry.flags);
+
     for (i, msgstr) in entry.msgstr.iter().enumerate() {
-        let msgstr_newlines = msgstr.matches('\n').count();
-        if msgid_newlines != msgstr_newlines && !entry.msgid.is_empty() && !msgstr.is_empty() {
+        if msgstr.is_empty() {
+            continue;
+        }
+        // The source string corresponding to this msgstr: the plural form is
+        // compared against msgid_plural, the singular against msgid.
+        let source = if is_plural && i > 0 {
+            entry.msgid_plural.as_deref().unwrap_or(&entry.msgid)
+        } else {
+            &entry.msgid
+        };
+        let suffix = if entry.msgstr.len() > 1 {
+            format!("[{}]", i)
+        } else {
+            String::new()
+        };
+
+        // Abnormality: boundary <newline> mismatch.
+        if boundary_newline_mismatch(source, msgstr) {
             diagnostics.push(Diagnostic {
                 file: file.clone(),
                 line: None,
                 message: format!(
-                    "msgid and msgstr{} have different newline counts ({} vs {})",
-                    if entry.msgstr.len() > 1 {
-                        format!("[{}]", i)
-                    } else {
-                        String::new()
-                    },
-                    msgid_newlines,
-                    msgstr_newlines
+                    "'msgid' and 'msgstr{}' do not both begin/end with '\\n'",
+                    suffix
                 ),
-                is_error: false,
+                is_error: true,
             });
         }
-    }
 
-    // Check for c-format consistency
-    if entry.flags.iter().any(|f| f == "c-format") {
-        let msgid_formats = count_format_specs(&entry.msgid);
-        for (i, msgstr) in entry.msgstr.iter().enumerate() {
-            let msgstr_formats = count_format_specs(msgstr);
-            if msgid_formats != msgstr_formats && !msgstr.is_empty() {
+        // Abnormality: c-format conversion specifiers differ in number or type.
+        if c_format {
+            let src_specs = format_signatures(source);
+            let dst_specs = format_signatures(msgstr);
+            if src_specs != dst_specs {
                 diagnostics.push(Diagnostic {
                     file: file.clone(),
                     line: None,
                     message: format!(
-                        "format specifications in msgid and msgstr{} differ",
-                        if entry.msgstr.len() > 1 {
-                            format!("[{}]", i)
-                        } else {
-                            String::new()
-                        }
+                        "format specifications in 'msgid' and 'msgstr{}' differ",
+                        suffix
                     ),
-                    is_error: false,
+                    is_error: true,
                 });
             }
         }
     }
 
-    // Check for empty translation of non-empty source
+    // Softer finding: empty translation of a non-empty source (informational).
     if !entry.msgid.is_empty() && entry.msgstr.iter().all(|s| s.is_empty()) {
         diagnostics.push(Diagnostic {
-            file: file.clone(),
+            file,
             line: None,
             message: format!("empty msgstr for: {}", truncate(&entry.msgid, 30)),
             is_error: false,
@@ -299,42 +391,87 @@ fn validate_entry(
     }
 }
 
-/// Count printf-style format specifications
-fn count_format_specs(s: &str) -> usize {
-    let mut count = 0;
+/// Normalized signatures of the printf-style conversion specifications in `s`,
+/// in order. Each signature is the length modifier plus an argument-type class,
+/// so the comparison catches both a differing count and differing argument
+/// types (`%d` vs `%s`), while treating equivalents like `%d`/`%i` as the same.
+fn format_signatures(s: &str) -> Vec<String> {
+    let mut sigs = Vec::new();
     let mut chars = s.chars().peekable();
 
     while let Some(c) = chars.next() {
-        if c == '%' {
-            match chars.peek() {
-                Some('%') => {
-                    chars.next(); // Skip %%
-                }
-                Some(_) => {
-                    count += 1;
-                    // Skip format specification
-                    while let Some(&c) = chars.peek() {
-                        if c.is_alphabetic() {
-                            chars.next();
-                            break;
-                        }
-                        chars.next();
-                    }
-                }
-                None => {}
+        if c != '%' {
+            continue;
+        }
+        match chars.peek() {
+            Some('%') => {
+                chars.next(); // literal %%
+                continue;
             }
+            None => break,
+            _ => {}
+        }
+
+        // Flags, field width, precision, positional ($) — ignored for typing.
+        while let Some(&c) = chars.peek() {
+            if "-+ #0".contains(c) || c.is_ascii_digit() || c == '.' || c == '*' || c == '$' {
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        // Length modifiers affect the argument type, so keep them.
+        let mut length = String::new();
+        while let Some(&c) = chars.peek() {
+            if "hlLjztq".contains(c) {
+                length.push(c);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        // Conversion character.
+        if let Some(conv) = chars.next() {
+            sigs.push(format!("{}{}", length, conversion_class(conv)));
         }
     }
 
-    count
+    sigs
 }
 
-/// Truncate a string for display
+/// Map a printf conversion character to an argument-type class.
+fn conversion_class(c: char) -> char {
+    match c {
+        'd' | 'i' => 'i',
+        'o' | 'u' | 'x' | 'X' => 'u',
+        'e' | 'E' | 'f' | 'F' | 'g' | 'G' | 'a' | 'A' => 'f',
+        'c' => 'c',
+        's' => 's',
+        'p' => 'p',
+        'n' => 'n',
+        other => other,
+    }
+}
+
+/// Print `-v` translation statistics to standard error.
+fn print_statistics(translated: usize, fuzzy: usize, untranslated: usize) {
+    let mut parts = vec![format!("{} translated messages", translated)];
+    if fuzzy > 0 {
+        parts.push(format!("{} fuzzy translations", fuzzy));
+    }
+    if untranslated > 0 {
+        parts.push(format!("{} untranslated messages", untranslated));
+    }
+    eprintln!("{}.", parts.join(", "));
+}
+
+/// Truncate a string for display, respecting character boundaries.
 fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+    if s.chars().count() <= max_len {
         s.to_string()
     } else {
-        format!("{}...", &s[..max_len])
+        let truncated: String = s.chars().take(max_len).collect();
+        format!("{}...", truncated)
     }
 }
 

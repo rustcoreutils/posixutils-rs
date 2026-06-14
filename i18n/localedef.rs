@@ -15,10 +15,41 @@
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use posixutils_i18n::locale_lib::types::{
+    LC_MESSAGES_KEYWORDS, LC_MONETARY_KEYWORDS, LC_NUMERIC_KEYWORDS, LC_TIME_KEYWORDS,
+};
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::exit;
+
+/// Locale category names recognized as section headers.
+const CATEGORIES: &[&str] = &[
+    "LC_CTYPE",
+    "LC_COLLATE",
+    "LC_MONETARY",
+    "LC_NUMERIC",
+    "LC_TIME",
+    "LC_MESSAGES",
+    "LC_IDENTIFICATION",
+    "LC_PAPER",
+    "LC_NAME",
+    "LC_ADDRESS",
+    "LC_TELEPHONE",
+    "LC_MEASUREMENT",
+];
+
+/// Recognized keyword names for the simple (keyword = value) categories.
+fn known_keywords(category: &str) -> &'static [&'static str] {
+    match category {
+        "LC_NUMERIC" => LC_NUMERIC_KEYWORDS,
+        "LC_MONETARY" => LC_MONETARY_KEYWORDS,
+        "LC_TIME" => LC_TIME_KEYWORDS,
+        "LC_MESSAGES" => LC_MESSAGES_KEYWORDS,
+        _ => &[],
+    }
+}
 
 /// localedef - define locale environment
 #[derive(Parser)]
@@ -54,79 +85,73 @@ struct Args {
     name: String,
 }
 
-/// Parsed locale definition
+/// Parsed data for a single locale category.
+#[derive(Debug, Default)]
+struct CategoryData {
+    /// `copy` directive target, if present.
+    copy_from: Option<String>,
+    /// keyword = value pairs.
+    keywords: HashMap<String, String>,
+    /// `<symbolic>` names referenced (LC_CTYPE / LC_COLLATE).
+    symbols: Vec<String>,
+}
+
+/// Parsed locale definition: per-category data plus the order categories were
+/// processed in (for the STDOUT report).
 #[derive(Debug, Default)]
 struct LocaleDefinition {
-    /// LC_CTYPE data
-    lc_ctype: LcCtypeData,
-    /// LC_COLLATE data
-    lc_collate: LcCollateData,
-    /// LC_MONETARY data
-    lc_monetary: LcMonetaryData,
-    /// LC_NUMERIC data
-    lc_numeric: LcNumericData,
-    /// LC_TIME data
-    lc_time: LcTimeData,
-    /// LC_MESSAGES data
-    lc_messages: LcMessagesData,
+    categories: HashMap<String, CategoryData>,
+    order: Vec<String>,
 }
 
-#[derive(Debug, Default)]
-struct LcCtypeData {
-    copy_from: Option<String>,
+impl LocaleDefinition {
+    fn category_mut(&mut self, name: &str) -> &mut CategoryData {
+        if !self.categories.contains_key(name) {
+            self.order.push(name.to_string());
+        }
+        self.categories.entry(name.to_string()).or_default()
+    }
 }
 
-#[derive(Debug, Default)]
-struct LcCollateData {
-    copy_from: Option<String>,
+/// Mutable parser state carried across (possibly `include`d) source files.
+struct ParseState {
+    comment_char: char,
+    escape_char: char,
+    current_category: Option<String>,
 }
 
-#[derive(Debug, Default)]
-struct LcMonetaryData {
-    copy_from: Option<String>,
-    int_curr_symbol: Option<String>,
-    currency_symbol: Option<String>,
-    mon_decimal_point: Option<String>,
-    mon_thousands_sep: Option<String>,
-    positive_sign: Option<String>,
-    negative_sign: Option<String>,
+impl Default for ParseState {
+    fn default() -> Self {
+        ParseState {
+            comment_char: '#',
+            escape_char: '\\',
+            current_category: None,
+        }
+    }
 }
 
-#[derive(Debug, Default)]
-struct LcNumericData {
-    copy_from: Option<String>,
-    decimal_point: Option<String>,
-    thousands_sep: Option<String>,
-    grouping: Option<String>,
-}
-
-#[derive(Debug, Default)]
-struct LcTimeData {
-    copy_from: Option<String>,
-    _abday: Vec<String>,
-    _day: Vec<String>,
-    _abmon: Vec<String>,
-    _mon: Vec<String>,
-    d_t_fmt: Option<String>,
-    d_fmt: Option<String>,
-    t_fmt: Option<String>,
-    _am_pm: Vec<String>,
-}
-
-#[derive(Debug, Default)]
-struct LcMessagesData {
-    copy_from: Option<String>,
-    yesexpr: Option<String>,
-    noexpr: Option<String>,
-    yesstr: Option<String>,
-    nostr: Option<String>,
-}
-
-/// Warning or error from compilation
+/// Warning or error from processing.
 struct Diagnostic {
     line: usize,
     message: String,
     is_error: bool,
+}
+
+impl Diagnostic {
+    fn error(line: usize, message: String) -> Self {
+        Diagnostic {
+            line,
+            message,
+            is_error: true,
+        }
+    }
+    fn warning(line: usize, message: String) -> Self {
+        Diagnostic {
+            line,
+            message,
+            is_error: false,
+        }
+    }
 }
 
 fn main() {
@@ -148,47 +173,84 @@ fn main() {
         }
     };
 
-    // Parse the locale definition
-    let mut diagnostics = Vec::new();
-    let definition = match parse_locale_definition(&input, &mut diagnostics) {
-        Ok(def) => def,
-        Err(e) => {
-            eprintln!("localedef: {}", e);
-            exit(4);
-        }
+    // LD-2: a `-f charmap` operand is opened and validated up front. A charmap
+    // that cannot be read means the coded character set is not available, so —
+    // per the exit-status table — exit 2 and create no locale.
+    let charmap_symbols = match &args.charmap {
+        Some(path) => match parse_charmap_symbols(path) {
+            Ok(symbols) => Some(symbols),
+            Err(e) => {
+                eprintln!("localedef: {}", e);
+                exit(2);
+            }
+        },
+        None => None,
     };
 
-    // Print diagnostics
+    // Parse the locale definition.
+    let base_dir = args
+        .input
+        .as_deref()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let mut diagnostics = Vec::new();
+    let mut definition = LocaleDefinition::default();
+    let mut state = ParseState::default();
+    parse_source(
+        &input,
+        &base_dir,
+        charmap_symbols.as_ref(),
+        &mut definition,
+        &mut state,
+        &mut diagnostics,
+        0,
+    );
+    if let Some(open) = state.current_category.take() {
+        diagnostics.push(Diagnostic::error(0, format!("missing END {}", open)));
+    }
+
     let has_errors = diagnostics.iter().any(|d| d.is_error);
     let has_warnings = diagnostics.iter().any(|d| !d.is_error);
 
+    // LD-11: warnings are always reported, not only under -v.
     for diag in &diagnostics {
-        if diag.is_error || args.verbose {
-            eprintln!(
-                "localedef:{}: {}: {}",
-                diag.line,
-                if diag.is_error { "error" } else { "warning" },
-                diag.message
-            );
-        }
+        eprintln!(
+            "localedef:{}: {}: {}",
+            diag.line,
+            if diag.is_error { "error" } else { "warning" },
+            diag.message
+        );
     }
 
-    // Determine exit code
-    let exit_code = if has_errors {
-        4 // Errors occurred
-    } else if has_warnings && !args.force {
-        1 // Warnings but continuing
-    } else {
-        0
-    };
+    // LD-4: a detected error never produces output, even with -c. Warnings
+    // produce output only with -c.
+    let create_output = !has_errors && (args.force || !has_warnings);
 
-    // Write output if no errors (or if -c specified with warnings)
-    if !has_errors || args.force {
+    if create_output {
         if let Err(e) = write_locale(&args.name, &definition, args.verbose) {
             eprintln!("localedef: {}", e);
             exit(4);
         }
+        // LD-9: report the categories successfully processed.
+        for category in &definition.order {
+            println!("{}", category);
+        }
     }
+
+    // LD-5: 0 = created, no warnings; 1 = created, warnings; >3 = errors or
+    // warnings with no output created. (Exit 2 for an unsupported charset is
+    // handled above; 3 — "creating locales unsupported" — is not used since a
+    // marker locale is still written.)
+    let exit_code = if create_output {
+        if has_warnings {
+            1
+        } else {
+            0
+        }
+    } else {
+        4
+    };
 
     exit(exit_code);
 }
@@ -215,122 +277,237 @@ fn read_input(input_path: &Option<PathBuf>) -> Result<String, String> {
     }
 }
 
-/// Parse a locale definition file
-fn parse_locale_definition(
+/// Parse a locale source (recursively for `include`d files). `depth` guards
+/// against runaway include nesting.
+#[allow(clippy::too_many_arguments)]
+fn parse_source(
     input: &str,
+    base_dir: &Path,
+    charmap_symbols: Option<&HashSet<String>>,
+    definition: &mut LocaleDefinition,
+    state: &mut ParseState,
     diagnostics: &mut Vec<Diagnostic>,
-) -> Result<LocaleDefinition, String> {
-    let mut definition = LocaleDefinition::default();
-    let mut current_category: Option<&str> = None;
-    let mut line_number = 0;
+    depth: usize,
+) {
+    let raw: Vec<&str> = input.lines().collect();
+    let mut i = 0;
 
-    for line in input.lines() {
-        line_number += 1;
-        let line = line.trim();
+    while i < raw.len() {
+        let line_number = i + 1;
+        let trimmed = raw[i].trim();
+        i += 1;
 
-        // Skip empty lines and comments
-        if line.is_empty()
-            || line.starts_with('#')
-            || line.starts_with("comment_char")
-            || line.starts_with("escape_char")
-        {
+        // Empty / comment lines (comment_char is honored — LD-6).
+        if trimmed.is_empty() || trimmed.starts_with(state.comment_char) {
             continue;
         }
 
-        // Check for category start
-        if line.starts_with("LC_") && !line.contains(' ') {
-            current_category = Some(line);
+        // escape_char / comment_char directives (LD-6).
+        if let Some(rest) = trimmed.strip_prefix("escape_char") {
+            if let Some(c) = rest.trim().chars().next() {
+                state.escape_char = c;
+            }
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("comment_char") {
+            if let Some(c) = rest.trim().chars().next() {
+                state.comment_char = c;
+            }
             continue;
         }
 
-        // Check for category end
-        if line.starts_with("END ") {
-            current_category = None;
+        // Join continued lines (a line ending in escape_char — LD-6).
+        let mut logical = trimmed.to_string();
+        while logical.ends_with(state.escape_char) {
+            logical.pop();
+            if i < raw.len() {
+                logical.push_str(raw[i].trim());
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        let logical = logical.trim().to_string();
+        if logical.is_empty() {
             continue;
         }
 
-        // Parse category content
-        if let Some(category) = current_category {
-            parse_category_line(category, line, &mut definition, line_number, diagnostics);
+        // Category header (LD-12: matched against the known category set).
+        if CATEGORIES.contains(&logical.as_str()) {
+            state.current_category = Some(logical);
+            continue;
+        }
+
+        // Category end (LD-12: validated against the open category).
+        if let Some(rest) = logical.strip_prefix("END") {
+            let ended = rest.trim();
+            match state.current_category.take() {
+                Some(open) if open == ended => {}
+                Some(open) => diagnostics.push(Diagnostic::error(
+                    line_number,
+                    format!("END {} does not match open category {}", ended, open),
+                )),
+                None => diagnostics.push(Diagnostic::error(
+                    line_number,
+                    format!("END {} with no open category", ended),
+                )),
+            }
+            continue;
+        }
+
+        // include directive (LD-7): inline another source file.
+        if let Some(rest) = logical.strip_prefix("include") {
+            let name = rest.trim().trim_matches('"');
+            if depth >= 8 {
+                diagnostics.push(Diagnostic::error(
+                    line_number,
+                    "include nesting too deep".to_string(),
+                ));
+                continue;
+            }
+            let path = base_dir.join(name);
+            match std::fs::read_to_string(&path) {
+                Ok(included) => {
+                    let inc_dir = path
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| base_dir.to_path_buf());
+                    parse_source(
+                        &included,
+                        &inc_dir,
+                        charmap_symbols,
+                        definition,
+                        state,
+                        diagnostics,
+                        depth + 1,
+                    );
+                }
+                Err(e) => diagnostics.push(Diagnostic::error(
+                    line_number,
+                    format!("include {}: {}", name, e),
+                )),
+            }
+            continue;
+        }
+
+        if let Some(category) = state.current_category.clone() {
+            parse_category_line(
+                &category,
+                &logical,
+                charmap_symbols,
+                definition,
+                line_number,
+                diagnostics,
+            );
         }
     }
-
-    Ok(definition)
 }
 
-/// Parse a line within a category
+/// Parse a line within a category.
 fn parse_category_line(
     category: &str,
     line: &str,
+    charmap_symbols: Option<&HashSet<String>>,
     definition: &mut LocaleDefinition,
     line_number: usize,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    // Handle copy directive
+    // copy directive (LD-7): recorded for every category.
     if let Some(rest) = line.strip_prefix("copy") {
         let source = rest.trim().trim_matches('"');
-        match category {
-            "LC_CTYPE" => definition.lc_ctype.copy_from = Some(source.to_string()),
-            "LC_COLLATE" => definition.lc_collate.copy_from = Some(source.to_string()),
-            "LC_MONETARY" => definition.lc_monetary.copy_from = Some(source.to_string()),
-            "LC_NUMERIC" => definition.lc_numeric.copy_from = Some(source.to_string()),
-            "LC_TIME" => definition.lc_time.copy_from = Some(source.to_string()),
-            "LC_MESSAGES" => definition.lc_messages.copy_from = Some(source.to_string()),
-            _ => {}
+        definition.category_mut(category).copy_from = Some(source.to_string());
+        return;
+    }
+
+    // LD-3: LC_CTYPE / LC_COLLATE are parsed for their symbolic-name references.
+    // A symbol absent from the charmap is a warning for these two categories
+    // (the spec makes it an error for the others).
+    if category == "LC_CTYPE" || category == "LC_COLLATE" {
+        for symbol in extract_symbols(line) {
+            if let Some(symbols) = charmap_symbols {
+                if !symbols.contains(&symbol) {
+                    diagnostics.push(Diagnostic::warning(
+                        line_number,
+                        format!("symbol <{}> not found in charmap", symbol),
+                    ));
+                }
+            }
+            definition.category_mut(category).symbols.push(symbol);
         }
         return;
     }
 
-    // Parse keyword value pairs
-    let parts: Vec<&str> = line.splitn(2, char::is_whitespace).collect();
-    if parts.len() < 2 {
+    // Simple keyword = value categories.
+    let mut parts = line.splitn(2, char::is_whitespace);
+    let keyword = match parts.next() {
+        Some(k) if !k.is_empty() => k,
+        _ => return,
+    };
+    let value = parts.next().unwrap_or("").trim().trim_matches('"');
+
+    let known = known_keywords(category);
+    if !known.is_empty() && !known.contains(&keyword) {
+        // LD-10: the full POSIX keyword set is recognized; anything else is an
+        // unsupported optional keyword and warned about (spec).
+        diagnostics.push(Diagnostic::warning(
+            line_number,
+            format!("unknown keyword: {}", keyword),
+        ));
         return;
     }
 
-    let keyword = parts[0];
-    let value = parts[1].trim().trim_matches('"');
+    definition
+        .category_mut(category)
+        .keywords
+        .insert(keyword.to_string(), value.to_string());
+}
 
-    match category {
-        "LC_NUMERIC" => match keyword {
-            "decimal_point" => definition.lc_numeric.decimal_point = Some(value.to_string()),
-            "thousands_sep" => definition.lc_numeric.thousands_sep = Some(value.to_string()),
-            "grouping" => definition.lc_numeric.grouping = Some(value.to_string()),
-            _ => {
-                diagnostics.push(Diagnostic {
-                    line: line_number,
-                    message: format!("unknown keyword: {}", keyword),
-                    is_error: false,
-                });
+/// Parse the symbolic names defined in a charmap file (LD-2). Returns an error
+/// if the file cannot be read.
+fn parse_charmap_symbols(path: &Path) -> Result<HashSet<String>, String> {
+    let content =
+        std::fs::read_to_string(path).map_err(|e| format!("{}: {}", path.display(), e))?;
+    let mut symbols = HashSet::new();
+    let mut in_charmap = false;
+    for line in content.lines() {
+        let line = line.trim();
+        if line == "CHARMAP" {
+            in_charmap = true;
+            continue;
+        }
+        if line == "END CHARMAP" {
+            in_charmap = false;
+            continue;
+        }
+        if in_charmap {
+            if let Some(token) = line.split_whitespace().next() {
+                let name = token.trim_matches(|c| c == '<' || c == '>');
+                if !name.is_empty() {
+                    symbols.insert(name.to_string());
+                }
             }
-        },
-        "LC_MONETARY" => match keyword {
-            "int_curr_symbol" => definition.lc_monetary.int_curr_symbol = Some(value.to_string()),
-            "currency_symbol" => definition.lc_monetary.currency_symbol = Some(value.to_string()),
-            "mon_decimal_point" => {
-                definition.lc_monetary.mon_decimal_point = Some(value.to_string())
-            }
-            "mon_thousands_sep" => {
-                definition.lc_monetary.mon_thousands_sep = Some(value.to_string())
-            }
-            "positive_sign" => definition.lc_monetary.positive_sign = Some(value.to_string()),
-            "negative_sign" => definition.lc_monetary.negative_sign = Some(value.to_string()),
-            _ => {}
-        },
-        "LC_TIME" => match keyword {
-            "d_t_fmt" => definition.lc_time.d_t_fmt = Some(value.to_string()),
-            "d_fmt" => definition.lc_time.d_fmt = Some(value.to_string()),
-            "t_fmt" => definition.lc_time.t_fmt = Some(value.to_string()),
-            _ => {}
-        },
-        "LC_MESSAGES" => match keyword {
-            "yesexpr" => definition.lc_messages.yesexpr = Some(value.to_string()),
-            "noexpr" => definition.lc_messages.noexpr = Some(value.to_string()),
-            "yesstr" => definition.lc_messages.yesstr = Some(value.to_string()),
-            "nostr" => definition.lc_messages.nostr = Some(value.to_string()),
-            _ => {}
-        },
-        _ => {}
+        }
     }
+    Ok(symbols)
+}
+
+/// Extract `<symbolic>` names referenced in a line.
+fn extract_symbols(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = line;
+    while let Some(start) = rest.find('<') {
+        let after = &rest[start + 1..];
+        if let Some(end) = after.find('>') {
+            let name = &after[..end];
+            if !name.is_empty() {
+                out.push(name.to_string());
+            }
+            rest = &after[end + 1..];
+        } else {
+            break;
+        }
+    }
+    out
 }
 
 /// Write the compiled locale

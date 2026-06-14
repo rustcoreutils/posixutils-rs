@@ -80,3 +80,39 @@ fn dirname_special_characters() {
         expected_exit_code: 0,
     });
 }
+
+fn dirname_case(arg: &str, out: &str) {
+    run_test(TestPlan {
+        cmd: String::from("dirname"),
+        args: vec![String::from(arg)],
+        stdin_data: String::new(),
+        expected_out: String::from(out),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+}
+
+// A non-final ".." component must be preserved (no pathname resolution).
+#[test]
+fn dirname_preserves_nonfinal_dotdot() {
+    dirname_case("a/../b", "a/..\n");
+}
+
+// Redundant <slash> elision is permitted; the directory portion is unchanged.
+#[test]
+fn dirname_redundant_slashes() {
+    dirname_case("/usr//bin", "/usr\n");
+}
+
+// FUTURE DIRECTIONS: an embedded <newline> in the output is treated as an error.
+#[test]
+fn dirname_newline_is_error() {
+    run_test(TestPlan {
+        cmd: String::from("dirname"),
+        args: vec![String::from("foo\nbar/baz")],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::from("dirname: result contains a newline character\n"),
+        expected_exit_code: 1,
+    });
+}

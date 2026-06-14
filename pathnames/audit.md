@@ -112,9 +112,9 @@ components (which `PathBuf` does) and forbids removing non-final `..` (which
 ### Priority issues
 
 #### Minor
-- [ ] **#D1 — output via `to_string_lossy()` mangles non-UTF-8 directory names.** `dirname.rs:34,39`. The operand is correctly an `OsString`, but the result is printed lossily. Use `OsStr`/byte-faithful output.
-- [ ] **#D2 — `//` handling is not the rationale-preferred `//`.** `dirname.rs:31-39`. Rust normalizes `//`; the spec rationale says `dirname //` should be `//` where `//` is distinct. Implementation-defined — low priority.
-- [ ] **#D3 — newline-in-pathname not treated as error (FUTURE DIRECTIONS).** Encouraged, not required.
+- [x] **#D1 — output via `to_string_lossy()` mangles non-UTF-8 directory names.** `dirname.rs:34,39`. The operand is correctly an `OsString`, but the result is printed lossily. Use `OsStr`/byte-faithful output. ✓ fixed — result is an `OsString`, written via `OsStrExt::as_bytes` + `write_all`.
+- [x] ~~#D2~~ — `//` left implementation-defined (Rust normalizes it); the spec explicitly permits this. No change; re-examined and accepted.
+- [x] **#D3 — newline-in-pathname not treated as error (FUTURE DIRECTIONS).** Encouraged, not required. ✓ fixed — result containing `\n` emits a diagnostic and exits non-zero.
 
 ### Detailed conformance matrix
 
@@ -132,15 +132,15 @@ components (which `PathBuf` does) and forbids removing non-final `..` (which
 - [x] **non-final `..` preserved** CONFORMS — `pop()` only removes the last component; `dirname a/../b` → `a/..`.
 
 #### STDOUT / STDERR / Exit / Environment
-- [x] **STDOUT `"%s\n"`** CONFORMS — `dirname.rs:39`.
-- [x] **EXIT STATUS** CONFORMS — returns 0; no error paths.
-- [x] **`setlocale`/`textdomain`** CONFORMS — `dirname.rs:43-45`.
+- [x] **STDOUT `"%s\n"`** CONFORMS — byte-faithful `write_all`. `dirname.rs`.
+- [x] **EXIT STATUS** CONFORMS — `plib::diag::exit_status()` (non-zero on newline error). `dirname.rs`.
+- [x] **`setlocale`/`textdomain`** CONFORMS — `plib::diag::init_locale("dirname")`.
 
 ### Test coverage signal
-Not covered:
-- [ ] non-final `..` preservation (`a/../b` → `a/..`)
-- [ ] redundant-slash input (`/usr//bin`)
-- [ ] non-UTF-8 operand (#D1)
+- [x] non-final `..` preservation (`a/../b` → `a/..`)
+- [x] redundant-slash input (`/usr//bin` → `/usr`)
+- [x] embedded-newline error (#D3)
+- [ ] non-UTF-8 operand (#D1) — code path is byte-clean; explicit test deferred (TestPlan args are UTF-8 strings)
 
 ---
 

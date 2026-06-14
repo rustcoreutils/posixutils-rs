@@ -8,10 +8,13 @@
 //
 
 use std::ffi::OsString;
+use std::io::{self, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
+use plib::diag;
 
 #[derive(Parser)]
 #[command(
@@ -19,34 +22,40 @@ use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleC
     about = gettext("dirname - return the directory portion of a pathname")
 )]
 struct Args {
+    #[arg(allow_hyphen_values = true)]
     pathname: OsString,
 }
 
 fn show_dirname(args: &Args) {
-    if args.pathname.is_empty() {
-        println!(".");
+    let result: OsString = if args.pathname.is_empty() {
+        OsString::from(".")
+    } else {
+        let mut pb = PathBuf::from(&args.pathname);
+        pb.pop();
+        if pb.as_os_str().is_empty() {
+            OsString::from(".")
+        } else {
+            pb.into_os_string()
+        }
+    };
+
+    // FUTURE DIRECTIONS: treat an embedded <newline> in the output as an error.
+    if result.as_bytes().contains(&b'\n') {
+        diag::error(&gettext("result contains a newline character"));
         return;
     }
 
-    let mut pb = PathBuf::from(&args.pathname);
-    pb.pop();
-
-    let mut dn = pb.to_string_lossy();
-    if dn.is_empty() {
-        dn = String::from(".").into();
-    }
-
-    println!("{}", dn);
+    let mut out = io::stdout().lock();
+    let _ = out.write_all(result.as_bytes());
+    let _ = out.write_all(b"\n");
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    diag::init_locale("dirname");
 
     let args = Args::parse();
 
     show_dirname(&args);
 
-    Ok(())
+    std::process::exit(diag::exit_status())
 }

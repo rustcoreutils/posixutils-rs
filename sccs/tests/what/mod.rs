@@ -184,3 +184,42 @@ fn special_characters() {
         assert!(stdout.contains("\tnull\n"), "should show null");
     });
 }
+
+#[test]
+fn what_binary_input_does_not_abort() {
+    // Regression for the UTF-8 abort bug: `what` must scan arbitrary binary
+    // input (its primary use case) and never error out on non-UTF-8 bytes.
+    use std::io::Write;
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("bin.o");
+    // Non-UTF-8 bytes (0xff, 0xfe) surrounding a valid @(#) identification.
+    let mut data = vec![0xffu8, 0x00, 0xfe, b'x'];
+    data.extend_from_slice(b"@(#)ident-here\" trailing");
+    data.extend_from_slice(&[0x80, 0x81, 0xff]);
+    std::fs::File::create(&path)
+        .unwrap()
+        .write_all(&data)
+        .unwrap();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("what"),
+            args: vec![path.to_string_lossy().into()],
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan: &TestPlan, output: &Output| {
+            assert!(
+                output.status.success(),
+                "what must exit 0 on a binary file containing an ident"
+            );
+            let out = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                out.contains("\tident-here"),
+                "expected the @(#) ident, got: {out:?}"
+            );
+        },
+    );
+}

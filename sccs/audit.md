@@ -768,18 +768,16 @@ virtually every binary/`.o`/`a.out`, exactly what `what` exists to scan.
 ### Priority issues
 
 #### Critical
-- [ ] **#W1 — Non-UTF-8 input aborts `what`, skipping all remaining files.**
-  `what.rs:33` uses `reader.lines()` → `InvalidData` ("stream did not contain
-  valid UTF-8"); the `?` at `:34` propagates. Verified: `what target/release/what`
-  → `Error: … InvalidData …` where CSSC printed ` GNU CSSC 1.4.1`. Spec INPUT
-  FILES: "any file type"; the EXAMPLES scan `a.out`. Fix: read raw bytes and scan
-  the `@(#)` byte pattern; never UTF-8-decode.
+- [x] **#W1 — Non-UTF-8 input aborts `what`, skipping all remaining files.** ✓
+  Phase 11: `process_file` rewritten to scan raw bytes for the `@(#)` byte
+  pattern (never UTF-8-decodes). Verified `what` scans its own ELF binary and
+  processes every file in a binary+text list; regression test added.
 
 #### Minor
 - [ ] **#W2 — Error message format/order differs from CSSC** (cosmetic; both stderr). `what.rs:72`.
 - [ ] **#W3 — Hardcoded-English "Cannot open file" (#X9).** `what.rs:72`.
-- [ ] **#W4 — `-s` buffers the whole file before stopping.** `what.rs:33`; with the
-  #W1 byte-reader rewrite, `break` on first ident (FIFO/RATIONALE concern). Minor.
+- [x] **#W4 — `-s` buffers the whole file before stopping.** ✓ Phase 11: the
+  byte scanner now returns immediately on the first ident under `-s`.
 
 ### Detailed conformance matrix
 - [x] `-s` CONFORMS — `what.rs:21-25,37`; verified (two idents on one line → only first).

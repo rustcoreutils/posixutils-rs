@@ -1758,17 +1758,32 @@ impl PfileEntry {
         let user = parts[2].to_string();
         let datetime = SccsDateTime::parse(parts[3], parts.get(4).unwrap_or(&"00:00:00"))?;
 
-        // Parse optional -i and -x
+        // Parse optional -i and -x, accepting both the attached form (`-i1.2`,
+        // as written by SCCS / CSSC) and the separated form (`-i 1.2`).
         let mut included = None;
         let mut excluded = None;
         let mut i = 5;
         while i < parts.len() {
-            if parts[i] == "-i" && i + 1 < parts.len() {
-                included = Some(parts[i + 1].to_string());
-                i += 2;
-            } else if parts[i] == "-x" && i + 1 < parts.len() {
-                excluded = Some(parts[i + 1].to_string());
-                i += 2;
+            if let Some(rest) = parts[i].strip_prefix("-i") {
+                if !rest.is_empty() {
+                    included = Some(rest.to_string());
+                    i += 1;
+                } else if i + 1 < parts.len() {
+                    included = Some(parts[i + 1].to_string());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            } else if let Some(rest) = parts[i].strip_prefix("-x") {
+                if !rest.is_empty() {
+                    excluded = Some(rest.to_string());
+                    i += 1;
+                } else if i + 1 < parts.len() {
+                    excluded = Some(parts[i + 1].to_string());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
             } else {
                 i += 1;
             }
@@ -1791,10 +1806,10 @@ impl PfileEntry {
             self.old_sid, self.new_sid, self.user, self.datetime
         );
         if let Some(ref inc) = self.included {
-            line.push_str(&format!(" -i {}", inc));
+            line.push_str(&format!(" -i{}", inc));
         }
         if let Some(ref exc) = self.excluded {
-            line.push_str(&format!(" -x {}", exc));
+            line.push_str(&format!(" -x{}", exc));
         }
         line
     }

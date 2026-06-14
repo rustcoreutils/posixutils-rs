@@ -325,19 +325,20 @@ shared-core #X1 (encoded bodies).
   ✓ fixed in Phase 3 (#X1): `get` uudecodes `e`-flag bodies to raw bytes.
 
 #### Major
-- [ ] **#G2 — `-c cutoff` MISSING.** `get.rs:24-56`; `get -c…` exit 2. Spec
-  mandates cutoff date-time filtering (with the 2-digit century rule).
-- [ ] **#G3 — `-i list` / `-x list` MISSING.** Force-include/-exclude deltas plus
-  the `Included:`/`Excluded:` stdout notation and p-file suffix. `DeltaEntry`
-  already carries `included`/`excluded`.
-- [ ] **#G4 — `-l` / `-L` (l-file / delta summary) MISSING.** Spec defines the
-  l-file table format; CSSC writes it, ours exits 2.
-- [ ] **#G5 — `-` stdin-list operand MISSING.** (#X7) `get.rs:546`. Verified
-  `get -p -` → `-: not an SCCS file`.
-- [ ] **#G6 — Directory operand MISSING.** (#X7) `get.rs:378`.
-- [ ] **#G7 — `-t` (top delta in release) MISSING.** `get.rs`.
+- [x] **#G2 — `-c cutoff`.** ✓ Phase 4: `-c` with the 2-digit POSIX year pivot;
+  deltas newer than the cutoff excluded. Matches cssc.
+- [x] **#G3 — `-i list` / `-x list`.** ✓ Phase 4: force include/exclude with the
+  `Included:`/`Excluded:` notation; recorded in the p-file (attached `-i`/`-x`
+  form; plib parser now accepts both forms).
+- [x] **#G4 — `-l` / `-L` (l-file / delta summary).** ✓ Phase 4; l-file is
+  **byte-identical to cssc**.
+- [x] **#G5 — `-` stdin-list operand.** ✓ Phase 4 via `paths::expand_operands`.
+- [x] **#G6 — Directory operand.** ✓ Phase 4 via `paths::expand_operands`.
+- [x] **#G7 — `-t` (top delta in release).** ✓ Phase 4; matches cssc.
 - [ ] **#G8 — z-file lock never created.** (#X8) `get -e` takes no lock.
-- [ ] **#G9 — `No id keywords` warning not emitted.** (#X6) Verified vs CSSC.
+- [x] **#G9 — `No id keywords` warning.** ✓ Phase 4: emits
+  `get: warning: <sfile>: No id keywords.` (matches cssc), escalates to fatal
+  when the `i` flag is set, silent when a keyword is present.
 
 #### Minor
 - [ ] **#G10 — p-file written 0644; spec implies owner-writable-only (0600).**

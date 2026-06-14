@@ -168,47 +168,49 @@ spaces, `*`, `$`, etc.
 ### Priority issues
 
 #### Critical
-- [ ] **#P1 — default mode reports `pathconf error` for existing files.** `pathchk.rs:88-106,112-126`. `find_fshandle` initializes `fsh = ""` and, when the path already exists, never enters the `while` loop → returns `""` → `pathconf("")` = `-1` → error. Verified: `pathchk /etc/passwd` → `/etc/passwd: pathconf error(path length)`, exit 1. Fix: when the full path (or its parent) exists, use it as the fs handle.
-- [ ] **#P2 — default mode rejects creatable relative pathnames.** `pathchk.rs:88-103`. `Path::new("foo").parent()` is `Some("")` (empty), not `Some(".")`; the loop walks to `""`, `pathconf("")` fails. Verified: `pathchk newfile` → `newfile: pathconf error(path length)`, exit 1 — but the spec says a creatable path "shall not be considered an error". Fix: treat an empty parent as `"."` (cwd).
+- [x] **#P1 — default mode reports `pathconf error` for existing files.** `pathchk.rs:88-106,112-126`. `find_fshandle` initializes `fsh = ""` and, when the path already exists, never enters the `while` loop → returns `""` → `pathconf("")` = `-1` → error. Verified: `pathchk /etc/passwd` → `/etc/passwd: pathconf error(path length)`, exit 1. Fix: when the full path (or its parent) exists, use it as the fs handle. ✓ fixed — `find_fshandle` now returns the deepest existing ancestor (the path itself if it exists), never empty; `pathchk /etc/passwd` → exit 0.
+- [x] **#P2 — default mode rejects creatable relative pathnames.** `pathchk.rs:88-103`. `Path::new("foo").parent()` is `Some("")` (empty), not `Some(".")`; the loop walks to `""`, `pathconf("")` fails. Verified: `pathchk newfile` → `newfile: pathconf error(path length)`, exit 1 — but the spec says a creatable path "shall not be considered an error". Fix: treat an empty parent as `"."` (cwd). ✓ fixed — empty parent resolves to `.`; creatable relative names → exit 0.
 
 #### Major
-- [ ] **#P3 — `-p` and `-P` are mutually exclusive.** `pathchk.rs:24,35` (`group = "mode"` on both). Verified: `pathchk -p -P foo` → clap error, exit 2. Spec APPLICATION USAGE: "applications should use both the `-p` and `-P` options together." Fix: drop the shared group; the three modes (`-p`, `-P`, default) are independent and combinable per the spec.
-- [ ] **#P4 — `-p` uses `is_ascii()` instead of the portable filename character set.** `pathchk.rs:78`. The portable set is `[A-Za-z0-9._-]` only. Verified: `pathchk -p 'a b'` → exit 0 (space accepted; spec requires a diagnostic). Fix: reject any component byte outside `[A-Za-z0-9._-]`.
-- [ ] **#P5 — default mode never checks "component in a directory that is not searchable" nor "byte sequence not valid in its containing directory."** `pathchk.rs:63-85,112-126`. Only length checks are performed. The search-permission check is a spec bullet; the invalid-byte check is harder (rare on common filesystems) but also mandated. Fix: stat/access ancestor dirs for search permission.
+- [x] **#P3 — `-p` and `-P` are mutually exclusive.** `pathchk.rs:24,35` (`group = "mode"` on both). Verified: `pathchk -p -P foo` → clap error, exit 2. Spec APPLICATION USAGE: "applications should use both the `-p` and `-P` options together." Fix: drop the shared group; the three modes (`-p`, `-P`, default) are independent and combinable per the spec. ✓ fixed — `group` removed; `-p` replaces the fs check, `-P` is additive on top; `pathchk -p -P foo` → exit 0.
+- [x] **#P4 — `-p` uses `is_ascii()` instead of the portable filename character set.** `pathchk.rs:78`. The portable set is `[A-Za-z0-9._-]` only. Verified: `pathchk -p 'a b'` → exit 0 (space accepted; spec requires a diagnostic). Fix: reject any component byte outside `[A-Za-z0-9._-]`. ✓ fixed — `is_portable_byte` enforces `[A-Za-z0-9._-]`; `-p 'a b'` / `-p 'a*b'` → exit 1.
+- [x] **#P5 — default mode never checks "component in a directory that is not searchable" nor "byte sequence not valid in its containing directory."** `pathchk.rs:63-85,112-126`. Only length checks are performed. The search-permission check is a spec bullet; the invalid-byte check is harder (rare on common filesystems) but also mandated. Fix: stat/access ancestor dirs for search permission. ✓ partly fixed — `check_searchable` runs `access(dir, X_OK)` on the deepest existing directory (best-effort). The invalid-byte-sequence check is **N/A** (not determinable without attempting creation; most implementations omit it).
+- [x] ~~#invalid-byte~~ N/A — see #P5.
 
 #### Minor
-- [ ] **#P6 — `_POSIX_PATH_MAX` is 255; XBD `<limits.h>` minimum is 256.** `pathchk.rs:16`. Off-by-one understates the portable limit. Fix: `256`.
-- [ ] **#P7 — diagnostics are hardcoded English.** `pathchk.rs:48,55,70,75,79,117,121` and `eprintln!` at `150`. `LC_MESSAGES` is inert despite `setlocale`. Wrap messages in `gettext`.
-- [ ] **#P8 — operands are `String`; non-UTF-8 pathnames rejected by clap.** `pathchk.rs:44`. Portable-filename and byte-validity checks logically operate on bytes; accept `OsString`.
-- [ ] **#P9 — `CString::new(fsh).unwrap()` panics if a fs-handle path contains an interior NUL.** `pathchk.rs:114`. Unreachable from clap `String` operands today, but a latent panic. Fix: propagate as a diagnostic.
+- [x] **#P6 — `_POSIX_PATH_MAX` is 255; XBD `<limits.h>` minimum is 256.** `pathchk.rs:16`. Off-by-one understates the portable limit. Fix: `256`. ✓ fixed — `POSIX_PATH_MAX = 256`.
+- [x] **#P7 — diagnostics are hardcoded English.** `pathchk.rs:48,55,70,75,79,117,121` and `eprintln!` at `150`. `LC_MESSAGES` is inert despite `setlocale`. Wrap messages in `gettext`. ✓ fixed — every diagnostic literal is a `gettext(...)` call; reporting goes through `plib::diag::error`.
+- [x] **#P8 — operands are `String`; non-UTF-8 pathnames rejected by clap.** `pathchk.rs:44`. Portable-filename and byte-validity checks logically operate on bytes; accept `OsString`. ✓ fixed — operands are `Vec<OsString>`; all checks operate on `as_bytes()`.
+- [x] **#P9 — `CString::new(fsh).unwrap()` panics if a fs-handle path contains an interior NUL.** `pathchk.rs:114`. Unreachable from clap `String` operands today, but a latent panic. Fix: propagate as a diagnostic. ✓ fixed — `CString::new(...)` errors map to a diagnostic instead of `.unwrap()`.
 
 ### Detailed conformance matrix
 
 #### Options
-- [ ] **`-p` (portable)** PARTIAL — present but wrong char set (#P4), mutually exclusive (#P3), wrong PATH_MAX const (#P6). `pathchk.rs:22-31,108-110`.
-- [x] **`-P` (basic)** CONFORMS — flags empty pathname and any component beginning with `-`. `pathchk.rs:33-41,47-61`.
-- [ ] **default (filesystem)** DIVERGES — broken (#P1, #P2), incomplete (#P5). `pathchk.rs:112-126`.
+- [x] **`-p` (portable)** CONFORMS — portable charset (#P4) + `_POSIX_PATH_MAX`=256 / `_POSIX_NAME_MAX`=14 (#P6); combinable with `-P` (#P3). `pathchk.rs`.
+- [x] **`-P` (basic)** CONFORMS — flags empty pathname and any component beginning with `-`; now additive to the fs/portable check. `pathchk.rs`.
+- [x] **default (filesystem)** CONFORMS — length checks via `pathconf` + search-permission check; `find_fshandle` repaired (#P1/#P2/#P5). `pathchk.rs`.
 - [x] **`--` end-of-options** CONFORMS — clap provides it (used in spec EXAMPLES).
 
 #### Operands / STDIN / STDOUT / STDERR
-- [x] **`pathname...` (multiple)** CONFORMS — loops over all operands in order. `pathchk.rs:147-152`.
+- [x] **`pathname...` (multiple)** CONFORMS — loops over all operands in order. `pathchk.rs`.
 - [x] **STDIN not used** CONFORMS.
 - [x] **STDOUT not used** CONFORMS — nothing on stdout. 
-- [x] **STDERR diagnostics only** CONFORMS (channel) — but English-only (#P7). `pathchk.rs:150`.
+- [x] **STDERR diagnostics only** CONFORMS — via `plib::diag::error`; messages `gettext`'d (#P7). `pathchk.rs`.
 
 #### Exit status / Environment
-- [x] **EXIT 0 all pass / >0 error** CONFORMS (mechanism) — accumulator `exit_code`, `exit(1)` on any failure. `pathchk.rs:145-154`. (Defeated in practice by #P1/#P2.)
-- [x] **`setlocale`/`textdomain`** CONFORMS — `pathchk.rs:139-141`.
-- [ ] `LC_MESSAGES` MINOR — diagnostics not translated (#P7).
+- [x] **EXIT 0 all pass / >0 error** CONFORMS — `plib::diag::exit_status()`; works now that #P1/#P2 are fixed. `pathchk.rs`.
+- [x] **`setlocale`/`textdomain`** CONFORMS — `plib::diag::init_locale("pathchk")`.
+- [x] `LC_MESSAGES` CONFORMS — diagnostics routed through `gettext` (#P7).
 
 ### Test coverage signal
-**No test file exists for `pathchk`.** Add `pathnames/tests/pathchk/mod.rs` covering:
-- [ ] `pathchk <existing-file>` → exit 0 (#P1)
-- [ ] `pathchk <creatable-relative-name>` → exit 0 (#P2)
-- [ ] `pathchk -p -P foo` → exit 0 (#P3)
-- [ ] `pathchk -p 'a b'` and `-p 'a*b'` → exit 1 (#P4)
-- [ ] `pathchk -P -foo` and `pathchk -P ''` → exit 1
-- [ ] over-long component / over-long path
+New `pathnames/tests/pathchk/mod.rs` (9 tests):
+- [x] `pathchk <existing-path>` → exit 0 (#P1)
+- [x] `pathchk <creatable-relative-name>` → exit 0 (#P2)
+- [x] `pathchk -p -P foo` → exit 0 (#P3)
+- [x] `pathchk -p 'a b'` and `-p 'a*b'` → exit 1 (#P4)
+- [x] `pathchk -P -- -foo` and `pathchk -P ''` → exit 1
+- [x] over-long component / over-long path (#P6)
+- [ ] search-permission (#P5) — logic in place; explicit test deferred (needs a non-searchable dir; root bypasses)
 
 ---
 

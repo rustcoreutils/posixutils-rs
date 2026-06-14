@@ -47,22 +47,22 @@ implemented — so `basename /usr/bin/env env` prints `bin` instead of `env`.
 ### Priority issues
 
 #### Critical
-- [ ] **#B1 — `basename` panics on `/`, `..`, and any path whose last component is `..`.** `basename.rs:48-50`. `Path::file_name()` returns `None` for these; `.expect("Input is not a pathname.")` aborts with exit 101. Verified: `basename /`, `basename ..`, `basename a/b/..` all panic. Spec steps 3/5 require `/`→`/` and `..`→`..`. Fix: implement the slash-trimming algorithm on the raw string instead of delegating to `Path::file_name()`.
+- [x] **#B1 — `basename` panics on `/`, `..`, and any path whose last component is `..`.** `basename.rs:48-50`. `Path::file_name()` returns `None` for these; `.expect("Input is not a pathname.")` aborts with exit 101. Verified: `basename /`, `basename ..`, `basename a/b/..` all panic. Spec steps 3/5 require `/`→`/` and `..`→`..`. Fix: implement the slash-trimming algorithm on the raw string instead of delegating to `Path::file_name()`. ✓ fixed — `basename_bytes()` implements steps 1-6 on raw bytes; `/`→`/`, `..`→`..`, no panic.
 
 #### Major
-- [ ] **#B2 — suffix is stripped from the full pathname, not the final component, and the "identical to result" guard is missing.** `basename.rs:29-37`. The code runs `pathname.strip_suffix(suffix)` on the whole argument before extracting the component. Consequences verified: `basename /usr/bin/env env` → `bin` (spec: `env`, because step 6 forbids removing a suffix identical to the whole result); `basename src/dir/ ir` → `dir` (spec: `d`). Fix: perform steps 3-5 first, then apply step 6 to the resulting component only, and skip removal when `suffix == result`.
-- [ ] **#B3 — suffix interacts wrongly with trailing slashes.** `basename.rs:31`. Because suffix removal precedes trailing-slash trimming, a trailing `/` makes `strip_suffix` silently no-op. Same root cause as #B2; folds into the same fix.
+- [x] **#B2 — suffix is stripped from the full pathname, not the final component, and the "identical to result" guard is missing.** `basename.rs:29-37`. The code runs `pathname.strip_suffix(suffix)` on the whole argument before extracting the component. Consequences verified: `basename /usr/bin/env env` → `bin` (spec: `env`, because step 6 forbids removing a suffix identical to the whole result); `basename src/dir/ ir` → `dir` (spec: `d`). Fix: perform steps 3-5 first, then apply step 6 to the resulting component only, and skip removal when `suffix == result`. ✓ fixed — step 6 now runs after steps 3-5 with the `result != suffix` guard; `env env`→`env`, `src/dir/ ir`→`d`.
+- [x] **#B3 — suffix interacts wrongly with trailing slashes.** `basename.rs:31`. Because suffix removal precedes trailing-slash trimming, a trailing `/` makes `strip_suffix` silently no-op. Same root cause as #B2; folds into the same fix. ✓ fixed with #B2.
 
 #### Minor
-- [ ] **#B4 — operands are `String`; non-UTF-8 pathnames are rejected by clap.** `basename.rs:22-23`. POSIX pathnames are byte strings. Use `OsString`/bytes (as `dirname` does for the operand).
-- [ ] **#B5 — no `--` is documented and leading-`-` operands fail.** `basename.rs:15-24`. `basename -n` is parsed as an unknown option by clap; the spec EXAMPLES rely on `basename -- "$1"`. clap supplies `--`, but a bare `-foo` string operand errors. Minor; spec OPTIONS is "None".
-- [ ] **#B6 — newline-in-pathname not treated as an error (FUTURE DIRECTIONS).** Whole-program. Encouraged, not required.
+- [x] **#B4 — operands are `String`; non-UTF-8 pathnames are rejected by clap.** `basename.rs:22-23`. POSIX pathnames are byte strings. Use `OsString`/bytes (as `dirname` does for the operand). ✓ fixed — operands are `OsString`; algorithm and output operate on bytes (`OsStrExt`/`write_all`).
+- [x] **#B5 — no `--` is documented and leading-`-` operands fail.** `basename.rs:15-24`. `basename -n` is parsed as an unknown option by clap; the spec EXAMPLES rely on `basename -- "$1"`. clap supplies `--`, but a bare `-foo` string operand errors. Minor; spec OPTIONS is "None". ✓ fixed — `allow_hyphen_values` on both operands; `basename -n`→`-n` (verified `--help`/`--version` still work).
+- [x] **#B6 — newline-in-pathname not treated as an error (FUTURE DIRECTIONS).** Whole-program. Encouraged, not required. ✓ fixed — result containing `\n` emits a diagnostic and exits non-zero.
 
 ### Detailed conformance matrix
 
 #### Options / Operands / STDIN
 - [x] **OPTIONS none** CONFORMS — no options defined. `basename.rs:15-24`.
-- [ ] **`string` operand** PARTIAL — present, but algorithm diverges (#B1-#B3). `basename.rs:26-52`.
+- [x] **`string` operand** CONFORMS — algorithm now follows DESCRIPTION steps 1-6 (#B1-#B3 fixed). `basename.rs`.
 - [x] **`suffix` operand present** CONFORMS (mechanically) — optional second operand. `basename.rs:23`. Semantics diverge (#B2).
 - [x] **STDIN not used** CONFORMS — never reads stdin. Whole file.
 - [x] **empty `string`** CONFORMS — prints empty line; spec allows `.` or null. `basename.rs:39-42`.
@@ -70,26 +70,26 @@ implemented — so `basename /usr/bin/env env` prints `bin` instead of `env`.
 
 #### Algorithm steps (DESCRIPTION 1-6)
 - [x] step 1 (null string) — handled. `basename.rs:39`.
-- [ ] **step 2 (`//`)** PARTIAL — falls through to `file_name()`; impl-defined, but currently yields `Path::file_name("//")` = `None` → panic. Folds into #B1.
-- [ ] **step 3 (all slashes → `/`)** DIVERGES — panics instead of printing `/`. #B1.
-- [x] step 4 (trailing slash) — `file_name()` trims trailing slash for normal names. `basename.rs:48`.
-- [x] step 5 (strip prefix) — `file_name()` does this for normal names. `basename.rs:48`.
-- [ ] **step 6 (suffix removal)** DIVERGES — wrong order, missing identical-guard. #B2.
+- [x] **step 2 (`//`)** CONFORMS — all-slash string yields `/` (impl-defined choice). ✓
+- [x] **step 3 (all slashes → `/`)** CONFORMS — `/`,`//`,`///` → `/`. ✓ #B1
+- [x] step 4 (trailing slash) — trailing `/` trimmed on raw bytes. `basename.rs`.
+- [x] step 5 (strip prefix) — prefix up to last `/` removed. `basename.rs`.
+- [x] **step 6 (suffix removal)** CONFORMS — applied to final component, with identical-guard. ✓ #B2
 
 #### STDOUT / STDERR / Exit / Environment
-- [x] **STDOUT `"%s\n"`** CONFORMS — `println!`. `basename.rs:46`.
-- [ ] **STDERR diagnostics only** PARTIAL — the only error path is a Rust panic to stderr (#B1), not a clean diagnostic.
-- [ ] **EXIT STATUS 0/>0** PARTIAL — success=0, but error path is panic=101 rather than a controlled `>0`. #B1.
-- [x] **`setlocale`/`textdomain`** CONFORMS — `basename.rs:55-57`.
-- [ ] `LC_MESSAGES` MINOR — no runtime diagnostics to translate (panic text is hardcoded). #B1.
+- [x] **STDOUT `"%s\n"`** CONFORMS — byte-faithful `write_all`. `basename.rs`.
+- [x] **STDERR diagnostics only** CONFORMS — newline error via `plib::diag::error` → stderr. ✓ #B6
+- [x] **EXIT STATUS 0/>0** CONFORMS — `plib::diag::exit_status()`; no panics. ✓ #B1
+- [x] **`setlocale`/`textdomain`** CONFORMS — `plib::diag::init_locale("basename")`.
+- [x] `LC_MESSAGES` CONFORMS — diagnostic routed through `gettext`. ✓ #B6
 
 ### Test coverage signal
-Not covered:
-- [ ] `basename /`, `basename //`, `basename ///` (panic — #B1)
-- [ ] `basename ..`, `basename x/..` (panic — #B1)
-- [ ] suffix identical to result (`env env` — #B2)
-- [ ] suffix + trailing slash (#B3)
-- [ ] non-UTF-8 operand (#B4)
+- [x] `basename /`, `basename //`, `basename ///` → `/` (#B1)
+- [x] `basename ..`, `basename a/b/..` → `..` (#B1)
+- [x] suffix identical to result (`env env`→`env`) (#B2)
+- [x] suffix + trailing slash (`src/dir/ ir`→`d`) (#B3)
+- [x] leading-hyphen operand, `--` separator (#B5), embedded-newline error (#B6)
+- [ ] non-UTF-8 operand (#B4) — code path is byte-clean; explicit test deferred (TestPlan args are UTF-8 strings)
 
 ---
 

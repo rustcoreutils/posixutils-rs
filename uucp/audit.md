@@ -64,20 +64,20 @@ consequences of the minimal SSH design.
 None.
 
 ### Major
-- [ ] **#UX1 — `uux` cross-system output-file routing is unimplemented, and a
+- [x] **#UX1 — `uux` cross-system output-file routing is unimplemented, and a
   null-system (`!`) output target is routed to the exec host, not local.**
-  `uux.rs:347-368` emits `warning: cross-system output file routing not yet
-  implemented` and does nothing when the output file's system differs from the
-  execution host; `uux.rs:186-214` maps an *empty* system-name on a `>`-target
-  to `exec_host` (`if sys.is_empty() { exec_host.clone() }`), but POSIX says "A
-  null system-name shall be interpreted as the local system." Net effect: POSIX
-  `uux` EXAMPLE 3 (`uux "a!diff a!/usr/xyz c!/usr/xyz >!~/xyz.diff"`) writes the
-  result to host `a`'s PUBDIR instead of the local PUBDIR, and any genuine
-  exec-here/output-there case is silently skipped. EXAMPLE 1 (all-local exec,
-  local output) does work. Fix: treat an explicit-but-empty system as local;
-  when the output system differs from the exec host, fetch the produced file
-  from the exec host and deliver it. (Bounded feature — affects only
-  cross-system output, which is uncommon.)
+  ✓ Phase 3 (minimal-correct): a `>`-target with an explicit `!` now names a
+  system — a null system-name (`>!file`) resolves to the **local** system, while
+  a target with no `!` still defaults to the execution host. The new
+  `deliver_output()` actually moves the produced file: exec-remote→output-local
+  via `ssh_fetch_file`, exec-local→output-remote via `ssh_send_file`; same-host
+  is a no-op; a third remote system (neither local nor the exec host) is a **hard
+  error** (non-zero exit) instead of the old silent TODO warning. POSIX EXAMPLE 3
+  now targets the local PUBDIR. Verified: local-exec local-output writes in
+  place; a remote output attempts SSH delivery and fails loudly when unreachable;
+  unit tests cover the `>!file`→local resolution, same-host no-op, and
+  third-system error. (Cross-host SSH delivery itself isn't exercised without a
+  multi-host setup, but reuses the already-tested transfer helpers.)
 
 ### Minor
 - [x] **#G1 — Diagnostics are hardcoded English; `LC_MESSAGES`/`NLSPATH` inert.**
@@ -187,7 +187,7 @@ None.
 - [x] No pathname expansion by `uux` (a literal `*.c` is passed through) — `uux.rs` never globs. CONFORMS (spec "shall not").
 - [x] No alias substitution — runs via `sh -c` of an explicit command. CONFORMS.
 - [x] Input files from other systems are fetched into a per-job work dir and referenced by basename — `uux.rs:217-304`. Matches "all files required... put into this directory" + the unique-basename caveat (EXAMPLE 2's intentional collision is the application's responsibility).
-- [ ] **Cross-system output-file routing unimplemented; `>!file` routed to exec host** (#UX1, Major) — `uux.rs:186-214,347-368`.
+- [x] **Cross-system output-file routing** (#UX1, Major) — ✓ Phase 3: null-system⇒local + `ssh_fetch_file`/`ssh_send_file` delivery; third system is a hard error.
 - [x] Command stdout is discarded when not redirected to a file — `uux.rs:391-392`. **DIVERGES (by design):** traditional `uux` returns command output by mail; POSIX leaves un-redirected output unspecified, so discarding is acceptable minimal. Accepted.
 - [x] `-n` suppresses the failure-notification mail; otherwise mail is sent on failure — `uux.rs:124-130`. CONFORMS (the notification is best-effort local `mail`).
 
@@ -262,8 +262,8 @@ Existing tests cover the golden paths well (local copy, dir handling, `-f`,
 multi-source, `-c` accepted, redirection rejection, `-p`/`-` stdin, `uustat`
 list/kill/rejuvenate/filter/conflicts). Gaps that map to findings:
 
-- [ ] No test asserts `uux` cross-system output routing or the `>!file`
-  (null-system ⇒ local) semantics (#UX1).
+- [x] No test asserts `uux` cross-system output routing or the `>!file`
+  (null-system ⇒ local) semantics (#UX1). ✓ Phase 3: unit tests added.
 - [ ] No test asserts `LC_MESSAGES` affects diagnostics (#G1) — expected to fail
   until diagnostics are `gettext()`-wrapped.
 - [ ] No test pins the `-j` job-ID semantics for immediate vs `-r` transfers (#UC1).

@@ -96,6 +96,15 @@ fn main() -> ExitCode {
         }
     };
 
+    // Reject an output pathname containing an encoded <newline> (POSIX FUTURE
+    // DIRECTIONS, Austin Group Defect 251).
+    if let Some(ref out) = parsed.output_file {
+        if out.path.contains('\n') {
+            eprintln!("uux: {}", gettext("output pathname contains a newline"));
+            return ExitCode::from(1);
+        }
+    }
+
     // Read stdin if -p specified
     let stdin_data = if pipe_stdin {
         let mut data = Vec::new();

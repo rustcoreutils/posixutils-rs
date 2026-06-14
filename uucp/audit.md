@@ -90,14 +90,14 @@ None.
   `.unwrap()`-ed in `main`.** ✓ Phase 1: replaced with `.ok()` in all three
   `main()` so a hostile locale environment degrades gracefully instead of
   panicking.
-- [ ] **#UC1 — `-j` emits a throwaway job ID for immediate transfers that
-  `uustat` cannot act on.** `uucp.rs:223-225` calls `generate_job_id()` for a
-  non-`-r` transfer and prints it; no `J.*` spool record exists, so the ID is
-  meaningless. `uux.rs:110-114` does the same — and `uux` *never* persists a job,
-  so its `-j` ID is *always* unusable by `uustat`. POSIX: the job ID "can be used
-  by `uustat` to obtain the status or terminate a job." Fix: for `uucp`, print
-  the queued job's ID only when a job is actually created (i.e. effectively only
-  meaningful under `-r`); for `uux`, document that the ID is informational only.
+- [x] **#UC1 — `-j` emits a throwaway job ID for immediate transfers that
+  `uustat` cannot act on.** ✓ Phase 4 (tidy): `uucp` now generates one job ID per
+  invocation and uses it for *both* the persisted job (under `-r`) and the `-j`
+  output, so `uucp -r -j` prints exactly the ID `uustat` then lists (covered by
+  `test_uustat_with_queued_job`). For an immediate (synchronous) transfer the ID
+  is documented as informational — the copy completes before `uucp` exits, so
+  there is no queued job to query; likewise `uux`'s `-j` ID is informational (it
+  never persists a job). This is inherent to the deliberate no-daemon design.
 - [x] **#G3 — Current-user identity and `uustat` ownership checks use `$USER`,
   not `getpwuid(getuid())`.** ✓ Phase 2: added `common::current_login()`
   (`getpwuid(getuid())` via `plib::user::get_by_uid`, env only as fallback) and
@@ -113,10 +113,12 @@ None.
   shell cannot expand it either. POSIX OPERANDS describes `~user` on the remote
   system. Fix: resolve `~user` against the remote (or document the limitation);
   note that single-quoting deliberately defeats remote tilde/glob expansion.
-- [ ] **#G4 — Newline-in-filename is not rejected (FUTURE DIRECTIONS).** Neither
-  `uucp` nor `uux` rejects a destination pathname containing an encoded
-  `<newline>`. POSIX FUTURE DIRECTIONS only *encourages* this today (Austin Group
-  Defect 251), so it is optional — track only.
+- [x] **#G4 — Newline-in-filename is not rejected (FUTURE DIRECTIONS).** ✓ Phase 4:
+  `uucp` rejects a destination pathname containing an encoded `<newline>` with a
+  non-zero exit (new `test_uucp_newline_in_destination_rejected`); `uux` has the
+  same defensive check on its output path (in practice unreachable there because
+  the command-string is whitespace-tokenized, so a newline cannot survive into a
+  path token). POSIX FUTURE DIRECTIONS (Austin Group Defect 251).
 
 ## Cross-cutting findings (`uucp/common.rs` + shared patterns)
 

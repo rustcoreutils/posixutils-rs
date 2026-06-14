@@ -42,6 +42,24 @@ fn uucp_test_with_checker<F: FnMut(&TestPlan, &Output)>(args: &[&str], checker: 
 }
 
 #[test]
+fn test_uucp_newline_in_destination_rejected() {
+    // POSIX FUTURE DIRECTIONS: a destination pathname containing an encoded
+    // <newline> is rejected with a non-zero exit (the check runs before any
+    // transfer, so the source need not exist).
+    uucp_test_with_checker(&["somesrc", "bad\nname"], |_, output| {
+        assert!(
+            !output.status.success(),
+            "newline in destination should fail"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("newline"),
+            "expected newline diagnostic, got: {stderr}"
+        );
+    });
+}
+
+#[test]
 fn test_uucp_no_args() {
     // No arguments should show usage and fail
     uucp_test_with_checker(&[], |_, output| {

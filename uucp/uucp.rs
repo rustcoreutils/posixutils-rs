@@ -66,6 +66,12 @@ fn main() -> ExitCode {
     // -d is the default, -f overrides it
     let create_dirs = !args.no_create_dirs;
 
+    // A single job ID for this invocation: it is persisted under -r and printed
+    // by -j. For an immediate (synchronous) transfer the ID is informational —
+    // the copy completes before uucp exits, so there is no queued job for uustat
+    // to query or kill.
+    let job_id = generate_job_id();
+
     // Split files into sources and destination
     let mut files = args.files.clone();
     let dest_spec = files.pop().unwrap();
@@ -78,6 +84,16 @@ fn main() -> ExitCode {
     // Check for unsupported routing (system!system!path)
     if dest_path.contains('!') {
         eprintln!("uucp: {}", gettext("route specification not supported"));
+        return ExitCode::from(1);
+    }
+
+    // Reject a destination pathname containing an encoded <newline> (POSIX
+    // FUTURE DIRECTIONS, Austin Group Defect 251).
+    if dest_path.contains('\n') {
+        eprintln!(
+            "uucp: {}",
+            gettext("destination pathname contains a newline")
+        );
         return ExitCode::from(1);
     }
 
@@ -163,7 +179,9 @@ fn main() -> ExitCode {
 
             if job.is_none() {
                 let request = format!("{} -> {}", source_spec, dest_spec);
-                job = Some(Job::new(system, "uucp", &request));
+                let mut j = Job::new(system, "uucp", &request);
+                j.id = job_id.clone();
+                job = Some(j);
             }
         } else {
             // Execute transfer immediately
@@ -220,9 +238,9 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
-    // Print job ID if requested (for immediate execution, generate one)
+    // Print the (informational) job ID for an immediate transfer if requested.
     if args.print_job_id {
-        println!("{}", generate_job_id());
+        println!("{}", job_id);
     }
 
     // Send mail to requester if -m specified and successful

@@ -113,8 +113,10 @@ fn write_path(path: &Path) -> bool {
     }
 
     let mut out = io::stdout().lock();
-    let _ = out.write_all(bytes);
-    let _ = out.write_all(b"\n");
+    if let Err(e) = out.write_all(bytes).and_then(|_| out.write_all(b"\n")) {
+        diag::error(&format!("{}: {}", gettext("write error"), e));
+        return false;
+    }
     true
 }
 

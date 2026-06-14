@@ -46,8 +46,12 @@ fn show_dirname(args: &Args) {
     }
 
     let mut out = io::stdout().lock();
-    let _ = out.write_all(result.as_bytes());
-    let _ = out.write_all(b"\n");
+    if let Err(e) = out
+        .write_all(result.as_bytes())
+        .and_then(|_| out.write_all(b"\n"))
+    {
+        diag::error(&format!("{}: {}", gettext("write error"), e));
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

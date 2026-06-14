@@ -79,8 +79,9 @@ fn show_basename(args: &Args) {
     }
 
     let mut out = io::stdout().lock();
-    let _ = out.write_all(&result);
-    let _ = out.write_all(b"\n");
+    if let Err(e) = out.write_all(&result).and_then(|_| out.write_all(b"\n")) {
+        diag::error(&format!("{}: {}", gettext("write error"), e));
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

@@ -420,11 +420,7 @@ fn main() -> ExitCode {
                 } else if let Some(stripped) = arg.strip_prefix("-u") {
                     user_filter = Some(stripped.to_string());
                 } else if *arg == "-U" {
-                    user_filter = Some(
-                        env::var("LOGNAME")
-                            .or_else(|_| env::var("USER"))
-                            .unwrap_or_default(),
-                    );
+                    user_filter = Some(plib::sccsfile::real_login_name());
                 }
             }
 

@@ -67,9 +67,7 @@ struct Args {
 }
 
 fn get_username() -> String {
-    std::env::var("USER")
-        .or_else(|_| std::env::var("LOGNAME"))
-        .unwrap_or_else(|_| "unknown".to_string())
+    plib::sccsfile::real_login_name()
 }
 
 fn read_input_file(path: Option<&str>) -> io::Result<Vec<String>> {

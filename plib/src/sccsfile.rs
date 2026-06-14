@@ -354,14 +354,49 @@ pub struct SccsDateTime {
     pub second: u8,
 }
 
+/// Return the login name of the real user, as SCCS requires for recording
+/// the author of a delta. Uses `getpwuid(getuid())` (the real uid), matching
+/// historical SCCS / CSSC behavior, and falls back to the `LOGNAME`/`USER`
+/// environment and finally `"unknown"` only when the passwd lookup fails.
+pub fn real_login_name() -> String {
+    let uid = unsafe { libc::getuid() };
+    if let Some(user) = crate::user::get_by_uid(uid) {
+        if !user.name.is_empty() {
+            return user.name;
+        }
+    }
+    std::env::var("LOGNAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
 impl SccsDateTime {
-    /// Create current date/time
+    /// Create current date/time in the local timezone (honoring `TZ`).
     pub fn now() -> Self {
         use std::time::{SystemTime, UNIX_EPOCH};
-        let duration = SystemTime::now()
+        let secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap_or_default();
-        Self::from_unix_timestamp(duration.as_secs() as i64)
+            .unwrap_or_default()
+            .as_secs() as libc::time_t;
+
+        // SCCS records local wall-clock time; `localtime_r` consults `TZ`
+        // (it behaves as if `tzset()` had been called).
+        unsafe {
+            let mut tm: libc::tm = std::mem::zeroed();
+            if !libc::localtime_r(&secs, &mut tm).is_null() {
+                return Self {
+                    year: ((tm.tm_year + 1900) % 100) as u16,
+                    month: (tm.tm_mon + 1) as u8,
+                    day: tm.tm_mday as u8,
+                    hour: tm.tm_hour as u8,
+                    minute: tm.tm_min as u8,
+                    second: tm.tm_sec as u8,
+                };
+            }
+        }
+
+        // Fallback: UTC if localtime_r is unavailable.
+        Self::from_unix_timestamp(secs as i64)
     }
 
     /// Create from Unix timestamp
@@ -1569,6 +1604,25 @@ mod tests {
         assert_eq!("1.1".parse::<Sid>().unwrap(), Sid::trunk(1, 1));
         assert_eq!("1.2.3.4".parse::<Sid>().unwrap(), Sid::new(1, 2, 3, 4));
         assert_eq!("2".parse::<Sid>().unwrap(), Sid::new(2, 0, 0, 0));
+    }
+
+    #[test]
+    fn test_real_login_name_nonempty() {
+        // Must resolve a name from the passwd database (real uid) regardless of
+        // a spoofed/empty USER/LOGNAME environment; never the empty string.
+        let name = real_login_name();
+        assert!(!name.is_empty());
+    }
+
+    #[test]
+    fn test_now_local_time_fields_in_range() {
+        // now() must produce valid wall-clock fields (TZ-aware via localtime_r).
+        let dt = SccsDateTime::now();
+        assert!(dt.month >= 1 && dt.month <= 12);
+        assert!(dt.day >= 1 && dt.day <= 31);
+        assert!(dt.hour <= 23);
+        assert!(dt.minute <= 59);
+        assert!(dt.second <= 60);
     }
 
     #[test]

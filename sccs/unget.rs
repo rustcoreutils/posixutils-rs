@@ -36,9 +36,7 @@ struct Args {
 }
 
 fn get_current_user() -> String {
-    std::env::var("LOGNAME")
-        .or_else(|_| std::env::var("USER"))
-        .unwrap_or_else(|_| "unknown".to_string())
+    plib::sccsfile::real_login_name()
 }
 
 fn unget_file(sfile: &Path, args: &Args) -> io::Result<bool> {

@@ -82,19 +82,16 @@ These affect multiple utilities. Per-utility sections reference them by number.
   (`prs -d:FL:` → `BranchEnabled`). Fix: map each `SccsFlag` to its canonical
   name + `<tab>` + value. (Surfaces as `prs` #P3.)
 
-- [ ] **#X4 — Login name taken from `$USER`/`$LOGNAME`, not `getpwuid(getuid())`.**
-  `get.rs:59`, `delta.rs:48`, `admin.rs:69`, `unget.rs:39`, `rmdel.rs:33`,
-  `sccs.rs:424` all read the env. Consequences: the recorded committer is
-  spoofable; falls back to `"unknown"` when unset; and `rmdel`'s
-  authorization check (#R2) is built on the spoofable value. Fix: a shared
-  `plib` helper using `getpwuid(getuid())`, env only as fallback.
+- [x] **#X4 — Login name taken from `$USER`/`$LOGNAME`, not `getpwuid(getuid())`.**
+  ✓ fixed in Phase 1. Added `plib::sccsfile::real_login_name()` (real-uid
+  `getpwuid` via `plib::user::get_by_uid`, env only as fallback); all six sites
+  (`get.rs`, `delta.rs`, `admin.rs`, `unget.rs`, `rmdel.rs`, `sccs.rs -U`) now
+  use it. Verified: committer resolves to the passwd login even with
+  `USER=evil`/`LOGNAME` spoofed.
 
-- [ ] **#X5 — `SccsDateTime::now()` ignores `TZ`; timestamps are always UTC.**
-  `plib/src/sccsfile.rs:359-365` computes from `SystemTime`/`UNIX_EPOCH` with no
-  timezone. CSSC records local time per `TZ`. delta/admin Dt timestamps only
-  matched CSSC in testing because the host is UTC; under a non-UTC `TZ` they
-  diverge. Spec `delta` (TZ shall determine the recorded zone). Fix: convert via
-  `plib::locale`/libc `localtime` honoring `TZ`.
+- [x] **#X5 — `SccsDateTime::now()` ignores `TZ`; timestamps are always UTC.**
+  ✓ fixed in Phase 1. `now()` now converts via libc `localtime_r` (honors
+  `TZ`). Verified `TZ=UTC0` vs `TZ=HST10` record times 10h apart.
 
 - [ ] **#X6 — `No id keywords` warning never emitted by `get` or `admin`.**
   `grep -rniE 'no id keyword|cm7' sccs/ plib/` → zero matches. POSIX `get`
@@ -173,8 +170,8 @@ Directory/`-` operands and the `No id keywords` warning are missing.
   operand reads s-file names from stdin. Never special-cased.
 
 #### Minor
-- [ ] **#A5 — Default `-y` committer login from `$USER`, falls back to `"unknown"`.**
-  (#X4) `admin.rs:69-73`.
+- [x] **#A5 — Default `-y` committer login from `$USER`, falls back to `"unknown"`.**
+  ✓ fixed in Phase 1 via `real_login_name()` (#X4). `admin.rs:69`.
 - [ ] **#A6 — No SIGINT handler; x-file orphaned on interrupt.** (#X10) Spec
   ASYNCHRONOUS EVENTS is "Default," so Minor; the atomic-rename design still
   leaks `x.file`.

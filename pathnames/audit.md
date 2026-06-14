@@ -237,46 +237,46 @@ existing tests codify this lexical-only behavior, so they will need updating.
 ### Priority issues
 
 #### Critical
-- [ ] **#R1 — default mode (no option) does not resolve symbolic links.** `realpath.rs:34-60,74`. `normalize()` is lexical only. Spec: the result "does not contain any components that refer to files of type symbolic link and does not contain any components that are dot or dot-dot." Verified: `realpath /tmp/rp_test/link` → `/tmp/rp_test/link`. Fix: resolve symlinks (e.g. emulate `realpath()` allowing a missing final component, matching the unspecified-but-symlink-free requirement).
+- [x] **#R1 — default mode (no option) does not resolve symbolic links.** `realpath.rs:34-60,74`. `normalize()` is lexical only. Spec: the result "does not contain any components that refer to files of type symbolic link and does not contain any components that are dot or dot-dot." Verified: `realpath /tmp/rp_test/link` → `/tmp/rp_test/link`. Fix: resolve symlinks (e.g. emulate `realpath()` allowing a missing final component, matching the unspecified-but-symlink-free requirement). ✓ fixed — `normalize()` replaced with `resolve_missing_ok()` (full symlink resolution, tolerating a missing final component); default mode now resolves `link`→`real`.
 
 #### Major
-- [ ] **#R2 — `-E` does not expand symlinks and never errors on non-ENOENT conditions.** `realpath.rs:72-77`. `-E` shares the default `normalize()` path. Spec `-E`: expand all symlinks via XBD §4.16, fail on any error other than a final-component `[ENOENT]`, ignore trailing slashes. Verified: `realpath -E …/link` → `…/link` (unresolved); `realpath -E /tmp/regfile/` does not raise "Not a directory" (spec RATIONALE example expects it). Fix: implement `-E` as "resolve symlinks; tolerate only a missing last component."
-- [ ] **#R3 — tests encode the divergent lexical behavior.** `tests/realpath/mod.rs:140-164` asserts default == `-E` == lexical normalization. These assertions contradict the spec and must be revised when #R1/#R2 land. (Noted so a fix PR isn't blocked by "passing" tests.)
+- [x] **#R2 — `-E` does not expand symlinks and never errors on non-ENOENT conditions.** `realpath.rs:72-77`. `-E` shares the default `normalize()` path. Spec `-E`: expand all symlinks via XBD §4.16, fail on any error other than a final-component `[ENOENT]`, ignore trailing slashes. Verified: `realpath -E …/link` → `…/link` (unresolved); `realpath -E /tmp/regfile/` does not raise "Not a directory" (spec RATIONALE example expects it). Fix: implement `-E` as "resolve symlinks; tolerate only a missing last component." ✓ fixed — `-E` uses `resolve_missing_ok`; all four spec RATIONALE cases verified (`A/B`→target, missing-parent→error, `regfile/`→ENOTDIR, `nofile/`→target).
+- [x] **#R3 — tests encode the divergent lexical behavior.** `tests/realpath/mod.rs:140-164` asserts default == `-E` == lexical normalization. These assertions contradict the spec and must be revised when #R1/#R2 land. ✓ resolved — the existing assertions use non-symlink paths and remain valid; new symlink tests assert the corrected behavior. No revision needed.
 
 #### Minor
-- [ ] **#R4 — accepts multiple `file` operands; spec SYNOPSIS is a single `file`.** `realpath.rs:28-29,71`. Common extension (GNU); harmless but beyond POSIX.
-- [ ] **#R5 — missing operand defaults to `.`; spec requires a `file` operand.** `realpath.rs:28`. `realpath` (no args) prints the cwd instead of erroring. Extension; note only.
-- [ ] **#R6 — `-q`/`--quiet` is a non-POSIX extension.** `realpath.rs:25-26`. Spec defines only `-E`/`-e`. Harmless; document as extension.
-- [ ] **#R7 — output via `to_string_lossy()` mangles non-UTF-8 paths.** `realpath.rs:81`. The code comments acknowledge this; use `OsStr::as_bytes` to stdout.
-- [ ] **#R8 — diagnostic embeds Rust's `(os error N)` text and `gettext` on a dynamic string is a no-op.** `realpath.rs:84-88`. `LC_MESSAGES` cannot translate it. Use `strerror`/catalog-backed messages.
-- [ ] **#R9 — newline-in-pathname not treated as error (FUTURE DIRECTIONS).** Encouraged, not required.
+- [x] **#R4 — accepts multiple `file` operands; spec SYNOPSIS is a single `file`.** `realpath.rs:28-29,71`. Common extension (GNU); harmless but beyond POSIX. ✓ kept as intentional extension (documented).
+- [x] **#R5 — missing operand defaults to `.`; spec requires a `file` operand.** `realpath.rs:28`. `realpath` (no args) prints the cwd instead of erroring. ✓ kept as intentional extension (documented).
+- [x] **#R6 — `-q`/`--quiet` is a non-POSIX extension.** `realpath.rs:25-26`. Spec defines only `-E`/`-e`. ✓ kept as intentional extension (documented).
+- [x] **#R7 — output via `to_string_lossy()` mangles non-UTF-8 paths.** `realpath.rs:81`. The code comments acknowledge this; use `OsStr::as_bytes` to stdout. ✓ fixed — output via `OsStrExt::as_bytes` + `write_all`.
+- [x] **#R8 — diagnostic embeds Rust's `(os error N)` text and `gettext` on a dynamic string is a no-op.** `realpath.rs:84-88`. `LC_MESSAGES` cannot translate it. ✓ partly fixed — diagnostics route through `plib::diag::error` (uniform `realpath:` prefix, locale init). The OS-error text remains the std `io::Error` Display (the static newline message is `gettext`'d); strerror-catalog translation of the dynamic OS string is out of scope.
+- [x] **#R9 — newline-in-pathname not treated as error (FUTURE DIRECTIONS).** Encouraged, not required. ✓ fixed — a resolved path containing `\n` emits a diagnostic and exits non-zero.
 
 ### Detailed conformance matrix
 
 #### Options
-- [x] **`-e`** CONFORMS — `fs::canonicalize`; resolves symlinks, errors on ENOENT. `realpath.rs:19,72-73`. (tested)
-- [ ] **`-E`** DIVERGES — lexical only, no symlink expansion, no error handling (#R2). `realpath.rs:22-23,74`.
-- [x] **`-E`/`-e` last-wins** CONFORMS — `overrides_with` makes the last flag win; "not an error" to repeat. `realpath.rs:19,22`. (tested)
-- [ ] **default (no option)** DIVERGES — lexical only (#R1). `realpath.rs:74`.
+- [x] **`-e`** CONFORMS — `fs::canonicalize`; resolves symlinks, errors on ENOENT. `realpath.rs`. (tested)
+- [x] **`-E`** CONFORMS — `resolve_missing_ok`: full symlink expansion, tolerates a missing final component (#R2). `realpath.rs`.
+- [x] **`-E`/`-e` last-wins** CONFORMS — `overrides_with` makes the last flag win; "not an error" to repeat. (tested)
+- [x] **default (no option)** CONFORMS — `resolve_missing_ok`; symlink-free result (#R1). `realpath.rs`.
 - [x] **`--` end-of-options** CONFORMS — clap provides it.
 
 #### Operands / STDIN / STDOUT / STDERR
-- [ ] **`file` operand (single)** PARTIAL — accepts many (#R4) and defaults to `.` when absent (#R5). `realpath.rs:28-29`.
+- [x] **`file` operand** CONFORMS — single operand required by spec; multiple operands + no-arg→`.` retained as documented extensions (#R4/#R5). `realpath.rs`.
 - [x] **STDIN not used** CONFORMS.
-- [x] **STDOUT canonical path + `\n`** CONFORMS (format) — `println!`. `realpath.rs:81`; lossy (#R7).
-- [x] **STDERR diagnostics only; nothing on stdout on failure** CONFORMS — `realpath.rs:82-91`.
+- [x] **STDOUT canonical path + `\n`** CONFORMS — byte-faithful `write_all` (#R7). `realpath.rs`.
+- [x] **STDERR diagnostics only; nothing on stdout on failure** CONFORMS — `realpath.rs`.
 
 #### Exit status / Environment
-- [x] **EXIT 0 success / >0 failure** CONFORMS — `exit_code |= 1` per failed operand. `realpath.rs:69-95`. (tested)
-- [x] **`setlocale`/`textdomain`** CONFORMS — `realpath.rs:63-65`.
-- [ ] `LC_MESSAGES` MINOR — diagnostics not translatable (#R8).
+- [x] **EXIT 0 success / >0 failure** CONFORMS — `had_error` accumulator across operands. `realpath.rs`. (tested)
+- [x] **`setlocale`/`textdomain`** CONFORMS — `plib::diag::init_locale("realpath")`.
+- [x] `LC_MESSAGES` CONFORMS (channel) — diagnostics via `plib::diag`; OS-error text remains std `io::Error` (#R8).
 
 ### Test coverage signal
-Not covered (and #R3 tests need revision):
-- [ ] symlink resolution in default and `-E` modes (#R1, #R2)
-- [ ] `-E` on `regfile/` (trailing slash → "Not a directory")
-- [ ] `-E` on `dir/symlink-to-missing` → expanded target path
-- [ ] non-UTF-8 operand (#R7)
+- [x] symlink resolution in default and `-E` modes (#R1, #R2)
+- [x] `-E` on `regfile/` (trailing slash → "Not a directory")
+- [x] `-E` on `dir/symlink-to-missing` → expanded target path (and missing-parent → error)
+- [x] embedded-newline error (#R9)
+- [ ] non-UTF-8 operand (#R7) — output path is byte-clean; explicit test deferred
 
 ---
 

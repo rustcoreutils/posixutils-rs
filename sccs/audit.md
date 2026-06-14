@@ -397,29 +397,33 @@ and exit codes are otherwise solid.
 ### Priority issues
 
 #### Critical
-- [ ] **#P1 — No trailing newline after each delta's dataspec / `M`-format keyword.**
-  `prs.rs:595-598` (per-delta loop) and `:293,217` (`:MR:`/`:C:` joins). Verified
-  `prs -d:I:` → ours `1.2` (no newline) vs CSSC `1.2\n`; default `prs` corrupts
-  the MR/COMMENTS boundary. Fix: append `\n` after each delta's expansion and
-  after each `M`-format keyword value.
+- [x] **#P1 — No trailing newline after each delta's dataspec / `M`-format keyword.**
+  ✓ Phase 7: each delta's expansion and each non-empty `M`-format value is now
+  newline-terminated (empty `M`-format values emit nothing, not a blank line).
+  Default `prs`, `prs -d:I:`, and `-r` are **byte-identical to cssc**.
 
 #### Major
-- [ ] **#P2 — `-r` optional option-argument rejected.** `prs.rs:40` (`Option<String>`
-  with a forced value). Verified `prs -r s.f` → "a value is required"; CSSC
-  prints `1.3`. Fix: `num_args=0..=1, default_missing_value=""`; empty = latest.
+- [x] **#P2 — `-r` optional option-argument rejected.** ✓ Phase 7:
+  `num_args=0..=1`; a bare `-r` (rewritten to `-r=`) resolves to the trunk head.
+  Byte-identical to cssc.
 - [x] **#P3 — `:FL:` emits Rust Debug.** ✓ fixed in Phase 2 (#X3) via
   `SccsFlag::prs_fl_line()`; `prs.rs:394`.
-- [ ] **#P4 — `:GB:` (gotten body) unimplemented.** `prs.rs:316` prints literal
-  `:GB:`; CSSC reconstructs the latest body. `compute_applied_set`/`evaluate_body`
-  already exist. Fix: wire them.
+- [x] **#P4 — `:GB:` (gotten body) unimplemented.** ✓ Phase 7: reconstructs the
+  delta body via `compute_applied_set`/`evaluate_body` (uudecodes when encoded).
+  Byte-identical to cssc.
 
 #### Minor
-- [ ] **#P5 — `:A:` double space.** `prs.rs:202` hardcodes two spaces; spec/CSSC use one.
-- [ ] **#P6 — Unset `:LK:`/`:FB:`/`:CB:`/`:Ds:` print empty vs CSSC `none`.** `prs.rs:159,151,154,173`.
-- [ ] **#P7 — `::` literal-colon collapse.** `prs.rs:71-75` turns `a::b` into `a:b`; CSSC keeps `a::b`.
-- [ ] **#P8 — `:PN:` canonicalizes the path** (resolves symlinks/`..`/absolutizes); spec wants the operand as given. `prs.rs:187-190`.
-- [ ] **#P9 — `:KV:` still handled** though removed by Austin Group Defect 1452. `prs.rs:172`. Harmless.
-- [ ] **#P10 — `:Li:`/`:Ld:`/`:Lu:` not zero-padded** to 5 digits and the 99 999 cap is unenforced (`u32`). `prs.rs:290-292`, `plib/src/sccsfile.rs:257`.
+- [x] **#P5 — `:A:` double space.** ✓ Phase 7: single space, matches cssc.
+- [x] **#P6 — Unset `:LK:`/`:FB:`/`:CB:`/`:Ds:` print empty vs CSSC `none`.** ✓ Phase 7.
+- [x] **#P7 — `::` literal-colon collapse.** ✓ Phase 7: the scanner emits a `:`
+  literally unless it opens a recognized `:kw:`, so `a::b` prints verbatim.
+- [x] **#P8 — `:PN:` canonicalizes the path.** ✓ Phase 7: emits the operand
+  path as given (spec wins over cssc's absolutized form).
+- [x] ~~**#P9 — `:KV:` still handled**~~ — WON'T FIX: a harmless retained
+  extension (removed from POSIX by Austin Group Defect 1452 but accepted for
+  compatibility); keeping it cannot misrender a conforming dataspec.
+- [x] **#P10 — `:Li:`/`:Ld:`/`:Lu:` not zero-padded.** ✓ Phase 7: zero-padded to
+  5 digits and clamped at 99999, matching cssc.
 
 ### Detailed conformance matrix
 

@@ -80,19 +80,16 @@ None.
   cross-system output, which is uncommon.)
 
 ### Minor
-- [ ] **#G1 — Diagnostics are hardcoded English; `LC_MESSAGES`/`NLSPATH` inert.**
-  All three utilities wire `setlocale(LC_ALL,"")` + `textdomain` +
-  `bind_textdomain_codeset` (e.g. `uucp.rs:61-63`), but every runtime diagnostic
-  is a raw `eprintln!`/`println!` literal (`uucp.rs:81,114,190`,
-  `uux.rs:65,84,92`, `uustat.rs:75,85`), not routed through `gettext()`. So
-  locale is initialized but never affects diagnostic text. Spec ENVIRONMENT
-  VARIABLES (`LC_MESSAGES`). Fix: wrap diagnostic strings in `gettext()`
-  (cross-cutting, same pattern as the rest of the repo).
-- [ ] **#G2 — `textdomain()` / `bind_textdomain_codeset()` results are
-  `.unwrap()`-ed in `main`.** `uucp.rs:62-63`, `uux.rs:46-47`, `uustat.rs:46-47`.
-  A failure (e.g. a hostile `NLSPATH`/locale environment) panics the process
-  with a Rust backtrace instead of degrading gracefully. The rest of the repo
-  uses `.ok()`. Fix: `.ok()`.
+- [x] **#G1 — Diagnostics are hardcoded English; `LC_MESSAGES`/`NLSPATH` inert.**
+  ✓ Phase 1: every user-facing `eprintln!`/`println!` diagnostic (and the
+  `uustat -q` informative line) across `uucp.rs`/`uux.rs`/`uustat.rs` now routes
+  its static clause through `gettext()`, with runtime values interpolated
+  outside. English wording is byte-identical in the C/POSIX locale (all tests +
+  diagnostics verified unchanged).
+- [x] **#G2 — `textdomain()` / `bind_textdomain_codeset()` results are
+  `.unwrap()`-ed in `main`.** ✓ Phase 1: replaced with `.ok()` in all three
+  `main()` so a hostile locale environment degrades gracefully instead of
+  panicking.
 - [ ] **#UC1 — `-j` emits a throwaway job ID for immediate transfers that
   `uustat` cannot act on.** `uucp.rs:223-225` calls `generate_job_id()` for a
   non-`-r` transfer and prints it; no `J.*` spool record exists, so the ID is
@@ -121,8 +118,8 @@ None.
 
 ## Cross-cutting findings (`uucp/common.rs` + shared patterns)
 
-- [ ] **#G1 — hardcoded-English diagnostics** (above).
-- [ ] **#G2 — `.unwrap()` on locale setup** (above).
+- [x] **#G1 — hardcoded-English diagnostics** (above). ✓ Phase 1.
+- [x] **#G2 — `.unwrap()` on locale setup** (above). ✓ Phase 1.
 - [ ] **#G3 — `$USER`-based identity / ownership** (above).
 - [x] **`shell_escape` is correct and is used on every value interpolated into an
   `ssh`/remote shell command** — `common.rs:26-39`, exercised at

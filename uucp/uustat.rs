@@ -43,8 +43,8 @@ struct Args {
 
 fn main() -> ExitCode {
     setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs").unwrap();
-    bind_textdomain_codeset("posixutils-rs", "UTF-8").unwrap();
+    textdomain("posixutils-rs").ok();
+    bind_textdomain_codeset("posixutils-rs", "UTF-8").ok();
 
     let args = Args::parse();
 
@@ -62,7 +62,7 @@ fn main() -> ExitCode {
             *counts.entry(job.system.clone()).or_insert(0) += 1;
         }
         for (system, count) in counts {
-            println!("{}: {} job(s) queued", system, count);
+            println!("{}: {} {}", system, count, gettext("job(s) queued"));
         }
     } else if let Some(jid) = args.kill_job {
         match find_job(&jid) {
@@ -72,17 +72,21 @@ fn main() -> ExitCode {
                 let is_root = current_user == "root";
 
                 if job.user != current_user && !is_root {
-                    eprintln!("uustat: permission denied to kill job {}", jid);
+                    eprintln!(
+                        "uustat: {} {}",
+                        gettext("permission denied to kill job:"),
+                        jid
+                    );
                     return ExitCode::from(1);
                 }
 
                 if let Err(e) = job.delete() {
-                    eprintln!("uustat: failed to delete job {}: {}", jid, e);
+                    eprintln!("uustat: {} {}: {}", gettext("failed to delete job"), jid, e);
                     return ExitCode::from(1);
                 }
             }
             None => {
-                eprintln!("uustat: job {} not found", jid);
+                eprintln!("uustat: {} {}", gettext("job not found:"), jid);
                 return ExitCode::from(1);
             }
         }
@@ -94,17 +98,26 @@ fn main() -> ExitCode {
                 let is_root = current_user == "root";
 
                 if job.user != current_user && !is_root {
-                    eprintln!("uustat: permission denied to rejuvenate job {}", jid);
+                    eprintln!(
+                        "uustat: {} {}",
+                        gettext("permission denied to rejuvenate job:"),
+                        jid
+                    );
                     return ExitCode::from(1);
                 }
 
                 if let Err(e) = job.rejuvenate() {
-                    eprintln!("uustat: failed to rejuvenate job {}: {}", jid, e);
+                    eprintln!(
+                        "uustat: {} {}: {}",
+                        gettext("failed to rejuvenate job"),
+                        jid,
+                        e
+                    );
                     return ExitCode::from(1);
                 }
             }
             None => {
-                eprintln!("uustat: job {} not found", jid);
+                eprintln!("uustat: {} {}", gettext("job not found:"), jid);
                 return ExitCode::from(1);
             }
         }

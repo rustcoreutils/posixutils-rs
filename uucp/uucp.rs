@@ -59,8 +59,8 @@ struct Args {
 
 fn main() -> ExitCode {
     setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs").unwrap();
-    bind_textdomain_codeset("posixutils-rs", "UTF-8").unwrap();
+    textdomain("posixutils-rs").ok();
+    bind_textdomain_codeset("posixutils-rs", "UTF-8").ok();
 
     let args = Args::parse();
 
@@ -78,7 +78,7 @@ fn main() -> ExitCode {
 
     // Check for unsupported routing (system!system!path)
     if dest_path.contains('!') {
-        eprintln!("uucp: route specification not supported");
+        eprintln!("uucp: {}", gettext("route specification not supported"));
         return ExitCode::from(1);
     }
 
@@ -87,7 +87,8 @@ fn main() -> ExitCode {
         && (dest_path.contains('*') || dest_path.contains('?') || dest_path.contains('['))
     {
         eprintln!(
-            "uucp: warning: wildcard expansion not supported for remote paths: {}",
+            "uucp: {}: {}",
+            gettext("warning: wildcard expansion not supported for remote paths"),
             dest_path
         );
     }
@@ -111,7 +112,7 @@ fn main() -> ExitCode {
 
         // Check for unsupported routing
         if src_path.contains('!') {
-            eprintln!("uucp: route specification not supported");
+            eprintln!("uucp: {}", gettext("route specification not supported"));
             return ExitCode::from(1);
         }
 
@@ -122,7 +123,8 @@ fn main() -> ExitCode {
             && (src_path.contains('*') || src_path.contains('?') || src_path.contains('['))
         {
             eprintln!(
-                "uucp: warning: wildcard expansion not supported for remote paths: {}",
+                "uucp: {}: {}",
+                gettext("warning: wildcard expansion not supported for remote paths"),
                 src_path
             );
         }
@@ -206,7 +208,7 @@ fn main() -> ExitCode {
     // Handle queued job
     if let Some(j) = job {
         if let Err(e) = j.save() {
-            eprintln!("uucp: failed to queue job: {}", e);
+            eprintln!("uucp: {}: {}", gettext("failed to queue job"), e);
             return ExitCode::from(1);
         }
         if args.print_job_id {

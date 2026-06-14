@@ -43,8 +43,8 @@ struct Args {
 
 fn main() -> ExitCode {
     setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs").unwrap();
-    bind_textdomain_codeset("posixutils-rs", "UTF-8").unwrap();
+    textdomain("posixutils-rs").ok();
+    bind_textdomain_codeset("posixutils-rs", "UTF-8").ok();
 
     let args = Args::parse();
 
@@ -62,15 +62,15 @@ fn main() -> ExitCode {
 
     // Check for too many non-option arguments (should be exactly one command string)
     if command_parts.len() > 1 {
-        eprintln!("uux: too many arguments");
-        eprintln!("usage: uux [-jnp] [-] command-string");
+        eprintln!("uux: {}", gettext("too many arguments"));
+        eprintln!("{}", gettext("usage: uux [-jnp] [-] command-string"));
         return ExitCode::from(1);
     }
 
     let cmd_str = match command_parts.first() {
         Some(s) => *s,
         None => {
-            eprintln!("usage: uux [-jnp] [-] command-string");
+            eprintln!("{}", gettext("usage: uux [-jnp] [-] command-string"));
             return ExitCode::from(1);
         }
     };
@@ -81,7 +81,10 @@ fn main() -> ExitCode {
         || cmd_str.contains(">|")
         || cmd_str.contains(">&")
     {
-        eprintln!("uux: redirection operators >>, <<, >|, >& not allowed");
+        eprintln!(
+            "uux: {}",
+            gettext("redirection operators >>, <<, >|, >& not allowed")
+        );
         return ExitCode::from(1);
     }
 
@@ -98,7 +101,7 @@ fn main() -> ExitCode {
     let stdin_data = if pipe_stdin {
         let mut data = Vec::new();
         if io::stdin().read_to_end(&mut data).is_err() {
-            eprintln!("uux: failed to read stdin");
+            eprintln!("uux: {}", gettext("failed to read stdin"));
             return ExitCode::from(1);
         }
         Some(data)

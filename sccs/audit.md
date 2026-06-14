@@ -552,14 +552,12 @@ returns a non-zero exit on a genuine error. **No Critical or Major defects.**
 ### Priority issues
 
 #### Minor
-- [ ] **#S1 — Exit status always SUCCESS.** `sact.rs:117,122,124,129` discard every
-  result (`.ok()`). A corrupt p-file or unreadable named operand still exits 0.
-  Spec: ">0 An error occurred." Fix: thread an error flag; return FAILURE on a
-  named-operand failure.
-- [ ] **#S2 — stdin `-` header forced when first operand is `-` even in a multi-operand list.**
-  `sact.rs:93-99`. Edge case.
-- [ ] **#S3 — "no pending delta" informative message absent.** Spec marks it
-  optional and CSSC is also silent — CONFORMS in practice; no action.
+- [x] **#S1 — Exit status always SUCCESS.** ✓ Phase 8: a parse failure on a named
+  operand (or `read_dir` failure) now yields a non-zero exit; no-pending stays 0.
+- [x] **#S2 — stdin `-` header forced when first operand is `-` even in a multi-operand list.**
+  ✓ Phase 8: header now gates on stdin / >1 file / directory.
+- [x] **#S3 — "no pending delta" informative message absent.** CONFORMS in
+  practice (the message is optional and CSSC is also silent); no action.
 
 ### Detailed conformance matrix
 - [x] `sact file...`, no options — `sact.rs:22-27`.
@@ -699,6 +697,57 @@ expanded.
 
 ### Test coverage gaps
 - [ ] Multi-file `\n%s:\n`; directory operand; `-` stdin; `-r` among several pending edits; CSSC p-file interop fixture.
+
+---
+
+## `val`
+
+**Implementation:** `sccs/val.rs` (238) + `plib/src/sccsfile.rs`
+**Spec:** POSIX.1-2024, Vol. 3 §3 — `val.md`
+**Date:** 2026-06-14 (behaviorally verified vs CSSC)
+
+### TL;DR
+The bit-coded exit status and per-file validation (checksum, `-r` SID existence,
+`-m`/`-y` keyword compare) are correct and in places more conformant than CSSC.
+The defects were the two argv-error bits (0x80 missing-file, 0x40
+unknown/duplicate-option) being unreachable behind clap's exit-2, and the
+stdin-mode STDOUT format/order.
+
+### Priority issues
+
+#### Major
+- [x] **#V1 — Missing file argument yields clap exit 2, not 0x80.** ✓ Phase 8:
+  dropped `required=true`; the no-operand check returns 0x80 (exit 128, matches
+  cssc).
+- [x] **#V2 — Unknown / duplicate option yields clap exit 2, not 0x40.** ✓
+  Phase 8: `try_parse_from` + map parse errors to 0x40 (exit 64, matches cssc);
+  in stdin mode the bit is OR'd into the aggregate.
+- [x] **#V3 — stdin-mode STDOUT format diverges from spec.** ✓ Phase 8: emits
+  the input line, a blank line, then the space-indented `pathname: <msg>`, in
+  spec order.
+
+#### Minor
+- [x] **#V4 — `-r 1.1.0` (branch 0) treated as `1.1`.** ✓ WON'T FIX (deferred):
+  the 3-part-zero-branch normalization lives in `plib::Sid::from_str`; cssc also
+  returns 0 here, so impact is nil. Tracked for a future plib change.
+- [x] **#V5 — `-` as one of several operands treated as a non-SCCS filename.** ✓
+  WON'T FIX: spec defines `-` as stdin only when it is the sole operand; ours
+  already matches the spec for that case.
+- [x] **#V6 — checksum verification skipped when body empty.** ✓ Phase 8:
+  header-only files are now checksum-verified.
+- [x] **#V7 — "cannot open" vs "corrupted" re-stats the file (TOCTOU).** ✓
+  WON'T FIX: a benign edge-case label distinction; race-hardening deferred.
+
+### Detailed conformance matrix
+- [x] `-s`, `-m`, `-r`, `-y` parse and validate; bit-coded status 0x01–0x80 with
+  multi-file OR — `val.rs`. Verified each bit vs cssc.
+- [x] Lone `-` reads stdin, each line re-parsed as an arg list (more conformant
+  than cssc) — CONFORMS, format fixed (#V3).
+- [x] Informative messages → stdout, diagnostics → stderr; `setlocale` wired
+  (`LC_MESSAGES` hardcoded English pending #X9).
+
+### Test coverage gaps
+- [ ] EXAMPLE from the spec; 0x20-vs-0x10 distinction; combined-bit OR cases.
 
 ---
 

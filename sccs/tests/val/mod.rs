@@ -112,6 +112,95 @@ fn val_not_sccs_file() {
 }
 
 #[test]
+fn val_no_file_argument() {
+    // Missing file argument must yield exit bit 0x80 (128), not clap's exit 2.
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("val"),
+            args: vec![],
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan: &TestPlan, output: &Output| {
+            assert_eq!(output.status.code(), Some(0x80), "missing file => 0x80");
+        },
+    );
+}
+
+#[test]
+fn val_unknown_keyletter() {
+    let tmp = TempDir::new().unwrap();
+    let sfile = create_sccs_file(&tmp, "test", "content\n");
+
+    // An unknown keyletter must yield exit bit 0x40 (64), not clap's exit 2.
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("val"),
+            args: vec!["-Q".into(), sfile.to_string_lossy().into()],
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan: &TestPlan, output: &Output| {
+            assert_eq!(output.status.code(), Some(0x40), "unknown option => 0x40");
+        },
+    );
+}
+
+#[test]
+fn val_duplicate_keyletter() {
+    let tmp = TempDir::new().unwrap();
+    let sfile = create_sccs_file(&tmp, "test", "content\n");
+
+    // A duplicated keyletter must yield exit bit 0x40 (64).
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("val"),
+            args: vec![
+                "-r1.1".into(),
+                "-r1.1".into(),
+                sfile.to_string_lossy().into(),
+            ],
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan: &TestPlan, output: &Output| {
+            assert_eq!(output.status.code(), Some(0x40), "duplicate option => 0x40");
+        },
+    );
+}
+
+#[test]
+fn val_stdin_discrepancy_format() {
+    let tmp = TempDir::new().unwrap();
+    let sfile = create_sccs_file(&tmp, "x", "content\n");
+    let line = format!("-y nomatch {}", sfile.to_string_lossy());
+
+    // POSIX stdin format: "%s\n\n %s: %s\n", <input>, <pathname>, <string>
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("val"),
+            args: vec!["-".into()],
+            stdin_data: format!("{}\n", line),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan: &TestPlan, output: &Output| {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let expected = format!("{}\n\n {}: %Y%, -y mismatch\n", line, sfile.display());
+            assert_eq!(stdout, expected, "stdin discrepancy format");
+            assert_eq!(output.status.code(), Some(0x02), "-y mismatch => 0x02");
+        },
+    );
+}
+
+#[test]
 fn val_silent_mode() {
     let tmp = TempDir::new().unwrap();
     let file = tmp.path().join("notsccs");

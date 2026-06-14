@@ -63,18 +63,21 @@ fn process_sfile(sfile: &Path, show_header: bool) -> io::Result<bool> {
     Ok(true)
 }
 
-fn process_directory(dir: &Path, show_header: bool) -> io::Result<bool> {
+fn process_directory(dir: &Path, show_header: bool, had_error: &mut bool) -> io::Result<bool> {
     let mut found_any = false;
 
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
+    let entries = fs::read_dir(dir)?;
+    for entry in entries.flatten() {
+        let path = entry.path();
 
-            // Skip non-SCCS files and unreadable files
-            if paths::is_sfile(&path) {
-                match process_sfile(&path, show_header) {
-                    Ok(found) => found_any = found_any || found,
-                    Err(_) => continue, // Silently ignore errors
+        // Skip non-SCCS files and unreadable files
+        if paths::is_sfile(&path) {
+            match process_sfile(&path, show_header) {
+                Ok(found) => found_any = found_any || found,
+                Err(_) => {
+                    // A corrupt p-file within a directory is reported via the
+                    // aggregate exit status but does not abort the scan.
+                    *had_error = true;
                 }
             }
         }
@@ -90,16 +93,20 @@ fn main() -> ExitCode {
 
     let args = Args::parse();
 
-    let show_header = args.files.len() > 1
-        || args.files.first().map(|p| p.is_dir()).unwrap_or(false)
-        || args
-            .files
-            .first()
-            .map(|p| p.to_string_lossy() == "-")
-            .unwrap_or(false);
+    let reading_stdin = args.files.len() == 1 && args.files[0].to_string_lossy() == "-";
+
+    // Per POSIX, the "\n%s:\n" pathname header is written when there is more
+    // than one named file, or a directory or standard input is named. A lone
+    // "-" reads stdin (each line a pathname) and is treated as multiple files,
+    // so headers are shown for it.
+    let show_header = reading_stdin
+        || args.files.len() > 1
+        || args.files.first().map(|p| p.is_dir()).unwrap_or(false);
+
+    let mut had_error = false;
 
     // Check if reading from stdin
-    if args.files.len() == 1 && args.files[0].to_string_lossy() == "-" {
+    if reading_stdin {
         let stdin = io::stdin();
         for line in stdin.lock().lines() {
             let line = match line {
@@ -114,17 +121,27 @@ fn main() -> ExitCode {
                 continue;
             }
 
+            // Silently ignore unreadable / non-SCCS files per spec.
             process_sfile(&path, true).ok();
         }
     } else {
         for file in &args.files {
             if file.is_dir() {
-                process_directory(file, show_header).ok();
-            } else if paths::is_sfile(file) {
-                process_sfile(file, show_header).ok();
+                if process_directory(file, show_header, &mut had_error).is_err() {
+                    had_error = true;
+                }
+            } else if paths::is_sfile(file) && process_sfile(file, show_header).is_err() {
+                had_error = true;
             }
+            // A named operand that is neither a directory nor a recognizable
+            // SCCS file is silently ignored (cssc returns 0 for a nonexistent
+            // operand), matching the no-impending-delta success case.
         }
     }
 
-    ExitCode::SUCCESS
+    if had_error {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
 }

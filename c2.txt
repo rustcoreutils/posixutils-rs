@@ -1,0 +1,24 @@
+sccs/get.rs
+        59
+    };
+
+    Some((year, month, day, hour, min, sec))
+Copilot commented 2 hours ago
+Copilot
+Copilot
+AI
+2 hours ago
+Medium
+parse_cutoff accepts out-of-range date/time fields (e.g., month 00/13+, minute 99) because it only checks digit count. That can make -c behave nonsensically instead of rejecting invalid input as an error. Add basic range validation before returning Some(...) so callers can surface an Invalid cutoff date error.
+
+Suggested changeset 1 (1)
+sccs/get.rs
+Original file line number	Diff line number	Diff line change
+         59
+     };
+     if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 59 {
+         return None;
+     }
+     Some((year, month, day, hour, min, sec))
+ }
+Copilot uses AI. Check for mistakes.

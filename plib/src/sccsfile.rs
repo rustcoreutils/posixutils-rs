@@ -31,6 +31,7 @@ use std::fmt;
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 // =============================================================================
@@ -1584,14 +1585,27 @@ pub fn compute_checksum(data: &[u8]) -> u16 {
 // SIGINT temp-file cleanup registry
 // =============================================================================
 
-/// Process-global list of filesystem paths to unlink if the process is
-/// interrupted (SIGINT). SCCS commands register transient files here (the
-/// z-file lock and the x-file temporary) so an interrupt during a mutation
-/// does not leave stale lock/temporary files behind.
-static CLEANUP: OnceLock<Mutex<Vec<CString>>> = OnceLock::new();
+/// Maximum number of transient files registered for SIGINT cleanup at once. A
+/// mutating SCCS command holds at most a couple (the z-file lock and one x-file
+/// temporary), so this bound is generous.
+const MAX_CLEANUP: usize = 32;
 
-fn cleanup_list() -> &'static Mutex<Vec<CString>> {
-    CLEANUP.get_or_init(|| Mutex::new(Vec::new()))
+/// Async-signal-safe slot array of paths to unlink on SIGINT. Each non-null
+/// entry points at the NUL-terminated bytes of a [`CString`] kept alive in
+/// `CLEANUP_OWNED`. The signal handler reads ONLY this array (atomic loads plus
+/// `unlink`/`_exit`, all async-signal-safe) — it never locks a mutex or
+/// allocates.
+static CLEANUP_SLOTS: [AtomicPtr<libc::c_char>; MAX_CLEANUP] =
+    [const { AtomicPtr::new(std::ptr::null_mut()) }; MAX_CLEANUP];
+
+/// Normal-execution bookkeeping that owns the registered `CString`s (so the raw
+/// pointers stored in `CLEANUP_SLOTS` stay valid) and records each one's slot.
+/// This mutex is locked ONLY from normal control flow (register/unregister) and
+/// is NEVER touched by the signal handler.
+static CLEANUP_OWNED: OnceLock<Mutex<Vec<(usize, CString)>>> = OnceLock::new();
+
+fn cleanup_owned() -> &'static Mutex<Vec<(usize, CString)>> {
+    CLEANUP_OWNED.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 /// Convert a path into a NUL-terminated C string for async-signal-safe
@@ -1603,43 +1617,56 @@ fn path_to_cstring(path: &Path) -> Option<CString> {
 
 /// Register `path` to be unlinked on SIGINT.
 pub fn register_cleanup(path: &Path) {
-    if let Some(c) = path_to_cstring(path) {
-        if let Ok(mut list) = cleanup_list().lock() {
-            list.push(c);
+    let cstr = match path_to_cstring(path) {
+        Some(c) => c,
+        None => return,
+    };
+    // The pointer into the CString's heap buffer stays valid after the CString
+    // is moved into the owned list (moving the `Box<[u8]>` does not relocate the
+    // allocation).
+    let ptr = cstr.as_ptr() as *mut libc::c_char;
+
+    if let Ok(mut owned) = cleanup_owned().lock() {
+        for (i, slot) in CLEANUP_SLOTS.iter().enumerate() {
+            if slot.load(Ordering::Acquire).is_null() {
+                slot.store(ptr, Ordering::Release);
+                owned.push((i, cstr));
+                return;
+            }
         }
+        // No free slot: the temp simply isn't covered by signal cleanup (it is
+        // still removed by normal-flow unregister / RAII). Not expected in
+        // practice.
     }
 }
 
 /// Remove `path` from the SIGINT cleanup registry (e.g. after a successful
 /// rename, when the temporary no longer exists).
 pub fn unregister_cleanup(path: &Path) {
-    if let Some(c) = path_to_cstring(path) {
-        if let Ok(mut list) = cleanup_list().lock() {
-            if let Some(pos) = list.iter().position(|p| *p == c) {
-                list.remove(pos);
-            }
+    let cstr = match path_to_cstring(path) {
+        Some(c) => c,
+        None => return,
+    };
+    if let Ok(mut owned) = cleanup_owned().lock() {
+        if let Some(pos) = owned.iter().position(|(_, c)| *c == cstr) {
+            let slot_idx = owned[pos].0;
+            // Clear the slot FIRST (Release) so the handler can no longer read
+            // the pointer, THEN drop the owning CString (freeing the buffer).
+            CLEANUP_SLOTS[slot_idx].store(std::ptr::null_mut(), Ordering::Release);
+            owned.remove(pos);
         }
     }
 }
 
-/// SIGINT handler: unlink every registered path and exit non-zero. Only
-/// async-signal-safe operations are performed (`unlink` + `_exit`); the
-/// registry was populated before the handler was installed and is read here
-/// without locking (the handler runs to process exit and does not return).
+/// SIGINT handler: unlink every registered path and exit non-zero. Performs
+/// ONLY async-signal-safe operations — atomic loads from `CLEANUP_SLOTS`,
+/// `unlink`, and `_exit` — with no mutex acquisition or allocation.
 extern "C" fn sigint_cleanup_handler(_sig: libc::c_int) {
-    // Read the raw registry. We deliberately avoid locking the Mutex (not
-    // async-signal-safe). The Vec is only appended/removed under normal
-    // execution; a torn read at worst skips/duplicates an unlink, which is
-    // harmless (ENOENT is ignored).
-    if let Some(lock) = CLEANUP.get() {
-        // SAFETY: get the inner pointer without locking. The handler never
-        // returns, so no concurrent mutation can corrupt our iteration after
-        // _exit.
-        if let Ok(list) = lock.try_lock() {
-            for c in list.iter() {
-                unsafe {
-                    libc::unlink(c.as_ptr());
-                }
+    for slot in CLEANUP_SLOTS.iter() {
+        let p = slot.load(Ordering::Acquire);
+        if !p.is_null() {
+            unsafe {
+                libc::unlink(p as *const libc::c_char);
             }
         }
     }
@@ -1652,8 +1679,8 @@ extern "C" fn sigint_cleanup_handler(_sig: libc::c_int) {
 /// exits with status 130. Idempotent enough to call once at the start of a
 /// mutating command's `main`.
 pub fn install_sigint_cleanup() {
-    // Ensure the registry exists before the handler can fire.
-    let _ = cleanup_list();
+    // Ensure the owned registry exists before the handler can fire.
+    let _ = cleanup_owned();
     unsafe {
         libc::signal(
             libc::SIGINT,

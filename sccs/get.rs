@@ -131,6 +131,12 @@ fn parse_cutoff(cutoff: &str) -> Option<(u16, u8, u8, u8, u8, u8)> {
         59
     };
 
+    // Reject out-of-range fields so an invalid -c cutoff is surfaced as an
+    // error rather than silently filtering nonsensically.
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 59 {
+        return None;
+    }
+
     Some((year, month, day, hour, min, sec))
 }
 

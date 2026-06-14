@@ -270,6 +270,37 @@ fn get_cutoff_excludes_newer_deltas() {
 }
 
 #[test]
+fn get_cutoff_invalid_field_rejected() {
+    // An out-of-range cutoff field (month 13) must be rejected as an error
+    // rather than silently filtering nonsensically.
+    let fixture = fixture_path("s.multi");
+    let plan = TestPlan {
+        cmd: String::from("get"),
+        args: vec![
+            "-p".into(),
+            "-c251312".into(),
+            fixture.to_string_lossy().into(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 1,
+    };
+    run_test_with_checker(plan, |_plan: &TestPlan, output: &Output| {
+        assert!(
+            !output.status.success(),
+            "invalid -c cutoff should fail, exit was {:?}",
+            output.status.code()
+        );
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            err.contains("Invalid cutoff date"),
+            "expected 'Invalid cutoff date' diagnostic, got: {err}"
+        );
+    });
+}
+
+#[test]
 fn get_lfile_to_stdout() {
     // -L writes the delta summary table to standard output.
     let fixture = fixture_path("s.multi");

@@ -1083,22 +1083,57 @@ fn parse_existing_pot(path: &PathBuf) -> Result<String, Box<dyn std::error::Erro
 /// Collect the (msgctxt, msgid) keys already present in an existing .po file, so
 /// `-j` can omit newly extracted duplicates.
 fn parse_existing_keys(content: &str) -> std::collections::HashSet<MessageKey> {
+    // The field whose value the current run of quoted continuation lines extends.
+    enum Field {
+        Ctxt,
+        Id,
+    }
+
     let mut keys = std::collections::HashSet::new();
     let mut pending_ctxt: Option<String> = None;
+    let mut cur: Option<Field> = None;
+    let mut buf = String::new();
+
     for line in content.lines() {
         let line = line.trim();
-        if let Some(rest) = line.strip_prefix("msgctxt ") {
-            pending_ctxt = unquote_po_value(rest);
-        } else if let Some(rest) = line.strip_prefix("msgid ") {
-            if let Some(msgid) = unquote_po_value(rest) {
+
+        // A bare quoted string continues the multi-line value of the open field.
+        if cur.is_some() && line.starts_with('"') {
+            if let Some(v) = unquote_po_value(line) {
+                buf.push_str(&v);
+            }
+            continue;
+        }
+
+        // Any other line closes the open field; commit its accumulated value.
+        match cur.take() {
+            Some(Field::Ctxt) => pending_ctxt = Some(std::mem::take(&mut buf)),
+            Some(Field::Id) => {
                 keys.insert(MessageKey {
                     msgctxt: pending_ctxt.take(),
-                    msgid,
+                    msgid: std::mem::take(&mut buf),
                 });
             }
-            pending_ctxt = None;
+            None => {}
+        }
+
+        if let Some(rest) = line.strip_prefix("msgctxt ") {
+            buf = unquote_po_value(rest).unwrap_or_default();
+            cur = Some(Field::Ctxt);
+        } else if let Some(rest) = line.strip_prefix("msgid ") {
+            buf = unquote_po_value(rest).unwrap_or_default();
+            cur = Some(Field::Id);
         }
     }
+
+    // Commit a field left open at end of input.
+    if let Some(Field::Id) = cur {
+        keys.insert(MessageKey {
+            msgctxt: pending_ctxt.take(),
+            msgid: buf,
+        });
+    }
+
     keys
 }
 

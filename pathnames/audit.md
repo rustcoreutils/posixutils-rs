@@ -9,20 +9,27 @@ follows the playbook in `audits.md`.
 **Date:** 2026-06-14
 **Verification:** All Critical/Major findings were reproduced against the
 release binaries (`cargo build -p posixutils-pathnames`) before publishing.
+**Status (2026-06-14):** ALL findings remediated; the four utilities are
+promoted to README "Stage 6 — Audited". Each box below is ticked with a
+"✓ fixed" note. The per-utility TL;DR sections retain the *original* (pre-fix)
+findings as a historical record; the crate-wide verdicts below reflect the
+fixed state.
 
-## Crate-wide TL;DR
+## Crate-wide TL;DR (post-fix)
 
-| Utility | Verdict | Headline |
+| Utility | Verdict | Notes |
 |---|---|---|
-| `basename` | **Broken on common inputs** | Panics (exit 101) on `/`, `..`, `x/..`; suffix is stripped from the *whole path* before the final component is extracted, and the "suffix identical to result" guard is missing → wrong output. |
-| `dirname` | **Largely conforms** | Lexical `PathBuf::pop()` matches the spec on every tested case. Only minor gaps (non-UTF-8 lossy output, `//`). |
-| `pathchk` | **Default mode unusable** | The no-option (filesystem) check errors `pathconf error(path length)` for *every existing file* and for creatable relative names; `-p`/`-P` are wired mutually-exclusive (spec mandates using them together); `-p` uses `is_ascii()` instead of the portable-filename character set. |
-| `realpath` | **Does not resolve symlinks except under `-e`** | Default and `-E` modes do purely lexical normalization — the canonical job of `realpath` (eliminating symbolic-link components) is not performed. Only `-e` (via `fs::canonicalize`) is correct. |
+| `basename` | **Conforms** | Rewritten to the POSIX 6-step byte algorithm; no panics; correct suffix handling; OsString/byte-faithful; newline guard. |
+| `dirname` | **Conforms** | Lexical `PathBuf::pop()` (already correct); now byte-faithful output + newline guard. |
+| `pathchk` | **Conforms** | Default-mode `find_fshandle` repaired; `-p`/`-P` combinable; portable-filename charset; `_POSIX_PATH_MAX`=256; best-effort search-permission check (invalid-byte = N/A). New test suite added. |
+| `realpath` | **Conforms** | Default and `-E` resolve symbolic links (`resolve_missing_ok`, tolerating a missing final component); `-e` unchanged; byte-faithful output; newline guard. |
 
-Cross-cutting: runtime diagnostics in `pathchk`/`realpath` are hardcoded English
-(not routed through `gettext`), so `LC_MESSAGES` is inert despite `setlocale`
-being called. `basename`/`pathchk` take `String` operands (clap rejects
-non-UTF-8 paths); `dirname` takes `OsString` but prints via `to_string_lossy`.
+Cross-cutting (all addressed): operands/output are byte-faithful (`OsString` +
+`OsStrExt::as_bytes`); runtime diagnostics go through `plib::diag::init_locale` +
+`error` + `exit_status` with `gettext`'d static messages; `plib` was promoted
+from a dev-dependency to a runtime dependency of the crate. Remaining N/A items:
+the `pathchk` invalid-byte-sequence check and strerror-catalog translation of
+dynamic OS-error text are out of scope (documented inline).
 
 ---
 

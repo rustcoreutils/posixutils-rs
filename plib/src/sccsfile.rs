@@ -1681,6 +1681,50 @@ pub mod paths {
         let name = sfile.file_name()?.to_str()?;
         name.strip_prefix("s.").map(|s| s.to_string())
     }
+
+    /// Expand SCCS file operands per POSIX, returning the flat list of paths to
+    /// process in order:
+    /// - a lone `-` operand reads pathnames from standard input, one per line;
+    /// - a directory operand (named directly or via stdin) expands to its
+    ///   `s.*` members (sorted; non-SCCS files silently ignored);
+    /// - every other operand passes through verbatim, so the caller can still
+    ///   diagnose an explicitly named non-SCCS file.
+    pub fn expand_operands(operands: &[PathBuf]) -> Vec<PathBuf> {
+        use std::io::BufRead;
+
+        fn push(p: PathBuf, out: &mut Vec<PathBuf>) {
+            if p.is_dir() {
+                if let Ok(entries) = std::fs::read_dir(&p) {
+                    let mut members: Vec<PathBuf> = entries
+                        .flatten()
+                        .map(|e| e.path())
+                        .filter(|q| is_sfile(q))
+                        .collect();
+                    members.sort();
+                    out.extend(members);
+                }
+            } else {
+                out.push(p);
+            }
+        }
+
+        let mut out = Vec::new();
+        if operands.len() == 1 && operands[0].as_os_str() == "-" {
+            let stdin = std::io::stdin();
+            for line in stdin.lock().lines().map_while(Result::ok) {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                push(PathBuf::from(trimmed), &mut out);
+            }
+        } else {
+            for op in operands {
+                push(op.clone(), &mut out);
+            }
+        }
+        out
+    }
 }
 
 // =============================================================================

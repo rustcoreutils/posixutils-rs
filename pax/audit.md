@@ -19,6 +19,16 @@ installed; `tar`/`cpio` are format-compatible oracles. Every Critical/Major
 finding below was re-verified directly with the release binary against
 tar/cpio.
 
+> **Status (remediated 2026-06-15):** every actionable finding below is resolved
+> — fixed (✓, with the implementing phase noted inline) over 8 phases on the
+> `pax-audit` branch, each behaviorally re-verified against GNU `tar` 1.35 /
+> `cpio` 2.15 and gated on `cargo build`/`clippy`/`fmt`/`test` (120 integration
+> tests). The two Critical findings (no non-zero exit; per-file abort/data-loss)
+> and all Major/Minor items are fixed; only **#26** (non-UTF-8 path bytes; cpio
+> TRAILER `c_mode`) is dispositioned **WON'T-FIX** with a rationale. The original
+> findings are preserved below (now ticked) as the historical record. `pax` is
+> promoted to README **Stage 6 — Audited**.
+
 ## Headline
 
 **The hard parts are right; the easy parts are wrong.** All three archive
@@ -286,42 +296,44 @@ read/list. There are **no crashes/hangs**.
 
 ### Modes
 - [x] **list** — plain `"%s\n"` and `-v` `ls -l`+`== link` CONFORM; subtree/`-d` (#11), `h`-type (#17), unmatched-pattern silent (#1).
-- [ ] **read/extract** — types/recursion/hardlink/symlink/fifo/mtime/re-extract-dir CONFORM; **aborts on per-file error (#2)**, unmatched silent (#1), umask ignored (#6), `-o` ignored (#13), subtree/`-d` (#11).
-- [ ] **write** — all file types, recursion, hardlink dedup, stdin file-list CONFORM; missing operand → exit 0 (#1), per-file abort (#2), sub-second mtime (#5).
-- [ ] **copy** — dir/file/symlink, `-l`, dest-must-be-dir CONFORM; **can't copy special files (#16)**, per-file abort (#2).
-- [ ] **append** — basic append CONFORMS; **mismatched-format coercion (#10)**; cpio append correctly refused.
+- [x] **read/extract** — types/recursion/hardlink/symlink/fifo/mtime/re-extract-dir CONFORM; per-file diagnose-and-continue (#2 ✓), unmatched diagnosed (#1 ✓), umask applied (#6 ✓), `-o` applied (#13 ✓), subtree/`-d` (#11 ✓).
+- [x] **write** — all file types, recursion, hardlink dedup, stdin file-list CONFORM; missing operand → non-zero (#1 ✓), per-file continue (#2 ✓), sub-second mtime (#5 ✓).
+- [x] **copy** — dir/file/symlink, `-l`, dest-must-be-dir CONFORM; FIFOs/devices recreated (#16 ✓), per-file continue (#2 ✓).
+- [x] **append** — basic append CONFORMS; mismatched-format now rejected (#10 ✓); cpio append correctly refused.
 
 ### Formats — ustar (header fields)
 - [x] name/mode/uid/gid/chksum/typeflag/linkname/magic("ustar\0")/version("00")/uname/gname/dev*/prefix all CONFORM; checksum (spaces-for-chksum-field) verified vs GNU tar both ways; prefix/name split ≤255 verified; size=0 for symlink/hardlink/dir; 512 padding + two-zero-block EOF.
-- [ ] **size/mtime ≥8 GB corrupt (#3)**; trailing-ws path strip on read (#15); to_string_lossy (#26).
+- [x] size/mtime ≥8 GB now error cleanly (#3 ✓); trailing-ws path fidelity on read (#15 ✓); to_string_lossy (#26 WON'T-FIX).
 
 ### Formats — cpio (ODC)
 - [x] magic "070707", c_dev/c_ino/c_mode/c_uid/c_gid/c_nlink/c_rdev/c_mtime/c_namesize(incl NUL)/c_filesize, name+NUL then data with no padding, TRAILER!!! — all CONFORM; verified vs GNU cpio both ways. Reader also accepts newc/binary (benign superset).
-- [ ] **c_filesize/c_ino/uid/gid overflow truncation ≥8 GB (#4)**; TRAILER mode cosmetic (#26).
+- [x] c_filesize/c_namesize/c_mtime overflow now error (#4 ✓); c_dev/c_ino/uid/gid masked by design; TRAILER mode cosmetic (#26 WON'T-FIX).
 
 ### Formats — pax interchange (extended headers)
 - [x] **Self-counting record length CONFORMS** (proven: `30 mtime=…123456789` = 30 bytes; digit-carry boundary 99→101 handled). Per-file `x` / global `g` typeflag; two-zero-block EOF; ustar physical layout; overflow thresholds (uid/gid>2097151, size>8589934591, path>256) all CONFORM; bidirectional GNU `--format=pax` interop (long path, non-ASCII, 9 GB, `g` globals).
-- [ ] **sub-second mtime/atime dropped (#5)**; `:=` standard-keyword overrides dropped (#12); `-o` not applied read/list (#13); listopt `%(keyword)s` missing (#14); always-emit `x` header (#21); globexthdr `$TMPDIR` (#19).
+- [x] sub-second mtime/atime preserved exactly (#5 ✓); `:=` standard-keyword overrides emitted (#12 ✓); `-o` applied on read incl. `delete=` (#13 ✓); listopt `%(keyword)s` (#14 ✓); `x` header emitted only when needed (#21 ✓); globexthdr `$TMPDIR` (#19 ✓).
 
 ### `-s` substitution / patterns / `-i` / blocking
 - [x] `-s`: BRE `old`, `&`, `\1`–`\9`, `\0`/`\&`/`\\` literals, `g`, `p` (`"%s >> %s\n"`), multi-`-s` order + first-success, arbitrary delimiter, empty→skip — all CONFORM (subst.rs). `-i` CONFORMS (/dev/tty, blank/`.`/rename/EOF).
-- [ ] `-s` `s`/`S` rejected (#9). Patterns: fnmatch correct + doesn't cross `/` (CONFORMS, conformant vs GNU `--wildcards`); leading-`.` rule missing (#18).
+- [x] `-s` `s`/`S` accepted (#9 ✓). Patterns: fnmatch correct + doesn't cross `/` (CONFORMS); leading-`.` rule now enforced (#18 ✓).
 
 ### Exit status / consequences of errors
 - [x] **#1 (no non-zero exit on unmatched/missing/per-file-fail)**, **#2 (per-file abort instead of continue)**, #22 (preserve-fail exit) — *all fixed, Phase 1.* Mode dispatch + 0-on-success CONFORM.
 
-## Test coverage signal (gaps)
+## Test coverage signal (gaps) — now closed by per-phase regression tests
 
-- [ ] No test asserts non-zero exit / diagnostics for unmatched patterns or
-  missing operands (#1), nor diagnose-and-continue (#2).
-- [ ] No test for ≥8 GB / ≥64 GB numeric-field encoding (#3/#4) — round-trip
-  tests pass because the readers are lenient, masking the dropped terminator.
-- [ ] No test for sub-second mtime (#5), umask-on-default-extract (#6),
-  per-format default blocksize (#7), `-b` byte-vs-factor (#8).
-- [ ] No test that `-s …/s` is accepted (#9), append-format mismatch errors (#10),
-  directory-pattern subtree selection / `-d` in read (#11), `-o gname:=`/`-o` in
-  read mode (#12/#13), `listopt=%(path)s` (#14), trailing-ws names (#15),
-  copy-of-FIFO (#16), leading-`.` patterns (#18).
+- [x] Non-zero exit / diagnostics for unmatched patterns and missing operands
+  (#1) and diagnose-and-continue (#2): `tests/options` exit-status tests.
+- [x] ≥8 GB numeric-field encoding (#3/#4): boundary unit tests in
+  `formats/{ustar,cpio}.rs` (8 GiB-1 fits, one larger is rejected).
+- [x] Sub-second mtime (#5): `formats/pax.rs` PaxTime round-trip + `tests/options`
+  `delete=mtime`. Umask-on-default-extract (#6): `modes/read.rs` unit test.
+  Per-format default blocksize and `-b` validation (#7/#8/#20): `blocked_io.rs`.
+- [x] `-s …/s` accepted (#9): `subst.rs`. Append-format mismatch (#10):
+  `tests/append`. Directory subtree / `-d` (#11): `tests/list` + `pattern.rs`.
+  `-o gname:=` / `delete=` on read (#12/#13) and `listopt=%(keyword)s` (#14):
+  `tests/options` + `options.rs`. Trailing-ws names (#15) and copy-of-FIFO
+  (#16): `tests/special`. Leading-`.` patterns (#18): `pattern.rs`.
 
 ## Suggested PR groupings
 

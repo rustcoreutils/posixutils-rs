@@ -90,6 +90,20 @@ pub fn run_test_base_with_env(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
+    // Default the spawned utility to the C locale for deterministic, host-locale-
+    // independent output. The utilities honor LC_* at runtime (LC_COLLATE-sensitive
+    // fnmatch ranges and strcoll, LC_CTYPE iswprint, LC_TIME strftime, ...), so a
+    // runner whose default locale is not C (e.g. the GitHub macOS runner's
+    // en_US.UTF-8) would otherwise change results. A test that needs a specific
+    // locale provides its own LC_*/LANG variable, in which case the locale is left
+    // entirely under its control (LC_ALL is not forced over it).
+    let test_controls_locale = env_vars
+        .iter()
+        .any(|(key, _)| key.starts_with("LC_") || *key == "LANG" || *key == "LANGUAGE");
+    if !test_controls_locale {
+        command.env("LC_ALL", "C");
+    }
+
     // Set environment variables
     for (key, value) in env_vars {
         command.env(key, value);

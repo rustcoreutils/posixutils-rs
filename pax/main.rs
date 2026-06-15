@@ -155,8 +155,9 @@ enum PaxMode {
 }
 
 fn main() -> ExitCode {
-    // Initialize locale so LC_* environment variables affect message lookup and
-    // locale-sensitive formatting (e.g. the `-v` listing time).
+    // Initialize locale so LC_* environment variables affect locale-sensitive
+    // libc formatting (e.g. LC_TIME month names in the `-v` listing time, via
+    // the strftime time formatter).
     setlocale(LocaleCategory::LcAll, "");
     let _ = textdomain("posixutils-rs");
     let _ = bind_textdomain_codeset("posixutils-rs", "UTF-8");

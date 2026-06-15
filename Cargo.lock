@@ -848,6 +848,9 @@ dependencies = [
 [[package]]
 name = "gettext-rs"
 version = "0.7.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "glob"

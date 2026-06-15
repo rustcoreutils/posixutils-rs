@@ -13,7 +13,7 @@ use crate::archive::{ArchiveEntry, ArchiveFormat, ArchiveReader, EntryType};
 use crate::error::PaxResult;
 use crate::formats::{CpioReader, PaxReader, UstarReader};
 use crate::options::{format_list_entry, FormatOptions, ListEntryInfo};
-use crate::pattern::{find_matching_pattern, Pattern};
+use crate::pattern::{find_matching_pattern_subtree, Pattern};
 use crate::subst::{apply_substitutions, SubstResult, Substitution};
 use std::collections::HashSet;
 use std::io::{Read, Write};
@@ -34,6 +34,9 @@ pub struct ListOptions {
     pub substitutions: Vec<Substitution>,
     /// Select only first archive member matching each pattern (-n)
     pub first_match: bool,
+    /// `-d`: a directory pattern matches only the directory itself, not its
+    /// subtree.
+    pub dir_only: bool,
 }
 
 /// List archive contents
@@ -144,9 +147,13 @@ fn should_list(
         return Some(true); // Match all
     }
 
-    // Find which pattern matches (if any)
-    let matching_pattern = find_matching_pattern(&options.patterns, &path)
-        .or_else(|| find_matching_pattern(&options.patterns, path_stripped));
+    // Find which pattern matches (if any). A pattern selecting a directory also
+    // selects its whole subtree unless `-d` (dir_only) was given.
+    let expand_subtree = !options.dir_only;
+    let matching_pattern = find_matching_pattern_subtree(&options.patterns, &path, expand_subtree)
+        .or_else(|| {
+            find_matching_pattern_subtree(&options.patterns, path_stripped, expand_subtree)
+        });
 
     match matching_pattern {
         Some(pattern_idx) => {
@@ -251,7 +258,9 @@ fn format_mode(entry: &ArchiveEntry) -> String {
     s.push(match entry.entry_type {
         EntryType::Directory => 'd',
         EntryType::Symlink => 'l',
-        EntryType::Hardlink => 'h',
+        // A hard link is a regular file with a link count > 1; POSIX `ls -l`
+        // (and the pax `-v` listing) shows it with the regular-file type char.
+        EntryType::Hardlink => '-',
         EntryType::BlockDevice => 'b',
         EntryType::CharDevice => 'c',
         EntryType::Fifo => 'p',

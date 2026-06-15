@@ -35,6 +35,7 @@ pub fn append_to_archive(
     archive_path: &PathBuf,
     files: &[PathBuf],
     options: &WriteOptions,
+    requested_format: Option<ArchiveFormat>,
 ) -> PaxResult<()> {
     // Open archive for read+write
     let mut file = OpenOptions::new()
@@ -44,6 +45,18 @@ pub fn append_to_archive(
 
     // Detect the archive format
     let format = detect_format(&mut file)?;
+
+    // Per POSIX, an explicit `-x` that names a format different from the existing
+    // archive is an error — pax must not silently coerce the new members into the
+    // archive's format.
+    if let Some(requested) = requested_format {
+        if requested != format {
+            return Err(PaxError::InvalidFormat(format!(
+                "cannot append in {} format to an existing {} archive",
+                requested, format
+            )));
+        }
+    }
 
     // Only support ustar and pax for append
     if format == ArchiveFormat::Cpio {

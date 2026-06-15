@@ -97,6 +97,11 @@ impl Substitution {
             match c {
                 'g' => global = true,
                 'p' => print = true,
+                // POSIX `s`/`S` select whether the substitution applies to the
+                // contents of a symbolic link. This implementation substitutes
+                // only pathnames (not link target contents), so both are accepted
+                // as no-ops rather than rejected.
+                's' | 'S' => {}
                 _ => {
                     return Err(PaxError::PatternError(format!(
                         "unknown substitution flag: {}",
@@ -314,6 +319,19 @@ mod tests {
         let s = Substitution::parse("/foo/bar/pg").unwrap();
         assert!(s.global);
         assert!(s.print);
+    }
+
+    #[test]
+    fn test_parse_symlink_flags_accepted() {
+        // The POSIX `s`/`S` symlink-content flags must be accepted (as no-ops),
+        // not rejected as unknown flags.
+        assert!(Substitution::parse("/foo/bar/s").is_ok());
+        assert!(Substitution::parse("/foo/bar/S").is_ok());
+        let s = Substitution::parse("/foo/bar/gps").unwrap();
+        assert!(s.global);
+        assert!(s.print);
+        // A genuinely unknown flag is still rejected.
+        assert!(Substitution::parse("/foo/bar/z").is_err());
     }
 
     #[test]

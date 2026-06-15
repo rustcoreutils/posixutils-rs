@@ -122,8 +122,11 @@ struct Args {
     #[arg(short, long, help = gettext("In list mode, produce a verbose table of contents"))]
     verbose: bool,
 
-    #[arg(short = 'x', long, value_enum, default_value_t = Format::Ustar, help = gettext("Specify the output archive format"))]
-    format: Format,
+    // Left as an Option (rather than a defaulted value) so append mode can tell
+    // an explicit `-x` from the ustar default and reject a format that conflicts
+    // with the existing archive.
+    #[arg(short = 'x', long, value_enum, help = gettext("Specify the output archive format"))]
+    format: Option<Format>,
 
     #[arg(short = 'X', long, help = gettext("Do not cross filesystem boundaries"))]
     one_file_system: bool,
@@ -236,6 +239,7 @@ fn run_list(args: &Args) -> PaxResult<()> {
         format_options,
         substitutions,
         first_match: args.first_match,
+        dir_only: args.dir_no_follow,
     };
 
     // Check for multi-volume mode
@@ -290,6 +294,7 @@ fn run_read(args: &Args) -> PaxResult<()> {
         first_match: args.first_match,
         umask: current_umask(),
         format_options,
+        dir_only: args.dir_no_follow,
     };
 
     // Check for multi-volume mode
@@ -338,7 +343,7 @@ fn run_write(args: &Args) -> PaxResult<()> {
         format_options,
     };
 
-    let format = ArchiveFormat::from(args.format);
+    let format = ArchiveFormat::from(args.format.unwrap_or(Format::Ustar));
 
     // Check for multi-volume mode
     if args.multi_volume {
@@ -446,7 +451,8 @@ fn run_append(args: &Args) -> PaxResult<()> {
         format_options,
     };
 
-    modes::append_to_archive(archive_path, &files, &options)
+    let requested_format = args.format.map(ArchiveFormat::from);
+    modes::append_to_archive(archive_path, &files, &options, requested_format)
 }
 
 /// Run copy mode (-r -w)

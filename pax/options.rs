@@ -339,14 +339,18 @@ impl FormatOptions {
     /// Default template: "$TMPDIR/GlobalHead.%p.%n", with `$TMPDIR` defaulting
     /// to `/tmp` when unset (per POSIX ENVIRONMENT VARIABLES).
     pub fn expand_globexthdr_name(&self, sequence: u64) -> String {
-        let default_template = {
-            let tmpdir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
-            format!("{}/GlobalHead.%p.%n", tmpdir.trim_end_matches('/'))
-        };
+        let tmpdir = std::env::var("TMPDIR").ok();
+        let default_template = default_globexthdr_template(tmpdir.as_deref());
         let template = self.globexthdr_name.as_deref().unwrap_or(&default_template);
 
         expand_global_header_template(template, sequence)
     }
+}
+
+/// Build the default `globexthdr.name` template from `$TMPDIR` (or `/tmp`).
+fn default_globexthdr_template(tmpdir: Option<&str>) -> String {
+    let dir = tmpdir.unwrap_or("/tmp");
+    format!("{}/GlobalHead.%p.%n", dir.trim_end_matches('/'))
 }
 
 /// Context for template expansion
@@ -760,7 +764,8 @@ const ENTRY_TYPE_CHARS: &[(EntryType, char)] = &[
     (EntryType::Regular, '-'),
     (EntryType::Directory, 'd'),
     (EntryType::Symlink, 'l'),
-    (EntryType::Hardlink, 'h'),
+    // A hard link is a regular file with link count > 1: ls -l shows '-'.
+    (EntryType::Hardlink, '-'),
     (EntryType::BlockDevice, 'b'),
     (EntryType::CharDevice, 'c'),
     (EntryType::Fifo, 'p'),
@@ -1006,25 +1011,19 @@ mod tests {
 
     #[test]
     fn test_globexthdr_name_uses_tmpdir() {
-        let opts = FormatOptions::default();
-
-        // With $TMPDIR set, the default global-header name template derives from
-        // it rather than the hardcoded /tmp.
-        std::env::set_var("TMPDIR", "/custom/tmp");
-        let name = opts.expand_globexthdr_name(7);
-        assert!(
-            name.starts_with("/custom/tmp/GlobalHead."),
-            "expected $TMPDIR-derived name, got {name}"
+        // The default global-header name template derives from $TMPDIR, falling
+        // back to /tmp when it is unset. Tested via the pure helper to avoid
+        // mutating the process-global TMPDIR env (which would race other tests'
+        // temp-dir creation).
+        assert_eq!(
+            default_globexthdr_template(Some("/custom/tmp")),
+            "/custom/tmp/GlobalHead.%p.%n"
         );
-        assert!(name.ends_with(".7"), "sequence %n should expand: {name}");
-
-        // With $TMPDIR unset it falls back to /tmp.
-        std::env::remove_var("TMPDIR");
-        let name = opts.expand_globexthdr_name(7);
-        assert!(
-            name.starts_with("/tmp/GlobalHead."),
-            "expected /tmp fallback, got {name}"
+        assert_eq!(
+            default_globexthdr_template(Some("/custom/tmp/")),
+            "/custom/tmp/GlobalHead.%p.%n"
         );
+        assert_eq!(default_globexthdr_template(None), "/tmp/GlobalHead.%p.%n");
     }
 
     #[test]
@@ -1165,9 +1164,10 @@ mod tests {
         // Other types
         assert_eq!(format_mode_symbolic(0o644, EntryType::Fifo), "prw-r--r--");
         assert_eq!(format_mode_symbolic(0o755, EntryType::Socket), "srwxr-xr-x");
+        // A hard link is a regular file (link count > 1): ls -l shows '-'.
         assert_eq!(
             format_mode_symbolic(0o644, EntryType::Hardlink),
-            "hrw-r--r--"
+            "-rw-r--r--"
         );
     }
 

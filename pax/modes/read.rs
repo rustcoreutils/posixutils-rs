@@ -13,7 +13,7 @@ use crate::archive::{ArchiveEntry, ArchiveFormat, ArchiveReader, EntryType, Extr
 use crate::error::{PaxError, PaxResult};
 use crate::formats::{CpioReader, PaxReader, UstarReader};
 use crate::interactive::{InteractivePrompter, RenameResult};
-use crate::pattern::{find_matching_pattern, Pattern};
+use crate::pattern::{find_matching_pattern_subtree, Pattern};
 use crate::subst::{apply_substitutions, SubstResult, Substitution};
 use std::collections::HashSet;
 use std::fs::{self, File, Permissions};
@@ -53,6 +53,9 @@ pub struct ReadOptions {
     pub umask: u32,
     /// `-o` extended-header options (delete=/keyword:=value) applied on extract.
     pub format_options: crate::options::FormatOptions,
+    /// `-d`: a directory pattern matches only the directory itself, not its
+    /// subtree.
+    pub dir_only: bool,
 }
 
 impl Default for ReadOptions {
@@ -72,6 +75,7 @@ impl Default for ReadOptions {
             first_match: false,
             umask: 0,
             format_options: crate::options::FormatOptions::default(),
+            dir_only: false,
         }
     }
 }
@@ -258,9 +262,13 @@ fn should_extract(
         return Some(true); // Match all
     }
 
-    // Find which pattern matches (if any)
-    let matching_pattern = find_matching_pattern(&options.patterns, &path)
-        .or_else(|| find_matching_pattern(&options.patterns, path_stripped));
+    // Find which pattern matches (if any). A pattern selecting a directory also
+    // selects its whole subtree unless `-d` (dir_only) was given.
+    let expand_subtree = !options.dir_only;
+    let matching_pattern = find_matching_pattern_subtree(&options.patterns, &path, expand_subtree)
+        .or_else(|| {
+            find_matching_pattern_subtree(&options.patterns, path_stripped, expand_subtree)
+        });
 
     match matching_pattern {
         Some(pattern_idx) => {

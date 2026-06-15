@@ -352,3 +352,58 @@ fn test_append_verbose() {
         "Verbose output should show appended file"
     );
 }
+
+/// Appending with an explicit `-x` format that differs from the existing
+/// archive's format is rejected (POSIX), rather than silently coerced.
+#[test]
+fn test_append_format_mismatch_rejected() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("a.tar");
+
+    fs::create_dir(&src_dir).unwrap();
+    File::create(src_dir.join("f1"))
+        .unwrap()
+        .write_all(b"one")
+        .unwrap();
+    File::create(src_dir.join("f2"))
+        .unwrap()
+        .write_all(b"two")
+        .unwrap();
+
+    // Build a ustar archive.
+    run_pax_in_dir(
+        &["-w", "-x", "ustar", "-f", archive.to_str().unwrap(), "f1"],
+        &src_dir,
+    );
+
+    // Appending in cpio format to a ustar archive must fail.
+    let out = run_pax_in_dir(
+        &[
+            "-w",
+            "-a",
+            "-x",
+            "cpio",
+            "-f",
+            archive.to_str().unwrap(),
+            "f2",
+        ],
+        &src_dir,
+    );
+    assert_failure(&out, "append with mismatched -x format");
+
+    // Appending in the matching format (or with no -x) still works.
+    let out = run_pax_in_dir(
+        &[
+            "-w",
+            "-a",
+            "-x",
+            "ustar",
+            "-f",
+            archive.to_str().unwrap(),
+            "f2",
+        ],
+        &src_dir,
+    );
+    assert_success(&out, "append with matching -x format");
+}

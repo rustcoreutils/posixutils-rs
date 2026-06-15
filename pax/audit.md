@@ -134,21 +134,21 @@ read/list. There are **no crashes/hangs**.
   write." Verified: `-b 20` → 10240-byte records; `-b 256` would silently become
   131072 (then clamp). Fix: interpret `-b` strictly as a byte count.
 
-- [ ] **#9 — `-s` rejects the trailing `s`/`S` symlink-content flags.** `subst.rs:96-107`
+- [x] **#9 — `-s` rejects the trailing `s`/`S` symlink-content flags.** *(Fixed, Phase 7.)* `subst.rs:96-107`
   accepts only `g`/`p` and errors on anything else. Spec 110319-110323 defines
   `s` (don't apply to symlink contents) and `S` (do). Verified: `-s '/a/X/s'` →
   `pax: Pattern error: unknown substitution flag: s`, aborting an otherwise
   conforming `-s`. Fix: parse `s`/`S` into an `Option<bool>` (even if symlink-
   content rewriting stays a no-op, the flags must not error).
 
-- [ ] **#10 — Append in a format different from the existing archive is silently coerced, not an error.**
+- [x] **#10 — Append in a format different from the existing archive is silently coerced, not an error.** *(Fixed, Phase 7.)*
   `modes/append.rs:45-74` detects the existing format and writes in *that*,
   ignoring `-x`. Spec 110358-110359: a format mismatch on append "shall cause
   pax to exit immediately with a non-zero exit status." Verified: `pax -w -a -x
   cpio -f ustar.tar f` exits 0 and appends ustar records. Fix: pass `-x` into
   `append_to_archive` and error on mismatch. (cpio-onto-ustar etc.)
 
-- [ ] **#11 — A directory-name pattern doesn't select its subtree; `-d` is inert in read/list.**
+- [x] **#11 — A directory-name pattern doesn't select its subtree; `-d` is inert in read/list.** *(Fixed, Phase 7.)*
   Spec DESCRIPTION 109995-110000: a pattern that names a directory selects the
   hierarchy rooted there; `-d` (110065) disables that. The matcher makes
   `*`/`?` stop at `/` (correct) but matching is per-member exact, and `-d`
@@ -195,10 +195,10 @@ read/list. There are **no crashes/hangs**.
   falls through to "unsupported file type". Spec 110019-110021: copy is
   as-if-write-then-extract, and write *does* archive FIFOs. Fix: `mknod`/`mkfifo`
   in copy mode.
-- [ ] **#17 — `-v` `ls -l` listing uses a non-standard `h` type char for hard links.**
+- [x] **#17 — `-v` `ls -l` listing uses a non-standard `h` type char for hard links.** *(Fixed, Phase 7.)*
   `list.rs:246` maps `Hardlink→'h'`; `ls -l` shows `-` (hard links are regular
   files) and the format only *adds* ` == linkname`. Fix: render `-`.
-- [ ] **#18 — Leading `.` is matched by `*`/`?`/bracket.** `pattern.rs:151-194`
+- [x] **#18 — Leading `.` is matched by `*`/`?`/bracket.** *(Fixed, Phase 7.)* `pattern.rs:151-194`
   special-cases `/` but not a leading period. Spec 2.14.3 rule 2 (via
   110428-110431): a `.` at start or after `/` is not matched by `*`/`?`/bracket.
   Verified: `'*'` matched `.hidden`. Fix: refuse to consume a `.` at position 0

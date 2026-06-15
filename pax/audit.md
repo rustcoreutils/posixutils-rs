@@ -122,13 +122,13 @@ read/list. There are **no crashes/hangs**.
   correct). Fix: distinguish "`-p` absent" from "`-p` without p/e"; when perms
   aren't requested, don't `chmod`.
 
-- [ ] **#7 — Default blocksize is 10240 for every format; cpio/pax require 5120.**
+- [x] **#7 — Default blocksize is 10240 for every format; cpio/pax require 5120.** *(Fixed, Phase 3.)*
   `main.rs:335-338,488-491` use `DEFAULT_RECORD_SIZE` (20×512) regardless of
   `-x`. Spec `-x` (110345-110355): cpio/pax default 5120, ustar 10240. Verified:
   cpio and pax archives of a 6-byte file are 10240 bytes. Fix: select the
   default per `args.format`.
 
-- [ ] **#8 — `-b` interprets values 1–511 as a GNU blocking factor (×512), not POSIX bytes.**
+- [x] **#8 — `-b` interprets values 1–511 as a GNU blocking factor (×512), not POSIX bytes.** *(Fixed, Phase 3.)*
   `blocked_io.rs:235-241` does `if blocksize < 512 { blocksize * 512 }`. Spec
   `-b` (110058-110062) is "a positive decimal integer number of *bytes* per
   write." Verified: `-b 20` → 10240-byte records; `-b 256` would silently become
@@ -204,7 +204,7 @@ read/list. There are **no crashes/hangs**.
   `options.rs:333`. Spec 110174-110177 + ENVIRONMENT VARIABLES: default is
   `$TMPDIR/GlobalHead.%n`. (No `env::var("TMPDIR")` in the crate.) `%n`/`%p`
   substitution itself is correct.
-- [ ] **#20 — `-b` out-of-range / non-multiple-of-512 / zero is silently clamped, not diagnosed.**
+- [x] **#20 — `-b` out-of-range / non-multiple-of-512 / zero is silently clamped, not diagnosed.** *(Fixed, Phase 3.)*
   `blocked_io.rs:244-248`: `>32256`→32256, non-multiple→rounded up, `0`→512.
   Legal (behavior is impl-defined) but a diagnostic would be friendlier; `-b 0`
   in particular should be rejected (`-b` is "a positive decimal integer").

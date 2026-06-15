@@ -20,7 +20,9 @@ mod pattern;
 mod subst;
 
 use archive::{ArchiveFormat, ArchiveWriter};
-use blocked_io::{parse_blocksize, BlockedReader, BlockedWriter, DEFAULT_RECORD_SIZE};
+use blocked_io::{
+    default_record_size, parse_blocksize, BlockedReader, BlockedWriter, DEFAULT_RECORD_SIZE,
+};
 use clap::{Parser, ValueEnum};
 use compression::{is_gzip, GzipReader, GzipWriter};
 use error::{PaxError, PaxResult};
@@ -340,11 +342,12 @@ fn run_write(args: &Args) -> PaxResult<()> {
         return run_write_multi_volume(args, &files, format, &options);
     }
 
-    // Determine record size for blocked I/O
-    let record_size = args
-        .blocksize
-        .map(parse_blocksize)
-        .unwrap_or(DEFAULT_RECORD_SIZE);
+    // Determine record size for blocked I/O. With no explicit -b, the default
+    // depends on the output format (cpio/pax: 5120, ustar: 10240).
+    let record_size = match args.blocksize {
+        Some(b) => parse_blocksize(b)?,
+        None => default_record_size(format),
+    };
 
     if let Some(ref path) = args.archive {
         let file = File::create(path)?;
@@ -493,11 +496,12 @@ fn run_copy(args: &Args) -> PaxResult<()> {
 
 /// Open archive for reading with format detection
 fn open_archive_for_read(args: &Args) -> PaxResult<(Box<dyn Read>, ArchiveFormat)> {
-    // Determine record size for blocked I/O
-    let record_size = args
-        .blocksize
-        .map(parse_blocksize)
-        .unwrap_or(DEFAULT_RECORD_SIZE);
+    // Determine record size for blocked I/O. On read the format is auto-detected
+    // after this point, so an unspecified -b just sets the read granularity.
+    let record_size = match args.blocksize {
+        Some(b) => parse_blocksize(b)?,
+        None => DEFAULT_RECORD_SIZE,
+    };
 
     // Create the underlying reader
     let raw_reader: Box<dyn Read> = if let Some(ref path) = args.archive {

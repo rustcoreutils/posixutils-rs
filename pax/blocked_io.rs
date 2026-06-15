@@ -18,7 +18,7 @@
 //! record boundaries. This module provides readers and writers that
 //! ensure all I/O operations are done at the specified block size.
 
-use crate::error::PaxResult;
+use crate::error::{PaxError, PaxResult};
 use std::io::{Read, Write};
 use std::mem::ManuallyDrop;
 
@@ -225,27 +225,46 @@ impl<W: Write> Drop for BlockedWriter<W> {
     }
 }
 
-/// Calculate record size from a blocksize specification
+/// Validate a `-b` blocksize argument and return the record size in bytes.
 ///
-/// The blocksize can be specified as:
-/// - Bytes directly (if >= 512)
-/// - Blocking factor (if < 512, multiply by 512)
+/// Per POSIX, `-b` is "a positive decimal integer number of bytes per write"
+/// (not a GNU blocking factor), and it must be a multiple of 512 not exceeding
+/// the 32256-byte maximum. Out-of-range, zero, and non-multiple values are
+/// diagnosed and rejected rather than silently clamped or rounded.
+pub fn parse_blocksize(blocksize: u32) -> PaxResult<usize> {
+    let size = blocksize as usize;
+
+    if size == 0 {
+        return Err(PaxError::InvalidFormat(
+            "blocksize (-b) must be a positive number of bytes".to_string(),
+        ));
+    }
+    if size % TAR_BLOCK_SIZE != 0 {
+        return Err(PaxError::InvalidFormat(format!(
+            "blocksize (-b) must be a multiple of {} bytes",
+            TAR_BLOCK_SIZE
+        )));
+    }
+    if size > MAX_RECORD_SIZE {
+        return Err(PaxError::InvalidFormat(format!(
+            "blocksize (-b) must not exceed {} bytes",
+            MAX_RECORD_SIZE
+        )));
+    }
+
+    Ok(size)
+}
+
+/// Default record size in bytes for a freshly created archive of `format`.
 ///
-/// Returns the record size in bytes, clamped to valid range.
-pub fn parse_blocksize(blocksize: u32) -> usize {
-    let size = if blocksize < TAR_BLOCK_SIZE as u32 {
-        // Treat as blocking factor
-        blocksize as usize * TAR_BLOCK_SIZE
-    } else {
-        blocksize as usize
-    };
-
-    // Clamp to valid range and round up to block boundary
-    let size = std::cmp::max(size, TAR_BLOCK_SIZE);
-    let size = std::cmp::min(size, MAX_RECORD_SIZE);
-
-    // Round up to nearest block boundary
-    size.div_ceil(TAR_BLOCK_SIZE) * TAR_BLOCK_SIZE
+/// POSIX `-x` specifies the cpio and pax interchange formats default to 5120
+/// bytes (10×512); the ustar format defaults to 10240 (20×512).
+pub fn default_record_size(format: crate::archive::ArchiveFormat) -> usize {
+    use crate::archive::ArchiveFormat;
+    match format {
+        ArchiveFormat::Ustar => DEFAULT_RECORD_SIZE,
+        ArchiveFormat::Cpio | ArchiveFormat::Pax => 10 * TAR_BLOCK_SIZE,
+    }
 }
 
 #[cfg(test)]
@@ -255,22 +274,30 @@ mod tests {
 
     #[test]
     fn test_parse_blocksize() {
-        // Blocking factor
-        assert_eq!(parse_blocksize(1), 512);
-        assert_eq!(parse_blocksize(20), 10240);
-        assert_eq!(parse_blocksize(63), 32256);
+        // -b is a byte count, a multiple of 512 up to 32256.
+        assert_eq!(parse_blocksize(512).unwrap(), 512);
+        assert_eq!(parse_blocksize(1024).unwrap(), 1024);
+        assert_eq!(parse_blocksize(10240).unwrap(), 10240);
+        assert_eq!(
+            parse_blocksize(MAX_RECORD_SIZE as u32).unwrap(),
+            MAX_RECORD_SIZE
+        );
 
-        // Direct bytes
-        assert_eq!(parse_blocksize(512), 512);
-        assert_eq!(parse_blocksize(1024), 1024);
-        assert_eq!(parse_blocksize(10240), 10240);
+        // Rejected: zero, non-multiple-of-512, out-of-range. No silent clamp,
+        // no GNU blocking-factor interpretation of small values.
+        assert!(parse_blocksize(0).is_err());
+        assert!(parse_blocksize(20).is_err()); // not a multiple of 512
+        assert!(parse_blocksize(1000).is_err()); // not a multiple of 512
+        assert!(parse_blocksize(100000).is_err()); // exceeds the maximum
+        assert!(parse_blocksize(MAX_RECORD_SIZE as u32 + 512).is_err());
+    }
 
-        // Clamping
-        assert_eq!(parse_blocksize(0), 512);
-        assert_eq!(parse_blocksize(100000), MAX_RECORD_SIZE);
-
-        // Rounding
-        assert_eq!(parse_blocksize(1000), 1024); // rounds up to 2 blocks
+    #[test]
+    fn test_default_record_size() {
+        use crate::archive::ArchiveFormat;
+        assert_eq!(default_record_size(ArchiveFormat::Ustar), 10240);
+        assert_eq!(default_record_size(ArchiveFormat::Cpio), 5120);
+        assert_eq!(default_record_size(ArchiveFormat::Pax), 5120);
     }
 
     #[test]

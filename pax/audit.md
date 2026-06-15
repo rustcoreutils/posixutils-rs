@@ -177,7 +177,7 @@ read/list. There are **no crashes/hangs**.
   (uid/gid/uname/gname/path/linkpath/size/mtime/atime). The list-mode `-o`
   keyword path is `listopt`, addressed in Phase 6.
 
-- [ ] **#14 — `-o listopt=format` doesn't implement the POSIX `%(keyword)s` form.**
+- [x] **#14 — `-o listopt=format` doesn't implement the POSIX `%(keyword)s` form.** *(Fixed, Phase 6.)*
   `options.rs:535-589` invented a single-letter scheme (`%F`/`%s`/`%T`); the
   spec (EXTENDED DESCRIPTION exceptions 7-12, 110382-110423) requires
   `%(keyword)s`, `%(size)d`, `(mtime)T`, and the `M`/`D`/`F`/`L` specifiers.
@@ -229,7 +229,7 @@ read/list. There are **no crashes/hangs**.
   (e.g. `copy.rs:104-119`). The `-v` time formatter (`list.rs:354`
   `days_to_ymd`) is hand-rolled and ignores `TZ`/`LC_TIME` (spec ties `-v` time
   to them).
-- [ ] **#25 — `-o listopt` value is comma-split.** `options.rs:158-171` splits a
+- [x] **#25 — `-o listopt` value is comma-split.** *(Fixed, Phase 6.)* `options.rs:158-171` splits a
   `listopt` value on unescaped commas; spec 110238-110243: `listopt=format` must
   be the final keyword and all remaining characters are the format string.
 - [ ] **#26 — non-UTF-8 path bytes are lossily mangled** (`to_string_lossy` in

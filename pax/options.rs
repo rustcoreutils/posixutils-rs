@@ -149,20 +149,32 @@ impl FormatOptions {
             return Ok(());
         }
 
-        // Parse comma-separated options
-        // Note: commas can be escaped with backslash
+        // Per POSIX, `listopt` is the final <comma>-separated keyword: its value
+        // runs to the end of the `-o` string, so commas inside the format are
+        // literal. Split it off before the comma tokenizer can break it apart.
+        if let Some(marker) = find_listopt_marker(input) {
+            let before = input[..marker].trim_end().trim_end_matches(',');
+            self.parse_comma_list(before)?;
+            let raw = &input[marker + "listopt=".len()..];
+            self.list_format = Some(unescape_backslashes(raw));
+            return Ok(());
+        }
+
+        self.parse_comma_list(input)
+    }
+
+    /// Parse a sequence of comma-separated options (backslash escapes a comma).
+    fn parse_comma_list(&mut self, input: &str) -> PaxResult<()> {
         let mut current = String::new();
-        let chars = input.chars();
         let mut escaped = false;
 
-        for c in chars {
+        for c in input.chars() {
             if escaped {
                 current.push(c);
                 escaped = false;
             } else if c == '\\' {
                 escaped = true;
             } else if c == ',' {
-                // End of option
                 self.parse_single_option(current.trim())?;
                 current.clear();
             } else {
@@ -170,7 +182,6 @@ impl FormatOptions {
             }
         }
 
-        // Parse final option
         let final_opt = current.trim();
         if !final_opt.is_empty() {
             self.parse_single_option(final_opt)?;
@@ -517,6 +528,47 @@ const FORMAT_SPECIFIERS: &[(char, FormatHandler)] = &[
     ('%', fmt_percent),
 ];
 
+/// Locate a `listopt=` keyword sitting at an option boundary (start of string
+/// or just after an unescaped comma), returning the byte offset of `listopt=`.
+fn find_listopt_marker(input: &str) -> Option<usize> {
+    let mut boundaries = vec![0usize];
+    let mut escaped = false;
+    for (i, c) in input.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == ',' {
+            boundaries.push(i + 1);
+        }
+    }
+    for b in boundaries {
+        let rest = &input[b..];
+        let start = b + (rest.len() - rest.trim_start().len());
+        if input[start..].starts_with("listopt=") {
+            return Some(start);
+        }
+    }
+    None
+}
+
+/// Remove backslash escapes (`\X` → `X`) from a listopt format value.
+fn unescape_backslashes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut escaped = false;
+    for c in s.chars() {
+        if escaped {
+            out.push(c);
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Parse list format specification and format an entry
 ///
 /// Format specifiers (subset of POSIX listopt):
@@ -565,6 +617,9 @@ struct FormatSpec {
     width: Option<usize>,
     precision: Option<usize>,
     spec: char,
+    /// POSIX `%(keyword)X` extended-header keyword (with an optional `=subformat`
+    /// tail used by the `T` time conversion).
+    keyword: Option<String>,
 }
 
 fn parse_format_specifier(
@@ -584,6 +639,19 @@ fn parse_format_specifier(
         spec.precision = parse_number(chars)
             .map(|p| p.min(MAX_FORMAT_FIELD_SIZE))
             .or(Some(0));
+    }
+
+    // POSIX keyword substitution: `%(keyword)s`, `%(mtime=%Y)T`, etc.
+    if let Some('(') = chars.peek().copied() {
+        chars.next();
+        let mut keyword = String::new();
+        for c in chars.by_ref() {
+            if c == ')' {
+                break;
+            }
+            keyword.push(c);
+        }
+        spec.keyword = Some(keyword);
     }
 
     spec.spec = chars.next()?;
@@ -612,14 +680,21 @@ fn parse_number(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<
 }
 
 fn format_with_spec(info: &ListEntryInfo, spec: FormatSpec) -> String {
-    let mut rendered =
-        if let Some((_, handler)) = FORMAT_SPECIFIERS.iter().find(|(ch, _)| *ch == spec.spec) {
-            handler(info)
-        } else {
-            let mut literal = String::from("%");
-            literal.push(spec.spec);
-            literal
-        };
+    let mut rendered = if let Some(ref keyword) = spec.keyword {
+        // POSIX `%(keyword)X` substitution. For the `T` time conversion the
+        // keyword may carry an `=subformat` tail; here the keyword names the
+        // time field and the (optional) subformat is currently rendered with
+        // the default time layout.
+        let (kw, _subformat) = keyword.split_once('=').unwrap_or((keyword.as_str(), ""));
+        keyword_value(info, kw.trim(), spec.spec)
+            .unwrap_or_else(|| format!("%({}){}", keyword, spec.spec))
+    } else if let Some((_, handler)) = FORMAT_SPECIFIERS.iter().find(|(ch, _)| *ch == spec.spec) {
+        handler(info)
+    } else {
+        let mut literal = String::from("%");
+        literal.push(spec.spec);
+        literal
+    };
 
     if let Some(precision) = spec.precision {
         if rendered.len() > precision {
@@ -639,6 +714,45 @@ fn format_with_spec(info: &ListEntryInfo, spec: FormatSpec) -> String {
     }
 
     rendered
+}
+
+/// Resolve a POSIX `%(keyword)X` listopt substitution to its rendered value.
+///
+/// `keyword` is the extended-header keyword named between the parentheses and
+/// `conversion` is the trailing conversion character (`s`, `d`, `T`, `M`, ...).
+/// Returns `None` for an unknown keyword so the caller can echo it literally.
+fn keyword_value(info: &ListEntryInfo, keyword: &str, conversion: char) -> Option<String> {
+    let value = match keyword {
+        "path" | "name" => fmt_fullpath(info),
+        "size" => info.size.to_string(),
+        "uid" => info.uid.to_string(),
+        "gid" => info.gid.to_string(),
+        "uname" => info.uname.unwrap_or("").to_string(),
+        "gname" => info.gname.unwrap_or("").to_string(),
+        "linkpath" => info.link_target.unwrap_or("").to_string(),
+        "mtime" | "atime" | "ctime" => {
+            // Time keyword: the `T` conversion renders a calendar time; any other
+            // conversion (s/d) yields the raw seconds.
+            if conversion == 'T' {
+                format_time_traditional(info.mtime)
+            } else {
+                info.mtime.to_string()
+            }
+        }
+        "mode" => format!("{:o}", info.mode),
+        _ => return None,
+    };
+
+    // For the mode/device/symlink special conversions, honor the conversion
+    // character even when a keyword was given (e.g. `%(path)F`).
+    let rendered = match conversion {
+        'M' => format_mode_symbolic(info.mode, info.entry_type),
+        'F' => fmt_fullpath(info),
+        'L' => fmt_link_target(info),
+        'D' => fmt_device(info),
+        _ => value,
+    };
+    Some(rendered)
 }
 
 /// Entry type to file type character mapping for symbolic mode display
@@ -962,6 +1076,47 @@ mod tests {
         };
         let result = format_list_entry("%M %u %g %s %f", &info);
         assert_eq!(result, "-rwxr-xr-x alice users 4096 file.txt");
+    }
+
+    #[test]
+    fn test_format_list_entry_keyword_substitution() {
+        let info = ListEntryInfo {
+            path: "dir/file.txt",
+            mode: 0o644,
+            size: 4096,
+            mtime: 0,
+            uid: 1000,
+            gid: 1000,
+            uname: Some("alice"),
+            gname: Some("users"),
+            link_target: None,
+            entry_type: EntryType::Regular,
+            devmajor: 0,
+            devminor: 0,
+        };
+
+        // POSIX `%(keyword)s`/`%(keyword)d` substitution.
+        assert_eq!(
+            format_list_entry("%(path)s %(size)d", &info),
+            "dir/file.txt 4096"
+        );
+        assert_eq!(
+            format_list_entry("%(uname)s:%(gname)s", &info),
+            "alice:users"
+        );
+        // An unknown keyword is echoed verbatim.
+        assert_eq!(format_list_entry("%(bogus)s", &info), "%(bogus)s");
+    }
+
+    #[test]
+    fn test_listopt_is_final_keyword_with_commas() {
+        // A literal comma inside the listopt format must not split the option.
+        let opts = FormatOptions::parse("times,listopt=%(path)s,%(size)d bytes").unwrap();
+        assert!(opts.include_times);
+        assert_eq!(
+            opts.list_format,
+            Some("%(path)s,%(size)d bytes".to_string())
+        );
     }
 
     #[test]

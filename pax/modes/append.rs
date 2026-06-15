@@ -258,7 +258,9 @@ fn write_files<W: ArchiveWriter>(
     };
 
     for path in files {
-        write_path(
+        // Diagnose a per-operand failure and set a non-zero exit, but continue
+        // appending the remaining operands (POSIX CONSEQUENCES OF ERRORS).
+        if let Err(e) = write_path(
             archive,
             path,
             options,
@@ -266,7 +268,9 @@ fn write_files<W: ArchiveWriter>(
             None,
             true,
             &mut prompter,
-        )?;
+        ) {
+            crate::error::report_error(path.display(), e);
+        }
     }
 
     Ok(())
@@ -298,7 +302,7 @@ fn write_path<W: ArchiveWriter>(
     let metadata = match metadata {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("pax: {}: {}", path.display(), e);
+            crate::error::report_error(path.display(), e);
             return Ok(());
         }
     };
@@ -395,7 +399,7 @@ fn write_directory<W: ArchiveWriter>(
         let entries = match fs::read_dir(src_path) {
             Ok(e) => e,
             Err(e) => {
-                eprintln!("pax: {}: {}", src_path.display(), e);
+                crate::error::report_error(src_path.display(), e);
                 return Ok(());
             }
         };
@@ -404,7 +408,7 @@ fn write_directory<W: ArchiveWriter>(
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
-                    eprintln!("pax: {}: {}", src_path.display(), e);
+                    crate::error::report_error(src_path.display(), e);
                     continue;
                 }
             };
@@ -533,7 +537,7 @@ fn write_special<W: ArchiveWriter>(
     } else if file_type.is_socket() {
         EntryType::Socket
     } else {
-        eprintln!("pax: {}: unsupported file type", path.display());
+        crate::error::report_error(path.display(), "unsupported file type");
         return Ok(());
     };
 

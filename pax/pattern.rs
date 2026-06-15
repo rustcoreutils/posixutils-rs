@@ -21,6 +21,9 @@ use crate::error::{PaxError, PaxResult};
 #[derive(Debug, Clone)]
 pub struct Pattern {
     tokens: Vec<Token>,
+    /// The original pattern string, retained for "not found" diagnostics when a
+    /// pattern operand matches no archive member.
+    pub source: String,
 }
 
 #[derive(Debug, Clone)]
@@ -51,7 +54,10 @@ impl Pattern {
     /// Compile a pattern string
     pub fn new(pattern: &str) -> PaxResult<Self> {
         let tokens = parse_pattern(pattern)?;
-        Ok(Pattern { tokens })
+        Ok(Pattern {
+            tokens,
+            source: pattern.to_string(),
+        })
     }
 
     /// Check if a string matches this pattern

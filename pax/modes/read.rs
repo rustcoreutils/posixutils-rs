@@ -154,11 +154,28 @@ fn extract_entries<R: ArchiveReader>(archive: &mut R, options: &ReadOptions) -> 
                     }
                 }
             }
-            extract_entry(archive, &entry, options, &mut extracted_links)?;
+            // Per POSIX CONSEQUENCES OF ERRORS: diagnose a per-file failure and
+            // set a non-zero exit, but continue with the next member. Skip any
+            // unconsumed data of the failed entry to realign the reader.
+            if let Err(e) = extract_entry(archive, &entry, options, &mut extracted_links) {
+                crate::error::report_error(entry.path.display(), e);
+                let _ = archive.skip_data();
+            }
         } else {
             archive.skip_data()?;
         }
     }
+
+    // Diagnose any pattern operand that matched no archive member (non-exclude
+    // mode) and set a non-zero exit status (POSIX DESCRIPTION).
+    if !options.exclude {
+        for (idx, pat) in options.patterns.iter().enumerate() {
+            if !matched_patterns.contains(&idx) {
+                crate::error::report_error(&pat.source, "not found");
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -194,19 +211,14 @@ fn should_extract(
             if options.exclude {
                 // Entry matched a pattern, so exclude it
                 None
+            } else if options.first_match && matched_patterns.contains(&pattern_idx) {
+                // first_match (-n): this pattern has already selected a member
+                Some(false)
             } else {
-                // Entry matched a pattern
-                if options.first_match {
-                    // Check if this pattern was already matched
-                    if matched_patterns.contains(&pattern_idx) {
-                        Some(false) // Skip - pattern already matched
-                    } else {
-                        matched_patterns.insert(pattern_idx);
-                        Some(true) // Extract - first match for this pattern
-                    }
-                } else {
-                    Some(true) // Extract normally
-                }
+                // Record the match (used for the unmatched-pattern sweep and for
+                // -n first-match tracking) and select the entry.
+                matched_patterns.insert(pattern_idx);
+                Some(true)
             }
         }
         None => {
@@ -472,6 +484,7 @@ fn extract_device(path: &Path, entry: &ArchiveEntry, options: &ReadOptions) -> P
                 "pax: cannot create device {}: Operation not permitted (requires root)",
                 path.display()
             );
+            crate::error::note_error();
             return Ok(());
         }
         return Err(err.into());
@@ -517,6 +530,7 @@ fn extract_fifo(path: &Path, entry: &ArchiveEntry, options: &ReadOptions) -> Pax
                 "pax: cannot create FIFO {}: Operation not permitted",
                 path.display()
             );
+            crate::error::note_error();
             return Ok(());
         }
         return Err(err.into());
@@ -637,6 +651,7 @@ fn set_owner(path: &Path, entry: &ArchiveEntry, options: &ReadOptions) -> PaxRes
                 "pax: cannot change owner of {}: Operation not permitted",
                 path.display()
             );
+            crate::error::note_error();
             return Ok(());
         }
         return Err(err.into());
@@ -726,6 +741,7 @@ fn set_times(path: &Path, entry: &ArchiveEntry, options: &ReadOptions) -> PaxRes
                     err
                 );
             }
+            crate::error::note_error();
         }
     }
 

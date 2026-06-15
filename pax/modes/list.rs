@@ -101,10 +101,23 @@ fn list_entries<R: ArchiveReader, W: Write>(
                     }
                 }
             }
-            print_entry(writer, &entry, options)?;
+            if let Err(e) = print_entry(writer, &entry, options) {
+                crate::error::report_error(entry.path.display(), e);
+            }
         }
         archive.skip_data()?;
     }
+
+    // Diagnose any pattern operand that matched no archive member (non-exclude
+    // mode) and set a non-zero exit status (POSIX DESCRIPTION).
+    if !options.exclude {
+        for (idx, pat) in options.patterns.iter().enumerate() {
+            if !matched_patterns.contains(&idx) {
+                crate::error::report_error(&pat.source, "not found");
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -140,19 +153,14 @@ fn should_list(
             if options.exclude {
                 // Entry matched a pattern, so exclude it
                 None
+            } else if options.first_match && matched_patterns.contains(&pattern_idx) {
+                // first_match (-n): this pattern has already selected a member
+                Some(false)
             } else {
-                // Entry matched a pattern
-                if options.first_match {
-                    // Check if this pattern was already matched
-                    if matched_patterns.contains(&pattern_idx) {
-                        Some(false) // Skip - pattern already matched
-                    } else {
-                        matched_patterns.insert(pattern_idx);
-                        Some(true) // Output - first match for this pattern
-                    }
-                } else {
-                    Some(true) // Output normally
-                }
+                // Record the match (for the unmatched-pattern sweep and -n) and
+                // select the entry.
+                matched_patterns.insert(pattern_idx);
+                Some(true)
             }
         }
         None => {

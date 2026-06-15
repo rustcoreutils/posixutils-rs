@@ -49,7 +49,7 @@ read/list. There are **no crashes/hangs**.
 
 ### Critical
 
-- [ ] **#1 — No non-zero exit status for unmatched operands or per-file failures.**
+- [x] **#1 — No non-zero exit status for unmatched operands or per-file failures.** *(Fixed, Phase 1.)*
   There is no `had_error` accumulator anywhere; `run()` maps `Ok(())`→SUCCESS
   (`main.rs:155-161`) and the only non-zero path is a fatal `Err`. The spec
   mandates (DESCRIPTION 110034-110036): "If any specified pattern or file
@@ -64,7 +64,7 @@ read/list. There are **no crashes/hangs**.
   on each per-file diagnostic + a per-pattern matched bitset swept after the
   walk; return a non-zero `ExitCode`.
 
-- [ ] **#2 — Per-file errors abort the whole run instead of diagnose-and-continue (data loss on extract).**
+- [x] **#2 — Per-file errors abort the whole run instead of diagnose-and-continue (data loss on extract).** *(Fixed, Phase 1.)*
   `read.rs:157` (`extract_entry(...)?` inside the `while` at `:116`), mirrored
   in `copy.rs:135` and `write.rs:93`, propagate any `fs` error via `?`,
   terminating the loop. Spec 111008-111011: a per-file failure is reported "but
@@ -209,7 +209,7 @@ read/list. There are **no crashes/hangs**.
   (a 512-byte header + duplicate-of-ustar `mtime`) per file. Conformant but
   wasteful. Fix: emit only when `from_entry` produced a non-empty header (or
   `-o times`/overrides apply).
-- [ ] **#22 — Preservation (chown/utimes) failures warn but don't set non-zero exit.**
+- [x] **#22 — Preservation (chown/utimes) failures warn but don't set non-zero exit.** *(Fixed, Phase 1.)*
   `read.rs:617-733` prints EPERM warnings but does not propagate to the exit
   status. Spec 110301-110303: preserve failure "shall affect the final exit
   status." (Subsumed by #1's error accumulator.)
@@ -288,7 +288,7 @@ read/list. There are **no crashes/hangs**.
 - [ ] `-s` `s`/`S` rejected (#9). Patterns: fnmatch correct + doesn't cross `/` (CONFORMS, conformant vs GNU `--wildcards`); leading-`.` rule missing (#18).
 
 ### Exit status / consequences of errors
-- [ ] **#1 (no non-zero exit on unmatched/missing/per-file-fail)**, **#2 (per-file abort instead of continue)**, #22 (preserve-fail exit). Mode dispatch + 0-on-success CONFORM.
+- [x] **#1 (no non-zero exit on unmatched/missing/per-file-fail)**, **#2 (per-file abort instead of continue)**, #22 (preserve-fail exit) — *all fixed, Phase 1.* Mode dispatch + 0-on-success CONFORM.
 
 ## Test coverage signal (gaps)
 

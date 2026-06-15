@@ -9,6 +9,7 @@
 
 use std::fmt;
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Error type for pax operations
 #[derive(Debug)]
@@ -64,4 +65,29 @@ pub fn is_eof_error(error: &PaxError) -> bool {
         PaxError::Io(e) => e.kind() == io::ErrorKind::UnexpectedEof,
         _ => false,
     }
+}
+
+/// Process-wide "an error occurred" flag. Per POSIX CONSEQUENCES OF ERRORS, a
+/// per-file failure (or an unmatched pattern/operand) shall be diagnosed and a
+/// non-zero exit status returned, but processing continues; this flag carries
+/// that deferred non-zero status to the single exit point in `main`.
+static HAD_ERROR: AtomicBool = AtomicBool::new(false);
+
+/// Mark the run as failed (a non-fatal error occurred). Processing continues,
+/// but `main` will return a non-zero exit status.
+pub fn note_error() {
+    HAD_ERROR.store(true, Ordering::Relaxed);
+}
+
+/// Whether any non-fatal error has been reported during this run.
+pub fn had_error() -> bool {
+    HAD_ERROR.load(Ordering::Relaxed)
+}
+
+/// Write a per-item diagnostic to standard error in the `pax: <context>: <err>`
+/// form and flag the run as failed, so that processing can continue (per POSIX)
+/// while the final exit status is still non-zero.
+pub fn report_error(context: impl fmt::Display, err: impl fmt::Display) {
+    eprintln!("pax: {}: {}", context, err);
+    note_error();
 }

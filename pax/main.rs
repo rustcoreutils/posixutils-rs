@@ -153,7 +153,16 @@ fn main() -> ExitCode {
     let args = Args::parse();
 
     match run(args) {
-        Ok(()) => ExitCode::SUCCESS,
+        // A clean return still maps to a non-zero exit if any per-file failure or
+        // unmatched operand was diagnosed along the way (POSIX CONSEQUENCES OF
+        // ERRORS: diagnose and continue, but exit non-zero).
+        Ok(()) => {
+            if crate::error::had_error() {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
         Err(e) => {
             eprintln!("pax: {}", e);
             ExitCode::FAILURE

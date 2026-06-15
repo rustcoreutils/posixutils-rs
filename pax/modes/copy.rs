@@ -132,7 +132,9 @@ pub fn copy_files(files: &[PathBuf], dest_dir: &Path, options: &CopyOptions) -> 
     };
 
     for path in files {
-        copy_path(
+        // Diagnose a per-operand failure and set a non-zero exit, but continue
+        // copying the remaining operands (POSIX CONSEQUENCES OF ERRORS).
+        if let Err(e) = copy_path(
             path,
             dest_dir,
             options,
@@ -140,7 +142,9 @@ pub fn copy_files(files: &[PathBuf], dest_dir: &Path, options: &CopyOptions) -> 
             initial_dev,
             true,
             &mut prompter,
-        )?;
+        ) {
+            crate::error::report_error(path.display(), e);
+        }
     }
 
     Ok(())
@@ -180,7 +184,7 @@ fn copy_path(
     let metadata = match metadata {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("pax: {}: {}", src.display(), e);
+            crate::error::report_error(src.display(), e);
             return Ok(());
         }
     };
@@ -259,7 +263,7 @@ fn copy_path(
     } else if metadata.is_file() {
         copy_file(src, &dest, options, link_tracker, &metadata)?;
     } else {
-        eprintln!("pax: {}: unsupported file type", src.display());
+        crate::error::report_error(src.display(), "unsupported file type");
     }
 
     Ok(())
@@ -277,7 +281,7 @@ fn copy_current_dir_contents(
     let entries = match fs::read_dir(src) {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("pax: {}: {}", src.display(), e);
+            crate::error::report_error(src.display(), e);
             return Ok(());
         }
     };
@@ -286,7 +290,7 @@ fn copy_current_dir_contents(
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
-                eprintln!("pax: {}: {}", src.display(), e);
+                crate::error::report_error(src.display(), e);
                 continue;
             }
         };
@@ -383,7 +387,7 @@ fn copy_directory(
         let entries = match fs::read_dir(src) {
             Ok(e) => e,
             Err(e) => {
-                eprintln!("pax: {}: {}", src.display(), e);
+                crate::error::report_error(src.display(), e);
                 return Ok(());
             }
         };
@@ -392,7 +396,7 @@ fn copy_directory(
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
-                    eprintln!("pax: {}: {}", src.display(), e);
+                    crate::error::report_error(src.display(), e);
                     continue;
                 }
             };
@@ -439,7 +443,7 @@ fn copy_path_to_dest(
     let metadata = match metadata {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("pax: {}: {}", src.display(), e);
+            crate::error::report_error(src.display(), e);
             return Ok(());
         }
     };
@@ -500,7 +504,7 @@ fn copy_path_to_dest(
     } else if metadata.is_file() {
         copy_file(src, &actual_dest, options, link_tracker, &metadata)?;
     } else {
-        eprintln!("pax: {}: unsupported file type", src.display());
+        crate::error::report_error(src.display(), "unsupported file type");
     }
 
     Ok(())

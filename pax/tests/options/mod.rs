@@ -859,3 +859,175 @@ fn test_first_match_option() {
         txt_count
     );
 }
+
+// --- Exit status: diagnose-and-continue (POSIX CONSEQUENCES OF ERRORS) ---
+
+/// An unmatched pattern operand in list mode must be diagnosed and yield a
+/// non-zero exit status, while the matched members are still listed.
+#[test]
+fn test_exit_status_unmatched_list_pattern() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("test.tar");
+
+    fs::create_dir(&src_dir).unwrap();
+    let mut f = File::create(src_dir.join("present.txt")).unwrap();
+    writeln!(f, "hello").unwrap();
+
+    run_pax_in_dir(
+        &["-w", "-x", "ustar", "-f", archive.to_str().unwrap(), "."],
+        &src_dir,
+    );
+
+    let output = run_pax(&["-f", archive.to_str().unwrap(), "present.txt", "nosuchfile"]);
+
+    assert_failure(&output, "list with an unmatched pattern");
+    let stderr = stderr_str(&output);
+    assert!(
+        stderr.contains("nosuchfile") && stderr.contains("not found"),
+        "expected a 'not found' diagnostic for the unmatched pattern, got: {stderr}"
+    );
+    // The matched member is still listed.
+    let stdout = stdout_str(&output);
+    assert!(
+        stdout.contains("present.txt"),
+        "the matched member should still be listed, got: {stdout}"
+    );
+}
+
+/// An unmatched pattern operand in read (extract) mode must be diagnosed and
+/// yield a non-zero exit status, while the matched members are still extracted.
+#[test]
+fn test_exit_status_unmatched_read_pattern() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let dst_dir = temp.path().join("dest");
+    let archive = temp.path().join("test.tar");
+
+    fs::create_dir(&src_dir).unwrap();
+    let mut f = File::create(src_dir.join("present.txt")).unwrap();
+    writeln!(f, "hello").unwrap();
+
+    run_pax_in_dir(
+        &["-w", "-x", "ustar", "-f", archive.to_str().unwrap(), "."],
+        &src_dir,
+    );
+
+    fs::create_dir(&dst_dir).unwrap();
+    let output = run_pax_in_dir(
+        &[
+            "-r",
+            "-f",
+            archive.to_str().unwrap(),
+            "present.txt",
+            "nosuchfile",
+        ],
+        &dst_dir,
+    );
+
+    assert_failure(&output, "extract with an unmatched pattern");
+    let stderr = stderr_str(&output);
+    assert!(
+        stderr.contains("nosuchfile") && stderr.contains("not found"),
+        "expected a 'not found' diagnostic, got: {stderr}"
+    );
+    // The matched member was still extracted.
+    assert!(
+        dst_dir.join("present.txt").exists(),
+        "the matched member should still be extracted"
+    );
+}
+
+/// A non-existent file operand in write mode must be diagnosed and yield a
+/// non-zero exit status, while the valid operands are still archived.
+#[test]
+fn test_exit_status_missing_write_operand() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("test.tar");
+
+    fs::create_dir(&src_dir).unwrap();
+    let mut f = File::create(src_dir.join("real.txt")).unwrap();
+    writeln!(f, "hello").unwrap();
+
+    let output = run_pax_in_dir(
+        &[
+            "-w",
+            "-x",
+            "ustar",
+            "-f",
+            archive.to_str().unwrap(),
+            "real.txt",
+            "ghost.txt",
+        ],
+        &src_dir,
+    );
+
+    assert_failure(&output, "write with a missing file operand");
+    let stderr = stderr_str(&output);
+    assert!(
+        stderr.contains("ghost.txt"),
+        "expected a diagnostic naming the missing operand, got: {stderr}"
+    );
+
+    // The valid operand was still archived: listing the archive shows it.
+    let list = run_pax(&["-f", archive.to_str().unwrap()]);
+    assert_success(&list, "list archive built despite missing operand");
+    assert!(
+        stdout_str(&list).contains("real.txt"),
+        "the valid operand should have been archived"
+    );
+}
+
+/// Extracting over a pre-existing directory blocks one member but the rest of
+/// the archive must still extract, with a non-zero exit status overall.
+#[test]
+fn test_exit_status_extract_continues_after_failure() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let dst_dir = temp.path().join("dest");
+    let archive = temp.path().join("test.tar");
+
+    // Two regular files; "a.txt" sorts/stores before "b.txt".
+    fs::create_dir(&src_dir).unwrap();
+    File::create(src_dir.join("a.txt"))
+        .unwrap()
+        .write_all(b"aaa")
+        .unwrap();
+    File::create(src_dir.join("b.txt"))
+        .unwrap()
+        .write_all(b"bbb")
+        .unwrap();
+
+    run_pax_in_dir(
+        &[
+            "-w",
+            "-x",
+            "ustar",
+            "-f",
+            archive.to_str().unwrap(),
+            "a.txt",
+            "b.txt",
+        ],
+        &src_dir,
+    );
+
+    // In the destination, pre-create "a.txt" as a non-empty *directory* so the
+    // file member cannot be created over it, but "b.txt" still can.
+    fs::create_dir(&dst_dir).unwrap();
+    fs::create_dir(dst_dir.join("a.txt")).unwrap();
+    File::create(dst_dir.join("a.txt").join("blocker"))
+        .unwrap()
+        .write_all(b"x")
+        .unwrap();
+
+    let output = run_pax_in_dir(&["-r", "-f", archive.to_str().unwrap()], &dst_dir);
+
+    assert_failure(&output, "extract over a blocking directory");
+    // The second member must still have been extracted.
+    assert_eq!(
+        fs::read(dst_dir.join("b.txt")).unwrap(),
+        b"bbb",
+        "the member after the failing one should still be extracted"
+    );
+}

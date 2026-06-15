@@ -265,7 +265,7 @@ fn copy_path(
         copy_symlink(src, &dest)?;
     } else if metadata.is_file() {
         copy_file(src, &dest, options, link_tracker, &metadata)?;
-    } else if let Err(e) = copy_special_file(src, &dest, &metadata) {
+    } else if let Err(e) = copy_special_file(&dest, &metadata) {
         crate::error::report_error(src.display(), e);
     }
 
@@ -506,20 +506,21 @@ fn copy_path_to_dest(
         copy_symlink(src, &actual_dest)?;
     } else if metadata.is_file() {
         copy_file(src, &actual_dest, options, link_tracker, &metadata)?;
-    } else if let Err(e) = copy_special_file(src, &actual_dest, &metadata) {
+    } else if let Err(e) = copy_special_file(&actual_dest, &metadata) {
         crate::error::report_error(src.display(), e);
     }
 
     Ok(())
 }
 
-/// Recreate a special file (FIFO or device node) at `dest` mirroring `src`.
+/// Recreate a special file (FIFO or device node) at `dest`.
 ///
 /// FIFOs are recreated with `mkfifo` and block/character devices with `mknod`
 /// (the latter typically requires privilege). Sockets cannot be meaningfully
-/// recreated and are reported as an unsupported type.
+/// recreated and are reported as an unsupported type. The error message is
+/// context-free; the caller adds the pathname via `report_error`.
 #[cfg(unix)]
-fn copy_special_file(src: &Path, dest: &Path, metadata: &fs::Metadata) -> PaxResult<()> {
+fn copy_special_file(dest: &Path, metadata: &fs::Metadata) -> PaxResult<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::FileTypeExt;
@@ -557,9 +558,8 @@ fn copy_special_file(src: &Path, dest: &Path, metadata: &fs::Metadata) -> PaxRes
             return Err(std::io::Error::last_os_error().into());
         }
     } else {
-        return Err(PaxError::InvalidFormat(format!(
-            "{}: unsupported file type",
-            src.display()
+        return Err(PaxError::InvalidFormat(gettextrs::gettext(
+            "unsupported file type",
         )));
     }
 
@@ -567,10 +567,9 @@ fn copy_special_file(src: &Path, dest: &Path, metadata: &fs::Metadata) -> PaxRes
 }
 
 #[cfg(not(unix))]
-fn copy_special_file(src: &Path, _dest: &Path, _metadata: &fs::Metadata) -> PaxResult<()> {
-    Err(PaxError::InvalidFormat(format!(
-        "{}: unsupported file type",
-        src.display()
+fn copy_special_file(_dest: &Path, _metadata: &fs::Metadata) -> PaxResult<()> {
+    Err(PaxError::InvalidFormat(gettextrs::gettext(
+        "unsupported file type",
     )))
 }
 

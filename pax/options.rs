@@ -734,15 +734,17 @@ fn keyword_value(info: &ListEntryInfo, keyword: &str, conversion: char) -> Optio
         "uname" => info.uname.unwrap_or("").to_string(),
         "gname" => info.gname.unwrap_or("").to_string(),
         "linkpath" => info.link_target.unwrap_or("").to_string(),
-        "mtime" | "atime" | "ctime" => {
-            // Time keyword: the `T` conversion renders a calendar time; any other
-            // conversion (s/d) yields the raw seconds.
+        "mtime" => {
+            // The `T` conversion renders a calendar time; any other conversion
+            // (s/d) yields the raw seconds.
             if conversion == 'T' {
                 format_time_traditional(info.mtime)
             } else {
                 info.mtime.to_string()
             }
         }
+        // atime/ctime are not carried by the listing entry, so leave them
+        // unsupported (echoed literally) rather than aliasing them to mtime.
         "mode" => format!("{:o}", info.mode),
         _ => return None,
     };

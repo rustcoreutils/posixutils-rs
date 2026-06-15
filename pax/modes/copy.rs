@@ -55,6 +55,9 @@ pub struct CopyOptions {
     pub update: bool,
     /// Path substitutions (-s option)
     pub substitutions: Vec<Substitution>,
+    /// Process file-creation mask, applied to the mode of copied files when the
+    /// mode is not explicitly preserved (no `-p p`/`-p e`).
+    pub umask: u32,
 }
 
 /// Tracks hard links during copy to preserve link structure
@@ -132,7 +135,9 @@ pub fn copy_files(files: &[PathBuf], dest_dir: &Path, options: &CopyOptions) -> 
     };
 
     for path in files {
-        copy_path(
+        // Diagnose a per-operand failure and set a non-zero exit, but continue
+        // copying the remaining operands (POSIX CONSEQUENCES OF ERRORS).
+        if let Err(e) = copy_path(
             path,
             dest_dir,
             options,
@@ -140,7 +145,9 @@ pub fn copy_files(files: &[PathBuf], dest_dir: &Path, options: &CopyOptions) -> 
             initial_dev,
             true,
             &mut prompter,
-        )?;
+        ) {
+            crate::error::report_error(path.display(), e);
+        }
     }
 
     Ok(())
@@ -180,7 +187,7 @@ fn copy_path(
     let metadata = match metadata {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("pax: {}: {}", src.display(), e);
+            crate::error::report_error(src.display(), e);
             return Ok(());
         }
     };
@@ -258,8 +265,8 @@ fn copy_path(
         copy_symlink(src, &dest)?;
     } else if metadata.is_file() {
         copy_file(src, &dest, options, link_tracker, &metadata)?;
-    } else {
-        eprintln!("pax: {}: unsupported file type", src.display());
+    } else if let Err(e) = copy_special_file(&dest, &metadata) {
+        crate::error::report_error(src.display(), e);
     }
 
     Ok(())
@@ -277,7 +284,7 @@ fn copy_current_dir_contents(
     let entries = match fs::read_dir(src) {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("pax: {}: {}", src.display(), e);
+            crate::error::report_error(src.display(), e);
             return Ok(());
         }
     };
@@ -286,7 +293,7 @@ fn copy_current_dir_contents(
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
-                eprintln!("pax: {}: {}", src.display(), e);
+                crate::error::report_error(src.display(), e);
                 continue;
             }
         };
@@ -383,7 +390,7 @@ fn copy_directory(
         let entries = match fs::read_dir(src) {
             Ok(e) => e,
             Err(e) => {
-                eprintln!("pax: {}: {}", src.display(), e);
+                crate::error::report_error(src.display(), e);
                 return Ok(());
             }
         };
@@ -392,7 +399,7 @@ fn copy_directory(
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
-                    eprintln!("pax: {}: {}", src.display(), e);
+                    crate::error::report_error(src.display(), e);
                     continue;
                 }
             };
@@ -439,7 +446,7 @@ fn copy_path_to_dest(
     let metadata = match metadata {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("pax: {}: {}", src.display(), e);
+            crate::error::report_error(src.display(), e);
             return Ok(());
         }
     };
@@ -499,11 +506,71 @@ fn copy_path_to_dest(
         copy_symlink(src, &actual_dest)?;
     } else if metadata.is_file() {
         copy_file(src, &actual_dest, options, link_tracker, &metadata)?;
-    } else {
-        eprintln!("pax: {}: unsupported file type", src.display());
+    } else if let Err(e) = copy_special_file(&actual_dest, &metadata) {
+        crate::error::report_error(src.display(), e);
     }
 
     Ok(())
+}
+
+/// Recreate a special file (FIFO or device node) at `dest`.
+///
+/// FIFOs are recreated with `mkfifo` and block/character devices with `mknod`
+/// (the latter typically requires privilege). Sockets cannot be meaningfully
+/// recreated and are reported as an unsupported type. The error message is
+/// context-free; the caller adds the pathname via `report_error`.
+#[cfg(unix)]
+fn copy_special_file(dest: &Path, metadata: &fs::Metadata) -> PaxResult<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::FileTypeExt;
+
+    let ft = metadata.file_type();
+
+    // Replace any existing destination entry first.
+    if dest.exists() || dest.symlink_metadata().is_ok() {
+        let _ = fs::remove_file(dest);
+    }
+
+    let dest_c = CString::new(dest.as_os_str().as_bytes())
+        .map_err(|_| PaxError::InvalidHeader("path contains null".to_string()))?;
+    let perm = (metadata.mode() & 0o7777) as libc::mode_t;
+
+    if ft.is_fifo() {
+        let r = unsafe { libc::mkfifo(dest_c.as_ptr(), perm) };
+        if r != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    } else if ft.is_block_device() || ft.is_char_device() {
+        let type_bits = if ft.is_block_device() {
+            libc::S_IFBLK
+        } else {
+            libc::S_IFCHR
+        };
+        let r = unsafe {
+            libc::mknod(
+                dest_c.as_ptr(),
+                perm | type_bits,
+                metadata.rdev() as libc::dev_t,
+            )
+        };
+        if r != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    } else {
+        return Err(PaxError::InvalidFormat(gettextrs::gettext(
+            "unsupported file type",
+        )));
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn copy_special_file(_dest: &Path, _metadata: &fs::Metadata) -> PaxResult<()> {
+    Err(PaxError::InvalidFormat(gettextrs::gettext(
+        "unsupported file type",
+    )))
 }
 
 /// Copy a symlink
@@ -609,21 +676,24 @@ fn do_copy_file(
 
 /// Set file permissions
 fn set_permissions(path: &Path, metadata: &fs::Metadata, options: &CopyOptions) -> PaxResult<()> {
-    if !options.preserve_perms {
-        return Ok(());
-    }
-
     #[cfg(unix)]
     {
-        let mode = metadata.mode() & 0o7777;
+        let mut mode = metadata.mode() & 0o7777;
+        // Without explicit `-p p`/`-p e`, copied files are created subject to the
+        // process umask (the normal file-creation action), matching extract mode.
+        if !options.preserve_perms {
+            mode &= !options.umask;
+        }
         let perms = Permissions::from_mode(mode);
         fs::set_permissions(path, perms)?;
     }
 
     #[cfg(not(unix))]
     {
-        let perms = metadata.permissions();
-        fs::set_permissions(path, perms)?;
+        if options.preserve_perms {
+            let perms = metadata.permissions();
+            fs::set_permissions(path, perms)?;
+        }
     }
 
     Ok(())
@@ -673,7 +743,9 @@ pub fn read_file_list<R: std::io::Read>(reader: R) -> PaxResult<Vec<PathBuf>> {
 
     for line in reader.lines() {
         let line = line?;
-        let line = line.trim();
+        // `lines()` already strips the trailing newline. Keep the rest verbatim
+        // so pathnames with leading/trailing spaces survive; skip only a wholly
+        // empty line (e.g. a trailing blank line).
         if !line.is_empty() {
             files.push(PathBuf::from(line));
         }

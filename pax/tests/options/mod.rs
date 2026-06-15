@@ -859,3 +859,275 @@ fn test_first_match_option() {
         txt_count
     );
 }
+
+// --- Exit status: diagnose-and-continue (POSIX CONSEQUENCES OF ERRORS) ---
+
+/// An unmatched pattern operand in list mode must be diagnosed and yield a
+/// non-zero exit status, while the matched members are still listed.
+#[test]
+fn test_exit_status_unmatched_list_pattern() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("test.tar");
+
+    fs::create_dir(&src_dir).unwrap();
+    let mut f = File::create(src_dir.join("present.txt")).unwrap();
+    writeln!(f, "hello").unwrap();
+
+    run_pax_in_dir(
+        &["-w", "-x", "ustar", "-f", archive.to_str().unwrap(), "."],
+        &src_dir,
+    );
+
+    let output = run_pax(&["-f", archive.to_str().unwrap(), "present.txt", "nosuchfile"]);
+
+    assert_failure(&output, "list with an unmatched pattern");
+    let stderr = stderr_str(&output);
+    assert!(
+        stderr.contains("nosuchfile") && stderr.contains("not found"),
+        "expected a 'not found' diagnostic for the unmatched pattern, got: {stderr}"
+    );
+    // The matched member is still listed.
+    let stdout = stdout_str(&output);
+    assert!(
+        stdout.contains("present.txt"),
+        "the matched member should still be listed, got: {stdout}"
+    );
+}
+
+/// An unmatched pattern operand in read (extract) mode must be diagnosed and
+/// yield a non-zero exit status, while the matched members are still extracted.
+#[test]
+fn test_exit_status_unmatched_read_pattern() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let dst_dir = temp.path().join("dest");
+    let archive = temp.path().join("test.tar");
+
+    fs::create_dir(&src_dir).unwrap();
+    let mut f = File::create(src_dir.join("present.txt")).unwrap();
+    writeln!(f, "hello").unwrap();
+
+    run_pax_in_dir(
+        &["-w", "-x", "ustar", "-f", archive.to_str().unwrap(), "."],
+        &src_dir,
+    );
+
+    fs::create_dir(&dst_dir).unwrap();
+    let output = run_pax_in_dir(
+        &[
+            "-r",
+            "-f",
+            archive.to_str().unwrap(),
+            "present.txt",
+            "nosuchfile",
+        ],
+        &dst_dir,
+    );
+
+    assert_failure(&output, "extract with an unmatched pattern");
+    let stderr = stderr_str(&output);
+    assert!(
+        stderr.contains("nosuchfile") && stderr.contains("not found"),
+        "expected a 'not found' diagnostic, got: {stderr}"
+    );
+    // The matched member was still extracted.
+    assert!(
+        dst_dir.join("present.txt").exists(),
+        "the matched member should still be extracted"
+    );
+}
+
+/// A non-existent file operand in write mode must be diagnosed and yield a
+/// non-zero exit status, while the valid operands are still archived.
+#[test]
+fn test_exit_status_missing_write_operand() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("test.tar");
+
+    fs::create_dir(&src_dir).unwrap();
+    let mut f = File::create(src_dir.join("real.txt")).unwrap();
+    writeln!(f, "hello").unwrap();
+
+    let output = run_pax_in_dir(
+        &[
+            "-w",
+            "-x",
+            "ustar",
+            "-f",
+            archive.to_str().unwrap(),
+            "real.txt",
+            "ghost.txt",
+        ],
+        &src_dir,
+    );
+
+    assert_failure(&output, "write with a missing file operand");
+    let stderr = stderr_str(&output);
+    assert!(
+        stderr.contains("ghost.txt"),
+        "expected a diagnostic naming the missing operand, got: {stderr}"
+    );
+
+    // The valid operand was still archived: listing the archive shows it.
+    let list = run_pax(&["-f", archive.to_str().unwrap()]);
+    assert_success(&list, "list archive built despite missing operand");
+    assert!(
+        stdout_str(&list).contains("real.txt"),
+        "the valid operand should have been archived"
+    );
+}
+
+/// Extracting over a pre-existing directory blocks one member but the rest of
+/// the archive must still extract, with a non-zero exit status overall.
+#[test]
+fn test_exit_status_extract_continues_after_failure() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let dst_dir = temp.path().join("dest");
+    let archive = temp.path().join("test.tar");
+
+    // Two regular files; "a.txt" sorts/stores before "b.txt".
+    fs::create_dir(&src_dir).unwrap();
+    File::create(src_dir.join("a.txt"))
+        .unwrap()
+        .write_all(b"aaa")
+        .unwrap();
+    File::create(src_dir.join("b.txt"))
+        .unwrap()
+        .write_all(b"bbb")
+        .unwrap();
+
+    run_pax_in_dir(
+        &[
+            "-w",
+            "-x",
+            "ustar",
+            "-f",
+            archive.to_str().unwrap(),
+            "a.txt",
+            "b.txt",
+        ],
+        &src_dir,
+    );
+
+    // In the destination, pre-create "a.txt" as a non-empty *directory* so the
+    // file member cannot be created over it, but "b.txt" still can.
+    fs::create_dir(&dst_dir).unwrap();
+    fs::create_dir(dst_dir.join("a.txt")).unwrap();
+    File::create(dst_dir.join("a.txt").join("blocker"))
+        .unwrap()
+        .write_all(b"x")
+        .unwrap();
+
+    let output = run_pax_in_dir(&["-r", "-f", archive.to_str().unwrap()], &dst_dir);
+
+    assert_failure(&output, "extract over a blocking directory");
+    // The second member must still have been extracted.
+    assert_eq!(
+        fs::read(dst_dir.join("b.txt")).unwrap(),
+        b"bbb",
+        "the member after the failing one should still be extracted"
+    );
+}
+
+// --- Phase 5: pax time fidelity + `-o` on read ---
+
+/// `-o gname:=value` forces a gname extended record even when the entry carried
+/// no gname of its own.
+#[test]
+fn test_pax_o_gname_override_emits_record() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("g.pax");
+
+    fs::create_dir(&src_dir).unwrap();
+    fs::write(src_dir.join("f"), b"hi").unwrap();
+
+    let output = run_pax_in_dir(
+        &[
+            "-w",
+            "-x",
+            "pax",
+            "-o",
+            "gname:=mygroup",
+            "-f",
+            archive.to_str().unwrap(),
+            "f",
+        ],
+        &src_dir,
+    );
+    assert_success(&output, "pax write with -o gname:=");
+
+    let bytes = fs::read(&archive).unwrap();
+    let needle = b"gname=mygroup";
+    assert!(
+        bytes.windows(needle.len()).any(|w| w == needle),
+        "archive should contain a gname=mygroup extended record"
+    );
+}
+
+/// `-o delete=mtime` on extract removes the extended mtime record so the
+/// (whole-second) ustar header time is used, dropping the sub-second part that a
+/// default extract preserves.
+#[test]
+fn test_pax_o_delete_mtime_on_extract() {
+    use std::os::unix::fs::MetadataExt;
+    use std::process::Command;
+
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("a.pax");
+
+    fs::create_dir(&src_dir).unwrap();
+    let src_file = src_dir.join("f");
+    fs::write(&src_file, b"hi").unwrap();
+    // Stamp a precise sub-second mtime.
+    let status = Command::new("touch")
+        .args(["-d", "2020-01-01 12:00:00.123456789"])
+        .arg(&src_file)
+        .status()
+        .unwrap();
+    if !status.success() {
+        eprintln!("skipping: touch with fractional time unsupported");
+        return;
+    }
+
+    assert_success(
+        &run_pax_in_dir(
+            &["-w", "-x", "pax", "-f", archive.to_str().unwrap(), "f"],
+            &src_dir,
+        ),
+        "pax write pax",
+    );
+
+    // Default extract preserves the nanoseconds.
+    let d_default = temp.path().join("d_default");
+    fs::create_dir(&d_default).unwrap();
+    assert_success(
+        &run_pax_in_dir(&["-r", "-f", archive.to_str().unwrap()], &d_default),
+        "extract default",
+    );
+    let nsec_default = fs::metadata(d_default.join("f")).unwrap().mtime_nsec();
+    assert_eq!(
+        nsec_default, 123456789,
+        "default extract must preserve sub-second mtime"
+    );
+
+    // delete=mtime falls back to the whole-second ustar time.
+    let d_del = temp.path().join("d_del");
+    fs::create_dir(&d_del).unwrap();
+    assert_success(
+        &run_pax_in_dir(
+            &["-r", "-o", "delete=mtime", "-f", archive.to_str().unwrap()],
+            &d_del,
+        ),
+        "extract delete=mtime",
+    );
+    let nsec_del = fs::metadata(d_del.join("f")).unwrap().mtime_nsec();
+    assert_eq!(
+        nsec_del, 0,
+        "delete=mtime must drop the sub-second precision"
+    );
+}

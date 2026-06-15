@@ -9,6 +9,7 @@
 
 use std::fmt;
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Error type for pax operations
 #[derive(Debug)]
@@ -27,12 +28,18 @@ pub enum PaxError {
 
 impl fmt::Display for PaxError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The fixed clause of each diagnostic is routed through gettext so it can
+        // be localized; the variable detail is interpolated outside. In the C
+        // locale gettext returns the message unchanged, so output is unchanged.
+        use gettextrs::gettext;
         match self {
-            PaxError::Io(e) => write!(f, "I/O error: {}", e),
-            PaxError::InvalidFormat(msg) => write!(f, "Invalid archive format: {}", msg),
-            PaxError::InvalidHeader(msg) => write!(f, "Invalid header: {}", msg),
-            PaxError::PathTooLong(path) => write!(f, "Path too long: {}", path),
-            PaxError::PatternError(msg) => write!(f, "Pattern error: {}", msg),
+            PaxError::Io(e) => write!(f, "{}: {}", gettext("I/O error"), e),
+            PaxError::InvalidFormat(msg) => {
+                write!(f, "{}: {}", gettext("Invalid archive format"), msg)
+            }
+            PaxError::InvalidHeader(msg) => write!(f, "{}: {}", gettext("Invalid header"), msg),
+            PaxError::PathTooLong(path) => write!(f, "{}: {}", gettext("Path too long"), path),
+            PaxError::PatternError(msg) => write!(f, "{}: {}", gettext("Pattern error"), msg),
         }
     }
 }
@@ -64,4 +71,29 @@ pub fn is_eof_error(error: &PaxError) -> bool {
         PaxError::Io(e) => e.kind() == io::ErrorKind::UnexpectedEof,
         _ => false,
     }
+}
+
+/// Process-wide "an error occurred" flag. Per POSIX CONSEQUENCES OF ERRORS, a
+/// per-file failure (or an unmatched pattern/operand) shall be diagnosed and a
+/// non-zero exit status returned, but processing continues; this flag carries
+/// that deferred non-zero status to the single exit point in `main`.
+static HAD_ERROR: AtomicBool = AtomicBool::new(false);
+
+/// Mark the run as failed (a non-fatal error occurred). Processing continues,
+/// but `main` will return a non-zero exit status.
+pub fn note_error() {
+    HAD_ERROR.store(true, Ordering::Relaxed);
+}
+
+/// Whether any non-fatal error has been reported during this run.
+pub fn had_error() -> bool {
+    HAD_ERROR.load(Ordering::Relaxed)
+}
+
+/// Write a per-item diagnostic to standard error in the `pax: <context>: <err>`
+/// form and flag the run as failed, so that processing can continue (per POSIX)
+/// while the final exit status is still non-zero.
+pub fn report_error(context: impl fmt::Display, err: impl fmt::Display) {
+    eprintln!("pax: {}: {}", context, err);
+    note_error();
 }

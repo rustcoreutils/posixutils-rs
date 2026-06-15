@@ -20,11 +20,13 @@ mod pattern;
 mod subst;
 
 use archive::{ArchiveFormat, ArchiveWriter};
-use blocked_io::{parse_blocksize, BlockedReader, BlockedWriter, DEFAULT_RECORD_SIZE};
+use blocked_io::{
+    default_record_size, parse_blocksize, BlockedReader, BlockedWriter, DEFAULT_RECORD_SIZE,
+};
 use clap::{Parser, ValueEnum};
 use compression::{is_gzip, GzipReader, GzipWriter};
 use error::{PaxError, PaxResult};
-use gettextrs::gettext;
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use modes::copy::CopyOptions;
 use modes::list::ListOptions;
 use modes::read::ReadOptions;
@@ -120,8 +122,11 @@ struct Args {
     #[arg(short, long, help = gettext("In list mode, produce a verbose table of contents"))]
     verbose: bool,
 
-    #[arg(short = 'x', long, value_enum, default_value_t = Format::Ustar, help = gettext("Specify the output archive format"))]
-    format: Format,
+    // Left as an Option (rather than a defaulted value) so append mode can tell
+    // an explicit `-x` from the ustar default and reject a format that conflicts
+    // with the existing archive.
+    #[arg(short = 'x', long, value_enum, help = gettext("Specify the output archive format"))]
+    format: Option<Format>,
 
     #[arg(short = 'X', long, help = gettext("Do not cross filesystem boundaries"))]
     one_file_system: bool,
@@ -150,10 +155,36 @@ enum PaxMode {
 }
 
 fn main() -> ExitCode {
+    // Initialize locale so LC_* environment variables affect locale-sensitive
+    // libc formatting (e.g. LC_TIME month names in the `-v` listing time, via
+    // the strftime time formatter).
+    setlocale(LocaleCategory::LcAll, "");
+    let _ = textdomain("posixutils-rs");
+    let _ = bind_textdomain_codeset("posixutils-rs", "UTF-8");
+    // glibc's localtime_r (used by the strftime time formatter) does not call
+    // tzset() itself, so initialize the timezone from $TZ once up front. The
+    // symbol is not surfaced by the `libc` crate, so declare it directly.
+    #[cfg(unix)]
+    {
+        extern "C" {
+            fn tzset();
+        }
+        unsafe { tzset() };
+    }
+
     let args = Args::parse();
 
     match run(args) {
-        Ok(()) => ExitCode::SUCCESS,
+        // A clean return still maps to a non-zero exit if any per-file failure or
+        // unmatched operand was diagnosed along the way (POSIX CONSEQUENCES OF
+        // ERRORS: diagnose and continue, but exit non-zero).
+        Ok(()) => {
+            if crate::error::had_error() {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
         Err(e) => {
             eprintln!("pax: {}", e);
             ExitCode::FAILURE
@@ -225,6 +256,7 @@ fn run_list(args: &Args) -> PaxResult<()> {
         format_options,
         substitutions,
         first_match: args.first_match,
+        dir_only: args.dir_no_follow,
     };
 
     // Check for multi-volume mode
@@ -262,6 +294,7 @@ fn run_list_multi_volume(args: &Args, options: &ListOptions) -> PaxResult<()> {
 fn run_read(args: &Args) -> PaxResult<()> {
     let patterns = compile_patterns(&args.files_and_patterns)?;
     let substitutions = parse_substitutions(args)?;
+    let format_options = parse_format_options(args)?;
 
     let options = ReadOptions {
         patterns,
@@ -276,6 +309,9 @@ fn run_read(args: &Args) -> PaxResult<()> {
         update: args.update,
         substitutions,
         first_match: args.first_match,
+        umask: current_umask(),
+        format_options,
+        dir_only: args.dir_no_follow,
     };
 
     // Check for multi-volume mode
@@ -324,18 +360,19 @@ fn run_write(args: &Args) -> PaxResult<()> {
         format_options,
     };
 
-    let format = ArchiveFormat::from(args.format);
+    let format = ArchiveFormat::from(args.format.unwrap_or(Format::Ustar));
 
     // Check for multi-volume mode
     if args.multi_volume {
         return run_write_multi_volume(args, &files, format, &options);
     }
 
-    // Determine record size for blocked I/O
-    let record_size = args
-        .blocksize
-        .map(parse_blocksize)
-        .unwrap_or(DEFAULT_RECORD_SIZE);
+    // Determine record size for blocked I/O. With no explicit -b, the default
+    // depends on the output format (cpio/pax: 5120, ustar: 10240).
+    let record_size = match args.blocksize {
+        Some(b) => parse_blocksize(b)?,
+        None => default_record_size(format),
+    };
 
     if let Some(ref path) = args.archive {
         let file = File::create(path)?;
@@ -431,7 +468,8 @@ fn run_append(args: &Args) -> PaxResult<()> {
         format_options,
     };
 
-    modes::append_to_archive(archive_path, &files, &options)
+    let requested_format = args.format.map(ArchiveFormat::from);
+    modes::append_to_archive(archive_path, &files, &options, requested_format)
 }
 
 /// Run copy mode (-r -w)
@@ -477,6 +515,7 @@ fn run_copy(args: &Args) -> PaxResult<()> {
         interactive: args.interactive,
         update: args.update,
         substitutions,
+        umask: current_umask(),
     };
 
     modes::copy_files(&files, &dest_dir, &options)
@@ -484,11 +523,12 @@ fn run_copy(args: &Args) -> PaxResult<()> {
 
 /// Open archive for reading with format detection
 fn open_archive_for_read(args: &Args) -> PaxResult<(Box<dyn Read>, ArchiveFormat)> {
-    // Determine record size for blocked I/O
-    let record_size = args
-        .blocksize
-        .map(parse_blocksize)
-        .unwrap_or(DEFAULT_RECORD_SIZE);
+    // Determine record size for blocked I/O. On read the format is auto-detected
+    // after this point, so an unspecified -b just sets the read granularity.
+    let record_size = match args.blocksize {
+        Some(b) => parse_blocksize(b)?,
+        None => DEFAULT_RECORD_SIZE,
+    };
 
     // Create the underlying reader
     let raw_reader: Box<dyn Read> = if let Some(ref path) = args.archive {
@@ -634,11 +674,12 @@ fn parse_privs(privs: &Option<String>) -> (bool, bool, bool, bool) {
     // Defaults per POSIX:
     // - atime: preserved (so 'a' disables it)
     // - mtime: preserved (so 'm' disables it)
-    // - perms: preserved (so absence of 'p' or 'e' disables it when -p is used)
+    // - perms: NOT preserved unless 'p' or 'e' is given; otherwise the mode is
+    //   set as part of the normal file-creation action (archived mode & ~umask)
     // - owner: NOT preserved (so 'o' or 'e' enables it)
     let mut preserve_atime = true;
     let mut preserve_mtime = true;
-    let mut preserve_perms = true;
+    let mut preserve_perms = false;
     let mut preserve_owner = false;
 
     if let Some(s) = privs {
@@ -659,11 +700,6 @@ fn parse_privs(privs: &Option<String>) -> (bool, bool, bool, bool) {
                 _ => {} // Ignore unknown characters per POSIX
             }
         }
-
-        // Per POSIX: if -p is specified but doesn't contain 'p' or 'e',
-        // permissions are still preserved by default. The only way to
-        // not preserve perms is to not specify -p at all (which we can't
-        // detect here) or implementation-specific. We keep default behavior.
     }
 
     (
@@ -672,6 +708,24 @@ fn parse_privs(privs: &Option<String>) -> (bool, bool, bool, bool) {
         preserve_perms,
         preserve_owner,
     )
+}
+
+/// Read the current process file-creation mask (umask) without disturbing it.
+///
+/// `umask(2)` has no pure query form, so the value is read by setting it and
+/// immediately restoring it. pax is single-threaded, so this is race-free here.
+#[cfg(unix)]
+fn current_umask() -> u32 {
+    unsafe {
+        let m = libc::umask(0);
+        libc::umask(m);
+        m as u32
+    }
+}
+
+#[cfg(not(unix))]
+fn current_umask() -> u32 {
+    0
 }
 
 /// Check if permissions should be preserved
@@ -754,10 +808,12 @@ mod tests {
 
     #[test]
     fn test_preserve_flags() {
-        // Default (no -p): preserve atime, mtime, perms; don't preserve owner
+        // Default (no -p): preserve atime, mtime; do NOT preserve perms (the mode
+        // is set as part of normal file creation, i.e. archived mode & ~umask) or
+        // owner.
         assert!(should_preserve_atime(&None));
         assert!(should_preserve_mtime(&None));
-        assert!(should_preserve_perms(&None));
+        assert!(!should_preserve_perms(&None));
         assert!(!should_preserve_owner(&None));
 
         // Individual flags
@@ -775,7 +831,7 @@ mod tests {
         // Combined flags
         assert!(!should_preserve_atime(&Some("am".to_string())));
         assert!(!should_preserve_mtime(&Some("am".to_string())));
-        assert!(should_preserve_perms(&Some("am".to_string()))); // perms still default to true
+        assert!(!should_preserve_perms(&Some("am".to_string()))); // no p/e → not preserved
 
         // Precedence: last wins
         // 'e' enables everything, then 'a' disables atime

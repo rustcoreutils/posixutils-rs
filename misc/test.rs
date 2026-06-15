@@ -593,14 +593,9 @@ fn eval_posix_strict(args: &[String]) -> EvalResult {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // setlocale establishes libc's global locale, which strcoll(3) (used by the
+    // `<` and `>` operators) consults, so LC_COLLATE takes effect. (audit #1)
     setlocale(LocaleCategory::LcAll, "");
-    // gettext-rs's setlocale operates on its bundled locale state and does not
-    // reliably establish the C library's global locale, which strcoll(3) (used
-    // by the `<` and `>` operators) consults. Set it directly so LC_COLLATE
-    // takes effect. (audit #1)
-    unsafe {
-        libc::setlocale(libc::LC_ALL, c"".as_ptr());
-    }
     textdomain("posixutils-rs")?;
     bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
 

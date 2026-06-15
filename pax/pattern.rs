@@ -21,6 +21,9 @@ use crate::error::{PaxError, PaxResult};
 #[derive(Debug, Clone)]
 pub struct Pattern {
     tokens: Vec<Token>,
+    /// The original pattern string, retained for "not found" diagnostics when a
+    /// pattern operand matches no archive member.
+    pub source: String,
 }
 
 #[derive(Debug, Clone)]
@@ -51,7 +54,10 @@ impl Pattern {
     /// Compile a pattern string
     pub fn new(pattern: &str) -> PaxResult<Self> {
         let tokens = parse_pattern(pattern)?;
-        Ok(Pattern { tokens })
+        Ok(Pattern {
+            tokens,
+            source: pattern.to_string(),
+        })
     }
 
     /// Check if a string matches this pattern
@@ -149,8 +155,12 @@ fn match_tokens_with_chars(tokens: &[Token], text_chars: &[char], pos: usize) ->
             }
         }
         Token::Any => {
-            // ? matches any single character except /
-            if pos < text_chars.len() && text_chars[pos] != '/' {
+            // ? matches any single character except /, and may not match a
+            // leading '.' (start of string or after '/'), per FNM_PERIOD.
+            if pos < text_chars.len()
+                && text_chars[pos] != '/'
+                && !is_leading_period(text_chars, pos)
+            {
                 match_tokens_with_chars(&tokens[1..], text_chars, pos + 1)
             } else {
                 false
@@ -161,13 +171,24 @@ fn match_tokens_with_chars(tokens: &[Token], text_chars: &[char], pos: usize) ->
             match_star_with_chars(&tokens[1..], text_chars, pos)
         }
         Token::Class(class) => {
-            if pos < text_chars.len() && class_matches(class, text_chars[pos]) {
+            // A bracket expression also may not match a leading '.'.
+            if pos < text_chars.len()
+                && class_matches(class, text_chars[pos])
+                && !is_leading_period(text_chars, pos)
+            {
                 match_tokens_with_chars(&tokens[1..], text_chars, pos + 1)
             } else {
                 false
             }
         }
     }
+}
+
+/// Whether the character at `pos` is a '.' in a leading position — at the start
+/// of the string or immediately after a '/'. Such a '.' must be matched by an
+/// explicit literal, never by `*`, `?`, or a bracket expression (FNM_PERIOD).
+fn is_leading_period(text_chars: &[char], pos: usize) -> bool {
+    text_chars[pos] == '.' && (pos == 0 || text_chars[pos - 1] == '/')
 }
 
 /// Handle star matching (greedy with backtracking) using pre-collected chars
@@ -187,6 +208,12 @@ fn match_star_with_chars(
 
         // Don't try to extend past a slash
         if pos < text_len && text_chars[pos] == '/' {
+            break;
+        }
+
+        // Don't let `*` consume a leading '.' (FNM_PERIOD); it may match empty
+        // before such a '.', but the '.' must be matched by an explicit literal.
+        if pos < text_len && is_leading_period(text_chars, pos) {
             break;
         }
     }
@@ -236,6 +263,40 @@ pub fn find_matching_pattern(patterns: &[Pattern], path: &str) -> Option<usize> 
         return None; // No patterns means match all - return None to indicate no specific pattern
     }
     patterns.iter().position(|p| p.matches(path))
+}
+
+/// Find the first pattern that matches `path`, or — when `expand_subtree` is set
+/// — that matches one of its ancestor directory components.
+///
+/// Per POSIX, a pattern that selects a directory member also selects the entire
+/// file hierarchy rooted at that directory; `-d` (`expand_subtree == false`)
+/// restricts the match to the directory itself.
+pub fn find_matching_pattern_subtree(
+    patterns: &[Pattern],
+    path: &str,
+    expand_subtree: bool,
+) -> Option<usize> {
+    if let Some(idx) = find_matching_pattern(patterns, path) {
+        return Some(idx);
+    }
+    // Directory members are stored with a trailing slash (e.g. "dir/"); a pattern
+    // like "dir" should still match the directory itself.
+    let trimmed = path.strip_suffix('/').unwrap_or(path);
+    if trimmed != path {
+        if let Some(idx) = find_matching_pattern(patterns, trimmed) {
+            return Some(idx);
+        }
+    }
+    if expand_subtree {
+        let mut ancestor = trimmed;
+        while let Some(slash) = ancestor.rfind('/') {
+            ancestor = &ancestor[..slash];
+            if let Some(idx) = find_matching_pattern(patterns, ancestor) {
+                return Some(idx);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -315,5 +376,47 @@ mod tests {
         let p = Pattern::new(r"file\*.txt").unwrap();
         assert!(p.matches("file*.txt"));
         assert!(!p.matches("file1.txt"));
+    }
+
+    #[test]
+    fn test_leading_period_not_matched_by_wildcards() {
+        // A leading '.' must be matched explicitly, never by * ? or [...].
+        assert!(!Pattern::new("*").unwrap().matches(".hidden"));
+        assert!(!Pattern::new("?hidden").unwrap().matches(".hidden"));
+        assert!(!Pattern::new("[.]hidden").unwrap().matches(".hidden"));
+        // An explicit leading dot does match.
+        assert!(Pattern::new(".*").unwrap().matches(".hidden"));
+        assert!(Pattern::new(".hidden").unwrap().matches(".hidden"));
+        // The same rule applies just after a '/'.
+        assert!(!Pattern::new("dir/*").unwrap().matches("dir/.hidden"));
+        assert!(Pattern::new("dir/.*").unwrap().matches("dir/.hidden"));
+        // A non-leading dot is matched normally.
+        assert!(Pattern::new("a*").unwrap().matches("a.b"));
+    }
+
+    #[test]
+    fn test_find_matching_pattern_subtree() {
+        let patterns = vec![Pattern::new("dir").unwrap()];
+
+        // Without expansion, only the directory itself matches (stored "dir/").
+        assert_eq!(
+            find_matching_pattern_subtree(&patterns, "dir/", false),
+            Some(0)
+        );
+        assert_eq!(
+            find_matching_pattern_subtree(&patterns, "dir/sub/f", false),
+            None
+        );
+
+        // With expansion, the whole subtree matches via an ancestor.
+        assert_eq!(
+            find_matching_pattern_subtree(&patterns, "dir/sub/f", true),
+            Some(0)
+        );
+        // An unrelated sibling never matches.
+        assert_eq!(
+            find_matching_pattern_subtree(&patterns, "dirfoo", true),
+            None
+        );
     }
 }

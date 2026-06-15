@@ -241,3 +241,100 @@ fn test_read_special_files_from_system_tar() {
         listing
     );
 }
+
+/// Copy mode (-r -w) recreates a FIFO at the destination rather than reporting
+/// it as an unsupported file type.
+#[test]
+fn test_copy_mode_recreates_fifo() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let dst_dir = temp.path().join("dest");
+
+    fs::create_dir(&src_dir).unwrap();
+    fs::create_dir(&dst_dir).unwrap();
+    let fifo_path = src_dir.join("myfifo");
+    let path_cstr = CString::new(fifo_path.as_os_str().as_bytes()).unwrap();
+    unsafe {
+        if libc::mkfifo(path_cstr.as_ptr(), 0o644) != 0 {
+            eprintln!("Skipping copy-FIFO test: mkfifo failed");
+            return;
+        }
+    }
+
+    let output = run_pax_in_dir(&["-r", "-w", "myfifo", dst_dir.to_str().unwrap()], &src_dir);
+    assert_success(&output, "pax copy fifo");
+
+    let copied = dst_dir.join("myfifo");
+    let meta = fs::symlink_metadata(&copied).unwrap();
+    assert!(
+        meta.file_type().is_fifo(),
+        "copied entry should be a FIFO, got {:?}",
+        meta.file_type()
+    );
+}
+
+/// A trailing <space> is a legitimate ustar pathname character: it must survive
+/// a write/list/extract round-trip (the name field is NUL-terminated, not
+/// space-trimmed).
+#[test]
+fn test_ustar_trailing_space_in_name_roundtrip() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let dst_dir = temp.path().join("dest");
+    let archive = temp.path().join("space.tar");
+
+    fs::create_dir(&src_dir).unwrap();
+    fs::write(src_dir.join("name "), b"hi").unwrap();
+
+    let output = run_pax_in_dir(
+        &[
+            "-w",
+            "-x",
+            "ustar",
+            "-f",
+            archive.to_str().unwrap(),
+            "name ",
+        ],
+        &src_dir,
+    );
+    assert_success(&output, "pax write trailing-space name");
+
+    let listing = stdout_str(&run_pax(&["-f", archive.to_str().unwrap()]));
+    assert!(
+        listing.lines().any(|l| l == "name "),
+        "listing should preserve the trailing space: {listing:?}"
+    );
+
+    fs::create_dir(&dst_dir).unwrap();
+    let output = run_pax_in_dir(&["-r", "-f", archive.to_str().unwrap()], &dst_dir);
+    assert_success(&output, "pax extract trailing-space name");
+    assert!(
+        dst_dir.join("name ").exists(),
+        "extracted file must keep its trailing space"
+    );
+}
+
+/// A pathname read from the -w stdin file list keeps a leading space (the list
+/// reader strips only the trailing newline, not surrounding whitespace).
+#[test]
+fn test_stdin_file_list_preserves_leading_space() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("lead.tar");
+
+    fs::create_dir(&src_dir).unwrap();
+    fs::write(src_dir.join(" lead"), b"hi").unwrap();
+
+    let output = run_pax_in_dir_with_stdin(
+        &["-w", "-x", "ustar", "-f", archive.to_str().unwrap()],
+        &src_dir,
+        " lead\n",
+    );
+    assert_success(&output, "pax write from stdin list");
+
+    let listing = stdout_str(&run_pax(&["-f", archive.to_str().unwrap()]));
+    assert!(
+        listing.lines().any(|l| l == " lead"),
+        "listing should preserve the leading space: {listing:?}"
+    );
+}

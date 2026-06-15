@@ -149,20 +149,32 @@ impl FormatOptions {
             return Ok(());
         }
 
-        // Parse comma-separated options
-        // Note: commas can be escaped with backslash
+        // Per POSIX, `listopt` is the final <comma>-separated keyword: its value
+        // runs to the end of the `-o` string, so commas inside the format are
+        // literal. Split it off before the comma tokenizer can break it apart.
+        if let Some(marker) = find_listopt_marker(input) {
+            let before = input[..marker].trim_end().trim_end_matches(',');
+            self.parse_comma_list(before)?;
+            let raw = &input[marker + "listopt=".len()..];
+            self.list_format = Some(unescape_backslashes(raw));
+            return Ok(());
+        }
+
+        self.parse_comma_list(input)
+    }
+
+    /// Parse a sequence of comma-separated options (backslash escapes a comma).
+    fn parse_comma_list(&mut self, input: &str) -> PaxResult<()> {
         let mut current = String::new();
-        let chars = input.chars();
         let mut escaped = false;
 
-        for c in chars {
+        for c in input.chars() {
             if escaped {
                 current.push(c);
                 escaped = false;
             } else if c == '\\' {
                 escaped = true;
             } else if c == ',' {
-                // End of option
                 self.parse_single_option(current.trim())?;
                 current.clear();
             } else {
@@ -170,7 +182,6 @@ impl FormatOptions {
             }
         }
 
-        // Parse final option
         let final_opt = current.trim();
         if !final_opt.is_empty() {
             self.parse_single_option(final_opt)?;
@@ -325,15 +336,21 @@ impl FormatOptions {
     /// - `%p` - process ID of pax
     /// - `%%` - literal percent sign
     ///
-    /// Default template: "/tmp/GlobalHead.%p.%n"
+    /// Default template: "$TMPDIR/GlobalHead.%p.%n", with `$TMPDIR` defaulting
+    /// to `/tmp` when unset (per POSIX ENVIRONMENT VARIABLES).
     pub fn expand_globexthdr_name(&self, sequence: u64) -> String {
-        let template = self
-            .globexthdr_name
-            .as_deref()
-            .unwrap_or("/tmp/GlobalHead.%p.%n");
+        let tmpdir = std::env::var("TMPDIR").ok();
+        let default_template = default_globexthdr_template(tmpdir.as_deref());
+        let template = self.globexthdr_name.as_deref().unwrap_or(&default_template);
 
         expand_global_header_template(template, sequence)
     }
+}
+
+/// Build the default `globexthdr.name` template from `$TMPDIR` (or `/tmp`).
+fn default_globexthdr_template(tmpdir: Option<&str>) -> String {
+    let dir = tmpdir.unwrap_or("/tmp");
+    format!("{}/GlobalHead.%p.%n", dir.trim_end_matches('/'))
 }
 
 /// Context for template expansion
@@ -515,6 +532,47 @@ const FORMAT_SPECIFIERS: &[(char, FormatHandler)] = &[
     ('%', fmt_percent),
 ];
 
+/// Locate a `listopt=` keyword sitting at an option boundary (start of string
+/// or just after an unescaped comma), returning the byte offset of `listopt=`.
+fn find_listopt_marker(input: &str) -> Option<usize> {
+    let mut boundaries = vec![0usize];
+    let mut escaped = false;
+    for (i, c) in input.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == ',' {
+            boundaries.push(i + 1);
+        }
+    }
+    for b in boundaries {
+        let rest = &input[b..];
+        let start = b + (rest.len() - rest.trim_start().len());
+        if input[start..].starts_with("listopt=") {
+            return Some(start);
+        }
+    }
+    None
+}
+
+/// Remove backslash escapes (`\X` → `X`) from a listopt format value.
+fn unescape_backslashes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut escaped = false;
+    for c in s.chars() {
+        if escaped {
+            out.push(c);
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Parse list format specification and format an entry
 ///
 /// Format specifiers (subset of POSIX listopt):
@@ -563,6 +621,9 @@ struct FormatSpec {
     width: Option<usize>,
     precision: Option<usize>,
     spec: char,
+    /// POSIX `%(keyword)X` extended-header keyword (with an optional `=subformat`
+    /// tail used by the `T` time conversion).
+    keyword: Option<String>,
 }
 
 fn parse_format_specifier(
@@ -582,6 +643,19 @@ fn parse_format_specifier(
         spec.precision = parse_number(chars)
             .map(|p| p.min(MAX_FORMAT_FIELD_SIZE))
             .or(Some(0));
+    }
+
+    // POSIX keyword substitution: `%(keyword)s`, `%(mtime=%Y)T`, etc.
+    if let Some('(') = chars.peek().copied() {
+        chars.next();
+        let mut keyword = String::new();
+        for c in chars.by_ref() {
+            if c == ')' {
+                break;
+            }
+            keyword.push(c);
+        }
+        spec.keyword = Some(keyword);
     }
 
     spec.spec = chars.next()?;
@@ -610,14 +684,21 @@ fn parse_number(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<
 }
 
 fn format_with_spec(info: &ListEntryInfo, spec: FormatSpec) -> String {
-    let mut rendered =
-        if let Some((_, handler)) = FORMAT_SPECIFIERS.iter().find(|(ch, _)| *ch == spec.spec) {
-            handler(info)
-        } else {
-            let mut literal = String::from("%");
-            literal.push(spec.spec);
-            literal
-        };
+    let mut rendered = if let Some(ref keyword) = spec.keyword {
+        // POSIX `%(keyword)X` substitution. For the `T` time conversion the
+        // keyword may carry an `=subformat` tail; here the keyword names the
+        // time field and the (optional) subformat is currently rendered with
+        // the default time layout.
+        let (kw, _subformat) = keyword.split_once('=').unwrap_or((keyword.as_str(), ""));
+        keyword_value(info, kw.trim(), spec.spec)
+            .unwrap_or_else(|| format!("%({}){}", keyword, spec.spec))
+    } else if let Some((_, handler)) = FORMAT_SPECIFIERS.iter().find(|(ch, _)| *ch == spec.spec) {
+        handler(info)
+    } else {
+        let mut literal = String::from("%");
+        literal.push(spec.spec);
+        literal
+    };
 
     if let Some(precision) = spec.precision {
         if rendered.len() > precision {
@@ -639,12 +720,54 @@ fn format_with_spec(info: &ListEntryInfo, spec: FormatSpec) -> String {
     rendered
 }
 
+/// Resolve a POSIX `%(keyword)X` listopt substitution to its rendered value.
+///
+/// `keyword` is the extended-header keyword named between the parentheses and
+/// `conversion` is the trailing conversion character (`s`, `d`, `T`, `M`, ...).
+/// Returns `None` for an unknown keyword so the caller can echo it literally.
+fn keyword_value(info: &ListEntryInfo, keyword: &str, conversion: char) -> Option<String> {
+    let value = match keyword {
+        "path" | "name" => fmt_fullpath(info),
+        "size" => info.size.to_string(),
+        "uid" => info.uid.to_string(),
+        "gid" => info.gid.to_string(),
+        "uname" => info.uname.unwrap_or("").to_string(),
+        "gname" => info.gname.unwrap_or("").to_string(),
+        "linkpath" => info.link_target.unwrap_or("").to_string(),
+        "mtime" => {
+            // The `T` conversion renders a calendar time; any other conversion
+            // (s/d) yields the raw seconds.
+            if conversion == 'T' {
+                format_time_traditional(info.mtime)
+            } else {
+                info.mtime.to_string()
+            }
+        }
+        // atime/ctime are not carried by the listing entry, so leave them
+        // unsupported (echoed literally) rather than aliasing them to mtime.
+        "mode" => format!("{:o}", info.mode),
+        _ => return None,
+    };
+
+    // For the mode/device/symlink special conversions, honor the conversion
+    // character even when a keyword was given (e.g. `%(path)F`).
+    let rendered = match conversion {
+        'M' => format_mode_symbolic(info.mode, info.entry_type),
+        'F' => fmt_fullpath(info),
+        'L' => fmt_link_target(info),
+        'D' => fmt_device(info),
+        _ => value,
+    };
+    Some(rendered)
+}
+
 /// Entry type to file type character mapping for symbolic mode display
 const ENTRY_TYPE_CHARS: &[(EntryType, char)] = &[
     (EntryType::Regular, '-'),
     (EntryType::Directory, 'd'),
     (EntryType::Symlink, 'l'),
-    (EntryType::Hardlink, 'h'),
+    // A hard link is a regular file with link count > 1: ls -l shows '-'.
+    (EntryType::Hardlink, '-'),
     (EntryType::BlockDevice, 'b'),
     (EntryType::CharDevice, 'c'),
     (EntryType::Fifo, 'p'),
@@ -727,114 +850,25 @@ fn format_mode_symbolic(mode: u32, entry_type: EntryType) -> String {
 
 /// Format time in traditional ls -l style
 fn format_time_traditional(mtime: u64) -> String {
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    // POSIX `ls -l`-style time, formatted via libc strftime (localtime_r), so TZ
+    // and LC_TIME take effect: date+time when recent, date+year otherwise.
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    let _time = UNIX_EPOCH + Duration::from_secs(mtime);
-    let now = SystemTime::now();
-
-    // Get current time for comparison
-    let now_secs = now
+    let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+    let age = now_secs - mtime as i64;
+    let six_months: i64 = 180 * 24 * 60 * 60;
+    let recent = (0..six_months).contains(&age);
 
-    // If within 6 months, show month/day/time; otherwise show month/day/year
-    let six_months = 180 * 24 * 60 * 60;
-    let use_time = now_secs.saturating_sub(mtime) < six_months;
-
-    // Simple formatting without chrono
-    let secs_per_day = 86400u64;
-    let days_since_epoch = mtime / secs_per_day;
-
-    // Approximate month/day calculation
-    let year = 1970 + (days_since_epoch / 365) as i32;
-    let day_of_year = days_since_epoch % 365;
-
-    let months = [
-        ("Jan", 31),
-        ("Feb", 28),
-        ("Mar", 31),
-        ("Apr", 30),
-        ("May", 31),
-        ("Jun", 30),
-        ("Jul", 31),
-        ("Aug", 31),
-        ("Sep", 30),
-        ("Oct", 31),
-        ("Nov", 30),
-        ("Dec", 31),
-    ];
-
-    let mut remaining = day_of_year;
-    let mut month_name = "Jan";
-    let mut day = 1u64;
-
-    for (name, days) in months.iter() {
-        if remaining < *days as u64 {
-            month_name = name;
-            day = remaining + 1;
-            break;
-        }
-        remaining -= *days as u64;
-    }
-
-    if use_time {
-        let time_of_day = mtime % secs_per_day;
-        let hour = time_of_day / 3600;
-        let min = (time_of_day % 3600) / 60;
-        format!("{} {:2} {:02}:{:02}", month_name, day, hour, min)
-    } else {
-        format!("{} {:2}  {:4}", month_name, day, year)
-    }
+    let fmt = if recent { "%b %e %H:%M" } else { "%b %e  %Y" };
+    plib::locale::strftime(fmt, mtime as i64).unwrap_or_else(|_| mtime.to_string())
 }
 
-/// Format time in ISO format
+/// Format time in ISO 8601 form (`%Y-%m-%dT%H:%M:%S`), TZ-aware via strftime.
 fn format_time_iso(mtime: u64) -> String {
-    let secs_per_day = 86400u64;
-    let days_since_epoch = mtime / secs_per_day;
-
-    // Approximate date calculation
-    let mut year = 1970i32;
-    let mut remaining_days = days_since_epoch as i64;
-
-    loop {
-        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
-        if remaining_days < days_in_year {
-            break;
-        }
-        remaining_days -= days_in_year;
-        year += 1;
-    }
-
-    let months = if is_leap_year(year) {
-        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    } else {
-        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    };
-
-    let mut month = 1;
-    for days in months.iter() {
-        if remaining_days < *days as i64 {
-            break;
-        }
-        remaining_days -= *days as i64;
-        month += 1;
-    }
-    let day = remaining_days + 1;
-
-    let time_of_day = mtime % secs_per_day;
-    let hour = time_of_day / 3600;
-    let min = (time_of_day % 3600) / 60;
-    let sec = time_of_day % 60;
-
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
-        year, month, day, hour, min, sec
-    )
-}
-
-fn is_leap_year(year: i32) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+    plib::locale::strftime("%Y-%m-%dT%H:%M:%S", mtime as i64).unwrap_or_else(|_| mtime.to_string())
 }
 
 #[cfg(test)]
@@ -889,6 +923,23 @@ mod tests {
     }
 
     #[test]
+    fn test_globexthdr_name_uses_tmpdir() {
+        // The default global-header name template derives from $TMPDIR, falling
+        // back to /tmp when it is unset. Tested via the pure helper to avoid
+        // mutating the process-global TMPDIR env (which would race other tests'
+        // temp-dir creation).
+        assert_eq!(
+            default_globexthdr_template(Some("/custom/tmp")),
+            "/custom/tmp/GlobalHead.%p.%n"
+        );
+        assert_eq!(
+            default_globexthdr_template(Some("/custom/tmp/")),
+            "/custom/tmp/GlobalHead.%p.%n"
+        );
+        assert_eq!(default_globexthdr_template(None), "/tmp/GlobalHead.%p.%n");
+    }
+
+    #[test]
     fn test_merge_options() {
         let mut opts1 = FormatOptions::parse("times").unwrap();
         let opts2 = FormatOptions::parse("linkdata,listopt=%F").unwrap();
@@ -940,6 +991,47 @@ mod tests {
     }
 
     #[test]
+    fn test_format_list_entry_keyword_substitution() {
+        let info = ListEntryInfo {
+            path: "dir/file.txt",
+            mode: 0o644,
+            size: 4096,
+            mtime: 0,
+            uid: 1000,
+            gid: 1000,
+            uname: Some("alice"),
+            gname: Some("users"),
+            link_target: None,
+            entry_type: EntryType::Regular,
+            devmajor: 0,
+            devminor: 0,
+        };
+
+        // POSIX `%(keyword)s`/`%(keyword)d` substitution.
+        assert_eq!(
+            format_list_entry("%(path)s %(size)d", &info),
+            "dir/file.txt 4096"
+        );
+        assert_eq!(
+            format_list_entry("%(uname)s:%(gname)s", &info),
+            "alice:users"
+        );
+        // An unknown keyword is echoed verbatim.
+        assert_eq!(format_list_entry("%(bogus)s", &info), "%(bogus)s");
+    }
+
+    #[test]
+    fn test_listopt_is_final_keyword_with_commas() {
+        // A literal comma inside the listopt format must not split the option.
+        let opts = FormatOptions::parse("times,listopt=%(path)s,%(size)d bytes").unwrap();
+        assert!(opts.include_times);
+        assert_eq!(
+            opts.list_format,
+            Some("%(path)s,%(size)d bytes".to_string())
+        );
+    }
+
+    #[test]
     fn test_format_mode_symbolic() {
         // Regular file with various permissions
         assert_eq!(
@@ -985,9 +1077,10 @@ mod tests {
         // Other types
         assert_eq!(format_mode_symbolic(0o644, EntryType::Fifo), "prw-r--r--");
         assert_eq!(format_mode_symbolic(0o755, EntryType::Socket), "srwxr-xr-x");
+        // A hard link is a regular file (link count > 1): ls -l shows '-'.
         assert_eq!(
             format_mode_symbolic(0o644, EntryType::Hardlink),
-            "hrw-r--r--"
+            "-rw-r--r--"
         );
     }
 
@@ -1054,9 +1147,20 @@ mod tests {
 
     #[test]
     fn test_format_time_iso() {
-        // 2024-01-01 00:00:00 UTC
-        let timestamp = 1704067200u64;
-        let result = format_time_iso(timestamp);
-        assert!(result.starts_with("2024-01-01T"));
+        // The exact value is timezone-dependent (strftime via localtime_r), so
+        // assert the ISO 8601 shape `YYYY-MM-DDTHH:MM:SS` rather than a fixed UTC
+        // instant.
+        let result = format_time_iso(1704067200);
+        let bytes = result.as_bytes();
+        assert_eq!(result.len(), 19, "unexpected ISO length: {result}");
+        assert_eq!(&result[4..5], "-");
+        assert_eq!(&result[7..8], "-");
+        assert_eq!(&result[10..11], "T");
+        assert_eq!(&result[13..14], ":");
+        assert_eq!(&result[16..17], ":");
+        assert!(
+            bytes[..4].iter().all(|b| b.is_ascii_digit()),
+            "year should be digits: {result}"
+        );
     }
 }

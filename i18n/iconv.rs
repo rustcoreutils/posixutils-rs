@@ -588,12 +588,8 @@ fn charmap_conversion(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Switch the C global locale to the environment locale so that
-    // `nl_langinfo(CODESET)` (used for the default codeset) reflects it; the
-    // gettextrs wrapper does not reliably apply it here.
-    unsafe {
-        libc::setlocale(libc::LC_ALL, c"".as_ptr());
-    }
+    // Switch libc's global locale to the environment locale so that
+    // `nl_langinfo(CODESET)` (used for the default codeset) reflects it.
     setlocale(LocaleCategory::LcAll, "");
     textdomain("posixutils-rs")?;
     bind_textdomain_codeset("posixutils-rs", "UTF-8")?;

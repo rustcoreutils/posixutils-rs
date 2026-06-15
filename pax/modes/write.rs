@@ -90,7 +90,9 @@ fn write_files<W: ArchiveWriter>(
     };
 
     for path in files {
-        write_path(
+        // Diagnose a per-operand failure and set a non-zero exit, but continue
+        // archiving the remaining operands (POSIX CONSEQUENCES OF ERRORS).
+        if let Err(e) = write_path(
             archive,
             path,
             options,
@@ -98,7 +100,9 @@ fn write_files<W: ArchiveWriter>(
             initial_dev,
             true,
             &mut prompter,
-        )?;
+        ) {
+            crate::error::report_error(path.display(), e);
+        }
     }
 
     Ok(())
@@ -125,7 +129,7 @@ fn write_path<W: ArchiveWriter>(
     let metadata = match metadata {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("pax: {}: {}", path.display(), e);
+            crate::error::report_error(path.display(), e);
             return Ok(());
         }
     };
@@ -332,7 +336,7 @@ fn write_directory<W: ArchiveWriter>(
         let entries = match fs::read_dir(src_path) {
             Ok(e) => e,
             Err(e) => {
-                eprintln!("pax: {}: {}", src_path.display(), e);
+                crate::error::report_error(src_path.display(), e);
                 return Ok(());
             }
         };
@@ -341,7 +345,7 @@ fn write_directory<W: ArchiveWriter>(
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
-                    eprintln!("pax: {}: {}", src_path.display(), e);
+                    crate::error::report_error(src_path.display(), e);
                     continue;
                 }
             };
@@ -402,7 +406,7 @@ fn write_special<W: ArchiveWriter>(
     } else if file_type.is_socket() {
         EntryType::Socket
     } else {
-        eprintln!("pax: {}: unsupported file type", path.display());
+        crate::error::report_error(path.display(), gettextrs::gettext("unsupported file type"));
         return Ok(());
     };
 
@@ -535,6 +539,11 @@ fn build_entry(path: &Path, metadata: &Metadata, entry_type: EntryType) -> PaxRe
         entry.uid = metadata.uid();
         entry.gid = metadata.gid();
         entry.mtime = metadata.mtime() as u64;
+        // Capture sub-second times so the pax interchange format can record a
+        // fractional `mtime`/`atime` (other formats ignore the nsec fields).
+        entry.mtime_nsec = metadata.mtime_nsec() as u32;
+        entry.atime = Some(metadata.atime() as u64);
+        entry.atime_nsec = metadata.atime_nsec() as u32;
         entry.dev = metadata.dev();
         entry.ino = metadata.ino();
         entry.nlink = metadata.nlink() as u32;
@@ -621,7 +630,9 @@ pub fn read_file_list<R: Read>(reader: R) -> PaxResult<Vec<PathBuf>> {
 
     for line in reader.lines() {
         let line = line?;
-        let line = line.trim();
+        // `lines()` already strips the trailing newline. Keep the rest verbatim
+        // so pathnames with leading/trailing spaces survive; skip only a wholly
+        // empty line (e.g. a trailing blank line).
         if !line.is_empty() {
             files.push(PathBuf::from(line));
         }

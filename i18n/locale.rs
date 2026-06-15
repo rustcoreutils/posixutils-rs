@@ -52,12 +52,8 @@ struct Args {
 }
 
 fn main() {
-    // Set up localization. Use libc::setlocale directly so the C global locale
-    // (read by localeconv/nl_langinfo below) is actually switched to the
-    // environment locale; the gettextrs wrapper does not reliably apply it here.
-    unsafe {
-        libc::setlocale(libc::LC_ALL, c"".as_ptr());
-    }
+    // Set up localization. setlocale switches libc's global locale (read by
+    // localeconv/nl_langinfo below) to the environment locale.
     setlocale(GettextCategory::LcAll, "");
     if textdomain("posixutils-rs").is_err() {
         // Ignore error - translation may not be available

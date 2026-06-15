@@ -81,6 +81,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] nm (Development)
  - [x] od
  - [x] pathchk
+ - [x] pax
  - [x] prs (SCCS)
  - [x] realpath
  - [x] rmdel (SCCS)
@@ -145,7 +146,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] nl
  - [x] paste
  - [x] patch
- - [x] pax
  - [x] pr
  - [x] printf
  - [x] ps

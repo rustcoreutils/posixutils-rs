@@ -13,7 +13,7 @@ use crate::archive::{ArchiveEntry, ArchiveFormat, ArchiveReader, EntryType};
 use crate::error::PaxResult;
 use crate::formats::{CpioReader, PaxReader, UstarReader};
 use crate::options::{format_list_entry, FormatOptions, ListEntryInfo};
-use crate::pattern::{find_matching_pattern, Pattern};
+use crate::pattern::{find_matching_pattern_subtree, Pattern};
 use crate::subst::{apply_substitutions, SubstResult, Substitution};
 use std::collections::HashSet;
 use std::io::{Read, Write};
@@ -34,6 +34,9 @@ pub struct ListOptions {
     pub substitutions: Vec<Substitution>,
     /// Select only first archive member matching each pattern (-n)
     pub first_match: bool,
+    /// `-d`: a directory pattern matches only the directory itself, not its
+    /// subtree.
+    pub dir_only: bool,
 }
 
 /// List archive contents
@@ -101,10 +104,23 @@ fn list_entries<R: ArchiveReader, W: Write>(
                     }
                 }
             }
-            print_entry(writer, &entry, options)?;
+            if let Err(e) = print_entry(writer, &entry, options) {
+                crate::error::report_error(entry.path.display(), e);
+            }
         }
         archive.skip_data()?;
     }
+
+    // Diagnose any pattern operand that matched no archive member (non-exclude
+    // mode) and set a non-zero exit status (POSIX DESCRIPTION).
+    if !options.exclude {
+        for (idx, pat) in options.patterns.iter().enumerate() {
+            if !matched_patterns.contains(&idx) {
+                crate::error::report_error(&pat.source, gettextrs::gettext("not found"));
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -131,28 +147,27 @@ fn should_list(
         return Some(true); // Match all
     }
 
-    // Find which pattern matches (if any)
-    let matching_pattern = find_matching_pattern(&options.patterns, &path)
-        .or_else(|| find_matching_pattern(&options.patterns, path_stripped));
+    // Find which pattern matches (if any). A pattern selecting a directory also
+    // selects its whole subtree unless `-d` (dir_only) was given.
+    let expand_subtree = !options.dir_only;
+    let matching_pattern = find_matching_pattern_subtree(&options.patterns, &path, expand_subtree)
+        .or_else(|| {
+            find_matching_pattern_subtree(&options.patterns, path_stripped, expand_subtree)
+        });
 
     match matching_pattern {
         Some(pattern_idx) => {
             if options.exclude {
                 // Entry matched a pattern, so exclude it
                 None
+            } else if options.first_match && matched_patterns.contains(&pattern_idx) {
+                // first_match (-n): this pattern has already selected a member
+                Some(false)
             } else {
-                // Entry matched a pattern
-                if options.first_match {
-                    // Check if this pattern was already matched
-                    if matched_patterns.contains(&pattern_idx) {
-                        Some(false) // Skip - pattern already matched
-                    } else {
-                        matched_patterns.insert(pattern_idx);
-                        Some(true) // Output - first match for this pattern
-                    }
-                } else {
-                    Some(true) // Output normally
-                }
+                // Record the match (for the unmatched-pattern sweep and -n) and
+                // select the entry.
+                matched_patterns.insert(pattern_idx);
+                Some(true)
             }
         }
         None => {
@@ -243,7 +258,9 @@ fn format_mode(entry: &ArchiveEntry) -> String {
     s.push(match entry.entry_type {
         EntryType::Directory => 'd',
         EntryType::Symlink => 'l',
-        EntryType::Hardlink => 'h',
+        // A hard link is a regular file with a link count > 1; POSIX `ls -l`
+        // (and the pax `-v` listing) shows it with the regular-file type char.
+        EntryType::Hardlink => '-',
         EntryType::BlockDevice => 'b',
         EntryType::CharDevice => 'c',
         EntryType::Fifo => 'p',
@@ -306,86 +323,21 @@ fn format_group(entry: &ArchiveEntry) -> String {
 
 /// Format modification time
 fn format_mtime(mtime: u64) -> String {
-    // Simple format: just show the timestamp
-    // In a full implementation, we'd format based on age
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    // POSIX `ls -l`-style time: a date+time for recent members, a date+year for
+    // members older than ~6 months (or in the future). Formatting goes through
+    // libc strftime via localtime_r, so TZ and LC_TIME (month names) take effect.
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    let time = UNIX_EPOCH + Duration::from_secs(mtime);
-
-    // Get current time to determine format
-    let now = SystemTime::now();
-    let six_months_ago = now - Duration::from_secs(180 * 24 * 60 * 60);
-
-    // Format the time (simplified)
-    format_system_time(time, time < six_months_ago)
-}
-
-/// Format a SystemTime for display
-fn format_system_time(time: std::time::SystemTime, show_year: bool) -> String {
-    use std::time::{Duration, UNIX_EPOCH};
-
-    let secs = time
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_secs();
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let age = now - mtime as i64;
+    let six_months: i64 = 180 * 24 * 60 * 60;
+    let recent = (0..six_months).contains(&age);
 
-    // Simple formatting without external crates
-    let days_since_epoch = secs / 86400;
-    let secs_today = secs % 86400;
-    let hours = secs_today / 3600;
-    let minutes = (secs_today % 3600) / 60;
-
-    // Approximate year/month/day calculation
-    let (year, month, day) = days_to_ymd(days_since_epoch);
-
-    let month_names = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-    let month_name = month_names.get(month as usize).unwrap_or(&"???");
-
-    if show_year {
-        format!("{} {:2}  {:4}", month_name, day, year)
-    } else {
-        format!("{} {:2} {:02}:{:02}", month_name, day, hours, minutes)
-    }
-}
-
-/// Convert days since epoch to (year, month, day)
-fn days_to_ymd(days: u64) -> (u64, u32, u32) {
-    // Simplified calculation - not perfectly accurate but good enough for display
-    let mut y = 1970;
-    let mut remaining = days as i64;
-
-    loop {
-        let days_in_year = if is_leap_year(y) { 366 } else { 365 };
-        if remaining < days_in_year {
-            break;
-        }
-        remaining -= days_in_year;
-        y += 1;
-    }
-
-    let days_in_month = if is_leap_year(y) {
-        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    } else {
-        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    };
-
-    let mut m = 0;
-    for (i, &days) in days_in_month.iter().enumerate() {
-        if remaining < days as i64 {
-            m = i;
-            break;
-        }
-        remaining -= days as i64;
-    }
-
-    (y, m as u32, remaining as u32 + 1)
-}
-
-/// Check if a year is a leap year
-fn is_leap_year(year: u64) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+    let fmt = if recent { "%b %e %H:%M" } else { "%b %e  %Y" };
+    plib::locale::strftime(fmt, mtime as i64).unwrap_or_else(|_| mtime.to_string())
 }
 
 /// Format link suffix for symlinks and hardlinks

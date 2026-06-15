@@ -35,6 +35,7 @@ pub fn append_to_archive(
     archive_path: &PathBuf,
     files: &[PathBuf],
     options: &WriteOptions,
+    requested_format: Option<ArchiveFormat>,
 ) -> PaxResult<()> {
     // Open archive for read+write
     let mut file = OpenOptions::new()
@@ -44,6 +45,18 @@ pub fn append_to_archive(
 
     // Detect the archive format
     let format = detect_format(&mut file)?;
+
+    // Per POSIX, an explicit `-x` that names a format different from the existing
+    // archive is an error — pax must not silently coerce the new members into the
+    // archive's format.
+    if let Some(requested) = requested_format {
+        if requested != format {
+            return Err(PaxError::InvalidFormat(format!(
+                "cannot append in {} format to an existing {} archive",
+                requested, format
+            )));
+        }
+    }
 
     // Only support ustar and pax for append
     if format == ArchiveFormat::Cpio {
@@ -258,7 +271,9 @@ fn write_files<W: ArchiveWriter>(
     };
 
     for path in files {
-        write_path(
+        // Diagnose a per-operand failure and set a non-zero exit, but continue
+        // appending the remaining operands (POSIX CONSEQUENCES OF ERRORS).
+        if let Err(e) = write_path(
             archive,
             path,
             options,
@@ -266,7 +281,9 @@ fn write_files<W: ArchiveWriter>(
             None,
             true,
             &mut prompter,
-        )?;
+        ) {
+            crate::error::report_error(path.display(), e);
+        }
     }
 
     Ok(())
@@ -298,7 +315,7 @@ fn write_path<W: ArchiveWriter>(
     let metadata = match metadata {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("pax: {}: {}", path.display(), e);
+            crate::error::report_error(path.display(), e);
             return Ok(());
         }
     };
@@ -395,7 +412,7 @@ fn write_directory<W: ArchiveWriter>(
         let entries = match fs::read_dir(src_path) {
             Ok(e) => e,
             Err(e) => {
-                eprintln!("pax: {}: {}", src_path.display(), e);
+                crate::error::report_error(src_path.display(), e);
                 return Ok(());
             }
         };
@@ -404,7 +421,7 @@ fn write_directory<W: ArchiveWriter>(
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
-                    eprintln!("pax: {}: {}", src_path.display(), e);
+                    crate::error::report_error(src_path.display(), e);
                     continue;
                 }
             };
@@ -533,7 +550,7 @@ fn write_special<W: ArchiveWriter>(
     } else if file_type.is_socket() {
         EntryType::Socket
     } else {
-        eprintln!("pax: {}: unsupported file type", path.display());
+        crate::error::report_error(path.display(), gettextrs::gettext("unsupported file type"));
         return Ok(());
     };
 

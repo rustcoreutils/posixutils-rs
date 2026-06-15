@@ -77,7 +77,7 @@ read/list. There are **no crashes/hangs**.
 
 ### Major
 
-- [ ] **#3 — ustar numeric fields corrupt size/mtime for files ≥8 GB.** `formats/ustar.rs:460-467`.
+- [x] **#3 — ustar numeric fields corrupt size/mtime for files ≥8 GB.** *(Fixed, Phase 2.)* `formats/ustar.rs:460-467`.
   `write_octal` emits `format!("{:0width$o} ", val, width=width-2)` (digits +
   trailing space) then truncates to `width`. For the 12-byte size/mtime field a
   12-octal-digit value (≥8 GB) fills all 12 bytes and the space **terminator is
@@ -88,14 +88,19 @@ read/list. There are **no crashes/hangs**.
   `width-1` octal digits + one NUL (matching GNU tar's 11-digit+NUL, clean to
   8 GB) and error / switch to a base-256 escape above that.
 
-- [ ] **#4 — cpio numeric fields silently truncate high digits ≥8 GB → stream corruption.**
+- [x] **#4 — cpio numeric fields silently truncate high digits ≥8 GB → stream corruption.** *(Fixed, Phase 2.)*
   `formats/cpio.rs:685-698`. On overflow `write_octal_field` keeps only the
   *last* `width` chars (`&bytes[bytes.len()-width..]`), dropping the high-order
   digits. `c_filesize` is 11 octal digits (max ≈8 GB); a larger member writes a
   wrong size, after which the reader mis-frames the data stream. `c_ino`/`c_dev`
   (6 digits, max 262143) and uid/gid overflow identically. Verified: a 9 GB
   member made `cpio -itv` report a wrong size then "skipped 8589934592 bytes of
-  junk." Fix: error on overflow (POSIX ODC has no large-value escape).
+  junk." Fix applied: the stream-framing fields (c_namesize, c_filesize,
+  c_mtime) now error on overflow (POSIX ODC has no large-value escape), so a
+  ≥8 GB member fails cleanly with a non-zero exit. The identity-only fields
+  (c_dev, c_ino, c_uid, c_gid) keep the historical low-order masking — large
+  real device/inode/uid values routinely exceed the 6-digit width on ordinary
+  filesystems and carry no stream-length information (matching GNU cpio `odc`).
 
 - [ ] **#5 — pax format drops sub-second mtime and never captures atime nanoseconds.**
   `modes/write.rs:528-548` (`build_entry`) stores only whole-second

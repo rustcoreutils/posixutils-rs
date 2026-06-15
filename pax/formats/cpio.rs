@@ -626,24 +626,24 @@ fn build_header(entry: &ArchiveEntry, ino: u64) -> PaxResult<Vec<u8>> {
     // c_magic
     header.extend_from_slice(ODC_MAGIC);
 
-    // c_dev
-    write_octal_field(&mut header, entry.dev, 6);
+    // c_dev (identity only; mask on overflow — large real dev numbers are normal)
+    write_octal_field_masked(&mut header, entry.dev, 6);
 
-    // c_ino
-    write_octal_field(&mut header, ino, 6);
+    // c_ino (identity only; mask on overflow to preserve hard-link grouping)
+    write_octal_field_masked(&mut header, ino, 6);
 
     // c_mode (file type + permissions)
     let mode = build_mode(entry);
-    write_octal_field(&mut header, mode as u64, 6);
+    write_octal_field(&mut header, mode as u64, 6)?;
 
-    // c_uid
-    write_octal_field(&mut header, entry.uid as u64, 6);
+    // c_uid (mask on overflow — high uids exceed the ODC 6-digit width)
+    write_octal_field_masked(&mut header, entry.uid as u64, 6);
 
-    // c_gid
-    write_octal_field(&mut header, entry.gid as u64, 6);
+    // c_gid (mask on overflow — high gids exceed the ODC 6-digit width)
+    write_octal_field_masked(&mut header, entry.gid as u64, 6);
 
     // c_nlink
-    write_octal_field(&mut header, entry.nlink as u64, 6);
+    write_octal_field(&mut header, entry.nlink as u64, 6)?;
 
     // c_rdev (device major/minor for block/char devices)
     let rdev = if entry.is_device() {
@@ -651,17 +651,17 @@ fn build_header(entry: &ArchiveEntry, ino: u64) -> PaxResult<Vec<u8>> {
     } else {
         0
     };
-    write_octal_field(&mut header, rdev, 6);
+    write_octal_field(&mut header, rdev, 6)?;
 
     // c_mtime
-    write_octal_field(&mut header, entry.mtime, 11);
+    write_octal_field(&mut header, entry.mtime, 11)?;
 
     // c_namesize (including NUL)
     let namesize = entry.path.to_string_lossy().len() + 1;
-    write_octal_field(&mut header, namesize as u64, 6);
+    write_octal_field(&mut header, namesize as u64, 6)?;
 
     // c_filesize
-    write_octal_field(&mut header, entry.size, 11);
+    write_octal_field(&mut header, entry.size, 11)?;
 
     Ok(header)
 }
@@ -681,20 +681,40 @@ fn build_mode(entry: &ArchiveEntry) -> u32 {
     type_bits | (entry.mode & C_PERM_MASK)
 }
 
-/// Write an octal field with exact width
-fn write_octal_field(buf: &mut Vec<u8>, val: u64, width: usize) {
+/// Write a stream-framing octal field (c_namesize, c_filesize, c_mtime) for the
+/// cpio ODC header.
+///
+/// These fields determine how the reader frames the rest of the stream, so a
+/// value too large for `width` octal digits is rejected with an error rather
+/// than silently keeping only its low-order digits — truncation here would
+/// mis-frame every following header (e.g. c_filesize for a file ≥8 GiB in the
+/// 11-digit field).
+fn write_octal_field(buf: &mut Vec<u8>, val: u64, width: usize) -> PaxResult<()> {
     let s = format!("{:0width$o}", val, width = width);
-    // Take last 'width' characters
-    let bytes = s.as_bytes();
-    if bytes.len() >= width {
-        buf.extend_from_slice(&bytes[bytes.len() - width..]);
-    } else {
-        // Pad with zeros
-        for _ in 0..(width - bytes.len()) {
-            buf.push(b'0');
-        }
-        buf.extend_from_slice(bytes);
+    if s.len() > width {
+        return Err(PaxError::InvalidHeader(format!(
+            "value {} too large for {}-digit cpio ODC field",
+            val, width
+        )));
     }
+    buf.extend_from_slice(s.as_bytes());
+    Ok(())
+}
+
+/// Write an identity octal field (c_dev, c_ino, c_uid, c_gid) for the cpio ODC
+/// header, keeping only the low-order `width` octal digits on overflow.
+///
+/// Unlike the framing fields, these carry no stream-length information: c_dev /
+/// c_ino exist only to associate hard links within the archive, and large real
+/// device/inode numbers routinely exceed the ODC 6-digit width on modern
+/// filesystems. Masking (the historical cpio behavior, matching GNU cpio's
+/// `odc` format) preserves hard-link grouping without corrupting the stream or
+/// failing on ordinary archives.
+fn write_octal_field_masked(buf: &mut Vec<u8>, val: u64, width: usize) {
+    let s = format!("{:0width$o}", val, width = width);
+    let bytes = s.as_bytes();
+    // Keep the last `width` digits (low-order), zero-filled if shorter.
+    buf.extend_from_slice(&bytes[bytes.len() - width..]);
 }
 
 // ============================================================================
@@ -748,12 +768,21 @@ mod tests {
     #[test]
     fn test_write_octal_field() {
         let mut buf = Vec::new();
-        write_octal_field(&mut buf, 0o644, 6);
+        write_octal_field(&mut buf, 0o644, 6).unwrap();
         assert_eq!(&buf, b"000644");
 
         let mut buf = Vec::new();
-        write_octal_field(&mut buf, 0, 6);
+        write_octal_field(&mut buf, 0, 6).unwrap();
         assert_eq!(&buf, b"000000");
+
+        // The widest value that fits an 11-digit c_filesize field is 8 GiB - 1.
+        let mut buf = Vec::new();
+        write_octal_field(&mut buf, 0o77_777_777_777, 11).unwrap();
+        assert_eq!(&buf, b"77777777777");
+
+        // One larger overflows and must be rejected, not truncated.
+        let mut buf = Vec::new();
+        assert!(write_octal_field(&mut buf, 0o100_000_000_000, 11).is_err());
     }
 
     #[test]

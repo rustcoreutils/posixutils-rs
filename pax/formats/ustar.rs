@@ -350,16 +350,16 @@ fn build_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
 
     // Write fields
     write_string(&mut header[NAME_OFF..], &name, NAME_LEN);
-    write_octal(&mut header[MODE_OFF..], entry.mode as u64, 8);
-    write_octal(&mut header[UID_OFF..], entry.uid as u64, 8);
-    write_octal(&mut header[GID_OFF..], entry.gid as u64, 8);
+    write_octal(&mut header[MODE_OFF..], entry.mode as u64, 8)?;
+    write_octal(&mut header[UID_OFF..], entry.uid as u64, 8)?;
+    write_octal(&mut header[GID_OFF..], entry.gid as u64, 8)?;
     // Per POSIX, symlinks and hardlinks must have size=0 (no data blocks)
     let header_size = match entry.entry_type {
         EntryType::Symlink | EntryType::Hardlink => 0,
         _ => entry.size,
     };
-    write_octal(&mut header[SIZE_OFF..], header_size, 12);
-    write_octal(&mut header[MTIME_OFF..], entry.mtime, 12);
+    write_octal(&mut header[SIZE_OFF..], header_size, 12)?;
+    write_octal(&mut header[MTIME_OFF..], entry.mtime, 12)?;
 
     // Typeflag
     header[TYPEFLAG_OFF] = entry_type_to_flag(&entry.entry_type);
@@ -386,15 +386,15 @@ fn build_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
     }
 
     // Device major/minor (always written for POSIX compliance)
-    write_octal(&mut header[DEVMAJOR_OFF..], entry.devmajor as u64, 8);
-    write_octal(&mut header[DEVMINOR_OFF..], entry.devminor as u64, 8);
+    write_octal(&mut header[DEVMAJOR_OFF..], entry.devmajor as u64, 8)?;
+    write_octal(&mut header[DEVMINOR_OFF..], entry.devminor as u64, 8)?;
 
     // Prefix
     write_string(&mut header[PREFIX_OFF..], &prefix, PREFIX_LEN);
 
     // Calculate and write checksum
     let checksum = calculate_checksum(&header);
-    write_octal(&mut header[CHKSUM_OFF..], checksum as u64, 8);
+    write_octal(&mut header[CHKSUM_OFF..], checksum as u64, 8)?;
 
     Ok(header)
 }
@@ -455,15 +455,24 @@ fn write_string(buf: &mut [u8], s: &str, max_len: usize) {
     buf[..len].copy_from_slice(&bytes[..len]);
 }
 
-/// Write an octal number to a field
-/// Format: leading zeros, octal digits, space or NUL terminator
-fn write_octal(buf: &mut [u8], val: u64, width: usize) {
-    // Format: (width-2) digits + space + NUL, or (width-1) digits + NUL
-    // Standard format uses (width-1) octal digits followed by space or NUL
-    let s = format!("{:0width$o} ", val, width = width - 2);
-    let bytes = s.as_bytes();
-    let len = std::cmp::min(bytes.len(), width);
-    buf[..len].copy_from_slice(&bytes[..len]);
+/// Write an octal number to a fixed-width ustar numeric field.
+///
+/// A field of `width` bytes holds `width - 1` zero-filled octal digits followed
+/// by a single NUL terminator. A value too large to fit is rejected with an
+/// error rather than silently truncating its high-order digits, which would
+/// corrupt the archive (e.g. a size field for a file ≥8 GiB).
+fn write_octal(buf: &mut [u8], val: u64, width: usize) -> PaxResult<()> {
+    let digits = width - 1;
+    let s = format!("{:0digits$o}", val, digits = digits);
+    if s.len() > digits {
+        return Err(PaxError::InvalidHeader(format!(
+            "value {} too large for {}-byte ustar numeric field",
+            val, width
+        )));
+    }
+    buf[..digits].copy_from_slice(s.as_bytes());
+    buf[digits] = 0;
+    Ok(())
 }
 
 // ============================================================================
@@ -506,6 +515,25 @@ mod tests {
         assert_eq!(parse_octal(b"000644 \0").unwrap(), 0o644);
         assert_eq!(parse_octal(b"0000755\0").unwrap(), 0o755);
         assert_eq!(parse_octal(b"       \0").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_write_octal_round_trip_and_overflow() {
+        // A small value: (width-1) octal digits, zero-filled, NUL-terminated.
+        let mut buf = [0u8; 8];
+        write_octal(&mut buf, 0o644, 8).unwrap();
+        assert_eq!(&buf, b"0000644\0");
+        assert_eq!(parse_octal(&buf).unwrap(), 0o644);
+
+        // The widest size that fits a 12-byte field is 11 octal digits = 8 GiB-1.
+        let mut buf = [0u8; 12];
+        let max = 0o77_777_777_777_u64; // 11 octal sevens = 8 GiB - 1
+        write_octal(&mut buf, max, 12).unwrap();
+        assert_eq!(parse_octal(&buf).unwrap(), max);
+
+        // One larger needs 12 digits and must be rejected, not truncated.
+        let mut buf = [0u8; 12];
+        assert!(write_octal(&mut buf, max + 1, 12).is_err());
     }
 
     #[test]

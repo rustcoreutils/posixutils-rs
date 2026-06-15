@@ -38,13 +38,37 @@ fn run_test_find_sorted(
     expected_error: &str,
     expected_exit_code: i32,
 ) {
+    run_test_find_sorted_env(
+        args,
+        &[],
+        expected_lines,
+        expected_error,
+        expected_exit_code,
+    );
+}
+
+/// Like [`run_test_find_sorted`] but with extra environment variables for the
+/// child process. Used to pin `LC_ALL=C` for tests whose `-name` bracket ranges
+/// (`[a-z]`) are otherwise `LC_COLLATE`-sensitive: `find` matches via libc
+/// `fnmatch(3)`, and a UTF-8 locale on some libc implementations (notably the
+/// BSD libc on macOS) collates uppercase letters into the `a`–`z` range. Pinning
+/// the C locale gives the deterministic, portable ASCII semantics these tests
+/// document.
+fn run_test_find_sorted_env(
+    args: &[&str],
+    env: &[(&str, &str)],
+    expected_lines: &[&str],
+    expected_error: &str,
+    expected_exit_code: i32,
+) {
     let find_path = get_binary_path("find");
 
-    let output = Command::new(&find_path)
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .expect("failed to execute find");
+    let mut command = Command::new(&find_path);
+    command.args(args).stdin(Stdio::null());
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let output = command.output().expect("failed to execute find");
 
     let actual_stdout = String::from_utf8_lossy(&output.stdout);
     let actual_stderr = String::from_utf8_lossy(&output.stderr);
@@ -344,11 +368,19 @@ fn make_fnmatch_dir(tag: &str, files: &[&str]) -> std::path::PathBuf {
 
 #[test]
 fn find_name_bracket_range() {
-    // POSIX bracket expression [a-z] must match a single lowercase letter.
+    // POSIX bracket expression [a-z] must match a single lowercase letter. The
+    // range is LC_COLLATE-sensitive, so pin the C locale for portable ASCII
+    // semantics (see run_test_find_sorted_env).
     let dir = make_fnmatch_dir("bracket", &["m", "Q", "9", "abc"]);
     let ds = dir.to_str().unwrap();
     let expect = format!("{ds}/m");
-    run_test_find_sorted(&[ds, "-name", "[a-z]"], &[&expect], "", 0);
+    run_test_find_sorted_env(
+        &[ds, "-name", "[a-z]"],
+        &[("LC_ALL", "C")],
+        &[&expect],
+        "",
+        0,
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -358,7 +390,14 @@ fn find_name_bracket_negation() {
     let ds = dir.to_str().unwrap();
     let e1 = format!("{ds}/Q");
     let e2 = format!("{ds}/9");
-    run_test_find_sorted(&[ds, "-name", "[!a-z]"], &[&e1, &e2], "", 0);
+    // [!a-z] is the complement of the same LC_COLLATE-sensitive range; pin C.
+    run_test_find_sorted_env(
+        &[ds, "-name", "[!a-z]"],
+        &[("LC_ALL", "C")],
+        &[&e1, &e2],
+        "",
+        0,
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

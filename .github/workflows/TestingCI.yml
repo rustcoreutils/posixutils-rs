@@ -14,6 +14,12 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Pin the C locale for deterministic, host-independent test output. The
+  # utilities honor LC_* at runtime (LC_COLLATE-sensitive fnmatch ranges,
+  # strcoll, strftime, ...), so without this the GitHub macOS runner's
+  # en_US.UTF-8 default changes results (e.g. `[a-z]` collating uppercase in
+  # `find -name`). Tests that exercise specific locales set their own env.
+  LC_ALL: C
 
 jobs:
   lint:

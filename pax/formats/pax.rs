@@ -72,13 +72,23 @@ const LINKNAME_LEN: usize = 100;
 const UNAME_LEN: usize = 32;
 const GNAME_LEN: usize = 32;
 
+/// A pax extended-header timestamp, held exactly as integer seconds plus
+/// nanoseconds. `f64` cannot represent nanosecond precision for present-day
+/// epochs (a 10-digit second count leaves too few mantissa bits), so the
+/// fractional `mtime`/`atime` records are carried losslessly here instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PaxTime {
+    pub sec: i64,
+    pub nsec: u32,
+}
+
 /// Extended header keywords as per POSIX
 #[derive(Debug, Clone, Default)]
 pub struct ExtendedHeader {
     /// atime - file access time
-    pub atime: Option<f64>,
+    pub atime: Option<PaxTime>,
     /// mtime - file modification time
-    pub mtime: Option<f64>,
+    pub mtime: Option<PaxTime>,
     /// path - file pathname
     pub path: Option<String>,
     /// linkpath - link target pathname
@@ -105,21 +115,6 @@ impl ExtendedHeader {
     /// Create a new empty extended header
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Check if the header is empty (no overrides)
-    pub fn is_empty(&self) -> bool {
-        self.atime.is_none()
-            && self.mtime.is_none()
-            && self.path.is_none()
-            && self.linkpath.is_none()
-            && self.size.is_none()
-            && self.uid.is_none()
-            && self.gid.is_none()
-            && self.uname.is_none()
-            && self.gname.is_none()
-            && self.hdrcharset.is_none()
-            && self.extra.is_empty()
     }
 
     /// Parse extended header records from data
@@ -299,6 +294,32 @@ impl ExtendedHeader {
             write_if_allowed(key, value);
         }
 
+        // Per-file overrides (`-o keyword:=value`) for *standard* keywords whose
+        // value is absent from this entry: write_if_allowed above already merges
+        // an override when the entry carried the field, but a forced value such
+        // as `-o gname:=other` / `-o uid:=N` on an entry with no gname/uid must
+        // still produce a record.
+        let standard_emitted = [
+            ("hdrcharset", self.hdrcharset.is_some()),
+            ("atime", self.atime.is_some()),
+            ("mtime", self.mtime.is_some()),
+            ("path", self.path.is_some()),
+            ("linkpath", self.linkpath.is_some()),
+            ("size", self.size.is_some()),
+            ("uid", self.uid.is_some()),
+            ("gid", self.gid.is_some()),
+            ("uname", self.uname.is_some()),
+            ("gname", self.gname.is_some()),
+        ];
+        for (keyword, already_emitted) in standard_emitted {
+            if already_emitted || options.should_delete_keyword(keyword) {
+                continue;
+            }
+            if let Some(value) = per_file.get(keyword) {
+                write_pax_record(&mut data, keyword, value);
+            }
+        }
+
         // Also write any per-file options that weren't already present in the header
         // (e.g., user can add custom keywords via -o keyword:=value)
         for (key, value) in per_file {
@@ -326,36 +347,57 @@ impl ExtendedHeader {
         data
     }
 
-    /// Apply extended header overrides to an ArchiveEntry
-    pub fn apply_to(&self, entry: &mut ArchiveEntry) {
-        if let Some(ref path) = self.path {
-            entry.path = PathBuf::from(path);
+    /// Apply extended-header overrides on extract, skipping any keyword removed
+    /// by the caller's `-o delete=` patterns so the underlying ustar header
+    /// value remains in force (POSIX Keyword Precedence).
+    pub fn apply_to_filtered(&self, entry: &mut ArchiveEntry, opts: &FormatOptions) {
+        let keep = |kw: &str| !opts.should_delete_keyword(kw);
+        if keep("path") {
+            if let Some(ref path) = self.path {
+                entry.path = PathBuf::from(path);
+            }
         }
-        if let Some(ref linkpath) = self.linkpath {
-            entry.link_target = Some(PathBuf::from(linkpath));
+        if keep("linkpath") {
+            if let Some(ref linkpath) = self.linkpath {
+                entry.link_target = Some(PathBuf::from(linkpath));
+            }
         }
-        if let Some(size) = self.size {
-            entry.size = size;
+        if keep("size") {
+            if let Some(size) = self.size {
+                entry.size = size;
+            }
         }
-        if let Some(uid) = self.uid {
-            entry.uid = uid;
+        if keep("uid") {
+            if let Some(uid) = self.uid {
+                entry.uid = uid;
+            }
         }
-        if let Some(gid) = self.gid {
-            entry.gid = gid;
+        if keep("gid") {
+            if let Some(gid) = self.gid {
+                entry.gid = gid;
+            }
         }
-        if let Some(ref uname) = self.uname {
-            entry.uname = Some(uname.clone());
+        if keep("uname") {
+            if let Some(ref uname) = self.uname {
+                entry.uname = Some(uname.clone());
+            }
         }
-        if let Some(ref gname) = self.gname {
-            entry.gname = Some(gname.clone());
+        if keep("gname") {
+            if let Some(ref gname) = self.gname {
+                entry.gname = Some(gname.clone());
+            }
         }
-        if let Some(mtime) = self.mtime {
-            entry.mtime = mtime as u64;
-            entry.mtime_nsec = ((mtime.fract()) * 1_000_000_000.0) as u32;
+        if keep("mtime") {
+            if let Some(mtime) = self.mtime {
+                entry.mtime = mtime.sec as u64;
+                entry.mtime_nsec = mtime.nsec;
+            }
         }
-        if let Some(atime) = self.atime {
-            entry.atime = Some(atime as u64);
-            entry.atime_nsec = ((atime.fract()) * 1_000_000_000.0) as u32;
+        if keep("atime") {
+            if let Some(atime) = self.atime {
+                entry.atime = Some(atime.sec as u64);
+                entry.atime_nsec = atime.nsec;
+            }
         }
     }
 
@@ -396,24 +438,20 @@ impl ExtendedHeader {
 
         // Include mtime: always if include_times, or if subsecond precision needed
         if include_times || entry.mtime_nsec > 0 {
-            let mtime_float = entry.mtime as f64 + (entry.mtime_nsec as f64 / 1_000_000_000.0);
-            header.mtime = Some(mtime_float);
+            header.mtime = Some(PaxTime {
+                sec: entry.mtime as i64,
+                nsec: entry.mtime_nsec,
+            });
         }
 
-        // Include atime: always if include_times, or if present
+        // Include atime only under `-o times`; it is not part of the default
+        // extended-record set, so an ordinary file produces no `x` header.
         if include_times {
-            // When -o times is set, include atime even if not in entry (use mtime as fallback)
-            let atime = entry.atime.unwrap_or(entry.mtime);
-            let atime_nsec = if entry.atime.is_some() {
-                entry.atime_nsec
-            } else {
-                entry.mtime_nsec
+            let (sec, nsec) = match entry.atime {
+                Some(atime) => (atime as i64, entry.atime_nsec),
+                None => (entry.mtime as i64, entry.mtime_nsec),
             };
-            let atime_float = atime as f64 + (atime_nsec as f64 / 1_000_000_000.0);
-            header.atime = Some(atime_float);
-        } else if let Some(atime) = entry.atime {
-            let atime_float = atime as f64 + (entry.atime_nsec as f64 / 1_000_000_000.0);
-            header.atime = Some(atime_float);
+            header.atime = Some(PaxTime { sec, nsec });
         }
 
         // uname/gname with non-ASCII characters
@@ -433,18 +471,35 @@ impl ExtendedHeader {
 }
 
 /// Parse pax time format (decimal seconds with optional fractional part)
-fn parse_pax_time(s: &str) -> PaxResult<f64> {
-    s.parse()
-        .map_err(|_| PaxError::InvalidHeader(format!("invalid pax time: {}", s)))
+fn parse_pax_time(s: &str) -> PaxResult<PaxTime> {
+    let invalid = || PaxError::InvalidHeader(format!("invalid pax time: {}", s));
+    let (sec_str, frac_str) = s.split_once('.').unwrap_or((s, ""));
+    let sec: i64 = sec_str.parse().map_err(|_| invalid())?;
+
+    // Take up to 9 fractional digits, zero-padded to nanoseconds.
+    let mut frac = String::with_capacity(9);
+    for c in frac_str.chars() {
+        if !c.is_ascii_digit() {
+            return Err(invalid());
+        }
+        if frac.len() < 9 {
+            frac.push(c);
+        }
+    }
+    while frac.len() < 9 {
+        frac.push('0');
+    }
+    let nsec: u32 = frac.parse().map_err(|_| invalid())?;
+    Ok(PaxTime { sec, nsec })
 }
 
-/// Format time for pax extended header
-fn format_pax_time(time: f64) -> String {
-    if time.fract() == 0.0 {
-        format!("{}", time as u64)
+/// Format time for pax extended header, preserving exact nanoseconds.
+fn format_pax_time(time: PaxTime) -> String {
+    if time.nsec == 0 {
+        format!("{}", time.sec)
     } else {
-        // Format with enough precision for nanoseconds
-        format!("{:.9}", time).trim_end_matches('0').to_string()
+        let frac = format!("{:09}", time.nsec);
+        format!("{}.{}", time.sec, frac.trim_end_matches('0'))
     }
 }
 
@@ -475,6 +530,8 @@ pub struct PaxReader<R: Read> {
     current_size: u64,
     bytes_read: u64,
     global_header: ExtendedHeader,
+    /// `-o` options consulted on read (currently `delete=` keyword removal).
+    options: FormatOptions,
 }
 
 impl<R: Read> PaxReader<R> {
@@ -485,7 +542,14 @@ impl<R: Read> PaxReader<R> {
             current_size: 0,
             bytes_read: 0,
             global_header: ExtendedHeader::new(),
+            options: FormatOptions::default(),
         }
+    }
+
+    /// Attach `-o` format options (e.g. `delete=`) consulted while extracting.
+    pub fn with_options(mut self, options: FormatOptions) -> Self {
+        self.options = options;
+        self
     }
 
     /// Read exactly n bytes
@@ -563,12 +627,14 @@ impl<R: Read> ArchiveReader for PaxReader<R> {
                     // Regular file entry - parse and apply extended headers
                     let mut entry = parse_ustar_header(&header)?;
 
-                    // Apply global header first
-                    self.global_header.apply_to(&mut entry);
+                    // Apply global header first, honoring `-o delete=` so removed
+                    // keywords fall back to the ustar header value.
+                    self.global_header
+                        .apply_to_filtered(&mut entry, &self.options);
 
                     // Apply per-file extended header (overrides global)
                     if let Some(ref ext) = extended_header {
-                        ext.apply_to(&mut entry);
+                        ext.apply_to_filtered(&mut entry, &self.options);
                     }
 
                     self.current_size = entry.size;
@@ -794,15 +860,11 @@ impl<W: Write> ArchiveWriter for PaxWriter<W> {
         // Write global header if this is the first entry and we have global options
         self.write_global_header()?;
 
-        // Build extended header (respecting -o times option)
-        let mut ext_header = ExtendedHeader::from_entry(entry, self.options.include_times);
-
-        // For pax format, always include at least mtime to ensure the archive
-        // is identifiable as pax (has extended headers with typeflag 'x')
-        if ext_header.is_empty() {
-            let mtime_float = entry.mtime as f64 + (entry.mtime_nsec as f64 / 1_000_000_000.0);
-            ext_header.mtime = Some(mtime_float);
-        }
+        // Build extended header (respecting -o times option). Emit an `x`
+        // extended header only when some field actually needs one; a pax archive
+        // with no extended records is a valid ustar archive and reads back
+        // identically, so there is no need to force an mtime record.
+        let ext_header = ExtendedHeader::from_entry(entry, self.options.include_times);
 
         self.write_extended_header(&ext_header, entry)?;
 
@@ -1150,17 +1212,55 @@ mod tests {
 
     #[test]
     fn test_parse_pax_time() {
-        assert_eq!(parse_pax_time("1234567890").unwrap(), 1234567890.0);
         assert_eq!(
-            parse_pax_time("1234567890.1234567").unwrap(),
-            1234567890.1234567
+            parse_pax_time("1234567890").unwrap(),
+            PaxTime {
+                sec: 1234567890,
+                nsec: 0
+            }
+        );
+        // Exact nanoseconds, including the full 9-digit tail that f64 lost.
+        assert_eq!(
+            parse_pax_time("1577880000.123456789").unwrap(),
+            PaxTime {
+                sec: 1577880000,
+                nsec: 123456789
+            }
+        );
+        // Fewer than 9 fractional digits are zero-padded on the right.
+        assert_eq!(
+            parse_pax_time("1234567890.5").unwrap(),
+            PaxTime {
+                sec: 1234567890,
+                nsec: 500000000
+            }
         );
     }
 
     #[test]
     fn test_format_pax_time() {
-        assert_eq!(format_pax_time(1234567890.0), "1234567890");
-        assert_eq!(format_pax_time(1234567890.5), "1234567890.5");
+        assert_eq!(
+            format_pax_time(PaxTime {
+                sec: 1234567890,
+                nsec: 0
+            }),
+            "1234567890"
+        );
+        assert_eq!(
+            format_pax_time(PaxTime {
+                sec: 1234567890,
+                nsec: 500000000
+            }),
+            "1234567890.5"
+        );
+        // Full nanosecond precision survives the round-trip exactly.
+        assert_eq!(
+            format_pax_time(PaxTime {
+                sec: 1577880000,
+                nsec: 123456789
+            }),
+            "1577880000.123456789"
+        );
     }
 
     #[test]
@@ -1168,14 +1268,18 @@ mod tests {
         let mut ext = ExtendedHeader::new();
         ext.path = Some("/very/long/path/that/exceeds/ustar/limits".to_string());
         ext.size = Some(10000000000);
-        ext.mtime = Some(1234567890.1234567);
+        ext.mtime = Some(PaxTime {
+            sec: 1234567890,
+            nsec: 123456789,
+        });
 
         let data = ext.serialize(&FormatOptions::default());
         let parsed = ExtendedHeader::parse(&data).unwrap();
 
         assert_eq!(parsed.path, ext.path);
         assert_eq!(parsed.size, ext.size);
-        assert!((parsed.mtime.unwrap() - ext.mtime.unwrap()).abs() < 0.000001);
+        // Nanoseconds round-trip exactly (no f64 precision loss).
+        assert_eq!(parsed.mtime, ext.mtime);
     }
 
     #[test]

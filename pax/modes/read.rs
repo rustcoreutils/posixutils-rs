@@ -51,6 +51,8 @@ pub struct ReadOptions {
     /// Process file-creation mask, applied to the mode of extracted files when
     /// the mode is not explicitly preserved (no `-p p`/`-p e`).
     pub umask: u32,
+    /// `-o` extended-header options (delete=/keyword:=value) applied on extract.
+    pub format_options: crate::options::FormatOptions,
 }
 
 impl Default for ReadOptions {
@@ -69,6 +71,7 @@ impl Default for ReadOptions {
             substitutions: Vec::new(),
             first_match: false,
             umask: 0,
+            format_options: crate::options::FormatOptions::default(),
         }
     }
 }
@@ -89,7 +92,7 @@ pub fn extract_archive<R: Read>(
             extract_entries(&mut archive, options)
         }
         ArchiveFormat::Pax => {
-            let mut archive = PaxReader::new(reader);
+            let mut archive = PaxReader::new(reader).with_options(options.format_options.clone());
             extract_entries(&mut archive, options)
         }
     }
@@ -124,6 +127,9 @@ fn extract_entries<R: ArchiveReader>(archive: &mut R, options: &ReadOptions) -> 
                 archive.skip_data()?;
                 continue;
             }
+            // Apply `-o keyword:=value` overrides before substitutions/rename so a
+            // forced path/uid/gid/etc. takes effect on the extracted file.
+            apply_keyword_overrides(&mut entry, &options.format_options);
             // Apply substitutions first (per POSIX: -s applies before -i)
             if !options.substitutions.is_empty() {
                 let path_str = entry.path.to_string_lossy();
@@ -181,6 +187,52 @@ fn extract_entries<R: ArchiveReader>(archive: &mut R, options: &ReadOptions) -> 
     }
 
     Ok(())
+}
+
+/// Apply `-o keyword:=value` per-file overrides to an entry on extract.
+///
+/// The `:=` form forces the value regardless of what the archive carried, so it
+/// is applied after the reader has merged any extended-header records. Only the
+/// standard keywords that map onto an entry field are handled; unknown keywords
+/// have no extraction effect. `delete=` is handled in the pax reader (so the
+/// ustar value remains), not here.
+fn apply_keyword_overrides(entry: &mut ArchiveEntry, opts: &crate::options::FormatOptions) {
+    for (keyword, value) in opts.per_file_options() {
+        match keyword.as_str() {
+            "uid" => {
+                if let Ok(v) = value.parse() {
+                    entry.uid = v;
+                }
+            }
+            "gid" => {
+                if let Ok(v) = value.parse() {
+                    entry.gid = v;
+                }
+            }
+            "uname" => entry.uname = Some(value.clone()),
+            "gname" => entry.gname = Some(value.clone()),
+            "path" => entry.path = PathBuf::from(value),
+            "linkpath" => entry.link_target = Some(PathBuf::from(value)),
+            "size" => {
+                if let Ok(v) = value.parse() {
+                    entry.size = v;
+                }
+            }
+            "mtime" => {
+                if let Ok(t) = value.parse::<f64>() {
+                    entry.mtime = t as u64;
+                    entry.mtime_nsec = (t.fract() * 1_000_000_000.0) as u32;
+                }
+            }
+            "atime" => {
+                if let Ok(t) = value.parse::<f64>() {
+                    entry.atime = Some(t as u64);
+                    entry.atime_nsec = (t.fract() * 1_000_000_000.0) as u32;
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Check if entry should be extracted
@@ -692,47 +744,46 @@ fn set_times(path: &Path, entry: &ArchiveEntry, options: &ReadOptions) -> PaxRes
         // Get current times for any we're not preserving
         let current_meta = fs::metadata(path).ok();
 
-        // Determine atime to set
-        let atime = if options.preserve_atime {
-            // Use archive's atime if available, otherwise use mtime as fallback
-            entry.atime.unwrap_or(entry.mtime) as libc::time_t
+        use std::os::unix::fs::MetadataExt;
+
+        // Determine the atime to set, preserving nanosecond precision.
+        let (atime_sec, atime_nsec) = if options.preserve_atime {
+            // Use the archive's atime if present, else fall back to mtime.
+            match entry.atime {
+                Some(sec) => (sec as i64, entry.atime_nsec as i64),
+                None => (entry.mtime as i64, entry.mtime_nsec as i64),
+            }
         } else {
-            // Keep current atime
+            // Keep the current atime.
             current_meta
                 .as_ref()
-                .map(|m| {
-                    use std::os::unix::fs::MetadataExt;
-                    m.atime() as libc::time_t
-                })
-                .unwrap_or(0)
+                .map(|m| (m.atime(), m.atime_nsec()))
+                .unwrap_or((0, 0))
         };
 
-        // Determine mtime to set
-        let mtime = if options.preserve_mtime {
-            entry.mtime as libc::time_t
+        // Determine the mtime to set, preserving nanosecond precision.
+        let (mtime_sec, mtime_nsec) = if options.preserve_mtime {
+            (entry.mtime as i64, entry.mtime_nsec as i64)
         } else {
-            // Keep current mtime
             current_meta
                 .as_ref()
-                .map(|m| {
-                    use std::os::unix::fs::MetadataExt;
-                    m.mtime() as libc::time_t
-                })
-                .unwrap_or(0)
+                .map(|m| (m.mtime(), m.mtime_nsec()))
+                .unwrap_or((0, 0))
         };
 
         let times = [
-            libc::timeval {
-                tv_sec: atime,
-                tv_usec: 0,
+            libc::timespec {
+                tv_sec: atime_sec as libc::time_t,
+                tv_nsec: atime_nsec as _,
             },
-            libc::timeval {
-                tv_sec: mtime,
-                tv_usec: 0,
+            libc::timespec {
+                tv_sec: mtime_sec as libc::time_t,
+                tv_nsec: mtime_nsec as _,
             },
         ];
 
-        let result = unsafe { libc::utimes(path_cstr.as_ptr(), times.as_ptr()) };
+        let result =
+            unsafe { libc::utimensat(libc::AT_FDCWD, path_cstr.as_ptr(), times.as_ptr(), 0) };
 
         if result != 0 {
             let err = std::io::Error::last_os_error();

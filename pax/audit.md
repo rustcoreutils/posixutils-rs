@@ -102,7 +102,7 @@ read/list. There are **no crashes/hangs**.
   real device/inode/uid values routinely exceed the 6-digit width on ordinary
   filesystems and carry no stream-length information (matching GNU cpio `odc`).
 
-- [ ] **#5 — pax format drops sub-second mtime and never captures atime nanoseconds.**
+- [x] **#5 — pax format drops sub-second mtime and never captures atime nanoseconds.** *(Fixed, Phase 5: exact nsec via a PaxTime sec+nsec pair and utimensat.)*
   `modes/write.rs:528-548` (`build_entry`) stores only whole-second
   `metadata.mtime()`; `mtime_nsec`/`atime`/`atime_nsec` are never set, so the
   nanosecond machinery in `formats/pax.rs:398-417` always sees zero. Spec *pax
@@ -157,7 +157,7 @@ read/list. There are **no crashes/hangs**.
   prints nothing where `tar tf arc.tar src` prints the whole subtree. Fix:
   prefix-match directory members in read/list; honor `-d` there.
 
-- [ ] **#12 — `-o keyword:=value` for standard keywords is silently ignored.**
+- [x] **#12 — `-o keyword:=value` for standard keywords is silently ignored.** *(Fixed, Phase 5.)*
   `formats/pax.rs:249-324` only emits a per-file override for fields the entry
   already set to `Some(..)`, and the fallback loop skips the ten standard
   keywords — so the spec's own example `-o gname:=other` (110267) does nothing,
@@ -165,14 +165,17 @@ read/list. There are **no crashes/hangs**.
   `-o uid:=12345` produce no record. Fix: emit per-file standard keywords from
   `per_file` even when the entry field is `None`.
 
-- [ ] **#13 — `-o` options are not applied in read mode and only partially in list mode.**
+- [x] **#13 — `-o` options are not applied in read mode and only partially in list mode.** *(Fixed for read/extract, Phase 5.)*
   `main.rs:262-288` (`run_read`) parses no format options (`ReadOptions` has no
   such field), so `-o delete=`, `-o keyword=value`, `-o keyword:=value`, and
   `-o invalid=` are discarded on extract; list mode stores them but consumes
   only `listopt`. Spec *Keyword Precedence* (110705-110717) requires
-  delete/override/invalid to participate in read and list. Fix: thread
-  `FormatOptions` into `ReadOptions`/the list path and apply before
-  `ExtendedHeader::apply_to`.
+  delete/override/invalid to participate in read and list. Fix applied:
+  `FormatOptions` is threaded into `ReadOptions`; the pax reader honors
+  `-o delete=` (the removed keyword falls back to the ustar header value) and
+  per-file `-o keyword:=value` overrides are applied to each entry on extract
+  (uid/gid/uname/gname/path/linkpath/size/mtime/atime). The list-mode `-o`
+  keyword path is `listopt`, addressed in Phase 6.
 
 - [ ] **#14 — `-o listopt=format` doesn't implement the POSIX `%(keyword)s` form.**
   `options.rs:535-589` invented a single-letter scheme (`%F`/`%s`/`%T`); the
@@ -200,7 +203,7 @@ read/list. There are **no crashes/hangs**.
   110428-110431): a `.` at start or after `/` is not matched by `*`/`?`/bracket.
   Verified: `'*'` matched `.hidden`. Fix: refuse to consume a `.` at position 0
   or after `/`.
-- [ ] **#19 — `globexthdr.name` default hardcodes `/tmp`, ignores `$TMPDIR`.**
+- [x] **#19 — `globexthdr.name` default hardcodes `/tmp`, ignores `$TMPDIR`.** *(Fixed, Phase 5.)*
   `options.rs:333`. Spec 110174-110177 + ENVIRONMENT VARIABLES: default is
   `$TMPDIR/GlobalHead.%n`. (No `env::var("TMPDIR")` in the crate.) `%n`/`%p`
   substitution itself is correct.
@@ -208,7 +211,7 @@ read/list. There are **no crashes/hangs**.
   `blocked_io.rs:244-248`: `>32256`→32256, non-multiple→rounded up, `0`→512.
   Legal (behavior is impl-defined) but a diagnostic would be friendlier; `-b 0`
   in particular should be rejected (`-b` is "a positive decimal integer").
-- [ ] **#21 — pax always emits an `x` extended header, even when no field needs one.**
+- [x] **#21 — pax always emits an `x` extended header, even when no field needs one.** *(Fixed, Phase 5.)*
   `formats/pax.rs:802-805` forces an `mtime` record "to identify the archive as
   pax." Spec Figure 3-1 shows members with no extended header; this adds ~1 KB
   (a 512-byte header + duplicate-of-ustar `mtime`) per file. Conformant but

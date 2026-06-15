@@ -325,12 +325,14 @@ impl FormatOptions {
     /// - `%p` - process ID of pax
     /// - `%%` - literal percent sign
     ///
-    /// Default template: "/tmp/GlobalHead.%p.%n"
+    /// Default template: "$TMPDIR/GlobalHead.%p.%n", with `$TMPDIR` defaulting
+    /// to `/tmp` when unset (per POSIX ENVIRONMENT VARIABLES).
     pub fn expand_globexthdr_name(&self, sequence: u64) -> String {
-        let template = self
-            .globexthdr_name
-            .as_deref()
-            .unwrap_or("/tmp/GlobalHead.%p.%n");
+        let default_template = {
+            let tmpdir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
+            format!("{}/GlobalHead.%p.%n", tmpdir.trim_end_matches('/'))
+        };
+        let template = self.globexthdr_name.as_deref().unwrap_or(&default_template);
 
         expand_global_header_template(template, sequence)
     }
@@ -886,6 +888,29 @@ mod tests {
     fn test_parse_escaped_comma() {
         let opts = FormatOptions::parse(r"listopt=a\,b").unwrap();
         assert_eq!(opts.list_format, Some("a,b".to_string()));
+    }
+
+    #[test]
+    fn test_globexthdr_name_uses_tmpdir() {
+        let opts = FormatOptions::default();
+
+        // With $TMPDIR set, the default global-header name template derives from
+        // it rather than the hardcoded /tmp.
+        std::env::set_var("TMPDIR", "/custom/tmp");
+        let name = opts.expand_globexthdr_name(7);
+        assert!(
+            name.starts_with("/custom/tmp/GlobalHead."),
+            "expected $TMPDIR-derived name, got {name}"
+        );
+        assert!(name.ends_with(".7"), "sequence %n should expand: {name}");
+
+        // With $TMPDIR unset it falls back to /tmp.
+        std::env::remove_var("TMPDIR");
+        let name = opts.expand_globexthdr_name(7);
+        assert!(
+            name.starts_with("/tmp/GlobalHead."),
+            "expected /tmp fallback, got {name}"
+        );
     }
 
     #[test]

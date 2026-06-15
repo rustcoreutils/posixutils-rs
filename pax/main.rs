@@ -273,6 +273,7 @@ fn run_list_multi_volume(args: &Args, options: &ListOptions) -> PaxResult<()> {
 fn run_read(args: &Args) -> PaxResult<()> {
     let patterns = compile_patterns(&args.files_and_patterns)?;
     let substitutions = parse_substitutions(args)?;
+    let format_options = parse_format_options(args)?;
 
     let options = ReadOptions {
         patterns,
@@ -288,6 +289,7 @@ fn run_read(args: &Args) -> PaxResult<()> {
         substitutions,
         first_match: args.first_match,
         umask: current_umask(),
+        format_options,
     };
 
     // Check for multi-volume mode

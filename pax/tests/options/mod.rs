@@ -1031,3 +1031,103 @@ fn test_exit_status_extract_continues_after_failure() {
         "the member after the failing one should still be extracted"
     );
 }
+
+// --- Phase 5: pax time fidelity + `-o` on read ---
+
+/// `-o gname:=value` forces a gname extended record even when the entry carried
+/// no gname of its own.
+#[test]
+fn test_pax_o_gname_override_emits_record() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("g.pax");
+
+    fs::create_dir(&src_dir).unwrap();
+    fs::write(src_dir.join("f"), b"hi").unwrap();
+
+    let output = run_pax_in_dir(
+        &[
+            "-w",
+            "-x",
+            "pax",
+            "-o",
+            "gname:=mygroup",
+            "-f",
+            archive.to_str().unwrap(),
+            "f",
+        ],
+        &src_dir,
+    );
+    assert_success(&output, "pax write with -o gname:=");
+
+    let bytes = fs::read(&archive).unwrap();
+    let needle = b"gname=mygroup";
+    assert!(
+        bytes.windows(needle.len()).any(|w| w == needle),
+        "archive should contain a gname=mygroup extended record"
+    );
+}
+
+/// `-o delete=mtime` on extract removes the extended mtime record so the
+/// (whole-second) ustar header time is used, dropping the sub-second part that a
+/// default extract preserves.
+#[test]
+fn test_pax_o_delete_mtime_on_extract() {
+    use std::os::unix::fs::MetadataExt;
+    use std::process::Command;
+
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("a.pax");
+
+    fs::create_dir(&src_dir).unwrap();
+    let src_file = src_dir.join("f");
+    fs::write(&src_file, b"hi").unwrap();
+    // Stamp a precise sub-second mtime.
+    let status = Command::new("touch")
+        .args(["-d", "2020-01-01 12:00:00.123456789"])
+        .arg(&src_file)
+        .status()
+        .unwrap();
+    if !status.success() {
+        eprintln!("skipping: touch with fractional time unsupported");
+        return;
+    }
+
+    assert_success(
+        &run_pax_in_dir(
+            &["-w", "-x", "pax", "-f", archive.to_str().unwrap(), "f"],
+            &src_dir,
+        ),
+        "pax write pax",
+    );
+
+    // Default extract preserves the nanoseconds.
+    let d_default = temp.path().join("d_default");
+    fs::create_dir(&d_default).unwrap();
+    assert_success(
+        &run_pax_in_dir(&["-r", "-f", archive.to_str().unwrap()], &d_default),
+        "extract default",
+    );
+    let nsec_default = fs::metadata(d_default.join("f")).unwrap().mtime_nsec();
+    assert_eq!(
+        nsec_default, 123456789,
+        "default extract must preserve sub-second mtime"
+    );
+
+    // delete=mtime falls back to the whole-second ustar time.
+    let d_del = temp.path().join("d_del");
+    fs::create_dir(&d_del).unwrap();
+    assert_success(
+        &run_pax_in_dir(
+            &["-r", "-o", "delete=mtime", "-f", archive.to_str().unwrap()],
+            &d_del,
+        ),
+        "extract delete=mtime",
+    );
+    let nsec_del = fs::metadata(d_del.join("f")).unwrap().mtime_nsec();
+    assert_eq!(
+        nsec_del, 0,
+        "delete=mtime must drop the sub-second precision"
+    );
+}

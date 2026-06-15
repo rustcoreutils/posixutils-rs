@@ -539,6 +539,11 @@ fn build_entry(path: &Path, metadata: &Metadata, entry_type: EntryType) -> PaxRe
         entry.uid = metadata.uid();
         entry.gid = metadata.gid();
         entry.mtime = metadata.mtime() as u64;
+        // Capture sub-second times so the pax interchange format can record a
+        // fractional `mtime`/`atime` (other formats ignore the nsec fields).
+        entry.mtime_nsec = metadata.mtime_nsec() as u32;
+        entry.atime = Some(metadata.atime() as u64);
+        entry.atime_nsec = metadata.atime_nsec() as u32;
         entry.dev = metadata.dev();
         entry.ino = metadata.ino();
         entry.nlink = metadata.nlink() as u32;

@@ -224,17 +224,29 @@ read/list. There are **no crashes/hangs**.
 - [x] **#23 — `read_file_list` trims and drops blank lines.** *(Fixed, Phase 4.)* `write.rs:622-628` /
   `copy.rs:674-681` `line.trim()` mangles stdin pathnames with leading/trailing
   blanks. Spec STDIN 110434-110435: only the `<newline>` is the terminator.
-- [ ] **#24 — Hardcoded-English diagnostics; `LC_MESSAGES` inert; `-v` time is `TZ`/`LC_TIME`-unaware.**
+- [x] **#24 — Hardcoded-English diagnostics; `LC_MESSAGES` inert; `-v` time is `TZ`/`LC_TIME`-unaware.** *(Fixed, Phase 8.)*
   Diagnostics throughout are raw English; some lack the `pax: <path>:` shape
   (e.g. `copy.rs:104-119`). The `-v` time formatter (`list.rs:354`
   `days_to_ymd`) is hand-rolled and ignores `TZ`/`LC_TIME` (spec ties `-v` time
-  to them).
+  to them). Fix applied: `main()` now initializes the locale
+  (`setlocale`/`textdomain`/`bind_textdomain_codeset` + `tzset`); the
+  `PaxError` diagnostic clauses and the `not found` / `unsupported file type`
+  messages route through `gettext` (English byte-identical in the C locale); and
+  both the `-v` listing time and the `listopt` `%T`/ISO time formatters were
+  replaced with `plib::locale::strftime` (libc `localtime_r`/`strftime`), so
+  `TZ` and `LC_TIME` now take effect.
 - [x] **#25 — `-o listopt` value is comma-split.** *(Fixed, Phase 6.)* `options.rs:158-171` splits a
   `listopt` value on unescaped commas; spec 110238-110243: `listopt=format` must
   be the final keyword and all remaining characters are the format string.
-- [ ] **#26 — non-UTF-8 path bytes are lossily mangled** (`to_string_lossy` in
+- [~] **#26 — non-UTF-8 path bytes are lossily mangled** (`to_string_lossy` in
   `ustar.rs:352,404,452`); ASCII/UTF-8 names are fine. cpio TRAILER header
   carries `c_mode=100644` (`cpio.rs:286`) where GNU writes `000000` — harmless.
+  **Documented WON'T-FIX (Phase 8).** Both items are cosmetic or non-data-losing
+  on the supported path: the cpio TRAILER `c_mode` is ignored by readers (they
+  key off the `TRAILER!!!` name), and exact non-UTF-8 byte preservation would
+  require threading raw `OsStr`/byte paths through the entire entry/format stack
+  (a cross-cutting rewrite); ASCII/UTF-8 pathnames — the overwhelming common
+  case — round-trip correctly today.
 
 ## Non-POSIX extensions (note; keep, document)
 

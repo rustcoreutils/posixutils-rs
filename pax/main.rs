@@ -26,7 +26,7 @@ use blocked_io::{
 use clap::{Parser, ValueEnum};
 use compression::{is_gzip, GzipReader, GzipWriter};
 use error::{PaxError, PaxResult};
-use gettextrs::gettext;
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use modes::copy::CopyOptions;
 use modes::list::ListOptions;
 use modes::read::ReadOptions;
@@ -155,6 +155,22 @@ enum PaxMode {
 }
 
 fn main() -> ExitCode {
+    // Initialize locale so LC_* environment variables affect message lookup and
+    // locale-sensitive formatting (e.g. the `-v` listing time).
+    setlocale(LocaleCategory::LcAll, "");
+    let _ = textdomain("posixutils-rs");
+    let _ = bind_textdomain_codeset("posixutils-rs", "UTF-8");
+    // glibc's localtime_r (used by the strftime time formatter) does not call
+    // tzset() itself, so initialize the timezone from $TZ once up front. The
+    // symbol is not surfaced by the `libc` crate, so declare it directly.
+    #[cfg(unix)]
+    {
+        extern "C" {
+            fn tzset();
+        }
+        unsafe { tzset() };
+    }
+
     let args = Args::parse();
 
     match run(args) {

@@ -116,7 +116,7 @@ fn list_entries<R: ArchiveReader, W: Write>(
     if !options.exclude {
         for (idx, pat) in options.patterns.iter().enumerate() {
             if !matched_patterns.contains(&idx) {
-                crate::error::report_error(&pat.source, "not found");
+                crate::error::report_error(&pat.source, gettextrs::gettext("not found"));
             }
         }
     }
@@ -323,86 +323,21 @@ fn format_group(entry: &ArchiveEntry) -> String {
 
 /// Format modification time
 fn format_mtime(mtime: u64) -> String {
-    // Simple format: just show the timestamp
-    // In a full implementation, we'd format based on age
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    // POSIX `ls -l`-style time: a date+time for recent members, a date+year for
+    // members older than ~6 months (or in the future). Formatting goes through
+    // libc strftime via localtime_r, so TZ and LC_TIME (month names) take effect.
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    let time = UNIX_EPOCH + Duration::from_secs(mtime);
-
-    // Get current time to determine format
-    let now = SystemTime::now();
-    let six_months_ago = now - Duration::from_secs(180 * 24 * 60 * 60);
-
-    // Format the time (simplified)
-    format_system_time(time, time < six_months_ago)
-}
-
-/// Format a SystemTime for display
-fn format_system_time(time: std::time::SystemTime, show_year: bool) -> String {
-    use std::time::{Duration, UNIX_EPOCH};
-
-    let secs = time
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_secs();
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let age = now - mtime as i64;
+    let six_months: i64 = 180 * 24 * 60 * 60;
+    let recent = (0..six_months).contains(&age);
 
-    // Simple formatting without external crates
-    let days_since_epoch = secs / 86400;
-    let secs_today = secs % 86400;
-    let hours = secs_today / 3600;
-    let minutes = (secs_today % 3600) / 60;
-
-    // Approximate year/month/day calculation
-    let (year, month, day) = days_to_ymd(days_since_epoch);
-
-    let month_names = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-    let month_name = month_names.get(month as usize).unwrap_or(&"???");
-
-    if show_year {
-        format!("{} {:2}  {:4}", month_name, day, year)
-    } else {
-        format!("{} {:2} {:02}:{:02}", month_name, day, hours, minutes)
-    }
-}
-
-/// Convert days since epoch to (year, month, day)
-fn days_to_ymd(days: u64) -> (u64, u32, u32) {
-    // Simplified calculation - not perfectly accurate but good enough for display
-    let mut y = 1970;
-    let mut remaining = days as i64;
-
-    loop {
-        let days_in_year = if is_leap_year(y) { 366 } else { 365 };
-        if remaining < days_in_year {
-            break;
-        }
-        remaining -= days_in_year;
-        y += 1;
-    }
-
-    let days_in_month = if is_leap_year(y) {
-        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    } else {
-        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    };
-
-    let mut m = 0;
-    for (i, &days) in days_in_month.iter().enumerate() {
-        if remaining < days as i64 {
-            m = i;
-            break;
-        }
-        remaining -= days as i64;
-    }
-
-    (y, m as u32, remaining as u32 + 1)
-}
-
-/// Check if a year is a leap year
-fn is_leap_year(year: u64) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+    let fmt = if recent { "%b %e %H:%M" } else { "%b %e  %Y" };
+    plib::locale::strftime(fmt, mtime as i64).unwrap_or_else(|_| mtime.to_string())
 }
 
 /// Format link suffix for symlinks and hardlinks

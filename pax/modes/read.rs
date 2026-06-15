@@ -185,7 +185,7 @@ fn extract_entries<R: ArchiveReader>(archive: &mut R, options: &ReadOptions) -> 
     if !options.exclude {
         for (idx, pat) in options.patterns.iter().enumerate() {
             if !matched_patterns.contains(&idx) {
-                crate::error::report_error(&pat.source, "not found");
+                crate::error::report_error(&pat.source, gettextrs::gettext("not found"));
             }
         }
     }

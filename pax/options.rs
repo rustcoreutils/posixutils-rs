@@ -848,114 +848,25 @@ fn format_mode_symbolic(mode: u32, entry_type: EntryType) -> String {
 
 /// Format time in traditional ls -l style
 fn format_time_traditional(mtime: u64) -> String {
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    // POSIX `ls -l`-style time, formatted via libc strftime (localtime_r), so TZ
+    // and LC_TIME take effect: date+time when recent, date+year otherwise.
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    let _time = UNIX_EPOCH + Duration::from_secs(mtime);
-    let now = SystemTime::now();
-
-    // Get current time for comparison
-    let now_secs = now
+    let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+    let age = now_secs - mtime as i64;
+    let six_months: i64 = 180 * 24 * 60 * 60;
+    let recent = (0..six_months).contains(&age);
 
-    // If within 6 months, show month/day/time; otherwise show month/day/year
-    let six_months = 180 * 24 * 60 * 60;
-    let use_time = now_secs.saturating_sub(mtime) < six_months;
-
-    // Simple formatting without chrono
-    let secs_per_day = 86400u64;
-    let days_since_epoch = mtime / secs_per_day;
-
-    // Approximate month/day calculation
-    let year = 1970 + (days_since_epoch / 365) as i32;
-    let day_of_year = days_since_epoch % 365;
-
-    let months = [
-        ("Jan", 31),
-        ("Feb", 28),
-        ("Mar", 31),
-        ("Apr", 30),
-        ("May", 31),
-        ("Jun", 30),
-        ("Jul", 31),
-        ("Aug", 31),
-        ("Sep", 30),
-        ("Oct", 31),
-        ("Nov", 30),
-        ("Dec", 31),
-    ];
-
-    let mut remaining = day_of_year;
-    let mut month_name = "Jan";
-    let mut day = 1u64;
-
-    for (name, days) in months.iter() {
-        if remaining < *days as u64 {
-            month_name = name;
-            day = remaining + 1;
-            break;
-        }
-        remaining -= *days as u64;
-    }
-
-    if use_time {
-        let time_of_day = mtime % secs_per_day;
-        let hour = time_of_day / 3600;
-        let min = (time_of_day % 3600) / 60;
-        format!("{} {:2} {:02}:{:02}", month_name, day, hour, min)
-    } else {
-        format!("{} {:2}  {:4}", month_name, day, year)
-    }
+    let fmt = if recent { "%b %e %H:%M" } else { "%b %e  %Y" };
+    plib::locale::strftime(fmt, mtime as i64).unwrap_or_else(|_| mtime.to_string())
 }
 
-/// Format time in ISO format
+/// Format time in ISO 8601 form (`%Y-%m-%dT%H:%M:%S`), TZ-aware via strftime.
 fn format_time_iso(mtime: u64) -> String {
-    let secs_per_day = 86400u64;
-    let days_since_epoch = mtime / secs_per_day;
-
-    // Approximate date calculation
-    let mut year = 1970i32;
-    let mut remaining_days = days_since_epoch as i64;
-
-    loop {
-        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
-        if remaining_days < days_in_year {
-            break;
-        }
-        remaining_days -= days_in_year;
-        year += 1;
-    }
-
-    let months = if is_leap_year(year) {
-        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    } else {
-        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    };
-
-    let mut month = 1;
-    for days in months.iter() {
-        if remaining_days < *days as i64 {
-            break;
-        }
-        remaining_days -= *days as i64;
-        month += 1;
-    }
-    let day = remaining_days + 1;
-
-    let time_of_day = mtime % secs_per_day;
-    let hour = time_of_day / 3600;
-    let min = (time_of_day % 3600) / 60;
-    let sec = time_of_day % 60;
-
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
-        year, month, day, hour, min, sec
-    )
-}
-
-fn is_leap_year(year: i32) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+    plib::locale::strftime("%Y-%m-%dT%H:%M:%S", mtime as i64).unwrap_or_else(|_| mtime.to_string())
 }
 
 #[cfg(test)]
@@ -1234,9 +1145,20 @@ mod tests {
 
     #[test]
     fn test_format_time_iso() {
-        // 2024-01-01 00:00:00 UTC
-        let timestamp = 1704067200u64;
-        let result = format_time_iso(timestamp);
-        assert!(result.starts_with("2024-01-01T"));
+        // The exact value is timezone-dependent (strftime via localtime_r), so
+        // assert the ISO 8601 shape `YYYY-MM-DDTHH:MM:SS` rather than a fixed UTC
+        // instant.
+        let result = format_time_iso(1704067200);
+        let bytes = result.as_bytes();
+        assert_eq!(result.len(), 19, "unexpected ISO length: {result}");
+        assert_eq!(&result[4..5], "-");
+        assert_eq!(&result[7..8], "-");
+        assert_eq!(&result[10..11], "T");
+        assert_eq!(&result[13..14], ":");
+        assert_eq!(&result[16..17], ":");
+        assert!(
+            bytes[..4].iter().all(|b| b.is_ascii_digit()),
+            "year should be digits: {result}"
+        );
     }
 }

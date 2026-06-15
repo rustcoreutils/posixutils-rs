@@ -28,12 +28,18 @@ pub enum PaxError {
 
 impl fmt::Display for PaxError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The fixed clause of each diagnostic is routed through gettext so it can
+        // be localized; the variable detail is interpolated outside. In the C
+        // locale gettext returns the message unchanged, so output is unchanged.
+        use gettextrs::gettext;
         match self {
-            PaxError::Io(e) => write!(f, "I/O error: {}", e),
-            PaxError::InvalidFormat(msg) => write!(f, "Invalid archive format: {}", msg),
-            PaxError::InvalidHeader(msg) => write!(f, "Invalid header: {}", msg),
-            PaxError::PathTooLong(path) => write!(f, "Path too long: {}", path),
-            PaxError::PatternError(msg) => write!(f, "Pattern error: {}", msg),
+            PaxError::Io(e) => write!(f, "{}: {}", gettext("I/O error"), e),
+            PaxError::InvalidFormat(msg) => {
+                write!(f, "{}: {}", gettext("Invalid archive format"), msg)
+            }
+            PaxError::InvalidHeader(msg) => write!(f, "{}: {}", gettext("Invalid header"), msg),
+            PaxError::PathTooLong(path) => write!(f, "{}: {}", gettext("Path too long"), path),
+            PaxError::PatternError(msg) => write!(f, "{}: {}", gettext("Pattern error"), msg),
         }
     }
 }

@@ -550,7 +550,7 @@ fn write_special<W: ArchiveWriter>(
     } else if file_type.is_socket() {
         EntryType::Socket
     } else {
-        crate::error::report_error(path.display(), "unsupported file type");
+        crate::error::report_error(path.display(), gettextrs::gettext("unsupported file type"));
         return Ok(());
     };
 

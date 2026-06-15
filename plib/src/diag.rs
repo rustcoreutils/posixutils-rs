@@ -93,11 +93,12 @@ pub fn init(utility: &str) {
 
 /// One-shot initializer for the locale + gettext + diagnostic surface.
 ///
-/// Equivalent to calling, in this order:
+/// This is the canonical locale-init entry point. It calls, in order:
 ///
-/// - `setlocale(LC_ALL, "")`  (libc directly — gettextrs's wrapper has been
-///   observed to not propagate the new locale to libc's `<ctype.h>` /
-///   `<wctype.h>` functions on glibc, breaking [`crate::locale::isprint`])
+/// - `setlocale(LC_ALL, "")` — inherits the locale from the environment so that
+///   locale-sensitive libc functions (`<ctype.h>`/`<wctype.h>`, `strcoll`,
+///   `strftime`, `nl_langinfo`, …) observe `LC_*`. The gettextrs wrapper applies
+///   this directly to libc's global locale.
 /// - `textdomain("posixutils-rs")`
 /// - `bind_textdomain_codeset("posixutils-rs", "UTF-8")`
 /// - [`init`]`(utility)`
@@ -107,13 +108,8 @@ pub fn init(utility: &str) {
 /// that's expected on systems without translations and shouldn't abort the
 /// utility's startup).
 pub fn init_locale(utility: &str) {
-    use gettextrs::{bind_textdomain_codeset, textdomain};
-    // SAFETY: setlocale is thread-safe at process start; we pass a
-    // NUL-terminated empty string as the locale argument, telling libc
-    // to inherit from the environment.
-    unsafe {
-        libc::setlocale(libc::LC_ALL, c"".as_ptr());
-    }
+    use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+    setlocale(LocaleCategory::LcAll, "");
     let _ = textdomain("posixutils-rs");
     let _ = bind_textdomain_codeset("posixutils-rs", "UTF-8");
     init(utility);

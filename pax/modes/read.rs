@@ -48,6 +48,9 @@ pub struct ReadOptions {
     pub substitutions: Vec<Substitution>,
     /// Select only first archive member matching each pattern (-n)
     pub first_match: bool,
+    /// Process file-creation mask, applied to the mode of extracted files when
+    /// the mode is not explicitly preserved (no `-p p`/`-p e`).
+    pub umask: u32,
 }
 
 impl Default for ReadOptions {
@@ -65,6 +68,7 @@ impl Default for ReadOptions {
             update: false,
             substitutions: Vec::new(),
             first_match: false,
+            umask: 0,
         }
     }
 }
@@ -597,10 +601,6 @@ fn copy_file_data<R: ArchiveReader>(archive: &mut R, file: &mut File, size: u64)
 
 /// Set file permissions
 fn set_permissions(path: &Path, entry: &ArchiveEntry, options: &ReadOptions) -> PaxResult<()> {
-    if !options.preserve_perms {
-        return Ok(());
-    }
-
     #[cfg(unix)]
     {
         let mut mode = entry.mode;
@@ -611,6 +611,14 @@ fn set_permissions(path: &Path, entry: &ArchiveEntry, options: &ReadOptions) -> 
             #[allow(clippy::unnecessary_cast)]
             let setid_mask = !((libc::S_ISUID | libc::S_ISGID) as u32);
             mode &= setid_mask;
+        }
+
+        // When the mode is not explicitly preserved (no `-p p`/`-p e`), the file
+        // is created as part of the "normal file creation action": the archived
+        // mode is modified by the process file-creation mask (umask), exactly as
+        // open()/mkdir() would do. With `-p p`/`-p e` the exact mode is restored.
+        if !options.preserve_perms {
+            mode &= !options.umask;
         }
 
         let perms = Permissions::from_mode(mode);
@@ -746,4 +754,52 @@ fn set_times(path: &Path, entry: &ArchiveEntry, options: &ReadOptions) -> PaxRes
     }
 
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use tempfile::TempDir;
+
+    /// Without explicit `-p p`/`-p e` the extracted mode is the archived mode
+    /// masked by the umask (normal file-creation action); with preservation the
+    /// exact archived mode is restored.
+    #[test]
+    fn test_set_permissions_umask_vs_preserve() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("member");
+        std::fs::File::create(&path).unwrap();
+
+        let entry = ArchiveEntry {
+            path: path.clone(),
+            mode: 0o777,
+            entry_type: EntryType::Regular,
+            ..Default::default()
+        };
+
+        // Not preserved: 0o777 & ~0o022 == 0o755.
+        let opts = ReadOptions {
+            preserve_perms: false,
+            umask: 0o022,
+            ..Default::default()
+        };
+        set_permissions(&path, &entry, &opts).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+
+        // Preserved: exact 0o777 regardless of umask.
+        let opts = ReadOptions {
+            preserve_perms: true,
+            umask: 0o022,
+            ..Default::default()
+        };
+        set_permissions(&path, &entry, &opts).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o777
+        );
+    }
 }

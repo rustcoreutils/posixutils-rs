@@ -113,7 +113,7 @@ read/list. There are **no crashes/hangs**.
   correct — only the value is truncated.) Fix: set
   `entry.mtime_nsec`/`atime`/`atime_nsec` from the `*_nsec()` stat accessors.
 
-- [ ] **#6 — Default (no `-p`) extraction ignores umask; restores the archived mode verbatim.**
+- [x] **#6 — Default (no `-p`) extraction ignores umask; restores the archived mode verbatim.** *(Fixed, Phase 4.)*
   `main.rs:633` `parse_privs` always returns `preserve_perms=true`, so
   `read.rs:585` always `chmod`s to the archived mode. Spec 110292-110297:
   attributes not preserved "shall be determined as part of the normal file
@@ -183,12 +183,12 @@ read/list. There are **no crashes/hangs**.
 
 ### Minor
 
-- [ ] **#15 — ustar read strips trailing whitespace from `name`/`prefix`/`linkname`.**
+- [x] **#15 — ustar read strips trailing whitespace from `name`/`prefix`/`linkname`.** *(Fixed, Phase 4.)*
   `formats/ustar.rs:273-278` `parse_string` does `.trim_end()`, correct for the
   space-padded numeric/owner fields but wrong for NUL-terminated path fields. A
   file named `"name "` lists/extracts as `"name"`. Fix: NUL-only termination for
   path fields.
-- [ ] **#16 — Copy mode cannot copy FIFOs / devices / sockets.** `copy.rs:261-263,502-504`
+- [x] **#16 — Copy mode cannot copy FIFOs / devices / sockets.** *(Fixed, Phase 4: FIFOs + devices recreated; sockets remain unsupported.)* `copy.rs:261-263,502-504`
   falls through to "unsupported file type". Spec 110019-110021: copy is
   as-if-write-then-extract, and write *does* archive FIFOs. Fix: `mknod`/`mkfifo`
   in copy mode.
@@ -218,7 +218,7 @@ read/list. There are **no crashes/hangs**.
   `read.rs:617-733` prints EPERM warnings but does not propagate to the exit
   status. Spec 110301-110303: preserve failure "shall affect the final exit
   status." (Subsumed by #1's error accumulator.)
-- [ ] **#23 — `read_file_list` trims and drops blank lines.** `write.rs:622-628` /
+- [x] **#23 — `read_file_list` trims and drops blank lines.** *(Fixed, Phase 4.)* `write.rs:622-628` /
   `copy.rs:674-681` `line.trim()` mangles stdin pathnames with leading/trailing
   blanks. Spec STDIN 110434-110435: only the `<newline>` is the terminator.
 - [ ] **#24 — Hardcoded-English diagnostics; `LC_MESSAGES` inert; `-v` time is `TZ`/`LC_TIME`-unaware.**

@@ -224,8 +224,8 @@ fn is_zero_block(block: &[u8]) -> bool {
 
 /// Parse a header block into an ArchiveEntry
 fn parse_header(header: &[u8; BLOCK_SIZE]) -> PaxResult<ArchiveEntry> {
-    let name = parse_string(&header[NAME_OFF..NAME_OFF + NAME_LEN]);
-    let prefix = parse_string(&header[PREFIX_OFF..PREFIX_OFF + PREFIX_LEN]);
+    let name = parse_path_field(&header[NAME_OFF..NAME_OFF + NAME_LEN]);
+    let prefix = parse_path_field(&header[PREFIX_OFF..PREFIX_OFF + PREFIX_LEN]);
 
     let path = build_path(&prefix, &name);
 
@@ -238,7 +238,7 @@ fn parse_header(header: &[u8; BLOCK_SIZE]) -> PaxResult<ArchiveEntry> {
     let typeflag = header[TYPEFLAG_OFF];
     let entry_type = parse_typeflag(typeflag)?;
 
-    let linkname = parse_string(&header[LINKNAME_OFF..LINKNAME_OFF + LINKNAME_LEN]);
+    let linkname = parse_path_field(&header[LINKNAME_OFF..LINKNAME_OFF + LINKNAME_LEN]);
     let link_target = if !linkname.is_empty() {
         Some(PathBuf::from(linkname))
     } else {
@@ -269,12 +269,25 @@ fn parse_header(header: &[u8; BLOCK_SIZE]) -> PaxResult<ArchiveEntry> {
     })
 }
 
-/// Parse a NUL-terminated or space-padded string
+/// Parse a NUL-terminated or space-padded string field.
+///
+/// Used for the space-padded fields (uname, gname) and as the basis for the
+/// numeric fields, so trailing whitespace is stripped.
 fn parse_string(bytes: &[u8]) -> String {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     String::from_utf8_lossy(&bytes[..end])
         .trim_end()
         .to_string()
+}
+
+/// Parse a path field (name, prefix, linkname).
+///
+/// These are NUL-terminated and a trailing <space> is a legitimate pathname
+/// character, so only the NUL terminator delimits the value — unlike the
+/// space-padded fields, no whitespace is trimmed.
+fn parse_path_field(bytes: &[u8]) -> String {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).to_string()
 }
 
 /// Parse an octal number from bytes

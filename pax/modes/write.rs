@@ -625,7 +625,9 @@ pub fn read_file_list<R: Read>(reader: R) -> PaxResult<Vec<PathBuf>> {
 
     for line in reader.lines() {
         let line = line?;
-        let line = line.trim();
+        // `lines()` already strips the trailing newline. Keep the rest verbatim
+        // so pathnames with leading/trailing spaces survive; skip only a wholly
+        // empty line (e.g. a trailing blank line).
         if !line.is_empty() {
             files.push(PathBuf::from(line));
         }

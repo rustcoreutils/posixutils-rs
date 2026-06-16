@@ -1537,6 +1537,83 @@ mod audit_regressions {
         expect_exit_code("trap ':' EXIT; exit 5\n", 5);
     }
 
+    // ----- Phase 4: control flow & word expansion -----
+
+    #[test]
+    fn return_with_no_operand_uses_dollar_question() {
+        // #10
+        run_successfully_and("f() { false; return; }; f; echo $?\n", |out| {
+            assert_eq!(out, "1\n");
+        });
+        run_successfully_and("f() { return 4; }; f; echo $?\n", |out| {
+            assert_eq!(out, "4\n");
+        });
+    }
+
+    #[test]
+    fn break_does_not_escape_a_function() {
+        // #11: a break inside a function must not break a loop in the caller.
+        run_successfully_and(
+            "for x in 1 2; do f() { break; }; f; echo in$x; done; echo done\n",
+            |out| assert_eq!(out, "in1\nin2\ndone\n"),
+        );
+        // break still works inside nested loops
+        run_successfully_and(
+            "for x in 1 2; do for y in a b; do echo $x$y; break 2; done; done\n",
+            |out| assert_eq!(out, "1a\n"),
+        );
+    }
+
+    #[test]
+    fn arithmetic_unary_operators_chain() {
+        // #26
+        test_script("echo $((!!0))\n", "0\n");
+        test_script("echo $((!!5))\n", "1\n");
+        test_script("echo $((- -1))\n", "1\n");
+        test_script("echo $((~~5))\n", "5\n");
+    }
+
+    #[test]
+    fn arithmetic_comma_operator() {
+        // #40
+        test_script("echo $((1,2,3))\n", "3\n");
+        test_script("echo $((a=1, b=2, a+b))\n", "3\n");
+        test_script("echo $((1+(2,3)))\n", "4\n");
+    }
+
+    #[test]
+    fn assign_default_does_not_reassign_set_variable() {
+        // #9: ${x:=word} must not expand/assign word when x is already set.
+        run_successfully_and("x=set; v=${x:=new}; echo \"$x:$v\"\n", |out| {
+            assert_eq!(out, "set:set\n");
+        });
+        // but it does assign when unset
+        run_successfully_and("unset x; v=${x:=new}; echo \"$x:$v\"\n", |out| {
+            assert_eq!(out, "new:new\n");
+        });
+    }
+
+    #[test]
+    fn parameter_expansion_word_may_contain_blanks() {
+        // #59
+        test_script("echo ${x:-a b c}\n", "a b c\n");
+        run_successfully_and("x=; echo ${x:=d e}; echo \"$x\"\n", |out| {
+            assert_eq!(out, "d e\nd e\n");
+        });
+    }
+
+    #[test]
+    fn string_length_counts_characters() {
+        // #39 (ASCII path; multibyte verified behaviorally under a UTF-8 locale)
+        test_script("x=hello; echo ${#x}\n", "5\n");
+    }
+
+    #[test]
+    fn tilde_with_unset_home_is_literal() {
+        // #30
+        test_script("unset HOME; echo ~\n", "~\n");
+    }
+
     #[test]
     fn bracket_literal_members_match() {
         // #8: literal members inside `[...]` (incl. '.', '*', '^', ']') match

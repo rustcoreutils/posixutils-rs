@@ -44,9 +44,12 @@ fn expand_home(
     user_home: &dyn UsersHomeDirs,
 ) -> Result<String, String> {
     if login_name.is_empty() {
-        env.get_str_value("HOME")
+        // POSIX leaves `~` with HOME unset unspecified; like dash, leave the
+        // tilde literal rather than failing the whole expansion.
+        Ok(env
+            .get_str_value("HOME")
             .map(|s| s.to_string())
-            .ok_or("sh: failed to expand ~, variable HOME is unset".to_string())
+            .unwrap_or_else(|| "~".to_string()))
     } else {
         if !login_name.chars().all(is_portable_filename_character) {
             return Err(format!("sh: invalid user '{login_name}'"));

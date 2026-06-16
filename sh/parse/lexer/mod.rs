@@ -97,7 +97,10 @@ trait Lexer {
     }
 
     fn skip_parameter_expansion(&mut self) -> ParseResult<()> {
-        self.skip_word_token(Some('}'), false)?;
+        // The word in `${param:-word}` / `:?` / `:=` / `:+` (and pattern in
+        // `${param#pat}` etc.) may contain blanks and operators up to the
+        // matching '}', so they must not terminate the token here.
+        self.skip_word_token(Some('}'), true)?;
         if self.lookahead() != '}' {
             return Err(ParserError::new(
                 self.line_no(),

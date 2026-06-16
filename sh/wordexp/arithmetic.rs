@@ -41,6 +41,7 @@ enum BinaryOperator {
     BitwiseOr,
     LogicalAnd,
     LogicalOr,
+    Comma,
 }
 
 enum Expr<'src> {
@@ -140,6 +141,7 @@ enum ExprToken<'src> {
     OrAssign,
     LParen,
     RParen,
+    Comma,
 
     Eof,
 }
@@ -184,6 +186,7 @@ impl Display for ExprToken<'_> {
             ExprToken::OrAssign => write!(f, "|="),
             ExprToken::LParen => write!(f, "("),
             ExprToken::RParen => write!(f, ")"),
+            ExprToken::Comma => write!(f, ","),
             ExprToken::Eof => write!(f, "<EOF>"),
         }
     }
@@ -395,6 +398,7 @@ impl<'src> ExpressionParser<'src> {
             Some(':') => Ok(ExprToken::Colon),
             Some('(') => Ok(ExprToken::LParen),
             Some(')') => Ok(ExprToken::RParen),
+            Some(',') => Ok(ExprToken::Comma),
             Some(c) if c.is_ascii_digit() => {
                 if c == '0' {
                     if self.peek() == Some('x') {
@@ -447,7 +451,7 @@ impl<'src> ExpressionParser<'src> {
             ExprToken::Variable(var) => Ok(Expr::Variable(var)),
             ExprToken::Number(num) => Ok(Expr::Number(num)),
             ExprToken::LParen => {
-                let expr = self.parse_expr()?;
+                let expr = self.parse_comma()?;
                 self.match_token(ExprToken::RParen)?;
                 Ok(expr)
             }
@@ -458,7 +462,8 @@ impl<'src> ExpressionParser<'src> {
     fn parse_unary(&mut self) -> ExprParseResult<Expr<'src>> {
         if let Some(op) = self.matches_alternatives(UNARY_OPERATORS) {
             self.advance_token()?;
-            let operand = self.parse_literal()?;
+            // recurse into parse_unary so unary operators can chain (!!x, - -1, ~~x)
+            let operand = self.parse_unary()?;
             Ok(Expr::UnaryOp {
                 operator: op.into(),
                 operand: operand.into(),
@@ -515,6 +520,23 @@ impl<'src> ExpressionParser<'src> {
         }
         Ok(expr)
     }
+
+    /// The comma operator: evaluate each sub-expression left-to-right, with the
+    /// value of the whole expression being that of the rightmost. Lowest
+    /// precedence; only valid at the top level or inside parentheses.
+    fn parse_comma(&mut self) -> ExprParseResult<Expr<'src>> {
+        let mut expr = self.parse_expr()?;
+        while self.matches(ExprToken::Comma) {
+            self.advance_token()?;
+            let rhs = self.parse_expr()?;
+            expr = Expr::BinaryOp {
+                operator: BinaryOperator::Comma,
+                lhs: expr.into(),
+                rhs: rhs.into(),
+            };
+        }
+        Ok(expr)
+    }
 }
 
 fn parse_expression(expr: &str) -> Result<Expr<'_>, String> {
@@ -525,7 +547,7 @@ fn parse_expression(expr: &str) -> Result<Expr<'_>, String> {
         lookahead: ExprToken::Eof,
     };
     parser.advance_token()?;
-    parser.parse_expr()
+    parser.parse_comma()
 }
 
 fn binary_operation(
@@ -567,7 +589,9 @@ fn binary_operation(
         BinaryOperator::BitwiseAnd => lhs_value & rhs_value,
         BinaryOperator::BitwiseXor => lhs_value ^ rhs_value,
         BinaryOperator::BitwiseOr => lhs_value | rhs_value,
-        BinaryOperator::LogicalAnd | BinaryOperator::LogicalOr => unreachable!(),
+        BinaryOperator::LogicalAnd | BinaryOperator::LogicalOr | BinaryOperator::Comma => {
+            unreachable!()
+        }
     };
     Ok(value)
 }
@@ -637,6 +661,8 @@ fn interpret_expression(expr: &Expr, shell: &mut Shell, depth: u32) -> Expansion
                         Ok(1)
                     }
                 }
+                // comma: lhs already evaluated for its side effects; value is rhs.
+                BinaryOperator::Comma => return interpret_expression(rhs, shell, depth),
                 _ => {}
             }
             let rhs_value = interpret_expression(rhs, shell, depth)?;

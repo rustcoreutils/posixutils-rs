@@ -398,6 +398,9 @@ impl Shell {
         let mut args = expanded_words[1..].to_vec();
         std::mem::swap(&mut args, &mut self.positional_parameters);
 
+        // A `break`/`continue` inside the function body must not escape into a
+        // loop in the caller (POSIX), so the loop nesting starts fresh here.
+        let saved_loop_depth = std::mem::take(&mut self.loop_depth);
         self.function_call_depth += 1;
         let result = self.interpret_compound_command(
             function_body,
@@ -409,6 +412,7 @@ impl Shell {
             self.control_flow_state = ControlFlowState::None;
         }
         self.function_call_depth -= 1;
+        self.loop_depth = saved_loop_depth;
         std::mem::swap(&mut args, &mut self.positional_parameters);
         std::mem::swap(&mut self.opened_files, &mut previous_opened_files);
         self.environment.pop_scope();

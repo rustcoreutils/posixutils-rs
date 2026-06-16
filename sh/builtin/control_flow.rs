@@ -18,14 +18,15 @@ fn loop_control_flow(
     name: &str,
     state: fn(u32) -> ControlFlowState,
 ) -> BuiltinResult {
-    if shell.loop_depth == 0 {
-        return Err(format!(
-            "{name}: '{name}' can only be used inside 'for', 'while' and 'until' loops"
-        )
-        .into());
-    }
-
     let args = skip_option_terminator(args);
+
+    if shell.loop_depth == 0 {
+        // POSIX leaves `break`/`continue` with no enclosing loop unspecified.
+        // Like dash/bash, treat it as a no-op that succeeds rather than a fatal
+        // error (which, for a special built-in, would abort a non-interactive
+        // shell). The function/dot boundary already isolates loop nesting.
+        return Ok(0);
+    }
 
     if args.len() > 1 {
         return Err(format!("{name}: too many arguments").into());
@@ -60,7 +61,7 @@ pub struct Continue;
 
 impl SpecialBuiltinUtility for Continue {
     fn exec(&self, args: &[String], shell: &mut Shell, _: &mut OpenedFiles) -> BuiltinResult {
-        loop_control_flow(args, shell, "break", ControlFlowState::Continue)
+        loop_control_flow(args, shell, "continue", ControlFlowState::Continue)
     }
 }
 
@@ -82,7 +83,8 @@ impl SpecialBuiltinUtility for Return {
                 }
             }
         } else {
-            0
+            // POSIX: with no operand, return the current value of `$?`.
+            shell.last_pipeline_exit_status
         };
         shell.control_flow_state = ControlFlowState::Return;
         Ok(n)

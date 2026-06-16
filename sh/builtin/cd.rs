@@ -64,6 +64,40 @@ fn io_err_to_string<Err: Display>(err: Err) -> String {
     format!("cd: io error ({err})\n")
 }
 
+/// Resolves `.` and `..` components purely lexically (without touching the
+/// filesystem), as required by `cd -L` (POSIX step 8).
+fn lexical_normalize(path: &[u8]) -> Vec<u8> {
+    let is_absolute = path.first() == Some(&b'/');
+    let mut stack: Vec<&[u8]> = Vec::new();
+    for component in path.split(|&b| b == b'/') {
+        match component {
+            b"" | b"." => {}
+            b".." => match stack.last() {
+                Some(&last) if last != b".." => {
+                    stack.pop();
+                }
+                None if is_absolute => {} // ".." at root stays at root
+                _ => stack.push(component),
+            },
+            other => stack.push(other),
+        }
+    }
+    let mut result = Vec::new();
+    if is_absolute {
+        result.push(b'/');
+    }
+    for (i, comp) in stack.iter().enumerate() {
+        if i > 0 {
+            result.push(b'/');
+        }
+        result.extend_from_slice(comp);
+    }
+    if result.is_empty() {
+        result.push(b'.');
+    }
+    result
+}
+
 pub struct Cd;
 
 impl BuiltinUtility for Cd {
@@ -94,22 +128,29 @@ impl BuiltinUtility for Cd {
                     // and doesn't change directory
                     return Ok(0);
                 };
+                // POSIX: an empty operand is an error.
+                if dir.is_empty() {
+                    return Err("cd: empty directory operand\n".into());
+                }
                 let mut curr_path = OsString::new();
+                let mut used_cdpath = false;
 
                 if !dir.starts_with('/') {
-                    if !dir.starts_with('.') && !dir.starts_with("..") {
+                    if !dir.starts_with("./")
+                        && !dir.starts_with("../")
+                        && dir != "."
+                        && dir != ".."
+                    {
                         if let Some(cdpath) = shell.environment.get_str_value("CDPATH") {
                             for component in cdpath.split(':') {
                                 let mut path = PathBuf::from(component);
                                 path.push(dir);
                                 if path.exists() {
+                                    // a non-empty/non-"." CDPATH entry is reported
+                                    used_cdpath = !component.is_empty() && component != ".";
                                     curr_path = path.into_os_string();
+                                    break; // first match wins
                                 }
-                            }
-                        } else {
-                            let path = PathBuf::from(dir);
-                            if path.exists() {
-                                curr_path = path.into_os_string();
                             }
                         }
                     }
@@ -134,14 +175,15 @@ impl BuiltinUtility for Cd {
                         new_curr_path.extend(curr_path.as_bytes());
                         curr_path = OsString::from_vec(new_curr_path)
                     }
-                    curr_path = PathBuf::from(curr_path)
-                        .canonicalize()
-                        .map_err(io_err_to_string)?
-                        .into_os_string();
+                    // -L: resolve `..` lexically, do NOT follow symbolic links.
+                    curr_path = OsString::from_vec(lexical_normalize(curr_path.as_bytes()));
                 }
 
                 let old_working_dir = std::env::current_dir().map_err(io_err_to_string)?;
                 chdir(AsRef::<OsStr>::as_ref(&curr_path)).map_err(io_err_to_string)?;
+                if used_cdpath {
+                    opened_files.write_out(format!("{}\n", curr_path.to_string_lossy()));
+                }
                 shell.current_directory = curr_path.clone();
 
                 shell.assign_global("PWD".to_string(), curr_path.to_string_lossy().into_owned())?;

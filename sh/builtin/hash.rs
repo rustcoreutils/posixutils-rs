@@ -46,7 +46,7 @@ impl BuiltinUtility for Hash {
                     && get_builtin_utility(arg.as_str()).is_none()
                     && shell.find_command(arg, "", true).is_none()
                 {
-                    opened_files.write_out(format!("hash: command {} was not found\n", arg));
+                    opened_files.write_err(format!("hash: command {} was not found\n", arg));
                     status = 1;
                 }
             }

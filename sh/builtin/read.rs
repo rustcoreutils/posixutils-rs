@@ -60,26 +60,27 @@ fn read_until_from_non_blocking_fd(
     let mut escape_next = false;
     'outer: loop {
         while let Some(next) = read_byte_non_blocking(fd)? {
+            if escape_next {
+                escape_next = false;
+                if next == delimiter {
+                    // backslash-<delimiter>: line continuation.
+                    continue;
+                } else if next == b'\\' {
+                    buffer.push(b'\\');
+                } else {
+                    result.append(bytes_to_string(std::mem::take(&mut buffer))?, false, true);
+                    result.append(bytes_to_string(vec![next])?, true, true);
+                }
+                continue;
+            }
             if next == delimiter {
                 break 'outer;
             }
             if backslash_escape && next == b'\\' {
-                if escape_next {
-                    buffer.push(b'\\');
-                    escape_next = false;
-                } else {
-                    escape_next = true;
-                }
+                escape_next = true;
                 continue;
             }
-            if escape_next {
-                result.append(bytes_to_string(buffer)?, false, true);
-                result.append(bytes_to_string(vec![next])?, true, true);
-                buffer = Vec::new();
-                escape_next = false;
-            } else {
-                buffer.push(next);
-            }
+            buffer.push(next);
         }
         // might receive signals while reading
         shell.handle_async_events();
@@ -104,27 +105,29 @@ fn read_until_from_file(
     let mut escape_next = false;
     let mut reached_eof = true;
     while let Some(next) = read_byte(fd)? {
+        if escape_next {
+            escape_next = false;
+            if next == delimiter {
+                // backslash-<delimiter> is a line continuation: drop both and
+                // keep reading (the delimiter is usually <newline>).
+                continue;
+            } else if next == b'\\' {
+                buffer.push(b'\\');
+            } else {
+                result.append(bytes_to_string(std::mem::take(&mut buffer))?, false, true);
+                result.append(bytes_to_string(vec![next])?, true, true);
+            }
+            continue;
+        }
         if next == delimiter {
             reached_eof = false;
             break;
         }
         if backslash_escape && next == b'\\' {
-            if escape_next {
-                buffer.push(b'\\');
-                escape_next = false;
-            } else {
-                escape_next = true;
-            }
+            escape_next = true;
             continue;
         }
-        if escape_next {
-            result.append(bytes_to_string(buffer)?, false, true);
-            result.append(bytes_to_string(vec![next])?, true, true);
-            buffer = Vec::new();
-            escape_next = false;
-        } else {
-            buffer.push(next);
-        }
+        buffer.push(next);
     }
 
     if !buffer.is_empty() {

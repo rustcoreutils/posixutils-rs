@@ -248,6 +248,10 @@ impl Shell {
         name: String,
         value: String,
     ) -> Result<&mut Value, CannotModifyReadonly> {
+        // Changing PATH invalidates the remembered command locations (hash).
+        if name == "PATH" {
+            self.saved_command_locations.clear();
+        }
         // inspect does not work in this case
         #[allow(clippy::manual_inspect)]
         self.environment.set_global(name, value).map(|val| {

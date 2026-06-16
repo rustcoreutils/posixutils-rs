@@ -1746,6 +1746,55 @@ mod audit_regressions {
         });
     }
 
+    // ----- Phase 7: read / cd / umask / hash / redirection -----
+
+    #[test]
+    fn read_honors_backslash_newline_continuation() {
+        // #19
+        run_successfully_and(
+            "printf 'a\\\\\\nb\\n' | { read x; echo \"[$x]\"; }\n",
+            |out| assert_eq!(out, "[ab]\n"),
+        );
+    }
+
+    #[test]
+    fn umask_accepts_symbolic_input() {
+        // #18
+        run_successfully_and("umask 022; umask u=rwx,go=rx; umask\n", |out| {
+            assert_eq!(out, "0022\n");
+        });
+        run_successfully_and("umask 0; umask a-w; umask\n", |out| {
+            assert_eq!(out, "0222\n");
+        });
+    }
+
+    #[test]
+    fn cd_empty_operand_is_an_error() {
+        // #42: `cd ""` fails (non-zero) but, being a regular built-in, does not
+        // abort the script.
+        run_successfully_and("cd \"\" 2>/dev/null; echo rc=$?\n", |out| {
+            assert_eq!(out, "rc=1\n");
+        });
+    }
+
+    #[test]
+    fn large_io_number_is_accepted() {
+        // #43: fd numbers above the old 1023 cap are allowed.
+        run_successfully_and(": 100>/dev/null; echo ok\n", |out| {
+            assert_eq!(out, "ok\n");
+        });
+    }
+
+    #[test]
+    fn noclobber_blocks_overwrite() {
+        // #44
+        run_successfully_and(
+            "set -C; f=\"$TEST_WRITE_DIR/nc_test\"; rm -f \"$f\"; echo a > \"$f\"; \
+             echo b > \"$f\" 2>/dev/null; echo rc=$?; echo c >| \"$f\" && echo override; rm -f \"$f\"\n",
+            |out| assert_eq!(out, "rc=1\noverride\n"),
+        );
+    }
+
     #[test]
     fn bracket_literal_members_match() {
         // #8: literal members inside `[...]` (incl. '.', '*', '^', ']') match

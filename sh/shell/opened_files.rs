@@ -16,7 +16,6 @@ use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
 use std::rc::Rc;
 
 pub const STDIN_FILENO: u32 = libc::STDIN_FILENO as u32;
@@ -57,24 +56,51 @@ impl OpenedFiles {
             IORedirectionKind::RedirectOutput
             | IORedirectionKind::RedirectOutputClobber
             | IORedirectionKind::RedirectOuputAppend => {
-                if *kind != IORedirectionKind::RedirectOutputClobber
-                    && shell.set_options.noclobber
-                    && Path::new(target).exists()
-                {
-                    return Err(CommandExecutionError::RedirectionError(format!(
-                        "sh: redirection would overwrite existing file {target}",
-                    )));
-                }
-
                 let append = *kind == IORedirectionKind::RedirectOuputAppend;
-                let file = File::options()
-                    .mode(shell.umask)
-                    .write(true)
-                    .truncate(!append)
-                    .append(append)
-                    .create(true)
-                    .open(target)
-                    .map_err(io_err_to_redirection_err)?;
+                let noclobber_active = *kind != IORedirectionKind::RedirectOutputClobber
+                    && !append
+                    && shell.set_options.noclobber;
+
+                let file = if noclobber_active {
+                    // Atomically create the file with O_CREAT|O_EXCL so the
+                    // existence check and creation cannot race.
+                    match File::options()
+                        .mode(shell.umask)
+                        .write(true)
+                        .create_new(true)
+                        .open(target)
+                    {
+                        Ok(file) => file,
+                        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                            // noclobber only forbids overwriting an existing
+                            // regular file; FIFOs/devices may still be written.
+                            let is_regular = std::fs::metadata(target)
+                                .map(|m| m.is_file())
+                                .unwrap_or(true);
+                            if is_regular {
+                                return Err(CommandExecutionError::RedirectionError(format!(
+                                    "sh: redirection would overwrite existing file {target}",
+                                )));
+                            }
+                            File::options()
+                                .mode(shell.umask)
+                                .write(true)
+                                .create(true)
+                                .open(target)
+                                .map_err(io_err_to_redirection_err)?
+                        }
+                        Err(err) => return Err(io_err_to_redirection_err(err)),
+                    }
+                } else {
+                    File::options()
+                        .mode(shell.umask)
+                        .write(true)
+                        .truncate(!append)
+                        .append(append)
+                        .create(true)
+                        .open(target)
+                        .map_err(io_err_to_redirection_err)?
+                };
 
                 let source_fd = file_descriptor.unwrap_or(STDOUT_FILENO);
                 self.opened_files

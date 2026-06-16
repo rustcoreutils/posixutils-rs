@@ -21,6 +21,64 @@ fn format_mode(mode: u32) -> String {
     format!("u={},g={},o={}\n", user, group, others)
 }
 
+/// Applies a chmod-style symbolic mode (e.g. `u=rwx,go=rx`, `a-w`) to the
+/// current *allowed-permission* bits (`shell.umask` stores the complement of
+/// the mask, so the symbolic operations apply to it directly).
+fn apply_symbolic(current: u32, spec: &str) -> Result<u32, String> {
+    let invalid = || format!("umask: invalid mask '{spec}'");
+    let mut mode = current;
+    for clause in spec.split(',') {
+        let bytes = clause.as_bytes();
+        let mut i = 0;
+        let mut who_mask = 0u32;
+        while i < bytes.len() && matches!(bytes[i], b'u' | b'g' | b'o' | b'a') {
+            match bytes[i] {
+                b'u' => who_mask |= 0o700,
+                b'g' => who_mask |= 0o070,
+                b'o' => who_mask |= 0o007,
+                b'a' => who_mask |= 0o777,
+                _ => unreachable!(),
+            }
+            i += 1;
+        }
+        if who_mask == 0 {
+            who_mask = 0o777; // an omitted "who" means all
+        }
+        let op = *bytes.get(i).ok_or_else(invalid)?;
+        if !matches!(op, b'+' | b'-' | b'=') {
+            return Err(invalid());
+        }
+        i += 1;
+        let mut perm = 0u32;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'r' => perm |= 4,
+                b'w' => perm |= 2,
+                b'x' => perm |= 1,
+                _ => return Err(invalid()),
+            }
+            i += 1;
+        }
+        let mut perm_bits = 0u32;
+        if who_mask & 0o700 != 0 {
+            perm_bits |= perm << 6;
+        }
+        if who_mask & 0o070 != 0 {
+            perm_bits |= perm << 3;
+        }
+        if who_mask & 0o007 != 0 {
+            perm_bits |= perm;
+        }
+        match op {
+            b'=' => mode = (mode & !who_mask) | perm_bits,
+            b'+' => mode |= perm_bits,
+            b'-' => mode &= !perm_bits,
+            _ => unreachable!(),
+        }
+    }
+    Ok(mode)
+}
+
 pub struct Umask;
 
 impl BuiltinUtility for Umask {
@@ -54,18 +112,18 @@ impl BuiltinUtility for Umask {
                 opened_files.write_out(format!("{:04o}\n", !shell.umask & 0o777));
             }
         } else if option_parser.next_argument() == args.len() - 1 {
-            // TODO: support symbolic umask
-            let new_umask = &args[option_parser.next_argument()];
-            // Reject if umask contains a sign
-            if new_umask.starts_with('+') || new_umask.starts_with('-') {
-                return Err(format!("umask: invalid mask '{new_umask}'").into());
+            let mask_arg = &args[option_parser.next_argument()];
+            if mask_arg.starts_with(|c: char| c.is_ascii_digit()) {
+                let new_umask = u32::from_str_radix(mask_arg, 8)
+                    .map_err(|_| format!("umask: invalid mask '{mask_arg}'"))?;
+                if new_umask > 0o777 {
+                    return Err(format!("umask: invalid mask '{mask_arg}'").into());
+                }
+                shell.umask = !new_umask & 0o777;
+            } else {
+                // symbolic mode operates on the allowed-permission bits
+                shell.umask = apply_symbolic(shell.umask, mask_arg)?;
             }
-            let new_umask = u32::from_str_radix(new_umask, 8)
-                .map_err(|_| format!("umask: invalid mask '{new_umask}'"))?;
-            if new_umask > 0o777 {
-                return Err("umask: invalid mask".into());
-            }
-            shell.umask = !new_umask & 0o777;
         } else {
             return Err("umask: too many arguments".into());
         }

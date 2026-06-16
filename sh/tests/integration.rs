@@ -1840,6 +1840,18 @@ mod audit_regressions {
     }
 
     #[test]
+    fn pipeline_waits_for_all_commands() {
+        // A pipeline must wait for every command, not just the last one. The
+        // head writes a marker only after a delay; if the pipeline did not wait,
+        // the following `cat` would not see it.
+        run_successfully_and(
+            "f=\"$TEST_WRITE_DIR/pipe_wait\"; rm -f \"$f\"; \
+             { sleep 0.3; echo waited > \"$f\"; } | true; cat \"$f\"; rm -f \"$f\"\n",
+            |out| assert_eq!(out, "waited\n"),
+        );
+    }
+
+    #[test]
     fn glob_matches_symlinks() {
         // #24
         set_env_vars();

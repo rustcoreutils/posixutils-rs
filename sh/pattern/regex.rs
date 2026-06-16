@@ -136,6 +136,10 @@ fn push_bracket_expression(expr: &BracketExpression, string: &mut String) {
             BracketItem::Char(']') => has_close = true,
             BracketItem::Char('^') => has_caret = true,
             BracketItem::Char('-') => has_hyphen = true,
+            // A literal backslash is emitted doubled: it works under engines
+            // that treat '\' as literal inside a bracket AND under those that
+            // still treat it as an escape there.
+            BracketItem::Char('\\') => middle.push_str("\\\\"),
             BracketItem::Char(c) => middle.push(*c),
             BracketItem::CharacterClass(class) => {
                 middle.push_str("[:");

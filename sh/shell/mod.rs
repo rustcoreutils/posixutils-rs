@@ -842,15 +842,18 @@ impl Shell {
                     dup2(current_stdin, libc::STDIN_FILENO)?;
                     let return_status = self.interpret_command(pipeline.commands.last(), false);
                     close(current_stdin)?;
+                    // Wait for every command in the pipeline to finish (POSIX
+                    // requires it), reaping the head commands so they are not
+                    // left running as orphans (e.g. `sleep 5 | true`).
+                    let mut statuses: Vec<i32> = head_pids
+                        .into_iter()
+                        .map(|pid| self.wait_child_process(pid).unwrap_or(0))
+                        .collect();
+                    statuses.push(return_status);
                     // With `pipefail`, the pipeline status is that of the
                     // rightmost command that exited non-zero (else 0); otherwise
                     // it is the status of the last command only.
                     let exit_status = if self.set_options.pipefail {
-                        let mut statuses: Vec<i32> = head_pids
-                            .into_iter()
-                            .map(|pid| self.wait_child_process(pid).unwrap_or(0))
-                            .collect();
-                        statuses.push(return_status);
                         statuses
                             .iter()
                             .rev()

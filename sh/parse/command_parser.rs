@@ -197,8 +197,9 @@ impl<'src> CommandParser<'src> {
     fn parse_redirection_opt(&mut self) -> ParseResult<Option<Redirection>> {
         if let CommandToken::IoNumber(n) = self.lookahead {
             // POSIX places no fixed ceiling on the redirection fd number (the
-            // OS bounds real descriptors); only reject implausibly large values.
-            if n > 65535 {
+            // OS bounds real descriptors); only reject values that would not
+            // fit in a RawFd (i32), since the fd is later used as an i32.
+            if n > i32::MAX as u32 {
                 return Err(ParserError::new(
                     self.lookahead_lineno,
                     "invalid file descriptor",
@@ -1704,8 +1705,9 @@ mod tests {
 
     #[test]
     fn out_of_range_file_descriptor_is_error() {
+        // a value above i32::MAX cannot fit in a RawFd
         assert!(
-            parse_complete_command("70000> file.txt", AliasTable::default())
+            parse_complete_command("3000000000> file.txt", AliasTable::default())
                 .is_err_and(|err| !err.could_be_resolved_with_more_input)
         );
     }

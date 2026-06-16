@@ -14,15 +14,15 @@ The Receive-Mode command interpreter is broad and largely well-shaped: nearly al
 
 ### Critical
 
-- [ ] **#1 — `-E` option unimplemented; `mailx -E …` exits non-zero with "illegal option".** `args.rs:59-118` has no `'E'` arm, so `-E` falls through to `_ => Err("illegal option -- {}")`. `-E` (discard messages with an empty body) is one of only two options *required on all systems* (the other is `-s`), added by Austin Group Defect 1367 (spec 104270). No empty-body-discard logic exists in `send.rs` either. Fix: parse `-E`, and in `send_message`/`send_mode` drop the message (success, no delivery) when the body is empty.
+- [x] **#1 — `-E` option unimplemented; `mailx -E …` exits non-zero with "illegal option".** *(FIXED: `'E'` arm in `args.rs` → `Args.discard_empty`; `send_mode` drops an empty-body message before delivery.)* `args.rs:59-118` has no `'E'` arm, so `-E` falls through to `_ => Err("illegal option -- {}")`. `-E` (discard messages with an empty body) is one of only two options *required on all systems* (the other is `-s`), added by Austin Group Defect 1367 (spec 104270). No empty-body-discard logic exists in `send.rs` either. Fix: parse `-E`, and in `send_message`/`send_mode` drop the message (success, no delivery) when the body is empty.
 - [ ] **#2 — No asynchronous-event / signal handling at all.** `grep -nE 'SIGINT|SIGCONT|signal_hook|libc::signal' *.rs` → zero matches. The whole ASYNCHRONOUS EVENTS section (spec 104388-104411) is unimplemented: in command mode `SIGINT` should abort the current command and re-prompt; in input mode it should (per `ignore`) print `@` and drop the line, or require a second interrupt to abort and write the partial message to `DEAD`. Rust default-terminates on `SIGINT`, so mailx just dies. The `-i`/`ignore` branch in `send.rs:176-193` keys off `io::ErrorKind::Interrupted` from `read_line`, which never occurs for a delivered signal — so `-i`/`ignore` is inert and the two-interrupt-to-abort flow is dead code. Fix: install a `SIGINT` handler (signal-hook) with command-mode vs input-mode state; honor `ignore`, `save`/`DEAD`.
 - [ ] **#3 — Header-summary display panics on multibyte text.** `message.rs:226` (`&s[..max_len - 3]`) and `mailbox.rs:395` (`&s[..max_len.saturating_sub(3)]`) slice a `String` at a byte offset; a `From:`/`Subject:` value whose UTF-8 boundary does not fall on byte 15/22 panics (`byte index N is not a char boundary`) while printing headers — i.e. an incoming message can crash mailx at startup. LC_CTYPE governs multibyte interpretation (spec 104333). Fix: truncate on `char_indices()` (or grapheme/`floor_char_boundary`).
 
 ### Major
 
 - [ ] **#4 — `sh -c` invocations omit the mandated `--` argument (Austin Group Defect 1528).** Spec requires three arguments `"-c"`, `"--"`, *command* for `pipe` (104870), `!` (105021), `~!` (105043), `~|` (105099) and `~r !command` (105087). All sites pass only `-c` + command: `commands.rs:833` (pipe), `commands.rs:1146` (`!`), `escapes.rs:334` (`~!`/`~: !`), `escapes.rs:680` (`~|`), `escapes.rs:371` (`~r !`). A command beginning with `-` is then mis-parsed by the shell. Fix: insert `.arg("--")` before the command at each site.
-- [ ] **#5 — `-f file` operand mis-parsed into Send Mode.** `args.rs:64-73` only captures the file when it is the last char of the `-f` cluster *and* the next token does not start with `-`; otherwise the file token hits the `else` at `args.rs:121-124` and is pushed onto `addresses`, and `args.rs:134-135` then selects `Mode::Send`. So `mailx -f -N file` and the RATIONALE's explicitly-required `mailx -fin mymail.box` (spec 105205-105206) send mail to "file"/"mymail.box" instead of reading it. Fix: treat `file` as a normal trailing operand (per XBD 12.2; `file` is an operand, not an option-argument), consumed in Receive Mode when `-f` is set.
-- [ ] **#6 — `-n` also suppresses the user `MAILRC` start-up file.** Spec Start-Up steps 4–5 (104553-104555) attach "unless the −n option is given" only to the *system* start-up file; the user file named by `MAILRC` is *always* processed. `main.rs:53/78/105` gate the entire `load_startup_files` (both system and user) on `!args.no_init`, so `mailx -n` skips `~/.mailrc` too. Fix: split the two; `-n` skips only the system file.
+- [x] **#5 — `-f file` operand mis-parsed into Send Mode.** *(FIXED: `file` is now a trailing operand consumed in Receive Mode; `-f` always selects Receive; `--` end-of-options terminator added.)* `args.rs:64-73` only captures the file when it is the last char of the `-f` cluster *and* the next token does not start with `-`; otherwise the file token hits the `else` at `args.rs:121-124` and is pushed onto `addresses`, and `args.rs:134-135` then selects `Mode::Send`. So `mailx -f -N file` and the RATIONALE's explicitly-required `mailx -fin mymail.box` (spec 105205-105206) send mail to "file"/"mymail.box" instead of reading it. Fix: treat `file` as a normal trailing operand (per XBD 12.2; `file` is an operand, not an option-argument), consumed in Receive Mode when `-f` is set.
+- [x] **#6 — `-n` also suppresses the user `MAILRC` start-up file.** *(FIXED: `load_startup_files` gates only the system file on `-n`; the user MAILRC is always processed.)* Spec Start-Up steps 4–5 (104553-104555) attach "unless the −n option is given" only to the *system* start-up file; the user file named by `MAILRC` is *always* processed. `main.rs:53/78/105` gate the entire `load_startup_files` (both system and user) on `!args.no_init`, so `mailx -n` skips `~/.mailrc` too. Fix: split the two; `-n` skips only the system file.
 - [ ] **#7 — No locale handling; diagnostics hardcoded English.** `grep -nE 'setlocale|gettext|LC_' *.rs` → zero. Spec lists `LANG`/`LC_ALL`/`LC_CTYPE`/`LC_MESSAGES`/`NLSPATH` (104328-104359) as affecting execution; `LC_MESSAGES` shall govern diagnostic and informative text. `setlocale(LC_ALL,"")` is never called and every `eprintln!`/`println!` string is literal English. Fix: `setlocale` near `main`, route diagnostics through `gettext` per project convention.
 - [ ] **#8 — `new` message state never produced; `N` shown as `U`, `:n` selector dead.** `mailbox.rs:69` sets every loaded message to `MessageState::Unread` (`// Assume unread for now`); only a `Status:` header containing `R`/`O` promotes to `Read` (`mailbox.rs:100-102`). `MessageState::New` is therefore unreachable from a real mailbox, so genuinely new mail displays state char `U` instead of `N` (spec 104491-104496), and `:n` (`msglist.rs:192`) matches nothing. Fix: treat absence of `Status:`/`O` as `New`, presence of `O` (without `R`) as `Unread`.
 - [ ] **#9 — `~:` / `~_` command-level escape is a stub, and `~:set` does not set.** `escapes.rs:732-775` (`execute_input_mode_command`) handles only `set`, `echo`, `!`; it ignores `_msg`/`_mb`, and its `set` arm merely `println!`s each argument (`escapes.rs:755-759`) instead of mutating `vars`. Spec 105048-105049: "`~: mailx-command` … Perform the command-level request." Fix: dispatch through the real command interpreter (the command-mode subset that is valid here), and actually apply `set`.
@@ -49,23 +49,23 @@ The Receive-Mode command interpreter is broad and largely well-shaped: nearly al
 
 | Opt | Status | Notes |
 |---|---|---|
-| `-E` | **MISSING** | (#1) No `'E'` arm; errors as illegal option. Required on all systems. |
+| `-E` | CONFORMS | (#1 FIXED) `'E'` arm; empty-body messages discarded in `send_mode`. |
 | `-e` | CONFORMS | `args.rs:61-63`, `main.rs:64-71` writes nothing, exit 0 if mail else 1. |
-| `-f [file]` | **PARTIAL/DIVERGES** | (#5) Bare/non-adjacent `file` becomes an address → Send Mode. `-f` alone (read mbox) works. |
+| `-f [file]` | CONFORMS | (#5 FIXED) `file` is a trailing operand read in Receive Mode; `-f` always selects Receive. |
 | `-F` | PARTIAL | `args.rs:75-77`; `send.rs:311-315` records to first-recipient login. Overrides `record` (spec 104278) — OK. |
 | `-H` | CONFORMS | `args.rs:78-80`, `main.rs:73-98` header summary then exit. |
 | `-i` | DIVERGES | (#2) Sets `ignore` (`main.rs:224-226`) but no signal handler exists, so it does nothing. |
-| `-n` | **DIVERGES** | (#6) Skips user `MAILRC` too. |
+| `-n` | CONFORMS | (#6 FIXED) Skips only the system start-up file; user `MAILRC` always read. |
 | `-N` | CONFORMS | `args.rs:87-89`; suppresses initial summary (`main.rs:137`). |
 | `-s subject` | CONFORMS | `args.rs:90-102`; `send.rs:112-113`. All chars preserved. |
 | `-u user` | PARTIAL | (#21) Hardcodes `/var/mail/user`; no privilege check. |
-| `--` end-of-options | MISSING | `args.rs:56` treats any `-`-prefixed token as options; no `--` terminator (XBD 12.2). |
+| `--` end-of-options | CONFORMS | (#5 FIXED) `--` terminator stops option parsing (XBD 12.2). |
 | `+`-prefix exception | N/A | Spec does not invoke the XBD 12.2 `+` exception for mailx. |
 
 ### Operands / STDIN / INPUT FILES
 
 - [x] `address...` operands → Send Mode recipients — `args.rs:121-124`, `send.rs:99-109`.
-- [ ] **`file` operand** routed correctly only when glued to `-f` (#5).
+- [x] **`file` operand** read in Receive Mode as a trailing operand (#5 FIXED).
 - [x] Send Mode: stdin is the message body — `send.rs:157-233`.
 - [x] Receive Mode: commands read from stdin — `main.rs:144-188`.
 - [x] Non-interactive send reads stdin literally (no tilde processing) — `send.rs:226-233` (spec leaves `~` "unspecified" off-terminal).
@@ -196,12 +196,12 @@ The Receive-Mode command interpreter is broad and largely well-shaped: nearly al
 
 141 tests exercise CLI options, receive-mode commands, msglist parsing, and variables. Not covered (mostly because unimplemented):
 
-- [ ] `-E` empty-body discard (#1) — no test.
+- [x] `-E` empty-body discard (#1) — `opt_e_uppercase_discards_empty_body`, `opt_e_uppercase_keeps_nonempty_body`.
 - [ ] Signal / interrupt behavior (#2) — `cli/mod.rs` notes "-i … limited testing"; no SIGINT test.
 - [ ] Multibyte header/subject truncation panic (#3).
 - [ ] `sh -c` receiving the `--` argument (#4).
-- [ ] `-f -N file` / `mailx -fin file` operand parsing (#5).
-- [ ] `mailx -n` still reading `~/.mailrc` (#6).
+- [x] `-f -N file` / `mailx -fin file` operand parsing (#5) — `opt_f_operand_after_other_options`, `opt_f_clustered_fin_operand`.
+- [x] `mailx -n` still reading `~/.mailrc` (#6) — `opt_n_still_reads_user_mailrc`.
 - [ ] `LC_*`/`setlocale` effect on diagnostics (#7).
 - [ ] `new` vs `unread` state characters / `:n` selector (#8).
 - [ ] `~:set` actually setting a variable (#9); `~w` append (#10); reply-all `Reply-To` (#11); `escape=` disabling escapes (#12).

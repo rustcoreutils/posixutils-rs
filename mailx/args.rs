@@ -29,6 +29,8 @@ pub struct Args {
     pub ignore_interrupts: bool,
     pub no_init: bool,
     pub user: Option<String>,
+    /// -E: discard messages with an empty body (do not send)
+    pub discard_empty: bool,
 }
 
 impl Args {
@@ -44,16 +46,25 @@ impl Args {
             ignore_interrupts: false,
             no_init: false,
             user: None,
+            discard_empty: false,
         };
 
         let mut i = 0;
         let mut check_mail = false;
         let mut headers_only = false;
+        let mut end_of_opts = false;
 
         while i < args.len() {
             let arg = &args[i];
 
-            if arg.starts_with('-') && arg.len() > 1 {
+            if arg == "--" && !end_of_opts {
+                // Explicit end-of-options terminator (XBD 12.2).
+                end_of_opts = true;
+                i += 1;
+                continue;
+            }
+
+            if !end_of_opts && arg.starts_with('-') && arg.len() > 1 {
                 let mut chars = arg[1..].chars().peekable();
 
                 while let Some(c) = chars.next() {
@@ -61,16 +72,14 @@ impl Args {
                         'e' => {
                             check_mail = true;
                         }
+                        'E' => {
+                            result.discard_empty = true;
+                        }
                         'f' => {
+                            // `file` is an operand (XBD 12.2), not an
+                            // option-argument: consumed as a trailing operand
+                            // in Receive Mode below, not glued to -f here.
                             result.read_mbox = true;
-                            // Check if next argument is a file (not starting with -)
-                            if chars.peek().is_none() && i + 1 < args.len() {
-                                let next = &args[i + 1];
-                                if !next.starts_with('-') {
-                                    result.file = Some(next.clone());
-                                    i += 1;
-                                }
-                            }
                         }
                         'F' => {
                             result.record_to_recipient = true;
@@ -118,8 +127,12 @@ impl Args {
                         }
                     }
                 }
+            } else if result.read_mbox && result.file.is_none() {
+                // With -f, the first non-option operand is the mailbox file to
+                // read (Receive Mode), not a recipient address.
+                result.file = Some(arg.clone());
             } else {
-                // Non-option argument - must be an address
+                // Non-option argument - must be an address (Send Mode).
                 result.addresses.push(arg.clone());
             }
 
@@ -131,6 +144,9 @@ impl Args {
             result.mode = Mode::CheckMail;
         } else if headers_only {
             result.mode = Mode::HeadersOnly;
+        } else if result.read_mbox {
+            // -f always selects Receive Mode, reading the named (or default) box.
+            result.mode = Mode::Receive;
         } else if !result.addresses.is_empty() {
             result.mode = Mode::Send;
         } else {

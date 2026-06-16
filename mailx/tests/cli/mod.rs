@@ -864,3 +864,180 @@ fn subject_without_recipient() {
         },
     );
 }
+
+// =============================================================================
+// -E Option: Discard messages with an empty body (audit #1)
+// =============================================================================
+
+/// -E with an empty body must succeed without attempting delivery.
+#[test]
+fn opt_e_uppercase_discards_empty_body() {
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-E"),
+                String::from("-s"),
+                String::from("Empty"),
+                String::from("recipient@example.com"),
+            ],
+            // Empty body (whitespace only): must be discarded, not sent.
+            stdin_data: String::from("   \n\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // No delivery attempt: sendmail is never invoked, so no "sendmail"
+            // failure diagnostic appears even on a host without sendmail.
+            assert!(output.status.success(), "Empty -E message should succeed");
+            assert!(
+                !stderr.contains("sendmail"),
+                "-E empty body must not attempt delivery: {}",
+                stderr
+            );
+        },
+    );
+}
+
+/// -E with a non-empty body still composes/sends (verified via debug mode).
+#[test]
+fn opt_e_uppercase_keeps_nonempty_body() {
+    let mailrc = create_temp_mailrc("set debug\n");
+    let mailrc_path = mailrc.path().to_str().unwrap();
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-E"),
+                String::from("-s"),
+                String::from("NonEmpty"),
+                String::from("recipient@example.com"),
+            ],
+            stdin_data: String::from("This body is not empty.\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("MAILRC", mailrc_path)],
+        |_plan, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("Debug mode"),
+                "-E with non-empty body should still send: {}",
+                stderr
+            );
+        },
+    );
+}
+
+// =============================================================================
+// -f file operand parsing (audit #5)
+// =============================================================================
+
+/// `mailx -f -N file` must read the mailbox, not send to "file".
+#[test]
+fn opt_f_operand_after_other_options() {
+    let mbox_path = test_data_path("testdata.mbox");
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-f"),
+                String::from("-N"),
+                mbox_path.to_str().unwrap().to_string(),
+            ],
+            stdin_data: String::from("quit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            // Reading the file in Receive Mode succeeds; it is not parsed as a
+            // recipient address (which, lacking sendmail, would error out).
+            assert!(
+                output.status.success(),
+                "-f -N file should read the mailbox: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        },
+    );
+}
+
+/// RATIONALE's `mailx -fin file` clustered form must read the mailbox.
+#[test]
+fn opt_f_clustered_fin_operand() {
+    let mbox_path = test_data_path("testdata.mbox");
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-fiN"),
+                mbox_path.to_str().unwrap().to_string(),
+            ],
+            stdin_data: String::from("quit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // Header summary is suppressed by N, but the file must load: a
+            // `headers` command then lists messages from the file.
+            assert!(
+                output.status.success(),
+                "-fiN file should read the mailbox: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            // Sanity: no "No recipients"/send error leaked to stdout.
+            assert!(
+                !stdout.contains("No recipients"),
+                "Should be Receive Mode, not Send: {}",
+                stdout
+            );
+        },
+    );
+}
+
+// =============================================================================
+// -n keeps the user MAILRC (audit #6)
+// =============================================================================
+
+/// `mailx -n` must still process the user MAILRC (only the system file is skipped).
+#[test]
+fn opt_n_still_reads_user_mailrc() {
+    let mbox_path = test_data_path("testdata.mbox");
+    let mailrc = create_temp_mailrc("set testvar\n");
+    let mailrc_path = mailrc.path().to_str().unwrap();
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path.to_str().unwrap().to_string(),
+            ],
+            stdin_data: String::from("set\nquit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("MAILRC", mailrc_path)],
+        |_plan, output| {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains("testvar"),
+                "-n must still read the user MAILRC: {}",
+                stdout
+            );
+        },
+    );
+}

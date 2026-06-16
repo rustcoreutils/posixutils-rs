@@ -232,6 +232,11 @@ pub fn send_mode(args: &Args, vars: &mut Variables) -> Result<(), String> {
         }
     }
 
+    // -E: discard a message with an empty body without sending it.
+    if args.discard_empty && msg.body.trim().is_empty() {
+        return Ok(());
+    }
+
     // Send the message
     send_message(&msg, vars, args.record_to_recipient)?;
 

@@ -11,6 +11,7 @@ use crate::builtin::{skip_option_terminator, BuiltinResult, SpecialBuiltinUtilit
 use crate::parse::command_parser::is_valid_name;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use gettextrs::gettext;
 
 pub struct ReadOnly;
 
@@ -23,7 +24,7 @@ impl SpecialBuiltinUtility for ReadOnly {
     ) -> BuiltinResult {
         if args.first().is_some_and(|arg| arg == "-p") {
             if args.len() > 1 && !(args.len() == 2 && args[1] == "--") {
-                return Err("readonly: too many arguments".into());
+                return Err(gettext("readonly: too many arguments").into());
             }
             let mut pairs = shell
                 .environment

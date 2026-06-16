@@ -33,6 +33,7 @@ use crate::shell::environment::{CannotModifyReadonly, Environment, Value};
 use crate::shell::history::{initialize_history_from_system, write_history_to_file, History};
 use crate::shell::opened_files::OpenedFiles;
 use crate::wordexp::{expand_word, expand_word_to_string, word_to_pattern};
+use gettextrs::gettext;
 use std::collections::HashMap;
 use std::ffi::{CString, OsString};
 use std::fmt::{Display, Formatter};
@@ -86,7 +87,7 @@ impl Display for CommandExecutionError {
                 writeln!(f, "{err}")
             }
             CommandExecutionError::CommandNotFound(command_name) => {
-                writeln!(f, "sh: '{command_name}' not found")
+                writeln!(f, "sh: '{command_name}' {}", gettext("not found"))
             }
             CommandExecutionError::OsError(err) => {
                 writeln!(f, "{err}")
@@ -94,8 +95,10 @@ impl Display for CommandExecutionError {
             CommandExecutionError::ParseError(err) => {
                 writeln!(
                     f,
-                    "sh: parsing error at line {}: {}",
-                    err.lineno, err.message
+                    "sh: {} {}: {}",
+                    gettext("parsing error at line"),
+                    err.lineno,
+                    err.message
                 )
             }
         }

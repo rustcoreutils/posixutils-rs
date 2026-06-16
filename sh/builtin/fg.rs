@@ -12,6 +12,7 @@ use crate::jobs::{parse_job_id, Job, JobId, JobState};
 use crate::os::signals::{kill, Signal};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use gettextrs::gettext;
 
 fn run_foreground_job(
     shell: &mut Shell,
@@ -46,13 +47,13 @@ impl BuiltinUtility for Fg {
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
         if !shell.set_options.monitor {
-            return Err("fg: cannot use fg when job control is disabled".into());
+            return Err(gettext("fg: cannot use fg when job control is disabled").into());
         }
         if !shell.is_interactive {
-            return Err("fg: cannot use fg in a non-interactive shell".into());
+            return Err(gettext("fg: cannot use fg in a non-interactive shell").into());
         }
         if shell.is_subshell {
-            return Err("fg: cannot use fg in a subshell environment".into());
+            return Err(gettext("fg: cannot use fg in a subshell environment").into());
         }
 
         let mut status = 0;

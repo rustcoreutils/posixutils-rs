@@ -11,6 +11,7 @@ use crate::builtin::{skip_option_terminator, BuiltinResult, SpecialBuiltinUtilit
 use crate::os::find_command;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::{execute_file_as_script, ScriptExecutionError, Shell};
+use gettextrs::gettext;
 use std::path::Path;
 
 pub struct Dot;
@@ -25,7 +26,7 @@ impl SpecialBuiltinUtility for Dot {
         let args = skip_option_terminator(args);
 
         if args.len() != 1 {
-            return Err("dot: incorrect number of arguments".into());
+            return Err(gettext("dot: incorrect number of arguments").into());
         }
 
         let path = shell.environment.get_str_value("PATH").unwrap_or_default();

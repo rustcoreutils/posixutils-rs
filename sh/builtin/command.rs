@@ -14,6 +14,7 @@ use crate::option_parser::OptionParser;
 use crate::os::DEFAULT_PATH;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use gettextrs::gettext;
 
 #[derive(PartialEq, Eq)]
 enum Action {
@@ -44,13 +45,13 @@ impl CommandArgs<'_> {
             match option {
                 'p' => {
                     if use_default_path {
-                        return Err("command: cannot specify -p multiple times".into());
+                        return Err(gettext("command: cannot specify -p multiple times"));
                     }
                     use_default_path = true;
                 }
                 'v' | 'V' => {
                     if action != Action::Execute {
-                        return Err("command: cannot specify both -v and -V".into());
+                        return Err(gettext("command: cannot specify both -v and -V"));
                     }
                     if option == 'v' {
                         action = Action::PrintShort;
@@ -64,10 +65,10 @@ impl CommandArgs<'_> {
 
         let first_operand = option_parser.next_argument();
         if first_operand >= args.len() {
-            return Err("command: missing command name".into());
+            return Err(gettext("command: missing command name"));
         }
         if action != Action::Execute && first_operand != args.len() - 1 {
-            return Err("command: too many arguments".into());
+            return Err(gettext("command: too many arguments"));
         }
         Ok(CommandArgs {
             use_default_path,

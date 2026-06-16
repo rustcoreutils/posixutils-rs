@@ -11,6 +11,7 @@ use crate::builtin::{skip_option_terminator, BuiltinResult, SpecialBuiltinUtilit
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::ControlFlowState;
 use crate::shell::Shell;
+use gettextrs::gettext;
 
 fn loop_control_flow(
     args: &[String],
@@ -70,16 +71,18 @@ pub struct Return;
 impl SpecialBuiltinUtility for Return {
     fn exec(&self, args: &[String], shell: &mut Shell, _: &mut OpenedFiles) -> BuiltinResult {
         if shell.function_call_depth == 0 && shell.dot_script_depth == 0 {
-            return Err("return: 'return' can only be used inside function or dot script".into());
+            return Err(
+                gettext("return: 'return' can only be used inside function or dot script").into(),
+            );
         }
         if args.len() > 1 {
-            return Err("return: too many arguments".into());
+            return Err(gettext("return: too many arguments").into());
         }
         let n = if let Some(n) = args.first() {
             match n.parse::<i32>() {
                 Ok(n) => n,
                 Err(_) => {
-                    return Err("return: expected numeric argument".into());
+                    return Err(gettext("return: expected numeric argument").into());
                 }
             }
         } else {

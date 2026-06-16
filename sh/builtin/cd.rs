@@ -12,6 +12,7 @@ use crate::option_parser::OptionParser;
 use crate::os::chdir;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use gettextrs::gettext;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Display;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -130,7 +131,7 @@ impl BuiltinUtility for Cd {
                 };
                 // POSIX: an empty operand is an error.
                 if dir.is_empty() {
-                    return Err("cd: empty directory operand\n".into());
+                    return Err(gettext("cd: empty directory operand\n").into());
                 }
                 let mut curr_path = OsString::new();
                 let mut used_cdpath = false;
@@ -210,7 +211,7 @@ impl BuiltinUtility for Cd {
                     opened_files.write_out(format!("{}\n", oldpwd));
                     return Ok(0);
                 }
-                return Err("cd: OLDPWD not set\n".into());
+                return Err(gettext("cd: OLDPWD not set\n").into());
             }
         }
 

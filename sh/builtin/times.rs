@@ -12,6 +12,7 @@ use crate::os::errno::get_current_errno_value;
 use crate::os::LibcResult;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use gettextrs::gettext;
 
 /// Formats a CPU time as POSIX `%dm%fs` — integer minutes and the remaining
 /// seconds with three fractional digits, e.g. `1m5.250s`.
@@ -42,7 +43,7 @@ impl SpecialBuiltinUtility for Times {
     ) -> BuiltinResult {
         let args = skip_option_terminator(args);
         if !args.is_empty() {
-            return Err("times: too many arguments".into());
+            return Err(gettext("times: too many arguments").into());
         }
 
         let shell_times = getusage(libc::RUSAGE_SELF)

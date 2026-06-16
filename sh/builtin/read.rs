@@ -15,12 +15,13 @@ use crate::shell::opened_files::{OpenedFile, OpenedFiles, STDIN_FILENO};
 use crate::shell::Shell;
 use crate::wordexp::expanded_word::ExpandedWord;
 use crate::wordexp::split_fields;
+use gettextrs::gettext;
 use std::io::IsTerminal;
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::Duration;
 
 fn bytes_to_string(bytes: Vec<u8>) -> Result<String, BuiltinError> {
-    String::from_utf8(bytes.to_vec()).map_err(|_| "read: invalid UTF-8".into())
+    String::from_utf8(bytes.to_vec()).map_err(|_| gettext("read: invalid UTF-8").into())
 }
 
 fn read_byte_non_blocking(fd: RawFd) -> Result<Option<u8>, BuiltinError> {
@@ -220,7 +221,7 @@ fn read_until(
             delimiter,
             backslash_escape,
         )),
-        _ => Err("read: invalid standard input".into()),
+        _ => Err(gettext("read: invalid standard input").into()),
     }
 }
 
@@ -247,13 +248,13 @@ impl BuiltinUtility for BuiltinRead {
                 }
                 'd' => {
                     if delim.is_some() {
-                        return Err("read: -d can only be specified once".into());
+                        return Err(gettext("read: -d can only be specified once").into());
                     }
                     let arg = option_parser
                         .next_option_argument()
                         .ok_or("read: -d requires an argument")?;
                     if arg.len() > 1 {
-                        return Err("read: -d requires a single character".into());
+                        return Err(gettext("read: -d requires a single character").into());
                     }
                     if arg.is_empty() {
                         delim = Some(b'\0');
@@ -267,7 +268,7 @@ impl BuiltinUtility for BuiltinRead {
 
         let first_operand = option_parser.next_argument();
         if first_operand == args.len() {
-            return Err("read: missing operand".into());
+            return Err(gettext("read: missing operand").into());
         }
         let vars = &args[first_operand..];
 

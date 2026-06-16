@@ -11,6 +11,7 @@ use crate::builtin::{BuiltinResult, BuiltinUtility};
 use crate::option_parser::OptionParser;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use gettextrs::gettext;
 
 fn format_mode(mode: u32) -> String {
     let types = ["", "x", "w", "wx", "r", "rx", "rw", "rwx"];
@@ -125,7 +126,7 @@ impl BuiltinUtility for Umask {
                 shell.umask = apply_symbolic(shell.umask, mask_arg)?;
             }
         } else {
-            return Err("umask: too many arguments".into());
+            return Err(gettext("umask: too many arguments").into());
         }
 
         Ok(0)

@@ -11,6 +11,7 @@ use crate::builtin::{skip_option_terminator, BuiltinResult, BuiltinUtility};
 use crate::parse::command_parser::is_valid_name;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use gettextrs::gettext;
 
 struct OptsParser<'s> {
     optstring: &'s str,
@@ -31,7 +32,7 @@ impl<'s> OptsParser<'s> {
             .chars()
             .all(|c| c.is_ascii_alphabetic() || c == ':')
         {
-            return Err("getopts: invalid option string".into());
+            return Err(gettext("getopts: invalid option string"));
         }
         Ok(Self { optstring })
     }
@@ -135,7 +136,7 @@ impl BuiltinUtility for GetOpts {
     ) -> BuiltinResult {
         let args = skip_option_terminator(args);
         if args.len() < 2 {
-            return Err("getopts: missing arguments".into());
+            return Err(gettext("getopts: missing arguments").into());
         }
 
         let quiet_errs = args[0].starts_with(':');

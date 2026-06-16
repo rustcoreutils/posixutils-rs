@@ -1456,10 +1456,12 @@ fn cmd_equals() {
         },
         |_plan, output| {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            // = should print current message number (1)
+            // = prints the current message number. testdata.mbox has no `new`
+            // message but message 3 (`Status: O`) is unread, so the current
+            // message is the first unread = 3 (spec 104481-104482).
             assert!(
-                stdout.contains("1"),
-                "= should show current message number: {}",
+                stdout.trim().lines().any(|l| l.trim() == "3"),
+                "= should show the current message number (first unread = 3): {}",
                 stdout
             );
             assert!(output.status.success());
@@ -2399,3 +2401,612 @@ fn create_temp_mailrc(content: &str) -> NamedTempFile {
 }
 
 use plib::testing::run_test_with_checker_and_env;
+
+// =============================================================================
+// `new` message state and the :n selector (audit #8)
+// =============================================================================
+
+/// A message with no Status: header is `new` (shown as `N`); a `:n` selector
+/// matches only such messages.
+#[test]
+fn new_state_and_n_selector() {
+    let body = "From new@example.com Mon Jan  1 10:00:00 2024\n\
+                From: new@example.com\n\
+                Subject: brand new\n\
+                \n\
+                fresh\n\
+                \n\
+                From old@example.com Mon Jan  1 09:00:00 2024\n\
+                From: old@example.com\n\
+                Status: RO\n\
+                Subject: already read\n\
+                \n\
+                stale\n";
+    let mbox = create_temp_mbox(body);
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox.path().to_str().unwrap().to_string(),
+            ],
+            // `from :n` lists header lines of new messages only.
+            stdin_data: String::from("from :n\nquit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains("new@example.com"),
+                ":n should match the new message: {}",
+                stdout
+            );
+            assert!(
+                !stdout.contains("old@example.com"),
+                ":n must not match the already-read message: {}",
+                stdout
+            );
+            // The new message shows the `N` state character.
+            assert!(
+                stdout
+                    .lines()
+                    .any(|l| l.contains('N') && l.contains("new@example.com")),
+                "new message should display state char N: {}",
+                stdout
+            );
+        },
+    );
+}
+
+// =============================================================================
+// reply-all honors Reply-To (audit #11)
+// =============================================================================
+
+/// In the reply-all (lowercase) form, the sender portion comes from Reply-To
+/// when present, not From.
+#[test]
+fn reply_all_uses_reply_to() {
+    let body = "From original@example.com Mon Jan  1 10:00:00 2024\n\
+                From: original@example.com\n\
+                Reply-To: replyto@example.com\n\
+                To: listmember@example.com\n\
+                Subject: hi\n\
+                \n\
+                hello\n";
+    let mbox = create_temp_mbox(body);
+    let mailrc = create_temp_mailrc("set debug\nset dot\n");
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-N"),
+                String::from("-f"),
+                mbox.path().to_str().unwrap().to_string(),
+            ],
+            stdin_data: String::from("reply 1\nReplying.\n.\nquit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("MAILRC", mailrc.path().to_str().unwrap())],
+        |_plan, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("replyto@example.com"),
+                "reply-all should use Reply-To: {}",
+                stderr
+            );
+            assert!(
+                !stderr.contains("original@example.com"),
+                "reply-all must not use From when Reply-To is present: {}",
+                stderr
+            );
+        },
+    );
+}
+
+// =============================================================================
+// mbox overrides the hold variable; commands gated to the system mailbox (#13)
+// =============================================================================
+
+/// `mbox` forces a message into the secondary mbox at quit even when the `hold`
+/// variable is set. Uses MAIL to make a temp file the system mailbox.
+#[test]
+fn mbox_overrides_hold_variable() {
+    let sys = create_temp_mbox(
+        "From sender@example.com Mon Jan  1 10:00:00 2024\n\
+         From: sender@example.com\n\
+         Status: RO\n\
+         Subject: keep me in mbox\n\
+         \n\
+         body\n",
+    );
+    let mbox_file = NamedTempFile::new().expect("mbox file");
+    let sys_path = sys.path().to_str().unwrap().to_string();
+    let mbox_path = mbox_file.path().to_str().unwrap().to_string();
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            // No -f: the MAIL file is the *system* mailbox, so mbox is allowed.
+            args: vec![String::from("-n"), String::from("-N")],
+            stdin_data: String::from("set hold\nmbox 1\nquit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("MAIL", &sys_path), ("MBOX", &mbox_path)],
+        |_plan, output| {
+            assert!(output.status.success());
+            let saved = std::fs::read_to_string(&mbox_path).unwrap_or_default();
+            assert!(
+                saved.contains("sender@example.com"),
+                "mbox should force the message into the secondary mbox despite hold: {:?}",
+                saved
+            );
+        },
+    );
+}
+
+/// `mbox` is rejected (diagnostic) when not reading the system mailbox.
+#[test]
+fn mbox_rejected_outside_system_mailbox() {
+    let mbox = copy_test_data("testdata.mbox");
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox.path().to_str().unwrap().to_string(),
+            ],
+            stdin_data: String::from("mbox 1\nquit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("system mailbox"),
+                "mbox outside the system mailbox should be diagnosed: {}",
+                stderr
+            );
+        },
+    );
+}
+
+// =============================================================================
+// Input-mode escapes (audit #9, #10, #12, #19, #20)
+// =============================================================================
+
+/// `~:set name` actually sets the variable (audit #9).
+#[test]
+fn tilde_colon_set_applies() {
+    let mbox = copy_test_data("testdata.mbox");
+    let mailrc = create_temp_mailrc("set debug\n");
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-N"),
+                String::from("-f"),
+                mbox.path().to_str().unwrap().to_string(),
+            ],
+            // Compose a message, set a variable via ~:, finish with ~., then
+            // list variables back in command mode.
+            stdin_data: String::from(
+                "mail recipient@example.com\n~:set composevar\nbody\n~.\nset\nquit\n",
+            ),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("MAILRC", mailrc.path().to_str().unwrap())],
+        |_plan, output| {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains("composevar"),
+                "~:set should set the variable: {}",
+                stdout
+            );
+        },
+    );
+}
+
+/// `~w file` appends to an existing file rather than truncating it (audit #10).
+#[test]
+fn tilde_w_appends() {
+    let mbox = copy_test_data("testdata.mbox");
+    let mailrc = create_temp_mailrc("set debug\n");
+    let target = create_temp_mbox("PREEXISTING CONTENT\n");
+    let target_path = target.path().to_str().unwrap().to_string();
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-N"),
+                String::from("-f"),
+                mbox.path().to_str().unwrap().to_string(),
+            ],
+            stdin_data: format!(
+                "mail recipient@example.com\nappended body\n~w {}\n~.\nquit\n",
+                target_path
+            ),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("MAILRC", mailrc.path().to_str().unwrap())],
+        |_plan, _output| {
+            let contents = std::fs::read_to_string(&target_path).unwrap_or_default();
+            assert!(
+                contents.contains("PREEXISTING CONTENT"),
+                "~w must not truncate the existing file: {:?}",
+                contents
+            );
+            assert!(
+                contents.contains("appended body"),
+                "~w must append the message body: {:?}",
+                contents
+            );
+        },
+    );
+}
+
+/// `set escape=` (null) disables command escaping, so `~x` is taken literally
+/// and the message is still sent rather than aborted (audit #12).
+#[test]
+fn escape_null_disables_escaping() {
+    let mbox = copy_test_data("testdata.mbox");
+    // dot terminates input; escape is null so ~x is not an escape.
+    let mailrc = create_temp_mailrc("set debug\nset dot\nset escape=\n");
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-N"),
+                String::from("-f"),
+                mbox.path().to_str().unwrap().to_string(),
+            ],
+            stdin_data: String::from("mail recipient@example.com\n~x\nbody\n.\nquit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("MAILRC", mailrc.path().to_str().unwrap())],
+        |_plan, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // With escaping disabled, ~x did not abort: the message is sent
+            // (debug mode reports it).
+            assert!(
+                stderr.contains("Debug mode"),
+                "escape= null should disable ~x abort and still send: {}",
+                stderr
+            );
+        },
+    );
+}
+
+/// With `ignoreeof` set, a lone "." terminates a receive-mode composition even
+/// when `dot` is not set (audit #19).
+#[test]
+fn ignoreeof_dot_terminates_compose() {
+    let mbox = copy_test_data("testdata.mbox");
+    let mailrc = create_temp_mailrc("set debug\nset ignoreeof\n");
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-N"),
+                String::from("-f"),
+                mbox.path().to_str().unwrap().to_string(),
+            ],
+            // If "." terminates, the echo runs as a command afterwards.
+            stdin_data: String::from(
+                "mail recipient@example.com\nbody line\n.\necho PHASEE_MARKER\nquit\n",
+            ),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("MAILRC", mailrc.path().to_str().unwrap())],
+        |_plan, output| {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains("PHASEE_MARKER"),
+                "ignoreeof should let '.' terminate compose so later commands run: {}",
+                stdout
+            );
+        },
+    );
+}
+
+/// `~h` does not prompt (or consume input) when stdin is not a terminal
+/// (audit #20): a command after the composition still runs.
+#[test]
+fn tilde_h_gated_on_terminal() {
+    let mbox = copy_test_data("testdata.mbox");
+    let mailrc = create_temp_mailrc("set debug\nset ignoreeof\n");
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-N"),
+                String::from("-f"),
+                mbox.path().to_str().unwrap().to_string(),
+            ],
+            // If ~h consumed the following lines (no tty gate), the echo would
+            // never run; with the gate it consumes nothing.
+            stdin_data: String::from(
+                "mail recipient@example.com\n~h\nbody line\n.\necho HMARKER\nquit\n",
+            ),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("MAILRC", mailrc.path().to_str().unwrap())],
+        |_plan, output| {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains("HMARKER"),
+                "~h must not consume input off a terminal: {}",
+                stdout
+            );
+        },
+    );
+}
+
+// =============================================================================
+// Command-mode niceties (audit #15, #16, #18)
+// =============================================================================
+
+/// `if`/`else`/`endif` gate commands in command mode (audit #16). Receive Mode
+/// makes the `r` condition true and `s` false.
+#[test]
+fn if_conditional_in_command_mode() {
+    let mbox = copy_test_data("testdata.mbox");
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox.path().to_str().unwrap().to_string(),
+            ],
+            stdin_data: String::from(
+                "if r\necho YESBLOCK\nendif\nif s\necho NOBLOCK\nendif\nquit\n",
+            ),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains("YESBLOCK"),
+                "`if r` body should execute in receive mode: {}",
+                stdout
+            );
+            assert!(
+                !stdout.contains("NOBLOCK"),
+                "`if s` body must not execute in receive mode: {}",
+                stdout
+            );
+        },
+    );
+}
+
+/// With `crt` set, pagination is skipped when stdout is not a terminal
+/// (audit #15): the message prints inline and no pager is spawned.
+#[test]
+fn crt_pagination_gated_on_terminal() {
+    let mbox = copy_test_data("testdata.mbox");
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox.path().to_str().unwrap().to_string(),
+            ],
+            stdin_data: String::from("set crt=1\nprint 1\nquit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        // A bogus pager: if pagination were (wrongly) attempted off a terminal,
+        // spawning it would fail and surface a diagnostic.
+        &[("PAGER", "nonexistent_pager_xyz123")],
+        |_plan, output| {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stdout.contains("Meeting Tomorrow") || stdout.contains("alice"),
+                "message should print inline without paging: {}",
+                stdout
+            );
+            assert!(
+                !stderr.contains("nonexistent_pager_xyz123"),
+                "no pager should be spawned off a terminal: {}",
+                stderr
+            );
+        },
+    );
+}
+
+/// `file #` reopens the previously-visited folder (audit #18).
+#[test]
+fn file_hash_previous_folder() {
+    let folder_a = create_temp_mbox(
+        "From aaa@a.example Mon Jan  1 10:00:00 2024\n\
+         From: aaa@a.example\n\
+         Subject: folder A\n\
+         \n\
+         a\n",
+    );
+    let folder_b = create_temp_mbox(
+        "From bbb@b.example Mon Jan  1 10:00:00 2024\n\
+         From: bbb@b.example\n\
+         Subject: folder B\n\
+         \n\
+         b\n",
+    );
+    let a_path = folder_a.path().to_str().unwrap().to_string();
+    let b_path = folder_b.path().to_str().unwrap().to_string();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                a_path.clone(),
+            ],
+            // Open B, then `#` returns to A.
+            stdin_data: format!("file {}\nfile #\nquit\n", b_path),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stdout.contains("bbb@b.example"),
+                "switching to folder B should show its summary: {}",
+                stdout
+            );
+            assert!(
+                stdout.contains("aaa@a.example"),
+                "`file #` should reopen folder A: {}",
+                stdout
+            );
+            assert!(
+                !stderr.contains("previous folder") && !stderr.contains("#:"),
+                "`file #` must resolve, not error: {}",
+                stderr
+            );
+        },
+    );
+}
+
+// =============================================================================
+// Regression tests for review fixes
+// =============================================================================
+
+/// A multibyte `escape` character must not panic when slicing the input line.
+#[test]
+fn multibyte_escape_char_no_panic() {
+    let mbox = copy_test_data("testdata.mbox");
+    // escape is the 2-byte character 'é'; "é." finishes the message.
+    let mailrc = create_temp_mailrc("set debug\nset escape=é\n");
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-N"),
+                String::from("-f"),
+                mbox.path().to_str().unwrap().to_string(),
+            ],
+            stdin_data: String::from("mail recipient@example.com\nbody\né.\nquit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("MAILRC", mailrc.path().to_str().unwrap())],
+        |_plan, output| {
+            assert!(
+                output.status.success(),
+                "multibyte escape char must not panic: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("Debug mode"),
+                "the message should compose and send: {}",
+                stderr
+            );
+        },
+    );
+}
+
+/// A second `else` in the same conditional block is diagnosed.
+#[test]
+fn double_else_is_diagnosed() {
+    let mbox = copy_test_data("testdata.mbox");
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox.path().to_str().unwrap().to_string(),
+            ],
+            stdin_data: String::from("if r\nelse\nelse\nquit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("unexpected else"),
+                "a second else should be diagnosed: {}",
+                stderr
+            );
+        },
+    );
+}
+
+/// A `Copy` command in a start-up file is diagnosed (case-folded match).
+#[test]
+fn startup_copy_is_diagnosed() {
+    let mbox = copy_test_data("testdata.mbox");
+    let mailrc = create_temp_mailrc("Copy 1\n");
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-N"),
+                String::from("-f"),
+                mbox.path().to_str().unwrap().to_string(),
+            ],
+            stdin_data: String::from("quit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("MAILRC", mailrc.path().to_str().unwrap())],
+        |_plan, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("not valid in a start-up file"),
+                "Copy in a start-up file should be diagnosed: {}",
+                stderr
+            );
+        },
+    );
+}

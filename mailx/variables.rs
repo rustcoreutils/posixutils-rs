@@ -28,6 +28,9 @@ pub struct Variables {
     pub retained_headers: Vec<String>,
     /// Last shell command (for ! expansion with bang variable)
     pub last_shell_cmd: Option<String>,
+    /// Conditional (`if`/`else`/`endif`) nesting state for command mode:
+    /// each entry is (this branch matches, currently in the else branch).
+    pub cond_stack: Vec<(bool, bool)>,
 }
 
 impl Variables {
@@ -40,6 +43,7 @@ impl Variables {
             ignored_headers: Vec::new(),
             retained_headers: Vec::new(),
             last_shell_cmd: None,
+            cond_stack: Vec::new(),
         };
 
         // Set defaults per POSIX
@@ -95,11 +99,16 @@ impl Variables {
         self.booleans.remove(name);
     }
 
-    /// Get the escape character
-    pub fn escape_char(&self) -> char {
-        self.get("escape")
-            .and_then(|s| s.chars().next())
-            .unwrap_or('~')
+    /// Get the command-escape character for input mode.
+    ///
+    /// Returns `Some('~')` by default, `Some(c)` when `escape` names a
+    /// character, and `None` when `escape` is set to null — in which case
+    /// command escaping is disabled (spec 104610-104612).
+    pub fn escape_char(&self) -> Option<char> {
+        match self.get("escape") {
+            None => Some('~'),
+            Some(s) => s.chars().next(), // empty string => None => disabled
+        }
     }
 
     /// Print all set variables
@@ -126,6 +135,12 @@ impl Variables {
         if let Some(addrs) = self.aliases.get(name) {
             let mut result = Vec::new();
             for addr in addrs {
+                // A leading unquoted backslash prevents expansion of this group
+                // member (spec 104720-104721): strip it and take the rest as-is.
+                if let Some(literal) = addr.strip_prefix('\\') {
+                    result.push(literal.to_string());
+                    continue;
+                }
                 // Recursively expand
                 let expanded = self.expand_alias(addr);
                 if expanded.is_empty() {
@@ -138,6 +153,12 @@ impl Variables {
         } else {
             Vec::new()
         }
+    }
+
+    /// Whether commands should currently execute given the conditional stack
+    /// (true when every enclosing `if`/`else` branch matches).
+    pub fn cond_active(&self) -> bool {
+        self.cond_stack.iter().all(|(matches, _)| *matches)
     }
 
     /// Check if an address is an alternate for the user

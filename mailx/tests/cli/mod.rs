@@ -864,3 +864,355 @@ fn subject_without_recipient() {
         },
     );
 }
+
+// =============================================================================
+// -E Option: Discard messages with an empty body (audit #1)
+// =============================================================================
+
+/// -E with an empty body must succeed without attempting delivery.
+#[test]
+fn opt_e_uppercase_discards_empty_body() {
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-E"),
+                String::from("-s"),
+                String::from("Empty"),
+                String::from("recipient@example.com"),
+            ],
+            // Empty body (whitespace only): must be discarded, not sent.
+            stdin_data: String::from("   \n\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // No delivery attempt: sendmail is never invoked, so no "sendmail"
+            // failure diagnostic appears even on a host without sendmail.
+            assert!(output.status.success(), "Empty -E message should succeed");
+            assert!(
+                !stderr.contains("sendmail"),
+                "-E empty body must not attempt delivery: {}",
+                stderr
+            );
+        },
+    );
+}
+
+/// -E with a non-empty body still composes/sends (verified via debug mode).
+#[test]
+fn opt_e_uppercase_keeps_nonempty_body() {
+    let mailrc = create_temp_mailrc("set debug\n");
+    let mailrc_path = mailrc.path().to_str().unwrap();
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-E"),
+                String::from("-s"),
+                String::from("NonEmpty"),
+                String::from("recipient@example.com"),
+            ],
+            stdin_data: String::from("This body is not empty.\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("MAILRC", mailrc_path)],
+        |_plan, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("Debug mode"),
+                "-E with non-empty body should still send: {}",
+                stderr
+            );
+        },
+    );
+}
+
+// =============================================================================
+// -f file operand parsing (audit #5)
+// =============================================================================
+
+/// `mailx -f -N file` must read the mailbox, not send to "file".
+#[test]
+fn opt_f_operand_after_other_options() {
+    let mbox_path = test_data_path("testdata.mbox");
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-f"),
+                String::from("-N"),
+                mbox_path.to_str().unwrap().to_string(),
+            ],
+            stdin_data: String::from("quit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            // Reading the file in Receive Mode succeeds; it is not parsed as a
+            // recipient address (which, lacking sendmail, would error out).
+            assert!(
+                output.status.success(),
+                "-f -N file should read the mailbox: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        },
+    );
+}
+
+/// RATIONALE's `mailx -fin file` clustered form must read the mailbox.
+#[test]
+fn opt_f_clustered_fin_operand() {
+    let mbox_path = test_data_path("testdata.mbox");
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-fiN"),
+                mbox_path.to_str().unwrap().to_string(),
+            ],
+            stdin_data: String::from("quit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // Header summary is suppressed by N, but the file must load: a
+            // `headers` command then lists messages from the file.
+            assert!(
+                output.status.success(),
+                "-fiN file should read the mailbox: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            // Sanity: no "No recipients"/send error leaked to stdout.
+            assert!(
+                !stdout.contains("No recipients"),
+                "Should be Receive Mode, not Send: {}",
+                stdout
+            );
+        },
+    );
+}
+
+// =============================================================================
+// -n keeps the user MAILRC (audit #6)
+// =============================================================================
+
+/// `mailx -n` must still process the user MAILRC (only the system file is skipped).
+#[test]
+fn opt_n_still_reads_user_mailrc() {
+    let mbox_path = test_data_path("testdata.mbox");
+    let mailrc = create_temp_mailrc("set testvar\n");
+    let mailrc_path = mailrc.path().to_str().unwrap();
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path.to_str().unwrap().to_string(),
+            ],
+            stdin_data: String::from("set\nquit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("MAILRC", mailrc_path)],
+        |_plan, output| {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains("testvar"),
+                "-n must still read the user MAILRC: {}",
+                stdout
+            );
+        },
+    );
+}
+
+// =============================================================================
+// Multibyte header-summary truncation must not panic (audit #3)
+// =============================================================================
+
+/// A multibyte From/Subject longer than the column widths must truncate on a
+/// character boundary rather than panicking on a byte slice.
+#[test]
+fn header_summary_multibyte_no_panic() {
+    // 3-byte chars in Subject (>25) and 2-byte chars in the From name (>18):
+    // a byte-offset slice at column 22/15 would fall mid-character and panic.
+    let subject: String = "あ".repeat(30);
+    let from_name: String = "Ñ".repeat(20);
+    let body = format!(
+        "From sender@example.com Mon Jan  1 10:00:00 2024\n\
+         From: {} <sender@example.com>\n\
+         Subject: {}\n\
+         \n\
+         body text\n",
+        from_name, subject
+    );
+    let mbox = create_temp_mbox(&body);
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-H"),
+                String::from("-f"),
+                mbox.path().to_str().unwrap().to_string(),
+            ],
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            assert!(
+                output.status.success(),
+                "header summary must not panic on multibyte text: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // Truncation appends an ellipsis.
+            assert!(
+                stdout.contains("..."),
+                "long fields should be truncated with ellipsis: {}",
+                stdout
+            );
+        },
+    );
+}
+
+// =============================================================================
+// sh -c receives the -- argument (audit #4)
+// =============================================================================
+
+/// A piped command beginning with `-` must be handed to the program (after the
+/// mandated `--`), not consumed by the shell as one of its own options.
+#[test]
+fn pipe_command_leading_dash_reaches_program() {
+    let mbox_path = test_data_path("testdata.mbox");
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path.to_str().unwrap().to_string(),
+            ],
+            // Pipe message 1 to the command "-n": with `sh -c -- -n` the shell
+            // runs "-n" as a command (not found) instead of swallowing it as the
+            // shell's own `-n` option (which would silently succeed).
+            stdin_data: String::from("pipe 1 -n\nquit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("not found"),
+                "`-n` should reach the shell as a command (proves `--`): {}",
+                stderr
+            );
+        },
+    );
+}
+
+// =============================================================================
+// Locale initialization (audit #7)
+// =============================================================================
+
+/// mailx initializes the locale from the environment without breaking; a
+/// UTF-8 LC_CTYPE drives multibyte header interpretation.
+#[test]
+fn locale_env_initialization() {
+    let subject: String = "résumé ".repeat(6); // multibyte, > 25 chars
+    let body = format!(
+        "From sender@example.com Mon Jan  1 10:00:00 2024\n\
+         From: sender@example.com\n\
+         Subject: {}\n\
+         \n\
+         body\n",
+        subject
+    );
+    let mbox = create_temp_mbox(&body);
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-H"),
+                String::from("-f"),
+                mbox.path().to_str().unwrap().to_string(),
+            ],
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        // The test controls the locale; C.UTF-8 exercises the UTF-8 ctype path.
+        &[("LC_ALL", "C.UTF-8")],
+        |_plan, output| {
+            assert!(
+                output.status.success(),
+                "mailx should run with an environment UTF-8 locale: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        },
+    );
+}
+
+// =============================================================================
+// alias backslash recursion guard (audit #17)
+// =============================================================================
+
+/// A leading backslash on an alias group member prevents its expansion.
+#[test]
+fn alias_backslash_prevents_expansion() {
+    // `user` expands to an address; `grp` references `\user` (literal) plus a
+    // normal address. The backslashed member must NOT expand.
+    let mailrc = create_temp_mailrc(
+        "set debug\nalias user expanded@example.com\nalias grp \\user other@example.com\n",
+    );
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![String::from("grp")],
+            stdin_data: String::from("body\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("MAILRC", mailrc.path().to_str().unwrap())],
+        |_plan, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("user") && stderr.contains("other@example.com"),
+                "group members should be present: {}",
+                stderr
+            );
+            assert!(
+                !stderr.contains("expanded@example.com"),
+                "backslashed member must not be expanded: {}",
+                stderr
+            );
+        },
+    );
+}

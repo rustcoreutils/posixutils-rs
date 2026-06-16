@@ -14,11 +14,14 @@ mod mailbox;
 mod message;
 mod msglist;
 mod send;
+mod signals;
 mod variables;
 
 use std::env;
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, IsTerminal, Write};
 use std::process;
+
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 
 use args::{Args, Mode};
 use commands::execute_command;
@@ -27,6 +30,17 @@ use send::send_mode;
 use variables::Variables;
 
 fn main() {
+    // Honor the environment locale (LC_CTYPE for multibyte text, LC_MESSAGES
+    // for diagnostics); diagnostics are routed through gettext for
+    // translatability. See the project locale-init convention.
+    setlocale(LocaleCategory::LcAll, "");
+    textdomain("posixutils-rs").ok();
+    bind_textdomain_codeset("posixutils-rs", "UTF-8").ok();
+
+    // Install the SIGINT handler so an interrupt aborts the current command or
+    // message instead of terminating mailx (ASYNCHRONOUS EVENTS).
+    signals::setup();
+
     let args = match Args::parse(env::args().skip(1).collect()) {
         Ok(args) => args,
         Err(e) => {
@@ -49,10 +63,8 @@ fn run_send_mode(args: &Args) -> i32 {
     let mut vars = Variables::new();
     init_variables(&mut vars, args);
 
-    // Load startup files unless -n is specified
-    if !args.no_init {
-        load_startup_files(&mut vars, RcMode::Send);
-    }
+    // -n suppresses only the system start-up file; the user MAILRC is always read.
+    load_startup_files(&mut vars, RcMode::Send, args.no_init);
 
     if let Err(e) = send_mode(args, &mut vars) {
         eprintln!("mailx: {}", e);
@@ -74,10 +86,8 @@ fn run_headers_only(args: &Args) -> i32 {
     let mut vars = Variables::new();
     init_variables(&mut vars, args);
 
-    // Load startup files unless -n is specified
-    if !args.no_init {
-        load_startup_files(&mut vars, RcMode::Receive);
-    }
+    // -n suppresses only the system start-up file; the user MAILRC is always read.
+    load_startup_files(&mut vars, RcMode::Receive, args.no_init);
 
     let mailbox_path = args.file.clone().unwrap_or_else(get_system_mailbox);
     let mb = match Mailbox::load(&mailbox_path) {
@@ -89,7 +99,7 @@ fn run_headers_only(args: &Args) -> i32 {
     };
 
     if mb.message_count() == 0 {
-        println!("No mail for {}", get_user());
+        println!("{} {}", gettext("No mail for"), get_user());
         return 0;
     }
 
@@ -101,10 +111,8 @@ fn run_receive_mode(args: &Args) -> i32 {
     let mut vars = Variables::new();
     init_variables(&mut vars, args);
 
-    // Load startup files unless -n is specified
-    if !args.no_init {
-        load_startup_files(&mut vars, RcMode::Receive);
-    }
+    // -n suppresses only the system start-up file; the user MAILRC is always read.
+    load_startup_files(&mut vars, RcMode::Receive, args.no_init);
 
     let mailbox_path = if args.read_mbox {
         args.file.clone().unwrap_or_else(get_mbox_path)
@@ -137,11 +145,10 @@ fn run_receive_mode(args: &Args) -> i32 {
     if !args.no_header_summary && vars.get_bool("header") && mb.message_count() > 0 {
         mb.print_headers(None, &vars);
     } else if mb.message_count() == 0 && is_tty {
-        println!("No mail for {}", get_user());
+        println!("{} {}", gettext("No mail for"), get_user());
     }
 
     // Command loop
-    let stdin = io::stdin();
     let mut stdout = io::stdout();
 
     loop {
@@ -155,16 +162,28 @@ fn run_receive_mode(args: &Args) -> i32 {
 
         // Read command
         let mut line = String::new();
-        match stdin.lock().read_line(&mut line) {
+        match signals::read_line_interruptible(&mut line) {
             Ok(0) => {
                 // EOF - quit
                 return quit_mailbox(&mut mb, &vars);
             }
             Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                // SIGINT in command mode: abort the partial command, re-prompt.
+                signals::take_sigint();
+                println!();
+                continue;
+            }
             Err(e) => {
-                eprintln!("mailx: read error: {}", e);
+                eprintln!("mailx: {}: {}", gettext("read error"), e);
                 return 1;
             }
+        }
+
+        // A SIGINT may have arrived between reads; abort this command too.
+        if signals::take_sigint() {
+            println!();
+            continue;
         }
 
         let line = line.trim();
@@ -234,12 +253,16 @@ const SYSTEM_MAILRC_PATHS: &[&str] = &[
     "/usr/lib/mailx/mailx.rc",
 ];
 
-fn load_startup_files(vars: &mut Variables, mode: RcMode) {
-    // Load system startup file first (POSIX requirement)
-    for path in SYSTEM_MAILRC_PATHS {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            load_rc_content(&content, path, vars, mode);
-            break; // Only load the first one found
+fn load_startup_files(vars: &mut Variables, mode: RcMode, no_init: bool) {
+    // Load system startup file first (POSIX requirement), unless -n was given.
+    // Per the Start-Up steps, -n attaches only to the system start-up file;
+    // the user's MAILRC is always processed.
+    if !no_init {
+        for path in SYSTEM_MAILRC_PATHS {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                load_rc_content(&content, path, vars, mode);
+                break; // Only load the first one found
+            }
         }
     }
 

@@ -11,7 +11,7 @@
 
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::process::{Command, Stdio};
 
 use crate::mailbox::Mailbox;
@@ -229,12 +229,14 @@ pub fn handle_escape(
             output.push_str(&msg.body);
             output.push_str("-------\n");
 
-            // Check if we should use pager (crt variable)
+            // Check if we should use pager (crt variable); only when stdout is
+            // a terminal (spec 104362-104367).
             let line_count = output.lines().count();
-            let use_pager = vars
-                .get_number("crt")
-                .map(|crt| line_count > crt as usize)
-                .unwrap_or(false);
+            let use_pager = io::stdout().is_terminal()
+                && vars
+                    .get_number("crt")
+                    .map(|crt| line_count > crt as usize)
+                    .unwrap_or(false);
 
             if use_pager {
                 let pager = vars.get("PAGER").unwrap_or("more");
@@ -288,9 +290,15 @@ pub fn handle_escape(
             Ok(EscapeResult::continue_input())
         }
         'w' => {
-            // Write body to file
+            // Write body to file: create, or append if it already exists
+            // (spec 105094-105097).
             let path = expand_filename(args, vars);
-            match fs::write(&path, &msg.body) {
+            let result = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .and_then(|mut f| f.write_all(msg.body.as_bytes()));
+            match result {
                 Ok(_) => println!("\"{}\" {} bytes", path, msg.body.len()),
                 Err(e) => println!("{}: {}", path, e),
             }
@@ -333,6 +341,7 @@ fn run_shell_command(cmd: &str, vars: &Variables) -> Result<(), String> {
     let shell = vars.get("SHELL").unwrap_or("/bin/sh");
     Command::new(shell)
         .arg("-c")
+        .arg("--")
         .arg(cmd)
         .status()
         .map_err(|e| e.to_string())?;
@@ -370,6 +379,7 @@ fn run_shell_command_output(cmd: &str, vars: &Variables) -> Result<String, Strin
     let shell = vars.get("SHELL").unwrap_or("/bin/sh");
     let output = Command::new(shell)
         .arg("-c")
+        .arg("--")
         .arg(cmd)
         .output()
         .map_err(|e| e.to_string())?;
@@ -447,6 +457,7 @@ fn shell_expand(s: &str, vars: &Variables) -> String {
 
     let output = Command::new(shell)
         .arg("-c")
+        .arg("--")
         .arg(format!("printf '%s' {}", s))
         .output();
 
@@ -543,6 +554,11 @@ fn parse_edited_message(content: &str, msg: &mut ComposedMessage) -> Result<(), 
 }
 
 fn prompt_headers(msg: &mut ComposedMessage) -> Result<(), String> {
+    // ~h prompts only when standard input is a terminal (spec 105065).
+    if !io::stdin().is_terminal() {
+        return Ok(());
+    }
+
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
@@ -679,6 +695,7 @@ fn pipe_through_command(input: &str, cmd: &str, vars: &Variables) -> Result<Stri
 
     let mut child = Command::new(shell)
         .arg("-c")
+        .arg("--")
         .arg(cmd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -727,16 +744,27 @@ fn pipe_output_through_pager(text: &str, pager: &str) {
     let _ = child.wait();
 }
 
-/// Execute a mailx command from input mode (~: or ~_)
-/// Only a subset of commands are allowed in input mode
+/// Execute a mailx command-level request from input mode (`~:` / `~_`).
+///
+/// Per spec 105048-105049 this performs the command-level request; the valid
+/// subset here is the command-mode commands that do not require the message
+/// store. Commands are dispatched through the real interpreter functions so a
+/// `set` actually mutates `vars`.
 fn execute_input_mode_command(
     line: &str,
     _msg: &mut ComposedMessage,
     _mb: Option<&Mailbox>,
-    vars: &Variables,
+    vars: &mut Variables,
 ) -> Result<(), String> {
     let line = line.trim();
     if line.is_empty() {
+        return Ok(());
+    }
+
+    // A leading `!` is a shell escape regardless of spacing.
+    if let Some(shell_cmd) = line.strip_prefix('!') {
+        run_shell_command(shell_cmd, vars)?;
+        println!("!");
         return Ok(());
     }
 
@@ -747,29 +775,18 @@ fn execute_input_mode_command(
         (line, "")
     };
 
-    let cmd_lower = cmd.to_lowercase();
-
-    // Handle allowed commands in input mode
-    match cmd_lower.as_str() {
-        // set/unset variables
-        "se" | "set" => {
-            for arg in args.split_whitespace() {
-                println!("{}", arg);
-            }
-            Ok(())
+    match cmd.to_lowercase().as_str() {
+        "se" | "set" => crate::commands::cmd_set(args, vars).map(|_| ()),
+        "uns" | "unse" | "unset" => crate::commands::cmd_unset(args, vars).map(|_| ()),
+        "a" | "al" | "ali" | "alia" | "alias" | "g" | "gr" | "gro" | "grou" | "group" => {
+            crate::commands::cmd_alias(args, vars).map(|_| ())
         }
-        // echo
+        "alt" | "alte" | "alter" | "altern" | "alterna" | "alternat" | "alternate"
+        | "alternates" => crate::commands::cmd_alternates(args, vars).map(|_| ()),
         "ec" | "ech" | "echo" => {
             println!("{}", args);
             Ok(())
         }
-        // Shell escape
-        cmd if cmd.starts_with('!') => {
-            let shell_cmd = &line[1..];
-            run_shell_command(shell_cmd, vars)?;
-            println!("!");
-            Ok(())
-        }
-        _ => Err(format!("Unknown command: {}", cmd)),
+        _ => Err(format!("{}: command not valid in input mode", cmd)),
     }
 }

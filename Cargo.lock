@@ -1780,6 +1780,8 @@ dependencies = [
  "chrono",
  "dirs 5.0.1",
  "filetime",
+ "gettext-rs",
+ "libc",
  "plib",
  "tempfile",
 ]

@@ -162,7 +162,7 @@ pub fn send_mode(args: &Args, vars: &mut Variables) -> Result<(), String> {
         // Interactive mode - handle escapes
         loop {
             let mut line = String::new();
-            match stdin.lock().read_line(&mut line) {
+            match crate::signals::read_line_interruptible(&mut line) {
                 Ok(0) => {
                     // EOF - if ignoreeof is set, ignore it
                     if vars.get_bool("ignoreeof") {
@@ -174,32 +174,40 @@ pub fn send_mode(args: &Args, vars: &mut Variables) -> Result<(), String> {
                 Ok(_) => {}
                 Err(e) => {
                     if e.kind() == io::ErrorKind::Interrupted {
-                        // If ignore is set, just print @ and continue
-                        if vars.get_bool("ignore") {
-                            println!("@");
-                            continue;
-                        }
-
-                        interrupt_count += 1;
-                        if interrupt_count >= 2 {
-                            // Save to dead letter and abort
-                            if vars.get_bool("save") && !msg.body.is_empty() {
-                                save_dead_letter(&msg, vars);
-                            }
+                        crate::signals::take_sigint();
+                        if crate::commands::interrupt_message(&msg, vars, &mut interrupt_count) {
                             return Err("Interrupt".to_string());
                         }
-                        println!("(Interrupt -- one more to kill letter)");
                         continue;
                     }
                     return Err(e.to_string());
                 }
             }
 
+            // A SIGINT may have arrived between reads.
+            if crate::signals::take_sigint()
+                && crate::commands::interrupt_message(&msg, vars, &mut interrupt_count)
+            {
+                return Err("Interrupt".to_string());
+            }
+
             interrupt_count = 0;
 
-            // Check for escape character
-            if line.starts_with(escape_char) && line.len() > 1 {
-                let result = handle_escape(&line[1..], &mut msg, vars, None)?;
+            // Check for escape character (disabled when `escape` is null).
+            // Slice past the escape char by its UTF-8 length so a multibyte
+            // escape does not split a character boundary.
+            if let Some(ec) =
+                escape_char.filter(|ec| line.starts_with(*ec) && line.len() > ec.len_utf8())
+            {
+                // A tilde-escape error is diagnosed but does not abort the
+                // message (spec 105114-105119).
+                let result = match handle_escape(&line[ec.len_utf8()..], &mut msg, vars, None) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("{}", e);
+                        continue;
+                    }
+                };
                 if result.done {
                     if result.abort {
                         // Only save to dead letter if the escape requested it (~q)
@@ -230,6 +238,11 @@ pub fn send_mode(args: &Args, vars: &mut Variables) -> Result<(), String> {
             msg.body.push_str(&line);
             msg.body.push('\n');
         }
+    }
+
+    // -E: discard a message with an empty body without sending it.
+    if args.discard_empty && msg.body.trim().is_empty() {
+        return Ok(());
     }
 
     // Send the message
@@ -355,7 +368,7 @@ fn record_message(msg: &ComposedMessage, filename: &str, vars: &Variables) -> Re
 }
 
 /// Save message to dead letter file
-fn save_dead_letter(msg: &ComposedMessage, vars: &Variables) {
+pub fn save_dead_letter(msg: &ComposedMessage, vars: &Variables) {
     let dead_path = vars.get("DEAD").map(|s| s.to_string()).unwrap_or_else(|| {
         let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
         format!("{}/dead.letter", home)
@@ -363,7 +376,8 @@ fn save_dead_letter(msg: &ComposedMessage, vars: &Variables) {
 
     if let Ok(mut file) = File::create(&dead_path) {
         let _ = write!(file, "{}", msg.format());
-        eprintln!("Message saved to {}", dead_path);
+        // Informative notice -> stdout (spec STDOUT, 104412-104414).
+        println!("Message saved to {}", dead_path);
     }
 }
 
@@ -390,9 +404,16 @@ pub fn compose_reply(original: &Message, reply_all: bool, vars: &Variables) -> C
 
     // Add recipients
     if reply_all {
-        // Reply to all recipients
-        // Add original sender
-        msg.add_to(original.from());
+        // Reply to all recipients.  The sender portion comes from Reply-To when
+        // present, otherwise from From (spec 104911-104916: in the lowercase
+        // form, From/To/Cc are used only when there is no Reply-To).
+        if let Some(reply_to) = original.get_header("reply-to") {
+            for addr in reply_to.split(',') {
+                msg.add_to(addr);
+            }
+        } else {
+            msg.add_to(original.from());
+        }
 
         // Add all To: recipients
         // If metoo is not set, exclude ourselves and our alternates

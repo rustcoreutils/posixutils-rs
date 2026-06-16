@@ -11,7 +11,7 @@
 
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, IsTerminal, Write};
 use std::process::Command;
 
 use crate::escapes::handle_escape;
@@ -43,6 +43,39 @@ pub fn execute_command(
 
     // Check for comment
     if line.starts_with('#') {
+        return Ok(CommandResult::Continue);
+    }
+
+    // Conditional execution (if/else/endif) in command mode. execute_command is
+    // the Receive-Mode interpreter, so the `r` condition is true and `s` false.
+    {
+        let (cword, cargs) = parse_command_line(line);
+        match cword.to_lowercase().as_str() {
+            "i" | "if" => {
+                let matches = matches!(cargs.trim().to_lowercase().as_str(), "r");
+                vars.cond_stack.push((matches, false));
+                return Ok(CommandResult::Continue);
+            }
+            "el" | "els" | "else" => {
+                match vars.cond_stack.pop() {
+                    // A second else in the same if block is an error.
+                    Some((_, true)) | None => return Err("mailx: unexpected else".to_string()),
+                    Some((matches, false)) => vars.cond_stack.push((!matches, true)),
+                }
+                return Ok(CommandResult::Continue);
+            }
+            "en" | "end" | "endi" | "endif" => {
+                if vars.cond_stack.pop().is_none() {
+                    return Err("mailx: unexpected endif".to_string());
+                }
+                return Ok(CommandResult::Continue);
+            }
+            _ => {}
+        }
+    }
+
+    // Inside a non-matching conditional branch, skip the command.
+    if !vars.cond_active() {
         return Ok(CommandResult::Continue);
     }
 
@@ -254,6 +287,12 @@ pub fn execute_startup_command(line: &str, vars: &mut Variables) -> Result<(), S
         return Ok(());
     }
 
+    // A shell escape (`!command`) is not valid in a start-up file (spec
+    // 104557-104559).
+    if line.starts_with('!') {
+        return Err("!: command not valid in a start-up file".to_string());
+    }
+
     let (cmd, args) = parse_command_line(line);
 
     match cmd.to_lowercase().as_str() {
@@ -269,7 +308,28 @@ pub fn execute_startup_command(line: &str, vars: &mut Variables) -> Result<(), S
         "uns" | "unse" | "unset" => cmd_unset_startup(args, vars),
         "so" | "sou" | "sour" | "sourc" | "source" => cmd_source_startup(args, vars),
         "i" | "if" | "el" | "els" | "else" | "en" | "end" | "endi" | "endif" => Ok(()),
-        _ => Ok(()), // Ignore unknown commands in startup
+
+        // Other legal start-up commands that do not require the message store.
+        "cd" | "ch" | "chd" | "chdi" | "chdir" => cmd_cd(args).map(|_| ()),
+        "ec" | "ech" | "echo" => {
+            println!("{}", args);
+            Ok(())
+        }
+
+        // Commands explicitly not valid in a start-up file (spec 104557-104559).
+        // The match is over the lowercased command, so copy/save/reply/followup
+        // also catch their Copy/Save/Reply/Followup forms.
+        "e" | "ed" | "edi" | "edit" | "ho" | "hol" | "hold" | "pre" | "pres" | "prese"
+        | "preser" | "preserv" | "preserve" | "m" | "ma" | "mai" | "mail" | "r" | "re" | "rep"
+        | "repl" | "reply" | "c" | "co" | "cop" | "copy" | "s" | "sa" | "sav" | "save" | "sh"
+        | "she" | "shel" | "shell" | "v" | "vi" | "vis" | "visu" | "visua" | "visual" | "fo"
+        | "fol" | "foll" | "follo" | "follow" | "followu" | "followup" => {
+            Err(format!("{}: command not valid in a start-up file", cmd))
+        }
+
+        // Other commands require the message store, which is not available
+        // during start-up; leave them as no-ops rather than diagnosing.
+        _ => Ok(()),
     }
 }
 
@@ -284,7 +344,7 @@ fn parse_command_line(line: &str) -> (&str, &str) {
 
 // ============ Command implementations ============
 
-fn cmd_alias(args: &str, vars: &mut Variables) -> Result<CommandResult, String> {
+pub(crate) fn cmd_alias(args: &str, vars: &mut Variables) -> Result<CommandResult, String> {
     if args.is_empty() {
         // Print all aliases
         let mut names: Vec<&String> = vars.aliases.keys().collect();
@@ -323,7 +383,7 @@ fn cmd_alias_startup(args: &str, vars: &mut Variables) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_alternates(args: &str, vars: &mut Variables) -> Result<CommandResult, String> {
+pub(crate) fn cmd_alternates(args: &str, vars: &mut Variables) -> Result<CommandResult, String> {
     if args.is_empty() {
         println!("{}", vars.alternates.join(" "));
     } else {
@@ -550,12 +610,25 @@ fn cmd_file(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
         return Ok(CommandResult::Continue);
     }
 
+    // Resolve the target, handling `#` (the previously-opened folder).
+    let path = if args.trim() == "#" {
+        match &mb.prev_path {
+            Some(p) => p.clone(),
+            None => return Err("No previous folder".to_string()),
+        }
+    } else {
+        expand_folder_name(args, vars)
+    };
+
+    // Remember the folder we are leaving for a later `#`.
+    let leaving = mb.path.clone();
+
     // Save current mailbox first
     mb.quit(vars)?;
 
     // Open new mailbox
-    let path = expand_folder_name(args, vars);
-    let new_mb = Mailbox::load(&path).map_err(|e| format!("{}: {}", path, e))?;
+    let mut new_mb = Mailbox::load(&path).map_err(|e| format!("{}: {}", path, e))?;
+    new_mb.prev_path = Some(leaving);
 
     *mb = new_mb;
     mb.print_headers(None, vars);
@@ -571,6 +644,7 @@ fn cmd_folders(vars: &Variables) -> Result<CommandResult, String> {
 
         Command::new(shell)
             .arg("-c")
+            .arg("--")
             .arg(format!("{} {}", lister, folder))
             .status()
             .map_err(|e| e.to_string())?;
@@ -689,6 +763,11 @@ Commands:
 }
 
 fn cmd_hold(args: &str, mb: &mut Mailbox) -> Result<CommandResult, String> {
+    // Allowed only in the system mailbox (spec 104831).
+    if !mb.is_system_mailbox {
+        return Err("hold: Allowed only in the system mailbox".to_string());
+    }
+
     let msg_nums = if args.is_empty() {
         vec![mb.current]
     } else {
@@ -750,6 +829,11 @@ fn cmd_mail(args: &str, mb: &Mailbox, vars: &mut Variables) -> Result<CommandRes
 }
 
 fn cmd_mbox(args: &str, mb: &mut Mailbox) -> Result<CommandResult, String> {
+    // Allowed only in the system mailbox (spec 104853).
+    if !mb.is_system_mailbox {
+        return Err("mbox: Allowed only in the system mailbox".to_string());
+    }
+
     let msg_nums = if args.is_empty() {
         vec![mb.current]
     } else {
@@ -758,7 +842,10 @@ fn cmd_mbox(args: &str, mb: &mut Mailbox) -> Result<CommandResult, String> {
 
     for num in msg_nums {
         if let Some(m) = mb.get_mut(num) {
+            // Force the message to the secondary mbox at quit, overriding a set
+            // `hold` variable; this also clears any preserve mark.
             m.state = MessageState::Read;
+            m.force_mbox = true;
         }
     }
 
@@ -831,6 +918,7 @@ fn cmd_pipe(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandRes
         if let Some(msg) = mb.get(*num) {
             let mut child = std::process::Command::new(shell)
                 .arg("-c")
+                .arg("--")
                 .arg(&cmd)
                 .stdin(std::process::Stdio::piped())
                 .spawn()
@@ -887,13 +975,15 @@ fn cmd_print(
                 msg.format_display(false, &vars.ignored_headers, &vars.retained_headers)
             };
 
-            // Check if we need to page
+            // Check if we need to page (only when stdout is a terminal, spec
+            // 104362-104367).
             if let Some(crt_lines) = crt {
-                if content.lines().count() > crt_lines as usize {
+                if io::stdout().is_terminal() && content.lines().count() > crt_lines as usize {
                     // Use pager
                     let shell = vars.get("SHELL").unwrap_or("/bin/sh");
                     let mut child = std::process::Command::new(shell)
                         .arg("-c")
+                        .arg("--")
                         .arg(pager)
                         .stdin(std::process::Stdio::piped())
                         .spawn()
@@ -1088,7 +1178,7 @@ fn cmd_save_author(
     Ok(CommandResult::Continue)
 }
 
-fn cmd_set(args: &str, vars: &mut Variables) -> Result<CommandResult, String> {
+pub(crate) fn cmd_set(args: &str, vars: &mut Variables) -> Result<CommandResult, String> {
     if args.is_empty() {
         vars.print_all();
         return Ok(CommandResult::Continue);
@@ -1145,6 +1235,7 @@ fn cmd_shell(cmd: &str, vars: &mut Variables) -> Result<CommandResult, String> {
     let shell = vars.get("SHELL").unwrap_or("/bin/sh");
     Command::new(shell)
         .arg("-c")
+        .arg("--")
         .arg(&cmd)
         .status()
         .map_err(|e| e.to_string())?;
@@ -1276,6 +1367,11 @@ fn cmd_top(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResu
 }
 
 fn cmd_touch(args: &str, mb: &mut Mailbox) -> Result<CommandResult, String> {
+    // Allowed only in the system mailbox (spec 104853, touch grouping).
+    if !mb.is_system_mailbox {
+        return Err("touch: Allowed only in the system mailbox".to_string());
+    }
+
     let msg_nums = if args.is_empty() {
         vec![mb.current]
     } else {
@@ -1284,9 +1380,12 @@ fn cmd_touch(args: &str, mb: &mut Mailbox) -> Result<CommandResult, String> {
 
     for num in msg_nums {
         if let Some(m) = mb.get_mut(num) {
+            // touch marks a message read so it moves to the mbox at quit,
+            // overriding a set `hold` variable (grouped with mbox, spec 104627).
             if m.state == MessageState::New || m.state == MessageState::Unread {
                 m.state = MessageState::Read;
             }
+            m.force_mbox = true;
         }
     }
 
@@ -1333,7 +1432,7 @@ fn cmd_undelete(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<Comman
     Ok(CommandResult::Continue)
 }
 
-fn cmd_unset(args: &str, vars: &mut Variables) -> Result<CommandResult, String> {
+pub(crate) fn cmd_unset(args: &str, vars: &mut Variables) -> Result<CommandResult, String> {
     for name in args.split_whitespace() {
         vars.unset(name);
     }
@@ -1487,10 +1586,9 @@ fn expand_folder_name(name: &str, vars: &Variables) -> String {
             let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
             format!("{}/mbox", home)
         }),
-        "#" => {
-            // Previous file - not implemented
-            name.to_string()
-        }
+        // `#` (previous folder) is resolved by cmd_file, which has the prior
+        // path; reaching here means there was none.
+        "#" => name.to_string(),
         _ => {
             if let Some(user) = name.strip_prefix('%') {
                 format!("/var/mail/{}", user)
@@ -1501,25 +1599,85 @@ fn expand_folder_name(name: &str, vars: &Variables) -> String {
     }
 }
 
+/// Handle a `SIGINT` received while composing a message in input mode.
+///
+/// With `ignore` set, the interrupt prints `@` and discards the current line.
+/// Otherwise the first interrupt warns; a second consecutive interrupt aborts
+/// the message, writing the partial letter to the dead-letter file when `save`
+/// is set.  Returns `true` when the message should be aborted.
+pub(crate) fn interrupt_message(
+    composed: &ComposedMessage,
+    vars: &Variables,
+    interrupt_count: &mut u32,
+) -> bool {
+    if vars.get_bool("ignore") {
+        println!("@");
+        return false;
+    }
+    *interrupt_count += 1;
+    if *interrupt_count >= 2 {
+        if vars.get_bool("save") && !composed.body.is_empty() {
+            crate::send::save_dead_letter(composed, vars);
+        }
+        return true;
+    }
+    println!("(Interrupt -- one more to kill letter)");
+    false
+}
+
 fn compose_message(
     composed: &mut ComposedMessage,
     mb: &Mailbox,
     vars: &mut Variables,
 ) -> Result<(), String> {
-    let stdin = io::stdin();
     let escape_char = vars.escape_char();
+    let mut interrupt_count = 0;
 
     loop {
         let mut line = String::new();
-        match stdin.lock().read_line(&mut line) {
-            Ok(0) => break, // EOF
+        match crate::signals::read_line_interruptible(&mut line) {
+            Ok(0) => {
+                // EOF - if ignoreeof is set, require "." (or ~.) to end.
+                if vars.get_bool("ignoreeof") {
+                    println!("Use \".\" to terminate letter.");
+                    continue;
+                }
+                break;
+            }
             Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                crate::signals::take_sigint();
+                if interrupt_message(composed, vars, &mut interrupt_count) {
+                    return Err("Interrupt".to_string());
+                }
+                continue;
+            }
             Err(e) => return Err(e.to_string()),
         }
 
-        // Check for escape character
-        if line.starts_with(escape_char) && line.len() > 1 {
-            let result = handle_escape(&line[1..], composed, vars, Some(mb))?;
+        // A SIGINT may have arrived between reads.
+        if crate::signals::take_sigint() && interrupt_message(composed, vars, &mut interrupt_count)
+        {
+            return Err("Interrupt".to_string());
+        }
+
+        interrupt_count = 0;
+
+        // Check for escape character (disabled when `escape` is null). Slice
+        // past the escape char by its UTF-8 length so a multibyte escape does
+        // not split a character boundary.
+        if let Some(ec) =
+            escape_char.filter(|ec| line.starts_with(*ec) && line.len() > ec.len_utf8())
+        {
+            // A tilde-escape error is diagnosed but does not abort the message
+            // (spec 105114-105119).
+            let result = match handle_escape(&line[ec.len_utf8()..], composed, vars, Some(mb)) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    continue;
+                }
+            };
             if result.done {
                 if result.abort {
                     return Err("Aborted".to_string());
@@ -1529,8 +1687,8 @@ fn compose_message(
             continue;
         }
 
-        // Check for single period (if dot is set)
-        if vars.get_bool("dot") && line.trim() == "." {
+        // Check for single period (if dot is set, or ignoreeof forces it)
+        if (vars.get_bool("dot") || vars.get_bool("ignoreeof")) && line.trim() == "." {
             break;
         }
 

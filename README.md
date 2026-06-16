@@ -73,6 +73,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] lex (Development)
  - [x] locale (i18n)
  - [x] m4
+ - [x] mailx
  - [x] make
  - [x] man
  - [x] more
@@ -140,7 +141,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] localedef (i18n)
  - [x] logger
  - [x] ls
- - [x] mailx
  - [x] mkdir
  - [x] mv
  - [x] nl

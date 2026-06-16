@@ -391,9 +391,16 @@ pub fn compose_reply(original: &Message, reply_all: bool, vars: &Variables) -> C
 
     // Add recipients
     if reply_all {
-        // Reply to all recipients
-        // Add original sender
-        msg.add_to(original.from());
+        // Reply to all recipients.  The sender portion comes from Reply-To when
+        // present, otherwise from From (spec 104911-104916: in the lowercase
+        // form, From/To/Cc are used only when there is no Reply-To).
+        if let Some(reply_to) = original.get_header("reply-to") {
+            for addr in reply_to.split(',') {
+                msg.add_to(addr);
+            }
+        } else {
+            msg.add_to(original.from());
+        }
 
         // Add all To: recipients
         // If metoo is not set, exclude ourselves and our alternates

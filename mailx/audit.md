@@ -24,15 +24,15 @@ The Receive-Mode command interpreter is broad and largely well-shaped: nearly al
 - [x] **#5 — `-f file` operand mis-parsed into Send Mode.** *(FIXED: `file` is now a trailing operand consumed in Receive Mode; `-f` always selects Receive; `--` end-of-options terminator added.)* `args.rs:64-73` only captures the file when it is the last char of the `-f` cluster *and* the next token does not start with `-`; otherwise the file token hits the `else` at `args.rs:121-124` and is pushed onto `addresses`, and `args.rs:134-135` then selects `Mode::Send`. So `mailx -f -N file` and the RATIONALE's explicitly-required `mailx -fin mymail.box` (spec 105205-105206) send mail to "file"/"mymail.box" instead of reading it. Fix: treat `file` as a normal trailing operand (per XBD 12.2; `file` is an operand, not an option-argument), consumed in Receive Mode when `-f` is set.
 - [x] **#6 — `-n` also suppresses the user `MAILRC` start-up file.** *(FIXED: `load_startup_files` gates only the system file on `-n`; the user MAILRC is always processed.)* Spec Start-Up steps 4–5 (104553-104555) attach "unless the −n option is given" only to the *system* start-up file; the user file named by `MAILRC` is *always* processed. `main.rs:53/78/105` gate the entire `load_startup_files` (both system and user) on `!args.no_init`, so `mailx -n` skips `~/.mailrc` too. Fix: split the two; `-n` skips only the system file.
 - [ ] **#7 — No locale handling; diagnostics hardcoded English.** `grep -nE 'setlocale|gettext|LC_' *.rs` → zero. Spec lists `LANG`/`LC_ALL`/`LC_CTYPE`/`LC_MESSAGES`/`NLSPATH` (104328-104359) as affecting execution; `LC_MESSAGES` shall govern diagnostic and informative text. `setlocale(LC_ALL,"")` is never called and every `eprintln!`/`println!` string is literal English. Fix: `setlocale` near `main`, route diagnostics through `gettext` per project convention.
-- [ ] **#8 — `new` message state never produced; `N` shown as `U`, `:n` selector dead.** `mailbox.rs:69` sets every loaded message to `MessageState::Unread` (`// Assume unread for now`); only a `Status:` header containing `R`/`O` promotes to `Read` (`mailbox.rs:100-102`). `MessageState::New` is therefore unreachable from a real mailbox, so genuinely new mail displays state char `U` instead of `N` (spec 104491-104496), and `:n` (`msglist.rs:192`) matches nothing. Fix: treat absence of `Status:`/`O` as `New`, presence of `O` (without `R`) as `Unread`.
+- [x] **#8 — `new` message state never produced; `N` shown as `U`, `:n` selector dead.** *(FIXED: loaded messages default to `New`; `Status:` with `R`→`Read`, `O`-only→`Unread`; absence stays `New`. `:n` and the `N` char now work; current = first new/unread per spec 104481-104482.)* `mailbox.rs:69` sets every loaded message to `MessageState::Unread` (`// Assume unread for now`); only a `Status:` header containing `R`/`O` promotes to `Read` (`mailbox.rs:100-102`). `MessageState::New` is therefore unreachable from a real mailbox, so genuinely new mail displays state char `U` instead of `N` (spec 104491-104496), and `:n` (`msglist.rs:192`) matches nothing. Fix: treat absence of `Status:`/`O` as `New`, presence of `O` (without `R`) as `Unread`.
 - [ ] **#9 — `~:` / `~_` command-level escape is a stub, and `~:set` does not set.** `escapes.rs:732-775` (`execute_input_mode_command`) handles only `set`, `echo`, `!`; it ignores `_msg`/`_mb`, and its `set` arm merely `println!`s each argument (`escapes.rs:755-759`) instead of mutating `vars`. Spec 105048-105049: "`~: mailx-command` … Perform the command-level request." Fix: dispatch through the real command interpreter (the command-mode subset that is valid here), and actually apply `set`.
 - [ ] **#10 — `~w file` truncates instead of appending.** `escapes.rs:293` uses `fs::write` (truncate). Spec 105094-105097: "The file shall be created or the message shall be appended to it if the file already exists." Fix: open with create+append.
-- [ ] **#11 — reply-all ignores `Reply-To`.** `compose_reply` for the lowercase (reply-all) form (`send.rs:392-432`) unconditionally seeds recipients from `From` + `To` + `Cc` and never consults `Reply-To`. Spec 104911-104916: in the lowercase form, only *when there is no* `Reply-To` are `From`,`To`,`Cc` used; when `Reply-To` is present the From-derived path does not apply (implementation-defined Reply-To/To/Cc). Fix: branch on `Reply-To` presence.
+- [x] **#11 — reply-all ignores `Reply-To`.** *(FIXED: reply-all seeds the sender portion from `Reply-To` when present, else `From`.)* `compose_reply` for the lowercase (reply-all) form (`send.rs:392-432`) unconditionally seeds recipients from `From` + `To` + `Cc` and never consults `Reply-To`. Spec 104911-104916: in the lowercase form, only *when there is no* `Reply-To` are `From`,`To`,`Cc` used; when `Reply-To` is present the From-derived path does not apply (implementation-defined Reply-To/To/Cc). Fix: branch on `Reply-To` presence.
 
 ### Minor
 
 - [ ] **#12 — `set escape=` (null) does not disable escaping.** `variables.rs:99-103` returns `'~'` via `unwrap_or('~')` when the value is empty. Spec 104610-104612: "if it is set to null, command escaping shall be disabled." Fix: distinguish unset (`~`) from set-empty (disabled).
-- [ ] **#13 — `mbox`/`touch`/`hold` not restricted to the system mailbox; `mbox` cannot override a set `hold` variable.** `commands.rs` `cmd_mbox`/`cmd_touch`/`cmd_hold` perform no "system mailbox only" check (spec 104831, 104853, 104986). `cmd_mbox` sets `Read`; at quit a `Read` message with the `hold` *variable* set is kept in place (`mailbox.rs:291-296`), so `mbox` does not force the message to the secondary mailbox as required (spec 104853-104855). Fix: add a distinct "force-to-mbox" state and gate the three commands on `is_system_mailbox`.
+- [x] **#13 — `mbox`/`touch`/`hold` not restricted to the system mailbox; `mbox` cannot override a set `hold` variable.** *(FIXED: the three commands are gated on `is_system_mailbox`; a new `Message.force_mbox` flag set by `mbox`/`touch` forces the message to the secondary mbox at quit, overriding the `hold` variable.)* `commands.rs` `cmd_mbox`/`cmd_touch`/`cmd_hold` perform no "system mailbox only" check (spec 104831, 104853, 104986). `cmd_mbox` sets `Read`; at quit a `Read` message with the `hold` *variable* set is kept in place (`mailbox.rs:291-296`), so `mbox` does not force the message to the secondary mailbox as required (spec 104853-104855). Fix: add a distinct "force-to-mbox" state and gate the three commands on `is_system_mailbox`.
 - [ ] **#14 — Start-up files: invalid commands silently ignored; several legal commands not executed.** `execute_startup_command` (`commands.rs:259-273`) whitelists only alias/alternates/discard/retain/set/unset/source/if and maps everything else to `Ok(())`. The spec's *invalid-in-startup* list (104557-104559) should produce a diagnostic (and "any errors … shall … terminate … or … continue after writing a diagnostic"); conversely legal start-up commands such as `cd`, `echo`, `folders` are dropped. Fix: diagnose the invalid set, execute the rest.
 - [ ] **#15 — `crt` pagination ignores whether stdout is a terminal.** `commands.rs:891` / `escapes.rs:233` paginate whenever the line count exceeds `crt`. Spec 104362-104367 gates pagination on stdout being a terminal device. Fix: only auto-page when `io::stdout().is_terminal()`.
 - [ ] **#16 — `if s|r` is a no-op in command mode.** `commands.rs:137-139` returns `Continue` for `if`/`else`/`endif`, so an interactive/`source`d conditional block always executes its body regardless of mode (spec 104836-104844). Only the start-up loader (`main.rs:264-331`) honors conditionals. Fix: track conditional state in `execute_command`.
@@ -124,17 +124,17 @@ The Receive-Mode command interpreter is broad and largely well-shaped: nearly al
 | `from` | CONFORMS | `commands.rs:616-625`. |
 | `headers` | CONFORMS | screenful pagination — `commands.rs:627-644`. |
 | `help`/`?` | CONFORMS | `commands.rs:646-689`. |
-| `hold`/`preserve` | PARTIAL | (#13) no system-mailbox gate. |
+| `hold`/`preserve` | CONFORMS | (#13 FIXED) gated on the system mailbox. |
 | `if`/`else`/`endif` | **DIVERGES** | (#16) no-op in command mode. |
 | `list` | CONFORMS | `commands.rs:707-717`. |
 | `mail` | CONFORMS | alias expand, asksub — `commands.rs:719-750`. |
-| `mbox` | **PARTIAL** | (#13) can't override `hold` variable; no system-mailbox gate. |
+| `mbox` | CONFORMS | (#13 FIXED) gated on the system mailbox; `force_mbox` overrides the `hold` variable. |
 | `next` | CONFORMS | `displayed`-flag logic per RATIONALE — `commands.rs:768-787`. |
 | `pipe` | CONFORMS | (#4 FIXED) `--` inserted; `cmd`/`page` handled — `commands.rs:789-867`. |
 | `Print`/`Type` | CONFORMS | overrides suppression — `commands.rs:867-930`. |
 | `print`/`type` | PARTIAL | (#15) crt pagination ignores tty. |
 | `quit` | CONFORMS | `main.rs:178-179`, `mailbox.rs:261-331`. |
-| `reply`/`Reply` (`flipr`) | PARTIAL | (#11) reply-all ignores `Reply-To`; r/R + flipr mapping correct — `commands.rs:168-183`. |
+| `reply`/`Reply` (`flipr`) | CONFORMS | (#11 FIXED) reply-all uses `Reply-To` when present; r/R + flipr mapping correct. |
 | `retain` | CONFORMS | overrides discard/ignore — `commands.rs:965-978`. |
 | `save`/`Save` | CONFORMS | msglist-or-file disambiguation — `commands.rs:989-1089`. |
 | `set` | CONFORMS | `no`-prefix unset, `=` values, `print_all` — `commands.rs:1091-1115`. |
@@ -142,7 +142,7 @@ The Receive-Mode command interpreter is broad and largely well-shaped: nearly al
 | `size` | CONFORMS | `commands.rs:1193-1207`. |
 | `source` | CONFORMS | `commands.rs:1209-1223`. |
 | `top` | CONFORMS | `toplines` — `commands.rs:1238-1276`. |
-| `touch` | PARTIAL | (#13) no system-mailbox gate. |
+| `touch` | CONFORMS | (#13 FIXED) gated on the system mailbox; forces message to mbox. |
 | `unalias` | CONFORMS | `commands.rs:1296-1301`. |
 | `undelete` | CONFORMS | default-selection rules — `commands.rs:1303-1334`. |
 | `unset` | CONFORMS | `commands.rs:1336-1341`. |
@@ -203,7 +203,7 @@ The Receive-Mode command interpreter is broad and largely well-shaped: nearly al
 - [x] `-f -N file` / `mailx -fin file` operand parsing (#5) — `opt_f_operand_after_other_options`, `opt_f_clustered_fin_operand`.
 - [x] `mailx -n` still reading `~/.mailrc` (#6) — `opt_n_still_reads_user_mailrc`.
 - [ ] `LC_*`/`setlocale` effect on diagnostics (#7).
-- [ ] `new` vs `unread` state characters / `:n` selector (#8).
+- [x] `new` vs `unread` state characters / `:n` selector (#8) — `new_state_and_n_selector`.
 - [ ] `~:set` actually setting a variable (#9); `~w` append (#10); reply-all `Reply-To` (#11); `escape=` disabling escapes (#12).
 
 ## Suggested PR groupings

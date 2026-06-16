@@ -63,10 +63,11 @@ impl Mailbox {
                     mailbox.messages.push(msg);
                 }
 
-                // Start new message
+                // Start new message.  Absent a Status: header it is `new`
+                // (spec 104491-104496); a Status: header may downgrade it below.
                 let mut msg = Message::new();
                 msg.from_line = line;
-                msg.state = MessageState::Unread; // Assume unread for now
+                msg.state = MessageState::New;
                 current_msg = Some(msg);
                 in_headers = true;
                 header_continuation = false;
@@ -96,9 +97,15 @@ impl Mailbox {
                         let key = line[..colon_pos].to_lowercase();
                         let value = line[colon_pos + 1..].trim().to_string();
 
-                        // Check for Status header to determine message state
-                        if key == "status" && (value.contains('R') || value.contains('O')) {
-                            msg.state = MessageState::Read;
+                        // A Status: header records prior disposition: `R`
+                        // (read) wins; `O` alone (seen but not read) is unread.
+                        // Absence of Status: leaves the message `new`.
+                        if key == "status" {
+                            if value.contains('R') {
+                                msg.state = MessageState::Read;
+                            } else if value.contains('O') {
+                                msg.state = MessageState::Unread;
+                            }
                         }
 
                         msg.headers.insert(key.clone(), value);
@@ -278,6 +285,12 @@ impl Mailbox {
         let mut keep_messages = Vec::new();
 
         for msg in &self.messages {
+            // The mbox/touch commands force a message into the secondary mbox,
+            // overriding a set `hold` variable (spec 104853-104855).
+            if msg.force_mbox && msg.state != MessageState::Deleted {
+                mbox_messages.push(msg.clone());
+                continue;
+            }
             match msg.state {
                 MessageState::Deleted => {
                     // Discard

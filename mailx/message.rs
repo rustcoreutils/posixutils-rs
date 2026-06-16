@@ -50,6 +50,9 @@ pub struct Message {
     pub state: MessageState,
     /// Whether this message has been displayed
     pub displayed: bool,
+    /// Set by the `mbox`/`touch` commands: force this message into the secondary
+    /// mbox at quit even when the `hold` variable is set (spec 104853-104855).
+    pub force_mbox: bool,
 }
 
 impl Message {
@@ -61,6 +64,7 @@ impl Message {
             body: String::new(),
             state: MessageState::New,
             displayed: false,
+            force_mbox: false,
         }
     }
 

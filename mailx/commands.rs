@@ -690,6 +690,11 @@ Commands:
 }
 
 fn cmd_hold(args: &str, mb: &mut Mailbox) -> Result<CommandResult, String> {
+    // Allowed only in the system mailbox (spec 104831).
+    if !mb.is_system_mailbox {
+        return Err("hold: Allowed only in the system mailbox".to_string());
+    }
+
     let msg_nums = if args.is_empty() {
         vec![mb.current]
     } else {
@@ -751,6 +756,11 @@ fn cmd_mail(args: &str, mb: &Mailbox, vars: &mut Variables) -> Result<CommandRes
 }
 
 fn cmd_mbox(args: &str, mb: &mut Mailbox) -> Result<CommandResult, String> {
+    // Allowed only in the system mailbox (spec 104853).
+    if !mb.is_system_mailbox {
+        return Err("mbox: Allowed only in the system mailbox".to_string());
+    }
+
     let msg_nums = if args.is_empty() {
         vec![mb.current]
     } else {
@@ -759,7 +769,10 @@ fn cmd_mbox(args: &str, mb: &mut Mailbox) -> Result<CommandResult, String> {
 
     for num in msg_nums {
         if let Some(m) = mb.get_mut(num) {
+            // Force the message to the secondary mbox at quit, overriding a set
+            // `hold` variable; this also clears any preserve mark.
             m.state = MessageState::Read;
+            m.force_mbox = true;
         }
     }
 
@@ -1280,6 +1293,11 @@ fn cmd_top(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResu
 }
 
 fn cmd_touch(args: &str, mb: &mut Mailbox) -> Result<CommandResult, String> {
+    // Allowed only in the system mailbox (spec 104853, touch grouping).
+    if !mb.is_system_mailbox {
+        return Err("touch: Allowed only in the system mailbox".to_string());
+    }
+
     let msg_nums = if args.is_empty() {
         vec![mb.current]
     } else {
@@ -1288,9 +1306,12 @@ fn cmd_touch(args: &str, mb: &mut Mailbox) -> Result<CommandResult, String> {
 
     for num in msg_nums {
         if let Some(m) = mb.get_mut(num) {
+            // touch marks a message read so it moves to the mbox at quit,
+            // overriding a set `hold` variable (grouped with mbox, spec 104627).
             if m.state == MessageState::New || m.state == MessageState::Unread {
                 m.state = MessageState::Read;
             }
+            m.force_mbox = true;
         }
     }
 

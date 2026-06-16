@@ -1456,10 +1456,12 @@ fn cmd_equals() {
         },
         |_plan, output| {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            // = should print current message number (1)
+            // = prints the current message number. testdata.mbox has no `new`
+            // message but message 3 (`Status: O`) is unread, so the current
+            // message is the first unread = 3 (spec 104481-104482).
             assert!(
-                stdout.contains("1"),
-                "= should show current message number: {}",
+                stdout.trim().lines().any(|l| l.trim() == "3"),
+                "= should show the current message number (first unread = 3): {}",
                 stdout
             );
             assert!(output.status.success());
@@ -2399,3 +2401,185 @@ fn create_temp_mailrc(content: &str) -> NamedTempFile {
 }
 
 use plib::testing::run_test_with_checker_and_env;
+
+// =============================================================================
+// `new` message state and the :n selector (audit #8)
+// =============================================================================
+
+/// A message with no Status: header is `new` (shown as `N`); a `:n` selector
+/// matches only such messages.
+#[test]
+fn new_state_and_n_selector() {
+    let body = "From new@example.com Mon Jan  1 10:00:00 2024\n\
+                From: new@example.com\n\
+                Subject: brand new\n\
+                \n\
+                fresh\n\
+                \n\
+                From old@example.com Mon Jan  1 09:00:00 2024\n\
+                From: old@example.com\n\
+                Status: RO\n\
+                Subject: already read\n\
+                \n\
+                stale\n";
+    let mbox = create_temp_mbox(body);
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox.path().to_str().unwrap().to_string(),
+            ],
+            // `from :n` lists header lines of new messages only.
+            stdin_data: String::from("from :n\nquit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains("new@example.com"),
+                ":n should match the new message: {}",
+                stdout
+            );
+            assert!(
+                !stdout.contains("old@example.com"),
+                ":n must not match the already-read message: {}",
+                stdout
+            );
+            // The new message shows the `N` state character.
+            assert!(
+                stdout
+                    .lines()
+                    .any(|l| l.contains('N') && l.contains("new@example.com")),
+                "new message should display state char N: {}",
+                stdout
+            );
+        },
+    );
+}
+
+// =============================================================================
+// reply-all honors Reply-To (audit #11)
+// =============================================================================
+
+/// In the reply-all (lowercase) form, the sender portion comes from Reply-To
+/// when present, not From.
+#[test]
+fn reply_all_uses_reply_to() {
+    let body = "From original@example.com Mon Jan  1 10:00:00 2024\n\
+                From: original@example.com\n\
+                Reply-To: replyto@example.com\n\
+                To: listmember@example.com\n\
+                Subject: hi\n\
+                \n\
+                hello\n";
+    let mbox = create_temp_mbox(body);
+    let mailrc = create_temp_mailrc("set debug\nset dot\n");
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-N"),
+                String::from("-f"),
+                mbox.path().to_str().unwrap().to_string(),
+            ],
+            stdin_data: String::from("reply 1\nReplying.\n.\nquit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("MAILRC", mailrc.path().to_str().unwrap())],
+        |_plan, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("replyto@example.com"),
+                "reply-all should use Reply-To: {}",
+                stderr
+            );
+            assert!(
+                !stderr.contains("original@example.com"),
+                "reply-all must not use From when Reply-To is present: {}",
+                stderr
+            );
+        },
+    );
+}
+
+// =============================================================================
+// mbox overrides the hold variable; commands gated to the system mailbox (#13)
+// =============================================================================
+
+/// `mbox` forces a message into the secondary mbox at quit even when the `hold`
+/// variable is set. Uses MAIL to make a temp file the system mailbox.
+#[test]
+fn mbox_overrides_hold_variable() {
+    let sys = create_temp_mbox(
+        "From sender@example.com Mon Jan  1 10:00:00 2024\n\
+         From: sender@example.com\n\
+         Status: RO\n\
+         Subject: keep me in mbox\n\
+         \n\
+         body\n",
+    );
+    let mbox_file = NamedTempFile::new().expect("mbox file");
+    let sys_path = sys.path().to_str().unwrap().to_string();
+    let mbox_path = mbox_file.path().to_str().unwrap().to_string();
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            // No -f: the MAIL file is the *system* mailbox, so mbox is allowed.
+            args: vec![String::from("-n"), String::from("-N")],
+            stdin_data: String::from("set hold\nmbox 1\nquit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("MAIL", &sys_path), ("MBOX", &mbox_path)],
+        |_plan, output| {
+            assert!(output.status.success());
+            let saved = std::fs::read_to_string(&mbox_path).unwrap_or_default();
+            assert!(
+                saved.contains("sender@example.com"),
+                "mbox should force the message into the secondary mbox despite hold: {:?}",
+                saved
+            );
+        },
+    );
+}
+
+/// `mbox` is rejected (diagnostic) when not reading the system mailbox.
+#[test]
+fn mbox_rejected_outside_system_mailbox() {
+    let mbox = copy_test_data("testdata.mbox");
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox.path().to_str().unwrap().to_string(),
+            ],
+            stdin_data: String::from("mbox 1\nquit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("system mailbox"),
+                "mbox outside the system mailbox should be diagnosed: {}",
+                stderr
+            );
+        },
+    );
+}

@@ -38,7 +38,11 @@ fn print_action<C: Display>(
             opened_files.write_out(format!("trap -- '' {}\n", condition));
         }
         TrapAction::Commands(cmd) => {
-            opened_files.write_out(format!("trap -- '{cmd}' {}\n", condition));
+            opened_files.write_out(format!(
+                "trap -- {} {}\n",
+                crate::utils::shell_quote(cmd),
+                condition
+            ));
         }
     }
 }

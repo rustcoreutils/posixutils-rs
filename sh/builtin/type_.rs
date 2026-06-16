@@ -15,6 +15,12 @@ use crate::os::find_command;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
 
+/// The POSIX shell reserved words (Section 2.4).
+const RESERVED_WORDS: &[&str] = &[
+    "!", "{", "}", "case", "do", "done", "elif", "else", "esac", "fi", "for", "if", "in", "then",
+    "until", "while",
+];
+
 pub struct Type_;
 
 impl BuiltinUtility for Type_ {
@@ -29,6 +35,8 @@ impl BuiltinUtility for Type_ {
         for command_name in args {
             if let Some(alias) = shell.alias_table.get(command_name) {
                 opened_files.write_out(format!("{} is aliased to '{}'\n", command_name, alias));
+            } else if RESERVED_WORDS.contains(&command_name.as_str()) {
+                opened_files.write_out(format!("{} is a shell keyword\n", command_name));
             } else if get_special_builtin_utility(command_name).is_some() {
                 opened_files.write_out(format!("{} is a special shell builtin\n", command_name));
             } else if shell.functions.contains_key(command_name.as_str()) {

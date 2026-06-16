@@ -180,6 +180,11 @@ pub struct Shell {
     pub is_subshell: bool,
     pub last_pipeline_command: String,
     pub terminal: Terminal,
+    /// `getopts` keeps `OPTIND` a plain integer; the within-argument position
+    /// for bundled options (`-abc`) is tracked here, as `(optind_we_wrote,
+    /// option_index)`. If `OPTIND` differs from `optind_we_wrote` on entry the
+    /// application reset it and the option index restarts at 0.
+    pub getopts_state: (usize, usize),
 }
 
 impl Shell {
@@ -770,6 +775,7 @@ impl Shell {
                     }
 
                     let mut current_stdin = libc::STDIN_FILENO;
+                    let mut head_pids = Vec::new();
                     for command in pipeline.commands.head() {
                         let (read_pipe, write_pipe) = pipe()?;
                         match fork()? {
@@ -786,7 +792,8 @@ impl Shell {
                                 }
                                 self.exit(return_status);
                             }
-                            ForkResult::Parent { .. } => {
+                            ForkResult::Parent { child } => {
+                                head_pids.push(child);
                                 if current_stdin != libc::STDIN_FILENO {
                                     close(current_stdin)?;
                                 }
@@ -797,7 +804,25 @@ impl Shell {
                     dup2(current_stdin, libc::STDIN_FILENO)?;
                     let return_status = self.interpret_command(pipeline.commands.last(), false);
                     close(current_stdin)?;
-                    self.exit(return_status);
+                    // With `pipefail`, the pipeline status is that of the
+                    // rightmost command that exited non-zero (else 0); otherwise
+                    // it is the status of the last command only.
+                    let exit_status = if self.set_options.pipefail {
+                        let mut statuses: Vec<i32> = head_pids
+                            .into_iter()
+                            .map(|pid| self.wait_child_process(pid).unwrap_or(0))
+                            .collect();
+                        statuses.push(return_status);
+                        statuses
+                            .iter()
+                            .rev()
+                            .find(|&&s| s != 0)
+                            .copied()
+                            .unwrap_or(0)
+                    } else {
+                        return_status
+                    };
+                    self.exit(exit_status);
                 }
                 ForkResult::Parent { child } => {
                     loop {
@@ -1098,6 +1123,7 @@ impl Default for Shell {
             saved_command_locations: HashMap::with_capacity(DEFAULT_COMMAND_CACHE_CAPACITY),
             is_subshell: false,
             last_pipeline_command: String::new(),
+            getopts_state: (0, 0),
             terminal: Terminal::default(),
         }
     }

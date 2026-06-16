@@ -12,3 +12,4 @@ xtrace    off
 ignoreeof off
 nolog     off
 vi        off
+pipefail  off

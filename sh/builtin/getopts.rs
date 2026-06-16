@@ -84,11 +84,19 @@ impl<'s> OptsParser<'s> {
                                     return ParseResult::MissingArg(c);
                                 }
                             } else if i == *option_index {
-                                *option_index += 1;
+                                advance_position(
+                                    param_index,
+                                    option_index,
+                                    pos + c.len_utf8() >= options.len() - 1,
+                                );
                                 return ParseResult::SimpleOption(c);
                             }
                         } else if i == *option_index {
-                            *option_index += 1;
+                            advance_position(
+                                param_index,
+                                option_index,
+                                pos + c.len_utf8() >= options.len() - 1,
+                            );
                             return ParseResult::InvalidOption(c);
                         }
                         i += 1;
@@ -104,35 +112,15 @@ impl<'s> OptsParser<'s> {
     }
 }
 
-fn parse_optind(value: &str) -> Result<(usize, usize), &'static str> {
-    if let Some(pos) = value.find(':') {
-        let (parameter, option) = value.split_at(pos);
-        let parameter_index = parameter
-            .parse::<usize>()
-            .map_err(|_| "getopts: invalid OPTIND")?;
-        if parameter_index < 1 {
-            return Err("getopts: invalid OPTIND");
-        }
-        let option_index = option[1..]
-            .parse::<usize>()
-            .map_err(|_| "getopts: invalid OPTIND")?;
-        Ok((parameter_index - 1, option_index))
+/// After returning an option, advance to the next within-argument position; if
+/// the option was the argument's last character, advance to the next argument
+/// so OPTIND points past it (matching POSIX/bash OPTIND semantics).
+fn advance_position(param_index: &mut usize, option_index: &mut usize, is_last_in_arg: bool) {
+    if is_last_in_arg {
+        *param_index += 1;
+        *option_index = 0;
     } else {
-        let parameter_index = value
-            .parse::<usize>()
-            .map_err(|_| "getopts: invalid OPTIND")?;
-        if parameter_index < 1 {
-            return Err("getopts: invalid OPTIND");
-        }
-        Ok((parameter_index - 1, 0))
-    }
-}
-
-fn optind_string(parameter_index: usize, option_index: usize) -> String {
-    if option_index == 0 {
-        parameter_index.to_string()
-    } else {
-        format!("{parameter_index}:{option_index}")
+        *option_index += 1;
     }
 }
 
@@ -152,8 +140,21 @@ impl BuiltinUtility for GetOpts {
 
         let quiet_errs = args[0].starts_with(':');
         let parser = OptsParser::new(&args[0][quiet_errs as usize..])?;
-        let optind = shell.environment.get_str_value("OPTIND").unwrap_or("1");
-        let (mut parameter_index, mut option_index) = parse_optind(optind)?;
+        // OPTIND is a plain 1-based integer (the next argument to inspect). The
+        // within-argument position for bundled options is tracked in shell state
+        // and reset whenever the application changes OPTIND.
+        let optind_val: usize = shell
+            .environment
+            .get_str_value("OPTIND")
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(1);
+        let mut parameter_index = optind_val - 1;
+        let mut option_index = if optind_val == shell.getopts_state.0 {
+            shell.getopts_state.1
+        } else {
+            0
+        };
 
         let var_name = args[1].as_str();
         if !is_valid_name(var_name) {
@@ -199,13 +200,16 @@ impl BuiltinUtility for GetOpts {
                 }
                 0
             }
-            ParseResult::EndOfOptions => 1,
+            ParseResult::EndOfOptions => {
+                // POSIX: at end of options the name variable is set to '?'.
+                shell.assign_global(var_name.to_string(), "?".to_string())?;
+                1
+            }
         };
 
-        shell.assign_global(
-            "OPTIND".to_string(),
-            optind_string(parameter_index + 1, option_index),
-        )?;
+        let new_optind = parameter_index + 1;
+        shell.assign_global("OPTIND".to_string(), new_optind.to_string())?;
+        shell.getopts_state = (new_optind, option_index);
 
         Ok(status)
     }
@@ -225,20 +229,20 @@ mod tests {
             parser.parse(&params, &mut param_index, &mut options_index),
             ParseResult::SimpleOption('a')
         );
-        assert_eq!(param_index, 0);
-        assert_eq!(options_index, 1);
+        assert_eq!(param_index, 1);
+        assert_eq!(options_index, 0);
         assert_eq!(
             parser.parse(&params, &mut param_index, &mut options_index),
             ParseResult::SimpleOption('b')
         );
-        assert_eq!(param_index, 1);
-        assert_eq!(options_index, 1);
+        assert_eq!(param_index, 2);
+        assert_eq!(options_index, 0);
         assert_eq!(
             parser.parse(&params, &mut param_index, &mut options_index),
             ParseResult::SimpleOption('c')
         );
-        assert_eq!(param_index, 2);
-        assert_eq!(options_index, 1);
+        assert_eq!(param_index, 3);
+        assert_eq!(options_index, 0);
     }
 
     #[test]
@@ -263,8 +267,8 @@ mod tests {
             parser.parse(&params, &mut param_index, &mut options_index),
             ParseResult::SimpleOption('c')
         );
-        assert_eq!(param_index, 0);
-        assert_eq!(options_index, 3);
+        assert_eq!(param_index, 1);
+        assert_eq!(options_index, 0);
     }
 
     #[test]
@@ -423,14 +427,14 @@ mod tests {
             parser.parse(&params, &mut param_index, &mut options_index),
             ParseResult::SimpleOption('b')
         );
-        assert_eq!(param_index, 0);
-        assert_eq!(options_index, 2);
+        assert_eq!(param_index, 1);
+        assert_eq!(options_index, 0);
         assert_eq!(
             parser.parse(&params, &mut param_index, &mut options_index),
             ParseResult::SimpleOption('c')
         );
-        assert_eq!(param_index, 1);
-        assert_eq!(options_index, 1);
+        assert_eq!(param_index, 2);
+        assert_eq!(options_index, 0);
         assert_eq!(
             parser.parse(&params, &mut param_index, &mut options_index),
             ParseResult::EndOfOptions
@@ -454,8 +458,8 @@ mod tests {
             parser.parse(&params, &mut param_index, &mut options_index),
             ParseResult::SimpleOption('a')
         );
-        assert_eq!(param_index, 0);
-        assert_eq!(options_index, 1);
+        assert_eq!(param_index, 1);
+        assert_eq!(options_index, 0);
         assert_eq!(
             parser.parse(&params, &mut param_index, &mut options_index),
             ParseResult::SimpleOption('b')
@@ -466,8 +470,8 @@ mod tests {
             parser.parse(&params, &mut param_index, &mut options_index),
             ParseResult::SimpleOption('c')
         );
-        assert_eq!(param_index, 1);
-        assert_eq!(options_index, 2);
+        assert_eq!(param_index, 2);
+        assert_eq!(options_index, 0);
         assert_eq!(
             parser.parse(&params, &mut param_index, &mut options_index),
             ParseResult::EndOfOptions

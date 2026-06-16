@@ -15,7 +15,12 @@ use crate::shell::Shell;
 pub struct BuiltinUnset;
 
 impl SpecialBuiltinUtility for BuiltinUnset {
-    fn exec(&self, args: &[String], shell: &mut Shell, _: &mut OpenedFiles) -> BuiltinResult {
+    fn exec(
+        &self,
+        args: &[String],
+        shell: &mut Shell,
+        opened_files: &mut OpenedFiles,
+    ) -> BuiltinResult {
         let mut unset_var = false;
         let mut unset_function = false;
         let mut parser = OptionParser::new(args);
@@ -23,9 +28,6 @@ impl SpecialBuiltinUtility for BuiltinUnset {
             .next_option()
             .map_err(|arg| format!("unset: invalid option {arg}"))?
         {
-            if unset_var || unset_function {
-                return Err("unset: cannot set multiple options".into());
-            }
             match option {
                 'f' => {
                     unset_function = true;
@@ -39,6 +41,13 @@ impl SpecialBuiltinUtility for BuiltinUnset {
             }
         }
 
+        // -f and -v are contradictory; repeating the same option is harmless.
+        // This usage error is non-fatal (matches bash): diagnose and return 1.
+        if unset_var && unset_function {
+            opened_files
+                .write_err("unset: cannot simultaneously unset a function and a variable\n");
+            return Ok(1);
+        }
         if !unset_var && !unset_function {
             unset_var = true;
         }

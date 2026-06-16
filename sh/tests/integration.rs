@@ -213,6 +213,7 @@ xtrace    off
 ignoreeof off
 nolog     off
 vi        off
+pipefail  off
 "#;
         test_cli(vec!["-c", "set -o"], "", output);
         test_cli(vec!["-s"], "set -o", output);
@@ -234,6 +235,7 @@ set +o xtrace
 set +o ignoreeof
 set +o nolog
 set +o vi
+set +o pipefail
 "#;
         test_cli(vec!["-c", "set +o"], "", output);
         test_cli(vec!["-s"], "set +o", output);
@@ -255,6 +257,7 @@ xtrace    off
 ignoreeof off
 nolog     off
 vi        off
+pipefail  off
 "#;
         test_cli(
             vec!["-c", "-aef", "+vx", "-o", "nounset", "set -o"],
@@ -275,6 +278,7 @@ set +o xtrace
 set +o ignoreeof
 set +o nolog
 set +o vi
+set +o pipefail
 "#;
         test_cli(
             vec!["-c", "-aef", "+vx", "-o", "nounset", "set +o"],
@@ -1686,6 +1690,60 @@ mod audit_regressions {
                 assert_eq!(output.status.code(), Some(127));
             },
         );
+    }
+
+    // ----- Phase 6: pipefail & built-in output hygiene -----
+
+    #[test]
+    fn pipefail_derives_pipeline_status() {
+        // #14
+        run_successfully_and("set -o pipefail; false | true; echo $?\n", |out| {
+            assert_eq!(out, "1\n");
+        });
+        run_successfully_and("set -o pipefail; true | true; echo $?\n", |out| {
+            assert_eq!(out, "0\n");
+        });
+        // without pipefail, only the last command counts
+        run_successfully_and("false | true; echo $?\n", |out| assert_eq!(out, "0\n"));
+    }
+
+    #[test]
+    fn type_identifies_reserved_words() {
+        // #16
+        run_successfully_and("type if\n", |out| {
+            assert_eq!(out, "if is a shell keyword\n");
+        });
+        run_successfully_and("type while\n", |out| {
+            assert_eq!(out, "while is a shell keyword\n");
+        });
+    }
+
+    #[test]
+    fn getopts_optind_is_a_plain_integer() {
+        // #17: OPTIND stays numeric, so `shift $((OPTIND-1))` works.
+        run_successfully_and(
+            "set -- -a foo; getopts a o; shift $((OPTIND-1)); echo \"$1\"\n",
+            |out| assert_eq!(out, "foo\n"),
+        );
+        run_successfully_and("set -- -a x; getopts a o; echo \"$OPTIND\"\n", |out| {
+            assert_eq!(out, "2\n");
+        });
+    }
+
+    #[test]
+    fn export_p_output_is_reinputtable() {
+        // #25: a value containing a single quote is still quoted safely.
+        run_successfully_and("export \"Q=a'b\"; export -p | grep '^export Q'\n", |out| {
+            assert_eq!(out, "export Q='a'\\''b'\n")
+        });
+    }
+
+    #[test]
+    fn unset_repeated_option_is_ok() {
+        // #47
+        run_successfully_and("x=1; unset -v -v x; echo \"[${x-gone}]\"\n", |out| {
+            assert_eq!(out, "[gone]\n");
+        });
     }
 
     #[test]

@@ -50,9 +50,9 @@ impl SpecialBuiltinUtility for SetSpecialBuiltin {
                         for (key, value) in sorted_vars {
                             // key should only contain valid ascii
                             opened_files.write_out(format!(
-                                "{}='{}'\n",
+                                "{}={}\n",
                                 key.to_str().unwrap(),
-                                value
+                                crate::utils::shell_quote(value)
                             ));
                         }
                     }
@@ -93,6 +93,8 @@ pub struct SetOptions {
     pub ignoreeof: bool,
     pub nolog: bool,
     pub vi: bool,
+    /// -o pipefail
+    pub pipefail: bool,
 }
 
 impl Default for SetOptions {
@@ -112,6 +114,7 @@ impl Default for SetOptions {
             ignoreeof: false,
             nolog: false,
             vi: false,
+            pipefail: false,
         }
     }
 }
@@ -138,6 +141,7 @@ impl SetOptions {
             "nolog" => self.nolog = value,
             "notify" => self.notify = value,
             "nounset" => self.nounset = value,
+            "pipefail" => self.pipefail = value,
             "vi" => self.vi = value,
             "xtrace" => self.xtrace = value,
             _ => return Err(format!("invalid option '{}'", long_option)),
@@ -182,6 +186,7 @@ impl SetOptions {
         writeln!(&mut result, "ignoreeof {}", option(self.ignoreeof)).unwrap();
         writeln!(&mut result, "nolog     {}", option(self.nolog)).unwrap();
         writeln!(&mut result, "vi        {}", option(self.vi)).unwrap();
+        writeln!(&mut result, "pipefail  {}", option(self.pipefail)).unwrap();
         result
     }
 
@@ -204,6 +209,7 @@ impl SetOptions {
         writeln!(&mut result, "set {}o ignoreeof", option(self.ignoreeof)).unwrap();
         writeln!(&mut result, "set {}o nolog", option(self.nolog)).unwrap();
         writeln!(&mut result, "set {}o vi", option(self.vi)).unwrap();
+        writeln!(&mut result, "set {}o pipefail", option(self.pipefail)).unwrap();
         result
     }
 

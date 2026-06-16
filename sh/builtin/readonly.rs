@@ -23,7 +23,7 @@ impl SpecialBuiltinUtility for ReadOnly {
     ) -> BuiltinResult {
         if args.first().is_some_and(|arg| arg == "-p") {
             if args.len() > 1 && !(args.len() == 2 && args[1] == "--") {
-                return Err("export: too many arguments".into());
+                return Err("readonly: too many arguments".into());
             }
             let mut pairs = shell
                 .environment
@@ -34,7 +34,11 @@ impl SpecialBuiltinUtility for ReadOnly {
             pairs.sort_by_key(|(k, _)| k.as_str());
             for (var, var_value) in pairs {
                 if let Some(val) = &var_value.value {
-                    opened_files.write_out(format!("readonly {}='{}'\n", var, val));
+                    opened_files.write_out(format!(
+                        "readonly {}={}\n",
+                        var,
+                        crate::utils::shell_quote(val)
+                    ));
                 } else {
                     opened_files.write_out(format!("readonly {}\n", var));
                 }

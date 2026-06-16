@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::parse::lexer::word_lexer::{WordLexer, WordToken};
+use crate::parse::lexer::word_lexer::{unescape_dollar_single_quote, WordLexer, WordToken};
 use crate::parse::word::{
     Parameter, ParameterExpansion, SpecialParameter, Word, WordPair, WordPart,
 };
@@ -55,7 +55,12 @@ impl<'src> WordParser<'src> {
             WordToken::Char('#') => Ok(Parameter::Special(SpecialParameter::Hash)),
             WordToken::Char('?') => Ok(Parameter::Special(SpecialParameter::QuestionMark)),
             WordToken::Char('-') => Ok(Parameter::Special(SpecialParameter::Minus)),
-            WordToken::Dollar => Ok(Parameter::Special(SpecialParameter::Dollar)),
+            // `$` may arrive either as a Dollar token or, when it is the
+            // operand of `$$` and followed by a non-parameter character, as a
+            // literal Char('$'); both denote the `$` special parameter here.
+            WordToken::Dollar | WordToken::Char('$') => {
+                Ok(Parameter::Special(SpecialParameter::Dollar))
+            }
             WordToken::Char('!') => Ok(Parameter::Special(SpecialParameter::Bang)),
             WordToken::Char('0') => Ok(Parameter::Special(SpecialParameter::Zero)),
             WordToken::Char(d) if d.is_ascii_digit() => {
@@ -281,7 +286,7 @@ impl<'src> WordParser<'src> {
                     if inside_double_quotes {
                         self.advance();
                         match self.lookahead {
-                            WordToken::Dollar => {
+                            WordToken::Dollar | WordToken::Char('$') => {
                                 current_literal.push('$');
                                 self.advance();
                             }
@@ -351,6 +356,26 @@ impl<'src> WordParser<'src> {
                         },
                         inside_double_quotes,
                     );
+                    self.advance();
+                }
+                WordToken::DollarSingleQuote(content) => {
+                    if inside_double_quotes {
+                        // Per POSIX 2.2.4, `$'...'` is NOT special inside double
+                        // quotes; it is the literal characters `$'<raw>'`.
+                        current_literal.push('$');
+                        current_literal.push('\'');
+                        current_literal.push_str(content);
+                        current_literal.push('\'');
+                    } else {
+                        // The unescaped result is quoted (no field splitting or
+                        // pathname expansion), like a single-quoted string.
+                        push_literal_and_insert(
+                            &mut current_literal,
+                            &mut word_parts,
+                            WordPart::QuotedLiteral(unescape_dollar_single_quote(content)),
+                            false,
+                        );
+                    }
                     self.advance();
                 }
                 WordToken::Char(c) => {

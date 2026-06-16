@@ -236,9 +236,10 @@ pub enum CommandToken<'src> {
     Newline,   // \n
     Pipe,      // |
     // multi character control operators
-    AndIf, // &&
-    OrIf,  // ||
-    DSemi, // ;;
+    AndIf,   // &&
+    OrIf,    // ||
+    DSemi,   // ;;
+    SemiAnd, // ;&
     // single character redirection operators
     Less,    // <
     Greater, // >
@@ -296,6 +297,7 @@ impl Display for CommandToken<'_> {
             CommandToken::AndIf => write!(f, "'&&'"),
             CommandToken::OrIf => write!(f, "'||'"),
             CommandToken::DSemi => write!(f, "';;'"),
+            CommandToken::SemiAnd => write!(f, "';&'"),
             CommandToken::Less => write!(f, "'<'"),
             CommandToken::Greater => write!(f, "'>'"),
             CommandToken::Clobber => write!(f, "'>|'"),
@@ -534,6 +536,7 @@ impl<'src> CommandLexer<'src> {
                 },
                 CommandToken::SemiColon => match self.source.lookahead() {
                     ';' => advance_and_return(self, CommandToken::DSemi),
+                    '&' => advance_and_return(self, CommandToken::SemiAnd),
                     _ => CommandToken::SemiColon,
                 },
                 CommandToken::Less => match self.source.lookahead() {

@@ -287,6 +287,21 @@ trait Lexer {
                         '{' => {
                             self.skip_parameter_expansion()?;
                         }
+                        '\'' => {
+                            // $'...' dollar-single-quote: a backslash escapes the
+                            // next character (so \' does not close the string).
+                            self.advance();
+                            while !self.reached_eof() && self.lookahead() != '\'' {
+                                if self.lookahead() == '\\' {
+                                    self.advance();
+                                    if self.reached_eof() {
+                                        break;
+                                    }
+                                }
+                                self.advance();
+                            }
+                            self.advance();
+                        }
                         _ => {}
                     }
                 }

@@ -1614,6 +1614,80 @@ mod audit_regressions {
         test_script("unset HOME; echo ~\n", "~\n");
     }
 
+    // ----- Phase 5: POSIX.1-2024 parser/lexer additions -----
+
+    #[test]
+    fn literal_dollar_is_not_an_error() {
+        // #58
+        test_script("echo $\n", "$\n");
+        test_script("echo a$\n", "a$\n");
+        test_script("echo \"$\"\n", "$\n");
+        test_script("echo $]\n", "$]\n");
+        // $$ is still the PID special parameter
+        run_successfully_and(
+            "case \"$$\" in [0-9]*) echo pid;; *) echo no;; esac\n",
+            |out| {
+                assert_eq!(out, "pid\n");
+            },
+        );
+    }
+
+    #[test]
+    fn dollar_single_quote_escapes() {
+        // #20
+        test_script("printf '%s' $'a\\tb'\n", "a\tb");
+        test_script("printf '%s' $'a\\nb'\n", "a\nb");
+        test_script("printf '%s' $'\\x41\\x42'\n", "AB");
+        test_script("printf '%s' $'\\101'\n", "A");
+        test_script("printf '%s' $'a\\'b'\n", "a'b");
+        // not special inside double quotes
+        test_script("printf '%s' \"$'abc'\"\n", "$'abc'");
+    }
+
+    #[test]
+    fn case_semi_and_falls_through() {
+        // #21
+        test_script(
+            "case a in a) echo A;& b) echo B;; c) echo C;; esac\n",
+            "A\nB\n",
+        );
+        test_script(
+            "case 1 in 1) echo one;& 2) echo two;& 3) echo three;; esac\n",
+            "one\ntwo\nthree\n",
+        );
+        // ;; still stops
+        test_script("case a in a) echo A;; b) echo B;; esac\n", "A\n");
+    }
+
+    #[test]
+    fn function_definition_allows_linebreak_before_body() {
+        // #23
+        test_script("f()\n{ echo HI; }\nf\n", "HI\n");
+    }
+
+    #[test]
+    fn double_dash_ends_options() {
+        // #22: `--` ends options; `-c` after it is an operand (a file name),
+        // not an "invalid option" error.
+        set_env_vars();
+        run_test_with_checker(
+            TestPlan {
+                cmd: "sh".to_string(),
+                args: vec!["--".to_string(), "-c".to_string(), "echo hi".to_string()],
+                stdin_data: String::new(),
+                expected_out: String::new(),
+                expected_err: String::new(),
+                expected_exit_code: 0,
+            },
+            |_, output| {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(!stderr.contains("invalid option"), "stderr: {stderr}");
+                // treated as a (missing) command_file operand -> 127
+                assert_eq!(output.status.code(), Some(127));
+            },
+        );
+    }
+
     #[test]
     fn bracket_literal_members_match() {
         // #8: literal members inside `[...]` (incl. '.', '*', '^', ']') match

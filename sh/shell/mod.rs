@@ -583,13 +583,31 @@ impl Shell {
     ) -> CommandExecutionResult<i32> {
         let arg = expand_word_to_string(&arg.word, false, self)?;
         let arg_cstr = CString::new(arg).expect("invalid pattern");
-        for case in cases {
+        for (index, case) in cases.iter().enumerate() {
+            let mut matched = false;
             for pattern in &case.pattern {
                 let pattern = word_to_pattern(&pattern.word, self)?;
                 if pattern.matches(&arg_cstr) {
-                    return Ok(self.interpret(&case.body, ignore_errexit));
+                    matched = true;
+                    break;
                 }
             }
+            if !matched {
+                continue;
+            }
+            let mut result = self.interpret(&case.body, ignore_errexit);
+            // `;&` falls through: execute subsequent items' bodies without
+            // pattern matching, stopping at a `;;` item, the end, or once a
+            // break/continue/return is pending.
+            let mut idx = index;
+            while cases[idx].fallthrough
+                && idx + 1 < cases.len()
+                && self.control_flow_state == ControlFlowState::None
+            {
+                idx += 1;
+                result = self.interpret(&cases[idx].body, ignore_errexit);
+            }
+            return Ok(result);
         }
         Ok(0)
     }

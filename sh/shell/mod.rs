@@ -185,6 +185,33 @@ pub struct Shell {
     /// option_index)`. If `OPTIND` differs from `optind_we_wrote` on entry the
     /// application reset it and the option index restarts at 0.
     pub getopts_state: (usize, usize),
+    /// Time of the last mail check and the last-seen mtime of each mail file.
+    pub mail_check: MailCheck,
+}
+
+#[derive(Default, Clone)]
+pub struct MailCheck {
+    last_check: Option<std::time::Instant>,
+    mtimes: HashMap<String, Option<std::time::SystemTime>>,
+}
+
+/// Splits a `MAILPATH` entry into its pathname and optional `%message`, with a
+/// backslash escaping the following character (so `\%` is a literal `%`).
+fn split_mailpath_entry(entry: &str) -> (String, Option<String>) {
+    let mut path = String::new();
+    let mut chars = entry.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                if let Some(next) = chars.next() {
+                    path.push(next);
+                }
+            }
+            '%' => return (path, Some(chars.collect())),
+            _ => path.push(c),
+        }
+    }
+    (path, None)
 }
 
 impl Shell {
@@ -1074,6 +1101,55 @@ impl Shell {
         }
     }
 
+    /// Checks the mailbox file(s) named by `MAILPATH` (or `MAIL`) and returns
+    /// any notifications to write before the next prompt, throttled by the
+    /// `MAILCHECK` interval (default 600s; 0 = every prompt). `MAILPATH` takes
+    /// precedence over `MAIL`.
+    pub fn check_mail(&mut self) -> Vec<String> {
+        let interval: u64 = self
+            .environment
+            .get_str_value("MAILCHECK")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(600);
+        let entries: Vec<(String, Option<String>)> =
+            if let Some(mailpath) = self.environment.get_str_value("MAILPATH") {
+                mailpath.split(':').map(split_mailpath_entry).collect()
+            } else if let Some(mail) = self.environment.get_str_value("MAIL") {
+                vec![(mail.to_string(), None)]
+            } else {
+                return Vec::new();
+            };
+        if interval > 0 {
+            if let Some(last) = self.mail_check.last_check {
+                if last.elapsed().as_secs() < interval {
+                    return Vec::new();
+                }
+            }
+        }
+        self.mail_check.last_check = Some(std::time::Instant::now());
+        let mut messages = Vec::new();
+        for (path, message) in entries {
+            let mtime = std::fs::metadata(&path)
+                .ok()
+                .and_then(|m| m.modified().ok());
+            let first_seen = !self.mail_check.mtimes.contains_key(&path);
+            let prev = self.mail_check.mtimes.get(&path).copied().flatten();
+            // notify when the file is created or its mtime advances (but never
+            // on the first observation, which just establishes the baseline)
+            let notify = !first_seen
+                && match (prev, mtime) {
+                    (Some(p), Some(m)) => m > p,
+                    (None, Some(_)) => true,
+                    _ => false,
+                };
+            self.mail_check.mtimes.insert(path, mtime);
+            if notify {
+                messages.push(message.unwrap_or_else(|| "you have mail".to_string()));
+            }
+        }
+        messages
+    }
+
     pub fn get_var_and_expand(&mut self, var: &str, default_if_err: &str) -> String {
         let var = self.environment.get_str_value(var).unwrap_or_default();
         match parse_word(var, 0, false) {
@@ -1139,6 +1215,7 @@ impl Default for Shell {
             is_subshell: false,
             last_pipeline_command: String::new(),
             getopts_state: (0, 0),
+            mail_check: MailCheck::default(),
             terminal: Terminal::default(),
         }
     }

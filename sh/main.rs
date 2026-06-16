@@ -50,6 +50,13 @@ fn execute_string(string: &str, shell: &mut Shell) {
     }
 }
 
+/// Writes any pending mail notifications to stderr before a prompt.
+fn report_mail(shell: &mut Shell) {
+    for message in shell.check_mail() {
+        eprintln!("{message}");
+    }
+}
+
 fn flush_stdout() {
     // this is a basic operation, if this doesn't work,
     // there's nothing else we can do
@@ -80,6 +87,7 @@ fn standard_repl(shell: &mut Shell) {
     let mut print_ps2 = false;
     clear_line();
     flush_stdout();
+    report_mail(shell);
     eprint!("{}", shell.get_ps1());
     loop {
         while let Some(c) = read_nonblocking_char() {
@@ -146,6 +154,7 @@ fn standard_repl(shell: &mut Shell) {
             program_buffer.clear();
             line_buffer.clear();
             println!();
+            report_mail(shell);
             eprint!("{}", shell.get_ps1());
         }
         if shell.set_options.vi {
@@ -160,6 +169,7 @@ fn vi_repl(shell: &mut Shell) {
     let mut print_ps2 = false;
     clear_line();
     flush_stdout();
+    report_mail(shell);
     eprint!("{}", shell.get_ps1());
     loop {
         while let Some(c) = read_nonblocking_char() {
@@ -218,6 +228,7 @@ fn vi_repl(shell: &mut Shell) {
             program_buffer.clear();
             editor.reset_current_line();
             println!();
+            report_mail(shell);
             eprint!("{}", shell.get_ps1());
         }
         if !shell.set_options.vi {

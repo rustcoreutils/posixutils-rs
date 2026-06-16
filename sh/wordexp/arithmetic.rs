@@ -572,42 +572,74 @@ fn binary_operation(
     Ok(value)
 }
 
-fn interpret_expression(expr: &Expr, shell: &mut Shell) -> ExpansionResult<i64> {
+/// Guards against unbounded recursion when a variable's value is itself
+/// evaluated as an arithmetic expression (e.g. `x=y; y=x`).
+const MAX_ARITH_RECURSION: u32 = 64;
+
+fn interpret_expression(expr: &Expr, shell: &mut Shell, depth: u32) -> ExpansionResult<i64> {
     match expr {
         Expr::Variable(var) => {
-            let value = shell.environment.get_str_value(var).unwrap_or_default();
-            Ok(value.parse().unwrap_or(0))
+            // POSIX: a variable referenced in an arithmetic expression is itself
+            // evaluated as an arithmetic expression. Honor `set -u` for unset
+            // names; an unset name (without nounset) evaluates to 0.
+            let value = shell.environment.get_str_value(var).map(|v| v.to_string());
+            match value {
+                None => {
+                    if shell.set_options.nounset {
+                        return Err(CommandExecutionError::ExpansionError(format!(
+                            "{var}: parameter not set"
+                        )));
+                    }
+                    Ok(0)
+                }
+                Some(value) => {
+                    let trimmed = value.trim();
+                    if trimmed.is_empty() {
+                        Ok(0)
+                    } else if let Ok(n) = trimmed.parse::<i64>() {
+                        Ok(n)
+                    } else if depth >= MAX_ARITH_RECURSION {
+                        Err(CommandExecutionError::ExpansionError(
+                            "expression recursion level exceeded".to_string(),
+                        ))
+                    } else {
+                        let inner = parse_expression(trimmed)
+                            .map_err(CommandExecutionError::ExpansionError)?;
+                        interpret_expression(&inner, shell, depth + 1)
+                    }
+                }
+            }
         }
         Expr::Number(num) => Ok(*num),
         Expr::UnaryOp { operator, operand } => {
-            let value = interpret_expression(operand, shell)?;
+            let value = interpret_expression(operand, shell, depth)?;
             match operator {
                 UnaryOperator::Plus => Ok(value),
-                UnaryOperator::Minus => Ok(-value),
+                UnaryOperator::Minus => Ok(value.wrapping_neg()),
                 UnaryOperator::Not => Ok((value == 0) as i64),
                 UnaryOperator::BitwiseNot => Ok(!value),
             }
         }
         Expr::BinaryOp { lhs, operator, rhs } => {
-            let lhs_value = interpret_expression(lhs, shell)?;
+            let lhs_value = interpret_expression(lhs, shell, depth)?;
             match operator {
                 BinaryOperator::LogicalAnd => {
                     return if lhs_value != 0 {
-                        Ok((interpret_expression(rhs, shell)? != 0) as i64)
+                        Ok((interpret_expression(rhs, shell, depth)? != 0) as i64)
                     } else {
                         Ok(0)
                     }
                 }
                 BinaryOperator::LogicalOr => {
                     return if lhs_value == 0 {
-                        Ok((interpret_expression(rhs, shell)? != 0) as i64)
+                        Ok((interpret_expression(rhs, shell, depth)? != 0) as i64)
                     } else {
                         Ok(1)
                     }
                 }
                 _ => {}
             }
-            let rhs_value = interpret_expression(rhs, shell)?;
+            let rhs_value = interpret_expression(rhs, shell, depth)?;
             binary_operation(operator, lhs_value, rhs_value)
         }
         Expr::Conditional {
@@ -615,14 +647,14 @@ fn interpret_expression(expr: &Expr, shell: &mut Shell) -> ExpansionResult<i64> 
             true_expr,
             false_expr,
         } => {
-            if interpret_expression(condition, shell)? != 0 {
-                interpret_expression(true_expr, shell)
+            if interpret_expression(condition, shell, depth)? != 0 {
+                interpret_expression(true_expr, shell, depth)
             } else {
-                interpret_expression(false_expr, shell)
+                interpret_expression(false_expr, shell, depth)
             }
         }
         Expr::Assignment { variable, value } => {
-            let value = interpret_expression(value, shell)?;
+            let value = interpret_expression(value, shell, depth)?;
             shell.assign_global(variable.to_string(), value.to_string())?;
             Ok(value)
         }
@@ -631,7 +663,7 @@ fn interpret_expression(expr: &Expr, shell: &mut Shell) -> ExpansionResult<i64> 
             operator,
             value,
         } => {
-            let value = interpret_expression(value, shell)?;
+            let value = interpret_expression(value, shell, depth)?;
             let current_value = shell
                 .environment
                 .get_str_value(variable)
@@ -652,7 +684,7 @@ pub fn expand_arithmetic_expression_into(
 ) -> ExpansionResult<()> {
     let expr = expand_word_to_string(expr, false, shell)?;
     let expr = parse_expression(&expr).map_err(CommandExecutionError::ExpansionError)?;
-    let value = interpret_expression(&expr, shell)?;
+    let value = interpret_expression(&expr, shell, 0)?;
     expanded_word.append(value.to_string(), inside_double_quotes, true);
     Ok(())
 }

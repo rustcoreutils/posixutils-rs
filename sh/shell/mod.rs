@@ -193,7 +193,11 @@ impl Shell {
     }
 
     pub fn exit(&mut self, code: i32) -> ! {
-        self.execute_action(self.exit_action.clone());
+        // Run the EXIT trap exactly once: take it out before executing so that
+        // an `exit` invoked from within the trap action terminates immediately
+        // (POSIX) instead of recursing forever.
+        let exit_action = std::mem::replace(&mut self.exit_action, TrapAction::Default);
+        self.execute_action(exit_action);
         if self.is_interactive && !self.is_subshell {
             write_history_to_file(&self.history, &self.environment);
         }
@@ -268,6 +272,14 @@ impl Shell {
         match err {
             CommandExecutionError::CommandNotFound(_) => 127,
             CommandExecutionError::OsError(_) => self.exit(1),
+            // POSIX §2.8.1: an expansion error or a variable-assignment error
+            // shall cause a non-interactive shell to exit.
+            CommandExecutionError::ExpansionError(_)
+            | CommandExecutionError::VariableAssignmentError(_)
+                if !self.is_interactive =>
+            {
+                self.exit(1)
+            }
             _ => 1,
         }
     }

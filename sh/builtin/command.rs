@@ -119,7 +119,9 @@ impl BuiltinUtility for Command {
                     .fork_and_exec(command, args.args, opened_files)
                     .map_err(BuiltinError::OsError);
             }
-            return Err(format!("command: {} not found", args.command_name).into());
+            // POSIX: a command that cannot be found exits with status 127.
+            opened_files.write_err(format!("command: {} not found\n", args.command_name));
+            return Ok(127);
         }
 
         if get_special_builtin_utility(args.command_name).is_some() {

@@ -388,7 +388,9 @@ impl SignalManager {
 }
 
 pub fn signal_to_exit_status(signal: Signal) -> libc::c_int {
-    128 + signal as libc::c_int
+    // Must be 128 + the real signal number (e.g. SIGINT -> 130), not the enum
+    // discriminant. `From<Signal> for i32` maps to the libc signal numbers.
+    128 + i32::from(signal)
 }
 
 pub fn kill(pid: Pid, signal: Option<Signal>) -> OsResult<()> {

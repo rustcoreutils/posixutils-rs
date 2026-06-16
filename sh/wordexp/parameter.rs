@@ -175,13 +175,25 @@ pub fn expand_parameter_into(
 ) -> ExpansionResult<()> {
     match parameter_expansion {
         ParameterExpansion::Simple(parameter) => {
-            expand_simple_parameter_into(
+            let result = expand_simple_parameter_into(
                 expanded_word,
                 parameter,
                 inside_double_quotes,
                 field_splitting_will_be_performed,
                 shell,
             );
+            // `set -u`: expanding an unset variable or positional parameter is an
+            // error (special parameters are always considered set).
+            if shell.set_options.nounset && result.is_unset() {
+                let name = match parameter {
+                    Parameter::Number(n) => n.to_string(),
+                    Parameter::Variable(var) => var.as_ref().to_string(),
+                    Parameter::Special(_) => String::new(),
+                };
+                return Err(CommandExecutionError::ExpansionError(format!(
+                    "{name}: parameter not set"
+                )));
+            }
         }
         ParameterExpansion::UnsetUseDefault {
             parameter,

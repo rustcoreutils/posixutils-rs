@@ -1481,6 +1481,62 @@ mod audit_regressions {
         test_script("case hello in hello) echo M;; *) echo NO;; esac\n", "M\n");
     }
 
+    // ----- Phase 3: set -u and exit/error semantics -----
+
+    #[test]
+    fn nounset_unset_variable_is_fatal_error() {
+        // #7/#13: under `set -u`, expanding an unset parameter errors and exits
+        // a non-interactive shell (so "AFTER" is never printed).
+        test_script_expect_error_status_and_stdout("set -u; echo $undef; echo AFTER\n", Some(""));
+        test_script_expect_error_status_and_stdout("set -u; echo ${undef}; echo AFTER\n", Some(""));
+        test_script_expect_error_status_and_stdout("set -u; v=${undef}; echo AFTER\n", Some(""));
+    }
+
+    #[test]
+    fn nounset_set_variable_is_ok() {
+        // #7: a set variable (even empty) is fine under `set -u`.
+        test_script("set -u; x=1; echo $x\n", "1\n");
+        test_script("set -u; set -- a b; echo $#\n", "2\n");
+    }
+
+    #[test]
+    fn expansion_error_exits_non_interactive() {
+        // #13: `${x:?}` on an unset variable exits the script.
+        test_script_expect_error_status_and_stdout("echo ${x:?}; echo AFTER\n", Some(""));
+    }
+
+    #[test]
+    fn arithmetic_variable_is_recursively_evaluated() {
+        // #41: a variable used in $(()) is itself evaluated as an expression.
+        test_script("x=1+2; echo $((x))\n", "3\n");
+        test_script("a=5; x=a; echo $((x))\n", "5\n");
+        // an unset name (without set -u) is 0
+        test_script("x=undefined_name; echo $((x))\n", "0\n");
+    }
+
+    #[test]
+    fn command_not_found_exits_127() {
+        // #15
+        run_successfully_and("command no_such_cmd_xyz_q; echo rc=$?\n", |out| {
+            assert_eq!(out, "rc=127\n");
+        });
+    }
+
+    #[test]
+    fn signal_terminated_status_is_128_plus_signal() {
+        // #12: a SIGTERM-killed child yields 128+15 = 143 (not 128+discriminant).
+        run_successfully_and("sleep 5 & p=$!; kill -TERM $p; wait $p; echo $?\n", |out| {
+            assert_eq!(out, "143\n");
+        });
+    }
+
+    #[test]
+    fn exit_within_exit_trap_does_not_recurse() {
+        // #37: `exit` inside the EXIT trap terminates immediately.
+        expect_exit_code("trap 'exit 3' EXIT; exit 1\n", 3);
+        expect_exit_code("trap ':' EXIT; exit 5\n", 5);
+    }
+
     #[test]
     fn bracket_literal_members_match() {
         // #8: literal members inside `[...]` (incl. '.', '*', '^', ']') match

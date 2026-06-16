@@ -1664,7 +1664,15 @@ fn compose_message(
 
         // Check for escape character (disabled when `escape` is null)
         if escape_char.is_some_and(|ec| line.starts_with(ec)) && line.len() > 1 {
-            let result = handle_escape(&line[1..], composed, vars, Some(mb))?;
+            // A tilde-escape error is diagnosed but does not abort the message
+            // (spec 105114-105119).
+            let result = match handle_escape(&line[1..], composed, vars, Some(mb)) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    continue;
+                }
+            };
             if result.done {
                 if result.abort {
                     return Err("Aborted".to_string());

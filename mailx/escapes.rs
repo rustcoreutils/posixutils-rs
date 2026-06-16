@@ -229,12 +229,14 @@ pub fn handle_escape(
             output.push_str(&msg.body);
             output.push_str("-------\n");
 
-            // Check if we should use pager (crt variable)
+            // Check if we should use pager (crt variable); only when stdout is
+            // a terminal (spec 104362-104367).
             let line_count = output.lines().count();
-            let use_pager = vars
-                .get_number("crt")
-                .map(|crt| line_count > crt as usize)
-                .unwrap_or(false);
+            let use_pager = io::stdout().is_terminal()
+                && vars
+                    .get_number("crt")
+                    .map(|crt| line_count > crt as usize)
+                    .unwrap_or(false);
 
             if use_pager {
                 let pager = vars.get("PAGER").unwrap_or("more");

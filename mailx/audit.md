@@ -4,7 +4,15 @@
 **Tests:** `mailx/tests/` — `cli/mod.rs` (866, 27 `#[test]`), `receive/mod.rs` (2401, 66), `variables/mod.rs` (1269, 35), `send/mod.rs` (518, 13) — 141 tests
 **Spec:** POSIX.1-2024 (IEEE Std 1003.1-2024), Vol. 3 §3, pp. 3150–3177
 **Reference slice:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/mailx.md`
-**Date:** 2026-06-15
+**Date:** 2026-06-15 (audit); 2026-06-16 (all findings resolved)
+
+## Status: RESOLVED
+
+All issues below (Critical #1–#3, Major #4–#11, Minor #12–#22, and the
+tilde-error-policy note) have been fixed across PRs A–G. The original audit text
+is retained for the record; each item is checked off with a parenthetical
+*(FIXED: …)* note describing the resolution. The mailx test suite now has 162
+tests (was 141). The paragraphs below describe the **pre-fix** state.
 
 ## TL;DR
 
@@ -190,7 +198,7 @@ The Receive-Mode command interpreter is broad and largely well-shaped: nearly al
 - [x] `-e`: 0 if mail, >0 otherwise — `main.rs:64-71`.
 - [x] Send Mode: 0 success, 1 on error — `main.rs:48-61`.
 - [x] Receive Mode command errors print + continue (CONSEQUENCES = Default) — `main.rs:184-186`.
-- [ ] Input/Send Mode tilde-error policy (diagnostic but don't block send vs. other errors block) not modeled (spec 105114-105119) — escape errors currently abort the compose loop (`commands.rs:1522-1528`, `send.rs:202`). Minor.
+- [x] Input/Send Mode tilde-error policy (diagnostic but don't block send vs. other errors block) — *(FIXED: a tilde-escape error is diagnosed and composition continues, rather than aborting the message; spec 105114-105119.)*
 
 ## Test coverage signal
 

@@ -86,10 +86,12 @@ pub enum JobId<'s> {
     Contains(&'s str),
 }
 
-/// # Panics
-/// panics if text does not begin with '%'
+/// Parses a job identifier. Returns `Err` if `text` is not a valid job id
+/// (including the case where it does not begin with '%').
 pub fn parse_job_id(text: &str) -> Result<JobId<'_>, ()> {
-    assert!(text.starts_with('%'));
+    if !text.starts_with('%') {
+        return Err(());
+    }
     match &text[1..] {
         "%" | "+" => Ok(JobId::CurrentJob),
         n if n.chars().all(|c| c.is_ascii_digit()) => {

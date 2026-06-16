@@ -276,7 +276,7 @@ impl BuiltinUtility for BuiltinRead {
         let fields = split_fields(
             input.contents,
             shell.environment.get_str_value("IFS"),
-            args.len(),
+            vars.len(),
         );
 
         for i in 0..fields.len() {

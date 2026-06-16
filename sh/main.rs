@@ -297,10 +297,20 @@ fn main() -> Result<(), Box<dyn Error>> {
             ExecutionMode::ReadCommandsFromString(command_string) => {
                 execute_string(&command_string, &mut shell);
             }
-            ExecutionMode::ReadFromFile(file) => {
-                let file_contents = std::fs::read_to_string(file).expect("could not read file");
-                execute_string(&file_contents, &mut shell);
-            }
+            ExecutionMode::ReadFromFile(file) => match std::fs::read_to_string(&file) {
+                Ok(file_contents) => execute_string(&file_contents, &mut shell),
+                Err(err) => {
+                    eprintln!("sh: {file}: {err}");
+                    // POSIX EXIT STATUS: 127 if the command_file could not be found,
+                    // otherwise treat it as not executable (ENOEXEC-like) -> 126.
+                    let status = if err.kind() == std::io::ErrorKind::NotFound {
+                        127
+                    } else {
+                        126
+                    };
+                    std::process::exit(status);
+                }
+            },
             _ => unreachable!(),
         },
     }

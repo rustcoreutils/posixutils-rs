@@ -1367,3 +1367,103 @@ mod builtin {
         );
     }
 }
+
+/// Regression tests for the findings in `sh/audit.md`. Each test cites its
+/// audit issue number. Tests are grouped by remediation phase.
+mod audit_regressions {
+    use super::*;
+
+    /// Asserts the script fails (non-zero exit) WITHOUT panicking (a Rust
+    /// panic surfaces as exit code 101 and a "panicked" message on stderr).
+    fn expect_clean_failure(script: &str) {
+        set_env_vars();
+        run_test_with_checker(
+            TestPlan {
+                cmd: "sh".to_string(),
+                args: vec!["-s".to_string()],
+                stdin_data: script.to_string(),
+                expected_out: String::new(),
+                expected_err: String::new(),
+                expected_exit_code: 0,
+            },
+            |_, output| {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(!stderr.contains("panicked"), "shell panicked: {stderr}");
+                assert_ne!(output.status.code(), Some(101), "shell panicked (exit 101)");
+                assert!(!output.status.success(), "expected non-zero exit status");
+            },
+        );
+    }
+
+    // ----- Phase 1: eliminate panics -----
+
+    #[test]
+    fn bracket_close_first_is_literal_no_panic() {
+        // #2: `]` as the first bracket member is a literal, not a crash.
+        test_script("case \"]\" in []]) echo M;; *) echo NO;; esac\n", "M\n");
+        test_script("case x in [!]]) echo M;; *) echo NO;; esac\n", "M\n");
+    }
+
+    #[test]
+    fn arithmetic_div_by_zero_is_error_not_panic() {
+        // #3
+        expect_clean_failure("echo $((1/0))\n");
+        expect_clean_failure("x=1; echo $((x/=0))\n");
+    }
+
+    #[test]
+    fn arithmetic_mod_by_zero_is_error_not_panic() {
+        // #4
+        expect_clean_failure("echo $((5%0))\n");
+    }
+
+    #[test]
+    fn arithmetic_overflow_and_shift_wrap_not_panic() {
+        // #3/#4 sibling: overflow and out-of-range shifts wrap, never panic.
+        test_script(
+            "echo $((9223372036854775807+1))\n",
+            "-9223372036854775808\n",
+        );
+        test_script("echo $((1<<64))\n", "1\n");
+    }
+
+    #[test]
+    fn read_with_options_before_vars_no_panic() {
+        // #5: `read -r x y` must split into vars.len() fields, not panic.
+        test_script(
+            "printf 'a b c\\n' | { read -r x y; echo \"[$x][$y]\"; }\n",
+            "[a][b c]\n",
+        );
+        test_script(
+            "printf 'a b c d e\\n' | { read x y; echo \"[$x][$y]\"; }\n",
+            "[a][b c d e]\n",
+        );
+    }
+
+    #[test]
+    fn missing_command_file_exits_127_not_panic() {
+        // #6
+        set_env_vars();
+        run_test_with_checker(
+            TestPlan {
+                cmd: "sh".to_string(),
+                args: vec!["/no_such_sh_audit_file_xyz".to_string()],
+                stdin_data: String::new(),
+                expected_out: String::new(),
+                expected_err: String::new(),
+                expected_exit_code: 0,
+            },
+            |_, output| {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(!stderr.contains("panicked"), "shell panicked: {stderr}");
+                assert_eq!(output.status.code(), Some(127));
+            },
+        );
+    }
+
+    #[test]
+    fn jobs_bare_id_is_error_not_panic() {
+        // #29: `jobs 1` (missing '%') must diagnose, not assert-panic.
+        expect_clean_failure("jobs 1\n");
+    }
+}

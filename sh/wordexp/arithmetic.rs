@@ -528,15 +528,36 @@ fn parse_expression(expr: &str) -> Result<Expr<'_>, String> {
     parser.parse_expr()
 }
 
-fn binary_operation(operator: &BinaryOperator, lhs_value: i64, rhs_value: i64) -> i64 {
-    match operator {
-        BinaryOperator::Mul => lhs_value * rhs_value,
-        BinaryOperator::Div => lhs_value / rhs_value,
-        BinaryOperator::Mod => lhs_value % rhs_value,
-        BinaryOperator::Add => lhs_value + rhs_value,
-        BinaryOperator::Sub => lhs_value - rhs_value,
-        BinaryOperator::ShiftLeft => lhs_value << rhs_value,
-        BinaryOperator::ShiftRight => lhs_value >> rhs_value,
+fn binary_operation(
+    operator: &BinaryOperator,
+    lhs_value: i64,
+    rhs_value: i64,
+) -> ExpansionResult<i64> {
+    // All arithmetic uses wrapping semantics so that overflow does not panic
+    // (it would only panic in debug builds; release wraps). Division/modulo by
+    // zero is a recoverable error, not a panic.
+    let value = match operator {
+        BinaryOperator::Mul => lhs_value.wrapping_mul(rhs_value),
+        BinaryOperator::Div => {
+            if rhs_value == 0 {
+                return Err(CommandExecutionError::ExpansionError(
+                    "division by zero".to_string(),
+                ));
+            }
+            lhs_value.wrapping_div(rhs_value)
+        }
+        BinaryOperator::Mod => {
+            if rhs_value == 0 {
+                return Err(CommandExecutionError::ExpansionError(
+                    "division by zero".to_string(),
+                ));
+            }
+            lhs_value.wrapping_rem(rhs_value)
+        }
+        BinaryOperator::Add => lhs_value.wrapping_add(rhs_value),
+        BinaryOperator::Sub => lhs_value.wrapping_sub(rhs_value),
+        BinaryOperator::ShiftLeft => lhs_value.wrapping_shl(rhs_value as u32),
+        BinaryOperator::ShiftRight => lhs_value.wrapping_shr(rhs_value as u32),
         BinaryOperator::Le => (lhs_value < rhs_value) as i64,
         BinaryOperator::Leq => (lhs_value <= rhs_value) as i64,
         BinaryOperator::Ge => (lhs_value > rhs_value) as i64,
@@ -547,7 +568,8 @@ fn binary_operation(operator: &BinaryOperator, lhs_value: i64, rhs_value: i64) -
         BinaryOperator::BitwiseXor => lhs_value ^ rhs_value,
         BinaryOperator::BitwiseOr => lhs_value | rhs_value,
         BinaryOperator::LogicalAnd | BinaryOperator::LogicalOr => unreachable!(),
-    }
+    };
+    Ok(value)
 }
 
 fn interpret_expression(expr: &Expr, shell: &mut Shell) -> ExpansionResult<i64> {
@@ -586,7 +608,7 @@ fn interpret_expression(expr: &Expr, shell: &mut Shell) -> ExpansionResult<i64> 
                 _ => {}
             }
             let rhs_value = interpret_expression(rhs, shell)?;
-            Ok(binary_operation(operator, lhs_value, rhs_value))
+            binary_operation(operator, lhs_value, rhs_value)
         }
         Expr::Conditional {
             condition,
@@ -615,7 +637,7 @@ fn interpret_expression(expr: &Expr, shell: &mut Shell) -> ExpansionResult<i64> 
                 .get_str_value(variable)
                 .map(|val| val.parse().unwrap_or(0))
                 .unwrap_or(0);
-            let new_value = binary_operation(operator, current_value, value);
+            let new_value = binary_operation(operator, current_value, value)?;
             shell.assign_global(variable.to_string(), new_value.to_string())?;
             Ok(new_value)
         }

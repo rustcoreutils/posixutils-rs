@@ -244,6 +244,9 @@ impl Parser<'_> {
         let mut matching = true;
         match self.lookahead {
             Token::Char(']') => {
+                // a ']' immediately after '[' (or "[!") is a literal member of the
+                // bracket expression, not the closing bracket (POSIX XBD 9.3.5).
+                expression_items.push(BracketItem::Char(']'));
                 self.store_and_advance(&mut pattern_items);
             }
             Token::Char('!') => {

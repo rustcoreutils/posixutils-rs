@@ -2908,3 +2908,105 @@ fn file_hash_previous_folder() {
         },
     );
 }
+
+// =============================================================================
+// Regression tests for review fixes
+// =============================================================================
+
+/// A multibyte `escape` character must not panic when slicing the input line.
+#[test]
+fn multibyte_escape_char_no_panic() {
+    let mbox = copy_test_data("testdata.mbox");
+    // escape is the 2-byte character 'é'; "é." finishes the message.
+    let mailrc = create_temp_mailrc("set debug\nset escape=é\n");
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-N"),
+                String::from("-f"),
+                mbox.path().to_str().unwrap().to_string(),
+            ],
+            stdin_data: String::from("mail recipient@example.com\nbody\né.\nquit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("MAILRC", mailrc.path().to_str().unwrap())],
+        |_plan, output| {
+            assert!(
+                output.status.success(),
+                "multibyte escape char must not panic: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("Debug mode"),
+                "the message should compose and send: {}",
+                stderr
+            );
+        },
+    );
+}
+
+/// A second `else` in the same conditional block is diagnosed.
+#[test]
+fn double_else_is_diagnosed() {
+    let mbox = copy_test_data("testdata.mbox");
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox.path().to_str().unwrap().to_string(),
+            ],
+            stdin_data: String::from("if r\nelse\nelse\nquit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("unexpected else"),
+                "a second else should be diagnosed: {}",
+                stderr
+            );
+        },
+    );
+}
+
+/// A `Copy` command in a start-up file is diagnosed (case-folded match).
+#[test]
+fn startup_copy_is_diagnosed() {
+    let mbox = copy_test_data("testdata.mbox");
+    let mailrc = create_temp_mailrc("Copy 1\n");
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-N"),
+                String::from("-f"),
+                mbox.path().to_str().unwrap().to_string(),
+            ],
+            stdin_data: String::from("quit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("MAILRC", mailrc.path().to_str().unwrap())],
+        |_plan, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("not valid in a start-up file"),
+                "Copy in a start-up file should be diagnosed: {}",
+                stderr
+            );
+        },
+    );
+}

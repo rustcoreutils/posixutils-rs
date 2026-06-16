@@ -193,11 +193,15 @@ pub fn send_mode(args: &Args, vars: &mut Variables) -> Result<(), String> {
 
             interrupt_count = 0;
 
-            // Check for escape character (disabled when `escape` is null)
-            if escape_char.is_some_and(|ec| line.starts_with(ec)) && line.len() > 1 {
+            // Check for escape character (disabled when `escape` is null).
+            // Slice past the escape char by its UTF-8 length so a multibyte
+            // escape does not split a character boundary.
+            if let Some(ec) =
+                escape_char.filter(|ec| line.starts_with(*ec) && line.len() > ec.len_utf8())
+            {
                 // A tilde-escape error is diagnosed but does not abort the
                 // message (spec 105114-105119).
-                let result = match handle_escape(&line[1..], &mut msg, vars, None) {
+                let result = match handle_escape(&line[ec.len_utf8()..], &mut msg, vars, None) {
                     Ok(r) => r,
                     Err(e) => {
                         eprintln!("{}", e);

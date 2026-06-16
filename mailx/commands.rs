@@ -57,10 +57,10 @@ pub fn execute_command(
                 return Ok(CommandResult::Continue);
             }
             "el" | "els" | "else" => {
-                if let Some((matches, _in_else)) = vars.cond_stack.pop() {
-                    vars.cond_stack.push((!matches, true));
-                } else {
-                    return Err("mailx: unexpected else".to_string());
+                match vars.cond_stack.pop() {
+                    // A second else in the same if block is an error.
+                    Some((_, true)) | None => return Err("mailx: unexpected else".to_string()),
+                    Some((matches, false)) => vars.cond_stack.push((!matches, true)),
                 }
                 return Ok(CommandResult::Continue);
             }
@@ -317,14 +317,15 @@ pub fn execute_startup_command(line: &str, vars: &mut Variables) -> Result<(), S
         }
 
         // Commands explicitly not valid in a start-up file (spec 104557-104559).
+        // The match is over the lowercased command, so copy/save/reply/followup
+        // also catch their Copy/Save/Reply/Followup forms.
         "e" | "ed" | "edi" | "edit" | "ho" | "hol" | "hold" | "pre" | "pres" | "prese"
         | "preser" | "preserv" | "preserve" | "m" | "ma" | "mai" | "mail" | "r" | "re" | "rep"
-        | "repl" | "reply" | "save" | "sh" | "she" | "shel" | "shell" | "v" | "vi" | "vis"
-        | "visu" | "visua" | "visual" | "fo" | "fol" | "foll" | "follo" | "follow" | "followu"
-        | "followup" => Err(format!("{}: command not valid in a start-up file", cmd)),
-        "R" | "Re" | "Rep" | "Repl" | "Reply" | "S" | "Sa" | "Sav" | "Save" | "C" | "Co"
-        | "Cop" | "Copy" | "F" | "Fo" | "Fol" | "Foll" | "Follo" | "Follow" | "Followu"
-        | "Followup" => Err(format!("{}: command not valid in a start-up file", cmd)),
+        | "repl" | "reply" | "c" | "co" | "cop" | "copy" | "s" | "sa" | "sav" | "save" | "sh"
+        | "she" | "shel" | "shell" | "v" | "vi" | "vis" | "visu" | "visua" | "visual" | "fo"
+        | "fol" | "foll" | "follo" | "follow" | "followu" | "followup" => {
+            Err(format!("{}: command not valid in a start-up file", cmd))
+        }
 
         // Other commands require the message store, which is not available
         // during start-up; leave them as no-ops rather than diagnosing.
@@ -1662,11 +1663,15 @@ fn compose_message(
 
         interrupt_count = 0;
 
-        // Check for escape character (disabled when `escape` is null)
-        if escape_char.is_some_and(|ec| line.starts_with(ec)) && line.len() > 1 {
+        // Check for escape character (disabled when `escape` is null). Slice
+        // past the escape char by its UTF-8 length so a multibyte escape does
+        // not split a character boundary.
+        if let Some(ec) =
+            escape_char.filter(|ec| line.starts_with(*ec) && line.len() > ec.len_utf8())
+        {
             // A tilde-escape error is diagnosed but does not abort the message
             // (spec 105114-105119).
-            let result = match handle_escape(&line[1..], composed, vars, Some(mb)) {
+            let result = match handle_escape(&line[ec.len_utf8()..], composed, vars, Some(mb)) {
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!("{}", e);

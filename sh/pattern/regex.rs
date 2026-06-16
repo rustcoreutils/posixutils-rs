@@ -120,26 +120,50 @@ fn push_bracket_expression(expr: &BracketExpression, string: &mut String) {
     if !expr.matching {
         string.push('^');
     }
+    // Inside a BRE bracket expression the characters '.', '*', '[', '\' and '$'
+    // lose their special meaning, so literal members are emitted verbatim (NOT
+    // backslash-escaped — '\' is itself literal inside a bracket). Only ']',
+    // '^' and '-' are positionally special: ']' must come first, a literal '^'
+    // must not be first (else it would negate), and a literal '-' must be last.
+    // Note POSIX shell patterns negate with '!', never '^', so a '^' member is
+    // always literal here.
+    let mut has_close = false;
+    let mut has_caret = false;
+    let mut has_hyphen = false;
+    let mut middle = String::new();
     for item in &expr.items {
         match item {
-            BracketItem::Char(c) => push_char_literal(*c, string),
+            BracketItem::Char(']') => has_close = true,
+            BracketItem::Char('^') => has_caret = true,
+            BracketItem::Char('-') => has_hyphen = true,
+            BracketItem::Char(c) => middle.push(*c),
             BracketItem::CharacterClass(class) => {
-                string.push_str("[:");
-                string.push_str(class);
-                string.push_str(":]");
+                middle.push_str("[:");
+                middle.push_str(class);
+                middle.push_str(":]");
             }
-            BracketItem::CollatingSymbol(symbol) => push_collating_symbol(symbol, string),
+            BracketItem::CollatingSymbol(symbol) => push_collating_symbol(symbol, &mut middle),
             BracketItem::EquivalenceClass(class) => {
-                string.push_str("[=");
-                string.push_str(class);
-                string.push_str("=]");
+                middle.push_str("[=");
+                middle.push_str(class);
+                middle.push_str("=]");
             }
             BracketItem::RangeExpression(start, end) => {
-                push_range_endpoint(start, string);
-                string.push('-');
-                push_range_endpoint(end, string);
+                push_range_endpoint(start, &mut middle);
+                middle.push('-');
+                push_range_endpoint(end, &mut middle);
             }
         }
+    }
+    if has_close {
+        string.push(']');
+    }
+    string.push_str(&middle);
+    if has_caret {
+        string.push('^');
+    }
+    if has_hyphen {
+        string.push('-');
     }
     string.push(']');
 }

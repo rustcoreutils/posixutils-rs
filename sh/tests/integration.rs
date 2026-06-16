@@ -1466,4 +1466,33 @@ mod audit_regressions {
         // #29: `jobs 1` (missing '%') must diagnose, not assert-panic.
         expect_clean_failure("jobs 1\n");
     }
+
+    // ----- Phase 2: pattern-matching correctness -----
+
+    #[test]
+    fn case_pattern_is_anchored() {
+        // #1: a `case` pattern must match the WHOLE word, not a substring.
+        test_script("case ab in a) echo M;; *) echo NO;; esac\n", "NO\n");
+        test_script("case foobar in oo) echo M;; *) echo NO;; esac\n", "NO\n");
+        test_script("case abc in b) echo M;; *) echo NO;; esac\n", "NO\n");
+        // full matches still work
+        test_script("case abc in a*c) echo M;; *) echo NO;; esac\n", "M\n");
+        test_script("case abc in a?c) echo M;; *) echo NO;; esac\n", "M\n");
+        test_script("case hello in hello) echo M;; *) echo NO;; esac\n", "M\n");
+    }
+
+    #[test]
+    fn bracket_literal_members_match() {
+        // #8: literal members inside `[...]` (incl. '.', '*', '^', ']') match
+        // themselves rather than being mis-escaped or mis-parsed.
+        test_script("case . in [.]) echo M;; *) echo NO;; esac\n", "M\n");
+        test_script("case x in [.]) echo M;; *) echo NO;; esac\n", "NO\n");
+        test_script("case '*' in [.*^]) echo M;; *) echo NO;; esac\n", "M\n");
+        test_script("case '^' in [.*^]) echo M;; *) echo NO;; esac\n", "M\n");
+        test_script("case '^' in [a^]) echo M;; *) echo NO;; esac\n", "M\n");
+        test_script("case ']' in []]) echo M;; *) echo NO;; esac\n", "M\n");
+        test_script("case d in [!abc]) echo M;; *) echo NO;; esac\n", "M\n");
+        test_script("case m in [a-z]) echo M;; *) echo NO;; esac\n", "M\n");
+        test_script("case 5 in [[:digit:]]) echo M;; *) echo NO;; esac\n", "M\n");
+    }
 }

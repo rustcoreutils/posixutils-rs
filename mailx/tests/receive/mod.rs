@@ -2769,3 +2769,142 @@ fn tilde_h_gated_on_terminal() {
         },
     );
 }
+
+// =============================================================================
+// Command-mode niceties (audit #15, #16, #18)
+// =============================================================================
+
+/// `if`/`else`/`endif` gate commands in command mode (audit #16). Receive Mode
+/// makes the `r` condition true and `s` false.
+#[test]
+fn if_conditional_in_command_mode() {
+    let mbox = copy_test_data("testdata.mbox");
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox.path().to_str().unwrap().to_string(),
+            ],
+            stdin_data: String::from(
+                "if r\necho YESBLOCK\nendif\nif s\necho NOBLOCK\nendif\nquit\n",
+            ),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains("YESBLOCK"),
+                "`if r` body should execute in receive mode: {}",
+                stdout
+            );
+            assert!(
+                !stdout.contains("NOBLOCK"),
+                "`if s` body must not execute in receive mode: {}",
+                stdout
+            );
+        },
+    );
+}
+
+/// With `crt` set, pagination is skipped when stdout is not a terminal
+/// (audit #15): the message prints inline and no pager is spawned.
+#[test]
+fn crt_pagination_gated_on_terminal() {
+    let mbox = copy_test_data("testdata.mbox");
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox.path().to_str().unwrap().to_string(),
+            ],
+            stdin_data: String::from("set crt=1\nprint 1\nquit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        // A bogus pager: if pagination were (wrongly) attempted off a terminal,
+        // spawning it would fail and surface a diagnostic.
+        &[("PAGER", "nonexistent_pager_xyz123")],
+        |_plan, output| {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stdout.contains("Meeting Tomorrow") || stdout.contains("alice"),
+                "message should print inline without paging: {}",
+                stdout
+            );
+            assert!(
+                !stderr.contains("nonexistent_pager_xyz123"),
+                "no pager should be spawned off a terminal: {}",
+                stderr
+            );
+        },
+    );
+}
+
+/// `file #` reopens the previously-visited folder (audit #18).
+#[test]
+fn file_hash_previous_folder() {
+    let folder_a = create_temp_mbox(
+        "From aaa@a.example Mon Jan  1 10:00:00 2024\n\
+         From: aaa@a.example\n\
+         Subject: folder A\n\
+         \n\
+         a\n",
+    );
+    let folder_b = create_temp_mbox(
+        "From bbb@b.example Mon Jan  1 10:00:00 2024\n\
+         From: bbb@b.example\n\
+         Subject: folder B\n\
+         \n\
+         b\n",
+    );
+    let a_path = folder_a.path().to_str().unwrap().to_string();
+    let b_path = folder_b.path().to_str().unwrap().to_string();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                a_path.clone(),
+            ],
+            // Open B, then `#` returns to A.
+            stdin_data: format!("file {}\nfile #\nquit\n", b_path),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stdout.contains("bbb@b.example"),
+                "switching to folder B should show its summary: {}",
+                stdout
+            );
+            assert!(
+                stdout.contains("aaa@a.example"),
+                "`file #` should reopen folder A: {}",
+                stdout
+            );
+            assert!(
+                !stderr.contains("previous folder") && !stderr.contains("#:"),
+                "`file #` must resolve, not error: {}",
+                stderr
+            );
+        },
+    );
+}

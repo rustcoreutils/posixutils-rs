@@ -28,6 +28,8 @@ pub struct Mailbox {
     pub is_system_mailbox: bool,
     /// Whether the mailbox has been modified
     pub modified: bool,
+    /// Path of the previously-opened folder, for the `#` substitution.
+    pub prev_path: Option<String>,
 }
 
 impl Mailbox {
@@ -39,6 +41,7 @@ impl Mailbox {
             current: 0,
             is_system_mailbox: false,
             modified: false,
+            prev_path: None,
         }
     }
 

@@ -1177,3 +1177,42 @@ fn locale_env_initialization() {
         },
     );
 }
+
+// =============================================================================
+// alias backslash recursion guard (audit #17)
+// =============================================================================
+
+/// A leading backslash on an alias group member prevents its expansion.
+#[test]
+fn alias_backslash_prevents_expansion() {
+    // `user` expands to an address; `grp` references `\user` (literal) plus a
+    // normal address. The backslashed member must NOT expand.
+    let mailrc = create_temp_mailrc(
+        "set debug\nalias user expanded@example.com\nalias grp \\user other@example.com\n",
+    );
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![String::from("grp")],
+            stdin_data: String::from("body\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("MAILRC", mailrc.path().to_str().unwrap())],
+        |_plan, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("user") && stderr.contains("other@example.com"),
+                "group members should be present: {}",
+                stderr
+            );
+            assert!(
+                !stderr.contains("expanded@example.com"),
+                "backslashed member must not be expanded: {}",
+                stderr
+            );
+        },
+    );
+}

@@ -33,14 +33,14 @@ The Receive-Mode command interpreter is broad and largely well-shaped: nearly al
 
 - [x] **#12 — `set escape=` (null) does not disable escaping.** *(FIXED: `escape_char()` returns `Option<char>`; set-empty yields `None`, disabling escape processing.)* `variables.rs:99-103` returns `'~'` via `unwrap_or('~')` when the value is empty. Spec 104610-104612: "if it is set to null, command escaping shall be disabled." Fix: distinguish unset (`~`) from set-empty (disabled).
 - [x] **#13 — `mbox`/`touch`/`hold` not restricted to the system mailbox; `mbox` cannot override a set `hold` variable.** *(FIXED: the three commands are gated on `is_system_mailbox`; a new `Message.force_mbox` flag set by `mbox`/`touch` forces the message to the secondary mbox at quit, overriding the `hold` variable.)* `commands.rs` `cmd_mbox`/`cmd_touch`/`cmd_hold` perform no "system mailbox only" check (spec 104831, 104853, 104986). `cmd_mbox` sets `Read`; at quit a `Read` message with the `hold` *variable* set is kept in place (`mailbox.rs:291-296`), so `mbox` does not force the message to the secondary mailbox as required (spec 104853-104855). Fix: add a distinct "force-to-mbox" state and gate the three commands on `is_system_mailbox`.
-- [ ] **#14 — Start-up files: invalid commands silently ignored; several legal commands not executed.** `execute_startup_command` (`commands.rs:259-273`) whitelists only alias/alternates/discard/retain/set/unset/source/if and maps everything else to `Ok(())`. The spec's *invalid-in-startup* list (104557-104559) should produce a diagnostic (and "any errors … shall … terminate … or … continue after writing a diagnostic"); conversely legal start-up commands such as `cd`, `echo`, `folders` are dropped. Fix: diagnose the invalid set, execute the rest.
-- [ ] **#15 — `crt` pagination ignores whether stdout is a terminal.** `commands.rs:891` / `escapes.rs:233` paginate whenever the line count exceeds `crt`. Spec 104362-104367 gates pagination on stdout being a terminal device. Fix: only auto-page when `io::stdout().is_terminal()`.
-- [ ] **#16 — `if s|r` is a no-op in command mode.** `commands.rs:137-139` returns `Continue` for `if`/`else`/`endif`, so an interactive/`source`d conditional block always executes its body regardless of mode (spec 104836-104844). Only the start-up loader (`main.rs:264-331`) honors conditionals. Fix: track conditional state in `execute_command`.
-- [ ] **#17 — `alias` backslash recursion-prevention unimplemented.** `variables.rs:125-141` (`expand_alias`) always recurses; spec 104720-104721 lets a leading unquoted `\` on a group member prevent expansion.
-- [ ] **#18 — `#` (previous file) folder substitution unimplemented.** `commands.rs:1490-1493` returns the literal `#` (spec 104794).
+- [x] **#14 — Start-up files: invalid commands silently ignored; several legal commands not executed.** *(FIXED: `cd`/`echo` now execute in start-up files; the spec invalid-in-startup set (and `!`) produce a diagnostic.)* `execute_startup_command` (`commands.rs:259-273`) whitelists only alias/alternates/discard/retain/set/unset/source/if and maps everything else to `Ok(())`. The spec's *invalid-in-startup* list (104557-104559) should produce a diagnostic (and "any errors … shall … terminate … or … continue after writing a diagnostic"); conversely legal start-up commands such as `cd`, `echo`, `folders` are dropped. Fix: diagnose the invalid set, execute the rest.
+- [x] **#15 — `crt` pagination ignores whether stdout is a terminal.** *(FIXED: `print`/`~p` paginate only when `io::stdout().is_terminal()`.)* `commands.rs:891` / `escapes.rs:233` paginate whenever the line count exceeds `crt`. Spec 104362-104367 gates pagination on stdout being a terminal device. Fix: only auto-page when `io::stdout().is_terminal()`.
+- [x] **#16 — `if s|r` is a no-op in command mode.** *(FIXED: `execute_command` tracks an if/else/endif stack on `Variables` and skips commands in a non-matching branch.)* `commands.rs:137-139` returns `Continue` for `if`/`else`/`endif`, so an interactive/`source`d conditional block always executes its body regardless of mode (spec 104836-104844). Only the start-up loader (`main.rs:264-331`) honors conditionals. Fix: track conditional state in `execute_command`.
+- [x] **#17 — `alias` backslash recursion-prevention unimplemented.** *(FIXED: a leading `\` on a group member is stripped and the member is not expanded.)* `variables.rs:125-141` (`expand_alias`) always recurses; spec 104720-104721 lets a leading unquoted `\` on a group member prevent expansion.
+- [x] **#18 — `#` (previous file) folder substitution unimplemented.** *(FIXED: `Mailbox.prev_path` records the prior folder; `file #` reopens it.)* `commands.rs:1490-1493` returns the literal `#` (spec 104794).
 - [x] **#19 — `ignoreeof` not honored during Receive-Mode composition.** *(FIXED: `compose_message` honors `ignoreeof` for both EOF and the `.` terminator.)* `compose_message` (`commands.rs:1512-1538`) breaks on EOF unconditionally and only checks `dot`; send-mode (`send.rs:167-221`) handles `ignoreeof` but the receive-mode reply/mail composer does not (spec 104630-104632, Austin Group Defect 1034 for `~.`).
 - [x] **#20 — Interactive prompts don't all gate on a terminal.** *(FIXED: `~h` (`prompt_headers`) returns immediately when stdin is not a terminal.)* `prompt_headers` (`escapes.rs:545`, `~h`) prompts unconditionally; spec 105065 says `~h` prompts "If standard input is a terminal".
-- [ ] **#21 — `-u user` hardcodes `/var/mail/user`.** `args.rs:141-143` ignores the other spool locations checked by `get_system_mailbox` and performs no privilege check (spec 104287-104289 requires appropriate privileges).
+- [x] **#21 — `-u user` hardcodes `/var/mail/user`.** *(FIXED: `-u` searches the usual spool locations; read access is enforced by file permissions.)* `args.rs:141-143` ignores the other spool locations checked by `get_system_mailbox` and performs no privilege check (spec 104287-104289 requires appropriate privileges).
 - [x] **#22 — Some informative output goes to stderr.** *(FIXED: the "Message saved to ..." dead-letter notice now goes to stdout.)* e.g. `save_dead_letter` writes "Message saved to …" to stderr (`send.rs:366`); spec STDOUT (104412-104414) routes messages to stdout, reserving stderr for diagnostics. Minor.
 
 ## Detailed conformance matrix
@@ -58,7 +58,7 @@ The Receive-Mode command interpreter is broad and largely well-shaped: nearly al
 | `-n` | CONFORMS | (#6 FIXED) Skips only the system start-up file; user `MAILRC` always read. |
 | `-N` | CONFORMS | `args.rs:87-89`; suppresses initial summary (`main.rs:137`). |
 | `-s subject` | CONFORMS | `args.rs:90-102`; `send.rs:112-113`. All chars preserved. |
-| `-u user` | PARTIAL | (#21) Hardcodes `/var/mail/user`; no privilege check. |
+| `-u user` | CONFORMS | (#21 FIXED) searches spool locations; FS permissions govern access. |
 | `--` end-of-options | CONFORMS | (#5 FIXED) `--` terminator stops option parsing (XBD 12.2). |
 | `+`-prefix exception | N/A | Spec does not invoke the XBD 12.2 `+` exception for mailx. |
 
@@ -108,7 +108,7 @@ The Receive-Mode command interpreter is broad and largely well-shaped: nearly al
 
 | Command | Status | Notes |
 |---|---|---|
-| `alias`/`group` | PARTIAL | list/define OK; (#17) no `\` recursion guard. |
+| `alias`/`group` | CONFORMS | (#17 FIXED) leading `\` prevents member expansion. |
 | `alternates` | CONFORMS | `commands.rs:326-337`. |
 | `cd` | CONFORMS | `commands.rs:348-357`. |
 | `copy`/`Copy` | CONFORMS | `commands.rs:359-437`. |
@@ -118,21 +118,21 @@ The Receive-Mode command interpreter is broad and largely well-shaped: nearly al
 | `echo` | CONFORMS | `commands.rs:96-99`. |
 | `edit` | CONFORMS | `EDITOR`, temp file — `commands.rs:520-544`. |
 | `exit` | CONFORMS | no message moving — `commands.rs:105-106`. |
-| `file`/`folder` | PARTIAL | quit-then-load OK; (#18) `#` unimplemented. |
+| `file`/`folder` | CONFORMS | (#18 FIXED) `#` reopens the previous folder. |
 | `folders` | PARTIAL | `LISTER` via `sh -c` (no `--`, minor) — `commands.rs:566-581`. |
 | `followup`/`Followup` | CONFORMS | ignores `record`, records by author — `commands.rs:583-614`. |
 | `from` | CONFORMS | `commands.rs:616-625`. |
 | `headers` | CONFORMS | screenful pagination — `commands.rs:627-644`. |
 | `help`/`?` | CONFORMS | `commands.rs:646-689`. |
 | `hold`/`preserve` | CONFORMS | (#13 FIXED) gated on the system mailbox. |
-| `if`/`else`/`endif` | **DIVERGES** | (#16) no-op in command mode. |
+| `if`/`else`/`endif` | CONFORMS | (#16 FIXED) honored in command mode via a conditional stack. |
 | `list` | CONFORMS | `commands.rs:707-717`. |
 | `mail` | CONFORMS | alias expand, asksub — `commands.rs:719-750`. |
 | `mbox` | CONFORMS | (#13 FIXED) gated on the system mailbox; `force_mbox` overrides the `hold` variable. |
 | `next` | CONFORMS | `displayed`-flag logic per RATIONALE — `commands.rs:768-787`. |
 | `pipe` | CONFORMS | (#4 FIXED) `--` inserted; `cmd`/`page` handled — `commands.rs:789-867`. |
 | `Print`/`Type` | CONFORMS | overrides suppression — `commands.rs:867-930`. |
-| `print`/`type` | PARTIAL | (#15) crt pagination ignores tty. |
+| `print`/`type` | CONFORMS | (#15 FIXED) crt pagination gated on a terminal. |
 | `quit` | CONFORMS | `main.rs:178-179`, `mailbox.rs:261-331`. |
 | `reply`/`Reply` (`flipr`) | CONFORMS | (#11 FIXED) reply-all uses `Reply-To` when present; r/R + flipr mapping correct. |
 | `retain` | CONFORMS | overrides discard/ignore — `commands.rs:965-978`. |
@@ -169,7 +169,7 @@ The Receive-Mode command interpreter is broad and largely well-shaped: nearly al
 | `~h` | CONFORMS | (#20 FIXED) gated on stdin being a terminal. |
 | `~i var` | CONFORMS | insert variable — `escapes.rs:189-198`. |
 | `~m`/`~M` | CONFORMS | indented insert — `escapes.rs:199-212`. |
-| `~p` | PARTIAL | (#15) crt/tty. |
+| `~p` | CONFORMS | (#15 FIXED) crt pagination gated on a terminal. |
 | `~q`/`~x` | CONFORMS | abort w/ and w/o dead-letter — `escapes.rs:247-302`. |
 | `~r`/`~<` (`!command`) | CONFORMS | (#4 FIXED) `--` inserted on the command path — `escapes.rs`. |
 | `~s` | CONFORMS | `escapes.rs:273-277`. |

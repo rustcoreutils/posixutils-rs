@@ -46,6 +46,39 @@ pub fn execute_command(
         return Ok(CommandResult::Continue);
     }
 
+    // Conditional execution (if/else/endif) in command mode. execute_command is
+    // the Receive-Mode interpreter, so the `r` condition is true and `s` false.
+    {
+        let (cword, cargs) = parse_command_line(line);
+        match cword.to_lowercase().as_str() {
+            "i" | "if" => {
+                let matches = matches!(cargs.trim().to_lowercase().as_str(), "r");
+                vars.cond_stack.push((matches, false));
+                return Ok(CommandResult::Continue);
+            }
+            "el" | "els" | "else" => {
+                if let Some((matches, _in_else)) = vars.cond_stack.pop() {
+                    vars.cond_stack.push((!matches, true));
+                } else {
+                    return Err("mailx: unexpected else".to_string());
+                }
+                return Ok(CommandResult::Continue);
+            }
+            "en" | "end" | "endi" | "endif" => {
+                if vars.cond_stack.pop().is_none() {
+                    return Err("mailx: unexpected endif".to_string());
+                }
+                return Ok(CommandResult::Continue);
+            }
+            _ => {}
+        }
+    }
+
+    // Inside a non-matching conditional branch, skip the command.
+    if !vars.cond_active() {
+        return Ok(CommandResult::Continue);
+    }
+
     // Check for shell escape
     if let Some(cmd) = line.strip_prefix('!') {
         return cmd_shell(cmd, vars);
@@ -254,6 +287,12 @@ pub fn execute_startup_command(line: &str, vars: &mut Variables) -> Result<(), S
         return Ok(());
     }
 
+    // A shell escape (`!command`) is not valid in a start-up file (spec
+    // 104557-104559).
+    if line.starts_with('!') {
+        return Err("!: command not valid in a start-up file".to_string());
+    }
+
     let (cmd, args) = parse_command_line(line);
 
     match cmd.to_lowercase().as_str() {
@@ -269,7 +308,27 @@ pub fn execute_startup_command(line: &str, vars: &mut Variables) -> Result<(), S
         "uns" | "unse" | "unset" => cmd_unset_startup(args, vars),
         "so" | "sou" | "sour" | "sourc" | "source" => cmd_source_startup(args, vars),
         "i" | "if" | "el" | "els" | "else" | "en" | "end" | "endi" | "endif" => Ok(()),
-        _ => Ok(()), // Ignore unknown commands in startup
+
+        // Other legal start-up commands that do not require the message store.
+        "cd" | "ch" | "chd" | "chdi" | "chdir" => cmd_cd(args).map(|_| ()),
+        "ec" | "ech" | "echo" => {
+            println!("{}", args);
+            Ok(())
+        }
+
+        // Commands explicitly not valid in a start-up file (spec 104557-104559).
+        "e" | "ed" | "edi" | "edit" | "ho" | "hol" | "hold" | "pre" | "pres" | "prese"
+        | "preser" | "preserv" | "preserve" | "m" | "ma" | "mai" | "mail" | "r" | "re" | "rep"
+        | "repl" | "reply" | "save" | "sh" | "she" | "shel" | "shell" | "v" | "vi" | "vis"
+        | "visu" | "visua" | "visual" | "fo" | "fol" | "foll" | "follo" | "follow" | "followu"
+        | "followup" => Err(format!("{}: command not valid in a start-up file", cmd)),
+        "R" | "Re" | "Rep" | "Repl" | "Reply" | "S" | "Sa" | "Sav" | "Save" | "C" | "Co"
+        | "Cop" | "Copy" | "F" | "Fo" | "Fol" | "Foll" | "Follo" | "Follow" | "Followu"
+        | "Followup" => Err(format!("{}: command not valid in a start-up file", cmd)),
+
+        // Other commands require the message store, which is not available
+        // during start-up; leave them as no-ops rather than diagnosing.
+        _ => Ok(()),
     }
 }
 
@@ -550,12 +609,25 @@ fn cmd_file(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
         return Ok(CommandResult::Continue);
     }
 
+    // Resolve the target, handling `#` (the previously-opened folder).
+    let path = if args.trim() == "#" {
+        match &mb.prev_path {
+            Some(p) => p.clone(),
+            None => return Err("No previous folder".to_string()),
+        }
+    } else {
+        expand_folder_name(args, vars)
+    };
+
+    // Remember the folder we are leaving for a later `#`.
+    let leaving = mb.path.clone();
+
     // Save current mailbox first
     mb.quit(vars)?;
 
     // Open new mailbox
-    let path = expand_folder_name(args, vars);
-    let new_mb = Mailbox::load(&path).map_err(|e| format!("{}: {}", path, e))?;
+    let mut new_mb = Mailbox::load(&path).map_err(|e| format!("{}: {}", path, e))?;
+    new_mb.prev_path = Some(leaving);
 
     *mb = new_mb;
     mb.print_headers(None, vars);
@@ -902,9 +974,10 @@ fn cmd_print(
                 msg.format_display(false, &vars.ignored_headers, &vars.retained_headers)
             };
 
-            // Check if we need to page
+            // Check if we need to page (only when stdout is a terminal, spec
+            // 104362-104367).
             if let Some(crt_lines) = crt {
-                if content.lines().count() > crt_lines as usize {
+                if io::stdout().is_terminal() && content.lines().count() > crt_lines as usize {
                     // Use pager
                     let shell = vars.get("SHELL").unwrap_or("/bin/sh");
                     let mut child = std::process::Command::new(shell)
@@ -1512,10 +1585,9 @@ fn expand_folder_name(name: &str, vars: &Variables) -> String {
             let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
             format!("{}/mbox", home)
         }),
-        "#" => {
-            // Previous file - not implemented
-            name.to_string()
-        }
+        // `#` (previous folder) is resolved by cmd_file, which has the prior
+        // path; reaching here means there was none.
+        "#" => name.to_string(),
         _ => {
             if let Some(user) = name.strip_prefix('%') {
                 format!("/var/mail/{}", user)

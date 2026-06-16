@@ -153,9 +153,22 @@ impl Args {
             result.mode = Mode::Receive;
         }
 
-        // If -u was specified, set up to read that user's mailbox
+        // If -u was specified, read that user's system mailbox. Search the
+        // usual spool locations (as get_system_mailbox does), defaulting to
+        // /var/mail. Read access is governed by the file's permissions, which
+        // provide the "appropriate privileges" check (spec 104287-104289).
         if let Some(ref user) = result.user {
-            result.file = Some(format!("/var/mail/{}", user));
+            let candidates = [
+                format!("/var/mail/{}", user),
+                format!("/var/spool/mail/{}", user),
+                format!("/usr/spool/mail/{}", user),
+            ];
+            let path = candidates
+                .iter()
+                .find(|p| std::path::Path::new(p).exists())
+                .cloned()
+                .unwrap_or_else(|| candidates[0].clone());
+            result.file = Some(path);
         }
 
         Ok(result)

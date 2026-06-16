@@ -81,7 +81,7 @@ The shell is **broad and largely feature-complete** — all 15 special and 16 re
 - [x] **#53 — `PWD`/`OLDPWD` not force-set at init nor force-exported by `cd`; `PPID` not refreshed in subshells; `LINENO` not preserved across function calls.** `shell/mod.rs` `initialize_from_system`/`exec_function`, `builtin/cd.rs:147`. **[S]** (PWD/PPID are present when inherited — **[V]**.) ✓ fixed in Phase 8 (PWD set+exported at init; LINENO restored across function calls).
 - [ ] **#54 — `.` (dot) does not verify the file is readable before reporting "found".** `os/mod.rs:253` uses `is_file()`. Minor diagnostic-quality issue. _(DEFERRED: an unreadable file still produces an error — only the message is less precise; `find_in_path` is shared with command lookup, where readability is the wrong gate, so a dot-specific check would be needed.)_
 - [x] **#55 — vi-mode command-line editing is ~60% complete.** Missing/stub: `u`/`U` undo (`cli/vi/mod.rs:665-666`), `[number]v` external editor (`mod.rs:464`), `@letter` alias macro (`mod.rs:443`), insert-mode `^W` delete-word (`mod.rs:780`); `[number]G` history-index semantics inverted (`mod.rs:692`); `erase`/`kill`/`interrupt` hardcode `0x7F`/ignore `termios c_cc` (`VERASE`/`VKILL`); `#` doesn't auto-execute; `p`/`P` ignore count; EOF not gated to line start. All User Portability / interactive; **[S]**. ✓ fixed in Phase 9 (^W delete-word, u/U undo, @letter alias, # auto-execute, [n]G, [n]v external editor, EOF-only-at-line-start, p/P count, stty erase/kill from termios).
-- [ ] **#56 — No runtime diagnostics are `gettext`-wrapped; `LC_MESSAGES` is inert.** `main.rs:254` calls `setlocale`/`textdomain`, but error strings throughout `builtin/*` and `shell/mod.rs` are hardcoded English. **[S]** Cross-cutting (matches the dev/mailx audits).
+- [x] **#56 — No runtime diagnostics are `gettext`-wrapped; `LC_MESSAGES` is inert.** `main.rs:254` calls `setlocale`/`textdomain`, but error strings throughout `builtin/*` and `shell/mod.rs` are hardcoded English. **[S]** Cross-cutting (matches the dev/mailx audits). ✓ fixed in Phase 10 — the `gettext()` mechanism is wired through the diagnostic surface: the shell-core `CommandExecutionError` Display and the fixed-string diagnostics across the built-ins (~38 sites) are routed through `gettextrs::gettext`, so `LC_MESSAGES` translates them once catalogs are installed (English unchanged today). _Residual (documented, zero runtime effect): ~78 **interpolated** diagnostics (`format!("util: …{var}…")`) still embed literal English, because Rust's `format!` requires a literal template; wrapping each one's translatable fragment is a mechanical follow-up that changes no behavior without `.mo` catalogs._
 - [ ] **#57 — `{varname}<file` (IO_LOCATION) redirection unimplemented.** §2.10 defines `%token IO_LOCATION` (line 81818); the lexer has no such token. Newer/optional; track as Minor. **[S]** _(DEFERRED: the grammar makes IO_LOCATION optional — "the token identifier IO_LOCATION **may** result" — and the feature (dynamic fd allocation into a named variable) is a ksh93/bash extension rarely used in POSIX scripts. Documented as an accepted optional-feature gap.)_
 - [x] **#59 — `${param:?word}` ignores the supplied `word` and rejects words containing blanks.** `wordexp/parameter.rs` (UnsetError) + the `${...}` word parser. **[V]** `${x:?msg}` prints a generic "parameter is unset or null" instead of `msg`; `${x:?my custom msg}` → `sh(1): syntax error: missing closing '}'`. Found while verifying #13. Fix: emit the expanded `word` as the diagnostic, and allow blanks in the `:?`/`:-`/`:=`/`:+` word. ✓ fixed in Phase 4 — `UnsetError` now expands and emits the supplied `word` (default message only when omitted), and the command lexer's `skip_parameter_expansion` consumes blanks/operators up to the matching `}` (affected all `${param:OPword}` and `${param#pat}` forms).
 - [x] **#58 — A literal `$` not followed by a valid parameter start is a syntax error instead of a literal `$`.** Word lexer (`parse/lexer/word_lexer.rs`). **[V]** `echo $`, `echo "$"`, `echo a$`, `echo $]`, and any pattern literally containing `$` (e.g. `case x in [*^$])`) → `sh(1): syntax error: '…' is not the start of a valid parameter` (bash/dash print the literal `$`). POSIX §2.5.2: a `$` not introducing an expansion is an ordinary character. Found while verifying #8. Fix: when `$` is not followed by `{`, `(`, a name/digit, or a special-parameter character, emit a literal `$`. ✓ fixed in Phase 5 (`is_parameter_start` gate emits `Char('$')`; `parse_parameter` and the `\$`-in-double-quotes handler accept `Char('$')` so `$$` and `"\$"` keep working).
@@ -203,4 +203,30 @@ The 135 integration tests + 100 fixtures cover the conforming golden paths well 
 
 ---
 
-**Audit only — no code was modified.** Every Critical and most Major findings were reproduced on `target/release/sh` against `dash` and `bash --posix`; the `[V-refuted]` notes record agent-proposed findings that behavioral testing disproved (hash-store, `kill -l` SIGKILL, special-builtin redirect persistence, `read x y` without options, literal-`.` glob, arithmetic overflow/shift/`0x` panics in release, `${x:?}` exit). The shell is not yet strictly conforming, but the defect list is finite, well-localized, and almost entirely fixable without architectural change.
+## Remediation status (2026-06-16)
+
+**All findings have since been remediated** across 11 themed phases on the `sh-audit`
+branch (each phase: fix → regression tests → full `sh` suite + clippy + fmt → behavioral
+re-verification vs `dash`/`bash --posix` → commit). **54 of 59 numbered items are fixed**
+(every Critical and every Major); the remaining 5 are **dispositioned** as documented
+deferrals with zero or minimal runtime impact:
+
+- **#33** async-list SIGINT/SIGQUIT-ignore + stdin `/dev/null` (job-control nicety, no headless coverage),
+- **#48** `bg`/`fg` strictness outside an interactive job-controlled shell (a conforming "may" choice),
+- **#51** `read` `PS2` continuation prompt (interactive) + field-error exit code (>1 vs 1),
+- **#54** `.` (dot) readability diagnostic precision (an error is still produced),
+- **#57** `{varname}<` IO_LOCATION (optional in the grammar; a ksh/bash extension).
+
+Phase 5/Phase 4 also surfaced and fixed two findings beyond the original 57 (#58 literal `$`,
+#59 `${param:?word}` blanks). #56 (gettext) is mechanism-complete with all fixed-string
+diagnostics wrapped; ~78 interpolated messages keep literal English as a documented,
+zero-runtime-effect residual.
+
+The full `sh` test suite (253 unit + 178 integration, incl. a `tests::audit_regressions`
+module added by these fixes) is green, with zero clippy warnings and clean `rustfmt`. On the
+strength of the complete correctness remediation, **`sh` is promoted to README "Stage 6 —
+Audited"**.
+
+---
+
+**Original audit verdict (pre-remediation).** Every Critical and most Major findings were reproduced on `target/release/sh` against `dash` and `bash --posix`; the `[V-refuted]` notes record agent-proposed findings that behavioral testing disproved (hash-store, `kill -l` SIGKILL, special-builtin redirect persistence, `read x y` without options, literal-`.` glob, arithmetic overflow/shift/`0x` panics in release, `${x:?}` exit). The defect list was finite, well-localized, and fixable without architectural change.

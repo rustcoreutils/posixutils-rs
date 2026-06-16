@@ -88,6 +88,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] rmdel (SCCS)
  - [x] sact (SCCS)
  - [x] sccs (SCCS)
+ - [x] sh
  - [x] split
  - [x] strings
  - [x] strip (Development)
@@ -153,7 +154,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] rm
  - [x] rmdir
  - [x] sed
- - [x] sh
  - [x] sort
  - [x] stty
  - [x] tabs

@@ -23,7 +23,7 @@ The Receive-Mode command interpreter is broad and largely well-shaped: nearly al
 - [x] **#4 — `sh -c` invocations omit the mandated `--` argument (Austin Group Defect 1528).** *(FIXED: `.arg("--")` inserted at every `sh -c` site in `commands.rs` and `escapes.rs`.)* Spec requires three arguments `"-c"`, `"--"`, *command* for `pipe` (104870), `!` (105021), `~!` (105043), `~|` (105099) and `~r !command` (105087). All sites pass only `-c` + command: `commands.rs:833` (pipe), `commands.rs:1146` (`!`), `escapes.rs:334` (`~!`/`~: !`), `escapes.rs:680` (`~|`), `escapes.rs:371` (`~r !`). A command beginning with `-` is then mis-parsed by the shell. Fix: insert `.arg("--")` before the command at each site.
 - [x] **#5 — `-f file` operand mis-parsed into Send Mode.** *(FIXED: `file` is now a trailing operand consumed in Receive Mode; `-f` always selects Receive; `--` end-of-options terminator added.)* `args.rs:64-73` only captures the file when it is the last char of the `-f` cluster *and* the next token does not start with `-`; otherwise the file token hits the `else` at `args.rs:121-124` and is pushed onto `addresses`, and `args.rs:134-135` then selects `Mode::Send`. So `mailx -f -N file` and the RATIONALE's explicitly-required `mailx -fin mymail.box` (spec 105205-105206) send mail to "file"/"mymail.box" instead of reading it. Fix: treat `file` as a normal trailing operand (per XBD 12.2; `file` is an operand, not an option-argument), consumed in Receive Mode when `-f` is set.
 - [x] **#6 — `-n` also suppresses the user `MAILRC` start-up file.** *(FIXED: `load_startup_files` gates only the system file on `-n`; the user MAILRC is always processed.)* Spec Start-Up steps 4–5 (104553-104555) attach "unless the −n option is given" only to the *system* start-up file; the user file named by `MAILRC` is *always* processed. `main.rs:53/78/105` gate the entire `load_startup_files` (both system and user) on `!args.no_init`, so `mailx -n` skips `~/.mailrc` too. Fix: split the two; `-n` skips only the system file.
-- [ ] **#7 — No locale handling; diagnostics hardcoded English.** `grep -nE 'setlocale|gettext|LC_' *.rs` → zero. Spec lists `LANG`/`LC_ALL`/`LC_CTYPE`/`LC_MESSAGES`/`NLSPATH` (104328-104359) as affecting execution; `LC_MESSAGES` shall govern diagnostic and informative text. `setlocale(LC_ALL,"")` is never called and every `eprintln!`/`println!` string is literal English. Fix: `setlocale` near `main`, route diagnostics through `gettext` per project convention.
+- [x] **#7 — No locale handling; diagnostics hardcoded English.** *(FIXED: `main` calls `setlocale(LC_ALL,"")` + `textdomain`/`bind_textdomain_codeset`; user-facing diagnostics routed through `gettext` per project convention.)* `grep -nE 'setlocale|gettext|LC_' *.rs` → zero. Spec lists `LANG`/`LC_ALL`/`LC_CTYPE`/`LC_MESSAGES`/`NLSPATH` (104328-104359) as affecting execution; `LC_MESSAGES` shall govern diagnostic and informative text. `setlocale(LC_ALL,"")` is never called and every `eprintln!`/`println!` string is literal English. Fix: `setlocale` near `main`, route diagnostics through `gettext` per project convention.
 - [x] **#8 — `new` message state never produced; `N` shown as `U`, `:n` selector dead.** *(FIXED: loaded messages default to `New`; `Status:` with `R`→`Read`, `O`-only→`Unread`; absence stays `New`. `:n` and the `N` char now work; current = first new/unread per spec 104481-104482.)* `mailbox.rs:69` sets every loaded message to `MessageState::Unread` (`// Assume unread for now`); only a `Status:` header containing `R`/`O` promotes to `Read` (`mailbox.rs:100-102`). `MessageState::New` is therefore unreachable from a real mailbox, so genuinely new mail displays state char `U` instead of `N` (spec 104491-104496), and `:n` (`msglist.rs:192`) matches nothing. Fix: treat absence of `Status:`/`O` as `New`, presence of `O` (without `R`) as `Unread`.
 - [x] **#9 — `~:` / `~_` command-level escape is a stub, and `~:set` does not set.** *(FIXED: `~:`/`~_` dispatch through the real command functions with `&mut Variables`; `set`/`unset`/`alias`/`alternates`/`echo`/`!` apply for real.)* `escapes.rs:732-775` (`execute_input_mode_command`) handles only `set`, `echo`, `!`; it ignores `_msg`/`_mb`, and its `set` arm merely `println!`s each argument (`escapes.rs:755-759`) instead of mutating `vars`. Spec 105048-105049: "`~: mailx-command` … Perform the command-level request." Fix: dispatch through the real command interpreter (the command-mode subset that is valid here), and actually apply `set`.
 - [x] **#10 — `~w file` truncates instead of appending.** *(FIXED: `~w` opens with create+append.)* `escapes.rs:293` uses `fs::write` (truncate). Spec 105094-105097: "The file shall be created or the message shall be appended to it if the file already exists." Fix: open with create+append.
@@ -41,7 +41,7 @@ The Receive-Mode command interpreter is broad and largely well-shaped: nearly al
 - [x] **#19 — `ignoreeof` not honored during Receive-Mode composition.** *(FIXED: `compose_message` honors `ignoreeof` for both EOF and the `.` terminator.)* `compose_message` (`commands.rs:1512-1538`) breaks on EOF unconditionally and only checks `dot`; send-mode (`send.rs:167-221`) handles `ignoreeof` but the receive-mode reply/mail composer does not (spec 104630-104632, Austin Group Defect 1034 for `~.`).
 - [x] **#20 — Interactive prompts don't all gate on a terminal.** *(FIXED: `~h` (`prompt_headers`) returns immediately when stdin is not a terminal.)* `prompt_headers` (`escapes.rs:545`, `~h`) prompts unconditionally; spec 105065 says `~h` prompts "If standard input is a terminal".
 - [ ] **#21 — `-u user` hardcodes `/var/mail/user`.** `args.rs:141-143` ignores the other spool locations checked by `get_system_mailbox` and performs no privilege check (spec 104287-104289 requires appropriate privileges).
-- [ ] **#22 — Some informative output goes to stderr.** e.g. `save_dead_letter` writes "Message saved to …" to stderr (`send.rs:366`); spec STDOUT (104412-104414) routes messages to stdout, reserving stderr for diagnostics. Minor.
+- [x] **#22 — Some informative output goes to stderr.** *(FIXED: the "Message saved to ..." dead-letter notice now goes to stdout.)* e.g. `save_dead_letter` writes "Message saved to …" to stderr (`send.rs:366`); spec STDOUT (104412-104414) routes messages to stdout, reserving stderr for diagnostics. Minor.
 
 ## Detailed conformance matrix
 
@@ -85,7 +85,7 @@ The Receive-Mode command interpreter is broad and largely well-shaped: nearly al
 | `VISUAL` | CONFORMS | imported `main.rs:219`; used `commands.rs:1357`, `escapes.rs:287`. |
 | `TERM` | MISSING | Not read; `screen` defaults to hardcoded `20` (spec 104374, "unspecified default" — acceptable but TERM ignored). |
 | `TZ` | PARTIAL | Not read explicitly; `chrono::Local` uses the process tz. Spec "may affect" (104380) — acceptable. |
-| `LANG`/`LC_ALL`/`LC_CTYPE`/`LC_MESSAGES`/`LC_TIME`/`NLSPATH` | **MISSING** | (#7) No `setlocale`, never consulted. |
+| `LANG`/`LC_ALL`/`LC_CTYPE`/`LC_MESSAGES`/`LC_TIME`/`NLSPATH` | CONFORMS | (#7 FIXED) `setlocale(LC_ALL,"")` honors the environment locale; diagnostics via `gettext`. |
 
 ### Asynchronous events
 
@@ -95,7 +95,7 @@ The Receive-Mode command interpreter is broad and largely well-shaped: nearly al
 
 - [x] Prompt, header summaries, message bodies → stdout — `main.rs:150-152`, `mailbox.rs:252`, `commands.rs:910`.
 - [x] Command/parse errors → stderr — `main.rs:185`.
-- [ ] **Some informative notices → stderr** (#22).
+- [x] **Informative notices → stdout** (#22 FIXED).
 
 ### Output files (mbox format)
 
@@ -202,7 +202,7 @@ The Receive-Mode command interpreter is broad and largely well-shaped: nearly al
 - [x] `sh -c` receiving the `--` argument (#4) — `pipe_command_leading_dash_reaches_program`.
 - [x] `-f -N file` / `mailx -fin file` operand parsing (#5) — `opt_f_operand_after_other_options`, `opt_f_clustered_fin_operand`.
 - [x] `mailx -n` still reading `~/.mailrc` (#6) — `opt_n_still_reads_user_mailrc`.
-- [ ] `LC_*`/`setlocale` effect on diagnostics (#7).
+- [x] `LC_*`/`setlocale` initialization (#7) — `locale_env_initialization`; exercised across the whole suite (harness runs utilities under a pinned locale).
 - [x] `new` vs `unread` state characters / `:n` selector (#8) — `new_state_and_n_selector`.
 - [x] `~:set` actually setting a variable (#9 `tilde_colon_set_applies`); `~w` append (#10 `tilde_w_appends`); reply-all `Reply-To` (#11 `reply_all_uses_reply_to`); `escape=` disabling escapes (#12 `escape_null_disables_escaping`); `ignoreeof` `.`-terminate (#19 `ignoreeof_dot_terminates_compose`); `~h` tty gate (#20 `tilde_h_gated_on_terminal`).
 

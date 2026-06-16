@@ -193,8 +193,8 @@ pub fn send_mode(args: &Args, vars: &mut Variables) -> Result<(), String> {
 
             interrupt_count = 0;
 
-            // Check for escape character
-            if line.starts_with(escape_char) && line.len() > 1 {
+            // Check for escape character (disabled when `escape` is null)
+            if escape_char.is_some_and(|ec| line.starts_with(ec)) && line.len() > 1 {
                 let result = handle_escape(&line[1..], &mut msg, vars, None)?;
                 if result.done {
                     if result.abort {
@@ -364,7 +364,8 @@ pub fn save_dead_letter(msg: &ComposedMessage, vars: &Variables) {
 
     if let Ok(mut file) = File::create(&dead_path) {
         let _ = write!(file, "{}", msg.format());
-        eprintln!("Message saved to {}", dead_path);
+        // Informative notice -> stdout (spec STDOUT, 104412-104414).
+        println!("Message saved to {}", dead_path);
     }
 }
 

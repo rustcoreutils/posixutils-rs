@@ -1132,3 +1132,48 @@ fn pipe_command_leading_dash_reaches_program() {
         },
     );
 }
+
+// =============================================================================
+// Locale initialization (audit #7)
+// =============================================================================
+
+/// mailx initializes the locale from the environment without breaking; a
+/// UTF-8 LC_CTYPE drives multibyte header interpretation.
+#[test]
+fn locale_env_initialization() {
+    let subject: String = "résumé ".repeat(6); // multibyte, > 25 chars
+    let body = format!(
+        "From sender@example.com Mon Jan  1 10:00:00 2024\n\
+         From: sender@example.com\n\
+         Subject: {}\n\
+         \n\
+         body\n",
+        subject
+    );
+    let mbox = create_temp_mbox(&body);
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-H"),
+                String::from("-f"),
+                mbox.path().to_str().unwrap().to_string(),
+            ],
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        // The test controls the locale; C.UTF-8 exercises the UTF-8 ctype path.
+        &[("LC_ALL", "C.UTF-8")],
+        |_plan, output| {
+            assert!(
+                output.status.success(),
+                "mailx should run with an environment UTF-8 locale: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        },
+    );
+}

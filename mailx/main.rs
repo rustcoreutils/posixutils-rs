@@ -21,6 +21,8 @@ use std::env;
 use std::io::{self, IsTerminal, Write};
 use std::process;
 
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+
 use args::{Args, Mode};
 use commands::execute_command;
 use mailbox::Mailbox;
@@ -28,6 +30,13 @@ use send::send_mode;
 use variables::Variables;
 
 fn main() {
+    // Honor the environment locale (LC_CTYPE for multibyte text, LC_MESSAGES
+    // for diagnostics); diagnostics are routed through gettext for
+    // translatability. See the project locale-init convention.
+    setlocale(LocaleCategory::LcAll, "");
+    textdomain("posixutils-rs").ok();
+    bind_textdomain_codeset("posixutils-rs", "UTF-8").ok();
+
     // Install the SIGINT handler so an interrupt aborts the current command or
     // message instead of terminating mailx (ASYNCHRONOUS EVENTS).
     signals::setup();
@@ -90,7 +99,7 @@ fn run_headers_only(args: &Args) -> i32 {
     };
 
     if mb.message_count() == 0 {
-        println!("No mail for {}", get_user());
+        println!("{} {}", gettext("No mail for"), get_user());
         return 0;
     }
 
@@ -136,7 +145,7 @@ fn run_receive_mode(args: &Args) -> i32 {
     if !args.no_header_summary && vars.get_bool("header") && mb.message_count() > 0 {
         mb.print_headers(None, &vars);
     } else if mb.message_count() == 0 && is_tty {
-        println!("No mail for {}", get_user());
+        println!("{} {}", gettext("No mail for"), get_user());
     }
 
     // Command loop
@@ -166,7 +175,7 @@ fn run_receive_mode(args: &Args) -> i32 {
                 continue;
             }
             Err(e) => {
-                eprintln!("mailx: read error: {}", e);
+                eprintln!("mailx: {}: {}", gettext("read error"), e);
                 return 1;
             }
         }

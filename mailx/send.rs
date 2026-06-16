@@ -162,7 +162,7 @@ pub fn send_mode(args: &Args, vars: &mut Variables) -> Result<(), String> {
         // Interactive mode - handle escapes
         loop {
             let mut line = String::new();
-            match stdin.lock().read_line(&mut line) {
+            match crate::signals::read_line_interruptible(&mut line) {
                 Ok(0) => {
                     // EOF - if ignoreeof is set, ignore it
                     if vars.get_bool("ignoreeof") {
@@ -174,25 +174,21 @@ pub fn send_mode(args: &Args, vars: &mut Variables) -> Result<(), String> {
                 Ok(_) => {}
                 Err(e) => {
                     if e.kind() == io::ErrorKind::Interrupted {
-                        // If ignore is set, just print @ and continue
-                        if vars.get_bool("ignore") {
-                            println!("@");
-                            continue;
-                        }
-
-                        interrupt_count += 1;
-                        if interrupt_count >= 2 {
-                            // Save to dead letter and abort
-                            if vars.get_bool("save") && !msg.body.is_empty() {
-                                save_dead_letter(&msg, vars);
-                            }
+                        crate::signals::take_sigint();
+                        if crate::commands::interrupt_message(&msg, vars, &mut interrupt_count) {
                             return Err("Interrupt".to_string());
                         }
-                        println!("(Interrupt -- one more to kill letter)");
                         continue;
                     }
                     return Err(e.to_string());
                 }
+            }
+
+            // A SIGINT may have arrived between reads.
+            if crate::signals::take_sigint()
+                && crate::commands::interrupt_message(&msg, vars, &mut interrupt_count)
+            {
+                return Err("Interrupt".to_string());
             }
 
             interrupt_count = 0;
@@ -360,7 +356,7 @@ fn record_message(msg: &ComposedMessage, filename: &str, vars: &Variables) -> Re
 }
 
 /// Save message to dead letter file
-fn save_dead_letter(msg: &ComposedMessage, vars: &Variables) {
+pub fn save_dead_letter(msg: &ComposedMessage, vars: &Variables) {
     let dead_path = vars.get("DEAD").map(|s| s.to_string()).unwrap_or_else(|| {
         let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
         format!("{}/dead.letter", home)

@@ -11,7 +11,7 @@
 
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, IsTerminal, Write};
 use std::process::Command;
 
 use crate::escapes::handle_escape;
@@ -1501,21 +1501,62 @@ fn expand_folder_name(name: &str, vars: &Variables) -> String {
     }
 }
 
+/// Handle a `SIGINT` received while composing a message in input mode.
+///
+/// With `ignore` set, the interrupt prints `@` and discards the current line.
+/// Otherwise the first interrupt warns; a second consecutive interrupt aborts
+/// the message, writing the partial letter to the dead-letter file when `save`
+/// is set.  Returns `true` when the message should be aborted.
+pub(crate) fn interrupt_message(
+    composed: &ComposedMessage,
+    vars: &Variables,
+    interrupt_count: &mut u32,
+) -> bool {
+    if vars.get_bool("ignore") {
+        println!("@");
+        return false;
+    }
+    *interrupt_count += 1;
+    if *interrupt_count >= 2 {
+        if vars.get_bool("save") && !composed.body.is_empty() {
+            crate::send::save_dead_letter(composed, vars);
+        }
+        return true;
+    }
+    println!("(Interrupt -- one more to kill letter)");
+    false
+}
+
 fn compose_message(
     composed: &mut ComposedMessage,
     mb: &Mailbox,
     vars: &mut Variables,
 ) -> Result<(), String> {
-    let stdin = io::stdin();
     let escape_char = vars.escape_char();
+    let mut interrupt_count = 0;
 
     loop {
         let mut line = String::new();
-        match stdin.lock().read_line(&mut line) {
+        match crate::signals::read_line_interruptible(&mut line) {
             Ok(0) => break, // EOF
             Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                crate::signals::take_sigint();
+                if interrupt_message(composed, vars, &mut interrupt_count) {
+                    return Err("Interrupt".to_string());
+                }
+                continue;
+            }
             Err(e) => return Err(e.to_string()),
         }
+
+        // A SIGINT may have arrived between reads.
+        if crate::signals::take_sigint() && interrupt_message(composed, vars, &mut interrupt_count)
+        {
+            return Err("Interrupt".to_string());
+        }
+
+        interrupt_count = 0;
 
         // Check for escape character
         if line.starts_with(escape_char) && line.len() > 1 {

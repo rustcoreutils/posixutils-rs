@@ -15,7 +15,7 @@ The Receive-Mode command interpreter is broad and largely well-shaped: nearly al
 ### Critical
 
 - [x] **#1 — `-E` option unimplemented; `mailx -E …` exits non-zero with "illegal option".** *(FIXED: `'E'` arm in `args.rs` → `Args.discard_empty`; `send_mode` drops an empty-body message before delivery.)* `args.rs:59-118` has no `'E'` arm, so `-E` falls through to `_ => Err("illegal option -- {}")`. `-E` (discard messages with an empty body) is one of only two options *required on all systems* (the other is `-s`), added by Austin Group Defect 1367 (spec 104270). No empty-body-discard logic exists in `send.rs` either. Fix: parse `-E`, and in `send_message`/`send_mode` drop the message (success, no delivery) when the body is empty.
-- [ ] **#2 — No asynchronous-event / signal handling at all.** `grep -nE 'SIGINT|SIGCONT|signal_hook|libc::signal' *.rs` → zero matches. The whole ASYNCHRONOUS EVENTS section (spec 104388-104411) is unimplemented: in command mode `SIGINT` should abort the current command and re-prompt; in input mode it should (per `ignore`) print `@` and drop the line, or require a second interrupt to abort and write the partial message to `DEAD`. Rust default-terminates on `SIGINT`, so mailx just dies. The `-i`/`ignore` branch in `send.rs:176-193` keys off `io::ErrorKind::Interrupted` from `read_line`, which never occurs for a delivered signal — so `-i`/`ignore` is inert and the two-interrupt-to-abort flow is dead code. Fix: install a `SIGINT` handler (signal-hook) with command-mode vs input-mode state; honor `ignore`, `save`/`DEAD`.
+- [x] **#2 — No asynchronous-event / signal handling at all.** *(FIXED: `signals.rs` installs a `SIGINT` handler via `sigaction` (no `SA_RESTART`); command mode aborts the command and re-prompts, input mode honors `ignore` (`@`) and the two-interrupt abort with dead-letter save. Interactive reads go through `read_line_interruptible`, which surfaces `EINTR`.)* `grep -nE 'SIGINT|SIGCONT|signal_hook|libc::signal' *.rs` → zero matches. The whole ASYNCHRONOUS EVENTS section (spec 104388-104411) is unimplemented: in command mode `SIGINT` should abort the current command and re-prompt; in input mode it should (per `ignore`) print `@` and drop the line, or require a second interrupt to abort and write the partial message to `DEAD`. Rust default-terminates on `SIGINT`, so mailx just dies. The `-i`/`ignore` branch in `send.rs:176-193` keys off `io::ErrorKind::Interrupted` from `read_line`, which never occurs for a delivered signal — so `-i`/`ignore` is inert and the two-interrupt-to-abort flow is dead code. Fix: install a `SIGINT` handler (signal-hook) with command-mode vs input-mode state; honor `ignore`, `save`/`DEAD`.
 - [ ] **#3 — Header-summary display panics on multibyte text.** `message.rs:226` (`&s[..max_len - 3]`) and `mailbox.rs:395` (`&s[..max_len.saturating_sub(3)]`) slice a `String` at a byte offset; a `From:`/`Subject:` value whose UTF-8 boundary does not fall on byte 15/22 panics (`byte index N is not a char boundary`) while printing headers — i.e. an incoming message can crash mailx at startup. LC_CTYPE governs multibyte interpretation (spec 104333). Fix: truncate on `char_indices()` (or grapheme/`floor_char_boundary`).
 
 ### Major
@@ -54,7 +54,7 @@ The Receive-Mode command interpreter is broad and largely well-shaped: nearly al
 | `-f [file]` | CONFORMS | (#5 FIXED) `file` is a trailing operand read in Receive Mode; `-f` always selects Receive. |
 | `-F` | PARTIAL | `args.rs:75-77`; `send.rs:311-315` records to first-recipient login. Overrides `record` (spec 104278) — OK. |
 | `-H` | CONFORMS | `args.rs:78-80`, `main.rs:73-98` header summary then exit. |
-| `-i` | DIVERGES | (#2) Sets `ignore` (`main.rs:224-226`) but no signal handler exists, so it does nothing. |
+| `-i` | CONFORMS | (#2 FIXED) Sets `ignore`; the `SIGINT` handler now honors it (`@`, line discarded). |
 | `-n` | CONFORMS | (#6 FIXED) Skips only the system start-up file; user `MAILRC` always read. |
 | `-N` | CONFORMS | `args.rs:87-89`; suppresses initial summary (`main.rs:137`). |
 | `-s subject` | CONFORMS | `args.rs:90-102`; `send.rs:112-113`. All chars preserved. |
@@ -89,7 +89,7 @@ The Receive-Mode command interpreter is broad and largely well-shaped: nearly al
 
 ### Asynchronous events
 
-- [ ] **Entire section MISSING** (#2). No `SIGINT` handling; command-abort/re-prompt, input-mode `@`/two-interrupt-abort, and `DEAD` save-on-interrupt all absent.
+- [x] **Implemented** (#2 FIXED). `SIGINT` handler installed; command-abort/re-prompt, input-mode `@`/two-interrupt-abort, and `DEAD` save-on-interrupt all present (`signals.rs`, `main.rs`, `send.rs`, `commands.rs`). `SIGQUIT`/`SIGHUP` left at defaults (acceptable; spec focuses on `SIGINT`).
 
 ### STDOUT / STDERR
 
@@ -197,7 +197,7 @@ The Receive-Mode command interpreter is broad and largely well-shaped: nearly al
 141 tests exercise CLI options, receive-mode commands, msglist parsing, and variables. Not covered (mostly because unimplemented):
 
 - [x] `-E` empty-body discard (#1) — `opt_e_uppercase_discards_empty_body`, `opt_e_uppercase_keeps_nonempty_body`.
-- [ ] Signal / interrupt behavior (#2) — `cli/mod.rs` notes "-i … limited testing"; no SIGINT test.
+- [x] Signal / interrupt behavior (#2) — `signals::tests::sigint_sets_and_clears_flag` unit test; manual TTY/FIFO verification (mailx survives SIGINT in command mode, exits 0 on quit).
 - [ ] Multibyte header/subject truncation panic (#3).
 - [ ] `sh -c` receiving the `--` argument (#4).
 - [x] `-f -N file` / `mailx -fin file` operand parsing (#5) — `opt_f_operand_after_other_options`, `opt_f_clustered_fin_operand`.

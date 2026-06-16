@@ -14,10 +14,11 @@ mod mailbox;
 mod message;
 mod msglist;
 mod send;
+mod signals;
 mod variables;
 
 use std::env;
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, IsTerminal, Write};
 use std::process;
 
 use args::{Args, Mode};
@@ -27,6 +28,10 @@ use send::send_mode;
 use variables::Variables;
 
 fn main() {
+    // Install the SIGINT handler so an interrupt aborts the current command or
+    // message instead of terminating mailx (ASYNCHRONOUS EVENTS).
+    signals::setup();
+
     let args = match Args::parse(env::args().skip(1).collect()) {
         Ok(args) => args,
         Err(e) => {
@@ -135,7 +140,6 @@ fn run_receive_mode(args: &Args) -> i32 {
     }
 
     // Command loop
-    let stdin = io::stdin();
     let mut stdout = io::stdout();
 
     loop {
@@ -149,16 +153,28 @@ fn run_receive_mode(args: &Args) -> i32 {
 
         // Read command
         let mut line = String::new();
-        match stdin.lock().read_line(&mut line) {
+        match signals::read_line_interruptible(&mut line) {
             Ok(0) => {
                 // EOF - quit
                 return quit_mailbox(&mut mb, &vars);
             }
             Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                // SIGINT in command mode: abort the partial command, re-prompt.
+                signals::take_sigint();
+                println!();
+                continue;
+            }
             Err(e) => {
                 eprintln!("mailx: read error: {}", e);
                 return 1;
             }
+        }
+
+        // A SIGINT may have arrived between reads; abort this command too.
+        if signals::take_sigint() {
+            println!();
+            continue;
         }
 
         let line = line.trim();

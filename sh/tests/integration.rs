@@ -1840,6 +1840,22 @@ mod audit_regressions {
     }
 
     #[test]
+    fn glob_matches_symlinks() {
+        // #24
+        set_env_vars();
+        let dir = Path::new(concat!(env!("CARGO_TARGET_TMPDIR"), "/sh_test_write_dir"))
+            .join("glob_symlink_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("real"), "x").unwrap();
+        std::os::unix::fs::symlink("real", dir.join("lnk")).unwrap();
+        run_successfully_and(
+            &format!("cd '{}'; for f in *; do echo \"$f\"; done\n", dir.display()),
+            |out| assert_eq!(out, "lnk\nreal\n"),
+        );
+    }
+
+    #[test]
     fn bracket_literal_members_match() {
         // #8: literal members inside `[...]` (incl. '.', '*', '^', ']') match
         // themselves rather than being mis-escaped or mis-parsed.

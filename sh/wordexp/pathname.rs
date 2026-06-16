@@ -44,11 +44,18 @@ impl FileSystem for DefaultFileSystem {
             } else {
                 continue;
             };
-            // TODO: symlinks
-            if file_type.is_file() {
-                result.push(DirEntry::File(entry.file_name()))
-            } else if file_type.is_dir() {
+            if file_type.is_dir() {
                 result.push(DirEntry::Dir(entry.file_name()))
+            } else if file_type.is_symlink() {
+                // classify a symlink by its target so a link to a directory can
+                // still be descended into; a broken link is treated as a file.
+                match std::fs::metadata(entry.path()) {
+                    Ok(meta) if meta.is_dir() => result.push(DirEntry::Dir(entry.file_name())),
+                    _ => result.push(DirEntry::File(entry.file_name())),
+                }
+            } else {
+                // regular files, FIFOs, devices, sockets — all match a pattern
+                result.push(DirEntry::File(entry.file_name()))
             }
         }
         result

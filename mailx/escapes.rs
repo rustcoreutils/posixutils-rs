@@ -333,6 +333,7 @@ fn run_shell_command(cmd: &str, vars: &Variables) -> Result<(), String> {
     let shell = vars.get("SHELL").unwrap_or("/bin/sh");
     Command::new(shell)
         .arg("-c")
+        .arg("--")
         .arg(cmd)
         .status()
         .map_err(|e| e.to_string())?;
@@ -370,6 +371,7 @@ fn run_shell_command_output(cmd: &str, vars: &Variables) -> Result<String, Strin
     let shell = vars.get("SHELL").unwrap_or("/bin/sh");
     let output = Command::new(shell)
         .arg("-c")
+        .arg("--")
         .arg(cmd)
         .output()
         .map_err(|e| e.to_string())?;
@@ -447,6 +449,7 @@ fn shell_expand(s: &str, vars: &Variables) -> String {
 
     let output = Command::new(shell)
         .arg("-c")
+        .arg("--")
         .arg(format!("printf '%s' {}", s))
         .output();
 
@@ -679,6 +682,7 @@ fn pipe_through_command(input: &str, cmd: &str, vars: &Variables) -> Result<Stri
 
     let mut child = Command::new(shell)
         .arg("-c")
+        .arg("--")
         .arg(cmd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

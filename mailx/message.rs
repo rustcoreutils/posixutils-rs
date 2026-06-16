@@ -201,7 +201,7 @@ impl Message {
         if let Some(start) = from.find('<') {
             let name = from[..start].trim().trim_matches('"');
             if !name.is_empty() {
-                return truncate_str(name, 18);
+                return truncate_display(name, 18);
             }
         }
         // Try to extract name from "(Name)" format
@@ -209,21 +209,28 @@ impl Message {
             if let Some(end) = from.find(')') {
                 let name = &from[start + 1..end];
                 if !name.is_empty() {
-                    return truncate_str(name, 18);
+                    return truncate_display(name, 18);
                 }
             }
         }
         // Just use the address
         let addr = from.trim_start_matches('<').trim_end_matches('>');
-        truncate_str(addr, 18)
+        truncate_display(addr, 18)
     }
 }
 
-fn truncate_str(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+/// Truncate `s` to at most `max_len` characters for header-summary display,
+/// appending an ellipsis when shortened.
+///
+/// Counts and slices by characters (not bytes) so a multibyte `From:`/`Subject:`
+/// value cannot land a slice on a non-char boundary and panic (audit #3).
+pub(crate) fn truncate_display(s: &str, max_len: usize) -> String {
+    if s.chars().count() <= max_len {
         s.to_string()
     } else {
-        format!("{}...", &s[..max_len - 3])
+        let keep = max_len.saturating_sub(3);
+        let truncated: String = s.chars().take(keep).collect();
+        format!("{}...", truncated)
     }
 }
 

@@ -12,7 +12,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 
-use crate::message::{Message, MessageState};
+use crate::message::{truncate_display, Message, MessageState};
 use crate::variables::Variables;
 
 /// A mailbox containing messages
@@ -239,7 +239,7 @@ impl Mailbox {
 
                 // Decide whether to show To or From
                 let address_field = if show_to && msg.from().contains(&user) {
-                    format!("To {}", truncate(msg.to(), 18))
+                    format!("To {}", truncate_display(msg.to(), 18))
                 } else {
                     msg.short_from()
                 };
@@ -247,7 +247,7 @@ impl Mailbox {
                 let date = msg.short_date();
                 let lines = msg.line_count();
                 let size = msg.size();
-                let subject = truncate(msg.subject(), 25);
+                let subject = truncate_display(msg.subject(), 25);
 
                 println!(
                     "{}{}{:>4}  {:<18}  {:>6}  {:>5}/{:<5}  {}",
@@ -386,12 +386,4 @@ fn get_mbox_path(vars: &Variables) -> String {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
         format!("{}/mbox", home)
     })
-}
-
-fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max_len.saturating_sub(3)])
-    }
 }

@@ -1041,3 +1041,94 @@ fn opt_n_still_reads_user_mailrc() {
         },
     );
 }
+
+// =============================================================================
+// Multibyte header-summary truncation must not panic (audit #3)
+// =============================================================================
+
+/// A multibyte From/Subject longer than the column widths must truncate on a
+/// character boundary rather than panicking on a byte slice.
+#[test]
+fn header_summary_multibyte_no_panic() {
+    // 3-byte chars in Subject (>25) and 2-byte chars in the From name (>18):
+    // a byte-offset slice at column 22/15 would fall mid-character and panic.
+    let subject: String = "あ".repeat(30);
+    let from_name: String = "Ñ".repeat(20);
+    let body = format!(
+        "From sender@example.com Mon Jan  1 10:00:00 2024\n\
+         From: {} <sender@example.com>\n\
+         Subject: {}\n\
+         \n\
+         body text\n",
+        from_name, subject
+    );
+    let mbox = create_temp_mbox(&body);
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-H"),
+                String::from("-f"),
+                mbox.path().to_str().unwrap().to_string(),
+            ],
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            assert!(
+                output.status.success(),
+                "header summary must not panic on multibyte text: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // Truncation appends an ellipsis.
+            assert!(
+                stdout.contains("..."),
+                "long fields should be truncated with ellipsis: {}",
+                stdout
+            );
+        },
+    );
+}
+
+// =============================================================================
+// sh -c receives the -- argument (audit #4)
+// =============================================================================
+
+/// A piped command beginning with `-` must be handed to the program (after the
+/// mandated `--`), not consumed by the shell as one of its own options.
+#[test]
+fn pipe_command_leading_dash_reaches_program() {
+    let mbox_path = test_data_path("testdata.mbox");
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path.to_str().unwrap().to_string(),
+            ],
+            // Pipe message 1 to the command "-n": with `sh -c -- -n` the shell
+            // runs "-n" as a command (not found) instead of swallowing it as the
+            // shell's own `-n` option (which would silently succeed).
+            stdin_data: String::from("pipe 1 -n\nquit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("not found"),
+                "`-n` should reach the shell as a command (proves `--`): {}",
+                stderr
+            );
+        },
+    );
+}

@@ -571,6 +571,7 @@ fn cmd_folders(vars: &Variables) -> Result<CommandResult, String> {
 
         Command::new(shell)
             .arg("-c")
+            .arg("--")
             .arg(format!("{} {}", lister, folder))
             .status()
             .map_err(|e| e.to_string())?;
@@ -831,6 +832,7 @@ fn cmd_pipe(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandRes
         if let Some(msg) = mb.get(*num) {
             let mut child = std::process::Command::new(shell)
                 .arg("-c")
+                .arg("--")
                 .arg(&cmd)
                 .stdin(std::process::Stdio::piped())
                 .spawn()
@@ -894,6 +896,7 @@ fn cmd_print(
                     let shell = vars.get("SHELL").unwrap_or("/bin/sh");
                     let mut child = std::process::Command::new(shell)
                         .arg("-c")
+                        .arg("--")
                         .arg(pager)
                         .stdin(std::process::Stdio::piped())
                         .spawn()
@@ -1145,6 +1148,7 @@ fn cmd_shell(cmd: &str, vars: &mut Variables) -> Result<CommandResult, String> {
     let shell = vars.get("SHELL").unwrap_or("/bin/sh");
     Command::new(shell)
         .arg("-c")
+        .arg("--")
         .arg(&cmd)
         .status()
         .map_err(|e| e.to_string())?;

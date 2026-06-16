@@ -25,21 +25,21 @@ The Receive-Mode command interpreter is broad and largely well-shaped: nearly al
 - [x] **#6 — `-n` also suppresses the user `MAILRC` start-up file.** *(FIXED: `load_startup_files` gates only the system file on `-n`; the user MAILRC is always processed.)* Spec Start-Up steps 4–5 (104553-104555) attach "unless the −n option is given" only to the *system* start-up file; the user file named by `MAILRC` is *always* processed. `main.rs:53/78/105` gate the entire `load_startup_files` (both system and user) on `!args.no_init`, so `mailx -n` skips `~/.mailrc` too. Fix: split the two; `-n` skips only the system file.
 - [ ] **#7 — No locale handling; diagnostics hardcoded English.** `grep -nE 'setlocale|gettext|LC_' *.rs` → zero. Spec lists `LANG`/`LC_ALL`/`LC_CTYPE`/`LC_MESSAGES`/`NLSPATH` (104328-104359) as affecting execution; `LC_MESSAGES` shall govern diagnostic and informative text. `setlocale(LC_ALL,"")` is never called and every `eprintln!`/`println!` string is literal English. Fix: `setlocale` near `main`, route diagnostics through `gettext` per project convention.
 - [x] **#8 — `new` message state never produced; `N` shown as `U`, `:n` selector dead.** *(FIXED: loaded messages default to `New`; `Status:` with `R`→`Read`, `O`-only→`Unread`; absence stays `New`. `:n` and the `N` char now work; current = first new/unread per spec 104481-104482.)* `mailbox.rs:69` sets every loaded message to `MessageState::Unread` (`// Assume unread for now`); only a `Status:` header containing `R`/`O` promotes to `Read` (`mailbox.rs:100-102`). `MessageState::New` is therefore unreachable from a real mailbox, so genuinely new mail displays state char `U` instead of `N` (spec 104491-104496), and `:n` (`msglist.rs:192`) matches nothing. Fix: treat absence of `Status:`/`O` as `New`, presence of `O` (without `R`) as `Unread`.
-- [ ] **#9 — `~:` / `~_` command-level escape is a stub, and `~:set` does not set.** `escapes.rs:732-775` (`execute_input_mode_command`) handles only `set`, `echo`, `!`; it ignores `_msg`/`_mb`, and its `set` arm merely `println!`s each argument (`escapes.rs:755-759`) instead of mutating `vars`. Spec 105048-105049: "`~: mailx-command` … Perform the command-level request." Fix: dispatch through the real command interpreter (the command-mode subset that is valid here), and actually apply `set`.
-- [ ] **#10 — `~w file` truncates instead of appending.** `escapes.rs:293` uses `fs::write` (truncate). Spec 105094-105097: "The file shall be created or the message shall be appended to it if the file already exists." Fix: open with create+append.
+- [x] **#9 — `~:` / `~_` command-level escape is a stub, and `~:set` does not set.** *(FIXED: `~:`/`~_` dispatch through the real command functions with `&mut Variables`; `set`/`unset`/`alias`/`alternates`/`echo`/`!` apply for real.)* `escapes.rs:732-775` (`execute_input_mode_command`) handles only `set`, `echo`, `!`; it ignores `_msg`/`_mb`, and its `set` arm merely `println!`s each argument (`escapes.rs:755-759`) instead of mutating `vars`. Spec 105048-105049: "`~: mailx-command` … Perform the command-level request." Fix: dispatch through the real command interpreter (the command-mode subset that is valid here), and actually apply `set`.
+- [x] **#10 — `~w file` truncates instead of appending.** *(FIXED: `~w` opens with create+append.)* `escapes.rs:293` uses `fs::write` (truncate). Spec 105094-105097: "The file shall be created or the message shall be appended to it if the file already exists." Fix: open with create+append.
 - [x] **#11 — reply-all ignores `Reply-To`.** *(FIXED: reply-all seeds the sender portion from `Reply-To` when present, else `From`.)* `compose_reply` for the lowercase (reply-all) form (`send.rs:392-432`) unconditionally seeds recipients from `From` + `To` + `Cc` and never consults `Reply-To`. Spec 104911-104916: in the lowercase form, only *when there is no* `Reply-To` are `From`,`To`,`Cc` used; when `Reply-To` is present the From-derived path does not apply (implementation-defined Reply-To/To/Cc). Fix: branch on `Reply-To` presence.
 
 ### Minor
 
-- [ ] **#12 — `set escape=` (null) does not disable escaping.** `variables.rs:99-103` returns `'~'` via `unwrap_or('~')` when the value is empty. Spec 104610-104612: "if it is set to null, command escaping shall be disabled." Fix: distinguish unset (`~`) from set-empty (disabled).
+- [x] **#12 — `set escape=` (null) does not disable escaping.** *(FIXED: `escape_char()` returns `Option<char>`; set-empty yields `None`, disabling escape processing.)* `variables.rs:99-103` returns `'~'` via `unwrap_or('~')` when the value is empty. Spec 104610-104612: "if it is set to null, command escaping shall be disabled." Fix: distinguish unset (`~`) from set-empty (disabled).
 - [x] **#13 — `mbox`/`touch`/`hold` not restricted to the system mailbox; `mbox` cannot override a set `hold` variable.** *(FIXED: the three commands are gated on `is_system_mailbox`; a new `Message.force_mbox` flag set by `mbox`/`touch` forces the message to the secondary mbox at quit, overriding the `hold` variable.)* `commands.rs` `cmd_mbox`/`cmd_touch`/`cmd_hold` perform no "system mailbox only" check (spec 104831, 104853, 104986). `cmd_mbox` sets `Read`; at quit a `Read` message with the `hold` *variable* set is kept in place (`mailbox.rs:291-296`), so `mbox` does not force the message to the secondary mailbox as required (spec 104853-104855). Fix: add a distinct "force-to-mbox" state and gate the three commands on `is_system_mailbox`.
 - [ ] **#14 — Start-up files: invalid commands silently ignored; several legal commands not executed.** `execute_startup_command` (`commands.rs:259-273`) whitelists only alias/alternates/discard/retain/set/unset/source/if and maps everything else to `Ok(())`. The spec's *invalid-in-startup* list (104557-104559) should produce a diagnostic (and "any errors … shall … terminate … or … continue after writing a diagnostic"); conversely legal start-up commands such as `cd`, `echo`, `folders` are dropped. Fix: diagnose the invalid set, execute the rest.
 - [ ] **#15 — `crt` pagination ignores whether stdout is a terminal.** `commands.rs:891` / `escapes.rs:233` paginate whenever the line count exceeds `crt`. Spec 104362-104367 gates pagination on stdout being a terminal device. Fix: only auto-page when `io::stdout().is_terminal()`.
 - [ ] **#16 — `if s|r` is a no-op in command mode.** `commands.rs:137-139` returns `Continue` for `if`/`else`/`endif`, so an interactive/`source`d conditional block always executes its body regardless of mode (spec 104836-104844). Only the start-up loader (`main.rs:264-331`) honors conditionals. Fix: track conditional state in `execute_command`.
 - [ ] **#17 — `alias` backslash recursion-prevention unimplemented.** `variables.rs:125-141` (`expand_alias`) always recurses; spec 104720-104721 lets a leading unquoted `\` on a group member prevent expansion.
 - [ ] **#18 — `#` (previous file) folder substitution unimplemented.** `commands.rs:1490-1493` returns the literal `#` (spec 104794).
-- [ ] **#19 — `ignoreeof` not honored during Receive-Mode composition.** `compose_message` (`commands.rs:1512-1538`) breaks on EOF unconditionally and only checks `dot`; send-mode (`send.rs:167-221`) handles `ignoreeof` but the receive-mode reply/mail composer does not (spec 104630-104632, Austin Group Defect 1034 for `~.`).
-- [ ] **#20 — Interactive prompts don't all gate on a terminal.** `prompt_headers` (`escapes.rs:545`, `~h`) prompts unconditionally; spec 105065 says `~h` prompts "If standard input is a terminal".
+- [x] **#19 — `ignoreeof` not honored during Receive-Mode composition.** *(FIXED: `compose_message` honors `ignoreeof` for both EOF and the `.` terminator.)* `compose_message` (`commands.rs:1512-1538`) breaks on EOF unconditionally and only checks `dot`; send-mode (`send.rs:167-221`) handles `ignoreeof` but the receive-mode reply/mail composer does not (spec 104630-104632, Austin Group Defect 1034 for `~.`).
+- [x] **#20 — Interactive prompts don't all gate on a terminal.** *(FIXED: `~h` (`prompt_headers`) returns immediately when stdin is not a terminal.)* `prompt_headers` (`escapes.rs:545`, `~h`) prompts unconditionally; spec 105065 says `~h` prompts "If standard input is a terminal".
 - [ ] **#21 — `-u user` hardcodes `/var/mail/user`.** `args.rs:141-143` ignores the other spool locations checked by `get_system_mailbox` and performs no privilege check (spec 104287-104289 requires appropriate privileges).
 - [ ] **#22 — Some informative output goes to stderr.** e.g. `save_dead_letter` writes "Message saved to …" to stderr (`send.rs:366`); spec STDOUT (104412-104414) routes messages to stdout, reserving stderr for diagnostics. Minor.
 
@@ -159,21 +159,21 @@ The Receive-Mode command interpreter is broad and largely well-shaped: nearly al
 |---|---|---|
 | `~!command` | CONFORMS | (#4 FIXED) `--` inserted. |
 | `~.` | CONFORMS | finish input — `escapes.rs:82-85`. |
-| `~:`/`~_` | **PARTIAL** | (#9) stub; `set` doesn't set. |
+| `~:`/`~_` | CONFORMS | (#9 FIXED) dispatches real commands; `set` applies. |
 | `~?` | CONFORMS | `escapes.rs:103-107`. |
 | `~A`/`~a` | CONFORMS | `Sign`/`sign` with `\t`/`\n` — `escapes.rs:118-135`. |
 | `~b`/`~c`/`~t` | CONFORMS | Bcc/Cc/To — `escapes.rs:136-149, 278-284`. |
 | `~d` | CONFORMS | read `DEAD` — `escapes.rs:150-164`. |
 | `~e`/`~v` | CONFORMS | EDITOR/VISUAL — `escapes.rs:165-169, 285-289`. |
 | `~f`/`~F` | CONFORMS | forward — `escapes.rs:170-183`. |
-| `~h` | PARTIAL | (#20) no tty gate. |
+| `~h` | CONFORMS | (#20 FIXED) gated on stdin being a terminal. |
 | `~i var` | CONFORMS | insert variable — `escapes.rs:189-198`. |
 | `~m`/`~M` | CONFORMS | indented insert — `escapes.rs:199-212`. |
 | `~p` | PARTIAL | (#15) crt/tty. |
 | `~q`/`~x` | CONFORMS | abort w/ and w/o dead-letter — `escapes.rs:247-302`. |
 | `~r`/`~<` (`!command`) | CONFORMS | (#4 FIXED) `--` inserted on the command path — `escapes.rs`. |
 | `~s` | CONFORMS | `escapes.rs:273-277`. |
-| `~w file` | **DIVERGES** | (#10) truncates — `escapes.rs:290-298`. |
+| `~w file` | CONFORMS | (#10 FIXED) create+append — `escapes.rs`. |
 | `~|command` | CONFORMS | (#4 FIXED) `--` inserted — `escapes.rs`. |
 | `~~` | CONFORMS | literal `~` — `escapes.rs:317-323`. |
 
@@ -182,7 +182,7 @@ The Receive-Mode command interpreter is broad and largely well-shaped: nearly al
 - [x] Defaults set: `asksub`, `header`, `save`, `prompt="? "`, `indentprefix="\t"`, `toplines=5` — `variables.rs:45-54`.
 - [x] `ask`/`asksub` synonym — `variables.rs:60-62`.
 - [x] `onehop` rejected (permanent `noonehop`) — `commands.rs:1102-1105` (documented divergence; spec default is `noonehop`, acceptable).
-- [ ] **`escape=` (null) doesn't disable escaping** (#12).
+- [x] **`escape=` (null) disables escaping** (#12 FIXED).
 - Boolean/string handling, `no`-prefix unset, alias/alternates/ignored/retained tracking — CONFORMS.
 
 ### Exit status / consequences of errors
@@ -204,7 +204,7 @@ The Receive-Mode command interpreter is broad and largely well-shaped: nearly al
 - [x] `mailx -n` still reading `~/.mailrc` (#6) — `opt_n_still_reads_user_mailrc`.
 - [ ] `LC_*`/`setlocale` effect on diagnostics (#7).
 - [x] `new` vs `unread` state characters / `:n` selector (#8) — `new_state_and_n_selector`.
-- [ ] `~:set` actually setting a variable (#9); `~w` append (#10); reply-all `Reply-To` (#11); `escape=` disabling escapes (#12).
+- [x] `~:set` actually setting a variable (#9 `tilde_colon_set_applies`); `~w` append (#10 `tilde_w_appends`); reply-all `Reply-To` (#11 `reply_all_uses_reply_to`); `escape=` disabling escapes (#12 `escape_null_disables_escaping`); `ignoreeof` `.`-terminate (#19 `ignoreeof_dot_terminates_compose`); `~h` tty gate (#20 `tilde_h_gated_on_terminal`).
 
 ## Suggested PR groupings
 

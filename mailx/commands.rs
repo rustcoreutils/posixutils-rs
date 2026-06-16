@@ -284,7 +284,7 @@ fn parse_command_line(line: &str) -> (&str, &str) {
 
 // ============ Command implementations ============
 
-fn cmd_alias(args: &str, vars: &mut Variables) -> Result<CommandResult, String> {
+pub(crate) fn cmd_alias(args: &str, vars: &mut Variables) -> Result<CommandResult, String> {
     if args.is_empty() {
         // Print all aliases
         let mut names: Vec<&String> = vars.aliases.keys().collect();
@@ -323,7 +323,7 @@ fn cmd_alias_startup(args: &str, vars: &mut Variables) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_alternates(args: &str, vars: &mut Variables) -> Result<CommandResult, String> {
+pub(crate) fn cmd_alternates(args: &str, vars: &mut Variables) -> Result<CommandResult, String> {
     if args.is_empty() {
         println!("{}", vars.alternates.join(" "));
     } else {
@@ -1104,7 +1104,7 @@ fn cmd_save_author(
     Ok(CommandResult::Continue)
 }
 
-fn cmd_set(args: &str, vars: &mut Variables) -> Result<CommandResult, String> {
+pub(crate) fn cmd_set(args: &str, vars: &mut Variables) -> Result<CommandResult, String> {
     if args.is_empty() {
         vars.print_all();
         return Ok(CommandResult::Continue);
@@ -1358,7 +1358,7 @@ fn cmd_undelete(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<Comman
     Ok(CommandResult::Continue)
 }
 
-fn cmd_unset(args: &str, vars: &mut Variables) -> Result<CommandResult, String> {
+pub(crate) fn cmd_unset(args: &str, vars: &mut Variables) -> Result<CommandResult, String> {
     for name in args.split_whitespace() {
         vars.unset(name);
     }
@@ -1563,7 +1563,14 @@ fn compose_message(
     loop {
         let mut line = String::new();
         match crate::signals::read_line_interruptible(&mut line) {
-            Ok(0) => break, // EOF
+            Ok(0) => {
+                // EOF - if ignoreeof is set, require "." (or ~.) to end.
+                if vars.get_bool("ignoreeof") {
+                    println!("Use \".\" to terminate letter.");
+                    continue;
+                }
+                break;
+            }
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {
                 crate::signals::take_sigint();
@@ -1583,8 +1590,8 @@ fn compose_message(
 
         interrupt_count = 0;
 
-        // Check for escape character
-        if line.starts_with(escape_char) && line.len() > 1 {
+        // Check for escape character (disabled when `escape` is null)
+        if escape_char.is_some_and(|ec| line.starts_with(ec)) && line.len() > 1 {
             let result = handle_escape(&line[1..], composed, vars, Some(mb))?;
             if result.done {
                 if result.abort {
@@ -1595,8 +1602,8 @@ fn compose_message(
             continue;
         }
 
-        // Check for single period (if dot is set)
-        if vars.get_bool("dot") && line.trim() == "." {
+        // Check for single period (if dot is set, or ignoreeof forces it)
+        if (vars.get_bool("dot") || vars.get_bool("ignoreeof")) && line.trim() == "." {
             break;
         }
 

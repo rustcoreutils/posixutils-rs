@@ -95,11 +95,16 @@ impl Variables {
         self.booleans.remove(name);
     }
 
-    /// Get the escape character
-    pub fn escape_char(&self) -> char {
-        self.get("escape")
-            .and_then(|s| s.chars().next())
-            .unwrap_or('~')
+    /// Get the command-escape character for input mode.
+    ///
+    /// Returns `Some('~')` by default, `Some(c)` when `escape` names a
+    /// character, and `None` when `escape` is set to null — in which case
+    /// command escaping is disabled (spec 104610-104612).
+    pub fn escape_char(&self) -> Option<char> {
+        match self.get("escape") {
+            None => Some('~'),
+            Some(s) => s.chars().next(), // empty string => None => disabled
+        }
     }
 
     /// Print all set variables

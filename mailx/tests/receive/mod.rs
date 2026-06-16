@@ -2583,3 +2583,189 @@ fn mbox_rejected_outside_system_mailbox() {
         },
     );
 }
+
+// =============================================================================
+// Input-mode escapes (audit #9, #10, #12, #19, #20)
+// =============================================================================
+
+/// `~:set name` actually sets the variable (audit #9).
+#[test]
+fn tilde_colon_set_applies() {
+    let mbox = copy_test_data("testdata.mbox");
+    let mailrc = create_temp_mailrc("set debug\n");
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-N"),
+                String::from("-f"),
+                mbox.path().to_str().unwrap().to_string(),
+            ],
+            // Compose a message, set a variable via ~:, finish with ~., then
+            // list variables back in command mode.
+            stdin_data: String::from(
+                "mail recipient@example.com\n~:set composevar\nbody\n~.\nset\nquit\n",
+            ),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("MAILRC", mailrc.path().to_str().unwrap())],
+        |_plan, output| {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains("composevar"),
+                "~:set should set the variable: {}",
+                stdout
+            );
+        },
+    );
+}
+
+/// `~w file` appends to an existing file rather than truncating it (audit #10).
+#[test]
+fn tilde_w_appends() {
+    let mbox = copy_test_data("testdata.mbox");
+    let mailrc = create_temp_mailrc("set debug\n");
+    let target = create_temp_mbox("PREEXISTING CONTENT\n");
+    let target_path = target.path().to_str().unwrap().to_string();
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-N"),
+                String::from("-f"),
+                mbox.path().to_str().unwrap().to_string(),
+            ],
+            stdin_data: format!(
+                "mail recipient@example.com\nappended body\n~w {}\n~.\nquit\n",
+                target_path
+            ),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("MAILRC", mailrc.path().to_str().unwrap())],
+        |_plan, _output| {
+            let contents = std::fs::read_to_string(&target_path).unwrap_or_default();
+            assert!(
+                contents.contains("PREEXISTING CONTENT"),
+                "~w must not truncate the existing file: {:?}",
+                contents
+            );
+            assert!(
+                contents.contains("appended body"),
+                "~w must append the message body: {:?}",
+                contents
+            );
+        },
+    );
+}
+
+/// `set escape=` (null) disables command escaping, so `~x` is taken literally
+/// and the message is still sent rather than aborted (audit #12).
+#[test]
+fn escape_null_disables_escaping() {
+    let mbox = copy_test_data("testdata.mbox");
+    // dot terminates input; escape is null so ~x is not an escape.
+    let mailrc = create_temp_mailrc("set debug\nset dot\nset escape=\n");
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-N"),
+                String::from("-f"),
+                mbox.path().to_str().unwrap().to_string(),
+            ],
+            stdin_data: String::from("mail recipient@example.com\n~x\nbody\n.\nquit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("MAILRC", mailrc.path().to_str().unwrap())],
+        |_plan, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // With escaping disabled, ~x did not abort: the message is sent
+            // (debug mode reports it).
+            assert!(
+                stderr.contains("Debug mode"),
+                "escape= null should disable ~x abort and still send: {}",
+                stderr
+            );
+        },
+    );
+}
+
+/// With `ignoreeof` set, a lone "." terminates a receive-mode composition even
+/// when `dot` is not set (audit #19).
+#[test]
+fn ignoreeof_dot_terminates_compose() {
+    let mbox = copy_test_data("testdata.mbox");
+    let mailrc = create_temp_mailrc("set debug\nset ignoreeof\n");
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-N"),
+                String::from("-f"),
+                mbox.path().to_str().unwrap().to_string(),
+            ],
+            // If "." terminates, the echo runs as a command afterwards.
+            stdin_data: String::from(
+                "mail recipient@example.com\nbody line\n.\necho PHASEE_MARKER\nquit\n",
+            ),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("MAILRC", mailrc.path().to_str().unwrap())],
+        |_plan, output| {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains("PHASEE_MARKER"),
+                "ignoreeof should let '.' terminate compose so later commands run: {}",
+                stdout
+            );
+        },
+    );
+}
+
+/// `~h` does not prompt (or consume input) when stdin is not a terminal
+/// (audit #20): a command after the composition still runs.
+#[test]
+fn tilde_h_gated_on_terminal() {
+    let mbox = copy_test_data("testdata.mbox");
+    let mailrc = create_temp_mailrc("set debug\nset ignoreeof\n");
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-N"),
+                String::from("-f"),
+                mbox.path().to_str().unwrap().to_string(),
+            ],
+            // If ~h consumed the following lines (no tty gate), the echo would
+            // never run; with the gate it consumes nothing.
+            stdin_data: String::from(
+                "mail recipient@example.com\n~h\nbody line\n.\necho HMARKER\nquit\n",
+            ),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("MAILRC", mailrc.path().to_str().unwrap())],
+        |_plan, output| {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains("HMARKER"),
+                "~h must not consume input off a terminal: {}",
+                stdout
+            );
+        },
+    );
+}

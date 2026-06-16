@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::os::signals::{signal_to_exit_status, Signal};
+use crate::os::signals::Signal;
 use crate::os::{waitpid, OsResult, Pid, WaitStatus};
 use std::fmt::{Display, Formatter, Write};
 
@@ -31,6 +31,8 @@ impl Display for JobPosition {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum JobState {
     Done(libc::c_int),
+    /// Terminated by a signal (must display distinctly and name the signal).
+    Signaled(Signal),
     Running,
     Stopped,
 }
@@ -45,6 +47,7 @@ impl Display for JobState {
                     write!(f, "Done({})", code)
                 }
             }
+            JobState::Signaled(signal) => write!(f, "Terminated (SIG{signal})"),
             JobState::Running => f.write_str("Running"),
             JobState::Stopped => f.write_str("Stopped"),
         }
@@ -143,7 +146,7 @@ impl JobManager {
 
     pub fn update_jobs(&mut self) -> OsResult<()> {
         for job in &mut self.jobs {
-            if let JobState::Done(_) = job.state {
+            if matches!(job.state, JobState::Done(_) | JobState::Signaled(_)) {
                 continue;
             }
             match waitpid(job.pid, true, true)? {
@@ -155,7 +158,7 @@ impl JobManager {
                     if signal == Signal::SigStop {
                         job.state = JobState::Stopped;
                     } else {
-                        job.state = JobState::Done(signal_to_exit_status(signal));
+                        job.state = JobState::Signaled(signal);
                     }
                     job.state_should_be_reported = true;
                 }
@@ -170,7 +173,8 @@ impl JobManager {
     }
 
     pub fn cleanup_terminated_jobs(&mut self) {
-        self.jobs.retain(|j| !matches!(j.state, JobState::Done(_)));
+        self.jobs
+            .retain(|j| !matches!(j.state, JobState::Done(_) | JobState::Signaled(_)));
         self.update_positions();
     }
 

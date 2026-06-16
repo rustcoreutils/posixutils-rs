@@ -410,6 +410,9 @@ impl Shell {
         // A `break`/`continue` inside the function body must not escape into a
         // loop in the caller (POSIX), so the loop nesting starts fresh here.
         let saved_loop_depth = std::mem::take(&mut self.loop_depth);
+        // LINENO is restored after the call so the caller's line numbering is
+        // unaffected by the function body.
+        let saved_lineno = self.last_lineno;
         self.function_call_depth += 1;
         let result = self.interpret_compound_command(
             function_body,
@@ -422,6 +425,7 @@ impl Shell {
         }
         self.function_call_depth -= 1;
         self.loop_depth = saved_loop_depth;
+        self.last_lineno = saved_lineno;
         std::mem::swap(&mut args, &mut self.positional_parameters);
         std::mem::swap(&mut self.opened_files, &mut previous_opened_files);
         self.environment.pop_scope();
@@ -1049,6 +1053,13 @@ impl Shell {
                 std::process::exit(1);
             }
         };
+        // POSIX: the shell sets and exports PWD to the current directory.
+        environment
+            .set_global_forced(
+                "PWD".to_string(),
+                current_directory.to_string_lossy().into_owned(),
+            )
+            .export = true;
         Shell {
             environment,
             program_name,
@@ -1063,7 +1074,7 @@ impl Shell {
         }
     }
 
-    fn get_var_and_expand(&mut self, var: &str, default_if_err: &str) -> String {
+    pub fn get_var_and_expand(&mut self, var: &str, default_if_err: &str) -> String {
         let var = self.environment.get_str_value(var).unwrap_or_default();
         match parse_word(var, 0, false) {
             Ok(word) => match expand_word_to_string(&word, false, self) {

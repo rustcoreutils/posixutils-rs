@@ -241,6 +241,21 @@ fn interactive_shell(shell: &mut Shell) {
         unsafe { handle_signal_ignore(Signal::SigTtou) }
         unsafe { handle_signal_ignore(Signal::SigTstp) }
     }
+    // POSIX: an interactive shell expands $ENV and, if the result is an absolute
+    // pathname, executes that file in the current environment. ENV is ignored if
+    // the real and effective user/group IDs differ.
+    let env_file = shell.get_var_and_expand("ENV", "");
+    if env_file.starts_with('/') {
+        let ids_match =
+            unsafe { libc::getuid() == libc::geteuid() && libc::getgid() == libc::getegid() };
+        if ids_match {
+            if let Ok(contents) = std::fs::read_to_string(&env_file) {
+                if let Err(err) = shell.execute_program(&contents) {
+                    eprintln!("sh: {env_file}: {}", err.message);
+                }
+            }
+        }
+    }
     loop {
         if shell.set_options.vi {
             vi_repl(shell);

@@ -1795,6 +1795,50 @@ mod audit_regressions {
         );
     }
 
+    // ----- Phase 8: jobs / signals / env / startup -----
+
+    #[test]
+    fn times_output_is_well_formed() {
+        // #27: two lines, each "MmS.SSSs MmS.SSSs".
+        run_successfully_and("times\n", |out| {
+            let lines: Vec<&str> = out.trim_end().split('\n').collect();
+            assert_eq!(lines.len(), 2, "times should print two lines: {out:?}");
+            for line in lines {
+                let fields: Vec<&str> = line.split(' ').collect();
+                assert_eq!(fields.len(), 2, "each line has two times: {line:?}");
+                for f in fields {
+                    assert!(
+                        f.contains('m') && f.ends_with('s') && f.contains('.'),
+                        "bad time field {f:?}"
+                    );
+                    // three fractional digits
+                    let frac = &f[f.find('.').unwrap() + 1..f.len() - 1];
+                    assert_eq!(frac.len(), 3, "expected 3 fractional digits in {f:?}");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn kill_accepts_signal_name_variants() {
+        // #49: case-independent names, with or without the SIG prefix.
+        run_successfully_and("sleep 5 & kill -s term $!; wait $!; echo $?\n", |out| {
+            assert_eq!(out, "143\n");
+        });
+        run_successfully_and("sleep 5 & kill -s Kill $!; wait $!; echo $?\n", |out| {
+            assert_eq!(out, "137\n");
+        });
+        run_successfully_and("kill -l 9\n", |out| assert_eq!(out, "KILL\n"));
+    }
+
+    #[test]
+    fn lineno_is_preserved_across_function_calls() {
+        // #53
+        run_successfully_and("f() { :; }\nf\necho $LINENO\n", |out| {
+            assert_eq!(out, "3\n");
+        });
+    }
+
     #[test]
     fn bracket_literal_members_match() {
         // #8: literal members inside `[...]` (incl. '.', '*', '^', ']') match

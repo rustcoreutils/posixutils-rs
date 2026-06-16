@@ -97,5 +97,6 @@ pub fn read_nonblocking_char() -> Option<u8> {
 }
 
 pub fn is_attached_to_terminal() -> bool {
-    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+    // POSIX: a shell is interactive when stdin AND stderr are terminals.
+    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
 }

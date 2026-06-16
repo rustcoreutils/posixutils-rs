@@ -18,8 +18,8 @@ fn run_foreground_job(
     opened_files: &mut OpenedFiles,
     arg: &str,
     job: &Job,
-) -> Result<(), String> {
-    if let JobState::Done(_) = job.state {
+) -> Result<i32, String> {
+    if matches!(job.state, JobState::Done(_) | JobState::Signaled(_)) {
         return Err(format!("fg: job {arg} already terminated"));
     }
     if job.state == JobState::Stopped {
@@ -29,11 +29,12 @@ fn run_foreground_job(
     opened_files.write_out(format!("{}\n", job.command));
     let mut temp = job.command.clone();
     std::mem::swap(&mut shell.last_pipeline_command, &mut temp);
-    shell
+    // The exit status of fg is the exit status of the job it waited for.
+    let exit_status = shell
         .wait_child_process(job.pid)
         .map_err(|err| err.to_string())?;
     std::mem::swap(&mut shell.last_pipeline_command, &mut temp);
-    Ok(())
+    Ok(exit_status)
 }
 pub struct Fg;
 
@@ -58,12 +59,15 @@ impl BuiltinUtility for Fg {
         let args = skip_option_terminator(args);
         if args.is_empty() {
             if let Some(job) = shell.background_jobs.remove_job(JobId::CurrentJob) {
-                if let Err(err) = run_foreground_job(shell, opened_files, "current", &job) {
-                    opened_files.write_err(err);
-                    status = 1;
+                match run_foreground_job(shell, opened_files, "current", &job) {
+                    Ok(s) => status = s,
+                    Err(err) => {
+                        opened_files.write_err(err);
+                        status = 1;
+                    }
                 }
             } else {
-                opened_files.write_err("bg: no background jobs");
+                opened_files.write_err("fg: no background jobs");
                 status = 1;
             }
         } else {
@@ -71,9 +75,12 @@ impl BuiltinUtility for Fg {
                 match parse_job_id(arg) {
                     Ok(job_id) => {
                         if let Some(job) = shell.background_jobs.remove_job(job_id) {
-                            if let Err(err) = run_foreground_job(shell, opened_files, arg, &job) {
-                                opened_files.write_err(err);
-                                status = 1;
+                            match run_foreground_job(shell, opened_files, arg, &job) {
+                                Ok(s) => status = s,
+                                Err(err) => {
+                                    opened_files.write_err(err);
+                                    status = 1;
+                                }
                             }
                         } else {
                             opened_files.write_err(format!("fg: '{arg}' no such job"));

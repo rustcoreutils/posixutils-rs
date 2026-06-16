@@ -86,33 +86,41 @@ impl FromStr for Signal {
     type Err = ();
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "HUP" | "hup" | "1" => Ok(Signal::SigHup),
-            "INT" | "int" | "2" => Ok(Signal::SigInt),
-            "QUIT" | "quit" | "3" => Ok(Signal::SigQuit),
-            "ILL" | "ill" => Ok(Signal::SigIll),
-            "TRAP" | "trap" => Ok(Signal::SigTrap),
-            "ABRT" | "abrt" | "6" => Ok(Signal::SigAbrt),
-            "BUS" | "bus" => Ok(Signal::SigBus),
-            "FPE" | "fpe" => Ok(Signal::SigFpe),
-            "USR1" | "usr1" => Ok(Signal::SigUsr1),
-            "SEGV" | "segv" => Ok(Signal::SigSegv),
-            "USR2" | "usr2" => Ok(Signal::SigUsr2),
-            "PIPE" | "pipe" => Ok(Signal::SigPipe),
-            "ALRM" | "alrm" | "14" => Ok(Signal::SigAlrm),
-            "TERM" | "term" | "15" => Ok(Signal::SigTerm),
-            "CHLD" | "chld" => Ok(Signal::SigChld),
-            "CONT" | "cont" => Ok(Signal::SigCont),
-            "STOP" | "stop" => Ok(Signal::SigStop),
-            "TSTP" | "tstp" => Ok(Signal::SigTstp),
-            "TTIN" | "ttin" => Ok(Signal::SigTtin),
-            "TTOU" | "ttou" => Ok(Signal::SigTtou),
-            "URG" | "urg" => Ok(Signal::SigUrg),
-            "XCPU" | "xcpu" => Ok(Signal::SigXcpu),
-            "XFSZ" | "xfsz" => Ok(Signal::SigXfsz),
-            "VTALRM" | "vtalrm" => Ok(Signal::SigVtalrm),
-            "PROF" | "prof" => Ok(Signal::SigProf),
-            "SYS" | "sys" => Ok(Signal::SigSys),
+        // A numeric signal number (the real libc number).
+        if let Ok(n) = s.parse::<i32>() {
+            return Signal::try_from(n).map_err(|_| ());
+        }
+        // Signal names are case-independent and may carry a leading "SIG".
+        let upper = s.to_ascii_uppercase();
+        let name = upper.strip_prefix("SIG").unwrap_or(&upper);
+        match name {
+            "HUP" => Ok(Signal::SigHup),
+            "INT" => Ok(Signal::SigInt),
+            "QUIT" => Ok(Signal::SigQuit),
+            "ILL" => Ok(Signal::SigIll),
+            "TRAP" => Ok(Signal::SigTrap),
+            "ABRT" => Ok(Signal::SigAbrt),
+            "BUS" => Ok(Signal::SigBus),
+            "FPE" => Ok(Signal::SigFpe),
+            "KILL" => Ok(Signal::SigKill),
+            "USR1" => Ok(Signal::SigUsr1),
+            "SEGV" => Ok(Signal::SigSegv),
+            "USR2" => Ok(Signal::SigUsr2),
+            "PIPE" => Ok(Signal::SigPipe),
+            "ALRM" => Ok(Signal::SigAlrm),
+            "TERM" => Ok(Signal::SigTerm),
+            "CHLD" => Ok(Signal::SigChld),
+            "CONT" => Ok(Signal::SigCont),
+            "STOP" => Ok(Signal::SigStop),
+            "TSTP" => Ok(Signal::SigTstp),
+            "TTIN" => Ok(Signal::SigTtin),
+            "TTOU" => Ok(Signal::SigTtou),
+            "URG" => Ok(Signal::SigUrg),
+            "XCPU" => Ok(Signal::SigXcpu),
+            "XFSZ" => Ok(Signal::SigXfsz),
+            "VTALRM" => Ok(Signal::SigVtalrm),
+            "PROF" => Ok(Signal::SigProf),
+            "SYS" => Ok(Signal::SigSys),
             _ => Err(()),
         }
     }

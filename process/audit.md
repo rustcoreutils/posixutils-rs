@@ -221,13 +221,13 @@ items remain (i18n, list-format, a `-l -opt` edge case).
 ### Priority issues
 
 #### Minor
-- [ ] **`#K1` — `kill -l` emits one space-joined line.** `signal.rs:13-15`
+- [x] **`#K1` — `kill -l` emits one space-joined line.** ✓ fixed in Phase 8 (explicit per-signal `%s%c`). `signal.rs:13-15`
   (`names.join(" ")` + one `println!`). POSIX formats each name `"%s%c"` with a
   space/newline separator, last = newline. The current output (all spaces, final
   newline) is *within* the letter of "separator shall be a `<space>` or
   `<newline>`", but a multi-line per-signal emit is the conventional form.
   Cosmetic.
-- [ ] **`#K2` — `-l` followed by an option mis-parses.** `kill.rs:36-51`.
+- [x] **`#K2` — `-l` followed by an option mis-parses.** ✓ fixed in Phase 8. `kill.rs:36-51`.
   `kill -l -s TERM …` treats `-s` as the `exit_status` operand →
   `"-s".parse::<i32>()` fails → "Invalid exit status". Fix: stop treating the
   next token as `exit_status` if it begins with `-`.

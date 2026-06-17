@@ -7,7 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
+use plib::diag;
 use posixutils_process::signal::{list_signals, lookup_signum, signum_to_name};
 
 enum ConfigMode {
@@ -29,6 +30,12 @@ fn parse_cmdline() -> Result<Config, &'static str> {
     let mut in_l_arg = false;
     for arg in std::env::args().skip(1) {
         if in_args {
+            // -l takes an OPTIONAL exit_status operand; if the next token is
+            // itself an option, -l had no operand (don't mis-read it as one).
+            if in_l_arg && arg.starts_with('-') && arg != "--" {
+                in_l_arg = false;
+            }
+
             if in_s_arg {
                 let sig_no = lookup_signum(&arg)?;
                 mode = ConfigMode::Signal(sig_no);
@@ -96,7 +103,7 @@ fn send_signal(prog_cfg: &Config, sig_no: i32) -> u32 {
         let res = unsafe { libc::kill(*pid as libc::pid_t, sig_no) };
         if res != 0 {
             let err = std::io::Error::last_os_error();
-            eprintln!("kill: {}: {}", pid, err);
+            diag::error(&format!("{}: {}", pid, err));
             exit_code = 1;
         }
     }
@@ -111,18 +118,26 @@ fn list_exit_status(exit_status: i32) -> u32 {
             0
         }
         None => {
-            eprintln!("kill: {}: invalid signal number", exit_status);
+            diag::error(&format!(
+                "{}: {}",
+                exit_status,
+                gettext("invalid signal number")
+            ));
             1
         }
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+fn main() {
+    diag::init_locale("kill");
 
-    let prog_cfg = parse_cmdline()?;
+    let prog_cfg = match parse_cmdline() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            diag::error(&gettext(e));
+            std::process::exit(1);
+        }
+    };
 
     let exit_code = match prog_cfg.mode {
         ConfigMode::List => {

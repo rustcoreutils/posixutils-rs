@@ -12,7 +12,6 @@ use crate::{
     ClassifyFiles, Config, FileTimeOption, LongFormatOptions, OutputFormat,
     DATE_TIME_FORMAT_OLD_OR_FUTURE, DATE_TIME_FORMAT_RECENT,
 };
-use chrono::{DateTime, Local};
 use std::{
     cmp::Ordering,
     ffi::{CStr, OsStr, OsString},
@@ -357,7 +356,7 @@ impl Entry {
 
     /// Comparison key for sorting based on just the file name.
     pub fn sorting_cmp_lexicographic(&self, other: &Self) -> Ordering {
-        self.file_name_raw.cmp(&other.file_name_raw)
+        collate_names(&self.file_name_raw, &other.file_name_raw)
     }
 
     // Returns (is_device, size, file_name). The `bool` is to have devices
@@ -381,7 +380,7 @@ impl Entry {
         match self_sorting_key.0.cmp(&other_sorting_key.0) {
             Ordering::Equal => {
                 match self_sorting_key.1.cmp(&other_sorting_key.1) {
-                    Ordering::Equal => self_sorting_key.2.cmp(other_sorting_key.2),
+                    Ordering::Equal => collate_names(self_sorting_key.2, other_sorting_key.2),
                     r => r.reverse(), // Default is from largest file size to smallest
                 }
             }
@@ -395,7 +394,7 @@ impl Entry {
     /// The kind of time is dependent on the flags -t, -c, -u.
     pub fn sorting_cmp_time(&self, other: &Self) -> Ordering {
         match self.time.cmp(&other.time) {
-            Ordering::Equal => self.file_name_raw.cmp(&other.file_name_raw),
+            Ordering::Equal => collate_names(&self.file_name_raw, &other.file_name_raw),
             r => r.reverse(), // Default is newest to oldest
         }
     }
@@ -735,35 +734,41 @@ fn get_system_time(
     Ok(time)
 }
 
+/// Compare two raw filenames using `LC_COLLATE` (libc `strcoll`) with a byte-order tiebreak, and a
+/// byte-order fallback for names that are not valid UTF-8 (which `strcoll` cannot accept).
+fn collate_names(a: &OsStr, b: &OsStr) -> Ordering {
+    match (a.to_str(), b.to_str()) {
+        (Some(sa), Some(sb)) => {
+            plib::locale::strcoll(sa, sb).then_with(|| a.as_bytes().cmp(b.as_bytes()))
+        }
+        _ => a.as_bytes().cmp(b.as_bytes()),
+    }
+}
+
 fn get_time_and_time_string(
     metadata: &ftw::Metadata,
     file_time_option: &FileTimeOption,
 ) -> io::Result<(SystemTime, String)> {
     let time = get_system_time(metadata, file_time_option)?;
 
+    // The recent-vs-old format is chosen relative to the *displayed* timestamp (so `-c`/`-u`
+    // track ctime/atime), using a precise ~6-month window (365.25/2 days).
     let dt_format = {
-        // The specification says to base it of "last modification time"
-        // without any mention of -c or -u
-        let last_modified_time = get_system_time(metadata, &FileTimeOption::LastModificationTime)?;
+        const SIX_MONTHS: Duration = Duration::from_secs(15_778_800);
         let now = SystemTime::now();
-
-        match now.duration_since(last_modified_time) {
-            Ok(duration) => {
-                const SIX_MONTHS: Duration = Duration::from_secs(3600 * 24 * 30 * 6);
-                if duration > SIX_MONTHS {
-                    DATE_TIME_FORMAT_OLD_OR_FUTURE // Old
-                } else {
-                    DATE_TIME_FORMAT_RECENT
-                }
-            }
-            Err(_) => DATE_TIME_FORMAT_OLD_OR_FUTURE, // Future
+        match now.duration_since(time) {
+            Ok(duration) if duration <= SIX_MONTHS => DATE_TIME_FORMAT_RECENT,
+            _ => DATE_TIME_FORMAT_OLD_OR_FUTURE, // older than 6 months, or a future timestamp
         }
     };
 
-    let time_string = {
-        // chrono parses the TZ environment variable in this conversion
-        let dt: DateTime<Local> = time.into();
-        dt.format(dt_format).to_string()
+    // libc `strftime` honors `LC_TIME` (localized month names) and `TZ`; the format strings use
+    // `%e` (blank-padded day) as the spec's `date "+%b %e %H:%M"` requires.
+    let epoch_secs = match time.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        Err(e) => -(e.duration().as_secs() as i64),
     };
+    let time_string = plib::locale::strftime(dt_format, epoch_secs)?;
+
     Ok((time, time_string))
 }

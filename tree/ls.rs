@@ -232,8 +232,8 @@ struct Args {
     file: Vec<PathBuf>,
 }
 
-const DATE_TIME_FORMAT_RECENT: &str = "%b %d %H:%M";
-const DATE_TIME_FORMAT_OLD_OR_FUTURE: &str = "%b %d  %Y"; // Two spaces between %d and %Y
+const DATE_TIME_FORMAT_RECENT: &str = "%b %e %H:%M";
+const DATE_TIME_FORMAT_OLD_OR_FUTURE: &str = "%b %e  %Y"; // Two spaces between %e and %Y
 const BLOCK_SIZE: u64 = 512;
 const BLOCK_SIZE_KIBIBYTES: u64 = 1024;
 const COLUMN_SPACING: usize = 2; // How many spaces in the column separator

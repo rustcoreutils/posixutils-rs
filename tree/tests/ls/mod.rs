@@ -719,3 +719,72 @@ fn test_ls_socket_classification() {
 
     fs::remove_dir_all(test_dir).unwrap();
 }
+
+// Audit #LS9: the long-format day is blank-padded (`%e`), not zero-padded (`Jun  5`, not `Jun 05`).
+#[test]
+fn test_ls_date_blank_padded_day() {
+    let test_dir = &format!(
+        "{}/test_ls_date_blank_padded_day",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let f = &format!("{test_dir}/f");
+    fs::create_dir(test_dir).unwrap();
+    fs::File::create(f).unwrap();
+    // An old (year-format) date on a single-digit day; noon UTC keeps the day stable across TZs.
+    change_file_time(f, TimeToChange::Both("2020-06-05 12:00:00"));
+
+    ls_test_with_checker(&["-l", f], |_, output| {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("2020"), "expected year format: {stdout}");
+        assert!(
+            (stdout.contains("Jun  5") || stdout.contains("Jun  6")),
+            "day should be blank-padded: {stdout}"
+        );
+        assert!(
+            !stdout.contains("Jun 05") && !stdout.contains("Jun 06"),
+            "day should not be zero-padded: {stdout}"
+        );
+    });
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// Audit #LS4: the recent-vs-old date format tracks the DISPLAYED timestamp — under `-u`, a file
+// with an old mtime but a recent atime uses the recent (HH:MM) format, not the year format.
+#[test]
+fn test_ls_u_recency_displayed_time() {
+    let test_dir = &format!(
+        "{}/test_ls_u_recency_displayed_time",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let f = &format!("{test_dir}/f");
+    fs::create_dir(test_dir).unwrap();
+    fs::File::create(f).unwrap();
+
+    let recent = (chrono::Local::now() - chrono::Duration::days(2))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    change_file_time(f, TimeToChange::Modified("2020-01-05 12:00:00")); // old mtime
+    change_file_time(f, TimeToChange::Accessed(&recent)); // recent atime (mtime preserved)
+
+    // -l uses mtime (old) → year format.
+    ls_test_with_checker(&["-l", f], |_, output| {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("2020"),
+            "-l should show the old year: {stdout}"
+        );
+    });
+    // -lu uses atime (recent) → time-of-day format, no year.
+    ls_test_with_checker(&["-lu", f], |_, output| {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            Regex::new(r"\d\d:\d\d").unwrap().is_match(&stdout),
+            "-lu should show HH:MM for a recent atime: {stdout}"
+        );
+        assert!(
+            !stdout.contains("2020"),
+            "-lu recent atime should not show a year: {stdout}"
+        );
+    });
+    fs::remove_dir_all(test_dir).unwrap();
+}

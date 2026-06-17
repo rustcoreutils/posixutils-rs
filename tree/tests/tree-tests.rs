@@ -21,4 +21,5 @@ mod mv;
 mod readlink;
 mod rm;
 mod rmdir;
+mod touch;
 mod unlink;

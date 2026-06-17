@@ -942,6 +942,110 @@ fn test_cp_special_bits() {
     fs::remove_dir_all(test_dir).unwrap();
 }
 
+// Audit #C1: `cp -p` must preserve S_ISUID/S_ISGID when ownership can be duplicated.
+// Copying our own file reproduces the chown-succeeds path (same owner), so the bits stay.
+#[test]
+fn test_cp_preserve_keeps_setuid_same_owner() {
+    let test_dir = &format!(
+        "{}/test_cp_preserve_keeps_setuid_same_owner",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let s = &format!("{test_dir}/s");
+    let s2 = &format!("{test_dir}/s2");
+
+    fs::create_dir(test_dir).unwrap();
+    fs::File::create(s).unwrap();
+
+    // Cast needed: libc mode constants are u16 on macOS, u32 on Linux
+    #[allow(clippy::unnecessary_cast)]
+    let setuid = libc::S_ISUID as u32;
+    fs::set_permissions(s, fs::Permissions::from_mode(0o755 | setuid)).unwrap();
+
+    cp_test(&["-p", s, s2], "", "", 0);
+
+    // chown to our own uid succeeds, so the mode (including setuid) is preserved verbatim.
+    assert_eq!(
+        fs::metadata(s).unwrap().mode(),
+        fs::metadata(s2).unwrap().mode()
+    );
+    assert_ne!(fs::metadata(s2).unwrap().mode() & setuid, 0);
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// Audit #C1: `cp -p` must CLEAR S_ISUID/S_ISGID when the user/group ID cannot be duplicated
+// (POSIX cp 90720-90721). A non-root user copying a root-owned setuid file cannot chown the copy
+// back to root, so the privileged bits must be dropped. Needs root + `NON_ROOT_USERNAME`.
+#[test]
+#[cfg_attr(
+    not(all(
+        target_os = "linux",
+        feature = "posixutils_test_all",
+        feature = "requires_root"
+    )),
+    ignore
+)]
+fn test_cp_preserve_clears_setuid_on_chown_fail() {
+    let Some(non_root) = option_env!("NON_ROOT_USERNAME") else {
+        eprintln!("Skipping: NON_ROOT_USERNAME not set");
+        return;
+    };
+
+    let test_dir = &format!(
+        "{}/test_cp_preserve_clears_setuid_on_chown_fail",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let s = &format!("{test_dir}/s");
+    let s2 = &format!("{test_dir}/s2");
+
+    fs::create_dir(test_dir).unwrap();
+    fs::File::create(s).unwrap(); // owned by root
+
+    // chmod 4755 (setuid + world rx so the non-root user can read it)
+    fs::set_permissions(s, fs::Permissions::from_mode(0o4755)).unwrap();
+
+    // Hand the directory to the non-root user so it can create the copy there.
+    unsafe {
+        let non_root_cstr = CString::new(non_root).unwrap();
+        let passwd = libc::getpwnam(non_root_cstr.as_ptr());
+        if passwd.is_null() {
+            panic!("{}", io::Error::last_os_error());
+        }
+        let uid = (*passwd).pw_uid;
+        let md = fs::metadata(test_dir).unwrap();
+        let test_dir_cstr = CString::new(test_dir.as_bytes()).unwrap();
+        if libc::chown(test_dir_cstr.as_ptr(), uid, md.gid()) != 0 {
+            panic!("{}", io::Error::last_os_error());
+        }
+    }
+
+    let mut child = Command::new("chroot")
+        .args([
+            "--skip-chdir",
+            &format!("--user={non_root}"),
+            "/",
+            env!("CARGO_BIN_EXE_cp"),
+            "-p",
+            s,
+            s2,
+        ])
+        .spawn()
+        .unwrap();
+    assert!(child.wait().unwrap().success());
+
+    // Cast needed: libc mode constants are u16 on macOS, u32 on Linux
+    #[allow(clippy::unnecessary_cast)]
+    let id_bits = (libc::S_ISUID | libc::S_ISGID) as u32;
+    let s2_mode = fs::metadata(s2).unwrap().mode();
+    assert_eq!(
+        s2_mode & id_bits,
+        0,
+        "setuid/setgid must be cleared when ownership cannot be duplicated (got mode {s2_mode:o})"
+    );
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
 // Replicates failure to copy D/D on `test_cp_fail_perm` due to not OR'ing with S_IRWXU:
 // https://github.com/rustcoreutils/posixutils-rs/issues/199
 #[test]

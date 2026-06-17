@@ -789,7 +789,9 @@ fn copy_characteristics(
             return Err(io::Error::other(err_str));
         }
 
-        // Copy user and group
+        // Copy user and group. Per cp's APPLICATION USAGE / RATIONALE and mv's DESCRIPTION, a
+        // failure here is not fatal (cp: "it is unspecified whether cp writes a diagnostic"; the
+        // dest is not deleted), but it has a security consequence handled below.
         let ret = libc::fchownat(
             target_dirfd,
             target_filename,
@@ -797,16 +799,27 @@ fn copy_characteristics(
             source_md.gid(),
             libc::AT_SYMLINK_NOFOLLOW,
         );
-        if ret != 0 {
+        let chown_ok = ret == 0;
+        if !chown_ok {
             // Ignore errors
             errno::set_errno(errno::Errno(0));
         }
 
-        // Copy permissions
+        // Copy permissions. POSIX cp 90720-90721 and mv 108104-108105: "If the user ID or the
+        // group ID cannot be duplicated, the file permission bits S_ISUID and S_ISGID shall be
+        // cleared." This prevents a set-user-ID / set-group-ID program from being copied to a file
+        // owned by a different user (a privilege leak). When ownership was duplicated successfully,
+        // the bits are preserved.
+        let mut mode = source_md.mode();
+        if !chown_ok {
+            #[allow(clippy::unnecessary_cast)]
+            let id_bits = (libc::S_ISUID | libc::S_ISGID) as u32;
+            mode &= !id_bits;
+        }
         let ret = libc::fchmodat(
             target_dirfd,
             target_filename,
-            source_md.mode() as libc::mode_t,
+            mode as libc::mode_t,
             libc::AT_SYMLINK_NOFOLLOW,
         );
         if ret != 0 {

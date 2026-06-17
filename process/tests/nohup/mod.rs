@@ -89,12 +89,15 @@ fn nohup_out_created_mode_0600() {
     let mut master: libc::c_int = 0;
     let mut slave: libc::c_int = 0;
     let rc = unsafe {
+        // The termp/winp arguments are `*mut` on macOS but `*const` on Linux
+        // glibc; pass typed null `*mut` pointers, which match macOS directly and
+        // coerce to `*const` on Linux.
         libc::openpty(
             &mut master,
             &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null(),
+            std::ptr::null_mut::<libc::c_char>(),
+            std::ptr::null_mut::<libc::termios>(),
+            std::ptr::null_mut::<libc::winsize>(),
         )
     };
     assert_eq!(rc, 0, "openpty failed");

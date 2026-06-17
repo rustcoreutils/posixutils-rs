@@ -159,7 +159,7 @@ impl Metadata {
             libc::S_IFDIR => FileType::Directory,
             libc::S_IFCHR => FileType::CharacterDevice,
             libc::S_IFIFO => FileType::Fifo,
-            _ => unreachable!(),
+            _ => FileType::Unknown,
         }
     }
 
@@ -296,6 +296,10 @@ pub enum FileType {
     Directory,
     CharacterDevice,
     Fifo,
+    /// A file whose `st_mode & S_IFMT` is not one of the types defined by the System Interfaces
+    /// volume of POSIX.1-2024. Reported rather than panicking so an unexpected on-disk type cannot
+    /// abort a traversal.
+    Unknown,
 }
 
 impl FileType {
@@ -755,7 +759,10 @@ where
             &mut err_reporter,
         ) {
             ProcessFileResult::ProcessedDirectory(entry) => {
-                match OwnedDir::open_at(&starting_dir, dir_filename.as_ptr()) {
+                // `O_DIRECTORY` rejects a non-directory; `O_NOFOLLOW` is intentionally NOT used for
+                // the root operand so that a symlinked directory argument is still honored per
+                // `follow_symlinks_on_args`.
+                match OwnedDir::open_at(&starting_dir, dir_filename.as_ptr(), libc::O_DIRECTORY) {
                     Ok(new_dir) => {
                         let node = TreeNode {
                             dir: HybridDir::Owned(new_dir),
@@ -785,20 +792,32 @@ where
 
     let mut success = true;
 
-    // Max allowable open file descriptors
+    // Max allowable open file descriptors. If `getrlimit` fails for any reason, fall back to a
+    // conservative default rather than aborting the traversal.
+    const FALLBACK_FD_LIMIT: libc::rlim_t = 1024;
     let fd_rlim_cur = unsafe {
         let mut rlim = MaybeUninit::uninit();
         let ret = libc::getrlimit(libc::RLIMIT_NOFILE, rlim.as_mut_ptr());
         if ret != 0 {
-            panic!("{}", io::Error::last_os_error());
+            FALLBACK_FD_LIMIT
+        } else {
+            rlim.assume_init().rlim_cur
         }
-        let rlim = rlim.assume_init();
-
-        rlim.rlim_cur
     };
 
-    // Subtract a few to allow for some FD bookkeeping
-    let fd_threshold: usize = fd_rlim_cur as usize - 7;
+    // Subtract a few to allow for some FD bookkeeping. `saturating_sub` guards against an
+    // implausibly tiny `RLIMIT_NOFILE`.
+    let fd_threshold: usize = (fd_rlim_cur as usize).saturating_sub(7).max(1);
+
+    // Flags OR'ed into every descent `openat`. `O_DIRECTORY` rejects a directory entry that was
+    // concurrently replaced with a non-directory (e.g. a FIFO, which would otherwise block the
+    // open). When symlinks are not being followed, `O_NOFOLLOW` additionally rejects a leaf that
+    // was swapped for a symlink, so the walk cannot be redirected out of the tree.
+    let descent_flags: libc::c_int = if follow_symlinks {
+        libc::O_DIRECTORY
+    } else {
+        libc::O_DIRECTORY | libc::O_NOFOLLOW
+    };
 
     // Depth first traversal main loop
     'outer: while let Some(current) = stack.last() {
@@ -883,6 +902,31 @@ where
                     &mut err_reporter,
                 ) {
                     ProcessFileResult::ProcessedDirectory(entry) => {
+                        let (want_dev, want_ino) = {
+                            let md = entry.metadata.as_ref().unwrap();
+                            (md.0.st_dev, md.0.st_ino)
+                        };
+
+                        // Symbolic-link loop detection. Only possible when following symlinks
+                        // (a real directory tree is acyclic). `stack` is exactly the chain of
+                        // ancestors of the entry about to be descended, so re-encountering an
+                        // ancestor's (dev, ino) means a cycle.
+                        if follow_symlinks
+                            && stack.iter().any(|n| {
+                                n.metadata.0.st_dev == want_dev && n.metadata.0.st_ino == want_ino
+                            })
+                        {
+                            err_reporter(
+                                entry,
+                                Error::new(
+                                    io::Error::from_raw_os_error(libc::ELOOP),
+                                    ErrorKind::Stat,
+                                ),
+                            );
+                            success = false;
+                            continue;
+                        }
+
                         let node = if conserve_fds {
                             match dir {
                                 HybridDir::Owned(current_dir) => {
@@ -893,6 +937,7 @@ where
                                             path.parent().unwrap().to_path_buf(),
                                         )),
                                         path,
+                                        descent_flags,
                                     );
                                     TreeNode {
                                         dir: HybridDir::Deferred(slow_dir),
@@ -905,6 +950,7 @@ where
                                     let slow_dir = DeferredDir::new(
                                         current_dir.parent().clone(),
                                         build_path(&path_stack, &entry_filename),
+                                        descent_flags,
                                     );
                                     TreeNode {
                                         dir: HybridDir::Deferred(slow_dir),
@@ -915,13 +961,44 @@ where
                                 }
                             }
                         } else {
-                            match OwnedDir::open_at(dir_fd, entry_filename.as_ptr()) {
-                                Ok(new_dir) => TreeNode {
-                                    dir: HybridDir::Owned(new_dir),
-                                    filename: entry_filename,
-                                    metadata: entry.metadata.unwrap(),
-                                    path_depth,
-                                },
+                            match OwnedDir::open_at(dir_fd, entry_filename.as_ptr(), descent_flags)
+                            {
+                                Ok(new_dir) => {
+                                    // TOCTOU re-verification: confirm the directory we opened is the
+                                    // very file we stat'd. A concurrent swap to a different
+                                    // directory passes `O_NOFOLLOW`/`O_DIRECTORY` but changes
+                                    // (dev, ino), so the walk would otherwise be redirected.
+                                    let verified = {
+                                        let mut sb = MaybeUninit::<libc::stat>::uninit();
+                                        let r = unsafe {
+                                            libc::fstat(
+                                                new_dir.file_descriptor().as_raw_fd(),
+                                                sb.as_mut_ptr(),
+                                            )
+                                        };
+                                        r == 0 && {
+                                            let sb = unsafe { sb.assume_init() };
+                                            sb.st_dev == want_dev && sb.st_ino == want_ino
+                                        }
+                                    };
+                                    if !verified {
+                                        err_reporter(
+                                            entry,
+                                            Error::new(
+                                                io::Error::from_raw_os_error(libc::ENOTDIR),
+                                                ErrorKind::OpenDir,
+                                            ),
+                                        );
+                                        success = false;
+                                        continue;
+                                    }
+                                    TreeNode {
+                                        dir: HybridDir::Owned(new_dir),
+                                        filename: entry_filename,
+                                        metadata: entry.metadata.unwrap(),
+                                        path_depth,
+                                    }
+                                }
                                 Err(error) => {
                                     err_reporter(entry, error);
                                     success = false;

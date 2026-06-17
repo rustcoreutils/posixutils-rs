@@ -153,6 +153,9 @@ where
                 }
             }
             ftw::FileType::Directory => unreachable!(), // Handled in the caller
+            ftw::FileType::Unknown => {
+                gettext!("remove '{}'?", filename_fn())
+            }
         };
 
         if !prompt_user(&prompt) {

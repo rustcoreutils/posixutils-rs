@@ -85,14 +85,21 @@ impl OwnedDir {
         }
     }
 
+    /// Open a directory entry for traversal.
+    ///
+    /// `extra_flags` is OR'ed into the `openat` flags. Callers descending into a subdirectory pass
+    /// `O_DIRECTORY` (and `O_NOFOLLOW` when symlinks must not be traversed) so that a directory
+    /// entry that is concurrently replaced with a symlink or non-directory cannot redirect the
+    /// walk (a filesystem-race / TOCTOU hardening).
     pub fn open_at(
         dir_file_descriptor: &FileDescriptor,
         filename: *const libc::c_char,
+        extra_flags: libc::c_int,
     ) -> Result<Self, Error> {
         let file_descriptor = FileDescriptor::open_at(
             dir_file_descriptor,
             unsafe { CStr::from_ptr(filename) },
-            libc::O_RDONLY,
+            libc::O_RDONLY | extra_flags,
         )
         .map_err(|e| Error::new(e, ErrorKind::Open))?;
         let dir = OwnedDir::new(file_descriptor).map_err(|e| Error::new(e, ErrorKind::OpenDir))?;
@@ -151,14 +158,22 @@ pub struct DeferredDir {
     parent: Rc<(FileDescriptor, PathBuf)>,
     path: PathBuf,
     visited: RefCell<HashSet<libc::ino_t>>,
+    /// Flags OR'ed into the leaf `openat` when (re)opening this directory. Carries the same
+    /// `O_DIRECTORY`/`O_NOFOLLOW` hardening as the non-deferred descent path.
+    descent_flags: libc::c_int,
 }
 
 impl DeferredDir {
-    pub fn new(parent: Rc<(FileDescriptor, PathBuf)>, path: PathBuf) -> Self {
+    pub fn new(
+        parent: Rc<(FileDescriptor, PathBuf)>,
+        path: PathBuf,
+        descent_flags: libc::c_int,
+    ) -> Self {
         Self {
             parent,
             path,
             visited: RefCell::new(HashSet::new()),
+            descent_flags,
         }
     }
 
@@ -189,7 +204,16 @@ impl DeferredDir {
 
         let filename_cstr = CString::new(components.as_path().as_os_str().as_bytes()).unwrap();
 
-        FileDescriptor::open_at(&starting_dir, &filename_cstr, libc::O_RDONLY).unwrap()
+        // Same descent hardening as the non-deferred path. `O_NOFOLLOW` here makes a leaf that was
+        // concurrently swapped for a symlink fail the reopen (fail-closed) rather than redirecting
+        // the walk. Note: the deferred path has no captured dev/ino baseline, so a swap to a
+        // different real directory is not detected here (documented residual).
+        FileDescriptor::open_at(
+            &starting_dir,
+            &filename_cstr,
+            libc::O_RDONLY | self.descent_flags,
+        )
+        .unwrap()
     }
 
     pub fn parent(&self) -> &Rc<(FileDescriptor, PathBuf)> {

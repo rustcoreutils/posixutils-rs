@@ -56,6 +56,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] bc
  - [x] cat
  - [x] cmp
+ - [x] cp
  - [x] crontab (cron cat.)
  - [x] dd
  - [x] delta (SCCS)
@@ -78,6 +79,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] man
  - [x] more
  - [x] msgfmt (i18n)
+ - [x] mv
  - [x] ngettext (i18n)
  - [x] nm (Development)
  - [x] od
@@ -85,6 +87,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] pax
  - [x] prs (SCCS)
  - [x] realpath
+ - [x] rm
  - [x] rmdel (SCCS)
  - [x] sact (SCCS)
  - [x] sccs (SCCS)
@@ -122,7 +125,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] cksum
  - [x] comm
  - [x] compress (compress cat.)
- - [x] cp
  - [x] csplit
  - [x] ctags (Development)
  - [x] cut
@@ -143,7 +145,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] logger
  - [x] ls
  - [x] mkdir
- - [x] mv
  - [x] nl
  - [x] paste
  - [x] patch
@@ -151,7 +152,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] printf
  - [x] ps
  - [x] readlink
- - [x] rm
  - [x] rmdir
  - [x] sed
  - [x] sort

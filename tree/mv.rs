@@ -58,10 +58,13 @@ impl MvConfig {
 }
 
 fn prompt_user(prompt: &str) -> bool {
-    eprint!("mv: {} ", prompt);
+    eprint!("mv: {prompt} ");
     let mut response = String::new();
-    io::stdin().read_line(&mut response).unwrap();
-    response.to_lowercase().starts_with('y')
+    // A read error or EOF is a non-affirmative response, not a panic.
+    if io::stdin().read_line(&mut response).unwrap_or(0) == 0 {
+        return false;
+    }
+    plib::locale::is_affirmative(response.trim_end_matches(['\r', '\n']))
 }
 
 // Copy the file or directory hierarchy from `src` to `dst`.
@@ -79,6 +82,9 @@ fn copy_hierarchy(
         interactive: cfg.interactive,
         preserve: true,  // Always copy file attributes
         recursive: true, // Recursively copy
+        prog: "mv",
+        // mv must stop the duplication on the first structural error so the source is not removed.
+        continue_on_error: false,
     };
 
     copy_file(
@@ -228,8 +234,9 @@ fn move_file(
     match fs::rename(source, target) {
         Ok(_) => return Ok(true),
         Err(e) => {
-            // use ErrorKind::CrossesDevices in the future, when it is stable
-            let errno = std::io::Error::last_os_error().raw_os_error().unwrap();
+            // use ErrorKind::CrossesDevices in the future, when it is stable.
+            // Use the captured error's errno rather than re-reading the global errno.
+            let errno = e.raw_os_error().unwrap_or(0);
             if errno != libc::EXDEV {
                 let err_str = match errno {
                     // The new directory pathname contains a path prefix that
@@ -349,7 +356,12 @@ fn move_files(cfg: &MvConfig, sources: &[PathBuf], target: &Path) -> Option<()> 
 
     // 7. Remove source file hierarchy
     for source in sources_to_delete {
-        let remove_result = if source.is_dir() {
+        // Classify without following symlinks: a symlink source must be removed as a link, not
+        // have its target's contents recursively deleted.
+        let is_real_dir = fs::symlink_metadata(source)
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
+        let remove_result = if is_real_dir {
             fs::remove_dir_all(source)
         } else {
             fs::remove_file(source)
@@ -401,6 +413,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // More than one source requires the target to be an existing directory (mv synopsis form 2).
+    if !dir_exists && sources.len() > 1 {
+        eprintln!(
+            "mv: {}",
+            gettext!("target '{}' is not a directory", target.display())
+        );
+        std::process::exit(1);
+    }
+
     let cfg = MvConfig::new(&args);
     if dir_exists {
         match move_files(&cfg, sources, target) {
@@ -412,12 +433,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     } else {
         let source = &sources[0];
+
+        // First synopsis form (108049-108050): "if source_file names a non-directory file and
+        // target_file ends with a trailing <slash> character, mv shall treat this as an error and
+        // no source_file operands shall be processed."
+        if target.as_os_str().as_bytes().ends_with(b"/") {
+            if let Ok(md) = fs::symlink_metadata(source) {
+                if !md.is_dir() {
+                    eprintln!(
+                        "mv: {}",
+                        gettext!(
+                            "cannot move '{}' to '{}': Not a directory",
+                            source.display(),
+                            target.display()
+                        )
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
         let mut dummy = HashMap::new();
         match move_file(&cfg, source, target, &mut dummy, None) {
             Ok(is_source_deleted) => {
                 // 7. Remove source file hierarchy
                 if !is_source_deleted {
-                    if source.is_dir() {
+                    // Classify without following symlinks (see move_files).
+                    let is_real_dir = fs::symlink_metadata(source)
+                        .map(|m| m.is_dir())
+                        .unwrap_or(false);
+                    if is_real_dir {
                         fs::remove_dir_all(source)?;
                     } else {
                         fs::remove_file(source)?;

@@ -1455,3 +1455,57 @@ fn test_mv_sticky_to_xpart() {
     fs::remove_dir_all(test_dir).unwrap();
     fs::remove_dir_all(other_dir).unwrap();
 }
+
+// Audit #M2: more than one source with a non-directory target must error (mv synopsis), and the
+// first source must NOT be moved.
+#[test]
+fn test_mv_multi_source_nondir_target() {
+    let test_dir = &format!(
+        "{}/test_mv_multi_source_nondir_target",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let a = &format!("{test_dir}/a");
+    let b = &format!("{test_dir}/b");
+    let c = &format!("{test_dir}/c"); // does not exist
+
+    fs::create_dir(test_dir).unwrap();
+    fs::write(a, b"aaa").unwrap();
+    fs::write(b, b"bbb").unwrap();
+
+    mv_test(
+        &[a, b, c],
+        "",
+        &format!("mv: target '{c}' is not a directory\n"),
+        1,
+    );
+    // Neither source was moved.
+    assert!(Path::new(a).exists());
+    assert!(Path::new(b).exists());
+    assert!(!Path::new(c).exists());
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// Audit #M2 (108049-108050): a non-directory source with a trailing-slash target_file is an error.
+#[test]
+fn test_mv_nondir_source_trailing_slash() {
+    let test_dir = &format!(
+        "{}/test_mv_nondir_source_trailing_slash",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let f = &format!("{test_dir}/f");
+    let target = &format!("{test_dir}/nodir/");
+
+    fs::create_dir(test_dir).unwrap();
+    fs::write(f, b"x").unwrap();
+
+    mv_test(
+        &[f, target],
+        "",
+        &format!("mv: cannot move '{f}' to '{target}': Not a directory\n"),
+        1,
+    );
+    assert!(Path::new(f).exists());
+
+    fs::remove_dir_all(test_dir).unwrap();
+}

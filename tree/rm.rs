@@ -17,7 +17,10 @@ use std::{
     ffi::CString,
     fs,
     io::{self, IsTerminal},
-    os::unix::{ffi::OsStrExt, fs::MetadataExt},
+    os::{
+        fd::AsRawFd,
+        unix::{ffi::OsStrExt, fs::MetadataExt},
+    },
     path::{Path, PathBuf},
 };
 
@@ -31,8 +34,14 @@ struct Args {
     #[arg(short, long, overrides_with_all = ["force", "interactive"], help = gettext("Prompt for confirmation"))]
     interactive: bool,
 
+    #[arg(short, long, help = gettext("Remove empty directories"))]
+    dir: bool,
+
     #[arg(short, visible_short_alias = 'R', long, help = gettext("Remove file hierarchies"))]
     recurse: bool,
+
+    #[arg(short, long, help = gettext("Write the name of each removed file to standard output"))]
+    verbose: bool,
 
     #[arg(value_parser = parse_pathbuf, help = gettext("Filepaths to remove"))]
     files: Vec<PathBuf>,
@@ -49,10 +58,13 @@ struct RmConfig {
 }
 
 fn prompt_user(prompt: &str) -> bool {
-    eprint!("rm: {} ", prompt);
+    eprint!("rm: {prompt} ");
     let mut response = String::new();
-    io::stdin().read_line(&mut response).unwrap();
-    response.to_lowercase().starts_with('y')
+    // A read error or EOF is a non-affirmative response, not a panic.
+    if io::stdin().read_line(&mut response).unwrap_or(0) == 0 {
+        return false;
+    }
+    plib::locale::is_affirmative(response.trim_end_matches(['\r', '\n']))
 }
 
 // Simplifies trailing slashes
@@ -66,6 +78,48 @@ fn display_cleaned(filepath: &Path) -> String {
 
 fn ask_for_prompt(cfg: &RmConfig, writable: bool) -> bool {
     !cfg.args.force && ((!writable && cfg.is_tty) || cfg.args.interactive)
+}
+
+// With `-v`, write the name of each removed entry to standard output (format unspecified by POSIX;
+// matches the `removed '…'` / `removed directory '…'` wording of common implementations).
+fn report_removed(cfg: &RmConfig, is_dir: bool, name: &str) {
+    if cfg.args.verbose {
+        let msg = if is_dir {
+            gettext!("removed directory '{}'", name)
+        } else {
+            gettext!("removed '{}'", name)
+        };
+        println!("{msg}");
+    }
+}
+
+// rm shall refuse `.`/`..` (as the basename) and an operand resolving to the root directory
+// (POSIX rm DESCRIPTION 113360-113362, APPLICATION USAGE 113466-113468).
+fn refuse_dot_dotdot_root(filepath: &Path) -> io::Result<()> {
+    let dot_dotdot_pattern = regex::bytes::Regex::new(r"(?:\.\/*|\.\.\/*)$").unwrap();
+    if dot_dotdot_pattern.is_match(filepath.as_os_str().as_bytes()) {
+        let err_str = gettext!(
+            "refusing to remove '.' or '..' directory: skipping '{}'",
+            display_cleaned(filepath)
+        );
+        return Err(io::Error::other(err_str));
+    }
+
+    if let Ok(abspath) = fs::canonicalize(filepath) {
+        if abspath.as_os_str() == "/" {
+            let err_str = if filepath.as_os_str() == "/" {
+                gettext("it is dangerous to operate recursively on '/'")
+            } else {
+                gettext!(
+                    "it is dangerous to operate recursively on '{}' (same as '/')",
+                    filepath.display()
+                )
+            };
+            return Err(io::Error::other(err_str));
+        }
+    }
+
+    Ok(())
 }
 
 fn descend_into_directory(cfg: &RmConfig, entry: &ftw::Entry, metadata: &ftw::Metadata) -> bool {
@@ -152,7 +206,14 @@ where
                     gettext!("remove write-protected regular file '{}'?", filename_fn())
                 }
             }
-            ftw::FileType::Directory => unreachable!(), // Handled in the caller
+            // Directories are handled by the caller before reaching here; fall back to a generic
+            // prompt rather than panicking if that ever changes.
+            ftw::FileType::Directory => {
+                gettext!("remove directory '{}'?", filename_fn())
+            }
+            ftw::FileType::Unknown => {
+                gettext!("remove '{}'?", filename_fn())
+            }
         };
 
         if !prompt_user(&prompt) {
@@ -204,6 +265,7 @@ fn process_directory(
                 };
                 Err(io::Error::other(err_str))
             } else {
+                report_removed(cfg, true, &entry.path().clean_trailing_slashes());
                 Ok(DirAction::Removed)
             }
         } else {
@@ -232,31 +294,8 @@ fn rm_directory(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
         return Err(io::Error::other(err_str));
     }
 
-    // It's not allowed to `rm` . and ..
-    let dot_dotdot_pattern = regex::bytes::Regex::new(r"(?:\.\/*|\.\.\/*)$").unwrap();
-    if dot_dotdot_pattern.is_match(filepath.as_os_str().as_bytes()) {
-        let err_str = gettext!(
-            "refusing to remove '.' or '..' directory: skipping '{}'",
-            display_cleaned(filepath)
-        );
-        return Err(io::Error::other(err_str));
-    }
-
-    // Also forbidden to `rm` the root directory
-    if let Ok(abspath) = fs::canonicalize(filepath) {
-        if abspath.as_os_str() == "/" {
-            // If the arg is verbatim "/"
-            let err_str = if filepath.as_os_str() == "/" {
-                gettext("it is dangerous to operate recursively on '/'")
-            } else {
-                gettext!(
-                    "it is dangerous to operate recursively on '{}' (same as '/')",
-                    filepath.display()
-                )
-            };
-            return Err(io::Error::other(err_str));
-        }
-    }
+    // It's not allowed to `rm` . and .. or the root directory.
+    refuse_dot_dotdot_root(filepath)?;
 
     let success = traverse_directory(
         filepath,
@@ -292,6 +331,7 @@ fn rm_directory(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
                         );
                         return Err(());
                     }
+                    report_removed(cfg, false, &entry.path().clean_trailing_slashes());
                 }
                 Ok(true)
             }
@@ -323,6 +363,8 @@ fn rm_directory(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
                         eprintln!("rm: {}", err_str);
                         return Err(());
                     }
+                } else {
+                    report_removed(cfg, true, &entry.path().clean_trailing_slashes());
                 }
             }
 
@@ -368,7 +410,17 @@ fn rm_directory(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
                     )
                 );
             }
-            ftw::ErrorKind::ReadLink => unreachable!(), // rm doesn't follow symlinks
+            // rm never follows symlinks, so this is not expected; report rather than panic.
+            ftw::ErrorKind::ReadLink => {
+                eprintln!(
+                    "rm: {}",
+                    gettext!(
+                        "cannot read symbolic link '{}': {}",
+                        entry.path().clean_trailing_slashes(),
+                        error_string(&error.inner())
+                    )
+                );
+            }
         },
         ftw::TraverseDirectoryOpts::default(),
     );
@@ -376,24 +428,94 @@ fn rm_directory(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
     Ok(success)
 }
 
+/// Open the parent directory of `filepath` and return its descriptor plus the basename.
+///
+/// This lets the top-level single-file removal stat and unlink relative to a pinned parent
+/// directory fd (audit #R4) instead of re-resolving the whole operand path twice, narrowing the
+/// TOCTOU window between classification and removal. A `None` parent (operand with no directory
+/// component) resolves against the current working directory.
+fn open_parent(filepath: &Path) -> io::Result<(ftw::FileDescriptor, CString)> {
+    let basename = filepath
+        .file_name()
+        .ok_or_else(|| io::Error::other(gettext!("invalid path: {}", display_cleaned(filepath))))?;
+    let basename_cstr = CString::new(basename.as_bytes())?;
+
+    let parent = filepath.parent().filter(|p| !p.as_os_str().is_empty());
+    let parent_fd = match parent {
+        Some(p) => {
+            let parent_cstr = CString::new(p.as_os_str().as_bytes())?;
+            ftw::FileDescriptor::open_at(
+                &ftw::FileDescriptor::cwd(),
+                &parent_cstr,
+                libc::O_RDONLY | libc::O_DIRECTORY,
+            )?
+        }
+        None => ftw::FileDescriptor::cwd(),
+    };
+
+    Ok((parent_fd, basename_cstr))
+}
+
 /// Removes a file.
 ///
 /// This function returns `Ok(true)` on success. This never returns `Ok(false)` and the function
 /// signature is only to match `rm_directory`.
 fn rm_file(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
-    let filename_cstr = CString::new(filepath.as_os_str().as_bytes())?;
-    let metadata = ftw::Metadata::new(libc::AT_FDCWD, &filename_cstr, false)?;
+    let (parent_fd, basename_cstr) = open_parent(filepath)?;
+    let metadata = ftw::Metadata::new(parent_fd.as_raw_fd(), &basename_cstr, false)?;
 
     if should_remove_file(cfg, &metadata, || display_cleaned(filepath)) {
-        fs::remove_file(filepath).map_err(|e| {
+        let ret = unsafe { libc::unlinkat(parent_fd.as_raw_fd(), basename_cstr.as_ptr(), 0) };
+        if ret != 0 {
+            let e = io::Error::last_os_error();
             let err_str = gettext!(
                 "cannot remove '{}': {}",
                 display_cleaned(filepath),
                 error_string(&e)
             );
-            io::Error::other(err_str)
-        })?;
+            return Err(io::Error::other(err_str));
+        }
+        report_removed(cfg, false, &display_cleaned(filepath));
     }
+
+    Ok(true)
+}
+
+/// Removes an empty directory (the `-d` option, without `-r`/`-R`), like `rmdir`.
+///
+/// Per POSIX rm DESCRIPTION 113369-113370 and RATIONALE 113532-113535, `-d` proceeds straight to
+/// the removal step for a directory operand (no recursion); a non-empty directory fails with the
+/// `remove_dir`/`rmdir` error, avoiding the type-check race of deciding what to do by file type.
+fn rm_dir_empty(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
+    refuse_dot_dotdot_root(filepath)?;
+
+    let filename_cstr = CString::new(filepath.as_os_str().as_bytes())?;
+    let metadata = ftw::Metadata::new(libc::AT_FDCWD, &filename_cstr, false)?;
+
+    let writable = metadata.is_writable();
+    if ask_for_prompt(cfg, writable) {
+        let prompt = if writable {
+            gettext!("remove directory '{}'?", display_cleaned(filepath))
+        } else {
+            gettext!(
+                "remove write-protected directory '{}'?",
+                display_cleaned(filepath)
+            )
+        };
+        if !prompt_user(&prompt) {
+            return Ok(true);
+        }
+    }
+
+    fs::remove_dir(filepath).map_err(|e| {
+        let err_str = gettext!(
+            "cannot remove '{}': {}",
+            display_cleaned(filepath),
+            error_string(&e)
+        );
+        io::Error::other(err_str)
+    })?;
+    report_removed(cfg, true, &display_cleaned(filepath));
 
     Ok(true)
 }
@@ -417,7 +539,13 @@ fn rm_path(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
     };
 
     if metadata.is_dir() {
-        rm_directory(cfg, filepath)
+        // `-r`/`-R` take precedence over `-d` (113534-113535). With only `-d`, remove an empty
+        // directory like `rmdir`; otherwise the recursive path errors when `-r` is absent.
+        if cfg.args.dir && !cfg.args.recurse {
+            rm_dir_empty(cfg, filepath)
+        } else {
+            rm_directory(cfg, filepath)
+        }
     } else {
         rm_file(cfg, filepath)
     }
@@ -432,6 +560,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let is_tty = io::stdin().is_terminal();
     let cfg = RmConfig { args, is_tty };
+
+    // POSIX rm SYNOPSIS form 1 requires at least one operand; only the `-f` form permits none, in
+    // which case rm is silent and successful (113405-113407).
+    if cfg.args.files.is_empty() {
+        if cfg.args.force {
+            std::process::exit(0);
+        }
+        eprintln!("rm: {}", gettext("missing operand"));
+        std::process::exit(1);
+    }
 
     let mut exit_code = 0;
 

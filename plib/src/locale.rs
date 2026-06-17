@@ -191,6 +191,36 @@ pub fn strftime(fmt: &str, epoch_secs: i64) -> io::Result<String> {
     }
 }
 
+/// Return `true` if `response` is an affirmative answer under the current `LC_MESSAGES`.
+///
+/// Uses the locale's `YESEXPR` extended regular expression (via libc `nl_langinfo(3)`); if that is
+/// unavailable, empty, or fails to compile, falls back to matching a leading `y`/`Y`. Intended for
+/// the interactive prompts of `cp`/`mv`/`rm` and similar utilities, replacing a hardcoded `y`
+/// check so the locale's affirmative responses are honored (POSIX `LC_MESSAGES`).
+///
+/// `setlocale(LC_ALL, "")` must have been called for a non-`C` `YESEXPR` to take effect.
+pub fn is_affirmative(response: &str) -> bool {
+    use std::ffi::CStr;
+    // SAFETY: nl_langinfo returns a pointer to a static, locale-owned string (or a valid empty
+    // string); the bytes are copied immediately before any further locale call.
+    let pattern = unsafe {
+        let p = libc::nl_langinfo(libc::YESEXPR);
+        if p.is_null() {
+            None
+        } else {
+            CStr::from_ptr(p).to_str().ok().map(str::to_owned)
+        }
+    };
+    let pattern = pattern.filter(|s| !s.is_empty());
+    match pattern {
+        Some(pat) => match crate::regex::Regex::ere(&pat) {
+            Ok(re) => re.is_match(response),
+            Err(_) => response.starts_with(['y', 'Y']),
+        },
+        None => response.starts_with(['y', 'Y']),
+    }
+}
+
 /// Split `bytes` into multibyte characters under the current `LC_CTYPE`, each
 /// returned as the sub-slice of bytes comprising one character.
 ///
@@ -268,6 +298,19 @@ mod tests {
         assert_eq!(to_lower('5'), '5');
         assert_eq!(to_upper('!'), '!');
         assert_eq!(to_lower('a'), 'a');
+    }
+
+    #[test]
+    fn is_affirmative_basic() {
+        // In the default C locale YESEXPR is `^[yY]`; the fallback also matches a leading y/Y.
+        assert!(is_affirmative("y"));
+        assert!(is_affirmative("Y"));
+        assert!(is_affirmative("yes"));
+        assert!(!is_affirmative("n"));
+        assert!(!is_affirmative("no"));
+        assert!(!is_affirmative(""));
+        // A leading non-y is not affirmative even if a y appears later.
+        assert!(!is_affirmative("maybe y"));
     }
 
     #[test]

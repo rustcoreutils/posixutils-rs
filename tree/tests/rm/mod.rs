@@ -1207,3 +1207,91 @@ fn test_rm_no_give_up() {
 
     fs::remove_dir_all(test_dir).unwrap();
 }
+
+// Audit #R1: `-d` removes an empty directory (rmdir semantics) without recursion.
+#[test]
+fn test_rm_d_empty() {
+    let test_dir = &format!("{}/test_rm_d_empty", env!("CARGO_TARGET_TMPDIR"));
+    let d = &format!("{test_dir}/d");
+    fs::create_dir(test_dir).unwrap();
+    fs::create_dir(d).unwrap();
+
+    rm_test(&["-d", d], "", "", 0);
+    assert!(!Path::new(d).exists());
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// Audit #R1: `-d` on a non-empty directory fails like `rmdir`, leaving it in place.
+#[test]
+fn test_rm_d_nonempty() {
+    let test_dir = &format!("{}/test_rm_d_nonempty", env!("CARGO_TARGET_TMPDIR"));
+    let d = &format!("{test_dir}/d");
+    fs::create_dir(test_dir).unwrap();
+    fs::create_dir(d).unwrap();
+    fs::File::create(format!("{d}/f")).unwrap();
+
+    rm_test(
+        &["-d", d],
+        "",
+        &format!("rm: cannot remove '{d}': Directory not empty\n"),
+        1,
+    );
+    assert!(Path::new(d).exists());
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// Audit #R1: `-r` takes precedence over `-d` — `-dr` recursively removes a non-empty directory.
+#[test]
+fn test_rm_dr_precedence() {
+    let test_dir = &format!("{}/test_rm_dr_precedence", env!("CARGO_TARGET_TMPDIR"));
+    let d = &format!("{test_dir}/d");
+    fs::create_dir(test_dir).unwrap();
+    fs::create_dir_all(format!("{d}/sub")).unwrap();
+    fs::File::create(format!("{d}/sub/x")).unwrap();
+
+    rm_test(&["-dr", d], "", "", 0);
+    assert!(!Path::new(d).exists());
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// Audit #R2: `-v` writes the removed name to stdout.
+#[test]
+fn test_rm_v_file() {
+    let test_dir = &format!("{}/test_rm_v_file", env!("CARGO_TARGET_TMPDIR"));
+    let f = &format!("{test_dir}/f");
+    fs::create_dir(test_dir).unwrap();
+    fs::File::create(f).unwrap();
+
+    rm_test(&["-v", f], &format!("removed '{f}'\n"), "", 0);
+    assert!(!Path::new(f).exists());
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// Audit #R2: `-dv` reports a removed empty directory on stdout.
+#[test]
+fn test_rm_dv_empty_dir() {
+    let test_dir = &format!("{}/test_rm_dv_empty_dir", env!("CARGO_TARGET_TMPDIR"));
+    let d = &format!("{test_dir}/d");
+    fs::create_dir(test_dir).unwrap();
+    fs::create_dir(d).unwrap();
+
+    rm_test(&["-dv", d], &format!("removed directory '{d}'\n"), "", 0);
+    assert!(!Path::new(d).exists());
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// Audit #R3: with no operands and without -f, rm is a usage error (exit 1); -f makes it silent/0.
+#[test]
+fn test_rm_no_operand() {
+    rm_test(&[], "", "rm: missing operand\n", 1);
+}
+
+#[test]
+fn test_rm_f_no_operand() {
+    rm_test(&["-f"], "", "", 0);
+}

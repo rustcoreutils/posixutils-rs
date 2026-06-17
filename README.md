@@ -67,15 +67,18 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] dirname
  - [x] du
  - [x] ed (Editors)
+ - [x] env
  - [x] ex (Editors)
  - [x] expr
  - [x] false
  - [x] file
  - [x] find
+ - [x] fuser
  - [x] gencat (i18n)
  - [x] get (SCCS)
  - [x] gettext (i18n)
  - [x] iconv (i18n)
+ - [x] kill
  - [x] lex (Development)
  - [x] link
  - [x] ln
@@ -91,13 +94,16 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] msgfmt (i18n)
  - [x] mv
  - [x] ngettext (i18n)
+ - [x] nice
  - [x] nm (Development)
+ - [x] nohup
  - [x] od
  - [x] pathchk
  - [x] pax
  - [x] prs (SCCS)
  - [x] readlink
  - [x] realpath
+ - [x] renice
  - [x] rm
  - [x] rmdel (SCCS)
  - [x] rmdir
@@ -109,6 +115,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] strip (Development)
  - [x] tee
  - [x] test
+ - [x] timeout
  - [x] touch
  - [x] true
  - [x] unget (SCCS)
@@ -119,6 +126,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] val (SCCS)
  - [x] vi (Editors)
  - [x] what (SCCS)
+ - [x] xargs
  - [x] xgettext (i18n)
  - [x] yacc (Development)
 
@@ -147,7 +155,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] echo
  - [x] expand
  - [x] fold
- - [x] fuser
  - [x] getconf
  - [x] grep
  - [x] head
@@ -167,7 +174,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] talk (with talkd local daemon)
  - [x] tail
  - [x] time
- - [x] timeout
  - [x] tput
  - [x] tr
  - [x] tsort
@@ -181,25 +187,19 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] wc
  - [x] who
  - [x] write
- - [x] xargs
  - [x] id
  - [x] ipcs (IPC)
- - [x] kill
  - [x] lp
  - [x] zcat (compress cat.)
 
 ## Stage 2 - Feature-complete and POSIX compliant
 
  - [x] date
- - [x] env
  - [x] ipcrm (IPC)
  - [x] logname
  - [x] mesg
  - [x] newgrp
- - [x] nice
- - [x] nohup
  - [x] pwd
- - [x] renice
  - [x] sleep
 
 ## Stage 1 - Rough draft

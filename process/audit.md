@@ -12,6 +12,46 @@ recorded inline (struck through) so the next auditor does not re-chase them.
 `timeout`, `xargs` (8 binaries) plus the shared `signal.rs` module.
 **Date:** 2026-06-17
 
+## Remediation status (2026-06-17)
+
+**All priority findings have since been remediated** on the `process-audit`
+branch across 8 themed phases, each independently committed with regression
+tests (the Critical/Major fixes were behaviorally re-verified against the
+rebuilt binaries) and clippy/fmt clean:
+
+- **Phase 1 — `env`** (`#E1`–`#E5`): exec failures map to 126/127 via a new
+  shared `posixutils_process::exec::exec_error_exit`; non-POSIX
+  `--ignore-env`/`--help`/`--version` surface removed; deterministic `BTreeMap`
+  dump; `name=value` validated against the portable name set.
+- **Phase 2 — `nice`** (`#NC1`–`#NC5`): a failed `nice()` no longer prevents
+  invoking the utility; errno-based failure check; 126/127 mapping; clap range
+  removed; `--niceval` dropped.
+- **Phase 3 — `renice`** (`#RN1`–`#RN4`) + `plib::priority`: accepts `ID...`
+  with per-ID continuation and non-zero exit on any failure; ID 0 accepted;
+  `-20..=20`; the `priority` library no longer prints its own diagnostics.
+- **Phase 4 — `nohup`** (`#NH1`–`#NH6`): `nohup.out` created mode 0600; `$HOME`
+  fallback; spec stderr-follows-stdout-fd routing; no-panic file-open failure;
+  `dirs` dependency dropped.
+- **Phase 5 — `timeout`** (`#T1`–`#T6`): `setitimer` sub-second precision;
+  child inherits timeout's SIGTTIN/SIGTTOU dispositions; full terminate-default
+  forwarding set; WCOREDUMP re-raise; group SIGCONT; `MONITORED_PID` sentinel.
+- **Phase 6 — `xargs`** (`#X1`–`#X5`): `-r` + run-once-on-empty; UTF-8 word
+  splitting; quoted-newline error; `-E` honored in insert mode; `is_affirmative`
+  for `-p`.
+- **Phase 7 — `fuser`** (`#F1`–`#F7`): `" %1d"` PID format; `makedev` device
+  decode; `scan_procs` error propagation; bounds-checked `/proc/mounts`;
+  `f`/`F` use-chars; stat-timeout thread tidied.
+- **Phase 8 — `kill`** (`#K1`/`#K2`): per-signal `%s%c` `-l` output; `-l`
+  no longer mis-reads a following option as its exit_status operand.
+- **`#C1`** (cross-cutting i18n): all 8 binaries migrated to `plib::diag`.
+
+All 8 utilities promoted to README **Stage 6 — Audited**. Validation: full
+workspace `cargo build --release` clean; `cargo clippy --all-targets` zero
+warnings; `cargo fmt --all -- --check` clean; 132 process integration tests +
+71 plib tests green. The **refuted** findings below (e.g. `env -u`, `fuser`
+exit-on-no-match, `xargs` signal→125, `kill` ABRT/IOT) remain dispositioned
+as recorded — not actionable.
+
 ---
 
 ## Cross-cutting findings (2026-06-17)
@@ -28,11 +68,11 @@ error/warning paths, and the `&'static str` error returns) are *not* wrapped in
 `gettext()`. POSIX requires `LC_MESSAGES` to determine "the format and contents
 of diagnostic messages written to standard error" for each utility. So the
 locale machinery is initialized but has no effect on actual error text.
-- [ ] **`#C1` Major** — wrap runtime diagnostics in `gettext()`. Sites:
-  `env.rs:113` (raw OS error via `?`); `kill.rs:99,114` + `signal.rs` `&str`
-  returns; `nice.rs:63`; `nohup.rs:65,74,88,94-101,110,126,135,139`;
-  `renice.rs:89,95`; `timeout.rs` `eprintln!` sites; `xargs.rs:25,180,183,534`;
-  `fuser.rs:648,652,901,1487,1521`.
+- [x] **`#C1` Major** — wrap runtime diagnostics in `gettext()`. ✓ fixed across
+  Phases 1–8: all 8 binaries now initialize locale via `plib::diag::init_locale`
+  and route runtime diagnostics through `plib::diag::error`/`warning` with the
+  human fragments wrapped in `gettext()` (replacing the per-crate
+  `setlocale`/`textdomain` boilerplate and raw `eprintln!` error paths).
 
 ### `#C2` — Shared `signal.rs` module
 
@@ -169,7 +209,7 @@ POSIX requirement and is correctly not implemented.
   "may", so this is a behavioral gap vs GNU `fuser`, not a spec violation.
 - [x] **`#F7` — detached timeout thread leak.** ✓ addressed in Phase 7 (self-reaps on stat completion; noise removed; full cancellation not portable). `fuser.rs:1484`. The NFS-stall
   guard thread is detached and keeps running on timeout.
-- [ ] **`#C1` — diagnostics hardcoded English.** `fuser.rs:648,652,901,1487,1521`.
+- [x] **`#C1` — diagnostics hardcoded English.** `fuser.rs` — ✓ fixed in Phase 7 (plib::diag).
 
 #### Refuted on verification
 - [x] ~~exit status must be >0 when no process uses any file~~ — re-examined:
@@ -231,7 +271,7 @@ items remain (i18n, list-format, a `-l -opt` edge case).
   `kill -l -s TERM …` treats `-s` as the `exit_status` operand →
   `"-s".parse::<i32>()` fails → "Invalid exit status". Fix: stop treating the
   next token as `exit_status` if it begins with `-`.
-- [ ] **`#C1` — diagnostics hardcoded English.** `kill.rs:99,114`; `signal.rs`
+- [x] **`#C1` — diagnostics hardcoded English (kill/signal).** ✓ fixed in Phase 8 (plib::diag); `signal.rs`
   `&'static str` returns (`"Invalid PID"`, `"Unknown signal name"`).
 
 #### Refuted on verification
@@ -307,7 +347,7 @@ nice value — and the increment is artificially clamped to `[-30, 29]` by clap.
 #### Minor
 - [x] **`#NC5` — `--niceval` long option is non-POSIX.** ✓ fixed in Phase 2. `nice.rs:23-35`. `-n`
   is correct; the derived `--niceval` long form is an unspecified extension.
-- [ ] **`#C1` — diagnostic at `nice.rs:63` not gettext-wrapped.**
+- [x] **`#C1` — diagnostic at `nice.rs:63` not gettext-wrapped.** ✓ fixed in Phase 2 (plib::diag).
 
 ### Conformance matrix
 
@@ -435,7 +475,7 @@ rejected; and the `-n` range excludes `+20`.
   Fix: `.range(-20..=20)`.
 
 #### Minor
-- [ ] **`#C1` — diagnostics at `renice.rs:89,95` not gettext-wrapped.**
+- [x] **`#C1` — diagnostics at `renice.rs:89,95` not gettext-wrapped.** ✓ fixed in Phase 3 (plib::diag).
 
 #### Refuted / N/A
 - [x] ~~`-n` is `--niceval` not `-n`~~ — re-examined: `#[arg(short)]` on field
@@ -516,7 +556,7 @@ forwarded where the spec says any terminate-default signal must be.
 - [x] **`#T6` — race: signal before `MONITORED_PID` is set.** ✓ fixed in Phase 5. `timeout.rs:131`
   exits `128+signal` if a signal lands between handler setup (`:361`) and PID
   store (`:405`). Use a `-1` sentinel.
-- [ ] **`#C1` — diagnostics not gettext-wrapped.**
+- [x] **`#C1` — diagnostics not gettext-wrapped.** ✓ fixed in Phase 5 (plib::diag).
 
 ### Conformance matrix
 
@@ -587,7 +627,7 @@ byte-to-`char` cast in the word-splitter corrupts multibyte UTF-8 arguments.
 - [x] **`#X5` — `-p` prompt format.** ✓ fixed in Phase 6. `xargs.rs:133` fuses command + `?...` in
   one `eprint!`; the affirmative test is ASCII `y`/`Y` rather than the locale
   `yesexpr`. (`/dev/tty` read at `xargs.rs:137` is correct.)
-- [ ] **`#C1` — error strings at `xargs.rs:25,180,183,534` not gettext-wrapped.**
+- [x] **`#C1` — error strings not gettext-wrapped.** ✓ fixed in Phase 6 (plib::diag).
 
 #### Refuted on verification
 - [x] ~~signal-killed child must exit 125 and stop~~ — re-examined: POSIX

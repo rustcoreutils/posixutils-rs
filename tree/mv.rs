@@ -58,10 +58,13 @@ impl MvConfig {
 }
 
 fn prompt_user(prompt: &str) -> bool {
-    eprint!("mv: {} ", prompt);
+    eprint!("mv: {prompt} ");
     let mut response = String::new();
-    io::stdin().read_line(&mut response).unwrap();
-    response.to_lowercase().starts_with('y')
+    // A read error or EOF is a non-affirmative response, not a panic.
+    if io::stdin().read_line(&mut response).unwrap_or(0) == 0 {
+        return false;
+    }
+    plib::locale::is_affirmative(response.trim_end_matches(['\r', '\n']))
 }
 
 // Copy the file or directory hierarchy from `src` to `dst`.
@@ -231,8 +234,9 @@ fn move_file(
     match fs::rename(source, target) {
         Ok(_) => return Ok(true),
         Err(e) => {
-            // use ErrorKind::CrossesDevices in the future, when it is stable
-            let errno = std::io::Error::last_os_error().raw_os_error().unwrap();
+            // use ErrorKind::CrossesDevices in the future, when it is stable.
+            // Use the captured error's errno rather than re-reading the global errno.
+            let errno = e.raw_os_error().unwrap_or(0);
             if errno != libc::EXDEV {
                 let err_str = match errno {
                     // The new directory pathname contains a path prefix that
@@ -352,7 +356,12 @@ fn move_files(cfg: &MvConfig, sources: &[PathBuf], target: &Path) -> Option<()> 
 
     // 7. Remove source file hierarchy
     for source in sources_to_delete {
-        let remove_result = if source.is_dir() {
+        // Classify without following symlinks: a symlink source must be removed as a link, not
+        // have its target's contents recursively deleted.
+        let is_real_dir = fs::symlink_metadata(source)
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
+        let remove_result = if is_real_dir {
             fs::remove_dir_all(source)
         } else {
             fs::remove_file(source)
@@ -448,7 +457,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(is_source_deleted) => {
                 // 7. Remove source file hierarchy
                 if !is_source_deleted {
-                    if source.is_dir() {
+                    // Classify without following symlinks (see move_files).
+                    let is_real_dir = fs::symlink_metadata(source)
+                        .map(|m| m.is_dir())
+                        .unwrap_or(false);
+                    if is_real_dir {
                         fs::remove_dir_all(source)?;
                     } else {
                         fs::remove_file(source)?;

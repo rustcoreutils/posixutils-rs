@@ -94,10 +94,13 @@ impl CopyConfig {
 }
 
 fn prompt_user(prompt: &str) -> bool {
-    eprint!("cp: {} ", prompt);
+    eprint!("cp: {prompt} ");
     let mut response = String::new();
-    io::stdin().read_line(&mut response).unwrap();
-    response.to_lowercase().starts_with('y')
+    // A read error or EOF is a non-affirmative response, not a panic.
+    if io::stdin().read_line(&mut response).unwrap_or(0) == 0 {
+        return false;
+    }
+    plib::locale::is_affirmative(response.trim_end_matches(['\r', '\n']))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

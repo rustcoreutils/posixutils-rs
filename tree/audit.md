@@ -97,8 +97,8 @@ fd), but they widen the top-level TOCTOU window relative to the recursive interi
 ### Prompts & i18n (applies to all three)
 - [x] Prompts and diagnostics are written to **stderr**; stdout is untouched — verified behaviorally for `rm -i` (prompt on stderr, stdout empty). Conforms to cp STDERR (90768-90770), mv STDERR (108164-108167), rm STDERR (113448-113451).
 - [x] `setlocale(LC_ALL, "")` + `textdomain` are called in every `main` (`cp.rs:101`, `mv.rs:371`, `rm.rs:427`), so `LANG`/`LC_ALL`/`LC_MESSAGES` select the message catalog.
-- [ ] **Affirmative responses are hardcoded `response.to_lowercase().starts_with('y')`** (`cp.rs:97`, `mv.rs:64`, `rm.rs:55`), ignoring the `LC_MESSAGES`/`LC_COLLATE`/`LC_CTYPE` `yesexpr` ERE the spec ties to "process affirmative responses" (cp 90758-90761, mv 108154-108157, rm 113438-113441). Minor. (#C8/#M5/#R6)
-- [ ] **`prompt_user` does `io::stdin().read_line(...).unwrap()`** (`cp.rs:96`, `mv.rs:63`, `rm.rs:54`) — a hard read error panics the utility mid-operation. Minor.
+- [x] **Affirmative responses are hardcoded `response.to_lowercase().starts_with('y')`**, ignoring the `LC_MESSAGES` `yesexpr` ERE the spec ties to "process affirmative responses" (cp 90758-90761, mv 108154-108157, rm 113438-113441). (#C8/#M5/#R6) ✓ **Fixed (Phase 7):** new shared `plib::locale::is_affirmative` matches the locale's `nl_langinfo(YESEXPR)` ERE (fallback `^[yY]`); cp/mv/rm `prompt_user` all use it. Test: `plib::locale::tests::is_affirmative_basic`.
+- [x] **`prompt_user` does `io::stdin().read_line(...).unwrap()`** — a hard read error or EOF panics the utility mid-operation. ✓ **Fixed (Phase 7):** `read_line(...).unwrap_or(0)` and an EOF/`0` read is treated as a non-affirmative response (no panic).
 
 ---
 
@@ -226,8 +226,8 @@ first source (removing it) and exits 0.
 - [x] **#M2 — >2 operands with a non-directory target silently moves only the first source.** `tree/mv.rs`: the single-move branch dropped `sources[1..]`. Behaviorally: `mv a b c` (c not a dir) → `a` renamed to `c` (**`a` gone**), `b` ignored, exit 0. More damaging than #C2 because the first source is actually removed. ✓ **Fixed (Phase 3):** `main` rejects `!dir_exists && sources.len() > 1` with `target '…' is not a directory` (exit 1) before moving; additionally the first-synopsis-form trailing-slash rule (108049-108050) now errors for a non-directory source. Tests: `test_mv_multi_source_nondir_target`, `test_mv_nondir_source_trailing_slash`.
 
 #### Minor
-- [ ] **#M3 — Cross-device source cleanup uses path-based `source.is_dir()` (follows symlinks).** `tree/mv.rs:352,420`: choosing `fs::remove_dir_all(source)` vs `fs::remove_file(source)` via `source.is_dir()` dereferences a symlink source; combined with the deferred-delete list this is a correctness/race edge for a symlink-to-directory source moved across filesystems. Fix: classify with `symlink_metadata`.
-- [ ] **#M4 — `EXDEV` detection re-reads global errno.** `tree/mv.rs:232` uses `std::io::Error::last_os_error().raw_os_error()` rather than the captured `e` from `fs::rename`; fragile (relies on no intervening syscall touching errno). Fix: use `e.raw_os_error()`.
+- [x] **#M3 — Cross-device source cleanup uses path-based `source.is_dir()` (follows symlinks).** Choosing `fs::remove_dir_all` vs `fs::remove_file` via `source.is_dir()` dereferenced a symlink source. ✓ **Fixed (Phase 7):** both cleanup sites classify with `fs::symlink_metadata` so a symlink source is removed as a link (`remove_file`), never `remove_dir_all` on its target.
+- [x] **#M4 — `EXDEV` detection re-reads global errno.** Used `std::io::Error::last_os_error().raw_os_error()` rather than the captured `e` from `fs::rename`. ✓ **Fixed (Phase 7):** uses `e.raw_os_error()`.
 
 ### Detailed conformance matrix
 

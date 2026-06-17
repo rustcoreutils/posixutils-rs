@@ -180,6 +180,43 @@ fn lp_file_not_found() {
     );
 }
 
+/// Test that a per-file error does not abort the remaining operands
+#[test]
+fn lp_multifile_continues_on_error() {
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("lp"),
+            args: vec![
+                "-d".to_string(),
+                "ipp://localhost/ipp/print".to_string(),
+                "/nonexistent/file/path.txt".to_string(),
+                "-".to_string(),
+            ],
+            stdin_data: String::from("stdin test data"),
+            expected_out: String::from(""),
+            expected_err: String::from(""),
+            expected_exit_code: 1,
+        },
+        &[("LPDEST", ""), ("PRINTER", "")],
+        |_, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // First operand fails to open; the loop must STILL process the
+            // second operand ('-' stdin), which then hits the printer error.
+            assert!(
+                stderr.contains("cannot open") && stderr.contains("/nonexistent/file/path.txt"),
+                "Expected cannot-open diagnostic for first operand, got: {}",
+                stderr
+            );
+            assert!(
+                stderr.contains("printer error"),
+                "Expected second operand to still be attempted (printer error), got: {}",
+                stderr
+            );
+            assert_eq!(output.status.code(), Some(1));
+        },
+    );
+}
+
 /// Test LPDEST environment variable is used when -d is not specified
 #[test]
 fn lp_lpdest_env_used() {

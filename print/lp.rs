@@ -216,8 +216,11 @@ fn send_print_job(
     job_id.ok_or_else(|| gettext("printer response missing job-id"))
 }
 
-fn do_lp(mut args: Args) -> Result<(), String> {
-    // Get and validate destination
+/// Process all operands. Returns `Ok(true)` if any file failed (so the caller
+/// exits non-zero), `Ok(false)` if all succeeded, or `Err` for a fatal setup
+/// error (bad destination) that aborts before any file is processed.
+fn do_lp(mut args: Args) -> Result<bool, String> {
+    // Get and validate destination (fatal — aborts before processing files).
     let dest = get_destination(&args)?;
     let uri = resolve_uri(&dest)?;
 
@@ -228,7 +231,10 @@ fn do_lp(mut args: Args) -> Result<(), String> {
         std::mem::take(&mut args.files)
     };
 
-    // Process each file
+    // Per-file errors are reported but do not abort the remaining operands
+    // (CONSEQUENCES OF ERRORS is Default; each file is independent).
+    let mut had_error = false;
+
     for file in &files {
         let file_name = if file.to_string_lossy() == "-" {
             None
@@ -237,11 +243,24 @@ fn do_lp(mut args: Args) -> Result<(), String> {
         };
 
         // Read input data
-        let data = read_input(file)
-            .map_err(|e| format!("{} '{}': {}", gettext("cannot open"), file.display(), e))?;
+        let data = match read_input(file) {
+            Ok(data) => data,
+            Err(e) => {
+                eprintln!("lp: {} '{}': {}", gettext("cannot open"), file.display(), e);
+                had_error = true;
+                continue;
+            }
+        };
 
         // Send print job
-        let job_id = send_print_job(&uri, data, &args, file_name)?;
+        let job_id = match send_print_job(&uri, data, &args, file_name) {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!("lp: {}", e);
+                had_error = true;
+                continue;
+            }
+        };
 
         // Output request ID unless silent
         if !args.silent {
@@ -249,7 +268,7 @@ fn do_lp(mut args: Args) -> Result<(), String> {
         }
     }
 
-    Ok(())
+    Ok(had_error)
 }
 
 fn main() -> ExitCode {
@@ -260,7 +279,9 @@ fn main() -> ExitCode {
     let args = Args::parse();
 
     match do_lp(args) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::SUCCESS,
+        // Per-file errors were already reported inside do_lp.
+        Ok(true) => ExitCode::FAILURE,
         Err(e) => {
             eprintln!("lp: {}", e);
             ExitCode::FAILURE

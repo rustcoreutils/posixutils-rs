@@ -271,6 +271,34 @@ fn test_timeout_reached() {
     timeout_test(&["1", SLEEP, "2"], "", 124);
 }
 
+// #T1: a sub-second (fractional) duration must time out. Before the fix,
+// alarm() truncated 0.3s to 0 seconds, disabling the timeout entirely.
+#[test]
+fn test_fractional_duration_times_out() {
+    timeout_test(&["0.3", SLEEP, "2"], "", 124);
+}
+
+// #T1: a sub-second duration with the 's' suffix likewise times out.
+#[test]
+fn test_fractional_duration_suffix_times_out() {
+    timeout_test(&["0.3s", SLEEP, "2"], "", 124);
+}
+
+// #T1: a fractional -k kill-after grace period also uses sub-second precision.
+// CONT does not terminate, so after the 0.3s timeout the fractional 0.3s
+// kill-after must still fire SIGKILL and the child must be reaped (the run
+// completes quickly rather than hanging for the full 3s sleep). The child is
+// killed by a signal, so timeout reports no exit code.
+#[test]
+fn test_fractional_kill_after() {
+    timeout_test_extended(
+        &["-p", "-s", "CONT", "-k", "0.3", "0.3", SLEEP, "3"],
+        "",
+        None,
+        false,
+    );
+}
+
 #[test]
 fn test_preserve_status_wait() {
     timeout_test(&["-p", "2", SLEEP, "1"], "", 0);

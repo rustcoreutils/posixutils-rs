@@ -484,13 +484,13 @@ forwarded where the spec says any terminate-default signal must be.
 ### Priority issues
 
 #### Critical
-- [ ] **`#T1` — fractional/sub-second duration truncated by `alarm()`.**
+- [x] **`#T1` — fractional/sub-second duration truncated by `alarm()`.** ✓ fixed in Phase 5.
   `timeout.rs:95` (`libc::alarm(duration.as_secs() as c_uint)`). `as_secs()`
   drops the fraction, so `timeout 0.5s …` arms a **0-second** alarm (never fires)
   and `timeout 1.9s …` fires at 1s. The parser correctly accepts fractions
   (slice 117549-117556), but the timer discards them. Fix: `setitimer(ITIMER_REAL)`
   (or `timerfd`) with microsecond precision. Also affects `-k` (`timeout.rs:136`).
-- [ ] **`#T2` — child resets SIGTTIN/SIGTTOU to `SIG_DFL` unconditionally.**
+- [x] **`#T2` — child resets SIGTTIN/SIGTTOU to `SIG_DFL` unconditionally.** ✓ fixed in Phase 5.
   `timeout.rs:384-385` (in `pre_exec`). Spec (slice 117593-117598): the child's
   dispositions "shall be the same as the disposition that timeout inherited,"
   except the `-s` signal. If timeout was launched with SIGTTIN/SIGTTOU ignored
@@ -499,21 +499,21 @@ forwarded where the spec says any terminate-default signal must be.
   `timeout.rs:363-364` and restore *that* in `pre_exec`.
 
 #### Major
-- [ ] **`#T3` — only 5 signals forwarded to the child.** `timeout.rs:212-246`
+- [x] **`#T3` — only 5 signals forwarded to the child.** ✓ fixed in Phase 5. `timeout.rs:212-246`
   forwards SIGALRM/SIGINT/SIGQUIT/SIGHUP/SIGTERM (+ `-s`). Spec (slice
   117587-117591): forward the `-s` signal *or any signal whose default action is
   to terminate*. SIGPIPE/SIGUSR1/SIGUSR2/SIGXCPU/SIGVTALRM/SIGPROF etc. are
   omitted — a SIGPIPE to timeout kills it silently, orphaning the child. Fix:
   register the full terminate-default set.
-- [ ] **`#T4` — `WCOREDUMP` branch exits 125 instead of re-raising.**
+- [x] **`#T4` — `WCOREDUMP` branch exits 125 instead of re-raising.** ✓ fixed in Phase 5.
   `timeout.rs:436-439`. On a core-dumping child, timeout returns 125 rather than
   mirroring the child's signal death (with core suppressed). Fix: fall through to
   the `raise(signal)` path.
 
 #### Minor
-- [ ] **`#T5` — SIGCONT after stop sent only to child PID.** `timeout.rs:420-422`
+- [x] **`#T5` — SIGCONT after stop sent only to child PID.** ✓ fixed in Phase 5. `timeout.rs:420-422`
   — in non-foreground mode it should also reach the process group.
-- [ ] **`#T6` — race: signal before `MONITORED_PID` is set.** `timeout.rs:131`
+- [x] **`#T6` — race: signal before `MONITORED_PID` is set.** ✓ fixed in Phase 5. `timeout.rs:131`
   exits `128+signal` if a signal lands between handler setup (`:361`) and PID
   store (`:405`). Use a `-1` sentinel.
 - [ ] **`#C1` — diagnostics not gettext-wrapped.**

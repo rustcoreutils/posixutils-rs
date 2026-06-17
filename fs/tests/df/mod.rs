@@ -109,6 +109,111 @@ fn test_df_nonexistent_file() {
 }
 
 #[test]
+fn test_df_operand_does_not_dump_all_filesystems() {
+    // Regression (audit #5): a single `file` operand must report only the
+    // filesystem(s) containing it, never the whole mount table.
+    let all = run_df_test(vec![]);
+    let one = run_df_test(vec!["/"]);
+
+    let all_rows = all.lines().count();
+    let one_rows = one.lines().count();
+
+    assert!(one_rows >= 2, "df / should print header + at least one row");
+    assert!(
+        one_rows <= all_rows,
+        "df / printed {one_rows} lines but the full table has only {all_rows}; \
+         an operand must never expand beyond the full table"
+    );
+}
+
+#[test]
+fn test_df_bad_operand_prints_no_filesystem_rows() {
+    // Regression (audit #5): a failed operand must NOT fall back to printing
+    // every filesystem. At most the header line may appear on stdout.
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_df"))
+        .arg("/nonexistent/path/that/does/not/exist")
+        .output()
+        .expect("Failed to execute df");
+
+    assert!(!output.status.success(), "df should fail for a bad operand");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.lines().count() <= 1,
+        "df <bad operand> must not dump all filesystems; stdout was:\n{stdout}"
+    );
+}
+
+#[test]
+fn test_df_default_has_inode_columns() {
+    // Audit #3: default output shall report free file slots / inodes.
+    let output = run_df_test(vec![]);
+    let header = output.lines().next().expect("No output from df");
+    assert!(
+        header.contains("Inodes"),
+        "default header missing Inodes: {header}"
+    );
+    assert!(
+        header.contains("IFree"),
+        "default header missing IFree: {header}"
+    );
+    assert!(
+        header.contains("IUse%"),
+        "default header missing IUse%: {header}"
+    );
+}
+
+#[test]
+fn test_df_total_has_inode_columns() {
+    // Audit #2/#3: -t output also reports inodes (and totals are present).
+    let output = run_df_test(vec!["-t"]);
+    let header = output.lines().next().expect("No output from df");
+    assert!(
+        header.contains("Inodes"),
+        "-t header missing Inodes: {header}"
+    );
+    assert!(
+        header.contains("IFree"),
+        "-t header missing IFree: {header}"
+    );
+}
+
+#[test]
+fn test_df_portable_has_no_inode_columns() {
+    // -P keeps the fixed six-column block format (no inode columns).
+    let output = run_df_test(vec!["-P"]);
+    let header = output.lines().next().expect("No output from df");
+    assert!(
+        !header.contains("Inodes") && !header.contains("IFree"),
+        "-P must not show inode columns: {header}"
+    );
+}
+
+#[test]
+fn test_df_kilo_has_no_inode_columns() {
+    // -k is "an option other than -t", so inodes are not required/shown.
+    let output = run_df_test(vec!["-k"]);
+    let header = output.lines().next().expect("No output from df");
+    assert!(
+        !header.contains("Inodes"),
+        "-k must not show inode columns: {header}"
+    );
+}
+
+#[test]
+fn test_df_portable_total_mutually_exclusive() {
+    // Audit #7: SYNOPSIS groups -P and -t as alternatives.
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_df"))
+        .args(["-P", "-t"])
+        .output()
+        .expect("Failed to execute df");
+    assert!(
+        !output.status.success(),
+        "df -P -t must be rejected as mutually exclusive"
+    );
+}
+
+#[test]
 fn test_df_help() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_df"))
         .arg("--help")

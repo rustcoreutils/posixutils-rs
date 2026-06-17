@@ -17,7 +17,10 @@ use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 #[cfg(target_os = "macos")]
 use std::ffi::CStr;
-use std::{cmp, ffi::CString, fmt::Display, io};
+use std::ffi::{CString, OsStr, OsString};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+use std::{cmp, fmt::Display, io};
 
 #[derive(Parser)]
 #[command(version, about = gettext("df - report free storage space"))]
@@ -37,9 +40,17 @@ struct Args {
     portable: bool,
 
     #[arg(
+        short = 't',
+        long,
+        conflicts_with = "portable",
+        help = gettext("Include total allocated-space figures in the output")
+    )]
+    total: bool,
+
+    #[arg(
         help = gettext("A pathname of a file within the hierarchy of the desired file system")
     )]
-    files: Vec<String>,
+    files: Vec<PathBuf>,
 }
 
 /// Display modes
@@ -112,6 +123,8 @@ impl Display for Field {
 
 pub struct Fields {
     pub mode: OutputMode,
+    /// Whether the inode columns are shown (default & -t modes, not -k/-P).
+    pub inodes: bool,
     /// file system
     pub source: Field,
     /// FS size
@@ -122,22 +135,33 @@ pub struct Fields {
     pub avail: Field,
     /// percent used
     pub pcent: Field,
+    /// total inodes (file slots)
+    pub itotal: Field,
+    /// used inodes
+    pub iused: Field,
+    /// free inodes
+    pub ifree: Field,
+    /// percent inodes used
+    pub ipcent: Field,
     /// mount point
     pub target: Field,
-    // /// specified file name
-    // file: Field,
 }
 
 impl Fields {
-    pub fn new(mode: OutputMode) -> Self {
+    pub fn new(mode: OutputMode, inodes: bool) -> Self {
         let size_caption = format!("{}-{}", mode.get_block_size(), gettext("blocks"));
         Self {
             mode,
+            inodes,
             source: Field::new(gettext("Filesystem"), 14, FieldType::Str),
             size: Field::new(size_caption, 10, FieldType::Num),
             used: Field::new(gettext("Used"), 10, FieldType::Num),
             avail: Field::new(gettext("Available"), 10, FieldType::Num),
             pcent: Field::new(gettext("Capacity"), 5, FieldType::Pcent),
+            itotal: Field::new(gettext("Inodes"), 10, FieldType::Num),
+            iused: Field::new(gettext("IUsed"), 10, FieldType::Num),
+            ifree: Field::new(gettext("IFree"), 10, FieldType::Num),
+            ipcent: Field::new(gettext("IUse%"), 5, FieldType::Pcent),
             target: Field::new(gettext("Mounted on"), 0, FieldType::Str),
         }
     }
@@ -148,20 +172,32 @@ impl Display for Fields {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} {} {} {} {} {}",
-            self.source, self.size, self.used, self.avail, self.pcent, self.target
-        )
+            "{} {} {} {} {}",
+            self.source, self.size, self.used, self.avail, self.pcent
+        )?;
+        if self.inodes {
+            write!(
+                f,
+                " {} {} {} {}",
+                self.itotal, self.iused, self.ifree, self.ipcent
+            )?;
+        }
+        write!(f, " {}", self.target)
     }
 }
 
 pub struct FieldsData<'a> {
     pub fields: &'a Fields,
-    pub source: &'a String,
+    pub source: String,
     pub size: u64,
     pub used: u64,
     pub avail: u64,
     pub pcent: u32,
-    pub target: &'a String,
+    pub itotal: u64,
+    pub iused: u64,
+    pub ifree: u64,
+    pub ipcent: u32,
+    pub target: String,
 }
 
 impl Display for FieldsData<'_> {
@@ -170,17 +206,30 @@ impl Display for FieldsData<'_> {
     // "%s %d %d %d %d%% %s\n", <file system name>, <total space>,
     //     <space used>, <space free>, <percentage used>,
     //     <file system root>
+    //
+    // In default and -t modes the inode (file-slot) columns are inserted
+    // before <file system root>; -k and -P keep the fixed six-column format.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} {} {} {} {}% {}",
-            self.fields.source.format(self.source),
+            "{} {} {} {} {}%",
+            self.fields.source.format(&self.source),
             self.fields.size.format(&self.size),
             self.fields.used.format(&self.used),
             self.fields.avail.format(&self.avail),
             self.fields.pcent.format(&self.pcent),
-            self.fields.target.format(self.target)
-        )
+        )?;
+        if self.fields.inodes {
+            write!(
+                f,
+                " {} {} {} {}%",
+                self.fields.itotal.format(&self.itotal),
+                self.fields.iused.format(&self.iused),
+                self.fields.ifree.format(&self.ifree),
+                self.fields.ipcent.format(&self.ipcent),
+            )?;
+        }
+        write!(f, " {}", self.fields.target.format(&self.target))
     }
 }
 
@@ -204,9 +253,39 @@ fn stat(filename: &CString) -> io::Result<libc::stat> {
     }
 }
 
+/// Scale a count of `bsize`-byte blocks into whole `unit`-byte output units.
+///
+/// A 128-bit intermediate is used so the `count * bsize` product cannot
+/// overflow on exabyte-scale filesystems (audit #10).
+fn scale_blocks(count: u64, bsize: u64, unit: u64) -> u64 {
+    ((count as u128 * bsize as u128) / unit as u128) as u64
+}
+
+/// Percentage of normally-available space in use, rounded up to the next
+/// integer (POSIX STDOUT, df: "any fractional result causing it to be rounded
+/// to the next highest integer").
+///
+/// `avail` is the space available to unprivileged users (statfs `f_bavail`),
+/// matching the spec's `<space free>` figure — NOT total free space
+/// (`f_bfree`), so reserved blocks are excluded from the denominator (audit
+/// #4). A zero denominator (e.g. a zero-block pseudo-filesystem) yields 0
+/// rather than dividing by zero (audit #11).
+fn capacity_percent(used: u64, avail: u64) -> u32 {
+    let denom = used as u128 + avail as u128;
+    if denom == 0 {
+        return 0;
+    }
+    // Ceiling division rounds any fractional percentage up to the next integer,
+    // implementing the POSIX rule exactly. 128-bit integer math keeps both the
+    // sum and the `used * 100` product overflow-free and avoids f64 precision
+    // loss on very large figures. `used <= denom`, so the result never exceeds
+    // 100 and fits a u32.
+    (used as u128 * 100).div_ceil(denom) as u32
+}
+
 struct Mount {
-    devname: String,
-    dir: String,
+    devname: OsString,
+    dir: OsString,
     dev: i64,
     masked: bool,
     cached_statfs: libc::statfs,
@@ -219,51 +298,47 @@ impl Mount {
         let block_size = fields.mode.get_block_size();
         let blksz = sf.f_bsize as u64;
 
-        let total = (sf.f_blocks * blksz) / block_size;
-        let avail = (sf.f_bavail * blksz) / block_size;
-        let free = (sf.f_bfree * blksz) / block_size;
+        let total = scale_blocks(sf.f_blocks, blksz, block_size);
+        let avail = scale_blocks(sf.f_bavail, blksz, block_size);
+        let free = scale_blocks(sf.f_bfree, blksz, block_size);
         let used = total - free;
 
-        // The percentage value shall be expressed as a positive integer,
-        // with any fractional result causing it to be rounded to the next highest integer.
-        let percentage_used = used as f64 / (used + free) as f64;
-        let percentage_used = (percentage_used * 100.0).ceil() as u32;
+        let percentage_used = capacity_percent(used, avail);
+
+        // Inode (file-slot) figures. Counts are unscaled (they are not space).
+        let itotal = sf.f_files;
+        let ifree = sf.f_ffree;
+        let iused = itotal.saturating_sub(ifree);
+        let ipcent = capacity_percent(iused, ifree); // iused / (iused + ifree) = iused / itotal
 
         FieldsData {
             fields,
-            source: &self.devname,
+            source: self.devname.to_string_lossy().into_owned(),
             size: total,
             used,
             avail,
             pcent: percentage_used,
-            target: &self.dir,
+            itotal,
+            iused,
+            ifree,
+            ipcent,
+            target: self.dir.to_string_lossy().into_owned(),
         }
     }
 }
 
 struct MountList {
     mounts: Vec<Mount>,
-    has_masks: bool,
 }
 
 impl MountList {
     fn new() -> MountList {
-        MountList {
-            mounts: Vec::new(),
-            has_masks: false,
-        }
+        MountList { mounts: Vec::new() }
     }
 
     fn mask_all(&mut self) {
         for mount in &mut self.mounts {
             mount.masked = true;
-        }
-    }
-
-    fn ensure_masked(&mut self) {
-        if !self.has_masks {
-            self.mask_all();
-            self.has_masks = true;
         }
     }
 
@@ -279,8 +354,8 @@ impl MountList {
         };
 
         self.mounts.push(Mount {
-            devname: String::from(devname.to_str().unwrap()),
-            dir: String::from(dirname.to_str().unwrap()),
+            devname: OsStr::from_bytes(devname.to_bytes()).to_os_string(),
+            dir: OsStr::from_bytes(dirname.to_bytes()).to_os_string(),
             dev,
             masked: false,
             cached_statfs: *fsstat,
@@ -320,9 +395,16 @@ fn read_mount_info() -> io::Result<MountList> {
             let mut buf: libc::statfs = std::mem::zeroed();
             let rc = libc::statfs(mount.dir.as_ptr(), &mut buf);
             if rc < 0 {
+                // A mount we cannot statfs during the automatic "all
+                // filesystems" enumeration (e.g. an inaccessible bind/overlay
+                // mount) is skipped with a diagnostic but does NOT make df
+                // fail: it was never requested by the user. This matches GNU
+                // coreutils df, which exits 0 in the same situation. Only a
+                // user-supplied `file` operand that fails sets a non-zero exit
+                // status (see mask_fs_by_file). Audit #12.
                 eprintln!(
                     "{}: {}",
-                    mount.dir.to_str().unwrap(),
+                    Path::new(OsStr::from_bytes(mount.dir.to_bytes())).display(),
                     io::Error::last_os_error()
                 );
                 continue;
@@ -335,18 +417,24 @@ fn read_mount_info() -> io::Result<MountList> {
     Ok(info)
 }
 
-fn mask_fs_by_file(info: &mut MountList, filename: &str) -> io::Result<()> {
-    let c_filename = CString::new(filename).expect("`filename` contains an internal 0 byte");
-    let stat_res = stat(&c_filename);
-    if let Err(e) = stat_res {
-        eprintln!("{}: {}", filename, e);
-        return Err(e);
-    }
-    let stat = stat_res.unwrap();
+fn mask_fs_by_file(info: &mut MountList, path: &Path) -> io::Result<()> {
+    let c_filename = match CString::new(path.as_os_str().as_bytes()) {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("{}: {}", path.display(), gettext("invalid pathname"));
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+    };
+    let stat = match stat(&c_filename) {
+        Ok(st) => st,
+        Err(e) => {
+            eprintln!("{}: {}", path.display(), e);
+            return Err(e);
+        }
+    };
 
     for mount in &mut info.mounts {
         if stat.st_dev as i64 == mount.dev {
-            info.has_masks = true;
             mount.masked = true;
         }
     }
@@ -374,19 +462,85 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    info.ensure_masked();
+    // POSIX DESCRIPTION: "if no options other than -t are specified, the number
+    // of free file slots, or inodes, available" shall be reported. So inodes are
+    // shown for bare `df` and `-t`, but not when -k or -P is given.
+    let show_inodes = !args.kilo && !args.portable;
+
+    // -t mandates that the output contain the total allocated space. df always
+    // reports the total (the "N-blocks" column), so -t needs no further action
+    // beyond the -P|-t mutual exclusion enforced by clap.
+    let _ = args.total;
 
     let mode = OutputMode::new(args.kilo, args.portable);
-    let fields = Fields::new(mode);
+    let fields = Fields::new(mode, show_inodes);
     // Print header
     println!("{}", fields);
 
     for mount in &info.mounts {
         if mount.masked {
+            // FUTURE DIRECTIONS / Austin Group Defect 251: treat a pathname
+            // containing a <newline> (a separator in the output format) as an
+            // error rather than emitting a corrupt, unparsable line.
+            if mount.devname.as_bytes().contains(&b'\n') || mount.dir.as_bytes().contains(&b'\n') {
+                eprintln!(
+                    "{}: {}",
+                    mount.dir.to_string_lossy(),
+                    gettext("pathname contains newline; skipping")
+                );
+                exit_code = 1;
+                continue;
+            }
             let row = mount.to_row(&fields);
             println!("{}", row);
         }
     }
 
     std::process::exit(exit_code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{capacity_percent, scale_blocks};
+
+    #[test]
+    fn capacity_percent_reserved_blocks() {
+        // total=100, f_bfree=10, f_bavail=5, used=90 -> 90/(90+5)=94.7% -> 95.
+        // (The old f_bfree denominator gave 90/(90+10)=90% — audit #4.)
+        assert_eq!(capacity_percent(90, 5), 95);
+    }
+
+    #[test]
+    fn capacity_percent_exact_and_bounds() {
+        assert_eq!(capacity_percent(50, 50), 50);
+        assert_eq!(capacity_percent(0, 100), 0);
+        assert_eq!(capacity_percent(100, 0), 100);
+    }
+
+    #[test]
+    fn capacity_percent_rounds_up() {
+        assert_eq!(capacity_percent(1, 99), 1); // 1.00% exact
+        assert_eq!(capacity_percent(2, 99), 2); // 1.98% -> 2
+    }
+
+    #[test]
+    fn capacity_percent_zero_denominator() {
+        // zero-block pseudo-filesystem: no NaN, no panic (audit #11).
+        assert_eq!(capacity_percent(0, 0), 0);
+    }
+
+    #[test]
+    fn scale_blocks_basic() {
+        // 2048 * 512 bytes = 1 MiB.
+        assert_eq!(scale_blocks(2048, 512, 1024), 1024);
+        assert_eq!(scale_blocks(2048, 512, 512), 2048);
+    }
+
+    #[test]
+    fn scale_blocks_no_overflow() {
+        // A count*bsize product that exceeds u64::MAX must not overflow (#10).
+        let big = u64::MAX / 1000;
+        let expected = ((big as u128 * 4096) / 1024) as u64;
+        assert_eq!(scale_blocks(big, 4096, 1024), expected);
+    }
 }

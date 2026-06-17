@@ -390,6 +390,13 @@ fn read_mount_info() -> io::Result<MountList> {
             let mut buf: libc::statfs = std::mem::zeroed();
             let rc = libc::statfs(mount.dir.as_ptr(), &mut buf);
             if rc < 0 {
+                // A mount we cannot statfs during the automatic "all
+                // filesystems" enumeration (e.g. an inaccessible bind/overlay
+                // mount) is skipped with a diagnostic but does NOT make df
+                // fail: it was never requested by the user. This matches GNU
+                // coreutils df, which exits 0 in the same situation. Only a
+                // user-supplied `file` operand that fails sets a non-zero exit
+                // status (see mask_fs_by_file). Audit #12.
                 eprintln!(
                     "{}: {}",
                     Path::new(OsStr::from_bytes(mount.dir.to_bytes())).display(),

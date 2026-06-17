@@ -53,13 +53,13 @@ English.
 
 #### Minor
 
-- [ ] **#6 — Runtime diagnostics are hardcoded English.** `fs/df.rs:323-327` and `342` use `eprintln!("{}: {}", …)` with no `gettext()`. `setlocale`/`textdomain` are initialized (`fs/df.rs:358-360`) and column captions are translated, but LC_MESSAGES has no effect on error text. Fix: route the two diagnostic sites through `gettext()` (low payload — mostly an OS error string + path).
+- [x] **#6 — Runtime diagnostics are hardcoded English.** `fs/df.rs:323-327` and `342` use `eprintln!("{}: {}", …)` with no `gettext()`. `setlocale`/`textdomain` are initialized (`fs/df.rs:358-360`) and column captions are translated, but LC_MESSAGES has no effect on error text. Fix: route the two diagnostic sites through `gettext()` (low payload — mostly an OS error string + path). **✓ fixed (Phase 1 + confirmed Phase 4)** — every message *literal* now goes through `gettext()` (`invalid pathname`, `pathname contains newline; skipping`, plus all column captions). The two `"{}: {}"` path-plus-error sites carry no English literal: the error text is `io::Error`/libc `strerror`, which already honors `LC_MESSAGES`. `grep` confirms no remaining bare-English diagnostic literal.
 - [x] **#7 — `-P|-t` mutual exclusion not enforced.** `fs/df.rs:22-43`. The synopsis groups `-P` and `-t` as alternatives. Currently moot (`-t` is absent, #2), but the fix for #2 must add `conflicts_with`. **✓ fixed Phase 3** — `-t` declared `conflicts_with = "portable"`; `df -P -t` errors. Test `test_df_portable_total_mutually_exclusive`.
 - [x] **#8 — Newline in a displayed pathname is not treated as an error.** FUTURE DIRECTIONS (92502-92505) / Austin Group Defect 251 "encourages" implementations to error when an output pathname contains a `<newline>` (a separator in the `-P` format). Not yet mandatory; track only. Fix: when a `devname`/`dir` to be printed contains `\n`, diagnose and set non-zero exit. **✓ fixed Phase 1** — the print loop checks the raw `OsString` bytes of `devname`/`dir`; a `\n` skips the row with a stderr diagnostic and sets exit 1.
 - [x] **#9 — File/device names and operands are forced through UTF-8 `String`.** `Args.files: Vec<String>` (`fs/df.rs:42`) and the `String` fields of `Mount` (`fs/df.rs:208-210`) mangle/refuse non-UTF-8 bytes. Subsumes #1's crash but is broader (operands too). Fix: use `OsString`/`PathBuf` end-to-end. **✓ fixed Phase 1** — `Args.files: Vec<PathBuf>`, `Mount` names `OsString`, `mask_fs_by_file(&Path)` stats via `CString::new(path.as_os_str().as_bytes())` (no `unwrap`/`expect` panic on internal NUL either).
 - [x] **#10 — `f_blocks * f_bsize` can overflow `u64`.** `fs/df.rs:222-224` multiplies before dividing by the unit; overflows only at ~16 EiB-scale filesystems. Fix: divide `f_bsize/block_size` first, or use `u128` intermediate. **✓ fixed Phase 2** — extracted `scale_blocks(count, bsize, unit)` using a `u128` intermediate; unit test `scale_blocks_no_overflow`.
 - [x] **#11 — Zero-block pseudo-filesystems print `0%` via a NaN path.** `fs/df.rs:229-230`: for `used+free == 0` (e.g. `/proc`, `/sys`), `0.0/0.0 = NaN`, `ceil(NaN) as u32 == 0`. No panic (saturating cast), but cosmetically diverges from coreutils. Fix: special-case a zero denominator. **✓ fixed Phase 2** — `capacity_percent` returns 0 when the denominator is 0; unit test `capacity_percent_zero_denominator`.
-- [ ] **#12 — statfs enumeration failures don't affect exit status.** `fs/df.rs:322-329`: a failed `statfs` on a system mount warns and `continue`s, leaving `exit_code == 0`. EXIT STATUS (92467-92469) returns `>0` when "an error occurred". Debatable (these are auto-enumerated, not user-requested), but arguably should propagate. Fix: set `exit_code = 1` on enumeration errors, or document the policy.
+- [x] **#12 — statfs enumeration failures don't affect exit status.** `fs/df.rs:322-329`: a failed `statfs` on a system mount warns and `continue`s, leaving `exit_code == 0`. EXIT STATUS (92467-92469) returns `>0` when "an error occurred". Debatable (these are auto-enumerated, not user-requested), but arguably should propagate. Fix: set `exit_code = 1` on enumeration errors, or document the policy. **✓ resolved Phase 4 — documented policy (NOT exit 1).** Behavioral cross-check: GNU coreutils `df` exits **0** on this host despite several inaccessible docker overlay/netns mounts. A mount that cannot be stat'd during the automatic "all filesystems" listing was never user-requested, so df now explicitly skips it with a diagnostic and leaves the exit status unchanged (matching coreutils); only a failed user `file` operand sets a non-zero exit (`mask_fs_by_file`). Code comment added at the enumeration site.
 
 ### Detailed conformance matrix
 
@@ -95,7 +95,7 @@ English.
 | `LANG` | CONFORMS | `setlocale(LcAll, "")` at `fs/df.rs:358`. |
 | `LC_ALL` | CONFORMS | same. |
 | `LC_CTYPE` | CONFORMS (init) | `setlocale` honors it; names are now byte-faithful `OsString` (#9 ✓ Phase 1). |
-| `LC_MESSAGES` | PARTIAL | (#6 Minor) Captions translated; runtime diagnostics hardcoded English. |
+| `LC_MESSAGES` | CONFORMS | (#6 ✓ Phase 1/4) Captions + message literals via `gettext`; OS error text via libc `strerror`. |
 | `NLSPATH` (XSI) | PARTIAL | `textdomain`/`bind_textdomain_codeset` wired (`fs/df.rs:359-360`); no explicit catalog path handling. |
 
 #### ASYNCHRONOUS EVENTS
@@ -128,7 +128,7 @@ English.
 
 - [x] 0 on success — `fs/df.rs:365`, `391`.
 - [x] Non-zero when a `file` operand cannot be stat'd — `fs/df.rs:371-373`.
-- [ ] **statfs enumeration errors don't set exit status** (#12 Minor) — `fs/df.rs:322-329`.
+- [x] **statfs enumeration errors are non-fatal by design** (#12 ✓ Phase 4) — auto-enumerated inaccessible mounts are skipped + diagnosed, exit unchanged (matches coreutils `df`); only user operands affect exit.
 - [x] CONSEQUENCES OF ERRORS = Default — no special policy required.
 
 ### `mntent.rs` notes (Linux mount-table helper)

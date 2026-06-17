@@ -72,15 +72,33 @@ fn get_destination(args: &Args) -> Result<String, String> {
     Err(gettext("no destination specified"))
 }
 
-/// Validate that the destination is a valid IPP URI
-fn validate_uri(dest: &str) -> Result<Uri, String> {
-    // Must start with ipp://
-    if !dest.starts_with("ipp://") {
-        return Err(gettext("invalid destination URI (must be ipp://...)"));
+/// Resolve a destination string into an IPP URI.
+///
+/// A value beginning with `ipp://` is used verbatim. Any other value is treated
+/// as a bare printer name (the historical System V / BSD `LPDEST`/`PRINTER`
+/// form) and resolved against the local IPP server as
+/// `ipp://localhost/printers/<name>`. Note: TLS (`ipps://`) is intentionally
+/// not supported (minimal dependencies).
+fn resolve_uri(dest: &str) -> Result<Uri, String> {
+    if dest.starts_with("ipp://") {
+        return dest
+            .parse::<Uri>()
+            .map_err(|_| gettext("invalid destination URI"));
     }
 
-    dest.parse::<Uri>()
-        .map_err(|_| gettext("invalid destination URI"))
+    // Bare printer name: reject characters that would corrupt the URI path
+    // (control characters, whitespace, or a path separator).
+    if dest.is_empty()
+        || dest
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace() || c == '/')
+    {
+        return Err(format!("{}: {}", gettext("invalid destination name"), dest));
+    }
+
+    format!("ipp://localhost/printers/{}", dest)
+        .parse::<Uri>()
+        .map_err(|_| format!("{}: {}", gettext("invalid destination name"), dest))
 }
 
 /// Read input data from a file or stdin.
@@ -165,7 +183,7 @@ fn send_print_job(
     let client = IppClient::new(uri.clone());
     let response = client
         .send(operation)
-        .map_err(|e| format!("{}: {}", gettext("printer error"), e))?;
+        .map_err(|e| format!("{} ({}): {}", gettext("printer error"), uri, e))?;
 
     // Check response status
     let status = response.header().status_code();
@@ -193,7 +211,7 @@ fn send_print_job(
 fn do_lp(mut args: Args) -> Result<(), String> {
     // Get and validate destination
     let dest = get_destination(&args)?;
-    let uri = validate_uri(&dest)?;
+    let uri = resolve_uri(&dest)?;
 
     // Determine input sources
     let files: Vec<PathBuf> = if args.files.is_empty() {

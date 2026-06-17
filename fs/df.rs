@@ -207,6 +207,31 @@ fn stat(filename: &CString) -> io::Result<libc::stat> {
     }
 }
 
+/// Scale a count of `bsize`-byte blocks into whole `unit`-byte output units.
+///
+/// A 128-bit intermediate is used so the `count * bsize` product cannot
+/// overflow on exabyte-scale filesystems (audit #10).
+fn scale_blocks(count: u64, bsize: u64, unit: u64) -> u64 {
+    ((count as u128 * bsize as u128) / unit as u128) as u64
+}
+
+/// Percentage of normally-available space in use, rounded up to the next
+/// integer (POSIX STDOUT, df: "any fractional result causing it to be rounded
+/// to the next highest integer").
+///
+/// `avail` is the space available to unprivileged users (statfs `f_bavail`),
+/// matching the spec's `<space free>` figure — NOT total free space
+/// (`f_bfree`), so reserved blocks are excluded from the denominator (audit
+/// #4). A zero denominator (e.g. a zero-block pseudo-filesystem) yields 0
+/// rather than a NaN (audit #11).
+fn capacity_percent(used: u64, avail: u64) -> u32 {
+    let denom = used + avail;
+    if denom == 0 {
+        return 0;
+    }
+    ((used as f64 / denom as f64) * 100.0).ceil() as u32
+}
+
 struct Mount {
     devname: OsString,
     dir: OsString,
@@ -222,15 +247,12 @@ impl Mount {
         let block_size = fields.mode.get_block_size();
         let blksz = sf.f_bsize as u64;
 
-        let total = (sf.f_blocks * blksz) / block_size;
-        let avail = (sf.f_bavail * blksz) / block_size;
-        let free = (sf.f_bfree * blksz) / block_size;
+        let total = scale_blocks(sf.f_blocks, blksz, block_size);
+        let avail = scale_blocks(sf.f_bavail, blksz, block_size);
+        let free = scale_blocks(sf.f_bfree, blksz, block_size);
         let used = total - free;
 
-        // The percentage value shall be expressed as a positive integer,
-        // with any fractional result causing it to be rounded to the next highest integer.
-        let percentage_used = used as f64 / (used + free) as f64;
-        let percentage_used = (percentage_used * 100.0).ceil() as u32;
+        let percentage_used = capacity_percent(used, avail);
 
         FieldsData {
             fields,
@@ -397,4 +419,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     std::process::exit(exit_code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{capacity_percent, scale_blocks};
+
+    #[test]
+    fn capacity_percent_reserved_blocks() {
+        // total=100, f_bfree=10, f_bavail=5, used=90 -> 90/(90+5)=94.7% -> 95.
+        // (The old f_bfree denominator gave 90/(90+10)=90% — audit #4.)
+        assert_eq!(capacity_percent(90, 5), 95);
+    }
+
+    #[test]
+    fn capacity_percent_exact_and_bounds() {
+        assert_eq!(capacity_percent(50, 50), 50);
+        assert_eq!(capacity_percent(0, 100), 0);
+        assert_eq!(capacity_percent(100, 0), 100);
+    }
+
+    #[test]
+    fn capacity_percent_rounds_up() {
+        assert_eq!(capacity_percent(1, 99), 1); // 1.00% exact
+        assert_eq!(capacity_percent(2, 99), 2); // 1.98% -> 2
+    }
+
+    #[test]
+    fn capacity_percent_zero_denominator() {
+        // zero-block pseudo-filesystem: no NaN, no panic (audit #11).
+        assert_eq!(capacity_percent(0, 0), 0);
+    }
+
+    #[test]
+    fn scale_blocks_basic() {
+        // 2048 * 512 bytes = 1 MiB.
+        assert_eq!(scale_blocks(2048, 512, 1024), 1024);
+        assert_eq!(scale_blocks(2048, 512, 512), 2048);
+    }
+
+    #[test]
+    fn scale_blocks_no_overflow() {
+        // A count*bsize product that exceeds u64::MAX must not overflow (#10).
+        let big = u64::MAX / 1000;
+        let expected = ((big as u128 * 4096) / 1024) as u64;
+        assert_eq!(scale_blocks(big, 4096, 1024), expected);
+    }
 }

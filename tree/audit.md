@@ -805,7 +805,7 @@ practice.
 #### Minor
 - [x] **#RL1 — "Not a symbolic link" / error diagnostics suppressed unless `-v`.** `tree/readlink.rs:149-153` returns `Err(String::new())` (silent) when `!verbose`; same for `ENOENT`/`EACCES` (`:79-94`). POSIX 113034-113035 says it "shall write a diagnostic message to standard error and exit with non-zero status." Exit status conforms; the message is suppressed. ~~(Proposed Major; demoted — GNU `readlink` is also silent, verified.)~~ Fix (strict): emit the diagnostic unconditionally.  ✓ **Fixed (Phase 7):** the not-a-symlink / error diagnostic is emitted unconditionally (per POSIX); `-v` is now a no-op. Test: `test_readlink_not_symlink_diagnoses`.
 - [x] **#RL2 — Hardcoded-English diagnostics** (`:80,89,95,146-153`).  ✓ **Fixed (Phase 7):** `format_error` routes the description through `gettext`.
-- [ ] **#RL3 — Non-POSIX `-f`/`-v` extensions on the public surface** (`:27-31`); POSIX defines only `-n`. Documented extensions; no action.
+- [x] **#RL3 — Non-POSIX `-f`/`-v` extensions on the public surface** (`:27-31`); POSIX defines only `-n`. Documented extensions; no action.  (Kept: `-f`/`-v` are documented GNU/BSD extensions; `-v` is now a no-op after #RL1. No action.)
 
 ### Detailed conformance matrix
 - [x] `-n` suppresses trailing newline (`:67-71`, tested); operand one required; STDIN not used; no symlink-follow (`symlink_metadata`+`read_link`); STDOUT writes link contents (+optional newline); EXIT 0/`>0` — CONFORMS. [ ] STDERR mandated diagnostic suppressed by default (#RL1). Symlink-loop bound at 40 (`-f` extension path) — reasonable.

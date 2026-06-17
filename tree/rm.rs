@@ -31,8 +31,14 @@ struct Args {
     #[arg(short, long, overrides_with_all = ["force", "interactive"], help = gettext("Prompt for confirmation"))]
     interactive: bool,
 
+    #[arg(short, long, help = gettext("Remove empty directories"))]
+    dir: bool,
+
     #[arg(short, visible_short_alias = 'R', long, help = gettext("Remove file hierarchies"))]
     recurse: bool,
+
+    #[arg(short, long, help = gettext("Write the name of each removed file to standard output"))]
+    verbose: bool,
 
     #[arg(value_parser = parse_pathbuf, help = gettext("Filepaths to remove"))]
     files: Vec<PathBuf>,
@@ -66,6 +72,48 @@ fn display_cleaned(filepath: &Path) -> String {
 
 fn ask_for_prompt(cfg: &RmConfig, writable: bool) -> bool {
     !cfg.args.force && ((!writable && cfg.is_tty) || cfg.args.interactive)
+}
+
+// With `-v`, write the name of each removed entry to standard output (format unspecified by POSIX;
+// matches the `removed '…'` / `removed directory '…'` wording of common implementations).
+fn report_removed(cfg: &RmConfig, is_dir: bool, name: &str) {
+    if cfg.args.verbose {
+        let msg = if is_dir {
+            gettext!("removed directory '{}'", name)
+        } else {
+            gettext!("removed '{}'", name)
+        };
+        println!("{msg}");
+    }
+}
+
+// rm shall refuse `.`/`..` (as the basename) and an operand resolving to the root directory
+// (POSIX rm DESCRIPTION 113360-113362, APPLICATION USAGE 113466-113468).
+fn refuse_dot_dotdot_root(filepath: &Path) -> io::Result<()> {
+    let dot_dotdot_pattern = regex::bytes::Regex::new(r"(?:\.\/*|\.\.\/*)$").unwrap();
+    if dot_dotdot_pattern.is_match(filepath.as_os_str().as_bytes()) {
+        let err_str = gettext!(
+            "refusing to remove '.' or '..' directory: skipping '{}'",
+            display_cleaned(filepath)
+        );
+        return Err(io::Error::other(err_str));
+    }
+
+    if let Ok(abspath) = fs::canonicalize(filepath) {
+        if abspath.as_os_str() == "/" {
+            let err_str = if filepath.as_os_str() == "/" {
+                gettext("it is dangerous to operate recursively on '/'")
+            } else {
+                gettext!(
+                    "it is dangerous to operate recursively on '{}' (same as '/')",
+                    filepath.display()
+                )
+            };
+            return Err(io::Error::other(err_str));
+        }
+    }
+
+    Ok(())
 }
 
 fn descend_into_directory(cfg: &RmConfig, entry: &ftw::Entry, metadata: &ftw::Metadata) -> bool {
@@ -207,6 +255,7 @@ fn process_directory(
                 };
                 Err(io::Error::other(err_str))
             } else {
+                report_removed(cfg, true, &entry.path().clean_trailing_slashes());
                 Ok(DirAction::Removed)
             }
         } else {
@@ -235,31 +284,8 @@ fn rm_directory(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
         return Err(io::Error::other(err_str));
     }
 
-    // It's not allowed to `rm` . and ..
-    let dot_dotdot_pattern = regex::bytes::Regex::new(r"(?:\.\/*|\.\.\/*)$").unwrap();
-    if dot_dotdot_pattern.is_match(filepath.as_os_str().as_bytes()) {
-        let err_str = gettext!(
-            "refusing to remove '.' or '..' directory: skipping '{}'",
-            display_cleaned(filepath)
-        );
-        return Err(io::Error::other(err_str));
-    }
-
-    // Also forbidden to `rm` the root directory
-    if let Ok(abspath) = fs::canonicalize(filepath) {
-        if abspath.as_os_str() == "/" {
-            // If the arg is verbatim "/"
-            let err_str = if filepath.as_os_str() == "/" {
-                gettext("it is dangerous to operate recursively on '/'")
-            } else {
-                gettext!(
-                    "it is dangerous to operate recursively on '{}' (same as '/')",
-                    filepath.display()
-                )
-            };
-            return Err(io::Error::other(err_str));
-        }
-    }
+    // It's not allowed to `rm` . and .. or the root directory.
+    refuse_dot_dotdot_root(filepath)?;
 
     let success = traverse_directory(
         filepath,
@@ -295,6 +321,7 @@ fn rm_directory(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
                         );
                         return Err(());
                     }
+                    report_removed(cfg, false, &entry.path().clean_trailing_slashes());
                 }
                 Ok(true)
             }
@@ -326,6 +353,8 @@ fn rm_directory(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
                         eprintln!("rm: {}", err_str);
                         return Err(());
                     }
+                } else {
+                    report_removed(cfg, true, &entry.path().clean_trailing_slashes());
                 }
             }
 
@@ -396,7 +425,47 @@ fn rm_file(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
             );
             io::Error::other(err_str)
         })?;
+        report_removed(cfg, false, &display_cleaned(filepath));
     }
+
+    Ok(true)
+}
+
+/// Removes an empty directory (the `-d` option, without `-r`/`-R`), like `rmdir`.
+///
+/// Per POSIX rm DESCRIPTION 113369-113370 and RATIONALE 113532-113535, `-d` proceeds straight to
+/// the removal step for a directory operand (no recursion); a non-empty directory fails with the
+/// `remove_dir`/`rmdir` error, avoiding the type-check race of deciding what to do by file type.
+fn rm_dir_empty(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
+    refuse_dot_dotdot_root(filepath)?;
+
+    let filename_cstr = CString::new(filepath.as_os_str().as_bytes())?;
+    let metadata = ftw::Metadata::new(libc::AT_FDCWD, &filename_cstr, false)?;
+
+    let writable = metadata.is_writable();
+    if ask_for_prompt(cfg, writable) {
+        let prompt = if writable {
+            gettext!("remove directory '{}'?", display_cleaned(filepath))
+        } else {
+            gettext!(
+                "remove write-protected directory '{}'?",
+                display_cleaned(filepath)
+            )
+        };
+        if !prompt_user(&prompt) {
+            return Ok(true);
+        }
+    }
+
+    fs::remove_dir(filepath).map_err(|e| {
+        let err_str = gettext!(
+            "cannot remove '{}': {}",
+            display_cleaned(filepath),
+            error_string(&e)
+        );
+        io::Error::other(err_str)
+    })?;
+    report_removed(cfg, true, &display_cleaned(filepath));
 
     Ok(true)
 }
@@ -420,7 +489,13 @@ fn rm_path(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
     };
 
     if metadata.is_dir() {
-        rm_directory(cfg, filepath)
+        // `-r`/`-R` take precedence over `-d` (113534-113535). With only `-d`, remove an empty
+        // directory like `rmdir`; otherwise the recursive path errors when `-r` is absent.
+        if cfg.args.dir && !cfg.args.recurse {
+            rm_dir_empty(cfg, filepath)
+        } else {
+            rm_directory(cfg, filepath)
+        }
     } else {
         rm_file(cfg, filepath)
     }

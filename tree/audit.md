@@ -295,8 +295,8 @@ dir-fd-relative, and a handful of `unreachable!()`/`unwrap()` sites are process-
 ### Priority issues
 
 #### Major
-- [ ] **#R1 — `-d` (remove empty directories) is unimplemented.** `grep -n "'d'" tree/rm.rs` → 0 matches; `Args` (`rm.rs:27-39`) declares only `-f`/`-i`/`-r`(`-R`). POSIX SYNOPSIS `rm [-diRrv] file...` (113356) and OPTIONS 113404 mandate `-d`; DESCRIPTION 113369-113370 gives it distinct semantics ("if `-d` is specified, rm shall proceed with step 3 for the current file" — i.e. `rmdir` an empty directory without recursion). RATIONALE 113532-113535 highlights that `-d` *"delete[s] either a file or an empty directory without … the inherent race between determining a file's type and deciding what action to attempt"* — directly relevant to this audit's race lens. Behaviorally: `rm -d emptydir` → `error: unexpected argument '-d'`, exit 2. Fix: add `-d`; for a directory operand with `-d` (and without `-r`/`-R`), `unlinkat(AT_REMOVEDIR)` after the standard prompt.
-- [ ] **#R2 — `-v` (verbose) is unimplemented.** `grep -n "'v'" tree/rm.rs` → 0 matches. POSIX SYNOPSIS 113356, OPTIONS 113412-113413, STDOUT 113445-113447, EXIT-STATUS 113458-113461 all require `-v` to write each removed pathname to **stdout**. Behaviorally: `rm -v file` → `error: unexpected argument '-v'`, exit 2. Fix: add `-v`; on each successful removal write the pathname to stdout (and treat a stdout-write failure as affecting exit status per 113458-113461). Note the FUTURE-DIRECTIONS newline-in-pathname caveat (113538-113541) applies to `-v` output.
+- [x] **#R1 — `-d` (remove empty directories) is unimplemented.** POSIX SYNOPSIS `rm [-diRrv] file...` (113356), OPTIONS 113404, DESCRIPTION 113369-113370 (Austin Group Defect 802). ✓ **Fixed (Phase 5):** added `-d/--dir`; a directory operand with `-d` and without `-r`/`-R` is removed via `fs::remove_dir` (rmdir) after the standard prompt, failing with `Directory not empty` on a non-empty directory; `-r`/`-R` take precedence (113534-113535). Tests: `test_rm_d_empty`, `test_rm_d_nonempty`, `test_rm_dr_precedence`.
+- [x] **#R2 — `-v` (verbose) is unimplemented.** POSIX SYNOPSIS 113356, OPTIONS 113412-113413, STDOUT 113445-113447 (Austin Group Defects 1154/1365/1487). ✓ **Fixed (Phase 5):** added `-v/--verbose`; each successful removal writes `removed '…'` / `removed directory '…'` to stdout, wired into `rm_file`, the recursive file/postprocess closures, the direct empty-dir removal, and the `-d` path. Tests: `test_rm_v_file`, `test_rm_dv_empty_dir`.
 
 #### Minor
 - [ ] **#R3 — No operands without `-f` exits 0 silently.** `tree/rm.rs:38` (`files: Vec<PathBuf>` is not `required`) + `main` loop (`rm.rs:438`). POSIX SYNOPSIS form 1 is `rm [-diRrv] file...` (≥1 operand required); only the `-f` form (113357) permits zero operands. Behaviorally: bare `rm` → exit 0; GNU → `rm: missing operand`, exit 1. The **`-f`** no-operand case is correctly silent/0 (113405-113407). Fix: if no operands and `-f` not set, diagnose and exit non-zero.
@@ -309,12 +309,12 @@ dir-fd-relative, and a handful of `unreachable!()`/`unwrap()` sites are process-
 
 | Opt | Status | Notes (file:line) |
 |---|---|---|
-| `-d` | MISSING | (#R1, Major) not declared. |
+| `-d` | CONFORMS | (#R1 ✓) `rm_dir_empty` — rmdir an empty directory operand, `-r`/`-R` precedence. |
 | `-f` | CONFORMS | `rm.rs:28`; suppresses prompt; `NotFound` swallowed (`rm.rs:406`); `overrides_with_all` clears prior `-i` (113405-113407). |
 | `-i` | CONFORMS | `rm.rs:31`; prompts even when stdin is not a terminal (113472-113474). |
 | `-R` | CONFORMS | `rm.rs:34` (`-R` a visible alias of `-r`). |
 | `-r` | CONFORMS | `rm.rs:34`; required for directory recursion (`rm.rs:227`). |
-| `-v` | MISSING | (#R2, Major) not declared. |
+| `-v` | CONFORMS | (#R2 ✓) `report_removed` writes each removed name to stdout. |
 
 #### DESCRIPTION steps (113363-113400)
 - [x] Step 1 nonexistent operand — diagnosed unless `-f` (`rm.rs:404-416`). CONFORMS.

@@ -7,21 +7,26 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::env;
-use std::io;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
+use plib::diag;
+use posixutils_process::exec::exec_error_exit;
 
 #[derive(Parser)]
-#[command(version, about = gettext("env - set the environment for command invocation"))]
+#[command(
+    version,
+    disable_help_flag = true,
+    disable_version_flag = true,
+    about = gettext("env - set the environment for command invocation")
+)]
 struct Args {
     #[arg(
-        short,
-        long,
+        short = 'i',
         help = gettext(
             "Invoke utility with exactly the environment specified by the arguments; the inherited environment shall be ignored completely"
         )
@@ -32,7 +37,18 @@ struct Args {
     operands: Vec<String>,
 }
 
-fn separate_ops(sv: &Vec<String>) -> (Vec<String>, Vec<String>) {
+/// True if `name` is a valid environment variable name per the portable
+/// character set: a non-digit `[A-Za-z_]` followed by `[A-Za-z0-9_]*`.
+fn is_valid_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c == '_' || c.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+fn separate_ops(sv: &[String]) -> (Vec<String>, Vec<String>) {
     // Upper bound: all operands could be envs or all could be args
     let mut envs = Vec::with_capacity(sv.len());
     let mut util_args = Vec::with_capacity(sv.len());
@@ -40,9 +56,13 @@ fn separate_ops(sv: &Vec<String>) -> (Vec<String>, Vec<String>) {
 
     for s in sv {
         if in_envs {
-            if s.contains('=') {
-                envs.push(String::from(s));
-                continue;
+            // A leading `name=value` operand is an assignment only when the
+            // part before the first '=' is a valid environment-variable name.
+            if let Some((name, _)) = s.split_once('=') {
+                if is_valid_name(name) {
+                    envs.push(String::from(s));
+                    continue;
+                }
             }
 
             in_envs = false;
@@ -56,17 +76,13 @@ fn separate_ops(sv: &Vec<String>) -> (Vec<String>, Vec<String>) {
     (envs, util_args)
 }
 
-fn merge_env(new_env: &Vec<String>, clear: bool) -> HashMap<String, String> {
-    // Collect inherited env vars first to know capacity
-    let inherited: Vec<_> = if clear {
-        Vec::new()
-    } else {
-        env::vars().collect()
-    };
-    let mut map = HashMap::with_capacity(inherited.len() + new_env.len());
+fn merge_env(new_env: &[String], clear: bool) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
 
-    for (key, value) in inherited {
-        map.insert(key, value);
+    if !clear {
+        for (key, value) in env::vars() {
+            map.insert(key, value);
+        }
     }
 
     for env_op in new_env {
@@ -77,29 +93,29 @@ fn merge_env(new_env: &Vec<String>, clear: bool) -> HashMap<String, String> {
     map
 }
 
-fn print_env(envs: HashMap<String, String>) -> Result<(), Box<dyn std::error::Error>> {
+fn print_env(envs: &BTreeMap<String, String>) {
+    // BTreeMap iterates in sorted key order, giving deterministic output.
     for (key, value) in envs {
         println!("{}={}", key, value);
     }
-
-    Ok(())
 }
 
-fn exec_util(envs: HashMap<String, String>, util_args: Vec<String>) -> io::Result<()> {
-    Err(Command::new(&util_args[0])
+fn exec_util(envs: &BTreeMap<String, String>, util_args: &[String]) -> ! {
+    let err = Command::new(&util_args[0])
         .args(&util_args[1..])
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .env_clear()
-        .envs(&envs)
-        .exec())
+        .envs(envs)
+        .exec();
+
+    // exec() only returns on failure.
+    exec_error_exit(&util_args[0], err)
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+fn main() {
+    diag::init_locale("env");
 
     let args = Args::parse();
 
@@ -107,10 +123,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let new_env = merge_env(&envs, args.ignore_env);
 
     if util_args.is_empty() {
-        return print_env(new_env);
+        print_env(&new_env);
+        return;
     }
 
-    exec_util(new_env, util_args)?;
-
-    Ok(())
+    exec_util(&new_env, &util_args);
 }

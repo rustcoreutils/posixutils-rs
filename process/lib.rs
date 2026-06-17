@@ -7,4 +7,5 @@
 // SPDX-License-Identifier: MIT
 //
 
+pub mod exec;
 pub mod signal;

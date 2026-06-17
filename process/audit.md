@@ -70,7 +70,7 @@ No tests exist.
 ### Priority issues
 
 #### Critical
-- [ ] **`#E1` — exec failure never yields 126/127.** `env.rs:88-97,113`.
+- [x] **`#E1` — exec failure never yields 126/127.** ✓ fixed in Phase 1. `env.rs:88-97,113`.
   `exec_util` returns `io::Result<()>`; the `?` at `env.rs:113` propagates the
   error out of `main() -> Result<…>`, so Rust prints it and exits **1**. POSIX
   `env` EXIT STATUS mandates **126** (found, not invocable) and **127** (not
@@ -78,19 +78,19 @@ No tests exist.
   `PermissionDenied`/other → `exit(126)`, internal errors → 1-125.
 
 #### Major
-- [ ] **`#E2` — `--ignore-env` long option is non-POSIX.** `env.rs:22-29`.
+- [x] **`#E2` — `--ignore-env` long option is non-POSIX.** ✓ fixed in Phase 1. `env.rs:22-29`.
   `#[arg(short, long)]` synthesizes `--ignore-env`; POSIX `env` SYNOPSIS
   (slice 94031) is `env [-i] [name=value]... [utility [argument...]]` — only
   `-i`. Fix: drop `long`, keep `short`.
-- [ ] **`#E3` — `--help`/`--version` intercepted by clap.** `env.rs:18-20`.
+- [x] **`#E3` — `--help`/`--version` intercepted by clap.** ✓ fixed in Phase 1. `env.rs:18-20`.
   `env --help foo` is eaten by clap instead of being treated as a utility named
   `--help`. Fix: `disable_help_flag`/`disable_version_flag`, or document.
 
 #### Minor
-- [ ] **`#E4` — stdout dump order is nondeterministic.** `env.rs:80-85`.
+- [x] **`#E4` — stdout dump order is nondeterministic.** ✓ fixed in Phase 1 (BTreeMap). `env.rs:80-85`.
   `print_env` iterates a `HashMap`, so `name=value` order randomizes per run.
   POSIX does not mandate order, but determinism is expected; sort by key.
-- [ ] **`#E5` — `name=value` split uses bare `contains('=')`.** `env.rs:43`.
+- [x] **`#E5` — `name=value` split uses bare `contains('=')`.** ✓ fixed in Phase 1. `env.rs:43`.
   A leading operand whose name is not a valid env-var name (e.g.
   `1abc=x`) is still treated as an assignment. Fix: validate the pre-`=` token
   against `[A-Za-z_][A-Za-z0-9_]*`.

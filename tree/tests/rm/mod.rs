@@ -1284,3 +1284,14 @@ fn test_rm_dv_empty_dir() {
 
     fs::remove_dir_all(test_dir).unwrap();
 }
+
+// Audit #R3: with no operands and without -f, rm is a usage error (exit 1); -f makes it silent/0.
+#[test]
+fn test_rm_no_operand() {
+    rm_test(&[], "", "rm: missing operand\n", 1);
+}
+
+#[test]
+fn test_rm_f_no_operand() {
+    rm_test(&["-f"], "", "", 0);
+}

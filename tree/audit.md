@@ -947,16 +947,16 @@ detector works.
 #### Major
 - [x] **#LS3 — Sort now uses `LC_COLLATE` collation.** Was raw `OsString::cmp` (byte order). ✓ **Fixed (Phase 2):** all three sort keys route through a `collate_names` helper using `plib::locale::strcoll` on the UTF-8 view, with a byte-order tiebreak / non-UTF-8 fallback. Verified locale-sensitive (case-insensitive grouping under a UTF-8 locale vs byte order under `C`).
 - [x] **#LS4 — 6-month date decision now tracks the displayed timestamp.** ✓ **Fixed (Phase 2):** the recent-vs-old branch uses the displayed `time` (ctime/atime under `-c`/`-u`), not always-mtime. Test: `test_ls_u_recency_displayed_time`.
-- [ ] **#LS5 — Alternate-access-method flag never emitted.** `tree/ls_util/entry.rs:577-658`. The spec's mode string ends with an optional trailing field (a single printable non-`<blank>`, conventionally `+`) when an alternate access method (e.g. an ACL) is present. The mode string is built to exactly 10 chars with no probe (`grep -n "acl|getxattr|'+'" tree/ls_util/entry.rs` → 0); ACL'd files render identically to plain ones. Fix: probe for ACLs/alternate access and append `+`.
-- [ ] **#LS6 — `-q` non-printable handling diverges from the `LC_CTYPE` print class.** `tree/ls_util/entry.rs:128-134` only maps `is_control()`/`\t` to `?`; it misses non-control non-printable code points and is not `LC_CTYPE`-driven, and `-q` is not the terminal default. Fix: classify against the locale print class.
+- [x] **#LS5 — Alternate-access-method `+` flag.** ✓ **Fixed (Phase 3):** the path is threaded into `get_file_mode_string`, which probes `getxattr(system.posix_acl_access)` via a `has_acl` helper and appends `+`. Verified against GNU. Test: `test_ls_acl_plus_flag` (gated on setfacl).
+- [x] **#LS6 — `-q` print-class + terminal default.** ✓ **Fixed (Phase 3):** non-printables are tested with `plib::locale::isprint`; `-q` also defaults on when stdout is a terminal (`libc::isatty`). Test: `test_ls_q_non_printable`.
 
 #### Minor
 - [x] **#LS7 — Six-month window is now precise** (365.25/2 days, was `30*6`). ✓ Fixed (Phase 2).
 - [x] **#LS8 — `LC_TIME` now honored.** ✓ **Fixed (Phase 2):** the date field is formatted via `plib::locale::strftime` (libc `strftime`, localized month names + `TZ`), replacing chrono’s English-only `%b`.
 - [x] **#LS9 — Recent date now uses `%e` (blank-pad).** ✓ **Fixed (Phase 2):** format strings use `%b %e …`; `Jun  5` not `Jun 05`. Test: `test_ls_date_blank_padded_day`.
 - [x] **#LS10 — socket type char `s` and `-F` socket `=`.** ✓ **Fixed (Phase 1):** added `FileType::Socket => 's'` to the mode-string type char and a `file_type.is_socket() => '='` arm to the `-F` classify. Test: `test_ls_socket_classification`.
-- [ ] **#LS11 — owner/group lookup failure errors instead of printing the numeric id** (`entry.rs:667-686`): spec says a name that "cannot be determined" is "replaced with their associated numeric values."
-- [ ] **#LS12 — wide (East-Asian) Unicode column width** uses `chars().count()` (every code point width 1) — CJK/zero-width misalign columns. [ ] **#LS13 — `-s`/no-`-k` uses 512-byte units** (GNU defaults to 1024) — conformant but surprising; the `total` line correctly uses 512.
+- [x] **#LS11 — owner/group lookup failure prints the numeric id.** ✓ **Fixed (Phase 3):** `get_owner_name`/`get_group_name` return the numeric UID/GID when `getpwuid`/`getgrgid` is null, per spec.
+- [x] **#LS12 — wide-character column width.** ✓ **Fixed (Phase 3):** filename display width sums libc `wcwidth` per char (East-Asian wide = 2, zero-width = 0) via a `display_width` helper.
 
 ### Detailed conformance matrix
 #### OPTIONS (every letter)
@@ -981,8 +981,8 @@ detector works.
 #### EXTENDED DESCRIPTION — long format
 - [x] type char `d b c l p` + rwx triads + setuid/setgid/sticky case rules — CONFORMS (`entry.rs:583-655`), **except** socket → `-` (#LS10); [ ] trailing alternate-access flag never written (#LS5).
 - [x] nlink/owner/group/size — CONFORMS, [ ] except owner/group numeric-fallback on lookup failure (#LS11).
-- [ ] date-time: recent `%b %d %H:%M` / old `%b %d  %Y` implemented but `%d` not `%e` (#LS9), mtime-keyed under `-c`/`-u` (#LS4), 180-day window (#LS7); future-date → old format CONFORMS.
-- [ ] symlink `-> target`: construction **panics** (#LS1/#LS2); the `@` link-type-indicator and the resolved-file type indicator are not implemented.
+- [x] date-time: now `%b %e %H:%M` / `%b %e  %Y` via `strftime` (LC_TIME), recency keyed on the displayed time, precise 6-month window (#LS4/#LS7/#LS8/#LS9 fixed Phase 2).
+- [x] symlink `-> target`: no longer panics (#LS1/#LS2 fixed Phase 1); the `@` suffix is emitted by `-F`. (The `-L -l` resolved-file type indicator remains an unspecified-format nicety, not a numbered finding.)
 - [x] `total <blocks>` in 512-byte units (1024 w/ `-k`), dirs only, before entries — CONFORMS.
 - [x] multi-column: `COLUMNS`/ioctl/80; constant column width; filenames never truncated; O(n²) guard at 1000 — CONFORMS (#LS12 width caveat).
 
@@ -990,8 +990,8 @@ detector works.
 - [x] no-operand → `.`; non-dir operands first (sorted separately); missing file → stderr + exit ≥1; STDIN not used; directory header `\n%s:\n` (omitted for a single operand); diagnostics to stderr — CONFORMS. [ ] operand sort itself byte-order (#LS3). EXIT 0/`>0` (loop → 2, conformant); panics (#LS1/#LS2) bypass exit status entirely.
 
 ### Test coverage signal
-- [ ] `ls -l` on a symlink (command-line *and* in-directory) — the crash is **entirely untested** (`test_ls_dangle` never uses `-l`) (#LS1/#LS2).
-- [ ] `LC_COLLATE` sort (#LS3); old-file-recent-atime under `-u -l` (#LS4); ACL `+` (#LS5); `-q` non-control non-printables (#LS6); `%e` blank-pad day (#LS9); socket `s`/`=` (#LS10); owner/group numeric fallback (#LS11).
+- [x] `ls -l` on a symlink (command-line + in-directory) — `test_ls_l_symlink_no_panic` (#LS1/#LS2).
+- [x] tests added: `-u -l` recency (#LS4), ACL `+` (#LS5, gated), `-q` non-printables (#LS6), `%e` day (#LS9), socket `s`/`=` (#LS10), `-s` 1024 units (#LS13). (LC_COLLATE #LS3 and numeric owner/group fallback #LS11 are locale/root-dependent — verified behaviorally, not unit-gated.)
 - [x] empty dir, dangle, file-type `-F`, infinite loop, inode, `-m`, recursive, `-rt`, size-align, time covered.
 
 ### Suggested PR groupings

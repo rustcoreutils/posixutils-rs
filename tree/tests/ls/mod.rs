@@ -788,3 +788,67 @@ fn test_ls_u_recency_displayed_time() {
     });
     fs::remove_dir_all(test_dir).unwrap();
 }
+
+// Audit #LS5: a file carrying a POSIX ACL gets the trailing `+` on its mode string. Gated on
+// `setfacl` being available and the filesystem supporting ACLs.
+#[test]
+fn test_ls_acl_plus_flag() {
+    let test_dir = &format!("{}/test_ls_acl_plus_flag", env!("CARGO_TARGET_TMPDIR"));
+    let f = &format!("{test_dir}/f");
+    fs::create_dir(test_dir).unwrap();
+    fs::File::create(f).unwrap();
+
+    let ok = std::process::Command::new("setfacl")
+        .args(["-m", "u:0:r", f])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!("Skipping: setfacl unavailable or filesystem lacks ACL support");
+        fs::remove_dir_all(test_dir).unwrap();
+        return;
+    }
+
+    ls_test_with_checker(&["-l", f], |_, output| {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mode = stdout.split_whitespace().next().unwrap_or("");
+        assert!(mode.ends_with('+'), "mode should carry ACL '+': {stdout}");
+    });
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// Audit #LS6: explicit `-q` replaces non-printable filename characters with `?`.
+#[test]
+fn test_ls_q_non_printable() {
+    let test_dir = &format!("{}/test_ls_q_non_printable", env!("CARGO_TARGET_TMPDIR"));
+    fs::create_dir(test_dir).unwrap();
+    let weird = &format!("{test_dir}/a\tb");
+    fs::File::create(weird).unwrap();
+
+    ls_test_with_checker(&["-q", test_dir], |_, output| {
+        assert_eq!(output.status.code(), Some(0));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("a?b"), "tab should become '?': {stdout:?}");
+        assert!(!stdout.contains('\t'), "no raw tab: {stdout:?}");
+    });
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// Audit #LS13: `-s` reports blocks in 1024-byte units by default (matches coreutils).
+#[test]
+fn test_ls_s_kib_default() {
+    let test_dir = &format!("{}/test_ls_s_kib_default", env!("CARGO_TARGET_TMPDIR"));
+    let f = &format!("{test_dir}/f");
+    fs::create_dir(test_dir).unwrap();
+    // 8 KiB of data → ~8 1024-byte blocks (allocation may add a little).
+    fs::write(f, vec![0u8; 8192]).unwrap();
+
+    let blocks_512 = fs::metadata(f).unwrap().blocks();
+    let expected_kib = blocks_512 / 2;
+    ls_test_with_checker(&["-s", f], |_, output| {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let first: u64 = stdout.split_whitespace().next().unwrap().parse().unwrap();
+        assert_eq!(first, expected_kib, "expected 1024-byte units: {stdout}");
+    });
+    fs::remove_dir_all(test_dir).unwrap();
+}

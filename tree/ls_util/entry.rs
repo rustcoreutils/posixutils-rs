@@ -56,6 +56,7 @@ impl Entry {
         file_name_raw: OsString,
         metadata: &ftw::Metadata,
         config: &Config,
+        path: &std::path::Path,
     ) -> io::Result<Self> {
         let file_info = get_file_info(metadata);
 
@@ -64,9 +65,9 @@ impl Entry {
 
         let blocks = metadata.blocks();
         let blocks_str = if config.display_size {
-            // The 2 is because `crate::BLOCK_SIZE_KIBIBYTES` is double that of
-            // `crate::BLOCK_SIZE`
-            let b = if config.kibibytes { blocks / 2 } else { blocks };
+            // `-s` defaults to 1024-byte units (matching coreutils); `metadata.blocks()` is in
+            // 512-byte units, so halve it. `-k` requests the same 1024-byte units (#LS13).
+            let b = blocks / 2;
             Some(format!("{}", b))
         } else {
             None
@@ -80,7 +81,7 @@ impl Entry {
 
         let long_format_data =
             if let OutputFormat::Long(long_format_options) = &config.output_format {
-                Some(LongFormatData::new(metadata, long_format_options)?)
+                Some(LongFormatData::new(metadata, long_format_options, path)?)
             } else {
                 None
             };
@@ -125,17 +126,17 @@ impl Entry {
         let file_name_display = {
             let tmp = ls_from_utf8_lossy(file_name_raw.as_bytes());
 
-            // -q
+            // -q: replace every non-printable character (per LC_CTYPE) with '?'.
             if config.hide_control_chars {
                 tmp.chars()
-                    .map(|c| if c.is_control() || c == '\t' { '?' } else { c })
+                    .map(|c| if plib::locale::isprint(c) { c } else { '?' })
                     .collect()
             } else {
                 tmp
             }
         };
 
-        let mut file_name_width = file_name_display.chars().count();
+        let mut file_name_width = display_width(&file_name_display);
         if suffix.is_some() {
             file_name_width += 1;
         }
@@ -543,8 +544,9 @@ impl LongFormatData {
     pub fn new(
         metadata: &ftw::Metadata,
         long_format_options: &LongFormatOptions,
+        path: &std::path::Path,
     ) -> io::Result<Self> {
-        let file_mode = get_file_mode_string(metadata);
+        let file_mode = get_file_mode_string(metadata, path);
 
         let num_links = metadata.nlink().to_string();
 
@@ -575,8 +577,8 @@ impl LongFormatData {
     }
 }
 
-fn get_file_mode_string(metadata: &ftw::Metadata) -> String {
-    let mut file_mode = String::with_capacity(10);
+fn get_file_mode_string(metadata: &ftw::Metadata, path: &std::path::Path) -> String {
+    let mut file_mode = String::with_capacity(11);
 
     let file_type = metadata.file_type();
 
@@ -656,6 +658,11 @@ fn get_file_mode_string(metadata: &ftw::Metadata) -> String {
         }
     });
 
+    // Alternate-access-method flag: '+' when the file carries a POSIX ACL.
+    if has_acl(path) {
+        file_mode.push('+');
+    }
+
     file_mode
 }
 
@@ -667,7 +674,8 @@ fn get_owner_name(metadata: &ftw::Metadata, numeric: bool) -> io::Result<String>
         unsafe {
             let passwd = libc::getpwuid(uid);
             if passwd.is_null() {
-                return Err(io::Error::last_os_error());
+                // POSIX: if the owner name cannot be determined, use the numeric UID.
+                return Ok(uid.to_string());
             }
             let passwd_ref = &*passwd;
             let name = CStr::from_ptr(passwd_ref.pw_name);
@@ -684,7 +692,8 @@ fn get_group_name(metadata: &ftw::Metadata, numeric: bool) -> io::Result<String>
         unsafe {
             let group = libc::getgrgid(gid);
             if group.is_null() {
-                return Err(io::Error::last_os_error());
+                // POSIX: if the group name cannot be determined, use the numeric GID.
+                return Ok(gid.to_string());
             }
             let group_ref = &*group;
             let name = CStr::from_ptr(group_ref.gr_name);
@@ -732,6 +741,46 @@ fn get_system_time(
         .checked_add(Duration::from_secs(seconds_since_epoch))
         .ok_or(io::Error::other("`SystemTime` overflow"))?;
     Ok(time)
+}
+
+/// Display width of a string in terminal columns, summing libc `wcwidth` per character so
+/// East-Asian wide characters count as 2 and zero-width characters as 0. Requires `LC_CTYPE` to
+/// have been set. Non-printable characters (`wcwidth` < 0) count as 1 (they are normally already
+/// replaced by `?` under `-q`).
+fn display_width(s: &str) -> usize {
+    // `wcwidth` is not surfaced by the `libc` crate on all targets, so declare it directly.
+    extern "C" {
+        fn wcwidth(c: libc::wchar_t) -> libc::c_int;
+    }
+    s.chars()
+        .map(|c| {
+            let w = unsafe { wcwidth(c as libc::wchar_t) };
+            if w < 0 {
+                1
+            } else {
+                w as usize
+            }
+        })
+        .sum()
+}
+
+/// True if `path` carries a POSIX access ACL (an "alternate access method"), probed via
+/// `getxattr(system.posix_acl_access)`. Used to append the `+` flag to the `-l` mode string.
+fn has_acl(path: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(cpath) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    const NAME: &[u8] = b"system.posix_acl_access\0";
+    let ret = unsafe {
+        libc::getxattr(
+            cpath.as_ptr(),
+            NAME.as_ptr() as *const libc::c_char,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    ret >= 0
 }
 
 /// Compare two raw filenames using `LC_COLLATE` (libc `strcoll`) with a byte-order tiebreak, and a

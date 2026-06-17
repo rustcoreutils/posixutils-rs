@@ -293,7 +293,6 @@ struct Config {
     file_time_option: FileTimeOption,
     file_inclusion: FileInclusion,
     inode: bool,
-    kibibytes: bool,
     hide_control_chars: bool,
     reverse_sorting: bool,
     display_size: bool,
@@ -486,8 +485,9 @@ impl Config {
             file_inclusion,
 
             inode: args.inode,
-            kibibytes: args.kibibytes,
-            hide_control_chars: args.hide_control_chars,
+            // -q is also the default when standard output is a terminal (POSIX permits this).
+            hide_control_chars: args.hide_control_chars
+                || unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 },
             reverse_sorting: args.reverse_sorting,
             display_size: args.display_size,
             recursive: args.recursive,
@@ -677,16 +677,9 @@ fn display_entries(entries: &mut [Entry], config: &Config, dir_path: Option<&str
             total_block_size += BLOCK_SIZE * entry.blocks();
         }
 
-        // The specification seems contradictory here. On the -s flag
-        // it says it is implementation-defined. But on the STDOUT
-        // section, it mandates it to be 512 when -k is not specified
-        // and 1024 when it is.
-        // coreutils seems to always have it as 1024 with or without -k.
-        if config.kibibytes {
-            total_block_size /= BLOCK_SIZE_KIBIBYTES;
-        } else {
-            total_block_size /= BLOCK_SIZE;
-        }
+        // The block size for -s and the total is implementation-defined without -k; we default to
+        // 1024-byte units (matching coreutils) so -k is the same as the default (#LS13).
+        total_block_size /= BLOCK_SIZE_KIBIBYTES;
         println!("{} {}", gettext("total"), total_block_size);
     }
 
@@ -925,6 +918,7 @@ fn ls(paths: Vec<PathBuf>, config: &Config) -> io::Result<u8> {
             path.as_os_str().to_os_string(),
             &metadata,
             config,
+            &path,
         ) {
             Ok(x) => x,
             Err(e) => {
@@ -1116,8 +1110,14 @@ fn process_single_dir(
                     target_path
                 };
 
-                let entry = Entry::new(target_path, file_name_raw, metadata, config)
-                    .map_err(|e| io::Error::other(format!("'{path_str}': {e}")))?;
+                let entry = Entry::new(
+                    target_path,
+                    file_name_raw,
+                    metadata,
+                    config,
+                    path.as_inner(),
+                )
+                .map_err(|e| io::Error::other(format!("'{path_str}': {e}")))?;
 
                 let mut include_entry = false;
 

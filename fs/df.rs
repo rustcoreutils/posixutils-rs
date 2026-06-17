@@ -40,6 +40,14 @@ struct Args {
     portable: bool,
 
     #[arg(
+        short = 't',
+        long,
+        conflicts_with = "portable",
+        help = gettext("Include total allocated-space figures in the output")
+    )]
+    total: bool,
+
+    #[arg(
         help = gettext("A pathname of a file within the hierarchy of the desired file system")
     )]
     files: Vec<PathBuf>,
@@ -115,6 +123,8 @@ impl Display for Field {
 
 pub struct Fields {
     pub mode: OutputMode,
+    /// Whether the inode columns are shown (default & -t modes, not -k/-P).
+    pub inodes: bool,
     /// file system
     pub source: Field,
     /// FS size
@@ -125,22 +135,33 @@ pub struct Fields {
     pub avail: Field,
     /// percent used
     pub pcent: Field,
+    /// total inodes (file slots)
+    pub itotal: Field,
+    /// used inodes
+    pub iused: Field,
+    /// free inodes
+    pub ifree: Field,
+    /// percent inodes used
+    pub ipcent: Field,
     /// mount point
     pub target: Field,
-    // /// specified file name
-    // file: Field,
 }
 
 impl Fields {
-    pub fn new(mode: OutputMode) -> Self {
+    pub fn new(mode: OutputMode, inodes: bool) -> Self {
         let size_caption = format!("{}-{}", mode.get_block_size(), gettext("blocks"));
         Self {
             mode,
+            inodes,
             source: Field::new(gettext("Filesystem"), 14, FieldType::Str),
             size: Field::new(size_caption, 10, FieldType::Num),
             used: Field::new(gettext("Used"), 10, FieldType::Num),
             avail: Field::new(gettext("Available"), 10, FieldType::Num),
             pcent: Field::new(gettext("Capacity"), 5, FieldType::Pcent),
+            itotal: Field::new(gettext("Inodes"), 10, FieldType::Num),
+            iused: Field::new(gettext("IUsed"), 10, FieldType::Num),
+            ifree: Field::new(gettext("IFree"), 10, FieldType::Num),
+            ipcent: Field::new(gettext("IUse%"), 5, FieldType::Pcent),
             target: Field::new(gettext("Mounted on"), 0, FieldType::Str),
         }
     }
@@ -151,9 +172,17 @@ impl Display for Fields {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} {} {} {} {} {}",
-            self.source, self.size, self.used, self.avail, self.pcent, self.target
-        )
+            "{} {} {} {} {}",
+            self.source, self.size, self.used, self.avail, self.pcent
+        )?;
+        if self.inodes {
+            write!(
+                f,
+                " {} {} {} {}",
+                self.itotal, self.iused, self.ifree, self.ipcent
+            )?;
+        }
+        write!(f, " {}", self.target)
     }
 }
 
@@ -164,6 +193,10 @@ pub struct FieldsData<'a> {
     pub used: u64,
     pub avail: u64,
     pub pcent: u32,
+    pub itotal: u64,
+    pub iused: u64,
+    pub ifree: u64,
+    pub ipcent: u32,
     pub target: String,
 }
 
@@ -173,17 +206,30 @@ impl Display for FieldsData<'_> {
     // "%s %d %d %d %d%% %s\n", <file system name>, <total space>,
     //     <space used>, <space free>, <percentage used>,
     //     <file system root>
+    //
+    // In default and -t modes the inode (file-slot) columns are inserted
+    // before <file system root>; -k and -P keep the fixed six-column format.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} {} {} {} {}% {}",
+            "{} {} {} {} {}%",
             self.fields.source.format(&self.source),
             self.fields.size.format(&self.size),
             self.fields.used.format(&self.used),
             self.fields.avail.format(&self.avail),
             self.fields.pcent.format(&self.pcent),
-            self.fields.target.format(&self.target)
-        )
+        )?;
+        if self.fields.inodes {
+            write!(
+                f,
+                " {} {} {} {}%",
+                self.fields.itotal.format(&self.itotal),
+                self.fields.iused.format(&self.iused),
+                self.fields.ifree.format(&self.ifree),
+                self.fields.ipcent.format(&self.ipcent),
+            )?;
+        }
+        write!(f, " {}", self.fields.target.format(&self.target))
     }
 }
 
@@ -254,6 +300,12 @@ impl Mount {
 
         let percentage_used = capacity_percent(used, avail);
 
+        // Inode (file-slot) figures. Counts are unscaled (they are not space).
+        let itotal = sf.f_files;
+        let ifree = sf.f_ffree;
+        let iused = itotal.saturating_sub(ifree);
+        let ipcent = capacity_percent(iused, ifree); // iused / (iused + ifree) = iused / itotal
+
         FieldsData {
             fields,
             source: self.devname.to_string_lossy().into_owned(),
@@ -261,6 +313,10 @@ impl Mount {
             used,
             avail,
             pcent: percentage_used,
+            itotal,
+            iused,
+            ifree,
+            ipcent,
             target: self.dir.to_string_lossy().into_owned(),
         }
     }
@@ -394,8 +450,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // POSIX DESCRIPTION: "if no options other than -t are specified, the number
+    // of free file slots, or inodes, available" shall be reported. So inodes are
+    // shown for bare `df` and `-t`, but not when -k or -P is given.
+    let show_inodes = !args.kilo && !args.portable;
+
+    // -t mandates that the output contain the total allocated space. df always
+    // reports the total (the "N-blocks" column), so -t needs no further action
+    // beyond the -P|-t mutual exclusion enforced by clap.
+    let _ = args.total;
+
     let mode = OutputMode::new(args.kilo, args.portable);
-    let fields = Fields::new(mode);
+    let fields = Fields::new(mode, show_inodes);
     // Print header
     println!("{}", fields);
 

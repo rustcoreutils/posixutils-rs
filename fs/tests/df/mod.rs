@@ -145,6 +145,75 @@ fn test_df_bad_operand_prints_no_filesystem_rows() {
 }
 
 #[test]
+fn test_df_default_has_inode_columns() {
+    // Audit #3: default output shall report free file slots / inodes.
+    let output = run_df_test(vec![]);
+    let header = output.lines().next().expect("No output from df");
+    assert!(
+        header.contains("Inodes"),
+        "default header missing Inodes: {header}"
+    );
+    assert!(
+        header.contains("IFree"),
+        "default header missing IFree: {header}"
+    );
+    assert!(
+        header.contains("IUse%"),
+        "default header missing IUse%: {header}"
+    );
+}
+
+#[test]
+fn test_df_total_has_inode_columns() {
+    // Audit #2/#3: -t output also reports inodes (and totals are present).
+    let output = run_df_test(vec!["-t"]);
+    let header = output.lines().next().expect("No output from df");
+    assert!(
+        header.contains("Inodes"),
+        "-t header missing Inodes: {header}"
+    );
+    assert!(
+        header.contains("IFree"),
+        "-t header missing IFree: {header}"
+    );
+}
+
+#[test]
+fn test_df_portable_has_no_inode_columns() {
+    // -P keeps the fixed six-column block format (no inode columns).
+    let output = run_df_test(vec!["-P"]);
+    let header = output.lines().next().expect("No output from df");
+    assert!(
+        !header.contains("Inodes") && !header.contains("IFree"),
+        "-P must not show inode columns: {header}"
+    );
+}
+
+#[test]
+fn test_df_kilo_has_no_inode_columns() {
+    // -k is "an option other than -t", so inodes are not required/shown.
+    let output = run_df_test(vec!["-k"]);
+    let header = output.lines().next().expect("No output from df");
+    assert!(
+        !header.contains("Inodes"),
+        "-k must not show inode columns: {header}"
+    );
+}
+
+#[test]
+fn test_df_portable_total_mutually_exclusive() {
+    // Audit #7: SYNOPSIS groups -P and -t as alternatives.
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_df"))
+        .args(["-P", "-t"])
+        .output()
+        .expect("Failed to execute df");
+    assert!(
+        !output.status.success(),
+        "df -P -t must be rejected as mutually exclusive"
+    );
+}
+
+#[test]
 fn test_df_help() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_df"))
         .arg("--help")

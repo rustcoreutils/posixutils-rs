@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, TestPlan};
+use plib::testing::{run_test, run_test_with_checker, TestPlan};
 use std::{
     fs,
     os::unix::{self, fs::PermissionsExt},
@@ -180,4 +180,50 @@ fn test_chmod_thru_dangling() {
     );
 
     fs::remove_dir_all(test_dir).unwrap();
+}
+
+// Audit #CM1 (shared with #CO1/#CG1/#DU1): a per-file error during `chmod -R` is reported but the
+// walk continues — a readable sibling is still chmod'd and the exit status is non-zero.
+#[test]
+fn test_chmod_continue_on_error() {
+    let test_dir = format!(
+        "{}/test_chmod_continue_on_error",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let bad = format!("{test_dir}/bad");
+    let good = format!("{test_dir}/good");
+    let good_f = format!("{good}/f");
+
+    let _ = fs::remove_dir_all(&test_dir);
+    fs::create_dir(&test_dir).unwrap();
+    fs::create_dir(&bad).unwrap();
+    fs::create_dir(&good).unwrap();
+    fs::File::create(&good_f).unwrap();
+    // `bad` is unsearchable; `chmod -R o+r` cannot restore owner search, so descending it fails
+    // (it only touches the "other" permission bits, never the owner's).
+    fs::set_permissions(&bad, fs::Permissions::from_mode(0o000)).unwrap();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("chmod"),
+            args: vec!["-R".into(), "o+r".into(), test_dir.clone()],
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 1,
+        },
+        |_, output| {
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "non-zero exit after the unreadable subdir"
+            );
+            // The readable sibling file was still modified (o+r applied).
+            let mode = fs::metadata(&good_f).unwrap().permissions().mode() & 0o004;
+            assert_eq!(mode, 0o004, "readable sibling still chmod'd");
+        },
+    );
+
+    fs::set_permissions(&bad, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::remove_dir_all(&test_dir).unwrap();
 }

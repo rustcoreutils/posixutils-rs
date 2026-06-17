@@ -55,12 +55,16 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] batch (cron cat.)
  - [x] bc
  - [x] cat
+ - [x] chgrp
+ - [x] chmod
+ - [x] chown
  - [x] cmp
  - [x] cp
  - [x] crontab (cron cat.)
  - [x] dd
  - [x] delta (SCCS)
  - [x] dirname
+ - [x] du
  - [x] ed (Editors)
  - [x] ex (Editors)
  - [x] expr
@@ -72,11 +76,16 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] gettext (i18n)
  - [x] iconv (i18n)
  - [x] lex (Development)
+ - [x] link
+ - [x] ln
  - [x] locale (i18n)
+ - [x] ls
  - [x] m4
  - [x] mailx
  - [x] make
  - [x] man
+ - [x] mkdir
+ - [x] mkfifo
  - [x] more
  - [x] msgfmt (i18n)
  - [x] mv
@@ -86,9 +95,11 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] pathchk
  - [x] pax
  - [x] prs (SCCS)
+ - [x] readlink
  - [x] realpath
  - [x] rm
  - [x] rmdel (SCCS)
+ - [x] rmdir
  - [x] sact (SCCS)
  - [x] sccs (SCCS)
  - [x] sh
@@ -97,8 +108,10 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] strip (Development)
  - [x] tee
  - [x] test
+ - [x] touch
  - [x] true
  - [x] unget (SCCS)
+ - [x] unlink
  - [x] uucp (UUCP)
  - [x] uustat (UUCP)
  - [x] uux (UUCP)
@@ -131,7 +144,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] cxref (Development)
  - [x] diff
  - [x] df
- - [x] du
  - [x] echo
  - [x] expand
  - [x] fold
@@ -140,19 +152,14 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] grep
  - [x] head
  - [x] join
- - [x] link
  - [x] localedef (i18n)
  - [x] logger
- - [x] ls
- - [x] mkdir
  - [x] nl
  - [x] paste
  - [x] patch
  - [x] pr
  - [x] printf
  - [x] ps
- - [x] readlink
- - [x] rmdir
  - [x] sed
  - [x] sort
  - [x] stty
@@ -171,7 +178,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] uuencode (uue)
  - [x] unexpand
  - [x] uniq
- - [x] unlink
  - [x] wc
  - [x] who
  - [x] write
@@ -184,23 +190,17 @@ Because it is a FAQ, the major differences between this project and uutils are:
 
 ## Stage 2 - Feature-complete and POSIX compliant
 
- - [x] chgrp
- - [x] chmod
- - [x] chown
  - [x] date
  - [x] env
  - [x] ipcrm (IPC)
- - [x] ln
  - [x] logname
  - [x] mesg
- - [x] mkfifo
  - [x] newgrp
  - [x] nice
  - [x] nohup
  - [x] pwd
  - [x] renice
  - [x] sleep
- - [x] touch
 
 ## Stage 1 - Rough draft
 

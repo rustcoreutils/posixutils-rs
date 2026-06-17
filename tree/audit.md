@@ -443,6 +443,8 @@ modes work. One real conformance gap: a per-file error **aborts the rest of the 
 (#CM1). Minors: missing `file` operand exits 0; hardcoded-English diagnostics; redundant
 double-set of setuid in the symbolic `Add` path.
 
+> **Resolved 2026-06-17** (Phases 4–5, this branch). All chmod items closed: #CM1 (shared abort-latch → report-and-continue), #CM2 (`file` operand `required`), #CM3/#CM4 (redundant setuid double-set removed from `plib::modestr`), and i18n. Regression test: `test_chmod_continue_on_error`.
+
 ### Priority issues
 #### Major
 - [x] **#CM1 — `-R` aborts the whole subtree on the first per-file error.** `tree/chmod.rs:99-105` (`*terminate.borrow_mut()=true; return Err(())`) + the `:41-43` early-out. EXIT STATUS / CONSEQUENCES OF ERRORS ("Default") expect report-and-continue (matching historical/GNU `chmod`). One `fchmodat` failure stops the walk; later siblings are skipped. Proof: `grep -n terminate tree/chmod.rs` → 35,41,79,103,114. Cross-operand iteration (`:141`) still continues, so only the current tree is abandoned. Fix: replace the `terminate` latch with a `had_error` flag (continue, set non-zero exit) — shared with #CO1/#CG1/#DU1.  ✓ **Fixed (Phase 4):** the shared `terminate` abort-latch in `change_ownership.rs`/`chmod.rs`/`du.rs` is replaced with a `had_error` flag — each per-file error is reported and the walk continues, mirroring the copy.rs pattern. Test: `test_du_continue_on_error`.
@@ -471,7 +473,7 @@ double-set of setuid in the symbolic `Add` path.
 
 #### Other sections
 - [x] STDIN/STDOUT not used, STDERR diagnostics-only, ASYNCHRONOUS "Default" — CONFORMS.
-- [x] EXIT 0/`>0` (`exit_code=1` `:143`) — CONFORMS; [ ] CONSEQUENCES "Default" DIVERGES via #CM1.
+- [x] EXIT 0/`>0` (`exit_code=1` `:143`) — CONFORMS; [x] CONSEQUENCES "Default" now report-and-continue (#CM1, Phase 4).
 
 ### Test coverage signal
 - [x] continue-after-error in `-R` (#CM1, shared) — `test_du_continue_on_error`; missing-`file` now a clap usage error (#CM2).
@@ -498,6 +500,8 @@ The setuid/setgid-clear-on-chown requirement is satisfied **by the Linux kernel*
 not by the utility (#CO3 — portability note). Minors: `owner:` (trailing colon) rejected; missing
 `file` exits 0; hardcoded English.
 
+> **Resolved 2026-06-17** (Phases 4–5, this branch). All chown items closed: #CO1 (shared continue-on-error), #CO2 (`-R` no-dereference default), #CO3 (explicitly clear `S_ISUID|S_ISGID` after an unprivileged `fchownat`), #CO4 (`owner:` → owner's login group via `getpwnam`), #CO5/#CO6 (required operand + i18n). Regression tests in `tree/tests/chown/mod.rs`.
+
 ### Priority issues
 #### Major
 - [x] **#CO1 — `-R` aborts the whole subtree on the first per-file error.** `tree/common/change_ownership.rs:93-97` + `:64-66`. Same mechanism/fix as #CM1. Proof: `grep -n terminate tree/common/change_ownership.rs` → 59,64,95,104,113.  ✓ **Fixed (Phase 4):** the shared `terminate` abort-latch in `change_ownership.rs`/`chmod.rs`/`du.rs` is replaced with a `had_error` flag — each per-file error is reported and the walk continues, mirroring the copy.rs pattern. Test: `test_du_continue_on_error`.
@@ -520,7 +524,7 @@ not by the utility (#CO3 — portability note). Minors: `owner:` (trailing colon
 - [x] `owner[:group]` numeric-or-name (numeric used as-is when present) — CONFORMS (`tree/chown.rs:73-99`).
 - [x] `:group` (empty owner) ≡ chgrp; period-separator not supported (colon-only) — CONFORMS.
 - [x] recursion race-safety (ftw `O_NOFOLLOW|O_DIRECTORY` + dir-fd `fchownat`) — CONFORMS.
-- [x] STDIN/STDOUT not used, STDERR diagnostics-only, ASYNCHRONOUS "Default" — CONFORMS. [ ] CONSEQUENCES DIVERGES via #CO1.
+- [x] STDIN/STDOUT not used, STDERR diagnostics-only, ASYNCHRONOUS "Default" — CONFORMS. [x] CONSEQUENCES now report-and-continue (#CO1, Phase 4).
 
 ### Test coverage signal
 - [x] `-R` continue-after-error (#CO1, shared); `owner:` login-group (#CO4) — `test_chown_owner_colon_login_group`; setid-clear kernel-satisfied (#CO3).
@@ -544,6 +548,8 @@ is correct; the owner is preserved. The one Major is the shared **`-R` abort-on-
 setid-clear is again kernel-implicit (#CG2). Minors: missing `file` exits 0; empty group string
 silently no-ops; hardcoded English.
 
+> **Resolved 2026-06-17** (Phases 4–5, this branch). All chgrp items closed: #CG1 (shared continue-on-error), #CG2 (clear setuid/setgid after an unprivileged group change), #CG3 (empty group operand rejected), #CG4/#CG5 (required operand + i18n). Regression tests in `tree/tests/chgrp/mod.rs`.
+
 ### Priority issues
 #### Major
 - [x] **#CG1 — `-R` aborts the whole subtree on the first per-file error.** Shared core `change_ownership.rs:93-97`. Same as #CM1/#CO1.  ✓ **Fixed (Phase 4):** the shared `terminate` abort-latch in `change_ownership.rs`/`chmod.rs`/`du.rs` is replaced with a `had_error` flag — each per-file error is reported and the walk continues, mirroring the copy.rs pattern. Test: `test_du_continue_on_error`.
@@ -561,7 +567,7 @@ silently no-ops; hardcoded English.
 | `-R` | CONFORMS (w/ #CG1) | default no-deref correctly set (`tree/chgrp.rs:84-86`). |
 
 #### Other
-- [x] numeric-or-name group; owner preserved (`uid.unwrap_or(md.uid())`); recursion race-safe; STDIN/STDOUT not used; STDERR diagnostics-only; ASYNCHRONOUS "Default"; EXIT 0/`>0` — CONFORMS. [ ] CONSEQUENCES DIVERGES via #CG1.
+- [x] numeric-or-name group; owner preserved (`uid.unwrap_or(md.uid())`); recursion race-safe; STDIN/STDOUT not used; STDERR diagnostics-only; ASYNCHRONOUS "Default"; EXIT 0/`>0` — CONFORMS. [x] CONSEQUENCES now report-and-continue (#CG1, Phase 4).
 
 ### Test coverage signal
 - [x] `-R` continue-after-error (#CG1, shared); empty group rejected (#CG3) — `test_chgrp_basic`; missing-`file` now a clap usage error (#CG4).
@@ -587,13 +593,15 @@ intermediate directories** instead of the spec's default-mode-modified-by-`u+wx`
 inaccessible and the descendant creation fails). Minors: `-p` existence test follows symlinks;
 CString panic on NUL; hardcoded English. (mkfifo, by contrast, handles `-m`/umask correctly.)
 
+> **Resolved 2026-06-17** (Phase 6, this branch). All mkdir items closed: #MK1 (`-m` bypasses the umask via save/restore), #MK2 (`-p` intermediates get the default mode, only the leaf gets `-m`), #MK3 (existence test via `EEXIST`+`is_dir`, not symlink-following `is_dir()`), #MK4 (`CString::new(...)?` + `<newline>` guard, no panic), #MK5 (i18n). Regression tests in `tree/tests/tree-tests-umask.rs`.
+
 ### Priority issues
 #### Major
 - [x] **#MK1 — `-m` mode is masked by umask; result can be more restrictive than requested.** `tree/mkdir.rs:32-42,57` calls `libc::mkdir(c_path, c_mode)` with **no `umask(0)` guard** (`grep -c umask tree/mkdir.rs` → 0). POSIX 107050-107051: "the directory shall at no time have permissions less restrictive than the −m mode." Verified: `mkdir -m 777 d` (umask 022) → `0755` (posixutils) vs `0777` (GNU). Fix: `umask(0)` around the `mkdir` for explicit `-m` (or post-`chmod`), as mkfifo (`tree/mkfifo.rs:35`) already does.  ✓ **Fixed (Phase 6):** an explicit `-m` mode bypasses umask (umask(0) around `mkdir`), so the dir gets exactly the `-m` mode. Test: `test_mkdir_explicit_mode_bypasses_umask`.
 - [x] **#MK2 — `-p` applies `-m` to intermediate dirs instead of default+`u+wx`.** `tree/mkdir.rs:50-58` applies the single `mode_val` to every component. POSIX 107062-107075 / APPLICATION USAGE: intermediate components get the default mode "modified by `u+wx` … regardless of the file mode creation mask"; only the final component gets `-m`. Verified: `mkdir -p -m 700 a/b/c` → `a`=`700` (posixutils) vs `755` (GNU); `-m 000` breaks descendant creation. Fix: create intermediates `0o777 & ~umask | 0o300`, apply `mode_val` only to the leaf.  ✓ **Fixed (Phase 6):** `-p` intermediates get `(0777 & ~umask) | u+wx`; only the leaf gets `-m`. Test: `test_mkdir_p_intermediate_mode`.
 
 #### Minor
-- [x] **#MK3 — `-p` existence test (`path.is_dir()`) follows symlinks and mis-handles a non-dir collision** (`:53-54`). [ ] **#MK4 — `CString::new(...).expect()` panics (exit 101) on a NUL-in-name operand; no `<newline>` guard** (`:33`). [ ] **#MK5 — hardcoded-English diagnostic body** (`:85`).  ✓ **Fixed (Phase 6):** an existing-directory component is detected via `EEXIST` + `is_dir`, and a non-`-p` existing directory is still an error.
+- [x] **#MK3 — `-p` existence test (`path.is_dir()`) follows symlinks and mis-handles a non-dir collision** (`:53-54`). [x] **#MK4 — `CString::new(...).expect()` panics (exit 101) on a NUL-in-name operand; no `<newline>` guard** (`:33`). [x] **#MK5 — hardcoded-English diagnostic body** (`:85`).  ✓ **Fixed (Phase 6):** an existing-directory component is detected via `EEXIST` + `is_dir`, and a non-`-p` existing directory is still an error. The path is built with `CString::new(...)?` (NUL → diagnostic, not panic) with an explicit `<newline>` guard, and the diagnostics route through `gettext`.
 
 ### Detailed conformance matrix
 #### OPTIONS
@@ -603,7 +611,7 @@ CString panic on NUL; hardcoded English. (mkfifo, by contrast, handles `-m`/umas
 | `-p` | PARTIAL | parents created, existing skipped; but #MK2 (mode) + #MK3 (symlink). |
 
 #### Other
-- [x] operands in order; STDIN/STDOUT not used; STDERR diagnostics; ASYNCHRONOUS "Default"; EXIT 0/`>0`, partial-completion continues; `-p`-already-exists → exit 0 — CONFORMS. [ ] NUL-operand panic DIVERGES (#MK4).
+- [x] operands in order; STDIN/STDOUT not used; STDERR diagnostics; ASYNCHRONOUS "Default"; EXIT 0/`>0`, partial-completion continues; `-p`-already-exists → exit 0 — CONFORMS. [x] NUL-operand now a diagnostic, not a panic (#MK4, Phase 6).
 
 ### Test coverage signal
 - [x] `-m` under non-zero umask (#MK1) and `-p` intermediate mode (#MK2) — `test_mkdir_explicit_mode_bypasses_umask`, `test_mkdir_p_intermediate_mode`.
@@ -624,12 +632,14 @@ Gets the mode semantics right (default `a=rw`→`0o666`, symbolic base `0o666`, 
 explicit `-m`** — the thing mkdir is missing). But it has a **Critical memory-safety bug**: it
 passes `filename.as_ptr()` of a Rust `&str` (not NUL-terminated) straight to `libc::mkfifo`.
 
+> **Resolved 2026-06-17** (Phase 6, this branch). All mkfifo items closed: #MF1 (Critical — the path is NUL-terminated via `CString` before `libc::mkfifo`), #MF2 (`<newline>`-in-name guard), #MF3 (`mkfifo:` prefix + gettext diagnostics). Regression test: `test_mkfifo_newline_rejected`.
+
 ### Priority issues
 #### Critical
 - [x] **#MF1 — non-NUL-terminated `&str` passed to `libc::mkfifo` (OOB read / wrong path).** `tree/mkfifo.rs:41-46`: `mkfifo(filename.as_ptr() as *const c_char, …)` where `do_mkfifo(filename: &str, …)` (from `files: Vec<String>`). A Rust `&str` is length-delimited, **not** NUL-terminated; the C call reads past the slice end until a stray NUL — UB; can create a FIFO with a garbage-suffixed name. `grep -c CString tree/mkfifo.rs` → 0 (every other syscall in the tree uses `CString::new`). Tests pass only because short literal argv strings happen to be NUL-followed. Fix: `let c = CString::new(filename)?; libc::mkfifo(c.as_ptr(), …)`.  ✓ **Fixed (Phase 6):** builds a `CString` from the path before `libc::mkfifo` (no more non-NUL-terminated `&str`).
 
 #### Minor
-- [x] **#MF2 — no `<newline>`-in-name guard** (FUTURE DIRECTIONS). [ ] **#MF3 — hardcoded-English diagnostic body** (`:79`).  ✓ **Fixed (Phase 6):** a `<newline>` in the name is rejected. Test: `test_mkfifo_newline_rejected`.
+- [x] **#MF2 — no `<newline>`-in-name guard** (FUTURE DIRECTIONS). [x] **#MF3 — hardcoded-English diagnostic body** (`:79`).  ✓ **Fixed (Phase 6):** a `<newline>` in the name is rejected. Test: `test_mkfifo_newline_rejected`. The diagnostic now carries the `mkfifo:` prefix and a `gettext`-routed body (the errno text is OS-localized).
 
 ### Detailed conformance matrix
 #### OPTIONS
@@ -662,6 +672,8 @@ parents, stopping with an error at the first non-empty parent — **which matche
 on a non-empty parent). The real defects are Minor: the error message names the **operand** path,
 not the parent that actually failed; and the `-p` walk uses lexical `Path::parent()` (mishandles a
 trailing-slash operand and walks toward `/` on absolute paths).
+
+> **Resolved 2026-06-17** (Phase 6, this branch). All rmdir items closed: #RD1 (the `-p` diagnostic names the parent that actually failed), #RD2 (trailing slashes stripped; the `-p` walk stops at `/`, `.`, `..`), #RD3 (i18n). Regression tests in `tree/tests/rmdir/mod.rs`.
 
 ### Priority issues
 #### Minor
@@ -698,6 +710,8 @@ A near-textbook thin wrapper over `link(2)`: exactly two operands, no options, h
 diagnostics to stderr, exit 0/1. Conforms on every golden path. Only nits are i18n and the
 optional `<newline>` FUTURE-DIRECTIONS guard.
 
+> **Resolved 2026-06-17** (Phase 7, this branch). All link items closed: #LK1 (gettext-routed `link:` diagnostic), #LK2 (`<newline>` in the target rejected). Regression tests: `link_create`, `link_already_exists`, `link_missing_operand`.
+
 ### Priority issues
 #### Minor
 - [x] **#LK1 — Diagnostic text hardcoded English** (`tree/link.rs:41`). `setlocale`/`textdomain` initialized but the `link: {} -> {}: {}` message bypasses `gettext`.  ✓ **Fixed (Phase 7):** the diagnostic is routed through `gettext!` (output unchanged, now translatable).
@@ -707,7 +721,7 @@ optional `<newline>` FUTURE-DIRECTIONS guard.
 - [x] OPTIONS "None" — only two positionals (`:18-22`). OPERANDS `file1`/`file2` exactly two required; semantics = `fs::hard_link` ≡ `link(file1,file2)` (no symlink-follow, no truncation). STDIN not used. ASYNCHRONOUS/STDOUT/STDERR/EXIT all CONFORMS (`:26,31-44`).
 
 ### Test coverage signal
-- [x] success + `EEXIST` covered. [ ] missing/extra-operand usage errors; `ENOENT`; directory source — low risk.
+- [x] success + `EEXIST` covered. [x] missing-operand usage error (`link_missing_operand`). `ENOENT`/directory-source paths flow through the same `io::Error` reporting — low risk.
 
 ### Suggested PR groupings
 - **PR "tree-wrapper i18n"**: #LK1 (+ #UN1/#LN4/#RL2). Optional: #LK2.
@@ -725,6 +739,8 @@ Faithful thin wrapper: exactly one operand, no options, exit 0/1. `fs::remove_fi
 for files and refuses directories (as `unlink(2)` would `EISDIR`/`EPERM` anyway), so observationally
 correct. Nits are i18n / strict-syscall-equivalence only.
 
+> **Resolved 2026-06-17** (Phase 7, this branch). All unlink items closed: #UN1 (gettext-routed `unlink:` diagnostic), #UN2 (`libc::unlink` called verbatim, per the spec wording). Regression test: `unlink_removes_symlink_not_target`.
+
 ### Priority issues
 #### Minor
 - [x] **#UN1 — Diagnostic text hardcoded English** (`tree/unlink.rs:39`).  ✓ **Fixed (Phase 7):** the diagnostic is routed through `gettext!`.
@@ -734,7 +750,7 @@ correct. Nits are i18n / strict-syscall-equivalence only.
 - [x] OPTIONS "None"; OPERAND `file` exactly one required; STDIN not used; ASYNCHRONOUS/STDOUT/STDERR/EXIT CONFORMS (`:17-42`).
 
 ### Test coverage signal
-- [x] existing/nonexistent/directory covered. [ ] missing/extra-operand usage; symlink operand (removes the link, not target) — worth a test.
+- [x] existing/nonexistent/directory covered. [x] symlink operand removes the link, not the target (`unlink_removes_symlink_not_target`). Missing/extra-operand handled by clap (required single operand).
 
 ### Suggested PR groupings
 - **PR "tree-wrapper i18n"**: #UN1. Optional/strict: #UN2.
@@ -754,6 +770,8 @@ but **four spec-mandated behaviors are broken or absent** and there is **no test
 operand **count**, not by "does the final operand name an existing directory"; `-L`/`-P` are
 entirely missing; and per-file diagnostics lack the `ln:` prefix and are untranslated.
 
+> **Resolved 2026-06-17** (Phase 8, this branch). All ln items closed: #LN1 (`-f` honored, guarding the same-dirent case), #LN2 (synopsis form chosen by stat-ing the final operand), #LN3 (`-L`/`-P` via `libc::linkat` ± `AT_SYMLINK_FOLLOW`, last-wins), #LN4 (`ln:` prefix + gettext), #LN5 (`Vec<PathBuf>` operands, no `.expect()` panics), #LN6 (`<newline>` guard). New regression module `tree/tests/ln/mod.rs`.
+
 ### Priority issues
 #### Major
 - [x] **#LN1 — `-f` (force) is inert; declared but never used.** `tree/ln.rs:19-20` (field `force`), no use site (`grep -n force tree/ln.rs` → only line 20, the declaration — verified). POSIX `-f`: "Force existing destination pathnames to be removed to allow the link." `ln -f existing src` → `EEXIST`, identical to no `-f`; the unlink-then-link steps are absent. Fix: when the destination exists and `-f` is set, `unlink` it (skipping the "same directory entry"/`ln a a` cases) before linking.  ✓ **Fixed (Phase 8):** `-f` removes an existing destination before linking, refusing the same-file (`ln a a`) case. Tests: `test_ln_force_over_existing`, `test_ln_force_same_file_refused`.
@@ -762,7 +780,7 @@ entirely missing; and per-file diagnostics lack the `ln:` prefix and are untrans
 
 #### Minor
 - [x] **#LN4 — Per-file diagnostics lack the `ln:` prefix and are untranslated** (`tree/ln.rs:68,74` emit `"{} -> {}: {}"`).  ✓ **Fixed (Phase 8):** diagnostics carry the `ln:` prefix and route through `gettext!`.
-- [x] **#LN5 — `.expect()`/`.unwrap()` panic on odd source names** (`:40,42` — `file_name().expect(...)` panics on `..`/trailing-`/`; `to_str().expect(...)` panics on non-UTF-8). [ ] **#LN6 — no `<newline>` guard** (optional).  ✓ **Fixed (Phase 8):** operands are `Vec<PathBuf>` and odd/`None` basenames are handled without `.expect()` panics.
+- [x] **#LN5 — `.expect()`/`.unwrap()` panic on odd source names** (`:40,42` — `file_name().expect(...)` panics on `..`/trailing-`/`; `to_str().expect(...)` panics on non-UTF-8). [x] **#LN6 — no `<newline>` guard** (optional).  ✓ **Fixed (Phase 8):** `path_cstring` rejects a `<newline>` in any operand.  ✓ **Fixed (Phase 8):** operands are `Vec<PathBuf>` and odd/`None` basenames are handled without `.expect()` panics.
 
 ### Detailed conformance matrix
 #### OPTIONS
@@ -775,8 +793,8 @@ entirely missing; and per-file diagnostics lack the `ln:` prefix and are untrans
 
 #### EXTENDED DESCRIPTION (per-source algorithm)
 - [x] Step 1 destination-exists: `-f` unlink + same-file/`ln a a` guard (#LN1).
-- [x] Step 2 `-s`→symlink CONFORMS; [ ] Step 3 symlink-source `-L`/`-P` MISSING (#LN3); [x] Step 4 default hard link CONFORMS (`fs::hard_link`).
-- [x] EXIT 0/`>0`, multi-source loop continues then exits non-zero (`:62-79`) — CONFORMS. [ ] STDERR missing `ln:` prefix (#LN4).
+- [x] Step 2 `-s`→symlink CONFORMS; [x] Step 3 symlink-source `-L`/`-P` implemented via `linkat` (#LN3, Phase 8); [x] Step 4 default hard link CONFORMS.
+- [x] EXIT 0/`>0`, multi-source loop continues then exits non-zero — CONFORMS. [x] STDERR carries the `ln:` prefix (#LN4, Phase 8).
 
 ### Test coverage signal
 **No test module exists** — nothing exercised. Highest priority: add the module + a `-f` test and a target-dir test (both fail today), plus `ln a a`, final-operand-not-a-directory, `-L`/`-P`.
@@ -801,6 +819,8 @@ Minor** because GNU `readlink` is also silent on a non-symlink (verified: both e
 and the load-bearing exit-status half conforms; the code even comments that it matches near-universal
 practice.
 
+> **Resolved 2026-06-17** (Phase 7, this branch). All readlink items closed: #RL1 (the not-a-symlink / error diagnostic is emitted unconditionally — the `!verbose` suppression is dropped), #RL2 (gettext diagnostics). #RL3 keeps `-f`/`-v` as documented non-POSIX extensions. Regression test: `test_readlink_not_symlink_diagnoses`.
+
 ### Priority issues
 #### Minor
 - [x] **#RL1 — "Not a symbolic link" / error diagnostics suppressed unless `-v`.** `tree/readlink.rs:149-153` returns `Err(String::new())` (silent) when `!verbose`; same for `ENOENT`/`EACCES` (`:79-94`). POSIX 113034-113035 says it "shall write a diagnostic message to standard error and exit with non-zero status." Exit status conforms; the message is suppressed. ~~(Proposed Major; demoted — GNU `readlink` is also silent, verified.)~~ Fix (strict): emit the diagnostic unconditionally.  ✓ **Fixed (Phase 7):** the not-a-symlink / error diagnostic is emitted unconditionally (per POSIX); `-v` is now a no-op. Test: `test_readlink_not_symlink_diagnoses`.
@@ -808,7 +828,7 @@ practice.
 - [x] **#RL3 — Non-POSIX `-f`/`-v` extensions on the public surface** (`:27-31`); POSIX defines only `-n`. Documented extensions; no action.  (Kept: `-f`/`-v` are documented GNU/BSD extensions; `-v` is now a no-op after #RL1. No action.)
 
 ### Detailed conformance matrix
-- [x] `-n` suppresses trailing newline (`:67-71`, tested); operand one required; STDIN not used; no symlink-follow (`symlink_metadata`+`read_link`); STDOUT writes link contents (+optional newline); EXIT 0/`>0` — CONFORMS. [ ] STDERR mandated diagnostic suppressed by default (#RL1). Symlink-loop bound at 40 (`-f` extension path) — reasonable.
+- [x] `-n` suppresses trailing newline (`:67-71`, tested); operand one required; STDIN not used; no symlink-follow (`symlink_metadata`+`read_link`); STDOUT writes link contents (+optional newline); EXIT 0/`>0` — CONFORMS. [x] STDERR mandated diagnostic now emitted unconditionally (#RL1, Phase 7). Symlink-loop bound at 40 (`-f` extension path) — reasonable.
 
 ### Test coverage signal
 - [x] default not-a-symlink diagnosis (#RL1) — `test_readlink_not_symlink_diagnoses`.
@@ -891,6 +911,8 @@ ignoring `TZ`/local (`-t 200701011200` under `TZ=America/New_York` lands at `07:
 1** instead of being silent with exit 0. The `-a`/`-m`/`-c`/`-r` wiring and umask-respecting creation
 are otherwise correct. **No test module exists.**
 
+> **Resolved 2026-06-17** (Phase 9, this branch). All touch items closed by a time-model rewrite: #TO1 (`CString` on every libc path call), #TO2/#TO3 (`-d` extended ISO-8601 and `-t` parsed in the local `TZ`), #TO4 (`-c` on a missing file → silent exit 0), #TO5 (`utimensat` with `UTIME_OMIT`/`UTIME_NOW`, sub-second preserved), #TO6/#TO7 (new-file `-a`/`-m` and `-r` corresponding-field via per-field selection), #TO8 (`SS=60` accepted), #TO9 (`touch:` prefix + gettext + errno). New regression module `tree/tests/touch/mod.rs`.
+
 ### Priority issues
 #### Critical
 - [x] **#TO1 — non-NUL-terminated `&str` to `libc::open`/`libc::utimes` (UB).** `tree/touch.rs:133,213` — `libc::open(filename.as_ptr() …)` / `libc::utimes(filename.as_ptr() …)` where `filename: &str` (from `files: Vec<String>`). `grep -c CString tree/touch.rs` → 0. Reads past the slice end → wrong/garbage pathname or OOB read. Fix: `CString::new(filename)?`.  ✓ **Fixed (Phase 9):** all path→libc calls go through `CString` (no non-NUL-terminated `&str`).
@@ -903,7 +925,7 @@ are otherwise correct. **No test module exists.**
 - [x] **#TO6 — new-file creation always sets BOTH times, ignoring `-a`/`-m`.** `tree/touch.rs:130-161` (`touch_file_new`) writes `times[0]=times[1]=time` unconditionally. `touch -a -t <past> newfile` wrongly sets mtime to the past option time instead of "now." Fix: in `touch_file_new`, set only the requested field(s) to `time`, the other to current time.  ✓ **Fixed (Phase 9):** the new-file path sets only the requested field(s) (`UTIME_OMIT` for the other), so `touch -a -t <past> newfile` leaves mtime at the creation time. Test: `test_touch_a_newfile_leaves_mtime_now`.
 
 #### Minor
-- [x] **#TO7 — `-r ref_file` copies only mtime, not the corresponding field** (`:124-128`); `touch -a -r` is wrong. [ ] **#TO8 — `-t` leap-second `SS=60` rejected by `with_ymd_and_hms`** (`:111-117`). [ ] **#TO9 — diagnostics hardcoded English and drop `errno`** (`:135,152,214`).  ✓ **Fixed (Phase 9):** `-r` copies the reference file’s corresponding atime/mtime independently (via `UTIME_OMIT` selection).
+- [x] **#TO7 — `-r ref_file` copies only mtime, not the corresponding field** (`:124-128`); `touch -a -r` is wrong. [x] **#TO8 — `-t` leap-second `SS=60` rejected by `with_ymd_and_hms`** (`:111-117`). [x] **#TO9 — diagnostics hardcoded English and drop `errno`** (`:135,152,214`).  ✓ **Fixed (Phase 9):** `-r` copies the reference file’s corresponding atime/mtime independently (via `UTIME_OMIT` selection); `-t` accepts `SS=60` (clamped to 59 for chrono); diagnostics carry the `touch:` prefix, route parse errors through `gettext`, and include the errno-bearing `io::Error`.
 
 ### Detailed conformance matrix
 #### OPTIONS
@@ -946,6 +968,8 @@ the 6-month recent/old date decision is keyed off **mtime even under `-c`/`-u`**
 alternate-access `+` flag is never emitted; and `-q` is not `LC_CTYPE`-driven. The infinite-loop
 detector works.
 
+> **Resolved 2026-06-17** (Phases 1–3, this branch). All ls items closed: #LS1/#LS2 (the `-l`-on-symlink panics are fixed via a shared `readlinkat` helper), #LS10 (socket type char `s` / `-F` `=`), #LS3 (collation-aware sort via `plib::locale::strcoll`), #LS4/#LS7/#LS8/#LS9 (recent/old date branch on the displayed time + `strftime`/`LC_TIME`/`%e`), #LS5 (ACL `+` flag via `getxattr`), #LS6 (`isprint` + TTY-default `-q` via `isatty`), #LS11 (numeric owner/group fallback), #LS12 (`wcwidth` column widths), #LS13 (default block units). Regression tests in `tree/tests/ls/mod.rs`.
+
 ### Priority issues
 #### Critical
 - [x] **#LS1 — `ls -l` on a command-line symlink panics.** `tree/ls.rs:916`: `buf.shrink_to(num_bytes)` (capacity, not length) left `buf.len()==PATH_MAX` of trailing NULs, so `CString::from_vec_with_nul(buf).unwrap()` hit `InteriorNul` and aborted. ✓ **Fixed (Phase 1):** a shared `read_link_target(dir_fd, name)` helper `truncate`s to the byte count and uses `ls_from_utf8_lossy`; a failed readlink now omits the target rather than erroring. Test: `test_ls_l_symlink_no_panic`.
@@ -986,15 +1010,15 @@ detector works.
 | `TZ` | CONFORMS | chrono `Local`. |
 
 #### EXTENDED DESCRIPTION — long format
-- [x] type char `d b c l p` + rwx triads + setuid/setgid/sticky case rules — CONFORMS (`entry.rs:583-655`), **except** socket → `-` (#LS10); [ ] trailing alternate-access flag never written (#LS5).
-- [x] nlink/owner/group/size — CONFORMS, [ ] except owner/group numeric-fallback on lookup failure (#LS11).
+- [x] type char `d b c l p` + rwx triads + setuid/setgid/sticky case rules — CONFORMS (`entry.rs:583-655`), **except** socket → `-` (#LS10, fixed Phase 1); [x] trailing alternate-access `+` flag written via ACL probe (#LS5, Phase 3).
+- [x] nlink/owner/group/size — CONFORMS, [x] owner/group fall back to the numeric id on lookup failure (#LS11, Phase 3).
 - [x] date-time: now `%b %e %H:%M` / `%b %e  %Y` via `strftime` (LC_TIME), recency keyed on the displayed time, precise 6-month window (#LS4/#LS7/#LS8/#LS9 fixed Phase 2).
 - [x] symlink `-> target`: no longer panics (#LS1/#LS2 fixed Phase 1); the `@` suffix is emitted by `-F`. (The `-L -l` resolved-file type indicator remains an unspecified-format nicety, not a numbered finding.)
 - [x] `total <blocks>` in 512-byte units (1024 w/ `-k`), dirs only, before entries — CONFORMS.
 - [x] multi-column: `COLUMNS`/ioctl/80; constant column width; filenames never truncated; O(n²) guard at 1000 — CONFORMS (#LS12 width caveat).
 
 #### Other
-- [x] no-operand → `.`; non-dir operands first (sorted separately); missing file → stderr + exit ≥1; STDIN not used; directory header `\n%s:\n` (omitted for a single operand); diagnostics to stderr — CONFORMS. [ ] operand sort itself byte-order (#LS3). EXIT 0/`>0` (loop → 2, conformant); panics (#LS1/#LS2) bypass exit status entirely.
+- [x] no-operand → `.`; non-dir operands first (sorted separately); missing file → stderr + exit ≥1; STDIN not used; directory header `\n%s:\n` (omitted for a single operand); diagnostics to stderr — CONFORMS. [x] operand sort now collation-aware (#LS3, Phase 2). EXIT 0/`>0` (loop → 2, conformant); panics (#LS1/#LS2) bypass exit status entirely.
 
 ### Test coverage signal
 - [x] `ls -l` on a symlink (command-line + in-directory) — `test_ls_l_symlink_no_panic` (#LS1/#LS2).
@@ -1034,5 +1058,15 @@ counted). **Demoted to Minor:** readlink silent-on-non-symlink (GNU parity), du 
 
 **Cross-cutting fixes that would close the most findings:** (1) the shared abort-latch→continue-flag
 refactor (#CM1/#CO1/#CG1/#DU1); (2) `CString`-terminate every `libc` path call (#MF1/#TO1, and audit
-the rest); (3) a shared `ln`/`-m`/time-parsing correctness pass. **No README "Stage" promotion** — these
-13 remain pre-remediation; cp/mv/rm are still the only Stage-6 utilities.
+the rest); (3) a shared `ln`/`-m`/time-parsing correctness pass.
+
+> **Resolved 2026-06-17** (Phases 1–11, branch `tree-audit`). Every Part II finding across all 13
+> utilities is now fixed and ticked (the only open boxes are non-actionable: the `du -x`
+> cross-device case needs a real mount point, and the legend line). The remediation reused existing
+> infrastructure only — `plib::locale` (`strcoll`/`isprint`/`strftime`), `plib::modestr`,
+> `chrono::Local` (TZ via the already-enabled `clock` feature), and `libc`
+> (`utimensat`/`getxattr`/`isatty`/`wcwidth`/`linkat`) — **no new external dependency**. New
+> regression coverage: `tree/tests/ln/mod.rs` and `tree/tests/touch/mod.rs` (new modules), plus
+> additions to the `ls`/`chmod`/`chown`/`chgrp`/`mkdir`/`mkfifo`/`rmdir`/`du`/`link`/`unlink`
+> suites. All 13 are promoted to README **Stage 6 — Audited**, joining cp/mv/rm. Per-utility
+> "Resolved 2026-06-17" blockquotes appear in each section above.

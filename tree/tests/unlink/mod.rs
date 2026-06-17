@@ -85,3 +85,28 @@ fn unlink_remove_directory() {
     // Clean up
     fs::remove_dir_all(dir_path).expect("Unable to remove test directory");
 }
+
+// Audit coverage: unlink removes the symbolic link itself, never the file it points to.
+#[test]
+fn unlink_removes_symlink_not_target() {
+    let temp_dir = tempdir().expect("Unable to create temporary directory");
+    let target = temp_dir.path().join("target.txt");
+    let link = temp_dir.path().join("link");
+
+    fs::write(&target, b"data").expect("Unable to create target file");
+    std::os::unix::fs::symlink(&target, &link).expect("Unable to create symlink");
+
+    let test_plan = TestPlan {
+        cmd: String::from("unlink"),
+        args: vec![link.to_str().unwrap().into()],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    };
+
+    run_test(test_plan);
+
+    assert!(!link.exists(), "the symbolic link itself should be removed");
+    assert!(target.exists(), "the symlink target must be left untouched");
+}

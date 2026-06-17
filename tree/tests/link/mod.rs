@@ -136,3 +136,26 @@ fn link_already_exists() {
     let _ = fs::remove_file(&source_path);
     let _ = fs::remove_file(&target_path);
 }
+
+// Audit coverage: a missing second operand is a clean usage error (clap), not a panic; exit != 0.
+#[test]
+fn link_missing_operand() {
+    run_test_with_checker(
+        TestPlan {
+            cmd: "link".to_string(),
+            args: vec!["only-one-operand".to_string()],
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 2,
+        },
+        |_, output| {
+            assert_eq!(output.status.code(), Some(2), "usage error exit status");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("error:") || stderr.contains("Usage"),
+                "expected a usage diagnostic: {stderr}"
+            );
+        },
+    );
+}

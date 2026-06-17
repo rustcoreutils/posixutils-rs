@@ -83,6 +83,33 @@ fn test_ln_force_same_file_refused() {
     fs::remove_dir_all(&d).unwrap();
 }
 
+// Audit #LN1/#LN3: `ln -f -L <symlink-to-X> X` must compare the *referent* (which -L hard-links)
+// against the destination, so the same-file guard fires and X is not unlinked.
+#[test]
+fn test_ln_force_logical_same_file_refused() {
+    let d = dir("test_ln_force_logical_same_file_refused");
+    let target = format!("{d}/target");
+    let sym = format!("{d}/sym");
+    fs::write(&target, b"keep").unwrap();
+    std::os::unix::fs::symlink("target", &sym).unwrap();
+
+    // Source is the symlink, dest is its referent; with -L the referent would be hard-linked onto
+    // itself. The same-file check must refuse this and leave `target` intact.
+    let out = run_ln(&["-f", "-L", &sym, &target]);
+    assert!(
+        !out.status.success(),
+        "ln -f -L onto the referent must fail"
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("same file"));
+    assert!(
+        Path::new(&target).exists(),
+        "the referent must be preserved"
+    );
+    assert_eq!(fs::read(&target).unwrap(), b"keep");
+
+    fs::remove_dir_all(&d).unwrap();
+}
+
 // Audit #LN2: with an existing-directory final operand, sources are linked into it.
 #[test]
 fn test_ln_into_directory() {

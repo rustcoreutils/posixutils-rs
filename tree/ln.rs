@@ -54,7 +54,15 @@ fn make_link(args: &Args, source: &Path, dest: &Path) -> io::Result<()> {
     // that would destroy the only copy (`ln a a`, or hard links to the same file).
     if args.force {
         if let Ok(dest_md) = std::fs::symlink_metadata(dest) {
-            if let Ok(src_md) = std::fs::symlink_metadata(source) {
+            // With -L (and not -s) the referent of a symbolic-link source is hard-linked, so compare
+            // the referent — not the link itself — against the destination. Otherwise `ln -f -L`
+            // could unlink the only copy of the destination before linking.
+            let src_md = if !args.symlink && args.logical {
+                std::fs::metadata(source)
+            } else {
+                std::fs::symlink_metadata(source)
+            };
+            if let Ok(src_md) = src_md {
                 if src_md.dev() == dest_md.dev() && src_md.ino() == dest_md.ino() {
                     return Err(io::Error::other(gettext!(
                         "'{}' and '{}' are the same file",

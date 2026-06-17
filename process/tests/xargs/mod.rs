@@ -230,17 +230,67 @@ fn xargs_mixed_quotes() {
     );
 }
 
+// #X1: POSIX requires the utility to run exactly once on empty input when -r
+// is not given. With `echo` and no args, that produces a single blank line.
 #[test]
-fn xargs_empty_input() {
-    // Empty input should not execute the utility
+fn xargs_empty_input_runs_once() {
     run_test(TestPlan {
         cmd: String::from("xargs"),
         args: vec!["echo".to_string()],
+        stdin_data: String::from(""),
+        expected_out: String::from("\n"),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}
+
+// #X1: -r (--no-run-if-empty) suppresses the run on empty input.
+#[test]
+fn xargs_empty_input_no_run_if_empty() {
+    run_test(TestPlan {
+        cmd: String::from("xargs"),
+        args: vec!["-r".to_string(), "echo".to_string()],
         stdin_data: String::from(""),
         expected_out: String::from(""),
         expected_err: String::from(""),
         expected_exit_code: 0,
     });
+}
+
+// #X1: blank-only input is also "no arguments" -> one run without -r.
+#[test]
+fn xargs_blank_input_runs_once() {
+    xargs_test("   \n  \n", "\n", vec!["echo"]);
+}
+
+// #X2: a multibyte UTF-8 argument must survive intact (was mangled to "Ã©"
+// by the per-byte `as char` cast).
+#[test]
+fn xargs_utf8_argument() {
+    xargs_test("é\n", "é\n", vec!["echo"]);
+}
+
+#[test]
+fn xargs_utf8_multiple() {
+    xargs_test("café naïve\n", "café naïve\n", vec!["echo"]);
+}
+
+// #X3: a newline inside a quoted string is an error (exit non-zero).
+#[test]
+fn xargs_newline_in_quote_errors() {
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("xargs"),
+            args: vec!["echo".to_string()],
+            stdin_data: String::from("\"unterminated\n more\""),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 1,
+        },
+        |_, output| {
+            assert_eq!(output.status.code(), Some(1));
+        },
+    );
 }
 
 #[test]
@@ -473,12 +523,13 @@ fn xargs_multiple_batch_verification() {
 
 #[test]
 fn xargs_whitespace_only_input() {
-    // Input with only whitespace should not invoke utility
+    // #X1: whitespace-only input yields no arguments, so POSIX runs the
+    // utility exactly once (without -r). With echo that is one blank line.
     run_test(TestPlan {
         cmd: String::from("xargs"),
         args: vec!["echo".to_string()],
         stdin_data: String::from("   \n\t\n  \t  \n"),
-        expected_out: String::from(""),
+        expected_out: String::from("\n"),
         expected_err: String::from(""),
         expected_exit_code: 0,
     });

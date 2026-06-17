@@ -15,14 +15,13 @@ use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, ExitStatus, Stdio};
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::BUFSZ;
+use gettextrs::gettext;
+use plib::{diag, BUFSZ};
 
 const FALLBACK_ARG_MAX: usize = 131072;
 // POSIX requires at least 255 bytes for -I constructed arguments
 // We use a higher limit for better usability
 const INSERT_ARG_MAX: usize = 4096;
-const ERR_ARG_TOO_LONG: &str = "xargs: argument line too long";
 
 fn get_arg_max() -> usize {
     let result = unsafe { libc::sysconf(libc::_SC_ARG_MAX) };
@@ -92,6 +91,13 @@ struct Args {
     #[arg(short, long, help = gettext("Prompt mode: ask before executing each command"))]
     prompt: bool,
 
+    #[arg(
+        short = 'r',
+        long = "no-run-if-empty",
+        help = gettext("Do not run the utility if standard input yields no arguments")
+    )]
+    no_run_if_empty: bool,
+
     #[arg(short, long, help = gettext("Trace mode: print each command before execution"))]
     trace: bool,
 
@@ -129,19 +135,20 @@ enum ExecResult {
 
 /// Prompt user for confirmation. Returns true if user confirms.
 fn prompt_confirm(util: &str, util_args: &[String]) -> io::Result<bool> {
-    // Write command and prompt to stderr
+    // Write command and prompt to stderr.
     eprint!("{} {}?...", util, util_args.join(" "));
     io::stderr().flush()?;
 
-    // Read response from /dev/tty
+    // Read response from /dev/tty (not stdin, which carries the argument list).
     let tty = File::open("/dev/tty")?;
     let mut reader = BufReader::new(tty);
     let mut response = String::new();
     reader.read_line(&mut response)?;
 
-    // Check for affirmative response (starts with 'y' or 'Y')
-    let trimmed = response.trim();
-    Ok(trimmed.starts_with('y') || trimmed.starts_with('Y'))
+    // Affirmative per the locale's LC_MESSAGES yesexpr (falls back to y/Y).
+    Ok(plib::locale::is_affirmative(
+        response.trim_end_matches(['\r', '\n']),
+    ))
 }
 
 /// Execute the utility with the given arguments
@@ -177,10 +184,14 @@ fn exec_util(
         }
         Err(e) => {
             if e.kind() == io::ErrorKind::NotFound {
-                eprintln!("xargs: {}: No such file or directory", util);
+                diag::error(&format!(
+                    "{}: {}",
+                    util,
+                    gettext("No such file or directory")
+                ));
                 Ok(ExecResult::NotFound)
             } else {
-                eprintln!("xargs: {}: {}", util, e);
+                diag::error(&format!("{}: {}", util, e));
                 Ok(ExecResult::CannotInvoke)
             }
         }
@@ -211,6 +222,12 @@ struct ParseState {
     quote_char: char,
     skip_remainder: bool,
     null_slop: Vec<u8>,
+    // Incomplete trailing UTF-8 bytes carried across read() boundaries.
+    pending: Vec<u8>,
+    // Set when a <newline> appears inside a quoted string (an error per POSIX:
+    // a quoted string is "non-<quote> non-<newline> characters") or a quote is
+    // left unterminated at end of input.
+    unmatched_quote: bool,
 
     // line mode state
     line_count: usize, // number of complete non-empty lines seen
@@ -246,6 +263,8 @@ impl ParseState {
             quote_char: '"',
             skip_remainder: false,
             null_slop: Vec::new(),
+            pending: Vec::new(),
+            unmatched_quote: false,
             line_count: 0,
             max_lines: args.lines,
             line_continues: false,
@@ -324,6 +343,58 @@ impl ParseState {
         ret
     }
 
+    /// Decode a freshly-read byte chunk into a `String`, prepending any
+    /// incomplete UTF-8 sequence carried over from the previous read and
+    /// stashing a new incomplete trailing sequence for the next read. An
+    /// invalid byte sequence in the middle is replaced with U+FFFD. This keeps
+    /// multibyte characters intact instead of mangling each byte via `as char`.
+    fn decode_chunk(&mut self, buf: &[u8]) -> String {
+        let mut bytes = mem::take(&mut self.pending);
+        bytes.extend_from_slice(buf);
+
+        let mut out = String::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            match std::str::from_utf8(&bytes[i..]) {
+                Ok(s) => {
+                    out.push_str(s);
+                    i = bytes.len();
+                }
+                Err(e) => {
+                    let valid = e.valid_up_to();
+                    if valid > 0 {
+                        out.push_str(unsafe {
+                            std::str::from_utf8_unchecked(&bytes[i..i + valid])
+                        });
+                        i += valid;
+                    }
+                    match e.error_len() {
+                        Some(n) => {
+                            out.push('\u{FFFD}');
+                            i += n;
+                        }
+                        None => {
+                            // Incomplete trailing sequence: keep for next read.
+                            self.pending = bytes[i..].to_vec();
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Decode any leftover pending bytes at end-of-input, lossily (there is no
+    /// more data to complete a truncated sequence).
+    fn take_pending_lossy(&mut self) -> String {
+        if self.pending.is_empty() {
+            String::new()
+        } else {
+            String::from_utf8_lossy(&mem::take(&mut self.pending)).to_string()
+        }
+    }
+
     // args are null-separated, without any further processing.
     // if the input data crosses a null boundary, the remainder is
     // stored as state for the next call to parse_buf_null.
@@ -356,22 +427,24 @@ impl ParseState {
         }
     }
 
-    fn parse_buf(&mut self, buf: &[u8]) {
+    fn parse_buf(&mut self, text: &str) {
         if self.skip_remainder {
             return;
         }
 
         let mut prev_was_blank = false;
 
-        for &c8 in buf {
-            let ch = c8 as char;
-
+        for ch in text.chars() {
             if self.in_quote {
                 if ch == self.quote_char {
                     self.in_quote = false;
                     self.in_arg = false;
                     self.args.push_back(mem::take(&mut self.tmp_arg));
                     self.line_has_content = true;
+                } else if ch == '\n' {
+                    // A <newline> inside a quoted string is not permitted.
+                    self.unmatched_quote = true;
+                    return;
                 } else {
                     self.tmp_arg.push(ch);
                 }
@@ -441,16 +514,14 @@ impl ParseState {
         }
     }
 
-    /// Parse buffer for -I insert mode: lines are separated only by newlines,
+    /// Parse text for -I insert mode: lines are separated only by newlines,
     /// blanks are preserved within arguments
-    fn parse_buf_insert(&mut self, buf: &[u8]) {
+    fn parse_buf_insert(&mut self, text: &str) {
         if self.skip_remainder {
             return;
         }
 
-        for &c8 in buf {
-            let ch = c8 as char;
-
+        for ch in text.chars() {
             if self.in_escape {
                 self.in_escape = false;
                 if ch == '\n' {
@@ -474,6 +545,11 @@ impl ParseState {
     }
 
     fn parse_finalize(&mut self) {
+        if self.in_quote {
+            // Input ended with an open quote.
+            self.unmatched_quote = true;
+        }
+
         if self.in_arg {
             self.in_arg = false;
             self.args.push_back(mem::take(&mut self.tmp_arg));
@@ -526,12 +602,13 @@ fn exec_insert_mode(
         .collect();
 
     // POSIX: Check that constructed arguments don't exceed the limit
-    // POSIX requires at least 255 bytes, we use INSERT_ARG_MAX (4096)
+    // POSIX requires at least 255 bytes, we use INSERT_ARG_MAX (4096).
+    // Message has no "xargs: " prefix; the caller routes it through diag.
     if let Some(arg) = util_args.iter().find(|arg| arg.len() > INSERT_ARG_MAX) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "xargs: constructed argument of {} bytes exceeds {} byte limit in insert mode",
+                "constructed argument of {} bytes exceeds {} byte limit in insert mode",
                 arg.len(),
                 INSERT_ARG_MAX
             ),
@@ -563,9 +640,25 @@ macro_rules! handle_exec_result {
     };
 }
 
+/// Emit the "argument line too long" diagnostic.
+fn err_arg_too_long() {
+    diag::error(&gettext("argument line too long"));
+}
+
+/// If parsing flagged an unterminated/invalid quote, report and return true.
+fn check_quote_error(state: &ParseState) -> bool {
+    if state.unmatched_quote {
+        diag::error(&gettext("unterminated quote"));
+        true
+    } else {
+        false
+    }
+}
+
 fn read_and_spawn(args: &Args) -> io::Result<i32> {
     let mut state = ParseState::new(args);
     let mut any_failed = false;
+    let mut invoked = false;
     let trace = args.trace || args.prompt; // -p implies -t
     let insert_mode = args.replstr.is_some();
     let line_mode = args.lines.is_some();
@@ -580,13 +673,16 @@ fn read_and_spawn(args: &Args) -> io::Result<i32> {
 
             // Parse the line (add newline since BufReader strips it)
             let line_with_nl = format!("{}\n", line);
-            state.parse_buf(line_with_nl.as_bytes());
+            state.parse_buf(&line_with_nl);
+            if check_quote_error(&state) {
+                return Ok(1);
+            }
             state.postprocess(args);
 
             // Check if we have enough lines to execute
             while state.full() && !state.args.is_empty() {
                 if state.exit_on_overflow && state.arg_too_large(&state.args[0]) {
-                    eprintln!("{}", ERR_ARG_TOO_LONG);
+                    err_arg_too_long();
                     return Ok(1);
                 }
 
@@ -597,6 +693,7 @@ fn read_and_spawn(args: &Args) -> io::Result<i32> {
                 }
                 util_args.extend(batch);
 
+                invoked = true;
                 let result = exec_util(&args.util, util_args, trace, args.prompt)?;
                 handle_exec_result!(result, any_failed);
             }
@@ -614,9 +711,15 @@ fn read_and_spawn(args: &Args) -> io::Result<i32> {
             if args.null_mode {
                 state.parse_buf_null(&buffer[..n_read]);
             } else if insert_mode {
-                state.parse_buf_insert(&buffer[..n_read]);
+                let text = state.decode_chunk(&buffer[..n_read]);
+                state.parse_buf_insert(&text);
+                state.postprocess(args);
             } else {
-                state.parse_buf(&buffer[..n_read]);
+                let text = state.decode_chunk(&buffer[..n_read]);
+                state.parse_buf(&text);
+                if check_quote_error(&state) {
+                    return Ok(1);
+                }
                 state.postprocess(args);
             }
 
@@ -627,10 +730,11 @@ fn read_and_spawn(args: &Args) -> io::Result<i32> {
                     let input_arg = state.args.pop_front().unwrap();
 
                     if state.exit_on_overflow && state.arg_too_large(&input_arg) {
-                        eprintln!("{}", ERR_ARG_TOO_LONG);
+                        err_arg_too_long();
                         return Ok(1);
                     }
 
+                    invoked = true;
                     let result = exec_insert_mode(args, replstr, &input_arg, trace, args.prompt)?;
                     handle_exec_result!(result, any_failed);
                 }
@@ -641,27 +745,44 @@ fn read_and_spawn(args: &Args) -> io::Result<i32> {
                         && !state.args.is_empty()
                         && state.arg_too_large(&state.args[0])
                     {
-                        eprintln!("{}", ERR_ARG_TOO_LONG);
+                        err_arg_too_long();
                         return Ok(1);
                     }
 
                     let mut util_args = args.util_args.clone();
                     let batch = state.remove_args();
                     if batch.is_empty() && state.exit_on_overflow {
-                        eprintln!("{}", ERR_ARG_TOO_LONG);
+                        err_arg_too_long();
                         return Ok(1);
                     }
                     util_args.extend(batch);
 
+                    invoked = true;
                     let result = exec_util(&args.util, util_args, trace, args.prompt)?;
                     handle_exec_result!(result, any_failed);
                 }
+            }
+        }
+
+        // Flush any incomplete trailing bytes (lossily) before finalizing.
+        let leftover = state.take_pending_lossy();
+        if !leftover.is_empty() {
+            if insert_mode {
+                state.parse_buf_insert(&leftover);
+            } else {
+                state.parse_buf(&leftover);
             }
         }
     }
 
     // finalize parsing
     state.parse_finalize();
+    if check_quote_error(&state) {
+        return Ok(1);
+    }
+    if !line_mode {
+        state.postprocess(args);
+    }
 
     // Handle remaining arguments
     if insert_mode {
@@ -670,10 +791,11 @@ fn read_and_spawn(args: &Args) -> io::Result<i32> {
             let input_arg = state.args.pop_front().unwrap();
 
             if state.exit_on_overflow && state.arg_too_large(&input_arg) {
-                eprintln!("{}", ERR_ARG_TOO_LONG);
+                err_arg_too_long();
                 return Ok(1);
             }
 
+            invoked = true;
             let result = exec_insert_mode(args, replstr, &input_arg, trace, args.prompt)?;
             handle_exec_result!(result, any_failed);
         }
@@ -681,21 +803,34 @@ fn read_and_spawn(args: &Args) -> io::Result<i32> {
         let mut util_args = args.util_args.clone();
         util_args.extend(state.remove_args());
 
+        invoked = true;
         let result = exec_util(&args.util, util_args, trace, args.prompt)?;
+        handle_exec_result!(result, any_failed);
+    }
+
+    // POSIX: if standard input yields no arguments, the utility shall be
+    // executed exactly once unless -r (--no-run-if-empty) was given. (Insert
+    // mode substitutes per input line, so an empty input means zero runs.)
+    if !invoked && !insert_mode && !args.no_run_if_empty {
+        let result = exec_util(&args.util, args.util_args.clone(), trace, args.prompt)?;
         handle_exec_result!(result, any_failed);
     }
 
     Ok(if any_failed { 1 } else { 0 })
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+fn main() {
+    diag::init_locale("xargs");
 
     let args = Args::parse();
 
-    let exit_code = read_and_spawn(&args)?;
+    let exit_code = match read_and_spawn(&args) {
+        Ok(code) => code,
+        Err(e) => {
+            diag::error(&e.to_string());
+            1
+        }
+    };
 
     std::process::exit(exit_code);
 }

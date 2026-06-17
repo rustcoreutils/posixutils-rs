@@ -561,7 +561,7 @@ byte-to-`char` cast in the word-splitter corrupts multibyte UTF-8 arguments.
 ### Priority issues
 
 #### Critical
-- [ ] **`#X1` — `-r` missing; empty input invokes 0× (POSIX: exactly 1×).**
+- [x] **`#X1` — `-r` missing; empty input invokes 0× (POSIX: exactly 1×).** ✓ fixed in Phase 6.
   `xargs.rs` (no `-r` field) + `xargs.rs:680` (`else if !state.args.is_empty()`).
   Spec (slice 123180-123182): "If no arguments are supplied on standard input,
   the utility … shall be executed **exactly once** if the −r option is not
@@ -571,20 +571,20 @@ byte-to-`char` cast in the word-splitter corrupts multibyte UTF-8 arguments.
   (Test `xargs_empty_input` currently encodes the wrong expectation.)
 
 #### Major
-- [ ] **`#X2` — `c8 as char` corrupts multibyte UTF-8.** `xargs.rs:367,452`.
+- [x] **`#X2` — `c8 as char` corrupts multibyte UTF-8.** ✓ fixed in Phase 6. `xargs.rs:367,452`.
   Casting a `u8` ≥ 0x80 to `char` yields the Latin-1 scalar, not the decoded
   multibyte codepoint, so `é` (0xC3 0xA9) becomes two wrong chars. POSIX requires
   `LC_CTYPE`-aware splitting. Fix: decode buffers via `str::from_utf8`/`chars()`.
-- [ ] **`#X3` — newline inside quotes silently accepted.** `xargs.rs:369-378`.
+- [x] **`#X3` — newline inside quotes silently accepted.** ✓ fixed in Phase 6. `xargs.rs:369-378`.
   Spec allows only "non-double-quote non-`<newline>`" chars inside double-quotes
   (likewise single). A quoted newline falls through to the generic push instead
   of erroring. Fix: error on `in_quote && ch == '\n'`.
-- [ ] **`#X4` — `-E` EOF string ignored in `-I` insert mode.**
+- [x] **`#X4` — `-E` EOF string ignored in `-I` insert mode.** ✓ fixed in Phase 6.
   `xargs.rs:616-620` — `postprocess` (the `eofstr` check) runs only on the
   non-insert path. Fix: apply the EOF check in insert mode too.
 
 #### Minor
-- [ ] **`#X5` — `-p` prompt format.** `xargs.rs:133` fuses command + `?...` in
+- [x] **`#X5` — `-p` prompt format.** ✓ fixed in Phase 6. `xargs.rs:133` fuses command + `?...` in
   one `eprint!`; the affirmative test is ASCII `y`/`Y` rather than the locale
   `yesexpr`. (`/dev/tty` read at `xargs.rs:137` is correct.)
 - [ ] **`#C1` — error strings at `xargs.rs:25,180,183,534` not gettext-wrapped.**

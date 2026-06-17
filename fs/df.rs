@@ -269,13 +269,18 @@ fn scale_blocks(count: u64, bsize: u64, unit: u64) -> u64 {
 /// matching the spec's `<space free>` figure — NOT total free space
 /// (`f_bfree`), so reserved blocks are excluded from the denominator (audit
 /// #4). A zero denominator (e.g. a zero-block pseudo-filesystem) yields 0
-/// rather than a NaN (audit #11).
+/// rather than dividing by zero (audit #11).
 fn capacity_percent(used: u64, avail: u64) -> u32 {
-    let denom = used + avail;
+    let denom = used as u128 + avail as u128;
     if denom == 0 {
         return 0;
     }
-    ((used as f64 / denom as f64) * 100.0).ceil() as u32
+    // Ceiling division rounds any fractional percentage up to the next integer,
+    // implementing the POSIX rule exactly. 128-bit integer math keeps both the
+    // sum and the `used * 100` product overflow-free and avoids f64 precision
+    // loss on very large figures. `used <= denom`, so the result never exceeds
+    // 100 and fits a u32.
+    (used as u128 * 100).div_ceil(denom) as u32
 }
 
 struct Mount {

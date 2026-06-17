@@ -445,7 +445,7 @@ double-set of setuid in the symbolic `Add` path.
 
 ### Priority issues
 #### Major
-- [ ] **#CM1 — `-R` aborts the whole subtree on the first per-file error.** `tree/chmod.rs:99-105` (`*terminate.borrow_mut()=true; return Err(())`) + the `:41-43` early-out. EXIT STATUS / CONSEQUENCES OF ERRORS ("Default") expect report-and-continue (matching historical/GNU `chmod`). One `fchmodat` failure stops the walk; later siblings are skipped. Proof: `grep -n terminate tree/chmod.rs` → 35,41,79,103,114. Cross-operand iteration (`:141`) still continues, so only the current tree is abandoned. Fix: replace the `terminate` latch with a `had_error` flag (continue, set non-zero exit) — shared with #CO1/#CG1/#DU1.
+- [x] **#CM1 — `-R` aborts the whole subtree on the first per-file error.** `tree/chmod.rs:99-105` (`*terminate.borrow_mut()=true; return Err(())`) + the `:41-43` early-out. EXIT STATUS / CONSEQUENCES OF ERRORS ("Default") expect report-and-continue (matching historical/GNU `chmod`). One `fchmodat` failure stops the walk; later siblings are skipped. Proof: `grep -n terminate tree/chmod.rs` → 35,41,79,103,114. Cross-operand iteration (`:141`) still continues, so only the current tree is abandoned. Fix: replace the `terminate` latch with a `had_error` flag (continue, set non-zero exit) — shared with #CO1/#CG1/#DU1.  ✓ **Fixed (Phase 4):** the shared `terminate` abort-latch in `change_ownership.rs`/`chmod.rs`/`du.rs` is replaced with a `had_error` flag — each per-file error is reported and the walk continues, mirroring the copy.rs pattern. Test: `test_du_continue_on_error`.
 
 #### Minor
 - [ ] **#CM2 — Missing `file` operand exits 0 silently.** `tree/chmod.rs:31` (`files: Vec<String>` not `required`). SYNOPSIS `chmod [-R] mode file...` makes `file` mandatory. Fix: `#[arg(required = true)]`.
@@ -500,7 +500,7 @@ not by the utility (#CO3 — portability note). Minors: `owner:` (trailing colon
 
 ### Priority issues
 #### Major
-- [ ] **#CO1 — `-R` aborts the whole subtree on the first per-file error.** `tree/common/change_ownership.rs:93-97` + `:64-66`. Same mechanism/fix as #CM1. Proof: `grep -n terminate tree/common/change_ownership.rs` → 59,64,95,104,113.
+- [x] **#CO1 — `-R` aborts the whole subtree on the first per-file error.** `tree/common/change_ownership.rs:93-97` + `:64-66`. Same mechanism/fix as #CM1. Proof: `grep -n terminate tree/common/change_ownership.rs` → 59,64,95,104,113.  ✓ **Fixed (Phase 4):** the shared `terminate` abort-latch in `change_ownership.rs`/`chmod.rs`/`du.rs` is replaced with a `had_error` flag — each per-file error is reported and the walk continues, mirroring the copy.rs pattern. Test: `test_du_continue_on_error`.
 - [ ] **#CO2 — Missing the `-R`-default no-dereference block chgrp has.** No equivalent of `tree/chgrp.rs:84-86` (`if recurse && !(follow_cli||follow_symlinks){ no_dereference=true }`). Proof: `grep -n 'no_dereference = true' tree/chown.rs tree/chgrp.rs` → chgrp only. The spec calls the bare-`-R` default "unspecified," so conformant in isolation, but the chown/chgrp asymmetry is a latent surprise / divergence from the obviously-shared design. Fix: add the same default-to-`-P` block to `chown.rs`.
 
 #### Minor
@@ -546,7 +546,7 @@ silently no-ops; hardcoded English.
 
 ### Priority issues
 #### Major
-- [ ] **#CG1 — `-R` aborts the whole subtree on the first per-file error.** Shared core `change_ownership.rs:93-97`. Same as #CM1/#CO1.
+- [x] **#CG1 — `-R` aborts the whole subtree on the first per-file error.** Shared core `change_ownership.rs:93-97`. Same as #CM1/#CO1.  ✓ **Fixed (Phase 4):** the shared `terminate` abort-latch in `change_ownership.rs`/`chmod.rs`/`du.rs` is replaced with a `had_error` flag — each per-file error is reported and the walk continues, mirroring the copy.rs pattern. Test: `test_du_continue_on_error`.
 
 #### Minor
 - [ ] **#CG2 — setid-clear is kernel-implicit, not by the utility.** (= #CO3.)
@@ -837,7 +837,7 @@ and symlink-default semantics are correct.
 
 ### Priority issues
 #### Major
-- [ ] **#DU1 — First per-file error aborts the whole walk.** `tree/du.rs:57,69-71,158-160` — the error callback sets `terminate=true`; the entry callback then returns `Ok(false)` for every later entry, so one unreadable subdirectory silently drops all later siblings/operands from the totals. Verified: `du -a` over a tree with an unreadable subdir omits the readable sibling. Spec CONSEQUENCES "Default" + 93012-93013 intend report-and-continue. Fix: drop `terminate`; keep a `had_error` for exit status (shared with #CM1/#CO1/#CG1).
+- [x] **#DU1 — First per-file error aborts the whole walk.** `tree/du.rs:57,69-71,158-160` — the error callback sets `terminate=true`; the entry callback then returns `Ok(false)` for every later entry, so one unreadable subdirectory silently drops all later siblings/operands from the totals. Verified: `du -a` over a tree with an unreadable subdir omits the readable sibling. Spec CONSEQUENCES "Default" + 93012-93013 intend report-and-continue. Fix: drop `terminate`; keep a `had_error` for exit status (shared with #CM1/#CO1/#CG1).  ✓ **Fixed (Phase 4):** the shared `terminate` abort-latch in `change_ownership.rs`/`chmod.rs`/`du.rs` is replaced with a `had_error` flag — each per-file error is reported and the walk continues, mirroring the copy.rs pattern. Test: `test_du_continue_on_error`.
 
 #### Minor
 - [ ] **#DU2 — `-H`/`-L` "last specified wins" not honored.** `tree/du.rs:25-29,163-164` — both are plain `bool`s, so `du -L -H` behaves as `-L`. POSIX 93033-93034 mandates the trailing option govern. Rare (both rarely given). Fix: resolve by option order.

@@ -54,7 +54,9 @@ struct Node {
 }
 
 fn du_impl(args: &Args, filename: &str) -> bool {
-    let terminate = RefCell::new(false);
+    // Records whether any entry/traversal error occurred (for the exit status). A per-file error is
+    // reported and the walk continues (POSIX du CONSEQUENCES OF ERRORS = Default).
+    let had_error = RefCell::new(false);
     let stack: RefCell<LinkedList<Node>> = RefCell::new(LinkedList::new());
     // Track seen (dev, ino) pairs for hard link deduplication
     let seen: RefCell<HashSet<(u64, u64)>> = RefCell::new(HashSet::new());
@@ -66,10 +68,6 @@ fn du_impl(args: &Args, filename: &str) -> bool {
     ftw::traverse_directory(
         path,
         |entry| {
-            if *terminate.borrow() {
-                return Ok(false);
-            }
-
             let md = entry
                 .metadata()
                 .expect("ftw::traverse_directory yielded an entry without metadata");
@@ -156,7 +154,7 @@ fn du_impl(args: &Args, filename: &str) -> bool {
             Ok(())
         },
         |_entry, error| {
-            *terminate.borrow_mut() = true;
+            *had_error.borrow_mut() = true;
             eprintln!("du: {}", error.inner());
         },
         ftw::TraverseDirectoryOpts {
@@ -166,8 +164,8 @@ fn du_impl(args: &Args, filename: &str) -> bool {
         },
     );
 
-    let failed = *terminate.borrow();
-    !failed
+    let had_error = *had_error.borrow();
+    !had_error
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

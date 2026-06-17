@@ -389,3 +389,35 @@ fn test_du_hardlink() {
 
     fs::remove_dir_all(test_dir).unwrap();
 }
+
+// Audit #DU1 (shared with #CM1/#CO1/#CG1): a per-file error during a recursive walk is reported
+// but the walk continues — a readable sibling is still counted and the exit status is non-zero.
+#[test]
+fn test_du_continue_on_error() {
+    use std::os::unix::fs::PermissionsExt;
+    let test_dir = format!("{}/test_du_continue_on_error", env!("CARGO_TARGET_TMPDIR"));
+    let bad = format!("{test_dir}/bad");
+    let good = format!("{test_dir}/good");
+    fs::create_dir(&test_dir).unwrap();
+    fs::create_dir(&bad).unwrap();
+    fs::File::create(format!("{bad}/inner")).unwrap();
+    fs::create_dir(&good).unwrap();
+    fs::write(format!("{good}/f"), vec![0u8; 4096]).unwrap();
+    fs::set_permissions(&bad, fs::Permissions::from_mode(0o000)).unwrap();
+
+    du_test_with_checker(&["-a", test_dir.as_str()], |_, output| {
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "non-zero exit after the unreadable subdir"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("good/f"),
+            "readable sibling still counted: {stdout}"
+        );
+    });
+
+    fs::set_permissions(&bad, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::remove_dir_all(&test_dir).unwrap();
+}

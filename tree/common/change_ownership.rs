@@ -56,15 +56,13 @@ where
     let follow_none = args.follow_none;
     let follow_symlinks = args.follow_symlinks;
 
-    let terminate = RefCell::new(false);
+    // A per-file error is reported and the walk continues; this records whether any error
+    // occurred (for the exit status), instead of aborting the rest of the `-R` subtree.
+    let had_error = RefCell::new(false);
 
     ftw::traverse_directory(
         filename,
         |entry| {
-            if *terminate.borrow() {
-                return Ok(false);
-            }
-
             let md = entry.metadata().unwrap();
 
             // Use the UID from the args if present. If not given, according to the chgrp spec:
@@ -92,7 +90,7 @@ where
 
             if ret != 0 {
                 chown_err_handler(io::Error::last_os_error(), entry.path());
-                *terminate.borrow_mut() = true;
+                *had_error.borrow_mut() = true;
                 return Err(());
             }
 
@@ -101,7 +99,7 @@ where
         |_| Ok(()), // Do nothing on `postprocess_dir`
         |entry, error| {
             err_handler(error.inner(), entry.path());
-            *terminate.borrow_mut() = true;
+            *had_error.borrow_mut() = true;
         },
         ftw::TraverseDirectoryOpts {
             follow_symlinks_on_args: args.follow_cli,
@@ -110,6 +108,6 @@ where
         },
     );
 
-    let failed = *terminate.borrow();
-    !failed
+    let had_error = *had_error.borrow();
+    !had_error
 }

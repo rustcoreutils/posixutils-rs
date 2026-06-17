@@ -32,16 +32,13 @@ struct Args {
 }
 
 fn chmod_file(filename: &str, mode: &ChmodMode, recurse: bool) -> Result<(), io::Error> {
-    let terminate = RefCell::new(false);
-    let result = RefCell::new(Ok(())); // Either `Ok(())` or the last error encountered
+    // Each per-file error is reported immediately and the walk continues; `had_error` drives the
+    // exit status. The returned error (if any) carries no message — it has already been printed.
+    let had_error = RefCell::new(false);
 
     ftw::traverse_directory(
         filename,
         |entry| {
-            if *terminate.borrow() {
-                return Ok(false);
-            }
-
             let md = entry.metadata().unwrap();
             let is_dir = md.is_dir();
 
@@ -75,8 +72,8 @@ fn chmod_file(filename: &str, mode: &ChmodMode, recurse: bool) -> Result<(), io:
 
                 if is_dangling {
                     let err_str = gettext!("cannot operate on dangling symlink '{}'", entry.path());
-                    *result.borrow_mut() = Err(io::Error::other(err_str));
-                    *terminate.borrow_mut() = true;
+                    eprintln!("chmod: {err_str}");
+                    *had_error.borrow_mut() = true;
                     return Err(());
                 } else {
                     // Symlink permissions are always lrwxrwxrwx
@@ -98,9 +95,11 @@ fn chmod_file(filename: &str, mode: &ChmodMode, recurse: bool) -> Result<(), io:
 
             if ret != 0 {
                 let e = io::Error::last_os_error();
-
-                *result.borrow_mut() = Err(e);
-                *terminate.borrow_mut() = true;
+                eprintln!(
+                    "chmod: {}",
+                    gettext!("cannot access '{}': {}", entry.path(), error_string(&e))
+                );
+                *had_error.borrow_mut() = true;
                 return Err(());
             }
 
@@ -110,8 +109,8 @@ fn chmod_file(filename: &str, mode: &ChmodMode, recurse: bool) -> Result<(), io:
         |entry, error| {
             let e = error.inner();
             let err_str = gettext!("cannot access '{}': {}", entry.path(), error_string(&e));
-            *result.borrow_mut() = Err(io::Error::other(err_str));
-            *terminate.borrow_mut() = true;
+            eprintln!("chmod: {err_str}");
+            *had_error.borrow_mut() = true;
         },
         ftw::TraverseDirectoryOpts {
             follow_symlinks_on_args: true, // Default behavior of coreutils chmod with or without -R
@@ -119,7 +118,12 @@ fn chmod_file(filename: &str, mode: &ChmodMode, recurse: bool) -> Result<(), io:
         },
     );
 
-    result.into_inner()
+    if *had_error.borrow() {
+        // Empty-message marker: diagnostics were already printed at the failure site.
+        Err(io::Error::other(String::new()))
+    } else {
+        Ok(())
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -141,7 +145,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for filename in &args.files {
         if let Err(e) = chmod_file(filename, &mode, args.recurse) {
             exit_code = 1;
-            eprintln!("chmod: {}", error_string(&e));
+            // `chmod_file` prints its own per-file diagnostics and returns an empty-message marker.
+            let s = error_string(&e);
+            if !s.is_empty() {
+                eprintln!("chmod: {s}");
+            }
         }
     }
 

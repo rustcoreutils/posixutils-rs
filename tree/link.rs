@@ -23,6 +23,13 @@ struct Args {
 }
 
 fn do_link(file1: &str, file2: &str) -> io::Result<()> {
+    // FUTURE DIRECTIONS: reject a <newline> in the target name (#LK2).
+    if file2.as_bytes().contains(&b'\n') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            gettext("pathname contains a <newline> character"),
+        ));
+    }
     fs::hard_link(file1, file2)?;
     Ok(())
 }
@@ -38,7 +45,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Err(e) = do_link(&args.file1, &args.file2) {
         exit_code = 1;
-        eprintln!("link: {} -> {}: {}", args.file1, args.file2, e);
+        // Route the (interpolated) diagnostic through gettext for translation (#LK1).
+        eprintln!(
+            "link: {}",
+            gettext!("{} -> {}: {}", args.file1, args.file2, e)
+        );
     }
 
     std::process::exit(exit_code)

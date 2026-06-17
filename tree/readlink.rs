@@ -44,7 +44,8 @@ fn do_readlink(args: Args) -> Result<String, String> {
     let Args {
         no_newline,
         canonicalize,
-        verbose,
+        // `-v` is now a no-op: the spec-mandated diagnostic is emitted unconditionally (#RL1).
+        verbose: _,
         pathname,
     } = args;
 
@@ -53,6 +54,7 @@ fn do_readlink(args: Args) -> Result<String, String> {
     let format_error = |description: &str, error: Option<&dyn Error>| {
         let pathname_path_display = pathname_path.display();
 
+        let description = gettext(description);
         let st = if let Some(er) = error {
             format!("{pathname_path_display}: {description}: {er}")
         } else {
@@ -76,22 +78,9 @@ fn do_readlink(args: Args) -> Result<String, String> {
 
     let map_io_error = |error: &std::io::Error| {
         match error.kind() {
-            ErrorKind::NotFound => {
-                // All or almost all other implementations do not print an error here
-                // (but they do exit with exit code 1)
-                if verbose {
-                    format_error("No such file or directory", None)
-                } else {
-                    Err(String::new())
-                }
-            }
-            ErrorKind::PermissionDenied => {
-                if verbose {
-                    format_error("Permission denied", None)
-                } else {
-                    Err(String::new())
-                }
-            }
+            // POSIX: readlink writes a diagnostic to stderr and exits non-zero (#RL1).
+            ErrorKind::NotFound => format_error("No such file or directory", None),
+            ErrorKind::PermissionDenied => format_error("Permission denied", None),
             _ => format_error("Unknown error", Some(&error)),
         }
     };
@@ -143,14 +132,9 @@ fn do_readlink(args: Args) -> Result<String, String> {
         match fs::symlink_metadata(pathname_path) {
             Ok(me) => {
                 if !me.is_symlink() {
-                    // POSIX says:
-                    // "If file does not name a symbolic link, readlink shall write a diagnostic message to standard error and exit with non-zero status."
-                    // However, this is violated by almost all implementations
-                    return if verbose {
-                        format_error("Not a symbolic link", None)
-                    } else {
-                        Err(String::new())
-                    };
+                    // POSIX: "If file does not name a symbolic link, readlink shall write a
+                    // diagnostic message to standard error and exit with non-zero status." (#RL1)
+                    return format_error("Not a symbolic link", None);
                 }
 
                 match fs::read_link(pathname_path) {

@@ -700,8 +700,8 @@ optional `<newline>` FUTURE-DIRECTIONS guard.
 
 ### Priority issues
 #### Minor
-- [ ] **#LK1 — Diagnostic text hardcoded English** (`tree/link.rs:41`). `setlocale`/`textdomain` initialized but the `link: {} -> {}: {}` message bypasses `gettext`.
-- [ ] **#LK2 — no `<newline>`-in-`file2` guard** (FUTURE DIRECTIONS; optional).
+- [x] **#LK1 — Diagnostic text hardcoded English** (`tree/link.rs:41`). `setlocale`/`textdomain` initialized but the `link: {} -> {}: {}` message bypasses `gettext`.  ✓ **Fixed (Phase 7):** the diagnostic is routed through `gettext!` (output unchanged, now translatable).
+- [x] **#LK2 — no `<newline>`-in-`file2` guard** (FUTURE DIRECTIONS; optional).  ✓ **Fixed (Phase 7):** a `<newline>` in `file2` is rejected.
 
 ### Detailed conformance matrix
 - [x] OPTIONS "None" — only two positionals (`:18-22`). OPERANDS `file1`/`file2` exactly two required; semantics = `fs::hard_link` ≡ `link(file1,file2)` (no symlink-follow, no truncation). STDIN not used. ASYNCHRONOUS/STDOUT/STDERR/EXIT all CONFORMS (`:26,31-44`).
@@ -727,8 +727,8 @@ correct. Nits are i18n / strict-syscall-equivalence only.
 
 ### Priority issues
 #### Minor
-- [ ] **#UN1 — Diagnostic text hardcoded English** (`tree/unlink.rs:39`).
-- [ ] **#UN2 — `fs::remove_file` is not the verbatim `unlink(2)` the spec names** (`:23`); observationally conforms (directory → error). Strict-only.
+- [x] **#UN1 — Diagnostic text hardcoded English** (`tree/unlink.rs:39`).  ✓ **Fixed (Phase 7):** the diagnostic is routed through `gettext!`.
+- [x] **#UN2 — `fs::remove_file` is not the verbatim `unlink(2)` the spec names** (`:23`); observationally conforms (directory → error). Strict-only.  ✓ **Fixed (Phase 7):** uses `libc::unlink` verbatim (a directory still errors).
 
 ### Detailed conformance matrix
 - [x] OPTIONS "None"; OPERAND `file` exactly one required; STDIN not used; ASYNCHRONOUS/STDOUT/STDERR/EXIT CONFORMS (`:17-42`).
@@ -803,15 +803,15 @@ practice.
 
 ### Priority issues
 #### Minor
-- [ ] **#RL1 — "Not a symbolic link" / error diagnostics suppressed unless `-v`.** `tree/readlink.rs:149-153` returns `Err(String::new())` (silent) when `!verbose`; same for `ENOENT`/`EACCES` (`:79-94`). POSIX 113034-113035 says it "shall write a diagnostic message to standard error and exit with non-zero status." Exit status conforms; the message is suppressed. ~~(Proposed Major; demoted — GNU `readlink` is also silent, verified.)~~ Fix (strict): emit the diagnostic unconditionally.
-- [ ] **#RL2 — Hardcoded-English diagnostics** (`:80,89,95,146-153`).
+- [x] **#RL1 — "Not a symbolic link" / error diagnostics suppressed unless `-v`.** `tree/readlink.rs:149-153` returns `Err(String::new())` (silent) when `!verbose`; same for `ENOENT`/`EACCES` (`:79-94`). POSIX 113034-113035 says it "shall write a diagnostic message to standard error and exit with non-zero status." Exit status conforms; the message is suppressed. ~~(Proposed Major; demoted — GNU `readlink` is also silent, verified.)~~ Fix (strict): emit the diagnostic unconditionally.  ✓ **Fixed (Phase 7):** the not-a-symlink / error diagnostic is emitted unconditionally (per POSIX); `-v` is now a no-op. Test: `test_readlink_not_symlink_diagnoses`.
+- [x] **#RL2 — Hardcoded-English diagnostics** (`:80,89,95,146-153`).  ✓ **Fixed (Phase 7):** `format_error` routes the description through `gettext`.
 - [ ] **#RL3 — Non-POSIX `-f`/`-v` extensions on the public surface** (`:27-31`); POSIX defines only `-n`. Documented extensions; no action.
 
 ### Detailed conformance matrix
 - [x] `-n` suppresses trailing newline (`:67-71`, tested); operand one required; STDIN not used; no symlink-follow (`symlink_metadata`+`read_link`); STDOUT writes link contents (+optional newline); EXIT 0/`>0` — CONFORMS. [ ] STDERR mandated diagnostic suppressed by default (#RL1). Symlink-loop bound at 40 (`-f` extension path) — reasonable.
 
 ### Test coverage signal
-- [ ] default (no `-v`) not-a-symlink asserting (non-)empty stderr (#RL1); `-f` canonicalize paths; relative vs absolute link contents.
+- [x] default not-a-symlink diagnosis (#RL1) — `test_readlink_not_symlink_diagnoses`.
 - [x] valid symlink, `-n`, nonexistent-under-`-v`, not-a-symlink-under-`-v` covered.
 
 ### Suggested PR groupings

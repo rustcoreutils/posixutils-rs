@@ -835,14 +835,21 @@ subdir drops the readable siblings). Two agent-proposed findings were **refuted 
 the `-H/-L` last-wins gap is real but rare (demoted to Minor). Block-size, hard-link, output-format,
 and symlink-default semantics are correct.
 
+> **Resolved 2026-06-17** (Phase 10, this branch). All du items closed: #DU1 (Phase 4 shared
+> continue-on-error), #DU2 (`-H`/`-L` last-wins via `overrides_with`), #DU3 (cross-operand
+> `(dev,ino)` dedup), #DU4 (gettext diagnostics), #DU5 (`-a`/`-s` mutually exclusive), #DU6
+> (`<newline>` output guard). Regression tests in `tree/tests/du/mod.rs`
+> (`test_du_continue_on_error`, `test_du_h_l_last_wins`, `test_du_hardlink_cross_operand`,
+> `test_du_a_s_conflict`).
+
 ### Priority issues
 #### Major
 - [x] **#DU1 — First per-file error aborts the whole walk.** `tree/du.rs:57,69-71,158-160` — the error callback sets `terminate=true`; the entry callback then returns `Ok(false)` for every later entry, so one unreadable subdirectory silently drops all later siblings/operands from the totals. Verified: `du -a` over a tree with an unreadable subdir omits the readable sibling. Spec CONSEQUENCES "Default" + 93012-93013 intend report-and-continue. Fix: drop `terminate`; keep a `had_error` for exit status (shared with #CM1/#CO1/#CG1).  ✓ **Fixed (Phase 4):** the shared `terminate` abort-latch in `change_ownership.rs`/`chmod.rs`/`du.rs` is replaced with a `had_error` flag — each per-file error is reported and the walk continues, mirroring the copy.rs pattern. Test: `test_du_continue_on_error`.
 
 #### Minor
-- [ ] **#DU2 — `-H`/`-L` "last specified wins" not honored.** `tree/du.rs:25-29,163-164` — both are plain `bool`s, so `du -L -H` behaves as `-L`. POSIX 93033-93034 mandates the trailing option govern. Rare (both rarely given). Fix: resolve by option order.
-- [ ] **#DU3 — Cross-operand hard-link dedup fails (Austin Group Defect 539).** The `seen` set is created **inside** `du_impl` (`tree/du.rs:60`), which is called per operand (`:188`), so a file appearing under two operands is counted twice. POSIX 93013-93014: counted "for only one entry, even if the occurrences are under different file operands." Rare usage. Fix: hoist `seen` across operands.
-- [ ] **#DU4 — hardcoded-English diagnostic body** (`:160`). [ ] **#DU5 — `-a`/`-s` not enforced mutually exclusive** (`-sa` silently behaves as `-s`; spec doesn't require rejecting). [ ] **#DU6 — no `<newline>` guard** (optional).
+- [x] **#DU2 — `-H`/`-L` "last specified wins" not honored.** `tree/du.rs:25-29,163-164` — both are plain `bool`s, so `du -L -H` behaves as `-L`. POSIX 93033-93034 mandates the trailing option govern. Rare (both rarely given). Fix: resolve by option order.  ✓ **Fixed (Phase 10):** each flag carries clap `overrides_with` the other, so the trailing option wins. Test: `test_du_h_l_last_wins`.
+- [x] **#DU3 — Cross-operand hard-link dedup fails (Austin Group Defect 539).** The `seen` set is created **inside** `du_impl` (`tree/du.rs:60`), which is called per operand (`:188`), so a file appearing under two operands is counted twice. POSIX 93013-93014: counted "for only one entry, even if the occurrences are under different file operands." Rare usage. Fix: hoist `seen` across operands.  ✓ **Fixed (Phase 10):** the `(dev,ino)` `seen` set is created once in `main` and threaded into `du_impl`, so the second occurrence reports 0. Test: `test_du_hardlink_cross_operand`.
+- [x] **#DU4 — hardcoded-English diagnostic body** (`:160`).  ✓ **Fixed (Phase 10):** the `du:`-prefixed diagnostics route through `gettext`; the per-entry walk error keeps the OS-supplied `error.inner()` body (standard errno text). [x] **#DU5 — `-a`/`-s` not enforced mutually exclusive** (`-sa` silently behaves as `-s`; spec doesn't require rejecting).  ✓ **Fixed (Phase 10):** clap `conflicts_with` makes `-a`/`-s` a usage error. Test: `test_du_a_s_conflict`. [x] **#DU6 — no `<newline>` guard** (optional).  ✓ **Fixed (Phase 10):** `du_print` rejects a `<newline>` in the pathname (it would corrupt the line-oriented output), reporting to stderr and skipping that line.
 
 > **Refuted on verification:** an agent-proposed Major "`-x` anchors to the first walker entry, not the operand, and still counts foreign-device dirs" — both halves are wrong: ftw yields the operand root *first* (so `initial_dev` = operand device), and the `-x` mismatch `return Ok(false)` (`tree/du.rs:85`) executes **before** the size is pushed (`:92+`), so foreign entries are not counted. `-x` conforms.
 
@@ -857,10 +864,10 @@ and symlink-default semantics are correct.
 | `-x` | CONFORMS | `:78-87` (refutation above). |
 
 #### Other
-- [x] no-operand → `.`; multiple operands in order; STDIN/INPUT FILES "None"; output `size<tab>path` (tab is a `<blank>`, conforms); 512-byte default, `-k` halves; directory size = subtree sum + dir; symlinks counted not followed (default); race-safe recursion; EXIT 0/`>0` — CONFORMS. [ ] CONSEQUENCES partial via #DU1; [ ] cross-operand dedup #DU3.
+- [x] no-operand → `.`; multiple operands in order; STDIN/INPUT FILES "None"; output `size<tab>path` (tab is a `<blank>`, conforms); 512-byte default, `-k` halves; directory size = subtree sum + dir; symlinks counted not followed (default); race-safe recursion; EXIT 0/`>0` — CONFORMS. [x] CONSEQUENCES now report-and-continue (#DU1); [x] cross-operand dedup (#DU3).
 
 ### Test coverage signal
-- [ ] mid-walk error continuation (#DU1); `-H -L`/`-L -H` order (#DU2); same file under two operands (#DU3); `-x` device boundary (needs a mount).
+- [x] mid-walk error continuation (#DU1); `-H -L`/`-L -H` order (#DU2); same file under two operands (#DU3). [ ] `-x` device boundary (needs a mount).
 - [x] `-a`,`-s`,`-k`(512 vs 1024), default, file-operand-listed, `-H`,`-L`, hard-link dedup, nonexistent→exit 1.
 
 ### Suggested PR groupings

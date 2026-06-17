@@ -421,3 +421,84 @@ fn test_du_continue_on_error() {
     fs::set_permissions(&bad, fs::Permissions::from_mode(0o755)).unwrap();
     fs::remove_dir_all(&test_dir).unwrap();
 }
+
+// Audit #DU5: -a and -s are mutually exclusive (clap conflict → usage error, non-zero exit).
+#[test]
+fn test_du_a_s_conflict() {
+    du_test_with_checker_and_exit(&["-a", "-s", "."], 2, |_, output| {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("cannot be used with"),
+            "expected a mutual-exclusion usage error: {stderr}"
+        );
+    });
+}
+
+// Audit #DU3: a hard-linked file appearing under two separate operands is counted once — the
+// (dev,ino) dedup set is shared across operands, so the second operand reports size 0.
+#[test]
+fn test_du_hardlink_cross_operand() {
+    let test_dir = &format!("{}/test_du_hl_cross", env!("CARGO_TARGET_TMPDIR"));
+    let _ = fs::remove_dir_all(test_dir);
+    fs::create_dir(test_dir).unwrap();
+
+    let file1 = format!("{test_dir}/file1");
+    let file2 = format!("{test_dir}/file2");
+    fs::write(&file1, "x".repeat(4096)).unwrap();
+    fs::hard_link(&file1, &file2).unwrap();
+
+    let file_size = fs::metadata(&file1).unwrap().blocks();
+
+    // Order of the two operands is deterministic (argv order). The first is counted, the second
+    // (same dev/ino) is deduplicated to 0.
+    du_test(
+        &[file1.as_str(), file2.as_str()],
+        &format!("{file_size}\t{file1}\n0\t{file2}\n"),
+        "",
+        0,
+    );
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// Audit #DU2: -H and -L are last-specified-wins. With an in-directory symlink, -H (follow only
+// command-line symlinks) leaves it unfollowed, while -L (follow all) reports the target's size.
+#[test]
+fn test_du_h_l_last_wins() {
+    let test_dir = &format!("{}/test_du_hl_order", env!("CARGO_TARGET_TMPDIR"));
+    let _ = fs::remove_dir_all(test_dir);
+    fs::create_dir(test_dir).unwrap();
+
+    let target_file = format!("{test_dir}/target");
+    let subdir = format!("{test_dir}/subdir");
+    let link_in_dir = format!("{subdir}/link");
+    fs::create_dir(&subdir).unwrap();
+    fs::write(&target_file, "x".repeat(2048)).unwrap();
+    std::os::unix::fs::symlink(&target_file, &link_in_dir).unwrap();
+
+    let target_size = fs::metadata(&target_file).unwrap().blocks();
+    let link_size = fs::symlink_metadata(&link_in_dir).unwrap().blocks();
+
+    let reported = |output: &Output| -> u64 {
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        stdout
+            .lines()
+            .find(|l| l.ends_with("/link"))
+            .and_then(|l| l.split('\t').next())
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    };
+
+    // -L then -H → -H wins → in-dir symlink not followed → link's own size.
+    du_test_with_checker(&["-a", "-L", "-H", subdir.as_str()], |_, output| {
+        assert_eq!(reported(output), link_size, "-L -H: -H must win");
+    });
+    // -H then -L → -L wins → in-dir symlink followed → target's size.
+    du_test_with_checker(&["-a", "-H", "-L", subdir.as_str()], |_, output| {
+        assert_eq!(reported(output), target_size, "-H -L: -L must win");
+    });
+
+    fs::remove_dir_all(test_dir).unwrap();
+}

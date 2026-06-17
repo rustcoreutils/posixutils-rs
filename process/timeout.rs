@@ -17,14 +17,37 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
+use plib::diag;
 use posixutils_process::signal::parse_signal;
 
 static FOREGROUND: AtomicBool = AtomicBool::new(false);
 static FIRST_SIGNAL: AtomicI32 = AtomicI32::new(libc::SIGTERM);
 static KILL_AFTER: Mutex<Option<Duration>> = Mutex::new(None);
-static MONITORED_PID: AtomicI32 = AtomicI32::new(0);
+// -1 means "no child yet": a signal arriving before the child is spawned is
+// ignored by the handler rather than mistaken for a self-directed exit.
+static MONITORED_PID: AtomicI32 = AtomicI32::new(-1);
 static TIMED_OUT: AtomicBool = AtomicBool::new(false);
+
+/// Signals whose default action terminates the process and which `timeout`
+/// forwards to the monitored utility (POSIX: "any signal whose default action
+/// is to terminate the process"). Synchronous program-error signals
+/// (SIGSEGV/SIGILL/SIGBUS/SIGFPE/...) are intentionally excluded — they
+/// indicate a fault in `timeout` itself, not something to relay.
+const FORWARDED_SIGNALS: [libc::c_int; 12] = [
+    libc::SIGALRM,
+    libc::SIGINT,
+    libc::SIGQUIT,
+    libc::SIGHUP,
+    libc::SIGTERM,
+    libc::SIGPIPE,
+    libc::SIGUSR1,
+    libc::SIGUSR2,
+    libc::SIGXCPU,
+    libc::SIGXFSZ,
+    libc::SIGVTALRM,
+    libc::SIGPROF,
+];
 
 #[derive(Parser)]
 #[command(version, about = gettext("timeout - execute a utility with a time limit"))]
@@ -91,8 +114,39 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
 ///
 /// * `duration` - [Duration] value of time until alarm.
 fn set_timeout(duration: Duration) {
-    if !duration.is_zero() {
-        unsafe { libc::alarm(duration.as_secs() as libc::c_uint) };
+    if duration.is_zero() {
+        return;
+    }
+    // Use setitimer for sub-second precision; alarm() truncates to whole
+    // seconds (so `timeout 0.5s` would arm a 0-second — i.e. disabled — timer).
+    //
+    // Saturate the seconds to time_t::MAX rather than letting `as time_t` wrap
+    // negative for a pathologically large duration (which would otherwise
+    // disable the timeout entirely).
+    let secs_u64 = duration.as_secs();
+    let secs = if secs_u64 > libc::time_t::MAX as u64 {
+        libc::time_t::MAX
+    } else {
+        secs_u64 as libc::time_t
+    };
+    let mut usecs = duration.subsec_micros() as libc::suseconds_t;
+    // A non-zero duration below 1us would round to an all-zero itimerval,
+    // which disarms the timer; round up to the smallest tick instead.
+    if secs == 0 && usecs == 0 {
+        usecs = 1;
+    }
+    let it = libc::itimerval {
+        it_interval: libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+        it_value: libc::timeval {
+            tv_sec: secs,
+            tv_usec: usecs,
+        },
+    };
+    unsafe {
+        libc::setitimer(libc::ITIMER_REAL, &it, std::ptr::null_mut());
     }
 }
 
@@ -178,7 +232,7 @@ fn unblock_signal(signal: i32) {
             std::ptr::null_mut::<libc::sigset_t>(),
         ) != 0
         {
-            eprintln!("timeout: failed to set unblock signals mask");
+            diag::error(&gettext("failed to set unblock signals mask"));
             std::process::exit(125)
         }
     }
@@ -218,32 +272,13 @@ fn set_handler(signal: i32) {
         libc::sigemptyset(&mut (*p_sa).sa_mask);
         let sig_action = sig_action.assume_init();
 
-        libc::sigaction(
-            libc::SIGALRM,
-            &sig_action,
-            std::ptr::null_mut::<libc::sigaction>(),
-        );
-        libc::sigaction(
-            libc::SIGINT,
-            &sig_action,
-            std::ptr::null_mut::<libc::sigaction>(),
-        );
-        libc::sigaction(
-            libc::SIGQUIT,
-            &sig_action,
-            std::ptr::null_mut::<libc::sigaction>(),
-        );
-        libc::sigaction(
-            libc::SIGHUP,
-            &sig_action,
-            std::ptr::null_mut::<libc::sigaction>(),
-        );
-        libc::sigaction(
-            libc::SIGTERM,
-            &sig_action,
-            std::ptr::null_mut::<libc::sigaction>(),
-        );
-        libc::sigaction(signal, &sig_action, std::ptr::null_mut::<libc::sigaction>());
+        for &sig in FORWARDED_SIGNALS.iter() {
+            libc::sigaction(sig, &sig_action, std::ptr::null_mut::<libc::sigaction>());
+        }
+        // The -s signal, if it is not already part of the forwarded set.
+        if !FORWARDED_SIGNALS.contains(&signal) {
+            libc::sigaction(signal, &sig_action, std::ptr::null_mut::<libc::sigaction>());
+        }
     }
 }
 
@@ -257,17 +292,17 @@ fn block_handler_and_chld(signal: i32, old_set: &mut libc::sigset_t) {
     unsafe {
         let mut block_set = get_empty_sig_set();
 
-        libc::sigaddset(&mut block_set, libc::SIGALRM);
-        libc::sigaddset(&mut block_set, libc::SIGINT);
-        libc::sigaddset(&mut block_set, libc::SIGQUIT);
-        libc::sigaddset(&mut block_set, libc::SIGHUP);
-        libc::sigaddset(&mut block_set, libc::SIGTERM);
-        libc::sigaddset(&mut block_set, signal);
+        for &sig in FORWARDED_SIGNALS.iter() {
+            libc::sigaddset(&mut block_set, sig);
+        }
+        if !FORWARDED_SIGNALS.contains(&signal) {
+            libc::sigaddset(&mut block_set, signal);
+        }
 
         libc::sigaddset(&mut block_set, libc::SIGCHLD);
 
         if libc::sigprocmask(libc::SIG_BLOCK, &block_set, old_set) != 0 {
-            eprintln!("timeout: failed to set block signals mask");
+            diag::error(&gettext("failed to set block signals mask"));
             std::process::exit(125)
         }
     }
@@ -342,7 +377,12 @@ fn timeout(args: Args) -> i32 {
         match search_in_path(&utility) {
             Some(path) => path,
             None => {
-                eprintln!("timeout: utility '{utility}' not found");
+                diag::error(&format!(
+                    "{} '{}' {}",
+                    gettext("utility"),
+                    utility,
+                    gettext("not found")
+                ));
                 return 127;
             }
         }
@@ -359,10 +399,16 @@ fn timeout(args: Args) -> i32 {
 
     // Setup handlers before to catch signals before fork()
     set_handler(signal_name);
-    unsafe {
-        libc::signal(libc::SIGTTIN, libc::SIG_IGN);
-        libc::signal(libc::SIGTTOU, libc::SIG_IGN);
-    }
+    // Ignore SIGTTIN/SIGTTOU while running, but remember the dispositions we
+    // inherited so the child can be given the *same* dispositions (POSIX: the
+    // utility's inherited dispositions shall match what timeout inherited,
+    // except for the -s signal).
+    let (old_ttin, old_ttou) = unsafe {
+        (
+            libc::signal(libc::SIGTTIN, libc::SIG_IGN),
+            libc::signal(libc::SIGTTOU, libc::SIG_IGN),
+        )
+    };
     set_chld();
 
     // To be able to handle SIGALRM (will be send after timeout)
@@ -381,8 +427,8 @@ fn timeout(args: Args) -> i32 {
                     std::ptr::null_mut::<libc::sigset_t>(),
                 );
 
-                libc::signal(libc::SIGTTIN, libc::SIG_DFL);
-                libc::signal(libc::SIGTTOU, libc::SIG_DFL);
+                libc::signal(libc::SIGTTIN, old_ttin);
+                libc::signal(libc::SIGTTOU, old_ttou);
                 Ok(())
             })
             .spawn()
@@ -391,11 +437,20 @@ fn timeout(args: Args) -> i32 {
         Ok(child) => child,
         Err(err) => match err.kind() {
             std::io::ErrorKind::NotFound => {
-                eprintln!("timeout: utility '{utility}' not found");
+                diag::error(&format!(
+                    "{} '{}' {}",
+                    gettext("utility"),
+                    utility,
+                    gettext("not found")
+                ));
                 return 127;
             }
             std::io::ErrorKind::PermissionDenied => {
-                eprintln!("timeout: unable to run the utility '{utility}'");
+                diag::error(&format!(
+                    "{} '{}'",
+                    gettext("unable to run the utility"),
+                    utility
+                ));
                 return 126;
             }
             _ => return 125,
@@ -419,6 +474,11 @@ fn timeout(args: Args) -> i32 {
             unsafe { libc::sigsuspend(&original_set) };
         } else if es.stopped_signal().is_some() {
             send_signal(MONITORED_PID.load(Ordering::SeqCst), libc::SIGCONT);
+            // In non-foreground mode the whole process group was signaled, so
+            // continue the group too, not just the immediate child.
+            if !FOREGROUND.load(Ordering::SeqCst) {
+                send_signal(0, libc::SIGCONT);
+            }
             TIMED_OUT.store(true, Ordering::SeqCst);
         } else {
             break;
@@ -426,17 +486,16 @@ fn timeout(args: Args) -> i32 {
     }
 
     if wait_status < 0 {
-        eprintln!("timeout: failed to wait for child");
+        diag::error(&gettext("failed to wait for child"));
         125
     } else {
         status = if libc::WIFEXITED(status) {
             libc::WEXITSTATUS(status)
         } else if libc::WIFSIGNALED(status) {
             let signal = libc::WTERMSIG(status);
-            if libc::WCOREDUMP(status) {
-                eprintln!("timeout: monitored command dumped core");
-                return 125;
-            }
+            // If the child was not timed out, mirror its signal death (with
+            // core dumps disabled so we do not create a second core image).
+            // This applies regardless of whether the child itself dumped core.
             if !TIMED_OUT.load(Ordering::SeqCst) && disable_core_dumps() {
                 unsafe { libc::signal(signal, libc::SIG_DFL) };
                 unblock_signal(signal);
@@ -447,7 +506,11 @@ fn timeout(args: Args) -> i32 {
             }
             128 + signal
         } else {
-            eprintln!("timeout: unknown status from command: {status}");
+            diag::error(&format!(
+                "{}: {}",
+                gettext("unknown status from command"),
+                status
+            ));
             return 125;
         };
 
@@ -464,10 +527,8 @@ fn timeout(args: Args) -> i32 {
 ///     125 - An error other than the two described below occurred.
 ///     126 - The utility specified by utility was found but could not be executed.
 ///     127 - The utility specified by utility could not be found.
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+fn main() {
+    diag::init_locale("timeout");
 
     let args = Args::try_parse().unwrap_or_else(|err| match err.kind() {
         clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => {
@@ -475,10 +536,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(0);
         }
         _ => {
-            eprintln!(
-                "timeout: {}",
-                err.source()
-                    .map_or_else(|| err.kind().to_string(), |err| err.to_string())
+            diag::error(
+                &err.source()
+                    .map_or_else(|| err.kind().to_string(), |err| err.to_string()),
             );
             std::process::exit(125);
         }

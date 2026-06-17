@@ -1918,7 +1918,6 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "clap",
- "dirs 5.0.1",
  "gettext-rs",
  "libc",
  "plib",

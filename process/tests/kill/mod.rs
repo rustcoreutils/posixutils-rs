@@ -50,6 +50,31 @@ fn get_kill_binary_path() -> std::path::PathBuf {
 // Signal listing tests (-l)
 // ============================================
 
+// `kill -l 6` maps signal number 6 to ABRT (not the IOT alias).
+#[test]
+fn test_list_signal_abrt() {
+    run_kill_test_exact(vec!["-l", "6"], "ABRT\n", "", 0);
+}
+
+// #K2: `-l` followed by another option must not be mis-read as the optional
+// exit_status operand (it used to error "Invalid exit status"). Here the
+// second -l is recognized as an option and the signal list is printed.
+#[test]
+fn test_list_dash_option_not_exit_status() {
+    run_kill_test(vec!["-l", "-l"], 0, |_, output| {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("TERM"),
+            "Expected signal list, got {stdout:?}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("Invalid exit status"),
+            "should not report Invalid exit status: {stderr:?}"
+        );
+    });
+}
+
 #[test]
 fn test_list_signals() {
     run_kill_test(vec!["-l"], 0, |_, output| {

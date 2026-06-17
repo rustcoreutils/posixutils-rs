@@ -13,7 +13,6 @@ clap.workspace = true
 gettext-rs.workspace = true
 libc.workspace = true
 chrono.workspace = true
-dirs.workspace = true
 chrono-tz.workspace = true
 
 [build-dependencies]

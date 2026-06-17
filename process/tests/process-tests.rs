@@ -7,7 +7,11 @@
 // SPDX-License-Identifier: MIT
 //
 
+mod env;
 mod fuser;
 mod kill;
+mod nice;
+mod nohup;
+mod renice;
 mod timeout;
 mod xargs;

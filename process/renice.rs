@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2024-2025 Jeff Garzik
+// Copyright (c) 2024-2026 Jeff Garzik
 //
 // This file is part of the posixutils-rs project covered under
 // the MIT License.  For the full license text, please see the LICENSE
@@ -8,10 +8,12 @@
 //
 
 use std::ffi::CString;
+use std::process;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use libc::{getpwnam, passwd};
+use plib::diag;
 use plib::priority::{getpriority, setpriority};
 
 const PRIO_MIN: i32 = -20;
@@ -21,14 +23,13 @@ const PRIO_MAX: i32 = 20;
 #[command(version, about = gettext("renice - set nice values of running processes"))]
 struct Args {
     #[arg(
-        short,
-        long,
+        short = 'n',
         required = true,
-        value_parser = clap::value_parser!(i32).range(-20..20),
+        allow_hyphen_values = true,
+        value_parser = clap::value_parser!(i32).range(-20..=20),
         help = gettext(
-            "A positive or negative decimal integer which shall have the same effect \
-             on the execution of the utility as if the utility had called the nice() \
-             function with the numeric value of the increment option-argument"
+            "A positive or negative decimal integer increment applied to the \
+             current nice value of each process"
         )
     )]
     niceval: i32,
@@ -63,48 +64,49 @@ struct Args {
     )]
     user: bool,
 
-    #[arg(help = gettext("Process id to adjust priority"))]
-    id: String,
+    #[arg(required = true, help = gettext("One or more IDs whose priority to adjust"))]
+    ids: Vec<String>,
 }
 
-fn lookup_uid(username: &str) -> Result<u32, &'static str> {
-    let c_username = CString::new(username).expect("CString::new failed");
+fn lookup_uid(username: &str) -> Result<u32, ()> {
+    let c_username = match CString::new(username) {
+        Ok(s) => s,
+        Err(_) => return Err(()),
+    };
     let passwd = unsafe { getpwnam(c_username.as_ptr()) };
 
     if passwd.is_null() {
-        return Err("User not found");
+        return Err(());
     }
 
     let passwd: &passwd = unsafe { &*passwd };
     Ok(passwd.pw_uid)
 }
 
+/// Resolve an operand to a numeric id for the given priority class. For the
+/// user class a non-numeric operand is looked up via `getpwnam`. Returns the
+/// resolved id, or `Err` with a localized diagnostic already emitted.
 #[allow(clippy::unnecessary_cast)] // PRIO_* types differ: i32 on macOS, u32 on Linux
-fn parse_id(which: u32, input: &str) -> Result<u32, &'static str> {
-    match input.parse::<u32>() {
-        Ok(0) => Err("Invalid ID"),
-        Ok(n) => Ok(n),
-        Err(e) => {
-            if which != libc::PRIO_USER as u32 {
-                eprintln!("{}", e);
-                Err("Invalid ID")
-            } else {
-                match lookup_uid(input) {
-                    Ok(uid) => Ok(uid),
-                    Err(e) => {
-                        eprintln!("{}", e);
-                        Err("Invalid ID or username")
-                    }
-                }
-            }
-        }
+fn parse_id(which: u32, input: &str) -> Result<u32, ()> {
+    if let Ok(n) = input.parse::<u32>() {
+        // 0 is a valid operand (PID/PGID 0 = caller's process/group,
+        // UID 0 = root); do not reject it.
+        return Ok(n);
     }
+
+    if which == libc::PRIO_USER as u32 {
+        if let Ok(uid) = lookup_uid(input) {
+            return Ok(uid);
+        }
+        diag::error(&format!("{}: {}", gettext("no such user"), input));
+    } else {
+        diag::error(&format!("{}: {}", gettext("invalid ID"), input));
+    }
+    Err(())
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+fn main() {
+    diag::init_locale("renice");
 
     let args = Args::parse();
 
@@ -121,17 +123,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // who: obtain pgrp/pid/uid
-    let id = parse_id(which, &args.id)?;
+    // Process each ID independently: a failure on one ID must not prevent
+    // processing the rest, and the exit status is non-zero if any failed.
+    for id_str in &args.ids {
+        let id = match parse_id(which, id_str) {
+            Ok(id) => id,
+            Err(()) => continue,
+        };
 
-    // get current priority
-    let prio = getpriority(which, id)?;
+        let prio = match getpriority(which, id) {
+            Ok(p) => p,
+            Err(e) => {
+                diag::error(&format!("{}: {}: {}", gettext("getpriority"), id_str, e));
+                continue;
+            }
+        };
 
-    // adjust priority based on user input
-    let newprio = (prio + args.niceval).clamp(PRIO_MIN, PRIO_MAX);
+        let newprio = (prio + args.niceval).clamp(PRIO_MIN, PRIO_MAX);
 
-    // attempt to set new priority
-    setpriority(which, id, newprio)?;
+        if let Err(e) = setpriority(which, id, newprio) {
+            diag::error(&format!("{}: {}: {}", gettext("setpriority"), id_str, e));
+        }
+    }
 
-    Ok(())
+    process::exit(diag::exit_status());
 }

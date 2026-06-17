@@ -6,11 +6,9 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// NOTES:
-// - Having console output in this module is probably wrong.  This
-//   should be a library module, moving console output back into
-//   the application... which implies errno handling probably
-//   should be done in the application as well.
+// This is a library module: it returns errors to the caller rather than
+// printing diagnostics itself (the application owns the diagnostic surface,
+// e.g. locale-aware messages via plib::diag).
 //
 
 use std::io;
@@ -32,9 +30,7 @@ pub fn getpriority(which: u32, id: u32) -> io::Result<i32> {
     if errno_res == 0 {
         Ok(res)
     } else {
-        let e = io::Error::from_raw_os_error(errno_res);
-        eprintln!("getpriority: {e}");
-        Err(e)
+        Err(io::Error::from_raw_os_error(errno_res))
     }
 }
 
@@ -42,9 +38,7 @@ pub fn setpriority(which: u32, id: u32, prio: i32) -> io::Result<()> {
     let res = unsafe { libc::setpriority(which as PPriorityWhichT, id, prio) };
 
     if res < 0 {
-        let e = io::Error::last_os_error();
-        eprintln!("setpriority: {e}");
-        Err(e)
+        Err(io::Error::last_os_error())
     } else {
         Ok(())
     }

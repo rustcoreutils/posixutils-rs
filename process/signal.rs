@@ -10,8 +10,15 @@
 // `kill` and `timeout` bins
 
 pub fn list_signals() {
-    let names: Vec<&str> = SIGLIST.iter().map(|(name, _)| *name).collect();
-    println!("{}", names.join(" "));
+    // POSIX: write each signal_name in the format "%s%c", where the separator
+    // is a <space> between names and a <newline> after the last one.
+    let mut out = String::new();
+    let last = SIGLIST.len().saturating_sub(1);
+    for (i, (name, _)) in SIGLIST.iter().enumerate() {
+        out.push_str(name);
+        out.push(if i == last { '\n' } else { ' ' });
+    }
+    print!("{}", out);
 }
 
 /// Returns the signal name for a given signal number.

@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2024 Jeff Garzik
+// Copyright (c) 2024-2026 Jeff Garzik
 //
 // This file is part of the posixutils-rs project covered under
 // the MIT License.  For the full license text, please see the LICENSE
@@ -12,7 +12,9 @@ use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
+use plib::diag;
+use posixutils_process::exec::exec_error_exit;
 
 #[derive(Parser)]
 #[command(
@@ -21,10 +23,9 @@ use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleC
 )]
 struct Args {
     #[arg(
-        short,
-        long,
+        short = 'n',
         default_value_t = 10,
-        value_parser = clap::value_parser!(i32).range(-30..30),
+        allow_hyphen_values = true,
         help = gettext(
             "A positive or negative decimal integer which shall have \
              the same effect on the execution of the utility as if the \
@@ -41,30 +42,54 @@ struct Args {
     util_args: Vec<String>,
 }
 
-fn exec_util(util: &str, util_args: Vec<String>) -> io::Result<()> {
-    Err(Command::new(util)
+#[cfg(target_os = "linux")]
+unsafe fn errno_ptr() -> *mut libc::c_int {
+    libc::__errno_location()
+}
+
+#[cfg(not(target_os = "linux"))]
+unsafe fn errno_ptr() -> *mut libc::c_int {
+    libc::__error()
+}
+
+/// Apply the nice increment. Per POSIX, if the nice value cannot be changed
+/// (e.g. lack of privilege), a warning may be written but this "shall not
+/// prevent the invocation of utility or affect the exit status" — so this
+/// never aborts.
+fn apply_increment(increment: i32) {
+    // nice(3) returns the new nice value (which can legitimately be -1), so the
+    // return value cannot be used to detect failure. Clear errno, call, then
+    // inspect errno.
+    unsafe {
+        *errno_ptr() = 0;
+        let _ = libc::nice(increment);
+        let errno = *errno_ptr();
+        if errno != 0 {
+            let e = io::Error::from_raw_os_error(errno);
+            // Non-fatal: warn and continue to exec the utility anyway.
+            diag::warning(&format!("{}: {}", gettext("cannot set nice value"), e));
+        }
+    }
+}
+
+fn exec_util(util: &str, util_args: &[String]) -> ! {
+    let err = Command::new(util)
         .args(util_args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
-        .exec())
+        .exec();
+
+    // exec() only returns on failure.
+    exec_error_exit(util, err)
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+fn main() {
+    diag::init_locale("nice");
 
     let args = Args::parse();
 
-    let res = unsafe { libc::nice(args.niceval) };
-    if res < 0 {
-        let e = io::Error::last_os_error();
-        eprintln!("nice: {}", e);
-        return Err(Box::new(e));
-    }
+    apply_increment(args.niceval);
 
-    exec_util(&args.util, args.util_args)?;
-
-    Ok(())
+    exec_util(&args.util, &args.util_args);
 }

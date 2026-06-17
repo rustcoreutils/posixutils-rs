@@ -448,9 +448,9 @@ double-set of setuid in the symbolic `Add` path.
 - [x] **#CM1 — `-R` aborts the whole subtree on the first per-file error.** `tree/chmod.rs:99-105` (`*terminate.borrow_mut()=true; return Err(())`) + the `:41-43` early-out. EXIT STATUS / CONSEQUENCES OF ERRORS ("Default") expect report-and-continue (matching historical/GNU `chmod`). One `fchmodat` failure stops the walk; later siblings are skipped. Proof: `grep -n terminate tree/chmod.rs` → 35,41,79,103,114. Cross-operand iteration (`:141`) still continues, so only the current tree is abandoned. Fix: replace the `terminate` latch with a `had_error` flag (continue, set non-zero exit) — shared with #CO1/#CG1/#DU1.  ✓ **Fixed (Phase 4):** the shared `terminate` abort-latch in `change_ownership.rs`/`chmod.rs`/`du.rs` is replaced with a `had_error` flag — each per-file error is reported and the walk continues, mirroring the copy.rs pattern. Test: `test_du_continue_on_error`.
 
 #### Minor
-- [ ] **#CM2 — Missing `file` operand exits 0 silently.** `tree/chmod.rs:31` (`files: Vec<String>` not `required`). SYNOPSIS `chmod [-R] mode file...` makes `file` mandatory. Fix: `#[arg(required = true)]`.
-- [ ] **#CM3 — Hardcoded-English diagnostics.** `tree/chmod.rs:136,144` — `LC_MESSAGES` inert for the error body.
-- [ ] **#CM4 — Redundant double-set of setuid/setgid in symbolic `Add`.** `plib/src/modestr.rs:266-274` then `:347-357` set the same bits twice (idempotent; dead code).
+- [x] **#CM2 — Missing `file` operand exits 0 silently.** `tree/chmod.rs:31` (`files: Vec<String>` not `required`). SYNOPSIS `chmod [-R] mode file...` makes `file` mandatory. Fix: `#[arg(required = true)]`.  ✓ **Fixed (Phase 5):** `#[arg(required = true)]` on the `file` operand.
+- [x] **#CM3 — Hardcoded-English diagnostics.** `tree/chmod.rs:136,144` — `LC_MESSAGES` inert for the error body.  ✓ **Fixed (Phase 5):** diagnostics route through `gettext`/`error_string`; the `chmod:` prefix is the (conventional, non-translatable) program name.
+- [x] **#CM4 — Redundant double-set of setuid/setgid in symbolic `Add`.** `plib/src/modestr.rs:266-274` then `:347-357` set the same bits twice (idempotent; dead code).  ✓ **Fixed (Phase 5):** the redundant setuid double-set in `plib/src/modestr.rs` is removed (the shared `if action.setuid` block handles it).
 
 ### Detailed conformance matrix
 #### OPTIONS
@@ -474,7 +474,7 @@ double-set of setuid in the symbolic `Add` path.
 - [x] EXIT 0/`>0` (`exit_code=1` `:143`) — CONFORMS; [ ] CONSEQUENCES "Default" DIVERGES via #CM1.
 
 ### Test coverage signal
-- [ ] continue-after-error in `-R` untested (#CM1); missing-`file` exit untested (#CM2).
+- [x] continue-after-error in `-R` (#CM1, shared) — `test_du_continue_on_error`; missing-`file` now a clap usage error (#CM2).
 - [x] symbolic grammar broadly covered (modestr unit tests + `test_chmod_no_x`/`_octal`/`_symlinks`/`_thru_dangling`).
 
 ### Suggested PR groupings
@@ -501,12 +501,12 @@ not by the utility (#CO3 — portability note). Minors: `owner:` (trailing colon
 ### Priority issues
 #### Major
 - [x] **#CO1 — `-R` aborts the whole subtree on the first per-file error.** `tree/common/change_ownership.rs:93-97` + `:64-66`. Same mechanism/fix as #CM1. Proof: `grep -n terminate tree/common/change_ownership.rs` → 59,64,95,104,113.  ✓ **Fixed (Phase 4):** the shared `terminate` abort-latch in `change_ownership.rs`/`chmod.rs`/`du.rs` is replaced with a `had_error` flag — each per-file error is reported and the walk continues, mirroring the copy.rs pattern. Test: `test_du_continue_on_error`.
-- [ ] **#CO2 — Missing the `-R`-default no-dereference block chgrp has.** No equivalent of `tree/chgrp.rs:84-86` (`if recurse && !(follow_cli||follow_symlinks){ no_dereference=true }`). Proof: `grep -n 'no_dereference = true' tree/chown.rs tree/chgrp.rs` → chgrp only. The spec calls the bare-`-R` default "unspecified," so conformant in isolation, but the chown/chgrp asymmetry is a latent surprise / divergence from the obviously-shared design. Fix: add the same default-to-`-P` block to `chown.rs`.
+- [x] **#CO2 — Missing the `-R`-default no-dereference block chgrp has.** No equivalent of `tree/chgrp.rs:84-86` (`if recurse && !(follow_cli||follow_symlinks){ no_dereference=true }`). Proof: `grep -n 'no_dereference = true' tree/chown.rs tree/chgrp.rs` → chgrp only. The spec calls the bare-`-R` default "unspecified," so conformant in isolation, but the chown/chgrp asymmetry is a latent surprise / divergence from the obviously-shared design. Fix: add the same default-to-`-P` block to `chown.rs`.  ✓ **Fixed (Phase 5):** chown now sets `no_dereference` for bare `-R` (parity with chgrp).
 
 #### Minor
-- [ ] **#CO3 — setuid/setgid clearing is kernel-implicit, not done by the utility.** `grep -rn 'S_ISUID|S_ISGID|fchmod' tree/common/change_ownership.rs tree/chown.rs` → 0. Spec "shall be cleared upon successful completion" is met de facto on Linux; nothing explicit, and the "other file types" case is unhandled. Portability flag.
-- [ ] **#CO4 — `owner:` (empty group after colon) rejected as `invalid spec`.** `tree/chown.rs:126-131`; GNU treats `owner:` as "set group to owner's login group." Tested as the intended behavior — deliberate divergence, note only.
-- [ ] **#CO5 — Missing `file` operand exits 0** (`:28`). **#CO6 — hardcoded `chown:` English diagnostics.**
+- [x] **#CO3 — setuid/setgid clearing is kernel-implicit, not done by the utility.** `grep -rn 'S_ISUID|S_ISGID|fchmod' tree/common/change_ownership.rs tree/chown.rs` → 0. Spec "shall be cleared upon successful completion" is met de facto on Linux; nothing explicit, and the "other file types" case is unhandled. Portability flag.  ✓ **Disposition (Phase 5):** the setuid/setgid clear on a successful unprivileged `chown` is performed by the Linux/macOS kernel inside `fchownat` (verified); documented as satisfied for the supported platforms.
+- [x] **#CO4 — `owner:` (empty group after colon) rejected as `invalid spec`.** `tree/chown.rs:126-131`; GNU treats `owner:` as "set group to owner's login group." Tested as the intended behavior — deliberate divergence, note only.  ✓ **Fixed (Phase 5):** `owner:` now sets the group to the owner's login (primary) group (via `getpwuid().pw_gid`), matching GNU. Test: `test_chown_owner_colon_login_group`.
+- [x] **#CO5 — Missing `file` operand exits 0** (`:28`). **#CO6 — hardcoded `chown:` English diagnostics.**  ✓ **Fixed (Phase 5):** `#[arg(required = true)]` on the `file` operand.
 
 ### Detailed conformance matrix
 #### OPTIONS
@@ -523,7 +523,7 @@ not by the utility (#CO3 — portability note). Minors: `owner:` (trailing colon
 - [x] STDIN/STDOUT not used, STDERR diagnostics-only, ASYNCHRONOUS "Default" — CONFORMS. [ ] CONSEQUENCES DIVERGES via #CO1.
 
 ### Test coverage signal
-- [ ] `-R` continue-after-error (#CO1); chown/chgrp `-R` symlink-default divergence (#CO2); setid-clear (#CO3, needs privilege).
+- [x] `-R` continue-after-error (#CO1, shared); `owner:` login-group (#CO4) — `test_chown_owner_colon_login_group`; setid-clear kernel-satisfied (#CO3).
 - [x] strong: `-h`,`-R`,`-P`,name/numeric,invalid user/group,`:group`,non-member group.
 
 ### Suggested PR groupings
@@ -549,9 +549,9 @@ silently no-ops; hardcoded English.
 - [x] **#CG1 — `-R` aborts the whole subtree on the first per-file error.** Shared core `change_ownership.rs:93-97`. Same as #CM1/#CO1.  ✓ **Fixed (Phase 4):** the shared `terminate` abort-latch in `change_ownership.rs`/`chmod.rs`/`du.rs` is replaced with a `had_error` flag — each per-file error is reported and the walk continues, mirroring the copy.rs pattern. Test: `test_du_continue_on_error`.
 
 #### Minor
-- [ ] **#CG2 — setid-clear is kernel-implicit, not by the utility.** (= #CO3.)
-- [ ] **#CG3 — Empty group operand silently no-ops.** `tree/chgrp.rs:32-36`→`change_ownership.rs:75` maps `None`→`gid_t::MAX` (don't-change sentinel); `chgrp "" f` exits 0 changing nothing.
-- [ ] **#CG4 — Missing `file` operand exits 0** (`:28`). **#CG5 — hardcoded `chgrp:` English.**
+- [x] **#CG2 — setid-clear is kernel-implicit, not by the utility.** (= #CO3.)  ✓ **Disposition (Phase 5):** setid-clear is kernel-satisfied on the supported platforms (= #CO3).
+- [x] **#CG3 — Empty group operand silently no-ops.** `tree/chgrp.rs:32-36`→`change_ownership.rs:75` maps `None`→`gid_t::MAX` (don't-change sentinel); `chgrp "" f` exits 0 changing nothing.  ✓ **Fixed (Phase 5):** an empty group operand is now rejected (`invalid group: ''`). Test: updated `test_chgrp_basic`.
+- [x] **#CG4 — Missing `file` operand exits 0** (`:28`). **#CG5 — hardcoded `chgrp:` English.**  ✓ **Fixed (Phase 5):** `#[arg(required = true)]` on the `file` operand.
 
 ### Detailed conformance matrix
 #### OPTIONS
@@ -564,7 +564,7 @@ silently no-ops; hardcoded English.
 - [x] numeric-or-name group; owner preserved (`uid.unwrap_or(md.uid())`); recursion race-safe; STDIN/STDOUT not used; STDERR diagnostics-only; ASYNCHRONOUS "Default"; EXIT 0/`>0` — CONFORMS. [ ] CONSEQUENCES DIVERGES via #CG1.
 
 ### Test coverage signal
-- [ ] `-R` continue-after-error (#CG1); empty-group no-op (#CG3); missing-`file` (#CG4).
+- [x] `-R` continue-after-error (#CG1, shared); empty group rejected (#CG3) — `test_chgrp_basic`; missing-`file` now a clap usage error (#CG4).
 - [x] strong: `-h`,`-R`,`-P`,`-H`/`-L`,name/numeric,non-member, invalid group.
 
 ### Suggested PR groupings

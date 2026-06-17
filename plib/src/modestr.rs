@@ -262,16 +262,8 @@ pub fn mutate(init_mode: u32, is_dir: bool, symbolic: &ChmodSymbolic) -> u32 {
                         group |= (rwx << 3) & !umask;
                         others |= rwx & !umask;
                     }
-
-                    if action.setuid {
-                        // If "who" is missing, set both `S_ISUID` and `S_ISGID`
-                        if clause.user || who_is_not_specified {
-                            special |= S_ISUID as u32;
-                        }
-                        if clause.group || who_is_not_specified {
-                            special |= S_ISGID as u32;
-                        }
-                    }
+                    // setuid/setgid for Add are handled by the shared `if action.setuid` block
+                    // after this match (#CM4 — removed a redundant duplicate set here).
                 }
 
                 // remove bits from the mode

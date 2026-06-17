@@ -659,3 +659,30 @@ fn test_chown_hardlink() {
 
     fs::remove_dir_all(test_dir).unwrap();
 }
+
+// Audit #CO4: the `owner:` form (trailing colon, empty group) sets the group to the owner's login
+// group rather than erroring.
+#[test]
+fn test_chown_owner_colon_login_group() {
+    use std::os::unix::fs::MetadataExt;
+    let test_dir = &format!(
+        "{}/test_chown_owner_colon_login_group",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let f = &format!("{test_dir}/f");
+    fs::create_dir(test_dir).unwrap();
+    fs::File::create(f).unwrap();
+
+    // Current user's own login → no privilege needed; group becomes the login group.
+    let uid = unsafe { libc::getuid() };
+    let login_gid = unsafe {
+        let p = libc::getpwuid(uid);
+        assert!(!p.is_null());
+        (*p).pw_gid
+    };
+    let spec = format!("{uid}:");
+    chown_test(&[&spec, f], "", "", 0);
+    assert_eq!(fs::metadata(f).unwrap().gid(), login_gid);
+
+    fs::remove_dir_all(test_dir).unwrap();
+}

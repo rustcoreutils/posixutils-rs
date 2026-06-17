@@ -218,7 +218,8 @@ fn test_chgrp_basic() {
     chgrp_test(&[g2, f], "", "", 0);
     assert_eq!(file_gid(f).unwrap(), gid2);
 
-    chgrp_test(&["", f], "", "", 0); // Empty group names are accepted
+    // An empty group operand is now rejected (#CG3); the file's group is unchanged.
+    chgrp_test(&["", f], "", "chgrp: invalid group: ''\n", 1);
     assert_eq!(file_gid(f).unwrap(), gid2);
 
     // Also done twice
@@ -310,8 +311,8 @@ fn test_chgrp_basic() {
         // Added check to see if the last chgrp was not optimized away
         assert!(f_ctime_2 > f_ctime_1);
 
-        // `chgrp '' f` is supposed to update the ctime
-        chgrp_test(&["", f], "", "", 0);
+        // A chgrp to the (already-current) group still updates the ctime.
+        chgrp_test(&[g1, f], "", "", 0);
         let f_ctime_3 = fs::metadata(f).unwrap().ctime();
         let g_ctime = fs::metadata(g).unwrap().ctime();
         assert!(f_ctime_3 > g_ctime);

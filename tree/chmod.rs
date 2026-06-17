@@ -27,7 +27,7 @@ struct Args {
     #[arg(allow_hyphen_values = true, help = gettext("Represents the change to be made to the file mode bits of each file named by one of the file operands"))]
     mode: String,
 
-    #[arg(help = gettext("The files to change"))]
+    #[arg(required = true, help = gettext("The files to change"))]
     files: Vec<String>,
 }
 

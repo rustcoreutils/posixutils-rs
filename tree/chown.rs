@@ -25,7 +25,20 @@ struct Args {
     owner_group: String,
 
     /// The files to change
+    #[arg(required = true)]
     files: Vec<String>,
+}
+
+// The login (primary) group ID of a user, used for the `owner:` operand form.
+fn login_gid(uid: u32) -> Option<u32> {
+    unsafe {
+        let passwd = libc::getpwuid(uid);
+        if passwd.is_null() {
+            None
+        } else {
+            Some((*passwd).pw_gid)
+        }
+    }
 }
 
 // lookup string group by name, or parse numeric group ID
@@ -87,7 +100,14 @@ fn parse_owner_group(owner_group: &str) -> Result<ParseOwnerGroupResult, String>
                 };
 
                 let gid = if group.is_empty() {
-                    None
+                    // `owner:` — use the owner's login (primary) group, matching GNU.
+                    match uid {
+                        Some(u) => Some(
+                            login_gid(u)
+                                .ok_or_else(|| gettext!("invalid spec: '{}'", owner_group))?,
+                        ),
+                        None => None, // `:` is handled by the EmptyOrColon branch above
+                    }
                 } else {
                     Some(parse_group(group)?)
                 };
@@ -103,7 +123,12 @@ fn main() -> Result<(), io::Error> {
     textdomain("posixutils-rs")?;
     bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
 
-    let args = Args::parse();
+    let mut args = Args::parse();
+
+    // Enable no-dereference if `-R` is given without `-H` or `-L` (parity with chgrp; #CO2).
+    if args.delegate.recurse && !(args.delegate.follow_cli || args.delegate.follow_symlinks) {
+        args.delegate.no_dereference = true;
+    }
 
     let mut exit_code = 0;
 
@@ -123,11 +148,10 @@ fn main() -> Result<(), io::Error> {
                     // `chown :group f` is equivalent to `chgrp group f`
                     (None, Some(gid))
                 }
-                (Some(_), None) => {
-                    // `chown owner: f` is invalid. There needs to be a group after the :
-                    let err_str = gettext!("invalid spec: '{}'", &args.owner_group);
-                    eprintln!("chown: {}", err_str);
-                    std::process::exit(1);
+                (Some(uid), None) => {
+                    // `chown owner:` resolved to the owner's login group above, so a None group
+                    // here is unexpected; treat it as owner-only.
+                    (Some(uid), None)
                 }
                 (Some(uid), Some(gid)) => (Some(uid), Some(gid)),
             },

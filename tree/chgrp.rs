@@ -25,14 +25,15 @@ struct Args {
     group: String,
 
     /// The files to change
+    #[arg(required = true)]
     files: Vec<String>,
 }
 
 // lookup string group by name, or parse numeric group ID
 fn parse_group(group: &str) -> Result<Option<u32>, String> {
-    // empty strings are accepted without errors
+    // An empty group operand is invalid (#CG3).
     if group.is_empty() {
-        return Ok(None);
+        return Err(gettext!("invalid group: '{}'", group));
     }
 
     match group.parse::<u32>() {

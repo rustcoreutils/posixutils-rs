@@ -46,6 +46,29 @@ the **destination must be an `ipp://` URI**, so historical
 system-default destination**, so bare `lp file` always exits 1. No Critical
 defects; no crashes, hangs, or data loss.
 
+### Remediation status (2026-06-17)
+
+All actionable findings are resolved on branch `print-audit` across five
+phases, each independently committed with build + `clippy --all-targets` +
+`fmt --check` + `cargo test -p posixutils-print` green:
+
+| Phase | Items | Summary |
+|---|---|---|
+| 1 | #4 (#3 WON'T-FIX) | `resolve_uri`: bare printer names → `ipp://localhost/printers/<name>`; `ipp://` verbatim; reject bad names; resolved URI echoed in errors. |
+| 2 | #6, #8, #9 | `-n` bounded to `i32::MAX`; malformed `-o` warns; missing `job-id` is an error (no `-0`). |
+| 3 | #5 | per-file errors continue (had-error accumulator) instead of aborting. |
+| 4 | #1, #2 | `-m`/`-w` poll job-state to completion (120 s bound), then mail (local sendmail) / write `/dev/tty`. |
+| 5 | #7, #10 WON'T-FIX | doc dispositions + README promotion. |
+
+**WON'T-FIX (documented):** **#3** (no system-default destination — conforming
+per 103059–103061), **#7** (`ipps://`/TLS — minimal-deps), **#10** (`NLSPATH` —
+consistent with the rest of the tree). `LC_TIME`/`TZ` were already N/A.
+
+Test surface: 22 integration + 5 unit tests. The success/poll path (request-ID
+to stdout, `-m`/`-w` completion) still needs a live IPP server and is
+unverifiable in `plib::testing` (no mock); covered by option-acceptance and
+helper unit tests instead.
+
 ### Priority issues
 
 #### Critical
@@ -64,10 +87,10 @@ defects; no crashes, hangs, or data loss.
 
 - [x] **#5 — Multi-file run aborts on the first error; later operands are not attempted.** ✓ **fixed (Phase 3).** `do_lp` now returns `Result<bool, String>`: destination/resolve failures stay fatal, but a per-file `read_input`/`send_print_job` error is reported to stderr, sets a `had_error` flag, and `continue`s to the next operand. `main` maps `Ok(true)` → non-zero exit. So `lp a b c` attempts every operand and still exits non-zero. Test: `lp_multifile_continues_on_error` (first operand unreadable, second `-` still attempted).
 - [x] **#6 — `-n copies` (`u32`) is cast to `i32` and wraps negative for values > 2147483647.** ✓ **fixed (Phase 2).** The clap validator is now `range(1..=i64::from(i32::MAX))`, so values above `i32::MAX` are rejected with exit 2 before any `as i32` cast. Test: `lp_n_copies_overflow_rejected`.
-- [ ] **#7 — `ipps://` (TLS) destinations are unsupported.** `print/lp.rs:78` accepts only the `ipp://` prefix; `Cargo.toml` drops TLS features for minimal deps. Encrypted print queues cannot be targeted. Fix: accept `ipps://` (needs the `ipp` TLS feature) or document the limitation.
+- [x] ~~**#7 — `ipps://` (TLS) destinations are unsupported.**~~ **WON'T-FIX (Phase 5).** Adding `ipps://` requires the `ipp` `client-tls`/`client-rustls` feature, which pulls in `rustls-native-certs` + `once_cell` + a TLS backend — contrary to the crate's explicit minimal-dependencies / no-TLS posture (`Cargo.toml`). Documented in `resolve_uri`'s doc comment as intentionally unsupported.
 - [x] **#8 — `-o` options without `=` are silently discarded.** ✓ **fixed (Phase 2).** The `split_once('=')` `else` branch now emits a gettext'd `lp: ignoring malformed -o option (expected name=value): <opt>` diagnostic to stderr before skipping. Test: `lp_o_malformed_warned`.
 - [x] **#9 — Request ID degrades to `<dest>-0` when the IPP response omits `job-id`.** ✓ **fixed (Phase 2).** `send_print_job` now returns `Err("printer response missing job-id")` (non-zero exit) instead of `.unwrap_or(0)`, honoring the unique-request-ID mandate (103065). Not unit-tested (requires a non-conformant IPP server, which the harness lacks).
-- [ ] **#10 — `NLSPATH` (XSI) is not explicitly honored.** `print/lp.rs` never reads `NLSPATH`; message-catalog lookup relies on `gettextrs`/`setlocale` defaults. Consistent with the rest of the tree; track for completeness.
+- [x] ~~**#10 — `NLSPATH` (XSI) is not explicitly honored.**~~ **WON'T-FIX (Phase 5).** `NLSPATH` is an XSI message-catalog override that no utility in the tree wires explicitly; catalog lookup goes through `gettextrs`/`setlocale` defaults. Left consistent with the rest of posixutils rather than special-casing `lp`.
 
 ### Detailed conformance matrix
 
@@ -84,11 +107,11 @@ defects; no crashes, hangs, or data loss.
 | Opt | Status | Notes (file:line) |
 |---|---|---|
 | `-c` | CONFORMS¹ | `_copy` parsed, never consulted (`lp.rs:25-26`). ¹**#C-note:** `read_input` slurps the whole file into a `Vec<u8>` and `client.send` uploads it synchronously *before* lp exits (`lp.rs:88-100, 162-168`), so "further access to the input files is no longer required" the moment lp returns — the `-c` guarantee (103072–103079) holds on **every** invocation. A conforming no-op, distinct from #1/#2. |
-| `-d dest` | PARTIAL | Precedence correct (`lp.rs:54-73`) but value must be `ipp://…` (#4). |
-| `-n copies` | PARTIAL | Sets IPP `copies` when >1 (`lp.rs:136-141`); `range(1..)` rejects 0/negative; `u32→i32` overflow (#6). |
-| `-m` | MISSING | (#1) `_mail` never consulted (`lp.rs:34-35`). |
+| `-d dest` | CONFORMS | Precedence correct; `ipp://` used verbatim, any other value resolved as a bare name → `ipp://localhost/printers/<name>` (#4 ✓ Phase 1). |
+| `-n copies` | CONFORMS | Sets IPP `copies` when >1; `range(1..=i32::MAX)` rejects 0/negative/overflow (#6 ✓ Phase 2). |
+| `-m` | CONFORMS | After printing, mails the requesting user via local sendmail (#1 ✓ Phase 4). |
 | `-s` | CONFORMS | Suppresses only the request-ID line (`lp.rs:221-223`), not stderr diagnostics — matches 103098 + STDERR 103150. |
-| `-w` | MISSING | (#2) `_write` never consulted (`lp.rs:40-41`). |
+| `-w` | CONFORMS | After printing, writes a completion message to `/dev/tty` (#2 ✓ Phase 4). |
 | `-o option` | CONFORMS | Repeatable (`ArgAction::Append`, `lp.rs:43`); `name=value` → typed IPP attribute (`lp.rs:145-160`). `-o` is spec-unspecified; malformed-option silence is #8. |
 | `-t title` | CONFORMS | Maps to IPP `job-name`/`job_title` (`lp.rs:128-133`); falls back to the file's basename when `-t` absent — a reasonable default, not a divergence. |
 

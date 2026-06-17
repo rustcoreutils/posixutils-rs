@@ -143,31 +143,31 @@ POSIX requirement and is correctly not implemented.
 ### Priority issues
 
 #### Major
-- [ ] **`#F1` — stdout PID format diverges from `" %1d"`.** `fuser.rs:1435-1438`.
+- [x] **`#F1` — stdout PID format diverges from `" %1d"`.** ✓ fixed in Phase 7. `fuser.rs:1435-1438`.
   Spec (slice 98794-98795): "On standard output, the process ID in the format:
   `" %1d", <process ID>`" — exactly **one** leading space. The code uses
   `let width = if pid.to_string().len() > 4 { " " } else { "  " }` → **two**
   spaces for ≤4-digit PIDs. Fix: `print!(" {}", pid)` unconditionally.
-- [ ] **`#F2` — `/proc/<pid>/maps` device number uses 8-bit minor encoding.**
+- [x] **`#F2` — `/proc/<pid>/maps` device number uses 8-bit minor encoding.** ✓ fixed in Phase 7 (libc::makedev).
   `fuser.rs:752` (`tmp_maj * 256 + tmp_min`). Modern Linux uses the split
   `makedev` encoding (minors > 255); this yields wrong device IDs on LVM / high
   minors → false negatives. Fix: `libc::makedev(tmp_maj, tmp_min)`.
-- [ ] **`#F3` — `scan_procs` error hard-exits, bypassing the error path.**
+- [x] **`#F3` — `scan_procs` error hard-exits, bypassing the error path.** ✓ fixed in Phase 7.
   `fuser.rs:368-380` calls `std::process::exit(1)` directly instead of
   propagating the `Err` to `main`. Exit is incidentally >0 (POSIX-OK) but the
   abrupt exit skips flush/cleanup. Fix: propagate with `?`.
 
 #### Minor
-- [ ] **`#F4` — `read_proc_mounts` can panic on a malformed line.**
+- [x] **`#F4` — `read_proc_mounts` can panic on a malformed line.** ✓ fixed in Phase 7.
   `fuser.rs:833` indexes `parts[1]` without a bounds check. Kernel-generated
   `/proc/mounts` is normally well-formed, but a short line panics. Use
   `parts.get(1)` and skip.
-- [ ] **`#F5` — macOS `pid.try_into().unwrap()`.** `fuser.rs:1351`. `.unwrap()`
+- [x] **`#F5` — macOS `pid.try_into().unwrap()`.** ✓ fixed in Phase 7. `fuser.rs:1351`. `.unwrap()`
   on `/proc`-style data is a code smell; use `pid as i32`.
-- [ ] **`#F6` — `Access::File`/`Access::Filewr` use-chars dropped.**
+- [x] **`#F6` — `Access::File`/`Access::Filewr` use-chars dropped.** ✓ fixed in Phase 7.
   `fuser.rs:1421` (`_ => ()`). POSIX mandates only `c` and `r`; `f`/`F` are
   "may", so this is a behavioral gap vs GNU `fuser`, not a spec violation.
-- [ ] **`#F7` — detached timeout thread leak.** `fuser.rs:1484`. The NFS-stall
+- [x] **`#F7` — detached timeout thread leak.** ✓ addressed in Phase 7 (self-reaps on stat completion; noise removed; full cancellation not portable). `fuser.rs:1484`. The NFS-stall
   guard thread is detached and keeps running on timeout.
 - [ ] **`#C1` — diagnostics hardcoded English.** `fuser.rs:648,652,901,1487,1521`.
 

@@ -18,7 +18,8 @@ use std::thread;
 use std::time::Duration;
 
 use clap::{CommandFactory, Parser};
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
+use plib::diag;
 
 const NAME_FIELD: usize = 20;
 
@@ -365,18 +366,14 @@ mod linux {
                 }
             }
 
-            if scan_procs(
+            scan_procs(
                 need_check_map,
                 name,
                 &inode_list,
                 &device_list,
                 &unix_socket_list,
                 net_dev,
-            )
-            .is_err()
-            {
-                std::process::exit(1);
-            }
+            )?;
         }
 
         Ok(names)
@@ -645,11 +642,20 @@ mod linux {
         let dir_entries = match fs::read_dir(&dir_path) {
             Ok(entries) => entries,
             Err(err) if err.kind() == ErrorKind::PermissionDenied => {
-                eprintln!("Permission denied for directory: {:?}", dir_path);
+                diag::warning(&format!(
+                    "{}: {:?}",
+                    gettext("permission denied for directory"),
+                    dir_path
+                ));
                 return Ok(());
             }
             Err(err) => {
-                eprintln!("Failed to read directory {:?}: {:?}", dir_path, err);
+                diag::warning(&format!(
+                    "{} {:?}: {:?}",
+                    gettext("failed to read directory"),
+                    dir_path,
+                    err
+                ));
                 return Err(err);
             }
         };
@@ -749,8 +755,11 @@ mod linux {
                         Err(_) => continue,
                     };
 
-                    let device = tmp_maj * 256 + tmp_min;
-                    let device_int = device as u64;
+                    // Use makedev() so high-numbered minors are encoded the
+                    // same way the kernel does (the old maj*256+min formula
+                    // assumed an 8-bit minor and misidentified LVM / large
+                    // devices).
+                    let device_int = libc::makedev(tmp_maj, tmp_min) as u64;
 
                     if device_list
                         .iter()
@@ -830,8 +839,12 @@ mod linux {
         for line in reader.lines() {
             let line = line?;
             let parts: Vec<&str> = line.split_whitespace().collect();
-            let mountpoint = PathBuf::from(parts[1].trim());
-            mount_list.mountpoints.push(mountpoint);
+            // /proc/mounts is kernel-generated, but guard against a short line
+            // rather than panicking on an out-of-bounds index.
+            let Some(field) = parts.get(1) else {
+                continue;
+            };
+            mount_list.mountpoints.push(PathBuf::from(field.trim()));
         }
 
         Ok(mount_list)
@@ -898,7 +911,11 @@ mod linux {
             Some(addr_str) => match addr_str.parse::<IpAddr>() {
                 Ok(addr) => addr,
                 Err(_) => {
-                    eprintln!("Warning: Invalid remote address {}", addr_str);
+                    diag::warning(&format!(
+                        "{} {}",
+                        gettext("invalid remote address"),
+                        addr_str
+                    ));
                     IpAddr::V4(Ipv4Addr::UNSPECIFIED) // Default value if address parsing fails
                 }
             },
@@ -1346,13 +1363,7 @@ mod macos {
             )?;
 
             for pid in pids {
-                add_process(
-                    name,
-                    pid.try_into().unwrap(),
-                    uid,
-                    Access::Cwd,
-                    ProcType::Normal,
-                );
+                add_process(name, pid as i32, uid, Access::Cwd, ProcType::Normal);
             }
         }
 
@@ -1418,7 +1429,8 @@ fn print_matches(name: &mut Names, user: bool) -> Result<(), io::Error> {
             Access::Cwd => entry.0.push('c'),
             Access::Exe => entry.0.push('e'),
             Access::Mmap => entry.0.push('m'),
-            _ => (),
+            Access::File => entry.0.push('f'),
+            Access::Filewr => entry.0.push('F'),
         }
 
         #[cfg(target_os = "macos")]
@@ -1433,9 +1445,8 @@ fn print_matches(name: &mut Names, user: bool) -> Result<(), io::Error> {
     }
 
     for (pid, (access, uid)) in proc_map {
-        let width = if pid.to_string().len() > 4 { " " } else { "  " };
-
-        print!("{}{}", width, pid);
+        // POSIX format is " %1d": exactly one leading space before each PID.
+        print!(" {}", pid);
         io::stdout().flush()?;
 
         eprint!("{}", access);
@@ -1480,12 +1491,13 @@ fn timeout(path: &str, seconds: u32) -> Result<Metadata, io::Error> {
     let (tx, rx) = mpsc::channel();
     let path = path.to_string(); // Clone path into a `String` with `'static` lifetime
 
-    // Spawn a thread to retrieve the metadata
+    // Spawn a helper thread to retrieve the metadata. If the stat() blocks
+    // past the timeout (e.g. a stalled NFS mount), we stop waiting on it; the
+    // thread then self-reaps as soon as stat() finally returns and its send
+    // fails harmlessly against the dropped receiver. (Cancelling an in-flight
+    // stat() is not portable in safe Rust, so this is the bounded best effort.)
     thread::spawn(move || {
-        let metadata = metadata(&path); // Use the cloned `String` here
-        if let Err(e) = tx.send(metadata) {
-            eprintln!("Failed to send result through channel: {}", e);
-        }
+        let _ = tx.send(metadata(&path));
     });
 
     // Wait for the result or timeout
@@ -1501,9 +1513,7 @@ fn timeout(path: &str, seconds: u32) -> Result<Metadata, io::Error> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    diag::init_locale("fuser");
 
     let Args {
         mount,
@@ -1518,7 +1528,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => {
             let mut stdout = std::io::stdout();
             let mut cmd = Args::command();
-            eprintln!("No process specification given");
+            diag::error(&gettext("no process specification given"));
             cmd.write_help(&mut stdout).unwrap();
             std::process::exit(1);
         }

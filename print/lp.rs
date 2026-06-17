@@ -28,7 +28,9 @@ struct Args {
     #[arg(short = 'd', help = gettext("Printer destination (IPP URI)"))]
     dest: Option<String>,
 
-    #[arg(short = 'n', default_value = "1", value_parser = clap::value_parser!(u32).range(1..), help = gettext("Number of copies to print"))]
+    // Upper-bounded to i32::MAX: the IPP `copies` attribute is a signed 32-bit
+    // integer, so a larger value would wrap negative when sent.
+    #[arg(short = 'n', default_value = "1", value_parser = clap::value_parser!(u32).range(1..=i64::from(i32::MAX)), help = gettext("Number of copies to print"))]
     copies: u32,
 
     #[arg(short = 'm', help = gettext("Send mail after printing"))]
@@ -173,8 +175,14 @@ fn send_print_job(
                 IppValue::Keyword(value.to_string())
             };
             builder = builder.attribute(IppAttribute::new(name, ipp_value));
+        } else {
+            // Not in IPP `name=value` attribute format: warn and skip.
+            eprintln!(
+                "lp: {}: {}",
+                gettext("ignoring malformed -o option (expected name=value)"),
+                opt
+            );
         }
-        // Ignore options without '=' as they're not valid IPP attribute format
     }
 
     let operation = builder.build();
@@ -196,16 +204,16 @@ fn send_print_job(
         ));
     }
 
-    // Extract job-id from response
+    // Extract job-id from response. POSIX 103065 mandates a unique request ID,
+    // so a response lacking job-id is an error rather than a fabricated "-0".
     let job_id = response
         .attributes()
         .groups_of(DelimiterTag::JobAttributes)
         .flat_map(|g| g.attributes().get("job-id"))
         .flat_map(|attr| attr.value().as_integer().copied())
-        .next()
-        .unwrap_or(0);
+        .next();
 
-    Ok(job_id)
+    job_id.ok_or_else(|| gettext("printer response missing job-id"))
 }
 
 fn do_lp(mut args: Args) -> Result<(), String> {

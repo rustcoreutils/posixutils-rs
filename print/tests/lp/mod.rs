@@ -360,6 +360,66 @@ fn lp_n_zero_rejected() {
     );
 }
 
+/// Test that -n above i32::MAX is rejected by clap validation
+#[test]
+fn lp_n_copies_overflow_rejected() {
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("lp"),
+            args: vec![
+                "-n".to_string(),
+                "3000000000".to_string(),
+                "-d".to_string(),
+                "ipp://localhost/ipp/print".to_string(),
+            ],
+            stdin_data: String::from("test data"),
+            expected_out: String::from(""),
+            expected_err: String::from(""),
+            expected_exit_code: 2,
+        },
+        &[("LPDEST", ""), ("PRINTER", "")],
+        |_, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // Above i32::MAX must be rejected with a validation error, not sent.
+            assert!(
+                stderr.contains("error:"),
+                "Expected validation error for -n 3000000000, got: {}",
+                stderr
+            );
+            assert_eq!(output.status.code(), Some(2));
+        },
+    );
+}
+
+/// Test that a malformed -o option (no '=') produces a warning
+#[test]
+fn lp_o_malformed_warned() {
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("lp"),
+            args: vec![
+                "-o".to_string(),
+                "noequals".to_string(),
+                "-d".to_string(),
+                "ipp://localhost/ipp/print".to_string(),
+            ],
+            stdin_data: String::from("test data"),
+            expected_out: String::from(""),
+            expected_err: String::from(""),
+            expected_exit_code: 1,
+        },
+        &[("LPDEST", ""), ("PRINTER", "")],
+        |_, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("malformed -o option") && stderr.contains("noequals"),
+                "Expected malformed -o warning, got: {}",
+                stderr
+            );
+        },
+    );
+}
+
 /// Test that -t title option is accepted
 #[test]
 fn lp_t_title_accepted() {

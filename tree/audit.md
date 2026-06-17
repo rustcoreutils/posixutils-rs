@@ -126,6 +126,8 @@ conform.
 
 ### Priority issues
 
+> **Resolved 2026-06-17** (this branch). All cp items closed: #C1 (Phase 2), #C2 (Phase 3), #C3 (Phase 4), #C8 (Phase 7); #C4/#C5/#C6 documented WON'T-FIX. Regression tests in `tree/tests/cp/mod.rs`.
+
 #### Critical
 - [x] **#C1 — `cp -p` does not clear `S_ISUID`/`S_ISGID` when ownership can't be duplicated (privilege leak).** `tree/common/copy.rs:793-803` ignored the `fchownat` result, then `:806-811` applied the **full source mode** via `fchmodat`, re-setting the setuid/setgid bits on a file now owned by the copying user. POSIX 90720-90721: *"If the user ID or the group ID cannot be duplicated, the file permission bits S_ISUID and S_ISGID shall be cleared."* Behaviorally: as non-root, `cp -p /usr/bin/passwd ./x` → `./x` ended up `-rwsr-xr-x caller:caller` (`4755`); GNU clears it to `0755`. ✓ **Fixed (Phase 2):** `copy_characteristics` now records whether `fchownat` succeeded and masks `~(S_ISUID|S_ISGID)` out of the mode before `fchmodat` when it did not. Re-verified: `cp -p /usr/bin/passwd` now yields `0755` (matches GNU); same-owner `cp -p` still preserves the bits. Tests: `test_cp_preserve_keeps_setuid_same_owner` (non-root) and root-gated `test_cp_preserve_clears_setuid_on_chown_fail` in `tree/tests/cp/mod.rs`.
 
@@ -134,15 +136,15 @@ conform.
 - [x] **#C3 — A per-file failure aborts the entire hierarchy copy instead of continuing with same-level siblings.** `tree/common/copy.rs` set `terminate = true` on the first `copy_file_impl` error, short-circuiting every subsequent entry. POSIX 90829-90832: *"When a failure occurs during the copying of a file hierarchy, cp is required to attempt to copy files that are on the same level in the hierarchy or above the file where the failure occurred."* ✓ **Fixed (Phase 4):** `CopyConfig` gained `continue_on_error` (cp `true`, mv `false`) and `prog`. In cp mode each per-file failure is diagnosed immediately (`{prog}: …`), an exit-status flag is set, and the walk continues; only mv still stops on the first structural error (so it never removes a source it could not fully duplicate). Additionally, **mv 108114-108115** is now honored: a characteristics-duplication failure is never fatal and does **not** change mv's exit status (cp still exits non-zero). Re-verified: `cp -R` over a tree with interspersed unreadable files copies every readable sibling, diagnoses each failure, and exits 1. Test: `test_cp_recursive_continue_on_error`.
 
 #### Minor
-- [ ] **#C4 — `source/.` trailing form is a non-POSIX extension (self-flagged).** `tree/common/copy.rs:637-660` special-cases a `…/.` source to copy a directory's *contents* (the code's own comment: *"This doesn't seem to be compliant with POSIX"*). Matches GNU `cp -R dir/.` behavior; harmless extension. Document or gate.
-- [ ] **#C5 — Special-file destination mode is hardcoded `0o644`, ignoring umask.** `tree/common/copy.rs:697-706`: non-FIFO special files (`-R`) are created with `mknodat` mode `0o644`; FIFOs correctly use the source mode. POSIX leaves special-file permissions/owner/group **unspecified** (90683-90687, RATIONALE 90833-90839), so this conforms, but `0644` unmodified by umask is a deliberate choice worth noting; with `-p` the subsequent `copy_characteristics` overwrites it with the source mode anyway.
-- [ ] **#C6 — `-H`/`-L` require `-R` (clap `requires = "recursive"`).** `tree/cp.rs:34,47`. POSIX lists `-H`/`-L`/`-P` only under the `-R` synopsis form, so requiring `-R` for `-H`/`-L` is defensible, but GNU accepts `-L`/`-H` without `-R`. `-P` correctly does **not** require `-R` (`cp.rs:53-63`, matching synopsis form 1/2 `[-Pfip]`). Low priority.
+- [x] ~~**#C4 — `source/.` trailing form is a non-POSIX extension.**~~ **WON'T FIX:** GNU-compatible (`cp -R dir/.` copies contents), harmless, and covered by `test_cp_dir_slash`. Kept intentionally.
+- [x] ~~**#C5 — Special-file destination mode is hardcoded `0o644`.**~~ **WON'T FIX:** POSIX leaves special-file permissions/owner/group **unspecified** (90683-90687, RATIONALE 90833-90839); FIFOs already use the source mode and `-p` overwrites the mode via `copy_characteristics`. Conforms as-is.
+- [x] ~~**#C6 — `-H`/`-L` require `-R`.**~~ **WON'T FIX:** POSIX lists `-H`/`-L` only under the `-R` synopsis form, so they are only meaningful with `-R`; requiring it is defensible (`-P` already works without `-R`).
 
 ### Detailed conformance matrix
 
 #### SYNOPSIS / operand dispatch
 - [x] Three synopsis forms recognized via target-is-directory probe (`cp.rs:117-131`) + `copy_files`/`copy_file`.
-- [ ] **>2 operands + non-dir target not an error** (#C2, Major) — `cp.rs:139-156`.
+- [x] **>2 operands + non-dir target now errors** (#C2 ✓, Phase 3) — `cp.rs` `main`.
 - [x] `-` operand treated as a literal filename, not stdin (no special-casing; `PathBuf` operands). Conforms 90731-90736.
 
 #### OPTIONS
@@ -176,7 +178,7 @@ conform.
 
 #### EXIT STATUS / CONSEQUENCES OF ERRORS
 - [x] 0 on success, >0 on error (90776-90779); `copy_files` accumulates failures and `main` exits 1 (`cp.rs:135-138`). A non-affirmative `-i` response is **not** an error (`CopyResult::Skipped`, `copy.rs:558`), matching 90777-90778.
-- [ ] (#C3) On error mid-hierarchy, cp stops rather than continuing same-level/above (90829-90832).
+- [x] (#C3 ✓, Phase 4) On error mid-hierarchy, cp now continues with same-level/above entries (90829-90832).
 
 ### Race-safety & security (cp)
 - **Hardened:** all in-tree file creation/overwrite is dir-fd-relative (`openat`/`mkdirat`/`symlinkat`/`mknodat` against ftw `target_dirfd` and `source.dir_fd()`), so the recursive interior is not path-re-resolving.
@@ -184,9 +186,9 @@ conform.
 - **Security:** #C1 (setuid/setgid leak) is the headline. The created-file just-overwritten guard (`copy.rs:243-250`) prevents a source from clobbering a file cp created this run.
 
 ### Test coverage signal
-- [ ] No test asserts setuid/setgid are cleared under `cp -p` when `chown` fails (#C1).
-- [ ] No test asserts the error for `cp a b non_dir_target` with >2 operands (#C2).
-- [ ] No test asserts same-level siblings are still copied after a per-file error (#C3).
+- [x] setuid/setgid cleared under `cp -p` when `chown` fails (#C1) — `test_cp_preserve_clears_setuid_on_chown_fail` (root-gated) + `test_cp_preserve_keeps_setuid_same_owner`.
+- [x] error for `cp a b non_dir_target` with >2 operands (#C2) — `test_cp_multi_source_nondir_target`.
+- [x] same-level siblings still copied after a per-file error (#C3) — `test_cp_recursive_continue_on_error`.
 - [x] Symlink, dangling-symlink, hard-link, preserve-times, special-file, trailing-slash, copy-into-self paths are exercised (`tree/tests/cp/mod.rs`).
 
 ### Suggested PR groupings
@@ -219,6 +221,8 @@ first source (removing it) and exits 0.
 
 ### Priority issues
 
+> **Resolved 2026-06-17** (this branch). All mv items closed: #M1 (Phase 2), #M2 + trailing-slash (Phase 3), characteristics exit-status (Phase 4), #M3/#M4/#M5 (Phase 7). Regression tests in `tree/tests/mv/mod.rs`.
+
 #### Critical
 - [x] **#M1 — Cross-filesystem `mv` does not clear `S_ISUID`/`S_ISGID` when ownership can't be duplicated.** `tree/mv.rs:80` sets `preserve = true` and routes through the shared `copy_characteristics` (`copy.rs`), which had the #C1 defect. POSIX 108104-108105: *"If the user ID, group ID, or file mode of a regular file cannot be duplicated, the file mode bits S_ISUID and S_ISGID shall not be duplicated."* ✓ **Fixed (Phase 2):** closed by the shared `copy_characteristics` fix (#C1).
 
@@ -233,8 +237,8 @@ first source (removing it) and exits 0.
 
 #### SYNOPSIS / operand dispatch
 - [x] Two forms via target-is-existing-directory probe (`mv.rs:390-402`); destination = `target.join(file_name)` (108054-108056).
-- [ ] **>2 operands + non-dir target not an error** (#M2, Major).
-- [ ] **Trailing-slash on a non-directory source→target_file not enforced.** POSIX 108049-108050: a non-directory source with a `target_file` ending in `/` *"shall [be] treat[ed] as an error and no source_file operands shall be processed."* No such check exists. Minor.
+- [x] **>2 operands + non-dir target now errors** (#M2 ✓, Phase 3).
+- [x] **Trailing-slash on a non-directory source→target_file now enforced** (Phase 3). POSIX 108049-108050: a non-directory source with a `target_file` ending in `/` is an error.
 
 #### OPTIONS
 
@@ -262,9 +266,9 @@ first source (removing it) and exits 0.
 - **Security:** #M1 (setuid/setgid leak across filesystems).
 
 ### Test coverage signal
-- [ ] No test for `mv a b non_dir_target` (>2 operands) erroring (#M2).
-- [ ] No test for setuid/setgid clearing on cross-device move with failed `chown` (#M1).
-- [ ] No test for a non-directory source with a trailing-slash `target_file` (108049-108050).
+- [x] `mv a b non_dir_target` (>2 operands) errors (#M2) — `test_mv_multi_source_nondir_target`.
+- [x] setuid/setgid clearing when ownership can't be duplicated (#M1) — covered by the shared `copy_characteristics` fix and `test_cp_preserve_clears_setuid_on_chown_fail` (mv cross-device uses the same engine; a dedicated cross-fs root test would add `OTHER_PARTITION_TMPDIR` plumbing — deferred).
+- [x] non-directory source with a trailing-slash `target_file` (108049-108050) — `test_mv_nondir_source_trailing_slash`.
 - [x] atomic move, cross-device (`part_rename`/`part_hardlink`), hard-link preservation, same-file/symlink-onto-self, dir-vs-file, into-self, fd-leak paths are exercised (`tree/tests/mv/mod.rs`).
 
 ### Suggested PR groupings
@@ -293,6 +297,8 @@ The single-file (non-recursive) removal path is also path-based rather than
 dir-fd-relative, and a handful of `unreachable!()`/`unwrap()` sites are process-aborting.
 
 ### Priority issues
+
+> **Resolved 2026-06-17** (this branch). All rm items closed: #R1/#R2 (Phase 5), #R3/#R4/#R5 (Phase 6), #R6 (Phase 7). Regression tests in `tree/tests/rm/mod.rs`.
 
 #### Major
 - [x] **#R1 — `-d` (remove empty directories) is unimplemented.** POSIX SYNOPSIS `rm [-diRrv] file...` (113356), OPTIONS 113404, DESCRIPTION 113369-113370 (Austin Group Defect 802). ✓ **Fixed (Phase 5):** added `-d/--dir`; a directory operand with `-d` and without `-r`/`-R` is removed via `fs::remove_dir` (rmdir) after the standard prompt, failing with `Directory not empty` on a non-empty directory; `-r`/`-R` take precedence (113534-113535). Tests: `test_rm_d_empty`, `test_rm_d_nonempty`, `test_rm_dr_precedence`.
@@ -337,9 +343,9 @@ dir-fd-relative, and a handful of `unreachable!()`/`unwrap()` sites are process-
 - **Security note:** the `-i` prompt between ftw's stat and the descent open (#F1) makes the rm race window arbitrarily wide when prompting is enabled.
 
 ### Test coverage signal
-- [ ] No test for `-d` or `-v` (don't exist — #R1, #R2).
-- [ ] No test for bare `rm` (no operands, no `-f`) erroring (#R3).
-- [ ] No adversarial test for the descent-open symlink-swap race (#F1) — would need a concurrent-rename harness.
+- [x] `-d` / `-v` (#R1, #R2) — `test_rm_d_empty`, `test_rm_d_nonempty`, `test_rm_dr_precedence`, `test_rm_v_file`, `test_rm_dv_empty_dir`.
+- [x] bare `rm` (no operands, no `-f`) errors (#R3) — `test_rm_no_operand`, `test_rm_f_no_operand`.
+- [x] descent-open symlink-swap race (#F1) — `ftw/tests/race.rs` deterministically swaps a directory for a symlink/other-dir inside the handler (no concurrency needed) and is verified to fail without the fix.
 - [x] cycle, dangling-symlink, deep tree, write-protected dir, dot-relative, empty/inaccessible, readdir-bug, `-i`/`-f`/`-r` combinations, root-link, EACCES paths are exercised (`tree/tests/rm/mod.rs`).
 
 ### Suggested PR groupings
@@ -352,22 +358,29 @@ dir-fd-relative, and a handful of `unreachable!()`/`unwrap()` sites are process-
 
 ## Cross-utility summary
 
-| # | Util | Sev | One-liner |
-|---|---|---|---|
-| #F1 | ftw | **Critical** | descent `openat` without `O_NOFOLLOW`/dev-ino re-check → leaf symlink-swap redirects `rm -r` to delete arbitrary dirs. |
-| #C1 | cp | **Critical** | `cp -p` keeps `S_ISUID`/`S_ISGID` when `chown` fails (privilege leak). |
-| #M1 | mv | **Critical** | cross-fs `mv` keeps setuid/setgid when ownership can't be duplicated (same root cause). |
-| #C2 | cp | Major | `cp a b c` (c not a dir) copies only `a`, exit 0. |
-| #M2 | mv | Major | `mv a b c` (c not a dir) moves only `a` (removing it), exit 0. |
-| #C3 | cp | Major | first per-file error aborts the whole hierarchy copy (vs continue same-level). |
-| #R1 | rm | Major | `-d` (remove empty dir) unimplemented. |
-| #R2 | rm | Major | `-v` (verbose) unimplemented. |
-| #F2–#F5, #C4–#C8, #M3–#M6, #R3–#R6 | — | Minor | panic surfaces, path-based seams, `yesexpr`, prompt `unwrap`, special-file mode, trailing-slash, errno hygiene. |
+**Status: all findings remediated 2026-06-17** (8 phases on this branch). `#C4/#C5/#C6`
+are documented WON'T-FIX (intentional/impl-defined); everything else is fixed with
+regression tests.
 
-**Headline.** The recursive *interior* of all three utilities is built correctly on
-ftw's dir-fd model, but three Critical issues cut across the family: a single ftw descent
-race (#F1) that turns `rm -r` into an arbitrary-deletion primitive under an adversarial
-rename, and a shared `copy_characteristics` privilege-leak (#C1/#M1) that re-applies
-setuid/setgid after a failed `chown`. Two Major operand-validation bugs (#C2/#M2) silently
-drop sources, and `rm` is missing two POSIX.1-2024-mandated options (#R1 `-d`, #R2 `-v`).
-No source was changed by this audit.
+| # | Util | Sev | One-liner | Status |
+|---|---|---|---|---|
+| #F1 | ftw | **Critical** | descent `openat` without `O_NOFOLLOW`/dev-ino re-check → leaf symlink-swap redirects `rm -r` to delete arbitrary dirs. | ✓ Ph1 |
+| #C1 | cp | **Critical** | `cp -p` keeps `S_ISUID`/`S_ISGID` when `chown` fails (privilege leak). | ✓ Ph2 |
+| #M1 | mv | **Critical** | cross-fs `mv` keeps setuid/setgid when ownership can't be duplicated (same root cause). | ✓ Ph2 |
+| #C2 | cp | Major | `cp a b c` (c not a dir) copies only `a`, exit 0. | ✓ Ph3 |
+| #M2 | mv | Major | `mv a b c` (c not a dir) moves only `a` (removing it), exit 0. | ✓ Ph3 |
+| #C3 | cp | Major | first per-file error aborts the whole hierarchy copy (vs continue same-level). | ✓ Ph4 |
+| #R1 | rm | Major | `-d` (remove empty dir) unimplemented. | ✓ Ph5 |
+| #R2 | rm | Major | `-v` (verbose) unimplemented. | ✓ Ph5 |
+| #F2–#F5, #M3–#M6, #R3–#R6, #C8 | — | Minor | panic surfaces, symlink-cycle, path-based seams, `yesexpr`, prompt `unwrap`, errno hygiene. | ✓ Ph1/6/7 |
+| #C4, #C5, #C6 | cp | Minor | `src/.` extension, special-file `0o644`, `-H/-L` require `-R`. | WON'T-FIX |
+
+**Headline.** The recursive *interior* of all three utilities was already built correctly
+on ftw's dir-fd model; this remediation closed the three Critical issues that cut across
+the family — the ftw descent race (#F1, now `O_NOFOLLOW`/`O_DIRECTORY` + `(dev,ino)`
+re-verification), and the shared `copy_characteristics` privilege-leak (#C1/#M1, now masks
+setuid/setgid when `chown` fails) — plus the operand-validation bugs (#C2/#M2), cp
+continue-on-error (#C3), the two missing rm options (#R1 `-d`, #R2 `-v`), and the panic /
+i18n / errno minors. **Residuals (documented):** the rare fd-conserving `DeferredDir` path
+has no `(dev,ino)` baseline (fails closed via `O_NOFOLLOW`), and #F3's deep-tree reopen
+still `panic!`s on a mid-walk race rather than routing to `err_reporter`.

@@ -10,8 +10,7 @@
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use std::fs;
-use std::io::{self, Error};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// rmdir - remove directories
 #[derive(Parser)]
@@ -24,24 +23,33 @@ struct Args {
     dirs: Vec<String>,
 }
 
-fn remove_dir(dirname: &str, rm_parents: bool) -> io::Result<()> {
-    fs::remove_dir(dirname)?;
+/// Remove `operand` and, with `-p`, its parent directories. Returns `true` on success. The
+/// diagnostic names the directory that actually failed (#RD1), and the `-p` walk stops at the
+/// filesystem root, `.`, or `..` (#RD2).
+fn remove_dir(operand: &str, rm_parents: bool) -> bool {
+    let mut path = PathBuf::from(operand);
+    loop {
+        if let Err(e) = fs::remove_dir(&path) {
+            eprintln!("rmdir: {}: {}", path.display(), e);
+            return false;
+        }
 
-    if rm_parents {
-        if let Some(parent) = Path::new(dirname).parent() {
-            if parent != Path::new("") {
-                match parent.to_str() {
-                    Some(parent_name) => return remove_dir(parent_name, rm_parents),
-                    None => {
-                        eprintln!("{}", gettext("Non-unicode directory name rejected"));
-                        return Err(Error::other("Non-unicode dir name"));
-                    }
-                }
+        if !rm_parents {
+            return true;
+        }
+
+        match path.parent() {
+            Some(parent)
+                if !parent.as_os_str().is_empty()
+                    && parent != Path::new("/")
+                    && parent != Path::new(".")
+                    && parent != Path::new("..") =>
+            {
+                path = parent.to_path_buf();
             }
+            _ => return true,
         }
     }
-
-    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -54,9 +62,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut exit_code = 0;
 
     for dirname in &args.dirs {
-        if let Err(e) = remove_dir(dirname, args.parents) {
+        if !remove_dir(dirname, args.parents) {
             exit_code = 1;
-            eprintln!("{}: {}", dirname, e);
         }
     }
 

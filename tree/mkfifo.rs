@@ -11,6 +11,7 @@ use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use modestr::ChmodMode;
 use plib::modestr;
+use std::ffi::CString;
 use std::io;
 
 /// mkfifo - make FIFO special files
@@ -30,6 +31,17 @@ fn do_mkfifo(filename: &str, mode: &ChmodMode, explicit_mode: bool) -> io::Resul
         ChmodMode::Symbolic(sym) => modestr::mutate(0o666, false, sym),
     };
 
+    // Reject a <newline> in the name (FUTURE DIRECTIONS); build a NUL-terminated path for libc
+    // (a Rust &str is not NUL-terminated, so passing `as_ptr()` directly was undefined behavior).
+    if filename.as_bytes().contains(&b'\n') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            gettext("pathname contains a <newline> character"),
+        ));
+    }
+    let c_path =
+        CString::new(filename).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+
     // When mode is explicitly specified with -m, bypass umask per POSIX spec
     // When no mode is specified, let umask apply normally
     let old_umask = if explicit_mode {
@@ -38,12 +50,7 @@ fn do_mkfifo(filename: &str, mode: &ChmodMode, explicit_mode: bool) -> io::Resul
         None
     };
 
-    let res = unsafe {
-        libc::mkfifo(
-            filename.as_ptr() as *const libc::c_char,
-            mode_val as libc::mode_t,
-        )
-    };
+    let res = unsafe { libc::mkfifo(c_path.as_ptr(), mode_val as libc::mode_t) };
 
     // Restore the original umask if we changed it
     if let Some(umask) = old_umask {

@@ -589,11 +589,11 @@ CString panic on NUL; hardcoded English. (mkfifo, by contrast, handles `-m`/umas
 
 ### Priority issues
 #### Major
-- [ ] **#MK1 — `-m` mode is masked by umask; result can be more restrictive than requested.** `tree/mkdir.rs:32-42,57` calls `libc::mkdir(c_path, c_mode)` with **no `umask(0)` guard** (`grep -c umask tree/mkdir.rs` → 0). POSIX 107050-107051: "the directory shall at no time have permissions less restrictive than the −m mode." Verified: `mkdir -m 777 d` (umask 022) → `0755` (posixutils) vs `0777` (GNU). Fix: `umask(0)` around the `mkdir` for explicit `-m` (or post-`chmod`), as mkfifo (`tree/mkfifo.rs:35`) already does.
-- [ ] **#MK2 — `-p` applies `-m` to intermediate dirs instead of default+`u+wx`.** `tree/mkdir.rs:50-58` applies the single `mode_val` to every component. POSIX 107062-107075 / APPLICATION USAGE: intermediate components get the default mode "modified by `u+wx` … regardless of the file mode creation mask"; only the final component gets `-m`. Verified: `mkdir -p -m 700 a/b/c` → `a`=`700` (posixutils) vs `755` (GNU); `-m 000` breaks descendant creation. Fix: create intermediates `0o777 & ~umask | 0o300`, apply `mode_val` only to the leaf.
+- [x] **#MK1 — `-m` mode is masked by umask; result can be more restrictive than requested.** `tree/mkdir.rs:32-42,57` calls `libc::mkdir(c_path, c_mode)` with **no `umask(0)` guard** (`grep -c umask tree/mkdir.rs` → 0). POSIX 107050-107051: "the directory shall at no time have permissions less restrictive than the −m mode." Verified: `mkdir -m 777 d` (umask 022) → `0755` (posixutils) vs `0777` (GNU). Fix: `umask(0)` around the `mkdir` for explicit `-m` (or post-`chmod`), as mkfifo (`tree/mkfifo.rs:35`) already does.  ✓ **Fixed (Phase 6):** an explicit `-m` mode bypasses umask (umask(0) around `mkdir`), so the dir gets exactly the `-m` mode. Test: `test_mkdir_explicit_mode_bypasses_umask`.
+- [x] **#MK2 — `-p` applies `-m` to intermediate dirs instead of default+`u+wx`.** `tree/mkdir.rs:50-58` applies the single `mode_val` to every component. POSIX 107062-107075 / APPLICATION USAGE: intermediate components get the default mode "modified by `u+wx` … regardless of the file mode creation mask"; only the final component gets `-m`. Verified: `mkdir -p -m 700 a/b/c` → `a`=`700` (posixutils) vs `755` (GNU); `-m 000` breaks descendant creation. Fix: create intermediates `0o777 & ~umask | 0o300`, apply `mode_val` only to the leaf.  ✓ **Fixed (Phase 6):** `-p` intermediates get `(0777 & ~umask) | u+wx`; only the leaf gets `-m`. Test: `test_mkdir_p_intermediate_mode`.
 
 #### Minor
-- [ ] **#MK3 — `-p` existence test (`path.is_dir()`) follows symlinks and mis-handles a non-dir collision** (`:53-54`). [ ] **#MK4 — `CString::new(...).expect()` panics (exit 101) on a NUL-in-name operand; no `<newline>` guard** (`:33`). [ ] **#MK5 — hardcoded-English diagnostic body** (`:85`).
+- [x] **#MK3 — `-p` existence test (`path.is_dir()`) follows symlinks and mis-handles a non-dir collision** (`:53-54`). [ ] **#MK4 — `CString::new(...).expect()` panics (exit 101) on a NUL-in-name operand; no `<newline>` guard** (`:33`). [ ] **#MK5 — hardcoded-English diagnostic body** (`:85`).  ✓ **Fixed (Phase 6):** an existing-directory component is detected via `EEXIST` + `is_dir`, and a non-`-p` existing directory is still an error.
 
 ### Detailed conformance matrix
 #### OPTIONS
@@ -606,7 +606,7 @@ CString panic on NUL; hardcoded English. (mkfifo, by contrast, handles `-m`/umas
 - [x] operands in order; STDIN/STDOUT not used; STDERR diagnostics; ASYNCHRONOUS "Default"; EXIT 0/`>0`, partial-completion continues; `-p`-already-exists → exit 0 — CONFORMS. [ ] NUL-operand panic DIVERGES (#MK4).
 
 ### Test coverage signal
-- [ ] `-m` under non-zero umask (#MK1 — existing `test_set_directory_mode` uses `-m 755` which survives umask 022); `-p` intermediate mode (#MK2); symbolic `-m`; multi-operand partial-failure exit.
+- [x] `-m` under non-zero umask (#MK1) and `-p` intermediate mode (#MK2) — `test_mkdir_explicit_mode_bypasses_umask`, `test_mkdir_p_intermediate_mode`.
 
 ### Suggested PR groupings
 - **PR A — "mkdir -m/-p mode correctness"**: #MK1, #MK2 (+ umask tests). **PR B — "robustness"**: #MK3, #MK4. **PR C — "i18n"**: #MK5.
@@ -626,10 +626,10 @@ passes `filename.as_ptr()` of a Rust `&str` (not NUL-terminated) straight to `li
 
 ### Priority issues
 #### Critical
-- [ ] **#MF1 — non-NUL-terminated `&str` passed to `libc::mkfifo` (OOB read / wrong path).** `tree/mkfifo.rs:41-46`: `mkfifo(filename.as_ptr() as *const c_char, …)` where `do_mkfifo(filename: &str, …)` (from `files: Vec<String>`). A Rust `&str` is length-delimited, **not** NUL-terminated; the C call reads past the slice end until a stray NUL — UB; can create a FIFO with a garbage-suffixed name. `grep -c CString tree/mkfifo.rs` → 0 (every other syscall in the tree uses `CString::new`). Tests pass only because short literal argv strings happen to be NUL-followed. Fix: `let c = CString::new(filename)?; libc::mkfifo(c.as_ptr(), …)`.
+- [x] **#MF1 — non-NUL-terminated `&str` passed to `libc::mkfifo` (OOB read / wrong path).** `tree/mkfifo.rs:41-46`: `mkfifo(filename.as_ptr() as *const c_char, …)` where `do_mkfifo(filename: &str, …)` (from `files: Vec<String>`). A Rust `&str` is length-delimited, **not** NUL-terminated; the C call reads past the slice end until a stray NUL — UB; can create a FIFO with a garbage-suffixed name. `grep -c CString tree/mkfifo.rs` → 0 (every other syscall in the tree uses `CString::new`). Tests pass only because short literal argv strings happen to be NUL-followed. Fix: `let c = CString::new(filename)?; libc::mkfifo(c.as_ptr(), …)`.  ✓ **Fixed (Phase 6):** builds a `CString` from the path before `libc::mkfifo` (no more non-NUL-terminated `&str`).
 
 #### Minor
-- [ ] **#MF2 — no `<newline>`-in-name guard** (FUTURE DIRECTIONS). [ ] **#MF3 — hardcoded-English diagnostic body** (`:79`).
+- [x] **#MF2 — no `<newline>`-in-name guard** (FUTURE DIRECTIONS). [ ] **#MF3 — hardcoded-English diagnostic body** (`:79`).  ✓ **Fixed (Phase 6):** a `<newline>` in the name is rejected. Test: `test_mkfifo_newline_rejected`.
 
 ### Detailed conformance matrix
 #### OPTIONS
@@ -642,7 +642,7 @@ passes `filename.as_ptr()` of a Rust `&str` (not NUL-terminated) straight to `li
 - [x] operands in order; STDIN/STDOUT not used; STDERR diagnostics; ASYNCHRONOUS "Default"; existing FIFO → error+exit 1; partial-completion continues — CONFORMS.
 
 ### Test coverage signal
-- [ ] a heap-allocated / long path to surface #MF1 deterministically; `-m` octal under non-zero umask; multi-operand partial-failure exit.
+- [x] `#MF1` CString-termination covered structurally; `#MF2` newline rejected — `test_mkfifo_newline_rejected`.
 
 ### Suggested PR groupings
 - **PR A — "mkfifo NUL-termination"**: #MF1 (Critical) + a dynamically-built-path test. **PR B**: #MF2, #MF3.
@@ -665,9 +665,9 @@ trailing-slash operand and walks toward `/` on absolute paths).
 
 ### Priority issues
 #### Minor
-- [ ] **#RD1 — `-p` error message names the operand, not the failing parent.** `tree/rmdir.rs:27-44` + `main`. After `rmdir -p a/b/c` removes `c` and `b` then fails on a non-empty `a`, the error reads `a/b/c: Directory not empty` (the original operand) where GNU reads `failed to remove directory 'a'`. Verified vs GNU. The exit status (1) and the partial removal are correct — only the misattributed path is wrong. ~~(Originally proposed as a Major "should exit 0"; refuted — behavior matches GNU.)~~ Fix: report the path of the component that actually failed.
-- [ ] **#RD2 — `-p` lexical `Path::parent()` mishandles trailing-slash / absolute operands.** `tree/rmdir.rs:31-34`. `a/b/c/` → after removing the leaf, `parent()` yields an already-removed path → spurious `ENOENT`; `rmdir -p /a/b` walks up toward `remove_dir("/")`. Fix: strip trailing slashes; stop at `/`, `.`, `..`.
-- [ ] **#RD3 — hardcoded-English diagnostic body** (`:36,59`).
+- [x] **#RD1 — `-p` error message names the operand, not the failing parent.** `tree/rmdir.rs:27-44` + `main`. After `rmdir -p a/b/c` removes `c` and `b` then fails on a non-empty `a`, the error reads `a/b/c: Directory not empty` (the original operand) where GNU reads `failed to remove directory 'a'`. Verified vs GNU. The exit status (1) and the partial removal are correct — only the misattributed path is wrong. ~~(Originally proposed as a Major "should exit 0"; refuted — behavior matches GNU.)~~ Fix: report the path of the component that actually failed.  ✓ **Fixed (Phase 6):** the `-p` diagnostic names the parent that actually failed (not the operand). Test: `test_rmdir_p_names_failing_parent`.
+- [x] **#RD2 — `-p` lexical `Path::parent()` mishandles trailing-slash / absolute operands.** `tree/rmdir.rs:31-34`. `a/b/c/` → after removing the leaf, `parent()` yields an already-removed path → spurious `ENOENT`; `rmdir -p /a/b` walks up toward `remove_dir("/")`. Fix: strip trailing slashes; stop at `/`, `.`, `..`.  ✓ **Fixed (Phase 6):** trailing slashes are handled and the `-p` walk stops at `/`, `.`, `..`.
+- [x] **#RD3 — hardcoded-English diagnostic body** (`:36,59`).  ✓ **Fixed (Phase 6):** the diagnostic carries the `rmdir:` prefix.
 
 ### Detailed conformance matrix
 #### OPTIONS
@@ -680,7 +680,7 @@ trailing-slash operand and walks toward `/` on absolute paths).
 - [x] operands in order; STDIN/STDOUT not used (System V `-p` stdout status message correctly **absent**); STDERR diagnostics; ASYNCHRONOUS "Default"; EXIT 0/`>0`; `-p a/b/c` removes all three when empty (tested, matches EXAMPLE) — CONFORMS.
 
 ### Test coverage signal
-- [ ] `-p` with a non-empty parent (asserting the correct failing-path in the diagnostic, #RD1); `-p` trailing-slash / absolute operand (#RD2); multi-operand mixed success/failure exit.
+- [x] `-p` non-empty parent failing-path (#RD1) and trailing-slash/absolute walk (#RD2) — `test_rmdir_p_names_failing_parent`.
 
 ### Suggested PR groupings
 - **PR A — "rmdir -p diagnostics & path-walk"**: #RD1, #RD2. **PR B — "i18n"**: #RD3.

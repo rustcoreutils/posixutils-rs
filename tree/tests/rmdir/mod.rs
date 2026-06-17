@@ -92,3 +92,32 @@ fn rmdir_remove_directory_with_parents() {
     assert!(!dir_path.exists());
     assert!(!parent_dir.exists());
 }
+
+// Audit #RD1: `rmdir -p` on a non-empty parent reports the parent that actually failed (not the
+// original operand), removes the empty leaf chain, and exits 1.
+#[test]
+fn test_rmdir_p_names_failing_parent() {
+    let test_dir = &format!(
+        "{}/test_rmdir_p_names_failing_parent",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let a = &format!("{test_dir}/a");
+    let c = &format!("{test_dir}/a/b/c");
+    fs::create_dir_all(c).unwrap();
+    fs::File::create(format!("{a}/keep")).unwrap(); // makes `a` non-empty
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_rmdir"))
+        .args(["-p", c])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&format!("rmdir: {a}: ")),
+        "diagnostic should name the failing parent: {stderr}"
+    );
+    assert!(!Path::new(c).exists(), "empty leaf chain removed");
+    assert!(Path::new(a).exists(), "non-empty parent kept");
+
+    fs::remove_dir_all(test_dir).unwrap();
+}

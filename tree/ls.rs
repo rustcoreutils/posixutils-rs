@@ -15,7 +15,7 @@ use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleC
 use plib::platform::P_WINSIZE_REQUEST_CODE;
 use std::{
     collections::HashMap,
-    ffi::{CString, OsStr},
+    ffi::{CStr, CString, OsStr},
     io,
     mem::MaybeUninit,
     os::unix::{ffi::OsStrExt, fs::MetadataExt},
@@ -23,6 +23,22 @@ use std::{
     process::ExitCode,
     sync::atomic::{AtomicU8, Ordering},
 };
+
+/// Read a symbolic link's target relative to `dir_fd` and return it as a (lossy) string.
+///
+/// Returns `None` on any error: a failed `readlink` of a listed symlink is not fatal for `ls`
+/// (the `-> target` is simply omitted). `readlinkat` does not NUL-terminate, so the buffer is
+/// truncated to the byte count it reports.
+fn read_link_target(dir_fd: libc::c_int, name: &CStr) -> Option<String> {
+    let mut buf = vec![0u8; libc::PATH_MAX as usize];
+    let ret =
+        unsafe { libc::readlinkat(dir_fd, name.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+    if ret < 0 {
+        return None;
+    }
+    buf.truncate(ret as usize);
+    Some(ls_from_utf8_lossy(&buf))
+}
 
 /// ls - list directory contents
 #[derive(Parser)]
@@ -896,26 +912,8 @@ fn ls(paths: Vec<PathBuf>, config: &Config) -> io::Result<u8> {
             let mut target_path = None;
             if metadata.is_symlink() && !dereference_symlink {
                 if let OutputFormat::Long(_) = &config.output_format {
-                    let mut buf = vec![0u8; libc::PATH_MAX as usize];
-
                     let path_cstr = CString::new(path.as_os_str().as_bytes()).unwrap();
-                    let ret = unsafe {
-                        libc::readlinkat(
-                            libc::AT_FDCWD,
-                            path_cstr.as_ptr(),
-                            buf.as_mut_ptr().cast(),
-                            buf.len(),
-                        )
-                    };
-                    if ret < 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    let num_bytes = ret as usize;
-                    buf.shrink_to(num_bytes);
-
-                    let target_path_cstr = CString::from_vec_with_nul(buf).unwrap();
-
-                    target_path = Some(ls_from_utf8_lossy(target_path_cstr.to_bytes()));
+                    target_path = read_link_target(libc::AT_FDCWD, &path_cstr);
                 }
             }
 
@@ -1106,9 +1104,12 @@ fn process_single_dir(
                     let mut target_path = None;
                     if metadata.is_symlink() && !dereference_symlink {
                         if let OutputFormat::Long(_) = &config.output_format {
-                            target_path = Some(ls_from_utf8_lossy(
-                                dir_entry.read_link().unwrap().to_bytes(),
-                            ));
+                            // Prefer ftw's cached readlink; fall back to an explicit readlinkat
+                            // (it can be `None` for symlinks discovered during directory traversal).
+                            target_path = match dir_entry.read_link() {
+                                Some(link) => Some(ls_from_utf8_lossy(link.to_bytes())),
+                                None => read_link_target(dir_entry.dir_fd(), dir_entry.file_name()),
+                            };
                         }
                     }
 

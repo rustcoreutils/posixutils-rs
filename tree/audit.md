@@ -941,8 +941,8 @@ detector works.
 
 ### Priority issues
 #### Critical
-- [ ] **#LS1 — `ls -l` on a command-line symlink panics.** `tree/ls.rs:916`. The readlink path allocates `buf = vec![0u8; PATH_MAX]`, writes `num_bytes` (no NUL), then `buf.shrink_to(num_bytes)` — which shrinks **capacity, not length** — leaving `buf.len()==PATH_MAX` of trailing NULs, so `CString::from_vec_with_nul(buf).unwrap()` hits `InteriorNul` and aborts. **Reproduced:** `ls -l link` → `panicked at tree/ls.rs:916:76: …InteriorNul(13)`, exit 101. Fix: `buf.truncate(num_bytes)` then build the CString.
-- [ ] **#LS2 — `ls -l` on a directory containing a symlink panics.** `tree/ls.rs:1110`. In the directory-traversal path the link target is built via `dir_entry.read_link().unwrap()`, which is `None` for the entry → abort. **Reproduced:** dir with a symlink → `ls -l d` → `panicked at tree/ls.rs:1110:55: …unwrap() on a None value`, exit 101. This makes `ls -l` unusable on most real directories. Fix: handle `None`/`Err` from `read_link()` gracefully (a failed link read is "not an error" per spec — emit no target rather than crashing).
+- [x] **#LS1 — `ls -l` on a command-line symlink panics.** `tree/ls.rs:916`: `buf.shrink_to(num_bytes)` (capacity, not length) left `buf.len()==PATH_MAX` of trailing NULs, so `CString::from_vec_with_nul(buf).unwrap()` hit `InteriorNul` and aborted. ✓ **Fixed (Phase 1):** a shared `read_link_target(dir_fd, name)` helper `truncate`s to the byte count and uses `ls_from_utf8_lossy`; a failed readlink now omits the target rather than erroring. Test: `test_ls_l_symlink_no_panic`.
+- [x] **#LS2 — `ls -l` on a directory containing a symlink panics.** `tree/ls.rs:1110`: `dir_entry.read_link().unwrap()` was `None` for in-traversal symlinks. ✓ **Fixed (Phase 1):** falls back to `read_link_target(dir_entry.dir_fd(), dir_entry.file_name())` when ftw's cached readlink is `None`. Test: `test_ls_l_symlink_no_panic` (directory case).
 
 #### Major
 - [ ] **#LS3 — Sort is byte-order, not `LC_COLLATE` collation.** `tree/ls_util/entry.rs:357,396` use `OsString::cmp` (raw bytes) for every sort key. POSIX: "sort … according to the collating sequence in the current locale," falling back to byte order only when the locale lacks a total order. `grep -rnE 'strcoll|LC_COLLATE' tree/ls.rs tree/ls_util/` → 0 (verified). Fix: route the primary filename key through `strcoll`/locale collation, byte-compare as tiebreak.
@@ -954,7 +954,7 @@ detector works.
 - [ ] **#LS7 — Six-month window is `30*6` days** (`entry.rs:749`), not a precise calendar split (~182.6 d) — off-by-days at the boundary.
 - [ ] **#LS8 — `LC_TIME` ignored for month names / format** (`entry.rs:219-220,760`): hardcoded English `%b` via chrono `Local`.
 - [ ] **#LS9 — Recent date uses `%d` (zero-pad) not `%e` (blank-pad)** (`entry.rs:219`): `Jul 04` vs the spec's `Jul  4` (`date "+%b %e %H:%M"`).
-- [ ] **#LS10 — socket type char `s` and `-F` socket `=` not emitted** (`entry.rs:89-113,583-590`): sockets render as `-`/no-indicator (spec lists `s`/`=`).
+- [x] **#LS10 — socket type char `s` and `-F` socket `=`.** ✓ **Fixed (Phase 1):** added `FileType::Socket => 's'` to the mode-string type char and a `file_type.is_socket() => '='` arm to the `-F` classify. Test: `test_ls_socket_classification`.
 - [ ] **#LS11 — owner/group lookup failure errors instead of printing the numeric id** (`entry.rs:667-686`): spec says a name that "cannot be determined" is "replaced with their associated numeric values."
 - [ ] **#LS12 — wide (East-Asian) Unicode column width** uses `chars().count()` (every code point width 1) — CJK/zero-width misalign columns. [ ] **#LS13 — `-s`/no-`-k` uses 512-byte units** (GNU defaults to 1024) — conformant but surprising; the `total` line correctly uses 512.
 

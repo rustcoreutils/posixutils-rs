@@ -661,3 +661,61 @@ fn test_ls_time() {
 
     fs::remove_dir_all(test_dir).unwrap();
 }
+
+// Audit #LS1/#LS2: `ls -l` on a symbolic link — named directly on the command line, and present
+// inside a listed directory — must not panic; it renders `name -> target`.
+#[test]
+fn test_ls_l_symlink_no_panic() {
+    let test_dir = &format!("{}/test_ls_l_symlink_no_panic", env!("CARGO_TARGET_TMPDIR"));
+    let sub = &format!("{test_dir}/sub");
+    let target = &format!("{test_dir}/sub/target");
+    let link = &format!("{test_dir}/sub/link");
+
+    fs::create_dir_all(sub).unwrap();
+    fs::File::create(target).unwrap();
+    std::os::unix::fs::symlink("target", link).unwrap();
+
+    // #LS2: symlink discovered while listing the directory.
+    ls_test_with_checker(&["-l", sub], |_, output| {
+        assert_eq!(output.status.code(), Some(0));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("link -> target"), "stdout: {stdout}");
+    });
+
+    // #LS1: symlink named directly on the command line.
+    ls_test_with_checker(&["-l", link], |_, output| {
+        assert_eq!(output.status.code(), Some(0));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("link -> target"), "stdout: {stdout}");
+    });
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// Audit #LS10: a socket gets type char `s` (long format) and indicator `=` (-F).
+#[test]
+fn test_ls_socket_classification() {
+    let test_dir = &format!(
+        "{}/test_ls_socket_classification",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    fs::create_dir(test_dir).unwrap();
+    let sock = &format!("{test_dir}/sock");
+    let _listener = std::os::unix::net::UnixListener::bind(sock).unwrap();
+
+    ls_test_with_checker(&["-F", sock], |_, output| {
+        assert_eq!(output.status.code(), Some(0));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("sock="), "stdout: {stdout}");
+    });
+    ls_test_with_checker(&["-l", sock], |_, output| {
+        assert_eq!(output.status.code(), Some(0));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.starts_with('s'),
+            "mode line should start with 's': {stdout}"
+        );
+    });
+
+    fs::remove_dir_all(test_dir).unwrap();
+}

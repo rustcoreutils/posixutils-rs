@@ -96,6 +96,8 @@ impl Entry {
                     let file_type = metadata.file_type();
                     if file_type.is_fifo() {
                         Some('|')
+                    } else if file_type.is_socket() {
+                        Some('=')
                     } else {
                         let mode = metadata.mode();
                         // Cast to u32 for cross-platform compatibility (u16 on macOS, u32 on Linux)
@@ -586,6 +588,7 @@ fn get_file_mode_string(metadata: &ftw::Metadata) -> String {
         ftw::FileType::Directory => 'd',
         ftw::FileType::CharacterDevice => 'c',
         ftw::FileType::Fifo => 'p',
+        ftw::FileType::Socket => 's',
         _ => '-',
     });
 

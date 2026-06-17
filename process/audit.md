@@ -284,28 +284,28 @@ nice value — and the increment is artificially clamped to `[-30, 29]` by clap.
 ### Priority issues
 
 #### Critical
-- [ ] **`#NC1` — a failed `nice()` must NOT prevent invoking the utility.**
+- [x] **`#NC1` — a failed `nice()` must NOT prevent invoking the utility.** ✓ fixed in Phase 2.
   `nice.rs:60-65`. Spec (slice 108435-108437): if the user lacks privilege the
   nice value "shall not [be] affect[ed]… but this shall not prevent the
   invocation of utility or affect the exit status." The code does
   `if res < 0 { eprintln!; return Err(...) }` → exits without exec. Fix: on
   `EPERM`, optionally warn, then fall through to `exec_util`.
-- [ ] **`#NC2` — exec failure never yields 126/127.** `nice.rs:44-51,67`.
+- [x] **`#NC2` — exec failure never yields 126/127.** ✓ fixed in Phase 2. `nice.rs:44-51,67`.
   Same `?`-propagation defect as `#E1`: `Command::exec()` error bubbles out of
   `main`, exiting **1**. Spec (slice 108484-108486 + the 108504 rationale)
   mandates 127/126. Fix: match `NotFound`→127, other exec err→126, internal→1-125.
 
 #### Major
-- [ ] **`#NC3` — increment clamped to `[-30, 29]` by clap.** `nice.rs:27`
+- [x] **`#NC3` — increment clamped to `[-30, 29]` by clap.** ✓ fixed in Phase 2. `nice.rs:27`
   (`.range(-30..30)`). POSIX places no fixed range on the `-n` argument — the
   kernel's `nice(3)` clamps the result. `nice -n 40 cmd` (historical) and
   `nice -n -20 cmd` are rejected at parse time. Fix: drop `.range()`.
-- [ ] **`#NC4` — `nice()` return checked as `res < 0`.** `nice.rs:60-61`.
+- [x] **`#NC4` — `nice()` return checked as `res < 0`.** ✓ fixed in Phase 2. `nice.rs:60-61`.
   `nice(3)` returns the *new nice value*; `-1` is legal (root, increment to -1)
   yet trips the error path. Fix: clear `errno`, call, then test `errno`.
 
 #### Minor
-- [ ] **`#NC5` — `--niceval` long option is non-POSIX.** `nice.rs:23-35`. `-n`
+- [x] **`#NC5` — `--niceval` long option is non-POSIX.** ✓ fixed in Phase 2. `nice.rs:23-35`. `-n`
   is correct; the derived `--niceval` long form is an unspecified extension.
 - [ ] **`#C1` — diagnostic at `nice.rs:63` not gettext-wrapped.**
 

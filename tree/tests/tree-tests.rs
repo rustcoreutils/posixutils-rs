@@ -13,6 +13,7 @@ mod chown;
 mod cp;
 mod du;
 mod link;
+mod ln;
 mod ls;
 mod mkdir;
 mod mkfifo;

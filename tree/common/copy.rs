@@ -694,7 +694,7 @@ where
                 Some(file_name) => target.join(file_name),
                 None => {
                     let err_str = gettext!("invalid filename: {}", source.display());
-                    eprintln!("cp: {}", err_str);
+                    eprintln!("{}: {}", cfg.prog, err_str);
                     result = None;
                     continue;
                 }
@@ -715,7 +715,7 @@ where
                 // returns an empty-message marker; only print here if a message is actually carried.
                 let s = error_string(&e);
                 if !s.is_empty() {
-                    eprintln!("cp: {s}");
+                    eprintln!("{}: {}", cfg.prog, s);
                 }
                 result = None;
             }

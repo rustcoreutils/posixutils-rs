@@ -115,7 +115,32 @@ struct Parser<'w> {
     used_in_filename_expansion: bool,
 }
 
-impl Parser<'_> {
+/// A snapshot of the parser position, used to backtrack after a speculative
+/// parse (e.g. a `[:class:]` / `[.sym.]` / `[=eq=]` attempt) fails.
+type Checkpoint<'w> = (
+    std::slice::Iter<'w, ExpandedWordPart>,
+    std::str::Chars<'w>,
+    bool,
+    Token,
+);
+
+impl<'w> Parser<'w> {
+    fn checkpoint(&self) -> Checkpoint<'w> {
+        (
+            self.word_parts.clone(),
+            self.chars.clone(),
+            self.inside_quoted_string,
+            self.lookahead,
+        )
+    }
+
+    fn restore(&mut self, checkpoint: Checkpoint<'w>) {
+        self.word_parts = checkpoint.0;
+        self.chars = checkpoint.1;
+        self.inside_quoted_string = checkpoint.2;
+        self.lookahead = checkpoint.3;
+    }
+
     fn advance(&mut self) {
         if let Some(c) = self.chars.next() {
             self.lookahead = Token::from_char(c, self.inside_quoted_string);
@@ -244,6 +269,9 @@ impl Parser<'_> {
         let mut matching = true;
         match self.lookahead {
             Token::Char(']') => {
+                // a ']' immediately after '[' (or "[!") is a literal member of the
+                // bracket expression, not the closing bracket (POSIX XBD 9.3.5).
+                expression_items.push(BracketItem::Char(']'));
                 self.store_and_advance(&mut pattern_items);
             }
             Token::Char('!') => {
@@ -254,45 +282,49 @@ impl Parser<'_> {
                     self.store_and_advance(&mut pattern_items);
                 }
             }
-            Token::Char(':') => match self.try_parse_character_class() {
-                Ok(class) => {
-                    // simple character class, the standard specifies that it is implementation
-                    // defined whether these patterns are supported, but bash does support them
-                    // so we do too.
-                    return Ok(BracketExpression {
-                        items: vec![BracketItem::CharacterClass(class)],
-                        matching,
-                    });
+            // A ':', '.' or '=' immediately after '[' may introduce a character
+            // class / collating symbol / equivalence class. If that speculative
+            // parse fails, the character is just a literal member: rewind and let
+            // the main loop below handle it (and the rest of the expression).
+            Token::Char(':') => {
+                let checkpoint = self.checkpoint();
+                match self.try_parse_character_class() {
+                    Ok(class) => {
+                        // simple character class, the standard specifies that it is implementation
+                        // defined whether these patterns are supported, but bash does support them
+                        // so we do too.
+                        return Ok(BracketExpression {
+                            items: vec![BracketItem::CharacterClass(class)],
+                            matching,
+                        });
+                    }
+                    Err(_) => self.restore(checkpoint),
                 }
-                Err(items) => {
-                    pattern_items.extend(items);
-                    expression_items.push(BracketItem::Char('['));
+            }
+            Token::Char('.') => {
+                let checkpoint = self.checkpoint();
+                match self.try_parse_collating_symbol() {
+                    Ok(symbol) => {
+                        return Ok(BracketExpression {
+                            items: vec![BracketItem::CollatingSymbol(symbol)],
+                            matching,
+                        });
+                    }
+                    Err(_) => self.restore(checkpoint),
                 }
-            },
-            Token::Char('.') => match self.try_parse_collating_symbol() {
-                Ok(symbol) => {
-                    return Ok(BracketExpression {
-                        items: vec![BracketItem::CollatingSymbol(symbol)],
-                        matching,
-                    });
+            }
+            Token::Char('=') => {
+                let checkpoint = self.checkpoint();
+                match self.try_parse_equivalence_class() {
+                    Ok(class) => {
+                        return Ok(BracketExpression {
+                            items: vec![BracketItem::EquivalenceClass(class)],
+                            matching,
+                        });
+                    }
+                    Err(_) => self.restore(checkpoint),
                 }
-                Err(items) => {
-                    pattern_items.extend(items);
-                    expression_items.push(BracketItem::Char('['));
-                }
-            },
-            Token::Char('=') => match self.try_parse_equivalence_class() {
-                Ok(class) => {
-                    return Ok(BracketExpression {
-                        items: vec![BracketItem::EquivalenceClass(class)],
-                        matching,
-                    });
-                }
-                Err(items) => {
-                    pattern_items.extend(items);
-                    expression_items.push(BracketItem::Char('['));
-                }
-            },
+            }
             _ => {}
         }
 
@@ -330,9 +362,9 @@ impl Parser<'_> {
                                 expression_items.push(BracketItem::Char('['));
                             }
                         },
-                        Token::Char('=') => match self.try_parse_character_class() {
+                        Token::Char('=') => match self.try_parse_equivalence_class() {
                             Ok(class) => {
-                                // remove '[' since it is part of a character class
+                                // remove '[' since it is part of an equivalence class
                                 pattern_items.pop();
                                 expression_items.push(BracketItem::EquivalenceClass(class));
                             }

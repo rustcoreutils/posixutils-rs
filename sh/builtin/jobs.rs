@@ -12,6 +12,7 @@ use crate::jobs::{parse_job_id, Job};
 use crate::option_parser::OptionParser;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use gettextrs::gettext;
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum PrintOptions {
@@ -57,7 +58,7 @@ impl BuiltinUtility for Jobs {
         {
             if option == 'l' || option == 'p' {
                 if print_option != PrintOptions::Default {
-                    return Err("jobs: can only specify either -l or -p".into());
+                    return Err(gettext("jobs: can only specify either -l or -p").into());
                 }
                 print_option = if option == 'l' {
                     PrintOptions::Long

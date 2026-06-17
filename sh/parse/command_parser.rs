@@ -196,7 +196,10 @@ impl<'src> CommandParser<'src> {
 
     fn parse_redirection_opt(&mut self) -> ParseResult<Option<Redirection>> {
         if let CommandToken::IoNumber(n) = self.lookahead {
-            if !(0..1023).contains(&n) {
+            // POSIX places no fixed ceiling on the redirection fd number (the
+            // OS bounds real descriptors); only reject values that would not
+            // fit in a RawFd (i32), since the fd is later used as an i32.
+            if n > i32::MAX as u32 {
                 return Err(ParserError::new(
                     self.lookahead_lineno,
                     "invalid file descriptor",
@@ -471,18 +474,27 @@ impl<'src> CommandParser<'src> {
 
         let body = self.parse_compound_list(CommandToken::Eof, alias_table)?;
 
+        let mut fallthrough = false;
         if self.lookahead == CommandToken::DSemi {
+            self.advance()?;
+            self.skip_linebreak()?;
+        } else if self.lookahead == CommandToken::SemiAnd {
+            fallthrough = true;
             self.advance()?;
             self.skip_linebreak()?;
         } else if self.lookahead != CommandToken::Esac {
             return Err(ParserError::new(
                 self.lookahead_lineno,
-                format!("expected ';;', found {}", self.lookahead),
+                format!("expected ';;' or ';&', found {}", self.lookahead),
                 self.lookahead == CommandToken::Eof,
             ));
         }
 
-        Ok(CaseItem { body, pattern })
+        Ok(CaseItem {
+            body,
+            pattern,
+            fallthrough,
+        })
     }
 
     fn parse_case_clause(&mut self, alias_table: &AliasTable) -> ParseResult<CompoundCommand> {
@@ -579,6 +591,8 @@ impl<'src> CommandParser<'src> {
         // consume '('
         self.advance()?;
         self.match_token(CommandToken::RParen)?;
+        // POSIX grammar allows a linebreak between `()` and the function body.
+        self.skip_linebreak()?;
         if let Some(body) = self.parse_compound_command(alias_table)? {
             Ok(FunctionDefinition {
                 name,
@@ -1337,7 +1351,7 @@ mod tests {
                     unquoted_literal_pair("2"),
                     unquoted_literal_pair("3")
                 ],
-                body: complete_command_from_word_pair(unquoted_literal_pair("cmd"), false)
+                body: complete_command_from_word_pair(unquoted_literal_pair("cmd"), false),
             }
         );
     }
@@ -1349,7 +1363,7 @@ mod tests {
             CompoundCommand::ForClause {
                 iter_var: Rc::from("i"),
                 words: vec![WordPair::new(special_parameter(SpecialParameter::At), "$@")],
-                body: complete_command_from_word_pair(unquoted_literal_pair("cmd"), false)
+                body: complete_command_from_word_pair(unquoted_literal_pair("cmd"), false),
             }
         );
     }
@@ -1380,7 +1394,8 @@ mod tests {
                 arg: unquoted_literal_pair("word"),
                 cases: vec![CaseItem {
                     pattern: NonEmpty::new(unquoted_literal_pair("pattern")),
-                    body: complete_command_from_word_pair(unquoted_literal_pair("cmd"), false)
+                    body: complete_command_from_word_pair(unquoted_literal_pair("cmd"), false),
+                    fallthrough: false,
                 }]
             }
         );
@@ -1406,15 +1421,18 @@ mod tests {
                 cases: vec![
                     CaseItem {
                         pattern: NonEmpty::new(unquoted_literal_pair("pattern1")),
-                        body: complete_command_from_word_pair(unquoted_literal_pair("cmd1"), false)
+                        body: complete_command_from_word_pair(unquoted_literal_pair("cmd1"), false),
+                        fallthrough: false,
                     },
                     CaseItem {
                         pattern: NonEmpty::new(unquoted_literal_pair("pattern2")),
-                        body: complete_command_from_word_pair(unquoted_literal_pair("cmd2"), false)
+                        body: complete_command_from_word_pair(unquoted_literal_pair("cmd2"), false),
+                        fallthrough: false,
                     },
                     CaseItem {
                         pattern: NonEmpty::new(unquoted_literal_pair("pattern3")),
-                        body: complete_command_from_word_pair(unquoted_literal_pair("cmd3"), false)
+                        body: complete_command_from_word_pair(unquoted_literal_pair("cmd3"), false),
+                        fallthrough: false,
                     }
                 ]
             }
@@ -1439,7 +1457,7 @@ mod tests {
                         unquoted_literal_pair("condition"),
                         false
                     ),
-                    body: complete_command_from_word_pair(unquoted_literal_pair("cmd"), false)
+                    body: complete_command_from_word_pair(unquoted_literal_pair("cmd"), false),
                 }),
                 else_body: None
             }
@@ -1456,7 +1474,7 @@ mod tests {
                         unquoted_literal_pair("condition"),
                         false
                     ),
-                    body: complete_command_from_word_pair(unquoted_literal_pair("cmd"), false)
+                    body: complete_command_from_word_pair(unquoted_literal_pair("cmd"), false),
                 },),
                 else_body: Some(complete_command_from_word_pair(
                     unquoted_literal_pair("cmd2"),
@@ -1477,21 +1495,21 @@ mod tests {
                                 unquoted_literal_pair("condition1"),
                                 false
                             ),
-                        body: complete_command_from_word_pair(unquoted_literal_pair("cmd1"), false)
+                        body: complete_command_from_word_pair(unquoted_literal_pair("cmd1"), false),
                     },
                     If {
                         condition: complete_command_from_word_pair(
                                 unquoted_literal_pair("condition2"),
                                 false
                             ),
-                        body: complete_command_from_word_pair(unquoted_literal_pair("cmd2"), false)
+                        body: complete_command_from_word_pair(unquoted_literal_pair("cmd2"), false),
                     },
                     If {
                         condition: complete_command_from_word_pair(
                                 unquoted_literal_pair("condition3"),
                                 false
                             ),
-                        body: complete_command_from_word_pair(unquoted_literal_pair("cmd3"), false)
+                        body: complete_command_from_word_pair(unquoted_literal_pair("cmd3"), false),
                     },
                 ].try_into().unwrap(),
                 else_body: Some(complete_command_from_word_pair(unquoted_literal_pair("cmd4"), false))
@@ -1508,7 +1526,7 @@ mod tests {
                     unquoted_literal_pair("condition"),
                     false
                 ),
-                body: complete_command_from_word_pair(unquoted_literal_pair("cmd"), false)
+                body: complete_command_from_word_pair(unquoted_literal_pair("cmd"), false),
             }
         );
     }
@@ -1522,7 +1540,7 @@ mod tests {
                     unquoted_literal_pair("condition"),
                     false
                 ),
-                body: complete_command_from_word_pair(unquoted_literal_pair("cmd"), false)
+                body: complete_command_from_word_pair(unquoted_literal_pair("cmd"), false),
             }
         );
     }
@@ -1617,7 +1635,7 @@ mod tests {
                     unquoted_literal_pair("2"),
                     unquoted_literal_pair("3")
                 ],
-                body: complete_command_from_word_pair(unquoted_literal_pair("cmd"), false)
+                body: complete_command_from_word_pair(unquoted_literal_pair("cmd"), false),
             }
         );
     }
@@ -1640,19 +1658,18 @@ mod tests {
             CompoundCommand::ForClause {
                 iter_var: Rc::from("word"),
                 words: vec![unquoted_literal_pair("in")],
-                body: complete_command_from_word_pair(unquoted_literal_pair("cmd"), false)
+                body: complete_command_from_word_pair(unquoted_literal_pair("cmd"), false),
             }
         );
     }
 
     #[test]
-    fn invalid_parameter_is_error() {
-        assert!(parse_complete_command("$.", AliasTable::default())
-            .is_err_and(|err| !err.could_be_resolved_with_more_input));
-        assert!(parse_complete_command("$\n0", AliasTable::default())
-            .is_err_and(|err| !err.could_be_resolved_with_more_input));
-        assert!(parse_complete_command("$", AliasTable::default())
-            .is_err_and(|err| !err.could_be_resolved_with_more_input))
+    fn dollar_not_introducing_an_expansion_is_a_literal() {
+        // POSIX 2.5.2: a '$' not followed by a valid parameter start is an
+        // ordinary character, not a syntax error.
+        assert!(parse_complete_command("echo $.", AliasTable::default()).is_ok());
+        assert!(parse_complete_command("echo $", AliasTable::default()).is_ok());
+        assert!(parse_complete_command("echo a$ b", AliasTable::default()).is_ok());
     }
 
     #[test]
@@ -1688,8 +1705,9 @@ mod tests {
 
     #[test]
     fn out_of_range_file_descriptor_is_error() {
+        // a value above i32::MAX cannot fit in a RawFd
         assert!(
-            parse_complete_command("2000> file.txt", AliasTable::default())
+            parse_complete_command("3000000000> file.txt", AliasTable::default())
                 .is_err_and(|err| !err.could_be_resolved_with_more_input)
         );
     }

@@ -213,6 +213,7 @@ xtrace    off
 ignoreeof off
 nolog     off
 vi        off
+pipefail  off
 "#;
         test_cli(vec!["-c", "set -o"], "", output);
         test_cli(vec!["-s"], "set -o", output);
@@ -234,6 +235,7 @@ set +o xtrace
 set +o ignoreeof
 set +o nolog
 set +o vi
+set +o pipefail
 "#;
         test_cli(vec!["-c", "set +o"], "", output);
         test_cli(vec!["-s"], "set +o", output);
@@ -255,6 +257,7 @@ xtrace    off
 ignoreeof off
 nolog     off
 vi        off
+pipefail  off
 "#;
         test_cli(
             vec!["-c", "-aef", "+vx", "-o", "nounset", "set -o"],
@@ -275,6 +278,7 @@ set +o xtrace
 set +o ignoreeof
 set +o nolog
 set +o vi
+set +o pipefail
 "#;
         test_cli(
             vec!["-c", "-aef", "+vx", "-o", "nounset", "set +o"],
@@ -1365,5 +1369,516 @@ mod builtin {
             include_str!("sh/builtin/read.sh"),
             include_str!("sh/builtin/read.out"),
         );
+    }
+}
+
+/// Regression tests for the findings in `sh/audit.md`. Each test cites its
+/// audit issue number. Tests are grouped by remediation phase.
+mod audit_regressions {
+    use super::*;
+
+    /// Asserts the script fails (non-zero exit) WITHOUT panicking (a Rust
+    /// panic surfaces as exit code 101 and a "panicked" message on stderr).
+    fn expect_clean_failure(script: &str) {
+        set_env_vars();
+        run_test_with_checker(
+            TestPlan {
+                cmd: "sh".to_string(),
+                args: vec!["-s".to_string()],
+                stdin_data: script.to_string(),
+                expected_out: String::new(),
+                expected_err: String::new(),
+                expected_exit_code: 0,
+            },
+            |_, output| {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(!stderr.contains("panicked"), "shell panicked: {stderr}");
+                assert_ne!(output.status.code(), Some(101), "shell panicked (exit 101)");
+                assert!(!output.status.success(), "expected non-zero exit status");
+            },
+        );
+    }
+
+    // ----- Phase 1: eliminate panics -----
+
+    #[test]
+    fn bracket_close_first_is_literal_no_panic() {
+        // #2: `]` as the first bracket member is a literal, not a crash.
+        test_script("case \"]\" in []]) echo M;; *) echo NO;; esac\n", "M\n");
+        test_script("case x in [!]]) echo M;; *) echo NO;; esac\n", "M\n");
+    }
+
+    #[test]
+    fn arithmetic_div_by_zero_is_error_not_panic() {
+        // #3
+        expect_clean_failure("echo $((1/0))\n");
+        expect_clean_failure("x=1; echo $((x/=0))\n");
+    }
+
+    #[test]
+    fn arithmetic_mod_by_zero_is_error_not_panic() {
+        // #4
+        expect_clean_failure("echo $((5%0))\n");
+    }
+
+    #[test]
+    fn arithmetic_overflow_and_shift_wrap_not_panic() {
+        // #3/#4 sibling: overflow and out-of-range shifts wrap, never panic.
+        test_script(
+            "echo $((9223372036854775807+1))\n",
+            "-9223372036854775808\n",
+        );
+        test_script("echo $((1<<64))\n", "1\n");
+    }
+
+    #[test]
+    fn read_with_options_before_vars_no_panic() {
+        // #5: `read -r x y` must split into vars.len() fields, not panic.
+        test_script(
+            "printf 'a b c\\n' | { read -r x y; echo \"[$x][$y]\"; }\n",
+            "[a][b c]\n",
+        );
+        test_script(
+            "printf 'a b c d e\\n' | { read x y; echo \"[$x][$y]\"; }\n",
+            "[a][b c d e]\n",
+        );
+    }
+
+    #[test]
+    fn missing_command_file_exits_127_not_panic() {
+        // #6
+        set_env_vars();
+        run_test_with_checker(
+            TestPlan {
+                cmd: "sh".to_string(),
+                args: vec!["/no_such_sh_audit_file_xyz".to_string()],
+                stdin_data: String::new(),
+                expected_out: String::new(),
+                expected_err: String::new(),
+                expected_exit_code: 0,
+            },
+            |_, output| {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(!stderr.contains("panicked"), "shell panicked: {stderr}");
+                assert_eq!(output.status.code(), Some(127));
+            },
+        );
+    }
+
+    #[test]
+    fn jobs_bare_id_is_error_not_panic() {
+        // #29: `jobs 1` (missing '%') must diagnose, not assert-panic.
+        expect_clean_failure("jobs 1\n");
+    }
+
+    // ----- Phase 2: pattern-matching correctness -----
+
+    #[test]
+    fn case_pattern_is_anchored() {
+        // #1: a `case` pattern must match the WHOLE word, not a substring.
+        test_script("case ab in a) echo M;; *) echo NO;; esac\n", "NO\n");
+        test_script("case foobar in oo) echo M;; *) echo NO;; esac\n", "NO\n");
+        test_script("case abc in b) echo M;; *) echo NO;; esac\n", "NO\n");
+        // full matches still work
+        test_script("case abc in a*c) echo M;; *) echo NO;; esac\n", "M\n");
+        test_script("case abc in a?c) echo M;; *) echo NO;; esac\n", "M\n");
+        test_script("case hello in hello) echo M;; *) echo NO;; esac\n", "M\n");
+    }
+
+    // ----- Phase 3: set -u and exit/error semantics -----
+
+    #[test]
+    fn nounset_unset_variable_is_fatal_error() {
+        // #7/#13: under `set -u`, expanding an unset parameter errors and exits
+        // a non-interactive shell (so "AFTER" is never printed).
+        test_script_expect_error_status_and_stdout("set -u; echo $undef; echo AFTER\n", Some(""));
+        test_script_expect_error_status_and_stdout("set -u; echo ${undef}; echo AFTER\n", Some(""));
+        test_script_expect_error_status_and_stdout("set -u; v=${undef}; echo AFTER\n", Some(""));
+    }
+
+    #[test]
+    fn nounset_set_variable_is_ok() {
+        // #7: a set variable (even empty) is fine under `set -u`.
+        test_script("set -u; x=1; echo $x\n", "1\n");
+        test_script("set -u; set -- a b; echo $#\n", "2\n");
+    }
+
+    #[test]
+    fn expansion_error_exits_non_interactive() {
+        // #13: `${x:?}` on an unset variable exits the script.
+        test_script_expect_error_status_and_stdout("echo ${x:?}; echo AFTER\n", Some(""));
+    }
+
+    #[test]
+    fn arithmetic_variable_is_recursively_evaluated() {
+        // #41: a variable used in $(()) is itself evaluated as an expression.
+        test_script("x=1+2; echo $((x))\n", "3\n");
+        test_script("a=5; x=a; echo $((x))\n", "5\n");
+        // an unset name (without set -u) is 0
+        test_script("x=undefined_name; echo $((x))\n", "0\n");
+    }
+
+    #[test]
+    fn command_not_found_exits_127() {
+        // #15
+        run_successfully_and("command no_such_cmd_xyz_q; echo rc=$?\n", |out| {
+            assert_eq!(out, "rc=127\n");
+        });
+    }
+
+    #[test]
+    fn signal_terminated_status_is_128_plus_signal() {
+        // #12: a SIGTERM-killed child yields 128+15 = 143 (not 128+discriminant).
+        run_successfully_and("sleep 5 & p=$!; kill -TERM $p; wait $p; echo $?\n", |out| {
+            assert_eq!(out, "143\n");
+        });
+    }
+
+    #[test]
+    fn exit_within_exit_trap_does_not_recurse() {
+        // #37: `exit` inside the EXIT trap terminates immediately.
+        expect_exit_code("trap 'exit 3' EXIT; exit 1\n", 3);
+        expect_exit_code("trap ':' EXIT; exit 5\n", 5);
+    }
+
+    // ----- Phase 4: control flow & word expansion -----
+
+    #[test]
+    fn return_with_no_operand_uses_dollar_question() {
+        // #10
+        run_successfully_and("f() { false; return; }; f; echo $?\n", |out| {
+            assert_eq!(out, "1\n");
+        });
+        run_successfully_and("f() { return 4; }; f; echo $?\n", |out| {
+            assert_eq!(out, "4\n");
+        });
+    }
+
+    #[test]
+    fn break_does_not_escape_a_function() {
+        // #11: a break inside a function must not break a loop in the caller.
+        run_successfully_and(
+            "for x in 1 2; do f() { break; }; f; echo in$x; done; echo done\n",
+            |out| assert_eq!(out, "in1\nin2\ndone\n"),
+        );
+        // break still works inside nested loops
+        run_successfully_and(
+            "for x in 1 2; do for y in a b; do echo $x$y; break 2; done; done\n",
+            |out| assert_eq!(out, "1a\n"),
+        );
+    }
+
+    #[test]
+    fn arithmetic_unary_operators_chain() {
+        // #26
+        test_script("echo $((!!0))\n", "0\n");
+        test_script("echo $((!!5))\n", "1\n");
+        test_script("echo $((- -1))\n", "1\n");
+        test_script("echo $((~~5))\n", "5\n");
+    }
+
+    #[test]
+    fn arithmetic_comma_operator() {
+        // #40
+        test_script("echo $((1,2,3))\n", "3\n");
+        test_script("echo $((a=1, b=2, a+b))\n", "3\n");
+        test_script("echo $((1+(2,3)))\n", "4\n");
+    }
+
+    #[test]
+    fn assign_default_does_not_reassign_set_variable() {
+        // #9: ${x:=word} must not expand/assign word when x is already set.
+        run_successfully_and("x=set; v=${x:=new}; echo \"$x:$v\"\n", |out| {
+            assert_eq!(out, "set:set\n");
+        });
+        // but it does assign when unset
+        run_successfully_and("unset x; v=${x:=new}; echo \"$x:$v\"\n", |out| {
+            assert_eq!(out, "new:new\n");
+        });
+    }
+
+    #[test]
+    fn parameter_expansion_word_may_contain_blanks() {
+        // #59
+        test_script("echo ${x:-a b c}\n", "a b c\n");
+        run_successfully_and("x=; echo ${x:=d e}; echo \"$x\"\n", |out| {
+            assert_eq!(out, "d e\nd e\n");
+        });
+    }
+
+    #[test]
+    fn string_length_counts_characters() {
+        // #39 (ASCII path; multibyte verified behaviorally under a UTF-8 locale)
+        test_script("x=hello; echo ${#x}\n", "5\n");
+    }
+
+    #[test]
+    fn tilde_with_unset_home_is_literal() {
+        // #30
+        test_script("unset HOME; echo ~\n", "~\n");
+    }
+
+    // ----- Phase 5: POSIX.1-2024 parser/lexer additions -----
+
+    #[test]
+    fn literal_dollar_is_not_an_error() {
+        // #58
+        test_script("echo $\n", "$\n");
+        test_script("echo a$\n", "a$\n");
+        test_script("echo \"$\"\n", "$\n");
+        test_script("echo $]\n", "$]\n");
+        // $$ is still the PID special parameter
+        run_successfully_and(
+            "case \"$$\" in [0-9]*) echo pid;; *) echo no;; esac\n",
+            |out| {
+                assert_eq!(out, "pid\n");
+            },
+        );
+    }
+
+    #[test]
+    fn dollar_single_quote_escapes() {
+        // #20
+        test_script("printf '%s' $'a\\tb'\n", "a\tb");
+        test_script("printf '%s' $'a\\nb'\n", "a\nb");
+        test_script("printf '%s' $'\\x41\\x42'\n", "AB");
+        test_script("printf '%s' $'\\101'\n", "A");
+        test_script("printf '%s' $'a\\'b'\n", "a'b");
+        // not special inside double quotes
+        test_script("printf '%s' \"$'abc'\"\n", "$'abc'");
+    }
+
+    #[test]
+    fn case_semi_and_falls_through() {
+        // #21
+        test_script(
+            "case a in a) echo A;& b) echo B;; c) echo C;; esac\n",
+            "A\nB\n",
+        );
+        test_script(
+            "case 1 in 1) echo one;& 2) echo two;& 3) echo three;; esac\n",
+            "one\ntwo\nthree\n",
+        );
+        // ;; still stops
+        test_script("case a in a) echo A;; b) echo B;; esac\n", "A\n");
+    }
+
+    #[test]
+    fn function_definition_allows_linebreak_before_body() {
+        // #23
+        test_script("f()\n{ echo HI; }\nf\n", "HI\n");
+    }
+
+    #[test]
+    fn double_dash_ends_options() {
+        // #22: `--` ends options; `-c` after it is an operand (a file name),
+        // not an "invalid option" error.
+        set_env_vars();
+        run_test_with_checker(
+            TestPlan {
+                cmd: "sh".to_string(),
+                args: vec!["--".to_string(), "-c".to_string(), "echo hi".to_string()],
+                stdin_data: String::new(),
+                expected_out: String::new(),
+                expected_err: String::new(),
+                expected_exit_code: 0,
+            },
+            |_, output| {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(!stderr.contains("invalid option"), "stderr: {stderr}");
+                // treated as a (missing) command_file operand -> 127
+                assert_eq!(output.status.code(), Some(127));
+            },
+        );
+    }
+
+    // ----- Phase 6: pipefail & built-in output hygiene -----
+
+    #[test]
+    fn pipefail_derives_pipeline_status() {
+        // #14
+        run_successfully_and("set -o pipefail; false | true; echo $?\n", |out| {
+            assert_eq!(out, "1\n");
+        });
+        run_successfully_and("set -o pipefail; true | true; echo $?\n", |out| {
+            assert_eq!(out, "0\n");
+        });
+        // without pipefail, only the last command counts
+        run_successfully_and("false | true; echo $?\n", |out| assert_eq!(out, "0\n"));
+    }
+
+    #[test]
+    fn type_identifies_reserved_words() {
+        // #16
+        run_successfully_and("type if\n", |out| {
+            assert_eq!(out, "if is a shell keyword\n");
+        });
+        run_successfully_and("type while\n", |out| {
+            assert_eq!(out, "while is a shell keyword\n");
+        });
+    }
+
+    #[test]
+    fn getopts_optind_is_a_plain_integer() {
+        // #17: OPTIND stays numeric, so `shift $((OPTIND-1))` works.
+        run_successfully_and(
+            "set -- -a foo; getopts a o; shift $((OPTIND-1)); echo \"$1\"\n",
+            |out| assert_eq!(out, "foo\n"),
+        );
+        run_successfully_and("set -- -a x; getopts a o; echo \"$OPTIND\"\n", |out| {
+            assert_eq!(out, "2\n");
+        });
+    }
+
+    #[test]
+    fn export_p_output_is_reinputtable() {
+        // #25: a value containing a single quote is still quoted safely.
+        run_successfully_and("export \"Q=a'b\"; export -p | grep '^export Q'\n", |out| {
+            assert_eq!(out, "export Q='a'\\''b'\n")
+        });
+    }
+
+    #[test]
+    fn unset_repeated_option_is_ok() {
+        // #47
+        run_successfully_and("x=1; unset -v -v x; echo \"[${x-gone}]\"\n", |out| {
+            assert_eq!(out, "[gone]\n");
+        });
+    }
+
+    // ----- Phase 7: read / cd / umask / hash / redirection -----
+
+    #[test]
+    fn read_honors_backslash_newline_continuation() {
+        // #19
+        run_successfully_and(
+            "printf 'a\\\\\\nb\\n' | { read x; echo \"[$x]\"; }\n",
+            |out| assert_eq!(out, "[ab]\n"),
+        );
+    }
+
+    #[test]
+    fn umask_accepts_symbolic_input() {
+        // #18
+        run_successfully_and("umask 022; umask u=rwx,go=rx; umask\n", |out| {
+            assert_eq!(out, "0022\n");
+        });
+        run_successfully_and("umask 0; umask a-w; umask\n", |out| {
+            assert_eq!(out, "0222\n");
+        });
+    }
+
+    #[test]
+    fn cd_empty_operand_is_an_error() {
+        // #42: `cd ""` fails (non-zero) but, being a regular built-in, does not
+        // abort the script.
+        run_successfully_and("cd \"\" 2>/dev/null; echo rc=$?\n", |out| {
+            assert_eq!(out, "rc=1\n");
+        });
+    }
+
+    #[test]
+    fn large_io_number_is_accepted() {
+        // #43: fd numbers above the old 1023 cap are allowed.
+        run_successfully_and(": 100>/dev/null; echo ok\n", |out| {
+            assert_eq!(out, "ok\n");
+        });
+    }
+
+    #[test]
+    fn noclobber_blocks_overwrite() {
+        // #44
+        run_successfully_and(
+            "set -C; f=\"$TEST_WRITE_DIR/nc_test\"; rm -f \"$f\"; echo a > \"$f\"; \
+             echo b > \"$f\" 2>/dev/null; echo rc=$?; echo c >| \"$f\" && echo override; rm -f \"$f\"\n",
+            |out| assert_eq!(out, "rc=1\noverride\n"),
+        );
+    }
+
+    // ----- Phase 8: jobs / signals / env / startup -----
+
+    #[test]
+    fn times_output_is_well_formed() {
+        // #27: two lines, each "MmS.SSSs MmS.SSSs".
+        run_successfully_and("times\n", |out| {
+            let lines: Vec<&str> = out.trim_end().split('\n').collect();
+            assert_eq!(lines.len(), 2, "times should print two lines: {out:?}");
+            for line in lines {
+                let fields: Vec<&str> = line.split(' ').collect();
+                assert_eq!(fields.len(), 2, "each line has two times: {line:?}");
+                for f in fields {
+                    assert!(
+                        f.contains('m') && f.ends_with('s') && f.contains('.'),
+                        "bad time field {f:?}"
+                    );
+                    // three fractional digits
+                    let frac = &f[f.find('.').unwrap() + 1..f.len() - 1];
+                    assert_eq!(frac.len(), 3, "expected 3 fractional digits in {f:?}");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn kill_accepts_signal_name_variants() {
+        // #49: case-independent names, with or without the SIG prefix.
+        run_successfully_and("sleep 5 & kill -s term $!; wait $!; echo $?\n", |out| {
+            assert_eq!(out, "143\n");
+        });
+        run_successfully_and("sleep 5 & kill -s Kill $!; wait $!; echo $?\n", |out| {
+            assert_eq!(out, "137\n");
+        });
+        run_successfully_and("kill -l 9\n", |out| assert_eq!(out, "KILL\n"));
+    }
+
+    #[test]
+    fn lineno_is_preserved_across_function_calls() {
+        // #53
+        run_successfully_and("f() { :; }\nf\necho $LINENO\n", |out| {
+            assert_eq!(out, "3\n");
+        });
+    }
+
+    #[test]
+    fn pipeline_waits_for_all_commands() {
+        // A pipeline must wait for every command, not just the last one. The
+        // head writes a marker only after a delay; if the pipeline did not wait,
+        // the following `cat` would not see it.
+        run_successfully_and(
+            "f=\"$TEST_WRITE_DIR/pipe_wait\"; rm -f \"$f\"; \
+             { sleep 0.3; echo waited > \"$f\"; } | true; cat \"$f\"; rm -f \"$f\"\n",
+            |out| assert_eq!(out, "waited\n"),
+        );
+    }
+
+    #[test]
+    fn glob_matches_symlinks() {
+        // #24
+        set_env_vars();
+        let dir = Path::new(concat!(env!("CARGO_TARGET_TMPDIR"), "/sh_test_write_dir"))
+            .join("glob_symlink_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("real"), "x").unwrap();
+        std::os::unix::fs::symlink("real", dir.join("lnk")).unwrap();
+        run_successfully_and(
+            &format!("cd '{}'; for f in *; do echo \"$f\"; done\n", dir.display()),
+            |out| assert_eq!(out, "lnk\nreal\n"),
+        );
+    }
+
+    #[test]
+    fn bracket_literal_members_match() {
+        // #8: literal members inside `[...]` (incl. '.', '*', '^', ']') match
+        // themselves rather than being mis-escaped or mis-parsed.
+        test_script("case . in [.]) echo M;; *) echo NO;; esac\n", "M\n");
+        test_script("case x in [.]) echo M;; *) echo NO;; esac\n", "NO\n");
+        test_script("case '*' in [.*^]) echo M;; *) echo NO;; esac\n", "M\n");
+        test_script("case '^' in [.*^]) echo M;; *) echo NO;; esac\n", "M\n");
+        test_script("case '^' in [a^]) echo M;; *) echo NO;; esac\n", "M\n");
+        test_script("case ']' in []]) echo M;; *) echo NO;; esac\n", "M\n");
+        test_script("case d in [!abc]) echo M;; *) echo NO;; esac\n", "M\n");
+        test_script("case m in [a-z]) echo M;; *) echo NO;; esac\n", "M\n");
+        test_script("case 5 in [[:digit:]]) echo M;; *) echo NO;; esac\n", "M\n");
     }
 }

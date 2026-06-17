@@ -13,6 +13,7 @@ use crate::builtin::{
 };
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use gettextrs::gettext;
 
 pub struct Hash;
 
@@ -25,7 +26,7 @@ impl BuiltinUtility for Hash {
     ) -> BuiltinResult {
         if args.first().is_some_and(|arg| arg == "-r") {
             if args.len() > 1 {
-                return Err("hash: too many arguments".into());
+                return Err(gettext("hash: too many arguments").into());
             }
             shell.saved_command_locations.clear();
             return Ok(0);
@@ -46,7 +47,7 @@ impl BuiltinUtility for Hash {
                     && get_builtin_utility(arg.as_str()).is_none()
                     && shell.find_command(arg, "", true).is_none()
                 {
-                    opened_files.write_out(format!("hash: command {} was not found\n", arg));
+                    opened_files.write_err(format!("hash: command {} was not found\n", arg));
                     status = 1;
                 }
             }

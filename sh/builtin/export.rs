@@ -11,6 +11,7 @@ use crate::builtin::{skip_option_terminator, BuiltinResult, SpecialBuiltinUtilit
 use crate::parse::command_parser::is_valid_name;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use gettextrs::gettext;
 
 pub struct Export;
 
@@ -23,7 +24,7 @@ impl SpecialBuiltinUtility for Export {
     ) -> BuiltinResult {
         if args.first().is_some_and(|arg| arg == "-p") {
             if args.len() > 1 && !(args.len() == 2 && args[1] == "--") {
-                return Err("export: too many arguments".into());
+                return Err(gettext("export: too many arguments").into());
             }
             let mut pairs = shell
                 .environment
@@ -34,7 +35,11 @@ impl SpecialBuiltinUtility for Export {
             pairs.sort_by_key(|(k, _)| k.as_str());
             for (var, var_value) in pairs {
                 if let Some(val) = &var_value.value {
-                    opened_files.write_out(format!("export {}='{}'\n", var, val));
+                    opened_files.write_out(format!(
+                        "export {}={}\n",
+                        var,
+                        crate::utils::shell_quote(val)
+                    ));
                 } else {
                     opened_files.write_out(format!("export {}\n", var));
                 }
@@ -44,7 +49,7 @@ impl SpecialBuiltinUtility for Export {
 
         let args = skip_option_terminator(args);
         if args.is_empty() {
-            return Err("export: too few arguments".into());
+            return Err(gettext("export: too few arguments").into());
         }
 
         for arg in args {

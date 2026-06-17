@@ -10,6 +10,7 @@
 use crate::builtin::{skip_option_terminator, BuiltinResult, BuiltinUtility};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use gettextrs::gettext;
 
 pub struct Unalias;
 
@@ -22,7 +23,7 @@ impl BuiltinUtility for Unalias {
     ) -> BuiltinResult {
         if args.first().is_some_and(|arg| arg == "-a") {
             if args.len() > 1 {
-                return Err("unalias: too many arguments".into());
+                return Err(gettext("unalias: too many arguments").into());
             }
             shell.alias_table.clear();
             return Ok(0);

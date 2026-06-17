@@ -33,6 +33,7 @@ use crate::shell::environment::{CannotModifyReadonly, Environment, Value};
 use crate::shell::history::{initialize_history_from_system, write_history_to_file, History};
 use crate::shell::opened_files::OpenedFiles;
 use crate::wordexp::{expand_word, expand_word_to_string, word_to_pattern};
+use gettextrs::gettext;
 use std::collections::HashMap;
 use std::ffi::{CString, OsString};
 use std::fmt::{Display, Formatter};
@@ -86,7 +87,7 @@ impl Display for CommandExecutionError {
                 writeln!(f, "{err}")
             }
             CommandExecutionError::CommandNotFound(command_name) => {
-                writeln!(f, "sh: '{command_name}' not found")
+                writeln!(f, "sh: '{command_name}' {}", gettext("not found"))
             }
             CommandExecutionError::OsError(err) => {
                 writeln!(f, "{err}")
@@ -94,8 +95,10 @@ impl Display for CommandExecutionError {
             CommandExecutionError::ParseError(err) => {
                 writeln!(
                     f,
-                    "sh: parsing error at line {}: {}",
-                    err.lineno, err.message
+                    "sh: {} {}: {}",
+                    gettext("parsing error at line"),
+                    err.lineno,
+                    err.message
                 )
             }
         }
@@ -180,6 +183,38 @@ pub struct Shell {
     pub is_subshell: bool,
     pub last_pipeline_command: String,
     pub terminal: Terminal,
+    /// `getopts` keeps `OPTIND` a plain integer; the within-argument position
+    /// for bundled options (`-abc`) is tracked here, as `(optind_we_wrote,
+    /// option_index)`. If `OPTIND` differs from `optind_we_wrote` on entry the
+    /// application reset it and the option index restarts at 0.
+    pub getopts_state: (usize, usize),
+    /// Time of the last mail check and the last-seen mtime of each mail file.
+    pub mail_check: MailCheck,
+}
+
+#[derive(Default, Clone)]
+pub struct MailCheck {
+    last_check: Option<std::time::Instant>,
+    mtimes: HashMap<String, Option<std::time::SystemTime>>,
+}
+
+/// Splits a `MAILPATH` entry into its pathname and optional `%message`, with a
+/// backslash escaping the following character (so `\%` is a literal `%`).
+fn split_mailpath_entry(entry: &str) -> (String, Option<String>) {
+    let mut path = String::new();
+    let mut chars = entry.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                if let Some(next) = chars.next() {
+                    path.push(next);
+                }
+            }
+            '%' => return (path, Some(chars.collect())),
+            _ => path.push(c),
+        }
+    }
+    (path, None)
 }
 
 impl Shell {
@@ -193,7 +228,11 @@ impl Shell {
     }
 
     pub fn exit(&mut self, code: i32) -> ! {
-        self.execute_action(self.exit_action.clone());
+        // Run the EXIT trap exactly once: take it out before executing so that
+        // an `exit` invoked from within the trap action terminates immediately
+        // (POSIX) instead of recursing forever.
+        let exit_action = std::mem::replace(&mut self.exit_action, TrapAction::Default);
+        self.execute_action(exit_action);
         if self.is_interactive && !self.is_subshell {
             write_history_to_file(&self.history, &self.environment);
         }
@@ -239,6 +278,10 @@ impl Shell {
         name: String,
         value: String,
     ) -> Result<&mut Value, CannotModifyReadonly> {
+        // Changing PATH invalidates the remembered command locations (hash).
+        if name == "PATH" {
+            self.saved_command_locations.clear();
+        }
         // inspect does not work in this case
         #[allow(clippy::manual_inspect)]
         self.environment.set_global(name, value).map(|val| {
@@ -268,6 +311,14 @@ impl Shell {
         match err {
             CommandExecutionError::CommandNotFound(_) => 127,
             CommandExecutionError::OsError(_) => self.exit(1),
+            // POSIX §2.8.1: an expansion error or a variable-assignment error
+            // shall cause a non-interactive shell to exit.
+            CommandExecutionError::ExpansionError(_)
+            | CommandExecutionError::VariableAssignmentError(_)
+                if !self.is_interactive =>
+            {
+                self.exit(1)
+            }
             _ => 1,
         }
     }
@@ -386,6 +437,12 @@ impl Shell {
         let mut args = expanded_words[1..].to_vec();
         std::mem::swap(&mut args, &mut self.positional_parameters);
 
+        // A `break`/`continue` inside the function body must not escape into a
+        // loop in the caller (POSIX), so the loop nesting starts fresh here.
+        let saved_loop_depth = std::mem::take(&mut self.loop_depth);
+        // LINENO is restored after the call so the caller's line numbering is
+        // unaffected by the function body.
+        let saved_lineno = self.last_lineno;
         self.function_call_depth += 1;
         let result = self.interpret_compound_command(
             function_body,
@@ -397,6 +454,8 @@ impl Shell {
             self.control_flow_state = ControlFlowState::None;
         }
         self.function_call_depth -= 1;
+        self.loop_depth = saved_loop_depth;
+        self.last_lineno = saved_lineno;
         std::mem::swap(&mut args, &mut self.positional_parameters);
         std::mem::swap(&mut self.opened_files, &mut previous_opened_files);
         self.environment.pop_scope();
@@ -567,13 +626,31 @@ impl Shell {
     ) -> CommandExecutionResult<i32> {
         let arg = expand_word_to_string(&arg.word, false, self)?;
         let arg_cstr = CString::new(arg).expect("invalid pattern");
-        for case in cases {
+        for (index, case) in cases.iter().enumerate() {
+            let mut matched = false;
             for pattern in &case.pattern {
                 let pattern = word_to_pattern(&pattern.word, self)?;
                 if pattern.matches(&arg_cstr) {
-                    return Ok(self.interpret(&case.body, ignore_errexit));
+                    matched = true;
+                    break;
                 }
             }
+            if !matched {
+                continue;
+            }
+            let mut result = self.interpret(&case.body, ignore_errexit);
+            // `;&` falls through: execute subsequent items' bodies without
+            // pattern matching, stopping at a `;;` item, the end, or once a
+            // break/continue/return is pending.
+            let mut idx = index;
+            while cases[idx].fallthrough
+                && idx + 1 < cases.len()
+                && self.control_flow_state == ControlFlowState::None
+            {
+                idx += 1;
+                result = self.interpret(&cases[idx].body, ignore_errexit);
+            }
+            return Ok(result);
         }
         Ok(0)
     }
@@ -736,6 +813,7 @@ impl Shell {
                     }
 
                     let mut current_stdin = libc::STDIN_FILENO;
+                    let mut head_pids = Vec::new();
                     for command in pipeline.commands.head() {
                         let (read_pipe, write_pipe) = pipe()?;
                         match fork()? {
@@ -752,7 +830,8 @@ impl Shell {
                                 }
                                 self.exit(return_status);
                             }
-                            ForkResult::Parent { .. } => {
+                            ForkResult::Parent { child } => {
+                                head_pids.push(child);
                                 if current_stdin != libc::STDIN_FILENO {
                                     close(current_stdin)?;
                                 }
@@ -763,7 +842,28 @@ impl Shell {
                     dup2(current_stdin, libc::STDIN_FILENO)?;
                     let return_status = self.interpret_command(pipeline.commands.last(), false);
                     close(current_stdin)?;
-                    self.exit(return_status);
+                    // Wait for every command in the pipeline to finish (POSIX
+                    // requires it), reaping the head commands so they are not
+                    // left running as orphans (e.g. `sleep 5 | true`).
+                    let mut statuses: Vec<i32> = head_pids
+                        .into_iter()
+                        .map(|pid| self.wait_child_process(pid).unwrap_or(0))
+                        .collect();
+                    statuses.push(return_status);
+                    // With `pipefail`, the pipeline status is that of the
+                    // rightmost command that exited non-zero (else 0); otherwise
+                    // it is the status of the last command only.
+                    let exit_status = if self.set_options.pipefail {
+                        statuses
+                            .iter()
+                            .rev()
+                            .find(|&&s| s != 0)
+                            .copied()
+                            .unwrap_or(0)
+                    } else {
+                        return_status
+                    };
+                    self.exit(exit_status);
                 }
                 ForkResult::Parent { child } => {
                     loop {
@@ -986,6 +1086,13 @@ impl Shell {
                 std::process::exit(1);
             }
         };
+        // POSIX: the shell sets and exports PWD to the current directory.
+        environment
+            .set_global_forced(
+                "PWD".to_string(),
+                current_directory.to_string_lossy().into_owned(),
+            )
+            .export = true;
         Shell {
             environment,
             program_name,
@@ -1000,7 +1107,56 @@ impl Shell {
         }
     }
 
-    fn get_var_and_expand(&mut self, var: &str, default_if_err: &str) -> String {
+    /// Checks the mailbox file(s) named by `MAILPATH` (or `MAIL`) and returns
+    /// any notifications to write before the next prompt, throttled by the
+    /// `MAILCHECK` interval (default 600s; 0 = every prompt). `MAILPATH` takes
+    /// precedence over `MAIL`.
+    pub fn check_mail(&mut self) -> Vec<String> {
+        let interval: u64 = self
+            .environment
+            .get_str_value("MAILCHECK")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(600);
+        let entries: Vec<(String, Option<String>)> =
+            if let Some(mailpath) = self.environment.get_str_value("MAILPATH") {
+                mailpath.split(':').map(split_mailpath_entry).collect()
+            } else if let Some(mail) = self.environment.get_str_value("MAIL") {
+                vec![(mail.to_string(), None)]
+            } else {
+                return Vec::new();
+            };
+        if interval > 0 {
+            if let Some(last) = self.mail_check.last_check {
+                if last.elapsed().as_secs() < interval {
+                    return Vec::new();
+                }
+            }
+        }
+        self.mail_check.last_check = Some(std::time::Instant::now());
+        let mut messages = Vec::new();
+        for (path, message) in entries {
+            let mtime = std::fs::metadata(&path)
+                .ok()
+                .and_then(|m| m.modified().ok());
+            let first_seen = !self.mail_check.mtimes.contains_key(&path);
+            let prev = self.mail_check.mtimes.get(&path).copied().flatten();
+            // notify when the file is created or its mtime advances (but never
+            // on the first observation, which just establishes the baseline)
+            let notify = !first_seen
+                && match (prev, mtime) {
+                    (Some(p), Some(m)) => m > p,
+                    (None, Some(_)) => true,
+                    _ => false,
+                };
+            self.mail_check.mtimes.insert(path, mtime);
+            if notify {
+                messages.push(message.unwrap_or_else(|| "you have mail".to_string()));
+            }
+        }
+        messages
+    }
+
+    pub fn get_var_and_expand(&mut self, var: &str, default_if_err: &str) -> String {
         let var = self.environment.get_str_value(var).unwrap_or_default();
         match parse_word(var, 0, false) {
             Ok(word) => match expand_word_to_string(&word, false, self) {
@@ -1064,6 +1220,8 @@ impl Default for Shell {
             saved_command_locations: HashMap::with_capacity(DEFAULT_COMMAND_CACHE_CAPACITY),
             is_subshell: false,
             last_pipeline_command: String::new(),
+            getopts_state: (0, 0),
+            mail_check: MailCheck::default(),
             terminal: Terminal::default(),
         }
     }

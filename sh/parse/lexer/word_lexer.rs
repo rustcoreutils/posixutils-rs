@@ -25,10 +25,100 @@ pub enum WordToken<'src> {
     CommandSubstitution(&'src str),
     BacktickCommandSubstitution(&'src str),
     ArithmeticExpansion(&'src str),
+    /// `$'...'` dollar-single-quote (POSIX.1-2024 §2.2.4); holds the raw,
+    /// not-yet-unescaped content between the quotes.
+    DollarSingleQuote(&'src str),
 
     Char(char),
 
     Eof,
+}
+
+/// A character that, immediately after `$`, can introduce a parameter
+/// expansion or special parameter. If `$` is followed by anything else (a
+/// blank, `]`, `"`, EOF, ...) it is an ordinary literal `$`.
+fn is_parameter_start(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '{' | '@' | '*' | '#' | '?' | '-' | '!' | '$')
+}
+
+/// Processes the backslash escape sequences of a `$'...'` string per
+/// POSIX.1-2024 §2.2.4 into the literal characters they denote.
+pub fn unescape_dollar_single_quote(raw: &str) -> String {
+    let mut result = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            result.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => result.push('\n'),
+            Some('t') => result.push('\t'),
+            Some('r') => result.push('\r'),
+            Some('a') => result.push('\u{07}'),
+            Some('b') => result.push('\u{08}'),
+            Some('e') | Some('E') => result.push('\u{1b}'),
+            Some('f') => result.push('\u{0c}'),
+            Some('v') => result.push('\u{0b}'),
+            Some('\\') => result.push('\\'),
+            Some('\'') => result.push('\''),
+            Some('"') => result.push('"'),
+            Some('?') => result.push('?'),
+            Some('x') => {
+                let mut value: u32 = 0;
+                let mut count = 0;
+                while count < 2 {
+                    match chars.peek().and_then(|c| c.to_digit(16)) {
+                        Some(d) => {
+                            value = value * 16 + d;
+                            chars.next();
+                            count += 1;
+                        }
+                        None => break,
+                    }
+                }
+                if count == 0 {
+                    result.push('\\');
+                    result.push('x');
+                } else if let Some(ch) = char::from_u32(value) {
+                    result.push(ch);
+                }
+            }
+            Some('c') => {
+                if let Some(ctrl) = chars.next() {
+                    // control character: \cX -> the byte X & 0x1f
+                    let upper = ctrl.to_ascii_uppercase() as u32;
+                    if let Some(ch) = char::from_u32(upper ^ 0x40) {
+                        result.push(ch);
+                    }
+                }
+            }
+            Some(d @ '0'..='7') => {
+                let mut value = d.to_digit(8).unwrap();
+                let mut count = 1;
+                while count < 3 {
+                    match chars.peek().and_then(|c| c.to_digit(8)) {
+                        Some(o) => {
+                            value = value * 8 + o;
+                            chars.next();
+                            count += 1;
+                        }
+                        None => break,
+                    }
+                }
+                if let Some(ch) = char::from_u32(value) {
+                    result.push(ch);
+                }
+            }
+            Some(other) => {
+                // unrecognized escape: keep the backslash and the character
+                result.push('\\');
+                result.push(other);
+            }
+            None => result.push('\\'),
+        }
+    }
+    result
 }
 
 impl Display for WordToken<'_> {
@@ -42,6 +132,7 @@ impl Display for WordToken<'_> {
             WordToken::CommandSubstitution(str) => write!(f, "'$({str})'"),
             WordToken::BacktickCommandSubstitution(str) => write!(f, "`{str}`"),
             WordToken::ArithmeticExpansion(str) => write!(f, "'$(({str}))'"),
+            WordToken::DollarSingleQuote(str) => write!(f, "$'{str}'"),
             WordToken::Char(c) => write!(f, "'{}'", c),
             WordToken::Eof => write!(f, "'EOF'"),
         }
@@ -143,8 +234,29 @@ impl<'src> WordLexer<'src> {
                         self.advance();
                         WordToken::CommandSubstitution(&self.source[start..end])
                     }
-                } else {
+                } else if self.lookahead == '\'' {
+                    // $'...' dollar-single-quote: capture the raw content, with
+                    // a backslash escaping the following character (so \' does
+                    // not terminate the string).
+                    self.advance();
+                    let start = self.position;
+                    while !self.reached_eof && self.lookahead != '\'' {
+                        if self.lookahead == '\\' {
+                            self.advance();
+                            if self.reached_eof {
+                                break;
+                            }
+                        }
+                        self.advance();
+                    }
+                    let content = &self.source[start..self.position];
+                    self.advance();
+                    WordToken::DollarSingleQuote(content)
+                } else if is_parameter_start(self.lookahead) {
                     WordToken::Dollar
+                } else {
+                    // a '$' not introducing an expansion is an ordinary character
+                    WordToken::Char('$')
                 }
             }
             other => advance_and_return(self, WordToken::Char(other)),
@@ -236,6 +348,10 @@ pub fn remove_quotes(word: &str) -> (bool, String) {
                 result.push_str("$((");
                 result.push_str(expr);
                 result.push_str("))");
+            }
+            WordToken::DollarSingleQuote(content) => {
+                is_quoted = true;
+                result.push_str(&unescape_dollar_single_quote(content));
             }
             WordToken::Char(c) => result.push(c),
             WordToken::Eof => break,

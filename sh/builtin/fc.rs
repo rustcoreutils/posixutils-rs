@@ -160,16 +160,15 @@ fn execute_history(
     shell: &mut Shell,
     opened_files: &mut OpenedFiles,
     keep_in_history: bool,
-) -> Result<(), BuiltinError> {
+) -> Result<i32, BuiltinError> {
     std::mem::swap(opened_files, &mut shell.opened_files);
     let result = shell.execute_program(history);
     std::mem::swap(opened_files, &mut shell.opened_files);
     if !keep_in_history {
         shell.history.remove_last_entry();
     }
-    result
-        .map(|_| ())
-        .map_err(|err| format!("fc: syntax error: {}", err.message).into())
+    // fc exits with the status of the commands it executed.
+    result.map_err(|err| format!("fc: syntax error: {}", err.message).into())
 }
 
 fn open_editor_with_file(
@@ -192,7 +191,7 @@ fn edit(
     first: Option<EndPoint>,
     last: Option<EndPoint>,
     opened_files: &mut OpenedFiles,
-) -> Result<(), BuiltinError> {
+) -> Result<i32, BuiltinError> {
     let history = match (first, last) {
         (None, None) => shell
             .history
@@ -219,7 +218,7 @@ fn edit(
         .to_string();
     let result = open_editor_with_file(&editor, path, shell, opened_files)?;
     if result != 0 {
-        return Ok(());
+        return Ok(result);
     }
     let mut file = unsafe { File::from_raw_fd(fd) };
     let mut edited_contents = String::new();
@@ -231,8 +230,7 @@ fn edit(
         shell,
         opened_files,
         edited_contents != history,
-    )?;
-    Ok(())
+    )
 }
 
 fn list(
@@ -278,15 +276,13 @@ impl BuiltinUtility for Fc {
     ) -> BuiltinResult {
         let args = FcArgs::parse(args)?;
 
-        match args {
+        let status = match args {
             FcArgs::Edit {
                 reverse,
                 editor,
                 first,
                 last,
-            } => {
-                edit(shell, reverse, editor, first, last, opened_files)?;
-            }
+            } => edit(shell, reverse, editor, first, last, opened_files)?,
             FcArgs::List {
                 reverse,
                 suppress_command_number,
@@ -301,6 +297,7 @@ impl BuiltinUtility for Fc {
                     first,
                     last,
                 )?;
+                0
             }
             FcArgs::Reexecute { replace, first } => {
                 let first = first.unwrap_or(EndPoint::Last(1));
@@ -312,17 +309,17 @@ impl BuiltinUtility for Fc {
                 shell.history.remove_last_entry();
                 if let Some(replacement) = replace {
                     let history = history.replace(replacement.old, replacement.new);
-                    execute_history(&history, shell, opened_files, true)?;
+                    execute_history(&history, shell, opened_files, true)?
                 } else {
                     // command was not changed and is already in the history, so we don't add it.
                     // The standard doesn't specify this, but its what bash does, and it seems
                     // like a good idea
-                    execute_history(&history, shell, opened_files, false)?;
+                    execute_history(&history, shell, opened_files, false)?
                 }
             }
-        }
+        };
 
-        Ok(0)
+        Ok(status)
     }
 }
 

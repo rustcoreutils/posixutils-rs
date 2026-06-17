@@ -15,12 +15,13 @@ use crate::shell::opened_files::{OpenedFile, OpenedFiles, STDIN_FILENO};
 use crate::shell::Shell;
 use crate::wordexp::expanded_word::ExpandedWord;
 use crate::wordexp::split_fields;
+use gettextrs::gettext;
 use std::io::IsTerminal;
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::Duration;
 
 fn bytes_to_string(bytes: Vec<u8>) -> Result<String, BuiltinError> {
-    String::from_utf8(bytes.to_vec()).map_err(|_| "read: invalid UTF-8".into())
+    String::from_utf8(bytes.to_vec()).map_err(|_| gettext("read: invalid UTF-8").into())
 }
 
 fn read_byte_non_blocking(fd: RawFd) -> Result<Option<u8>, BuiltinError> {
@@ -60,26 +61,27 @@ fn read_until_from_non_blocking_fd(
     let mut escape_next = false;
     'outer: loop {
         while let Some(next) = read_byte_non_blocking(fd)? {
+            if escape_next {
+                escape_next = false;
+                if next == delimiter {
+                    // backslash-<delimiter>: line continuation.
+                    continue;
+                } else if next == b'\\' {
+                    buffer.push(b'\\');
+                } else {
+                    result.append(bytes_to_string(std::mem::take(&mut buffer))?, false, true);
+                    result.append(bytes_to_string(vec![next])?, true, true);
+                }
+                continue;
+            }
             if next == delimiter {
                 break 'outer;
             }
             if backslash_escape && next == b'\\' {
-                if escape_next {
-                    buffer.push(b'\\');
-                    escape_next = false;
-                } else {
-                    escape_next = true;
-                }
+                escape_next = true;
                 continue;
             }
-            if escape_next {
-                result.append(bytes_to_string(buffer)?, false, true);
-                result.append(bytes_to_string(vec![next])?, true, true);
-                buffer = Vec::new();
-                escape_next = false;
-            } else {
-                buffer.push(next);
-            }
+            buffer.push(next);
         }
         // might receive signals while reading
         shell.handle_async_events();
@@ -104,27 +106,29 @@ fn read_until_from_file(
     let mut escape_next = false;
     let mut reached_eof = true;
     while let Some(next) = read_byte(fd)? {
+        if escape_next {
+            escape_next = false;
+            if next == delimiter {
+                // backslash-<delimiter> is a line continuation: drop both and
+                // keep reading (the delimiter is usually <newline>).
+                continue;
+            } else if next == b'\\' {
+                buffer.push(b'\\');
+            } else {
+                result.append(bytes_to_string(std::mem::take(&mut buffer))?, false, true);
+                result.append(bytes_to_string(vec![next])?, true, true);
+            }
+            continue;
+        }
         if next == delimiter {
             reached_eof = false;
             break;
         }
         if backslash_escape && next == b'\\' {
-            if escape_next {
-                buffer.push(b'\\');
-                escape_next = false;
-            } else {
-                escape_next = true;
-            }
+            escape_next = true;
             continue;
         }
-        if escape_next {
-            result.append(bytes_to_string(buffer)?, false, true);
-            result.append(bytes_to_string(vec![next])?, true, true);
-            buffer = Vec::new();
-            escape_next = false;
-        } else {
-            buffer.push(next);
-        }
+        buffer.push(next);
     }
 
     if !buffer.is_empty() {
@@ -217,7 +221,7 @@ fn read_until(
             delimiter,
             backslash_escape,
         )),
-        _ => Err("read: invalid standard input".into()),
+        _ => Err(gettext("read: invalid standard input").into()),
     }
 }
 
@@ -244,13 +248,13 @@ impl BuiltinUtility for BuiltinRead {
                 }
                 'd' => {
                     if delim.is_some() {
-                        return Err("read: -d can only be specified once".into());
+                        return Err(gettext("read: -d can only be specified once").into());
                     }
                     let arg = option_parser
                         .next_option_argument()
                         .ok_or("read: -d requires an argument")?;
                     if arg.len() > 1 {
-                        return Err("read: -d requires a single character".into());
+                        return Err(gettext("read: -d requires a single character").into());
                     }
                     if arg.is_empty() {
                         delim = Some(b'\0');
@@ -264,7 +268,7 @@ impl BuiltinUtility for BuiltinRead {
 
         let first_operand = option_parser.next_argument();
         if first_operand == args.len() {
-            return Err("read: missing operand".into());
+            return Err(gettext("read: missing operand").into());
         }
         let vars = &args[first_operand..];
 
@@ -276,7 +280,7 @@ impl BuiltinUtility for BuiltinRead {
         let fields = split_fields(
             input.contents,
             shell.environment.get_str_value("IFS"),
-            args.len(),
+            vars.len(),
         );
 
         for i in 0..fields.len() {

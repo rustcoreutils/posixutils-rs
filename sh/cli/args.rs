@@ -57,6 +57,9 @@ pub fn parse_args(args: Vec<String>, is_attached_to_terminal: bool) -> Result<Sh
                 }
                 set_options.set_long(&option, next == "-o")?;
             }
+            // "--" marks the end of options; it is consumed and the remaining
+            // arguments are operands.
+            "--" => break,
             s if s.starts_with('-') => {
                 for c in s.chars().skip(1) {
                     match c {

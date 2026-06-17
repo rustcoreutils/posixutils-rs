@@ -12,6 +12,7 @@ mod word;
 
 use crate::cli::vi::cursor::{Cursor, MotionCommand, MotionError};
 use crate::cli::vi::word::{current_bigword, BigWordIter};
+use crate::os::{mkstemp, write};
 use crate::parse::word_parser::parse_word;
 use crate::pattern::{FilenamePattern, HistoryPattern};
 use crate::shell::history::History;
@@ -39,7 +40,7 @@ enum CommandOp {
     /// *
     ExpandAll,
     /// @c
-    Alias(()),
+    Alias(u8),
     /// ~
     ChangeCase,
     /// .
@@ -148,7 +149,7 @@ impl Command {
             b'=' => CommandOp::DisplayExpansions,
             b'\\' => CommandOp::ExpandUnique,
             b'*' => CommandOp::ExpandAll,
-            b'@' if remaining_bytes.len() > 1 => CommandOp::Alias(()),
+            b'@' if remaining_bytes.len() > 1 => CommandOp::Alias(remaining_bytes[1]),
             b'@' => return Err(CommandParseError::IncompleteCommand),
             b'~' => CommandOp::ChangeCase,
             b'.' => CommandOp::RepeatLast,
@@ -299,6 +300,11 @@ pub struct ViEditor {
     /// its an index into the history starting
     /// from the most recent command
     current_history_command: usize,
+    /// snapshot of the edit line taken before the last modifying command (for `u`)
+    undo_line: Vec<u8>,
+    undo_cursor: usize,
+    /// the edit line as it was when editing of the current line began (for `U`)
+    original_line: Vec<u8>,
 }
 
 impl ViEditor {
@@ -310,6 +316,8 @@ impl ViEditor {
                 .unwrap()
                 .as_bytes()
                 .to_vec();
+            // remember the original for `U` (undo all changes to the line)
+            self.original_line = self.edit_line.clone();
             self.current_history_command = 0;
         }
         &mut self.edit_line
@@ -362,6 +370,11 @@ impl ViEditor {
             return Ok(Action::None);
         }
         self.last_nonmotion_command = Some(command.clone());
+        // Snapshot the line before a modifying command so `u` can restore it.
+        if !matches!(command.op, CommandOp::UndoLastCommand | CommandOp::UndoAll) {
+            self.undo_line = self.current_line(shell).to_vec();
+            self.undo_cursor = self.cursor.position;
+        }
         match command.op {
             CommandOp::Execute => {
                 let mut result = self.current_line(shell).to_vec();
@@ -370,11 +383,22 @@ impl ViEditor {
                 self.cursor.position = 0;
                 self.current_history_command = 0;
                 self.edit_line.clear();
+                self.original_line.clear();
                 return Ok(Action::Execute(result));
             }
             CommandOp::Redraw => return Ok(Action::Redraw),
             CommandOp::CommentLine => {
+                // Insert '#' at the start and submit the line; it is entered
+                // into the history (and, being a comment, does nothing).
                 self.edit_current_line(shell).insert(0, b'#');
+                let mut result = self.current_line(shell).to_vec();
+                result.push(b'\n');
+                self.mode = EditorMode::Insert;
+                self.cursor.position = 0;
+                self.current_history_command = 0;
+                self.edit_line.clear();
+                self.original_line.clear();
+                return Ok(Action::Execute(result));
             }
             CommandOp::DisplayExpansions => {
                 let current_line = self.current_line(shell);
@@ -440,9 +464,19 @@ impl ViEditor {
                     self.mode = EditorMode::Insert;
                 }
             }
-            CommandOp::Alias(_) => {
-                // I don't know what they mean by alias since it's not
-                // a shell alias, and no other types of alias are mentioned
+            CommandOp::Alias(letter) => {
+                // Insert the value of the shell alias named `_<letter>`.
+                let alias_name = format!("_{}", letter as char);
+                let value = shell
+                    .alias_table
+                    .get(&alias_name)
+                    .cloned()
+                    .ok_or(CommandError)?;
+                self.edit_current_line(shell);
+                let at = self.cursor.position;
+                self.edit_line.splice(at..at, value.bytes());
+                self.cursor.position = at + value.len();
+                self.mode = EditorMode::Insert;
             }
             CommandOp::ChangeCase => {
                 self.edit_current_line(shell);
@@ -461,7 +495,39 @@ impl ViEditor {
                     return self.execute_command(last_command.clone(), shell);
                 }
             }
-            CommandOp::EditCommand => {}
+            CommandOp::EditCommand => {
+                // Edit the current command line in an external editor, then
+                // execute the result.
+                let mut content = self.current_line(shell).to_vec();
+                content.push(b'\n');
+                let editor = shell
+                    .environment
+                    .get_str_value("VISUAL")
+                    .or_else(|| shell.environment.get_str_value("FCEDIT"))
+                    .unwrap_or("vi")
+                    .to_string();
+                let command_path = shell
+                    .find_command(&editor, "", shell.set_options.hashall)
+                    .ok_or(CommandError)?;
+                let (fd, path) = mkstemp("/tmp/sh-vi.XXXXXX").map_err(|_| CommandError)?;
+                write(fd, &content).map_err(|_| CommandError)?;
+                let opened = shell.opened_files.clone();
+                // restore cooked mode for the editor, then return to raw mode
+                shell.terminal.reset();
+                let args = vec![editor.clone(), path.to_string_lossy().into_owned()];
+                let _ = shell.fork_and_exec(command_path, &args, &opened);
+                shell.terminal.set_nonblocking_no_echo();
+                // read the edited file back (a fresh handle avoids fd-offset issues)
+                let edited = std::fs::read(&path).map_err(|_| CommandError)?;
+                let _ = unsafe { libc::close(fd) };
+                let _ = std::fs::remove_file(&path);
+                self.mode = EditorMode::Insert;
+                self.cursor.position = 0;
+                self.current_history_command = 0;
+                self.edit_line.clear();
+                self.original_line.clear();
+                return Ok(Action::Execute(edited));
+            }
             CommandOp::InsertAtNextChar => {
                 self.cursor.position += 1;
                 self.mode = EditorMode::Insert;
@@ -644,26 +710,39 @@ impl ViEditor {
                 self.save_buffer = self.current_line(shell)[self.cursor.position..].to_vec();
             }
             CommandOp::PasteAfter => {
+                let count = command.count.unwrap_or(0) + 1;
                 self.edit_current_line(shell);
                 if !self.save_buffer.is_empty() {
-                    self.edit_line.splice(
-                        self.cursor.position..self.cursor.position,
-                        self.save_buffer.iter().copied(),
-                    );
-                    self.cursor.position += 1;
+                    // put `count` copies of the save buffer after the cursor
+                    let insert_at = (self.cursor.position + 1).min(self.edit_line.len());
+                    let inserted: Vec<u8> = self.save_buffer.repeat(count);
+                    let last = insert_at + inserted.len();
+                    self.edit_line.splice(insert_at..insert_at, inserted);
+                    self.cursor.position = last.saturating_sub(1);
                 }
             }
             CommandOp::PasteBefore => {
+                let count = command.count.unwrap_or(0) + 1;
                 self.edit_current_line(shell);
                 if !self.save_buffer.is_empty() {
-                    self.edit_line.splice(
-                        self.cursor.position..self.cursor.position,
-                        self.save_buffer.iter().copied(),
-                    );
+                    let at = self.cursor.position;
+                    let inserted: Vec<u8> = self.save_buffer.repeat(count);
+                    let last = at + inserted.len();
+                    self.edit_line.splice(at..at, inserted);
+                    self.cursor.position = last.saturating_sub(1);
                 }
             }
-            CommandOp::UndoLastCommand => {}
-            CommandOp::UndoAll => {}
+            CommandOp::UndoLastCommand => {
+                // vi `u` toggles between the line and its pre-change snapshot.
+                std::mem::swap(&mut self.edit_line, &mut self.undo_line);
+                std::mem::swap(&mut self.cursor.position, &mut self.undo_cursor);
+                self.cursor.position = self.cursor.position.min(self.edit_line.len());
+            }
+            CommandOp::UndoAll => {
+                // restore the edit line to its state when editing began
+                self.edit_line = self.original_line.clone();
+                self.cursor.position = self.cursor.position.min(self.edit_line.len());
+            }
             CommandOp::PreviousShellCommand => {
                 if self.current_history_command == 0 {
                     self.saved_edit_line_position = self.cursor.position;
@@ -690,13 +769,22 @@ impl ViEditor {
                 }
             }
             CommandOp::OldestShellCommand => {
-                let number = command.count.unwrap_or(shell.history.entries_count());
                 if self.current_history_command == 0 {
                     self.saved_edit_line_position = self.cursor.position;
                 }
-                if number > self.current_history_command {
+                let total = shell.history.entries_count();
+                if total == 0 {
                     return Err(CommandError);
                 }
+                // `G` selects the oldest command; `[number]G` selects the
+                // command numbered `number` (1 = oldest). `current_history_command`
+                // is a reverse index (1 = most recent); `command.count` is stored
+                // as the requested number minus one.
+                let number = match command.count {
+                    Some(c) if c < total => total - c,
+                    Some(_) => return Err(CommandError),
+                    None => total,
+                };
                 self.current_history_command = number;
                 self.cursor.position = 0;
             }
@@ -749,6 +837,9 @@ impl ViEditor {
     pub fn process_new_input(&mut self, c: u8, shell: &mut Shell) -> Result<Action, CommandError> {
         match self.mode {
             EditorMode::Insert | EditorMode::Replace => {
+                // erase/kill characters come from the terminal settings (stty)
+                let erase = shell.terminal.erase_char();
+                let kill = shell.terminal.kill_char();
                 match c {
                     b'\n' => {
                         let mut result = Vec::new();
@@ -765,19 +856,42 @@ impl ViEditor {
                             .position
                             .min(self.edit_line.len().saturating_sub(1));
                     }
-                    b'\x7F' => {
-                        // delete
+                    c if c == erase => {
+                        // erase the previous character
                         if !self.edit_line.is_empty() && self.cursor.position != 0 {
                             self.edit_line.remove(self.cursor.position - 1);
                             self.cursor.position -= 1;
                         }
                     }
-                    b'\x04' => return Ok(Action::Eof),
+                    c if c == kill => {
+                        // clear the whole input line
+                        self.edit_line.clear();
+                        self.cursor.position = 0;
+                    }
+                    b'\x04' => {
+                        // end-of-file is only honored at the beginning of an
+                        // input line (i.e. when the line is empty).
+                        if self.edit_line.is_empty() {
+                            return Ok(Action::Eof);
+                        }
+                    }
                     b'\x16' => {
                         // ^V
                         self.mode = EditorMode::InsertNext;
                     }
-                    b'\x17' => {}
+                    b'\x17' => {
+                        // ^W: delete from before the cursor back to the
+                        // preceding word boundary.
+                        let mut pos = self.cursor.position;
+                        while pos > 0 && self.edit_line[pos - 1].is_ascii_whitespace() {
+                            pos -= 1;
+                        }
+                        while pos > 0 && !self.edit_line[pos - 1].is_ascii_whitespace() {
+                            pos -= 1;
+                        }
+                        self.edit_line.drain(pos..self.cursor.position);
+                        self.cursor.position = pos;
+                    }
                     other if !other.is_ascii_control() => {
                         if self.cursor.position < self.edit_line.len() {
                             if self.mode == EditorMode::Replace {
@@ -842,6 +956,9 @@ impl Default for ViEditor {
             last_search: None,
             save_buffer: Vec::new(),
             current_history_command: 0,
+            undo_line: Vec::new(),
+            undo_cursor: 0,
+            original_line: Vec::new(),
         }
     }
 }

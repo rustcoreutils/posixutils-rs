@@ -40,6 +40,22 @@ pub struct Terminal {
 }
 
 impl Terminal {
+    /// The terminal's erase character (`stty erase`), or DEL if unknown.
+    pub fn erase_char(&self) -> u8 {
+        self.base_settings
+            .map(|t| t.c_cc[libc::VERASE])
+            .filter(|&c| c != 0)
+            .unwrap_or(0x7f)
+    }
+
+    /// The terminal's kill character (`stty kill`), or `^U` if unknown.
+    pub fn kill_char(&self) -> u8 {
+        self.base_settings
+            .map(|t| t.c_cc[libc::VKILL])
+            .filter(|&c| c != 0)
+            .unwrap_or(0x15)
+    }
+
     /// # Panic
     /// Panics if the current process is not attached to a terminal.
     pub fn set_nonblocking_no_echo(&self) {
@@ -97,5 +113,6 @@ pub fn read_nonblocking_char() -> Option<u8> {
 }
 
 pub fn is_attached_to_terminal() -> bool {
-    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+    // POSIX: a shell is interactive when stdin AND stderr are terminals.
+    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
 }

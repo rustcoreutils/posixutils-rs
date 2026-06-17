@@ -50,6 +50,13 @@ fn execute_string(string: &str, shell: &mut Shell) {
     }
 }
 
+/// Writes any pending mail notifications to stderr before a prompt.
+fn report_mail(shell: &mut Shell) {
+    for message in shell.check_mail() {
+        eprintln!("{message}");
+    }
+}
+
 fn flush_stdout() {
     // this is a basic operation, if this doesn't work,
     // there's nothing else we can do
@@ -80,6 +87,7 @@ fn standard_repl(shell: &mut Shell) {
     let mut print_ps2 = false;
     clear_line();
     flush_stdout();
+    report_mail(shell);
     eprint!("{}", shell.get_ps1());
     loop {
         while let Some(c) = read_nonblocking_char() {
@@ -146,6 +154,7 @@ fn standard_repl(shell: &mut Shell) {
             program_buffer.clear();
             line_buffer.clear();
             println!();
+            report_mail(shell);
             eprint!("{}", shell.get_ps1());
         }
         if shell.set_options.vi {
@@ -160,6 +169,7 @@ fn vi_repl(shell: &mut Shell) {
     let mut print_ps2 = false;
     clear_line();
     flush_stdout();
+    report_mail(shell);
     eprint!("{}", shell.get_ps1());
     loop {
         while let Some(c) = read_nonblocking_char() {
@@ -218,6 +228,7 @@ fn vi_repl(shell: &mut Shell) {
             program_buffer.clear();
             editor.reset_current_line();
             println!();
+            report_mail(shell);
             eprint!("{}", shell.get_ps1());
         }
         if !shell.set_options.vi {
@@ -240,6 +251,21 @@ fn interactive_shell(shell: &mut Shell) {
         unsafe { handle_signal_ignore(Signal::SigTtin) }
         unsafe { handle_signal_ignore(Signal::SigTtou) }
         unsafe { handle_signal_ignore(Signal::SigTstp) }
+    }
+    // POSIX: an interactive shell expands $ENV and, if the result is an absolute
+    // pathname, executes that file in the current environment. ENV is ignored if
+    // the real and effective user/group IDs differ.
+    let env_file = shell.get_var_and_expand("ENV", "");
+    if env_file.starts_with('/') {
+        let ids_match =
+            unsafe { libc::getuid() == libc::geteuid() && libc::getgid() == libc::getegid() };
+        if ids_match {
+            if let Ok(contents) = std::fs::read_to_string(&env_file) {
+                if let Err(err) = shell.execute_program(&contents) {
+                    eprintln!("sh: {env_file}: {}", err.message);
+                }
+            }
+        }
     }
     loop {
         if shell.set_options.vi {
@@ -297,10 +323,20 @@ fn main() -> Result<(), Box<dyn Error>> {
             ExecutionMode::ReadCommandsFromString(command_string) => {
                 execute_string(&command_string, &mut shell);
             }
-            ExecutionMode::ReadFromFile(file) => {
-                let file_contents = std::fs::read_to_string(file).expect("could not read file");
-                execute_string(&file_contents, &mut shell);
-            }
+            ExecutionMode::ReadFromFile(file) => match std::fs::read_to_string(&file) {
+                Ok(file_contents) => execute_string(&file_contents, &mut shell),
+                Err(err) => {
+                    eprintln!("sh: {file}: {err}");
+                    // POSIX EXIT STATUS: 127 if the command_file could not be found,
+                    // otherwise treat it as not executable (ENOEXEC-like) -> 126.
+                    let status = if err.kind() == std::io::ErrorKind::NotFound {
+                        127
+                    } else {
+                        126
+                    };
+                    std::process::exit(status);
+                }
+            },
             _ => unreachable!(),
         },
     }

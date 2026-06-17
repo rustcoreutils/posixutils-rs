@@ -12,6 +12,7 @@ use crate::jobs::{parse_job_id, Job, JobState};
 use crate::os::signals::{kill, Signal};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use gettextrs::gettext;
 
 fn run_background_job(
     arg: &str,
@@ -39,13 +40,13 @@ impl BuiltinUtility for Bg {
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
         if !shell.set_options.monitor {
-            return Err("bg: cannot use bg when job control is disabled".into());
+            return Err(gettext("bg: cannot use bg when job control is disabled").into());
         }
         if !shell.is_interactive {
-            return Err("bg: cannot use bg in a non-interactive shell".into());
+            return Err(gettext("bg: cannot use bg in a non-interactive shell").into());
         }
         if shell.is_subshell {
-            return Err("bg: cannot use bg in a subshell environment".into());
+            return Err(gettext("bg: cannot use bg in a subshell environment").into());
         }
 
         let mut status = 0;

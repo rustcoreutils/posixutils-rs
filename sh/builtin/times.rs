@@ -12,13 +12,15 @@ use crate::os::errno::get_current_errno_value;
 use crate::os::LibcResult;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use gettextrs::gettext;
 
-fn seconds_to_minutes(seconds: f32) -> i32 {
-    seconds as i32 / 60
-}
-
-fn time_in_seconds(time: libc::timeval) -> f32 {
-    time.tv_sec as f32 + time.tv_usec as f32 / 1000.0
+/// Formats a CPU time as POSIX `%dm%fs` — integer minutes and the remaining
+/// seconds with three fractional digits, e.g. `1m5.250s`.
+fn format_time(time: libc::timeval) -> String {
+    let total = time.tv_sec as f64 + time.tv_usec as f64 / 1_000_000.0;
+    let minutes = (total / 60.0) as i64;
+    let seconds = total - (minutes as f64) * 60.0;
+    format!("{minutes}m{seconds:.3}s")
 }
 
 fn getusage(who: libc::c_int) -> LibcResult<libc::rusage> {
@@ -41,7 +43,7 @@ impl SpecialBuiltinUtility for Times {
     ) -> BuiltinResult {
         let args = skip_option_terminator(args);
         if !args.is_empty() {
-            return Err("times: too many arguments".into());
+            return Err(gettext("times: too many arguments").into());
         }
 
         let shell_times = getusage(libc::RUSAGE_SELF)
@@ -49,21 +51,12 @@ impl SpecialBuiltinUtility for Times {
         let children_times = getusage(libc::RUSAGE_CHILDREN)
             .map_err(|err| format!("times: failed to read children times ({err})"))?;
 
-        let shell_user_s = time_in_seconds(shell_times.ru_utime);
-        let shell_system_s = time_in_seconds(shell_times.ru_stime);
-        let children_user_s = time_in_seconds(children_times.ru_utime);
-        let children_system_s = time_in_seconds(children_times.ru_stime);
-
         opened_files.write_out(format!(
-            "{}m{}s {}m{}s\n{}m{}s {}m{}s\n",
-            seconds_to_minutes(shell_user_s),
-            shell_user_s,
-            seconds_to_minutes(shell_system_s),
-            shell_system_s,
-            seconds_to_minutes(children_user_s),
-            children_user_s,
-            seconds_to_minutes(children_system_s),
-            children_system_s
+            "{} {}\n{} {}\n",
+            format_time(shell_times.ru_utime),
+            format_time(shell_times.ru_stime),
+            format_time(children_times.ru_utime),
+            format_time(children_times.ru_stime),
         ));
         Ok(0)
     }

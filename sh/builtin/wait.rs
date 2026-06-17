@@ -16,8 +16,11 @@ use crate::shell::Shell;
 fn wait_for_pid(pid: Pid, shell: &mut Shell) -> i32 {
     match shell.wait_child_process(pid) {
         Ok(exit_status) => exit_status,
+        // No such child (already reaped or never existed).
         Err(err) if err.errno == Errno::ECHILD => 127,
-        _ => unreachable!(),
+        // Any other error (e.g. EINTR from a trapped signal) must not abort the
+        // shell; report a non-zero status rather than panicking.
+        Err(_) => 127,
     }
 }
 

@@ -11,6 +11,7 @@ use crate::builtin::{BuiltinError, BuiltinResult, SpecialBuiltinUtility};
 use crate::os::signals::Signal;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use gettextrs::gettext;
 use std::fmt::Display;
 use std::str::FromStr;
 
@@ -38,7 +39,11 @@ fn print_action<C: Display>(
             opened_files.write_out(format!("trap -- '' {}\n", condition));
         }
         TrapAction::Commands(cmd) => {
-            opened_files.write_out(format!("trap -- '{cmd}' {}\n", condition));
+            opened_files.write_out(format!(
+                "trap -- {} {}\n",
+                crate::utils::shell_quote(cmd),
+                condition
+            ));
         }
     }
 }
@@ -128,7 +133,7 @@ impl SpecialBuiltinUtility for Trap {
             if condition == Signal::SigKill || condition == Signal::SigStop {
                 // the standard says it is unspecified what happens if you try to trap KILL or STOP
                 // we just return error
-                return Err("trap: cannot trap SIGKILL or SIGSTOP".into());
+                return Err(gettext("trap: cannot trap SIGKILL or SIGSTOP").into());
             }
             match action {
                 TrapArg::Reset => {

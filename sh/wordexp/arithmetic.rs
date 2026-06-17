@@ -41,6 +41,7 @@ enum BinaryOperator {
     BitwiseOr,
     LogicalAnd,
     LogicalOr,
+    Comma,
 }
 
 enum Expr<'src> {
@@ -140,6 +141,7 @@ enum ExprToken<'src> {
     OrAssign,
     LParen,
     RParen,
+    Comma,
 
     Eof,
 }
@@ -184,6 +186,7 @@ impl Display for ExprToken<'_> {
             ExprToken::OrAssign => write!(f, "|="),
             ExprToken::LParen => write!(f, "("),
             ExprToken::RParen => write!(f, ")"),
+            ExprToken::Comma => write!(f, ","),
             ExprToken::Eof => write!(f, "<EOF>"),
         }
     }
@@ -395,6 +398,7 @@ impl<'src> ExpressionParser<'src> {
             Some(':') => Ok(ExprToken::Colon),
             Some('(') => Ok(ExprToken::LParen),
             Some(')') => Ok(ExprToken::RParen),
+            Some(',') => Ok(ExprToken::Comma),
             Some(c) if c.is_ascii_digit() => {
                 if c == '0' {
                     if self.peek() == Some('x') {
@@ -447,7 +451,7 @@ impl<'src> ExpressionParser<'src> {
             ExprToken::Variable(var) => Ok(Expr::Variable(var)),
             ExprToken::Number(num) => Ok(Expr::Number(num)),
             ExprToken::LParen => {
-                let expr = self.parse_expr()?;
+                let expr = self.parse_comma()?;
                 self.match_token(ExprToken::RParen)?;
                 Ok(expr)
             }
@@ -458,7 +462,8 @@ impl<'src> ExpressionParser<'src> {
     fn parse_unary(&mut self) -> ExprParseResult<Expr<'src>> {
         if let Some(op) = self.matches_alternatives(UNARY_OPERATORS) {
             self.advance_token()?;
-            let operand = self.parse_literal()?;
+            // recurse into parse_unary so unary operators can chain (!!x, - -1, ~~x)
+            let operand = self.parse_unary()?;
             Ok(Expr::UnaryOp {
                 operator: op.into(),
                 operand: operand.into(),
@@ -515,6 +520,23 @@ impl<'src> ExpressionParser<'src> {
         }
         Ok(expr)
     }
+
+    /// The comma operator: evaluate each sub-expression left-to-right, with the
+    /// value of the whole expression being that of the rightmost. Lowest
+    /// precedence; only valid at the top level or inside parentheses.
+    fn parse_comma(&mut self) -> ExprParseResult<Expr<'src>> {
+        let mut expr = self.parse_expr()?;
+        while self.matches(ExprToken::Comma) {
+            self.advance_token()?;
+            let rhs = self.parse_expr()?;
+            expr = Expr::BinaryOp {
+                operator: BinaryOperator::Comma,
+                lhs: expr.into(),
+                rhs: rhs.into(),
+            };
+        }
+        Ok(expr)
+    }
 }
 
 fn parse_expression(expr: &str) -> Result<Expr<'_>, String> {
@@ -525,18 +547,39 @@ fn parse_expression(expr: &str) -> Result<Expr<'_>, String> {
         lookahead: ExprToken::Eof,
     };
     parser.advance_token()?;
-    parser.parse_expr()
+    parser.parse_comma()
 }
 
-fn binary_operation(operator: &BinaryOperator, lhs_value: i64, rhs_value: i64) -> i64 {
-    match operator {
-        BinaryOperator::Mul => lhs_value * rhs_value,
-        BinaryOperator::Div => lhs_value / rhs_value,
-        BinaryOperator::Mod => lhs_value % rhs_value,
-        BinaryOperator::Add => lhs_value + rhs_value,
-        BinaryOperator::Sub => lhs_value - rhs_value,
-        BinaryOperator::ShiftLeft => lhs_value << rhs_value,
-        BinaryOperator::ShiftRight => lhs_value >> rhs_value,
+fn binary_operation(
+    operator: &BinaryOperator,
+    lhs_value: i64,
+    rhs_value: i64,
+) -> ExpansionResult<i64> {
+    // All arithmetic uses wrapping semantics so that overflow does not panic
+    // (it would only panic in debug builds; release wraps). Division/modulo by
+    // zero is a recoverable error, not a panic.
+    let value = match operator {
+        BinaryOperator::Mul => lhs_value.wrapping_mul(rhs_value),
+        BinaryOperator::Div => {
+            if rhs_value == 0 {
+                return Err(CommandExecutionError::ExpansionError(
+                    "division by zero".to_string(),
+                ));
+            }
+            lhs_value.wrapping_div(rhs_value)
+        }
+        BinaryOperator::Mod => {
+            if rhs_value == 0 {
+                return Err(CommandExecutionError::ExpansionError(
+                    "division by zero".to_string(),
+                ));
+            }
+            lhs_value.wrapping_rem(rhs_value)
+        }
+        BinaryOperator::Add => lhs_value.wrapping_add(rhs_value),
+        BinaryOperator::Sub => lhs_value.wrapping_sub(rhs_value),
+        BinaryOperator::ShiftLeft => lhs_value.wrapping_shl(rhs_value as u32),
+        BinaryOperator::ShiftRight => lhs_value.wrapping_shr(rhs_value as u32),
         BinaryOperator::Le => (lhs_value < rhs_value) as i64,
         BinaryOperator::Leq => (lhs_value <= rhs_value) as i64,
         BinaryOperator::Ge => (lhs_value > rhs_value) as i64,
@@ -546,61 +589,98 @@ fn binary_operation(operator: &BinaryOperator, lhs_value: i64, rhs_value: i64) -
         BinaryOperator::BitwiseAnd => lhs_value & rhs_value,
         BinaryOperator::BitwiseXor => lhs_value ^ rhs_value,
         BinaryOperator::BitwiseOr => lhs_value | rhs_value,
-        BinaryOperator::LogicalAnd | BinaryOperator::LogicalOr => unreachable!(),
-    }
+        BinaryOperator::LogicalAnd | BinaryOperator::LogicalOr | BinaryOperator::Comma => {
+            unreachable!()
+        }
+    };
+    Ok(value)
 }
 
-fn interpret_expression(expr: &Expr, shell: &mut Shell) -> ExpansionResult<i64> {
+/// Guards against unbounded recursion when a variable's value is itself
+/// evaluated as an arithmetic expression (e.g. `x=y; y=x`).
+const MAX_ARITH_RECURSION: u32 = 64;
+
+fn interpret_expression(expr: &Expr, shell: &mut Shell, depth: u32) -> ExpansionResult<i64> {
     match expr {
         Expr::Variable(var) => {
-            let value = shell.environment.get_str_value(var).unwrap_or_default();
-            Ok(value.parse().unwrap_or(0))
+            // POSIX: a variable referenced in an arithmetic expression is itself
+            // evaluated as an arithmetic expression. Honor `set -u` for unset
+            // names; an unset name (without nounset) evaluates to 0.
+            let value = shell.environment.get_str_value(var).map(|v| v.to_string());
+            match value {
+                None => {
+                    if shell.set_options.nounset {
+                        return Err(CommandExecutionError::ExpansionError(format!(
+                            "{var}: parameter not set"
+                        )));
+                    }
+                    Ok(0)
+                }
+                Some(value) => {
+                    let trimmed = value.trim();
+                    if trimmed.is_empty() {
+                        Ok(0)
+                    } else if let Ok(n) = trimmed.parse::<i64>() {
+                        Ok(n)
+                    } else if depth >= MAX_ARITH_RECURSION {
+                        Err(CommandExecutionError::ExpansionError(
+                            "expression recursion level exceeded".to_string(),
+                        ))
+                    } else {
+                        let inner = parse_expression(trimmed)
+                            .map_err(CommandExecutionError::ExpansionError)?;
+                        interpret_expression(&inner, shell, depth + 1)
+                    }
+                }
+            }
         }
         Expr::Number(num) => Ok(*num),
         Expr::UnaryOp { operator, operand } => {
-            let value = interpret_expression(operand, shell)?;
+            let value = interpret_expression(operand, shell, depth)?;
             match operator {
                 UnaryOperator::Plus => Ok(value),
-                UnaryOperator::Minus => Ok(-value),
+                UnaryOperator::Minus => Ok(value.wrapping_neg()),
                 UnaryOperator::Not => Ok((value == 0) as i64),
                 UnaryOperator::BitwiseNot => Ok(!value),
             }
         }
         Expr::BinaryOp { lhs, operator, rhs } => {
-            let lhs_value = interpret_expression(lhs, shell)?;
+            let lhs_value = interpret_expression(lhs, shell, depth)?;
             match operator {
                 BinaryOperator::LogicalAnd => {
                     return if lhs_value != 0 {
-                        Ok((interpret_expression(rhs, shell)? != 0) as i64)
+                        Ok((interpret_expression(rhs, shell, depth)? != 0) as i64)
                     } else {
                         Ok(0)
                     }
                 }
                 BinaryOperator::LogicalOr => {
                     return if lhs_value == 0 {
-                        Ok((interpret_expression(rhs, shell)? != 0) as i64)
+                        Ok((interpret_expression(rhs, shell, depth)? != 0) as i64)
                     } else {
                         Ok(1)
                     }
                 }
+                // comma: lhs already evaluated for its side effects; value is rhs.
+                BinaryOperator::Comma => return interpret_expression(rhs, shell, depth),
                 _ => {}
             }
-            let rhs_value = interpret_expression(rhs, shell)?;
-            Ok(binary_operation(operator, lhs_value, rhs_value))
+            let rhs_value = interpret_expression(rhs, shell, depth)?;
+            binary_operation(operator, lhs_value, rhs_value)
         }
         Expr::Conditional {
             condition,
             true_expr,
             false_expr,
         } => {
-            if interpret_expression(condition, shell)? != 0 {
-                interpret_expression(true_expr, shell)
+            if interpret_expression(condition, shell, depth)? != 0 {
+                interpret_expression(true_expr, shell, depth)
             } else {
-                interpret_expression(false_expr, shell)
+                interpret_expression(false_expr, shell, depth)
             }
         }
         Expr::Assignment { variable, value } => {
-            let value = interpret_expression(value, shell)?;
+            let value = interpret_expression(value, shell, depth)?;
             shell.assign_global(variable.to_string(), value.to_string())?;
             Ok(value)
         }
@@ -609,13 +689,13 @@ fn interpret_expression(expr: &Expr, shell: &mut Shell) -> ExpansionResult<i64> 
             operator,
             value,
         } => {
-            let value = interpret_expression(value, shell)?;
+            let value = interpret_expression(value, shell, depth)?;
             let current_value = shell
                 .environment
                 .get_str_value(variable)
                 .map(|val| val.parse().unwrap_or(0))
                 .unwrap_or(0);
-            let new_value = binary_operation(operator, current_value, value);
+            let new_value = binary_operation(operator, current_value, value)?;
             shell.assign_global(variable.to_string(), new_value.to_string())?;
             Ok(new_value)
         }
@@ -630,7 +710,7 @@ pub fn expand_arithmetic_expression_into(
 ) -> ExpansionResult<()> {
     let expr = expand_word_to_string(expr, false, shell)?;
     let expr = parse_expression(&expr).map_err(CommandExecutionError::ExpansionError)?;
-    let value = interpret_expression(&expr, shell)?;
+    let value = interpret_expression(&expr, shell, 0)?;
     expanded_word.append(value.to_string(), inside_double_quotes, true);
     Ok(())
 }

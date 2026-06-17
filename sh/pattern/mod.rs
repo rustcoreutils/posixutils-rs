@@ -31,7 +31,15 @@ impl Pattern {
     }
 
     pub fn matches(&self, s: &CStr) -> bool {
-        self.regex.matches(s)
+        // A shell pattern must match the ENTIRE string (e.g. in `case`), unlike
+        // the substring semantics of the underlying regex engine. Because the
+        // engine is POSIX leftmost-longest, if any match begins at offset 0 then
+        // the leftmost match begins at 0 and is the longest there, so checking
+        // that it spans the whole string is a correct full-match test.
+        match self.regex.match_locations(s).next() {
+            Some(m) => m.start == 0 && m.end == s.to_bytes().len(),
+            None => false,
+        }
     }
 
     pub fn remove_largest_prefix(&self, s: String) -> String {

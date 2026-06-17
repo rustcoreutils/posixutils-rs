@@ -175,13 +175,25 @@ pub fn expand_parameter_into(
 ) -> ExpansionResult<()> {
     match parameter_expansion {
         ParameterExpansion::Simple(parameter) => {
-            expand_simple_parameter_into(
+            let result = expand_simple_parameter_into(
                 expanded_word,
                 parameter,
                 inside_double_quotes,
                 field_splitting_will_be_performed,
                 shell,
             );
+            // `set -u`: expanding an unset variable or positional parameter is an
+            // error (special parameters are always considered set).
+            if shell.set_options.nounset && result.is_unset() {
+                let name = match parameter {
+                    Parameter::Number(n) => n.to_string(),
+                    Parameter::Variable(var) => var.as_ref().to_string(),
+                    Parameter::Special(_) => String::new(),
+                };
+                return Err(CommandExecutionError::ExpansionError(format!(
+                    "{name}: parameter not set"
+                )));
+            }
         }
         ParameterExpansion::UnsetUseDefault {
             parameter,
@@ -206,18 +218,23 @@ pub fn expand_parameter_into(
             word,
             assign_on_null,
         } => {
-            let value = expand_word_to_string(word, false, shell)?;
-
-            if let Some(current_value) = shell.environment.get_str_value(variable_name) {
-                if current_value.is_empty() && *assign_on_null {
-                    shell.assign_global(variable_name.to_string(), value.clone())?;
-                    expanded_word.append(value, inside_double_quotes, true);
-                } else {
-                    expanded_word.append(current_value.to_string(), inside_double_quotes, true);
-                }
-            } else {
+            // POSIX: if the substitution is not needed, `word` shall NOT be
+            // expanded (it may have side effects), so decide first, expand last.
+            let needs_assign = match shell.environment.get_str_value(variable_name) {
+                None => true,
+                Some(current) => current.is_empty() && *assign_on_null,
+            };
+            if needs_assign {
+                let value = expand_word_to_string(word, false, shell)?;
                 shell.assign_global(variable_name.to_string(), value.clone())?;
                 expanded_word.append(value, inside_double_quotes, true);
+            } else {
+                let current = shell
+                    .environment
+                    .get_str_value(variable_name)
+                    .unwrap_or_default()
+                    .to_string();
+                expanded_word.append(current, inside_double_quotes, true);
             }
         }
         ParameterExpansion::UnsetError {
@@ -234,18 +251,18 @@ pub fn expand_parameter_into(
                 shell,
             );
             if parameter_type.is_unset() || (*error_on_null && parameter_type.is_null()) {
-                return if word.parts.is_empty() {
-                    let message = expand_word_to_string(word, false, shell)?;
-                    Err(CommandExecutionError::ExpansionError(message))
-                } else if *error_on_null {
-                    Err(CommandExecutionError::ExpansionError(
-                        "parameter is unset or null".to_string(),
-                    ))
+                // POSIX: if `word` is supplied, expand it and use it as the
+                // diagnostic; otherwise emit a default "unset"/"null" message.
+                let message = if word.parts.is_empty() {
+                    if *error_on_null {
+                        "parameter null or not set".to_string()
+                    } else {
+                        "parameter not set".to_string()
+                    }
                 } else {
-                    Err(CommandExecutionError::ExpansionError(
-                        "parameter is unset".to_string(),
-                    ))
+                    expand_word_to_string(word, false, shell)?
                 };
+                return Err(CommandExecutionError::ExpansionError(message));
             }
             expanded_word.extend(expanded_parameter);
         }
@@ -282,8 +299,9 @@ pub fn expand_parameter_into(
                     "sh: parameter is unset".to_string(),
                 ));
             }
+            // POSIX: length in characters, not bytes.
             expanded_word.append(
-                expanded_parameter.to_string().len().to_string(),
+                expanded_parameter.to_string().chars().count().to_string(),
                 inside_double_quotes,
                 true,
             );

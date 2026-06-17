@@ -168,6 +168,9 @@ impl SimpleCommand {
 pub struct CaseItem {
     pub pattern: NonEmpty<WordPair>,
     pub body: CompleteCommand,
+    /// `true` if this item is terminated by `;&` (fall through to the next
+    /// item's body without pattern matching) rather than `;;`.
+    pub fallthrough: bool,
 }
 
 impl Display for CaseItem {
@@ -178,7 +181,7 @@ impl Display for CaseItem {
         }
         write!(f, ")")?;
         write!(f, " {}", &self.body)?;
-        write!(f, ";;")
+        write!(f, "{}", if self.fallthrough { ";&" } else { ";;" })
     }
 }
 

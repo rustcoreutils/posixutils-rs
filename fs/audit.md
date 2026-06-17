@@ -13,10 +13,49 @@ therefore covers `df` only.
 
 ---
 
+## Resolution (2026-06-17) — all findings remediated; `df` promoted to Stage 6
+
+All 12 numbered findings (1 Critical, 4 Major, 7 Minor) are fixed or dispositioned
+across five committed phases on branch `fs-audit`, each with regression tests and
+behavioral cross-checks against GNU coreutils `df`:
+
+- **Phase 1 — enumeration-path robustness (#1, #5, #8, #9).** Mount device/dir
+  names are now byte-faithful `OsString` and file operands `Vec<PathBuf>`,
+  removing the `to_str().unwrap()` panic on non-UTF-8 kernel mount-table entries
+  and the `CString::new().expect()` panic on an operand with an internal NUL
+  (#1/#9). A failed or unmatched `file` operand no longer falls back to dumping
+  the entire mount table (#5, `ensure_masked`/`has_masks` removed). A device or
+  mount pathname containing a `<newline>` is rejected with a diagnostic and a
+  non-zero exit (#8, Austin Group Defect 251).
+- **Phase 2 — capacity % + safe scaling (#4, #10, #11).** Capacity now divides by
+  `used + avail` (`f_bavail`), matching coreutils `df -P` (85% vs the old 81% on
+  `/`) and able to exceed 100% as the spec note requires (#4); pure helpers
+  `scale_blocks` (u128 intermediate, #10) and `capacity_percent` (zero
+  denominator → 0, #11) with unit tests.
+- **Phase 3 — free inodes + `-t` (#2, #3, #7).** Default and `-t` modes append
+  `Inodes`/`IUsed`/`IFree`/`IUse%` from `f_files`/`f_ffree` (#3, IUse% verified
+  against coreutils `df -i`); `-k`/`-P` keep the fixed six-column format. `-t`
+  added (#2) and made mutually exclusive with `-P` (#7).
+- **Phase 4 — diagnostics & exit-status (#6, #12).** All message literals are
+  `gettext`-wrapped and OS error text comes from libc `strerror` (#6). Mounts
+  that cannot be stat'd during the automatic full listing are skipped without
+  changing the exit status — matching coreutils, which exits 0 on hosts with
+  inaccessible overlay/bind mounts (#12); only user operands affect exit.
+- **Phase 5 — promotion.** `df` moved from README "Stage 3 — Test coverage" to
+  "Stage 6 — Audited". Full workspace builds; `cargo test -p posixutils-fs`,
+  `clippy --all-targets`, and `fmt` are clean (24 fs tests: 10 unit + 14
+  integration).
+
+Box state below is preserved as the historical contract (each item annotated
+inline with the phase that closed it).
+
+---
+
 ## `df`
 
-**Implementation:** `fs/df.rs` (392 lines) + `fs/mntent.rs` (156 lines, Linux mount-table reader)
-**Tests:** `fs/tests/df/mod.rs` (123 lines, 7 `#[test]`s)
+**Implementation:** `fs/df.rs` (541 lines, post-remediation) + `fs/mntent.rs` (156 lines, Linux mount-table reader)
+**Tests:** `fs/tests/df/mod.rs` (228 lines, 14 integration `#[test]`s) + 6 in-crate unit tests
+**Original audit (pre-fix):** `df.rs` 392 lines, 7 tests
 **Spec:** POSIX.1-2024 (IEEE Std 1003.1-2024), Vol. 3 §3, pp. 2839–2842 (lines 92372–92524)
 **Reference slice:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/df.md`
 **Date:** 2026-06-17

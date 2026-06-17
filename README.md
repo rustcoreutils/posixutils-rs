@@ -63,6 +63,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] crontab (cron cat.)
  - [x] dd
  - [x] delta (SCCS)
+ - [x] df
  - [x] dirname
  - [x] du
  - [x] ed (Editors)
@@ -143,7 +144,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] cut
  - [x] cxref (Development)
  - [x] diff
- - [x] df
  - [x] echo
  - [x] expand
  - [x] fold

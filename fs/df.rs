@@ -17,7 +17,10 @@ use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 #[cfg(target_os = "macos")]
 use std::ffi::CStr;
-use std::{cmp, ffi::CString, fmt::Display, io};
+use std::ffi::{CString, OsStr, OsString};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+use std::{cmp, fmt::Display, io};
 
 #[derive(Parser)]
 #[command(version, about = gettext("df - report free storage space"))]
@@ -39,7 +42,7 @@ struct Args {
     #[arg(
         help = gettext("A pathname of a file within the hierarchy of the desired file system")
     )]
-    files: Vec<String>,
+    files: Vec<PathBuf>,
 }
 
 /// Display modes
@@ -156,12 +159,12 @@ impl Display for Fields {
 
 pub struct FieldsData<'a> {
     pub fields: &'a Fields,
-    pub source: &'a String,
+    pub source: String,
     pub size: u64,
     pub used: u64,
     pub avail: u64,
     pub pcent: u32,
-    pub target: &'a String,
+    pub target: String,
 }
 
 impl Display for FieldsData<'_> {
@@ -174,12 +177,12 @@ impl Display for FieldsData<'_> {
         write!(
             f,
             "{} {} {} {} {}% {}",
-            self.fields.source.format(self.source),
+            self.fields.source.format(&self.source),
             self.fields.size.format(&self.size),
             self.fields.used.format(&self.used),
             self.fields.avail.format(&self.avail),
             self.fields.pcent.format(&self.pcent),
-            self.fields.target.format(self.target)
+            self.fields.target.format(&self.target)
         )
     }
 }
@@ -205,8 +208,8 @@ fn stat(filename: &CString) -> io::Result<libc::stat> {
 }
 
 struct Mount {
-    devname: String,
-    dir: String,
+    devname: OsString,
+    dir: OsString,
     dev: i64,
     masked: bool,
     cached_statfs: libc::statfs,
@@ -231,39 +234,28 @@ impl Mount {
 
         FieldsData {
             fields,
-            source: &self.devname,
+            source: self.devname.to_string_lossy().into_owned(),
             size: total,
             used,
             avail,
             pcent: percentage_used,
-            target: &self.dir,
+            target: self.dir.to_string_lossy().into_owned(),
         }
     }
 }
 
 struct MountList {
     mounts: Vec<Mount>,
-    has_masks: bool,
 }
 
 impl MountList {
     fn new() -> MountList {
-        MountList {
-            mounts: Vec::new(),
-            has_masks: false,
-        }
+        MountList { mounts: Vec::new() }
     }
 
     fn mask_all(&mut self) {
         for mount in &mut self.mounts {
             mount.masked = true;
-        }
-    }
-
-    fn ensure_masked(&mut self) {
-        if !self.has_masks {
-            self.mask_all();
-            self.has_masks = true;
         }
     }
 
@@ -279,8 +271,8 @@ impl MountList {
         };
 
         self.mounts.push(Mount {
-            devname: String::from(devname.to_str().unwrap()),
-            dir: String::from(dirname.to_str().unwrap()),
+            devname: OsStr::from_bytes(devname.to_bytes()).to_os_string(),
+            dir: OsStr::from_bytes(dirname.to_bytes()).to_os_string(),
             dev,
             masked: false,
             cached_statfs: *fsstat,
@@ -322,7 +314,7 @@ fn read_mount_info() -> io::Result<MountList> {
             if rc < 0 {
                 eprintln!(
                     "{}: {}",
-                    mount.dir.to_str().unwrap(),
+                    Path::new(OsStr::from_bytes(mount.dir.to_bytes())).display(),
                     io::Error::last_os_error()
                 );
                 continue;
@@ -335,18 +327,24 @@ fn read_mount_info() -> io::Result<MountList> {
     Ok(info)
 }
 
-fn mask_fs_by_file(info: &mut MountList, filename: &str) -> io::Result<()> {
-    let c_filename = CString::new(filename).expect("`filename` contains an internal 0 byte");
-    let stat_res = stat(&c_filename);
-    if let Err(e) = stat_res {
-        eprintln!("{}: {}", filename, e);
-        return Err(e);
-    }
-    let stat = stat_res.unwrap();
+fn mask_fs_by_file(info: &mut MountList, path: &Path) -> io::Result<()> {
+    let c_filename = match CString::new(path.as_os_str().as_bytes()) {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("{}: {}", path.display(), gettext("invalid pathname"));
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+    };
+    let stat = match stat(&c_filename) {
+        Ok(st) => st,
+        Err(e) => {
+            eprintln!("{}: {}", path.display(), e);
+            return Err(e);
+        }
+    };
 
     for mount in &mut info.mounts {
         if stat.st_dev as i64 == mount.dev {
-            info.has_masks = true;
             mount.masked = true;
         }
     }
@@ -374,8 +372,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    info.ensure_masked();
-
     let mode = OutputMode::new(args.kilo, args.portable);
     let fields = Fields::new(mode);
     // Print header
@@ -383,6 +379,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for mount in &info.mounts {
         if mount.masked {
+            // FUTURE DIRECTIONS / Austin Group Defect 251: treat a pathname
+            // containing a <newline> (a separator in the output format) as an
+            // error rather than emitting a corrupt, unparsable line.
+            if mount.devname.as_bytes().contains(&b'\n') || mount.dir.as_bytes().contains(&b'\n') {
+                eprintln!(
+                    "{}: {}",
+                    mount.dir.to_string_lossy(),
+                    gettext("pathname contains newline; skipping")
+                );
+                exit_code = 1;
+                continue;
+            }
             let row = mount.to_row(&fields);
             println!("{}", row);
         }

@@ -38,7 +38,10 @@ fn get_nohup_out_file() -> io::Result<(File, NohupDir)> {
         Err(_) => {
             // POSIX: the fallback directory is the HOME environment variable.
             let home = env::var("HOME").map_err(|_| {
-                io::Error::new(io::ErrorKind::NotFound, "HOME environment variable not set")
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    gettext("HOME environment variable not set"),
+                )
             })?;
             let mut path = std::path::PathBuf::from(home);
             path.push("nohup.out");

@@ -119,16 +119,21 @@ fn set_timeout(duration: Duration) {
     }
     // Use setitimer for sub-second precision; alarm() truncates to whole
     // seconds (so `timeout 0.5s` would arm a 0-second — i.e. disabled — timer).
-    let mut secs = duration.as_secs() as libc::time_t;
+    //
+    // Saturate the seconds to time_t::MAX rather than letting `as time_t` wrap
+    // negative for a pathologically large duration (which would otherwise
+    // disable the timeout entirely).
+    let secs_u64 = duration.as_secs();
+    let secs = if secs_u64 > libc::time_t::MAX as u64 {
+        libc::time_t::MAX
+    } else {
+        secs_u64 as libc::time_t
+    };
     let mut usecs = duration.subsec_micros() as libc::suseconds_t;
     // A non-zero duration below 1us would round to an all-zero itimerval,
     // which disarms the timer; round up to the smallest tick instead.
     if secs == 0 && usecs == 0 {
         usecs = 1;
-    }
-    // Cap is unnecessary; just guard the impossible negative.
-    if secs < 0 {
-        secs = 0;
     }
     let it = libc::itimerval {
         it_interval: libc::timeval {

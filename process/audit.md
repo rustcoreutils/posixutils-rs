@@ -417,20 +417,20 @@ rejected; and the `-n` range excludes `+20`.
 ### Priority issues
 
 #### Critical
-- [ ] **`#RN1` — only one `ID` accepted; POSIX requires `ID...`.**
+- [x] **`#RN1` — only one `ID` accepted; POSIX requires `ID...`.** ✓ fixed in Phase 3.
   `renice.rs:67` (`id: String`). The SYNOPSIS is
   `renice [-g|-p|-u] -n increment ID...` — one or more. A second operand makes
   clap error "unexpected argument". Fix: `id: Vec<String>` + loop.
-- [ ] **`#RN2` — no per-ID error continuation.** `renice.rs:125-134`. CONSEQUENCES
+- [x] **`#RN2` — no per-ID error continuation.** ✓ fixed in Phase 3. `renice.rs:125-134`. CONSEQUENCES
   OF ERRORS = "Default": a failure on one ID must not stop the others, and exit
   must be >0 if any failed. The `?` chain aborts on the first error (and only
   one ID exists anyway). Fix: loop, accumulate failures, exit non-zero at end.
 
 #### Major
-- [ ] **`#RN3` — numeric ID `0` rejected.** `renice.rs:85`
+- [x] **`#RN3` — numeric ID `0` rejected.** ✓ fixed in Phase 3. `renice.rs:85`
   (`Ok(0) => Err("Invalid ID")`). `0` is valid: PID/PGID 0 = caller's
   process/group, UID 0 = root. Fix: remove the `Ok(0)` reject arm.
-- [ ] **`#RN4` — `-n` range excludes `+20`.** `renice.rs:27` (`.range(-20..20)`,
+- [x] **`#RN4` — `-n` range excludes `+20`.** ✓ fixed in Phase 3. `renice.rs:27` (`.range(-20..20)`,
   exclusive upper). Historical max increment is `+20` (spec EXAMPLES cite 19/20).
   Fix: `.range(-20..=20)`.
 

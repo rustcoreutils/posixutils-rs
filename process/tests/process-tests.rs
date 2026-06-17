@@ -11,5 +11,6 @@ mod env;
 mod fuser;
 mod kill;
 mod nice;
+mod renice;
 mod timeout;
 mod xargs;

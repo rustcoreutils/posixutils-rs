@@ -347,32 +347,32 @@ instead of the controlled error path.
 ### Priority issues
 
 #### Critical
-- [ ] **`#NH1` — `nohup.out` not created mode 0600.** `nohup.rs:26-40`.
+- [x] **`#NH1` — `nohup.out` not created mode 0600.** ✓ fixed in Phase 4. `nohup.rs:26-40`.
   `OpenOptions::new().create(true).append(true)` honors umask (→ 0644/0666).
   Spec (slice 108896) mandates `S_IRUSR | S_IWUSR` (0600) on creation. Fix:
   `OpenOptionsExt::mode(0o600)`.
-- [ ] **`#NH2` — home fallback uses `dirs::home_dir()`, not `$HOME`.**
+- [x] **`#NH2` — home fallback uses `dirs::home_dir()`, not `$HOME`.** ✓ fixed in Phase 4.
   `nohup.rs:34`. Spec (slice 108916) names the **`HOME`** environment variable.
   `dirs::home_dir()` consults `getpwuid` and may ignore a set `$HOME`. Fix:
   `std::env::var("HOME")`.
 
 #### Major
-- [ ] **`#NH3` — stderr redirect misses the "follow stdout fd" case.**
+- [x] **`#NH3` — stderr redirect misses the "follow stdout fd" case.** ✓ fixed in Phase 4.
   `nohup.rs:106-113`. Spec (slice 108897-108900): "If standard error is a
   terminal and standard output is open but is not a terminal, all output … to
   its standard error shall be redirected to **the same open file description as
   the standard output**." The code only redirects stderr to a freshly-opened
   `nohup.out`; when stdout is a non-terminal pipe/file it should `dup2` stdout's
   fd onto stderr instead. Fix: branch on stdout's terminal/open state per spec.
-- [ ] **`#NH4` — file-open failure panics (exit 101) instead of erroring.**
+- [x] **`#NH4` — file-open failure panics (exit 101) instead of erroring.** ✓ fixed in Phase 4.
   `nohup.rs:81-82` (`.expect(...)`). Spec APPLICATION USAGE expects an internal
   failure to exit 127 with a diagnostic, not a Rust panic backtrace. Fix:
   handle the `Err` and `exit(127)`.
 
 #### Minor
-- [ ] **`#NH5` — `signal(SIGHUP, SIG_IGN)` return value unchecked.**
+- [x] **`#NH5` — `signal(SIGHUP, SIG_IGN)` return value unchecked.** ✓ fixed in Phase 4.
   `nohup.rs:57-60`. A `SIG_ERR` return goes undetected. Check and `exit(127)`.
-- [ ] **`#NH6` — "appending output" notice wording/format.** `nohup.rs:94-101`.
+- [x] **`#NH6` — "appending output" notice wording/format.** ✓ fixed in Phase 4. `nohup.rs:94-101`.
   Functional and correctly gated on `stdout().is_terminal()`, but the message
   text is bespoke (not gettext-wrapped — `#C1`).
 

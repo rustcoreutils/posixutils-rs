@@ -401,6 +401,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // More than one source requires the target to be an existing directory (mv synopsis form 2).
+    if !dir_exists && sources.len() > 1 {
+        eprintln!(
+            "mv: {}",
+            gettext!("target '{}' is not a directory", target.display())
+        );
+        std::process::exit(1);
+    }
+
     let cfg = MvConfig::new(&args);
     if dir_exists {
         match move_files(&cfg, sources, target) {
@@ -412,6 +421,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     } else {
         let source = &sources[0];
+
+        // First synopsis form (108049-108050): "if source_file names a non-directory file and
+        // target_file ends with a trailing <slash> character, mv shall treat this as an error and
+        // no source_file operands shall be processed."
+        if target.as_os_str().as_bytes().ends_with(b"/") {
+            if let Ok(md) = fs::symlink_metadata(source) {
+                if !md.is_dir() {
+                    eprintln!(
+                        "mv: {}",
+                        gettext!(
+                            "cannot move '{}' to '{}': Not a directory",
+                            source.display(),
+                            target.display()
+                        )
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
         let mut dummy = HashMap::new();
         match move_file(&cfg, source, target, &mut dummy, None) {
             Ok(is_source_deleted) => {

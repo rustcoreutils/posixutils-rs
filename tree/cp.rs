@@ -130,6 +130,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // POSIX cp DESCRIPTION (90605-90606): "It shall be an error if target does not exist and more
+    // than two operands are specified, or if target exists and does not name a directory." Both
+    // map to: more than one source with a target that is not an existing directory.
+    if !dir_exists && sources.len() > 1 {
+        eprintln!(
+            "cp: {}",
+            gettext!("target '{}' is not a directory", target.display())
+        );
+        std::process::exit(1);
+    }
+
     let cfg = CopyConfig::new(&args);
     if dir_exists {
         match copy_files(&cfg, sources, target, None, prompt_user) {

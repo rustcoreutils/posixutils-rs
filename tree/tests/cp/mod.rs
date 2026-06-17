@@ -1079,3 +1079,30 @@ fn test_cp_issue199() {
 
     fs::remove_dir_all(test_dir).unwrap();
 }
+
+// Audit #C2: more than one source with a target that is not an existing directory must be an
+// error (POSIX cp 90605-90606), not a silent copy of only the first source.
+#[test]
+fn test_cp_multi_source_nondir_target() {
+    let test_dir = &format!(
+        "{}/test_cp_multi_source_nondir_target",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let a = &format!("{test_dir}/a");
+    let b = &format!("{test_dir}/b");
+    let c = &format!("{test_dir}/c"); // does not exist
+
+    fs::create_dir(test_dir).unwrap();
+    fs::write(a, b"aaa").unwrap();
+    fs::write(b, b"bbb").unwrap();
+
+    cp_test(
+        &[a, b, c],
+        "",
+        &format!("cp: target '{c}' is not a directory\n"),
+        1,
+    );
+    assert!(!Path::new(c).exists());
+
+    fs::remove_dir_all(test_dir).unwrap();
+}

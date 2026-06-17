@@ -97,3 +97,22 @@ fn test_readlink_not_a_symlink() {
         expected_exit_code: 1,
     });
 }
+
+// Audit #RL1: readlink on a non-symlink writes a diagnostic to stderr and exits 1, even without -v.
+#[test]
+fn test_readlink_not_symlink_diagnoses() {
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("file.txt");
+    File::create(&file_path).unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_readlink"))
+        .arg(&file_path)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Not a symbolic link"),
+        "expected a diagnostic: {stderr:?}"
+    );
+}

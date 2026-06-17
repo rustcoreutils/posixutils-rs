@@ -661,3 +661,194 @@ fn test_ls_time() {
 
     fs::remove_dir_all(test_dir).unwrap();
 }
+
+// Audit #LS1/#LS2: `ls -l` on a symbolic link — named directly on the command line, and present
+// inside a listed directory — must not panic; it renders `name -> target`.
+#[test]
+fn test_ls_l_symlink_no_panic() {
+    let test_dir = &format!("{}/test_ls_l_symlink_no_panic", env!("CARGO_TARGET_TMPDIR"));
+    let sub = &format!("{test_dir}/sub");
+    let target = &format!("{test_dir}/sub/target");
+    let link = &format!("{test_dir}/sub/link");
+
+    fs::create_dir_all(sub).unwrap();
+    fs::File::create(target).unwrap();
+    std::os::unix::fs::symlink("target", link).unwrap();
+
+    // #LS2: symlink discovered while listing the directory.
+    ls_test_with_checker(&["-l", sub], |_, output| {
+        assert_eq!(output.status.code(), Some(0));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("link -> target"), "stdout: {stdout}");
+    });
+
+    // #LS1: symlink named directly on the command line.
+    ls_test_with_checker(&["-l", link], |_, output| {
+        assert_eq!(output.status.code(), Some(0));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("link -> target"), "stdout: {stdout}");
+    });
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// Audit #LS10: a socket gets type char `s` (long format) and indicator `=` (-F).
+#[test]
+fn test_ls_socket_classification() {
+    let test_dir = &format!(
+        "{}/test_ls_socket_classification",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    fs::create_dir(test_dir).unwrap();
+    let sock = &format!("{test_dir}/sock");
+    let _listener = std::os::unix::net::UnixListener::bind(sock).unwrap();
+
+    ls_test_with_checker(&["-F", sock], |_, output| {
+        assert_eq!(output.status.code(), Some(0));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("sock="), "stdout: {stdout}");
+    });
+    ls_test_with_checker(&["-l", sock], |_, output| {
+        assert_eq!(output.status.code(), Some(0));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.starts_with('s'),
+            "mode line should start with 's': {stdout}"
+        );
+    });
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// Audit #LS9: the long-format day is blank-padded (`%e`), not zero-padded (`Jun  5`, not `Jun 05`).
+#[test]
+fn test_ls_date_blank_padded_day() {
+    let test_dir = &format!(
+        "{}/test_ls_date_blank_padded_day",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let f = &format!("{test_dir}/f");
+    fs::create_dir(test_dir).unwrap();
+    fs::File::create(f).unwrap();
+    // An old (year-format) date on a single-digit day; noon UTC keeps the day stable across TZs.
+    change_file_time(f, TimeToChange::Both("2020-06-05 12:00:00"));
+
+    ls_test_with_checker(&["-l", f], |_, output| {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("2020"), "expected year format: {stdout}");
+        assert!(
+            (stdout.contains("Jun  5") || stdout.contains("Jun  6")),
+            "day should be blank-padded: {stdout}"
+        );
+        assert!(
+            !stdout.contains("Jun 05") && !stdout.contains("Jun 06"),
+            "day should not be zero-padded: {stdout}"
+        );
+    });
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// Audit #LS4: the recent-vs-old date format tracks the DISPLAYED timestamp — under `-u`, a file
+// with an old mtime but a recent atime uses the recent (HH:MM) format, not the year format.
+#[test]
+fn test_ls_u_recency_displayed_time() {
+    let test_dir = &format!(
+        "{}/test_ls_u_recency_displayed_time",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let f = &format!("{test_dir}/f");
+    fs::create_dir(test_dir).unwrap();
+    fs::File::create(f).unwrap();
+
+    let recent = (chrono::Local::now() - chrono::Duration::days(2))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    change_file_time(f, TimeToChange::Modified("2020-01-05 12:00:00")); // old mtime
+    change_file_time(f, TimeToChange::Accessed(&recent)); // recent atime (mtime preserved)
+
+    // -l uses mtime (old) → year format.
+    ls_test_with_checker(&["-l", f], |_, output| {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("2020"),
+            "-l should show the old year: {stdout}"
+        );
+    });
+    // -lu uses atime (recent) → time-of-day format, no year.
+    ls_test_with_checker(&["-lu", f], |_, output| {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            Regex::new(r"\d\d:\d\d").unwrap().is_match(&stdout),
+            "-lu should show HH:MM for a recent atime: {stdout}"
+        );
+        assert!(
+            !stdout.contains("2020"),
+            "-lu recent atime should not show a year: {stdout}"
+        );
+    });
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// Audit #LS5: a file carrying a POSIX ACL gets the trailing `+` on its mode string. Gated on
+// `setfacl` being available and the filesystem supporting ACLs.
+#[test]
+fn test_ls_acl_plus_flag() {
+    let test_dir = &format!("{}/test_ls_acl_plus_flag", env!("CARGO_TARGET_TMPDIR"));
+    let f = &format!("{test_dir}/f");
+    fs::create_dir(test_dir).unwrap();
+    fs::File::create(f).unwrap();
+
+    let ok = std::process::Command::new("setfacl")
+        .args(["-m", "u:0:r", f])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!("Skipping: setfacl unavailable or filesystem lacks ACL support");
+        fs::remove_dir_all(test_dir).unwrap();
+        return;
+    }
+
+    ls_test_with_checker(&["-l", f], |_, output| {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mode = stdout.split_whitespace().next().unwrap_or("");
+        assert!(mode.ends_with('+'), "mode should carry ACL '+': {stdout}");
+    });
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// Audit #LS6: explicit `-q` replaces non-printable filename characters with `?`.
+#[test]
+fn test_ls_q_non_printable() {
+    let test_dir = &format!("{}/test_ls_q_non_printable", env!("CARGO_TARGET_TMPDIR"));
+    fs::create_dir(test_dir).unwrap();
+    let weird = &format!("{test_dir}/a\tb");
+    fs::File::create(weird).unwrap();
+
+    ls_test_with_checker(&["-q", test_dir], |_, output| {
+        assert_eq!(output.status.code(), Some(0));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("a?b"), "tab should become '?': {stdout:?}");
+        assert!(!stdout.contains('\t'), "no raw tab: {stdout:?}");
+    });
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// Audit #LS13: `-s` reports blocks in 1024-byte units by default (matches coreutils).
+#[test]
+fn test_ls_s_kib_default() {
+    let test_dir = &format!("{}/test_ls_s_kib_default", env!("CARGO_TARGET_TMPDIR"));
+    let f = &format!("{test_dir}/f");
+    fs::create_dir(test_dir).unwrap();
+    // 8 KiB of data → ~8 1024-byte blocks (allocation may add a little).
+    fs::write(f, vec![0u8; 8192]).unwrap();
+
+    let blocks_512 = fs::metadata(f).unwrap().blocks();
+    let expected_kib = blocks_512 / 2;
+    ls_test_with_checker(&["-s", f], |_, output| {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let first: u64 = stdout.split_whitespace().next().unwrap().parse().unwrap();
+        assert_eq!(first, expected_kib, "expected 1024-byte units: {stdout}");
+    });
+    fs::remove_dir_all(test_dir).unwrap();
+}

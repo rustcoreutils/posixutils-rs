@@ -329,3 +329,65 @@ fn test_chmod_setgid() {
 
     fs::remove_dir_all(test_dir).unwrap();
 }
+
+fn mkdir_test(args: &[&str], expected_output: &str, expected_error: &str, expected_exit_code: i32) {
+    base_test(
+        "mkdir",
+        args,
+        expected_output,
+        expected_error,
+        expected_exit_code,
+    )
+}
+
+// Audit #MK1: an explicit `-m` mode is not reduced by the umask.
+#[test]
+fn test_mkdir_explicit_mode_bypasses_umask() {
+    let test_dir = &format!(
+        "{}/test_mkdir_explicit_mode_bypasses_umask",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let d = &format!("{test_dir}/d");
+    fs::create_dir(test_dir).unwrap();
+
+    let umask_setter = UMASK_SETTER.lock().unwrap();
+    let original_umask = umask_setter.umask(0o022);
+
+    mkdir_test(&["-m", "777", d], "", "", 0);
+    assert_eq!(fs::metadata(d).unwrap().mode() & 0o777, 0o777);
+
+    umask_setter.umask(original_umask);
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// Audit #MK2: `-p` intermediates get the default mode (+u+wx), only the leaf gets `-m`.
+#[test]
+fn test_mkdir_p_intermediate_mode() {
+    let test_dir = &format!(
+        "{}/test_mkdir_p_intermediate_mode",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let a = &format!("{test_dir}/a");
+    let b = &format!("{test_dir}/a/b");
+    let c = &format!("{test_dir}/a/b/c");
+    fs::create_dir(test_dir).unwrap();
+
+    let umask_setter = UMASK_SETTER.lock().unwrap();
+    let original_umask = umask_setter.umask(0o022);
+
+    mkdir_test(&["-p", "-m", "700", c], "", "", 0);
+    assert_eq!(
+        fs::metadata(a).unwrap().mode() & 0o777,
+        0o755,
+        "intermediate a"
+    );
+    assert_eq!(
+        fs::metadata(b).unwrap().mode() & 0o777,
+        0o755,
+        "intermediate b"
+    );
+    assert_eq!(fs::metadata(c).unwrap().mode() & 0o777, 0o700, "leaf c");
+
+    umask_setter.umask(original_umask);
+    fs::remove_dir_all(test_dir).unwrap();
+}

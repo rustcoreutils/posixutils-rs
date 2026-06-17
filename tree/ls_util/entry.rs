@@ -12,7 +12,6 @@ use crate::{
     ClassifyFiles, Config, FileTimeOption, LongFormatOptions, OutputFormat,
     DATE_TIME_FORMAT_OLD_OR_FUTURE, DATE_TIME_FORMAT_RECENT,
 };
-use chrono::{DateTime, Local};
 use std::{
     cmp::Ordering,
     ffi::{CStr, OsStr, OsString},
@@ -57,6 +56,7 @@ impl Entry {
         file_name_raw: OsString,
         metadata: &ftw::Metadata,
         config: &Config,
+        path: &std::path::Path,
     ) -> io::Result<Self> {
         let file_info = get_file_info(metadata);
 
@@ -65,9 +65,9 @@ impl Entry {
 
         let blocks = metadata.blocks();
         let blocks_str = if config.display_size {
-            // The 2 is because `crate::BLOCK_SIZE_KIBIBYTES` is double that of
-            // `crate::BLOCK_SIZE`
-            let b = if config.kibibytes { blocks / 2 } else { blocks };
+            // `-s` defaults to 1024-byte units (matching coreutils); `metadata.blocks()` is in
+            // 512-byte units, so halve it. `-k` requests the same 1024-byte units (#LS13).
+            let b = blocks / 2;
             Some(format!("{}", b))
         } else {
             None
@@ -81,7 +81,7 @@ impl Entry {
 
         let long_format_data =
             if let OutputFormat::Long(long_format_options) = &config.output_format {
-                Some(LongFormatData::new(metadata, long_format_options)?)
+                Some(LongFormatData::new(metadata, long_format_options, path)?)
             } else {
                 None
             };
@@ -96,6 +96,8 @@ impl Entry {
                     let file_type = metadata.file_type();
                     if file_type.is_fifo() {
                         Some('|')
+                    } else if file_type.is_socket() {
+                        Some('=')
                     } else {
                         let mode = metadata.mode();
                         // Cast to u32 for cross-platform compatibility (u16 on macOS, u32 on Linux)
@@ -124,17 +126,17 @@ impl Entry {
         let file_name_display = {
             let tmp = ls_from_utf8_lossy(file_name_raw.as_bytes());
 
-            // -q
+            // -q: replace every non-printable character (per LC_CTYPE) with '?'.
             if config.hide_control_chars {
                 tmp.chars()
-                    .map(|c| if c.is_control() || c == '\t' { '?' } else { c })
+                    .map(|c| if plib::locale::isprint(c) { c } else { '?' })
                     .collect()
             } else {
                 tmp
             }
         };
 
-        let mut file_name_width = file_name_display.chars().count();
+        let mut file_name_width = display_width(&file_name_display);
         if suffix.is_some() {
             file_name_width += 1;
         }
@@ -355,7 +357,7 @@ impl Entry {
 
     /// Comparison key for sorting based on just the file name.
     pub fn sorting_cmp_lexicographic(&self, other: &Self) -> Ordering {
-        self.file_name_raw.cmp(&other.file_name_raw)
+        collate_names(&self.file_name_raw, &other.file_name_raw)
     }
 
     // Returns (is_device, size, file_name). The `bool` is to have devices
@@ -379,7 +381,7 @@ impl Entry {
         match self_sorting_key.0.cmp(&other_sorting_key.0) {
             Ordering::Equal => {
                 match self_sorting_key.1.cmp(&other_sorting_key.1) {
-                    Ordering::Equal => self_sorting_key.2.cmp(other_sorting_key.2),
+                    Ordering::Equal => collate_names(self_sorting_key.2, other_sorting_key.2),
                     r => r.reverse(), // Default is from largest file size to smallest
                 }
             }
@@ -393,7 +395,7 @@ impl Entry {
     /// The kind of time is dependent on the flags -t, -c, -u.
     pub fn sorting_cmp_time(&self, other: &Self) -> Ordering {
         match self.time.cmp(&other.time) {
-            Ordering::Equal => self.file_name_raw.cmp(&other.file_name_raw),
+            Ordering::Equal => collate_names(&self.file_name_raw, &other.file_name_raw),
             r => r.reverse(), // Default is newest to oldest
         }
     }
@@ -542,8 +544,9 @@ impl LongFormatData {
     pub fn new(
         metadata: &ftw::Metadata,
         long_format_options: &LongFormatOptions,
+        path: &std::path::Path,
     ) -> io::Result<Self> {
-        let file_mode = get_file_mode_string(metadata);
+        let file_mode = get_file_mode_string(metadata, path);
 
         let num_links = metadata.nlink().to_string();
 
@@ -574,8 +577,8 @@ impl LongFormatData {
     }
 }
 
-fn get_file_mode_string(metadata: &ftw::Metadata) -> String {
-    let mut file_mode = String::with_capacity(10);
+fn get_file_mode_string(metadata: &ftw::Metadata, path: &std::path::Path) -> String {
+    let mut file_mode = String::with_capacity(11);
 
     let file_type = metadata.file_type();
 
@@ -586,6 +589,7 @@ fn get_file_mode_string(metadata: &ftw::Metadata) -> String {
         ftw::FileType::Directory => 'd',
         ftw::FileType::CharacterDevice => 'c',
         ftw::FileType::Fifo => 'p',
+        ftw::FileType::Socket => 's',
         _ => '-',
     });
 
@@ -654,6 +658,11 @@ fn get_file_mode_string(metadata: &ftw::Metadata) -> String {
         }
     });
 
+    // Alternate-access-method flag: '+' when the file carries a POSIX ACL.
+    if has_acl(path) {
+        file_mode.push('+');
+    }
+
     file_mode
 }
 
@@ -665,7 +674,8 @@ fn get_owner_name(metadata: &ftw::Metadata, numeric: bool) -> io::Result<String>
         unsafe {
             let passwd = libc::getpwuid(uid);
             if passwd.is_null() {
-                return Err(io::Error::last_os_error());
+                // POSIX: if the owner name cannot be determined, use the numeric UID.
+                return Ok(uid.to_string());
             }
             let passwd_ref = &*passwd;
             let name = CStr::from_ptr(passwd_ref.pw_name);
@@ -682,7 +692,8 @@ fn get_group_name(metadata: &ftw::Metadata, numeric: bool) -> io::Result<String>
         unsafe {
             let group = libc::getgrgid(gid);
             if group.is_null() {
-                return Err(io::Error::last_os_error());
+                // POSIX: if the group name cannot be determined, use the numeric GID.
+                return Ok(gid.to_string());
             }
             let group_ref = &*group;
             let name = CStr::from_ptr(group_ref.gr_name);
@@ -732,35 +743,120 @@ fn get_system_time(
     Ok(time)
 }
 
+/// Display width of a string in terminal columns, summing libc `wcwidth` per character so
+/// East-Asian wide characters count as 2 and zero-width characters as 0. Requires `LC_CTYPE` to
+/// have been set. Non-printable characters (`wcwidth` < 0) count as 1 (they are normally already
+/// replaced by `?` under `-q`).
+fn display_width(s: &str) -> usize {
+    // `wcwidth` is not surfaced by the `libc` crate on all targets, so declare it directly.
+    extern "C" {
+        fn wcwidth(c: libc::wchar_t) -> libc::c_int;
+    }
+    s.chars()
+        .map(|c| {
+            let w = unsafe { wcwidth(c as libc::wchar_t) };
+            if w < 0 {
+                1
+            } else {
+                w as usize
+            }
+        })
+        .sum()
+}
+
+/// True if `path` carries an ACL (an "alternate access method"); used to append the `+` flag to the
+/// `-l` mode string. The probe is platform-specific: Linux exposes a POSIX access ACL through the
+/// `system.posix_acl_access` extended attribute, while macOS/BSD report an extended ACL through the
+/// `acl(3)` API (`getxattr` there has a different, 6-argument signature and does not surface ACLs by
+/// that name).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn has_acl(path: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(cpath) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    const NAME: &[u8] = b"system.posix_acl_access\0";
+    let ret = unsafe {
+        libc::getxattr(
+            cpath.as_ptr(),
+            NAME.as_ptr() as *const libc::c_char,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    ret >= 0
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn has_acl(path: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    // macOS/BSD: an extended ACL is present iff `acl_get_link_np(path, ACL_TYPE_EXTENDED)` returns a
+    // non-empty list (matching what BSD `ls` does for the `+` flag). These symbols live in libSystem
+    // but are not surfaced by the `libc` crate on every target, so declare them directly. `acl_t` /
+    // `acl_entry_t` are opaque pointers.
+    extern "C" {
+        fn acl_get_link_np(path: *const libc::c_char, acl_type: libc::c_uint) -> *mut libc::c_void;
+        fn acl_get_entry(
+            acl: *mut libc::c_void,
+            entry_id: libc::c_int,
+            entry_p: *mut *mut libc::c_void,
+        ) -> libc::c_int;
+        fn acl_free(obj_p: *mut libc::c_void) -> libc::c_int;
+    }
+    const ACL_TYPE_EXTENDED: libc::c_uint = 0x0000_0100;
+    const ACL_FIRST_ENTRY: libc::c_int = 0;
+
+    let Ok(cpath) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    unsafe {
+        let acl = acl_get_link_np(cpath.as_ptr(), ACL_TYPE_EXTENDED);
+        if acl.is_null() {
+            return false;
+        }
+        // An allocated-but-entryless ACL is treated as "no ACL" (no `+`).
+        let mut entry: *mut libc::c_void = std::ptr::null_mut();
+        let has_entry = acl_get_entry(acl, ACL_FIRST_ENTRY, &mut entry) == 0;
+        acl_free(acl);
+        has_entry
+    }
+}
+
+/// Compare two raw filenames using `LC_COLLATE` (libc `strcoll`) with a byte-order tiebreak, and a
+/// byte-order fallback for names that are not valid UTF-8 (which `strcoll` cannot accept).
+fn collate_names(a: &OsStr, b: &OsStr) -> Ordering {
+    match (a.to_str(), b.to_str()) {
+        (Some(sa), Some(sb)) => {
+            plib::locale::strcoll(sa, sb).then_with(|| a.as_bytes().cmp(b.as_bytes()))
+        }
+        _ => a.as_bytes().cmp(b.as_bytes()),
+    }
+}
+
 fn get_time_and_time_string(
     metadata: &ftw::Metadata,
     file_time_option: &FileTimeOption,
 ) -> io::Result<(SystemTime, String)> {
     let time = get_system_time(metadata, file_time_option)?;
 
+    // The recent-vs-old format is chosen relative to the *displayed* timestamp (so `-c`/`-u`
+    // track ctime/atime), using a precise ~6-month window (365.25/2 days).
     let dt_format = {
-        // The specification says to base it of "last modification time"
-        // without any mention of -c or -u
-        let last_modified_time = get_system_time(metadata, &FileTimeOption::LastModificationTime)?;
+        const SIX_MONTHS: Duration = Duration::from_secs(15_778_800);
         let now = SystemTime::now();
-
-        match now.duration_since(last_modified_time) {
-            Ok(duration) => {
-                const SIX_MONTHS: Duration = Duration::from_secs(3600 * 24 * 30 * 6);
-                if duration > SIX_MONTHS {
-                    DATE_TIME_FORMAT_OLD_OR_FUTURE // Old
-                } else {
-                    DATE_TIME_FORMAT_RECENT
-                }
-            }
-            Err(_) => DATE_TIME_FORMAT_OLD_OR_FUTURE, // Future
+        match now.duration_since(time) {
+            Ok(duration) if duration <= SIX_MONTHS => DATE_TIME_FORMAT_RECENT,
+            _ => DATE_TIME_FORMAT_OLD_OR_FUTURE, // older than 6 months, or a future timestamp
         }
     };
 
-    let time_string = {
-        // chrono parses the TZ environment variable in this conversion
-        let dt: DateTime<Local> = time.into();
-        dt.format(dt_format).to_string()
+    // libc `strftime` honors `LC_TIME` (localized month names) and `TZ`; the format strings use
+    // `%e` (blank-padded day) as the spec's `date "+%b %e %H:%M"` requires.
+    let epoch_secs = match time.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        Err(e) => -(e.duration().as_secs() as i64),
     };
+    let time_string = plib::locale::strftime(dt_format, epoch_secs)?;
+
     Ok((time, time_string))
 }

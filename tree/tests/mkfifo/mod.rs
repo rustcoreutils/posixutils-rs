@@ -168,3 +168,23 @@ fn test_create_multiple_fifos() {
     fs::remove_file(fifo1).expect("Unable to remove test FIFO");
     fs::remove_file(fifo2).expect("Unable to remove test FIFO");
 }
+
+// Audit #MF2: a <newline> in the pathname is rejected.
+#[test]
+fn test_mkfifo_newline_rejected() {
+    let test_dir = &format!(
+        "{}/test_mkfifo_newline_rejected",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    fs::create_dir(test_dir).unwrap();
+    let bad = &format!("{test_dir}/a\nb");
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_mkfifo"))
+        .arg(bad)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(!Path::new(bad).exists());
+
+    fs::remove_dir_all(test_dir).unwrap();
+}

@@ -12,26 +12,43 @@ use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleC
 use std::{
     cell::RefCell,
     collections::{HashSet, LinkedList},
-    os::unix::fs::MetadataExt,
+    os::unix::{ffi::OsStrExt, fs::MetadataExt},
 };
+
+// Print one `size<tab>path` line. FUTURE DIRECTIONS: a <newline> in the pathname would corrupt the
+// line-oriented output, so such a path is reported to stderr and skipped (#DU6).
+fn du_print(size: u64, path: &ftw::DisplayablePath) {
+    if path.as_inner().as_os_str().as_bytes().contains(&b'\n') {
+        eprintln!(
+            "du: {}",
+            gettext("a pathname contains a <newline> character; skipping")
+        );
+        return;
+    }
+    println!("{}\t{}", size, path);
+}
 
 /// du - estimate file space usage
 #[derive(Parser)]
 #[command(version, about = gettext("du - estimate file space usage"))]
 struct Args {
-    #[arg(short, long, help = gettext("Write counts for all files, not just directories"))]
+    #[arg(short, long, conflicts_with = "sum",
+          help = gettext("Write counts for all files, not just directories"))]
     all: bool,
 
-    #[arg(short = 'H', long, help = gettext("Follow command line symlinks"))]
+    #[arg(short = 'H', long, overrides_with = "dereference",
+          help = gettext("Follow command line symlinks"))]
     follow_cli: bool,
 
-    #[arg(short = 'L', long, help = gettext("Dereference all symlinks"))]
+    #[arg(short = 'L', long, overrides_with = "follow_cli",
+          help = gettext("Dereference all symlinks"))]
     dereference: bool,
 
     #[arg(short, long, help = gettext("Write the files sizes in units of 1024 bytes, rather than the default 512-byte units"))]
     kilo: bool,
 
-    #[arg(short, long, help = gettext("Write only the sum of all arguments"))]
+    #[arg(short, long, conflicts_with = "all",
+          help = gettext("Write only the sum of all arguments"))]
     sum: bool,
 
     #[arg(short = 'x', long, help = gettext("When evaluating file sizes, evaluate only those files that have the same device as the file specified by the file operand"))]
@@ -53,11 +70,13 @@ struct Node {
     total_blocks: u64,
 }
 
-fn du_impl(args: &Args, filename: &str) -> bool {
-    let terminate = RefCell::new(false);
+fn du_impl(args: &Args, filename: &str, seen: &RefCell<HashSet<(u64, u64)>>) -> bool {
+    // Records whether any entry/traversal error occurred (for the exit status). A per-file error is
+    // reported and the walk continues (POSIX du CONSEQUENCES OF ERRORS = Default).
+    let had_error = RefCell::new(false);
     let stack: RefCell<LinkedList<Node>> = RefCell::new(LinkedList::new());
-    // Track seen (dev, ino) pairs for hard link deduplication
-    let seen: RefCell<HashSet<(u64, u64)>> = RefCell::new(HashSet::new());
+    // `seen` (dev, ino) pairs for hard-link dedup are shared across operands (#DU3) so a file
+    // appearing under two operands is counted once.
     // Track initial device for -x option
     let initial_dev: RefCell<Option<u64>> = RefCell::new(None);
 
@@ -66,10 +85,6 @@ fn du_impl(args: &Args, filename: &str) -> bool {
     ftw::traverse_directory(
         path,
         |entry| {
-            if *terminate.borrow() {
-                return Ok(false);
-            }
-
             let md = entry
                 .metadata()
                 .expect("ftw::traverse_directory yielded an entry without metadata");
@@ -124,10 +139,10 @@ fn du_impl(args: &Args, filename: &str) -> bool {
                 let display_size = size;
                 if is_root {
                     // File operands are always listed
-                    println!("{}\t{}", display_size, entry.path());
+                    du_print(display_size, &entry.path());
                 } else if args.all && !args.sum {
                     // -a: report all files within directories
-                    println!("{}\t{}", display_size, entry.path());
+                    du_print(display_size, &entry.path());
                 }
             }
 
@@ -147,16 +162,16 @@ fn du_impl(args: &Args, filename: &str) -> bool {
                     // -s: report only the total sum for the file operand
                     let entry_path = entry.path();
                     if entry_path.as_inner() == path {
-                        println!("{}\t{}", size, entry_path);
+                        du_print(size, &entry_path);
                     }
                 } else {
-                    println!("{}\t{}", size, entry.path());
+                    du_print(size, &entry.path());
                 }
             }
             Ok(())
         },
         |_entry, error| {
-            *terminate.borrow_mut() = true;
+            *had_error.borrow_mut() = true;
             eprintln!("du: {}", error.inner());
         },
         ftw::TraverseDirectoryOpts {
@@ -166,8 +181,8 @@ fn du_impl(args: &Args, filename: &str) -> bool {
         },
     );
 
-    let failed = *terminate.borrow();
-    !failed
+    let had_error = *had_error.borrow();
+    !had_error
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -183,9 +198,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut exit_code = 0;
 
-    // apply the group to each file
+    // Shared across operands so a hard-linked file under multiple operands is counted once (#DU3).
+    let seen: RefCell<HashSet<(u64, u64)>> = RefCell::new(HashSet::new());
+
     for filename in &args.files {
-        if !du_impl(&args, filename) {
+        if !du_impl(&args, filename, &seen) {
             exit_code = 1;
         }
     }

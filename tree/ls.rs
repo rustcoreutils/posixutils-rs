@@ -15,7 +15,7 @@ use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleC
 use plib::platform::P_WINSIZE_REQUEST_CODE;
 use std::{
     collections::HashMap,
-    ffi::{CString, OsStr},
+    ffi::{CStr, CString, OsStr},
     io,
     mem::MaybeUninit,
     os::unix::{ffi::OsStrExt, fs::MetadataExt},
@@ -23,6 +23,22 @@ use std::{
     process::ExitCode,
     sync::atomic::{AtomicU8, Ordering},
 };
+
+/// Read a symbolic link's target relative to `dir_fd` and return it as a (lossy) string.
+///
+/// Returns `None` on any error: a failed `readlink` of a listed symlink is not fatal for `ls`
+/// (the `-> target` is simply omitted). `readlinkat` does not NUL-terminate, so the buffer is
+/// truncated to the byte count it reports.
+fn read_link_target(dir_fd: libc::c_int, name: &CStr) -> Option<String> {
+    let mut buf = vec![0u8; libc::PATH_MAX as usize];
+    let ret =
+        unsafe { libc::readlinkat(dir_fd, name.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+    if ret < 0 {
+        return None;
+    }
+    buf.truncate(ret as usize);
+    Some(ls_from_utf8_lossy(&buf))
+}
 
 /// ls - list directory contents
 #[derive(Parser)]
@@ -216,8 +232,8 @@ struct Args {
     file: Vec<PathBuf>,
 }
 
-const DATE_TIME_FORMAT_RECENT: &str = "%b %d %H:%M";
-const DATE_TIME_FORMAT_OLD_OR_FUTURE: &str = "%b %d  %Y"; // Two spaces between %d and %Y
+const DATE_TIME_FORMAT_RECENT: &str = "%b %e %H:%M";
+const DATE_TIME_FORMAT_OLD_OR_FUTURE: &str = "%b %e  %Y"; // Two spaces between %e and %Y
 const BLOCK_SIZE: u64 = 512;
 const BLOCK_SIZE_KIBIBYTES: u64 = 1024;
 const COLUMN_SPACING: usize = 2; // How many spaces in the column separator
@@ -277,7 +293,6 @@ struct Config {
     file_time_option: FileTimeOption,
     file_inclusion: FileInclusion,
     inode: bool,
-    kibibytes: bool,
     hide_control_chars: bool,
     reverse_sorting: bool,
     display_size: bool,
@@ -470,8 +485,9 @@ impl Config {
             file_inclusion,
 
             inode: args.inode,
-            kibibytes: args.kibibytes,
-            hide_control_chars: args.hide_control_chars,
+            // -q is also the default when standard output is a terminal (POSIX permits this).
+            hide_control_chars: args.hide_control_chars
+                || unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 },
             reverse_sorting: args.reverse_sorting,
             display_size: args.display_size,
             recursive: args.recursive,
@@ -661,16 +677,9 @@ fn display_entries(entries: &mut [Entry], config: &Config, dir_path: Option<&str
             total_block_size += BLOCK_SIZE * entry.blocks();
         }
 
-        // The specification seems contradictory here. On the -s flag
-        // it says it is implementation-defined. But on the STDOUT
-        // section, it mandates it to be 512 when -k is not specified
-        // and 1024 when it is.
-        // coreutils seems to always have it as 1024 with or without -k.
-        if config.kibibytes {
-            total_block_size /= BLOCK_SIZE_KIBIBYTES;
-        } else {
-            total_block_size /= BLOCK_SIZE;
-        }
+        // The block size for -s and the total is implementation-defined without -k; we default to
+        // 1024-byte units (matching coreutils) so -k is the same as the default (#LS13).
+        total_block_size /= BLOCK_SIZE_KIBIBYTES;
         println!("{} {}", gettext("total"), total_block_size);
     }
 
@@ -896,26 +905,8 @@ fn ls(paths: Vec<PathBuf>, config: &Config) -> io::Result<u8> {
             let mut target_path = None;
             if metadata.is_symlink() && !dereference_symlink {
                 if let OutputFormat::Long(_) = &config.output_format {
-                    let mut buf = vec![0u8; libc::PATH_MAX as usize];
-
                     let path_cstr = CString::new(path.as_os_str().as_bytes()).unwrap();
-                    let ret = unsafe {
-                        libc::readlinkat(
-                            libc::AT_FDCWD,
-                            path_cstr.as_ptr(),
-                            buf.as_mut_ptr().cast(),
-                            buf.len(),
-                        )
-                    };
-                    if ret < 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    let num_bytes = ret as usize;
-                    buf.shrink_to(num_bytes);
-
-                    let target_path_cstr = CString::from_vec_with_nul(buf).unwrap();
-
-                    target_path = Some(ls_from_utf8_lossy(target_path_cstr.to_bytes()));
+                    target_path = read_link_target(libc::AT_FDCWD, &path_cstr);
                 }
             }
 
@@ -927,6 +918,7 @@ fn ls(paths: Vec<PathBuf>, config: &Config) -> io::Result<u8> {
             path.as_os_str().to_os_string(),
             &metadata,
             config,
+            &path,
         ) {
             Ok(x) => x,
             Err(e) => {
@@ -1106,17 +1098,26 @@ fn process_single_dir(
                     let mut target_path = None;
                     if metadata.is_symlink() && !dereference_symlink {
                         if let OutputFormat::Long(_) = &config.output_format {
-                            target_path = Some(ls_from_utf8_lossy(
-                                dir_entry.read_link().unwrap().to_bytes(),
-                            ));
+                            // Prefer ftw's cached readlink; fall back to an explicit readlinkat
+                            // (it can be `None` for symlinks discovered during directory traversal).
+                            target_path = match dir_entry.read_link() {
+                                Some(link) => Some(ls_from_utf8_lossy(link.to_bytes())),
+                                None => read_link_target(dir_entry.dir_fd(), dir_entry.file_name()),
+                            };
                         }
                     }
 
                     target_path
                 };
 
-                let entry = Entry::new(target_path, file_name_raw, metadata, config)
-                    .map_err(|e| io::Error::other(format!("'{path_str}': {e}")))?;
+                let entry = Entry::new(
+                    target_path,
+                    file_name_raw,
+                    metadata,
+                    config,
+                    path.as_inner(),
+                )
+                .map_err(|e| io::Error::other(format!("'{path_str}': {e}")))?;
 
                 let mut include_entry = false;
 

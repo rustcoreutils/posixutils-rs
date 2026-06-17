@@ -32,6 +32,12 @@ pub struct CopyConfig {
     pub interactive: bool,
     pub preserve: bool,
     pub recursive: bool,
+    /// Diagnostic prefix (`"cp"` or `"mv"`) for messages emitted directly by the copy engine.
+    pub prog: &'static str,
+    /// When `true` (cp), a per-file failure is reported and the walk continues with same-level and
+    /// ancestor entries (POSIX cp CONSEQUENCES OF ERRORS, 90829-90832). When `false` (mv), the
+    /// first structural error stops the duplication so the source is not removed.
+    pub continue_on_error: bool,
 }
 
 enum CopyResult {
@@ -427,6 +433,9 @@ where
     let target_dir_path = RefCell::new(PathBuf::new());
     let terminate = RefCell::new(false);
     let last_error = RefCell::new(None);
+    // In `continue_on_error` (cp) mode each diagnostic is emitted immediately and this flag records
+    // that the final exit status must be non-zero (without a returned message to re-print).
+    let had_error = RefCell::new(false);
 
     let _ = traverse_directory(
         source_arg,
@@ -475,8 +484,14 @@ where
                     }
                     // else failed
                     else {
-                        *last_error.borrow_mut() = Some(io::Error::last_os_error());
-                        *terminate_borrowed = true;
+                        let e = io::Error::last_os_error();
+                        if cfg.continue_on_error {
+                            eprintln!("{}: {}", cfg.prog, error_string(&e));
+                            *had_error.borrow_mut() = true;
+                        } else {
+                            *last_error.borrow_mut() = Some(e);
+                            *terminate_borrowed = true;
+                        }
                         return Ok(false);
                     }
                 }
@@ -524,8 +539,14 @@ where
                                         target.display(),
                                         error_string(&e)
                                     );
-                                    *last_error.borrow_mut() = Some(io::Error::other(err_str));
-                                    *terminate_borrowed = true;
+                                    let e = io::Error::other(err_str);
+                                    if cfg.continue_on_error {
+                                        eprintln!("{}: {}", cfg.prog, error_string(&e));
+                                        *had_error.borrow_mut() = true;
+                                    } else {
+                                        *last_error.borrow_mut() = Some(e);
+                                        *terminate_borrowed = true;
+                                    }
                                     return Ok(false);
                                 }
                             };
@@ -545,12 +566,16 @@ where
                                     target_dirfd.as_raw_fd(),
                                     target_filename_cstr.as_ptr(),
                                 ) {
-                                    *last_error.borrow_mut() = Some(e);
-                                    *terminate_borrowed = true;
-                                    false
-                                } else {
-                                    true
+                                    // A characteristics-duplication failure is never fatal: cp
+                                    // reports it and sets a non-zero exit status; mv reports it but
+                                    // must NOT modify its exit status (108114-108115) and still
+                                    // completes the move.
+                                    eprintln!("{}: {}", cfg.prog, error_string(&e));
+                                    if cfg.continue_on_error {
+                                        *had_error.borrow_mut() = true;
+                                    }
                                 }
+                                true
                             } else {
                                 true
                             }
@@ -559,8 +584,13 @@ where
                     }
                 }
                 Err(e) => {
-                    *last_error.borrow_mut() = Some(e);
-                    *terminate_borrowed = true;
+                    if cfg.continue_on_error {
+                        eprintln!("{}: {}", cfg.prog, error_string(&e));
+                        *had_error.borrow_mut() = true;
+                    } else {
+                        *last_error.borrow_mut() = Some(e);
+                        *terminate_borrowed = true;
+                    }
                     false
                 }
             };
@@ -568,7 +598,6 @@ where
             Ok(continue_processing)
         },
         |source| {
-            let mut terminate_borrowed = terminate.borrow_mut();
             let mut target_dirfd_stack_borrowed = target_dirfd_stack.borrow_mut();
             let mut target_dir_path_borrowed = target_dir_path.borrow_mut();
 
@@ -593,16 +622,25 @@ where
                     target_dirfd.as_raw_fd(),
                     target_filename_cstr.as_ptr(),
                 ) {
-                    *last_error.borrow_mut() = Some(e);
-                    *terminate_borrowed = true;
+                    // Same policy as the file case: never fatal, exit-status only for cp.
+                    eprintln!("{}: {}", cfg.prog, error_string(&e));
+                    if cfg.continue_on_error {
+                        *had_error.borrow_mut() = true;
+                    }
                 }
             }
 
             Ok(())
         },
         |_entry, error| {
-            *last_error.borrow_mut() = Some(error.inner());
-            *terminate.borrow_mut() = true;
+            let e = error.inner();
+            if cfg.continue_on_error {
+                eprintln!("{}: {}", cfg.prog, error_string(&e));
+                *had_error.borrow_mut() = true;
+            } else {
+                *last_error.borrow_mut() = Some(e);
+                *terminate.borrow_mut() = true;
+            }
         },
         ftw::TraverseDirectoryOpts {
             follow_symlinks_on_args: cfg.follow_cli,
@@ -613,6 +651,10 @@ where
 
     match last_error.into_inner() {
         Some(e) => Err(e),
+        // In `continue_on_error` mode every diagnostic was already written to stderr; signal
+        // failure with an empty-message error so the caller sets a non-zero status without
+        // re-printing.
+        None if had_error.into_inner() => Err(io::Error::other(String::new())),
         None => Ok(()),
     }
 }
@@ -669,7 +711,12 @@ where
         ) {
             Ok(_) => (),
             Err(e) => {
-                eprintln!("cp: {}", error_string(&e));
+                // `copy_file` emits its own per-file diagnostics in continue-on-error mode and then
+                // returns an empty-message marker; only print here if a message is actually carried.
+                let s = error_string(&e);
+                if !s.is_empty() {
+                    eprintln!("cp: {s}");
+                }
                 result = None;
             }
         }

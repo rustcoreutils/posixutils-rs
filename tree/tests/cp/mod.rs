@@ -1106,3 +1106,44 @@ fn test_cp_multi_source_nondir_target() {
 
     fs::remove_dir_all(test_dir).unwrap();
 }
+
+// Audit #C3: a per-file failure during `cp -R` must not abort the whole copy — same-level and
+// ancestor entries are still copied (POSIX cp 90829-90832). One unreadable file among several
+// readable siblings: all readable siblings must still be copied (regardless of readdir order),
+// and the exit status is non-zero.
+#[test]
+fn test_cp_recursive_continue_on_error() {
+    let test_dir = &format!(
+        "{}/test_cp_recursive_continue_on_error",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let src = &format!("{test_dir}/src");
+    let dst = &format!("{test_dir}/dst");
+    let u = &format!("{src}/u"); // unreadable
+
+    fs::create_dir(test_dir).unwrap();
+    fs::create_dir(src).unwrap();
+    for name in ["a", "b", "c"] {
+        fs::write(format!("{src}/{name}"), name.as_bytes()).unwrap();
+    }
+    fs::File::create(u).unwrap();
+    fs::set_permissions(u, fs::Permissions::from_mode(0o0)).unwrap();
+
+    cp_test(
+        &["-R", src, dst],
+        "",
+        &format!("cp: cannot open '{u}' for reading: Permission denied\n"),
+        1,
+    );
+
+    // The readable siblings were copied despite the failure.
+    for name in ["a", "b", "c"] {
+        assert!(
+            Path::new(&format!("{dst}/{name}")).exists(),
+            "{name} should have been copied"
+        );
+    }
+
+    fs::set_permissions(u, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::remove_dir_all(test_dir).unwrap();
+}

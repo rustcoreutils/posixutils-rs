@@ -79,6 +79,9 @@ fn copy_hierarchy(
         interactive: cfg.interactive,
         preserve: true,  // Always copy file attributes
         recursive: true, // Recursively copy
+        prog: "mv",
+        // mv must stop the duplication on the first structural error so the source is not removed.
+        continue_on_error: false,
     };
 
     copy_file(

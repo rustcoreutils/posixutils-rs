@@ -86,6 +86,9 @@ impl CopyConfig {
             interactive: args.interactive,
             preserve: args.preserve,
             recursive: args.recursive,
+            prog: "cp",
+            // POSIX cp continues with same-level/ancestor files after a per-file failure.
+            continue_on_error: true,
         }
     }
 }
@@ -160,7 +163,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ) {
             Ok(_) => Ok(()),
             Err(e) => {
-                eprintln!("cp: {}", error_string(&e));
+                // `copy_file` already emitted its per-file diagnostics (empty-message marker).
+                let s = error_string(&e);
+                if !s.is_empty() {
+                    eprintln!("cp: {s}");
+                }
                 std::process::exit(1);
             }
         }

@@ -10,8 +10,8 @@ The `print/` crate ships a single POSIX utility, **`lp`**. (POSIX `pr` and
 
 ## `lp`
 
-**Implementation:** `print/lp.rs` (243 lines)
-**Tests:** `print/tests/lp/mod.rs` (567 lines, 16 `#[test]`s)
+**Implementation:** `print/lp.rs` (originally 243 lines; 460 after remediation)
+**Tests:** `print/tests/lp/mod.rs` (originally 16 `#[test]`s; 22 after remediation)
 **Spec:** POSIX.1-2024 (IEEE Std 1003.1-2024), Vol. 3 §3, pp. 3121–3125
 **Reference slice:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/lp.md`
 **Date:** 2026-06-17

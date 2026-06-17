@@ -301,6 +301,9 @@ fn send_mail(recipient: &str, subject: &str, body: &str) -> bool {
     let mut child = match Command::new(sendmail)
         .args(["-t", "-oi"])
         .stdin(Stdio::piped())
+        // Silence MTA diagnostics so they don't leak into lp's stderr.
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
     {
         Ok(c) => c,

@@ -143,76 +143,71 @@ fn get_comment_field(entry: &Utmpx) -> String {
     }
 }
 
-fn print_fmt_short(args: &Args, entry: &Utmpx, line: &str) {
-    if args.idle_time {
-        let comment = get_comment_field(entry);
-
-        if comment.is_empty() {
-            println!(
-                "{:<16} {:<12} {} {} {:>5}",
-                entry.user,
-                line,
-                fmt_timestamp(entry.timestamp),
-                get_idle_time(line),
-                entry.pid
-            );
-        } else {
-            println!(
-                "{:<16} {:<12} {} {} {:>5} {}",
-                entry.user,
-                line,
-                fmt_timestamp(entry.timestamp),
-                get_idle_time(line),
-                entry.pid,
-                comment
-            );
-        }
+// The <name> field: POSIX requires the literal "LOGIN" for login-process
+// entries (the lines on which the system waits for someone to log in) (#W2).
+fn display_name(typ: libc::c_short, user: &str) -> &str {
+    if typ == platform::LOGIN_PROCESS {
+        "LOGIN"
     } else {
-        println!(
-            "{:<16} {:<12} {}",
-            entry.user,
-            line,
-            fmt_timestamp(entry.timestamp)
-        );
+        user
     }
+}
+
+// The <exit> field: POSIX requires it for dead processes, carrying the
+// termination and exit values of the expired process (#W1). None for other
+// entry types or on platforms without ut_exit (macOS).
+fn exit_field(typ: libc::c_short, exit_status: Option<(i16, i16)>) -> Option<String> {
+    if typ == platform::DEAD_PROCESS {
+        exit_status.map(|(term, exit)| format!("term={} exit={}", term, exit))
+    } else {
+        None
+    }
+}
+
+fn print_fmt_short(args: &Args, entry: &Utmpx, line: &str) {
+    let mut out = format!(
+        "{:<16} {:<12} {}",
+        display_name(entry.typ, &entry.user),
+        line,
+        fmt_timestamp(entry.timestamp)
+    );
+    if args.idle_time {
+        out.push_str(&format!(" {} {:>5}", get_idle_time(line), entry.pid));
+        let comment = get_comment_field(entry);
+        if !comment.is_empty() {
+            out.push(' ');
+            out.push_str(&comment);
+        }
+    }
+    if let Some(exit) = exit_field(entry.typ, entry.exit_status) {
+        out.push(' ');
+        out.push_str(&exit);
+    }
+    println!("{}", out);
 }
 
 fn print_fmt_term(args: &Args, entry: &Utmpx, line: &str) {
     let term_state = get_terminal_state(line);
+    let mut out = format!(
+        "{:<16} {} {:<12} {}",
+        display_name(entry.typ, &entry.user),
+        term_state,
+        line,
+        fmt_timestamp(entry.timestamp)
+    );
     if args.idle_time {
+        out.push_str(&format!(" {} {:>5}", get_idle_time(line), entry.pid));
         let comment = get_comment_field(entry);
-
-        if comment.is_empty() {
-            println!(
-                "{:<16} {} {:<12} {} {} {:>5}",
-                entry.user,
-                term_state,
-                line,
-                fmt_timestamp(entry.timestamp),
-                get_idle_time(line),
-                entry.pid
-            );
-        } else {
-            println!(
-                "{:<16} {} {:<12} {} {} {:>5} {}",
-                entry.user,
-                term_state,
-                line,
-                fmt_timestamp(entry.timestamp),
-                get_idle_time(line),
-                entry.pid,
-                comment
-            );
+        if !comment.is_empty() {
+            out.push(' ');
+            out.push_str(&comment);
         }
-    } else {
-        println!(
-            "{:<16} {} {:<12} {}",
-            entry.user,
-            term_state,
-            line,
-            fmt_timestamp(entry.timestamp)
-        );
     }
+    if let Some(exit) = exit_field(entry.typ, entry.exit_status) {
+        out.push(' ');
+        out.push_str(&exit);
+    }
+    println!("{}", out);
 }
 
 fn current_terminal() -> Option<String> {
@@ -377,4 +372,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -l entries display the literal name "LOGIN" (#W2).
+    #[test]
+    fn login_process_name_is_login() {
+        assert_eq!(display_name(platform::LOGIN_PROCESS, "whatever"), "LOGIN");
+        assert_eq!(display_name(platform::USER_PROCESS, "alice"), "alice");
+        assert_eq!(display_name(platform::DEAD_PROCESS, "bob"), "bob");
+    }
+
+    // -d dead processes carry an <exit> field; other types do not (#W1).
+    #[test]
+    fn dead_process_exit_field() {
+        assert_eq!(
+            exit_field(platform::DEAD_PROCESS, Some((9, 0))),
+            Some("term=9 exit=0".to_string())
+        );
+        assert_eq!(exit_field(platform::DEAD_PROCESS, None), None);
+        assert_eq!(exit_field(platform::USER_PROCESS, Some((0, 0))), None);
+    }
 }

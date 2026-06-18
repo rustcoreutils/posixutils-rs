@@ -20,6 +20,10 @@ pub struct Utmpx {
     pub typ: libc::c_short,
     pub timestamp: libc::time_t,
     pub host: String,
+    /// Process termination and exit status `(e_termination, e_exit)`, meaningful
+    /// for `DEAD_PROCESS` entries (used by `who -d`). `None` on platforms whose
+    /// `utmpx` has no `ut_exit` member (macOS).
+    pub exit_status: Option<(i16, i16)>,
 }
 
 pub fn ut_type_str(typ: libc::c_short) -> &'static str {
@@ -65,6 +69,12 @@ fn load_entries() -> Vec<Utmpx> {
                 .to_string_lossy()
                 .into_owned();
 
+            // ut_exit exists on glibc/musl but not on macOS's utmpx.
+            #[cfg(not(target_os = "macos"))]
+            let exit_status = Some((utx.ut_exit.e_termination as i16, utx.ut_exit.e_exit as i16));
+            #[cfg(target_os = "macos")]
+            let exit_status = None;
+
             // Add the utx to the returned list of entries
             entries.push(Utmpx {
                 user,
@@ -74,6 +84,7 @@ fn load_entries() -> Vec<Utmpx> {
                 typ,
                 timestamp: timestamp as libc::time_t,
                 host,
+                exit_status,
             });
 
             utxent = getutxent(); // Move to the next utx entry

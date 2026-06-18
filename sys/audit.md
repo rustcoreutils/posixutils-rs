@@ -403,9 +403,9 @@ extra operands beyond `file` are silently ignored rather than diagnosed.
 
 #### Major
 
-- [ ] **#W1 — `-d` `<exit>` field never emitted.** `plib/src/utmpx.rs:15-23` (struct has no exit field) + `sys/who.rs:247` (filters `DEAD_PROCESS` but prints no exit). Spec 122908–122910 requires the termination/exit values column for dead processes. Fix: add `exit_status: Option<(i16,i16)>` to `Utmpx`, populate from `ut_exit.e_termination`/`e_exit`, print for `DEAD_PROCESS`.
-- [ ] **#W2 — `-l` does not print the literal `LOGIN` as `<name>`.** `sys/who.rs:248` + print functions (`who.rs:146,171`). Spec 122912–122914 mandates the name field be `LOGIN` for login lines; the code prints `entry.user` (record-dependent). Fix: substitute `"LOGIN"` when `typ == LOGIN_PROCESS`.
-- [ ] **#W3 — Extra operands beyond `file` silently ignored.** `sys/who.rs:64-65` (clap `file: Option<PathBuf>`). XBD 12.2 expects a diagnostic for extraneous operands; the only legal multi-token form is `who am i`. Fix: validate operand count (allow exactly the `am i`/`am I` pair or a single `file`).
+- [x] **#W1 — `-d` `<exit>` field never emitted.** `plib/src/utmpx.rs:15-23` (struct had no exit field) + `sys/who.rs:247`. Spec 122908–122910 requires the termination/exit values column for dead processes. ✓ **fixed in Phase 8** — added `Utmpx.exit_status: Option<(i16,i16)>` populated from `ut_exit.e_termination`/`.e_exit` (`#[cfg(not(macos))]`; `None` on macOS, which lacks `ut_exit`); `who` emits a `term=<t> exit=<e>` field for `DEAD_PROCESS`. Unit test `dead_process_exit_field`.
+- [x] **#W2 — `-l` does not print the literal `LOGIN` as `<name>`.** `sys/who.rs:248` + print functions. Spec 122912–122914 mandates the name field be `LOGIN` for login lines; the code printed `entry.user`. ✓ **fixed in Phase 8** — `display_name()` substitutes `"LOGIN"` when `typ == LOGIN_PROCESS`. Unit test `login_process_name_is_login`.
+- [x] ~~**#W3 — Extra operands beyond `file` silently ignored.**~~ **Refuted (Phase 8).** Behaviorally tested: `who foo bar baz` already exits **2** with clap's `error: unexpected argument 'bar'` — the single `file: Option<PathBuf>` positional rejects a second operand. The `who am i`/`am I` form is intercepted before clap. No code change needed.
 
 #### Minor
 
@@ -422,9 +422,9 @@ extra operands beyond `file` are silently ignored rather than diagnosed.
 |---|---|---|
 | `-a` | PARTIAL | expands to sub-flags — `who.rs:359-371`. |
 | `-b` | CONFORMS | "system boot" — `who.rs:245,262`. |
-| `-d` | MISSING `<exit>` | (#W1) `who.rs:247`. |
+| `-d` | CONFORMS | `<exit>` field `term=N exit=M` (#W1 ✓ Phase 8). |
 | `-H` | CONFORMS | localized headings — `who.rs:274-313`. |
-| `-l` | PARTIAL | name not forced to `LOGIN` (#W2) — `who.rs:248`. |
+| `-l` | CONFORMS | name forced to `LOGIN` (#W2 ✓ Phase 8). |
 | `-m` / `am i` | CONFORMS | `who.rs:230-242, 349-354`. |
 | `-p` / `-r` / `-t` | CONFORMS | `who.rs:250,249,251-252`. |
 | `-q` | CONFORMS | names + `# users=N` — `who.rs:326-341`. |
@@ -434,7 +434,7 @@ extra operands beyond `file` are silently ignored rather than diagnosed.
 
 #### Operands / STDIN / input files (utmpx)
 - [x] `am i`/`am I` → `-m`; `file` operand via `utmpxname` — `who.rs:349-354,317`. CONFORMS.
-- [ ] **Extra operands not diagnosed** (#W3).
+- [x] **Extra operands diagnosed** (#W3 refuted — clap exits 2 on a second operand).
 - [x] Default db path via libc (`/var/run/utmp` Linux, `/var/run/utmpx` macOS). CONFORMS (portable; macOS db may be sparse at runtime — data issue, not a bug).
 
 #### Environment variables
@@ -444,7 +444,7 @@ extra operands beyond `file` are silently ignored rather than diagnosed.
 
 #### STDOUT / STDERR / exit status
 - [x] Default/`-T`/`-q`/`-b`/`-H` formats — `who.rs:171,209,326-341,262,274-313`. CONFORMS.
-- [ ] **`-d` `<exit>`** (#W1); **`-l` LOGIN** (#W2).
+- [x] **`-d` `<exit>`** (#W1 ✓ Phase 8); **`-l` LOGIN** (#W2 ✓ Phase 8).
 - [x] 0 / non-zero via `?`. CONFORMS.
 
 #### Cross-cutting / portability
@@ -453,7 +453,7 @@ extra operands beyond `file` are silently ignored rather than diagnosed.
 ### Test coverage signal
 
 Most tests check exit code only. Not covered:
-- [ ] `-d` exit field (#W1), `-l` name=`LOGIN` (#W2), `-T` state chars, `-b` "system boot" content, extra-operand rejection (#W3).
+- [x] `-d` exit field (#W1) + `-l` name=`LOGIN` (#W2) — unit tests (Phase 8); extra-operand rejection (#W3 — behavioral, exit 2). [ ] `-T` state chars, `-b` "system boot" content.
 
 ---
 

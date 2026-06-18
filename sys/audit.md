@@ -193,12 +193,12 @@ with exit 0 instead of a diagnostic.
 
 #### Critical
 
-- [ ] **#IS1 — `/proc/sysvipc/*` mode field parsed as decimal, but the kernel writes it in octal.** `sys/ipcs.rs:228, 262, 296` (the `perms: fields[2].parse().unwrap_or(0)` sites for msg/shm/sem). The Linux kernel's `*_proc_show` routines print the `ipc_perm.mode` field with `%4o`. Parsing `"644"` as decimal yields `644` (`0o1204`), so `format_mode` (`ipcs.rs:118-138`) reads the wrong bits and the MODE column is incorrect on every run. Fix: `u16::from_str_radix(fields[2], 8)`.
+- [x] **#IS1 — `/proc/sysvipc/*` mode field parsed as decimal, but the kernel writes it in octal.** `sys/ipcs.rs:228, 262, 296` (the `perms: fields[2].parse().unwrap_or(0)` sites for msg/shm/sem). The Linux kernel's `*_proc_show` routines print the `ipc_perm.mode` field with `%4o`. Parsing `"644"` as decimal yields `644` (`0o1204`), so `format_mode` (`ipcs.rs:118-138`) reads the wrong bits and the MODE column is incorrect on every run. Fix: `u16::from_str_radix(fields[2], 8)`. ✓ **fixed in Phase 1** — all three `read_proc_*` sites now parse base 8; behaviorally verified against `/usr/bin/ipcs` (0640→`-rw-r-----`, 0600→`-rw-------`, 0644→`-rw-r--r--`); unit test `proc_mode_field_is_octal`.
 
 #### Major
 
 - [ ] **#IS2 — Message-queue `QBYTES` always prints `-`.** `sys/ipcs.rs:548-550` (acknowledged in a code comment). `q_qbytes` is not in `/proc/sysvipc/msg`; obtaining it needs `msgctl(msqid, IPC_STAT, &buf)`. Spec (the `-b` column for message queues) requires the value. Fix: call `msgctl(IPC_STAT)` per entry.
-- [ ] **#IS3 — MODE status flags never set.** `sys/ipcs.rs:118-123` (`c1`/`c2` hard-coded `-`; `_waiting_send`/`_waiting_recv` params ignored). Spec 100916–100940: position 1 = `S` (process waiting on `msgsnd`) / position 2 = `R` (`msgrcv`); for shm, `C` when the segment is marked for removal (`SHM_DEST`). All are always `-`. Fix: derive `S`/`R` from queue wait state and `C` from the `SHM_DEST` bit.
+- [x] **#IS3 — MODE status flags never set + wrong char count.** `sys/ipcs.rs:118-123` (`c1`/`c2` hard-coded `-`). ✓ **fixed in Phase 1.** Re-reading the spec (IEEE Std 1003.1-2024, ipcs MODE column 100916–100940) corrected the finding: POSIX mandates **11** characters — a single leading flag char (`C` if a shared memory segment is marked for clearing/`SHM_DEST`, else `-`), then 9 permission chars, then 1 ACL char. There is **no** `S`/`R` msgsnd/msgrcv flag in POSIX.1-2024 (that is a historical SysV-ism), and there is no `/proc` data source for waiters anyway. The old code emitted **12** chars (two bogus `-` flags) — itself a divergence. `format_mode` now returns the 11-char form and sets the `C` flag from `SHM_DEST`; unit tests `mode_string_is_eleven_chars_and_decodes_perms` + `shm_dest_sets_c_flag`.
 - [ ] **#IS4 — `-t` time column zero-pads the hour; spec format is `%d:%2.2d:%2.2d`.** `sys/ipcs.rs:165`. Uses `%H:%M:%S` (e.g. `09:30:00`); spec 100... mandates an unpadded hour (`9:30:00`). Fix: use `%-H:%M:%S` (or hand-format the hour).
 - [ ] **#IS5 — `/proc` read errors silently swallowed; "facility not in system" never emitted on Linux for shm/sem.** `sys/ipcs.rs:500, 579, 653` (`.unwrap_or_default()`). If a facility is compiled out (file missing) or unreadable (EACCES), the code emits a header with no rows and exits 0, instead of `"%s facility not in system.\n"` (spec 100887) or a stderr diagnostic + non-zero exit. Fix: branch on the `Err` from `read_proc_*`; emit the not-in-system line for missing facilities and a diagnostic for hard errors.
 
@@ -222,7 +222,7 @@ with exit 0 instead of a diagnostic.
 #### STDOUT / STDERR
 - [x] Title line `IPC status from <source> as of <date>` — `ipcs.rs:719`. CONFORMS.
 - [x] Facility order msg→shm→sem; `T`/`KEY`/OWNER/GROUP columns — `ipcs.rs:721-731`, truncation `ipcs.rs:98`. CONFORMS.
-- [ ] **MODE octal-parse bug** (#IS1); **QBYTES `-`** (#IS2); **MODE flags `--`** (#IS3); **shm/sem "not in system" missing** (#IS5).
+- [x] **MODE octal-parse bug** (#IS1 ✓ Phase 1); **MODE flags / 11-char form** (#IS3 ✓ Phase 1). **QBYTES `-`** (#IS2); **shm/sem "not in system" missing** (#IS5).
 - [ ] **Errors swallowed instead of stderr** (#IS5).
 
 #### Exit status / consequences of errors
@@ -234,7 +234,7 @@ with exit 0 instead of a diagnostic.
 ### Test coverage signal
 
 Tests are structural smoke tests. Not covered:
-- [ ] MODE string correctness (#IS1, #IS3).
+- [x] MODE string correctness (#IS1, #IS3) — unit tests + behavioral cross-check (Phase 1).
 - [ ] QBYTES value (#IS2).
 - [ ] `-t` hour format (#IS4).
 - [ ] facility-not-in-system path (#IS5).

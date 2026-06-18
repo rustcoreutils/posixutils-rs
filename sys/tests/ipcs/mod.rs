@@ -596,9 +596,8 @@ mod ipc_resource_tests {
                     continue;
                 }
                 if line.contains(&shm_id.to_string()) {
-                    // Mode string should be 11 characters matching pattern
-                    // [S-][RC-][rwa][rwa][rwa]
-                    // Look for a pattern like "--rw-rw----" or similar
+                    // POSIX MODE column is 11 chars: [C-] + rwa rwa rwa + ACL space
+                    // (single SHM_DEST flag char, not the historical [S-][RC-] pair).
                     let has_mode = line.contains("rw") || line.contains("r-");
                     assert!(
                         has_mode,

@@ -102,28 +102,35 @@ fn truncate_to_chars(s: &str, max_chars: usize) -> &str {
     }
 }
 
-/// Format permission mode as 12-character string per POSIX
-/// Format: [S-][RC-][rwa][rwa][rwa][ACL]
-/// - First char: S if process waiting on msgsnd, else -
-/// - Second char: R if process waiting on msgrcv, C if shm marked for removal, else -
-/// - Chars 3-5: owner permissions (r/w/a)
-/// - Chars 6-8: group permissions (r/w/a)
-/// - Chars 9-11: other permissions (r/w/a)
-/// - Char 12: space if no alternate access control, other printable char if ACL present
+/// SHM_DEST: shared memory segment marked to be destroyed when the last
+/// process detaches. Stored in the upper bits of the IPC mode field on both
+/// Linux (visible via /proc/sysvipc) and macOS (shm_perm.mode).
+const SHM_DEST: u16 = 0o1000;
+
+/// Format the access mode and flags as the 11-character string POSIX mandates
+/// (IEEE Std 1003.1-2024, ipcs STDOUT, MODE column):
+///   `[C-]` `rwa rwa rwa` `[ ]`
+/// - Char 1: `C` if this is a shared memory segment marked for clearing
+///   (SHM_DEST), otherwise `-`.
+/// - Chars 2-10: three sets of three bits (owner, group, others); within each
+///   set: read (`r`), write/alter (`a`), nothing (`-`).
+/// - Char 11: alternate/additional access-control indicator; a single <space>
+///   when none is associated with the facility.
 ///
 /// IPC permission bits map to file permission bits:
 /// - read (r): 0400/040/004
-/// - write (w): 0200/020/002
-/// - alter (a): 0100/010/001 (execute equivalent for IPC)
-fn format_mode(mode: u16, facility: char, _waiting_send: bool, _waiting_recv: bool) -> String {
-    // First two special characters
-    let c1 = '-'; // We don't have waiting info in current implementation
-    let c2 = match facility {
-        'm' => '-', // Could be 'C' for SHM_DEST (shm marked for removal)
-        _ => '-',
+/// - write/alter (a): 0200/020/002
+/// - (the execute bits 0100/010/001 are not meaningful for IPC objects)
+fn format_mode(mode: u16, facility: char) -> String {
+    // First character: C for a shared memory segment pending destruction.
+    let clear = if facility == 'm' && (mode & SHM_DEST) != 0 {
+        'C'
+    } else {
+        '-'
     };
 
-    // Permission bits: read (r), write (w), alter (a)
+    // Permission bits: read (r), write/alter (a). The first bit of each triad
+    // is read; the second is write/alter.
     let owner_r = if mode & 0o400 != 0 { 'r' } else { '-' };
     let owner_w = if mode & 0o200 != 0 { 'w' } else { '-' };
     let owner_a = if mode & 0o100 != 0 { 'a' } else { '-' };
@@ -136,23 +143,12 @@ fn format_mode(mode: u16, facility: char, _waiting_send: bool, _waiting_recv: bo
     let other_w = if mode & 0o002 != 0 { 'w' } else { '-' };
     let other_a = if mode & 0o001 != 0 { 'a' } else { '-' };
 
-    // 12th character: space means no alternate access control method
+    // 11th character: space means no alternate access control method.
     let acl = ' ';
 
     format!(
-        "{}{}{}{}{}{}{}{}{}{}{}{}",
-        c1,
-        c2,
-        owner_r,
-        owner_w,
-        owner_a,
-        group_r,
-        group_w,
-        group_a,
-        other_r,
-        other_w,
-        other_a,
-        acl
+        "{}{}{}{}{}{}{}{}{}{}{}",
+        clear, owner_r, owner_w, owner_a, group_r, group_w, group_a, other_r, other_w, other_a, acl
     )
 }
 
@@ -225,7 +221,9 @@ fn read_proc_msg() -> io::Result<Vec<MsgQueueInfo>> {
             entries.push(MsgQueueInfo {
                 key: fields[0].parse::<i32>().unwrap_or(0),
                 msqid: fields[1].parse().unwrap_or(0),
-                perms: fields[2].parse().unwrap_or(0),
+                // The kernel prints the mode field in /proc/sysvipc in octal
+                // (see Documentation: it uses "%4o"), so parse base 8.
+                perms: u16::from_str_radix(fields[2], 8).unwrap_or(0),
                 cbytes: fields[3].parse().unwrap_or(0),
                 qnum: fields[4].parse().unwrap_or(0),
                 lspid: fields[5].parse().unwrap_or(0),
@@ -259,7 +257,8 @@ fn read_proc_shm() -> io::Result<Vec<ShmInfo>> {
             entries.push(ShmInfo {
                 key: fields[0].parse::<i32>().unwrap_or(0),
                 shmid: fields[1].parse().unwrap_or(0),
-                perms: fields[2].parse().unwrap_or(0),
+                // Octal mode field (see read_proc_msg); includes SHM_DEST when set.
+                perms: u16::from_str_radix(fields[2], 8).unwrap_or(0),
                 size: fields[3].parse().unwrap_or(0),
                 cpid: fields[4].parse().unwrap_or(0),
                 lpid: fields[5].parse().unwrap_or(0),
@@ -293,7 +292,8 @@ fn read_proc_sem() -> io::Result<Vec<SemInfo>> {
             entries.push(SemInfo {
                 key: fields[0].parse::<i32>().unwrap_or(0),
                 semid: fields[1].parse().unwrap_or(0),
-                perms: fields[2].parse().unwrap_or(0),
+                // Octal mode field (see read_proc_msg).
+                perms: u16::from_str_radix(fields[2], 8).unwrap_or(0),
                 nsems: fields[3].parse().unwrap_or(0),
                 uid: fields[4].parse().unwrap_or(0),
                 gid: fields[5].parse().unwrap_or(0),
@@ -520,7 +520,7 @@ fn display_message_queues(_args: &Args) {
         println!("{}:", gettext("Message Queues"));
 
         for entry in entries {
-            let mode_str = format_mode(entry.perms, 'q', false, false);
+            let mode_str = format_mode(entry.perms, 'q');
             let owner = get_username(entry.uid);
             let group = get_groupname(entry.gid);
 
@@ -602,7 +602,7 @@ fn display_shared_memory(args: &Args) {
     println!("{}:", gettext("Shared Memory"));
 
     for entry in entries {
-        let mode_str = format_mode(entry.perms, 'm', false, false);
+        let mode_str = format_mode(entry.perms, 'm');
         let owner = get_username(entry.uid);
         let group = get_groupname(entry.gid);
 
@@ -670,7 +670,7 @@ fn display_semaphores(args: &Args) {
     println!("{}:", gettext("Semaphores"));
 
     for entry in entries {
-        let mode_str = format_mode(entry.perms, 's', false, false);
+        let mode_str = format_mode(entry.perms, 's');
         let owner = get_username(entry.uid);
         let group = get_groupname(entry.gid);
 
@@ -752,4 +752,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     display_ipc_status(&args);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The /proc/sysvipc mode field is printed in octal by the kernel; ipcs must
+    // parse it base 8, not base 10 (regression for audit item #IS1).
+    #[test]
+    fn proc_mode_field_is_octal() {
+        // "640" is octal 0o640 == 416, NOT decimal 640.
+        assert_eq!(u16::from_str_radix("640", 8).unwrap(), 0o640);
+        assert_ne!(u16::from_str_radix("640", 8).unwrap(), 640);
+        // With SHM_DEST set the kernel prints e.g. "1640".
+        assert_eq!(u16::from_str_radix("1640", 8).unwrap(), 0o1640);
+    }
+
+    // The MODE column is exactly 11 characters: [C-] + 9 perm chars + ACL space
+    // (audit item #IS3 + the 11-vs-12 char POSIX conformance correction).
+    #[test]
+    fn mode_string_is_eleven_chars_and_decodes_perms() {
+        // 0o640 = rw-r----- ; not a shm dest, so leading flag is '-'.
+        let s = format_mode(0o640, 'q');
+        assert_eq!(s.chars().count(), 11, "MODE must be 11 chars, got {s:?}");
+        assert_eq!(s, "-rw-r----- ");
+
+        // Full perms 0o777 -> rwarwarwa.
+        assert_eq!(format_mode(0o777, 's'), "-rwarwarwa ");
+        // No perms: leading flag '-', nine '-' perm chars, ACL space.
+        assert_eq!(format_mode(0o000, 'm'), "---------- ");
+    }
+
+    // The 'C' clear-on-detach flag is set only for shared memory with SHM_DEST.
+    #[test]
+    fn shm_dest_sets_c_flag() {
+        // SHM_DEST set on a shared memory segment -> leading 'C'.
+        assert_eq!(format_mode(0o1640, 'm'), "Crw-r----- ");
+        // SHM_DEST bit set but not a shared memory facility -> still '-'.
+        assert_eq!(format_mode(0o1640, 'q'), "-rw-r----- ");
+        // Shared memory without SHM_DEST -> '-'.
+        assert_eq!(format_mode(0o640, 'm'), "-rw-r----- ");
+    }
 }

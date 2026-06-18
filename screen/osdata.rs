@@ -27,9 +27,10 @@ use termios::os::linux::{
 use termios::*;
 
 pub fn load_speeds() -> HashMap<&'static str, speed_t> {
-    HashMap::from([
+    #[allow(unused_mut)] // higher speeds are cfg-gated to non-Apple targets
+    let mut m = HashMap::from([
         ("0", libc::B0),
-        ("54", libc::B50),
+        ("50", libc::B50),
         ("75", libc::B75),
         ("110", libc::B110),
         ("134", libc::B134),
@@ -47,7 +48,16 @@ pub fn load_speeds() -> HashMap<&'static str, speed_t> {
         ("57600", libc::B57600),
         ("115200", libc::B115200),
         ("230400", libc::B230400),
-    ])
+    ]);
+
+    // B460800 / B921600 are not defined on Apple platforms.
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    {
+        m.insert("460800", libc::B460800);
+        m.insert("921600", libc::B921600);
+    }
+
+    m
 }
 
 pub fn load_speeds_rev(map: &HashMap<&'static str, speed_t>) -> HashMap<speed_t, &'static str> {

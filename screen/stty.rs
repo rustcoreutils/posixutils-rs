@@ -54,8 +54,27 @@ struct Args {
     )]
     save: bool,
 
-    #[arg(help = gettext("List of terminal configuration commands"))]
+    #[arg(allow_hyphen_values = true, help = gettext("List of terminal configuration commands"))]
     operands: Vec<String>,
+}
+
+// Render a termios control-character value for display per POSIX STDOUT:
+// "<undef>" if disabled, a "^c" form for control characters, the literal
+// character if printable, else an octal escape for high/non-printable bytes.
+fn cchar_to_str(ch: cc_t, cchar_rev: &HashMap<char, char>) -> String {
+    if ch == 0 {
+        return String::from("<undef>");
+    }
+    if let Some(xlat) = cchar_rev.get(&(ch as char)) {
+        return format!("^{}", xlat);
+    }
+    if ch < 0x20 {
+        return format!("^{}", (ch + 0x40) as char);
+    }
+    if (0x20..0x7f).contains(&ch) {
+        return format!("{}", ch as char);
+    }
+    format!("\\{:03o}", ch)
 }
 
 fn speed_to_str(revspeed: &HashMap<speed_t, &'static str>, speed: speed_t) -> String {
@@ -140,16 +159,7 @@ fn stty_show_short(ti: Termios) -> io::Result<()> {
     let show_cchar = |name: &str, idx: usize, default: u8| -> Option<String> {
         let ch = ti.c_cc[idx];
         if ch != default as cc_t {
-            let ch_str = if ch == 0 {
-                "<undef>".to_string()
-            } else if let Some(xlat) = cchar_rev.get(&(ch as char)) {
-                format!("^{}", xlat)
-            } else if ch < 0x20 {
-                format!("^{}", (ch + 0x40) as char)
-            } else {
-                format!("{}", ch)
-            };
-            Some(format!("{} = {}", name, ch_str))
+            Some(format!("{} = {}", name, cchar_to_str(ch, &cchar_rev)))
         } else {
             None
         }
@@ -241,18 +251,7 @@ fn show_cchars(tty_params: &HashMap<&'static str, ParamType>, ti: &Termios) {
 
     for (name, param) in tty_params {
         if let ParamType::Cchar(_pflg, chidx) = param {
-            let ch = ti.c_cc[*chidx] as char;
-            let ch_rev = cchar_rev.get(&ch);
-            let ch_str = {
-                if ch == '\0' {
-                    String::from("<undef>")
-                } else if let Some(ch_xlat) = ch_rev {
-                    format!("^{}", ch_xlat)
-                } else {
-                    format!("{}", ti.c_cc[*chidx])
-                }
-            };
-
+            let ch_str = cchar_to_str(ti.c_cc[*chidx], &cchar_rev);
             v.push(format!("{} = {}", name, ch_str));
         }
     }
@@ -426,6 +425,19 @@ fn set_ti_cchar_oparg(
         return Ok(true);
     }
 
+    // POSIX: "If string is a single character, the control character shall be
+    // set to that character." (Handles plain values like `stty erase x` or a
+    // literal control byte; the `^c` form below covers the caret notation.)
+    if op_arg.chars().count() == 1 {
+        let ch = op_arg.chars().next().unwrap();
+        let code = ch as u32;
+        if code > 0xff {
+            return Err("control character value out of range");
+        }
+        *cc = code as cc_t;
+        return Ok(true);
+    }
+
     if !op_arg.starts_with("^") || op_arg.len() != 2 {
         return Err("Invalid cchar specification");
     }
@@ -440,6 +452,25 @@ fn set_ti_cchar_oparg(
     Ok(true)
 }
 
+// read the terminal window size (rows/cols) from standard input
+fn get_winsize() -> io::Result<libc::winsize> {
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    let ret = unsafe { libc::ioctl(libc::STDIN_FILENO, libc::TIOCGWINSZ, &mut ws) };
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(ws)
+}
+
+// write the terminal window size (rows/cols) to standard input
+fn set_winsize(ws: &libc::winsize) -> io::Result<()> {
+    let ret = unsafe { libc::ioctl(libc::STDIN_FILENO, libc::TIOCSWINSZ, ws) };
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 fn set_ti_speed(
     ti: &mut Termios,
     speedmap: &HashMap<&str, speed_t>,
@@ -448,7 +479,7 @@ fn set_ti_speed(
 ) -> io::Result<()> {
     let speed_res = speedmap.get(op_arg);
     if speed_res.is_none() {
-        return Err(Error::other("Invalid speed"));
+        return Err(Error::other(gettext("invalid speed")));
     }
     let speed = speed_res.unwrap();
 
@@ -484,8 +515,11 @@ fn stty_set_compact(mut ti: Termios, compact: &str) -> io::Result<()> {
     // split by ':'
     let parts: Vec<&str> = compact.split(":").collect();
 
-    // assert validates _prior_ user input check, guaranteeing this condition
-    assert_eq!(parts[0], HDR_SAVE);
+    // The caller only routes here when the operand starts with HDR_SAVE; reject
+    // a malformed blob with a diagnostic rather than aborting.
+    if parts.first() != Some(&HDR_SAVE) {
+        return Err(Error::other(gettext("invalid saved-settings format")));
+    }
 
     // iterate through strings, assuming they are KEY=VALUE pair strings.
     // skip first entry, our header marker.
@@ -501,11 +535,11 @@ fn stty_set_compact(mut ti: Termios, compact: &str) -> io::Result<()> {
                     pairmap.insert(String::from(key), n);
                 }
                 Err(_e) => {
-                    return Err(Error::other("Invalid ent"));
+                    return Err(Error::other(gettext("invalid saved-settings entry")));
                 }
             },
             None => {
-                return Err(Error::other("Invalid ent"));
+                return Err(Error::other(gettext("invalid saved-settings entry")));
             }
         }
     }
@@ -514,7 +548,7 @@ fn stty_set_compact(mut ti: Termios, compact: &str) -> io::Result<()> {
     let dirty = match merge_map(&mut ti, &pairmap) {
         Ok(d) => d,
         Err(e) => {
-            return Err(Error::other(e));
+            return Err(Error::other(gettext(e)));
         }
     };
 
@@ -639,7 +673,7 @@ fn handle_combination_mode(ti: &mut Termios, operand: &str, negate: bool) -> Opt
 
 // update termio settings based on setting-per-arg parsed values
 fn stty_set_long(mut ti: Termios, args: &Args) -> io::Result<()> {
-    assert!(args.operands.len() > 1);
+    assert!(!args.operands.is_empty());
 
     // load static list of params
     let tty_params = osdata::load_params();
@@ -681,10 +715,47 @@ fn stty_set_long(mut ti: Termios, args: &Args) -> io::Result<()> {
             continue;
         }
 
+        // Terminal window size operands (Issue 8: rows, cols) and the size
+        // informational query. None of these are negatable.
+        if matches!(operand, "rows" | "cols" | "size") {
+            if negate {
+                let errstr = format!("{}: {}", gettext("cannot negate operand"), operand);
+                return Err(Error::other(errstr));
+            }
+            if operand == "size" {
+                let ws = get_winsize()?;
+                println!("{} {}", ws.ws_row, ws.ws_col);
+                idx += 1;
+                continue;
+            }
+            // rows / cols take a numeric argument
+            idx += 1;
+            if idx == args.operands.len() {
+                let errstr = format!("{}: {}", gettext("missing argument for operand"), operand);
+                return Err(Error::other(errstr));
+            }
+            let n: u16 = args.operands[idx].parse().map_err(|_| {
+                Error::other(format!(
+                    "{}: {}",
+                    gettext("invalid numeric value for operand"),
+                    operand
+                ))
+            })?;
+            let mut ws = get_winsize()?;
+            if operand == "rows" {
+                ws.ws_row = n;
+            } else {
+                ws.ws_col = n;
+            }
+            set_winsize(&ws)?;
+            idx += 1;
+            continue;
+        }
+
         // lookup operand in param map
         let param_res = tty_params.get(operand);
         if param_res.is_none() {
-            let errstr = format!("Unknown operand {}", operand);
+            let errstr = format!("{}: {}", gettext("unknown operand"), operand);
             return Err(Error::other(errstr));
         }
         let param = param_res.unwrap();
@@ -700,7 +771,7 @@ fn stty_set_long(mut ti: Termios, args: &Args) -> io::Result<()> {
             ParamType::Ospeed(pflg) => pflg,
         };
         if negate && ((flags & PNEG) == 0) {
-            let errstr = format!("Operand {} cannot be negated", operand);
+            let errstr = format!("{}: {}", gettext("cannot negate operand"), operand);
             return Err(Error::other(errstr));
         }
 
@@ -709,7 +780,7 @@ fn stty_set_long(mut ti: Termios, args: &Args) -> io::Result<()> {
             idx += 1;
 
             if idx == args.operands.len() {
-                let errstr = format!("Missing operand for {}", operand);
+                let errstr = format!("{}: {}", gettext("missing argument for operand"), operand);
                 return Err(Error::other(errstr));
             }
 
@@ -734,7 +805,7 @@ fn stty_set_long(mut ti: Termios, args: &Args) -> io::Result<()> {
                 let dirty_res =
                     set_ti_cchar_oparg(&cchar_xlat, &mut ti.c_cc[*chidx], &op_arg, dirty);
                 if let Err(e) = dirty_res {
-                    return Err(Error::other(e));
+                    return Err(Error::other(gettext(e)));
                 }
 
                 dirty = dirty_res.unwrap();
@@ -749,7 +820,11 @@ fn stty_set_long(mut ti: Termios, args: &Args) -> io::Result<()> {
                         }
                     }
                     Err(_) => {
-                        let errstr = format!("Invalid numeric value for {}", operand);
+                        let errstr = format!(
+                            "{}: {}",
+                            gettext("invalid numeric value for operand"),
+                            operand
+                        );
                         return Err(Error::other(errstr));
                     }
                 }
@@ -783,32 +858,123 @@ fn stty_set(ti: Termios, args: &Args) -> io::Result<()> {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
-
-    let args = Args::parse();
+fn run(args: &Args) -> io::Result<()> {
+    // The SYNOPSIS separates `stty [-a|-g]` from `stty operand...`; operands
+    // alongside -a/-g are a usage error.
+    if (args.all || args.save) && !args.operands.is_empty() {
+        return Err(Error::other(gettext(
+            "operands cannot be combined with -a or -g",
+        )));
+    }
 
     // load termio settings
     let ti = Termios::from_fd(libc::STDIN_FILENO)?;
 
     // display long form readable, if -a
     if args.all {
-        stty_show_long(ti)?;
+        stty_show_long(ti)
 
     // display computer-parseable, if -g
     } else if args.save {
-        stty_show_compact(ti)?;
+        stty_show_compact(ti)
 
     // display short form readable, if no args
     } else if args.operands.is_empty() {
-        stty_show_short(ti)?;
+        stty_show_short(ti)
 
     // otherwise, a list of operands instructing termio updates
     } else {
-        stty_set(ti, &args)?;
+        stty_set(ti, args)
+    }
+}
+
+fn main() -> std::process::ExitCode {
+    setlocale(LocaleCategory::LcAll, "");
+    // Non-fatal: a missing gettext catalog must not prevent stty from running
+    // with untranslated strings (matching plib::diag and the other utilities).
+    let _ = textdomain("posixutils-rs");
+    let _ = bind_textdomain_codeset("posixutils-rs", "UTF-8");
+
+    let args = Args::parse();
+
+    match run(&args) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("stty: {}", e);
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cchar_to_str_undef() {
+        let rev = osdata::reverse_charmap(&osdata::load_cchar_xlat());
+        assert_eq!(cchar_to_str(0, &rev), "<undef>");
     }
 
-    Ok(())
+    #[test]
+    fn test_cchar_to_str_control() {
+        let rev = osdata::reverse_charmap(&osdata::load_cchar_xlat());
+        // 0x03 (ETX) maps to ^C, 0x7f (DEL) maps to ^?
+        assert_eq!(cchar_to_str(0x03, &rev).to_uppercase(), "^C");
+        assert_eq!(cchar_to_str(0x7f, &rev), "^?");
+    }
+
+    #[test]
+    fn test_cchar_to_str_printable() {
+        let rev = osdata::reverse_charmap(&osdata::load_cchar_xlat());
+        // Audit #7: a printable byte renders as the character, not its decimal.
+        assert_eq!(cchar_to_str(b'q', &rev), "q");
+        assert_eq!(cchar_to_str(b'@', &rev), "@");
+    }
+
+    #[test]
+    fn test_cchar_to_str_high_byte_octal() {
+        let rev = osdata::reverse_charmap(&osdata::load_cchar_xlat());
+        assert_eq!(cchar_to_str(0x80, &rev), "\\200");
+    }
+
+    #[test]
+    fn test_speed_table_50_not_54() {
+        // Audit #6: B50 is keyed "50", and "54" is not a key.
+        let speeds = osdata::load_speeds();
+        assert!(speeds.contains_key("50"));
+        assert!(!speeds.contains_key("54"));
+    }
+
+    #[test]
+    fn test_speed_to_str_roundtrip() {
+        let speeds = osdata::load_speeds();
+        let rev = osdata::load_speeds_rev(&speeds);
+        let b9600 = *speeds.get("9600").unwrap();
+        assert_eq!(speed_to_str(&rev, b9600), "9600");
+    }
+
+    #[test]
+    fn test_set_ti_flag_set_and_negate() {
+        let mut flags: tcflag_t = 0;
+        // set ECHO
+        let dirty = set_ti_flag(&mut flags, ECHO, ECHO, false, false);
+        assert!(dirty);
+        assert_ne!(flags & ECHO, 0);
+        // negate clears it
+        let dirty = set_ti_flag(&mut flags, ECHO, ECHO, true, false);
+        assert!(dirty);
+        assert_eq!(flags & ECHO, 0);
+        // no-op when already in desired state
+        let dirty = set_ti_flag(&mut flags, ECHO, ECHO, true, false);
+        assert!(!dirty);
+    }
+
+    #[test]
+    fn test_build_flagstr() {
+        // flag present -> name; absent + negatable -> -name; absent + not -> empty
+        assert_eq!(build_flagstr("echo", ECHO, PNEG, ECHO, ECHO), "echo");
+        assert_eq!(build_flagstr("echo", 0, PNEG, ECHO, ECHO), "-echo");
+        assert_eq!(build_flagstr("cs7", 0, 0, CS7, CSIZE), "");
+    }
 }

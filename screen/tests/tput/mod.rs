@@ -54,7 +54,38 @@ fn test_tput_no_operand() {
     assert_eq!(exit_code, 2, "Expected exit code 2 for missing operand");
 }
 
-// Note: Testing clear/init/reset requires a terminal and produces
-// terminal-specific escape sequences. These are verified to work
-// through manual testing. The terminfo database lookup and capability
-// expansion is handled by the terminfo crate.
+// tput writes to stdout even when it is not a terminal (it is commonly used in
+// command substitution, e.g. `clear=$(tput clear)`), so these run with a piped
+// stdout against a known terminal type.
+
+#[test]
+fn test_tput_clear_xterm() {
+    let (exit_code, stdout, _stderr) = run_tput(&["-T", "xterm", "clear"]);
+    assert_eq!(exit_code, 0, "tput -T xterm clear should exit 0");
+    assert!(
+        !stdout.is_empty(),
+        "tput clear should emit the xterm clear sequence"
+    );
+}
+
+// Audit #T3: a valid operand runs even when a later operand is invalid; the
+// invalid operand still yields exit 4.
+#[test]
+fn test_tput_valid_then_invalid_operand() {
+    let (exit_code, stdout, stderr) = run_tput(&["-T", "xterm", "clear", "bogus"]);
+    assert_eq!(
+        exit_code, 4,
+        "an invalid operand should yield exit 4 even after a valid one"
+    );
+    assert!(
+        !stdout.is_empty(),
+        "the leading 'clear' operand should have produced output before the invalid one"
+    );
+    assert!(stderr.contains("Invalid operand"));
+}
+
+#[test]
+fn test_tput_multiple_valid_operands() {
+    let (exit_code, _stdout, _stderr) = run_tput(&["-T", "xterm", "clear", "init"]);
+    assert_eq!(exit_code, 0, "clear + init should both succeed on xterm");
+}

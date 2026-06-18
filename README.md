@@ -114,10 +114,13 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] split
  - [x] strings
  - [x] strip (Development)
+ - [x] stty
+ - [x] tabs
  - [x] tee
  - [x] test
  - [x] timeout
  - [x] touch
+ - [x] tput
  - [x] true
  - [x] unget (SCCS)
  - [x] unlink
@@ -170,12 +173,9 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] ps
  - [x] sed
  - [x] sort
- - [x] stty
- - [x] tabs
  - [x] talk (with talkd local daemon)
  - [x] tail
  - [x] time
- - [x] tput
  - [x] tr
  - [x] tsort
  - [x] tty

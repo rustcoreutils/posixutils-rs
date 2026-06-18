@@ -36,10 +36,15 @@ struct Args {
 // The `if`/`rf` capabilities name a file whose *contents* are the
 // initialization/reset sequence; emit the file's bytes, not its name.
 // Best-effort: an unreadable file is treated as an unavailable capability.
-fn emit_cap_file(path_bytes: &[u8]) {
+// Returns true if any bytes were actually written.
+fn emit_cap_file(path_bytes: &[u8]) -> bool {
     let path = std::ffi::OsStr::from_bytes(path_bytes);
-    if let Ok(contents) = std::fs::read(path) {
-        let _ = io::stdout().write_all(&contents);
+    match std::fs::read(path) {
+        Ok(contents) => {
+            let _ = io::stdout().write_all(&contents);
+            true
+        }
+        Err(_) => false,
     }
 }
 
@@ -60,6 +65,7 @@ fn tput_init(info: &Database) -> terminfo::Result<()> {
     if let Some(cap) = info.get::<cap::InitFile>() {
         emit_cap_file(cap.as_ref());
     }
+    // (init has no fallback; emit best-effort)
     if let Some(cap) = info.get::<cap::InitProg>() {
         run_cap_prog(cap.as_ref());
     }
@@ -81,8 +87,9 @@ fn tput_reset(info: &Database) -> terminfo::Result<()> {
         emitted = true;
     }
     if let Some(cap) = info.get::<cap::ResetFile>() {
-        emit_cap_file(cap.as_ref());
-        emitted = true;
+        // Only counts as "reset emitted" if the file was actually readable, so
+        // an unreadable rf still falls back to the init sequence below.
+        emitted |= emit_cap_file(cap.as_ref());
     }
     if let Some(cap) = info.get::<cap::Reset3String>() {
         cap.expand().to(io::stdout())?;

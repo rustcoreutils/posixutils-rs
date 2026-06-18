@@ -719,7 +719,7 @@ fn stty_set_long(mut ti: Termios, args: &Args) -> io::Result<()> {
         // informational query. None of these are negatable.
         if matches!(operand, "rows" | "cols" | "size") {
             if negate {
-                let errstr = format!("Operand {} cannot be negated", operand);
+                let errstr = format!("{}: {}", gettext("cannot negate operand"), operand);
                 return Err(Error::other(errstr));
             }
             if operand == "size" {
@@ -890,11 +890,10 @@ fn run(args: &Args) -> io::Result<()> {
 
 fn main() -> std::process::ExitCode {
     setlocale(LocaleCategory::LcAll, "");
-    if textdomain("posixutils-rs").is_err()
-        || bind_textdomain_codeset("posixutils-rs", "UTF-8").is_err()
-    {
-        return std::process::ExitCode::FAILURE;
-    }
+    // Non-fatal: a missing gettext catalog must not prevent stty from running
+    // with untranslated strings (matching plib::diag and the other utilities).
+    let _ = textdomain("posixutils-rs");
+    let _ = bind_textdomain_codeset("posixutils-rs", "UTF-8");
 
     let args = Args::parse();
 

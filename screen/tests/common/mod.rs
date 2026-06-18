@@ -23,8 +23,6 @@
 //! Each helper returns `None` when the platform/CI cannot allocate a PTY;
 //! callers print a "Skipping PTY test" notice and return early.
 
-#![allow(dead_code)] // each test module uses a subset of these helpers
-
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::Read;
 use std::sync::{Arc, Mutex};

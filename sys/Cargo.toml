@@ -12,7 +12,6 @@ plib = { path = "../plib" }
 clap.workspace = true
 errno.workspace = true
 gettext-rs.workspace = true
-uname = "0.1"
 libc.workspace = true
 chrono.workspace = true
 

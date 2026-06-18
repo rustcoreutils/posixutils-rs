@@ -133,8 +133,8 @@ decimal key parsing capped at signed `i32`.
 
 #### Minor
 
-- [ ] **#IR1 — Options processed in fixed internal order, not argv order.** `sys/ipcrm.rs:192-306`. The removal loops run semkey→semid→shmkey→shmid→msgkey→msgid regardless of command-line order. XBD 12.2 Guideline 11 says repeated option/option-argument pairs should be interpreted in the order specified. Harmless here (removals are independent) but a strict-conformance gap. Fix: collect a single `Vec<(Kind, value)>` in argv order during parsing and iterate it once.
-- [ ] **#IR2 — Decimal keys limited to signed `i32` range.** `sys/ipcrm.rs:31`. `parse_ipc_key` parses hex via `u32::from_str_radix(...) as i32` (full 32-bit space) but decimal directly as `i32`, so a decimal key > 2147483647 fails to parse while the same value in hex succeeds. `key_t` is a 32-bit type. Fix: parse decimal as `u32` then cast `as i32`, matching the hex path.
+- [x] **#IR1 — Options processed in fixed internal order, not argv order.** `sys/ipcrm.rs:192-306`. XBD 12.2 Guideline 11 says repeated option/option-argument pairs should be interpreted in the order specified. ✓ **fixed in Phase 11** — `main` now reads clap value indices (`ArgMatches::indices_of`) for all six options, builds a single `Vec<(index, Op)>`, sorts by argv index, and processes in that order. Behaviorally verified: `ipcrm -s 991 -m 992 -s 993` reports the three in command-line order.
+- [x] **#IR2 — Decimal keys limited to signed `i32` range.** `sys/ipcrm.rs:31`. A decimal key > 2147483647 failed to parse while the same value in hex succeeded. ✓ **fixed in Phase 11** — `parse_ipc_key` falls back to `u32` (cast to `i32`, matching the hex path) for out-of-`i32`-range decimals. Behaviorally `ipcrm -S 3000000000` parses to `0xb2d05e00`. Unit test `parse_keys`.
 - [ ] **#IR3 — macOS message-queue support omitted wholesale.** `sys/ipcrm.rs:284-304`. `-q`/`-Q` on macOS print an error and exit 1. This is acceptable (macOS does not provide working SysV message queues — `msgget` is effectively stubbed), but the POSIX SYNOPSIS lists `-q`/`-Q` unconditionally. Recorded as a documented platform limitation, not an actionable defect.
 - [ ] **#IR4 — No `.mo` catalogs (crate-wide).** `sys/ipcrm.rs:310-312`. `LC_MESSAGES` has no runtime effect. See cross-cutting.
 
@@ -143,7 +143,7 @@ decimal key parsing capped at signed `i32`.
 #### Options
 - [x] `-q msgid` / `-m shmid` / `-s semid` (by id) → `*ctl(IPC_RMID)` — `ipcrm.rs:169-180` and per-type loops. CONFORMS (msg: Linux-only).
 - [x] `-Q msgkey` / `-M shmkey` / `-S semkey` (by key) → key lookup then remove — `ipcrm.rs` key-lookup helpers. CONFORMS (msg: Linux-only).
-- [ ] **Fixed processing order** (#IR1); **decimal `i32` cap** (#IR2).
+- [x] **argv-order processing** (#IR1 ✓ Phase 11); **full decimal key range** (#IR2 ✓ Phase 11).
 
 #### Operands / STDIN / input / output files
 - [x] None accepted / used. CONFORMS.
@@ -163,8 +163,8 @@ decimal key parsing capped at signed `i32`.
 ### Test coverage signal
 
 Not covered:
-- [ ] argv-order processing (#IR1).
-- [ ] large decimal key parsing (#IR2).
+- [x] argv-order processing (#IR1) — behavioral (Phase 11).
+- [x] large decimal key parsing (#IR2) — `parse_keys` unit test (Phase 11).
 
 ---
 
@@ -352,8 +352,8 @@ extension hygiene (non-POSIX long options) and the unmaintained dependency.
 
 #### Minor
 
-- [ ] **#U1 — Non-POSIX long options exposed in `--help`.** `sys/uname.rs:17-33`. clap exposes `--all`/`--machine`/… and the awkward `--osversion` (renamed to dodge clap's built-in `--version`). POSIX defines only the short letters. Harmless extensions; flagged for surface hygiene. Fix: hide long options or document them as extensions.
-- [ ] **#U2 — Unmaintained `uname = "0.1"` dependency.** `sys/Cargo.toml:15`. The crate is a thin `libc::uname()` wrapper, last released years ago. Fix (optional): inline a ~5-line direct `libc::uname()` call and drop the dep, per the crate's minimal-deps principle.
+- [x] **#U1 — Non-POSIX long options exposed in `--help`.** `sys/uname.rs:17-33`. clap exposes `--all`/`--machine`/… and the awkward `--osversion`. POSIX defines only the short letters. Harmless extensions. ✓ **addressed in Phase 11** — retained as intentional GNU-style convenience extensions (removing them would break `uname --all` etc.), now documented with a code comment explaining the `--osversion`/`--version` clash. No behavioral change (matches the finding's "acceptable, document" recommendation).
+- [x] **#U2 — Unmaintained `uname = "0.1"` dependency.** `sys/Cargo.toml:15`. ✓ **fixed in Phase 11** — replaced with a direct `libc::uname()` call (`get_uname` + `field_to_string`); the `uname` crate is dropped from `Cargo.toml`. Output is byte-for-byte unchanged (verified against the system `uname`, 5 POSIX fields); compiles on both Linux and macOS targets.
 - [ ] **#U3 — No `.mo` catalogs (crate-wide).** See cross-cutting. (uname field values are implementation-defined and legitimately not translated.)
 
 ### Detailed conformance matrix

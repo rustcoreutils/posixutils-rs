@@ -141,6 +141,15 @@ struct Args {
     /// Custom output format
     #[arg(short = 'o', value_name = "format", action = clap::ArgAction::Append, help = gettext("Specify output format"))]
     output_format: Vec<String>,
+
+    /// Wide output: behave as if COLUMNS >= 132; repeat to remove the limit
+    #[arg(short = 'w', action = clap::ArgAction::Count, help = gettext("Wide output; repeat to remove the line-length limit"))]
+    wide: u8,
+
+    /// Alternative system namelist file (XSI). The format is unspecified by
+    /// POSIX; accepted for conformance and otherwise ignored.
+    #[arg(short = 'n', value_name = "namelist", help = gettext("Specify an alternative namelist file (accepted; ignored)"))]
+    namelist: Option<String>,
 }
 
 /// Field definition for -o option
@@ -550,6 +559,50 @@ struct Context {
     full_format: bool, // -f selected (renders uid as a login name, etc.)
 }
 
+/// Resolve the maximum output line length per the `-w` option and the `COLUMNS`
+/// environment variable (audit #P4). POSIX: lines contain no more than the
+/// greater of `{LINE_MAX}` and `COLUMNS` bytes; a single `-w` behaves as if
+/// `COLUMNS` were at least 132; repeating `-w` removes the limit.
+fn resolve_line_limit(wide_count: u8) -> usize {
+    if wide_count >= 2 {
+        return usize::MAX; // -ww: no limit
+    }
+    let line_max = {
+        let v = unsafe { libc::sysconf(libc::_SC_LINE_MAX) };
+        if v > 0 {
+            v as usize
+        } else {
+            2048 // conventional {LINE_MAX} fallback
+        }
+    };
+    let mut columns = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    if wide_count == 1 {
+        columns = columns.max(132); // -w: as if COLUMNS >= 132
+    }
+    line_max.max(columns)
+}
+
+/// Truncate `line` to at most `max_bytes`, rounding down to a UTF-8 character
+/// boundary so multi-byte characters are never split (POSIX bounds the line in
+/// bytes; for ASCII this is exact).
+fn truncate_line(line: &str, max_bytes: usize) -> &str {
+    if line.len() <= max_bytes {
+        return line;
+    }
+    let mut end = 0;
+    for (i, c) in line.char_indices() {
+        let next = i + c.len_utf8();
+        if next > max_bytes {
+            break;
+        }
+        end = next;
+    }
+    &line[..end]
+}
+
 /// Get current terminal name
 fn get_current_tty() -> Option<String> {
     unsafe {
@@ -618,6 +671,11 @@ fn main() -> ExitCode {
     let _ = bind_textdomain_codeset("posixutils-rs", "UTF-8");
 
     let args = Args::parse();
+
+    // -n namelist is accepted for XSI conformance; its format is unspecified by
+    // POSIX and this implementation reads live process state (/proc on Linux,
+    // proc_* on macOS), so an alternative namelist has no effect.
+    let _ = &args.namelist;
 
     // Get processes
     let processes = match platform::list_processes() {
@@ -783,25 +841,30 @@ fn main() -> ExitCode {
         full_format: args.full_format,
     };
 
+    // Maximum line length (-w / COLUMNS / {LINE_MAX}); lines are clipped to it.
+    let line_limit = resolve_line_limit(args.wide);
+
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
-    // Print header
+    // Print header (clipped to the line limit so it stays aligned with rows).
     if print_header {
+        let mut line = String::new();
         for (i, field) in output_fields.iter().enumerate() {
             if i > 0 {
-                let _ = write!(out, " ");
+                line.push(' ');
             }
-            let _ = write!(out, "{:>width$}", field.header, width = field.width);
+            line.push_str(&format!("{:>width$}", field.header, width = field.width));
         }
-        let _ = writeln!(out);
+        let _ = writeln!(out, "{}", truncate_line(&line, line_limit));
     }
 
     // Print processes
     for proc in filtered {
+        let mut line = String::new();
         for (i, field) in output_fields.iter().enumerate() {
             if i > 0 {
-                let _ = write!(out, " ");
+                line.push(' ');
             }
             let value = get_field_value(&proc, field.name, &ctx);
             // Right-align numeric fields, left-align text
@@ -809,12 +872,12 @@ fn main() -> ExitCode {
                 field.name,
                 "pid" | "ppid" | "pgid" | "sid" | "uid" | "gid" | "nice" | "pri" | "vsz" | "sz"
             ) {
-                let _ = write!(out, "{:>width$}", value, width = field.width);
+                line.push_str(&format!("{:>width$}", value, width = field.width));
             } else {
-                let _ = write!(out, "{:<width$}", value, width = field.width);
+                line.push_str(&format!("{:<width$}", value, width = field.width));
             }
         }
-        let _ = writeln!(out);
+        let _ = writeln!(out, "{}", truncate_line(&line, line_limit));
     }
 
     ExitCode::SUCCESS
@@ -863,5 +926,20 @@ mod tests {
         assert_eq!(format_stime(started, now + 86_400, &Utc), "Jan01");
         // Unknown start time.
         assert_eq!(format_stime(0, now, &Utc), "-");
+    }
+
+    // -ww removes the line-length limit; truncation never splits UTF-8 (#P4).
+    #[test]
+    fn line_limit_and_truncation() {
+        assert_eq!(resolve_line_limit(2), usize::MAX);
+        // Single/zero -w yields a finite cap (>= {LINE_MAX} fallback 2048).
+        assert!(resolve_line_limit(0) >= 2048);
+        assert!(resolve_line_limit(1) >= 2048);
+
+        assert_eq!(truncate_line("hello world", 5), "hello");
+        assert_eq!(truncate_line("hi", 100), "hi");
+        // A 2-byte 'é' at the boundary is dropped whole, never split.
+        assert_eq!(truncate_line("aé", 2), "a");
+        assert_eq!(truncate_line("aé", 3), "aé");
     }
 }

@@ -272,8 +272,8 @@ var) are absent. `TZ`/`LC_TIME` are ignored for all time output.
 #### Major
 
 - [x] **#P3 — CPU/elapsed time hardcodes 100 ticks/second.** `sys/ps.rs:474-488` (`format_time`: `ticks / 100`). POSIX requires `sysconf(_SC_CLK_TCK)`; Linux `CONFIG_HZ` may be 250/1000. Fix: divide by `sysconf(_SC_CLK_TCK)`. ✓ **fixed in Phase 3** — the Linux backend divides `utime+stime` by `sysconf(_SC_CLK_TCK)` (read once); `format_time` now takes whole seconds. Behaviorally verified `TIME` == `/usr/bin/ps` (`00:00:38` for PID 1). Unit test `format_time_seconds`.
-- [ ] **#P4 — `-w` option and `COLUMNS` env var absent; output never width-limited.** `sys/ps.rs:92-144` (no `-w` field); `COLUMNS` never read. Spec 112496–112498 + the `-w` row require `COLUMNS`/`-w` to govern line width. Fix: add `-w` (repeatable), read `COLUMNS`, truncate at `max(LINE_MAX, COLUMNS)`.
-- [ ] **#P5 — `-n namelist` option absent.** `sys/ps.rs:92-144`. In the SYNOPSIS (XSI). Behavior is implementation-defined; a parsed no-op (or warning) would close the SYNOPSIS gap. Fix: add the flag.
+- [x] **#P4 — `-w` option and `COLUMNS` env var absent; output never width-limited.** `sys/ps.rs:92-144` (no `-w` field); `COLUMNS` never read. Spec 112481–112498 require lines to contain no more than the greater of `{LINE_MAX}` and `COLUMNS` bytes; a single `-w` behaves as if `COLUMNS` ≥ 132; repeated `-w` removes the limit. ✓ **fixed in Phase 5** — added `-w` (repeatable `Count`); `resolve_line_limit` reads `_SC_LINE_MAX` + `COLUMNS`; each row/header is clipped by `truncate_line` at a UTF-8 boundary. Behaviorally verified: a 3041-byte argv caps at 2048 by default, full under `-ww`, and `COLUMNS` raises the cap. Unit test `line_limit_and_truncation`.
+- [x] **#P5 — `-n namelist` option absent.** `sys/ps.rs:92-144`. In the SYNOPSIS (XSI); the namelist format is "unspecified", so a parsed no-op is conforming. ✓ **fixed in Phase 5** — added `-n namelist`, accepted and ignored (this implementation reads live state). Integration test `ps_namelist_accepted`.
 - [x] **#P6 — `stime` column always `-` in `-f` listing.** `sys/ps.rs:573`. The `-f` full format mandates STIME; the field returned `"-"`. ✓ **fixed in Phase 4** — new pure `format_stime(start_epoch, now_epoch, tz)` renders `HH:MM` if started today else `MmmDD` (matching historical `ps`), `"-"` when the start time is unknown. Behaviorally verified `ps -p 1 -o stime` == `/usr/bin/ps` (`Jun15`). Unit test `format_stime_today_vs_date`.
 - [x] **#P7 — `TZ` / `LC_TIME` ignored for all time output.** `sys/ps.rs:474-517`. ✓ **fixed in Phase 4** — the only absolute-time field (`stime`) now formats through `chrono::Local`, which honors `$TZ` (verified: `TZ=UTC`→`10:16` vs `TZ=America/New_York`→`06:16`). `etime`/`time` are elapsed durations (timezone-independent by definition). `LC_TIME`-localized month/digit glyphs remain a deferred crate-wide i18n item.
 - [ ] **#P8 — macOS `args` is the executable path, not argv; no bracketed fallback.** `sys/psmacos.rs:171`. Spec 112547–112549: under `-f`, reconstruct argv, else write `[comm]` in brackets. Linux does this (`pslinux.rs:146`); macOS sets `args = full_path` always. Fix: use `sysctl KERN_PROCARGS2` to reconstruct argv; bracket kernel/threadless procs.
@@ -301,14 +301,14 @@ var) are absent. `TZ`/`LC_TIME` are ignored for all time output.
 | `-l` | CONFORMS | F S UID PID PPID C PRI NI ADDR SZ WCHAN TTY TIME CMD — `ps.rs:398-471`. |
 | `-o` | CONFORMS | append + `name=header` + null-header suppression — `ps.rs:260-319, 739`. |
 | `-t` | PARTIAL | substring match; XSI two-form (`tty04`/`04`) not handled — `ps.rs:131`. |
-| `-n namelist` | MISSING | (#P5). |
-| `-w` | MISSING | (#P4). |
+| `-n namelist` | CONFORMS | accepted no-op (#P5 ✓ Phase 5). |
+| `-w` | CONFORMS | `-w`/`-ww` + `COLUMNS` line limit (#P4 ✓ Phase 5). |
 
 #### Operands / STDIN / input files
 - [x] None accepted / used. CONFORMS.
 
 #### Environment variables
-- [ ] **`COLUMNS` never read** (#P4, Phase 5). **`TZ` honored for `stime`** (#P7 ✓ Phase 4).
+- [x] **`COLUMNS` read for line limit** (#P4 ✓ Phase 5). **`TZ` honored for `stime`** (#P7 ✓ Phase 4).
 - [x] `LANG`/`LC_*`/`NLSPATH` via `setlocale` — `ps.rs:580-584`. CONFORMS (catalogs deferred).
 
 #### STDOUT / STDERR
@@ -326,8 +326,8 @@ var) are absent. `TZ`/`LC_TIME` are ignored for all time output.
 
 Not covered:
 - [x] `etime` numeric correctness (#P1) — unit test `format_etime_elapsed` + behavioral cross-check vs `/usr/bin/ps` (Phase 3).
-- [ ] `COLUMNS`/`-w` truncation (#P4).
-- [ ] `-n` (#P5), defunct marking (#P10), header suppression content (`ps_empty_header` only checks exit).
+- [x] `COLUMNS`/`-w` truncation (#P4) — unit test + behavioral 3041-byte argv check (Phase 5).
+- [x] `-n` accepted (#P5) — `ps_namelist_accepted` (Phase 5). [ ] defunct marking (#P10, Phase 6); header suppression content (`ps_empty_header` only checks exit).
 
 ---
 

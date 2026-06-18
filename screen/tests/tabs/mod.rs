@@ -7,10 +7,13 @@
 // SPDX-License-Identifier: MIT
 //
 
+use crate::common::PtyHarness;
 use std::process::Command;
 
+const TABS: &str = env!("CARGO_BIN_EXE_tabs");
+
 fn run_tabs(args: &[&str]) -> (i32, String, String) {
-    let output = Command::new(env!("CARGO_BIN_EXE_tabs"))
+    let output = Command::new(TABS)
         .args(args)
         .output()
         .expect("Failed to execute tabs");
@@ -92,4 +95,46 @@ fn test_tabs_non_ascending_tabstops() {
             stderr
         );
     }
+}
+
+macro_rules! pty_or_skip {
+    () => {
+        match PtyHarness::new(24, 80) {
+            Some(h) => h,
+            None => {
+                eprintln!("Skipping PTY test: cannot allocate a pseudo-terminal");
+                return;
+            }
+        }
+    };
+}
+
+// Setting tabs requires a terminal that supports the hardware-tab capabilities
+// (vt100 has hts/tbc). Default (-8) and a preset should both succeed and emit a
+// non-empty sequence.
+#[test]
+fn test_tabs_default_under_pty() {
+    let pty = pty_or_skip!();
+    let (code, out) = pty.run(TABS, &["-T", "vt100"]);
+    assert_eq!(code, 0, "tabs -T vt100 (default) should exit 0, got {code}");
+    assert!(!out.is_empty(), "tabs should emit a clear/set sequence");
+}
+
+#[test]
+fn test_tabs_preset_under_pty() {
+    let pty = pty_or_skip!();
+    let (code, _out) = pty.run(TABS, &["-T", "vt100", "-a"]);
+    assert_eq!(code, 0, "tabs -T vt100 -a should exit 0, got {code}");
+}
+
+// Audit #T5: with stdout not a terminal (a pipe via .output()), a valid request
+// is a usage error rather than dumping escapes into the pipe.
+#[test]
+fn test_tabs_non_terminal_stdout_errors() {
+    let (exit_code, _stdout, stderr) = run_tabs(&["-T", "vt100", "1,5,9"]);
+    assert_ne!(exit_code, 0, "tabs to a non-terminal stdout should fail");
+    assert!(
+        stderr.contains("not a terminal"),
+        "expected a 'not a terminal' diagnostic, got: {stderr}"
+    );
 }

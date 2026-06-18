@@ -181,14 +181,14 @@ tolerated.
 
 #### Major
 
-- [ ] **#T1 — Unset `TERM` with no `-T` errors instead of using a default terminal type.** `tabs.rs:326-337`: `Database::from_env()` failing (TERM unset/null) prints "cannot determine terminal type" and exits 1. POSIX 116447-116449 / 116507-116508: when `-T` is absent and `TERM` is unset/null, "an unspecified default terminal type shall be used." Erroring is a divergence from the mandated fallback. Fix: fall back to a built-in default (e.g. `dumb`/`ansi`) instead of hard-failing. (Borderline Minor — the spec leaves the default "unspecified", but mandates that one be used.)
+- [x] **#T1 — Unset `TERM` with no `-T` errors instead of using a default terminal type.** ✓ fixed (Phase 4): the no-`-T` path now falls back `from_env → ansi → dumb → vt100` before erroring. `tabs.rs:326-337`: `Database::from_env()` failing (TERM unset/null) prints "cannot determine terminal type" and exits 1. POSIX 116447-116449 / 116507-116508: when `-T` is absent and `TERM` is unset/null, "an unspecified default terminal type shall be used." Erroring is a divergence from the mandated fallback. Fix: fall back to a built-in default (e.g. `dumb`/`ansi`) instead of hard-failing. (Borderline Minor — the spec leaves the default "unspecified", but mandates that one be used.)
 
 #### Minor
 
-- [ ] **#T2 — `MAX_COLUMN` hardcoded at 160.** `tabs.rs:19`, used by `generate_repetitive_tabs` (`tabs.rs:156-169`). POSIX 116446: "The maximum number of tab stops allowed is terminal-dependent." A fixed cap is acceptable but should ideally derive from the terminal width (terminfo `cols`). Fix: query terminfo `cols` or document the cap.
-- [ ] **#T3 — A leading `+N` first operand is silently accepted.** `tabs.rs:117-146` (`parse_tabstops`): the first token `+5` is treated as `0+5`. POSIX 116485-116486: the `+`-increment applies to any value "except the first one". Fix: reject a leading `+`.
-- [ ] **#T4 — Custom-operand path does not enforce `n` ≤ a single column max / first stop ≥ 1 vs preset semantics.** `parse_tabstops` rejects a literal `0` (`tabs.rs:127-129`) and non-ascending order (`:140-142`) — correct — but does not bound values to the terminal; combined with #T2 the behavior for `tabs 500` is to emit a stop the terminal cannot honor. Minor.
-- [ ] **#T5 — Output written even when stdout is not a terminal.** `set_hw_tabs` (`tabs.rs:249-285`) writes the clear/set sequence unconditionally. POSIX 116512-116514: "If standard output is not a terminal, undefined results occur." Undefined ⇒ writing is permitted; flagged only as a robustness note (no `isatty` guard). No fix required.
+- [x] **#T2 — `MAX_COLUMN` hardcoded at 160.** ✓ fixed (Phase 4): `max_column()` derives the cap from `TIOCGWINSZ` `ws_col` (fallback `DEFAULT_MAX_COLUMN = 160`); `generate_repetitive_tabs(interval, max)`; regression `test_generate_repetitive_tabs_respects_max`. `tabs.rs:19`, used by `generate_repetitive_tabs` (`tabs.rs:156-169`). POSIX 116446: "The maximum number of tab stops allowed is terminal-dependent." A fixed cap is acceptable but should ideally derive from the terminal width (terminfo `cols`). Fix: query terminfo `cols` or document the cap.
+- [x] **#T3 — A leading `+N` first operand is silently accepted.** ✓ fixed (Phase 4): a leading `+` is now rejected ("first tab stop cannot be an increment"); regression `test_parse_tabstops_leading_increment_rejected`. `tabs.rs:117-146` (`parse_tabstops`): the first token `+5` is treated as `0+5`. POSIX 116485-116486: the `+`-increment applies to any value "except the first one". Fix: reject a leading `+`.
+- [x] **#T4 — Custom-operand path does not enforce `n` ≤ a single column max / first stop ≥ 1 vs preset semantics.** ✓ fixed (Phase 4): `parse_cmd_line` rejects any explicit stop beyond `max_column()` ("tab stop larger than terminal width"); regression `test_tabstop_beyond_width_rejected`. `parse_tabstops` rejects a literal `0` (`tabs.rs:127-129`) and non-ascending order (`:140-142`).
+- [x] **#T5 — Output written even when stdout is not a terminal.** ✓ fixed (Phase 4, strict): `set_hw_tabs` now guards on `libc::isatty(STDOUT_FILENO)` and errors ("standard output is not a terminal") rather than dumping escapes into a pipe; regression `test_tabs_non_terminal_stdout_errors`. `set_hw_tabs` (`tabs.rs:249-285`). POSIX 116512-116514: "If standard output is not a terminal, undefined results occur."
 
 ### Detailed conformance matrix
 
@@ -213,7 +213,7 @@ tolerated.
 - [x] `n[[sep[+]n]...]` with comma **or** blank separators — `tabs.rs:111` splits on `,`/whitespace.
 - [x] `+N` increment relative to previous value — `tabs.rs:117-137`.
 - [x] Strictly-ascending positive integers enforced — `tabs.rs:127-142`.
-- [ ] **Leading `+N` first operand tolerated** (#T3).
+- [x] **Leading `+N` first operand rejected** (#T3 ✓).
 - [x] STDIN "Not used" — no stdin reads.
 - [x] INPUT FILES "None".
 
@@ -224,7 +224,7 @@ tolerated.
 | `LANG`/`LC_ALL`/`LC_CTYPE` | CONFORMS | `setlocale(LC_ALL, "")` at `tabs.rs:288`. |
 | `LC_MESSAGES` | CONFORMS (plumbed) | diagnostics wrapped in `gettext()` (`tabs.rs:125,141,149,254,262,275,319,332,344`). |
 | `NLSPATH` (XSI) | MISSING | no catalog wiring (tree-wide gap). |
-| `TERM` | PARTIAL | read via `Database::from_env` but no default-on-unset (#T1). |
+| `TERM` | CONFORMS | read via `Database::from_env`; falls back to a default terminal when unset (#T1 ✓). |
 
 #### ASYNCHRONOUS EVENTS / STDOUT / STDERR / EXIT STATUS
 
@@ -242,9 +242,9 @@ Good for a TTY-dependent utility: 11 unit tests cover `parse_tabstops`
 `--version`, and error paths.
 
 Not covered:
-- [ ] Each XSI preset (`-a`/`-c3`/…) yields its exact documented list (`parse_cmd_line`, easily unit-testable without a TTY).
-- [ ] `-0` produces an empty stop list; default equals `-8` (#T1-adjacent).
-- [ ] Leading `+N` rejection (#T3).
+- [x] Each XSI preset (`-a`/`-c3`/…) yields its exact documented list — `test_xsi_presets`.
+- [x] `-0` produces an empty stop list; default equals `-8` — `test_rep0_and_default`.
+- [x] Leading `+N` rejection (#T3) — `test_parse_tabstops_leading_increment_rejected`.
 
 ---
 

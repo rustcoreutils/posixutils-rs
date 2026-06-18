@@ -311,15 +311,15 @@ of `>1`. No tests at all.
 ### Priority issues
 
 #### Critical
-- [ ] **#MG1 — Exit status does not reflect messaging state.** `users/mesg.rs:122-137`. Spec 106996-106998: exit 0 if receiving messages is allowed, 1 if not, >1 on error. The impl returns `Ok(())` (exit 0) for `show_mesg`, `mesg y`, and `mesg n` uniformly. So `mesg n` exits 0 and `mesg` on a locked tty exits 0 — both wrong. Fix: compute `allowed = (st_mode & (S_IWGRP|S_IWOTH)) != 0` from the state **before** any change, then `process::exit(if allowed {0} else {1})`.
-- [ ] **#MG2 — Error paths exit 1, indistinguishable from "not messageable".** `users/mesg.rs:56,93,129,133`. "tty not found", invalid operand, and fchmod failure all bubble through `main() -> Result<…>` → exit 1. Spec reserves 1 for "not allowed" and requires `>1` for errors. Fix: handle errors explicitly and `process::exit(2)`.
+- [x] **#MG1 — Exit status does not reflect messaging state.** ✓ fixed (phase 5) — `main` now exits 0 when receiving is allowed and 1 when not, for the report, `y`, and `n` cases. `users/mesg.rs`.
+- [x] **#MG2 — Error paths exit 1, indistinguishable from "not messageable".** ✓ fixed (phase 5) — no-terminal, invalid operand, and fchmod failure now emit a diagnostic and exit 2. `users/mesg.rs`.
 
 #### Major
-- [ ] **#MG3 — Exit must reflect the state *before* the command.** `users/mesg.rs:90-120` (depends on #MG1 fix). The pre-change `st` (mesg.rs:97/129) holds the old mode, so the #MG1 fix must read the bit from `st` (pre-change), not re-stat after `fchmod`. Ensure ordering.
+- [x] ~~**#MG3 — Exit must reflect the state *before* the command.**~~ ✓ fixed (phase 5) — **the "before the command" framing was incorrect.** Behaviorally verified against the system `mesg`: the exit status reflects the **resulting** state (`mesg y` → 0, `mesg n` → 1; report → current state). Implemented accordingly via `exit_for(resulting_allowed)`. `users/mesg.rs`.
 
 #### Minor
-- [ ] **#MG4 — Accepts `Y`/`N` beyond the POSIX `y`/`n` operands.** `users/mesg.rs:83-84`. Spec lists only lowercase `y`/`n` in the POSIX locale. Harmless extension; optionally restrict or document.
-- [ ] **#MG5 — Diagnostics partially unlocalized.** `users/mesg.rs:56,85` use raw English (`"tty not found"`, `"invalid operand"`) not `gettext`-wrapped, while mesg.rs:64,115 are. Consistency fix.
+- [x] **#MG4 — Accepts `Y`/`N` beyond the POSIX `y`/`n` operands.** ✓ fixed (phase 5) — restricted to lowercase `y`/`n`; any other operand is an error (exit 2). `users/mesg.rs`.
+- [x] **#MG5 — Diagnostics partially unlocalized.** ✓ fixed (phase 5) — all diagnostics now go through `plib::diag::error` + `gettext`. `users/mesg.rs`.
 
 ### Detailed conformance matrix
 
@@ -329,22 +329,21 @@ of `>1`. No tests at all.
 | `y` grants permission | CONFORMS `- [x]` | adds S_IWGRP\|S_IWOTH. mesg.rs:99-104 |
 | `n` denies permission | CONFORMS `- [x]` | clears the bits. mesg.rs:105-110 |
 | No operand → report, no change | CONFORMS `- [x]` | `None => show_mesg`. mesg.rs:132 |
-| Only `y`/`n` in POSIX locale | DIVERGES (minor) | also accepts `Y`/`N`. mesg.rs:83-84 (#MG4) |
+| Only `y`/`n` in POSIX locale | CONFORMS ✓ | restricted to lowercase `y`/`n` (fixed #MG4, phase 5). mesg.rs |
 | STDIN (Not used) | CONFORMS `- [x]` | stdin only inspected for is_terminal. |
 | First tty among stdin,stdout,stderr | CONFORMS `- [x]` | find_tty. mesg.rs:33-43 |
 | Operates on that device's mode bits | CONFORMS `- [x]` | fstat/fchmod on chosen fd. mesg.rs:53-69,113 |
-| Env LANG/LC_*/LC_MESSAGES | PARTIAL | setlocale mesg.rs:123; some msgs unlocalized (#MG5) |
+| Env LANG/LC_*/LC_MESSAGES | CONFORMS ✓ | `plib::diag` + all diagnostics `gettext`-wrapped (fixed #MG5, phase 5). mesg.rs |
 | Async events (Default) | N/A `- [x]` | |
 | STDOUT (state, unspecified format) | CONFORMS `- [x]` | `is y`/`is n`, only on no-operand. mesg.rs:74,76,132 |
 | STDERR (diagnostics only) | CONFORMS `- [x]` | mesg.rs:64,115 |
-| Exit 0 = receiving allowed | MISSING `- [ ]` | always 0 on success (#MG1) |
-| Exit 1 = not allowed | MISSING `- [ ]` | never produced for "denied" (#MG1) |
-| Exit >1 = error | DIVERGES `- [ ]` | errors exit 1, not >1 (#MG2) |
+| Exit 0 = receiving allowed | CONFORMS ✓ | `exit_for(allowed)` (fixed #MG1, phase 5) |
+| Exit 1 = not allowed | CONFORMS ✓ | `mesg n`/report-when-denied → 1 (fixed #MG1, phase 5) |
+| Exit >1 = error | CONFORMS ✓ | no-tty/invalid-operand/fchmod-fail → 2 (fixed #MG2, phase 5) |
 
 ### Test coverage signal
 
-Not covered:
-- [ ] **Everything** — no `users/tests/mesg/` module. Two Critical exit-status bugs that `mesg n; echo $?` on a PTY would catch immediately. Recommend PTY-backed round-trip tests for the bit change and the pre-change-based exit code, plus invalid-operand → exit 2 and no-tty → exit 2.
+- [x] ✓ added (phase 5) — `users/tests/mesg/mod.rs`: PTY-backed `y`→0/`n`→1 round-trip with report, no-terminal→2, invalid-operand→2. Exit semantics behaviorally cross-checked against the system `mesg`.
 
 ---
 

@@ -26,13 +26,13 @@ fn lp_no_destination_error() {
     );
 }
 
-/// Test that lp fails with invalid URI
+/// Test that a destination name containing a path separator is rejected
 #[test]
-fn lp_invalid_uri_error() {
+fn lp_invalid_name_rejected() {
     run_test_with_checker_and_env(
         TestPlan {
             cmd: String::from("lp"),
-            args: vec!["-d".to_string(), "not-a-uri".to_string()],
+            args: vec!["-d".to_string(), "bad/name".to_string()],
             stdin_data: String::from("test data"),
             expected_out: String::from(""),
             expected_err: String::from(""),
@@ -42,8 +42,40 @@ fn lp_invalid_uri_error() {
         |_, output| {
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(
-                stderr.contains("invalid destination URI"),
-                "Expected invalid URI error, got: {}",
+                stderr.contains("invalid destination name"),
+                "Expected invalid name error, got: {}",
+                stderr
+            );
+            assert_eq!(output.status.code(), Some(1));
+        },
+    );
+}
+
+/// Test that a bare printer name resolves to a localhost IPP URI
+#[test]
+fn lp_bare_name_resolves_to_localhost() {
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("lp"),
+            args: vec!["-d".to_string(), "myprinter".to_string()],
+            stdin_data: String::from("test data"),
+            expected_out: String::from(""),
+            expected_err: String::from(""),
+            expected_exit_code: 1,
+        },
+        &[("LPDEST", ""), ("PRINTER", "")],
+        |_, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // The bare name is resolved, not rejected; the connection then fails.
+            assert!(
+                !stderr.contains("invalid destination"),
+                "Expected bare name to resolve, got: {}",
+                stderr
+            );
+            assert!(
+                stderr.contains("printer error")
+                    && stderr.contains("ipp://localhost/printers/myprinter"),
+                "Expected printer error against resolved localhost URI, got: {}",
                 stderr
             );
             assert_eq!(output.status.code(), Some(1));
@@ -148,6 +180,43 @@ fn lp_file_not_found() {
     );
 }
 
+/// Test that a per-file error does not abort the remaining operands
+#[test]
+fn lp_multifile_continues_on_error() {
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("lp"),
+            args: vec![
+                "-d".to_string(),
+                "ipp://localhost/ipp/print".to_string(),
+                "/nonexistent/file/path.txt".to_string(),
+                "-".to_string(),
+            ],
+            stdin_data: String::from("stdin test data"),
+            expected_out: String::from(""),
+            expected_err: String::from(""),
+            expected_exit_code: 1,
+        },
+        &[("LPDEST", ""), ("PRINTER", "")],
+        |_, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // First operand fails to open; the loop must STILL process the
+            // second operand ('-' stdin), which then hits the printer error.
+            assert!(
+                stderr.contains("cannot open") && stderr.contains("/nonexistent/file/path.txt"),
+                "Expected cannot-open diagnostic for first operand, got: {}",
+                stderr
+            );
+            assert!(
+                stderr.contains("printer error"),
+                "Expected second operand to still be attempted (printer error), got: {}",
+                stderr
+            );
+            assert_eq!(output.status.code(), Some(1));
+        },
+    );
+}
+
 /// Test LPDEST environment variable is used when -d is not specified
 #[test]
 fn lp_lpdest_env_used() {
@@ -160,13 +229,13 @@ fn lp_lpdest_env_used() {
             expected_err: String::from(""),
             expected_exit_code: 1,
         },
-        &[("LPDEST", "not-ipp-uri"), ("PRINTER", "")],
+        &[("LPDEST", "lpdest-printer"), ("PRINTER", "")],
         |_, output| {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            // Should fail because the URI from LPDEST is not valid ipp://
+            // LPDEST is read and resolved to a localhost URI carrying its name.
             assert!(
-                stderr.contains("invalid destination URI"),
-                "Expected invalid URI error from LPDEST, got: {}",
+                stderr.contains("printer error") && stderr.contains("lpdest-printer"),
+                "Expected printer error referencing LPDEST name, got: {}",
                 stderr
             );
             assert_eq!(output.status.code(), Some(1));
@@ -186,13 +255,13 @@ fn lp_printer_env_used() {
             expected_err: String::from(""),
             expected_exit_code: 1,
         },
-        &[("LPDEST", ""), ("PRINTER", "not-ipp-uri")],
+        &[("LPDEST", ""), ("PRINTER", "printer-name")],
         |_, output| {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            // Should fail because the URI from PRINTER is not valid ipp://
+            // PRINTER is read and resolved to a localhost URI carrying its name.
             assert!(
-                stderr.contains("invalid destination URI"),
-                "Expected invalid URI error from PRINTER, got: {}",
+                stderr.contains("printer error") && stderr.contains("printer-name"),
+                "Expected printer error referencing PRINTER name, got: {}",
                 stderr
             );
             assert_eq!(output.status.code(), Some(1));
@@ -206,7 +275,7 @@ fn lp_d_overrides_lpdest() {
     run_test_with_checker_and_env(
         TestPlan {
             cmd: String::from("lp"),
-            args: vec!["-d".to_string(), "not-a-uri".to_string()],
+            args: vec!["-d".to_string(), "dprinter".to_string()],
             stdin_data: String::from("test data"),
             expected_out: String::from(""),
             expected_err: String::from(""),
@@ -218,10 +287,10 @@ fn lp_d_overrides_lpdest() {
         ],
         |_, output| {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            // Should fail with the -d value, not the LPDEST value
+            // -d wins: the resolved URI carries the -d name, not the LPDEST host.
             assert!(
-                stderr.contains("invalid destination URI"),
-                "Expected invalid URI error from -d, got: {}",
+                stderr.contains("dprinter") && !stderr.contains("should-not-be-used"),
+                "Expected -d to take precedence over LPDEST, got: {}",
                 stderr
             );
             assert_eq!(output.status.code(), Some(1));
@@ -322,6 +391,66 @@ fn lp_n_zero_rejected() {
             assert!(
                 stderr.contains("error:") && stderr.contains("0"),
                 "Expected argument validation error for -n 0, got: {}",
+                stderr
+            );
+        },
+    );
+}
+
+/// Test that -n above i32::MAX is rejected by clap validation
+#[test]
+fn lp_n_copies_overflow_rejected() {
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("lp"),
+            args: vec![
+                "-n".to_string(),
+                "3000000000".to_string(),
+                "-d".to_string(),
+                "ipp://localhost/ipp/print".to_string(),
+            ],
+            stdin_data: String::from("test data"),
+            expected_out: String::from(""),
+            expected_err: String::from(""),
+            expected_exit_code: 2,
+        },
+        &[("LPDEST", ""), ("PRINTER", "")],
+        |_, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // Above i32::MAX must be rejected with a validation error, not sent.
+            assert!(
+                stderr.contains("error:"),
+                "Expected validation error for -n 3000000000, got: {}",
+                stderr
+            );
+            assert_eq!(output.status.code(), Some(2));
+        },
+    );
+}
+
+/// Test that a malformed -o option (no '=') produces a warning
+#[test]
+fn lp_o_malformed_warned() {
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("lp"),
+            args: vec![
+                "-o".to_string(),
+                "noequals".to_string(),
+                "-d".to_string(),
+                "ipp://localhost/ipp/print".to_string(),
+            ],
+            stdin_data: String::from("test data"),
+            expected_out: String::from(""),
+            expected_err: String::from(""),
+            expected_exit_code: 1,
+        },
+        &[("LPDEST", ""), ("PRINTER", "")],
+        |_, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("malformed -o option") && stderr.contains("noequals"),
+                "Expected malformed -o warning, got: {}",
                 stderr
             );
         },
@@ -493,11 +622,10 @@ fn lp_lpdest_over_printer() {
         &[("LPDEST", "lpdest-value"), ("PRINTER", "printer-value")],
         |_, output| {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            // Should fail because LPDEST (not PRINTER) is used and it's not a valid ipp:// URI
-            // This proves LPDEST is being read, not PRINTER
+            // LPDEST wins: the resolved URI carries the LPDEST name, not PRINTER.
             assert!(
-                stderr.contains("invalid destination URI"),
-                "Expected invalid URI error from LPDEST, got: {}",
+                stderr.contains("lpdest-value") && !stderr.contains("printer-value"),
+                "Expected LPDEST to take precedence over PRINTER, got: {}",
                 stderr
             );
             assert_eq!(output.status.code(), Some(1));
@@ -520,11 +648,10 @@ fn lp_empty_lpdest_fallback() {
         &[("LPDEST", ""), ("PRINTER", "printer-fallback")],
         |_, output| {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            // LPDEST is empty, so PRINTER should be used
-            // Should fail because PRINTER is not a valid ipp:// URI
+            // LPDEST is empty, so PRINTER is used and resolved to a localhost URI.
             assert!(
-                stderr.contains("invalid destination URI"),
-                "Expected invalid URI error from PRINTER fallback, got: {}",
+                stderr.contains("printer error") && stderr.contains("printer-fallback"),
+                "Expected printer error referencing PRINTER fallback name, got: {}",
                 stderr
             );
             assert_eq!(output.status.code(), Some(1));

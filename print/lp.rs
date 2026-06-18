@@ -8,10 +8,11 @@
 //
 
 use std::env;
-use std::fs::File;
-use std::io::{self, Cursor, Read};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode, Stdio};
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
@@ -28,17 +29,19 @@ struct Args {
     #[arg(short = 'd', help = gettext("Printer destination (IPP URI)"))]
     dest: Option<String>,
 
-    #[arg(short = 'n', default_value = "1", value_parser = clap::value_parser!(u32).range(1..), help = gettext("Number of copies to print"))]
+    // Upper-bounded to i32::MAX: the IPP `copies` attribute is a signed 32-bit
+    // integer, so a larger value would wrap negative when sent.
+    #[arg(short = 'n', default_value = "1", value_parser = clap::value_parser!(u32).range(1..=i64::from(i32::MAX)), help = gettext("Number of copies to print"))]
     copies: u32,
 
     #[arg(short = 'm', help = gettext("Send mail after printing"))]
-    _mail: bool,
+    mail: bool,
 
     #[arg(short = 's', help = gettext("Suppress messages (no request ID output)"))]
     silent: bool,
 
     #[arg(short = 'w', help = gettext("Write to terminal after printing"))]
-    _write: bool,
+    write_terminal: bool,
 
     #[arg(short = 'o', action = clap::ArgAction::Append, help = gettext("Printer-dependent options"))]
     options: Vec<String>,
@@ -72,15 +75,33 @@ fn get_destination(args: &Args) -> Result<String, String> {
     Err(gettext("no destination specified"))
 }
 
-/// Validate that the destination is a valid IPP URI
-fn validate_uri(dest: &str) -> Result<Uri, String> {
-    // Must start with ipp://
-    if !dest.starts_with("ipp://") {
-        return Err(gettext("invalid destination URI (must be ipp://...)"));
+/// Resolve a destination string into an IPP URI.
+///
+/// A value beginning with `ipp://` is used verbatim. Any other value is treated
+/// as a bare printer name (the historical System V / BSD `LPDEST`/`PRINTER`
+/// form) and resolved against the local IPP server as
+/// `ipp://localhost/printers/<name>`. Note: TLS (`ipps://`) is intentionally
+/// not supported (minimal dependencies).
+fn resolve_uri(dest: &str) -> Result<Uri, String> {
+    if dest.starts_with("ipp://") {
+        return dest
+            .parse::<Uri>()
+            .map_err(|_| gettext("invalid destination URI"));
     }
 
-    dest.parse::<Uri>()
-        .map_err(|_| gettext("invalid destination URI"))
+    // Bare printer name: reject characters that would corrupt the URI path
+    // (control characters, whitespace, or a path separator).
+    if dest.is_empty()
+        || dest
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace() || c == '/')
+    {
+        return Err(format!("{}: {}", gettext("invalid destination name"), dest));
+    }
+
+    format!("ipp://localhost/printers/{}", dest)
+        .parse::<Uri>()
+        .map_err(|_| format!("{}: {}", gettext("invalid destination name"), dest))
 }
 
 /// Read input data from a file or stdin.
@@ -155,8 +176,14 @@ fn send_print_job(
                 IppValue::Keyword(value.to_string())
             };
             builder = builder.attribute(IppAttribute::new(name, ipp_value));
+        } else {
+            // Not in IPP `name=value` attribute format: warn and skip.
+            eprintln!(
+                "lp: {}: {}",
+                gettext("ignoring malformed -o option (expected name=value)"),
+                opt
+            );
         }
-        // Ignore options without '=' as they're not valid IPP attribute format
     }
 
     let operation = builder.build();
@@ -165,7 +192,7 @@ fn send_print_job(
     let client = IppClient::new(uri.clone());
     let response = client
         .send(operation)
-        .map_err(|e| format!("{}: {}", gettext("printer error"), e))?;
+        .map_err(|e| format!("{} ({}): {}", gettext("printer error"), uri, e))?;
 
     // Check response status
     let status = response.header().status_code();
@@ -178,22 +205,150 @@ fn send_print_job(
         ));
     }
 
-    // Extract job-id from response
+    // Extract job-id from response. POSIX 103065 mandates a unique request ID,
+    // so a response lacking job-id is an error rather than a fabricated "-0".
     let job_id = response
         .attributes()
         .groups_of(DelimiterTag::JobAttributes)
         .flat_map(|g| g.attributes().get("job-id"))
         .flat_map(|attr| attr.value().as_integer().copied())
-        .next()
-        .unwrap_or(0);
+        .next();
 
-    Ok(job_id)
+    job_id.ok_or_else(|| gettext("printer response missing job-id"))
 }
 
-fn do_lp(mut args: Args) -> Result<(), String> {
-    // Get and validate destination
+/// Maximum time to wait for a submitted job to reach a terminal state.
+const POLL_TIMEOUT: Duration = Duration::from_secs(120);
+/// Interval between job-state polls.
+const POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Terminal outcome of waiting for a print job.
+enum JobOutcome {
+    Completed,
+    Canceled,
+    Aborted,
+    /// Did not reach a terminal state within the timeout, or could not be queried.
+    Unknown,
+}
+
+fn outcome_text(outcome: &JobOutcome) -> String {
+    match outcome {
+        JobOutcome::Completed => gettext("completed"),
+        JobOutcome::Canceled => gettext("canceled"),
+        JobOutcome::Aborted => gettext("aborted"),
+        JobOutcome::Unknown => gettext("status unknown"),
+    }
+}
+
+/// Poll a submitted job until it reaches a terminal state or the timeout
+/// elapses. Honors the "after the files have been printed" wording for -m/-w.
+fn wait_for_job(client: &IppClient, uri: &Uri, job_id: i32) -> JobOutcome {
+    let deadline = Instant::now() + POLL_TIMEOUT;
+    loop {
+        let op = IppOperationBuilder::get_job_attributes(uri.clone(), job_id)
+            .user_name(get_username())
+            .build();
+        let state = match client.send(op) {
+            Ok(resp) => resp
+                .attributes()
+                .groups_of(DelimiterTag::JobAttributes)
+                .flat_map(|g| g.attributes().get(IppAttribute::JOB_STATE))
+                .flat_map(|attr| attr.value().as_enum().copied())
+                .next(),
+            // Cannot query the job; give up rather than spin.
+            Err(_) => return JobOutcome::Unknown,
+        };
+
+        match state {
+            Some(s) if s == JobState::Completed as i32 => return JobOutcome::Completed,
+            Some(s) if s == JobState::Canceled as i32 => return JobOutcome::Canceled,
+            Some(s) if s == JobState::Aborted as i32 => return JobOutcome::Aborted,
+            _ => {}
+        }
+
+        if Instant::now() >= deadline {
+            return JobOutcome::Unknown;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Reject recipient names with characters that could inject extra mail headers
+/// or sendmail arguments.
+fn recipient_is_safe(recipient: &str) -> bool {
+    !recipient.is_empty()
+        && recipient
+            .chars()
+            .all(|c| !c.is_control() && !c.is_whitespace() && c != '<' && c != '>')
+}
+
+/// Best-effort delivery of a completion mail via the local sendmail program.
+fn send_mail(recipient: &str, subject: &str, body: &str) -> bool {
+    if !recipient_is_safe(recipient) {
+        return false;
+    }
+    let sendmail = [
+        "/usr/sbin/sendmail",
+        "/usr/lib/sendmail",
+        "/usr/bin/sendmail",
+    ]
+    .into_iter()
+    .find(|p| Path::new(p).exists());
+    let sendmail = match sendmail {
+        Some(p) => p,
+        None => return false,
+    };
+    let mut child = match Command::new(sendmail)
+        .args(["-t", "-oi"])
+        .stdin(Stdio::piped())
+        // Silence MTA diagnostics so they don't leak into lp's stderr.
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let message = format!("To: {recipient}\nSubject: {subject}\n\n{body}\n");
+        let _ = stdin.write_all(message.as_bytes());
+    }
+    child.wait().map(|s| s.success()).unwrap_or(false)
+}
+
+/// Best-effort write of a message to the controlling terminal.
+fn write_to_terminal(message: &str) {
+    if let Ok(mut tty) = OpenOptions::new().write(true).open("/dev/tty") {
+        let _ = tty.write_all(message.as_bytes());
+    }
+}
+
+/// Wait for all submitted jobs to finish, then deliver -m / -w notifications.
+fn notify_after_print(uri: &Uri, args: &Args, jobs: &[(i32, String)]) {
+    let client = IppClient::new(uri.clone());
+    let mut lines = Vec::with_capacity(jobs.len());
+    for (job_id, request_id) in jobs {
+        let outcome = wait_for_job(&client, uri, *job_id);
+        lines.push(format!("{}: {}", request_id, outcome_text(&outcome)));
+    }
+    let body = lines.join("\n");
+
+    if args.mail {
+        let _ = send_mail(&get_username(), &gettext("lp: print job completed"), &body);
+    }
+    if args.write_terminal {
+        let message = format!("lp: {}\n{}\n", gettext("print job completed"), body);
+        write_to_terminal(&message);
+    }
+}
+
+/// Process all operands. Returns `Ok(true)` if any file failed (so the caller
+/// exits non-zero), `Ok(false)` if all succeeded, or `Err` for a fatal setup
+/// error (bad destination) that aborts before any file is processed.
+fn do_lp(mut args: Args) -> Result<bool, String> {
+    // Get and validate destination (fatal — aborts before processing files).
     let dest = get_destination(&args)?;
-    let uri = validate_uri(&dest)?;
+    let uri = resolve_uri(&dest)?;
 
     // Determine input sources
     let files: Vec<PathBuf> = if args.files.is_empty() {
@@ -202,7 +357,12 @@ fn do_lp(mut args: Args) -> Result<(), String> {
         std::mem::take(&mut args.files)
     };
 
-    // Process each file
+    // Per-file errors are reported but do not abort the remaining operands
+    // (CONSEQUENCES OF ERRORS is Default; each file is independent).
+    let mut had_error = false;
+    // Successfully submitted jobs: (job-id, request-id) for -m/-w notification.
+    let mut submitted: Vec<(i32, String)> = Vec::new();
+
     for file in &files {
         let file_name = if file.to_string_lossy() == "-" {
             None
@@ -211,19 +371,38 @@ fn do_lp(mut args: Args) -> Result<(), String> {
         };
 
         // Read input data
-        let data = read_input(file)
-            .map_err(|e| format!("{} '{}': {}", gettext("cannot open"), file.display(), e))?;
+        let data = match read_input(file) {
+            Ok(data) => data,
+            Err(e) => {
+                eprintln!("lp: {} '{}': {}", gettext("cannot open"), file.display(), e);
+                had_error = true;
+                continue;
+            }
+        };
 
         // Send print job
-        let job_id = send_print_job(&uri, data, &args, file_name)?;
+        let job_id = match send_print_job(&uri, data, &args, file_name) {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!("lp: {}", e);
+                had_error = true;
+                continue;
+            }
+        };
 
         // Output request ID unless silent
         if !args.silent {
             print!("{}", format_request_id(&dest, job_id));
         }
+        submitted.push((job_id, format!("{}-{}", dest, job_id)));
     }
 
-    Ok(())
+    // -m / -w: wait for the submitted jobs to finish printing, then notify.
+    if (args.mail || args.write_terminal) && !submitted.is_empty() {
+        notify_after_print(&uri, &args, &submitted);
+    }
+
+    Ok(had_error)
 }
 
 fn main() -> ExitCode {
@@ -234,10 +413,51 @@ fn main() -> ExitCode {
     let args = Args::parse();
 
     match do_lp(args) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::SUCCESS,
+        // Per-file errors were already reported inside do_lp.
+        Ok(true) => ExitCode::FAILURE,
         Err(e) => {
             eprintln!("lp: {}", e);
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_uri_bare_name() {
+        let uri = resolve_uri("myprinter").unwrap();
+        assert_eq!(uri.to_string(), "ipp://localhost/printers/myprinter");
+    }
+
+    #[test]
+    fn resolve_uri_full_uri_passthrough() {
+        let uri = resolve_uri("ipp://host/ipp/print").unwrap();
+        assert_eq!(uri.to_string(), "ipp://host/ipp/print");
+    }
+
+    #[test]
+    fn resolve_uri_rejects_bad_name() {
+        assert!(resolve_uri("bad/name").is_err());
+        assert!(resolve_uri("has space").is_err());
+        assert!(resolve_uri("").is_err());
+    }
+
+    #[test]
+    fn recipient_is_safe_accepts_plain_names() {
+        assert!(recipient_is_safe("alice"));
+        assert!(recipient_is_safe("user.name-1"));
+    }
+
+    #[test]
+    fn recipient_is_safe_rejects_injection() {
+        assert!(!recipient_is_safe(""));
+        assert!(!recipient_is_safe("a b"));
+        assert!(!recipient_is_safe("a\nb"));
+        assert!(!recipient_is_safe("a<b"));
+        assert!(!recipient_is_safe("a>b"));
     }
 }

@@ -84,6 +84,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] ln
  - [x] locale (i18n)
  - [x] ls
+ - [x] lp
  - [x] m4
  - [x] mailx
  - [x] make
@@ -189,7 +190,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] write
  - [x] id
  - [x] ipcs (IPC)
- - [x] lp
  - [x] zcat (compress cat.)
 
 ## Stage 2 - Feature-complete and POSIX compliant

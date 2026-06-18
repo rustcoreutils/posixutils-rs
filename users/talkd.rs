@@ -412,10 +412,20 @@ fn write_announcement(tty_path: &str, caller: &str) -> io::Result<()> {
         return Err(io::Error::other("not a terminal device"));
     }
 
+    // SECURITY: `caller` comes from an untrusted datagram and is written to the
+    // recipient's terminal. Strip control characters so a hostile name cannot
+    // inject terminal escape sequences (cursor/screen manipulation), and bound
+    // the length. A real POSIX login name survives this unchanged.
+    let safe_caller: String = caller
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(32)
+        .collect();
+
     let banner = format!(
         "\x07\r\nMessage from Talk_Daemon...\r\n\
-         talk: connection requested by {caller}.\r\n\
-         talk: respond with:  talk {caller}\r\n"
+         talk: connection requested by {safe_caller}.\r\n\
+         talk: respond with:  talk {safe_caller}\r\n"
     );
     OpenOptions::new()
         .write(true)
@@ -858,6 +868,28 @@ mod tests {
             new_addr,
             "refresh updates the TCP address"
         );
+    }
+
+    #[test]
+    fn test_caller_name_control_chars_stripped() {
+        // The sanitization applied before a tty write must drop control bytes
+        // (terminal-escape-injection guard) while preserving a normal name.
+        let hostile = "bob\x1b[2J\x07\r\nevil";
+        let safe: String = hostile
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(32)
+            .collect();
+        assert_eq!(safe, "bob[2Jevil");
+        assert!(!safe.chars().any(|c| c.is_control()));
+
+        let normal = "alice.dev_1";
+        let safe_normal: String = normal
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(32)
+            .collect();
+        assert_eq!(safe_normal, normal, "a normal login name is unchanged");
     }
 
     #[test]

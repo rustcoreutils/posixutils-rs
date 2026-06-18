@@ -910,7 +910,7 @@ entire reason a talk daemon exists — is unimplemented.
 - [ ] Resolve callee / logged-in check — MISSING (#TD2).
 - [ ] `mesg n` / tty group-write check — MISSING (#TD3).
 - [ ] Write banner to recipient tty — MISSING (#TD1).
-- [ ] Attacker-controllable tty path — N/A today (never writes a tty) — but `r_tty` is taken untrusted (:165) and would feed any future tty-write path unchecked.
+- [x] Attacker-controllable tty write — ✓ hardened (phase 11 + security follow-up): the announce target tty is validated as a char device under `/dev`, and the untrusted `caller` name is stripped of control characters before the banner is written (terminal-escape-injection guard, flagged by the commit security review; unit-tested). `r_tty` is only matched against utmpx entries, never written.
 
 #### Datagram parsing safety
 - [x] Short/truncated packet — graceful: `recv_from` into `[0u8;1024]` (:405,411); `CtlMsg::from_bytes` (:152) binrw `read_be` returns `Err` (not panic) on EOF; loop logs + `continue`s (:423-429). Verified no `unwrap`/`expect`/indexing on the network path (only `unwrap_or` :434, slice `buf[..len]` with `len≤1024`).

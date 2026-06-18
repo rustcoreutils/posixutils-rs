@@ -7,9 +7,10 @@
 // SPDX-License-Identifier: MIT
 //
 
-// Note: stty tests are omitted because stty requires a terminal (TTY)
-// and automated test environments typically don't provide one.
-// See screen/tests/stty/mod.rs for details.
+// stty/tabs PTY-backed tests use the shared `common` harness; tput and the
+// argument-parsing paths of tabs use plain subprocess tests.
 
+mod common;
+mod stty;
 mod tabs;
 mod tput;

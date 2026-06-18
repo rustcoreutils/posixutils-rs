@@ -1943,6 +1943,7 @@ dependencies = [
  "gettext-rs",
  "libc",
  "plib",
+ "portable-pty",
  "terminfo 0.8.0",
  "termios",
 ]

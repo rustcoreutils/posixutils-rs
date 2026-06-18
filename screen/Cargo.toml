@@ -16,6 +16,7 @@ libc.workspace = true
 
 [dev-dependencies]
 plib = { path = "../plib" }
+portable-pty = "0.9"
 
 [lints]
 workspace = true

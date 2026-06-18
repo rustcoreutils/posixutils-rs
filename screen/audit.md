@@ -66,8 +66,8 @@ the speed table mis-keys `B50` as `"54"`. Diagnostics are hardcoded English.
 
 #### Critical
 
-- [ ] **#1 — `stty <single mode operand>` panics (assertion failure, exit 101).** `stty.rs:642` (`assert!(args.operands.len() > 1)`) at the top of `stty_set_long`. `stty_set` (`stty.rs:778-784`) routes any non-`pfmt1` operand list to `stty_set_long`, including a list of length 1. So `stty sane`, `stty raw`, `stty cs8`, `stty parenb`, `stty -8` etc. all abort. **Behaviorally confirmed under a PTY:** `stty parenb` → `panicked at screen/stty.rs:642 … assertion failed: args.operands.len() > 1`, exit 101. This is the most common stty usage form. Fix: change the assertion to `>= 1` (or delete it; the `while idx < len` loop already handles any length).
-- [ ] **#2 — Negation operands (`-echo`, `-icanon`, `-parenb`, …) are rejected by clap before stty ever sees them.** `stty.rs:34-59` declares `operands: Vec<String>` with no `allow_hyphen_values`/`trailing_var_arg`. clap treats a leading-`-` token as an option cluster. **Behaviorally confirmed:** `stty -echo` → `error: unexpected argument '-e' found`, exit 2. The internal set logic *does* implement negation (`stty.rs:657-665` `strip_prefix("-")`), so the entire negation surface is dead code. Fix: add `#[arg(allow_hyphen_values = true)]` (or `trailing_var_arg`) to the `operands` field so `-flag` operands reach `stty_set_long`.
+- [x] **#1 — `stty <single mode operand>` panics (assertion failure, exit 101).** ✓ fixed (Phase 1): assertion changed to `!args.operands.is_empty()`; regression `test_stty_single_operand_no_panic`. `stty.rs:642` (`assert!(args.operands.len() > 1)`) at the top of `stty_set_long`. `stty_set` (`stty.rs:778-784`) routes any non-`pfmt1` operand list to `stty_set_long`, including a list of length 1. So `stty sane`, `stty raw`, `stty cs8`, `stty parenb`, `stty -8` etc. all abort. **Behaviorally confirmed under a PTY:** `stty parenb` → `panicked at screen/stty.rs:642 … assertion failed: args.operands.len() > 1`, exit 101. This is the most common stty usage form. Fix: change the assertion to `>= 1` (or delete it; the `while idx < len` loop already handles any length).
+- [x] **#2 — Negation operands (`-echo`, `-icanon`, `-parenb`, …) are rejected by clap before stty ever sees them.** ✓ fixed (Phase 1): `#[arg(allow_hyphen_values = true)]` on `operands`; `-a`/`-g` still parse as options; regression `test_stty_negation_operand_applied`. `stty.rs:34-59` declares `operands: Vec<String>` with no `allow_hyphen_values`/`trailing_var_arg`. clap treats a leading-`-` token as an option cluster. **Behaviorally confirmed:** `stty -echo` → `error: unexpected argument '-e' found`, exit 2. The internal set logic *does* implement negation (`stty.rs:657-665` `strip_prefix("-")`), so the entire negation surface is dead code. Fix: add `#[arg(allow_hyphen_values = true)]` (or `trailing_var_arg`) to the `operands` field so `-flag` operands reach `stty_set_long`.
 
 #### Major
 
@@ -148,8 +148,8 @@ the speed table mis-keys `B50` as `"54"`. Diagnostics are hardcoded English.
 needs a TTY. The unit-test-able pure functions are untested.
 
 Not covered (all map to findings):
-- [ ] `stty <single operand>` does not panic (#1) — trivially reproducible with a PTY harness (as used in this audit).
-- [ ] Negation operand `-echo` reaches the set path (#2).
+- [x] `stty <single operand>` does not panic (#1) — `test_stty_single_operand_no_panic` (PTY harness).
+- [x] Negation operand `-echo` reaches the set path (#2) — `test_stty_negation_operand_applied`.
 - [ ] `stty erase x` single-char assignment (#3).
 - [ ] `rows`/`cols`/`size` (#4).
 - [ ] `parse`/`merge_map`/`set_ti_flag`/`speed_to_str` pure-function unit tests (no TTY needed).

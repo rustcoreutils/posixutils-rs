@@ -54,7 +54,7 @@ struct Args {
     )]
     save: bool,
 
-    #[arg(help = gettext("List of terminal configuration commands"))]
+    #[arg(allow_hyphen_values = true, help = gettext("List of terminal configuration commands"))]
     operands: Vec<String>,
 }
 
@@ -639,7 +639,7 @@ fn handle_combination_mode(ti: &mut Termios, operand: &str, negate: bool) -> Opt
 
 // update termio settings based on setting-per-arg parsed values
 fn stty_set_long(mut ti: Termios, args: &Args) -> io::Result<()> {
-    assert!(args.operands.len() > 1);
+    assert!(!args.operands.is_empty());
 
     // load static list of params
     let tty_params = osdata::load_params();

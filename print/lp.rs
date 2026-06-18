@@ -197,9 +197,14 @@ fn send_print_job(
     // Check response status
     let status = response.header().status_code();
     if !status.is_success() {
+        // Include the destination URI, consistent with the transport-error path
+        // above. (Without it, this diagnostic varied by platform: a host with a
+        // live IPP server — e.g. macOS CUPS — reaches here, while a host without
+        // one fails at `send` above.)
         return Err(format!(
-            "{}: {} (0x{:04x})",
+            "{} ({}): {} (0x{:04x})",
             gettext("printer error"),
+            uri,
             status,
             status.to_u16().unwrap_or(0)
         ));

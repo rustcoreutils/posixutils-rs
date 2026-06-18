@@ -12,6 +12,7 @@ use std::{
     fs::{File, Permissions},
     io::Read,
     os::unix::fs::PermissionsExt,
+    path::PathBuf,
 };
 
 const RWX: u32 = 0o7;
@@ -273,4 +274,126 @@ fn uudecode_truncated_header_no_panic() {
 fn uudecode_bad_mode_no_panic() {
     // Non-octal mode previously hit u32::from_str_radix(...).expect(...).
     uudecode_expect_graceful_failure(b"begin xyz out.txt\nM(2)Q\n");
+}
+
+// =============================================================================
+// uudecode spec semantics — regression tests for audit #UD2..#UD6.
+// Base64 of b"hi\n" (0x68,0x69,0x0a) is "aGkK".
+// =============================================================================
+
+fn unique_tmp(name: &str) -> PathBuf {
+    let mut p = std::env::temp_dir();
+    p.push(format!("xform_uue_{}_{}", std::process::id(), name));
+    p
+}
+
+fn running_as_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+#[test]
+fn uudecode_dash_cookie_to_stdout() {
+    // A decode pathname of '-' in the header means standard output (#UD2).
+    run_test(TestPlan {
+        cmd: String::from("uudecode"),
+        args: vec![],
+        stdin_data: String::from("begin-base64 644 -\naGkK\n====\n"),
+        expected_out: String::from("hi\n"),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn uudecode_o_dash_overrides_to_stdout() {
+    // -o - means stdout and must not create the header's named file (#UD2).
+    let bogus = unique_tmp("should_not_be_created");
+    let _ = std::fs::remove_file(&bogus);
+    let input = format!("begin-base64 644 {}\naGkK\n====\n", bogus.display());
+    run_test(TestPlan {
+        cmd: String::from("uudecode"),
+        args: vec![String::from("-o"), String::from("-")],
+        stdin_data: input,
+        expected_out: String::from("hi\n"),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+    assert!(!bogus.exists(), "-o - must not create the header's file");
+}
+
+#[test]
+fn uudecode_scans_for_begin_line() {
+    // The begin line need not be the first input line (#UD3).
+    run_test(TestPlan {
+        cmd: String::from("uudecode"),
+        args: vec![],
+        stdin_data: String::from("From: a@b\nSubject: x\n\nbegin-base64 644 -\naGkK\n====\n"),
+        expected_out: String::from("hi\n"),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn uudecode_base64_tolerates_crlf_and_whitespace() {
+    // CRLF transport and stray whitespace must be ignored, not error (#UD4).
+    run_test(TestPlan {
+        cmd: String::from("uudecode"),
+        args: vec![],
+        stdin_data: String::from("begin-base64 644 -\r\naGkK \r\n====\r\n"),
+        expected_out: String::from("hi\n"),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn uudecode_overwrites_existing_writable_file() {
+    // Existing writable target is overwritten in place (#UD5).
+    let target = unique_tmp("existing_writable.txt");
+    std::fs::write(&target, b"OLD CONTENT").unwrap();
+    let output = run_test_base(
+        &String::from("uudecode"),
+        &vec![String::from("-o"), target.to_str().unwrap().to_string()],
+        b"begin-base64 644 ignored\naGkK\n====\n",
+    );
+    let code = output.status.code();
+    let got = std::fs::read(&target).unwrap();
+    let _ = std::fs::remove_file(&target);
+    assert_eq!(
+        code,
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(got, b"hi\n");
+}
+
+#[test]
+fn uudecode_readonly_target_errors() {
+    // Existing non-writable target → error, file left unchanged (#UD5).
+    if running_as_root() {
+        return; // root bypasses W_OK
+    }
+    let target = unique_tmp("readonly.txt");
+    std::fs::write(&target, b"KEEP").unwrap();
+    let mut perm = std::fs::metadata(&target).unwrap().permissions();
+    perm.set_mode(0o444);
+    std::fs::set_permissions(&target, perm).unwrap();
+
+    let output = run_test_base(
+        &String::from("uudecode"),
+        &vec![String::from("-o"), target.to_str().unwrap().to_string()],
+        b"begin-base64 644 ignored\naGkK\n====\n",
+    );
+
+    // Restore perms so cleanup can remove it.
+    let mut perm = std::fs::metadata(&target).unwrap().permissions();
+    perm.set_mode(0o644);
+    let _ = std::fs::set_permissions(&target, perm);
+    let content = std::fs::read(&target).unwrap();
+    let _ = std::fs::remove_file(&target);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(content, b"KEEP", "read-only target must be left unchanged");
 }

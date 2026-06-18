@@ -386,38 +386,38 @@ check** while treating a failed `set_permissions` as fatal.
   `io::Error`s; decode on bytes, not `String`.
 
 #### Major
-- [ ] **#UD2 — `-` magic cookie not honored.** Defect 1544 (119816-119818)
+- [x] **#UD2 — `-` magic cookie not honored.** ✓ fixed (phase 2) — `is_stdout_cookie` accepts `-` and `/dev/stdout` for both `-o` and the header. Defect 1544 (119816-119818)
   requires an output pathname of `-` (from `-o -` *or* the header) to mean
   standard output. Only `/dev/stdout` is special-cased (`uudecode.rs:154`);
   `-` would create a file literally named `-`. Fix: treat both `-` and
   `/dev/stdout` as the stdout cookie for `-o` and the header path.
-- [ ] **#UD3 — does not scan for the begin line.** Spec DESCRIPTION
+- [x] **#UD3 — does not scan for the begin line.** ✓ fixed (phase 2) — input is scanned for a `begin`/`begin-base64` line. Spec DESCRIPTION
   (119705-119707): "scan the input file, searching for data compatible with one
   of the formats". The code takes `lines.next()` as the header
   (`uudecode.rs:119-120`) and panics if line 1 is not `begin`/`begin-base64`,
   so a `begin` preceded by mail headers / blank lines fails. Fix: skip lines
   until a valid begin header is found.
-- [ ] **#UD4 — Base64 decoder is strict.** Spec 119899-119900: "All line breaks
+- [x] **#UD4 — Base64 decoder is strict.** ✓ fixed (phase 2) — each line is alphabet-filtered before decode (ignores CR/whitespace/stray chars). Spec 119899-119900: "All line breaks
   or other characters not found in the table shall be ignored by decoding
   software." The whole line is handed to `BASE64_STANDARD.decode`
   (`uudecode.rs:96-99`), which errors on a trailing `\r` (CRLF transport),
   embedded spaces, etc. The historical path replaces backtick→space
   (`uudecode.rs:125`) but does not strip `\r`. Fix: filter to the alphabet
   before decoding.
-- [ ] **#UD5 — existing-file write-permission check missing; overwrite is
+- [x] **#UD5 — existing-file write-permission check missing; overwrite is
   unlink+create.** Spec 119716-119720: if the target exists and the user lacks
   write permission, terminate with an error; if writable, overwrite in place.
   The code unconditionally `remove_file` then `File::create`
   (`uudecode.rs:156-161`), which depends only on directory write permission
   (bypassing the file's own perms) and changes inode/ownership. Fix: check
   write access; truncate-in-place rather than unlink.
-- [ ] **#UD6 — failed `set_permissions` treated as fatal.** `set_permissions(…)?`
+- [x] **#UD6 — failed `set_permissions` treated as fatal.** ✓ fixed (phase 2) — `set_permissions` result is ignored. `set_permissions(…)?`
   (`uudecode.rs:168`) propagates as an error. Spec 119719-119720: "if the mode
   bits cannot be set, uudecode shall not treat this as an error." Fix: ignore
   the error (`let _ =`).
 
 #### Minor
-- [ ] **#UD7 — mode parsing edge cases.** `from_str_radix(mode_str, 8)`
+- [x] **#UD7 — mode parsing edge cases.** ✓ fixed (phase 2) — parsed mode masked to `0o7777`; symbolic mode documented out of scope. `from_str_radix(mode_str, 8)`
   (`uudecode.rs:66`) accepts arbitrary-width octal and `(mode>>9<<9)|bits`
   (`uudecode.rs:164`) can fold a 4-digit header (e.g. `4755`) into setuid bits;
   symbolic chmod notation (spec 119714-119715, "unspecified" initial mode) is
@@ -431,24 +431,24 @@ check** while treating a failed `set_permissions` as fatal.
 #### Options / operands / STDIN
 - [x] `-o outfile` override CONFORMS — `args.outfile … unwrap_or(&header.out)`
   (`uudecode.rs:152`).
-- [ ] **`-o -` (and header `-`) DIVERGES** — see #UD2.
+- [x] **`-o -` (and header `-`) DIVERGES** — see #UD2 (✓ phase 2).
 - [x] `file` operand / no-operand stdin CONFORMS — `uudecode.rs:105-116`.
-- [ ] **scan-for-header MISSING** — see #UD3.
+- [x] **scan-for-header MISSING** — see #UD3 (✓ phase 2).
 
 #### Decode correctness
 - [x] historical decode CONFORMS on well-formed lines — `uudecode.rs:77-93`,
   backtick→space + per-line length truncation (`uudecode.rs:124-139`).
 - [x] Base64 decode CONFORMS on well-formed lines — `uudecode.rs:95-99`;
   `====` terminator (`uudecode.rs:144-146`).
-- [ ] **lenient decode of transport artifacts MISSING** — see #UD4.
+- [x] **lenient decode of transport artifacts MISSING** — see #UD4 (✓ phase 2).
 - [x] **robustness on malformed input CRITICAL** — see #UD1 (✓ fixed, phase 1).
 
 #### Output file / mode
 - [x] `/dev/stdout` → stdout CONFORMS — `uudecode.rs:154-155`.
 - [x] mode bits from data, umask not affecting final CONFORMS — explicit
   `set_mode` after create (`uudecode.rs:162-168`); spec 119711-119713.
-- [ ] **write-permission check / in-place overwrite DIVERGES** — see #UD5.
-- [ ] **failed set-mode fatal DIVERGES** — see #UD6.
+- [x] **write-permission check / in-place overwrite DIVERGES** — see #UD5 (✓ phase 2).
+- [x] **failed set-mode fatal DIVERGES** — see #UD6 (✓ phase 2).
 
 #### Exit / locale
 - [x] EXIT STATUS 0/>0 CONFORMS on graceful errors — `uudecode.rs:188-195`
@@ -460,10 +460,10 @@ check** while treating a failed `set_permissions` as fatal.
 Not covered:
 - [x] Malformed / truncated / non-UTF-8 input (should diagnose + exit >0) —
   #UD1 (✓ phase 1).
-- [ ] `-o -` and header pathname `-` → stdout — #UD2.
-- [ ] Header not on line 1 (leading mail headers) — #UD3.
-- [ ] CRLF / whitespace-padded encoded lines — #UD4.
-- [ ] Decode to an existing read-only file — #UD5.
+- [x] `-o -` and header pathname `-` → stdout — #UD2 (✓ phase 2).
+- [x] Header not on line 1 (leading mail headers) — #UD3 (✓ phase 2).
+- [x] CRLF / whitespace-padded encoded lines — #UD4 (✓ phase 2).
+- [x] Decode to an existing read-only file — #UD5 (✓ phase 2).
 
 ---
 

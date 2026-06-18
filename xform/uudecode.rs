@@ -10,10 +10,10 @@
 use base64::prelude::*;
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use std::fs::{remove_file, File};
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// uudecode - decode a binary file
 #[derive(Parser)]
@@ -50,6 +50,22 @@ fn strip_cr(line: &[u8]) -> &[u8] {
     match line.split_last() {
         Some((b'\r', init)) => init,
         _ => line,
+    }
+}
+
+/// The magic cookies `-` and `/dev/stdout` both mean "write to standard output"
+/// (POSIX.1-2024, Austin Group Defect 1544).
+fn is_stdout_cookie(path: &Path) -> bool {
+    let s = path.as_os_str();
+    s == "-" || s == "/dev/stdout"
+}
+
+/// Whether the caller has write permission on an existing path (access(2), W_OK).
+fn is_writable(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    match std::ffi::CString::new(path.as_os_str().as_bytes()) {
+        Ok(c) => unsafe { libc::access(c.as_ptr(), libc::W_OK) == 0 },
+        Err(_) => false,
     }
 }
 
@@ -106,8 +122,15 @@ fn decode_historical_line(line: &[u8]) -> Vec<u8> {
 }
 
 fn decode_base64_line(line: &[u8]) -> io::Result<Vec<u8>> {
+    // Per spec (119899-119900), characters not in the Base64 alphabet (line breaks,
+    // stray whitespace, CR from CRLF transport, ...) are ignored by decoders.
+    let filtered: Vec<u8> = line
+        .iter()
+        .copied()
+        .filter(|&b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
+        .collect();
     BASE64_STANDARD
-        .decode(line)
+        .decode(&filtered)
         .map_err(|_| invalid("invalid base64 data"))
 }
 
@@ -128,9 +151,18 @@ fn decode_file(args: &Args) -> io::Result<()> {
         file.read_to_end(&mut buf)?;
     }
 
+    // Scan the input for the begin line (it need not be the first line — the
+    // encoded stream may be wrapped in a mail message or preceded by other text).
     let mut lines = buf.split(|&b| b == b'\n');
-    let header_line = lines.next().ok_or_else(|| invalid("no header line"))?;
-    let header = Header::parse(strip_cr(header_line))?;
+    let header = loop {
+        let line = match lines.next() {
+            Some(l) => strip_cr(l),
+            None => return Err(invalid("no uuencode header found")),
+        };
+        if line.starts_with(b"begin ") || line.starts_with(b"begin-base64 ") {
+            break Header::parse(line)?;
+        }
+    };
 
     match header.dec_type {
         DecodingType::Historical => {
@@ -180,21 +212,29 @@ fn decode_file(args: &Args) -> io::Result<()> {
 
     let out_path = args.outfile.as_ref().unwrap_or(&header.out);
 
-    if out_path == &PathBuf::from("/dev/stdout") {
+    if is_stdout_cookie(out_path) {
         io::stdout().write_all(&out)?;
     } else {
-        if out_path.exists() {
-            remove_file(out_path)?;
+        // If the target exists and the user lacks write permission, terminate with
+        // an error (spec 119716-119718). Otherwise overwrite the file in place
+        // (File::create truncates, keeping the inode) — do not unlink it.
+        if out_path.exists() && !is_writable(out_path) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "output file is not writable",
+            ));
         }
 
         let mut o_file = File::create(out_path)?;
         let mut o_file_perm = o_file.metadata()?.permissions();
         let o_file_perm_mode = o_file_perm.mode();
-        let new_o_file_perm_mode = ((o_file_perm_mode >> 9) << 9) | header.lower_perm_bits;
+        let new_o_file_perm_mode =
+            ((o_file_perm_mode >> 9) << 9) | (header.lower_perm_bits & 0o7777);
         o_file_perm.set_mode(new_o_file_perm_mode);
 
         o_file.write_all(&out)?;
-        o_file.set_permissions(o_file_perm)?;
+        // If the mode bits cannot be set, this is not an error (spec 119719-119720).
+        let _ = o_file.set_permissions(o_file_perm);
     }
 
     Ok(())

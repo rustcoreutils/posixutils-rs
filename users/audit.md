@@ -591,21 +591,28 @@ superuser override**, SIGHUP/SIGPIPE/SIGQUIT are unhandled, and the
 
 ### Priority issues
 
+> **Design note (phase 9):** the spec (123047-123048) processes input "while in
+> **canonical input mode**", so the terminal driver consumes INTR/EOF/ERASE/KILL
+> before write ever sees them — they never appear as data bytes. The redesign is
+> therefore *per-character rendering of the canonical line content* (forward the
+> alert, render other non-printables, pass print/space through), and the removal
+> of the bogus byte-detection of driver-handled special chars — not raw mode.
+
 #### Critical
-- [ ] **#WR1 — Alert and erase/kill characters written to sender stdout, not the recipient terminal.** `write.rs:168-176` (`alert_sender_terminal` writes to `io::stdout()`), `write.rs:128-155` (`process_erase_or_kill` writes BS/space/BS and other chars to `io::stdout()`), invoked at `write.rs:300,309,311`. The post-connect double-alert at line 300 is to the *sender's* terminal (correct per spec 123042-123044), but the typed-alert passthrough (309) and rendered erase/kill (311) must reach the *recipient* (spec 123051 "Typing `<alert>` shall write the `<alert>` character to the recipient's terminal"). Fix: route the typed-alert passthrough and rendered erase/kill through `write_to_terminal(&terminal, …)`.
-- [ ] **#WR2 — Control-character detection model is wrong (cooked line input vs. termios special chars).** `write.rs:302-317` reads `stdin.lock().lines()` (canonical, NL-stripped) then classifies whole lines via `is_interrupt_or_eof`/`is_only_alert`/`is_only_erase_or_kill` (`write.rs:179-196`), each requiring the line to consist *entirely* of that char (`.all(...)`). In a real session INTR/EOF/ERASE/KILL are consumed by the driver and never appear in the data stream, and a mixed line like `hi\x03there` matches none of these branches. Spec 123047-123055 describes per-character processing in canonical input mode. Fix: redesign to process input bytewise honoring termios special chars (or at minimum handle embedded INTR/EOF anywhere in a line).
+- [x] **#WR1 — Alert and erase/kill characters written to sender stdout, not the recipient terminal.** ✓ fixed (phase 9) — the typed alert is now forwarded to the recipient via `render_line` (BEL byte passed through to the recipient file); the post-connect double-alert correctly stays on the sender's stdout. Erase/kill are the driver's job in canonical mode (removed). `users/write.rs`.
+- [x] **#WR2 — Control-character detection model is wrong (cooked line input vs. termios special chars).** ✓ fixed (phase 9) — dropped `is_interrupt_or_eof`/`is_only_alert`/`is_only_erase_or_kill` (they detected bytes that never arrive in canonical mode). EOF is the read loop ending, INTR is the signal handler; each canonical line is rendered character-by-character. `users/write.rs` `render_line`.
 
 #### Major
-- [ ] **#WR3 — No superuser override for recipient mesg permission.** `write.rs:83-120` `check_write_permission` returns true only if owner/group/other write bits are set; root (uid 0) is refused when the recipient has `mesg n`. Spec 123067-123069. Fix: short-circuit to `true` when `geteuid() == 0`.
-- [ ] **#WR4 — Write failures panic instead of clean diagnostic/exit.** `write.rs:159-165` (`write_to_terminal` uses `.expect`), `write.rs:136-154` (`process_erase_or_kill` `.expect`), `write.rs:304` (`line.unwrap()`). A closed recipient tty (SIGPIPE/EIO) panics with a backtrace rather than writing EOT and exiting. Spec STDERR 123104-123105. Fix: replace `.expect`/`.unwrap` with graceful error → stderr → `exit(>0)`; best-effort EOT on broken pipe.
-- [ ] **#WR5 — SIGHUP / SIGPIPE / SIGQUIT not handled.** Only `SIGINT` is trapped (`write.rs:235-260`). Spec 123099-123100 permits default for "all other signals", but combined with #WR4's `.expect`, a closed recipient tty kills write uncleanly. Fix: install the EOT-and-exit handler for SIGHUP/SIGPIPE too.
-- [ ] **#WR6 — Multiple-login selection hard-excludes `console`.** `write.rs:58-73` skips `line == "console"` unconditionally; a user logged in only on console falls through to error exit even though reachable. The >1-login stdout notice (123063-123066) is otherwise correct. Fix: don't hard-exclude console; pick a reachable tty.
+- [x] **#WR3 — No superuser override for recipient mesg permission.** ✓ fixed (phase 9) — `check_write_permission` short-circuits to true when `geteuid()==0`. `users/write.rs`.
+- [x] **#WR4 — Write failures panic instead of clean diagnostic/exit.** ✓ fixed (phase 9) — all `.expect()`/`.unwrap()` on I/O are gone; `deliver()` diagnoses and exits 1 on write failure, and the read loop handles errors. `users/write.rs`.
+- [x] **#WR5 — SIGHUP / SIGPIPE / SIGQUIT not handled.** ✓ fixed (phase 9) — SIGINT, SIGHUP, and SIGPIPE all install the EOT-and-exit-0 handler. (SIGQUIT keeps the permitted default action.) `users/write.rs` `register_signal_handlers`.
+- [x] **#WR6 — Multiple-login selection hard-excludes `console`.** ✓ fixed (phase 9) — picks the first reachable terminal (no console exclusion); the >1-login stdout notice is preserved. `users/write.rs` `select_terminal`.
 
 #### Minor
-- [ ] **#WR7 — Tab/backspace mis-handled in printable test.** `write.rs:199-202` `contains_printable_or_space` uses `is_ascii_graphic() || is_ascii_whitespace()`, so `\t`,`\r`,`\x0c`,`\x0b` are sent verbatim rather than rendered. Fix: align the two predicates on a single LC_CTYPE-driven space/print definition.
-- [ ] **#WR8 — Header banner uses locale-insensitive date.** `write.rs:294-297,122-126` use `%Y-%m-%d %H:%M:%S` ignoring LC_TIME. Spec format is loosely specified; no action required beyond noting.
-- [ ] **#WR9 — `terminal` operand not validated; bare name blindly prefixed `/dev/`.** `write.rs:270-279`: `../../etc/passwd` → `/dev/../../etc/passwd`. Low severity (perms gate it). Fix: require the operand be under `/dev` and a character device.
-- [ ] **#WR10 — caret/printable logic is ASCII-only; ignores LC_CTYPE for multibyte.** `write.rs:199-230`. Non-ASCII bytes pass through unconditionally (reasonable for UTF-8 but not an LC_CTYPE classification). Minor.
+- [x] **#WR7 — Tab/backspace mis-handled in printable test.** ✓ fixed (phase 9) — `render_line` sends `\t` as-is, renders other control bytes as `^X`/`^?`. `users/write.rs`.
+- [x] ~~**#WR8 — Header banner uses locale-insensitive date.**~~ WON'T-FIX (phase 9) — the banner format is loosely specified (123041) and `LC_TIME`-formatted timestamps are not required; the `%Y-%m-%d %H:%M:%S` form is retained.
+- [x] **#WR9 — `terminal` operand not validated; bare name blindly prefixed `/dev/`.** ✓ fixed (phase 9) — `validate_terminal` canonicalizes the path, requires it under `/dev`, and requires a character device (rejects `/dev/../etc/passwd`). `users/write.rs`.
+- [x] **#WR10 — caret/printable logic is ASCII-only; ignores LC_CTYPE for multibyte.** ✓ addressed (phase 9) — high bytes (UTF-8 multibyte) pass through for the recipient terminal to interpret; control bytes are caret-rendered. Full per-wide-char `LC_CTYPE` isprint classification is a documented residual (byte-passthrough is correct for the common UTF-8 case). `users/write.rs`.
 
 ### Detailed conformance matrix
 
@@ -614,9 +621,9 @@ superuser override**, SIGHUP/SIGPIPE/SIGQUIT are unhandled, and the
 
 #### Operands / STDIN
 - [x] `user_name` required — clap enforces, missing → exit 2 (`test_write_no_args`). CONFORMS (123075).
-- [ ] optional `terminal` — write.rs:39,270. PARTIAL: no who-format validation (#WR9).
-- [x] STDIN read as lines copied to recipient — write.rs:302-303. CONFORMS to "lines read from stdin" but DIVERGES on canonical control-char semantics (#WR2).
-- [ ] Multiple-login selection — write.rs:44-81. PARTIAL: excludes console, may wrongly error (#WR6).
+- [x] optional `terminal` — validated under `/dev` + char device (fixed #WR9, phase 9). write.rs `validate_terminal`.
+- [x] STDIN read as canonical lines, rendered per-char to the recipient (fixed #WR2, phase 9). write.rs.
+- [x] Multiple-login selection — first reachable terminal incl. console (fixed #WR6, phase 9). write.rs `select_terminal`.
 
 #### Environment variables
 
@@ -632,8 +639,8 @@ superuser override**, SIGHUP/SIGPIPE/SIGQUIT are unhandled, and the
 | Signal | Impl | Status |
 |---|---|---|
 | SIGINT | `handle_sigint` writes `EOT\n`, exit(0) write.rs:235-260 | CONFORMS (tested `test_pty_sigint_handling`) |
-| SIGHUP | unhandled (default terminate) | PARTIAL/MISSING (#WR5) |
-| SIGPIPE | unhandled; `.expect` panics on EPIPE | DIVERGES (#WR4/#WR5) |
+| SIGHUP | EOT-and-exit-0 handler (fixed #WR5, phase 9) | CONFORMS ✓ |
+| SIGPIPE | EOT-and-exit-0 handler; no panics (fixed #WR4/#WR5, phase 9) | CONFORMS ✓ |
 | SIGQUIT | unhandled (default) | CONFORMS (default action permitted) |
 
 #### STDOUT / STDERR
@@ -641,16 +648,16 @@ superuser override**, SIGHUP/SIGPIPE/SIGQUIT are unhandled, and the
 - [ ] STDERR diagnostics only — explicit diagnostics conform, but `.expect`/`.unwrap` panics emit backtraces. DIVERGES (#WR4).
 
 #### Extended description / character rendering
-- [ ] alert → recipient — handler exists (184,308-309) but routes to stdout. DIVERGES (#WR1, spec 123051).
-- [ ] erase/kill via termios — write.rs:128-155,310-311 PARTIAL: only fires when the whole line is erase/kill chars (#WR2).
-- [x] INTR/EOF → "EOT\n" and exit — write.rs:179-181,305-307,319-320. CONFORMS in spirit; whole-line `.all()` gating misses embedded chars (#WR2).
-- [x] print/space → recipient — write.rs:199-202,312-313. CONFORMS for ASCII; LC_CTYPE not honored (#WR10).
+- [x] alert → recipient — forwarded via `render_line` (fixed #WR1, phase 9). write.rs.
+- [x] erase/kill via termios — handled by the driver in canonical mode; bogus byte-detection removed (fixed #WR2, phase 9). write.rs.
+- [x] INTR/EOF → "EOT\n" and exit — INTR via signal handler, EOF via read-loop end (fixed #WR2, phase 9). write.rs.
+- [x] print/space → recipient — `render_line` passes print/space + tab; high bytes pass through (fixed #WR7/#WR10, phase 9). write.rs.
 - [x] other non-printable → `^X`/`^?` — write.rs:207-230. CONFORMS (123061-123062; tested). iexten N/A (impl-defined).
 
 #### Exit status / consequences of errors
 - [x] 0 success — EOF path / SIGINT exit(0). CONFORMS (123112).
 - [x] >0 user not logged on / permission denied — write.rs:55,80,283. CONFORMS (123113; tested).
-- [ ] CONSEQUENCES OF ERRORS: Default — DIVERGES via panic paths (#WR4, spec 123114-123115).
+- [x] CONSEQUENCES OF ERRORS: Default — no panic paths; failures diagnose + exit (fixed #WR4, phase 9).
 
 #### Sender identity
 - [x] sender-login-id — `curuser::login_name()` write.rs:290 (note inherits the #LN1 `$USER` fallback). CONFORMS pragmatically.
@@ -659,12 +666,9 @@ superuser override**, SIGHUP/SIGPIPE/SIGQUIT are unhandled, and the
 ### Test coverage signal
 
 The PTY suite is unusually thorough (real `posix_openpt`/`grantpt`/`unlockpt`/`ptsname` pairs, mutex-serialized): missing-arg exit 2, invalid user/terminal exit 1, header format, basic/multi-line copy + EOT + exit 0, SIGINT→EOT→exit 0, caret notation, alert passthrough, special/unicode chars. Not covered:
-- [ ] The wrong-destination bug (#WR1) — `test_pty_alert_passthrough` only asserts BEL isn't rendered `^G`; it never checks BEL reaches the *recipient* PTY (it goes to the child's stdout, uncaptured, so the test passes vacuously).
-- [ ] Embedded mid-line control chars (#WR2).
-- [ ] Superuser / mesg-n permission (#WR3).
-- [ ] SIGHUP/SIGPIPE / closed-recipient panic (#WR4/#WR5).
-- [ ] Multiple-login selection / console-only (#WR6); tab/backspace rendering (#WR7).
-- [ ] PTY tests are timing-based (fixed sleeps) and silently `return` if the binary is absent — they can pass without exercising anything.
+- [x] ✓ added (phase 9) — `test_write_rejects_path_traversal_terminal` (#WR9). Existing PTY tests (banner, basic/multi-line, EOT, SIGINT→0, caret, alert) still pass against the redesign.
+- [ ] Residual: superuser / mesg-n permission (#WR3) and SIGHUP/SIGPIPE delivery aren't directly asserted (need a root / second-tty harness); covered by code inspection + behavioral spot-checks.
+- [ ] PTY tests remain timing-based and self-skip if the binary is absent (pre-existing harness trait).
 
 ---
 

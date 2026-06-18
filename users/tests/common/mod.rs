@@ -23,8 +23,6 @@
 //! Each helper returns `None` when the platform/CI cannot allocate a PTY;
 //! callers print a "Skipping PTY test" notice and return early.
 
-#![allow(dead_code)]
-
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::Read;
 use std::sync::{Arc, Mutex};
@@ -91,15 +89,6 @@ fn spawn_and_capture(mut cmd: CommandBuilder) -> Option<(i32, String)> {
         None => -1,
     };
     Some((code, out))
-}
-
-/// Run `bin` with `args` directly in a fresh PTY.
-pub fn run(bin: &str, args: &[&str]) -> Option<(i32, String)> {
-    let mut cmd = CommandBuilder::new(bin);
-    for a in args {
-        cmd.arg(*a);
-    }
-    spawn_and_capture(cmd)
 }
 
 /// Run a `/bin/sh -c` script in a fresh PTY. Use this to chain several commands

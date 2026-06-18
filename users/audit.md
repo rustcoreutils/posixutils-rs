@@ -634,7 +634,7 @@ superuser override**, SIGHUP/SIGPIPE/SIGQUIT are unhandled, and the
 #### Major
 - [x] **#WR3 — No superuser override for recipient mesg permission.** ✓ fixed (phase 9) — `check_write_permission` short-circuits to true when `geteuid()==0`. `users/write.rs`.
 - [x] **#WR4 — Write failures panic instead of clean diagnostic/exit.** ✓ fixed (phase 9) — all `.expect()`/`.unwrap()` on I/O are gone; `deliver()` diagnoses and exits 1 on write failure, and the read loop handles errors. `users/write.rs`.
-- [x] **#WR5 — SIGHUP / SIGPIPE / SIGQUIT not handled.** ✓ fixed (phase 9) — SIGINT, SIGHUP, and SIGPIPE all install the EOT-and-exit-0 handler. (SIGQUIT keeps the permitted default action.) `users/write.rs` `register_signal_handlers`.
+- [x] **#WR5 — SIGHUP / SIGPIPE / SIGQUIT not handled.** ✓ fixed (phase 9; hardened in follow-up) — SIGINT, SIGHUP, and SIGPIPE install the EOT-and-exit-0 handler. (SIGQUIT keeps the permitted default action.) The handler is **async-signal-safe**: it reads the recipient fd from an `AtomicI32` and performs only a raw `write(2)` + `_exit` — no `Mutex` lock, file open, or buffered I/O (addresses a Copilot async-signal-safety review). `users/write.rs` `register_signal_handlers`/`handle_signal`.
 - [x] **#WR6 — Multiple-login selection hard-excludes `console`.** ✓ fixed (phase 9) — picks the first reachable terminal (no console exclusion); the >1-login stdout notice is preserved. `users/write.rs` `select_terminal`.
 
 #### Minor

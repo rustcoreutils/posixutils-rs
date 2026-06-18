@@ -14,11 +14,15 @@ use plib::{curuser, platform, utmpx};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::io::AsRawFd;
 use std::process::exit;
-use std::sync::{LazyLock, Mutex};
+use std::sync::atomic::{AtomicI32, Ordering};
 
-/// Recipient terminal path, read by the signal handler to flush "EOT".
-static RECIPIENT_TERMINAL: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
+/// Raw fd of the recipient terminal, published for the signal handler. An
+/// atomic (not a `Mutex<String>`) so the handler stays async-signal-safe: it
+/// performs only a raw `write(2)` + `_exit`, with no lock, allocation, file
+/// open, or buffered I/O. `-1` means "no recipient open yet".
+static RECIPIENT_FD: AtomicI32 = AtomicI32::new(-1);
 
 const ALERT_BYTE: u8 = 0x07;
 
@@ -158,15 +162,19 @@ fn alert_sender_terminal() {
 
 /// Signal handler for SIGINT/SIGHUP/SIGPIPE: write "EOT" to the recipient and
 /// exit 0 (POSIX mandates a zero status for the interrupt case).
+///
+/// Async-signal-safe: only a raw `write(2)` to the already-open recipient fd
+/// and `_exit(2)` — no locks, allocation, buffered I/O, or file opens, so it
+/// cannot deadlock against the main thread or corrupt libc state.
 extern "C" fn handle_signal(_sig: libc::c_int) {
-    if let Ok(guard) = RECIPIENT_TERMINAL.lock() {
-        if let Some(ref terminal) = *guard {
-            if let Ok(mut file) = OpenOptions::new().write(true).open(terminal) {
-                let _ = file.write_all(b"EOT\n");
-            }
+    let fd = RECIPIENT_FD.load(Ordering::SeqCst);
+    if fd >= 0 {
+        let msg = b"EOT\n";
+        unsafe {
+            libc::write(fd, msg.as_ptr() as *const libc::c_void, msg.len());
         }
     }
-    std::process::exit(0);
+    unsafe { libc::_exit(0) };
 }
 
 fn register_signal_handlers() {
@@ -213,10 +221,6 @@ fn main() {
         exit(1);
     }
 
-    // Record the path for the signal handler, then install handlers.
-    *RECIPIENT_TERMINAL.lock().unwrap() = Some(terminal.clone());
-    register_signal_handlers();
-
     let mut recipient = match OpenOptions::new().write(true).open(&terminal) {
         Ok(f) => f,
         Err(e) => {
@@ -229,6 +233,10 @@ fn main() {
             exit(1);
         }
     };
+
+    // Publish the recipient fd for the signal handler, then install handlers.
+    RECIPIENT_FD.store(recipient.as_raw_fd(), Ordering::SeqCst);
+    register_signal_handlers();
 
     // Banner: "Message from sender-login-id (sending-terminal) [date]..."
     let banner = format!(

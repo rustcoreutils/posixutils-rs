@@ -427,11 +427,11 @@ instead. The obsolete `-s` option is correctly absent (removed in Issue 6).
 ### Priority issues
 
 #### Major
-- [ ] **#TY1 — Terminal-name lookup falls back to stdout/stderr instead of being stdin-only.** `users/tty.rs:33` → `plib/src/curuser.rs:43-61`. The shared `tty()` helper loops over STDIN, STDOUT, STDERR and returns the first named one. Spec: "the name of the terminal that is open as standard input … equivalent to `ttyname()`." Fix: call `libc::ttyname(STDIN_FILENO)` directly (or pass an fd to the helper), never consulting fds 1/2.
+- [x] **#TY1 — Terminal-name lookup falls back to stdout/stderr instead of being stdin-only.** ✓ fixed (phase 4) — now calls `curuser::ttyname_of(STDIN_FILENO)`; never consults fds 1/2. `users/tty.rs`.
 
 #### Minor
-- [ ] **#TY2 — `not a tty` not localized.** `users/tty.rs:29,36`. Hardcoded, not `gettext`-wrapped (functionally fine in the POSIX locale). Fix: wrap for consistency.
-- [ ] **#TY3 — ttyname-failure-on-tty maps to exit 1, not >1.** `users/tty.rs:35-38`. After the `is_terminal` check at line 27, the `None` arm is only reachable when stdin *is* a terminal but `ttyname` fails — an error, which should be `>1`, not the "not a terminal" status 1. Rare race. Fix: treat that case as exit 2.
+- [x] **#TY2 — `not a tty` not localized.** ✓ fixed (phase 4) — `gettext`-wrapped. `users/tty.rs`.
+- [x] **#TY3 — ttyname-failure-on-tty maps to exit 1, not >1.** ✓ fixed (phase 4) — ttyname() failure on a confirmed-tty stdin now emits a diagnostic and exits 2. `users/tty.rs`.
 
 ### Detailed conformance matrix
 
@@ -441,8 +441,8 @@ instead. The obsolete `-s` option is correctly absent (removed in Issue 6).
 | Obsolete `-s` absent | CONFORMS `- [x]` | Removed Issue 6; grep confirms no `-s`. |
 | Operands (None) | CONFORMS `- [x]` | clap rejects extras (exit 2). tty.rs:18 |
 | STDIN examined, not read | CONFORMS `- [x]` | `is_terminal()`. tty.rs:27 |
-| Name reported = stdin | DIVERGES `- [ ]` | helper also consults stdout/stderr. tty.rs:33 (#TY1) |
-| Env LANG/LC_*/LC_MESSAGES | PARTIAL | setlocale tty.rs:21; no localized strings (#TY2) |
+| Name reported = stdin | CONFORMS ✓ | `ttyname_of(STDIN_FILENO)` only (fixed #TY1, phase 4). tty.rs |
+| Env LANG/LC_*/LC_MESSAGES | CONFORMS ✓ | `plib::diag` + `gettext`-wrapped output (fixed #TY2, phase 4). tty.rs |
 | NLSPATH (XSI) | N/A | textdomain machinery. tty.rs:22-23 |
 | Async events (Default) | N/A `- [x]` | |
 | STDOUT `"%s\n"` name when tty | CONFORMS `- [x]` | tty.rs:34 |
@@ -450,13 +450,12 @@ instead. The obsolete `-s` option is correctly absent (removed in Issue 6).
 | STDERR (diagnostics only) | CONFORMS `- [x]` | clap errors → stderr |
 | Exit 0 = stdin is a terminal | CONFORMS `- [x]` | implicit exit 0. tty.rs:34 |
 | Exit 1 = stdin not a terminal | CONFORMS `- [x]` | tty.rs:30 |
-| Exit >1 = error | PARTIAL | usage errors exit 2; ttyname-failure-on-tty wrongly exits 1 (#TY3) |
+| Exit >1 = error | CONFORMS ✓ | usage errors exit 2; ttyname-failure-on-tty now exits 2 (fixed #TY3, phase 4) |
 
 ### Test coverage signal
 
-Good: non-terminal stdin → `not a tty\n` + exit 1 (mod.rs:272-296), `--help`/`--version` exit 0, PTY-backed stdin → `/dev/...` + exit 0 (mod.rs:353-446). Not covered:
-- [ ] The reported name equals stdin's tty *specifically* (would catch #TY1 if stdin/stdout point at different ttys).
-- [ ] Extra-operand → exit 2 usage path.
+Good: non-terminal stdin → `not a tty\n` + exit 1, `--help`/`--version` exit 0, PTY-backed stdin → `/dev/...` + exit 0.
+- [x] ✓ added (phase 4) — extra-operand → exit 2 (`test_tty_rejects_operand`). The existing `test_tty_pty_output_is_slave_path` already asserts the reported name is stdin's pts.
 
 ---
 

@@ -18,7 +18,36 @@ confirmed by reading the cited implementation lines **and** the cited spec
 lines directly (and, for the shared helpers, `plib/src/curuser.rs`). No code
 was modified — this is an audit, not a fix.
 
-**Date:** 2026-06-18.
+**Date:** 2026-06-18 (audit). **Remediation:** 2026-06-18, branch `users-audit`.
+
+## Remediation summary (2026-06-18)
+
+All findings have since been remediated across 12 themed, independently-committed
+phases (build + `clippy --all-targets` + `fmt` clean and tests green per phase).
+Shared foundation: `plib::curuser::{login_name_strict, ttyname_of}`, a new
+`plib::exec::exec_error_exit` (126/127), a ported `portable-pty` test harness
+(`users/tests/common`), and a crate-wide migration to `plib::diag` + `gettext`.
+
+| Utility | Disposition | Notes |
+|---|---|---|
+| `id` | **Audited** ✓ | `-G` now emits {gid,egid}∪getgroups(); egid name fallback; i18n. |
+| `logname` | **Audited** ✓ | strict `getlogin()` (no `$USER`), fails + diagnoses; tests added. |
+| `logger` | **Audited** ✓ | `-i`/`-f`/`-p`/`-t`, stdin bodies, `user.notice` default. |
+| `mesg` | **Audited** ✓ | 0/1/>1 exit ladder (verified vs system `mesg`); PTY tests. |
+| `pwd` | **Audited** ✓ | `-L`/`-P` last-wins, byte-faithful output; tests. |
+| `tty` | **Audited** ✓ | stdin-only name; ttyname-fail → exit 2. |
+| `newgrp` | **Audited** ✓ | execs a shell in both modes; invoke-anyway; gshadow+group-DB verify (Linux), constant-time, fail-closed; privilege drop kept. |
+| `write` | **Audited** ✓ | canonical-mode per-char rendering; alert→recipient; superuser override; no panics; SIGHUP/SIGPIPE; `/dev` char-device validation. |
+| `talkd` | resolved; **stays Stage 3 with `talk`** | all items fixed or documented (`#TD7` local-only WON'T-FIX). Not separately promoted because the README bundles it with `talk`. |
+| `talk` | **not promoted (Stage 3)** | Criticals (#TK1/2/3) + Majors (#TK5/6/8) fixed; **#TK7** (full char-processing) and Minors #TK9/#TK10/#TK14 **deferred** — the interactive curses/input engine is unverifiable in CI, so changing it blind risks silent regressions. |
+
+Per-finding ✓-fixed annotations appear inline in each section below. README
+promotions: `id`, `logname`, `logger`, `mesg`, `newgrp`, `pwd`, `tty`, `write`
+→ **Stage 6 — Audited**; `talk (with talkd local daemon)` remains Stage 3.
+
+The headline-counts table below is the **original audit snapshot** (what was
+found), preserved for the record; the disposition table above reflects the
+current state.
 
 ## Headline counts
 

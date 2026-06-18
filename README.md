@@ -79,6 +79,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] getconf
  - [x] gettext (i18n)
  - [x] iconv (i18n)
+ - [x] id
  - [x] ipcrm (IPC)
  - [x] ipcs (IPC)
  - [x] kill
@@ -86,17 +87,21 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] link
  - [x] ln
  - [x] locale (i18n)
- - [x] ls
+ - [x] logger
+ - [x] logname
  - [x] lp
+ - [x] ls
  - [x] m4
  - [x] mailx
  - [x] make
  - [x] man
+ - [x] mesg
  - [x] mkdir
  - [x] mkfifo
  - [x] more
  - [x] msgfmt (i18n)
  - [x] mv
+ - [x] newgrp
  - [x] ngettext (i18n)
  - [x] nice
  - [x] nm (Development)
@@ -106,6 +111,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] pax
  - [x] prs (SCCS)
  - [x] ps
+ - [x] pwd
  - [x] readlink
  - [x] realpath
  - [x] renice
@@ -126,6 +132,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] touch
  - [x] tput
  - [x] true
+ - [x] tty
  - [x] uname
  - [x] unget (SCCS)
  - [x] unlink
@@ -136,6 +143,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] vi (Editors)
  - [x] what (SCCS)
  - [x] who
+ - [x] write
  - [x] xargs
  - [x] xgettext (i18n)
  - [x] yacc (Development)
@@ -169,7 +177,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] head
  - [x] join
  - [x] localedef (i18n)
- - [x] logger
  - [x] nl
  - [x] paste
  - [x] patch
@@ -182,24 +189,17 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] time
  - [x] tr
  - [x] tsort
- - [x] tty
  - [x] uncompress (compress cat.)
  - [x] uudecode (uue)
  - [x] uuencode (uue)
  - [x] unexpand
  - [x] uniq
  - [x] wc
- - [x] write
- - [x] id
  - [x] zcat (compress cat.)
 
 ## Stage 2 - Feature-complete and POSIX compliant
 
  - [x] date
- - [x] logname
- - [x] mesg
- - [x] newgrp
- - [x] pwd
  - [x] sleep
 
 ## Stage 1 - Rough draft

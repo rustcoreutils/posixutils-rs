@@ -118,10 +118,12 @@ const SHM_DEST: u16 = 0o1000;
 /// - Char 11: alternate/additional access-control indicator; a single <space>
 ///   when none is associated with the facility.
 ///
-/// IPC permission bits map to file permission bits:
-/// - read (r): 0400/040/004
-/// - write/alter (a): 0200/020/002
-/// - (the execute bits 0100/010/001 are not meaningful for IPC objects)
+/// IPC permission bits map to file permission bits (matching the rendering
+/// below): the first character of each triad is read, the second write, the
+/// third alter (IPC objects have no execute permission):
+/// - read (r):  0400/040/004
+/// - write (w): 0200/020/002
+/// - alter (a): 0100/010/001
 fn format_mode(mode: u16, facility: char) -> String {
     // First character: C for a shared memory segment pending destruction.
     let clear = if facility == 'm' && (mode & SHM_DEST) != 0 {

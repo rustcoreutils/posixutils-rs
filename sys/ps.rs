@@ -15,6 +15,7 @@ mod pslinux;
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
+use std::fmt::Write as _; // write! into a String (distinct from io::Write below)
 use std::io::{self, Write};
 use std::process::ExitCode;
 
@@ -875,7 +876,7 @@ fn main() -> ExitCode {
             if i > 0 {
                 line.push(' ');
             }
-            line.push_str(&format!("{:>width$}", field.header, width = field.width));
+            let _ = write!(line, "{:>width$}", field.header, width = field.width);
         }
         let _ = writeln!(out, "{}", truncate_line(&line, line_limit));
     }
@@ -893,9 +894,9 @@ fn main() -> ExitCode {
                 field.name,
                 "pid" | "ppid" | "pgid" | "sid" | "uid" | "gid" | "nice" | "pri" | "vsz" | "sz"
             ) {
-                line.push_str(&format!("{:>width$}", value, width = field.width));
+                let _ = write!(line, "{:>width$}", value, width = field.width);
             } else {
-                line.push_str(&format!("{:<width$}", value, width = field.width));
+                let _ = write!(line, "{:<width$}", value, width = field.width);
             }
         }
         let _ = writeln!(out, "{}", truncate_line(&line, line_limit));

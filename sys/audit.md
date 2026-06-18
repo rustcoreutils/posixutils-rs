@@ -267,7 +267,7 @@ var) are absent. `TZ`/`LC_TIME` are ignored for all time output.
 #### Critical
 
 - [x] **#P1 — `etime` mixes time bases (always wrong on Linux).** `sys/ps.rs:491-517` (`format_etime`) computes `now_epoch_secs - start_time`, but `pslinux.rs:28` documents `start_time` as "clock ticks since boot". The subtraction is meaningless; the in-code comment admits "proper implementation would need boot time". Fix: read boot time (`/proc/stat` `btime` or `/proc/uptime`), convert `start_time / CLK_TCK` to an epoch instant, then take the delta. ✓ **fixed in Phase 3** — `pslinux.rs` reads `/proc/stat` `btime` once and normalizes `start_time` to epoch seconds; `format_etime(start_epoch, now_epoch)` is now pure (`now` injected from `main`) and `saturating_sub`s for skew. Behaviorally verified: `ps -p 1 -o etime` == `/usr/bin/ps` (`2-12:52:14`). Unit test `format_etime_elapsed`.
-- [ ] **#P2 — macOS PID buffer fixed at 1024 → silent process-list truncation.** `sys/psmacos.rs:40` (`let mut pids = vec![0; 1024];`). `proc_listallpids` with an undersized buffer returns a truncated list with no error. Fix: call `proc_listallpids(NULL, 0)` to get the count, then allocate.
+- [x] **#P2 — macOS PID buffer fixed at 1024 → silent process-list truncation.** `sys/psmacos.rs:40` (`let mut pids = vec![0; 1024];`). `proc_listallpids` with an undersized buffer returns a truncated list with no error. Fix: call `proc_listallpids(NULL, 0)` to get the count, then allocate. ✓ **fixed in Phase 7** (macOS, code-only) — count-then-allocate with +64 slack. Verified via `cargo check`/`clippy --target x86_64-apple-darwin`; runtime macOS verification pending CI.
 
 #### Major
 
@@ -276,7 +276,7 @@ var) are absent. `TZ`/`LC_TIME` are ignored for all time output.
 - [x] **#P5 — `-n namelist` option absent.** `sys/ps.rs:92-144`. In the SYNOPSIS (XSI); the namelist format is "unspecified", so a parsed no-op is conforming. ✓ **fixed in Phase 5** — added `-n namelist`, accepted and ignored (this implementation reads live state). Integration test `ps_namelist_accepted`.
 - [x] **#P6 — `stime` column always `-` in `-f` listing.** `sys/ps.rs:573`. The `-f` full format mandates STIME; the field returned `"-"`. ✓ **fixed in Phase 4** — new pure `format_stime(start_epoch, now_epoch, tz)` renders `HH:MM` if started today else `MmmDD` (matching historical `ps`), `"-"` when the start time is unknown. Behaviorally verified `ps -p 1 -o stime` == `/usr/bin/ps` (`Jun15`). Unit test `format_stime_today_vs_date`.
 - [x] **#P7 — `TZ` / `LC_TIME` ignored for all time output.** `sys/ps.rs:474-517`. ✓ **fixed in Phase 4** — the only absolute-time field (`stime`) now formats through `chrono::Local`, which honors `$TZ` (verified: `TZ=UTC`→`10:16` vs `TZ=America/New_York`→`06:16`). `etime`/`time` are elapsed durations (timezone-independent by definition). `LC_TIME`-localized month/digit glyphs remain a deferred crate-wide i18n item.
-- [ ] **#P8 — macOS `args` is the executable path, not argv; no bracketed fallback.** `sys/psmacos.rs:171`. Spec 112547–112549: under `-f`, reconstruct argv, else write `[comm]` in brackets. Linux does this (`pslinux.rs:146`); macOS sets `args = full_path` always. Fix: use `sysctl KERN_PROCARGS2` to reconstruct argv; bracket kernel/threadless procs.
+- [x] **#P8 — macOS `args` is the executable path, not argv; no bracketed fallback.** `sys/psmacos.rs:171`. Spec 112547–112549: under `-f`, reconstruct argv, else write `[comm]` in brackets. Linux does this (`pslinux.rs:146`); macOS set `args = full_path` always. Fix: use `sysctl KERN_PROCARGS2` to reconstruct argv; bracket kernel/threadless procs. ✓ **fixed in Phase 7** (macOS, code-only) — new `get_process_args` parses the `KERN_PROCARGS2` `[argc][exec_path][argv...]` buffer; falls back to `[comm]` when unavailable. `cargo check`/`clippy --target x86_64-apple-darwin` clean; runtime macOS verification pending CI.
 
 #### Minor
 
@@ -284,7 +284,7 @@ var) are absent. `TZ`/`LC_TIME` are ignored for all time output.
 - [x] **#P10 — Defunct (zombie) processes not marked `<defunct>`.** No marking anywhere. Spec 112545–112546. Fix: append `<defunct>` to `args`/`comm` when state == `Z`. ✓ **fixed in Phase 6** — `mark_defunct()` appends ` <defunct>` to the command column for state `Z`. Behaviorally verified against a real zombie (`perl <defunct>`). Unit test `defunct_marking`.
 - [x] **#P11 — Controlling-terminal detection via `isatty(STDIN)`; TTY match by substring.** `sys/ps.rs:521-537` (uses stdin, breaks under redirected stdin) and `ps.rs:714-717` (`contains()` so `pts/0` spuriously matches `pts/00`). ✓ **fixed in Phase 6** — `get_current_tty` now probes stdin→stdout→stderr (a redirected stdin no longer hides the terminal); the default filter compares TTY names by **equality** (`ptty == ctty`).
 - [x] ~~**#P12 — `-f` args header is `CMD`; spec default header for `args` is `COMMAND`.**~~ **Refuted (Phase 6).** Re-reading the spec: line 112543 makes `CMD` the command-column header for the full/long listing (`-f`/`-l`), while line 112604 maps only the `-o args`/`-o comm` *format specifiers* to the default header `COMMAND`. The code already matches both (`get_full_fields` → `CMD`; `get_posix_fields` `args`/`comm` → `COMMAND`). No change needed.
-- [ ] **#P13 — macOS `get_tty_name` scans all of `/dev` per process; no `tty_dev==0` guard.** `sys/psmacos.rs:176-189`. O(procs × /dev). Fix: build a one-time `dev→name` map; guard `tty_dev==0 → None`.
+- [x] **#P13 — macOS `get_tty_name` scans all of `/dev` per process; no `tty_dev==0` guard.** `sys/psmacos.rs:176-189`. O(procs × /dev). Fix: build a one-time `dev→name` map; guard `tty_dev==0 → None`. ✓ **fixed in Phase 7** (macOS, code-only) — `build_dev_name_map` runs once; `get_tty_name` is now a map lookup that returns None for `e_tdev` 0/`NODEV`. `cargo check`/`clippy --target x86_64-apple-darwin` clean.
 - [ ] **#P14 — No `.mo` catalogs (crate-wide).** See cross-cutting.
 
 ### Detailed conformance matrix
@@ -320,7 +320,7 @@ var) are absent. `TZ`/`LC_TIME` are ignored for all time output.
 - [x] 0 / 1 via `ExitCode` — `ps.rs:592,728`. CONFORMS.
 
 #### Cross-cutting / portability
-- [ ] **Back-end divergences:** `start_time`/`time` units (#P9 ✓ Phase 3), macOS `args` (#P8), macOS PID buffer (#P2), macOS `/dev` scan (#P13).
+- [x] **Back-end divergences resolved:** `start_time`/`time` units (#P9 ✓ Phase 3), macOS `args` (#P8 ✓ Phase 7), macOS PID buffer (#P2 ✓ Phase 7), macOS `/dev` scan (#P13 ✓ Phase 7).
 
 ### Test coverage signal
 

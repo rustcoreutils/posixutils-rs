@@ -512,6 +512,44 @@ fn format_etime(start_epoch: u64, now_epoch: u64) -> String {
     }
 }
 
+/// Format a process start time (epoch seconds) for the STIME column: `HH:MM`
+/// if it started today in the given timezone, otherwise `MmmDD` (matching
+/// historical `ps`, e.g. "Jun15"). Returns "-" when the start time is unknown
+/// (epoch 0, e.g. boot time unavailable). Honors `$TZ` when called with
+/// `chrono::Local`; generic over the timezone so it is deterministically
+/// unit-testable (audit #P6/#P7).
+fn format_stime<Tz>(start_epoch: u64, now_epoch: u64, tz: &Tz) -> String
+where
+    Tz: chrono::TimeZone,
+    Tz::Offset: std::fmt::Display,
+{
+    if start_epoch == 0 {
+        return "-".to_string();
+    }
+    let start = match tz.timestamp_opt(start_epoch as i64, 0).single() {
+        Some(t) => t,
+        None => return "-".to_string(),
+    };
+    let same_day = tz
+        .timestamp_opt(now_epoch as i64, 0)
+        .single()
+        .map(|now| now.date_naive() == start.date_naive())
+        .unwrap_or(false);
+
+    if same_day {
+        start.format("%H:%M").to_string()
+    } else {
+        start.format("%b%d").to_string()
+    }
+}
+
+/// Per-invocation rendering context, captured once in `main` so the
+/// time-dependent fields stay deterministic and honor `$TZ`/`LC_TIME`.
+struct Context {
+    now: u64,          // current time, seconds since the Unix epoch
+    full_format: bool, // -f selected (renders uid as a login name, etc.)
+}
+
 /// Get current terminal name
 fn get_current_tty() -> Option<String> {
     unsafe {
@@ -533,21 +571,15 @@ fn get_current_tty() -> Option<String> {
     }
 }
 
-/// Get field value for a process. `now` is the current time in epoch seconds,
-/// injected so the time-dependent fields stay deterministic and testable.
-fn get_field_value(
-    proc: &platform::ProcessInfo,
-    field: &str,
-    full_format: bool,
-    now: u64,
-) -> String {
+/// Get field value for a process, using `ctx` for time-dependent fields.
+fn get_field_value(proc: &platform::ProcessInfo, field: &str, ctx: &Context) -> String {
     match field {
         "pid" => proc.pid.to_string(),
         "ppid" => proc.ppid.to_string(),
         "pgid" => proc.pgid.to_string(),
         "sid" => proc.sid.to_string(),
         "uid" => {
-            if full_format {
+            if ctx.full_format {
                 uid_to_name(proc.uid).unwrap_or_else(|| proc.uid.to_string())
             } else {
                 proc.uid.to_string()
@@ -562,7 +594,7 @@ fn get_field_value(
         "comm" => proc.comm.clone(),
         "args" => proc.args.clone(),
         "time" => format_time(proc.time),
-        "etime" => format_etime(proc.start_time, now),
+        "etime" => format_etime(proc.start_time, ctx.now),
         "nice" => proc.nice.to_string(),
         "pri" => proc.priority.to_string(),
         "vsz" => proc.vsz.to_string(),
@@ -572,7 +604,7 @@ fn get_field_value(
         "c" => "-".to_string(),    // CPU utilization - difficult to calculate
         "addr" => "-".to_string(), // Memory address - implementation specific
         "wchan" => "-".to_string(), // Wait channel - implementation specific
-        "stime" => "-".to_string(), // Start time - would need proper formatting
+        "stime" => format_stime(proc.start_time, ctx.now, &chrono::Local),
         "pcpu" => "-".to_string(), // CPU percentage - needs interval measurement
         _ => "-".to_string(),
     }
@@ -740,11 +772,16 @@ fn main() -> ExitCode {
     // Check if we should print header (all headers non-empty)
     let print_header = output_fields.iter().any(|f| !f.header.is_empty());
 
-    // Current time (epoch seconds), captured once for deterministic etime.
+    // Capture the current time once so time-dependent fields are consistent
+    // across the whole listing.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    let ctx = Context {
+        now,
+        full_format: args.full_format,
+    };
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
@@ -766,7 +803,7 @@ fn main() -> ExitCode {
             if i > 0 {
                 let _ = write!(out, " ");
             }
-            let value = get_field_value(&proc, field.name, args.full_format, now);
+            let value = get_field_value(&proc, field.name, &ctx);
             // Right-align numeric fields, left-align text
             if matches!(
                 field.name,
@@ -810,5 +847,21 @@ mod tests {
         // Unknown start (boot epoch unavailable -> 0): huge "elapsed" is just
         // formatted, but the common path (valid start) is correct above.
         assert_eq!(format_etime(0, 0), "00:00");
+    }
+
+    // STIME shows HH:MM when started today, else MmmDD; "-" when unknown (#P6).
+    #[test]
+    fn format_stime_today_vs_date() {
+        use chrono::Utc;
+        // 2021-01-01 00:00:00 UTC = 1_609_459_200.
+        let day_start = 1_609_459_200u64;
+        // Same UTC day, 01:02 -> "01:02".
+        let started = day_start + 3720; // 01:02:00
+        let now = day_start + 7200; // 02:00:00 same day
+        assert_eq!(format_stime(started, now, &Utc), "01:02");
+        // When "now" is the next day, the Jan-01 start renders as "MmmDD".
+        assert_eq!(format_stime(started, now + 86_400, &Utc), "Jan01");
+        // Unknown start time.
+        assert_eq!(format_stime(0, now, &Utc), "-");
     }
 }

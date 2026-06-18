@@ -274,8 +274,8 @@ var) are absent. `TZ`/`LC_TIME` are ignored for all time output.
 - [x] **#P3 — CPU/elapsed time hardcodes 100 ticks/second.** `sys/ps.rs:474-488` (`format_time`: `ticks / 100`). POSIX requires `sysconf(_SC_CLK_TCK)`; Linux `CONFIG_HZ` may be 250/1000. Fix: divide by `sysconf(_SC_CLK_TCK)`. ✓ **fixed in Phase 3** — the Linux backend divides `utime+stime` by `sysconf(_SC_CLK_TCK)` (read once); `format_time` now takes whole seconds. Behaviorally verified `TIME` == `/usr/bin/ps` (`00:00:38` for PID 1). Unit test `format_time_seconds`.
 - [ ] **#P4 — `-w` option and `COLUMNS` env var absent; output never width-limited.** `sys/ps.rs:92-144` (no `-w` field); `COLUMNS` never read. Spec 112496–112498 + the `-w` row require `COLUMNS`/`-w` to govern line width. Fix: add `-w` (repeatable), read `COLUMNS`, truncate at `max(LINE_MAX, COLUMNS)`.
 - [ ] **#P5 — `-n namelist` option absent.** `sys/ps.rs:92-144`. In the SYNOPSIS (XSI). Behavior is implementation-defined; a parsed no-op (or warning) would close the SYNOPSIS gap. Fix: add the flag.
-- [ ] **#P6 — `stime` column always `-` in `-f` listing.** `sys/ps.rs:573`. The `-f` full format mandates STIME; the field returns `"-"`. Fix: format `start_time` via `strftime`/chrono honoring `TZ` (Linux must first convert ticks→epoch, see #P1).
-- [ ] **#P7 — `TZ` / `LC_TIME` ignored for all time output.** `sys/ps.rs:474-517`. Hand-rolled formatting; no locale/TZ consultation (unlike `ipcs`/`who`). The `etime` `[[dd-]hh:]mm:ss` shape happens to match the POSIX locale but is coincidental. Fix: route through libc `strftime` / chrono with `TZ`.
+- [x] **#P6 — `stime` column always `-` in `-f` listing.** `sys/ps.rs:573`. The `-f` full format mandates STIME; the field returned `"-"`. ✓ **fixed in Phase 4** — new pure `format_stime(start_epoch, now_epoch, tz)` renders `HH:MM` if started today else `MmmDD` (matching historical `ps`), `"-"` when the start time is unknown. Behaviorally verified `ps -p 1 -o stime` == `/usr/bin/ps` (`Jun15`). Unit test `format_stime_today_vs_date`.
+- [x] **#P7 — `TZ` / `LC_TIME` ignored for all time output.** `sys/ps.rs:474-517`. ✓ **fixed in Phase 4** — the only absolute-time field (`stime`) now formats through `chrono::Local`, which honors `$TZ` (verified: `TZ=UTC`→`10:16` vs `TZ=America/New_York`→`06:16`). `etime`/`time` are elapsed durations (timezone-independent by definition). `LC_TIME`-localized month/digit glyphs remain a deferred crate-wide i18n item.
 - [ ] **#P8 — macOS `args` is the executable path, not argv; no bracketed fallback.** `sys/psmacos.rs:171`. Spec 112547–112549: under `-f`, reconstruct argv, else write `[comm]` in brackets. Linux does this (`pslinux.rs:146`); macOS sets `args = full_path` always. Fix: use `sysctl KERN_PROCARGS2` to reconstruct argv; bracket kernel/threadless procs.
 
 #### Minor
@@ -295,7 +295,7 @@ var) are absent. `TZ`/`LC_TIME` are ignored for all time output.
 | `-A` / `-e` | CONFORMS | `ps.rs:94,98`. |
 | `-a` | PARTIAL | `ps.rs:103` selects tty-bearing procs; optional session-leader exclusion not done (XSI "may"). |
 | `-d` | CONFORMS | `ps.rs:106`, `pid==sid` check `ps.rs:702`. |
-| `-f` | PARTIAL | login-name UID OK; `stime` `-` (#P6); args header `CMD` (#P12). |
+| `-f` | PARTIAL | login-name UID OK; `stime` ✓ Phase 4 (#P6); args header `CMD` (#P12, Phase 6). |
 | `-g` | CONFORMS | filters by session id — `ps.rs:118,656`. |
 | `-G` / `-U` / `-u` / `-p` | CONFORMS | `ps.rs:122,138,134,127`. |
 | `-l` | CONFORMS | F S UID PID PPID C PRI NI ADDR SZ WCHAN TTY TIME CMD — `ps.rs:398-471`. |
@@ -308,13 +308,13 @@ var) are absent. `TZ`/`LC_TIME` are ignored for all time output.
 - [x] None accepted / used. CONFORMS.
 
 #### Environment variables
-- [ ] **`COLUMNS` never read** (#P4). **`TZ`/`LC_TIME` ignored** (#P7).
+- [ ] **`COLUMNS` never read** (#P4, Phase 5). **`TZ` honored for `stime`** (#P7 ✓ Phase 4).
 - [x] `LANG`/`LC_*`/`NLSPATH` via `setlocale` — `ps.rs:580-584`. CONFORMS (catalogs deferred).
 
 #### STDOUT / STDERR
 - [x] Default columns PID TTY TIME CMD (default format unspecified by spec) — `ps.rs:326-349`. CONFORMS.
 - [x] `-o` all-null-header suppression correct (`any(non-empty)`) — `ps.rs:739`. CONFORMS (agent's "inverted logic" claim self-refuted; verified correct).
-- [x] **`etime`/CLK_TCK** (#P1/#P3 ✓ Phase 3). `stime` column (#P6) — Phase 4.
+- [x] **`etime`/CLK_TCK** (#P1/#P3 ✓ Phase 3); **`stime`/TZ** (#P6/#P7 ✓ Phase 4).
 
 #### Exit status / consequences of errors
 - [x] 0 / 1 via `ExitCode` — `ps.rs:592,728`. CONFORMS.

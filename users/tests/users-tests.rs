@@ -12,6 +12,7 @@ mod id;
 mod logger;
 mod logname;
 mod mesg;
+mod newgrp;
 mod pwd;
 mod talk;
 mod tty;

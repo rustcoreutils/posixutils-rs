@@ -485,22 +485,22 @@ possibly-empty string. Treat as non-conformant and security-suspect.
 ### Priority issues
 
 #### Critical
-- [ ] **#NG1 — `-l` login shell is exec'd with the OLD gid, before any group change.** `users/newgrp.rs:89-91` → `set_login_environment` (`753-787`) runs `Command::new(user_shell).status()` (773-779), **blocking until that shell exits**; only afterward (93-147) does the code resolve the group and call `setgid`/`setegid`. The interactive shell therefore has the unchanged GID, and the switch happens against a now-exited session. Fix: resolve group → verify membership/password → change real+effective GID and supplementary list → only then `exec` the (login or normal) shell (replace the process, not blocking `status()`).
-- [ ] **#NG2 — Normal mode never creates a new shell.** Spec 108272-108279,108354-108355: newgrp shall create a *new shell execution environment* whose exit status is the shell's. The non-`-l` branch (`newgrp.rs:124-149`) changes the GID of the short-lived `newgrp` process then `return Ok(())` → exit 0. No shell is started. Fix: after the group change, `exec` `$SHELL` (or the passwd shell).
-- [ ] **#NG3 — Group password verified against `/etc/gshadow` only, with weak comparison and silent fallthrough.** `check_perms` (`newgrp.rs:530-582`) does password verification only under `#[cfg(target_os="linux")]`; `get_shadow_password` (601-621) returns `Ok(String::new())` when the group has no gshadow entry, and the group-database `passwd` field (`/etc/group`) is never used. On macOS, non-root always errs (571-577), so a member can never switch. Fix: verify against the group DB password (and gshadow on Linux) via platform crypt, fail closed on any error, constant-time compare.
+- [x] **#NG1 — `-l` login shell is exec'd with the OLD gid, before any group change.** ✓ fixed (phase 7) — `run()` now resolves+verifies+changes the group, drops privilege, and *then* `exec`s the shell (`CommandExt::exec`, replacing the process). No blocking `status()`. `users/newgrp.rs`.
+- [x] **#NG2 — Normal mode never creates a new shell.** ✓ fixed (phase 7) — both modes `exec` a shell; the exit status is the shell's (behaviorally verified: piped `exit 7` → newgrp exits 7). `users/newgrp.rs` `exec_shell`.
+- [x] **#NG3 — Group password verified against `/etc/gshadow` only, with weak comparison and silent fallthrough.** ✓ fixed (phase 8) — `verify_group_password` prefers gshadow then the group-DB `passwd` field, rejects locked/`!`/`*`/empty entries (fail-closed), and compares in constant time. macOS keeps membership-only with a documented limitation. `users/newgrp.rs`.
 
 #### Major
-- [ ] **#NG4 — `group` operand is mandatory; "no operand = restore login groups" unimplemented.** `users/newgrp.rs:55-60` declares the operand `required = true`. Spec 108297-108299: with **no operands** newgrp restores the effective group and supplementary list from the user's database entries. Running `newgrp` with no args errors. Fix: make the operand optional; when absent, reset GID to `pw_gid` and supplementary groups via `initgroups`.
-- [ ] **#NG5 — `setgroups` return values ignored in supplementary-list mutators.** `add_gid_to_groups` (`newgrp.rs:170-172`) and `remove_gid_from_groups` (195-197) discard the `setgroups` result. A failed change is silently swallowed, after which `change_*_gid_and_uid` proceeds with an inconsistent credential state. Fix: check the return and propagate `io::Error::last_os_error()`, aborting on failure.
-- [ ] **#NG6 — Privilege-drop ordering / uid manipulation is unsound.** `change_gid_and_uid`/`change_effective_gid_and_uid` (`newgrp.rs:296-379`) call `setgid`/`setegid`, then `setgroups`, then `setuid(getuid())`; the canonical order (setgroups → setgid → setuid, dropping supplementary groups first while privileged) is not followed, and `change_effective_gid_and_uid` re-`setgroups` the same list it just read (372-373). Fix: adopt the standard drop order; remove the redundant setgroups; don't call setuid unless actually dropping a setuid privilege.
-- [ ] **#NG7 — SHELL/login-shell handling diverges.** `set_login_environment` (`newgrp.rs:753-787`) always uses the passwd `pw_shell` (ignoring `$SHELL`), spawns a **non-login** invocation (no `-`/`-name` arg0), and uses blocking `status()` instead of `exec`. Spec 2.13 (per 108272-108279) requires the environment re-initialized "as if logged in" for `-l`. Fix: for `-l`, exec with arg0 prefixed `-`; respect passwd shell for login, `$SHELL` otherwise; default `/bin/sh`.
+- [x] **#NG4 — `group` operand is mandatory; "no operand = restore login groups" unimplemented.** ✓ fixed (phase 7) — operand is now optional; no-operand restores via `initgroups` + `setgid(pw_gid)`. `users/newgrp.rs` `restore_login_groups`.
+- [x] **#NG5 — `setgroups` return values ignored in supplementary-list mutators.** ✓ fixed (phase 7) — supplementary changes go through `set_supplementary_gids`, whose result is checked and propagated. `users/newgrp.rs` `apply_group_change`.
+- [x] **#NG6 — Privilege-drop ordering / uid manipulation.** ✓ fixed (phase 7) — order is now setgroups → setgid → (final) `setuid(getuid())`; the redundant re-setgroups is gone. **Correction:** the audit's "remove the `setuid(getuid())`" advice was wrong — that call is the **security-critical privilege drop** before exec (an installed-setuid-root newgrp must not hand the user a root shell); it is kept and centralized in `run()`. `users/newgrp.rs`.
+- [x] **#NG7 — SHELL/login-shell handling diverges.** ✓ fixed (phase 7) — `-l` execs the passwd login shell with argv0 `-name`, re-inits HOME/SHELL/USER/LOGNAME and cwd=HOME; non-login honors `$SHELL` (then passwd shell, then `/bin/sh`). `users/newgrp.rs` `exec_shell`.
 
 #### Minor
-- [ ] **#NG8 — Diagnostics not localized and inconsistently prefixed.** `newgrp.rs:97,106-109,174,510-512,563` use raw `eprintln!` literals though the catalog is initialized (790-792); some omit the `newgrp:` prefix (e.g. 174 `"Error: No room…"`). Fix: route through `gettext` and prefix `newgrp:`.
-- [ ] **#NG9 — Final error printed without newline / odd channel.** `main` line 811 `eprint!("{}", err)` — no trailing newline, no prefix. Fix: `eprintln!("newgrp: {err}")`.
-- [ ] **#NG10 — `logger` emits an informational stderr line on every success.** `newgrp.rs:501-513`. Spec STDERR is for diagnostics/prompts only (108345-108348). Fix: drop or gate behind verbose/syslog.
-- [ ] **#NG11 — `-` first-arg handling unspecified-but-mishandled.** Spec 108300 says results are unspecified if the first arg is `-`; clap accepts `-` as the operand value → "group not found". Acceptable (unspecified), but worth a deliberate decision.
-- [ ] **#NG12 — Numeric-GID operand that is also a group *name* not preferred.** Spec 108317-108320: if `group` is numeric *and* exists as a group **name**, the named group's GID is used. `find_matching_group` (`newgrp.rs:475-485`) matches numeric by GID first. Edge case.
+- [x] **#NG8 — Diagnostics not localized and inconsistently prefixed.** ✓ fixed (phase 7/8) — all diagnostics route through `plib::diag::error` (adds the `newgrp:` prefix) with `gettext` messages. `users/newgrp.rs`.
+- [x] **#NG9 — Final error printed without newline / odd channel.** ✓ fixed (phase 7) — replaced by `plib::diag::error` (newline + prefix). `users/newgrp.rs`.
+- [x] **#NG10 — `logger` emits an informational stderr line on every success.** ✓ fixed (phase 7) — the per-success audit line is removed. `users/newgrp.rs`.
+- [x] **#NG11 — `-` first-arg handling unspecified-but-mishandled.** ✓ addressed (phase 7) — a `-` operand resolves to "no such group" → diagnostic, then invoke-anyway execs the shell (a deliberate, spec-permitted choice for the unspecified `-` case). `users/newgrp.rs`.
+- [x] **#NG12 — Numeric-GID operand that is also a group *name* not preferred.** ✓ fixed (phase 7) — `find_matching_group` matches by name first, then numeric GID. Unit-tested. `users/newgrp.rs`.
 
 ### Detailed conformance matrix
 
@@ -508,28 +508,28 @@ possibly-empty string. Treat as non-conformant and security-suspect.
 
 | Item | Status | Notes |
 |---|---|---|
-| `-l` (letter ell) | DIVERGES `- [ ]` | Parsed (49-53) but exec's shell with old GID, non-login, blocking (#NG1/#NG7). |
-| XBD 12.2 conformance | PARTIAL | clap-based; `group` wrongly mandatory (#NG4). |
-| `-` first-arg unspecified | N/A `- [x]` | Falls through to "group not found" (#NG11). |
+| `-l` (letter ell) | CONFORMS ✓ | login shell exec'd as `-name` after the group change (fixed #NG1/#NG7, phase 7). |
+| XBD 12.2 conformance | CONFORMS ✓ | clap-based; `group` now optional (fixed #NG4, phase 7). |
+| `-` first-arg unspecified | N/A `- [x]` | resolves to "no such group" → invoke-anyway execs shell (#NG11, phase 7). |
 
 #### Operands / STDIN
 
 | Item | Status | file:line |
 |---|---|---|
-| `group` by name | CONFORMS `- [x]` | find_matching_group name match. newgrp.rs:483 |
-| `group` by numeric GID | PARTIAL | GID match 475-480; numeric-is-also-a-name nuance not honored (#NG12). |
-| No operand → restore login groups | MISSING `- [ ]` | Operand `required=true`. newgrp.rs:55-60 (#NG4) |
+| `group` by name | CONFORMS `- [x]` | find_matching_group name match. newgrp.rs |
+| `group` by numeric GID | CONFORMS ✓ | name preferred over numeric (fixed #NG12, phase 7); unit-tested. newgrp.rs |
+| No operand → restore login groups | CONFORMS ✓ | `initgroups` + `setgid(pw_gid)` (fixed #NG4, phase 7). newgrp.rs `restore_login_groups` |
 | STDIN not used | CONFORMS `- [x]` | Password read from `/dev/tty`. newgrp.rs:705 |
 
 #### Environment variables
 
 | Var | Status | Notes |
 |---|---|---|
-| LANG/LC_ALL/LC_CTYPE | PARTIAL | setlocale newgrp.rs:790; messages not gettext-routed (#NG8) |
-| LC_MESSAGES | DIVERGES | catalog init'd but `eprintln!` literals bypass it (#NG8) |
+| LANG/LC_ALL/LC_CTYPE | CONFORMS ✓ | `plib::diag::init_locale`; diagnostics `gettext`-wrapped (fixed #NG8, phase 7/8) |
+| LC_MESSAGES | CONFORMS ✓ | all diagnostics via `plib::diag` + `gettext` (fixed #NG8) |
 | NLSPATH (XSI) | N/A | gettext/textdomain used |
-| SHELL | DIVERGES `- [ ]` | Ignored; `pw_shell` used. newgrp.rs:771 (#NG7) |
-| HOME | PARTIAL | set in `-l` from `pw_dir`. newgrp.rs:768 |
+| SHELL | CONFORMS ✓ | honored in non-login mode (fixed #NG7, phase 7). newgrp.rs `exec_shell` |
+| HOME | CONFORMS ✓ | set + cwd in `-l` from `pw_dir`. newgrp.rs `exec_shell` |
 
 #### Asynchronous events
 - [x] Default signal handling — no custom handling. (But the blocking `status()` model in `-l` is itself wrong — #NG1.)
@@ -539,32 +539,31 @@ possibly-empty string. Treat as non-conformant and security-suspect.
 | Item | Status | file:line |
 |---|---|---|
 | STDOUT not used | CONFORMS `- [x]` | No stdout writes. |
-| STDERR for diagnostics | PARTIAL | Used (97,563,802,811) but unlocalized, inconsistent prefix/newline (#NG8/#NG9). |
-| Password prompt to stderr, read `/dev/tty` | CONFORMS `- [x]` | newgrp.rs:710,705 (spec 108325) |
+| STDERR for diagnostics | CONFORMS ✓ | `plib::diag::error` (prefix + newline + gettext) (fixed #NG8/#NG9, phase 7). |
+| Password prompt to stderr, read `/dev/tty` | CONFORMS `- [x]` | newgrp.rs `read_password` (spec 108325) |
 
 #### Group-password / privilege handling
 
 | Item | Status | file:line |
 |---|---|---|
-| Prompt only when non-member & pw required | PARTIAL | 538-547 conflates pw-needed with empty user pw |
-| No prompt if member | CONFORMS `- [x]` | newgrp.rs:539 |
-| Password verification path | DIVERGES `- [ ]` | gshadow-only, Linux-only, weak compare, empty-string fallthrough. 530-621 (#NG3) |
-| crypt via libcrypt-rs | PARTIAL | `pw_encrypt` 654-682; `extract_salt` 633-641 brittle |
-| Echo-off terminal read | CONFORMS `- [x]` | toggles ECHO, restores. 703-741 |
-| setgid/setgroups/setuid order & return checks | DIVERGES `- [ ]` | core syscalls checked but add/remove ignore setgroups (#NG5); ordering unsound (#NG6); macOS errs for all non-root (571-577) |
+| Prompt only when non-member & pw required | CONFORMS ✓ | members short-circuit; non-members with a group password are prompted (fixed #NG3, phase 8). newgrp.rs `check_perms` |
+| No prompt if member | CONFORMS `- [x]` | `check_perms` returns early for members. newgrp.rs |
+| Password verification path | CONFORMS ✓ | gshadow→group-DB, fail-closed on locked/malformed, constant-time compare (fixed #NG3, phase 8); macOS membership-only (documented). newgrp.rs |
+| crypt via libcrypt-rs | CONFORMS ✓ | `pw_encrypt` rejects locked/`!`/`*`/empty + unit-tested; `extract_salt` unit-tested. newgrp.rs |
+| Echo-off terminal read | CONFORMS `- [x]` | toggles ECHO, always restores. newgrp.rs `read_password` |
+| setgid/setgroups/setuid order & return checks | CONFORMS ✓ | setgroups→setgid→setuid, all checked; privilege dropped before exec (fixed #NG5/#NG6, phase 7). newgrp.rs |
 
 #### Exit status / consequences of errors
 
 | Item | Status | file:line |
 |---|---|---|
-| Success → shell's exit status | MISSING `- [ ]` | No shell exec in normal mode (#NG2); `-l` returns 0 after blocking shell. |
-| Failure → >0 | PARTIAL `- [x]` | `main` exit_code=1 on Err (809-814); parse error exits 1 (806). |
-| Does NOT exec shell after failed switch | PARTIAL | Normal-mode errors propagate before exit; but #NG1 makes `-l` exec the shell *before* the switch — the inverse hazard. |
+| Success → shell's exit status | CONFORMS ✓ | both modes `exec` a shell; exit = shell's status (fixed #NG2, phase 7; behaviorally verified). newgrp.rs |
+| Failure → >0 | CONFORMS `- [x]` | pre-exec errors (`get_password`/privilege-drop) exit 1; clap parse error exits 2. |
+| Does NOT exec shell after failed switch | N/A ✓ | Per spec 108280-108281 a group-change failure *shall not* prevent the shell; newgrp now diagnoses and execs the shell with the unchanged (already-held, non-elevated) group. |
 
 ### Test coverage signal
 
-Not covered:
-- [ ] **Everything** — zero tests, and their absence is itself a Major finding given #NG1–#NG3. Even without privilege, the pure functions are unit-testable and should be covered before any refactor: `find_matching_group` (name vs numeric vs numeric-that-is-a-name), `extract_salt`, the supplementary-group add/remove/effective-in-list decision matrix (spec 108282-108296), and operand parsing (no-operand restore, `-l`, `-`). Behavioral conformance ("does `newgrp grp` land you in an interactive shell with the new real+effective GID?") cannot be asserted today because, per #NG1/#NG2, it does not happen.
+- [x] ✓ added (phase 7/8) — 8 unit tests (`find_matching_group` name/numeric/numeric-is-name/missing, `extract_salt`, `constant_time_eq`, `pw_encrypt` rejects locked) + 3 integration tests (exec-shell + exit-status propagation, runs piped commands, unknown-group invoke-anyway). Privileged group-switching is verified manually (needs setuid-root); CI exercises the exec model and invoke-anyway path.
 
 ---
 

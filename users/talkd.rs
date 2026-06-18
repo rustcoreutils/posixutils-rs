@@ -7,22 +7,36 @@
 // SPDX-License-Identifier: MIT
 //
 
-//! talkd - Local talk daemon for testing
+//! talkd - local talk daemon
 //!
-//! This is a local-only implementation of the talk daemon that uses Unix
-//! domain sockets instead of the network UDP protocol. It maintains an
-//! invitation registry and facilitates connections between talk clients.
+//! This is a **local-only** talk daemon: it serves the BSD `ntalk` control
+//! protocol over a Unix-domain datagram socket (default `/var/run/talkd.sock`)
+//! rather than UDP port 518. This is a deliberate, documented divergence
+//! (audit #TD7): the goal is to make the bundled `talk --local` handshake work
+//! end-to-end on one host without exposing a network-facing root daemon. It is
+//! therefore NOT interoperable with stock/remote `talk` clients.
+//!
+//! Privilege model (audit #TD6): to deliver an announcement, talkd must write
+//! to the callee's terminal. It honors the recipient's `mesg` permission (the
+//! tty's group/other write bits) and, when not running as root, can only write
+//! to ttys that permit messages. A production network deployment would run as
+//! root and contain that privilege; this local daemon writes only to the
+//! invoking user's own mesg-enabled terminals.
 
 use binrw::{binrw, BinReaderExt, BinWrite, Endian};
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use std::collections::HashMap;
-use std::fs;
-use std::io::{self, Cursor};
+use std::ffi::CString;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Cursor, Write};
 use std::mem::size_of;
 use std::net::{Ipv4Addr, SocketAddrV4};
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
+use std::process;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
@@ -38,6 +52,9 @@ pub const DEFAULT_SOCKET_PATH: &str = "/var/run/talkd.sock";
 
 /// Invitation timeout in seconds
 const INVITATION_TIMEOUT_SECS: u64 = 60;
+
+/// Upper bound on simultaneously-held invitations (DoS guard, audit #TD4).
+const MAX_INVITATIONS: usize = 1024;
 
 /// Protocol version
 const TALK_VERSION: u8 = 1;
@@ -98,7 +115,7 @@ enum Answer {
     BadCtlAddr = 8,
 }
 
-#[derive(Default, PartialEq, Clone)]
+#[derive(Default, Debug, PartialEq, Clone)]
 #[binrw]
 struct Osockaddr {
     sa_family: SaFamily,
@@ -270,11 +287,32 @@ impl InvitationRegistry {
         self.invitations.get(&id)
     }
 
-    fn insert(&mut self, invitation: Invitation) -> u32 {
+    /// Insert an invitation, returning its id, or `None` when the table is at
+    /// capacity (after an expiry sweep) — a bound against unauthenticated flood.
+    fn insert(&mut self, invitation: Invitation) -> Option<u32> {
+        if self.invitations.len() >= MAX_INVITATIONS {
+            self.cleanup_expired();
+            if self.invitations.len() >= MAX_INVITATIONS {
+                return None;
+            }
+        }
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
         self.invitations.insert(id, Invitation { id, ..invitation });
-        id
+        Some(id)
+    }
+
+    /// Refresh an existing (callee, caller) invitation's address and timestamp,
+    /// returning its id. Used by LEAVE_INVITE so a re-invite does not hand out a
+    /// stale TCP rendezvous address (audit #TD11).
+    fn refresh(&mut self, callee: &str, caller: &str, tcp_addr: &Osockaddr) -> Option<u32> {
+        let entry = self
+            .invitations
+            .values_mut()
+            .find(|inv| inv.callee == callee && inv.caller == caller)?;
+        entry.tcp_addr = tcp_addr.clone();
+        entry.timestamp = Instant::now();
+        Some(entry.id)
     }
 
     #[cfg(test)]
@@ -312,16 +350,93 @@ fn handle_lookup(registry: &InvitationRegistry, msg: &CtlMsg) -> CtlRes {
     }
 }
 
+/// Verify the callee exists and is logged in, honor their `mesg` permission,
+/// and write the talk announcement to their terminal (audit #TD1/#TD2/#TD3).
+/// Returns the `Answer` to report to the caller.
+fn announce_to_tty(caller: &str, callee: &str, requested_tty: &str) -> Answer {
+    // The callee must exist in the password database.
+    let c_callee = match CString::new(callee) {
+        Ok(c) => c,
+        Err(_) => return Answer::Failed,
+    };
+    if unsafe { libc::getpwnam(c_callee.as_ptr()).is_null() } {
+        return Answer::NotHere;
+    }
+
+    // The callee must be logged in; pick the requested tty if given, else the
+    // first login terminal.
+    let entries = plib::utmpx::load();
+    let tty_line = entries
+        .iter()
+        .filter(|e| e.user == callee && e.typ == plib::platform::USER_PROCESS)
+        .find(|e| requested_tty.is_empty() || e.line == requested_tty)
+        .map(|e| e.line.clone());
+    let tty_line = match tty_line {
+        Some(l) => l,
+        None => return Answer::NotHere,
+    };
+
+    let tty_path = format!("/dev/{}", tty_line);
+
+    // Honor the recipient's mesg setting (group/other write bit), unless root.
+    match mesg_permits(&tty_path) {
+        Ok(true) => {}
+        Ok(false) => return Answer::PermissionDenied,
+        Err(_) => return Answer::NotHere,
+    }
+
+    if write_announcement(&tty_path, caller).is_err() {
+        return Answer::Failed;
+    }
+    Answer::Success
+}
+
+/// Whether the terminal at `tty_path` currently permits messages (mesg y), or
+/// the daemon is privileged.
+fn mesg_permits(tty_path: &str) -> io::Result<bool> {
+    if unsafe { libc::geteuid() } == 0 {
+        return Ok(true);
+    }
+    let mode = fs::metadata(tty_path)?.permissions().mode();
+    Ok(mode & 0o020 != 0 || mode & 0o002 != 0)
+}
+
+/// Write the talk announcement banner to the recipient's terminal, after
+/// confirming it resolves to a character device under `/dev`.
+fn write_announcement(tty_path: &str, caller: &str) -> io::Result<()> {
+    let canonical = fs::canonicalize(tty_path)?;
+    if !canonical.starts_with("/dev/") {
+        return Err(io::Error::other("not a terminal device"));
+    }
+    if !fs::metadata(&canonical)?.file_type().is_char_device() {
+        return Err(io::Error::other("not a terminal device"));
+    }
+
+    let banner = format!(
+        "\x07\r\nMessage from Talk_Daemon...\r\n\
+         talk: connection requested by {caller}.\r\n\
+         talk: respond with:  talk {caller}\r\n"
+    );
+    OpenOptions::new()
+        .write(true)
+        .open(&canonical)?
+        .write_all(banner.as_bytes())
+}
+
 fn handle_announce(registry: &mut InvitationRegistry, msg: &CtlMsg) -> CtlRes {
-    // For now, just acknowledge - in a real daemon this would notify the callee
-    // In our local testing setup, we just store the invitation
     let caller = msg.local_name();
     let callee = msg.remote_name();
     let callee_tty = msg.remote_tty();
 
+    // Notify the callee on their terminal (validating user/login/mesg first).
+    let answer = announce_to_tty(&caller, &callee, &callee_tty);
+    if answer != Answer::Success {
+        return CtlRes::new(MessageType::Announce, answer, 0, Osockaddr::default());
+    }
+
     let invitation = Invitation {
         id: 0, // Will be set by insert
-        caller: caller.clone(),
+        caller,
         callee,
         caller_tty: String::new(),
         callee_tty,
@@ -330,14 +445,20 @@ fn handle_announce(registry: &mut InvitationRegistry, msg: &CtlMsg) -> CtlRes {
         timestamp: Instant::now(),
     };
 
-    let id = registry.insert(invitation);
-
-    CtlRes::new(
-        MessageType::Announce,
-        Answer::Success,
-        id,
-        Osockaddr::default(),
-    )
+    match registry.insert(invitation) {
+        Some(id) => CtlRes::new(
+            MessageType::Announce,
+            Answer::Success,
+            id,
+            Osockaddr::default(),
+        ),
+        None => CtlRes::new(
+            MessageType::Announce,
+            Answer::Failed,
+            0,
+            Osockaddr::default(),
+        ),
+    }
 }
 
 fn handle_leave_invite(registry: &mut InvitationRegistry, msg: &CtlMsg) -> CtlRes {
@@ -345,12 +466,13 @@ fn handle_leave_invite(registry: &mut InvitationRegistry, msg: &CtlMsg) -> CtlRe
     let callee = msg.remote_name();
     let callee_tty = msg.remote_tty();
 
-    // Check if invitation already exists
-    if let Some(existing) = registry.find_for_callee(&callee, &caller) {
+    // If an invitation for this (callee, caller) pair already exists, refresh
+    // its address + timestamp rather than returning a stale entry (#TD11).
+    if let Some(id) = registry.refresh(&callee, &caller, &msg.addr) {
         return CtlRes::new(
             MessageType::LeaveInvite,
             Answer::Success,
-            existing.id,
+            id,
             Osockaddr::default(),
         );
     }
@@ -366,14 +488,20 @@ fn handle_leave_invite(registry: &mut InvitationRegistry, msg: &CtlMsg) -> CtlRe
         timestamp: Instant::now(),
     };
 
-    let id = registry.insert(invitation);
-
-    CtlRes::new(
-        MessageType::LeaveInvite,
-        Answer::Success,
-        id,
-        Osockaddr::default(),
-    )
+    match registry.insert(invitation) {
+        Some(id) => CtlRes::new(
+            MessageType::LeaveInvite,
+            Answer::Success,
+            id,
+            Osockaddr::default(),
+        ),
+        None => CtlRes::new(
+            MessageType::LeaveInvite,
+            Answer::Failed,
+            0,
+            Osockaddr::default(),
+        ),
+    }
 }
 
 fn handle_delete(registry: &mut InvitationRegistry, msg: &CtlMsg) -> CtlRes {
@@ -395,23 +523,42 @@ fn handle_delete(registry: &mut InvitationRegistry, msg: &CtlMsg) -> CtlRes {
 // ============================================================================
 
 fn daemon_loop(socket_path: &Path) -> io::Result<()> {
-    // Remove existing socket file if present
-    if socket_path.exists() {
-        fs::remove_file(socket_path)?;
+    // Symlink safety (#TD5): inspect the path without following links. Only
+    // unlink a pre-existing path if it is a socket we own; never follow a
+    // symlink an attacker may have planted to make us unlink an arbitrary file.
+    match fs::symlink_metadata(socket_path) {
+        Ok(meta) => {
+            if !meta.file_type().is_socket() {
+                return Err(io::Error::other(format!(
+                    "refusing to replace non-socket path {:?}",
+                    socket_path
+                )));
+            }
+            fs::remove_file(socket_path)?;
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
     }
 
-    let socket = UnixDatagram::bind(socket_path)?;
+    // Restrict the socket mode to 0600 by tightening the umask across bind.
+    let old_umask = unsafe { libc::umask(0o177) };
+    let bind_result = UnixDatagram::bind(socket_path);
+    unsafe { libc::umask(old_umask) };
+    let socket = bind_result?;
+    // Belt-and-suspenders: enforce 0600 explicitly.
+    let _ = fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600));
+
     let mut registry = InvitationRegistry::new();
     let mut buf = [0u8; 1024];
 
-    eprintln!("talkd: listening on {:?}", socket_path);
+    log_info(&format!("{} {:?}", gettext("listening on"), socket_path));
 
     loop {
         // Receive message from client
         let (len, client_addr) = match socket.recv_from(&mut buf) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("talkd: recv error: {}", e);
+                log_err(&format!("{}: {}", gettext("recv error"), e));
                 continue;
             }
         };
@@ -419,11 +566,11 @@ fn daemon_loop(socket_path: &Path) -> io::Result<()> {
         // Clean up expired invitations periodically
         registry.cleanup_expired();
 
-        // Parse the control message
+        // Parse the control message (a short/garbage datagram is dropped, not fatal)
         let msg = match CtlMsg::from_bytes(&buf[..len]) {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("talkd: failed to parse message: {}", e);
+                log_err(&format!("{}: {}", gettext("failed to parse message"), e));
                 continue;
             }
         };
@@ -469,9 +616,42 @@ fn daemon_loop(socket_path: &Path) -> io::Result<()> {
         // Send response
         if let Ok(bytes) = response.to_bytes() {
             if let Err(e) = socket.send_to_addr(&bytes, &client_addr) {
-                eprintln!("talkd: failed to send response: {}", e);
+                log_err(&format!("{}: {}", gettext("failed to send response"), e));
             }
         }
+    }
+}
+
+/// Operational logging. In foreground mode messages go to stderr; once
+/// daemonized (no controlling terminal), they go to syslog (LOG_DAEMON).
+fn log_info(msg: &str) {
+    if DAEMONIZED.get().copied().unwrap_or(false) {
+        syslog_line(syslog::Severity::LOG_INFO, msg);
+    } else {
+        eprintln!("talkd: {}", msg);
+    }
+}
+
+fn log_err(msg: &str) {
+    if DAEMONIZED.get().copied().unwrap_or(false) {
+        syslog_line(syslog::Severity::LOG_ERR, msg);
+    } else {
+        eprintln!("talkd: {}", msg);
+    }
+}
+
+fn syslog_line(severity: syslog::Severity, msg: &str) {
+    let formatter = syslog::Formatter3164 {
+        facility: syslog::Facility::LOG_DAEMON,
+        hostname: None,
+        process: "talkd".into(),
+        pid: process::id(),
+    };
+    if let Ok(mut writer) = syslog::unix(formatter) {
+        let _ = match severity {
+            syslog::Severity::LOG_ERR => writer.err(msg),
+            _ => writer.info(msg),
+        };
     }
 }
 
@@ -479,34 +659,62 @@ fn daemon_loop(socket_path: &Path) -> io::Result<()> {
 // Signal Handling
 // ============================================================================
 
-static mut SOCKET_PATH: Option<PathBuf> = None;
+/// Socket path for the cleanup signal handler (audit #TD8: replaces the unsound
+/// `static mut`).
+static SOCKET_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Whether the daemon has detached from its controlling terminal (selects the
+/// logging sink).
+static DAEMONIZED: OnceLock<bool> = OnceLock::new();
 
 extern "C" fn handle_signal(_sig: libc::c_int) {
-    // Clean up socket file on exit
-    unsafe {
-        if let Some(ref path) = SOCKET_PATH {
-            let _ = fs::remove_file(path);
-        }
+    // Clean up the socket file on exit.
+    if let Some(path) = SOCKET_PATH.get() {
+        let _ = fs::remove_file(path);
     }
     std::process::exit(0);
 }
 
 fn register_signals(socket_path: &Path) {
-    unsafe {
-        SOCKET_PATH = Some(socket_path.to_path_buf());
-        libc::signal(
-            libc::SIGINT,
-            handle_signal as *const () as libc::sighandler_t,
-        );
-        libc::signal(
-            libc::SIGTERM,
-            handle_signal as *const () as libc::sighandler_t,
-        );
-        libc::signal(
-            libc::SIGQUIT,
-            handle_signal as *const () as libc::sighandler_t,
-        );
+    let _ = SOCKET_PATH.set(socket_path.to_path_buf());
+    for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGQUIT] {
+        unsafe {
+            libc::signal(sig, handle_signal as *const () as libc::sighandler_t);
+        }
     }
+}
+
+/// Detach from the controlling terminal (audit #TD9): double-fork, `setsid`,
+/// `chdir("/")`, and redirect the standard descriptors to `/dev/null`.
+fn daemonize() -> io::Result<()> {
+    // First fork: the parent exits so the child is not a process-group leader.
+    match unsafe { libc::fork() } {
+        -1 => return Err(io::Error::last_os_error()),
+        0 => {}
+        _ => process::exit(0),
+    }
+    if unsafe { libc::setsid() } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // Second fork: ensure we can never reacquire a controlling terminal.
+    match unsafe { libc::fork() } {
+        -1 => return Err(io::Error::last_os_error()),
+        0 => {}
+        _ => process::exit(0),
+    }
+    unsafe {
+        libc::chdir(c"/".as_ptr());
+        let nullfd = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
+        if nullfd >= 0 {
+            libc::dup2(nullfd, libc::STDIN_FILENO);
+            libc::dup2(nullfd, libc::STDOUT_FILENO);
+            libc::dup2(nullfd, libc::STDERR_FILENO);
+            if nullfd > libc::STDERR_FILENO {
+                libc::close(nullfd);
+            }
+        }
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -514,16 +722,25 @@ fn register_signals(socket_path: &Path) {
 // ============================================================================
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    plib::diag::init_locale("talkd");
 
     let args = Args::parse();
+
+    // Detach unless asked to stay in the foreground (#TD9).
+    if !args.foreground {
+        if let Err(e) = daemonize() {
+            plib::diag::error(&format!("{}: {}", gettext("failed to daemonize"), e));
+            std::process::exit(1);
+        }
+        let _ = DAEMONIZED.set(true);
+    } else {
+        let _ = DAEMONIZED.set(false);
+    }
 
     register_signals(&args.socket);
 
     if let Err(e) = daemon_loop(&args.socket) {
-        eprintln!("talkd: {}", e);
+        log_err(&e.to_string());
         // Clean up socket on error
         let _ = fs::remove_file(&args.socket);
         std::process::exit(1);
@@ -551,7 +768,7 @@ mod tests {
             timestamp: Instant::now(),
         };
 
-        let id = registry.insert(inv);
+        let id = registry.insert(inv).expect("insert should succeed");
         assert!(registry.find_by_id(id).is_some());
         assert!(registry.find_for_callee("bob", "alice").is_some());
         assert!(registry.find_for_callee("alice", "bob").is_none());
@@ -572,7 +789,7 @@ mod tests {
             timestamp: Instant::now(),
         };
 
-        let id = registry.insert(inv);
+        let id = registry.insert(inv).expect("insert should succeed");
         assert!(registry.delete(id));
         assert!(registry.find_by_id(id).is_none());
     }
@@ -592,5 +809,73 @@ mod tests {
             b'h' as i8, b'e' as i8, b'l' as i8, b'l' as i8, b'o' as i8, 0, 0, 0, 0, 0, 0, 0,
         ];
         assert_eq!(c_array_to_string(&arr), "hello");
+    }
+
+    fn sample_invitation(caller: &str, callee: &str) -> Invitation {
+        Invitation {
+            id: 0,
+            caller: caller.to_string(),
+            callee: callee.to_string(),
+            caller_tty: String::new(),
+            callee_tty: String::new(),
+            tcp_addr: Osockaddr::default(),
+            ctl_addr: Osockaddr::default(),
+            timestamp: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn test_invitation_table_is_bounded() {
+        // The table must refuse growth past MAX_INVITATIONS (DoS guard, #TD4).
+        let mut registry = InvitationRegistry::new();
+        for i in 0..MAX_INVITATIONS {
+            assert!(registry
+                .insert(sample_invitation(&format!("c{i}"), &format!("d{i}")))
+                .is_some());
+        }
+        assert!(
+            registry
+                .insert(sample_invitation("overflow", "x"))
+                .is_none(),
+            "insert past the cap must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_leave_invite_refresh_updates_address() {
+        // A re-invite for the same (callee, caller) refreshes the stored TCP
+        // address instead of leaving a stale one (#TD11).
+        let mut registry = InvitationRegistry::new();
+        let id = registry
+            .insert(sample_invitation("alice", "bob"))
+            .expect("insert");
+
+        let new_addr = Osockaddr::from(&SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 9), 4242));
+        let refreshed = registry.refresh("bob", "alice", &new_addr);
+        assert_eq!(refreshed, Some(id), "refresh keeps the same id");
+        assert_eq!(
+            registry.find_by_id(id).unwrap().tcp_addr,
+            new_addr,
+            "refresh updates the TCP address"
+        );
+    }
+
+    #[test]
+    fn test_ctlmsg_wire_round_trip() {
+        // A CtlRes serializes to a fixed-size big-endian buffer and a truncated
+        // datagram fails to parse (graceful drop, not a panic) (#TD12).
+        let res = CtlRes::new(
+            MessageType::LookUp,
+            Answer::Success,
+            0x01020304,
+            Osockaddr::default(),
+        );
+        let bytes = res.to_bytes().expect("serialize");
+        assert_eq!(bytes.len(), size_of::<CtlRes>());
+
+        // A short buffer must be rejected by the parser, not panic.
+        assert!(CtlMsg::from_bytes(&[0u8; 4]).is_err());
+        // A zero-length datagram is also a graceful parse error.
+        assert!(CtlMsg::from_bytes(&[]).is_err());
     }
 }

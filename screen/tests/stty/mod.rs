@@ -107,3 +107,36 @@ fn test_stty_save_restore_roundtrip() {
         "restoring a saved -g blob should exit 0, got {code}"
     );
 }
+
+// Audit #3: single-character control-char assignment was rejected ("Invalid
+// cchar specification"). It must now set the control character. Use a literal
+// backspace (0x08) so `stty -a` renders it as "^H".
+#[test]
+fn test_stty_single_char_cchar_assignment() {
+    let pty = pty_or_skip!();
+    let (code, _) = pty.run(STTY, &["erase", "\u{8}"]);
+    assert_eq!(code, 0, "stty erase <BS> should exit 0, got {code}");
+
+    let (_code, out) = pty.run(STTY, &["-a"]);
+    assert!(
+        out.to_lowercase().contains("erase = ^h"),
+        "stty -a should show erase = ^H after assigning a literal backspace; got:\n{out}"
+    );
+}
+
+// Audit #4: rows/cols operands and the size informational query were missing
+// ("Unknown operand"). rows/cols set the window size; size reports it.
+#[test]
+fn test_stty_rows_cols_size() {
+    let pty = pty_or_skip!();
+    let (code, _) = pty.run(STTY, &["rows", "40", "cols", "100"]);
+    assert_eq!(code, 0, "stty rows 40 cols 100 should exit 0, got {code}");
+
+    let (code, out) = pty.run(STTY, &["size"]);
+    assert_eq!(code, 0, "stty size should exit 0, got {code}");
+    assert_eq!(
+        out.trim(),
+        "40 100",
+        "stty size should report the rows/cols just set; got: {out:?}"
+    );
+}

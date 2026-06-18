@@ -426,6 +426,19 @@ fn set_ti_cchar_oparg(
         return Ok(true);
     }
 
+    // POSIX: "If string is a single character, the control character shall be
+    // set to that character." (Handles plain values like `stty erase x` or a
+    // literal control byte; the `^c` form below covers the caret notation.)
+    if op_arg.chars().count() == 1 {
+        let ch = op_arg.chars().next().unwrap();
+        let code = ch as u32;
+        if code > 0xff {
+            return Err("control character value out of range");
+        }
+        *cc = code as cc_t;
+        return Ok(true);
+    }
+
     if !op_arg.starts_with("^") || op_arg.len() != 2 {
         return Err("Invalid cchar specification");
     }
@@ -438,6 +451,25 @@ fn set_ti_cchar_oparg(
     let value = value_res.unwrap();
     *cc = *value as cc_t;
     Ok(true)
+}
+
+// read the terminal window size (rows/cols) from standard input
+fn get_winsize() -> io::Result<libc::winsize> {
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    let ret = unsafe { libc::ioctl(libc::STDIN_FILENO, libc::TIOCGWINSZ, &mut ws) };
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(ws)
+}
+
+// write the terminal window size (rows/cols) to standard input
+fn set_winsize(ws: &libc::winsize) -> io::Result<()> {
+    let ret = unsafe { libc::ioctl(libc::STDIN_FILENO, libc::TIOCSWINSZ, ws) };
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn set_ti_speed(
@@ -677,6 +709,39 @@ fn stty_set_long(mut ti: Termios, args: &Args) -> io::Result<()> {
             if changed {
                 dirty = true;
             }
+            idx += 1;
+            continue;
+        }
+
+        // Terminal window size operands (Issue 8: rows, cols) and the size
+        // informational query. None of these are negatable.
+        if matches!(operand, "rows" | "cols" | "size") {
+            if negate {
+                let errstr = format!("Operand {} cannot be negated", operand);
+                return Err(Error::other(errstr));
+            }
+            if operand == "size" {
+                let ws = get_winsize()?;
+                println!("{} {}", ws.ws_row, ws.ws_col);
+                idx += 1;
+                continue;
+            }
+            // rows / cols take a numeric argument
+            idx += 1;
+            if idx == args.operands.len() {
+                let errstr = format!("Missing operand for {}", operand);
+                return Err(Error::other(errstr));
+            }
+            let n: u16 = args.operands[idx]
+                .parse()
+                .map_err(|_| Error::other(format!("Invalid numeric value for {}", operand)))?;
+            let mut ws = get_winsize()?;
+            if operand == "rows" {
+                ws.ws_row = n;
+            } else {
+                ws.ws_col = n;
+            }
+            set_winsize(&ws)?;
             idx += 1;
             continue;
         }

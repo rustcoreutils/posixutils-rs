@@ -281,9 +281,9 @@ var) are absent. `TZ`/`LC_TIME` are ignored for all time output.
 #### Minor
 
 - [x] **#P9 — `start_time` semantics diverge between back-ends.** `pslinux.rs:28` (ticks since boot) vs `psmacos.rs` (epoch seconds). The shared `format_etime` cannot be correct for both. Fix: normalize both back-ends to epoch seconds before handing to `ps.rs`. ✓ **fixed in Phase 3** — the `ProcessInfo` contract is now documented as `start_time` = epoch seconds, `time` = whole CPU seconds; Linux converts (ticks→seconds, +btime) and macOS converts CPU ns→seconds (`start_time` already epoch). The shared formatters are unit-agnostic.
-- [ ] **#P10 — Defunct (zombie) processes not marked `<defunct>`.** No marking anywhere. Spec 112545–112546. Fix: append `<defunct>` to `args`/`comm` when state == `Z`.
-- [ ] **#P11 — Controlling-terminal detection via `isatty(STDIN)`; TTY match by substring.** `sys/ps.rs:521-537` (uses stdin, not the invoker's controlling terminal — breaks under redirected stdin) and `ps.rs:714-717` (`contains()` so `pts/0` spuriously matches `pts/00`). Fix: read own `tty_nr` from `/proc/self/stat` field 7; compare TTY names by equality.
-- [ ] **#P12 — `-f` args header is `CMD`; spec default header for `args` is `COMMAND`.** `sys/ps.rs:392`. Fix: use `COMMAND` for the `args` field header.
+- [x] **#P10 — Defunct (zombie) processes not marked `<defunct>`.** No marking anywhere. Spec 112545–112546. Fix: append `<defunct>` to `args`/`comm` when state == `Z`. ✓ **fixed in Phase 6** — `mark_defunct()` appends ` <defunct>` to the command column for state `Z`. Behaviorally verified against a real zombie (`perl <defunct>`). Unit test `defunct_marking`.
+- [x] **#P11 — Controlling-terminal detection via `isatty(STDIN)`; TTY match by substring.** `sys/ps.rs:521-537` (uses stdin, breaks under redirected stdin) and `ps.rs:714-717` (`contains()` so `pts/0` spuriously matches `pts/00`). ✓ **fixed in Phase 6** — `get_current_tty` now probes stdin→stdout→stderr (a redirected stdin no longer hides the terminal); the default filter compares TTY names by **equality** (`ptty == ctty`).
+- [x] ~~**#P12 — `-f` args header is `CMD`; spec default header for `args` is `COMMAND`.**~~ **Refuted (Phase 6).** Re-reading the spec: line 112543 makes `CMD` the command-column header for the full/long listing (`-f`/`-l`), while line 112604 maps only the `-o args`/`-o comm` *format specifiers* to the default header `COMMAND`. The code already matches both (`get_full_fields` → `CMD`; `get_posix_fields` `args`/`comm` → `COMMAND`). No change needed.
 - [ ] **#P13 — macOS `get_tty_name` scans all of `/dev` per process; no `tty_dev==0` guard.** `sys/psmacos.rs:176-189`. O(procs × /dev). Fix: build a one-time `dev→name` map; guard `tty_dev==0 → None`.
 - [ ] **#P14 — No `.mo` catalogs (crate-wide).** See cross-cutting.
 
@@ -295,7 +295,7 @@ var) are absent. `TZ`/`LC_TIME` are ignored for all time output.
 | `-A` / `-e` | CONFORMS | `ps.rs:94,98`. |
 | `-a` | PARTIAL | `ps.rs:103` selects tty-bearing procs; optional session-leader exclusion not done (XSI "may"). |
 | `-d` | CONFORMS | `ps.rs:106`, `pid==sid` check `ps.rs:702`. |
-| `-f` | PARTIAL | login-name UID OK; `stime` ✓ Phase 4 (#P6); args header `CMD` (#P12, Phase 6). |
+| `-f` | CONFORMS | login-name UID OK; `stime` ✓ Phase 4 (#P6); args header `CMD` is correct per spec 112543 (#P12 refuted). |
 | `-g` | CONFORMS | filters by session id — `ps.rs:118,656`. |
 | `-G` / `-U` / `-u` / `-p` | CONFORMS | `ps.rs:122,138,134,127`. |
 | `-l` | CONFORMS | F S UID PID PPID C PRI NI ADDR SZ WCHAN TTY TIME CMD — `ps.rs:398-471`. |
@@ -327,7 +327,7 @@ var) are absent. `TZ`/`LC_TIME` are ignored for all time output.
 Not covered:
 - [x] `etime` numeric correctness (#P1) — unit test `format_etime_elapsed` + behavioral cross-check vs `/usr/bin/ps` (Phase 3).
 - [x] `COLUMNS`/`-w` truncation (#P4) — unit test + behavioral 3041-byte argv check (Phase 5).
-- [x] `-n` accepted (#P5) — `ps_namelist_accepted` (Phase 5). [ ] defunct marking (#P10, Phase 6); header suppression content (`ps_empty_header` only checks exit).
+- [x] `-n` accepted (#P5, Phase 5); defunct marking (#P10 — unit test + real-zombie check, Phase 6). [ ] header suppression content (`ps_empty_header` only checks exit).
 
 ---
 

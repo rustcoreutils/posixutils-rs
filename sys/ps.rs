@@ -20,7 +20,10 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use libc::{geteuid, getgrgid, getgrnam, getpwnam, getpwuid, isatty, ttyname, STDIN_FILENO};
+use libc::{
+    geteuid, getgrgid, getgrnam, getpwnam, getpwuid, isatty, ttyname, STDERR_FILENO, STDIN_FILENO,
+    STDOUT_FILENO,
+};
 
 #[cfg(target_os = "macos")]
 mod platform {
@@ -603,24 +606,41 @@ fn truncate_line(line: &str, max_bytes: usize) -> &str {
     &line[..end]
 }
 
-/// Get current terminal name
+/// Get the invoker's controlling-terminal name (e.g. "pts/0").
+///
+/// Probe stdin, then stdout, then stderr, so a redirected stdin alone does not
+/// hide the terminal (audit #P11). Returns the device name with the "/dev/"
+/// prefix stripped, to match the names derived from each process's `tty_nr`.
 fn get_current_tty() -> Option<String> {
-    unsafe {
-        if isatty(STDIN_FILENO) == 0 {
-            return None;
+    for fd in [STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO] {
+        unsafe {
+            if isatty(fd) == 0 {
+                continue;
+            }
+            let name = ttyname(fd);
+            if name.is_null() {
+                continue;
+            }
+            let name_str = std::ffi::CStr::from_ptr(name).to_string_lossy().to_string();
+            return Some(
+                name_str
+                    .strip_prefix("/dev/")
+                    .map(str::to_string)
+                    .unwrap_or(name_str),
+            );
         }
-        let name = ttyname(STDIN_FILENO);
-        if name.is_null() {
-            return None;
-        }
-        let cstr = std::ffi::CStr::from_ptr(name);
-        let name_str = cstr.to_string_lossy().to_string();
-        // Extract just the device name (e.g., "pts/0" from "/dev/pts/0")
-        if let Some(stripped) = name_str.strip_prefix("/dev/") {
-            Some(stripped.to_string())
-        } else {
-            Some(name_str)
-        }
+    }
+    None
+}
+
+/// Annotate the command column for a zombie (state 'Z'): POSIX says a process
+/// that has exited but not yet been waited for "shall be marked defunct"
+/// (audit #P10). Matches the historical `<defunct>` tag.
+fn mark_defunct(command: &str, state: char) -> String {
+    if state == 'Z' {
+        format!("{} <defunct>", command)
+    } else {
+        command.to_string()
     }
 }
 
@@ -644,8 +664,8 @@ fn get_field_value(proc: &platform::ProcessInfo, field: &str, ctx: &Context) -> 
         "group" => gid_to_name(proc.gid).unwrap_or_else(|| proc.gid.to_string()),
         "rgroup" => gid_to_name(proc.rgid).unwrap_or_else(|| proc.rgid.to_string()),
         "tty" => proc.tty.as_deref().unwrap_or("?").to_string(),
-        "comm" => proc.comm.clone(),
-        "args" => proc.args.clone(),
+        "comm" => mark_defunct(&proc.comm, proc.state),
+        "args" => mark_defunct(&proc.args, proc.state),
         "time" => format_time(proc.time),
         "etime" => format_etime(proc.start_time, ctx.now),
         "nice" => proc.nice.to_string(),
@@ -803,7 +823,8 @@ fn main() -> ExitCode {
                 return false;
             }
             match (&p.tty, &current_tty) {
-                (Some(ptty), Some(ctty)) => ptty.contains(ctty) || ctty.contains(ptty),
+                // Exact match: "pts/1" must not match "pts/10" (audit #P11).
+                (Some(ptty), Some(ctty)) => ptty == ctty,
                 (None, None) => true,
                 _ => false,
             }
@@ -941,5 +962,13 @@ mod tests {
         // A 2-byte 'é' at the boundary is dropped whole, never split.
         assert_eq!(truncate_line("aé", 2), "a");
         assert_eq!(truncate_line("aé", 3), "aé");
+    }
+
+    // Zombies are tagged <defunct> in the command column (#P10).
+    #[test]
+    fn defunct_marking() {
+        assert_eq!(mark_defunct("[bash]", 'Z'), "[bash] <defunct>");
+        assert_eq!(mark_defunct("bash", 'S'), "bash");
+        assert_eq!(mark_defunct("bash", 'R'), "bash");
     }
 }

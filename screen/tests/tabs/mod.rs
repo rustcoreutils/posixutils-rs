@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::common::PtyHarness;
+use crate::common::run as run_pty;
 use std::process::Command;
 
 const TABS: &str = env!("CARGO_BIN_EXE_tabs");
@@ -97,10 +97,10 @@ fn test_tabs_non_ascending_tabstops() {
     }
 }
 
-macro_rules! pty_or_skip {
-    () => {
-        match PtyHarness::new(24, 80) {
-            Some(h) => h,
+macro_rules! pty {
+    ($e:expr) => {
+        match $e {
+            Some(v) => v,
             None => {
                 eprintln!("Skipping PTY test: cannot allocate a pseudo-terminal");
                 return;
@@ -114,16 +114,14 @@ macro_rules! pty_or_skip {
 // non-empty sequence.
 #[test]
 fn test_tabs_default_under_pty() {
-    let pty = pty_or_skip!();
-    let (code, out) = pty.run(TABS, &["-T", "vt100"]);
+    let (code, out) = pty!(run_pty(TABS, &["-T", "vt100"]));
     assert_eq!(code, 0, "tabs -T vt100 (default) should exit 0, got {code}");
     assert!(!out.is_empty(), "tabs should emit a clear/set sequence");
 }
 
 #[test]
 fn test_tabs_preset_under_pty() {
-    let pty = pty_or_skip!();
-    let (code, _out) = pty.run(TABS, &["-T", "vt100", "-a"]);
+    let (code, _out) = pty!(run_pty(TABS, &["-T", "vt100", "-a"]));
     assert_eq!(code, 0, "tabs -T vt100 -a should exit 0, got {code}");
 }
 

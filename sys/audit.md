@@ -62,22 +62,22 @@ not accepted as operands at all, and `confstr` results are passed through
 
 #### Major
 
-- [ ] **#G1 — `-v POSIX_V8_*` specifications are rejected.** `sys/getconf.rs:544-556` (`is_valid_specification`). The `matches!` arm lists only `POSIX_V6_*` and `POSIX_V7_*`. The spec (slice 99382–99406, CHANGE HISTORY 99566–99571: "Austin Group Defect 1330 is applied … changing `_V7_` to `_V8_`") makes `POSIX_V8_ILP32_OFF32`, `POSIX_V8_ILP32_OFFBIG`, `POSIX_V8_LP64_OFF64`, `POSIX_V8_LPBIG_OFFBIG` the current `-v` argument set. `getconf -v POSIX_V8_LP64_OFF64 ARG_MAX` exits 1 "invalid specification". Fix: add the four `POSIX_V8_*` arms (accept as no-op like V6/V7).
-- [ ] **#G2 — `<limits.h>` Maximum/Minimum value names not accepted as operands.** Whole file — no table. Spec (99441–99455) requires names from the `<limits.h>` Maximum/Minimum tables (`LONG_BIT`, `WORD_BIT`, `MB_LEN_MAX`, `NL_ARGMAX`, `NL_LANGMAX`, `NL_MSGMAX`, `NL_NMAX`, `NL_SETMAX`, `NL_TEXTMAX`, `NZERO`, `CHARCLASS_NAME_MAX`, `COLL_WEIGHTS_MAX`, `RE_DUP_MAX`, `LINE_MAX`, …) to resolve as `system_var`. These are compile-time constants, not `sysconf` lookups, so a separate constant table is needed. Fix: add a `&str → i64` constant map seeded from `libc`/std values.
-- [ ] **#G3 — `POSIX_V8_*` confstr entries missing on both platforms.** `sys/getconf.rs:186-528` (`load_confstr_mapping`): Linux branch stops at `_CS_POSIX_V7_*`, macOS branch at `_CS_POSIX_V6_*`. Per Issue 8, the `_CS_POSIX_V8_*_CFLAGS`/`_LDFLAGS`/`_LIBS` family should be queryable. Fix: add V8 confstr entries (gated per platform availability).
+- [x] **#G1 — `-v POSIX_V8_*` specifications are rejected.** `sys/getconf.rs:544-556` (`is_valid_specification`). The `matches!` arm listed only `POSIX_V6_*` and `POSIX_V7_*`. The spec (CHANGE HISTORY 99566–99571: Austin Group Defect 1330, `_V7_` → `_V8_`) makes the four `POSIX_V8_*` names the current `-v` set. ✓ **fixed in Phase 10** — added the four V8 arms (legacy V6/V7 kept). Behaviorally verified `getconf -v POSIX_V8_LP64_OFF64 ARG_MAX` → 3200000. Unit test `v8_specifications_accepted`.
+- [x] **#G2 — `<limits.h>` Maximum/Minimum value names not accepted as operands.** Spec 99441–99455. ✓ **fixed in Phase 10 (partial, by design)** — new `lookup_limit_constant`, dispatched in `main` before the confstr/sysconf path, returns the portably-derivable `LONG_BIT` and `WORD_BIT` (`c_long::BITS`/`c_int::BITS`); behaviorally `getconf LONG_BIT` → 64 == system. The utility-limit values (`LINE_MAX`, `RE_DUP_MAX`, `COLL_WEIGHTS_MAX`, `BC_*`, `EXPR_NEST_MAX`) were already covered via the sysconf map. **Deferred:** the remaining pure-header macros (`MB_LEN_MAX`, `NL_ARGMAX`/`NL_*`, `NZERO`, `CHARCLASS_NAME_MAX`) are not exposed by the `libc` crate on Linux/macOS and are not hardcoded, since their per-platform values can't be runtime-verified from this host.
+- [ ] **#G3 — `POSIX_V8_*` confstr entries missing on both platforms.** `sys/getconf.rs` (`load_confstr_mapping`). **Deferred (Phase 10).** The `libc` crate defines no `_CS_POSIX_V8_*` constants for Linux or macOS (grep-confirmed), and neither glibc nor the macOS SDK exposes the Issue-8 V8 confstr names yet; hardcoding speculative integers for a `confstr(3)` query would be unverifiable and risk wrong output. Revisit when libc/the C libraries gain `_CS_POSIX_V8_*`.
 
 #### Minor
 
-- [ ] **#G4 — `confstr` value passed through `.trim_end()`.** `sys/getconf.rs:140`. After stripping the NUL terminator the code trims trailing whitespace, but the spec output format is `"%s\n"` (verbatim). A confstr value with significant trailing spaces would be altered. Fix: keep `.trim_end_matches('\0')` only; drop the general `.trim_end()`.
-- [ ] **#G5 — Several POSIX.1-2024 sysconf names absent.** `sys/getconf.rs:558-706` (`load_sysconf_mapping`). Missing the Issue-8 `NPROCESSORS_CONF`/`NPROCESSORS_ONLN` (Defect 339, spec 99567) plus a long tail (`_SC_BARRIERS`, `_SC_CLOCK_SELECTION`, `_SC_CPUTIME`, `_SC_MONOTONIC_CLOCK`, `_SC_READER_WRITER_LOCKS`, `_SC_SPIN_LOCKS`, `_SC_THREAD_CPUTIME`, `_SC_TIMEOUTS`, `_SC_TYPED_MEMORY_OBJECTS`, `_SC_XOPEN_REALTIME[_THREADS]`, `_SC_TRACE`, the `_SC_V7_*` programming-env queries). Fix: extend the map, `#[cfg]`-gating names not present on every platform.
-- [ ] **#G6 — A few pathconf names absent.** `sys/getconf.rs:708-732` (`load_pathconf_mapping`): no `_PC_SYNC_IO` (peer of the mapped `_PC_ASYNC_IO`), `_PC_2_SYMLINKS`, `_PC_TIMESTAMP_RESOLUTION`. Fix: add entries; `#[cfg]`-gate the ones not on all platforms.
+- [x] **#G4 — `confstr` value passed through `.trim_end()`.** `sys/getconf.rs:140`. ✓ **fixed in Phase 10** — now strips only the NUL terminator (`.trim_end_matches('\0')`); significant trailing whitespace is preserved per the `"%s\n"` format.
+- [x] **#G5 — Several POSIX.1-2024 sysconf names absent.** `sys/getconf.rs` (`load_sysconf_mapping`). ✓ **fixed in Phase 10** — added the Issue-8 `_SC_NPROCESSORS_CONF`/`_SC_NPROCESSORS_ONLN` (Defect 339) plus `_SC_BARRIERS`, `_SC_CLOCK_SELECTION`, `_SC_CPUTIME`, `_SC_MONOTONIC_CLOCK`, `_SC_READER_WRITER_LOCKS`, `_SC_SPIN_LOCKS`, `_SC_SPORADIC_SERVER`, `_SC_THREAD_CPUTIME`, `_SC_TIMEOUTS`, `_SC_TYPED_MEMORY_OBJECTS`, `_SC_TRACE`, `_SC_XOPEN_REALTIME`, `_SC_XOPEN_REALTIME_THREADS` (all verified present in `libc` for both Linux and macOS via `cargo check --target`). Behaviorally `getconf NPROCESSORS_ONLN` == system. Unit test `nprocessors_mapped`. (The `_SC_V7_*`/`_SC_V8_*` programming-env *query* variables are not in libc — deferred with #G3.)
+- [x] **#G6 — A few pathconf names absent.** `sys/getconf.rs` (`load_pathconf_mapping`). ✓ **fixed in Phase 10** — added `POSIX2_SYMLINKS`/`_PC_2_SYMLINKS` (present on both targets); behaviorally `getconf POSIX2_SYMLINKS /` → 1, unit test `posix2_symlinks_mapped`. **Deferred:** `_PC_SYNC_IO` (not defined for linux-gnu/musl in `libc`) and `_PC_TIMESTAMP_RESOLUTION` (not defined for Linux or macOS in `libc`).
 
 ### Detailed conformance matrix
 
 #### SYNOPSIS / OPTIONS / OPERANDS
 - [x] `getconf [-v spec] system_var` and `getconf [-v spec] path_var pathname` forms — `getconf.rs:24-36, 752`. CONFORMS.
 - [x] `--` end-of-options handled by clap. CONFORMS.
-- [ ] **`-v` accepts only V6/V7** (#G1). `getconf.rs:544-556`.
+- [x] **`-v` accepts V6/V7/V8** (#G1 ✓ Phase 10). `getconf.rs:544-556`.
 - [x] `pathname` operand passed to `pathconf` via `CString` — `getconf.rs:164`. CONFORMS.
 
 #### STDIN / INPUT FILES / OUTPUT FILES
@@ -88,7 +88,7 @@ not accepted as operands at all, and `confstr` results are passed through
 
 #### STDOUT / STDERR
 - [x] Numeric vars `"%d\n"`, undefined → `undefined\n`, invalid → nothing on stdout + stderr diagnostic + exit 1 — `getconf.rs:77/85/113/141/171`. CONFORMS.
-- [ ] **confstr `.trim_end()`** (#G4) — `getconf.rs:140`.
+- [x] **confstr verbatim (NUL-only strip)** (#G4 ✓ Phase 10) — `getconf.rs:140`.
 
 #### Exit status / consequences of errors
 - [x] 0 on success (incl. valid-but-`undefined` → exit 0 per RATIONALE 99532–99535); >0 on any error via `process::exit(1)`. CONFORMS — `getconf.rs:77/113/171` (undefined), error paths.
@@ -104,10 +104,10 @@ not accepted as operands at all, and `confstr` results are passed through
 ### Test coverage signal
 
 Not covered:
-- [ ] `getconf -v POSIX_V8_*` acceptance (#G1).
-- [ ] `<limits.h>` constant operands (#G2).
-- [ ] confstr trailing-whitespace preservation (#G4).
-- [ ] `NPROCESSORS_CONF` / `NPROCESSORS_ONLN` (#G5).
+- [x] `getconf -v POSIX_V8_*` acceptance (#G1) — `v8_specifications_accepted` (Phase 10).
+- [x] `<limits.h>` constant operands (#G2) — `limit_constants` (Phase 10; LONG_BIT/WORD_BIT).
+- [x] confstr trailing-whitespace preservation (#G4) — behavioral (Phase 10).
+- [x] `NPROCESSORS_CONF` / `NPROCESSORS_ONLN` (#G5) — `nprocessors_mapped` + behavioral (Phase 10).
 
 ---
 

@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, TestPlan};
+use plib::testing::{run_test, run_test_base, TestPlan};
 use std::{
     fs::{File, Permissions},
     io::Read,
@@ -217,4 +217,60 @@ fn uuencode_uudecode_with_base64_encoding_jpg_file() {
     let source_file_content = String::from_utf8_lossy(&source_file_content);
 
     uudecode_test(&[], &encoded_file_content, &source_file_content, "");
+}
+
+// =============================================================================
+// uudecode robustness — malformed/binary input must diagnose + exit >0,
+// never panic (exit 101).  Regression tests for audit #UD1.
+// =============================================================================
+
+fn uudecode_expect_graceful_failure(stdin_data: &[u8]) {
+    let output = run_test_base(&String::from("uudecode"), &Vec::new(), stdin_data);
+    let code = output.status.code();
+    assert_ne!(
+        code,
+        Some(101),
+        "uudecode panicked (exit 101) on malformed input; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        code,
+        Some(1),
+        "expected exit 1 on malformed input, got {:?}; stderr={}",
+        code,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.stderr.is_empty(),
+        "expected a diagnostic on stderr for malformed input"
+    );
+}
+
+#[test]
+fn uudecode_binary_input_no_panic() {
+    // Non-UTF-8 / random binary input previously hit String::from_utf8().unwrap().
+    let data: &[u8] = &[0x80, 0xFF, 0x00, 0x01, b'h', b'i', 0xC3, 0x28, 0xFE, 0x9D];
+    uudecode_expect_graceful_failure(data);
+}
+
+#[test]
+fn uudecode_empty_input_no_panic() {
+    uudecode_expect_graceful_failure(b"");
+}
+
+#[test]
+fn uudecode_missing_header_no_panic() {
+    uudecode_expect_graceful_failure(b"this is not uuencoded data\nmore junk\n");
+}
+
+#[test]
+fn uudecode_truncated_header_no_panic() {
+    // "begin" with no mode / no pathname previously panicked on split[1]/split[2].
+    uudecode_expect_graceful_failure(b"begin\n");
+}
+
+#[test]
+fn uudecode_bad_mode_no_panic() {
+    // Non-octal mode previously hit u32::from_str_radix(...).expect(...).
+    uudecode_expect_graceful_failure(b"begin xyz out.txt\nM(2)Q\n");
 }

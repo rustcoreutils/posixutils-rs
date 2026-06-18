@@ -11,15 +11,9 @@ use base64::prelude::*;
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use std::fs::{remove_file, File};
-use std::io::{self, Error, Read, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-
-macro_rules! reduce {
-    ($e : expr) => {
-        ($e - 0x20)
-    };
-}
 
 /// uudecode - decode a binary file
 #[derive(Parser)]
@@ -46,56 +40,75 @@ struct Header {
     out: PathBuf,
 }
 
-impl Header {
-    fn parse(line: &str) -> Self {
-        // split with spaces
-        let split: Vec<&str> = line.split(' ').collect();
-        let dec_type = if split[0] == "begin" {
-            DecodingType::Historical
-        } else if split[0] == "begin-base64" {
-            DecodingType::Base64
-        } else {
-            panic!("Invalid encoding type");
-        };
+/// Build an `InvalidData` error for malformed uuencode input.
+fn invalid(msg: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, msg.to_string())
+}
 
-        let mode_str = split[1];
-        // Reject if mode contains a sign
-        if mode_str.starts_with('+') || mode_str.starts_with('-') {
-            panic!("Invalid permission value: unexpected sign");
-        }
-        let lower_perm_bits = u32::from_str_radix(mode_str, 8).expect("Invalid permission value");
-        let out = PathBuf::from(split[2]);
-
-        Self {
-            dec_type,
-            lower_perm_bits,
-            out,
-        }
+/// Drop a single trailing carriage return (matches `str::lines()` for CRLF input).
+fn strip_cr(line: &[u8]) -> &[u8] {
+    match line.split_last() {
+        Some((b'\r', init)) => init,
+        _ => line,
     }
 }
 
-fn decode_historical_line(line: &str) -> Vec<u8> {
+impl Header {
+    fn parse(line: &[u8]) -> io::Result<Self> {
+        // The header line is always portable ASCII; reject non-text rather than panic.
+        let line = std::str::from_utf8(line).map_err(|_| invalid("header is not valid text"))?;
+
+        // "begin <mode> <decode_pathname>" — the pathname may contain spaces.
+        let mut fields = line.splitn(3, ' ');
+        let tag = fields.next().unwrap_or("");
+        let dec_type = match tag {
+            "begin" => DecodingType::Historical,
+            "begin-base64" => DecodingType::Base64,
+            _ => return Err(invalid("invalid uuencode header")),
+        };
+
+        let mode_str = fields
+            .next()
+            .ok_or_else(|| invalid("missing mode in uuencode header"))?;
+        // Reject if mode contains a sign.
+        if mode_str.starts_with('+') || mode_str.starts_with('-') {
+            return Err(invalid("invalid permission value: unexpected sign"));
+        }
+        let lower_perm_bits =
+            u32::from_str_radix(mode_str, 8).map_err(|_| invalid("invalid permission value"))?;
+
+        let out = fields
+            .next()
+            .ok_or_else(|| invalid("missing pathname in uuencode header"))?;
+
+        Ok(Self {
+            dec_type,
+            lower_perm_bits,
+            out: PathBuf::from(out),
+        })
+    }
+}
+
+fn decode_historical_line(line: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
 
-    for chunk in line.as_bytes().chunks(4) {
-        let chunk = chunk.to_vec();
+    for chunk in line.chunks(4) {
+        // Missing trailing bytes in a short final chunk decode to zero (0x20 - 0x20).
+        let v = |i: usize| chunk.get(i).copied().unwrap_or(0x20).wrapping_sub(0x20) & 0x3F;
+        let (a, b, c, d) = (v(0), v(1), v(2), v(3));
 
-        let out_chunk = [
-            (reduce!(chunk[0]) << 2) | (reduce!(chunk[1]) >> 4),
-            (reduce!(chunk[1]) << 4) | (reduce!(chunk[2]) >> 2),
-            (reduce!(chunk[2]) << 6) | reduce!(chunk[3]),
-        ];
-
-        out.extend_from_slice(&out_chunk);
+        out.push((a << 2) | (b >> 4));
+        out.push((b << 4) | (c >> 2));
+        out.push((c << 6) | d);
     }
 
     out
 }
 
-fn decode_base64_line(line: &str) -> io::Result<Vec<u8>> {
+fn decode_base64_line(line: &[u8]) -> io::Result<Vec<u8>> {
     BASE64_STANDARD
         .decode(line)
-        .map_err(|_| Error::from(io::ErrorKind::InvalidInput))
+        .map_err(|_| invalid("invalid base64 data"))
 }
 
 fn decode_file(args: &Args) -> io::Result<()> {
@@ -115,34 +128,50 @@ fn decode_file(args: &Args) -> io::Result<()> {
         file.read_to_end(&mut buf)?;
     }
 
-    let buf = String::from_utf8(buf).unwrap();
-    let mut lines = buf.lines();
-    let header = Header::parse(lines.next().expect("No header line"));
+    let mut lines = buf.split(|&b| b == b'\n');
+    let header_line = lines.next().ok_or_else(|| invalid("no header line"))?;
+    let header = Header::parse(strip_cr(header_line))?;
 
     match header.dec_type {
         DecodingType::Historical => {
-            while let Some(line) = lines.next() {
-                let line = line.replace("`", " ");
-                if line.len() == 1 && line == " " {
-                    let end_line = lines.next().expect("No end line");
-                    if end_line == "end" || end_line == "end\r" {
+            while let Some(raw) = lines.next() {
+                let line = strip_cr(raw);
+                if line.is_empty() {
+                    continue;
+                }
+
+                // Historical encoding optionally replaces 0x20 with 0x60 ('`').
+                let line: Vec<u8> = line
+                    .iter()
+                    .map(|&b| if b == b'`' { b' ' } else { b })
+                    .collect();
+
+                if line.len() == 1 && line[0] == b' ' {
+                    let end_line = lines.next().map(strip_cr).unwrap_or(b"");
+                    if end_line == b"end" {
                         break;
                     } else {
-                        panic!("Invalid ending")
+                        return Err(invalid("invalid ending"));
                     }
                 }
 
-                let len = (line.as_bytes()[0] - 32) as usize;
+                let len = line[0].wrapping_sub(0x20) as usize;
                 let mut dec_out = decode_historical_line(&line[1..]);
-                dec_out.truncate(len);
+                if len < dec_out.len() {
+                    dec_out.truncate(len);
+                }
                 out.extend_from_slice(&dec_out);
             }
         }
 
         DecodingType::Base64 => {
-            for line in lines {
-                if line == "====" || line == "====\n" {
+            for raw in lines {
+                let line = strip_cr(raw);
+                if line == b"====" {
                     break;
+                }
+                if line.is_empty() {
+                    continue;
                 }
                 out.extend_from_slice(&decode_base64_line(line)?);
             }

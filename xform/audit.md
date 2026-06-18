@@ -371,7 +371,7 @@ check** while treating a failed `set_permissions` as fatal.
 ### Priority issues
 
 #### Critical
-- [ ] **#UD1 — panics (exit 101) on malformed / non-text input.**
+- [x] **#UD1 — panics (exit 101) on malformed / non-text input.** ✓ fixed (phase 1) — byte-based decode (no `from_utf8().unwrap()`); `Header::parse` + line decoders return `io::Result`; short/empty lines tolerated; regression tests in `tests/uue/mod.rs`.
   `String::from_utf8(buf).unwrap()` (`uudecode.rs:118`) aborts on any non-UTF-8
   byte — and the spec RATIONALE (119781-119783) explicitly notes the encoded
   stream may be wrapped in a non-text file. Additional abort sites:
@@ -441,7 +441,7 @@ check** while treating a failed `set_permissions` as fatal.
 - [x] Base64 decode CONFORMS on well-formed lines — `uudecode.rs:95-99`;
   `====` terminator (`uudecode.rs:144-146`).
 - [ ] **lenient decode of transport artifacts MISSING** — see #UD4.
-- [ ] **robustness on malformed input CRITICAL** — see #UD1.
+- [x] **robustness on malformed input CRITICAL** — see #UD1 (✓ fixed, phase 1).
 
 #### Output file / mode
 - [x] `/dev/stdout` → stdout CONFORMS — `uudecode.rs:154-155`.
@@ -458,8 +458,8 @@ check** while treating a failed `set_permissions` as fatal.
 
 ### Test coverage signal
 Not covered:
-- [ ] Malformed / truncated / non-UTF-8 input (should diagnose + exit >0) —
-  #UD1.
+- [x] Malformed / truncated / non-UTF-8 input (should diagnose + exit >0) —
+  #UD1 (✓ phase 1).
 - [ ] `-o -` and header pathname `-` → stdout — #UD2.
 - [ ] Header not on line 1 (leading mail headers) — #UD3.
 - [ ] CRLF / whitespace-padded encoded lines — #UD4.

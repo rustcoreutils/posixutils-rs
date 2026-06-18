@@ -371,39 +371,38 @@ not override to physical and `-P` does nothing; (2) error/output paths use
 ### Priority issues
 
 #### Major
-- [ ] **#PW1 — `-L`/`-P` "last one wins" not implemented; `-P` ignored.** `users/pwd.rs:24-29,57-64`. Spec 112743-112744: "If both −L and −P are specified, the last one shall apply." Clap stores two independent bools; the code reads only `args.env` and **never** `args.process` (verified: line 28 field is unused). So `-P` is a no-op and `-L -P` still behaves logically. Fix: track option order so the last of `-L`/`-P` decides; on physical, ignore `$PWD` and use `current_dir()`.
-- [ ] **#PW2 — `-P` does not explicitly guarantee symlink-free resolution.** `users/pwd.rs:57`. `current_dir()` is canonical on Linux, so default/-P output is physically correct in practice, but because `-P` is never branched there is no explicit canonicalization. Fix: for `-P`, optionally `canonicalize()`, or document reliance on getcwd. (Tie to #PW1.)
+- [x] **#PW1 — `-L`/`-P` "last one wins" not implemented; `-P` ignored.** ✓ fixed (phase 3) — `-L`/`-P` are now `overrides_with` each other (last wins); physical mode ignores `$PWD` and uses getcwd. Verified with a real symlinked cwd. `users/pwd.rs`.
+- [x] **#PW2 — `-P` does not explicitly guarantee symlink-free resolution.** ✓ fixed (phase 3) — `-P` uses `current_dir()` (getcwd, symlink-free on Linux/macOS); documented in `resolve_cwd`. `users/pwd.rs`.
 
 #### Minor
-- [ ] **#PW3 — `$PWD` length not bounded against {PATH_MAX}.** `users/pwd.rs:58-63`. Spec 112732-112734 makes behavior unspecified beyond PATH_MAX, permitting `-P` fallback. Fix: if `dir.len() >= PATH_MAX`, fall back to `current_dir()`.
-- [ ] **#PW4 — Diagnostics not localized; default Rust error formatting.** `users/pwd.rs:50,57`. `Box<dyn Error>` from `?` yields an unlocalized message. Fix: catch and `eprintln!(gettext(...))`.
-- [ ] **#PW5 — `to_string_lossy()` can corrupt non-UTF-8 paths.** `users/pwd.rs:66`. Invalid UTF-8 bytes become U+FFFD. Fix: write the raw `OsStr` bytes via `write_all`.
-- [ ] **#PW6 — No tests.** Add: default output absolute & equals getcwd; `-L` with a valid `$PWD` symlink prints the logical path; `-L` with `$PWD` containing `..` is rejected; `-L -P` prints physical. The stale `pwd.rs:10` TODO (about `-L` "." normalization) is partly moot — `dirname_valid` rejects `.` — but unverified.
+- [x] **#PW3 — `$PWD` length not bounded against {PATH_MAX}.** ✓ fixed (phase 3) — logical mode falls back to getcwd when `$PWD` length ≥ `libc::PATH_MAX`. `users/pwd.rs`.
+- [x] **#PW4 — Diagnostics not localized; default Rust error formatting.** ✓ fixed (phase 3) — `plib::diag::error` + `gettext`. `users/pwd.rs`.
+- [x] **#PW5 — `to_string_lossy()` can corrupt non-UTF-8 paths.** ✓ fixed (phase 3) — emits raw `OsStr` bytes via `write_all`. `users/pwd.rs`.
+- [x] **#PW6 — No tests.** ✓ fixed (phase 3) — new `users/tests/pwd/mod.rs`: invalid/`..` `$PWD` fallback, `-L` honors valid `$PWD`, `-P` ignores it, and both last-wins orderings. The stale `pwd.rs:10` TODO removed.
 
 ### Detailed conformance matrix
 
 | Area | Status | Notes (file:line) |
 |---|---|---|
-| Options conform to XBD 12.2 | PARTIAL | clap handles `--`/`--help`; option relationship wrong (#PW1). pwd.rs:21-29 |
-| Option −L (use valid `$PWD`) | CONFORMS `- [x]` | Validates absolute + no `.`/`..`. pwd.rs:31-48,58-64 |
-| Option −P (physical, no symlinks) | DIVERGES `- [ ]` | `args.process` declared but never read. pwd.rs:28,57 (#PW1/#PW2) |
-| Last −L/−P wins; default −L | DIVERGES `- [ ]` | No precedence logic; default is `current_dir()`. pwd.rs:57-64 (#PW1) |
-| `$PWD` absolute / no `.`,`..` | CONFORMS `- [x]` | `dirname_valid`. pwd.rs:31-48 |
-| `$PWD` > PATH_MAX handling | PARTIAL | No length check (unspecified per spec). pwd.rs:58 (#PW3) |
+| Options conform to XBD 12.2 | CONFORMS ✓ | `overrides_with` last-wins (fixed #PW1, phase 3). pwd.rs |
+| Option −L (use valid `$PWD`) | CONFORMS `- [x]` | Validates absolute + no `.`/`..`. pwd.rs `dirname_valid` |
+| Option −P (physical, no symlinks) | CONFORMS ✓ | `-P` → getcwd, ignores `$PWD` (fixed #PW1/#PW2, phase 3). pwd.rs |
+| Last −L/−P wins; default −L | CONFORMS ✓ | `overrides_with` (fixed #PW1, phase 3). pwd.rs |
+| `$PWD` absolute / no `.`,`..` | CONFORMS `- [x]` | `dirname_valid`. pwd.rs |
+| `$PWD` > PATH_MAX handling | CONFORMS ✓ | falls back to getcwd at ≥ PATH_MAX (fixed #PW3, phase 3). pwd.rs |
 | Operands (None) | CONFORMS `- [x]` | clap errors on extras. pwd.rs:23-29 |
 | STDIN (Not used) | CONFORMS `- [x]` | Never read. |
 | Env PWD | CONFORMS `- [x]` | Read only under `-L`, validated first. pwd.rs:58-60 |
 | Env LC_*/LANG/NLSPATH | CONFORMS `- [x]` | setlocale + textdomain. pwd.rs:51-53 |
 | Async events (Default) | N/A `- [x]` | |
-| STDOUT `"%s\n"` | PARTIAL | `println!` adds `\n`; lossy UTF-8 (#PW5). pwd.rs:66 |
-| STDERR (diagnostics only) | PARTIAL | Errors via `?`; unlocalized (#PW4). pwd.rs:50,57 |
+| STDOUT `"%s\n"` | CONFORMS ✓ | raw `OsStr` bytes via `write_all` (fixed #PW5, phase 3). pwd.rs |
+| STDERR (diagnostics only) | CONFORMS ✓ | `plib::diag` + `gettext` (fixed #PW4, phase 3). pwd.rs |
 | Exit status (0 ok / >0 err) | CONFORMS `- [x]` | `?` → non-zero on error; 0 on success. pwd.rs:50,68 |
 | No partial output on error | CONFORMS `- [x]` | Errors precede `println!`. pwd.rs:57-66 |
 
 ### Test coverage signal
 
-Not covered:
-- [ ] **Everything** — no tests. The unused `args.process` (#PW1) is exactly what a `-L -P` precedence test would expose; a `$PWD`-with-`..` test would confirm `dirname_valid`.
+- [x] ✓ added (phase 3) — `users/tests/pwd/mod.rs` covers the `-L`/`-P` precedence matrix, `$PWD` validity/PATH_MAX fallback, and absolute-output invariants.
 
 ---
 

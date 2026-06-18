@@ -11,6 +11,7 @@ mod common;
 mod id;
 mod logger;
 mod logname;
+mod pwd;
 mod talk;
 mod tty;
 mod write;

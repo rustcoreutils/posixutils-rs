@@ -221,6 +221,57 @@ fn uuencode_uudecode_with_base64_encoding_jpg_file() {
 }
 
 // =============================================================================
+// uuencode operands — regression tests for audit #UE1, #UE2.
+// =============================================================================
+
+#[test]
+fn uuencode_single_operand_reads_stdin() {
+    // `uuencode NAME` (one operand) must read stdin and name the decode path NAME,
+    // NOT open NAME as the input file.
+    let payload = "hello from stdin\n";
+    let enc = run_test_base(
+        &String::from("uuencode"),
+        &vec![String::from("thedata")],
+        payload.as_bytes(),
+    );
+    assert_eq!(
+        enc.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&enc.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&enc.stdout);
+    let header = stdout.lines().next().unwrap();
+    assert!(header.starts_with("begin "), "header line: {header}");
+    assert!(
+        header.ends_with(" thedata"),
+        "header must name the decode path: {header}"
+    );
+
+    // Round-trip through uudecode -o - to confirm stdin was the input.
+    let dec = run_test_base(
+        &String::from("uudecode"),
+        &vec![String::from("-o"), String::from("-")],
+        &enc.stdout,
+    );
+    assert_eq!(
+        dec.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&dec.stderr)
+    );
+    assert_eq!(dec.stdout, payload.as_bytes());
+}
+
+#[test]
+fn uuencode_missing_decode_pathname_errors() {
+    // Zero operands: decode_pathname is required.
+    let out = run_test_base(&String::from("uuencode"), &Vec::new(), b"data\n");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(!out.stderr.is_empty(), "expected a diagnostic on stderr");
+}
+
+// =============================================================================
 // uudecode robustness — malformed/binary input must diagnose + exit >0,
 // never panic (exit 101).  Regression tests for audit #UD1.
 // =============================================================================

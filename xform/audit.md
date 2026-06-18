@@ -281,7 +281,7 @@ real defect is operand parsing: the spec's optional operand (`file`) is
 ### Priority issues
 
 #### Major
-- [ ] **#UE1 — single-operand form mis-parsed.** Synopsis is
+- [x] **#UE1 — single-operand form mis-parsed.** ✓ fixed (phase 3) — operands collected into a `Vec`; 1 operand = stdin + decode_pathname, 2 = file + decode_pathname. Synopsis is
   `uuencode [-m] [file] decode_pathname` (119822) — the optional `file` is the
   *first* operand. With two positionals (`file`, `decode_path`) both declared
   `Option` (`uuencode.rs:28-33`), clap fills left-to-right, so
@@ -291,13 +291,13 @@ real defect is operand parsing: the spec's optional operand (`file`) is
   source and emits the wrong decode pathname. Fix: collect operands into a
   `Vec`; 1 operand ⇒ stdin + `decode_pathname`, 2 operands ⇒ `file` +
   `decode_pathname`.
-- [ ] **#UE2 — required `decode_pathname` operand not enforced.** Zero
+- [x] **#UE2 — required `decode_pathname` operand not enforced.** ✓ fixed (phase 3) — zero operands → usage error, exit 1. Zero
   operands is accepted: `uuencode` reads stdin and emits
   `begin <mode> /dev/stdout` (`uuencode.rs:100-103,121-138`). Spec makes
   `decode_pathname` mandatory; missing operand should be a usage error.
 
 #### Minor
-- [ ] **#UE3 — `umask()` mutates process umask to read it.** The stdin mode is
+- [x] **#UE3 — `umask()` mutates process umask to read it.** ✓ fixed (phase 3) — `current_umask_mode` reads then restores the mask. The stdin mode is
   computed as `RW & !umask(RW)` (`uuencode.rs:121-132`), which *sets* the umask
   to `0666` and never restores it. Harmless (the process exits immediately) but
   a smell; query without mutating, or restore afterward.
@@ -312,8 +312,7 @@ real defect is operand parsing: the spec's optional operand (`file`) is
 
 #### Options / operands
 - [x] `-m` (Base64) CONFORMS — `uuencode.rs:25-26,105-109`.
-- [ ] **`[file] decode_pathname` PARTIAL** — two-operand form correct; one- and
-  zero-operand forms broken (#UE1, #UE2).
+- [x] **`[file] decode_pathname`** ✓ fixed (phase 3) — all of 0/1/2-operand forms handled (#UE1, #UE2).
 - [x] `decode_pathname` = `-`/`/dev/stdout` CONFORMS — passed verbatim into the
   header (`uuencode.rs:135,143`); meaning is interpreted by `uudecode`.
 
@@ -345,8 +344,8 @@ real defect is operand parsing: the spec's optional operand (`file`) is
 
 ### Test coverage signal
 Not covered:
-- [ ] Single-operand stdin form (`… | uuencode name`) — would expose #UE1.
-- [ ] Zero-operand usage error — #UE2.
+- [x] Single-operand stdin form (`… | uuencode name`) — #UE1 (✓ phase 3).
+- [x] Zero-operand usage error — #UE2 (✓ phase 3).
 - [ ] Empty input (begin line then backtick/`end`).
 - [ ] `decode_pathname` of `-` / `/dev/stdout` round-trip through `uudecode`.
 

@@ -10,6 +10,7 @@
 mod common;
 mod id;
 mod logger;
+mod logname;
 mod talk;
 mod tty;
 mod write;

@@ -185,13 +185,13 @@ produce erroneous results."
 ### Priority issues
 
 #### Major
-- [ ] **#LN1 — Falls back to the `$USER` environment variable; the spec forbids env-derived names.** `plib/src/curuser.rs:24-26` (consumed at `logname.rs:13`). The login name must be the `getlogin()` string; APPLICATION USAGE explicitly cautions against env-derived names. Fix: in the logname path, do not consult `$USER`; if `getlogin()` fails, error out.
-- [ ] **#LN2 — Never fails on `getlogin()` failure; spec mandates non-zero exit + stderr diagnostic.** `logname.rs:12-16`, `curuser.rs:38` (`"unknown"` last resort). Spec 102992-102994: "Under the conditions where getlogin() would fail, the logname utility shall write a diagnostic message to standard error and exit with a non-zero exit status." Implementation always returns a string and exits 0. Fix: return `Option`/`Result` from a logname-specific helper; on `None`, diagnose + `exit(1)`.
+- [x] **#LN1 — Falls back to the `$USER` environment variable; the spec forbids env-derived names.** ✓ fixed (phase 2) — `logname` now calls the new `curuser::login_name_strict()` (getlogin only, no `$USER`/getpwuid). `users/logname.rs`.
+- [x] **#LN2 — Never fails on `getlogin()` failure; spec mandates non-zero exit + stderr diagnostic.** ✓ fixed (phase 2) — on `None`, emits `logname: no login name` via `plib::diag::error` and exits 1. `users/logname.rs`.
 
 #### Minor
-- [ ] **#LN3 — `getpwuid()` fallback diverges from getlogin() semantics.** `curuser.rs:30-37`. `getlogin()` reflects the controlling-terminal/session name (can differ after `su`); folding to `getpwuid(getuid())` masks failure and can yield a different name. Same fix as #LN2.
-- [ ] **#LN4 — No locale initialization.** `logname.rs` has no `setlocale`/`textdomain` (compare `pwd.rs:51-53`). Diagnostics, once added, should be localizable. Fix: add the standard locale-init wrapper.
-- [ ] **#LN5 — No tests.** Add a module asserting output matches `getlogin()`/`id -un` with a trailing newline, and that the failure path errors.
+- [x] **#LN3 — `getpwuid()` fallback diverges from getlogin() semantics.** ✓ fixed (phase 2) — strict helper drops the getpwuid fallback entirely. `plib/src/curuser.rs` `login_name_strict`.
+- [x] **#LN4 — No locale initialization.** ✓ fixed (phase 2) — `plib::diag::init_locale("logname")`. `users/logname.rs`.
+- [x] **#LN5 — No tests.** ✓ fixed (phase 2) — new `users/tests/logname/mod.rs`: strict-contract (exit 0 non-empty name XOR exit 1 + diagnostic) and operand-rejection tests.
 
 ### Detailed conformance matrix
 
@@ -201,18 +201,17 @@ produce erroneous results."
 | Operands (None) | CONFORMS `- [x]` | None accepted. logname.rs:12 |
 | STDIN (Not used) | CONFORMS `- [x]` | Never read. |
 | Env — LOGNAME ignored | CONFORMS `- [x]` | Not consulted. curuser.rs:12-39 |
-| Env — USER ignored | DIVERGES `- [ ]` | `$USER` IS consulted as fallback. curuser.rs:24-26 (#LN1) |
-| Env — LC_*/LANG/NLSPATH | MISSING `- [ ]` | No `setlocale`/`textdomain`. logname.rs (#LN4) |
+| Env — USER ignored | CONFORMS ✓ | `login_name_strict` ignores `$USER` (fixed #LN1, phase 2) |
+| Env — LC_*/LANG/NLSPATH | CONFORMS ✓ | `plib::diag::init_locale` (fixed #LN4, phase 2) |
 | Async events (Default) | N/A `- [x]` | |
-| STDOUT `"%s\n"` | CONFORMS `- [x]` | `println!` emits name + `\n`. logname.rs:15 |
-| STDERR (diagnostics only) | PARTIAL `- [ ]` | Nothing written; spec requires a diagnostic on failure, which never happens. (#LN2) |
-| Login name = getlogin() | DIVERGES `- [ ]` | getlogin → `$USER` → getpwuid → `"unknown"`. curuser.rs:14-38 (#LN1/#LN3) |
-| Exit status (0 ok / >0 err) | DIVERGES `- [ ]` | Always 0 even with no login name. curuser.rs:38 (#LN2) |
+| STDOUT `"%s\n"` | CONFORMS `- [x]` | `println!` emits name + `\n`. logname.rs |
+| STDERR (diagnostics only) | CONFORMS ✓ | `logname: no login name` on getlogin() failure (fixed #LN2, phase 2) |
+| Login name = getlogin() | CONFORMS ✓ | getlogin only, no fallback (fixed #LN1/#LN3, phase 2) |
+| Exit status (0 ok / >0 err) | CONFORMS ✓ | exits 1 on no login name (fixed #LN2, phase 2) |
 
 ### Test coverage signal
 
-Not covered:
-- [ ] **Everything** — zero tests. The `$USER` fallback and missing failure path are exactly what a test (USER unset + no controlling tty → expect error, not `"unknown"`) would catch.
+- [x] ✓ added (phase 2) — `users/tests/logname/mod.rs` strict-contract + operand-rejection tests.
 
 ---
 

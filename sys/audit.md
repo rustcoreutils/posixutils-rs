@@ -197,15 +197,15 @@ with exit 0 instead of a diagnostic.
 
 #### Major
 
-- [ ] **#IS2 — Message-queue `QBYTES` always prints `-`.** `sys/ipcs.rs:548-550` (acknowledged in a code comment). `q_qbytes` is not in `/proc/sysvipc/msg`; obtaining it needs `msgctl(msqid, IPC_STAT, &buf)`. Spec (the `-b` column for message queues) requires the value. Fix: call `msgctl(IPC_STAT)` per entry.
+- [x] **#IS2 — Message-queue `QBYTES` always prints `-`.** `sys/ipcs.rs:548-550` (acknowledged in a code comment). `q_qbytes` is not in `/proc/sysvipc/msg`; obtaining it needs `msgctl(msqid, IPC_STAT, &buf)`. Spec (the `-b` column for message queues) requires the value. Fix: call `msgctl(IPC_STAT)` per entry. ✓ **fixed in Phase 2** — new `get_msg_qbytes()` helper + `MsgQueueInfo.qbytes: Option<u64>`; renders `-` only when the stat fails. Behaviorally verified (`ipcs -q -b` shows 16384, the `msgmnb` default).
 - [x] **#IS3 — MODE status flags never set + wrong char count.** `sys/ipcs.rs:118-123` (`c1`/`c2` hard-coded `-`). ✓ **fixed in Phase 1.** Re-reading the spec (IEEE Std 1003.1-2024, ipcs MODE column 100916–100940) corrected the finding: POSIX mandates **11** characters — a single leading flag char (`C` if a shared memory segment is marked for clearing/`SHM_DEST`, else `-`), then 9 permission chars, then 1 ACL char. There is **no** `S`/`R` msgsnd/msgrcv flag in POSIX.1-2024 (that is a historical SysV-ism), and there is no `/proc` data source for waiters anyway. The old code emitted **12** chars (two bogus `-` flags) — itself a divergence. `format_mode` now returns the 11-char form and sets the `C` flag from `SHM_DEST`; unit tests `mode_string_is_eleven_chars_and_decodes_perms` + `shm_dest_sets_c_flag`.
-- [ ] **#IS4 — `-t` time column zero-pads the hour; spec format is `%d:%2.2d:%2.2d`.** `sys/ipcs.rs:165`. Uses `%H:%M:%S` (e.g. `09:30:00`); spec 100... mandates an unpadded hour (`9:30:00`). Fix: use `%-H:%M:%S` (or hand-format the hour).
-- [ ] **#IS5 — `/proc` read errors silently swallowed; "facility not in system" never emitted on Linux for shm/sem.** `sys/ipcs.rs:500, 579, 653` (`.unwrap_or_default()`). If a facility is compiled out (file missing) or unreadable (EACCES), the code emits a header with no rows and exits 0, instead of `"%s facility not in system.\n"` (spec 100887) or a stderr diagnostic + non-zero exit. Fix: branch on the `Err` from `read_proc_*`; emit the not-in-system line for missing facilities and a diagnostic for hard errors.
+- [x] **#IS4 — `-t` time column zero-pads the hour; spec format is `%d:%2.2d:%2.2d`.** `sys/ipcs.rs:165`. Uses `%H:%M:%S` (e.g. `09:30:00`); spec 100977–100985 mandates an unpadded hour (`9:30:00`). Fix: use `%-H:%M:%S`. ✓ **fixed in Phase 2**; unit test `time_no_entry_and_format`.
+- [x] **#IS5 — `/proc` read errors silently swallowed; "facility not in system" never emitted on Linux for shm/sem.** `sys/ipcs.rs:500, 579, 653` (`.unwrap_or_default()`). If a facility is compiled out (file missing) or unreadable (EACCES), the code emits a header with no rows and exits 0, instead of `"%s facility not in system.\n"` (spec 100886–100889) or a stderr diagnostic + non-zero exit. Fix: branch on the `Err` from `read_proc_*`; emit the not-in-system line for missing facilities and a diagnostic for hard errors. ✓ **fixed in Phase 2** — `display_*` now return `io::Result<()>`; `NotFound` (and an empty facility, per the spec's "not used since the last reboot") emits the singular `"<facility> facility not in system."`; any other error propagates to `main` (diagnostic + non-zero exit). Behaviorally verified on a clean host (all three report "not in system").
 
 #### Minor
 
-- [ ] **#IS6 — `get_current_date` fallback uses `%z` instead of `%Z`.** `sys/ipcs.rs:185, 200`. The primary `strftime` path correctly uses `%a %b %e %H:%M:%S %Z %Y`; only the chrono fallback (used when `localtime_r`/`strftime` fail) emits numeric `%z`. Fix: change the fallback format to `%Z`.
-- [ ] **#IS7 — macOS slot iteration capped at 256.** `sys/ipcs.rs` (`MAX_IPC_SLOTS_TO_CHECK = 256`). IDs beyond slot 256 are missed on busy systems. Fix: drive the bound from `kern.sysv.shmmni`/`semmni`.
+- [x] **#IS6 — `get_current_date` fallback uses `%z` instead of `%Z`.** `sys/ipcs.rs:185, 200`. The primary `strftime` path correctly uses `%a %b %e %H:%M:%S %Z %Y`; only the chrono fallback (used when `localtime_r`/`strftime` fail) emits numeric `%z`. Fix: change the fallback format to `%Z`. ✓ **fixed in Phase 2** (both fallback format strings).
+- [x] **#IS7 — macOS slot iteration capped at 256.** `sys/ipcs.rs` (`MAX_IPC_SLOTS_TO_CHECK = 256`). IDs beyond slot 256 are missed on busy systems. Fix: drive the bound from `kern.sysv.shmmni`/`semmni`. ✓ **fixed in Phase 2** (macOS, code-only — compiled, not run on this Linux host): the slot dimension is now bounded by `MACOS_MAX_SLOTS` (2048), separate from the per-slot sequence probe `MACOS_SEQ_PROBE`; `read_macos_sem` no longer caps slots at the sequence budget. Documented as a best-effort heuristic (macOS lacks an IPC-enumeration API).
 - [ ] **#IS8 — No `.mo` catalogs (crate-wide).** See cross-cutting.
 
 ### Detailed conformance matrix
@@ -217,27 +217,27 @@ with exit 0 instead of a diagnostic.
 #### Environment variables
 - [x] `LANG`/`LC_ALL`/`LC_CTYPE`/`LC_MESSAGES`/`NLSPATH` via `setlocale` — `ipcs.rs:735-737`. CONFORMS.
 - [x] `TZ` honored incidentally (`localtime_r` via chrono/`strftime`) — `ipcs.rs:164,189`. CONFORMS.
-- [ ] **`LC_TIME` not honored for the `-t` hour format** (#IS4).
+- [x] **`-t` hour format** (#IS4 ✓ Phase 2 — unpadded hour per `%d:%2.2d:%2.2d`). `LC_TIME`-localized digits remain a deferred crate-wide i18n item.
 
 #### STDOUT / STDERR
 - [x] Title line `IPC status from <source> as of <date>` — `ipcs.rs:719`. CONFORMS.
 - [x] Facility order msg→shm→sem; `T`/`KEY`/OWNER/GROUP columns — `ipcs.rs:721-731`, truncation `ipcs.rs:98`. CONFORMS.
-- [x] **MODE octal-parse bug** (#IS1 ✓ Phase 1); **MODE flags / 11-char form** (#IS3 ✓ Phase 1). **QBYTES `-`** (#IS2); **shm/sem "not in system" missing** (#IS5).
-- [ ] **Errors swallowed instead of stderr** (#IS5).
+- [x] **MODE octal-parse bug** (#IS1 ✓ Phase 1); **MODE flags / 11-char form** (#IS3 ✓ Phase 1); **QBYTES** (#IS2 ✓ Phase 2); **shm/sem "not in system"** (#IS5 ✓ Phase 2).
+- [x] **Errors propagated (not swallowed)** (#IS5 ✓ Phase 2).
 
 #### Exit status / consequences of errors
-- [x] 0 success / `?`-propagated error path exists — but I/O errors are swallowed so real failures still exit 0 (#IS5). PARTIAL.
+- [x] 0 success / non-zero on hard `/proc` errors (#IS5 ✓ Phase 2 — `display_*` propagate `io::Result` to `main`; `NotFound`/empty → "not in system" at exit 0).
 
 #### Cross-cutting
-- [x] Portability: Linux `/proc/sysvipc`; macOS `shmctl`/`semctl(IPC_STAT)` slot scan; msg queues "not in system" on macOS. CONFORMS (except #IS7 cap).
+- [x] Portability: Linux `/proc/sysvipc`; macOS `shmctl`/`semctl(IPC_STAT)` slot scan (#IS7 cap raised, Phase 2); msg queues "not in system" on macOS. CONFORMS.
 
 ### Test coverage signal
 
 Tests are structural smoke tests. Not covered:
 - [x] MODE string correctness (#IS1, #IS3) — unit tests + behavioral cross-check (Phase 1).
-- [ ] QBYTES value (#IS2).
-- [ ] `-t` hour format (#IS4).
-- [ ] facility-not-in-system path (#IS5).
+- [x] QBYTES value (#IS2) — gated real-IPC test + behavioral check (Phase 2).
+- [x] `-t` hour format (#IS4) — unit test `time_no_entry_and_format` (Phase 2).
+- [x] facility-not-in-system path (#IS5) — behavioral check on a clean host (Phase 2).
 
 ---
 

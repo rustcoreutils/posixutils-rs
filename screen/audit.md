@@ -270,9 +270,9 @@ runs, and there is no init→fallback for a missing reset string.
 
 #### Minor
 
-- [ ] **#T1 — `init`/`reset` emit the init/reset *file* capability literally instead of catting its contents.** `tput.rs:42-45` (`InitFile`) and `:60-63` (`ResetFile`) expand and write the capability value, which for `if`/`rf` is a *pathname*; the spec intent is to send the file's *contents*. The code comments acknowledge this ("for now just output the capability"). Few terminfo entries use `if`/`rf`, so impact is low. Fix: read the named file and write its bytes. Also `iprog` (init program) is not executed.
-- [ ] **#T2 — `reset` does not fall back to init strings when reset strings are absent.** `tput.rs:53-69` (`tput_reset`) emits only `rs1/rs2/rf/rs3`. Historical `tput reset` falls back to `is1/is2/if/is3` when the reset variants are missing. POSIX leaves init-vs-reset "unspecified," so this CONFORMS; flagged for parity with historical behavior. No fix required.
-- [ ] **#T3 — An invalid operand aborts all earlier valid operands.** `tput.rs:132-137` pre-validates the whole operand list and returns exit 4 on the first invalid name *before* loading terminfo or running any operand. So `tput clear bogus` never clears. The design is deliberate (comment: invalid-operand exit 4 should outrank no-terminfo exit 3), and CONSEQUENCES OF ERRORS (117983) speaks to *unavailable* operations (which the loop does continue past, `tput.rs:165-170`), not *invalid* names. Borderline; flagged as a behavioral note. Fix (optional): run valid operands first, then report the invalid-operand status.
+- [x] **#T1 — `init`/`reset` emit the init/reset *file* capability literally instead of catting its contents.** ✓ fixed (Phase 5): `emit_cap_file` reads the `if`/`rf` filename (via `cap.as_ref()`) and writes its contents; `run_cap_prog` runs the `iprog` (`cap::InitProg`) program. `tput.rs:42-45` (`InitFile`) and `:60-63` (`ResetFile`) expand and write the capability value, which for `if`/`rf` is a *pathname*; the spec intent is to send the file's *contents*. The code comments acknowledge this ("for now just output the capability"). Few terminfo entries use `if`/`rf`, so impact is low. Fix: read the named file and write its bytes. Also `iprog` (init program) is not executed.
+- [x] **#T2 — `reset` does not fall back to init strings when reset strings are absent.** ✓ fixed (Phase 5, strict): `tput_reset` now tracks whether any `rs1/rs2/rf/rs3` was emitted and falls back to `tput_init` when none are present (historical parity). `tput.rs:53-69`.
+- [x] **#T3 — An invalid operand aborts all earlier valid operands.** ✓ fixed (Phase 5, strict): the early-abort pre-validation is replaced — when at least one operand is valid, terminfo loads and operands run in order, so `tput clear bogus` clears then exits 4; an all-invalid list still short-circuits to exit 4 (outranking no-terminfo exit 3) without needing a terminal. Regressions `test_tput_valid_then_invalid_operand`, `test_tput_multiple_valid_operands`. `tput.rs:132-137`.
 
 ### Detailed conformance matrix
 
@@ -281,8 +281,8 @@ runs, and there is no init→fallback for a missing reset string.
 - [x] `-T type` — `tput.rs:28-29, 151-157` (`Database::from_name`).
 - [x] `TERM` fallback — `tput.rs:141-150` (`Database::from_env`); unset/unknown → exit 3 with diagnostic.
 - [x] `clear` — `tput.rs:71-77` emits `ClearScreen` (`clear`).
-- [x] `init` — `tput.rs:35-51` emits `is1/is2/if/is3` (but see #T1).
-- [x] `reset` — `tput.rs:53-69` emits `rs1/rs2/rf/rs3` (but see #T1/#T2).
+- [x] `init` — `tput.rs:35-51` emits `is1/is2` + `if`-contents + `iprog` + `is3` (#T1 ✓).
+- [x] `reset` — `tput.rs:53-69` emits `rs1/rs2` + `rf`-contents + `rs3`, falling back to init when none present (#T1/#T2 ✓).
 - [x] Unsupported operation is **not** an error — `tput.rs:36-49,54-67,72-75` skip absent capabilities via `if let Some(...)`; `process_operand` returns `Ok` (POSIX 117940-117941). CONFORMS.
 
 #### STDIN / INPUT FILES / ENVIRONMENT
@@ -306,7 +306,7 @@ runs, and there is no init→fallback for a missing reset string.
 - [x] 4 invalid operand — `tput.rs:22, 104-106, 132-137` (confirmed by `test_tput_invalid_operand`).
 - [x] >4 (5) other error — `tput.rs:23, 89-101`.
 - [x] Continue past unavailable capability — `tput.rs:165-170` keeps the worst exit code and continues. CONFORMS to CONSEQUENCES OF ERRORS.
-- [ ] **Invalid operand aborts valid earlier operands** (#T3, Minor).
+- [x] **Valid operands run before an invalid-operand exit 4** (#T3 ✓).
 
 ##### Note: `tput.rs:23` defines `EXIT_OTHER_ERROR = 5`
 
@@ -319,9 +319,9 @@ runs, and there is no init→fallback for a missing reset string.
 manual testing (terminfo-dependent).
 
 Not covered:
-- [ ] `tput clear` emits the terminal's `clear` sequence (needs a known `-T`, e.g. `-T xterm`).
-- [ ] Multi-operand continue-past-unavailable behavior (#T3).
-- [ ] `init`/`reset` file-capability handling (#T1).
+- [x] `tput clear` emits the terminal's `clear` sequence — `test_tput_clear_xterm`.
+- [x] Multi-operand continue / valid-before-invalid behavior (#T3) — `test_tput_valid_then_invalid_operand`, `test_tput_multiple_valid_operands`.
+- [ ] `init`/`reset` file-capability (`if`/`rf`/`iprog`) handling (#T1) — exercised manually (few terminfo entries carry these caps; no portable fixture).
 
 ---
 

@@ -266,12 +266,12 @@ var) are absent. `TZ`/`LC_TIME` are ignored for all time output.
 
 #### Critical
 
-- [ ] **#P1 — `etime` mixes time bases (always wrong on Linux).** `sys/ps.rs:491-517` (`format_etime`) computes `now_epoch_secs - start_time`, but `pslinux.rs:28` documents `start_time` as "clock ticks since boot". The subtraction is meaningless; the in-code comment admits "proper implementation would need boot time". Fix: read boot time (`/proc/stat` `btime` or `/proc/uptime`), convert `start_time / CLK_TCK` to an epoch instant, then take the delta. (macOS `start_time` is `pbi_start_tvsec` = epoch seconds, so only the Linux path is broken — itself a back-end divergence, see #P9.)
+- [x] **#P1 — `etime` mixes time bases (always wrong on Linux).** `sys/ps.rs:491-517` (`format_etime`) computes `now_epoch_secs - start_time`, but `pslinux.rs:28` documents `start_time` as "clock ticks since boot". The subtraction is meaningless; the in-code comment admits "proper implementation would need boot time". Fix: read boot time (`/proc/stat` `btime` or `/proc/uptime`), convert `start_time / CLK_TCK` to an epoch instant, then take the delta. ✓ **fixed in Phase 3** — `pslinux.rs` reads `/proc/stat` `btime` once and normalizes `start_time` to epoch seconds; `format_etime(start_epoch, now_epoch)` is now pure (`now` injected from `main`) and `saturating_sub`s for skew. Behaviorally verified: `ps -p 1 -o etime` == `/usr/bin/ps` (`2-12:52:14`). Unit test `format_etime_elapsed`.
 - [ ] **#P2 — macOS PID buffer fixed at 1024 → silent process-list truncation.** `sys/psmacos.rs:40` (`let mut pids = vec![0; 1024];`). `proc_listallpids` with an undersized buffer returns a truncated list with no error. Fix: call `proc_listallpids(NULL, 0)` to get the count, then allocate.
 
 #### Major
 
-- [ ] **#P3 — CPU/elapsed time hardcodes 100 ticks/second.** `sys/ps.rs:474-488` (`format_time`: `ticks / 100`). POSIX requires `sysconf(_SC_CLK_TCK)`; Linux `CONFIG_HZ` may be 250/1000. Fix: divide by `sysconf(_SC_CLK_TCK)`.
+- [x] **#P3 — CPU/elapsed time hardcodes 100 ticks/second.** `sys/ps.rs:474-488` (`format_time`: `ticks / 100`). POSIX requires `sysconf(_SC_CLK_TCK)`; Linux `CONFIG_HZ` may be 250/1000. Fix: divide by `sysconf(_SC_CLK_TCK)`. ✓ **fixed in Phase 3** — the Linux backend divides `utime+stime` by `sysconf(_SC_CLK_TCK)` (read once); `format_time` now takes whole seconds. Behaviorally verified `TIME` == `/usr/bin/ps` (`00:00:38` for PID 1). Unit test `format_time_seconds`.
 - [ ] **#P4 — `-w` option and `COLUMNS` env var absent; output never width-limited.** `sys/ps.rs:92-144` (no `-w` field); `COLUMNS` never read. Spec 112496–112498 + the `-w` row require `COLUMNS`/`-w` to govern line width. Fix: add `-w` (repeatable), read `COLUMNS`, truncate at `max(LINE_MAX, COLUMNS)`.
 - [ ] **#P5 — `-n namelist` option absent.** `sys/ps.rs:92-144`. In the SYNOPSIS (XSI). Behavior is implementation-defined; a parsed no-op (or warning) would close the SYNOPSIS gap. Fix: add the flag.
 - [ ] **#P6 — `stime` column always `-` in `-f` listing.** `sys/ps.rs:573`. The `-f` full format mandates STIME; the field returns `"-"`. Fix: format `start_time` via `strftime`/chrono honoring `TZ` (Linux must first convert ticks→epoch, see #P1).
@@ -280,7 +280,7 @@ var) are absent. `TZ`/`LC_TIME` are ignored for all time output.
 
 #### Minor
 
-- [ ] **#P9 — `start_time` semantics diverge between back-ends.** `pslinux.rs:28` (ticks since boot) vs `psmacos.rs` (epoch seconds). The shared `format_etime` cannot be correct for both. Fix: normalize both back-ends to epoch seconds before handing to `ps.rs`.
+- [x] **#P9 — `start_time` semantics diverge between back-ends.** `pslinux.rs:28` (ticks since boot) vs `psmacos.rs` (epoch seconds). The shared `format_etime` cannot be correct for both. Fix: normalize both back-ends to epoch seconds before handing to `ps.rs`. ✓ **fixed in Phase 3** — the `ProcessInfo` contract is now documented as `start_time` = epoch seconds, `time` = whole CPU seconds; Linux converts (ticks→seconds, +btime) and macOS converts CPU ns→seconds (`start_time` already epoch). The shared formatters are unit-agnostic.
 - [ ] **#P10 — Defunct (zombie) processes not marked `<defunct>`.** No marking anywhere. Spec 112545–112546. Fix: append `<defunct>` to `args`/`comm` when state == `Z`.
 - [ ] **#P11 — Controlling-terminal detection via `isatty(STDIN)`; TTY match by substring.** `sys/ps.rs:521-537` (uses stdin, not the invoker's controlling terminal — breaks under redirected stdin) and `ps.rs:714-717` (`contains()` so `pts/0` spuriously matches `pts/00`). Fix: read own `tty_nr` from `/proc/self/stat` field 7; compare TTY names by equality.
 - [ ] **#P12 — `-f` args header is `CMD`; spec default header for `args` is `COMMAND`.** `sys/ps.rs:392`. Fix: use `COMMAND` for the `args` field header.
@@ -314,18 +314,18 @@ var) are absent. `TZ`/`LC_TIME` are ignored for all time output.
 #### STDOUT / STDERR
 - [x] Default columns PID TTY TIME CMD (default format unspecified by spec) — `ps.rs:326-349`. CONFORMS.
 - [x] `-o` all-null-header suppression correct (`any(non-empty)`) — `ps.rs:739`. CONFORMS (agent's "inverted logic" claim self-refuted; verified correct).
-- [ ] **`etime`/`stime`/CLK_TCK** (#P1/#P3/#P6).
+- [x] **`etime`/CLK_TCK** (#P1/#P3 ✓ Phase 3). `stime` column (#P6) — Phase 4.
 
 #### Exit status / consequences of errors
 - [x] 0 / 1 via `ExitCode` — `ps.rs:592,728`. CONFORMS.
 
 #### Cross-cutting / portability
-- [ ] **Back-end divergences:** `start_time` units (#P9), macOS `args` (#P8), macOS PID buffer (#P2), macOS `/dev` scan (#P13).
+- [ ] **Back-end divergences:** `start_time`/`time` units (#P9 ✓ Phase 3), macOS `args` (#P8), macOS PID buffer (#P2), macOS `/dev` scan (#P13).
 
 ### Test coverage signal
 
 Not covered:
-- [ ] `etime` numeric correctness (#P1) — `check_time_format` only asserts colons exist.
+- [x] `etime` numeric correctness (#P1) — unit test `format_etime_elapsed` + behavioral cross-check vs `/usr/bin/ps` (Phase 3).
 - [ ] `COLUMNS`/`-w` truncation (#P4).
 - [ ] `-n` (#P5), defunct marking (#P10), header suppression content (`ps_empty_header` only checks exit).
 

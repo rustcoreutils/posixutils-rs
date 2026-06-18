@@ -27,8 +27,8 @@ pub struct ProcessInfo {
     pub sid: pid_t,          // session ID
     pub nice: i32,           // nice value
     pub vsz: u64,            // virtual memory size in KB
-    pub time: u64,           // CPU time in clock ticks
-    pub start_time: u64,     // start time (seconds since epoch)
+    pub time: u64,           // cumulative CPU time in whole seconds
+    pub start_time: u64,     // start time in seconds since the Unix epoch
     pub state: char,         // process state
     pub priority: i32,       // priority
     pub flags: u32,          // process flags
@@ -99,10 +99,11 @@ fn get_process_info(pid: pid_t) -> Option<ProcessInfo> {
     let (vsz, time) = if task_res > 0 {
         let task_info = unsafe { task_info.assume_init() };
         let vsz_kb = task_info.pti_virtual_size / 1024;
-        // Total CPU time in nanoseconds, convert to clock ticks (assume 100 ticks/sec)
+        // Total CPU time is in nanoseconds; normalize to whole seconds to match
+        // the shared formatter's contract (audit #P9).
         let total_time = task_info.pti_total_user + task_info.pti_total_system;
-        let time_ticks = total_time / 10_000_000; // nanoseconds to centiseconds
-        (vsz_kb, time_ticks)
+        let time_secs = total_time / 1_000_000_000;
+        (vsz_kb, time_secs)
     } else {
         (0, 0)
     };

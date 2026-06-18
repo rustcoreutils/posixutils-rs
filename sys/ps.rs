@@ -470,37 +470,33 @@ fn get_long_fields() -> Vec<OutputField> {
     ]
 }
 
-/// Format time value (CPU time) as [dd-]hh:mm:ss
-fn format_time(ticks: u64) -> String {
-    // Convert ticks to seconds (assuming 100 ticks per second)
-    let total_secs = ticks / 100;
-    let hours = total_secs / 3600;
-    let mins = (total_secs % 3600) / 60;
-    let secs = total_secs % 60;
+/// Format a cumulative CPU time, given in **seconds**, as `[dd-]hh:mm:ss`.
+///
+/// Pure: the backends normalize their native units (Linux clock ticks, macOS
+/// nanoseconds) to whole seconds before this is called, so no `_SC_CLK_TCK`
+/// scaling happens here (audit #P3/#P9).
+fn format_time(secs: u64) -> String {
+    let hours = secs / 3600;
+    let mins = (secs % 3600) / 60;
+    let s = secs % 60;
 
     if hours >= 24 {
         let days = hours / 24;
         let hours = hours % 24;
-        format!("{}-{:02}:{:02}:{:02}", days, hours, mins, secs)
+        format!("{}-{:02}:{:02}:{:02}", days, hours, mins, s)
     } else {
-        format!("{:02}:{:02}:{:02}", hours, mins, secs)
+        format!("{:02}:{:02}:{:02}", hours, mins, s)
     }
 }
 
-/// Format elapsed time as [[dd-]hh:]mm:ss
-fn format_etime(start_time: u64) -> String {
-    // This is a simplified version - proper implementation would need boot time
-    // For now, just format as mm:ss
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    let elapsed = if start_time > 0 && now > start_time {
-        now - start_time
-    } else {
-        0
-    };
+/// Format elapsed (wall-clock) time as `[[dd-]hh:]mm:ss`.
+///
+/// Both `start_epoch` and `now_epoch` are seconds since the Unix epoch; the
+/// backends normalize `start_time` to epoch seconds (Linux adds the boot time
+/// to the ticks-since-boot value — audit #P1). Pure and clock-independent:
+/// `now` is injected by the caller. Clock skew (`now < start`) clamps to zero.
+fn format_etime(start_epoch: u64, now_epoch: u64) -> String {
+    let elapsed = now_epoch.saturating_sub(start_epoch);
 
     let days = elapsed / 86400;
     let hours = (elapsed % 86400) / 3600;
@@ -537,8 +533,14 @@ fn get_current_tty() -> Option<String> {
     }
 }
 
-/// Get field value for a process
-fn get_field_value(proc: &platform::ProcessInfo, field: &str, full_format: bool) -> String {
+/// Get field value for a process. `now` is the current time in epoch seconds,
+/// injected so the time-dependent fields stay deterministic and testable.
+fn get_field_value(
+    proc: &platform::ProcessInfo,
+    field: &str,
+    full_format: bool,
+    now: u64,
+) -> String {
     match field {
         "pid" => proc.pid.to_string(),
         "ppid" => proc.ppid.to_string(),
@@ -560,7 +562,7 @@ fn get_field_value(proc: &platform::ProcessInfo, field: &str, full_format: bool)
         "comm" => proc.comm.clone(),
         "args" => proc.args.clone(),
         "time" => format_time(proc.time),
-        "etime" => format_etime(proc.start_time),
+        "etime" => format_etime(proc.start_time, now),
         "nice" => proc.nice.to_string(),
         "pri" => proc.priority.to_string(),
         "vsz" => proc.vsz.to_string(),
@@ -738,6 +740,12 @@ fn main() -> ExitCode {
     // Check if we should print header (all headers non-empty)
     let print_header = output_fields.iter().any(|f| !f.header.is_empty());
 
+    // Current time (epoch seconds), captured once for deterministic etime.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
@@ -758,7 +766,7 @@ fn main() -> ExitCode {
             if i > 0 {
                 let _ = write!(out, " ");
             }
-            let value = get_field_value(&proc, field.name, args.full_format);
+            let value = get_field_value(&proc, field.name, args.full_format, now);
             // Right-align numeric fields, left-align text
             if matches!(
                 field.name,
@@ -773,4 +781,34 @@ fn main() -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // CPU time is given in seconds and rendered [dd-]hh:mm:ss (#P3).
+    #[test]
+    fn format_time_seconds() {
+        assert_eq!(format_time(0), "00:00:00");
+        assert_eq!(format_time(61), "00:01:01");
+        assert_eq!(format_time(3661), "01:01:01");
+        // 90061 s = 1 day + 1:01:01.
+        assert_eq!(format_time(90061), "1-01:01:01");
+    }
+
+    // etime is now_epoch - start_epoch (#P1); both are epoch seconds, so the
+    // result is correct rather than the old ticks-vs-epoch garbage. Skew clamps.
+    #[test]
+    fn format_etime_elapsed() {
+        let start = 1_000_000_000;
+        assert_eq!(format_etime(start, start + 61), "01:01");
+        assert_eq!(format_etime(start, start + 3661), "01:01:01");
+        assert_eq!(format_etime(start, start + 90061), "1-01:01:01");
+        // Clock skew: now < start -> 0, never an underflow panic.
+        assert_eq!(format_etime(start, start - 5), "00:00");
+        // Unknown start (boot epoch unavailable -> 0): huge "elapsed" is just
+        // formatted, but the common path (valid start) is correct above.
+        assert_eq!(format_etime(0, 0), "00:00");
+    }
 }

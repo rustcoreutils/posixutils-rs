@@ -409,10 +409,10 @@ extra operands beyond `file` are silently ignored rather than diagnosed.
 
 #### Minor
 
-- [ ] **#W4 — `LC_TIME` not honored for time rendering.** `sys/who.rs:69-76`. `dt.format("%b %e %H:%M")` is the hardcoded POSIX-locale shape (conforming for the POSIX locale, spec 122980) but month names won't localize. `TZ` *is* honored (chrono `Local` → libc). Fix: route through libc `strftime` honoring `LC_TIME`, or document as implementation-defined.
-- [ ] **#W5 — `--userproc` internal flag leaks into `--help`.** `sys/who.rs:58-59`. Non-POSIX; an implementation detail for the default `USER_PROCESS` case. Fix: make it a plain bool, not a clap arg.
-- [ ] **#W6 — Negative idle time possible on clock skew.** `sys/who.rs:111`. `idle_secs` is not clamped at 0. Fix: `idle_secs.max(0)`.
-- [ ] **#W7 — `-s`/`-T` clap group is fragile.** `sys/who.rs:49,55`. `-s` has `default_value_t=true` and is never actually read (the format path checks `args.terminals`); correct by accident. Fix: drop `short_format` from clap and derive it as `!args.terminals`.
+- [x] **#W4 — `LC_TIME` not honored for time rendering.** `sys/who.rs:69-76`. `dt.format("%b %e %H:%M")` was the hardcoded POSIX-locale shape; month names didn't localize. ✓ **fixed in Phase 9** — `fmt_timestamp` now calls `plib::locale::strftime("%b %e %H:%M", …)`, which formats via libc `localtime_r`+`strftime` so both `LC_TIME` (month/day names) and `TZ` take effect.
+- [x] **#W5 — `--userproc` internal flag leaks into `--help`.** `sys/who.rs:58-59`. Non-POSIX; an implementation detail for the default `USER_PROCESS` case. ✓ **fixed in Phase 9** — marked `#[arg(hide = true)]` so it no longer appears in `--help` (verified) while remaining functional for the internal default-selection logic.
+- [x] **#W6 — Negative idle time possible on clock skew.** `sys/who.rs:111`. `idle_secs` was not clamped at 0. ✓ **fixed in Phase 9** — `(now - atime).max(0)`.
+- [x] **#W7 — `-s`/`-T` clap group is fragile.** `sys/who.rs:49,55`. `-s` had `default_value_t=true` (always-on, unread) conflicting with `-T`'s group. ✓ **fixed in Phase 9** — removed `default_value_t`; `-s` is now a normal opt-in flag (short remains the default; the output dispatch keys off `terminals`). The `-s`/`-T` mutual exclusion is preserved (behaviorally verified: `who -s -T` exits 2).
 - [ ] **#W8 — No `.mo` catalogs (crate-wide).** See cross-cutting.
 
 ### Detailed conformance matrix
@@ -428,9 +428,9 @@ extra operands beyond `file` are silently ignored rather than diagnosed.
 | `-m` / `am i` | CONFORMS | `who.rs:230-242, 349-354`. |
 | `-p` / `-r` / `-t` | CONFORMS | `who.rs:250,249,251-252`. |
 | `-q` | CONFORMS | names + `# users=N` — `who.rs:326-341`. |
-| `-s` | PARTIAL | always-true default, unread (#W7) — `who.rs:49-50`. |
+| `-s` | CONFORMS | opt-in flag, mutually exclusive with `-T` (#W7 ✓ Phase 9). |
 | `-T` | CONFORMS | `+`/`-`/`?` via group-write bit `0o020` — `who.rs:180-216`. |
-| `-u` | PARTIAL | idle from `/dev/<line>` atime; `<pid>` column added; no negative clamp (#W6) — `who.rs:99-124,147-177`. |
+| `-u` | CONFORMS | idle from `/dev/<line>` atime; `<pid>` column; idle clamped at 0 (#W6 ✓ Phase 9). |
 
 #### Operands / STDIN / input files (utmpx)
 - [x] `am i`/`am I` → `-m`; `file` operand via `utmpxname` — `who.rs:349-354,317`. CONFORMS.
@@ -440,7 +440,7 @@ extra operands beyond `file` are silently ignored rather than diagnosed.
 #### Environment variables
 - [x] `LANG`/`LC_ALL`/`LC_CTYPE`/`LC_MESSAGES`/`NLSPATH` via `setlocale` — `who.rs:344-346`. CONFORMS.
 - [x] `TZ` honored (chrono `Local`). CONFORMS.
-- [ ] **`LC_TIME` month names not localized** (#W4).
+- [x] **`LC_TIME`/`TZ` honored** via `plib::locale::strftime` (#W4 ✓ Phase 9).
 
 #### STDOUT / STDERR / exit status
 - [x] Default/`-T`/`-q`/`-b`/`-H` formats — `who.rs:171,209,326-341,262,274-313`. CONFORMS.

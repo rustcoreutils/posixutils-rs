@@ -46,7 +46,11 @@ struct Args {
     #[arg(short, long, help = gettext("Print the current run-level of the init process"))]
     runlevel: bool,
 
-    #[arg(short, long = "short", default_value_t = true, group = "output", help = gettext("List only the name, line, and time fields (default)"))]
+    // Short format is the default; -s is accepted explicitly and is mutually
+    // exclusive with -T. No default_value_t (an always-true unread default
+    // conflicting with the group was fragile — #W7); the output dispatch keys
+    // off `terminals`.
+    #[arg(short, long = "short", group = "output", help = gettext("List only the name, line, and time fields (default)"))]
     short_format: bool,
 
     #[arg(short = 't', long = "time", help = gettext("Indicate the last change to the system clock"))]
@@ -55,7 +59,10 @@ struct Args {
     #[arg(short = 'T', long, group = "output", help = gettext("Show the state of each terminal"))]
     terminals: bool,
 
-    #[arg(long, help = gettext("Normal selection of information"))]
+    // Internal selection flag for USER_PROCESS entries (the default view). Not
+    // a POSIX option; hidden from --help so it doesn't pollute the public CLI
+    // surface (#W5).
+    #[arg(long, hide = true, help = gettext("Normal selection of information"))]
     userproc: bool,
 
     #[arg(short = 'u', long = "users", help = gettext("Write \"idle time\" for each displayed user"))]
@@ -65,14 +72,14 @@ struct Args {
     file: Option<PathBuf>,
 }
 
-// convert timestamp into POSIX-specified strftime format (local time)
+// Convert timestamp into the POSIX who time format. Uses libc strftime via
+// plib so LC_TIME (month names) and TZ are honored (#W4).
 fn fmt_timestamp(ts: libc::time_t) -> String {
-    use chrono::{Local, TimeZone};
-    let dt = Local
-        .timestamp_opt(ts, 0)
-        .single()
-        .unwrap_or_else(Local::now);
-    dt.format("%b %e %H:%M").to_string()
+    // No-op where time_t is i64 (Linux/macOS), a widening on 32-bit time_t
+    // targets; mirrors plib::locale::strftime's own handling.
+    #[allow(clippy::useless_conversion)]
+    let secs = i64::from(ts);
+    plib::locale::strftime("%b %e %H:%M", secs).unwrap_or_default()
 }
 
 // Get terminal state for -T option: + (write allowed), - (write denied), ? (unknown)
@@ -108,7 +115,8 @@ fn get_idle_time(line: &str) -> String {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs() as i64;
-            let idle_secs = now - atime;
+            // Clamp negative values (clock skew / atime in the future) to 0.
+            let idle_secs = (now - atime).max(0);
             if idle_secs < 60 {
                 "   .".to_string() // Active in last minute
             } else if idle_secs > 24 * 60 * 60 {

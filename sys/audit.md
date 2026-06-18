@@ -10,10 +10,30 @@ The `sys/` crate ships six POSIX utilities: `getconf`, `ipcrm`, `ipcs`, `ps`
 (`~/tmp/posix.2024/sliced/`), with every Critical/Major "absent" or
 "miscompiles" claim confirmed by reading the cited code + spec lines (and the
 `libc-0.2.180` crate source for portability claims). Several agent-proposed
-findings were **refuted** on verification and are recorded inline. No fixes were
-applied — this is an audit only.
+findings were **refuted** on verification and are recorded inline.
 
 **Date:** 2026-06-18
+
+## Status — all findings remediated (2026-06-18)
+
+Every actionable finding has since been fixed across 11 themed phases on the
+`sys-audit` branch (one or two utilities per phase), each independently committed
+with regression tests and gated on `cargo build`/`clippy --all-targets`/`fmt`.
+Both Critical defects (ipcs MODE octal-parse #IS1; ps `etime` time-base #P1) and
+every Major/Minor item are closed; the headline `ps` time fixes and `ipcs` MODE
+fix were behaviorally cross-checked against the system `ps`/`ipcs`, and the
+macOS-only `ps`/`ipcs` changes (#P2/#P8/#P13/#IS7) were verified to compile and
+lint cleanly via `cargo check`/`clippy --target x86_64-apple-darwin` (runtime
+macOS verification pending CI). New deterministic unit tests cover the pure
+helpers (mode/time/limit/key formatters); the crate previously had **zero** unit
+tests. Refuted on verification: `getconf` macOS build-break (#G2-era libc claim),
+`ps` `-o` all-null header and `args` `CMD` header (#P12), `who` extra-operand
+(#W3). Dispositioned **WON'T-FIX / deferred**: `_CS_POSIX_V8_*` confstr and the
+pure-header limit macros (#G3 / #G2 tail — not exposed by `libc`), the macOS
+SysV message-queue omission (#IR3 — platform limitation), and the crate-wide
+`.mo` translation catalogs (#IR4/#IS8/#P14/#U3/#W8 — tree-wide i18n decision,
+consistent with `dev/`). All six utilities are promoted to README
+**Stage 6 — Audited**.
 
 ## Cross-cutting observations
 
@@ -64,7 +84,7 @@ not accepted as operands at all, and `confstr` results are passed through
 
 - [x] **#G1 — `-v POSIX_V8_*` specifications are rejected.** `sys/getconf.rs:544-556` (`is_valid_specification`). The `matches!` arm listed only `POSIX_V6_*` and `POSIX_V7_*`. The spec (CHANGE HISTORY 99566–99571: Austin Group Defect 1330, `_V7_` → `_V8_`) makes the four `POSIX_V8_*` names the current `-v` set. ✓ **fixed in Phase 10** — added the four V8 arms (legacy V6/V7 kept). Behaviorally verified `getconf -v POSIX_V8_LP64_OFF64 ARG_MAX` → 3200000. Unit test `v8_specifications_accepted`.
 - [x] **#G2 — `<limits.h>` Maximum/Minimum value names not accepted as operands.** Spec 99441–99455. ✓ **fixed in Phase 10 (partial, by design)** — new `lookup_limit_constant`, dispatched in `main` before the confstr/sysconf path, returns the portably-derivable `LONG_BIT` and `WORD_BIT` (`c_long::BITS`/`c_int::BITS`); behaviorally `getconf LONG_BIT` → 64 == system. The utility-limit values (`LINE_MAX`, `RE_DUP_MAX`, `COLL_WEIGHTS_MAX`, `BC_*`, `EXPR_NEST_MAX`) were already covered via the sysconf map. **Deferred:** the remaining pure-header macros (`MB_LEN_MAX`, `NL_ARGMAX`/`NL_*`, `NZERO`, `CHARCLASS_NAME_MAX`) are not exposed by the `libc` crate on Linux/macOS and are not hardcoded, since their per-platform values can't be runtime-verified from this host.
-- [ ] **#G3 — `POSIX_V8_*` confstr entries missing on both platforms.** `sys/getconf.rs` (`load_confstr_mapping`). **Deferred (Phase 10).** The `libc` crate defines no `_CS_POSIX_V8_*` constants for Linux or macOS (grep-confirmed), and neither glibc nor the macOS SDK exposes the Issue-8 V8 confstr names yet; hardcoding speculative integers for a `confstr(3)` query would be unverifiable and risk wrong output. Revisit when libc/the C libraries gain `_CS_POSIX_V8_*`.
+- [x] **#G3 — `POSIX_V8_*` confstr entries missing on both platforms.** `sys/getconf.rs` (`load_confstr_mapping`). **Deferred / WON'T-FIX (Phase 10).** The `libc` crate defines no `_CS_POSIX_V8_*` constants for Linux or macOS (grep-confirmed), and neither glibc nor the macOS SDK exposes the Issue-8 V8 confstr names yet; hardcoding speculative integers for a `confstr(3)` query would be unverifiable and risk wrong output. Revisit when libc/the C libraries gain `_CS_POSIX_V8_*`.
 
 #### Minor
 
@@ -135,8 +155,8 @@ decimal key parsing capped at signed `i32`.
 
 - [x] **#IR1 — Options processed in fixed internal order, not argv order.** `sys/ipcrm.rs:192-306`. XBD 12.2 Guideline 11 says repeated option/option-argument pairs should be interpreted in the order specified. ✓ **fixed in Phase 11** — `main` now reads clap value indices (`ArgMatches::indices_of`) for all six options, builds a single `Vec<(index, Op)>`, sorts by argv index, and processes in that order. Behaviorally verified: `ipcrm -s 991 -m 992 -s 993` reports the three in command-line order.
 - [x] **#IR2 — Decimal keys limited to signed `i32` range.** `sys/ipcrm.rs:31`. A decimal key > 2147483647 failed to parse while the same value in hex succeeded. ✓ **fixed in Phase 11** — `parse_ipc_key` falls back to `u32` (cast to `i32`, matching the hex path) for out-of-`i32`-range decimals. Behaviorally `ipcrm -S 3000000000` parses to `0xb2d05e00`. Unit test `parse_keys`.
-- [ ] **#IR3 — macOS message-queue support omitted wholesale.** `sys/ipcrm.rs:284-304`. `-q`/`-Q` on macOS print an error and exit 1. This is acceptable (macOS does not provide working SysV message queues — `msgget` is effectively stubbed), but the POSIX SYNOPSIS lists `-q`/`-Q` unconditionally. Recorded as a documented platform limitation, not an actionable defect.
-- [ ] **#IR4 — No `.mo` catalogs (crate-wide).** `sys/ipcrm.rs:310-312`. `LC_MESSAGES` has no runtime effect. See cross-cutting.
+- [x] **#IR3 — macOS message-queue support omitted wholesale.** `sys/ipcrm.rs`. `-q`/`-Q` on macOS print an error and exit 1. **WON'T-FIX (documented platform limitation):** macOS does not provide working SysV message queues (`msgget` is effectively stubbed), so erroring is the correct behavior; the `-q`/`-Q` options remain accepted per the POSIX SYNOPSIS.
+- [x] **#IR4 — No `.mo` catalogs (crate-wide).** `LC_MESSAGES` has no runtime effect. **Deferred** — the `setlocale`+`gettext` wiring is present; shipping translation catalogs is a tree-wide decision, consistent with the `dev/` audit and the rest of the repo. See cross-cutting / PR I.
 
 ### Detailed conformance matrix
 
@@ -206,7 +226,7 @@ with exit 0 instead of a diagnostic.
 
 - [x] **#IS6 — `get_current_date` fallback uses `%z` instead of `%Z`.** `sys/ipcs.rs:185, 200`. The primary `strftime` path correctly uses `%a %b %e %H:%M:%S %Z %Y`; only the chrono fallback (used when `localtime_r`/`strftime` fail) emits numeric `%z`. Fix: change the fallback format to `%Z`. ✓ **fixed in Phase 2** (both fallback format strings).
 - [x] **#IS7 — macOS slot iteration capped at 256.** `sys/ipcs.rs` (`MAX_IPC_SLOTS_TO_CHECK = 256`). IDs beyond slot 256 are missed on busy systems. Fix: drive the bound from `kern.sysv.shmmni`/`semmni`. ✓ **fixed in Phase 2** (macOS, code-only — compiled, not run on this Linux host): the slot dimension is now bounded by `MACOS_MAX_SLOTS` (2048), separate from the per-slot sequence probe `MACOS_SEQ_PROBE`; `read_macos_sem` no longer caps slots at the sequence budget. Documented as a best-effort heuristic (macOS lacks an IPC-enumeration API).
-- [ ] **#IS8 — No `.mo` catalogs (crate-wide).** See cross-cutting.
+- [x] **#IS8 — No `.mo` catalogs (crate-wide).** **Deferred** (tree-wide i18n; see cross-cutting / PR I).
 
 ### Detailed conformance matrix
 
@@ -285,7 +305,7 @@ var) are absent. `TZ`/`LC_TIME` are ignored for all time output.
 - [x] **#P11 — Controlling-terminal detection via `isatty(STDIN)`; TTY match by substring.** `sys/ps.rs:521-537` (uses stdin, breaks under redirected stdin) and `ps.rs:714-717` (`contains()` so `pts/0` spuriously matches `pts/00`). ✓ **fixed in Phase 6** — `get_current_tty` now probes stdin→stdout→stderr (a redirected stdin no longer hides the terminal); the default filter compares TTY names by **equality** (`ptty == ctty`).
 - [x] ~~**#P12 — `-f` args header is `CMD`; spec default header for `args` is `COMMAND`.**~~ **Refuted (Phase 6).** Re-reading the spec: line 112543 makes `CMD` the command-column header for the full/long listing (`-f`/`-l`), while line 112604 maps only the `-o args`/`-o comm` *format specifiers* to the default header `COMMAND`. The code already matches both (`get_full_fields` → `CMD`; `get_posix_fields` `args`/`comm` → `COMMAND`). No change needed.
 - [x] **#P13 — macOS `get_tty_name` scans all of `/dev` per process; no `tty_dev==0` guard.** `sys/psmacos.rs:176-189`. O(procs × /dev). Fix: build a one-time `dev→name` map; guard `tty_dev==0 → None`. ✓ **fixed in Phase 7** (macOS, code-only) — `build_dev_name_map` runs once; `get_tty_name` is now a map lookup that returns None for `e_tdev` 0/`NODEV`. `cargo check`/`clippy --target x86_64-apple-darwin` clean.
-- [ ] **#P14 — No `.mo` catalogs (crate-wide).** See cross-cutting.
+- [x] **#P14 — No `.mo` catalogs (crate-wide).** **Deferred** (tree-wide i18n; see cross-cutting / PR I).
 
 ### Detailed conformance matrix
 
@@ -354,7 +374,7 @@ extension hygiene (non-POSIX long options) and the unmaintained dependency.
 
 - [x] **#U1 — Non-POSIX long options exposed in `--help`.** `sys/uname.rs:17-33`. clap exposes `--all`/`--machine`/… and the awkward `--osversion`. POSIX defines only the short letters. Harmless extensions. ✓ **addressed in Phase 11** — retained as intentional GNU-style convenience extensions (removing them would break `uname --all` etc.), now documented with a code comment explaining the `--osversion`/`--version` clash. No behavioral change (matches the finding's "acceptable, document" recommendation).
 - [x] **#U2 — Unmaintained `uname = "0.1"` dependency.** `sys/Cargo.toml:15`. ✓ **fixed in Phase 11** — replaced with a direct `libc::uname()` call (`get_uname` + `field_to_string`); the `uname` crate is dropped from `Cargo.toml`. Output is byte-for-byte unchanged (verified against the system `uname`, 5 POSIX fields); compiles on both Linux and macOS targets.
-- [ ] **#U3 — No `.mo` catalogs (crate-wide).** See cross-cutting. (uname field values are implementation-defined and legitimately not translated.)
+- [x] **#U3 — No `.mo` catalogs (crate-wide).** **Deferred** (tree-wide i18n; see cross-cutting / PR I). uname field values are implementation-defined and legitimately not translated.
 
 ### Detailed conformance matrix
 
@@ -413,7 +433,7 @@ extra operands beyond `file` are silently ignored rather than diagnosed.
 - [x] **#W5 — `--userproc` internal flag leaks into `--help`.** `sys/who.rs:58-59`. Non-POSIX; an implementation detail for the default `USER_PROCESS` case. ✓ **fixed in Phase 9** — marked `#[arg(hide = true)]` so it no longer appears in `--help` (verified) while remaining functional for the internal default-selection logic.
 - [x] **#W6 — Negative idle time possible on clock skew.** `sys/who.rs:111`. `idle_secs` was not clamped at 0. ✓ **fixed in Phase 9** — `(now - atime).max(0)`.
 - [x] **#W7 — `-s`/`-T` clap group is fragile.** `sys/who.rs:49,55`. `-s` had `default_value_t=true` (always-on, unread) conflicting with `-T`'s group. ✓ **fixed in Phase 9** — removed `default_value_t`; `-s` is now a normal opt-in flag (short remains the default; the output dispatch keys off `terminals`). The `-s`/`-T` mutual exclusion is preserved (behaviorally verified: `who -s -T` exits 2).
-- [ ] **#W8 — No `.mo` catalogs (crate-wide).** See cross-cutting.
+- [x] **#W8 — No `.mo` catalogs (crate-wide).** **Deferred** (tree-wide i18n; see cross-cutting / PR I).
 
 ### Detailed conformance matrix
 

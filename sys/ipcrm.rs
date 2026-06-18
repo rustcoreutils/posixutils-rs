@@ -11,7 +11,7 @@ use std::ffi::{c_int, c_ushort};
 use std::io::{self, Error, ErrorKind};
 use std::ptr;
 
-use clap::Parser;
+use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 #[cfg(not(target_os = "macos"))]
 use libc::{msgctl, msgget, msqid_ds};
@@ -28,7 +28,11 @@ fn parse_ipc_key(s: &str) -> Result<i32, String> {
             .map(|v| v as i32)
             .map_err(|e| format!("invalid hex key: {}", e))
     } else {
-        s.parse::<i32>().map_err(|e| format!("invalid key: {}", e))
+        // Accept the full 32-bit key_t range: signed decimals directly, and
+        // unsigned decimals above i32::MAX cast to i32 like the hex path (#IR2).
+        s.parse::<i32>()
+            .or_else(|_| s.parse::<u32>().map(|v| v as i32))
+            .map_err(|e| format!("invalid key: {}", e))
     }
 }
 
@@ -186,124 +190,139 @@ fn sem_rm(semid: i32) -> io::Result<()> {
     }
 }
 
-fn remove_ipcs(args: &Args) -> i32 {
-    let mut exit_code = 0;
+/// A single removal request, in the order it appeared on the command line.
+enum Op {
+    SemKey(i32),
+    SemId(i32),
+    ShmKey(i32),
+    ShmId(i32),
+    MsgKey(i32),
+    MsgId(i32),
+}
 
-    // Remove semaphores by key
-    for semkey in &args.semkey {
-        match sem_key_lookup(*semkey) {
-            Ok(semid) => {
-                if let Err(e) = sem_rm(semid) {
-                    eprintln!("ipcrm: {}: {}", gettext("semaphore key"), e);
-                    exit_code = 1;
-                }
-            }
-            Err(e) => {
-                eprintln!(
-                    "ipcrm: {}: 0x{:x}: {}",
-                    gettext("semaphore key"),
-                    *semkey,
-                    e
-                );
-                exit_code = 1;
-            }
+// Each remover prints its own diagnostic and returns true on failure.
+
+fn rm_sem_key(semkey: i32) -> bool {
+    match sem_key_lookup(semkey) {
+        Ok(semid) => sem_rm(semid)
+            .map_err(|e| eprintln!("ipcrm: {}: {}", gettext("semaphore key"), e))
+            .is_err(),
+        Err(e) => {
+            eprintln!("ipcrm: {}: 0x{:x}: {}", gettext("semaphore key"), semkey, e);
+            true
         }
     }
+}
 
-    // Remove semaphores by ID
-    for semid in &args.semid {
-        if let Err(e) = sem_rm(*semid) {
-            eprintln!("ipcrm: {}: {}: {}", gettext("semaphore id"), semid, e);
-            exit_code = 1;
+fn rm_sem_id(semid: i32) -> bool {
+    sem_rm(semid)
+        .map_err(|e| eprintln!("ipcrm: {}: {}: {}", gettext("semaphore id"), semid, e))
+        .is_err()
+}
+
+fn rm_shm_key(shmkey: i32) -> bool {
+    match shm_key_lookup(shmkey) {
+        Ok(shmid) => shm_rm(shmid)
+            .map_err(|e| eprintln!("ipcrm: {}: {}", gettext("shared memory key"), e))
+            .is_err(),
+        Err(e) => {
+            eprintln!(
+                "ipcrm: {}: 0x{:x}: {}",
+                gettext("shared memory key"),
+                shmkey,
+                e
+            );
+            true
         }
     }
+}
 
-    // Remove shared memory segments by key
-    for shmkey in &args.shmkey {
-        match shm_key_lookup(*shmkey) {
-            Ok(shmid) => {
-                if let Err(e) = shm_rm(shmid) {
-                    eprintln!("ipcrm: {}: {}", gettext("shared memory key"), e);
-                    exit_code = 1;
-                }
-            }
-            Err(e) => {
-                eprintln!(
-                    "ipcrm: {}: 0x{:x}: {}",
-                    gettext("shared memory key"),
-                    *shmkey,
-                    e
-                );
-                exit_code = 1;
-            }
-        }
-    }
+fn rm_shm_id(shmid: i32) -> bool {
+    shm_rm(shmid)
+        .map_err(|e| eprintln!("ipcrm: {}: {}: {}", gettext("shared memory id"), shmid, e))
+        .is_err()
+}
 
-    // Remove shared memory segments by ID
-    for shmid in &args.shmid {
-        if let Err(e) = shm_rm(*shmid) {
-            eprintln!("ipcrm: {}: {}: {}", gettext("shared memory id"), shmid, e);
-            exit_code = 1;
-        }
-    }
-
-    // Remove message queues (Linux only - macOS doesn't support SysV message queues)
-    #[cfg(not(target_os = "macos"))]
-    {
-        // Remove message queues by key
-        for msgkey in &args.msgkey {
-            match msg_key_lookup(*msgkey) {
-                Ok(msgid) => {
-                    if let Err(e) = msg_rm(msgid) {
-                        eprintln!("ipcrm: {}: {}", gettext("message queue key"), e);
-                        exit_code = 1;
-                    }
-                }
-                Err(e) => {
-                    eprintln!(
-                        "ipcrm: {}: 0x{:x}: {}",
-                        gettext("message queue key"),
-                        *msgkey,
-                        e
-                    );
-                    exit_code = 1;
-                }
-            }
-        }
-
-        // Remove message queues by ID
-        for msgid in &args.msgid {
-            if let Err(e) = msg_rm(*msgid) {
-                eprintln!("ipcrm: {}: {}: {}", gettext("message queue id"), msgid, e);
-                exit_code = 1;
-            }
-        }
-    }
-
-    // macOS doesn't support SysV message queues - report error if options used
-    #[cfg(target_os = "macos")]
-    {
-        for msgkey in &args.msgkey {
+#[cfg(not(target_os = "macos"))]
+fn rm_msg_key(msgkey: i32) -> bool {
+    match msg_key_lookup(msgkey) {
+        Ok(msgid) => msg_rm(msgid)
+            .map_err(|e| eprintln!("ipcrm: {}: {}", gettext("message queue key"), e))
+            .is_err(),
+        Err(e) => {
             eprintln!(
                 "ipcrm: {}: 0x{:x}: {}",
                 gettext("message queue key"),
-                *msgkey,
-                gettext("message queues not supported on this system")
+                msgkey,
+                e
             );
-            exit_code = 1;
+            true
         }
-        for msgid in &args.msgid {
-            eprintln!(
-                "ipcrm: {}: {}: {}",
-                gettext("message queue id"),
-                msgid,
-                gettext("message queues not supported on this system")
-            );
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn rm_msg_id(msgid: i32) -> bool {
+    msg_rm(msgid)
+        .map_err(|e| eprintln!("ipcrm: {}: {}: {}", gettext("message queue id"), msgid, e))
+        .is_err()
+}
+
+// macOS does not support SysV message queues: report and fail.
+#[cfg(target_os = "macos")]
+fn rm_msg_key(msgkey: i32) -> bool {
+    eprintln!(
+        "ipcrm: {}: 0x{:x}: {}",
+        gettext("message queue key"),
+        msgkey,
+        gettext("message queues not supported on this system")
+    );
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn rm_msg_id(msgid: i32) -> bool {
+    eprintln!(
+        "ipcrm: {}: {}: {}",
+        gettext("message queue id"),
+        msgid,
+        gettext("message queues not supported on this system")
+    );
+    true
+}
+
+fn remove_ipcs(ops: &[Op]) -> i32 {
+    let mut exit_code = 0;
+    for op in ops {
+        let failed = match op {
+            Op::SemKey(k) => rm_sem_key(*k),
+            Op::SemId(id) => rm_sem_id(*id),
+            Op::ShmKey(k) => rm_shm_key(*k),
+            Op::ShmId(id) => rm_shm_id(*id),
+            Op::MsgKey(k) => rm_msg_key(*k),
+            Op::MsgId(id) => rm_msg_id(*id),
+        };
+        if failed {
             exit_code = 1;
         }
     }
-
     exit_code
+}
+
+/// Append each parsed value paired with its command-line value index, so the
+/// operations can later be sorted back into argv order (Guideline 11, #IR1).
+fn collect(
+    out: &mut Vec<(usize, Op)>,
+    m: &ArgMatches,
+    id: &str,
+    values: &[i32],
+    make: fn(i32) -> Op,
+) {
+    if let Some(indices) = m.indices_of(id) {
+        for (val, idx) in values.iter().zip(indices) {
+            out.push((idx, make(*val)));
+        }
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -311,9 +330,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     textdomain("posixutils-rs")?;
     bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
 
-    let args = Args::parse();
+    // Parse via clap (for --help/--version/validation) and keep the matches so
+    // we can recover the command-line order of the repeated options.
+    let matches = Args::command().get_matches();
+    let args = Args::from_arg_matches(&matches)?;
 
-    let exit_code = remove_ipcs(&args);
+    let mut ops: Vec<(usize, Op)> = Vec::new();
+    collect(&mut ops, &matches, "semkey", &args.semkey, Op::SemKey);
+    collect(&mut ops, &matches, "semid", &args.semid, Op::SemId);
+    collect(&mut ops, &matches, "shmkey", &args.shmkey, Op::ShmKey);
+    collect(&mut ops, &matches, "shmid", &args.shmid, Op::ShmId);
+    collect(&mut ops, &matches, "msgkey", &args.msgkey, Op::MsgKey);
+    collect(&mut ops, &matches, "msgid", &args.msgid, Op::MsgId);
+    ops.sort_by_key(|(idx, _)| *idx);
+    let ordered: Vec<Op> = ops.into_iter().map(|(_, op)| op).collect();
+
+    let exit_code = remove_ipcs(&ordered);
 
     std::process::exit(exit_code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_keys() {
+        assert_eq!(parse_ipc_key("0x10"), Ok(0x10));
+        assert_eq!(parse_ipc_key("16"), Ok(16));
+        assert_eq!(parse_ipc_key("-1"), Ok(-1));
+        // Decimal above i32::MAX is accepted and wraps like the hex path (#IR2).
+        assert_eq!(parse_ipc_key("3000000000"), Ok(0xb2d0_5e00u32 as i32));
+        assert_eq!(parse_ipc_key("0xB2D05E00"), Ok(0xb2d0_5e00u32 as i32));
+        assert!(parse_ipc_key("0xZZ").is_err());
+        assert!(parse_ipc_key("notanumber").is_err());
+    }
 }

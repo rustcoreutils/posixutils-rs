@@ -11,9 +11,10 @@ use chrono::{Local, TimeZone};
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use std::ffi::CStr;
+use std::io;
 
 #[cfg(target_os = "linux")]
-use std::io::{self, BufRead};
+use std::io::BufRead;
 
 #[derive(Parser)]
 #[command(
@@ -102,28 +103,37 @@ fn truncate_to_chars(s: &str, max_chars: usize) -> &str {
     }
 }
 
-/// Format permission mode as 12-character string per POSIX
-/// Format: [S-][RC-][rwa][rwa][rwa][ACL]
-/// - First char: S if process waiting on msgsnd, else -
-/// - Second char: R if process waiting on msgrcv, C if shm marked for removal, else -
-/// - Chars 3-5: owner permissions (r/w/a)
-/// - Chars 6-8: group permissions (r/w/a)
-/// - Chars 9-11: other permissions (r/w/a)
-/// - Char 12: space if no alternate access control, other printable char if ACL present
+/// SHM_DEST: shared memory segment marked to be destroyed when the last
+/// process detaches. Stored in the upper bits of the IPC mode field on both
+/// Linux (visible via /proc/sysvipc) and macOS (shm_perm.mode).
+const SHM_DEST: u16 = 0o1000;
+
+/// Format the access mode and flags as the 11-character string POSIX mandates
+/// (IEEE Std 1003.1-2024, ipcs STDOUT, MODE column):
+///   `[C-]` `rwa rwa rwa` `[ ]`
+/// - Char 1: `C` if this is a shared memory segment marked for clearing
+///   (SHM_DEST), otherwise `-`.
+/// - Chars 2-10: three sets of three bits (owner, group, others); within each
+///   set: read (`r`), write/alter (`a`), nothing (`-`).
+/// - Char 11: alternate/additional access-control indicator; a single <space>
+///   when none is associated with the facility.
 ///
-/// IPC permission bits map to file permission bits:
-/// - read (r): 0400/040/004
+/// IPC permission bits map to file permission bits (matching the rendering
+/// below): the first character of each triad is read, the second write, the
+/// third alter (IPC objects have no execute permission):
+/// - read (r):  0400/040/004
 /// - write (w): 0200/020/002
-/// - alter (a): 0100/010/001 (execute equivalent for IPC)
-fn format_mode(mode: u16, facility: char, _waiting_send: bool, _waiting_recv: bool) -> String {
-    // First two special characters
-    let c1 = '-'; // We don't have waiting info in current implementation
-    let c2 = match facility {
-        'm' => '-', // Could be 'C' for SHM_DEST (shm marked for removal)
-        _ => '-',
+/// - alter (a): 0100/010/001
+fn format_mode(mode: u16, facility: char) -> String {
+    // First character: C for a shared memory segment pending destruction.
+    let clear = if facility == 'm' && (mode & SHM_DEST) != 0 {
+        'C'
+    } else {
+        '-'
     };
 
-    // Permission bits: read (r), write (w), alter (a)
+    // Permission bits: read (r), write/alter (a). The first bit of each triad
+    // is read; the second is write/alter.
     let owner_r = if mode & 0o400 != 0 { 'r' } else { '-' };
     let owner_w = if mode & 0o200 != 0 { 'w' } else { '-' };
     let owner_a = if mode & 0o100 != 0 { 'a' } else { '-' };
@@ -136,33 +146,25 @@ fn format_mode(mode: u16, facility: char, _waiting_send: bool, _waiting_recv: bo
     let other_w = if mode & 0o002 != 0 { 'w' } else { '-' };
     let other_a = if mode & 0o001 != 0 { 'a' } else { '-' };
 
-    // 12th character: space means no alternate access control method
+    // 11th character: space means no alternate access control method.
     let acl = ' ';
 
     format!(
-        "{}{}{}{}{}{}{}{}{}{}{}{}",
-        c1,
-        c2,
-        owner_r,
-        owner_w,
-        owner_a,
-        group_r,
-        group_w,
-        group_a,
-        other_r,
-        other_w,
-        other_a,
-        acl
+        "{}{}{}{}{}{}{}{}{}{}{}",
+        clear, owner_r, owner_w, owner_a, group_r, group_w, group_a, other_r, other_w, other_a, acl
     )
 }
 
-/// Format time as HH:MM:SS or " no-entry" per POSIX
+/// Format a timestamp as the POSIX `%d:%2.2d:%2.2d` time-of-day (unpadded hour,
+/// zero-padded minute and second) or " no-entry" when no event has occurred.
 fn format_time(timestamp: i64) -> String {
     if timestamp == 0 {
         " no-entry".to_string()
     } else {
         match Local.timestamp_opt(timestamp, 0).single() {
-            Some(dt) => dt.format("%H:%M:%S").to_string(),
+            // `%-H` suppresses the leading zero on the hour, matching the
+            // spec's `%d` (e.g. "9:30:00", not "09:30:00").
+            Some(dt) => dt.format("%-H:%M:%S").to_string(),
             None => " no-entry".to_string(), // Invalid or ambiguous timestamp
         }
     }
@@ -182,7 +184,7 @@ fn get_current_date() -> String {
         if tm_ptr.is_null() {
             // Fallback to chrono if localtime_r fails
             chrono::Local::now()
-                .format("%a %b %e %H:%M:%S %z %Y")
+                .format("%a %b %e %H:%M:%S %Z %Y")
                 .to_string()
         } else {
             let tm = tm.assume_init();
@@ -209,6 +211,22 @@ fn get_current_date() -> String {
 // Linux-specific IPC enumeration via /proc/sysvipc
 // ============================================================================
 
+/// Fetch the maximum-bytes (`msg_qbytes`) limit of a message queue.
+///
+/// This value is not exposed in /proc/sysvipc/msg, so query it directly via
+/// `msgctl(IPC_STAT)`. Returns `None` if the call fails (e.g. the queue was
+/// removed between enumeration and the stat, or we lack read permission), in
+/// which case the column is rendered as "-".
+#[cfg(target_os = "linux")]
+fn get_msg_qbytes(msqid: i32) -> Option<u64> {
+    let mut buf: libc::msqid_ds = unsafe { std::mem::zeroed() };
+    if unsafe { libc::msgctl(msqid, libc::IPC_STAT, &mut buf) } == 0 {
+        Some(buf.msg_qbytes as u64)
+    } else {
+        None
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn read_proc_msg() -> io::Result<Vec<MsgQueueInfo>> {
     let mut entries = Vec::new();
@@ -222,10 +240,15 @@ fn read_proc_msg() -> io::Result<Vec<MsgQueueInfo>> {
         let line = line?;
         let fields: Vec<&str> = line.split_whitespace().collect();
         if fields.len() >= 14 {
+            let msqid: i32 = fields[1].parse().unwrap_or(0);
             entries.push(MsgQueueInfo {
                 key: fields[0].parse::<i32>().unwrap_or(0),
-                msqid: fields[1].parse().unwrap_or(0),
-                perms: fields[2].parse().unwrap_or(0),
+                msqid,
+                // The kernel prints the mode field in /proc/sysvipc in octal
+                // (see Documentation: it uses "%4o"), so parse base 8.
+                perms: u16::from_str_radix(fields[2], 8).unwrap_or(0),
+                // qbytes is not in /proc; fetch it via msgctl(IPC_STAT).
+                qbytes: get_msg_qbytes(msqid),
                 cbytes: fields[3].parse().unwrap_or(0),
                 qnum: fields[4].parse().unwrap_or(0),
                 lspid: fields[5].parse().unwrap_or(0),
@@ -259,7 +282,8 @@ fn read_proc_shm() -> io::Result<Vec<ShmInfo>> {
             entries.push(ShmInfo {
                 key: fields[0].parse::<i32>().unwrap_or(0),
                 shmid: fields[1].parse().unwrap_or(0),
-                perms: fields[2].parse().unwrap_or(0),
+                // Octal mode field (see read_proc_msg); includes SHM_DEST when set.
+                perms: u16::from_str_radix(fields[2], 8).unwrap_or(0),
                 size: fields[3].parse().unwrap_or(0),
                 cpid: fields[4].parse().unwrap_or(0),
                 lpid: fields[5].parse().unwrap_or(0),
@@ -293,7 +317,8 @@ fn read_proc_sem() -> io::Result<Vec<SemInfo>> {
             entries.push(SemInfo {
                 key: fields[0].parse::<i32>().unwrap_or(0),
                 semid: fields[1].parse().unwrap_or(0),
-                perms: fields[2].parse().unwrap_or(0),
+                // Octal mode field (see read_proc_msg).
+                perms: u16::from_str_radix(fields[2], 8).unwrap_or(0),
                 nsems: fields[3].parse().unwrap_or(0),
                 uid: fields[4].parse().unwrap_or(0),
                 gid: fields[5].parse().unwrap_or(0),
@@ -315,9 +340,17 @@ fn read_proc_sem() -> io::Result<Vec<SemInfo>> {
 #[cfg(target_os = "macos")]
 const MACOS_DEFAULT_SEMMNI: i32 = 87381;
 
-/// Maximum number of IPC slots to check (caps iteration for performance)
+/// macOS has no /proc and no IPC-enumeration API, so we probe identifiers by
+/// the (slot, sequence) encoding. These bound the probe: the *slot* count is
+/// the number of identifier slots a live object can occupy (`shmmni`/`semmni`),
+/// and the *sequence* count is how many reuse generations we probe per slot.
+/// They are a best-effort ceiling — objects in very high slots/sequences on an
+/// extremely busy host may be missed.
 #[cfg(target_os = "macos")]
-const MAX_IPC_SLOTS_TO_CHECK: i32 = 256;
+const MACOS_MAX_SLOTS: i32 = 2048;
+
+#[cfg(target_os = "macos")]
+const MACOS_SEQ_PROBE: i32 = 256;
 
 /// Query a sysctl integer value by name
 #[cfg(target_os = "macos")]
@@ -352,8 +385,8 @@ fn get_sysctl_int(name: &str) -> Option<i32> {
 /// This is much faster than iterating through all possible IDs sequentially.
 #[cfg(target_os = "macos")]
 fn iter_macos_ipc_ids(max_slots: i32, seqs_per_slot: i32) -> impl Iterator<Item = i32> {
-    let max_slots = max_slots.min(1024); // Cap slots for safety
-    let seqs = seqs_per_slot.min(1024); // Cap sequences for safety
+    let max_slots = max_slots.min(MACOS_MAX_SLOTS); // Hard ceiling for safety
+    let seqs = seqs_per_slot.min(MACOS_SEQ_PROBE);
 
     (0..max_slots).flat_map(move |slot| {
         let base = slot * 65536;
@@ -370,8 +403,7 @@ fn read_macos_shm() -> Vec<ShmInfo> {
 
     // kern.sysv.shmmni is the max number of shared memory identifiers (typically 32)
     let max_slots = get_sysctl_int("kern.sysv.shmmni").unwrap_or(32);
-    // Each slot can have multiple sequences
-    let seqs_per_slot = MAX_IPC_SLOTS_TO_CHECK;
+    let seqs_per_slot = MACOS_SEQ_PROBE;
 
     for shmid in iter_macos_ipc_ids(max_slots, seqs_per_slot) {
         if unsafe { shmctl(shmid, IPC_STAT, &mut shmbuf) } == 0 {
@@ -403,13 +435,12 @@ fn read_macos_sem() -> Vec<SemInfo> {
     let mut entries = Vec::new();
     let mut sembuf: semid_ds = unsafe { std::mem::zeroed() };
 
-    // kern.sysv.semmni is the max number of semaphore identifiers
-    // On macOS this can be very high, so we cap the slots we check
-    let max_slots = get_sysctl_int("kern.sysv.semmni")
-        .unwrap_or(MACOS_DEFAULT_SEMMNI)
-        .min(MAX_IPC_SLOTS_TO_CHECK);
-    // Each slot can have multiple sequences
-    let seqs_per_slot = MAX_IPC_SLOTS_TO_CHECK;
+    // kern.sysv.semmni is the max number of semaphore identifiers. It can be
+    // very large, so the slot count is bounded by MACOS_MAX_SLOTS inside
+    // iter_macos_ipc_ids (no longer artificially capped at the sequence-probe
+    // budget, which previously dropped any identifier in slot >= 256).
+    let max_slots = get_sysctl_int("kern.sysv.semmni").unwrap_or(MACOS_DEFAULT_SEMMNI);
+    let seqs_per_slot = MACOS_SEQ_PROBE;
 
     for semid in iter_macos_ipc_ids(max_slots, seqs_per_slot) {
         if unsafe { semctl(semid, 0, IPC_STAT, &mut sembuf) } == 0 {
@@ -440,6 +471,7 @@ struct MsgQueueInfo {
     key: i32,
     msqid: i32,
     perms: u16,
+    qbytes: Option<u64>,
     cbytes: u64,
     qnum: u64,
     lspid: i32,
@@ -489,17 +521,31 @@ struct SemInfo {
 // Display functions
 // ============================================================================
 
-fn display_message_queues(_args: &Args) {
+fn display_message_queues(_args: &Args) -> io::Result<()> {
     println!();
 
     #[cfg(target_os = "linux")]
-    let args = _args;
-
-    #[cfg(target_os = "linux")]
     {
-        let entries = read_proc_msg().unwrap_or_default();
+        let args = _args;
+        let entries = match read_proc_msg() {
+            Ok(e) => e,
+            // Facility compiled out of the kernel: report "not in system".
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                println!("{}", gettext("Message Queue facility not in system."));
+                return Ok(());
+            }
+            // Any other error (e.g. permission denied) is a real failure.
+            Err(e) => return Err(e),
+        };
 
-        // Build header - always show header per POSIX, even when empty
+        // POSIX: a facility not installed or not used since the last reboot is
+        // reported as "not in system" rather than an empty table.
+        if entries.is_empty() {
+            println!("{}", gettext("Message Queue facility not in system."));
+            return Ok(());
+        }
+
+        // Column headings (facility has been used since the last reboot).
         let mut header = String::from("T     ID     KEY        MODE        OWNER    GROUP");
         if args.creator {
             header.push_str("  CREATOR   CGROUP");
@@ -520,7 +566,7 @@ fn display_message_queues(_args: &Args) {
         println!("{}:", gettext("Message Queues"));
 
         for entry in entries {
-            let mode_str = format_mode(entry.perms, 'q', false, false);
+            let mode_str = format_mode(entry.perms, 'q');
             let owner = get_username(entry.uid);
             let group = get_groupname(entry.gid);
 
@@ -546,8 +592,10 @@ fn display_message_queues(_args: &Args) {
                 line.push_str(&format!(" {:>8} {:>7}", entry.cbytes, entry.qnum));
             }
             if args.max_size {
-                // Note: qbytes is not in /proc, would need sysctl
-                line.push_str(&format!(" {:>8}", "-"));
+                match entry.qbytes {
+                    Some(q) => line.push_str(&format!(" {:>8}", q)),
+                    None => line.push_str(&format!(" {:>8}", "-")),
+                }
             }
             if args.pid {
                 line.push_str(&format!(" {:>8} {:>8}", entry.lspid, entry.lrpid));
@@ -568,20 +616,36 @@ fn display_message_queues(_args: &Args) {
     // macOS doesn't support SysV message queues
     #[cfg(target_os = "macos")]
     {
+        let _ = _args;
         println!("{}", gettext("Message Queue facility not in system."));
     }
+
+    Ok(())
 }
 
-fn display_shared_memory(args: &Args) {
+fn display_shared_memory(args: &Args) -> io::Result<()> {
     println!();
 
     #[cfg(target_os = "linux")]
-    let entries = read_proc_shm().unwrap_or_default();
+    let entries = match read_proc_shm() {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            println!("{}", gettext("Shared Memory facility not in system."));
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
 
     #[cfg(target_os = "macos")]
     let entries = read_macos_shm();
 
-    // Build header - always show header per POSIX, even when empty
+    // POSIX: not installed or unused since last reboot -> "not in system".
+    if entries.is_empty() {
+        println!("{}", gettext("Shared Memory facility not in system."));
+        return Ok(());
+    }
+
+    // Column headings (facility has been used since the last reboot).
     let mut header = String::from("T     ID     KEY        MODE        OWNER    GROUP");
     if args.creator {
         header.push_str("  CREATOR   CGROUP");
@@ -602,7 +666,7 @@ fn display_shared_memory(args: &Args) {
     println!("{}:", gettext("Shared Memory"));
 
     for entry in entries {
-        let mode_str = format_mode(entry.perms, 'm', false, false);
+        let mode_str = format_mode(entry.perms, 'm');
         let owner = get_username(entry.uid);
         let group = get_groupname(entry.gid);
 
@@ -644,18 +708,33 @@ fn display_shared_memory(args: &Args) {
 
         println!("{}", line);
     }
+
+    Ok(())
 }
 
-fn display_semaphores(args: &Args) {
+fn display_semaphores(args: &Args) -> io::Result<()> {
     println!();
 
     #[cfg(target_os = "linux")]
-    let entries = read_proc_sem().unwrap_or_default();
+    let entries = match read_proc_sem() {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            println!("{}", gettext("Semaphore facility not in system."));
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
 
     #[cfg(target_os = "macos")]
     let entries = read_macos_sem();
 
-    // Build header - always show header per POSIX, even when empty
+    // POSIX: not installed or unused since last reboot -> "not in system".
+    if entries.is_empty() {
+        println!("{}", gettext("Semaphore facility not in system."));
+        return Ok(());
+    }
+
+    // Column headings (facility has been used since the last reboot).
     let mut header = String::from("T     ID     KEY        MODE        OWNER    GROUP");
     if args.creator {
         header.push_str("  CREATOR   CGROUP");
@@ -670,7 +749,7 @@ fn display_semaphores(args: &Args) {
     println!("{}:", gettext("Semaphores"));
 
     for entry in entries {
-        let mode_str = format_mode(entry.perms, 's', false, false);
+        let mode_str = format_mode(entry.perms, 's');
         let owner = get_username(entry.uid);
         let group = get_groupname(entry.gid);
 
@@ -705,9 +784,11 @@ fn display_semaphores(args: &Args) {
 
         println!("{}", line);
     }
+
+    Ok(())
 }
 
-fn display_ipc_status(args: &Args) {
+fn display_ipc_status(args: &Args) -> io::Result<()> {
     // POSIX requires: "IPC status from %s as of %s\n", <source>, <date>
     #[cfg(target_os = "linux")]
     let source = "/proc/sysvipc";
@@ -719,16 +800,18 @@ fn display_ipc_status(args: &Args) {
     println!("IPC status from {} as of {}", source, get_current_date());
 
     if args.message_queues {
-        display_message_queues(args);
+        display_message_queues(args)?;
     }
 
     if args.shared_memory {
-        display_shared_memory(args);
+        display_shared_memory(args)?;
     }
 
     if args.semaphores {
-        display_semaphores(args);
+        display_semaphores(args)?;
     }
+
+    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -749,7 +832,65 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Display IPC status
-    display_ipc_status(&args);
+    display_ipc_status(&args)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The /proc/sysvipc mode field is printed in octal by the kernel; ipcs must
+    // parse it base 8, not base 10 (regression for audit item #IS1).
+    #[test]
+    fn proc_mode_field_is_octal() {
+        // "640" is octal 0o640 == 416, NOT decimal 640.
+        assert_eq!(u16::from_str_radix("640", 8).unwrap(), 0o640);
+        assert_ne!(u16::from_str_radix("640", 8).unwrap(), 640);
+        // With SHM_DEST set the kernel prints e.g. "1640".
+        assert_eq!(u16::from_str_radix("1640", 8).unwrap(), 0o1640);
+    }
+
+    // The MODE column is exactly 11 characters: [C-] + 9 perm chars + ACL space
+    // (audit item #IS3 + the 11-vs-12 char POSIX conformance correction).
+    #[test]
+    fn mode_string_is_eleven_chars_and_decodes_perms() {
+        // 0o640 = rw-r----- ; not a shm dest, so leading flag is '-'.
+        let s = format_mode(0o640, 'q');
+        assert_eq!(s.chars().count(), 11, "MODE must be 11 chars, got {s:?}");
+        assert_eq!(s, "-rw-r----- ");
+
+        // Full perms 0o777 -> rwarwarwa.
+        assert_eq!(format_mode(0o777, 's'), "-rwarwarwa ");
+        // No perms: leading flag '-', nine '-' perm chars, ACL space.
+        assert_eq!(format_mode(0o000, 'm'), "---------- ");
+    }
+
+    // The time columns use " no-entry" when no event has occurred (timestamp 0),
+    // and otherwise the unpadded-hour POSIX form `%d:%2.2d:%2.2d` (#IS4).
+    #[test]
+    fn time_no_entry_and_format() {
+        assert_eq!(format_time(0), " no-entry");
+        // A real timestamp renders as H:MM:SS with exactly two ':' separators
+        // and zero-padded minute/second; the hour carries no leading zero.
+        let s = format_time(1_000_000_000);
+        assert_eq!(s.matches(':').count(), 2, "expected H:MM:SS, got {s:?}");
+        let hour = s.split(':').next().unwrap();
+        assert!(
+            hour.len() == 1 || !hour.starts_with('0'),
+            "hour must be unpadded (no leading zero): {s:?}"
+        );
+    }
+
+    // The 'C' clear-on-detach flag is set only for shared memory with SHM_DEST.
+    #[test]
+    fn shm_dest_sets_c_flag() {
+        // SHM_DEST set on a shared memory segment -> leading 'C'.
+        assert_eq!(format_mode(0o1640, 'm'), "Crw-r----- ");
+        // SHM_DEST bit set but not a shared memory facility -> still '-'.
+        assert_eq!(format_mode(0o1640, 'q'), "-rw-r----- ");
+        // Shared memory without SHM_DEST -> '-'.
+        assert_eq!(format_mode(0o640, 'm'), "-rw-r----- ");
+    }
 }

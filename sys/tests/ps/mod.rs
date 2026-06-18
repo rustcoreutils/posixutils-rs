@@ -402,3 +402,16 @@ fn ps_output_ends_with_newline() {
         assert!(stdout.ends_with('\n'), "Output should end with newline");
     });
 }
+
+// -w (wide) and -ww (no limit) are accepted (#P4).
+#[test]
+fn ps_wide_options_accepted() {
+    run_ps_test(vec!["-A", "-w"], 0, check_exit_success);
+    run_ps_test(vec!["-A", "-w", "-w"], 0, check_exit_success);
+}
+
+// -n namelist is accepted for XSI conformance and ignored (#P5).
+#[test]
+fn ps_namelist_accepted() {
+    run_ps_test(vec!["-n", "/dev/null", "-A"], 0, check_exit_success);
+}

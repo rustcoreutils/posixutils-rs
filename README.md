@@ -76,8 +76,11 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] fuser
  - [x] gencat (i18n)
  - [x] get (SCCS)
+ - [x] getconf
  - [x] gettext (i18n)
  - [x] iconv (i18n)
+ - [x] ipcrm (IPC)
+ - [x] ipcs (IPC)
  - [x] kill
  - [x] lex (Development)
  - [x] link
@@ -102,6 +105,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] pathchk
  - [x] pax
  - [x] prs (SCCS)
+ - [x] ps
  - [x] readlink
  - [x] realpath
  - [x] renice
@@ -122,6 +126,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] touch
  - [x] tput
  - [x] true
+ - [x] uname
  - [x] unget (SCCS)
  - [x] unlink
  - [x] uucp (UUCP)
@@ -130,6 +135,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] val (SCCS)
  - [x] vi (Editors)
  - [x] what (SCCS)
+ - [x] who
  - [x] xargs
  - [x] xgettext (i18n)
  - [x] yacc (Development)
@@ -159,7 +165,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] echo
  - [x] expand
  - [x] fold
- - [x] getconf
  - [x] grep
  - [x] head
  - [x] join
@@ -170,7 +175,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] patch
  - [x] pr
  - [x] printf
- - [x] ps
  - [x] sed
  - [x] sort
  - [x] talk (with talkd local daemon)
@@ -179,23 +183,19 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] tr
  - [x] tsort
  - [x] tty
- - [x] uname
  - [x] uncompress (compress cat.)
  - [x] uudecode (uue)
  - [x] uuencode (uue)
  - [x] unexpand
  - [x] uniq
  - [x] wc
- - [x] who
  - [x] write
  - [x] id
- - [x] ipcs (IPC)
  - [x] zcat (compress cat.)
 
 ## Stage 2 - Feature-complete and POSIX compliant
 
  - [x] date
- - [x] ipcrm (IPC)
  - [x] logname
  - [x] mesg
  - [x] newgrp

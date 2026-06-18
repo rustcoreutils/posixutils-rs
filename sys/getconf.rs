@@ -133,11 +133,9 @@ fn handle_confstr(
         eprintln!("getconf: {}: {}", var, e);
         std::process::exit(1);
     } else {
-        // Trim the null terminator and any trailing whitespace
-        let s = std::str::from_utf8(&buf)
-            .unwrap()
-            .trim_end_matches('\0')
-            .trim_end();
+        // Strip only the NUL terminator; the value is printed verbatim per the
+        // spec "%s\n" format (do not trim significant trailing whitespace, #G4).
+        let s = std::str::from_utf8(&buf).unwrap().trim_end_matches('\0');
         println!("{}", s);
     }
 
@@ -540,11 +538,18 @@ fn is_confstr_var(var: &str, mapping: &HashMap<&'static str, libc::c_int>) -> bo
 }
 
 /// Check if a specification name is a valid POSIX compilation environment.
-/// We accept POSIX_V6_* and POSIX_V7_* specifications as no-op (using default environment).
+/// We accept the POSIX_V6_*, POSIX_V7_*, and POSIX_V8_* specifications as a
+/// no-op (using the default environment). POSIX.1-2024 (Issue 8, Austin Group
+/// Defect 1330) renamed `_V7_` to `_V8_`, so the V8 names are the current set
+/// (#G1); the older names are kept for backward compatibility.
 fn is_valid_specification(spec: &str) -> bool {
     matches!(
         spec,
-        "POSIX_V7_ILP32_OFF32"
+        "POSIX_V8_ILP32_OFF32"
+            | "POSIX_V8_ILP32_OFFBIG"
+            | "POSIX_V8_LP64_OFF64"
+            | "POSIX_V8_LPBIG_OFFBIG"
+            | "POSIX_V7_ILP32_OFF32"
             | "POSIX_V7_ILP32_OFFBIG"
             | "POSIX_V7_LP64_OFF64"
             | "POSIX_V7_LPBIG_OFFBIG"
@@ -555,12 +560,47 @@ fn is_valid_specification(spec: &str) -> bool {
     )
 }
 
+/// Look up a `<limits.h>` compile-time Maximum/Minimum value that POSIX requires
+/// `getconf` to accept as a system variable but which is not a `sysconf`,
+/// `confstr`, or `pathconf` query (#G2). Only the values that can be derived
+/// portably and correctly are provided here; the remaining pure-header macros
+/// (`MB_LEN_MAX`, `NL_*`, `NZERO`, `CHARCLASS_NAME_MAX`) are not exposed by the
+/// `libc` crate and are intentionally not hardcoded.
+fn lookup_limit_constant(var: &str) -> Option<i64> {
+    match var {
+        // Number of bits in a `long` / an `int` on this implementation.
+        "LONG_BIT" => Some(i64::from(libc::c_long::BITS)),
+        "WORD_BIT" => Some(i64::from(libc::c_int::BITS)),
+        _ => None,
+    }
+}
+
 fn load_sysconf_mapping() -> HashMap<&'static str, libc::c_int> {
     HashMap::from([
         ("_SC_ARG_MAX", libc::_SC_ARG_MAX),
         ("_SC_CHILD_MAX", libc::_SC_CHILD_MAX),
         ("_SC_CLK_TCK", libc::_SC_CLK_TCK),
         ("_SC_NGROUPS_MAX", libc::_SC_NGROUPS_MAX),
+        // Issue 8 (Austin Group Defect 339) added these (#G5).
+        ("_SC_NPROCESSORS_CONF", libc::_SC_NPROCESSORS_CONF),
+        ("_SC_NPROCESSORS_ONLN", libc::_SC_NPROCESSORS_ONLN),
+        // POSIX option/feature sysconf variables (#G5).
+        ("_SC_BARRIERS", libc::_SC_BARRIERS),
+        ("_SC_CLOCK_SELECTION", libc::_SC_CLOCK_SELECTION),
+        ("_SC_CPUTIME", libc::_SC_CPUTIME),
+        ("_SC_MONOTONIC_CLOCK", libc::_SC_MONOTONIC_CLOCK),
+        ("_SC_READER_WRITER_LOCKS", libc::_SC_READER_WRITER_LOCKS),
+        ("_SC_SPIN_LOCKS", libc::_SC_SPIN_LOCKS),
+        ("_SC_SPORADIC_SERVER", libc::_SC_SPORADIC_SERVER),
+        ("_SC_THREAD_CPUTIME", libc::_SC_THREAD_CPUTIME),
+        ("_SC_TIMEOUTS", libc::_SC_TIMEOUTS),
+        ("_SC_TYPED_MEMORY_OBJECTS", libc::_SC_TYPED_MEMORY_OBJECTS),
+        ("_SC_TRACE", libc::_SC_TRACE),
+        ("_SC_XOPEN_REALTIME", libc::_SC_XOPEN_REALTIME),
+        (
+            "_SC_XOPEN_REALTIME_THREADS",
+            libc::_SC_XOPEN_REALTIME_THREADS,
+        ),
         ("_SC_OPEN_MAX", libc::_SC_OPEN_MAX),
         ("_SC_STREAM_MAX", libc::_SC_STREAM_MAX),
         ("_SC_TZNAME_MAX", libc::_SC_TZNAME_MAX),
@@ -728,6 +768,9 @@ fn load_pathconf_mapping() -> HashMap<&'static str, libc::c_int> {
         ("_POSIX_VDISABLE", libc::_PC_VDISABLE),
         ("_POSIX_ASYNC_IO", libc::_PC_ASYNC_IO),
         ("_POSIX_PRIO_IO", libc::_PC_PRIO_IO),
+        // POSIX2_SYMLINKS pathconf variable (#G6).
+        ("POSIX2_SYMLINKS", libc::_PC_2_SYMLINKS),
+        ("_PC_2_SYMLINKS", libc::_PC_2_SYMLINKS),
     ])
 }
 
@@ -752,6 +795,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(pathname) = args.pathname {
         let pathconf_mappings = load_pathconf_mapping();
         handle_pathconf(&args.var, &pathname, &pathconf_mappings)?;
+    } else if let Some(value) = lookup_limit_constant(&args.var) {
+        // <limits.h> compile-time Maximum/Minimum value (#G2).
+        println!("{}", value);
     } else {
         let confstr_mappings = load_confstr_mapping();
 
@@ -764,4 +810,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // POSIX.1-2024 (Issue 8) -v specification names must be accepted (#G1).
+    #[test]
+    fn v8_specifications_accepted() {
+        assert!(is_valid_specification("POSIX_V8_LP64_OFF64"));
+        assert!(is_valid_specification("POSIX_V8_ILP32_OFFBIG"));
+        // Legacy names still accepted.
+        assert!(is_valid_specification("POSIX_V7_LP64_OFF64"));
+        assert!(is_valid_specification("POSIX_V6_ILP32_OFF32"));
+        // Nonsense rejected.
+        assert!(!is_valid_specification("POSIX_V9_LP64_OFF64"));
+        assert!(!is_valid_specification("bogus"));
+    }
+
+    // <limits.h> constant queries (#G2).
+    #[test]
+    fn limit_constants() {
+        // 64-bit targets: LONG_BIT == 64; both are a multiple of 8 and > 0.
+        let long_bit = lookup_limit_constant("LONG_BIT").unwrap();
+        let word_bit = lookup_limit_constant("WORD_BIT").unwrap();
+        assert!(long_bit >= 32 && long_bit % 8 == 0);
+        assert!(word_bit >= 16 && word_bit % 8 == 0);
+        assert_eq!(lookup_limit_constant("NOT_A_LIMIT"), None);
+    }
+
+    // NPROCESSORS_CONF/ONLN are present in the sysconf map (#G5).
+    #[test]
+    fn nprocessors_mapped() {
+        let m = load_sysconf_mapping();
+        assert!(m.contains_key("_SC_NPROCESSORS_CONF"));
+        assert!(m.contains_key("_SC_NPROCESSORS_ONLN"));
+    }
+
+    // POSIX2_SYMLINKS is present in the pathconf map (#G6).
+    #[test]
+    fn posix2_symlinks_mapped() {
+        let m = load_pathconf_mapping();
+        assert!(m.contains_key("POSIX2_SYMLINKS"));
+    }
 }

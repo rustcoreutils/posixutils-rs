@@ -46,7 +46,11 @@ struct Args {
     #[arg(short, long, help = gettext("Print the current run-level of the init process"))]
     runlevel: bool,
 
-    #[arg(short, long = "short", default_value_t = true, group = "output", help = gettext("List only the name, line, and time fields (default)"))]
+    // Short format is the default; -s is accepted explicitly and is mutually
+    // exclusive with -T. No default_value_t (an always-true unread default
+    // conflicting with the group was fragile — #W7); the output dispatch keys
+    // off `terminals`.
+    #[arg(short, long = "short", group = "output", help = gettext("List only the name, line, and time fields (default)"))]
     short_format: bool,
 
     #[arg(short = 't', long = "time", help = gettext("Indicate the last change to the system clock"))]
@@ -55,7 +59,10 @@ struct Args {
     #[arg(short = 'T', long, group = "output", help = gettext("Show the state of each terminal"))]
     terminals: bool,
 
-    #[arg(long, help = gettext("Normal selection of information"))]
+    // Internal selection flag for USER_PROCESS entries (the default view). Not
+    // a POSIX option; hidden from --help so it doesn't pollute the public CLI
+    // surface (#W5).
+    #[arg(long, hide = true, help = gettext("Normal selection of information"))]
     userproc: bool,
 
     #[arg(short = 'u', long = "users", help = gettext("Write \"idle time\" for each displayed user"))]
@@ -65,14 +72,14 @@ struct Args {
     file: Option<PathBuf>,
 }
 
-// convert timestamp into POSIX-specified strftime format (local time)
+// Convert timestamp into the POSIX who time format. Uses libc strftime via
+// plib so LC_TIME (month names) and TZ are honored (#W4).
 fn fmt_timestamp(ts: libc::time_t) -> String {
-    use chrono::{Local, TimeZone};
-    let dt = Local
-        .timestamp_opt(ts, 0)
-        .single()
-        .unwrap_or_else(Local::now);
-    dt.format("%b %e %H:%M").to_string()
+    // No-op where time_t is i64 (Linux/macOS), a widening on 32-bit time_t
+    // targets; mirrors plib::locale::strftime's own handling.
+    #[allow(clippy::useless_conversion)]
+    let secs = i64::from(ts);
+    plib::locale::strftime("%b %e %H:%M", secs).unwrap_or_default()
 }
 
 // Get terminal state for -T option: + (write allowed), - (write denied), ? (unknown)
@@ -108,7 +115,8 @@ fn get_idle_time(line: &str) -> String {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs() as i64;
-            let idle_secs = now - atime;
+            // Clamp negative values (clock skew / atime in the future) to 0.
+            let idle_secs = (now - atime).max(0);
             if idle_secs < 60 {
                 "   .".to_string() // Active in last minute
             } else if idle_secs > 24 * 60 * 60 {
@@ -143,76 +151,71 @@ fn get_comment_field(entry: &Utmpx) -> String {
     }
 }
 
-fn print_fmt_short(args: &Args, entry: &Utmpx, line: &str) {
-    if args.idle_time {
-        let comment = get_comment_field(entry);
-
-        if comment.is_empty() {
-            println!(
-                "{:<16} {:<12} {} {} {:>5}",
-                entry.user,
-                line,
-                fmt_timestamp(entry.timestamp),
-                get_idle_time(line),
-                entry.pid
-            );
-        } else {
-            println!(
-                "{:<16} {:<12} {} {} {:>5} {}",
-                entry.user,
-                line,
-                fmt_timestamp(entry.timestamp),
-                get_idle_time(line),
-                entry.pid,
-                comment
-            );
-        }
+// The <name> field: POSIX requires the literal "LOGIN" for login-process
+// entries (the lines on which the system waits for someone to log in) (#W2).
+fn display_name(typ: libc::c_short, user: &str) -> &str {
+    if typ == platform::LOGIN_PROCESS {
+        "LOGIN"
     } else {
-        println!(
-            "{:<16} {:<12} {}",
-            entry.user,
-            line,
-            fmt_timestamp(entry.timestamp)
-        );
+        user
     }
+}
+
+// The <exit> field: POSIX requires it for dead processes, carrying the
+// termination and exit values of the expired process (#W1). None for other
+// entry types or on platforms without ut_exit (macOS).
+fn exit_field(typ: libc::c_short, exit_status: Option<(i16, i16)>) -> Option<String> {
+    if typ == platform::DEAD_PROCESS {
+        exit_status.map(|(term, exit)| format!("term={} exit={}", term, exit))
+    } else {
+        None
+    }
+}
+
+fn print_fmt_short(args: &Args, entry: &Utmpx, line: &str) {
+    let mut out = format!(
+        "{:<16} {:<12} {}",
+        display_name(entry.typ, &entry.user),
+        line,
+        fmt_timestamp(entry.timestamp)
+    );
+    if args.idle_time {
+        out.push_str(&format!(" {} {:>5}", get_idle_time(line), entry.pid));
+        let comment = get_comment_field(entry);
+        if !comment.is_empty() {
+            out.push(' ');
+            out.push_str(&comment);
+        }
+    }
+    if let Some(exit) = exit_field(entry.typ, entry.exit_status) {
+        out.push(' ');
+        out.push_str(&exit);
+    }
+    println!("{}", out);
 }
 
 fn print_fmt_term(args: &Args, entry: &Utmpx, line: &str) {
     let term_state = get_terminal_state(line);
+    let mut out = format!(
+        "{:<16} {} {:<12} {}",
+        display_name(entry.typ, &entry.user),
+        term_state,
+        line,
+        fmt_timestamp(entry.timestamp)
+    );
     if args.idle_time {
+        out.push_str(&format!(" {} {:>5}", get_idle_time(line), entry.pid));
         let comment = get_comment_field(entry);
-
-        if comment.is_empty() {
-            println!(
-                "{:<16} {} {:<12} {} {} {:>5}",
-                entry.user,
-                term_state,
-                line,
-                fmt_timestamp(entry.timestamp),
-                get_idle_time(line),
-                entry.pid
-            );
-        } else {
-            println!(
-                "{:<16} {} {:<12} {} {} {:>5} {}",
-                entry.user,
-                term_state,
-                line,
-                fmt_timestamp(entry.timestamp),
-                get_idle_time(line),
-                entry.pid,
-                comment
-            );
+        if !comment.is_empty() {
+            out.push(' ');
+            out.push_str(&comment);
         }
-    } else {
-        println!(
-            "{:<16} {} {:<12} {}",
-            entry.user,
-            term_state,
-            line,
-            fmt_timestamp(entry.timestamp)
-        );
     }
+    if let Some(exit) = exit_field(entry.typ, entry.exit_status) {
+        out.push(' ');
+        out.push_str(&exit);
+    }
+    println!("{}", out);
 }
 
 fn current_terminal() -> Option<String> {
@@ -377,4 +380,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -l entries display the literal name "LOGIN" (#W2).
+    #[test]
+    fn login_process_name_is_login() {
+        assert_eq!(display_name(platform::LOGIN_PROCESS, "whatever"), "LOGIN");
+        assert_eq!(display_name(platform::USER_PROCESS, "alice"), "alice");
+        assert_eq!(display_name(platform::DEAD_PROCESS, "bob"), "bob");
+    }
+
+    // -d dead processes carry an <exit> field; other types do not (#W1).
+    #[test]
+    fn dead_process_exit_field() {
+        assert_eq!(
+            exit_field(platform::DEAD_PROCESS, Some((9, 0))),
+            Some("term=9 exit=0".to_string())
+        );
+        assert_eq!(exit_field(platform::DEAD_PROCESS, None), None);
+        assert_eq!(exit_field(platform::USER_PROCESS, Some((0, 0))), None);
+    }
 }

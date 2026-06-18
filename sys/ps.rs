@@ -15,12 +15,16 @@ mod pslinux;
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
+use std::fmt::Write as _; // write! into a String (distinct from io::Write below)
 use std::io::{self, Write};
 use std::process::ExitCode;
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use libc::{geteuid, getgrgid, getgrnam, getpwnam, getpwuid, isatty, ttyname, STDIN_FILENO};
+use libc::{
+    geteuid, getgrgid, getgrnam, getpwnam, getpwuid, isatty, ttyname, STDERR_FILENO, STDIN_FILENO,
+    STDOUT_FILENO,
+};
 
 #[cfg(target_os = "macos")]
 mod platform {
@@ -141,6 +145,15 @@ struct Args {
     /// Custom output format
     #[arg(short = 'o', value_name = "format", action = clap::ArgAction::Append, help = gettext("Specify output format"))]
     output_format: Vec<String>,
+
+    /// Wide output: behave as if COLUMNS >= 132; repeat to remove the limit
+    #[arg(short = 'w', action = clap::ArgAction::Count, help = gettext("Wide output; repeat to remove the line-length limit"))]
+    wide: u8,
+
+    /// Alternative system namelist file (XSI). The format is unspecified by
+    /// POSIX; accepted for conformance and otherwise ignored.
+    #[arg(short = 'n', value_name = "namelist", help = gettext("Specify an alternative namelist file (accepted; ignored)"))]
+    namelist: Option<String>,
 }
 
 /// Field definition for -o option
@@ -470,37 +483,33 @@ fn get_long_fields() -> Vec<OutputField> {
     ]
 }
 
-/// Format time value (CPU time) as [dd-]hh:mm:ss
-fn format_time(ticks: u64) -> String {
-    // Convert ticks to seconds (assuming 100 ticks per second)
-    let total_secs = ticks / 100;
-    let hours = total_secs / 3600;
-    let mins = (total_secs % 3600) / 60;
-    let secs = total_secs % 60;
+/// Format a cumulative CPU time, given in **seconds**, as `[dd-]hh:mm:ss`.
+///
+/// Pure: the backends normalize their native units (Linux clock ticks, macOS
+/// nanoseconds) to whole seconds before this is called, so no `_SC_CLK_TCK`
+/// scaling happens here (audit #P3/#P9).
+fn format_time(secs: u64) -> String {
+    let hours = secs / 3600;
+    let mins = (secs % 3600) / 60;
+    let s = secs % 60;
 
     if hours >= 24 {
         let days = hours / 24;
         let hours = hours % 24;
-        format!("{}-{:02}:{:02}:{:02}", days, hours, mins, secs)
+        format!("{}-{:02}:{:02}:{:02}", days, hours, mins, s)
     } else {
-        format!("{:02}:{:02}:{:02}", hours, mins, secs)
+        format!("{:02}:{:02}:{:02}", hours, mins, s)
     }
 }
 
-/// Format elapsed time as [[dd-]hh:]mm:ss
-fn format_etime(start_time: u64) -> String {
-    // This is a simplified version - proper implementation would need boot time
-    // For now, just format as mm:ss
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    let elapsed = if start_time > 0 && now > start_time {
-        now - start_time
-    } else {
-        0
-    };
+/// Format elapsed (wall-clock) time as `[[dd-]hh:]mm:ss`.
+///
+/// Both `start_epoch` and `now_epoch` are seconds since the Unix epoch; the
+/// backends normalize `start_time` to epoch seconds (Linux adds the boot time
+/// to the ticks-since-boot value — audit #P1). Pure and clock-independent:
+/// `now` is injected by the caller. Clock skew (`now < start`) clamps to zero.
+fn format_etime(start_epoch: u64, now_epoch: u64) -> String {
+    let elapsed = now_epoch.saturating_sub(start_epoch);
 
     let days = elapsed / 86400;
     let hours = (elapsed % 86400) / 3600;
@@ -516,36 +525,135 @@ fn format_etime(start_time: u64) -> String {
     }
 }
 
-/// Get current terminal name
-fn get_current_tty() -> Option<String> {
-    unsafe {
-        if isatty(STDIN_FILENO) == 0 {
-            return None;
-        }
-        let name = ttyname(STDIN_FILENO);
-        if name.is_null() {
-            return None;
-        }
-        let cstr = std::ffi::CStr::from_ptr(name);
-        let name_str = cstr.to_string_lossy().to_string();
-        // Extract just the device name (e.g., "pts/0" from "/dev/pts/0")
-        if let Some(stripped) = name_str.strip_prefix("/dev/") {
-            Some(stripped.to_string())
-        } else {
-            Some(name_str)
-        }
+/// Format a process start time (epoch seconds) for the STIME column: `HH:MM`
+/// if it started today in the given timezone, otherwise `MmmDD` (matching
+/// historical `ps`, e.g. "Jun15"). Returns "-" when the start time is unknown
+/// (epoch 0, e.g. boot time unavailable). Honors `$TZ` when called with
+/// `chrono::Local`; generic over the timezone so it is deterministically
+/// unit-testable (audit #P6/#P7).
+fn format_stime<Tz>(start_epoch: u64, now_epoch: u64, tz: &Tz) -> String
+where
+    Tz: chrono::TimeZone,
+    Tz::Offset: std::fmt::Display,
+{
+    if start_epoch == 0 {
+        return "-".to_string();
+    }
+    let start = match tz.timestamp_opt(start_epoch as i64, 0).single() {
+        Some(t) => t,
+        None => return "-".to_string(),
+    };
+    let same_day = tz
+        .timestamp_opt(now_epoch as i64, 0)
+        .single()
+        .map(|now| now.date_naive() == start.date_naive())
+        .unwrap_or(false);
+
+    if same_day {
+        start.format("%H:%M").to_string()
+    } else {
+        start.format("%b%d").to_string()
     }
 }
 
-/// Get field value for a process
-fn get_field_value(proc: &platform::ProcessInfo, field: &str, full_format: bool) -> String {
+/// Per-invocation rendering context, captured once in `main` so the
+/// time-dependent fields stay deterministic and honor `$TZ`/`LC_TIME`.
+struct Context {
+    now: u64,          // current time, seconds since the Unix epoch
+    full_format: bool, // -f selected (renders uid as a login name, etc.)
+}
+
+/// Resolve the maximum output line length per the `-w` option and the `COLUMNS`
+/// environment variable (audit #P4). POSIX: lines contain no more than the
+/// greater of `{LINE_MAX}` and `COLUMNS` bytes; a single `-w` behaves as if
+/// `COLUMNS` were at least 132; repeating `-w` removes the limit.
+fn resolve_line_limit(wide_count: u8) -> usize {
+    if wide_count >= 2 {
+        return usize::MAX; // -ww: no limit
+    }
+    let line_max = {
+        let v = unsafe { libc::sysconf(libc::_SC_LINE_MAX) };
+        if v > 0 {
+            v as usize
+        } else {
+            2048 // conventional {LINE_MAX} fallback
+        }
+    };
+    let mut columns = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    if wide_count == 1 {
+        columns = columns.max(132); // -w: as if COLUMNS >= 132
+    }
+    line_max.max(columns)
+}
+
+/// Truncate `line` to at most `max_bytes`, rounding down to a UTF-8 character
+/// boundary so multi-byte characters are never split (POSIX bounds the line in
+/// bytes; for ASCII this is exact).
+fn truncate_line(line: &str, max_bytes: usize) -> &str {
+    if line.len() <= max_bytes {
+        return line;
+    }
+    let mut end = 0;
+    for (i, c) in line.char_indices() {
+        let next = i + c.len_utf8();
+        if next > max_bytes {
+            break;
+        }
+        end = next;
+    }
+    &line[..end]
+}
+
+/// Get the invoker's controlling-terminal name (e.g. "pts/0").
+///
+/// Probe stdin, then stdout, then stderr, so a redirected stdin alone does not
+/// hide the terminal (audit #P11). Returns the device name with the "/dev/"
+/// prefix stripped, to match the names derived from each process's `tty_nr`.
+fn get_current_tty() -> Option<String> {
+    for fd in [STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO] {
+        unsafe {
+            if isatty(fd) == 0 {
+                continue;
+            }
+            let name = ttyname(fd);
+            if name.is_null() {
+                continue;
+            }
+            let name_str = std::ffi::CStr::from_ptr(name).to_string_lossy().to_string();
+            return Some(
+                name_str
+                    .strip_prefix("/dev/")
+                    .map(str::to_string)
+                    .unwrap_or(name_str),
+            );
+        }
+    }
+    None
+}
+
+/// Annotate the command column for a zombie (state 'Z'): POSIX says a process
+/// that has exited but not yet been waited for "shall be marked defunct"
+/// (audit #P10). Matches the historical `<defunct>` tag.
+fn mark_defunct(command: &str, state: char) -> String {
+    if state == 'Z' {
+        format!("{} <defunct>", command)
+    } else {
+        command.to_string()
+    }
+}
+
+/// Get field value for a process, using `ctx` for time-dependent fields.
+fn get_field_value(proc: &platform::ProcessInfo, field: &str, ctx: &Context) -> String {
     match field {
         "pid" => proc.pid.to_string(),
         "ppid" => proc.ppid.to_string(),
         "pgid" => proc.pgid.to_string(),
         "sid" => proc.sid.to_string(),
         "uid" => {
-            if full_format {
+            if ctx.full_format {
                 uid_to_name(proc.uid).unwrap_or_else(|| proc.uid.to_string())
             } else {
                 proc.uid.to_string()
@@ -557,10 +665,10 @@ fn get_field_value(proc: &platform::ProcessInfo, field: &str, full_format: bool)
         "group" => gid_to_name(proc.gid).unwrap_or_else(|| proc.gid.to_string()),
         "rgroup" => gid_to_name(proc.rgid).unwrap_or_else(|| proc.rgid.to_string()),
         "tty" => proc.tty.as_deref().unwrap_or("?").to_string(),
-        "comm" => proc.comm.clone(),
-        "args" => proc.args.clone(),
+        "comm" => mark_defunct(&proc.comm, proc.state),
+        "args" => mark_defunct(&proc.args, proc.state),
         "time" => format_time(proc.time),
-        "etime" => format_etime(proc.start_time),
+        "etime" => format_etime(proc.start_time, ctx.now),
         "nice" => proc.nice.to_string(),
         "pri" => proc.priority.to_string(),
         "vsz" => proc.vsz.to_string(),
@@ -570,7 +678,7 @@ fn get_field_value(proc: &platform::ProcessInfo, field: &str, full_format: bool)
         "c" => "-".to_string(),    // CPU utilization - difficult to calculate
         "addr" => "-".to_string(), // Memory address - implementation specific
         "wchan" => "-".to_string(), // Wait channel - implementation specific
-        "stime" => "-".to_string(), // Start time - would need proper formatting
+        "stime" => format_stime(proc.start_time, ctx.now, &chrono::Local),
         "pcpu" => "-".to_string(), // CPU percentage - needs interval measurement
         _ => "-".to_string(),
     }
@@ -584,6 +692,11 @@ fn main() -> ExitCode {
     let _ = bind_textdomain_codeset("posixutils-rs", "UTF-8");
 
     let args = Args::parse();
+
+    // -n namelist is accepted for XSI conformance; its format is unspecified by
+    // POSIX and this implementation reads live process state (/proc on Linux,
+    // proc_* on macOS), so an alternative namelist has no effect.
+    let _ = &args.namelist;
 
     // Get processes
     let processes = match platform::list_processes() {
@@ -711,7 +824,8 @@ fn main() -> ExitCode {
                 return false;
             }
             match (&p.tty, &current_tty) {
-                (Some(ptty), Some(ctty)) => ptty.contains(ctty) || ctty.contains(ptty),
+                // Exact match: "pts/1" must not match "pts/10" (audit #P11).
+                (Some(ptty), Some(ctty)) => ptty == ctty,
                 (None, None) => true,
                 _ => false,
             }
@@ -738,39 +852,124 @@ fn main() -> ExitCode {
     // Check if we should print header (all headers non-empty)
     let print_header = output_fields.iter().any(|f| !f.header.is_empty());
 
+    // Capture the current time once so time-dependent fields are consistent
+    // across the whole listing.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let ctx = Context {
+        now,
+        full_format: args.full_format,
+    };
+
+    // Maximum line length (-w / COLUMNS / {LINE_MAX}); lines are clipped to it.
+    let line_limit = resolve_line_limit(args.wide);
+
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
-    // Print header
+    // Print header (clipped to the line limit so it stays aligned with rows).
     if print_header {
+        let mut line = String::new();
         for (i, field) in output_fields.iter().enumerate() {
             if i > 0 {
-                let _ = write!(out, " ");
+                line.push(' ');
             }
-            let _ = write!(out, "{:>width$}", field.header, width = field.width);
+            let _ = write!(line, "{:>width$}", field.header, width = field.width);
         }
-        let _ = writeln!(out);
+        let _ = writeln!(out, "{}", truncate_line(&line, line_limit));
     }
 
     // Print processes
     for proc in filtered {
+        let mut line = String::new();
         for (i, field) in output_fields.iter().enumerate() {
             if i > 0 {
-                let _ = write!(out, " ");
+                line.push(' ');
             }
-            let value = get_field_value(&proc, field.name, args.full_format);
+            let value = get_field_value(&proc, field.name, &ctx);
             // Right-align numeric fields, left-align text
             if matches!(
                 field.name,
                 "pid" | "ppid" | "pgid" | "sid" | "uid" | "gid" | "nice" | "pri" | "vsz" | "sz"
             ) {
-                let _ = write!(out, "{:>width$}", value, width = field.width);
+                let _ = write!(line, "{:>width$}", value, width = field.width);
             } else {
-                let _ = write!(out, "{:<width$}", value, width = field.width);
+                let _ = write!(line, "{:<width$}", value, width = field.width);
             }
         }
-        let _ = writeln!(out);
+        let _ = writeln!(out, "{}", truncate_line(&line, line_limit));
     }
 
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // CPU time is given in seconds and rendered [dd-]hh:mm:ss (#P3).
+    #[test]
+    fn format_time_seconds() {
+        assert_eq!(format_time(0), "00:00:00");
+        assert_eq!(format_time(61), "00:01:01");
+        assert_eq!(format_time(3661), "01:01:01");
+        // 90061 s = 1 day + 1:01:01.
+        assert_eq!(format_time(90061), "1-01:01:01");
+    }
+
+    // etime is now_epoch - start_epoch (#P1); both are epoch seconds, so the
+    // result is correct rather than the old ticks-vs-epoch garbage. Skew clamps.
+    #[test]
+    fn format_etime_elapsed() {
+        let start = 1_000_000_000;
+        assert_eq!(format_etime(start, start + 61), "01:01");
+        assert_eq!(format_etime(start, start + 3661), "01:01:01");
+        assert_eq!(format_etime(start, start + 90061), "1-01:01:01");
+        // Clock skew: now < start -> 0, never an underflow panic.
+        assert_eq!(format_etime(start, start - 5), "00:00");
+        // Unknown start (boot epoch unavailable -> 0): huge "elapsed" is just
+        // formatted, but the common path (valid start) is correct above.
+        assert_eq!(format_etime(0, 0), "00:00");
+    }
+
+    // STIME shows HH:MM when started today, else MmmDD; "-" when unknown (#P6).
+    #[test]
+    fn format_stime_today_vs_date() {
+        use chrono::Utc;
+        // 2021-01-01 00:00:00 UTC = 1_609_459_200.
+        let day_start = 1_609_459_200u64;
+        // Same UTC day, 01:02 -> "01:02".
+        let started = day_start + 3720; // 01:02:00
+        let now = day_start + 7200; // 02:00:00 same day
+        assert_eq!(format_stime(started, now, &Utc), "01:02");
+        // When "now" is the next day, the Jan-01 start renders as "MmmDD".
+        assert_eq!(format_stime(started, now + 86_400, &Utc), "Jan01");
+        // Unknown start time.
+        assert_eq!(format_stime(0, now, &Utc), "-");
+    }
+
+    // -ww removes the line-length limit; truncation never splits UTF-8 (#P4).
+    #[test]
+    fn line_limit_and_truncation() {
+        assert_eq!(resolve_line_limit(2), usize::MAX);
+        // Single/zero -w yields a finite cap (>= {LINE_MAX} fallback 2048).
+        assert!(resolve_line_limit(0) >= 2048);
+        assert!(resolve_line_limit(1) >= 2048);
+
+        assert_eq!(truncate_line("hello world", 5), "hello");
+        assert_eq!(truncate_line("hi", 100), "hi");
+        // A 2-byte 'é' at the boundary is dropped whole, never split.
+        assert_eq!(truncate_line("aé", 2), "a");
+        assert_eq!(truncate_line("aé", 3), "aé");
+    }
+
+    // Zombies are tagged <defunct> in the command column (#P10).
+    #[test]
+    fn defunct_marking() {
+        assert_eq!(mark_defunct("[bash]", 'Z'), "[bash] <defunct>");
+        assert_eq!(mark_defunct("bash", 'S'), "bash");
+        assert_eq!(mark_defunct("bash", 'R'), "bash");
+    }
 }

@@ -240,28 +240,28 @@ case; non-conformant for the full surface.
 ### Priority issues
 
 #### Critical
-- [ ] **#LG1 — No option parsing; `-f`/`-i`/`-p`/`-t` are treated as message text.** `logger.rs:19-21`. `args.join(" ")` over all argv means `logger -t mytag hi` logs the literal string `-t mytag hi`. Spec 102862,102877-102905. Fix: parse options (clap) before building the body; strip recognized flags.
-- [ ] **#LG2 — No STDIN / `-f file` message-body input.** `logger.rs:19-21`. Spec 102869-102871,102909-102915: with no operands and no `-f`, read message bodies from stdin (one non-empty line per message); `-f file` reads from a file. Current code logs an empty string when no operands are given (locked in by `test_logger_no_args`). Fix: when operands empty, read stdin/`-f` line-by-line, one syslog message per non-empty line.
+- [x] **#LG1 — No option parsing; `-f`/`-i`/`-p`/`-t` are treated as message text.** ✓ fixed (phase 6) — clap now parses `-i`/`-f`/`-p`/`-t`; only the `string...` operands form the body. Verified in syslog that flags are not logged. `users/logger.rs`.
+- [x] **#LG2 — No STDIN / `-f file` message-body input.** ✓ fixed (phase 6) — with no operands, message bodies are read from `-f file` (or stdin), one non-empty line per message. `users/logger.rs` `collect_messages`.
 
 #### Major
-- [ ] **#LG3 — Default priority is `user.err`, not `user.notice`.** `logger.rs:35` calls `writer.err(&log_str)`. Spec 102902: "If the −p option is not specified, the priority shall be user.notice." `err` is a higher severity than `notice`. Fix: use the notice-level write and honor `-p facility.level`.
+- [x] **#LG3 — Default priority is `user.err`, not `user.notice`.** ✓ fixed (phase 6) — default is `user.notice`; `-p facility.level` honored (bare level defaults facility to `user`). `users/logger.rs`.
 
 #### Minor
-- [ ] **#LG4 — Default tag/PID hardcoded; `-i`/`-t` unsupported.** `logger.rs:23-28` sets `process:"logger"`, `pid:0`. Spec 102903-102905: default tag is the invoking user/effective name; `-t` overrides; `-i` adds the PID. Fix: default tag to the login/user name, wire `-t`, populate `pid` from `std::process::id()` under `-i`.
-- [ ] **#LG5 — Operand-embedded newline sent as one multi-line record.** `logger.rs:21`. Spec treats each input *line* as a separate message; operand newline behavior is unspecified, so low severity, but ties to #LG2.
+- [x] **#LG4 — Default tag/PID hardcoded; `-i`/`-t` unsupported.** ✓ fixed (phase 6) — default tag is the login name, `-t` overrides, `-i` logs `std::process::id()`. `users/logger.rs`.
+- [x] **#LG5 — Operand-embedded newline sent as one multi-line record.** ✓ addressed (phase 6) — the stdin/`-f` path now splits on lines (one message each); the operand path remains a single concatenated message (operand-newline behavior is unspecified). `users/logger.rs`.
 
 ### Detailed conformance matrix
 
-#### Options — DIVERGES (all four missing)
-- [ ] `-f file` MISSING — no file reading. logger.rs:19-21.
-- [ ] `-i` MISSING — `pid:0` hardcoded. logger.rs:27.
-- [ ] `-p priority` MISSING — priority fixed at `err`, facility `LOG_USER`. logger.rs:24,35.
-- [ ] `-t tag` MISSING — tag fixed `"logger"`. logger.rs:26.
-- No `--` handling / XBD 12.2 conformance since no options are parsed.
+#### Options — CONFORMS ✓ (all four implemented, phase 6)
+- [x] `-f file` — reads bodies from file (or `-`/stdin). logger.rs `collect_messages`.
+- [x] `-i` — logs `std::process::id()`. logger.rs.
+- [x] `-p priority` — `facility.level`, default `user.notice`. logger.rs `parse_priority`.
+- [x] `-t tag` — overrides the default login-name tag. logger.rs.
+- [x] clap provides `--` / XBD 12.2 handling.
 
 #### Operands / STDIN
-- [x] `string...` operands concatenated with single space — CONFORMS. logger.rs:21 (spec 102907-102909; RATIONALE "similar to echo"). Verified by `test_logger_multiple_args`.
-- [ ] STDIN fallback when no operands — MISSING/DIVERGES. Spec 102909-102915; logs empty string instead. logger.rs:19-21 (grep: no `stdin`/`BufRead`).
+- [x] `string...` operands concatenated with single space — CONFORMS. logger.rs `collect_messages` (spec 102907-102909). Verified by `test_logger_multiple_args`.
+- [x] STDIN/`-f` fallback when no operands — CONFORMS ✓ (fixed #LG2, phase 6); one non-empty line per message. logger.rs.
 
 #### Environment variables
 - [x] LANG/LC_ALL/LC_CTYPE/LC_MESSAGES — PARTIAL. `setlocale(LcAll,"")` logger.rs:15 honors precedence; no per-category handling. NLSPATH not separately handled (acceptable).

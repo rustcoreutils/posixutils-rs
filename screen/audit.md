@@ -64,6 +64,15 @@ the speed table mis-keys `B50` as `"54"`. Diagnostics are hardcoded English.
 
 ### Priority issues
 
+> **Resolved 2026-06-18** (branch `screen-audit`). All stty findings fixed
+> across Phases 1–3: #1/#2 unbreak the set path (single-operand panic removed,
+> `allow_hyphen_values` for negation), #3 single-char cchar assignment, #4
+> `rows`/`cols`/`size`, #5 hardened save-blob parse, #6 `"50"` speed key (+
+> cfg-gated higher bauds), #7 `cchar_to_str` display, #8 `gettext` + `stty:`
+> prefix, #9 ek/sane reviewed-conforming, #10 reject operands with `-a`/`-g`.
+> stty gained a full test suite (8 pure-function unit tests + 9 PTY
+> regressions via the `portable-pty` harness) where it previously had none.
+
 #### Critical
 
 - [x] **#1 — `stty <single mode operand>` panics (assertion failure, exit 101).** ✓ fixed (Phase 1): assertion changed to `!args.operands.is_empty()`; regression `test_stty_single_operand_no_panic`. `stty.rs:642` (`assert!(args.operands.len() > 1)`) at the top of `stty_set_long`. `stty_set` (`stty.rs:778-784`) routes any non-`pfmt1` operand list to `stty_set_long`, including a list of length 1. So `stty sane`, `stty raw`, `stty cs8`, `stty parenb`, `stty -8` etc. all abort. **Behaviorally confirmed under a PTY:** `stty parenb` → `panicked at screen/stty.rs:642 … assertion failed: args.operands.len() > 1`, exit 101. This is the most common stty usage form. Fix: change the assertion to `>= 1` (or delete it; the `while idx < len` loop already handles any length).
@@ -88,7 +97,7 @@ the speed table mis-keys `B50` as `"54"`. Diagnostics are hardcoded English.
 #### SYNOPSIS / argv parsing
 
 - [x] `-a` and `-g` mutually exclusive — `stty.rs:40,48` share clap `group = "mode"`.
-- [ ] **Negation operands rejected by clap** (#2 Critical) — `operands` lacks `allow_hyphen_values` (`stty.rs:57`).
+- [x] **Negation operands reach the set path** (#2 ✓) — `operands` now has `allow_hyphen_values` (`stty.rs:57`).
 - [x] Bundled/standalone positive operands accepted — `stty cs8 cs7` reaches the set path (confirmed; failed only at `tcsetattr` on the test PTY, i.e. parsing/dispatch worked).
 - [x] `--` end-of-options handled (clap default).
 
@@ -101,14 +110,14 @@ the speed table mis-keys `B50` as `"54"`. Diagnostics are hardcoded English.
 
 #### OPERANDS
 
-- [ ] **Control Modes** — `parenb/parodd/cs5-8/hupcl/hup/cstopb/cread/clocal` present (`osdata.rs:152-164`); baud `number`/`ispeed`/`ospeed` present but speed table buggy (#6).
-- [ ] **Input Modes** — all present (`osdata.rs:178-192`); reachable only via the broken set path (#1/#2).
-- [ ] **Output Modes** — `opost` (Base) + XSI `onlcr/ocrnl/onocr/onlret/ofill/ofdel/cr0-3/nl0-1/tab0-3/tabs/bs0-1/ff0-1/vt0-1` present (`osdata.rs:196-222`).
-- [ ] **Local Modes** — `isig/icanon/iexten/echo/echoe/echok/echonl/noflsh/tostop` present (`osdata.rs:226-237`).
-- [ ] **Special Control Character Assignments** — `eof/eol/erase/intr/kill/quit/susp/start/stop` mapped (`osdata.rs:247-255`); `^c` table complete (`osdata.rs:63-124`); `^-`/`undef`→0 handled (`stty.rs:424-427`); **single-char form missing** (#3 Major).
+- [x] **Control Modes** — `parenb/parodd/cs5-8/hupcl/hup/cstopb/cread/clocal` present (`osdata.rs:152-164`); baud `number`/`ispeed`/`ospeed` present (speed table fixed, #6 ✓).
+- [x] **Input Modes** — all present (`osdata.rs:178-192`); reachable now that the set path is fixed (#1/#2 ✓).
+- [x] **Output Modes** — `opost` (Base) + XSI `onlcr/ocrnl/onocr/onlret/ofill/ofdel/cr0-3/nl0-1/tab0-3/tabs/bs0-1/ff0-1/vt0-1` present (`osdata.rs:196-222`).
+- [x] **Local Modes** — `isig/icanon/iexten/echo/echoe/echok/echonl/noflsh/tostop` present (`osdata.rs:226-237`).
+- [x] **Special Control Character Assignments** — `eof/eol/erase/intr/kill/quit/susp/start/stop` mapped (`osdata.rs:247-255`); `^c` table complete (`osdata.rs:63-124`); `^-`/`undef`→0 handled; **single-char form now supported** (#3 ✓).
 - [x] **`min`/`time`** — `osdata.rs:259-260` + `stty.rs:742-756` parse numeric `u8` args.
-- [ ] **Combination Modes** — `evenp/parity/oddp/-parity/-evenp/-oddp/raw/cooked/nl/-nl/ek/sane/tabs/-tabs` handled (`stty.rs:533-638`); `raw` matches the POSIX literal recipe (cs8, disable erase/kill/intr/quit/eof/eol, `-opost`, `-inpck`); `saved settings` only for `pfmt1` blobs (#5).
-- [ ] **Terminal Window Size (`rows`/`cols`) and `size` query MISSING** (#4 Major).
+- [x] **Combination Modes** — `evenp/parity/oddp/-parity/-evenp/-oddp/raw/cooked/nl/-nl/ek/sane/tabs/-tabs` handled (`stty.rs:533-638`); `raw` matches the POSIX literal recipe (cs8, disable erase/kill/intr/quit/eof/eol, `-opost`, `-inpck`); `saved settings` `pfmt1` round-trip hardened (#5 ✓).
+- [x] **Terminal Window Size (`rows`/`cols`) and `size` query** now supported (#4 ✓).
 
 #### STDIN / INPUT FILES
 
@@ -133,13 +142,13 @@ the speed table mis-keys `B50` as `"54"`. Diagnostics are hardcoded English.
 - [x] With set-operands and no Informational Query: no stdout — set path writes nothing to stdout (`stty.rs:778-784`).
 - [x] `-a` speed line: `"speed %d baud;"` when ispeed==ospeed, else `"ispeed … ospeed …"` — `stty.rs:74-78` (`ti_baud_str`). CONFORMS.
 - [x] `-a` control chars: `"%s = %s;"` with `<undef>` for disabled — `stty.rs:256, 247-254`. CONFORMS (except value rendering, #7).
-- [ ] **`size` query output `"%1d %1d\n"` MISSING** (#4).
+- [x] **`size` query output `"%d %d\n"`** now emitted (#4 ✓).
 - [x] Diagnostics → stderr — via `Error:`/`eprintln` (but English & misprefixed, #8).
 
 #### EXIT STATUS / CONSEQUENCES OF ERRORS
 
 - [x] 0 on success; >0 on error — `main` returns `Ok`/`Err` (`stty.rs:786-814`).
-- [ ] **Exit 101 (panic) on `stty <single operand>`** (#1 Critical) — violates "0 success / >0 error" with an abnormal abort.
+- [x] **No panic on `stty <single operand>`** (#1 ✓) — the abort is removed; single operands exit 0.
 - [x] First bad operand aborts the operand list — `stty_set_long` returns `Err` on the first failure (`stty.rs:687-714`). CONSEQUENCES OF ERRORS = Default, so abort is permitted.
 
 ### Test coverage signal
@@ -178,6 +187,12 @@ type", `MAX_COLUMN` is hardcoded at 160, and a leading `+N` first operand is
 tolerated.
 
 ### Priority issues
+
+> **Resolved 2026-06-18** (branch `screen-audit`, Phase 4). All tabs findings
+> fixed (strict scope): #T1 default-terminal fallback, #T2/#T4 width-derived
+> cap + beyond-width rejection, #T3 leading-`+` rejection, #T5 non-terminal
+> stdout guard. Added preset/`-0`/default/leading-`+`/beyond-width unit tests
+> plus PTY set-path and non-terminal-stdout integration tests.
 
 #### Major
 
@@ -267,6 +282,11 @@ contents, an invalid operand aborts the whole list before any valid operand
 runs, and there is no init→fallback for a missing reset string.
 
 ### Priority issues
+
+> **Resolved 2026-06-18** (branch `screen-audit`, Phase 5). All tput findings
+> fixed (strict scope): #T1 `if`/`rf` file contents emitted + `iprog` run, #T2
+> reset→init fallback, #T3 valid operands run before an invalid-operand exit 4.
+> Added clear / valid-then-invalid / multi-valid integration tests.
 
 #### Minor
 

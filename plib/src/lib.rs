@@ -10,6 +10,7 @@
 pub mod archive;
 pub mod curuser;
 pub mod diag;
+pub mod exec;
 pub mod group;
 pub mod io;
 pub mod locale;

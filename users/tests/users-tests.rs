@@ -7,8 +7,13 @@
 // SPDX-License-Identifier: MIT
 //
 
+mod common;
 mod id;
 mod logger;
+mod logname;
+mod mesg;
+mod newgrp;
+mod pwd;
 mod talk;
 mod tty;
 mod write;

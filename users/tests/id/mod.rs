@@ -398,3 +398,78 @@ fn test_id_current_user_by_name() {
         );
     });
 }
+
+// ============================================================================
+// -G group-set tests (#I1/#I2)
+// ============================================================================
+
+#[test]
+fn test_id_groups_includes_real_and_effective_gid() {
+    // -G must output effective, real, AND supplementary group IDs. On the
+    // common path egid == gid, but the real/effective gid must always appear
+    // first in the list and the list must be non-empty.
+    let real_gid = get_current_gid();
+    let eff_gid = get_current_egid();
+
+    id_test_with_checker(&["-G"], |_plan, output| {
+        assert!(output.status.success(), "id -G should succeed");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let ids: Vec<u32> = stdout
+            .split_whitespace()
+            .filter_map(|t| t.parse::<u32>().ok())
+            .collect();
+        assert!(!ids.is_empty(), "id -G must list at least one group");
+        assert_eq!(ids[0], real_gid, "real (primary) gid must be first in -G");
+        assert!(
+            ids.contains(&eff_gid),
+            "effective gid {} must appear in -G output: {:?}",
+            eff_gid,
+            ids
+        );
+        // No duplicate gids in the -G list.
+        let mut seen = std::collections::HashSet::new();
+        for id in &ids {
+            assert!(seen.insert(*id), "duplicate gid {} in -G output", id);
+        }
+    });
+}
+
+#[test]
+fn test_id_mutually_exclusive_output_options() {
+    // -G/-g/-u are mutually exclusive; clap rejects combinations with exit 2.
+    for combo in [["-G", "-g"], ["-g", "-u"], ["-G", "-u"]] {
+        let str_args: Vec<String> = combo.iter().map(|s| String::from(*s)).collect();
+        run_test_with_checker(
+            TestPlan {
+                cmd: String::from("id"),
+                args: str_args,
+                stdin_data: String::new(),
+                expected_out: String::new(),
+                expected_err: String::new(),
+                expected_exit_code: 2,
+            },
+            |_plan, output| {
+                assert_eq!(
+                    output.status.code(),
+                    Some(2),
+                    "mutually-exclusive {:?} should exit 2",
+                    combo
+                );
+            },
+        );
+    }
+}
+
+#[test]
+fn test_id_double_dash_operand() {
+    // `id -- root` must treat `root` as the user operand, not an option.
+    id_test_with_checker(&["--", "root"], |_plan, output| {
+        assert!(output.status.success(), "id -- root should succeed");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.starts_with("uid=0(root)"),
+            "Expected root's identity, got: {}",
+            stdout
+        );
+    });
+}

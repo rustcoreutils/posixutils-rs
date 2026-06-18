@@ -11,6 +11,7 @@ use libc::{endgrent, getgrent, setgrent};
 use std::ffi::{CStr, CString};
 use std::ptr;
 
+#[derive(Clone, Debug)]
 pub struct Group {
     pub name: String,
     pub passwd: String,

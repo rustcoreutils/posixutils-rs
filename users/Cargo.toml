@@ -21,6 +21,7 @@ binrw = "0.14"
 [dev-dependencies]
 libc = { workspace = true }
 regex = { workspace = true }
+portable-pty = "0.9"
 
 [lints]
 workspace = true

@@ -2013,6 +2013,7 @@ dependencies = [
  "libc",
  "libcrypt-rs",
  "plib",
+ "portable-pty",
  "regex",
  "syslog",
  "thiserror 1.0.69",

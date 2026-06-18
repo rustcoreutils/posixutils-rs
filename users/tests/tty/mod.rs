@@ -295,6 +295,28 @@ fn test_tty_not_terminal_with_input() {
     });
 }
 
+#[test]
+fn test_tty_rejects_operand() {
+    // tty defines no operands; an extra argument is rejected with exit 2.
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("tty"),
+            args: vec![String::from("bogus")],
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 2,
+        },
+        |_plan, output| {
+            assert_eq!(
+                output.status.code(),
+                Some(2),
+                "an unexpected operand should be rejected with exit 2"
+            );
+        },
+    );
+}
+
 // ============================================================================
 // Help and Version Tests
 // ============================================================================

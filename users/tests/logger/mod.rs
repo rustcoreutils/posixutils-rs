@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, TestPlan};
+use plib::testing::{run_test, run_test_with_checker, TestPlan};
 
 fn logger_test(args: &[&str]) {
     let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
@@ -19,6 +19,25 @@ fn logger_test(args: &[&str]) {
         expected_err: String::new(),
         expected_exit_code: 0,
     });
+}
+
+/// Assert `logger <args>` exits with `code` (priority parsing happens before
+/// any syslog connection, so the error cases are deterministic offline).
+fn logger_exit(args: &[&str], code: i32) {
+    let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("logger"),
+            args: str_args,
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: code,
+        },
+        move |_plan, output| {
+            assert_eq!(output.status.code(), Some(code));
+        },
+    );
 }
 
 // POSIX notes that logger is "difficult to test" since the output format
@@ -74,4 +93,33 @@ fn test_logger_multiword_quoted() {
 fn test_logger_newlines() {
     // Test embedded newlines (implementation may handle differently)
     logger_test(&["line1\nline2\nline3"]);
+}
+
+// ============================================================================
+// Option parsing (#LG1/#LG3/#LG4) — operands are no longer logged verbatim
+// ============================================================================
+
+#[test]
+fn test_logger_unknown_facility_errors() {
+    // -p with an unknown facility is rejected before any syslog connection.
+    logger_exit(&["-p", "nosuchfac.info", "hello"], 1);
+}
+
+#[test]
+fn test_logger_unknown_level_errors() {
+    // -p with an unknown level is rejected.
+    logger_exit(&["-p", "user.nosuchlevel", "hello"], 1);
+}
+
+#[test]
+fn test_logger_options_not_logged_as_body() {
+    // -t/-p/-i must be parsed as options, not concatenated into the message
+    // body. A valid invocation succeeds (exit 0) when syslog is reachable.
+    logger_test(&["-i", "-t", "mytag", "-p", "user.info", "hello", "world"]);
+}
+
+#[test]
+fn test_logger_bare_level_priority() {
+    // A bare level (no facility) defaults the facility to user.
+    logger_test(&["-p", "warning", "a warning message"]);
 }

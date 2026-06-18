@@ -459,9 +459,38 @@ fn test_write_invalid_terminal() {
             assert!(
                 stderr.contains("Permission denied")
                     || stderr.contains("No such file")
-                    || stderr.contains("Error"),
+                    || stderr.contains("Error")
+                    || stderr.contains("cannot access"),
                 "Expected error about terminal, got: {}",
                 stderr
+            );
+        },
+    );
+}
+
+#[test]
+fn test_write_rejects_path_traversal_terminal() {
+    // A terminal operand resolving outside /dev (or not a char device) must be
+    // rejected (exit 1), not opened and written to.
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("write"),
+            args: vec![String::from("root"), String::from("/dev/../etc/passwd")],
+            stdin_data: String::from("hello\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 1,
+        },
+        |_plan, output| {
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "a non-/dev terminal path must be rejected"
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("not a terminal device") || stderr.contains("cannot access"),
+                "expected a terminal-validation diagnostic; got: {stderr}"
             );
         },
     );

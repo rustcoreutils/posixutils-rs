@@ -1,20 +1,17 @@
 //
-// Copyright (c) 2024-2025 Jeff Garzik
+// Copyright (c) 2024-2026 Jeff Garzik
 //
 // This file is part of the posixutils-rs project covered under
 // the MIT License.  For the full license text, please see the LICENSE
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// TODO:
-// - use .metadata() and std::os::unix::fs::PermissionsExt if possible
-// - set process exit code according to spec
-//
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use std::io::{self, Error, IsTerminal};
+use gettextrs::gettext;
+use std::io::{self, IsTerminal};
 use std::mem;
+use std::process::ExitCode;
 
 /// mesg - permit or deny messages
 #[derive(Parser)]
@@ -30,6 +27,8 @@ enum Stream {
     Stderr,
 }
 
+/// Per POSIX/System V, operate on the first terminal among standard input,
+/// standard output, and standard error (in that order).
 fn find_tty() -> Option<Stream> {
     if io::stdin().is_terminal() {
         Some(Stream::Stdin)
@@ -51,87 +50,98 @@ fn tty_to_fd(tty: Stream) -> i32 {
 }
 
 fn stat_tty() -> io::Result<(i32, libc::stat)> {
-    let tty_res = find_tty();
-    if tty_res.is_none() {
-        return Err(Error::other("tty not found"));
-    }
-    let fd = tty_to_fd(tty_res.unwrap());
+    let fd = match find_tty() {
+        Some(tty) => tty_to_fd(tty),
+        None => return Err(io::Error::other("no terminal")),
+    };
 
     unsafe {
         let mut st: libc::stat = mem::zeroed();
-        let ret = libc::fstat(fd, &mut st);
-        if ret < 0 {
-            eprintln!("{}", gettext("fstat failed"));
+        if libc::fstat(fd, &mut st) < 0 {
             return Err(io::Error::last_os_error());
         }
-
         Ok((fd, st))
     }
 }
 
-fn show_mesg(st: libc::stat) -> io::Result<()> {
-    if (st.st_mode & (libc::S_IWGRP | libc::S_IWOTH)) != 0 {
-        println!("is y");
-    } else {
-        println!("is n");
-    }
-    Ok(())
+/// Receiving messages is allowed when group- or other-write is set on the tty.
+fn mesg_allowed(st: &libc::stat) -> bool {
+    (st.st_mode & (libc::S_IWGRP | libc::S_IWOTH)) != 0
 }
 
-fn parse_setting(setting: &str) -> Result<bool, &'static str> {
-    match setting {
-        "y" | "Y" => Ok(true),
-        "n" | "N" => Ok(false),
-        _ => Err("invalid operand"),
-    }
-}
-
-#[allow(clippy::assign_op_pattern)]
-fn set_mesg(fd: i32, st: libc::stat, setting: &str) -> io::Result<()> {
-    let res = parse_setting(setting);
-    if let Err(e) = res {
-        return Err(Error::other(e));
-    }
-    let affirm = res.unwrap();
-
+/// Set or clear the group/other write bits on the terminal device.
+fn set_mesg(fd: i32, st: &libc::stat, grant: bool) -> io::Result<()> {
     let mut mode = st.st_mode;
 
-    if affirm {
-        if (mode & (libc::S_IWGRP | libc::S_IWOTH)) != 0 {
+    if grant {
+        if mesg_allowed(st) {
             return Ok(());
         }
-
-        mode = mode | libc::S_IWGRP | libc::S_IWOTH;
+        mode |= libc::S_IWGRP | libc::S_IWOTH;
     } else {
-        if (mode & (libc::S_IWGRP | libc::S_IWOTH)) == 0 {
+        if !mesg_allowed(st) {
             return Ok(());
         }
-
-        mode = mode & !(libc::S_IWGRP | libc::S_IWOTH);
+        mode &= !(libc::S_IWGRP | libc::S_IWOTH);
     }
 
-    let chres = unsafe { libc::fchmod(fd, mode) };
-    if chres < 0 {
-        eprintln!("{}", gettext("failed to change terminal mode"));
+    if unsafe { libc::fchmod(fd, mode) } < 0 {
         return Err(io::Error::last_os_error());
     }
-
     Ok(())
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+/// POSIX EXIT STATUS: 0 if receiving messages is allowed, 1 if not. The status
+/// reflects the resulting state (verified against the system `mesg`: `mesg n`
+/// exits 1, `mesg y` exits 0).
+fn exit_for(allowed: bool) -> ExitCode {
+    if allowed {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
+fn main() -> ExitCode {
+    plib::diag::init_locale("mesg");
 
     let args = Args::parse();
 
-    let (fd, stat) = stat_tty()?;
+    let (fd, st) = match stat_tty() {
+        Ok(v) => v,
+        Err(_) => {
+            plib::diag::error(&gettext("cannot find a terminal"));
+            return ExitCode::from(2);
+        }
+    };
 
-    match args.operand {
-        None => show_mesg(stat)?,
-        Some(op) => set_mesg(fd, stat, &op)?,
+    match args.operand.as_deref() {
+        // No operand: report the current state without changing it.
+        None => {
+            let allowed = mesg_allowed(&st);
+            println!("{}", if allowed { "is y" } else { "is n" });
+            exit_for(allowed)
+        }
+        Some(op) => {
+            // POSIX locale operands are exactly `y` and `n`.
+            let grant = match op {
+                "y" => true,
+                "n" => false,
+                _ => {
+                    plib::diag::error(&gettext("invalid operand (expected 'y' or 'n')"));
+                    return ExitCode::from(2);
+                }
+            };
+            if let Err(e) = set_mesg(fd, &st, grant) {
+                plib::diag::error(&format!(
+                    "{}: {}",
+                    gettext("failed to change terminal mode"),
+                    e
+                ));
+                return ExitCode::from(2);
+            }
+            // Exit status reflects the resulting messaging state.
+            exit_for(grant)
+        }
     }
-
-    Ok(())
 }

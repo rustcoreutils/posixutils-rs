@@ -7,7 +7,7 @@
 //
 
 use clap::{error::ErrorKind, Parser};
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use thiserror::Error;
 
 use binrw::{binrw, BinReaderExt, BinWrite, Endian};
@@ -64,6 +64,23 @@ pub struct State {
 /// A static variable to hold the state of delete invitations on SIGINT signal.
 static DELETE_INVITATIONS: LazyLock<Arc<Mutex<Option<State>>>> =
     LazyLock::new(|| Arc::new(Mutex::new(None)));
+
+/// Original terminal attributes captured before entering raw mode, so the
+/// signal handler and connection-close paths can restore the terminal on exit
+/// (the per-thread `RestoreTermOnDrop` guard does not cover those paths).
+static ORIGINAL_TERMIOS: LazyLock<Mutex<Option<libc::termios>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+/// Restore the terminal to the attributes captured before raw mode, if any.
+fn restore_terminal() {
+    if let Ok(guard) = ORIGINAL_TERMIOS.lock() {
+        if let Some(termios) = guard.as_ref() {
+            unsafe {
+                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, termios);
+            }
+        }
+    }
+}
 
 /// The size of the buffer for control message fields like l_name, r_name, and r_tty in CtlMsg.
 const BUFFER_SIZE: usize = 12;
@@ -267,7 +284,10 @@ impl From<&SocketAddrV4> for Osockaddr {
 
 impl From<&SocketAddrV6> for Osockaddr {
     fn from(_value: &SocketAddrV6) -> Self {
-        unimplemented!()
+        // The talk wire protocol carries only IPv4 (sockaddr_in); an IPv6
+        // address has no representation here. Return an empty address rather
+        // than panicking (the connection attempt will fail downstream).
+        Osockaddr::default()
     }
 }
 
@@ -546,9 +566,13 @@ fn talk_local(args: Args) -> Result<(), TalkError> {
 ///
 /// A `Result` indicating success or a `TalkError` if the input is not a TTY.
 fn check_if_tty() -> Result<(), TalkError> {
-    let is_tty = io::stdin().is_terminal();
-    if !is_tty {
-        eprintln!("Not a TTY");
+    if !io::stdin().is_terminal() {
+        plib::diag::error(&gettext("standard input is not a terminal"));
+        return Err(TalkError::NotTty);
+    }
+    // Spec STDOUT: if standard output is not a terminal, talk exits non-zero.
+    if !io::stdout().is_terminal() {
+        plib::diag::error(&gettext("standard output is not a terminal"));
         return Err(TalkError::NotTty);
     }
     Ok(())
@@ -638,8 +662,12 @@ fn spawn_input_thread(
         }
         let mut termios = unsafe { termios.assume_init() };
 
-        // Save the original terminal attributes to restore later
+        // Save the original terminal attributes to restore later (both via the
+        // local Drop guard and the global the signal handler consults).
         let original_termios = termios;
+        if let Ok(mut guard) = ORIGINAL_TERMIOS.lock() {
+            *guard = Some(original_termios);
+        }
 
         // Set raw mode flags
         termios.c_lflag &= !(libc::ICANON); // Disable canonical mode and echo
@@ -840,7 +868,6 @@ fn handle_character<W: Write>(
     top_line: u16,
     handle: &mut W,
 ) -> Result<(), TalkError> {
-    eprintln!("{}", output_buffer.len());
     if line_buffer.len() < MAX_USER_INPUT_LENGTH {
         line_buffer.push(c);
     } else {
@@ -931,6 +958,11 @@ fn process_input_char(
 ) -> Result<(), io::Error> {
     let mut top_line = top_line.lock().unwrap();
 
+    // The sender's local echo is part of the on-screen UI and must go to the
+    // terminal (stdout), not stderr (spec STDERR is "None").
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+
     match input_char {
         '\n' => {
             if !line_buffer.is_empty() {
@@ -938,13 +970,14 @@ fn process_input_char(
                 line_buffer.clear();
             }
             // Move the cursor to the start of the next line and clear it
-            eprint!("\x1B[{};H\x1B[K", *top_line + 1);
+            let _ = write!(out, "\x1B[{};H\x1B[K", *top_line + 1);
             *top_line += 1;
 
             if *top_line >= split_row.saturating_sub(1) {
-                eprint!("\x1B[{};H", 2);
+                let _ = write!(out, "\x1B[{};H", 2);
                 *top_line = 2;
             }
+            let _ = out.flush();
             // Send newline byte
             send_byte(write_stream, b'\n')?;
         }
@@ -954,11 +987,9 @@ fn process_input_char(
                 line_buffer.pop();
 
                 // Clear the current line and redraw it
-                // Move cursor to the line below and clear it
-                eprint!("\x1B[{};H\x1B[K", *top_line);
-
-                // Redraw the remaining characters
-                eprint!("{}", line_buffer);
+                let _ = write!(out, "\x1B[{};H\x1B[K", *top_line);
+                let _ = write!(out, "{}", line_buffer);
+                let _ = out.flush();
 
                 // Send backspace character
                 send_byte(write_stream, b'\x08')?;
@@ -1211,30 +1242,30 @@ fn get_names(
     Ok((my_machine_name, his_machine_name))
 }
 
-/// Converts a Rust string to a C-style string and stores it in a fixed-size buffer.
-fn string_to_c_string(s: &str) -> [i8; BUFFER_SIZE] {
-    let mut buffer: [i8; BUFFER_SIZE] = [0; BUFFER_SIZE];
-    let c_string = CString::new(s).expect("CString::new failed");
-    let bytes = c_string.to_bytes();
-
-    // Copy the bytes into the buffer, leaving space for the null terminator.
-    for (i, &byte) in bytes.iter().take(BUFFER_SIZE - 1).enumerate() {
+/// Copy `s` into a fixed-size NUL-terminated C buffer. An interior NUL ends the
+/// copy (treated as the terminator); longer strings are truncated. Never panics.
+fn copy_to_c_buffer<const N: usize>(s: &str) -> [i8; N] {
+    let mut buffer = [0i8; N];
+    for (i, &byte) in s
+        .as_bytes()
+        .iter()
+        .take_while(|&&b| b != 0)
+        .take(N - 1)
+        .enumerate()
+    {
         buffer[i] = byte as i8;
     }
     buffer
 }
 
+/// Converts a Rust string to a C-style string and stores it in a fixed-size buffer.
+fn string_to_c_string(s: &str) -> [i8; BUFFER_SIZE] {
+    copy_to_c_buffer(s)
+}
+
 /// Converts a Rust string to a C-style string for terminal names.
 fn tty_to_c_string(s: &str) -> [i8; 16] {
-    let mut buffer: [i8; 16] = [0; 16];
-    let c_string = CString::new(s).expect("CString::new failed");
-    let bytes = c_string.to_bytes();
-
-    // Copy the bytes into the buffer, leaving space for the null terminator.
-    for (i, &byte) in bytes.iter().take(16 - 1).enumerate() {
-        buffer[i] = byte as i8;
-    }
-    buffer
+    copy_to_c_buffer(s)
 }
 
 /// Resolves the IP addresses for both the local and remote machines, and retrieves the service port for communication.
@@ -1584,7 +1615,28 @@ fn announce(
         socket,
         res,
         MessageType::Announce,
-    )
+    )?;
+    check_announce_answer(res)
+}
+
+/// Translate a daemon ANNOUNCE response into an error for any non-success
+/// answer, so the caller stops instead of ringing forever (spec 123069: write
+/// shall fail when the user lacks the appropriate privileges; talk likewise).
+fn check_announce_answer(res: &CtlRes) -> Result<(), TalkError> {
+    match res.answer {
+        Answer::Success => Ok(()),
+        Answer::NotHere => Err(TalkError::Other(gettext(
+            "the addressed user is not logged on",
+        ))),
+        Answer::PermissionDenied => Err(TalkError::Other(gettext(
+            "the addressed user's terminal does not permit messages",
+        ))),
+        ref other => Err(TalkError::Other(format!(
+            "{}: {:?}",
+            gettext("the talk daemon refused the request"),
+            other
+        ))),
+    }
 }
 
 /// Sends a delete request (`CtlMsg`) to the talk daemon over a UDP socket and waits for a response.
@@ -1639,7 +1691,8 @@ fn leave_invite_local(
 
 /// Sends an Announce message to the local talkd daemon via Unix socket.
 fn announce_local(socket_path: &Path, msg: &mut CtlMsg, res: &mut CtlRes) -> Result<(), TalkError> {
-    request_local(socket_path, msg, MessageType::Announce, res)
+    request_local(socket_path, msg, MessageType::Announce, res)?;
+    check_announce_answer(res)
 }
 
 /// Sends a Delete message to the local talkd daemon via Unix socket.
@@ -1838,19 +1891,28 @@ pub fn register_signals() {
 ///
 /// Logs an error message if sending or receiving messages fails.
 pub fn handle_signals(signal_code: libc::c_int) {
-    // Clear the terminal screen
+    // Restore the terminal (we may be in raw mode) and clear the screen.
+    restore_terminal();
     clear_terminal();
     eprintln!("Connection closed, exiting...");
 
     // Lock the DELETE_INVITATIONS mutex and check for an existing invitation
-    if let Some(state) = DELETE_INVITATIONS.lock().unwrap().as_ref() {
-        // Handle the deletion of invitations
-        handle_delete_invitations(&state.socket, &state.msg_bytes1, &state.talkd_addr);
-        handle_delete_invitations(&state.socket, &state.msg_bytes2, &state.talkd_addr);
+    if let Ok(guard) = DELETE_INVITATIONS.lock() {
+        if let Some(state) = guard.as_ref() {
+            // Handle the deletion of invitations
+            handle_delete_invitations(&state.socket, &state.msg_bytes1, &state.talkd_addr);
+            handle_delete_invitations(&state.socket, &state.msg_bytes2, &state.talkd_addr);
+        }
     }
 
-    // Exit the process with a code indicating the signal received
-    std::process::exit(128 + signal_code);
+    // POSIX: a SIGINT shall terminate talk with a zero exit status. Other
+    // trapped signals use the conventional 128+signal status.
+    let code = if signal_code == SIGINT {
+        0
+    } else {
+        128 + signal_code
+    };
+    std::process::exit(code);
 }
 
 /// Clears the terminal screen by sending escape sequences.
@@ -1908,10 +1970,13 @@ fn handle_delete_invitations(socket: &UdpSocket, msg_bytes: &[u8], talkd_addr: &
 /// This function prints a message indicating that the connection is closed,
 /// clears the terminal, and terminates the process with exit code `3`.
 fn handle_connection_close() {
+    // The peer closed the connection: restore the terminal, clear the screen,
+    // and exit cleanly (the conversation ended normally).
+    restore_terminal();
     clear_terminal();
     io::stdout().flush().ok();
     eprintln!("Connection closed, exiting...");
-    process::exit(130);
+    process::exit(0);
 }
 
 /// Retrieves the terminal size (width and height in characters) via an `ioctl` system call.
@@ -1938,9 +2003,7 @@ fn get_terminal_size() -> (u16, u16) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    plib::diag::init_locale("talk");
 
     let args = Args::try_parse().unwrap_or_else(|err| {
         if err.kind() == ErrorKind::DisplayHelp || err.kind() == ErrorKind::DisplayVersion {
@@ -1967,7 +2030,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Err(err) = result {
         exit_code = 1;
-        eprint!("{}", err);
+        plib::diag::error(&err.to_string());
     }
 
     process::exit(exit_code)

@@ -8,7 +8,7 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use plib::group;
 use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
@@ -97,8 +97,13 @@ fn userinfo_process(userinfo: &mut UserInfo) -> Result<(), String> {
     userinfo.egid = unsafe { libc::getegid() };
 
     // Get username for real uid
-    userinfo.username = get_username(userinfo.uid)
-        .ok_or_else(|| format!("id: cannot find name for user ID {}", userinfo.uid))?;
+    userinfo.username = get_username(userinfo.uid).ok_or_else(|| {
+        format!(
+            "{} {}",
+            gettext("cannot find name for user ID"),
+            userinfo.uid
+        )
+    })?;
 
     // Get username for effective uid (may be same as real)
     userinfo.eusername = if userinfo.euid == userinfo.uid {
@@ -114,10 +119,11 @@ fn userinfo_process(userinfo: &mut UserInfo) -> Result<(), String> {
 }
 
 fn userinfo_name(userinfo: &mut UserInfo, user: &str) -> Result<(), String> {
-    let user_str = std::ffi::CString::new(user).map_err(|_| "invalid username".to_string())?;
+    let user_str =
+        std::ffi::CString::new(user).map_err(|_| gettext("invalid username").to_string())?;
     let passwd = unsafe { libc::getpwnam(user_str.as_ptr()) };
     if passwd.is_null() {
-        return Err(format!("id: {}: no such user", user));
+        return Err(format!("{}: {}", user, gettext("no such user")));
     }
 
     unsafe {
@@ -200,12 +206,19 @@ fn get_group_info(userinfo: &mut UserInfo, is_named_user: bool) {
 
         userinfo.groups = user_groups;
     } else {
-        // For current process, groups are already set from getgroups()
-        // Just need to look up names and deduplicate
-        let mut unique_groups = Vec::new();
+        // For the current process, the -G / default group set is the
+        // deduplicated union {gid, egid} ∪ getgroups(), per POSIX: -G outputs
+        // "effective, real, and supplementary group IDs". Order: real (primary)
+        // gid first, then the effective gid when distinct, then supplementary
+        // groups from getgroups(). seen_gids already holds gid and egid (seeded
+        // above), so the supplementary loop will not duplicate them.
+        let mut unique_groups = vec![userinfo.gid];
 
-        // Ensure primary group is first
-        unique_groups.push(userinfo.gid);
+        // Effective group next, when distinct from the real (primary) group.
+        // Without this, an egid absent from getgroups() was silently dropped.
+        if userinfo.egid != userinfo.gid {
+            unique_groups.push(userinfo.egid);
+        }
 
         for &gid in &userinfo.groups {
             if !seen_gids.contains(&gid) {
@@ -325,6 +338,8 @@ fn display_user_info(args: &Args, userinfo: &UserInfo) -> io::Result<()> {
         write!(out, " egid={}", userinfo.egid)?;
         if let Some(name) = userinfo.group_names.get(&userinfo.egid) {
             write!(out, "({})", name)?;
+        } else if let Some(name) = get_groupname(userinfo.egid) {
+            write!(out, "({})", name)?;
         }
     }
 
@@ -350,16 +365,14 @@ fn display_user_info(args: &Args, userinfo: &UserInfo) -> io::Result<()> {
 }
 
 fn main() -> ExitCode {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs").ok();
-    bind_textdomain_codeset("posixutils-rs", "UTF-8").ok();
+    plib::diag::init_locale("id");
 
     let args = Args::parse();
 
     let mut userinfo = match get_user_info(&args) {
         Ok(info) => info,
         Err(e) => {
-            eprintln!("{}", e);
+            plib::diag::error(&e);
             return ExitCode::from(1);
         }
     };
@@ -367,7 +380,7 @@ fn main() -> ExitCode {
     get_group_info(&mut userinfo, args.user.is_some());
 
     if let Err(e) = display_user_info(&args, &userinfo) {
-        eprintln!("id: write error: {}", e);
+        plib::diag::error(&format!("{}: {}", gettext("write error"), e));
         return ExitCode::from(1);
     }
 

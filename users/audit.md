@@ -98,12 +98,12 @@ crashes or hangs.
 (none)
 
 #### Major
-- [ ] **#I1 — `-G` for the current process can omit the effective group ID.** `users/id.rs:172-177,202-221`. In `get_group_info` egid is added to `seen_gids` (line 176) before the supplementary loop; the non-named branch builds `unique_groups` from `gid` + `getgroups()`, skipping anything in `seen_gids`, so an egid that differs from gid and is absent from `getgroups()` never reaches the `-G`/default `groups=` list. Spec (100623-100625) requires `-G` to output effective, real, and supplementary IDs. Fix: after seeding gid, explicitly push egid into `unique_groups` (when distinct).
-- [ ] **#I2 — `-G`/default group set is built from real gid only, egid filtered.** `users/id.rs:161-221,304-346`. The `-G` set is seeded only with `userinfo.gid` (real); egid is filtered via `seen_gids` (see #I1). A process whose real and effective gids both differ from its supplementary set prints an incomplete `-G`. Fix: build the `-G` set as the dedup union {gid, egid} ∪ getgroups(), effective-first.
+- [x] **#I1 — `-G` for the current process can omit the effective group ID.** ✓ fixed (phase 1) — current-process branch now builds {gid, egid} ∪ getgroups() with egid pushed explicitly. `users/id.rs:172-177,202-221`. In `get_group_info` egid is added to `seen_gids` (line 176) before the supplementary loop; the non-named branch builds `unique_groups` from `gid` + `getgroups()`, skipping anything in `seen_gids`, so an egid that differs from gid and is absent from `getgroups()` never reaches the `-G`/default `groups=` list. Spec (100623-100625) requires `-G` to output effective, real, and supplementary IDs. Fix: after seeding gid, explicitly push egid into `unique_groups` (when distinct).
+- [x] **#I2 — `-G`/default group set is built from real gid only, egid filtered.** ✓ fixed (phase 1) — bundled with #I1; egid now always included when distinct. `users/id.rs:161-221,304-346`. The `-G` set is seeded only with `userinfo.gid` (real); egid is filtered via `seen_gids` (see #I1). A process whose real and effective gids both differ from its supplementary set prints an incomplete `-G`. Fix: build the `-G` set as the dedup union {gid, egid} ∪ getgroups(), effective-first.
 
 #### Minor
-- [ ] **#I3 — Diagnostics not localized despite gettext setup.** `users/id.rs:101,120,362,370`. `main()` calls `setlocale`/`textdomain` (353-355) but error strings are plain format strings, not `gettext()`-wrapped, so `LC_MESSAGES` cannot affect them. Fix: wrap user-facing messages in `gettext()`.
-- [ ] **#I4 — `egid=` name lookup in default output ignores live `getgrgid` fallback.** `users/id.rs:323-329`. The `egid=` branch only consults the cached `group_names` and never falls back to `get_groupname()`, unlike the `-g` path (263). Fix: mirror the `-g` fallback.
+- [x] **#I3 — Diagnostics not localized despite gettext setup.** ✓ fixed (phase 1) — migrated to `plib::diag::{init_locale, error}`; messages wrapped in `gettext()`. `users/id.rs:101,120,362,370`.
+- [x] **#I4 — `egid=` name lookup in default output ignores live `getgrgid` fallback.** ✓ fixed (phase 1) — `egid=` branch now falls back to `get_groupname()` like the `-g` path. `users/id.rs:323-329`.
 - [ ] **#I5 — Named-user "omit `(%s)`" comments slightly misleading; output conforms.** `users/id.rs:104-108,242,266,291`. Behavior is correct (omits the name when unmappable per spec); documentation-only.
 - [ ] **#I6 — Single-operand surface; extras rejected by clap (exit 2).** `users/id.rs:37-38`. Spec SYNOPSIS allows only `[user]`; clap exits 2 on extras (acceptable, `>0`). Noted for completeness, no change needed.
 
@@ -113,7 +113,7 @@ crashes or hangs.
 
 | Option | Spec | Status | Notes (file:line) |
 |---|---|---|---|
-| `-G` | 100623 | PARTIAL | Space-separated, primary first; may drop egid/real gid. id.rs:276-299 (#I1/#I2) |
+| `-G` | 100623 | CONFORMS ✓ | Space-separated, primary first; egid+real always included (fixed #I1/#I2, phase 1). id.rs:276-299 |
 | `-g` | 100626 | CONFORMS | Effective gid; `-r`→real, `-n`→name w/ numeric fallback. id.rs:254-273 |
 | `-u` | 100630 | CONFORMS | Effective uid; `-r`→real, `-n`→name. id.rs:229-251 |
 | `-n` | 100627 | CONFORMS | Modifier on `-G`/`-g`/`-u`; ignored alone. id.rs:34-35 |
@@ -131,7 +131,7 @@ crashes or hangs.
 | Var | Status | Notes |
 |---|---|---|
 | `LANG`/`LC_ALL`/`LC_CTYPE` | CONFORMS | `setlocale(LcAll,"")` id.rs:353 |
-| `LC_MESSAGES` | PARTIAL | Locale set, diagnostics not `gettext()`-wrapped (#I3) |
+| `LC_MESSAGES` | CONFORMS ✓ | `plib::diag` + `gettext()`-wrapped diagnostics (fixed #I3, phase 1); inert only until `.mo` catalogs ship (tree-wide) |
 | `NLSPATH` (XSI) | N/A | gettextrs stub-backed |
 
 #### Asynchronous events
@@ -140,8 +140,8 @@ crashes or hangs.
 #### STDOUT / STDERR
 - [x] Default format `uid=%u(%s) gid=%u(%s)` — id.rs:304-313. CONFORMS.
 - [x] `euid=` inserted only when euid≠uid — id.rs:316-321. CONFORMS.
-- [ ] `egid=` inserted only when egid≠gid — id.rs:324-329, name fallback gap (#I4). PARTIAL.
-- [ ] `groups=` list format conforms but membership set may be incomplete (#I1/#I2). PARTIAL.
+- [x] `egid=` inserted only when egid≠gid — id.rs:324-329, name fallback added (fixed #I4, phase 1). CONFORMS.
+- [x] `groups=` list — membership set now {gid,egid}∪getgroups() (fixed #I1/#I2, phase 1). CONFORMS.
 - [x] Omit `(%s)` when name unmappable — id.rs:305,311,318,326,342. CONFORMS.
 - [x] STDERR for diagnostics only — id.rs:362,370. CONFORMS.
 

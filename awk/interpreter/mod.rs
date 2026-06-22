@@ -269,7 +269,7 @@ impl Interpreter {
         match function {
             BuiltinFunction::Match => {
                 let (start, len) = builtin_match(stack, global_env)?;
-                // borrowing `self.globas` mutably here breaks the stacked borrows rules
+                // borrowing `self.globals` mutably here breaks the stacked borrows rules
                 // so we have to use unsafe code to get around that
                 unsafe {
                     *self.globals[SpecialVar::Rstart as usize].get() = start.into();

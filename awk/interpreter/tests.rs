@@ -1042,11 +1042,11 @@ fn test_builtin_match() {
     assert_eq!(result.execution_result.unwrap_expr(), AwkValue::from(6.0));
     assert_eq!(
         result.globals[SpecialVar::Rstart as usize],
-        AwkValue::from(6.0)
+        AwkValue::from(6.0).into_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Rstart))
     );
     assert_eq!(
         result.globals[SpecialVar::Rlength as usize],
-        AwkValue::from(4.0)
+        AwkValue::from(4.0).into_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Rlength))
     );
 }
 

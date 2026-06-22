@@ -13,7 +13,7 @@ use std::fmt::Write;
 use super::format::{
     fmt_write_decimal_float, fmt_write_float_general, fmt_write_hex_float,
     fmt_write_scientific_float, fmt_write_signed, fmt_write_string, fmt_write_unsigned,
-    parse_conversion_specifier_args, IntegerFormat,
+    parse_conversion_specifier_args, FormatArgs, IntegerFormat,
 };
 use super::record::{split_record, FieldSeparator, FieldsState};
 use super::stack::Stack;
@@ -68,65 +68,7 @@ pub(crate) fn sprintf(
                 }
                 current_arg -= 1;
                 let value = swap_with_default(&mut values[current_arg]);
-                match specifier {
-                    'd' | 'i' => {
-                        let value = value.scalar_as_f64() as i64;
-                        fmt_write_signed(&mut result, value, &args);
-                    }
-                    'u' | 'o' | 'x' | 'X' => {
-                        let value = value.scalar_as_f64() as i64;
-                        if value.is_negative() {
-                            return Err("negative value for unsigned format specifier".to_string());
-                        }
-                        let format = match specifier {
-                            'u' => IntegerFormat::Decimal,
-                            'o' => IntegerFormat::Octal,
-                            'x' => IntegerFormat::HexLower,
-                            'X' => IntegerFormat::HexUpper,
-                            _ => unreachable!(),
-                        };
-                        fmt_write_unsigned(&mut result, value as u64, format, &args);
-                    }
-                    'a' | 'A' => {
-                        let value = value.scalar_as_f64();
-                        fmt_write_hex_float(&mut result, value, specifier == 'a', &args);
-                    }
-                    'f' | 'F' => {
-                        let value = value.scalar_as_f64();
-                        fmt_write_decimal_float(&mut result, value, specifier == 'f', &args);
-                    }
-                    'e' | 'E' => {
-                        let value = value.scalar_as_f64();
-                        fmt_write_scientific_float(&mut result, value, specifier == 'e', &args);
-                    }
-                    'g' | 'G' => {
-                        let value = value.scalar_as_f64();
-                        fmt_write_float_general(&mut result, value, specifier == 'g', &args);
-                    }
-                    'c' => {
-                        let ch = match &value.value {
-                            AwkValueVariant::Number(n) => char::from_u32(*n as u32).unwrap_or('\0'),
-                            AwkValueVariant::String(s) if s.is_numeric => {
-                                let code = value.scalar_as_f64() as u32;
-                                char::from_u32(code).unwrap_or('\0')
-                            }
-                            AwkValueVariant::String(s) if !s.is_empty() => {
-                                s.chars().next().unwrap()
-                            }
-                            _ => {
-                                let code = value.scalar_as_f64() as u32;
-                                char::from_u32(code).unwrap_or('\0')
-                            }
-                        };
-                        let ch_str = ch.to_string();
-                        fmt_write_string(&mut result, &ch_str, &args);
-                    }
-                    's' => {
-                        let value = value.scalar_to_string(float_format)?;
-                        fmt_write_string(&mut result, &value, &args);
-                    }
-                    _ => return Err(format!("unsupported format specifier '{}'", specifier)),
-                }
+                format_one_conversion(&mut result, specifier, value, &args, float_format)?;
                 next = iter.next();
             }
             other => {
@@ -136,6 +78,75 @@ pub(crate) fn sprintf(
         }
     }
     Ok(result.into())
+}
+
+/// Format a single `%` conversion (`specifier` with `args`, using the
+/// already-fetched argument `value`) and append it to `result`.
+fn format_one_conversion(
+    result: &mut String,
+    specifier: char,
+    value: AwkValue,
+    args: &FormatArgs,
+    float_format: &str,
+) -> Result<(), String> {
+    match specifier {
+        'd' | 'i' => {
+            let value = value.scalar_as_f64() as i64;
+            fmt_write_signed(result, value, args);
+        }
+        'u' | 'o' | 'x' | 'X' => {
+            let value = value.scalar_as_f64() as i64;
+            if value.is_negative() {
+                return Err("negative value for unsigned format specifier".to_string());
+            }
+            let format = match specifier {
+                'u' => IntegerFormat::Decimal,
+                'o' => IntegerFormat::Octal,
+                'x' => IntegerFormat::HexLower,
+                'X' => IntegerFormat::HexUpper,
+                _ => unreachable!(),
+            };
+            fmt_write_unsigned(result, value as u64, format, args);
+        }
+        'a' | 'A' => {
+            let value = value.scalar_as_f64();
+            fmt_write_hex_float(result, value, specifier == 'a', args);
+        }
+        'f' | 'F' => {
+            let value = value.scalar_as_f64();
+            fmt_write_decimal_float(result, value, specifier == 'f', args);
+        }
+        'e' | 'E' => {
+            let value = value.scalar_as_f64();
+            fmt_write_scientific_float(result, value, specifier == 'e', args);
+        }
+        'g' | 'G' => {
+            let value = value.scalar_as_f64();
+            fmt_write_float_general(result, value, specifier == 'g', args);
+        }
+        'c' => {
+            let ch = match &value.value {
+                AwkValueVariant::Number(n) => char::from_u32(*n as u32).unwrap_or('\0'),
+                AwkValueVariant::String(s) if s.is_numeric => {
+                    let code = value.scalar_as_f64() as u32;
+                    char::from_u32(code).unwrap_or('\0')
+                }
+                AwkValueVariant::String(s) if !s.is_empty() => s.chars().next().unwrap(),
+                _ => {
+                    let code = value.scalar_as_f64() as u32;
+                    char::from_u32(code).unwrap_or('\0')
+                }
+            };
+            let ch_str = ch.to_string();
+            fmt_write_string(result, &ch_str, args);
+        }
+        's' => {
+            let value = value.scalar_to_string(float_format)?;
+            fmt_write_string(result, &value, args);
+        }
+        _ => return Err(format!("unsupported format specifier '{}'", specifier)),
+    }
+    Ok(())
 }
 
 pub(crate) fn builtin_sprintf(
@@ -155,6 +166,24 @@ pub(crate) fn builtin_sprintf(
 /// characters, while the regex engine and `str` searches report byte offsets.
 pub(crate) fn byte_offset_to_char_count(s: &str, byte: usize) -> usize {
     s.char_indices().take_while(|&(i, _)| i < byte).count()
+}
+
+/// `substr(s, m[, n])`: the at most `n`-character substring of `s` that begins
+/// at character position `m` (numbering from 1). Positions below 1 still consume
+/// part of `n`, matching nawk/gawk, so e.g. `substr("hello", -1, 3) == "h"`.
+/// `m` and `n` are assumed already truncated toward zero by the caller. The
+/// character window is `[max(m, 1), m + n)`; `take` naturally stops at the end
+/// of the string, so no length pre-scan or `Vec` is needed.
+pub(crate) fn substr(s: &str, m: i64, n: Option<i64>) -> String {
+    let start = m.max(1);
+    let count = match n {
+        None => usize::MAX,
+        Some(n) => m.saturating_add(n).saturating_sub(start).max(0) as usize,
+    };
+    // `start >= 1`; a start past `usize::MAX` (only possible on a 32-bit `usize`)
+    // skips the whole string, yielding the empty substring.
+    let skip = usize::try_from(start - 1).unwrap_or(usize::MAX);
+    s.chars().skip(skip).take(count).collect()
 }
 
 pub(crate) fn builtin_match(
@@ -235,6 +264,44 @@ pub(crate) fn gsub(
     }
     result.push_str(&in_str[last_match_end..]);
     Ok((result.into(), num_replacements))
+}
+
+/// `split(s, arr[, fs])`: split `s` into `arr` on the field separator (the
+/// optional third argument, else `FS`) and return the number of fields. When the
+/// `fs` argument is a regex value it is used directly; otherwise it is
+/// interpreted like `FS` (e.g. `" "` means whitespace).
+pub(crate) fn builtin_split(
+    stack: &mut Stack,
+    global_env: &mut GlobalEnv,
+    argc: u16,
+) -> Result<FieldsState, String> {
+    let separator = if argc == 2 {
+        None
+    } else {
+        let sep_val = stack.pop_value();
+        if matches!(&sep_val.value, AwkValueVariant::Regex { .. }) {
+            Some(FieldSeparator::Ere(sep_val.into_ere()?))
+        } else {
+            let sep_str = sep_val.scalar_to_string(&global_env.convfmt)?;
+            Some(FieldSeparator::try_from(sep_str)?)
+        }
+    };
+    let s = stack
+        .pop_scalar_value()?
+        .scalar_to_string(&global_env.convfmt)?;
+    let array = stack.pop_ref().as_array()?;
+    array.clear();
+
+    if !s.is_empty() {
+        split_record(
+            s,
+            separator.iter().next().unwrap_or(&global_env.fs),
+            |i, s| array.set((i + 1).to_string(), s).map(|_| ()),
+        )?;
+    }
+    let n = array.len();
+    stack.push_value(n as f64)?;
+    Ok(FieldsState::Ok)
 }
 
 pub(crate) fn builtin_gsub(
@@ -324,43 +391,12 @@ pub(crate) fn call_simple_builtin(
                 }
             }
         }
-        BuiltinFunction::Split => {
-            let separator = if argc == 2 {
-                None
-            } else {
-                let sep_val = stack.pop_value();
-                if matches!(&sep_val.value, AwkValueVariant::Regex { .. }) {
-                    Some(FieldSeparator::Ere(sep_val.into_ere()?))
-                } else {
-                    let sep_str = sep_val.scalar_to_string(&global_env.convfmt)?;
-                    Some(FieldSeparator::try_from(sep_str)?)
-                }
-            };
-            let s = stack
-                .pop_scalar_value()?
-                .scalar_to_string(&global_env.convfmt)?;
-            let array = stack.pop_ref().as_array()?;
-            array.clear();
-
-            if !s.is_empty() {
-                split_record(
-                    s,
-                    separator.iter().next().unwrap_or(&global_env.fs),
-                    |i, s| array.set((i + 1).to_string(), s).map(|_| ()),
-                )?;
-            }
-            let n = array.len();
-            stack.push_value(n as f64)?;
-        }
+        BuiltinFunction::Split => return builtin_split(stack, global_env, argc),
         BuiltinFunction::Sprintf => {
             let str = builtin_sprintf(stack, argc, global_env)?;
             stack.push_value(str)?;
         }
         BuiltinFunction::Substr => {
-            // substr(s, m[, n]): the at most n-character substring of s that
-            // begins at character position m (numbering from 1). Positions below
-            // 1 still consume part of n, matching nawk/gawk, so e.g.
-            // substr("hello", -1, 3) == "h". m and n truncate toward zero.
             let n = if argc == 2 {
                 None
             } else {
@@ -370,15 +406,7 @@ pub(crate) fn call_simple_builtin(
             let s = stack
                 .pop_scalar_value()?
                 .scalar_to_string(&global_env.convfmt)?;
-            // Character window is [max(m, 1), m + n); `take` naturally stops at
-            // the end of the string, so no length pre-scan or Vec is needed.
-            let start = m.max(1);
-            let count = match n {
-                None => usize::MAX,
-                Some(n) => m.saturating_add(n).saturating_sub(start).max(0) as usize,
-            };
-            let substr: String = s.chars().skip((start - 1) as usize).take(count).collect();
-            stack.push_value(substr)?;
+            stack.push_value(substr(s.as_str(), m, n))?;
         }
         BuiltinFunction::ToLower => {
             // POSIX: case mapping follows the LC_CTYPE category of the locale.
@@ -403,17 +431,7 @@ pub(crate) fn call_simple_builtin(
                 .pop_scalar_value()?
                 .scalar_to_string(&global_env.convfmt)?
                 .try_into()?;
-            let status = unsafe { libc::system(command.as_ptr()) };
-            let exit_code: i32 = if status == -1 {
-                -1
-            } else if libc::WIFEXITED(status) {
-                libc::WEXITSTATUS(status)
-            } else if libc::WIFSIGNALED(status) {
-                128 + libc::WTERMSIG(status)
-            } else {
-                -1
-            };
-            stack.push_value(exit_code as f64)?;
+            stack.push_value(run_system(&command) as f64)?;
         }
         BuiltinFunction::Print => {
             print!("{}", print_to_string(stack, argc, global_env)?);
@@ -424,6 +442,22 @@ pub(crate) fn call_simple_builtin(
         _ => unreachable!("call_simple_builtin was passed an invalid builtin function kind"),
     }
     Ok(FieldsState::Ok)
+}
+
+/// Run `command` via `libc::system` and translate its wait-status into the value
+/// awk's `system()` returns: the exit code for a normal exit, `128 + signal` for
+/// a signalled child, or -1 when the command could not be run.
+fn run_system(command: &CString) -> i32 {
+    let status = unsafe { libc::system(command.as_ptr()) };
+    if status == -1 {
+        -1
+    } else if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else if libc::WIFSIGNALED(status) {
+        128 + libc::WTERMSIG(status)
+    } else {
+        -1
+    }
 }
 
 pub(crate) fn gather_values(stack: &mut Stack, count: u16) -> Result<Vec<AwkValue>, String> {

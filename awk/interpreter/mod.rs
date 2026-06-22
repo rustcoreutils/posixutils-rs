@@ -217,6 +217,185 @@ fn stack_trace(error: String, stack: Stack) -> String {
 }
 
 impl Interpreter {
+    /// Close `name` in every I/O table (a name may have been opened for both
+    /// reading and writing). POSIX: close shall return 0 if the close was
+    /// successful and non-zero otherwise (e.g. the name was not open). Surface
+    /// any error status, else 0, else -1 when nothing matched.
+    fn close_streams(&mut self, name: &str) -> i32 {
+        let results = [
+            self.write_files.close_file(name),
+            self.read_files.close_file(name),
+            self.write_pipes.close_pipe(name),
+            self.read_pipes.close_pipe(name),
+        ];
+        if results.iter().all(Option::is_none) {
+            -1
+        } else {
+            results
+                .iter()
+                .flatten()
+                .copied()
+                .find(|&s| s != 0)
+                .unwrap_or(0)
+        }
+    }
+
+    /// Increment a special counter global (NR or FNR) by one, keeping its
+    /// `AwkValue` and the cached `global_env` copy in sync via `assign`.
+    /// Borrowing a global mutably while `global_env` is also borrowed mutably
+    /// breaks the stacked-borrows rules, so the cell is reached via a raw pointer.
+    fn bump_counter(&mut self, var: SpecialVar, global_env: &mut GlobalEnv) -> Result<(), String> {
+        let ptr = self.globals[var as usize].get();
+        let next = unsafe { (*ptr).scalar_as_f64() } + 1.0;
+        unsafe { &mut *ptr }.assign(next, global_env)?;
+        Ok(())
+    }
+
+    /// Execute a `CallBuiltin` opcode: dispatch to the I/O, getline, and other
+    /// builtins that need interpreter state (`self`), the current input file, or
+    /// the operand stack. Returns the resulting [`FieldsState`] so the caller can
+    /// recompute `$0`/fields when a getline assignment changed them; builtins
+    /// that don't touch fields return [`FieldsState::Ok`]. Builtins that need
+    /// none of this state are delegated to [`call_simple_builtin`].
+    fn call_builtin<'a>(
+        &mut self,
+        function: BuiltinFunction,
+        argc: u16,
+        stack: &mut Stack<'a, 'a>,
+        global_env: &mut GlobalEnv,
+        current_file: &mut dyn RecordReader,
+    ) -> Result<FieldsState, String> {
+        let mut fields_state = FieldsState::Ok;
+        match function {
+            BuiltinFunction::Match => {
+                let (start, len) = builtin_match(stack, global_env)?;
+                // borrowing `self.globas` mutably here breaks the stacked borrows rules
+                // so we have to use unsafe code to get around that
+                unsafe {
+                    *self.globals[SpecialVar::Rstart as usize].get() = start.into();
+                    *self.globals[SpecialVar::Rlength as usize].get() = len.into();
+                }
+            }
+            BuiltinFunction::RedirectedPrintfTruncate
+            | BuiltinFunction::RedirectedPrintfAppend
+            | BuiltinFunction::RedirectedPrintTruncate
+            | BuiltinFunction::RedirectedPrintAppend => {
+                let filename = stack
+                    .pop_scalar_value()?
+                    .scalar_to_string(&global_env.convfmt)?;
+                let is_printf = matches!(
+                    function,
+                    BuiltinFunction::RedirectedPrintfTruncate
+                        | BuiltinFunction::RedirectedPrintfAppend
+                );
+                let str = if is_printf {
+                    builtin_sprintf(stack, argc - 1, global_env)?
+                } else {
+                    print_to_string(stack, argc - 1, global_env)?
+                };
+                let is_append = matches!(
+                    function,
+                    BuiltinFunction::RedirectedPrintfAppend
+                        | BuiltinFunction::RedirectedPrintAppend
+                );
+                self.write_files.write(&filename, &str, is_append)?;
+            }
+            BuiltinFunction::RedirectedPrintPipe | BuiltinFunction::RedirectedPrintfPipe => {
+                let command = stack
+                    .pop_scalar_value()?
+                    .scalar_to_string(&global_env.convfmt)?;
+                let str = if function == BuiltinFunction::RedirectedPrintPipe {
+                    print_to_string(stack, argc - 1, global_env)?
+                } else {
+                    builtin_sprintf(stack, argc - 1, global_env)?
+                };
+                self.write_pipes.write(command, str)?;
+            }
+            BuiltinFunction::Close => {
+                let filename = stack
+                    .pop_scalar_value()?
+                    .scalar_to_string(&global_env.convfmt)?;
+                stack.push_value(self.close_streams(&filename) as f64)?;
+            }
+            BuiltinFunction::FFlush => {
+                let expr_str = if argc == 1 {
+                    stack
+                        .pop_scalar_value()?
+                        .scalar_to_string(&global_env.convfmt)?
+                } else {
+                    AwkString::default()
+                };
+                let result = if expr_str.is_empty() {
+                    let stdout_ok = std::io::Write::flush(&mut std::io::stdout()).is_ok();
+                    stdout_ok && self.write_files.flush_all() && self.write_pipes.flush_all()
+                } else {
+                    self.write_files.flush_file(&expr_str) && self.write_pipes.flush_file(&expr_str)
+                };
+                stack.push_value(if result { 0.0 } else { -1.0 })?;
+            }
+            BuiltinFunction::GetLine => {
+                let var = stack.pop_ref();
+                if let Some(next_record) = current_file.read_next_record(&global_env.rs)? {
+                    fields_state = var.assign(maybe_numeric_string(next_record), global_env)?;
+                    // `getline` (from the main input) advances both NR and FNR.
+                    self.bump_counter(SpecialVar::Nr, global_env)?;
+                    self.bump_counter(SpecialVar::Fnr, global_env)?;
+                    stack.push_value(1.0)?;
+                } else {
+                    stack.push_value(0.0)?;
+                }
+            }
+            BuiltinFunction::GetLineFromFile | BuiltinFunction::GetLineFromPipe => {
+                let filename = stack
+                    .pop_scalar_value()?
+                    .scalar_to_string(&global_env.convfmt)?;
+                let var = stack.pop_ref();
+                let maybe_next_record = if function == BuiltinFunction::GetLineFromFile {
+                    self.read_files.read_next_record(filename, &global_env.rs)
+                } else {
+                    self.read_pipes.read_next_record(filename, &global_env.rs)
+                };
+                match maybe_next_record {
+                    Ok(Some(next_record)) => {
+                        fields_state = var.assign(maybe_numeric_string(next_record), global_env)?;
+                        // `cmd | getline` advances NR (but not FNR), like
+                        // historical awk; `getline < file` touches neither.
+                        if function == BuiltinFunction::GetLineFromPipe {
+                            self.bump_counter(SpecialVar::Nr, global_env)?;
+                        }
+                        stack.push_value(1.0)?;
+                    }
+                    Ok(None) => {
+                        stack.push_value(0.0)?;
+                    }
+                    Err(_) => {
+                        // Per POSIX, getline returns -1 on error
+                        stack.push_value(-1.0)?;
+                    }
+                }
+            }
+            BuiltinFunction::Rand => {
+                let rand = self.rng.gen_range(0.0..1.0);
+                stack.push_value(rand)?;
+            }
+            BuiltinFunction::Srand => {
+                let seed = if argc == 1 {
+                    stack.pop_scalar_value()?.scalar_as_f64() as u64
+                } else {
+                    SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .expect("time went backwards")
+                        .as_secs()
+                };
+                stack.push_value(self.rand_seed as f64)?;
+                self.rand_seed = seed;
+                self.rng = SmallRng::seed_from_u64(self.rand_seed);
+            }
+            other => fields_state = call_simple_builtin(other, argc, stack, global_env)?,
+        }
+        Ok(fields_state)
+    }
+
     fn run(
         &mut self,
         action: &Action,
@@ -505,166 +684,10 @@ impl Interpreter {
                     stack.call_function(&functions[id as usize]);
                     ip_increment = 0;
                 }
-                OpCode::CallBuiltin { function, argc } => match function {
-                    BuiltinFunction::Match => {
-                        let (start, len) = builtin_match(stack, global_env)?;
-                        // borrowing `self.globas` mutably here breaks the stacked borrows rules
-                        // so we have to use unsafe code to get around that
-                        unsafe {
-                            *self.globals[SpecialVar::Rstart as usize].get() = start.into();
-                            *self.globals[SpecialVar::Rlength as usize].get() = len.into();
-                        }
-                    }
-                    BuiltinFunction::RedirectedPrintfTruncate
-                    | BuiltinFunction::RedirectedPrintfAppend
-                    | BuiltinFunction::RedirectedPrintTruncate
-                    | BuiltinFunction::RedirectedPrintAppend => {
-                        let filename = stack
-                            .pop_scalar_value()?
-                            .scalar_to_string(&global_env.convfmt)?;
-                        let is_printf = matches!(
-                            function,
-                            BuiltinFunction::RedirectedPrintfTruncate
-                                | BuiltinFunction::RedirectedPrintfAppend
-                        );
-                        let str = if is_printf {
-                            builtin_sprintf(stack, argc - 1, global_env)?
-                        } else {
-                            print_to_string(stack, argc - 1, global_env)?
-                        };
-                        let is_append = matches!(
-                            function,
-                            BuiltinFunction::RedirectedPrintfAppend
-                                | BuiltinFunction::RedirectedPrintAppend
-                        );
-                        self.write_files.write(&filename, &str, is_append)?;
-                    }
-                    BuiltinFunction::RedirectedPrintPipe
-                    | BuiltinFunction::RedirectedPrintfPipe => {
-                        let command = stack
-                            .pop_scalar_value()?
-                            .scalar_to_string(&global_env.convfmt)?;
-                        let str = if function == BuiltinFunction::RedirectedPrintPipe {
-                            print_to_string(stack, argc - 1, global_env)?
-                        } else {
-                            builtin_sprintf(stack, argc - 1, global_env)?
-                        };
-                        self.write_pipes.write(command, str)?;
-                    }
-                    BuiltinFunction::Close => {
-                        let filename = stack
-                            .pop_scalar_value()?
-                            .scalar_to_string(&global_env.convfmt)?;
-                        // A name may have been opened for both reading and
-                        // writing, so close it in every table.
-                        let results = [
-                            self.write_files.close_file(&filename),
-                            self.read_files.close_file(&filename),
-                            self.write_pipes.close_pipe(&filename),
-                            self.read_pipes.close_pipe(&filename),
-                        ];
-                        // POSIX: close shall return 0 if the close was
-                        // successful and non-zero otherwise (e.g. the name was
-                        // not open). Surface any error status, else 0, else -1
-                        // when nothing matched.
-                        let status = if results.iter().all(Option::is_none) {
-                            -1
-                        } else {
-                            results
-                                .iter()
-                                .flatten()
-                                .copied()
-                                .find(|&s| s != 0)
-                                .unwrap_or(0)
-                        };
-                        stack.push_value(status as f64)?;
-                    }
-                    BuiltinFunction::FFlush => {
-                        let expr_str = if argc == 1 {
-                            stack
-                                .pop_scalar_value()?
-                                .scalar_to_string(&global_env.convfmt)?
-                        } else {
-                            AwkString::default()
-                        };
-                        let result = if expr_str.is_empty() {
-                            let stdout_ok = std::io::Write::flush(&mut std::io::stdout()).is_ok();
-                            stdout_ok
-                                && self.write_files.flush_all()
-                                && self.write_pipes.flush_all()
-                        } else {
-                            self.write_files.flush_file(&expr_str)
-                                && self.write_pipes.flush_file(&expr_str)
-                        };
-                        stack.push_value(if result { 0.0 } else { -1.0 })?;
-                    }
-                    BuiltinFunction::GetLine => {
-                        let var = stack.pop_ref();
-                        if let Some(next_record) = current_file.read_next_record(&global_env.rs)? {
-                            fields_state =
-                                var.assign(maybe_numeric_string(next_record), global_env)?;
-                            // borrowing `self.globas` mutably here breaks the stacked borrows rules
-                            // so we have to use unsafe code to get around that
-                            let nr = unsafe { &mut *self.globals[SpecialVar::Nr as usize].get() };
-                            nr.assign(global_env.nr as f64 + 1.0, global_env)?;
-                            let fnr = unsafe { &mut *self.globals[SpecialVar::Fnr as usize].get() };
-                            fnr.assign(global_env.fnr as f64 + 1.0, global_env)?;
-                            stack.push_value(1.0)?;
-                        } else {
-                            stack.push_value(0.0)?;
-                        }
-                    }
-                    BuiltinFunction::GetLineFromFile | BuiltinFunction::GetLineFromPipe => {
-                        let filename = stack
-                            .pop_scalar_value()?
-                            .scalar_to_string(&global_env.convfmt)?;
-                        let var = stack.pop_ref();
-                        let maybe_next_record = if function == BuiltinFunction::GetLineFromFile {
-                            self.read_files.read_next_record(filename, &global_env.rs)
-                        } else {
-                            self.read_pipes.read_next_record(filename, &global_env.rs)
-                        };
-                        match maybe_next_record {
-                            Ok(Some(next_record)) => {
-                                fields_state =
-                                    var.assign(maybe_numeric_string(next_record), global_env)?;
-                                // `cmd | getline` advances NR (but not FNR), like
-                                // historical awk; `getline < file` touches neither.
-                                if function == BuiltinFunction::GetLineFromPipe {
-                                    let nr_ptr = self.globals[SpecialVar::Nr as usize].get();
-                                    let next_nr = unsafe { (*nr_ptr).scalar_as_f64() } + 1.0;
-                                    unsafe { &mut *nr_ptr }.assign(next_nr, global_env)?;
-                                }
-                                stack.push_value(1.0)?;
-                            }
-                            Ok(None) => {
-                                stack.push_value(0.0)?;
-                            }
-                            Err(_) => {
-                                // Per POSIX, getline returns -1 on error
-                                stack.push_value(-1.0)?;
-                            }
-                        }
-                    }
-                    BuiltinFunction::Rand => {
-                        let rand = self.rng.gen_range(0.0..1.0);
-                        stack.push_value(rand)?;
-                    }
-                    BuiltinFunction::Srand => {
-                        let seed = if argc == 1 {
-                            stack.pop_scalar_value()?.scalar_as_f64() as u64
-                        } else {
-                            SystemTime::now()
-                                .duration_since(SystemTime::UNIX_EPOCH)
-                                .expect("time went backwards")
-                                .as_secs()
-                        };
-                        stack.push_value(self.rand_seed as f64)?;
-                        self.rand_seed = seed;
-                        self.rng = SmallRng::seed_from_u64(self.rand_seed);
-                    }
-                    other => fields_state = call_simple_builtin(other, argc, stack, global_env)?,
-                },
+                OpCode::CallBuiltin { function, argc } => {
+                    fields_state =
+                        self.call_builtin(function, argc, stack, global_env, current_file)?;
+                }
                 OpCode::PushConstant(index) => match self.constants[index as usize].clone() {
                     Constant::Number(num) => stack.push_value(num)?,
                     Constant::String(s) => stack.push_value(AwkString::from(s))?,

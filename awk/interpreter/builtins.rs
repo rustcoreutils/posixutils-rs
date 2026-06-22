@@ -180,7 +180,10 @@ pub(crate) fn substr(s: &str, m: i64, n: Option<i64>) -> String {
         None => usize::MAX,
         Some(n) => m.saturating_add(n).saturating_sub(start).max(0) as usize,
     };
-    s.chars().skip((start - 1) as usize).take(count).collect()
+    // `start >= 1`; a start past `usize::MAX` (only possible on a 32-bit `usize`)
+    // skips the whole string, yielding the empty substring.
+    let skip = usize::try_from(start - 1).unwrap_or(usize::MAX);
+    s.chars().skip(skip).take(count).collect()
 }
 
 pub(crate) fn builtin_match(
@@ -264,8 +267,9 @@ pub(crate) fn gsub(
 }
 
 /// `split(s, arr[, fs])`: split `s` into `arr` on the field separator (the
-/// optional third argument, else FS) and return the number of fields. With three
-/// arguments a regex separator is honoured; otherwise it is taken as a string.
+/// optional third argument, else `FS`) and return the number of fields. When the
+/// `fs` argument is a regex value it is used directly; otherwise it is
+/// interpreted like `FS` (e.g. `" "` means whitespace).
 pub(crate) fn builtin_split(
     stack: &mut Stack,
     global_env: &mut GlobalEnv,

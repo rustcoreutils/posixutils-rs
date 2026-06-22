@@ -269,12 +269,14 @@ impl Interpreter {
         match function {
             BuiltinFunction::Match => {
                 let (start, len) = builtin_match(stack, global_env)?;
-                // borrowing `self.globals` mutably here breaks the stacked borrows rules
-                // so we have to use unsafe code to get around that
-                unsafe {
-                    *self.globals[SpecialVar::Rstart as usize].get() = start.into();
-                    *self.globals[SpecialVar::Rlength as usize].get() = len.into();
-                }
+                // Update via `assign` so RSTART/RLENGTH keep their
+                // `SpecialGlobalVar` ref_type; reach the cells through raw
+                // pointers because borrowing `self.globals` mutably would break
+                // the stacked borrows rules.
+                unsafe { &mut *self.globals[SpecialVar::Rstart as usize].get() }
+                    .assign(start, global_env)?;
+                unsafe { &mut *self.globals[SpecialVar::Rlength as usize].get() }
+                    .assign(len, global_env)?;
             }
             BuiltinFunction::RedirectedPrintfTruncate
             | BuiltinFunction::RedirectedPrintfAppend

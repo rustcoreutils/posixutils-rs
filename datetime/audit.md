@@ -235,7 +235,7 @@ definition.
 
 #### Major
 
-- [ ] **#S1 — `sleep 0` is rejected.** `sleep.rs:17-18`: `value_parser!(u64).range(1..)` makes the minimum 1, so `sleep 0` exits non-zero with a clap range error. POSIX 115335: the `time` operand is "A non-negative decimal integer" — `0` is valid and must suspend for "at least 0 seconds" (i.e. return immediately with exit 0). Fix: change the range to `0..` (or drop the lower bound).
+- [x] **#S1 — `sleep 0` is rejected.** ✓ fixed in Phase 2 (`range(1..)` → `range(0..)`; new `tests/sleep/mod.rs`). `sleep.rs:17-18`: `value_parser!(u64).range(1..)` made the minimum 1, so `sleep 0` exited non-zero with a clap range error. POSIX 115335: the `time` operand is "A non-negative decimal integer" — `0` is valid and must suspend for "at least 0 seconds" (i.e. return immediately with exit 0).
 
 #### Minor
 
@@ -246,7 +246,7 @@ definition.
 #### SYNOPSIS / OPERANDS
 
 - [x] `sleep time` — single operand (`sleep.rs:17-21`). CONFORMS.
-- [ ] **`time` non-negative integer** — (#S1) `0` rejected.
+- [x] **`time` non-negative integer** — (#S1) ✓ fixed in Phase 2; `sleep 0` accepted.
 - [x] Up to 2 147 483 647 seconds supported — `u64` covers it; `thread::sleep(Duration::from_secs)` (`sleep.rs:36`). CONFORMS (RATIONALE 115397).
 - [x] Integral seconds only — `u64`, no fractional/suffix parsing. CONFORMS (POSIX requires only integral).
 
@@ -274,7 +274,7 @@ definition.
 ### Test coverage signal
 
 Not covered:
-- [ ] No tests exist for `sleep` at all. Add: `sleep 0` exits 0 (#S1); `sleep 1` returns ~promptly; invalid operand exits >0.
+- [x] No tests exist for `sleep` at all. ✓ Phase 2 added `tests/sleep/mod.rs`: `sleep 0` exits 0 (#S1), `sleep 1` exits 0, non-numeric/negative operand exits >0.
 
 ---
 

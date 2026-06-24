@@ -15,7 +15,8 @@ use std::{thread, time};
 #[command(version, about = gettext("sleep - suspend execution for an interval"))]
 struct Args {
     #[arg(
-        value_parser = clap::value_parser!(u64).range(1..),
+        // POSIX: the `time` operand is a non-negative decimal integer, so 0 is valid.
+        value_parser = clap::value_parser!(u64).range(0..),
         help = gettext("Number of seconds to sleep")
     )]
     seconds: u64,

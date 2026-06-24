@@ -9,7 +9,28 @@ utilities, ~640 lines total).
 **Reference slices:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/{cal,date,sleep,time}.md`
 **Date:** 2026-06-24
 **Method:** static spec-vs-code, every "absent"/"wrong-value" claim grep-verified
-against the cited lines. No code was modified — audit only.
+against the cited lines.
+
+> **Remediation status (2026-06-24).** All actionable findings — **2 Critical,
+> 3 Major, 6 Minor** — have since been fixed on the `datetime-audit` branch
+> across five themed, independently-committed phases, each with regression
+> tests and a clean `build` / `clippy --all-targets` / `fmt` / datetime test
+> run:
+> - **Phase 1 — `time`** CPU accounting + exit-status propagation (#T1, #T2,
+>   #T3, #T5).
+> - **Phase 2 — `sleep`** accept `sleep 0` (#S1) + first `sleep` test module.
+> - **Phase 3 — `date`** century off-by-one (#D1, `infer_century` + unit test),
+>   grow-until-fits `strftime` (#D2), raw-byte output (#D4).
+> - **Phase 4 — i18n** adopt `plib::diag::init_locale` + `gettext` diagnostics
+>   for `date`/`time` (#T4, #D3, #T6); `#S2` deferred (clap-generated, tree-wide).
+> - **Phase 5 — `cal`** `LC_TIME`-aware month/weekday names via
+>   `plib::locale::strftime` (#C1).
+>
+> The only items left open are minor *test-coverage* niceties (a 126/127
+> assertion; empty-`strftime`/non-UTF-8-locale display tests) and the tree-wide
+> `.mo` catalog deferral (so `LC_MESSAGES` stays inert). All four utilities are
+> promoted to README **Stage 6 — Audited**. Checkboxes below are ticked with
+> `✓ fixed in Phase N`.
 
 ---
 
@@ -19,8 +40,8 @@ against the cited lines. No code was modified — audit only.
 |---|---|---|
 | `setlocale(LC_ALL, "")` at `main` | Present in all four | `cal.rs:212`, `date.rs:183`, `sleep.rs:25`, `time.rs:134`. |
 | `textdomain`/`bind_textdomain_codeset` | Present in all four | `time.rs:136` additionally calls `bindtextdomain("posixutils-rs", "locale")` with a relative path; the other three omit `bindtextdomain` entirely. No `.mo` catalogs ship, so `gettext()` is an identity map regardless. |
-| Runtime diagnostics via `gettext()` | **Partial** | `cal` wraps its one error string; `date` and `time` use raw `eprintln!`/`Err(&str)` hardcoded English; `sleep` has no diagnostics of its own (clap-only). `LC_MESSAGES` is therefore inert for `date`/`time`. |
-| `LC_CTYPE`/`LC_TIME`/`TZ` honored via libc | Mixed | `date`/`cal` defer to libc `strftime`/`localtime_r` (honor `LC_TIME`/`TZ`); `cal`'s *own* month-name/weekday strings do **not** honor `LC_TIME` (#C1). |
+| Runtime diagnostics via `gettext()` | **Fixed (Phase 4)** | ~~`cal` wraps its one error string; `date` and `time` use raw `eprintln!`/`Err(&str)` hardcoded English.~~ All four now share `plib::diag::init_locale` and route diagnostics through `plib::diag::error` + `gettext` (`sleep` emits none of its own). Only clap's own parse/range errors stay English (`#S2`, deferred). `.mo` catalog shipping remains a tree-wide deferral. |
+| `LC_CTYPE`/`LC_TIME`/`TZ` honored via libc | **Fixed (Phase 5)** | `date`/`cal` defer to libc `strftime`/`localtime_r` (honor `LC_TIME`/`TZ`); `cal`'s month-name/weekday strings ~~do **not** honor `LC_TIME`~~ now derive from `plib::locale::strftime` under `LC_TIME` (#C1). |
 
 As in the `dev/` and `sys/` audits, crate-wide `.mo` catalog shipping is a
 tree-wide i18n concern and is not counted against individual utilities beyond a
@@ -131,9 +152,9 @@ broken. Separately, the child's exit status is discarded, so `time` always exits
 ### Test coverage signal
 
 Not covered:
-- [ ] No test asserts the reported `user`/`sys` values are non-zero for a CPU-bound child (would catch #T1/#T2).
-- [ ] No test asserts `time` propagates a non-zero child exit code (#T3).
-- [ ] No test asserts 126/127 mapping (only "not provided"/clap errors are exercised; `tests/time/mod.rs:51-57`).
+- [x] No test asserts the reported `user`/`sys` values are non-zero for a CPU-bound child (would catch #T1/#T2). — ✓ Phase 1 `cpu_bound_child_reports_nonzero_cpu_time`.
+- [x] No test asserts `time` propagates a non-zero child exit code (#T3). — ✓ Phase 1 `propagates_child_exit_status`.
+- [ ] No test asserts 126/127 mapping (only "not provided"/clap errors are exercised; `tests/time/mod.rs:51-57`). (127 behaviorally spot-checked; no automated assertion yet.)
 
 ---
 

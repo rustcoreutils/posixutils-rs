@@ -133,7 +133,7 @@ fn prompt_user(prompt: &str) -> bool {
     if io::stdin().read_line(&mut response).is_err() {
         return false;
     }
-    response.to_lowercase().starts_with('y')
+    plib::locale::is_affirmative(response.trim_end_matches(['\r', '\n']))
 }
 
 /// Combine per-file exit codes into a single, order-independent status.

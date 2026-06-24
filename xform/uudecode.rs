@@ -43,7 +43,7 @@ struct Header {
 
 /// Build an `InvalidData` error for malformed uuencode input.
 fn invalid(msg: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, msg.to_string())
+    io::Error::new(io::ErrorKind::InvalidData, gettext(msg))
 }
 
 /// Drop a single trailing carriage return (matches `str::lines()` for CRLF input).
@@ -222,7 +222,7 @@ fn decode_file(args: &Args) -> io::Result<()> {
         if out_path.exists() && !is_writable(out_path) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "output file is not writable",
+                gettext("output file is not writable"),
             ));
         }
 

@@ -9,7 +9,9 @@ data-transformation crate. Each audit follows the playbook in `audits.md`.
 (`~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/`), with every
 Critical/Major "absent" claim confirmed by reading the cited code + spec lines
 and grepping the source (`isatty`/`is_terminal`, `chown`, newline-in-pathname
-checks all confirmed absent). No code was changed — this is a punch list.
+checks all confirmed absent). Originally a no-code-change punch list; the
+findings were subsequently remediated in follow-up phases — see the per-item
+✓ annotations and the TL;DR status below.
 **Date:** 2026-06-18
 
 ## TL;DR (crate-wide)

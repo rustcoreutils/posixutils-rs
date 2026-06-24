@@ -96,8 +96,11 @@ fn spawn_with_retry(command: &mut Command, cmd: &str) -> std::process::Child {
                 if !transient {
                     panic!("failed to spawn command {cmd}: {e}");
                 }
-                // Exponential backoff: 20ms, 40ms, 80ms, 160ms.
-                thread::sleep(Duration::from_millis(20u64 << attempt));
+                // Exponential backoff: 20ms, 40ms, 80ms, 160ms — but only when
+                // another attempt will follow (no sleep before the final panic).
+                if attempt + 1 < MAX_ATTEMPTS {
+                    thread::sleep(Duration::from_millis(20u64 << attempt));
+                }
                 last_err = Some(e);
             }
         }

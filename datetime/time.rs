@@ -8,6 +8,7 @@
 //
 
 use std::io::{self, Write};
+use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
@@ -55,7 +56,10 @@ enum TimeError {
     CommandNotFound(String),
 }
 
-fn time(args: Args) -> Result<(), TimeError> {
+/// Run `args.utility`, write timing statistics to standard error, and return
+/// the exit code that `time` itself should exit with (the utility's exit
+/// status, per POSIX EXIT STATUS).
+fn time(args: Args) -> Result<i32, TimeError> {
     let start_time = Instant::now();
     // SAFETY: std::mem::zeroed() is used to create an instance of libc::tms with all fields set to zero.
     // This is safe here because libc::tms is a Plain Old Data type, and zero is a valid value for all its fields.
@@ -64,6 +68,7 @@ fn time(args: Args) -> Result<(), TimeError> {
     // It is safe to call because it does not modify any memory and has no side effects.
     let clock_ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) as f64 };
 
+    // Snapshot the process's accumulated CPU times *before* spawning the child.
     // SAFETY: times is a POSIX function that fills the provided tms structure with time-accounting information.
     // It is safe to call because we have correctly allocated and initialized tms_start, and the function
     // only writes to this structure.
@@ -79,13 +84,25 @@ fn time(args: Args) -> Result<(), TimeError> {
             _ => TimeError::ExecCommand(args.utility),
         })?;
 
-    let _ = child.wait().map_err(|_| TimeError::ExecTime)?;
+    let status = child.wait().map_err(|_| TimeError::ExecTime)?;
 
     let elapsed = start_time.elapsed();
-    let tms_end: libc::tms = unsafe { std::mem::zeroed() };
 
-    let user_time = (tms_start.tms_utime - tms_end.tms_utime) as f64 / clock_ticks_per_second;
-    let system_time = (tms_start.tms_stime - tms_end.tms_stime) as f64 / clock_ticks_per_second;
+    // Snapshot again *after* the child has been waited for, so the child's CPU
+    // usage has been folded into this process's tms_cutime/tms_cstime fields.
+    // SAFETY: same invariant as the tms_start call above.
+    let mut tms_end: libc::tms = unsafe { std::mem::zeroed() };
+    unsafe { libc::times(&mut tms_end) };
+
+    // POSIX: User CPU time is the sum of tms_utime and tms_cutime, System CPU
+    // time the sum of tms_stime and tms_cstime, for the process in which the
+    // utility is executed. The child's usage is in the c* fields after wait().
+    let user_ticks =
+        (tms_end.tms_utime + tms_end.tms_cutime) - (tms_start.tms_utime + tms_start.tms_cutime);
+    let system_ticks =
+        (tms_end.tms_stime + tms_end.tms_cstime) - (tms_start.tms_stime + tms_start.tms_cstime);
+    let user_time = user_ticks as f64 / clock_ticks_per_second;
+    let system_time = system_ticks as f64 / clock_ticks_per_second;
 
     if args.posix {
         writeln!(
@@ -107,11 +124,18 @@ fn time(args: Args) -> Result<(), TimeError> {
         .map_err(|_| TimeError::ExecTime)?;
     }
 
-    Ok(())
+    // EXIT STATUS: the exit status of time shall be the exit status of utility.
+    // A child terminated by a signal is reported as 128 + signal number.
+    let code = match status.code() {
+        Some(code) => code,
+        None => 128 + status.signal().unwrap_or(0),
+    };
+    Ok(code)
 }
 
 enum Status {
-    Ok,
+    /// The utility was invoked; exit with its exit status (per POSIX).
+    Utility(i32),
     TimeError,
     UtilError,
     UtilNotFound,
@@ -120,7 +144,7 @@ enum Status {
 impl Status {
     fn exit(self) -> ! {
         let res = match self {
-            Status::Ok => 0,
+            Status::Utility(code) => code,
             Status::TimeError => 1,
             Status::UtilError => 126,
             Status::UtilNotFound => 127,
@@ -138,8 +162,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
 
-    if let Err(err) = time(args) {
-        match err {
+    match time(args) {
+        Ok(code) => Status::Utility(code).exit(),
+        Err(err) => match err {
             TimeError::CommandNotFound(err) => {
                 eprintln!("Command not found: {}", err);
                 Status::UtilNotFound.exit()
@@ -152,8 +177,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("Error while executing time utility");
                 Status::TimeError.exit()
             }
-        }
+        },
     }
-
-    Status::Ok.exit()
 }

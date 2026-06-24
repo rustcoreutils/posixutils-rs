@@ -73,17 +73,17 @@ broken. Separately, the child's exit status is discarded, so `time` always exits
 
 #### Critical
 
-- [ ] **#T1 — `tms_end` is never populated; CPU stats are computed against an all-zero struct.** `time.rs:85`. `let tms_end: libc::tms = unsafe { std::mem::zeroed() };` — there is exactly one `libc::times` call in the file (`time.rs:70`, filling `tms_start`); `grep -n 'libc::times' time.rs` → one hit. The end snapshot is required after `child.wait()` to capture accumulated child CPU. As written, `tms_end.*` is always 0. Fix: call `libc::times(&mut tms_end)` after the wait, before computing deltas.
-- [ ] **#T2 — Wrong fields and wrong subtraction direction.** `time.rs:87-88`. POSIX 117331–117335: User CPU time is "the sum of the `tms_utime` and `tms_cutime` fields … for the process in which utility is executed", System CPU likewise `tms_stime + tms_cstime`. The child's CPU is accumulated into the parent's **`tms_cutime`/`tms_cstime`** after `wait()`. The code instead reads `tms_start.tms_utime - tms_end.tms_utime` (parent's *own* user time, start minus end). Even if #T1 is fixed, this measures the wrong process and has the sign inverted. Fix: `user = (tms_end.tms_cutime + tms_end.tms_utime) - (tms_start.tms_cutime + tms_start.tms_utime)`, likewise for system with the `s`-variants; divide by `_SC_CLK_TCK`.
+- [x] **#T1 — `tms_end` is never populated; CPU stats are computed against an all-zero struct.** ✓ fixed in Phase 1 (`libc::times(&mut tms_end)` now called after `child.wait()`). `time.rs:85`. `let tms_end: libc::tms = unsafe { std::mem::zeroed() };` — there is exactly one `libc::times` call in the file (`time.rs:70`, filling `tms_start`); `grep -n 'libc::times' time.rs` → one hit. The end snapshot is required after `child.wait()` to capture accumulated child CPU. As written, `tms_end.*` is always 0. Fix: call `libc::times(&mut tms_end)` after the wait, before computing deltas.
+- [x] **#T2 — Wrong fields and wrong subtraction direction.** ✓ fixed in Phase 1 (now `(end.tms_utime+end.tms_cutime) − (start…)`, likewise system, ÷ `_SC_CLK_TCK`). `time.rs:87-88`. POSIX 117331–117335: User CPU time is "the sum of the `tms_utime` and `tms_cutime` fields … for the process in which utility is executed", System CPU likewise `tms_stime + tms_cstime`. The child's CPU is accumulated into the parent's **`tms_cutime`/`tms_cstime`** after `wait()`. The code instead reads `tms_start.tms_utime - tms_end.tms_utime` (parent's *own* user time, start minus end). Even if #T1 is fixed, this measures the wrong process and has the sign inverted. Fix: `user = (tms_end.tms_cutime + tms_end.tms_utime) - (tms_start.tms_cutime + tms_start.tms_utime)`, likewise for system with the `s`-variants; divide by `_SC_CLK_TCK`.
 
 #### Major
 
-- [ ] **#T3 — Child exit status is discarded; `time` always exits 0.** `time.rs:82` (`let _ = child.wait()...`), `time.rs:158` (`Status::Ok.exit()` → 0). POSIX EXIT STATUS 117435: "If the utility utility is invoked, the exit status of `time` shall be the exit status of utility." A successful spawn whose child exits 5 still yields `time` exit 0. Fix: capture `ExitStatus`, and on normal exit propagate `code()`; on signal termination map to 128+signal (see #T5).
+- [x] **#T3 — Child exit status is discarded; `time` always exits 0.** ✓ fixed in Phase 1 (`time()` returns the child's code via `Status::Utility(code)`; `main` exits with it). `time.rs:82` (`let _ = child.wait()...`), `time.rs:158` (`Status::Ok.exit()` → 0). POSIX EXIT STATUS 117435: "If the utility utility is invoked, the exit status of `time` shall be the exit status of utility." A successful spawn whose child exits 5 still yields `time` exit 0. Fix: capture `ExitStatus`, and on normal exit propagate `code()`; on signal termination map to 128+signal (see #T5).
 
 #### Minor
 
 - [ ] **#T4 — Runtime diagnostics are hardcoded English.** `time.rs:144,148,152` (`eprintln!("Command not found: {}", …)` etc.). POSIX 117404: `LC_MESSAGES` shall affect diagnostic message contents. These strings are not routed through `gettext()` (only clap help/about is). Fix: wrap in `gettext()`.
-- [ ] **#T5 — Signal-terminated child not reflected in exit status.** `time.rs:82`. Bundled with #T3: when the utility dies from a signal, the conventional shell behavior is exit 128+signum; the current discard path can't express it.
+- [x] **#T5 — Signal-terminated child not reflected in exit status.** ✓ fixed in Phase 1 (`status.code()` else `128 + status.signal()`). `time.rs:82`. When the utility dies from a signal, `time` now exits 128+signum.
 - [ ] **#T6 — `bindtextdomain("posixutils-rs", "locale")` uses a relative path.** `time.rs:136`. Diverges from the other three binaries (which omit `bindtextdomain`) and resolves relative to CWD. Harmless today (no catalogs), but inconsistent. Note only.
 
 ### Detailed conformance matrix
@@ -105,7 +105,7 @@ broken. Separately, the child's exit status is discarded, so `time` always exits
 - [x] Timing statistics written to standard error — `writeln!(io::stderr(), …)` (`time.rs:91-107`). CONFORMS.
 - [x] `-p` format `"real %f\nuser %f\nsys %f\n"` — `time.rs:91-98` emits `real {:.6}\nuser {:.6}\nsys {:.6}` + `writeln!` trailing `\n`. Six fractional digits ≥ the mandated ≥1. CONFORMS (format); values are wrong (#T1/#T2).
 - [x] Default (non-`-p`) format unspecified — `time.rs:100-107` "Elapsed/User/System time" is permitted. CONFORMS.
-- [ ] **Timing values incorrect** — (#T1/#T2) the numbers themselves are garbage.
+- [x] **Timing values incorrect** — (#T1/#T2) ✓ fixed in Phase 1; CPU stats now reflect the invoked utility.
 
 #### ENVIRONMENT VARIABLES
 
@@ -121,7 +121,7 @@ broken. Separately, the child's exit status is discarded, so `time` always exits
 
 - [x] 127 when utility not found — `io::ErrorKind::NotFound → CommandNotFound → 127` (`time.rs:77-78,126,145`). CONFORMS.
 - [x] 126 when found but not invocable — other spawn errors → `ExecCommand → 126` (`time.rs:79,125,149`). CONFORMS.
-- [ ] **Exit status of invoked utility not propagated** — (#T3) always 0.
+- [x] **Exit status of invoked utility not propagated** — (#T3) ✓ fixed in Phase 1; `time` exits with the utility's status.
 - [x] 1–125 on internal `time` error — `TimeError → 1` (`time.rs:124,153`). CONFORMS.
 
 #### ASYNCHRONOUS EVENTS

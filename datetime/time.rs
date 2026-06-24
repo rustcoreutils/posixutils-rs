@@ -13,9 +13,8 @@ use std::process::{Command, Stdio};
 use std::time::Instant;
 
 use clap::Parser;
-use gettextrs::{
-    bind_textdomain_codeset, bindtextdomain, gettext, setlocale, textdomain, LocaleCategory,
-};
+use gettextrs::gettext;
+use plib::diag;
 
 #[derive(Parser)]
 #[command(
@@ -154,27 +153,24 @@ impl Status {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bindtextdomain("posixutils-rs", "locale")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+fn main() {
+    diag::init_locale("time");
 
     let args = Args::parse();
 
     match time(args) {
         Ok(code) => Status::Utility(code).exit(),
         Err(err) => match err {
-            TimeError::CommandNotFound(err) => {
-                eprintln!("Command not found: {}", err);
+            TimeError::CommandNotFound(util) => {
+                diag::error(&format!("{}: {}", gettext("utility not found"), util));
                 Status::UtilNotFound.exit()
             }
-            TimeError::ExecCommand(err) => {
-                eprintln!("Error while executing command: {}", err);
+            TimeError::ExecCommand(util) => {
+                diag::error(&format!("{}: {}", gettext("cannot execute utility"), util));
                 Status::UtilError.exit()
             }
             TimeError::ExecTime => {
-                eprintln!("Error while executing time utility");
+                diag::error(&gettext("error running time utility"));
                 Status::TimeError.exit()
             }
         },

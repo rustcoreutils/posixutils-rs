@@ -9,7 +9,8 @@
 
 use chrono::{DateTime, Datelike, Local, LocalResult, TimeZone, Utc};
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
+use plib::diag;
 use std::ffi::CString;
 use std::io::{self, Write};
 use std::mem::MaybeUninit;
@@ -61,14 +62,14 @@ fn show_time(utc: bool, formatstr: &str) {
     let c_format = match CString::new(formatstr) {
         Ok(s) => s,
         Err(_) => {
-            eprintln!("date: format string contains NUL byte");
+            diag::error(&gettext("format string contains NUL byte"));
             process::exit(1);
         }
     };
 
     let now = unsafe { libc::time(std::ptr::null_mut()) };
     if now == -1 {
-        eprintln!("date: failed to get current time");
+        diag::error(&gettext("failed to get current time"));
         process::exit(1);
     }
     let mut tm = MaybeUninit::<libc::tm>::uninit();
@@ -82,7 +83,7 @@ fn show_time(utc: bool, formatstr: &str) {
     };
 
     if tm_ptr.is_null() {
-        eprintln!("date: failed to get current time");
+        diag::error(&gettext("failed to get current time"));
         process::exit(1);
     }
 
@@ -123,7 +124,7 @@ fn show_time(utc: bool, formatstr: &str) {
 fn set_time(utc: bool, timestr: &str) -> Result<(), &'static str> {
     for ch in timestr.chars() {
         if !ch.is_ascii_digit() {
-            return Err("date: invalid date");
+            return Err("invalid date");
         }
     }
 
@@ -162,7 +163,7 @@ fn set_time(utc: bool, timestr: &str) -> Result<(), &'static str> {
             (year, month, day, hour, minute)
         }
         _ => {
-            return Err("date: invalid date");
+            return Err("invalid date");
         }
     };
 
@@ -172,14 +173,14 @@ fn set_time(utc: bool, timestr: &str) -> Result<(), &'static str> {
             match chrono::Utc.with_ymd_and_hms(year, month, day, hour, minute, 0) {
                 LocalResult::<DateTime<Utc>>::Single(t) => t.timestamp(),
                 _ => {
-                    return Err("date: invalid date");
+                    return Err("invalid date");
                 }
             }
         } else {
             match chrono::Local.with_ymd_and_hms(year, month, day, hour, minute, 0) {
                 LocalResult::<DateTime<Local>>::Single(t) => t.timestamp(),
                 _ => {
-                    return Err("date: invalid date");
+                    return Err("invalid date");
                 }
             }
         }
@@ -193,17 +194,15 @@ fn set_time(utc: bool, timestr: &str) -> Result<(), &'static str> {
     // set system time
     unsafe {
         if libc::clock_settime(libc::CLOCK_REALTIME, &new_time) != 0 {
-            return Err("date: failed to set time");
+            return Err("failed to set time");
         }
     }
 
     Ok(())
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+fn main() {
+    diag::init_locale("date");
 
     let args = Args::parse();
 
@@ -212,13 +211,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(timestr) => {
             if let Some(st) = timestr.strip_prefix("+") {
                 show_time(args.utc, st);
-            } else {
-                set_time(args.utc, timestr)?;
+            } else if let Err(msg) = set_time(args.utc, timestr) {
+                diag::error(&gettext(msg));
+                process::exit(1);
             }
         }
     }
-
-    Ok(())
 }
 
 #[cfg(test)]

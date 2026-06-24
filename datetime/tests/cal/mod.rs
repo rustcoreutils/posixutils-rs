@@ -7,12 +7,16 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test_with_checker, TestPlan};
+use plib::testing::{run_test_with_checker, run_test_with_checker_and_env, TestPlan};
+
+// Pin name-asserting tests to the C locale so month/weekday names are
+// deterministic regardless of the developer's or CI's environment locale.
+const C_LOCALE: &[(&str, &str)] = &[("LC_ALL", "C"), ("LANG", "C")];
 
 fn cal_test_error(args: &[&str]) {
     let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
 
-    run_test_with_checker(
+    run_test_with_checker_and_env(
         TestPlan {
             cmd: String::from("cal"),
             args: str_args,
@@ -21,6 +25,7 @@ fn cal_test_error(args: &[&str]) {
             expected_err: String::new(),
             expected_exit_code: 1,
         },
+        C_LOCALE,
         |_, output| {
             assert!(!output.status.success(), "Expected command to fail");
         },
@@ -30,7 +35,7 @@ fn cal_test_error(args: &[&str]) {
 fn cal_test_contains(args: &[&str], checks: &[&str]) {
     let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
 
-    run_test_with_checker(
+    run_test_with_checker_and_env(
         TestPlan {
             cmd: String::from("cal"),
             args: str_args,
@@ -39,6 +44,7 @@ fn cal_test_contains(args: &[&str], checks: &[&str]) {
             expected_err: String::new(),
             expected_exit_code: 0,
         },
+        C_LOCALE,
         |_, output| {
             assert!(output.status.success(), "Expected command to succeed");
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -57,7 +63,7 @@ fn cal_test_contains(args: &[&str], checks: &[&str]) {
 fn cal_test_not_contains(args: &[&str], checks: &[&str]) {
     let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
 
-    run_test_with_checker(
+    run_test_with_checker_and_env(
         TestPlan {
             cmd: String::from("cal"),
             args: str_args,
@@ -66,6 +72,7 @@ fn cal_test_not_contains(args: &[&str], checks: &[&str]) {
             expected_err: String::new(),
             expected_exit_code: 0,
         },
+        C_LOCALE,
         |_, output| {
             assert!(output.status.success(), "Expected command to succeed");
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -373,4 +380,35 @@ fn test_cal_february_non_leap() {
 fn test_cal_february_leap() {
     // February in leap year has 29 days
     cal_test_contains(&["2", "2024"], &["29"]);
+}
+
+// ============================================================================
+// LC_TIME localization (#C1) — best-effort: confirms the month name comes from
+// the locale (not a hardcoded English array). Tolerant of the fr_FR locale not
+// being installed, in which case setlocale falls back to C and the header
+// stays "January".
+// ============================================================================
+
+#[test]
+fn test_cal_lc_time_french_month_name() {
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("cal"),
+            args: vec![String::from("1"), String::from("2024")],
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("LC_ALL", "fr_FR.UTF-8"), ("LANG", "fr_FR.UTF-8")],
+        |_, output| {
+            assert!(output.status.success());
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains("janvier") || stdout.contains("January"),
+                "expected localized 'janvier' (fr_FR installed) or fallback 'January', got:\n{}",
+                stdout
+            );
+        },
+    );
 }

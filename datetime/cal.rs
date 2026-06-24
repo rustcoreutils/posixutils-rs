@@ -7,11 +7,13 @@
 // SPDX-License-Identifier: MIT
 //
 
-use chrono::Datelike;
+use chrono::{Datelike, TimeZone, Utc};
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
+use plib::{diag, locale};
+use std::process;
 
-/// Month names for calendar display
+/// English fallback month names, used when the locale lookup fails.
 const MONTH_NAMES: [&str; 12] = [
     "January",
     "February",
@@ -148,11 +150,55 @@ struct Args {
     year: Option<u32>,
 }
 
-fn print_month(month: u32, year: u32) {
-    let month_name = gettext(MONTH_NAMES[(month - 1) as usize]);
+/// Localized full month name (`%B`) for `month` (1–12), honoring `LC_TIME`.
+/// The name is year-independent, so a fixed safe date (the 15th at noon, where
+/// a timezone offset can never shift it into an adjacent month) is used. Falls
+/// back to the English name on any locale/format error.
+fn month_name(month: u32) -> String {
+    if let Some(dt) = Utc.with_ymd_and_hms(2001, month, 15, 12, 0, 0).single() {
+        if let Ok(name) = locale::strftime("%B", dt.timestamp()) {
+            if !name.is_empty() {
+                return name;
+            }
+        }
+    }
+    MONTH_NAMES[(month - 1) as usize].to_string()
+}
 
-    println!("    {} {}", month_name, year);
-    println!("{}", gettext("Su Mo Tu We Th Fr Sa"));
+/// Two-character weekday abbreviations, Sunday first, honoring `LC_TIME`
+/// (e.g. `"Su Mo Tu We Th Fr Sa"` in the C locale). The reference weekday is
+/// read back via `%w` so the alignment is correct under any `TZ`. Falls back to
+/// the English header on any locale/format error.
+fn weekday_header() -> String {
+    const FALLBACK: &str = "Su Mo Tu We Th Fr Sa";
+    // A noon four weeks after the epoch; read its local weekday (0 = Sunday).
+    let base: i64 = 28 * 86400 + 43200;
+    let wd0 = match locale::strftime("%w", base)
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+    {
+        Some(w) => w,
+        None => return FALLBACK.to_string(),
+    };
+
+    let mut cols = Vec::with_capacity(7);
+    for slot in 0..7 {
+        let epoch = base + (slot - wd0).rem_euclid(7) * 86400;
+        let abbr: String = match locale::strftime("%a", epoch) {
+            Ok(name) => name.chars().take(2).collect(),
+            Err(_) => return FALLBACK.to_string(),
+        };
+        if abbr.is_empty() {
+            return FALLBACK.to_string();
+        }
+        cols.push(abbr);
+    }
+    cols.join(" ")
+}
+
+fn print_month(month: u32, year: u32) {
+    println!("    {} {}", month_name(month), year);
+    println!("{}", weekday_header());
 
     let days = days_in_month(year, month);
     let first_day = days[0];
@@ -208,10 +254,8 @@ fn print_year(year: u32) {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+fn main() {
+    diag::init_locale("cal");
 
     let mut args = Args::parse();
 
@@ -233,12 +277,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(month) = args.month {
         if month > 12 {
-            return Err(gettext("month must be between 1 and 12").into());
+            diag::error(&gettext("month must be between 1 and 12"));
+            process::exit(1);
         }
         print_month(month, year);
     } else {
         print_year(year);
     }
-
-    Ok(())
 }

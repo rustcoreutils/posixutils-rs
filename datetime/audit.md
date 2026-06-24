@@ -300,7 +300,7 @@ hardcoded English array passed through `gettext()` (which has no catalogs).
 
 #### Minor
 
-- [ ] **#C1 — `LC_TIME` not honored for month names / weekday header.** `cal.rs:14-28` (`MONTH_NAMES`), `cal.rs:152` (`gettext(MONTH_NAMES[...])`), `cal.rs:155` (`gettext("Su Mo Tu We Th Fr Sa")`). POSIX 88457: "`LC_TIME` Determine the format and contents of the calendar." The strings are English literals routed through `gettext()` (an `LC_MESSAGES` mechanism, not `LC_TIME`) with no `.mo` catalogs, so output is always English/Sunday-first regardless of `LC_TIME`. The spec leaves the *format* unspecified (so Sunday-first and the column layout are fine), but the month/day **names** are an `LC_TIME` responsibility. Fix: derive abbreviated weekday and month names from libc `nl_langinfo`/`strftime` under `LC_TIME` (as `dev/`'s `plib::locale::strftime` does). Low practical impact until catalogs/locale wiring exists.
+- [x] **#C1 — `LC_TIME` not honored for month names / weekday header.** ✓ fixed in Phase 5. `cal.rs` now derives the month name (`%B`) and the 2-char weekday abbreviations (`%a`, with the reference weekday read back via `%w` so the alignment is `TZ`-correct) from `plib::locale::strftime` under `LC_TIME`, with the English literals kept only as a fallback. The C/POSIX-locale output is byte-identical to before (`January`, `Su Mo Tu We Th Fr Sa`); a non-C `LC_TIME` (e.g. `fr_FR.UTF-8` → `janvier`) now localizes the names. POSIX 88457: "`LC_TIME` Determine the format and contents of the calendar." The spec leaves the *format* unspecified (Sunday-first and the column layout are unchanged); the month/day **names** are now an `LC_TIME` responsibility.
 
 ### Detailed conformance matrix
 
@@ -332,7 +332,7 @@ hardcoded English array passed through `gettext()` (which has no catalogs).
 |---|---|---|
 | `LANG`/`LC_ALL`/`LC_CTYPE` | CONFORMS | `setlocale` at `cal.rs:212`. |
 | `LC_MESSAGES` | PARTIAL | Catalogs absent (tree-wide); the one error string is gettext-wrapped (`cal.rs:236`). |
-| `LC_TIME` | **MISSING** | (#C1) month/weekday names hardcoded English. |
+| `LC_TIME` | CONFORMS | (#C1) ✓ Phase 5: month/weekday names derived from `plib::locale::strftime` under `LC_TIME`. |
 | `NLSPATH` (XSI) | MISSING | Tree-wide. |
 | `TZ` | CONFORMS | Current month derived from `chrono::Local::now()`, which honors `TZ` (`cal.rs:220`). |
 
@@ -345,7 +345,7 @@ hardcoded English array passed through `gettext()` (which has no catalogs).
 
 Well covered (24 tests): operand forms, Sep-1752 gap, leap-year rules across
 Julian/Gregorian eras, day-of-week, month names, range errors. Gaps:
-- [ ] No test asserts `LC_TIME` affects month/weekday names (#C1) — would currently fail, documents the gap.
+- [x] No test asserts `LC_TIME` affects month/weekday names (#C1) — ✓ Phase 5 added `test_cal_lc_time_french_month_name` (best-effort: `janvier` when `fr_FR` is installed, else `January`); the C-locale name assertions are now pinned to `LC_ALL=C` for determinism.
 
 ---
 

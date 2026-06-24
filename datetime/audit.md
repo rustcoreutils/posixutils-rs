@@ -160,13 +160,13 @@ non-UTF-8 locale bytes can be mangled (#D4).
 
 #### Major
 
-- [ ] **#D1 — 2-digit-year century inference off by one.** `date.rs:128-133`. POSIX 91707–91708: "values in the range [69,99] shall refer to years 1969 to 1999 … values in the range [00,68] shall refer to years 2000 to 2068." The code does `if year < 70 { year + 2000 } else { year + 1900 }`, so `yy=69` → 2069 (should be 1969). The boundary should be `< 69` (i.e., 00–68 → 20xx, 69–99 → 19xx). Fix: change the threshold from `70` to `69`. Affects exactly the two-digit year `69`.
+- [x] **#D1 — 2-digit-year century inference off by one.** ✓ fixed in Phase 3 (extracted `infer_century(yy)` with the `< 69` threshold; unit-tested over 68/69/70/99). `date.rs:128-133`. POSIX 91707–91708: "values in the range [69,99] shall refer to years 1969 to 1999 … values in the range [00,68] shall refer to years 2000 to 2068." The code did `if year < 70 { year + 2000 } else { year + 1900 }`, so `yy=69` → 2069 (should be 1969).
 
 #### Minor
 
-- [ ] **#D2 — `strftime` returning 0 is always treated as a fatal error.** `date.rs:87-95`. `strftime(3)` returns 0 both when the buffer is too small **and** when the conversion legitimately produces an empty string. After trying 256- and 1024-byte buffers, the code prints "format string produced no output" and exits 1. A format whose entire output is empty (or empty in a given locale) is thus rejected. Fix: distinguish empty-but-valid (e.g. format string non-empty but `len==0` after a successful call with adequate buffer) from buffer-overflow; or special-case via a sentinel. Low impact in the POSIX locale.
+- [x] **#D2 — `strftime` returning 0 is always treated as a fatal error.** ✓ fixed in Phase 3 (grow-until-fits loop to a 64 KiB cap; a 0 return at the cap is an empty-but-valid result → emit just the trailing newline). `date.rs:87-95`. `strftime(3)` returns 0 both when the buffer is too small **and** when the conversion legitimately produces an empty string.
 - [ ] **#D3 — Runtime diagnostics hardcoded English.** `date.rs:49,56,70,94,101,144,154,161,175`. POSIX 91728: `LC_MESSAGES` shall affect diagnostic messages. The `eprintln!`/`Err(&str)` strings bypass `gettext()`. Fix: route through `gettext()` and a uniform `date:` prefix (the `Err(&str)` paths currently surface as Rust's `Error: date: …` via `main`'s `Box<dyn Error>`).
-- [ ] **#D4 — `from_utf8_lossy` may mangle `strftime` output in non-UTF-8 locales.** `date.rs:88`. `strftime` emits bytes in the locale's `LC_CTYPE` encoding; `String::from_utf8_lossy` replaces invalid sequences with U+FFFD. Fix: write the raw bytes to stdout (`stdout().write_all(&buf[..len])`) instead of lossy-decoding.
+- [x] **#D4 — `from_utf8_lossy` may mangle `strftime` output in non-UTF-8 locales.** ✓ fixed in Phase 3 (`stdout().write_all(&buf[..len])` raw bytes + newline, no lossy decode). `date.rs:88`. `strftime` emits bytes in the locale's `LC_CTYPE` encoding; `String::from_utf8_lossy` replaced invalid sequences with U+FFFD.
 
 ### Detailed conformance matrix
 
@@ -182,7 +182,7 @@ non-UTF-8 locale bytes can be mangled (#D4).
 - [x] `<newline>` always appended to `strftime` output — `println!("{}", timestr)` (`date.rs:89`); empty format → bare `println!()` (`date.rs:42`). CONFORMS.
 - [x] Set form `mmddhhmm` (len 8) → current year — `date.rs:116-122`. CONFORMS.
 - [x] Set form `mmddhhmmccyy` (len 12) → explicit 4-digit year — `date.rs:135-142`. CONFORMS.
-- [ ] **Set form `mmddhhmmyy` (len 10) century inference** — (#D1) off by one at `yy=69`.
+- [x] **Set form `mmddhhmmyy` (len 10) century inference** — (#D1) ✓ fixed in Phase 3 via `infer_century`.
 - [x] Invalid field values rejected — `chrono::with_ymd_and_hms` non-`Single` → `Err` (`date.rs:151-164`). CONFORMS.
 
 #### STDIN / STDOUT / STDERR
@@ -209,7 +209,7 @@ non-UTF-8 locale bytes can be mangled (#D4).
 ### Test coverage signal
 
 Not covered:
-- [ ] No test exercises the set-time path at all (would catch #D1) — set-time needs privilege, so a unit-level century-mapping test is the practical route.
+- [x] No test exercises the set-time path at all (would catch #D1) — ✓ Phase 3 added a `century_boundaries` unit test over the `infer_century` helper (set-time itself needs privilege).
 - [ ] No test asserts `+`-empty / unusual formats (#D2).
 - [ ] No test for `-u` set-form or non-UTF-8 locale output (#D4).
 

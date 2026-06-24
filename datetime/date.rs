@@ -11,10 +11,25 @@ use chrono::{DateTime, Datelike, Local, LocalResult, TimeZone, Utc};
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use std::ffi::CString;
+use std::io::{self, Write};
 use std::mem::MaybeUninit;
 use std::process;
 
 const DEF_TIMESTR: &str = "%a %b %e %H:%M:%S %Z %Y";
+
+/// Upper bound for the `strftime` output buffer. A zero return at this size is
+/// treated as a legitimately-empty conversion rather than a buffer overflow.
+const STRFTIME_BUF_MAX: usize = 64 * 1024;
+
+/// Map a 2-digit year to a full year per POSIX: values in [00,68] refer to
+/// 2000–2068, and values in [69,99] refer to 1969–1999.
+fn infer_century(yy: i32) -> i32 {
+    if yy < 69 {
+        yy + 2000
+    } else {
+        yy + 1900
+    }
+}
 
 #[derive(Parser)]
 #[command(version, about = gettext("date - write the date and time"))]
@@ -73,8 +88,13 @@ fn show_time(utc: bool, formatstr: &str) {
 
     let tm = unsafe { tm.assume_init() };
 
-    // Try 256-byte buffer first, then 1024
-    for buf_size in [256, 1024] {
+    // Grow the buffer until strftime succeeds. strftime returns 0 both when the
+    // buffer is too small AND when the conversion is legitimately empty; once
+    // the buffer is provably large enough (STRFTIME_BUF_MAX), a 0 return can
+    // only mean an empty result, which is valid — emit just the trailing
+    // <newline> rather than treating it as an error.
+    let mut buf_size = 256;
+    loop {
         let mut buf = vec![0u8; buf_size];
         let len = unsafe {
             libc::strftime(
@@ -85,14 +105,19 @@ fn show_time(utc: bool, formatstr: &str) {
             )
         };
         if len > 0 {
-            let timestr = String::from_utf8_lossy(&buf[..len]);
-            println!("{}", timestr);
+            // Write the raw bytes so non-UTF-8 locale output is preserved.
+            let mut out = io::stdout().lock();
+            let _ = out.write_all(&buf[..len]);
+            let _ = out.write_all(b"\n");
             return;
         }
+        if buf_size >= STRFTIME_BUF_MAX {
+            // Empty-but-valid conversion: a <newline> shall always be appended.
+            let _ = io::stdout().write_all(b"\n");
+            return;
+        }
+        buf_size *= 2;
     }
-
-    eprintln!("date: format string produced no output");
-    process::exit(1);
 }
 
 fn set_time(utc: bool, timestr: &str) -> Result<(), &'static str> {
@@ -125,12 +150,8 @@ fn set_time(utc: bool, timestr: &str) -> Result<(), &'static str> {
             let day = timestr[2..4].parse::<u32>().unwrap();
             let hour = timestr[4..6].parse::<u32>().unwrap();
             let minute = timestr[6..8].parse::<u32>().unwrap();
-            let year = timestr[8..10].parse::<i32>().unwrap();
-            if year < 70 {
-                (year + 2000, month, day, hour, minute)
-            } else {
-                (year + 1900, month, day, hour, minute)
-            }
+            let year = infer_century(timestr[8..10].parse::<i32>().unwrap());
+            (year, month, day, hour, minute)
         }
         12 => {
             let month = timestr[0..2].parse::<u32>().unwrap();
@@ -198,4 +219,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::infer_century;
+
+    #[test]
+    fn century_boundaries() {
+        // POSIX: [00,68] -> 2000..2068, [69,99] -> 1969..1999.
+        assert_eq!(infer_century(0), 2000);
+        assert_eq!(infer_century(68), 2068);
+        assert_eq!(infer_century(69), 1969);
+        assert_eq!(infer_century(70), 1970);
+        assert_eq!(infer_century(99), 1999);
+    }
 }

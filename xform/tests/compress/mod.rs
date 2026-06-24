@@ -1253,3 +1253,47 @@ fn test_decompress_suffixless_no_data_loss(/* #C3 */) {
     cleanup_file(&dotz);
     cleanup_file(&nosuffix);
 }
+
+#[test]
+fn test_compress_bits_16_accepted_and_roundtrips(/* #C4 */) {
+    // -b 15/16 were previously rejected despite the default emitting 16-bit
+    // codes; the LZW range now accepts 9-16.
+    let test_dir = get_test_dir();
+    let source_file = test_dir.join("lorem_ipsum.txt");
+    let test_file = test_dir.join("bits16_test.txt");
+    let compressed_file = test_dir.join("bits16_test.txt.Z");
+
+    cleanup_file(&test_file);
+    cleanup_file(&compressed_file);
+
+    let mut original_content = String::new();
+    File::open(&source_file)
+        .unwrap()
+        .read_to_string(&mut original_content)
+        .unwrap();
+    fs::copy(&source_file, &test_file).unwrap();
+
+    compress_test(&["-b", "16", test_file.to_str().unwrap()], "", "");
+    assert!(compressed_file.exists(), "Compressed file should exist");
+
+    let mut file = File::open(&compressed_file).unwrap();
+    let mut header = [0u8; 3];
+    file.read_exact(&mut header).unwrap();
+    assert_eq!(header[2] & 0x1F, 16, "header should record 16-bit codes");
+
+    // Roundtrip back to stdout.
+    run_test(TestPlan {
+        cmd: String::from("compress"),
+        args: vec![
+            String::from("-c"),
+            String::from("-d"),
+            compressed_file.to_str().unwrap().to_string(),
+        ],
+        stdin_data: String::new(),
+        expected_out: original_content,
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    cleanup_file(&compressed_file);
+}

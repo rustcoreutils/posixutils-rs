@@ -20,7 +20,29 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-const NAME_MAX: usize = 255;
+/// Conventional fallback when {NAME_MAX} cannot be queried.
+const NAME_MAX_FALLBACK: usize = 255;
+
+/// Query `{NAME_MAX}` for the directory that will hold the output file, via
+/// `pathconf(_PC_NAME_MAX)`; fall back to a conventional 255 when unavailable.
+fn name_max(dir: &Path) -> usize {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    if let Ok(c) = CString::new(dir.as_os_str().as_bytes()) {
+        // SAFETY: c is a valid NUL-terminated C string for the lifetime of the call.
+        let v = unsafe { libc::pathconf(c.as_ptr(), libc::_PC_NAME_MAX) };
+        if v > 0 {
+            return v as usize;
+        }
+    }
+    NAME_MAX_FALLBACK
+}
 
 /// Compression algorithm
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +135,19 @@ fn prompt_user(prompt: &str) -> bool {
     response.to_lowercase().starts_with('y')
 }
 
+/// Combine per-file exit codes into a single, order-independent status.
+///
+/// Severity order: 1 (error) outranks 2 (file not compressed because it would
+/// grow) outranks 0 (success). Both 1 and 2 are non-zero per spec 90511-90516;
+/// this just makes the final code deterministic regardless of file order.
+fn merge_exit(current: i32, new: i32) -> i32 {
+    match (current, new) {
+        (1, _) | (_, 1) => 1,
+        (2, _) | (_, 2) => 2,
+        _ => 0,
+    }
+}
+
 /// Decide whether an existing output file may be overwritten.
 ///
 /// Returns `true` to proceed with the write, `false` to skip it (the caller
@@ -146,6 +181,8 @@ fn may_overwrite(output_path: &Path, force: bool) -> bool {
 /// Saved file metadata for preservation
 struct FileMetadata {
     mode: u32,
+    uid: u32,
+    gid: u32,
     atime: SystemTime,
     mtime: SystemTime,
 }
@@ -155,21 +192,31 @@ impl FileMetadata {
         let meta = fs::metadata(path)?;
         Ok(Self {
             mode: meta.permissions().mode(),
+            uid: meta.uid(),
+            gid: meta.gid(),
             atime: meta.accessed()?,
             mtime: meta.modified()?,
         })
     }
 
     fn apply_to(&self, path: &Path) -> io::Result<()> {
-        let perms = fs::Permissions::from_mode(self.mode);
-        fs::set_permissions(path, perms)?;
-
         #[cfg(unix)]
         {
             use std::ffi::CString;
             use std::os::unix::ffi::OsStrExt;
 
             let path_cstr = CString::new(path.as_os_str().as_bytes())?;
+
+            // Restore ownership before the mode bits: chown() clears the
+            // set-user-ID / set-group-ID bits, so it must run first. Best
+            // effort — only a sufficiently privileged process succeeds, so the
+            // result is intentionally ignored (spec 90389-90392).
+            unsafe {
+                libc::chown(path_cstr.as_ptr(), self.uid, self.gid);
+            }
+
+            let perms = fs::Permissions::from_mode(self.mode);
+            fs::set_permissions(path, perms)?;
 
             fn to_timeval(time: SystemTime) -> libc::timeval {
                 match time.duration_since(std::time::UNIX_EPOCH) {
@@ -293,11 +340,13 @@ fn parse_algorithm(s: &str) -> io::Result<Algorithm> {
 fn validate_bits(algo: Algorithm, bits: u32) -> io::Result<()> {
     match algo {
         Algorithm::Lzw => {
-            // POSIX compress specifies 9-14 bit range
-            if !(9..=14).contains(&bits) {
+            // The LZW writer's default (no -b) emits 16-bit codes, and the
+            // RATIONALE (spec 90542-90544) encourages 15/16, so accept the full
+            // historical 9-16 range rather than the normative-DESCRIPTION 14.
+            if !(9..=16).contains(&bits) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "LZW bits must be 9-14 (POSIX)",
+                    "LZW bits must be 9-16",
                 ));
             }
         }
@@ -331,21 +380,18 @@ fn compress_output_path(input: &Path, algo: Algorithm) -> io::Result<PathBuf> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "input path has no filename"))?;
     let fname = format!("{}{}", file_name.to_string_lossy(), algo.suffix());
 
-    if fname.len() > NAME_MAX {
+    let parent = input.parent();
+    let dir = parent.unwrap_or_else(|| Path::new(""));
+    if fname.len() > name_max(dir) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "filename too long",
         ));
     }
 
-    let output = if let Some(parent) = input.parent() {
-        if parent.as_os_str().is_empty() {
-            PathBuf::from(&fname)
-        } else {
-            parent.join(&fname)
-        }
-    } else {
-        PathBuf::from(&fname)
+    let output = match parent {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(&fname),
+        _ => PathBuf::from(&fname),
     };
 
     check_path_max(&output)?;
@@ -485,8 +531,18 @@ fn compress_file(args: &Args, pathname: &Path, algo: Algorithm) -> io::Result<i3
         let _ = meta.apply_to(&output_path);
     }
 
-    // Remove original
-    fs::remove_file(pathname)?;
+    // Remove original. If it cannot be removed, back out the output so we do
+    // not leave both files behind, and report a non-zero status
+    // (spec 90393-90400).
+    if let Err(e) = fs::remove_file(pathname) {
+        let _ = fs::remove_file(&output_path);
+        eprintln!(
+            "compress: {}: cannot remove input: {}",
+            pathname.display(),
+            e
+        );
+        return Ok(1);
+    }
 
     if args.verbose {
         let ratio = if inp_buf_size > 0 {
@@ -576,8 +632,18 @@ fn decompress_file(args: &Args, pathname: &Path) -> io::Result<i32> {
         let _ = meta.apply_to(&output_path);
     }
 
-    // Remove compressed file
-    fs::remove_file(&input_path)?;
+    // Remove compressed file. If it cannot be removed, back out the output so
+    // we do not leave both files behind, and report a non-zero status
+    // (spec 90393-90400).
+    if let Err(e) = fs::remove_file(&input_path) {
+        let _ = fs::remove_file(&output_path);
+        eprintln!(
+            "compress: {}: cannot remove input: {}",
+            input_path.display(),
+            e
+        );
+        return Ok(1);
+    }
 
     if args.verbose {
         eprintln!(
@@ -633,13 +699,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         match result {
-            Ok(code) => {
-                if code == 1 || (code == 2 && exit_code == 0) {
-                    exit_code = code;
-                }
-            }
+            Ok(code) => exit_code = merge_exit(exit_code, code),
             Err(e) => {
-                exit_code = 1;
+                exit_code = merge_exit(exit_code, 1);
                 let display_name = if is_stdin(filename) {
                     "stdin".to_string()
                 } else {

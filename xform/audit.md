@@ -182,7 +182,9 @@ output, and a `-b` validation range that contradicts the actual default.
   output is `file`; refuse when input==output.
 
 #### Minor
-- [ ] **#C4 — `-b` LZW range contradicts the default.** `validate_bits`
+- [x] **#C4 — `-b` LZW range contradicts the default.** ✓ fixed (phase 5) —
+  `validate_bits` now accepts LZW 9–16, matching the 16-bit default and the
+  RATIONALE's 15/16 encouragement. `validate_bits`
   rejects LZW values outside 9–14 (`compress.rs:261-271`), but the default
   (no `-b`) is 16 (`plib/src/lzw.rs:18` `BITS=16`, used when `mbits==None` at
   `lzw.rs:433-437`) and the writer clamps requests to 9–16
@@ -190,25 +192,30 @@ output, and a `-b` validation range that contradicts the actual default.
   are rejected. Spec normative DESCRIPTION says the default "shall be 14"
   (90414), while the RATIONALE (90542-90544) encourages 15/16. Pick one
   consistently (recommend: default 16, accept `-b 9..16`).
-- [ ] **#C5 — output ownership not preserved.** Spec 90389-90392: with
+- [x] **#C5 — output ownership not preserved.** ✓ fixed (phase 5) —
+  `FileMetadata` now carries uid/gid and `apply_to` best-effort `libc::chown`s
+  the output before restoring mode (chown clears setuid/setgid). Spec 90389-90392: with
   sufficient privilege, output ownership shall match input. `FileMetadata`
   preserves only mode + atime + mtime (`compress.rs:114-163`); no
   `chown`/`fchown` anywhere. Minor (privileged path only).
-- [ ] **#C6 — `{NAME_MAX}` hardcoded to 255.** `compress.rs:23,302` uses a
+- [x] **#C6 — `{NAME_MAX}` hardcoded to 255.** ✓ fixed (phase 5) — `name_max`
+  queries `pathconf(_PC_NAME_MAX)` on the target directory, falling back to 255.
+  `compress.rs:23,302` uses a
   literal instead of `pathconf(_PC_NAME_MAX)`. `{PATH_MAX}` uses the libc
   constant (`compress.rs:182-195`) — acceptable since that check is "may fail".
 - [ ] **#C7 — diagnostics hardcoded English.** Error/`-v`/warning strings
   (`compress.rs:169-173, 379-385, 427, 470-475, 616`) are not `gettext`-wrapped
   (the overwrite *prompt* is, `compress.rs:441,527`). `LC_MESSAGES` inert for
   diagnostics.
-- [ ] **#C8 — S_ISVTX / "cannot remove input" policy unimplemented.** Spec
-  90393-90400 mandates nuanced behavior when the input cannot be removed
-  (`-f` vs no-`-f`, remove the output, non-zero exit). `fs::remove_file`
-  failures (`compress.rs:462,548`) just propagate as a generic exit-1 error.
-- [ ] **#C9 — exit code 2 can be lowered to 1 by a later error.** The reducer
-  (`compress.rs:603-608`) lets a subsequent per-file `Err` (sets `exit_code=1`)
-  overwrite a prior size-skip `2`. Both are non-zero/"error" per spec
-  (90511-90516), so cosmetic.
+- [x] **#C8 — "cannot remove input" policy.** ✓ fixed (phase 5) — when the
+  input cannot be removed, both paths now back out (remove) the just-written
+  output and emit a "cannot remove input" diagnostic with a non-zero exit, per
+  spec 90393-90400. (The S_ISVTX-specific `-f`/no-`-f` nuance is intentionally
+  not micro-managed; the core "don't leave both files, report" behavior holds.)
+- [x] **#C9 — exit-code ordering made deterministic.** ✓ fixed (phase 5) — a
+  `merge_exit` helper combines per-file codes order-independently (1 outranks 2
+  outranks 0), so the final status no longer depends on file order. Both 1 and
+  2 remain non-zero per spec 90511-90516.
 
 ### Detailed conformance matrix
 
@@ -216,7 +223,7 @@ output, and a `-b` validation range that contradicts the actual default.
 - [x] `-c`/`-d`/`-f`/`-g`/`-m`/`-v` CONFORMS — all declared and consulted
   (`compress.rs:76-100`); `-g` ⇒ deflate (`compress.rs:286-288`), `-m` last-one
   semantics handled by clap single value.
-- [ ] **`-b` PARTIAL** — see #C4.
+- [x] **`-b`** ✓ fixed (phase 5) — see #C4.
 - [x] `-m`/`-g` mutual non-error CONFORMS — `-g` takes precedence
   (`get_compress_algorithm`, `compress.rs:285-293`); spec 90447-90449 says
   specifying both "shall not be considered an error".
@@ -235,7 +242,7 @@ output, and a `-b` validation range that contradicts the actual default.
   output path built with suffix + `{NAME_MAX}` guard (`compress.rs:296-321`).
 - [x] mode/atime/mtime preservation CONFORMS — `FileMetadata::apply_to`
   (`compress.rs:131-162`).
-- [ ] **ownership preservation MINOR** — see #C5.
+- [x] **ownership preservation** ✓ fixed (phase 5) — see #C5.
 - [x] GZIP format for deflate/gzip CONFORMS — `flate2` `GzEncoder`
   (`compress.rs:206-211`), spec 90504 (RFC 1952).
 
@@ -256,7 +263,7 @@ output, and a `-b` validation range that contradicts the actual default.
 - [x] CONSEQUENCES (input unmodified on error) CONFORMS — output written to a
   *new* path; input removed only after success (`compress.rs:452-462`), spec
   90521-90522.
-- [ ] **exit-2 vs exit-1 ordering MINOR** — see #C9.
+- [x] **exit-2 vs exit-1 ordering** ✓ fixed (phase 5) — see #C9.
 
 ### Test coverage signal
 Not covered:
@@ -266,7 +273,8 @@ Not covered:
   `test_compress_c_on_hardlinked_file`).
 - [x] Decompress of a suffix-less existing file — #C3 (✓ phase 4,
   `test_decompress_suffixless_no_data_loss`).
-- [ ] `-b 15`/`-b 16` (currently rejected) and default-bits value in header.
+- [x] `-b 15`/`-b 16` (previously rejected) and bits value in header — #C4
+  (✓ phase 5, `test_compress_bits_16_accepted_and_roundtrips`).
 - [ ] `-v` percentage output content.
 - [ ] Ownership/time preservation assertions.
 

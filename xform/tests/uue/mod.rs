@@ -448,3 +448,70 @@ fn uudecode_readonly_target_errors() {
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(content, b"KEEP", "read-only target must be left unchanged");
 }
+
+// =============================================================================
+// uuencode coverage backfill — empty input and the "-" / /dev/stdout decode
+// pathname round-trips (audit "Test coverage signal").
+// =============================================================================
+
+#[test]
+fn uuencode_empty_input_roundtrips() {
+    // Empty input still emits a begin header, the zero-length backtick line,
+    // and end; decoding it yields no bytes.
+    let enc = run_test_base(&String::from("uuencode"), &vec![String::from("empty")], b"");
+    assert_eq!(
+        enc.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&enc.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&enc.stdout);
+    assert!(
+        stdout.starts_with("begin ") && stdout.contains("\nend"),
+        "empty-input encoding must have begin/end framing: {stdout:?}"
+    );
+
+    let dec = run_test_base(
+        &String::from("uudecode"),
+        &vec![String::from("-o"), String::from("-")],
+        &enc.stdout,
+    );
+    assert_eq!(dec.status.code(), Some(0));
+    assert!(dec.stdout.is_empty(), "decoded empty input must be empty");
+}
+
+fn decode_pathname_to_stdout_roundtrip(decode_pathname: &str) {
+    // A decode pathname of "-" or "/dev/stdout" in the header must make
+    // uudecode (with no -o override) write to standard output.
+    let payload = "round trip via header cookie\n";
+    let enc = run_test_base(
+        &String::from("uuencode"),
+        &vec![String::from(decode_pathname)],
+        payload.as_bytes(),
+    );
+    assert_eq!(
+        enc.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&enc.stderr)
+    );
+
+    let dec = run_test_base(&String::from("uudecode"), &Vec::new(), &enc.stdout);
+    assert_eq!(
+        dec.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&dec.stderr)
+    );
+    assert_eq!(dec.stdout, payload.as_bytes());
+}
+
+#[test]
+fn uuencode_decode_pathname_dash_roundtrip() {
+    decode_pathname_to_stdout_roundtrip("-");
+}
+
+#[test]
+fn uuencode_decode_pathname_dev_stdout_roundtrip() {
+    decode_pathname_to_stdout_roundtrip("/dev/stdout");
+}

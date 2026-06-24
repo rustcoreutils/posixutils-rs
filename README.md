@@ -58,7 +58,9 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] chgrp
  - [x] chmod
  - [x] chown
+ - [x] cksum
  - [x] cmp
+ - [x] compress (compress cat.)
  - [x] cp
  - [x] crontab (cron cat.)
  - [x] dd
@@ -134,9 +136,12 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] true
  - [x] tty
  - [x] uname
+ - [x] uncompress (compress cat.)
  - [x] unget (SCCS)
  - [x] unlink
  - [x] uucp (UUCP)
+ - [x] uudecode (uue)
+ - [x] uuencode (uue)
  - [x] uustat (UUCP)
  - [x] uux (UUCP)
  - [x] val (SCCS)
@@ -147,6 +152,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] xargs
  - [x] xgettext (i18n)
  - [x] yacc (Development)
+ - [x] zcat (compress cat.)
 
 ## Stage 5 - Fully Translated to 2+ languages
 
@@ -162,9 +168,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] c99 (Development)
  - [x] cal
  - [x] cflow (Development)
- - [x] cksum
  - [x] comm
- - [x] compress (compress cat.)
  - [x] csplit
  - [x] ctags (Development)
  - [x] cut
@@ -189,13 +193,9 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] time
  - [x] tr
  - [x] tsort
- - [x] uncompress (compress cat.)
- - [x] uudecode (uue)
- - [x] uuencode (uue)
  - [x] unexpand
  - [x] uniq
  - [x] wc
- - [x] zcat (compress cat.)
 
 ## Stage 2 - Feature-complete and POSIX compliant
 

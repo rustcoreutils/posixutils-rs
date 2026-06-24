@@ -14,28 +14,32 @@ checks all confirmed absent). No code was changed — this is a punch list.
 
 ## TL;DR (crate-wide)
 
-`cksum` is the cleanest utility audited here — **no Critical or Major
-defects**; the CRC core is a line-for-line transcription of the POSIX model
-program and the output/exit/stdin contract conforms. The other three each have
-real defects. **`uudecode` is the worst: it panics (exit 101) on malformed or
-binary input** (`String::from_utf8().unwrap()` plus a cluster of
-`expect`/`panic!`/index sites), **never honors the `-` magic cookie** mandated
-by Austin Group Defect 1544, and **does not "scan…searching for" the begin
-line** — it requires the header to be the literal first input line, so
-uuencoded data wrapped in a mail message aborts. **`uuencode` mis-parses the
-single-operand form** (`… | uuencode decode_pathname`): because the optional
-`file` operand is positionally *first*, clap binds the lone operand to `file`
-(opened as input) and silently defaults the decode pathname to `/dev/stdout`.
-**`compress` never checks whether stdin is a terminal** before prompting for an
-overwrite (spec: non-terminal + no `-f` → diagnostic + exit >0, *no* prompt),
-runs its hard-link guard even under `-c` (which removes nothing), and has a
-suffix-less-file decompress path that can delete the decompressed output.
-Cross-cutting: locale is initialized everywhere (`setlocale` + `textdomain` +
-`bind_textdomain_codeset`) but runtime diagnostics are hardcoded English, so
-`LC_MESSAGES` is inert; and the Austin-Group-251 newline-in-pathname
-FUTURE DIRECTION is unimplemented (encouraged, not required).
+**Status: complete (2026-06-24).** Every Critical, Major, and Minor item below
+is resolved or accepted-and-tracked; see the per-item ✓ annotations and the
+phase commits.
 
-Totals: **1 Critical, 9 Major, 14 Minor.**
+The audit originally found these defects (all now fixed). `cksum` was the
+cleanest — **no Critical or Major defects** — with the CRC core a line-for-line
+transcription of the POSIX model program. The other three each had real
+defects. **`uudecode` was the worst: it panicked (exit 101) on malformed or
+binary input** (`String::from_utf8().unwrap()` plus a cluster of
+`expect`/`panic!`/index sites), **never honored the `-` magic cookie** mandated
+by Austin Group Defect 1544, and **did not "scan…searching for" the begin
+line** (fixed in phases 1–2). **`uuencode` mis-parsed the single-operand form**
+(fixed in phase 3). **`compress` never checked whether stdin is a terminal**
+before the overwrite prompt, ran its hard-link guard even under `-c`, and had a
+suffix-less-file decompress path that could delete the decompressed output
+(fixed in phase 4); the `-b` range, ownership preservation, NAME_MAX,
+cannot-remove-input policy, and exit-code ordering followed in phase 5.
+Cross-cutting: runtime diagnostics were hardcoded English (`LC_MESSAGES`
+inert) — phase 6 routed every utility's diagnostics through `plib::diag` +
+`gettext`. The Austin-Group-251/-cksum newline-in-pathname FUTURE DIRECTION
+remains intentionally unimplemented (encouraged, not required).
+
+Original totals: **1 Critical, 9 Major, 14 Minor** — all now resolved or
+accepted-and-tracked. Remaining open boxes are optional test-coverage niceties
+only (verbose-`%` output content; root-only ownership/time assertions) plus the
+cksum `-`-as-stdin N/A note — no conformance defects remain.
 
 ---
 
@@ -112,11 +116,13 @@ i18n / future-direction gaps remain. No Critical or Major issues.
 
 ### Test coverage signal
 Not covered:
-- [ ] Multiple file operands (only single stdin case tested).
-- [ ] Named-file operand (pathname printed in output).
-- [ ] Binary / non-UTF-8 file content.
-- [ ] Empty input (length-only CRC).
-- [ ] Per-file error → exit status 1.
+- [x] Multiple file operands (✓ phase 7, `cksum_multiple_file_operands`).
+- [x] Named-file operand (pathname printed in output) (✓ phase 7,
+  `cksum_named_file_operand`).
+- [x] Binary / non-UTF-8 file content (✓ phase 7,
+  `cksum_binary_stdin_non_utf8`).
+- [x] Empty input (length-only CRC) (✓ phase 7, `cksum_empty_input`).
+- [x] Per-file error → exit status 1 (✓ phase 7, `cksum_per_file_error_exit_1`).
 
 ---
 
@@ -369,8 +375,11 @@ real defect is operand parsing: the spec's optional operand (`file`) is
 Not covered:
 - [x] Single-operand stdin form (`… | uuencode name`) — #UE1 (✓ phase 3).
 - [x] Zero-operand usage error — #UE2 (✓ phase 3).
-- [ ] Empty input (begin line then backtick/`end`).
-- [ ] `decode_pathname` of `-` / `/dev/stdout` round-trip through `uudecode`.
+- [x] Empty input (begin line then backtick/`end`) (✓ phase 7,
+  `uuencode_empty_input_roundtrips`).
+- [x] `decode_pathname` of `-` / `/dev/stdout` round-trip through `uudecode`
+  (✓ phase 7, `uuencode_decode_pathname_dash_roundtrip`,
+  `uuencode_decode_pathname_dev_stdout_roundtrip`).
 
 ---
 

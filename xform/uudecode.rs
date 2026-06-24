@@ -9,7 +9,8 @@
 
 use base64::prelude::*;
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
+use plib::diag;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -242,24 +243,19 @@ fn decode_file(args: &Args) -> io::Result<()> {
 
 fn pathname_display(path: &Option<PathBuf>) -> String {
     match path {
-        None => "stdin".to_string(),
+        None => gettext("standard input"),
         Some(p) => p.display().to_string(),
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+fn main() {
+    diag::init_locale("uudecode");
 
     let args = Args::parse();
 
-    let mut exit_code = 0;
-
     if let Err(e) = decode_file(&args) {
-        exit_code = 1;
-        eprintln!("{:?}: {}", pathname_display(&args.file), e);
+        diag::error(&format!("{}: {}", pathname_display(&args.file), e));
     }
 
-    std::process::exit(exit_code)
+    std::process::exit(diag::exit_status())
 }

@@ -9,7 +9,8 @@
 
 use base64::prelude::*;
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
+use plib::diag;
 use std::fs::{File, Permissions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -175,31 +176,26 @@ fn encode_file(base64: bool, file: Option<&Path>, decode_path: &str) -> io::Resu
     Ok(())
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+fn main() {
+    diag::init_locale("uuencode");
 
     let args = Args::parse();
 
     let (file, decode_path) = match resolve_operands(&args.operands) {
         Ok(v) => v,
         Err(msg) => {
-            eprintln!("uuencode: {msg}");
+            diag::error(&msg);
             std::process::exit(1);
         }
     };
 
-    let mut exit_code = 0;
-
     if let Err(e) = encode_file(args.base64, file.as_deref(), &decode_path) {
-        exit_code = 1;
         let name = file
             .as_ref()
             .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "stdin".to_string());
-        eprintln!("{name}: {e}");
+            .unwrap_or_else(|| gettext("standard input"));
+        diag::error(&format!("{name}: {e}"));
     }
 
-    std::process::exit(exit_code)
+    std::process::exit(diag::exit_status())
 }

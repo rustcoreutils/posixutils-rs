@@ -11,7 +11,8 @@ use clap::Parser;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
+use plib::diag;
 use plib::io::input_stream;
 use plib::lzw::{UnixLZWReader, UnixLZWWriter};
 use std::fs::{self, File};
@@ -166,14 +167,19 @@ fn may_overwrite(output_path: &Path, force: bool) -> bool {
             output_path.display()
         ));
         if !yes {
-            eprintln!("{} not overwritten", output_path.display());
+            diag::warning(&format!(
+                "{}: {}",
+                output_path.display(),
+                gettext("not overwritten")
+            ));
         }
         yes
     } else {
-        eprintln!(
-            "compress: {}: already exists; not overwritten (use -f to force)",
-            output_path.display()
-        );
+        diag::error(&format!(
+            "{}: {}",
+            output_path.display(),
+            gettext("already exists; not overwritten (use -f to force)")
+        ));
         false
     }
 }
@@ -245,11 +251,11 @@ impl FileMetadata {
 fn check_hard_links(path: &Path, force: bool) -> io::Result<bool> {
     let meta = fs::metadata(path)?;
     if meta.nlink() > 1 {
-        eprintln!(
-            "compress: {}: has {} hard links",
+        diag::warning(&format!(
+            "{}: {}",
             path.display(),
-            meta.nlink()
-        );
+            gettext!("has {} hard links", meta.nlink())
+        ));
         if !force {
             return Ok(false);
         }
@@ -265,7 +271,7 @@ fn check_path_max(path: &Path) -> io::Result<()> {
         if path_len > libc::PATH_MAX as usize {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "pathname too long",
+                gettext("pathname too long"),
             ));
         }
     }
@@ -319,7 +325,7 @@ fn decompress_auto(data: &[u8]) -> io::Result<Vec<u8>> {
         Some(Algorithm::Deflate) => decompress_gzip(data),
         None => Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "unknown compression format",
+            gettext("unknown compression format"),
         )),
     }
 }
@@ -331,7 +337,7 @@ fn parse_algorithm(s: &str) -> io::Result<Algorithm> {
         "deflate" | "gzip" => Ok(Algorithm::Deflate),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("unknown algorithm: {}", s),
+            gettext!("unknown algorithm: {}", s),
         )),
     }
 }
@@ -346,7 +352,7 @@ fn validate_bits(algo: Algorithm, bits: u32) -> io::Result<()> {
             if !(9..=16).contains(&bits) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "LZW bits must be 9-16",
+                    gettext("LZW bits must be 9-16"),
                 ));
             }
         }
@@ -354,7 +360,7 @@ fn validate_bits(algo: Algorithm, bits: u32) -> io::Result<()> {
             if !(1..=9).contains(&bits) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "DEFLATE level must be 1-9",
+                    gettext("DEFLATE level must be 1-9"),
                 ));
             }
         }
@@ -375,9 +381,12 @@ fn get_compress_algorithm(args: &Args) -> io::Result<Algorithm> {
 
 /// Build output path for compression
 fn compress_output_path(input: &Path, algo: Algorithm) -> io::Result<PathBuf> {
-    let file_name = input
-        .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "input path has no filename"))?;
+    let file_name = input.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            gettext("input path has no filename"),
+        )
+    })?;
     let fname = format!("{}{}", file_name.to_string_lossy(), algo.suffix());
 
     let parent = input.parent();
@@ -385,7 +394,7 @@ fn compress_output_path(input: &Path, algo: Algorithm) -> io::Result<PathBuf> {
     if fname.len() > name_max(dir) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "filename too long",
+            gettext("filename too long"),
         ));
     }
 
@@ -455,11 +464,11 @@ fn compress_file(args: &Args, pathname: &Path, algo: Algorithm) -> io::Result<i3
     if !reading_stdin {
         if let Some(ext) = pathname.extension() {
             if ext == "Z" || ext == "gz" {
-                eprintln!(
-                    "compress: {}: already has {} suffix",
+                diag::warning(&format!(
+                    "{}: {}",
                     pathname.display(),
-                    ext.to_str().unwrap()
-                );
+                    gettext!("already has {} suffix", ext.to_str().unwrap())
+                ));
             }
         }
     }
@@ -504,7 +513,10 @@ fn compress_file(args: &Args, pathname: &Path, algo: Algorithm) -> io::Result<i3
             } else {
                 0.0
             };
-            eprintln!("{}: Compression: {:.1}%", pathname.display(), ratio);
+            eprintln!(
+                "{}",
+                gettext!("{}: Compression: {:.1}%", pathname.display(), ratio)
+            );
         }
         return Ok(0);
     }
@@ -536,11 +548,12 @@ fn compress_file(args: &Args, pathname: &Path, algo: Algorithm) -> io::Result<i3
     // (spec 90393-90400).
     if let Err(e) = fs::remove_file(pathname) {
         let _ = fs::remove_file(&output_path);
-        eprintln!(
-            "compress: {}: cannot remove input: {}",
+        diag::error(&format!(
+            "{}: {}: {}",
             pathname.display(),
+            gettext("cannot remove input"),
             e
-        );
+        ));
         return Ok(1);
     }
 
@@ -551,10 +564,13 @@ fn compress_file(args: &Args, pathname: &Path, algo: Algorithm) -> io::Result<i3
             0.0
         };
         eprintln!(
-            "{}: -- replaced with {} Compression: {:.1}%",
-            pathname.display(),
-            output_path.display(),
-            ratio
+            "{}",
+            gettext!(
+                "{}: -- replaced with {} Compression: {:.1}%",
+                pathname.display(),
+                output_path.display(),
+                ratio
+            )
         );
     }
 
@@ -598,7 +614,7 @@ fn decompress_file(args: &Args, pathname: &Path) -> io::Result<i32> {
     if writing_to_stdout {
         io::stdout().write_all(&decompressed)?;
         if args.verbose && !reading_stdin {
-            eprintln!("{}: -- decompressed", input_path.display());
+            eprintln!("{}", gettext!("{}: -- decompressed", input_path.display()));
         }
         return Ok(0);
     }
@@ -610,10 +626,11 @@ fn decompress_file(args: &Args, pathname: &Path) -> io::Result<i32> {
     // equals the input path: writing the decompressed bytes and then removing
     // the input would destroy the result (#C3, data loss).
     if output_path == input_path {
-        eprintln!(
-            "compress: {}: unknown suffix -- ignored",
-            input_path.display()
-        );
+        diag::error(&format!(
+            "{}: {}",
+            input_path.display(),
+            gettext("unknown suffix -- ignored")
+        ));
         return Ok(1);
     }
 
@@ -637,30 +654,32 @@ fn decompress_file(args: &Args, pathname: &Path) -> io::Result<i32> {
     // (spec 90393-90400).
     if let Err(e) = fs::remove_file(&input_path) {
         let _ = fs::remove_file(&output_path);
-        eprintln!(
-            "compress: {}: cannot remove input: {}",
+        diag::error(&format!(
+            "{}: {}: {}",
             input_path.display(),
+            gettext("cannot remove input"),
             e
-        );
+        ));
         return Ok(1);
     }
 
     if args.verbose {
         eprintln!(
-            "{}: -- replaced with {} ({} bytes)",
-            input_path.display(),
-            output_path.display(),
-            decompressed_size
+            "{}",
+            gettext!(
+                "{}: -- replaced with {} ({} bytes)",
+                input_path.display(),
+                output_path.display(),
+                decompressed_size
+            )
         );
     }
 
     Ok(0)
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+fn main() {
+    diag::init_locale("compress");
 
     let program_mode = ProgramMode::detect();
     let mut args = Args::parse();
@@ -684,7 +703,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Determine algorithm for compression
     let algo = if !args.decompress {
-        get_compress_algorithm(&args)?
+        match get_compress_algorithm(&args) {
+            Ok(a) => a,
+            Err(e) => {
+                diag::error(&e.to_string());
+                std::process::exit(1);
+            }
+        }
     } else {
         Algorithm::Lzw // not used for decompression (auto-detect)
     };
@@ -703,11 +728,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => {
                 exit_code = merge_exit(exit_code, 1);
                 let display_name = if is_stdin(filename) {
-                    "stdin".to_string()
+                    gettext("standard input")
                 } else {
                     filename.display().to_string()
                 };
-                eprintln!("compress: {}: {}", display_name, e);
+                diag::error(&format!("{}: {}", display_name, e));
             }
         }
     }

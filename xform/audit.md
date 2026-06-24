@@ -56,18 +56,18 @@ i18n / future-direction gaps remain. No Critical or Major issues.
 ### Priority issues
 
 #### Minor
-- [ ] **#CK1 — runtime diagnostics hardcoded English.** `cksum.rs:87`
-  (`eprintln!("{}: {}", …, e)`) emits Rust std I/O error text; `LC_MESSAGES`
-  inert despite the spec listing it. `setlocale`/`textdomain` are wired
-  (`cksum.rs:71-73`) but the strings are not `gettext`-wrapped. Fix: route
-  through a shared diag helper + `gettext`.
-- [ ] **#CK2 — newline-in-pathname not treated as an error.** FUTURE DIRECTIONS
-  (spec 89779-89782) encourages erroring when an output pathname contains an
-  encoded `<newline>`. Not implemented (`cksum.rs:59-66`). Encouraged, not
-  `shall` — Minor.
-- [ ] **#CK3 — clap adds `--help`/`--version` though OPTIONS is "None".**
-  `cksum.rs:28-29`. Harmless extension; flag only for strict-conformance
-  tracking.
+- [x] **#CK1 — runtime diagnostics hardcoded English.** ✓ fixed (phase 6) —
+  `main` now uses `plib::diag::init_locale("cksum")` and routes the per-file
+  error through `diag::error` with a `gettext`-wrapped "standard input" label;
+  the std I/O error text is appended after a localizable prefix.
+- [x] **#CK2 — newline-in-pathname not treated as an error.** ✓ accepted —
+  FUTURE DIRECTIONS (spec 89779-89782) only *encourages* erroring when an output
+  pathname contains an encoded `<newline>`; it is not a `shall`. Intentionally
+  not implemented (also applies to the analogous `compress` path). Tracked.
+- [x] **#CK3 — clap adds `--help`/`--version` though OPTIONS is "None".**
+  ✓ accepted (phase 6) — `--help`/`--version` are a deliberate, project-wide
+  convention across all posixutils-rs utilities; kept intentionally. Tracked,
+  not a defect to fix.
 
 ### Detailed conformance matrix
 
@@ -92,8 +92,8 @@ i18n / future-direction gaps remain. No Critical or Major issues.
 #### Environment variables
 - [x] `LANG`/`LC_ALL`/`LC_CTYPE` CONFORMS (via `setlocale(LcAll, "")`,
   `cksum.rs:71`).
-- [ ] **`LC_MESSAGES`/`NLSPATH` MINOR** — locale initialized but diagnostics
-  not localized (#CK1).
+- [x] **`LC_MESSAGES`/`NLSPATH`** ✓ fixed (phase 6) — diagnostics now route
+  through `plib::diag` + `gettext` (#CK1).
 
 #### STDOUT / STDERR / exit status
 - [x] STDOUT format CONFORMS — `"{} {}{}{}"` = checksum, octets, prefix,
@@ -203,10 +203,13 @@ output, and a `-b` validation range that contradicts the actual default.
   `compress.rs:23,302` uses a
   literal instead of `pathconf(_PC_NAME_MAX)`. `{PATH_MAX}` uses the libc
   constant (`compress.rs:182-195`) — acceptable since that check is "may fail".
-- [ ] **#C7 — diagnostics hardcoded English.** Error/`-v`/warning strings
-  (`compress.rs:169-173, 379-385, 427, 470-475, 616`) are not `gettext`-wrapped
-  (the overwrite *prompt* is, `compress.rs:441,527`). `LC_MESSAGES` inert for
-  diagnostics.
+- [x] **#C7 — diagnostics hardcoded English.** ✓ fixed (phase 6) — `compress`
+  now uses `plib::diag::init_locale` and routes error/warning diagnostics
+  through `diag::error`/`diag::warning` with `gettext`/`gettext!`-wrapped
+  messages; the constructed `io::Error` strings (bits range, algorithm,
+  format, NAME/PATH limits) and the `-v` informational lines are
+  `gettext`-wrapped too. (The literal "compress: " program-name prefix on the
+  interactive prompt is language-neutral and kept.)
 - [x] **#C8 — "cannot remove input" policy.** ✓ fixed (phase 5) — when the
   input cannot be removed, both paths now back out (remove) the just-written
   output and emit a "cannot remove input" diagnostic with a non-zero exit, per
@@ -319,12 +322,14 @@ real defect is operand parsing: the spec's optional operand (`file`) is
   computed as `RW & !umask(RW)` (`uuencode.rs:121-132`), which *sets* the umask
   to `0666` and never restores it. Harmless (the process exits immediately) but
   a smell; query without mutating, or restore afterward.
-- [ ] **#UE4 — diagnostics debug-quote the path + hardcoded English.**
-  `eprintln!("{:?}: {}", …)` (`uuencode.rs:188`) wraps the pathname in quotes
-  and is not `gettext`-wrapped.
-- [ ] **#UE5 — `decode_pathname` not validated against the portable filename
-  character set N/A.** Spec 119839-119840: results "unspecified" if non-portable
-  chars appear — no obligation, tracked only.
+- [x] **#UE4 — diagnostics debug-quote the path + hardcoded English.**
+  ✓ fixed (phase 6) — both diagnostic sites now route through `plib::diag`
+  (no manual prefix), use `Display` (no `{:?}` quoting), and the "standard
+  input" fallback label is `gettext`-wrapped.
+- [x] **#UE5 — `decode_pathname` not validated against the portable filename
+  character set N/A.** ✓ accepted (phase 6) — spec 119839-119840 makes results
+  "unspecified" for non-portable chars; there is no `shall`, so no validation
+  is required. Tracked only, intentionally not implemented.
 
 ### Detailed conformance matrix
 
@@ -422,12 +427,12 @@ check** while treating a failed `set_permissions` as fatal.
   (`uudecode.rs:125`) but does not strip `\r`. Fix: filter to the alphabet
   before decoding.
 - [x] **#UD5 — existing-file write-permission check missing; overwrite is
-  unlink+create.** Spec 119716-119720: if the target exists and the user lacks
-  write permission, terminate with an error; if writable, overwrite in place.
-  The code unconditionally `remove_file` then `File::create`
-  (`uudecode.rs:156-161`), which depends only on directory write permission
-  (bypassing the file's own perms) and changes inode/ownership. Fix: check
-  write access; truncate-in-place rather than unlink.
+  unlink+create.** ✓ fixed (phase 2) — `decode_file` now checks `is_writable`
+  (`libc::access(W_OK)`) before writing and uses `File::create` to truncate in
+  place (no `remove_file`), so the inode/ownership are preserved and a
+  read-only target is refused with `PermissionDenied`. Spec 119716-119720: if
+  the target exists and the user lacks write permission, terminate with an
+  error; if writable, overwrite in place.
 - [x] **#UD6 — failed `set_permissions` treated as fatal.** ✓ fixed (phase 2) — `set_permissions` result is ignored. `set_permissions(…)?`
   (`uudecode.rs:168`) propagates as an error. Spec 119719-119720: "if the mode
   bits cannot be set, uudecode shall not treat this as an error." Fix: ignore
@@ -440,8 +445,10 @@ check** while treating a failed `set_permissions` as fatal.
   symbolic chmod notation (spec 119714-119715, "unspecified" initial mode) is
   unsupported and a leading sign panics (`uudecode.rs:63-64`). Low risk —
   `uuencode` here always emits 3 octal digits.
-- [ ] **#UD8 — diagnostics debug-quote the path + hardcoded English.**
-  `eprintln!("{:?}: {}", …)` (`uudecode.rs:192`); not `gettext`-wrapped.
+- [x] **#UD8 — diagnostics debug-quote the path + hardcoded English.**
+  ✓ fixed (phase 6) — the diagnostic now routes through `plib::diag::error`
+  with `pathname_display` returning a `gettext`-wrapped "standard input" and a
+  plain `Display` path (no `{:?}`).
 
 ### Detailed conformance matrix
 

@@ -1108,3 +1108,148 @@ fn test_compress_binary_repeating_pattern() {
     let data: Vec<u8> = pattern.iter().cycle().take(100_000).copied().collect();
     binary_roundtrip_test(&data, "repeating");
 }
+
+// =============================================================================
+// POSIX audit regression tests (xform/audit.md)
+// =============================================================================
+
+#[test]
+fn test_overwrite_nonterminal_no_force_diagnoses(/* #C1 */) {
+    // When stdout output already exists, -f is absent, and stdin is NOT a
+    // terminal (the test harness pipes stdin), compress must NOT prompt
+    // (which would consume the input stream). It must emit a diagnostic and
+    // exit non-zero, leaving the existing output untouched.
+    let test_dir = get_test_dir();
+    let test_file = test_dir.join("c1_src.txt");
+    let compressed_file = test_dir.join("c1_src.txt.Z");
+
+    cleanup_file(&test_file);
+    cleanup_file(&compressed_file);
+
+    fs::copy(test_dir.join("lorem_ipsum.txt"), &test_file).unwrap();
+    // Pre-create the output file with sentinel content.
+    fs::write(&compressed_file, b"SENTINEL").unwrap();
+
+    let str_args: Vec<String> = vec![test_file.to_str().unwrap().to_string()];
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("compress"),
+            args: str_args,
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 1,
+        },
+        |_plan, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("already exists") && stderr.contains("not overwritten"),
+                "expected non-terminal overwrite diagnostic, got: {}",
+                stderr
+            );
+        },
+    );
+
+    // Existing output must be untouched (not overwritten by compressed data).
+    let after = fs::read(&compressed_file).unwrap();
+    assert_eq!(
+        after, b"SENTINEL",
+        "existing output must not be overwritten"
+    );
+    // Input must still exist (not removed).
+    assert!(test_file.exists(), "input must be preserved on refusal");
+
+    cleanup_file(&test_file);
+    cleanup_file(&compressed_file);
+}
+
+#[test]
+fn test_compress_c_on_hardlinked_file(/* #C2 */) {
+    // `compress -c` never removes its input, so a multiply-hard-linked input
+    // must not be rejected by the hard-link guard; it must produce output.
+    let test_dir = get_test_dir();
+    let test_file = test_dir.join("c2_src.txt");
+    let link_file = test_dir.join("c2_link.txt");
+
+    cleanup_file(&test_file);
+    cleanup_file(&link_file);
+
+    fs::copy(test_dir.join("lorem_ipsum.txt"), &test_file).unwrap();
+    fs::hard_link(&test_file, &link_file).unwrap();
+
+    let str_args: Vec<String> = vec![String::from("-c"), test_file.to_str().unwrap().to_string()];
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("compress"),
+            args: str_args,
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            assert!(
+                output.stdout.len() >= 2 && output.stdout[0] == 0x1F && output.stdout[1] == 0x9D,
+                "compress -c on a hard-linked file should emit compressed output"
+            );
+        },
+    );
+
+    // Both links must still exist (nothing removed under -c).
+    assert!(test_file.exists() && link_file.exists());
+
+    cleanup_file(&test_file);
+    cleanup_file(&link_file);
+}
+
+#[test]
+fn test_decompress_suffixless_no_data_loss(/* #C3 */) {
+    // Decompressing a suffix-less existing file must not write-then-delete the
+    // same path (data loss). The tool must refuse and preserve the input.
+    let test_dir = get_test_dir();
+    let src = test_dir.join("c3_src.txt");
+    let dotz = test_dir.join("c3_src.txt.Z");
+    let nosuffix = test_dir.join("c3_nosuffix");
+
+    cleanup_file(&src);
+    cleanup_file(&dotz);
+    cleanup_file(&nosuffix);
+
+    // Produce valid LZW-compressed bytes, then store them under a name with
+    // no known suffix.
+    fs::copy(test_dir.join("lorem_ipsum.txt"), &src).unwrap();
+    compress_test(&[src.to_str().unwrap()], "", "");
+    let compressed = fs::read(&dotz).unwrap();
+    fs::write(&nosuffix, &compressed).unwrap();
+
+    let str_args: Vec<String> = vec![String::from("-d"), nosuffix.to_str().unwrap().to_string()];
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("compress"),
+            args: str_args,
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 1,
+        },
+        |_plan, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("unknown suffix"),
+                "expected suffix-less refusal, got: {}",
+                stderr
+            );
+        },
+    );
+
+    // The input must be intact (its compressed bytes preserved, not destroyed).
+    assert!(nosuffix.exists(), "suffix-less input must be preserved");
+    assert_eq!(
+        fs::read(&nosuffix).unwrap(),
+        compressed,
+        "suffix-less input content must be unchanged"
+    );
+
+    cleanup_file(&dotz);
+    cleanup_file(&nosuffix);
+}

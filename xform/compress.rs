@@ -15,7 +15,7 @@ use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleC
 use plib::io::input_stream;
 use plib::lzw::{UnixLZWReader, UnixLZWWriter};
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -107,8 +107,40 @@ fn is_stdin(pathname: &Path) -> bool {
 fn prompt_user(prompt: &str) -> bool {
     eprint!("compress: {} ", prompt);
     let mut response = String::new();
-    io::stdin().read_line(&mut response).unwrap();
+    if io::stdin().read_line(&mut response).is_err() {
+        return false;
+    }
     response.to_lowercase().starts_with('y')
+}
+
+/// Decide whether an existing output file may be overwritten.
+///
+/// Returns `true` to proceed with the write, `false` to skip it (the caller
+/// then returns a non-zero exit code). Per POSIX (90427-90432), the overwrite
+/// prompt is issued **only** when standard input is a terminal; when stdin is
+/// not a terminal and `-f` was not given, a diagnostic is written and the file
+/// is not overwritten, with no prompt (so a pipeline's input stream is never
+/// consumed by `read_line`).
+fn may_overwrite(output_path: &Path, force: bool) -> bool {
+    if force || !output_path.exists() {
+        return true;
+    }
+    if io::stdin().is_terminal() {
+        let yes = prompt_user(&gettext!(
+            "Do you want to overwrite {} (y)es or (n)o?",
+            output_path.display()
+        ));
+        if !yes {
+            eprintln!("{} not overwritten", output_path.display());
+        }
+        yes
+    } else {
+        eprintln!(
+            "compress: {}: already exists; not overwritten (use -f to force)",
+            output_path.display()
+        );
+        false
+    }
 }
 
 /// Saved file metadata for preservation
@@ -371,6 +403,7 @@ fn find_decompress_input(pathname: &Path) -> PathBuf {
 /// Process a single file for compression
 fn compress_file(args: &Args, pathname: &Path, algo: Algorithm) -> io::Result<i32> {
     let reading_stdin = is_stdin(pathname);
+    let writing_to_stdout = args.stdout || reading_stdin;
 
     // Warn if input already has compression suffix
     if !reading_stdin {
@@ -385,8 +418,11 @@ fn compress_file(args: &Args, pathname: &Path, algo: Algorithm) -> io::Result<i3
         }
     }
 
-    // Check hard links
-    if !reading_stdin && !check_hard_links(pathname, args.force)? {
+    // Check hard links only when the input will actually be unlinked. Under
+    // -c (or stdin) the input is never removed, so the multi-link guard
+    // (spec 90403-90406, about files "to be removed after processing") does
+    // not apply.
+    if !writing_to_stdout && !check_hard_links(pathname, args.force)? {
         return Ok(1);
     }
 
@@ -414,8 +450,6 @@ fn compress_file(args: &Args, pathname: &Path, algo: Algorithm) -> io::Result<i3
     };
     let out_buf_size = out_buf.len();
 
-    let writing_to_stdout = args.stdout || reading_stdin;
-
     if writing_to_stdout {
         io::stdout().write_all(&out_buf)?;
         if args.verbose && !reading_stdin {
@@ -436,16 +470,9 @@ fn compress_file(args: &Args, pathname: &Path, algo: Algorithm) -> io::Result<i3
 
     let output_path = compress_output_path(pathname, algo)?;
 
-    // Check for existing file
-    if output_path.exists() && !args.force {
-        let is_affirm = prompt_user(&gettext!(
-            "Do you want to overwrite {} (y)es or (n)o?",
-            output_path.display()
-        ));
-        if !is_affirm {
-            eprintln!("{} not overwritten", output_path.display());
-            return Ok(1);
-        }
+    // Check for existing file (terminal-gated prompt per #C1)
+    if !may_overwrite(&output_path, args.force) {
+        return Ok(1);
     }
 
     // Write compressed file
@@ -490,8 +517,9 @@ fn decompress_file(args: &Args, pathname: &Path) -> io::Result<i32> {
         find_decompress_input(pathname)
     };
 
-    // Check hard links
-    if !reading_stdin && !check_hard_links(&input_path, args.force)? {
+    // Check hard links only when the input will actually be unlinked
+    // (not under -c / stdin); see #C2.
+    if !writing_to_stdout && !check_hard_links(&input_path, args.force)? {
         return Ok(1);
     }
 
@@ -522,16 +550,20 @@ fn decompress_file(args: &Args, pathname: &Path) -> io::Result<i32> {
     // File output mode
     let output_path = decompress_output_path(&input_path);
 
-    // Check for existing output
-    if output_path.exists() && !args.force {
-        let is_affirm = prompt_user(&gettext!(
-            "Do you want to overwrite {} (y)es or (n)o?",
-            output_path.display()
-        ));
-        if !is_affirm {
-            eprintln!("{} not overwritten", output_path.display());
-            return Ok(1);
-        }
+    // Refuse when the input has no known suffix to strip, so the output path
+    // equals the input path: writing the decompressed bytes and then removing
+    // the input would destroy the result (#C3, data loss).
+    if output_path == input_path {
+        eprintln!(
+            "compress: {}: unknown suffix -- ignored",
+            input_path.display()
+        );
+        return Ok(1);
+    }
+
+    // Check for existing output (terminal-gated prompt per #C1)
+    if !may_overwrite(&output_path, args.force) {
+        return Ok(1);
     }
 
     // Write decompressed file

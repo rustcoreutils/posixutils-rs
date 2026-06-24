@@ -144,7 +144,10 @@ output, and a `-b` validation range that contradicts the actual default.
 ### Priority issues
 
 #### Major
-- [ ] **#C1 — overwrite prompt never checks whether stdin is a terminal.**
+- [x] **#C1 — overwrite prompt never checks whether stdin is a terminal.**
+  ✓ fixed (phase 4) — `may_overwrite` gates the prompt on
+  `io::stdin().is_terminal()`; when stdin is not a terminal and `-f` is absent
+  it writes a diagnostic and refuses (exit 1) without reading stdin.
   `compress.rs:440-449` (compress) and `compress.rs:526-535` (decompress) call
   `prompt_user` (`compress.rs:107-112`) whenever the output file exists and
   `-f` is absent, unconditionally reading a line from stdin. Spec (90427-90432):
@@ -153,7 +156,9 @@ output, and a `-b` validation range that contradicts the actual default.
   prompt. No `isatty`/`is_terminal` call exists anywhere in the crate.
   Consequence: in a pipeline the prompt silently consumes data from the input
   stream. Fix: gate on `std::io::stdin().is_terminal()`.
-- [ ] **#C2 — hard-link guard runs even with `-c`.** `compress_file` calls
+- [x] **#C2 — hard-link guard runs even with `-c`.** ✓ fixed (phase 4) — both
+  call sites now gate `check_hard_links` on `!writing_to_stdout`, so `-c`/stdin
+  (input never unlinked) no longer triggers the guard. `compress_file` calls
   `check_hard_links` (`compress.rs:389`) *before* the `writing_to_stdout`
   branch (`compress.rs:417`); `decompress_file` likewise (`compress.rs:494`).
   Under `-c` the input is never removed, so the multi-hard-link case (spec
@@ -161,8 +166,11 @@ output, and a `-b` validation range that contradicts the actual default.
   apply — yet `compress -c hardlinked` warns and returns 1 with no output.
   Fix: only check when the input will actually be unlinked
   (`!stdout && !stdin`).
-- [ ] **#C3 — suffix-less decompress can delete the decompressed output
-  (data loss).** For `uncompress foo` where `foo` exists but has no known
+- [x] **#C3 — suffix-less decompress can delete the decompressed output
+  (data loss).** ✓ fixed (phase 4) — `decompress_file` now refuses with an
+  "unknown suffix" diagnostic (exit 1) when the resolved `output_path` equals
+  the `input_path`, so the write-then-`remove_file` on the same path can no
+  longer occur. For `uncompress foo` where `foo` exists but has no known
   suffix, `find_decompress_input` returns `foo` as-is (`compress.rs:336-339`)
   and `decompress_output_path(foo)` returns `foo` unchanged (no suffix to
   strip, `compress.rs:324-333`). The code then writes the decompressed bytes to
@@ -220,7 +228,7 @@ output, and a `-b` validation range that contradicts the actual default.
   (`compress.rs:583-585`); `-`⇒stdin⇒stdout (`compress.rs:373,417,483-484`).
 - [x] Multi-file `zcat` concatenation CONFORMS — each file decompressed to
   stdout in turn (`compress.rs:596-601`), matching spec 90369-90370.
-- [ ] **Overwrite/terminal handling PARTIAL** — see #C1.
+- [x] **Overwrite/terminal handling** ✓ fixed (phase 4) — see #C1.
 
 #### Output files / metadata
 - [x] `.Z`/`.gz` suffix CONFORMS — `Algorithm::suffix` (`compress.rs:33-38`);
@@ -238,7 +246,7 @@ output, and a `-b` validation range that contradicts the actual default.
 - [x] try `file`, `file.Z`, `file.gz` CONFORMS (as permitted extension) —
   `find_decompress_input` (`compress.rs:336-369`); spec 90534-90537 allows
   trying other known suffixes.
-- [ ] **suffix-less file path DIVERGES (data loss) — see #C3.**
+- [x] **suffix-less file path** ✓ fixed (phase 4) — see #C3.
 
 #### Exit status / consequences of errors
 - [x] compress 0/1/2/>2 CONFORMS — size-increase ⇒ 2 (`compress.rs:433-435`),
@@ -252,10 +260,12 @@ output, and a `-b` validation range that contradicts the actual default.
 
 ### Test coverage signal
 Not covered:
-- [ ] Non-terminal overwrite-without-`-f` (should diagnose + exit >0, not
-  prompt) — #C1.
-- [ ] `compress -c` on a multiply-hard-linked file — #C2.
-- [ ] Decompress of a suffix-less existing file — #C3.
+- [x] Non-terminal overwrite-without-`-f` (should diagnose + exit >0, not
+  prompt) — #C1 (✓ phase 4, `test_overwrite_nonterminal_no_force_diagnoses`).
+- [x] `compress -c` on a multiply-hard-linked file — #C2 (✓ phase 4,
+  `test_compress_c_on_hardlinked_file`).
+- [x] Decompress of a suffix-less existing file — #C3 (✓ phase 4,
+  `test_decompress_suffixless_no_data_loss`).
 - [ ] `-b 15`/`-b 16` (currently rejected) and default-bits value in header.
 - [ ] `-v` percentage output content.
 - [ ] Ownership/time preservation assertions.

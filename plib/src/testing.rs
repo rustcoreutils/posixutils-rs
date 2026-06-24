@@ -71,6 +71,43 @@ pub struct TestPlanU8 {
     pub expected_exit_code: i32,
 }
 
+/// Spawn a child process, retrying transient OS-level failures.
+///
+/// The test suite runs many tests in parallel, each forking child processes
+/// (some, like the PTY-based `talk`/`write`/`tty` tests, fork several). Under
+/// that load `fork`/`exec` can transiently fail with `EAGAIN` (RLIMIT_NPROC or
+/// memory pressure) or `ETXTBSY` (the binary briefly held open for write by a
+/// concurrent build). These are not test failures, so retry with backoff
+/// instead of swallowing the error and panicking the first time it happens.
+fn spawn_with_retry(command: &mut Command, cmd: &str) -> std::process::Child {
+    use std::io::ErrorKind;
+
+    const MAX_ATTEMPTS: u32 = 5;
+    let mut last_err = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        match command.spawn() {
+            Ok(child) => return child,
+            Err(e) => {
+                let transient = matches!(
+                    e.kind(),
+                    ErrorKind::WouldBlock | ErrorKind::ResourceBusy | ErrorKind::Interrupted
+                ) || e.raw_os_error() == Some(libc::EAGAIN)
+                    || e.raw_os_error() == Some(libc::ETXTBSY);
+                if !transient {
+                    panic!("failed to spawn command {cmd}: {e}");
+                }
+                // Exponential backoff: 20ms, 40ms, 80ms, 160ms.
+                thread::sleep(Duration::from_millis(20u64 << attempt));
+                last_err = Some(e);
+            }
+        }
+    }
+    panic!(
+        "failed to spawn command {cmd} after {MAX_ATTEMPTS} attempts: {}",
+        last_err.expect("retry loop ran without recording an error")
+    );
+}
+
 /// Run a test command with environment variables
 ///
 /// This is the core test runner that supports setting environment variables.
@@ -109,9 +146,7 @@ pub fn run_test_base_with_env(
         command.env(key, value);
     }
 
-    let mut child = command
-        .spawn()
-        .unwrap_or_else(|_| panic!("failed to spawn command {cmd}"));
+    let mut child = spawn_with_retry(&mut command, cmd);
 
     // Separate the mutable borrow of stdin from the child process
     if let Some(mut stdin) = child.stdin.take() {

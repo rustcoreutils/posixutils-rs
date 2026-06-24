@@ -9,11 +9,12 @@
 
 use base64::prelude::*;
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
+use plib::diag;
 use std::fs::{File, Permissions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const PERMISSION_MASK: u32 = 0o7;
 const RW: u32 = 0o666;
@@ -25,11 +26,10 @@ struct Args {
     #[arg(short = 'm', long, help = gettext("Encode to base64 (MIME) standard, rather than UUE format"))]
     base64: bool,
 
-    #[arg(help = gettext("File to read as input"))]
-    file: Option<PathBuf>,
-
-    #[arg(help = gettext("Decode pathname"))]
-    decode_path: Option<String>,
+    /// `[file] decode_pathname` — the optional input file is the *first* operand,
+    /// the required decode pathname is the last.
+    #[arg(help = gettext("[file] decode_pathname"))]
+    operands: Vec<String>,
 }
 
 enum EncodingType {
@@ -47,6 +47,20 @@ impl EncodingType {
     }
 }
 
+/// Resolve operands into `(input file, decode_pathname)`.
+///
+/// Synopsis is `uuencode [-m] [file] decode_pathname`: the optional `file` is the
+/// *first* operand, so a single operand is the (required) decode pathname and the
+/// input is standard input.
+fn resolve_operands(operands: &[String]) -> Result<(Option<PathBuf>, String), String> {
+    match operands {
+        [] => Err(gettext("missing decode_pathname operand")),
+        [decode_pathname] => Ok((None, decode_pathname.clone())),
+        [file, decode_pathname] => Ok((Some(PathBuf::from(file)), decode_pathname.clone())),
+        _ => Err(gettext("too many operands")),
+    }
+}
+
 /// <sys/stat.h> mentions the constants ncessary to extract out the permission
 /// so we'll use bit masking by shifting 3 bits everytime to ge
 fn get_permission_values(perm: Permissions) -> String {
@@ -57,6 +71,22 @@ fn get_permission_values(perm: Permissions) -> String {
     let user_perm = (perm_mode >> 6) & PERMISSION_MASK;
 
     format!("{user_perm}{group_perm}{others_perm}")
+}
+
+/// Read the current umask without leaving it changed (umask(2) has no read-only form).
+fn current_umask_mode() -> u32 {
+    #[cfg(target_os = "macos")]
+    {
+        let old = unsafe { libc::umask(RW as u16) };
+        unsafe { libc::umask(old) };
+        RW & (!old as u32)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let old = unsafe { libc::umask(RW) };
+        unsafe { libc::umask(old) };
+        RW & !old
+    }
 }
 
 fn encode_base64_line(line: &[u8]) -> Vec<u8> {
@@ -95,54 +125,33 @@ fn encode_historical_line(line: &[u8]) -> Vec<u8> {
     out
 }
 
-/// encodes the file(it can be standard input too) and outputs on standard output
-fn encode_file(args: &Args) -> io::Result<()> {
-    let decode_path = match &args.decode_path {
-        None => String::from("/dev/stdout"),
-        Some(path) => String::from(path),
-    };
-
-    let encoding_type = if args.base64 {
+/// encodes the file (it can be standard input too) and outputs on standard output
+fn encode_file(base64: bool, file: Option<&Path>, decode_path: &str) -> io::Result<()> {
+    let encoding_type = if base64 {
         EncodingType::Base64
     } else {
         EncodingType::Historical
     };
+    let header_init = encoding_type.get_header();
 
     let mut buf: Vec<u8> = Vec::new();
     let mut out: Vec<u8> = Vec::new();
 
-    let header_init = encoding_type.get_header();
-    let file_p = args
-        .file
-        .as_ref()
-        .unwrap_or(&PathBuf::from("/dev/stdin"))
-        .clone();
-
-    if file_p.as_os_str() == "/dev/stdin" {
-        let mode = {
-            #[cfg(target_os = "macos")]
-            {
-                RW & (!unsafe { libc::umask(RW as u16) } as u32)
-            }
-
-            #[cfg(not(target_os = "macos"))]
-            {
-                RW & (!unsafe { libc::umask(RW) })
-            }
-        };
-
-        let perm = get_permission_values(Permissions::from_mode(mode));
-        let header = format!("{header_init} {perm} {decode_path}\n");
-
-        io::stdout().write_all(header.as_bytes())?;
-        io::stdin().lock().read_to_end(&mut buf)?;
-    } else {
-        let mut file = File::open(&file_p)?;
-        let perm = get_permission_values(file.metadata()?.permissions());
-
-        let header = format!("{header_init} {perm} {decode_path}\n");
-        out.extend_from_slice(header.as_bytes());
-        file.read_to_end(&mut buf)?;
+    match file {
+        None => {
+            let mode = current_umask_mode();
+            let perm = get_permission_values(Permissions::from_mode(mode));
+            let header = format!("{header_init} {perm} {decode_path}\n");
+            out.extend_from_slice(header.as_bytes());
+            io::stdin().lock().read_to_end(&mut buf)?;
+        }
+        Some(path) => {
+            let mut f = File::open(path)?;
+            let perm = get_permission_values(f.metadata()?.permissions());
+            let header = format!("{header_init} {perm} {decode_path}\n");
+            out.extend_from_slice(header.as_bytes());
+            f.read_to_end(&mut buf)?;
+        }
     }
 
     match encoding_type {
@@ -167,26 +176,26 @@ fn encode_file(args: &Args) -> io::Result<()> {
     Ok(())
 }
 
-fn pathname_display(path: &Option<PathBuf>) -> String {
-    match path {
-        None => String::from("/dev/stdin"),
-        Some(p) => p.display().to_string(),
-    }
-}
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+fn main() {
+    diag::init_locale("uuencode");
 
     let args = Args::parse();
 
-    let mut exit_code = 0;
+    let (file, decode_path) = match resolve_operands(&args.operands) {
+        Ok(v) => v,
+        Err(msg) => {
+            diag::error(&msg);
+            std::process::exit(1);
+        }
+    };
 
-    if let Err(e) = encode_file(&args) {
-        exit_code = 1;
-        eprintln!("{:?}: {}", pathname_display(&args.file), e);
+    if let Err(e) = encode_file(args.base64, file.as_deref(), &decode_path) {
+        let name = file
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| gettext("standard input"));
+        diag::error(&format!("{name}: {e}"));
     }
 
-    std::process::exit(exit_code)
+    std::process::exit(diag::exit_status())
 }

@@ -18,7 +18,8 @@
 mod crc32;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
+use plib::diag;
 use plib::io::input_stream;
 use plib::BUFSZ;
 use std::io::{self, Read};
@@ -67,10 +68,8 @@ fn cksum_file(filename: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+fn main() {
+    diag::init_locale("cksum");
 
     let mut args = Args::parse();
 
@@ -79,14 +78,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.files.push(PathBuf::new());
     }
 
-    let mut exit_code = 0;
-
     for filename in &args.files {
         if let Err(e) = cksum_file(filename) {
-            exit_code = 1;
-            eprintln!("{}: {}", filename.display(), e);
+            let name = if filename.as_os_str().is_empty() {
+                gettext("standard input")
+            } else {
+                filename.display().to_string()
+            };
+            diag::error(&format!("{}: {}", name, e));
         }
     }
 
-    std::process::exit(exit_code)
+    std::process::exit(diag::exit_status())
 }

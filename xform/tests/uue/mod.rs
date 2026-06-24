@@ -7,11 +7,12 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, TestPlan};
+use plib::testing::{run_test, run_test_base, TestPlan};
 use std::{
     fs::{File, Permissions},
     io::Read,
     os::unix::fs::PermissionsExt,
+    path::PathBuf,
 };
 
 const RWX: u32 = 0o7;
@@ -217,4 +218,300 @@ fn uuencode_uudecode_with_base64_encoding_jpg_file() {
     let source_file_content = String::from_utf8_lossy(&source_file_content);
 
     uudecode_test(&[], &encoded_file_content, &source_file_content, "");
+}
+
+// =============================================================================
+// uuencode operands — regression tests for audit #UE1, #UE2.
+// =============================================================================
+
+#[test]
+fn uuencode_single_operand_reads_stdin() {
+    // `uuencode NAME` (one operand) must read stdin and name the decode path NAME,
+    // NOT open NAME as the input file.
+    let payload = "hello from stdin\n";
+    let enc = run_test_base(
+        &String::from("uuencode"),
+        &vec![String::from("thedata")],
+        payload.as_bytes(),
+    );
+    assert_eq!(
+        enc.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&enc.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&enc.stdout);
+    let header = stdout.lines().next().unwrap();
+    assert!(header.starts_with("begin "), "header line: {header}");
+    assert!(
+        header.ends_with(" thedata"),
+        "header must name the decode path: {header}"
+    );
+
+    // Round-trip through uudecode -o - to confirm stdin was the input.
+    let dec = run_test_base(
+        &String::from("uudecode"),
+        &vec![String::from("-o"), String::from("-")],
+        &enc.stdout,
+    );
+    assert_eq!(
+        dec.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&dec.stderr)
+    );
+    assert_eq!(dec.stdout, payload.as_bytes());
+}
+
+#[test]
+fn uuencode_missing_decode_pathname_errors() {
+    // Zero operands: decode_pathname is required.
+    let out = run_test_base(&String::from("uuencode"), &Vec::new(), b"data\n");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(!out.stderr.is_empty(), "expected a diagnostic on stderr");
+}
+
+// =============================================================================
+// uudecode robustness — malformed/binary input must diagnose + exit >0,
+// never panic (exit 101).  Regression tests for audit #UD1.
+// =============================================================================
+
+fn uudecode_expect_graceful_failure(stdin_data: &[u8]) {
+    let output = run_test_base(&String::from("uudecode"), &Vec::new(), stdin_data);
+    let code = output.status.code();
+    assert_ne!(
+        code,
+        Some(101),
+        "uudecode panicked (exit 101) on malformed input; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        code,
+        Some(1),
+        "expected exit 1 on malformed input, got {:?}; stderr={}",
+        code,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.stderr.is_empty(),
+        "expected a diagnostic on stderr for malformed input"
+    );
+}
+
+#[test]
+fn uudecode_binary_input_no_panic() {
+    // Non-UTF-8 / random binary input previously hit String::from_utf8().unwrap().
+    let data: &[u8] = &[0x80, 0xFF, 0x00, 0x01, b'h', b'i', 0xC3, 0x28, 0xFE, 0x9D];
+    uudecode_expect_graceful_failure(data);
+}
+
+#[test]
+fn uudecode_empty_input_no_panic() {
+    uudecode_expect_graceful_failure(b"");
+}
+
+#[test]
+fn uudecode_missing_header_no_panic() {
+    uudecode_expect_graceful_failure(b"this is not uuencoded data\nmore junk\n");
+}
+
+#[test]
+fn uudecode_truncated_header_no_panic() {
+    // "begin" with no mode / no pathname previously panicked on split[1]/split[2].
+    uudecode_expect_graceful_failure(b"begin\n");
+}
+
+#[test]
+fn uudecode_bad_mode_no_panic() {
+    // Non-octal mode previously hit u32::from_str_radix(...).expect(...).
+    uudecode_expect_graceful_failure(b"begin xyz out.txt\nM(2)Q\n");
+}
+
+// =============================================================================
+// uudecode spec semantics — regression tests for audit #UD2..#UD6.
+// Base64 of b"hi\n" (0x68,0x69,0x0a) is "aGkK".
+// =============================================================================
+
+fn unique_tmp(name: &str) -> PathBuf {
+    let mut p = std::env::temp_dir();
+    p.push(format!("xform_uue_{}_{}", std::process::id(), name));
+    p
+}
+
+fn running_as_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+#[test]
+fn uudecode_dash_cookie_to_stdout() {
+    // A decode pathname of '-' in the header means standard output (#UD2).
+    run_test(TestPlan {
+        cmd: String::from("uudecode"),
+        args: vec![],
+        stdin_data: String::from("begin-base64 644 -\naGkK\n====\n"),
+        expected_out: String::from("hi\n"),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn uudecode_o_dash_overrides_to_stdout() {
+    // -o - means stdout and must not create the header's named file (#UD2).
+    let bogus = unique_tmp("should_not_be_created");
+    let _ = std::fs::remove_file(&bogus);
+    let input = format!("begin-base64 644 {}\naGkK\n====\n", bogus.display());
+    run_test(TestPlan {
+        cmd: String::from("uudecode"),
+        args: vec![String::from("-o"), String::from("-")],
+        stdin_data: input,
+        expected_out: String::from("hi\n"),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+    assert!(!bogus.exists(), "-o - must not create the header's file");
+}
+
+#[test]
+fn uudecode_scans_for_begin_line() {
+    // The begin line need not be the first input line (#UD3).
+    run_test(TestPlan {
+        cmd: String::from("uudecode"),
+        args: vec![],
+        stdin_data: String::from("From: a@b\nSubject: x\n\nbegin-base64 644 -\naGkK\n====\n"),
+        expected_out: String::from("hi\n"),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn uudecode_base64_tolerates_crlf_and_whitespace() {
+    // CRLF transport and stray whitespace must be ignored, not error (#UD4).
+    run_test(TestPlan {
+        cmd: String::from("uudecode"),
+        args: vec![],
+        stdin_data: String::from("begin-base64 644 -\r\naGkK \r\n====\r\n"),
+        expected_out: String::from("hi\n"),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn uudecode_overwrites_existing_writable_file() {
+    // Existing writable target is overwritten in place (#UD5).
+    let target = unique_tmp("existing_writable.txt");
+    std::fs::write(&target, b"OLD CONTENT").unwrap();
+    let output = run_test_base(
+        &String::from("uudecode"),
+        &vec![String::from("-o"), target.to_str().unwrap().to_string()],
+        b"begin-base64 644 ignored\naGkK\n====\n",
+    );
+    let code = output.status.code();
+    let got = std::fs::read(&target).unwrap();
+    let _ = std::fs::remove_file(&target);
+    assert_eq!(
+        code,
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(got, b"hi\n");
+}
+
+#[test]
+fn uudecode_readonly_target_errors() {
+    // Existing non-writable target → error, file left unchanged (#UD5).
+    if running_as_root() {
+        return; // root bypasses W_OK
+    }
+    let target = unique_tmp("readonly.txt");
+    std::fs::write(&target, b"KEEP").unwrap();
+    let mut perm = std::fs::metadata(&target).unwrap().permissions();
+    perm.set_mode(0o444);
+    std::fs::set_permissions(&target, perm).unwrap();
+
+    let output = run_test_base(
+        &String::from("uudecode"),
+        &vec![String::from("-o"), target.to_str().unwrap().to_string()],
+        b"begin-base64 644 ignored\naGkK\n====\n",
+    );
+
+    // Restore perms so cleanup can remove it.
+    let mut perm = std::fs::metadata(&target).unwrap().permissions();
+    perm.set_mode(0o644);
+    let _ = std::fs::set_permissions(&target, perm);
+    let content = std::fs::read(&target).unwrap();
+    let _ = std::fs::remove_file(&target);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(content, b"KEEP", "read-only target must be left unchanged");
+}
+
+// =============================================================================
+// uuencode coverage backfill — empty input and the "-" / /dev/stdout decode
+// pathname round-trips (audit "Test coverage signal").
+// =============================================================================
+
+#[test]
+fn uuencode_empty_input_roundtrips() {
+    // Empty input still emits a begin header, the zero-length backtick line,
+    // and end; decoding it yields no bytes.
+    let enc = run_test_base(&String::from("uuencode"), &vec![String::from("empty")], b"");
+    assert_eq!(
+        enc.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&enc.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&enc.stdout);
+    assert!(
+        stdout.starts_with("begin ") && stdout.contains("\nend"),
+        "empty-input encoding must have begin/end framing: {stdout:?}"
+    );
+
+    let dec = run_test_base(
+        &String::from("uudecode"),
+        &vec![String::from("-o"), String::from("-")],
+        &enc.stdout,
+    );
+    assert_eq!(dec.status.code(), Some(0));
+    assert!(dec.stdout.is_empty(), "decoded empty input must be empty");
+}
+
+fn decode_pathname_to_stdout_roundtrip(decode_pathname: &str) {
+    // A decode pathname of "-" or "/dev/stdout" in the header must make
+    // uudecode (with no -o override) write to standard output.
+    let payload = "round trip via header cookie\n";
+    let enc = run_test_base(
+        &String::from("uuencode"),
+        &vec![String::from(decode_pathname)],
+        payload.as_bytes(),
+    );
+    assert_eq!(
+        enc.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&enc.stderr)
+    );
+
+    let dec = run_test_base(&String::from("uudecode"), &Vec::new(), &enc.stdout);
+    assert_eq!(
+        dec.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&dec.stderr)
+    );
+    assert_eq!(dec.stdout, payload.as_bytes());
+}
+
+#[test]
+fn uuencode_decode_pathname_dash_roundtrip() {
+    decode_pathname_to_stdout_roundtrip("-");
+}
+
+#[test]
+fn uuencode_decode_pathname_dev_stdout_roundtrip() {
+    decode_pathname_to_stdout_roundtrip("/dev/stdout");
 }

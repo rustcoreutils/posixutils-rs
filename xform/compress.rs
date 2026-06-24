@@ -11,16 +11,39 @@ use clap::Parser;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
+use plib::diag;
 use plib::io::input_stream;
 use plib::lzw::{UnixLZWReader, UnixLZWWriter};
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-const NAME_MAX: usize = 255;
+/// Conventional fallback when {NAME_MAX} cannot be queried.
+const NAME_MAX_FALLBACK: usize = 255;
+
+/// Query `{NAME_MAX}` for the directory that will hold the output file, via
+/// `pathconf(_PC_NAME_MAX)`; fall back to a conventional 255 when unavailable.
+fn name_max(dir: &Path) -> usize {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    if let Ok(c) = CString::new(dir.as_os_str().as_bytes()) {
+        // SAFETY: c is a valid NUL-terminated C string for the lifetime of the call.
+        let v = unsafe { libc::pathconf(c.as_ptr(), libc::_PC_NAME_MAX) };
+        if v > 0 {
+            return v as usize;
+        }
+    }
+    NAME_MAX_FALLBACK
+}
 
 /// Compression algorithm
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,13 +130,65 @@ fn is_stdin(pathname: &Path) -> bool {
 fn prompt_user(prompt: &str) -> bool {
     eprint!("compress: {} ", prompt);
     let mut response = String::new();
-    io::stdin().read_line(&mut response).unwrap();
-    response.to_lowercase().starts_with('y')
+    if io::stdin().read_line(&mut response).is_err() {
+        return false;
+    }
+    plib::locale::is_affirmative(response.trim_end_matches(['\r', '\n']))
+}
+
+/// Combine per-file exit codes into a single, order-independent status.
+///
+/// Severity order: 1 (error) outranks 2 (file not compressed because it would
+/// grow) outranks 0 (success). Both 1 and 2 are non-zero per spec 90511-90516;
+/// this just makes the final code deterministic regardless of file order.
+fn merge_exit(current: i32, new: i32) -> i32 {
+    match (current, new) {
+        (1, _) | (_, 1) => 1,
+        (2, _) | (_, 2) => 2,
+        _ => 0,
+    }
+}
+
+/// Decide whether an existing output file may be overwritten.
+///
+/// Returns `true` to proceed with the write, `false` to skip it (the caller
+/// then returns a non-zero exit code). Per POSIX (90427-90432), the overwrite
+/// prompt is issued **only** when standard input is a terminal; when stdin is
+/// not a terminal and `-f` was not given, a diagnostic is written and the file
+/// is not overwritten, with no prompt (so a pipeline's input stream is never
+/// consumed by `read_line`).
+fn may_overwrite(output_path: &Path, force: bool) -> bool {
+    if force || !output_path.exists() {
+        return true;
+    }
+    if io::stdin().is_terminal() {
+        let yes = prompt_user(&gettext!(
+            "Do you want to overwrite {} (y)es or (n)o?",
+            output_path.display()
+        ));
+        if !yes {
+            diag::warning(&format!(
+                "{}: {}",
+                output_path.display(),
+                gettext("not overwritten")
+            ));
+        }
+        yes
+    } else {
+        diag::error(&format!(
+            "{}: {}",
+            output_path.display(),
+            gettext("already exists; not overwritten (use -f to force)")
+        ));
+        false
+    }
 }
 
 /// Saved file metadata for preservation
 struct FileMetadata {
     mode: u32,
+    uid: u32,
+    gid: u32,
     atime: SystemTime,
     mtime: SystemTime,
 }
@@ -123,21 +198,31 @@ impl FileMetadata {
         let meta = fs::metadata(path)?;
         Ok(Self {
             mode: meta.permissions().mode(),
+            uid: meta.uid(),
+            gid: meta.gid(),
             atime: meta.accessed()?,
             mtime: meta.modified()?,
         })
     }
 
     fn apply_to(&self, path: &Path) -> io::Result<()> {
-        let perms = fs::Permissions::from_mode(self.mode);
-        fs::set_permissions(path, perms)?;
-
         #[cfg(unix)]
         {
             use std::ffi::CString;
             use std::os::unix::ffi::OsStrExt;
 
             let path_cstr = CString::new(path.as_os_str().as_bytes())?;
+
+            // Restore ownership before the mode bits: chown() clears the
+            // set-user-ID / set-group-ID bits, so it must run first. Best
+            // effort — only a sufficiently privileged process succeeds, so the
+            // result is intentionally ignored (spec 90389-90392).
+            unsafe {
+                libc::chown(path_cstr.as_ptr(), self.uid, self.gid);
+            }
+
+            let perms = fs::Permissions::from_mode(self.mode);
+            fs::set_permissions(path, perms)?;
 
             fn to_timeval(time: SystemTime) -> libc::timeval {
                 match time.duration_since(std::time::UNIX_EPOCH) {
@@ -166,11 +251,11 @@ impl FileMetadata {
 fn check_hard_links(path: &Path, force: bool) -> io::Result<bool> {
     let meta = fs::metadata(path)?;
     if meta.nlink() > 1 {
-        eprintln!(
-            "compress: {}: has {} hard links",
+        diag::warning(&format!(
+            "{}: {}",
             path.display(),
-            meta.nlink()
-        );
+            gettext!("has {} hard links", meta.nlink())
+        ));
         if !force {
             return Ok(false);
         }
@@ -186,7 +271,7 @@ fn check_path_max(path: &Path) -> io::Result<()> {
         if path_len > libc::PATH_MAX as usize {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "pathname too long",
+                gettext("pathname too long"),
             ));
         }
     }
@@ -240,7 +325,7 @@ fn decompress_auto(data: &[u8]) -> io::Result<Vec<u8>> {
         Some(Algorithm::Deflate) => decompress_gzip(data),
         None => Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "unknown compression format",
+            gettext("unknown compression format"),
         )),
     }
 }
@@ -252,7 +337,7 @@ fn parse_algorithm(s: &str) -> io::Result<Algorithm> {
         "deflate" | "gzip" => Ok(Algorithm::Deflate),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("unknown algorithm: {}", s),
+            gettext!("unknown algorithm: {}", s),
         )),
     }
 }
@@ -261,11 +346,13 @@ fn parse_algorithm(s: &str) -> io::Result<Algorithm> {
 fn validate_bits(algo: Algorithm, bits: u32) -> io::Result<()> {
     match algo {
         Algorithm::Lzw => {
-            // POSIX compress specifies 9-14 bit range
-            if !(9..=14).contains(&bits) {
+            // The LZW writer's default (no -b) emits 16-bit codes, and the
+            // RATIONALE (spec 90542-90544) encourages 15/16, so accept the full
+            // historical 9-16 range rather than the normative-DESCRIPTION 14.
+            if !(9..=16).contains(&bits) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "LZW bits must be 9-14 (POSIX)",
+                    gettext("LZW bits must be 9-16"),
                 ));
             }
         }
@@ -273,7 +360,7 @@ fn validate_bits(algo: Algorithm, bits: u32) -> io::Result<()> {
             if !(1..=9).contains(&bits) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "DEFLATE level must be 1-9",
+                    gettext("DEFLATE level must be 1-9"),
                 ));
             }
         }
@@ -294,26 +381,26 @@ fn get_compress_algorithm(args: &Args) -> io::Result<Algorithm> {
 
 /// Build output path for compression
 fn compress_output_path(input: &Path, algo: Algorithm) -> io::Result<PathBuf> {
-    let file_name = input
-        .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "input path has no filename"))?;
+    let file_name = input.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            gettext("input path has no filename"),
+        )
+    })?;
     let fname = format!("{}{}", file_name.to_string_lossy(), algo.suffix());
 
-    if fname.len() > NAME_MAX {
+    let parent = input.parent();
+    let dir = parent.unwrap_or_else(|| Path::new(""));
+    if fname.len() > name_max(dir) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "filename too long",
+            gettext("filename too long"),
         ));
     }
 
-    let output = if let Some(parent) = input.parent() {
-        if parent.as_os_str().is_empty() {
-            PathBuf::from(&fname)
-        } else {
-            parent.join(&fname)
-        }
-    } else {
-        PathBuf::from(&fname)
+    let output = match parent {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(&fname),
+        _ => PathBuf::from(&fname),
     };
 
     check_path_max(&output)?;
@@ -371,22 +458,26 @@ fn find_decompress_input(pathname: &Path) -> PathBuf {
 /// Process a single file for compression
 fn compress_file(args: &Args, pathname: &Path, algo: Algorithm) -> io::Result<i32> {
     let reading_stdin = is_stdin(pathname);
+    let writing_to_stdout = args.stdout || reading_stdin;
 
     // Warn if input already has compression suffix
     if !reading_stdin {
         if let Some(ext) = pathname.extension() {
             if ext == "Z" || ext == "gz" {
-                eprintln!(
-                    "compress: {}: already has {} suffix",
+                diag::warning(&format!(
+                    "{}: {}",
                     pathname.display(),
-                    ext.to_str().unwrap()
-                );
+                    gettext!("already has {} suffix", ext.to_str().unwrap())
+                ));
             }
         }
     }
 
-    // Check hard links
-    if !reading_stdin && !check_hard_links(pathname, args.force)? {
+    // Check hard links only when the input will actually be unlinked. Under
+    // -c (or stdin) the input is never removed, so the multi-link guard
+    // (spec 90403-90406, about files "to be removed after processing") does
+    // not apply.
+    if !writing_to_stdout && !check_hard_links(pathname, args.force)? {
         return Ok(1);
     }
 
@@ -414,8 +505,6 @@ fn compress_file(args: &Args, pathname: &Path, algo: Algorithm) -> io::Result<i3
     };
     let out_buf_size = out_buf.len();
 
-    let writing_to_stdout = args.stdout || reading_stdin;
-
     if writing_to_stdout {
         io::stdout().write_all(&out_buf)?;
         if args.verbose && !reading_stdin {
@@ -424,7 +513,10 @@ fn compress_file(args: &Args, pathname: &Path, algo: Algorithm) -> io::Result<i3
             } else {
                 0.0
             };
-            eprintln!("{}: Compression: {:.1}%", pathname.display(), ratio);
+            eprintln!(
+                "{}",
+                gettext!("{}: Compression: {:.1}%", pathname.display(), ratio)
+            );
         }
         return Ok(0);
     }
@@ -436,16 +528,9 @@ fn compress_file(args: &Args, pathname: &Path, algo: Algorithm) -> io::Result<i3
 
     let output_path = compress_output_path(pathname, algo)?;
 
-    // Check for existing file
-    if output_path.exists() && !args.force {
-        let is_affirm = prompt_user(&gettext!(
-            "Do you want to overwrite {} (y)es or (n)o?",
-            output_path.display()
-        ));
-        if !is_affirm {
-            eprintln!("{} not overwritten", output_path.display());
-            return Ok(1);
-        }
+    // Check for existing file (terminal-gated prompt per #C1)
+    if !may_overwrite(&output_path, args.force) {
+        return Ok(1);
     }
 
     // Write compressed file
@@ -458,8 +543,19 @@ fn compress_file(args: &Args, pathname: &Path, algo: Algorithm) -> io::Result<i3
         let _ = meta.apply_to(&output_path);
     }
 
-    // Remove original
-    fs::remove_file(pathname)?;
+    // Remove original. If it cannot be removed, back out the output so we do
+    // not leave both files behind, and report a non-zero status
+    // (spec 90393-90400).
+    if let Err(e) = fs::remove_file(pathname) {
+        let _ = fs::remove_file(&output_path);
+        diag::error(&format!(
+            "{}: {}: {}",
+            pathname.display(),
+            gettext("cannot remove input"),
+            e
+        ));
+        return Ok(1);
+    }
 
     if args.verbose {
         let ratio = if inp_buf_size > 0 {
@@ -468,10 +564,13 @@ fn compress_file(args: &Args, pathname: &Path, algo: Algorithm) -> io::Result<i3
             0.0
         };
         eprintln!(
-            "{}: -- replaced with {} Compression: {:.1}%",
-            pathname.display(),
-            output_path.display(),
-            ratio
+            "{}",
+            gettext!(
+                "{}: -- replaced with {} Compression: {:.1}%",
+                pathname.display(),
+                output_path.display(),
+                ratio
+            )
         );
     }
 
@@ -490,8 +589,9 @@ fn decompress_file(args: &Args, pathname: &Path) -> io::Result<i32> {
         find_decompress_input(pathname)
     };
 
-    // Check hard links
-    if !reading_stdin && !check_hard_links(&input_path, args.force)? {
+    // Check hard links only when the input will actually be unlinked
+    // (not under -c / stdin); see #C2.
+    if !writing_to_stdout && !check_hard_links(&input_path, args.force)? {
         return Ok(1);
     }
 
@@ -514,7 +614,7 @@ fn decompress_file(args: &Args, pathname: &Path) -> io::Result<i32> {
     if writing_to_stdout {
         io::stdout().write_all(&decompressed)?;
         if args.verbose && !reading_stdin {
-            eprintln!("{}: -- decompressed", input_path.display());
+            eprintln!("{}", gettext!("{}: -- decompressed", input_path.display()));
         }
         return Ok(0);
     }
@@ -522,16 +622,21 @@ fn decompress_file(args: &Args, pathname: &Path) -> io::Result<i32> {
     // File output mode
     let output_path = decompress_output_path(&input_path);
 
-    // Check for existing output
-    if output_path.exists() && !args.force {
-        let is_affirm = prompt_user(&gettext!(
-            "Do you want to overwrite {} (y)es or (n)o?",
-            output_path.display()
+    // Refuse when the input has no known suffix to strip, so the output path
+    // equals the input path: writing the decompressed bytes and then removing
+    // the input would destroy the result (#C3, data loss).
+    if output_path == input_path {
+        diag::error(&format!(
+            "{}: {}",
+            input_path.display(),
+            gettext("unknown suffix -- ignored")
         ));
-        if !is_affirm {
-            eprintln!("{} not overwritten", output_path.display());
-            return Ok(1);
-        }
+        return Ok(1);
+    }
+
+    // Check for existing output (terminal-gated prompt per #C1)
+    if !may_overwrite(&output_path, args.force) {
+        return Ok(1);
     }
 
     // Write decompressed file
@@ -544,25 +649,37 @@ fn decompress_file(args: &Args, pathname: &Path) -> io::Result<i32> {
         let _ = meta.apply_to(&output_path);
     }
 
-    // Remove compressed file
-    fs::remove_file(&input_path)?;
+    // Remove compressed file. If it cannot be removed, back out the output so
+    // we do not leave both files behind, and report a non-zero status
+    // (spec 90393-90400).
+    if let Err(e) = fs::remove_file(&input_path) {
+        let _ = fs::remove_file(&output_path);
+        diag::error(&format!(
+            "{}: {}: {}",
+            input_path.display(),
+            gettext("cannot remove input"),
+            e
+        ));
+        return Ok(1);
+    }
 
     if args.verbose {
         eprintln!(
-            "{}: -- replaced with {} ({} bytes)",
-            input_path.display(),
-            output_path.display(),
-            decompressed_size
+            "{}",
+            gettext!(
+                "{}: -- replaced with {} ({} bytes)",
+                input_path.display(),
+                output_path.display(),
+                decompressed_size
+            )
         );
     }
 
     Ok(0)
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+fn main() {
+    diag::init_locale("compress");
 
     let program_mode = ProgramMode::detect();
     let mut args = Args::parse();
@@ -586,7 +703,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Determine algorithm for compression
     let algo = if !args.decompress {
-        get_compress_algorithm(&args)?
+        match get_compress_algorithm(&args) {
+            Ok(a) => a,
+            Err(e) => {
+                diag::error(&e.to_string());
+                std::process::exit(1);
+            }
+        }
     } else {
         Algorithm::Lzw // not used for decompression (auto-detect)
     };
@@ -601,19 +724,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         match result {
-            Ok(code) => {
-                if code == 1 || (code == 2 && exit_code == 0) {
-                    exit_code = code;
-                }
-            }
+            Ok(code) => exit_code = merge_exit(exit_code, code),
             Err(e) => {
-                exit_code = 1;
+                exit_code = merge_exit(exit_code, 1);
                 let display_name = if is_stdin(filename) {
-                    "stdin".to_string()
+                    gettext("standard input")
                 } else {
                     filename.display().to_string()
                 };
-                eprintln!("compress: {}: {}", display_name, e);
+                diag::error(&format!("{}: {}", display_name, e));
             }
         }
     }

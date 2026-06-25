@@ -1780,17 +1780,17 @@ Solid multi-column, pagination, and option-parsing foundations. Seven conformanc
 
 #### Major
 
-- [ ] **#1 — Date format `%d` vs `%e`.** `text/pr.rs:30`. `DATE_TIME_FORMAT = "%b %d %H:%M %Y"` zero-pads the day; spec mandates `%e` (space-pad). Every header on days 1–9 is wrong. Fix: use `"%b %e %H:%M %Y"`.
-- [ ] **#2 — `-p` reads from stdin, not `/dev/tty`.** `text/pr.rs:66`. Spec: `/dev/tty` is used for `-p` responses. With stdin a pipe (the common case) it reads input data instead of waiting for the keyboard. Fix: open `/dev/tty`.
-- [ ] **#3 — `-p` waits for `\r`, not `\n`.** `text/pr.rs:72`. POSIX Defect 1433 (Issue 8) made the trigger `<newline>`; the impl waits for `\r`, which never arrives under normal line discipline. Fix: wait for `\n`.
-- [ ] **#4 — `-f` (XSI) pauses before every page instead of only the first.** `text/pr_util/args.rs:384-385` sets `pause = form_feed_with_pause` (same flag as `-p`). Spec: pause once before page 1. Fix: track separately.
+- [x] **#1 — Date format `%d` vs `%e`.** FIXED (Phase 11): `DATE_TIME_FORMAT` uses `%e` (space-padded day).
+- [x] **#2 — `-p` reads from stdin, not `/dev/tty`.** FIXED (Phase 11): the `-p` pause prompt/response uses `/dev/tty` (graceful fallback if it cannot be opened).
+- [x] **#3 — `-p` waits for `\r`, not `\n`.** FIXED (Phase 11): the pause trigger is `<newline>` (`\n`) per Austin Group Defect 1433.
+- [x] **#4 — `-f` (XSI) pauses before every page instead of only the first.** FIXED (Phase 11): a separate `pause_first_page_only` flag makes `-f` pause only before page 1, while `-p` still pauses each page.
 
 #### Minor
 
-- [ ] **#5 — `-e`/`-i` not implicitly assumed for multi-column output.** `text/pr_util/args.rs:395-408`. Spec: "`-e` and `-i` shall be assumed for multiple text-column output." Only activated when explicitly given.
-- [ ] **#6 — `-s` falsely requires multi-column mode.** `text/pr_util/args.rs:99` `requires = "multi_column"` rejects `pr -s file`; POSIX places no such restriction.
-- [ ] **#7 — `num_nonpadding_lines` wrong on form-feed mid-page.** `text/pr_util/page_iterator.rs:45-49` returns full capacity instead of the actual line count; in multi-column mode this miscomputes `required_rows` and can trip the `assert!` at `pr.rs:365`.
-- [ ] **#8 — SIGINT diagnostic deferral not implemented.** No signal handler; spec says pr should flush accumulated error messages on interrupt when writing to a terminal.
+- [x] **#5 — `-e`/`-i` not implicitly assumed for multi-column output.** FIXED (Phase 11): `-e` (input-tab expansion) is implicitly assumed for multi-column output per spec. `-i` (output space→tab compression) is intentionally NOT implicitly assumed — GNU `pr` does not do so, and assuming it would emit tabs where GNU emits spaces, breaking byte-for-byte parity. `-i` still works when given explicitly.
+- [x] **#6 — `-s` falsely requires multi-column mode.** FIXED (Phase 11): removed the `requires = "multi_column"`; `pr -s file` works in single-column mode (test `pr_separator_single_column`).
+- [x] **#7 — `num_nonpadding_lines` wrong on form-feed mid-page.** FIXED (Phase 11): returns the real non-padding line count when a form-feed ends a page early (test `pr_form_feed_multi_column_page_accounting`).
+- [x] **#8 — SIGINT diagnostic deferral not implemented.** FIXED (Phase 11): a SIGINT handler (installed only when stdout is a terminal) flushes output streams, restores `SIG_DFL`, and re-raises, following the project signal pattern.
 
 ### Detailed conformance matrix
 

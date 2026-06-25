@@ -42,10 +42,24 @@ impl Iterator for PageIterator {
                         ends_in_form_feed = line.ends_on_form_feed;
                     }
                     lines.push(line);
-                    if lines.len() == self.body_lines_per_page || ends_in_form_feed {
+                    let page_full = lines.len() == self.body_lines_per_page;
+                    if page_full || ends_in_form_feed {
+                        // A <form-feed> can end a page before it is full. The
+                        // number of real (non-padding) lines is therefore the
+                        // count gathered so far, not the page capacity. Pad the
+                        // remainder with blank lines so pagination and the
+                        // multi-column layout still see a full-capacity page.
+                        let num_nonpadding_lines = lines.len();
+                        while lines.len() < self.body_lines_per_page {
+                            lines.push(Ok(Line {
+                                line: String::new(),
+                                ends_on_form_feed: false,
+                                is_padding: true,
+                            }))
+                        }
                         return Some(Page {
                             lines,
-                            num_nonpadding_lines: self.body_lines_per_page,
+                            num_nonpadding_lines,
                         });
                     }
                 }

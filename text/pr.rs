@@ -25,9 +25,10 @@ const FORM_FEED: char = 12 as char;
 const TAB: char = '\t';
 const BACKSPACE: char = 8 as char;
 const ALERT: char = 7 as char;
-const CARRIAGE_RETURN: char = '\r';
+const NEWLINE: char = '\n';
 
-const DATE_TIME_FORMAT: &str = "%b %d %H:%M %Y";
+// POSIX requires the day to be space-padded (`%e`), not zero-padded (`%d`).
+const DATE_TIME_FORMAT: &str = "%b %e %H:%M %Y";
 
 const DEFAULT_PAGE_WIDTH: usize = 72;
 const PAGE_WIDTH_IF_HAS_SEPARATOR: usize = 512;
@@ -58,22 +59,68 @@ impl IntoIoResult for std::fmt::Result {
     }
 }
 
-// Used in the -p option
+// Used in the -p option (and the XSI -f option before the first page).
+//
+// POSIX: pr "shall write an <alert> to standard error and wait for a
+// <newline> to be read on /dev/tty". (Austin Group Defect 1433 changed the
+// trigger from <carriage-return> to <newline>.) The response must come from
+// /dev/tty, not standard input.
 fn pause() -> io::Result<()> {
     // Must print \a to stderr.
     eprint!("{ALERT}");
 
-    let mut reader = io::BufReader::new(io::stdin().lock());
+    // Read the response from the controlling terminal, never from stdin. If
+    // /dev/tty cannot be opened (e.g. no controlling terminal), skip the pause
+    // gracefully rather than aborting.
+    let tty = match fs::File::open("/dev/tty") {
+        Ok(f) => f,
+        Err(_) => return Ok(()),
+    };
+    let mut reader = io::BufReader::new(tty);
 
-    // Wait for \r
+    // Wait for a <newline>.
     let mut chr = 0;
     loop {
-        reader.read_exact(std::array::from_mut(&mut chr))?;
-        if chr as char == CARRIAGE_RETURN {
-            break;
+        match reader.read_exact(std::array::from_mut(&mut chr)) {
+            Ok(()) => {
+                if chr as char == NEWLINE {
+                    break;
+                }
+            }
+            // EOF on the terminal (e.g. Ctrl-D): stop waiting rather than error.
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e),
         }
     }
     Ok(())
+}
+
+/// Minimal SIGINT handler installed only when standard output is a terminal.
+///
+/// POSIX: "If pr receives an interrupt while writing to a terminal, it shall
+/// flush all accumulated error messages to the screen before terminating."
+/// We flush any buffered output streams, restore the default disposition, and
+/// re-raise so the process dies from the signal (and the parent observes a
+/// signal death).
+fn handle_sigint(signal_code: libc::c_int) {
+    unsafe {
+        // Flush all open stdio output streams so any pending diagnostic
+        // reaches the terminal before we terminate.
+        libc::fflush(std::ptr::null_mut());
+        libc::signal(signal_code, libc::SIG_DFL);
+        libc::raise(signal_code);
+    }
+}
+
+/// Install the SIGINT handler only when writing to a terminal; otherwise the
+/// default disposition (terminate) already applies.
+fn install_sigint_handler() {
+    let stdout_is_terminal = unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 };
+    if stdout_is_terminal {
+        unsafe {
+            libc::signal(libc::SIGINT, handle_sigint as *const () as usize);
+        }
+    }
 }
 
 fn print_header(
@@ -167,11 +214,16 @@ fn write_line_content(
     if !params.merge {
         write_line_number(&mut tmp, params, line_number)?;
     }
-    write!(&mut tmp, "{}", &line.line).into_io_result()?;
 
-    // -e
-    line_transform::expand_tabs(&mut tmp, params.expand_tabs);
-    // -i
+    // -e expands tabs that appear in the input *content*, not the formatting
+    // we add ourselves (e.g. the -n line-number separator, which defaults to a
+    // <tab>). Expand the content before prepending the line number so the
+    // separator tab is preserved.
+    let mut content = line.line.clone();
+    line_transform::expand_tabs(&mut content, params.expand_tabs);
+    tmp.push_str(&content);
+
+    // -i: replace runs of output spaces with tabs within this cell.
     line_transform::replace_spaces(&mut tmp, params.output_tabs);
 
     if params.num_columns == 1 || !params.pad_columns {
@@ -244,6 +296,9 @@ fn pr_serial(path: &PathBuf, params: &Parameters) -> io::Result<()> {
     if params.across {
         let mut output_line = String::with_capacity(params.page_width);
 
+        // For the XSI `-f` option: pause only before the first printed page.
+        let mut first_printed_page = true;
+
         for page in page_iterator {
             // +FIRST_PAGE[:LAST_PAGE]
             if page_number < params.first_page {
@@ -256,10 +311,12 @@ fn pr_serial(path: &PathBuf, params: &Parameters) -> io::Result<()> {
                 }
             }
 
-            // -p
-            if params.pause {
+            // -p pauses before every page; XSI -f pauses only before the
+            // first printed page.
+            if params.pause || (params.pause_first_page_only && first_printed_page) {
                 pause()?;
             }
+            first_printed_page = false;
 
             if !params.omit_header {
                 print_header(
@@ -333,6 +390,9 @@ fn pr_serial(path: &PathBuf, params: &Parameters) -> io::Result<()> {
             .map(|_| String::with_capacity(params.page_width))
             .collect();
 
+        // For the XSI `-f` option: pause only before the first printed page.
+        let mut first_printed_page = true;
+
         for page in page_iterator {
             // +FIRST_PAGE[:LAST_PAGE]
             if page_number < params.first_page {
@@ -345,10 +405,12 @@ fn pr_serial(path: &PathBuf, params: &Parameters) -> io::Result<()> {
                 }
             }
 
-            // -p
-            if params.pause {
+            // -p pauses before every page; XSI -f pauses only before the
+            // first printed page.
+            if params.pause || (params.pause_first_page_only && first_printed_page) {
                 pause()?;
             }
+            first_printed_page = false;
 
             if !params.omit_header {
                 print_header(
@@ -435,6 +497,10 @@ fn pr_merged(paths: &[PathBuf], params: &Parameters) -> io::Result<()> {
 
     let mut page_number = params.page_number_start;
     let mut line_number = params.line_number_start;
+
+    // For the XSI `-f` option: pause only before the first printed page.
+    let mut first_printed_page = true;
+
     loop {
         // The `next` methods of the `PageIterator`s need to be called at the
         // start of the loop
@@ -456,10 +522,12 @@ fn pr_merged(paths: &[PathBuf], params: &Parameters) -> io::Result<()> {
             }
         }
 
-        // -p
-        if params.pause {
+        // -p pauses before every page; XSI -f pauses only before the first
+        // printed page.
+        if params.pause || (params.pause_first_page_only && first_printed_page) {
             pause()?;
         }
+        first_printed_page = false;
 
         if !params.omit_header {
             print_header(
@@ -543,6 +611,8 @@ fn main() -> ExitCode {
     setlocale(LocaleCategory::LcAll, "");
     textdomain("posixutils-rs").unwrap();
     bind_textdomain_codeset("posixutils-rs", "UTF-8").unwrap();
+
+    install_sigint_handler();
 
     let args = Args::parse_custom();
 

@@ -1199,24 +1199,24 @@ An early-stage stub that passes only the narrowest happy-path tests. At least ni
 
 #### Critical
 
-- [ ] **#1 — Default output format wrong when join field is not field 1 of file 1.** `text/join.rs:127`. Output is `fields1.join(" ") + " " + fields2[1..].join(" ")`. Spec: join field, then remaining file1 fields (before+after the join field), then remaining file2 fields. With `-1 2` this leaves the join field in place and always drops `fields2[0]` regardless of the file2 join field. Fix: reconstruct per spec around the join-field position.
-- [ ] **#2 — `-o 0` (join-field specifier) panics.** `text/join.rs:98-120`. `-o` parsing asserts `f_num.len() == 2`; `"0".split('.')` yields one element → `assert_eq!` aborts. `0` is a mandatory POSIX.1-2024 outer-join feature. Fix: handle `"0"` before the `.`-split.
-- [ ] **#3 — Cartesian-product / bookkeeping wrong for duplicate keys; sort order ignored.** `text/join.rs:73-135`. For each file1 line the code rescans all of file2; `matched_keys` is keyed on the key value, so `-v`/`-a` bookkeeping is wrong for repeated keys, and non-consecutive keys (the "must be sorted" precondition) produce wrong output. Fix: merge-join over collation-sorted input.
-- [ ] **#4 — Default field-separator semantics wrong.** `text/join.rs:49-51`. `line.split(' ')` produces empty fields for multiple/leading blanks. Spec: multiple separators count as one; leading separators ignored. Fix: whitespace-sequence split for the default case.
+- [x] **#1 — Default output format wrong when join field is not field 1 of file 1.** `text/join.rs:127`. Output is `fields1.join(" ") + " " + fields2[1..].join(" ")`. Spec: join field, then remaining file1 fields (before+after the join field), then remaining file2 fields. With `-1 2` this leaves the join field in place and always drops `fields2[0]` regardless of the file2 join field. Fix: reconstruct per spec around the join-field position. FIXED (Phases 16-18): default output is join-field-once, then file1 other fields, then file2 other fields — correct for any `-1`/`-2`.
+- [x] **#2 — `-o 0` (join-field specifier) panics.** `text/join.rs:98-120`. `-o` parsing asserts `f_num.len() == 2`; `"0".split('.')` yields one element → `assert_eq!` aborts. `0` is a mandatory POSIX.1-2024 outer-join feature. Fix: handle `"0"` before the `.`-split. FIXED: `-o 0` decodes the join field before the `.`-split (no panic).
+- [x] **#3 — Cartesian-product / bookkeeping wrong for duplicate keys; sort order ignored.** `text/join.rs:73-135`. For each file1 line the code rescans all of file2; `matched_keys` is keyed on the key value, so `-v`/`-a` bookkeeping is wrong for repeated keys, and non-consecutive keys (the "must be sorted" precondition) produce wrong output. Fix: merge-join over collation-sorted input. FIXED: single-pass merge-join over equal-key groups with cartesian product; collation order honored.
+- [x] **#4 — Default field-separator semantics wrong.** `text/join.rs:49-51`. `line.split(' ')` produces empty fields for multiple/leading blanks. Spec: multiple separators count as one; leading separators ignored. Fix: whitespace-sequence split for the default case. FIXED: default separator splits on maximal non-blank runs (space+tab collapse, leading blanks ignored) matching GNU `xfields`.
 
 #### Major
 
-- [ ] **#5 — `-a` accepts a single file number; `-a 1 -a 2` impossible.** `text/join.rs:21-22,132`. `additional: u8`; only `-a 1` handled. file2 unpairable lines never output. Fix: allow both.
-- [ ] **#6 — `-v` accepts a single file number; `-v 1 -v 2` impossible.** `text/join.rs:33-34,139-157`.
-- [ ] **#7 — `-v` uses wrong algorithm / breaks on stdin.** `text/join.rs:137-157`. `matched_keys` is populated by file2's matched keys, so `-v 1` suppresses any file1 line whose key ever appeared in file2; also re-opens `file1_path` via `File::open`, crashing when file1 was stdin.
-- [ ] **#8 — `LC_COLLATE` not used; key comparison is byte-equal.** `text/join.rs:91`. `key1 == key2` (byte equality). Spec requires collation comparison (`strcoll`). Fix: use `libc::strcoll`.
-- [ ] **#9 — `-o` and `-a` output ignore `-t` separator (and `-o`/`-e` on unpairable lines).** `text/join.rs:124,133`. `res.join(" ")` and `fields1.join(" ")` hard-code space; unpairable `-a` lines ignore `-o`/`-e`.
-- [ ] **#10 — stdin (`-`) can only be file1.** `text/join.rs:81-85,137`. A second `stdin.lock()` while the first is held; `-v` re-read crashes on stdin.
+- [x] **#5 — `-a` accepts a single file number; `-a 1 -a 2` impossible.** `text/join.rs:21-22,132`. `additional: u8`; only `-a 1` handled. file2 unpairable lines never output. Fix: allow both. FIXED: `-a` is repeatable (`-a 1 -a 2`); file2 unpairable lines are output.
+- [x] **#6 — `-v` accepts a single file number; `-v 1 -v 2` impossible.** `text/join.rs:33-34,139-157`. FIXED: `-v` is repeatable (`-v 1 -v 2`).
+- [x] **#7 — `-v` uses wrong algorithm / breaks on stdin.** `text/join.rs:137-157`. `matched_keys` is populated by file2's matched keys, so `-v 1` suppresses any file1 line whose key ever appeared in file2; also re-opens `file1_path` via `File::open`, crashing when file1 was stdin. FIXED: `-v`/`-a` unpairable bookkeeping is correct for duplicate keys (GNU `seen_unpairable` model); stdin no longer re-read/crashes.
+- [x] **#8 — `LC_COLLATE` not used; key comparison is byte-equal.** `text/join.rs:91`. `key1 == key2` (byte equality). Spec requires collation comparison (`strcoll`). Fix: use `libc::strcoll`. FIXED: key comparison uses `plib::locale::strcoll` (LC_COLLATE).
+- [x] **#9 — `-o` and `-a` output ignore `-t` separator (and `-o`/`-e` on unpairable lines).** `text/join.rs:124,133`. `res.join(" ")` and `fields1.join(" ")` hard-code space; unpairable `-a` lines ignore `-o`/`-e`. FIXED: the output separator (`-t` char else space) is applied consistently to joined, `-o`, and `-a`/`-v` lines; `-e` fills missing `-o` fields incl. unpairable lines.
+- [x] **#10 — stdin (`-`) can only be file1.** `text/join.rs:81-85,137`. A second `stdin.lock()` while the first is held; `-v` re-read crashes on stdin. FIXED: `-` works as file1 or file2 via `input_stream_dashed` (both-stdin is an error).
 
 #### Minor
 
-- [ ] **#11 — `-o` list does not support blank-separated elements.** `text/join.rs:27`. `value_delimiter = ','` only.
-- [ ] **#12 — `assert_eq!`/`panic!` in code path.** `text/join.rs:99,120`. Produces Rust backtraces, not POSIX stderr diagnostics + exit >0.
+- [x] **#11 — `-o` list does not support blank-separated elements.** `text/join.rs:27`. `value_delimiter = ','` only. FIXED: `-o` accepts comma- and blank-separated elements and multiple `-o` args.
+- [x] **#12 — `assert_eq!`/`panic!` in code path.** `text/join.rs:99,120`. Produces Rust backtraces, not POSIX stderr diagnostics + exit >0. FIXED: `assert_eq!`/`panic!` replaced with `plib::diag::error` diagnostics and non-zero exit.
 
 ### Detailed conformance matrix
 
@@ -1309,15 +1309,15 @@ An early-stage stub that passes only the narrowest happy-path tests. At least ni
 Existing tests cover only unique-key, space-separated, default-field happy paths.
 
 Not covered:
-- [ ] `-a 2`; `-a 1 -a 2`; `-v 1 -v 2`
-- [ ] `-o 0`; `-o` blank-separated; `-o` with `-t` output separator
-- [ ] `-e` with `-a` unpairable lines
-- [ ] join on a field other than field 1 (#1)
-- [ ] duplicate keys (cartesian product)
-- [ ] multi-blank / leading-blank separators (#4)
-- [ ] stdin as file2 (#10)
-- [ ] locale-collation key comparison (#8)
-- [ ] error exit for bad field numbers / unreadable files
+- [x] `-a 2`; `-a 1 -a 2`; `-v 1 -v 2`
+- [x] `-o 0`; `-o` blank-separated; `-o` with `-t` output separator
+- [x] `-e` with `-a` unpairable lines
+- [x] join on a field other than field 1 (#1)
+- [x] duplicate keys (cartesian product)
+- [x] multi-blank / leading-blank separators (#4)
+- [x] stdin as file2 (#10)
+- [x] locale-collation key comparison (#8)
+- [x] error exit for bad field numbers / unreadable files
 
 ### Suggested PR groupings
 

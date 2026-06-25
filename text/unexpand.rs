@@ -9,6 +9,7 @@
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use plib::io::input_stream_dashed;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
@@ -37,10 +38,17 @@ fn unexpand(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut stdout = io::stdout();
 
-    if (args.files.len() == 1 && args.files[0].as_os_str() == "-") || args.files.is_empty() {
-        let reader = io::stdin();
-        let lines = io::BufReader::new(reader).lines();
-        for line in lines {
+    // No operands read stdin; otherwise each operand is processed in order, with
+    // a "-" reading stdin at its position (POSIX Guideline 13).
+    let sources: Vec<PathBuf> = if args.files.is_empty() {
+        vec![PathBuf::from("-")]
+    } else {
+        args.files.clone()
+    };
+
+    for source in &sources {
+        let reader = io::BufReader::new(input_stream_dashed(source)?);
+        for line in reader.lines() {
             let line = line?;
             let converted_line = if args.all_spaces && args.tablist.is_none() {
                 convert_all_blanks(&line, &tablist)
@@ -49,20 +57,7 @@ fn unexpand(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             };
             writeln!(stdout, "{}", converted_line)?;
         }
-    } else {
-        for file in &args.files {
-            let reader = io::BufReader::new(std::fs::File::open(file)?);
-            for line in reader.lines() {
-                let line = line?;
-                let converted_line = if args.all_spaces && args.tablist.is_none() {
-                    convert_all_blanks(&line, &tablist)
-                } else {
-                    convert_leading_blanks(&line, &tablist)
-                };
-                writeln!(stdout, "{}", converted_line)?;
-            }
-        }
-    };
+    }
 
     Ok(())
 }

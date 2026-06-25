@@ -11,7 +11,8 @@ use std::io::{self, BufRead, Error, Read};
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use std::path::PathBuf;
+use plib::io::input_stream_dashed;
+use std::path::{Path, PathBuf};
 
 /// cut - cut out selected fields of each line of a file
 #[derive(Parser, Clone)]
@@ -281,20 +282,18 @@ fn cut_fields(line: &str, delim: char, ranges: &Vec<(i32, i32)>, suppress: bool)
 fn cut_files(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     validate_args(&args).map_err(|err| Box::new(Error::other(err)))?;
 
-    // open files, or stdin
-
+    // open files, or stdin. A "-" operand reads stdin at its position in the
+    // list (POSIX Guideline 13), not only when it is the sole operand.
     let filenames = args.filenames;
-    let filenames_len = filenames.len();
-    let readers: Vec<Box<dyn Read>> =
-        if filenames_len == 0 || (filenames_len == 1 && filenames[0].as_os_str() == "-") {
-            vec![Box::new(io::stdin().lock())]
-        } else {
-            let mut bufs: Vec<Box<dyn Read>> = Vec::with_capacity(filenames_len);
-            for file in &filenames {
-                bufs.push(Box::new(std::fs::File::open(file)?))
-            }
-            bufs
-        };
+    let readers: Vec<Box<dyn Read>> = if filenames.is_empty() {
+        vec![input_stream_dashed(Path::new(""))?]
+    } else {
+        let mut bufs: Vec<Box<dyn Read>> = Vec::with_capacity(filenames.len());
+        for file in &filenames {
+            bufs.push(input_stream_dashed(file)?);
+        }
+        bufs
+    };
 
     // Process each file
     for file in readers {

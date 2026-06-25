@@ -43,3 +43,9 @@ fn wc_two() {
     wc_test(&["-l"], "x y\n", "1\n");
     wc_test(&["-w"], "x y\n", "2\n");
 }
+
+#[test]
+fn wc_dash_operand_reads_stdin() {
+    // A "-" operand reads standard input rather than a file named "-".
+    wc_test(&["-l", "-"], "a\nb\n", "2\n");
+}

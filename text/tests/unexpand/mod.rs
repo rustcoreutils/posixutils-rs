@@ -72,3 +72,10 @@ fn unexpand_test_6() {
         "text\twith\t\tspaces\n",
     );
 }
+
+#[test]
+fn unexpand_dash_non_sole_operand() {
+    // "-" reads stdin at its position; a second "-" sees EOF. Interior spaces
+    // are preserved by default (only leading blanks are converted).
+    unexpand_test(&["-", "-"], "x y\n", "x y\n");
+}

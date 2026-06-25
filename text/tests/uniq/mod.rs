@@ -202,3 +202,9 @@ fn uniq_42() {
 fn uniq_43() {
     uniq_test(&["-c"], "a\na\n", "2 a\n");
 }
+
+#[test]
+fn uniq_dash_output_operand_is_stdout() {
+    // A "-" output_file operand means standard output, not a file named "-".
+    uniq_test(&["-", "-"], "a\na\nb\n", "a\nb\n");
+}

@@ -13,8 +13,10 @@ use std::io::Read;
 use std::{
     fs::File,
     io::{self, BufRead, BufWriter, Error, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
+
+use plib::io::input_stream_dashed;
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
@@ -952,15 +954,14 @@ fn merge_empty_lines(vec: Vec<&str>) -> Vec<String> {
 /// * `Err(Box<dyn Error>)` if an error occurs during sorting or merging.
 ///
 fn sort(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-    let mut readers: Vec<Box<dyn Read>> = if (args.filenames.len() == 1
-        && args.filenames[0].as_os_str() == "-")
-        || args.filenames.is_empty()
-    {
-        vec![Box::new(io::stdin().lock())]
+    // A "-" operand reads stdin at its position in the list (POSIX Guideline
+    // 13), not only when it is the sole operand.
+    let mut readers: Vec<Box<dyn Read>> = if args.filenames.is_empty() {
+        vec![input_stream_dashed(Path::new(""))?]
     } else {
-        let mut bufs: Vec<Box<dyn Read>> = vec![];
+        let mut bufs: Vec<Box<dyn Read>> = Vec::with_capacity(args.filenames.len());
         for file in &args.filenames {
-            bufs.push(Box::new(std::fs::File::open(file)?))
+            bufs.push(input_stream_dashed(file)?);
         }
         bufs
     };

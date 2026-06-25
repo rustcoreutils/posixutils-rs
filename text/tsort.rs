@@ -13,7 +13,8 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::io::input_stream_opt;
+use plib::io::input_stream_dashed;
+use std::path::Path;
 
 /// tsort - topological sort
 #[derive(Parser)]
@@ -99,7 +100,8 @@ impl TopoSort {
 }
 
 fn tsort_file(pathname: &Option<PathBuf>) -> io::Result<()> {
-    let file = input_stream_opt(pathname)?;
+    // No operand or "-" reads stdin; any other path is opened as a file.
+    let file = input_stream_dashed(pathname.as_deref().unwrap_or(Path::new("")))?;
     let reader = io::BufReader::new(file);
 
     let mut ts = TopoSort::new();

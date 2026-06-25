@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::io::input_stream;
+use plib::io::input_stream_dashed;
 use plib::BUFSZ;
 
 /// expand - convert tabs to spaces
@@ -66,8 +66,8 @@ fn space_out(column: &mut usize, writer: &mut BufWriter<dyn Write>) -> io::Resul
 }
 
 fn expand_file(tablist: &TabList, pathname: &Path) -> io::Result<()> {
-    // open file, or stdin
-    let mut file = input_stream(pathname, false)?;
+    // open file, or stdin ("-" or no operand)
+    let mut file = input_stream_dashed(pathname)?;
 
     let mut raw_buffer = [0; BUFSZ];
     let mut writer = BufWriter::new(io::stdout());

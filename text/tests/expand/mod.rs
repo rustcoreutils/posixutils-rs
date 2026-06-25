@@ -26,3 +26,16 @@ fn expand_basic() {
     expand_test_noargs("", "");
     expand_test_noargs("a\tb\tc\n", "a       b       c\n");
 }
+
+#[test]
+fn expand_dash_operand_reads_stdin() {
+    // A "-" operand reads standard input rather than a file named "-".
+    run_test(TestPlan {
+        cmd: String::from("expand"),
+        args: vec![String::from("-")],
+        stdin_data: String::from("a\tb\tc\n"),
+        expected_out: String::from("a       b       c\n"),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}

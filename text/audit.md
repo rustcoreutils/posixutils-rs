@@ -394,7 +394,7 @@ Covers common use cases and passes a solid test suite, but has five correctness 
 #### Critical
 
 - [ ] **#1 — `-f` without `-d` passes every line through verbatim instead of using tab default.** `text/cut.rs:337-344`. `cut_fields()` is only called when `args.delimiter` is `Some`; with `-f` and no `-d` the `else` branch unconditionally `println!`s the whole line. `cut -f 1 file` (ubiquitous, default tab) produces wrong output. Fix: default the delimiter to `'\t'` when `-f` is given without `-d`.
-- [ ] **#2 — `-` file operand only works as the sole argument.** `text/cut.rs:289`. `if filenames_len == 0 || (filenames_len == 1 && filenames[0] == "-")`. `cut -f1 file1 - file2` treats `-` as a literal filename and fails. Fix: substitute stdin wherever `-` appears among operands.
+- [x] **#2 — `-` file operand only works as the sole argument.** `text/cut.rs:289`. FIXED (Phase 2): each operand is opened via `plib::io::input_stream_dashed`, so `-` reads stdin at any position. (The helper returns an unlocked `Stdin` handle so multiple `-` operands do not deadlock on the stdin lock.)
 
 #### Major
 
@@ -680,7 +680,7 @@ The `UniStop` (single-integer `-t N`) path works correctly for default and custo
 #### Minor
 
 - [ ] **#6 — `--tablist` long option exposed.** `text/expand.rs:22`. POSIX specifies only `-t tablist`. Non-standard but harmless.
-- [ ] **#7 — `-` operand treated as literal filename.** `text/expand.rs:70`. `input_stream` called with `dashed_stdin: false`; a `-` operand opens a file named `-`. (Spec OPERANDS does not mandate `-`, so Minor.)
+- [x] **#7 — `-` operand treated as literal filename.** `text/expand.rs:70`. FIXED (Phase 2): opens via `plib::io::input_stream_dashed`; a `-` operand reads stdin at its position.
 
 (Note: the backspace floor-at-column-1 is correct — 1-based column 1 == 0-based position 0 — not a bug.)
 
@@ -813,7 +813,7 @@ Core folding logic is present and structurally sound, but the `-s` (break-on-spa
 
 #### Minor
 
-- [ ] **#5 — `-` file operand does not invoke stdin.** `text/fold.rs:103`. `input_stream` called with `dashed_stdin: false`; `-` opens a literal file named `-`.
+- [x] **#5 — `-` file operand does not invoke stdin.** `text/fold.rs:103`. FIXED (Phase 2): opens via `plib::io::input_stream_dashed`; `-` reads stdin.
 - [ ] **#6 — Non-POSIX long options.** `text/fold.rs:24-35`. clap registers `--bytes`/`--spaces`/`--width`; POSIX specifies only `-b`/`-s`/`-w`.
 
 (Note: backspace decrement and CR-reset to column 0 are handled; no explicit guard prevents a fold immediately before `\r`/`\b`, a quality concern under undefined-width inputs.)
@@ -1076,7 +1076,7 @@ Largely correct. Two actionable gaps: (1) the `-` operand is not treated as stdi
 
 #### Major
 
-- [ ] **#1 — `-` operand not treated as stdin.** `text/head.rs:64`. `input_stream(pathname, false)` → `-` falls through to `fs::File::open("-")` and fails. Every other file-reading utility in the workspace passes `dashed_stdin = true`. Fix: change to `input_stream(pathname, true)`.
+- [x] **#1 — `-` operand not treated as stdin.** `text/head.rs:64`. FIXED (Phase 2): opens via `plib::io::input_stream_dashed`; `head -` reads stdin.
 - [ ] **#2 — Zero count produces non-zero exit instead of empty output.** `text/head.rs:161-164,170-173`. Spec makes "positive integer" a caller constraint, not a utility-error trigger; GNU/BusyBox/uutils all emit empty output for `-n 0`/`-c 0`. The impl exits 1 with a diagnostic, breaking `head -n "$N"` where `$N` may be 0. Fix: remove the zero guards (the count loops already produce empty output for 0).
 
 #### Minor
@@ -2123,7 +2123,7 @@ The scaffolding (option parsing, `-c/-C/-m/-o/-u/-b/-d/-f/-i/-n/-r/-t/-k`) is pr
 - [ ] **#16–#18 — `-d`/`-i`, `-d`/`-n`, `-n`/`-i` rejected as mutually exclusive** (`text/sort.rs:82-94`) though POSIX does not declare them so (over-restrictive).
 - [ ] **#19 — `usize::MAX - 1` magic sentinel for end-of-field.** `text/sort.rs:247-252,457-464` (fragile).
 - [ ] **#20 — `-o`/`-m` does not guard same-file overwrite during read.** `text/sort.rs:847-855`. Under `-m`, `File::create` truncates an input that is also the output before reading.
-- [ ] **#21 — `-` operand only honored as the sole argument.** `text/sort.rs:955-956`. `sort file1 - file2` opens a literal `-`.
+- [x] **#21 — `-` operand only honored as the sole argument.** `text/sort.rs:955-956`. FIXED (Phase 2): each operand is opened via `plib::io::input_stream_dashed`, so `-` reads stdin at any position.
 - [ ] **#22 — All errors exit 1, not >1.** `text/sort.rs:995`. Spec reserves >1 for errors, 1 for `-c`/`-C` disorder.
 
 ### Detailed conformance matrix
@@ -2526,7 +2526,7 @@ The core topological sort and output format are correct. Three gaps: the `-w` op
 
 #### Major
 
-- [ ] **#3 — `-` operand not treated as stdin.** `text/tsort.rs:102` calls `input_stream_opt` with `dashed_stdin: false`; `tsort -` opens a literal `-` (ENOENT). Fix: pass `dashed_stdin: true`.
+- [x] **#3 — `-` operand not treated as stdin.** `text/tsort.rs:102`. FIXED (Phase 2): opens via `plib::io::input_stream_dashed`; `tsort -` reads stdin.
 
 #### Minor
 
@@ -2648,7 +2648,7 @@ Two Critical and three Major non-conformances. Most damaging: (1) `-t tablist` d
 
 - [ ] **#6 — `parse_tablist` splits only on comma, not blank.** `text/unexpand.rs:30`. Spec allows "blank or comma".
 - [ ] **#7 — `split_whitespaces` uses `is_whitespace()` not blank-only.** `text/unexpand.rs:113`. Matches `\n`/`\r`/`\f`/`\v`/Unicode spaces; POSIX blank is space+tab.
-- [ ] **#8 — `-` operand only honored as the sole file argument.** `text/unexpand.rs:40`.
+- [x] **#8 — `-` operand only honored as the sole file argument.** `text/unexpand.rs:40`. FIXED (Phase 2): operands are processed in order via `plib::io::input_stream_dashed`, so `-` reads stdin at any position.
 - [ ] **#9 — Leading tab characters not treated as blanks for column tracking.** `text/unexpand.rs:70-105` stops collection at the first non-space.
 - [ ] **#10 — Multibyte / wide-character column width ignored.** No `unicode-width`/`wcwidth`.
 
@@ -2773,7 +2773,7 @@ Core deduplication is correct and the five options are present. Three substantiv
 #### Major
 
 - [ ] **#2 — Field-skip leaves a leading blank in the comparison string.** `text/uniq.rs:136-147`. The `skip_while` counts each whitespace char as a boundary and stops at the first blank, so `-f 1` on `"a b c"` leaves `" b c"`. POSIX field = `[[:blank:]]*[^[:blank:]]*` (leading blanks belong to the field). A line beginning with a blank breaks immediately. Fix: skip leading blanks then non-blanks, N times.
-- [ ] **#3 — Output file operand `-` not recognized as stdout.** `text/uniq.rs:84-87`. `File::create(path)` even when `path == "-"`; spec says `-` means stdout. The input side handles `-` (lines 75-76); the output side does not. Fix: mirror the `-` check.
+- [x] **#3 — Output file operand `-` not recognized as stdout.** `text/uniq.rs:84-87`. FIXED (Phase 2): a `-` output_file operand now writes to stdout instead of creating a file named `-`.
 - [ ] **#4 — `-c` with `-d`/`-u` is a hard error.** `text/uniq.rs:48-60`. POSIX marks the `[-c|-d|-u]` combination undefined, not mandatorily an error; rejecting is permitted but diverges from common practice. (Informational/Major.)
 
 #### Minor
@@ -2903,7 +2903,7 @@ Two confirmed bugs dominate: (1) a single named file operand prints no filename,
 #### Major
 
 - [ ] **#1 — Single named-file operand omits the filename.** `text/wc.rs:105`. The format is `"%d %d %d %s\n"` with `<file>`; the "no name" exception applies only when no file operands are given. `build_display_str` tests `args.files.len() > 1`, so `wc -c foo.txt` emits `42` not `42 foo.txt`. Fix: append the filename whenever `!filename.is_empty()`.
-- [ ] **#2 — `-` operand does not invoke stdin.** `text/wc.rs:120`. `input_stream(pathname, false)` disables `-`-as-stdin; `cat f | wc - f2` yields ENOENT for `-`. Fix: pass `dashed_stdin: true`.
+- [x] **#2 — `-` operand does not invoke stdin.** `text/wc.rs:120`. FIXED (Phase 2): `wc_file_bytes` opens via `plib::io::input_stream_dashed`; `-` reads stdin.
 - [ ] **#3 — `-m` character counting is unconditionally UTF-8.** `text/wc.rs:138` (`(ch >> 6) != 0b10`). Correct only in UTF-8 locales; spec requires LC_CTYPE encoding. Fix: `mbrlen`-based loop under the process locale.
 
 #### Minor

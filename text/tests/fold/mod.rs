@@ -75,3 +75,16 @@ fn fold_spaces_mode() {
 fn fold_bytes_and_spaces_mode() {
     run_fold_test(vec!["-b", "-s"], "input2.txt", "output_bytes_spaces.txt");
 }
+
+#[test]
+fn fold_dash_operand_reads_stdin() {
+    // A "-" operand reads standard input rather than a file named "-".
+    run_test(TestPlan {
+        cmd: String::from("fold"),
+        args: vec![String::from("-")],
+        stdin_data: String::from("hello\n"),
+        expected_out: String::from("hello\n"),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}

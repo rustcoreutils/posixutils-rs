@@ -613,3 +613,10 @@ fn test_files_sort_2() {
             "",
         );
 }
+
+#[test]
+fn test_dash_non_sole_operand() {
+    // "-" reads stdin at its position; a second "-" sees EOF. Previously a
+    // non-sole "-" was opened as a file named "-" and failed.
+    sort_test(&["-", "-"], "b\na\n", "a\nb\n", 0, "");
+}

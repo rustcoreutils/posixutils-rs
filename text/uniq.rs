@@ -81,9 +81,11 @@ fn uniq(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         None => Box::new(BufReader::new(io::stdin())),
     };
 
+    // A "-" output_file operand means standard output (POSIX), not a file
+    // literally named "-".
     let mut output: Box<dyn Write> = match &args.output_file {
-        Some(file) => Box::new(File::create(file)?),
-        None => Box::new(io::stdout()),
+        Some(file) if file.as_os_str() != "-" => Box::new(File::create(file)?),
+        _ => Box::new(io::stdout()),
     };
 
     let lines: Vec<String> = input.lines().collect::<Result<_, _>>()?;

@@ -354,3 +354,11 @@ fn test_stdin_no_hyphen() {
         "081ca869c86b 41 truefalse/src/false.rs\n",
     );
 }
+
+#[test]
+fn test_cut_dash_non_sole_operand() {
+    // "-" reads stdin even when not the sole operand (POSIX Guideline 13).
+    // The second "-" reads the now-exhausted stdin (EOF), so only the first
+    // contributes output. Previously this tried to open a file named "-".
+    cut_test(&["-c", "1", "-", "-"], "ab\n", "a\n");
+}

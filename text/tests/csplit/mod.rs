@@ -44,7 +44,7 @@ fn test_csplit_text_by_lines() {
 15
 16
 17",
-        "43\n57\n31\n14\n",
+        "44\n77\n19\n8\n",
     );
     std::fs::remove_file("text00").unwrap();
     std::fs::remove_file("text01").unwrap();
@@ -57,7 +57,7 @@ fn test_csplit_text_by_lines_from_file() {
     csplit_test(
         &["-f", "text_f", "tests/assets/test_file.txt", "5", "{3}"],
         "",
-        "43\n57\n31\n14\n",
+        "44\n77\n19\n8\n",
     );
     std::fs::remove_file("text_f00").unwrap();
     std::fs::remove_file("text_f01").unwrap();
@@ -79,12 +79,13 @@ fn test_csplit_c_code_by_regex() {
             "{3}",
         ],
         "",
-        "59\n53\n53\n54\n",
+        "60\n54\n54\n54\n0\n",
     );
     std::fs::remove_file("code_c00").unwrap();
     std::fs::remove_file("code_c01").unwrap();
     std::fs::remove_file("code_c02").unwrap();
     std::fs::remove_file("code_c03").unwrap();
+    std::fs::remove_file("code_c04").unwrap();
 }
 
 #[test]
@@ -99,12 +100,13 @@ fn test_csplit_c_code_by_regex_negative_offset() {
             "{3}",
         ],
         "",
-        "12\n46\n52\n107\n",
+        "13\n48\n54\n54\n53\n",
     );
     std::fs::remove_file("code_c_neg00").unwrap();
     std::fs::remove_file("code_c_neg01").unwrap();
     std::fs::remove_file("code_c_neg02").unwrap();
     std::fs::remove_file("code_c_neg03").unwrap();
+    std::fs::remove_file("code_c_neg04").unwrap();
 }
 
 #[test]
@@ -126,6 +128,7 @@ fn test_csplit_c_code_by_regex_suppress() {
     std::fs::remove_file("code_c_s01").unwrap();
     std::fs::remove_file("code_c_s02").unwrap();
     std::fs::remove_file("code_c_s03").unwrap();
+    std::fs::remove_file("code_c_s04").unwrap();
 }
 
 #[test]
@@ -142,12 +145,13 @@ fn test_csplit_c_code_by_regex_with_number() {
             "{3}",
         ],
         "",
-        "59\n53\n53\n54\n",
+        "60\n54\n54\n54\n0\n",
     );
     std::fs::remove_file("code_c_n000").unwrap();
     std::fs::remove_file("code_c_n001").unwrap();
     std::fs::remove_file("code_c_n002").unwrap();
     std::fs::remove_file("code_c_n003").unwrap();
+    std::fs::remove_file("code_c_n004").unwrap();
 }
 
 #[test]
@@ -155,7 +159,7 @@ fn test_csplit_regex_by_empty_lines() {
     csplit_test(
         &["-f", "empty_lines", "tests/assets/empty_line.txt", "/^$/"],
         "",
-        "6\n7\n",
+        "7\n7\n",
     );
     std::fs::remove_file("empty_lines00").unwrap();
     std::fs::remove_file("empty_lines01").unwrap();
@@ -182,7 +186,7 @@ fn test_csplit_regex_in_uniq() {
     csplit_test(
         &["-f", "in_uniq", "tests/assets/in_uniq", "/^$/", "{*}"],
         "",
-        "6\n10\n8\n9\n",
+        "7\n11\n9\n9\n",
     );
     std::fs::remove_file("in_uniq00").unwrap();
     std::fs::remove_file("in_uniq01").unwrap();
@@ -195,7 +199,7 @@ fn test_csplit_regex_in_uniq_2() {
     csplit_test(
         &["-f", "in_uniq_2_", "tests/assets/in_uniq", "/^$/-1", "{*}"],
         "",
-        "3\n10\n8\n12\n",
+        "4\n11\n9\n12\n",
     );
     std::fs::remove_file("in_uniq_2_00").unwrap();
     std::fs::remove_file("in_uniq_2_01").unwrap();
@@ -208,7 +212,7 @@ fn test_csplit_regex_in_uniq_3() {
     csplit_test(
         &["-f", "in_uniq_3_", "tests/assets/in_uniq", "/^$/1", "{*}"],
         "",
-        "7\n10\n8\n8\n",
+        "8\n11\n9\n8\n",
     );
     std::fs::remove_file("in_uniq_3_00").unwrap();
     std::fs::remove_file("in_uniq_3_01").unwrap();
@@ -221,7 +225,7 @@ fn test_csplit_regex_in_seq() {
     csplit_test(
         &["-f", "in_seq", "tests/assets/in_seq", "/2/", "/4/", "/6/"],
         "",
-        "1\n3\n3\n1\n",
+        "2\n4\n4\n1\n",
     );
     std::fs::remove_file("in_seq00").unwrap();
     std::fs::remove_file("in_seq01").unwrap();
@@ -294,7 +298,7 @@ fn test_csplit_keep_files_on_error() {
         cmd: String::from("csplit"),
         args: str_args,
         stdin_data: String::from("line1\nline2\nline3\nline4\n"),
-        expected_out: String::from("11\n12\n"),
+        expected_out: String::from("12\n12\n"),
         expected_err: String::from(""),
         expected_exit_code: 0,
     });
@@ -315,7 +319,7 @@ fn test_csplit_bre_patterns() {
     csplit_test(
         &["-f", "bre_test", "-", "/^line/"],
         "header\nline1\nline2\n",
-        "6\n12\n",
+        "7\n12\n",
     );
     std::fs::remove_file("bre_test00").unwrap();
     std::fs::remove_file("bre_test01").unwrap();

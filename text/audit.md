@@ -259,20 +259,20 @@ Largely functional and handles the core splitting modes. Three correctness defec
 
 #### Critical
 
-- [ ] **#1 — Absolute line numbers broken with multiple `line_no` operands and no `{num}`.** `text/csplit.rs:209,214`. After a `line_no` split fires, `state.in_line_no` is reset to 1 (line 214). A subsequent `line_no` operand counts from the start of the new section, not the start of the file. `csplit file 5 10` splits at file-line 5 then at file-line 15 (perceived "line 10" of section 2), not file-line 10. Fix: maintain a monotonically increasing global file line counter; never reset it.
-- [ ] **#2 — `line_no` operand without a following `{num}` never consumed.** `text/csplit.rs:218-225`. After a `line_no` fires, the operand list is only advanced if the next item is a `Repeat`. With no `Repeat`, the `LineNum` operand stays and (combined with #1's reset) fires every N lines indefinitely. `csplit file 5` should split once at line 5; instead it splits at 5, 10, 15, … to EOF. Fix: consume a non-repeated `LineNum` after it fires.
-- [ ] **#3 — stdout byte count diverges from actual file size.** `text/csplit.rs:388`. Spec stdout format is `"%d\n", <file size in bytes>`. The impl prints `lines.len()`, but callers strip the trailing newline with `lines.pop()` before writing (e.g. lines 211, 255, 283, 319), so the printed count omits the newline and mismatches `wc -c` of the written file. Fix: report the size of what was actually written.
+- [x] **#1 — Absolute line numbers broken with multiple `line_no` operands and no `{num}`.** FIXED (Phase 9): `in_line_no` is now a monotonic absolute counter (never reset); `LineNum { target, step }` carries the repeat step, so `csplit file 5 10` splits at absolute lines 5 and 10.
+- [x] **#2 — `line_no` operand without a following `{num}` never consumed.** FIXED (Phase 9): a bare line number is removed from the operand list after it fires; `{N}` advances the target by `step` and removes the pair once exhausted (and `{N}` now fires N+1 times, matching GNU).
+- [x] **#3 — stdout byte count diverges from actual file size.** FIXED (Phase 9): the trailing-newline `lines.pop()` calls were removed (they also corrupted the written files), so each file keeps its bytes and the printed count equals `wc -c`. The negative-offset path was rewritten to move whole lines preserving their newlines. Verified byte-for-byte against GNU coreutils 9.4.
 
 #### Major
 
-- [ ] **#4 — ASYNCHRONOUS EVENTS: no signal handler for created-file cleanup.** `text/csplit.rs:626-635`. Cleanup runs only in the `Err` branch. If killed by a signal mid-run, created files are neither removed (default) nor retained-per-`-k`. Fix: register SIGINT/SIGTERM handlers mirroring the cleanup at lines 631-634.
+- [ ] **#4 — ASYNCHRONOUS EVENTS: no signal handler for created-file cleanup.** `text/csplit.rs:626-635`. REMAINING (Phase 9): the on-error cleanup is correct; a SIGINT/SIGTERM handler mirroring it is still to be added.
 
 #### Minor
 
-- [ ] **#5 — `{*}` decrements `usize::MAX`, panics in debug builds.** `text/csplit.rs:334` (also 220). `Repeat(usize::MAX)` minus 1 panics on overflow in debug. Fix: special-case the unbounded repeat.
-- [ ] **#6 — Escaped delimiter not translated into the BRE.** `text/csplit.rs:407-449`. The `\/` (and `\%`) escape is used to find the operand's end but the resulting pattern slice is passed to the BRE engine without translating `\/`→`/`, so `/proc\/sys/` compiles the literal `proc\/sys`. Fix: translate the escaped delimiter before compiling.
-- [ ] **#7 — Hardcoded `NAME_MAX = 255`.** `text/csplit.rs:595-596`. Not queried via `pathconf`/`libc::NAME_MAX`. Portability minor.
-- [ ] **#8 — No error when an operand references a line past EOF.** `text/csplit.rs:541`. Spec requires an error if an operand does not reference a line between the current position and EOF; remaining operands are instead silently ignored.
+- [x] **#5 — `{*}` decrements `usize::MAX`, panics in debug builds.** FIXED (Phase 9): the repeat is only decremented when it is non-zero (the final fire removes the operand instead), so `Repeat(usize::MAX)` never underflows; `{*}` is verified working.
+- [x] **#6 — Escaped delimiter not translated into the BRE.** FIXED (Phase 9): `parse_op_rx` translates `\<delim>` to a literal delimiter before compiling, so `/proc\/sys/` matches `proc/sys`.
+- [x] **#7 — Hardcoded `NAME_MAX = 255`.** ACCEPTED: 255 is the POSIX `_POSIX_NAME_MAX`-era value used on Linux/macOS/BSD; the guard is conservative and portable. (A `pathconf` query is a possible refinement.)
+- [ ] **#8 — No error when an operand references a line past EOF.** `text/csplit.rs:541`. REMAINING (Phase 9): a `line_no` (or `{N}`/`{*}` repeat) that targets a line past EOF should error (GNU: "line number out of range"); the file output is byte-for-byte correct, but the exit status stays 0 instead of non-zero. Deferred.
 
 ### Detailed conformance matrix
 

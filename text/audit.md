@@ -40,8 +40,8 @@ The `asa` implementation is almost fully conformant. The single meaningful gap i
 
 #### Minor
 
-- [ ] **#1 — Undocumented `-` extension diverges from POSIX rationale recommendation.** `text/asa.rs:92-100`. The spec leaves the action for unrecognized first-characters "unspecified" and the rationale explicitly recommends treating them as `<space>`. The implementation instead provides a triple-spacing `-` extension that silently produces two blank lines for any input line whose control character is a hyphen. Portability trap: FORTRAN programs that accidentally write `-` as the first character get triple-spacing rather than single-spacing. Fix: remove the `-` arm and let it fall through to the `_` (space-equivalent) branch, or document it explicitly as a local extension.
-- [ ] **#2 — Diagnostics bypass `plib::diag`.** `text/asa.rs:146`. Error messages are emitted via bare `eprintln!("{}: {}", filename.display(), e)` rather than through `plib::diag`. Every other audited utility touched during the datetime-audit cycle routes runtime diagnostics through `plib::diag::error()` / `plib::diag::init_locale()`. Fix: call `plib::diag::init_locale("asa")` in `main` and replace the `eprintln!` with `plib::diag::error(...)`.
+- [x] **#1 — Undocumented `-` extension diverges from POSIX rationale recommendation.** ACCEPTED (kept + documented): the `-` triple-spacing extension is retained and documented in the source header per the keep-and-document policy for harmless extensions.
+- [x] **#2 — Diagnostics bypass `plib::diag`.** FIXED (Phase 5): `main` calls `plib::diag::init_locale("asa")`, routes errors through `plib::diag::error`, and exits via `plib::diag::exit_status()`.
 
 ### Detailed conformance matrix
 
@@ -149,12 +149,12 @@ Mostly correct on the happy path (options, column suppression, tab-lead arithmet
 
 #### Major
 
-- [ ] **#1 — Line comparison ignores LC_COLLATE — uses Rust byte order instead of `strcoll(3)`.** `text/comm.rs:106-109`. The comparisons `buf1 < buf2` / `buf2 < buf1` use Rust's `<` on `String` (UTF-8 byte order = the C/POSIX locale, but diverges from any non-POSIX locale). Spec requires comparison in "the collating sequence of the current locale". The workspace already provides `plib::locale::strcoll` (`plib/src/locale.rs:122`) but `comm` neither imports nor calls it. Under a non-C locale, `comm` and `sort` disagree on ordering → garbage output. Fix: replace the two comparisons with `plib::locale::strcoll(&buf1, &buf2)`.
+- [x] **#1 — Line comparison ignores LC_COLLATE — uses Rust byte order instead of `strcoll(3)`.** FIXED (Phase 5): comparison uses `plib::locale::strcoll`, with a byte-comparison tiebreak for collate-equal-but-not-identical lines (POSIX Issue 8).
 
 #### Minor
 
-- [ ] **#2 — `--` end-of-options with operands starting with `-`.** `text/comm.rs:23-38`. The `file1`/`file2` positional `PathBuf` fields lack `allow_hyphen_values`. Bare `-` (stdin) works, but a literal filename starting with `-` is misparsed as an unknown option. Fix: add `#[arg(allow_hyphen_values = true)]` or struct-level `allow_hyphen_values`.
-- [ ] **#3 — No locale-aware diagnostic messages (LC_MESSAGES).** `text/comm.rs:157`. `eprintln!("{}", e)` emits the raw Rust I/O error string (always English) regardless of `LC_MESSAGES`. `textdomain` is initialized but the error path does not use a gettextrs-wrapped message. Fix: route through `plib::diag`/`gettext`.
+- [x] **#2 — `--` end-of-options with operands starting with `-`.** ACCEPTED (conforming): a filename beginning with `-` is passed after the `--` end-of-options delimiter (XBD §12.2 Guideline 10), which clap honors (verified: `comm -- -file1 -file2`). `allow_hyphen_values` is intentionally not added, as it would let a bare `-foo` be misread as a value for a flag.
+- [x] **#3 — No locale-aware diagnostic messages (LC_MESSAGES).** FIXED (Phase 5): diagnostics route through `plib::diag::error` (uniform `comm:` prefix, stderr, exit-status accumulator).
 
 ### Detailed conformance matrix
 
@@ -1077,12 +1077,12 @@ Largely correct. Two actionable gaps: (1) the `-` operand is not treated as stdi
 #### Major
 
 - [x] **#1 — `-` operand not treated as stdin.** `text/head.rs:64`. FIXED (Phase 2): opens via `plib::io::input_stream_dashed`; `head -` reads stdin.
-- [ ] **#2 — Zero count produces non-zero exit instead of empty output.** `text/head.rs:161-164,170-173`. Spec makes "positive integer" a caller constraint, not a utility-error trigger; GNU/BusyBox/uutils all emit empty output for `-n 0`/`-c 0`. The impl exits 1 with a diagnostic, breaking `head -n "$N"` where `$N` may be 0. Fix: remove the zero guards (the count loops already produce empty output for 0).
+- [x] **#2 — Zero count produces non-zero exit instead of empty output.** FIXED (Phase 5): `-n 0`/`-c 0` produce empty output and exit 0; multi-file headers are still printed.
 
 #### Minor
 
-- [ ] **#3 — `--lines`/`--bytes` long options are non-POSIX.** `text/head.rs:26,32`. Harmless GNU extensions; POSIX specifies only `-n`/`-c`.
-- [ ] **#4 — Zero-value diagnostics not routed through gettext.** `text/head.rs:162,171`. Hardcoded English (moot if #2 removes the guards).
+- [x] **#3 — `--lines`/`--bytes` long options are non-POSIX.** ACCEPTED (kept): harmless GNU-compatible convenience aliases.
+- [x] **#4 — Zero-value diagnostics not routed through gettext.** FIXED (Phase 5): the zero-rejection diagnostics were removed (zero is now valid); other diagnostics route through `plib::diag`.
 
 (Verified CONFORMS: the multi-file `==> name <==` header format and first-vs-subsequent blank-line placement match the spec exactly, lines 55-60.)
 
@@ -1482,15 +1482,15 @@ Functionally solid; passes a broad test suite. One Major gap: serial (`-s`) mode
 
 #### Major
 
-- [ ] **#1 — Serial mode ignores Section 1.4 "continue on file-open error."** `text/paste.rs:232-287,443-452`. The spec's CONSEQUENCES OF ERRORS says for `-s` the utility "shall provide the default behavior described in Section 1.4" (diagnose and continue to the next operand, exit >0). `open_inputs()` opens ALL files before processing and returns `Err` on any failure, so a bad file at position 2 of 4 silently suppresses positions 3–4. Fix: in serial mode, open each file at processing time and continue past failures. (Parallel mode's eager open is correct, since the spec requires no stdout output on error and no output has been written yet.)
+- [x] **#1 — Serial mode ignores Section 1.4 "continue on file-open error."** FIXED (Phase 5): serial mode opens each operand at processing time (`paste_files_serial` + `open_source`); a file that fails to open is diagnosed and processing continues with the next operand. Parallel mode keeps its eager open.
 
 #### Minor
 
-- [ ] **#2 — Empty-string file operand diagnostic lacks `paste:` prefix.** `text/paste.rs:251`. Style inconsistency; spec mandates stderr but not a prefix.
-- [ ] **#3 — Non-POSIX `--serial`/`--delimiters` long options.** `text/paste.rs:27-35`. Harmless extensions.
-- [ ] **#4 — `-d ""` accepted silently.** `text/paste.rs:167-229`. Spec says "may result in an error"; accepting it (as "no delimiter", matching GNU) is permitted.
-- [ ] **#5 — `\0` followed by hex digit not detected.** `text/paste.rs:194`. Spec marks this "unspecified"; no warning emitted (not a violation; a warning would help).
-- [ ] **#6 — Error strings not localized.** Raw string literals at paste.rs:218,251,258,275 bypass `gettext()`/`LC_MESSAGES`.
+- [x] **#2 — Empty-string file operand diagnostic lacks `paste:` prefix.** FIXED (Phase 5): the diagnostic now routes through `plib::diag::error`, which prefixes `paste:`.
+- [x] **#3 — Non-POSIX `--serial`/`--delimiters` long options.** ACCEPTED (kept): harmless convenience aliases.
+- [x] **#4 — `-d ""` accepted silently.** ACCEPTED: the spec permits an error or acceptance; treating it as "no delimiter" matches GNU.
+- [x] **#5 — `\0` followed by hex digit not detected.** ACCEPTED: the spec marks this "unspecified"; no behavior change required.
+- [x] **#6 — Error strings not localized.** FIXED (Phase 5): diagnostics route through `plib::diag` (uniform prefix + stderr); message-catalog translation is the tree-wide gettext `.mo` deferral.
 
 ### Detailed conformance matrix
 
@@ -2521,8 +2521,8 @@ The core topological sort and output format are correct. Three gaps: the `-w` op
 
 #### Critical
 
-- [ ] **#1 — `-w` option completely absent.** `text/tsort.rs:19-24` (`Args`). POSIX.1-2024 synopsis is `tsort [-w] [file]`; with `-w`, exit status = cycle count (capped). Neither the option nor counting exists; `tsort -w` errors out via clap. Fix: add `-w` + cycle counting.
-- [ ] **#2 — Cycle detection does not set non-zero exit status.** `text/tsort.rs:139-151,170-177`. Spec: "If a diagnostic message is written, the final exit status shall be non-zero." `tsort_file` always returns `Ok(())`; tests at lines 233, 264 assert exit 0 for cycles. Fix: return non-zero on any cycle.
+- [x] **#1 — `-w` option completely absent.** FIXED (Phase 5): `-w` is supported; `sort` breaks and counts cycles, and `-w` sets the exit status to the cycle count (capped at 255).
+- [x] **#2 — Cycle detection does not set non-zero exit status.** FIXED (Phase 5): a cycle is reported via `plib::diag::error`, so the exit status is non-zero (the three cycle tests now assert exit 1).
 
 #### Major
 
@@ -2530,9 +2530,9 @@ The core topological sort and output format are correct. Three gaps: the `-w` op
 
 #### Minor
 
-- [ ] **#4 — Odd-token input emits a warning but exits 0.** `text/tsort.rs:125-128`. Spec puts the pairing obligation on the application; warning-without-error is permissible but inconsistent.
-- [ ] **#5 — Cycle reporting lists members, not cycle paths.** `text/tsort.rs:139-151`. Multiple independent cycles are dumped together under one header.
-- [ ] **#6 — Cycle nodes emitted to both stderr and stdout** (`text/tsort.rs:142-151`, "match macOS behavior"); not prohibited but the comment indicates a non-POSIX extension.
+- [x] **#4 — Odd-token input emits a warning but exits 0.** ACCEPTED: the pairing obligation is on the application; the notice is now a `plib::diag::warning` (advisory, exit unaffected).
+- [x] **#5 — Cycle reporting lists members, not cycle paths.** FIXED (Phase 5): each cycle is found by DFS and reported as its own `cycle in data` group with the nodes forming that cycle; independent cycles are reported separately.
+- [x] **#6 — Cycle nodes emitted to both stderr and stdout.** FIXED (Phase 5): cycles are broken so their nodes appear once in the stdout total order (as the spec requires); stderr carries only the diagnostic cycle report.
 
 ### Detailed conformance matrix
 

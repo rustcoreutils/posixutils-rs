@@ -12,7 +12,7 @@ use std::io::{self, Read, StdoutLock, Write};
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use plib::io::input_stream_dashed;
 use plib::BUFSZ;
 
@@ -93,6 +93,10 @@ fn head_file(
                 }
             }
         }
+        CountType::Lines(0) => {
+            // -n 0 selects no lines: produce no output (the header, if any, has
+            // already been written).
+        }
         CountType::Lines(n) => {
             let mut nl = 0_usize;
 
@@ -142,40 +146,21 @@ fn head_file(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    plib::diag::init_locale("head");
 
     let mut args = Args::parse();
 
-    // bsdutils (FreeBSD) enforces n > 0 (and c > 0)
-    // BusyBox, coreutils' uutils, GNU Core Utilities, and toybox do not (and just print nothing)
-    // POSIX says:
-    // "The application shall ensure that the number option-argument is a positive decimal integer."
+    // POSIX makes "the number is a positive integer" a constraint on the
+    // application, not a reason for head to fail: a count of zero selects
+    // nothing and produces empty output (as GNU, BusyBox, uutils, and toybox
+    // do), rather than exiting non-zero.
     let count_type = match (args.n, args.bytes_to_copy) {
         (None, None) => {
             // If no arguments are provided, the default is 10 lines
             CountType::Lines(10_usize)
         }
-        (Some(n), None) => {
-            if n == 0_usize {
-                eprintln!("head: when a value for -n is provided, it must be greater than 0");
-
-                std::process::exit(1_i32);
-            }
-
-            CountType::Lines(n)
-        }
-        (None, Some(bytes_to_copy)) => {
-            if bytes_to_copy == 0_usize {
-                eprintln!("head: when a value for -c is provided, it must be greater than 0");
-
-                std::process::exit(1_i32);
-            }
-
-            CountType::Bytes(bytes_to_copy)
-        }
-
+        (Some(n), None) => CountType::Lines(n),
+        (None, Some(bytes_to_copy)) => CountType::Bytes(bytes_to_copy),
         (Some(_), Some(_)) => {
             // Will be caught by clap
             unreachable!();
@@ -191,19 +176,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let want_header = files.len() > 1;
 
-    let mut exit_code = 0;
     let mut first = true;
 
     let mut stdout_lock = io::stdout().lock();
 
     for filename in files {
         if let Err(e) = head_file(&count_type, filename, first, want_header, &mut stdout_lock) {
-            exit_code = 1;
-            eprintln!("{}: {}", filename.display(), e);
+            plib::diag::error(&format!("{}: {}", filename.display(), e));
         }
 
         first = false;
     }
 
-    std::process::exit(exit_code)
+    std::process::exit(plib::diag::exit_status())
 }

@@ -7,11 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
-// TODO:
-// - improve:  don't open all files at once in --serial mode
-
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use std::cell::{OnceCell, RefCell};
 use std::error::Error;
 use std::fs::File;
@@ -229,44 +226,44 @@ fn parse_delimiters_argument(delimiters: Option<String>) -> Result<Box<[Box<[u8]
     Ok(vec.into_boxed_slice())
 }
 
+/// Open one operand as a [`Source`]. `-` is standard input (shared across all
+/// `-` operands), an empty string yields `None` (skip), and any other name is
+/// opened as a file.
+fn open_source(
+    file: &str,
+    stdin_once_cell: &OnceCell<Rc<RefCell<Stdin>>>,
+) -> Result<Option<Source>, Box<dyn Error>> {
+    // POSIX says only to read from stdin if "-" is passed as a file.
+    match file {
+        "-" => Ok(Some(Source::StandardInput(
+            stdin_once_cell
+                .get_or_init(|| Rc::new(RefCell::new(io::stdin())))
+                .clone(),
+        ))),
+        "" => Ok(None),
+        st => {
+            let fi = File::open(st)
+                .map_err(|er| -> Box<dyn Error> { Box::from(format!("{st}: {er}")) })?;
+            Ok(Some(Source::File {
+                buf_reader: BufReader::new(fi),
+                file_description: format!("File: {st}"),
+            }))
+        }
+    }
+}
+
 fn open_inputs(files: Vec<String>) -> Result<PasteInfo, Box<dyn Error>> {
     let stdin_once_cell = OnceCell::<Rc<RefCell<Stdin>>>::new();
 
     let mut paste_file_vec = Vec::<PasteFile>::with_capacity(files.len());
 
-    // open each input
+    // Parallel mode opens every input before producing output (CONSEQUENCES OF
+    // ERRORS: no output is written if a file cannot be opened), so a failure
+    // here aborts before anything is printed.
     for file in files {
-        // POSIX says only to read from stdin if "-" is passed as a file. Most implementations
-        // automatically read from stdin if no files are passed to `paste`.
-        // https://pubs.opengroup.org/onlinepubs/9799919799/utilities/paste.html
-        match file.as_str() {
-            "-" => {
-                paste_file_vec.push(PasteFile::new(Source::StandardInput(
-                    stdin_once_cell
-                        .get_or_init(|| Rc::new(RefCell::new(io::stdin())))
-                        .clone(),
-                )));
-            }
-            "" => {
-                eprintln!("FILE is an empty string, skipping");
-            }
-            st => {
-                let open_result = File::open(st);
-
-                let buf_reader = match open_result {
-                    Err(er) => {
-                        return Err(Box::from(format!("{st}: {er}")));
-                    }
-                    Ok(fi) => BufReader::new(fi),
-                };
-
-                let filename = format!("File: {st}");
-
-                paste_file_vec.push(PasteFile::new(Source::File {
-                    buf_reader,
-                    file_description: filename,
-                }));
-            }
+        match open_source(&file, &stdin_once_cell)? {
+            Some(source) => paste_file_vec.push(PasteFile::new(source)),
+            None => plib::diag::error("file operand is an empty string, skipping"),
         }
     }
 
@@ -286,65 +283,74 @@ fn open_inputs(files: Vec<String>) -> Result<PasteInfo, Box<dyn Error>> {
     })
 }
 
-fn paste_files_serial(
-    mut paste_info: PasteInfo,
-    mut delimiter_state: DelimiterState,
+/// Concatenate every line of one source onto a single output line (serial mode).
+fn write_serial(
+    source: &mut Source,
+    delimiter_state: &mut DelimiterState,
+    stdout_lock: &mut io::StdoutLock,
+    buffer: &mut Vec<u8>,
 ) -> Result<(), Box<dyn Error>> {
-    let mut stdout_lock = io::stdout().lock();
+    let mut first_line = true;
 
-    // Re-use buffers to avoid repeated allocations
-    let mut buffer = Vec::new();
+    loop {
+        buffer.clear();
 
-    // loop serially for each input file
-    for paste_file in &mut paste_info.inputs {
-        let mut first_line = true;
-
-        // for each input line
-        loop {
-            // Equivalent to allocating a new Vec here
-            buffer.clear();
-
-            let read_line_result = paste_file.source.read_until_new_line(&mut buffer)?;
-
-            // if EOF, output line terminator and end inner loop
-            if read_line_result == 0 {
-                stdout_lock.write_all(b"\n")?;
-
-                break;
-            } else {
-                if !first_line {
-                    delimiter_state.write(&mut stdout_lock)?;
-                }
-
-                // output line segment
-                let mut iter = buffer.iter();
-
-                // TODO
-                // Check that the removed character is a newline?
-                // Update: checking if it was a newline in this manner fixes "paste_multiple_stdin_serial_test_two"
-                // But this seems hacky
-                let slice = match iter.next_back() {
-                    // `iter` is correct, since the byte that was removed was a newline character
-                    Some(b'\n') => iter.as_slice(),
-                    // `iter` is wrong, since it is now missing the final character (which was not a newline
-                    // character), so use `buffer`, unmodified
-                    _ => buffer.as_slice(),
-                };
-
-                stdout_lock.write_all(slice)?;
-            }
-
-            if first_line {
-                first_line = false;
-            }
+        if source.read_until_new_line(buffer)? == 0 {
+            // EOF: terminate the output line.
+            stdout_lock.write_all(b"\n")?;
+            break;
         }
 
-        // See https://pubs.opengroup.org/onlinepubs/9799919799/utilities/paste.html:
-        //
-        //    When the -s option is specified:
-        //    The last <newline> in a file shall not be modified.
-        //    The delimiter shall be reset to the first element of list after each file operand is processed.
-        delimiter_state.reset();
+        if !first_line {
+            delimiter_state.write(stdout_lock)?;
+        }
+
+        // Drop the trailing newline if present; keep the line otherwise.
+        let mut iter = buffer.iter();
+        let slice = match iter.next_back() {
+            Some(b'\n') => iter.as_slice(),
+            _ => buffer.as_slice(),
+        };
+        stdout_lock.write_all(slice)?;
+
+        first_line = false;
+    }
+
+    // The delimiter resets to the first element after each file operand.
+    delimiter_state.reset();
+    Ok(())
+}
+
+fn paste_files_serial(
+    files: &[String],
+    mut delimiter_state: DelimiterState,
+) -> Result<(), Box<dyn Error>> {
+    if files.is_empty() {
+        return Err(Box::from(
+            "No valid [FILES] were specified. Use '-' if you are trying to read from stdin.",
+        ));
+    }
+
+    let stdin_once_cell = OnceCell::<Rc<RefCell<Stdin>>>::new();
+    let mut stdout_lock = io::stdout().lock();
+    let mut buffer = Vec::new();
+
+    // Serial mode follows the POSIX Section 1.4 default for CONSEQUENCES OF
+    // ERRORS: a file that cannot be opened is diagnosed and processing
+    // continues with the next operand (the final exit status is non-zero).
+    for file in files {
+        match open_source(file, &stdin_once_cell) {
+            Ok(Some(mut source)) => {
+                write_serial(
+                    &mut source,
+                    &mut delimiter_state,
+                    &mut stdout_lock,
+                    &mut buffer,
+                )?;
+            }
+            Ok(None) => plib::diag::error("file operand is an empty string, skipping"),
+            Err(e) => plib::diag::error(&format!("{e}")),
+        }
     }
 
     Ok(())
@@ -417,9 +423,7 @@ fn paste_files(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    plib::diag::init_locale("paste");
 
     let args = Args::parse();
 
@@ -432,21 +436,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let parsed_delimiters_argument = match parse_delimiters_argument(delimiters) {
         Ok(bo) => bo,
         Err(st) => {
-            eprintln!("paste: {st}");
-
-            // TODO
-            // `std::process::exit` should not be used
-            std::process::exit(1);
-        }
-    };
-
-    let paste_info = match open_inputs(files) {
-        Ok(pa) => pa,
-        Err(bo) => {
-            eprintln!("paste: {bo}");
-
-            // TODO
-            // `std::process::exit` should not be used
+            plib::diag::error(&st);
             std::process::exit(1);
         }
     };
@@ -454,10 +444,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let delimiter_state = DelimiterState::new(&parsed_delimiters_argument);
 
     if serial {
-        paste_files_serial(paste_info, delimiter_state)?;
+        if let Err(e) = paste_files_serial(&files, delimiter_state) {
+            plib::diag::error(&format!("{e}"));
+        }
     } else {
-        paste_files(paste_info, delimiter_state)?;
+        match open_inputs(files) {
+            Ok(paste_info) => {
+                if let Err(e) = paste_files(paste_info, delimiter_state) {
+                    plib::diag::error(&format!("{e}"));
+                }
+            }
+            Err(e) => plib::diag::error(&format!("{e}")),
+        }
     }
 
-    Ok(())
+    std::process::exit(plib::diag::exit_status())
 }

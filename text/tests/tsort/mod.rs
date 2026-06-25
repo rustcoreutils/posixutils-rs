@@ -229,8 +229,8 @@ fn test_tsort_cycle_two_nodes() {
     let output = child.wait_with_output().expect("failed to wait on tsort");
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    // Exit code should be 0 (matching macOS behavior)
-    assert_eq!(output.status.code(), Some(0));
+    // A cycle is a diagnostic condition, so the exit status is non-zero (POSIX).
+    assert_eq!(output.status.code(), Some(1));
 
     // Should report cycle to stderr
     assert!(stderr.contains("cycle"), "Expected cycle message in stderr");
@@ -261,7 +261,7 @@ fn test_tsort_cycle_three_nodes() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.status.code(), Some(1));
     assert!(stderr.contains("cycle"));
     assert!(stdout.contains("a") && stdout.contains("b") && stdout.contains("c"));
 }
@@ -287,7 +287,7 @@ fn test_tsort_partial_cycle() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.status.code(), Some(1));
     assert!(stderr.contains("cycle"));
 
     // All nodes should appear in output
@@ -326,4 +326,43 @@ fn tsort_dash_operand_reads_stdin() {
         expected_err: String::from(""),
         expected_exit_code: 0,
     });
+}
+
+#[test]
+fn test_tsort_w_counts_cycles() {
+    // -w sets the exit status to the number of cycles (two disjoint 2-cycles).
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tsort"))
+        .arg("-w")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(b"a b\nb a\nc d\nd c\n")?;
+            child.wait_with_output()
+        })
+        .expect("failed to run tsort");
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn test_tsort_w_no_cycle_is_zero() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tsort"))
+        .arg("-w")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.as_mut().unwrap().write_all(b"a b\nb c\n")?;
+            child.wait_with_output()
+        })
+        .expect("failed to run tsort");
+    assert_eq!(output.status.code(), Some(0));
 }

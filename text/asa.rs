@@ -11,7 +11,7 @@ use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use plib::io::input_reader;
 
 /// asa - interpret carriage-control characters
@@ -127,9 +127,7 @@ fn asa_file(pathname: &Path) -> io::Result<()> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    plib::diag::init_locale("asa");
 
     let mut args = Args::parse();
 
@@ -138,14 +136,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.files.push(PathBuf::from("-"));
     }
 
-    let mut exit_code = 0;
-
     for filename in &args.files {
         if let Err(e) = asa_file(filename) {
-            exit_code = 1;
-            eprintln!("{}: {}", filename.display(), e);
+            plib::diag::error(&format!("{}: {}", filename.display(), e));
         }
     }
 
-    std::process::exit(exit_code)
+    std::process::exit(plib::diag::exit_status())
 }

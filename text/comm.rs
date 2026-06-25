@@ -8,8 +8,10 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use plib::io::input_reader;
+use plib::locale::strcoll;
+use std::cmp::Ordering;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -103,16 +105,40 @@ fn comm_file(
         if buf1.is_empty() {
             line_out(lead_dup, mask, NO2, &buf2)?;
             buf2.clear();
-        } else if buf2.is_empty() || buf1 < buf2 {
+        } else if buf2.is_empty() {
             line_out(lead_dup, mask, NO1, &buf1)?;
             buf1.clear();
-        } else if buf2 < buf1 {
-            line_out(lead_dup, mask, NO2, &buf2)?;
-            buf2.clear();
         } else {
-            line_out(lead_dup, mask, NODUP, &buf1)?;
-            buf1.clear();
-            buf2.clear();
+            // Compare in the current locale's collating sequence (LC_COLLATE),
+            // matching the order `sort` produces.
+            match strcoll(&buf1, &buf2) {
+                Ordering::Less => {
+                    line_out(lead_dup, mask, NO1, &buf1)?;
+                    buf1.clear();
+                }
+                Ordering::Greater => {
+                    line_out(lead_dup, mask, NO2, &buf2)?;
+                    buf2.clear();
+                }
+                Ordering::Equal => {
+                    if buf1 == buf2 {
+                        line_out(lead_dup, mask, NODUP, &buf1)?;
+                        buf1.clear();
+                        buf2.clear();
+                    } else {
+                        // Collate-equal but not identical (the locale's order is
+                        // not a total order): POSIX Issue 8 requires treating
+                        // them as different lines, ordered by a byte comparison.
+                        if buf1 < buf2 {
+                            line_out(lead_dup, mask, NO1, &buf1)?;
+                            buf1.clear();
+                        } else {
+                            line_out(lead_dup, mask, NO2, &buf2)?;
+                            buf2.clear();
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -135,9 +161,7 @@ fn args_mask(args: &Args) -> u32 {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    plib::diag::init_locale("comm");
 
     let args = Args::parse();
 
@@ -150,12 +174,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (true, true) => "",
     };
 
-    let mut exit_code = 0;
-
     if let Err(e) = comm_file(mask, lead_dup, &args.file1, &args.file2) {
-        exit_code = 1;
-        eprintln!("{}", e);
+        plib::diag::error(&format!("{}", e));
     }
 
-    std::process::exit(exit_code)
+    std::process::exit(plib::diag::exit_status())
 }

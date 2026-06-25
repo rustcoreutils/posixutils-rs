@@ -8,11 +8,11 @@
 //
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use plib::io::input_stream_dashed;
 use std::path::Path;
 
@@ -20,9 +20,16 @@ use std::path::Path;
 #[derive(Parser)]
 #[command(version, about = gettext("tsort - topological sort"))]
 struct Args {
+    #[arg(short = 'w', help = gettext("Set the exit status to the number of cycles found in the input"))]
+    cycle_count_status: bool,
+
     #[arg(help = gettext("File to read as input"))]
     file: Option<PathBuf>,
 }
+
+/// Implementation-defined maximum reported by `-w` (process exit codes are
+/// limited to 0..=255).
+const MAX_CYCLE_STATUS: usize = 255;
 
 /// Topological sort using Kahn's algorithm
 struct TopoSort {
@@ -60,46 +67,115 @@ impl TopoSort {
         }
     }
 
-    /// Perform topological sort, returning (sorted_nodes, cycle_nodes)
-    fn sort(mut self) -> (Vec<String>, Vec<String>) {
-        let node_count = self.in_degree.len();
-        let mut result = Vec::with_capacity(node_count);
-        let mut queue: VecDeque<String> = VecDeque::new();
+    /// Queue every not-yet-emitted node whose in-degree is currently zero.
+    fn ready_nodes(&self) -> VecDeque<String> {
+        self.in_degree
+            .iter()
+            .filter(|(_, &deg)| deg == 0)
+            .map(|(node, _)| node.clone())
+            .collect()
+    }
 
-        // Find all nodes with in-degree 0
-        for (node, &deg) in &self.in_degree {
-            if deg == 0 {
-                queue.push_back(node.clone());
+    /// Find a cycle among the remaining (not-yet-emitted) nodes via DFS,
+    /// returning the nodes that form it in order. There is guaranteed to be one
+    /// when this is called (Kahn's algorithm has stalled with nodes left).
+    fn find_cycle(&self) -> Vec<String> {
+        let mut visited: BTreeSet<String> = BTreeSet::new();
+        for start in self.in_degree.keys() {
+            let mut path: Vec<String> = Vec::new();
+            let mut on_path: BTreeSet<String> = BTreeSet::new();
+            if let Some(cycle) = self.dfs_cycle(start, &mut path, &mut on_path, &mut visited) {
+                return cycle;
             }
         }
+        // Unreachable in practice; degrade gracefully.
+        self.in_degree.keys().next().cloned().into_iter().collect()
+    }
 
-        // Process nodes with no remaining dependencies
-        while let Some(node) = queue.pop_front() {
-            result.push(node.clone());
+    fn dfs_cycle(
+        &self,
+        node: &str,
+        path: &mut Vec<String>,
+        on_path: &mut BTreeSet<String>,
+        visited: &mut BTreeSet<String>,
+    ) -> Option<Vec<String>> {
+        path.push(node.to_string());
+        on_path.insert(node.to_string());
 
-            // Remove this node's edges and update in-degrees
-            if let Some(succs) = self.successors.remove(&node) {
-                for succ in succs {
-                    if let Some(deg) = self.in_degree.get_mut(&succ) {
-                        *deg -= 1;
-                        if *deg == 0 {
-                            queue.push_back(succ);
-                        }
+        if let Some(succs) = self.successors.get(node) {
+            for succ in succs {
+                // Ignore edges to already-emitted nodes.
+                if !self.in_degree.contains_key(succ) {
+                    continue;
+                }
+                if on_path.contains(succ) {
+                    let idx = path.iter().position(|n| n == succ).unwrap();
+                    return Some(path[idx..].to_vec());
+                }
+                if !visited.contains(succ) {
+                    if let Some(cycle) = self.dfs_cycle(succ, path, on_path, visited) {
+                        return Some(cycle);
                     }
                 }
             }
-            self.in_degree.remove(&node);
         }
 
-        // Any remaining nodes are in cycles
-        let mut cycle_nodes = Vec::with_capacity(self.in_degree.len());
-        cycle_nodes.extend(self.in_degree.into_keys());
+        path.pop();
+        on_path.remove(node);
+        visited.insert(node.to_string());
+        None
+    }
 
-        (result, cycle_nodes)
+    /// Produce a total order. When the partial order contains cycles they are
+    /// detected and broken (one edge each) so output still covers every node;
+    /// each broken cycle is returned so the caller can report and count it.
+    fn sort(mut self) -> (Vec<String>, Vec<Vec<String>>) {
+        let mut result = Vec::with_capacity(self.in_degree.len());
+        let mut cycles: Vec<Vec<String>> = Vec::new();
+        let mut queue = self.ready_nodes();
+
+        loop {
+            // Emit everything currently free of dependencies (Kahn's algorithm).
+            while let Some(node) = queue.pop_front() {
+                result.push(node.clone());
+                if let Some(succs) = self.successors.remove(&node) {
+                    for succ in succs {
+                        if let Some(deg) = self.in_degree.get_mut(&succ) {
+                            *deg -= 1;
+                            if *deg == 0 {
+                                queue.push_back(succ);
+                            }
+                        }
+                    }
+                }
+                self.in_degree.remove(&node);
+            }
+
+            if self.in_degree.is_empty() {
+                break;
+            }
+
+            // Stalled: a cycle remains. Find it, break the edge that closes it,
+            // and continue; the freed nodes are re-queued below.
+            let cycle = self.find_cycle();
+            let from = cycle.last().unwrap().clone();
+            let to = cycle.first().unwrap().clone();
+            if let Some(succs) = self.successors.get_mut(&from) {
+                if succs.remove(&to) {
+                    if let Some(deg) = self.in_degree.get_mut(&to) {
+                        *deg -= 1;
+                    }
+                }
+            }
+            cycles.push(cycle);
+            queue = self.ready_nodes();
+        }
+
+        (result, cycles)
     }
 }
 
-fn tsort_file(pathname: &Option<PathBuf>) -> io::Result<()> {
+fn tsort_file(pathname: &Option<PathBuf>) -> io::Result<usize> {
     // No operand or "-" reads stdin; any other path is opened as a file.
     let file = input_stream_dashed(pathname.as_deref().unwrap_or(Path::new("")))?;
     let reader = io::BufReader::new(file);
@@ -124,35 +200,32 @@ fn tsort_file(pathname: &Option<PathBuf>) -> io::Result<()> {
         }
     }
 
-    // Warn if odd number of tokens (last token silently discarded)
+    // The application is responsible for supplying token pairs; an odd count
+    // is advisory (the last token is ignored).
     if !sv.is_empty() {
-        eprintln!("{}", gettext("tsort: odd number of tokens"));
+        plib::diag::warning(&gettext("odd number of tokens"));
     }
 
-    // Perform the sort
-    let (sorted, cycle_nodes) = ts.sort();
+    // Perform the sort, breaking and reporting any cycles.
+    let (sorted, cycles) = ts.sort();
 
-    // Output sorted nodes
+    // Output the total order to stdout (cycle members are included, since their
+    // cycles were broken).
+    let mut stdout = io::stdout().lock();
     for node in &sorted {
-        println!("{}", node);
+        writeln!(stdout, "{}", node)?;
     }
 
-    // Handle cycles
-    if !cycle_nodes.is_empty() {
-        eprintln!("{}", gettext("tsort: cycle in data"));
-
-        // Report cycle members to stderr (match macOS behavior)
-        for node in &cycle_nodes {
-            eprintln!("tsort: {}", node);
-        }
-
-        // Output cycle members to stdout (match macOS behavior)
-        for node in &cycle_nodes {
-            println!("{}", node);
+    // Report each broken cycle to stderr; reporting makes the exit status
+    // non-zero (unless -w overrides it with the cycle count).
+    for cycle in &cycles {
+        plib::diag::error(&gettext("cycle in data"));
+        for node in cycle {
+            plib::diag::error(node);
         }
     }
 
-    Ok(())
+    Ok(cycles.len())
 }
 
 fn pathname_display(path: &Option<PathBuf>) -> String {
@@ -163,18 +236,23 @@ fn pathname_display(path: &Option<PathBuf>) -> String {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    plib::diag::init_locale("tsort");
 
     let args = Args::parse();
 
-    let mut exit_code = 0;
-
-    if let Err(e) = tsort_file(&args.file) {
-        exit_code = 1;
-        eprintln!("{}: {}", pathname_display(&args.file), e);
+    match tsort_file(&args.file) {
+        Ok(cycle_count) => {
+            if args.cycle_count_status {
+                // -w: exit status is the number of cycles, capped at the
+                // implementation-defined maximum.
+                std::process::exit(cycle_count.min(MAX_CYCLE_STATUS) as i32);
+            }
+            // Otherwise, a reported cycle makes the status non-zero.
+            std::process::exit(plib::diag::exit_status());
+        }
+        Err(e) => {
+            plib::diag::error(&format!("{}: {}", pathname_display(&args.file), e));
+            std::process::exit(1);
+        }
     }
-
-    std::process::exit(exit_code)
 }

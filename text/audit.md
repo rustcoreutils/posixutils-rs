@@ -2635,22 +2635,22 @@ Two Critical and three Major non-conformances. Most damaging: (1) `-t tablist` d
 
 #### Critical
 
-- [ ] **#1 — Repeating tab stops not implemented.** `text/unexpand.rs:85-97`. `for &tabstop in tablist` iterates each explicit stop once; for default `[8]` only one pass runs, so 16 leading spaces produce `\t` + 8 spaces instead of `\t\t`. Default is "equivalent to `-t 8`" → stops repeat every 8 columns. `test_2`'s 16-space ("Date") expectation encodes the wrong answer, masking the bug. Fix: treat a single-entry tablist as a repeating period.
-- [ ] **#2 — `-t` does not imply all-blanks conversion.** `text/unexpand.rs:45-49,57-61`. Dispatch `if args.all_spaces && args.tablist.is_none()`; with `-t` and no `-a`, this is false → wrong function. Spec: with `-t`, conversion is not limited to leading blanks. Fix: condition `args.all_spaces || args.tablist.is_some()`.
+- [x] **#1 — Repeating tab stops not implemented.** FIXED (Phase 3): the default and single-integer `-t N` are `TabStops::Uniform(N)`, repeating every N columns, so 16 default-stop leading spaces become `\t\t`. The wrong `test_2` expectation was corrected (verified against GNU coreutils 9.4).
+- [x] **#2 — `-t` does not imply all-blanks conversion.** FIXED (Phase 3): `all_mode = args.all_spaces || args.tablist.is_some()`, so `-t` enables full conversion.
 
 #### Major
 
-- [ ] **#3 — `convert_all_blanks` loses column position and structure.** `text/unexpand.rs:107-142`. `split_whitespaces` counts spaces from position 0 of each run, not the actual column; tab-stop alignment is relative to the run, not the line. Fix: single-pass column-tracking conversion.
-- [ ] **#4 — `convert_all_blanks` ignores a multi-stop tablist.** `text/unexpand.rs:138` uses `tablist[0]` only.
-- [ ] **#5 — Backspace column-decrement not implemented.** No `'\x08'` handling anywhere; spec requires backspace to be copied and decrement the column (min 1).
+- [x] **#3 — `convert_all_blanks` loses column position and structure.** FIXED (Phase 3): replaced by `unexpand_line`, a single-pass converter tracking the true 0-based column across the whole line.
+- [x] **#4 — `convert_all_blanks` ignores a multi-stop tablist.** FIXED (Phase 3): conversion uses all stops via `TabStops::next_stop`.
+- [x] **#5 — Backspace column-decrement not implemented.** FIXED (Phase 3): a `<backspace>` is copied and decrements the column (saturating at 0).
 
 #### Minor
 
-- [ ] **#6 — `parse_tablist` splits only on comma, not blank.** `text/unexpand.rs:30`. Spec allows "blank or comma".
-- [ ] **#7 — `split_whitespaces` uses `is_whitespace()` not blank-only.** `text/unexpand.rs:113`. Matches `\n`/`\r`/`\f`/`\v`/Unicode spaces; POSIX blank is space+tab.
+- [x] **#6 — `parse_tablist` splits only on comma, not blank.** FIXED (Phase 3): the list is split on commas, blanks, and tabs.
+- [x] **#7 — `split_whitespaces` uses `is_whitespace()` not blank-only.** FIXED (Phase 3): `unexpand_line` operates on space and tab bytes only; `split_whitespaces` was removed.
 - [x] **#8 — `-` operand only honored as the sole file argument.** `text/unexpand.rs:40`. FIXED (Phase 2): operands are processed in order via `plib::io::input_stream_dashed`, so `-` reads stdin at any position.
-- [ ] **#9 — Leading tab characters not treated as blanks for column tracking.** `text/unexpand.rs:70-105` stops collection at the first non-space.
-- [ ] **#10 — Multibyte / wide-character column width ignored.** No `unicode-width`/`wcwidth`.
+- [x] **#9 — Leading tab characters not treated as blanks for column tracking.** FIXED (Phase 3): a `<tab>` advances the column and does not end the leading-blank region.
+- [x] **#10 — Multibyte / wide-character column width ignored.** FIXED (Phase 3): characters are segmented with `plib::locale::mb_char_slices` and the column advances by `plib::locale::wcwidth_char`.
 
 ### Detailed conformance matrix
 

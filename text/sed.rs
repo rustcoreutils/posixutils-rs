@@ -9,7 +9,6 @@
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use libc::{ioctl, winsize, STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO, TIOCGWINSZ};
 use plib::regex::{Regex as PlibRegex, RegexFlags};
 use std::sync::Mutex;
 use std::{
@@ -20,8 +19,6 @@ use std::{
     ops::Range,
     path::PathBuf,
 };
-
-const DEFAULT_TMP_DIR: &str = "../target/tmp";
 
 static ERE: Mutex<bool> = Mutex::new(false);
 
@@ -94,10 +91,10 @@ impl Args {
                 return Err(SedError::NoScripts);
             } else {
                 // Neither [-e script] nor [-f script_file] is supplied and [file...] is not empty
-                // then consider first [file...] as single script.
-                for raw_script_line in self.file.remove(0).split('\n') {
-                    raw_script.push_str(raw_script_line);
-                }
+                // then consider first [file...] as single script. Preserve embedded
+                // newlines verbatim: they delimit commands and terminate the text of
+                // multi-line `a`/`i`/`c` commands and `:`/`b`/`t` labels.
+                raw_script = self.file.remove(0);
             }
         }
 
@@ -107,11 +104,15 @@ impl Args {
             self.file.push("-".to_string());
         }
 
+        // POSIX: the -E/-r flag selects ERE for *all* regexes in the script.
+        // This must be set BEFORE parsing, because Script::parse compiles every
+        // regex (addresses and `s` patterns) at parse time.
+        *ERE.lock().unwrap() = self.ere;
+
         let script = Script::parse(raw_script)?;
         script.check_labels()?;
 
         Ok(Sed {
-            ere: self.ere,
             quiet: self.quiet,
             script,
             input_sources: self.file,
@@ -124,6 +125,7 @@ impl Args {
             is_last_line: false,
             current_end: None,
             next_line: String::new(),
+            append_queue: Vec::new(),
         })
     }
 }
@@ -261,6 +263,8 @@ enum ReplaceFlag {
     /// Write. Append the pattern space to wfile if a
     /// replacement was made
     AppendToIfReplace(PathBuf), // w
+    /// Case-insensitive matching (POSIX.1-2024 `i`/`I` flag)
+    CaseInsensitive, // i / I
 }
 
 /// Newtype for implementing [`Debug`] trait for Regex
@@ -309,8 +313,12 @@ enum Command {
     /// Write text to standard output
     PrintTextBefore(Option<Address>, String), // i
     /// Write the pattern space to standard
-    /// output in a visually unambiguous form
+    /// output in a visually unambiguous form.
+    /// Non-POSIX EXTENSION (`I`); kept for backwards compatibility.
     PrintPatternBinary(Option<Address>), // I
+    /// POSIX `l`: write the pattern space to standard output in a
+    /// visually unambiguous form, with an optional line-wrap width.
+    PrintPatternList(Option<Address>, Option<usize>), // l
     /// Write the pattern space to standard output
     /// and replace pattern space with next line,
     /// then continue current cycle
@@ -368,6 +376,7 @@ impl Command {
             Command::AppendPatternToHold(address) => (address, 2),
             Command::PrintTextBefore(address, ..) => (address, 1),
             Command::PrintPatternBinary(address) => (address, 2),
+            Command::PrintPatternList(address, ..) => (address, 2),
             Command::PrintPatternAndReplaceWithNext(address) => (address, 2),
             Command::PrintPattern(address, ..) => (address, 2),
             Command::Quit(address) => (address, 1),
@@ -941,15 +950,44 @@ fn parse_text_attribute(chars: &[char], i: &mut usize) -> Result<Option<String>,
         ));
     }
     *i += 1;
+    // POSIX multi-line form: `a\` followed by a <newline> begins the text on the
+    // following line(s); a line ending in `\` continues to the next line.
+    // Do NOT skip the newline when it is immediately followed by a command
+    // delimiter / end-of-script, which is the empty `a\` (missing text) case.
+    if chars.get(*i) == Some(&'\n') && !matches!(chars.get(*i + 1), Some(';') | None) {
+        *i += 1;
+    }
     let mut text = String::new();
     while let Some(ch) = chars.get(*i) {
         match *ch {
             '\n' => {
-                *i += 1;
+                // An unescaped <newline> terminates the text: the text ends at
+                // the first line that does NOT end in a backslash. Back up one
+                // so the caller's `i += 1` lands on this newline, which is then
+                // processed as a command delimiter; the next line is the next
+                // command. (Only when text was collected; an empty text is an
+                // error and keeps the index on the newline for diagnostics.)
+                if !text.is_empty() {
+                    *i -= 1;
+                }
                 break;
             }
             '\\' => {
                 *i += 1;
+                match chars.get(*i) {
+                    // `\` before a newline is a continuation: emit a real
+                    // newline and keep reading the next line.
+                    Some('\n') => {
+                        text.push('\n');
+                        *i += 1;
+                    }
+                    // Any other escaped char: drop the backslash, keep the char.
+                    Some(c) => {
+                        text.push(*c);
+                        *i += 1;
+                    }
+                    None => break,
+                }
                 continue;
             }
             _ => (),
@@ -1161,6 +1199,31 @@ fn parse_replace_command(
     Ok(result)
 }
 
+/// Unescape a `y///` operand at parse time, building the real character list.
+///
+/// POSIX: inside a `y` operand a backslash may escape the delimiter, a
+/// backslash, or `n` (newline). GNU additionally recognises the usual C
+/// escapes (`\t`, `\r`). Any other `\X` yields the literal `X`.
+fn unescape_transliteration(s: &str) -> Vec<char> {
+    let mut out = vec![];
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
+                Some('\\') => out.push('\\'),
+                Some(other) => out.push(other),
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Parse [`Command::Replace`] flags
 fn parse_replace_flags(chars: &[char], i: &mut usize) -> Result<Vec<ReplaceFlag>, SedError> {
     let mut flags = vec![];
@@ -1181,6 +1244,7 @@ fn parse_replace_flags(chars: &[char], i: &mut usize) -> Result<Vec<ReplaceFlag>
                 *flag_map.get_mut(&'p').unwrap() += 1;
                 flags.push(ReplaceFlag::PrintPatternIfReplace)
             }
+            'i' | 'I' => flags.push(ReplaceFlag::CaseInsensitive),
             'w' => {
                 if w_start_position.is_none() {
                     w_start_position = Some(*i);
@@ -1234,16 +1298,25 @@ fn parse_replace_flags(chars: &[char], i: &mut usize) -> Result<Vec<ReplaceFlag>
 
 /// Compiles [`pattern`] as a POSIX regex (BRE or ERE based on ERE flag)
 fn compile_regex(pattern: String) -> Result<PlibRegex, SedError> {
+    compile_regex_icase(pattern, false)
+}
+
+/// Compiles [`pattern`] as a POSIX regex, optionally case-insensitive
+/// (REG_ICASE), used by the `s///i` flag (POSIX.1-2024, Defect 779).
+fn compile_regex_icase(pattern: String, icase: bool) -> Result<PlibRegex, SedError> {
     // Normalize backslash escapes
     let pattern = pattern.replace("\\\\", "\\");
 
     // Check ERE flag to determine regex mode
     let ere = ERE.lock().unwrap();
-    let flags = if *ere {
+    let mut flags = if *ere {
         RegexFlags::ere()
     } else {
         RegexFlags::bre()
     };
+    if icase {
+        flags = flags.ignore_case();
+    }
 
     // plib::regex handles macOS empty pattern workaround internally
     PlibRegex::new(&pattern, flags).map_err(|e| {
@@ -1251,78 +1324,48 @@ fn compile_regex(pattern: String) -> Result<PlibRegex, SedError> {
     })
 }
 
-fn screen_width() -> Option<usize> {
-    let mut ws: *mut winsize = std::ptr::null_mut();
-    if unsafe { ioctl(STDIN_FILENO, TIOCGWINSZ, &mut ws) != 0 }
-        && unsafe { ioctl(STDOUT_FILENO, TIOCGWINSZ, &mut ws) != 0 }
-        && unsafe { ioctl(STDERR_FILENO, TIOCGWINSZ, &mut ws) != 0 }
-    {
-        return None;
-    }
-    Some(unsafe { *ws }.ws_col as usize)
-}
+/// Default line-wrap width for the `l` command (GNU `sed` default is 70).
+const DEFAULT_L_WIDTH: usize = 70;
 
-fn print_multiline_binary(line: &str) {
-    let line = line
-        .chars()
-        .flat_map(|ch| {
-            if b"\x07\x08\x09\x0B\x0C\x0D".contains(&(ch as u8)) {
-                match ch as u8 {
-                    b'\x07' => vec!['\\', 'a'],
-                    b'\x08' => vec!['\\', 'b'],
-                    b'\x09' => vec!['\\', 't'],
-                    b'\x0B' => vec!['\\', 'v'],
-                    b'\x0C' => vec!['\\', 'f'],
-                    b'\x0D' => vec!['\\', 'r'],
-                    _ => unreachable!(),
-                }
-            } else if ch == '\n' {
-                vec![ch]
-            } else if ch.is_ascii() {
-                format!(r#"\x{:02x}"#, ch as u8).chars().collect::<Vec<_>>()
-            } else {
-                vec![ch]
-            }
-        })
-        .collect::<String>();
-    if let Some(width) = screen_width() {
-        if width >= 1 {
-            let line = line.chars().collect::<Vec<_>>();
-            let mut chunks = line.chunks(width - 1).peekable();
-            while let Some(chunk) = chunks.next() {
-                if chunk.strip_suffix(&['\n']).is_some() {
-                    if chunks.peek().is_some() {
-                        println!("\\\n");
-                    } else {
-                        println!("$\n");
-                    }
-                } else if chunks.peek().is_some() {
-                    println!("\\");
-                } else {
-                    println!("$");
-                }
-            }
+/// Render the pattern space for the `l` command in a visually-unambiguous form
+/// (POSIX `l`), byte-for-byte compatible with GNU `sed`:
+///   * `\\` for backslash; `\a \b \f \n \r \t \v` for the C escapes;
+///   * any other non-printable byte as three-digit octal `\NNN`;
+///   * printable ASCII bytes verbatim;
+///   * a trailing `$`, and folding at `width` columns with a trailing `\`.
+///
+/// A `width` of 0 disables folding.  Operates on raw bytes so multibyte/high
+/// bytes are escaped octally exactly like GNU.
+fn format_l(line: &str, width: usize) -> String {
+    let mut out = String::new();
+    let mut col = 0usize;
+    for &b in line.as_bytes() {
+        let esc: String = match b {
+            0x07 => "\\a".to_string(),
+            0x08 => "\\b".to_string(),
+            0x0C => "\\f".to_string(),
+            b'\n' => "\\n".to_string(),
+            0x0D => "\\r".to_string(),
+            0x09 => "\\t".to_string(),
+            0x0B => "\\v".to_string(),
+            b'\\' => "\\\\".to_string(),
+            0x20..=0x7E => (b as char).to_string(),
+            _ => format!("\\{:03o}", b),
+        };
+        let olen = esc.len();
+        if width > 0 && col + olen >= width {
+            out.push_str("\\\n");
+            col = 0;
         }
-    } else if let Some(line) = line.strip_suffix(['\n']) {
-        println!("{}$", line);
-    } else {
-        print!("{}$", line);
+        out.push_str(&esc);
+        col += olen;
     }
+    out.push_str("$\n");
+    out
 }
 
-/// Find first label in [`Script`] that has duplicates
-fn find_first_repeated_label(vec: Vec<String>) -> Option<String> {
-    let mut counts = HashMap::with_capacity(vec.len());
-    for item in &vec {
-        *counts.entry(item).or_insert(0) += 1;
-    }
-
-    // Collect elements with count > 1
-    counts
-        .into_iter()
-        .filter(|&(_, count)| count > 1)
-        .map(|(item, _)| item.clone())
-        .next()
+fn print_multiline_binary(line: &str, width: Option<usize>) {
+    print!("{}", format_l(line, width.unwrap_or(DEFAULT_L_WIDTH)));
 }
 
 // Skip [`Script`] fragment from '#' to '\n' chars (comment)
@@ -1334,7 +1377,12 @@ fn skip_comment(chars: &[char], i: &mut usize) {
     }
 }
 
-/// Filter comments (line ends after '#') in raw script
+/// Filter comments (line ends after '#') in raw script.
+///
+/// NOTE on labels (`b`/`t`/`:`): GNU `sed` treats `#` as a comment delimiter
+/// even within a label argument (the label is terminated by `#`, whitespace,
+/// `;`, or newline). The line-based stripping below matches that behavior, so
+/// `b label#x` branches to label `label` exactly like GNU.
 fn filter_comments(raw_script: impl AsRef<str>) -> String {
     let mut raw_script_without_comments = String::new();
     for line in raw_script.as_ref().lines() {
@@ -1370,16 +1418,6 @@ fn filter_comments(raw_script: impl AsRef<str>) -> String {
     raw_script_without_comments
 }
 
-/// Get path to [`wfile`] in tmp dir
-fn get_tmp_path(wfile: PathBuf) -> PathBuf {
-    let mut tmp_path =
-        PathBuf::from(std::env::var("CARGO_TARGET_TMPDIR").unwrap_or(DEFAULT_TMP_DIR.to_string()));
-
-    tmp_path.extend(&wfile);
-
-    tmp_path
-}
-
 /// Contains [`Command`] sequence of all [`Sed`] session
 /// that applied all to every line of input files
 #[derive(Debug)]
@@ -1404,8 +1442,9 @@ impl Script {
 
         while let Some(ch) = chars.get(i) {
             match *ch {
-                ' ' | '\n' => {}
-                ';' => {
+                ' ' => {}
+                // A bare <newline> is a command separator, exactly like `;`.
+                ';' | '\n' => {
                     if address.is_some() && !command_added {
                         let position = get_current_line_and_col(&chars, i);
                         return Err(SedError::ScriptParse(
@@ -1485,6 +1524,35 @@ impl Script {
                     }
                 }
                 'I' => commands.push(Command::PrintPatternBinary(address.clone())),
+                'l' => {
+                    // Optional numeric line-wrap argument: `l n`.
+                    i += 1;
+                    while let Some(c) = chars.get(i) {
+                        if *c == ' ' {
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    let mut n_str = String::new();
+                    while let Some(c) = chars.get(i) {
+                        if c.is_ascii_digit() {
+                            n_str.push(*c);
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    let width = if n_str.is_empty() {
+                        None
+                    } else {
+                        Some(n_str.parse::<usize>().map_err(|_| {
+                            SedError::ScriptParse("can't parse number".to_string(), None)
+                        })?)
+                    };
+                    i -= 1;
+                    commands.push(Command::PrintPatternList(address.clone(), width));
+                }
                 'n' => commands.push(Command::PrintPatternAndReplaceWithNext(address.clone())),
                 'N' => commands.push(Command::AppendNextToPattern(address.clone())),
                 'p' => commands.push(Command::PrintPattern(address.clone(), false)),
@@ -1497,8 +1565,9 @@ impl Script {
                 's' => {
                     let (pattern, replacement) =
                         parse_replace_command(&chars, &mut i, "s".to_string())?;
-                    let re = compile_regex(pattern.clone())?;
                     let flags = parse_replace_flags(&chars, &mut i)?;
+                    let icase = flags.contains(&ReplaceFlag::CaseInsensitive);
+                    let re = compile_regex_icase(pattern.clone(), icase)?;
                     commands.push(Command::Replace(
                         address.clone(),
                         Regex(re),
@@ -1525,14 +1594,22 @@ impl Script {
                 'y' => {
                     let (string1, string2) =
                         parse_replace_command(&chars, &mut i, "y".to_string())?;
-                    if string1.len() != string2.len() {
+                    // Resolve escapes (\n, \\, \<delim>, ...) into real chars at
+                    // parse time so transliteration sees actual characters.
+                    let from = unescape_transliteration(&string1);
+                    let to = unescape_transliteration(&string2);
+                    if from.len() != to.len() {
                         let position = get_current_line_and_col(&chars, i);
                         return Err(SedError::ScriptParse(
                             "number of characters in the two arrays does not match".to_string(),
                             position,
                         ));
                     }
-                    commands.push(Command::ReplaceCharSet(address.clone(), string1, string2));
+                    commands.push(Command::ReplaceCharSet(
+                        address.clone(),
+                        from.into_iter().collect(),
+                        to.into_iter().collect(),
+                    ));
                 }
                 ':' => {
                     i += 1;
@@ -1600,16 +1677,10 @@ impl Script {
                 format!("can't find label for jump to `{}'", label),
                 None,
             ));
-        } else if labels.len() > labels_set.len() {
-            let label = match find_first_repeated_label(labels) {
-                Some(label) => format!("label {}", label),
-                None => "some label".to_string(),
-            };
-            return Err(SedError::ScriptParse(
-                format!("{} is repeated", label),
-                None,
-            ));
         }
+        // NOTE: duplicate labels are NOT an error. GNU `sed` accepts repeated
+        // `:label` definitions (a branch resolves to the first match), so we
+        // match that behavior rather than rejecting duplicates.
         Ok(())
     }
 }
@@ -1689,6 +1760,36 @@ fn get_group_positions(chars: Vec<char>) -> Vec<(usize, usize)> {
     group_positions
 }
 
+/// Process backslash escapes in an `s///` replacement string after backrefs
+/// (`\1`..`\9`) and `&` have already been substituted in.
+///
+/// POSIX/GNU: `\n`->newline, `\t`->tab, `\r`->CR, `\a`/`\f`/`\v` controls,
+/// `\\`->`\`, `\&`->literal `&`. Any other `\X` yields the literal `X`
+/// (the backslash is dropped), matching GNU's treatment of unknown escapes.
+fn process_replacement_escapes(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
+                Some('a') => out.push('\x07'),
+                Some('f') => out.push('\x0C'),
+                Some('v') => out.push('\x0B'),
+                Some('\\') => out.push('\\'),
+                Some('&') => out.push('&'),
+                Some(other) => out.push(other),
+                None => {}
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Construct replace string and replace
 /// ranges with new content in pattern space
 fn update_pattern_space(
@@ -1723,10 +1824,10 @@ fn update_pattern_space(
             };
             local_replacement.replace_range(position..(position + 2), replace_str);
         }
-        local_replacement = local_replacement.replace("\\", "");
+        local_replacement = process_replacement_escapes(&local_replacement);
         pattern_space.replace_range(main_range.clone(), &local_replacement);
     } else if !ranges.is_empty() {
-        local_replacement = local_replacement.replace("\\", "");
+        local_replacement = process_replacement_escapes(&local_replacement);
         pattern_space.replace_range(main_range.clone(), &local_replacement);
         return true;
     }
@@ -1782,15 +1883,8 @@ fn execute_replace(
         Some(wfile)
     }) {
         if replace && wfile.components().next().is_some() {
-            let mut wfile = wfile.clone();
-            if !(wfile.is_absolute()
-                || wfile.starts_with("./")
-                || wfile.starts_with("../")
-                || wfile.exists())
-            {
-                wfile = get_tmp_path(wfile);
-            }
-
+            // Relative wfile paths are resolved against the current working
+            // directory (the wfile was pre-created/truncated at startup).
             if let Ok(mut file) = std::fs::OpenOptions::new()
                 .append(true)
                 .create(true)
@@ -1828,11 +1922,19 @@ enum ControlFlowInstruction {
     // SkipPrint
 }
 
+/// An item queued by `a` (append text) or `r` (read file), to be written to
+/// output just before the next line of input is read (POSIX deferred output).
+#[derive(Debug, Clone)]
+enum AppendItem {
+    /// Text from an `a\` command.
+    Text(String),
+    /// Contents of a file from an `r` command (read lazily at flush time).
+    File(PathBuf),
+}
+
 /// Main program structure. Process input
 /// files by [`Script`] [`Command`]s
 struct Sed {
-    /// Use extended regular expresions
-    ere: bool,
     /// Suppress default behavior of editing [`Command`]s
     /// to print result
     quiet: bool,
@@ -1863,6 +1965,8 @@ struct Sed {
     is_last_line: bool,
     /// Contains chars '\n\r' line end of current line for processed file
     current_end: Option<String>,
+    /// Output deferred by `a`/`r`, flushed just before the next input line.
+    append_queue: Vec<AppendItem>,
 }
 
 impl Sed {
@@ -1879,12 +1983,13 @@ impl Sed {
         let current_command = command.clone();
         match current_command {
             Command::PrintTextAfter(_, text) => {
-                // a
+                // a: queue text for deferred output (written just before the
+                // next input line is read). It must NOT enter the pattern space,
+                // so later commands in this cycle cannot see or alter it.
                 if !self.need_execute(command_position)? {
                     return Ok(None);
                 }
-                self.pattern_space += &("\n".to_string() + &text);
-                self.current_end = Some("\n".to_string());
+                self.append_queue.push(AppendItem::Text(text));
             }
             Command::BranchToLabel(_, label) => {
                 // b
@@ -1950,11 +2055,18 @@ impl Sed {
                 println!("{text}");
             }
             Command::PrintPatternBinary(_) => {
-                // I
+                // I (extension)
                 if !self.need_execute(command_position)? {
                     return Ok(None);
                 }
-                print_multiline_binary(&self.pattern_space);
+                print_multiline_binary(&self.pattern_space, None);
+            }
+            Command::PrintPatternList(_, width) => {
+                // l
+                if !self.need_execute(command_position)? {
+                    return Ok(None);
+                }
+                print_multiline_binary(&self.pattern_space, width);
             }
             Command::PrintPatternAndReplaceWithNext(_) => {
                 // n
@@ -2034,9 +2146,9 @@ impl Sed {
                 if !self.need_execute(command_position)? {
                     return Ok(None);
                 }
-                if !self.quiet {
-                    println!("{}", self.current_line + 1);
-                }
+                // POSIX/GNU: `=` writes the line number unconditionally,
+                // even under -n.
+                println!("{}", self.current_line + 1);
             }
             Command::IgnoreComment if !self.quiet => {
                 // #
@@ -2140,20 +2252,32 @@ impl Sed {
     }
 
     fn execute_r(&mut self, rfile: PathBuf) {
-        if let Ok(file) = File::open(rfile) {
-            let reader = BufReader::new(file);
-            for line in reader.lines() {
-                let Ok(line) = line else {
-                    break;
-                };
-                self.pattern_space += "\n";
-                self.pattern_space += &line;
+        // POSIX/GNU: like `a`, `r` is deferred to just before the next input
+        // line is read. The file is read lazily at flush time; if it is
+        // unreadable, GNU silently outputs nothing for it.
+        self.append_queue.push(AppendItem::File(rfile));
+    }
+
+    /// Flush the deferred `a`/`r` output queue. Called just before the next
+    /// input line is read (and at the end of each cycle). Emits a separating
+    /// newline first when the previous output line lacked a terminator, exactly
+    /// like GNU's `output_missing_newline`.
+    fn flush_appends(&mut self) {
+        if self.append_queue.is_empty() {
+            return;
+        }
+        if self.current_end.is_none() {
+            println!();
+        }
+        for item in std::mem::take(&mut self.append_queue) {
+            match item {
+                AppendItem::Text(text) => println!("{text}"),
+                AppendItem::File(path) => {
+                    if let Ok(contents) = std::fs::read_to_string(&path) {
+                        print!("{contents}");
+                    }
+                }
             }
-            if self.current_end.is_none() {
-                self.current_end = Some("\n".to_string());
-            }
-        } else {
-            self.current_end = Some("\n".to_string());
         }
     }
 
@@ -2182,20 +2306,37 @@ impl Sed {
         Ok(())
     }
 
-    fn execute_w(&mut self, wfile: PathBuf) -> Result<(), SedError> {
-        let mut wfile = wfile.clone();
-        if !(wfile.is_absolute()
-            || wfile.starts_with("./")
-            || wfile.starts_with("../")
-            || wfile.exists())
-        {
-            wfile = get_tmp_path(wfile);
-            // Ensure tmp directory exists
-            if let Some(parent) = wfile.parent() {
-                let _ = std::fs::create_dir_all(parent);
+    /// Pre-create (truncate) every wfile named in the script before processing.
+    /// POSIX requires each wfile to be created before processing begins, so a
+    /// `w`/`s///w` whose address never matches still yields an empty file.
+    /// Relative paths are resolved against the current working directory.
+    fn create_wfiles(&mut self) {
+        let mut paths: Vec<PathBuf> = Vec::new();
+        for cmd in &self.script.0 {
+            match cmd {
+                Command::AppendPatternToFile(_, path) if path.components().next().is_some() => {
+                    paths.push(path.clone())
+                }
+                Command::Replace(_, _, _, _, flags) => {
+                    for flag in flags {
+                        if let ReplaceFlag::AppendToIfReplace(path) = flag {
+                            if path.components().next().is_some() {
+                                paths.push(path.clone());
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
+        for path in paths {
+            // Best-effort: errors (e.g. missing parent dir) are surfaced later
+            // at write time, preserving existing runtime diagnostics.
+            let _ = File::create(&path);
+        }
+    }
 
+    fn execute_w(&mut self, wfile: PathBuf) -> Result<(), SedError> {
         let _ = match std::fs::OpenOptions::new()
             .append(true)
             .create(true)
@@ -2253,7 +2394,8 @@ impl Sed {
                     .replace_range(position..(position + 1), &ch);
             }
         }
-        self.pattern_space = self.pattern_space.replace("\\n", "\n");
+        // Escapes were already resolved when the y operands were parsed; the
+        // pattern space must NOT be post-processed (that corrupted literal \n).
         self.has_replacements_since_t = true;
     }
 
@@ -2316,16 +2458,22 @@ impl Sed {
                     }
                     ControlFlowInstruction::Continue => {
                         if self.pattern_space.is_empty() {
+                            // `d`: no auto-print, but deferred a/r output is
+                            // still flushed at end of cycle.
+                            self.flush_appends();
                             return Ok(None);
                         } else {
                             break;
                         }
                     }
                     ControlFlowInstruction::NotReadNext => {
-                        self.hold_space.clear();
+                        // POSIX `D` restarts the cycle without reading input and
+                        // WITHOUT touching the hold space.
                         i = 0;
                     }
                     ControlFlowInstruction::AppendNext => {
+                        // Reading a new input line flushes deferred a/r output.
+                        self.flush_appends();
                         let mut line = self.next_line.clone();
                         self.next_line = self.read_line()?;
                         self.current_line += 1;
@@ -2352,6 +2500,8 @@ impl Sed {
                             print!("{}", self.pattern_space);
                             print!("{}", self.current_end.clone().unwrap_or_default());
                         }
+                        // Reading a new input line flushes deferred a/r output.
+                        self.flush_appends();
                         if let Some(l) = line.strip_suffix("\n") {
                             line = l.to_string();
                         }
@@ -2372,6 +2522,9 @@ impl Sed {
                 print!("{end}");
             }
         }
+
+        // Flush deferred a/r output at end of cycle, before the next line read.
+        self.flush_appends();
 
         Ok(global_instruction)
     }
@@ -2413,7 +2566,10 @@ impl Sed {
     /// Main [`Sed`] function. Executes all commands of
     /// own [`Script`] for all content of all input files
     fn sed(&mut self) -> Result<(), SedError> {
-        *ERE.lock().unwrap() = self.ere;
+        // ERE flag is set in `try_to_sed` before parsing (regexes are compiled
+        // at parse time). Pre-create/truncate every wfile named in the script,
+        // as required by POSIX (each wfile is created before processing begins).
+        self.create_wfiles();
         for mut input in self.input_sources.drain(..).collect::<Vec<_>>() {
             self.current_file = Some(if input == "-" {
                 Box::new(BufReader::new(std::io::stdin()))

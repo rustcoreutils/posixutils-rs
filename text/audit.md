@@ -1934,28 +1934,28 @@ Covers the core command set and passes a wide test suite, but carries several cr
 
 #### Critical
 
-- [ ] **#1 — `l` command unimplemented; `I` (non-POSIX) used instead.** `text/sed.rs:313,1487,1952-1957`. Lowercase `l` is never matched in `Script::parse`, so any `l` script hits the `_` arm → "unknown character 'l'". Additionally `print_multiline_binary` (`sed.rs:1265-1311`) uses `\x{:02x}` hex rather than the spec-mandated three-digit octal `\NNN`, and does not emit `\\` for backslash. Fix: dispatch `l`; emit octal per byte; emit `\\`.
-- [ ] **#2 — ERE global flag set after the script is compiled.** `text/sed.rs:110,2415-2416`. `Script::parse` compiles every regex at line 110, but `*ERE.lock() = self.ere` runs later inside `Sed::sed()`. At parse time the global is always `false`, so `-E` patterns compile as BRE. Fix: set the ERE flag before `Script::parse`.
-- [ ] **#3 — `a` appends text into the pattern space rather than scheduling deferred output.** `text/sed.rs:1881-1887`. Spec: `a` text is written just before the next input fetch. Appending to `pattern_space` lets later `s`/`d`/`y` in the same cycle match/alter it. Fix: deferred output queue.
-- [ ] **#4 — `D` incorrectly clears the hold space.** `text/sed.rs:2324-2326`. The `NotReadNext` path calls `hold_space.clear()`; POSIX says `D` does not touch the hold space. Breaks any `h`/`H`/`g`/`G`/`x` + `D` script. Fix: remove the clear.
+- [x] **#1 — `l` command unimplemented; `I` (non-POSIX) used instead.** `text/sed.rs:313,1487,1952-1957`. Lowercase `l` is never matched in `Script::parse`, so any `l` script hits the `_` arm → "unknown character 'l'". Additionally `print_multiline_binary` (`sed.rs:1265-1311`) uses `\x{:02x}` hex rather than the spec-mandated three-digit octal `\NNN`, and does not emit `\\` for backslash. Fix: dispatch `l`; emit octal per byte; emit `\\`. FIXED (Phase 13): the POSIX `l` command is implemented (three-digit octal `\NNN`, C escapes, `\\`, `$` terminator, fold at width with trailing `\`, optional `l n`); the non-POSIX `I` extension is kept and shares the octal renderer. Verified vs GNU on tab/backslash/bell/embedded-newline. (High bytes require non-UTF-8 input, which sed reads as UTF-8 — a pre-existing architecture limit.)
+- [x] **#2 — ERE global flag set after the script is compiled.** `text/sed.rs:110,2415-2416`. `Script::parse` compiles every regex at line 110, but `*ERE.lock() = self.ere` runs later inside `Sed::sed()`. At parse time the global is always `false`, so `-E` patterns compile as BRE. Fix: set the ERE flag before `Script::parse`. FIXED (Phase 13): the ERE flag is set before `Script::parse`, so `-E` patterns compile as ERE.
+- [x] **#3 — `a` appends text into the pattern space rather than scheduling deferred output.** `text/sed.rs:1881-1887`. Spec: `a` text is written just before the next input fetch. Appending to `pattern_space` lets later `s`/`d`/`y` in the same cycle match/alter it. Fix: deferred output queue. FIXED (Phase 13): `a` text is written via a deferred-output queue flushed before the next read; later `s`/`d`/`y` in the cycle no longer see it.
+- [x] **#4 — `D` incorrectly clears the hold space.** `text/sed.rs:2324-2326`. The `NotReadNext` path calls `hold_space.clear()`; POSIX says `D` does not touch the hold space. Breaks any `h`/`H`/`g`/`G`/`x` + `D` script. Fix: remove the clear. FIXED (Phase 13): `D` no longer clears the hold space.
 
 #### Major
 
-- [ ] **#5 — `s///i` case-insensitive flag absent.** `text/sed.rs:1165-1233`. Mandatory since POSIX.1-2024 (Defect 779). The `i` char hits the `_` arm and is silently discarded; the substitution proceeds case-sensitively. Fix: add a case-insensitive `ReplaceFlag` → `REG_ICASE`.
-- [ ] **#6 — `=` suppressed under `-n`.** `text/sed.rs:2037-2039`. Gated by `if !self.quiet`; POSIX (and GNU/BSD) print `=` regardless of `-n`. Fix: remove the guard.
-- [ ] **#7 — `r` reads the file into the pattern space instead of deferring.** `text/sed.rs:2142-2158`. Same deferred-output requirement as `a`; file content participates in pattern-space ops for the rest of the cycle. Fix: deferred queue.
-- [ ] **#8 — wfiles not pre-created before processing begins.** `text/sed.rs:2185-2215,1793-1801`. Spec: each wfile shall be created before processing. The impl opens in append mode at execution time, so an unmatched address leaves the wfile uncreated/stale. Fix: truncate-or-create all wfiles at startup.
-- [ ] **#9 — `y///` post-processing replaces literal `\\n` in the pattern space.** `text/sed.rs:2256`. After transliteration, `pattern_space.replace("\\n","\n")` corrupts any literal backslash-n. The `\n` interpretation should happen while parsing the `y` operands. Fix: handle escapes at parse time.
-- [ ] **#10 — `\n` in `s///` replacement not handled.** `text/sed.rs:1694-1734`. `update_pattern_space` strips all backslashes (`replace("\\","")`) and never converts `\`-newline into an embedded newline. Fix: convert escaped newline to a real newline in the replacement.
+- [x] **#5 — `s///i` case-insensitive flag absent.** `text/sed.rs:1165-1233`. Mandatory since POSIX.1-2024 (Defect 779). The `i` char hits the `_` arm and is silently discarded; the substitution proceeds case-sensitively. Fix: add a case-insensitive `ReplaceFlag` → `REG_ICASE`. FIXED (Phase 13): the `s///i` case-insensitive flag maps to `REG_ICASE`.
+- [x] **#6 — `=` suppressed under `-n`.** `text/sed.rs:2037-2039`. Gated by `if !self.quiet`; POSIX (and GNU/BSD) print `=` regardless of `-n`. Fix: remove the guard. FIXED (Phase 13): `=` prints under `-n`.
+- [x] **#7 — `r` reads the file into the pattern space instead of deferring.** `text/sed.rs:2142-2158`. Same deferred-output requirement as `a`; file content participates in pattern-space ops for the rest of the cycle. Fix: deferred queue. FIXED (Phase 13): `r file` is deferred via the same queue (read lazily; unreadable file emits nothing, matching GNU).
+- [x] **#8 — wfiles not pre-created before processing begins.** `text/sed.rs:2185-2215,1793-1801`. Spec: each wfile shall be created before processing. The impl opens in append mode at execution time, so an unmatched address leaves the wfile uncreated/stale. Fix: truncate-or-create all wfiles at startup. FIXED (Phase 13): all wfiles are truncated/created at startup.
+- [x] **#9 — `y///` post-processing replaces literal `\\n` in the pattern space.** `text/sed.rs:2256`. After transliteration, `pattern_space.replace("\\n","\n")` corrupts any literal backslash-n. The `\n` interpretation should happen while parsing the `y` operands. Fix: handle escapes at parse time. FIXED (Phase 13): `y///` escapes are resolved at parse time; the corrupting post-process `replace("\\n","\n")` was removed.
+- [x] **#10 — `\n` in `s///` replacement not handled.** `text/sed.rs:1694-1734`. `update_pattern_space` strips all backslashes (`replace("\\","")`) and never converts `\`-newline into an embedded newline. Fix: convert escaped newline to a real newline in the replacement. FIXED (Phase 13): `s///` replacement escapes (`\n`,`\t`,`\\`,`\&`,backrefs) are converted properly.
 
 #### Minor
 
-- [ ] **#11 — `c` with a 2-address range: per-line delete-and-restart for >2-line ranges questionable.** `text/sed.rs:2052-2089`.
-- [ ] **#12 — address `0` rejected unconditionally** (`text/sed.rs:844-851`), so the common `0,/re/` form is unavailable (POSIX does not define `0,/re/`, so informational).
-- [ ] **#13 — `a`/`i`/`c` multi-line POSIX text form unsupported.** `text/sed.rs:925-964` reads only to the first `\n` after the `\`.
-- [ ] **#14 — `b`/`t` label parsing truncates at `#`.** `text/sed.rs:969-992`; `filter_comments` strips after `#`, so `b label#` jumps to `:label`.
-- [ ] **#15 — relative `w`/`s///w` paths redirected into `CARGO_TARGET_TMPDIR`.** `text/sed.rs:1374-1381,2186-2195`. A production-correctness defect: `w output.txt` writes to the tmp dir, not the CWD. Fix: write relative wfile paths relative to the CWD.
-- [ ] **#16 — global duplicate-label check rejects same-named labels in different scopes.** `text/sed.rs:1576-1614`.
+- [x] **#11 — `c` with a 2-address range: per-line delete-and-restart for >2-line ranges questionable.** `text/sed.rs:2052-2089`. ACCEPTED (Phase 13): `c` on a 2-address range matches GNU (deletes the range, outputs text once at range end).
+- [x] **#12 — address `0` rejected unconditionally** (`text/sed.rs:844-851`), so the common `0,/re/` form is unavailable (POSIX does not define `0,/re/`, so informational). ACCEPTED (Phase 13): address `0` rejected, matching GNU POSIX mode (`0,/re/` is a GNU extension, not POSIX).
+- [x] **#13 — `a`/`i`/`c` multi-line POSIX text form unsupported.** `text/sed.rs:925-964` reads only to the first `\n` after the `\`. FIXED (Phase 13): the multi-line `a`/`i`/`c` POSIX text form (continuation lines ending in `\`) is supported; text terminates at the first non-`\` line and the next line parses as a command (also fixed positional-script newline preservation).
+- [x] **#14 — `b`/`t` label parsing truncates at `#`.** `text/sed.rs:969-992`; `filter_comments` strips after `#`, so `b label#` jumps to `:label`. ACCEPTED (Phase 13): `#` terminates a label in GNU too; the existing `filter_comments` behavior matches GNU (the audit premise was incorrect).
+- [x] **#15 — relative `w`/`s///w` paths redirected into `CARGO_TARGET_TMPDIR`.** `text/sed.rs:1374-1381,2186-2195`. A production-correctness defect: `w output.txt` writes to the tmp dir, not the CWD. Fix: write relative wfile paths relative to the CWD. FIXED (Phase 13): relative `w`/`s///w` paths resolve against the CWD, not `CARGO_TARGET_TMPDIR`; tests redirect wfiles to a controlled temp path.
+- [x] **#16 — global duplicate-label check rejects same-named labels in different scopes.** `text/sed.rs:1576-1614`. FIXED (Phase 13): duplicate `:label` definitions are accepted (GNU does not error); a branch resolves to the first match.
 
 ### Detailed conformance matrix
 
@@ -2061,16 +2061,16 @@ Covers the core command set and passes a wide test suite, but carries several cr
 ### Test coverage signal
 
 Not covered:
-- [ ] `l` command (only `I` tested) (#1)
-- [ ] `s///i` (zero tests) (#5)
-- [ ] multi-line `a\`/`i\`/`c\` text form (#13)
-- [ ] wfile pre-creation (#8)
-- [ ] `r` deferred output (#7)
-- [ ] `\n` in `s///` replacement to split a line (#10)
-- [ ] `=` output under `-n` (#6)
-- [ ] `-E` mode with patterns differing from BRE (#2)
-- [ ] `y///` with `\n` in operands (#9)
-- [ ] `D` interaction with hold space (#4)
+- [x] `l` command (only `I` tested) (#1)
+- [x] `s///i` (zero tests) (#5)
+- [x] multi-line `a\`/`i\`/`c\` text form (#13)
+- [x] wfile pre-creation (#8)
+- [x] `r` deferred output (#7)
+- [x] `\n` in `s///` replacement to split a line (#10)
+- [x] `=` output under `-n` (#6)
+- [x] `-E` mode with patterns differing from BRE (#2)
+- [x] `y///` with `\n` in operands (#9)
+- [x] `D` interaction with hold space (#4)
 
 ### Suggested PR groupings
 

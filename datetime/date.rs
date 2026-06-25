@@ -9,12 +9,28 @@
 
 use chrono::{DateTime, Datelike, Local, LocalResult, TimeZone, Utc};
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
+use plib::diag;
 use std::ffi::CString;
+use std::io::{self, Write};
 use std::mem::MaybeUninit;
 use std::process;
 
 const DEF_TIMESTR: &str = "%a %b %e %H:%M:%S %Z %Y";
+
+/// Upper bound for the `strftime` output buffer. A zero return at this size is
+/// treated as a legitimately-empty conversion rather than a buffer overflow.
+const STRFTIME_BUF_MAX: usize = 64 * 1024;
+
+/// Map a 2-digit year to a full year per POSIX: values in [00,68] refer to
+/// 2000–2068, and values in [69,99] refer to 1969–1999.
+fn infer_century(yy: i32) -> i32 {
+    if yy < 69 {
+        yy + 2000
+    } else {
+        yy + 1900
+    }
+}
 
 #[derive(Parser)]
 #[command(version, about = gettext("date - write the date and time"))]
@@ -46,14 +62,14 @@ fn show_time(utc: bool, formatstr: &str) {
     let c_format = match CString::new(formatstr) {
         Ok(s) => s,
         Err(_) => {
-            eprintln!("date: format string contains NUL byte");
+            diag::error(&gettext("format string contains NUL byte"));
             process::exit(1);
         }
     };
 
     let now = unsafe { libc::time(std::ptr::null_mut()) };
     if now == -1 {
-        eprintln!("date: failed to get current time");
+        diag::error(&gettext("failed to get current time"));
         process::exit(1);
     }
     let mut tm = MaybeUninit::<libc::tm>::uninit();
@@ -67,15 +83,23 @@ fn show_time(utc: bool, formatstr: &str) {
     };
 
     if tm_ptr.is_null() {
-        eprintln!("date: failed to get current time");
+        diag::error(&gettext("failed to get current time"));
         process::exit(1);
     }
 
     let tm = unsafe { tm.assume_init() };
 
-    // Try 256-byte buffer first, then 1024
-    for buf_size in [256, 1024] {
+    // strftime returns 0 both when the buffer is too small AND when the
+    // conversion is legitimately empty (e.g. %Z with no zone abbreviation).
+    // Disambiguate with a first-byte sentinel: on any success — including an
+    // empty result — strftime writes a terminating NUL at offset 0, whereas a
+    // too-small buffer leaves the sentinel (or partial content) in place. So a
+    // 0 return with buf[0] == 0 is an empty-but-valid conversion, and a 0
+    // return with buf[0] != 0 means the output did not fit and we grow.
+    let mut buf_size = 256;
+    loop {
         let mut buf = vec![0u8; buf_size];
+        buf[0] = 1;
         let len = unsafe {
             libc::strftime(
                 buf.as_mut_ptr() as *mut libc::c_char,
@@ -85,20 +109,31 @@ fn show_time(utc: bool, formatstr: &str) {
             )
         };
         if len > 0 {
-            let timestr = String::from_utf8_lossy(&buf[..len]);
-            println!("{}", timestr);
+            // Write the raw bytes so non-UTF-8 locale output is preserved.
+            let mut out = io::stdout().lock();
+            let _ = out.write_all(&buf[..len]);
+            let _ = out.write_all(b"\n");
             return;
         }
+        if buf[0] == 0 {
+            // Empty-but-valid conversion: a <newline> shall always be appended.
+            let _ = io::stdout().write_all(b"\n");
+            return;
+        }
+        // Output did not fit; grow and retry, capped to guard against a
+        // pathologically large format silently allocating unbounded memory.
+        if buf_size >= STRFTIME_BUF_MAX {
+            diag::error(&gettext("formatted output exceeds internal buffer limit"));
+            process::exit(1);
+        }
+        buf_size *= 2;
     }
-
-    eprintln!("date: format string produced no output");
-    process::exit(1);
 }
 
 fn set_time(utc: bool, timestr: &str) -> Result<(), &'static str> {
     for ch in timestr.chars() {
         if !ch.is_ascii_digit() {
-            return Err("date: invalid date");
+            return Err("invalid date");
         }
     }
 
@@ -125,12 +160,8 @@ fn set_time(utc: bool, timestr: &str) -> Result<(), &'static str> {
             let day = timestr[2..4].parse::<u32>().unwrap();
             let hour = timestr[4..6].parse::<u32>().unwrap();
             let minute = timestr[6..8].parse::<u32>().unwrap();
-            let year = timestr[8..10].parse::<i32>().unwrap();
-            if year < 70 {
-                (year + 2000, month, day, hour, minute)
-            } else {
-                (year + 1900, month, day, hour, minute)
-            }
+            let year = infer_century(timestr[8..10].parse::<i32>().unwrap());
+            (year, month, day, hour, minute)
         }
         12 => {
             let month = timestr[0..2].parse::<u32>().unwrap();
@@ -141,7 +172,7 @@ fn set_time(utc: bool, timestr: &str) -> Result<(), &'static str> {
             (year, month, day, hour, minute)
         }
         _ => {
-            return Err("date: invalid date");
+            return Err("invalid date");
         }
     };
 
@@ -151,14 +182,14 @@ fn set_time(utc: bool, timestr: &str) -> Result<(), &'static str> {
             match chrono::Utc.with_ymd_and_hms(year, month, day, hour, minute, 0) {
                 LocalResult::<DateTime<Utc>>::Single(t) => t.timestamp(),
                 _ => {
-                    return Err("date: invalid date");
+                    return Err("invalid date");
                 }
             }
         } else {
             match chrono::Local.with_ymd_and_hms(year, month, day, hour, minute, 0) {
                 LocalResult::<DateTime<Local>>::Single(t) => t.timestamp(),
                 _ => {
-                    return Err("date: invalid date");
+                    return Err("invalid date");
                 }
             }
         }
@@ -172,17 +203,15 @@ fn set_time(utc: bool, timestr: &str) -> Result<(), &'static str> {
     // set system time
     unsafe {
         if libc::clock_settime(libc::CLOCK_REALTIME, &new_time) != 0 {
-            return Err("date: failed to set time");
+            return Err("failed to set time");
         }
     }
 
     Ok(())
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+fn main() {
+    diag::init_locale("date");
 
     let args = Args::parse();
 
@@ -191,11 +220,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(timestr) => {
             if let Some(st) = timestr.strip_prefix("+") {
                 show_time(args.utc, st);
-            } else {
-                set_time(args.utc, timestr)?;
+            } else if let Err(msg) = set_time(args.utc, timestr) {
+                diag::error(&gettext(msg));
+                process::exit(1);
             }
         }
     }
+}
 
-    Ok(())
+#[cfg(test)]
+mod tests {
+    use super::infer_century;
+
+    #[test]
+    fn century_boundaries() {
+        // POSIX: [00,68] -> 2000..2068, [69,99] -> 1969..1999.
+        assert_eq!(infer_century(0), 2000);
+        assert_eq!(infer_century(68), 2068);
+        assert_eq!(infer_century(69), 1969);
+        assert_eq!(infer_century(70), 1970);
+        assert_eq!(infer_century(99), 1999);
+    }
 }

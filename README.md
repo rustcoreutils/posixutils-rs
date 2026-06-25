@@ -54,6 +54,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] basename
  - [x] batch (cron cat.)
  - [x] bc
+ - [x] cal
  - [x] cat
  - [x] chgrp
  - [x] chmod
@@ -63,6 +64,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] compress (compress cat.)
  - [x] cp
  - [x] crontab (cron cat.)
+ - [x] date
  - [x] dd
  - [x] delta (SCCS)
  - [x] df
@@ -123,6 +125,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] sact (SCCS)
  - [x] sccs (SCCS)
  - [x] sh
+ - [x] sleep
  - [x] split
  - [x] strings
  - [x] strip (Development)
@@ -130,6 +133,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] tabs
  - [x] tee
  - [x] test
+ - [x] time
  - [x] timeout
  - [x] touch
  - [x] tput
@@ -166,7 +170,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
 
  - [x] asa
  - [x] c99 (Development)
- - [x] cal
  - [x] cflow (Development)
  - [x] comm
  - [x] csplit
@@ -190,7 +193,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] sort
  - [x] talk (with talkd local daemon)
  - [x] tail
- - [x] time
  - [x] tr
  - [x] tsort
  - [x] unexpand
@@ -199,8 +201,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
 
 ## Stage 2 - Feature-complete and POSIX compliant
 
- - [x] date
- - [x] sleep
+(none)
 
 ## Stage 1 - Rough draft
 

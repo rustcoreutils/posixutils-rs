@@ -9,4 +9,5 @@
 
 mod cal;
 mod date;
+mod sleep;
 mod time;

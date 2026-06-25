@@ -8,23 +8,22 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use std::{thread, time};
 
 #[derive(Parser)]
 #[command(version, about = gettext("sleep - suspend execution for an interval"))]
 struct Args {
     #[arg(
-        value_parser = clap::value_parser!(u64).range(1..),
+        // POSIX: the `time` operand is a non-negative decimal integer, so 0 is valid.
+        value_parser = clap::value_parser!(u64).range(0..),
         help = gettext("Number of seconds to sleep")
     )]
     seconds: u64,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+fn main() {
+    plib::diag::init_locale("sleep");
 
     let args = Args::parse();
 
@@ -34,6 +33,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     thread::sleep(time::Duration::from_secs(args.seconds));
-
-    Ok(())
 }

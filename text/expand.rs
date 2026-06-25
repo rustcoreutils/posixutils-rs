@@ -70,12 +70,13 @@ fn next_stop(tablist: &TabList, p: usize) -> usize {
     match tablist {
         TabList::UniStop(n) => ((p / n) + 1) * n,
         TabList::Stops(list) => {
-            // `list` holds 1-based stop positions; column position P (1-based)
-            // is 0-based index P-1.
+            // List values are 0-based column positions, on the same scale as
+            // the uniform multiples (matching GNU/POSIX: `-t 4` and `-t 4,…`
+            // share the first stop). A leading tab under `-t 4` advances to
+            // column 4, i.e. four spaces.
             for &s in list {
-                let stop0 = s - 1;
-                if stop0 > p {
-                    return stop0;
+                if s > p {
+                    return s;
                 }
             }
             // Past the last explicit stop, each column is its own tab stop.

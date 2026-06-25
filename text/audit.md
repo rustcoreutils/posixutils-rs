@@ -668,18 +668,18 @@ The `UniStop` (single-integer `-t N`) path works correctly for default and custo
 
 #### Critical
 
-- [ ] **#1 — Division-by-zero panic on `-t 0`.** `text/expand.rs:104`. `parse_tablist` accepts `0` and returns `UniStop(0)`; the loop evaluates `column % n` with `n=0` → panic. Spec requires a positive integer. Fix: reject zero.
-- [ ] **#2 — `cur_stop` never reset on newline.** `text/expand.rs:75,97,119`. In the `Stops` variant `cur_stop` is initialized once per file and only incremented; the newline branch resets `column=1` but not `cur_stop=0`. Every line after the first uses exhausted/wrong stop indices. Fix: reset `cur_stop = 0` on newline.
+- [x] **#1 — Division-by-zero panic on `-t 0`.** `text/expand.rs:104`. FIXED (Phase 3): `parse_tablist` rejects a zero tab size (single value and list element) with a diagnostic and exit 1.
+- [x] **#2 — `cur_stop` never reset on newline.** FIXED (Phase 3): the expander was rewritten with a stateless 0-based column recomputed from the line position, so there is no per-line stop index to reset; lines after the first now expand correctly.
 
 #### Major
 
-- [ ] **#3 — Off-by-one in `Stops` tab expansion.** `text/expand.rs:115-121`. After `while column < next_tab { space_out }`, an extra `space_out` (line 120) overshoots every stop by one column. With `-t 4,8`, a tab at column 1 emits 4 spaces (lands at col 5) instead of 3. Fix: remove the extra `space_out`.
-- [ ] **#4 — Zero accepted in list tabstops.** `text/expand.rs:40-55`. `parse_tablist` does not reject `0` as the first list element (the `!v.is_empty()` guard is skipped). Spec requires each stop > 0. Fix: reject zero in lists.
-- [ ] **#5 — Multibyte / wide-character column width not tracked.** `text/expand.rs:87-100`. The byte loop counts every non-special byte as +1 column regardless of encoding/display width; wide chars advance by byte count, not visual width. Spec requires `LC_CTYPE` to govern column width. Fix: use `wcwidth`/`unicode-width` per character.
+- [x] **#3 — Off-by-one in `Stops` tab expansion.** FIXED (Phase 3): the `next_stop` helper advances to each stop exactly. (Note: the audit text's "lands at col 5 instead of 3" was a 1-based misreading; verified against GNU coreutils 9.4, `-t` list values are 0-based column positions on the same scale as the uniform multiples, so a leading `-t 4` tab is four spaces — `expand -t 4` and `expand -t 4,8` share that first stop.)
+- [x] **#4 — Zero accepted in list tabstops.** FIXED (Phase 3): `parse_tablist` rejects a zero element anywhere in the list.
+- [x] **#5 — Multibyte / wide-character column width not tracked.** FIXED (Phase 3): characters are segmented with `plib::locale::mb_char_slices` and advance the column by `plib::locale::wcwidth_char` under `LC_CTYPE`.
 
 #### Minor
 
-- [ ] **#6 — `--tablist` long option exposed.** `text/expand.rs:22`. POSIX specifies only `-t tablist`. Non-standard but harmless.
+- [x] **#6 — `--tablist` long option exposed.** `text/expand.rs:22`. ACCEPTED (kept + documented): a non-POSIX convenience alias, retained and commented in the source per the project's keep-and-document policy for harmless extensions.
 - [x] **#7 — `-` operand treated as literal filename.** `text/expand.rs:70`. FIXED (Phase 2): opens via `plib::io::input_stream_dashed`; a `-` operand reads stdin at its position.
 
 (Note: the backspace floor-at-column-1 is correct — 1-based column 1 == 0-based position 0 — not a bug.)
@@ -803,18 +803,18 @@ Core folding logic is present and structurally sound, but the `-s` (break-on-spa
 
 #### Critical
 
-- [ ] **#1 — `find_last_blank` returns reversed offset, used as forward index.** `text/fold.rs:91-95,139-141`. The function iterates `v.iter().rev().enumerate()` so `pos` is the distance from the end, but `fold_file` treats it as a forward index. For `hello world` (space at forward index 5) it finds reversed `pos`, then splices `data[6..]` and truncates to garbage. Every `-s` fold point produces wrong output when folding actually fires. Fix: return `v.len() - 1 - pos` (or use `rposition`).
+- [x] **#1 — `find_last_blank` returns reversed offset, used as forward index.** FIXED (Phase 3): `find_last_blank` now uses `rposition` to return the true forward index, and the folder was rewritten; `-s` breaks at the correct blank.
 
 #### Major
 
-- [ ] **#2 — Column counting ignores display width under LC_CTYPE.** `text/fold.rs:73-75`. Without `-b`, `incr_column` adds 1 per byte; a 2-byte UTF-8 char adds 2, a 3-byte CJK char adds 3. Spec mandates `LC_CTYPE`-governed column width. Fix: decode UTF-8 and use a `wcwidth`/`unicode-width` lookup.
-- [ ] **#3 — `is_whitespace()` used for "blank" in `-s` path.** `text/fold.rs:93`. Matches `\n`,`\r`,`\t`,`\v`,`\f` and all Unicode whitespace; POSIX `<blank>` is space and tab only. Can break at `\r`/`\v`. Fix: restrict to `b' '` and `b'\t'`.
-- [ ] **#4 — Multibyte char may be split at an internal byte boundary.** `text/fold.rs:119-134`. The outer loop iterates raw bytes; a fold can land mid-UTF-8-sequence. Spec: a line shall not be broken in the middle of a character.
+- [x] **#2 — Column counting ignores display width under LC_CTYPE.** FIXED (Phase 3): `char_advance` advances by `plib::locale::wcwidth_char` over `mb_char_slices` characters (byte length in `-b` mode).
+- [x] **#3 — `is_whitespace()` used for "blank" in `-s` path.** FIXED (Phase 3): `find_last_blank` matches only `b' '` and `b'\t'`.
+- [x] **#4 — Multibyte char may be split at an internal byte boundary.** FIXED (Phase 3): folding iterates whole locale-segmented characters, so a break never lands inside a multibyte sequence.
 
 #### Minor
 
 - [x] **#5 — `-` file operand does not invoke stdin.** `text/fold.rs:103`. FIXED (Phase 2): opens via `plib::io::input_stream_dashed`; `-` reads stdin.
-- [ ] **#6 — Non-POSIX long options.** `text/fold.rs:24-35`. clap registers `--bytes`/`--spaces`/`--width`; POSIX specifies only `-b`/`-s`/`-w`.
+- [x] **#6 — Non-POSIX long options.** `text/fold.rs:24-35`. ACCEPTED (kept + documented): `--bytes`/`--spaces`/`--width` are harmless convenience aliases retained per the keep-and-document policy.
 
 (Note: backspace decrement and CR-reset to column 0 are handled; no explicit guard prevents a fold immediately before `\r`/`\b`, a quality concern under undefined-width inputs.)
 

@@ -78,22 +78,22 @@ fn expand_rejects_zero_in_list() {
 
 #[test]
 fn expand_multi_stop_list() {
-    // -t 4,8: tab at col 1 lands at position 4 (3 spaces); after "   a" (col 5)
-    // the next tab lands at position 8.
-    expand_args_test(&["-t", "4,8"], "\ta\tb\n", "   a   b\n");
+    // -t 4,8 (0-based stops): a leading tab fills to column 4 (4 spaces); after
+    // "    a" (col 5) the next tab fills to column 8 (3 spaces). Matches GNU.
+    expand_args_test(&["-t", "4,8"], "\ta\tb\n", "    a   b\n");
 }
 
 #[test]
 fn expand_multi_stop_resets_each_line() {
-    // The stop index must reset at every newline; previously line 2 used a
-    // stale, advanced stop index and mis-expanded.
-    expand_args_test(&["-t", "4,8"], "\ta\n\tc\n", "   a\n   c\n");
+    // The stop position is recomputed from the column at every newline, so
+    // line 2 expands identically to line 1.
+    expand_args_test(&["-t", "4,8"], "\ta\n\tc\n", "    a\n    c\n");
 }
 
 #[test]
-fn expand_tab_at_col1_no_off_by_one() {
-    // -t 4: a leading tab is 3 spaces (to position 4), not 4.
-    expand_args_test(&["-t", "4,8"], "\tX\n", "   X\n");
+fn expand_tab_at_col1_list_stop() {
+    // -t 4,8: a leading tab advances to column 4 — four spaces (GNU/POSIX).
+    expand_args_test(&["-t", "4,8"], "\tX\n", "    X\n");
 }
 
 /// A usable UTF-8 locale name, or `None` if neither is installed.

@@ -208,3 +208,31 @@ fn uniq_dash_output_operand_is_stdout() {
     // A "-" output_file operand means standard output, not a file named "-".
     uniq_test(&["-", "-"], "a\na\nb\n", "a\nb\n");
 }
+
+#[test]
+fn uniq_skip_chars_multibyte_no_panic() {
+    // Regression: -s counts characters, not bytes; multibyte input must not
+    // panic on a non-char-boundary byte index.
+    uniq_test(&["-s", "1"], "öabc\nöabd\n", "öabc\nöabd\n");
+}
+
+#[test]
+fn uniq_skip_fields_leading_blanks() {
+    // A field is [[:blank:]]*[^[:blank:]]*; the leading blank belongs to field
+    // 1, so skipping one field leaves " bar" vs " qux" — distinct keys, both
+    // printed. (Previously a leading blank was mis-counted as a field boundary.)
+    uniq_test(&["-f", "1"], " foo bar\n baz qux\n", " foo bar\n baz qux\n");
+}
+
+#[test]
+fn uniq_over_skip_yields_null_key() {
+    // When -s skips past the end, both lines reduce to the null string and
+    // compare equal, so only the first is emitted.
+    uniq_test(&["-s", "5"], "abc\nabd\n", "abc\n");
+}
+
+#[test]
+fn uniq_over_skip_fields_null_key() {
+    // Skipping more fields than exist also yields the null key.
+    uniq_test(&["-f", "5"], "a apple\nb banana\n", "a apple\n");
+}

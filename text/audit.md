@@ -2768,19 +2768,19 @@ Core deduplication is correct and the five options are present. Three substantiv
 
 #### Critical
 
-- [ ] **#1 — `-s N` byte-indexes into a UTF-8 string (panic on multi-byte chars).** `text/uniq.rs:153` (`processed_line[c..].to_string()`). `-s` counts *characters*, but `c` is used as a byte offset; `uniq -s 1` on `"öabc"` panics ("not a char boundary"). Fix: `chars().skip(c).collect()`.
+- [x] **#1 — `-s N` byte-indexes into a UTF-8 string (panic on multi-byte chars).** FIXED (Phase 4): `process_line` skips by character index (`char_indices().nth(c)`), so `uniq -s 1` on multibyte input no longer panics.
 
 #### Major
 
-- [ ] **#2 — Field-skip leaves a leading blank in the comparison string.** `text/uniq.rs:136-147`. The `skip_while` counts each whitespace char as a boundary and stops at the first blank, so `-f 1` on `"a b c"` leaves `" b c"`. POSIX field = `[[:blank:]]*[^[:blank:]]*` (leading blanks belong to the field). A line beginning with a blank breaks immediately. Fix: skip leading blanks then non-blanks, N times.
+- [x] **#2 — Field-skip leaves a leading blank in the comparison string.** FIXED (Phase 4): each skipped field consumes its leading `<blank>`s (via `plib::locale::isblank`) then its non-blank run, per `[[:blank:]]*[^[:blank:]]*`.
 - [x] **#3 — Output file operand `-` not recognized as stdout.** `text/uniq.rs:84-87`. FIXED (Phase 2): a `-` output_file operand now writes to stdout instead of creating a file named `-`.
-- [ ] **#4 — `-c` with `-d`/`-u` is a hard error.** `text/uniq.rs:48-60`. POSIX marks the `[-c|-d|-u]` combination undefined, not mandatorily an error; rejecting is permitted but diverges from common practice. (Informational/Major.)
+- [x] **#4 — `-c` with `-d`/`-u` is a hard error.** ACCEPTED (kept): POSIX shows `[-c|-d|-u]` as mutually exclusive and leaves combinations undefined, so a clear diagnostic + exit is conforming. Retained intentionally (see #7).
 
 #### Minor
 
-- [ ] **#5 — Over-skip returns the original line instead of a null string.** `text/uniq.rs:159-163`. When `-f`/`-s` consumes the whole line, spec says use a null string for comparison; the impl compares full original lines, so two lines that both reduce to empty compare unequal. Fix: return empty string.
-- [ ] **#6 — `process_line` called twice per iteration** (`text/uniq.rs:95,98`); redundant work, not a correctness issue.
-- [ ] **#7 — `-u -d` rejected** though POSIX only says undefined (`text/uniq.rs:50`).
+- [x] **#5 — Over-skip returns the original line instead of a null string.** FIXED (Phase 4): when the skips consume the whole line, the comparison key is the empty string, so such lines compare equal.
+- [x] **#6 — `process_line` called twice per iteration.** FIXED (Phase 4): the comparison key is computed once per line and carried with the run's first line.
+- [x] **#7 — `-u -d` rejected** though POSIX only says undefined. ACCEPTED (kept): `-u` and `-d` are mutually contradictory (only-unique vs only-repeated); a diagnostic + exit is conforming under POSIX's "undefined" latitude.
 
 ### Detailed conformance matrix
 
@@ -2902,15 +2902,15 @@ Two confirmed bugs dominate: (1) a single named file operand prints no filename,
 
 #### Major
 
-- [ ] **#1 — Single named-file operand omits the filename.** `text/wc.rs:105`. The format is `"%d %d %d %s\n"` with `<file>`; the "no name" exception applies only when no file operands are given. `build_display_str` tests `args.files.len() > 1`, so `wc -c foo.txt` emits `42` not `42 foo.txt`. Fix: append the filename whenever `!filename.is_empty()`.
+- [x] **#1 — Single named-file operand omits the filename.** FIXED (Phase 4): every file operand (including `-`) prints its name; only the no-operand standard input omits it.
 - [x] **#2 — `-` operand does not invoke stdin.** `text/wc.rs:120`. FIXED (Phase 2): `wc_file_bytes` opens via `plib::io::input_stream_dashed`; `-` reads stdin.
-- [ ] **#3 — `-m` character counting is unconditionally UTF-8.** `text/wc.rs:138` (`(ch >> 6) != 0b10`). Correct only in UTF-8 locales; spec requires LC_CTYPE encoding. Fix: `mbrlen`-based loop under the process locale.
+- [x] **#3 — `-m` character counting is unconditionally UTF-8.** FIXED (Phase 4): characters are decoded under `LC_CTYPE` with a streaming `plib::locale::MbDecoder` (mbrtowc-based), handling multibyte sequences across read boundaries.
 
 #### Minor
 
-- [ ] **#4 — `-w` whitespace detection is ASCII-only.** `text/wc.rs:58-69,141-145`. `BYTE_TABLE` covers only the six ASCII whitespace bytes; multibyte locale whitespace (e.g. U+00A0) is not recognized, and the byte-by-byte loop can't detect multibyte whitespace. Fix: `iswspace` on decoded wide chars.
-- [ ] **#5 — Field width fixed at 8 (`{:>8}`)** (`text/wc.rs:78,89,100`); not a spec violation (the format doesn't mandate a width) but misaligns the total line for >8-digit counts; GNU uses an adaptive width.
-- [ ] **#6 — Totals line accumulates zero counts for files that failed to open** (`text/wc.rs:200-209`); acceptable per "Default" consequences but potentially misleading.
+- [x] **#4 — `-w` whitespace detection is ASCII-only.** FIXED (Phase 4): word boundaries use `plib::locale::isspace` (libc `iswspace`) on decoded characters, so locale whitespace such as U+3000 splits words.
+- [x] **#5 — Field width fixed at 8 (`{:>8}`).** FIXED (Phase 4): the field width adapts to the largest value printed across files and the total (minimum one digit). (GNU's separate stdin stat-fallback minimum is a non-POSIX quirk not replicated.)
+- [x] **#6 — Totals line accumulates zero counts for files that failed to open.** FIXED (Phase 4): a file that fails to open contributes no row and is not added to the total.
 
 ### Detailed conformance matrix
 

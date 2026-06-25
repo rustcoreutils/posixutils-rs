@@ -370,6 +370,92 @@ pub fn mb_char_slices(bytes: &[u8]) -> Vec<&[u8]> {
     result
 }
 
+/// Stateful incremental multibyte decoder for streaming input.
+///
+/// Feed successive byte chunks to [`MbDecoder::decode`]: complete characters are
+/// returned, and a trailing incomplete multibyte sequence is absorbed into the
+/// decoder's conversion state to be completed by a later chunk (no caller-side
+/// carryover buffer is needed — feed each byte exactly once). At end of input
+/// call [`MbDecoder::pending`] to learn how many bytes of an unfinished trailing
+/// sequence remain. `setlocale(LC_ALL, "")` governs the encoding via
+/// `LC_CTYPE`; in the `C` locale every byte is its own character.
+///
+/// Used by `wc` to count characters (`-m`) and split words (`-w`) correctly in
+/// a multibyte locale without reading the whole input into memory.
+pub struct MbDecoder {
+    state: MbStateT,
+    pending: usize,
+}
+
+impl Default for MbDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MbDecoder {
+    pub fn new() -> Self {
+        MbDecoder {
+            state: MbStateT::zeroed(),
+            pending: 0,
+        }
+    }
+
+    /// Bytes of an incomplete trailing multibyte sequence not yet completed.
+    /// After the final chunk, these count as one character each (matching the
+    /// invalid-byte convention).
+    pub fn pending(&self) -> usize {
+        self.pending
+    }
+
+    /// Decode every complete character in `bytes`, returning each as the decoded
+    /// `char` (an undecodable byte yields `None` and counts as one character).
+    /// The whole chunk is consumed: a trailing incomplete sequence is retained
+    /// in the decoder state and completed by the next chunk.
+    pub fn decode(&mut self, bytes: &[u8]) -> Vec<Option<char>> {
+        let mut chars = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            let remaining = &bytes[i..];
+            let mut wc: libc::wchar_t = 0;
+            // SAFETY: the pointer/length describe a valid slice and `state` is a
+            // live mbstate_t owned by this decoder.
+            let n = unsafe {
+                mbrtowc(
+                    &mut wc,
+                    remaining.as_ptr() as *const libc::c_char,
+                    remaining.len() as libc::size_t,
+                    &mut self.state,
+                )
+            };
+            if n == 0 {
+                // A NUL wide character occupies one byte.
+                chars.push(Some('\0'));
+                i += 1;
+                self.pending = 0;
+            } else if n == usize::MAX - 1 {
+                // (size_t)-2: the remaining bytes form an incomplete but valid
+                // prefix and are absorbed into `state`; record them as pending.
+                self.pending += remaining.len();
+                i = bytes.len();
+            } else if n == usize::MAX {
+                // (size_t)-1: invalid sequence — consume one byte, reset state.
+                self.state = MbStateT::zeroed();
+                chars.push(None);
+                i += 1;
+                self.pending = 0;
+            } else {
+                // A complete character; `n` bytes were consumed from this chunk
+                // (it may also have used bytes retained from earlier chunks).
+                chars.push(char::from_u32(wc as u32));
+                i += n;
+                self.pending = 0;
+            }
+        }
+        chars
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -576,6 +662,43 @@ mod tests {
         }
         if !ok.is_null() {
             assert_eq!(w, 2, "expected 世 to be 2 columns wide in a UTF-8 locale");
+        }
+    }
+
+    #[test]
+    fn mb_decoder_ascii() {
+        let mut d = MbDecoder::new();
+        let chars = d.decode(b"abc");
+        assert_eq!(chars, vec![Some('a'), Some('b'), Some('c')]);
+        assert_eq!(d.pending(), 0);
+    }
+
+    #[test]
+    fn mb_decoder_split_sequence_across_chunks() {
+        // A 2-byte character (é = 0xC3 0xA9) split across two chunks must be
+        // counted once. Each byte is fed exactly once; the decoder's state
+        // carries the partial sequence.
+        let _guard = LOCALE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = unsafe { libc::setlocale(libc::LC_ALL, std::ptr::null()) };
+        let saved =
+            (!saved.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(saved) }.to_owned());
+        let utf8 = std::ffi::CString::new("C.UTF-8").unwrap();
+        let ok = unsafe { libc::setlocale(libc::LC_ALL, utf8.as_ptr()) };
+
+        if !ok.is_null() {
+            let mut d = MbDecoder::new();
+            // First chunk ends mid-character: 'a' plus the lead byte of é.
+            let c1 = d.decode(&[b'a', 0xC3]);
+            assert_eq!(c1, vec![Some('a')]);
+            assert_eq!(d.pending(), 1); // 0xC3 retained in the decoder state
+                                        // Second chunk completes é and adds 'b'.
+            let c2 = d.decode(&[0xA9, b'b']);
+            assert_eq!(c2, vec![Some('é'), Some('b')]);
+            assert_eq!(d.pending(), 0);
+        }
+
+        if let Some(saved) = saved {
+            unsafe { libc::setlocale(libc::LC_ALL, saved.as_ptr()) };
         }
     }
 

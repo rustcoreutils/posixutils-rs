@@ -7,7 +7,13 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::{collections::HashSet, ffi::OsString, io, path::PathBuf};
+use std::{
+    collections::HashSet,
+    ffi::OsString,
+    fs, io,
+    os::unix::fs::{FileTypeExt, MetadataExt},
+    path::PathBuf,
+};
 
 use crate::diff_util::{
     constants::COULD_NOT_UNWRAP_FILENAME, diff_exit_status::DiffExitStatus, file_diff::FileDiff,
@@ -43,14 +49,42 @@ impl<'a> DirDiff<'a> {
         format_options: &FormatOptions,
         recursive: bool,
     ) -> io::Result<DiffExitStatus> {
+        let mut visited = HashSet::new();
+        Self::dir_diff_inner(path1, path2, format_options, recursive, &mut visited)
+    }
+
+    /// Recursive directory comparison with (dev, ino) tracking of directories
+    /// already visited on the current path, so symlink cycles cannot cause
+    /// infinite recursion.
+    fn dir_diff_inner(
+        path1: PathBuf,
+        path2: PathBuf,
+        format_options: &FormatOptions,
+        recursive: bool,
+        visited: &mut HashSet<(u64, u64)>,
+    ) -> io::Result<DiffExitStatus> {
+        // Mark both directories as visited before descending into them.
+        for path in [&path1, &path2] {
+            if let Ok(md) = fs::metadata(path) {
+                visited.insert((md.dev(), md.ino()));
+            }
+        }
+
         let mut dir1: DirData = DirData::load(path1)?;
         let mut dir2: DirData = DirData::load(path2)?;
 
         let mut dir_diff = DirDiff::new(&mut dir1, &mut dir2, format_options, recursive);
-        dir_diff.analyze()
+        dir_diff.analyze(visited)
     }
 
-    fn analyze(&mut self) -> io::Result<DiffExitStatus> {
+    /// True if `dir_data`'s entry `file_name` is a FIFO, block-special, or
+    /// character-special file (which `diff` cannot read as a regular file).
+    fn is_special(file_name: &OsString, dir_data: &DirData) -> io::Result<bool> {
+        let file_type = dir_data.files()[file_name].file_type()?;
+        Ok(file_type.is_fifo() || file_type.is_block_device() || file_type.is_char_device())
+    }
+
+    fn analyze(&mut self, visited: &mut HashSet<(u64, u64)>) -> io::Result<DiffExitStatus> {
         let mut exit_status = DiffExitStatus::NotDifferent;
 
         fn is_file(file_name: &OsString, dir_data: &DirData) -> io::Result<bool> {
@@ -89,11 +123,24 @@ impl<'a> DirDiff<'a> {
 
             match (in_dir1, in_dir2) {
                 (true, true) => {
-                    let in_dir1_is_file = is_file(file_name, self.dir1)?;
-                    let in_dir2_is_file = is_file(file_name, self.dir2)?;
-
                     let path1 = self.dir1.path().join(file_name);
                     let path2 = self.dir2.path().join(file_name);
+
+                    // Special files (FIFO/block/char) cannot be diffed as
+                    // regular files and would block on open; skip them.
+                    if Self::is_special(file_name, self.dir1)?
+                        || Self::is_special(file_name, self.dir2)?
+                    {
+                        println!(
+                            "File {} or {} is not a regular file or directory and was skipped",
+                            path1.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME),
+                            path2.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME)
+                        );
+                        continue;
+                    }
+
+                    let in_dir1_is_file = is_file(file_name, self.dir1)?;
+                    let in_dir2_is_file = is_file(file_name, self.dir2)?;
 
                     if in_dir1_is_file && in_dir2_is_file {
                         let mut show_if_different = String::from("diff ");
@@ -158,12 +205,26 @@ impl<'a> DirDiff<'a> {
                         }
                     } else if !in_dir1_is_file && !in_dir2_is_file {
                         if self.recursive {
-                            Self::dir_diff(
-                                self.dir1.path().join(file_name),
-                                self.dir2.path().join(file_name),
-                                self.format_options,
-                                self.recursive,
-                            )?;
+                            // Skip subdirectories already visited on this path
+                            // (symlink cycle) to avoid infinite recursion.
+                            let cycle = [&path1, &path2].iter().any(|p| {
+                                fs::metadata(p)
+                                    .ok()
+                                    .map(|md| visited.contains(&(md.dev(), md.ino())))
+                                    .unwrap_or(false)
+                            });
+                            if !cycle {
+                                let inner_exit_status = Self::dir_diff_inner(
+                                    path1.clone(),
+                                    path2.clone(),
+                                    self.format_options,
+                                    self.recursive,
+                                    visited,
+                                )?;
+                                if exit_status.status_code() < inner_exit_status.status_code() {
+                                    exit_status = inner_exit_status;
+                                }
+                            }
                         } else {
                             println!(
                                 "Common subdirectories: {} and {}",

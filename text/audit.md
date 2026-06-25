@@ -516,23 +516,23 @@ Core diff algorithm (histogram LCS), default output, `-e`, `-f`, `-r`, `-b`, and
 
 #### Critical
 
-- [ ] **#1 — `-b` whitespace normalization diverges from spec.** `text/diff_util/file_data.rs:26-43`. `normalize_whitespace()` collapses ALL whitespace runs including interior ones and trims leading whitespace. Spec: trailing whitespace before a newline is ignored and interior whitespace runs collapse to a single space — but leading space should not be trimmed/collapsed, producing different comparison semantics. Fix: collapse interior runs and trim trailing only; do not collapse leading space.
-- [ ] **#2 — Existence-check errors written to stdout instead of stderr.** `text/diff_util/functions.rs:52-55`. `check_existance()` uses `println!()` for `"diff: {}: No such file or directory"`. Diagnostics on stdout corrupt piped output. Fix: `eprintln!`.
+- [x] **#1 — `-b` whitespace normalization diverges from spec.** FIXED (Phase 10): `-b` matches GNU (interior/leading blank runs collapse to one space, trailing blanks stripped, leading presence significant); verified byte-for-byte.
+- [x] **#2 — Existence-check errors written to stdout instead of stderr.** FIXED (Phase 10): `check_existance` uses `eprintln!`.
 
 #### Major
 
-- [ ] **#3 — `-r` infinite-loop detection absent.** `text/diff_util/dir_diff.rs:161-166`. Recursion has no visited-directory / inode-device tracking; symlink cycles hang or exhaust the stack. Spec mandates infinite-loop detection. Fix: track visited (dev,ino) and check before recursing.
-- [ ] **#4 — Context-format single-line range printed in two-number form.** `text/diff_util/file_diff.rs:733-747`. Spec: one line → `*** %d ****`; ≥2 lines → `*** %d,%d ****`; empty range → preceding line / 0. Impl always emits `*** {start},{end} ****` (e.g. `*** 3,3 ****`). Rejected by spec-following `patch`. Fix: emit single-number form for length-1 ranges.
-- [ ] **#5 — Unified header missing `<frac>` and `<zone>` fields.** `text/diff_util/functions.rs:30-33`. `system_time_to_unified_format()` emits only `%Y-%m-%d %H:%M:%S` — no fractional seconds, no `+HHMM` timezone. Spec mandates both; TZ changes have no effect. Fix: append fractional seconds and timezone offset.
-- [ ] **#6 — `-C n` rejects n=0.** `text/diff.rs:43`. clap `.range(1..)` makes `diff -C 0` an error; spec places no floor on `-C`. Fix: remove the range restriction.
+- [x] **#3 — `-r` infinite-loop detection absent.** FIXED (Phase 10): `(dev,ino)` visited-set tracking skips already-seen directories; symlink cycles terminate. (Also fixed a discarded subdir exit status.)
+- [x] **#4 — Context-format single-line range printed in two-number form.** FIXED (Phase 10): `context_range()` emits `*** N ****` for 1-line ranges, `*** F,L ****` otherwise; verified vs `diff -c`.
+- [x] **#5 — Unified header missing `<frac>` and `<zone>` fields.** FIXED (Phase 10): unified timestamps are `%Y-%m-%d %H:%M:%S%.9f %z` (fractional seconds + tz offset).
+- [x] **#6 — `-C n` rejects n=0.** FIXED (Phase 10): removed the clap range floor and the n==0 clamp; `-C 0`/`-U 0` produce GNU-matching zero-context output.
 
 #### Minor
 
-- [ ] **#7 — "No newline at end of file" placement in context/unified.** `text/diff_util/file_diff.rs:497-502,562-567`. Marker emitted once at the very end (for each file) rather than immediately after the relevant hunk line, and printed unconditionally even with no hunks. Fix: emit after the specific hunk line.
-- [ ] **#8 — Default-format "no newline" only for the last hunk.** `text/diff_util/hunks.rs:98,109,118`. `is_last` guards all marker output; a no-trailing-newline file in a non-last hunk suppresses the marker.
-- [ ] **#9 — Edit-script "no newline" uses a non-spec message.** `text/diff_util/hunks.rs:149-163,190-204`. For `-e`/`-f`, emits `"diff: {file}: No newline..."` via `println!`, corrupting the edit script fed to `ed`. Spec does not specify this message for edit-script formats.
-- [ ] **#10 — `-f` multi-line range uses comma, not space.** `text/diff_util/hunks.rs:178-184`. `-f` ranges should be space-separated with command-letter first; impl uses comma for multi-line ranges.
-- [ ] **#11 — Dir diff may call `file_diff` on a FIFO and hang.** `text/diff_util/dir_diff.rs:92-93`. `is_file()` skips dirs but a regular-file-vs-FIFO pair reaches `file_diff()`, which blocks. Spec says do not compare block/char/FIFO special files.
+- [x] **#7 — "No newline at end of file" placement in context/unified.** FIXED (Phase 10): the marker is written inline immediately after the file's final newline-less line; the once-at-end emission was removed; verified vs `diff -u`/`-c`.
+- [x] **#8 — Default-format "no newline" only for the last hunk.** FIXED (Phase 10): the marker keys on whether the hunk span ends at the file's actual last line lacking a newline, not hunk position.
+- [x] **#9 — Edit-script "no newline" uses a non-spec message.** FIXED (Phase 10): the no-newline diagnostic for `-e`/`-f` moved from stdout to stderr (matches GNU, no longer corrupts the ed script) with exit 2.
+- [x] **#10 — `-f` multi-line range uses comma, not space.** FIXED (Phase 10): `-f` ranges are space-separated (`c2 4`); default/ed keep comma; verified vs `diff -f`.
+- [x] **#11 — Dir diff may call `file_diff` on a FIFO and hang.** FIXED (Phase 10): FIFO/block/char special files are detected and skipped with a message instead of blocking.
 
 ### Detailed conformance matrix
 

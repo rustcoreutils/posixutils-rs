@@ -30,6 +30,29 @@ use std::{
     path::PathBuf,
 };
 
+/// Format a context-format (`-c`/`-C`) line range starting at 1-indexed
+/// `start` and spanning `len` lines. A single line prints as one number, an
+/// empty range prints the preceding line number, and longer ranges print
+/// `first,last`.
+fn context_range(start: usize, len: usize) -> String {
+    match len {
+        0 => format!("{}", start.saturating_sub(1)),
+        1 => format!("{}", start),
+        _ => format!("{},{}", start, start + len - 1),
+    }
+}
+
+/// Format a unified-format (`-u`/`-U`) line range starting at 1-indexed
+/// `start` and spanning `len` lines. A single line prints as one number, an
+/// empty range prints `before,0`, and longer ranges print `start,len`.
+fn unified_range(start: usize, len: usize) -> String {
+    match len {
+        0 => format!("{},0", start.saturating_sub(1)),
+        1 => format!("{}", start),
+        _ => format!("{},{}", start, len),
+    }
+}
+
 /// Entry for histogram-based LCS algorithm.
 /// Stores occurrence counts and last positions for lines in both files.
 #[derive(Clone, Copy, Default)]
@@ -185,18 +208,21 @@ impl<'a> FileDiff<'a> {
         self.order_hunks_by_output_format();
 
         if let OutputFormat::Context(context) = self.format_options.output_format {
-            let _ = self.print_context(context);
+            // Identical files produce no output (not even the file headers).
+            if self.are_different {
+                let _ = self.print_context(context);
+            }
         } else if let OutputFormat::Unified(unified) = self.format_options.output_format {
-            let _ = self.print_unified(unified);
+            if self.are_different {
+                let _ = self.print_unified(unified);
+            }
         } else {
             let hunks_count = self.hunks.hunks().len();
 
             for hunk_index in 0..hunks_count {
                 let hunk = self.hunks.hunk_at_mut(hunk_index);
                 match self.format_options.output_format {
-                    OutputFormat::Default => {
-                        hunk.print_default(self.file1, self.file2, hunk_index == hunks_count - 1)
-                    }
+                    OutputFormat::Default => hunk.print_default(self.file1, self.file2),
                     OutputFormat::EditScript => hunk.print_edit_script(
                         self.file1,
                         self.file2,
@@ -220,6 +246,16 @@ impl<'a> FileDiff<'a> {
         }
 
         if self.are_different {
+            // An edit script cannot faithfully represent a file whose final
+            // line lacks a trailing newline (ed always terminates lines), so
+            // GNU diff reports "trouble" (exit 2) in that case.
+            let edit_script = matches!(
+                self.format_options.output_format,
+                OutputFormat::EditScript | OutputFormat::ForwardEditScript
+            );
+            if edit_script && (!self.file1.ends_with_newline() || !self.file2.ends_with_newline()) {
+                return Ok(DiffExitStatus::Trouble);
+            }
             Ok(DiffExitStatus::Different)
         } else {
             Ok(DiffExitStatus::NotDifferent)
@@ -481,8 +517,8 @@ impl<'a> FileDiff<'a> {
             if diff_disp.curr_pos1 < self.file1.lines().len() {
                 let end1 = self.file1.lines().len().min(diff_disp.curr_pos1 + context);
                 let end2 = self.file2.lines().len().min(diff_disp.curr_pos2 + context);
-                diff_disp.write_line(self.file1, diff_disp.curr_pos1, end1, " ", true)?;
-                diff_disp.write_line(self.file2, diff_disp.curr_pos2, end2, " ", false)?;
+                diff_disp.write_line(self.file1, diff_disp.curr_pos1, end1, "  ", true)?;
+                diff_disp.write_line(self.file2, diff_disp.curr_pos2, end2, "  ", false)?;
             }
             let print_lines1 = diff_disp.hunk_lines[0]
                 .split('\n')
@@ -494,12 +530,6 @@ impl<'a> FileDiff<'a> {
             diff_disp.print_section(false, print_lines2);
         }
 
-        if !self.file1.ends_with_newline() {
-            println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
-        }
-        if !self.file2.ends_with_newline() {
-            println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
-        }
         Ok(())
     }
 
@@ -559,12 +589,6 @@ impl<'a> FileDiff<'a> {
             diff_disp.print_section();
         }
 
-        if !self.file1.ends_with_newline() {
-            println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
-        }
-        if !self.file2.ends_with_newline() {
-            println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
-        }
         Ok(())
     }
 
@@ -616,8 +640,14 @@ impl UnifiedDiffDisplay {
         prefix: &str,
     ) -> Result<(), std::fmt::Error> {
         let mut offset = 0;
+        let total = file.lines().len();
         for i in start..end {
             writeln!(self.hunk_lines, "{prefix}{}", file.line(i))?;
+            // Emit the no-newline marker inline, immediately after the file's
+            // final line, when that line lacks a trailing newline.
+            if i + 1 == total && !file.ends_with_newline() {
+                writeln!(self.hunk_lines, "{}", NO_NEW_LINE_AT_END_OF_FILE)?;
+            }
             offset += 1;
         }
         if prefix == " " {
@@ -644,8 +674,9 @@ impl UnifiedDiffDisplay {
 
     pub fn print_section(&mut self) {
         println!(
-            "@@ -{},{} +{},{} @@",
-            self.context_start1, self.hunk1_len, self.context_start2, self.hunk2_len
+            "@@ -{} +{} @@",
+            unified_range(self.context_start1, self.hunk1_len),
+            unified_range(self.context_start2, self.hunk2_len)
         );
         self.print_hunk();
         self.context_start1 = self.curr_pos1 + 1;
@@ -697,9 +728,19 @@ impl ContextDiffDisplay {
     ) -> Result<(), std::fmt::Error> {
         let mut offset = 0;
         let file_index = if is_file1 { 0 } else { 1 };
+        let total = file.lines().len();
 
         for i in start..end {
             writeln!(self.hunk_lines[file_index], "{prefix}{}", file.line(i))?;
+            // Emit the no-newline marker inline, immediately after the file's
+            // final line, when that line lacks a trailing newline.
+            if i + 1 == total && !file.ends_with_newline() {
+                writeln!(
+                    self.hunk_lines[file_index],
+                    "{}",
+                    NO_NEW_LINE_AT_END_OF_FILE
+                )?;
+            }
             offset += 1;
         }
         if prefix.starts_with(" ") {
@@ -731,9 +772,8 @@ impl ContextDiffDisplay {
     pub fn print_section(&mut self, is_file1: bool, print_lines: bool) {
         if is_file1 {
             println!(
-                "***************\n*** {},{} ****",
-                self.context_start1,
-                self.context_start1 + self.hunk1_len - 1
+                "***************\n*** {} ****",
+                context_range(self.context_start1, self.hunk1_len)
             );
             if print_lines {
                 self.print_hunk(true);
@@ -742,9 +782,8 @@ impl ContextDiffDisplay {
             self.hunk1_len = 0;
         } else {
             println!(
-                "--- {},{} ----",
-                self.context_start2,
-                self.context_start2 + self.hunk2_len - 1
+                "--- {} ----",
+                context_range(self.context_start2, self.hunk2_len)
             );
             if print_lines {
                 self.print_hunk(false);

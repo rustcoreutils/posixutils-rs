@@ -40,7 +40,7 @@ struct Args {
     #[arg(short, help = gettext("Output 3 lines of copied context"))]
     context3: bool,
 
-    #[arg(short='C', value_parser = clap::value_parser!(u32).range(1..), help = gettext("Output <N> lines of copied context"))]
+    #[arg(short='C', value_parser = clap::value_parser!(u32), help = gettext("Output <N> lines of copied context"))]
     context: Option<u32>,
 
     #[arg(short, long, help = gettext("Produce output in a form suitable as input for the ed utility"))]
@@ -88,7 +88,6 @@ impl From<&Args> for OutputFormat {
         } else if args.fed {
             OutputFormat::ForwardEditScript
         } else if let Some(n) = args.context {
-            let n = if n == 0 { 1 } else { n };
             OutputFormat::Context(n as usize)
         } else if let Some(n) = args.unified {
             OutputFormat::Unified(n as usize)

@@ -89,14 +89,17 @@ fn show_time(utc: bool, formatstr: &str) {
 
     let tm = unsafe { tm.assume_init() };
 
-    // Grow the buffer until strftime succeeds. strftime returns 0 both when the
-    // buffer is too small AND when the conversion is legitimately empty; once
-    // the buffer is provably large enough (STRFTIME_BUF_MAX), a 0 return can
-    // only mean an empty result, which is valid — emit just the trailing
-    // <newline> rather than treating it as an error.
+    // strftime returns 0 both when the buffer is too small AND when the
+    // conversion is legitimately empty (e.g. %Z with no zone abbreviation).
+    // Disambiguate with a first-byte sentinel: on any success — including an
+    // empty result — strftime writes a terminating NUL at offset 0, whereas a
+    // too-small buffer leaves the sentinel (or partial content) in place. So a
+    // 0 return with buf[0] == 0 is an empty-but-valid conversion, and a 0
+    // return with buf[0] != 0 means the output did not fit and we grow.
     let mut buf_size = 256;
     loop {
         let mut buf = vec![0u8; buf_size];
+        buf[0] = 1;
         let len = unsafe {
             libc::strftime(
                 buf.as_mut_ptr() as *mut libc::c_char,
@@ -112,10 +115,16 @@ fn show_time(utc: bool, formatstr: &str) {
             let _ = out.write_all(b"\n");
             return;
         }
-        if buf_size >= STRFTIME_BUF_MAX {
+        if buf[0] == 0 {
             // Empty-but-valid conversion: a <newline> shall always be appended.
             let _ = io::stdout().write_all(b"\n");
             return;
+        }
+        // Output did not fit; grow and retry, capped to guard against a
+        // pathologically large format silently allocating unbounded memory.
+        if buf_size >= STRFTIME_BUF_MAX {
+            diag::error(&gettext("formatted output exceeds internal buffer limit"));
+            process::exit(1);
         }
         buf_size *= 2;
     }

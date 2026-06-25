@@ -102,6 +102,25 @@ fn test_default_format_utc() {
     });
 }
 
+// Regression for the #D2 follow-up (Copilot): a format whose output exceeds
+// the internal 64 KiB strftime buffer must be reported as an error, not
+// silently truncated to a bare newline.
+#[test]
+fn test_format_exceeds_buffer_errors() {
+    let huge = format!("+{}", "x".repeat(70_000));
+    run_test_with_checker_and_env(date_plan(&[&huge]), &[("TZ", "UTC")], |_, output| {
+        assert!(
+            !output.status.success(),
+            "an over-long format should exit non-zero, got success"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("exceeds internal buffer limit"),
+            "expected buffer-limit diagnostic, got stderr: {stderr}"
+        );
+    });
+}
+
 #[test]
 fn test_locale_abbrev_weekday_and_month_c() {
     run_test_with_checker_and_env(

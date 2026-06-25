@@ -185,7 +185,7 @@ non-UTF-8 locale bytes can be mangled (#D4).
 
 #### Minor
 
-- [x] **#D2 — `strftime` returning 0 is always treated as a fatal error.** ✓ fixed in Phase 3 (grow-until-fits loop to a 64 KiB cap; a 0 return at the cap is an empty-but-valid result → emit just the trailing newline). `date.rs:87-95`. `strftime(3)` returns 0 both when the buffer is too small **and** when the conversion legitimately produces an empty string.
+- [x] **#D2 — `strftime` returning 0 is always treated as a fatal error.** ✓ fixed in Phase 3, refined post-review. `date.rs:87-95`. `strftime(3)` returns 0 both when the buffer is too small **and** when the conversion legitimately produces an empty string. The fix grows the buffer and uses a **first-byte sentinel** to tell the two apart: on any success (incl. empty output) `strftime` writes a terminating NUL at offset 0, so `buf[0]==0` ⇒ empty-but-valid (emit just the newline), while `buf[0]!=0` ⇒ output didn't fit (grow, then error at the 64 KiB cap rather than silently dropping a huge format — addresses a Copilot follow-up; regression test `test_format_exceeds_buffer_errors`).
 - [x] **#D3 — Runtime diagnostics hardcoded English.** ✓ fixed in Phase 4 (all `eprintln!`/`Err(&str)` diagnostics route through `plib::diag::error` + `gettext()` with a uniform `date:` prefix; the awkward `Error: date: …` double-prefix is gone). `date.rs:49,56,70,94,101,144,154,161,175`. POSIX 91728.
 - [x] **#D4 — `from_utf8_lossy` may mangle `strftime` output in non-UTF-8 locales.** ✓ fixed in Phase 3 (`stdout().write_all(&buf[..len])` raw bytes + newline, no lossy decode). `date.rs:88`. `strftime` emits bytes in the locale's `LC_CTYPE` encoding; `String::from_utf8_lossy` replaced invalid sequences with U+FFFD.
 

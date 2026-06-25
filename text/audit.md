@@ -393,19 +393,19 @@ Covers common use cases and passes a solid test suite, but has five correctness 
 
 #### Critical
 
-- [ ] **#1 — `-f` without `-d` passes every line through verbatim instead of using tab default.** `text/cut.rs:337-344`. `cut_fields()` is only called when `args.delimiter` is `Some`; with `-f` and no `-d` the `else` branch unconditionally `println!`s the whole line. `cut -f 1 file` (ubiquitous, default tab) produces wrong output. Fix: default the delimiter to `'\t'` when `-f` is given without `-d`.
+- [x] **#1 — `-f` without `-d` passes every line through verbatim instead of using tab default.** FIXED (Phase 6): the field delimiter defaults to `<tab>` when `-d` is absent (`args.delimiter.unwrap_or('\t')`).
 - [x] **#2 — `-` file operand only works as the sole argument.** `text/cut.rs:289`. FIXED (Phase 2): each operand is opened via `plib::io::input_stream_dashed`, so `-` reads stdin at any position. (The helper returns an unlocked `Stdin` handle so multiple `-` operands do not deadlock on the stdin lock.)
 
 #### Major
 
-- [ ] **#3 — Non-UTF-8 byte output from `-b` silently suppressed.** `text/cut.rs:328-331`. `String::from_utf8(bytes)` failure only `eprintln!`s and writes nothing; exit stays 0. `-b` selects bytes that need not be valid characters. Fix: write the `Vec<u8>` directly to stdout with `write_all`.
-- [ ] **#4 — `-n` algorithm not conformant.** `text/cut.rs:129-135`. Spec: decrement `low` until it is a character's first byte; decrement `high` until it is a character's last byte (of the prior character); drop the element if `high == 0` or `low > high`. Impl decrements by 1 only, never iterates to a true boundary, and has no drop logic. Wrong for characters wider than 2 bytes. Fix: re-implement boundary search + drop logic.
+- [x] **#3 — Non-UTF-8 byte output from `-b` silently suppressed.** FIXED (Phase 6): input lines are read as raw bytes and `-b` writes the selected bytes verbatim via `write_all`, so arbitrary bytes pass through.
+- [x] **#4 — `-n` algorithm not conformant.** FIXED (Phase 6): `-n` snaps the low byte to a character start and the high byte to a character end using `LC_CTYPE` character boundaries (`plib::locale::mb_char_slices`), dropping a range that collapses. (In the `C` locale every byte is a character, so `-n` is a no-op, as in GNU; under a multibyte locale the snap rule applies — note GNU coreutils currently ignores `-n` entirely, so it is not a conformance reference here.)
 
 #### Minor
 
-- [ ] **#5 — Range list does not accept blank-separated lists.** `text/cut.rs:353`. Spec allows comma- *or* `<blank>`-separated lists; impl splits on comma only, so `-c "1 3 5"` misparses. Fix: split on comma-or-blank.
-- [ ] **#6 — `cut_fields` uses `escape_debug()` to split.** `text/cut.rs:233-239`. A literal backslash delimiter becomes the two-char string `\\` and the line is split on that. Fix: split on the raw `char`.
-- [ ] **#7 — File-error handling aborts remaining files.** `text/cut.rs:292-296`. `?` propagates the first open error, halting subsequent files; spec says only the exit status is affected. Fix: emit diagnostic, set exit code, continue.
+- [x] **#5 — Range list does not accept blank-separated lists.** FIXED (Phase 6): `read_range` splits on commas, blanks, and tabs. (The fragile `range.len() == 1` single-number check was also corrected to `nums.len() == 1`.)
+- [x] **#6 — `cut_fields` uses `escape_debug()` to split.** FIXED (Phase 6): fields are split on the raw delimiter character.
+- [x] **#7 — File-error handling aborts remaining files.** FIXED (Phase 6): each operand is opened at processing time; a file that fails to open is diagnosed via `plib::diag` and processing continues, affecting only the exit status.
 
 (Note: `read_range` uses `range.len()==1` to detect single-number elements — fragile but currently masked by the `split('-')` element count; worth tidying.)
 

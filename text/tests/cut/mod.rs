@@ -362,3 +362,62 @@ fn test_cut_dash_non_sole_operand() {
     // contributes output. Previously this tried to open a file named "-".
     cut_test(&["-c", "1", "-", "-"], "ab\n", "a\n");
 }
+
+#[test]
+fn test_cut_f_default_tab() {
+    // -f without -d uses <tab> as the default field delimiter.
+    cut_test(&["-f", "2", "-"], "a\tb\tc\n", "b\n");
+}
+
+#[test]
+fn test_cut_blank_separated_list() {
+    // A list may be blank-separated (POSIX), not only comma-separated.
+    cut_test(&["-c", "1 3 5", "-"], "abcde\n", "ace\n");
+}
+
+#[test]
+fn test_cut_b_raw_bytes_non_utf8() {
+    // -b selects bytes that need not be valid UTF-8; they are written verbatim.
+    use std::io::Write;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_cut"))
+        .args(["-b", "1-2", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(&[0xff, 0xfe, 0xfd, b'\n'])
+        .unwrap();
+    let out = child.wait_with_output().unwrap().stdout;
+    assert_eq!(out, vec![0xff, 0xfe, b'\n']);
+}
+
+#[test]
+fn test_cut_continue_after_missing_file() {
+    use std::io::Write;
+    let dir = std::env::temp_dir();
+    let good = dir.join("cut_continue_after_missing_file.txt");
+    std::fs::File::create(&good)
+        .unwrap()
+        .write_all(b"x\n")
+        .unwrap();
+    let missing = dir.join("cut_continue_after_missing_file_nope.txt");
+    let _ = std::fs::remove_file(&missing);
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cut"))
+        .arg("-c")
+        .arg("1")
+        .arg(&good)
+        .arg(&missing)
+        .arg(&good)
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&good);
+
+    // The two readable files still produce output; the run exits non-zero.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "x\nx\n");
+    assert_ne!(out.status.code(), Some(0));
+}

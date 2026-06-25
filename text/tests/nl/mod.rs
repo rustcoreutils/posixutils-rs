@@ -93,3 +93,30 @@ fn test_nl_regex() {
         "     1\tsomething\n     2\tanything\n     3\teverything\n       cat\n       dog\n",
     );
 }
+
+#[test]
+fn test_nl_pbre_is_basic_regex() {
+    // The pBRE numbering style uses a Basic RE: `+` is a literal character
+    // (not a quantifier), so only the line containing "a+" is numbered.
+    run_test(TestPlan {
+        cmd: String::from("nl"),
+        args: vec!["-b".to_string(), "pa+".to_string()],
+        stdin_data: String::from("a+b\nxyz\n"),
+        expected_out: String::from("     1\ta+b\n       xyz\n"),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn test_nl_pbre_interval() {
+    // BRE interval \{3\}: number only lines containing three consecutive a's.
+    run_test(TestPlan {
+        cmd: String::from("nl"),
+        args: vec!["-b".to_string(), r"pa\{3\}".to_string()],
+        stdin_data: String::from("aaa\nbb\naaaa\n"),
+        expected_out: String::from("     1\taaa\n       bb\n     2\taaaa\n"),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+}

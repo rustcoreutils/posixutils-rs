@@ -928,18 +928,18 @@ Broadly conformant, and the single best design decision is using POSIX `regcomp`
 
 #### Critical
 
-- [ ] **#1 — Pattern `dedup()` silently drops duplicate patterns.** `text/grep.rs:124-125`. `resolve()` sorts patterns by length then `dedup()`s. Spec: "All of the specified patterns shall be used when matching lines." Removing a duplicate (e.g. an empty match-all pattern supplied twice across `-e`/`-f`) can silently change the exit code from 0 to 1. Fix: do not remove patterns; if dedup is wanted for speed, use a membership check that preserves match semantics. (Sorting also reorders evaluation — permissible per "order of evaluation is unspecified," but removal is not.)
+- [x] **#1 — Pattern `dedup()` silently drops duplicate patterns.** FIXED (Phase 8): the `sort_by_key` + `dedup` were removed, so every specified pattern is kept and used.
 
 #### Major
 
-- [ ] **#2 — `-i` with `-F` uses Unicode `to_lowercase()`, not locale `LC_CTYPE` folding.** `text/grep.rs:220,266-270`. The regex path correctly uses `REG_ICASE` (locale-aware); the fixed-string path folds with Rust Unicode case-folding, independent of locale. Wrong in e.g. Turkish (`I`↔`ı`). Fix: fold via `libc::towlower`, or route `-F -i` through a regex with escaped literals + `REG_ICASE`.
-- [ ] **#3 — Diagnostics not locale-aware (LC_MESSAGES).** `text/grep.rs:326`. File-open errors use Rust `io::Error` Display (`"No such file or directory (os error 2)"`), not `LC_MESSAGES`-translated text. Fix: route through gettext.
+- [x] **#2 — `-i` with `-F` uses Unicode `to_lowercase()`, not locale `LC_CTYPE` folding.** FIXED (Phase 8): the `-F -i` fixed-string path folds via `plib::locale::to_lower` (libc `tolower`/`towlower`), honoring `LC_CTYPE`.
+- [x] **#3 — Diagnostics not locale-aware (LC_MESSAGES).** FIXED (Phase 8): diagnostics route through `plib::diag::error` (uniform `grep:` prefix + stderr); message-catalog translation is the tree-wide gettext `.mo` deferral.
 
 #### Minor
 
-- [ ] **#4 — `\r\n` line endings: only `\n` stripped.** `text/grep.rs:361-365`. A trailing `\r` remains in the matched line on DOS/Windows files. POSIX text files use `\n`, so quality issue rather than violation.
-- [ ] **#5 — `-c`/`-l`/`-q` and `-E`/`-F` conflicts enforced as hard errors.** `text/grep.rs:76-87`. POSIX shows these as mutually exclusive but leaves conflicting use "undefined"; a hard error (exit 2) is a conformant, reasonable choice — noted for completeness.
-- [ ] **#6 — Non-POSIX long options + absent `-G`.** Long option aliases (`--extended-regexp`, etc.) are harmless extensions; `-G` is a GNU extension, not required by POSIX.
+- [x] **#4 — `\r\n` line endings: only `\n` stripped.** ACCEPTED: POSIX text files are newline-terminated; GNU grep likewise leaves a trailing `\r` in place by default. No change.
+- [x] **#5 — `-c`/`-l`/`-q` and `-E`/`-F` conflicts enforced as hard errors.** ACCEPTED: POSIX leaves conflicting use undefined; a clear diagnostic + exit 2 is conforming.
+- [x] **#6 — Non-POSIX long options + absent `-G`.** ACCEPTED: long-option aliases are harmless extensions; `-G` is a GNU extension not required by POSIX.
 
 (Verified non-issues: `-q` correctly exits 0 on first match even with later errors — the per-file early-exit at grep.rs:331-333 fires immediately once `any_matches` is set.)
 
@@ -1349,15 +1349,15 @@ Mostly correct. The golden path (body numbering, `-v`, `-i`, `-n`, `-s`, `-w`, `
 
 #### Major
 
-- [ ] **#1 — `pBRE` uses an ERE engine, not BRE.** `text/nl.rs:12,92-93`. The `-b pSTRING`/`-f pSTRING`/`-h pSTRING` arguments are spec'd as BRE (§9.3) but compiled with `regex::Regex::new()` (ERE/Perl). BRE constructs (`\(…\)`, `\{n\}` intervals, backreferences) and anchoring semantics diverge. The test file even notes "better regex support than the reference." Fix: use a POSIX BRE engine (e.g. `plib`/libc `regcomp` without `REG_EXTENDED`).
-- [ ] **#2 — `-l` blank-line counter not reset across section boundaries.** `text/nl.rs:155,220-228`. `consecutive_blank_lines` is reset only on a non-empty line or when the join count is reached, never on a `\:`/`\:\:`/`\:\:\:` delimiter. Trailing blank lines from one section inflate the next section's run. Fix: reset the counter in the `non_text` branch.
+- [x] **#1 — `pBRE` uses an ERE engine, not BRE.** FIXED (Phase 8): the `pSTRING` style compiles with the libc-backed `plib::regex` BRE engine (`RegexFlags::bre()`), so `+`/`?`/`{}` are literal and `\(…\)`/`\{n\}` are BRE operators.
+- [x] **#2 — `-l` blank-line counter not reset across section boundaries.** FIXED (Phase 8): `consecutive_blank_lines` is reset in the section-delimiter (`non_text`) branch.
 
 #### Minor
 
-- [ ] **#3 — Regex match is unanchored.** `text/nl.rs:261`. `is_match` matches anywhere (consistent with spec "contain"); but ERE anchoring (#1) differs from BRE at interval boundaries.
-- [ ] **#4 — `LC_COLLATE`/`LC_CTYPE` not passed to the regex engine.** `text/nl.rs:291-293`. `setlocale` is called but the `regex` crate ignores it; locale-aware bracket expressions unsupported. (Resolved if #1 moves to libc regcomp.)
-- [ ] **#5 — `-d` empty / >2-char argument exits 1.** `text/nl.rs:297-306`. Spec doesn't define these cases; exiting 1 is a plausible-but-unspecified interpretation.
-- [ ] **#6 — Unnumbered lines emit aligned spaces rather than `<empty>`+suppressed separator.** `text/nl.rs:194-200`. Spec STDOUT wording suggests the number is blank and the separator omitted; impl emits `width+sep` spaces. This is the traditional universal behavior; low risk.
+- [x] **#3 — Regex match is unanchored.** RESOLVED (Phase 8): the engine is now BRE (#1), so `^`/`$` and interval anchoring follow §9.3; an unanchored match is correct for the spec's "contain the BRE".
+- [x] **#4 — `LC_COLLATE`/`LC_CTYPE` not passed to the regex engine.** FIXED (Phase 8): the libc `regcomp`/`regexec` engine honors `LC_COLLATE`/`LC_CTYPE` in bracket expressions (resolved by the #1 switch).
+- [x] **#5 — `-d` empty / >2-char argument exits 1.** ACCEPTED: the spec does not define these cases; rejecting them is a reasonable, conforming interpretation.
+- [x] **#6 — Unnumbered lines emit aligned spaces rather than `<empty>`+suppressed separator.** ACCEPTED: the aligned-spaces output is the traditional universal `nl` behavior; the spec wording is permissive and this is low-risk.
 
 ### Detailed conformance matrix
 

@@ -9,7 +9,7 @@
 
 use clap::{Parser, ValueEnum};
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use regex::Regex;
+use plib::regex::{Regex, RegexFlags};
 use std::fs;
 use std::io::{self, BufRead, Read};
 use std::path::PathBuf;
@@ -89,7 +89,10 @@ impl FromStr for LineNumberingStyle {
             "n" => Ok(LineNumberingStyle::None),
             s => {
                 if let Some(re) = s.strip_prefix('p') {
-                    if let Ok(regexp) = Regex::new(re) {
+                    // The pBRE style matches a basic regular expression (POSIX
+                    // §9.3); use the libc-backed BRE engine, which also honors
+                    // LC_COLLATE/LC_CTYPE in bracket expressions.
+                    if let Ok(regexp) = Regex::new(re, RegexFlags::bre()) {
                         Ok(LineNumberingStyle::Regex(regexp))
                     } else {
                         Err(format!("invalid regular expression: {re}"))
@@ -109,7 +112,7 @@ impl std::fmt::Display for LineNumberingStyle {
             LineNumberingStyle::NonEmpty => write!(f, "t"),
             LineNumberingStyle::None => write!(f, "n"),
             LineNumberingStyle::Regex(re) => {
-                write!(f, "p{}", re)
+                write!(f, "p{}", re.as_str())
             }
         }
     }
@@ -277,6 +280,9 @@ fn nl_main(args: &Args) -> io::Result<()> {
                     line_number = args.starting_line_number;
                     line_number_overflowed = false;
                 }
+                // Blank-line grouping (-l) is scoped to a logical-page section;
+                // reset the run when crossing a section delimiter.
+                consecutive_blank_lines = 0;
                 println!();
             }
         } else {

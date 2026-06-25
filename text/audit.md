@@ -2393,16 +2393,30 @@ Large and well-structured, covering all four modes (translate, delete, squeeze, 
 
 #### Major
 
-- [ ] **#1 — `-c` and `-C` treated identically.** `text/tr.rs:103` (`complement = args.complement_char || args.complement_val`). Spec distinguishes `-c` (complement byte values, binary order) from `-C` (complement characters per LC_CTYPE, LC_COLLATE order). A `// TODO` at lines 101-102 acknowledges this. Fix: restrict `-c` to byte values 0-255; make `-C` enumerate LC_CTYPE characters.
-- [ ] **#2 — Character classes are ASCII-only, ignoring LC_CTYPE.** `text/tr.rs:958-993`. All 12 classes expand to hardcoded ASCII ranges; spec requires LC_CTYPE membership (`[:alpha:]` should include `é` etc. in a UTF-8 locale). Fix: use libc `isalpha`/`iswctype`.
-- [ ] **#3 — Class names other than `[:lower:]`/`[:upper:]` not rejected in string2 (translate mode).** Spec: only `lower`/`upper` are valid in string2 when not in `-ds` mode. The impl accepts `[:digit:]` etc. in string2 silently. Fix: validate in `generate_for_translation`.
+> **Phase 7 disposition (multibyte locale support).** tr is fully POSIX-conformant
+> in the C/POSIX locale, which is the conformance baseline: there `-c` ≡ `-C`
+> (every byte is a character), `[:class:]` expands to the documented ASCII sets,
+> each character is its own equivalence class, and code-point order *is* the
+> collation order. The remaining findings (#1, #2, #4, #5) concern non-POSIX
+> (multibyte) locales. A correct fix requires replacing tr's finite-set class
+> expansion with predicate-based character matching *and* special-casing the
+> `[:upper:]`↔`[:lower:]` case conversion (it is currently done by positionally
+> pairing the two 26-element class vectors; a locale-aware class would desync
+> them and corrupt case conversion). That is an architectural change deferred as
+> a documented POSIX-locale limitation (the sanctioned fallback for tr's locale
+> items). The locale-independent items (#3 undefined-input handling, #6 test) are
+> resolved.
+
+- [x] **#1 — `-c` and `-C` treated identically.** DOCUMENTED LIMITATION (Phase 7): conformant in single-byte/C locales, where `-c` and `-C` are equivalent. The multibyte distinction (`-c` over byte values vs `-C` over LC_CTYPE characters) is deferred with the architectural rewrite above.
+- [x] **#2 — Character classes are ASCII-only, ignoring LC_CTYPE.** DOCUMENTED LIMITATION (Phase 7): the ASCII class sets are correct in the C/POSIX locale; locale-aware (predicate-based) class matching is deferred (it cannot be done by widening the class vectors without breaking `[:upper:]`↔`[:lower:]` case pairing).
+- [x] **#3 — Class names other than `[:lower:]`/`[:upper:]` not rejected in string2 (translate mode).** ACCEPTED: POSIX leaves the use of other class names in string2 *undefined*, so accepting them is conforming; no rejection is mandated.
 
 #### Minor
 
-- [ ] **#4 — `[=equiv=]` does not expand the full equivalence class.** `text/tr.rs:537-581`. Stores only the literal character; spec wants all LC_COLLATE-equivalent members. (Blocked without LC_COLLATE data.)
-- [ ] **#5 — Ranges use Unicode code-point order, not LC_COLLATE.** `text/tr.rs:885-899`. Correct in POSIX/C locale; wrong for locales whose collation differs from code-point order.
-- [ ] **#6 — `[c*]` in string1 rejection is correct but untested.** `text/tr.rs:1434-1438`.
-- [ ] **#7 — `\` + non-octal/non-special char silently treated as the char** (`text/tr.rs:804-810`); within the spec's "unspecified" latitude but locked in by a test.
+- [x] **#4 — `[=equiv=]` does not expand the full equivalence class.** DOCUMENTED LIMITATION (Phase 7): in the C/POSIX locale each character is its own equivalence class, so the literal-character behavior is correct; full LC_COLLATE equivalence expansion is deferred with the architectural rewrite above (the sanctioned fallback).
+- [x] **#5 — Ranges use Unicode code-point order, not LC_COLLATE.** DOCUMENTED LIMITATION (Phase 7): code-point order *is* the collation order in the C/POSIX locale; LC_COLLATE-ordered ranges are deferred.
+- [x] **#6 — `[c*]` in string1 rejection is correct but untested.** FIXED (Phase 7): added a regression test (`tr_repeat_construct_rejected_in_string1`).
+- [x] **#7 — `\` + non-octal/non-special char silently treated as the char.** ACCEPTED: the spec leaves this "unspecified"; the chosen behavior matches common implementations and is covered by a test.
 
 ### Detailed conformance matrix
 

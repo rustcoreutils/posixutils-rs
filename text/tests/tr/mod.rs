@@ -793,3 +793,17 @@ Only one string may be given when deleting without squeezing repeats.
 ",
     );
 }
+
+#[test]
+fn tr_repeat_construct_rejected_in_string1() {
+    // The [c*] / [c*n] repeat construct may only appear in string2; in string1
+    // it is an error (POSIX).
+    run_test(TestPlan {
+        cmd: "tr".to_owned(),
+        args: vec!["[a*]".to_owned(), "x".to_owned()],
+        stdin_data: "abc".to_owned(),
+        expected_out: String::new(),
+        expected_err: "tr: the [c*] repeat construct may not appear in string1\n".to_owned(),
+        expected_exit_code: 1,
+    });
+}

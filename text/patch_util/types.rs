@@ -42,6 +42,10 @@ pub struct Hunk {
     pub new_count: usize,
     /// The actual line operations
     pub lines: Vec<LineOp>,
+    /// The old-side last line had no trailing newline ("\ No newline...").
+    pub old_no_newline: bool,
+    /// The new-side last line had no trailing newline ("\ No newline...").
+    pub new_no_newline: bool,
 }
 
 impl Hunk {
@@ -56,6 +60,8 @@ impl Hunk {
             new_start,
             new_count,
             lines: Vec::with_capacity(estimated_lines),
+            old_no_newline: false,
+            new_no_newline: false,
         }
     }
 
@@ -63,6 +69,7 @@ impl Hunk {
     pub fn reverse(&mut self) {
         std::mem::swap(&mut self.old_start, &mut self.new_start);
         std::mem::swap(&mut self.old_count, &mut self.new_count);
+        std::mem::swap(&mut self.old_no_newline, &mut self.new_no_newline);
         // Mutate in place using mem::take to avoid cloning strings
         for op in &mut self.lines {
             *op = match std::mem::take(op) {
@@ -205,10 +212,8 @@ pub struct ApplyResult {
     pub rejected_hunks: Vec<(usize, Hunk, String)>,
     /// Final file content
     pub content: Vec<String>,
-    /// Whether any hunks had offset != 0
-    pub had_offset: bool,
-    /// Whether any hunks used fuzz > 0
-    pub had_fuzz: bool,
+    /// Whether the resulting file's last line has no trailing newline.
+    pub no_trailing_newline: bool,
 }
 
 /// Configuration options for patch.
@@ -216,6 +221,8 @@ pub struct ApplyResult {
 pub struct PatchConfig {
     /// Save .orig backup (-b)
     pub backup: bool,
+    /// Force application without prompting (-f)
+    pub force: bool,
     /// Force context diff interpretation (-c)
     pub force_context: bool,
     /// Change directory before processing (-d)

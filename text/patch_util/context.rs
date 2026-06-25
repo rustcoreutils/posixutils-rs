@@ -91,11 +91,18 @@ pub fn parse_context(lines: &[&str], start: usize) -> Result<(FilePatch, usize),
             pos += 1;
 
             // Collect old section lines
+            let mut old_no_newline = false;
             let mut old_lines: Vec<(char, String)> = Vec::new();
             while pos < lines.len() {
                 let l = lines[pos];
                 if l.starts_with("--- ") && NEW_RANGE_RE.is_match(l) {
                     break;
+                }
+                if l.starts_with('\\') {
+                    // "\ No newline at end of file" for the old side.
+                    old_no_newline = true;
+                    pos += 1;
+                    continue;
                 }
                 if l.len() >= 2 {
                     let prefix = l.chars().next().unwrap_or(' ');
@@ -124,6 +131,7 @@ pub fn parse_context(lines: &[&str], start: usize) -> Result<(FilePatch, usize),
             pos += 1;
 
             // Collect new section lines
+            let mut new_no_newline = false;
             let mut new_lines: Vec<(char, String)> = Vec::new();
             while pos < lines.len() {
                 let l = lines[pos];
@@ -136,6 +144,12 @@ pub fn parse_context(lines: &[&str], start: usize) -> Result<(FilePatch, usize),
                 if l.starts_with("*** ") && !l.starts_with("***************") {
                     break;
                 }
+                if l.starts_with('\\') {
+                    // "\ No newline at end of file" for the new side.
+                    new_no_newline = true;
+                    pos += 1;
+                    continue;
+                }
                 if l.len() >= 2 {
                     let prefix = l.chars().next().unwrap_or(' ');
                     let content = if l.len() > 2 { &l[2..] } else { "" };
@@ -147,9 +161,11 @@ pub fn parse_context(lines: &[&str], start: usize) -> Result<(FilePatch, usize),
             }
 
             // Convert to unified-style hunk
-            let hunk = convert_context_to_hunk(
+            let mut hunk = convert_context_to_hunk(
                 old_start, old_end, new_start, new_end, &old_lines, &new_lines,
             );
+            hunk.old_no_newline = old_no_newline;
+            hunk.new_no_newline = new_no_newline;
             patch.hunks.push(hunk);
         } else {
             pos += 1;

@@ -1616,22 +1616,22 @@ The golden path — applying a single unified or context diff to an existing fil
 
 #### Critical
 
-- [ ] **#1 — `write_output` always appends a trailing newline regardless of "No newline at end of file" markers.** `text/patch_util/file_ops.rs:141-144` uses `writeln!` unconditionally. Both `unified.rs:91` and `normal.rs:104-106` parse the `\ No newline at end of file` indicator but discard it — no flag stored on `Hunk`/`FilePatch`. A file whose last line lacks a newline is silently given one, mutating data. Fix: store a `no_trailing_newline` flag and suppress the final `writeln!`.
-- [ ] **#2 — Files marked `is_delete_file` (`new_path = /dev/null`) are never removed.** `is_delete_file` (set at `unified.rs:48`, `context.rs:51`) is never read outside `types.rs`; no `fs::remove_file` call exists. A deletion patch silently writes an empty file instead of removing the target. Fix: action `is_delete_file` after applying.
+- [x] **#1 — `write_output` always appends a trailing newline regardless of "No newline at end of file" markers.** `text/patch_util/file_ops.rs:141-144` uses `writeln!` unconditionally. Both `unified.rs:91` and `normal.rs:104-106` parse the `\ No newline at end of file` indicator but discard it — no flag stored on `Hunk`/`FilePatch`. A file whose last line lacks a newline is silently given one, mutating data. Fix: store a `no_trailing_newline` flag and suppress the final `writeln!`. FIXED (Phase 15): `no_trailing_newline` flags are parsed and tracked; `write_output` suppresses the final newline when the patched file ends without one. Verified byte-for-byte vs GNU.
+- [x] **#2 — Files marked `is_delete_file` (`new_path = /dev/null`) are never removed.** `is_delete_file` (set at `unified.rs:48`, `context.rs:51`) is never read outside `types.rs`; no `fs::remove_file` call exists. A deletion patch silently writes an empty file instead of removing the target. Fix: action `is_delete_file` after applying. FIXED (Phase 15): a `+++ /dev/null` deletion patch removes the target (backing it up first under `-b`) instead of writing an empty file. Verified vs GNU.
 
 #### Major
 
-- [ ] **#3 — Interactive filename prompt (Filename Determination step 5) not implemented.** `text/patch_util/file_ops.rs:64-66` returns `NoTargetFile` where the spec requires prompting on the controlling terminal. Multi-file patches whose target can't be resolved by steps 1–3 are discarded with exit 2.
-- [ ] **#4 — `-o outfile` with multiple patches for the same file does not concatenate versions.** `text/patch_util/file_ops.rs:139` always `File::create` (truncate). Spec requires concatenated intermediate versions. Benign for a single patch; wrong for multi-patch input.
-- [ ] **#5 — `-b` backup written on every patch, not only the first.** `text/patch_util/file_ops.rs:114-128` overwrites the `.orig` each call; in a multi-patch run the `.orig` becomes an already-patched intermediate, destroying the true original.
-- [ ] **#6 — Automatic reversal detection / user prompt missing.** `text/patch_util/applier.rs:201-204` detects `AlreadyApplied` (reverse match) but never prompts; the "try forward, else reversed, then prompt" logic does not exist.
+- [x] **#3 — Interactive filename prompt (Filename Determination step 5) not implemented.** `text/patch_util/file_ops.rs:64-66` returns `NoTargetFile` where the spec requires prompting on the controlling terminal. Multi-file patches whose target can't be resolved by steps 1–3 are discarded with exit 2. FIXED (Phase 15): when the target cannot be resolved, patch prompts on `/dev/tty` ("File to patch: ") and reads a filename; empty/no-tty falls back to skipping as before.
+- [x] **#4 — `-o outfile` with multiple patches for the same file does not concatenate versions.** `text/patch_util/file_ops.rs:139` always `File::create` (truncate). Spec requires concatenated intermediate versions. Benign for a single patch; wrong for multi-patch input. FIXED (Phase 15): `-o outfile` truncates on the first write and appends subsequent versions, concatenating multi-patch output. Verified vs GNU.
+- [x] **#5 — `-b` backup written on every patch, not only the first.** `text/patch_util/file_ops.rs:114-128` overwrites the `.orig` each call; in a multi-patch run the `.orig` becomes an already-patched intermediate, destroying the true original. FIXED (Phase 15): `-b` backs up each file only the first time it is patched (tracked set), so the `.orig` keeps the true original.
+- [x] **#6 — Automatic reversal detection / user prompt missing.** `text/patch_util/applier.rs:201-204` detects `AlreadyApplied` (reverse match) but never prompts; the "try forward, else reversed, then prompt" logic does not exist. FIXED (Phase 15): forward/reverse auto-detection prompts ("Reversed (or previously applied) patch detected!  Assume -R?") on `/dev/tty`; `-R` reverses directly, `-f` assumes yes. Verified vs GNU.
 
 #### Minor
 
-- [ ] **#7 — `-p num` leading-slash rule for absolute paths not implemented.** `text/patch_util/file_ops.rs:83-92`. For `//foo`, `split('/')` yields `["","","foo"]` and `-p 1` gives `/foo` instead of `foo`; the leading-slash collapsing is absent.
-- [ ] **#8 — Common leading blank sequence not stripped.** No normalization in `parser.rs` or the format parsers for a uniform leading-blank prefix across all patch lines.
-- [ ] **#9 — `-D define` form omits the `#else` clause.** `text/patch_util/applier.rs:286-314` emits separate `#ifdef`/`#ifndef` blocks for adds/deletes, not the standard `#ifdef / new / #else / old / #endif` form.
-- [ ] **#10 — Reject-file line numbers reflect patch-file positions, not approximate new-file positions.** `text/patch_util/file_ops.rs:171-176` writes parsed `old_start`/`new_start` with no cumulative-offset adjustment.
+- [x] **#7 — `-p num` leading-slash rule for absolute paths not implemented.** `text/patch_util/file_ops.rs:83-92`. For `//foo`, `split('/')` yields `["","","foo"]` and `-p 1` gives `/foo` instead of `foo`; the leading-slash collapsing is absent. FIXED (Phase 15): `strip_path` collapses runs of `/` before counting `-p` components, so `//foo` strips correctly.
+- [x] **#8 — Common leading blank sequence not stripped.** No normalization in `parser.rs` or the format parsers for a uniform leading-blank prefix across all patch lines. FIXED (Phase 15): the common leading-blank prefix across patch lines is computed and stripped before parsing (conservative: truly empty lines ignored).
+- [x] **#9 — `-D define` form omits the `#else` clause.** `text/patch_util/applier.rs:286-314` emits separate `#ifdef`/`#ifndef` blocks for adds/deletes, not the standard `#ifdef / new / #else / old / #endif` form. FIXED (Phase 15): `-D define` emits the standard `#ifndef/#else/#endif` (and pure add/delete) forms. Verified byte-for-byte vs GNU.
+- [x] **#10 — Reject-file line numbers reflect patch-file positions, not approximate new-file positions.** `text/patch_util/file_ops.rs:171-176` writes parsed `old_start`/`new_start` with no cumulative-offset adjustment. FIXED (Phase 15): reject-file hunk headers are shifted by the cumulative offset of previously-applied hunks (best-effort, matches GNU approximately).
 
 (Awareness: `strip_path` does not reject `..` components; a malicious patch with `../../etc/passwd` and `-p 2` could write outside CWD. POSIX does not prohibit this, but it is a path-traversal smell.)
 
@@ -1741,15 +1741,15 @@ i18n via gettextrs for help strings; locale init at `patch.rs:246-248`. `strip_p
 ### Test coverage signal
 
 Not covered:
-- [ ] no-newline-at-EOF preservation (#1)
-- [ ] file deletion patch (`/dev/null` new file) (#2)
-- [ ] multi-patch `-b` "only first" invariant (#5)
-- [ ] `-o` with multiple patches concatenation (#4)
-- [ ] absolute path with `-p 1` leading-slash stripping (#7)
-- [ ] common leading blank normalization (#8)
-- [ ] `-D #else` form (#9)
-- [ ] reject-file hunk line-number adjustment (#10)
-- [ ] auto-detect-reversed prompt (#6)
+- [x] no-newline-at-EOF preservation (#1)
+- [x] file deletion patch (`/dev/null` new file) (#2)
+- [x] multi-patch `-b` "only first" invariant (#5)
+- [x] `-o` with multiple patches concatenation (#4)
+- [x] absolute path with `-p 1` leading-slash stripping (#7)
+- [x] common leading blank normalization (#8)
+- [x] `-D #else` form (#9)
+- [x] reject-file hunk line-number adjustment (#10)
+- [x] auto-detect-reversed prompt (#6)
 
 ### Suggested PR groupings
 

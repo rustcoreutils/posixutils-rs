@@ -74,21 +74,60 @@ pub fn parse_unified(lines: &[&str], start: usize) -> Result<(FilePatch, usize),
             let mut hunk = Hunk::new(old_start, old_count, new_start, new_count);
             pos += 1;
 
+            // Track the side(s) the previous content line belongs to, so a
+            // following "\ No newline at end of file" marker is attributed
+            // correctly: context lines belong to both old and new, '+' to new,
+            // '-' to old.
+            let mut prev_old = false;
+            let mut prev_new = false;
+
+            // Consume exactly the number of old/new lines declared in the
+            // header. This prevents the next file's "--- " header (which begins
+            // with '-') from being swallowed as a delete line, so a patch file
+            // covering several files splits into separate FilePatches.
+            let mut old_remaining = old_count;
+            let mut new_remaining = new_count;
+
             // Parse hunk lines
             while pos < lines.len() {
                 let hunk_line = lines[pos];
 
+                // "\ No newline at end of file" applies to the preceding line
+                // and does not consume any old/new line count.
+                if hunk_line.starts_with('\\') {
+                    if prev_old {
+                        hunk.old_no_newline = true;
+                    }
+                    if prev_new {
+                        hunk.new_no_newline = true;
+                    }
+                    pos += 1;
+                    continue;
+                }
+
+                // Stop once all declared old and new lines are consumed.
+                if old_remaining == 0 && new_remaining == 0 {
+                    break;
+                }
+
                 if let Some(rest) = hunk_line.strip_prefix(' ') {
                     hunk.lines.push(LineOp::Context(rest.to_string()));
+                    prev_old = true;
+                    prev_new = true;
+                    old_remaining = old_remaining.saturating_sub(1);
+                    new_remaining = new_remaining.saturating_sub(1);
                     pos += 1;
                 } else if let Some(rest) = hunk_line.strip_prefix('+') {
                     hunk.lines.push(LineOp::Add(rest.to_string()));
+                    prev_old = false;
+                    prev_new = true;
+                    new_remaining = new_remaining.saturating_sub(1);
                     pos += 1;
                 } else if let Some(rest) = hunk_line.strip_prefix('-') {
                     hunk.lines.push(LineOp::Delete(rest.to_string()));
-                    pos += 1;
-                } else if hunk_line.starts_with('\\') {
-                    // "\ No newline at end of file" - skip
+                    prev_old = true;
+                    prev_new = false;
+                    old_remaining = old_remaining.saturating_sub(1);
                     pos += 1;
                 } else if hunk_line.starts_with('@') {
                     // Next hunk
@@ -96,6 +135,10 @@ pub fn parse_unified(lines: &[&str], start: usize) -> Result<(FilePatch, usize),
                 } else if hunk_line.is_empty() {
                     // Empty line could be context with no prefix (some patches do this)
                     hunk.lines.push(LineOp::Context(String::new()));
+                    prev_old = true;
+                    prev_new = true;
+                    old_remaining = old_remaining.saturating_sub(1);
+                    new_remaining = new_remaining.saturating_sub(1);
                     pos += 1;
                 } else {
                     // End of hunk content

@@ -17,11 +17,14 @@ use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use patch_util::{
     applier::PatchApplier,
-    file_ops::{determine_target_file, read_file_lines, write_output, write_rejects},
+    file_ops::{
+        delete_target, determine_target_file, read_file_lines, write_output, write_rejects,
+    },
     parser::parse_patch,
     types::{PatchConfig, PatchError},
 };
 use std::{
+    collections::HashSet,
     env,
     fs::File,
     io::{self, BufReader, Read},
@@ -44,6 +47,10 @@ struct Args {
     /// Interpret patch as context diff
     #[arg(short = 'c', help = gettext("Interpret the patch file as a context difference"))]
     context: bool,
+
+    /// Force; do not prompt
+    #[arg(short = 'f', help = gettext("Force; do not ask any questions and assume answers"))]
+    force: bool,
 
     /// Change to directory before processing
     #[arg(short = 'd', value_name = "DIR", help = gettext("Change to directory before processing"))]
@@ -123,6 +130,7 @@ impl Args {
     fn to_config(&self) -> PatchConfig {
         PatchConfig {
             backup: self.backup,
+            force: self.force,
             force_context: self.context,
             directory: self.directory.clone(),
             ifdef_define: self.ifdef_define.clone(),
@@ -183,6 +191,12 @@ fn run(args: Args) -> Result<bool, PatchError> {
     let mut had_rejects = false;
     let mut exit_code = 0;
 
+    // Track files already backed up (-b) and -o outputs already written, so
+    // that backups capture the true original and successive -o versions of the
+    // same file are concatenated rather than truncated.
+    let mut backed_up: HashSet<PathBuf> = HashSet::new();
+    let mut written_outputs: HashSet<PathBuf> = HashSet::new();
+
     // Process each file patch
     for file_patch in &mut patch.file_patches {
         // Determine target file
@@ -196,10 +210,10 @@ fn run(args: Args) -> Result<bool, PatchError> {
         };
 
         // Read target file content (or empty for new files)
-        let lines = if target.exists() {
+        let (lines, orig_trailing_newline) = if target.exists() {
             read_file_lines(&target)?
         } else if file_patch.is_new_file {
-            Vec::new()
+            (Vec::new(), true)
         } else {
             eprintln!(
                 "patch: {}: {}",
@@ -211,19 +225,28 @@ fn run(args: Args) -> Result<bool, PatchError> {
         };
 
         // Apply patch
-        let mut applier = PatchApplier::new(&config, lines);
+        let mut applier = PatchApplier::new(&config, lines, orig_trailing_newline);
         let result = applier.apply_patch(file_patch)?;
 
-        // Report any offset/fuzz messages
-        for (i, hunk) in file_patch.hunks.iter().enumerate() {
-            if result.had_offset || result.had_fuzz {
-                // Messages are printed by applier
-            }
-            let _ = (i, hunk); // Silence unused warning
+        // A deletion patch (new file is /dev/null) removes the target rather
+        // than leaving an empty file behind.
+        if file_patch.is_delete_file
+            && config.output_file.is_none()
+            && result.rejected_hunks.is_empty()
+        {
+            delete_target(&target, &config, &mut backed_up)?;
+            continue;
         }
 
         // Write output
-        write_output(&result.content, &target, &config)?;
+        write_output(
+            &result.content,
+            &target,
+            &config,
+            result.no_trailing_newline,
+            &mut backed_up,
+            &mut written_outputs,
+        )?;
 
         // Handle rejects
         if !result.rejected_hunks.is_empty() {

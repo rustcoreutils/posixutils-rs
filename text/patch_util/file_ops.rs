@@ -11,8 +11,9 @@
 
 use super::types::{DiffFormat, FilePatch, Hunk, LineOp, PatchConfig, PatchError};
 use std::{
-    fs::{self, File},
-    io::{self, BufWriter, Write},
+    collections::HashSet,
+    fs::{self, File, OpenOptions},
+    io::{self, BufRead, BufWriter, Write},
     path::{Path, PathBuf},
 };
 
@@ -61,9 +62,58 @@ pub fn determine_target_file(
         }
     }
 
-    // Could not determine file - in interactive mode we'd prompt
-    // For now, return error
+    // Filename Determination step 5: prompt the user on the controlling
+    // terminal for a filename. If no terminal is available or the response is
+    // empty, give up and skip the patch (as before).
+    if let Some(name) = prompt_for_filename() {
+        let trimmed = name.trim();
+        if !trimmed.is_empty() {
+            return Ok(PathBuf::from(trimmed));
+        }
+    }
+
     Err(PatchError::NoTargetFile)
+}
+
+/// Prompt on the controlling terminal (/dev/tty) for a filename to patch.
+/// Returns None if /dev/tty cannot be opened or nothing was read.
+fn prompt_for_filename() -> Option<String> {
+    let mut tty = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .ok()?;
+    write!(tty, "File to patch: ").ok()?;
+    tty.flush().ok()?;
+    let mut reader = io::BufReader::new(tty);
+    let mut line = String::new();
+    let n = reader.read_line(&mut line).ok()?;
+    if n == 0 {
+        return None;
+    }
+    Some(line)
+}
+
+/// Prompt a yes/no question on the controlling terminal (/dev/tty).
+/// Returns Some(true) for an affirmative (or empty/default) answer, Some(false)
+/// for a negative answer, or None if /dev/tty is unavailable.
+pub fn prompt_yes_no(prompt: &str) -> Option<bool> {
+    let mut tty = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .ok()?;
+    write!(tty, "{}", prompt).ok()?;
+    tty.flush().ok()?;
+    let mut reader = io::BufReader::new(tty);
+    let mut line = String::new();
+    let n = reader.read_line(&mut line).ok()?;
+    if n == 0 {
+        return None;
+    }
+    let answer = line.trim();
+    // Default (empty) answer is affirmative, matching the "[y]" prompt.
+    Some(answer.is_empty() || answer.starts_with('y') || answer.starts_with('Y'))
 }
 
 /// Strip leading path components from a path.
@@ -81,10 +131,15 @@ fn strip_path(path: &str, strip_count: Option<usize>) -> String {
             path.to_string()
         }
         Some(n) => {
-            // Strip n components
-            let components: Vec<&str> = path.split('/').collect();
+            // Strip n components. Per POSIX, a sequence of adjacent <slash>
+            // characters counts as a single <slash> when counting components.
+            let collapsed = collapse_slashes(path);
+            let components: Vec<&str> = collapsed.split('/').collect();
             if n >= components.len() {
-                components.last().unwrap_or(&path).to_string()
+                components
+                    .last()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| collapsed.clone())
             } else {
                 components[n..].join("/")
             }
@@ -92,39 +147,99 @@ fn strip_path(path: &str, strip_count: Option<usize>) -> String {
     }
 }
 
+/// Collapse runs of adjacent <slash> characters into a single <slash>.
+fn collapse_slashes(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    let mut prev_slash = false;
+    for c in path.chars() {
+        if c == '/' {
+            if !prev_slash {
+                out.push(c);
+            }
+            prev_slash = true;
+        } else {
+            out.push(c);
+            prev_slash = false;
+        }
+    }
+    out
+}
+
 /// Read a file into a vector of lines.
-/// Optimized to read the entire file at once and split, avoiding
-/// per-line allocations and system calls.
-pub fn read_file_lines(path: &Path) -> io::Result<Vec<String>> {
+///
+/// Returns the lines and a flag indicating whether the file ended with a
+/// trailing newline (false for an empty file). Optimized to read the entire
+/// file at once and split, avoiding per-line allocations and system calls.
+pub fn read_file_lines(path: &Path) -> io::Result<(Vec<String>, bool)> {
     let content = fs::read_to_string(path)?;
+    let trailing_newline = content.ends_with('\n');
     // Count lines for pre-allocation
     let line_count = content.bytes().filter(|&b| b == b'\n').count() + 1;
     let mut lines = Vec::with_capacity(line_count);
     for line in content.lines() {
         lines.push(line.to_string());
     }
-    Ok(lines)
+    Ok((lines, trailing_newline))
+}
+
+/// Back up a file with the .orig suffix, but only the first time it is seen in
+/// this run (tracked via `backed_up`). This preserves the true original across
+/// a multi-patch run rather than overwriting it with an intermediate version.
+fn backup_once(path: &Path, backed_up: &mut HashSet<PathBuf>) -> io::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let key = path.to_path_buf();
+    if backed_up.contains(&key) {
+        return Ok(());
+    }
+    let backup_path = format!("{}.orig", path.display());
+    fs::copy(path, &backup_path)?;
+    backed_up.insert(key);
+    Ok(())
+}
+
+/// Remove the target file for a deletion patch (new file is /dev/null),
+/// honoring -b backup first. Used instead of writing an empty file.
+pub fn delete_target(
+    target: &Path,
+    config: &PatchConfig,
+    backed_up: &mut HashSet<PathBuf>,
+) -> io::Result<()> {
+    if config.backup {
+        backup_once(target, backed_up)?;
+    }
+    if target.exists() {
+        fs::remove_file(target)?;
+    }
+    Ok(())
 }
 
 /// Write content to the output file, handling backup if needed.
-pub fn write_output(content: &[String], target: &Path, config: &PatchConfig) -> io::Result<()> {
+///
+/// `no_trailing_newline` suppresses the final newline (the patched file's last
+/// line had no newline). `backed_up` tracks which files have already been
+/// backed up this run (so -b preserves the true original). `written_outputs`
+/// tracks which -o output files have already been written, so successive
+/// patched versions of the same -o file are concatenated rather than truncated.
+#[allow(clippy::too_many_arguments)]
+pub fn write_output(
+    content: &[String],
+    target: &Path,
+    config: &PatchConfig,
+    no_trailing_newline: bool,
+    backed_up: &mut HashSet<PathBuf>,
+    written_outputs: &mut HashSet<PathBuf>,
+) -> io::Result<()> {
     // Determine output path
     let output_path = config.output_file.as_deref().unwrap_or(target);
 
-    // Handle backup (-b option)
+    // Handle backup (-b option) once per file.
     if config.backup {
         if config.output_file.is_some() {
-            // When -o is used, backup the output file if it exists
-            if output_path.exists() {
-                let backup_path = format!("{}.orig", output_path.display());
-                fs::copy(output_path, &backup_path)?;
-            }
+            backup_once(output_path, backed_up)?;
         } else {
-            // Backup the target file
-            if target.exists() {
-                let backup_path = format!("{}.orig", target.display());
-                fs::copy(target, &backup_path)?;
-            }
+            backup_once(target, backed_up)?;
         }
     }
 
@@ -135,11 +250,26 @@ pub fn write_output(content: &[String], target: &Path, config: &PatchConfig) -> 
         }
     }
 
+    // For -o output, concatenate successive patched versions of the same file:
+    // truncate on first write, append thereafter.
+    let key = output_path.to_path_buf();
+    let append = config.output_file.is_some() && written_outputs.contains(&key);
+    let file = if append {
+        OpenOptions::new().append(true).open(output_path)?
+    } else {
+        File::create(output_path)?
+    };
+    written_outputs.insert(key);
+
     // Write content using BufWriter for better I/O performance
-    let file = File::create(output_path)?;
     let mut writer = BufWriter::new(file);
-    for line in content {
-        writeln!(writer, "{}", line)?;
+    let last = content.len().saturating_sub(1);
+    for (i, line) in content.iter().enumerate() {
+        if i == last && no_trailing_newline {
+            write!(writer, "{}", line)?;
+        } else {
+            writeln!(writer, "{}", line)?;
+        }
     }
     writer.flush()?;
 

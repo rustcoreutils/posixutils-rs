@@ -19,30 +19,52 @@ pub struct PatchApplier<'a> {
     config: &'a PatchConfig,
     file_lines: Vec<String>,
     offset: i64,
+    /// Whether the resulting file's last line currently has no trailing newline.
+    eof_no_newline: bool,
 }
 
 impl<'a> PatchApplier<'a> {
     /// Create a new applier with the given configuration and file content.
-    pub fn new(config: &'a PatchConfig, file_lines: Vec<String>) -> Self {
+    ///
+    /// `orig_trailing_newline` reflects whether the file being patched ended
+    /// with a newline; this is preserved unless a hunk that reaches end-of-file
+    /// changes it.
+    pub fn new(
+        config: &'a PatchConfig,
+        file_lines: Vec<String>,
+        orig_trailing_newline: bool,
+    ) -> Self {
         Self {
             config,
             file_lines,
             offset: 0,
+            eof_no_newline: !orig_trailing_newline,
         }
     }
 
     /// Apply all hunks from a file patch.
     pub fn apply_patch(&mut self, patch: &mut FilePatch) -> Result<ApplyResult, PatchError> {
+        // Automatic reversal detection (POSIX): if the patch does not apply
+        // forward but the reversed patch does, it was probably already applied
+        // or created in the opposite direction. Prompt (or honor -f / -N).
+        // Skipped when -R was given (already reversed) or -N (ignore applied).
+        if !self.config.reverse && !self.config.ignore_applied && self.detect_reversed(patch) {
+            if self.decide_assume_reverse() {
+                patch.reverse();
+            } else if !self.config.force {
+                return Err(PatchError::ReversedPatch);
+            }
+            // With -f and a "no" decision, fall through and apply forward
+            // (which will reject), matching GNU's "apply anyway" path.
+        }
+
         let mut rejected_hunks: Vec<(usize, Hunk, String)> = Vec::new();
-        let mut had_offset = false;
-        let mut had_fuzz = false;
 
         for (i, hunk) in patch.hunks.iter_mut().enumerate() {
             let hunk_num = i + 1;
             match self.apply_hunk(hunk, hunk_num) {
                 HunkResult::Applied { offset, fuzz } => {
                     if offset != 0 {
-                        had_offset = true;
                         let target_line = (hunk.old_start as i64 + self.offset) as usize;
                         eprintln!(
                             "Hunk #{} succeeded at {} (offset {} line{})",
@@ -53,7 +75,6 @@ impl<'a> PatchApplier<'a> {
                         );
                     }
                     if fuzz > 0 {
-                        had_fuzz = true;
                         eprintln!("Hunk #{} succeeded with fuzz {}", hunk_num, fuzz);
                     }
                     // Update cumulative offset (but not for ed scripts, where line numbers
@@ -70,18 +91,73 @@ impl<'a> PatchApplier<'a> {
                     eprintln!("Hunk #{} already applied", hunk_num);
                 }
                 HunkResult::Rejected { reason } => {
-                    rejected_hunks.push((hunk_num, hunk.clone(), reason));
+                    // Adjust the reject's header line numbers by the cumulative
+                    // offset of previously-applied hunks so they approximate the
+                    // positions in the (partially) patched file (matching GNU).
+                    let mut rej = hunk.clone();
+                    if self.offset != 0 {
+                        let adjust = |start: usize| -> usize {
+                            ((start as i64 + self.offset).max(1)) as usize
+                        };
+                        rej.old_start = adjust(rej.old_start);
+                        rej.new_start = adjust(rej.new_start);
+                    }
+                    rejected_hunks.push((hunk_num, rej, reason));
                 }
             }
         }
+
+        let no_trailing_newline = self.eof_no_newline && !self.file_lines.is_empty();
 
         Ok(ApplyResult {
             rejected_hunks,
             // Use mem::take to avoid cloning the entire file content
             content: std::mem::take(&mut self.file_lines),
-            had_offset,
-            had_fuzz,
+            no_trailing_newline,
         })
+    }
+
+    /// Detect whether the patch appears reversed/already-applied: its first
+    /// content hunk fails to apply forward at its expected position but the
+    /// reversed hunk (the new-side lines) matches there.
+    fn detect_reversed(&self, patch: &FilePatch) -> bool {
+        for hunk in &patch.hunks {
+            let old_lines = hunk.get_old_lines();
+            // Skip pure additions and ed-style hunks (no real context to test).
+            if old_lines.is_empty() || old_lines.iter().all(|s| s.is_empty()) {
+                continue;
+            }
+            let expected_pos = if hunk.old_start == 0 {
+                0
+            } else {
+                (hunk.old_start - 1).min(self.file_lines.len())
+            };
+            let forward_ok = self.lines_match_at(&old_lines, expected_pos);
+            if forward_ok {
+                return false;
+            }
+            let new_lines = hunk.get_new_lines();
+            if !new_lines.is_empty() && self.lines_match_at(&new_lines, expected_pos) {
+                return true;
+            }
+            // First testable hunk did not clearly indicate a reversal.
+            return false;
+        }
+        false
+    }
+
+    /// Decide whether to assume -R for a detected reversed patch. With -f,
+    /// assume yes. Otherwise prompt on the controlling terminal; if no
+    /// terminal is available, default to "no" (preserving the error path).
+    fn decide_assume_reverse(&self) -> bool {
+        if self.config.force {
+            return true;
+        }
+        // No terminal available -> default to "no" (preserves the error path).
+        super::file_ops::prompt_yes_no(
+            "Reversed (or previously applied) patch detected!  Assume -R? [y] ",
+        )
+        .unwrap_or(false)
     }
 
     /// Apply a single hunk.
@@ -99,8 +175,12 @@ impl<'a> PatchApplier<'a> {
 
             let new_lines: Vec<String> =
                 hunk.get_new_lines().iter().map(|s| s.to_string()).collect();
+            let new_len = new_lines.len();
             // Use splice for O(n) instead of multiple insert() which is O(n²)
             self.file_lines.splice(insert_pos..insert_pos, new_lines);
+            if insert_pos + new_len == self.file_lines.len() {
+                self.eof_no_newline = hunk.new_no_newline;
+            }
             return HunkResult::Applied { offset: 0, fuzz: 0 };
         }
 
@@ -279,31 +359,65 @@ impl<'a> PatchApplier<'a> {
 
         // Use splice for O(n) instead of drain() + multiple insert() which is O(n²)
         let remove_end = (pos + delete_count).min(self.file_lines.len());
+        let new_len = new_lines.len();
         self.file_lines.splice(pos..remove_end, new_lines);
+        // If this hunk's new content now ends the file, its newline marker
+        // determines whether the output gets a trailing newline.
+        if pos + new_len == self.file_lines.len() {
+            self.eof_no_newline = hunk.new_no_newline;
+        }
     }
 
     /// Perform changes with #ifdef wrapping.
+    ///
+    /// Adjacent deletes+adds (a change) are emitted as a single
+    /// `#ifndef DEFINE` / old / `#else` / new / `#endif` block, matching the
+    /// conventional `diff -D` / `patch -D` output. Pure additions use
+    /// `#ifdef DEFINE` / new / `#endif`; pure deletions use
+    /// `#ifndef DEFINE` / old / `#endif`.
     fn perform_ifdef_changes(&mut self, hunk: &Hunk, pos: usize, define: &str) {
-        // Pre-allocate: worst case each line becomes 3 lines (ifdef wrapped)
-        let mut result: Vec<String> = Vec::with_capacity(hunk.lines.len() * 3);
+        // Pre-allocate: worst case each line becomes ~2 lines (ifdef wrapped)
+        let mut result: Vec<String> = Vec::with_capacity(hunk.lines.len() * 2);
         let mut delete_count = 0;
 
-        for op in &hunk.lines {
-            match op {
+        let ops = &hunk.lines;
+        let mut i = 0;
+        while i < ops.len() {
+            match &ops[i] {
                 LineOp::Context(s) => {
                     delete_count += 1;
                     result.push(s.clone());
+                    i += 1;
                 }
-                LineOp::Delete(s) => {
-                    delete_count += 1;
-                    result.push(format!("#ifndef {}", define));
-                    result.push(s.clone());
-                    result.push(format!("#endif /* !{} */", define));
-                }
-                LineOp::Add(s) => {
-                    result.push(format!("#ifdef {}", define));
-                    result.push(s.clone());
-                    result.push(format!("#endif /* {} */", define));
+                LineOp::Delete(_) | LineOp::Add(_) => {
+                    // Gather a run of consecutive deletes followed by adds.
+                    let mut dels: Vec<String> = Vec::new();
+                    while let Some(LineOp::Delete(s)) = ops.get(i) {
+                        dels.push(s.clone());
+                        delete_count += 1;
+                        i += 1;
+                    }
+                    let mut adds: Vec<String> = Vec::new();
+                    while let Some(LineOp::Add(s)) = ops.get(i) {
+                        adds.push(s.clone());
+                        i += 1;
+                    }
+
+                    if !dels.is_empty() && !adds.is_empty() {
+                        result.push(format!("#ifndef {}", define));
+                        result.extend(dels);
+                        result.push("#else".to_string());
+                        result.extend(adds);
+                        result.push("#endif".to_string());
+                    } else if !adds.is_empty() {
+                        result.push(format!("#ifdef {}", define));
+                        result.extend(adds);
+                        result.push("#endif".to_string());
+                    } else if !dels.is_empty() {
+                        result.push(format!("#ifndef {}", define));
+                        result.extend(dels);
+                        result.push("#endif".to_string());
+                    }
                 }
             }
         }

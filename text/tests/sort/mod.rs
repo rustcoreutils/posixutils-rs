@@ -71,7 +71,9 @@ fn test_n8a() {
 
 #[test]
 fn test_n8b() {
-    sort_test(&["-n", "-k1,1"], ".0b\n.0a\n", ".0b\n.0a\n", 0, "");
+    // Numeric keys tie (both 0); GNU breaks the tie with a byte-wise
+    // whole-line last-resort compare, so .0a precedes .0b.
+    sort_test(&["-n", "-k1,1"], ".0b\n.0a\n", ".0a\n.0b\n", 0, "");
 }
 
 #[test]
@@ -81,22 +83,27 @@ fn test_n9a() {
 
 #[test]
 fn test_n9b() {
-    sort_test(&["-n", "-k1,1"], ".000b\n.000a\n", ".000b\n.000a\n", 0, "");
+    // Numeric tie broken by byte-wise whole-line last-resort (GNU behavior).
+    sort_test(&["-n", "-k1,1"], ".000b\n.000a\n", ".000a\n.000b\n", 0, "");
 }
 
 #[test]
 fn test_n10a() {
-    sort_test(&["-n", "-k1,1"], ".00a\n.000b\n", ".00a\n.000b\n", 0, "");
+    // Numeric tie (both 0) -> byte-wise whole-line last-resort: ".00a" has
+    // 'a' where ".000b" has '0' at index 3, and '0' < 'a', so ".000b" first.
+    sort_test(&["-n", "-k1,1"], ".00a\n.000b\n", ".000b\n.00a\n", 0, "");
 }
 
 #[test]
 fn test_n10b() {
-    sort_test(&["-n", "-k1,1"], ".00b\n.000a\n", ".00b\n.000a\n", 0, "");
+    // Numeric tie -> byte-wise whole-line last-resort (GNU): ".000a" first.
+    sort_test(&["-n", "-k1,1"], ".00b\n.000a\n", ".000a\n.00b\n", 0, "");
 }
 
 #[test]
 fn test_n11a() {
-    sort_test(&["-n", "-k1,1"], ".01a\n.010\n", ".01a\n.010\n", 0, "");
+    // Numeric tie -> byte-wise whole-line last-resort (GNU): ".010" < ".01a".
+    sort_test(&["-n", "-k1,1"], ".01a\n.010\n", ".010\n.01a\n", 0, "");
 }
 
 #[test]
@@ -111,13 +118,8 @@ fn test_02a() {
 
 #[test]
 fn test_02b() {
-    sort_test(
-        &["-c"],
-        "A\nC\nB\n",
-        "",
-        1,
-        "The order of the lines is not correct on line 2:`C`\n",
-    );
+    // GNU -c reports the first out-of-order line as "FILE:LINE: disorder: TEXT".
+    sort_test(&["-c"], "A\nC\nB\n", "", 1, "sort: -:3: disorder: B\n");
 }
 
 #[test]
@@ -132,18 +134,14 @@ fn test_02d() {
 
 #[test]
 fn test_02e() {
-    sort_test(
-        &["-C"],
-        "A\nC\nB\n",
-        "",
-        1,
-        "The order of the lines is not correct\n",
-    );
+    // -C sets exit status only; unlike -c it emits no diagnostic.
+    sort_test(&["-C"], "A\nC\nB\n", "", 1, "");
 }
 
 #[test]
 fn test_02m() {
-    sort_test(&["-cu"], "A\nA\n", "", 1, "Duplicate key was found! `A`\n");
+    // -cu treats equal adjacent keys as disorder (GNU message format).
+    sort_test(&["-cu"], "A\nA\n", "", 1, "sort: -:2: disorder: A\n");
 }
 
 #[test]
@@ -153,24 +151,13 @@ fn test_02n() {
 
 #[test]
 fn test_02o() {
-    sort_test(
-        &["-cu"],
-        "A\nB\nB\n",
-        "",
-        1,
-        "Duplicate key was found! `B`\n",
-    );
+    sort_test(&["-cu"], "A\nB\nB\n", "", 1, "sort: -:3: disorder: B\n");
 }
 
 #[test]
 fn test_02p() {
-    sort_test(
-        &["-cu"],
-        "B\nA\nB\n",
-        "",
-        1,
-        "Duplicate key was found! `B`\n",
-    );
+    // First disorder is the out-of-order A on line 2 (A < B).
+    sort_test(&["-cu"], "B\nA\nB\n", "", 1, "sort: -:2: disorder: A\n");
 }
 
 #[test]
@@ -190,8 +177,9 @@ fn test_03c() {
 
 #[test]
 fn test_03d() {
-    // Fail with a diagnostic when -k specifies field == 0.
-    sort_test(&["-k0", "-"], "", "", 1, "the key can't be zero.\n");
+    // Fail with a diagnostic when -k specifies field == 0. Operand errors use
+    // exit status 2 (status 1 is reserved for -c/-C detecting disorder).
+    sort_test(&["-k0", "-"], "", "", 2, "sort: the key can't be zero.\n");
 }
 
 #[test]
@@ -289,8 +277,8 @@ fn test_07f() {
         &["-n", "-k1.3,1.1", "-"],
         "a 2\nb 1\n",
         "",
-        1,
-        "keys fields with end position before start!\n",
+        2,
+        "sort: keys fields with end position before start!\n",
     );
 }
 
@@ -301,8 +289,8 @@ fn test_08a() {
         &["-k", "2.,3", "-"],
         "",
         "",
-        1,
-        "cannot parse integer from empty string\n",
+        2,
+        "sort: cannot parse integer from empty string\n",
     );
 }
 
@@ -313,8 +301,8 @@ fn test_08b() {
         &["-k", "2,", "-"],
         "",
         "",
-        1,
-        "cannot parse integer from empty string\n",
+        2,
+        "sort: cannot parse integer from empty string\n",
     );
 }
 
@@ -612,6 +600,102 @@ fn test_files_sort_2() {
             0,
             "",
         );
+}
+
+#[test]
+fn test_merge_kway() {
+    // -m interleaves two presorted inputs (true k-way merge), vs GNU.
+    sort_test(
+        &[
+            "-m",
+            "tests/assets/sort_merge_a.txt",
+            "tests/assets/sort_merge_b.txt",
+        ],
+        "",
+        "1\n2\n3\n4\n5\n6\n",
+        0,
+        "",
+    );
+}
+
+#[test]
+fn test_merge_unique() {
+    // -m -u merges and drops duplicate keys across files (GNU: a b c d e).
+    sort_test(
+        &[
+            "-m",
+            "-u",
+            "tests/assets/sort_merge_c.txt",
+            "tests/assets/sort_merge_d.txt",
+        ],
+        "",
+        "a\nb\nc\nd\ne\n",
+        0,
+        "",
+    );
+}
+
+#[test]
+fn test_large_int_numeric() {
+    // -n compares large integers exactly (no f64 precision loss).
+    sort_test(
+        &["-n"],
+        "100000000000000000000\n99999999999999999999\n",
+        "99999999999999999999\n100000000000000000000\n",
+        0,
+        "",
+    );
+}
+
+#[test]
+fn test_numeric_negatives_blanks() {
+    // -n: leading blanks stripped, negatives ordered correctly (vs GNU).
+    sort_test(&["-n"], "  -5\n-10\n3\n  2\n", "-10\n  -5\n  2\n3\n", 0, "");
+}
+
+#[test]
+fn test_multikey_three() {
+    // All -k keys (>=3) are honored, each applied in order.
+    sort_test(
+        &["-k1,1", "-k2,2", "-k3,3"],
+        "3 2 1\n3 1 2\n3 1 1\n",
+        "3 1 1\n3 1 2\n3 2 1\n",
+        0,
+        "",
+    );
+}
+
+#[test]
+fn test_global_b_wholeline() {
+    // A global -b (no -k) applies to the implicit whole-line key, so leading
+    // blanks are ignored: "a" sorts before "  b" (vs GNU).
+    sort_test(&["-b"], "  b\na\n", "a\n  b\n", 0, "");
+}
+
+#[test]
+fn test_global_t_accepted() {
+    // A global -t without -k is accepted (no error) and sorts whole lines.
+    sort_test(&["-t:"], "b\na\n", "a\nb\n", 0, "");
+}
+
+#[test]
+fn test_dict_numeric_combo_accepted() {
+    // POSIX does not declare -d and -n mutually exclusive; accept the combo.
+    sort_test(&["-d", "-n"], "b1\na2\n", "a2\nb1\n", 0, "");
+}
+
+#[test]
+fn test_numeric_ignore_combo_accepted() {
+    // POSIX does not declare -n and -i mutually exclusive; accept the combo.
+    sort_test(&["-n", "-i"], "2\n1\n", "1\n2\n", 0, "");
+}
+
+#[test]
+fn test_default_sep_tab_and_space() {
+    // The default field separator treats both SPACE and TAB as blanks, and a
+    // field includes its leading blanks: under -k2, "\tb" (tab) sorts before
+    // " a" (space) because tab (0x09) < space (0x20). Matches GNU.
+    sort_test(&["-k2"], "y a\nx\tb\n", "x\tb\ny a\n", 0, "");
 }
 
 #[test]

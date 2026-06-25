@@ -2099,32 +2099,32 @@ The scaffolding (option parsing, `-c/-C/-m/-o/-u/-b/-d/-f/-i/-n/-r/-t/-k`) is pr
 
 #### Critical
 
-- [ ] **#1 — No `strcoll`/locale collation — default sort is wrong-order.** `text/sort.rs:579-587,643-652`. `compare_lines`/`compare_key` use `str::cmp` / `to_uppercase().cmp()`. Spec requires the current locale's collating sequence (`strcoll`). Wrong in any non-C locale. Fix: `libc::strcoll` + whole-line byte tiebreak.
-- [ ] **#2 — `-m` does not merge — it concatenates.** `text/sort.rs:884-898`. `merge_files` `io::copy`s each reader sequentially with no interleave. Presorted inputs come out unordered. Fix: k-way merge using the comparator.
-- [ ] **#3 — `-u` unique logic broken for no-key and 3+-key cases.** `text/sort.rs:784-818`. The `duplicates` Vec relies on the comparator being called on adjacent equal pairs (not guaranteed post-sort), and ≥3 keys are ignored so dedup only fires when the first two keys are equal. Fix: compare adjacent lines after sorting.
-- [ ] **#4 — `-C` emits a diagnostic to stderr.** `text/sort.rs:825-832,996`. Spec: `-C` is like `-c` but with no stderr warning; test `test_02e` asserts non-empty stderr. Fix: suppress stderr for `-C`.
+- [x] **#1 — No `strcoll`/locale collation — default sort is wrong-order.** `text/sort.rs:579-587,643-652`. `compare_lines`/`compare_key` use `str::cmp` / `to_uppercase().cmp()`. Spec requires the current locale's collating sequence (`strcoll`). Wrong in any non-C locale. Fix: `libc::strcoll` + whole-line byte tiebreak. FIXED (Phase 12): default/key text comparison uses `plib::locale::strcoll`; whole-line last-resort is strcoll-then-byte ("as if no options but -r"), verified vs GNU in C and en_US.utf8.
+- [x] **#2 — `-m` does not merge — it concatenates.** `text/sort.rs:884-898`. `merge_files` `io::copy`s each reader sequentially with no interleave. Presorted inputs come out unordered. Fix: k-way merge using the comparator. FIXED (Phase 12): `-m` performs a true stable k-way merge.
+- [x] **#3 — `-u` unique logic broken for no-key and 3+-key cases.** `text/sort.rs:784-818`. The `duplicates` Vec relies on the comparator being called on adjacent equal pairs (not guaranteed post-sort), and ≥3 keys are ignored so dedup only fires when the first two keys are equal. Fix: compare adjacent lines after sorting. FIXED (Phase 12): `-u` dedupes by comparing adjacent sorted lines on the key comparator; works for zero and 3+ keys.
+- [x] **#4 — `-C` emits a diagnostic to stderr.** `text/sort.rs:825-832,996`. Spec: `-C` is like `-c` but with no stderr warning; test `test_02e` asserts non-empty stderr. Fix: suppress stderr for `-C`. FIXED (Phase 12): `-C` emits no stderr; sets exit status only.
 
 #### Major
 
-- [ ] **#5 — `-b` without `-k` rejected as an error.** `text/sort.rs:97-99`. POSIX allows global `-b`; the impl errors "Options '-b' can be used together with '-k'". Fix: apply global `-b` to all keys incl. the implicit whole-line key.
-- [ ] **#6 — `-t` without `-k` rejected as an error.** `text/sort.rs:101-103`. POSIX allows global `-t char`.
-- [ ] **#7 — `-n` uses `f64`; wrong tokenizer.** `text/sort.rs:287-334`. Accepts `*` (line 292); no leading-blank strip; `f64` loses precision >2^53; ignores `LC_NUMERIC` radix/thousands. Fix: integer/arbitrary-precision compare + locale-aware tokenizer.
-- [ ] **#8 — Only two `-k` keys processed; the rest silently ignored.** `text/sort.rs:771-795`. POSIX requires ≥9 `-k` occurrences. Fix: iterate all keys.
-- [ ] **#9 — No whole-line tiebreak when all specified keys compare equal.** `text/sort.rs:784-796`. Spec requires a final whole-line comparison (with `-r` still in effect).
-- [ ] **#10 — `-c`/`-C` check uses sort-then-diff, not a sequential scan.** `text/sort.rs:825-843`. `find_first_difference` compares sorted vs original by index, not the first out-of-order input line.
-- [ ] **#11 — Inconsistent trailing-newline handling between stdout (`println!`+`join`) and `-o`/`-m` (`writeln!`) paths.** `text/sort.rs:851-858`. Agrees for well-formed input but is fragile.
+- [x] **#5 — `-b` without `-k` rejected as an error.** `text/sort.rs:97-99`. POSIX allows global `-b`; the impl errors "Options '-b' can be used together with '-k'". Fix: apply global `-b` to all keys incl. the implicit whole-line key. FIXED (Phase 12): global `-b` accepted without `-k`.
+- [x] **#6 — `-t` without `-k` rejected as an error.** `text/sort.rs:101-103`. POSIX allows global `-t char`. FIXED (Phase 12): global `-t char` accepted without `-k`.
+- [x] **#7 — `-n` uses `f64`; wrong tokenizer.** `text/sort.rs:287-334`. Accepts `*` (line 292); no leading-blank strip; `f64` loses precision >2^53; ignores `LC_NUMERIC` radix/thousands. Fix: integer/arbitrary-precision compare + locale-aware tokenizer. FIXED (Phase 12): `-n` rejects `*`, strips leading blanks, arbitrary-precision compare; locale radix via localeconv.
+- [x] **#8 — Only two `-k` keys processed; the rest silently ignored.** `text/sort.rs:771-795`. POSIX requires ≥9 `-k` occurrences. Fix: iterate all keys. FIXED (Phase 12): all `-k` keys (>=9) processed in order.
+- [x] **#9 — No whole-line tiebreak when all specified keys compare equal.** `text/sort.rs:784-796`. Spec requires a final whole-line comparison (with `-r` still in effect). FIXED (Phase 12): whole-line last-resort tiebreak when all keys are equal.
+- [x] **#10 — `-c`/`-C` check uses sort-then-diff, not a sequential scan.** `text/sort.rs:825-843`. `find_first_difference` compares sorted vs original by index, not the first out-of-order input line. FIXED (Phase 12): `-c`/`-C` sequential scan reports the first out-of-order line; `-c` message matches GNU.
+- [x] **#11 — Inconsistent trailing-newline handling between stdout (`println!`+`join`) and `-o`/`-m` (`writeln!`) paths.** `text/sort.rs:851-858`. Agrees for well-formed input but is fragile. FIXED (Phase 12): unified `writeln!` per line across stdout/`-o`/`-m`.
 
 #### Minor
 
-- [ ] **#12 — `-i` filter is ASCII-only, not LC_CTYPE.** `text/sort.rs:369-373`. `is_ascii_graphic()` excludes printable non-ASCII and strips space/tab.
-- [ ] **#13 — `-d` uses Unicode `is_whitespace()`/`is_alphanumeric()`, not LC_CTYPE.** `text/sort.rs:350-354`.
-- [ ] **#14 — Default blank separator splits only on ASCII space, not tab.** `text/sort.rs:511`. `<blank>` includes horizontal tab.
-- [ ] **#15 — `update_range_field` merges modifiers across start/end.** `text/sort.rs:154-176`. A modifier on one half propagates to both.
-- [ ] **#16–#18 — `-d`/`-i`, `-d`/`-n`, `-n`/`-i` rejected as mutually exclusive** (`text/sort.rs:82-94`) though POSIX does not declare them so (over-restrictive).
-- [ ] **#19 — `usize::MAX - 1` magic sentinel for end-of-field.** `text/sort.rs:247-252,457-464` (fragile).
-- [ ] **#20 — `-o`/`-m` does not guard same-file overwrite during read.** `text/sort.rs:847-855`. Under `-m`, `File::create` truncates an input that is also the output before reading.
+- [x] **#12 — `-i` filter is ASCII-only, not LC_CTYPE.** `text/sort.rs:369-373`. `is_ascii_graphic()` excludes printable non-ASCII and strips space/tab. FIXED (Phase 12): `-i` uses LC_CTYPE printability.
+- [x] **#13 — `-d` uses Unicode `is_whitespace()`/`is_alphanumeric()`, not LC_CTYPE.** `text/sort.rs:350-354`. FIXED (Phase 12): `-d` keeps blank+alphanumeric per LC_CTYPE.
+- [x] **#14 — Default blank separator splits only on ASCII space, not tab.** `text/sort.rs:511`. `<blank>` includes horizontal tab. FIXED (Phase 12): default separator treats SPACE and TAB as <blank>.
+- [x] **#15 — `update_range_field` merges modifiers across start/end.** `text/sort.rs:154-176`. A modifier on one half propagates to both. FIXED (Phase 12): start/end key modifiers parsed independently.
+- [x] **#16–#18 — `-d`/`-i`, `-d`/`-n`, `-n`/`-i` rejected as mutually exclusive** (`text/sort.rs:82-94`) though POSIX does not declare them so (over-restrictive). FIXED (Phase 12): the three false mutual-exclusions removed (POSIX does not declare them exclusive; GNU rejects `-d -n`/`-n -i` — a deliberate POSIX-conformant divergence).
+- [x] **#19 — `usize::MAX - 1` magic sentinel for end-of-field.** `text/sort.rs:247-252,457-464` (fragile). FIXED (Phase 12): the `usize::MAX-1` sentinel replaced with `Option<usize>`.
+- [x] **#20 — `-o`/`-m` does not guard same-file overwrite during read.** `text/sort.rs:847-855`. Under `-m`, `File::create` truncates an input that is also the output before reading. FIXED (Phase 12): inputs read fully before the `-o`/`-m` output file is opened.
 - [x] **#21 — `-` operand only honored as the sole argument.** `text/sort.rs:955-956`. FIXED (Phase 2): each operand is opened via `plib::io::input_stream_dashed`, so `-` reads stdin at any position.
-- [ ] **#22 — All errors exit 1, not >1.** `text/sort.rs:995`. Spec reserves >1 for errors, 1 for `-c`/`-C` disorder.
+- [x] **#22 — All errors exit 1, not >1.** `text/sort.rs:995`. Spec reserves >1 for errors, 1 for `-c`/`-C` disorder. FIXED (Phase 12): argument/operand errors exit 2; exit 1 reserved for `-c`/`-C` disorder.
 
 ### Detailed conformance matrix
 
@@ -2222,16 +2222,16 @@ The scaffolding (option parsing, `-c/-C/-m/-o/-u/-b/-d/-f/-i/-n/-r/-t/-k`) is pr
 ### Test coverage signal
 
 Not covered:
-- [ ] `sort -b` / `sort -t :` global (without `-k`) — should succeed (#5,#6)
-- [ ] three or more `-k` keys (#8)
-- [ ] locale collation via strcoll (#1)
-- [ ] `-m` interleaved merge (#2)
-- [ ] numeric sort with locale thousands/radix; large integers >2^53 (#7)
-- [ ] `-C` silence (#4)
-- [ ] whole-line tiebreak (#9)
-- [ ] `-` as non-sole operand (#21)
-- [ ] `-o` same as input file safety (#20)
-- [ ] exit code >1 on I/O error (#22)
+- [x] `sort -b` / `sort -t :` global (without `-k`) — should succeed (#5,#6)
+- [x] three or more `-k` keys (#8)
+- [x] locale collation via strcoll (#1)
+- [x] `-m` interleaved merge (#2)
+- [x] numeric sort with locale thousands/radix; large integers >2^53 (#7)
+- [x] `-C` silence (#4)
+- [x] whole-line tiebreak (#9)
+- [x] `-` as non-sole operand (#21)
+- [x] `-o` same as input file safety (#20)
+- [x] exit code >1 on I/O error (#22)
 
 ### Suggested PR groupings
 

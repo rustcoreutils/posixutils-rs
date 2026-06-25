@@ -8,15 +8,15 @@
 //
 
 use std::cmp::Ordering;
-
-use std::io::Read;
+use std::ffi::CStr;
 use std::{
     fs::File,
-    io::{self, BufRead, BufWriter, Error, Write},
-    path::{Path, PathBuf},
+    io::{self, BufRead, BufWriter, Write},
+    path::PathBuf,
 };
 
 use plib::io::input_stream_dashed;
+use plib::locale;
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
@@ -29,9 +29,9 @@ struct Args {
     check_order: bool,
 
     #[arg(short = 'C', help = gettext("Same as -c, but without warning message for disorder or duplicate keys"))]
-    check_order_without_war_mess: bool,
+    check_order_silent: bool,
 
-    #[arg(short = 'm', help = gettext("Merge only; the input file shall be assumed to be already sorted"))]
+    #[arg(short = 'm', help = gettext("Merge only; the input files shall be assumed to be already sorted"))]
     merge_only: bool,
 
     #[arg(short = 'o', help = gettext("Specify the name of an output file to be used instead of the standard output"))]
@@ -70,934 +70,712 @@ struct Args {
 
 impl Args {
     fn validate_args(&self) -> Result<(), String> {
-        // Check if conflicting options are used together
-        if self.check_order && self.merge_only {
-            return Err("Options '-c' and '-m' cannot be used together".to_string());
+        // POSIX: -c and -C cannot be combined; -c/-C cannot be combined with -m.
+        if self.check_order && self.check_order_silent {
+            return Err("options '-c' and '-C' cannot be used together".to_string());
         }
-
-        // Check if conflicting options are used together
-        if self.check_order && self.check_order_without_war_mess {
-            return Err("Options '-c' and '-C' cannot be used together".to_string());
+        if (self.check_order || self.check_order_silent) && self.merge_only {
+            return Err("options '-c'/'-C' and '-m' cannot be used together".to_string());
         }
-
-        // Check if conflicting options are used together
-        if self.dictionary_order && self.ignore_nonprintable {
-            return Err("Options '-d' and '-i' cannot be used together".to_string());
-        }
-
-        // Check if conflicting options are used together
-        if self.dictionary_order && self.numeric_sort {
-            return Err("Options '-d' and '-n' cannot be used together".to_string());
-        }
-
-        // Check if conflicting options are used together
-        if self.numeric_sort && self.ignore_nonprintable {
-            return Err("Options '-n' and '-i' cannot be used together".to_string());
-        }
-
-        // Check if conflicting options are used together
-        if self.ignore_leading_blanks && self.key_definition.is_empty() {
-            return Err("Options '-b' can be used together with '-k' ".to_string());
-        }
-        // Check if conflicting options are used together
-        if self.field_separator.is_some() && self.key_definition.is_empty() {
-            return Err("Options '-t' can be used together with '-k' ".to_string());
-        }
-
         Ok(())
     }
 }
 
-/// A struct representing a range field with various sorting and comparison options.
-#[derive(Clone, Default)]
-struct RangeField {
-    /// The number of the field to be considered in the range.
-    field_number: usize,
-
-    /// The position of the first character in the field to start comparison.
-    first_character: usize,
-
-    /// A boolean flag to indicate if the field should be sorted numerically.
-    numeric_sort: bool,
-
-    /// A boolean flag to indicate if leading blanks should be ignored during comparison.
-    ignore_leading_blanks: bool,
-
-    /// A boolean flag to indicate if the sort order should be reversed.
+/// One parsed `-k` key (or the implicit whole-line key).
+///
+/// Field and character positions are 1-based, matching the `-k F.C` notation.
+#[derive(Clone)]
+struct KeySpec {
+    start_field: usize,
+    start_char: usize,
+    /// `None` means "to end of line" (no end position given).
+    end_field: Option<usize>,
+    /// `None` means "to end of field". Only meaningful when `end_field` is set.
+    end_char: Option<usize>,
+    numeric: bool,
     reverse: bool,
-
-    /// A boolean flag to indicate if non-printable characters should be ignored during comparison.
-    ignore_nonprintable: bool,
-
-    /// A boolean flag to indicate if the case should be folded (case-insensitive comparison).
     fold_case: bool,
-
-    /// A boolean flag to indicate if the field should be compared in dictionary order
-    /// (considers only alphanumeric characters and blanks).
-    dictionary_order: bool,
+    dictionary: bool,
+    ignore_nonprintable: bool,
+    /// Skip leading blanks at the start position (`b` on the start key, or global `-b`).
+    start_blanks: bool,
+    /// Skip leading blanks at the end position (`b` on the end key, or global `-b`).
+    end_blanks: bool,
 }
 
-/// Updates two RangeField objects based on their comparison options.
-///
-/// This function takes two RangeField objects, compares their fields, and updates the fields
-/// according to the comparison options. If any of the comparison options (`dictionary_order`,
-/// `fold_case`, `ignore_nonprintable`, or `numeric_sort`) is true in either of the objects,
-/// it sets the same option to true in both objects.
-///
-/// # Arguments
-///
-/// * `field1` - The first RangeField object to compare and update.
-/// * `field2` - The second RangeField object to compare and update.
-///
-/// # Returns
-///
-/// A tuple containing the updated RangeField objects.
-///
-fn update_range_field(mut field1: RangeField, mut field2: RangeField) -> (RangeField, RangeField) {
-    if field1.dictionary_order || field2.dictionary_order {
-        field1.dictionary_order = true;
-        field2.dictionary_order = true;
-    }
-
-    if field1.fold_case || field2.fold_case {
-        field1.fold_case = true;
-        field2.fold_case = true;
-    }
-
-    if field1.ignore_nonprintable || field2.ignore_nonprintable {
-        field1.ignore_nonprintable = true;
-        field2.ignore_nonprintable = true;
-    }
-
-    if field1.numeric_sort || field2.numeric_sort {
-        field1.numeric_sort = true;
-        field2.numeric_sort = true;
-    }
-
-    (field1, field2)
+/// A precomputed numeric value, retained with arbitrary precision so values
+/// beyond `2^53` compare exactly (unlike an `f64`).
+#[derive(Clone)]
+struct ParsedNum {
+    negative: bool,
+    /// Integer digits with leading zeros stripped.
+    int: Vec<char>,
+    /// Fraction digits with trailing zeros stripped.
+    frac: Vec<char>,
+    is_zero: bool,
 }
 
-/// Compares two RangeField objects based on their field numbers and first characters.
-///
-/// This function takes references to two RangeField objects and compares them based on their
-/// field numbers and first characters. If the field number of the first object is less than
-/// the field number of the second object, it returns true. If the field numbers are equal,
-/// it compares the first characters, returning true if the first character of the first object
-/// is less than or equal to the first character of the second object. Otherwise, it returns false.
-///
-/// # Arguments
-///
-/// * `field1` - A reference to the first RangeField object to compare.
-/// * `field2` - A reference to the second RangeField object to compare.
-///
-/// # Returns
-///
-/// A boolean value indicating whether the first RangeField object is less than or equal to
-/// the second RangeField object based on their field numbers and first characters.
-///
-fn compare_range_fields(field1: &RangeField, field2: &RangeField) -> bool {
-    match field1.field_number.cmp(&field2.field_number) {
-        Ordering::Less => true,
-        Ordering::Equal => field1.first_character <= field2.first_character,
-        Ordering::Greater => false,
-    }
+/// A precomputed comparison value for one key.
+#[derive(Clone)]
+enum KeyVal {
+    Num(ParsedNum),
+    Text(String),
 }
 
-/// Trims and concatenates substrings from a vector of strings based on a specified range.
-///
-/// This function takes a vector of string slices and a key range, then extracts and concatenates
-/// the substrings from the specified range. The range is defined by a tuple of `RangeField`
-/// structs, where the first element defines the start of the range, and the optional second element
-/// defines the end of the range.
-///
-/// # Arguments
-///
-/// * `line` - A vector of string slices representing the fields to be processed.
-/// * `key_range` - A tuple containing two elements:
-///     * The first `RangeField` specifies the starting field and character position.
-///     * An optional `RangeField` that specifies the ending field and character position.
-///
-/// # Returns
-///
-/// A `String` that contains the concatenated result of the specified range of substrings.
-///
-fn cut_line_by_range(line: Vec<&str>, key_range: &(RangeField, Option<RangeField>)) -> String {
-    let mut result = String::new();
+/// A line plus its precomputed per-key comparison values.
+struct Record {
+    line: String,
+    keys: Vec<KeyVal>,
+}
 
-    let start_field = key_range.0.field_number;
-    let start_char = key_range.0.first_character;
-
-    let end_field = match &key_range.1 {
-        Some(range) => range.field_number,
-        None => line.len() - 1,
-    };
-    let end_char = key_range.1.as_ref().map(|range| range.first_character);
-
-    for (i, field) in line.iter().skip(start_field).enumerate() {
-        let i = i + start_field;
-        if i >= start_field && i <= end_field {
-            let start = if i == start_field {
-                if key_range.0.ignore_leading_blanks {
-                    start_char + (field.len() - field.trim_start().len())
-                } else {
-                    start_char
-                }
+/// Locale-driven numeric formatting: (decimal point, optional thousands separator).
+fn numeric_conv() -> (char, Option<char>) {
+    // SAFETY: localeconv returns a pointer to a static, locale-owned struct.
+    unsafe {
+        let lc = libc::localeconv();
+        if lc.is_null() {
+            return ('.', None);
+        }
+        let decimal = {
+            let dp = (*lc).decimal_point;
+            if dp.is_null() {
+                '.'
             } else {
-                0
-            };
-            let mut end = if i == end_field {
-                if let Some(char) = end_char {
-                    if char == usize::MAX - 1 {
-                        field.len() - 1
-                    } else if key_range.clone().1.unwrap().ignore_leading_blanks {
-                        char + (field.len() - field.trim_start().len())
-                    } else {
-                        char
-                    }
-                } else {
-                    field.len() - 1
-                }
-            } else {
-                field.len() - 1
-            };
-            if end >= field.len() {
-                end = field.len() - 1;
+                CStr::from_ptr(dp)
+                    .to_str()
+                    .ok()
+                    .and_then(|s| s.chars().next())
+                    .unwrap_or('.')
             }
-
-            result.push_str(&field[start..=end]);
-        }
+        };
+        let thousands = {
+            let ts = (*lc).thousands_sep;
+            if ts.is_null() {
+                None
+            } else {
+                CStr::from_ptr(ts)
+                    .to_str()
+                    .ok()
+                    .and_then(|s| s.chars().next())
+            }
+        };
+        (decimal, thousands)
     }
-
-    result
 }
 
-/// Extracts a number from a string, ignoring other characters.
-///
-/// This function processes an input string and extracts the first sequence of characters that can
-/// be part of a number (including digits, a minus sign, a decimal point, and an asterisk). If no
-/// such sequence is found, it returns `None`.
-///
-/// # Arguments
-///
-/// * `input` - A string slice (`&str`) containing the input to be processed.
-///
-/// # Returns
-///
-/// An `Option<String>` containing the extracted number if found, or `None` if no numeric sequence
-/// is found.
-///
-fn numeric_sort_filter(input: &str) -> Option<String> {
-    let mut result = String::new();
-    let mut found_number = false;
+fn is_blank(c: char) -> bool {
+    locale::isblank(c)
+}
 
-    for c in input.chars() {
-        if c.is_ascii_digit() || c == '-' || c == '.' || c == '*' {
-            found_number = true;
-            result.push(c);
-        } else if found_number {
-            return Some(result);
+/// Offset (in chars) of the start of field `field` (1-based), including any
+/// leading blanks belonging to the field (default separator) or following the
+/// preceding separator (explicit `-t`).
+fn field_start(chars: &[char], field: usize, sep: Option<char>) -> usize {
+    let len = chars.len();
+    let mut i = 0;
+    match sep {
+        Some(t) => {
+            for _ in 1..field {
+                while i < len && chars[i] != t {
+                    i += 1;
+                }
+                if i < len {
+                    i += 1;
+                }
+            }
+        }
+        None => {
+            for _ in 1..field {
+                while i < len && is_blank(chars[i]) {
+                    i += 1;
+                }
+                while i < len && !is_blank(chars[i]) {
+                    i += 1;
+                }
+            }
         }
     }
+    i
+}
 
-    if found_number {
-        Some(result)
+/// Offset (in chars) just past the non-blank content of field `field`.
+fn content_end(chars: &[char], field: usize, sep: Option<char>) -> usize {
+    let len = chars.len();
+    let mut i = field_start(chars, field, sep);
+    match sep {
+        Some(t) => {
+            while i < len && chars[i] != t {
+                i += 1;
+            }
+        }
+        None => {
+            while i < len && is_blank(chars[i]) {
+                i += 1;
+            }
+            while i < len && !is_blank(chars[i]) {
+                i += 1;
+            }
+        }
+    }
+    i
+}
+
+/// Extract the raw key substring described by `key` from `chars`.
+fn extract_key(chars: &[char], key: &KeySpec, sep: Option<char>) -> String {
+    let len = chars.len();
+
+    let mut start = field_start(chars, key.start_field, sep);
+    if key.start_blanks {
+        while start < len && is_blank(chars[start]) {
+            start += 1;
+        }
+    }
+    start = (start + key.start_char - 1).min(len);
+
+    let end = match key.end_field {
+        None => len,
+        Some(ef) => match key.end_char {
+            None => content_end(chars, ef, sep),
+            Some(ec) => {
+                let mut base = field_start(chars, ef, sep);
+                if key.end_blanks {
+                    while base < len && is_blank(chars[base]) {
+                        base += 1;
+                    }
+                }
+                (base + ec).min(len)
+            }
+        },
+    };
+
+    if end <= start {
+        String::new()
     } else {
-        None
+        chars[start..end].iter().collect()
     }
 }
 
-/// Compares two strings numerically, extracting numbers and performing a numeric comparison.
-///
-/// This function extracts the first numeric sequence from each input string using
-/// `numeric_sort_filter` and then compares these sequences as floating-point numbers (`f64`).
-/// If no valid numeric sequence is found, it defaults to comparing the strings lexicographically.
-///
-/// # Arguments
-///
-/// * `line1` - A string slice (`&str`) representing the first input string.
-/// * `line2` - A string slice (`&str`) representing the second input string.
-///
-/// # Returns
-///
-/// An `Ordering` value (`Ordering::Less`, `Ordering::Greater`, or `Ordering::Equal`) indicating
-/// the result of the comparison:
-/// * `Ordering::Less` if the first number is less than the second.
-/// * `Ordering::Greater` if the first number is greater than the second.
-/// * `Ordering::Equal` if the numbers are equal or if both strings lack numeric sequences and are
-///   equal lexicographically.
-///
-fn compare_numeric(line1: &str, line2: &str) -> Ordering {
-    let line1 = numeric_sort_filter(line1).unwrap_or("0".to_string());
-    let line2 = numeric_sort_filter(line2).unwrap_or("0".to_string());
-    let a_num = line1.parse::<f64>().ok();
-    let b_num = line2.parse::<f64>().ok();
-
-    a_num.partial_cmp(&b_num).unwrap_or(Ordering::Equal)
+/// Apply dictionary (`-d`), ignore-nonprintable (`-i`), and fold (`-f`)
+/// transforms, per `LC_CTYPE`.
+fn transform_text(s: &str, key: &KeySpec) -> String {
+    if !key.dictionary && !key.ignore_nonprintable && !key.fold_case {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if key.dictionary && !(is_blank(c) || locale::isalnum(c)) {
+            continue;
+        }
+        if key.ignore_nonprintable && !locale::isprint(c) {
+            continue;
+        }
+        if key.fold_case {
+            out.push(locale::to_upper(c));
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
-/// Filters a string to include only alphanumeric characters and whitespace.
-///
-/// This function processes an input string and retains only the alphanumeric characters
-/// (`a-z`, `A-Z`, `0-9`) and whitespace characters, effectively removing all other characters.
-/// It is useful for preparing strings for dictionary-order comparisons.
-///
-/// # Arguments
-///
-/// * `line` - A string slice (`&str`) representing the input string to be filtered.
-///
-/// # Returns
-///
-/// A `String` containing only the alphanumeric and whitespace characters from the input string.
-///
-fn dictionary_order_filter(line: &str) -> String {
-    line.chars()
-        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
-        .collect::<String>()
+/// Parse a numeric value from the start of `s` (POSIX `-n` semantics):
+/// optional leading blanks, optional sign, integer digits, an optional radix
+/// point, and fraction digits. Non-numeric / empty input parses as 0.
+fn parse_num(s: &str, conv: (char, Option<char>)) -> ParsedNum {
+    let (decimal, thousands) = conv;
+    let mut it = s.chars().peekable();
+
+    while let Some(&c) = it.peek() {
+        if is_blank(c) {
+            it.next();
+        } else {
+            break;
+        }
+    }
+
+    let mut negative = false;
+    match it.peek() {
+        Some('-') => {
+            negative = true;
+            it.next();
+        }
+        Some('+') => {
+            it.next();
+        }
+        _ => {}
+    }
+
+    let mut int = Vec::new();
+    while let Some(&c) = it.peek() {
+        if c.is_ascii_digit() {
+            int.push(c);
+            it.next();
+        } else if Some(c) == thousands {
+            it.next();
+        } else {
+            break;
+        }
+    }
+
+    let mut frac = Vec::new();
+    if it.peek() == Some(&decimal) {
+        it.next();
+        while let Some(&c) = it.peek() {
+            if c.is_ascii_digit() {
+                frac.push(c);
+                it.next();
+            } else {
+                break;
+            }
+        }
+    }
+
+    // Normalize: drop leading integer zeros and trailing fraction zeros.
+    let first_nonzero = int.iter().position(|&c| c != '0').unwrap_or(int.len());
+    int.drain(..first_nonzero);
+    while frac.last() == Some(&'0') {
+        frac.pop();
+    }
+
+    let is_zero = int.is_empty() && frac.is_empty();
+    if is_zero {
+        negative = false;
+    }
+    ParsedNum {
+        negative,
+        int,
+        frac,
+        is_zero,
+    }
 }
 
-/// Filters a string to include only printable ASCII characters.
-///
-/// This function processes an input string and retains only the ASCII characters that are
-/// considered printable and graphic (i.e., not control characters or whitespace).
-///
-/// # Arguments
-///
-/// * `line` - A string slice (`&str`) representing the input string to be filtered.
-///
-/// # Returns
-///
-/// A `String` containing only the printable ASCII characters from the input string.
-///
-fn ignore_nonprintable_filter(line: &str) -> String {
-    line.chars()
-        .filter(|&c| c.is_ascii() && c.is_ascii_graphic())
+fn cmp_frac(a: &[char], b: &[char]) -> Ordering {
+    let n = a.len().max(b.len());
+    for i in 0..n {
+        let da = a.get(i).copied().unwrap_or('0');
+        let db = b.get(i).copied().unwrap_or('0');
+        match da.cmp(&db) {
+            Ordering::Equal => continue,
+            o => return o,
+        }
+    }
+    Ordering::Equal
+}
+
+fn cmp_magnitude(a: &ParsedNum, b: &ParsedNum) -> Ordering {
+    match a.int.len().cmp(&b.int.len()) {
+        Ordering::Equal => match a.int.cmp(&b.int) {
+            Ordering::Equal => cmp_frac(&a.frac, &b.frac),
+            o => o,
+        },
+        o => o,
+    }
+}
+
+fn cmp_num(a: &ParsedNum, b: &ParsedNum) -> Ordering {
+    if a.is_zero && b.is_zero {
+        return Ordering::Equal;
+    }
+    match (a.negative, b.negative) {
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (false, false) => cmp_magnitude(a, b),
+        (true, true) => cmp_magnitude(a, b).reverse(),
+    }
+}
+
+fn compare_keyval(a: &KeyVal, b: &KeyVal) -> Ordering {
+    match (a, b) {
+        (KeyVal::Num(x), KeyVal::Num(y)) => cmp_num(x, y),
+        (KeyVal::Text(x), KeyVal::Text(y)) => locale::strcoll(x, y),
+        _ => Ordering::Equal,
+    }
+}
+
+/// Compare two records by the key list. When `last_resort` is true and all keys
+/// compare equal, fall back to a byte-wise whole-line comparison (reversed by
+/// the global `-r`).
+fn compare_records(
+    a: &Record,
+    b: &Record,
+    keys: &[KeySpec],
+    reverse_global: bool,
+    last_resort: bool,
+) -> Ordering {
+    for (i, k) in keys.iter().enumerate() {
+        let mut o = compare_keyval(&a.keys[i], &b.keys[i]);
+        if k.reverse {
+            o = o.reverse();
+        }
+        if o != Ordering::Equal {
+            return o;
+        }
+    }
+    if last_resort {
+        // The whole-line last resort compares the entire lines using the
+        // default (locale collation) comparison, falling back to byte order
+        // only to break collation ties so the result is a total order. The
+        // whole thing is reversed by the global `-r`.
+        let mut o = locale::strcoll(&a.line, &b.line);
+        if o == Ordering::Equal {
+            o = a.line.as_bytes().cmp(b.line.as_bytes());
+        }
+        if reverse_global {
+            o.reverse()
+        } else {
+            o
+        }
+    } else {
+        Ordering::Equal
+    }
+}
+
+/// Split a key spec field ("F[.C][mods]") into (field, optional char, modifiers).
+fn parse_field_spec(s: &str) -> Result<(usize, Option<usize>, String), String> {
+    // The numeric portion is the leading run of digits and '.'; the remainder
+    // are single-letter modifiers.
+    let split = s
+        .char_indices()
+        .find(|(_, c)| c.is_ascii_alphabetic())
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
+    let (numpart, mods) = s.split_at(split);
+
+    for c in mods.chars() {
+        if !"bdfinr".contains(c) {
+            return Err(format!("invalid modifier '{c}' in key specification"));
+        }
+    }
+
+    let mut np = numpart.split('.');
+    let field: usize = np.next().unwrap().parse().map_err(|e| format!("{e}"))?;
+    let char_pos = match np.next() {
+        Some(cs) => Some(cs.parse::<usize>().map_err(|e| format!("{e}"))?),
+        None => None,
+    };
+    Ok((field, char_pos, mods.to_string()))
+}
+
+/// Parse one `-k` definition string into a `KeySpec`, OR-ing in global options.
+fn parse_one_key(kdef: &str, args: &Args) -> Result<KeySpec, String> {
+    if kdef.is_empty() {
+        return Err("key must be non-empty".to_string());
+    }
+    let mut parts = kdef.splitn(2, ',');
+    let start_str = parts.next().unwrap();
+    let end_str = parts.next();
+
+    let (sf, sc, smods) = parse_field_spec(start_str)?;
+    if sf == 0 {
+        return Err("the key can't be zero.".to_string());
+    }
+    let start_char = match sc {
+        Some(0) | None => 1,
+        Some(n) => n,
+    };
+
+    let (ef, ec, emods) = match end_str {
+        Some(es) => {
+            let (f, c, m) = parse_field_spec(es)?;
+            if f == 0 {
+                return Err("the key can't be zero.".to_string());
+            }
+            (Some(f), c, m)
+        }
+        None => (None, None, String::new()),
+    };
+    // An end char of 0 (or absent) means "to end of field".
+    let end_char = ec.filter(|&c| c != 0);
+
+    // POSIX: if a key carries ANY modifier letter (including `b`), the global
+    // ordering options are ignored entirely for that key; otherwise the key
+    // inherits all of them.
+    let has_mods = !smods.is_empty() || !emods.is_empty();
+    let has = |c: char| smods.contains(c) || emods.contains(c);
+    let key = if has_mods {
+        KeySpec {
+            start_field: sf,
+            start_char,
+            end_field: ef,
+            end_char,
+            numeric: has('n'),
+            reverse: has('r'),
+            fold_case: has('f'),
+            dictionary: has('d'),
+            ignore_nonprintable: has('i'),
+            start_blanks: smods.contains('b'),
+            end_blanks: emods.contains('b'),
+        }
+    } else {
+        KeySpec {
+            start_field: sf,
+            start_char,
+            end_field: ef,
+            end_char,
+            numeric: args.numeric_sort,
+            reverse: args.reverse,
+            fold_case: args.fold_case,
+            dictionary: args.dictionary_order,
+            ignore_nonprintable: args.ignore_nonprintable,
+            start_blanks: args.ignore_leading_blanks,
+            end_blanks: args.ignore_leading_blanks,
+        }
+    };
+
+    if let Some(ef) = ef {
+        let before = ef < sf || (ef == sf && end_char.is_some_and(|e| e < start_char));
+        if before {
+            return Err("keys fields with end position before start!".to_string());
+        }
+    }
+
+    Ok(key)
+}
+
+/// Build the key list. With no `-k`, a single implicit whole-line key carries
+/// the global ordering options (including a global `-b`).
+fn build_keys(args: &Args) -> Result<Vec<KeySpec>, String> {
+    if args.key_definition.is_empty() {
+        return Ok(vec![KeySpec {
+            start_field: 1,
+            start_char: 1,
+            end_field: None,
+            end_char: None,
+            numeric: args.numeric_sort,
+            reverse: args.reverse,
+            fold_case: args.fold_case,
+            dictionary: args.dictionary_order,
+            ignore_nonprintable: args.ignore_nonprintable,
+            start_blanks: args.ignore_leading_blanks,
+            end_blanks: args.ignore_leading_blanks,
+        }]);
+    }
+    args.key_definition
+        .iter()
+        .map(|k| parse_one_key(k, args))
         .collect()
 }
 
-/// Generates a `RangeField` struct based on the specified key range and arguments.
-///
-/// This function constructs a `RangeField` struct based on the provided key range string
-/// and the arguments specified in the `Args` struct. It parses the key range string to
-/// determine various sorting and comparison options.
-///
-/// # Arguments
-///
-/// * `key_range` - A string slice (`&str`) representing the key range configuration.
-/// * `args` - A reference to an `Args` struct containing additional configuration options.
-/// * `first` - A boolean indicating whether this is the first part of a range.
-///
-/// # Returns
-///
-/// A `Result` containing the constructed `RangeField` if successful, or a `Box` containing
-/// a dynamic `Error` trait object if parsing or construction fails.
-///
-fn generate_range(
-    key_range: &str,
-    args: &Args,
-    first: bool,
-) -> Result<RangeField, Box<dyn std::error::Error>> {
-    let mut numeric_sort = args.numeric_sort;
-    let mut ignore_leading_blanks = args.ignore_leading_blanks;
-    let mut reverse = args.reverse;
-    let mut ignore_nonprintable = args.ignore_nonprintable;
-    let mut fold_case = args.fold_case;
-    let mut dictionary_order = args.dictionary_order;
+fn make_record(
+    line: String,
+    keys: &[KeySpec],
+    conv: (char, Option<char>),
+    sep: Option<char>,
+) -> Record {
+    let chars: Vec<char> = line.chars().collect();
+    let mut kvs = Vec::with_capacity(keys.len());
+    for k in keys {
+        let s = extract_key(&chars, k, sep);
+        if k.numeric {
+            kvs.push(KeyVal::Num(parse_num(&s, conv)));
+        } else {
+            kvs.push(KeyVal::Text(transform_text(&s, k)));
+        }
+    }
+    Record { line, keys: kvs }
+}
 
-    if key_range.contains('n')
-        || key_range.contains('b')
-        || key_range.contains('r')
-        || key_range.contains('i')
-        || key_range.contains('f')
-        || key_range.contains('d')
-    {
-        numeric_sort = false;
-        ignore_leading_blanks = false;
-        ignore_nonprintable = false;
-        fold_case = false;
-        dictionary_order = false;
-    }
-
-    let mut key_range = key_range.to_string();
-    if key_range.contains('n') {
-        key_range = key_range.replace('n', "");
-        numeric_sort = true;
-    }
-    if key_range.contains('b') {
-        key_range = key_range.replace('b', "");
-        ignore_leading_blanks = true;
-    }
-    if key_range.contains('r') {
-        key_range = key_range.replace('r', "");
-        reverse = true;
-    }
-    if key_range.contains('i') {
-        key_range = key_range.replace('i', "");
-        ignore_nonprintable = true;
-    }
-    if key_range.contains('f') {
-        key_range = key_range.replace('f', "");
-        fold_case = true;
-    }
-    if key_range.contains('d') {
-        key_range = key_range.replace('d', "");
-        dictionary_order = true;
-    }
-    let mut parts = key_range.split('.');
-    let start_1: usize = parts
-        .next()
-        .unwrap()
-        .parse()
-        .map_err(|err| Box::new(Error::other(err)))?;
-
-    let start_2 = parts.next();
-    let mut start_2: usize = match first {
-        true => start_2
-            .unwrap_or("1")
-            .parse()
-            .map_err(|err| Box::new(Error::other(err)))?,
-        false => start_2
-            .unwrap_or(&usize::MAX.to_string())
-            .parse()
-            .map_err(|err| Box::new(Error::other(err)))?,
+/// Read every input fully into memory before any output is produced (so an
+/// output file that is also an input is not truncated before being read).
+fn read_inputs(args: &Args) -> Result<Vec<(String, Vec<String>)>, String> {
+    let files: Vec<PathBuf> = if args.filenames.is_empty() {
+        vec![PathBuf::new()]
+    } else {
+        args.filenames.clone()
     };
 
-    if !first && start_2 == 0 {
-        start_2 = usize::MAX;
-    }
-
-    Ok(RangeField {
-        field_number: start_1 - 1,
-        first_character: start_2 - 1,
-        numeric_sort,
-        ignore_leading_blanks,
-        reverse,
-        ignore_nonprintable,
-        fold_case,
-        dictionary_order,
-    })
-}
-
-/// Cuts a line into fields based on the provided RangeField object(s) and field separator.
-///
-/// This function takes a line of text, a RangeField object or a tuple of two RangeField objects
-/// representing the key range(s), and an optional field separator character. It then splits the line
-/// into fields according to the provided separator or space character, and returns a string containing
-/// the selected fields based on the key range(s).
-///
-/// If a field separator character is provided, the line is split using that separator.
-/// If no separator is provided, the line is split using space (' ') as the separator.
-///
-/// # Arguments
-///
-/// * `line` - A reference to the input line of text to be cut into fields.
-/// * `key_range` - A tuple containing one or two RangeField objects representing the key range(s).
-///   The first RangeField object represents the primary key range, and the second one represents
-///   the secondary key range. If only one key range is provided, the second element of the tuple
-///   should be None.
-/// * `field_separator` - An optional character used to separate fields in the line. If None, space
-///   (' ') is used as the default separator.
-///
-/// # Returns
-///
-/// A string containing the selected fields based on the key range(s).
-///
-fn cut_line(
-    line: &str,
-    key_range: &(RangeField, Option<RangeField>),
-    field_separator: Option<char>,
-) -> String {
-    if let Some(separator) = field_separator {
-        let split = line.split(separator);
-        cut_line_by_range(split.collect(), key_range)
-    } else {
-        let split: Vec<&str> = line.split(' ').collect();
-
-        cut_line_by_range(
-            merge_empty_lines(split)
-                .iter()
-                .map(|s| s.as_str())
-                .collect(),
-            key_range,
-        )
-    }
-}
-
-/// Compares two strings based on a specified key range and optional field separator.
-///
-/// This function compares two strings (`line1` and `line2`) based on a specified key range,
-/// taking into account optional field separation if provided. It applies sorting and comparison
-/// rules defined in the `RangeField` struct associated with the key range.
-///
-/// # Arguments
-///
-/// * `line1` - A string slice (`&str`) representing the first input string to be compared.
-/// * `line2` - A string slice (`&str`) representing the second input string to be compared.
-/// * `key_range` - A tuple containing two elements:
-///     * The first `RangeField` specifies the key range configuration for both strings.
-///     * An optional `RangeField` specifies the end of the key range if different from the start.
-/// * `field_separator` - An optional character specifying the field separator for splitting
-///   strings into fields before comparison. If `None`, whitespace is used as the separator.
-///
-/// # Returns
-///
-/// An `Ordering` value (`Ordering::Less`, `Ordering::Greater`, or `Ordering::Equal`) indicating
-/// the result of the comparison:
-/// * `Ordering::Less` if `line1` is less than `line2` according to the specified key range.
-/// * `Ordering::Greater` if `line1` is greater than `line2` according to the specified key range.
-/// * `Ordering::Equal` if `line1` and `line2` are equal within the specified key range.
-///
-fn compare_key(
-    line1: &str,
-    line2: &str,
-    key_range: &(RangeField, Option<RangeField>),
-    field_separator: Option<char>,
-) -> Ordering {
-    let mut line1 = cut_line(line1, key_range, field_separator);
-    let mut line2 = cut_line(line2, key_range, field_separator);
-
-    // Compare keys
-    if key_range.0.numeric_sort {
-        // If the keys are represented by numbers, compare them as numbers
-        let mut result = compare_numeric(&line1, &line2);
-        if key_range.0.reverse {
-            match result {
-                Ordering::Less => result = Ordering::Greater,
-                Ordering::Greater => result = Ordering::Less,
-                _ => (),
-            }
-        }
-        return result;
-    } else if key_range.0.dictionary_order {
-        line1 = dictionary_order_filter(&line1);
-        line2 = dictionary_order_filter(&line2);
-    } else if key_range.0.ignore_nonprintable {
-        line1 = ignore_nonprintable_filter(&line1);
-        line2 = ignore_nonprintable_filter(&line2);
-    }
-
-    let result;
-
-    if key_range.0.fold_case {
-        let cmp = line1.to_uppercase().cmp(&line2.to_uppercase());
-        if cmp == std::cmp::Ordering::Equal {
-            result = line1.cmp(&line2);
+    let mut out = Vec::with_capacity(files.len());
+    for f in files {
+        let s = f.as_os_str();
+        let name = if s.is_empty() || s == "-" {
+            "-".to_string()
         } else {
-            result = cmp;
-        }
-    } else {
-        result = line1.cmp(&line2);
-    }
-    if key_range.0.reverse {
-        match result {
-            Ordering::Less => Ordering::Greater,
-            Ordering::Greater => Ordering::Less,
-            _ => Ordering::Equal,
-        }
-    } else {
-        result
-    }
-}
-
-/// Compares two lines of text based on specified sorting and comparison options.
-///
-/// This function compares two lines of text (`line1` and `line2`) based on specified
-/// sorting and comparison options. It supports options for numeric sorting, dictionary
-/// ordering, case folding, and ignoring non-printable characters.
-///
-/// # Arguments
-///
-/// * `line1` - A string slice (`&str`) representing the first line of text to be compared.
-/// * `line2` - A string slice (`&str`) representing the second line of text to be compared.
-/// * `dictionary_order` - A boolean indicating whether to use dictionary ordering.
-/// * `fold_case` - A boolean indicating whether to fold case during comparison.
-/// * `ignore_nonprintable` - A boolean indicating whether to ignore non-printable characters.
-/// * `numeric_sort` - A boolean indicating whether to perform numeric sorting.
-///
-/// # Returns
-///
-/// An `Ordering` value (`Ordering::Less`, `Ordering::Greater`, or `Ordering::Equal`)
-/// indicating the result of the comparison:
-/// * `Ordering::Less` if `line1` is less than `line2` according to the specified options.
-/// * `Ordering::Greater` if `line1` is greater than `line2` according to the specified options.
-/// * `Ordering::Equal` if `line1` and `line2` are equal within the specified options.
-///
-fn compare_lines(
-    line1: &str,
-    line2: &str,
-    dictionary_order: bool,
-    fold_case: bool,
-    ignore_nonprintable: bool,
-    numeric_sort: bool,
-) -> Ordering {
-    let mut line1 = line1.to_string();
-    let mut line2 = line2.to_string();
-
-    if numeric_sort {
-        return compare_numeric(&line1, &line2);
-    } else if dictionary_order {
-        line1 = dictionary_order_filter(&line1);
-        line2 = dictionary_order_filter(&line2);
-    } else if ignore_nonprintable {
-        line1 = ignore_nonprintable_filter(&line1);
-        line2 = ignore_nonprintable_filter(&line2);
-    }
-
-    if fold_case {
-        let cmp = line1.to_uppercase().cmp(&line2.to_uppercase());
-        if cmp == std::cmp::Ordering::Equal {
-            line1.cmp(&line2)
-        } else {
-            cmp
-        }
-    } else {
-        line1.cmp(&line2)
-    }
-}
-
-/// Finds the first differing line between two slices of strings.
-///
-/// This function iterates over two slices of strings (`lines_1` and `lines_2`)
-/// and finds the index and content of the first line where they differ.
-/// If the slices have different lengths, it returns the index and content
-/// of the first line from `lines_1` that doesn't have a corresponding line
-/// in `lines_2`.
-///
-/// # Arguments
-///
-/// * `lines_1` - A slice of strings (`&[String]`) representing the first set of lines.
-/// * `lines_2` - A slice of strings (`&[String]`) representing the second set of lines.
-///
-/// # Returns
-///
-/// An `Option` containing a tuple:
-/// - If differing lines are found, it returns the index of the differing line and its content.
-/// - If the slices have different lengths, it returns the index and content of the first
-///   additional line from `lines_1` compared to `lines_2`.
-/// - If the slices are identical, it returns `None`.
-///
-fn find_first_difference(lines_1: &[String], lines_2: &[String]) -> Option<(usize, String)> {
-    let min_length = std::cmp::min(lines_1.len(), lines_2.len());
-
-    for i in 0..min_length {
-        if lines_1[i] != lines_2[i] {
-            return Some((i, lines_1[i].clone()));
-        }
-    }
-
-    if lines_1.len() != lines_2.len() {
-        return Some((min_length, lines_1.get(min_length).unwrap().to_string()));
-    }
-
-    None
-}
-
-/// Creates range fields based on the specified key range and arguments.
-///
-/// This function takes a key range string (`key_range`) and a reference to an `Args` struct (`args`)
-/// containing additional configuration options. It splits the key range string into individual
-/// range components separated by commas and generates corresponding `RangeField` structs for each
-/// component using the `generate_range` function.
-///
-/// # Arguments
-///
-/// * `key_range` - A string slice (`&str`) representing the key range configuration.
-/// * `args` - A reference to an `Args` struct containing additional configuration options.
-///
-/// # Returns
-///
-/// A `Result` containing a tuple `(RangeField, Option<RangeField>)` if successful, or a `Box`
-/// containing a dynamic `Error` trait object if parsing or construction fails.
-///
-fn create_ranges(
-    key_range: &str,
-    args: &Args,
-) -> Result<(RangeField, Option<RangeField>), Box<dyn std::error::Error>> {
-    // Split the key range with commas
-    let key_ranges: Vec<&str> = key_range.split(',').collect();
-    let mut key_ranges = key_ranges.iter();
-
-    // Convert key ranges to numeric representations
-    let mut ranges: (RangeField, Option<RangeField>) = (RangeField::default(), None);
-
-    ranges.0 = {
-        let key_range = key_ranges.next().unwrap().to_string();
-        if key_range == "0" {
-            return Err(Box::new(Error::other("the key can't be zero.")));
-        }
-        generate_range(&key_range, args, true)?
-    };
-    ranges.1 = {
-        if let Some(key_range) = key_ranges.next() {
-            Some(generate_range(key_range, args, false)?)
-        } else {
-            None
-        }
-    };
-    if let Some(range_2) = ranges.1 {
-        let (range_1, range_2) = update_range_field(ranges.0, range_2);
-        if !compare_range_fields(&range_1, &range_2) {
-            return Err(Box::new(Error::other(
-                "keys fields with end position before start!",
-            )));
-        }
-
-        ranges = (range_1, Some(range_2));
-    }
-
-    Ok(ranges)
-}
-
-/// Sorts strings based on specified sorting criteria and writes the result to the output.
-///
-/// This function reads lines from the provided input reader and sorts them based on the
-/// specified sorting criteria in the `Args` struct. It supports sorting by key ranges,
-/// dictionary ordering, case folding, numeric sorting, and other options. The sorted
-/// lines are then written to the output, which can be a file or the standard output.
-///
-/// # Arguments
-///
-/// * `args` - A reference to an `Args` struct containing sorting and configuration options.
-/// * `reader` - A boxed reader implementing the `Read` trait, representing the input source.
-///
-/// # Returns
-///
-/// A `Result` indicating success or failure:
-/// * `Ok(())` if the sorting and writing process completes successfully.
-/// * `Err(Box<dyn Error>)` if an error occurs during sorting, reading, or writing.
-///
-fn sort_lines(args: &Args, lines: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
-    let mut result_lines = lines.clone();
-    let mut duplicates = vec![];
-
-    if !args.key_definition.is_empty() {
-        let key_range = &args.key_definition[0];
-
-        if key_range.is_empty() {
-            return Err(Box::new(Error::other("key must be non-empty")));
-        }
-
-        let ranges = create_ranges(key_range, args)?;
-        let ranges_2 = match args.key_definition.get(1) {
-            Some(key_range_2) => Some(create_ranges(key_range_2, args)?),
-            None => None,
+            f.display().to_string()
         };
+        let reader = input_stream_dashed(&f).map_err(|e| format!("cannot read: {name}: {e}"))?;
+        let br = io::BufReader::new(reader);
+        let mut lines = Vec::new();
+        for line in br.lines() {
+            lines.push(line.map_err(|e| format!("read error: {name}: {e}"))?);
+        }
+        out.push((name, lines));
+    }
+    Ok(out)
+}
 
-        // Sort strings by keys
-        result_lines.sort_by(|a, b| {
-            let mut ordering = compare_key(a, b, &ranges, args.field_separator);
-            if let Ordering::Equal = ordering {
-                if let Some(ranges_2) = &ranges_2 {
-                    let ordering_2 = compare_key(a, b, ranges_2, args.field_separator);
-                    if let Ordering::Equal = ordering_2 {
-                        duplicates.push(a.to_string());
+fn write_output(records: &[Record], args: &Args) -> Result<(), String> {
+    if let Some(path) = &args.output_file {
+        let file =
+            File::create(path).map_err(|e| format!("open failed: {}: {e}", path.display()))?;
+        let mut w = BufWriter::new(file);
+        for r in records {
+            writeln!(w, "{}", r.line).map_err(|e| format!("write error: {e}"))?;
+        }
+        w.flush().map_err(|e| format!("write error: {e}"))?;
+    } else {
+        let stdout = io::stdout();
+        let mut w = BufWriter::new(stdout.lock());
+        for r in records {
+            writeln!(w, "{}", r.line).map_err(|e| format!("write error: {e}"))?;
+        }
+        w.flush().map_err(|e| format!("write error: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Sequentially scan the inputs for the first out-of-order pair (`-c`/`-C`).
+/// Returns the exit status (0 ordered, 1 disordered). `-c` prints a diagnostic
+/// matching GNU's `sort: FILE:LINE: disorder: TEXT`; `-C` is silent.
+fn check_order(
+    args: &Args,
+    keys: &[KeySpec],
+    conv: (char, Option<char>),
+    sep: Option<char>,
+    inputs: &[(String, Vec<String>)],
+) -> i32 {
+    let last_resort = !args.unique;
+    let mut prev: Option<Record> = None;
+
+    for (name, lines) in inputs {
+        for (i, line) in lines.iter().enumerate() {
+            let cur = make_record(line.clone(), keys, conv, sep);
+            if let Some(p) = &prev {
+                let o = compare_records(p, &cur, keys, args.reverse, last_resort);
+                let bad = if args.unique {
+                    o != Ordering::Less
+                } else {
+                    o == Ordering::Greater
+                };
+                if bad {
+                    if args.check_order {
+                        eprintln!("sort: {}:{}: disorder: {}", name, i + 1, cur.line);
                     }
-                    ordering = ordering_2
+                    return 1;
                 }
             }
-            ordering
-        });
-        if args.unique {
-            result_lines.retain(|line| !duplicates.contains(line));
+            prev = Some(cur);
         }
+    }
+    0
+}
+
+fn run(args: &Args) -> Result<i32, String> {
+    args.validate_args()?;
+
+    let keys = build_keys(args)?;
+    let conv = numeric_conv();
+    let sep = args.field_separator;
+    let inputs = read_inputs(args)?;
+
+    if args.check_order || args.check_order_silent {
+        return Ok(check_order(args, &keys, conv, sep, &inputs));
+    }
+
+    // With -u the sort omits the last-resort whole-line tiebreak so equal-key
+    // lines keep input order (a stable sort), and -u then keeps the first.
+    let last_resort = !args.unique;
+
+    let mut records: Vec<Record> = if args.merge_only {
+        // Merge each (already sorted) input as a stream.
+        let files: Vec<Vec<Record>> = inputs
+            .iter()
+            .map(|(_, lines)| {
+                lines
+                    .iter()
+                    .map(|l| make_record(l.clone(), &keys, conv, sep))
+                    .collect()
+            })
+            .collect();
+        merge_records(files, &keys, args.reverse, last_resort)
     } else {
-        result_lines.sort_by(|a, b| {
-            let ord = compare_lines(
-                a,
-                b,
-                args.dictionary_order,
-                args.fold_case,
-                args.ignore_nonprintable,
-                args.numeric_sort,
-            );
-            if let Ordering::Equal = ord {
-                duplicates.push(a.to_string());
+        let mut recs: Vec<Record> = inputs
+            .iter()
+            .flat_map(|(_, lines)| {
+                lines
+                    .iter()
+                    .map(|l| make_record(l.clone(), &keys, conv, sep))
+            })
+            .collect();
+        recs.sort_by(|a, b| compare_records(a, b, &keys, args.reverse, last_resort));
+        recs
+    };
+
+    if args.unique {
+        records
+            .dedup_by(|a, b| compare_records(a, b, &keys, args.reverse, false) == Ordering::Equal);
+    }
+
+    write_output(&records, args)?;
+    Ok(0)
+}
+
+/// Consume per-file sorted record lists and produce a single merged list via a
+/// stable k-way merge.
+fn merge_records(
+    mut files: Vec<Vec<Record>>,
+    keys: &[KeySpec],
+    reverse: bool,
+    last_resort: bool,
+) -> Vec<Record> {
+    let mut idx = vec![0usize; files.len()];
+    let total: usize = files.iter().map(|f| f.len()).sum();
+    let mut out: Vec<Record> = Vec::with_capacity(total);
+    loop {
+        let mut best: Option<usize> = None;
+        for f in 0..files.len() {
+            if idx[f] >= files[f].len() {
+                continue;
             }
-            ord
-        });
-
-        if args.unique {
-            result_lines.retain(|line| !duplicates.contains(line));
+            match best {
+                None => best = Some(f),
+                Some(b) => {
+                    if compare_records(
+                        &files[f][idx[f]],
+                        &files[b][idx[b]],
+                        keys,
+                        reverse,
+                        last_resort,
+                    ) == Ordering::Less
+                    {
+                        best = Some(f);
+                    }
+                }
+            }
+        }
+        match best {
+            None => break,
+            Some(f) => {
+                let i = idx[f];
+                let rec = std::mem::replace(
+                    &mut files[f][i],
+                    Record {
+                        line: String::new(),
+                        keys: Vec::new(),
+                    },
+                );
+                out.push(rec);
+                idx[f] += 1;
+            }
         }
     }
-
-    if args.reverse {
-        result_lines.reverse();
-    }
-
-    if args.check_order_without_war_mess {
-        if find_first_difference(&lines, &result_lines).is_some() {
-            return Err(Box::new(Error::other(
-                "The order of the lines is not correct",
-            )));
-        } else {
-            return Ok(());
-        }
-    } else if args.check_order {
-        if args.unique && !duplicates.is_empty() {
-            let message = format!("Duplicate key was found! `{}`", duplicates.first().unwrap());
-            return Err(Box::new(Error::other(message)));
-        }
-        if let Some((index, line)) = find_first_difference(&lines, &result_lines) {
-            let message = format!(
-                "The order of the lines is not correct on line {}:`{}`",
-                index + 1,
-                line
-            );
-            return Err(Box::new(Error::other(message)));
-        }
-        return Ok(());
-    } else if let Some(file_path) = &args.output_file {
-        // Open the file for writing
-        let file_out = File::create(file_path)?;
-        let mut writer = BufWriter::new(file_out);
-
-        // Write the sorted strings to a file
-        for line in result_lines {
-            writeln!(writer, "{}", line)?;
-        }
-    } else {
-        let result = result_lines.join("\n");
-        println!("{result}");
-    }
-
-    Ok(())
+    out
 }
 
-/// Merges contents from multiple sorted files into a single output.
-///
-/// This function takes a vector of mutable references to readers (`paths`) representing
-/// sorted input files and an optional output file path (`output_path`). It reads from each
-/// input file sequentially and writes the contents to the output file or the standard output.
-///
-/// # Arguments
-///
-/// * `paths` - A mutable reference to a vector of readers (`Vec<Box<dyn Read>>`) representing
-///   sorted input files.
-/// * `output_path` - An optional string (`Option<String>`) representing the output file path.
-///   If `Some`, the merged contents are written to the specified file; if `None`,
-///   the contents are written to the standard output.
-///
-/// # Returns
-///
-/// An `io::Result` indicating success or failure:
-/// * `Ok(())` if the merging process completes successfully.
-/// * `Err(io::Error)` if an error occurs during file I/O or copying.
-///
-fn merge_files(paths: &mut Vec<Box<dyn Read>>, output_path: &Option<PathBuf>) -> io::Result<()> {
-    let mut output_file: Box<dyn Write> = match output_path {
-        Some(path) => Box::new(File::create(path)?),
-        None => Box::new(io::stdout()),
-    };
-
-    for path in paths {
-        let mut input_file = path;
-
-        // Copy the contents of the input file to the output file or stdout
-        io::copy(&mut input_file, &mut output_file)?;
-    }
-
-    Ok(())
-}
-
-/// Merges consecutive empty strings in the input vector with the nearest non-empty string.
-/// Spaces are added to empty strings to align them with the nearest non-empty string.
-///
-/// # Arguments
-///
-/// * `vec` - A vector of string references (`&str`).
-///
-/// # Returns
-///
-/// A vector of strings (`Vec<String>`) where consecutive empty strings are merged with the nearest non-empty string.
-///
-/// # Examples
-///
-/// ```
-/// let result = merge_empty_lines(vec!["line1", "line2", "", "", "", "lineN"]);
-/// assert_eq!(result, vec!["line1", "line2", "   lineN"]);
-/// ```
-///
-fn merge_empty_lines(vec: Vec<&str>) -> Vec<String> {
-    let mut empty_count = 0;
-    let mut result = vec![];
-
-    for i in vec {
-        if i.is_empty() {
-            empty_count += 1;
-        } else if empty_count > 0 {
-            let spaces = " ".repeat(empty_count);
-            result.push(format!("{}{}", spaces, i));
-            empty_count = 0;
-        } else {
-            result.push(i.to_string());
-        }
-    }
-
-    result
-}
-
-/// Sorts the contents of input files or standard input based on specified criteria.
-///
-/// This function takes an `Args` struct containing sorting options and configuration and sorts
-/// the contents of input files or standard input accordingly. It supports sorting by key ranges,
-/// dictionary ordering, case folding, numeric sorting, and other options. The sorted contents
-/// can be written to the output or merged directly if specified.
-///
-/// # Arguments
-///
-/// * `args` - A reference to an `Args` struct containing sorting and configuration options.
-///
-/// # Returns
-///
-/// A `Result` indicating success or failure:
-/// * `Ok(())` if the sorting process completes successfully.
-/// * `Err(Box<dyn Error>)` if an error occurs during sorting or merging.
-///
-fn sort(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-    // A "-" operand reads stdin at its position in the list (POSIX Guideline
-    // 13), not only when it is the sole operand.
-    let mut readers: Vec<Box<dyn Read>> = if args.filenames.is_empty() {
-        vec![input_stream_dashed(Path::new(""))?]
-    } else {
-        let mut bufs: Vec<Box<dyn Read>> = Vec::with_capacity(args.filenames.len());
-        for file in &args.filenames {
-            bufs.push(input_stream_dashed(file)?);
-        }
-        bufs
-    };
-
-    if args.merge_only {
-        merge_files(&mut readers, &args.output_file)?;
-        return Ok(());
-    }
-    let mut all_lines: Vec<String> = Vec::new();
-    for reader in readers {
-        let reader = io::BufReader::new(reader);
-        let lines: Vec<String> = reader.lines().map(|l| l.unwrap()).collect();
-        all_lines.extend(lines);
-    }
-    sort_lines(args, all_lines)?;
-
-    Ok(())
-}
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
     setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    let _ = textdomain("posixutils-rs");
+    let _ = bind_textdomain_codeset("posixutils-rs", "UTF-8");
 
     let args = Args::parse();
 
-    args.validate_args()?;
-
-    let mut exit_code = 0;
-
-    if let Err(err) = sort(&args) {
-        exit_code = 1;
-        eprintln!("{}", err);
-    }
-
-    std::process::exit(exit_code)
+    let code = match run(&args) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("sort: {e}");
+            2
+        }
+    };
+    std::process::exit(code);
 }
 
 #[cfg(test)]
@@ -1005,8 +783,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_merge_empty_lines() {
-        let result = merge_empty_lines(vec!["line1", "line2", "", "", "", "lineN"]);
-        assert_eq!(result, vec!["line1", "line2", "   lineN"]);
+    fn numeric_large_ints_exact() {
+        let conv = ('.', None);
+        let a = parse_num("99999999999999999999", conv);
+        let b = parse_num("100000000000000000000", conv);
+        assert_eq!(cmp_num(&a, &b), Ordering::Less);
+    }
+
+    #[test]
+    fn numeric_negatives_and_zero() {
+        let conv = ('.', None);
+        let neg = parse_num("-5", conv);
+        let zero = parse_num("0", conv);
+        let pos = parse_num("3", conv);
+        assert_eq!(cmp_num(&neg, &zero), Ordering::Less);
+        assert_eq!(cmp_num(&zero, &pos), Ordering::Less);
+        assert_eq!(cmp_num(&neg, &pos), Ordering::Less);
+        // -0 == 0
+        assert_eq!(cmp_num(&parse_num("-0", conv), &zero), Ordering::Equal);
     }
 }

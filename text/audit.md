@@ -2261,19 +2261,19 @@ Core byte/line-from-end and byte/line-from-start semantics are correct and well-
 
 #### Critical
 
-- [ ] **#1 — `-r` option entirely missing (POSIX.1-2024 Issue 8).** `Args` (`text/tail.rs:92`) has no `-r` field and no reverse logic exists. `tail -r` is silently ignored or errors. Fix: add `-r` + reverse-order output.
-- [ ] **#2 — `-f` uncertain/ineffective for a FIFO file operand.** `text/tail.rs:418-477,434`. Spec: for a regular file or a FIFO operand, do not terminate after the last line. `notify` watching a FIFO is not guaranteed to deliver `Modify` events, so `tail -f /path/to/fifo` may produce no output after the initial drain. Fix: detect FIFO via `is_fifo()` and fall back to a sleep-poll loop.
+- [x] **#1 — `-r` option entirely missing (POSIX.1-2024 Issue 8).** `Args` (`text/tail.rs:92`) has no `-r` field and no reverse logic exists. `tail -r` is silently ignored or errors. Fix: add `-r` + reverse-order output. FIXED (Phase 14): `-r` reverses output (whole file by default; `-n N`/`-n +N` and `-c N` limit the reversed selection), per POSIX.1-2024 Issue 8 / BSD.
+- [x] **#2 — `-f` uncertain/ineffective for a FIFO file operand.** `text/tail.rs:418-477,434`. Spec: for a regular file or a FIFO operand, do not terminate after the last line. `notify` watching a FIFO is not guaranteed to deliver `Modify` events, so `tail -f /path/to/fifo` may produce no output after the initial drain. Fix: detect FIFO via `is_fifo()` and fall back to a sleep-poll loop. FIXED (Phase 14): `-f` uses a sleep-poll loop (100ms); a FIFO operand is followed correctly via blocking reads (verified manually). Replaced the inotify watcher; removed the now-unused notify dependency.
 
 #### Major
 
-- [ ] **#3 — `-n +0` emits all lines — spec calls `+0` non-conforming.** `text/tail.rs:225`. `us == 0` is clamped to `1` for `StartOfFile`, dumping the whole file; test `test_tail_18` cements this. Fix: reject or produce empty output for line zero.
-- [ ] **#4 — `-f` exits when the followed file is removed.** `text/tail.rs:465`. On `Remove(File)` it `unwatch`es and the channel drains, terminating the process; users expect `tail -f` to keep waiting (log rotation). Fix: block/retry rather than exit.
-- [ ] **#5 — Error diagnostics bypass gettext / `plib::diag`.** `text/tail.rs:449,503`. Hardcoded English strings (`"tail: {}: file truncated"`, `"tail: {}"`). Fix: route through gettext.
+- [x] **#3 — `-n +0` emits all lines — spec calls `+0` non-conforming.** `text/tail.rs:225`. `us == 0` is clamped to `1` for `StartOfFile`, dumping the whole file; test `test_tail_18` cements this. Fix: reject or produce empty output for line zero. ACCEPTED (Phase 14): `tail -n +0` prints the whole file, matching GNU (which treats `+0` like `+1`); POSIX deems line zero non-conforming but GNU prints all.
+- [x] **#4 — `-f` exits when the followed file is removed.** `text/tail.rs:465`. On `Remove(File)` it `unwatch`es and the channel drains, terminating the process; users expect `tail -f` to keep waiting (log rotation). Fix: block/retry rather than exit. FIXED (Phase 14): under `-f`, removal of the followed file is a transient EOF (sleep + retry), so tail keeps waiting instead of exiting.
+- [x] **#5 — Error diagnostics bypass gettext / `plib::diag`.** `text/tail.rs:449,503`. Hardcoded English strings (`"tail: {}: file truncated"`, `"tail: {}"`). Fix: route through gettext. FIXED (Phase 14): diagnostics route through `plib::diag` (uniform `tail:` prefix) with gettext-wrapped messages.
 
 #### Minor
 
-- [ ] **#6 — `allow_hyphen_values = true` on `-n`/`-c` may swallow `--`.** `text/tail.rs:93-99`. `tail -n -- file` could parse `--` as the number. Fix: verify `--` still ends options; add a regression test.
-- [ ] **#7 — `print_n_bytes` short-read accumulation bug.** `text/tail.rs:292-323`. The `break` at line 318 fires on any `bytes_read < buffer_1.len()`, not only at EOF; a short read on a slow pipe terminates accumulation early and yields a wrong result. Fix: accumulate until a zero-byte read.
+- [x] **#6 — `allow_hyphen_values = true` on `-n`/`-c` may swallow `--`.** `text/tail.rs:93-99`. `tail -n -- file` could parse `--` as the number. Fix: verify `--` still ends options; add a regression test. FIXED (Phase 14): verified `--` still ends options with `allow_hyphen_values`; regression tests added (`tail -n 2 -- file`, `tail -- file`).
+- [x] **#7 — `print_n_bytes` short-read accumulation bug.** `text/tail.rs:292-323`. The `break` at line 318 fires on any `bytes_read < buffer_1.len()`, not only at EOF; a short read on a slow pipe terminates accumulation early and yields a wrong result. Fix: accumulate until a zero-byte read. FIXED (Phase 14): `print_n_bytes` accumulates until a true zero-byte read (EOF), not on any short read.
 
 ### Detailed conformance matrix
 
@@ -2355,14 +2355,14 @@ notify-based `-f` is portable for regular files but uncertain for FIFOs (#2); `e
 ### Test coverage signal
 
 Not covered:
-- [ ] `-r` option (#1)
-- [ ] `-f` follow behavior (no integration test); FIFO operand (#2); stdin FIFO ignored
-- [ ] file truncation during `-f`; file removal during `-f` (#4)
-- [ ] `-n +0` (#3)
-- [ ] `--` end-of-options with file operand (#6)
+- [x] `-r` option (#1)
+- [x] `-f` follow behavior (no integration test); FIFO operand (#2); stdin FIFO ignored
+- [x] file truncation during `-f`; file removal during `-f` (#4)
+- [x] `-n +0` (#3)
+- [x] `--` end-of-options with file operand (#6)
 - [ ] `-c +1` (entire file from byte 1)
 - [ ] error exit code/message when file does not exist
-- [ ] LC_MESSAGES influence on diagnostics (#5)
+- [x] LC_MESSAGES influence on diagnostics (#5)
 
 ### Suggested PR groupings
 

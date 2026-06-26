@@ -8,11 +8,34 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, TestPlan};
+use plib::testing::{run_test, run_test_with_checker, TestPlan};
 
 const EXIT_STATUS_NO_DIFFERENCE: i32 = 0;
 const EXIT_STATUS_DIFFERENCE: i32 = 1;
+const EXIT_STATUS_TROUBLE: i32 = 2;
+use std::io::Write as _;
 use std::{collections::HashMap, path::PathBuf, process::Stdio, sync::LazyLock};
+
+/// Write `content` to a uniquely named temp file and return its path. The
+/// `tag` must be unique per test to avoid collisions under parallel runs.
+fn write_tmp(tag: &str, content: &[u8]) -> String {
+    let path = std::env::temp_dir().join(format!("pu_difftest_{}_{}", std::process::id(), tag));
+    let mut f = std::fs::File::create(&path).expect("create temp file");
+    f.write_all(content).expect("write temp file");
+    path.to_str().unwrap().to_string()
+}
+
+/// Run `diff` with `args`, asserting stdout, stderr, and exit code.
+fn diff_test_full(args: &[&str], out: &str, err: &str, code: i32) {
+    run_test(TestPlan {
+        cmd: String::from("diff"),
+        args: args.iter().map(|s| s.to_string()).collect(),
+        stdin_data: String::new(),
+        expected_out: String::from(out),
+        expected_err: String::from(err),
+        expected_exit_code: code,
+    });
+}
 
 fn diff_test(args: &[&str], expected_output: &str, expected_exit_code: i32) {
     let str_args = args.iter().cloned().map(str::to_owned).collect();
@@ -432,5 +455,154 @@ fn test_diff_unified_two_labels() {
         ],
         data.content(),
         EXIT_STATUS_DIFFERENCE,
+    );
+}
+
+// --- POSIX-conformance regression tests (outputs verified against GNU diff) ---
+
+/// `-b`: a sequence of blanks compares equal to any other non-empty sequence,
+/// and trailing blanks are ignored, so interior/trailing whitespace differences
+/// are not reported.
+#[test]
+fn test_diff_b_interior_blanks_equal() {
+    let f1 = write_tmp("b_interior_1", b"a  b\tc \n");
+    let f2 = write_tmp("b_interior_2", b"a b c\n");
+    diff_test_full(&["-b", &f1, &f2], "", "", EXIT_STATUS_NO_DIFFERENCE);
+}
+
+/// `-b`: the presence vs. absence of leading blanks IS significant (a leading
+/// blank run does not compare equal to no leading blank).
+#[test]
+fn test_diff_b_leading_blanks_significant() {
+    let f1 = write_tmp("b_leading_1", b"   foo\n");
+    let f2 = write_tmp("b_leading_2", b"foo\n");
+    diff_test_full(
+        &["-b", &f1, &f2],
+        "1c1\n<    foo\n---\n> foo\n",
+        "",
+        EXIT_STATUS_DIFFERENCE,
+    );
+}
+
+/// `-f`: multi-line ranges are space-separated (`c2 4`), not comma-separated.
+#[test]
+fn test_diff_forward_multiline_range() {
+    let f1 = write_tmp("fed_range_1", b"a\nb\nc\nd\ne\n");
+    let f2 = write_tmp("fed_range_2", b"a\nX\nY\nZ\nW\ne\n");
+    diff_test_full(
+        &["-f", &f1, &f2],
+        "c2 4\nX\nY\nZ\nW\n.\n",
+        "",
+        EXIT_STATUS_DIFFERENCE,
+    );
+}
+
+/// `-C 0`: zero context must be accepted, and a single-line context range is
+/// printed with one number (`*** 2 ****`), not two.
+#[test]
+fn test_diff_context_zero_single_line_range() {
+    let f1 = write_tmp("c0_range_1", b"a\nb\nc\nd\ne\n");
+    let f2 = write_tmp("c0_range_2", b"a\nB\nc\nd\ne\n");
+    diff_test_full(
+        &["--label", "L1", "--label2", "L2", "-C0", &f1, &f2],
+        "*** L1\n--- L2\n***************\n*** 2 ****\n! b\n--- 2 ----\n! B\n",
+        "",
+        EXIT_STATUS_DIFFERENCE,
+    );
+}
+
+/// `-U 0`: zero context must be accepted, and a single-line unified range is
+/// printed with one number (`@@ -2 +2 @@`).
+#[test]
+fn test_diff_unified_zero_single_line_range() {
+    let f1 = write_tmp("u0_range_1", b"a\nb\nc\nd\ne\n");
+    let f2 = write_tmp("u0_range_2", b"a\nB\nc\nd\ne\n");
+    diff_test_full(
+        &["--label", "L1", "--label2", "L2", "-U0", &f1, &f2],
+        "--- L1\n+++ L2\n@@ -2 +2 @@\n-b\n+B\n",
+        "",
+        EXIT_STATUS_DIFFERENCE,
+    );
+}
+
+/// Default format: the "no newline" marker is emitted for an appended last line
+/// that lacks a trailing newline (Insert hunk at end of file).
+#[test]
+fn test_diff_default_no_newline_append() {
+    let f1 = write_tmp("nonl_app_1", b"a\nb\n");
+    let f2 = write_tmp("nonl_app_2", b"a\nb\nc");
+    diff_test_full(
+        &[&f1, &f2],
+        "2a3\n> c\n\\ No newline at end of file\n",
+        "",
+        EXIT_STATUS_DIFFERENCE,
+    );
+}
+
+/// Default format: the marker follows the file1 line that lacks a trailing
+/// newline; file2 (which has one) gets no marker.
+#[test]
+fn test_diff_default_no_newline_substitute() {
+    let f1 = write_tmp("nonl_sub_1", b"a\nb\nc");
+    let f2 = write_tmp("nonl_sub_2", b"a\nb\nC\n");
+    diff_test_full(
+        &[&f1, &f2],
+        "3c3\n< c\n\\ No newline at end of file\n---\n> C\n",
+        "",
+        EXIT_STATUS_DIFFERENCE,
+    );
+}
+
+/// `-e`: the "no newline" diagnostic must never corrupt the ed script on
+/// stdout; it goes to stderr, and a missing trailing newline yields exit 2.
+#[test]
+fn test_diff_edit_script_no_newline_stderr() {
+    let f1 = write_tmp("ed_nonl_1", b"a\nb\nc");
+    let f2 = write_tmp("ed_nonl_2", b"a\nb\nC");
+    let err = format!(
+        "diff: {}: No newline at end of file\n\ndiff: {}: No newline at end of file\n\n",
+        f1, f2
+    );
+    diff_test_full(&["-e", &f1, &f2], "3c\nC\n.\n", &err, EXIT_STATUS_TROUBLE);
+}
+
+/// Unified header timestamps carry fractional seconds and a timezone offset,
+/// e.g. `2024-01-01 12:00:00.000000000 +0000`.
+#[test]
+fn test_diff_unified_header_timestamp_format() {
+    let f1 = write_tmp("uhdr_1", b"a\n");
+    let f2 = write_tmp("uhdr_2", b"b\n");
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("diff"),
+            args: vec![String::from("-u"), f1.clone(), f2.clone()],
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: EXIT_STATUS_DIFFERENCE,
+        },
+        |_plan, output| {
+            assert_eq!(output.status.code(), Some(EXIT_STATUS_DIFFERENCE));
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let header = stdout.lines().next().expect("missing header line");
+            let ts = header.split('\t').nth(1).expect("missing timestamp field");
+            // e.g. "2026-06-25 19:16:19.521127253 +0000"
+            let (datetime, offset) = ts.rsplit_once(' ').expect("missing tz offset");
+            assert!(
+                offset.len() == 5
+                    && (offset.starts_with('+') || offset.starts_with('-'))
+                    && offset[1..].chars().all(|c| c.is_ascii_digit()),
+                "bad tz offset: {ts:?}"
+            );
+            let frac = datetime
+                .rsplit_once('.')
+                .expect("missing fractional seconds")
+                .1;
+            assert!(
+                frac.len() == 9 && frac.chars().all(|c| c.is_ascii_digit()),
+                "bad fractional seconds: {ts:?}"
+            );
+        },
     );
 }

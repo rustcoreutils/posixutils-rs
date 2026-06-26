@@ -8,13 +8,20 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use plib::regex::{Regex, RegexFlags};
 use std::{
     fs::File,
     io::{self, BufRead, BufReader},
     path::{Path, PathBuf},
 };
+
+/// Fold a string to lowercase under the current `LC_CTYPE` (libc `tolower`/
+/// `towlower`), used for the `-F -i` fixed-string comparison so case-insensitive
+/// matching honors the locale rather than Rust's Unicode-only folding.
+fn locale_lower(s: &str) -> String {
+    s.chars().map(plib::locale::to_lower).collect()
+}
 
 /// grep - search a file for a pattern
 #[derive(Parser)]
@@ -99,7 +106,7 @@ impl Args {
                 Err(err) => {
                     self.any_errors = true;
                     if !self.no_messages {
-                        eprintln!("{}: {}", path_buf.display(), err);
+                        plib::diag::error(&format!("{}: {}", path_buf.display(), err));
                     }
                 }
             }
@@ -116,13 +123,15 @@ impl Args {
             }
         }
 
+        // Split multi-line -e/-f arguments into individual patterns. Every
+        // specified pattern is kept and used (POSIX): duplicates are not
+        // removed, as dropping a duplicate (e.g. an empty match-all pattern
+        // supplied twice) could change the result.
         self.regexp = self
             .regexp
             .iter()
             .flat_map(|pattern| pattern.split('\n').map(String::from))
             .collect();
-        self.regexp.sort_by_key(|r| r.len());
-        self.regexp.dedup();
 
         if self.input_files.is_empty() {
             self.input_files.push(String::from("-"))
@@ -217,7 +226,7 @@ impl Patterns {
             Ok(Self::Fixed(
                 patterns
                     .into_iter()
-                    .map(|p| if ignore_case { p.to_lowercase() } else { p })
+                    .map(|p| if ignore_case { locale_lower(&p) } else { p })
                     .collect(),
                 ignore_case,
                 line_regexp,
@@ -264,7 +273,7 @@ impl Patterns {
         match self {
             Patterns::Fixed(patterns, ignore_case, line_regexp) => {
                 let input = if *ignore_case {
-                    input.to_lowercase()
+                    locale_lower(input)
                 } else {
                     input.to_string()
                 };
@@ -323,7 +332,7 @@ impl GrepModel {
                     Err(err) => {
                         self.any_errors = true;
                         if !self.no_messages {
-                            eprintln!("{}: {}", input_name, err);
+                            plib::diag::error(&format!("{}: {}", input_name, err));
                         }
                     }
                 }
@@ -407,10 +416,10 @@ impl GrepModel {
                 Err(err) => {
                     self.any_errors = true;
                     if !self.no_messages {
-                        eprintln!(
-                            "{}: Error reading line {} ({})",
+                        plib::diag::error(&format!(
+                            "{}: error reading line {} ({})",
                             input_name, line_number, err
-                        );
+                        ));
                     }
                 }
             }
@@ -431,9 +440,7 @@ impl GrepModel {
 //     1 - No lines were selected.
 //     >1 - An error occurred.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    plib::diag::init_locale("grep");
 
     let mut args = Args::parse();
 
@@ -445,7 +452,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .map(|mut grep_model| grep_model.grep())
         .unwrap_or_else(|err| {
-            eprintln!("{}", err);
+            plib::diag::error(&err);
             2
         });
 

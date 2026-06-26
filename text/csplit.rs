@@ -43,7 +43,13 @@ struct Args {
 
 enum Operand {
     Rx(Regex, isize, bool),
-    LineNum(usize),
+    /// Split before absolute line `target`. When followed by a repeat, `step`
+    /// (the original line number) is added to `target` after each split, so the
+    /// file is split every `step` lines.
+    LineNum {
+        target: usize,
+        step: usize,
+    },
     Repeat(usize),
 }
 
@@ -205,24 +211,42 @@ fn csplit_file(args: &Args, ctx: SplitOps, new_files: &mut Vec<String>) -> io::R
             continue;
         }
         match split_options.first().unwrap() {
-            Operand::LineNum(num) => {
-                if *num == state.in_line_no {
-                    if lines.ends_with('\n') && lines != "\n" {
-                        lines.pop();
-                    }
+            Operand::LineNum { target, step } => {
+                // `in_line_no` is the absolute (monotonic) input line number.
+                if state.in_line_no == *target {
+                    let step = *step;
+                    // Write the accumulated lines verbatim (including their
+                    // trailing newlines), then start the next section with the
+                    // current line.
                     process_lines(&mut lines, &mut state, new_files, args.suppress)?;
-                    state.in_line_no = 1;
                     lines = String::new();
                     lines.push_str(&line);
 
-                    if split_options.len() > 1 {
-                        if let Operand::Repeat(repeat) = &mut split_options[1] {
-                            *repeat -= 1;
-                            if *repeat == 0 {
-                                split_options.remove(0);
-                                split_options.remove(0);
+                    // Advance or consume the operand. `{N}` repeats the pattern
+                    // N more times after the base split (N+1 splits total), so
+                    // the operand is only removed once the repeat count reaches
+                    // zero and fires its final time.
+                    if matches!(split_options.get(1), Some(Operand::Repeat(_))) {
+                        let remaining = match split_options.get(1) {
+                            Some(Operand::Repeat(r)) => *r,
+                            _ => 0,
+                        };
+                        if remaining == 0 {
+                            split_options.remove(0); // LineNum
+                            split_options.remove(0); // Repeat
+                        } else {
+                            if let Some(Operand::Repeat(r)) = split_options.get_mut(1) {
+                                *r -= 1;
+                            }
+                            if let Some(Operand::LineNum { target, .. }) = split_options.get_mut(0)
+                            {
+                                // Repeat means "split every `step` lines".
+                                *target += step;
                             }
                         }
+                    } else {
+                        // A bare line number fires exactly once.
+                        split_options.remove(0);
                     }
                 } else {
                     lines.push_str(&line);
@@ -235,37 +259,32 @@ fn csplit_file(args: &Args, ctx: SplitOps, new_files: &mut Vec<String>) -> io::R
                 if regex.is_match(&line) {
                     match offset.cmp(&0) {
                         std::cmp::Ordering::Less => {
-                            let mut lines_vec: Vec<&str> = lines.lines().collect();
-
-                            let mut removed_lines_string = String::new();
-                            let length = lines_vec.len();
-                            if length >= offset.unsigned_abs() {
-                                let removed_lines =
-                                    lines_vec.split_off(length - offset.unsigned_abs());
-                                removed_lines_string = removed_lines.join("\n");
-
-                                removed_lines_string.push('\n');
-                            }
-
-                            lines = lines_vec.join("\n");
-                            if !lines.is_empty() {
-                                if *skip {
-                                    lines.clear();
+                            // Negative offset: move the last `n` complete lines
+                            // of the accumulated section into the next section,
+                            // preserving their exact bytes (newlines included).
+                            let n = offset.unsigned_abs();
+                            let nl_positions: Vec<usize> =
+                                lines.match_indices('\n').map(|(i, _)| i).collect();
+                            let total = nl_positions.len();
+                            let (mut first, moved) = if total >= n {
+                                let keep = total - n;
+                                let boundary = if keep == 0 {
+                                    0
                                 } else {
-                                    if lines.ends_with('\n') {
-                                        lines.pop();
-                                    }
-                                    process_lines(
-                                        &mut lines,
-                                        &mut state,
-                                        new_files,
-                                        args.suppress,
-                                    )?;
-                                }
+                                    nl_positions[keep - 1] + 1
+                                };
+                                (lines[..boundary].to_string(), lines[boundary..].to_string())
+                            } else {
+                                (String::new(), std::mem::take(&mut lines))
+                            };
+
+                            if !first.is_empty() && !*skip {
+                                process_lines(&mut first, &mut state, new_files, args.suppress)?;
                             }
 
-                            lines = removed_lines_string;
-
+                            // The next section is the moved lines plus the
+                            // matched line.
+                            lines = moved;
                             if line.is_empty() {
                                 lines.push('\n');
                             } else {
@@ -280,9 +299,6 @@ fn csplit_file(args: &Args, ctx: SplitOps, new_files: &mut Vec<String>) -> io::R
                                 }
                                 lines.push_str(&line);
                             } else {
-                                if lines.ends_with('\n') {
-                                    lines.pop();
-                                }
                                 process_lines(&mut lines, &mut state, new_files, args.suppress)?;
 
                                 if line.is_empty() {
@@ -316,31 +332,26 @@ fn csplit_file(args: &Args, ctx: SplitOps, new_files: &mut Vec<String>) -> io::R
                             if *skip {
                                 lines.clear();
                             } else {
-                                if lines.ends_with('\n') {
-                                    lines.pop();
-                                }
                                 process_lines(&mut lines, &mut state, new_files, args.suppress)?;
                                 lines = String::new();
                             }
                         }
                     }
 
-                    match split_options.len() {
-                        1 => {
+                    // `{N}` repeats the pattern N more times (N+1 matches total).
+                    if matches!(split_options.get(1), Some(Operand::Repeat(_))) {
+                        let remaining = match split_options.get(1) {
+                            Some(Operand::Repeat(r)) => *r,
+                            _ => 0,
+                        };
+                        if remaining == 0 {
                             split_options.remove(0);
+                            split_options.remove(0);
+                        } else if let Some(Operand::Repeat(r)) = split_options.get_mut(1) {
+                            *r -= 1;
                         }
-                        us if us > 1 => {
-                            if let Operand::Repeat(repeat) = &mut split_options[1] {
-                                *repeat -= 1;
-                                if *repeat == 0 {
-                                    split_options.remove(0);
-                                    split_options.remove(0);
-                                }
-                            } else {
-                                split_options.remove(0);
-                            }
-                        }
-                        _ => {}
+                    } else {
+                        split_options.remove(0);
                     }
                 } else {
                     if line.is_empty() {
@@ -447,8 +458,11 @@ fn parse_op_rx(opstr: &str, delim: char) -> io::Result<Operand> {
 
     // parse string sandwiched between two delimiter chars
     let end_pos = res.unwrap();
-    let re_str = &opstr[1..end_pos];
-    let re = Regex::bre(re_str)?;
+    // An escaped delimiter (`\/` or `\%`) inside the pattern represents a
+    // literal delimiter character; translate it before compiling the BRE so
+    // e.g. `/proc\/sys/` matches `proc/sys`.
+    let re_str = opstr[1..end_pos].replace(&format!("\\{delim}"), &delim.to_string());
+    let re = Regex::bre(&re_str)?;
 
     // reference offset string
     let mut offset_str = &opstr[end_pos + 1..];
@@ -539,7 +553,7 @@ fn parse_op_linenum(opstr: &str) -> io::Result<Operand> {
     // parse simple positive integer
     match opstr.parse::<usize>() {
         Ok(0) => Err(Error::other("line number must be greater than zero")),
-        Ok(n) => Ok(Operand::LineNum(n)),
+        Ok(n) => Ok(Operand::LineNum { target: n, step: n }),
         Err(e) => {
             let msg = format!("{}", e);
             Err(Error::other(msg))
@@ -800,7 +814,7 @@ mod tests {
     fn test_parse_op_linenum_valid() {
         let opstr = "10";
         match parse_op_linenum(opstr) {
-            Ok(Operand::LineNum(n)) => assert_eq!(n, 10),
+            Ok(Operand::LineNum { target, .. }) => assert_eq!(target, 10),
             _ => panic!("Expected Ok(Operand::LineNum)"),
         }
     }
@@ -852,7 +866,7 @@ mod tests {
                     _ => panic!("Expected Operand::Rx"),
                 }
                 match &ops.ops[2] {
-                    Operand::LineNum(n) => assert_eq!(*n, 15),
+                    Operand::LineNum { target, .. } => assert_eq!(*target, 15),
                     _ => panic!("Expected Operand::LineNum"),
                 }
                 match &ops.ops[3] {
@@ -895,7 +909,7 @@ mod tests {
         let mut contents = String::new();
         file.read_to_string(&mut contents).unwrap();
 
-        let expected = String::from("1sdfghnm\n2sadsgdhjmf\n3zcxbncvm vbm\n4asdbncv");
+        let expected = String::from("1sdfghnm\n2sadsgdhjmf\n3zcxbncvm vbm\n4asdbncv\n");
 
         assert_eq!(contents, expected);
 
@@ -904,7 +918,7 @@ mod tests {
         let mut contents = String::new();
         file.read_to_string(&mut contents).unwrap();
 
-        let expected = String::from("13\n14\n15\n16\n17");
+        let expected = String::from("15\n16\n17");
 
         assert_eq!(contents, expected);
 
@@ -952,7 +966,7 @@ mod tests {
         file.read_to_string(&mut contents).unwrap();
 
         let expected =
-            String::from("int main() {\n    printf(\"Hello, world!\\n\");\n    return 0;\n}");
+            String::from("int main() {\n    printf(\"Hello, world!\\n\");\n    return 0;\n}\n");
 
         assert_eq!(contents, expected);
 
@@ -970,6 +984,7 @@ mod tests {
         fs::remove_file("c_file01").unwrap();
         fs::remove_file("c_file02").unwrap();
         fs::remove_file("c_file03").unwrap();
+        fs::remove_file("c_file04").unwrap();
     }
 
     #[test]
@@ -1008,7 +1023,7 @@ mod tests {
         let mut contents = String::new();
         file.read_to_string(&mut contents).unwrap();
 
-        let expected = String::from("    printf(\"Hello, world!\\n\");\n    return 0;\n}");
+        let expected = String::from("    printf(\"Hello, world!\\n\");\n    return 0;\n}\n");
 
         assert_eq!(contents, expected);
 
@@ -1026,6 +1041,7 @@ mod tests {
         fs::remove_file("c_file_2_01").unwrap();
         fs::remove_file("c_file_2_02").unwrap();
         fs::remove_file("c_file_2_03").unwrap();
+        fs::remove_file("c_file_2_04").unwrap();
     }
 
     #[test]
@@ -1065,7 +1081,7 @@ mod tests {
         file.read_to_string(&mut contents).unwrap();
 
         let expected =
-            String::from("\nint main() {\n    printf(\"Hello, world!\\n\");\n    return 0;\n}");
+            String::from("\nint main() {\n    printf(\"Hello, world!\\n\");\n    return 0;\n}\n");
 
         assert_eq!(contents, expected);
 
@@ -1083,6 +1099,7 @@ mod tests {
         fs::remove_file("c_file_3_01").unwrap();
         fs::remove_file("c_file_3_02").unwrap();
         fs::remove_file("c_file_3_03").unwrap();
+        fs::remove_file("c_file_3_04").unwrap();
     }
 
     #[test]
@@ -1122,7 +1139,7 @@ mod tests {
         file.read_to_string(&mut contents).unwrap();
 
         let expected =
-            String::from("int main() {\n    printf(\"Hello, world!\\n\");\n    return 0;");
+            String::from("int main() {\n    printf(\"Hello, world!\\n\");\n    return 0;\n");
 
         assert_eq!(contents, expected);
 
@@ -1132,7 +1149,7 @@ mod tests {
         file.read_to_string(&mut contents).unwrap();
 
         let expected =
-            String::from("}\n\nvoid func3() {\n    printf(\"This is function 3\\n\");\n}\n");
+            String::from("}\n\nvoid func3() {\n    printf(\"This is function 3\\n\");\n");
 
         assert_eq!(contents, expected);
 
@@ -1140,6 +1157,7 @@ mod tests {
         fs::remove_file("c_file_4_01").unwrap();
         fs::remove_file("c_file_4_02").unwrap();
         fs::remove_file("c_file_4_03").unwrap();
+        fs::remove_file("c_file_4_04").unwrap();
     }
 
     #[test]
@@ -1178,7 +1196,7 @@ mod tests {
         let mut contents = String::new();
         file.read_to_string(&mut contents).unwrap();
 
-        let expected = String::from("int main() {\n    printf(\"Hello, world!\\n\");");
+        let expected = String::from("int main() {\n    printf(\"Hello, world!\\n\");\n");
 
         assert_eq!(contents, expected);
 
@@ -1188,7 +1206,7 @@ mod tests {
         file.read_to_string(&mut contents).unwrap();
 
         let expected =
-            String::from("    printf(\"This is function 2\\n\");\n}\n\nvoid func3() {\n    printf(\"This is function 3\\n\");\n}\n");
+            String::from("    printf(\"This is function 2\\n\");\n}\n\nvoid func3() {\n");
 
         assert_eq!(contents, expected);
 
@@ -1196,5 +1214,6 @@ mod tests {
         fs::remove_file("c_file_5_01").unwrap();
         fs::remove_file("c_file_5_02").unwrap();
         fs::remove_file("c_file_5_03").unwrap();
+        fs::remove_file("c_file_5_04").unwrap();
     }
 }

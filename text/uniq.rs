@@ -9,6 +9,7 @@
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use plib::locale::isblank;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -81,86 +82,93 @@ fn uniq(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         None => Box::new(BufReader::new(io::stdin())),
     };
 
+    // A "-" output_file operand means standard output (POSIX), not a file
+    // literally named "-".
     let mut output: Box<dyn Write> = match &args.output_file {
-        Some(file) => Box::new(File::create(file)?),
-        None => Box::new(io::stdout()),
+        Some(file) if file.as_os_str() != "-" => Box::new(File::create(file)?),
+        _ => Box::new(io::stdout()),
     };
 
     let lines: Vec<String> = input.lines().collect::<Result<_, _>>()?;
 
-    let mut last_line: Option<String> = None;
+    // Track the first line of the current run plus its comparison key; the key
+    // is computed once per line (not recomputed for the previous line each
+    // iteration).
+    let mut current: Option<(String, String)> = None;
     let mut current_count = 0;
 
     for line in &lines {
-        let processed_line = process_line(line, args.fields, args.chars);
+        let key = process_line(line, args.fields, args.chars);
 
-        if let Some(last_line) = &last_line {
-            let processed_last_line = process_line(last_line, args.fields, args.chars);
-            if processed_line == processed_last_line {
+        match &current {
+            Some((_, last_key)) if *last_key == key => {
                 current_count += 1;
-                continue;
-            } else {
-                output_result(&mut output, last_line, current_count, args)?;
+            }
+            Some((first_line, _)) => {
+                output_result(&mut output, first_line, current_count, args)?;
+                current = Some((line.clone(), key));
+                current_count = 1;
+            }
+            None => {
+                current = Some((line.clone(), key));
+                current_count = 1;
             }
         }
-        last_line = Some(line.to_string());
-        current_count = 1;
     }
 
-    if let Some(last) = last_line {
-        output_result(&mut output, &last, current_count, args)?;
+    if let Some((first_line, _)) = current {
+        output_result(&mut output, &first_line, current_count, args)?;
     }
     Ok(())
 }
 
-/// Processes a line according to the specified field and character options.
+/// Returns the comparison key for `line`: the remainder after skipping the
+/// first `fields` fields and then the first `chars` characters.
 ///
-/// # Arguments
-///
-/// * `line` - The line to be processed.
-/// * `fields` - The number of fields to skip.
-/// * `chars` - The number of characters to skip.
-///
-/// # Returns
-///
-/// Returns the processed line as a `String`.
+/// A field is `[[:blank:]]*[^[:blank:]]*` — leading `<blank>`s belong to the
+/// field, followed by the run of non-blanks (POSIX). Character skipping uses
+/// character counts, not byte offsets, so multibyte input does not panic. When
+/// the skips consume the whole line, the key is the empty string (a null
+/// string), so two lines that reduce to nothing compare equal.
 fn process_line(line: &str, fields: Option<usize>, chars: Option<usize>) -> String {
-    let mut processed_line = line.to_string();
-    if line.is_empty() {
-        return line.to_string();
-    }
-    if let Some(f) = fields {
-        if f == 0 {
-            processed_line = line.to_string();
-        } else {
-            let mut field_count = 0;
+    let mut start = 0; // byte offset into `line`
 
-            let chars = line.chars().skip_while(|c| {
-                if c.is_whitespace() {
-                    if field_count >= f - 1 {
-                        return false;
-                    }
-                    field_count += 1;
+    if let Some(f) = fields {
+        let mut it = line.char_indices().peekable();
+        for _ in 0..f {
+            // Skip leading blanks of this field.
+            while let Some(&(i, c)) = it.peek() {
+                if isblank(c) {
+                    it.next();
+                    start = i + c.len_utf8();
+                } else {
+                    break;
                 }
-                true
-            });
-            processed_line = chars.collect::<String>();
+            }
+            // Skip the non-blank run of this field.
+            while let Some(&(i, c)) = it.peek() {
+                if isblank(c) {
+                    break;
+                }
+                it.next();
+                start = i + c.len_utf8();
+            }
+            if it.peek().is_none() {
+                break;
+            }
         }
     }
+
+    let mut rest = &line[start..];
 
     if let Some(c) = chars {
-        if c < processed_line.len() {
-            processed_line = processed_line[c..].to_string();
-        } else {
-            processed_line.clear();
-        }
+        rest = match rest.char_indices().nth(c) {
+            Some((i, _)) => &rest[i..],
+            None => "", // skipped past the end: null comparison string
+        };
     }
 
-    if processed_line.is_empty() {
-        line.to_string()
-    } else {
-        processed_line
-    }
+    rest.to_string()
 }
 
 /// Writes the result to the output according to the specified arguments.

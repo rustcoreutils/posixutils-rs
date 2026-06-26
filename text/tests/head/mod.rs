@@ -267,3 +267,16 @@ input_len: {input_len}
     }
 }
 /* #endregion */
+
+#[test]
+fn head_dash_operand_reads_stdin() {
+    // A "-" operand reads standard input rather than a file named "-".
+    run_test(TestPlan {
+        cmd: String::from("head"),
+        args: vec![String::from("-")],
+        stdin_data: String::from("a\nb\nc\n"),
+        expected_out: String::from("a\nb\nc\n"),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}

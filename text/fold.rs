@@ -7,13 +7,13 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::io::input_stream;
-use plib::BUFSZ;
+use plib::io::input_stream_dashed;
+use plib::locale::{mb_char_slices, wcwidth_char};
 
 const TABSTOP: usize = 8;
 
@@ -35,131 +35,109 @@ struct Args {
     files: Vec<PathBuf>,
 }
 
-struct OutputState {
-    args: Args,
-    column: usize,
-    data: Vec<u8>,
-}
-
-impl OutputState {
-    fn new(args: &Args) -> OutputState {
-        OutputState {
-            args: args.clone(),
-            column: 0,
-            data: Vec::new(),
+/// Column reached after appending character `ch` (a single locale-segmented
+/// character) to a line whose current column is `col`.
+///
+/// In `-b` (byte) mode every character contributes its byte length and the
+/// control-character column semantics do not apply. Otherwise `<backspace>`
+/// decrements (never below zero), `<carriage-return>` resets to zero, `<tab>`
+/// advances to the next 8-column stop, and any other character advances by its
+/// display width under `LC_CTYPE`.
+fn char_advance(col: usize, ch: &[u8], bytes_mode: bool) -> usize {
+    if bytes_mode {
+        return col + ch.len();
+    }
+    match ch {
+        b"\x08" => col.saturating_sub(1),
+        b"\r" => 0,
+        b"\t" => col + (TABSTOP - (col % TABSTOP)),
+        _ => {
+            let w = std::str::from_utf8(ch)
+                .ok()
+                .and_then(|s| s.chars().next())
+                .map(wcwidth_char)
+                .unwrap_or(1);
+            col + if w > 0 { w as usize } else { 0 }
         }
-    }
-
-    fn push(&mut self, byte: u8) {
-        self.data.push(byte);
-    }
-
-    fn incr_column(&mut self, ch: char) {
-        if self.args.bytes {
-            self.column += 1;
-        } else {
-            match ch {
-                '\x08' => {
-                    if self.column > 0 {
-                        self.column -= 1;
-                    }
-                }
-                '\t' => {
-                    self.column += TABSTOP - (self.column % TABSTOP);
-                }
-                '\r' => {
-                    self.column = 0;
-                }
-                _ => {
-                    self.column += 1;
-                }
-            }
-        }
-    }
-
-    fn write_line(&mut self) -> io::Result<()> {
-        io::stdout().write_all(&self.data)?;
-
-        self.column = 0;
-        self.data.clear();
-
-        Ok(())
     }
 }
 
+/// Index of the last `<blank>` (`<space>` or `<tab>`) byte in `v`, or `None`.
+///
+/// POSIX `<blank>` is space and tab only; blank bytes are ASCII and never occur
+/// inside a multibyte character, so a byte scan is safe.
 fn find_last_blank(v: &[u8]) -> Option<usize> {
-    for (pos, chv) in v.iter().rev().enumerate() {
-        let ch = *chv as char;
-        if ch.is_whitespace() {
-            return Some(pos);
-        }
-    }
-
-    None
+    v.iter().rposition(|&b| b == b' ' || b == b'\t')
 }
 
 fn fold_file(args: &Args, pathname: &Path) -> io::Result<()> {
-    // open file, or stdin
-    let mut file = input_stream(pathname, false)?;
+    // open file, or stdin ("-" or no operand)
+    let mut reader = BufReader::new(input_stream_dashed(pathname)?);
 
-    let mut raw_buffer = [0; BUFSZ];
-    let mut state = OutputState::new(args);
+    let width = args.width as usize;
+    let mut out = BufWriter::new(io::stdout());
+    let mut line: Vec<u8> = Vec::new();
+    let mut col: usize = 0;
 
+    // Process one input line at a time so large inputs are not buffered in
+    // full. A <newline> never splits a multibyte character; the wrap state
+    // (`line`/`col`) carries across reads and is flushed at each newline.
+    let mut data: Vec<u8> = Vec::new();
     loop {
-        // read a chunk of file data
-        let n_read = file.read(&mut raw_buffer[..])?;
-        if n_read == 0 {
+        data.clear();
+        if reader.read_until(b'\n', &mut data)? == 0 {
             break;
         }
-
-        // slice of buffer containing file data
-        let buf = &raw_buffer[0..n_read];
-
-        // loop for each character in buffer, which may include partial lines
-        for chv in buf {
-            let ch = *chv as char;
-
-            if ch == '\n' {
-                state.push(*chv);
-                state.write_line()?;
+        for ch in mb_char_slices(&data) {
+            if ch == b"\n" {
+                line.extend_from_slice(ch);
+                out.write_all(&line)?;
+                line.clear();
+                col = 0;
                 continue;
             }
 
-            loop {
-                state.incr_column(ch);
+            let mut next = char_advance(col, ch, args.bytes);
 
-                if state.column <= args.width as usize {
-                    state.push(*chv);
-                    break;
-                }
-
+            // Insert breaks while appending this character would exceed the width
+            // and the line is non-empty (a single over-wide character on an empty
+            // line is emitted as-is; the spec leaves that case undefined).
+            while next > width && !line.is_empty() {
+                let mut folded = false;
                 if args.spaces {
-                    if let Some(blankpos) = find_last_blank(&state.data) {
-                        let mut spill: Vec<u8> = Vec::new();
-                        let rhs = &state.data[blankpos + 1..];
-                        spill.extend_from_slice(rhs);
-                        state.data.truncate(blankpos + 1);
-                        state.push(b'\n');
-                        state.write_line()?;
-                        for dchv in &spill {
-                            let dch = *dchv as char;
-                            state.incr_column(dch);
+                    if let Some(b) = find_last_blank(&line) {
+                        out.write_all(&line[..=b])?;
+                        out.write_all(b"\n")?;
+                        let remainder = line[b + 1..].to_vec();
+                        line = remainder;
+                        // Recompute the column over the kept remainder (its
+                        // characters are complete: blanks are char boundaries).
+                        col = 0;
+                        for rc in mb_char_slices(&line) {
+                            col = char_advance(col, rc, args.bytes);
                         }
-                        state.data = spill;
-                        continue;
+                        folded = true;
                     }
                 }
-
-                if state.data.is_empty() {
-                    state.push(*chv);
-                    break;
+                if !folded {
+                    out.write_all(&line)?;
+                    out.write_all(b"\n")?;
+                    line.clear();
+                    col = 0;
                 }
-
-                state.push(b'\n');
-                state.write_line()?;
+                next = char_advance(col, ch, args.bytes);
             }
+
+            line.extend_from_slice(ch);
+            col = next;
         }
     }
+
+    // Trailing partial line (input without a final newline).
+    if !line.is_empty() {
+        out.write_all(&line)?;
+    }
+    out.flush()?;
 
     Ok(())
 }

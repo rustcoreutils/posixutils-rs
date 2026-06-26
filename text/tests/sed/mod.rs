@@ -9,6 +9,12 @@
 
 use plib::testing::{run_test, run_test_with_checker, TestPlan};
 
+/// Build an absolute path under the cargo test temp dir for a wfile, so that
+/// `w`/`s///w` side effects never leave scratch files in the repository.
+fn wfile(name: &str) -> String {
+    format!("{}/sed_{}", env!("CARGO_TARGET_TMPDIR"), name)
+}
+
 fn sed_test(
     args: &[&str],
     test_data: &str,
@@ -515,10 +521,12 @@ mod tests {
                 "sed: commands must be delimited with ';' (line: 0, col: 3)\n",
             ),
             (
+                // <newline> separates commands; on line 2 ` gh ` the `h`
+                // immediately follows the `g` command without a delimiter.
                 "g; h \n gh \n g h ; gh \\",
                 "abc\ndef\n@#$",
                 "",
-                "sed: commands must be delimited with ';' (line: 1, col: 2)\n",
+                "sed: commands must be delimited with ';' (line: 1, col: 3)\n",
             ),
         ];
 
@@ -836,7 +844,7 @@ mod tests {
                 "a\\",
                 "abc\ndef\n@#$",
                 "",
-                "sed: missing text argument (line: 1, col: 1)\n",
+                "sed: missing text argument (line: 0, col: 3)\n",
             ),
             (
                 "a  \text",
@@ -857,10 +865,14 @@ mod tests {
                 "sed: text must be separated with '\\' (line: 0, col: 2)\n",
             ),
             (
+                // The <newline> ends the `a` text (POSIX/GNU: text ends at the
+                // first line not ending in `\`). Line 2 ` text ` is a separate
+                // command: `t` (branch-if-substituted) with label `ext`, which
+                // is undefined. Matches GNU sed.
                 "a\\ text text \n text ",
                 "abc\ndef\n@#$",
                 "",
-                "sed: commands must be delimited with ';' (line: 1, col: 2)\n",
+                "sed: can't find label for jump to `ext'\n",
             ),
             (
                 "atext",
@@ -905,10 +917,15 @@ mod tests {
                 "sed: can't find label for jump to `label'\n",
             ),
             (
+                // The <newline> separates commands: `b ab` (branch to label
+                // `ab`), then line 2 `cd` is a `c` command, which requires a
+                // `\` before its text. (GNU accepts the one-line `c text` form
+                // and instead reports the missing `ab` label; this impl does not
+                // implement that extension, a pre-existing limitation.)
                 "b ab\ncd; :ab\ncd",
                 "",
                 "",
-                "sed: commands must be delimited with ';' (line: 1, col: 1)\n",
+                "sed: text must be separated with '\\' (line: 1, col: 2)\n",
             ),
             (
                 "b label",
@@ -941,10 +958,13 @@ mod tests {
                 "sed: can't find label for jump to `g'\n",
             ),
             (
+                // `l` is now a valid command (POSIX list); `label` parses as
+                // `l` followed by `abel`, so the diagnostic is the delimiter
+                // error rather than "unknown character 'l'".
                 "b; label",
                 "aa\naa",
                 "",
-                "sed: unknown character 'l' (line: 0, col: 4)\n",
+                "sed: commands must be delimited with ';' (line: 0, col: 5)\n",
             ),
             (
                 "b :label",
@@ -1002,7 +1022,7 @@ mod tests {
                 "c\\",
                 "abc\ndef\n@#$",
                 "",
-                "sed: missing text argument (line: 1, col: 1)\n",
+                "sed: missing text argument (line: 0, col: 3)\n",
             ),
             (
                 "c  \text",
@@ -1023,10 +1043,12 @@ mod tests {
                 "sed: text must be separated with '\\' (line: 0, col: 2)\n",
             ),
             (
+                // The <newline> ends the `c` text; line 2 ` text ` parses as a
+                // separate `t` command with undefined label `ext`. Matches GNU.
                 "c\\ text text \n text ",
                 "abc\ndef\n@#$",
                 "",
-                "sed: commands must be delimited with ';' (line: 1, col: 2)\n",
+                "sed: can't find label for jump to `ext'\n",
             ),
         ];
 
@@ -1266,7 +1288,7 @@ mod tests {
                 "i\\",
                 "abc\ncdf\n\n",
                 "",
-                "sed: missing text argument (line: 1, col: 1)\n",
+                "sed: missing text argument (line: 0, col: 3)\n",
             ),
             (
                 "i  \text",
@@ -1287,10 +1309,12 @@ mod tests {
                 "sed: text must be separated with '\\' (line: 0, col: 2)\n",
             ),
             (
+                // The <newline> ends the `i` text; line 2 ` text ` parses as a
+                // separate `t` command with undefined label `ext`. Matches GNU.
                 "i\\ text text \n text ",
                 "abc\ncdf\n\n",
                 "",
-                "sed: commands must be delimited with ';' (line: 1, col: 2)\n",
+                "sed: can't find label for jump to `ext'\n",
             ),
         ];
 
@@ -1304,9 +1328,11 @@ mod tests {
         let test_data = [
             // correct
             (
+                // `I` (extension) now renders in the same GNU `l` form as the
+                // POSIX `l` command: octal escapes for non-printables.
                 "I",
                 "\x01\x02\x03\x04\x05\x06\x07\x08\x09\n\x0B\x0C\x0D\x0E\x0F",
-                "\\x01\\x02\\x03\\x04\\x05\\x06\\a\\b\\t$\\v\\f\\r\\x0e\\x0f$",
+                "\\001\\002\\003\\004\\005\\006\\a\\b\\t$\n\\v\\f\\r\\016\\017$\n",
                 "",
             ),
             // wrong
@@ -1613,88 +1639,94 @@ mod tests {
 
     #[test]
     fn test_s_with_right_flags() {
-        let test_data = [
+        // wfile paths are redirected to an absolute temp path to avoid leaving
+        // scratch files in the repo (relative paths now resolve against CWD).
+        let test_data: Vec<(String, &str, &str)> = vec![
             // correct
-            ("s/b/r/6", "abcbbdfbdbdfbfb\n", "abcbbdfbdbdfrfb\n", ""),
-            ("s/b/r/g", "abcbbdfbdbdfbfb\n", "arcrrdfrdrdfrfr\n", ""),
             (
-                "s/b/r/p",
+                "s/b/r/6".to_string(),
                 "abcbbdfbdbdfbfb\n",
-                "arcbbdfbdbdfbfb\narcbbdfbdbdfbfb\n",
-                "",
+                "abcbbdfbdbdfrfb\n",
             ),
             (
-                "s/b/r/w ./tests/sed/assets/r",
+                "s/b/r/g".to_string(),
+                "abcbbdfbdbdfbfb\n",
+                "arcrrdfrdrdfrfr\n",
+            ),
+            (
+                "s/b/r/p".to_string(),
+                "abcbbdfbdbdfbfb\n",
+                "arcbbdfbdbdfbfb\narcbbdfbdbdfbfb\n",
+            ),
+            (
+                format!("s/b/r/w {}", wfile("sr")),
                 "abcbbdfbdbdfbfb\n",
                 "arcbbdfbdbdfbfb\n",
-                "",
             ),
             (
-                "s/b/r/6p",
+                "s/b/r/6p".to_string(),
                 "abcbbdfbdbdfbfb\n",
                 "abcbbdfbdbdfrfb\nabcbbdfbdbdfrfb\n",
-                "",
             ),
             (
-                "s/[[:alpha:]]/r/g",
+                "s/[[:alpha:]]/r/g".to_string(),
                 "abc\nbbb\nbcb\nrbt\n@#$\n",
                 "rrr\nrrr\nrrr\nrrr\n@#$\n",
-                "",
             ),
             (
-                "s/b/r/gp",
+                "s/b/r/gp".to_string(),
                 "abcbbdfbdbdfbfb\n",
                 "arcrrdfrdrdfrfr\narcrrdfrdrdfrfr\n",
-                "",
             ),
             (
-                "s/b/r/p6",
+                "s/b/r/p6".to_string(),
                 "abcbbdfbdbdfbfb\n",
                 "abcbbdfbdbdfrfb\nabcbbdfbdbdfrfb\n",
-                "",
             ),
             (
-                "s/b/r/pw ./tests/sed/assets/r",
+                format!("s/b/r/pw {}", wfile("sr")),
                 "abcbbdfbdbdfbfb\n",
                 "arcbbdfbdbdfbfb\narcbbdfbdbdfbfb\n",
-                "",
             ),
             (
-                "s/b/r/6pw ./tests/sed/assets/r",
+                format!("s/b/r/6pw {}", wfile("sr")),
                 "abcbbdfbdbdfbfb\n",
                 "abcbbdfbdbdfrfb\nabcbbdfbdbdfrfb\n",
-                "",
             ),
             (
-                "s/b/r/gpw ./tests/sed/assets/r",
+                format!("s/b/r/gpw {}", wfile("sr")),
                 "abcbbdfbdbdfbfb\n",
                 "arcrrdfrdrdfrfr\narcrrdfrdrdfrfr\n",
-                "",
             ),
             (
-                "s/b/r/ p",
+                "s/b/r/ p".to_string(),
                 "abc\nbbb\nbcb\nrbt",
                 "arc\narc\nrbb\nrbb\nrcb\nrcb\nrrt\nrrt",
-                "",
             ),
             (
-                "s/b/r/ p w ./r",
+                format!("s/b/r/ p w {}", wfile("sr2")),
                 "abc\nbbb\nbcb\nrbt",
                 "arc\narc\nrbb\nrbb\nrcb\nrcb\nrrt\nrrt",
-                "",
             ),
             (
-                "s/b/r/w g6",
+                format!("s/b/r/w {}", wfile("g6")),
                 "abc\nbbb\nbcb\nrbt\n",
                 "arc\nrbb\nrcb\nrrt\n",
-                "",
             ),
-            ("s/b/r/wpg6", "abc\nbbb\nbcb\nrbt", "arc\nrbb\nrcb\nrrt", ""),
-            ("s/b/r/w6", "abc\nbbb\nbcb\nrbt", "arc\nrbb\nrcb\nrrt", ""),
+            (
+                format!("s/b/r/w{}", wfile("pg6")),
+                "abc\nbbb\nbcb\nrbt",
+                "arc\nrbb\nrcb\nrrt",
+            ),
+            (
+                format!("s/b/r/w{}", wfile("6")),
+                "abc\nbbb\nbcb\nrbt",
+                "arc\nrbb\nrcb\nrrt",
+            ),
         ];
 
-        for (script, input, output, err) in test_data {
-            sed_test(&["-e", script], input, output, err, !err.is_empty() as i32);
+        for (script, input, output) in test_data {
+            sed_test(&["-e", &script], input, output, "", 0);
         }
     }
 
@@ -1830,10 +1862,12 @@ mod tests {
             ),
             ("t g", "", "", "sed: can't find label for jump to `g'\n"),
             (
+                // `l` is now a valid command (POSIX list); `label` parses as
+                // `l` followed by `abel`.
                 "t; label",
                 "aa\naaa\n\n",
                 "",
-                "sed: unknown character 'l' (line: 0, col: 4)\n",
+                "sed: commands must be delimited with ';' (line: 0, col: 5)\n",
             ),
             (
                 "t label :label",
@@ -1842,10 +1876,13 @@ mod tests {
                 "sed: label can't contain ' ' (line: 0, col: 14)\n",
             ),
             (
+                // The <newline> separates commands: `t ab`, then line 2 `cd`
+                // is a `c` command requiring a `\` before its text. (GNU's
+                // one-line `c text` extension is not implemented here.)
                 "t ab\ncd; :ab\ncd",
                 "aa\naaa\n\n",
                 "",
-                "sed: commands must be delimited with ';' (line: 1, col: 1)\n",
+                "sed: text must be separated with '\\' (line: 1, col: 2)\n",
             ),
         ];
 
@@ -1856,35 +1893,48 @@ mod tests {
 
     #[test]
     fn test_w() {
-        let test_data = [
+        // Relative wfile paths are written relative to the CWD; tests redirect
+        // them to an absolute temp path so no scratch files leak into the repo.
+        let test_data: Vec<(String, &str, &str, String)> = vec![
             // correct
-            ("w atyfv", "abc\ncdf\n", "abc\ncdf\n", ""),
-            ("w./tests/sed/assets/r", "", "", ""),
-            ("w newfile", "a\n", "a\n", ""),
-            ("w ; h", "abc\ncdf\n", "abc\ncdf\n", ""),
+            (
+                format!("w {}", wfile("atyfv")),
+                "abc\ncdf\n",
+                "abc\ncdf\n",
+                String::new(),
+            ),
+            (format!("w{}", wfile("w_empty")), "", "", String::new()),
+            (format!("w {}", wfile("newfile")), "a\n", "a\n", String::new()),
+            ("w ; h".to_string(), "abc\ncdf\n", "abc\ncdf\n", String::new()),
             // wrong
             (
-                "w ./dir/newfile", 
-                "abc\ncdf\n", 
-                "", 
-                "sed: read stdin: can't find './dir/newfile': no such file or directory (os error 2)\n",
+                "w ./dir/newfile".to_string(),
+                "abc\ncdf\n",
+                "",
+                "sed: read stdin: can't find './dir/newfile': no such file or directory (os error 2)\n".to_string(),
             ),
             (
-                "w./tests/s\x04ed/assets/abc",
+                "w./tests/s\x04ed/assets/abc".to_string(),
                 "a\n",
                 "",
-                "sed: read stdin: can't find './tests/s\u{4}ed/assets/abc': no such file or directory (os error 2)\n",
+                "sed: read stdin: can't find './tests/s\u{4}ed/assets/abc': no such file or directory (os error 2)\n".to_string(),
             ),
             (
-                "w./tests/ard/assets/abc",
+                "w./tests/ard/assets/abc".to_string(),
                 "a\n",
                 "",
-                "sed: read stdin: can't find './tests/ard/assets/abc': no such file or directory (os error 2)\n",
+                "sed: read stdin: can't find './tests/ard/assets/abc': no such file or directory (os error 2)\n".to_string(),
             ),
         ];
 
         for (script, input, output, err) in test_data {
-            sed_test(&["-e", script], input, output, err, !err.is_empty() as i32);
+            sed_test(
+                &["-e", &script],
+                input,
+                output,
+                &err,
+                !err.is_empty() as i32,
+            );
         }
     }
 
@@ -2000,10 +2050,16 @@ mod tests {
             ("#n", "abc\ncdf\naaa", "", ""),
             // wrong
             (
+                // `#text` is stripped as a comment, leaving `a\` then `text`
+                // on the next line. With POSIX multi-line `a` support, that is
+                // the classic two-line form, so `text` is appended after each
+                // input line (deferred). (GNU does not strip `#text` as a
+                // comment here; that comment-stripping divergence is pre-existing
+                // and out of scope.)
                 "a\\#text\ntext",
                 "abc\ncdf\naaa\n",
+                "abc\ntext\ncdf\ntext\naaa\ntext\n",
                 "",
-                "sed: missing text argument (line: 1, col: 1)\n",
             ),
             (
                 "{ #\\ }\n{ #\n }\n#h",
@@ -2018,10 +2074,13 @@ mod tests {
                 "sed: '{' not have pair for closing block (line: 0, col: 1)\n",
             ),
             (
+                // `#abc` is stripped as a comment, leaving `a\text` then a
+                // <newline> (command separator) then line 2 `text`, which parses
+                // as a `t` command with undefined label `ext`. Matches GNU.
                 "a\\text#abc\ntext",
                 "abc\ncdf\n",
                 "",
-                "sed: commands must be delimited with ';' (line: 1, col: 2)\n",
+                "sed: can't find label for jump to `ext'\n",
             ),
         ];
 
@@ -2311,5 +2370,134 @@ mod tests {
         for (script, input, output, err) in test_data {
             sed_test(&["-e", script], input, output, err, !err.is_empty() as i32);
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // POSIX-conformance regression tests (all outputs verified against GNU sed).
+    // -------------------------------------------------------------------------
+
+    /// #1 POSIX `l` command: visually-unambiguous output with three-digit octal
+    /// escapes, C escapes, embedded `\n`, and line folding.
+    #[test]
+    fn test_l_command() {
+        // tab, backslash, BEL -> \t \\ \a, then trailing $.
+        sed_test(&["-n", "-e", "l"], "\t\\\x07", "\\t\\\\\\a$\n", "", 0);
+        // Embedded newline (via N) is shown as \n, not a real newline.
+        sed_test(&["-n", "-e", "N;l"], "a\nb\n", "a\\nb$\n", "", 0);
+        // Non-printable bytes as three-digit octal.
+        sed_test(&["-n", "-e", "l"], "\x01\x1f", "\\001\\037$\n", "", 0);
+        // Optional line-wrap width argument: l 5.
+        sed_test(
+            &["-n", "-e", "l 5"],
+            "aaaaaaaaaa",
+            "aaaa\\\naaaa\\\naa$\n",
+            "",
+            0,
+        );
+        // Width 0 disables folding.
+        sed_test(&["-n", "-e", "l 0"], "aaaaaaaaaa", "aaaaaaaaaa$\n", "", 0);
+    }
+
+    /// #2 `-E` selects ERE for all regexes (regexes are compiled at parse time,
+    /// so the flag must be applied before parsing).
+    #[test]
+    fn test_ere_flag() {
+        // ERE: `a+` is a quantifier.
+        sed_test(&["-E", "-e", "s/a+/X/"], "aaa\n", "X\n", "", 0);
+        // BRE: `+` is literal, so `a+` does not match `aaa`.
+        sed_test(&["-e", "s/a+/X/"], "aaa\n", "aaa\n", "", 0);
+        // BRE: `a+` matches the literal text `a+`.
+        sed_test(&["-e", "s/a+/X/"], "a+\n", "X\n", "", 0);
+    }
+
+    /// #3 `a` text is deferred to just before the next input line, so a later
+    /// command in the same cycle cannot see or alter it.
+    #[test]
+    fn test_a_deferred() {
+        sed_test(
+            &["-e", "a\\APP", "-e", "s/APP/Z/"],
+            "x\n",
+            "x\nAPP\n",
+            "",
+            0,
+        );
+        // Deferred output is still emitted when the cycle ends with `d`.
+        sed_test(&["-e", "a\\foo", "-e", "d"], "x\n", "foo\n", "", 0);
+    }
+
+    /// #4 `D` must not clear the hold space. After a D-loop the hold value set on
+    /// the first line is still observable via `x`.
+    #[test]
+    fn test_d_keeps_hold() {
+        sed_test(&["-e", "1h;$!{N;D};x"], "a\nb\nc\n", "a\n", "", 0);
+    }
+
+    /// #5 `s///i` case-insensitive matching (POSIX.1-2024, Defect 779).
+    #[test]
+    fn test_s_icase_flag() {
+        sed_test(&["-e", "s/abc/x/i"], "ABC\n", "x\n", "", 0);
+        sed_test(&["-e", "s/abc/x/I"], "AbC\n", "x\n", "", 0);
+    }
+
+    /// #6 `=` writes the line number regardless of -n.
+    #[test]
+    fn test_eq_under_quiet() {
+        sed_test(&["-n", "-e", "="], "a\nb\n", "1\n2\n", "", 0);
+    }
+
+    /// #7 `r file` is deferred like `a`; a later command does not see its
+    /// contents, and the file contents are emitted after the current line.
+    #[test]
+    fn test_r_deferred() {
+        sed_test(
+            &["-e", "r ./tests/sed/assets/abc", "-e", "s/.*/X/"],
+            "a\n",
+            "X\nabc\n",
+            "",
+            0,
+        );
+    }
+
+    /// #8 A wfile is created (truncated) before processing begins, so a `w`
+    /// whose address never matches still yields an empty file.
+    #[test]
+    fn test_wfile_precreated_when_unmatched() {
+        let wf = wfile("never_matches");
+        let _ = std::fs::remove_file(&wf);
+        sed_test(&["-e", &format!("99 w {wf}")], "a\nb\n", "a\nb\n", "", 0);
+        let meta = std::fs::metadata(&wf).expect("wfile must be pre-created");
+        assert_eq!(meta.len(), 0, "wfile must be empty when never matched");
+        let _ = std::fs::remove_file(&wf);
+    }
+
+    /// #9 `y///` escapes are resolved when parsing the operands, so a literal
+    /// backslash-n already present in the pattern space is not corrupted, and an
+    /// escaped newline operand transliterates to a real newline.
+    #[test]
+    fn test_y_escapes() {
+        // Literal `\n` (backslash + n) in input is preserved (not turned into a
+        // newline) by an unrelated transliteration.
+        sed_test(&["-e", "y/a/X/"], "a\\nb\n", "X\\nb\n", "", 0);
+        // Escaped newline operand -> real newline.
+        sed_test(&["-e", "y/Z/\\n/"], "aZb\n", "a\nb\n", "", 0);
+    }
+
+    /// #10 `s///` replacement escapes: `\n`->newline, `\t`->tab, `\\`->`\`,
+    /// `\&`->literal `&`, and backrefs.
+    #[test]
+    fn test_s_replacement_escapes() {
+        sed_test(&["-e", "s/b/\\n/"], "abc\n", "a\nc\n", "", 0);
+        sed_test(&["-e", "s/b/\\t/"], "abc\n", "a\tc\n", "", 0);
+        // Use a non-`/` delimiter: `\\` adjacent to a `/` delimiter hits a
+        // separate pre-existing escaped-delimiter quirk in the parser.
+        sed_test(&["-e", "s|b|\\\\|"], "abc\n", "a\\c\n", "", 0);
+        sed_test(&["-e", "s/\\(b\\)/[\\1\\&]/"], "abc\n", "a[b&]c\n", "", 0);
+    }
+
+    /// #16 Duplicate `:label` definitions are accepted (not an error), matching
+    /// GNU sed.
+    #[test]
+    fn test_duplicate_labels_ok() {
+        sed_test(&["-e", ":x", "-e", ":x"], "a\n", "a\n", "", 0);
     }
 }

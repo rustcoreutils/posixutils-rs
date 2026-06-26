@@ -13,7 +13,7 @@ use plib::testing::{run_test, run_test_with_checker, TestPlan};
 use regex::Regex;
 use std::fs;
 use std::io::Read;
-const PR_DATE_TIME_FORMAT: &str = "%b %d %H:%M %Y";
+const PR_DATE_TIME_FORMAT: &str = "%b %e %H:%M %Y";
 
 fn pr_test(args: &[&str], test_data: &str, expected_output: &str) {
     let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
@@ -304,4 +304,27 @@ fn pr_expand_and_replace() {
         None,
     );
     pr_test(&["-i?3", "-e", "-t", input], "", &output);
+}
+
+// Finding #6: POSIX places no restriction tying `-s` to multi-column mode. A
+// single-column `pr -s, file` must be accepted (previously rejected by a clap
+// `requires = "multi_column"`). The separator has no effect in single column.
+#[test]
+fn pr_separator_single_column() {
+    pr_test(&["-s,", "-t", "-l5"], "a\nb\nc\n", "a\nb\nc\n");
+}
+
+// Finding #7: a <form-feed> can end a page before it is full. The page's
+// non-padding line count must reflect the real number of lines so that
+// `required_rows` (and the multi-column row layout) is computed correctly,
+// rather than reporting the full page capacity. Here the form-feed after `c`
+// ends page 1 with 3 lines; in 2-column down mode each page must render only
+// `ceil(3/2) = 2` rows, not the full per-column page length.
+#[test]
+fn pr_form_feed_multi_column_page_accounting() {
+    pr_test(
+        &["-2", "-t", "-s,"],
+        "a\nb\nc\u{0c}d\ne\nf\n",
+        "a,c,\nb,\nd,f,\ne,\n",
+    );
 }

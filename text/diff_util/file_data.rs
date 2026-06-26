@@ -119,16 +119,6 @@ impl<'a> FileData<'a> {
         self.modified
     }
 
-    pub fn name(&self) -> &str {
-        if let Some(os_str) = self.path.file_name() {
-            if let Some(str_slice) = os_str.to_str() {
-                return str_slice;
-            }
-        }
-
-        COULD_NOT_UNWRAP_FILENAME
-    }
-
     pub fn path(&self) -> &str {
         self.path.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME)
     }

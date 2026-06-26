@@ -86,6 +86,12 @@ pub fn parse_normal(lines: &[&str], start: usize) -> Result<(FilePatch, usize), 
                 _ => continue,
             };
 
+            // Track which side the previous content line belonged to, so a
+            // following "\ No newline at end of file" marker is attributed
+            // to the old ('<') or new ('>') side.
+            let mut prev_old = false;
+            let mut prev_new = false;
+
             // Parse content lines
             while pos < lines.len() {
                 let content_line = lines[pos];
@@ -93,16 +99,26 @@ pub fn parse_normal(lines: &[&str], start: usize) -> Result<(FilePatch, usize), 
                 if let Some(rest) = content_line.strip_prefix("< ") {
                     // Delete line (from old file)
                     hunk.lines.push(LineOp::Delete(rest.to_string()));
+                    prev_old = true;
+                    prev_new = false;
                     pos += 1;
                 } else if let Some(rest) = content_line.strip_prefix("> ") {
                     // Add line (to new file)
                     hunk.lines.push(LineOp::Add(rest.to_string()));
+                    prev_old = false;
+                    prev_new = true;
                     pos += 1;
                 } else if content_line == "---" {
                     // Separator between delete and add in change
                     pos += 1;
                 } else if content_line.starts_with("\\") {
-                    // "\ No newline at end of file"
+                    // "\ No newline at end of file" applies to the preceding line.
+                    if prev_old {
+                        hunk.old_no_newline = true;
+                    }
+                    if prev_new {
+                        hunk.new_no_newline = true;
+                    }
                     pos += 1;
                 } else {
                     // End of this hunk

@@ -96,7 +96,9 @@ pub struct Args {
     #[arg(short = 'r', long, help = gettext("Write no diagnostic reports on failure to open files"))]
     no_file_warnings: bool,
 
-    #[arg(short = 's', long, value_parser = parse_separator, value_name = "CHAR", requires = "multi_column",
+    // POSIX places no restriction tying `-s` to multi-column mode, so it must
+    // be accepted in single-column mode too (where it has no harmful effect).
+    #[arg(short = 's', long, value_parser = parse_separator, value_name = "CHAR",
           help = gettext("Separate text columns by single character CHAR"))]
     separator: Option<char>,
 
@@ -345,6 +347,9 @@ pub struct Parameters {
     pub no_file_warnings: bool,
     pub form_feed: bool,
     pub pause: bool,
+    /// XSI `-f`/`-F` with pause: pause only once, before the very first page
+    /// (as opposed to `-p`, which pauses before every page).
+    pub pause_first_page_only: bool,
     pub strict_posix: bool,
     pub column_separator: char,
     pub line_separator: String,
@@ -382,7 +387,10 @@ impl Parameters {
         };
 
         let form_feed = args.form_feed || args.form_feed_with_pause;
-        let pause = args.pause || args.form_feed_with_pause;
+        // `-p` pauses before every page. The XSI `-f` option pauses only once,
+        // before the first page, so it is tracked separately.
+        let pause = args.pause;
+        let pause_first_page_only = args.form_feed_with_pause;
 
         let column_separator = args.separator.unwrap_or(' ');
 
@@ -392,13 +400,29 @@ impl Parameters {
             String::from("\n")
         };
 
-        let expand_tabs = args.expand_tabs.as_ref().map(|x| {
-            if x.num == 0 {
-                (x.chr, DEFAULT_TAB_WIDTH)
+        // POSIX: "The option -e shall be assumed for multiple text-column
+        // output." Multi-column output is in effect for -column > 1, for -a
+        // (which fills across columns), or for -m (merge). Note that GNU pr
+        // does NOT implicitly enable -i for multi-column output (it emits
+        // spaces, not tabs), so -i stays off unless explicitly requested.
+        let multi_column = num_columns > 1 || args.across || args.merge;
+
+        let expand_tabs = args
+            .expand_tabs
+            .as_ref()
+            .map(|x| {
+                if x.num == 0 {
+                    (x.chr, DEFAULT_TAB_WIDTH)
+                } else {
+                    (x.chr, x.num)
+                }
+            })
+            .or(if multi_column {
+                // Implicit -e: expand input tabs using the default tab stops.
+                Some((TAB, DEFAULT_TAB_WIDTH))
             } else {
-                (x.chr, x.num)
-            }
-        });
+                None
+            });
         let output_tabs = args.output_tabs.as_ref().map(|x| {
             if x.num == 0 {
                 (x.chr, DEFAULT_TAB_WIDTH)
@@ -453,6 +477,7 @@ impl Parameters {
             no_file_warnings: args.no_file_warnings,
             form_feed,
             pause,
+            pause_first_page_only,
             strict_posix: !args.prettify_headers,
             column_separator,
             line_separator,

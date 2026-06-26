@@ -7,18 +7,20 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::io::input_stream;
-use plib::BUFSZ;
+use plib::io::input_stream_dashed;
+use plib::locale::{mb_char_slices, wcwidth_char};
 
 /// expand - convert tabs to spaces
 #[derive(Parser)]
 #[command(version, about = gettext("expand - convert tabs to spaces"))]
 struct Args {
+    // `--tablist` is a non-POSIX long-option alias kept for convenience; POSIX
+    // specifies only `-t tablist`.
     #[arg(short, long, help = gettext("Tab stops, either a single positive decimal integer or a list of tabstops separated by commas."))]
     tablist: Option<String>,
 
@@ -27,98 +29,108 @@ struct Args {
 }
 
 enum TabList {
+    /// Uniform tab width: stops every N columns.
     UniStop(usize),
+    /// Explicit 1-based stop positions, ascending.
     Stops(Vec<usize>),
 }
 
 fn parse_tablist(tablist: &str) -> Result<TabList, &'static str> {
-    let res = tablist.parse::<usize>();
-    if let Ok(tab) = res {
+    // A single integer sets a uniform tab width. It must be positive: a width
+    // of zero is rejected rather than panicking on a modulo-by-zero.
+    if let Ok(tab) = tablist.parse::<usize>() {
+        if tab == 0 {
+            return Err("tab size must be a positive integer");
+        }
         return Ok(TabList::UniStop(tab));
     }
 
-    let mut v = Vec::new();
-    for token in tablist.split(&[' ', ','][..]) {
-        let n = match token.parse::<usize>() {
-            Ok(val) => val,
-            Err(_e) => return Err("Invalid tab stop in list"),
-        };
-
-        if !v.is_empty() {
-            let last = *v.iter().last().unwrap();
+    let mut v: Vec<usize> = Vec::new();
+    for token in tablist.split([' ', ',']) {
+        let n = token
+            .parse::<usize>()
+            .map_err(|_| "invalid tab stop in list")?;
+        // Each tab stop must be a positive integer (POSIX).
+        if n == 0 {
+            return Err("tab stop must be a positive integer");
+        }
+        if let Some(&last) = v.last() {
             if n <= last {
-                return Err("Invalid tab stop order in list");
+                return Err("tab stops must be in strictly ascending order");
             }
         }
-
         v.push(n);
     }
 
     Ok(TabList::Stops(v))
 }
 
-fn space_out(column: &mut usize, writer: &mut BufWriter<dyn Write>) -> io::Result<()> {
-    *column += 1;
-
-    writer.write_all(b" ")?;
-
-    Ok(())
+/// Next tab stop strictly greater than the current 0-based column `p`.
+fn next_stop(tablist: &TabList, p: usize) -> usize {
+    match tablist {
+        TabList::UniStop(n) => ((p / n) + 1) * n,
+        TabList::Stops(list) => {
+            // List values are 0-based column positions, on the same scale as
+            // the uniform multiples (matching GNU/POSIX: `-t 4` and `-t 4,…`
+            // share the first stop). A leading tab under `-t 4` advances to
+            // column 4, i.e. four spaces.
+            for &s in list {
+                if s > p {
+                    return s;
+                }
+            }
+            // Past the last explicit stop, each column is its own tab stop.
+            p + 1
+        }
+    }
 }
 
 fn expand_file(tablist: &TabList, pathname: &Path) -> io::Result<()> {
-    // open file, or stdin
-    let mut file = input_stream(pathname, false)?;
+    // open file, or stdin ("-" or no operand)
+    let mut reader = BufReader::new(input_stream_dashed(pathname)?);
 
-    let mut raw_buffer = [0; BUFSZ];
     let mut writer = BufWriter::new(io::stdout());
-    let mut column: usize = 1;
-    let mut cur_stop = 0;
+    // 0-based column = number of column positions consumed on the current line.
+    let mut p: usize = 0;
 
+    // Process one line at a time so arbitrarily large inputs (e.g. a long pipe)
+    // do not have to be buffered in full. A <newline> never splits a multibyte
+    // character, so chunking on it is safe; `p` resets at each line boundary.
+    let mut data: Vec<u8> = Vec::new();
     loop {
-        // read a chunk of file data
-        let n_read = file.read(&mut raw_buffer[..])?;
-        if n_read == 0 {
+        data.clear();
+        if reader.read_until(b'\n', &mut data)? == 0 {
             break;
         }
-
-        // slice of buffer containing file data
-        let buf = &raw_buffer[0..n_read];
-
-        for byte_ref in buf {
-            let byte = *byte_ref;
-            if byte == 0x8 {
-                // backspace
-                writer.write_all(&[byte])?;
-                if column > 1 {
-                    column -= 1;
-                }
-            } else if byte == b'\r' || byte == b'\n' {
-                writer.write_all(&[byte])?;
-                column = 1;
-            } else if byte != b'\t' {
-                writer.write_all(&[byte])?;
-                column += 1;
-            } else {
-                match tablist {
-                    TabList::UniStop(n) => {
-                        while (column % n) != 0 {
-                            space_out(&mut column, &mut writer)?;
-                        }
-                        space_out(&mut column, &mut writer)?;
+        for ch in mb_char_slices(&data) {
+            match ch {
+                b"\t" => {
+                    let stop = next_stop(tablist, p);
+                    for _ in p..stop {
+                        writer.write_all(b" ")?;
                     }
-                    TabList::Stops(tabvec) => {
-                        let last_tab: usize = tabvec[tabvec.len() - 1];
-                        let next_tab = tabvec[cur_stop];
-
-                        if column >= last_tab {
-                            space_out(&mut column, &mut writer)?;
-                        } else {
-                            while column < next_tab {
-                                space_out(&mut column, &mut writer)?;
-                            }
-                            cur_stop += 1;
-                            space_out(&mut column, &mut writer)?;
-                        }
+                    p = stop;
+                }
+                b"\x08" => {
+                    // backspace: column count decrements, never below zero
+                    writer.write_all(ch)?;
+                    p = p.saturating_sub(1);
+                }
+                b"\r" | b"\n" => {
+                    writer.write_all(ch)?;
+                    p = 0;
+                }
+                _ => {
+                    writer.write_all(ch)?;
+                    // Advance by the character's display width under LC_CTYPE.
+                    // Non-printable / undecodable bytes do not advance the column.
+                    let w = std::str::from_utf8(ch)
+                        .ok()
+                        .and_then(|s| s.chars().next())
+                        .map(wcwidth_char)
+                        .unwrap_or(1);
+                    if w > 0 {
+                        p += w as usize;
                     }
                 }
             }

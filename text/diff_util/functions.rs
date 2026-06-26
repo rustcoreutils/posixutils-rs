@@ -25,11 +25,12 @@ pub fn system_time_to_context_format(system_time: SystemTime) -> String {
     dt.format("%a %b %e %T %Y").to_string()
 }
 
-/// POSIX unified diff timestamp format: "%Y-%m-%d %H:%M:%S"
-/// Example: "2025-12-13 10:26:40"
+/// POSIX unified diff timestamp format with fractional seconds and timezone
+/// offset: "%Y-%m-%d %H:%M:%S.%f %z"
+/// Example: "2025-12-13 10:26:40.123456789 +0000"
 pub fn system_time_to_unified_format(system_time: SystemTime) -> String {
     let dt: DateTime<Local> = system_time.into();
-    dt.format("%Y-%m-%d %H:%M:%S").to_string()
+    dt.format("%Y-%m-%d %H:%M:%S%.9f %z").to_string()
 }
 
 pub fn is_binary(file_path: &PathBuf) -> io::Result<bool> {
@@ -49,7 +50,7 @@ pub fn is_binary(file_path: &PathBuf) -> io::Result<bool> {
 
 pub fn check_existance(path_buf: &Path) -> io::Result<bool> {
     if !path_buf.exists() {
-        println!(
+        eprintln!(
             "diff: {}: No such file or directory",
             path_buf.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME)
         );

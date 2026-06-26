@@ -42,23 +42,27 @@ impl Default for Hunk {
 }
 
 impl Hunk {
-    pub fn f1_range(&self, is_ed: bool) -> String {
+    /// Format the file1 line range. A single-line range collapses to one
+    /// number; a multi-line range joins the two bounds with `sep` (`,` for
+    /// default/ed scripts, ` ` for the `-f` forward edit script).
+    pub fn f1_range(&self, sep: &str) -> String {
         if self.ln1_start == self.ln1_end {
             format!("{}", self.ln1_start)
-        } else if is_ed && (self.ln1_start == self.ln1_end - 1) {
+        } else if self.ln1_start == self.ln1_end - 1 {
             format!("{}", self.ln1_end)
         } else {
-            format!("{},{}", self.ln1_start + 1, self.ln1_end)
+            format!("{}{}{}", self.ln1_start + 1, sep, self.ln1_end)
         }
     }
 
-    pub fn f2_range(&self, is_ed: bool) -> String {
+    /// Format the file2 line range. See [`Hunk::f1_range`].
+    pub fn f2_range(&self, sep: &str) -> String {
         if self.ln2_start == self.ln2_end {
             format!("{}", self.ln2_start)
-        } else if is_ed && (self.ln2_start == self.ln2_end - 1) {
+        } else if self.ln2_start == self.ln2_end - 1 {
             format!("{}", self.ln2_end)
         } else {
-            format!("{},{}", self.ln2_start + 1, self.ln2_end)
+            format!("{}{}{}", self.ln2_start + 1, sep, self.ln2_end)
         }
     }
 
@@ -78,35 +82,51 @@ impl Hunk {
         self.ln2_end
     }
 
-    pub fn print_default(&mut self, file1: &FileData, file2: &FileData, is_last: bool) {
+    /// True when this hunk's file1 span ends at file1's final line and that
+    /// line has no trailing newline (so the marker belongs to this hunk).
+    fn file1_lacks_final_newline(&self, file1: &FileData) -> bool {
+        self.ln1_end == file1.lines().len() && !file1.ends_with_newline()
+    }
+
+    /// True when this hunk's file2 span ends at file2's final line and that
+    /// line has no trailing newline (so the marker belongs to this hunk).
+    fn file2_lacks_final_newline(&self, file2: &FileData) -> bool {
+        self.ln2_end == file2.lines().len() && !file2.ends_with_newline()
+    }
+
+    pub fn print_default(&mut self, file1: &FileData, file2: &FileData) {
         match self.kind {
             Change::None => {}
             Change::Insert => {
-                println!("{}a{}", self.ln1_start, self.f2_range(true));
+                println!("{}a{}", self.ln1_start, self.f2_range(","));
 
                 for i in self.ln2_start..self.ln2_end {
                     println!("> {}", file2.line(i));
                 }
+
+                if self.file2_lacks_final_newline(file2) {
+                    println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
+                }
             }
             Change::Delete => {
-                println!("{}d{}", self.f1_range(true), self.ln2_end);
+                println!("{}d{}", self.f1_range(","), self.ln2_end);
 
                 for i in self.ln1_start..self.ln1_end {
                     println!("< {}", file1.line(i));
                 }
 
-                if is_last && !file1.ends_with_newline() {
+                if self.file1_lacks_final_newline(file1) {
                     println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
                 }
             }
             Change::Substitute => {
-                println!("{}c{}", self.f1_range(true), self.f2_range(true));
+                println!("{}c{}", self.f1_range(","), self.f2_range(","));
 
                 for i in self.ln1_start..self.ln1_end {
                     println!("< {}", file1.line(i));
                 }
 
-                if is_last && !file1.ends_with_newline() {
+                if self.file1_lacks_final_newline(file1) {
                     println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
                 }
 
@@ -115,7 +135,7 @@ impl Hunk {
                     println!("> {}", file2.line(i));
                 }
 
-                if is_last && !file2.ends_with_newline() {
+                if self.file2_lacks_final_newline(file2) {
                     println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
                 }
             }
@@ -134,10 +154,10 @@ impl Hunk {
                 println!(".")
             }
             Change::Delete => {
-                println!("{}d", self.f1_range(true));
+                println!("{}d", self.f1_range(","));
             }
             Change::Substitute => {
-                println!("{}c", self.f1_range(true));
+                println!("{}c", self.f1_range(","));
                 for i in self.ln2_start..self.ln2_end {
                     println!("{}", file2.line(i));
                 }
@@ -146,18 +166,21 @@ impl Hunk {
             }
         }
 
+        // POSIX does not specify a no-newline marker for edit-script output, so
+        // it must never appear on stdout (it would corrupt the ed script). GNU
+        // emits a diagnostic to stderr instead; mirror that.
         if is_last && !file1.ends_with_newline() {
-            println!(
+            eprintln!(
                 "diff: {}:{}\n",
-                file1.name(),
+                file1.path(),
                 &NO_NEW_LINE_AT_END_OF_FILE[1..]
             );
         }
 
         if is_last && !file2.ends_with_newline() {
-            println!(
+            eprintln!(
                 "diff: {}:{}\n",
-                file2.name(),
+                file2.path(),
                 &NO_NEW_LINE_AT_END_OF_FILE[1..]
             );
         }
@@ -176,10 +199,10 @@ impl Hunk {
                 println!(".")
             }
             Change::Delete => {
-                println!("d{}", self.f1_range(true));
+                println!("d{}", self.f1_range(" "));
             }
             Change::Substitute => {
-                println!("c{}", self.f1_range(true));
+                println!("c{}", self.f1_range(" "));
                 for i in self.ln2_start..self.ln2_end {
                     println!("{}", file2.line(i));
                 }
@@ -187,18 +210,19 @@ impl Hunk {
             }
         }
 
+        // See print_edit_script: no-newline marker goes to stderr, never stdout.
         if is_last && !file1.ends_with_newline() {
-            println!(
+            eprintln!(
                 "diff: {}:{}\n",
-                file1.name(),
+                file1.path(),
                 &NO_NEW_LINE_AT_END_OF_FILE[1..]
             );
         }
 
         if is_last && !file2.ends_with_newline() {
-            println!(
+            eprintln!(
                 "diff: {}:{}\n",
-                file2.name(),
+                file2.path(),
                 &NO_NEW_LINE_AT_END_OF_FILE[1..]
             );
         }

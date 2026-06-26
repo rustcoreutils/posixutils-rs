@@ -54,6 +54,19 @@ extern "C" {
     fn iswprint(c: WintT) -> libc::c_int;
     fn towlower(c: WintT) -> WintT;
     fn towupper(c: WintT) -> WintT;
+    // Wide-character classification + display-width functions. The `libc`
+    // crate does not surface all of these on every target (notably macOS), so
+    // they are declared directly to match the `iswprint` precedent above.
+    fn iswblank(c: WintT) -> libc::c_int;
+    fn iswspace(c: WintT) -> libc::c_int;
+    fn iswalpha(c: WintT) -> libc::c_int;
+    fn iswalnum(c: WintT) -> libc::c_int;
+    fn iswdigit(c: WintT) -> libc::c_int;
+    fn iswpunct(c: WintT) -> libc::c_int;
+    fn iswcntrl(c: WintT) -> libc::c_int;
+    fn iswgraph(c: WintT) -> libc::c_int;
+    fn iswxdigit(c: WintT) -> libc::c_int;
+    fn wcwidth(c: libc::wchar_t) -> libc::c_int;
     // `mbrtowc` and `mbstate_t` are not surfaced by the `libc` crate on all
     // targets (notably macOS), so both are declared directly.
     fn mbrtowc(
@@ -63,6 +76,97 @@ extern "C" {
         ps: *mut MbStateT,
     ) -> libc::size_t;
 }
+
+/// Number of column positions occupied by `c` under the current `LC_CTYPE`,
+/// per libc `wcwidth(3)`.
+///
+/// Returns `1` for ordinary single-width printable characters, `2` for
+/// double-width (e.g. East Asian wide) characters, `0` for zero-width
+/// (combining) characters, and `-1` for non-printable characters (control
+/// characters, or any character not representable in the current locale).
+///
+/// `setlocale(LC_ALL, "")` must have been called for non-ASCII characters to be
+/// measured correctly; in the default `C` locale only ASCII has a defined width
+/// and other codepoints return `-1`. Callers that track screen columns (e.g.
+/// `expand`, `fold`, `unexpand`, `pr`) handle control characters such as
+/// `<tab>`, `<backspace>`, and `<carriage-return>` separately and only consult
+/// this for ordinary characters.
+pub fn wcwidth_char(c: char) -> i32 {
+    // SAFETY: wcwidth is thread-safe and side-effect-free; every Unicode
+    // codepoint (max 0x10FFFF) fits losslessly in wchar_t (32-bit on all
+    // supported targets).
+    unsafe { wcwidth(c as u32 as libc::wchar_t) }
+}
+
+/// Generate a locale-aware character-class predicate that dispatches a
+/// single-byte value (`code <= 0xFF`) to the libc `isX(3)` function and any
+/// wider Unicode character to the corresponding `iswX(3)` function. Mirrors the
+/// byte-vs-wide split used by [`isprint`].
+macro_rules! ctype_predicate {
+    ($(#[$meta:meta])* $name:ident, $byte_fn:path, $wide_fn:ident) => {
+        $(#[$meta])*
+        pub fn $name(c: char) -> bool {
+            let code = c as u32;
+            if code <= 0xFF {
+                // SAFETY: the libc ctype function is thread-safe and
+                // side-effect-free; the argument is in [0, 255].
+                unsafe { $byte_fn(code as libc::c_int) != 0 }
+            } else {
+                // SAFETY: the libc wide-ctype function is thread-safe; `WintT`
+                // matches the platform's wint_t and every Unicode codepoint
+                // fits losslessly (the high bit is always clear).
+                unsafe { $wide_fn(code as WintT) != 0 }
+            }
+        }
+    };
+}
+
+ctype_predicate!(
+    /// True if `c` is a blank (`<space>` or `<tab>` in the POSIX locale) under
+    /// the current `LC_CTYPE`, per libc `isblank(3)`.
+    isblank, libc::isblank, iswblank
+);
+ctype_predicate!(
+    /// True if `c` is whitespace under the current `LC_CTYPE`, per libc
+    /// `isspace(3)` (space, tab, newline, vertical tab, form feed, carriage
+    /// return in the POSIX locale).
+    isspace, libc::isspace, iswspace
+);
+ctype_predicate!(
+    /// True if `c` is alphabetic under the current `LC_CTYPE`, per libc
+    /// `isalpha(3)`.
+    isalpha, libc::isalpha, iswalpha
+);
+ctype_predicate!(
+    /// True if `c` is alphanumeric under the current `LC_CTYPE`, per libc
+    /// `isalnum(3)`.
+    isalnum, libc::isalnum, iswalnum
+);
+ctype_predicate!(
+    /// True if `c` is a decimal digit under the current `LC_CTYPE`, per libc
+    /// `isdigit(3)`.
+    isdigit, libc::isdigit, iswdigit
+);
+ctype_predicate!(
+    /// True if `c` is punctuation under the current `LC_CTYPE`, per libc
+    /// `ispunct(3)`.
+    ispunct, libc::ispunct, iswpunct
+);
+ctype_predicate!(
+    /// True if `c` is a control character under the current `LC_CTYPE`, per
+    /// libc `iscntrl(3)`.
+    iscntrl, libc::iscntrl, iswcntrl
+);
+ctype_predicate!(
+    /// True if `c` has a visible glyph (printable and not `<space>`) under the
+    /// current `LC_CTYPE`, per libc `isgraph(3)`.
+    isgraph, libc::isgraph, iswgraph
+);
+ctype_predicate!(
+    /// True if `c` is a hexadecimal digit under the current `LC_CTYPE`, per
+    /// libc `isxdigit(3)`.
+    isxdigit, libc::isxdigit, iswxdigit
+);
 
 /// Map `c` to lowercase under the current `LC_CTYPE`.
 ///
@@ -266,6 +370,92 @@ pub fn mb_char_slices(bytes: &[u8]) -> Vec<&[u8]> {
     result
 }
 
+/// Stateful incremental multibyte decoder for streaming input.
+///
+/// Feed successive byte chunks to [`MbDecoder::decode`]: complete characters are
+/// returned, and a trailing incomplete multibyte sequence is absorbed into the
+/// decoder's conversion state to be completed by a later chunk (no caller-side
+/// carryover buffer is needed — feed each byte exactly once). At end of input
+/// call [`MbDecoder::pending`] to learn how many bytes of an unfinished trailing
+/// sequence remain. `setlocale(LC_ALL, "")` governs the encoding via
+/// `LC_CTYPE`; in the `C` locale every byte is its own character.
+///
+/// Used by `wc` to count characters (`-m`) and split words (`-w`) correctly in
+/// a multibyte locale without reading the whole input into memory.
+pub struct MbDecoder {
+    state: MbStateT,
+    pending: usize,
+}
+
+impl Default for MbDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MbDecoder {
+    pub fn new() -> Self {
+        MbDecoder {
+            state: MbStateT::zeroed(),
+            pending: 0,
+        }
+    }
+
+    /// Bytes of an incomplete trailing multibyte sequence not yet completed.
+    /// After the final chunk, these count as one character each (matching the
+    /// invalid-byte convention).
+    pub fn pending(&self) -> usize {
+        self.pending
+    }
+
+    /// Decode every complete character in `bytes`, returning each as the decoded
+    /// `char` (an undecodable byte yields `None` and counts as one character).
+    /// The whole chunk is consumed: a trailing incomplete sequence is retained
+    /// in the decoder state and completed by the next chunk.
+    pub fn decode(&mut self, bytes: &[u8]) -> Vec<Option<char>> {
+        let mut chars = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            let remaining = &bytes[i..];
+            let mut wc: libc::wchar_t = 0;
+            // SAFETY: the pointer/length describe a valid slice and `state` is a
+            // live mbstate_t owned by this decoder.
+            let n = unsafe {
+                mbrtowc(
+                    &mut wc,
+                    remaining.as_ptr() as *const libc::c_char,
+                    remaining.len() as libc::size_t,
+                    &mut self.state,
+                )
+            };
+            if n == 0 {
+                // A NUL wide character occupies one byte.
+                chars.push(Some('\0'));
+                i += 1;
+                self.pending = 0;
+            } else if n == usize::MAX - 1 {
+                // (size_t)-2: the remaining bytes form an incomplete but valid
+                // prefix and are absorbed into `state`; record them as pending.
+                self.pending += remaining.len();
+                i = bytes.len();
+            } else if n == usize::MAX {
+                // (size_t)-1: invalid sequence — consume one byte, reset state.
+                self.state = MbStateT::zeroed();
+                chars.push(None);
+                i += 1;
+                self.pending = 0;
+            } else {
+                // A complete character; `n` bytes were consumed from this chunk
+                // (it may also have used bytes retained from earlier chunks).
+                chars.push(char::from_u32(wc as u32));
+                i += n;
+                self.pending = 0;
+            }
+        }
+        chars
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,6 +585,120 @@ mod tests {
                 matched,
                 "expected é to be one 2-byte character, got {slices:?}"
             );
+        }
+    }
+
+    #[test]
+    fn ctype_predicates_ascii_c_locale() {
+        // blank = space + tab only
+        assert!(isblank(' '));
+        assert!(isblank('\t'));
+        assert!(!isblank('\n'));
+        assert!(!isblank('a'));
+        // space = the six standard whitespace chars
+        assert!(isspace(' '));
+        assert!(isspace('\t'));
+        assert!(isspace('\n'));
+        assert!(isspace('\r'));
+        assert!(!isspace('a'));
+        // alpha / alnum / digit
+        assert!(isalpha('a'));
+        assert!(isalpha('Z'));
+        assert!(!isalpha('5'));
+        assert!(!isalpha(' '));
+        assert!(isalnum('a'));
+        assert!(isalnum('5'));
+        assert!(!isalnum('!'));
+        assert!(isdigit('0'));
+        assert!(isdigit('9'));
+        assert!(!isdigit('a'));
+        // punct / cntrl / graph
+        assert!(ispunct('!'));
+        assert!(ispunct(','));
+        assert!(!ispunct('a'));
+        assert!(!ispunct(' '));
+        assert!(iscntrl('\n'));
+        assert!(iscntrl('\0'));
+        assert!(!iscntrl('a'));
+        assert!(isgraph('a'));
+        assert!(isgraph('!'));
+        assert!(!isgraph(' ')); // space is printable but not graph
+        assert!(!isgraph('\n'));
+        // xdigit
+        assert!(isxdigit('0'));
+        assert!(isxdigit('9'));
+        assert!(isxdigit('a'));
+        assert!(isxdigit('F'));
+        assert!(!isxdigit('g'));
+    }
+
+    #[test]
+    fn wcwidth_ascii() {
+        // Ordinary printable ASCII is one column wide.
+        assert_eq!(wcwidth_char('a'), 1);
+        assert_eq!(wcwidth_char(' '), 1);
+        assert_eq!(wcwidth_char('~'), 1);
+        // Control characters are non-printable: width -1.
+        assert_eq!(wcwidth_char('\t'), -1);
+        assert_eq!(wcwidth_char('\n'), -1);
+    }
+
+    #[test]
+    fn wcwidth_wide_after_setlocale() {
+        // Recover from a poisoned lock (guarded data is just ()).
+        let _guard = LOCALE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let saved = unsafe { libc::setlocale(libc::LC_ALL, std::ptr::null()) };
+        let saved =
+            (!saved.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(saved) }.to_owned());
+
+        let utf8 = std::ffi::CString::new("C.UTF-8").unwrap();
+        let ok = unsafe { libc::setlocale(libc::LC_ALL, utf8.as_ptr()) };
+        // U+4E16 (世) is a double-width CJK ideograph in a UTF-8 locale.
+        let w = wcwidth_char('世');
+
+        if let Some(saved) = saved {
+            unsafe { libc::setlocale(libc::LC_ALL, saved.as_ptr()) };
+        }
+        if !ok.is_null() {
+            assert_eq!(w, 2, "expected 世 to be 2 columns wide in a UTF-8 locale");
+        }
+    }
+
+    #[test]
+    fn mb_decoder_ascii() {
+        let mut d = MbDecoder::new();
+        let chars = d.decode(b"abc");
+        assert_eq!(chars, vec![Some('a'), Some('b'), Some('c')]);
+        assert_eq!(d.pending(), 0);
+    }
+
+    #[test]
+    fn mb_decoder_split_sequence_across_chunks() {
+        // A 2-byte character (é = 0xC3 0xA9) split across two chunks must be
+        // counted once. Each byte is fed exactly once; the decoder's state
+        // carries the partial sequence.
+        let _guard = LOCALE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = unsafe { libc::setlocale(libc::LC_ALL, std::ptr::null()) };
+        let saved =
+            (!saved.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(saved) }.to_owned());
+        let utf8 = std::ffi::CString::new("C.UTF-8").unwrap();
+        let ok = unsafe { libc::setlocale(libc::LC_ALL, utf8.as_ptr()) };
+
+        if !ok.is_null() {
+            let mut d = MbDecoder::new();
+            // First chunk ends mid-character: 'a' plus the lead byte of é.
+            let c1 = d.decode(&[b'a', 0xC3]);
+            assert_eq!(c1, vec![Some('a')]);
+            assert_eq!(d.pending(), 1); // 0xC3 retained in the decoder state
+                                        // Second chunk completes é and adds 'b'.
+            let c2 = d.decode(&[0xA9, b'b']);
+            assert_eq!(c2, vec![Some('é'), Some('b')]);
+            assert_eq!(d.pending(), 0);
+        }
+
+        if let Some(saved) = saved {
+            unsafe { libc::setlocale(libc::LC_ALL, saved.as_ptr()) };
         }
     }
 

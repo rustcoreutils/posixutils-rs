@@ -9,6 +9,8 @@
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use plib::io::input_stream_dashed;
+use plib::locale::{mb_char_slices, wcwidth_char};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
@@ -16,160 +18,232 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(version, about = gettext("unexpand - convert spaces to tabs"))]
 struct Args {
-    #[arg(short = 'a', help = gettext("Convert all sequences of two or more spaces to tabs"))]
+    #[arg(short = 'a', help = gettext("Convert all sequences of two or more spaces to tabs, not just leading ones"))]
     all_spaces: bool,
 
-    #[arg(short = 't', help = gettext("Specify tab stops"))]
+    // Specifying -t also enables -a (POSIX): conversion is not limited to
+    // leading blanks.
+    #[arg(short = 't', help = gettext("Specify tab stops, comma- or blank-separated (implies -a)"))]
     tablist: Option<String>,
 
     #[arg(help = gettext("Input files"))]
     files: Vec<PathBuf>,
 }
 
-fn parse_tablist(s: &str) -> Result<Vec<usize>, std::num::ParseIntError> {
-    s.split(',').map(|item| item.parse::<usize>()).collect()
+/// Tab stops, expressed as 0-based column positions on the same scale as the
+/// uniform multiples (so `-t 4` and `-t 4,8` share their first stop).
+enum TabStops {
+    /// Stops every N columns: 0, N, 2N, ...
+    Uniform(usize),
+    /// Explicit ascending 0-based stop positions; no conversion past the last.
+    List(Vec<usize>),
+}
+
+impl TabStops {
+    /// Smallest tab stop strictly greater than 0-based column `c`, if any.
+    fn next_stop(&self, c: usize) -> Option<usize> {
+        match self {
+            TabStops::Uniform(n) => Some(((c / n) + 1) * n),
+            TabStops::List(v) => v.iter().copied().find(|&s| s > c),
+        }
+    }
+
+    /// Column reached by a literal `<tab>` at 0-based column `c` (the next stop,
+    /// or one column past the last explicit stop).
+    fn tab_advance(&self, c: usize) -> usize {
+        self.next_stop(c).unwrap_or(c + 1)
+    }
+}
+
+fn parse_tablist(s: &str) -> Result<TabStops, String> {
+    // A single integer sets a uniform, repeating tab width (must be positive).
+    if let Ok(n) = s.trim().parse::<usize>() {
+        if n == 0 {
+            return Err("tab size must be a positive integer".to_string());
+        }
+        return Ok(TabStops::Uniform(n));
+    }
+
+    // Otherwise a comma- or blank-separated list of ascending positive stops.
+    let mut v: Vec<usize> = Vec::new();
+    for tok in s.split([' ', ',', '\t']) {
+        if tok.is_empty() {
+            continue;
+        }
+        let n: usize = tok
+            .parse()
+            .map_err(|_| "invalid tab stop in list".to_string())?;
+        if n == 0 {
+            return Err("tab stop must be a positive integer".to_string());
+        }
+        if let Some(&last) = v.last() {
+            if n <= last {
+                return Err("tab stops must be in strictly ascending order".to_string());
+            }
+        }
+        v.push(n);
+    }
+    if v.is_empty() {
+        return Err("invalid tab stop in list".to_string());
+    }
+    Ok(TabStops::List(v))
 }
 
 fn unexpand(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-    let tablist = match &args.tablist {
+    let tabs = match &args.tablist {
         Some(s) => parse_tablist(s)?,
-        None => vec![8],
+        None => TabStops::Uniform(8),
     };
-    let mut stdout = io::stdout();
+    // -t implies -a (POSIX): conversion is not limited to leading blanks.
+    let all_mode = args.all_spaces || args.tablist.is_some();
 
-    if (args.files.len() == 1 && args.files[0].as_os_str() == "-") || args.files.is_empty() {
-        let reader = io::stdin();
-        let lines = io::BufReader::new(reader).lines();
-        for line in lines {
-            let line = line?;
-            let converted_line = if args.all_spaces && args.tablist.is_none() {
-                convert_all_blanks(&line, &tablist)
-            } else {
-                convert_leading_blanks(&line, &tablist)
-            };
-            writeln!(stdout, "{}", converted_line)?;
-        }
+    // No operands read stdin; otherwise each operand is processed in order, with
+    // a "-" reading stdin at its position (POSIX Guideline 13).
+    let sources: Vec<PathBuf> = if args.files.is_empty() {
+        vec![PathBuf::from("-")]
     } else {
-        for file in &args.files {
-            let reader = io::BufReader::new(std::fs::File::open(file)?);
-            for line in reader.lines() {
-                let line = line?;
-                let converted_line = if args.all_spaces && args.tablist.is_none() {
-                    convert_all_blanks(&line, &tablist)
-                } else {
-                    convert_leading_blanks(&line, &tablist)
-                };
-                writeln!(stdout, "{}", converted_line)?;
+        args.files.clone()
+    };
+
+    let mut stdout = io::stdout().lock();
+    for source in &sources {
+        let mut reader = io::BufReader::new(input_stream_dashed(source)?);
+        // Read raw bytes per line to preserve exact line endings and any
+        // non-UTF-8 bytes; multibyte characters are segmented by LC_CTYPE.
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            buf.clear();
+            if reader.read_until(b'\n', &mut buf)? == 0 {
+                break;
+            }
+            let had_newline = buf.last() == Some(&b'\n');
+            let content = if had_newline {
+                &buf[..buf.len() - 1]
+            } else {
+                &buf[..]
+            };
+            stdout.write_all(&unexpand_line(content, &tabs, all_mode))?;
+            if had_newline {
+                stdout.write_all(b"\n")?;
             }
         }
-    };
+    }
 
     Ok(())
 }
 
-fn convert_leading_blanks(line: &str, tablist: &[usize]) -> String {
-    let mut result = String::new();
-    let mut space_count = 0;
-    let mut chars = line.chars().peekable();
-
-    while let Some(&ch) = chars.peek() {
-        if ch == ' ' {
-            space_count += 1;
-            chars.next();
+/// Emit a pending run of `run_len` spaces beginning at 0-based column
+/// `run_start`. When `eligible`, replace as much of the run as possible with
+/// tabs (advancing through tab stops) and keep the remainder as spaces;
+/// otherwise emit the spaces verbatim.
+fn flush_run(out: &mut Vec<u8>, tabs: &TabStops, run_start: usize, run_len: usize, eligible: bool) {
+    if run_len == 0 {
+        return;
+    }
+    if !eligible {
+        out.extend(std::iter::repeat_n(b' ', run_len));
+        return;
+    }
+    let end = run_start + run_len;
+    let mut c = run_start;
+    while let Some(stop) = tabs.next_stop(c) {
+        if stop <= end {
+            out.push(b'\t');
+            c = stop;
         } else {
             break;
         }
     }
+    out.extend(std::iter::repeat_n(b' ', end - c));
+}
 
-    let mut col = 0;
-    for &tabstop in tablist {
-        while space_count > 0 && col < tabstop {
-            let spaces_to_next_tabstop = tabstop - col;
-            if space_count >= spaces_to_next_tabstop {
-                result.push('\t');
-                space_count -= spaces_to_next_tabstop;
-                col = tabstop;
-            } else {
-                col += space_count;
-                break;
+/// Convert the blanks of one line (without its trailing newline) to tabs.
+///
+/// In `-a`/`-t` mode any run of two or more spaces that spans a tab stop is
+/// converted; otherwise only the leading run of blanks is converted. Existing
+/// `<tab>` characters are preserved and advance the column; a single space is
+/// never turned into a tab. Column positions follow `wcwidth(3)` under
+/// `LC_CTYPE`, and a `<tab>` does not end the leading-blank region.
+fn unexpand_line(line: &[u8], tabs: &TabStops, all_mode: bool) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut col: usize = 0;
+    let mut run_start: usize = 0;
+    let mut run_len: usize = 0;
+    let mut seen_nonblank = false;
+
+    let is_eligible = |run_len: usize, seen_nonblank: bool| {
+        if all_mode {
+            run_len >= 2
+        } else {
+            !seen_nonblank
+        }
+    };
+
+    for ch in mb_char_slices(line) {
+        match ch {
+            b" " => {
+                if run_len == 0 {
+                    run_start = col;
+                }
+                run_len += 1;
+                col += 1;
+            }
+            b"\t" => {
+                flush_run(
+                    &mut out,
+                    tabs,
+                    run_start,
+                    run_len,
+                    is_eligible(run_len, seen_nonblank),
+                );
+                run_len = 0;
+                out.push(b'\t');
+                col = tabs.tab_advance(col);
+            }
+            b"\x08" => {
+                flush_run(
+                    &mut out,
+                    tabs,
+                    run_start,
+                    run_len,
+                    is_eligible(run_len, seen_nonblank),
+                );
+                run_len = 0;
+                out.push(0x08);
+                col = col.saturating_sub(1);
+                seen_nonblank = true;
+            }
+            _ => {
+                flush_run(
+                    &mut out,
+                    tabs,
+                    run_start,
+                    run_len,
+                    is_eligible(run_len, seen_nonblank),
+                );
+                run_len = 0;
+                out.extend_from_slice(ch);
+                let w = std::str::from_utf8(ch)
+                    .ok()
+                    .and_then(|s| s.chars().next())
+                    .map(wcwidth_char)
+                    .unwrap_or(1);
+                if w > 0 {
+                    col += w as usize;
+                }
+                seen_nonblank = true;
             }
         }
     }
+    flush_run(
+        &mut out,
+        tabs,
+        run_start,
+        run_len,
+        is_eligible(run_len, seen_nonblank),
+    );
 
-    for _ in 0..space_count {
-        result.push(' ');
-    }
-
-    result.push_str(&chars.collect::<String>());
-    result
-}
-
-fn split_whitespaces(line: &str) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut current_part = String::new();
-    let mut in_word = false;
-
-    for c in line.chars() {
-        if c.is_whitespace() {
-            if in_word {
-                parts.push(current_part.clone());
-                current_part.clear();
-                in_word = false;
-            }
-        } else if !in_word {
-            in_word = true;
-        }
-
-        current_part.push(c);
-    }
-
-    if !current_part.is_empty() {
-        parts.push(current_part);
-    }
-    parts
-}
-
-fn convert_all_blanks(line: &str, tablist: &[usize]) -> String {
-    let mut result = String::new();
-
-    let split_parts: Vec<String> = split_whitespaces(line);
-
-    for part in &split_parts {
-        result.push_str(&convert_spaces_to_tabs(part, tablist[0]));
-    }
-
-    result
-}
-
-fn convert_spaces_to_tabs(line: &str, tabstop: usize) -> String {
-    let mut result = String::new();
-    let mut space_count = 0;
-    let mut chars = line.chars().peekable();
-
-    while let Some(&ch) = chars.peek() {
-        if ch == ' ' {
-            space_count += 1;
-            chars.next();
-        } else {
-            break;
-        }
-    }
-
-    while space_count > 0 {
-        if space_count >= tabstop {
-            result.push('\t');
-            space_count -= tabstop;
-        } else {
-            break;
-        }
-    }
-
-    for _ in 0..space_count {
-        result.push(' ');
-    }
-
-    result.push_str(&chars.collect::<String>());
-    result
+    out
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

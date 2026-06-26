@@ -50,13 +50,66 @@ pub fn detect_format(lines: &[&str], config: &PatchConfig) -> Option<DiffFormat>
     None
 }
 
+/// Compute the byte length of the leading <blank> (space/tab) run of a line.
+fn leading_blank_len(line: &str) -> usize {
+    line.find(|c| c != ' ' && c != '\t').unwrap_or(line.len())
+}
+
+/// If all non-empty lines of the patch begin with the same leading sequence of
+/// <blank> characters, return that common prefix length (in bytes) so it can be
+/// removed before proceeding (POSIX). Truly empty lines are ignored when
+/// computing the prefix (they would otherwise spuriously defeat the rule for
+/// patches separated by blank lines).
+fn common_blank_prefix_len(lines: &[&str]) -> usize {
+    let mut prefix: Option<&str> = None;
+    for &line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let blanks = &line[..leading_blank_len(line)];
+        prefix = Some(match prefix {
+            None => blanks,
+            Some(p) => {
+                let n = p
+                    .bytes()
+                    .zip(blanks.bytes())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                &p[..n]
+            }
+        });
+        if prefix == Some("") {
+            return 0;
+        }
+    }
+    prefix.map(|p| p.len()).unwrap_or(0)
+}
+
 /// Parse the patch content into a Patch structure.
 pub fn parse_patch(content: &str, config: &PatchConfig) -> Result<Patch, PatchError> {
-    let lines: Vec<&str> = content.lines().collect();
+    let raw_lines: Vec<&str> = content.lines().collect();
 
-    if lines.is_empty() {
+    if raw_lines.is_empty() {
         return Ok(Patch::default());
     }
+
+    // POSIX: if all lines begin with the same leading <blank> sequence, remove
+    // it before proceeding (e.g. a uniformly indented / email-quoted patch).
+    let prefix_len = common_blank_prefix_len(&raw_lines);
+    let lines: Vec<&str> = if prefix_len > 0 {
+        raw_lines
+            .iter()
+            .map(|l| {
+                if l.len() >= prefix_len {
+                    &l[prefix_len..]
+                } else {
+                    l
+                }
+            })
+            .collect()
+    } else {
+        raw_lines
+    };
 
     let format = detect_format(&lines, config).ok_or_else(|| PatchError::Parse {
         line: 1,

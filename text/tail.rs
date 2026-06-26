@@ -16,15 +16,15 @@ use std::io::{
 };
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use notify_debouncer_full::new_debouncer;
-use notify_debouncer_full::notify::event::{ModifyKind, RemoveKind};
-use notify_debouncer_full::notify::{EventKind, RecursiveMode, Watcher};
+use gettextrs::gettext;
 use plib::BUFSZ;
+
+/// Interval between read attempts in the `-f` (follow) poll loop.
+const FOLLOW_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 enum RelativeFrom {
     StartOfFile(usize),
@@ -101,6 +101,9 @@ struct Args {
     #[arg(short = 'f', help = gettext("Output appended data as the file grows"))]
     follow: bool,
 
+    #[arg(short = 'r', help = gettext("Copy lines in reverse order"))]
+    reverse: bool,
+
     #[arg(help = gettext("The file to read"))]
     file: Option<PathBuf>,
 }
@@ -117,13 +120,21 @@ impl Args {
             (None, Some(st)) => BytesOrLines::Lines(RelativeFrom::from_str(st.as_str())?),
             (Some(_), Some(_)) => {
                 // Check if conflicting options are used together
-                return Err(Box::from("options '-c' and '-n' cannot be used together"));
+                return Err(Box::from(gettext(
+                    "options '-c' and '-n' cannot be used together",
+                )));
             }
             (None, None) => {
-                // The default behavior is the last 10 lines (-n 10)
-                // "If neither -c nor -n is specified, -n 10 shall be assumed."
-                // https://pubs.opengroup.org/onlinepubs/9699919799/utilities/tail.html
-                BytesOrLines::Lines(RelativeFrom::EndOfFile(10_usize))
+                if self.reverse {
+                    // POSIX: with -r the default count is the WHOLE file. Lines
+                    // from the start-of-file at offset 1 selects every line.
+                    BytesOrLines::Lines(RelativeFrom::StartOfFile(1_usize))
+                } else {
+                    // The default behavior is the last 10 lines (-n 10)
+                    // "If neither -c nor -n is specified, -n 10 shall be assumed."
+                    // https://pubs.opengroup.org/onlinepubs/9699919799/utilities/tail.html
+                    BytesOrLines::Lines(RelativeFrom::EndOfFile(10_usize))
+                }
             }
         };
 
@@ -147,6 +158,95 @@ impl FileOrStdin {
 
 fn print_bytes(stdout_lock: &mut StdoutLock, bytes: &[u8]) -> io::Result<()> {
     stdout_lock.write_all(bytes)
+}
+
+/// Read every line from `read`, stripping a single trailing `\n` from each.
+fn read_all_lines<R: Read + BufRead>(read: &mut R) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
+    let mut lines = Vec::<Vec<u8>>::new();
+    let mut line = Vec::<u8>::with_capacity(BUFSZ);
+
+    loop {
+        match read.read_until(b'\n', &mut line) {
+            Ok(0) => break,
+            Ok(_) => {
+                if line.last() == Some(&b'\n') {
+                    line.pop();
+                }
+                lines.push(std::mem::take(&mut line));
+            }
+            Err(er) => {
+                if er.kind() == ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(Box::from(er));
+            }
+        }
+    }
+
+    Ok(lines)
+}
+
+/// `-r`: copy the selected lines in reverse order.
+///
+/// With no count, the whole file is reversed. `-n` (lines) selects which lines
+/// (counted from the end, or from the start with `+N`) are reversed.
+fn print_reverse_lines<R: Read + BufRead>(
+    stdout_lock: &mut StdoutLock,
+    read: &mut R,
+    relative_from: RelativeFrom,
+) -> Result<(), Box<dyn Error>> {
+    let lines = read_all_lines(read)?;
+
+    let selected: &[Vec<u8>] = match relative_from {
+        RelativeFrom::EndOfFile(n) => {
+            if n == 0_usize {
+                return Ok(());
+            }
+            let start = lines.len().saturating_sub(n);
+            &lines[start..]
+        }
+        RelativeFrom::StartOfFile(n) => {
+            // +N is 1-based; +0 and +1 both select the whole file.
+            let start = n.saturating_sub(1).min(lines.len());
+            &lines[start..]
+        }
+    };
+
+    for line in selected.iter().rev() {
+        stdout_lock.write_all(line.as_slice())?;
+        stdout_lock.write_all(b"\n")?;
+    }
+
+    Ok(())
+}
+
+/// `-r` combined with `-c`: reverse the selected bytes.
+fn print_reverse_bytes<R: Read>(
+    stdout_lock: &mut StdoutLock,
+    read: &mut R,
+    relative_from: RelativeFrom,
+) -> Result<(), Box<dyn Error>> {
+    let mut all = Vec::<u8>::new();
+    read.read_to_end(&mut all)?;
+
+    let selected: &[u8] = match relative_from {
+        RelativeFrom::EndOfFile(n) => {
+            if n == 0_usize {
+                return Ok(());
+            }
+            let start = all.len().saturating_sub(n);
+            &all[start..]
+        }
+        RelativeFrom::StartOfFile(n) => {
+            let start = n.saturating_sub(1).min(all.len());
+            &all[start..]
+        }
+    };
+
+    let reversed: Vec<u8> = selected.iter().rev().copied().collect();
+    print_bytes(stdout_lock, &reversed)?;
+
+    Ok(())
 }
 
 fn print_n_lines<R: Read + BufRead>(
@@ -288,39 +388,33 @@ fn print_n_bytes<R: Read>(
                 us
             };
 
-            // Buffer to read `n` bytes at a time.
-            let mut buffer_1 = vec![0_u8; n];
+            // Sliding window holding at most the last `n` bytes seen so far.
+            let mut tail_buf = Vec::<u8>::with_capacity(n);
 
-            // Buffer to store the last `n` bytes read.
-            let mut buffer_2 = Vec::<u8>::new();
+            // Buffer to read chunks of data from the reader.
+            let mut chunk = [0_u8; BUFSZ];
 
-            // Continuously read bytes into buffer_1.
             loop {
                 let bytes_read = read
-                    .read(&mut buffer_1)
+                    .read(&mut chunk)
                     .map_err(|er| format!("Failed to read: {er}"))?;
 
-                // If the number of bytes read is less than the buffer size, we're at the end of the file.
-                if bytes_read < buffer_1.len() {
-                    // Add the bytes read to buffer_2.
-                    buffer_2.extend(&buffer_1[..bytes_read]);
-
-                    // If buffer_2 contains fewer than `n` bytes, print all of them.
-                    if buffer_2.len() < n {
-                        print_bytes(stdout_lock, &buffer_2)?;
-                    } else {
-                        // Otherwise, print the last `n` bytes from buffer_2.
-                        let start = buffer_2.len() - n;
-                        print_bytes(stdout_lock, &buffer_2[start..])?;
-                    }
-
-                    // Exit the loop since we've reached the end of the file.
+                // Only a zero-byte read signals true EOF; a short read on a slow
+                // pipe must not terminate accumulation early.
+                if bytes_read == 0_usize {
                     break;
                 }
 
-                // Clone buffer_1 into buffer_2 for the next iteration.
-                buffer_2.clone_from(&buffer_1);
+                tail_buf.extend_from_slice(&chunk[..bytes_read]);
+
+                // Keep only the last `n` bytes to bound memory use.
+                if tail_buf.len() > n {
+                    let excess = tail_buf.len() - n;
+                    tail_buf.drain(..excess);
+                }
             }
+
+            print_bytes(stdout_lock, &tail_buf)?;
         }
         RelativeFrom::StartOfFile(us) => {
             let mut skip = us;
@@ -363,6 +457,62 @@ fn print_n_bytes<R: Read>(
     Ok(())
 }
 
+/// Follow a file with `-f`, using a sleep-poll loop.
+///
+/// This handles regular files (appended data appears on the next read), FIFOs
+/// (a blocking read returns new data when a writer sends it, EOF when all
+/// writers close), and removed/rotated files (a transient EOF, not fatal).
+fn follow_file(
+    stdout_lock: &mut StdoutLock,
+    pa: PathBuf,
+    mut bu: BufReader<File>,
+) -> Result<(), Box<dyn Error>> {
+    // Move the cursor to the end of the file so only new data is emitted.
+    // FIFOs are not seekable; ignore the error in that case.
+    let _ = bu.seek(SeekFrom::End(0_i64));
+
+    let mut buffer = [0_u8; BUFSZ];
+
+    loop {
+        // Detect truncation of a regular file: if the file shrank below our
+        // current offset, restart from the beginning.
+        if let Ok(metadata) = bu.get_ref().metadata() {
+            if metadata.is_file() {
+                if let Ok(pos) = bu.stream_position() {
+                    if metadata.len() < pos {
+                        plib::diag::error(&format!(
+                            "{}: {}",
+                            pa.display(),
+                            gettext("file truncated")
+                        ));
+                        bu.seek(SeekFrom::Start(0_u64))?;
+                    }
+                }
+            }
+        }
+
+        match bu.read(&mut buffer) {
+            Ok(0) => {
+                // No new data right now. For a regular file this means we are
+                // at EOF (more data may be appended later); for a FIFO it means
+                // no writer is currently sending. In both cases - including when
+                // the file has been removed/rotated - keep waiting.
+                thread::sleep(FOLLOW_POLL_INTERVAL);
+            }
+            Ok(bytes_read) => {
+                print_bytes(stdout_lock, &buffer[..bytes_read])?;
+                stdout_lock.flush()?;
+            }
+            Err(er) => {
+                if er.kind() == ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(Box::from(er));
+            }
+        }
+    }
+}
+
 /// The main logic for the `tail` command.
 ///
 /// This function processes the command-line arguments to determine how many lines or bytes
@@ -381,6 +531,7 @@ fn print_n_bytes<R: Read>(
 fn tail(
     file: Option<PathBuf>,
     follow: bool,
+    reverse: bool,
     bytes_or_lines: BytesOrLines,
 ) -> Result<(), Box<dyn Error>> {
     fn get_stdin() -> FileOrStdin {
@@ -405,74 +556,27 @@ fn tail(
     {
         let mut buf_reader = file_or_stdin.get_buf_read();
 
-        match bytes_or_lines {
-            BytesOrLines::Bytes(re) => {
+        match (reverse, bytes_or_lines) {
+            (true, BytesOrLines::Bytes(re)) => {
+                print_reverse_bytes(&mut stdout_lock, &mut buf_reader, re)?;
+            }
+            (true, BytesOrLines::Lines(re)) => {
+                print_reverse_lines(&mut stdout_lock, &mut buf_reader, re)?;
+            }
+            (false, BytesOrLines::Bytes(re)) => {
                 print_n_bytes(&mut stdout_lock, &mut buf_reader, re)?;
             }
-            BytesOrLines::Lines(re) => {
+            (false, BytesOrLines::Lines(re)) => {
                 print_n_lines(&mut stdout_lock, &mut buf_reader, re)?;
             }
         }
     }
 
-    if follow {
-        // If follow option is specified, continue monitoring the file
-        if let FileOrStdin::File(pa, mut bu) = file_or_stdin {
-            // Move the the cursor to the end of the file
-            // Is this still necessary now that the `BufReader` and underlying `File` are being reused?
-            bu.seek(SeekFrom::End(0_i64))?;
-
-            let (tx, rx) = mpsc::channel();
-
-            // Automatically select the best implementation for your platform.
-            let mut debouncer = new_debouncer(Duration::from_millis(1_u64), None, tx).unwrap();
-
-            // Add a path to be watched.
-            // below will be monitored for changes.
-            debouncer
-                .watcher()
-                .watch(pa.as_path(), RecursiveMode::NonRecursive)?;
-
-            for res in rx {
-                match res {
-                    Ok(events) => {
-                        let event = events.first().unwrap();
-                        match event.kind {
-                            EventKind::Modify(ModifyKind::Any)
-                            | EventKind::Modify(ModifyKind::Data(_))
-                            | EventKind::Modify(ModifyKind::Other) => {
-                                // If the file has been modified, check if the file was truncated
-                                let metadata = bu.get_mut().metadata()?;
-                                let current_size = metadata.len();
-
-                                if current_size < bu.stream_position()? {
-                                    eprintln!("\ntail: {}: file truncated", pa.display());
-
-                                    bu.seek(SeekFrom::Start(0_u64))?;
-                                }
-
-                                // Read the new lines and output them
-                                let mut new_data = Vec::<u8>::new();
-
-                                let bytes_read = bu.read_to_end(&mut new_data)?;
-
-                                if bytes_read > 0_usize {
-                                    print_bytes(&mut stdout_lock, &new_data)?;
-
-                                    io::stdout().flush()?;
-                                }
-                            }
-                            EventKind::Remove(RemoveKind::File) => {
-                                debouncer.watcher().unwatch(pa.as_path())?
-                            }
-                            _ => {}
-                        }
-                    }
-                    Err(ve) => {
-                        eprintln!("tail: watch error: {ve:?}");
-                    }
-                }
-            }
+    // -f only applies to files, and is meaningless with -r (the whole input has
+    // already been consumed and reversed).
+    if follow && !reverse {
+        if let FileOrStdin::File(pa, bu) = file_or_stdin {
+            follow_file(&mut stdout_lock, pa, bu)?;
         }
     }
 
@@ -480,28 +584,22 @@ fn tail(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    plib::diag::init_locale("tail");
 
     let args = Args::parse();
 
     let bytes_or_lines = match args.get_bytes_or_lines() {
         Ok(by) => by,
         Err(bo) => {
-            eprintln!("tail: {bo}");
+            plib::diag::error(&format!("{bo}"));
 
             std::process::exit(1_i32)
         }
     };
 
-    let mut exit_code = 0_i32;
-
-    if let Err(er) = tail(args.file, args.follow, bytes_or_lines) {
-        exit_code = 1_i32;
-
-        eprintln!("tail: {}", er);
+    if let Err(er) = tail(args.file, args.follow, args.reverse, bytes_or_lines) {
+        plib::diag::error(&format!("{er}"));
     }
 
-    std::process::exit(exit_code)
+    std::process::exit(plib::diag::exit_status())
 }

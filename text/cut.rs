@@ -7,10 +7,11 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::io::{self, BufRead, Error, Read};
+use std::io::{self, BufRead, Error, Write};
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
+use plib::io::input_stream_dashed;
 use std::path::PathBuf;
 
 /// cut - cut out selected fields of each line of a file
@@ -79,26 +80,35 @@ enum ParseVariat {
     Fields(Vec<(i32, i32)>),
 }
 
-/// Helper function to determine if the given bytes form a valid UTF-8 character boundary.
-///
-/// This function checks if the first byte of the provided byte slice `bytes` represents
-/// the start of a valid UTF-8 character. If the bytes are valid UTF-8, it returns true;
-/// otherwise, it returns false.
-///
-/// # Arguments
-///
-/// * `bytes` - A slice of bytes to be checked.
-///
-/// # Returns
-///
-/// A boolean value indicating whether the provided bytes form a valid UTF-8 character boundary.
-///
-fn is_character_boundary(bytes: &[u8]) -> bool {
-    // Check if the first byte of `bytes` is a valid UTF-8 character boundary
-    match std::str::from_utf8(bytes) {
-        Ok(s) => s.chars().next().is_some(),
-        Err(_) => false,
+/// Byte offsets at which each character of `line` begins under the current
+/// `LC_CTYPE`, plus `line.len()` as a trailing sentinel. In the `C` locale every
+/// byte begins a character, so `-n` becomes a no-op.
+fn char_boundaries(line: &[u8]) -> Vec<usize> {
+    let mut boundaries = Vec::new();
+    let mut offset = 0;
+    for ch in plib::locale::mb_char_slices(line) {
+        boundaries.push(offset);
+        offset += ch.len();
     }
+    boundaries.push(line.len());
+    boundaries
+}
+
+/// For `-b -n`: move byte index `i` left to the first byte of the character it
+/// falls within.
+fn snap_low(boundaries: &[usize], i: usize) -> usize {
+    let pos = boundaries.partition_point(|&b| b <= i);
+    boundaries[pos - 1]
+}
+
+/// For `-b -n`: ensure inclusive byte index `i` is the last byte of a character.
+/// If it falls inside a character, back up to the last byte of the preceding
+/// character; returns `None` if that drops the range entirely.
+fn snap_high(boundaries: &[usize], i: usize, len: usize) -> Option<usize> {
+    if i + 1 >= len || boundaries.binary_search(&(i + 1)).is_ok() {
+        return Some(i);
+    }
+    snap_low(boundaries, i).checked_sub(1)
 }
 
 /// Cuts out selected bytes from the given line based on the specified ranges.
@@ -122,16 +132,21 @@ fn is_character_boundary(bytes: &[u8]) -> bool {
 fn cut_bytes(line: &[u8], delim: Option<char>, ranges: &Vec<(i32, i32)>, n: bool) -> Vec<u8> {
     let mut result = Vec::with_capacity(line.len());
 
+    // Character boundaries are only needed (and computed) for -n.
+    let boundaries = if n { char_boundaries(line) } else { Vec::new() };
+
     for (start, end) in ranges {
         let mut start = *start as usize;
         let mut end = *end as usize;
 
         if n {
-            if start != 0 && !is_character_boundary(&line[start..]) {
-                start -= 1;
-            }
-            if end != 0 && !is_character_boundary(&line[end..]) {
-                end -= 1;
+            // Do not split multibyte characters: snap the low byte to a
+            // character start and the high byte to a character end; drop the
+            // range if that leaves it empty.
+            start = snap_low(&boundaries, start);
+            match snap_high(&boundaries, end, line.len()) {
+                Some(e) if e >= start => end = e,
+                _ => continue,
             }
         }
 
@@ -230,13 +245,8 @@ fn cut_characters(line: &str, delim: Option<char>, ranges: &Vec<(i32, i32)>) -> 
 fn cut_fields(line: &str, delim: char, ranges: &Vec<(i32, i32)>, suppress: bool) -> (String, bool) {
     let mut result = String::new();
     let mut skip = false;
-    let delim_escaped = delim.escape_debug().to_string();
-    let mut fields: Vec<&str>;
-    if delim_escaped.len() > 1 {
-        fields = line.split(&delim_escaped).collect();
-    } else {
-        fields = line.split(delim).collect();
-    }
+    // Split on the raw delimiter character (each occurrence is significant).
+    let mut fields: Vec<&str> = line.split(delim).collect();
 
     if fields.len() == 1 {
         fields = vec![];
@@ -279,68 +289,79 @@ fn cut_fields(line: &str, delim: char, ranges: &Vec<(i32, i32)>, suppress: bool)
 /// A `Result` indicating success or failure. If an error occurs during file processing, it is returned as `Err`.
 ///
 fn cut_files(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    // Usage errors abort before any processing.
     validate_args(&args).map_err(|err| Box::new(Error::other(err)))?;
 
-    // open files, or stdin
+    // Parse the byte/character/field list once.
+    let parse_option = if let Some(bytes_list) = &args.bytes {
+        ParseVariat::Bytes(read_range(bytes_list).map_err(|err| Box::new(Error::other(err)))?)
+    } else if let Some(characters_list) = &args.characters {
+        ParseVariat::Characters(
+            read_range(characters_list).map_err(|err| Box::new(Error::other(err)))?,
+        )
+    } else if let Some(fields_list) = &args.fields {
+        ParseVariat::Fields(read_range(fields_list).map_err(|err| Box::new(Error::other(err)))?)
+    } else {
+        return Err(Box::new(Error::other("Invalid arguments")));
+    };
 
-    let filenames = args.filenames;
-    let filenames_len = filenames.len();
-    let readers: Vec<Box<dyn Read>> =
-        if filenames_len == 0 || (filenames_len == 1 && filenames[0].as_os_str() == "-") {
-            vec![Box::new(io::stdin().lock())]
-        } else {
-            let mut bufs: Vec<Box<dyn Read>> = Vec::with_capacity(filenames_len);
-            for file in &filenames {
-                bufs.push(Box::new(std::fs::File::open(file)?))
+    // For -f, the default delimiter is <tab> when -d is not given.
+    let field_delim = args.delimiter.unwrap_or('\t');
+
+    // No operands read stdin; otherwise each operand is processed in order, with
+    // a "-" reading stdin at its position (POSIX Guideline 13). A file that
+    // cannot be opened is diagnosed and processing continues (only the exit
+    // status is affected).
+    let sources: Vec<PathBuf> = if args.filenames.is_empty() {
+        vec![PathBuf::from("-")]
+    } else {
+        args.filenames.clone()
+    };
+
+    let mut stdout = io::stdout().lock();
+    for source in &sources {
+        let mut reader = match input_stream_dashed(source) {
+            Ok(r) => io::BufReader::new(r),
+            Err(e) => {
+                plib::diag::error(&format!("{}: {}", source.display(), e));
+                continue;
             }
-            bufs
         };
 
-    // Process each file
-    for file in readers {
-        let reader = io::BufReader::new(file);
+        // Read lines as raw bytes so -b can select arbitrary bytes; -c/-f
+        // interpret the bytes as text (lossily for non-UTF-8 input).
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) => {
+                    plib::diag::error(&format!("{}: {}", source.display(), e));
+                    break;
+                }
+            }
+            if buf.last() == Some(&b'\n') {
+                buf.pop();
+            }
 
-        let parse_option;
-
-        if let Some(bytes_list) = &args.bytes {
-            let ranges: Vec<(i32, i32)> =
-                read_range(bytes_list).map_err(|err| Box::new(Error::other(err)))?;
-
-            parse_option = ParseVariat::Bytes(ranges);
-        } else if let Some(characters_list) = &args.characters {
-            let ranges: Vec<(i32, i32)> =
-                read_range(characters_list).map_err(|err| Box::new(Error::other(err)))?;
-
-            parse_option = ParseVariat::Characters(ranges);
-        } else if let Some(fields_list) = &args.fields {
-            let ranges: Vec<(i32, i32)> =
-                read_range(fields_list).map_err(|err| Box::new(Error::other(err)))?;
-            parse_option = ParseVariat::Fields(ranges);
-        } else {
-            return Err(Box::new(Error::other("Invalid arguments")));
-        }
-
-        for line in reader.lines() {
-            let line = line?;
-            match parse_option.clone() {
+            match &parse_option {
                 ParseVariat::Bytes(ranges) => {
-                    let bytes = cut_bytes(line.as_bytes(), args.delimiter, &ranges, args.no_split);
-                    match String::from_utf8(bytes) {
-                        Ok(string) => println!("{}", string),
-                        Err(e) => eprintln!("Conversion error to string: {}", e),
-                    }
+                    // Write the selected bytes verbatim: they need not be valid
+                    // characters, so do not route through a UTF-8 string.
+                    let mut bytes = cut_bytes(&buf, args.delimiter, ranges, args.no_split);
+                    bytes.push(b'\n');
+                    stdout.write_all(&bytes)?;
                 }
                 ParseVariat::Characters(ranges) => {
-                    println!("{}", cut_characters(&line, args.delimiter, &ranges))
+                    let line = String::from_utf8_lossy(&buf);
+                    writeln!(stdout, "{}", cut_characters(&line, args.delimiter, ranges))?;
                 }
                 ParseVariat::Fields(ranges) => {
-                    if let Some(delim) = args.delimiter {
-                        let result = cut_fields(&line, delim, &ranges, args.suppress);
-                        if !result.1 {
-                            println!("{}", result.0)
-                        }
-                    } else {
-                        println!("{}", line);
+                    let line = String::from_utf8_lossy(&buf);
+                    let (result, skip) = cut_fields(&line, field_delim, ranges, args.suppress);
+                    if !skip {
+                        writeln!(stdout, "{}", result)?;
                     }
                 }
             }
@@ -350,7 +371,11 @@ fn cut_files(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn read_range(line: &str) -> Result<Vec<(i32, i32)>, String> {
-    let ranges: Vec<&str> = line.split(',').collect();
+    // A list is comma- or blank-separated (POSIX).
+    let ranges: Vec<&str> = line
+        .split([',', ' ', '\t'])
+        .filter(|s| !s.is_empty())
+        .collect();
     for range in &ranges {
         if *range == "-" {
             return Err("Invalid range, no endpopint".to_string());
@@ -370,7 +395,7 @@ fn read_range(line: &str) -> Result<Vec<(i32, i32)>, String> {
                 }
             };
 
-            let end = if range.len() == 1 {
+            let end = if nums.len() == 1 {
                 start
             } else if nums[1].is_empty() {
                 i32::MAX - 1
@@ -429,18 +454,13 @@ fn read_range(line: &str) -> Result<Vec<(i32, i32)>, String> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    plib::diag::init_locale("cut");
 
     let args = Args::parse();
 
-    let mut exit_code = 0;
-
     if let Err(err) = cut_files(args) {
-        exit_code = 1;
-        eprintln!("{}", err);
+        plib::diag::error(&format!("{}", err));
     }
 
-    std::process::exit(exit_code)
+    std::process::exit(plib::diag::exit_status())
 }

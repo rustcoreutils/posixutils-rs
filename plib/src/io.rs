@@ -31,6 +31,30 @@ pub fn input_stream_opt(pathname: &Option<PathBuf>) -> io::Result<Box<dyn Read>>
     }
 }
 
+/// Open `pathname` for reading, treating both an empty path and the literal `-`
+/// as standard input.
+///
+/// POSIX utilities accept `-` as a stdin operand at *any* position in the file
+/// list (XBD §12.2 Guideline 13), not only when it is the sole operand. Use
+/// this at each per-operand open site so a `-` interleaved with real files
+/// (e.g. `util a - b`) reads stdin at that position, while keeping an empty
+/// path (the conventional "no file operands" sentinel) routed to stdin too.
+///
+/// Unlike [`input_stream`], the stdin case returns the unlocked [`io::Stdin`]
+/// handle (which acquires the stdin lock per read) rather than a persistent
+/// [`io::StdinLock`]. This lets a utility hold several stdin sources open at
+/// once — e.g. `cut - -` or `sort - -` build a vector of readers — without
+/// deadlocking on a second `StdinLock` acquisition. The first source drains
+/// stdin; later stdin sources see EOF.
+pub fn input_stream_dashed(pathname: &Path) -> io::Result<Box<dyn Read>> {
+    let s = pathname.as_os_str();
+    if s.is_empty() || s == "-" {
+        Ok(Box::new(io::stdin()))
+    } else {
+        Ok(Box::new(fs::File::open(pathname)?))
+    }
+}
+
 pub fn input_reader(
     pathname: &Path,
     dashed_stdin: bool,
@@ -79,6 +103,27 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn input_stream_dashed_opens_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.txt");
+        fs::write(&path, b"hello\n").unwrap();
+
+        let mut s = input_stream_dashed(&path).unwrap();
+        let mut buf = String::new();
+        s.read_to_string(&mut buf).unwrap();
+        assert_eq!(buf, "hello\n");
+    }
+
+    #[test]
+    fn input_stream_dashed_missing_file_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nope.txt");
+        // A real (non-"-") path that does not exist must surface the open error,
+        // not be silently treated as stdin.
+        assert!(input_stream_dashed(&path).is_err());
+    }
 
     #[test]
     fn write_atomic_replaces_content() {

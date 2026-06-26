@@ -235,6 +235,56 @@ fn test_tail_zero_bytes_and_zero_lines() {
     tail_test(&["-n", "-0"], INPUT, "");
 }
 
+// Finding #1: -r (reverse). BSD `tail -r` reverses all lines; `tail -r -n N`
+// reverses only the last N lines. (GNU dropped -r, so BSD is the reference.)
+#[test]
+fn test_tail_reverse_all() {
+    tail_test(&["-r"], "a\nb\nc\n", "c\nb\na\n");
+}
+
+#[test]
+fn test_tail_reverse_last_n() {
+    tail_test(&["-r", "-n", "2"], "a\nb\nc\n", "c\nb\n");
+}
+
+#[test]
+fn test_tail_reverse_from_start() {
+    // +2: reverse lines from the 2nd to the end.
+    tail_test(&["-r", "-n", "+2"], "a\nb\nc\n", "c\nb\n");
+}
+
+#[test]
+fn test_tail_reverse_no_trailing_newline() {
+    // A missing final newline is normalized; each reversed line is terminated.
+    tail_test(&["-r"], "a\nb\nc", "c\nb\na\n");
+}
+
+#[test]
+fn test_tail_reverse_bytes() {
+    // -r with -c reverses the selected bytes.
+    tail_test(&["-r", "-c", "3"], "abcd", "dcb");
+}
+
+// Finding #6: `--` must still terminate option parsing despite
+// allow_hyphen_values on -n/-c.
+#[test]
+fn test_tail_double_dash_with_count() {
+    tail_test(&["-n", "2", "--"], "a\nb\nc\n", "b\nc\n");
+}
+
+#[test]
+fn test_tail_double_dash_default() {
+    tail_test(&["--"], "a\nb\nc\n", "a\nb\nc\n");
+}
+
+// Finding #3: `-n +0` matches GNU, which prints the WHOLE file (treats +0
+// like +1). POSIX deems line/byte zero from start non-conforming, but GNU's
+// choice is to emit everything; accepted as GNU-correct.
+#[test]
+fn test_tail_plus_zero_prints_all() {
+    tail_test(&["-n", "+0"], "a\nb\nc\n", "a\nb\nc\n");
+}
+
 #[test]
 fn test_tail_c_and_n() {
     tail_test_failure(

@@ -659,11 +659,12 @@ fn test_patch_ifdef() {
     });
 
     let content = fs::read_to_string(&original).unwrap();
-    // Should contain #ifdef/#ifndef wrappers
-    assert!(content.contains("#ifdef FEATURE_X"), "Should have #ifdef");
-    assert!(content.contains("#ifndef FEATURE_X"), "Should have #ifndef");
-    assert!(content.contains("new line"), "Should have new line");
-    assert!(content.contains("old line"), "Should have old line");
+    // A change hunk (delete + add) must use the #else form, matching GNU
+    // `patch -D`: #ifndef DEFINE / old / #else / new / #endif.
+    assert_eq!(
+        content,
+        "before\n#ifndef FEATURE_X\nold line\n#else\nnew line\n#endif\nafter\n"
+    );
 
     cleanup_test_dir(&test_dir);
 }
@@ -1118,4 +1119,214 @@ fn test_patch_reverse_ed_error() {
             );
         },
     );
+}
+
+// #1: a patch whose last line is marked "\ No newline at end of file" must
+// produce a file with no trailing newline (matching GNU patch).
+#[test]
+fn test_patch_no_newline_at_eof() {
+    let test_dir = setup_test_dir("no_newline_eof");
+
+    let original = test_dir.join("nl.txt");
+    fs::write(&original, "line 1\nline 2\nline 3\n").unwrap();
+
+    let patch_file = test_dir.join("nl.patch");
+    fs::write(
+        &patch_file,
+        "--- nl.txt\n+++ nl.txt\n@@ -1,3 +1,3 @@\n line 1\n line 2\n-line 3\n+line 3 changed\n\\ No newline at end of file\n",
+    )
+    .unwrap();
+
+    run_test(TestPlan {
+        cmd: String::from("patch"),
+        args: vec![
+            String::from("-i"),
+            patch_file.to_str().unwrap().to_string(),
+            original.to_str().unwrap().to_string(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    // Last line must NOT have a trailing newline.
+    let content = fs::read_to_string(&original).unwrap();
+    assert_eq!(content, "line 1\nline 2\nline 3 changed");
+    assert!(
+        !content.ends_with('\n'),
+        "Output must have no trailing newline"
+    );
+
+    cleanup_test_dir(&test_dir);
+}
+
+// #2: a deletion patch (new file is /dev/null) must remove the target rather
+// than leaving an empty file behind.
+#[test]
+fn test_patch_delete_file() {
+    let test_dir = setup_test_dir("delete_file");
+
+    let original = test_dir.join("doomed.txt");
+    fs::write(&original, "a\nb\n").unwrap();
+
+    let patch_file = test_dir.join("del.patch");
+    fs::write(
+        &patch_file,
+        "--- doomed.txt\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-a\n-b\n",
+    )
+    .unwrap();
+
+    run_test(TestPlan {
+        cmd: String::from("patch"),
+        args: vec![
+            String::from("-i"),
+            patch_file.to_str().unwrap().to_string(),
+            original.to_str().unwrap().to_string(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    assert!(
+        !original.exists(),
+        "Deletion patch should remove the target file"
+    );
+
+    cleanup_test_dir(&test_dir);
+}
+
+// #4: -o outfile receiving multiple patched files must concatenate the
+// successive versions rather than truncating each time.
+#[test]
+fn test_patch_output_concat() {
+    let test_dir = setup_test_dir("output_concat");
+
+    let f1 = test_dir.join("f1.txt");
+    let f2 = test_dir.join("f2.txt");
+    fs::write(&f1, "a\n").unwrap();
+    fs::write(&f2, "b\n").unwrap();
+
+    // One patch file with two file sections.
+    let patch_file = test_dir.join("multi.patch");
+    fs::write(
+        &patch_file,
+        "--- f1.txt\n+++ f1.txt\n@@ -1 +1 @@\n-a\n+A\n--- f2.txt\n+++ f2.txt\n@@ -1 +1 @@\n-b\n+B\n",
+    )
+    .unwrap();
+
+    let output = test_dir.join("out.txt");
+
+    // Run from the test directory so the relative paths resolve.
+    run_test(TestPlan {
+        cmd: String::from("patch"),
+        args: vec![
+            String::from("-d"),
+            test_dir.to_str().unwrap().to_string(),
+            String::from("-o"),
+            output.to_str().unwrap().to_string(),
+            String::from("-i"),
+            patch_file.to_str().unwrap().to_string(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    let out_content = fs::read_to_string(&output).unwrap();
+    assert_eq!(
+        out_content, "A\nB\n",
+        "Successive -o versions must concatenate"
+    );
+
+    cleanup_test_dir(&test_dir);
+}
+
+// #5: -b must back up each file only the first time it is patched, so the
+// .orig holds the true original after a multi-patch run on the same file.
+#[test]
+fn test_patch_backup_once() {
+    let test_dir = setup_test_dir("backup_once");
+
+    let target = test_dir.join("b.txt");
+    fs::write(&target, "a\n").unwrap();
+
+    // Two sections both patching b.txt: a -> B -> C.
+    let patch_file = test_dir.join("b2.patch");
+    fs::write(
+        &patch_file,
+        "--- b.txt\n+++ b.txt\n@@ -1 +1 @@\n-a\n+B\n--- b.txt\n+++ b.txt\n@@ -1 +1 @@\n-B\n+C\n",
+    )
+    .unwrap();
+
+    run_test(TestPlan {
+        cmd: String::from("patch"),
+        args: vec![
+            String::from("-b"),
+            String::from("-d"),
+            test_dir.to_str().unwrap().to_string(),
+            String::from("-i"),
+            patch_file.to_str().unwrap().to_string(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    let content = fs::read_to_string(&target).unwrap();
+    assert_eq!(content, "C\n", "Both hunks should apply in sequence");
+
+    let backup = test_dir.join("b.txt.orig");
+    assert!(backup.exists(), "Backup should exist");
+    let backup_content = fs::read_to_string(&backup).unwrap();
+    assert_eq!(
+        backup_content, "a\n",
+        ".orig must hold the ORIGINAL content, not an intermediate version"
+    );
+
+    cleanup_test_dir(&test_dir);
+}
+
+// #7: -p must count a sequence of adjacent slashes as a single slash.
+#[test]
+fn test_patch_strip_path_double_slash() {
+    let test_dir = setup_test_dir("strip_double_slash");
+
+    let subdir = test_dir.join("sub");
+    fs::create_dir_all(&subdir).unwrap();
+    let target = subdir.join("strip.txt");
+    fs::write(&target, "content\n").unwrap();
+
+    // The header path has a "//" run that must collapse to one slash so that
+    // -p2 yields "sub/strip.txt" (not "foo/sub/strip.txt").
+    let patch_file = test_dir.join("pp.patch");
+    fs::write(
+        &patch_file,
+        "--- //foo/sub/strip.txt\n+++ //foo/sub/strip.txt\n@@ -1 +1 @@\n-content\n+new content\n",
+    )
+    .unwrap();
+
+    run_test(TestPlan {
+        cmd: String::from("patch"),
+        args: vec![
+            String::from("-d"),
+            test_dir.to_str().unwrap().to_string(),
+            String::from("-p2"),
+            String::from("-i"),
+            patch_file.to_str().unwrap().to_string(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    let content = fs::read_to_string(&target).unwrap();
+    assert_eq!(content, "new content\n");
+
+    cleanup_test_dir(&test_dir);
 }

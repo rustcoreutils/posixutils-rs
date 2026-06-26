@@ -83,21 +83,21 @@ fn test_incompatible_options() {
         &["-cl"],
         "",
         "",
-        "Options \'-c\' and \'-l\' cannot be used together\n",
+        "grep: Options \'-c\' and \'-l\' cannot be used together\n",
         2,
     );
     grep_test(
         &["-cq"],
         "",
         "",
-        "Options \'-c\' and \'-q\' cannot be used together\n",
+        "grep: Options \'-c\' and \'-q\' cannot be used together\n",
         2,
     );
     grep_test(
         &["-lq"],
         "",
         "",
-        "Options \'-l\' and \'-q\' cannot be used together\n",
+        "grep: Options \'-l\' and \'-q\' cannot be used together\n",
         2,
     );
 }
@@ -108,7 +108,7 @@ fn test_absent_pattern() {
         &[],
         "",
         "",
-        "Required at least one pattern list or file\n",
+        "grep: Required at least one pattern list or file\n",
         2,
     );
 }
@@ -119,7 +119,7 @@ fn test_inexisting_file_pattern() {
         &["-f", BAD_INPUT_FILE],
         "",
         "",
-        "tests/grep/inexisting_file: No such file or directory (os error 2)\n",
+        "grep: tests/grep/inexisting_file: No such file or directory (os error 2)\n",
         2,
     );
 }
@@ -152,7 +152,7 @@ fn test_basic_regexp_03() {
         &[BRE, INVALID_LINE_INPUT_FILE],
         "",
         "line_{1}\np_line_{2}_s\n",
-        "tests/grep/invalid_line: Error reading line 2 (stream did not contain valid UTF-8)\n",
+        "grep: tests/grep/invalid_line: error reading line 2 (stream did not contain valid UTF-8)\n",
         2,
     );
 }
@@ -198,7 +198,7 @@ fn test_basic_regexp_quiet_with_error_02() {
         &["-q", BRE, BAD_INPUT_FILE, "-"],
         LINES_INPUT,
         "",
-        "tests/grep/inexisting_file: No such file or directory (os error 2)\n",
+        "grep: tests/grep/inexisting_file: No such file or directory (os error 2)\n",
         0,
     );
 }
@@ -209,7 +209,7 @@ fn test_basic_regexp_quiet_with_error_03() {
         &["-q", BRE, "-", BAD_INPUT_FILE],
         BAD_INPUT,
         "",
-        "tests/grep/inexisting_file: No such file or directory (os error 2)\n",
+        "grep: tests/grep/inexisting_file: No such file or directory (os error 2)\n",
         2,
     );
 }
@@ -252,7 +252,7 @@ fn test_basic_regexp_line_number_03() {
         &["-n", BRE, INVALID_LINE_INPUT_FILE],
         "",
         "1:line_{1}\n3:p_line_{2}_s\n",
-        "tests/grep/invalid_line: Error reading line 2 (stream did not contain valid UTF-8)\n",
+        "grep: tests/grep/invalid_line: error reading line 2 (stream did not contain valid UTF-8)\n",
         2,
     );
 }
@@ -370,7 +370,7 @@ fn test_extended_regexp_03() {
         &["-E", ERE, INVALID_LINE_INPUT_FILE],
         "",
         "line_{1}\np_line_{2}_s\n",
-        "tests/grep/invalid_line: Error reading line 2 (stream did not contain valid UTF-8)\n",
+        "grep: tests/grep/invalid_line: error reading line 2 (stream did not contain valid UTF-8)\n",
         2,
     );
 }
@@ -422,7 +422,7 @@ fn test_extended_regexp_quiet_with_error_02() {
         &["-E", "-q", ERE, BAD_INPUT_FILE, "-"],
         LINES_INPUT,
         "",
-        "tests/grep/inexisting_file: No such file or directory (os error 2)\n",
+        "grep: tests/grep/inexisting_file: No such file or directory (os error 2)\n",
         0,
     );
 }
@@ -433,7 +433,7 @@ fn test_extended_regexp_quiet_with_error_03() {
         &["-E", "-q", ERE, "-", BAD_INPUT_FILE],
         BAD_INPUT,
         "",
-        "tests/grep/inexisting_file: No such file or directory (os error 2)\n",
+        "grep: tests/grep/inexisting_file: No such file or directory (os error 2)\n",
         2,
     );
 }
@@ -476,7 +476,7 @@ fn test_extended_regexp_line_number_03() {
         &["-E", "-n", ERE, INVALID_LINE_INPUT_FILE],
         "",
         "1:line_{1}\n3:p_line_{2}_s\n",
-        "tests/grep/invalid_line: Error reading line 2 (stream did not contain valid UTF-8)\n",
+        "grep: tests/grep/invalid_line: error reading line 2 (stream did not contain valid UTF-8)\n",
         2,
     );
 }
@@ -610,7 +610,7 @@ fn test_fixed_strings_03() {
         &["-F", FIXED, INVALID_LINE_INPUT_FILE],
         "",
         "line_{1}\np_line_{2}_s\n",
-        "tests/grep/invalid_line: Error reading line 2 (stream did not contain valid UTF-8)\n",
+        "grep: tests/grep/invalid_line: error reading line 2 (stream did not contain valid UTF-8)\n",
         2,
     );
 }
@@ -668,7 +668,7 @@ fn test_fixed_strings_quiet_with_error_02() {
         &["-F", "-q", FIXED, BAD_INPUT_FILE, "-"],
         LINES_INPUT,
         "",
-        "tests/grep/inexisting_file: No such file or directory (os error 2)\n",
+        "grep: tests/grep/inexisting_file: No such file or directory (os error 2)\n",
         0,
     );
 }
@@ -679,7 +679,7 @@ fn test_fixed_strings_quiet_with_error_03() {
         &["-F", "-q", FIXED, "-", BAD_INPUT_FILE],
         BAD_INPUT,
         "",
-        "tests/grep/inexisting_file: No such file or directory (os error 2)\n",
+        "grep: tests/grep/inexisting_file: No such file or directory (os error 2)\n",
         2,
     );
 }
@@ -722,7 +722,7 @@ fn test_fixed_strings_line_number_03() {
         &["-F", "-n", FIXED, INVALID_LINE_INPUT_FILE],
         "",
         "1:line_{1}\n3:p_line_{2}_s\n",
-        "tests/grep/invalid_line: Error reading line 2 (stream did not contain valid UTF-8)\n",
+        "grep: tests/grep/invalid_line: error reading line 2 (stream did not contain valid UTF-8)\n",
         2,
     );
 }
@@ -765,7 +765,7 @@ fn test_fixed_strings_no_messages_with_error_03() {
         &["-F", "-cl", "-s", FIXED, "-", BAD_INPUT_FILE],
         LINES_INPUT,
         "",
-        "Options '-c' and '-l' cannot be used together\n",
+        "grep: Options '-c' and '-l' cannot be used together\n",
         2,
     );
 }
@@ -1404,4 +1404,11 @@ fn test_long_names_files() {
             "",
             0,
         );
+}
+
+#[test]
+fn test_duplicate_patterns_are_all_used() {
+    // Every specified pattern is kept (duplicates are not removed). Two
+    // identical -e patterns still match the line exactly once.
+    grep_test(&["-e", "foo", "-e", "foo"], "foo\nbar\n", "foo\n", "", 0);
 }

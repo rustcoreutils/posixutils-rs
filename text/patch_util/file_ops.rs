@@ -112,8 +112,9 @@ pub fn prompt_yes_no(prompt: &str) -> Option<bool> {
         return None;
     }
     let answer = line.trim();
-    // Default (empty) answer is affirmative, matching the "[y]" prompt.
-    Some(answer.is_empty() || answer.starts_with('y') || answer.starts_with('Y'))
+    // Default (empty) answer is affirmative, matching the "[y]" prompt; a
+    // non-empty answer is matched against the locale's YESEXPR.
+    Some(answer.is_empty() || plib::locale::is_affirmative(answer))
 }
 
 /// Strip leading path components from a path.

@@ -102,7 +102,7 @@ fn pause() -> io::Result<()> {
 /// We flush any buffered output streams, restore the default disposition, and
 /// re-raise so the process dies from the signal (and the parent observes a
 /// signal death).
-fn handle_sigint(signal_code: libc::c_int) {
+extern "C" fn handle_sigint(signal_code: libc::c_int) {
     unsafe {
         // Flush all open stdio output streams so any pending diagnostic
         // reaches the terminal before we terminate.
@@ -118,7 +118,10 @@ fn install_sigint_handler() {
     let stdout_is_terminal = unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 };
     if stdout_is_terminal {
         unsafe {
-            libc::signal(libc::SIGINT, handle_sigint as *const () as usize);
+            libc::signal(
+                libc::SIGINT,
+                handle_sigint as extern "C" fn(libc::c_int) as libc::sighandler_t,
+            );
         }
     }
 }

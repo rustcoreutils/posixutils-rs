@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
@@ -72,57 +72,65 @@ fn find_last_blank(v: &[u8]) -> Option<usize> {
 
 fn fold_file(args: &Args, pathname: &Path) -> io::Result<()> {
     // open file, or stdin ("-" or no operand)
-    let mut file = input_stream_dashed(pathname)?;
-    let mut data = Vec::new();
-    file.read_to_end(&mut data)?;
+    let mut reader = BufReader::new(input_stream_dashed(pathname)?);
 
     let width = args.width as usize;
     let mut out = BufWriter::new(io::stdout());
     let mut line: Vec<u8> = Vec::new();
     let mut col: usize = 0;
 
-    for ch in mb_char_slices(&data) {
-        if ch == b"\n" {
-            line.extend_from_slice(ch);
-            out.write_all(&line)?;
-            line.clear();
-            col = 0;
-            continue;
+    // Process one input line at a time so large inputs are not buffered in
+    // full. A <newline> never splits a multibyte character; the wrap state
+    // (`line`/`col`) carries across reads and is flushed at each newline.
+    let mut data: Vec<u8> = Vec::new();
+    loop {
+        data.clear();
+        if reader.read_until(b'\n', &mut data)? == 0 {
+            break;
         }
-
-        let mut next = char_advance(col, ch, args.bytes);
-
-        // Insert breaks while appending this character would exceed the width
-        // and the line is non-empty (a single over-wide character on an empty
-        // line is emitted as-is; the spec leaves that case undefined).
-        while next > width && !line.is_empty() {
-            let mut folded = false;
-            if args.spaces {
-                if let Some(b) = find_last_blank(&line) {
-                    out.write_all(&line[..=b])?;
-                    out.write_all(b"\n")?;
-                    let remainder = line[b + 1..].to_vec();
-                    line = remainder;
-                    // Recompute the column over the kept remainder (its
-                    // characters are complete: blanks are char boundaries).
-                    col = 0;
-                    for rc in mb_char_slices(&line) {
-                        col = char_advance(col, rc, args.bytes);
-                    }
-                    folded = true;
-                }
-            }
-            if !folded {
+        for ch in mb_char_slices(&data) {
+            if ch == b"\n" {
+                line.extend_from_slice(ch);
                 out.write_all(&line)?;
-                out.write_all(b"\n")?;
                 line.clear();
                 col = 0;
+                continue;
             }
-            next = char_advance(col, ch, args.bytes);
-        }
 
-        line.extend_from_slice(ch);
-        col = next;
+            let mut next = char_advance(col, ch, args.bytes);
+
+            // Insert breaks while appending this character would exceed the width
+            // and the line is non-empty (a single over-wide character on an empty
+            // line is emitted as-is; the spec leaves that case undefined).
+            while next > width && !line.is_empty() {
+                let mut folded = false;
+                if args.spaces {
+                    if let Some(b) = find_last_blank(&line) {
+                        out.write_all(&line[..=b])?;
+                        out.write_all(b"\n")?;
+                        let remainder = line[b + 1..].to_vec();
+                        line = remainder;
+                        // Recompute the column over the kept remainder (its
+                        // characters are complete: blanks are char boundaries).
+                        col = 0;
+                        for rc in mb_char_slices(&line) {
+                            col = char_advance(col, rc, args.bytes);
+                        }
+                        folded = true;
+                    }
+                }
+                if !folded {
+                    out.write_all(&line)?;
+                    out.write_all(b"\n")?;
+                    line.clear();
+                    col = 0;
+                }
+                next = char_advance(col, ch, args.bytes);
+            }
+
+            line.extend_from_slice(ch);
+            col = next;
+        }
     }
 
     // Trailing partial line (input without a final newline).

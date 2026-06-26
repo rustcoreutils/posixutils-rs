@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
@@ -87,43 +87,51 @@ fn next_stop(tablist: &TabList, p: usize) -> usize {
 
 fn expand_file(tablist: &TabList, pathname: &Path) -> io::Result<()> {
     // open file, or stdin ("-" or no operand)
-    let mut file = input_stream_dashed(pathname)?;
-    let mut data = Vec::new();
-    file.read_to_end(&mut data)?;
+    let mut reader = BufReader::new(input_stream_dashed(pathname)?);
 
     let mut writer = BufWriter::new(io::stdout());
     // 0-based column = number of column positions consumed on the current line.
     let mut p: usize = 0;
 
-    for ch in mb_char_slices(&data) {
-        match ch {
-            b"\t" => {
-                let stop = next_stop(tablist, p);
-                for _ in p..stop {
-                    writer.write_all(b" ")?;
+    // Process one line at a time so arbitrarily large inputs (e.g. a long pipe)
+    // do not have to be buffered in full. A <newline> never splits a multibyte
+    // character, so chunking on it is safe; `p` resets at each line boundary.
+    let mut data: Vec<u8> = Vec::new();
+    loop {
+        data.clear();
+        if reader.read_until(b'\n', &mut data)? == 0 {
+            break;
+        }
+        for ch in mb_char_slices(&data) {
+            match ch {
+                b"\t" => {
+                    let stop = next_stop(tablist, p);
+                    for _ in p..stop {
+                        writer.write_all(b" ")?;
+                    }
+                    p = stop;
                 }
-                p = stop;
-            }
-            b"\x08" => {
-                // backspace: column count decrements, never below zero
-                writer.write_all(ch)?;
-                p = p.saturating_sub(1);
-            }
-            b"\r" | b"\n" => {
-                writer.write_all(ch)?;
-                p = 0;
-            }
-            _ => {
-                writer.write_all(ch)?;
-                // Advance by the character's display width under LC_CTYPE.
-                // Non-printable / undecodable bytes do not advance the column.
-                let w = std::str::from_utf8(ch)
-                    .ok()
-                    .and_then(|s| s.chars().next())
-                    .map(wcwidth_char)
-                    .unwrap_or(1);
-                if w > 0 {
-                    p += w as usize;
+                b"\x08" => {
+                    // backspace: column count decrements, never below zero
+                    writer.write_all(ch)?;
+                    p = p.saturating_sub(1);
+                }
+                b"\r" | b"\n" => {
+                    writer.write_all(ch)?;
+                    p = 0;
+                }
+                _ => {
+                    writer.write_all(ch)?;
+                    // Advance by the character's display width under LC_CTYPE.
+                    // Non-printable / undecodable bytes do not advance the column.
+                    let w = std::str::from_utf8(ch)
+                        .ok()
+                        .and_then(|s| s.chars().next())
+                        .map(wcwidth_char)
+                        .unwrap_or(1);
+                    if w > 0 {
+                        p += w as usize;
+                    }
                 }
             }
         }

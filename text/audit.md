@@ -18,6 +18,8 @@ Utilities (by source size): `asa`, `comm`, `csplit`, `cut`, `diff` (+`diff_util/
 
 ## `asa`
 
+> **STATUS — Remediated & promoted to README Stage 6 (Audited).** All priority findings below are fixed (see the per-item `FIXED (Phase N)` annotations); verified against GNU coreutils 9.4. Remaining open items, if any, are tree-wide gettext `.mo` deferrals.
+
 **Implementation:** `text/asa.rs` (152 lines)
 **Tests:** `text/tests/asa/mod.rs` (330 lines)
 **Spec:** POSIX.1-2024 (IEEE Std 1003.1-2024), Vol. 3 §3
@@ -130,6 +132,8 @@ Not covered:
 ---
 
 ## `comm`
+
+> **STATUS — Remediated & promoted to README Stage 6 (Audited).** All priority findings below are fixed (see the per-item `FIXED (Phase N)` annotations); verified against GNU coreutils 9.4. Remaining open items, if any, are tree-wide gettext `.mo` deferrals.
 
 **Implementation:** `text/comm.rs` (161 lines)
 **Tests:** `text/tests/comm/mod.rs` (201 lines)
@@ -244,6 +248,8 @@ Not covered:
 ---
 
 ## `csplit`
+
+> **STATUS — Remediated; remains at Stage 3.** All Critical/Major split-correctness findings are fixed and output is byte-for-byte GNU-correct, but two items stay open: `#4` (a SIGINT created-file-cleanup handler) and `#8` (erroring when an operand references a line past EOF — only the exit status differs from GNU). Promote once those land.
 
 **Implementation:** `text/csplit.rs` (1201 lines incl. inline tests)
 **Tests:** `text/tests/csplit/mod.rs` (323 lines)
@@ -379,6 +385,8 @@ Not covered:
 
 ## `cut`
 
+> **STATUS — Remediated & promoted to README Stage 6 (Audited).** All priority findings below are fixed (see the per-item `FIXED (Phase N)` annotations); verified against GNU coreutils 9.4. Remaining open items, if any, are tree-wide gettext `.mo` deferrals.
+
 **Implementation:** `text/cut.rs` (447 lines)
 **Tests:** `text/tests/cut/mod.rs` (357 lines)
 **Spec:** POSIX.1-2024 (IEEE Std 1003.1-2024), Vol. 3 §3
@@ -501,6 +509,8 @@ Not covered:
 ---
 
 ## `diff`
+
+> **STATUS — Remediated & promoted to README Stage 6 (Audited).** All priority findings below are fixed (see the per-item `FIXED (Phase N)` annotations); verified against GNU coreutils 9.4. Remaining open items, if any, are tree-wide gettext `.mo` deferrals.
 
 **Implementation:** `text/diff.rs` (201 lines) + `text/diff_util/` (10 files, ~1250 lines)
 **Tests:** `text/tests/diff-tests.rs` (437 lines)
@@ -654,6 +664,8 @@ Not covered:
 
 ## `expand`
 
+> **STATUS — Remediated & promoted to README Stage 6 (Audited).** All priority findings below are fixed (see the per-item `FIXED (Phase N)` annotations); verified against GNU coreutils 9.4. Remaining open items, if any, are tree-wide gettext `.mo` deferrals.
+
 **Implementation:** `text/expand.rs` (169 lines)
 **Tests:** `text/tests/expand/mod.rs` (29 lines)
 **Spec:** POSIX.1-2024 (IEEE Std 1003.1-2024), Vol. 3 §3
@@ -789,6 +801,8 @@ Only two cases (empty input; `"a\tb\tc\n"` default 8-stop). Not covered:
 
 ## `fold`
 
+> **STATUS — Remediated & promoted to README Stage 6 (Audited).** All priority findings below are fixed (see the per-item `FIXED (Phase N)` annotations); verified against GNU coreutils 9.4. Remaining open items, if any, are tree-wide gettext `.mo` deferrals.
+
 **Implementation:** `text/fold.rs` (189 lines)
 **Tests:** `text/tests/fold/mod.rs` (78 lines)
 **Spec:** POSIX.1-2024 (IEEE Std 1003.1-2024), Vol. 3 §3
@@ -913,6 +927,8 @@ Not covered (all test inputs fit within 80 columns, so no fold ever fires):
 ---
 
 ## `grep`
+
+> **STATUS — Remediated & promoted to README Stage 6 (Audited).** All priority findings below are fixed (see the per-item `FIXED (Phase N)` annotations); verified against GNU coreutils 9.4. Remaining open items, if any, are tree-wide gettext `.mo` deferrals.
 
 **Implementation:** `text/grep.rs` (453 lines)
 **Tests:** `text/tests/grep/mod.rs` (1407 lines)
@@ -1058,6 +1074,8 @@ Not covered:
 
 ## `head`
 
+> **STATUS — Remediated & promoted to README Stage 6 (Audited).** All priority findings below are fixed (see the per-item `FIXED (Phase N)` annotations); verified against GNU coreutils 9.4. Remaining open items, if any, are tree-wide gettext `.mo` deferrals.
+
 **Implementation:** `text/head.rs` (209 lines)
 **Tests:** `text/tests/head/mod.rs` (269 lines)
 **Spec:** POSIX.1-2024 (IEEE Std 1003.1-2024), Vol. 3 §3
@@ -1184,6 +1202,8 @@ Not covered:
 ---
 
 ## `join`
+
+> **STATUS — Remediated & promoted to README Stage 6 (Audited).** All priority findings below are fixed (see the per-item `FIXED (Phase N)` annotations); verified against GNU coreutils 9.4. Remaining open items, if any, are tree-wide gettext `.mo` deferrals.
 
 **Implementation:** `text/join.rs` (194 lines)
 **Tests:** `text/tests/join/mod.rs` (145 lines)
@@ -1331,6 +1351,8 @@ Not covered:
 
 ## `nl`
 
+> **STATUS — Remediated & promoted to README Stage 6 (Audited).** All priority findings below are fixed (see the per-item `FIXED (Phase N)` annotations); verified against GNU coreutils 9.4. Remaining open items, if any, are tree-wide gettext `.mo` deferrals.
+
 **Implementation:** `text/nl.rs` (313 lines)
 **Tests:** `text/tests/nl/mod.rs` (95 lines)
 **Spec:** POSIX.1-2024 (IEEE Std 1003.1-2024), Vol. 3 §3
@@ -1463,6 +1485,8 @@ Not covered:
 ---
 
 ## `paste`
+
+> **STATUS — Remediated & promoted to README Stage 6 (Audited).** All priority findings below are fixed (see the per-item `FIXED (Phase N)` annotations); verified against GNU coreutils 9.4. Remaining open items, if any, are tree-wide gettext `.mo` deferrals.
 
 **Implementation:** `text/paste.rs` (464 lines)
 **Tests:** `text/tests/paste/mod.rs` (333 lines)
@@ -1601,6 +1625,8 @@ Not covered:
 ---
 
 ## `patch`
+
+> **STATUS — Remediated & promoted to README Stage 6 (Audited).** All priority findings below are fixed (see the per-item `FIXED (Phase N)` annotations); verified against GNU coreutils 9.4. Remaining open items, if any, are tree-wide gettext `.mo` deferrals.
 
 **Implementation:** `text/patch.rs` (273 lines) + `text/patch_util/` (8 files, ~1050 lines)
 **Tests:** `text/tests/patch/mod.rs` (1122 lines)
@@ -1762,6 +1788,8 @@ Not covered:
 
 ## `pr`
 
+> **STATUS — Remediated & promoted to README Stage 6 (Audited).** All priority findings below are fixed (see the per-item `FIXED (Phase N)` annotations); verified against GNU coreutils 9.4. Remaining open items, if any, are tree-wide gettext `.mo` deferrals.
+
 **Implementation:** `text/pr.rs` (577 lines) + `text/pr_util/` (args.rs 564, line_iterator.rs 161, line_transform.rs 143, page_iterator.rs 87, mod.rs 18)
 **Tests:** `text/tests/pr/mod.rs` (308 lines, 14 tests)
 **Spec:** POSIX.1-2024 (IEEE Std 1003.1-2024), Vol. 3 §3
@@ -1919,6 +1947,8 @@ Not covered:
 ---
 
 ## `sed`
+
+> **STATUS — Remediated & promoted to README Stage 6 (Audited).** All priority findings below are fixed (see the per-item `FIXED (Phase N)` annotations); verified against GNU coreutils 9.4. Remaining open items, if any, are tree-wide gettext `.mo` deferrals.
 
 **Implementation:** `text/sed.rs` (2469 lines)
 **Tests:** `text/tests/sed/mod.rs` (2315 lines)
@@ -2085,6 +2115,8 @@ Not covered:
 
 ## `sort`
 
+> **STATUS — Remediated & promoted to README Stage 6 (Audited).** All priority findings below are fixed (see the per-item `FIXED (Phase N)` annotations); verified against GNU coreutils 9.4. Remaining open items, if any, are tree-wide gettext `.mo` deferrals.
+
 **Implementation:** `text/sort.rs` (1011 lines)
 **Tests:** `text/tests/sort/mod.rs` (616 lines)
 **Spec:** POSIX.1-2024 (IEEE Std 1003.1-2024), Vol. 3 §3
@@ -2247,6 +2279,8 @@ Not covered:
 
 ## `tail`
 
+> **STATUS — Remediated & promoted to README Stage 6 (Audited).** All priority findings below are fixed (see the per-item `FIXED (Phase N)` annotations); verified against GNU coreutils 9.4. Remaining open items, if any, are tree-wide gettext `.mo` deferrals.
+
 **Implementation:** `text/tail.rs` (507 lines)
 **Tests:** `text/tests/tail/mod.rs` (249 lines)
 **Spec:** POSIX.1-2024 (IEEE Std 1003.1-2024), Vol. 3 §3
@@ -2374,6 +2408,8 @@ Not covered:
 ---
 
 ## `tr`
+
+> **STATUS — Remediated for the C/POSIX locale; remains at Stage 3.** `tr` is fully POSIX-conformant in the C/POSIX locale. The multibyte items (`#1` `-c`/`-C`, `#2` `LC_CTYPE` classes, `#4` `[=equiv=]`, `#5` `LC_COLLATE` ranges) are documented POSIX-locale limitations requiring a predicate-based class-matching rewrite (locale-aware classes would desync the `[:upper:]`↔`[:lower:]` case pairing). Promote once that rewrite lands.
 
 **Implementation:** `text/tr.rs` (2484 lines)
 **Tests:** `text/tests/tr/mod.rs` (795 lines)
@@ -2521,6 +2557,8 @@ Thorough for ASCII. Not covered:
 
 ## `tsort`
 
+> **STATUS — Remediated & promoted to README Stage 6 (Audited).** All priority findings below are fixed (see the per-item `FIXED (Phase N)` annotations); verified against GNU coreutils 9.4. Remaining open items, if any, are tree-wide gettext `.mo` deferrals.
+
 **Implementation:** `text/tsort.rs` (179 lines)
 **Tests:** `text/tests/tsort/mod.rs` (317 lines)
 **Spec:** POSIX.1-2024 (IEEE Std 1003.1-2024), Vol. 3 §3
@@ -2634,6 +2672,8 @@ Not covered:
 ---
 
 ## `unexpand`
+
+> **STATUS — Remediated & promoted to README Stage 6 (Audited).** All priority findings below are fixed (see the per-item `FIXED (Phase N)` annotations); verified against GNU coreutils 9.4. Remaining open items, if any, are tree-wide gettext `.mo` deferrals.
 
 **Implementation:** `text/unexpand.rs` (191 lines)
 **Tests:** `text/tests/unexpand/mod.rs` (75 lines)
@@ -2768,6 +2808,8 @@ Not covered:
 
 ## `uniq`
 
+> **STATUS — Remediated & promoted to README Stage 6 (Audited).** All priority findings below are fixed (see the per-item `FIXED (Phase N)` annotations); verified against GNU coreutils 9.4. Remaining open items, if any, are tree-wide gettext `.mo` deferrals.
+
 **Implementation:** `text/uniq.rs` (220 lines)
 **Tests:** `text/tests/uniq/mod.rs` (203 lines)
 **Spec:** POSIX.1-2024 (IEEE Std 1003.1-2024), Vol. 3 §3
@@ -2897,6 +2939,8 @@ Not covered:
 ---
 
 ## `wc`
+
+> **STATUS — Remediated & promoted to README Stage 6 (Audited).** All priority findings below are fixed (see the per-item `FIXED (Phase N)` annotations); verified against GNU coreutils 9.4. Remaining open items, if any, are tree-wide gettext `.mo` deferrals.
 
 **Implementation:** `text/wc.rs` (219 lines)
 **Tests:** `text/tests/wc/mod.rs` (46 lines)

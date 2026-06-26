@@ -49,6 +49,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
 
  - [x] admin (SCCS)
  - [x] ar (Development)
+ - [x] asa
  - [x] at (cron cat.)
  - [x] awk
  - [x] basename
@@ -61,31 +62,39 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] chown
  - [x] cksum
  - [x] cmp
+ - [x] comm
  - [x] compress (compress cat.)
  - [x] cp
  - [x] crontab (cron cat.)
+ - [x] cut
  - [x] date
  - [x] dd
  - [x] delta (SCCS)
  - [x] df
+ - [x] diff
  - [x] dirname
  - [x] du
  - [x] ed (Editors)
  - [x] env
  - [x] ex (Editors)
+ - [x] expand
  - [x] expr
  - [x] false
  - [x] file
  - [x] find
+ - [x] fold
  - [x] fuser
  - [x] gencat (i18n)
  - [x] get (SCCS)
  - [x] getconf
  - [x] gettext (i18n)
+ - [x] grep
+ - [x] head
  - [x] iconv (i18n)
  - [x] id
  - [x] ipcrm (IPC)
  - [x] ipcs (IPC)
+ - [x] join
  - [x] kill
  - [x] lex (Development)
  - [x] link
@@ -108,11 +117,15 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] newgrp
  - [x] ngettext (i18n)
  - [x] nice
+ - [x] nl
  - [x] nm (Development)
  - [x] nohup
  - [x] od
+ - [x] paste
+ - [x] patch
  - [x] pathchk
  - [x] pax
+ - [x] pr
  - [x] prs (SCCS)
  - [x] ps
  - [x] pwd
@@ -124,13 +137,16 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] rmdir
  - [x] sact (SCCS)
  - [x] sccs (SCCS)
+ - [x] sed
  - [x] sh
  - [x] sleep
+ - [x] sort
  - [x] split
  - [x] strings
  - [x] strip (Development)
  - [x] stty
  - [x] tabs
+ - [x] tail
  - [x] tee
  - [x] test
  - [x] time
@@ -138,10 +154,13 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] touch
  - [x] tput
  - [x] true
+ - [x] tsort
  - [x] tty
  - [x] uname
  - [x] uncompress (compress cat.)
+ - [x] unexpand
  - [x] unget (SCCS)
+ - [x] uniq
  - [x] unlink
  - [x] uucp (UUCP)
  - [x] uudecode (uue)
@@ -150,6 +169,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] uux (UUCP)
  - [x] val (SCCS)
  - [x] vi (Editors)
+ - [x] wc
  - [x] what (SCCS)
  - [x] who
  - [x] write
@@ -168,36 +188,16 @@ Because it is a FAQ, the major differences between this project and uutils are:
 
 ## Stage 3 - Test coverage
 
- - [x] asa
  - [x] c99 (Development)
  - [x] cflow (Development)
- - [x] comm
  - [x] csplit
  - [x] ctags (Development)
- - [x] cut
  - [x] cxref (Development)
- - [x] diff
  - [x] echo
- - [x] expand
- - [x] fold
- - [x] grep
- - [x] head
- - [x] join
  - [x] localedef (i18n)
- - [x] nl
- - [x] paste
- - [x] patch
- - [x] pr
  - [x] printf
- - [x] sed
- - [x] sort
  - [x] talk (with talkd local daemon)
- - [x] tail
  - [x] tr
- - [x] tsort
- - [x] unexpand
- - [x] uniq
- - [x] wc
 
 ## Stage 2 - Feature-complete and POSIX compliant
 

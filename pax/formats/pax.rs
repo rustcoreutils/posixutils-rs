@@ -1131,13 +1131,28 @@ fn split_path(entry: &ArchiveEntry) -> PaxResult<(String, String)> {
     }
 
     // For pax format, if path is too long, we use extended headers
-    // Just truncate for the ustar header (extended header will have full path)
+    // Just truncate for the ustar header (extended header will have full path).
+    // Truncate on a UTF-8 char boundary so multi-byte characters landing on the
+    // NAME_LEN boundary don't cause a panic.
     let truncated = if path_str.len() > NAME_LEN {
-        path_str[..NAME_LEN].to_string()
+        let end = floor_char_boundary(&path_str, NAME_LEN);
+        path_str[..end].to_string()
     } else {
         path_str
     };
     Ok((truncated, String::new()))
+}
+
+/// Return the largest index `<= max` that lies on a UTF-8 char boundary of `s`.
+fn floor_char_boundary(s: &str, max: usize) -> usize {
+    if max >= s.len() {
+        return s.len();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
 }
 
 /// Convert EntryType to typeflag
@@ -1291,5 +1306,18 @@ mod tests {
         let ext = ExtendedHeader::from_entry(&entry, false);
         assert!(ext.uid.is_some());
         assert!(ext.mtime.is_some());
+    }
+
+    #[test]
+    fn test_split_path_multibyte_on_boundary() {
+        // A name whose NAME_LEN'th byte falls inside a multi-byte UTF-8
+        // character must not panic; it should truncate on a char boundary.
+        // The leading ASCII byte makes byte 100 land in the middle of a 'Я'.
+        let name = format!("a{}", "\u{42f}".repeat(90));
+        assert!(!name.is_char_boundary(NAME_LEN));
+        let entry = ArchiveEntry::new(PathBuf::from(name), EntryType::Regular);
+        let (truncated, prefix) = split_path(&entry).unwrap();
+        assert!(prefix.is_empty());
+        assert!(truncated.len() <= NAME_LEN);
     }
 }

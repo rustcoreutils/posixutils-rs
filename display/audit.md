@@ -374,11 +374,34 @@ Not covered (each is a "write a test" task tied to the matching finding):
 
 # Crate-level summary — `display/`
 
-| Utility | Critical | Major | Minor | README stage |
-|---|---|---|---|---|
-| `more` | 2 (both fixed) | 7 (4 fixed) | 6 | Stage 6 — Audited |
-| `echo` | 1 | 2 | 5 | Stage 3 (not promoted) |
-| `printf` | 0 | 6 | 12 | Stage 3 (not promoted) |
+| Utility | Critical | Major | Minor | Status | README stage |
+|---|---|---|---|---|---|
+| `more` | 2 | 7 | 6 | all 15 priority items fixed; 4 render-path matrix items deferred | Stage 6 — Audited |
+| `echo` | 1 | 2 | 5 | all fixed (#E7 deliberate no-action) | Stage 6 — Audited |
+| `printf` | 0 | 6 | 12 | all fixed | Stage 6 — Audited |
+
+Nine remediation phases landed after the audit, each independently committed
+with regression tests and validated by a full workspace build, `clippy
+--all-targets`, `fmt --check`, and the crate suite (214 integration + 7 unit
+tests, up from 192 integration and 0 unit):
+
+| Phase | Scope | Items |
+|---|---|---|
+| 1 | echo: byte-faithful operands, output integrity, diagnostics | #E1-#E6, #E8 |
+| 2 | printf: unsigned conversions, overflow saturation | #P2, #P3, #P6 |
+| 3 | printf: `%n$` numbered conversion specifications | #P1 |
+| 4 | printf: XBD Ch. 5 precision and flag conformance | #P4, #P7-#P10, #P14 |
+| 5 | printf: incremental output, checked flush, octal range | #P5, #P11, #P18 |
+| 6 | printf: `plib::diag` diagnostics, `LC_NUMERIC` | #P12, #P13, #P15-#P17 |
+| 7 | more: command-mode and error semantics | #7-#11, #15 |
+| 8 | more: `LINES`/`COLUMNS` on resize, hidden `--test`, gettext | #12, #13, #14 |
+| 9 | more: remaining matrix items and re-dispositions | `-p`, `[count]s`, `=`, `h` |
+
+Three defects were found *during* remediation that the audit had missed, each
+because a test written for a neighboring finding exercised the path: `%A`
+emitted lowercase mantissa digits (XBD 3600-3601); the Phase 2 saturation paths
+set a non-zero exit status but printed no diagnostic at all; and an operand of
+only blanks was accepted as zero. All three are fixed and covered.
 
 **Cross-cutting themes across the crate:**
 
@@ -387,4 +410,6 @@ Not covered (each is a "write a test" task tied to the matching finding):
 3. **Diagnostics.** `more`'s `MoreError` strings (#14), all of `echo`'s (there are none, only Rust `Debug` output — #E5), and seven of `printf`'s eight (#P16) are hardcoded English. None of the three uses `plib::diag`. A single crate-wide migration closes #14, #E5, #E6, #P16, #P17.
 4. **`NLSPATH` / `.mo` catalogs** are absent tree-wide, so `LC_MESSAGES` is inert regardless of the above. Tracked at project level, not per-utility.
 
-**Promotion status.** `echo` and `printf` are **deliberately not promoted** to README Stage 6 by this audit: `echo` still aborts (exit 101) on a non-UTF-8 operand (#E1) and both silently discard write errors on their most common non-newline paths (#E2/#P5). This follows the precedent set for `text/` `csplit`/`tr` and `users/` `talk` — audited, punch-list published, promotion deferred until the Critical/Major items are remediated with regression tests.
+**Promotion status.** `echo` and `printf` are promoted to README **Stage 6 — Audited**: every actionable finding is fixed and covered by a regression test. The two items left unchecked for them are `NLSPATH` (a tree-wide gap — no `.mo` catalogs ship anywhere in the project) and `echo` #E7, which is a deliberate, documented choice POSIX explicitly makes implementation-defined.
+
+`more` keeps its Stage 6 standing: all 15 numbered priority items are now fixed. Four matrix items in the interactive render path remain open and are documented above with the reason (they need an input-capable PTY harness) — the same disposition `users/` `talk` received.

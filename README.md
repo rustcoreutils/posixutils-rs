@@ -74,6 +74,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] diff
  - [x] dirname
  - [x] du
+ - [x] echo
  - [x] ed (Editors)
  - [x] env
  - [x] ex (Editors)
@@ -126,6 +127,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] pathchk
  - [x] pax
  - [x] pr
+ - [x] printf
  - [x] prs (SCCS)
  - [x] ps
  - [x] pwd
@@ -193,9 +195,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] csplit
  - [x] ctags (Development)
  - [x] cxref (Development)
- - [x] echo
  - [x] localedef (i18n)
- - [x] printf
  - [x] talk (with talkd local daemon)
  - [x] tr
 

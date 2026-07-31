@@ -3875,23 +3875,17 @@ impl Parser<'_> {
                 for element in path {
                     match element {
                         OffsetOfPath::Field(field_id) => {
-                            if let Some(member_info) =
-                                self.types.find_member(current_type, *field_id)
-                            {
-                                offset += member_info.offset as i128;
-                                current_type = member_info.typ;
-                            } else {
-                                return None;
-                            }
+                            // None if the field is not found
+                            let member_info = self.types.find_member(current_type, *field_id)?;
+                            offset += member_info.offset as i128;
+                            current_type = member_info.typ;
                         }
                         OffsetOfPath::Index(index) => {
-                            if let Some(elem_type) = self.types.base_type(current_type) {
-                                let elem_size = self.types.size_bytes(elem_type);
-                                offset += *index as i128 * (elem_size as i128);
-                                current_type = elem_type;
-                            } else {
-                                return None;
-                            }
+                            // None if this is not an array type
+                            let elem_type = self.types.base_type(current_type)?;
+                            let elem_size = self.types.size_bytes(elem_type);
+                            offset += *index as i128 * (elem_size as i128);
+                            current_type = elem_type;
                         }
                     }
                 }

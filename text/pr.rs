@@ -236,7 +236,7 @@ fn write_line_content(
         // that column alignment/truncation be suppressed: cells are emitted
         // as their raw transformed content with the user's separator
         // character between them.
-        write!(output_line, "{}", &tmp).into_io_result()?;
+        write!(output_line, "{}", tmp).into_io_result()?;
     } else {
         let mut width = column_width;
 
@@ -252,7 +252,7 @@ fn write_line_content(
         }
 
         // Pad or truncate
-        write!(output_line, "{:width$.width$}", &tmp).into_io_result()?;
+        write!(output_line, "{:width$.width$}", tmp).into_io_result()?;
     }
 
     Ok(())

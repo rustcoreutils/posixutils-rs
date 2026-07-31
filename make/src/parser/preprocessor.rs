@@ -446,10 +446,9 @@ fn substitute(source: &str, table: &HashMap<String, String>) -> Result<(String, 
 fn parse_include_directive(line: &str) -> Option<(&str, bool)> {
     let (rest, ignore_missing) = if let Some(rest) = line.strip_prefix("-include") {
         (rest, true)
-    } else if let Some(rest) = line.strip_prefix("include") {
-        (rest, false)
     } else {
-        return None;
+        let rest = line.strip_prefix("include")?;
+        (rest, false)
     };
     if rest.starts_with([' ', '\t']) {
         Some((rest.trim(), ignore_missing))

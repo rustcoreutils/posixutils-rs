@@ -170,7 +170,7 @@ fn parse_delimiters_argument(delimiters: Option<String>) -> Result<Box<[Box<[u8]
 
     let Some(delimiters_string) = delimiters else {
         // Default when no delimiter argument is provided
-        return Ok(Box::new([Box::new([b'\t'])]));
+        return Ok(Box::new([Box::new(*b"\t")]));
     };
 
     let mut buffer = [0_u8; 4];

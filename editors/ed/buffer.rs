@@ -197,7 +197,7 @@ impl Buffer {
 
         // Update marks
         self.marks.retain(|_, line| *line < start || *line > end);
-        for (_, line) in self.marks.iter_mut() {
+        for line in self.marks.values_mut() {
             if *line > end {
                 *line -= end - start + 1;
             }

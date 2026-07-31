@@ -3031,7 +3031,7 @@ impl<'a> Linearizer<'a> {
             // Check if this is a static local (sentinel value)
             if local.sym.0 == u32::MAX {
                 // Static local - look up the global name and treat as global
-                let key = format!("{}.{}", self.current_func_name, &name_str);
+                let key = format!("{}.{}", self.current_func_name, name_str);
                 if let Some(static_info) = self.static_locals.get(&key).cloned() {
                     let sym_id = self.alloc_pseudo();
                     let pseudo = Pseudo::sym(sym_id, static_info.global_name);

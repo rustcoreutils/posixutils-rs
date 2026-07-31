@@ -919,21 +919,18 @@ impl<'a> Parser<'a> {
                     if self.is_special(b'(') {
                         // Type specifier form: _Atomic(type-name)
                         self.advance(); // consume '('
-                        if let Some(inner_type) = self.try_parse_type_name() {
-                            if !self.is_special(b')') {
-                                return None;
-                            }
-                            self.advance(); // consume ')'
-                            let inner = self.types.get(inner_type).clone();
-                            let result = Type {
-                                modifiers: modifiers | inner.modifiers | TypeModifiers::ATOMIC,
-                                ..inner
-                            };
-                            let result_id = self.types.intern(result);
-                            return Some(self.parse_pointer_chain(result_id));
-                        } else {
+                        let inner_type = self.try_parse_type_name()?;
+                        if !self.is_special(b')') {
                             return None;
                         }
+                        self.advance(); // consume ')'
+                        let inner = self.types.get(inner_type).clone();
+                        let result = Type {
+                            modifiers: modifiers | inner.modifiers | TypeModifiers::ATOMIC,
+                            ..inner
+                        };
+                        let result_id = self.types.intern(result);
+                        return Some(self.parse_pointer_chain(result_id));
                     } else {
                         // Qualifier form: just _Atomic
                         modifiers |= TypeModifiers::ATOMIC;

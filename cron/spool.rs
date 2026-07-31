@@ -107,7 +107,7 @@ pub fn at(
 
     let user = User::current().ok_or("Failed to get current user")?;
     if !is_user_allowed(&user.name) {
-        return Err(format!("Access denied for user: {}", &user.name).into());
+        return Err(format!("Access denied for user: {}", user.name).into());
     }
 
     let job = Job::new(&user, std::env::current_dir()?, std::env::vars(), cmd, mail).into_script();

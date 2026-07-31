@@ -409,10 +409,15 @@ impl ExtendedHeader {
     pub fn from_entry(entry: &ArchiveEntry, include_times: bool) -> Self {
         let mut header = ExtendedHeader::new();
 
-        // Path needs extended header if too long for ustar
-        let path_str = entry.path.to_string_lossy();
-        if path_str.len() > NAME_LEN + PREFIX_LEN + 1 {
-            header.path = Some(path_str.to_string());
+        // Path needs an extended header whenever it cannot be represented
+        // exactly by the ustar name/prefix pair. Length alone is not the test:
+        // a path under NAME_LEN + PREFIX_LEN + 1 bytes still fails to split
+        // when it has no '/' at a position that leaves a <= NAME_LEN tail
+        // (e.g. a 190-byte "dir/<185-byte-basename>"). Without this record the
+        // ustar fallback in split_path() silently truncates the name.
+        let path_str = ustar_path_string(entry);
+        if try_split_path(&path_str).is_none() {
+            header.path = Some(entry.path.to_string_lossy().into_owned());
         }
 
         // Link path needs extended header if too long
@@ -1065,11 +1070,9 @@ fn build_ustar_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
     // Linkname
     if let Some(ref target) = entry.link_target {
         let link_str = target.to_string_lossy();
-        let truncated = if link_str.len() > LINKNAME_LEN {
-            &link_str[..LINKNAME_LEN]
-        } else {
-            &link_str
-        };
+        // Truncate on a char boundary; the full target is in the `linkpath`
+        // extended record whenever it exceeds LINKNAME_LEN.
+        let truncated = &link_str[..floor_char_boundary(&link_str, LINKNAME_LEN)];
         write_string(&mut header[LINKNAME_OFF..], truncated, LINKNAME_LEN);
     }
 
@@ -1099,45 +1102,66 @@ fn build_ustar_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
     Ok(header)
 }
 
-/// Split path into name (max 100) and prefix (max 155)
-fn split_path(entry: &ArchiveEntry) -> PaxResult<(String, String)> {
+/// The path as it is written to the ustar name/prefix fields: directories
+/// carry a trailing slash. Shared by split_path() and ExtendedHeader so both
+/// judge "does this fit in ustar?" against the identical string.
+fn ustar_path_string(entry: &ArchiveEntry) -> String {
     let path_str = entry.path.to_string_lossy();
-
-    // Add trailing slash for directories
-    let path_str = if entry.is_dir() && !path_str.ends_with('/') {
+    if entry.is_dir() && !path_str.ends_with('/') {
         format!("{}/", path_str)
     } else {
-        path_str.to_string()
-    };
+        path_str.into_owned()
+    }
+}
 
+/// Split a path into ustar name (max 100) and prefix (max 155) fields.
+///
+/// Returns `None` if the path cannot be represented exactly, in which case the
+/// caller must emit a `path=` extended header record.
+fn try_split_path(path_str: &str) -> Option<(String, String)> {
     if path_str.len() <= NAME_LEN {
-        return Ok((path_str, String::new()));
+        return Some((path_str.to_string(), String::new()));
     }
 
-    // Try to split at a '/' within bounds
-    if path_str.len() <= NAME_LEN + PREFIX_LEN + 1 {
-        for i in (1..=PREFIX_LEN).rev() {
-            if i >= path_str.len() {
-                continue;
-            }
-            if path_str.as_bytes()[i] == b'/' {
-                let prefix = &path_str[..i];
-                let name = &path_str[i + 1..];
-                if name.len() <= NAME_LEN {
-                    return Ok((name.to_string(), prefix.to_string()));
-                }
-            }
+    // Split at the highest '/' that leaves a name of at most NAME_LEN bytes.
+    // '/' is ASCII, so an index holding it is always a char boundary.
+    for i in (1..=PREFIX_LEN.min(path_str.len().saturating_sub(1))).rev() {
+        if path_str.as_bytes()[i] == b'/' && path_str.len() - (i + 1) <= NAME_LEN {
+            return Some((path_str[i + 1..].to_string(), path_str[..i].to_string()));
         }
     }
 
-    // For pax format, if path is too long, we use extended headers
-    // Just truncate for the ustar header (extended header will have full path)
-    let truncated = if path_str.len() > NAME_LEN {
-        path_str[..NAME_LEN].to_string()
-    } else {
-        path_str
-    };
-    Ok((truncated, String::new()))
+    None
+}
+
+/// Split path into name (max 100) and prefix (max 155)
+fn split_path(entry: &ArchiveEntry) -> PaxResult<(String, String)> {
+    let path_str = ustar_path_string(entry);
+
+    if let Some(split) = try_split_path(&path_str) {
+        return Ok(split);
+    }
+
+    // The path does not fit; ExtendedHeader::from_entry has recorded the real
+    // path in a `path=` record, so the ustar fields are only a fallback for
+    // readers that ignore extended headers. Truncate on a UTF-8 char boundary
+    // so a multi-byte character straddling NAME_LEN does not panic.
+    Ok((
+        path_str[..floor_char_boundary(&path_str, NAME_LEN)].to_string(),
+        String::new(),
+    ))
+}
+
+/// Largest index `<= max` that lies on a UTF-8 character boundary of `s`.
+fn floor_char_boundary(s: &str, max: usize) -> usize {
+    if max >= s.len() {
+        return s.len();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
 }
 
 /// Convert EntryType to typeflag

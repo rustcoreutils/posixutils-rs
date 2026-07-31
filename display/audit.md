@@ -162,20 +162,20 @@ Not covered (each gap is a "write a test" task tied to fixing the corresponding 
 
 ### Critical
 
-- [ ] **#E1 — Non-UTF-8 argument panics (exit 101).** `echo.rs:117` uses `std::env::args()`, which is documented to panic when any argument is not valid Unicode. Verified: `echo $'\xff'` → `thread 'main' panicked at library/std/src/env.rs:876: called Result::unwrap() on an Err value: "\xFF"`, exit **101**, zero bytes on stdout. POSIX 93159: "The echo utility writes its arguments to standard output" — arguments are byte strings, not Unicode. Fix: switch to `std::env::args_os()` + `OsStrExt::as_bytes()` and make `translate_str` byte-oriented (`printf.rs:1191-1195` already does exactly this).
+- [x] **#E1 — Non-UTF-8 argument panics (exit 101).** `echo.rs:117` uses `std::env::args()`, which is documented to panic when any argument is not valid Unicode. Verified: `echo $'\xff'` → `thread 'main' panicked at library/std/src/env.rs:876: called Result::unwrap() on an Err value: "\xFF"`, exit **101**, zero bytes on stdout. POSIX 93159: "The echo utility writes its arguments to standard output" — arguments are byte strings, not Unicode. ✓ **fixed (Phase 1)**: `main` now collects `std::env::args_os()` as `Vec<Vec<u8>>` via `OsStrExt::as_bytes`, joins with a `b' '` separator, and `translate_str` was replaced by the byte-oriented `translate_bytes`. Regression tests `test_echo_non_utf8_operand`, `test_echo_non_utf8_operand_mixed`.
 
 ### Major
 
-- [ ] **#E2 — Buffered output is never flushed-and-checked, so write errors are silently discarded.** `echo.rs:131` calls `io::stdout().write_all(...)` and `main` returns without `flush()`. Rust's `LineWriter` only pushes through on a `<newline>`, so the `-n` (and `\c`) paths leave the payload in the buffer, where the runtime's exit-time flush swallows the error. Verified: `echo -n hello > /dev/full` → **exit 0**, no diagnostic (GNU coreutils `echo`: exit 1). The default path happens to work (`echo hello > /dev/full` → exit 1) only because the trailing newline forces the flush inside `write_all`. POSIX 93218-93220: ">0 An error occurred". Fix: explicit `stdout().flush()` with the result checked, before returning.
-- [ ] **#E3 — Octal accumulator overflows `u8`.** `echo.rs:77`, `octal_value = octal_value * 8 + (digit - b'0')` on a `u8`. `\0777` = 511 overflows: **debug build panics** (`attempt to multiply with overflow`, exit 101, reproduced against `target/debug/echo`); release wraps to `0xFF`. POSIX 93185 defines `\0num` as "an 8-bit value that is the zero, one, two, or three-digit octal number", so a three-digit value above `377` is out of range and needs a defined answer, not an overflow. Fix: accumulate in `u16` and mask (`& 0xFF`) or reject, matching the `\0400` → `\0` result the release build already produces.
+- [x] **#E2 — Buffered output is never flushed-and-checked, so write errors are silently discarded.** `echo.rs:131` calls `io::stdout().write_all(...)` and `main` returns without `flush()`. Rust's `LineWriter` only pushes through on a `<newline>`, so the `-n` (and `\c`) paths leave the payload in the buffer, where the runtime's exit-time flush swallows the error. Verified: `echo -n hello > /dev/full` → **exit 0**, no diagnostic (GNU coreutils `echo`: exit 1). The default path happens to work (`echo hello > /dev/full` → exit 1) only because the trailing newline forces the flush inside `write_all`. POSIX 93218-93220: ">0 An error occurred". ✓ **fixed (Phase 1)**: `write_all(...).and_then(|()| stdout.flush())` on a locked handle, diagnosed and `ExitCode::FAILURE` on error. Regression test `test_echo_write_error_exit_status` (both the newline and `-n` paths).
+- [x] **#E3 — Octal accumulator overflows `u8`.** `echo.rs:77`, `octal_value = octal_value * 8 + (digit - b'0')` on a `u8`. `\0777` = 511 overflows: **debug build panics** (`attempt to multiply with overflow`, exit 101, reproduced against `target/debug/echo`); release wraps to `0xFF`. POSIX 93185 defines `\0num` as "an 8-bit value that is the zero, one, two, or three-digit octal number", so a three-digit value above `377` is out of range and needs a defined answer, not an overflow. ✓ **fixed (Phase 1)**: accumulated in `u16`, masked with `& 0xff`. Regression tests `test_echo_octal_escape_out_of_range` and the `octal_escape_range` unit test.
 
 ### Minor
 
-- [ ] **#E4 — Unknown escape drops the `<backslash>`.** `echo.rs:87-94` emits only the character following the backslash: `echo '\q'` → `q`, where GNU `echo -e '\q'` → `\q`. POSIX leaves this implementation-defined (only the listed sequences are specified), but discarding the backslash loses data that no other implementation loses. Fix: emit `\` + the character.
-- [ ] **#E5 — Diagnostics are raw Rust `Debug` output with no utility prefix.** `main` returns `Result<(), Box<dyn Error>>`, so a write failure prints `Error: Os { code: 28, kind: StorageFull, message: "No space left on device" }` (verified). POSIX 93212: standard error is for diagnostic messages; every other audited utility uses an `echo: <message>` form. Fix: route through `plib::diag` / `gettext`.
-- [ ] **#E6 — `textdomain()` / `bind_textdomain_codeset()` failure aborts before any output.** `echo.rs:114-115` propagate with `?`, so a locale-setup failure makes `echo` print nothing and exit 1. Fix: `.ok()` — i18n setup failure must not suppress the utility's whole purpose.
+- [x] **#E4 — Unknown escape drops the `<backslash>`.** `echo.rs:87-94` emits only the character following the backslash: `echo '\q'` → `q`, where GNU `echo -e '\q'` → `\q`. POSIX leaves this implementation-defined (only the listed sequences are specified), but discarding the backslash loses data that no other implementation loses. ✓ **fixed (Phase 1)**: undefined sequences are emitted verbatim, backslash included. `test_echo_unknown_escape` updated to the new expectations plus the `unspecified_escape_is_verbatim` unit test.
+- [x] **#E5 — Diagnostics are raw Rust `Debug` output with no utility prefix.** `main` returns `Result<(), Box<dyn Error>>`, so a write failure prints `Error: Os { code: 28, kind: StorageFull, message: "No space left on device" }` (verified). POSIX 93212: standard error is for diagnostic messages; every other audited utility uses an `echo: <message>` form. ✓ **fixed (Phase 1)**: `main` returns `ExitCode` and diagnostics go through `plib::diag::error` with a `gettext`'d message, yielding `echo: write error: <errno text>`.
+- [x] **#E6 — `textdomain()` / `bind_textdomain_codeset()` failure aborts before any output.** `echo.rs:114-115` propagate with `?`, so a locale-setup failure makes `echo` print nothing and exit 1. ✓ **fixed (Phase 1)**: replaced by `plib::diag::init_locale("echo")`, which ignores catalog-setup errors by design.
 - [ ] **#E7 — `-n` consumed while XSI escapes are processed (BSD/System V hybrid).** `echo.rs:120-127` strips a leading `-n` (BSD behavior) but `translate_str` unconditionally expands escapes (System V / XSI behavior). Under XSI (93170-93172) a first operand of `-` followed by characters from `{'e','E','n'}` "shall be treated as a string to be written", i.e. an XSI `echo -n` prints `-n`. Verified: ours consumes `-n`, and prints `-e`/`-E`/`-ne` literally. POSIX 93167-93169 makes this **implementation-defined** for non-XSI systems (Austin Group Defect 1222), so this is a legitimate documented choice — recorded so the choice is deliberate, not accidental. No action proposed; the existing test at `tests/echo/mod.rs:52-57` already codifies it.
-- [ ] **#E8 — `LC_CTYPE` not consulted.** Non-escape characters are re-encoded as UTF-8 via `char::encode_utf8` (`echo.rs:97-101`) regardless of locale. Harmless today because `args()` already forced UTF-8 validity, but it becomes live once #E1 is fixed byte-faithfully. Fix falls out of #E1: copy operand bytes through unchanged.
+- [x] **#E8 — `LC_CTYPE` not consulted.** Non-escape characters are re-encoded as UTF-8 via `char::encode_utf8` (`echo.rs:97-101`) regardless of locale. Harmless today because `args()` already forced UTF-8 validity, but it becomes live once #E1 is fixed byte-faithfully. ✓ **fixed (Phase 1)** as a consequence of #E1: `translate_bytes` copies operand bytes through unchanged, so no decode/re-encode step exists to be locale-sensitive.
 
 ## Detailed conformance matrix
 
@@ -188,7 +188,7 @@ Not covered (each gap is a "write a test" task tied to fixing the corresponding 
 
 - [x] **Arguments separated by single `<space>`** CONFORMS — `args.join(" ")`, `echo.rs:129` (93208).
 - [x] **No arguments → only `<newline>`** CONFORMS — empty join, newline appended at `echo.rs:105-107` (93159-93160); test `test_echo_no_args`.
-- [ ] **Non-UTF-8 operand DIVERGES** — panics, see #E1.
+- [x] **Non-UTF-8 operand** CONFORMS ✓ fixed (#E1).
 - [x] **Escape sequences recognized across the joined string, not per-argument** CONFORMS — `\c` in an earlier operand suppresses later operands (`echo.rs:40-43` breaks the loop); test `test_echo_suppress_newline_c`.
 
 ### STDIN / INPUT FILES / OUTPUT FILES
@@ -199,8 +199,8 @@ Not covered (each gap is a "write a test" task tied to fixing the corresponding 
 ### Environment variables
 
 - [x] `LANG` / `LC_ALL` CONFORMS in the weak sense — `setlocale(LcAll, "")` at `echo.rs:113` honors the standard precedence chain (93193-93196).
-- [ ] **`LC_CTYPE` MISSING** — see #E8 (93198).
-- [ ] **`LC_MESSAGES` inert** — `echo.rs` contains **zero** `gettext` calls (grep-verified); the only diagnostics are Rust `Debug` strings (93201-93203). See #E5.
+- [x] **`LC_CTYPE`** N/A ✓ (#E8) — operands are copied byte-for-byte, so there is no interpretation for `LC_CTYPE` to govern (93198).
+- [x] **`LC_MESSAGES`** CONFORMS as far as the tree allows ✓ (#E5) — the single diagnostic is `gettext`'d and routed through `plib::diag` (93201-93203). Text stays English until `.mo` catalogs ship (see `NLSPATH` below).
 - [ ] **`NLSPATH` MISSING** (XSI, 93204) — tree-wide gap: no `.mo` catalogs ship anywhere in the project. Tracked, not actionable per-utility.
 
 ### Asynchronous events
@@ -211,30 +211,29 @@ Not covered (each gap is a "write a test" task tied to fixing the corresponding 
 
 - [x] **Arguments to stdout, single-space separated, trailing `<newline>`** CONFORMS (93208-93210).
 - [x] **Escape output transformations** CONFORMS — all XSI sequences present: `\a`(0x07) `\b`(0x08) `\c` `\f`(0x0c) `\n` `\r` `\t` `\v`(0x0b) `\\` `\0num`, `echo.rs:31-95`. Verified `\0303\0251` emits the two raw bytes `303 251` under `LC_ALL=C` (byte-faithful, not re-encoded).
-- [ ] **stderr used only for diagnostics PARTIAL** — the channel is right, the format is not (#E5).
+- [x] **stderr used only for diagnostics** CONFORMS ✓ fixed (#E5) — `echo: <message>` via `plib::diag`.
 
 ### Exit status / consequences of errors
 
 - [x] **0 on success** CONFORMS.
-- [ ] **>0 on error PARTIAL** — true for the newline path, false for the `-n`/`\c` paths (#E2). Panic path returns 101 rather than a diagnostic (#E1).
+- [x] **>0 on error** CONFORMS ✓ fixed (#E1, #E2) — every output path is flushed and checked; no panic path remains.
 - [x] **Consequences of errors: Default** CONFORMS (93222).
 
 ## Test coverage signal
 
 18 tests, covering: no-args, multi-arg joining, `-n`, `\c`, every named escape, `\0` with 0/1/2/3 digits, non-octal termination, unknown escapes, trailing backslash, `--`, empty-string operands. Good breadth for the specified surface; the gaps are all on the defect paths.
 
-Not covered:
+Previously not covered, all added in Phase 1 (27 integration tests + 3 unit tests):
 
-- [ ] Non-UTF-8 operand byte-passthrough (would catch #E1)
-- [ ] Write-failure exit status (`> /dev/full`, would catch #E2)
-- [ ] `\0777` / `\0400` out-of-range octal (would catch #E3)
-- [ ] Diagnostic text/format on failure
+- [x] Non-UTF-8 operand byte-passthrough (#E1) — `test_echo_non_utf8_operand`, `test_echo_non_utf8_operand_mixed`, `non_utf8_operand_passes_through`
+- [x] Write-failure exit status (`> /dev/full`) (#E2) — `test_echo_write_error_exit_status`
+- [x] `\0777` / `\0400` out-of-range octal (#E3) — `test_echo_octal_escape_out_of_range`, `octal_escape_range`
+- [x] Diagnostic text/format on failure (#E5) — asserted by `test_echo_write_error_exit_status`
 
 ## Suggested PR groupings
 
-- **PR A — "echo: byte-faithful operands"**: #E1 + #E8 (`args_os` + byte-oriented `translate_str`), with a non-UTF-8 regression test.
-- **PR B — "echo: honor write errors"**: #E2, plus #E3's octal range fix (both are output-correctness), with `/dev/full` and `\0777` tests.
-- **PR C — "echo: diagnostics"**: #E4, #E5, #E6.
+- [x] **Phase 1 — "echo: byte-faithful operands and output integrity"**: #E1, #E2, #E3, #E4, #E5, #E6, #E8. Landed as one commit rather than the three originally sketched: `echo.rs` is 134 lines and every finding touches the same two functions, so splitting it would have left the file half-migrated between commits.
+- [x] **No action — #E7** (BSD `-n` retained; implementation-defined per Austin Group Defect 1222).
 
 ---
 ---

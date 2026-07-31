@@ -798,14 +798,14 @@ fn display_entries(entries: &mut [Entry], config: &Config, dir_path: Option<&str
                             for output in &stream_outputs[start..i] {
                                 print!("{}, ", output);
                             }
-                            println!("{},", &stream_outputs[i]);
+                            println!("{},", stream_outputs[i]);
 
                             start = i + 1;
                         } else {
                             // Long file name that exceeds
                             // `terminal_width` by itself
                             if start == i {
-                                println!("{}", &stream_outputs[i]);
+                                println!("{}", stream_outputs[i]);
                                 start = i + 1;
 
                             // `start..i` fits in `terminal_width`
@@ -813,7 +813,7 @@ fn display_entries(entries: &mut [Entry], config: &Config, dir_path: Option<&str
                                 for output in &stream_outputs[start..(i - 1)] {
                                     print!("{}, ", output);
                                 }
-                                println!("{},", &stream_outputs[i - 1]);
+                                println!("{},", stream_outputs[i - 1]);
 
                                 start = i;
                             }
@@ -826,7 +826,7 @@ fn display_entries(entries: &mut [Entry], config: &Config, dir_path: Option<&str
                     print!("{}, ", output);
                 }
                 // No comma on the very last file name
-                println!("{}", &stream_outputs[stream_outputs.len() - 1]);
+                println!("{}", stream_outputs[stream_outputs.len() - 1]);
 
                 break;
             }

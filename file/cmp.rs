@@ -101,7 +101,7 @@ fn cmp_main(args: &Args) -> io::Result<u8> {
                         // Don't print anything
                     } else if args.verbose {
                         // `{:o}` for the required octal representation output
-                        println!("{} {:o} {:o}", &bytes, c1, c2);
+                        println!("{} {:o} {:o}", bytes, c1, c2);
                     } else {
                         println!(
                             "{} {} differ: {} {}, {} {}",

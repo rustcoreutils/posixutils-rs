@@ -272,7 +272,7 @@ fn nl_main(args: &Args) -> io::Result<()> {
                 // Reference `nl` unconditionally adds a newline even on files
                 // not ending on a newline
                 line_buffer.push('\n');
-                print!("{}", &line_buffer);
+                print!("{}", line_buffer);
             }
 
             if non_text {

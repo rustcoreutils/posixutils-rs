@@ -12,6 +12,7 @@
 use crate::common::*;
 use std::fs::{self, File};
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::TempDir;
 
@@ -792,4 +793,209 @@ fn test_symlink_tar_no_damaged_warning() {
     assert!(link_path.is_symlink(), "Symlink was not created");
     let target = fs::read_link(&link_path).unwrap();
     assert_eq!(target.to_string_lossy(), "hello.txt");
+}
+
+/// Write `src_dir` to a pax archive, extract it into a fresh directory, and
+/// return that directory plus the raw archive bytes. Fails loudly if pax
+/// panics on either leg.
+fn pax_roundtrip(temp: &TempDir, src_dir: &Path, tag: &str) -> (PathBuf, Vec<u8>) {
+    let archive = temp.path().join(format!("{}.tar", tag));
+    let dst_dir = temp.path().join(format!("dest-{}", tag));
+
+    let output = run_pax_in_dir(
+        &["-w", "-x", "pax", "-f", archive.to_str().unwrap(), "."],
+        src_dir,
+    );
+    assert!(
+        !stderr_str(&output).contains("panicked"),
+        "pax -w panicked ({}): {}",
+        tag,
+        stderr_str(&output)
+    );
+    assert_success(&output, "pax write");
+
+    fs::create_dir(&dst_dir).unwrap();
+    let output = run_pax_in_dir(&["-r", "-f", archive.to_str().unwrap()], &dst_dir);
+    assert!(
+        !stderr_str(&output).contains("panicked"),
+        "pax -r panicked ({}): {}",
+        tag,
+        stderr_str(&output)
+    );
+    assert_success(&output, "pax read");
+
+    (dst_dir, fs::read(&archive).unwrap())
+}
+
+/// Count pax extended-header records for `keyword`. Records are serialized as
+/// "<len> <keyword>=<value>\n", so the leading space anchors the match.
+fn count_pax_records(archive: &[u8], keyword: &str) -> usize {
+    let needle = format!(" {}=", keyword).into_bytes();
+    archive
+        .windows(needle.len())
+        .filter(|w| *w == needle.as_slice())
+        .count()
+}
+
+/// Sorted list of file names directly under `dir`.
+fn file_names_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Issue #616: `pax -w` panicked on a name longer than the 100-byte ustar
+/// name field whose multi-byte character straddled the truncation point.
+/// The panic was only the visible half of the bug: such names were never
+/// given a `path=` extended header record at all, so they were silently
+/// truncated in the archive. Both halves are checked here.
+#[test]
+fn test_long_multibyte_name_roundtrip() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let nested = src_dir.join("test");
+    fs::create_dir_all(&nested).unwrap();
+
+    // "test/" + 90 * 'Я' (180 bytes) + suffix -> byte 100 lands inside a 'Я'.
+    let base: String = "\u{42f}".repeat(90);
+    let mut expected = Vec::new();
+    for i in 1..=12 {
+        let name = format!("{}{}.txt", base, i);
+        // The archive member path is "./test/<name>"; byte 100 of it must
+        // land inside a 'Я' for this to reproduce the reported panic.
+        assert!(
+            !format!("./test/{}", name).is_char_boundary(100),
+            "test setup: byte 100 must fall inside a multi-byte character"
+        );
+        File::create(nested.join(&name))
+            .unwrap()
+            .write_all(format!("contents {}", i).as_bytes())
+            .unwrap();
+        expected.push(name);
+    }
+    expected.sort();
+
+    let (dst_dir, archive) = pax_roundtrip(&temp, &src_dir, "multibyte");
+
+    // Each unrepresentable name must carry its own `path=` record; without
+    // them the ustar name field alone would silently lose the tail.
+    assert_eq!(
+        count_pax_records(&archive, "path"),
+        12,
+        "expected one path= record per over-long name"
+    );
+    assert_eq!(
+        file_names_in(&dst_dir.join("test")),
+        expected,
+        "long multi-byte names were not preserved through the archive"
+    );
+    for i in 1..=12 {
+        let name = format!("{}{}.txt", base, i);
+        assert_eq!(
+            fs::read_to_string(dst_dir.join("test").join(&name)).unwrap(),
+            format!("contents {}", i),
+            "content mismatch for name {}",
+            i
+        );
+    }
+}
+
+/// The same defect with no multi-byte character in sight: a 190-byte path
+/// that cannot be split at a '/' into ustar name/prefix got no `path=`
+/// record, so it was silently truncated to 100 bytes with no panic and no
+/// diagnostic. A char-boundary-only fix would leave this corruption in place.
+#[test]
+fn test_long_ascii_name_not_truncated() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let nested = src_dir.join("ascii");
+    fs::create_dir_all(&nested).unwrap();
+
+    // "./ascii/" + 180 'a' + ".txt": too long for the name field, and the
+    // only '/' leaves a 184-byte tail, so no ustar split exists.
+    let name = format!("{}.txt", "a".repeat(180));
+    File::create(nested.join(&name))
+        .unwrap()
+        .write_all(b"payload")
+        .unwrap();
+
+    let (dst_dir, archive) = pax_roundtrip(&temp, &src_dir, "ascii");
+
+    assert_eq!(
+        count_pax_records(&archive, "path"),
+        1,
+        "an unsplittable 190-byte path must get a path= record"
+    );
+    assert_eq!(file_names_in(&dst_dir.join("ascii")), vec![name.clone()]);
+    assert_eq!(
+        fs::read_to_string(dst_dir.join("ascii").join(&name)).unwrap(),
+        "payload"
+    );
+}
+
+/// A symlink target longer than the 100-byte linkname field, with a
+/// multi-byte character on the boundary, hit the identical slicing panic in
+/// the ustar fallback.
+#[cfg(unix)]
+#[test]
+fn test_long_multibyte_symlink_target() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    fs::create_dir_all(&src_dir).unwrap();
+
+    // Leading 'a' shifts the 'Я' run so byte 100 falls inside a character.
+    let target = format!("a{}", "\u{42f}".repeat(90));
+    assert!(!target.is_char_boundary(100));
+    std::os::unix::fs::symlink(&target, src_dir.join("link")).unwrap();
+
+    let (dst_dir, archive) = pax_roundtrip(&temp, &src_dir, "symlink");
+
+    assert_eq!(
+        count_pax_records(&archive, "linkpath"),
+        1,
+        "an over-long symlink target must get a linkpath= record"
+    );
+    assert_eq!(
+        fs::read_link(dst_dir.join("link"))
+            .unwrap()
+            .to_string_lossy(),
+        target,
+        "long symlink target was not preserved"
+    );
+}
+
+/// Guard against over-correcting: a long path that *does* split cleanly at a
+/// '/' must keep using the ustar name/prefix fields and still round-trip.
+#[test]
+fn test_long_splittable_path_roundtrip() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let dir_name = "d".repeat(60);
+    let nested = src_dir.join(&dir_name);
+    fs::create_dir_all(&nested).unwrap();
+
+    let name = format!("{}.txt", "f".repeat(60));
+    File::create(nested.join(&name))
+        .unwrap()
+        .write_all(b"splittable")
+        .unwrap();
+
+    let (dst_dir, archive) = pax_roundtrip(&temp, &src_dir, "splittable");
+
+    // The whole point: this 127-byte path splits at '/' into a 62-byte prefix
+    // and a 64-byte name, so it must ride in the ustar fields with no `path=`
+    // record at all. A fix that widened the extended-header trigger too far
+    // would show up here as a spurious record.
+    assert_eq!(
+        count_pax_records(&archive, "path"),
+        0,
+        "a prefix-splittable path must not need an extended header"
+    );
+    assert_eq!(
+        fs::read_to_string(dst_dir.join(&dir_name).join(&name)).unwrap(),
+        "splittable"
+    );
 }

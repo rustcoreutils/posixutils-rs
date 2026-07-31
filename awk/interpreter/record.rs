@@ -264,7 +264,7 @@ impl Record {
                 let field_str = (*cell.get())
                     .clone()
                     .scalar_to_string(&global_env.convfmt)?;
-                write!(new_record, "{}{}", field_str, &global_env.ofs)
+                write!(new_record, "{}{}", field_str, global_env.ofs)
                     .expect("error writing to string");
             }
             let last_field_str = (*fields[last_field].get())

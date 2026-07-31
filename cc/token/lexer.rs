@@ -2140,7 +2140,7 @@ mod tests {
 
     #[test]
     fn test_char_table_hex_letters() {
-        for c in [b'A', b'B', b'C', b'D', b'F', b'a', b'b', b'c', b'd', b'f'] {
+        for c in *b"ABCDFabcdf" {
             let cl = char_class(c);
             assert_eq!(cl & LETTER, LETTER, "hex letter {}", c as char);
             assert_eq!(cl & HEX, HEX, "hex flag {}", c as char);
@@ -2149,7 +2149,7 @@ mod tests {
 
     #[test]
     fn test_char_table_exp_letters() {
-        for c in [b'E', b'e', b'P', b'p'] {
+        for c in *b"EePp" {
             let cl = char_class(c);
             assert_eq!(cl & EXP, EXP, "exp {}", c as char);
             assert_eq!(cl & LETTER, LETTER, "exp letter {}", c as char);
@@ -2194,7 +2194,7 @@ mod tests {
 
     #[test]
     fn test_char_table_valid_second() {
-        for c in [b'=', b'+', b'-', b'>', b'<', b'&', b'|', b'#'] {
+        for c in *b"=+-><&|#" {
             assert_ne!(
                 char_class(c) & VALID_SECOND,
                 0,

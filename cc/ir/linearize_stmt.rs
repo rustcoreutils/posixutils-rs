@@ -1463,23 +1463,17 @@ impl<'a> super::linearize::Linearizer<'a> {
                     match element {
                         OffsetOfPath::Field(field_id) => {
                             let struct_type = self.resolve_struct_type(current_type);
-                            if let Some(member_info) =
-                                self.types.find_member(struct_type, *field_id)
-                            {
-                                offset += member_info.offset as u64;
-                                current_type = member_info.typ;
-                            } else {
-                                return None; // Field not found
-                            }
+                            // None if the field is not found
+                            let member_info = self.types.find_member(struct_type, *field_id)?;
+                            offset += member_info.offset as u64;
+                            current_type = member_info.typ;
                         }
                         OffsetOfPath::Index(index) => {
-                            if let Some(elem_type) = self.types.base_type(current_type) {
-                                let elem_size = self.types.size_bytes(elem_type);
-                                offset += (*index as u64) * (elem_size as u64);
-                                current_type = elem_type;
-                            } else {
-                                return None; // Not an array type
-                            }
+                            // None if this is not an array type
+                            let elem_type = self.types.base_type(current_type)?;
+                            let elem_size = self.types.size_bytes(elem_type);
+                            offset += (*index as u64) * (elem_size as u64);
+                            current_type = elem_type;
                         }
                     }
                 }

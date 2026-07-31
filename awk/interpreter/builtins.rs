@@ -483,7 +483,7 @@ pub(crate) fn print_to_string(
     }
     let mut output = String::new();
     values.iter().skip(1).rev().fold(&mut output, |acc, elem| {
-        write!(acc, "{}{}", elem, &global_env.ofs).expect("error writing to string");
+        write!(acc, "{}{}", elem, global_env.ofs).expect("error writing to string");
         acc
     });
     // there has to be at least an element

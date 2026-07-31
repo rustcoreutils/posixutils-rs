@@ -3680,7 +3680,7 @@ impl MdocFormatter {
     }
 
     fn format_fn_synopsis(&mut self, funcname: &str, macro_node: MacroNode) -> String {
-        format!("{};\n", &self.format_fn(funcname, macro_node))
+        format!("{};\n", self.format_fn(funcname, macro_node))
     }
 
     fn format_fr(&mut self, macro_node: MacroNode) -> String {
@@ -3835,7 +3835,7 @@ impl MdocFormatter {
         format!(
             "{}\\[pfmacroescape]{}",
             prefix,
-            &self.format_inline_macro(macro_node)
+            self.format_inline_macro(macro_node)
         )
     }
 

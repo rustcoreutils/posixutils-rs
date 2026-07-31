@@ -443,7 +443,7 @@ fn is_incomplete(text: &str, error: &PestError) -> bool {
     // - the error occurs at the start of an incomplete comment
     // - the error occurs at the start of an incomplete string
     pos == text.len()
-        || text.as_bytes()[pos..text.len().min(pos + 2)] == [b'/', b'*']
+        || text.as_bytes()[pos..text.len().min(pos + 2)] == *b"/*"
         || text.as_bytes()[pos] == b'"'
 }
 

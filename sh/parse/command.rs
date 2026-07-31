@@ -180,7 +180,7 @@ impl Display for CaseItem {
             write!(f, " | {}", pattern.as_string)?;
         }
         write!(f, ")")?;
-        write!(f, " {}", &self.body)?;
+        write!(f, " {}", self.body)?;
         write!(f, "{}", if self.fallthrough { ";&" } else { ";;" })
     }
 }

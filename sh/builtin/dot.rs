@@ -33,7 +33,7 @@ impl SpecialBuiltinUtility for Dot {
         let file_path = if let Some(file_path) = find_command(&args[0], path) {
             file_path
         } else {
-            return Err(format!("dot: {}, no such file or directory\n", &args[0]).into());
+            return Err(format!("dot: {}, no such file or directory\n", args[0]).into());
         };
 
         std::mem::swap(&mut shell.opened_files, opened_files);

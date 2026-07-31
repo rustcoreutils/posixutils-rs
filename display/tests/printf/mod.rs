@@ -630,6 +630,53 @@ fn test_audit_p6_overflow_saturates() {
 }
 
 #[test]
+fn test_audit_p1_numbered_conversions() {
+    // #P1 / POSIX 111973-111981 (Austin Group Defect 1592): conversions can
+    // name the nth argument operand with "%n$".
+    printf_test(&["%2$s %1$s\n", "one", "two"], "two one\n");
+    printf_test(&["%1$s%1$s", "x"], "xx");
+    // 112064-112066: gaps are allowed -- "%3$s %1$d\n" evaluates the first and
+    // third operands but not the second.
+    printf_test(&["%3$s %1$d\n", "7", "skipped", "third"], "third 7\n");
+    // %% may be mixed with the numbered form.
+    printf_test(&["%1$s%%\n", "x"], "x%\n");
+    // Flags, width and precision still apply after the number.
+    printf_test(&["%1$5d|", "42"], "   42|");
+    printf_test(&["%1$-5d|", "42"], "42   |");
+    printf_test(&["%1$.2s|", "abcdef"], "ab|");
+}
+
+#[test]
+fn test_audit_p1_numbered_conversions_format_reuse() {
+    // 111994-111996: on reuse, n refers to the nth operand following the
+    // highest-numbered operand consumed by the previous use of the format.
+    printf_test(&["%1$s\n", "a", "b", "c"], "a\nb\nc\n");
+    printf_test(&["[%1$s-%2$s]", "a", "b", "c", "d"], "[a-b][c-d]");
+    printf_test(&["%2$s%1$s", "a", "b", "c", "d"], "badc");
+}
+
+#[test]
+fn test_audit_p1_numbered_missing_operand() {
+    // 111998-112000: a missing operand for a numbered conversion should be
+    // diagnosed and should not exit zero.
+    printf_status_test(&["%1$s %2$s\n", "only"], "only \n", 1);
+    printf_status_test(&["%3$s", "a"], "", 1);
+}
+
+#[test]
+fn test_audit_unnumbered_conversions_unchanged() {
+    // A digit run not followed by '$' is still flags + width, not an
+    // argument number.
+    printf_test(&["%05d", "42"], "00042");
+    printf_test(&["%5d", "42"], "   42");
+    printf_test(&["%05.2f", "1.5"], "01.50");
+    printf_test(
+        &["%5d%4d\n", "1", "21", "321", "4321", "54321"],
+        "    1  21\n  3214321\n54321   0\n",
+    );
+}
+
+#[test]
 fn test_audit_integer_operand_forms_unchanged() {
     // Guard the operand grammar the parser rewrite touched (112013-112018).
     printf_test(&["%d", "10"], "10");

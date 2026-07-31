@@ -21,6 +21,9 @@ use std::{
 struct ConvSpec {
     // the conversion specifier character
     spec: char,
+    // the 1-based argument operand number of a "%n$" conversion (POSIX
+    // 111973-111981); None for an ordinary, unnumbered conversion
+    arg_number: Option<usize>,
     // the minimum field width
     width: Option<usize>,
     // the precision
@@ -37,6 +40,7 @@ impl Default for ConvSpec {
     fn default() -> Self {
         Self {
             spec: ' ',
+            arg_number: Default::default(),
             width: Default::default(),
             precision: Default::default(),
             left_justify: Default::default(),
@@ -202,6 +206,35 @@ fn escaped_char(
     Ok(ParsedBackslashSequence::Byte(parsed_byte))
 }
 
+/// Recognize the `n$` prefix of a numbered conversion specification, POSIX
+/// 111973-111975: `"%n$"`, where n is a decimal integer in [1,{NL_ARGMAX}]
+/// giving the argument operand number.
+///
+/// The iterator is positioned just past the introducing `'%'`.  A numbered
+/// prefix is recognized only when a run of digits is followed by `'$'`, so
+/// the probe runs on a clone and the real iterator is advanced only on a
+/// match — leaving `"%05d"` and friends to be parsed as flags and width.
+fn parse_arg_number(peekable: &mut Peekable<Iter<'_, u8>>) -> Option<usize> {
+    let mut probe = peekable.clone();
+    let mut digits = String::new();
+
+    while let Some(&&digit @ b'0'..=b'9') = probe.peek() {
+        digits.push(char::from(digit));
+        probe.next();
+    }
+
+    if digits.is_empty() || probe.peek() != Some(&&b'$') {
+        return None;
+    }
+    probe.next();
+
+    // n is 1-based; "%0$" is not a valid argument number.
+    let arg_number = digits.parse::<usize>().ok().filter(|&n| n > 0)?;
+
+    *peekable = probe;
+    Some(arg_number)
+}
+
 fn tokenize_format_str(format: &[u8]) -> Result<Vec<Token>, Box<dyn Error>> {
     let mut conv_spec = ConvSpec::default();
     let mut literal = Vec::<u8>::with_capacity(format.len());
@@ -225,6 +258,7 @@ fn tokenize_format_str(format: &[u8]) -> Result<Vec<Token>, Box<dyn Error>> {
                             literal.clear();
                         }
 
+                        conv_spec.arg_number = parse_arg_number(&mut peekable);
                         state = ParseState::Flags;
                     } else if current_byte == b'\\' {
                         match escaped_char(&mut peekable)? {
@@ -1159,15 +1193,25 @@ fn do_printf(format: &[u8], arguments: &[&[u8]]) -> Result<bool, Box<dyn Error>>
     let token_vec = tokenize_format_str(format)?;
 
     let mut output = Vec::<u8>::with_capacity(format.len() * 2_usize);
-    let mut arg_index = 0_usize;
     let mut stop_output = false;
     let mut had_error = false;
 
+    let had_conversion = token_vec
+        .iter()
+        .any(|t| matches!(t, Token::Conversion(c) if c.spec != '%'));
+
+    // Operands consumed by previous uses of the format operand.  POSIX
+    // 111994-111996: on format reuse, the n of a "%n$" conversion refers to
+    // the nth operand *following* the highest-numbered operand the previous
+    // use consumed.
+    let mut base = 0_usize;
+
     // Process format, reusing it if there are remaining arguments
     loop {
-        let had_conversion = token_vec
-            .iter()
-            .any(|t| matches!(t, Token::Conversion(c) if c.spec != '%'));
+        // Running index for unnumbered conversions, and the highest 1-based
+        // operand number a numbered conversion named during this pass.
+        let mut next_unnumbered = base;
+        let mut highest_numbered = 0_usize;
 
         for token in &token_vec {
             if stop_output {
@@ -1179,9 +1223,20 @@ fn do_printf(format: &[u8], arguments: &[&[u8]]) -> Result<bool, Box<dyn Error>>
                     // %% doesn't consume an argument
                     let arg_str = if co.spec == '%' {
                         &[][..]
+                    } else if let Some(n) = co.arg_number {
+                        highest_numbered = highest_numbered.max(n);
+                        let index = base + n - 1;
+                        if index >= arguments.len() {
+                            // POSIX 111998-112000: a missing operand for a
+                            // numbered conversion should be diagnosed and
+                            // should not exit zero.
+                            eprintln!("printf: missing argument for conversion %{n}$");
+                            had_error = true;
+                        }
+                        arguments.get(index).copied().unwrap_or(&[])
                     } else {
-                        let arg = arguments.get(arg_index).copied().unwrap_or(&[]);
-                        arg_index += 1;
+                        let arg = arguments.get(next_unnumbered).copied().unwrap_or(&[]);
+                        next_unnumbered += 1;
                         arg
                     };
 
@@ -1207,10 +1262,16 @@ fn do_printf(format: &[u8], arguments: &[&[u8]]) -> Result<bool, Box<dyn Error>>
             }
         }
 
+        // Every argument-consuming conversion advances this past `base`, so a
+        // format containing one always makes progress.
+        let consumed = next_unnumbered.max(base + highest_numbered);
+
         // If we've consumed all arguments or there are no conversion specs, stop
-        if stop_output || arg_index >= arguments.len() || !had_conversion {
+        if stop_output || consumed >= arguments.len() || !had_conversion {
             break;
         }
+
+        base = consumed;
     }
 
     io::stdout().write_all(output.as_slice())?;

@@ -32,9 +32,9 @@
 
 - [x] **#10 — `v` command uses `+N` instead of POSIX-mandated `-c N`** for vi/ex. `more.rs:1916`. ✓ **fixed (Phase 7)**: emits `["-c", <line>, "--", <file>]` per 107618-107620. Regression test `test_audit_invoke_editor_arguments`.
 - [x] **#11 — `v` editor-name check is `editor == "vi"`** — fails for `/usr/bin/vi`, `vim`, etc. `more.rs:1907`. ✓ **fixed (Phase 7)**: compares `Path::new(editor).file_name()`, matching 107617's "If the last pathname component in EDITOR is either vi or ex". Covered by the same regression test, which reaches a script named `vi` through a full path.
-- [ ] **#12 — Env-var precedence on resize ignored.** Termion's `terminal_size()` always wins, even when `LINES` / `COLUMNS` env is set. `more.rs:1532-1542`. Fix: re-check env vars inside `Terminal::resize()` and prefer them when set.
-- [ ] **#13 — Undocumented `--test` flag exposed in clap surface.** `more.rs:106-112`. Fix: `#[arg(hide = true)]` or move behind a build-only feature gate.
-- [ ] **#14 — `MoreError` strings hardcoded English.** Only clap help strings are gettext'd. `more.rs:198-246`. Fix: wrap in `gettext!()`.
+- [x] **#12 — Env-var precedence on resize ignored.** Termion's `terminal_size()` always wins, even when `LINES` / `COLUMNS` env is set. `more.rs:1532-1542`. ✓ **fixed (Phase 8)**: `Terminal::resize()` now consults `COLUMNS`/`LINES` on every call and prefers them over the ioctl result, per 107336 and 107357 ("override the system-selected ... size"), with `-n` still taking precedence over `LINES` per 107359. A shared `env_screen_size` helper treats unset, empty, unparsable, and zero values as absent so the system size is used instead; the startup read uses the same helper. Unit test `env_screen_size_rejects_unusable_values`; the resize path itself needs a PTY to observe, but the env values are demonstrably honored end-to-end (`LINES=9` renders 9 rows, `COLUMNS=20` renders 20 columns).
+- [x] **#13 — Undocumented `--test` flag exposed in clap surface.** `more.rs:106-112`. ✓ **fixed (Phase 8)**: `#[arg(hide = true)]`. `more --help` no longer mentions it; the flag still works for the test harness.
+- [x] **#14 — `MoreError` strings hardcoded English.** Only clap help strings are gettext'd. `more.rs:198-246`. ✓ **fixed (Phase 8)**: `thiserror`'s derived `Display` evaluates its format strings at compile time and so cannot call `gettext`. All three error enums (`MoreError`, `SeekPositionsError`, `SourceContextError`) now carry a hand-written `Display` that passes every message through `gettext`, keeping the existing wording so the tests' expected diagnostics are unchanged. Tree-wide caveat: no `.mo` catalogs ship, so `LC_MESSAGES` stays inert.
 - [x] **#15 — `:t` shells out to `find` + `grep`, treating tagstring as a regex pattern.** `more.rs:1950-1983`. ✓ **fixed (Phase 7)**: `goto_tag` now compares the tagstring literally against each tags line's first tab-separated field, per 107607-107608's "the tag named by the tagstring argument". Behaviorally verified: with a tags file containing only `fooxbar`, `:t foo.bar` used to match it (regex `^foo.bar`) and silently open the wrong tag; it now reports the tag as not found. Both subprocesses are gone — a new `find_tags_files` walks the directory tree in-process (not following symbolic links, so a link loop cannot hang the walk), which also removed the now-unreachable `MoreError::CTagsFailed` variant. A tags entry naming an absolute path is no longer glued onto the tags directory prefix (`Path::join`). Unit test `find_tags_files_walks_subdirectories`.
 
 ---
@@ -62,22 +62,22 @@
 
 ### Environment variables
 
-- [ ] **`COLUMNS` PARTIAL.** Read once at init (line 1394); not re-honored after resize.
-- [ ] **`LINES` PARTIAL.** Same — env var not re-checked on SIGWINCH.
+- [x] **`COLUMNS`** CONFORMS ✓ fixed (#12) — re-consulted on every resize.
+- [x] **`LINES`** CONFORMS ✓ fixed (#12) — re-consulted on every resize, with `-n` taking precedence (107359).
 - [x] `MORE` CONFORMS — prepended before CLI args (lines 2983–3003); CLI wins on conflict.
 - [x] `EDITOR` CONFORMS — line 1901, falls back to `vi`.
 - [ ] **`TERM` MISSING (via termion).** Termion reads internally; we don't validate.
 - [ ] **`LANG` MISSING.** Only `LC_ALL` set via `setlocale` at line 3006.
 - [ ] **`LC_COLLATE` MISSING.**
 - [ ] **`LC_CTYPE` MISSING.**
-- [ ] **`LC_MESSAGES` MISSING.**
+- [x] **`LC_MESSAGES`** CONFORMS as far as the tree allows ✓ fixed (#14) — all diagnostics are `gettext`'d; text stays English until `.mo` catalogs ship.
 - [ ] `NLSPATH` (XSI) MISSING — optional XSI, acceptable; track anyway.
 
 ### Asynchronous events
 
 - [x] **SIGCONT** ✓ fixed (same as Major #3).
 - [x] **SIGWINCH as signal** ✓ fixed (same as Major #4).
-- [ ] **`tcgetwinsize`-equivalent on resize PARTIAL** — termion ioctl called, env-var precedence ignored (same as Minor #12).
+- [x] **`tcgetwinsize`-equivalent on resize** CONFORMS ✓ fixed — termion ioctl called, env-var precedence now honored (same as Minor #12).
 
 ### STDOUT / STDERR
 
@@ -138,7 +138,7 @@ Not covered (each gap is a "write a test" task tied to fixing the corresponding 
 ## Suggested PR groupings
 
 - **PR A — "POSIX I/O channels"**: Critical #1, #2 + Major #5, #6
-- **PR B — "Signal handling + resize precedence"**: Major #3, #4 + Minor #12
+- [x] **Phase 8 — "Env precedence, hidden flag, i18n"**: Minor #12, #13, #14 (Major #3, #4 landed earlier)
 - [x] **Phase 7 — "Command-mode conformance"**: Major #7, #8, #9 + Minor #10, #11, #15
 - **PR D — "Rendering correctness"**: backspace/embolden sequences, `\r` handling, non-printable display, `-c` redraw
 - **PR E — "i18n + cleanup"**: Minor #13, #14 + locale env var coverage

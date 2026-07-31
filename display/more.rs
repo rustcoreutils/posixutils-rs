@@ -106,10 +106,12 @@ struct Args {
     )]
     lines: Option<u16>,
 
-    /// Enable interactive session test
+    /// Enable interactive session test.  Not part of the POSIX option set:
+    /// hidden from `--help` so it does not read as a supported interface.
     #[arg(
         short = 'd',
         long = "test",
+        hide = true,
         help = gettext("Enable interactive session test")
     )]
     test: bool,
@@ -199,80 +201,132 @@ enum Command {
 }
 
 /// All more errors
+///
+/// `Display` is written by hand rather than derived so that every diagnostic
+/// passes through `gettext`, which POSIX 107344-107346 requires of
+/// `LC_MESSAGES`-affected text.  (Derive attributes are evaluated at compile
+/// time and cannot call it.)
 #[derive(Debug, Clone, thiserror::Error)]
 enum MoreError {
     /// Errors raised in [`SeekPositions`] level
-    #[error("{}", .0)]
     SeekPositions(#[from] SeekPositionsError),
     /// Errors raised in [`SourceContext`] level
-    #[error("{}", .0)]
     SourceContext(#[from] SourceContextError),
     /// Attempt set [`String`] on [`Terminal`] that goes beyond
-    #[error("Set chars outside screen is forbidden")]
     SetOutside,
     /// Attempt set [`Prompt`] on [`Terminal`] longer that [`Terminal`] width
-    #[error("Input too long")]
     InputTooLong,
     /// Read [`std::io::Stdin`] is failed
-    #[error("Couldn't read from stdin")]
     InputRead,
     /// Stdout is a terminal but no readable channel exists for user commands
     /// (neither stderr nor `/dev/tty`).  POSIX requires `more` to terminate
     /// with an error in this case (see INPUT FILES in the POSIX.1-2024 spec).
-    #[error("Cannot read user commands: neither stderr nor /dev/tty is available")]
     NoCommandSource,
     /// Calling [`std::process::Command`] for editor is failed
-    #[error("Editor process failed")]
     EditorFailed,
     /// Open, read [`File`] is failed
-    #[error("Couldn't read file \'{}\'", .0)]
     FileRead(String),
     /// [`Output`], [`Regex`] parse errors
-    #[error("Couldn't parse {}", .0)]
     StringParse(String),
     /// Attempt execute [`Command::UnknownCommand`]
-    #[error("Couldn't execute unknown command")]
     UnknownCommand,
     /// [`Terminal`] init is failed
-    #[error("Terminal isn't initialized")]
     TerminalInit,
     /// [`Terminal`] size is too small
-    #[error("Can't execute commands for too small terminal")]
     TerminalOutput,
     /// [`Terminal`] size read is failed
-    #[error("Couldn't get current terminal size")]
     SizeRead,
     /// Attempt update [`SourceContext::current_screen`] without [`Terminal`]
-    #[error("Terminal operations is forbidden")]
     MissingTerminal,
     /// Search has no results
-    #[error("Couldn't find \'{}\' pattern", .0)]
     PatternNotFound(String),
+}
+
+impl std::fmt::Display for MoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SeekPositions(e) => write!(f, "{e}"),
+            Self::SourceContext(e) => write!(f, "{e}"),
+            Self::SetOutside => write!(f, "{}", gettext("Set chars outside screen is forbidden")),
+            Self::InputTooLong => write!(f, "{}", gettext("Input too long")),
+            Self::InputRead => write!(f, "{}", gettext("Couldn't read from stdin")),
+            Self::NoCommandSource => write!(
+                f,
+                "{}",
+                gettext("Cannot read user commands: neither stderr nor /dev/tty is available")
+            ),
+            Self::EditorFailed => write!(f, "{}", gettext("Editor process failed")),
+            Self::FileRead(name) => {
+                write!(f, "{} \'{name}\'", gettext("Couldn't read file"))
+            }
+            Self::StringParse(what) => write!(f, "{} {what}", gettext("Couldn't parse")),
+            Self::UnknownCommand => write!(f, "{}", gettext("Couldn't execute unknown command")),
+            Self::TerminalInit => write!(f, "{}", gettext("Terminal isn't initialized")),
+            Self::TerminalOutput => write!(
+                f,
+                "{}",
+                gettext("Can't execute commands for too small terminal")
+            ),
+            Self::SizeRead => write!(f, "{}", gettext("Couldn't get current terminal size")),
+            Self::MissingTerminal => write!(f, "{}", gettext("Terminal operations is forbidden")),
+            Self::PatternNotFound(pattern) => {
+                write!(
+                    f,
+                    "{} \'{pattern}\' {}",
+                    gettext("Couldn't find"),
+                    gettext("pattern")
+                )
+            }
+        }
+    }
 }
 
 /// All [`SeekPositions`] errors
 #[derive(Debug, Clone, thiserror::Error)]
 enum SeekPositionsError {
     /// [`Output`], [`Regex`] parse errors
-    #[error("Couldn't parse {}", .0)]
     StringParse(String),
     /// Attempt seek buffer out of bounds
-    #[error("Couldn't seek to {} position", .0)]
     OutOfRange(u64),
     /// Source open, read errors
-    #[error("Couldn't read {}", .0)]
     FileRead(String),
+}
+
+impl std::fmt::Display for SeekPositionsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StringParse(what) => write!(f, "{} {what}", gettext("Couldn't parse")),
+            Self::OutOfRange(position) => {
+                write!(
+                    f,
+                    "{} {position} {}",
+                    gettext("Couldn't seek to"),
+                    gettext("position")
+                )
+            }
+            Self::FileRead(name) => write!(f, "{} {name}", gettext("Couldn't read")),
+        }
+    }
 }
 
 /// All [`SourceContext`] errors
 #[derive(Debug, Clone, thiserror::Error)]
 enum SourceContextError {
     /// Attempt execute previous search when it is [`None`]
-    #[error("No previous regular expression")]
     MissingLastSearch,
     /// Attempt move current position to mark when it isn`t set
-    #[error("Couldn't find mark for \'{}", .0)]
     MissingMark(char),
+}
+
+impl std::fmt::Display for SourceContextError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingLastSearch => write!(f, "{}", gettext("No previous regular expression")),
+            Self::MissingMark(mark) => {
+                write!(f, "{} \'{mark}", gettext("Couldn't find mark for"))
+            }
+        }
+    }
 }
 
 /// Sets display style for every [`Screen`] char on [`Terminal`]
@@ -1800,9 +1854,8 @@ impl Terminal {
             tty: stdout(),
             prompt_out,
             size: (
-                u16::from_str(&std::env::var("LINES").unwrap_or_default())
-                    .unwrap_or(LINES_PER_PAGE),
-                u16::from_str(&std::env::var("COLUMNS").unwrap_or_default()).unwrap_or(NUM_COLUMNS),
+                env_screen_size("LINES").unwrap_or(LINES_PER_PAGE),
+                env_screen_size("COLUMNS").unwrap_or(NUM_COLUMNS),
             ),
             lines,
             plain,
@@ -1909,16 +1962,26 @@ impl Terminal {
     /// Update terminal size for wrapper
     fn resize(&mut self) -> Result<(), MoreError> {
         let (x, y) = terminal_size().map_err(|_| MoreError::SizeRead)?;
-        if self.size != (y, x) {
-            if y < 2 {
-                return Err(MoreError::TerminalOutput);
-            }
-            let mut lines = self.lines.unwrap_or(y);
-            if lines > y || lines < 1 {
-                lines = y;
-            }
-            self.size = (lines, x);
+
+        // POSIX 107336 and 107357: COLUMNS and LINES "override the
+        // system-selected" sizes.  They are consulted here, on every resize,
+        // rather than only at startup, so a window change cannot silently
+        // discard them.
+        let columns = env_screen_size("COLUMNS").unwrap_or(x);
+        let rows = env_screen_size("LINES").unwrap_or(y);
+
+        if rows < 2 {
+            return Err(MoreError::TerminalOutput);
         }
+
+        // 107359: "The -n option shall take precedence over the LINES
+        // variable", bounded by the screen actually available.
+        let mut lines = self.lines.unwrap_or(rows);
+        if lines > rows || lines < 1 {
+            lines = rows;
+        }
+
+        self.size = (lines, columns);
         Ok(())
     }
 
@@ -3350,6 +3413,17 @@ fn word_expand(word: &str) -> Result<String, MoreError> {
     }
 }
 
+/// Read a screen dimension from the environment, per POSIX 107336/107357.
+///
+/// A variable that is unset, empty, unparsable, or zero is treated as absent
+/// so that the system-selected size is used instead.
+fn env_screen_size(name: &str) -> Option<u16> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| u16::from_str(value.trim()).ok())
+        .filter(|&size| size > 0)
+}
+
 /// Collect every file named `tags` at or below `root`.
 ///
 /// Replaces a `find . -name tags -type f` subprocess; `more` needs no
@@ -3818,6 +3892,25 @@ mod tests {
         std::env::set_var("POSIXUTILS_MORE_TEST_TWO", "one two");
         assert!(word_expand("$POSIXUTILS_MORE_TEST_TWO").is_err());
         assert!(word_expand("'unterminated").is_err());
+    }
+
+    #[test]
+    fn env_screen_size_rejects_unusable_values() {
+        use super::env_screen_size;
+
+        // POSIX 107336/107357: COLUMNS and LINES override the system size.
+        // A variable that is unset, empty, unparsable, or zero is treated as
+        // absent so the system-selected size is used instead.
+        std::env::set_var("POSIXUTILS_MORE_SIZE", "40");
+        assert_eq!(env_screen_size("POSIXUTILS_MORE_SIZE"), Some(40));
+        std::env::set_var("POSIXUTILS_MORE_SIZE", " 40 ");
+        assert_eq!(env_screen_size("POSIXUTILS_MORE_SIZE"), Some(40));
+        for bad in ["", "0", "abc", "-5", "99999999"] {
+            std::env::set_var("POSIXUTILS_MORE_SIZE", bad);
+            assert_eq!(env_screen_size("POSIXUTILS_MORE_SIZE"), None, "for {bad:?}");
+        }
+        std::env::remove_var("POSIXUTILS_MORE_SIZE");
+        assert_eq!(env_screen_size("POSIXUTILS_MORE_SIZE"), None);
     }
 
     #[test]

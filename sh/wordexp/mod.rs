@@ -25,12 +25,8 @@ mod tilde;
 
 pub type ExpansionResult<T> = Result<T, CommandExecutionError>;
 
-fn is_ifs_whitespace(c: char) -> bool {
-    c == ' ' || c == '\t' || c == '\n'
-}
-
 fn split_generated_unquoted_literal(
-    lit: String,
+    mut lit: String,
     last_word: &mut ExpandedWord,
     result: &mut Vec<ExpandedWord>,
     ifs: &str,
@@ -39,8 +35,16 @@ fn split_generated_unquoted_literal(
     if lit.is_empty() {
         return;
     }
+    let ifs_whitespace = ifs
+        .chars()
+        .filter(|c| c.is_ascii_whitespace())
+        .collect::<String>();
+    if !ifs_whitespace.is_empty() {
+        lit = lit.trim_matches(|c| ifs_whitespace.contains(c)).to_string();
+    }
     let mut accumulator = String::new();
     let mut iter = lit.chars();
+    // we know that lit isn't empty, from above
     let mut next_char = iter.next().unwrap();
     'outer: loop {
         if result.len() == max_fields - 1 {
@@ -50,31 +54,23 @@ fn split_generated_unquoted_literal(
             return;
         }
         if ifs.contains(next_char) {
-            if is_ifs_whitespace(next_char) {
-                loop {
-                    match iter.next() {
-                        Some(c) => {
-                            next_char = c;
-                            if !is_ifs_whitespace(next_char) {
-                                break;
-                            }
+            loop {
+                match iter.next() {
+                    Some(c) => {
+                        next_char = c;
+                        if !ifs_whitespace.contains(next_char) {
+                            break;
                         }
-                        None => break 'outer,
                     }
+                    None => break 'outer,
                 }
-            } else if let Some(c) = iter.next() {
-                next_char = c;
-            } else {
-                break;
             }
 
-            if !accumulator.is_empty() {
-                last_word.append(accumulator, false, false);
-                accumulator = String::new();
-                let mut temp = ExpandedWord::default();
-                std::mem::swap(&mut temp, last_word);
-                result.push(temp);
-            }
+            last_word.append(accumulator, false, false);
+            accumulator = String::new();
+            let mut temp = ExpandedWord::default();
+            std::mem::swap(&mut temp, last_word);
+            result.push(temp);
         } else {
             accumulator.push(next_char);
             if let Some(c) = iter.next() {
@@ -300,6 +296,8 @@ pub mod tests {
                 ExpandedWord::unquoted_literal("b"),
                 ExpandedWord::unquoted_literal("c"),
                 ExpandedWord::unquoted_literal("d"),
+                ExpandedWord::unquoted_literal(""),
+                ExpandedWord::unquoted_literal(""),
                 ExpandedWord::unquoted_literal("x y")
             ]
         );

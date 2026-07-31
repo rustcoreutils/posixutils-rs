@@ -324,28 +324,43 @@ fn tokenize_format_str(format: &[u8]) -> Result<Vec<Token>, Box<dyn Error>> {
     Ok(tokens)
 }
 
-/// Format an integer with all POSIX flags applied
-fn format_integer(conv: &ConvSpec, value: i64, is_signed: bool, base: u32, upper: bool) -> Vec<u8> {
-    let is_negative = value < 0;
-    let abs_value = value.unsigned_abs();
+/// Format a signed integer (the `d` and `i` conversions) with all POSIX flags
+/// applied.  The `+` and <space> flags are meaningful only here: XBD 3569-3570
+/// define them in terms of a *signed* conversion.
+fn format_integer_signed(conv: &ConvSpec, value: i64) -> Vec<u8> {
+    let sign_char = if value < 0 {
+        Some('-')
+    } else if conv.sign {
+        Some('+')
+    } else if conv.space {
+        Some(' ')
+    } else {
+        None
+    };
+
+    format_integer(conv, value.unsigned_abs(), sign_char, 10, false)
+}
+
+/// Format an integer with all POSIX flags applied.
+///
+/// `magnitude` is the absolute value to render; `sign_char` is the sign (or
+/// <space>) to prepend, already decided by the caller, and is always `None`
+/// for the unsigned conversions `o`, `u`, `x`, and `X` (XBD 3607-3608).
+fn format_integer(
+    conv: &ConvSpec,
+    magnitude: u64,
+    sign_char: Option<char>,
+    base: u32,
+    upper: bool,
+) -> Vec<u8> {
+    let abs_value = magnitude;
 
     // Convert to string in the appropriate base
-    let digits = match base {
+    let digits: String = match base {
         8 => format!("{abs_value:o}"),
         16 if upper => format!("{abs_value:X}"),
         16 => format!("{abs_value:x}"),
         _ => abs_value.to_string(),
-    };
-
-    // Determine sign/prefix
-    let sign_char = if is_negative {
-        Some('-')
-    } else if is_signed && conv.sign {
-        Some('+')
-    } else if is_signed && conv.space {
-        Some(' ')
-    } else {
-        None
     };
 
     // Alternate form prefix (#)
@@ -798,14 +813,33 @@ fn format_arg_float(conv: &ConvSpec, arg: &[u8]) -> Result<(Vec<u8>, bool), Box<
     Ok((format_float(conv, value), had_error))
 }
 
-/// Parse an integer argument according to POSIX rules:
+/// An integer operand after evaluation as a C integer constant.
+struct IntOperand {
+    /// The value, saturated into the `i128` range.  A 128-bit accumulator is
+    /// wide enough to hold every value either a signed or an unsigned 64-bit
+    /// conversion can render, so saturation to the conversion's own range can
+    /// be decided later, per conversion specifier.
+    value: i128,
+    /// False if the operand had trailing bytes that were not converted.
+    fully_consumed: bool,
+    /// True if the operand's magnitude exceeded what could be represented.
+    overflowed: bool,
+}
+
+/// Parse an integer argument according to POSIX rules (112013-112018):
 /// - Leading + or - allowed
 /// - 0x or 0X prefix for hexadecimal
 /// - 0 prefix for octal
 /// - 'c or "c for character constant (value of character c)
-fn parse_integer_arg(arg: &[u8]) -> Result<(i64, bool), String> {
+fn parse_integer_arg(arg: &[u8]) -> Result<IntOperand, String> {
+    let operand = |value: i128| IntOperand {
+        value,
+        fully_consumed: true,
+        overflowed: false,
+    };
+
     if arg.is_empty() {
-        return Ok((0, true));
+        return Ok(operand(0));
     }
 
     let arg_str = match std::str::from_utf8(arg) {
@@ -816,13 +850,13 @@ fn parse_integer_arg(arg: &[u8]) -> Result<(i64, bool), String> {
     let arg_str = arg_str.trim();
 
     if arg_str.is_empty() {
-        return Ok((0, true));
+        return Ok(operand(0));
     }
 
     // Check for character constant: 'c or "c
     if (arg_str.starts_with('\'') || arg_str.starts_with('"')) && arg_str.len() >= 2 {
         let ch = arg_str.chars().nth(1).unwrap();
-        return Ok((ch as i64, true));
+        return Ok(operand(i128::from(u32::from(ch))));
     }
 
     // Handle sign
@@ -834,119 +868,118 @@ fn parse_integer_arg(arg: &[u8]) -> Result<(i64, bool), String> {
         (false, arg_str)
     };
 
-    // Parse the number
-    let (value, fully_consumed) = if let Some(hex) = num_str
+    // Split the magnitude into a radix and the run of digits valid for it.
+    // Only digits of the right radix are handed to the parser, so the sole
+    // remaining failure mode is a magnitude too large for i128 — which is
+    // saturated rather than rejected, per 112020-112024.
+    let (radix, digits) = if let Some(hex) = num_str
         .strip_prefix("0x")
         .or_else(|| num_str.strip_prefix("0X"))
     {
-        // Hexadecimal
-        // Reject if hex part starts with a sign (after we already handled the sign above)
-        if hex.starts_with('+') || hex.starts_with('-') {
-            return Err(format!("invalid number: {arg_str}"));
-        }
-        match i64::from_str_radix(hex, 16) {
-            Ok(n) => (n, true),
-            Err(_) => {
-                // Try to parse as much as we can
-                let valid_len = hex.chars().take_while(|c| c.is_ascii_hexdigit()).count();
-                if valid_len == 0 {
-                    return Err(format!("invalid number: {arg_str}"));
-                }
-                match i64::from_str_radix(&hex[..valid_len], 16) {
-                    Ok(n) => (n, valid_len == hex.len()),
-                    Err(_) => return Err(format!("invalid number: {arg_str}")),
-                }
-            }
-        }
-    } else if num_str.starts_with('0')
-        && num_str.len() > 1
-        && num_str
-            .chars()
-            .nth(1)
-            .map(|c| c.is_ascii_digit())
-            .unwrap_or(false)
-    {
-        // Octal
-        // Reject if octal part starts with a sign (after we already handled the sign above)
-        if num_str.starts_with('+') || num_str.starts_with('-') {
-            return Err(format!("invalid number: {arg_str}"));
-        }
-        let valid_len = num_str
-            .chars()
-            .take_while(|c| ('0'..='7').contains(c))
-            .count();
-        match i64::from_str_radix(&num_str[..valid_len], 8) {
-            Ok(n) => (n, valid_len == num_str.len()),
-            Err(_) => return Err(format!("invalid octal number: {arg_str}")),
-        }
+        (16, hex)
+    } else if num_str.len() > 1 && num_str.starts_with('0') {
+        (8, num_str)
     } else {
-        // Decimal
-        let valid_len = num_str.chars().take_while(|c| c.is_ascii_digit()).count();
-        if valid_len == 0 {
-            return Err(format!("invalid number: {arg_str}"));
-        }
-        match num_str[..valid_len].parse::<i64>() {
-            Ok(n) => (n, valid_len == num_str.len()),
-            Err(_) => return Err(format!("invalid number: {arg_str}")),
-        }
+        (10, num_str)
     };
 
-    let result = if is_negative { -value } else { value };
-    Ok((result, fully_consumed))
+    let valid_len = digits.chars().take_while(|c| c.is_digit(radix)).count();
+    if valid_len == 0 {
+        return Err(format!("invalid number: {arg_str}"));
+    }
+
+    let (magnitude, overflowed) = match i128::from_str_radix(&digits[..valid_len], radix) {
+        Ok(n) => (n, false),
+        Err(_) => (i128::MAX, true),
+    };
+
+    Ok(IntOperand {
+        value: if is_negative { -magnitude } else { magnitude },
+        fully_consumed: valid_len == digits.len(),
+        overflowed,
+    })
 }
 
-fn format_arg_uint_base(conv: &ConvSpec, arg: &[u8]) -> Result<(Vec<u8>, bool), Box<dyn Error>> {
-    let mut had_error = false;
-    let value = match parse_integer_arg(arg) {
-        Ok((n, fully_consumed)) => {
-            if !fully_consumed {
-                let arg_str = std::str::from_utf8(arg).unwrap_or("<invalid>");
+/// Evaluate an integer operand, emitting the diagnostics POSIX 112020-112024
+/// requires.  Returns the value and whether an error was reported; on error
+/// the caller still writes the accumulated value, as the spec directs.
+fn eval_integer_arg(arg: &[u8]) -> (IntOperand, bool) {
+    match parse_integer_arg(arg) {
+        Ok(operand) => {
+            let mut had_error = false;
+            if !operand.fully_consumed {
+                let arg_str = String::from_utf8_lossy(arg);
                 eprintln!("printf: {arg_str}: not completely converted");
                 had_error = true;
             }
-            n
-        }
-        Err(e) => {
-            let arg_str = std::str::from_utf8(arg).unwrap_or("<invalid>");
-            eprintln!("printf: {arg_str}: {e}");
-            had_error = true;
-            0
-        }
-    };
-
-    let formatted = match conv.spec {
-        'u' => format_integer(conv, value.unsigned_abs() as i64, false, 10, false),
-        'o' => format_integer(conv, value.unsigned_abs() as i64, false, 8, false),
-        'x' => format_integer(conv, value.unsigned_abs() as i64, false, 16, false),
-        'X' => format_integer(conv, value.unsigned_abs() as i64, false, 16, true),
-        ch => {
-            panic!("printf: BUG: invalid conversion specifier: {ch}");
-        }
-    };
-
-    Ok((formatted, had_error))
-}
-
-fn format_arg_int(conv: &ConvSpec, arg: &[u8]) -> Result<(Vec<u8>, bool), Box<dyn Error>> {
-    let mut had_error = false;
-    let value = match parse_integer_arg(arg) {
-        Ok((n, fully_consumed)) => {
-            if !fully_consumed {
-                let arg_str = std::str::from_utf8(arg).unwrap_or("<invalid>");
-                eprintln!("printf: {arg_str}: not completely converted");
+            if operand.overflowed {
+                let arg_str = String::from_utf8_lossy(arg);
+                eprintln!("printf: {arg_str}: arithmetic overflow");
                 had_error = true;
             }
-            n
+            (operand, had_error)
         }
         Err(e) => {
-            let arg_str = std::str::from_utf8(arg).unwrap_or("<invalid>");
+            let arg_str = String::from_utf8_lossy(arg);
             eprintln!("printf: {arg_str}: {e}");
-            had_error = true;
-            0
+            (
+                IntOperand {
+                    value: 0,
+                    fully_consumed: true,
+                    overflowed: false,
+                },
+                true,
+            )
         }
+    }
+}
+
+/// Format an argument under one of the unsigned conversions (`o`, `u`, `x`,
+/// `X`).  A negative operand is reinterpreted as its two's-complement bit
+/// pattern, matching `strtoul()` and XBD 3607-3608's "unsigned octal /
+/// unsigned decimal / unsigned hexadecimal notation".
+fn format_arg_uint_base(conv: &ConvSpec, arg: &[u8], base: u32, upper: bool) -> (Vec<u8>, bool) {
+    let (operand, mut had_error) = eval_integer_arg(arg);
+
+    let magnitude = if operand.value < 0 {
+        // Saturate into the signed range first, then reinterpret the bits.
+        let signed = if operand.value < i128::from(i64::MIN) {
+            had_error = true;
+            i64::MIN
+        } else {
+            operand.value as i64
+        };
+        signed as u64
+    } else if operand.value > i128::from(u64::MAX) {
+        had_error = true;
+        u64::MAX
+    } else {
+        operand.value as u64
     };
 
-    Ok((format_integer(conv, value, true, 10, false), had_error))
+    (
+        format_integer(conv, magnitude, None, base, upper),
+        had_error,
+    )
+}
+
+/// Format an argument under the signed conversions (`d`, `i`).  An
+/// out-of-range operand saturates to `i64::MIN`/`i64::MAX`, which is what
+/// `strtol()` returns and what the spec's EXAMPLES (112117-112120) show.
+fn format_arg_int(conv: &ConvSpec, arg: &[u8]) -> (Vec<u8>, bool) {
+    let (operand, mut had_error) = eval_integer_arg(arg);
+
+    let value = if operand.value < i128::from(i64::MIN) {
+        had_error = true;
+        i64::MIN
+    } else if operand.value > i128::from(i64::MAX) {
+        had_error = true;
+        i64::MAX
+    } else {
+        operand.value as i64
+    };
+
+    (format_integer_signed(conv, value), had_error)
 }
 
 fn format_arg_char(conv: &ConvSpec, arg: &[u8]) -> Vec<u8> {
@@ -1084,11 +1117,17 @@ struct FormatResult {
 fn format_arg(conv: &ConvSpec, arg: &[u8]) -> Result<FormatResult, Box<dyn Error>> {
     let (bytes, stop_output, had_error) = match conv.spec {
         'd' | 'i' => {
-            let (bytes, had_error) = format_arg_int(conv, arg)?;
+            let (bytes, had_error) = format_arg_int(conv, arg);
             (bytes, false, had_error)
         }
         'u' | 'o' | 'x' | 'X' => {
-            let (bytes, had_error) = format_arg_uint_base(conv, arg)?;
+            let (base, upper) = match conv.spec {
+                'o' => (8, false),
+                'x' => (16, false),
+                'X' => (16, true),
+                _ => (10, false),
+            };
+            let (bytes, had_error) = format_arg_uint_base(conv, arg, base, upper);
             (bytes, false, had_error)
         }
         'f' | 'F' | 'e' | 'E' | 'g' | 'G' | 'a' | 'A' => {

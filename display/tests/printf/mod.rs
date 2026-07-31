@@ -7,7 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, TestPlan};
+use plib::testing::{get_binary_path, run_test, TestPlan};
+use std::process::Command;
 
 fn printf_test(args: &[&str], expected_out: &str) {
     let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
@@ -554,4 +555,92 @@ fn test_reject_double_minus_hex() {
 fn test_reject_double_plus_octal() {
     // This should fail: "+0+55" should be rejected
     printf_test(&["%d", "+0+55"], "45");
+}
+
+// ---------------------------------------------------------------------------
+// Audit regressions
+// ---------------------------------------------------------------------------
+
+/// Run `printf` with the given operands and assert on stdout and exit status.
+fn printf_status_test(args: &[&str], expected_out: &str, expected_code: i32) {
+    let output = Command::new(get_binary_path("printf"))
+        .args(args)
+        .output()
+        .expect("failed to run printf");
+
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        expected_out,
+        "stdout mismatch for {args:?}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(expected_code),
+        "exit status mismatch for {args:?} (stderr: {})",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn test_audit_p2_unsigned_conversions_are_unsigned() {
+    // #P2: a negative operand under o/u/x/X is reinterpreted as its
+    // two's-complement bit pattern, not printed as its absolute value.
+    printf_test(&["%u", "-1"], "18446744073709551615");
+    printf_test(&["%x", "-1"], "ffffffffffffffff");
+    printf_test(&["%X", "-1"], "FFFFFFFFFFFFFFFF");
+    printf_test(&["%o", "-1"], "1777777777777777777777");
+    printf_test(&["%u", "-2"], "18446744073709551614");
+    // The + and <space> flags apply only to signed conversions.
+    printf_test(&["%+u", "1"], "1");
+    printf_test(&["% u", "1"], "1");
+    printf_test(&["%+d", "1"], "+1");
+}
+
+#[test]
+fn test_audit_p3_unsigned_full_range() {
+    // #P3: INT64_MIN was rejected as an invalid number, and magnitudes above
+    // i64::MAX could not be represented at all.
+    printf_status_test(&["%u", "-9223372036854775808"], "9223372036854775808", 0);
+    printf_status_test(&["%u", "9223372036854775808"], "9223372036854775808", 0);
+    printf_status_test(&["%u", "18446744073709551615"], "18446744073709551615", 0);
+    printf_status_test(&["%d", "-9223372036854775808"], "-9223372036854775808", 0);
+    printf_status_test(&["%d", "9223372036854775807"], "9223372036854775807", 0);
+    printf_status_test(&["%x", "0xffffffffffffffff"], "ffffffffffffffff", 0);
+}
+
+#[test]
+fn test_audit_p6_overflow_saturates() {
+    // #P6: POSIX 112020-112024 requires the accumulated value to be written;
+    // the EXAMPLES table (112117-112120) shows strtol()-style saturation
+    // together with a diagnostic and a non-zero exit status.
+    printf_status_test(&["%d", "9999999999999999999999"], "9223372036854775807", 1);
+    printf_status_test(
+        &["%d", "-9999999999999999999999"],
+        "-9223372036854775808",
+        1,
+    );
+    printf_status_test(
+        &["%u", "99999999999999999999999999"],
+        "18446744073709551615",
+        1,
+    );
+    // Not-completely-converted still reports and still prints the prefix.
+    printf_status_test(&["%d", "5a"], "5", 1);
+    printf_status_test(&["%d", "ABC"], "0", 1);
+}
+
+#[test]
+fn test_audit_integer_operand_forms_unchanged() {
+    // Guard the operand grammar the parser rewrite touched (112013-112018).
+    printf_test(&["%d", "10"], "10");
+    printf_test(&["%d", "010"], "8");
+    printf_test(&["%d", "0x10"], "16");
+    printf_test(&["%d", "0X10"], "16");
+    printf_test(&["%d", "+3"], "3");
+    printf_test(&["%d", "-3"], "-3");
+    printf_test(&["%d", "'3"], "51");
+    printf_test(&["%d", "\"+3"], "43");
+    printf_test(&["%d", "0"], "0");
+    printf_test(&["%d", ""], "0");
+    printf_status_test(&["%d", "08"], "0", 1);
 }

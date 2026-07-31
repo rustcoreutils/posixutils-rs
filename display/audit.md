@@ -24,18 +24,18 @@
 - [x] **#4 — SIGWINCH detected only by polling, not by signal.** ✓ fixed: `handle_winch` sets `SIGWINCH_PENDING`; main loop drains the flag and calls `resize()`. The per-tick polling `self.resize()` in `get_input_with_update` is gone; the only remaining sleep is the 80 ms tick that bounds how soon a *signal flag* is noticed. (POSIX winsize refetch via termion's `terminal_size()`, which wraps the `TIOCGWINSZ` ioctl — equivalent to `tcgetwinsize`.)
 - [x] **#5 — Prompt written to `self.tty` (stdout) instead of stderr.** ✓ fixed: `Terminal` now owns a `prompt_out: Box<dyn Write + Send>` separate from `tty` (stdout). Set to `CommandIO::writer` (stderr/`/dev/tty`) in interactive mode; stdout in test mode; `io::sink()` in filter mode. Content rendering still goes to stdout.
 - [x] **#6 — Prompt missing current filename.** ✓ fixed: `Prompt::More` and `Prompt::Eof` are now structs carrying an `Option<String>` filename plumbed from `MoreControl::current_filename()`. Renders as `foo.txt: -- More --(NN%)` when known; degrades to the historical form for stdin sources.
-- [ ] **#7 — `:n` / `:p` file-open errors call `exit()` instead of trying next/prev with non-zero exit.** `more.rs:2484` (handle_error), `2420-2435`. Fix: catch `FileRead` in `:n`/`:p` handlers, set `had_error`, advance/retreat, exit code at end.
-- [ ] **#8 — `:e` filename not shell-word-expanded** (XCU 2.6). `more.rs:2210-2251`. Fix: run `wordexp(3)` (libc) on the filename, fail if it yields ≠1 path.
-- [ ] **#9 — `''` (return-to-previous) doesn't track "large movement".** Only resets on file open. `more.rs:2382-2385`, 1340. Fix: save `last_line` before any command that moves more than one screenful.
+- [x] **#7 — `:n` / `:p` file-open errors call `exit()` instead of trying next/prev with non-zero exit.** `more.rs:2484` (handle_error), `2420-2435`. ✓ **fixed (Phase 7)**: new `MoreControl::examine_adjacent_file` wraps `scroll_file_position`, and on a `FileRead` error sets a new `had_error` field, shows the error prompt, and steps one further in the same direction until a file opens or the list is exhausted — POSIX 107643-107646's "more shall attempt to examine the next file in the argument list, but the final exit status shall be affected". `exit()` now returns non-zero when `had_error` is set even without a fatal message. `handle_error`'s `FileRead` arm no longer aborts, which also gives `:e` the 107595-107597 behavior (report, keep the current file). Regression test `test_audit_next_file_error_affects_exit_status`; the success counterpart is already covered by `test_1_file`/`test_3_files`.
+- [x] **#8 — `:e` filename not shell-word-expanded** (XCU 2.6). `more.rs:2210-2251`. ✓ **fixed (Phase 7)**: new `word_expand` calls `wordexp(3)` and is applied in `examine_file` to everything except more's own `#` and `-` tokens. The `libc` crate exposes neither `wordexp` nor `wordexp_t`, so both are declared locally — the structure layout is fixed by POSIX and identical on glibc and macOS. More than one resulting pathname is treated as an error (107593-107594 leaves it unspecified), so 107595-107597's "the current file and screen shall not change" applies. Behaviorally verified: `:e $VAR` and `:e ~/…` now report the *expanded* path. Unit tests `word_expand_applies_shell_expansions`, `word_expand_rejects_multiple_pathnames`.
+- [x] **#9 — `''` (return-to-previous) doesn't track "large movement".** Only resets on file open. `more.rs:2382-2385`, 1340. ✓ **fixed (Phase 7)**: `execute` was split into a measuring wrapper around `execute_command`. The wrapper records the current line before the command and, if the line moved by more than a screenful afterwards, stores the pre-command line in `last_line` — implementing 107563-107565's "any movement of more than a screenful of lines" by *measuring* the move rather than by enumerating which commands qualify, so no command can be missed. `''` itself is excluded from tracking. New `SourceContext::screen_lines` supplies the threshold.
 
 ### Minor
 
-- [ ] **#10 — `v` command uses `+N` instead of POSIX-mandated `-c N`** for vi/ex. `more.rs:1916`. Fix: emit `["-c", &N.to_string(), "--", file_path]`.
-- [ ] **#11 — `v` editor-name check is `editor == "vi"`** — fails for `/usr/bin/vi`, `vim`, etc. `more.rs:1907`. Fix: compare `Path::new(&editor).file_name()` against `"vi"`/`"ex"`.
+- [x] **#10 — `v` command uses `+N` instead of POSIX-mandated `-c N`** for vi/ex. `more.rs:1916`. ✓ **fixed (Phase 7)**: emits `["-c", <line>, "--", <file>]` per 107618-107620. Regression test `test_audit_invoke_editor_arguments`.
+- [x] **#11 — `v` editor-name check is `editor == "vi"`** — fails for `/usr/bin/vi`, `vim`, etc. `more.rs:1907`. ✓ **fixed (Phase 7)**: compares `Path::new(editor).file_name()`, matching 107617's "If the last pathname component in EDITOR is either vi or ex". Covered by the same regression test, which reaches a script named `vi` through a full path.
 - [ ] **#12 — Env-var precedence on resize ignored.** Termion's `terminal_size()` always wins, even when `LINES` / `COLUMNS` env is set. `more.rs:1532-1542`. Fix: re-check env vars inside `Terminal::resize()` and prefer them when set.
 - [ ] **#13 — Undocumented `--test` flag exposed in clap surface.** `more.rs:106-112`. Fix: `#[arg(hide = true)]` or move behind a build-only feature gate.
 - [ ] **#14 — `MoreError` strings hardcoded English.** Only clap help strings are gettext'd. `more.rs:198-246`. Fix: wrap in `gettext!()`.
-- [ ] **#15 — `:t` shells out to `find` + `grep`, treating tagstring as a regex pattern.** `more.rs:1950-1983`. Fix: use literal-string match (or `grep -F`), escape tagstring.
+- [x] **#15 — `:t` shells out to `find` + `grep`, treating tagstring as a regex pattern.** `more.rs:1950-1983`. ✓ **fixed (Phase 7)**: `goto_tag` now compares the tagstring literally against each tags line's first tab-separated field, per 107607-107608's "the tag named by the tagstring argument". Behaviorally verified: with a tags file containing only `fooxbar`, `:t foo.bar` used to match it (regex `^foo.bar`) and silently open the wrong tag; it now reports the tag as not found. Both subprocesses are gone — a new `find_tags_files` walks the directory tree in-process (not following symbolic links, so a link loop cannot hang the walk), which also removed the now-unreachable `MoreError::CTagsFailed` variant. A tags entry naming an absolute path is no longer glued onto the tags directory prefix (`Path::join`). Unit test `find_tags_files_walks_subdirectories`.
 
 ---
 
@@ -49,7 +49,7 @@
 - [x] `-n` CONFORMS — overrides LINES/COLUMNS at line 1538.
 - [ ] **`-p` PARTIAL.** Commands run on new-file display (lines 2501–2528). Spec requires that if any `-p` command fails, an informational message is written AND remaining `-p` commands for that file are suppressed — current code may `exit()` on error.
 - [x] `-s` CONFORMS — squeeze propagates via `SeekPositions`.
-- [ ] **`-t` PARTIAL** — see `:t` notes (literal vs regex tag matching).
+- [x] **`-t`** CONFORMS ✓ fixed — the option shares `goto_tag`, so the literal-match fix of #15 covers it.
 - [x] `-u` CONFORMS — `plain` flag suppresses backspace/underscore/bold processing.
 - [ ] **`+` as option prefix MISSING.** Spec allows but doesn't require; clap doesn't recognize it. (Lowest priority — optional.)
 
@@ -92,12 +92,12 @@
 All 28 spec commands are wired (count-prefix supported on every command that takes one). Issues found:
 
 - [ ] **`[count]s` PARTIAL.** Implemented as plain scroll; spec requires "screenful beginning with line `count` lines after last line on current screen".
-- [ ] **`''` DIVERGES.** `last_line` only reset on file open (line 1340); never updated on "large movements" (>1 screenful) — same as Major #9.
-- [ ] **`:e filename` PARTIAL.** No shell word expansion; no non-seekable check — same as Major #8.
-- [ ] **`:n` / `:p` PARTIAL.** Errors call `exit()` not next/prev-with-error — same as Major #7.
-- [ ] **`:t tagstring` PARTIAL.** Tag treated as regex via `grep`; spec means literal name — same as Minor #15.
-- [ ] **`v` uses `+N` not `-c N`** — same as Minor #10.
-- [ ] **`v` editor name compared as exact string** — same as Minor #11.
+- [x] **`''`** CONFORMS ✓ fixed — same as Major #9.
+- [x] **`:e filename`** CONFORMS for word expansion ✓ fixed (#8); the non-seekable check remains unimplemented (107595: "including that it is a non-seekable file").
+- [x] **`:n` / `:p`** CONFORMS ✓ fixed — same as Major #7.
+- [x] **`:t tagstring`** CONFORMS ✓ fixed — same as Minor #15.
+- [x] **`v` uses `-c N`** ✓ fixed — same as Minor #10.
+- [x] **`v` editor name compared by last pathname component** ✓ fixed — same as Minor #11.
 - [ ] **`=` uses basename instead of full pathname for files.** Spec allows omitting byte info for stdin (that case works).
 - [ ] **`h` help text links to a POSIX 2018 URL** (line 2967), not 2024.
 
@@ -112,8 +112,8 @@ All 28 spec commands are wired (count-prefix supported on every command that tak
 ### Exit status / consequences of errors
 
 - [x] Exit `0` / `>0` CONFORMS (line 2206).
-- [ ] **`:e` error affects exit code** when it should not. File state preserved, but exit code is touched.
-- [ ] **`:n` / `:p` error → DIVERGES** (same as Major #7).
+- [x] **`:e` error affects exit code** when it should not. ✓ fixed (Phase 7) — `handle_error`'s `FileRead` arm reports and continues instead of exiting, so only `:n`/`:p` set `had_error` (107647-107648).
+- [x] **`:n` / `:p` error** CONFORMS ✓ fixed (same as Major #7).
 
 ---
 
@@ -123,10 +123,10 @@ Tests cover `-c`, `-e`, `-i`, `-n`, `-s`, `-u` and most basic interactive comman
 
 Not covered (each gap is a "write a test" task tied to fixing the corresponding bug):
 
-- [ ] `''` large-movement semantics
-- [ ] `:e` shell expansion
-- [ ] `v` `-c` flag emission for vi/ex
-- [ ] `:n` / `:p` error-path behavior (next file tried, exit code affected)
+- [x] `''` large-movement semantics — implemented by measurement in Phase 7; no automated test (asserting on the alternate-screen byte stream needs a PTY harness)
+- [x] `:e` shell expansion — `word_expand` unit tests (Phase 7)
+- [x] `v` `-c` flag emission for vi/ex — `test_audit_invoke_editor_arguments` (Phase 7)
+- [x] `:n` / `:p` error-path behavior (next file tried, exit code affected) — `test_audit_next_file_error_affects_exit_status` (Phase 7)
 - [x] Prompt target (stdout vs stderr) — verified manually via `more file >/tmp/out 2>/tmp/err </dev/null`; tracked as audit checkbox closed by Major #5 fix. (No automated test added; would need a PTY harness.)
 - [x] SIGCONT behavior (resume from `kill -STOP $$; kill -CONT $$`) — handler installed; covered by code path, no automated test (needs PTY harness).
 - [x] SIGWINCH behavior (size change while paused at prompt) — handler installed; covered by code path, no automated test.
@@ -139,7 +139,7 @@ Not covered (each gap is a "write a test" task tied to fixing the corresponding 
 
 - **PR A — "POSIX I/O channels"**: Critical #1, #2 + Major #5, #6
 - **PR B — "Signal handling + resize precedence"**: Major #3, #4 + Minor #12
-- **PR C — "Command-mode conformance"**: Major #7, #8, #9 + Minor #10, #11
+- [x] **Phase 7 — "Command-mode conformance"**: Major #7, #8, #9 + Minor #10, #11, #15
 - **PR D — "Rendering correctness"**: backspace/embolden sequences, `\r` handling, non-printable display, `-c` redraw
 - **PR E — "i18n + cleanup"**: Minor #13, #14 + locale env var coverage
 

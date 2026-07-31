@@ -12,12 +12,13 @@ use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleC
 use libc::{getegid, getgid, getuid, setgid, setuid};
 use plib::regex::{Regex, RegexFlags};
 use std::collections::HashMap;
+use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::{stdout, BufRead, BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::mem::MaybeUninit;
 use std::ops::{Not, Range};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{exit, ExitStatus};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -223,9 +224,6 @@ enum MoreError {
     /// Calling [`std::process::Command`] for editor is failed
     #[error("Editor process failed")]
     EditorFailed,
-    /// Calling [`std::process::Command`] for ctags is failed
-    #[error("Couldn't call ctags")]
-    CTagsFailed,
     /// Open, read [`File`] is failed
     #[error("Couldn't read file \'{}\'", .0)]
     FileRead(String),
@@ -366,7 +364,7 @@ impl Screen {
 }
 
 /// Defines search, scroll direction
-#[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
 enum Direction {
     /// Direction to bigger position
     Forward,
@@ -1200,6 +1198,14 @@ impl SourceContext {
         self.is_ended_file = self.seek_positions.is_ended;
     }
 
+    /// Number of content lines a screenful holds, used to decide whether a
+    /// movement counts as "large" for the `''` command.
+    pub fn screen_lines(&self) -> usize {
+        self.terminal_size
+            .map(|(lines, _)| lines.saturating_sub(1).max(1))
+            .unwrap_or(1)
+    }
+
     /// Seek to previous line
     pub fn return_previous(&mut self) {
         self.seek_positions.set_current(self.last_line);
@@ -1279,11 +1285,7 @@ impl SourceContext {
         is_reversed: bool,
     ) -> Result<(), MoreError> {
         if let Some((pattern, is_not, direction)) = &self.last_search {
-            let direction = if is_reversed {
-                !direction.clone()
-            } else {
-                direction.clone()
-            };
+            let direction = if is_reversed { !*direction } else { *direction };
             self.search(count, pattern.clone(), *is_not, direction)
         } else {
             Err(MoreError::SourceContext(
@@ -2158,6 +2160,10 @@ struct MoreControl {
     is_new_file: bool,
     /// Last search has succeess match
     is_matched: bool,
+    /// Set when a per-file error occurred that must affect the final exit
+    /// status without aborting the session (POSIX CONSEQUENCES OF ERRORS,
+    /// 107643-107646: the `:n` and `:p` commands).
+    had_error: bool,
     /// Buffered stdin content (slurped once at startup).  Populated when
     /// stdin is the implicit content source (no file operands) or when `-`
     /// appears in the operand list.  Re-used by `print_all_input` (multi-
@@ -2277,6 +2283,7 @@ impl MoreControl {
             count_default: None,
             commands_buffer: String::new(),
             prompt: None,
+            had_error: false,
             last_source_before_usage: None,
             file_pathes,
             is_new_file: false,
@@ -2491,19 +2498,24 @@ impl MoreControl {
             DEFAULT_EDITOR.to_string()
         };
         let editor = editor.as_str();
-        let is_editor_vi_or_ex = editor == "vi" || editor == "ex";
+        // POSIX 107617-107618: "If the last pathname component in EDITOR is
+        // either vi or ex" -- so compare the basename, not the whole string,
+        // which would miss /usr/bin/vi.
+        let is_editor_vi_or_ex = Path::new(editor)
+            .file_name()
+            .map(|name| name == "vi" || name == "ex")
+            .unwrap_or(false);
         let Some(file_path) = file_path.as_os_str().to_str() else {
             return Err(MoreError::FileRead(
                 file_path.to_str().unwrap_or("<file>").to_owned(),
             ));
         };
 
+        // POSIX 107618-107620: vi and ex take "-c linenumber", where
+        // linenumber is the line displayed as the first line of the screen.
+        let line_number = self.context.seek_positions.current_line().to_string();
         let args: &[&str] = if is_editor_vi_or_ex {
-            &[
-                &format!("+{}", self.context.seek_positions.current_line()),
-                "--",
-                file_path,
-            ]
+            &["-c", line_number.as_str(), "--", file_path]
         } else {
             &[file_path]
         };
@@ -2529,55 +2541,44 @@ impl MoreControl {
             return Err(MoreError::FileRead(String::new()));
         };
         let parse_error = Err(MoreError::StringParse(tagstring.clone() + " ctags output"));
-        let pattern = if tagstring.contains(['^']) {
-            tagstring.clone()
-        } else {
-            format!("^{}", tagstring)
-        };
-        let output = std::process::Command::new("find")
-            .args([".", "-name", "tags", "-type", "f"])
-            .output();
-        let Ok(output) = output else {
-            return Err(MoreError::CTagsFailed);
-        };
-        let Ok(output) = std::str::from_utf8(&output.stdout) else {
-            return parse_error;
-        };
-        let mut outputs = String::new();
+
+        // POSIX 107607-107608: ":t tagstring" names *the tag*, so the lookup
+        // is a literal comparison against a tags file's first field -- not a
+        // regular-expression search, which would both mismatch tags
+        // containing regex metacharacters and match unrelated ones.
+        let mut matched: Option<String> = None;
         let mut tags_path: Option<String> = None;
-        for file in output.split('\n') {
-            let output = std::process::Command::new("grep")
-                .args([pattern.as_str(), file])
-                .output();
-            let Ok(output) = output else {
+        for file in find_tags_files(Path::new(".")) {
+            let Ok(contents) = std::fs::read_to_string(&file) else {
                 continue;
             };
-            let Ok(output) = std::str::from_utf8(&output.stdout) else {
+            let Some(line) = contents
+                .lines()
+                .find(|line| line.split('\t').next() == Some(tagstring.as_str()))
+            else {
                 continue;
             };
-            if !output.is_empty() {
-                outputs.push_str(output);
-                if let Some(folder) = to_path(file.to_owned())?.parent() {
-                    if !folder.exists() {
-                        return Err(MoreError::FileRead(file.to_owned()));
-                    }
-                    tags_path = folder.to_str().map(|s| s.to_owned());
+            if let Some(folder) = file.parent() {
+                if !folder.exists() {
+                    return Err(MoreError::FileRead(file.to_string_lossy().into_owned()));
                 }
-                break;
+                tags_path = folder.to_str().map(|s| s.to_owned());
             }
+            matched = Some(line.to_owned());
+            break;
         }
-        if outputs.is_empty() {
+        let Some(line) = matched else {
             return Err(MoreError::PatternNotFound(tagstring));
-        }
-        let lines = outputs.split("\n").collect::<Vec<&str>>();
-        let Some(line) = lines.first() else {
-            return Err(MoreError::FileRead(tagstring));
         };
         let fields = line.split("\t").collect::<Vec<&str>>();
         if fields.len() < 2 {
             return parse_error;
         };
-        let path = to_path(tags_path.unwrap_or_default() + "/" + fields[1])?;
+        // Tags files normally name files relative to their own directory, but
+        // an absolute entry must not be glued onto that prefix; Path::join
+        // handles both.
+        let path = Path::new(&tags_path.unwrap_or_else(|| ".".to_owned())).join(fields[1]);
+        let path = to_path(path.to_string_lossy().into_owned())?;
         let line;
         if let Some(line_str) = fields.iter().find(|w| w.starts_with("line:")) {
             let Some(line_str) = line_str.split(":").last() else {
@@ -2803,7 +2804,49 @@ impl MoreControl {
             eprintln!("{error_message}");
             println!("{error_message}");
         }
-        exit(error_message.is_some() as i32);
+        exit((error_message.is_some() || self.had_error) as i32);
+    }
+
+    /// Move `count` files in `direction` and examine what is found there.
+    ///
+    /// POSIX CONSEQUENCES OF ERRORS (107643-107646): "If an error is
+    /// encountered accessing a file when using the :n command, more shall
+    /// attempt to examine the next file in the argument list, but the final
+    /// exit status shall be affected", and correspondingly for `:p`.  So a
+    /// file that cannot be opened is reported, remembered for the exit
+    /// status, and skipped -- it does not end the session.
+    ///
+    /// Returns true when the move ran past the end of the file list.
+    fn examine_adjacent_file(
+        &mut self,
+        count: Option<usize>,
+        direction: Direction,
+    ) -> Result<bool, MoreError> {
+        let mut count = count;
+
+        loop {
+            match self.scroll_file_position(count, direction) {
+                Ok(past_end) => return Ok(past_end),
+                Err(MoreError::FileRead(name)) => {
+                    self.had_error = true;
+                    self.prompt = Some(Prompt::Error(MoreError::FileRead(name).to_string()));
+
+                    // scroll_file_position has already moved to the file that
+                    // failed; stop once there is nothing further to try.
+                    let position = self.current_position.unwrap_or(0);
+                    let exhausted = match direction {
+                        Direction::Forward => position + 1 >= self.file_pathes.len(),
+                        Direction::Backward => position == 0,
+                    };
+                    if exhausted {
+                        return Ok(false);
+                    }
+
+                    count = Some(1);
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Set current file by [`file_string`] path
@@ -2811,6 +2854,15 @@ impl MoreControl {
         if file_string.is_empty() {
             self.context.reset()?;
         }
+
+        // POSIX 107600-107602: the filename operand of `:e` is subject to
+        // shell word expansion.  "#" and "-" are more's own tokens and are
+        // recognized before expansion.
+        let file_string = if file_string.is_empty() || file_string == "#" || file_string == "-" {
+            file_string
+        } else {
+            word_expand(&file_string)?
+        };
 
         if file_string.as_str() == "#" {
             if let Source::File(last_source_path) = &self.context.last_source {
@@ -2880,6 +2932,27 @@ impl MoreControl {
 
     /// Execute [`Command`]
     fn execute(&mut self, command: Command) -> Result<(), MoreError> {
+        // POSIX 107563-107565: `''` returns "to the position from which the
+        // last large movement command was executed (where a 'large movement'
+        // is defined as any movement of more than a screenful of lines)".
+        // Rather than enumerate which commands qualify, measure the move.
+        let line_before = self.context.seek_positions.current_line();
+        let track_movement = !matches!(command, Command::ReturnPreviousPosition);
+
+        let result = self.execute_command(command);
+
+        if track_movement && result.is_ok() {
+            let line_after = self.context.seek_positions.current_line();
+            let screenful = self.context.screen_lines();
+            if line_after.abs_diff(line_before) > screenful {
+                self.context.last_line = line_before;
+            }
+        }
+
+        result
+    }
+
+    fn execute_command(&mut self, command: Command) -> Result<(), MoreError> {
         match command {
             Command::Help => {
                 let string = commands_usage();
@@ -3018,7 +3091,7 @@ impl MoreControl {
             }
             Command::ExamineNewFile(filename) => self.examine_file(filename)?,
             Command::ExamineNextFile(count) => {
-                if self.scroll_file_position(count, Direction::Forward)? {
+                if self.examine_adjacent_file(count, Direction::Forward)? {
                     self.prompt = Some(Prompt::Exit);
                     self.display()?;
                     self.get_input_with_update()?;
@@ -3026,7 +3099,7 @@ impl MoreControl {
                 }
             }
             Command::ExaminePreviousFile(count) => {
-                if self.scroll_file_position(count, Direction::Backward)? {
+                if self.examine_adjacent_file(count, Direction::Backward)? {
                     self.prompt = Some(Prompt::Exit);
                     self.display()?;
                     self.get_input_with_update()?;
@@ -3077,10 +3150,13 @@ impl MoreControl {
                 self.commands_buffer.clear();
                 self.prompt = Some(Prompt::Error(error_str.clone()));
             }
+            // POSIX 107595-107597 (`:e`) and 107643-107646 (`:n`/`:p`): a
+            // file that cannot be accessed is reported, and more carries on.
+            MoreError::FileRead(_) => {
+                self.prompt = Some(Prompt::Error(error_str.clone()));
+            }
             MoreError::SetOutside
             | MoreError::EditorFailed
-            | MoreError::CTagsFailed
-            | MoreError::FileRead(_)
             | MoreError::SizeRead
             | MoreError::InputRead
             | MoreError::NoCommandSource
@@ -3218,6 +3294,89 @@ fn to_path(file_string: String) -> Result<PathBuf, MoreError> {
         .metadata()
         .map_err(|_| MoreError::FileRead(file_string.clone()))?;
     Ok(file_path)
+}
+
+/// `wordexp_t` of `<wordexp.h>`.  Not exposed by the `libc` crate, but the
+/// layout is fixed by POSIX and identical on the platforms this project
+/// targets (glibc and macOS both declare exactly these three members, in
+/// this order).
+#[repr(C)]
+struct WordExp {
+    we_wordc: libc::size_t,
+    we_wordv: *mut *mut libc::c_char,
+    we_offs: libc::size_t,
+}
+
+extern "C" {
+    fn wordexp(
+        words: *const libc::c_char,
+        pwordexp: *mut WordExp,
+        flags: libc::c_int,
+    ) -> libc::c_int;
+    fn wordfree(pwordexp: *mut WordExp);
+}
+
+/// Apply shell word expansions (XCU Section 2.6) to `word`, which POSIX
+/// 107592-107594 requires for the `:e` filename operand.
+///
+/// The spec leaves the effects unspecified when the expansion yields more
+/// than one pathname; treat that, like a failed expansion, as an error, so
+/// that 107595-107597's "the current file and screen shall not change"
+/// applies.
+fn word_expand(word: &str) -> Result<String, MoreError> {
+    let failed = || MoreError::FileRead(word.to_owned());
+    let c_word = CString::new(word).map_err(|_| failed())?;
+
+    // SAFETY: the structure is zeroed before use, as wordexp(3) requires
+    // when called without WRDE_APPEND/WRDE_DOOFFS; `c_word` outlives the
+    // call; and `wordfree` runs on every path where `wordexp` succeeded.
+    unsafe {
+        let mut we: WordExp = std::mem::zeroed();
+        if wordexp(c_word.as_ptr(), &mut we, 0) != 0 {
+            return Err(failed());
+        }
+
+        let expanded = if we.we_wordc == 1 && !we.we_wordv.is_null() {
+            CStr::from_ptr(*we.we_wordv)
+                .to_str()
+                .map(str::to_owned)
+                .map_err(|_| failed())
+        } else {
+            Err(failed())
+        };
+
+        wordfree(&mut we);
+        expanded
+    }
+}
+
+/// Collect every file named `tags` at or below `root`.
+///
+/// Replaces a `find . -name tags -type f` subprocess; `more` needs no
+/// external program to walk a directory.
+fn find_tags_files(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // Do not follow symbolic links: a link loop would not terminate.
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                pending.push(path);
+            } else if file_type.is_file() && entry.file_name() == "tags" {
+                found.push(path);
+            }
+        }
+    }
+
+    found
 }
 
 /// Get formated file name and extension from [`PathBuf`]
@@ -3631,5 +3790,52 @@ fn main() {
             println!("{}", error);
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{find_tags_files, word_expand};
+    use std::path::Path;
+
+    #[test]
+    fn word_expand_applies_shell_expansions() {
+        // POSIX 107592-107594: the `:e` filename is subject to shell word
+        // expansions.
+        std::env::set_var("POSIXUTILS_MORE_TEST_VAR", "/tmp/expanded");
+        assert_eq!(
+            word_expand("$POSIXUTILS_MORE_TEST_VAR").unwrap(),
+            "/tmp/expanded"
+        );
+        assert_eq!(word_expand("plain_name").unwrap(), "plain_name");
+        assert!(word_expand("~").unwrap().starts_with('/'));
+    }
+
+    #[test]
+    fn word_expand_rejects_multiple_pathnames() {
+        // "if more than a single pathname results, the effects are
+        // unspecified" -- treated as an error so the current file is kept.
+        std::env::set_var("POSIXUTILS_MORE_TEST_TWO", "one two");
+        assert!(word_expand("$POSIXUTILS_MORE_TEST_TWO").is_err());
+        assert!(word_expand("'unterminated").is_err());
+    }
+
+    #[test]
+    fn find_tags_files_walks_subdirectories() {
+        let dir = std::env::temp_dir().join("posixutils_more_tags_walk");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("a/b")).unwrap();
+        std::fs::write(dir.join("tags"), "").unwrap();
+        std::fs::write(dir.join("a/b/tags"), "").unwrap();
+        std::fs::write(dir.join("a/not_tags"), "").unwrap();
+
+        let mut found = find_tags_files(&dir);
+        found.sort();
+        assert_eq!(found.len(), 2, "found {found:?}");
+        assert!(found.iter().all(|p| p.file_name() == Some("tags".as_ref())));
+
+        assert!(find_tags_files(Path::new(&dir.join("missing"))).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

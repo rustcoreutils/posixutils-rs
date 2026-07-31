@@ -1277,3 +1277,79 @@ fn test_more_env_variable_combined() {
         &[("MORE", "-s -c")],
     );
 }
+
+// ---------------------------------------------------------------------------
+// Audit regressions
+// ---------------------------------------------------------------------------
+
+/// Audit #7 / POSIX CONSEQUENCES OF ERRORS (107643-107646): "If an error is
+/// encountered accessing a file when using the :n command, more shall attempt
+/// to examine the next file in the argument list, but the final exit status
+/// shall be affected."
+#[test]
+fn test_audit_next_file_error_affects_exit_status() {
+    run_test_more(
+        &[
+            "--test",
+            "-p",
+            ":n",
+            "test_files/README.md",
+            "test_files/does_not_exist.md",
+        ],
+        "",
+        "",
+        "Couldn't read file 'test_files/does_not_exist.md'\n",
+        1,
+    );
+}
+
+// The success counterpart -- `:n` over readable files still exiting 0 -- is
+// already asserted by `test_1_file` and `test_3_files` above; a dedicated
+// test cannot be added here because `more --test` blocks in its interactive
+// loop whenever a command lands mid-list rather than running past the end.
+
+/// Audit #10/#11 / POSIX 107617-107620: the editor is chosen by the *last
+/// pathname component* of EDITOR, and vi/ex are invoked with `-c linenumber`.
+#[test]
+fn test_audit_invoke_editor_arguments() {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = std::env::temp_dir().join("posixutils_more_audit_editor");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let record = dir.join("args");
+    // Named `vi`, but reached through a full path: the basename is what
+    // decides whether `-c linenumber` is passed.
+    let editor = dir.join("vi");
+    let mut script = std::fs::File::create(&editor).unwrap();
+    writeln!(script, "#!/bin/sh").unwrap();
+    writeln!(script, "printf '%s\\n' \"$@\" > {}", record.display()).unwrap();
+    drop(script);
+    std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    run_test_more_with_env(
+        &["--test", "-p", "vq", "test_files/README.md"],
+        "",
+        "",
+        "",
+        0,
+        &[("EDITOR", editor.to_str().unwrap())],
+    );
+
+    let args = std::fs::read_to_string(&record).unwrap();
+    let args: Vec<&str> = args.lines().collect();
+    assert_eq!(
+        args.first().copied(),
+        Some("-c"),
+        "vi must be invoked with -c linenumber, got {args:?}"
+    );
+    assert!(
+        args.get(1).is_some_and(|n| n.parse::<usize>().is_ok()),
+        "-c must be followed by a line number, got {args:?}"
+    );
+    assert_eq!(args.get(2).copied(), Some("--"), "got {args:?}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

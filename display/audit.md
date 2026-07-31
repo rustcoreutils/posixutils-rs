@@ -142,3 +142,246 @@ Not covered (each gap is a "write a test" task tied to fixing the corresponding 
 - **PR C — "Command-mode conformance"**: Major #7, #8, #9 + Minor #10, #11
 - **PR D — "Rendering correctness"**: backspace/embolden sequences, `\r` handling, non-printable display, `-c` redraw
 - **PR E — "i18n + cleanup"**: Minor #13, #14 + locale env var coverage
+
+---
+---
+
+# Part II — `echo`
+
+**Implementation:** `display/echo.rs` (134 lines) + `display/tests/echo/mod.rs` (191 lines, 18 tests)
+**Spec:** POSIX.1-2024 (IEEE Std 1003.1-2024), Vol. 3 §3 `echo`, pp. 2859–2862
+**Reference slice:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/echo.md`
+**Date:** 2026-07-31
+**Method:** full spec read + full implementation read + behavioral verification against the release binary (`target/release/echo`) and, where the spec leaves behavior implementation-defined, against GNU coreutils `echo`. Every "absent"/"wrong-value" claim below was reproduced from a shell, not inferred.
+
+## TL;DR
+
+`echo` is a 134-line utility and gets the *text* of the spec right: arguments joined with single `<space>`, trailing `<newline>`, no options recognized in the Utility Syntax Guideline sense, `--` treated as an ordinary string operand, and the full XSI escape set (`\a \b \c \f \n \r \t \v \\ \0num`). The defects are all in the plumbing around that core. **It aborts with a Rust panic (exit 101) on any non-UTF-8 argument** — `echo $'\xff'` prints a backtrace instead of a byte, which is a hard failure of "write its arguments to standard output" for exactly the data `echo` exists to emit. A second data-loss path is quieter: `echo -n foo > /dev/full` **exits 0** because the final buffered flush is never checked. The octal accumulator overflows a `u8` (`\0777` panics in a debug build, wraps in release). Everything else is Minor: an unknown escape loses its backslash, diagnostics are raw Rust `Debug` text, and the `-n`/escape combination is a BSD/System V hybrid rather than either historical behavior.
+
+## Priority issues
+
+### Critical
+
+- [ ] **#E1 — Non-UTF-8 argument panics (exit 101).** `echo.rs:117` uses `std::env::args()`, which is documented to panic when any argument is not valid Unicode. Verified: `echo $'\xff'` → `thread 'main' panicked at library/std/src/env.rs:876: called Result::unwrap() on an Err value: "\xFF"`, exit **101**, zero bytes on stdout. POSIX 93159: "The echo utility writes its arguments to standard output" — arguments are byte strings, not Unicode. Fix: switch to `std::env::args_os()` + `OsStrExt::as_bytes()` and make `translate_str` byte-oriented (`printf.rs:1191-1195` already does exactly this).
+
+### Major
+
+- [ ] **#E2 — Buffered output is never flushed-and-checked, so write errors are silently discarded.** `echo.rs:131` calls `io::stdout().write_all(...)` and `main` returns without `flush()`. Rust's `LineWriter` only pushes through on a `<newline>`, so the `-n` (and `\c`) paths leave the payload in the buffer, where the runtime's exit-time flush swallows the error. Verified: `echo -n hello > /dev/full` → **exit 0**, no diagnostic (GNU coreutils `echo`: exit 1). The default path happens to work (`echo hello > /dev/full` → exit 1) only because the trailing newline forces the flush inside `write_all`. POSIX 93218-93220: ">0 An error occurred". Fix: explicit `stdout().flush()` with the result checked, before returning.
+- [ ] **#E3 — Octal accumulator overflows `u8`.** `echo.rs:77`, `octal_value = octal_value * 8 + (digit - b'0')` on a `u8`. `\0777` = 511 overflows: **debug build panics** (`attempt to multiply with overflow`, exit 101, reproduced against `target/debug/echo`); release wraps to `0xFF`. POSIX 93185 defines `\0num` as "an 8-bit value that is the zero, one, two, or three-digit octal number", so a three-digit value above `377` is out of range and needs a defined answer, not an overflow. Fix: accumulate in `u16` and mask (`& 0xFF`) or reject, matching the `\0400` → `\0` result the release build already produces.
+
+### Minor
+
+- [ ] **#E4 — Unknown escape drops the `<backslash>`.** `echo.rs:87-94` emits only the character following the backslash: `echo '\q'` → `q`, where GNU `echo -e '\q'` → `\q`. POSIX leaves this implementation-defined (only the listed sequences are specified), but discarding the backslash loses data that no other implementation loses. Fix: emit `\` + the character.
+- [ ] **#E5 — Diagnostics are raw Rust `Debug` output with no utility prefix.** `main` returns `Result<(), Box<dyn Error>>`, so a write failure prints `Error: Os { code: 28, kind: StorageFull, message: "No space left on device" }` (verified). POSIX 93212: standard error is for diagnostic messages; every other audited utility uses an `echo: <message>` form. Fix: route through `plib::diag` / `gettext`.
+- [ ] **#E6 — `textdomain()` / `bind_textdomain_codeset()` failure aborts before any output.** `echo.rs:114-115` propagate with `?`, so a locale-setup failure makes `echo` print nothing and exit 1. Fix: `.ok()` — i18n setup failure must not suppress the utility's whole purpose.
+- [ ] **#E7 — `-n` consumed while XSI escapes are processed (BSD/System V hybrid).** `echo.rs:120-127` strips a leading `-n` (BSD behavior) but `translate_str` unconditionally expands escapes (System V / XSI behavior). Under XSI (93170-93172) a first operand of `-` followed by characters from `{'e','E','n'}` "shall be treated as a string to be written", i.e. an XSI `echo -n` prints `-n`. Verified: ours consumes `-n`, and prints `-e`/`-E`/`-ne` literally. POSIX 93167-93169 makes this **implementation-defined** for non-XSI systems (Austin Group Defect 1222), so this is a legitimate documented choice — recorded so the choice is deliberate, not accidental. No action proposed; the existing test at `tests/echo/mod.rs:52-57` already codifies it.
+- [ ] **#E8 — `LC_CTYPE` not consulted.** Non-escape characters are re-encoded as UTF-8 via `char::encode_utf8` (`echo.rs:97-101`) regardless of locale. Harmless today because `args()` already forced UTF-8 validity, but it becomes live once #E1 is fixed byte-faithfully. Fix falls out of #E1: copy operand bytes through unchanged.
+
+## Detailed conformance matrix
+
+### SYNOPSIS / OPTIONS
+
+- [x] **No options recognized** CONFORMS (93164). There is no clap surface; only the implementation-defined `-n` (see #E7) is special-cased at `echo.rs:121`.
+- [x] **`--` is a string operand, not an end-of-options marker** CONFORMS (93162-93163). Verified `echo -- hello` → `-- hello`; test at `tests/echo/mod.rs:166-171`.
+
+### Operands
+
+- [x] **Arguments separated by single `<space>`** CONFORMS — `args.join(" ")`, `echo.rs:129` (93208).
+- [x] **No arguments → only `<newline>`** CONFORMS — empty join, newline appended at `echo.rs:105-107` (93159-93160); test `test_echo_no_args`.
+- [ ] **Non-UTF-8 operand DIVERGES** — panics, see #E1.
+- [x] **Escape sequences recognized across the joined string, not per-argument** CONFORMS — `\c` in an earlier operand suppresses later operands (`echo.rs:40-43` breaks the loop); test `test_echo_suppress_newline_c`.
+
+### STDIN / INPUT FILES / OUTPUT FILES
+
+- [x] **STDIN not used** CONFORMS (93188) — grep-verified: no `stdin` reference anywhere in `echo.rs`.
+- [x] **No input files, no output files** CONFORMS (93190, 93214).
+
+### Environment variables
+
+- [x] `LANG` / `LC_ALL` CONFORMS in the weak sense — `setlocale(LcAll, "")` at `echo.rs:113` honors the standard precedence chain (93193-93196).
+- [ ] **`LC_CTYPE` MISSING** — see #E8 (93198).
+- [ ] **`LC_MESSAGES` inert** — `echo.rs` contains **zero** `gettext` calls (grep-verified); the only diagnostics are Rust `Debug` strings (93201-93203). See #E5.
+- [ ] **`NLSPATH` MISSING** (XSI, 93204) — tree-wide gap: no `.mo` catalogs ship anywhere in the project. Tracked, not actionable per-utility.
+
+### Asynchronous events
+
+- [x] **Default** CONFORMS (93206) — no handlers installed, which is exactly what "Default" requires.
+
+### STDOUT / STDERR
+
+- [x] **Arguments to stdout, single-space separated, trailing `<newline>`** CONFORMS (93208-93210).
+- [x] **Escape output transformations** CONFORMS — all XSI sequences present: `\a`(0x07) `\b`(0x08) `\c` `\f`(0x0c) `\n` `\r` `\t` `\v`(0x0b) `\\` `\0num`, `echo.rs:31-95`. Verified `\0303\0251` emits the two raw bytes `303 251` under `LC_ALL=C` (byte-faithful, not re-encoded).
+- [ ] **stderr used only for diagnostics PARTIAL** — the channel is right, the format is not (#E5).
+
+### Exit status / consequences of errors
+
+- [x] **0 on success** CONFORMS.
+- [ ] **>0 on error PARTIAL** — true for the newline path, false for the `-n`/`\c` paths (#E2). Panic path returns 101 rather than a diagnostic (#E1).
+- [x] **Consequences of errors: Default** CONFORMS (93222).
+
+## Test coverage signal
+
+18 tests, covering: no-args, multi-arg joining, `-n`, `\c`, every named escape, `\0` with 0/1/2/3 digits, non-octal termination, unknown escapes, trailing backslash, `--`, empty-string operands. Good breadth for the specified surface; the gaps are all on the defect paths.
+
+Not covered:
+
+- [ ] Non-UTF-8 operand byte-passthrough (would catch #E1)
+- [ ] Write-failure exit status (`> /dev/full`, would catch #E2)
+- [ ] `\0777` / `\0400` out-of-range octal (would catch #E3)
+- [ ] Diagnostic text/format on failure
+
+## Suggested PR groupings
+
+- **PR A — "echo: byte-faithful operands"**: #E1 + #E8 (`args_os` + byte-oriented `translate_str`), with a non-UTF-8 regression test.
+- **PR B — "echo: honor write errors"**: #E2, plus #E3's octal range fix (both are output-correctness), with `/dev/full` and `\0777` tests.
+- **PR C — "echo: diagnostics"**: #E4, #E5, #E6.
+
+---
+---
+
+# Part III — `printf`
+
+**Implementation:** `display/printf.rs` (1216 lines) + `display/tests/printf/mod.rs` (557 lines, 98 tests)
+**Spec:** POSIX.1-2024 (IEEE Std 1003.1-2024), Vol. 3 §3 `printf`, pp. 3344–3351, plus **XBD Chapter 5 (File Format Notation)**, pp. 113–117, which the utility spec incorporates by reference for the entire conversion-specification grammar
+**Reference slices:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/printf.md`, `~/tmp/posix.2024/sliced/xbd-base-definitions/5-file-format-notation/_chapter.md`
+**Date:** 2026-07-31
+**Method:** full read of both spec files + full implementation read + behavioral verification of every Critical/Major/Minor claim against `target/release/printf` side-by-side with GNU coreutils `printf` 9.x. Line numbers below are POSIX line numbers (`111892`-series for the utility page, `3549`-series for XBD Ch. 5).
+
+## TL;DR
+
+`printf` is the more complete of the two: it is byte-faithful end to end (`args_os` + `as_bytes`, `printf.rs:1191-1195`), the tokenizer handles flags/width/precision/specifier as a proper state machine, `%b` implements the full POSIX escape set including `\c` and precision-bounded output, format reuse matches the spec's own EXAMPLES byte-for-byte, and the optional floating-point conversions are supported. The defects concentrate in three places. First, **`%n$` numbered conversion specifications — added to POSIX by Issue 8 / Austin Group Defect 1592 — are not implemented**, and rather than diagnosing cleanly the tokenizer mis-parses `%2$s` into a `$` conversion and emits garbage. Second, **the unsigned conversions are not unsigned**: `%u`/`%o`/`%x`/`%X` print the *absolute value* of a negative argument (`printf '%u' -1` → `1`, where the spec and every other implementation give `18446744073709551615`), and `%u` of `INT64_MIN` is rejected outright as an invalid number. Third, **an empty precision (`%.f`, `%.s`) is treated as "no precision" instead of zero**, contradicting XBD 3562-3563's "a null digit string is treated as zero". A fourth, quieter defect matches `echo`'s: output is accumulated in one buffer and written once, and the final flush is unchecked, so `printf 'hello' > /dev/full` exits **0**. The remaining items are conversion-detail divergences (`%#.3o` double zero, zero-padded NaN, `NaN` spelling, `\400` arithmetic, `%a` default precision) and a locale gap (`LC_NUMERIC` is never consulted).
+
+## Priority issues
+
+### Major
+
+- [ ] **#P1 — `%n$` numbered conversion specifications MISSING, and mis-parsed into garbage.** `printf.rs:205-325` — the tokenizer has no positional-argument state, so `%2$s` is read as flags → width `2` → specifier `$`, falls through to `format_arg`'s catch-all (`printf.rs:1105-1108`), prints a diagnostic *and* the argument as a string. Verified: `printf '%2$s %1$s\n' one two` → stderr `unknown conversion specifier: $` (twice) and stdout `ones twos`, exit 1. POSIX 111973-111981 (item 8) makes this a normative feature of Issue 8, and 111994-111996 defines its interaction with format reuse. Fix: add an optional `n$` prefix to `ConvSpec`, parsed between `%` and the flags; enforce the "numbered or unnumbered, not both (except `%%`)" rule; on reuse, rebase `n` on the highest-numbered operand consumed by the previous pass.
+- [ ] **#P2 — `%u`, `%o`, `%x`, `%X` print the absolute value of a negative argument.** `printf.rs:918-921` converts via `value.unsigned_abs() as i64` and then formats through the *signed* path. Verified: `%u -1` → `1`, `%x -1` → `1`, `%o -1` → `1` (GNU: `18446744073709551615`, `ffffffffffffffff`, `1777777777777777777777`). XBD 3607-3608: the argument "shall be written as ... unsigned octal (o), unsigned decimal (u), or unsigned hexadecimal notation (x and X)". Compounding it, `unsigned_abs()` of `i64::MIN` round-trips back to a negative `i64`, so `format_integer` would print a leading `-` on an unsigned conversion. Fix: carry the parsed value as `u64` for these four specifiers (reinterpret the two's-complement bits, as `strtoul` does) and format unsigned.
+- [ ] **#P3 — `%u` of `-9223372036854775808` rejected as an invalid number.** `printf.rs:829-835, 884-891` strips the sign and parses the magnitude `9223372036854775808` as `i64`, which overflows. Verified: `printf '%u' -9223372036854775808` → `printf: -9223372036854775808: invalid number`, prints `0`, exit 1 (GNU: `9223372036854775808`). Fix: parse the signed magnitude in `i128`/`u64` space before narrowing, or negate during accumulation.
+- [ ] **#P4 — Empty precision (`%.f`, `%.s`, `%.e`) treated as absent, not as zero.** `printf.rs:288-302` — `ParseState::PrecisionValue` only assigns `conv_spec.precision` when the digit buffer is non-empty, so a bare `.` leaves it `None` and the default (6 for floats, unbounded for strings) applies. Verified: `%.f 10` → `10.000000` (GNU `10`); `%.s abc` → `abc` (GNU empty). XBD 3562-3563 is normative and unambiguous: "The precision shall take the form of a `<period>` ('.') followed by a decimal digit string; **a null digit string is treated as zero**." Fix: set `precision = Some(0)` on entering `PrecisionValue` and overwrite when digits follow.
+- [ ] **#P5 — Final output flush is unchecked, so write errors are silently lost.** `printf.rs:1177` writes the accumulated buffer with `write_all` and `main` returns without `flush()`. Verified: `printf 'hello' > /dev/full` → **exit 0**, no diagnostic (GNU: exit 1); `printf 'hello\n' > /dev/full` → exit 1 only because the newline forces the flush. POSIX 112028-112030. Fix: explicit checked `flush()`. (Same root cause as `echo` #E2.)
+- [ ] **#P6 — Integer overflow prints `0` instead of the saturated value.** `printf.rs:888-891` returns `Err` on an out-of-range decimal, and the caller substitutes `0` (`printf.rs:944-945`). Verified: `printf '%d' 9999999999999999999999` → diagnostic + `0`, exit 1; GNU prints `9223372036854775807`. POSIX 112020-112024 requires the utility to "write the value accumulated at the time the error was detected to standard output", and the EXAMPLES table at 112117-112120 spells out the expected `2147483647` / `−2147483648` saturation with the note that it is "what would be expected as the return value from the `strtol()` function". Fix: saturate to `i64::MIN`/`i64::MAX` on overflow, keep the diagnostic and the non-zero exit.
+
+### Minor
+
+- [ ] **#P7 — Zero value with precision 0 must produce no characters.** XBD 3615-3616. `printf.rs:364-372` only zero-*extends*; it never truncates. Verified: `%.0d 0` → `0`, `%.0o 0` → `0`, `%.0x 0` → `0` (GNU: empty in all three). Fix: return an empty digit string when `value == 0 && precision == Some(0)`.
+- [ ] **#P8 — The `0` flag is applied to infinity and NaN.** XBD 3580-3582: leading zeros pad to the field width "**except when converting an infinity or NaN**". `printf.rs:737-742` has no such guard. Verified: `%08f inf` → `00000inf` (GNU `     inf`); `%08f nan` → `00000NaN` (GNU `     nan`). Fix: force space padding when `value.is_nan() || value.is_infinite()`.
+- [ ] **#P9 — `%f` of NaN prints `NaN`.** `printf.rs:696` falls through to Rust's `Display`, which spells it `NaN`. XBD 3629-3631 permits only the styles `[-]nan` and `[-]nan(n-char-sequence)` for `f`, with `NAN` reserved for `F`. Verified: `%f nan` → `NaN`, `%F nan` → `NAN` (correct), `%e nan` / `%g nan` → `nan` (correct — those paths have explicit NaN handling at `printf.rs:503-508, 559-564`). Fix: give the `f`/`F` arm the same explicit handling the other arms already have.
+- [ ] **#P10 — `%#.<n>o` emits a redundant leading zero.** `printf.rs:352-361` prepends a literal `"0"` for alt-form octal *in addition to* the precision zero-fill. XBD 3574-3575 says `#` "shall **increase the precision** to force the first digit of the result to be a zero" — it is not a prefix. Verified: `%#.3o 8` → `0010` (GNU `010`); `%#.1o 8` → `010` (agrees, by luck). Fix: for base 8, implement `#` as `precision = max(precision, digits.len() + 1)` and drop the prefix.
+- [ ] **#P11 — `\400` in the format maps to byte `0x01` via `parsed - 255`.** `printf.rs:113-118`. The comment above `parse_octal_sequence` correctly describes the two implementations in the wild (BusyBox splits it, others mask to 8 bits), then implements a third behavior belonging to neither. Verified: ours → `0x01`, GNU → `0x00`. POSIX 111944-111946 defines `\ddd` only for values that fit a byte, so out-of-range input is unspecified — but subtracting 255 is arbitrary. Fix: mask with `& 0xFF`.
+- [ ] **#P12 — Quoted character constant with trailing bytes reports no error.** `printf.rs:823-826` returns `fully_consumed = true` after reading one character. Verified: `printf '%d\n' "'-3"` → `45`, **exit 0**; GNU prints `45` plus `warning: 3: character(s) following character constant have been ignored`. POSIX EXAMPLES 112128-112141: "Since the last two arguments contain more characters than used for the conversion, a diagnostic message is generated and **the exit status is non-zero**." Fix: flag `fully_consumed = false` when bytes remain after the quoted character.
+- [ ] **#P13 — Numeric arguments are `trim()`ed, hiding trailing garbage.** `printf.rs:816` (integers) and `printf.rs:434` (floats). Verified: `printf '%d' '5 '` → `5`, exit 0; GNU → `5` plus `value not completely converted`, exit 1. Leading blanks are fine (`strtol` skips them), trailing ones are not. Fix: `trim_start()` only.
+- [ ] **#P14 — `%a` uses default precision 6 instead of an exact representation.** `printf.rs:684` supplies `unwrap_or(6)` to `format_hex_float`. XBD 3594-3598: with the precision missing and a binary `FLT_RADIX`, "the precision shall be sufficient for an exact representation of the value", with trailing zeros omitted. Verified: `%a 1` → `0x1.000000p+0` (glibc `0x8p-3`); `%a 3.5` → `0x1.c00000p+1` (glibc `0xep-2`). Both are arithmetically equal to the input and `a`/`A` are optional per 111951 (item 6), so this is cosmetic. Fix: pass `Option<usize>` through and emit the trimmed mantissa when it is `None`. Note `format_hex_float` also *truncates* rather than rounds when a precision is given (`printf.rs:658-663`).
+- [ ] **#P15 — `LC_NUMERIC` never consulted.** XBD 3623-3624 and 3637-3638 require `LC_NUMERIC` to select the radix character for `e`, `E`, `f`, `g`, `G`, and the utility page lists it at 111924-111926. All float paths use Rust's `format!`, which is locale-independent and always emits `.`. Code-verified (no `localeconv`/`LC_NUMERIC` reference in the file); not behaviorally reproducible on this host — no non-`C` numeric locale is installed (`locale -a` has no `de_DE`). Fix: consult `plib::locale` for the radix character and substitute post-format.
+- [ ] **#P16 — Diagnostics are hardcoded English.** Eight of the nine `eprintln!`/`eprint!` sites (`printf.rs:785, 792, 904, 911, 936, 943, 1106, 1206`) emit untranslated text; only `printf.rs:1212` ("not enough arguments") is wrapped in `gettext`. POSIX 111921-111923 makes `LC_MESSAGES` govern diagnostic text. Tree-wide caveat: no `.mo` catalogs ship, so `LC_MESSAGES` is inert project-wide regardless.
+- [ ] **#P17 — Two panic sites and a truncated diagnostic in `main`.** `printf.rs:1186-1189` `.unwrap()`s `textdomain` and `bind_textdomain_codeset` (both carry `// TODO unwrap` comments); `printf.rs:922-924` is an explicit `panic!("printf: BUG: invalid conversion specifier")` — currently unreachable, since `format_arg` dispatches only `u`/`o`/`x`/`X` into that function, but it is a live abort path if the dispatch table ever changes. Separately `printf.rs:1206` uses `eprint!` without a newline, so tokenizer errors print unterminated: verified `printf '%99999999999999999999d' 1` → `printf: number too large to fit in target type` with no trailing newline, exit 1. Fix: `.ok()` on the locale calls, return an error instead of panicking, `eprintln!`.
+- [ ] **#P18 — Whole output buffered in memory before the single write.** `printf.rs:1122, 1150, 1177` accumulate every byte into one `Vec` across all format-reuse passes. Correct, but unbounded: a large operand list materializes the entire output before a byte is emitted, and nothing is written if an early tokenizer error aborts. Informational; fix would be to write incrementally per token.
+
+## Detailed conformance matrix
+
+### SYNOPSIS / OPTIONS / OPERANDS
+
+- [x] **No options** CONFORMS (111900) — no clap surface; `printf.rs:1193-1194` takes `argv[1]` as the format verbatim, so `printf -- '%s\n' a` correctly treats `--` as the *format*.
+- [x] **`format` operand required** CONFORMS — missing → `printf: not enough arguments`, exit 1 (`printf.rs:1211-1214`); verified.
+- [x] **Empty format** CONFORMS — no output, exit 0; verified.
+- [x] **Byte-faithful operands** CONFORMS — `args_os()` + `as_bytes()` (`printf.rs:1191-1195`). Verified: `printf '%s\n' $'\xff\xfe'` emits `377 376 \n`. (Numeric conversions still require UTF-8 and diagnose otherwise, `printf.rs:811-813` — correct, since a numeric operand must be a character string.)
+
+### STDIN / INPUT FILES / OUTPUT FILES
+
+- [x] **STDIN not used** CONFORMS (111908) — grep-verified: no `stdin` reference in `printf.rs`.
+- [x] **No input/output files** CONFORMS (111910, 111935).
+
+### Environment variables
+
+- [x] `LANG` / `LC_ALL` CONFORMS in the weak sense — `setlocale(LcAll, "")` at `printf.rs:1183`.
+- [x] `LC_CTYPE` N/A in practice — every conversion is byte-oriented, which is what 112041-112044 prescribes for `%c` and for precision on `%b`/`%s`.
+- [ ] **`LC_MESSAGES` PARTIAL** — one of eight diagnostics is translatable; see #P16.
+- [ ] **`LC_NUMERIC` MISSING** — see #P15.
+- [ ] **`NLSPATH` MISSING** (XSI, 111927) — tree-wide gap.
+
+### Asynchronous events
+
+- [x] **Default** CONFORMS (111929) — no handlers installed.
+
+### Extended description — format string
+
+- [x] **`<space>` outside a flag position is an ordinary character** CONFORMS (item 1, 111940-111941).
+- [x] **`\ddd` octal in the format** CONFORMS for in-range values (item 3, 111944-111946) — `printf.rs:179-183`; out-of-range handled oddly (#P11).
+- [x] **No stray blanks around `d`/`u` output, no stray zeros before `o`** CONFORMS (items 4-5, 111947-111950) — `format_integer` emits nothing it was not asked for.
+- [x] **`a A e E f F g G` supported** CONFORMS as an encouraged extension (item 6, 111951 + 112039). Verified `%e`/`%f`/`%g` match GNU byte-for-byte across `1.005`, `1e10`, `0.1`, `1234.5678`, `0.0001`, `0.00001`, `100000`, `1000000`, `123456789`; exponent is always ≥2 digits and grows past two when needed (`1e100` → `1.000000e+100`), per XBD 3641-3643. Divergences confined to #P8, #P9, #P14.
+- [x] **`%b` conversion** CONFORMS (item 7, 111952-111971) — `printf.rs:968-1029`: full escape set, `\0ddd` with up to three digits after the zero, `\c` stopping the remaining string, remaining operands, and the rest of the format (verified `printf '%b\n' a 'b\c' c` → `a\nb`, matching GNU), precision applied to the *converted* string (verified `%.2b abcdef` → `ab`).
+- [ ] **Numbered conversion specifications MISSING** (items 8/10, 111972-111996) — see #P1.
+- [x] **Argument consumption order** CONFORMS (item 9, 111982-111992) — `printf.rs:1141-1147`; `%%` correctly consumes nothing.
+- [x] **Format reuse** CONFORMS (item 10, 111993) — `printf.rs:1128-1175`. The spec's own example `printf "%5d%4d\n" 1 21 321 4321 54321` reproduces byte-for-byte, including the synthesized `0` for the unmatched final `%4d`. A format with no argument-consuming conversion correctly stops after one pass (`printf.rs:1129-1131, 1172`), so `printf 'abc\n' x y` prints once and cannot loop forever.
+- [x] **Missing operands** CONFORMS (item 11, 111997-112004) — `printf.rs:1144` substitutes an empty operand; `b`/`c`/`s` yield the null string, numeric conversions yield zero (`printf.rs:807-809`).
+- [x] **Invalid conversion specification** — unspecified per item 12 (112005-112006). Ours diagnoses and then prints the operand as a string (`printf.rs:1105-1108`); GNU errors out. Acceptable; noted because the output is noisy (`printf '%z' abc` → `abc` on stdout).
+- [x] **`%c` semantics** CONFORMS (item 13, 112007-112010 + XBD 3654) — first byte only, nothing written for an empty operand. Verified `%c abc` → `a`, `%c 'é'` → the single byte `0303`, `%c ''` → empty. The multi-byte truncation is exactly what 112041-112044 warns applications about.
+- [x] **Integer operand forms** CONFORMS (112013-112018) — leading `+`/`-`, `0x`/`0X` hex, `0` octal, and `'c`/`"c` character constants all parse (`printf.rs:806-896`). Verified against the spec EXAMPLES: `printf '%d\n' 10 010 0x10` → `10 8 16`.
+- [x] **Partial conversion is diagnosed, non-zero exit, remaining operands still processed, accumulated value still written** CONFORMS in shape (112020-112024) — verified `printf 'a%db\n' ABC` → stdout `a0b`, diagnostic on stderr, exit 1 (GNU identical). The *value* written on overflow diverges (#P6), and two paths under-report (#P12, #P13).
+- [x] **Incomplete use of a `b`/`c`/`s` operand is not an error** CONFORMS (112025-112026).
+
+### Extended description — XBD Chapter 5 conversion details
+
+- [x] **Flags `-` `+` `<space>` `#` `0`** CONFORMS (3568-3585) — verified `%-5s`, `%+d`, `% d`, `%#x`, `%05d`, `%-6d` all match GNU.
+- [x] **`0` ignored when a precision is given for `d i o u x X`** CONFORMS (3583-3585) — `printf.rs:394` guards on `conv.precision.is_none()`; verified `%08.3d 42` → `     042`, matching GNU.
+- [x] **Field width never truncates** CONFORMS (3662-3664) — `format_arg_string`/`format_integer` only pad.
+- [x] **Default precision 1 for integers; precision zero-extends** CONFORMS (3612-3615) — verified `%.5d 42` → `00042`.
+- [ ] **Zero value with precision 0 DIVERGES** (3615-3616) — see #P7.
+- [x] **`%s` precision bounds bytes written** CONFORMS (3655-3659) — verified `%5.2s`, `%.0s`.
+- [x] **`%f` precision 0 suppresses the radix character** CONFORMS (3625-3626) — verified `%.0f 2.5` → `2`, `%.0f 3.5` → `4` (round-half-even, matching glibc).
+- [x] **`%g` trailing-zero removal and `#` suppression thereof** CONFORMS (3646-3651) — verified `%g 100` → `100`, `%#g 100` → `100.000`, `%.0g 100` → `1e+02`.
+- [ ] **`#` with `o` DIVERGES** (3574-3575) — see #P10.
+- [ ] **`0` with infinity/NaN DIVERGES** (3580-3582) — see #P8.
+- [ ] **NaN style for `f` DIVERGES** (3629-3631) — see #P9.
+- [ ] **`a`/`A` default precision DIVERGES** (3594-3598) — see #P14.
+- [x] **`%%`** CONFORMS (3660-3661).
+
+### Exit status / consequences of errors
+
+- [x] **0 on success, >0 on conversion error** CONFORMS (112028-112030) — `had_error` threaded through every conversion and returned from `do_printf` (`printf.rs:1119-1179, 1198-1204`).
+- [ ] **>0 on write error PARTIAL** — see #P5.
+- [ ] **>0 on a partly-consumed quoted character constant MISSING** — see #P12.
+- [x] **Consequences of errors: Default** CONFORMS (112032).
+
+## Test coverage signal
+
+98 tests — the broadest of the three utilities in this crate. Covered: all integer/string/char conversions, `%b` with every escape, `%%`, character constants, hex/octal operand parsing, format reuse (including the spec's `%5d%4d` example), width/precision/left-justify/zero-pad combinations, all format-string escapes, missing operands, `\c` in both the format and a `%b` operand.
+
+Not covered (each is a "write a test" task tied to the matching finding):
+
+- [ ] `%n$` numbered conversions (#P1)
+- [ ] Negative operands to `%u`/`%o`/`%x`/`%X` (#P2) and `i64::MIN` (#P3)
+- [ ] Empty precision `%.f` / `%.s` (#P4)
+- [ ] Write-failure exit status (#P5)
+- [ ] Integer overflow saturation (#P6)
+- [ ] `%.0d 0` (#P7), `%08f inf` (#P8), `%f nan` (#P9), `%#.3o` (#P10)
+- [ ] `\400` (#P11), quoted constant with trailing bytes (#P12), trailing whitespace in a numeric operand (#P13)
+- [ ] Any floating-point test at all — `%f`/`%e`/`%g`/`%a` have **zero** tests despite ~280 lines of implementation (`printf.rs:424-758`)
+- [ ] `LC_NUMERIC` radix character (#P15)
+
+## Suggested PR groupings
+
+- **PR A — "printf: unsigned conversions"**: #P2, #P3, #P6 — one theme (integer operand → value → unsigned formatting), one test module.
+- **PR B — "printf: numbered conversion specifications"**: #P1 alone; touches the tokenizer and the reuse loop, deserves its own review.
+- **PR C — "printf: precision and flag conformance"**: #P4, #P7, #P8, #P9, #P10, #P14 — all XBD Ch. 5 detail fixes, plus the crate's first floating-point tests.
+- **PR D — "printf: output integrity"**: #P5 (checked flush) + #P11 (octal masking) + #P18 if incremental writing is wanted; pairs naturally with `echo` PR B.
+- **PR E — "printf: diagnostics and error reporting"**: #P12, #P13, #P16, #P17.
+
+---
+
+# Crate-level summary — `display/`
+
+| Utility | Critical | Major | Minor | README stage |
+|---|---|---|---|---|
+| `more` | 2 (both fixed) | 7 (4 fixed) | 6 | Stage 6 — Audited |
+| `echo` | 1 | 2 | 5 | Stage 3 (not promoted) |
+| `printf` | 0 | 6 | 12 | Stage 3 (not promoted) |
+
+**Cross-cutting themes across the crate:**
+
+1. **Unchecked final flush.** `echo` #E2 and `printf` #P5 are the same bug: Rust's line-buffered stdout hides the write error whenever the output does not end in a `<newline>`, and neither `main` calls `flush()`. Both silently exit 0 after losing data. Fix them together.
+2. **Byte fidelity is inconsistent.** `printf` is byte-faithful from `args_os` through to output; `echo` panics on the same input. `echo` should adopt `printf`'s pattern verbatim.
+3. **Diagnostics.** `more`'s `MoreError` strings (#14), all of `echo`'s (there are none, only Rust `Debug` output — #E5), and seven of `printf`'s eight (#P16) are hardcoded English. None of the three uses `plib::diag`. A single crate-wide migration closes #14, #E5, #E6, #P16, #P17.
+4. **`NLSPATH` / `.mo` catalogs** are absent tree-wide, so `LC_MESSAGES` is inert regardless of the above. Tracked at project level, not per-utility.
+
+**Promotion status.** `echo` and `printf` are **deliberately not promoted** to README Stage 6 by this audit: `echo` still aborts (exit 101) on a non-UTF-8 operand (#E1) and both silently discard write errors on their most common non-newline paths (#E2/#P5). This follows the precedent set for `text/` `csplit`/`tr` and `users/` `talk` — audited, punch-list published, promotion deferred until the Critical/Major items are remediated with regression tests.

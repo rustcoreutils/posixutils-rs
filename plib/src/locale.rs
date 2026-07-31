@@ -218,6 +218,37 @@ pub fn isprint(c: char) -> bool {
     }
 }
 
+/// The current locale's radix character (`LC_NUMERIC`'s decimal point).
+///
+/// Returns `"."` when the locale does not supply one, so callers can use the
+/// result unconditionally. `localeconv(3)` is used rather than
+/// `nl_langinfo(RADIXCHAR)` because the latter's `nl_item` constant is not
+/// exposed for every platform this project targets.
+///
+/// Call after `setlocale(LC_ALL, "")` (see `plib::diag::init_locale`);
+/// before that, the C locale's `"."` is reported.
+pub fn radix_char() -> String {
+    // SAFETY: localeconv() returns a pointer to a static structure owned by
+    // the C library, valid until the next setlocale()/localeconv() call. We
+    // copy the string out immediately.
+    unsafe {
+        let lconv = libc::localeconv();
+        if lconv.is_null() {
+            return ".".to_string();
+        }
+
+        let decimal_point = (*lconv).decimal_point;
+        if decimal_point.is_null() {
+            return ".".to_string();
+        }
+
+        match std::ffi::CStr::from_ptr(decimal_point).to_str() {
+            Ok("") | Err(_) => ".".to_string(),
+            Ok(s) => s.to_string(),
+        }
+    }
+}
+
 /// Compare two strings using `LC_COLLATE`.
 ///
 /// Returns `Less`, `Equal`, or `Greater` per libc `strcoll(3)`. If either

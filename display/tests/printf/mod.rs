@@ -814,6 +814,90 @@ fn test_audit_floating_point_conversions() {
     printf_status_test(&["%f", "abc"], "0.000000", 1);
 }
 
+/// Run `printf` and assert on stdout, exit status, and a stderr substring.
+fn printf_diag_test(args: &[&str], expected_out: &str, expected_code: i32, stderr_needle: &str) {
+    let output = Command::new(get_binary_path("printf"))
+        .args(args)
+        .output()
+        .expect("failed to run printf");
+
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        expected_out,
+        "stdout mismatch for {args:?}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(expected_code),
+        "exit status mismatch for {args:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.starts_with("printf: "),
+        "diagnostic should be prefixed with the utility name, got {stderr:?}"
+    );
+    assert!(
+        stderr.contains(stderr_needle),
+        "expected {stderr_needle:?} in stderr, got {stderr:?}"
+    );
+}
+
+#[test]
+fn test_audit_p12_quoted_constant_trailing_bytes() {
+    // #P12 / POSIX EXAMPLES 112128-112141: "Since the last two arguments
+    // contain more characters than used for the conversion, a diagnostic
+    // message is generated and the exit status is non-zero."
+    printf_diag_test(&["%d", "'-3"], "45", 1, "not completely converted");
+    printf_diag_test(&["%d", "\"+3"], "43", 1, "not completely converted");
+    // A constant with nothing after it is clean.
+    printf_status_test(&["%d", "'A"], "65", 0);
+    printf_status_test(&["%d", "'3"], "51", 0);
+}
+
+#[test]
+fn test_audit_p13_operand_whitespace() {
+    // #P13: leading blanks are skipped, as strtol()/strtod() do, but
+    // trailing ones leave the operand not completely converted.
+    printf_status_test(&["%d", " 5"], "5", 0);
+    printf_status_test(&["%d", "\t5"], "5", 0);
+    printf_diag_test(&["%d", "5 "], "5", 1, "not completely converted");
+    printf_diag_test(&["%f", "5 "], "5.000000", 1, "not completely converted");
+    // Blanks alone are not a numeric constant; an absent operand still is 0.
+    printf_diag_test(&["%d", "   "], "0", 1, "expected numeric value");
+    printf_status_test(&["%d", ""], "0", 0);
+    printf_status_test(&["%d%d", "1"], "10", 0);
+}
+
+#[test]
+fn test_audit_p16_diagnostics_are_prefixed() {
+    // #P16/#P17: every diagnostic goes through plib::diag, so it is
+    // "printf: <message>" on stderr and newline-terminated.
+    printf_diag_test(&["%d", "ABC"], "0", 1, "expected numeric value");
+    printf_diag_test(
+        &["%d", "9999999999999999999999"],
+        "9223372036854775807",
+        1,
+        "arithmetic overflow",
+    );
+    printf_diag_test(
+        &["%u", "-99999999999999999999999999"],
+        "9223372036854775808",
+        1,
+        "arithmetic overflow",
+    );
+    printf_diag_test(&["%1$s %2$s", "only"], "only ", 1, "missing argument");
+
+    // A tokenizer failure reports before any output and is newline-terminated.
+    let output = Command::new(get_binary_path("printf"))
+        .args(["%99999999999999999999d", "1"])
+        .output()
+        .expect("failed to run printf");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.starts_with(b"printf: "));
+    assert!(output.stderr.ends_with(b"\n"));
+}
+
 #[test]
 fn test_audit_p5_write_error_exit_status() {
     // #P5: a failed write must be diagnosed and must not exit 0, even when
@@ -870,7 +954,9 @@ fn test_audit_integer_operand_forms_unchanged() {
     printf_test(&["%d", "+3"], "3");
     printf_test(&["%d", "-3"], "-3");
     printf_test(&["%d", "'3"], "51");
-    printf_test(&["%d", "\"+3"], "43");
+    // Spec EXAMPLES 112128-112141: the extra byte is not used by the
+    // conversion, so this diagnoses and exits non-zero (see #P12).
+    printf_status_test(&["%d", "\"+3"], "43", 1);
     printf_test(&["%d", "0"], "0");
     printf_test(&["%d", ""], "0");
     printf_status_test(&["%d", "08"], "0", 1);

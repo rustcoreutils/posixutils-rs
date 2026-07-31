@@ -7,7 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
+use plib::diag;
 use std::{
     error::Error,
     io::{self, Write},
@@ -15,7 +16,28 @@ use std::{
     os::unix::ffi::OsStrExt,
     process::ExitCode,
     slice::Iter,
+    sync::OnceLock,
 };
+
+/// The locale's radix character, resolved once.  POSIX 111924-111926 makes
+/// `LC_NUMERIC` determine the character used by the e, E, f, g, and G
+/// conversions; Rust's own formatting is locale-independent and always emits
+/// a <period>, so the result is substituted after formatting.
+fn radix_char() -> &'static str {
+    static RADIX: OnceLock<String> = OnceLock::new();
+    RADIX.get_or_init(plib::locale::radix_char)
+}
+
+/// Replace the <period> Rust's formatting produced with the locale's radix
+/// character.  Every floating-point rendering here contains at most one.
+fn apply_radix_char(formatted: String) -> String {
+    let radix = radix_char();
+    if radix == "." {
+        formatted
+    } else {
+        formatted.replacen('.', radix, 1)
+    }
+}
 
 // the following structure is a printf format conversion specifier
 struct ConvSpec {
@@ -468,19 +490,23 @@ fn parse_float_arg(arg: &[u8]) -> Result<(f64, bool), String> {
 
     let arg_str = match std::str::from_utf8(arg) {
         Ok(s) => s,
-        Err(_) => return Err("invalid UTF-8".to_string()),
+        Err(_) => return Err(gettext("invalid UTF-8")),
     };
 
-    let arg_str = arg_str.trim();
+    // strtod() skips leading blanks but stops at trailing ones, which are
+    // then "not completely converted" (POSIX 112020-112024).
+    let arg_str = arg_str.trim_start();
 
     if arg_str.is_empty() {
-        return Ok((0.0, true));
+        return Err(gettext("expected numeric value"));
     }
 
-    // Check for character constant: 'c or "c
+    // Check for character constant: 'c or "c.  POSIX 112013-112018 attaches
+    // this extension to the integer conversions; accepting it here too is a
+    // superset, and matches every other implementation.
     if (arg_str.starts_with('\'') || arg_str.starts_with('"')) && arg_str.len() >= 2 {
         let ch = arg_str.chars().nth(1).unwrap();
-        return Ok((ch as u32 as f64, true));
+        return Ok((ch as u32 as f64, arg_str.chars().count() == 2));
     }
 
     // Parse as float
@@ -526,13 +552,13 @@ fn parse_float_arg(arg: &[u8]) -> Result<(f64, bool), String> {
             }
 
             if end == 0 {
-                return Err(format!("invalid floating point number: {arg_str}"));
+                return Err(gettext("expected numeric value"));
             }
 
             let parsed: &str = &arg_str[..end];
             match parsed.parse::<f64>() {
                 Ok(n) => Ok((n, end == arg_str.len())),
-                Err(_) => Err(format!("invalid floating point number: {arg_str}")),
+                Err(_) => Err(gettext("expected numeric value")),
             }
         }
     }
@@ -783,6 +809,10 @@ fn format_float(conv: &ConvSpec, value: f64) -> Vec<u8> {
         _ => format_fixed(abs_value, precision, false),
     };
 
+    // POSIX 111924-111926 / XBD 3623-3624: LC_NUMERIC determines the radix
+    // character.  Rust's formatting always produces a <period>.
+    let formatted = apply_radix_char(formatted);
+
     // Determine sign
     let sign_char = if is_negative {
         Some('-')
@@ -863,15 +893,18 @@ fn format_arg_float(conv: &ConvSpec, arg: &[u8]) -> Result<(Vec<u8>, bool), Box<
     let value = match parse_float_arg(arg) {
         Ok((n, fully_consumed)) => {
             if !fully_consumed {
-                let arg_str = std::str::from_utf8(arg).unwrap_or("<invalid>");
-                eprintln!("printf: {arg_str}: not completely converted");
+                let arg_str = String::from_utf8_lossy(arg);
+                diag::error(&format!(
+                    "{arg_str}: {}",
+                    gettext("not completely converted")
+                ));
                 had_error = true;
             }
             n
         }
         Err(e) => {
-            let arg_str = std::str::from_utf8(arg).unwrap_or("<invalid>");
-            eprintln!("printf: {arg_str}: {e}");
+            let arg_str = String::from_utf8_lossy(arg);
+            diag::error(&format!("{arg_str}: {e}"));
             had_error = true;
             0.0
         }
@@ -889,8 +922,6 @@ struct IntOperand {
     value: i128,
     /// False if the operand had trailing bytes that were not converted.
     fully_consumed: bool,
-    /// True if the operand's magnitude exceeded what could be represented.
-    overflowed: bool,
 }
 
 /// Parse an integer argument according to POSIX rules (112013-112018):
@@ -902,7 +933,6 @@ fn parse_integer_arg(arg: &[u8]) -> Result<IntOperand, String> {
     let operand = |value: i128| IntOperand {
         value,
         fully_consumed: true,
-        overflowed: false,
     };
 
     if arg.is_empty() {
@@ -911,19 +941,29 @@ fn parse_integer_arg(arg: &[u8]) -> Result<IntOperand, String> {
 
     let arg_str = match std::str::from_utf8(arg) {
         Ok(s) => s,
-        Err(_) => return Err("invalid UTF-8".to_string()),
+        Err(_) => return Err(gettext("invalid UTF-8")),
     };
 
-    let arg_str = arg_str.trim();
+    // A C integer constant may be preceded by blanks (strtol() skips them),
+    // but trailing bytes are "not completely converted" (112020-112024).
+    let arg_str = arg_str.trim_start();
 
+    // Blanks alone are not a constant.  (An operand that is empty to begin
+    // with is the "missing operand" substitution of item 11, handled above.)
     if arg_str.is_empty() {
-        return Ok(operand(0));
+        return Err(gettext("expected numeric value"));
     }
 
     // Check for character constant: 'c or "c
     if (arg_str.starts_with('\'') || arg_str.starts_with('"')) && arg_str.len() >= 2 {
         let ch = arg_str.chars().nth(1).unwrap();
-        return Ok(operand(i128::from(u32::from(ch))));
+        return Ok(IntOperand {
+            value: i128::from(u32::from(ch)),
+            // POSIX EXAMPLES 112128-112141: bytes beyond the quoted character
+            // are not used by the conversion, so a diagnostic is generated
+            // and the exit status is non-zero.
+            fully_consumed: arg_str.chars().count() == 2,
+        });
     }
 
     // Handle sign
@@ -952,18 +992,17 @@ fn parse_integer_arg(arg: &[u8]) -> Result<IntOperand, String> {
 
     let valid_len = digits.chars().take_while(|c| c.is_digit(radix)).count();
     if valid_len == 0 {
-        return Err(format!("invalid number: {arg_str}"));
+        return Err(gettext("expected numeric value"));
     }
 
-    let (magnitude, overflowed) = match i128::from_str_radix(&digits[..valid_len], radix) {
-        Ok(n) => (n, false),
-        Err(_) => (i128::MAX, true),
-    };
+    // Only digits of the operand's radix reach the parser, so the sole
+    // failure mode is a magnitude too large for i128.  Saturate; the
+    // conversion's own range check below reports it.
+    let magnitude = i128::from_str_radix(&digits[..valid_len], radix).unwrap_or(i128::MAX);
 
     Ok(IntOperand {
         value: if is_negative { -magnitude } else { magnitude },
         fully_consumed: valid_len == digits.len(),
-        overflowed,
     })
 }
 
@@ -976,29 +1015,34 @@ fn eval_integer_arg(arg: &[u8]) -> (IntOperand, bool) {
             let mut had_error = false;
             if !operand.fully_consumed {
                 let arg_str = String::from_utf8_lossy(arg);
-                eprintln!("printf: {arg_str}: not completely converted");
-                had_error = true;
-            }
-            if operand.overflowed {
-                let arg_str = String::from_utf8_lossy(arg);
-                eprintln!("printf: {arg_str}: arithmetic overflow");
+                diag::error(&format!(
+                    "{arg_str}: {}",
+                    gettext("not completely converted")
+                ));
                 had_error = true;
             }
             (operand, had_error)
         }
         Err(e) => {
             let arg_str = String::from_utf8_lossy(arg);
-            eprintln!("printf: {arg_str}: {e}");
+            diag::error(&format!("{arg_str}: {e}"));
             (
                 IntOperand {
                     value: 0,
                     fully_consumed: true,
-                    overflowed: false,
                 },
                 true,
             )
         }
     }
+}
+
+/// Report an operand whose value did not fit the conversion.  POSIX
+/// 112020-112024 requires the diagnostic alongside the saturated value; the
+/// wording follows the spec's own EXAMPLES table (112117-112120).
+fn report_overflow(arg: &[u8]) {
+    let arg_str = String::from_utf8_lossy(arg);
+    diag::error(&format!("{arg_str}: {}", gettext("arithmetic overflow")));
 }
 
 /// Format an argument under one of the unsigned conversions (`o`, `u`, `x`,
@@ -1012,6 +1056,7 @@ fn format_arg_uint_base(conv: &ConvSpec, arg: &[u8], base: u32, upper: bool) -> 
         // Saturate into the signed range first, then reinterpret the bits.
         let signed = if operand.value < i128::from(i64::MIN) {
             had_error = true;
+            report_overflow(arg);
             i64::MIN
         } else {
             operand.value as i64
@@ -1019,6 +1064,7 @@ fn format_arg_uint_base(conv: &ConvSpec, arg: &[u8], base: u32, upper: bool) -> 
         signed as u64
     } else if operand.value > i128::from(u64::MAX) {
         had_error = true;
+        report_overflow(arg);
         u64::MAX
     } else {
         operand.value as u64
@@ -1038,9 +1084,11 @@ fn format_arg_int(conv: &ConvSpec, arg: &[u8]) -> (Vec<u8>, bool) {
 
     let value = if operand.value < i128::from(i64::MIN) {
         had_error = true;
+        report_overflow(arg);
         i64::MIN
     } else if operand.value > i128::from(i64::MAX) {
         had_error = true;
+        report_overflow(arg);
         i64::MAX
     } else {
         operand.value as i64
@@ -1209,7 +1257,10 @@ fn format_arg(conv: &ConvSpec, arg: &[u8]) -> Result<FormatResult, Box<dyn Error
         }
         '%' => (vec![b'%'], false, false),
         ch => {
-            eprintln!("printf: unknown conversion specifier: {ch}");
+            diag::error(&format!(
+                "{}: {ch}",
+                gettext("unknown conversion specifier")
+            ));
             (format_arg_string(conv, arg), false, true)
         }
     };
@@ -1267,7 +1318,10 @@ fn do_printf(format: &[u8], arguments: &[&[u8]]) -> Result<bool, Box<dyn Error>>
                             // POSIX 111998-112000: a missing operand for a
                             // numbered conversion should be diagnosed and
                             // should not exit zero.
-                            eprintln!("printf: missing argument for conversion %{n}$");
+                            diag::error(&format!(
+                                "{} %{n}$",
+                                gettext("missing argument for conversion")
+                            ));
                             had_error = true;
                         }
                         arguments.get(index).copied().unwrap_or(&[])
@@ -1320,13 +1374,7 @@ fn do_printf(format: &[u8], arguments: &[&[u8]]) -> Result<bool, Box<dyn Error>>
 }
 
 fn main() -> ExitCode {
-    setlocale(LocaleCategory::LcAll, "");
-    // TODO
-    // unwrap
-    textdomain("posixutils-rs").unwrap();
-    // TODO
-    // unwrap
-    bind_textdomain_codeset("posixutils-rs", "UTF-8").unwrap();
+    diag::init_locale("printf");
 
     let args = std::env::args_os().collect::<Vec<_>>();
 
@@ -1343,13 +1391,13 @@ fn main() -> ExitCode {
                     }
                 }
                 Err(er) => {
-                    eprint!("printf: {er}");
+                    diag::error(&er.to_string());
                     ExitCode::FAILURE
                 }
             }
         }
         _ => {
-            eprintln!("printf: {}", gettext("not enough arguments"));
+            diag::error(&gettext("not enough arguments"));
             ExitCode::FAILURE
         }
     }

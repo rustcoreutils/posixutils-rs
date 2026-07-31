@@ -43,15 +43,15 @@
 
 ### Options
 
-- [ ] **`-c` PARTIAL.** Flag parsed (line 43); `print_over` field never consulted in render path — clear-on-first-screen and per-line redraw not observable.
+- [x] ~~**`-c` PARTIAL**~~ — **re-examined (Phase 9); actually conforms.** 107274-107278 asks that a screen sharing no lines with the current one be *redrawn line by line rather than scrolled*, and that the first screen be cleared. The renderer never scrolls: every refresh positions the cursor and rewrites each cell from the top of the screen down, and the alternate screen it enters is cleared on entry. Those guarantees therefore hold on every invocation, with or without the flag, so `-c` is a conforming no-op. (107278 additionally permits silently ignoring it.)
 - [x] `-e` CONFORMS (line 2148).
 - [x] `-i` CONFORMS — `RegexFlags::bre().ignore_case()` at line 1649.
 - [x] `-n` CONFORMS — overrides LINES/COLUMNS at line 1538.
-- [ ] **`-p` PARTIAL.** Commands run on new-file display (lines 2501–2528). Spec requires that if any `-p` command fails, an informational message is written AND remaining `-p` commands for that file are suppressed — current code may `exit()` on error.
+- [x] **`-p`** CONFORMS ✓ **fixed (Phase 9)**: `process_p` catches a failing command, reports it through `handle_error`, and stops the loop for that file, per 107291-107293 ("an informational message to this effect shall be written, and no further commands ... shall be executed for this file"). The command list is kept intact, so the next file starts from the beginning of it.
 - [x] `-s` CONFORMS — squeeze propagates via `SeekPositions`.
 - [x] **`-t`** CONFORMS ✓ fixed — the option shares `goto_tag`, so the literal-match fix of #15 covers it.
 - [x] `-u` CONFORMS — `plain` flag suppresses backspace/underscore/bold processing.
-- [ ] **`+` as option prefix MISSING.** Spec allows but doesn't require; clap doesn't recognize it. (Lowest priority — optional.)
+- [x] **`+` as option prefix N/A** — the `more` SYNOPSIS (107250) does not include a `+` form, and XBD 12.2's `+`-prefix exception is a permission, not a requirement. Recorded, not implemented.
 
 ### Operands / STDIN
 
@@ -66,10 +66,10 @@
 - [x] **`LINES`** CONFORMS ✓ fixed (#12) — re-consulted on every resize, with `-n` taking precedence (107359).
 - [x] `MORE` CONFORMS — prepended before CLI args (lines 2983–3003); CLI wins on conflict.
 - [x] `EDITOR` CONFORMS — line 1901, falls back to `vi`.
-- [ ] **`TERM` MISSING (via termion).** Termion reads internally; we don't validate.
-- [ ] **`LANG` MISSING.** Only `LC_ALL` set via `setlocale` at line 3006.
-- [ ] **`LC_COLLATE` MISSING.**
-- [ ] **`LC_CTYPE` MISSING.**
+- [x] **`TERM`** CONFORMS by delegation — termion reads it to select terminal capabilities, which is exactly what 107366's "the MORE variable shall take precedence over the TERM and LINES variables" contemplates. `more` itself has no reason to validate it.
+- [x] ~~**`LANG` MISSING**~~ — **re-examined (Phase 9); actually conforms.** The call is `setlocale(LC_ALL, "")`, whose empty locale argument makes libc apply the whole `LC_ALL` > `LC_*` > `LANG` precedence chain of XBD 8.2. The original finding read the `LcAll` *category* as if it were the `LC_ALL` variable.
+- [x] **`LC_COLLATE`** CONFORMS — reaches libc through the same `setlocale(LC_ALL, "")`, and the search path compiles patterns via `plib::regex`, whose bracket-expression ranges are collation-aware.
+- [ ] **`LC_CTYPE` PARTIAL.** Set through `setlocale(LC_ALL, "")`, so libc-based classification sees it, but the render path still decides printability by `u8::is_ascii_control` rather than a locale-aware classifier. Tied to the deferred non-printable-display item below.
 - [x] **`LC_MESSAGES`** CONFORMS as far as the tree allows ✓ fixed (#14) — all diagnostics are `gettext`'d; text stays English until `.mo` catalogs ship.
 - [ ] `NLSPATH` (XSI) MISSING — optional XSI, acceptable; track anyway.
 
@@ -82,7 +82,7 @@
 ### STDOUT / STDERR
 
 - [x] Content to stdout (non-tty) CONFORMS — `print_all_input` lines 1763–1829.
-- [ ] **Content rendering (tty mode) DIVERGES** from "write to stdout" model — uses termion alternate screen on stdout. (Design-level; may be acceptable but worth confirming.)
+- [x] **Content rendering (tty mode)** CONFORMS — **confirmed (Phase 9).** The alternate screen is entered on *standard output*, which is where 107208-107210 requires the content to go; the spec constrains the channel, not the terminal mode. It is also what makes the `-c` guarantee above hold unconditionally.
 - [x] **Prompt to stderr** ✓ fixed (same as Major #5).
 - [x] **Prompt contains filename** ✓ fixed (same as Major #6).
 - [x] EOF prompt contains next file CONFORMS — `Prompt::Eof` line 1622.
@@ -91,23 +91,25 @@
 
 All 28 spec commands are wired (count-prefix supported on every command that takes one). Issues found:
 
-- [ ] **`[count]s` PARTIAL.** Implemented as plain scroll; spec requires "screenful beginning with line `count` lines after last line on current screen".
+- [x] **`[count]s`** CONFORMS ✓ **fixed (Phase 9)**: the top now advances past the whole current screen plus `count` (`screenful - 1 + count`), per 107528. `scroll` clamps at end of file, which is 107529-107530's "the last screenful in the file shall be written".
 - [x] **`''`** CONFORMS ✓ fixed — same as Major #9.
 - [x] **`:e filename`** CONFORMS for word expansion ✓ fixed (#8); the non-seekable check remains unimplemented (107595: "including that it is a non-seekable file").
 - [x] **`:n` / `:p`** CONFORMS ✓ fixed — same as Major #7.
 - [x] **`:t tagstring`** CONFORMS ✓ fixed — same as Minor #15.
 - [x] **`v` uses `-c N`** ✓ fixed — same as Minor #10.
 - [x] **`v` editor name compared by last pathname component** ✓ fixed — same as Minor #11.
-- [ ] **`=` uses basename instead of full pathname for files.** Spec allows omitting byte info for stdin (that case works).
-- [ ] **`h` help text links to a POSIX 2018 URL** (line 2967), not 2024.
+- [x] **`=`** CONFORMS ✓ **fixed (Phase 9)**: reports the pathname as given rather than its last component (107628); the stdin case already omitted the byte figures as 107631-107632 permits.
+- [x] **`h` help text** ✓ **fixed (Phase 9)**: now links to the POSIX.1-2024 page.
 
 ### Extended description / rendering
 
 - [x] Line folding CONFORMS for ASCII.
-- [ ] **Multi-column-character splitting** at column boundary is unspecified by POSIX; implementation behavior on a wide character straddling the column limit is undefined. Track for hardening.
-- [ ] **Backspace/underscore/embolden (when `-u` absent) PARTIAL.** The 3-byte pattern match in `continious_styled_parse` / `last_styled_parse` (lines 743–848) doesn't implement the full POSIX sequences (`char + n*BS + n*'_'` for underline; `char + n*BS + char` for bold) for n > 1.
-- [ ] **`\r` at EOL ignored PARTIAL.** `\r` participates in `line_len` rather than being discarded before `\n`.
-- [ ] **Non-printable display PARTIAL.** Line parse breaks on first non-`\x08` control character (lines 673–675), truncating the line rather than displaying it in `ex print` notation.
+**Deferred as a group — the interactive render path.** The four items below all live in `find_next_line_len_with_skip` and its `continious_styled_parse` / `last_styled_parse` helpers, which are only reached when standard output is a terminal (in filter mode `more` copies its input through verbatim, which is already correct). Changing that parser is only safe with a harness that can both allocate a PTY *and drive `more`'s command input*, because `more` waits for a command even under `-e`; the crate has no such harness today (`screen/tests/common/mod.rs` allocates a PTY but never writes to it). Rewriting the parser blind was judged worse than recording the gap — the same call the project made for `users/` `talk`. A fix should land together with an input-capable PTY harness in `display/tests/common/`.
+
+- [ ] **Non-printable display PARTIAL** (the most user-visible of the four). Line parse breaks on the first non-`\x08` control character (lines 673–675), so the rest of the line is dropped rather than displayed in `ex print` notation (`^X`, `\NNN`) per 107450-107452. A literal `<tab>` triggers it too, since `is_ascii_control` includes it.
+- [ ] **Backspace/underscore/embolden (when `-u` absent) PARTIAL.** The 3-byte pattern match doesn't implement the full POSIX sequences (`char + n*BS + n*'_'` for underline; `char + n*BS + char` for bold, 107432-107445) for n > 1.
+- [ ] **`\r` at EOL ignored PARTIAL.** `\r` participates in `line_len` rather than being discarded before `\n` (107448-107449).
+- [ ] **Multi-column-character splitting** at a column boundary is unspecified by POSIX (107452-107453), but the same lines require that such a character "shall not be discarded" — worth confirming once the harness exists.
 
 ### Exit status / consequences of errors
 
@@ -131,7 +133,7 @@ Not covered (each gap is a "write a test" task tied to fixing the corresponding 
 - [x] SIGCONT behavior (resume from `kill -STOP $$; kill -CONT $$`) — handler installed; covered by code path, no automated test (needs PTY harness).
 - [x] SIGWINCH behavior (size change while paused at prompt) — handler installed; covered by code path, no automated test.
 - [x] Implicit-stdin (`echo -e 'a\nb\nc' | more`) — would catch Critical #1 (covered by `test_0_files_multiline_stdin_not_truncated` and `test_0_files_empty_stdin`)
-- [ ] `-p` command-failure suppression of remaining `-p` commands
+- [x] `-p` command-failure suppression of remaining `-p` commands — implemented in Phase 9; verified by hand (a failing `:e` in a `-p` list stops the list)
 
 ---
 
@@ -140,8 +142,9 @@ Not covered (each gap is a "write a test" task tied to fixing the corresponding 
 - **PR A — "POSIX I/O channels"**: Critical #1, #2 + Major #5, #6
 - [x] **Phase 8 — "Env precedence, hidden flag, i18n"**: Minor #12, #13, #14 (Major #3, #4 landed earlier)
 - [x] **Phase 7 — "Command-mode conformance"**: Major #7, #8, #9 + Minor #10, #11, #15
-- **PR D — "Rendering correctness"**: backspace/embolden sequences, `\r` handling, non-printable display, `-c` redraw
-- **PR E — "i18n + cleanup"**: Minor #13, #14 + locale env var coverage
+- [x] **Phase 9 — "Remaining matrix items"**: `-p` failure suppression, `[count]s`, `=` pathname, `h` URL, plus re-dispositions of `-c`, `+`, `TERM`, `LANG`, `LC_COLLATE`, and the alternate-screen design item
+- [ ] **Future — "Rendering correctness"**: the four deferred render-path items above, to land with an input-capable PTY harness
+- [x] **Phase 8 — "i18n + cleanup"**: Minor #13, #14 + locale env var coverage
 
 ---
 ---

@@ -2685,14 +2685,13 @@ impl MoreControl {
         let Some(terminal_size) = self.context.terminal_size else {
             return Err(MoreError::MissingTerminal);
         };
-        let mut filename = "<error>";
+        // POSIX 107628: the message includes "the name of the file currently
+        // being examined" -- the pathname as given, not just its last
+        // component, which would be ambiguous across directories.
+        let mut filename = String::from("<error>");
         let mut file_size = 0;
         if let Source::File(path) = &self.context.current_source {
-            if let Some(file_string) = path.file_name() {
-                if let Some(file_string) = file_string.to_str() {
-                    filename = file_string;
-                }
-            }
+            filename = path.to_string_lossy().into_owned();
             if let Ok(metadata) = path.metadata() {
                 file_size = metadata.len();
             }
@@ -3072,8 +3071,15 @@ impl MoreControl {
                 self.if_eof_and_prompt_goto_next_file()?;
             }
             Command::SkipForwardOneLine(count) => {
+                // POSIX 107528: "Display the screenful beginning with the line
+                // count lines after the last line on the current screen" --
+                // so the top moves past the whole current screen, not just by
+                // count lines.  scroll() clamps at the end of the file, which
+                // gives 107529-107530's "the last screenful shall be written".
                 let count = count.unwrap_or(1);
-                self.context.scroll(count, Direction::Forward);
+                let screenful = self.context.screen_lines();
+                self.context
+                    .scroll(screenful.saturating_sub(1) + count, Direction::Forward);
                 self.if_eof_and_prompt_goto_next_file()?;
             }
             Command::ScrollBackwardOneHalfScreenful(count) => {
@@ -3251,7 +3257,16 @@ impl MoreControl {
             }
             let is_empty = remainder.is_empty();
             commands_str = remainder.clone();
-            self.execute(command)?;
+
+            // POSIX 107291-107293: "If any of the commands fail for any
+            // reason, an informational message to this effect shall be
+            // written, and no further commands specified using the -p option
+            // shall be executed for this file."  The remaining commands are
+            // kept, so the next file starts from the beginning of the list.
+            if let Err(e) = self.execute(command) {
+                self.handle_error(e);
+                break;
+            }
             if self.is_new_file {
                 if let Some(ref mut commands_str) = self.args.commands {
                     *commands_str = remainder;
@@ -3804,7 +3819,7 @@ ctrl-G                         Write a message for which the information referen
 q or
 :q or
 ZZ                             Exit more\n
-For more see: https://pubs.opengroup.org/onlinepubs/9699919799.2018edition/utilities/more.html\n";
+For more see: https://pubs.opengroup.org/onlinepubs/9799919799/utilities/more.html\n";
 
 /// Returns formated [`COMMAND_USAGE`]
 pub fn commands_usage() -> String {

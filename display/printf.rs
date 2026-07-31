@@ -77,53 +77,27 @@ enum ParsedBackslashSequence {
     Byte(u8),
 }
 
-// BusyBox: "\400" is interpreted as the ' ' character (octal 40), followed by the '0' character
-// Other implementations ignore the 8th bit, so "\400" is interpreted the same as "\000"
-fn parse_octal_sequence(
-    first_octal_digit: char,
-    peekable: &mut Peekable<Iter<'_, u8>>,
-) -> Result<u8, Box<dyn Error>> {
-    let mut st = String::with_capacity(3_usize);
+/// Parse the `\ddd` escape of POSIX 111944-111946: one, two, or three octal
+/// digits naming "a byte with the numeric value specified by the octal
+/// number".
+///
+/// Three digits can name a value above 377, which does not fit the byte the
+/// spec calls for; the low 8 bits are kept (so `\400` is `\0`, as in every
+/// implementation that does not instead stop the sequence early).
+fn parse_octal_sequence(first_octal_digit: u8, peekable: &mut Peekable<Iter<'_, u8>>) -> u8 {
+    let mut value = u16::from(first_octal_digit - b'0');
 
-    st.push(first_octal_digit);
-
-    let mut added_octal_digit_to_buffer = |pe: &mut Peekable<Iter<'_, u8>>| {
-        if let Some(&&octal_digit @ b'0'..=b'7') = pe.peek() {
-            st.push(char::from(octal_digit));
-
-            pe.next();
-
-            true
-        } else {
-            false
+    for _ in 0..2 {
+        match peekable.peek() {
+            Some(&&octal_digit @ b'0'..=b'7') => {
+                value = value * 8 + u16::from(octal_digit - b'0');
+                peekable.next();
+            }
+            _ => break,
         }
-    };
+    }
 
-    if added_octal_digit_to_buffer(peekable) {
-        added_octal_digit_to_buffer(peekable);
-    };
-
-    let from_str_radix_result = u16::from_str_radix(&st, 8_u32);
-
-    let parsed = match from_str_radix_result {
-        Ok(value) => value,
-        Err(parse_int_error) => {
-            return Err(Box::from(format!(
-                "failed to parse octal sequence '{st}' ({parse_int_error})"
-            )));
-        }
-    };
-
-    // Wrap around if greater than a byte
-    let wrapped = if parsed > 255_u16 {
-        parsed - 255_u16
-    } else {
-        parsed
-    };
-
-    let wrapped_byte = u8::try_from(wrapped)?;
-
-    Ok(wrapped_byte)
+    (value & 0xff) as u8
 }
 
 fn parse_hexadecimal_sequence(peekable: &mut Peekable<Iter<'_, u8>>) -> Result<u8, Box<dyn Error>> {
@@ -181,9 +155,9 @@ fn escaped_char(
 
     let parsed_byte = match byte_after_backslash {
         &byte @ b'0'..=b'7' => {
-            let byte = parse_octal_sequence(char::from(byte), peekable)?;
-
-            return Ok(ParsedBackslashSequence::Byte(byte));
+            return Ok(ParsedBackslashSequence::Byte(parse_octal_sequence(
+                byte, peekable,
+            )));
         }
         b'a' => b'\x07',
         b'b' => b'\x08',
@@ -1251,7 +1225,11 @@ fn format_arg(conv: &ConvSpec, arg: &[u8]) -> Result<FormatResult, Box<dyn Error
 fn do_printf(format: &[u8], arguments: &[&[u8]]) -> Result<bool, Box<dyn Error>> {
     let token_vec = tokenize_format_str(format)?;
 
-    let mut output = Vec::<u8>::with_capacity(format.len() * 2_usize);
+    // Write as we go rather than accumulating the whole result: format reuse
+    // over a long operand list would otherwise materialize every byte of
+    // output in memory before any of it reached standard output.
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
     let mut stop_output = false;
     let mut had_error = false;
 
@@ -1300,7 +1278,7 @@ fn do_printf(format: &[u8], arguments: &[&[u8]]) -> Result<bool, Box<dyn Error>>
                     };
 
                     let result = format_arg(co, arg_str)?;
-                    output.extend_from_slice(&result.bytes);
+                    output.write_all(&result.bytes)?;
 
                     if result.had_error {
                         had_error = true;
@@ -1316,7 +1294,7 @@ fn do_printf(format: &[u8], arguments: &[&[u8]]) -> Result<bool, Box<dyn Error>>
                     break;
                 }
                 Token::Literal(vec) => {
-                    output.extend_from_slice(vec.as_slice());
+                    output.write_all(vec.as_slice())?;
                 }
             }
         }
@@ -1333,7 +1311,10 @@ fn do_printf(format: &[u8], arguments: &[&[u8]]) -> Result<bool, Box<dyn Error>>
         base = consumed;
     }
 
-    io::stdout().write_all(output.as_slice())?;
+    // POSIX 112028-112030: a failed write is an error.  Standard output is
+    // line-buffered, so anything not ending in a <newline> is still in the
+    // buffer here and its write error would otherwise be lost at exit.
+    output.flush()?;
 
     Ok(had_error)
 }

@@ -8,6 +8,8 @@
 //
 
 use plib::testing::{get_binary_path, run_test, TestPlan};
+use std::fs::File;
+use std::path::Path;
 use std::process::Command;
 
 fn printf_test(args: &[&str], expected_out: &str) {
@@ -561,6 +563,17 @@ fn test_reject_double_plus_octal() {
 // Audit regressions
 // ---------------------------------------------------------------------------
 
+/// Run `printf` with the given operands and assert on the raw output bytes.
+fn printf_bytes_test(args: &[&str], expected_out: &[u8]) {
+    let output = Command::new(get_binary_path("printf"))
+        .args(args)
+        .output()
+        .expect("failed to run printf");
+
+    assert_eq!(output.stdout, expected_out, "stdout mismatch for {args:?}");
+    assert_eq!(output.status.code(), Some(0), "exit status for {args:?}");
+}
+
 /// Run `printf` with the given operands and assert on stdout and exit status.
 fn printf_status_test(args: &[&str], expected_out: &str, expected_code: i32) {
     let output = Command::new(get_binary_path("printf"))
@@ -799,6 +812,52 @@ fn test_audit_floating_point_conversions() {
     // Floating-point operands accept the same forms as the integer ones.
     printf_test(&["%.1f", "'A"], "65.0");
     printf_status_test(&["%f", "abc"], "0.000000", 1);
+}
+
+#[test]
+fn test_audit_p5_write_error_exit_status() {
+    // #P5: a failed write must be diagnosed and must not exit 0, even when
+    // the output does not end in a <newline> (the buffered case).
+    if !Path::new("/dev/full").exists() {
+        return;
+    }
+
+    for args in [&["hello\\n"][..], &["hello"][..], &["%s", "hello"][..]] {
+        let devfull = File::options()
+            .write(true)
+            .open("/dev/full")
+            .expect("failed to open /dev/full");
+
+        let output = Command::new(get_binary_path("printf"))
+            .args(args)
+            .stdout(devfull)
+            .output()
+            .expect("failed to run printf");
+
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "printf {args:?} > /dev/full should exit 1"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.starts_with("printf: "),
+            "diagnostic should be prefixed with the utility name, got {stderr:?}"
+        );
+    }
+}
+
+#[test]
+fn test_audit_p11_octal_escape_range() {
+    // #P11 / POSIX 111944-111946: \ddd names "a byte with the numeric value
+    // specified by the octal number".  Three digits can exceed a byte; the
+    // low 8 bits are kept rather than an arbitrary value being produced.
+    printf_bytes_test(&["\\400"], &[0x00]);
+    printf_bytes_test(&["\\777"], &[0xff]);
+    printf_bytes_test(&["\\101"], b"A");
+    printf_bytes_test(&["\\0"], &[0x00]);
+    printf_bytes_test(&["\\1"], &[0x01]);
+    printf_bytes_test(&["\\18"], &[0x01, b'8']);
 }
 
 #[test]

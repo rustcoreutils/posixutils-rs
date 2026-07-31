@@ -312,6 +312,11 @@ fn tokenize_format_str(format: &[u8]) -> Result<Vec<Token>, Box<dyn Error>> {
                 }
                 ParseState::Precision => {
                     if current_byte == b'.' {
+                        // XBD 3562-3563: "The precision shall take the form of
+                        // a <period> ('.') followed by a decimal digit string;
+                        // a null digit string is treated as zero."  Commit to
+                        // zero now; any digits that follow overwrite it.
+                        conv_spec.precision = Some(0);
                         state = ParseState::PrecisionValue;
 
                         done_with_char = true;
@@ -389,28 +394,22 @@ fn format_integer(
 ) -> Vec<u8> {
     let abs_value = magnitude;
 
-    // Convert to string in the appropriate base
-    let digits: String = match base {
-        8 => format!("{abs_value:o}"),
-        16 if upper => format!("{abs_value:X}"),
-        16 => format!("{abs_value:x}"),
-        _ => abs_value.to_string(),
-    };
-
-    // Alternate form prefix (#)
-    let prefix = if conv.alt_form && abs_value != 0 {
-        match base {
-            8 => "0",
-            16 if upper => "0X",
-            16 => "0x",
-            _ => "",
-        }
+    // Convert to string in the appropriate base.  XBD 3615-3616: "The result
+    // of converting a zero value with a precision of 0 shall be no
+    // characters."
+    let digits: String = if abs_value == 0 && conv.precision == Some(0) {
+        String::new()
     } else {
-        ""
+        match base {
+            8 => format!("{abs_value:o}"),
+            16 if upper => format!("{abs_value:X}"),
+            16 => format!("{abs_value:x}"),
+            _ => abs_value.to_string(),
+        }
     };
 
     // Apply precision (minimum digits, zero-padded)
-    let digits_with_precision = if let Some(prec) = conv.precision {
+    let mut digits_with_precision = if let Some(prec) = conv.precision {
         if digits.len() < prec {
             format!("{:0>width$}", digits, width = prec)
         } else {
@@ -418,6 +417,24 @@ fn format_integer(
         }
     } else {
         digits
+    };
+
+    // XBD 3574-3575: for the o conversion, '#' "shall increase the precision
+    // to force the first digit of the result to be a zero" — it is not a
+    // prefix, so it must not add a zero to a result that already has one.
+    if base == 8 && conv.alt_form && !digits_with_precision.starts_with('0') {
+        digits_with_precision.insert(0, '0');
+    }
+
+    // Alternate form prefix (# on x and X only; see above for o)
+    let prefix = if conv.alt_form && abs_value != 0 {
+        match base {
+            16 if upper => "0X",
+            16 => "0x",
+            _ => "",
+        }
+    } else {
+        ""
     };
 
     // Calculate total content length
@@ -655,63 +672,111 @@ fn format_general(value: f64, precision: usize, upper: bool, alt_form: bool) -> 
     }
 }
 
-/// Format a floating point number in hexadecimal format (%a/%A)
-fn format_hex_float(value: f64, precision: usize, upper: bool) -> String {
-    if value.is_nan() {
-        return if upper {
-            "NAN".to_string()
-        } else {
-            "nan".to_string()
+/// Render an infinity or a NaN in the style XBD 3627-3632 prescribes: the
+/// lowercase conversions produce "inf"/"nan", the uppercase ones "INF"/"NAN".
+fn format_nonfinite(value: f64, upper: bool) -> Option<String> {
+    if !value.is_finite() {
+        let text = match (value.is_nan(), upper) {
+            (true, false) => "nan",
+            (true, true) => "NAN",
+            (false, false) => "inf",
+            (false, true) => "INF",
         };
+        return Some(text.to_string());
     }
-    if value.is_infinite() {
-        return if upper {
-            "INF".to_string()
-        } else {
-            "inf".to_string()
-        };
+    None
+}
+
+/// Format a floating point number in decimal notation (%f/%F)
+fn format_fixed(value: f64, precision: usize, upper: bool) -> String {
+    if let Some(text) = format_nonfinite(value, upper) {
+        return text;
     }
-    if value == 0.0 {
-        let zeros = if precision > 0 {
-            format!(".{:0<width$}", "", width = precision)
-        } else {
-            String::new()
-        };
-        return if upper {
-            format!("0X0{}P+0", zeros)
-        } else {
-            format!("0x0{}p+0", zeros)
-        };
+
+    format!("{:.prec$}", value, prec = precision)
+}
+
+/// Format a floating point number in hexadecimal format (%a/%A).
+///
+/// `precision` is `None` when the format omitted it, which per XBD 3594-3598
+/// means "sufficient for an exact representation of the value" — for a binary
+/// FLT_RADIX that is the mantissa with its trailing zeros removed.
+fn format_hex_float(value: f64, precision: Option<usize>, upper: bool) -> String {
+    if let Some(text) = format_nonfinite(value, upper) {
+        return text;
     }
+
+    const MANTISSA_DIGITS: usize = 13;
 
     let bits = value.to_bits();
     let exp_bits = ((bits >> 52) & 0x7FF) as i32;
-    let mantissa = bits & 0xFFFFFFFFFFFFF;
+    let mut mantissa = bits & 0xF_FFFF_FFFF_FFFF;
 
-    let (exponent, leading_digit) = if exp_bits == 0 {
+    let (exponent, mut leading_digit) = if value == 0.0 {
+        (0, 0_u64)
+    } else if exp_bits == 0 {
         // Denormalized
-        (-1022, 0)
+        (-1022, 0_u64)
     } else {
-        (exp_bits - 1023, 1)
+        (exp_bits - 1023, 1_u64)
     };
 
-    // Format mantissa as hex
-    let mantissa_hex = format!("{:013x}", mantissa);
-    let trimmed = mantissa_hex.trim_end_matches('0');
-    let frac_part = if trimmed.is_empty() {
-        if precision > 0 {
-            format!(".{:0<width$}", "", width = precision)
+    // An explicit precision shorter than the mantissa rounds (half-to-even),
+    // rather than truncating, so the printed value is the nearest one
+    // representable in the requested number of hexadecimal digits.
+    if let Some(prec) = precision.filter(|&p| p < MANTISSA_DIGITS) {
+        let shift = 4 * (MANTISSA_DIGITS - prec) as u32;
+        let kept = mantissa >> shift;
+        let rest = mantissa & ((1_u64 << shift) - 1);
+        let half = 1_u64 << (shift - 1);
+
+        let rounded = if rest > half || (rest == half && kept & 1 == 1) {
+            kept + 1
         } else {
-            String::new()
+            kept
+        };
+
+        if rounded >> (4 * prec as u32) != 0 {
+            // Carry out of the fraction bumps the digit before the point.
+            leading_digit += 1;
+            mantissa = 0;
+        } else {
+            mantissa = rounded << shift;
         }
-    } else if precision > 0 {
-        format!(
-            ".{:0<width$}",
-            &mantissa_hex[..precision.min(13)],
-            width = precision
-        )
+    }
+
+    // XBD 3600-3601: "The letters "abcdef" shall be used for a conversion and
+    // the letters "ABCDEF" for A conversion."
+    let mantissa_hex = if upper {
+        format!("{mantissa:013X}")
     } else {
-        format!(".{}", trimmed)
+        format!("{mantissa:013x}")
+    };
+    let frac_part = match precision {
+        // XBD 3594-3598: with the precision missing and a binary FLT_RADIX,
+        // it "shall be sufficient for an exact representation of the value",
+        // and trailing zeros may be omitted.
+        None => {
+            let trimmed = mantissa_hex.trim_end_matches('0');
+            if trimmed.is_empty() {
+                String::new()
+            } else {
+                format!(".{trimmed}")
+            }
+        }
+        // XBD 3599: with a precision of zero and no '#' flag, no
+        // decimal-point character appears.
+        Some(0) => String::new(),
+        Some(prec) => {
+            let mut digits = mantissa_hex
+                .chars()
+                .take(prec.min(MANTISSA_DIGITS))
+                .collect::<String>();
+            while digits.len() < prec {
+                digits.push('0');
+            }
+            format!(".{digits}")
+        }
     };
 
     let exp_sign = if exponent >= 0 { '+' } else { '-' };
@@ -734,24 +799,14 @@ fn format_float(conv: &ConvSpec, value: f64) -> Vec<u8> {
 
     // Format the number according to specifier
     let formatted = match conv.spec {
-        'f' | 'F' => {
-            if conv.spec == 'F' && (abs_value.is_infinite() || abs_value.is_nan()) {
-                if abs_value.is_infinite() {
-                    "INF".to_string()
-                } else {
-                    "NAN".to_string()
-                }
-            } else {
-                format!("{:.prec$}", abs_value, prec = precision)
-            }
-        }
+        'F' => format_fixed(abs_value, precision, true),
         'e' => format_scientific(abs_value, precision, false),
         'E' => format_scientific(abs_value, precision, true),
         'g' => format_general(abs_value, precision, false, conv.alt_form),
         'G' => format_general(abs_value, precision, true, conv.alt_form),
-        'a' => format_hex_float(abs_value, precision, false),
-        'A' => format_hex_float(abs_value, precision, true),
-        _ => format!("{:.prec$}", abs_value, prec = precision),
+        'a' => format_hex_float(abs_value, conv.precision, false),
+        'A' => format_hex_float(abs_value, conv.precision, true),
+        _ => format_fixed(abs_value, precision, false),
     };
 
     // Determine sign
@@ -777,13 +832,17 @@ fn format_float(conv: &ConvSpec, value: f64) -> Vec<u8> {
     if width > content_len {
         let padding = width - content_len;
 
+        // XBD 3580-3582: the '0' flag pads with leading zeros "except when
+        // converting an infinity or NaN".
+        let zero_pad = conv.zero_pad && abs_value.is_finite();
+
         if conv.left_justify {
             if let Some(s) = sign_char {
                 output.push(s as u8);
             }
             output.extend_from_slice(formatted.as_bytes());
             output.resize(output.len() + padding, b' ');
-        } else if conv.zero_pad {
+        } else if zero_pad {
             if let Some(s) = sign_char {
                 output.push(s as u8);
             }

@@ -677,6 +677,131 @@ fn test_audit_unnumbered_conversions_unchanged() {
 }
 
 #[test]
+fn test_audit_p4_empty_precision_is_zero() {
+    // #P4 / XBD 3562-3563: "The precision shall take the form of a <period>
+    // ('.') followed by a decimal digit string; a null digit string is
+    // treated as zero."
+    printf_test(&["%.f", "10"], "10");
+    printf_test(&["%.f", "2.7"], "3");
+    printf_test(&["%.s", "abc"], "");
+    printf_test(&["%.b", "abc"], "");
+    printf_test(&["%.e", "1234"], "1e+03");
+    printf_test(&["%.d", "5"], "5");
+    printf_test(&["%.5d", "5"], "00005");
+}
+
+#[test]
+fn test_audit_p7_zero_value_precision_zero() {
+    // #P7 / XBD 3615-3616: "The result of converting a zero value with a
+    // precision of 0 shall be no characters."
+    printf_test(&["%.0d", "0"], "");
+    printf_test(&["%.0i", "0"], "");
+    printf_test(&["%.0o", "0"], "");
+    printf_test(&["%.0u", "0"], "");
+    printf_test(&["%.0x", "0"], "");
+    printf_test(&["%.0X", "0"], "");
+    // Non-zero values are unaffected, and the field width still applies.
+    printf_test(&["%.0d", "5"], "5");
+    printf_test(&["%3.0d|", "0"], "   |");
+    // '#' still forces a leading zero for the o conversion (XBD 3574-3575).
+    printf_test(&["%#.0o", "0"], "0");
+}
+
+#[test]
+fn test_audit_p8_zero_flag_ignored_for_nonfinite() {
+    // #P8 / XBD 3580-3582: the '0' flag pads with leading zeros "except when
+    // converting an infinity or NaN".
+    printf_test(&["%08f", "inf"], "     inf");
+    printf_test(&["%08f", "nan"], "     nan");
+    printf_test(&["%08.2f", "inf"], "     inf");
+    printf_test(&["%08e", "inf"], "     inf");
+    printf_test(&["%08f", "-inf"], "    -inf");
+    // Finite values still zero-pad.
+    printf_test(&["%08.2f", "1.5"], "00001.50");
+}
+
+#[test]
+fn test_audit_p9_nonfinite_styles() {
+    // #P9 / XBD 3627-3632: f produces "inf"/"nan", F produces "INF"/"NAN".
+    printf_test(&["%f", "nan"], "nan");
+    printf_test(&["%F", "nan"], "NAN");
+    printf_test(&["%f", "inf"], "inf");
+    printf_test(&["%F", "inf"], "INF");
+    printf_test(&["%f", "-inf"], "-inf");
+    printf_test(&["%e", "nan"], "nan");
+    printf_test(&["%E", "nan"], "NAN");
+    printf_test(&["%g", "inf"], "inf");
+    printf_test(&["%G", "inf"], "INF");
+    printf_test(&["%a", "nan"], "nan");
+    printf_test(&["%A", "inf"], "INF");
+}
+
+#[test]
+fn test_audit_p10_alt_form_octal() {
+    // #P10 / XBD 3574-3575: '#' "shall increase the precision to force the
+    // first digit of the result to be a zero" -- it is not a prefix, so it
+    // must not add a zero to a result that already has one.
+    printf_test(&["%#o", "8"], "010");
+    printf_test(&["%#.1o", "8"], "010");
+    printf_test(&["%#.3o", "8"], "010");
+    printf_test(&["%#.5o", "8"], "00010");
+    printf_test(&["%#o", "0"], "0");
+    // x/X keep their 0x/0X prefix.
+    printf_test(&["%#x", "255"], "0xff");
+    printf_test(&["%#X", "255"], "0XFF");
+    printf_test(&["%#x", "0"], "0");
+}
+
+#[test]
+fn test_audit_p14_hex_float_precision() {
+    // #P14 / XBD 3594-3598: with the precision missing, it "shall be
+    // sufficient for an exact representation of the value" -- not the
+    // default of 6 used by the other floating-point conversions.
+    printf_test(&["%a", "1"], "0x1p+0");
+    printf_test(&["%a", "0.5"], "0x1p-1");
+    printf_test(&["%a", "3.5"], "0x1.cp+1");
+    printf_test(&["%a", "255"], "0x1.fep+7");
+    printf_test(&["%a", "0"], "0x0p+0");
+    // XBD 3600-3602: A uses "ABCDEF" for the digits and X/P instead of x/p.
+    printf_test(&["%A", "3.5"], "0X1.CP+1");
+    // An explicit precision rounds rather than truncating: 3.5 is 0x1.c,
+    // so one fewer digit rounds up and carries into the leading digit.
+    printf_test(&["%.0a", "3.5"], "0x2p+1");
+    printf_test(&["%.2a", "3.5"], "0x1.c0p+1");
+    printf_test(&["%.13a", "3.5"], "0x1.c000000000000p+1");
+}
+
+#[test]
+fn test_audit_floating_point_conversions() {
+    // The floating-point engine had no test coverage at all; these pin the
+    // behavior verified against GNU coreutils printf.
+    printf_test(&["%f", "1.5"], "1.500000");
+    printf_test(&["%f", "0.1"], "0.100000");
+    printf_test(&["%.2f", "3.14159"], "3.14");
+    printf_test(&["%.0f", "2.5"], "2"); // round-half-even
+    printf_test(&["%.0f", "3.5"], "4");
+    printf_test(&["%e", "1234.5678"], "1.234568e+03");
+    printf_test(&["%E", "1234.5678"], "1.234568E+03");
+    printf_test(&["%e", "1e100"], "1.000000e+100"); // exponent grows past 2 digits
+    printf_test(&["%e", "1e5"], "1.000000e+05"); // exponent is at least 2 digits
+    printf_test(&["%g", "100"], "100");
+    printf_test(&["%g", "0.0001"], "0.0001");
+    printf_test(&["%g", "0.00001"], "1e-05");
+    printf_test(&["%g", "1000000"], "1e+06");
+    printf_test(&["%g", "123456789"], "1.23457e+08");
+    printf_test(&["%#g", "100"], "100.000"); // # keeps trailing zeros
+    printf_test(&["%.0g", "100"], "1e+02");
+    printf_test(&["%+f", "1.5"], "+1.500000");
+    printf_test(&["% f", "1.5"], " 1.500000");
+    printf_test(&["%-10.2f|", "1.5"], "1.50      |");
+    printf_test(&["%10.2f|", "1.5"], "      1.50|");
+    printf_test(&["%f", "-0.5"], "-0.500000");
+    // Floating-point operands accept the same forms as the integer ones.
+    printf_test(&["%.1f", "'A"], "65.0");
+    printf_status_test(&["%f", "abc"], "0.000000", 1);
+}
+
+#[test]
 fn test_audit_integer_operand_forms_unchanged() {
     // Guard the operand grammar the parser rewrite touched (112013-112018).
     printf_test(&["%d", "10"], "10");

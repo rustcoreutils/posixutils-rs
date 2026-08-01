@@ -699,12 +699,26 @@ fn cflow_analyzes_object_files() {
     let (stdout, stderr, code) = run("cflow", &[obj.to_str().unwrap()]);
     assert_eq!(code, 0, "{}", stderr);
 
-    // The call graph is recovered from relocations.
+    // The call graph is recovered from relocations. Note the symbols are named
+    // exactly as in the C source: Mach-O's leading underscore is an ABI
+    // artifact and must not reach the listing (nor be mistaken for a C name
+    // beginning with an underscore, which -i _ governs).
     assert!(
         stdout.contains("top:") && stdout.contains("middle:") && stdout.contains("leaf:"),
         "expected all three symbols: {:?}",
         stdout
     );
+
+    // Assembler-local labels are not program symbols. pcc emits `.L…` on ELF
+    // and the Mach-O assembler adds `ltmp…`/`L…`; neither belongs in a flowgraph.
+    for line in stdout.lines() {
+        let name = line.split_whitespace().nth(1).unwrap_or("");
+        assert!(
+            !name.starts_with(".L") && !name.starts_with("ltmp"),
+            "assembler-local label leaked into the graph: {:?}",
+            line
+        );
+    }
     // "...indicate the filename and location counter under which the symbol
     // appeared (for example, text)."
     assert!(

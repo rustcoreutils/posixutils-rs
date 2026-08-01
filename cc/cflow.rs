@@ -766,10 +766,32 @@ fn location_counter(section: &str) -> String {
 /// a relocation at offset X of a text section is attributed to the function
 /// symbol with the greatest address <= X in that section.
 fn process_object_file(path: &str, graph: &mut CallGraph, buffer: &[u8]) -> io::Result<()> {
-    use object::{Object, ObjectSection, ObjectSymbol, RelocationTarget, SymbolKind};
+    use object::{BinaryFormat, Object, ObjectSection, ObjectSymbol, RelocationTarget, SymbolKind};
 
     let obj = object::File::parse(buffer)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+
+    // Mach-O prefixes every C symbol with an underscore, so the object-level
+    // spelling of `main` is `_main`. Two things follow:
+    //
+    //   * that prefix is an ABI artifact, not part of the C name, so it must be
+    //     stripped before the name is matched, displayed, or run past the -i _
+    //     filter (which is about C names that begin with an underscore -- without
+    //     this, every function on macOS would be filtered out by default); and
+    //   * a Mach-O symbol *without* the prefix is therefore an assembler-local
+    //     label (`ltmp0`, `L_.str`), not a program symbol.
+    //
+    // ELF has no such prefix; its assembler-local labels are spelled `.L…`.
+    let macho = obj.format() == BinaryFormat::MachO;
+    let program_name = |raw: &str| -> Option<String> {
+        if macho {
+            raw.strip_prefix('_').map(String::from)
+        } else if raw.starts_with(".L") {
+            None
+        } else {
+            Some(raw.to_string())
+        }
+    };
 
     // Defined symbols, grouped by section, sorted by address so a relocation
     // offset can be attributed to its enclosing function.
@@ -777,10 +799,14 @@ fn process_object_file(path: &str, graph: &mut CallGraph, buffer: &[u8]) -> io::
     let mut defined: Vec<(String, NodeKind, String)> = Vec::new();
 
     for sym in obj.symbols() {
-        let Ok(name) = sym.name() else { continue };
-        if name.is_empty() || !sym.is_definition() {
+        let Ok(raw) = sym.name() else { continue };
+        if raw.is_empty() || !sym.is_definition() {
             continue;
         }
+        let Some(name) = program_name(raw) else {
+            continue;
+        };
+        let name = name.as_str();
         let Some(sec_idx) = sym.section_index() else {
             continue;
         };
@@ -824,7 +850,10 @@ fn process_object_file(path: &str, graph: &mut CallGraph, buffer: &[u8]) -> io::
             let Ok(target) = obj.symbol_by_index(sym_idx) else {
                 continue;
             };
-            let Ok(target_name) = target.name() else {
+            let Ok(target_raw) = target.name() else {
+                continue;
+            };
+            let Some(target_name) = program_name(target_raw) else {
                 continue;
             };
             if target_name.is_empty() {
@@ -835,12 +864,12 @@ fn process_object_file(path: &str, graph: &mut CallGraph, buffer: &[u8]) -> io::
             let Some((_, caller)) = syms.iter().rev().find(|(addr, _)| *addr <= site) else {
                 continue;
             };
-            if caller == target_name {
+            if *caller == target_name {
                 continue;
             }
             let entry = calls.entry(caller.clone()).or_default();
-            if !entry.contains(&target_name.to_string()) {
-                entry.push(target_name.to_string());
+            if !entry.contains(&target_name) {
+                entry.push(target_name);
             }
         }
     }

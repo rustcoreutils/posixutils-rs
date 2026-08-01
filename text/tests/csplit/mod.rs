@@ -500,3 +500,48 @@ fn test_csplit_signal_keeps_created_files_with_k() {
         "-k must retain created files when interrupted (POSIX ASYNCHRONOUS EVENTS)"
     );
 }
+
+// ============================================================================
+// Regression coverage for behaviours the audit listed as untested
+// ============================================================================
+
+/// Audit #1/#2: multiple bare `line_no` operands are absolute positions, and a
+/// bare line number fires exactly once. Verified against GNU coreutils 9.4.
+#[test]
+fn test_csplit_multiple_bare_line_numbers() {
+    csplit_test(
+        &["-f", "multiln", "-", "5", "10"],
+        "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\nl11\nl12\n",
+        "12\n15\n12\n",
+    );
+    for i in 0..3 {
+        std::fs::remove_file(format!("multiln0{}", i)).unwrap();
+    }
+}
+
+/// Audit #6: `\/` inside a `/rexp/` operand is a literal delimiter, not the end
+/// of the pattern (POSIX OPERANDS: "The application shall use the sequence
+/// \"\\/\" to specify a <slash> character within the rexp").
+#[test]
+fn test_csplit_escaped_delimiter_in_rexp() {
+    csplit_test(
+        &["-f", "escdel", "-", r"/proc\/sys/"],
+        "aa\nproc/sys\nbb\n",
+        "3\n12\n",
+    );
+    std::fs::remove_file("escdel00").unwrap();
+    std::fs::remove_file("escdel01").unwrap();
+}
+
+/// Audit #3: the byte count printed for each file must equal the bytes actually
+/// written, i.e. what `wc -c` would report.
+#[test]
+fn test_csplit_byte_counts_match_file_sizes() {
+    csplit_test(&["-f", "bytecnt", "-", "3"], "aa\nbb\ncc\ndd\n", "6\n6\n");
+
+    for name in ["bytecnt00", "bytecnt01"] {
+        let len = std::fs::metadata(name).unwrap().len();
+        assert_eq!(len, 6, "{} should be 6 bytes on disk", name);
+        std::fs::remove_file(name).unwrap();
+    }
+}

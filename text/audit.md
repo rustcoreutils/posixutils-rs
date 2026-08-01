@@ -249,7 +249,7 @@ Not covered:
 
 ## `csplit`
 
-> **STATUS — Remediated; remains at Stage 3.** All Critical/Major split-correctness findings are fixed and output is byte-for-byte GNU-correct, but two items stay open: `#4` (a SIGINT created-file-cleanup handler) and `#8` (erroring when an operand references a line past EOF — only the exit status differs from GNU). Promote once those land.
+> **STATUS — Resolved; promoted to Stage 6 (2026-08-01).** `#4` (signal cleanup of created files) and `#8` (out-of-range operand is an error) have landed, closing every finding. Differential-tested against GNU coreutils 9.4: exit status and surviving file count match on plain splits, `{N}` overshoot, both `{*}` kinds, and a never-matching regex.
 
 **Implementation:** `text/csplit.rs` (1201 lines incl. inline tests)
 **Tests:** `text/tests/csplit/mod.rs` (323 lines)
@@ -271,14 +271,14 @@ Largely functional and handles the core splitting modes. Three correctness defec
 
 #### Major
 
-- [ ] **#4 — ASYNCHRONOUS EVENTS: no signal handler for created-file cleanup.** `text/csplit.rs:626-635`. REMAINING (Phase 9): the on-error cleanup is correct; a SIGINT/SIGTERM handler mirroring it is still to be added.
+- [x] **#4 — ASYNCHRONOUS EVENTS: no signal handler for created-file cleanup.** `text/csplit.rs:626-635`. REMAINING (Phase 9): the on-error cleanup is correct; a SIGINT/SIGTERM handler mirroring it is still to be added. **✓ fixed** — async-signal-safe handler rebuilds each created name from prefix+width+index and `unlink`s it, then restores `SIG_DFL` and re-raises so "the default action occurs"; not installed under `-k`.
 
 #### Minor
 
 - [x] **#5 — `{*}` decrements `usize::MAX`, panics in debug builds.** FIXED (Phase 9): the repeat is only decremented when it is non-zero (the final fire removes the operand instead), so `Repeat(usize::MAX)` never underflows; `{*}` is verified working.
 - [x] **#6 — Escaped delimiter not translated into the BRE.** FIXED (Phase 9): `parse_op_rx` translates `\<delim>` to a literal delimiter before compiling, so `/proc\/sys/` matches `proc/sys`.
 - [x] **#7 — Hardcoded `NAME_MAX = 255`.** ACCEPTED: 255 is the POSIX `_POSIX_NAME_MAX`-era value used on Linux/macOS/BSD; the guard is conservative and portable. (A `pathconf` query is a possible refinement.)
-- [ ] **#8 — No error when an operand references a line past EOF.** `text/csplit.rs:541`. REMAINING (Phase 9): a `line_no` (or `{N}`/`{*}` repeat) that targets a line past EOF should error (GNU: "line number out of range"); the file output is byte-for-byte correct, but the exit status stays 0 instead of non-zero. Deferred.
+- [x] **#8 — No error when an operand references a line past EOF.** `text/csplit.rs:541`. REMAINING (Phase 9): a `line_no` (or `{N}`/`{*}` repeat) that targets a line past EOF should error (GNU: "line number out of range"); the file output is byte-for-byte correct, but the exit status stays 0 instead of non-zero. Deferred. **✓ fixed** — a non-empty operand queue at EOF is the error condition; `{*}` follows GNU (error for a line number, success for a pattern).
 
 ### Detailed conformance matrix
 
@@ -323,7 +323,7 @@ Largely functional and handles the core splitting modes. Three correctness defec
 
 #### ASYNCHRONOUS EVENTS
 
-- [ ] **`-k`/default signal cleanup MISSING** — no signal handler (#4).
+- [x] **`-k`/default signal cleanup** — ✓ fixed (#4).
 
 #### STDOUT / STDERR
 
@@ -365,13 +365,13 @@ BRE entirely via libc `regcomp`/`regexec` (correct §9.3). The escape-stripping 
 ### Test coverage signal
 
 Not covered:
-- [ ] Multiple `line_no` operands without `{num}` (exposes #1/#2)
-- [ ] `\/` / `\%` escape inside rexp (#6)
-- [ ] Pattern not found before EOF → error (#8)
-- [ ] Signal/interrupt with and without `-k` (#4)
-- [ ] `{*}` in a debug build (#5)
-- [ ] Byte-count output matches `wc -c` (#3)
-- [ ] stdin (`-`) with regex operands
+- [x] Multiple `line_no` operands without `{num}` — `test_csplit_multiple_bare_line_numbers`
+- [x] `\/` / `\%` escape inside rexp — `test_csplit_escaped_delimiter_in_rexp`
+- [x] Pattern not found before EOF → error — `test_csplit_removes_files_on_range_error`, `test_csplit_keep_files_on_error`
+- [x] Signal/interrupt with and without `-k` — `test_csplit_signal_{removes,keeps}_created_files*`
+- [x] `{*}` semantics for both operand kinds — `test_csplit_star_repeat_semantics`
+- [x] Byte-count output matches `wc -c` — `test_csplit_byte_counts_match_file_sizes`
+- [x] stdin (`-`) with regex operands — `test_csplit_star_repeat_semantics`
 
 ### Suggested PR groupings
 

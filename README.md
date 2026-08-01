@@ -67,6 +67,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] compress (compress cat.)
  - [x] cp
  - [x] crontab (cron cat.)
+ - [x] csplit
  - [x] ctags (Development)
  - [x] cut
  - [x] cxref (Development)
@@ -194,7 +195,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
 ## Stage 3 - Test coverage
 
  - [x] c99 (Development)
- - [x] csplit
  - [x] localedef (i18n)
  - [x] talk (with talkd local daemon)
  - [x] tr

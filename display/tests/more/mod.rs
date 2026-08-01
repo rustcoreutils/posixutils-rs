@@ -1475,3 +1475,28 @@ fn test_pty_prompt_reports_percentage() {
 
     assert_eq!(session.quit(), Some(0));
 }
+
+#[test]
+fn test_filter_mode_squeezes_blank_lines() {
+    // POSIX 107650: "When the standard output is not a terminal, only the -s
+    // filter-modification option is effective." It previously had no effect
+    // there at all.
+    run_test_more(&["-s"], "a\n\n\n\nb\n\n\nc\n", "a\n\nb\n\nc\n", "", 0);
+    // Without -s the input is reproduced exactly.
+    run_test_more(&[], "a\n\n\n\nb\n\n\nc\n", "a\n\n\n\nb\n\n\nc\n", "", 0);
+}
+
+#[test]
+fn test_filter_mode_is_byte_exact() {
+    // 107253: when standard output is not a terminal more filters its input
+    // to standard output. That is a byte copy -- non-UTF-8 input used to fail
+    // with "Couldn't parse", because the filter path decoded every line.
+    let path = render_fixture("binary.txt", b"a\xff\xfeb\nsecond\n");
+    let output = std::process::Command::new(plib::testing::get_binary_path("more"))
+        .arg(&path)
+        .output()
+        .expect("failed to run more");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"a\xff\xfeb\nsecond\n".to_vec());
+}

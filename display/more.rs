@@ -23,7 +23,7 @@ use std::process::{exit, ExitStatus};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use termion::{clear::*, cursor::*, event::*, input::*, screen::*, style::*, *};
 
@@ -445,6 +445,140 @@ trait SeekRead: Seek + Read {}
 impl<T: Seek + Read> SeekRead for Box<T> {}
 impl SeekRead for File {}
 impl SeekRead for Cursor<String> {}
+impl SeekRead for SpillReader {}
+
+/// Backing store that makes a non-seekable input seekable.
+///
+/// `more` must be able to seek: it shows a screenful at a time and lets the
+/// user move back.  Holding the whole input in memory would cap the input size
+/// at available RAM, which for a pager fed by a pipe is the wrong bound
+/// entirely.  Instead, bytes are appended to an unlinked temporary file as
+/// they are read, and seeks are served from that file, so only the portion the
+/// user has actually reached is ever stored.
+struct Spill {
+    /// Upstream reader; `None` once it has reported end-of-file.
+    upstream: Option<Box<dyn Read + Send>>,
+    /// Everything read so far.  `tempfile()` unlinks on creation, so the file
+    /// cannot outlive the process on any exit path, including a signal.
+    file: File,
+    /// Bytes pulled from `upstream` and written to `file`.
+    written: u64,
+}
+
+impl Spill {
+    fn new(upstream: Box<dyn Read + Send>) -> std::io::Result<Self> {
+        Ok(Self {
+            upstream: Some(upstream),
+            file: tempfile::tempfile()?,
+            written: 0,
+        })
+    }
+
+    /// Total size, known only once upstream has been drained.
+    fn total(&self) -> Option<u64> {
+        self.upstream.is_none().then_some(self.written)
+    }
+
+    /// Pull from upstream until `target` bytes are stored, or EOF.
+    fn fill_to(&mut self, target: u64) -> std::io::Result<()> {
+        let mut chunk = [0u8; 8192];
+        while self.written < target {
+            let Some(upstream) = self.upstream.as_mut() else {
+                break;
+            };
+            let n = upstream.read(&mut chunk)?;
+            if n == 0 {
+                self.upstream = None;
+                break;
+            }
+            self.file.seek(SeekFrom::Start(self.written))?;
+            self.file.write_all(&chunk[..n])?;
+            self.written += n as u64;
+        }
+        Ok(())
+    }
+
+    /// Read at an absolute offset, pulling more input first if needed.
+    /// A short read of 0 therefore means genuine end-of-input.
+    fn read_at(&mut self, pos: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.fill_to(pos.saturating_add(buf.len() as u64))?;
+        if pos >= self.written {
+            return Ok(0);
+        }
+        let n = buf.len().min((self.written - pos) as usize);
+        self.file.seek(SeekFrom::Start(pos))?;
+        self.file.read_exact(&mut buf[..n])?;
+        Ok(n)
+    }
+}
+
+/// A [`Spill`] shared by every cursor over the same input.
+#[derive(Clone)]
+struct SharedSpill(Arc<Mutex<Spill>>);
+
+impl std::fmt::Debug for SharedSpill {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SharedSpill")
+    }
+}
+
+impl SharedSpill {
+    fn new(upstream: Box<dyn Read + Send>) -> std::io::Result<Self> {
+        Ok(Self(Arc::new(Mutex::new(Spill::new(upstream)?))))
+    }
+
+    fn total(&self) -> Option<u64> {
+        self.0.lock().ok()?.total()
+    }
+
+    fn reader(&self) -> SpillReader {
+        SpillReader {
+            spill: self.clone(),
+            pos: 0,
+        }
+    }
+}
+
+/// An independent seekable cursor over a [`SharedSpill`].
+struct SpillReader {
+    spill: SharedSpill,
+    pos: u64,
+}
+
+impl Read for SpillReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut spill = self
+            .spill
+            .0
+            .lock()
+            .map_err(|_| std::io::Error::other("spill lock poisoned"))?;
+        let n = spill.read_at(self.pos, buf)?;
+        drop(spill);
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for SpillReader {
+    fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+        self.pos = match from {
+            SeekFrom::Start(n) => n,
+            SeekFrom::Current(delta) => self.pos.saturating_add_signed(delta),
+            SeekFrom::End(delta) => {
+                // Locating the end is the one operation that must drain the
+                // input; it only happens because the user asked to go there.
+                let mut spill = self
+                    .spill
+                    .0
+                    .lock()
+                    .map_err(|_| std::io::Error::other("spill lock poisoned"))?;
+                spill.fill_to(u64::MAX)?;
+                spill.written.saturating_add_signed(delta)
+            }
+        };
+        Ok(self.pos)
+    }
+}
 
 /// Universal cursor that can read lines, seek
 /// over any [`SeekRead`] source
@@ -496,6 +630,9 @@ impl SeekPositions {
                 let total = Some(buffer.get_ref().len() as u64);
                 (Box::new(buffer), total)
             }
+            // Size is unknown until the input has been drained, which more
+            // must not do just to start displaying.
+            Source::Stream(spill) => (Box::new(spill.reader()), None),
         };
 
         Ok(Self {
@@ -575,6 +712,18 @@ impl SeekPositions {
         }
     }
 
+    /// Total size of the source, if that is knowable.
+    ///
+    /// A file or an in-memory buffer knows it up front; a stream only learns
+    /// it once its input has been drained, so it is queried rather than
+    /// cached.
+    fn total_bytes(&self) -> Option<u64> {
+        match &self.source {
+            Source::Stream(spill) => spill.total(),
+            _ => self.total_bytes,
+        }
+    }
+
     /// Percentage of the source preceding the current position, when the
     /// total size is known.
     ///
@@ -583,7 +732,7 @@ impl SeekPositions {
     /// input.  Measuring in *bytes* rather than lines is what keeps this O(1):
     /// a total line count cannot be had without reading the whole source.
     fn percent(&self) -> Option<u8> {
-        let total = self.total_bytes?;
+        let total = self.total_bytes()?;
         if total == 0 {
             return None;
         }
@@ -605,7 +754,7 @@ impl SeekPositions {
         let err = Err(MoreError::SeekPositions(SeekPositionsError::OutOfRange(
             position,
         )));
-        if self.total_bytes.is_some_and(|total| position > total) {
+        if self.total_bytes().is_some_and(|total| position > total) {
             return err;
         }
         loop {
@@ -903,11 +1052,12 @@ impl Iterator for SeekPositions {
             return None;
         }
         let line_len = self.find_next_line_len_with_skip();
-        let Ok(stream_position) = self.buffer.stream_position() else {
-            return None;
-        };
         let next_position = current_position + line_len as u64;
-        if self.is_ended || next_position >= stream_position {
+        // `is_ended` is set when the reader actually reported end-of-input.
+        // The total is consulted only when it is known; a stream's is not,
+        // and the buffered reader's position is a read-ahead point rather
+        // than the end of the source, so it cannot stand in for one.
+        if self.is_ended || self.total_bytes().is_some_and(|t| next_position >= t) {
             let _ = self.buffer.seek(SeekFrom::Start(current_position));
             None
         } else {
@@ -938,6 +1088,10 @@ enum Source {
     File(PathBuf),
     /// [`Cursor`] on [`String`] that can be used for seek and read with [`SeekPositions`]
     Buffer(Cursor<String>),
+    /// A non-seekable input (standard input) made seekable by spilling what
+    /// has been read to a temporary file.  Shared, so that every cursor over
+    /// the same input reads the same bytes exactly once.
+    Stream(SharedSpill),
 }
 
 impl Source {
@@ -945,6 +1099,7 @@ impl Source {
     fn name(&mut self) -> String {
         match self {
             Source::File(path) => path.to_str().unwrap_or("<file>").to_owned(),
+            Source::Stream(_) => "-".to_owned(),
             Source::Buffer(cursor) => {
                 let current_pos = cursor.stream_position().unwrap_or(0);
                 let _ = cursor.seek(SeekFrom::Start(0));
@@ -2205,12 +2360,13 @@ struct MoreControl {
     /// status without aborting the session (POSIX CONSEQUENCES OF ERRORS,
     /// 107643-107646: the `:n` and `:p` commands).
     had_error: bool,
-    /// Buffered stdin content (slurped once at startup).  Populated when
-    /// stdin is the implicit content source (no file operands) or when `-`
-    /// appears in the operand list.  Re-used by `print_all_input` (multi-
-    /// file filter mode containing a `-` operand) and by `:e -` (re-examine
-    /// stdin).  `None` when no operand references stdin.
-    stdin_buffer: Option<String>,
+    /// Spill-backed view of standard input.  Present when stdin is the
+    /// implicit content source (no file operands) or when `-` appears in the
+    /// operand list.  Shared by `print_all_input` (multi-file filter mode
+    /// containing a `-` operand) and by `:e -` (re-examine stdin), so the
+    /// stream is read exactly once no matter how many cursors want it.
+    /// `None` when no operand references stdin.
+    stdin_spill: Option<SharedSpill>,
     /// Command-input/prompt channel (stderr or /dev/tty) used when stdout is
     /// a terminal.  `None` in filter mode and under `--test`.  Declared last
     /// so its `Drop` (which restores cooked-mode termios) runs **after**
@@ -2225,24 +2381,22 @@ impl MoreControl {
         let mut current_position = None;
         let mut file_pathes = vec![];
 
-        // STEP 1: Slurp stdin FIRST — before anything puts the terminal in
-        // raw mode.  Stdin is content when no file operands are given
-        // (implicit stdin) or when `-` appears in the operand list.  We read
-        // here, while termios is still in cooked mode, so that an
+        // STEP 1: Attach to stdin FIRST — before anything puts the terminal
+        // in raw mode.  Stdin is content when no file operands are given
+        // (implicit stdin) or when `-` appears in the operand list.  We
+        // attach here, while termios is still in cooked mode, so that an
         // interactive user (no piped input, no operands) can still press
         // Ctrl-D to signal EOF — raw mode disables that line-discipline
         // shortcut, and reading stdin under raw mode would hang the terminal
-        // with no recovery path.  POSIX requires the full stream be
-        // available for pagination; earlier code read only the first line on
-        // the implicit-stdin path, truncating `cat foo | more` to a single
-        // line.
+        // with no recovery path.
+        //
+        // Nothing is read yet: the stream is wrapped in a spill file and
+        // pulled from only as the display demands it.  Reading it through
+        // here would bound the input size by available memory, which for a
+        // pager fed by a pipe is the wrong bound entirely.
         let needs_stdin = args.input_files.is_empty() || args.input_files.iter().any(|f| f == "-");
-        let stdin_buffer: Option<String> = if needs_stdin {
-            let mut buf = String::new();
-            std::io::stdin()
-                .read_to_string(&mut buf)
-                .map_err(|_| MoreError::InputRead)?;
-            Some(buf)
+        let stdin_spill: Option<SharedSpill> = if needs_stdin {
+            Some(SharedSpill::new(Box::new(std::io::stdin())).map_err(|_| MoreError::InputRead)?)
         } else {
             None
         };
@@ -2286,7 +2440,7 @@ impl MoreControl {
         {
             // Implicit stdin or single explicit '-' operand. Empty stdin is
             // valid (yields an empty Buffer); it is not an error.
-            Source::Buffer(Cursor::new(stdin_buffer.clone().unwrap_or_default()))
+            stdin_source(stdin_spill.as_ref())
         } else {
             for file_string in &args.input_files {
                 if file_string == "-" {
@@ -2300,7 +2454,7 @@ impl MoreControl {
             current_position = Some(0);
             let first_file = &file_pathes[0];
             if first_file == &PathBuf::from("-") {
-                Source::Buffer(Cursor::new(stdin_buffer.clone().unwrap_or_default()))
+                stdin_source(stdin_spill.as_ref())
             } else {
                 Source::File(first_file.clone())
             }
@@ -2329,7 +2483,7 @@ impl MoreControl {
             file_pathes,
             is_new_file: false,
             is_matched: false,
-            stdin_buffer,
+            stdin_spill,
             command_io,
         })
     }
@@ -2338,27 +2492,21 @@ impl MoreControl {
     fn print_all_input(&mut self) {
         let input_files = self.file_pathes.clone();
         if input_files.is_empty() || (input_files.len() == 1 && self.args.input_files[0] == *"-") {
-            // Match the multi-file branch's loop order: read the current line
-            // first, then advance.  Calling `next()` before the first
-            // `read_line()` would skip line 0 of the buffer (a pre-existing bug
-            // formerly masked by stdin being truncated to a single line).
-            while let Ok(line) = self
-                .context
-                .seek_positions
-                .read_line()
-                .inspect_err(|e| self.handle_error(e.clone()))
-            {
-                print!("{line}");
-                if self.context.seek_positions.next().is_none() {
-                    break;
+            let source = self.context.current_source.clone();
+            match source_reader(&source) {
+                Ok(mut reader) => {
+                    let mut out = stdout().lock();
+                    if filter_copy(&mut reader, self.args.squeeze, &mut out).is_err() {
+                        self.handle_error(MoreError::InputRead);
+                    }
                 }
+                Err(e) => self.handle_error(e),
             }
         } else {
             for file_path in &input_files {
                 // Handle '-' as stdin
                 let source = if file_path.as_os_str() == "-" {
-                    let buf = self.stdin_buffer.clone().unwrap_or_default();
-                    Source::Buffer(Cursor::new(buf))
+                    stdin_source(self.stdin_spill.as_ref())
                 } else {
                     Source::File(file_path.clone())
                 };
@@ -2393,16 +2541,15 @@ impl MoreControl {
                     }
                 }
 
-                while let Ok(line) = self
-                    .context
-                    .seek_positions
-                    .read_line()
-                    .inspect_err(|e| self.handle_error(e.clone()))
-                {
-                    print!("{line}");
-                    if self.context.seek_positions.next().is_none() {
-                        break;
+                let current = self.context.current_source.clone();
+                match source_reader(&current) {
+                    Ok(mut reader) => {
+                        let mut out = stdout().lock();
+                        if filter_copy(&mut reader, self.args.squeeze, &mut out).is_err() {
+                            self.handle_error(MoreError::InputRead);
+                        }
                     }
+                    Err(e) => self.handle_error(e),
                 }
             }
         }
@@ -2422,7 +2569,7 @@ impl MoreControl {
                 .file_name()
                 .and_then(|s| s.to_str())
                 .map(|s| s.to_owned()),
-            Source::Buffer(_) => None,
+            Source::Buffer(_) | Source::Stream(_) => None,
         }
     }
 
@@ -2924,8 +3071,8 @@ impl MoreControl {
             // Handle stdin as a source using the buffered content
             self.context.goto_eof(None);
             let _ = self.context.update_screen();
-            let buf = self.stdin_buffer.clone().unwrap_or_default();
-            self.context.set_source(Source::Buffer(Cursor::new(buf)))?;
+            self.context
+                .set_source(stdin_source(self.stdin_spill.as_ref()))?;
             self.last_position = self.current_position;
         } else {
             self.context.goto_eof(None);
@@ -3402,6 +3549,90 @@ fn env_screen_size(name: &str) -> Option<u16> {
         .ok()
         .and_then(|value| u16::from_str(value.trim()).ok())
         .filter(|&size| size > 0)
+}
+
+/// Copy a source straight to standard output, honoring only `-s`.
+///
+/// POSIX 107650: "When the standard output is not a terminal, only the -s
+/// filter-modification option is effective."  So this is a byte-for-byte
+/// copy: no decoding (arbitrary binary passes through unharmed), no line
+/// index, and nothing proportional to the input held in memory.
+fn filter_copy(reader: &mut dyn Read, squeeze: bool, out: &mut dyn Write) -> std::io::Result<u64> {
+    if !squeeze {
+        return std::io::copy(reader, out);
+    }
+
+    // Collapsing runs of empty lines needs to know whether a line is empty
+    // before its <newline> is written, but an empty line is at most a lone
+    // <carriage-return>.  So at most two bytes are ever held back; anything
+    // longer proves the line is not empty and streams through immediately.
+    let mut chunk = [0u8; 8192];
+    let mut pending: Vec<u8> = Vec::with_capacity(2);
+    let mut line_started = false;
+    let mut previous_blank = false;
+    let mut written = 0u64;
+
+    loop {
+        let read = reader.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        for &byte in &chunk[..read] {
+            if byte == b'\n' {
+                let blank = !line_started && pending.iter().all(|&b| b == b'\r');
+                if blank && previous_blank {
+                    pending.clear();
+                    continue;
+                }
+                out.write_all(&pending)?;
+                out.write_all(b"\n")?;
+                written += pending.len() as u64 + 1;
+                previous_blank = blank;
+                pending.clear();
+                line_started = false;
+            } else if line_started {
+                out.write_all(&[byte])?;
+                written += 1;
+            } else {
+                pending.push(byte);
+                if pending.len() > 1 || byte != b'\r' {
+                    out.write_all(&pending)?;
+                    written += pending.len() as u64;
+                    pending.clear();
+                    line_started = true;
+                }
+            }
+        }
+    }
+
+    if !pending.is_empty() {
+        out.write_all(&pending)?;
+        written += pending.len() as u64;
+    }
+
+    Ok(written)
+}
+
+/// A readable handle on a [`Source`], for the filter path.
+fn source_reader(source: &Source) -> Result<Box<dyn Read>, MoreError> {
+    match source {
+        Source::File(path) => File::open(path)
+            .map(|f| Box::new(f) as Box<dyn Read>)
+            .map_err(|_| MoreError::FileRead(path.to_str().unwrap_or("<file>").to_owned())),
+        Source::Buffer(cursor) => Ok(Box::new(cursor.clone())),
+        Source::Stream(spill) => Ok(Box::new(spill.reader())),
+    }
+}
+
+/// The [`Source`] for a `-` operand or implicit standard input.
+///
+/// Falls back to an empty buffer when stdin was never attached, which keeps
+/// the "no operand references stdin" case from needing a separate path.
+fn stdin_source(spill: Option<&SharedSpill>) -> Source {
+    match spill {
+        Some(spill) => Source::Stream(spill.clone()),
+        None => Source::Buffer(Cursor::new(String::new())),
+    }
 }
 
 /// Collect every file named `tags` at or below `root`.

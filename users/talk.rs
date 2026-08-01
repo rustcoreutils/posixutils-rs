@@ -1458,12 +1458,38 @@ fn resolve_address(
         ));
     }
 
+    // getaddrinfo allocates the list; it must be released on every path out of
+    // this function, including the not-found error below.
+    struct AddrInfoList(*mut addrinfo);
+    impl Drop for AddrInfoList {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { libc::freeaddrinfo(self.0) };
+            }
+        }
+    }
+    let list = AddrInfoList(res);
+
     let mut addr = Ipv4Addr::UNSPECIFIED;
-    let mut ai = res;
+    let mut ai = list.0;
     while !ai.is_null() {
+        // SAFETY: `ai` is non-null here, and every `ai_next` in the chain is
+        // either null or points at an entry owned by `list`, which outlives
+        // this loop.
         let ai_ref = unsafe { &*ai };
-        if ai_ref.ai_family == AF_INET {
-            let sockaddr: &sockaddr_in = unsafe { &*(ai_ref.ai_addr as *const sockaddr_in) };
+
+        // Only trust `ai_addr` when the entry claims AF_INET *and* actually
+        // carries a large enough socket address. Casting on the family alone
+        // would read past the allocation if a resolver returned a shorter one.
+        if ai_ref.ai_family == AF_INET
+            && !ai_ref.ai_addr.is_null()
+            && ai_ref.ai_addrlen as usize >= size_of::<sockaddr_in>()
+        {
+            // Copy rather than forming a `&sockaddr_in`: the buffer belongs to
+            // libc and carries no alignment guarantee for that type.
+            // SAFETY: non-null and at least `sockaddr_in` bytes long, per the
+            // condition above.
+            let sockaddr = unsafe { ptr::read_unaligned(ai_ref.ai_addr as *const sockaddr_in) };
             addr = Ipv4Addr::from(u32::from_be(sockaddr.sin_addr.s_addr));
             break;
         }

@@ -754,6 +754,22 @@ the recipient `mesg` permission path are absent, and the
 - [x] **#TK13 — Diagnostics not internationalized.** ✓ fixed (phase 10) — `plib::diag::init_locale` + top-level/`check_if_tty` diagnostics via `plib::diag`/`gettext`. (On-screen status strings stay literal — screen furniture, not `LC_MESSAGES` diagnostics.) `users/talk.rs`.
 - [ ] **#TK14 — Long-line handling / buffer mismatch (DEFERRED).** Cosmetic; part of the deferred UI-engine rework. `users/talk.rs`.
 
+### Findings added 2026-08-01
+
+Surfaced while re-examining the input/echo engine for the phase-10 deferrals.
+All are in, or adjacent to, the same code, and were verified against the source
+rather than inferred.
+
+#### Major
+- [ ] **#TK15 — `ECHO` is never disabled, so every keystroke is echoed twice.** `users/talk.rs:673` is `termios.c_lflag &= !(libc::ICANON);` — the comment says "Disable canonical mode and echo", but only `ICANON` is cleared. The tty therefore keeps echoing each character at the cursor *in addition to* the manual echo `process_input_char` writes into the top window. Spec 116821-116823 requires typed characters to appear in the sending window; duplicating them elsewhere on screen corrupts the display. Fix: clear `ECHO` alongside `ICANON`.
+- [ ] **#TK16 — The peer window's cursor column is computed from a dead snapshot.** `handle_character` (`users/talk.rs:881`) positions the cursor with `output_buffer.len()`, but `output_buffer` reaches the reader thread as `&mut output_buffer.clone()` (`:616`, `:1431`) and is immediately re-copied (`:652`). The thread therefore holds a snapshot that never observes the user's typing. Compounding it, the buffer is only ever appended to (`:1000`) and never truncated, so once it passes the terminal width the computed column runs off-screen permanently. Fix: derive the column from live state, bounded by the window width.
+- [ ] **#TK17 — Output uses bare `<newline>` with `ICANON` cleared, so the cursor never returns to column 0.** `writeln!` at `users/talk.rs:801` and `:879-880` emits `\n` only. Without `ONLCR`-style translation in the tty's current state this moves down a row without a carriage return, so each rendered line starts further right. Fix: emit `\r\n`.
+
+#### Minor
+- [ ] **#TK18 — Panics reachable from ordinary terminal conditions.** Two kinds: every terminal `write!` in the render path is `.unwrap()`ed (`users/talk.rs:834-839`, `:879-882`), so a closed stdout aborts the reader thread; and `*bottom_line >= split_row - 2` (`:799`) underflows on a terminal shorter than 4 rows, where the analogous check at `:976` correctly uses `saturating_sub`. Fix: propagate write errors and use saturating arithmetic consistently.
+- [ ] **#TK19 — `parse_address` splits on the leftmost of any delimiter, mis-parsing dotted names.** `users/talk.rs:1183` does `address.find(|c| "@:!.".contains(c))` and then treats a non-`@` hit as `host<delim>user` (`:1188-1206`). Historical BSD `talk` instead tries `index('@')` first, then `rindex('!')`, `rindex(':')`, `rindex('.')`. Consequences: `first.last@host` splits at the `.` and never reaches the `@` branch, yielding user `last@host`; `host.example.com:user` splits at the first label, yielding host `host`. Spec 116798-116801 defines the `user@host` form, so the `@` case must win. Fix: BSD precedence with `rfind`, plus a unit-test table.
+- [ ] **#TK20 — Timeout/refusal paths exit without restoring the terminal.** `users/talk.rs:1767`, `:1835`, `:1850` call `process::exit(128)` directly, bypassing `restore_terminal()`. Today these all run during the handshake, *before* `spawn_input_thread` enters raw mode, so nothing is observably broken — this is recorded as a latent hazard rather than a live defect, and it becomes real the moment raw-mode setup moves earlier. Fix: route them through the same restore path as the other exits.
+
 ### Detailed conformance matrix
 
 #### Options
@@ -885,6 +901,10 @@ entire reason a talk daemon exists — is unimplemented.
 - [x] **#TD10 — Diagnostics go to stderr, not syslog.** ✓ fixed (phase 11) — `log_info`/`log_err` write to stderr in the foreground and to `syslog` (LOG_DAEMON) once detached; messages are `gettext`-wrapped. `users/talkd.rs`.
 - [x] **#TD11 — `LEAVE_INVITE` dedup keys only on (callee, caller), ignoring tty/addr.** ✓ fixed (phase 11) — `registry.refresh` updates the stored `tcp_addr`/`timestamp` on a matching re-invite; unit-tested. `users/talkd.rs`.
 - [x] **#TD12 — No tests for the wire/loop path.** ✓ added (phase 11) — `test_ctlmsg_wire_round_trip` (serialize size + short/empty-datagram graceful parse errors), `test_invitation_table_is_bounded`, `test_leave_invite_refresh_updates_address`. `users/talkd.rs`.
+
+### Findings added 2026-08-01
+
+- [ ] **#TD13 — `DELETE` ignores `id_num`, so one datagram cancels every invitation from a caller.** `users/talkd.rs:323-325`: `delete_by_caller` is `retain(|_, inv| inv.caller != caller)`, and `handle_delete` (`:517-533`) then echoes the *requested* `id_num` back as success. The client relies on per-id semantics — it sends two distinct id-scoped Deletes on teardown (`users/talk.rs:1108-1112`) — and BSD talkd deletes by id. Because the datagram socket is unauthenticated, any local process that can name a caller can cancel all of that caller's sessions, and the reply is indistinguishable from a correct one. Fix: delete the invitation whose `id_num` matches, and only when the caller also matches; return `Answer::Failed` (not a forged success) when no such invitation exists.
 
 ### Detailed conformance matrix
 

@@ -15,6 +15,9 @@ plib = { path = "../plib" }
 termion = "4.0"
 thiserror.workspace = true
 
+[dev-dependencies]
+portable-pty = "0.9"
+
 [lints]
 workspace = true
 

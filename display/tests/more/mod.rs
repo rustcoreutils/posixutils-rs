@@ -1353,3 +1353,85 @@ fn test_audit_invoke_editor_arguments() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// PTY render tests
+//
+// `more` only takes its interactive render path when standard output is a
+// terminal, so these are the only tests that exercise it at all. They pin
+// behavior that is already correct, so that changes to the render path show up
+// as a clean diff.
+// ---------------------------------------------------------------------------
+
+use crate::common::MoreSession;
+
+/// Write `content` to a fresh file under a per-test temporary directory.
+fn render_fixture(name: &str, content: &[u8]) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join("posixutils_more_render");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(name);
+    std::fs::write(&path, content).unwrap();
+    path
+}
+
+#[test]
+fn test_pty_renders_plain_lines() {
+    let path = render_fixture("plain.txt", b"alpha\nbravo\ncharlie\n");
+    let Some(session) = MoreSession::spawn(&[path.to_str().unwrap()], &[], 10, 40) else {
+        println!("Skipping PTY test: no pseudo-terminal available");
+        return;
+    };
+
+    let grid = session.grid();
+    assert_eq!(grid[0], "alpha");
+    assert_eq!(grid[1], "bravo");
+    assert_eq!(grid[2], "charlie");
+
+    assert_eq!(session.quit(), Some(0));
+}
+
+#[test]
+fn test_pty_folds_without_losing_content() {
+    // A line longer than the display is folded, not truncated (POSIX
+    // 107427-107429). The fold *column* is deliberately not asserted here:
+    // the current parser gives back up to three columns per folded line (the
+    // `buffer_str` backoff in `find_next_line_len_with_skip`), so a 20-column
+    // terminal folds at 17. That is a defect, tracked separately; what must
+    // hold either way is that no byte is dropped.
+    const LINE: &str = "abcdefghijklmnopqrstuvwxyz0123";
+    let path = render_fixture("fold.txt", format!("{LINE}\n").as_bytes());
+    let Some(session) = MoreSession::spawn(&[path.to_str().unwrap()], &[], 10, 20) else {
+        println!("Skipping PTY test: no pseudo-terminal available");
+        return;
+    };
+
+    let grid = session.grid();
+    assert!(
+        LINE.starts_with(&grid[0]),
+        "first row must be a prefix of the line, got {:?}",
+        grid[0]
+    );
+    assert!(!grid[0].is_empty() && grid[0].len() <= 20);
+    assert_eq!(
+        format!("{}{}", grid[0], grid[1]),
+        LINE,
+        "folding must not drop content"
+    );
+
+    assert_eq!(session.quit(), Some(0));
+}
+
+#[test]
+fn test_pty_scroll_forward_one_line() {
+    let path = render_fixture("scroll.txt", b"l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n");
+    let Some(mut session) = MoreSession::spawn(&[path.to_str().unwrap()], &[], 4, 20) else {
+        println!("Skipping PTY test: no pseudo-terminal available");
+        return;
+    };
+
+    assert_eq!(session.row(0), "l1");
+    session.keys("j");
+    assert_eq!(session.row(0), "l2");
+
+    assert_eq!(session.quit(), Some(0));
+}

@@ -7,6 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+mod common;
 mod echo;
 mod more;
 mod printf;

@@ -26,7 +26,7 @@ fn csplit_test(args: &[&str], test_data: &str, expected_output: &str) {
 #[test]
 fn test_csplit_text_by_lines() {
     csplit_test(
-        &["-f", "text", "-", "5", "{3}"],
+        &["-f", "text", "-", "5", "{2}"],
         "1sdfghnm
 2sadsgdhjmf
 3zcxbncvm vbm
@@ -55,7 +55,7 @@ fn test_csplit_text_by_lines() {
 #[test]
 fn test_csplit_text_by_lines_from_file() {
     csplit_test(
-        &["-f", "text_f", "tests/assets/test_file.txt", "5", "{3}"],
+        &["-f", "text_f", "tests/assets/test_file.txt", "5", "{2}"],
         "",
         "44\n77\n19\n8\n",
     );
@@ -284,30 +284,120 @@ fn test_csplit_error_invalid_bre() {
     );
 }
 
-// Test -k option: files should be kept on error
+// Test -k option: files should be kept on error.
+//
+// POSIX OPERANDS: "An error shall be reported if an operand does not reference a
+// line between the current position and the end of the file." Line 999 does not
+// exist in a 4-line input, so this run fails -- but -k means the two files it
+// did create must survive. Verified against GNU coreutils 9.4, which likewise
+// prints both byte counts, diagnoses the operand, exits 1, and keeps the files.
 #[test]
 fn test_csplit_keep_files_on_error() {
-    // This test creates some files then encounters an error (line 999 doesn't exist)
-    // With -k, the files should be kept
     let str_args: Vec<String> = ["-k", "-f", "keep_err", "-", "3", "999"]
         .iter()
         .map(|s| String::from(*s))
         .collect();
 
-    run_test(TestPlan {
-        cmd: String::from("csplit"),
-        args: str_args,
-        stdin_data: String::from("line1\nline2\nline3\nline4\n"),
-        expected_out: String::from("12\n12\n"),
-        expected_err: String::from(""),
-        expected_exit_code: 0,
-    });
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("csplit"),
+            args: str_args,
+            stdin_data: String::from("line1\nline2\nline3\nline4\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 1,
+        },
+        |_, output| {
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "out-of-range operand must fail"
+            );
+            assert_eq!(String::from_utf8_lossy(&output.stdout), "12\n12\n");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("999") && stderr.contains("line number out of range"),
+                "diagnostic should name the operand: {:?}",
+                stderr
+            );
+        },
+    );
 
     // With -k, all created files should exist
     assert!(std::path::Path::new("keep_err00").exists());
     assert!(std::path::Path::new("keep_err01").exists());
     std::fs::remove_file("keep_err00").unwrap();
     std::fs::remove_file("keep_err01").unwrap();
+}
+
+// The same run without -k must remove the files it created.
+#[test]
+fn test_csplit_removes_files_on_range_error() {
+    let str_args: Vec<String> = ["-f", "rm_err", "-", "3", "999"]
+        .iter()
+        .map(|s| String::from(*s))
+        .collect();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("csplit"),
+            args: str_args,
+            stdin_data: String::from("line1\nline2\nline3\nline4\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 1,
+        },
+        |_, output| {
+            assert_eq!(output.status.code(), Some(1));
+        },
+    );
+
+    assert!(!std::path::Path::new("rm_err00").exists());
+    assert!(!std::path::Path::new("rm_err01").exists());
+}
+
+// `{*}` is a GNU extension whose two operand kinds behave differently, verified
+// against GNU coreutils 9.4: a pattern simply stops matching (success), while a
+// line number eventually names a line past the end (error).
+#[test]
+fn test_csplit_star_repeat_semantics() {
+    // Pattern + {*}: runs out of matches cleanly.
+    csplit_test(
+        &["-f", "star_rx", "-", "/^$/", "{*}"],
+        "a\n\nb\n\nc\n",
+        "2\n3\n3\n",
+    );
+    for i in 0..3 {
+        let _ = std::fs::remove_file(format!("star_rx0{}", i));
+    }
+
+    // Line number + {*}: errors once the next multiple is past EOF.
+    let str_args: Vec<String> = ["-k", "-f", "star_ln", "-", "2", "{*}"]
+        .iter()
+        .map(|s| String::from(*s))
+        .collect();
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("csplit"),
+            args: str_args,
+            stdin_data: String::from("1\n2\n3\n4\n5\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 1,
+        },
+        |_, output| {
+            assert_eq!(output.status.code(), Some(1));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("line number out of range"),
+                "got {:?}",
+                stderr
+            );
+        },
+    );
+    for i in 0..6 {
+        let _ = std::fs::remove_file(format!("star_ln0{}", i));
+    }
 }
 
 // Test BRE-specific patterns work correctly

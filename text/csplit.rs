@@ -330,7 +330,12 @@ fn csplit_file(args: &Args, ctx: SplitOps, new_files: &mut Vec<String>) -> io::R
                             split_options.remove(0); // Repeat
                         } else {
                             if let Some(Operand::Repeat(r)) = split_options.get_mut(1) {
-                                *r -= 1;
+                                // `{*}` is stored as usize::MAX and left there:
+                                // never counting down keeps it distinguishable
+                                // from a finite `{N}` at end of input.
+                                if *r != usize::MAX {
+                                    *r -= 1;
+                                }
                             }
                             if let Some(Operand::LineNum { target, .. }) = split_options.get_mut(0)
                             {
@@ -442,7 +447,9 @@ fn csplit_file(args: &Args, ctx: SplitOps, new_files: &mut Vec<String>) -> io::R
                             split_options.remove(0);
                             split_options.remove(0);
                         } else if let Some(Operand::Repeat(r)) = split_options.get_mut(1) {
-                            *r -= 1;
+                            if *r != usize::MAX {
+                                *r -= 1;
+                            }
                         }
                     } else {
                         split_options.remove(0);
@@ -458,6 +465,40 @@ fn csplit_file(args: &Args, ctx: SplitOps, new_files: &mut Vec<String>) -> io::R
         }
 
         state.in_line_no += 1;
+    }
+
+    // POSIX OPERANDS: "An error shall be reported if an operand does not
+    // reference a line between the current position and the end of the file."
+    //
+    // The operand queue is self-cleaning: a bare line number is removed once it
+    // fires, and a line-number/`{N}` pair is removed once the repeat is
+    // exhausted. So whatever is still queued here never fired.
+    //
+    // `{*}` is the deliberate exception — "repeat as many times as possible" is
+    // its defined meaning, so it is never removed and never an error.
+    // `{*}` is a GNU extension, not POSIX, so its behaviour follows GNU
+    // csplit 9.4, which distinguishes the two operand kinds:
+    //
+    //   csplit f 5 '{*}'      -> error, "line number out of range"
+    //   csplit f '/re/' '{*}' -> exit 0
+    //
+    // A line number with `{*}` still names a specific line (5, 10, 15, …), and
+    // eventually names one past the end; a pattern with `{*}` simply stops
+    // matching, which is what "as many times as possible" means.
+    if let Some(op) = split_options.first() {
+        let unbounded = matches!(split_options.get(1), Some(Operand::Repeat(usize::MAX)));
+        match op {
+            // Report `step`, which is the line number as the user wrote it.
+            // `target` has already been advanced by the repeat, so naming it
+            // would point at a number that never appeared on the command line.
+            Operand::LineNum { step, .. } => {
+                return Err(Error::other(format!("{}: line number out of range", step)));
+            }
+            Operand::Rx(..) if !unbounded => {
+                return Err(Error::other("match not found".to_string()));
+            }
+            _ => {}
+        }
     }
 
     Ok(())
@@ -994,7 +1035,10 @@ mod tests {
             num: 2,
             suppress: false,
             filename: PathBuf::from("tests/assets/test_file.txt"),
-            operands: vec![String::from("5"), String::from("{3}")],
+            // `{2}` splits at 5/10/15, which fits the 16-line asset. `{3}` would
+            // need line 20 and is now correctly an out-of-range error, matching
+            // GNU csplit.
+            operands: vec![String::from("5"), String::from("{2}")],
         };
 
         let ctx = parse_operands(&args).unwrap();

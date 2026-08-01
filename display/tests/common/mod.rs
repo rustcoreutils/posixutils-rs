@@ -55,6 +55,23 @@ impl MoreSession {
     ///
     /// Returns `None` when no PTY can be allocated.
     pub fn spawn(args: &[&str], env: &[(&str, &str)], rows: u16, cols: u16) -> Option<Self> {
+        Self::spawn_in(None, args, env, rows, cols)
+    }
+
+    /// Like [`spawn`], but runs `more` with a given working directory.
+    ///
+    /// Lets a test refer to its fixture by a bare filename. Anything that
+    /// echoes the filename back — the `=` message, the prompt — is then
+    /// independent of how long the system temporary directory happens to be,
+    /// which differs by an order of magnitude between `/tmp` on Linux and
+    /// `/var/folders/…/T` on macOS.
+    pub fn spawn_in(
+        cwd: Option<&std::path::Path>,
+        args: &[&str],
+        env: &[(&str, &str)],
+        rows: u16,
+        cols: u16,
+    ) -> Option<Self> {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows,
@@ -67,6 +84,9 @@ impl MoreSession {
         let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_more"));
         for arg in args {
             cmd.arg(arg);
+        }
+        if let Some(dir) = cwd {
+            cmd.cwd(dir);
         }
         cmd.env("TERM", "vt100");
 

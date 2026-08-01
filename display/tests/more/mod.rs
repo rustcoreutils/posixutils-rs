@@ -1562,7 +1562,13 @@ fn test_pty_equals_reports_source_line() {
         .map(|n| format!("{}{}\n", n, "x".repeat(150)))
         .collect();
     let path = render_fixture("wide_lines.txt", wide.as_bytes());
-    let Some(mut session) = MoreSession::spawn(&[path.to_str().unwrap()], &[], 8, 60) else {
+    // Run from the fixture directory and name the file relatively: the `=`
+    // message echoes the operand, and an absolute path under macOS's
+    // /var/folders/…/T temporary directory does not fit in 60 columns, which
+    // would truncate the line number this test is reading.
+    let dir = path.parent().unwrap().to_path_buf();
+    let Some(mut session) = MoreSession::spawn_in(Some(&dir), &["wide_lines.txt"], &[], 8, 60)
+    else {
         println!("Skipping PTY test: no pseudo-terminal available");
         return;
     };

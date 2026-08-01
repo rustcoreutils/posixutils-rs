@@ -41,6 +41,9 @@ fn split_generated_unquoted_literal(
         .collect::<String>();
     if !ifs_whitespace.is_empty() {
         lit = lit.trim_matches(|c| ifs_whitespace.contains(c)).to_string();
+        if lit.is_empty() {
+            return;
+        }
     }
     let mut accumulator = String::new();
     let mut iter = lit.chars();
@@ -260,6 +263,18 @@ pub mod tests {
         assert_eq!(
             split_fields(
                 ExpandedWord::generated_unquoted_literal(""),
+                None,
+                usize::MAX
+            ),
+            Vec::<ExpandedWord>::new()
+        );
+    }
+
+    #[test]
+    fn split_fields_on_whitespace_only_literal() {
+        assert_eq!(
+            split_fields(
+                ExpandedWord::generated_unquoted_literal("   \t\n\n"),
                 None,
                 usize::MAX
             ),

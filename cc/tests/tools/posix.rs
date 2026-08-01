@@ -609,6 +609,58 @@ fn cflow_reverse_sort_respects_lc_collate() {
     );
 }
 
+// ============================================================================
+// -D / -U ordering — audit #F4, #R6
+//
+// cflow and cxref both state they conform to XBD 12.2 "except that the order of
+// the -D, -I, and -U options ... is significant". That is the opposite of c17,
+// where -U wins regardless of order, and the three utilities share one
+// preprocessor.
+// ============================================================================
+
+#[test]
+fn cflow_cxref_define_undefine_order_is_significant() {
+    let dir = TempDir::new().unwrap();
+    let f = src(
+        &dir,
+        "ord.c",
+        "#if defined(FOO) && FOO == 2\nint foo_is_two(void) { return 0; }\n#elif defined(FOO)\nint foo_other(void) { return 0; }\n#else\nint foo_undefined(void) { return 0; }\n#endif\n",
+    );
+
+    // (options, the symbol that must appear)
+    let cases = [
+        (vec!["-DFOO=1", "-UFOO", "-DFOO=2"], "foo_is_two"),
+        (vec!["-UFOO", "-DFOO=2"], "foo_is_two"),
+        (vec!["-DFOO=1", "-UFOO"], "foo_undefined"),
+        (vec!["-DFOO=1"], "foo_other"),
+        // Separated spelling must behave identically to the attached one.
+        (
+            vec!["-D", "FOO=1", "-U", "FOO", "-D", "FOO=2"],
+            "foo_is_two",
+        ),
+    ];
+
+    for (opts, expected) in cases {
+        for tool in ["cflow", "cxref"] {
+            let mut args = opts.clone();
+            if tool == "cxref" {
+                args.insert(0, "-s");
+            }
+            args.push(&f);
+            let (stdout, stderr, code) = run(tool, &args);
+            assert_eq!(code, 0, "{} {:?}: {}", tool, opts, stderr);
+            assert!(
+                stdout.contains(expected),
+                "{} {:?} should select {}, got:\n{}",
+                tool,
+                opts,
+                expected,
+                stdout
+            );
+        }
+    }
+}
+
 /// Diagnostics belong on stderr only; stdout carries the report.
 /// POSIX STDERR: "used only for diagnostic messages" (all three utilities).
 #[test]

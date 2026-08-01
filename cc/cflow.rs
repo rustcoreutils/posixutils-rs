@@ -16,6 +16,7 @@ use clap::Parser;
 use gettextrs::gettext;
 use posixutils_cc::parse::ast::{ExprKind, ExternalDecl, Stmt};
 use posixutils_cc::parse::Parser as CParser;
+use posixutils_cc::ppargs;
 use posixutils_cc::strings::StringTable;
 use posixutils_cc::symbol::SymbolTable;
 use posixutils_cc::target::Target;
@@ -911,6 +912,11 @@ fn main() -> ExitCode {
 
     let args = Args::parse();
 
+    // -D/-U are order-significant for this utility (unlike c17, where -U
+    // always wins). clap collects each flag into its own list, losing the
+    // interleaving, so rescan the raw argument vector and replay it.
+    let (defines, undefines) = ppargs::resolve(&ppargs::scan(std::env::args()));
+
     // Parse include options. POSIX defines exactly two values for -i.
     for incl in &args.include {
         if incl != "x" && incl != "_" {
@@ -945,8 +951,8 @@ fn main() -> ExitCode {
                     file,
                     &mut streams,
                     &mut graph,
-                    &args.defines,
-                    &args.undefines,
+                    &defines,
+                    &undefines,
                     &args.include_paths,
                 ) {
                     plib::diag::error(&format!("{}: {}", file, e));

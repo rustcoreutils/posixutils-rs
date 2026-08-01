@@ -682,14 +682,12 @@ fn spawn_input_thread(
             return;
         }
 
-        // Initialize terminal drawing
-        let mut handle = match draw_terminal(split_row, width) {
-            Ok(handle) => handle,
-            Err(e) => {
-                eprintln!("Failed to draw terminal: {}", e);
-                return; // Exit thread on failure
-            }
-        };
+        // Initialize terminal drawing. The stdout lock is taken and released
+        // inside; each render below re-acquires it briefly (audit #TK21).
+        if let Err(e) = draw_terminal(split_row, width) {
+            eprintln!("Failed to draw terminal: {}", e);
+            return; // Exit thread on failure
+        }
 
         let mut buffer = [0; 128];
         // Bytes of a multi-byte character split across two recv() calls
@@ -728,6 +726,10 @@ fn spawn_input_thread(
                         Ok(w) => w,
                         Err(_) => break,
                     };
+                    // Short-lived: released at the end of this chunk so the
+                    // keyboard thread can draw its own echo.
+                    let stdout = io::stdout();
+                    let mut handle = stdout.lock();
                     if RESIZED.swap(false, Ordering::SeqCst) {
                         let (w, h) = get_terminal_size();
                         let split = h / 2;
@@ -1558,7 +1560,7 @@ fn handle_client(stream: TcpStream) -> Result<(), io::Error> {
 /// # Errors
 ///
 /// Returns an `io::Error` if there is an issue with writing to the terminal or flushing output.
-fn draw_terminal(split_row: u16, width: u16) -> io::Result<io::StdoutLock<'static>> {
+fn draw_terminal(split_row: u16, width: u16) -> io::Result<()> {
     let stdout = io::stdout();
     let mut handle = stdout.lock();
 
@@ -1579,7 +1581,11 @@ fn draw_terminal(split_row: u16, width: u16) -> io::Result<io::StdoutLock<'stati
 
     handle.flush()?;
 
-    Ok(handle)
+    // The lock is deliberately released here. Holding it for the session (as
+    // this used to, by returning it) deadlocked the other thread: Rust's stdout
+    // lock is reentrant only for the *same* thread, so the keyboard path's
+    // io::stdout().lock() blocked forever on the first keystroke (audit #TK21).
+    Ok(())
 }
 
 /// Opens a TCP socket bound to the provided IPv4 address.
@@ -2263,6 +2269,26 @@ mod tests {
     // ========================================================================
     // Address parsing (audit #TK19)
     // ========================================================================
+
+    #[test]
+    fn test_draw_terminal_does_not_retain_stdout_lock() {
+        // Audit #TK21: draw_terminal used to return the StdoutLock, which the
+        // reader thread then held for the whole session, so the keyboard
+        // thread's own lock() blocked forever. Its return type carrying no
+        // guard is what makes that structurally impossible.
+        fn assert_unit(_: fn(u16, u16) -> io::Result<()>) {}
+        assert_unit(draw_terminal);
+
+        // And a second thread can still take the lock after it runs.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let stdout = io::stdout();
+            let _guard = stdout.lock();
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("stdout must be lockable from another thread");
+    }
 
     #[test]
     fn test_parse_address_bsd_precedence() {

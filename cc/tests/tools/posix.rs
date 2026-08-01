@@ -727,11 +727,66 @@ fn cflow_analyzes_object_files() {
         stdout
     );
     // Nesting proves the edges were recovered, not just the symbol list.
-    let top_idx = stdout.find("top:").unwrap();
-    let mid_idx = stdout.find("middle:").unwrap();
+    //
+    // Only asserted where a call between two functions in the same object
+    // actually leaves a relocation behind. ELF emits one even for a same-object
+    // call (R_X86_64_PLT32, because the symbol may be interposed), but the
+    // Mach-O arm64 assembler resolves an intra-section `bl` itself and emits
+    // nothing, so there is no relocation to attribute a caller to. Edge recovery
+    // for calls that *do* carry a relocation is covered on every platform by
+    // `cflow_recovers_external_call_edges` below.
+    #[cfg(target_os = "linux")]
+    {
+        let top_idx = stdout.find("top:").unwrap();
+        let mid_idx = stdout.find("middle:").unwrap();
+        assert!(
+            mid_idx > top_idx,
+            "middle should nest under top: {}",
+            stdout
+        );
+    }
+}
+
+/// #F5, edge recovery: a call to a function defined elsewhere always leaves a
+/// relocation, on every object format, because the target address cannot be
+/// known at assembly time. This is the portable half of the relocation-walking
+/// logic exercised by `cflow_analyzes_object_files`.
+#[test]
+fn cflow_recovers_external_call_edges() {
+    let dir = TempDir::new().unwrap();
+    let c = src(
+        &dir,
+        "ext.c",
+        "extern int outside(int);\nint caller(void) { return outside(1); }\n",
+    );
+    let obj = dir.path().join("ext.o");
+
+    let built = Command::new(env!("CARGO_BIN_EXE_pcc"))
+        .args(["-c", &c, "-o", obj.to_str().unwrap()])
+        .output()
+        .expect("run pcc");
     assert!(
-        mid_idx > top_idx,
-        "middle should nest under top: {}",
+        built.status.success() && obj.exists(),
+        "failed to build fixture object: {}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let (stdout, stderr, code) = run("cflow", &[obj.to_str().unwrap()]);
+    assert_eq!(code, 0, "{}", stderr);
+
+    let caller_idx = stdout.find("caller:").expect("caller should be listed");
+    let outside_idx = stdout
+        .find("outside:")
+        .unwrap_or_else(|| panic!("the external callee should be reached: {}", stdout));
+    assert!(
+        outside_idx > caller_idx,
+        "outside should nest under caller: {}",
+        stdout
+    );
+    // It has no definition in this object, so it takes the undefined form.
+    assert!(
+        stdout.contains("outside: <>"),
+        "an undefined reference is written as `<>`: {:?}",
         stdout
     );
 }

@@ -1551,3 +1551,46 @@ fn test_pty_renders_full_width_non_ascii() {
 
     assert_eq!(session.quit(), Some(0));
 }
+
+#[test]
+fn test_pty_equals_reports_source_line() {
+    // POSIX 107629: the `=` message reports "the line number in the file".
+    // Folding makes the display line larger than the source line, so the two
+    // must be tracked separately. Each source line here folds into three
+    // display lines in a 20-column terminal.
+    let wide: String = (1..=6)
+        .map(|n| format!("{}{}\n", n, "x".repeat(150)))
+        .collect();
+    let path = render_fixture("wide_lines.txt", wide.as_bytes());
+    let Some(mut session) = MoreSession::spawn(&[path.to_str().unwrap()], &[], 8, 60) else {
+        println!("Skipping PTY test: no pseudo-terminal available");
+        return;
+    };
+
+    // Each 150-character source line folds into three display lines here, so
+    // three `j` presses advance the reported file line by exactly one. Before
+    // source lines were tracked, the display line was reported and it grew by
+    // three.
+    let reported = |session: &mut MoreSession| -> usize {
+        session.keys("=");
+        let prompt = session.row(7);
+        prompt
+            .split_whitespace()
+            .nth(2)
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("no line number in {prompt:?}"))
+    };
+
+    let before = reported(&mut session);
+    session.keys("j");
+    session.keys("j");
+    session.keys("j");
+    let after = reported(&mut session);
+    assert_eq!(
+        after,
+        before + 1,
+        "three display lines are one source line ({before} -> {after})"
+    );
+
+    assert_eq!(session.quit(), Some(0));
+}

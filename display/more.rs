@@ -971,6 +971,12 @@ struct SeekPositions {
     squeeze_lines: bool,
     /// `-u`: suppress underlining and bold
     plain: bool,
+    /// Source line number at each entry of `positions`.
+    ///
+    /// A folded line occupies several display lines but is one line of the
+    /// file, so the two counts diverge; POSIX 107629 asks for "the line
+    /// number in the file".
+    source_lines: Vec<usize>,
     /// Iteration over [`SeekPositions`] buffer has reached end
     is_ended: bool,
 }
@@ -1010,6 +1016,7 @@ impl SeekPositions {
             // 1.  (The scan this replaced left `positions` in exactly this
             // state as a side effect; stating it is clearer than deriving it.)
             positions: vec![0],
+            source_lines: vec![1],
             line_len,
             total_bytes,
             source,
@@ -1091,6 +1098,12 @@ impl SeekPositions {
         self.positions.len()
     }
 
+    /// Line number *in the file* at the current position, as distinct from
+    /// the display line, which folding makes larger.
+    fn current_source_line(&self) -> usize {
+        self.source_lines.last().copied().unwrap_or(1)
+    }
+
     /// Sets current line to [`position`]
     fn set_current(&mut self, position: usize) {
         self.is_ended = false;
@@ -1167,28 +1180,31 @@ impl SeekPositions {
         Ok(())
     }
 
-    /// Returns nth position of choosen [`char`] if it exists
+    /// Byte offset at which the nth *source* line begins, if it exists.
+    ///
+    /// Counted with `read_until`, which keeps the <newline> in the byte
+    /// count; `lines()` strips it, so the offsets this produced were short by
+    /// one byte per line and drifted further the deeper the file went.
     pub fn find_n_line(&mut self, n: usize) -> Option<u64> {
         let last_seek = self.current();
-        let mut n_char_seek = None;
-        let _ = self.buffer.rewind();
-        let mut i = 0;
-        let mut seek_pos = 0;
-        {
-            let reader = BufReader::new(&mut self.buffer).lines();
-            for line in reader {
-                if let Ok(line) = line {
-                    seek_pos += line.len();
-                }
-                i += 1;
-                if i >= n {
-                    n_char_seek = Some(seek_pos as u64);
-                    break;
+        let mut offset = 0u64;
+        let mut found = None;
+
+        if self.buffer.rewind().is_ok() {
+            let mut reader = BufReader::new(&mut self.buffer);
+            let mut line = Vec::new();
+            for _ in 1..n.max(1) {
+                line.clear();
+                match reader.read_until(b'\n', &mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => offset += read as u64,
                 }
             }
+            found = Some(offset);
         }
+
         let _ = self.seek(last_seek);
-        n_char_seek
+        found
     }
 }
 
@@ -1230,7 +1246,10 @@ impl Iterator for SeekPositions {
         if self.buffer.seek(SeekFrom::Start(next_position)).is_err() {
             return None;
         }
+        let source_line =
+            self.source_lines.last().copied().unwrap_or(1) + usize::from(line.ended_at_newline);
         self.positions.push(next_position);
+        self.source_lines.push(source_line);
         Some(next_position)
     }
 }
@@ -1239,6 +1258,7 @@ impl DoubleEndedIterator for SeekPositions {
     /// Iter over [`SeekRead`] buffer lines in backward direction
     fn next_back(&mut self) -> Option<Self::Item> {
         let _ = self.positions.pop();
+        let _ = self.source_lines.pop();
         let _ = self
             .buffer
             .seek(SeekFrom::Start(*self.positions.last().unwrap_or(&0)));
@@ -2927,7 +2947,7 @@ impl MoreControl {
             .map(|cp| (cp + 1).to_string())
             .unwrap_or("?".to_string());
         let input_files_count = self.file_pathes.len();
-        let current_line = self.context.seek_positions.current_line();
+        let current_line = self.context.seek_positions.current_source_line();
         let byte_number = self.context.seek_positions.current();
 
         // POSIX 107631-107632: "If more is reading from standard input, or the

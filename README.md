@@ -57,6 +57,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] bc
  - [x] cal
  - [x] cat
+ - [x] cflow (Development)
  - [x] chgrp
  - [x] chmod
  - [x] chown
@@ -66,7 +67,9 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] compress (compress cat.)
  - [x] cp
  - [x] crontab (cron cat.)
+ - [x] ctags (Development)
  - [x] cut
+ - [x] cxref (Development)
  - [x] date
  - [x] dd
  - [x] delta (SCCS)
@@ -191,10 +194,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
 ## Stage 3 - Test coverage
 
  - [x] c99 (Development)
- - [x] cflow (Development)
  - [x] csplit
- - [x] ctags (Development)
- - [x] cxref (Development)
  - [x] localedef (i18n)
  - [x] talk (with talkd local daemon)
  - [x] tr

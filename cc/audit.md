@@ -15,6 +15,18 @@ crate. Each audit follows the playbook in `audits.md`.
 | `ctags` | `ctags` | `cc/ctags.rs` (349) | `ctags.md` (220 lines) | 2865–2869 |
 | `cxref` | `cxref` | `cc/cxref.rs` (595) | `cxref.md` (114 lines) | 2879–2881 |
 
+## Status
+
+> **`cflow`, `ctags`, and `cxref`: all 32 findings closed (2026-08-01).**
+> Landed across six commits on branch `updates`; each item is ticked below with
+> a one-line note. All three were promoted to *Stage 6 — Audited* in
+> `README.md`. New conformance tests live in `cc/tests/tools/posix.rs`.
+>
+> **`c17` (`pcc`): open.** Its 49 findings are deliberately untouched — the
+> maintainer scoped this round to the three standalone utilities. `c17` remains
+> at *Stage 3* in `README.md`, which is correct while #U1 (multi-translation-unit
+> compilation fails outright), #P2, #X1, #P1/#X2 and #L1 are open.
+
 ---
 
 ## Naming: `pcc` → `c17`
@@ -346,8 +358,8 @@ INPUT FILES — are unsupported.
 
 - [x] **#F3 — The back-reference line does not match the documented output format.** `cc/cflow.rs:549-552` prints `"{ref}{indent}{name}  {{{prev}}}"`. STDOUT mandates `"%d %s:%s\n"` and *"subsequent references to that name contain only the reference number of the line where the definition can be found."* **[probed]** a diamond call graph yields `5         shared  {3}` — no colon, and `{3}` braces inconsistent with the tool's own `<>` conventions. Recursion produces the same shape. The shipped mega-test cannot catch this: its only repeated call is de-duplicated at extraction time (line 168). Fix: emit the colon form. **✓ fixed** — repeated references print `name: <refnum>`.
 - [x] **#F4 — `-D`/`-I`/`-U` relative order is not preserved.** `cc/cflow.rs:49-56` + `cc/token/preprocess.rs:3795-3818`. `cflow` explicitly overrides XBD 12.2 to make this order significant (cflow.md 88920-88921) — the *opposite* of `c17`'s rule — but it shares `c17`'s "all `-D`s then all `-U`s" code path. **[probed]** via the shared path: `-DFOO=1 -UFOO -DFOO=2` leaves `FOO` undefined; per cflow's spec it should be `2`. Fix: parse into one ordered list and replay in order. **✓ fixed** — `cc/ppargs.rs` rescans argv and replays `-D`/`-U` in order; `c17`'s own rule is unchanged.
-- [ ] **#F5 — Object-file input is unsupported.** `cc/cflow.rs:647-666` recognizes only `c|h|l|y|i` and stubs `s`; everything else, including `.o`, hits "unknown file type". DESCRIPTION and INPUT FILES require object files, and STDOUT even specifies their distinct definition format ("filename and location counter ... for example, `text`"). **[static]** Fix: read ELF/Mach-O symbol tables, or document the gap.
-- [ ] **#F6 — `.l`/`.y` operands are parsed as plain C.** `cc/cflow.rs:647-648,484-492` routes them through the identical C pipeline. OPERANDS requires they be "processed as appropriate" for lex/yacc. Real `.l`/`.y` source is not valid C, so the parse fails, the error is swallowed (488-491), and the file contributes nothing — silently. **[static]** Fix: pre-run `lex`/`yacc`, or refuse them explicitly like `.s`.
+- [x] **#F5 — Object-file input is unsupported.** `cc/cflow.rs:647-666` recognizes only `c|h|l|y|i` and stubs `s`; everything else, including `.o`, hits "unknown file type". DESCRIPTION and INPUT FILES require object files, and STDOUT even specifies their distinct definition format ("filename and location counter ... for example, `text`"). **[static]** Fix: read ELF/Mach-O symbol tables, or document the gap. **✓ fixed** — object files read via the `object` crate; call edges recovered from relocations; definitions use the `<file counter>` form.
+- [x] **#F6 — `.l`/`.y` operands are parsed as plain C.** `cc/cflow.rs:647-648,484-492` routes them through the identical C pipeline. OPERANDS requires they be "processed as appropriate" for lex/yacc. Real `.l`/`.y` source is not valid C, so the parse fails, the error is swallowed (488-491), and the file contributes nothing — silently. **[static]** Fix: pre-run `lex`/`yacc`, or refuse them explicitly like `.s`. **✓ fixed** — `.l`/`.y` operands are run through `lex`/`yacc` and the generated C is analyzed; diagnostics name the original operand.
 
 ### Minor
 
@@ -659,6 +671,7 @@ Ordered roughly by value-per-unit-risk. Each is independently landable.
   Three of four utilities never report failure, and `c17` aborts instead of
   continuing. Small, mechanical, high user-visible value, and it makes every
   later PR's tests able to assert failure.
+  **✓ LANDED** (8f42de37) — note the scope split: `c17`'s #U2 was excluded from this round.
 
 - **PR B — "`c17`: one link, all operands"**: #U1, #U3.
   The single largest correctness defect in the crate. Restructure the driver
@@ -694,15 +707,18 @@ Ordered roughly by value-per-unit-risk. Each is independently landable.
 - **PR G — "`cxref` data correctness"**: #R1, #R2, #R4, #R5.
   Threading a position through `InitDeclarator` (#R2) is the prerequisite for
   most of the rest; the per-file header (#R4) is a few lines once that lands.
+  **✓ LANDED** (a9eee879).
 
 - **PR H — "`ctags` data correctness and format"**: #T2, #T3, #T8.
   Re-key the tag map, fix the `-x` format to the mandated `%s %d %s %s`, and
   adopt `plib::io::write_atomic`.
+  **✓ LANDED** (f7c58704).
 
 - **PR I — "`cflow` output format"**: #F2, #F3, #F12.
   Make `-i x` real, fix the back-reference line, and attribute definitions to
   the declarator line. Together these make the spec's worked EXAMPLE
   reproducible byte-for-byte, which is a good acceptance test.
+  **✓ LANDED** (ccc84be5) — the spec's worked EXAMPLE is now reproduced exactly and pinned by a test.
 
 - **PR J — "Missing `c17` options"**: #U4, #U6.
   `-B`, `-G`, `-R`, `-s`, plus `TMPDIR` and safe temp-file creation. The
@@ -719,10 +735,15 @@ Ordered roughly by value-per-unit-risk. Each is independently landable.
   Adopt `plib::locale::strcoll` in the three sort paths. Note the `ctags`
   asymmetry: the tags file must stay in POSIX-locale order; only `-x` follows
   `LC_COLLATE`.
+  **✓ LANDED** across the three per-utility commits.
 
-- **Deferred / not scheduled**: #F5 and #F6 (`cflow` object-file and
-  `lex`/`yacc` input) are real spec gaps but represent substantial new
-  subsystems. #L7 (K&R promotion) is unconfirmed — it did not reproduce — and
+- **PR M — "`cflow` object-file and lex/yacc input"**: #F5, #F6.
+  Originally deferred here as "substantial new subsystems". **✓ LANDED**
+  (c9336743) — the maintainer opted in. Object symbols are read with the
+  `object` crate and call edges recovered from relocations; `.l`/`.y` operands
+  are run through `lex`/`yacc` first.
+
+- **Deferred / not scheduled**: #L7 (K&R promotion) is unconfirmed — it did not reproduce — and
   #H4 (aarch64 `long double`) is unverified because this audit ran on x86_64;
   both need a repro before being scheduled. The `getconf`
   programming-environment obligations (c17.md 88105-88179) belong to whichever

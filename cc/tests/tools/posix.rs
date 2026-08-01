@@ -18,15 +18,26 @@ use std::fs;
 use std::process::Command;
 use tempfile::TempDir;
 
-fn run(bin: &str, args: &[&str]) -> (String, String, i32) {
-    let exe = match bin {
+fn exe_for(bin: &str) -> &'static str {
+    match bin {
         "cflow" => env!("CARGO_BIN_EXE_cflow"),
         "ctags" => env!("CARGO_BIN_EXE_ctags"),
         "cxref" => env!("CARGO_BIN_EXE_cxref"),
         _ => unreachable!(),
-    };
-    let output = Command::new(exe)
-        .args(args)
+    }
+}
+
+fn run(bin: &str, args: &[&str]) -> (String, String, i32) {
+    run_env(bin, args, &[])
+}
+
+fn run_env(bin: &str, args: &[&str], env: &[(&str, &str)]) -> (String, String, i32) {
+    let mut cmd = Command::new(exe_for(bin));
+    cmd.args(args);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let output = cmd
         .output()
         .unwrap_or_else(|e| panic!("failed to execute {}: {}", bin, e));
     (
@@ -233,6 +244,207 @@ fn ctags_tolerates_non_utf8_input() {
         "tags should still be produced: {:?}",
         body
     );
+}
+
+// ============================================================================
+// cxref — audit #R1, #R2, #R4, #R5, #R7, #R8, #R11
+// ============================================================================
+
+/// Return the reference column(s) of the row whose symbol is `name`.
+fn cxref_rows<'a>(out: &'a str, name: &str) -> Vec<&'a str> {
+    out.lines()
+        .filter(|l| l.split_whitespace().next() == Some(name))
+        .collect()
+}
+
+/// #R1: macros are consumed by the preprocessor, so a `#define` used to be
+/// absent from the listing entirely.
+#[test]
+fn cxref_macros_are_cross_referenced() {
+    let dir = TempDir::new().unwrap();
+    let f = src(
+        &dir,
+        "m.c",
+        "#define MAXV 10\nint g;\nint f(void) { return g + MAXV; }\n",
+    );
+
+    let (stdout, stderr, code) = run("cxref", &["-s", &f]);
+    assert_eq!(code, 0, "{}", stderr);
+
+    let rows = cxref_rows(&stdout, "MAXV");
+    assert!(!rows.is_empty(), "MAXV should be listed: {:?}", stdout);
+    let joined = rows.join(" ");
+    assert!(
+        joined.contains("*1"),
+        "the #define line should be the declaring reference: {:?}",
+        joined
+    );
+    assert!(
+        joined.contains(" 3") || joined.ends_with("3"),
+        "the use on line 3 should be referenced: {:?}",
+        joined
+    );
+}
+
+/// #R2: declarations without an initializer previously reported line 0, and
+/// uninitialized locals were dropped from the listing altogether.
+#[test]
+fn cxref_declaration_line_numbers_are_real() {
+    let dir = TempDir::new().unwrap();
+    let f = src(
+        &dir,
+        "d.c",
+        "int g;\nint fn(void) {\n    int loc;\n    loc = g;\n    return loc;\n}\n",
+    );
+
+    let (stdout, stderr, code) = run("cxref", &["-s", &f]);
+    assert_eq!(code, 0, "{}", stderr);
+
+    assert!(
+        !stdout.contains("*0"),
+        "no declaration should report line 0: {:?}",
+        stdout
+    );
+    let g = cxref_rows(&stdout, "g").join(" ");
+    assert!(
+        g.contains("*1"),
+        "uninitialized global should be declared on line 1: {:?}",
+        g
+    );
+    let loc = cxref_rows(&stdout, "loc").join(" ");
+    assert!(
+        loc.contains("*3"),
+        "uninitialized local should appear, declared on line 3: {:?}",
+        loc
+    );
+}
+
+/// #R4: POSIX STDOUT requires a per-file name line when -c is absent, which
+/// also makes -c meaningfully different from the default.
+#[test]
+fn cxref_per_file_header_distinguishes_combined() {
+    let dir = TempDir::new().unwrap();
+    let p = src(&dir, "p.c", "int aaa;\n");
+    let q = src(&dir, "q.c", "int bbb;\n");
+
+    let (plain, stderr, code) = run("cxref", &[&p, &q]);
+    assert_eq!(code, 0, "{}", stderr);
+    assert!(
+        plain.lines().any(|l| l.trim() == p),
+        "input file name should appear on its own line: {:?}",
+        plain
+    );
+    assert!(plain.lines().any(|l| l.trim() == q));
+
+    let (combined, _, code) = run("cxref", &["-c", &p, &q]);
+    assert_eq!(code, 0);
+    assert!(
+        !combined.lines().any(|l| l.trim() == p),
+        "-c must not emit per-file headers: {:?}",
+        combined
+    );
+    assert_ne!(
+        plain, combined,
+        "-c must produce different output from the default"
+    );
+
+    // -s suppresses filenames, header included.
+    let (silent, _, _) = run("cxref", &["-s", &p]);
+    assert!(!silent.contains(&p), "-s should suppress filenames");
+}
+
+/// #R5: a function name is not "a symbol appearing inside a function", so its
+/// own definition belongs to file scope.
+#[test]
+fn cxref_function_definition_is_file_scope() {
+    let dir = TempDir::new().unwrap();
+    let f = src(&dir, "s.c", "int helper(void) {\n    return 1;\n}\n");
+
+    let (stdout, stderr, code) = run("cxref", &["-s", &f]);
+    assert_eq!(code, 0, "{}", stderr);
+
+    let rows = cxref_rows(&stdout, "helper");
+    assert_eq!(rows.len(), 1, "expected a single row: {:?}", stdout);
+    // Row layout is "name  <file>  <function>  refs"; with -s the file column
+    // is blank, so a file-scope row must not name `helper` a second time.
+    let after_name = rows[0].trim_start().trim_start_matches("helper");
+    assert!(
+        !after_name.contains("helper"),
+        "function's own definition should not be scoped to itself: {:?}",
+        rows[0]
+    );
+}
+
+/// #R7: LC_COLLATE determines the order of the symbol listing.
+#[test]
+fn cxref_sort_respects_lc_collate() {
+    let dir = TempDir::new().unwrap();
+    let f = src(&dir, "coll.c", "int apple;\nint Banana;\nint cherry;\n");
+
+    let order = |env: &[(&str, &str)]| -> Vec<String> {
+        let (out, _, _) = run_env("cxref", &["-s", &f], env);
+        out.lines()
+            .filter_map(|l| l.split_whitespace().next())
+            .map(String::from)
+            .collect()
+    };
+
+    // In the POSIX locale collation is by byte value, so uppercase sorts first.
+    let c_order = order(&[("LC_ALL", "C")]);
+    assert_eq!(
+        c_order,
+        vec!["Banana", "apple", "cherry"],
+        "POSIX locale should collate by byte value"
+    );
+}
+
+/// #R8: cxref's OPERANDS section names no filename suffix rule.
+#[test]
+fn cxref_accepts_any_pathname() {
+    let dir = TempDir::new().unwrap();
+    let f = src(&dir, "source_without_suffix", "int visible;\n");
+
+    let (stdout, stderr, code) = run("cxref", &["-s", &f]);
+    assert_eq!(
+        code, 0,
+        "suffix-less C source should be accepted: {}",
+        stderr
+    );
+    assert!(
+        stdout.contains("visible"),
+        "symbols should be listed: {:?}",
+        stdout
+    );
+}
+
+/// #R11: -w bounds the whole line, not just the line-number run.
+#[test]
+fn cxref_width_bounds_every_line() {
+    let dir = TempDir::new().unwrap();
+    let body = format!(
+        "int aa;\nint use(void) {{ return {}; }}\n",
+        vec!["aa"; 20].join(" + ")
+    );
+    let f = src(&dir, "a_rather_long_source_file_name.c", &body);
+
+    for width in [80usize, 40, 20] {
+        let w = width.to_string();
+        let (stdout, stderr, code) = run_env("cxref", &["-w", &w, &f], &[("LC_ALL", "C")]);
+        assert_eq!(code, 0, "{}", stderr);
+        for line in stdout.lines() {
+            // The per-file header is the filename itself and cannot be folded.
+            if line.trim() == f {
+                continue;
+            }
+            assert!(
+                line.len() <= width,
+                "-w {} exceeded by {:?} (len {})",
+                width,
+                line,
+                line.len()
+            );
+        }
+    }
 }
 
 /// Diagnostics belong on stderr only; stdout carries the report.

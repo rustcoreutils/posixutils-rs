@@ -969,6 +969,13 @@ pub struct InitDeclarator {
     pub vla_sizes: Vec<Expr>,
     /// Explicit alignment from _Alignas specifier (None = use natural alignment)
     pub explicit_align: Option<u32>,
+    /// Source position of the declarator itself.
+    ///
+    /// Recorded independently of `init` so that a declaration with no
+    /// initializer (`int g;`, a prototype, an uninitialized local) still has a
+    /// usable location. Consumers such as `cxref` need this to report where a
+    /// name is declared.
+    pub pos: Position,
 }
 
 #[cfg(test)]
@@ -977,6 +984,7 @@ impl Declaration {
     pub fn simple(symbol: SymbolId, typ: TypeId, init: Option<Expr>) -> Self {
         Declaration {
             declarators: vec![InitDeclarator {
+                pos: Position::default(),
                 symbol,
                 typ,
                 storage_class: TypeModifiers::empty(),

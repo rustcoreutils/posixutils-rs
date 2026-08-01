@@ -24,7 +24,6 @@ use posixutils_cc::types::TypeTable;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{self, BufReader, Read, Write};
-use std::path::Path;
 use std::process::ExitCode;
 
 // ============================================================================
@@ -186,8 +185,11 @@ fn extract_refs_from_expr(
             extract_refs_from_expr(then_expr, strings, symbols, xref);
             extract_refs_from_expr(else_expr, strings, symbols, xref);
         }
-        ExprKind::Member { expr, .. } | ExprKind::Arrow { expr, .. } => {
+        ExprKind::Member { expr, member } | ExprKind::Arrow { expr, member } => {
             extract_refs_from_expr(expr, strings, symbols, xref);
+            // The member name is a symbol in its own right; without this, `s.x`
+            // contributed a reference to `s` but none to `x`.
+            xref.add_reference(strings.get(*member), expr.pos.line);
         }
         ExprKind::Index { array, index } => {
             extract_refs_from_expr(array, strings, symbols, xref);
@@ -264,10 +266,11 @@ fn extract_refs_from_stmt(
                     posixutils_cc::parse::ast::BlockItem::Declaration(decl) => {
                         for d in &decl.declarators {
                             let name = strings.get(symbols.get(d.symbol).name).to_string();
-                            // Local variable definition
-                            // Note: we don't have position for declarations, use 0
+                            // The declarator carries its own position, so a local
+                            // with no initializer is still recorded (previously
+                            // such declarations were skipped entirely).
+                            xref.add_definition(&name, d.pos.line);
                             if let Some(init) = &d.init {
-                                xref.add_definition(&name, init.pos.line);
                                 extract_refs_from_expr(init, strings, symbols, xref);
                             }
                         }
@@ -308,8 +311,8 @@ fn extract_refs_from_stmt(
                     posixutils_cc::parse::ast::ForInit::Declaration(d) => {
                         for decl in &d.declarators {
                             let name = strings.get(symbols.get(decl.symbol).name).to_string();
+                            xref.add_definition(&name, decl.pos.line);
                             if let Some(init_expr) = &decl.init {
-                                xref.add_definition(&name, init_expr.pos.line);
                                 extract_refs_from_expr(init_expr, strings, symbols, xref);
                             }
                         }
@@ -342,6 +345,73 @@ fn extract_refs_from_stmt(
 }
 
 // ============================================================================
+// Macro cross-referencing
+// ============================================================================
+
+/// Split a line into identifier-like tokens with their column offsets.
+fn identifiers(line: &str) -> Vec<&str> {
+    line.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|t| !t.is_empty() && !t.starts_with(|c: char| c.is_ascii_digit()))
+        .collect()
+}
+
+/// Cross-reference `#define`d names.
+///
+/// Macro definitions are consumed by the preprocessor and macro uses are
+/// expanded away, so neither survives into the AST — a macro would otherwise be
+/// entirely absent from the listing. Both are therefore recovered from the raw
+/// source text: the `#define` line is the defining reference, and any later
+/// identifier occurrence of that name is a use.
+fn extract_macro_refs(content: &str, xref: &mut CrossRef) {
+    let lines: Vec<&str> = content.lines().collect();
+
+    // Pass 1: definitions.
+    let mut macros: BTreeMap<String, u32> = BTreeMap::new();
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim_start();
+        let Some(rest) = t.strip_prefix('#') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(rest) = rest.strip_prefix("define") else {
+            continue;
+        };
+        // Require a separator so "#defined" is not mistaken for "#define d".
+        if !rest.starts_with(|c: char| c.is_whitespace()) {
+            continue;
+        }
+        let name: String = rest
+            .trim_start()
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if name.is_empty() {
+            continue;
+        }
+        let line_no = (i + 1) as u32;
+        macros.entry(name.clone()).or_insert(line_no);
+        xref.set_function("");
+        xref.add_definition(&name, line_no);
+    }
+
+    if macros.is_empty() {
+        return;
+    }
+
+    // Pass 2: uses.
+    for (i, line) in lines.iter().enumerate() {
+        let line_no = (i + 1) as u32;
+        for ident in identifiers(line) {
+            if let Some(&def_line) = macros.get(ident) {
+                if def_line != line_no {
+                    xref.add_reference(ident, line_no);
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
 // File Processing
 // ============================================================================
 
@@ -360,6 +430,11 @@ fn process_file(
     reader.read_to_end(&mut buffer)?;
 
     xref.set_file(path);
+
+    // Recover macro definitions/uses from the raw text before the preprocessor
+    // expands them away.
+    let text = String::from_utf8_lossy(&buffer);
+    extract_macro_refs(&text, xref);
 
     // Create stream
     let stream_id = streams.add(path.to_string());
@@ -408,8 +483,12 @@ fn process_file(
         match item {
             ExternalDecl::FunctionDef(func) => {
                 let name = strings.get(func.name).to_string();
-                xref.set_function(&name);
+                // The function's own name is not "a symbol appearing inside a
+                // function", so its defining reference belongs to file scope.
+                // Record it before entering the function's scope.
+                xref.set_function("");
                 xref.add_definition(&name, func.pos.line);
+                xref.set_function(&name);
 
                 // Add parameter references
                 for param in &func.params {
@@ -427,10 +506,7 @@ fn process_file(
                 xref.set_function("");
                 for d in &decl.declarators {
                     let name = strings.get(symbols.get(d.symbol).name).to_string();
-                    // Use initializer position if available, otherwise 0
-                    // (Declaration/InitDeclarator don't carry position info)
-                    let line = d.init.as_ref().map(|e| e.pos.line).unwrap_or(0);
-                    xref.add_definition(&name, line);
+                    xref.add_definition(&name, d.pos.line);
                     if let Some(init) = &d.init {
                         extract_refs_from_expr(init, &strings, &symbols, xref);
                     }
@@ -446,9 +522,17 @@ fn process_file(
 // Output
 // ============================================================================
 
-/// Format and print the cross-reference
+/// Format and print the cross-reference.
+///
+/// POSIX ENVIRONMENT VARIABLES: `LC_COLLATE` determines the order in which the
+/// symbol listing is sorted, so the map's byte order is re-sorted through
+/// `strcoll` here rather than relied upon.
 fn print_xref(xref: &CrossRef, width: usize, silent: bool, output: &mut dyn Write) {
-    for (name, info) in &xref.symbols {
+    let mut names: Vec<&String> = xref.symbols.keys().collect();
+    names.sort_by(|a, b| plib::locale::strcoll(a, b));
+
+    for name in names {
+        let info = &xref.symbols[name];
         let mut first_file = true;
 
         for (file, funcs) in &info.refs {
@@ -476,13 +560,26 @@ fn print_xref(xref: &CrossRef, width: usize, silent: bool, output: &mut dyn Writ
                     line_parts.push(line_str);
                 }
 
-                // Calculate prefix length for continuation lines
-                let prefix = format!(
+                // Calculate prefix length for continuation lines. The prefix is
+                // bounded too: a long filename or function name would otherwise
+                // blow past -w on its own, before a single line number is
+                // emitted. Reserve room for at least one reference.
+                let mut prefix = format!(
                     "{:<16} {} {} ",
                     if first_file { name.as_str() } else { "" },
                     file_display,
                     func_display
                 );
+                let widest_ref = line_parts.iter().map(|p| p.len()).max().unwrap_or(1);
+                let prefix_budget = width.saturating_sub(widest_ref);
+                if prefix.len() > prefix_budget && prefix_budget > 0 {
+                    // Truncate on a character boundary; filenames may be UTF-8.
+                    let mut cut = prefix_budget;
+                    while cut > 0 && !prefix.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    prefix.truncate(cut);
+                }
                 let prefix_len = prefix.len();
 
                 // Build output lines respecting width
@@ -553,34 +650,37 @@ fn main() -> ExitCode {
     let mut xref = CrossRef::default();
     let mut streams = StreamTable::new();
 
+    // POSIX OPERANDS for cxref names only "file" — "a pathname of a C-language
+    // source file" — with no suffix rule, so every operand is offered to the
+    // parser and only a genuine read/parse failure is diagnosed.
     for file in &args.files {
-        let ext = Path::new(file)
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
-
-        match ext {
-            "c" | "h" => {
-                if let Err(e) = process_file(
-                    file,
-                    &mut streams,
-                    &mut xref,
-                    &args.defines,
-                    &args.undefines,
-                    &args.include_paths,
-                ) {
-                    plib::diag::error(&format!("{}: {}", file, e));
-                }
-
-                // In non-combined mode, print and reset after each file
-                if !args.combined {
-                    print_xref(&xref, args.width, args.silent, &mut *output_file);
-                    xref = CrossRef::default();
-                }
+        let readable = match process_file(
+            file,
+            &mut streams,
+            &mut xref,
+            &args.defines,
+            &args.undefines,
+            &args.include_paths,
+        ) {
+            Ok(()) => true,
+            Err(e) => {
+                plib::diag::error(&format!("{}: {}", file, e));
+                false
             }
-            _ => {
-                plib::diag::error(&format!("{}: {}", file, gettext("not a C source file")));
+        };
+
+        // In non-combined mode, print and reset after each file. A file that
+        // could not be read contributes no portion to the listing, so it gets
+        // no heading either.
+        if !args.combined && readable {
+            // POSIX STDOUT: "If the -c option is not specified, each portion of
+            // the listing shall start with the name of the input file on a
+            // separate line." -s suppresses filenames entirely.
+            if !args.silent {
+                let _ = writeln!(output_file, "{}", file);
             }
+            print_xref(&xref, args.width, args.silent, &mut *output_file);
+            xref = CrossRef::default();
         }
     }
 

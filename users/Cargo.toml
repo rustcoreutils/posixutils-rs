@@ -16,7 +16,7 @@ chrono.workspace = true
 syslog = "6.1"
 libcrypt-rs = "0.1"
 thiserror.workspace = true
-binrw = "0.14"
+binrw = "0.15"
 
 [dev-dependencies]
 libc = { workspace = true }

@@ -2047,4 +2047,75 @@ mod tests {
         assert_eq!(value.sa_family, libc::AF_UNSPEC as u16);
         assert_eq!(value.sa_data, [2, 88, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2]);
     }
+
+    /// Pin the on-the-wire layout of CtlMsg.
+    ///
+    /// The talk protocol's control message is a fixed 84-byte big-endian
+    /// structure that a remote talkd parses positionally, so the encoding
+    /// binrw generates is part of this program's external contract rather than
+    /// an implementation detail. This asserts each field's offset and byte
+    /// order so that a binrw upgrade cannot silently change the format.
+    #[test]
+    fn test_ctl_msg_wire_layout() {
+        let msg = CtlMsg {
+            vers: 1,
+            r#type: MessageType::Announce as u8,
+            answer: Answer::NotHere as u8,
+            pad: 0,
+            id_num: 0x0102_0304,
+            addr: Osockaddr {
+                sa_family: 0x0a0b,
+                sa_data: [0x11; 14],
+            },
+            ctl_addr: Osockaddr {
+                sa_family: 0x0c0d,
+                sa_data: [0x22; 14],
+            },
+            pid: 0x0506_0708,
+            l_name: string_to_c_string("local"),
+            r_name: string_to_c_string("remote"),
+            r_tty: [0; 16],
+        };
+
+        let bytes = msg.to_bytes().unwrap();
+        assert_eq!(bytes.len(), 84, "CtlMsg is a fixed 84-byte structure");
+
+        assert_eq!(&bytes[0..4], &[1, 3, 1, 0], "vers/type/answer/pad");
+        assert_eq!(&bytes[4..8], &0x0102_0304u32.to_be_bytes(), "id_num is BE");
+
+        assert_eq!(&bytes[8..10], &0x0a0bu16.to_be_bytes(), "addr.sa_family");
+        assert_eq!(&bytes[10..24], &[0x11; 14], "addr.sa_data");
+        assert_eq!(
+            &bytes[24..26],
+            &0x0c0du16.to_be_bytes(),
+            "ctl_addr.sa_family"
+        );
+        assert_eq!(&bytes[26..40], &[0x22; 14], "ctl_addr.sa_data");
+
+        assert_eq!(&bytes[40..44], &0x0506_0708u32.to_be_bytes(), "pid is BE");
+        assert_eq!(&bytes[44..49], b"local", "l_name");
+        assert_eq!(&bytes[56..62], b"remote", "r_name");
+        assert_eq!(&bytes[68..84], &[0; 16], "r_tty");
+    }
+
+    /// CtlRes decodes from the 24-byte big-endian response the daemon sends.
+    #[test]
+    fn test_ctl_res_decodes_daemon_response() {
+        let mut bytes = [0u8; 24];
+        bytes[0] = 1; // vers
+        bytes[1] = MessageType::Delete as u8;
+        bytes[2] = Answer::Success as u8;
+        bytes[3] = 0; // pad
+        bytes[4..8].copy_from_slice(&0xdead_beefu32.to_be_bytes());
+        bytes[8..10].copy_from_slice(&2u16.to_be_bytes()); // sa_family
+        bytes[10..24].copy_from_slice(&[0x33; 14]);
+
+        let res = CtlRes::from_bytes(&bytes).expect("decode CtlRes");
+        assert_eq!(res.vers, 1);
+        assert_eq!(res.r#type, MessageType::Delete);
+        assert_eq!(res.answer, Answer::Success);
+        assert_eq!(res.id_num, 0xdead_beef);
+        assert_eq!(res.addr.sa_family, 2);
+        assert_eq!(res.addr.sa_data, [0x33; 14]);
+    }
 }

@@ -22,7 +22,7 @@ use posixutils_cc::target::Target;
 use posixutils_cc::token::{preprocess_with_defines, PreprocessConfig, StreamTable, Tokenizer};
 use posixutils_cc::types::TypeTable;
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::ExitCode;
@@ -35,11 +35,12 @@ use std::process::ExitCode;
 #[command(version, about = gettext("ctags - create a tags file"))]
 struct Args {
     /// Append to existing tags file
-    #[arg(short = 'a', long, help = gettext("Append to tagsfile"))]
+    #[arg(short = 'a', long, conflicts_with = "index", help = gettext("Append to tagsfile"))]
     append: bool,
 
     /// Write tags to specified file (default: tags)
-    #[arg(short = 'f', long = "file", default_value = "tags", help = gettext("Write tags to specified file"))]
+    #[arg(short = 'f', long = "file", default_value = "tags", conflicts_with = "index",
+          help = gettext("Write tags to specified file"))]
     tags_file: String,
 
     /// Print index to stdout instead of creating tags file
@@ -55,7 +56,7 @@ struct Args {
 // ============================================================================
 
 /// A tag entry representing a definition location
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct TagEntry {
     /// The identifier name
     name: String,
@@ -68,6 +69,15 @@ struct TagEntry {
 }
 
 impl TagEntry {
+    /// Identity of a tag for duplicate-suppression purposes.
+    ///
+    /// Two definitions of the same name in different files (or on different
+    /// lines of one file) are distinct tags and must both survive; only an
+    /// exact re-discovery of the same location is a duplicate.
+    fn key(&self) -> (&str, &str, u32) {
+        (&self.name, &self.file, self.line)
+    }
+
     /// Format as tags file line: identifier<TAB>filename<TAB>/^pattern$/
     fn format_tags(&self) -> String {
         // Escape slashes and backslashes in the pattern
@@ -75,14 +85,19 @@ impl TagEntry {
         format!("{}\t{}\t/^{}$/", self.name, self.file, pattern.trim_end())
     }
 
-    /// Format as -x index line: name line file text
+    /// Format as -x index line.
+    ///
+    /// POSIX STDOUT mandates exactly `"%s %d %s %s", <object-name>,
+    /// <line-number>, <filename>, <text>` where `<text>` is "the text of line
+    /// <line-number> of file <filename>" — single-space separated, and the
+    /// line reproduced verbatim (leading indentation included).
     fn format_index(&self) -> String {
         format!(
-            "{:<16} {:>6} {:<20} {}",
+            "{} {} {} {}",
             self.name,
             self.line,
             self.file,
-            self.line_content.trim()
+            self.line_content.trim_end()
         )
     }
 }
@@ -104,8 +119,11 @@ fn get_line_content(lines: &[String], line_num: u32) -> String {
 fn process_file(path: &str, streams: &mut StreamTable) -> io::Result<Vec<TagEntry>> {
     let mut tags = Vec::new();
 
-    // Read file content once
-    let content = fs::read_to_string(path)?;
+    // Read file content once. Decode leniently rather than hard-failing on a
+    // non-UTF-8 source: the tokenizer works on bytes, and a stray high byte in
+    // a comment or string literal should not cost the whole file its tags.
+    let raw = fs::read(path)?;
+    let content = String::from_utf8_lossy(&raw).into_owned();
     let lines: Vec<String> = content.lines().map(String::from).collect();
 
     // Extract macro tags first (before preprocessing removes them)
@@ -201,15 +219,8 @@ fn process_file(path: &str, streams: &mut StreamTable) -> io::Result<Vec<TagEntr
     Ok(tags)
 }
 
-/// Check whether a line contains a typedef definition for the given name.
-///
-/// This is a lightweight heuristic that:
-/// - Ignores anything following `//` or `/*` on the line.
-/// - Requires `typedef` to appear as a separate token.
-/// - Requires the typedef name to appear as an identifier-like token
-///   (allowing for trailing punctuation like `;` or `,`).
-fn is_typedef_line(line: &str, name: &str) -> bool {
-    // Strip off line comments and simple block comment starts.
+/// Strip line comments and simple block-comment starts from a source line.
+fn strip_comments(line: &str) -> &str {
     let mut code = line;
     if let Some(idx) = code.find("//") {
         code = &code[..idx];
@@ -217,34 +228,77 @@ fn is_typedef_line(line: &str, name: &str) -> bool {
     if let Some(idx) = code.find("/*") {
         code = &code[..idx];
     }
-    let code = code.trim();
-    if code.is_empty() {
-        return false;
-    }
-    let mut has_typedef = false;
-    let mut has_name = false;
-    for raw_token in code.split_whitespace() {
-        if raw_token == "typedef" {
-            has_typedef = true;
-            continue;
-        }
-        // Strip trailing non-identifier characters (e.g., ';', ',', ')').
-        let cleaned = raw_token.trim_end_matches(|c: char| !(c.is_alphanumeric() || c == '_'));
-        if cleaned == name {
-            has_name = true;
-        }
-    }
-    has_typedef && has_name
+    code
 }
 
-/// Find the line number where a typedef is defined
+/// Split a line into identifier-like tokens.
+fn identifiers(code: &str) -> impl Iterator<Item = &str> {
+    code.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|t| !t.is_empty())
+}
+
+/// Whether `code` contains `typedef` as a standalone token.
+fn has_typedef_keyword(code: &str) -> bool {
+    identifiers(code).any(|t| t == "typedef")
+}
+
+/// Find the line number on which the typedef *name* `name` is declared.
+///
+/// A typedef declaration may span several lines — the extremely common
+///
+/// ```c
+/// typedef struct {
+///     int x;
+/// } Foo;
+/// ```
+///
+/// puts the `typedef` keyword and the declared name on different lines, so a
+/// single-line "contains both" test never matches it. This walks the whole
+/// typedef declaration (from the `typedef` keyword to the `;` that closes it at
+/// brace depth zero) and reports the *last* line within that declaration on
+/// which `name` occurs as an identifier — which is where the declarator sits,
+/// and therefore the line whose text belongs in the tag's search pattern.
 fn find_typedef_line(lines: &[String], name: &str) -> Option<u32> {
+    let mut in_typedef = false;
+    let mut depth: i32 = 0;
+    let mut last_hit: Option<u32> = None;
+
     for (i, line) in lines.iter().enumerate() {
-        if is_typedef_line(line, name) {
-            return Some((i + 1) as u32);
+        let code = strip_comments(line);
+
+        if !in_typedef {
+            if !has_typedef_keyword(code) {
+                continue;
+            }
+            in_typedef = true;
+            depth = 0;
+            last_hit = None;
+        }
+
+        if identifiers(code).any(|t| t == name) {
+            last_hit = Some((i + 1) as u32);
+        }
+
+        for ch in code.chars() {
+            match ch {
+                '{' | '(' | '[' => depth += 1,
+                '}' | ')' | ']' => depth -= 1,
+                ';' if depth <= 0 => {
+                    // Declaration complete.
+                    if let Some(hit) = last_hit {
+                        return Some(hit);
+                    }
+                    in_typedef = false;
+                }
+                _ => {}
+            }
+            if !in_typedef {
+                break;
+            }
         }
     }
-    None
+
+    last_hit
 }
 
 /// Extract macro definitions with arguments from source
@@ -279,8 +333,10 @@ fn main() -> ExitCode {
 
     let args = Args::parse();
 
-    // Collect all tags
-    let mut all_tags: BTreeMap<String, TagEntry> = BTreeMap::new();
+    // Collect all tags. Keyed by (name, file, line) rather than by name alone:
+    // two files that each define `init` are two distinct tags, and dropping one
+    // of them silently loses a definition the user asked for.
+    let mut all_tags: BTreeMap<(String, String, u32), TagEntry> = BTreeMap::new();
     let mut streams = StreamTable::new();
 
     for file in &args.files {
@@ -294,7 +350,8 @@ fn main() -> ExitCode {
             "c" | "h" => match process_file(file, &mut streams) {
                 Ok(tags) => {
                     for tag in tags {
-                        all_tags.insert(tag.name.clone(), tag);
+                        let (n, f, l) = tag.key();
+                        all_tags.insert((n.to_string(), f.to_string(), l), tag);
                     }
                 }
                 Err(e) => {
@@ -319,22 +376,25 @@ fn main() -> ExitCode {
     }
 
     if args.index {
-        // Print -x index to stdout
-        for tag in all_tags.values() {
+        // -x listing. POSIX ENVIRONMENT VARIABLES: LC_COLLATE determines "the
+        // order in which output is sorted for the -x option" — unlike the tags
+        // file below, which is fixed to the POSIX locale's collating sequence.
+        let mut tags: Vec<&TagEntry> = all_tags.values().collect();
+        tags.sort_by(|a, b| {
+            plib::locale::strcoll(&a.name, &b.name)
+                .then_with(|| a.file.cmp(&b.file))
+                .then_with(|| a.line.cmp(&b.line))
+        });
+        for tag in tags {
             println!("{}", tag.format_index());
         }
-    } else {
-        // Write tags file
-        let open_result = if args.append {
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&args.tags_file)
-        } else {
-            File::create(&args.tags_file)
-        };
-
-        match open_result {
+    } else if args.append {
+        // Append cannot be made atomic; open and add to whatever is there.
+        match OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&args.tags_file)
+        {
             Ok(mut file) => {
                 for tag in all_tags.values() {
                     if let Err(e) = writeln!(file, "{}", tag.format_tags()) {
@@ -357,6 +417,27 @@ fn main() -> ExitCode {
                 ));
                 return ExitCode::from(1);
             }
+        }
+    } else {
+        // Fresh tags file: build it in memory and swap it into place, so an
+        // interrupted or failed write cannot leave a truncated tags file behind
+        // for a concurrently-running vi/ex to read.
+        //
+        // all_tags is keyed name-major, so iteration order is already the
+        // POSIX-locale (byte) collating sequence the tags file requires.
+        let mut body = String::new();
+        for tag in all_tags.values() {
+            body.push_str(&tag.format_tags());
+            body.push('\n');
+        }
+        if let Err(e) = plib::io::write_atomic(Path::new(&args.tags_file), body.as_bytes()) {
+            plib::diag::error(&format!(
+                "{}: {}: {}",
+                args.tags_file,
+                gettext("error writing"),
+                e
+            ));
+            return ExitCode::from(1);
         }
     }
 

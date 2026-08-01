@@ -83,9 +83,7 @@ fn split_generated_unquoted_literal(
             }
         }
     }
-    if !accumulator.is_empty() {
-        last_word.append(accumulator, false, false);
-    }
+    last_word.append(accumulator, false, false);
 }
 
 fn insert_remaining_parts_into(
@@ -286,14 +284,15 @@ pub mod tests {
     fn split_fields_on_single_non_whitespace_char() {
         assert_eq!(
             split_fields(
-                ExpandedWord::generated_unquoted_literal("a:b:c:"),
+                ExpandedWord::generated_unquoted_literal("a:b:c::"),
                 Some(":"),
                 usize::MAX
             ),
             vec![
                 ExpandedWord::unquoted_literal("a"),
                 ExpandedWord::unquoted_literal("b"),
-                ExpandedWord::unquoted_literal("c")
+                ExpandedWord::unquoted_literal("c"),
+                ExpandedWord::unquoted_literal(""),
             ]
         );
     }

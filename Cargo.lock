@@ -1572,6 +1572,8 @@ dependencies = [
  "gettext-rs",
  "libc",
  "plib",
+ "portable-pty",
+ "tempfile",
  "termion",
  "thiserror 1.0.69",
 ]

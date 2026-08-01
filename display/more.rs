@@ -453,10 +453,10 @@ struct SeekPositions {
     positions: Vec<u64>,
     /// Terminal width for spliting long lines. If [`None`], lines not splited by length
     line_len: Option<usize>,
-    /// Stream size
-    stream_len: u64,
-    /// Count of all lines in source
-    lines_count: usize,
+    /// Total size of the source in bytes, when it is knowable without reading
+    /// everything.  `None` for a source whose length cannot be established up
+    /// front; POSIX 107631-107632 permits omitting the figures derived from it.
+    total_bytes: Option<u64>,
     /// Source that handles info for creating [`SeekRead`] buffer
     source: Source,
     /// Buffer for which is seek and read is applied  
@@ -479,67 +479,39 @@ impl SeekPositions {
         squeeze_lines: bool,
         plain: bool,
     ) -> Result<Self, MoreError> {
-        let buffer: Box<dyn SeekRead> = match source.clone() {
+        // Sizing is O(1): the file's metadata, or the buffer's length.  more
+        // must never read a source through in order to start displaying it —
+        // the input can be arbitrarily large.
+        let (buffer, total_bytes): (Box<dyn SeekRead>, Option<u64>) = match source.clone() {
             Source::File(path) => {
                 let Ok(file) = File::open(path.clone()) else {
                     return Err(MoreError::SeekPositions(SeekPositionsError::FileRead(
                         path.to_str().unwrap_or("<file>").to_string(),
                     )));
                 };
-                let buffer: Box<dyn SeekRead> = Box::new(file);
-                buffer
+                let total = file.metadata().ok().map(|meta| meta.len());
+                (Box::new(file), total)
             }
             Source::Buffer(buffer) => {
-                let buffer: Box<dyn SeekRead> = Box::new(buffer);
-                buffer
+                let total = Some(buffer.get_ref().len() as u64);
+                (Box::new(buffer), total)
             }
         };
-        let mut seek_pos = Self {
-            positions: vec![],
+
+        Ok(Self {
+            // The first line starts at offset 0, so the cursor begins on line
+            // 1.  (The scan this replaced left `positions` in exactly this
+            // state as a side effect; stating it is clearer than deriving it.)
+            positions: vec![0],
             line_len,
-            stream_len: 0,
-            lines_count: 0,
-            source: source.clone(),
+            total_bytes,
+            source,
             buffer,
             squeeze_lines,
             plain,
             is_ended: false,
             style_positions: vec![],
-        };
-        (seek_pos.lines_count, seek_pos.stream_len) = seek_pos.lines_count_and_stream_len();
-        if seek_pos.lines_count as u64 > seek_pos.stream_len {
-            return Err(MoreError::FileRead(source.clone().name()));
-        }
-        Ok(seek_pos)
-    }
-
-    /// Counts all buffer lines and set [`SeekPositions`] to previous state
-    fn lines_count_and_stream_len(&mut self) -> (usize, u64) {
-        let current_line = self.current_line();
-        let _ = self.buffer.rewind();
-        let mut count = 0;
-        while self.next().is_some() {
-            count += 1;
-        }
-        {
-            let mut reader = BufReader::new(&mut self.buffer);
-            let mut buf = vec![];
-            let _ = reader.read_to_end(&mut buf);
-            if !buf.is_empty() {
-                count += 1;
-            }
-        }
-        let stream_position = self.buffer.stream_position().unwrap_or(0);
-        let _ = self.buffer.rewind();
-        let mut i = 0;
-        self.positions = vec![0];
-        while i < current_line {
-            if self.next().is_none() {
-                break;
-            };
-            i += 1;
-        }
-        (count, stream_position)
+        })
     }
 
     /// Read line from current seek position with removing styling control chars
@@ -603,14 +575,29 @@ impl SeekPositions {
         }
     }
 
-    /// Returns full lines count fo current source
-    fn len_lines(&self) -> usize {
-        self.lines_count
+    /// Percentage of the source preceding the current position, when the
+    /// total size is known.
+    ///
+    /// POSIX 107630-107632 asks for "what percentage of the file precedes the
+    /// current position", but permits omitting it when reading from standard
+    /// input.  Measuring in *bytes* rather than lines is what keeps this O(1):
+    /// a total line count cannot be had without reading the whole source.
+    fn percent(&self) -> Option<u8> {
+        let total = self.total_bytes?;
+        if total == 0 {
+            return None;
+        }
+        Some(((u128::from(self.current()) * 100 / u128::from(total)).min(100)) as u8)
     }
 
-    /// Returns stream len fo current source
-    fn _len(&self) -> u64 {
-        self.stream_len
+    /// Drive the source to its end.
+    ///
+    /// This is the only operation that must read everything, and it is only
+    /// ever reached because the user asked to go to the end (`G`) or because
+    /// the display ran off it.  `set_current` stops and sets `is_ended` when
+    /// the source is exhausted, so `usize::MAX` means "as far as this goes".
+    fn goto_end(&mut self) {
+        self.set_current(usize::MAX);
     }
 
     /// Seek to certain [`position`] over current source
@@ -618,7 +605,7 @@ impl SeekPositions {
         let err = Err(MoreError::SeekPositions(SeekPositionsError::OutOfRange(
             position,
         )));
-        if position > self.stream_len {
+        if self.total_bytes.is_some_and(|total| position > total) {
             return err;
         }
         loop {
@@ -1118,13 +1105,10 @@ impl SourceContext {
                 let l = previous_source_screen.0.len();
                 previous_lines = previous_source_screen.0[(l - remain)..].to_vec();
             } else {
-                if current_line + remain < self.seek_positions.len_lines() {
-                    current_line += remain;
-                    self.seek_positions.set_current(current_line);
-                } else {
-                    current_line = self.seek_positions.len_lines();
-                    self.seek_positions.set_current(current_line);
-                }
+                // set_current clamps at the end of the source, so there is
+                // no need to know the total line count to avoid overrunning.
+                self.seek_positions.set_current(current_line + remain);
+                current_line = self.seek_positions.current_line();
                 content_lines_len = current_line;
             }
         }
@@ -1229,12 +1213,7 @@ impl SourceContext {
         } else {
             terminal_size.0 - 1 - header_lines_count
         };
-        if self.seek_positions.len_lines() < next_line {
-            self.seek_positions
-                .set_current(self.seek_positions.len_lines() + 1)
-        } else {
-            self.seek_positions.set_current(next_line)
-        };
+        self.seek_positions.set_current(next_line);
         if let Some(count) = count {
             self.scroll(count, Direction::Forward);
         }
@@ -1247,8 +1226,7 @@ impl SourceContext {
             self.goto_beginning(count);
             return;
         }
-        self.seek_positions
-            .set_current(self.seek_positions.len_lines() + 1);
+        self.seek_positions.goto_end();
         self.is_ended_file = self.seek_positions.is_ended;
     }
 
@@ -2462,11 +2440,7 @@ impl MoreControl {
                 Some(Prompt::More { .. }) | None => Prompt::More {
                     filename: filename.clone(),
                     percent: if self.file_pathes.len() == 1 {
-                        Some(
-                            ((self.context.seek_positions.current_line() as f32
-                                / self.context.seek_positions.lines_count as f32)
-                                * 100.0) as u8,
-                        )
+                        self.context.seek_positions.percent()
                     } else {
                         None
                     },
@@ -2682,9 +2656,9 @@ impl MoreControl {
 
     /// Set [`MoreControl::prompt`] to [`Prompt::DisplayPosition`]
     fn set_position_prompt(&mut self) -> Result<(), MoreError> {
-        let Some(terminal_size) = self.context.terminal_size else {
+        if self.context.terminal_size.is_none() {
             return Err(MoreError::MissingTerminal);
-        };
+        }
         // POSIX 107628: the message includes "the name of the file currently
         // being examined" -- the pathname as given, not just its last
         // component, which would be ambiguous across directories.
@@ -2704,7 +2678,12 @@ impl MoreControl {
         let current_line = self.context.seek_positions.current_line();
         let byte_number = self.context.seek_positions.current();
 
-        let line = if self.context.seek_positions.lines_count >= terminal_size.0 {
+        // POSIX 107631-107632: "If more is reading from standard input, or the
+        // file is shorter than a single screen, the line number, the byte
+        // number, the total bytes, and the percentage need not be written."
+        // Those figures are exactly the ones that need a known total size, so
+        // the short form is used precisely when the size is not knowable.
+        let line = if let Some(percent) = self.context.seek_positions.percent() {
             format!(
                 "{} {}/{} {} {}/{} {}%",
                 filename,
@@ -2713,8 +2692,7 @@ impl MoreControl {
                 current_line,
                 byte_number,
                 file_size,
-                ((current_line as f32 / self.context.seek_positions.lines_count as f32) * 100.0)
-                    as usize
+                percent
             )
         } else {
             format!("{} {}/{}", filename, current_position, input_files_count)
@@ -2795,8 +2773,7 @@ impl MoreControl {
             }
 
             if self.current_position == Some(self.file_pathes.len() - 1)
-                && self.context.seek_positions.current_line()
-                    == self.context.seek_positions.len_lines()
+                && self.context.seek_positions.is_ended
             {
                 if self.args.exit_on_eof {
                     self.exit(None);
@@ -2827,11 +2804,7 @@ impl MoreControl {
                     self.prompt = Some(Prompt::More {
                         filename: self.current_filename(),
                         percent: if self.file_pathes.len() == 1 {
-                            Some(
-                                (self.context.seek_positions.current_line() as f32
-                                    / self.context.seek_positions.lines_count as f32)
-                                    as u8,
-                            )
+                            self.context.seek_positions.percent()
                         } else {
                             None
                         },
@@ -3314,11 +3287,7 @@ impl MoreControl {
                         self.prompt = Some(Prompt::More {
                             filename: self.current_filename(),
                             percent: if self.file_pathes.len() == 1 {
-                                Some(
-                                    (self.context.seek_positions.current_line() as f32
-                                        / self.context.seek_positions.lines_count as f32)
-                                        as u8,
-                                )
+                                self.context.seek_positions.percent()
                             } else {
                                 None
                             },
@@ -3338,11 +3307,7 @@ impl MoreControl {
                     self.prompt = Some(Prompt::More {
                         filename: self.current_filename(),
                         percent: if self.file_pathes.len() == 1 {
-                            Some(
-                                (self.context.seek_positions.current_line() as f32
-                                    / self.context.seek_positions.lines_count as f32)
-                                    as u8,
-                            )
+                            self.context.seek_positions.percent()
                         } else {
                             None
                         },

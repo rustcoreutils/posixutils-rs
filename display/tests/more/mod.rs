@@ -1435,3 +1435,43 @@ fn test_pty_scroll_forward_one_line() {
 
     assert_eq!(session.quit(), Some(0));
 }
+
+#[test]
+fn test_pty_prompt_reports_percentage() {
+    // POSIX 107630: the prompt reports "what percentage of the file precedes
+    // the current position". It is computed from byte offsets against the
+    // source's total size, which is O(1) to obtain -- a line count would
+    // require reading the whole source.
+    let content: String = (1..=500).map(|n| format!("{n}\n")).collect();
+    let path = render_fixture("percent.txt", content.as_bytes());
+    let Some(mut session) = MoreSession::spawn(&[path.to_str().unwrap()], &[], 10, 40) else {
+        println!("Skipping PTY test: no pseudo-terminal available");
+        return;
+    };
+
+    // The prompt occupies the last row and is erased on exit, so it has to be
+    // sampled before quitting.
+    let first = session.row(9);
+    assert!(
+        first.contains("-- More --(") && first.ends_with("%)"),
+        "expected a percentage in the prompt, got {first:?}"
+    );
+
+    // The figure must advance as the user moves through the file.
+    let percent_of = |row: &str| -> u32 {
+        row.rsplit_once('(')
+            .and_then(|(_, rest)| rest.trim_end_matches("%)").parse().ok())
+            .unwrap_or_else(|| panic!("no percentage in {row:?}"))
+    };
+    // Move forward a few screenfuls -- but not to the end, which would swap
+    // the prompt for the exit prompt.
+    let before = percent_of(&first);
+    session.keys("fff");
+    let after = percent_of(&session.row(9));
+    assert!(
+        after > before,
+        "percentage should grow moving toward the end: {before} -> {after}"
+    );
+
+    assert_eq!(session.quit(), Some(0));
+}

@@ -1500,3 +1500,54 @@ fn test_filter_mode_is_byte_exact() {
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(output.stdout, b"a\xff\xfeb\nsecond\n".to_vec());
 }
+
+#[test]
+fn test_pty_renders_non_printable_and_tabs() {
+    // The four render-path items the audit deferred, end to end. Every one of
+    // these inputs used to terminate the line at the control byte, dropping
+    // the rest of it.
+    let path = render_fixture(
+        "render.txt",
+        b"aaa\tbbb\nccc\x01ddd\nzzz\r\nA\x08_ under\na\x08a\x08a\x08a bold\n",
+    );
+    let Some(session) = MoreSession::spawn(&[path.to_str().unwrap()], &[], 12, 40) else {
+        println!("Skipping PTY test: no pseudo-terminal available");
+        return;
+    };
+
+    let grid = session.grid();
+    assert_eq!(grid[0], "aaa     bbb", "tab expands to the next stop");
+    assert_eq!(
+        grid[1], "ccc\\001ddd",
+        "control byte renders, line survives"
+    );
+    assert_eq!(grid[2], "zzz", "carriage return before newline is ignored");
+    assert_eq!(grid[3], "A under", "overstrike underline resolves");
+    assert_eq!(grid[4], "a bold", "a\\ba\\ba\\ba collapses to one 'a'");
+
+    assert_eq!(session.quit(), Some(0));
+}
+
+#[test]
+fn test_pty_renders_full_width_non_ascii() {
+    // A line of non-ASCII is many more bytes than columns. Folding used to be
+    // byte-based, so it split the line mid-character and decoding failed.
+    let path = render_fixture("wide.txt", "ééééééééééééééééééét\n".as_bytes());
+    let Some(session) =
+        MoreSession::spawn(&[path.to_str().unwrap()], &[("LC_ALL", "C.UTF-8")], 10, 20)
+    else {
+        println!("Skipping PTY test: no pseudo-terminal available");
+        return;
+    };
+
+    let grid = session.grid();
+    // 19 accented characters plus 't' is exactly 20 columns -- and 39 bytes,
+    // which the byte-based screen bound used to reject outright.
+    assert_eq!(grid[0], "ééééééééééééééééééét");
+    assert!(
+        !grid.iter().any(|r| r.contains("Couldn't")),
+        "no error should be reported, got {grid:?}"
+    );
+
+    assert_eq!(session.quit(), Some(0));
+}

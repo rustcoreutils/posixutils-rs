@@ -16,7 +16,7 @@ use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::{stdout, BufRead, BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::mem::MaybeUninit;
-use std::ops::{Not, Range};
+use std::ops::Not;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::{exit, ExitStatus};
@@ -30,7 +30,6 @@ use termion::{clear::*, cursor::*, event::*, input::*, screen::*, style::*, *};
 const LINES_PER_PAGE: u16 = 24;
 const NUM_COLUMNS: u16 = 80;
 const DEFAULT_EDITOR: &str = "vi";
-const CONVERT_STRING_BUF_SIZE: usize = 64;
 const PROJECT_NAME: &str = "posixutils-rs";
 
 /// Last acceptable pressed mouse button
@@ -281,8 +280,6 @@ impl std::fmt::Display for MoreError {
 /// All [`SeekPositions`] errors
 #[derive(Debug, Clone, thiserror::Error)]
 enum SeekPositionsError {
-    /// [`Output`], [`Regex`] parse errors
-    StringParse(String),
     /// Attempt seek buffer out of bounds
     OutOfRange(u64),
     /// Source open, read errors
@@ -292,7 +289,6 @@ enum SeekPositionsError {
 impl std::fmt::Display for SeekPositionsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::StringParse(what) => write!(f, "{} {what}", gettext("Couldn't parse")),
             Self::OutOfRange(position) => {
                 write!(
                     f,
@@ -441,6 +437,381 @@ impl Not for Direction {
 /// Defines set of methods that can be used for any [`Source`]'s.
 /// Used for storage and processing of any [`Source`] type in
 /// [`SeekPositions`]
+/// Continuation cell occupying the second column of a double-width character.
+/// [`Terminal::display`] skips these; the character itself was already drawn.
+const CELL_CONT: char = '\u{0}';
+
+/// Default <tab> stop interval.
+const TAB_STOP: usize = 8;
+
+/// How a source line is turned into display cells.
+#[derive(Clone, Copy)]
+struct RenderOpts {
+    /// `-u`: resolve overstrike sequences as usual, but draw everything
+    /// unstyled.  Layout is identical with and without it.
+    plain: bool,
+}
+
+/// One source line (or one folded piece of one) as it appears on screen.
+struct RenderedLine {
+    /// One entry per display column.
+    cells: Vec<(char, StyleType)>,
+    /// Source bytes this consumed.  Kept separate from the column count:
+    /// a byte can occupy four columns (`\377`) and a character can occupy
+    /// two, so the two quantities are unrelated.
+    bytes: usize,
+    /// The piece ended because a <newline> was consumed.
+    ended_at_newline: bool,
+}
+
+/// A decoded input unit: either a character, or a byte that is not part of a
+/// valid character.
+#[derive(Clone, Copy, PartialEq)]
+enum Glyph {
+    Ch(char),
+    Byte(u8),
+}
+
+/// A unit after overstrike resolution: what to draw, how, and how many source
+/// bytes it accounts for (including any discarded overstrike material).
+struct Piece {
+    glyph: Glyph,
+    style: StyleType,
+    bytes: usize,
+}
+
+/// Decode one UTF-8 character from the front of `src`.
+///
+/// Returns `None` when `src` holds only part of a sequence, so the caller can
+/// fetch more input.  UTF-8 is decoded regardless of `LC_CTYPE`: text is
+/// overwhelmingly UTF-8 even under `LC_ALL=C`, and escaping it there would
+/// make ordinary content unreadable.  Bytes that are not valid UTF-8 are
+/// reported one at a time and end up as octal escapes.
+fn decode_glyph(src: &[u8]) -> Option<(Glyph, usize)> {
+    let first = src[0];
+    let len = match first {
+        0x00..=0x7f => 1,
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => return Some((Glyph::Byte(first), 1)),
+    };
+
+    if src.len() < len {
+        return None;
+    }
+
+    match std::str::from_utf8(&src[..len]) {
+        Ok(text) => text.chars().next().map(|c| (Glyph::Ch(c), len)),
+        Err(_) => Some((Glyph::Byte(first), 1)),
+    }
+}
+
+/// Display width of a character, never less than one column.
+fn glyph_width(c: char) -> usize {
+    match plib::locale::wcwidth_char(c) {
+        w if w > 0 => w as usize,
+        // Combining marks and characters the locale cannot measure still need
+        // somewhere to go; a column each is the safe answer.
+        _ => 1,
+    }
+}
+
+/// Render a non-printable character in the `ed` list format that POSIX
+/// 107450-107452 points at: the named escapes of XBD Table 5-1, otherwise one
+/// three-digit octal number per byte of the character.
+///
+/// Unlike `ed`'s `l` command this does not escape a literal <backslash> or
+/// mark the end of line: `l` renders whole lines unambiguously, whereas 107450
+/// scopes escaping to "other non-printable characters" only.  Escaping every
+/// backslash in a pager would be noise.
+fn escape_glyph(glyph: Glyph, out: &mut Vec<char>) {
+    let named = |c: char| -> Option<&'static str> {
+        Some(match c {
+            '\x07' => "\\a",
+            '\x08' => "\\b",
+            '\x0c' => "\\f",
+            '\r' => "\\r",
+            '\x0b' => "\\v",
+            _ => return None,
+        })
+    };
+
+    match glyph {
+        Glyph::Ch(c) => {
+            if let Some(text) = named(c) {
+                out.extend(text.chars());
+                return;
+            }
+            let mut buf = [0u8; 4];
+            for byte in c.encode_utf8(&mut buf).as_bytes() {
+                out.extend(format!("\\{byte:03o}").chars());
+            }
+        }
+        Glyph::Byte(b) => out.extend(format!("\\{b:03o}").chars()),
+    }
+}
+
+/// Resolve the overstrike conventions of POSIX 107432-107447 over a decoded
+/// line, producing the units to draw.
+///
+/// Bytes that are discarded (backspaces and the characters they erase) are
+/// attributed to the *following* unit, so that re-rendering from any byte
+/// offset reproduces the same units — which is what keeps the seek positions
+/// exact across folds.
+fn resolve_overstrike(glyphs: &[(Glyph, usize)], plain: bool) -> Vec<Piece> {
+    let mut pieces: Vec<Piece> = Vec::with_capacity(glyphs.len());
+    let mut carried = 0usize;
+    let mut i = 0;
+
+    let is = |idx: usize, c: char| glyphs.get(idx).map(|g| g.0) == Some(Glyph::Ch(c));
+    let run = |mut idx: usize, c: char| {
+        let mut n = 0;
+        while is(idx, c) {
+            n += 1;
+            idx += 1;
+        }
+        n
+    };
+    let bytes_of = |from: usize, to: usize| -> usize {
+        glyphs[from..to.min(glyphs.len())].iter().map(|g| g.1).sum()
+    };
+
+    while i < glyphs.len() {
+        let (glyph, len) = glyphs[i];
+
+        // A backspace with nothing to erase, or one left over after the forms
+        // below: discard it together with the character it follows
+        // (107446-107447).
+        if glyph == Glyph::Ch('\x08') {
+            carried += len;
+            if let Some(prev) = pieces.pop() {
+                carried += prev.bytes;
+            }
+            i += 1;
+            continue;
+        }
+
+        let width = match glyph {
+            Glyph::Ch(c) if !c.is_control() => glyph_width(c),
+            _ => 1,
+        };
+
+        // "_"*n <backspace>*n <char of width n> -- underline written the other
+        // way round.  Checked before the embolden form so that "_\b_"
+        // underlines rather than emboldening.
+        if glyph == Glyph::Ch('_') {
+            let underscores = run(i, '_');
+            let after = i + underscores;
+            if run(after, '\x08') >= underscores {
+                let target = after + underscores;
+                if let Some(&(Glyph::Ch(c), _)) = glyphs.get(target) {
+                    if !c.is_control() && glyph_width(c) == underscores {
+                        pieces.push(Piece {
+                            glyph: Glyph::Ch(c),
+                            style: if plain {
+                                StyleType::None
+                            } else {
+                                StyleType::Underscore
+                            },
+                            bytes: carried + bytes_of(i, target + 1),
+                        });
+                        carried = 0;
+                        i = target + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        let backspaces = run(i + 1, '\x08');
+        if backspaces == width {
+            let after = i + 1 + backspaces;
+
+            // <char> <backspace>*n "_"*n -- underline.
+            if run(after, '_') >= width {
+                pieces.push(Piece {
+                    glyph,
+                    style: if plain {
+                        StyleType::None
+                    } else {
+                        StyleType::Underscore
+                    },
+                    bytes: carried + bytes_of(i, after + width),
+                });
+                carried = 0;
+                i = after + width;
+                continue;
+            }
+
+            // <char> <backspace>*n <same char> -- embolden.  Further
+            // <backspace>*n <same char> pairs are absorbed, so "a\ba\ba\ba" is
+            // a single emboldened 'a' (107443-107445).
+            if glyphs.get(after).map(|g| g.0) == Some(glyph) {
+                let mut end = after + 1;
+                loop {
+                    let next = end + width;
+                    if run(end, '\x08') >= width && glyphs.get(next).map(|g| g.0) == Some(glyph) {
+                        end = next + 1;
+                    } else {
+                        break;
+                    }
+                }
+                pieces.push(Piece {
+                    glyph,
+                    style: if plain {
+                        StyleType::None
+                    } else {
+                        StyleType::Negative
+                    },
+                    bytes: carried + bytes_of(i, end),
+                });
+                carried = 0;
+                i = end;
+                continue;
+            }
+        }
+
+        pieces.push(Piece {
+            glyph,
+            style: StyleType::None,
+            bytes: carried + len,
+        });
+        carried = 0;
+        i += 1;
+    }
+
+    // Trailing material that erased everything after it still has to be
+    // accounted for, or the cursor would never move past it.
+    if carried > 0 {
+        pieces.push(Piece {
+            glyph: Glyph::Ch('\0'),
+            style: StyleType::None,
+            bytes: carried,
+        });
+    }
+
+    pieces
+}
+
+/// Render one display line from the front of `src`.
+///
+/// Stops at a <newline>, when `cols` columns are filled, or when the input
+/// runs out.  Returns `None` when more input is needed to decide — the caller
+/// then supplies a longer slice.  At end of input it always returns a line.
+///
+/// `bytes` and the column count are tracked separately: this is the whole
+/// point of the function.  A control byte occupies four columns as `\001`, a
+/// <tab> occupies up to eight, and a double-width character occupies two, so
+/// no single number can serve as both a fold width and a seek offset.
+fn render_display_line(
+    src: &[u8],
+    cols: Option<usize>,
+    opts: RenderOpts,
+    at_eof: bool,
+) -> Option<RenderedLine> {
+    // Decode the whole slice up front; overstrike needs lookahead.
+    let mut glyphs: Vec<(Glyph, usize)> = Vec::new();
+    let mut consumed = 0usize;
+    let mut ended_at_newline = false;
+
+    while consumed < src.len() {
+        let Some((glyph, len)) = decode_glyph(&src[consumed..]) else {
+            if at_eof {
+                // A truncated sequence at end of input is just bytes.
+                glyphs.push((Glyph::Byte(src[consumed]), 1));
+                consumed += 1;
+                continue;
+            }
+            return None;
+        };
+
+        // A <carriage-return> immediately before the <newline> that ends the
+        // line is ignored rather than written (107448-107449).  Anywhere else
+        // it is an ordinary non-printable.  Resolved here, before overstrike,
+        // so it can never take part in a backspace sequence.
+        if glyph == Glyph::Ch('\r') {
+            match src.get(consumed + len) {
+                Some(b'\n') => {
+                    consumed += len + 1;
+                    ended_at_newline = true;
+                    break;
+                }
+                None if !at_eof => return None,
+                None => {
+                    consumed += len;
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        consumed += len;
+        if glyph == Glyph::Ch('\n') {
+            ended_at_newline = true;
+            break;
+        }
+        glyphs.push((glyph, len));
+    }
+
+    if !ended_at_newline && !at_eof {
+        // The line may continue in bytes we have not been given yet.
+        return None;
+    }
+
+    let pieces = resolve_overstrike(&glyphs, opts.plain);
+
+    // Lay the pieces out, stopping at the column budget.  A piece is atomic:
+    // if its expansion does not fit it is not emitted and its bytes are not
+    // consumed, so it begins the next display line rather than being split or
+    // dropped (107452-107453).
+    let budget = cols.unwrap_or(usize::MAX);
+    let mut cells: Vec<(char, StyleType)> = Vec::new();
+    let mut bytes = 0usize;
+    let mut folded = false;
+
+    for piece in &pieces {
+        let mut expansion: Vec<char> = Vec::new();
+        match piece.glyph {
+            // The placeholder used for trailing discarded material.
+            Glyph::Ch('\0') => {}
+            Glyph::Ch('\t') => {
+                let next_stop = (cells.len() / TAB_STOP + 1) * TAB_STOP;
+                expansion.resize(next_stop.saturating_sub(cells.len()).max(1), ' ');
+            }
+            Glyph::Ch(c) if !c.is_control() => {
+                expansion.push(c);
+                expansion.resize(glyph_width(c), CELL_CONT);
+            }
+            other => escape_glyph(other, &mut expansion),
+        }
+
+        // Nothing emitted yet and it still does not fit? Emit anyway rather
+        // than making no progress; the screen layer clamps.
+        if !expansion.is_empty() && cells.len() + expansion.len() > budget && !cells.is_empty() {
+            folded = true;
+            break;
+        }
+
+        for ch in expansion {
+            cells.push((ch, piece.style));
+        }
+        bytes += piece.bytes;
+    }
+
+    if !folded && ended_at_newline {
+        // The <newline> (and any <carriage-return> before it) is consumed by
+        // this piece even though it draws nothing.
+        bytes = consumed;
+    }
+
+    Some(RenderedLine {
+        cells,
+        bytes,
+        ended_at_newline: ended_at_newline && !folded,
+    })
+}
+
 trait SeekRead: Seek + Read {}
 
 impl<T: Seek + Read> SeekRead for Box<T> {}
@@ -598,12 +969,10 @@ struct SeekPositions {
     buffer: Box<dyn SeekRead>,
     /// Shrink all sequences of <newline>'s to one <newline>
     squeeze_lines: bool,
-    /// Suppress underlining and bold
+    /// `-u`: suppress underlining and bold
     plain: bool,
     /// Iteration over [`SeekPositions`] buffer has reached end
     is_ended: bool,
-    /// Char positions for stylized text
-    style_positions: Vec<(Range<usize>, StyleType)>,
 }
 
 impl SeekPositions {
@@ -648,46 +1017,68 @@ impl SeekPositions {
             squeeze_lines,
             plain,
             is_ended: false,
-            style_positions: vec![],
         })
     }
 
-    /// Read line from current seek position with removing styling control chars
-    fn read_line(&mut self) -> Result<String, MoreError> {
-        let current_seek = self.current();
-        let mut line = if let Some(next_seek) = self.next() {
-            self.next_back();
-            let mut line_buf = vec![b' '; (next_seek - current_seek) as usize];
-            self.buffer.read_exact(&mut line_buf).map_err(|_| {
-                MoreError::SeekPositions(SeekPositionsError::FileRead(self.source.name()))
-            })?;
-            String::from_utf8(Vec::from_iter(line_buf)).map_err(|_| {
-                MoreError::SeekPositions(SeekPositionsError::StringParse(self.source.name()))
-            })?
-        } else {
-            let mut line_buf = vec![];
-            let _ = self.buffer.read_to_end(&mut line_buf);
-            String::from_utf8(Vec::from_iter(line_buf)).unwrap_or_default()
-        };
-        if line.is_empty() {
-            return Ok(String::new());
-        }
-        for (rng, _) in self.style_positions.iter().rev() {
-            if rng.end > line.len() {
-                continue;
-            };
-            let new = line[rng.clone()]
-                .chars()
-                .filter(|ch| *ch != '\x08' && *ch != '_' && *ch != '\r')
-                .collect::<String>();
-            if !new.is_empty() {
-                let new = new[..1].to_string();
-                if line.len() >= rng.end {
-                    line.replace_range(rng.clone(), &new);
+    /// Render the display line at `start`.
+    ///
+    /// The renderer is a pure function over bytes, so this only has to feed
+    /// it enough of them: it asks for more whenever the slice ends mid-line
+    /// or mid-character, which terminates because the request grows.
+    fn render_at(&mut self, start: u64) -> Option<RenderedLine> {
+        let mut chunk = 1024usize;
+        loop {
+            if self.buffer.seek(SeekFrom::Start(start)).is_err() {
+                return None;
+            }
+
+            let mut buf = vec![0u8; chunk];
+            let mut filled = 0usize;
+            while filled < chunk {
+                match self.buffer.read(&mut buf[filled..]) {
+                    Ok(0) => break,
+                    Ok(n) => filled += n,
+                    Err(_) => return None,
                 }
             }
+            buf.truncate(filled);
+            let at_eof = filled < chunk;
+
+            let opts = RenderOpts { plain: self.plain };
+            if let Some(line) = render_display_line(&buf, self.line_len, opts, at_eof) {
+                if at_eof && line.bytes >= filled {
+                    self.is_ended = true;
+                }
+                return Some(line);
+            }
+            if at_eof {
+                return None;
+            }
+            chunk *= 4;
         }
-        Ok(line)
+    }
+
+    /// The display line at the current position, as cells.
+    fn render_current_line(&mut self) -> Option<RenderedLine> {
+        let start = self.current();
+        self.render_at(start)
+    }
+
+    /// The display line at the current position, as text.
+    ///
+    /// Used for searching, so it is the text the user can see: escapes and
+    /// tab expansion included, overstrike control characters removed.
+    fn read_line(&mut self) -> Result<String, MoreError> {
+        Ok(self
+            .render_current_line()
+            .map(|line| {
+                line.cells
+                    .iter()
+                    .map(|(c, _)| *c)
+                    .filter(|c| *c != CELL_CONT)
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     /// Returns current seek position
@@ -799,248 +1190,6 @@ impl SeekPositions {
         let _ = self.seek(last_seek);
         n_char_seek
     }
-
-    /// Search 'EOF', '\n', if line length bigger than [`Self::line_len`],
-    /// then return next line len as [`Self::line_len`]. Skip next line
-    /// after that [`Self::buffer`] seek position will be at last char
-    /// position of next line. When this function search line end, it
-    /// skips styled text control bytes and add range for replacing this
-    /// bytes with text to [`Self::style_positions`]. [`Self::style_positions`]
-    /// used in [`Self::read_line`] for formating styled text.
-    fn find_next_line_len_with_skip(&mut self) -> usize {
-        let mut style_positions = vec![];
-        let mut buffer_str = String::new();
-        self.is_ended = false;
-        let mut line_len = 0;
-        let mut need_add_chars = 0;
-        let max_line_len = self.line_len.unwrap_or(usize::MAX) as u64;
-        let mut n_count = 0;
-        let mut r_count = 0;
-        {
-            let reader = BufReader::new(&mut self.buffer);
-            let mut bytes = reader.bytes();
-            let mut buf = Vec::with_capacity(CONVERT_STRING_BUF_SIZE);
-            loop {
-                let Some(Ok(byte)) = bytes.next() else {
-                    self.is_ended = true;
-                    break;
-                };
-                match byte {
-                    b'\r' => {
-                        line_len += 1;
-                        buffer_str.push(byte as char);
-                        buf.push(byte);
-                        r_count += 1;
-                        continue;
-                    }
-                    b'\n' => {
-                        line_len += 1;
-                        if self.squeeze_lines {
-                            n_count += 1;
-                            loop {
-                                let Some(Ok(byte)) = bytes.next() else {
-                                    self.is_ended = true;
-                                    break;
-                                };
-                                match byte {
-                                    b'\n' => {
-                                        line_len += 1;
-                                        n_count += 1;
-                                        buffer_str.push(byte as char);
-                                    }
-                                    b'\r' => {
-                                        line_len += 1;
-                                        r_count += 1;
-                                        buffer_str.push(byte as char);
-                                    }
-                                    _ => break,
-                                }
-                            }
-                            let diff = 1 + r_count.min(1);
-                            if n_count > 1 && line_len > diff {
-                                line_len -= diff;
-                                for _ in 0..diff {
-                                    buffer_str.pop();
-                                }
-                            }
-                        }
-                        break;
-                    }
-                    byte if byte.is_ascii_control() && byte != b'\x08' => {
-                        line_len += 1;
-                        break;
-                    }
-                    _ => {
-                        if !self.plain {
-                            if let Some(mut new_style_positions) = continious_styled_parse(
-                                &mut buffer_str,
-                                &mut need_add_chars,
-                                line_len,
-                            ) {
-                                style_positions.append(&mut new_style_positions);
-                            } else {
-                                buffer_str.push(byte as char);
-                                line_len += 1;
-                                continue;
-                            }
-                        }
-                        buffer_str.push(byte as char);
-                        line_len += 1;
-                    }
-                }
-                buf.push(byte);
-                if buf.len() >= CONVERT_STRING_BUF_SIZE {
-                    if let Err(err) = std::str::from_utf8(&buf) {
-                        buf = buf[err.valid_up_to()..].to_vec();
-                    } else {
-                        buf.clear();
-                    }
-                }
-                if line_len as u64 >= max_line_len + need_add_chars {
-                    if line_len > buffer_str.len() {
-                        line_len -= buffer_str.len() + 1;
-                    }
-                    if let Err(err) = std::str::from_utf8(&buf) {
-                        line_len -= buf.len() - err.valid_up_to();
-                    }
-                    break;
-                }
-            }
-        }
-        if !self.plain {
-            let mut new_style_positions = last_styled_parse(
-                &mut buffer_str,
-                &mut line_len,
-                max_line_len as usize,
-                self.is_ended,
-            );
-            if buffer_str.len() < 3 && !self.is_ended {
-                style_positions.pop();
-            }
-            style_positions.append(&mut new_style_positions);
-            self.style_positions = style_positions;
-        }
-        line_len
-    }
-}
-
-/// Parse last chars before current position in [`SeekPositions::buffer`]
-/// for finding styled control sequences during
-/// [`SeekPositions::find_next_line_len_with_skip`] loop
-///
-/// # Arguments
-///
-/// * `buffer_str` - last chars in [SeekPositions::buffer] stream that can
-///   contain styling sequences.
-/// * `need_add_chars` - text styling control char count. This count will be
-///   used for checking if line length is bigger than max line length.
-/// * `line_len` - next line length at that moment in
-///   [`SeekPositions::find_next_line_len_with_skip`] loop.
-fn continious_styled_parse(
-    buffer_str: &mut String,
-    need_add_chars: &mut u64,
-    line_len: usize,
-) -> Option<Vec<(Range<usize>, StyleType)>> {
-    let check_styled = |(i, ch, first): (usize, &char, char)| {
-        (i % 2 == 0 && *ch == first) || (i % 2 == 1 && *ch == '\x08')
-    };
-    let mut style_positions = vec![];
-    let buffer = buffer_str.chars().collect::<Vec<char>>();
-    if buffer.len() == 3 && (buffer.starts_with(&['_', '\x08']) || buffer.ends_with(&['\x08', '_']))
-    {
-        style_positions.push(((line_len - buffer.len())..line_len, StyleType::Underscore));
-        *need_add_chars += 2;
-        buffer_str.clear();
-    } else if buffer.len() < 3 {
-        let is_styled = buffer
-            .iter()
-            .enumerate()
-            .map(|(i, ch)| (i, ch, buffer[0]))
-            .all(check_styled);
-        if is_styled {
-            return None;
-        } else {
-            buffer_str.remove(0);
-        }
-    } else if buffer.len() >= 3 {
-        let is_styled = buffer
-            .iter()
-            .enumerate()
-            .map(|(i, ch)| (i, ch, buffer[0]))
-            .all(check_styled);
-        if !is_styled {
-            style_positions.push((
-                (line_len - buffer.len())..(line_len - 1),
-                StyleType::Negative,
-            ));
-            *need_add_chars += ((buffer.len() as f32) / 2.0).floor() as u64;
-        } else {
-            return None;
-        }
-        let last = buffer_str.chars().last();
-        buffer_str.clear();
-        if let Some(last) = last {
-            buffer_str.push(last);
-        }
-    }
-    Some(style_positions)
-}
-
-/// Parse last chars before current position in [`SeekPositions::buffer`]
-/// for finding styled control sequences after
-/// [`SeekPositions::find_next_line_len_with_skip`] loop
-///
-/// # Arguments
-///
-/// * `buffer_str` - last chars in [SeekPositions::buffer] stream that can
-///   contain styling sequences.
-/// * `line_len` - next line length at that moment in
-///   [`SeekPositions::find_next_line_len_with_skip`] loop.
-///
-/// * `max_line_len` - line that length bigger than this value will be splited
-/// * `is_ended` - indicate that [SeekPositions::buffer] stream reached `EOF`
-fn last_styled_parse(
-    buffer_str: &mut str,
-    line_len: &mut usize,
-    max_line_len: usize,
-    is_ended: bool,
-) -> Vec<(Range<usize>, StyleType)> {
-    let check_styled = |(i, ch, first): (usize, &char, char)| {
-        (i % 2 == 0 && *ch == first) || (i % 2 == 1 && *ch == '\x08')
-    };
-    let mut style_positions = vec![];
-    let l = buffer_str
-        .chars()
-        .filter(|ch| *ch == '\n' || *ch == '\r' || *ch == ' ')
-        .count();
-    let buffer = buffer_str
-        .chars()
-        .filter(|ch| *ch != '\n' && *ch != '\r' && *ch != ' ')
-        .collect::<Vec<char>>();
-    if !buffer.is_empty() && buffer.len() < 3 && max_line_len > l + 2 && *line_len >= max_line_len {
-        *line_len -= l + 2;
-    } else if buffer.len() == 3
-        && (buffer.starts_with(&['_', '\x08']) || buffer.ends_with(&['\x08', '_']))
-    {
-        style_positions.push((
-            (*line_len - buffer.len() - l - (!is_ended as usize))
-                ..(*line_len - (!is_ended as usize)),
-            StyleType::Underscore,
-        ));
-    } else if buffer.len() >= 3
-        && buffer
-            .iter()
-            .enumerate()
-            .map(|(i, ch)| (i, ch, buffer[0]))
-            .all(check_styled)
-    {
-        style_positions.push((
-            (*line_len - buffer.len() - l - (!is_ended as usize))
-                ..(*line_len - (!is_ended as usize)),
-            StyleType::Negative,
-        ));
-    }
-    style_positions
 }
 
 impl Iterator for SeekPositions {
@@ -1048,26 +1197,41 @@ impl Iterator for SeekPositions {
 
     /// Iter over [`SeekRead`] buffer lines in forward direction
     fn next(&mut self) -> Option<Self::Item> {
-        let current_position = *self.positions.last().unwrap_or(&0);
-        if self.buffer.seek(SeekFrom::Start(current_position)).is_err() {
+        let current_position = self.current();
+        let line = self.render_at(current_position)?;
+        if line.bytes == 0 {
+            self.is_ended = true;
             return None;
         }
-        let line_len = self.find_next_line_len_with_skip();
-        let next_position = current_position + line_len as u64;
-        // `is_ended` is set when the reader actually reported end-of-input.
-        // The total is consulted only when it is known; a stream's is not,
-        // and the buffered reader's position is a read-ahead point rather
-        // than the end of the source, so it cannot stand in for one.
-        if self.is_ended || self.total_bytes().is_some_and(|t| next_position >= t) {
-            let _ = self.buffer.seek(SeekFrom::Start(current_position));
-            None
-        } else {
-            if self.buffer.seek(SeekFrom::Start(next_position)).is_err() {
-                return None;
-            };
-            self.positions.push(next_position);
-            Some(next_position)
+
+        let mut next_position = current_position + line.bytes as u64;
+
+        // `-s`: a run of empty lines is displayed as one, so the run's bytes
+        // are consumed together.  This lives here rather than in the renderer
+        // because it spans lines.
+        if self.squeeze_lines && line.ended_at_newline && line.cells.is_empty() {
+            while let Some(extra) = self.render_at(next_position) {
+                if extra.bytes == 0 || !extra.ended_at_newline || !extra.cells.is_empty() {
+                    break;
+                }
+                next_position += extra.bytes as u64;
+            }
         }
+
+        if self
+            .total_bytes()
+            .is_some_and(|total| next_position >= total)
+        {
+            self.is_ended = true;
+            let _ = self.buffer.seek(SeekFrom::Start(current_position));
+            return None;
+        }
+
+        if self.buffer.seek(SeekFrom::Start(next_position)).is_err() {
+            return None;
+        }
+        self.positions.push(next_position);
+        Some(next_position)
     }
 }
 
@@ -1093,31 +1257,6 @@ enum Source {
     /// has been read to a temporary file.  Shared, so that every cursor over
     /// the same input reads the same bytes exactly once.
     Stream(SharedSpill),
-}
-
-impl Source {
-    /// Returns [`String`] that identify [`Source`]
-    fn name(&mut self) -> String {
-        match self {
-            Source::File(path) => path.to_str().unwrap_or("<file>").to_owned(),
-            Source::Stream(_) => "-".to_owned(),
-            Source::Buffer(cursor) => {
-                let current_pos = cursor.stream_position().unwrap_or(0);
-                let _ = cursor.seek(SeekFrom::Start(0));
-                let mut line = String::new();
-                if BufRead::read_line(cursor, &mut line).is_err() {
-                    line = "<buffer>".to_owned();
-                }
-                if line.len() > 15 {
-                    if let Some(sub) = line.get(..15) {
-                        line = sub.to_owned() + "...";
-                    }
-                }
-                let _ = cursor.seek(SeekFrom::Start(current_pos));
-                line
-            }
-        }
-    }
 }
 
 /// Context of more current source, last search, flags etc
@@ -1269,44 +1408,23 @@ impl SourceContext {
             }
         }
 
+        // Collect the visible lines as cells.  Style travels inside the cells,
+        // so there is no second pass to map byte ranges onto column indices.
         let mut i = 0;
         // Guard the subtraction: a source with nothing to show yields zero
         // content lines, and `0 - 1` would wrap to usize::MAX.
         while i + 1 < content_lines_len {
-            let line = self.seek_positions.read_line()?;
-            content_lines.push(line);
+            content_lines.push(self.seek_positions.render_current_line());
             if self.seek_positions.next_back().is_none() {
                 break;
             }
             i += 1;
         }
-        let line = self.seek_positions.read_line()?;
-        content_lines.push(line);
-
+        content_lines.push(self.seek_positions.render_current_line());
         content_lines.reverse();
 
-        let mut style_lines = vec![];
-        let mut add_style_line = |seek_positions: &mut SeekPositions| {
-            let mut deleted_count = 0;
-            style_lines.push(
-                seek_positions
-                    .style_positions
-                    .clone()
-                    .into_iter()
-                    .map(|(rng, st)| {
-                        deleted_count += rng.end - rng.start - 1;
-                        (rng.end - deleted_count - 1, st)
-                    })
-                    .collect::<Vec<_>>(),
-            );
-        };
-        while self.seek_positions.next().is_some()
-            && self.seek_positions.current_line() <= current_line
-        {
-            add_style_line(&mut self.seek_positions);
-        }
-        add_style_line(&mut self.seek_positions);
         self.seek_positions.set_current(current_line);
+
         let previous_lines_len = previous_lines.len();
         for (i, line) in previous_lines.into_iter().enumerate() {
             screen.set_raw((i, 0), line)?
@@ -1317,22 +1435,8 @@ impl SourceContext {
         }
 
         for (i, line) in content_lines.into_iter().enumerate() {
-            screen.set_str(
-                (i + previous_lines_len + header_lines_len, 0),
-                line,
-                StyleType::None,
-            )?;
-            let Some(style_positions) = style_lines.get(i) else {
-                continue;
-            };
-            let Some(line) = screen.0.get_mut(i + previous_lines_len + header_lines_len) else {
-                continue;
-            };
-            for (pos, st) in style_positions {
-                if line.len() > *pos {
-                    line[*pos].1 = *st;
-                }
-            }
+            let cells = line.map(|l| l.cells).unwrap_or_default();
+            screen.set_raw((i + previous_lines_len + header_lines_len, 0), cells)?;
         }
 
         self.is_ended_file = self.seek_positions.is_ended;
@@ -1927,8 +2031,6 @@ struct Terminal {
     size: (u16, u16),
     /// Set terminal height as lines
     lines: Option<u16>,
-    /// Suppress underlining and bold
-    plain: bool,
     /// Input stream
     input_stream: Receiver<Result<String, MoreError>>,
     /// Held only when no input thread is spawned (`--test` or filter mode),
@@ -1961,7 +2063,6 @@ impl Terminal {
     fn new(
         is_test: bool,
         lines: Option<u16>,
-        plain: bool,
         command_reader: CommandReader,
         prompt_out: Box<dyn Write + Send>,
     ) -> Result<Self, MoreError> {
@@ -1994,7 +2095,6 @@ impl Terminal {
                 env_screen_size("COLUMNS").unwrap_or(NUM_COLUMNS),
             ),
             lines,
-            plain,
             input_stream: receiver,
             _input_keepalive: keepalive,
         };
@@ -2024,13 +2124,18 @@ impl Terminal {
             return Err(MoreError::SetOutside);
         }
         let mut style = StyleType::None;
-        let plain = self.plain;
         for (i, line) in screen.0.iter().enumerate() {
             write_ch_on(&mut self.tty, ' ', 0, i as u16);
             clear_current_line_on(&mut self.tty);
             for (j, (ch, st)) in line.iter().enumerate() {
+                // The second column of a double-width character holds a
+                // continuation marker; the character itself was drawn in the
+                // column before it.
+                if *ch == CELL_CONT {
+                    continue;
+                }
                 if style != *st {
-                    let _ = set_style_on(&mut self.tty, if !plain { *st } else { StyleType::None });
+                    let _ = set_style_on(&mut self.tty, *st);
                     style = *st;
                 }
                 write_ch_on(&mut self.tty, *ch, j as u16, i as u16);
@@ -2080,15 +2185,11 @@ impl Terminal {
         } else {
             self.size.0 - 1
         };
-        let plain = self.plain;
         write_ch_on(&mut self.prompt_out, ' ', 1, line_position);
         clear_current_line_on(&mut self.prompt_out);
         for (i, (ch, st)) in line.iter().enumerate() {
             if style != *st {
-                let _ = set_style_on(
-                    &mut self.prompt_out,
-                    if !plain { *st } else { StyleType::None },
-                );
+                let _ = set_style_on(&mut self.prompt_out, *st);
                 style = *st;
             }
             write_ch_on(&mut self.prompt_out, *ch, i as u16, line_position);
@@ -2432,14 +2533,7 @@ impl MoreControl {
         } else {
             (None, CommandReader::None, Box::new(std::io::sink()))
         };
-        let terminal = Terminal::new(
-            args.test,
-            args.lines,
-            args.plain,
-            command_reader,
-            prompt_out,
-        )
-        .ok();
+        let terminal = Terminal::new(args.test, args.lines, command_reader, prompt_out).ok();
 
         let source = if args.input_files.is_empty()
             || (args.input_files.len() == 1 && args.input_files[0] == *"-")
@@ -2604,6 +2698,11 @@ impl MoreControl {
             } else {
                 terminal.display(screen)?;
             };
+            // Content goes to stdout and the prompt to stderr, which are
+            // separately buffered handles onto the same terminal.  Flush the
+            // content before writing the prompt, or the two interleave and
+            // escape sequences from one land inside the other.
+            let _ = terminal.tty.flush();
             terminal.display_prompt(prompt)?;
             if self.is_matched {
                 write_str_on(&mut terminal.prompt_out, "", 0, 0);
@@ -3326,7 +3425,7 @@ impl MoreControl {
         }
         match error {
             MoreError::SeekPositions(ref seek_positions_error) => match seek_positions_error {
-                SeekPositionsError::StringParse(_) | SeekPositionsError::OutOfRange(_) => {
+                SeekPositionsError::OutOfRange(_) => {
                     self.exit(Some(error_str.clone()));
                 }
                 SeekPositionsError::FileRead(_) => {
@@ -4112,6 +4211,138 @@ mod tests {
         std::env::set_var("POSIXUTILS_MORE_TEST_TWO", "one two");
         assert!(word_expand("$POSIXUTILS_MORE_TEST_TWO").is_err());
         assert!(word_expand("'unterminated").is_err());
+    }
+
+    use super::{render_display_line, RenderOpts, StyleType, CELL_CONT};
+
+    /// Render `src` and return the drawn text, the styles, and the bytes taken.
+    fn render(src: &[u8], cols: Option<usize>) -> (String, Vec<StyleType>, usize) {
+        let opts = RenderOpts { plain: false };
+        let line = render_display_line(src, cols, opts, true).expect("at eof");
+        let text = line
+            .cells
+            .iter()
+            .map(|(c, _)| *c)
+            .filter(|c| *c != CELL_CONT)
+            .collect();
+        let styles = line.cells.iter().map(|(_, st)| *st).collect();
+        (text, styles, line.bytes)
+    }
+
+    fn text_of(src: &[u8]) -> String {
+        render(src, None).0
+    }
+
+    #[test]
+    fn render_expands_non_printable_characters() {
+        // POSIX 107450-107452: the ed(1) list format -- named escapes, then
+        // one three-digit octal number per byte.
+        assert_eq!(text_of(b"ccc\x01ddd\n"), "ccc\\001ddd");
+        assert_eq!(text_of(b"a\x7fb\n"), "a\\177b");
+        assert_eq!(text_of(b"a\x07b\n"), "a\\ab");
+        assert_eq!(text_of(b"a\x0bb\n"), "a\\vb");
+        // Invalid bytes are escaped one at a time; valid UTF-8 is not, in any
+        // locale.
+        assert_eq!(text_of(b"a\xffb\n"), "a\\377b");
+        assert_eq!(text_of("café\n".as_bytes()), "café");
+        // A literal backslash is printable and is left alone.
+        assert_eq!(text_of(b"a\\b\n"), "a\\b");
+    }
+
+    #[test]
+    fn render_expands_tabs_to_stops() {
+        assert_eq!(text_of(b"a\tb\n"), "a       b");
+        assert_eq!(text_of(b"\tx\n"), "        x");
+        assert_eq!(text_of(b"abcdefg\th\n"), "abcdefg h");
+        assert_eq!(text_of(b"abcdefgh\ti\n"), "abcdefgh        i");
+    }
+
+    #[test]
+    fn render_ignores_carriage_return_at_end_of_line() {
+        // 107448-107449: a <carriage-return> ending a line is ignored rather
+        // than written as a non-printable character.
+        assert_eq!(text_of(b"zzz\r\n"), "zzz");
+        assert_eq!(text_of(b"zzz\r"), "zzz");
+        // Anywhere else it is an ordinary non-printable.
+        assert_eq!(text_of(b"a\rb\n"), "a\\rb");
+    }
+
+    #[test]
+    fn render_resolves_overstrike() {
+        // 107432-107445. Underline, both orders.
+        let (text, styles, _) = render(b"A\x08_\n", None);
+        assert_eq!(text, "A");
+        assert_eq!(styles, vec![StyleType::Underscore]);
+
+        let (text, styles, _) = render(b"_\x08A\n", None);
+        assert_eq!(text, "A");
+        assert_eq!(styles, vec![StyleType::Underscore]);
+
+        // "_\b_" underlines rather than emboldening.
+        let (_, styles, _) = render(b"_\x08_\n", None);
+        assert_eq!(styles, vec![StyleType::Underscore]);
+
+        // Embolden, and "a\ba\ba\ba" is one emboldened 'a' (107443-107445).
+        let (text, styles, _) = render(b"a\x08a\n", None);
+        assert_eq!(text, "a");
+        assert_eq!(styles, vec![StyleType::Negative]);
+
+        let (text, styles, _) = render(b"a\x08a\x08a\x08a\n", None);
+        assert_eq!(text, "a");
+        assert_eq!(styles, vec![StyleType::Negative]);
+
+        // Any other backspace discards itself and the character before it.
+        assert_eq!(text_of(b"A\x08B\n"), "B");
+        assert_eq!(text_of(b"\x08B\n"), "B");
+    }
+
+    #[test]
+    fn render_plain_keeps_layout_but_drops_style() {
+        let opts = RenderOpts { plain: true };
+        let line = render_display_line(b"A\x08_ b\n", None, opts, true).unwrap();
+        let text: String = line.cells.iter().map(|(c, _)| *c).collect();
+        assert_eq!(text, "A b", "-u must not change layout");
+        assert!(line.cells.iter().all(|(_, st)| *st == StyleType::None));
+    }
+
+    #[test]
+    fn render_folds_without_splitting_or_dropping() {
+        // A unit that does not fit begins the next line rather than being
+        // split or discarded (107452-107453).
+        let (text, _, bytes) = render(b"abcdefghij\n", Some(4));
+        assert_eq!(text, "abcd");
+        assert_eq!(bytes, 4);
+
+        // An escape is four columns wide and is not split across the fold.
+        let (text, _, bytes) = render(b"ab\x01cd\n", Some(4));
+        assert_eq!(text, "ab");
+        assert_eq!(bytes, 2);
+        let (text, _, _) = render(b"\x01cd\n", Some(4));
+        assert_eq!(text, "\\001");
+    }
+
+    #[test]
+    fn render_byte_accounting_round_trips() {
+        // Every byte of the source must be accounted for exactly once, or
+        // the seek offsets built from these counts would drift.
+        let src: &[u8] =
+            b"plain\nA\x08_ under\na\x08a bold\n\ttab\n\x01\xff\n\r\ncaf\xc3\xa9\n\n\n";
+        for cols in [None, Some(3), Some(7), Some(40)] {
+            let mut offset = 0usize;
+            let mut guard = 0;
+            while offset < src.len() {
+                let opts = RenderOpts { plain: false };
+                let line = render_display_line(&src[offset..], cols, opts, true).expect("at eof");
+                assert!(
+                    line.bytes > 0,
+                    "no progress at offset {offset} cols {cols:?}"
+                );
+                offset += line.bytes;
+                guard += 1;
+                assert!(guard < 1000, "runaway at cols {cols:?}");
+            }
+            assert_eq!(offset, src.len(), "byte drift at cols {cols:?}");
+        }
     }
 
     #[test]

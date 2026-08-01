@@ -193,11 +193,15 @@ impl<'a> super::linearize::Linearizer<'a> {
 
             // Check if this is a VLA (Variable Length Array)
             if !declarator.vla_sizes.is_empty() {
-                // C99 6.7.8: VLAs cannot have initializers
+                // C99 6.7.8: VLAs cannot have initializers.
+                // Report against the declarator's own position: `current_pos`
+                // is an Option and, when it is None, this constraint violation
+                // used to be dropped without any diagnostic at all.
                 if declarator.init.is_some() {
-                    if let Some(pos) = self.current_pos {
-                        error(pos, "variable length arrays cannot have initializers");
-                    }
+                    error(
+                        declarator.pos,
+                        "variable length arrays cannot have initializers",
+                    );
                 }
                 self.linearize_vla_decl(declarator);
                 continue;

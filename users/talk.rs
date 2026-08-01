@@ -32,6 +32,7 @@ use std::{
     os::unix::net::UnixDatagram,
     path::{Path, PathBuf},
     process, ptr,
+    sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, LazyLock, Mutex},
     thread,
     time::{Duration, Instant},
@@ -71,6 +72,14 @@ static DELETE_INVITATIONS: LazyLock<Arc<Mutex<Option<State>>>> =
 static ORIGINAL_TERMIOS: LazyLock<Mutex<Option<libc::termios>>> =
     LazyLock::new(|| Mutex::new(None));
 
+/// The terminal's erase/kill characters, captured from termios before raw mode
+/// (spec 116758). Falls back to the POSIX defaults until then.
+static KEYMAP: LazyLock<Mutex<KeyMap>> = LazyLock::new(|| Mutex::new(KeyMap::default()));
+
+/// Set by the SIGWINCH handler; the render loops re-query the terminal size and
+/// repaint when they see it (audit #TK9).
+static RESIZED: AtomicBool = AtomicBool::new(false);
+
 /// Restore the terminal to the attributes captured before raw mode, if any.
 fn restore_terminal() {
     if let Ok(guard) = ORIGINAL_TERMIOS.lock() {
@@ -88,8 +97,6 @@ const BUFFER_SIZE: usize = 12;
 //i The maximum size for the buffer to store the hostname, based on typical hostname lengths.
 const HOSTNAME_BUFFER_SIZE: usize = 256;
 
-/// The maximum number of characters allowed for user input in a single operation.
-const MAX_USER_INPUT_LENGTH: usize = 128;
 /// The version number for the talk protocol.
 const TALK_VERSION: u8 = 1;
 
@@ -407,7 +414,6 @@ impl CtlRes {
 fn talk(args: Args) -> Result<(), TalkError> {
     let mut msg = CtlMsg::default();
     let mut res = CtlRes::default();
-    let mut output_buffer = String::new();
 
     // Retrieve the local and remote machine names
     let (my_machine_name, his_machine_name) =
@@ -439,7 +445,7 @@ fn talk(args: Args) -> Result<(), TalkError> {
 
     // Set the invitation ID number and send a delete request for the old invitation
     if res.answer == Answer::Success {
-        handle_existing_invitation(width, height, &mut output_buffer, &mut res)?;
+        handle_existing_invitation(width, height, &mut res)?;
     } else {
         logger.set_state("[Waiting to connect with caller]");
         handle_new_invitation(
@@ -451,7 +457,6 @@ fn talk(args: Args) -> Result<(), TalkError> {
             &mut res,
             my_machine_addr,
             &mut logger,
-            &mut output_buffer,
         )?;
     }
 
@@ -465,7 +470,6 @@ fn talk(args: Args) -> Result<(), TalkError> {
 fn talk_local(args: Args) -> Result<(), TalkError> {
     let mut msg = CtlMsg::default();
     let mut res = CtlRes::default();
-    let mut output_buffer = String::new();
 
     let socket_path = PathBuf::from(get_local_socket_path());
 
@@ -522,7 +526,7 @@ fn talk_local(args: Args) -> Result<(), TalkError> {
 
     if res.answer == Answer::Success {
         // Found an existing invitation - connect to it
-        handle_existing_invitation(width, height, &mut output_buffer, &mut res)?;
+        handle_existing_invitation(width, height, &mut res)?;
     } else {
         // No invitation found - create one and wait
         logger.set_state("[Waiting for your party to respond]");
@@ -547,7 +551,7 @@ fn talk_local(args: Args) -> Result<(), TalkError> {
                     msg.id_num = remote_id;
                     let _ = send_delete_local(&socket_path, &mut msg, &mut res);
 
-                    if let Err(e) = handle_client(client_stream, &mut output_buffer) {
+                    if let Err(e) = handle_client(client_stream) {
                         eprintln!("Failed to handle client: {}", e);
                     }
                     break;
@@ -589,12 +593,7 @@ fn check_if_tty() -> Result<(), TalkError> {
 /// # Returns
 ///
 /// A `Result` indicating success or a `TalkError`.
-fn handle_existing_invitation(
-    width: u16,
-    height: u16,
-    output_buffer: &mut String,
-    res: &mut CtlRes,
-) -> Result<(), TalkError> {
+fn handle_existing_invitation(width: u16, height: u16, res: &mut CtlRes) -> Result<(), TalkError> {
     let tcp_addr = SocketAddrV4::from(&res.addr);
 
     // Establish a TCP connection to the `tcp_addr`. Map any IO errors to `TalkError::IoError`.
@@ -603,27 +602,24 @@ fn handle_existing_invitation(
     let write_stream = stream.try_clone().map_err(TalkError::IoError)?;
     let read_stream = stream.try_clone().map_err(TalkError::IoError)?;
 
-    let top_line = Arc::new(Mutex::new(2));
-    let bottom_line = Arc::new(Mutex::new(0));
+    let split_row = height / 2;
+    // Top half is the local user's, bottom half the peer's.
+    let local_window = Arc::new(Mutex::new(Window::new(
+        1,
+        split_row.saturating_sub(1),
+        width,
+    )));
+    let peer_window = Arc::new(Mutex::new(Window::new(
+        split_row + 1,
+        height.saturating_sub(split_row),
+        width,
+    )));
 
     // Spawn a thread to handle incoming data from the TCP read stream and update the terminal accordingly.
-    spawn_input_thread(
-        read_stream,
-        height / 2,
-        width,
-        Arc::clone(&top_line),
-        Arc::clone(&bottom_line),
-        &mut output_buffer.clone(),
-    )?;
+    spawn_input_thread(read_stream, split_row, width, Arc::clone(&peer_window))?;
 
     // Handle user input from stdin, writing it to the TCP write stream and updating the terminal's top line.
-    handle_stdin_input(
-        write_stream,
-        height / 2,
-        Arc::clone(&top_line),
-        output_buffer,
-    )
-    .map_err(TalkError::IoError)?;
+    handle_stdin_input(write_stream, split_row, local_window).map_err(TalkError::IoError)?;
 
     Ok(())
 }
@@ -645,11 +641,8 @@ fn spawn_input_thread(
     read_stream: TcpStream,
     split_row: u16,
     width: u16,
-    top_line: Arc<Mutex<u16>>,
-    bottom_line: Arc<Mutex<u16>>,
-    output_buffer: &mut str,
+    peer_window: Arc<Mutex<Window>>,
 ) -> Result<(), TalkError> {
-    let mut output = output_buffer.to_owned();
     thread::spawn(move || {
         // Set terminal to raw mode
         let stdin_fd = libc::STDIN_FILENO;
@@ -669,8 +662,17 @@ fn spawn_input_thread(
             *guard = Some(original_termios);
         }
 
-        // Set raw mode flags
-        termios.c_lflag &= !(libc::ICANON); // Disable canonical mode and echo
+        // The erase/kill characters must come from the terminal's own settings
+        // (spec 116758), so capture them before we change anything.
+        if let Ok(mut guard) = KEYMAP.lock() {
+            *guard = KeyMap::from_termios(&original_termios);
+        }
+
+        // Set raw mode flags. ECHO must go too: talk draws every character
+        // itself, so leaving the driver's echo on shows each keystroke twice
+        // (audit #TK15) -- the original comment claimed this but only cleared
+        // ICANON.
+        termios.c_lflag &= !(libc::ICANON | libc::ECHO);
         termios.c_cc[libc::VMIN] = 1; // Minimum number of characters to read
         termios.c_cc[libc::VTIME] = 0; // No timeout, read immediately
 
@@ -680,17 +682,17 @@ fn spawn_input_thread(
             return;
         }
 
-        // Initialize terminal drawing
-        let mut handle = match draw_terminal(split_row, width) {
-            Ok(handle) => handle,
-            Err(e) => {
-                eprintln!("Failed to draw terminal: {}", e);
-                return; // Exit thread on failure
-            }
-        };
+        // Initialize terminal drawing. The stdout lock is taken and released
+        // inside; each render below re-acquires it briefly (audit #TK21).
+        if let Err(e) = draw_terminal(split_row, width) {
+            eprintln!("Failed to draw terminal: {}", e);
+            return; // Exit thread on failure
+        }
 
         let mut buffer = [0; 128];
-        let mut line_buffer = String::new();
+        // Bytes of a multi-byte character split across two recv() calls
+        // (audit #TK10).
+        let mut pending: Vec<u8> = Vec::new();
 
         let _restore = RestoreTermOnDrop { original_termios };
 
@@ -715,54 +717,31 @@ fn spawn_input_thread(
                     break;
                 }
                 nbytes => {
-                    // Process the received data
                     let nbytes = nbytes as usize;
-                    let input = match std::str::from_utf8(&buffer[..nbytes]) {
-                        Ok(input) => input,
-                        Err(e) => {
-                            eprintln!("Failed to convert buffer to UTF-8 string: {}", e);
-                            continue; // Continue on invalid UTF-8
-                        }
-                    };
+                    pending.extend_from_slice(&buffer[..nbytes]);
+                    let text = decode_pending(&mut pending);
 
-                    let top_line = top_line.lock().unwrap();
-                    let mut bottom_line = bottom_line.lock().unwrap();
-                    for c in input.chars() {
-                        match c {
-                            '\n' => {
-                                if let Err(e) = handle_newline(
-                                    &mut line_buffer,
-                                    &mut bottom_line,
-                                    split_row,
-                                    &mut handle,
-                                ) {
-                                    eprintln!("Error handling newline: {}", e);
-                                }
-                            }
-                            '\x08' | '\x7f' => {
-                                if let Err(e) = handle_backspace(
-                                    &mut line_buffer,
-                                    split_row,
-                                    *bottom_line,
-                                    &mut handle,
-                                    *top_line,
-                                ) {
-                                    eprintln!("Error handling backspace: {}", e);
-                                }
-                            }
-                            _ => {
-                                if let Err(e) = handle_character(
-                                    c,
-                                    &mut line_buffer,
-                                    &mut output,
-                                    split_row,
-                                    *bottom_line,
-                                    *top_line,
-                                    &mut handle,
-                                ) {
-                                    eprintln!("Error handling character '{}': {}", c, e);
-                                }
-                            }
+                    let keys = KEYMAP.lock().map(|k| *k).unwrap_or_default();
+                    let mut win = match peer_window.lock() {
+                        Ok(w) => w,
+                        Err(_) => break,
+                    };
+                    // Short-lived: released at the end of this chunk so the
+                    // keyboard thread can draw its own echo.
+                    let stdout = io::stdout();
+                    let mut handle = stdout.lock();
+                    if RESIZED.swap(false, Ordering::SeqCst) {
+                        let (w, h) = get_terminal_size();
+                        let split = h / 2;
+                        win.resize(split + 1, h.saturating_sub(split), w);
+                        let _ = win.repaint(&mut handle);
+                    }
+                    for c in text.chars() {
+                        // The peer's stream is display-only: nothing it sends is
+                        // echoed back, so the transmit half of `apply` is dropped.
+                        if let Err(e) = apply(c, &keys, &mut win, &mut handle) {
+                            eprintln!("Error rendering peer input: {}", e);
+                            break;
                         }
                     }
                 }
@@ -772,140 +751,317 @@ fn spawn_input_thread(
     Ok(())
 }
 
-/// Handles the newline character input by processing the current line buffer.
+// ============================================================================
+// Split-screen renderer
+// ============================================================================
+
+/// One half of talk's split screen.
 ///
-/// Clears the line buffer after processing and increments the bottom line position.
-/// If the bottom line exceeds the available space in the terminal, it resets to 0.
+/// Both directions render the same way — the local user's typing into the top
+/// window, the peer's into the bottom — so they share this one implementation
+/// rather than the two divergent copies the code used to carry. Keeping it free
+/// of sockets, threads and `io::stdout()` is what makes the render path
+/// testable: a caller can drive it against a `Vec<u8>` and assert the exact
+/// bytes emitted.
 ///
-/// # Arguments
-///
-/// * `line_buffer` - A mutable reference to the string containing the current line input.
-/// * `bottom_line` - A mutable reference to the bottom line position in the terminal.
-/// * `split_row` - The row in the terminal where the input area begins.
-/// * `handle` - A mutable reference to the output stream to write to.
-///
-/// # Returns
-///
-/// A `Result` indicating success or a `TalkError` on failure.
-fn handle_newline<W: Write>(
-    line_buffer: &mut String,
-    bottom_line: &mut u16,
-    split_row: u16,
-    handle: &mut W,
-) -> Result<(), TalkError> {
-    if !line_buffer.is_empty() {
-        line_buffer.clear(); // Clear the line buffer after handling
-    }
-    if *bottom_line >= split_row - 2 {
-        *bottom_line = 0; // Reset bottom line position if it exceeds available space
-    }
-    *bottom_line += 1; // Move to the next line
-    handle.flush().unwrap(); // Ensure output is flushed
-    Ok(())
+/// Row and column are tracked here rather than recomputed from a text buffer,
+/// which is what audit #TK16 was about: the column used to come from a snapshot
+/// of the sender's buffer that the peer thread could never see updated.
+struct Window {
+    /// First terminal row this window occupies (1-based).
+    origin: u16,
+    /// Usable rows, at least 1.
+    height: u16,
+    /// Terminal width in columns, at least 1.
+    width: u16,
+    /// Cursor row within the window, 0-based.
+    row: u16,
+    /// Cursor column, 0-based.
+    col: u16,
+    /// Characters on the current line, kept for backspace redraw.
+    line: String,
 }
 
-/// Handles the backspace character input by removing the last character from the line buffer.
-///
-/// Clears the current input line in the terminal and redraws the remaining characters.
-/// The cursor is moved back to the input position.
-///
-/// # Arguments
-///
-/// * `line_buffer` - A mutable reference to the string containing the current line input.
-/// * `split_row` - The row in the terminal where the input area begins.
-/// * `bottom_line` - The current bottom line position in the terminal.
-/// * `handle` - A mutable reference to the output stream to write to.
-/// * `top_line` - The current top line position in the terminal.
-///
-/// # Returns
-///
-/// A `Result` indicating success or a `TalkError` on failure.
-fn handle_backspace<W: Write>(
-    line_buffer: &mut String,
-    split_row: u16,
-    bottom_line: u16,
-    handle: &mut W,
-    top_line: u16,
-) -> Result<(), TalkError> {
-    if !line_buffer.is_empty() {
-        // Remove the last character from the line buffer
-        line_buffer.pop();
-        // Clear the line
-        write!(handle, "\x1b[{};0H\x1b[K", split_row + bottom_line + 1).unwrap();
-        // Redraw the remaining characters
-        writeln!(handle, "{}", line_buffer).unwrap();
-        // Move cursor back to the input position
-        write!(handle, "\x1b[{};H", top_line).unwrap();
-
-        handle.flush().unwrap();
+impl Window {
+    fn new(origin: u16, height: u16, width: u16) -> Self {
+        Window {
+            origin: origin.max(1),
+            height: height.max(1),
+            width: width.max(1),
+            row: 0,
+            col: 0,
+            line: String::new(),
+        }
     }
-    Ok(())
+
+    /// Absolute terminal row of the cursor (1-based).
+    fn cursor_row(&self) -> u16 {
+        self.origin + self.row
+    }
+
+    /// Start a fresh line, wrapping back to the top of the window when full.
+    fn newline<W: Write>(&mut self, out: &mut W) -> io::Result<()> {
+        self.line.clear();
+        self.col = 0;
+        self.row += 1;
+        if self.row >= self.height {
+            self.row = 0;
+        }
+        // Explicit positioning rather than a bare "\n": with ICANON/ONLCR
+        // cleared a newline moves down without returning to column 0
+        // (audit #TK17).
+        write!(out, "\x1b[{};1H\x1b[K", self.cursor_row())?;
+        out.flush()
+    }
+
+    /// Append one character, wrapping at the window width (audit #TK14).
+    fn put<W: Write>(&mut self, c: char, out: &mut W) -> io::Result<()> {
+        if self.col >= self.width {
+            self.newline(out)?;
+        }
+        self.line.push(c);
+        self.col += 1;
+        write!(out, "{}", c)?;
+        out.flush()
+    }
+
+    /// Erase the character before the cursor.
+    fn erase<W: Write>(&mut self, out: &mut W) -> io::Result<()> {
+        if self.line.pop().is_none() {
+            return Ok(());
+        }
+        self.col = self.col.saturating_sub(1);
+        // Redraw the line rather than emitting a destructive backspace, so the
+        // window stays consistent after a wrap.
+        write!(out, "\x1b[{};1H\x1b[K{}", self.cursor_row(), self.line)?;
+        out.flush()
+    }
+
+    /// Discard the whole current line (the termios KILL character).
+    fn kill<W: Write>(&mut self, out: &mut W) -> io::Result<()> {
+        self.line.clear();
+        self.col = 0;
+        write!(out, "\x1b[{};1H\x1b[K", self.cursor_row())?;
+        out.flush()
+    }
+
+    /// Repaint this window's current line, used for Ctrl-L refresh and after a
+    /// resize.
+    fn repaint<W: Write>(&mut self, out: &mut W) -> io::Result<()> {
+        write!(out, "\x1b[{};1H\x1b[K{}", self.cursor_row(), self.line)?;
+        out.flush()
+    }
+
+    /// Re-apply a new terminal geometry, clamping the cursor into range.
+    fn resize(&mut self, origin: u16, height: u16, width: u16) {
+        self.origin = origin.max(1);
+        self.height = height.max(1);
+        self.width = width.max(1);
+        if self.row >= self.height {
+            self.row = self.height - 1;
+        }
+        if self.col > self.width {
+            self.col = self.width;
+        }
+    }
 }
 
-/// Handles a character input by adding it to the line buffer and updating the terminal display.
+/// The terminal's erase and kill characters.
 ///
-/// If the line buffer exceeds the maximum allowed length, it removes the oldest character.
-/// The cursor is moved to the bottom of the terminal to display the updated line.
-///
-/// # Arguments
-///
-/// * `c` - The character to handle.
-/// * `line_buffer` - A mutable reference to the string containing the current line input.
-/// * `split_row` - The row in the terminal where the input area begins.
-/// * `bottom_line` - The current bottom line position in the terminal.
-/// * `top_line` - The current top line position in the terminal.
-/// * `handle` - A mutable reference to the output stream to write to.
-///
-/// # Returns
-///
-/// A `Result` indicating success or a `TalkError` on failure.
-fn handle_character<W: Write>(
-    c: char,
-    line_buffer: &mut String,
-    output_buffer: &mut str,
-    split_row: u16,
-    bottom_line: u16,
-    top_line: u16,
-    handle: &mut W,
-) -> Result<(), TalkError> {
-    if line_buffer.len() < MAX_USER_INPUT_LENGTH {
-        line_buffer.push(c);
+/// Spec 116758: "Typing the erase and kill characters shall affect the sender's
+/// terminal in the manner described by the termios interface". They therefore
+/// come from the terminal's own settings rather than being hardcoded, which is
+/// what audit #TK7 was about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KeyMap {
+    erase: u8,
+    kill: u8,
+}
+
+impl Default for KeyMap {
+    /// POSIX defaults when no termios is available: DEL and ^U.
+    fn default() -> Self {
+        KeyMap {
+            erase: 0x7f,
+            kill: 0x15,
+        }
+    }
+}
+
+impl KeyMap {
+    fn from_termios(t: &libc::termios) -> Self {
+        KeyMap {
+            erase: t.c_cc[libc::VERASE],
+            kill: t.c_cc[libc::VKILL],
+        }
+    }
+}
+
+/// What the character-processing rules (spec 116755-116770) say to do with one
+/// character.
+#[derive(Debug, PartialEq, Eq)]
+enum Action {
+    /// 116756: alert the recipient's terminal.
+    Alert,
+    /// 116757: refresh the sender's screen regions. Local only — never sent.
+    Refresh,
+    /// 116758: erase the preceding character.
+    Erase,
+    /// 116758: discard the current line.
+    Kill,
+    /// End of line.
+    Newline,
+    /// 116764: an LC_CTYPE `print` or `space` character, sent verbatim.
+    Send(char),
+    /// 116769: any other non-printable, rendered as an implementation-defined
+    /// printable sequence. Uses the `^X` convention `write`(1) already uses
+    /// (see `render_line` in `users/write.rs`).
+    Caret(char),
+}
+
+/// Classify one character according to the spec's rules.
+fn classify(c: char, keys: &KeyMap) -> Action {
+    // erase/kill are matched first: they are configurable and may well be
+    // control characters that the rules below would otherwise claim.
+    if let Ok(byte) = u8::try_from(c as u32) {
+        if byte == keys.erase {
+            return Action::Erase;
+        }
+        if byte == keys.kill {
+            return Action::Kill;
+        }
+    }
+
+    match c {
+        '\x07' => Action::Alert,
+        '\x0c' => Action::Refresh,
+        '\n' | '\r' => Action::Newline,
+        // <tab> is in the `space` class but not `print`.
+        '\t' => Action::Send(c),
+        // Within ASCII, LC_CTYPE decides: anything not `print` is a control
+        // character and gets a printable stand-in (116769).
+        _ if c.is_ascii() && !plib::locale::isprint(c) => Action::Caret(c),
+        // Everything else passes through as its own bytes. Non-ASCII cannot be
+        // usefully re-encoded here -- RATIONALE 116855-116857 notes the two
+        // parties may not even share a language -- so it is the recipient's
+        // terminal that interprets it. This matches `write`'s `render_line`.
+        _ => Action::Send(c),
+    }
+}
+
+/// The two printable characters that stand in for a control character.
+fn caret_pair(c: char) -> (char, char) {
+    let byte = c as u32;
+    if byte == 0x7f {
+        ('^', '?')
     } else {
-        eprintln!("Line buffer exceeded max size. Truncating input.");
-        line_buffer.remove(0); // Remove the first character
-        line_buffer.push(c); // Add the new character
+        ('^', char::from_u32(byte + 64).unwrap_or('?'))
     }
-
-    write!(handle, "\x1b[{};0H", split_row + bottom_line + 1).unwrap(); // Move cursor to the bottom window
-    writeln!(handle, "{}", line_buffer).unwrap(); // Write the line
-    write!(handle, "\x1b[{};{}H", top_line, output_buffer.len()).unwrap();
-    // Move cursor to top line and to the right by buffer length
-    handle.flush().unwrap();
-    Ok(())
 }
 
-/// Handles user input from stdin, sending it over a TCP stream.
+/// Decode as much valid UTF-8 as `pending` currently holds, leaving any
+/// trailing partial sequence in place for the next read.
 ///
-/// # Arguments
+/// `recv` splits wherever it likes, so a multi-byte character can straddle two
+/// chunks. Decoding each chunk in isolation used to drop the *whole* chunk on
+/// such a boundary (audit #TK10); this keeps the tail instead. Genuinely
+/// invalid bytes are consumed as U+FFFD so a corrupt stream cannot wedge the
+/// decoder.
+fn decode_pending(pending: &mut Vec<u8>) -> String {
+    let mut out = String::new();
+    loop {
+        match std::str::from_utf8(pending) {
+            Ok(s) => {
+                out.push_str(s);
+                pending.clear();
+                return out;
+            }
+            Err(e) => {
+                let good = e.valid_up_to();
+                out.push_str(unsafe { std::str::from_utf8_unchecked(&pending[..good]) });
+                match e.error_len() {
+                    // Invalid sequence: replace it and keep going.
+                    Some(bad) => {
+                        out.push('\u{fffd}');
+                        pending.drain(..good + bad);
+                    }
+                    // Truncated but possibly valid: wait for more bytes.
+                    None => {
+                        pending.drain(..good);
+                        return out;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Apply one character to a window, returning what should be transmitted.
 ///
-/// * `write_stream` - The TCP stream to send user input to.
-/// * `split_row` - The row in the terminal where the input area begins.
-/// * `top_line` - An `Arc` of a `Mutex` that tracks the top line position in the terminal.
+/// This is the single render path for both directions: the local user's typing
+/// and the peer's incoming text differ only in which window they land in and
+/// whether the result is sent onward. Keeping it free of sockets and
+/// `io::stdout()` is what makes it testable.
 ///
-/// # Returns
+/// Returns the bytes to forward to the other side, which is empty for purely
+/// local effects such as Ctrl-L refresh (spec 116757).
+fn apply<W: Write>(c: char, keys: &KeyMap, win: &mut Window, out: &mut W) -> io::Result<Vec<u8>> {
+    match classify(c, keys) {
+        Action::Alert => {
+            // 116756: alerts the *recipient*, so it is forwarded, not drawn.
+            Ok(vec![0x07])
+        }
+        Action::Refresh => {
+            win.repaint(out)?;
+            Ok(Vec::new())
+        }
+        Action::Erase => {
+            win.erase(out)?;
+            Ok(vec![keys.erase])
+        }
+        Action::Kill => {
+            win.kill(out)?;
+            Ok(vec![keys.kill])
+        }
+        Action::Newline => {
+            win.newline(out)?;
+            Ok(vec![b'\n'])
+        }
+        Action::Send(ch) => {
+            win.put(ch, out)?;
+            let mut buf = [0u8; 4];
+            Ok(ch.encode_utf8(&mut buf).as_bytes().to_vec())
+        }
+        Action::Caret(ch) => {
+            // 116769: send a printable stand-in rather than the raw control
+            // character, which historical implementations refuse for security
+            // reasons (RATIONALE 116866-116869).
+            let (a, b) = caret_pair(ch);
+            win.put(a, out)?;
+            win.put(b, out)?;
+            let mut buf = [0u8; 8];
+            let mut bytes = a.encode_utf8(&mut buf).as_bytes().to_vec();
+            let mut tail = [0u8; 4];
+            bytes.extend_from_slice(b.encode_utf8(&mut tail).as_bytes());
+            Ok(bytes)
+        }
+    }
+}
+/// Read the local user's keystrokes, echo them into the top window, and send
+/// them to the peer.
 ///
-/// A `Result` indicating success or an `io::Error`.
+/// Bytes are accumulated and decoded incrementally, so a multi-byte character
+/// typed (or pasted) as several reads is delivered as one character rather than
+/// being mangled into Latin-1 (audit #TK10).
 fn handle_stdin_input(
     write_stream: TcpStream,
     split_row: u16,
-    top_line: Arc<Mutex<u16>>,
-    output_buffer: &mut String,
+    local_window: Arc<Mutex<Window>>,
 ) -> Result<(), io::Error> {
-    // Buffer for raw input
     let mut buffer: [u8; 1] = [0; 1];
-    let mut line_buffer = String::new();
+    let mut pending: Vec<u8> = Vec::new();
+
     loop {
-        // Read one byte from stdin
         let result =
             unsafe { libc::read(STDIN_FILENO, buffer.as_mut_ptr() as *mut libc::c_void, 1) };
 
@@ -914,93 +1070,41 @@ fn handle_stdin_input(
                 eprintln!("Error reading from stdin: {}", io::Error::last_os_error());
                 break;
             }
-            std::cmp::Ordering::Equal => {
-                // EOF reached
-                break;
-            }
+            // 116760: end-of-file terminates the local utility.
+            std::cmp::Ordering::Equal => break,
             _ => {}
         }
 
-        let input_char = char::from(buffer[0]);
-        process_input_char(
-            input_char,
-            &mut line_buffer,
-            &write_stream,
-            split_row,
-            &top_line,
-            output_buffer,
-        )?;
-    }
-
-    Ok(())
-}
-
-/// Processes a single character input from stdin, including newline and backspace handling.
-///
-/// # Arguments
-///
-/// * `input_char` - The character read from stdin.
-/// * `line_buffer` - A mutable reference to the line buffer storing user input.
-/// * `write_stream` - The TCP stream to send user input to.
-/// * `split_row` - The row in the terminal where the input area begins.
-/// * `top_line` - An `Arc` of a `Mutex` that tracks the top line position in the terminal.
-///
-/// # Returns
-///
-/// A `Result` indicating success or an `io::Error` on failure.
-fn process_input_char(
-    input_char: char,
-    line_buffer: &mut String,
-    write_stream: &TcpStream,
-    split_row: u16,
-    top_line: &Arc<Mutex<u16>>,
-    output_buffer: &mut String,
-) -> Result<(), io::Error> {
-    let mut top_line = top_line.lock().unwrap();
-
-    // The sender's local echo is part of the on-screen UI and must go to the
-    // terminal (stdout), not stderr (spec STDERR is "None").
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-
-    match input_char {
-        '\n' => {
-            if !line_buffer.is_empty() {
-                // Clear the line buffer after handling
-                line_buffer.clear();
-            }
-            // Move the cursor to the start of the next line and clear it
-            let _ = write!(out, "\x1B[{};H\x1B[K", *top_line + 1);
-            *top_line += 1;
-
-            if *top_line >= split_row.saturating_sub(1) {
-                let _ = write!(out, "\x1B[{};H", 2);
-                *top_line = 2;
-            }
-            let _ = out.flush();
-            // Send newline byte
-            send_byte(write_stream, b'\n')?;
+        pending.push(buffer[0]);
+        let text = decode_pending(&mut pending);
+        if text.is_empty() {
+            continue;
         }
-        '\x08' | '\x7f' => {
-            // Handle backspace (ASCII 8 or 127)
-            if !line_buffer.is_empty() {
-                line_buffer.pop();
 
-                // Clear the current line and redraw it
-                let _ = write!(out, "\x1B[{};H\x1B[K", *top_line);
-                let _ = write!(out, "{}", line_buffer);
-                let _ = out.flush();
+        let keys = KEYMAP.lock().map(|k| *k).unwrap_or_default();
+        let mut win = match local_window.lock() {
+            Ok(w) => w,
+            Err(_) => break,
+        };
 
-                // Send backspace character
-                send_byte(write_stream, b'\x08')?;
+        // The local echo is part of the on-screen UI and belongs on the
+        // terminal (spec STDERR is "None").
+        let stdout = io::stdout();
+        let mut out = stdout.lock();
+
+        if RESIZED.swap(false, Ordering::SeqCst) {
+            let (w, h) = get_terminal_size();
+            win.resize(1, (h / 2).saturating_sub(1), w);
+            let _ = win.repaint(&mut out);
+        }
+
+        for c in text.chars() {
+            let outgoing = apply(c, &keys, &mut win, &mut out)?;
+            if !outgoing.is_empty() {
+                send_bytes(&write_stream, &outgoing)?;
             }
         }
-        _ => {
-            line_buffer.push(input_char);
-            output_buffer.push(input_char);
-            // Send the character as a byte
-            send_byte(write_stream, input_char as u8)?;
-        }
+        let _ = split_row; // geometry is carried by the window itself
     }
 
     Ok(())
@@ -1016,14 +1120,16 @@ fn process_input_char(
 /// # Returns
 ///
 /// A `Result` indicating success or an `io::Error` if sending the byte fails.
-fn send_byte(write_stream: &TcpStream, byte: u8) -> Result<(), io::Error> {
-    let buffer = [byte];
+fn send_bytes(write_stream: &TcpStream, bytes: &[u8]) -> Result<(), io::Error> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
 
     let result = unsafe {
         libc::send(
             write_stream.as_raw_fd(),
-            buffer.as_ptr() as *const libc::c_void,
-            1,
+            bytes.as_ptr() as *const libc::c_void,
+            bytes.len(),
             0,
         )
     };
@@ -1062,7 +1168,6 @@ fn handle_new_invitation(
     res: &mut CtlRes,
     my_machine_addr: Ipv4Addr,
     logger: &mut StateLogger,
-    output_buffer: &mut String,
 ) -> Result<(), TalkError> {
     let (socket_addr, listener) = open_socket(my_machine_addr).map_err(TalkError::IoError)?;
 
@@ -1113,7 +1218,7 @@ fn handle_new_invitation(
                 msg.id_num = remote_id;
                 send_delete(daemon_port, his_machine_addr, msg, &socket, res)?;
 
-                if let Err(e) = handle_client(client_stream, output_buffer) {
+                if let Err(e) = handle_client(client_stream) {
                     eprintln!("Failed to handle client: {}", e);
                 }
             }
@@ -1180,32 +1285,34 @@ fn get_local_machine_name() -> Result<String, io::Error> {
 ///
 /// A tuple containing the user name and the host name.
 fn parse_address(address: &str, my_machine_name: &str) -> (String, String) {
-    // Look for the first occurrence of any delimiter character ('@', ':', '!', '.').
-    let at_index = address.find(|c| "@:!.".contains(c));
-
-    // If a delimiter is found, determine how to split the address into user and host.
-    if let Some(index) = at_index {
-        let delimiter = address.chars().nth(index);
-
-        match delimiter {
-            // If the delimiter is '@', split the address as "user@host".
-            Some('@') => {
-                let (user, host) = address.split_at(index);
-                // Extract the host by skipping the '@' character.
-                let host = host.get(1..).unwrap_or_default();
-                (user.to_string(), host.to_string())
-            }
-            // For any other delimiter, split the address as "host:user".
-            _ => {
-                let (host, user) = address.split_at(index);
-                // Extract the user by skipping the delimiter character.
-                let user = user.get(1..).unwrap_or_default();
-                (user.to_string(), host.to_string())
-            }
-        }
-    } else {
-        (address.to_string(), my_machine_name.to_string())
+    // Historical BSD `talk` resolves the address by delimiter *precedence*,
+    // not by whichever delimiter appears first:
+    //
+    //   index('@')  ->  user@host
+    //   rindex('!') ->  host!user
+    //   rindex(':') ->  host:user
+    //   rindex('.') ->  host.user
+    //
+    // Scanning for the leftmost of the whole set instead (audit #TK19) splits
+    // `first.last@host` at the dot -- never reaching the `@` branch -- and
+    // splits `host.example.com:user` at its first label. Taking `@` first, and
+    // the *last* occurrence of the others, fixes both: a dotted hostname keeps
+    // its labels, and a dotted user name still yields the `@` form.
+    if let Some(index) = address.find('@') {
+        let (user, rest) = address.split_at(index);
+        let host = rest.get(1..).unwrap_or_default();
+        return (user.to_string(), host.to_string());
     }
+
+    for delimiter in ['!', ':', '.'] {
+        if let Some(index) = address.rfind(delimiter) {
+            let (host, rest) = address.split_at(index);
+            let user = rest.get(1..).unwrap_or_default();
+            return (user.to_string(), host.to_string());
+        }
+    }
+
+    (address.to_string(), my_machine_name.to_string())
 }
 
 /// Retrieves and sets the names for both local and remote users, updating the control message accordingly.
@@ -1413,27 +1520,27 @@ fn get_service_port(service: &CString, protocol: &CString) -> Result<u16, io::Er
 /// # Returns
 ///
 /// Returns `Result<(), io::Error>` if the operation completes successfully or an error occurs during execution.
-fn handle_client(stream: TcpStream, output_buffer: &mut String) -> Result<(), io::Error> {
+fn handle_client(stream: TcpStream) -> Result<(), io::Error> {
     let write_stream = stream.try_clone()?;
 
     let (width, height) = get_terminal_size();
     let split_row = height / 2;
-    let top_line = Arc::new(Mutex::new(2));
-    let bottom_line = Arc::new(Mutex::new(0));
+    let local_window = Arc::new(Mutex::new(Window::new(
+        1,
+        split_row.saturating_sub(1),
+        width,
+    )));
+    let peer_window = Arc::new(Mutex::new(Window::new(
+        split_row + 1,
+        height.saturating_sub(split_row),
+        width,
+    )));
 
     // Spawn a separate thread to handle reading from the stream.
-    spawn_input_thread(
-        stream,
-        height / 2,
-        width,
-        Arc::clone(&top_line),
-        Arc::clone(&bottom_line),
-        &mut output_buffer.clone(),
-    )
-    .unwrap();
+    spawn_input_thread(stream, split_row, width, Arc::clone(&peer_window)).unwrap();
 
     // Handle user input from stdin and send it to the write stream.
-    handle_stdin_input(write_stream, split_row, top_line, output_buffer)?;
+    handle_stdin_input(write_stream, split_row, local_window)?;
 
     Ok(())
 }
@@ -1453,7 +1560,7 @@ fn handle_client(stream: TcpStream, output_buffer: &mut String) -> Result<(), io
 /// # Errors
 ///
 /// Returns an `io::Error` if there is an issue with writing to the terminal or flushing output.
-fn draw_terminal(split_row: u16, width: u16) -> io::Result<io::StdoutLock<'static>> {
+fn draw_terminal(split_row: u16, width: u16) -> io::Result<()> {
     let stdout = io::stdout();
     let mut handle = stdout.lock();
 
@@ -1474,7 +1581,11 @@ fn draw_terminal(split_row: u16, width: u16) -> io::Result<io::StdoutLock<'stati
 
     handle.flush()?;
 
-    Ok(handle)
+    // The lock is deliberately released here. Holding it for the session (as
+    // this used to, by returning it) deadlocked the other thread: Rust's stdout
+    // lock is reentrant only for the *same* thread, so the keyboard path's
+    // io::stdout().lock() blocked forever on the first keystroke (audit #TK21).
+    Ok(())
 }
 
 /// Opens a TCP socket bound to the provided IPv4 address.
@@ -1764,6 +1875,7 @@ fn request(
                         // If we would block, check for timeout and continue
                         if start_time.elapsed() >= timeout {
                             eprintln!("Please check talk daemon status. Cannot connect to it!");
+                            restore_terminal();
                             process::exit(128);
                         }
 
@@ -1785,6 +1897,24 @@ fn request(
     Ok(())
 }
 
+/// Unlinks a path when dropped.
+struct PathCleanup(std::path::PathBuf);
+
+impl Drop for PathCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// A private, unique path for this client's reply socket.
+fn client_reply_path() -> std::path::PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("talk.{}.{}.sock", process::id(), nonce))
+}
+
 /// Sends a control message to the local talkd daemon via Unix domain socket.
 ///
 /// # Arguments
@@ -1803,7 +1933,14 @@ fn request_local(
     msg_type: MessageType,
     res: &mut CtlRes,
 ) -> Result<(), TalkError> {
-    let socket = UnixDatagram::unbound().map_err(TalkError::IoError)?;
+    // The daemon replies with send_to_addr() using the source address of our
+    // datagram, so this socket must have one. An unbound Unix datagram socket
+    // is unnamed, which made every reply fail with EINVAL and left the local
+    // handshake permanently timing out (audit #TK22). Bind a private path, and
+    // remove it on the way out.
+    let reply_path = client_reply_path();
+    let socket = UnixDatagram::bind(&reply_path).map_err(TalkError::IoError)?;
+    let _reply_cleanup = PathCleanup(reply_path);
 
     msg.r#type = msg_type as u8;
     let msg_bytes = msg
@@ -1832,6 +1969,7 @@ fn request_local(
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                         if start_time.elapsed() >= timeout {
                             eprintln!("Local talkd daemon not responding. Is it running?");
+                            restore_terminal();
                             process::exit(128);
                         }
                         std::thread::sleep(Duration::from_millis(10));
@@ -1847,6 +1985,7 @@ fn request_local(
                     "Cannot connect to local talkd. Is it running at {:?}?",
                     socket_path
                 );
+                restore_terminal();
                 process::exit(128);
             }
             Err(e) => {
@@ -1878,7 +2017,23 @@ pub fn register_signals() {
                 eprintln!("Failed to register signal handler for signal {}", sig);
             }
         }
+
+        // Window resize (audit #TK9). Separate from the list above because the
+        // handler must not terminate: it only records that the geometry
+        // changed, and the render loops re-query and repaint when they notice.
+        if signal(libc::SIGWINCH, handle_winch as *const () as usize) == libc::SIG_ERR {
+            eprintln!("Failed to register signal handler for SIGWINCH");
+        }
     }
+}
+
+/// SIGWINCH handler: record the resize and return.
+///
+/// Async-signal-safe by construction -- a single atomic store, nothing else.
+/// The terminal is re-measured and repainted by whichever render loop observes
+/// the flag.
+extern "C" fn handle_winch(_signal_code: i32) {
+    RESIZED.store(true, Ordering::SeqCst);
 }
 
 /// Handles incoming signals by setting the interrupt flag and exiting the process.
@@ -1999,6 +2154,14 @@ fn get_terminal_size() -> (u16, u16) {
         }
     }
 
+    // The ioctl can succeed and still report zeroes -- a pty whose window size
+    // was never set does exactly that. Treat it the same as a failure rather
+    // than propagating a degenerate geometry, which would wrap the display
+    // after every single character.
+    if size.ws_col == 0 || size.ws_row == 0 {
+        return (80, 24);
+    }
+
     (size.ws_col, size.ws_row)
 }
 
@@ -2046,5 +2209,292 @@ mod tests {
         let value = Osockaddr::from(&socket);
         assert_eq!(value.sa_family, libc::AF_UNSPEC as u16);
         assert_eq!(value.sa_data, [2, 88, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2]);
+    }
+
+    /// Pin the on-the-wire layout of CtlMsg.
+    ///
+    /// The talk protocol's control message is a fixed 84-byte big-endian
+    /// structure that a remote talkd parses positionally, so the encoding
+    /// binrw generates is part of this program's external contract rather than
+    /// an implementation detail. This asserts each field's offset and byte
+    /// order so that a binrw upgrade cannot silently change the format.
+    #[test]
+    fn test_ctl_msg_wire_layout() {
+        let msg = CtlMsg {
+            vers: 1,
+            r#type: MessageType::Announce as u8,
+            answer: Answer::NotHere as u8,
+            pad: 0,
+            id_num: 0x0102_0304,
+            addr: Osockaddr {
+                sa_family: 0x0a0b,
+                sa_data: [0x11; 14],
+            },
+            ctl_addr: Osockaddr {
+                sa_family: 0x0c0d,
+                sa_data: [0x22; 14],
+            },
+            pid: 0x0506_0708,
+            l_name: string_to_c_string("local"),
+            r_name: string_to_c_string("remote"),
+            r_tty: [0; 16],
+        };
+
+        let bytes = msg.to_bytes().unwrap();
+        assert_eq!(bytes.len(), 84, "CtlMsg is a fixed 84-byte structure");
+
+        assert_eq!(&bytes[0..4], &[1, 3, 1, 0], "vers/type/answer/pad");
+        assert_eq!(&bytes[4..8], &0x0102_0304u32.to_be_bytes(), "id_num is BE");
+
+        assert_eq!(&bytes[8..10], &0x0a0bu16.to_be_bytes(), "addr.sa_family");
+        assert_eq!(&bytes[10..24], &[0x11; 14], "addr.sa_data");
+        assert_eq!(
+            &bytes[24..26],
+            &0x0c0du16.to_be_bytes(),
+            "ctl_addr.sa_family"
+        );
+        assert_eq!(&bytes[26..40], &[0x22; 14], "ctl_addr.sa_data");
+
+        assert_eq!(&bytes[40..44], &0x0506_0708u32.to_be_bytes(), "pid is BE");
+        assert_eq!(&bytes[44..49], b"local", "l_name");
+        assert_eq!(&bytes[56..62], b"remote", "r_name");
+        assert_eq!(&bytes[68..84], &[0; 16], "r_tty");
+    }
+
+    /// CtlRes decodes from the 24-byte big-endian response the daemon sends.
+    #[test]
+    fn test_ctl_res_decodes_daemon_response() {
+        let mut bytes = [0u8; 24];
+        bytes[0] = 1; // vers
+        bytes[1] = MessageType::Delete as u8;
+        bytes[2] = Answer::Success as u8;
+        bytes[3] = 0; // pad
+        bytes[4..8].copy_from_slice(&0xdead_beefu32.to_be_bytes());
+        bytes[8..10].copy_from_slice(&2u16.to_be_bytes()); // sa_family
+        bytes[10..24].copy_from_slice(&[0x33; 14]);
+
+        let res = CtlRes::from_bytes(&bytes).expect("decode CtlRes");
+        assert_eq!(res.vers, 1);
+        assert_eq!(res.r#type, MessageType::Delete);
+        assert_eq!(res.answer, Answer::Success);
+        assert_eq!(res.id_num, 0xdead_beef);
+        assert_eq!(res.addr.sa_family, 2);
+        assert_eq!(res.addr.sa_data, [0x33; 14]);
+    }
+
+    // ========================================================================
+    // Split-screen renderer (audit #TK7, #TK14, #TK15-#TK18)
+    //
+    // The render path takes any `W: Write`, so these drive it against a Vec<u8>
+    // and assert the exact bytes emitted -- no socket, tty, or thread.
+    // ========================================================================
+
+    fn render(chars: &str, win: &mut Window) -> (String, Vec<u8>) {
+        let keys = KeyMap::default();
+        let mut out: Vec<u8> = Vec::new();
+        let mut sent: Vec<u8> = Vec::new();
+        for c in chars.chars() {
+            sent.extend(apply(c, &keys, win, &mut out).unwrap());
+        }
+        (String::from_utf8_lossy(&out).into_owned(), sent)
+    }
+
+    // ========================================================================
+    // Address parsing (audit #TK19)
+    // ========================================================================
+
+    #[test]
+    fn test_draw_terminal_does_not_retain_stdout_lock() {
+        // Audit #TK21: draw_terminal used to return the StdoutLock, which the
+        // reader thread then held for the whole session, so the keyboard
+        // thread's own lock() blocked forever. Its return type carrying no
+        // guard is what makes that structurally impossible.
+        fn assert_unit(_: fn(u16, u16) -> io::Result<()>) {}
+        assert_unit(draw_terminal);
+
+        // And a second thread can still take the lock after it runs.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let stdout = io::stdout();
+            let _guard = stdout.lock();
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("stdout must be lockable from another thread");
+    }
+
+    #[test]
+    fn test_parse_address_bsd_precedence() {
+        let me = "myhost";
+        let cases: &[(&str, &str, &str)] = &[
+            // (input, expected user, expected host)
+            ("alice", "alice", "myhost"),
+            ("alice@host", "alice", "host"),
+            ("alice@host.example.com", "alice", "host.example.com"),
+            // '@' wins over a dot appearing earlier: this is the case the old
+            // leftmost-of-any-delimiter scan got wrong.
+            ("first.last@host", "first.last", "host"),
+            // Non-'@' forms are host-first, and use the *last* delimiter so a
+            // dotted hostname keeps its labels.
+            ("host!alice", "alice", "host"),
+            ("host:alice", "alice", "host"),
+            ("host.alice", "alice", "host"),
+            ("ns1.example.com!alice", "alice", "ns1.example.com"),
+            ("host.example.com:alice", "alice", "host.example.com"),
+            ("a.b.c.alice", "alice", "a.b.c"),
+        ];
+        for (input, want_user, want_host) in cases {
+            let (user, host) = parse_address(input, me);
+            assert_eq!(
+                (user.as_str(), host.as_str()),
+                (*want_user, *want_host),
+                "parsing {:?}",
+                input
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_follows_spec_rules() {
+        let keys = KeyMap::default();
+        // 116756 / 116757: alert and Ctrl-L are special.
+        assert_eq!(classify('\x07', &keys), Action::Alert);
+        assert_eq!(classify('\x0c', &keys), Action::Refresh);
+        // 116758: erase and kill come from termios, not hardcoded.
+        assert_eq!(classify('\x7f', &keys), Action::Erase);
+        assert_eq!(classify('\x15', &keys), Action::Kill);
+        // 116764: print and space classes are sent verbatim.
+        assert_eq!(classify('a', &keys), Action::Send('a'));
+        assert_eq!(classify(' ', &keys), Action::Send(' '));
+        assert_eq!(classify('\t', &keys), Action::Send('\t'));
+        // 116769: other non-printables become printable stand-ins.
+        assert_eq!(classify('\x01', &keys), Action::Caret('\x01'));
+        assert_eq!(classify('\n', &keys), Action::Newline);
+    }
+
+    #[test]
+    fn test_erase_and_kill_honor_termios() {
+        // A terminal configured with ^H as erase must get erase semantics for
+        // 0x08, and 0x7f then becomes an ordinary non-printable.
+        let keys = KeyMap {
+            erase: 0x08,
+            kill: 0x18,
+        };
+        assert_eq!(classify('\x08', &keys), Action::Erase);
+        assert_eq!(classify('\x18', &keys), Action::Kill);
+        assert_eq!(classify('\x7f', &keys), Action::Caret('\x7f'));
+    }
+
+    #[test]
+    fn test_renderer_emits_cr_positioning_not_bare_newline() {
+        // #TK17: with ICANON cleared a bare "\n" never returns to column 0, so
+        // the renderer must position the cursor explicitly.
+        let mut win = Window::new(1, 10, 20);
+        let (out, sent) = render("ab\n", &mut win);
+        assert!(
+            !out.contains('\n') || out.contains("\x1b["),
+            "expected explicit cursor positioning, got {:?}",
+            out
+        );
+        assert!(
+            out.contains("\u{1b}[2;1H"),
+            "newline should move to row 2 col 1: {:?}",
+            out
+        );
+        // A newline is still what goes on the wire.
+        assert_eq!(sent, b"ab\n");
+    }
+
+    #[test]
+    fn test_renderer_wraps_at_window_width() {
+        // #TK14: long lines wrap at the terminal width instead of running off
+        // the edge or being truncated at a byte count.
+        let mut win = Window::new(1, 10, 4);
+        let (out, _) = render("abcdef", &mut win);
+        // After 4 columns the renderer moves to the next row.
+        assert!(
+            out.contains("\u{1b}[2;1H"),
+            "expected a wrap to row 2: {:?}",
+            out
+        );
+        assert_eq!(win.row, 1, "cursor should be on the second row");
+    }
+
+    #[test]
+    fn test_renderer_erase_redraws_line() {
+        let mut win = Window::new(1, 10, 20);
+        let (_, _) = render("abc", &mut win);
+        assert_eq!(win.line, "abc");
+        let (out, sent) = render("\x7f", &mut win);
+        assert_eq!(win.line, "ab");
+        assert!(out.contains("ab"), "line should be redrawn: {:?}", out);
+        assert_eq!(sent, vec![0x7f]);
+    }
+
+    #[test]
+    fn test_renderer_kill_clears_line() {
+        let mut win = Window::new(1, 10, 20);
+        render("hello", &mut win);
+        render("\x15", &mut win);
+        assert_eq!(win.line, "");
+        assert_eq!(win.col, 0);
+    }
+
+    #[test]
+    fn test_refresh_is_local_only_and_alert_is_forwarded() {
+        let mut win = Window::new(1, 10, 20);
+        // Ctrl-L repaints locally and sends nothing (116757).
+        let (_, sent) = render("\x0c", &mut win);
+        assert!(sent.is_empty(), "Ctrl-L must not be transmitted");
+        // The alert goes to the peer (116756).
+        let (_, sent) = render("\x07", &mut win);
+        assert_eq!(sent, vec![0x07]);
+    }
+
+    #[test]
+    fn test_non_printable_sent_as_printable_sequence() {
+        // 116769 + RATIONALE 116866-116869: raw control characters are not
+        // transmitted; a printable stand-in is.
+        let mut win = Window::new(1, 10, 20);
+        let (out, sent) = render("\x01", &mut win);
+        assert!(out.contains("^A"), "expected caret rendering: {:?}", out);
+        assert_eq!(sent, b"^A");
+    }
+
+    #[test]
+    fn test_multibyte_character_survives_round_trip() {
+        // #TK10: non-ASCII must reach the peer as its own bytes, not narrowed
+        // to one. It passes through regardless of the sender's LC_CTYPE, since
+        // only the recipient's terminal can interpret it (RATIONALE
+        // 116855-116857).
+        let mut win = Window::new(1, 10, 20);
+        let (_, sent) = render("é", &mut win);
+        assert_eq!(sent, "é".as_bytes());
+    }
+
+    #[test]
+    fn test_tiny_terminal_does_not_panic() {
+        // #TK18: a terminal shorter than the old `split_row - 2` guard used to
+        // underflow. Every dimension here is degenerate.
+        let mut win = Window::new(1, 1, 1);
+        render("abc\n\x7f\x15", &mut win);
+        let mut win = Window::new(0, 0, 0);
+        render("x\n", &mut win);
+    }
+
+    #[test]
+    fn test_decode_pending_handles_split_multibyte() {
+        // #TK10: a character split across two reads must not be dropped.
+        let mut pending = Vec::new();
+        pending.extend_from_slice(&"é".as_bytes()[..1]);
+        assert_eq!(decode_pending(&mut pending), "");
+        pending.extend_from_slice(&"é".as_bytes()[1..]);
+        assert_eq!(decode_pending(&mut pending), "é");
+        assert!(pending.is_empty());
+
+        // Invalid bytes are consumed rather than wedging the decoder.
+        let mut pending = vec![0xff, b'a'];
+        assert_eq!(decode_pending(&mut pending), "\u{fffd}a");
+        assert!(pending.is_empty());
     }
 }

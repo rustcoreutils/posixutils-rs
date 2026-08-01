@@ -1277,3 +1277,326 @@ fn test_more_env_variable_combined() {
         &[("MORE", "-s -c")],
     );
 }
+
+// ---------------------------------------------------------------------------
+// Audit regressions
+// ---------------------------------------------------------------------------
+
+/// Audit #7 / POSIX CONSEQUENCES OF ERRORS (107643-107646): "If an error is
+/// encountered accessing a file when using the :n command, more shall attempt
+/// to examine the next file in the argument list, but the final exit status
+/// shall be affected."
+#[test]
+fn test_audit_next_file_error_affects_exit_status() {
+    run_test_more(
+        &[
+            "--test",
+            "-p",
+            ":n",
+            "test_files/README.md",
+            "test_files/does_not_exist.md",
+        ],
+        "",
+        "",
+        "Couldn't read file 'test_files/does_not_exist.md'\n",
+        1,
+    );
+}
+
+// The success counterpart -- `:n` over readable files still exiting 0 -- is
+// already asserted by `test_1_file` and `test_3_files` above; a dedicated
+// test cannot be added here because `more --test` blocks in its interactive
+// loop whenever a command lands mid-list rather than running past the end.
+
+/// Audit #10/#11 / POSIX 107617-107620: the editor is chosen by the *last
+/// pathname component* of EDITOR, and vi/ex are invoked with `-c linenumber`.
+#[test]
+fn test_audit_invoke_editor_arguments() {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = std::env::temp_dir().join("posixutils_more_audit_editor");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let record = dir.join("args");
+    // Named `vi`, but reached through a full path: the basename is what
+    // decides whether `-c linenumber` is passed.
+    let editor = dir.join("vi");
+    let mut script = std::fs::File::create(&editor).unwrap();
+    writeln!(script, "#!/bin/sh").unwrap();
+    writeln!(script, "printf '%s\\n' \"$@\" > {}", record.display()).unwrap();
+    drop(script);
+    std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    run_test_more_with_env(
+        &["--test", "-p", "vq", "test_files/README.md"],
+        "",
+        "",
+        "",
+        0,
+        &[("EDITOR", editor.to_str().unwrap())],
+    );
+
+    let args = std::fs::read_to_string(&record).unwrap();
+    let args: Vec<&str> = args.lines().collect();
+    assert_eq!(
+        args.first().copied(),
+        Some("-c"),
+        "vi must be invoked with -c linenumber, got {args:?}"
+    );
+    assert!(
+        args.get(1).is_some_and(|n| n.parse::<usize>().is_ok()),
+        "-c must be followed by a line number, got {args:?}"
+    );
+    assert_eq!(args.get(2).copied(), Some("--"), "got {args:?}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// PTY render tests
+//
+// `more` only takes its interactive render path when standard output is a
+// terminal, so these are the only tests that exercise it at all. They pin
+// behavior that is already correct, so that changes to the render path show up
+// as a clean diff.
+// ---------------------------------------------------------------------------
+
+use crate::common::MoreSession;
+
+/// Write `content` to a fresh file under a per-test temporary directory.
+fn render_fixture(name: &str, content: &[u8]) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join("posixutils_more_render");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(name);
+    std::fs::write(&path, content).unwrap();
+    path
+}
+
+#[test]
+fn test_pty_renders_plain_lines() {
+    let path = render_fixture("plain.txt", b"alpha\nbravo\ncharlie\n");
+    let Some(session) = MoreSession::spawn(&[path.to_str().unwrap()], &[], 10, 40) else {
+        println!("Skipping PTY test: no pseudo-terminal available");
+        return;
+    };
+
+    let grid = session.grid();
+    assert_eq!(grid[0], "alpha");
+    assert_eq!(grid[1], "bravo");
+    assert_eq!(grid[2], "charlie");
+
+    assert_eq!(session.quit(), Some(0));
+}
+
+#[test]
+fn test_pty_folds_without_losing_content() {
+    // A line longer than the display is folded, not truncated (POSIX
+    // 107427-107429). The fold *column* is deliberately not asserted here:
+    // the current parser gives back up to three columns per folded line (the
+    // `buffer_str` backoff in `find_next_line_len_with_skip`), so a 20-column
+    // terminal folds at 17. That is a defect, tracked separately; what must
+    // hold either way is that no byte is dropped.
+    const LINE: &str = "abcdefghijklmnopqrstuvwxyz0123";
+    let path = render_fixture("fold.txt", format!("{LINE}\n").as_bytes());
+    let Some(session) = MoreSession::spawn(&[path.to_str().unwrap()], &[], 10, 20) else {
+        println!("Skipping PTY test: no pseudo-terminal available");
+        return;
+    };
+
+    let grid = session.grid();
+    assert!(
+        LINE.starts_with(&grid[0]),
+        "first row must be a prefix of the line, got {:?}",
+        grid[0]
+    );
+    assert!(!grid[0].is_empty() && grid[0].len() <= 20);
+    assert_eq!(
+        format!("{}{}", grid[0], grid[1]),
+        LINE,
+        "folding must not drop content"
+    );
+
+    assert_eq!(session.quit(), Some(0));
+}
+
+#[test]
+fn test_pty_scroll_forward_one_line() {
+    let path = render_fixture("scroll.txt", b"l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n");
+    let Some(mut session) = MoreSession::spawn(&[path.to_str().unwrap()], &[], 4, 20) else {
+        println!("Skipping PTY test: no pseudo-terminal available");
+        return;
+    };
+
+    assert_eq!(session.row(0), "l1");
+    session.keys("j");
+    assert_eq!(session.row(0), "l2");
+
+    assert_eq!(session.quit(), Some(0));
+}
+
+#[test]
+fn test_pty_prompt_reports_percentage() {
+    // POSIX 107630: the prompt reports "what percentage of the file precedes
+    // the current position". It is computed from byte offsets against the
+    // source's total size, which is O(1) to obtain -- a line count would
+    // require reading the whole source.
+    let content: String = (1..=500).map(|n| format!("{n}\n")).collect();
+    let path = render_fixture("percent.txt", content.as_bytes());
+    let Some(mut session) = MoreSession::spawn(&[path.to_str().unwrap()], &[], 10, 40) else {
+        println!("Skipping PTY test: no pseudo-terminal available");
+        return;
+    };
+
+    // The prompt occupies the last row and is erased on exit, so it has to be
+    // sampled before quitting.
+    let first = session.row(9);
+    assert!(
+        first.contains("-- More --(") && first.ends_with("%)"),
+        "expected a percentage in the prompt, got {first:?}"
+    );
+
+    // The figure must advance as the user moves through the file.
+    let percent_of = |row: &str| -> u32 {
+        row.rsplit_once('(')
+            .and_then(|(_, rest)| rest.trim_end_matches("%)").parse().ok())
+            .unwrap_or_else(|| panic!("no percentage in {row:?}"))
+    };
+    // Move forward a few screenfuls -- but not to the end, which would swap
+    // the prompt for the exit prompt.
+    let before = percent_of(&first);
+    session.keys("fff");
+    let after = percent_of(&session.row(9));
+    assert!(
+        after > before,
+        "percentage should grow moving toward the end: {before} -> {after}"
+    );
+
+    assert_eq!(session.quit(), Some(0));
+}
+
+#[test]
+fn test_filter_mode_squeezes_blank_lines() {
+    // POSIX 107650: "When the standard output is not a terminal, only the -s
+    // filter-modification option is effective." It previously had no effect
+    // there at all.
+    run_test_more(&["-s"], "a\n\n\n\nb\n\n\nc\n", "a\n\nb\n\nc\n", "", 0);
+    // Without -s the input is reproduced exactly.
+    run_test_more(&[], "a\n\n\n\nb\n\n\nc\n", "a\n\n\n\nb\n\n\nc\n", "", 0);
+}
+
+#[test]
+fn test_filter_mode_is_byte_exact() {
+    // 107253: when standard output is not a terminal more filters its input
+    // to standard output. That is a byte copy -- non-UTF-8 input used to fail
+    // with "Couldn't parse", because the filter path decoded every line.
+    let path = render_fixture("binary.txt", b"a\xff\xfeb\nsecond\n");
+    let output = std::process::Command::new(plib::testing::get_binary_path("more"))
+        .arg(&path)
+        .output()
+        .expect("failed to run more");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"a\xff\xfeb\nsecond\n".to_vec());
+}
+
+#[test]
+fn test_pty_renders_non_printable_and_tabs() {
+    // The four render-path items the audit deferred, end to end. Every one of
+    // these inputs used to terminate the line at the control byte, dropping
+    // the rest of it.
+    let path = render_fixture(
+        "render.txt",
+        b"aaa\tbbb\nccc\x01ddd\nzzz\r\nA\x08_ under\na\x08a\x08a\x08a bold\n",
+    );
+    let Some(session) = MoreSession::spawn(&[path.to_str().unwrap()], &[], 12, 40) else {
+        println!("Skipping PTY test: no pseudo-terminal available");
+        return;
+    };
+
+    let grid = session.grid();
+    assert_eq!(grid[0], "aaa     bbb", "tab expands to the next stop");
+    assert_eq!(
+        grid[1], "ccc\\001ddd",
+        "control byte renders, line survives"
+    );
+    assert_eq!(grid[2], "zzz", "carriage return before newline is ignored");
+    assert_eq!(grid[3], "A under", "overstrike underline resolves");
+    assert_eq!(grid[4], "a bold", "a\\ba\\ba\\ba collapses to one 'a'");
+
+    assert_eq!(session.quit(), Some(0));
+}
+
+#[test]
+fn test_pty_renders_full_width_non_ascii() {
+    // A line of non-ASCII is many more bytes than columns. Folding used to be
+    // byte-based, so it split the line mid-character and decoding failed.
+    let path = render_fixture("wide.txt", "ééééééééééééééééééét\n".as_bytes());
+    let Some(session) =
+        MoreSession::spawn(&[path.to_str().unwrap()], &[("LC_ALL", "C.UTF-8")], 10, 20)
+    else {
+        println!("Skipping PTY test: no pseudo-terminal available");
+        return;
+    };
+
+    let grid = session.grid();
+    // 19 accented characters plus 't' is exactly 20 columns -- and 39 bytes,
+    // which the byte-based screen bound used to reject outright.
+    assert_eq!(grid[0], "ééééééééééééééééééét");
+    assert!(
+        !grid.iter().any(|r| r.contains("Couldn't")),
+        "no error should be reported, got {grid:?}"
+    );
+
+    assert_eq!(session.quit(), Some(0));
+}
+
+#[test]
+fn test_pty_equals_reports_source_line() {
+    // POSIX 107629: the `=` message reports "the line number in the file".
+    // Folding makes the display line larger than the source line, so the two
+    // must be tracked separately. Each source line here folds into three
+    // display lines in a 20-column terminal.
+    let wide: String = (1..=6)
+        .map(|n| format!("{}{}\n", n, "x".repeat(150)))
+        .collect();
+    let path = render_fixture("wide_lines.txt", wide.as_bytes());
+    // Run from the fixture directory and name the file relatively: the `=`
+    // message echoes the operand, and an absolute path under macOS's
+    // /var/folders/…/T temporary directory does not fit in 60 columns, which
+    // would truncate the line number this test is reading.
+    let dir = path.parent().unwrap().to_path_buf();
+    let Some(mut session) = MoreSession::spawn_in(Some(&dir), &["wide_lines.txt"], &[], 8, 60)
+    else {
+        println!("Skipping PTY test: no pseudo-terminal available");
+        return;
+    };
+
+    // Each 150-character source line folds into three display lines here, so
+    // three `j` presses advance the reported file line by exactly one. Before
+    // source lines were tracked, the display line was reported and it grew by
+    // three.
+    let reported = |session: &mut MoreSession| -> usize {
+        session.keys("=");
+        let prompt = session.row(7);
+        prompt
+            .split_whitespace()
+            .nth(2)
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("no line number in {prompt:?}"))
+    };
+
+    let before = reported(&mut session);
+    session.keys("j");
+    session.keys("j");
+    session.keys("j");
+    let after = reported(&mut session);
+    assert_eq!(
+        after,
+        before + 1,
+        "three display lines are one source line ({before} -> {after})"
+    );
+
+    assert_eq!(session.quit(), Some(0));
+}

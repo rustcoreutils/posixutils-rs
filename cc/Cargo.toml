@@ -11,7 +11,11 @@ rust-version.workspace = true
 bitflags = "2"
 clap.workspace = true
 gettext-rs.workspace = true
+# cflow analyzes object files as well as source (POSIX cflow INPUT FILES).
+object = { version = "0.35", default-features = false, features = ["read", "std"] }
 plib = { path = "../plib" }
+# cflow shells out to lex/yacc for .l/.y operands and needs a scratch directory.
+tempfile.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

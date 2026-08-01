@@ -7,7 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
+use plib::diag;
 use std::{
     error::Error,
     io::{self, Write},
@@ -15,12 +16,36 @@ use std::{
     os::unix::ffi::OsStrExt,
     process::ExitCode,
     slice::Iter,
+    sync::OnceLock,
 };
+
+/// The locale's radix character, resolved once.  POSIX 111924-111926 makes
+/// `LC_NUMERIC` determine the character used by the e, E, f, g, and G
+/// conversions; Rust's own formatting is locale-independent and always emits
+/// a <period>, so the result is substituted after formatting.
+fn radix_char() -> &'static str {
+    static RADIX: OnceLock<String> = OnceLock::new();
+    RADIX.get_or_init(plib::locale::radix_char)
+}
+
+/// Replace the <period> Rust's formatting produced with the locale's radix
+/// character.  Every floating-point rendering here contains at most one.
+fn apply_radix_char(formatted: String) -> String {
+    let radix = radix_char();
+    if radix == "." {
+        formatted
+    } else {
+        formatted.replacen('.', radix, 1)
+    }
+}
 
 // the following structure is a printf format conversion specifier
 struct ConvSpec {
     // the conversion specifier character
     spec: char,
+    // the 1-based argument operand number of a "%n$" conversion (POSIX
+    // 111973-111981); None for an ordinary, unnumbered conversion
+    arg_number: Option<usize>,
     // the minimum field width
     width: Option<usize>,
     // the precision
@@ -37,6 +62,7 @@ impl Default for ConvSpec {
     fn default() -> Self {
         Self {
             spec: ' ',
+            arg_number: Default::default(),
             width: Default::default(),
             precision: Default::default(),
             left_justify: Default::default(),
@@ -73,53 +99,27 @@ enum ParsedBackslashSequence {
     Byte(u8),
 }
 
-// BusyBox: "\400" is interpreted as the ' ' character (octal 40), followed by the '0' character
-// Other implementations ignore the 8th bit, so "\400" is interpreted the same as "\000"
-fn parse_octal_sequence(
-    first_octal_digit: char,
-    peekable: &mut Peekable<Iter<'_, u8>>,
-) -> Result<u8, Box<dyn Error>> {
-    let mut st = String::with_capacity(3_usize);
+/// Parse the `\ddd` escape of POSIX 111944-111946: one, two, or three octal
+/// digits naming "a byte with the numeric value specified by the octal
+/// number".
+///
+/// Three digits can name a value above 377, which does not fit the byte the
+/// spec calls for; the low 8 bits are kept (so `\400` is `\0`, as in every
+/// implementation that does not instead stop the sequence early).
+fn parse_octal_sequence(first_octal_digit: u8, peekable: &mut Peekable<Iter<'_, u8>>) -> u8 {
+    let mut value = u16::from(first_octal_digit - b'0');
 
-    st.push(first_octal_digit);
-
-    let mut added_octal_digit_to_buffer = |pe: &mut Peekable<Iter<'_, u8>>| {
-        if let Some(&&octal_digit @ b'0'..=b'7') = pe.peek() {
-            st.push(char::from(octal_digit));
-
-            pe.next();
-
-            true
-        } else {
-            false
+    for _ in 0..2 {
+        match peekable.peek() {
+            Some(&&octal_digit @ b'0'..=b'7') => {
+                value = value * 8 + u16::from(octal_digit - b'0');
+                peekable.next();
+            }
+            _ => break,
         }
-    };
+    }
 
-    if added_octal_digit_to_buffer(peekable) {
-        added_octal_digit_to_buffer(peekable);
-    };
-
-    let from_str_radix_result = u16::from_str_radix(&st, 8_u32);
-
-    let parsed = match from_str_radix_result {
-        Ok(value) => value,
-        Err(parse_int_error) => {
-            return Err(Box::from(format!(
-                "failed to parse octal sequence '{st}' ({parse_int_error})"
-            )));
-        }
-    };
-
-    // Wrap around if greater than a byte
-    let wrapped = if parsed > 255_u16 {
-        parsed - 255_u16
-    } else {
-        parsed
-    };
-
-    let wrapped_byte = u8::try_from(wrapped)?;
-
-    Ok(wrapped_byte)
+    (value & 0xff) as u8
 }
 
 fn parse_hexadecimal_sequence(peekable: &mut Peekable<Iter<'_, u8>>) -> Result<u8, Box<dyn Error>> {
@@ -177,9 +177,9 @@ fn escaped_char(
 
     let parsed_byte = match byte_after_backslash {
         &byte @ b'0'..=b'7' => {
-            let byte = parse_octal_sequence(char::from(byte), peekable)?;
-
-            return Ok(ParsedBackslashSequence::Byte(byte));
+            return Ok(ParsedBackslashSequence::Byte(parse_octal_sequence(
+                byte, peekable,
+            )));
         }
         b'a' => b'\x07',
         b'b' => b'\x08',
@@ -200,6 +200,35 @@ fn escaped_char(
     };
 
     Ok(ParsedBackslashSequence::Byte(parsed_byte))
+}
+
+/// Recognize the `n$` prefix of a numbered conversion specification, POSIX
+/// 111973-111975: `"%n$"`, where n is a decimal integer in [1,{NL_ARGMAX}]
+/// giving the argument operand number.
+///
+/// The iterator is positioned just past the introducing `'%'`.  A numbered
+/// prefix is recognized only when a run of digits is followed by `'$'`, so
+/// the probe runs on a clone and the real iterator is advanced only on a
+/// match — leaving `"%05d"` and friends to be parsed as flags and width.
+fn parse_arg_number(peekable: &mut Peekable<Iter<'_, u8>>) -> Option<usize> {
+    let mut probe = peekable.clone();
+    let mut digits = String::new();
+
+    while let Some(&&digit @ b'0'..=b'9') = probe.peek() {
+        digits.push(char::from(digit));
+        probe.next();
+    }
+
+    if digits.is_empty() || probe.peek() != Some(&&b'$') {
+        return None;
+    }
+    probe.next();
+
+    // n is 1-based; "%0$" is not a valid argument number.
+    let arg_number = digits.parse::<usize>().ok().filter(|&n| n > 0)?;
+
+    *peekable = probe;
+    Some(arg_number)
 }
 
 fn tokenize_format_str(format: &[u8]) -> Result<Vec<Token>, Box<dyn Error>> {
@@ -225,6 +254,7 @@ fn tokenize_format_str(format: &[u8]) -> Result<Vec<Token>, Box<dyn Error>> {
                             literal.clear();
                         }
 
+                        conv_spec.arg_number = parse_arg_number(&mut peekable);
                         state = ParseState::Flags;
                     } else if current_byte == b'\\' {
                         match escaped_char(&mut peekable)? {
@@ -278,6 +308,11 @@ fn tokenize_format_str(format: &[u8]) -> Result<Vec<Token>, Box<dyn Error>> {
                 }
                 ParseState::Precision => {
                     if current_byte == b'.' {
+                        // XBD 3562-3563: "The precision shall take the form of
+                        // a <period> ('.') followed by a decimal digit string;
+                        // a null digit string is treated as zero."  Commit to
+                        // zero now; any digits that follow overwrite it.
+                        conv_spec.precision = Some(0);
                         state = ParseState::PrecisionValue;
 
                         done_with_char = true;
@@ -324,44 +359,53 @@ fn tokenize_format_str(format: &[u8]) -> Result<Vec<Token>, Box<dyn Error>> {
     Ok(tokens)
 }
 
-/// Format an integer with all POSIX flags applied
-fn format_integer(conv: &ConvSpec, value: i64, is_signed: bool, base: u32, upper: bool) -> Vec<u8> {
-    let is_negative = value < 0;
-    let abs_value = value.unsigned_abs();
-
-    // Convert to string in the appropriate base
-    let digits = match base {
-        8 => format!("{abs_value:o}"),
-        16 if upper => format!("{abs_value:X}"),
-        16 => format!("{abs_value:x}"),
-        _ => abs_value.to_string(),
-    };
-
-    // Determine sign/prefix
-    let sign_char = if is_negative {
+/// Format a signed integer (the `d` and `i` conversions) with all POSIX flags
+/// applied.  The `+` and <space> flags are meaningful only here: XBD 3569-3570
+/// define them in terms of a *signed* conversion.
+fn format_integer_signed(conv: &ConvSpec, value: i64) -> Vec<u8> {
+    let sign_char = if value < 0 {
         Some('-')
-    } else if is_signed && conv.sign {
+    } else if conv.sign {
         Some('+')
-    } else if is_signed && conv.space {
+    } else if conv.space {
         Some(' ')
     } else {
         None
     };
 
-    // Alternate form prefix (#)
-    let prefix = if conv.alt_form && abs_value != 0 {
-        match base {
-            8 => "0",
-            16 if upper => "0X",
-            16 => "0x",
-            _ => "",
-        }
+    format_integer(conv, value.unsigned_abs(), sign_char, 10, false)
+}
+
+/// Format an integer with all POSIX flags applied.
+///
+/// `magnitude` is the absolute value to render; `sign_char` is the sign (or
+/// <space>) to prepend, already decided by the caller, and is always `None`
+/// for the unsigned conversions `o`, `u`, `x`, and `X` (XBD 3607-3608).
+fn format_integer(
+    conv: &ConvSpec,
+    magnitude: u64,
+    sign_char: Option<char>,
+    base: u32,
+    upper: bool,
+) -> Vec<u8> {
+    let abs_value = magnitude;
+
+    // Convert to string in the appropriate base.  XBD 3615-3616: "The result
+    // of converting a zero value with a precision of 0 shall be no
+    // characters."
+    let digits: String = if abs_value == 0 && conv.precision == Some(0) {
+        String::new()
     } else {
-        ""
+        match base {
+            8 => format!("{abs_value:o}"),
+            16 if upper => format!("{abs_value:X}"),
+            16 => format!("{abs_value:x}"),
+            _ => abs_value.to_string(),
+        }
     };
 
     // Apply precision (minimum digits, zero-padded)
-    let digits_with_precision = if let Some(prec) = conv.precision {
+    let mut digits_with_precision = if let Some(prec) = conv.precision {
         if digits.len() < prec {
             format!("{:0>width$}", digits, width = prec)
         } else {
@@ -369,6 +413,24 @@ fn format_integer(conv: &ConvSpec, value: i64, is_signed: bool, base: u32, upper
         }
     } else {
         digits
+    };
+
+    // XBD 3574-3575: for the o conversion, '#' "shall increase the precision
+    // to force the first digit of the result to be a zero" — it is not a
+    // prefix, so it must not add a zero to a result that already has one.
+    if base == 8 && conv.alt_form && !digits_with_precision.starts_with('0') {
+        digits_with_precision.insert(0, '0');
+    }
+
+    // Alternate form prefix (# on x and X only; see above for o)
+    let prefix = if conv.alt_form && abs_value != 0 {
+        match base {
+            16 if upper => "0X",
+            16 => "0x",
+            _ => "",
+        }
+    } else {
+        ""
     };
 
     // Calculate total content length
@@ -428,19 +490,23 @@ fn parse_float_arg(arg: &[u8]) -> Result<(f64, bool), String> {
 
     let arg_str = match std::str::from_utf8(arg) {
         Ok(s) => s,
-        Err(_) => return Err("invalid UTF-8".to_string()),
+        Err(_) => return Err(gettext("invalid UTF-8")),
     };
 
-    let arg_str = arg_str.trim();
+    // strtod() skips leading blanks but stops at trailing ones, which are
+    // then "not completely converted" (POSIX 112020-112024).
+    let arg_str = arg_str.trim_start();
 
     if arg_str.is_empty() {
-        return Ok((0.0, true));
+        return Err(gettext("expected numeric value"));
     }
 
-    // Check for character constant: 'c or "c
+    // Check for character constant: 'c or "c.  POSIX 112013-112018 attaches
+    // this extension to the integer conversions; accepting it here too is a
+    // superset, and matches every other implementation.
     if (arg_str.starts_with('\'') || arg_str.starts_with('"')) && arg_str.len() >= 2 {
         let ch = arg_str.chars().nth(1).unwrap();
-        return Ok((ch as u32 as f64, true));
+        return Ok((ch as u32 as f64, arg_str.chars().count() == 2));
     }
 
     // Parse as float
@@ -486,13 +552,13 @@ fn parse_float_arg(arg: &[u8]) -> Result<(f64, bool), String> {
             }
 
             if end == 0 {
-                return Err(format!("invalid floating point number: {arg_str}"));
+                return Err(gettext("expected numeric value"));
             }
 
             let parsed: &str = &arg_str[..end];
             match parsed.parse::<f64>() {
                 Ok(n) => Ok((n, end == arg_str.len())),
-                Err(_) => Err(format!("invalid floating point number: {arg_str}")),
+                Err(_) => Err(gettext("expected numeric value")),
             }
         }
     }
@@ -606,63 +672,111 @@ fn format_general(value: f64, precision: usize, upper: bool, alt_form: bool) -> 
     }
 }
 
-/// Format a floating point number in hexadecimal format (%a/%A)
-fn format_hex_float(value: f64, precision: usize, upper: bool) -> String {
-    if value.is_nan() {
-        return if upper {
-            "NAN".to_string()
-        } else {
-            "nan".to_string()
+/// Render an infinity or a NaN in the style XBD 3627-3632 prescribes: the
+/// lowercase conversions produce "inf"/"nan", the uppercase ones "INF"/"NAN".
+fn format_nonfinite(value: f64, upper: bool) -> Option<String> {
+    if !value.is_finite() {
+        let text = match (value.is_nan(), upper) {
+            (true, false) => "nan",
+            (true, true) => "NAN",
+            (false, false) => "inf",
+            (false, true) => "INF",
         };
+        return Some(text.to_string());
     }
-    if value.is_infinite() {
-        return if upper {
-            "INF".to_string()
-        } else {
-            "inf".to_string()
-        };
+    None
+}
+
+/// Format a floating point number in decimal notation (%f/%F)
+fn format_fixed(value: f64, precision: usize, upper: bool) -> String {
+    if let Some(text) = format_nonfinite(value, upper) {
+        return text;
     }
-    if value == 0.0 {
-        let zeros = if precision > 0 {
-            format!(".{:0<width$}", "", width = precision)
-        } else {
-            String::new()
-        };
-        return if upper {
-            format!("0X0{}P+0", zeros)
-        } else {
-            format!("0x0{}p+0", zeros)
-        };
+
+    format!("{:.prec$}", value, prec = precision)
+}
+
+/// Format a floating point number in hexadecimal format (%a/%A).
+///
+/// `precision` is `None` when the format omitted it, which per XBD 3594-3598
+/// means "sufficient for an exact representation of the value" — for a binary
+/// FLT_RADIX that is the mantissa with its trailing zeros removed.
+fn format_hex_float(value: f64, precision: Option<usize>, upper: bool) -> String {
+    if let Some(text) = format_nonfinite(value, upper) {
+        return text;
     }
+
+    const MANTISSA_DIGITS: usize = 13;
 
     let bits = value.to_bits();
     let exp_bits = ((bits >> 52) & 0x7FF) as i32;
-    let mantissa = bits & 0xFFFFFFFFFFFFF;
+    let mut mantissa = bits & 0xF_FFFF_FFFF_FFFF;
 
-    let (exponent, leading_digit) = if exp_bits == 0 {
+    let (exponent, mut leading_digit) = if value == 0.0 {
+        (0, 0_u64)
+    } else if exp_bits == 0 {
         // Denormalized
-        (-1022, 0)
+        (-1022, 0_u64)
     } else {
-        (exp_bits - 1023, 1)
+        (exp_bits - 1023, 1_u64)
     };
 
-    // Format mantissa as hex
-    let mantissa_hex = format!("{:013x}", mantissa);
-    let trimmed = mantissa_hex.trim_end_matches('0');
-    let frac_part = if trimmed.is_empty() {
-        if precision > 0 {
-            format!(".{:0<width$}", "", width = precision)
+    // An explicit precision shorter than the mantissa rounds (half-to-even),
+    // rather than truncating, so the printed value is the nearest one
+    // representable in the requested number of hexadecimal digits.
+    if let Some(prec) = precision.filter(|&p| p < MANTISSA_DIGITS) {
+        let shift = 4 * (MANTISSA_DIGITS - prec) as u32;
+        let kept = mantissa >> shift;
+        let rest = mantissa & ((1_u64 << shift) - 1);
+        let half = 1_u64 << (shift - 1);
+
+        let rounded = if rest > half || (rest == half && kept & 1 == 1) {
+            kept + 1
         } else {
-            String::new()
+            kept
+        };
+
+        if rounded >> (4 * prec as u32) != 0 {
+            // Carry out of the fraction bumps the digit before the point.
+            leading_digit += 1;
+            mantissa = 0;
+        } else {
+            mantissa = rounded << shift;
         }
-    } else if precision > 0 {
-        format!(
-            ".{:0<width$}",
-            &mantissa_hex[..precision.min(13)],
-            width = precision
-        )
+    }
+
+    // XBD 3600-3601: "The letters "abcdef" shall be used for a conversion and
+    // the letters "ABCDEF" for A conversion."
+    let mantissa_hex = if upper {
+        format!("{mantissa:013X}")
     } else {
-        format!(".{}", trimmed)
+        format!("{mantissa:013x}")
+    };
+    let frac_part = match precision {
+        // XBD 3594-3598: with the precision missing and a binary FLT_RADIX,
+        // it "shall be sufficient for an exact representation of the value",
+        // and trailing zeros may be omitted.
+        None => {
+            let trimmed = mantissa_hex.trim_end_matches('0');
+            if trimmed.is_empty() {
+                String::new()
+            } else {
+                format!(".{trimmed}")
+            }
+        }
+        // XBD 3599: with a precision of zero and no '#' flag, no
+        // decimal-point character appears.
+        Some(0) => String::new(),
+        Some(prec) => {
+            let mut digits = mantissa_hex
+                .chars()
+                .take(prec.min(MANTISSA_DIGITS))
+                .collect::<String>();
+            while digits.len() < prec {
+                digits.push('0');
+            }
+            format!(".{digits}")
+        }
     };
 
     let exp_sign = if exponent >= 0 { '+' } else { '-' };
@@ -685,25 +799,19 @@ fn format_float(conv: &ConvSpec, value: f64) -> Vec<u8> {
 
     // Format the number according to specifier
     let formatted = match conv.spec {
-        'f' | 'F' => {
-            if conv.spec == 'F' && (abs_value.is_infinite() || abs_value.is_nan()) {
-                if abs_value.is_infinite() {
-                    "INF".to_string()
-                } else {
-                    "NAN".to_string()
-                }
-            } else {
-                format!("{:.prec$}", abs_value, prec = precision)
-            }
-        }
+        'F' => format_fixed(abs_value, precision, true),
         'e' => format_scientific(abs_value, precision, false),
         'E' => format_scientific(abs_value, precision, true),
         'g' => format_general(abs_value, precision, false, conv.alt_form),
         'G' => format_general(abs_value, precision, true, conv.alt_form),
-        'a' => format_hex_float(abs_value, precision, false),
-        'A' => format_hex_float(abs_value, precision, true),
-        _ => format!("{:.prec$}", abs_value, prec = precision),
+        'a' => format_hex_float(abs_value, conv.precision, false),
+        'A' => format_hex_float(abs_value, conv.precision, true),
+        _ => format_fixed(abs_value, precision, false),
     };
+
+    // POSIX 111924-111926 / XBD 3623-3624: LC_NUMERIC determines the radix
+    // character.  Rust's formatting always produces a <period>.
+    let formatted = apply_radix_char(formatted);
 
     // Determine sign
     let sign_char = if is_negative {
@@ -728,13 +836,17 @@ fn format_float(conv: &ConvSpec, value: f64) -> Vec<u8> {
     if width > content_len {
         let padding = width - content_len;
 
+        // XBD 3580-3582: the '0' flag pads with leading zeros "except when
+        // converting an infinity or NaN".
+        let zero_pad = conv.zero_pad && abs_value.is_finite();
+
         if conv.left_justify {
             if let Some(s) = sign_char {
                 output.push(s as u8);
             }
             output.extend_from_slice(formatted.as_bytes());
             output.resize(output.len() + padding, b' ');
-        } else if conv.zero_pad {
+        } else if zero_pad {
             if let Some(s) = sign_char {
                 output.push(s as u8);
             }
@@ -781,15 +893,18 @@ fn format_arg_float(conv: &ConvSpec, arg: &[u8]) -> Result<(Vec<u8>, bool), Box<
     let value = match parse_float_arg(arg) {
         Ok((n, fully_consumed)) => {
             if !fully_consumed {
-                let arg_str = std::str::from_utf8(arg).unwrap_or("<invalid>");
-                eprintln!("printf: {arg_str}: not completely converted");
+                let arg_str = String::from_utf8_lossy(arg);
+                diag::error(&format!(
+                    "{arg_str}: {}",
+                    gettext("not completely converted")
+                ));
                 had_error = true;
             }
             n
         }
         Err(e) => {
-            let arg_str = std::str::from_utf8(arg).unwrap_or("<invalid>");
-            eprintln!("printf: {arg_str}: {e}");
+            let arg_str = String::from_utf8_lossy(arg);
+            diag::error(&format!("{arg_str}: {e}"));
             had_error = true;
             0.0
         }
@@ -798,31 +913,57 @@ fn format_arg_float(conv: &ConvSpec, arg: &[u8]) -> Result<(Vec<u8>, bool), Box<
     Ok((format_float(conv, value), had_error))
 }
 
-/// Parse an integer argument according to POSIX rules:
+/// An integer operand after evaluation as a C integer constant.
+struct IntOperand {
+    /// The value, saturated into the `i128` range.  A 128-bit accumulator is
+    /// wide enough to hold every value either a signed or an unsigned 64-bit
+    /// conversion can render, so saturation to the conversion's own range can
+    /// be decided later, per conversion specifier.
+    value: i128,
+    /// False if the operand had trailing bytes that were not converted.
+    fully_consumed: bool,
+}
+
+/// Parse an integer argument according to POSIX rules (112013-112018):
 /// - Leading + or - allowed
 /// - 0x or 0X prefix for hexadecimal
 /// - 0 prefix for octal
 /// - 'c or "c for character constant (value of character c)
-fn parse_integer_arg(arg: &[u8]) -> Result<(i64, bool), String> {
+fn parse_integer_arg(arg: &[u8]) -> Result<IntOperand, String> {
+    let operand = |value: i128| IntOperand {
+        value,
+        fully_consumed: true,
+    };
+
     if arg.is_empty() {
-        return Ok((0, true));
+        return Ok(operand(0));
     }
 
     let arg_str = match std::str::from_utf8(arg) {
         Ok(s) => s,
-        Err(_) => return Err("invalid UTF-8".to_string()),
+        Err(_) => return Err(gettext("invalid UTF-8")),
     };
 
-    let arg_str = arg_str.trim();
+    // A C integer constant may be preceded by blanks (strtol() skips them),
+    // but trailing bytes are "not completely converted" (112020-112024).
+    let arg_str = arg_str.trim_start();
 
+    // Blanks alone are not a constant.  (An operand that is empty to begin
+    // with is the "missing operand" substitution of item 11, handled above.)
     if arg_str.is_empty() {
-        return Ok((0, true));
+        return Err(gettext("expected numeric value"));
     }
 
     // Check for character constant: 'c or "c
     if (arg_str.starts_with('\'') || arg_str.starts_with('"')) && arg_str.len() >= 2 {
         let ch = arg_str.chars().nth(1).unwrap();
-        return Ok((ch as i64, true));
+        return Ok(IntOperand {
+            value: i128::from(u32::from(ch)),
+            // POSIX EXAMPLES 112128-112141: bytes beyond the quoted character
+            // are not used by the conversion, so a diagnostic is generated
+            // and the exit status is non-zero.
+            fully_consumed: arg_str.chars().count() == 2,
+        });
     }
 
     // Handle sign
@@ -834,119 +975,126 @@ fn parse_integer_arg(arg: &[u8]) -> Result<(i64, bool), String> {
         (false, arg_str)
     };
 
-    // Parse the number
-    let (value, fully_consumed) = if let Some(hex) = num_str
+    // Split the magnitude into a radix and the run of digits valid for it.
+    // Only digits of the right radix are handed to the parser, so the sole
+    // remaining failure mode is a magnitude too large for i128 — which is
+    // saturated rather than rejected, per 112020-112024.
+    let (radix, digits) = if let Some(hex) = num_str
         .strip_prefix("0x")
         .or_else(|| num_str.strip_prefix("0X"))
     {
-        // Hexadecimal
-        // Reject if hex part starts with a sign (after we already handled the sign above)
-        if hex.starts_with('+') || hex.starts_with('-') {
-            return Err(format!("invalid number: {arg_str}"));
-        }
-        match i64::from_str_radix(hex, 16) {
-            Ok(n) => (n, true),
-            Err(_) => {
-                // Try to parse as much as we can
-                let valid_len = hex.chars().take_while(|c| c.is_ascii_hexdigit()).count();
-                if valid_len == 0 {
-                    return Err(format!("invalid number: {arg_str}"));
-                }
-                match i64::from_str_radix(&hex[..valid_len], 16) {
-                    Ok(n) => (n, valid_len == hex.len()),
-                    Err(_) => return Err(format!("invalid number: {arg_str}")),
-                }
-            }
-        }
-    } else if num_str.starts_with('0')
-        && num_str.len() > 1
-        && num_str
-            .chars()
-            .nth(1)
-            .map(|c| c.is_ascii_digit())
-            .unwrap_or(false)
-    {
-        // Octal
-        // Reject if octal part starts with a sign (after we already handled the sign above)
-        if num_str.starts_with('+') || num_str.starts_with('-') {
-            return Err(format!("invalid number: {arg_str}"));
-        }
-        let valid_len = num_str
-            .chars()
-            .take_while(|c| ('0'..='7').contains(c))
-            .count();
-        match i64::from_str_radix(&num_str[..valid_len], 8) {
-            Ok(n) => (n, valid_len == num_str.len()),
-            Err(_) => return Err(format!("invalid octal number: {arg_str}")),
-        }
+        (16, hex)
+    } else if num_str.len() > 1 && num_str.starts_with('0') {
+        (8, num_str)
     } else {
-        // Decimal
-        let valid_len = num_str.chars().take_while(|c| c.is_ascii_digit()).count();
-        if valid_len == 0 {
-            return Err(format!("invalid number: {arg_str}"));
-        }
-        match num_str[..valid_len].parse::<i64>() {
-            Ok(n) => (n, valid_len == num_str.len()),
-            Err(_) => return Err(format!("invalid number: {arg_str}")),
-        }
+        (10, num_str)
     };
 
-    let result = if is_negative { -value } else { value };
-    Ok((result, fully_consumed))
+    let valid_len = digits.chars().take_while(|c| c.is_digit(radix)).count();
+    if valid_len == 0 {
+        return Err(gettext("expected numeric value"));
+    }
+
+    // Only digits of the operand's radix reach the parser, so the sole
+    // failure mode is a magnitude too large for i128.  Saturate; the
+    // conversion's own range check below reports it.
+    let magnitude = i128::from_str_radix(&digits[..valid_len], radix).unwrap_or(i128::MAX);
+
+    Ok(IntOperand {
+        value: if is_negative { -magnitude } else { magnitude },
+        fully_consumed: valid_len == digits.len(),
+    })
 }
 
-fn format_arg_uint_base(conv: &ConvSpec, arg: &[u8]) -> Result<(Vec<u8>, bool), Box<dyn Error>> {
-    let mut had_error = false;
-    let value = match parse_integer_arg(arg) {
-        Ok((n, fully_consumed)) => {
-            if !fully_consumed {
-                let arg_str = std::str::from_utf8(arg).unwrap_or("<invalid>");
-                eprintln!("printf: {arg_str}: not completely converted");
+/// Evaluate an integer operand, emitting the diagnostics POSIX 112020-112024
+/// requires.  Returns the value and whether an error was reported; on error
+/// the caller still writes the accumulated value, as the spec directs.
+fn eval_integer_arg(arg: &[u8]) -> (IntOperand, bool) {
+    match parse_integer_arg(arg) {
+        Ok(operand) => {
+            let mut had_error = false;
+            if !operand.fully_consumed {
+                let arg_str = String::from_utf8_lossy(arg);
+                diag::error(&format!(
+                    "{arg_str}: {}",
+                    gettext("not completely converted")
+                ));
                 had_error = true;
             }
-            n
+            (operand, had_error)
         }
         Err(e) => {
-            let arg_str = std::str::from_utf8(arg).unwrap_or("<invalid>");
-            eprintln!("printf: {arg_str}: {e}");
-            had_error = true;
-            0
+            let arg_str = String::from_utf8_lossy(arg);
+            diag::error(&format!("{arg_str}: {e}"));
+            (
+                IntOperand {
+                    value: 0,
+                    fully_consumed: true,
+                },
+                true,
+            )
         }
-    };
-
-    let formatted = match conv.spec {
-        'u' => format_integer(conv, value.unsigned_abs() as i64, false, 10, false),
-        'o' => format_integer(conv, value.unsigned_abs() as i64, false, 8, false),
-        'x' => format_integer(conv, value.unsigned_abs() as i64, false, 16, false),
-        'X' => format_integer(conv, value.unsigned_abs() as i64, false, 16, true),
-        ch => {
-            panic!("printf: BUG: invalid conversion specifier: {ch}");
-        }
-    };
-
-    Ok((formatted, had_error))
+    }
 }
 
-fn format_arg_int(conv: &ConvSpec, arg: &[u8]) -> Result<(Vec<u8>, bool), Box<dyn Error>> {
-    let mut had_error = false;
-    let value = match parse_integer_arg(arg) {
-        Ok((n, fully_consumed)) => {
-            if !fully_consumed {
-                let arg_str = std::str::from_utf8(arg).unwrap_or("<invalid>");
-                eprintln!("printf: {arg_str}: not completely converted");
-                had_error = true;
-            }
-            n
-        }
-        Err(e) => {
-            let arg_str = std::str::from_utf8(arg).unwrap_or("<invalid>");
-            eprintln!("printf: {arg_str}: {e}");
+/// Report an operand whose value did not fit the conversion.  POSIX
+/// 112020-112024 requires the diagnostic alongside the saturated value; the
+/// wording follows the spec's own EXAMPLES table (112117-112120).
+fn report_overflow(arg: &[u8]) {
+    let arg_str = String::from_utf8_lossy(arg);
+    diag::error(&format!("{arg_str}: {}", gettext("arithmetic overflow")));
+}
+
+/// Format an argument under one of the unsigned conversions (`o`, `u`, `x`,
+/// `X`).  A negative operand is reinterpreted as its two's-complement bit
+/// pattern, matching `strtoul()` and XBD 3607-3608's "unsigned octal /
+/// unsigned decimal / unsigned hexadecimal notation".
+fn format_arg_uint_base(conv: &ConvSpec, arg: &[u8], base: u32, upper: bool) -> (Vec<u8>, bool) {
+    let (operand, mut had_error) = eval_integer_arg(arg);
+
+    let magnitude = if operand.value < 0 {
+        // Saturate into the signed range first, then reinterpret the bits.
+        let signed = if operand.value < i128::from(i64::MIN) {
             had_error = true;
-            0
-        }
+            report_overflow(arg);
+            i64::MIN
+        } else {
+            operand.value as i64
+        };
+        signed as u64
+    } else if operand.value > i128::from(u64::MAX) {
+        had_error = true;
+        report_overflow(arg);
+        u64::MAX
+    } else {
+        operand.value as u64
     };
 
-    Ok((format_integer(conv, value, true, 10, false), had_error))
+    (
+        format_integer(conv, magnitude, None, base, upper),
+        had_error,
+    )
+}
+
+/// Format an argument under the signed conversions (`d`, `i`).  An
+/// out-of-range operand saturates to `i64::MIN`/`i64::MAX`, which is what
+/// `strtol()` returns and what the spec's EXAMPLES (112117-112120) show.
+fn format_arg_int(conv: &ConvSpec, arg: &[u8]) -> (Vec<u8>, bool) {
+    let (operand, mut had_error) = eval_integer_arg(arg);
+
+    let value = if operand.value < i128::from(i64::MIN) {
+        had_error = true;
+        report_overflow(arg);
+        i64::MIN
+    } else if operand.value > i128::from(i64::MAX) {
+        had_error = true;
+        report_overflow(arg);
+        i64::MAX
+    } else {
+        operand.value as i64
+    };
+
+    (format_integer_signed(conv, value), had_error)
 }
 
 fn format_arg_char(conv: &ConvSpec, arg: &[u8]) -> Vec<u8> {
@@ -1084,11 +1232,17 @@ struct FormatResult {
 fn format_arg(conv: &ConvSpec, arg: &[u8]) -> Result<FormatResult, Box<dyn Error>> {
     let (bytes, stop_output, had_error) = match conv.spec {
         'd' | 'i' => {
-            let (bytes, had_error) = format_arg_int(conv, arg)?;
+            let (bytes, had_error) = format_arg_int(conv, arg);
             (bytes, false, had_error)
         }
         'u' | 'o' | 'x' | 'X' => {
-            let (bytes, had_error) = format_arg_uint_base(conv, arg)?;
+            let (base, upper) = match conv.spec {
+                'o' => (8, false),
+                'x' => (16, false),
+                'X' => (16, true),
+                _ => (10, false),
+            };
+            let (bytes, had_error) = format_arg_uint_base(conv, arg, base, upper);
             (bytes, false, had_error)
         }
         'f' | 'F' | 'e' | 'E' | 'g' | 'G' | 'a' | 'A' => {
@@ -1103,7 +1257,10 @@ fn format_arg(conv: &ConvSpec, arg: &[u8]) -> Result<FormatResult, Box<dyn Error
         }
         '%' => (vec![b'%'], false, false),
         ch => {
-            eprintln!("printf: unknown conversion specifier: {ch}");
+            diag::error(&format!(
+                "{}: {ch}",
+                gettext("unknown conversion specifier")
+            ));
             (format_arg_string(conv, arg), false, true)
         }
     };
@@ -1119,16 +1276,30 @@ fn format_arg(conv: &ConvSpec, arg: &[u8]) -> Result<FormatResult, Box<dyn Error
 fn do_printf(format: &[u8], arguments: &[&[u8]]) -> Result<bool, Box<dyn Error>> {
     let token_vec = tokenize_format_str(format)?;
 
-    let mut output = Vec::<u8>::with_capacity(format.len() * 2_usize);
-    let mut arg_index = 0_usize;
+    // Write as we go rather than accumulating the whole result: format reuse
+    // over a long operand list would otherwise materialize every byte of
+    // output in memory before any of it reached standard output.
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
     let mut stop_output = false;
     let mut had_error = false;
 
+    let had_conversion = token_vec
+        .iter()
+        .any(|t| matches!(t, Token::Conversion(c) if c.spec != '%'));
+
+    // Operands consumed by previous uses of the format operand.  POSIX
+    // 111994-111996: on format reuse, the n of a "%n$" conversion refers to
+    // the nth operand *following* the highest-numbered operand the previous
+    // use consumed.
+    let mut base = 0_usize;
+
     // Process format, reusing it if there are remaining arguments
     loop {
-        let had_conversion = token_vec
-            .iter()
-            .any(|t| matches!(t, Token::Conversion(c) if c.spec != '%'));
+        // Running index for unnumbered conversions, and the highest 1-based
+        // operand number a numbered conversion named during this pass.
+        let mut next_unnumbered = base;
+        let mut highest_numbered = 0_usize;
 
         for token in &token_vec {
             if stop_output {
@@ -1140,14 +1311,28 @@ fn do_printf(format: &[u8], arguments: &[&[u8]]) -> Result<bool, Box<dyn Error>>
                     // %% doesn't consume an argument
                     let arg_str = if co.spec == '%' {
                         &[][..]
+                    } else if let Some(n) = co.arg_number {
+                        highest_numbered = highest_numbered.max(n);
+                        let index = base + n - 1;
+                        if index >= arguments.len() {
+                            // POSIX 111998-112000: a missing operand for a
+                            // numbered conversion should be diagnosed and
+                            // should not exit zero.
+                            diag::error(&format!(
+                                "{} %{n}$",
+                                gettext("missing argument for conversion")
+                            ));
+                            had_error = true;
+                        }
+                        arguments.get(index).copied().unwrap_or(&[])
                     } else {
-                        let arg = arguments.get(arg_index).copied().unwrap_or(&[]);
-                        arg_index += 1;
+                        let arg = arguments.get(next_unnumbered).copied().unwrap_or(&[]);
+                        next_unnumbered += 1;
                         arg
                     };
 
                     let result = format_arg(co, arg_str)?;
-                    output.extend_from_slice(&result.bytes);
+                    output.write_all(&result.bytes)?;
 
                     if result.had_error {
                         had_error = true;
@@ -1163,30 +1348,33 @@ fn do_printf(format: &[u8], arguments: &[&[u8]]) -> Result<bool, Box<dyn Error>>
                     break;
                 }
                 Token::Literal(vec) => {
-                    output.extend_from_slice(vec.as_slice());
+                    output.write_all(vec.as_slice())?;
                 }
             }
         }
 
+        // Every argument-consuming conversion advances this past `base`, so a
+        // format containing one always makes progress.
+        let consumed = next_unnumbered.max(base + highest_numbered);
+
         // If we've consumed all arguments or there are no conversion specs, stop
-        if stop_output || arg_index >= arguments.len() || !had_conversion {
+        if stop_output || consumed >= arguments.len() || !had_conversion {
             break;
         }
+
+        base = consumed;
     }
 
-    io::stdout().write_all(output.as_slice())?;
+    // POSIX 112028-112030: a failed write is an error.  Standard output is
+    // line-buffered, so anything not ending in a <newline> is still in the
+    // buffer here and its write error would otherwise be lost at exit.
+    output.flush()?;
 
     Ok(had_error)
 }
 
 fn main() -> ExitCode {
-    setlocale(LocaleCategory::LcAll, "");
-    // TODO
-    // unwrap
-    textdomain("posixutils-rs").unwrap();
-    // TODO
-    // unwrap
-    bind_textdomain_codeset("posixutils-rs", "UTF-8").unwrap();
+    diag::init_locale("printf");
 
     let args = std::env::args_os().collect::<Vec<_>>();
 
@@ -1203,13 +1391,13 @@ fn main() -> ExitCode {
                     }
                 }
                 Err(er) => {
-                    eprint!("printf: {er}");
+                    diag::error(&er.to_string());
                     ExitCode::FAILURE
                 }
             }
         }
         _ => {
-            eprintln!("printf: {}", gettext("not enough arguments"));
+            diag::error(&gettext("not enough arguments"));
             ExitCode::FAILURE
         }
     }

@@ -1329,6 +1329,7 @@ impl Parser<'_> {
         // e.g., "struct point { int x; int y; };"
         if !self.is_special(b';') {
             loop {
+                let decl_pos = self.current_pos();
                 let (name, typ, vla_sizes, _func_params) = self.parse_declarator(base_type_id)?;
                 // Skip GCC extensions like __asm("...") or __attribute__((...))
                 self.skip_extensions();
@@ -1358,6 +1359,7 @@ impl Parser<'_> {
                     init,
                     vla_sizes,
                     explicit_align: validated_align,
+                    pos: decl_pos,
                 });
 
                 if self.is_special(b',') {
@@ -1543,6 +1545,7 @@ impl Parser<'_> {
         // e.g., "struct point { int x; int y; };"
         if !self.is_special(b';') {
             loop {
+                let decl_pos = self.current_pos();
                 let (name, mut typ, vla_sizes, _func_params) =
                     self.parse_declarator(base_type_id)?;
                 // Skip GCC extensions like __asm("...") or __attribute__((...))
@@ -1628,6 +1631,7 @@ impl Parser<'_> {
                         init,
                         vla_sizes,
                         explicit_align: validated_align,
+                        pos: decl_pos,
                     });
                 }
 
@@ -3184,6 +3188,7 @@ impl Parser<'_> {
                         init,
                         vla_sizes: vec![],
                         explicit_align: validated_align,
+                        pos: decl_pos,
                     }],
                 }));
             }
@@ -3376,6 +3381,7 @@ impl Parser<'_> {
                         init,
                         vla_sizes: vec![],
                         explicit_align: validated_align,
+                        pos: decl_pos,
                     }],
                 }));
             }
@@ -3531,6 +3537,7 @@ impl Parser<'_> {
                         init: None,
                         vla_sizes: vec![],
                         explicit_align: None, // Functions don't have _Alignas
+                        pos: decl_pos,
                     }],
                 }));
             }
@@ -3665,11 +3672,13 @@ impl Parser<'_> {
             init,
             vla_sizes: vec![],
             explicit_align: validated_align,
+            pos: decl_pos,
         });
 
         // Handle additional declarators
         while self.is_special(b',') {
             self.advance();
+            let next_decl_pos = self.current_pos();
             let (decl_name, mut decl_type, vla_sizes, _decl_func_params) =
                 self.parse_declarator(base_type_id)?;
 
@@ -3745,6 +3754,7 @@ impl Parser<'_> {
                 init: decl_init,
                 vla_sizes: vec![],
                 explicit_align: decl_validated_align,
+                pos: next_decl_pos,
             });
         }
 

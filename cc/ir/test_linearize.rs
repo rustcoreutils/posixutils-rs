@@ -1741,6 +1741,7 @@ fn test_linearize_for() {
         Stmt::For {
             init: Some(ForInit::Declaration(Declaration {
                 declarators: vec![crate::parse::ast::InitDeclarator {
+                    pos: Position::default(),
                     symbol: i_sym,
                     typ: int_type,
                     storage_class: crate::types::TypeModifiers::empty(),
@@ -2018,6 +2019,7 @@ fn test_local_var_emits_load_store() {
         body: Stmt::Block(vec![
             BlockItem::Declaration(Declaration {
                 declarators: vec![crate::parse::ast::InitDeclarator {
+                    pos: Position::default(),
                     symbol: x_sym,
                     typ: int_type,
                     storage_class: crate::types::TypeModifiers::empty(),
@@ -2078,6 +2080,7 @@ fn test_ssa_converts_local_to_phi() {
             // int x = 1;
             BlockItem::Declaration(Declaration {
                 declarators: vec![crate::parse::ast::InitDeclarator {
+                    pos: Position::default(),
                     symbol: x_sym,
                     typ: int_type,
                     storage_class: crate::types::TypeModifiers::empty(),
@@ -2144,6 +2147,7 @@ fn test_ssa_loop_variable() {
             // int i = 0;
             BlockItem::Declaration(Declaration {
                 declarators: vec![crate::parse::ast::InitDeclarator {
+                    pos: Position::default(),
                     symbol: i_sym,
                     typ: int_type,
                     storage_class: crate::types::TypeModifiers::empty(),
@@ -2618,6 +2622,7 @@ fn test_string_literal_char_array_init() {
         body: Stmt::Block(vec![
             BlockItem::Declaration(Declaration {
                 declarators: vec![InitDeclarator {
+                    pos: Position::default(),
                     symbol: arr_sym,
                     typ: char_arr_type,
                     storage_class: crate::types::TypeModifiers::empty(),
@@ -2669,6 +2674,7 @@ fn test_string_literal_char_pointer_init() {
         body: Stmt::Block(vec![
             BlockItem::Declaration(Declaration {
                 declarators: vec![InitDeclarator {
+                    pos: Position::default(),
                     symbol: p_sym,
                     typ: ctx.types.char_ptr_id,
                     storage_class: crate::types::TypeModifiers::empty(),
@@ -2832,6 +2838,7 @@ fn test_incomplete_struct_type_resolution() {
         params: vec![],
         body: Stmt::Block(vec![BlockItem::Declaration(Declaration {
             declarators: vec![InitDeclarator {
+                pos: Position::default(),
                 symbol: f_sym,
                 typ: incomplete_struct_type,
                 storage_class: crate::types::TypeModifiers::empty(),
@@ -2896,6 +2903,7 @@ fn test_static_local_pre_increment() {
     // Create declaration: static int counter = 0;
     let decl = Declaration {
         declarators: vec![InitDeclarator {
+            pos: Position::default(),
             symbol: counter_sym,
             typ: static_int_type,
             storage_class: TypeModifiers::STATIC,
@@ -2971,6 +2979,7 @@ fn test_static_local_pre_decrement() {
 
     let decl = Declaration {
         declarators: vec![InitDeclarator {
+            pos: Position::default(),
             symbol: counter_sym,
             typ: static_int_type,
             storage_class: TypeModifiers::STATIC,
@@ -3039,6 +3048,7 @@ fn test_static_local_post_increment() {
 
     let decl = Declaration {
         declarators: vec![InitDeclarator {
+            pos: Position::default(),
             symbol: counter_sym,
             typ: static_int_type,
             storage_class: TypeModifiers::STATIC,
@@ -3105,6 +3115,7 @@ fn test_static_local_post_decrement() {
 
     let decl = Declaration {
         declarators: vec![InitDeclarator {
+            pos: Position::default(),
             symbol: counter_sym,
             typ: static_int_type,
             storage_class: TypeModifiers::STATIC,
@@ -3171,6 +3182,7 @@ fn test_static_local_compound_assignment() {
 
     let decl = Declaration {
         declarators: vec![InitDeclarator {
+            pos: Position::default(),
             symbol: sum_sym,
             typ: static_int_type,
             storage_class: TypeModifiers::STATIC,
@@ -3451,6 +3463,7 @@ fn test_static_local_address_in_initializer() {
     // static int x = 0;
     let x_decl = Declaration {
         declarators: vec![InitDeclarator {
+            pos: Position::default(),
             symbol: x_sym,
             typ: static_int_type,
             storage_class: TypeModifiers::STATIC,
@@ -3471,6 +3484,7 @@ fn test_static_local_address_in_initializer() {
 
     let p_decl = Declaration {
         declarators: vec![InitDeclarator {
+            pos: Position::default(),
             symbol: p_sym,
             typ: static_int_ptr_type,
             storage_class: TypeModifiers::STATIC,
@@ -4232,6 +4246,7 @@ fn test_mixed_designated_positional_struct_init() {
         body: Stmt::Block(vec![
             BlockItem::Declaration(Declaration {
                 declarators: vec![InitDeclarator {
+                    pos: Position::default(),
                     symbol: s_sym,
                     typ: struct_type,
                     storage_class: crate::types::TypeModifiers::empty(),
@@ -4328,6 +4343,7 @@ fn test_mixed_designated_positional_array_init() {
         body: Stmt::Block(vec![
             BlockItem::Declaration(Declaration {
                 declarators: vec![InitDeclarator {
+                    pos: Position::default(),
                     symbol: arr_sym,
                     typ: arr_type,
                     storage_class: crate::types::TypeModifiers::empty(),
@@ -4476,6 +4492,7 @@ fn test_designator_chain_nested_struct_init() {
         body: Stmt::Block(vec![
             BlockItem::Declaration(Declaration {
                 declarators: vec![InitDeclarator {
+                    pos: Position::default(),
                     symbol: outer_sym,
                     typ: outer_type,
                     storage_class: crate::types::TypeModifiers::empty(),
@@ -4550,6 +4567,7 @@ fn test_designator_chain_array_member_init() {
         body: Stmt::Block(vec![
             BlockItem::Declaration(Declaration {
                 declarators: vec![InitDeclarator {
+                    pos: Position::default(),
                     symbol: s_sym,
                     typ: struct_type,
                     storage_class: crate::types::TypeModifiers::empty(),
@@ -4612,6 +4630,7 @@ fn test_repeated_designator_last_wins_array() {
         body: Stmt::Block(vec![
             BlockItem::Declaration(Declaration {
                 declarators: vec![InitDeclarator {
+                    pos: Position::default(),
                     symbol: arr_sym,
                     typ: arr_type,
                     storage_class: crate::types::TypeModifiers::empty(),
@@ -4711,6 +4730,7 @@ fn test_skip_unnamed_bitfield_positional_init() {
         body: Stmt::Block(vec![
             BlockItem::Declaration(Declaration {
                 declarators: vec![InitDeclarator {
+                    pos: Position::default(),
                     symbol: s_sym,
                     typ: struct_type,
                     storage_class: crate::types::TypeModifiers::empty(),
@@ -4794,6 +4814,7 @@ fn test_union_first_named_member_positional_init() {
         body: Stmt::Block(vec![
             BlockItem::Declaration(Declaration {
                 declarators: vec![InitDeclarator {
+                    pos: Position::default(),
                     symbol: u_sym,
                     typ: union_type,
                     storage_class: crate::types::TypeModifiers::empty(),
@@ -4898,6 +4919,7 @@ fn test_valist_local_not_indirect() {
     // Function: void test(void) { va_list lva; }
     let lva_decl = Declaration {
         declarators: vec![InitDeclarator {
+            pos: Position::default(),
             symbol: lva_sym,
             typ: valist_type,
             storage_class: crate::types::TypeModifiers::empty(),
@@ -4968,6 +4990,7 @@ fn test_valist_expression_decay() {
 
     let ptr_decl = Declaration {
         declarators: vec![InitDeclarator {
+            pos: Position::default(),
             symbol: ptr_sym,
             typ: uchar_ptr_type,
             storage_class: crate::types::TypeModifiers::empty(),
@@ -5106,6 +5129,7 @@ fn test_bitfield_designated_init_multiple_same_offset() {
     // Create a function with static local declaration
     let decl = Declaration {
         declarators: vec![InitDeclarator {
+            pos: Position::default(),
             symbol: s_sym,
             typ: struct_type,
             storage_class: TypeModifiers::STATIC,
@@ -5247,6 +5271,7 @@ fn test_bitfield_designated_init_local_var() {
         body: Stmt::Block(vec![
             BlockItem::Declaration(Declaration {
                 declarators: vec![InitDeclarator {
+                    pos: Position::default(),
                     symbol: s_sym,
                     typ: struct_type,
                     storage_class: crate::types::TypeModifiers::empty(),
@@ -5370,6 +5395,7 @@ fn test_large_struct_copy_from_array() {
         body: Stmt::Block(vec![
             BlockItem::Declaration(Declaration {
                 declarators: vec![InitDeclarator {
+                    pos: Position::default(),
                     symbol: item_sym,
                     typ: struct_type,
                     storage_class: crate::types::TypeModifiers::empty(),

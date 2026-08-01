@@ -12,24 +12,24 @@ use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleC
 use libc::{getegid, getgid, getuid, setgid, setuid};
 use plib::regex::{Regex, RegexFlags};
 use std::collections::HashMap;
+use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::{stdout, BufRead, BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::mem::MaybeUninit;
-use std::ops::{Not, Range};
+use std::ops::Not;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{exit, ExitStatus};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use termion::{clear::*, cursor::*, event::*, input::*, screen::*, style::*, *};
 
 const LINES_PER_PAGE: u16 = 24;
 const NUM_COLUMNS: u16 = 80;
 const DEFAULT_EDITOR: &str = "vi";
-const CONVERT_STRING_BUF_SIZE: usize = 64;
 const PROJECT_NAME: &str = "posixutils-rs";
 
 /// Last acceptable pressed mouse button
@@ -105,10 +105,12 @@ struct Args {
     )]
     lines: Option<u16>,
 
-    /// Enable interactive session test
+    /// Enable interactive session test.  Not part of the POSIX option set:
+    /// hidden from `--help` so it does not read as a supported interface.
     #[arg(
         short = 'd',
         long = "test",
+        hide = true,
         help = gettext("Enable interactive session test")
     )]
     test: bool,
@@ -198,83 +200,126 @@ enum Command {
 }
 
 /// All more errors
+///
+/// `Display` is written by hand rather than derived so that every diagnostic
+/// passes through `gettext`, which POSIX 107344-107346 requires of
+/// `LC_MESSAGES`-affected text.  (Derive attributes are evaluated at compile
+/// time and cannot call it.)
 #[derive(Debug, Clone, thiserror::Error)]
 enum MoreError {
     /// Errors raised in [`SeekPositions`] level
-    #[error("{}", .0)]
     SeekPositions(#[from] SeekPositionsError),
     /// Errors raised in [`SourceContext`] level
-    #[error("{}", .0)]
     SourceContext(#[from] SourceContextError),
     /// Attempt set [`String`] on [`Terminal`] that goes beyond
-    #[error("Set chars outside screen is forbidden")]
     SetOutside,
-    /// Attempt set [`Prompt`] on [`Terminal`] longer that [`Terminal`] width
-    #[error("Input too long")]
-    InputTooLong,
     /// Read [`std::io::Stdin`] is failed
-    #[error("Couldn't read from stdin")]
     InputRead,
     /// Stdout is a terminal but no readable channel exists for user commands
     /// (neither stderr nor `/dev/tty`).  POSIX requires `more` to terminate
     /// with an error in this case (see INPUT FILES in the POSIX.1-2024 spec).
-    #[error("Cannot read user commands: neither stderr nor /dev/tty is available")]
     NoCommandSource,
     /// Calling [`std::process::Command`] for editor is failed
-    #[error("Editor process failed")]
     EditorFailed,
-    /// Calling [`std::process::Command`] for ctags is failed
-    #[error("Couldn't call ctags")]
-    CTagsFailed,
     /// Open, read [`File`] is failed
-    #[error("Couldn't read file \'{}\'", .0)]
     FileRead(String),
     /// [`Output`], [`Regex`] parse errors
-    #[error("Couldn't parse {}", .0)]
     StringParse(String),
     /// Attempt execute [`Command::UnknownCommand`]
-    #[error("Couldn't execute unknown command")]
     UnknownCommand,
     /// [`Terminal`] init is failed
-    #[error("Terminal isn't initialized")]
     TerminalInit,
     /// [`Terminal`] size is too small
-    #[error("Can't execute commands for too small terminal")]
     TerminalOutput,
     /// [`Terminal`] size read is failed
-    #[error("Couldn't get current terminal size")]
     SizeRead,
     /// Attempt update [`SourceContext::current_screen`] without [`Terminal`]
-    #[error("Terminal operations is forbidden")]
     MissingTerminal,
     /// Search has no results
-    #[error("Couldn't find \'{}\' pattern", .0)]
     PatternNotFound(String),
+}
+
+impl std::fmt::Display for MoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SeekPositions(e) => write!(f, "{e}"),
+            Self::SourceContext(e) => write!(f, "{e}"),
+            Self::SetOutside => write!(f, "{}", gettext("Set chars outside screen is forbidden")),
+            Self::InputRead => write!(f, "{}", gettext("Couldn't read from stdin")),
+            Self::NoCommandSource => write!(
+                f,
+                "{}",
+                gettext("Cannot read user commands: neither stderr nor /dev/tty is available")
+            ),
+            Self::EditorFailed => write!(f, "{}", gettext("Editor process failed")),
+            Self::FileRead(name) => {
+                write!(f, "{} \'{name}\'", gettext("Couldn't read file"))
+            }
+            Self::StringParse(what) => write!(f, "{} {what}", gettext("Couldn't parse")),
+            Self::UnknownCommand => write!(f, "{}", gettext("Couldn't execute unknown command")),
+            Self::TerminalInit => write!(f, "{}", gettext("Terminal isn't initialized")),
+            Self::TerminalOutput => write!(
+                f,
+                "{}",
+                gettext("Can't execute commands for too small terminal")
+            ),
+            Self::SizeRead => write!(f, "{}", gettext("Couldn't get current terminal size")),
+            Self::MissingTerminal => write!(f, "{}", gettext("Terminal operations is forbidden")),
+            Self::PatternNotFound(pattern) => {
+                write!(
+                    f,
+                    "{} \'{pattern}\' {}",
+                    gettext("Couldn't find"),
+                    gettext("pattern")
+                )
+            }
+        }
+    }
 }
 
 /// All [`SeekPositions`] errors
 #[derive(Debug, Clone, thiserror::Error)]
 enum SeekPositionsError {
-    /// [`Output`], [`Regex`] parse errors
-    #[error("Couldn't parse {}", .0)]
-    StringParse(String),
     /// Attempt seek buffer out of bounds
-    #[error("Couldn't seek to {} position", .0)]
     OutOfRange(u64),
     /// Source open, read errors
-    #[error("Couldn't read {}", .0)]
     FileRead(String),
+}
+
+impl std::fmt::Display for SeekPositionsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OutOfRange(position) => {
+                write!(
+                    f,
+                    "{} {position} {}",
+                    gettext("Couldn't seek to"),
+                    gettext("position")
+                )
+            }
+            Self::FileRead(name) => write!(f, "{} {name}", gettext("Couldn't read")),
+        }
+    }
 }
 
 /// All [`SourceContext`] errors
 #[derive(Debug, Clone, thiserror::Error)]
 enum SourceContextError {
     /// Attempt execute previous search when it is [`None`]
-    #[error("No previous regular expression")]
     MissingLastSearch,
     /// Attempt move current position to mark when it isn`t set
-    #[error("Couldn't find mark for \'{}", .0)]
     MissingMark(char),
+}
+
+impl std::fmt::Display for SourceContextError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingLastSearch => write!(f, "{}", gettext("No previous regular expression")),
+            Self::MissingMark(mark) => {
+                write!(f, "{} \'{mark}", gettext("Couldn't find mark for"))
+            }
+        }
+    }
 }
 
 /// Sets display style for every [`Screen`] char on [`Terminal`]
@@ -306,15 +351,19 @@ impl Screen {
     }
 
     /// Sets string range on [`Screen`]
+    ///
+    /// The screen is a grid of cells, so the bound is the number of cells the
+    /// text occupies, not its length in bytes: an 80-column line of non-ASCII
+    /// text is many more bytes than columns and used to be rejected outright.
+    /// Text that does not fit is written up to the edge rather than refused —
+    /// a caller asking to draw past the margin wants the visible part drawn.
     fn set_str(
         &mut self,
         position: (usize, usize),
         string: String,
         style: StyleType,
     ) -> Result<(), MoreError> {
-        if position.0 >= self.0.len()
-            || (self.0[0].len() as isize - position.1 as isize) < string.len() as isize
-        {
+        if position.0 >= self.0.len() {
             return Err(MoreError::SetOutside);
         }
 
@@ -333,14 +382,14 @@ impl Screen {
     }
 
     /// Set string ([`Vec<(char, StyleType)>`]) range on [`Screen`]
+    ///
+    /// Bounded by cells and clamped, for the same reasons as [`Self::set_str`].
     fn set_raw(
         &mut self,
         position: (usize, usize),
         string: Vec<(char, StyleType)>,
     ) -> Result<(), MoreError> {
-        if position.0 > self.0.len()
-            || (self.0[0].len() as isize - position.1 as isize) < string.len() as isize
-        {
+        if position.0 >= self.0.len() {
             return Err(MoreError::SetOutside);
         }
 
@@ -366,7 +415,7 @@ impl Screen {
 }
 
 /// Defines search, scroll direction
-#[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
 enum Direction {
     /// Direction to bigger position
     Forward,
@@ -388,11 +437,520 @@ impl Not for Direction {
 /// Defines set of methods that can be used for any [`Source`]'s.
 /// Used for storage and processing of any [`Source`] type in
 /// [`SeekPositions`]
+/// Continuation cell occupying the second column of a double-width character.
+/// [`Terminal::display`] skips these; the character itself was already drawn.
+const CELL_CONT: char = '\u{0}';
+
+/// Default <tab> stop interval.
+const TAB_STOP: usize = 8;
+
+/// How a source line is turned into display cells.
+#[derive(Clone, Copy)]
+struct RenderOpts {
+    /// `-u`: resolve overstrike sequences as usual, but draw everything
+    /// unstyled.  Layout is identical with and without it.
+    plain: bool,
+}
+
+/// One source line (or one folded piece of one) as it appears on screen.
+struct RenderedLine {
+    /// One entry per display column.
+    cells: Vec<(char, StyleType)>,
+    /// Source bytes this consumed.  Kept separate from the column count:
+    /// a byte can occupy four columns (`\377`) and a character can occupy
+    /// two, so the two quantities are unrelated.
+    bytes: usize,
+    /// The piece ended because a <newline> was consumed.
+    ended_at_newline: bool,
+}
+
+/// A decoded input unit: either a character, or a byte that is not part of a
+/// valid character.
+#[derive(Clone, Copy, PartialEq)]
+enum Glyph {
+    Ch(char),
+    Byte(u8),
+}
+
+/// A unit after overstrike resolution: what to draw, how, and how many source
+/// bytes it accounts for (including any discarded overstrike material).
+struct Piece {
+    glyph: Glyph,
+    style: StyleType,
+    bytes: usize,
+}
+
+/// Decode one UTF-8 character from the front of `src`.
+///
+/// Returns `None` when `src` holds only part of a sequence, so the caller can
+/// fetch more input.  UTF-8 is decoded regardless of `LC_CTYPE`: text is
+/// overwhelmingly UTF-8 even under `LC_ALL=C`, and escaping it there would
+/// make ordinary content unreadable.  Bytes that are not valid UTF-8 are
+/// reported one at a time and end up as octal escapes.
+fn decode_glyph(src: &[u8]) -> Option<(Glyph, usize)> {
+    let first = src[0];
+    let len = match first {
+        0x00..=0x7f => 1,
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => return Some((Glyph::Byte(first), 1)),
+    };
+
+    if src.len() < len {
+        return None;
+    }
+
+    match std::str::from_utf8(&src[..len]) {
+        Ok(text) => text.chars().next().map(|c| (Glyph::Ch(c), len)),
+        Err(_) => Some((Glyph::Byte(first), 1)),
+    }
+}
+
+/// Display width of a character, never less than one column.
+fn glyph_width(c: char) -> usize {
+    match plib::locale::wcwidth_char(c) {
+        w if w > 0 => w as usize,
+        // Combining marks and characters the locale cannot measure still need
+        // somewhere to go; a column each is the safe answer.
+        _ => 1,
+    }
+}
+
+/// Render a non-printable character in the `ed` list format that POSIX
+/// 107450-107452 points at: the named escapes of XBD Table 5-1, otherwise one
+/// three-digit octal number per byte of the character.
+///
+/// Unlike `ed`'s `l` command this does not escape a literal <backslash> or
+/// mark the end of line: `l` renders whole lines unambiguously, whereas 107450
+/// scopes escaping to "other non-printable characters" only.  Escaping every
+/// backslash in a pager would be noise.
+fn escape_glyph(glyph: Glyph, out: &mut Vec<char>) {
+    let named = |c: char| -> Option<&'static str> {
+        Some(match c {
+            '\x07' => "\\a",
+            '\x08' => "\\b",
+            '\x0c' => "\\f",
+            '\r' => "\\r",
+            '\x0b' => "\\v",
+            _ => return None,
+        })
+    };
+
+    match glyph {
+        Glyph::Ch(c) => {
+            if let Some(text) = named(c) {
+                out.extend(text.chars());
+                return;
+            }
+            let mut buf = [0u8; 4];
+            for byte in c.encode_utf8(&mut buf).as_bytes() {
+                out.extend(format!("\\{byte:03o}").chars());
+            }
+        }
+        Glyph::Byte(b) => out.extend(format!("\\{b:03o}").chars()),
+    }
+}
+
+/// Resolve the overstrike conventions of POSIX 107432-107447 over a decoded
+/// line, producing the units to draw.
+///
+/// Bytes that are discarded (backspaces and the characters they erase) are
+/// attributed to the *following* unit, so that re-rendering from any byte
+/// offset reproduces the same units — which is what keeps the seek positions
+/// exact across folds.
+fn resolve_overstrike(glyphs: &[(Glyph, usize)], plain: bool) -> Vec<Piece> {
+    let mut pieces: Vec<Piece> = Vec::with_capacity(glyphs.len());
+    let mut carried = 0usize;
+    let mut i = 0;
+
+    let is = |idx: usize, c: char| glyphs.get(idx).map(|g| g.0) == Some(Glyph::Ch(c));
+    let run = |mut idx: usize, c: char| {
+        let mut n = 0;
+        while is(idx, c) {
+            n += 1;
+            idx += 1;
+        }
+        n
+    };
+    let bytes_of = |from: usize, to: usize| -> usize {
+        glyphs[from..to.min(glyphs.len())].iter().map(|g| g.1).sum()
+    };
+
+    while i < glyphs.len() {
+        let (glyph, len) = glyphs[i];
+
+        // A backspace with nothing to erase, or one left over after the forms
+        // below: discard it together with the character it follows
+        // (107446-107447).
+        if glyph == Glyph::Ch('\x08') {
+            carried += len;
+            if let Some(prev) = pieces.pop() {
+                carried += prev.bytes;
+            }
+            i += 1;
+            continue;
+        }
+
+        let width = match glyph {
+            Glyph::Ch(c) if !c.is_control() => glyph_width(c),
+            _ => 1,
+        };
+
+        // "_"*n <backspace>*n <char of width n> -- underline written the other
+        // way round.  Checked before the embolden form so that "_\b_"
+        // underlines rather than emboldening.
+        if glyph == Glyph::Ch('_') {
+            let underscores = run(i, '_');
+            let after = i + underscores;
+            if run(after, '\x08') >= underscores {
+                let target = after + underscores;
+                if let Some(&(Glyph::Ch(c), _)) = glyphs.get(target) {
+                    if !c.is_control() && glyph_width(c) == underscores {
+                        pieces.push(Piece {
+                            glyph: Glyph::Ch(c),
+                            style: if plain {
+                                StyleType::None
+                            } else {
+                                StyleType::Underscore
+                            },
+                            bytes: carried + bytes_of(i, target + 1),
+                        });
+                        carried = 0;
+                        i = target + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        let backspaces = run(i + 1, '\x08');
+        if backspaces == width {
+            let after = i + 1 + backspaces;
+
+            // <char> <backspace>*n "_"*n -- underline.
+            if run(after, '_') >= width {
+                pieces.push(Piece {
+                    glyph,
+                    style: if plain {
+                        StyleType::None
+                    } else {
+                        StyleType::Underscore
+                    },
+                    bytes: carried + bytes_of(i, after + width),
+                });
+                carried = 0;
+                i = after + width;
+                continue;
+            }
+
+            // <char> <backspace>*n <same char> -- embolden.  Further
+            // <backspace>*n <same char> pairs are absorbed, so "a\ba\ba\ba" is
+            // a single emboldened 'a' (107443-107445).
+            if glyphs.get(after).map(|g| g.0) == Some(glyph) {
+                let mut end = after + 1;
+                loop {
+                    let next = end + width;
+                    if run(end, '\x08') >= width && glyphs.get(next).map(|g| g.0) == Some(glyph) {
+                        end = next + 1;
+                    } else {
+                        break;
+                    }
+                }
+                pieces.push(Piece {
+                    glyph,
+                    style: if plain {
+                        StyleType::None
+                    } else {
+                        StyleType::Negative
+                    },
+                    bytes: carried + bytes_of(i, end),
+                });
+                carried = 0;
+                i = end;
+                continue;
+            }
+        }
+
+        pieces.push(Piece {
+            glyph,
+            style: StyleType::None,
+            bytes: carried + len,
+        });
+        carried = 0;
+        i += 1;
+    }
+
+    // Trailing material that erased everything after it still has to be
+    // accounted for, or the cursor would never move past it.
+    if carried > 0 {
+        pieces.push(Piece {
+            glyph: Glyph::Ch('\0'),
+            style: StyleType::None,
+            bytes: carried,
+        });
+    }
+
+    pieces
+}
+
+/// Render one display line from the front of `src`.
+///
+/// Stops at a <newline>, when `cols` columns are filled, or when the input
+/// runs out.  Returns `None` when more input is needed to decide — the caller
+/// then supplies a longer slice.  At end of input it always returns a line.
+///
+/// `bytes` and the column count are tracked separately: this is the whole
+/// point of the function.  A control byte occupies four columns as `\001`, a
+/// <tab> occupies up to eight, and a double-width character occupies two, so
+/// no single number can serve as both a fold width and a seek offset.
+fn render_display_line(
+    src: &[u8],
+    cols: Option<usize>,
+    opts: RenderOpts,
+    at_eof: bool,
+) -> Option<RenderedLine> {
+    // Decode the whole slice up front; overstrike needs lookahead.
+    let mut glyphs: Vec<(Glyph, usize)> = Vec::new();
+    let mut consumed = 0usize;
+    let mut ended_at_newline = false;
+
+    while consumed < src.len() {
+        let Some((glyph, len)) = decode_glyph(&src[consumed..]) else {
+            if at_eof {
+                // A truncated sequence at end of input is just bytes.
+                glyphs.push((Glyph::Byte(src[consumed]), 1));
+                consumed += 1;
+                continue;
+            }
+            return None;
+        };
+
+        // A <carriage-return> immediately before the <newline> that ends the
+        // line is ignored rather than written (107448-107449).  Anywhere else
+        // it is an ordinary non-printable.  Resolved here, before overstrike,
+        // so it can never take part in a backspace sequence.
+        if glyph == Glyph::Ch('\r') {
+            match src.get(consumed + len) {
+                Some(b'\n') => {
+                    consumed += len + 1;
+                    ended_at_newline = true;
+                    break;
+                }
+                None if !at_eof => return None,
+                None => {
+                    consumed += len;
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        consumed += len;
+        if glyph == Glyph::Ch('\n') {
+            ended_at_newline = true;
+            break;
+        }
+        glyphs.push((glyph, len));
+    }
+
+    if !ended_at_newline && !at_eof {
+        // The line may continue in bytes we have not been given yet.
+        return None;
+    }
+
+    let pieces = resolve_overstrike(&glyphs, opts.plain);
+
+    // Lay the pieces out, stopping at the column budget.  A piece is atomic:
+    // if its expansion does not fit it is not emitted and its bytes are not
+    // consumed, so it begins the next display line rather than being split or
+    // dropped (107452-107453).
+    let budget = cols.unwrap_or(usize::MAX);
+    let mut cells: Vec<(char, StyleType)> = Vec::new();
+    let mut bytes = 0usize;
+    let mut folded = false;
+
+    for piece in &pieces {
+        let mut expansion: Vec<char> = Vec::new();
+        match piece.glyph {
+            // The placeholder used for trailing discarded material.
+            Glyph::Ch('\0') => {}
+            Glyph::Ch('\t') => {
+                let next_stop = (cells.len() / TAB_STOP + 1) * TAB_STOP;
+                expansion.resize(next_stop.saturating_sub(cells.len()).max(1), ' ');
+            }
+            Glyph::Ch(c) if !c.is_control() => {
+                expansion.push(c);
+                expansion.resize(glyph_width(c), CELL_CONT);
+            }
+            other => escape_glyph(other, &mut expansion),
+        }
+
+        // Nothing emitted yet and it still does not fit? Emit anyway rather
+        // than making no progress; the screen layer clamps.
+        if !expansion.is_empty() && cells.len() + expansion.len() > budget && !cells.is_empty() {
+            folded = true;
+            break;
+        }
+
+        for ch in expansion {
+            cells.push((ch, piece.style));
+        }
+        bytes += piece.bytes;
+    }
+
+    if !folded && ended_at_newline {
+        // The <newline> (and any <carriage-return> before it) is consumed by
+        // this piece even though it draws nothing.
+        bytes = consumed;
+    }
+
+    Some(RenderedLine {
+        cells,
+        bytes,
+        ended_at_newline: ended_at_newline && !folded,
+    })
+}
+
 trait SeekRead: Seek + Read {}
 
 impl<T: Seek + Read> SeekRead for Box<T> {}
 impl SeekRead for File {}
 impl SeekRead for Cursor<String> {}
+impl SeekRead for SpillReader {}
+
+/// Backing store that makes a non-seekable input seekable.
+///
+/// `more` must be able to seek: it shows a screenful at a time and lets the
+/// user move back.  Holding the whole input in memory would cap the input size
+/// at available RAM, which for a pager fed by a pipe is the wrong bound
+/// entirely.  Instead, bytes are appended to an unlinked temporary file as
+/// they are read, and seeks are served from that file, so only the portion the
+/// user has actually reached is ever stored.
+struct Spill {
+    /// Upstream reader; `None` once it has reported end-of-file.
+    upstream: Option<Box<dyn Read + Send>>,
+    /// Everything read so far.  `tempfile()` unlinks on creation, so the file
+    /// cannot outlive the process on any exit path, including a signal.
+    file: File,
+    /// Bytes pulled from `upstream` and written to `file`.
+    written: u64,
+}
+
+impl Spill {
+    fn new(upstream: Box<dyn Read + Send>) -> std::io::Result<Self> {
+        Ok(Self {
+            upstream: Some(upstream),
+            file: tempfile::tempfile()?,
+            written: 0,
+        })
+    }
+
+    /// Total size, known only once upstream has been drained.
+    fn total(&self) -> Option<u64> {
+        self.upstream.is_none().then_some(self.written)
+    }
+
+    /// Pull from upstream until `target` bytes are stored, or EOF.
+    fn fill_to(&mut self, target: u64) -> std::io::Result<()> {
+        let mut chunk = [0u8; 8192];
+        while self.written < target {
+            let Some(upstream) = self.upstream.as_mut() else {
+                break;
+            };
+            let n = upstream.read(&mut chunk)?;
+            if n == 0 {
+                self.upstream = None;
+                break;
+            }
+            self.file.seek(SeekFrom::Start(self.written))?;
+            self.file.write_all(&chunk[..n])?;
+            self.written += n as u64;
+        }
+        Ok(())
+    }
+
+    /// Read at an absolute offset, pulling more input first if needed.
+    /// A short read of 0 therefore means genuine end-of-input.
+    fn read_at(&mut self, pos: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.fill_to(pos.saturating_add(buf.len() as u64))?;
+        if pos >= self.written {
+            return Ok(0);
+        }
+        let n = buf.len().min((self.written - pos) as usize);
+        self.file.seek(SeekFrom::Start(pos))?;
+        self.file.read_exact(&mut buf[..n])?;
+        Ok(n)
+    }
+}
+
+/// A [`Spill`] shared by every cursor over the same input.
+#[derive(Clone)]
+struct SharedSpill(Arc<Mutex<Spill>>);
+
+impl std::fmt::Debug for SharedSpill {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SharedSpill")
+    }
+}
+
+impl SharedSpill {
+    fn new(upstream: Box<dyn Read + Send>) -> std::io::Result<Self> {
+        Ok(Self(Arc::new(Mutex::new(Spill::new(upstream)?))))
+    }
+
+    fn total(&self) -> Option<u64> {
+        self.0.lock().ok()?.total()
+    }
+
+    fn reader(&self) -> SpillReader {
+        SpillReader {
+            spill: self.clone(),
+            pos: 0,
+        }
+    }
+}
+
+/// An independent seekable cursor over a [`SharedSpill`].
+struct SpillReader {
+    spill: SharedSpill,
+    pos: u64,
+}
+
+impl Read for SpillReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut spill = self
+            .spill
+            .0
+            .lock()
+            .map_err(|_| std::io::Error::other("spill lock poisoned"))?;
+        let n = spill.read_at(self.pos, buf)?;
+        drop(spill);
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for SpillReader {
+    fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+        self.pos = match from {
+            SeekFrom::Start(n) => n,
+            SeekFrom::Current(delta) => self.pos.saturating_add_signed(delta),
+            SeekFrom::End(delta) => {
+                // Locating the end is the one operation that must drain the
+                // input; it only happens because the user asked to go there.
+                let mut spill = self
+                    .spill
+                    .0
+                    .lock()
+                    .map_err(|_| std::io::Error::other("spill lock poisoned"))?;
+                spill.fill_to(u64::MAX)?;
+                spill.written.saturating_add_signed(delta)
+            }
+        };
+        Ok(self.pos)
+    }
+}
 
 /// Universal cursor that can read lines, seek
 /// over any [`SeekRead`] source
@@ -401,22 +959,26 @@ struct SeekPositions {
     positions: Vec<u64>,
     /// Terminal width for spliting long lines. If [`None`], lines not splited by length
     line_len: Option<usize>,
-    /// Stream size
-    stream_len: u64,
-    /// Count of all lines in source
-    lines_count: usize,
+    /// Total size of the source in bytes, when it is knowable without reading
+    /// everything.  `None` for a source whose length cannot be established up
+    /// front; POSIX 107631-107632 permits omitting the figures derived from it.
+    total_bytes: Option<u64>,
     /// Source that handles info for creating [`SeekRead`] buffer
     source: Source,
     /// Buffer for which is seek and read is applied  
     buffer: Box<dyn SeekRead>,
     /// Shrink all sequences of <newline>'s to one <newline>
     squeeze_lines: bool,
-    /// Suppress underlining and bold
+    /// `-u`: suppress underlining and bold
     plain: bool,
+    /// Source line number at each entry of `positions`.
+    ///
+    /// A folded line occupies several display lines but is one line of the
+    /// file, so the two counts diverge; POSIX 107629 asks for "the line
+    /// number in the file".
+    source_lines: Vec<usize>,
     /// Iteration over [`SeekPositions`] buffer has reached end
     is_ended: bool,
-    /// Char positions for stylized text
-    style_positions: Vec<(Range<usize>, StyleType)>,
 }
 
 impl SeekPositions {
@@ -427,105 +989,103 @@ impl SeekPositions {
         squeeze_lines: bool,
         plain: bool,
     ) -> Result<Self, MoreError> {
-        let buffer: Box<dyn SeekRead> = match source.clone() {
+        // Sizing is O(1): the file's metadata, or the buffer's length.  more
+        // must never read a source through in order to start displaying it —
+        // the input can be arbitrarily large.
+        let (buffer, total_bytes): (Box<dyn SeekRead>, Option<u64>) = match source.clone() {
             Source::File(path) => {
                 let Ok(file) = File::open(path.clone()) else {
                     return Err(MoreError::SeekPositions(SeekPositionsError::FileRead(
                         path.to_str().unwrap_or("<file>").to_string(),
                     )));
                 };
-                let buffer: Box<dyn SeekRead> = Box::new(file);
-                buffer
+                let total = file.metadata().ok().map(|meta| meta.len());
+                (Box::new(file), total)
             }
             Source::Buffer(buffer) => {
-                let buffer: Box<dyn SeekRead> = Box::new(buffer);
-                buffer
+                let total = Some(buffer.get_ref().len() as u64);
+                (Box::new(buffer), total)
             }
+            // Size is unknown until the input has been drained, which more
+            // must not do just to start displaying.
+            Source::Stream(spill) => (Box::new(spill.reader()), None),
         };
-        let mut seek_pos = Self {
-            positions: vec![],
+
+        Ok(Self {
+            // The first line starts at offset 0, so the cursor begins on line
+            // 1.  (The scan this replaced left `positions` in exactly this
+            // state as a side effect; stating it is clearer than deriving it.)
+            positions: vec![0],
+            source_lines: vec![1],
             line_len,
-            stream_len: 0,
-            lines_count: 0,
-            source: source.clone(),
+            total_bytes,
+            source,
             buffer,
             squeeze_lines,
             plain,
             is_ended: false,
-            style_positions: vec![],
-        };
-        (seek_pos.lines_count, seek_pos.stream_len) = seek_pos.lines_count_and_stream_len();
-        if seek_pos.lines_count as u64 > seek_pos.stream_len {
-            return Err(MoreError::FileRead(source.clone().name()));
-        }
-        Ok(seek_pos)
+        })
     }
 
-    /// Counts all buffer lines and set [`SeekPositions`] to previous state
-    fn lines_count_and_stream_len(&mut self) -> (usize, u64) {
-        let current_line = self.current_line();
-        let _ = self.buffer.rewind();
-        let mut count = 0;
-        while self.next().is_some() {
-            count += 1;
-        }
-        {
-            let mut reader = BufReader::new(&mut self.buffer);
-            let mut buf = vec![];
-            let _ = reader.read_to_end(&mut buf);
-            if !buf.is_empty() {
-                count += 1;
+    /// Render the display line at `start`.
+    ///
+    /// The renderer is a pure function over bytes, so this only has to feed
+    /// it enough of them: it asks for more whenever the slice ends mid-line
+    /// or mid-character, which terminates because the request grows.
+    fn render_at(&mut self, start: u64) -> Option<RenderedLine> {
+        let mut chunk = 1024usize;
+        loop {
+            if self.buffer.seek(SeekFrom::Start(start)).is_err() {
+                return None;
             }
-        }
-        let stream_position = self.buffer.stream_position().unwrap_or(0);
-        let _ = self.buffer.rewind();
-        let mut i = 0;
-        self.positions = vec![0];
-        while i < current_line {
-            if self.next().is_none() {
-                break;
-            };
-            i += 1;
-        }
-        (count, stream_position)
-    }
 
-    /// Read line from current seek position with removing styling control chars
-    fn read_line(&mut self) -> Result<String, MoreError> {
-        let current_seek = self.current();
-        let mut line = if let Some(next_seek) = self.next() {
-            self.next_back();
-            let mut line_buf = vec![b' '; (next_seek - current_seek) as usize];
-            self.buffer.read_exact(&mut line_buf).map_err(|_| {
-                MoreError::SeekPositions(SeekPositionsError::FileRead(self.source.name()))
-            })?;
-            String::from_utf8(Vec::from_iter(line_buf)).map_err(|_| {
-                MoreError::SeekPositions(SeekPositionsError::StringParse(self.source.name()))
-            })?
-        } else {
-            let mut line_buf = vec![];
-            let _ = self.buffer.read_to_end(&mut line_buf);
-            String::from_utf8(Vec::from_iter(line_buf)).unwrap_or_default()
-        };
-        if line.is_empty() {
-            return Ok(String::new());
-        }
-        for (rng, _) in self.style_positions.iter().rev() {
-            if rng.end > line.len() {
-                continue;
-            };
-            let new = line[rng.clone()]
-                .chars()
-                .filter(|ch| *ch != '\x08' && *ch != '_' && *ch != '\r')
-                .collect::<String>();
-            if !new.is_empty() {
-                let new = new[..1].to_string();
-                if line.len() >= rng.end {
-                    line.replace_range(rng.clone(), &new);
+            let mut buf = vec![0u8; chunk];
+            let mut filled = 0usize;
+            while filled < chunk {
+                match self.buffer.read(&mut buf[filled..]) {
+                    Ok(0) => break,
+                    Ok(n) => filled += n,
+                    Err(_) => return None,
                 }
             }
+            buf.truncate(filled);
+            let at_eof = filled < chunk;
+
+            let opts = RenderOpts { plain: self.plain };
+            if let Some(line) = render_display_line(&buf, self.line_len, opts, at_eof) {
+                if at_eof && line.bytes >= filled {
+                    self.is_ended = true;
+                }
+                return Some(line);
+            }
+            if at_eof {
+                return None;
+            }
+            chunk *= 4;
         }
-        Ok(line)
+    }
+
+    /// The display line at the current position, as cells.
+    fn render_current_line(&mut self) -> Option<RenderedLine> {
+        let start = self.current();
+        self.render_at(start)
+    }
+
+    /// The display line at the current position, as text.
+    ///
+    /// Used for searching, so it is the text the user can see: escapes and
+    /// tab expansion included, overstrike control characters removed.
+    fn read_line(&mut self) -> Result<String, MoreError> {
+        Ok(self
+            .render_current_line()
+            .map(|line| {
+                line.cells
+                    .iter()
+                    .map(|(c, _)| *c)
+                    .filter(|c| *c != CELL_CONT)
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     /// Returns current seek position
@@ -536,6 +1096,12 @@ impl SeekPositions {
     /// Returns current line index
     fn current_line(&self) -> usize {
         self.positions.len()
+    }
+
+    /// Line number *in the file* at the current position, as distinct from
+    /// the display line, which folding makes larger.
+    fn current_source_line(&self) -> usize {
+        self.source_lines.last().copied().unwrap_or(1)
     }
 
     /// Sets current line to [`position`]
@@ -551,14 +1117,41 @@ impl SeekPositions {
         }
     }
 
-    /// Returns full lines count fo current source
-    fn len_lines(&self) -> usize {
-        self.lines_count
+    /// Total size of the source, if that is knowable.
+    ///
+    /// A file or an in-memory buffer knows it up front; a stream only learns
+    /// it once its input has been drained, so it is queried rather than
+    /// cached.
+    fn total_bytes(&self) -> Option<u64> {
+        match &self.source {
+            Source::Stream(spill) => spill.total(),
+            _ => self.total_bytes,
+        }
     }
 
-    /// Returns stream len fo current source
-    fn _len(&self) -> u64 {
-        self.stream_len
+    /// Percentage of the source preceding the current position, when the
+    /// total size is known.
+    ///
+    /// POSIX 107630-107632 asks for "what percentage of the file precedes the
+    /// current position", but permits omitting it when reading from standard
+    /// input.  Measuring in *bytes* rather than lines is what keeps this O(1):
+    /// a total line count cannot be had without reading the whole source.
+    fn percent(&self) -> Option<u8> {
+        let total = self.total_bytes()?;
+        if total == 0 {
+            return None;
+        }
+        Some(((u128::from(self.current()) * 100 / u128::from(total)).min(100)) as u8)
+    }
+
+    /// Drive the source to its end.
+    ///
+    /// This is the only operation that must read everything, and it is only
+    /// ever reached because the user asked to go to the end (`G`) or because
+    /// the display ran off it.  `set_current` stops and sets `is_ended` when
+    /// the source is exhausted, so `usize::MAX` means "as far as this goes".
+    fn goto_end(&mut self) {
+        self.set_current(usize::MAX);
     }
 
     /// Seek to certain [`position`] over current source
@@ -566,7 +1159,7 @@ impl SeekPositions {
         let err = Err(MoreError::SeekPositions(SeekPositionsError::OutOfRange(
             position,
         )));
-        if position > self.stream_len {
+        if self.total_bytes().is_some_and(|total| position > total) {
             return err;
         }
         loop {
@@ -587,271 +1180,32 @@ impl SeekPositions {
         Ok(())
     }
 
-    /// Returns nth position of choosen [`char`] if it exists
+    /// Byte offset at which the nth *source* line begins, if it exists.
+    ///
+    /// Counted with `read_until`, which keeps the <newline> in the byte
+    /// count; `lines()` strips it, so the offsets this produced were short by
+    /// one byte per line and drifted further the deeper the file went.
     pub fn find_n_line(&mut self, n: usize) -> Option<u64> {
         let last_seek = self.current();
-        let mut n_char_seek = None;
-        let _ = self.buffer.rewind();
-        let mut i = 0;
-        let mut seek_pos = 0;
-        {
-            let reader = BufReader::new(&mut self.buffer).lines();
-            for line in reader {
-                if let Ok(line) = line {
-                    seek_pos += line.len();
-                }
-                i += 1;
-                if i >= n {
-                    n_char_seek = Some(seek_pos as u64);
-                    break;
+        let mut offset = 0u64;
+        let mut found = None;
+
+        if self.buffer.rewind().is_ok() {
+            let mut reader = BufReader::new(&mut self.buffer);
+            let mut line = Vec::new();
+            for _ in 1..n.max(1) {
+                line.clear();
+                match reader.read_until(b'\n', &mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => offset += read as u64,
                 }
             }
+            found = Some(offset);
         }
+
         let _ = self.seek(last_seek);
-        n_char_seek
+        found
     }
-
-    /// Search 'EOF', '\n', if line length bigger than [`Self::line_len`],
-    /// then return next line len as [`Self::line_len`]. Skip next line
-    /// after that [`Self::buffer`] seek position will be at last char
-    /// position of next line. When this function search line end, it
-    /// skips styled text control bytes and add range for replacing this
-    /// bytes with text to [`Self::style_positions`]. [`Self::style_positions`]
-    /// used in [`Self::read_line`] for formating styled text.
-    fn find_next_line_len_with_skip(&mut self) -> usize {
-        let mut style_positions = vec![];
-        let mut buffer_str = String::new();
-        self.is_ended = false;
-        let mut line_len = 0;
-        let mut need_add_chars = 0;
-        let max_line_len = self.line_len.unwrap_or(usize::MAX) as u64;
-        let mut n_count = 0;
-        let mut r_count = 0;
-        {
-            let reader = BufReader::new(&mut self.buffer);
-            let mut bytes = reader.bytes();
-            let mut buf = Vec::with_capacity(CONVERT_STRING_BUF_SIZE);
-            loop {
-                let Some(Ok(byte)) = bytes.next() else {
-                    self.is_ended = true;
-                    break;
-                };
-                match byte {
-                    b'\r' => {
-                        line_len += 1;
-                        buffer_str.push(byte as char);
-                        buf.push(byte);
-                        r_count += 1;
-                        continue;
-                    }
-                    b'\n' => {
-                        line_len += 1;
-                        if self.squeeze_lines {
-                            n_count += 1;
-                            loop {
-                                let Some(Ok(byte)) = bytes.next() else {
-                                    self.is_ended = true;
-                                    break;
-                                };
-                                match byte {
-                                    b'\n' => {
-                                        line_len += 1;
-                                        n_count += 1;
-                                        buffer_str.push(byte as char);
-                                    }
-                                    b'\r' => {
-                                        line_len += 1;
-                                        r_count += 1;
-                                        buffer_str.push(byte as char);
-                                    }
-                                    _ => break,
-                                }
-                            }
-                            let diff = 1 + r_count.min(1);
-                            if n_count > 1 && line_len > diff {
-                                line_len -= diff;
-                                for _ in 0..diff {
-                                    buffer_str.pop();
-                                }
-                            }
-                        }
-                        break;
-                    }
-                    byte if byte.is_ascii_control() && byte != b'\x08' => {
-                        line_len += 1;
-                        break;
-                    }
-                    _ => {
-                        if !self.plain {
-                            if let Some(mut new_style_positions) = continious_styled_parse(
-                                &mut buffer_str,
-                                &mut need_add_chars,
-                                line_len,
-                            ) {
-                                style_positions.append(&mut new_style_positions);
-                            } else {
-                                buffer_str.push(byte as char);
-                                line_len += 1;
-                                continue;
-                            }
-                        }
-                        buffer_str.push(byte as char);
-                        line_len += 1;
-                    }
-                }
-                buf.push(byte);
-                if buf.len() >= CONVERT_STRING_BUF_SIZE {
-                    if let Err(err) = std::str::from_utf8(&buf) {
-                        buf = buf[err.valid_up_to()..].to_vec();
-                    } else {
-                        buf.clear();
-                    }
-                }
-                if line_len as u64 >= max_line_len + need_add_chars {
-                    if line_len > buffer_str.len() {
-                        line_len -= buffer_str.len() + 1;
-                    }
-                    if let Err(err) = std::str::from_utf8(&buf) {
-                        line_len -= buf.len() - err.valid_up_to();
-                    }
-                    break;
-                }
-            }
-        }
-        if !self.plain {
-            let mut new_style_positions = last_styled_parse(
-                &mut buffer_str,
-                &mut line_len,
-                max_line_len as usize,
-                self.is_ended,
-            );
-            if buffer_str.len() < 3 && !self.is_ended {
-                style_positions.pop();
-            }
-            style_positions.append(&mut new_style_positions);
-            self.style_positions = style_positions;
-        }
-        line_len
-    }
-}
-
-/// Parse last chars before current position in [`SeekPositions::buffer`]
-/// for finding styled control sequences during
-/// [`SeekPositions::find_next_line_len_with_skip`] loop
-///
-/// # Arguments
-///
-/// * `buffer_str` - last chars in [SeekPositions::buffer] stream that can
-///   contain styling sequences.
-/// * `need_add_chars` - text styling control char count. This count will be
-///   used for checking if line length is bigger than max line length.
-/// * `line_len` - next line length at that moment in
-///   [`SeekPositions::find_next_line_len_with_skip`] loop.
-fn continious_styled_parse(
-    buffer_str: &mut String,
-    need_add_chars: &mut u64,
-    line_len: usize,
-) -> Option<Vec<(Range<usize>, StyleType)>> {
-    let check_styled = |(i, ch, first): (usize, &char, char)| {
-        (i % 2 == 0 && *ch == first) || (i % 2 == 1 && *ch == '\x08')
-    };
-    let mut style_positions = vec![];
-    let buffer = buffer_str.chars().collect::<Vec<char>>();
-    if buffer.len() == 3 && (buffer.starts_with(&['_', '\x08']) || buffer.ends_with(&['\x08', '_']))
-    {
-        style_positions.push(((line_len - buffer.len())..line_len, StyleType::Underscore));
-        *need_add_chars += 2;
-        buffer_str.clear();
-    } else if buffer.len() < 3 {
-        let is_styled = buffer
-            .iter()
-            .enumerate()
-            .map(|(i, ch)| (i, ch, buffer[0]))
-            .all(check_styled);
-        if is_styled {
-            return None;
-        } else {
-            buffer_str.remove(0);
-        }
-    } else if buffer.len() >= 3 {
-        let is_styled = buffer
-            .iter()
-            .enumerate()
-            .map(|(i, ch)| (i, ch, buffer[0]))
-            .all(check_styled);
-        if !is_styled {
-            style_positions.push((
-                (line_len - buffer.len())..(line_len - 1),
-                StyleType::Negative,
-            ));
-            *need_add_chars += ((buffer.len() as f32) / 2.0).floor() as u64;
-        } else {
-            return None;
-        }
-        let last = buffer_str.chars().last();
-        buffer_str.clear();
-        if let Some(last) = last {
-            buffer_str.push(last);
-        }
-    }
-    Some(style_positions)
-}
-
-/// Parse last chars before current position in [`SeekPositions::buffer`]
-/// for finding styled control sequences after
-/// [`SeekPositions::find_next_line_len_with_skip`] loop
-///
-/// # Arguments
-///
-/// * `buffer_str` - last chars in [SeekPositions::buffer] stream that can
-///   contain styling sequences.
-/// * `line_len` - next line length at that moment in
-///   [`SeekPositions::find_next_line_len_with_skip`] loop.
-///
-/// * `max_line_len` - line that length bigger than this value will be splited
-/// * `is_ended` - indicate that [SeekPositions::buffer] stream reached `EOF`
-fn last_styled_parse(
-    buffer_str: &mut str,
-    line_len: &mut usize,
-    max_line_len: usize,
-    is_ended: bool,
-) -> Vec<(Range<usize>, StyleType)> {
-    let check_styled = |(i, ch, first): (usize, &char, char)| {
-        (i % 2 == 0 && *ch == first) || (i % 2 == 1 && *ch == '\x08')
-    };
-    let mut style_positions = vec![];
-    let l = buffer_str
-        .chars()
-        .filter(|ch| *ch == '\n' || *ch == '\r' || *ch == ' ')
-        .count();
-    let buffer = buffer_str
-        .chars()
-        .filter(|ch| *ch != '\n' && *ch != '\r' && *ch != ' ')
-        .collect::<Vec<char>>();
-    if !buffer.is_empty() && buffer.len() < 3 && max_line_len > l + 2 && *line_len >= max_line_len {
-        *line_len -= l + 2;
-    } else if buffer.len() == 3
-        && (buffer.starts_with(&['_', '\x08']) || buffer.ends_with(&['\x08', '_']))
-    {
-        style_positions.push((
-            (*line_len - buffer.len() - l - (!is_ended as usize))
-                ..(*line_len - (!is_ended as usize)),
-            StyleType::Underscore,
-        ));
-    } else if buffer.len() >= 3
-        && buffer
-            .iter()
-            .enumerate()
-            .map(|(i, ch)| (i, ch, buffer[0]))
-            .all(check_styled)
-    {
-        style_positions.push((
-            (*line_len - buffer.len() - l - (!is_ended as usize))
-                ..(*line_len - (!is_ended as usize)),
-            StyleType::Negative,
-        ));
-    }
-    style_positions
 }
 
 impl Iterator for SeekPositions {
@@ -859,25 +1213,44 @@ impl Iterator for SeekPositions {
 
     /// Iter over [`SeekRead`] buffer lines in forward direction
     fn next(&mut self) -> Option<Self::Item> {
-        let current_position = *self.positions.last().unwrap_or(&0);
-        if self.buffer.seek(SeekFrom::Start(current_position)).is_err() {
+        let current_position = self.current();
+        let line = self.render_at(current_position)?;
+        if line.bytes == 0 {
+            self.is_ended = true;
             return None;
         }
-        let line_len = self.find_next_line_len_with_skip();
-        let Ok(stream_position) = self.buffer.stream_position() else {
-            return None;
-        };
-        let next_position = current_position + line_len as u64;
-        if self.is_ended || next_position >= stream_position {
+
+        let mut next_position = current_position + line.bytes as u64;
+
+        // `-s`: a run of empty lines is displayed as one, so the run's bytes
+        // are consumed together.  This lives here rather than in the renderer
+        // because it spans lines.
+        if self.squeeze_lines && line.ended_at_newline && line.cells.is_empty() {
+            while let Some(extra) = self.render_at(next_position) {
+                if extra.bytes == 0 || !extra.ended_at_newline || !extra.cells.is_empty() {
+                    break;
+                }
+                next_position += extra.bytes as u64;
+            }
+        }
+
+        if self
+            .total_bytes()
+            .is_some_and(|total| next_position >= total)
+        {
+            self.is_ended = true;
             let _ = self.buffer.seek(SeekFrom::Start(current_position));
-            None
-        } else {
-            if self.buffer.seek(SeekFrom::Start(next_position)).is_err() {
-                return None;
-            };
-            self.positions.push(next_position);
-            Some(next_position)
+            return None;
         }
+
+        if self.buffer.seek(SeekFrom::Start(next_position)).is_err() {
+            return None;
+        }
+        let source_line =
+            self.source_lines.last().copied().unwrap_or(1) + usize::from(line.ended_at_newline);
+        self.positions.push(next_position);
+        self.source_lines.push(source_line);
+        Some(next_position)
     }
 }
 
@@ -885,6 +1258,7 @@ impl DoubleEndedIterator for SeekPositions {
     /// Iter over [`SeekRead`] buffer lines in backward direction
     fn next_back(&mut self) -> Option<Self::Item> {
         let _ = self.positions.pop();
+        let _ = self.source_lines.pop();
         let _ = self
             .buffer
             .seek(SeekFrom::Start(*self.positions.last().unwrap_or(&0)));
@@ -899,30 +1273,10 @@ enum Source {
     File(PathBuf),
     /// [`Cursor`] on [`String`] that can be used for seek and read with [`SeekPositions`]
     Buffer(Cursor<String>),
-}
-
-impl Source {
-    /// Returns [`String`] that identify [`Source`]
-    fn name(&mut self) -> String {
-        match self {
-            Source::File(path) => path.to_str().unwrap_or("<file>").to_owned(),
-            Source::Buffer(cursor) => {
-                let current_pos = cursor.stream_position().unwrap_or(0);
-                let _ = cursor.seek(SeekFrom::Start(0));
-                let mut line = String::new();
-                if BufRead::read_line(cursor, &mut line).is_err() {
-                    line = "<buffer>".to_owned();
-                }
-                if line.len() > 15 {
-                    if let Some(sub) = line.get(..15) {
-                        line = sub.to_owned() + "...";
-                    }
-                }
-                let _ = cursor.seek(SeekFrom::Start(current_pos));
-                line
-            }
-        }
-    }
+    /// A non-seekable input (standard input) made seekable by spilling what
+    /// has been read to a temporary file.  Shared, so that every cursor over
+    /// the same input reads the same bytes exactly once.
+    Stream(SharedSpill),
 }
 
 /// Context of more current source, last search, flags etc
@@ -1066,53 +1420,31 @@ impl SourceContext {
                 let l = previous_source_screen.0.len();
                 previous_lines = previous_source_screen.0[(l - remain)..].to_vec();
             } else {
-                if current_line + remain < self.seek_positions.len_lines() {
-                    current_line += remain;
-                    self.seek_positions.set_current(current_line);
-                } else {
-                    current_line = self.seek_positions.len_lines();
-                    self.seek_positions.set_current(current_line);
-                }
+                // set_current clamps at the end of the source, so there is
+                // no need to know the total line count to avoid overrunning.
+                self.seek_positions.set_current(current_line + remain);
+                current_line = self.seek_positions.current_line();
                 content_lines_len = current_line;
             }
         }
 
+        // Collect the visible lines as cells.  Style travels inside the cells,
+        // so there is no second pass to map byte ranges onto column indices.
         let mut i = 0;
-        while i < content_lines_len - 1 {
-            let line = self.seek_positions.read_line()?;
-            content_lines.push(line);
+        // Guard the subtraction: a source with nothing to show yields zero
+        // content lines, and `0 - 1` would wrap to usize::MAX.
+        while i + 1 < content_lines_len {
+            content_lines.push(self.seek_positions.render_current_line());
             if self.seek_positions.next_back().is_none() {
                 break;
             }
             i += 1;
         }
-        let line = self.seek_positions.read_line()?;
-        content_lines.push(line);
-
+        content_lines.push(self.seek_positions.render_current_line());
         content_lines.reverse();
 
-        let mut style_lines = vec![];
-        let mut add_style_line = |seek_positions: &mut SeekPositions| {
-            let mut deleted_count = 0;
-            style_lines.push(
-                seek_positions
-                    .style_positions
-                    .clone()
-                    .into_iter()
-                    .map(|(rng, st)| {
-                        deleted_count += rng.end - rng.start - 1;
-                        (rng.end - deleted_count - 1, st)
-                    })
-                    .collect::<Vec<_>>(),
-            );
-        };
-        while self.seek_positions.next().is_some()
-            && self.seek_positions.current_line() <= current_line
-        {
-            add_style_line(&mut self.seek_positions);
-        }
-        add_style_line(&mut self.seek_positions);
         self.seek_positions.set_current(current_line);
+
         let previous_lines_len = previous_lines.len();
         for (i, line) in previous_lines.into_iter().enumerate() {
             screen.set_raw((i, 0), line)?
@@ -1123,22 +1455,8 @@ impl SourceContext {
         }
 
         for (i, line) in content_lines.into_iter().enumerate() {
-            screen.set_str(
-                (i + previous_lines_len + header_lines_len, 0),
-                line,
-                StyleType::None,
-            )?;
-            let Some(style_positions) = style_lines.get(i) else {
-                continue;
-            };
-            let Some(line) = screen.0.get_mut(i + previous_lines_len + header_lines_len) else {
-                continue;
-            };
-            for (pos, st) in style_positions {
-                if line.len() > *pos {
-                    line[*pos].1 = *st;
-                }
-            }
+            let cells = line.map(|l| l.cells).unwrap_or_default();
+            screen.set_raw((i + previous_lines_len + header_lines_len, 0), cells)?;
         }
 
         self.is_ended_file = self.seek_positions.is_ended;
@@ -1177,12 +1495,7 @@ impl SourceContext {
         } else {
             terminal_size.0 - 1 - header_lines_count
         };
-        if self.seek_positions.len_lines() < next_line {
-            self.seek_positions
-                .set_current(self.seek_positions.len_lines() + 1)
-        } else {
-            self.seek_positions.set_current(next_line)
-        };
+        self.seek_positions.set_current(next_line);
         if let Some(count) = count {
             self.scroll(count, Direction::Forward);
         }
@@ -1195,9 +1508,16 @@ impl SourceContext {
             self.goto_beginning(count);
             return;
         }
-        self.seek_positions
-            .set_current(self.seek_positions.len_lines() + 1);
+        self.seek_positions.goto_end();
         self.is_ended_file = self.seek_positions.is_ended;
+    }
+
+    /// Number of content lines a screenful holds, used to decide whether a
+    /// movement counts as "large" for the `''` command.
+    pub fn screen_lines(&self) -> usize {
+        self.terminal_size
+            .map(|(lines, _)| lines.saturating_sub(1).max(1))
+            .unwrap_or(1)
     }
 
     /// Seek to previous line
@@ -1279,11 +1599,7 @@ impl SourceContext {
         is_reversed: bool,
     ) -> Result<(), MoreError> {
         if let Some((pattern, is_not, direction)) = &self.last_search {
-            let direction = if is_reversed {
-                !direction.clone()
-            } else {
-                direction.clone()
-            };
+            let direction = if is_reversed { !*direction } else { *direction };
             self.search(count, pattern.clone(), *is_not, direction)
         } else {
             Err(MoreError::SourceContext(
@@ -1735,8 +2051,6 @@ struct Terminal {
     size: (u16, u16),
     /// Set terminal height as lines
     lines: Option<u16>,
-    /// Suppress underlining and bold
-    plain: bool,
     /// Input stream
     input_stream: Receiver<Result<String, MoreError>>,
     /// Held only when no input thread is spawned (`--test` or filter mode),
@@ -1769,7 +2083,6 @@ impl Terminal {
     fn new(
         is_test: bool,
         lines: Option<u16>,
-        plain: bool,
         command_reader: CommandReader,
         prompt_out: Box<dyn Write + Send>,
     ) -> Result<Self, MoreError> {
@@ -1798,12 +2111,10 @@ impl Terminal {
             tty: stdout(),
             prompt_out,
             size: (
-                u16::from_str(&std::env::var("LINES").unwrap_or_default())
-                    .unwrap_or(LINES_PER_PAGE),
-                u16::from_str(&std::env::var("COLUMNS").unwrap_or_default()).unwrap_or(NUM_COLUMNS),
+                env_screen_size("LINES").unwrap_or(LINES_PER_PAGE),
+                env_screen_size("COLUMNS").unwrap_or(NUM_COLUMNS),
             ),
             lines,
-            plain,
             input_stream: receiver,
             _input_keepalive: keepalive,
         };
@@ -1833,13 +2144,18 @@ impl Terminal {
             return Err(MoreError::SetOutside);
         }
         let mut style = StyleType::None;
-        let plain = self.plain;
         for (i, line) in screen.0.iter().enumerate() {
             write_ch_on(&mut self.tty, ' ', 0, i as u16);
             clear_current_line_on(&mut self.tty);
             for (j, (ch, st)) in line.iter().enumerate() {
+                // The second column of a double-width character holds a
+                // continuation marker; the character itself was drawn in the
+                // column before it.
+                if *ch == CELL_CONT {
+                    continue;
+                }
                 if style != *st {
-                    let _ = set_style_on(&mut self.tty, if !plain { *st } else { StyleType::None });
+                    let _ = set_style_on(&mut self.tty, *st);
                     style = *st;
                 }
                 write_ch_on(&mut self.tty, *ch, j as u16, i as u16);
@@ -1865,10 +2181,13 @@ impl Terminal {
 
     // Display prompt in bottom row
     pub fn display_prompt(&mut self, prompt: Prompt) -> Result<(), MoreError> {
-        let line = prompt.format();
-        if line.len() > self.size.1 as usize {
-            let _ = set_style_on(&mut self.prompt_out, StyleType::None);
-            return Err(MoreError::InputTooLong);
+        let mut line = prompt.format();
+        // The prompt is measured in cells, and a prompt too wide for the
+        // terminal is truncated rather than refused: a narrow window must
+        // still get a prompt, and `line` here is already a cell vector.
+        let width = self.size.1 as usize;
+        if line.len() > width {
+            line.truncate(width);
         }
 
         let mut style = StyleType::None;
@@ -1886,15 +2205,11 @@ impl Terminal {
         } else {
             self.size.0 - 1
         };
-        let plain = self.plain;
         write_ch_on(&mut self.prompt_out, ' ', 1, line_position);
         clear_current_line_on(&mut self.prompt_out);
         for (i, (ch, st)) in line.iter().enumerate() {
             if style != *st {
-                let _ = set_style_on(
-                    &mut self.prompt_out,
-                    if !plain { *st } else { StyleType::None },
-                );
+                let _ = set_style_on(&mut self.prompt_out, *st);
                 style = *st;
             }
             write_ch_on(&mut self.prompt_out, *ch, i as u16, line_position);
@@ -1907,16 +2222,26 @@ impl Terminal {
     /// Update terminal size for wrapper
     fn resize(&mut self) -> Result<(), MoreError> {
         let (x, y) = terminal_size().map_err(|_| MoreError::SizeRead)?;
-        if self.size != (y, x) {
-            if y < 2 {
-                return Err(MoreError::TerminalOutput);
-            }
-            let mut lines = self.lines.unwrap_or(y);
-            if lines > y || lines < 1 {
-                lines = y;
-            }
-            self.size = (lines, x);
+
+        // POSIX 107336 and 107357: COLUMNS and LINES "override the
+        // system-selected" sizes.  They are consulted here, on every resize,
+        // rather than only at startup, so a window change cannot silently
+        // discard them.
+        let columns = env_screen_size("COLUMNS").unwrap_or(x);
+        let rows = env_screen_size("LINES").unwrap_or(y);
+
+        if rows < 2 {
+            return Err(MoreError::TerminalOutput);
         }
+
+        // 107359: "The -n option shall take precedence over the LINES
+        // variable", bounded by the screen actually available.
+        let mut lines = self.lines.unwrap_or(rows);
+        if lines > rows || lines < 1 {
+            lines = rows;
+        }
+
+        self.size = (lines, columns);
         Ok(())
     }
 
@@ -2158,12 +2483,17 @@ struct MoreControl {
     is_new_file: bool,
     /// Last search has succeess match
     is_matched: bool,
-    /// Buffered stdin content (slurped once at startup).  Populated when
-    /// stdin is the implicit content source (no file operands) or when `-`
-    /// appears in the operand list.  Re-used by `print_all_input` (multi-
-    /// file filter mode containing a `-` operand) and by `:e -` (re-examine
-    /// stdin).  `None` when no operand references stdin.
-    stdin_buffer: Option<String>,
+    /// Set when a per-file error occurred that must affect the final exit
+    /// status without aborting the session (POSIX CONSEQUENCES OF ERRORS,
+    /// 107643-107646: the `:n` and `:p` commands).
+    had_error: bool,
+    /// Spill-backed view of standard input.  Present when stdin is the
+    /// implicit content source (no file operands) or when `-` appears in the
+    /// operand list.  Shared by `print_all_input` (multi-file filter mode
+    /// containing a `-` operand) and by `:e -` (re-examine stdin), so the
+    /// stream is read exactly once no matter how many cursors want it.
+    /// `None` when no operand references stdin.
+    stdin_spill: Option<SharedSpill>,
     /// Command-input/prompt channel (stderr or /dev/tty) used when stdout is
     /// a terminal.  `None` in filter mode and under `--test`.  Declared last
     /// so its `Drop` (which restores cooked-mode termios) runs **after**
@@ -2178,24 +2508,22 @@ impl MoreControl {
         let mut current_position = None;
         let mut file_pathes = vec![];
 
-        // STEP 1: Slurp stdin FIRST — before anything puts the terminal in
-        // raw mode.  Stdin is content when no file operands are given
-        // (implicit stdin) or when `-` appears in the operand list.  We read
-        // here, while termios is still in cooked mode, so that an
+        // STEP 1: Attach to stdin FIRST — before anything puts the terminal
+        // in raw mode.  Stdin is content when no file operands are given
+        // (implicit stdin) or when `-` appears in the operand list.  We
+        // attach here, while termios is still in cooked mode, so that an
         // interactive user (no piped input, no operands) can still press
         // Ctrl-D to signal EOF — raw mode disables that line-discipline
         // shortcut, and reading stdin under raw mode would hang the terminal
-        // with no recovery path.  POSIX requires the full stream be
-        // available for pagination; earlier code read only the first line on
-        // the implicit-stdin path, truncating `cat foo | more` to a single
-        // line.
+        // with no recovery path.
+        //
+        // Nothing is read yet: the stream is wrapped in a spill file and
+        // pulled from only as the display demands it.  Reading it through
+        // here would bound the input size by available memory, which for a
+        // pager fed by a pipe is the wrong bound entirely.
         let needs_stdin = args.input_files.is_empty() || args.input_files.iter().any(|f| f == "-");
-        let stdin_buffer: Option<String> = if needs_stdin {
-            let mut buf = String::new();
-            std::io::stdin()
-                .read_to_string(&mut buf)
-                .map_err(|_| MoreError::InputRead)?;
-            Some(buf)
+        let stdin_spill: Option<SharedSpill> = if needs_stdin {
+            Some(SharedSpill::new(Box::new(std::io::stdin())).map_err(|_| MoreError::InputRead)?)
         } else {
             None
         };
@@ -2225,21 +2553,14 @@ impl MoreControl {
         } else {
             (None, CommandReader::None, Box::new(std::io::sink()))
         };
-        let terminal = Terminal::new(
-            args.test,
-            args.lines,
-            args.plain,
-            command_reader,
-            prompt_out,
-        )
-        .ok();
+        let terminal = Terminal::new(args.test, args.lines, command_reader, prompt_out).ok();
 
         let source = if args.input_files.is_empty()
             || (args.input_files.len() == 1 && args.input_files[0] == *"-")
         {
             // Implicit stdin or single explicit '-' operand. Empty stdin is
             // valid (yields an empty Buffer); it is not an error.
-            Source::Buffer(Cursor::new(stdin_buffer.clone().unwrap_or_default()))
+            stdin_source(stdin_spill.as_ref())
         } else {
             for file_string in &args.input_files {
                 if file_string == "-" {
@@ -2253,7 +2574,7 @@ impl MoreControl {
             current_position = Some(0);
             let first_file = &file_pathes[0];
             if first_file == &PathBuf::from("-") {
-                Source::Buffer(Cursor::new(stdin_buffer.clone().unwrap_or_default()))
+                stdin_source(stdin_spill.as_ref())
             } else {
                 Source::File(first_file.clone())
             }
@@ -2277,11 +2598,12 @@ impl MoreControl {
             count_default: None,
             commands_buffer: String::new(),
             prompt: None,
+            had_error: false,
             last_source_before_usage: None,
             file_pathes,
             is_new_file: false,
             is_matched: false,
-            stdin_buffer,
+            stdin_spill,
             command_io,
         })
     }
@@ -2290,27 +2612,21 @@ impl MoreControl {
     fn print_all_input(&mut self) {
         let input_files = self.file_pathes.clone();
         if input_files.is_empty() || (input_files.len() == 1 && self.args.input_files[0] == *"-") {
-            // Match the multi-file branch's loop order: read the current line
-            // first, then advance.  Calling `next()` before the first
-            // `read_line()` would skip line 0 of the buffer (a pre-existing bug
-            // formerly masked by stdin being truncated to a single line).
-            while let Ok(line) = self
-                .context
-                .seek_positions
-                .read_line()
-                .inspect_err(|e| self.handle_error(e.clone()))
-            {
-                print!("{line}");
-                if self.context.seek_positions.next().is_none() {
-                    break;
+            let source = self.context.current_source.clone();
+            match source_reader(&source) {
+                Ok(mut reader) => {
+                    let mut out = stdout().lock();
+                    if filter_copy(&mut reader, self.args.squeeze, &mut out).is_err() {
+                        self.handle_error(MoreError::InputRead);
+                    }
                 }
+                Err(e) => self.handle_error(e),
             }
         } else {
             for file_path in &input_files {
                 // Handle '-' as stdin
                 let source = if file_path.as_os_str() == "-" {
-                    let buf = self.stdin_buffer.clone().unwrap_or_default();
-                    Source::Buffer(Cursor::new(buf))
+                    stdin_source(self.stdin_spill.as_ref())
                 } else {
                     Source::File(file_path.clone())
                 };
@@ -2345,16 +2661,15 @@ impl MoreControl {
                     }
                 }
 
-                while let Ok(line) = self
-                    .context
-                    .seek_positions
-                    .read_line()
-                    .inspect_err(|e| self.handle_error(e.clone()))
-                {
-                    print!("{line}");
-                    if self.context.seek_positions.next().is_none() {
-                        break;
+                let current = self.context.current_source.clone();
+                match source_reader(&current) {
+                    Ok(mut reader) => {
+                        let mut out = stdout().lock();
+                        if filter_copy(&mut reader, self.args.squeeze, &mut out).is_err() {
+                            self.handle_error(MoreError::InputRead);
+                        }
                     }
+                    Err(e) => self.handle_error(e),
                 }
             }
         }
@@ -2374,7 +2689,7 @@ impl MoreControl {
                 .file_name()
                 .and_then(|s| s.to_str())
                 .map(|s| s.to_owned()),
-            Source::Buffer(_) => None,
+            Source::Buffer(_) | Source::Stream(_) => None,
         }
     }
 
@@ -2392,11 +2707,7 @@ impl MoreControl {
                 Some(Prompt::More { .. }) | None => Prompt::More {
                     filename: filename.clone(),
                     percent: if self.file_pathes.len() == 1 {
-                        Some(
-                            ((self.context.seek_positions.current_line() as f32
-                                / self.context.seek_positions.lines_count as f32)
-                                * 100.0) as u8,
-                        )
+                        self.context.seek_positions.percent()
                     } else {
                         None
                     },
@@ -2407,6 +2718,11 @@ impl MoreControl {
             } else {
                 terminal.display(screen)?;
             };
+            // Content goes to stdout and the prompt to stderr, which are
+            // separately buffered handles onto the same terminal.  Flush the
+            // content before writing the prompt, or the two interleave and
+            // escape sequences from one land inside the other.
+            let _ = terminal.tty.flush();
             terminal.display_prompt(prompt)?;
             if self.is_matched {
                 write_str_on(&mut terminal.prompt_out, "", 0, 0);
@@ -2491,19 +2807,24 @@ impl MoreControl {
             DEFAULT_EDITOR.to_string()
         };
         let editor = editor.as_str();
-        let is_editor_vi_or_ex = editor == "vi" || editor == "ex";
+        // POSIX 107617-107618: "If the last pathname component in EDITOR is
+        // either vi or ex" -- so compare the basename, not the whole string,
+        // which would miss /usr/bin/vi.
+        let is_editor_vi_or_ex = Path::new(editor)
+            .file_name()
+            .map(|name| name == "vi" || name == "ex")
+            .unwrap_or(false);
         let Some(file_path) = file_path.as_os_str().to_str() else {
             return Err(MoreError::FileRead(
                 file_path.to_str().unwrap_or("<file>").to_owned(),
             ));
         };
 
+        // POSIX 107618-107620: vi and ex take "-c linenumber", where
+        // linenumber is the line displayed as the first line of the screen.
+        let line_number = self.context.seek_positions.current_line().to_string();
         let args: &[&str] = if is_editor_vi_or_ex {
-            &[
-                &format!("+{}", self.context.seek_positions.current_line()),
-                "--",
-                file_path,
-            ]
+            &["-c", line_number.as_str(), "--", file_path]
         } else {
             &[file_path]
         };
@@ -2529,55 +2850,44 @@ impl MoreControl {
             return Err(MoreError::FileRead(String::new()));
         };
         let parse_error = Err(MoreError::StringParse(tagstring.clone() + " ctags output"));
-        let pattern = if tagstring.contains(['^']) {
-            tagstring.clone()
-        } else {
-            format!("^{}", tagstring)
-        };
-        let output = std::process::Command::new("find")
-            .args([".", "-name", "tags", "-type", "f"])
-            .output();
-        let Ok(output) = output else {
-            return Err(MoreError::CTagsFailed);
-        };
-        let Ok(output) = std::str::from_utf8(&output.stdout) else {
-            return parse_error;
-        };
-        let mut outputs = String::new();
+
+        // POSIX 107607-107608: ":t tagstring" names *the tag*, so the lookup
+        // is a literal comparison against a tags file's first field -- not a
+        // regular-expression search, which would both mismatch tags
+        // containing regex metacharacters and match unrelated ones.
+        let mut matched: Option<String> = None;
         let mut tags_path: Option<String> = None;
-        for file in output.split('\n') {
-            let output = std::process::Command::new("grep")
-                .args([pattern.as_str(), file])
-                .output();
-            let Ok(output) = output else {
+        for file in find_tags_files(Path::new(".")) {
+            let Ok(contents) = std::fs::read_to_string(&file) else {
                 continue;
             };
-            let Ok(output) = std::str::from_utf8(&output.stdout) else {
+            let Some(line) = contents
+                .lines()
+                .find(|line| line.split('\t').next() == Some(tagstring.as_str()))
+            else {
                 continue;
             };
-            if !output.is_empty() {
-                outputs.push_str(output);
-                if let Some(folder) = to_path(file.to_owned())?.parent() {
-                    if !folder.exists() {
-                        return Err(MoreError::FileRead(file.to_owned()));
-                    }
-                    tags_path = folder.to_str().map(|s| s.to_owned());
+            if let Some(folder) = file.parent() {
+                if !folder.exists() {
+                    return Err(MoreError::FileRead(file.to_string_lossy().into_owned()));
                 }
-                break;
+                tags_path = folder.to_str().map(|s| s.to_owned());
             }
+            matched = Some(line.to_owned());
+            break;
         }
-        if outputs.is_empty() {
+        let Some(line) = matched else {
             return Err(MoreError::PatternNotFound(tagstring));
-        }
-        let lines = outputs.split("\n").collect::<Vec<&str>>();
-        let Some(line) = lines.first() else {
-            return Err(MoreError::FileRead(tagstring));
         };
         let fields = line.split("\t").collect::<Vec<&str>>();
         if fields.len() < 2 {
             return parse_error;
         };
-        let path = to_path(tags_path.unwrap_or_default() + "/" + fields[1])?;
+        // Tags files normally name files relative to their own directory, but
+        // an absolute entry must not be glued onto that prefix; Path::join
+        // handles both.
+        let path = Path::new(&tags_path.unwrap_or_else(|| ".".to_owned())).join(fields[1]);
+        let path = to_path(path.to_string_lossy().into_owned())?;
         let line;
         if let Some(line_str) = fields.iter().find(|w| w.starts_with("line:")) {
             let Some(line_str) = line_str.split(":").last() else {
@@ -2618,17 +2928,16 @@ impl MoreControl {
 
     /// Set [`MoreControl::prompt`] to [`Prompt::DisplayPosition`]
     fn set_position_prompt(&mut self) -> Result<(), MoreError> {
-        let Some(terminal_size) = self.context.terminal_size else {
+        if self.context.terminal_size.is_none() {
             return Err(MoreError::MissingTerminal);
-        };
-        let mut filename = "<error>";
+        }
+        // POSIX 107628: the message includes "the name of the file currently
+        // being examined" -- the pathname as given, not just its last
+        // component, which would be ambiguous across directories.
+        let mut filename = String::from("<error>");
         let mut file_size = 0;
         if let Source::File(path) = &self.context.current_source {
-            if let Some(file_string) = path.file_name() {
-                if let Some(file_string) = file_string.to_str() {
-                    filename = file_string;
-                }
-            }
+            filename = path.to_string_lossy().into_owned();
             if let Ok(metadata) = path.metadata() {
                 file_size = metadata.len();
             }
@@ -2638,10 +2947,15 @@ impl MoreControl {
             .map(|cp| (cp + 1).to_string())
             .unwrap_or("?".to_string());
         let input_files_count = self.file_pathes.len();
-        let current_line = self.context.seek_positions.current_line();
+        let current_line = self.context.seek_positions.current_source_line();
         let byte_number = self.context.seek_positions.current();
 
-        let line = if self.context.seek_positions.lines_count >= terminal_size.0 {
+        // POSIX 107631-107632: "If more is reading from standard input, or the
+        // file is shorter than a single screen, the line number, the byte
+        // number, the total bytes, and the percentage need not be written."
+        // Those figures are exactly the ones that need a known total size, so
+        // the short form is used precisely when the size is not knowable.
+        let line = if let Some(percent) = self.context.seek_positions.percent() {
             format!(
                 "{} {}/{} {} {}/{} {}%",
                 filename,
@@ -2650,8 +2964,7 @@ impl MoreControl {
                 current_line,
                 byte_number,
                 file_size,
-                ((current_line as f32 / self.context.seek_positions.lines_count as f32) * 100.0)
-                    as usize
+                percent
             )
         } else {
             format!("{} {}/{}", filename, current_position, input_files_count)
@@ -2732,8 +3045,7 @@ impl MoreControl {
             }
 
             if self.current_position == Some(self.file_pathes.len() - 1)
-                && self.context.seek_positions.current_line()
-                    == self.context.seek_positions.len_lines()
+                && self.context.seek_positions.is_ended
             {
                 if self.args.exit_on_eof {
                     self.exit(None);
@@ -2764,11 +3076,7 @@ impl MoreControl {
                     self.prompt = Some(Prompt::More {
                         filename: self.current_filename(),
                         percent: if self.file_pathes.len() == 1 {
-                            Some(
-                                (self.context.seek_positions.current_line() as f32
-                                    / self.context.seek_positions.lines_count as f32)
-                                    as u8,
-                            )
+                            self.context.seek_positions.percent()
                         } else {
                             None
                         },
@@ -2803,7 +3111,49 @@ impl MoreControl {
             eprintln!("{error_message}");
             println!("{error_message}");
         }
-        exit(error_message.is_some() as i32);
+        exit((error_message.is_some() || self.had_error) as i32);
+    }
+
+    /// Move `count` files in `direction` and examine what is found there.
+    ///
+    /// POSIX CONSEQUENCES OF ERRORS (107643-107646): "If an error is
+    /// encountered accessing a file when using the :n command, more shall
+    /// attempt to examine the next file in the argument list, but the final
+    /// exit status shall be affected", and correspondingly for `:p`.  So a
+    /// file that cannot be opened is reported, remembered for the exit
+    /// status, and skipped -- it does not end the session.
+    ///
+    /// Returns true when the move ran past the end of the file list.
+    fn examine_adjacent_file(
+        &mut self,
+        count: Option<usize>,
+        direction: Direction,
+    ) -> Result<bool, MoreError> {
+        let mut count = count;
+
+        loop {
+            match self.scroll_file_position(count, direction) {
+                Ok(past_end) => return Ok(past_end),
+                Err(MoreError::FileRead(name)) => {
+                    self.had_error = true;
+                    self.prompt = Some(Prompt::Error(MoreError::FileRead(name).to_string()));
+
+                    // scroll_file_position has already moved to the file that
+                    // failed; stop once there is nothing further to try.
+                    let position = self.current_position.unwrap_or(0);
+                    let exhausted = match direction {
+                        Direction::Forward => position + 1 >= self.file_pathes.len(),
+                        Direction::Backward => position == 0,
+                    };
+                    if exhausted {
+                        return Ok(false);
+                    }
+
+                    count = Some(1);
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Set current file by [`file_string`] path
@@ -2811,6 +3161,15 @@ impl MoreControl {
         if file_string.is_empty() {
             self.context.reset()?;
         }
+
+        // POSIX 107600-107602: the filename operand of `:e` is subject to
+        // shell word expansion.  "#" and "-" are more's own tokens and are
+        // recognized before expansion.
+        let file_string = if file_string.is_empty() || file_string == "#" || file_string == "-" {
+            file_string
+        } else {
+            word_expand(&file_string)?
+        };
 
         if file_string.as_str() == "#" {
             if let Source::File(last_source_path) = &self.context.last_source {
@@ -2837,8 +3196,8 @@ impl MoreControl {
             // Handle stdin as a source using the buffered content
             self.context.goto_eof(None);
             let _ = self.context.update_screen();
-            let buf = self.stdin_buffer.clone().unwrap_or_default();
-            self.context.set_source(Source::Buffer(Cursor::new(buf)))?;
+            self.context
+                .set_source(stdin_source(self.stdin_spill.as_ref()))?;
             self.last_position = self.current_position;
         } else {
             self.context.goto_eof(None);
@@ -2880,6 +3239,27 @@ impl MoreControl {
 
     /// Execute [`Command`]
     fn execute(&mut self, command: Command) -> Result<(), MoreError> {
+        // POSIX 107563-107565: `''` returns "to the position from which the
+        // last large movement command was executed (where a 'large movement'
+        // is defined as any movement of more than a screenful of lines)".
+        // Rather than enumerate which commands qualify, measure the move.
+        let line_before = self.context.seek_positions.current_line();
+        let track_movement = !matches!(command, Command::ReturnPreviousPosition);
+
+        let result = self.execute_command(command);
+
+        if track_movement && result.is_ok() {
+            let line_after = self.context.seek_positions.current_line();
+            let screenful = self.context.screen_lines();
+            if line_after.abs_diff(line_before) > screenful {
+                self.context.last_line = line_before;
+            }
+        }
+
+        result
+    }
+
+    fn execute_command(&mut self, command: Command) -> Result<(), MoreError> {
         match command {
             Command::Help => {
                 let string = commands_usage();
@@ -2936,8 +3316,15 @@ impl MoreControl {
                 self.if_eof_and_prompt_goto_next_file()?;
             }
             Command::SkipForwardOneLine(count) => {
+                // POSIX 107528: "Display the screenful beginning with the line
+                // count lines after the last line on the current screen" --
+                // so the top moves past the whole current screen, not just by
+                // count lines.  scroll() clamps at the end of the file, which
+                // gives 107529-107530's "the last screenful shall be written".
                 let count = count.unwrap_or(1);
-                self.context.scroll(count, Direction::Forward);
+                let screenful = self.context.screen_lines();
+                self.context
+                    .scroll(screenful.saturating_sub(1) + count, Direction::Forward);
                 self.if_eof_and_prompt_goto_next_file()?;
             }
             Command::ScrollBackwardOneHalfScreenful(count) => {
@@ -3018,7 +3405,7 @@ impl MoreControl {
             }
             Command::ExamineNewFile(filename) => self.examine_file(filename)?,
             Command::ExamineNextFile(count) => {
-                if self.scroll_file_position(count, Direction::Forward)? {
+                if self.examine_adjacent_file(count, Direction::Forward)? {
                     self.prompt = Some(Prompt::Exit);
                     self.display()?;
                     self.get_input_with_update()?;
@@ -3026,7 +3413,7 @@ impl MoreControl {
                 }
             }
             Command::ExaminePreviousFile(count) => {
-                if self.scroll_file_position(count, Direction::Backward)? {
+                if self.examine_adjacent_file(count, Direction::Backward)? {
                     self.prompt = Some(Prompt::Exit);
                     self.display()?;
                     self.get_input_with_update()?;
@@ -3058,7 +3445,7 @@ impl MoreControl {
         }
         match error {
             MoreError::SeekPositions(ref seek_positions_error) => match seek_positions_error {
-                SeekPositionsError::StringParse(_) | SeekPositionsError::OutOfRange(_) => {
+                SeekPositionsError::OutOfRange(_) => {
                     self.exit(Some(error_str.clone()));
                 }
                 SeekPositionsError::FileRead(_) => {
@@ -3070,17 +3457,20 @@ impl MoreControl {
                     self.prompt = Some(Prompt::Error(error_str.clone()));
                 }
             },
-            MoreError::InputTooLong | MoreError::PatternNotFound(_) => {
+            MoreError::PatternNotFound(_) => {
                 self.prompt = Some(Prompt::Error(error_str.clone()));
             }
             MoreError::StringParse(_) => {
                 self.commands_buffer.clear();
                 self.prompt = Some(Prompt::Error(error_str.clone()));
             }
+            // POSIX 107595-107597 (`:e`) and 107643-107646 (`:n`/`:p`): a
+            // file that cannot be accessed is reported, and more carries on.
+            MoreError::FileRead(_) => {
+                self.prompt = Some(Prompt::Error(error_str.clone()));
+            }
             MoreError::SetOutside
             | MoreError::EditorFailed
-            | MoreError::CTagsFailed
-            | MoreError::FileRead(_)
             | MoreError::SizeRead
             | MoreError::InputRead
             | MoreError::NoCommandSource
@@ -3112,7 +3502,16 @@ impl MoreControl {
             }
             let is_empty = remainder.is_empty();
             commands_str = remainder.clone();
-            self.execute(command)?;
+
+            // POSIX 107291-107293: "If any of the commands fail for any
+            // reason, an informational message to this effect shall be
+            // written, and no further commands specified using the -p option
+            // shall be executed for this file."  The remaining commands are
+            // kept, so the next file starts from the beginning of the list.
+            if let Err(e) = self.execute(command) {
+                self.handle_error(e);
+                break;
+            }
             if self.is_new_file {
                 if let Some(ref mut commands_str) = self.args.commands {
                     *commands_str = remainder;
@@ -3160,11 +3559,7 @@ impl MoreControl {
                         self.prompt = Some(Prompt::More {
                             filename: self.current_filename(),
                             percent: if self.file_pathes.len() == 1 {
-                                Some(
-                                    (self.context.seek_positions.current_line() as f32
-                                        / self.context.seek_positions.lines_count as f32)
-                                        as u8,
-                                )
+                                self.context.seek_positions.percent()
                             } else {
                                 None
                             },
@@ -3184,11 +3579,7 @@ impl MoreControl {
                     self.prompt = Some(Prompt::More {
                         filename: self.current_filename(),
                         percent: if self.file_pathes.len() == 1 {
-                            Some(
-                                (self.context.seek_positions.current_line() as f32
-                                    / self.context.seek_positions.lines_count as f32)
-                                    as u8,
-                            )
+                            self.context.seek_positions.percent()
                         } else {
                             None
                         },
@@ -3220,6 +3611,184 @@ fn to_path(file_string: String) -> Result<PathBuf, MoreError> {
     Ok(file_path)
 }
 
+/// `wordexp_t` of `<wordexp.h>`.  Not exposed by the `libc` crate, but the
+/// layout is fixed by POSIX and identical on the platforms this project
+/// targets (glibc and macOS both declare exactly these three members, in
+/// this order).
+#[repr(C)]
+struct WordExp {
+    we_wordc: libc::size_t,
+    we_wordv: *mut *mut libc::c_char,
+    we_offs: libc::size_t,
+}
+
+extern "C" {
+    fn wordexp(
+        words: *const libc::c_char,
+        pwordexp: *mut WordExp,
+        flags: libc::c_int,
+    ) -> libc::c_int;
+    fn wordfree(pwordexp: *mut WordExp);
+}
+
+/// Apply shell word expansions (XCU Section 2.6) to `word`, which POSIX
+/// 107592-107594 requires for the `:e` filename operand.
+///
+/// The spec leaves the effects unspecified when the expansion yields more
+/// than one pathname; treat that, like a failed expansion, as an error, so
+/// that 107595-107597's "the current file and screen shall not change"
+/// applies.
+fn word_expand(word: &str) -> Result<String, MoreError> {
+    let failed = || MoreError::FileRead(word.to_owned());
+    let c_word = CString::new(word).map_err(|_| failed())?;
+
+    // SAFETY: the structure is zeroed before use, as wordexp(3) requires
+    // when called without WRDE_APPEND/WRDE_DOOFFS; `c_word` outlives the
+    // call; and `wordfree` runs on every path where `wordexp` succeeded.
+    unsafe {
+        let mut we: WordExp = std::mem::zeroed();
+        if wordexp(c_word.as_ptr(), &mut we, 0) != 0 {
+            return Err(failed());
+        }
+
+        let expanded = if we.we_wordc == 1 && !we.we_wordv.is_null() {
+            CStr::from_ptr(*we.we_wordv)
+                .to_str()
+                .map(str::to_owned)
+                .map_err(|_| failed())
+        } else {
+            Err(failed())
+        };
+
+        wordfree(&mut we);
+        expanded
+    }
+}
+
+/// Read a screen dimension from the environment, per POSIX 107336/107357.
+///
+/// A variable that is unset, empty, unparsable, or zero is treated as absent
+/// so that the system-selected size is used instead.
+fn env_screen_size(name: &str) -> Option<u16> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| u16::from_str(value.trim()).ok())
+        .filter(|&size| size > 0)
+}
+
+/// Copy a source straight to standard output, honoring only `-s`.
+///
+/// POSIX 107650: "When the standard output is not a terminal, only the -s
+/// filter-modification option is effective."  So this is a byte-for-byte
+/// copy: no decoding (arbitrary binary passes through unharmed), no line
+/// index, and nothing proportional to the input held in memory.
+fn filter_copy(reader: &mut dyn Read, squeeze: bool, out: &mut dyn Write) -> std::io::Result<u64> {
+    if !squeeze {
+        return std::io::copy(reader, out);
+    }
+
+    // Collapsing runs of empty lines needs to know whether a line is empty
+    // before its <newline> is written, but an empty line is at most a lone
+    // <carriage-return>.  So at most two bytes are ever held back; anything
+    // longer proves the line is not empty and streams through immediately.
+    let mut chunk = [0u8; 8192];
+    let mut pending: Vec<u8> = Vec::with_capacity(2);
+    let mut line_started = false;
+    let mut previous_blank = false;
+    let mut written = 0u64;
+
+    loop {
+        let read = reader.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        for &byte in &chunk[..read] {
+            if byte == b'\n' {
+                let blank = !line_started && pending.iter().all(|&b| b == b'\r');
+                if blank && previous_blank {
+                    pending.clear();
+                    continue;
+                }
+                out.write_all(&pending)?;
+                out.write_all(b"\n")?;
+                written += pending.len() as u64 + 1;
+                previous_blank = blank;
+                pending.clear();
+                line_started = false;
+            } else if line_started {
+                out.write_all(&[byte])?;
+                written += 1;
+            } else {
+                pending.push(byte);
+                if pending.len() > 1 || byte != b'\r' {
+                    out.write_all(&pending)?;
+                    written += pending.len() as u64;
+                    pending.clear();
+                    line_started = true;
+                }
+            }
+        }
+    }
+
+    if !pending.is_empty() {
+        out.write_all(&pending)?;
+        written += pending.len() as u64;
+    }
+
+    Ok(written)
+}
+
+/// A readable handle on a [`Source`], for the filter path.
+fn source_reader(source: &Source) -> Result<Box<dyn Read>, MoreError> {
+    match source {
+        Source::File(path) => File::open(path)
+            .map(|f| Box::new(f) as Box<dyn Read>)
+            .map_err(|_| MoreError::FileRead(path.to_str().unwrap_or("<file>").to_owned())),
+        Source::Buffer(cursor) => Ok(Box::new(cursor.clone())),
+        Source::Stream(spill) => Ok(Box::new(spill.reader())),
+    }
+}
+
+/// The [`Source`] for a `-` operand or implicit standard input.
+///
+/// Falls back to an empty buffer when stdin was never attached, which keeps
+/// the "no operand references stdin" case from needing a separate path.
+fn stdin_source(spill: Option<&SharedSpill>) -> Source {
+    match spill {
+        Some(spill) => Source::Stream(spill.clone()),
+        None => Source::Buffer(Cursor::new(String::new())),
+    }
+}
+
+/// Collect every file named `tags` at or below `root`.
+///
+/// Replaces a `find . -name tags -type f` subprocess; `more` needs no
+/// external program to walk a directory.
+fn find_tags_files(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // Do not follow symbolic links: a link loop would not terminate.
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                pending.push(path);
+            } else if file_type.is_file() && entry.file_name() == "tags" {
+                found.push(path);
+            }
+        }
+    }
+
+    found
+}
+
 /// Get formated file name and extension from [`PathBuf`]
 fn name_and_ext(path: PathBuf) -> Result<String, MoreError> {
     let file_name = path.file_name().ok_or(MoreError::FileRead(
@@ -3239,12 +3808,15 @@ fn format_file_header(
     let name_and_ext = name_and_ext(file_path)?;
 
     let (mut name_and_ext, border) = if let Some(line_len) = line_len {
-        let header_width = if name_and_ext.len() < 14 {
+        // Measure the name in characters, not bytes, and guard the
+        // subtraction so a terminal narrower than the border does not wrap.
+        let name_width = name_and_ext.chars().count();
+        let header_width = if name_width < 14 {
             14
-        } else if name_and_ext.len() > line_len - 4 {
+        } else if name_width + 4 > line_len {
             line_len
         } else {
-            name_and_ext.len() + 4
+            name_width + 4
         };
 
         (
@@ -3571,7 +4143,7 @@ ctrl-G                         Write a message for which the information referen
 q or
 :q or
 ZZ                             Exit more\n
-For more see: https://pubs.opengroup.org/onlinepubs/9699919799.2018edition/utilities/more.html\n";
+For more see: https://pubs.opengroup.org/onlinepubs/9799919799/utilities/more.html\n";
 
 /// Returns formated [`COMMAND_USAGE`]
 pub fn commands_usage() -> String {
@@ -3631,5 +4203,203 @@ fn main() {
             println!("{}", error);
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{find_tags_files, word_expand};
+    use std::path::Path;
+
+    #[test]
+    fn word_expand_applies_shell_expansions() {
+        // POSIX 107592-107594: the `:e` filename is subject to shell word
+        // expansions.
+        std::env::set_var("POSIXUTILS_MORE_TEST_VAR", "/tmp/expanded");
+        assert_eq!(
+            word_expand("$POSIXUTILS_MORE_TEST_VAR").unwrap(),
+            "/tmp/expanded"
+        );
+        assert_eq!(word_expand("plain_name").unwrap(), "plain_name");
+        assert!(word_expand("~").unwrap().starts_with('/'));
+    }
+
+    #[test]
+    fn word_expand_rejects_multiple_pathnames() {
+        // "if more than a single pathname results, the effects are
+        // unspecified" -- treated as an error so the current file is kept.
+        std::env::set_var("POSIXUTILS_MORE_TEST_TWO", "one two");
+        assert!(word_expand("$POSIXUTILS_MORE_TEST_TWO").is_err());
+        assert!(word_expand("'unterminated").is_err());
+    }
+
+    use super::{render_display_line, RenderOpts, StyleType, CELL_CONT};
+
+    /// Render `src` and return the drawn text, the styles, and the bytes taken.
+    fn render(src: &[u8], cols: Option<usize>) -> (String, Vec<StyleType>, usize) {
+        let opts = RenderOpts { plain: false };
+        let line = render_display_line(src, cols, opts, true).expect("at eof");
+        let text = line
+            .cells
+            .iter()
+            .map(|(c, _)| *c)
+            .filter(|c| *c != CELL_CONT)
+            .collect();
+        let styles = line.cells.iter().map(|(_, st)| *st).collect();
+        (text, styles, line.bytes)
+    }
+
+    fn text_of(src: &[u8]) -> String {
+        render(src, None).0
+    }
+
+    #[test]
+    fn render_expands_non_printable_characters() {
+        // POSIX 107450-107452: the ed(1) list format -- named escapes, then
+        // one three-digit octal number per byte.
+        assert_eq!(text_of(b"ccc\x01ddd\n"), "ccc\\001ddd");
+        assert_eq!(text_of(b"a\x7fb\n"), "a\\177b");
+        assert_eq!(text_of(b"a\x07b\n"), "a\\ab");
+        assert_eq!(text_of(b"a\x0bb\n"), "a\\vb");
+        // Invalid bytes are escaped one at a time; valid UTF-8 is not, in any
+        // locale.
+        assert_eq!(text_of(b"a\xffb\n"), "a\\377b");
+        assert_eq!(text_of("café\n".as_bytes()), "café");
+        // A literal backslash is printable and is left alone.
+        assert_eq!(text_of(b"a\\b\n"), "a\\b");
+    }
+
+    #[test]
+    fn render_expands_tabs_to_stops() {
+        assert_eq!(text_of(b"a\tb\n"), "a       b");
+        assert_eq!(text_of(b"\tx\n"), "        x");
+        assert_eq!(text_of(b"abcdefg\th\n"), "abcdefg h");
+        assert_eq!(text_of(b"abcdefgh\ti\n"), "abcdefgh        i");
+    }
+
+    #[test]
+    fn render_ignores_carriage_return_at_end_of_line() {
+        // 107448-107449: a <carriage-return> ending a line is ignored rather
+        // than written as a non-printable character.
+        assert_eq!(text_of(b"zzz\r\n"), "zzz");
+        assert_eq!(text_of(b"zzz\r"), "zzz");
+        // Anywhere else it is an ordinary non-printable.
+        assert_eq!(text_of(b"a\rb\n"), "a\\rb");
+    }
+
+    #[test]
+    fn render_resolves_overstrike() {
+        // 107432-107445. Underline, both orders.
+        let (text, styles, _) = render(b"A\x08_\n", None);
+        assert_eq!(text, "A");
+        assert_eq!(styles, vec![StyleType::Underscore]);
+
+        let (text, styles, _) = render(b"_\x08A\n", None);
+        assert_eq!(text, "A");
+        assert_eq!(styles, vec![StyleType::Underscore]);
+
+        // "_\b_" underlines rather than emboldening.
+        let (_, styles, _) = render(b"_\x08_\n", None);
+        assert_eq!(styles, vec![StyleType::Underscore]);
+
+        // Embolden, and "a\ba\ba\ba" is one emboldened 'a' (107443-107445).
+        let (text, styles, _) = render(b"a\x08a\n", None);
+        assert_eq!(text, "a");
+        assert_eq!(styles, vec![StyleType::Negative]);
+
+        let (text, styles, _) = render(b"a\x08a\x08a\x08a\n", None);
+        assert_eq!(text, "a");
+        assert_eq!(styles, vec![StyleType::Negative]);
+
+        // Any other backspace discards itself and the character before it.
+        assert_eq!(text_of(b"A\x08B\n"), "B");
+        assert_eq!(text_of(b"\x08B\n"), "B");
+    }
+
+    #[test]
+    fn render_plain_keeps_layout_but_drops_style() {
+        let opts = RenderOpts { plain: true };
+        let line = render_display_line(b"A\x08_ b\n", None, opts, true).unwrap();
+        let text: String = line.cells.iter().map(|(c, _)| *c).collect();
+        assert_eq!(text, "A b", "-u must not change layout");
+        assert!(line.cells.iter().all(|(_, st)| *st == StyleType::None));
+    }
+
+    #[test]
+    fn render_folds_without_splitting_or_dropping() {
+        // A unit that does not fit begins the next line rather than being
+        // split or discarded (107452-107453).
+        let (text, _, bytes) = render(b"abcdefghij\n", Some(4));
+        assert_eq!(text, "abcd");
+        assert_eq!(bytes, 4);
+
+        // An escape is four columns wide and is not split across the fold.
+        let (text, _, bytes) = render(b"ab\x01cd\n", Some(4));
+        assert_eq!(text, "ab");
+        assert_eq!(bytes, 2);
+        let (text, _, _) = render(b"\x01cd\n", Some(4));
+        assert_eq!(text, "\\001");
+    }
+
+    #[test]
+    fn render_byte_accounting_round_trips() {
+        // Every byte of the source must be accounted for exactly once, or
+        // the seek offsets built from these counts would drift.
+        let src: &[u8] =
+            b"plain\nA\x08_ under\na\x08a bold\n\ttab\n\x01\xff\n\r\ncaf\xc3\xa9\n\n\n";
+        for cols in [None, Some(3), Some(7), Some(40)] {
+            let mut offset = 0usize;
+            let mut guard = 0;
+            while offset < src.len() {
+                let opts = RenderOpts { plain: false };
+                let line = render_display_line(&src[offset..], cols, opts, true).expect("at eof");
+                assert!(
+                    line.bytes > 0,
+                    "no progress at offset {offset} cols {cols:?}"
+                );
+                offset += line.bytes;
+                guard += 1;
+                assert!(guard < 1000, "runaway at cols {cols:?}");
+            }
+            assert_eq!(offset, src.len(), "byte drift at cols {cols:?}");
+        }
+    }
+
+    #[test]
+    fn env_screen_size_rejects_unusable_values() {
+        use super::env_screen_size;
+
+        // POSIX 107336/107357: COLUMNS and LINES override the system size.
+        // A variable that is unset, empty, unparsable, or zero is treated as
+        // absent so the system-selected size is used instead.
+        std::env::set_var("POSIXUTILS_MORE_SIZE", "40");
+        assert_eq!(env_screen_size("POSIXUTILS_MORE_SIZE"), Some(40));
+        std::env::set_var("POSIXUTILS_MORE_SIZE", " 40 ");
+        assert_eq!(env_screen_size("POSIXUTILS_MORE_SIZE"), Some(40));
+        for bad in ["", "0", "abc", "-5", "99999999"] {
+            std::env::set_var("POSIXUTILS_MORE_SIZE", bad);
+            assert_eq!(env_screen_size("POSIXUTILS_MORE_SIZE"), None, "for {bad:?}");
+        }
+        std::env::remove_var("POSIXUTILS_MORE_SIZE");
+        assert_eq!(env_screen_size("POSIXUTILS_MORE_SIZE"), None);
+    }
+
+    #[test]
+    fn find_tags_files_walks_subdirectories() {
+        let dir = std::env::temp_dir().join("posixutils_more_tags_walk");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("a/b")).unwrap();
+        std::fs::write(dir.join("tags"), "").unwrap();
+        std::fs::write(dir.join("a/b/tags"), "").unwrap();
+        std::fs::write(dir.join("a/not_tags"), "").unwrap();
+
+        let mut found = find_tags_files(&dir);
+        found.sort();
+        assert_eq!(found.len(), 2, "found {found:?}");
+        assert!(found.iter().all(|p| p.file_name() == Some("tags".as_ref())));
+
+        assert!(find_tags_files(Path::new(&dir.join("missing"))).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

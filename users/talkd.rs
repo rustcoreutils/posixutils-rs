@@ -320,8 +320,20 @@ impl InvitationRegistry {
         self.invitations.remove(&id).is_some()
     }
 
-    fn delete_by_caller(&mut self, caller: &str) {
-        self.invitations.retain(|_, inv| inv.caller != caller);
+    /// Remove one invitation, identified by the id the client was given.
+    ///
+    /// The caller name is checked too, so a client cannot cancel an invitation
+    /// it does not own by guessing an id. Deleting by name alone (audit #TD13)
+    /// let a single datagram cancel every session belonging to a caller, and on
+    /// an unauthenticated socket that is a cancel-anyone primitive.
+    fn delete_by_id(&mut self, id: u32, caller: &str) -> bool {
+        match self.invitations.get(&id) {
+            Some(inv) if inv.caller == caller => {
+                self.invitations.remove(&id);
+                true
+            }
+            _ => false,
+        }
     }
 }
 
@@ -517,12 +529,18 @@ fn handle_leave_invite(registry: &mut InvitationRegistry, msg: &CtlMsg) -> CtlRe
 fn handle_delete(registry: &mut InvitationRegistry, msg: &CtlMsg) -> CtlRes {
     let caller = msg.local_name();
 
-    // Delete all invitations from this caller
-    registry.delete_by_caller(&caller);
+    // BSD talkd deletes the single invitation named by id_num. Reporting
+    // success for an id that was never ours would tell a client its teardown
+    // worked when nothing happened.
+    let answer = if registry.delete_by_id(msg.id_num, &caller) {
+        Answer::Success
+    } else {
+        Answer::Failed
+    };
 
     CtlRes::new(
         MessageType::Delete,
-        Answer::Success,
+        answer,
         msg.id_num,
         Osockaddr::default(),
     )
@@ -909,5 +927,37 @@ mod tests {
         assert!(CtlMsg::from_bytes(&[0u8; 4]).is_err());
         // A zero-length datagram is also a graceful parse error.
         assert!(CtlMsg::from_bytes(&[]).is_err());
+    }
+
+    #[test]
+    fn test_delete_is_id_scoped_and_ownership_checked() {
+        // Audit #TD13: DELETE must remove exactly the invitation named by
+        // id_num, and only for its own caller.
+        let mut registry = InvitationRegistry::new();
+        let mk = |callee: &str| Invitation {
+            id: 0,
+            caller: "alice".to_string(),
+            callee: callee.to_string(),
+            caller_tty: String::new(),
+            callee_tty: String::new(),
+            tcp_addr: Osockaddr::default(),
+            ctl_addr: Osockaddr::default(),
+            timestamp: Instant::now(),
+        };
+
+        let first = registry.insert(mk("bob")).expect("insert");
+        let second = registry.insert(mk("carol")).expect("insert");
+
+        // Deleting one leaves the other alone -- the old delete-by-name removed
+        // every invitation belonging to the caller.
+        assert!(registry.delete_by_id(first, "alice"));
+        assert!(registry.find_by_id(second).is_some());
+
+        // A different caller cannot cancel someone else's invitation.
+        assert!(!registry.delete_by_id(second, "mallory"));
+        assert!(registry.find_by_id(second).is_some());
+
+        // An unknown id is a failure, not a forged success.
+        assert!(!registry.delete_by_id(9999, "alice"));
     }
 }

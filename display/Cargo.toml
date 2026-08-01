@@ -12,8 +12,12 @@ clap = { workspace = true, features = ["env"] }
 gettext-rs.workspace = true
 libc.workspace = true
 plib = { path = "../plib" }
+tempfile.workspace = true
 termion = "4.0"
 thiserror.workspace = true
+
+[dev-dependencies]
+portable-pty = "0.9"
 
 [lints]
 workspace = true

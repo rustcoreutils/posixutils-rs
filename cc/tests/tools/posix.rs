@@ -32,8 +32,14 @@ fn run(bin: &str, args: &[&str]) -> (String, String, i32) {
 }
 
 fn run_env(bin: &str, args: &[&str], env: &[(&str, &str)]) -> (String, String, i32) {
+    // Run in a scratch directory. ctags writes its default `tags` file into the
+    // working directory whenever -f is absent, and the crate root is the cwd
+    // under `cargo test`; without this, tests would litter the repository.
+    // Every fixture path these tests pass is absolute, so this is transparent.
+    let cwd = TempDir::new().unwrap();
+
     let mut cmd = Command::new(exe_for(bin));
-    cmd.args(args);
+    cmd.args(args).current_dir(cwd.path());
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -658,6 +664,107 @@ fn cflow_cxref_define_undefine_order_is_significant() {
                 stdout
             );
         }
+    }
+}
+
+// ============================================================================
+// cflow object-file and lex/yacc input — audit #F5, #F6
+// ============================================================================
+
+/// #F5: DESCRIPTION requires cflow to analyze "a collection of object files".
+/// Definitions from an object file report the filename and location counter
+/// rather than a source line.
+#[test]
+fn cflow_analyzes_object_files() {
+    let dir = TempDir::new().unwrap();
+    let c = src(
+        &dir,
+        "obj.c",
+        "int leaf(void){return 1;}\nint middle(void){return leaf();}\nint top(void){return middle();}\n",
+    );
+    let obj = dir.path().join("obj.o");
+
+    // Build the object with our own compiler so the test needs no host toolchain
+    // beyond the assembler pcc already relies on.
+    let built = Command::new(env!("CARGO_BIN_EXE_pcc"))
+        .args(["-c", &c, "-o", obj.to_str().unwrap()])
+        .output()
+        .expect("run pcc");
+    assert!(
+        built.status.success() && obj.exists(),
+        "failed to build fixture object: {}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let (stdout, stderr, code) = run("cflow", &[obj.to_str().unwrap()]);
+    assert_eq!(code, 0, "{}", stderr);
+
+    // The call graph is recovered from relocations.
+    assert!(
+        stdout.contains("top:") && stdout.contains("middle:") && stdout.contains("leaf:"),
+        "expected all three symbols: {:?}",
+        stdout
+    );
+    // "...indicate the filename and location counter under which the symbol
+    // appeared (for example, text)."
+    assert!(
+        stdout.contains("obj.o text>"),
+        "definitions should carry the location counter: {:?}",
+        stdout
+    );
+    // Nesting proves the edges were recovered, not just the symbol list.
+    let top_idx = stdout.find("top:").unwrap();
+    let mid_idx = stdout.find("middle:").unwrap();
+    assert!(
+        mid_idx > top_idx,
+        "middle should nest under top: {}",
+        stdout
+    );
+}
+
+/// #F6: `.l`/`.y` operands are lex/yacc input and must be "processed as
+/// appropriate", not parsed as if they were C.
+///
+/// The error path is asserted unconditionally (a .l operand with no reachable
+/// `lex` must fail loudly rather than silently contribute nothing, which is what
+/// used to happen). The success path is additionally asserted when a `lex`
+/// binary is present alongside the tools under test.
+#[test]
+fn cflow_processes_lex_input() {
+    let dir = TempDir::new().unwrap();
+    let l = src(
+        &dir,
+        "scan.l",
+        "%{\nint count_digits(void);\nint yywrap(void);\n%}\n%%\n[0-9]+  { return count_digits(); }\n%%\nint count_digits(void) { return 1; }\nint yywrap(void) { return 1; }\n",
+    );
+
+    // Unreachable generator: must be a loud failure.
+    let (_, stderr, code) = run_env("cflow", &[&l], &[("PATH", "/nonexistent")]);
+    assert_ne!(code, 0, "a .l operand with no lex must fail");
+    assert!(
+        stderr.contains("lex"),
+        "diagnostic should name the generator: {:?}",
+        stderr
+    );
+
+    // Success path, when lex was built alongside these binaries.
+    let bindir = std::path::Path::new(exe_for("cflow")).parent().unwrap();
+    if bindir.join("lex").exists() {
+        let path = format!("{}:{}", bindir.display(), std::env::var("PATH").unwrap());
+        let (stdout, stderr, code) = run_env("cflow", &[&l], &[("PATH", &path)]);
+        assert_eq!(code, 0, "lex input should analyze cleanly: {}", stderr);
+        assert!(
+            stdout.contains("yylex"),
+            "the generated scanner should appear in the graph: {:?}",
+            stdout
+        );
+        // Output must reference the operand, never the temporary file.
+        assert!(
+            !stdout.contains("lex.yy.c"),
+            "output should name the .l operand, not the generated file: {:?}",
+            stdout
+        );
+        assert!(stdout.contains("scan.l"), "got {:?}", stdout);
     }
 }
 

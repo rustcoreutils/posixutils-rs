@@ -1520,6 +1520,7 @@ dependencies = [
  "bitflags 2.13.1",
  "clap",
  "gettext-rs",
+ "object",
  "plib",
  "tempfile",
 ]

@@ -85,12 +85,14 @@ enum NodeKind {
 struct FunctionInfo {
     /// Symbol name
     name: String,
-    /// Type as string
-    return_type: String,
-    /// Source file
-    file: String,
-    /// Line number
-    line: u32,
+    /// The `<definition>` field of the POSIX output format, precomputed.
+    ///
+    /// For C source this is an abstract declaration plus the source location,
+    /// e.g. `int(), <file.c 13>` for a function or `int, <file.c 1>` for data.
+    /// For a symbol recovered from an object file the spec instead calls for
+    /// "the filename and location counter under which the symbol appeared",
+    /// e.g. `<file.o text>`.
+    definition: String,
     /// Globals referenced by this one (callees, plus data symbols under -i x)
     calls: Vec<String>,
     /// Whether this is a function or a data object
@@ -98,13 +100,23 @@ struct FunctionInfo {
 }
 
 impl FunctionInfo {
-    /// The `<definition>` field of the POSIX output format.
-    fn definition(&self) -> String {
-        match self.kind {
-            NodeKind::Function => {
-                format!("{}(), <{} {}>", self.return_type, self.file, self.line)
-            }
-            NodeKind::Data => format!("{}, <{} {}>", self.return_type, self.file, self.line),
+    fn from_source(
+        name: String,
+        type_str: &str,
+        file: &str,
+        line: u32,
+        calls: Vec<String>,
+        kind: NodeKind,
+    ) -> Self {
+        let definition = match kind {
+            NodeKind::Function => format!("{}(), <{} {}>", type_str, file, line),
+            NodeKind::Data => format!("{}, <{} {}>", type_str, file, line),
+        };
+        Self {
+            name,
+            definition,
+            calls,
+            kind,
         }
     }
 }
@@ -654,11 +666,212 @@ fn format_type(typ: posixutils_cc::types::TypeId, types: &TypeTable) -> String {
 }
 
 // ============================================================================
+// lex / yacc Input
+// ============================================================================
+
+/// C source generated from a `.l` or `.y` operand, plus the temporary directory
+/// holding it (dropped, and so cleaned up, when this goes out of scope).
+struct GeneratedSource {
+    _dir: tempfile::TempDir,
+    path: String,
+}
+
+impl GeneratedSource {
+    fn path(&self) -> &str {
+        &self.path
+    }
+}
+
+/// Run `lex` or `yacc` over an operand and return the C source it produces.
+///
+/// POSIX OPERANDS: "Filenames suffixed by .l shall be taken to be lex input,
+/// .y as yacc input ... Such files shall be processed as appropriate."
+/// APPLICATION USAGE adds that feeding cflow the *generated* C confuses it
+/// because of the reordered `#line` directives, which is precisely why the
+/// grammar itself is the operand.
+fn generate_from_grammar(file: &str, ext: &str) -> io::Result<GeneratedSource> {
+    use std::process::Command;
+
+    let dir = tempfile::TempDir::new()?;
+    let absolute = std::fs::canonicalize(file)?;
+
+    let (tool, output_name) = match ext {
+        "l" => ("lex", "lex.yy.c"),
+        _ => ("yacc", "y.tab.c"),
+    };
+
+    let mut cmd = Command::new(tool);
+    cmd.current_dir(dir.path());
+    if tool == "yacc" {
+        // Fixes the output prefix, so the generated file is y.tab.c.
+        cmd.arg("-b").arg("y");
+    }
+    cmd.arg(&absolute);
+
+    let output = cmd.output().map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("{}: {}: {}", gettext("cannot run"), tool, e),
+        )
+    })?;
+
+    if !output.status.success() {
+        // Surface the generator's own diagnostics.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for line in stderr.lines() {
+            plib::diag::error(line);
+        }
+        return Err(io::Error::other(format!("{} {}", tool, gettext("failed"))));
+    }
+
+    let generated = dir.path().join(output_name);
+    if !generated.exists() {
+        return Err(io::Error::other(format!(
+            "{} {} {}",
+            tool,
+            gettext("produced no output file"),
+            output_name
+        )));
+    }
+
+    let path = generated.to_string_lossy().into_owned();
+    Ok(GeneratedSource { _dir: dir, path })
+}
+
+// ============================================================================
+// Object File Processing
+// ============================================================================
+
+/// Map a section name to the "location counter" POSIX asks for.
+///
+/// STDOUT: "Definitions extracted from object files indicate the filename and
+/// location counter under which the symbol appeared (for example, `text`)."
+/// The historical counters are `text`, `data`, and `bss`, which is what the
+/// leading dot/underscore is stripped down to here.
+fn location_counter(section: &str) -> String {
+    let s = section
+        .trim_start_matches('.')
+        .trim_start_matches("__")
+        .trim_start_matches('_');
+    match s.split('.').next().unwrap_or(s) {
+        "" => "text".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Analyze an object file (or shared library) and add its symbols to the graph.
+///
+/// Object files carry no source positions, so definitions are reported as the
+/// filename plus location counter. Call edges are recovered from relocations:
+/// a relocation at offset X of a text section is attributed to the function
+/// symbol with the greatest address <= X in that section.
+fn process_object_file(path: &str, graph: &mut CallGraph, buffer: &[u8]) -> io::Result<()> {
+    use object::{Object, ObjectSection, ObjectSymbol, RelocationTarget, SymbolKind};
+
+    let obj = object::File::parse(buffer)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+
+    // Defined symbols, grouped by section, sorted by address so a relocation
+    // offset can be attributed to its enclosing function.
+    let mut per_section: HashMap<usize, Vec<(u64, String)>> = HashMap::new();
+    let mut defined: Vec<(String, NodeKind, String)> = Vec::new();
+
+    for sym in obj.symbols() {
+        let Ok(name) = sym.name() else { continue };
+        if name.is_empty() || !sym.is_definition() {
+            continue;
+        }
+        let Some(sec_idx) = sym.section_index() else {
+            continue;
+        };
+        let sec_name = obj
+            .section_by_index(sec_idx)
+            .ok()
+            .and_then(|s| s.name().ok().map(String::from))
+            .unwrap_or_default();
+        let counter = location_counter(&sec_name);
+
+        let kind = match sym.kind() {
+            SymbolKind::Text => NodeKind::Function,
+            SymbolKind::Data => NodeKind::Data,
+            _ => continue,
+        };
+
+        if kind == NodeKind::Function {
+            per_section
+                .entry(sec_idx.0)
+                .or_default()
+                .push((sym.address(), name.to_string()));
+        }
+        defined.push((name.to_string(), kind, counter));
+    }
+
+    for syms in per_section.values_mut() {
+        syms.sort_by_key(|(addr, _)| *addr);
+    }
+
+    // Relocations -> call edges.
+    let mut calls: HashMap<String, Vec<String>> = HashMap::new();
+    for section in obj.sections() {
+        let Some(syms) = per_section.get(&section.index().0) else {
+            continue;
+        };
+        let base = section.address();
+        for (offset, reloc) in section.relocations() {
+            let RelocationTarget::Symbol(sym_idx) = reloc.target() else {
+                continue;
+            };
+            let Ok(target) = obj.symbol_by_index(sym_idx) else {
+                continue;
+            };
+            let Ok(target_name) = target.name() else {
+                continue;
+            };
+            if target_name.is_empty() {
+                continue;
+            }
+            // Enclosing function: greatest address <= the relocation site.
+            let site = base + offset;
+            let Some((_, caller)) = syms.iter().rev().find(|(addr, _)| *addr <= site) else {
+                continue;
+            };
+            if caller == target_name {
+                continue;
+            }
+            let entry = calls.entry(caller.clone()).or_default();
+            if !entry.contains(&target_name.to_string()) {
+                entry.push(target_name.to_string());
+            }
+        }
+    }
+
+    for (name, kind, counter) in defined {
+        if kind == NodeKind::Data && !graph.include_data {
+            continue;
+        }
+        let edges = calls.remove(&name).unwrap_or_default();
+        let edges: Vec<String> = edges
+            .into_iter()
+            .filter(|c| graph.should_include(c))
+            .collect();
+        graph.add_function(FunctionInfo {
+            definition: format!("<{} {}>", path, counter),
+            name,
+            calls: edges,
+            kind,
+        });
+    }
+
+    Ok(())
+}
+
+// ============================================================================
 // File Processing
 // ============================================================================
 
 fn process_file(
     path: &str,
+    display: &str,
     streams: &mut StreamTable,
     graph: &mut CallGraph,
     defines: &[String],
@@ -749,14 +962,14 @@ fn process_file(
                 let line = declarator_line(&lines, d.pos.line, &name);
                 data_symbols.insert(
                     name.clone(),
-                    FunctionInfo {
+                    FunctionInfo::from_source(
                         name,
-                        return_type: format_type(d.typ, &types),
-                        file: path.to_string(),
+                        &format_type(d.typ, &types),
+                        display,
                         line,
-                        calls: Vec::new(),
-                        kind: NodeKind::Data,
-                    },
+                        Vec::new(),
+                        NodeKind::Data,
+                    ),
                 );
             }
         }
@@ -787,16 +1000,14 @@ fn process_file(
             // Filter calls based on include options (e.g., underscore names)
             calls.retain(|c| graph.should_include(c));
 
-            let info = FunctionInfo {
+            graph.add_function(FunctionInfo::from_source(
                 name,
-                return_type,
-                file: path.to_string(),
+                &return_type,
+                display,
                 line,
                 calls,
-                kind: NodeKind::Function,
-            };
-
-            graph.add_function(info);
+                NodeKind::Function,
+            ));
         }
     }
 
@@ -847,7 +1058,7 @@ fn print_flowgraph(
         printed_refs.insert(name.to_string(), my_ref);
 
         // Print the definition
-        println!("{}{} {}: {}", my_ref, indent, name, info.definition());
+        println!("{}{} {}: {}", my_ref, indent, name, info.definition);
 
         // Avoid infinite recursion
         if visited.contains(name) {
@@ -889,7 +1100,7 @@ fn print_reverse_flowgraph(graph: &CallGraph) {
         ref_num += 1;
 
         match graph.functions.get(&name) {
-            Some(info) => println!("{} {}: {}", ref_num, name, info.definition()),
+            Some(info) => println!("{} {}: {}", ref_num, name, info.definition),
             None => println!("{} {}: <>", ref_num, name),
         }
 
@@ -897,7 +1108,7 @@ fn print_reverse_flowgraph(graph: &CallGraph) {
         for caller in graph.get_callers(&name) {
             ref_num += 1;
             if let Some(info) = graph.functions.get(&caller) {
-                println!("{}     {}: {}", ref_num, caller, info.definition());
+                println!("{}     {}: {}", ref_num, caller, info.definition);
             }
         }
     }
@@ -946,8 +1157,9 @@ fn main() -> ExitCode {
             .unwrap_or("");
 
         match ext {
-            "c" | "h" | "l" | "y" | "i" => {
+            "c" | "h" | "i" => {
                 if let Err(e) = process_file(
+                    file,
                     file,
                     &mut streams,
                     &mut graph,
@@ -958,6 +1170,27 @@ fn main() -> ExitCode {
                     plib::diag::error(&format!("{}: {}", file, e));
                 }
             }
+            // POSIX OPERANDS: ".l shall be taken to be lex input, .y as yacc
+            // input ... such files shall be processed as appropriate". Generate
+            // the C source first rather than parsing the grammar as if it were C.
+            "l" | "y" => match generate_from_grammar(file, ext) {
+                Ok(generated) => {
+                    // Report against the operand the user named, not the
+                    // temporary file the generator produced.
+                    if let Err(e) = process_file(
+                        generated.path(),
+                        file,
+                        &mut streams,
+                        &mut graph,
+                        &defines,
+                        &undefines,
+                        &args.include_paths,
+                    ) {
+                        plib::diag::error(&format!("{}: {}", file, e));
+                    }
+                }
+                Err(e) => plib::diag::error(&format!("{}: {}", file, e)),
+            },
             "s" => {
                 plib::diag::error(&format!(
                     "{}: {}",
@@ -965,9 +1198,17 @@ fn main() -> ExitCode {
                     gettext("assembly files not supported")
                 ));
             }
-            _ => {
-                plib::diag::error(&format!("{}: {}", file, gettext("unknown file type")));
-            }
+            // Object files, archives and shared libraries. DESCRIPTION requires
+            // cflow to analyze "a collection of object files or assembler,
+            // C-language, lex, or yacc source files".
+            _ => match std::fs::read(file) {
+                Ok(buffer) => {
+                    if let Err(e) = process_object_file(file, &mut graph, &buffer) {
+                        plib::diag::error(&format!("{}: {}", file, e));
+                    }
+                }
+                Err(e) => plib::diag::error(&format!("{}: {}", file, e)),
+            },
         }
     }
 

@@ -69,7 +69,7 @@
 - [x] **`TERM`** CONFORMS by delegation — termion reads it to select terminal capabilities, which is exactly what 107366's "the MORE variable shall take precedence over the TERM and LINES variables" contemplates. `more` itself has no reason to validate it.
 - [x] ~~**`LANG` MISSING**~~ — **re-examined (Phase 9); actually conforms.** The call is `setlocale(LC_ALL, "")`, whose empty locale argument makes libc apply the whole `LC_ALL` > `LC_*` > `LANG` precedence chain of XBD 8.2. The original finding read the `LcAll` *category* as if it were the `LC_ALL` variable.
 - [x] **`LC_COLLATE`** CONFORMS — reaches libc through the same `setlocale(LC_ALL, "")`, and the search path compiles patterns via `plib::regex`, whose bracket-expression ranges are collation-aware.
-- [ ] **`LC_CTYPE` PARTIAL.** Set through `setlocale(LC_ALL, "")`, so libc-based classification sees it, but the render path still decides printability by `u8::is_ascii_control` rather than a locale-aware classifier. Tied to the deferred non-printable-display item below.
+- [x] **`LC_CTYPE`** CONFORMS ✓ — the render path now classifies characters rather than bytes, using `plib::locale::wcwidth_char` for widths. One deliberate divergence: UTF-8 is decoded regardless of `LC_CTYPE`, because a strict reading would render every non-ASCII byte as `\NNN` under `LC_ALL=C` — common in scripts and CI — and make ordinary text unreadable. Bytes that are not valid UTF-8 still escape.
 - [x] **`LC_MESSAGES`** CONFORMS as far as the tree allows ✓ fixed (#14) — all diagnostics are `gettext`'d; text stays English until `.mo` catalogs ship.
 - [ ] `NLSPATH` (XSI) MISSING — optional XSI, acceptable; track anyway.
 
@@ -104,12 +104,45 @@ All 28 spec commands are wired (count-prefix supported on every command that tak
 ### Extended description / rendering
 
 - [x] Line folding CONFORMS for ASCII.
-**Deferred as a group — the interactive render path.** The four items below all live in `find_next_line_len_with_skip` and its `continious_styled_parse` / `last_styled_parse` helpers, which are only reached when standard output is a terminal (in filter mode `more` copies its input through verbatim, which is already correct). Changing that parser is only safe with a harness that can both allocate a PTY *and drive `more`'s command input*, because `more` waits for a command even under `-e`; the crate has no such harness today (`screen/tests/common/mod.rs` allocates a PTY but never writes to it). Rewriting the parser blind was judged worse than recording the gap — the same call the project made for `users/` `talk`. A fix should land together with an input-capable PTY harness in `display/tests/common/`.
+**Resolved — the interactive render path.** All four items below were fixed by
+replacing `find_next_line_len_with_skip` (and its `continious_styled_parse` /
+`last_styled_parse` helpers) with `render_display_line`, a pure total function
+from source bytes to display cells. The root cause was shared: the old function
+returned a single `usize` used as **both** the byte advance into the source and
+the display width for folding, so one byte was always one column. That is why
+any control byte except `<backspace>` *terminated the line* — with no way to
+spend four columns on one byte it gave up and dropped the rest. The new function
+reports columns produced and bytes consumed separately.
 
-- [ ] **Non-printable display PARTIAL** (the most user-visible of the four). Line parse breaks on the first non-`\x08` control character (lines 673–675), so the rest of the line is dropped rather than displayed in `ex print` notation (`^X`, `\NNN`) per 107450-107452. A literal `<tab>` triggers it too, since `is_ascii_control` includes it.
-- [ ] **Backspace/underscore/embolden (when `-u` absent) PARTIAL.** The 3-byte pattern match doesn't implement the full POSIX sequences (`char + n*BS + n*'_'` for underline; `char + n*BS + char` for bold, 107432-107445) for n > 1.
-- [ ] **`\r` at EOL ignored PARTIAL.** `\r` participates in `line_len` rather than being discarded before `\n` (107448-107449).
-- [ ] **Multi-column-character splitting** at a column boundary is unspecified by POSIX (107452-107453), but the same lines require that such a character "shall not be discarded" — worth confirming once the harness exists.
+The enabling work was `display/tests/common/mod.rs`, a PTY harness that can both
+drive `more`'s command input and reconstruct the drawn screen (`Terminal::display`
+emits a `Goto` before every cell, so the byte stream replays into a grid).
+
+- [x] **Non-printable display** CONFORMS ✓ — rendered in the `ed(1)` list format
+  POSIX 107450-107452 points at: the named escapes of XBD Table 5-1, else one
+  three-digit octal number per byte. A literal `<backslash>` is deliberately
+  *not* escaped (107450 scopes escaping to non-printable characters; `ed`'s `l`
+  escapes it only because `l` renders whole lines unambiguously). `<tab>`
+  expands to 8-column stops rather than being escaped — POSIX never mentions
+  tabs, and the column counter makes it free.
+- [x] **Backspace/underscore/embolden** CONFORMS ✓ (107432-107445) — all three
+  forms at n > 1, both underline orders (`_`-first checked before the embolden
+  form so `_\b_` underlines), repeats absorbed so `a\ba\ba\ba` is one
+  emboldened `a`, and the catch-all discarding a stray `<backspace>` together
+  with the character before it.
+- [x] **`\r` at EOL** CONFORMS ✓ (107448-107449) — resolved before overstrike, so
+  a `<carriage-return>` can never join a backspace sequence; elsewhere it is an
+  ordinary non-printable.
+- [x] **Multi-column characters** CONFORMS ✓ (107452-107453) — width comes from
+  `plib::locale::wcwidth_char`, a double-width character occupies a continuation
+  cell, and each expanded unit is atomic at the fold: if it does not fit it is
+  not emitted and its bytes are not consumed, so it begins the next display line
+  rather than being split or discarded.
+
+**Byte accounting** is the invariant that makes folding safe: bytes discarded by
+overstrike are attributed to the *following* unit, so re-rendering from any
+offset reproduces the same units. A unit test asserts the rendered byte counts
+sum to the file length at four different fold widths.
 
 ### Exit status / consequences of errors
 
@@ -143,7 +176,7 @@ Not covered (each gap is a "write a test" task tied to fixing the corresponding 
 - [x] **Phase 8 — "Env precedence, hidden flag, i18n"**: Minor #12, #13, #14 (Major #3, #4 landed earlier)
 - [x] **Phase 7 — "Command-mode conformance"**: Major #7, #8, #9 + Minor #10, #11, #15
 - [x] **Phase 9 — "Remaining matrix items"**: `-p` failure suppression, `[count]s`, `=` pathname, `h` URL, plus re-dispositions of `-c`, `+`, `TERM`, `LANG`, `LC_COLLATE`, and the alternate-screen design item
-- [ ] **Future — "Rendering correctness"**: the four deferred render-path items above, to land with an input-capable PTY harness
+- [x] **Rendering correctness** — landed with the PTY harness, in six phases (harness, source sizing, streaming input, cell semantics, renderer swap, byte-offset consumers).
 - [x] **Phase 8 — "i18n + cleanup"**: Minor #13, #14 + locale env var coverage
 
 ---
@@ -372,11 +405,59 @@ Not covered (each is a "write a test" task tied to the matching finding):
 
 ---
 
+## Found while fixing the render path (2026-08-01)
+
+None of these were in the audit; all were found by the work above, most by a
+test written for a neighboring finding. All are fixed except the last.
+
+- [x] **Startup read the entire source.** `SeekPositions::new` called
+  `lines_count_and_stream_len` unconditionally, walking every line before
+  anything was drawn. It was far worse than O(file): each `next()` built a
+  `BufReader` that read 8 KiB ahead then seeked back, so the same bytes were
+  re-read per line. Measured on a 200 MB file: **62,394,353,376 bytes read,
+  ~297× the file size**; now 976,559. All it bought was a total line count for
+  the `--More--(NN%)` figure, which POSIX 107631-107632 permits omitting; the
+  percentage now comes from byte offsets against an O(1) total.
+- [x] **Standard input was read into memory.** `read_to_string` bounded the
+  input size by RAM, so a pipe larger than memory could not be paged at all.
+  Standard input is now spill-backed: bytes append to an unlinked temporary
+  file as they are read, and seeks are served from it, so `more` stays seekable
+  without materializing the stream.
+- [x] **Filter mode was unbounded and lossy.** It walked the input line by line
+  through `SeekPositions`, so the line index grew a `u64` per line (~216 MB for
+  a 1 GB input) and every line was UTF-8 decoded. POSIX 107253 makes filter mode
+  a copy; it is now a byte copy. Measured, 1 GB through a pipe: **peak RSS
+  7,049,856 KB → 3,456 KB, 38.2s → 0.6s**.
+- [x] **`-s` had no effect in filter mode** — though 107650 makes it the *one*
+  option that must be effective when standard output is not a terminal.
+- [x] **Non-UTF-8 input failed in filter mode** with `Couldn't parse <file>`
+  instead of being copied through (107253).
+- [x] **Content and prompt interleaved.** Content goes to stdout and the prompt
+  to stderr, separately buffered handles onto the same terminal, but stdout was
+  only flushed *after* the prompt was written — so escape sequences from one
+  stream landed inside the other. Caught by the PTY grid reconstruction.
+- [x] **`-u` stripped the prompt's reverse-video**, which POSIX never asks for;
+  `-u` is about the displayed text (107299).
+- [x] **`find_n_line` offsets drifted.** It summed lengths from
+  `BufReader::lines()`, which strips the `<newline>`, so every offset was short
+  by one byte per line and `:t` landed in the wrong place.
+- [x] **Screen writes were bounded by bytes, not cells**, so a valid full-width
+  non-ASCII line was refused with `MoreError::SetOutside`. Also fixed: two
+  `usize` underflows (`content_lines_len - 1`, `line_len - 4`) and a prompt
+  wider than the terminal refusing to draw rather than truncating.
+- [ ] **The line index is still unbounded.** `positions` grows 8 bytes per
+  display line *visited* — bounded by how far the user scrolls, so unlike the
+  two defects above it cannot be hit by merely opening a file, but `G` on a very
+  large pipe still indexes every line on the way to the end (~200 GB for a 1 TB
+  input of 40-byte lines). Deliberately deferred: the fix is anchoring the index
+  every Nth line and re-scanning between anchors, which is independent of the
+  render work. `less` keeps a growing line index too.
+
 # Crate-level summary — `display/`
 
 | Utility | Critical | Major | Minor | Status | README stage |
 |---|---|---|---|---|---|
-| `more` | 2 | 7 | 6 | all 15 priority items fixed; 4 render-path matrix items deferred | Stage 6 — Audited |
+| `more` | 2 | 7 | 6 | all 15 priority items and all matrix items fixed; only tree-wide `NLSPATH` open | Stage 6 — Audited |
 | `echo` | 1 | 2 | 5 | all fixed (#E7 deliberate no-action) | Stage 6 — Audited |
 | `printf` | 0 | 6 | 12 | all fixed | Stage 6 — Audited |
 
@@ -412,4 +493,4 @@ only blanks was accepted as zero. All three are fixed and covered.
 
 **Promotion status.** `echo` and `printf` are promoted to README **Stage 6 — Audited**: every actionable finding is fixed and covered by a regression test. The two items left unchecked for them are `NLSPATH` (a tree-wide gap — no `.mo` catalogs ship anywhere in the project) and `echo` #E7, which is a deliberate, documented choice POSIX explicitly makes implementation-defined.
 
-`more` keeps its Stage 6 standing: all 15 numbered priority items are now fixed. Four matrix items in the interactive render path remain open and are documented above with the reason (they need an input-capable PTY harness) — the same disposition `users/` `talk` received.
+`more` keeps its Stage 6 standing, now with **every** numbered priority item and every matrix item closed. The four interactive-render items that were deferred for want of a PTY harness are fixed, the harness exists (`display/tests/common/mod.rs`), and ten further defects found during that work are recorded above — nine fixed, one (the unbounded line index) deliberately deferred with its measurement. The only item left unchecked for the whole crate is `NLSPATH`, a tree-wide gap: no `.mo` catalogs ship anywhere in the project.

@@ -1897,6 +1897,24 @@ fn request(
     Ok(())
 }
 
+/// Unlinks a path when dropped.
+struct PathCleanup(std::path::PathBuf);
+
+impl Drop for PathCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// A private, unique path for this client's reply socket.
+fn client_reply_path() -> std::path::PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("talk.{}.{}.sock", process::id(), nonce))
+}
+
 /// Sends a control message to the local talkd daemon via Unix domain socket.
 ///
 /// # Arguments
@@ -1915,7 +1933,14 @@ fn request_local(
     msg_type: MessageType,
     res: &mut CtlRes,
 ) -> Result<(), TalkError> {
-    let socket = UnixDatagram::unbound().map_err(TalkError::IoError)?;
+    // The daemon replies with send_to_addr() using the source address of our
+    // datagram, so this socket must have one. An unbound Unix datagram socket
+    // is unnamed, which made every reply fail with EINVAL and left the local
+    // handshake permanently timing out (audit #TK22). Bind a private path, and
+    // remove it on the way out.
+    let reply_path = client_reply_path();
+    let socket = UnixDatagram::bind(&reply_path).map_err(TalkError::IoError)?;
+    let _reply_cleanup = PathCleanup(reply_path);
 
     msg.r#type = msg_type as u8;
     let msg_bytes = msg
@@ -2127,6 +2152,14 @@ fn get_terminal_size() -> (u16, u16) {
             // Default fallback size
             return (80, 24);
         }
+    }
+
+    // The ioctl can succeed and still report zeroes -- a pty whose window size
+    // was never set does exactly that. Treat it the same as a failure rather
+    // than propagating a degenerate geometry, which would wrap the display
+    // after every single character.
+    if size.ws_col == 0 || size.ws_row == 0 {
+        return (80, 24);
     }
 
     (size.ws_col, size.ws_row)

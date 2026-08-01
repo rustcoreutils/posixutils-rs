@@ -214,8 +214,6 @@ enum MoreError {
     SourceContext(#[from] SourceContextError),
     /// Attempt set [`String`] on [`Terminal`] that goes beyond
     SetOutside,
-    /// Attempt set [`Prompt`] on [`Terminal`] longer that [`Terminal`] width
-    InputTooLong,
     /// Read [`std::io::Stdin`] is failed
     InputRead,
     /// Stdout is a terminal but no readable channel exists for user commands
@@ -248,7 +246,6 @@ impl std::fmt::Display for MoreError {
             Self::SeekPositions(e) => write!(f, "{e}"),
             Self::SourceContext(e) => write!(f, "{e}"),
             Self::SetOutside => write!(f, "{}", gettext("Set chars outside screen is forbidden")),
-            Self::InputTooLong => write!(f, "{}", gettext("Input too long")),
             Self::InputRead => write!(f, "{}", gettext("Couldn't read from stdin")),
             Self::NoCommandSource => write!(
                 f,
@@ -358,15 +355,19 @@ impl Screen {
     }
 
     /// Sets string range on [`Screen`]
+    ///
+    /// The screen is a grid of cells, so the bound is the number of cells the
+    /// text occupies, not its length in bytes: an 80-column line of non-ASCII
+    /// text is many more bytes than columns and used to be rejected outright.
+    /// Text that does not fit is written up to the edge rather than refused —
+    /// a caller asking to draw past the margin wants the visible part drawn.
     fn set_str(
         &mut self,
         position: (usize, usize),
         string: String,
         style: StyleType,
     ) -> Result<(), MoreError> {
-        if position.0 >= self.0.len()
-            || (self.0[0].len() as isize - position.1 as isize) < string.len() as isize
-        {
+        if position.0 >= self.0.len() {
             return Err(MoreError::SetOutside);
         }
 
@@ -385,14 +386,14 @@ impl Screen {
     }
 
     /// Set string ([`Vec<(char, StyleType)>`]) range on [`Screen`]
+    ///
+    /// Bounded by cells and clamped, for the same reasons as [`Self::set_str`].
     fn set_raw(
         &mut self,
         position: (usize, usize),
         string: Vec<(char, StyleType)>,
     ) -> Result<(), MoreError> {
-        if position.0 > self.0.len()
-            || (self.0[0].len() as isize - position.1 as isize) < string.len() as isize
-        {
+        if position.0 >= self.0.len() {
             return Err(MoreError::SetOutside);
         }
 
@@ -1269,7 +1270,9 @@ impl SourceContext {
         }
 
         let mut i = 0;
-        while i < content_lines_len - 1 {
+        // Guard the subtraction: a source with nothing to show yields zero
+        // content lines, and `0 - 1` would wrap to usize::MAX.
+        while i + 1 < content_lines_len {
             let line = self.seek_positions.read_line()?;
             content_lines.push(line);
             if self.seek_positions.next_back().is_none() {
@@ -2053,10 +2056,13 @@ impl Terminal {
 
     // Display prompt in bottom row
     pub fn display_prompt(&mut self, prompt: Prompt) -> Result<(), MoreError> {
-        let line = prompt.format();
-        if line.len() > self.size.1 as usize {
-            let _ = set_style_on(&mut self.prompt_out, StyleType::None);
-            return Err(MoreError::InputTooLong);
+        let mut line = prompt.format();
+        // The prompt is measured in cells, and a prompt too wide for the
+        // terminal is truncated rather than refused: a narrow window must
+        // still get a prompt, and `line` here is already a cell vector.
+        let width = self.size.1 as usize;
+        if line.len() > width {
+            line.truncate(width);
         }
 
         let mut style = StyleType::None;
@@ -3332,7 +3338,7 @@ impl MoreControl {
                     self.prompt = Some(Prompt::Error(error_str.clone()));
                 }
             },
-            MoreError::InputTooLong | MoreError::PatternNotFound(_) => {
+            MoreError::PatternNotFound(_) => {
                 self.prompt = Some(Prompt::Error(error_str.clone()));
             }
             MoreError::StringParse(_) => {
@@ -3683,12 +3689,15 @@ fn format_file_header(
     let name_and_ext = name_and_ext(file_path)?;
 
     let (mut name_and_ext, border) = if let Some(line_len) = line_len {
-        let header_width = if name_and_ext.len() < 14 {
+        // Measure the name in characters, not bytes, and guard the
+        // subtraction so a terminal narrower than the border does not wrap.
+        let name_width = name_and_ext.chars().count();
+        let header_width = if name_width < 14 {
             14
-        } else if name_and_ext.len() > line_len - 4 {
+        } else if name_width + 4 > line_len {
             line_len
         } else {
-            name_and_ext.len() + 4
+            name_width + 4
         };
 
         (

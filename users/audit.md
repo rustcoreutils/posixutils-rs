@@ -38,12 +38,27 @@ Shared foundation: `plib::curuser::{login_name_strict, ttyname_of}`, a new
 | `tty` | **Audited** ✓ | stdin-only name; ttyname-fail → exit 2. |
 | `newgrp` | **Audited** ✓ | execs a shell in both modes; invoke-anyway; gshadow+group-DB verify (Linux), constant-time, fail-closed; privilege drop kept. |
 | `write` | **Audited** ✓ | canonical-mode per-char rendering; alert→recipient; superuser override; no panics; SIGHUP/SIGPIPE; `/dev` char-device validation. |
-| `talkd` | resolved; **stays Stage 3 with `talk`** | all items fixed or documented (`#TD7` local-only WON'T-FIX). Not separately promoted because the README bundles it with `talk`. |
-| `talk` | **not promoted (Stage 3)** | Criticals (#TK1/2/3) + Majors (#TK5/6/8) fixed; **#TK7** (full char-processing) and Minors #TK9/#TK10/#TK14 **deferred** — the interactive curses/input engine is unverifiable in CI, so changing it blind risks silent regressions. |
+| `talkd` | **Audited** ✓ (2026-08-01) | All items fixed or documented (`#TD7` local-only WON'T-FIX); `#TD13` (id-scoped DELETE) closed 2026-08-01. |
+| `talk` | **Audited** ✓ (2026-08-01) | The phase-10 deferrals (#TK7/#TK9/#TK10/#TK14) are closed by the renderer extraction, along with eight defects found while doing it (#TK15–#TK23) — including a stdout-lock deadlock that made the keyboard path hang, and an unbound client socket that meant `--local` never completed a handshake. See the residual note below. |
 
 Per-finding ✓-fixed annotations appear inline in each section below. README
 promotions: `id`, `logname`, `logger`, `mesg`, `newgrp`, `pwd`, `tty`, `write`
-→ **Stage 6 — Audited**; `talk (with talkd local daemon)` remains Stage 3.
+→ **Stage 6 — Audited** (2026-06-18); `talk (with talkd local daemon)`
+→ **Stage 6 — Audited** (2026-08-01).
+
+> **Residual on `talk` — read before trusting the promotion.** Every finding is
+> closed and the render path now has unit tests where it had none, but the
+> interactive path is **not guarded by an automated test**. A two-peer session
+> was verified by hand with a pty driver — connect, type, receive in the peer
+> window, single local echo, SIGINT exit 0 — and that is what justifies the
+> promotion. It is manual evidence, so it does not protect against regression.
+> The phase-10 audit's judgement that this code is hard to verify was sound:
+> two of the defects found here (#TK21 stdout deadlock, #TK22 unbound client
+> socket) each made the utility non-functional and survived a full audit plus
+> the whole test suite. **An end-to-end pty test is the outstanding work**, and
+> is now clearly feasible: the throwaway driver used here was about sixty
+> lines, and `users` already has `portable-pty` as a dev-dependency plus
+> raw-libc pty helpers in `tests/tty` and `tests/write`.
 
 The headline-counts table below is the **original audit snapshot** (what was
 found), preserved for the record; the disposition table above reflects the

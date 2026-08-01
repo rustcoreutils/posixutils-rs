@@ -152,6 +152,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] strip (Development)
  - [x] stty
  - [x] tabs
+ - [x] talk (with talkd local daemon)
  - [x] tail
  - [x] tee
  - [x] test
@@ -196,7 +197,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
 
  - [x] c99 (Development)
  - [x] localedef (i18n)
- - [x] talk (with talkd local daemon)
  - [x] tr
 
 ## Stage 2 - Feature-complete and POSIX compliant

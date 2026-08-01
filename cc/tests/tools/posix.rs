@@ -765,6 +765,28 @@ fn cflow_processes_lex_input() {
             stdout
         );
         assert!(stdout.contains("scan.l"), "got {:?}", stdout);
+
+        // Diagnostics must not leak the temporary path either: it is deleted
+        // when the run ends, so it tells the reader nothing actionable.
+        let broken = src(
+            &dir,
+            "broken.l",
+            "%%\n[0-9]+  { return 1; }\n%%\nthis is not valid C at all @@@\n",
+        );
+        let (_, stderr, code) = run_env("cflow", &[&broken], &[("PATH", &path)]);
+        assert_ne!(code, 0, "a .l whose generated C will not parse must fail");
+        // (The fixture itself lives in a temp dir, so only the *generated*
+        // filename indicates a leak.)
+        assert!(
+            !stderr.contains("lex.yy.c"),
+            "diagnostics should name the operand, not the generated file: {:?}",
+            stderr
+        );
+        assert!(
+            stderr.contains("broken.l"),
+            "diagnostic should name the operand: {:?}",
+            stderr
+        );
     }
 }
 

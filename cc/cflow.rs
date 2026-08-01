@@ -934,7 +934,10 @@ fn process_file(
     let ast = match parser.parse_translation_unit() {
         Ok(ast) => ast,
         Err(e) => {
-            plib::diag::error(&format!("{}: {}: {}", path, gettext("parse error"), e));
+            // Report against the operand the user named. For a .l/.y operand
+            // `path` is the generated temporary file, which is deleted when the
+            // run ends and so is useless to the reader.
+            plib::diag::error(&format!("{}: {}: {}", display, gettext("parse error"), e));
             return Ok(());
         }
     };

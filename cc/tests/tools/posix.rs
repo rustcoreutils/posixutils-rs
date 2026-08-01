@@ -447,6 +447,168 @@ fn cxref_width_bounds_every_line() {
     }
 }
 
+// ============================================================================
+// cflow — audit #F2, #F3, #F7, #F8, #F9, #F10, #F12
+// ============================================================================
+
+/// The worked EXAMPLE from the cflow spec, reproduced verbatim.
+///
+/// This single fixture pins #F2 (data symbols under -i x), #F12 (the definition
+/// line is the declarator's, not the type specifier's) and the `<>` form for an
+/// undefined reference all at once.
+const SPEC_EXAMPLE: &str = "int i;\nint f();\nint g();\nint h();\nint\nmain(void)\n{\n    f();\n    g();\n    f();\n}\nint\nf()\n{\n    i = h();\n}\n";
+
+#[test]
+fn cflow_reproduces_spec_example() {
+    let dir = TempDir::new().unwrap();
+    let f = src(&dir, "file.c", SPEC_EXAMPLE);
+
+    let (stdout, stderr, code) = run("cflow", &["-i", "x", &f]);
+    assert_eq!(code, 0, "{}", stderr);
+
+    // Indentation width is "at least one column position per level" and so is
+    // not fixed by the spec; compare with runs of spaces collapsed.
+    let squeeze = |s: &str| {
+        s.lines()
+            .map(|l| {
+                let mut out = String::new();
+                let mut prev_space = false;
+                for c in l.chars() {
+                    if c == ' ' {
+                        if !prev_space {
+                            out.push(' ');
+                        }
+                        prev_space = true;
+                    } else {
+                        out.push(c);
+                        prev_space = false;
+                    }
+                }
+                out
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let expected = vec![
+        format!("1 main: int(), <{} 6>", f),
+        format!("2 f: int(), <{} 13>", f),
+        "3 h: <>".to_string(),
+        format!("4 i: int, <{} 1>", f),
+        "5 g: <>".to_string(),
+    ];
+    assert_eq!(squeeze(&stdout), expected, "raw output was:\n{}", stdout);
+}
+
+/// #F2: without -i x, data symbols stay out of the graph.
+#[test]
+fn cflow_data_symbols_require_i_x() {
+    let dir = TempDir::new().unwrap();
+    let f = src(&dir, "file.c", SPEC_EXAMPLE);
+
+    let (stdout, _, _) = run("cflow", &[&f]);
+    assert!(
+        !stdout.lines().any(|l| l.contains(" i: ")),
+        "data symbol should be absent without -i x: {:?}",
+        stdout
+    );
+}
+
+/// #F3: a repeated callee prints only the reference number of its definition,
+/// in the same "%d %s:%s" shape as every other line.
+#[test]
+fn cflow_back_reference_format() {
+    let dir = TempDir::new().unwrap();
+    let f = src(
+        &dir,
+        "dia.c",
+        "int shared(void){return 1;}\nint a(void){return shared();}\nint b(void){return shared();}\nint main(void){return a()+b();}\n",
+    );
+
+    let (stdout, stderr, code) = run("cflow", &[&f]);
+    assert_eq!(code, 0, "{}", stderr);
+
+    let repeat = stdout
+        .lines()
+        .rfind(|l| l.contains("shared:"))
+        .expect("a repeated reference to `shared`");
+    assert!(
+        repeat.trim_end().ends_with("shared: 3"),
+        "back-reference should be `name: <refnum>`, got {:?}",
+        repeat
+    );
+    assert!(
+        !stdout.contains('{') && !stdout.contains('}'),
+        "no brace-wrapped reference form should remain: {:?}",
+        stdout
+    );
+}
+
+/// #F7: "Attempts to set the cut-off depth to a non-positive integer shall be
+/// ignored."
+#[test]
+fn cflow_non_positive_depth_is_ignored() {
+    let dir = TempDir::new().unwrap();
+    let f = src(&dir, "file.c", SPEC_EXAMPLE);
+
+    let (baseline, _, code) = run("cflow", &[&f]);
+    assert_eq!(code, 0);
+
+    for depth in ["0", "-1"] {
+        let (out, stderr, code) = run("cflow", &["-d", depth, &f]);
+        assert_eq!(code, 0, "-d {} should be accepted: {}", depth, stderr);
+        assert_eq!(
+            out, baseline,
+            "-d {} should behave as if -d were absent",
+            depth
+        );
+    }
+
+    // A positive depth still truncates.
+    let (shallow, _, _) = run("cflow", &["-d", "1", &f]);
+    assert!(shallow.lines().count() < baseline.lines().count());
+}
+
+/// #F9: -i takes exactly `x` or `_`.
+#[test]
+fn cflow_rejects_invalid_include_argument() {
+    let dir = TempDir::new().unwrap();
+    let f = src(&dir, "file.c", SPEC_EXAMPLE);
+
+    let (_, stderr, code) = run("cflow", &["-i", "bogus", &f]);
+    assert_ne!(code, 0, "invalid -i argument should be rejected");
+    assert!(stderr.contains("bogus"), "got {:?}", stderr);
+
+    for good in ["x", "_"] {
+        let (_, _, code) = run("cflow", &["-i", good, &f]);
+        assert_eq!(code, 0, "-i {} should be accepted", good);
+    }
+}
+
+/// #F8: LC_COLLATE orders the -r listing.
+#[test]
+fn cflow_reverse_sort_respects_lc_collate() {
+    let dir = TempDir::new().unwrap();
+    let f = src(
+        &dir,
+        "coll.c",
+        "int apple(void){return 0;}\nint Banana(void){return 0;}\nint cherry(void){return 0;}\n",
+    );
+
+    let (out, stderr, code) = run_env("cflow", &["-r", &f], &[("LC_ALL", "C")]);
+    assert_eq!(code, 0, "{}", stderr);
+    let names: Vec<&str> = out
+        .lines()
+        .filter_map(|l| l.split_whitespace().nth(1))
+        .map(|n| n.trim_end_matches(':'))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["Banana", "apple", "cherry"],
+        "POSIX locale should collate by byte value: {:?}",
+        out
+    );
+}
+
 /// Diagnostics belong on stderr only; stdout carries the report.
 /// POSIX STDERR: "used only for diagnostic messages" (all three utilities).
 #[test]

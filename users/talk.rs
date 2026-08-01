@@ -1283,32 +1283,34 @@ fn get_local_machine_name() -> Result<String, io::Error> {
 ///
 /// A tuple containing the user name and the host name.
 fn parse_address(address: &str, my_machine_name: &str) -> (String, String) {
-    // Look for the first occurrence of any delimiter character ('@', ':', '!', '.').
-    let at_index = address.find(|c| "@:!.".contains(c));
-
-    // If a delimiter is found, determine how to split the address into user and host.
-    if let Some(index) = at_index {
-        let delimiter = address.chars().nth(index);
-
-        match delimiter {
-            // If the delimiter is '@', split the address as "user@host".
-            Some('@') => {
-                let (user, host) = address.split_at(index);
-                // Extract the host by skipping the '@' character.
-                let host = host.get(1..).unwrap_or_default();
-                (user.to_string(), host.to_string())
-            }
-            // For any other delimiter, split the address as "host:user".
-            _ => {
-                let (host, user) = address.split_at(index);
-                // Extract the user by skipping the delimiter character.
-                let user = user.get(1..).unwrap_or_default();
-                (user.to_string(), host.to_string())
-            }
-        }
-    } else {
-        (address.to_string(), my_machine_name.to_string())
+    // Historical BSD `talk` resolves the address by delimiter *precedence*,
+    // not by whichever delimiter appears first:
+    //
+    //   index('@')  ->  user@host
+    //   rindex('!') ->  host!user
+    //   rindex(':') ->  host:user
+    //   rindex('.') ->  host.user
+    //
+    // Scanning for the leftmost of the whole set instead (audit #TK19) splits
+    // `first.last@host` at the dot -- never reaching the `@` branch -- and
+    // splits `host.example.com:user` at its first label. Taking `@` first, and
+    // the *last* occurrence of the others, fixes both: a dotted hostname keeps
+    // its labels, and a dotted user name still yields the `@` form.
+    if let Some(index) = address.find('@') {
+        let (user, rest) = address.split_at(index);
+        let host = rest.get(1..).unwrap_or_default();
+        return (user.to_string(), host.to_string());
     }
+
+    for delimiter in ['!', ':', '.'] {
+        if let Some(index) = address.rfind(delimiter) {
+            let (host, rest) = address.split_at(index);
+            let user = rest.get(1..).unwrap_or_default();
+            return (user.to_string(), host.to_string());
+        }
+    }
+
+    (address.to_string(), my_machine_name.to_string())
 }
 
 /// Retrieves and sets the names for both local and remote users, updating the control message accordingly.
@@ -1867,6 +1869,7 @@ fn request(
                         // If we would block, check for timeout and continue
                         if start_time.elapsed() >= timeout {
                             eprintln!("Please check talk daemon status. Cannot connect to it!");
+                            restore_terminal();
                             process::exit(128);
                         }
 
@@ -1935,6 +1938,7 @@ fn request_local(
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                         if start_time.elapsed() >= timeout {
                             eprintln!("Local talkd daemon not responding. Is it running?");
+                            restore_terminal();
                             process::exit(128);
                         }
                         std::thread::sleep(Duration::from_millis(10));
@@ -1950,6 +1954,7 @@ fn request_local(
                     "Cannot connect to local talkd. Is it running at {:?}?",
                     socket_path
                 );
+                restore_terminal();
                 process::exit(128);
             }
             Err(e) => {
@@ -1981,7 +1986,23 @@ pub fn register_signals() {
                 eprintln!("Failed to register signal handler for signal {}", sig);
             }
         }
+
+        // Window resize (audit #TK9). Separate from the list above because the
+        // handler must not terminate: it only records that the geometry
+        // changed, and the render loops re-query and repaint when they notice.
+        if signal(libc::SIGWINCH, handle_winch as *const () as usize) == libc::SIG_ERR {
+            eprintln!("Failed to register signal handler for SIGWINCH");
+        }
     }
+}
+
+/// SIGWINCH handler: record the resize and return.
+///
+/// Async-signal-safe by construction -- a single atomic store, nothing else.
+/// The terminal is re-measured and repainted by whichever render loop observes
+/// the flag.
+extern "C" fn handle_winch(_signal_code: i32) {
+    RESIZED.store(true, Ordering::SeqCst);
 }
 
 /// Handles incoming signals by setting the interrupt flag and exiting the process.
@@ -2237,6 +2258,41 @@ mod tests {
             sent.extend(apply(c, &keys, win, &mut out).unwrap());
         }
         (String::from_utf8_lossy(&out).into_owned(), sent)
+    }
+
+    // ========================================================================
+    // Address parsing (audit #TK19)
+    // ========================================================================
+
+    #[test]
+    fn test_parse_address_bsd_precedence() {
+        let me = "myhost";
+        let cases: &[(&str, &str, &str)] = &[
+            // (input, expected user, expected host)
+            ("alice", "alice", "myhost"),
+            ("alice@host", "alice", "host"),
+            ("alice@host.example.com", "alice", "host.example.com"),
+            // '@' wins over a dot appearing earlier: this is the case the old
+            // leftmost-of-any-delimiter scan got wrong.
+            ("first.last@host", "first.last", "host"),
+            // Non-'@' forms are host-first, and use the *last* delimiter so a
+            // dotted hostname keeps its labels.
+            ("host!alice", "alice", "host"),
+            ("host:alice", "alice", "host"),
+            ("host.alice", "alice", "host"),
+            ("ns1.example.com!alice", "alice", "ns1.example.com"),
+            ("host.example.com:alice", "alice", "host.example.com"),
+            ("a.b.c.alice", "alice", "a.b.c"),
+        ];
+        for (input, want_user, want_host) in cases {
+            let (user, host) = parse_address(input, me);
+            assert_eq!(
+                (user.as_str(), host.as_str()),
+                (*want_user, *want_host),
+                "parsing {:?}",
+                input
+            );
+        }
     }
 
     #[test]

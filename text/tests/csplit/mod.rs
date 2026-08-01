@@ -324,3 +324,89 @@ fn test_csplit_bre_patterns() {
     std::fs::remove_file("bre_test00").unwrap();
     std::fs::remove_file("bre_test01").unwrap();
 }
+
+// ============================================================================
+// ASYNCHRONOUS EVENTS (audit #4)
+//
+// POSIX csplit: "If the -k option is specified, created files shall be
+// retained. Otherwise, the default action occurs." The -k clause only means
+// anything if the default is to remove them.
+// ============================================================================
+
+/// Run csplit against a slow stdin, interrupt it once some output files exist,
+/// and report which of them survived.
+fn csplit_interrupted(prefix: &str, extra: &[&str]) -> Vec<String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let bin = plib::testing::get_binary_path("csplit");
+    let mut args: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
+    args.extend([
+        "-f".into(),
+        prefix.into(),
+        "-".into(),
+        "2".into(),
+        "{*}".into(),
+    ]);
+
+    let mut child = Command::new(bin)
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn csplit");
+
+    // Feed enough lines to create several output files, then hold the pipe open
+    // so csplit is still running when the signal arrives.
+    {
+        let stdin = child.stdin.as_mut().expect("stdin");
+        for i in 0..8 {
+            writeln!(stdin, "line{}", i).unwrap();
+        }
+        stdin.flush().unwrap();
+    }
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    // `kill` rather than libc: this crate has no libc dev-dependency.
+    let _ = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status();
+    let _ = child.wait();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    let mut survivors = Vec::new();
+    for i in 0..16 {
+        let name = format!("{}{:02}", prefix, i);
+        if std::path::Path::new(&name).exists() {
+            survivors.push(name);
+        }
+    }
+    survivors
+}
+
+#[test]
+fn test_csplit_signal_removes_created_files() {
+    let survivors = csplit_interrupted("sigrm", &[]);
+    for name in &survivors {
+        let _ = std::fs::remove_file(name);
+    }
+    assert!(
+        survivors.is_empty(),
+        "created files must be removed when interrupted without -k, found: {:?}",
+        survivors
+    );
+}
+
+#[test]
+fn test_csplit_signal_keeps_created_files_with_k() {
+    let survivors = csplit_interrupted("sigkeep", &["-k"]);
+    let found = !survivors.is_empty();
+    for name in &survivors {
+        let _ = std::fs::remove_file(name);
+    }
+    assert!(
+        found,
+        "-k must retain created files when interrupted (POSIX ASYNCHRONOUS EVENTS)"
+    );
+}

@@ -14,6 +14,100 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, Error, ErrorKind, Read, Write};
 use std::path::PathBuf;
 
+/// Removal of created files when a signal arrives (audit #4).
+///
+/// POSIX csplit ASYNCHRONOUS EVENTS: "If the −k option is specified, created
+/// files shall be retained. Otherwise, the default action occurs." The `-k`
+/// clause is only meaningful if the default is to *remove* them — otherwise it
+/// would say nothing at all, since terminating by signal leaves files behind
+/// either way. That reading also matches CONSEQUENCES OF ERRORS ("created files
+/// shall be removed if an error occurs") and historical behaviour.
+///
+/// A signal handler may only call async-signal-safe functions, so nothing here
+/// allocates, locks, or formats. That rules out walking the `Vec<String>` of
+/// created names that `main` uses for the error path. It is not needed: a csplit
+/// filename is fully determined by the prefix, the suffix width, and a
+/// sequential index, so the handler rebuilds each name into a stack buffer and
+/// calls `unlink(2)` directly.
+mod cleanup {
+    use std::ptr;
+    use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+
+    /// Longest name csplit can create. `validate_prefix` bounds
+    /// prefix + suffix to NAME_MAX (255); one more byte holds the NUL.
+    const NAME_CAP: usize = 256;
+
+    static PREFIX_PTR: AtomicPtr<u8> = AtomicPtr::new(ptr::null_mut());
+    static PREFIX_LEN: AtomicUsize = AtomicUsize::new(0);
+    static SUFFIX_LEN: AtomicUsize = AtomicUsize::new(0);
+    static CREATED: AtomicUsize = AtomicUsize::new(0);
+
+    /// Record that one more output file now exists on disk.
+    pub fn note_created() {
+        CREATED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Arm the handler. Call once, before any output file is created, and only
+    /// when `-k` was not given.
+    pub fn arm(prefix: &str, suffix_len: u8) {
+        // Leaked deliberately: the handler may run at any point up to process
+        // exit, so this must outlive every other owner.
+        let bytes: &'static mut [u8] = Vec::leak(prefix.as_bytes().to_vec());
+        PREFIX_PTR.store(bytes.as_mut_ptr(), Ordering::SeqCst);
+        PREFIX_LEN.store(bytes.len(), Ordering::SeqCst);
+        SUFFIX_LEN.store(suffix_len as usize, Ordering::SeqCst);
+
+        for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
+            unsafe { install(sig) };
+        }
+    }
+
+    unsafe fn install(signum: libc::c_int) {
+        let mut act: libc::sigaction = std::mem::zeroed();
+        // Cast via an explicit fn pointer: casting a function *item* straight to
+        // an integer trips the `function_casts_as_integer` lint.
+        let entry: extern "C" fn(libc::c_int) = handler;
+        act.sa_sigaction = entry as libc::sighandler_t;
+        act.sa_flags = 0;
+        libc::sigemptyset(&mut act.sa_mask);
+        libc::sigaction(signum, &act, ptr::null_mut());
+    }
+
+    extern "C" fn handler(signum: libc::c_int) {
+        let prefix = PREFIX_PTR.load(Ordering::SeqCst);
+        let plen = PREFIX_LEN.load(Ordering::SeqCst);
+        let slen = SUFFIX_LEN.load(Ordering::SeqCst);
+        let created = CREATED.load(Ordering::SeqCst);
+
+        if !prefix.is_null() && plen + slen < NAME_CAP {
+            let mut name = [0u8; NAME_CAP];
+            // SAFETY: `prefix` points to a leaked allocation of `plen` bytes,
+            // and `plen + slen < NAME_CAP` was just checked.
+            unsafe { ptr::copy_nonoverlapping(prefix, name.as_mut_ptr(), plen) };
+
+            for index in 0..created {
+                // Zero-padded decimal, written right to left. Doing it by hand
+                // keeps the handler free of formatting machinery.
+                let mut value = index;
+                for digit in (0..slen).rev() {
+                    name[plen + digit] = b'0' + (value % 10) as u8;
+                    value /= 10;
+                }
+                name[plen + slen] = 0;
+                unsafe { libc::unlink(name.as_ptr() as *const libc::c_char) };
+            }
+        }
+
+        // "Otherwise, the default action occurs": restore the default
+        // disposition and re-raise, so the process really does die by this
+        // signal and its wait status says so.
+        unsafe {
+            libc::signal(signum, libc::SIG_DFL);
+            libc::raise(signum);
+        }
+    }
+}
+
 /// csplit - split files based on context
 #[derive(Parser)]
 #[command(version, about = gettext("csplit - split files based on context"))]
@@ -394,7 +488,12 @@ fn process_lines(
 ) -> io::Result<()> {
     let file_name = state.open_output()?;
     state.outf.as_mut().unwrap().write_all(lines.as_bytes())?;
-    new_files.push(file_name);
+    // `open_output` returns an empty name when a file was already open, which is
+    // not a newly created file and must not reach the cleanup list.
+    if !file_name.is_empty() {
+        new_files.push(file_name);
+        cleanup::note_created();
+    }
     if !suppress {
         println!("{}", lines.len());
     }
@@ -637,6 +736,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ctx = parse_operands(&args)?;
 
+    // Arm signal cleanup before the first output file can exist. Skipped
+    // entirely under -k, which requires created files to be retained.
+    if !args.keep {
+        cleanup::arm(&args.prefix, args.num);
+    }
+
     let mut exit_code = 0;
     let mut new_files = vec![];
     if let Err(err) = csplit_file(&args, ctx, &mut new_files) {
@@ -644,7 +749,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("{}: {}", args.filename.display(), err);
         if !args.keep {
             for file_name in new_files.iter() {
-                fs::remove_file(file_name).unwrap();
+                // Tolerate an already-absent file: unlinking is best effort, and
+                // panicking here would replace the real diagnostic with a trace.
+                let _ = fs::remove_file(file_name);
             }
         }
     }

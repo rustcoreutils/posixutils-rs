@@ -13,7 +13,7 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use posixutils_cc::parse::ast::{ExprKind, ExternalDecl, Stmt};
 use posixutils_cc::parse::Parser as CParser;
 use posixutils_cc::strings::StringTable;
@@ -486,7 +486,7 @@ fn process_file(
     let ast = match parser.parse_translation_unit() {
         Ok(ast) => ast,
         Err(e) => {
-            eprintln!("cflow: {}: parse error: {}", path, e);
+            plib::diag::error(&format!("{}: {}: {}", path, gettext("parse error"), e));
             return Ok(());
         }
     };
@@ -624,9 +624,7 @@ fn print_reverse_flowgraph(graph: &CallGraph) {
 // ============================================================================
 
 fn main() -> ExitCode {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs").unwrap();
-    bind_textdomain_codeset("posixutils-rs", "UTF-8").unwrap();
+    plib::diag::init_locale("cflow");
 
     let args = Args::parse();
 
@@ -654,14 +652,18 @@ fn main() -> ExitCode {
                     &args.undefines,
                     &args.include_paths,
                 ) {
-                    eprintln!("cflow: {}: {}", file, e);
+                    plib::diag::error(&format!("{}: {}", file, e));
                 }
             }
             "s" => {
-                eprintln!("cflow: {}: assembly files not supported", file);
+                plib::diag::error(&format!(
+                    "{}: {}",
+                    file,
+                    gettext("assembly files not supported")
+                ));
             }
             _ => {
-                eprintln!("cflow: {}: unknown file type", file);
+                plib::diag::error(&format!("{}: {}", file, gettext("unknown file type")));
             }
         }
     }
@@ -688,5 +690,17 @@ fn main() -> ExitCode {
         }
     }
 
-    ExitCode::SUCCESS
+    exit_code()
+}
+
+/// Combine this utility's own diagnostics with any emitted by the C front end
+/// (undeclared identifiers and friends are reported by `posixutils_cc::diag`,
+/// which keeps its own counter). POSIX requires a non-zero status when either
+/// has fired.
+fn exit_code() -> ExitCode {
+    if plib::diag::has_errors() || posixutils_cc::diag::has_error() != 0 {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
 }

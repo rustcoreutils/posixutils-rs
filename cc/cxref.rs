@@ -13,7 +13,7 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use posixutils_cc::parse::ast::{ExprKind, ExternalDecl, Stmt};
 use posixutils_cc::parse::Parser as CParser;
 use posixutils_cc::strings::StringTable;
@@ -398,7 +398,7 @@ fn process_file(
     let ast = match parser.parse_translation_unit() {
         Ok(ast) => ast,
         Err(e) => {
-            eprintln!("cxref: {}: parse error: {}", path, e);
+            plib::diag::error(&format!("{}: {}: {}", path, gettext("parse error"), e));
             return Ok(());
         }
     };
@@ -527,9 +527,7 @@ fn print_xref(xref: &CrossRef, width: usize, silent: bool, output: &mut dyn Writ
 // ============================================================================
 
 fn main() -> ExitCode {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs").unwrap();
-    bind_textdomain_codeset("posixutils-rs", "UTF-8").unwrap();
+    plib::diag::init_locale("cxref");
 
     let args = Args::parse();
 
@@ -543,7 +541,7 @@ fn main() -> ExitCode {
                 output_file = Box::new(f);
             }
             Err(e) => {
-                eprintln!("cxref: cannot open {}: {}", path, e);
+                plib::diag::error(&format!("{}: {}: {}", path, gettext("cannot open"), e));
                 return ExitCode::from(1);
             }
         }
@@ -571,7 +569,7 @@ fn main() -> ExitCode {
                     &args.undefines,
                     &args.include_paths,
                 ) {
-                    eprintln!("cxref: {}: {}", file, e);
+                    plib::diag::error(&format!("{}: {}", file, e));
                 }
 
                 // In non-combined mode, print and reset after each file
@@ -581,7 +579,7 @@ fn main() -> ExitCode {
                 }
             }
             _ => {
-                eprintln!("cxref: {}: not a C source file", file);
+                plib::diag::error(&format!("{}: {}", file, gettext("not a C source file")));
             }
         }
     }
@@ -591,5 +589,15 @@ fn main() -> ExitCode {
         print_xref(&xref, args.width, args.silent, &mut *output_file);
     }
 
-    ExitCode::SUCCESS
+    exit_code()
+}
+
+/// Combine this utility's own diagnostics with any emitted by the C front end.
+/// POSIX requires a non-zero status when either has fired.
+fn exit_code() -> ExitCode {
+    if plib::diag::has_errors() || posixutils_cc::diag::has_error() != 0 {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
 }

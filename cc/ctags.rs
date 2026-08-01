@@ -13,7 +13,7 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use posixutils_cc::parse::ast::ExternalDecl;
 use posixutils_cc::parse::Parser as CParser;
 use posixutils_cc::strings::StringTable;
@@ -142,7 +142,7 @@ fn process_file(path: &str, streams: &mut StreamTable) -> io::Result<Vec<TagEntr
     let ast = match parser.parse_translation_unit() {
         Ok(ast) => ast,
         Err(e) => {
-            eprintln!("ctags: {}: parse error: {}", path, e);
+            plib::diag::error(&format!("{}: {}: {}", path, gettext("parse error"), e));
             return Ok(tags);
         }
     };
@@ -275,9 +275,7 @@ fn extract_macro_tags(lines: &[String], path: &str, tags: &mut Vec<TagEntry>) {
 // ============================================================================
 
 fn main() -> ExitCode {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs").unwrap();
-    bind_textdomain_codeset("posixutils-rs", "UTF-8").unwrap();
+    plib::diag::init_locale("ctags");
 
     let args = Args::parse();
 
@@ -300,15 +298,22 @@ fn main() -> ExitCode {
                     }
                 }
                 Err(e) => {
-                    eprintln!("ctags: {}: {}", file, e);
+                    plib::diag::error(&format!("{}: {}", file, e));
                 }
             },
             "f" => {
-                // FORTRAN support - not implemented
-                eprintln!("ctags: {}: FORTRAN files not supported", file);
+                // FORTRAN is not mandated by POSIX.1-2024 (it appears only in
+                // RATIONALE as something historical implementations understood).
+                // Refusing it is a valid implementation-defined choice, but it
+                // is still an error for this invocation.
+                plib::diag::error(&format!(
+                    "{}: {}",
+                    file,
+                    gettext("FORTRAN files not supported")
+                ));
             }
             _ => {
-                eprintln!("ctags: {}: unknown file type", file);
+                plib::diag::error(&format!("{}: {}", file, gettext("unknown file type")));
             }
         }
     }
@@ -333,17 +338,37 @@ fn main() -> ExitCode {
             Ok(mut file) => {
                 for tag in all_tags.values() {
                     if let Err(e) = writeln!(file, "{}", tag.format_tags()) {
-                        eprintln!("ctags: error writing to {}: {}", args.tags_file, e);
+                        plib::diag::error(&format!(
+                            "{}: {}: {}",
+                            args.tags_file,
+                            gettext("error writing"),
+                            e
+                        ));
                         return ExitCode::from(1);
                     }
                 }
             }
             Err(e) => {
-                eprintln!("ctags: cannot open {}: {}", args.tags_file, e);
+                plib::diag::error(&format!(
+                    "{}: {}: {}",
+                    args.tags_file,
+                    gettext("cannot open"),
+                    e
+                ));
                 return ExitCode::from(1);
             }
         }
     }
 
-    ExitCode::SUCCESS
+    exit_code()
+}
+
+/// Combine this utility's own diagnostics with any emitted by the C front end.
+/// POSIX requires a non-zero status when either has fired.
+fn exit_code() -> ExitCode {
+    if plib::diag::has_errors() || posixutils_cc::diag::has_error() != 0 {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
 }

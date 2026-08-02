@@ -212,15 +212,18 @@ impl ArchiveMember {
         // format definition taken from: https://en.wikipedia.org/wiki/Ar_(Unix)
 
         // Since we are using the System V (or GNU) archive format, the data section
-        // needs to be 2 byte aligned, if it isn't we add a newline as filler
-        let size = self.size + (self.data.len() % 2) as u64;
-
+        // needs to be 2 byte aligned, if it isn't we add a newline as filler.
+        //
+        // #A13: the header `size` field is the *payload* size. The alignment pad
+        // written below is not part of the member and must not be counted, or
+        // every reader hands the pad byte back as data -- `ar -x` then writes a
+        // file one byte too long, and each rewrite appends another newline.
         writer.write_all(&format_name_for_header(&self.name, long_name_offset)?)?;
         writer.write_all(&pad_metadata_with_spaces::<12>(self.date.to_string())?)?;
         writer.write_all(&pad_metadata_with_spaces::<6>(self.uid.to_string())?)?;
         writer.write_all(&pad_metadata_with_spaces::<6>(self.gid.to_string())?)?;
         writer.write_all(&pad_metadata_with_spaces::<8>(format!("{:o}", self.mode))?)?;
-        writer.write_all(&pad_metadata_with_spaces::<10>(size.to_string())?)?;
+        writer.write_all(&pad_metadata_with_spaces::<10>(self.size.to_string())?)?;
         writer.write_all(&object::archive::TERMINATOR)?;
         writer.write_all(&self.data)?;
         if self.data.len() % 2 != 0 {
@@ -653,7 +656,7 @@ fn quick_append_cmd(args: QuickAppendArgs) -> ArResult<()> {
         Archive::read_from_file(archive_path)?
     } else {
         if !args.no_create_message {
-            eprintln!("ar: creating {}", archive_path.display());
+            eprintln!("ar: {} {}", gettext("creating"), archive_path.display());
         }
         Archive::default()
     };
@@ -810,7 +813,7 @@ fn list_cmd(args: ListArgs) -> ArResult<()> {
             } else {
                 return Err(format!(
                     "{}: {}",
-                    archive_path.display(),
+                    file.to_string_lossy(),
                     gettext("No such file or directory")
                 )
                 .into());

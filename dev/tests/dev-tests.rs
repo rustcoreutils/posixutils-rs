@@ -940,6 +940,153 @@ fn test_ar_bundled_mode_flags() {
     assert_eq!(String::from_utf8_lossy(&dv.stdout), "d - m.o\n");
 }
 
+/// Build an archive from `(name, contents)` pairs and return (dir, archive path).
+fn ar_make_archive(members: &[(&str, &[u8])]) -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut argv = vec!["-r".to_string(), "-c".to_string()];
+    let arc = dir.path().join("a.a");
+    argv.push(arc.to_str().unwrap().to_string());
+    for (name, data) in members {
+        let p = dir.path().join(name);
+        fs::write(&p, data).unwrap();
+        argv.push(p.to_str().unwrap().to_string());
+    }
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_ar"))
+        .args(&argv)
+        .output()
+        .expect("run ar -rc");
+    assert!(
+        out.status.success(),
+        "ar -rc failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (dir, arc)
+}
+
+#[test]
+fn test_ar_odd_length_member_roundtrip() {
+    // #A13: the header `size` field is the payload size; the 2-byte alignment
+    // pad is not part of the member. Counting the pad made `ar -x` write an
+    // extra trailing newline for every odd-length member.
+    let payload: &[u8] = b"odd";
+    assert_eq!(payload.len() % 2, 1, "fixture must be odd-length");
+    let (dir, arc) = ar_make_archive(&[("odd.txt", payload), ("even.txt", b"even")]);
+
+    let xdir = dir.path().join("x");
+    fs::create_dir(&xdir).unwrap();
+    let x = std::process::Command::new(env!("CARGO_BIN_EXE_ar"))
+        .args(["-x", arc.to_str().unwrap()])
+        .current_dir(&xdir)
+        .output()
+        .expect("run ar -x");
+    assert!(
+        x.status.success(),
+        "ar -x failed: {}",
+        String::from_utf8_lossy(&x.stderr)
+    );
+
+    let extracted = fs::read(xdir.join("odd.txt")).unwrap();
+    assert_eq!(
+        extracted,
+        payload,
+        "odd-length member must extract byte-identical (got {} bytes, want {})",
+        extracted.len(),
+        payload.len()
+    );
+    assert_eq!(fs::read(xdir.join("even.txt")).unwrap(), b"even");
+}
+
+#[test]
+fn test_ar_odd_length_member_size_field_excludes_pad() {
+    // #A13, at the byte level: the ASCII size field must read the payload
+    // length, with the pad newline following the payload uncounted.
+    let (_dir, arc) = ar_make_archive(&[("odd.txt", b"odd")]);
+    let raw = fs::read(&arc).unwrap();
+    let text = String::from_utf8_lossy(&raw);
+    let hdr = text
+        .find("odd.txt/")
+        .expect("member header must be present in the archive");
+    // Header layout after the 16-byte name: 12 date + 6 uid + 6 gid + 8 mode,
+    // then the 10-byte size field.
+    let size_at = hdr + 16 + 12 + 6 + 6 + 8;
+    let size_field = text[size_at..size_at + 10].trim();
+    assert_eq!(
+        size_field, "3",
+        "size field must be the unpadded payload length, got {:?}",
+        size_field
+    );
+}
+
+#[test]
+fn test_ar_repeated_rewrite_is_stable() {
+    // #A13: mis-counting the pad byte made each rewrite re-read the pad as
+    // payload, growing every odd-length member by one newline per pass.
+    let (dir, arc) = ar_make_archive(&[("odd.txt", b"odd")]);
+    let extra = dir.path().join("extra.txt");
+    fs::write(&extra, b"even").unwrap();
+
+    // Sample the size *before* the first rewrite: the pad byte is absorbed on
+    // pass one and the archive is stable thereafter, so a post-rewrite-only
+    // sample would miss the growth entirely.
+    let mut sizes = vec![fs::metadata(&arc).unwrap().len()];
+    for _ in 0..3 {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_ar"))
+            .args(["-r", arc.to_str().unwrap(), extra.to_str().unwrap()])
+            .output()
+            .expect("run ar -r");
+        assert!(
+            out.status.success(),
+            "ar -r failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        sizes.push(fs::metadata(&arc).unwrap().len());
+    }
+    // extra.txt is added once on the first pass, so allow that one delta and
+    // require every later pass to be a no-op in size terms.
+    assert!(
+        sizes[1..].iter().all(|s| *s == sizes[1]),
+        "archive size must not grow across repeated rewrites: {:?}",
+        sizes
+    );
+
+    // The odd-length member must still be exactly its original payload.
+    let xdir = dir.path().join("x");
+    fs::create_dir(&xdir).unwrap();
+    let x = std::process::Command::new(env!("CARGO_BIN_EXE_ar"))
+        .args(["-x", arc.to_str().unwrap(), "odd.txt"])
+        .current_dir(&xdir)
+        .output()
+        .expect("run ar -x");
+    assert!(
+        x.status.success(),
+        "ar -x failed: {}",
+        String::from_utf8_lossy(&x.stderr)
+    );
+    assert_eq!(
+        fs::read(xdir.join("odd.txt")).unwrap(),
+        b"odd",
+        "odd-length member must survive repeated archive rewrites unchanged"
+    );
+}
+
+#[test]
+fn test_ar_list_missing_operand_names_the_operand() {
+    // #A14: `ar -t arc nosuch.o` must name the missing operand, not the
+    // archive (which exists and was read successfully).
+    let (_dir, arc) = ar_make_archive(&[("present.o", b"data")]);
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_ar"))
+        .args(["-t", arc.to_str().unwrap(), "nosuch.o"])
+        .output()
+        .expect("run ar -t");
+    assert!(!out.status.success(), "missing operand must fail");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("nosuch.o"),
+        "diagnostic must name the missing operand: {}",
+        err
+    );
+}
+
 #[test]
 fn test_ar_move_verbose() {
     // #A5: ar -m -v reports each moved member as "m - <name>".

@@ -823,6 +823,14 @@ mod word_expansion {
             include_str!("sh/word_expansion/variable_expansion.out"),
         );
     }
+
+    #[test]
+    fn field_splitting_can_create_empty_fields() {
+        test_script(
+            include_str!("sh/word_expansion/field_splitting_can_create_empty_fields.sh"),
+            include_str!("sh/word_expansion/field_splitting_can_create_empty_fields.out"),
+        );
+    }
 }
 
 mod redirection {

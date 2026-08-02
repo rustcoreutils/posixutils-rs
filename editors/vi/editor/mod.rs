@@ -1873,6 +1873,9 @@ impl Editor {
         if !pattern.is_empty() {
             self.search.set_pattern(&pattern, dir)?;
             self.registers.set_search(&pattern);
+            // POSIX's "last RE used in the editor" spans searches as well as
+            // substitutes, which is what `~` and an empty `s//` pattern reuse.
+            self.set_last_regex(&pattern);
         }
         self.search_next(dir)?;
         if offset != 0 {
@@ -2267,6 +2270,27 @@ impl Editor {
                 self.execute_ex_repeat_substitute(&range, &flags)?;
                 Ok(ExResult::Continue)
             }
+            ExCommand::TildeSubstitute { range, flags } => {
+                // `~` pairs the previous *replacement* with the last RE, which
+                // may have come from a search rather than a substitute -- that
+                // is what distinguishes it from `&` (#X18).
+                let pattern = self
+                    .last_regex()
+                    .ok_or(ViError::NoPreviousSearch)?
+                    .to_string();
+                let replacement = self
+                    .last_substitution
+                    .as_ref()
+                    .map(|l| l.replacement.clone())
+                    .ok_or(ViError::NoPreviousSubstitution)?;
+                self.substitute(&range, &pattern, &replacement, &flags)?;
+                let printed = std::mem::take(&mut self.substitute_output);
+                if printed.is_empty() {
+                    Ok(ExResult::Continue)
+                } else {
+                    Ok(ExResult::CommandOutput(printed))
+                }
+            }
             ExCommand::Nop => Ok(ExResult::Continue),
             ExCommand::Tag { tag } => {
                 self.goto_tag(&tag)?;
@@ -2343,8 +2367,17 @@ impl Editor {
             if let Ok(home) = std::env::var("HOME") {
                 if !home.is_empty() {
                     let exrc_path = format!("{}/.exrc", home);
-                    if let Some(content) = crate::config::read_safe_exrc(&exrc_path) {
-                        let _ = self.execute_source_content(&content);
+                    match crate::config::read_safe_exrc(&exrc_path) {
+                        Ok(Some(content)) => {
+                            let _ = self.execute_source_content(&content);
+                        }
+                        // Absent or deliberately skipped for safety: silent.
+                        Ok(None) => {}
+                        // Exists but unreadable -- say so rather than start up
+                        // as though the user had no configuration (#X21).
+                        Err(e) => {
+                            eprintln!("{}: {}", exrc_path, e);
+                        }
                     }
                 }
             }
@@ -2354,8 +2387,14 @@ impl Editor {
         if self.options.exrc {
             let local_exrc = ".exrc";
             if !crate::config::is_same_file_as_home_exrc(local_exrc) {
-                if let Some(content) = crate::config::read_safe_exrc(local_exrc) {
-                    let _ = self.execute_source_content(&content);
+                match crate::config::read_safe_exrc(local_exrc) {
+                    Ok(Some(content)) => {
+                        let _ = self.execute_source_content(&content);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        eprintln!("{}: {}", local_exrc, e);
+                    }
                 }
             }
         }
@@ -2411,8 +2450,15 @@ impl Editor {
     fn execute_shell_read(&mut self, line: Option<usize>, command: &str) -> Result<()> {
         use crate::buffer::Line;
 
-        // Capture command output
-        let output = self.shell.execute_capture(command)?;
+        // #V18: the child inherits our stdin now (#X23), so it must not find
+        // the terminal in raw mode. `execute_shell_command` already brackets
+        // its child this way; this path did not.
+        let was_raw = self.terminal.disable_raw_mode().is_ok();
+        let output = self.shell.execute_capture(command);
+        if was_raw {
+            let _ = self.terminal.enable_raw_mode();
+        }
+        let output = output?;
 
         if !output.success {
             self.set_error(&format!("shell returned {}", output.exit_code));

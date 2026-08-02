@@ -325,29 +325,6 @@ impl WriteStats {
     }
 }
 
-/// Read output of a shell command into buffer.
-pub fn read_shell_output(buffer: &mut Buffer, line_num: usize, command: &str) -> Result<usize> {
-    use std::process::Command;
-
-    let output = Command::new("sh").arg("-c").arg(command).output()?;
-
-    if !output.status.success() {
-        return Err(ViError::InvalidCommand(
-            String::from_utf8_lossy(&output.stderr).to_string(),
-        ));
-    }
-
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut count = 0;
-
-    for (i, line) in text.lines().enumerate() {
-        buffer.insert_line_after(line_num + i, Line::from(line));
-        count += 1;
-    }
-
-    Ok(count)
-}
-
 /// Write buffer range to a shell command.
 pub fn write_shell_input(
     buffer: &Buffer,

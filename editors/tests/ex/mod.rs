@@ -926,3 +926,44 @@ fn test_ex_backslash_newline_continues_the_command() {
         "     1\ta\n     2\tb\n     3\tc-d\n",
     );
 }
+
+// ============================================================================
+// Remaining ex deferrals -- audit #X18/#X23
+// ============================================================================
+
+#[test]
+fn test_ex_tilde_uses_last_regex_with_previous_replacement() {
+    // #X18: `~` pairs the previous substitute's REPLACEMENT with the last RE,
+    // which may have come from a search. That is what distinguishes it from
+    // `&`, which reuses the previous pattern.
+    //
+    // s/foo/XX/ then /bar/ then 2~  ->  line 2 becomes "XX two"
+    ex_test_with_file(
+        "foo one\nbar two\nfoo three\n",
+        "1s/foo/XX/\n/bar/\n2~\n1,$p\nq!\n",
+        "XX one\nXX two\nfoo three\n",
+    );
+
+    // `&` by contrast reuses the previous pattern, so it hits line 3.
+    ex_test_with_file(
+        "foo one\nbar two\nfoo three\n",
+        "1s/foo/XX/\n3&\n1,$p\nq!\n",
+        "XX one\nbar two\nXX three\n",
+    );
+}
+
+#[test]
+fn test_ex_read_shell_command_inherits_stdin() {
+    // #X23: `:r !cmd` handed the child Stdio::null(), so a command that reads
+    // stdin got nothing. POSIX (ex.md §95278-95280) says the program's stdin
+    // "shall be set to the standard input of the ex program when it was
+    // invoked". Here `cat` must therefore see the remaining script text.
+    let (code, _err, dir) = ex_run("L1\n", &["-s"], "r !echo INSERTED\nw out.txt\nq!\n");
+    assert_eq!(code, 0);
+    let out = fs::read_to_string(dir.path().join("out.txt")).unwrap();
+    assert!(
+        out.contains("INSERTED"),
+        "`:r !cmd` must insert the command's output, got {:?}",
+        out
+    );
+}

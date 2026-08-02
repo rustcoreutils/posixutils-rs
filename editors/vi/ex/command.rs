@@ -209,6 +209,15 @@ pub enum ExCommand {
         range: AddressRange,
         flags: SubstituteFlags,
     },
+    /// Repeat the previous substitute's replacement against the last RE (`:~`).
+    ///
+    /// Distinct from `&`: that reuses the previous *pattern* and replacement,
+    /// while `~` takes the pattern from the most recent RE, which may have come
+    /// from a search (#X18).
+    TildeSubstitute {
+        range: AddressRange,
+        flags: SubstituteFlags,
+    },
     /// No operation (empty command).
     Nop,
 }

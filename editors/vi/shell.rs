@@ -165,10 +165,14 @@ impl ShellExecutor {
         // Save as last command
         self.last_command = Some(expanded.clone());
 
+        // #X23: POSIX (ex.md §95278-95280) says the program's standard input
+        // "shall be set to the standard input of the ex program when it was
+        // invoked", so inherit it rather than handing the child /dev/null --
+        // that is what makes `:r !cat` and `:r !sed ...` work at all.
         let output = Command::new(&self.shell)
             .arg("-c")
             .arg(&expanded)
-            .stdin(Stdio::null())
+            .stdin(Stdio::inherit())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()

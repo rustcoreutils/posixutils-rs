@@ -339,6 +339,17 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
             Ok(ExCommand::RepeatSubstitute { range, flags })
         }
 
+        // Repeat substitute with the LAST RE rather than the previous
+        // substitute's pattern (#X18). `&` reuses both pattern and
+        // replacement; `~` reuses the replacement but takes the pattern from
+        // the most recent RE, whether that came from a search or a substitute.
+        "~" => {
+            let (flags_str, line_count) = split_subst_flags(args);
+            let mut flags = SubstituteFlags::parse(&flags_str);
+            flags.line_count = line_count;
+            Ok(ExCommand::TildeSubstitute { range, flags })
+        }
+
         // Print with line numbers (#) - alias for number
         "#" => Ok(ExCommand::Number {
             range,
@@ -361,6 +372,7 @@ fn split_command(input: &str) -> (&str, &str) {
         Some('@') => return ("@", input[1..].trim_start()),
         Some('*') => return ("*", input[1..].trim_start()),
         Some('&') => return ("&", input[1..].trim_start()),
+        Some('~') => return ("~", input[1..].trim_start()),
         Some('#') => return ("#", input[1..].trim_start()),
         _ => {}
     }

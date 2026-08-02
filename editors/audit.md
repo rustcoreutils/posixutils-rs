@@ -19,6 +19,59 @@ via the CLI). Lines marked *(verified)* were confirmed by running the binary;
 
 ---
 
+## Closeout (2026-08-02)
+
+All three utilities closed out across ten phases. Two things are worth
+recording.
+
+**1. Several recorded blockers were wrong.** #X10's "requires threading the
+separator through `AddressRange`" was a non-issue — all five constructors live
+in `address.rs` and no struct literal exists elsewhere. #X15's "needs command
+context threaded into resolution" was factually wrong — `a`/`i`/`=`/`put` never
+called `resolve` at all. And the `;`-vs-`,` bug was in the **comma** path, the
+opposite of what #X10 said. #X12's claim that the `c`/`p` flags "work" was
+false: both were dead code with zero call sites.
+
+**2. Auditing the audit found 14 defects no finding list contained.** One was
+silent data loss.
+
+| New | Sev | Summary |
+|---|---|---|
+| #X24 | **Critical** | `:1,5w out` silently wrote the **entire buffer**; `file::write_range` existed, was tested, and had zero callers |
+| #X25 | Major | ex insert-class commands ignored every non-literal address — `$a` appended after line **1** |
+| #X26 | Major | substitute `c` and `p` flags were parsed, stored, and dead |
+| #X27 | Major | `:set ro` did not block `:w` (only `-R` did) |
+| #V17 | Major | `s`/`S` were un-undoable and ignored counts and registers |
+| #X28 | Minor | a substitute's pattern did not become the last RE |
+| #X29 | Minor | `:x` always wrote; `x!`/`xit!` were unparsed |
+| #X30 | Minor | a multibyte mark name panicked the address parser |
+| #X31 | Minor | `read_shell_output` was a dead duplicate carrying the same defect |
+| #V18 | Minor | `:r !cmd` did not drop raw mode around the child |
+| #V19 | Minor | a second `u` after any change operator empties the line *(still open)* |
+| — | Minor | `:l` was not unambiguous: caret notation, unescaped `\` and `$` |
+| — | Minor | `@@` failed with `Buffer "@" is empty` |
+| — | Minor | `j` implemented one of POSIX's five join rules |
+
+Every fix was confirmed to fail against the pre-fix code before being
+accepted. Where a reference existed it was used: `vim -e` for addressing and
+write rules, and the spec's own worked examples for substitute case
+conversion (ex.md §95726-95732), which now reproduce byte-for-byte. `vim -e`
+was **rejected** as an oracle for substitute — in this harness it does not
+apply even a plain `s/foo/XXX/`.
+
+**Deferrals reconsidered, per instruction.** All ten recorded deferrals are
+closed. #X12's `\n` buffer-splitting required a new `ChangeKind::ReplaceLines`
+in the undo model, which was the honest reason it had been deferred. `TERM`
+terminfo is the one item accepted as a deliberate non-goal, with rationale
+recorded inline.
+
+**Remaining open: 3**, all genuine and itemized — #V19, the insert-mode
+`^V`/`^D`/autoindent partials, and the remaining ex command modifier gaps
+(that box was one opaque checkbox covering ~15 commands; it is now a named
+list, with `j`, `q`, `r`, `w`/`wq`/`x`, `l` and `@@` struck off).
+
+---
+
 ## Cross-cutting themes
 
 Four patterns recur across all three editors. Fixing them at the shared layer
@@ -68,9 +121,9 @@ in vi still uses Rust built-ins (minor; not a spec `shall`).
 
 ## `ed`
 
-**Implementation:** `ed_main.rs` (118) + `ed/editor.rs` (1674) + `ed/parser.rs`
-(883) + `ed/buffer.rs` (550) + `ed/error.rs` (66)
-**Tests:** `tests/ed/mod.rs` (1394)
+**Implementation:** `ed_main.rs` (122) + `ed/editor.rs` (1732) + `ed/parser.rs`
+(883) + `ed/buffer.rs` (550) + `ed/error.rs` (69) + `ed/mod.rs` (19)
+**Tests:** `tests/ed/mod.rs` (1527, 157 tests)
 **Spec slice:** `…/3-utilities/ed.md`
 
 ### TL;DR
@@ -134,16 +187,16 @@ diverge.
 - [x] `a c d i j k l m n p P t = ` CONFORMS — see `buffer.rs`/`editor.rs` per command.
 - [x] `e E f r w W` CONFORMS — incl. `r !cmd`/`w !cmd` shell forms (`editor.rs:622-691`).
 - [x] `g v` CONFORMS — mark-then-iterate (`editor.rs:1186-1375`).
-- [ ] **`G V` PARTIAL** — #E6.
+- [x] **`G V`** — ✓ #E6 fixed; `test_ed_global_interactive_forbids_append`.
 - [x] `h H P q Q u` CONFORMS.
 - [x] **`s` — BRE engine + count fixed (phase 1)**; #E3 (no-op marks modified) lands in phase 2. Flags `g p l n % & \&` and `\<newline>` split CONFORM.
 - [x] `!cmd` CONFORMS — `%`/`!` expansion, completion marker (`editor.rs:710-775`).
-- [ ] `x z #` are non-POSIX extensions (treated as wq / scroll / null) — N/A, harmless.
+- [x] `x z #` are non-POSIX extensions (treated as wq / scroll / null) — N/A, harmless. *Not a finding; ticked so it stops reading as open work.*
 
 #### Addressing
 - [x] `. $ n 'x +n -n + - , ;` and `/re/`,`?re?` wrap CONFORM — `parser.rs`, `editor.rs:265-391`.
-- [ ] **Intermediate out-of-range DIVERGES** — #E7.
-- [ ] **Compound `,,`/`;;` MISSING** — #E10.
+- [x] **Intermediate out-of-range** — ✓ #E7 fixed; `test_ed_intermediate_address_out_of_range_ok`.
+- [x] **Compound `,,`/`;;`** — ✓ #E10 examined and conforming; `test_ed_comma_separator`, `test_ed_semicolon_separator`, `test_ed_semicolon_with_offset`, `test_ed_semicolon_current_line`.
 
 #### EXIT STATUS / CONSEQUENCES OF ERRORS
 - [x] **Command errors exit 0** — ✓ fixed (phase 2), #E2.
@@ -151,11 +204,11 @@ diverge.
 
 ### Test coverage signal
 Not covered:
-- [ ] BRE-specific patterns (`\(\)`, `\{n,m\}`, back-refs) — would catch #E1.
-- [ ] Exit status after a command error — would catch #E2.
-- [ ] Identical-result substitute (`s/x/x/`) — would catch #E3.
-- [ ] EOF behavior in command/input mode — #E4/#E5.
-- [ ] `G`/`V` forbidden sub-commands — #E6.
+- [x] BRE-specific patterns (`\(\)`, `\{n,m\}`, back-refs) — `test_ed_bre_backreference_pattern`, `test_ed_bre_grouping_address`, `test_ed_bre_interval_address`, `test_ed_sub_backreference_replacement`.
+- [x] Exit status after a command error — `test_ed_exit_status_on_command_error`, `test_ed_exit_status_clean_is_zero`.
+- [x] Identical-result substitute (`s/x/x/`) — `test_ed_identity_substitute_marks_modified`, `test_ed_sub_identity_is_not_error`.
+- [x] EOF behavior in command/input mode — `test_ed_eof_acts_as_quit_warns_when_modified`, `test_ed_eof_in_input_mode_finalizes_append`, `test_ed_eof_in_input_mode_terminates_then_quits`.
+- [x] `G`/`V` forbidden sub-commands — `test_ed_global_interactive_forbids_append`.
 
 ### Suggested PR groupings
 - **PR ed-A — "BRE engine"**: #E1 (+ #E9 count rework, #E8 collation).
@@ -167,11 +220,11 @@ Not covered:
 
 ## `vi`
 
-**Implementation:** `vi_main.rs` (16) + `vi/` ≈ 14.3k lines (entry/dispatch
+**Implementation:** `vi_main.rs` (25) + `vi/` ≈ 15.8k lines (entry/dispatch
 `lib.rs`, `editor/`, `command/`, `mode/`, `buffer/`, `ui/`, `input/`, `search.rs`,
 `options.rs`, `file.rs`, `register.rs`, `undo.rs`, `shell.rs`, `config.rs`).
-**Tests:** `tests/integration/mod.rs` (2043), `tests/pty/mod.rs` (254),
-`tests/headless/mod.rs` (797)
+**Tests:** `tests/integration/mod.rs` (2052), `tests/pty/mod.rs` (377+),
+`tests/headless/mod.rs` (806+)
 **Spec slice:** `…/3-utilities/vi.md`
 
 ### TL;DR
@@ -214,7 +267,7 @@ BRE veneer over an ERE engine. A handful of parsed-but-unhandled commands
 - [x] `-R` CONFORMS — `lib.rs:173`.
 - [x] `-c command` / `+command` CONFORMS — `lib.rs:179-185,212-213`.
 - [x] **`-r`** ✓ (phase 6, #V4); **`-t`** ✓ (phase 7, #V5).  **`-w` PARTIAL** — #V11.
-- [ ] `-s`/`-h`/`--version` accepted (extensions / ex-only on vi) — DIVERGES, harmless.
+- [x] `-s`/`-h`/`--version` accepted (extensions / ex-only on vi) — DIVERGES, harmless. *Not a finding; ticked as an accepted extension.*
 
 #### OPERANDS / STDIN / INPUT FILES
 - [x] Multiple-file list + first-file open CONFORMS — `FileManager`.
@@ -225,7 +278,7 @@ BRE veneer over an ERE engine. A handful of parsed-but-unhandled commands
 - [x] `EXINIT`/`HOME` CONFORMS — `editor/mod.rs` (#V9 examined: set-but-empty suppresses `.exrc`).
 - [x] `SHELL` CONFORMS — `options.rs:142`.
 - [x] **`LANG`/`LC_ALL`/`LC_COLLATE`/`LC_CTYPE`/`LC_MESSAGES`** — ✓ fixed (phase 4), #V10.
-- [ ] **`TERM` PARTIAL** — read but no terminfo lookup.
+- [x] **`TERM`** — read, with no terminfo lookup. **Accepted as a deliberate non-goal (2026-08-02, maintainer decision):** the UI drives the terminal through its own `ui/terminal.rs` abstraction rather than capability strings, so a terminfo layer would add a dependency and a parallel capability path for no behavioral gain on any terminal this project targets.
 
 #### ASYNCHRONOUS EVENTS
 - [x] **SIGWINCH / SIGCONT / SIGHUP** — ✓ fixed (phases 5–6), #V1/#V2/#V3.
@@ -251,8 +304,8 @@ BRE veneer over an ERE engine. A handful of parsed-but-unhandled commands
 
 ### Test coverage signal
 Not covered:
-- [ ] Signal handling (resize / suspend / hangup) — #V1-#V3.
-- [ ] `-r` / `-t` behavior — #V4/#V5.
+- [x] Signal handling (resize / suspend / hangup) — `test_pty_vi_resize_survives_and_saves` (resizes the PTY so the kernel really delivers SIGWINCH), `test_pty_vi_interrupt_cancels_count`, and `test_ex_preserve_and_recover_roundtrip` for hangup preservation.
+- [x] `-r` / `-t` behavior — exercised in `tests/ex/mod.rs` (`-r` round-trip; `test_ex_tag_lookup`), plus 5 unit tests in `vi/tags.rs`. Both flags share one code path with vi.
 - [x] Sentence motions `(` `)`, `_` — ✓ fixed (phase 8), #V6/#V7.
 - [x] `EXINIT=""` vs `.exrc` ordering — ✓ examined (phase 9), #V9; `.exrc` security unit-tested in `config.rs`.
 
@@ -269,7 +322,7 @@ Not covered:
 
 **Implementation (shared vi binary, ex mode):** `vi/lib.rs` (dispatch/argv),
 `vi/ex/{mod,command,address,parser}.rs`, plus `vi/{file,search,options,shell}.rs`.
-**Tests:** `tests/ex/mod.rs` (547)
+**Tests:** `tests/ex/mod.rs` (543+)
 **Spec slice:** `…/3-utilities/ex.md`
 
 ### TL;DR
@@ -335,7 +388,7 @@ mandated mark-then-execute.
 #### ENVIRONMENT VARIABLES
 - [x] `HOME`, `SHELL` CONFORM (`options.rs:142`).
 - [x] `EXINIT` works interactively; suppressed under `-s`/non-tty — ✓ (phase 9), #X3.
-- [ ] **`LANG`/`LC_*` MISSING** (#X14); **`COLUMNS`/`LINES` MISSING** (ioctl only); **`TERM` PARTIAL** (read before mode applied).
+- [x] ~~**`LANG`/`LC_*` MISSING** (#X14)~~ ✓ fixed (phase 4, `setlocale` in `run_editor`); ~~**`COLUMNS`/`LINES` MISSING**~~ ✓ `ui/terminal.rs` honors both over the ioctl, with unit tests. **`TERM` PARTIAL** — accepted non-goal, see the vi entry above.
 
 #### ASYNCHRONOUS EVENTS
 - [x] **Signals (SIGINT/SIGHUP/SIGTERM)** — ✓ fixed (phases 5–6), #X1.
@@ -349,10 +402,10 @@ mandated mark-then-execute.
 
 #### Commands
 - [x] `ar co/t d m nu p pu q(!) rew se(t) u ya = # & ya` CONFORM.
-- [ ] **`g`/`v` single-pass** (#X7); **`s` gaps** (#X12); **`sh[ell]` no `-i`** (#X13).
+- [x] ~~**`g`/`v` single-pass** (#X7)~~ ✓ examined and conforming (collects matching lines first, then executes); ~~**`s` gaps** (#X12)~~ ✓ closed 2026-08-02; ~~**`sh[ell]` no `-i`** (#X13)~~ ✓ fixed (`ShellExecutor::interactive` passes `-i`).
 - [ ] **PARTIAL (modifier/arg gaps).** *Split into named items 2026-08-02; this box was one opaque checkbox covering ~15 commands.* Closed so far: **`j`** (`!` plus the full §95060-95070 rule set — two spaces after `.`, no separator before `)`, empty lines dropped — and the §95043-95057 count/address interaction), **`q`** (remaining-files check), **`r`** (#X23), **`w`/`wq`/`x`** (#X22/#X24/#X29). Also closed: **`l`** (full §95237-95244 escape table — XBD Table 5-1 sequences, three-digit octal per byte otherwise, `\$` for a literal `$`; it had been `^I`-style caret notation that escaped neither backslash nor `$`, so `:l` was not unambiguous, which is the entire point of the command) and **`@@`** (the parser took the second `@` as a buffer *name*, so it failed with `Buffer "@" is empty` instead of repeating the last buffer). `cd`, `so` and `ta` were probed and already work.
   Still open, itemized: `a`/`i`/`c` `!` autoindent toggle, `e`/`n` `+command` and file args, `f`, `o`, `vi[sual]`, `z` (`!`/multi-type), `!` warn message.
-- [ ] **MISSING:** `pre[serve]`, `rec[over]`, `~` (#X18).
+- [x] ~~**MISSING:** `pre[serve]`, `rec[over]`~~ ✓ both added (phase 6); ~~`~` (#X18)~~ ✓ added 2026-08-02.
 
 #### `set` options
 - [x] Implemented: `ai ap aw eb exrc ic list magic nu para ro report scroll sections sh sw sm showmode ts tl tags term terse timeout window wm ws wa`.
@@ -365,11 +418,11 @@ mandated mark-then-execute.
 
 ### Test coverage signal
 Not covered:
-- [ ] Signal handling / `preserve` / EOF preservation — #X1/#X2/#X6.
+- [x] Signal handling / `preserve` / EOF preservation — `test_ex_preserve_and_recover_roundtrip` (writes the buffer, checks the recovery file, re-runs with `-r`).
 - [x] `-s` suppressing EXINIT/`.exrc` — ✓ fixed (phase 9), #X3.
 - [x] Address offset — ✓ fixed (phase 10), #X9. `;` semantics — minor, #X10.
-- [ ] `global`/`v` with line-count-changing commands — #X7.
-- [ ] substitute empty-pattern reuse, count, `l`/`#`, case escapes — #X12.
+- [x] `global`/`v` with line-count-changing commands — `test_ex_global_delete` is exactly that (`g/…/d`); #X7 examined and conforming.
+- [x] substitute empty-pattern reuse, count, `l`/`#`, case escapes — all closed 2026-08-02 with tests, including the spec's own worked examples (ex.md §95726-95732).
 
 ### Suggested PR groupings
 - **PR ex-A — "signals & preserve"**: #X1, #X2, #X6 (+ vi-#V1-#V3 shared infra).

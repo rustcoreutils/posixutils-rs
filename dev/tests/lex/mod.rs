@@ -676,7 +676,7 @@ fn test_input_code_generation() {
     assert!(success, "lex failed to generate C code");
 
     // Check for input function
-    assert!(c_code.contains("static int input(void)"));
+    assert!(c_code.contains("int input(void)"));
 }
 
 #[test]
@@ -734,7 +734,7 @@ fn test_unput_code_generation() {
     assert!(success, "lex failed to generate C code");
 
     // Check for unput function - now uses direct buffer insertion with memmove
-    assert!(c_code.contains("static int unput(int c)"));
+    assert!(c_code.contains("int unput(int c)"));
     assert!(c_code.contains("memmove"));
 }
 
@@ -832,7 +832,7 @@ int main(void) {
     let (c_code, success) = run_lex(lex_input);
     assert!(success, "lex failed to generate C code");
     assert!(
-        c_code.contains("static int unput(int c)"),
+        c_code.contains("int unput(int c)"),
         "unput must be declared `int unput(int c)`: {}",
         c_code
     );
@@ -2215,6 +2215,85 @@ int main() {
 }
 
 #[test]
+fn test_default_main_and_yywrap_are_suppressible() {
+    // #L1/#L14: POSIX 102022-102031 says yywrap() and main() belong to the lex
+    // library so a conforming application can redefine them. We still emit
+    // defaults (the generated yylex() calls yywrap() on every EOF path), but
+    // each must be individually suppressible so an application supplying its
+    // own definitions in a SEPARATE translation unit does not hit duplicate
+    // symbols. Before, `main` was guarded by the misnamed YY_SKIP_YYWRAP and
+    // `yywrap` had no escape hatch at all.
+    let lex_input = r#"
+%%
+[a-z]+  { return 1; }
+.|\n    { }
+%%
+"#;
+    let (c_code, ok) = run_lex(lex_input);
+    assert!(ok, "lex failed: {}", c_code);
+    assert!(
+        c_code.contains("#ifndef YY_NO_DEFAULT_YYWRAP"),
+        "yywrap must be guarded by its own macro"
+    );
+    assert!(
+        c_code.contains("#ifndef YY_NO_DEFAULT_MAIN"),
+        "main must be guarded by its own macro"
+    );
+    assert!(
+        !c_code.contains("YY_SKIP_YYWRAP"),
+        "the misnamed guard must be gone"
+    );
+
+    // Link the scanner against a second TU providing both symbols. Without the
+    // macros this fails with duplicate definitions; with them it must link.
+    let temp_dir = TempDir::new().unwrap();
+    let c_file = temp_dir.path().join("lexer.c");
+    let app_file = temp_dir.path().join("app.c");
+    let exe_file = temp_dir.path().join("app");
+    fs::write(&c_file, &c_code).unwrap();
+    fs::write(
+        &app_file,
+        r#"
+#include <stdio.h>
+int yylex(void);
+int yywrap(void) { return 1; }
+int main(void) { while (yylex() != 0) {} printf("app-main\n"); return 0; }
+"#,
+    )
+    .unwrap();
+
+    let compile = Command::new("cc")
+        .args([
+            "-Wall",
+            "-O2",
+            "-Werror",
+            "-DYY_NO_DEFAULT_MAIN",
+            "-DYY_NO_DEFAULT_YYWRAP",
+            "-o",
+            exe_file.to_str().unwrap(),
+            c_file.to_str().unwrap(),
+            app_file.to_str().unwrap(),
+            "-lm",
+        ])
+        .output()
+        .expect("Failed to compile");
+    assert!(
+        compile.status.success(),
+        "user-supplied main/yywrap in a separate TU must link cleanly: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe_file)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("Failed to run");
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("app-main"),
+        "the application's main must be the one that runs"
+    );
+}
+
+#[test]
 fn test_yywrap_custom() {
     // Test custom yywrap that processes multiple inputs
     let lex_input = r#"
@@ -2918,13 +2997,13 @@ fn test_option_noinput_suppresses_input_function() {
 
     // Verify that input() function is NOT generated
     assert!(
-        !c_code.contains("static int input(void)"),
+        !c_code.contains("int input(void)"),
         "input() function should NOT be generated with %option noinput"
     );
 
     // Verify that unput() function IS still generated (noinput doesn't affect it)
     assert!(
-        c_code.contains("static int unput(int c)"),
+        c_code.contains("int unput(int c)"),
         "unput() function should still be generated"
     );
 }
@@ -2947,13 +3026,13 @@ fn test_option_nounput_suppresses_unput_function() {
 
     // Verify that unput() function is NOT generated
     assert!(
-        !c_code.contains("static int unput(int c)"),
+        !c_code.contains("int unput(int c)"),
         "unput() function should NOT be generated with %option nounput"
     );
 
     // Verify that input() function IS still generated (nounput doesn't affect it)
     assert!(
-        c_code.contains("static int input(void)"),
+        c_code.contains("int input(void)"),
         "input() function should still be generated"
     );
 }
@@ -2979,11 +3058,11 @@ int main() {
 
     // Verify that NEITHER function is generated
     assert!(
-        !c_code.contains("static int input(void)"),
+        !c_code.contains("int input(void)"),
         "input() function should NOT be generated"
     );
     assert!(
-        !c_code.contains("static int unput(int c)"),
+        !c_code.contains("int unput(int c)"),
         "unput() function should NOT be generated"
     );
 
@@ -3017,11 +3096,11 @@ int main() {
 
     // Verify that NEITHER function is generated
     assert!(
-        !c_code.contains("static int input(void)"),
+        !c_code.contains("int input(void)"),
         "input() function should NOT be generated"
     );
     assert!(
-        !c_code.contains("static int unput(int c)"),
+        !c_code.contains("int unput(int c)"),
         "unput() function should NOT be generated"
     );
 
@@ -3052,11 +3131,11 @@ int main() {
 
     // Verify that BOTH functions are generated by default
     assert!(
-        c_code.contains("static int input(void)"),
+        c_code.contains("int input(void)"),
         "input() function should be generated by default"
     );
     assert!(
-        c_code.contains("static int unput(int c)"),
+        c_code.contains("int unput(int c)"),
         "unput() function should be generated by default"
     );
 }

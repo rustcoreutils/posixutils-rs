@@ -24,7 +24,7 @@ use crate::input::{InputReader, Key};
 use crate::mode::{enter_insert_mode, process_insert_key, InsertKind, InsertState, Mode};
 use crate::options::Options;
 use crate::register::{RegisterContent, Registers};
-use crate::search::{SearchDirection, SearchState, Substitutor};
+use crate::search::{SearchDirection, SearchState, SubstituteConfig, Substitutor};
 use crate::shell::ShellExecutor;
 use crate::ui::{Screen, Terminal, TerminalSize};
 use crate::undo::UndoManager;
@@ -175,6 +175,11 @@ pub struct Editor {
     last_find: Option<FindCommand>,
     /// Last substitution for & command.
     last_substitution: Option<LastSubstitution>,
+    /// The last regular expression used anywhere in the editor -- by a search
+    /// or by a substitute. An empty `:s//repl/` pattern reuses it (#X28).
+    last_regex: Option<String>,
+    /// Lines echoed by the most recent substitute's `p`/`l`/`#` flags.
+    substitute_output: Vec<String>,
     /// Last command for . (dot) repeat.
     last_command: Option<LastCommand>,
     /// Last macro register for @@ repeat.
@@ -241,6 +246,8 @@ impl Editor {
             pending_filter: None,
             last_find: None,
             last_substitution: None,
+            last_regex: None,
+            substitute_output: Vec::new(),
             last_command: None,
             last_macro_register: None,
             ex_insert_mode: None,
@@ -280,6 +287,8 @@ impl Editor {
             pending_filter: None,
             last_find: None,
             last_substitution: None,
+            last_regex: None,
+            substitute_output: Vec::new(),
             last_command: None,
             last_macro_register: None,
             ex_insert_mode: None,
@@ -322,6 +331,8 @@ impl Editor {
             pending_filter: None,
             last_find: None,
             last_substitution: None,
+            last_regex: None,
+            substitute_output: Vec::new(),
             last_command: None,
             last_macro_register: None,
             ex_insert_mode: None,
@@ -1996,7 +2007,13 @@ impl Editor {
                 flags,
             } => {
                 self.substitute(&range, &pattern, &replacement, &flags)?;
-                Ok(ExResult::Continue)
+                // The p/l/# flags echo each changed line.
+                let printed = std::mem::take(&mut self.substitute_output);
+                if printed.is_empty() {
+                    Ok(ExResult::Continue)
+                } else {
+                    Ok(ExResult::CommandOutput(printed))
+                }
             }
             ExCommand::Goto { line } => {
                 let line = line.min(self.buffer.line_count()).max(1);
@@ -2744,24 +2761,61 @@ impl Editor {
         replacement: &str,
         flags: &SubstituteFlags,
     ) -> Result<()> {
-        let sub = Substitutor::new(
+        // An empty pattern reuses the last RE used in the editor -- from a
+        // search or a previous substitute (ex.md §95700). Only the editor can
+        // resolve that, which is why the parser now forwards an empty pattern
+        // instead of rejecting it.
+        let pattern = if pattern.is_empty() {
+            self.last_regex()
+                .ok_or(ViError::NoPreviousSubstitution)?
+                .to_string()
+        } else {
+            pattern.to_string()
+        };
+        let pattern = pattern.as_str();
+
+        // `~` alone as the replacement means "the previous replacement", which
+        // is how a bare `s` repeats the last substitution.
+        let prev_replacement = self
+            .last_substitution
+            .as_ref()
+            .map(|l| l.replacement.clone())
+            .unwrap_or_default();
+
+        let sub = Substitutor::new(SubstituteConfig {
             pattern,
             replacement,
-            flags.global,
-            flags.confirm,
-            flags.print,
-            flags.count,
-            self.options.ignorecase,
-        )?;
+            global: flags.global,
+            confirm: flags.confirm,
+            print: flags.print,
+            list: flags.list,
+            number: flags.number,
+            count_only: flags.count,
+            ignorecase: self.options.ignorecase,
+            prev_replacement: &prev_replacement,
+        })?;
 
-        // Resolve range
-        let (start, end) = self.resolve_range(range)?;
+        // Resolve range. A trailing numeric count re-bases the range on the
+        // last addressed line and extends it (substitute synopsis).
+        let (mut start, mut end) = self.resolve_range(range)?;
+        if let Some(n) = flags.line_count {
+            let n = n.max(1);
+            start = end;
+            end = (start + n - 1).min(self.buffer.line_count());
+        }
         let mut total_count = 0;
+        let mut printed: Vec<String> = Vec::new();
 
         for line_num in start..=end {
             if let Some(line) = self.buffer.line(line_num) {
                 let content = line.content().to_string();
-                let (new_content, count) = sub.substitute_line(&content);
+                let (new_content, count) = if sub.needs_confirm() && !sub.is_count_only() {
+                    sub.substitute_line_confirmed(&content, |line, s, e| {
+                        Self::confirm_substitution(line, s, e)
+                    })
+                } else {
+                    sub.substitute_line(&content)
+                };
 
                 if count > 0 && !sub.is_count_only() {
                     self.undo.record_replace(
@@ -2771,6 +2825,21 @@ impl Editor {
                         false,
                     );
                     self.buffer.replace_line(line_num, &new_content)?;
+
+                    // `p`, `l` and `#` echo each changed line; `l` uses the
+                    // unambiguous form and `#` prefixes the line number.
+                    if sub.should_print() || sub.should_list() || sub.should_number() {
+                        let body = if sub.should_list() {
+                            Self::list_form(&new_content)
+                        } else {
+                            new_content.clone()
+                        };
+                        printed.push(if sub.should_number() {
+                            format!("{}\t{}", line_num, body)
+                        } else {
+                            body
+                        });
+                    }
                 }
                 total_count += count;
             }
@@ -2788,9 +2857,65 @@ impl Editor {
                 replacement: replacement.to_string(),
                 global: flags.global,
             });
+            // #X28: the substitute pattern becomes the last RE, so a following
+            // bare `n` or `//` reuses it.
+            self.set_last_regex(pattern);
         }
 
+        self.substitute_output = printed;
         Ok(())
+    }
+
+    /// The last RE used by a search or substitute (#X28).
+    fn last_regex(&self) -> Option<&str> {
+        self.last_regex.as_deref().or_else(|| self.search.pattern())
+    }
+
+    /// Record the last RE used, so `:s//repl/` and a bare `n` agree.
+    fn set_last_regex(&mut self, pattern: &str) {
+        self.last_regex = Some(pattern.to_string());
+    }
+
+    /// Ask whether to apply one substitution (the `c` flag).
+    ///
+    /// POSIX/historical ex reads the answer from standard input, in batch as
+    /// well as interactively, so a script can answer inline. A line beginning
+    /// with `y` accepts; anything else (including EOF) declines.
+    fn confirm_substitution(line: &str, start: usize, end: usize) -> bool {
+        use std::io::{BufRead, Write};
+        let mut out = std::io::stdout();
+        let _ = writeln!(out, "{}", line);
+        let _ = writeln!(
+            out,
+            "{}{}",
+            " ".repeat(line[..start].chars().count()),
+            "^".repeat(line[start..end].chars().count().max(1))
+        );
+        let _ = out.flush();
+
+        let mut answer = String::new();
+        match std::io::stdin().lock().read_line(&mut answer) {
+            Ok(0) | Err(_) => false,
+            Ok(_) => answer.trim_start().starts_with('y'),
+        }
+    }
+
+    /// Render a line in `list` form: non-printing characters shown
+    /// unambiguously and a trailing `$` marking end-of-line.
+    fn list_form(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() + 1);
+        for c in s.chars() {
+            match c {
+                '\t' => out.push_str("\\t"),
+                '\\' => out.push_str("\\\\"),
+                c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                    out.push_str(&format!("\\{:03o}", c as u32));
+                }
+                c => out.push(c),
+            }
+        }
+        out.push('$');
+        out
     }
 
     /// Write buffer to file.
@@ -3324,6 +3449,9 @@ impl Editor {
                 print: false,
                 count: false,
                 ignore_case: self.options.ignorecase,
+                list: false,
+                number: false,
+                line_count: None,
             };
             let range = AddressRange::current();
             self.substitute(&range, &last_sub.pattern, &last_sub.replacement, &flags)?;

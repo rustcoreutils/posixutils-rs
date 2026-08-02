@@ -763,3 +763,106 @@ fn test_ex_multibyte_mark_name_does_not_panic() {
         code
     );
 }
+
+// ============================================================================
+// substitute -- audit #X12/#X26/#X28
+// ============================================================================
+
+#[test]
+fn test_ex_substitute_case_conversion_spec_examples() {
+    // The POSIX spec ships these worked examples verbatim (ex.md
+    // §95726-95732). They exercise \u, \U, \e, back-references and the `p`
+    // flag at once.
+    //
+    //   :s/\<.at\>/\u&/gp     -> The Cat Sat on the Mat.
+    //   :s/S\(.*\)M/S\U\1\eM/p -> The Cat SAT ON THE Mat.
+    ex_test_with_file(
+        "The cat sat on the mat.\n",
+        "s/\\<.at\\>/\\u&/gp\nq!\n",
+        "The Cat Sat on the Mat.\n",
+    );
+    ex_test_with_file(
+        "The cat sat on the mat.\n",
+        "s/\\<.at\\>/\\u&/g\ns/S\\(.*\\)M/S\\U\\1\\eM/p\nq!\n",
+        "The Cat SAT ON THE Mat.\n",
+    );
+}
+
+#[test]
+fn test_ex_substitute_print_flag_emits_the_line() {
+    // #X26: `p` and `c` were parsed and stored but dead -- needs_confirm() and
+    // should_print() had zero call sites, so `:s/../../p` printed nothing.
+    ex_test_with_file("aaa\nbbb\n", "1s/aaa/ZZZ/p\nq!\n", "ZZZ\n");
+}
+
+#[test]
+fn test_ex_substitute_number_and_list_flags() {
+    // `#` prefixes the line number; `l` shows the line unambiguously with a
+    // trailing '$'. Neither was even parsed before.
+    ex_test_with_file(
+        "aaa\nbbb\naaa\n",
+        "1,$s/aaa/ZZZ/#\nq!\n",
+        "1\tZZZ\n3\tZZZ\n",
+    );
+    ex_test_with_file("aaa\n", "1s/aaa/A\tB/l\nq!\n", "A\\tB$\n");
+}
+
+#[test]
+fn test_ex_substitute_empty_pattern_reuses_last_regex() {
+    // #X12/#X28: an empty pattern reuses the last RE (ex.md §95700). The
+    // parser used to reject `s//x/` outright as NoPreviousSubstitution, which
+    // is a decision only the editor can make.
+    ex_test_with_file(
+        "aaa\nbbb\naaa\n",
+        "/bbb/\ns//REPLACED/\n1,$p\nq!\n",
+        "aaa\nREPLACED\naaa\n",
+    );
+
+    // And a substitute's own pattern becomes the last RE (#X28), so a later
+    // empty pattern picks it up.
+    ex_test_with_file(
+        "one two\nthree two\n",
+        "1s/two/2/\n2s//2/\n1,$p\nq!\n",
+        "one 2\nthree 2\n",
+    );
+}
+
+#[test]
+fn test_ex_substitute_tilde_reuses_previous_replacement() {
+    // `~` in the replacement expands to the previous substitute's replacement
+    // (ex.md §95713-95714).
+    ex_test_with_file(
+        "aaa\nbbb\n",
+        "1s/aaa/XY/\n2s/bbb/~Z/\n1,$p\nq!\n",
+        "XY\nXYZ\n",
+    );
+}
+
+#[test]
+fn test_ex_substitute_numeric_count() {
+    // A trailing count operates on that many lines starting at the last line
+    // of the address range.
+    ex_test_with_file(
+        "a1\na2\na3\na4\n",
+        "1s/a/X/ 3\n1,$p\nq!\n",
+        "X1\nX2\nX3\na4\n",
+    );
+}
+
+#[test]
+fn test_ex_substitute_confirm_flag_reads_stdin() {
+    // #X26: the `c` flag was dead. POSIX/historical ex reads the answer from
+    // standard input, in batch as well as interactively, so a script can
+    // answer inline. 'y' accepts, anything else declines.
+    let (code, _err, dir) = ex_run(
+        "aaa\nbbb\naaa\n",
+        &["-s"],
+        "1,$s/aaa/YES/c\ny\nn\nw out.txt\nq!\n",
+    );
+    assert_eq!(code, 0);
+    let out = fs::read_to_string(dir.path().join("out.txt")).unwrap();
+    assert_eq!(
+        out, "YES\nbbb\naaa\n",
+        "the confirmed match is substituted and the declined one is left alone"
+    );
+}

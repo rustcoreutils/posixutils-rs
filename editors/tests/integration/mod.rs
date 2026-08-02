@@ -608,7 +608,7 @@ fn test_search_ignorecase() {
 
 #[test]
 fn test_substitute_simple() {
-    let sub = Substitutor::new("foo", "bar", false, false, false, false, false).unwrap();
+    let sub = Substitutor::new(SubstituteConfig::new("foo", "bar")).unwrap();
     let (result, count) = sub.substitute_line("foo baz foo");
 
     assert_eq!(result, "bar baz foo");
@@ -617,7 +617,7 @@ fn test_substitute_simple() {
 
 #[test]
 fn test_substitute_global() {
-    let sub = Substitutor::new("foo", "bar", true, false, false, false, false).unwrap();
+    let sub = Substitutor::new(SubstituteConfig::new("foo", "bar").with_global(true)).unwrap();
     let (result, count) = sub.substitute_line("foo baz foo");
 
     assert_eq!(result, "bar baz bar");
@@ -626,8 +626,8 @@ fn test_substitute_global() {
 
 #[test]
 fn test_substitute_ignorecase() {
-    // Substitutor::new(pattern, replacement, global, confirm, print, count_only, ignorecase)
-    let sub = Substitutor::new("FOO", "bar", false, false, false, false, true).unwrap();
+    // Substitutor::new(SubstituteConfig::new(pattern, replacement))
+    let sub = Substitutor::new(SubstituteConfig::new("FOO", "bar").with_ignorecase(true)).unwrap();
     let (result, count) = sub.substitute_line("foo baz FOO");
 
     // Case insensitive: "foo" matches first
@@ -637,7 +637,7 @@ fn test_substitute_ignorecase() {
 
 #[test]
 fn test_substitute_ampersand() {
-    let sub = Substitutor::new("foo", "[&]", false, false, false, false, false).unwrap();
+    let sub = Substitutor::new(SubstituteConfig::new("foo", "[&]")).unwrap();
     let (result, _) = sub.substitute_line("foo");
 
     assert_eq!(result, "[foo]");

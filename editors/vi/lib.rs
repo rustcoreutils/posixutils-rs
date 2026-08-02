@@ -44,7 +44,7 @@ pub use input::{InputReader, Key};
 pub use mode::{enter_insert_mode, process_insert_key, InsertKind, InsertState, Mode};
 pub use options::Options;
 pub use register::{RegisterContent, Registers};
-pub use search::{SearchDirection, SearchState, Substitutor};
+pub use search::{SearchDirection, SearchState, SubstituteConfig, Substitutor};
 pub use shell::{ShellExecutor, ShellOutput};
 pub use ui::{
     byte_offset_to_display_col, char_width, display_col_to_byte_offset, expand_for_display,

@@ -444,22 +444,37 @@ fn parse_write_quit(range: AddressRange, args: &str, force: bool, xit: bool) -> 
 
 /// Parse substitute command.
 fn parse_substitute(range: AddressRange, args: &str) -> Result<ExCommand> {
-    // s/pattern/replacement/flags
-    if args.is_empty() {
-        return Err(ViError::NoPreviousSubstitution);
+    // s[/pattern/replacement/][flags][count]
+    //
+    // A bare `s`, and an empty pattern (`s//repl/`), both mean "reuse the last
+    // regular expression" (ex.md §95700). Both used to be rejected outright as
+    // NoPreviousSubstitution, which is a decision only the editor can make --
+    // it is the one that knows whether a previous RE exists. An empty
+    // `pattern` is therefore passed through and resolved at execution time.
+    let args = args.trim_start();
+
+    // Bare `s`, optionally followed by flags/count: `s`, `s g`, `s 3`.
+    if args.is_empty() || args.chars().next().is_some_and(|c| c.is_alphanumeric()) {
+        let (flags, line_count) = split_subst_flags(args);
+        let mut flags = SubstituteFlags::parse(&flags);
+        flags.line_count = line_count;
+        return Ok(ExCommand::Substitute {
+            range,
+            pattern: String::new(),
+            replacement: "~".to_string(),
+            flags,
+        });
     }
 
     let delim = args.chars().next().unwrap();
-    let parts: Vec<&str> = args[1..].split(delim).collect();
+    let parts: Vec<&str> = args[delim.len_utf8()..].split(delim).collect();
 
     let pattern = parts.first().unwrap_or(&"").to_string();
     let replacement = parts.get(1).unwrap_or(&"").to_string();
-    let flags_str = parts.get(2).unwrap_or(&"");
-    let flags = SubstituteFlags::parse(flags_str);
-
-    if pattern.is_empty() {
-        return Err(ViError::NoPreviousSubstitution);
-    }
+    let trailing = parts.get(2).unwrap_or(&"");
+    let (flags_str, line_count) = split_subst_flags(trailing);
+    let mut flags = SubstituteFlags::parse(&flags_str);
+    flags.line_count = line_count;
 
     Ok(ExCommand::Substitute {
         range,
@@ -467,6 +482,23 @@ fn parse_substitute(range: AddressRange, args: &str) -> Result<ExCommand> {
         replacement,
         flags,
     })
+}
+
+/// Split a substitute suffix into its flag letters and a trailing numeric
+/// count, e.g. `"g3"` -> `("g", Some(3))`.
+fn split_subst_flags(s: &str) -> (String, Option<usize>) {
+    let s = s.trim();
+    let digits_at = s
+        .char_indices()
+        .position(|(_, c)| c.is_ascii_digit())
+        .and_then(|_| s.find(|c: char| c.is_ascii_digit()));
+    match digits_at {
+        Some(i) => {
+            let (flags, num) = s.split_at(i);
+            (flags.trim().to_string(), num.trim().parse().ok())
+        }
+        None => (s.to_string(), None),
+    }
 }
 
 /// Parse global command.

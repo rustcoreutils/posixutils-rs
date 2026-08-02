@@ -226,6 +226,13 @@ pub struct SubstituteFlags {
     pub count: bool,
     /// Case insensitive.
     pub ignore_case: bool,
+    /// `l` -- print changed lines in unambiguous (list) form.
+    pub list: bool,
+    /// `#` -- print changed lines with line numbers.
+    pub number: bool,
+    /// Trailing numeric count: operate on that many lines starting at the last
+    /// line of the address range (ex.md substitute synopsis).
+    pub line_count: Option<usize>,
 }
 
 impl SubstituteFlags {
@@ -239,6 +246,8 @@ impl SubstituteFlags {
                 'p' => flags.print = true,
                 'n' => flags.count = true,
                 'i' | 'I' => flags.ignore_case = true,
+                'l' => flags.list = true,
+                '#' => flags.number = true,
                 _ => {}
             }
         }

@@ -857,3 +857,39 @@ fn test_upper_s_substitutes_whole_lines() {
         text
     );
 }
+
+#[test]
+fn test_insert_honors_configured_erase_and_kill_chars() {
+    // #V12: insert mode hardcoded ^H/^U. POSIX vi honors the terminal's
+    // `stty erase` and `stty kill` characters, which are now read from the
+    // termios captured before raw mode and carried into the insert session.
+    //
+    // Driven at the InsertState level because a headless editor has no
+    // terminal to read termios from -- the PTY suite covers the wiring.
+    use vi_rs::{process_insert_key, Buffer, InsertKind, InsertState, Key, Position};
+
+    let mut buffer = Buffer::from_text("");
+    let mut state = InsertState::new(InsertKind::Insert, Position::new(1, 0), 1);
+    state.erase_char = Some('#');
+    state.kill_char = Some('@');
+
+    for c in "abc".chars() {
+        process_insert_key(&mut buffer, Key::Char(c), &mut state).unwrap();
+    }
+    // '#' is this terminal's erase character, so it deletes rather than
+    // inserting a literal '#'.
+    process_insert_key(&mut buffer, Key::Char('#'), &mut state).unwrap();
+    assert_eq!(buffer.line(1).unwrap().content(), "ab");
+
+    // '@' is the kill character: discard back to the start of the line.
+    process_insert_key(&mut buffer, Key::Char('@'), &mut state).unwrap();
+    assert_eq!(buffer.line(1).unwrap().content(), "");
+
+    // With no erase/kill configured the same bytes are ordinary text.
+    let mut buffer = Buffer::from_text("");
+    let mut plain = InsertState::new(InsertKind::Insert, Position::new(1, 0), 1);
+    for c in "a#b".chars() {
+        process_insert_key(&mut buffer, Key::Char(c), &mut plain).unwrap();
+    }
+    assert_eq!(buffer.line(1).unwrap().content(), "a#b");
+}

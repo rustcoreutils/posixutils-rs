@@ -180,6 +180,9 @@ pub struct Editor {
     last_regex: Option<String>,
     /// Lines echoed by the most recent substitute's `p`/`l`/`#` flags.
     substitute_output: Vec<String>,
+    /// Text from the previous insert session; a NUL in insert mode re-inserts
+    /// it (#V15).
+    previous_insert: String,
     /// Last command for . (dot) repeat.
     last_command: Option<LastCommand>,
     /// Last macro register for @@ repeat.
@@ -248,6 +251,7 @@ impl Editor {
             last_substitution: None,
             last_regex: None,
             substitute_output: Vec::new(),
+            previous_insert: String::new(),
             last_command: None,
             last_macro_register: None,
             ex_insert_mode: None,
@@ -289,6 +293,7 @@ impl Editor {
             last_substitution: None,
             last_regex: None,
             substitute_output: Vec::new(),
+            previous_insert: String::new(),
             last_command: None,
             last_macro_register: None,
             ex_insert_mode: None,
@@ -333,6 +338,7 @@ impl Editor {
             last_substitution: None,
             last_regex: None,
             substitute_output: Vec::new(),
+            previous_insert: String::new(),
             last_command: None,
             last_macro_register: None,
             ex_insert_mode: None,
@@ -938,7 +944,12 @@ impl Editor {
 
     /// Enter insert mode.
     fn enter_insert(&mut self, kind: InsertKind) {
-        if let Ok(state) = enter_insert_mode(&mut self.buffer, kind) {
+        if let Ok(mut state) = enter_insert_mode(&mut self.buffer, kind) {
+            // Carry the terminal's erase/kill characters and the previous
+            // insertion into the session (#V12, #V15).
+            state.erase_char = self.terminal.erase_char();
+            state.kill_char = self.terminal.kill_char();
+            state.previous_insert = self.previous_insert.clone();
             self.mode = Mode::Insert(kind);
             self.insert_state = Some(state);
         }
@@ -952,6 +963,11 @@ impl Editor {
             if should_exit {
                 // Exited insert mode
                 self.mode = Mode::Command;
+                // Remember this session's text so a NUL in the next one can
+                // re-insert it (#V15).
+                if !state.inserted_text.is_empty() {
+                    self.previous_insert = state.inserted_text.clone();
+                }
                 // Record for undo
                 if !state.inserted_text.is_empty() {
                     self.undo

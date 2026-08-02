@@ -32,6 +32,13 @@ pub struct InsertState {
     pub inserted_text: String,
     /// Count for repeating insert.
     pub count: usize,
+    /// The terminal's `stty erase` character, when it differs from `^H` (#V12).
+    pub erase_char: Option<char>,
+    /// The terminal's `stty kill` character, when it differs from `^U` (#V12).
+    pub kill_char: Option<char>,
+    /// Text inserted by the *previous* insert session, which a NUL re-inserts
+    /// (#V15).
+    pub previous_insert: String,
 }
 
 impl InsertState {
@@ -43,6 +50,9 @@ impl InsertState {
             return_column: None,
             inserted_text: String::new(),
             count,
+            erase_char: None,
+            kill_char: None,
+            previous_insert: String::new(),
         }
     }
 
@@ -124,6 +134,26 @@ pub fn process_insert_key(buffer: &mut Buffer, key: Key, state: &mut InsertState
             // Exit insert mode
             finalize_insert(buffer, state);
             return Ok(true);
+        }
+        // A NUL re-inserts the text from the previous insert session (#V15).
+        // The reader maps byte 0 to Ctrl('@'), not Char('\0').
+        Key::Ctrl('@') => {
+            let previous = state.previous_insert.clone();
+            for c in previous.chars() {
+                if c == '\n' {
+                    insert_newline(buffer, state);
+                } else {
+                    insert_char(buffer, c, state);
+                }
+            }
+        }
+        // Honor the terminal's configured erase/kill characters as well as the
+        // hardcoded ^H/^U, which only ever covered the common case (#V12).
+        Key::Char(c) if Some(c) == state.erase_char => {
+            delete_char_before(buffer, state)?;
+        }
+        Key::Char(c) if Some(c) == state.kill_char => {
+            delete_to_line_start(buffer, state);
         }
         Key::Char(c) => {
             insert_char(buffer, c, state);

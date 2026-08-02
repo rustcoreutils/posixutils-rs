@@ -108,6 +108,31 @@ impl Terminal {
     }
 
     /// Get terminal size.
+    /// The terminal's `stty erase` character, if one is configured.
+    ///
+    /// Read from the termios captured before raw mode was entered, so it
+    /// reflects the user's actual settings rather than a hardcoded `^H`
+    /// (#V12).
+    pub fn erase_char(&self) -> Option<char> {
+        self.cc_char(termios::VERASE)
+    }
+
+    /// The terminal's `stty kill` character, if one is configured.
+    pub fn kill_char(&self) -> Option<char> {
+        self.cc_char(termios::VKILL)
+    }
+
+    fn cc_char(&self, idx: usize) -> Option<char> {
+        let t = self.original_termios.as_ref()?;
+        let b = t.c_cc[idx];
+        // 0 means "disabled"; _POSIX_VDISABLE is also commonly 0 or 0xff.
+        if b == 0 || b == 0xff {
+            None
+        } else {
+            Some(b as char)
+        }
+    }
+
     pub fn size(&self) -> TerminalSize {
         self.size
     }

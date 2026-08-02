@@ -50,7 +50,6 @@ impl Editor {
             None => start + 1,
         };
         let end = end.min(self.buffer.line_count());
-        let end = end;
 
         if start >= end || start > self.buffer.line_count() {
             return Ok(()); // Nothing to join

@@ -222,7 +222,8 @@ Not covered:
 
 **Implementation:** `vi_main.rs` (25) + `vi/` ≈ 15.8k lines (entry/dispatch
 `lib.rs`, `editor/`, `command/`, `mode/`, `buffer/`, `ui/`, `input/`, `search.rs`,
-`options.rs`, `file.rs`, `register.rs`, `undo.rs`, `shell.rs`, `config.rs`).
+`options.rs`, `file.rs`, `register.rs`, `undo.rs`, `shell.rs`, `config.rs`,
+`recover.rs`, `signals.rs`, `tags.rs`).
 **Tests:** `tests/integration/mod.rs` (2052), `tests/pty/mod.rs` (377+),
 `tests/headless/mod.rs` (806+)
 **Spec slice:** `…/3-utilities/vi.md`

@@ -349,7 +349,8 @@ mandated mark-then-execute.
 #### Commands
 - [x] `ar co/t d m nu p pu q(!) rew se(t) u ya = # & ya` CONFORM.
 - [ ] **`g`/`v` single-pass** (#X7); **`s` gaps** (#X12); **`sh[ell]` no `-i`** (#X13).
-- [ ] **PARTIAL (modifier/arg gaps).** *Split into named items 2026-08-02; this box was one opaque checkbox covering ~15 commands.* Closed so far: **`j`** (`!` plus the full §95060-95070 rule set — two spaces after `.`, no separator before `)`, empty lines dropped — and the §95043-95057 count/address interaction), **`q`** (remaining-files check), **`r`** (#X23), **`w`/`wq`/`x`** (#X22/#X24/#X29). Still open, itemized: `a`/`i`/`c` `!` autoindent toggle, `cd`, `e`/`n` `+command` and file args, `f`, `l` escape table, `o`, `so`, `ta`, `vi[sual]`, `z` (`!`/multi-type), `!` warn message, `@`/`@@`.
+- [ ] **PARTIAL (modifier/arg gaps).** *Split into named items 2026-08-02; this box was one opaque checkbox covering ~15 commands.* Closed so far: **`j`** (`!` plus the full §95060-95070 rule set — two spaces after `.`, no separator before `)`, empty lines dropped — and the §95043-95057 count/address interaction), **`q`** (remaining-files check), **`r`** (#X23), **`w`/`wq`/`x`** (#X22/#X24/#X29). Also closed: **`l`** (full §95237-95244 escape table — XBD Table 5-1 sequences, three-digit octal per byte otherwise, `\$` for a literal `$`; it had been `^I`-style caret notation that escaped neither backslash nor `$`, so `:l` was not unambiguous, which is the entire point of the command) and **`@@`** (the parser took the second `@` as a buffer *name*, so it failed with `Buffer "@" is empty` instead of repeating the last buffer). `cd`, `so` and `ta` were probed and already work.
+  Still open, itemized: `a`/`i`/`c` `!` autoindent toggle, `e`/`n` `+command` and file args, `f`, `o`, `vi[sual]`, `z` (`!`/multi-type), `!` warn message.
 - [ ] **MISSING:** `pre[serve]`, `rec[over]`, `~` (#X18).
 
 #### `set` options

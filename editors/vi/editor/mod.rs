@@ -2684,22 +2684,7 @@ impl Editor {
         let mut lines = Vec::new();
         for line_num in start..=end {
             if let Some(line) = self.buffer.line(line_num) {
-                // Convert non-printable characters to visible form
-                let mut listed = String::new();
-                for ch in line.content().chars() {
-                    match ch {
-                        '\t' => listed.push_str("^I"),
-                        c if c.is_ascii_control() => {
-                            // Only convert ASCII control characters (0x00-0x1F)
-                            // to ^@ through ^_ notation
-                            listed.push('^');
-                            listed.push((c as u8 + b'@') as char);
-                        }
-                        c => listed.push(c),
-                    }
-                }
-                listed.push('$'); // End of line marker
-                lines.push(listed);
+                lines.push(Self::list_form(line.content()));
             }
         }
         Ok(lines)
@@ -3010,16 +2995,41 @@ impl Editor {
         }
     }
 
-    /// Render a line in `list` form: non-printing characters shown
-    /// unambiguously and a trailing `$` marking end-of-line.
+    /// Render a line in `list` form, per ex.md §95237-95244:
+    ///
+    /// 1. characters in XBD Table 5-1 are written as their escape sequence;
+    /// 2. other non-printable characters as a three-digit octal escape per
+    ///    byte, most significant byte first;
+    /// 3. the end of the line is marked `$`, and a literal `$` is written
+    ///    `\$`.
+    ///
+    /// Shared by the `:list` command and the substitute `l` flag, which
+    /// previously disagreed -- `:l` used `^I`-style caret notation, escaped
+    /// neither backslash nor `$`, and so was not unambiguous at all.
     fn list_form(s: &str) -> String {
         let mut out = String::with_capacity(s.len() + 1);
         for c in s.chars() {
             match c {
-                '\t' => out.push_str("\\t"),
+                // XBD Table 5-1.
                 '\\' => out.push_str("\\\\"),
+                '\x07' => out.push_str("\\a"),
+                '\x08' => out.push_str("\\b"),
+                '\x0c' => out.push_str("\\f"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                '\x0b' => out.push_str("\\v"),
+                // A literal '$' must not be mistaken for the end marker.
+                '$' => out.push_str("\\$"),
                 c if (c as u32) < 0x20 || c as u32 == 0x7f => {
                     out.push_str(&format!("\\{:03o}", c as u32));
+                }
+                // Non-ASCII: one octal escape per byte of the encoding.
+                c if !c.is_ascii() => {
+                    let mut buf = [0u8; 4];
+                    for b in c.encode_utf8(&mut buf).as_bytes() {
+                        out.push_str(&format!("\\{:03o}", b));
+                    }
                 }
                 c => out.push(c),
             }

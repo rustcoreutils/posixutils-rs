@@ -1028,3 +1028,27 @@ fn test_ex_quit_warns_while_more_files_remain() {
         err
     );
 }
+
+// ============================================================================
+// Command modifier/arg gaps -- part 2
+// ============================================================================
+
+#[test]
+fn test_ex_list_uses_posix_escapes() {
+    // ex.md §95237-95244: XBD Table 5-1 escapes, three-digit octal for other
+    // non-printables, '$' at end of line and '\$' for a literal '$'.
+    // `:l` previously used ^I-style caret notation and escaped neither
+    // backslash nor '$', so its output was not unambiguous.
+    ex_test_with_file("a\tb\n", "1l\nq!\n", "a\\tb$\n");
+    ex_test_with_file("a\\b\n", "1l\nq!\n", "a\\\\b$\n");
+    ex_test_with_file("cost $5\n", "1l\nq!\n", "cost \\$5$\n");
+    // SOH (0x01) is not in Table 5-1, so it becomes a three-digit octal.
+    ex_test_with_file("a\u{01}b\n", "1l\nq!\n", "a\\001b$\n");
+}
+
+#[test]
+fn test_ex_at_at_repeats_last_buffer() {
+    // `@@` means "repeat the last executed buffer". The parser accepted '@'
+    // as a buffer *name*, so it failed with `Buffer "@" is empty`.
+    ex_test_with_file("s/o/O/\nooo\n", "1y a\n2\n@a\n@@\n2p\nq!\n", "OOo\n");
+}

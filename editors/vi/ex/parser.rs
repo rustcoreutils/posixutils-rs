@@ -329,10 +329,11 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
 
         // Execute buffer
         "@" | "*" => {
-            let buffer = args
-                .chars()
-                .next()
-                .filter(|c| c.is_ascii_alphabetic() || *c == '@' || *c == '*');
+            // `@@` (and `@*`) mean "repeat the last executed buffer", so they
+            // must resolve to None here and let the executor fall back to
+            // `last_macro_register`. Treating '@' as a buffer *name* made
+            // `@@` fail with `Buffer "@" is empty`.
+            let buffer = args.chars().next().filter(|c| c.is_ascii_alphabetic());
             Ok(ExCommand::Execute { range, buffer })
         }
 

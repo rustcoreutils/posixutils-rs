@@ -8,7 +8,7 @@
 //
 // Determinism regression tests.
 //
-// pcc must produce bit-identical .s/.o output on identical input
+// c17 must produce bit-identical .s/.o output on identical input
 // across runs. This is a property of the *compiler*, not the
 // generated code: it ensures reproducible builds, makes binary
 // diffs across compiler changes meaningful, and prevents subtle
@@ -46,7 +46,7 @@ use tempfile::NamedTempFile;
 
 fn create_c_file(name: &str, content: &str) -> NamedTempFile {
     let mut file = tempfile::Builder::new()
-        .prefix(&format!("pcc_det_{}_", name))
+        .prefix(&format!("c17_det_{}_", name))
         .suffix(".c")
         .tempfile()
         .expect("failed to create temp file");
@@ -56,7 +56,7 @@ fn create_c_file(name: &str, content: &str) -> NamedTempFile {
 }
 
 /// Compile `content` with the given extra args twice and return both
-/// assembly outputs as Strings. Each invocation is a fresh pcc
+/// assembly outputs as Strings. Each invocation is a fresh c17
 /// process, so each gets its own HashMap RandomState seed.
 fn compile_twice(name: &str, content: &str, extra_args: &[&str]) -> (String, String) {
     let c_file = create_c_file(name, content);
@@ -64,7 +64,7 @@ fn compile_twice(name: &str, content: &str, extra_args: &[&str]) -> (String, Str
 
     let mut outputs = Vec::with_capacity(2);
     for i in 0..2 {
-        let s_path = std::env::temp_dir().join(format!("pcc_det_{}_{}.s", name, i));
+        let s_path = std::env::temp_dir().join(format!("c17_det_{}_{}.s", name, i));
         let s_path_str = s_path.to_string_lossy().to_string();
 
         let mut args: Vec<String> = vec!["-S".to_string(), "-o".to_string(), s_path_str.clone()];
@@ -73,10 +73,10 @@ fn compile_twice(name: &str, content: &str, extra_args: &[&str]) -> (String, Str
         }
         args.push(c_path.clone());
 
-        let result = run_test_base("pcc", &args, &[]);
+        let result = run_test_base("c17", &args, &[]);
         assert!(
             result.status.success(),
-            "pcc compilation failed for {name} (run {i}):\n{}",
+            "c17 compilation failed for {name} (run {i}):\n{}",
             String::from_utf8_lossy(&result.stderr)
         );
 

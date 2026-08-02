@@ -332,7 +332,7 @@ int main() {
 }
 
 /// Bug Q: dereferencing a function pointer is a no-op in C (C99 6.5.3.2).
-/// *func_ptr == func_ptr. Without the fix, pcc emitted a load instruction
+/// *func_ptr == func_ptr. Without the fix, c17 emitted a load instruction
 /// that read the first byte of the function's code as a value.
 #[test]
 fn c89_functions_deref_funcptr_noop() {

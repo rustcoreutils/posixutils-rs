@@ -6,7 +6,7 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// IR validator for pcc C99 compiler
+// IR validator for c17 C99 compiler
 //
 // The validator enforces structural invariants the IR is required to
 // satisfy at well-defined pipeline points (between optimization passes
@@ -497,7 +497,7 @@ mod tests {
 
     /// I2 — runtime check: a hand-crafted IR with a barrier-but-not-
     /// side-effect (constructed by abusing AsmData on a non-Asm op) is
-    /// not actually reachable through normal pcc pipelines, but the
+    /// not actually reachable through normal c17 pipelines, but the
     /// validator's check covers the contract end-to-end. A simpler
     /// sanity case: a normal asm-with-memory-clobber passes I2.
     #[test]

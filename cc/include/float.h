@@ -9,8 +9,8 @@
 // ISO C Standard:  5.2.4.2.2  Characteristics of floating types <float.h>
 //
 
-#ifndef _PCC_FLOAT_H
-#define _PCC_FLOAT_H
+#ifndef _C17_FLOAT_H
+#define _C17_FLOAT_H
 
 // Radix of exponent representation
 #define FLT_RADIX __FLT_RADIX__
@@ -118,4 +118,4 @@
 #define FLT16_TRUE_MIN __FLT16_DENORM_MIN__
 #endif
 
-#endif // _PCC_FLOAT_H
+#endif // _C17_FLOAT_H

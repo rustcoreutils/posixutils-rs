@@ -9,7 +9,7 @@ Goal of an audit: produce `<crate>/audit.md` — a checkbox-driven punch list a 
 ## 0. Inputs you always need
 
 - **Sliced spec:** `~/tmp/posix.2024/sliced/` — see its top-level `README.md`, `INDEX.md`, `ALIASES.md`. Use the slice, never the 4107-page PDF.
-- **Primary spec file:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/<util>.md`. If the utility name is weird (shell builtin `.`/`:`, posixutils-rs `pcc`→`c17`, etc.), consult `ALIASES.md` first.
+- **Primary spec file:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/<util>.md`. If the utility name is weird (shell builtin `.`/`:`, a posixutils-rs binary whose name differs from the spec's, etc.), consult `ALIASES.md` first.
 - **Implementation:** typically `<category>/<util>.rs` (e.g. `display/more.rs`, `file/cat.rs`). Multi-file utilities live in their own crate (`sh/`, `awk/`, `pax/`, `cc/`, `make/`, `m4/`, `editors/`).
 - **Tests:** `<category>/tests/<util>/mod.rs`. Skim for coverage signal, not bug-hunting.
 - **Cross-referenced spec sections** to consult when the main spec links them:

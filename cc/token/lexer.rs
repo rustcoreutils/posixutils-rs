@@ -6,7 +6,7 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// Lexer module for pcc - C99 Tokenizer
+// Lexer module for c17 - C99 Tokenizer
 // Implements C99 preprocessing token lexing (pp-number, pp-tokens)
 //
 

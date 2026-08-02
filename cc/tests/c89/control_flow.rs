@@ -8,7 +8,7 @@
 //
 // C89 Control Flow Mega-Test
 //
-// Consolidates: if/while/for/do-while/switch/goto/break/continue tests from pcc/
+// Consolidates: if/while/for/do-while/switch/goto/break/continue tests from c17/
 //
 
 use crate::common::compile_and_run;

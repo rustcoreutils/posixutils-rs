@@ -1,5 +1,5 @@
 /*
- * pcc builtin stdbool.h
+ * c17 builtin stdbool.h
  *
  * This file is part of the posixutils-rs project covered under
  * the MIT License. For the full license text, please see the LICENSE

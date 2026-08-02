@@ -308,7 +308,7 @@ int test_typedef_as_struct_member(void) {
 
 // ============================================================================
 // Section 20: Non-power-of-2 __attribute__((aligned(3))) silently ignored
-// GCC errors on this; pcc silently ignores (skips non-power-of-2)
+// GCC errors on this; c17 silently ignores (skips non-power-of-2)
 // The variable should get natural alignment, not 3
 // ============================================================================
 

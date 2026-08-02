@@ -6,7 +6,7 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// C89 (ANSI C) tests for pcc
+// C89 (ANSI C) tests for c17
 //
 // This module contains mega-tests for C89-era features:
 // - datatypes: ALL integral, floating-point, and aggregate types

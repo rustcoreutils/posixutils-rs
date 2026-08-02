@@ -6,7 +6,7 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// Expression parsing for pcc C99 compiler
+// Expression parsing for c17 C99 compiler
 //
 
 use super::ast::{

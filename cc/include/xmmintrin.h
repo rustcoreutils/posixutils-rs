@@ -1,5 +1,5 @@
 /*
- * pcc builtin xmmintrin.h - SSE intrinsics
+ * c17 builtin xmmintrin.h - SSE intrinsics
  *
  * This file is part of the posixutils-rs project covered under
  * the MIT License. For the full license text, please see the LICENSE
@@ -10,6 +10,6 @@
 #ifndef _XMMINTRIN_H
 #define _XMMINTRIN_H
 
-#error "xmmintrin.h (SSE) intrinsics are not supported by pcc yet"
+#error "xmmintrin.h (SSE) intrinsics are not supported by c17 yet"
 
 #endif /* _XMMINTRIN_H */

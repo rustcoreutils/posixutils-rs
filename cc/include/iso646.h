@@ -1,7 +1,7 @@
 /*
  * iso646.h - C95/C99 alternative spellings for operators
  *
- * Builtin header for pcc compiler.
+ * Builtin header for c17 compiler.
  */
 #ifndef _ISO646_H
 #define _ISO646_H

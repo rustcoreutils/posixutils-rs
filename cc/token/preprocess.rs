@@ -374,7 +374,7 @@ pub struct Preprocessor<'a> {
     line_file_override: Option<String>,
 }
 
-/// Check if an attribute name is supported by pcc
+/// Check if an attribute name is supported by c17
 fn is_supported_attribute(name: &str) -> bool {
     matches!(
         name,
@@ -556,7 +556,7 @@ impl<'a> Preprocessor<'a> {
         self.define_macro(Macro::predefined(
             "__VERSION__",
             Some(concat!(
-                "\"pcc ",
+                "\"c17 ",
                 env!("CARGO_PKG_VERSION"),
                 " (gcc compatible 4.2.1)\""
             )),
@@ -2517,7 +2517,7 @@ impl<'a> Preprocessor<'a> {
         // Expect a string literal
         // C99 6.10.9p1 requires destringification (unescape \" and \\) and
         // re-tokenization as a #pragma directive. Since all pragmas are no-ops
-        // in pcc, we just consume and discard the string token.
+        // in c17, we just consume and discard the string token.
         if let Some(token) = iter.next() {
             if !matches!(token.typ, TokenType::String) {
                 // Not a valid _Pragma - just silently ignore

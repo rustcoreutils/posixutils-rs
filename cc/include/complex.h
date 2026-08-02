@@ -1,7 +1,7 @@
 /*
  * complex.h - C99 complex arithmetic <complex.h>
  *
- * Builtin header for pcc compiler.
+ * Builtin header for c17 compiler.
  */
 #ifndef _COMPLEX_H
 #define _COMPLEX_H

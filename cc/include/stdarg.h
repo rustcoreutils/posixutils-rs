@@ -1,5 +1,5 @@
 /*
- * pcc builtin stdarg.h
+ * c17 builtin stdarg.h
  *
  * This file is part of the posixutils-rs project covered under
  * the MIT License. For the full license text, please see the LICENSE

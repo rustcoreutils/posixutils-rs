@@ -1,6 +1,6 @@
 # Compiler Builtins
 
-Builtin functions supported by pcc. GCC/Clang compatible.
+Builtin functions supported by c17. GCC/Clang compatible.
 
 ## Variadic Functions
 

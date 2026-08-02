@@ -321,7 +321,7 @@ fn codegen_inline_asm_x86_64_fixed_precolor_collides_with_abi_pin() {
     // Today's linearizer stores incoming ABI-args to local stack
     // slots at function entry, so the asm operand is loaded back
     // through a fresh pseudo that's NOT ABI-pinned — meaning the
-    // bug doesn't trigger end-to-end on current pcc. This test
+    // bug doesn't trigger end-to-end on current c17. This test
     // therefore can't fail under the broken code today, but it
     // anchors the linearizer-side assumption: if a future change
     // makes the arg pseudo and the asm operand pseudo identical
@@ -534,7 +534,7 @@ end_goto:
 /// Plain pointer-aliased store/reload across an empty `asm volatile("" :::
 /// "memory")` compiler barrier. A reordering pass that ignored the
 /// barrier could forward the first store's value into the post-barrier
-/// load, missing the intervening store. Today pcc doesn't reorder; this
+/// load, missing the intervening store. Today c17 doesn't reorder; this
 /// test locks it in.
 #[test]
 fn codegen_inline_asm_memory_barrier_pointer_aliased_reload() {
@@ -964,7 +964,7 @@ int main(void) {
 #[test]
 fn codegen_inline_asm_x86_64_class_letter_q() {
     // `q` constraint — byte-class register. Used by kernel/glibc
-    // for byte stores via `movb`. pcc maps `q` to `Any` since every
+    // for byte stores via `movb`. c17 maps `q` to `Any` since every
     // modern x86_64 GP register has a low-byte alias.
     let code = r#"
 int main(void) {
@@ -989,7 +989,7 @@ int main(void) {
 #[test]
 fn codegen_inline_asm_x86_64_class_letter_i_immediate() {
     // `I` constraint — integer constant in [0, 31]. Used for shift
-    // counts. pcc maps `I` to `Imm`; the assembler enforces the
+    // counts. c17 maps `I` to `Imm`; the assembler enforces the
     // range.
     let code = r#"
 int main(void) {
@@ -1094,7 +1094,7 @@ int main(void) {
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn codegen_inline_asm_aarch64_class_letter_k_immediate() {
-    // `K` on aarch64 — 32-bit logical immediate. pcc maps to Imm.
+    // `K` on aarch64 — 32-bit logical immediate. c17 maps to Imm.
     let code = r#"
 int main(void) {
     int x = 0xFF;

@@ -1,6 +1,6 @@
-# pcc Documentation
+# c17 Documentation
 
-This directory contains detailed documentation for the pcc C compiler.
+This directory contains detailed documentation for the c17 C compiler.
 
 ## Documents
 
@@ -47,4 +47,4 @@ This directory contains detailed documentation for the pcc C compiler.
 
 ## See Also
 
-- [../README.md](../README.md) - Main pcc guide (building, testing, architecture)
+- [../README.md](../README.md) - Main c17 guide (building, testing, architecture)

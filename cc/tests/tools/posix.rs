@@ -685,11 +685,11 @@ fn cflow_analyzes_object_files() {
     let obj = dir.path().join("obj.o");
 
     // Build the object with our own compiler so the test needs no host toolchain
-    // beyond the assembler pcc already relies on.
-    let built = Command::new(env!("CARGO_BIN_EXE_pcc"))
+    // beyond the assembler c17 already relies on.
+    let built = Command::new(env!("CARGO_BIN_EXE_c17"))
         .args(["-c", &c, "-o", obj.to_str().unwrap()])
         .output()
-        .expect("run pcc");
+        .expect("run c17");
     assert!(
         built.status.success() && obj.exists(),
         "failed to build fixture object: {}",
@@ -709,7 +709,7 @@ fn cflow_analyzes_object_files() {
         stdout
     );
 
-    // Assembler-local labels are not program symbols. pcc emits `.L…` on ELF
+    // Assembler-local labels are not program symbols. c17 emits `.L…` on ELF
     // and the Mach-O assembler adds `ltmp…`/`L…`; neither belongs in a flowgraph.
     for line in stdout.lines() {
         let name = line.split_whitespace().nth(1).unwrap_or("");
@@ -761,10 +761,10 @@ fn cflow_recovers_external_call_edges() {
     );
     let obj = dir.path().join("ext.o");
 
-    let built = Command::new(env!("CARGO_BIN_EXE_pcc"))
+    let built = Command::new(env!("CARGO_BIN_EXE_c17"))
         .args(["-c", &c, "-o", obj.to_str().unwrap()])
         .output()
-        .expect("run pcc");
+        .expect("run c17");
     assert!(
         built.status.success() && obj.exists(),
         "failed to build fixture object: {}",

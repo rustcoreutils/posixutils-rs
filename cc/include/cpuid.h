@@ -1,6 +1,6 @@
 /*
  * Minimal cpuid.h - GCC-compatible CPUID intrinsics
- * For pcc (posixutils-rs C compiler)
+ * For c17 (posixutils-rs C compiler)
  */
 #ifndef _CPUID_H_INCLUDED
 #define _CPUID_H_INCLUDED

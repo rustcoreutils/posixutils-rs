@@ -6,7 +6,7 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// pcc - A POSIX C99 compiler
+// c17 - A POSIX C99 compiler
 //
 
 #![recursion_limit = "512"]
@@ -73,7 +73,7 @@ impl RuntimeLib {
 // ============================================================================
 
 #[derive(Parser)]
-#[command(version, about = gettext("pcc - compile standard C programs"))]
+#[command(version, about = gettext("c17 - compile standard C programs"))]
 struct Args {
     #[arg(required_unless_present = "print_targets", help = gettext("Input files"))]
     files: Vec<String>,
@@ -153,17 +153,17 @@ struct Args {
 
     /// Generate position-independent code (for shared libraries)
     /// Set by preprocess_args() when -fPIC or -fpic is passed
-    #[arg(long = "pcc-fpic", hide = true)]
+    #[arg(long = "c17-fpic", hide = true)]
     fpic: bool,
 
     /// Generate position-independent executable code (PIE)
     /// Set by preprocess_args() when -fPIE or -fpie is passed
-    #[arg(long = "pcc-fpie", action = clap::ArgAction::SetTrue, hide = true)]
+    #[arg(long = "c17-fpie", action = clap::ArgAction::SetTrue, hide = true)]
     fpie: bool,
 
     /// Disable PIE code generation (GCC compatibility)
     /// Set by preprocess_args() when -fno-pie is passed
-    #[arg(long = "pcc-fno-pie", action = clap::ArgAction::SetTrue, hide = true)]
+    #[arg(long = "c17-fno-pie", action = clap::ArgAction::SetTrue, hide = true)]
     fno_pie: bool,
 
     /// Produce a shared library
@@ -203,22 +203,22 @@ struct Args {
     libraries: Vec<String>,
 
     /// Disable builtin function recognition (GCC compatibility)
-    /// pcc does not implicitly recognize standard library functions as builtins,
+    /// c17 does not implicitly recognize standard library functions as builtins,
     /// so this flag is accepted for compatibility but has no effect.
     #[arg(long = "fno-builtin", help = gettext("Disable builtin function recognition"))]
     fno_builtin: bool,
 
     /// Disable specific builtin function (GCC compatibility)
     /// Accepts -fno-builtin-FUNC format via preprocess_args
-    #[arg(long = "pcc-fno-builtin-func", action = clap::ArgAction::Append, value_name = "func", hide = true)]
+    #[arg(long = "c17-fno-builtin-func", action = clap::ArgAction::Append, value_name = "func", hide = true)]
     fno_builtin_funcs: Vec<String>,
 
     /// Extra flags to pass through to the linker (set by preprocess_args)
-    #[arg(long = "pcc-linker-flag", action = clap::ArgAction::Append, value_name = "flag", hide = true)]
+    #[arg(long = "c17-linker-flag", action = clap::ArgAction::Append, value_name = "flag", hide = true)]
     linker_flags: Vec<String>,
 
     /// Unsupported machine flags captured by preprocess_args
-    #[arg(long = "pcc-unsupported-mflag", action = clap::ArgAction::Append, value_name = "flag", hide = true)]
+    #[arg(long = "c17-unsupported-mflag", action = clap::ArgAction::Append, value_name = "flag", hide = true)]
     unsupported_mflags: Vec<String>,
 }
 
@@ -564,7 +564,7 @@ fn process_file(
     }
 
     // Write temporary assembly file
-    let temp_asm = format!("/tmp/pcc_{}.s", std::process::id());
+    let temp_asm = format!("/tmp/c17_{}.s", std::process::id());
     {
         let mut file = File::create(&temp_asm)?;
         file.write_all(asm.as_bytes())?;
@@ -597,7 +597,7 @@ fn process_file(
     let exe_file = args.output.clone().unwrap_or_else(|| "a.out".to_string());
 
     // Assemble
-    let temp_obj = format!("/tmp/pcc_{}.o", std::process::id());
+    let temp_obj = format!("/tmp/c17_{}.o", std::process::id());
     let mut as_cmd = Command::new("as");
     if args.debug > 0 {
         as_cmd.arg("-g");
@@ -708,22 +708,22 @@ fn preprocess_args() -> Vec<String> {
             result.push(arg[2..].to_string());
             i += 1;
         } else if arg.starts_with("-std=") {
-            // -std=c99, -std=c11, etc. - ignore (pcc is C99)
+            // -std=c99, -std=c11, etc. - ignore (c17 is C99)
             i += 1;
         } else if arg == "-fPIC" || arg == "-fpic" {
-            // -fPIC / -fpic → --pcc-fpic (internal flag) (first one only)
+            // -fPIC / -fpic → --c17-fpic (internal flag) (first one only)
             if !seen_fpic {
-                result.push("--pcc-fpic".to_string());
+                result.push("--c17-fpic".to_string());
                 seen_fpic = true;
             }
             i += 1;
         } else if arg == "-fPIE" || arg == "-fpie" {
-            // -fPIE / -fpie → --pcc-fpie (internal flag)
-            result.push("--pcc-fpie".to_string());
+            // -fPIE / -fpie → --c17-fpie (internal flag)
+            result.push("--c17-fpie".to_string());
             i += 1;
         } else if arg == "-fno-pie" {
-            // -fno-pie → --pcc-fno-pie (internal flag)
-            result.push("--pcc-fno-pie".to_string());
+            // -fno-pie → --c17-fno-pie (internal flag)
+            result.push("--c17-fno-pie".to_string());
             i += 1;
         } else if arg == "-shared" {
             // -shared → --shared
@@ -734,8 +734,8 @@ fn preprocess_args() -> Vec<String> {
             result.push("--fno-builtin".to_string());
             i += 1;
         } else if let Some(func) = arg.strip_prefix("-fno-builtin-") {
-            // -fno-builtin-FUNC → --pcc-fno-builtin-func FUNC
-            result.push("--pcc-fno-builtin-func".to_string());
+            // -fno-builtin-FUNC → --c17-fno-builtin-func FUNC
+            result.push("--c17-fno-builtin-func".to_string());
             result.push(func.to_string());
             i += 1;
         } else if arg == "-fstrict-overflow"
@@ -744,11 +744,11 @@ fn preprocess_args() -> Vec<String> {
             || arg == "-fstrict-aliasing"
             || arg == "-fno-strict-aliasing"
         {
-            // GCC optimization flags - silently ignore (pcc doesn't have these optimizations)
+            // GCC optimization flags - silently ignore (c17 doesn't have these optimizations)
             i += 1;
         } else if arg.starts_with("-m") && arg.len() > 2 {
             // Machine flags - unsupported (SIMD/arch not supported yet)
-            result.push(format!("--pcc-unsupported-mflag={}", arg));
+            result.push(format!("--c17-unsupported-mflag={}", arg));
             i += 1;
         } else if arg.starts_with("-fvisibility")
             || arg == "-fno-semantic-interposition"
@@ -762,50 +762,50 @@ fn preprocess_args() -> Vec<String> {
             // GCC flags - silently ignore
             i += 1;
         } else if arg.starts_with("-fsanitize") {
-            // Sanitizer flags - silently ignore (pcc doesn't support sanitizers)
+            // Sanitizer flags - silently ignore (c17 doesn't support sanitizers)
             i += 1;
         } else if arg.starts_with("-f") && !arg.starts_with("-fno-builtin") {
             // Catch-all: silently ignore any other -f* flag we don't handle
             i += 1;
         } else if arg == "-p" || arg == "-pg" {
-            // Profiling flags - silently ignore (pcc doesn't support profiling)
+            // Profiling flags - silently ignore (c17 doesn't support profiling)
             i += 1;
         } else if arg == "-pipe" {
             // Misc GCC flags - silently ignore
             i += 1;
         } else if arg == "-pie" {
             // -pie enables PIE link mode
-            result.push("--pcc-fpie".to_string());
-            result.push("--pcc-linker-flag=-pie".to_string());
+            result.push("--c17-fpie".to_string());
+            result.push("--c17-linker-flag=-pie".to_string());
             i += 1;
         } else if arg == "-no-pie" {
             // -no-pie disables PIE link mode
-            result.push("--pcc-fno-pie".to_string());
-            result.push("--pcc-linker-flag=-no-pie".to_string());
+            result.push("--c17-fno-pie".to_string());
+            result.push("--c17-linker-flag=-no-pie".to_string());
             i += 1;
         } else if let Some(wl_args) = arg.strip_prefix("-Wl,") {
             // -Wl,flag1,flag2 -> pass each flag to linker
             for flag in wl_args.split(',') {
-                result.push(format!("--pcc-linker-flag={}", flag));
+                result.push(format!("--c17-linker-flag={}", flag));
             }
             i += 1;
         } else if arg == "-Xlinker" {
             // -Xlinker <arg> -> pass next arg to linker
             if i + 1 < raw_args.len() {
-                result.push(format!("--pcc-linker-flag={}", raw_args[i + 1]));
+                result.push(format!("--c17-linker-flag={}", raw_args[i + 1]));
                 i += 2;
             } else {
                 i += 1;
             }
         } else if arg == "-pthread" {
             // -pthread -> pass to linker and define _REENTRANT
-            result.push("--pcc-linker-flag=-pthread".to_string());
+            result.push("--c17-linker-flag=-pthread".to_string());
             result.push("-D".to_string());
             result.push("_REENTRANT".to_string());
             i += 1;
         } else if arg == "-rdynamic" {
             // -rdynamic -> pass to linker
-            result.push("--pcc-linker-flag=-rdynamic".to_string());
+            result.push("--c17-linker-flag=-rdynamic".to_string());
             i += 1;
         } else if arg == "--print-multiarch" {
             // GCC compatibility: print multiarch tuple and exit
@@ -876,7 +876,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Handle unsupported machine flags early
     if !args.unsupported_mflags.is_empty() {
         for flag in &args.unsupported_mflags {
-            eprintln!("pcc: unsupported machine flag: {}", flag);
+            eprintln!("c17: unsupported machine flag: {}", flag);
         }
         std::process::exit(1);
     }
@@ -894,7 +894,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match Target::from_triple(triple) {
             Some(t) => t,
             None => {
-                eprintln!("pcc: unsupported target: {}", triple);
+                eprintln!("c17: unsupported target: {}", triple);
                 std::process::exit(1);
             }
         }
@@ -908,7 +908,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("compiler-rt") => RuntimeLib::CompilerRt,
         Some(other) => {
             eprintln!(
-                "pcc: unknown rtlib '{}' (use 'libgcc' or 'compiler-rt')",
+                "c17: unknown rtlib '{}' (use 'libgcc' or 'compiler-rt')",
                 other
             );
             std::process::exit(1);
@@ -924,7 +924,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Warn about unrecognized file types
     for file in &args.files {
         if !is_source_file(file) && !is_asm_file(file) && !is_object_file(file) {
-            eprintln!("pcc: warning: unrecognized file type: {}", file);
+            eprintln!("c17: warning: unrecognized file type: {}", file);
         }
     }
 
@@ -938,17 +938,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let obj_file = if args.compile_only {
             args.output.clone().unwrap_or_else(|| format!("{}.o", stem))
         } else {
-            format!("/tmp/pcc_{}_{}.o", std::process::id(), stem)
+            format!("/tmp/c17_{}_{}.o", std::process::id(), stem)
         };
 
         // .S files need preprocessing, .s files don't
         let asm_to_assemble = if asm_path.ends_with(".S") {
             // Preprocess with internal preprocessor (assembly mode)
-            let temp_s = format!("/tmp/pcc_{}_{}.s", std::process::id(), stem);
+            let temp_s = format!("/tmp/c17_{}_{}.s", std::process::id(), stem);
             let content = match std::fs::read(asm_path) {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("pcc: cannot read '{}': {}", asm_path, e);
+                    eprintln!("c17: cannot read '{}': {}", asm_path, e);
                     std::process::exit(1);
                 }
             };
@@ -961,11 +961,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let preprocessed = preprocess_asm_file(&content, &target, asm_path, &asm_config);
             // Check for preprocessor errors (e.g., #error directive, missing include)
             if diag::has_error() != 0 {
-                eprintln!("pcc: preprocessing failed for {}", asm_path);
+                eprintln!("c17: preprocessing failed for {}", asm_path);
                 std::process::exit(1);
             }
             if let Err(e) = std::fs::write(&temp_s, &preprocessed) {
-                eprintln!("pcc: cannot write '{}': {}", temp_s, e);
+                eprintln!("c17: cannot write '{}': {}", temp_s, e);
                 std::process::exit(1);
             }
             temp_s
@@ -987,7 +987,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if !status.success() {
-            eprintln!("pcc: assembler failed for {}", asm_path);
+            eprintln!("c17: assembler failed for {}", asm_path);
             std::process::exit(1);
         }
 
@@ -1035,7 +1035,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = std::fs::remove_file(obj);
         }
         if !status.success() {
-            eprintln!("pcc: linker failed");
+            eprintln!("c17: linker failed");
             std::process::exit(1);
         }
         if args.verbose {
@@ -1048,7 +1048,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for path in &source_files {
         if let Err(e) = process_file(path, &mut streams, &args, &target) {
-            eprintln!("pcc: {}: {}", path, e);
+            eprintln!("c17: {}: {}", path, e);
             std::process::exit(1);
         }
     }
@@ -1140,7 +1140,7 @@ mod tests {
 
     fn run_preprocess(args: &[&str]) -> Vec<String> {
         // Simulate preprocess_args logic with all flag handling
-        let raw_args: Vec<String> = std::iter::once("pcc".to_string())
+        let raw_args: Vec<String> = std::iter::once("c17".to_string())
             .chain(args.iter().map(|s| s.to_string()))
             .collect();
 
@@ -1191,15 +1191,15 @@ mod tests {
                 i += 1;
             } else if arg == "-fPIC" || arg == "-fpic" {
                 if !seen_fpic {
-                    result.push("--pcc-fpic".to_string());
+                    result.push("--c17-fpic".to_string());
                     seen_fpic = true;
                 }
                 i += 1;
             } else if arg == "-fPIE" || arg == "-fpie" {
-                result.push("--pcc-fpie".to_string());
+                result.push("--c17-fpie".to_string());
                 i += 1;
             } else if arg == "-fno-pie" {
-                result.push("--pcc-fno-pie".to_string());
+                result.push("--c17-fno-pie".to_string());
                 i += 1;
             } else if arg == "-shared" {
                 result.push("--shared".to_string());
@@ -1208,12 +1208,12 @@ mod tests {
                 result.push("--fno-builtin".to_string());
                 i += 1;
             } else if let Some(func) = arg.strip_prefix("-fno-builtin-") {
-                result.push("--pcc-fno-builtin-func".to_string());
+                result.push("--c17-fno-builtin-func".to_string());
                 result.push(func.to_string());
                 i += 1;
             } else if arg.starts_with("-m") && arg.len() > 2 {
                 // Machine flags - unsupported (SIMD/arch not supported yet)
-                result.push(format!("--pcc-unsupported-mflag={}", arg));
+                result.push(format!("--c17-unsupported-mflag={}", arg));
                 i += 1;
             } else if (arg.starts_with("-f") && !arg.starts_with("-fno-builtin"))
                 || arg == "-p"
@@ -1223,32 +1223,32 @@ mod tests {
                 // Silently ignore -f* flags, profiling flags, -pipe
                 i += 1;
             } else if arg == "-pie" {
-                result.push("--pcc-fpie".to_string());
-                result.push("--pcc-linker-flag=-pie".to_string());
+                result.push("--c17-fpie".to_string());
+                result.push("--c17-linker-flag=-pie".to_string());
                 i += 1;
             } else if arg == "-no-pie" {
-                result.push("--pcc-fno-pie".to_string());
-                result.push("--pcc-linker-flag=-no-pie".to_string());
+                result.push("--c17-fno-pie".to_string());
+                result.push("--c17-linker-flag=-no-pie".to_string());
                 i += 1;
             } else if let Some(wl_args) = arg.strip_prefix("-Wl,") {
                 for flag in wl_args.split(',') {
-                    result.push(format!("--pcc-linker-flag={}", flag));
+                    result.push(format!("--c17-linker-flag={}", flag));
                 }
                 i += 1;
             } else if arg == "-Xlinker" {
                 if i + 1 < raw_args.len() {
-                    result.push(format!("--pcc-linker-flag={}", raw_args[i + 1]));
+                    result.push(format!("--c17-linker-flag={}", raw_args[i + 1]));
                     i += 2;
                 } else {
                     i += 1;
                 }
             } else if arg == "-pthread" {
-                result.push("--pcc-linker-flag=-pthread".to_string());
+                result.push("--c17-linker-flag=-pthread".to_string());
                 result.push("-D".to_string());
                 result.push("_REENTRANT".to_string());
                 i += 1;
             } else if arg == "-rdynamic" {
-                result.push("--pcc-linker-flag=-rdynamic".to_string());
+                result.push("--c17-linker-flag=-rdynamic".to_string());
                 i += 1;
             } else {
                 result.push(arg.clone());
@@ -1261,14 +1261,14 @@ mod tests {
     #[test]
     fn test_preprocess_fpic_uppercase() {
         let result = run_preprocess(&["-fPIC", "foo.c"]);
-        assert!(result.contains(&"--pcc-fpic".to_string()));
+        assert!(result.contains(&"--c17-fpic".to_string()));
         assert!(!result.contains(&"-fPIC".to_string()));
     }
 
     #[test]
     fn test_preprocess_fpic_lowercase() {
         let result = run_preprocess(&["-fpic", "foo.c"]);
-        assert!(result.contains(&"--pcc-fpic".to_string()));
+        assert!(result.contains(&"--c17-fpic".to_string()));
         assert!(!result.contains(&"-fpic".to_string()));
     }
 
@@ -1302,7 +1302,7 @@ mod tests {
     #[test]
     fn test_preprocess_combined() {
         let result = run_preprocess(&["-fPIC", "-shared", "-lz", "-L.", "foo.c"]);
-        assert!(result.contains(&"--pcc-fpic".to_string()));
+        assert!(result.contains(&"--c17-fpic".to_string()));
         assert!(result.contains(&"--shared".to_string()));
         assert!(result.contains(&"-l".to_string()));
         assert!(result.contains(&"z".to_string()));
@@ -1366,7 +1366,7 @@ mod tests {
     #[test]
     fn test_preprocess_m_flags_unsupported() {
         let result = run_preprocess(&["-msse2", "foo.c"]);
-        assert!(result.contains(&"--pcc-unsupported-mflag=-msse2".to_string()));
+        assert!(result.contains(&"--c17-unsupported-mflag=-msse2".to_string()));
         assert!(result.contains(&"foo.c".to_string()));
     }
 
@@ -1380,33 +1380,33 @@ mod tests {
     #[test]
     fn test_preprocess_fpie() {
         let result = run_preprocess(&["-fPIE", "foo.c"]);
-        assert!(result.contains(&"--pcc-fpie".to_string()));
+        assert!(result.contains(&"--c17-fpie".to_string()));
     }
 
     #[test]
     fn test_preprocess_fpie_lowercase() {
         let result = run_preprocess(&["-fpie", "foo.c"]);
-        assert!(result.contains(&"--pcc-fpie".to_string()));
+        assert!(result.contains(&"--c17-fpie".to_string()));
     }
 
     #[test]
     fn test_preprocess_fno_pie() {
         let result = run_preprocess(&["-fno-pie", "foo.c"]);
-        assert!(result.contains(&"--pcc-fno-pie".to_string()));
+        assert!(result.contains(&"--c17-fno-pie".to_string()));
     }
 
     #[test]
     fn test_preprocess_pie_linker_flag() {
         let result = run_preprocess(&["-pie", "foo.c"]);
-        assert!(result.contains(&"--pcc-fpie".to_string()));
-        assert!(result.contains(&"--pcc-linker-flag=-pie".to_string()));
+        assert!(result.contains(&"--c17-fpie".to_string()));
+        assert!(result.contains(&"--c17-linker-flag=-pie".to_string()));
     }
 
     #[test]
     fn test_preprocess_no_pie_linker_flag() {
         let result = run_preprocess(&["-no-pie", "foo.c"]);
-        assert!(result.contains(&"--pcc-fno-pie".to_string()));
-        assert!(result.contains(&"--pcc-linker-flag=-no-pie".to_string()));
+        assert!(result.contains(&"--c17-fno-pie".to_string()));
+        assert!(result.contains(&"--c17-linker-flag=-no-pie".to_string()));
     }
 
     // ========================================================================
@@ -1416,22 +1416,22 @@ mod tests {
     #[test]
     fn test_preprocess_wl_flags() {
         let result = run_preprocess(&["-Wl,-z,now", "foo.c"]);
-        assert!(result.contains(&"--pcc-linker-flag=-z".to_string()));
-        assert!(result.contains(&"--pcc-linker-flag=now".to_string()));
+        assert!(result.contains(&"--c17-linker-flag=-z".to_string()));
+        assert!(result.contains(&"--c17-linker-flag=now".to_string()));
         assert!(!result.contains(&"-Wl,-z,now".to_string()));
     }
 
     #[test]
     fn test_preprocess_xlinker() {
         let result = run_preprocess(&["-Xlinker", "--hash-style=gnu", "foo.c"]);
-        assert!(result.contains(&"--pcc-linker-flag=--hash-style=gnu".to_string()));
+        assert!(result.contains(&"--c17-linker-flag=--hash-style=gnu".to_string()));
         assert!(!result.contains(&"-Xlinker".to_string()));
     }
 
     #[test]
     fn test_preprocess_pthread() {
         let result = run_preprocess(&["-pthread", "foo.c"]);
-        assert!(result.contains(&"--pcc-linker-flag=-pthread".to_string()));
+        assert!(result.contains(&"--c17-linker-flag=-pthread".to_string()));
         // Should also define _REENTRANT
         assert!(result.contains(&"-D".to_string()));
         assert!(result.contains(&"_REENTRANT".to_string()));
@@ -1440,7 +1440,7 @@ mod tests {
     #[test]
     fn test_preprocess_rdynamic() {
         let result = run_preprocess(&["-rdynamic", "foo.c"]);
-        assert!(result.contains(&"--pcc-linker-flag=-rdynamic".to_string()));
+        assert!(result.contains(&"--c17-linker-flag=-rdynamic".to_string()));
     }
 
     #[test]
@@ -1483,6 +1483,6 @@ mod tests {
         assert!(!result.contains(&"-fno-plt".to_string()));
         assert!(!result.contains(&"-pipe".to_string()));
         // Linker flags should be passed through
-        assert!(result.iter().any(|a| a.starts_with("--pcc-linker-flag=")));
+        assert!(result.iter().any(|a| a.starts_with("--c17-linker-flag=")));
     }
 }

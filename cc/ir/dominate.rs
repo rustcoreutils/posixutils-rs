@@ -6,7 +6,7 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// Dominator tree computation for pcc C99 compiler
+// Dominator tree computation for c17 C99 compiler
 //
 // Algorithms used:
 // - Dominator tree: "A simple, fast dominance algorithm" by Cooper, Harvey, Kennedy

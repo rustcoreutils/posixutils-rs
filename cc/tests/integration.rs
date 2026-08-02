@@ -6,7 +6,7 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// Integration test harness for pcc
+// Integration test harness for c17
 //
 // Test organization by C standard and feature category:
 // - c89/: C89 standard tests (datatypes, operators, control flow, functions, globals, storage)

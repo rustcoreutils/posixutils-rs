@@ -7,6 +7,7 @@ awk	awk/
 basename	pathnames/basename.rs
 batch	process/batch.rs
 bc	calc/bc.rs
+c17	cc/
 cal	datetime/cal.rs
 cat	file/cat.rs
 cflow	cc/cflow.rs
@@ -82,7 +83,6 @@ paste	text/paste.rs
 patch	text/patch.rs
 pathchk	pathnames/pathchk.rs
 pax	pax/
-pcc	cc/
 pr	text/pr.rs
 printf	display/printf.rs
 prs	sccs/prs.rs

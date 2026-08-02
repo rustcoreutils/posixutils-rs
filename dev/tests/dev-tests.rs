@@ -833,6 +833,111 @@ fn test_strings_utf8_file() {
 }
 
 #[test]
+fn test_strings_offsets_are_file_relative_for_objects() {
+    // #S10: POSIX 115906 defines -t's offset as "from the start of the file".
+    // Scanning an object file section-by-section previously restarted the
+    // count at 0 for every section, so offsets were section-relative.
+    // Self-validating: each reported offset must actually locate that string
+    // in the file, which pins the property without hardcoding numbers.
+    let path = "tests/strings/object.o";
+    let bytes = fs::read(path).expect("object fixture");
+    let args = vec!["-t".to_string(), "d".to_string(), path.to_string()];
+    let out = plib::testing::run_test_base_with_env(
+        "strings",
+        &args,
+        b"",
+        &[("LC_CTYPE", "C"), ("LC_ALL", "C"), ("LANG", "C")],
+    );
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut checked = 0;
+    for line in stdout.lines() {
+        let (off, text) = line
+            .split_once(' ')
+            .expect("`-t d` emits \"<offset> <string>\"");
+        let off: usize = off.parse().expect("offset must be decimal");
+        assert!(
+            off + text.len() <= bytes.len(),
+            "offset {} for {:?} runs past the {}-byte file",
+            off,
+            text,
+            bytes.len()
+        );
+        assert_eq!(
+            &bytes[off..off + text.len()],
+            text.as_bytes(),
+            "offset {} does not locate {:?} in the file (section-relative?)",
+            off,
+            text
+        );
+        checked += 1;
+    }
+    assert!(checked > 1, "fixture should yield several strings");
+}
+
+#[test]
+fn test_strings_minimum_length_counts_characters_not_bytes() {
+    // #S9: POSIX 115860 counts printable *characters*. Three multi-byte
+    // characters span nine bytes, so a byte-based comparison wrongly cleared
+    // a `-n 4` threshold. GNU strings prints nothing here.
+    let dir = tempfile::TempDir::new().unwrap();
+    let f = dir.path().join("mb.bin");
+    // Three EURO SIGNs (U+20AC): 3 characters, 9 bytes.
+    fs::write(&f, "\u{20ac}\u{20ac}\u{20ac}\n").unwrap();
+
+    let args = vec!["-n".to_string(), "4".to_string(), f.display().to_string()];
+    let out = plib::testing::run_test_base_with_env(
+        "strings",
+        &args,
+        b"",
+        &[("LC_CTYPE", "C.UTF-8"), ("LC_ALL", "C.UTF-8")],
+    );
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "",
+        "a 3-character run must not satisfy -n 4 even though it spans 9 bytes"
+    );
+
+    // ...and four of them must still print, proving the threshold still works.
+    fs::write(&f, "\u{20ac}\u{20ac}\u{20ac}\u{20ac}\n").unwrap();
+    let out = plib::testing::run_test_base_with_env(
+        "strings",
+        &args,
+        b"",
+        &[("LC_CTYPE", "C.UTF-8"), ("LC_ALL", "C.UTF-8")],
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "\u{20ac}\u{20ac}\u{20ac}\u{20ac}\n"
+    );
+}
+
+#[test]
+fn test_strings_newline_terminates_a_string() {
+    // #S2: POSIX 115860 -- a printable string is terminated by <newline> or
+    // NUL. The audit flagged that no fixture contained an embedded newline,
+    // so nothing pinned this behavior.
+    let dir = tempfile::TempDir::new().unwrap();
+    let f = dir.path().join("nl.bin");
+    fs::write(&f, b"abcd\nefgh\nijkl\n").unwrap();
+
+    let args = vec![f.display().to_string()];
+    let out = plib::testing::run_test_base_with_env(
+        "strings",
+        &args,
+        b"",
+        &[("LC_CTYPE", "C"), ("LC_ALL", "C")],
+    );
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "abcd\nefgh\nijkl\n",
+        "each newline must end the current string rather than be absorbed into it"
+    );
+}
+
+#[test]
 fn test_strings_object_file() {
     // Pin LC_CTYPE so iswprint behavior is identical on glibc and Darwin.
     // The object file contains valid-UTF-8 Latin-1 supplement byte runs

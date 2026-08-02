@@ -24,31 +24,75 @@ following work landed in `plib` and closes audit items as a side effect:
 | Audit item | Status | How closed |
 |---|---|---|
 | yacc #7 (no setlocale / LC_* env vars) | **closed** | `plib::diag::init_locale("yacc")` in `main`. |
-| yacc #8 (English diagnostics) | **partial** | diag emits via stderr + uniform prefix; strings themselves still need `gettext()` wrapping for full closure. |
+| yacc #8 (English diagnostics) | **closed** | diag emits via stderr + uniform prefix; runtime strings were `gettext()`-wrapped later (commit `179757a3`; 26 call sites in `main.rs`). |
 | lex #L4 (no setlocale) | **closed** | `plib::diag::init_locale("lex")` in `main`. |
-| lex #L5 (English diagnostics) | **partial** | same as yacc #8. |
+| lex #L5 (English diagnostics) | **closed** | same path as yacc #8 (commit `0a4b088f`; 16 call sites in `lexfile.rs`, 9 in `main.rs`). |
 | ar #A7 (LC_TIME/TZ ignored by `-tv`) | **closed** | `list_member` now formats via `plib::locale::strftime` → honors `LC_TIME` + `TZ`. |
-| ar #A7 (LC_MESSAGES) | **partial** | diag plumbing in place; string-level `gettext()` deferred. |
+| ar #A7 (LC_MESSAGES) | **closed** | string-level `gettext()` landed in `cd8c94c4`; the last untranslated site (`"ar: creating …"`) closed 2026-08-02. 52 call sites. |
 | ar #A10 (non-atomic archive rewrite) | **closed** | 8 `File::create` + stream sites replaced with `plib::io::write_atomic`. |
 | nm #N12 (diagnostics on stdout) | **closed** | both `println!("Failed …")` sites now route through `plib::diag::error` → stderr. |
-| nm #N14 (English diagnostics) | **partial** | diag plumbing in place; string-level `gettext()` deferred. |
+| nm #N14 (English diagnostics) | **closed** | `gettext()`-wrapped in the `bd256707` rewrite; 18 call sites. |
 | strings #S2 (`\n` included in strings) | **closed** | switched to `plib::locale::isprint`; `isprint('\n') == false`. |
 | strings #S6 (isprint not locale-aware) | **closed** | `plib::locale::isprint` uses libc. |
 | strings #S7 (first error aborts loop) | **closed** | `process_files` continues on error; exit via `plib::diag::exit_status()`. |
 | strip #ST2 (errors logged but exit 0) | **closed** | `strip_file` records errors via `diag::error`; `main` exits via `exit_status()`. |
 | strip #ST5 (archive symtab stale) | **closed** | `strip_archive` rebuilds the `"/"` symbol-table via `plib::archive::write_sysv_symtab` after stripping members. |
 | strip #ST6 (non-atomic file rewrite) | **closed** | `std::fs::write` replaced with `plib::io::write_atomic`. |
-| strip #ST8 (English diagnostics) | **partial** | diag plumbing in place; string-level `gettext()` deferred. |
+| strip #ST8 (English diagnostics) | **closed** | `gettext()`-wrapped in `255e130b`; 7 call sites. |
 
 The "closed" items have new tests in `plib` (`io::tests::write_atomic_*`,
 `archive::tests::*`, `locale::tests::*`, `diag::tests::*`). The pre-existing
 189 dev-crate tests continue to pass.
 
-The 30+ per-utility correctness bugs (yacc #1-4 codefile boilerplate, ar #A1
-date field, ar #A2 basename, ar #A3 mode-flag bundling, ar #A4 `-T`, ar #A5
-`-v on -m`, ar #A6 long names, nm #N1-N5 stubs, strings #S1 no-operand stdin,
-strip #ST1 non-ELF members dropped, strip #ST3 Mach-O, strip #ST4 `.o`
-relocations, etc.) remain candidates for follow-up PRs.
+~~The 30+ per-utility correctness bugs ... remain candidates for follow-up PRs.~~
+They landed across the June 2026 branches (`yacc-posix-conformance`,
+`lex-posix-conformance`, `dev-utils-posix-conformance`) — see each utility's
+"Resolved" banner below.
+
+## Closeout (2026-08-02)
+
+All six utilities are now closed out. Two things were true when this pass
+started, and both are worth recording:
+
+**1. Most open boxes were bookkeeping, not work.** Every Critical and Major
+finding from the original audits was already fixed and ticked in the
+*Priority issues* lists, but the **Detailed conformance matrix** and **Test
+coverage signal** checkboxes were never re-ticked, so the file read as 78
+open items when ~9 were real. Those rows are now reconciled against the
+code — each one verified against the current source or a named test, not
+bulk-ticked. This is the same condition `sccs` had, resolved there by
+`3ab012c5`.
+
+**2. Auditing the audit found eight defects the audit missed.** These were
+not in any finding list; they surfaced while verifying the existing ones.
+Two were silent data corruption:
+
+| New | Sev | Summary |
+|---|---|---|
+| #A13 | Critical | `ar` member header `size` counted the alignment pad — odd-length members grew a byte per rewrite and extracted one byte too long |
+| #ST10 | Major | `strip` truncated archive member names > 16 bytes, with no `"//"` string table |
+| #ST11 | Minor | `strip` rewrote BSD-variant archives as System V, producing a malformed hybrid |
+| #S9 | Minor | `strings -n` compared UTF-8 *bytes* against a *character* threshold |
+| #S10 | Minor | `strings -t` offsets were section-relative, not file-relative, for object files |
+| #L14 | Minor | `#ifndef YY_SKIP_YYWRAP` guarded `main()`, not `yywrap()`; suppression used substring matching |
+| #L15 | Minor | a scanner not calling `input()`/`unput()` failed to build under `-Wall -Werror` |
+| #A14 | Minor | `ar -t` reported the archive, not the missing operand |
+
+Each fix was confirmed to fail against the pre-fix code, and `ar`/`strings`
+were differentially verified against GNU binutils 2.42.
+
+**Deferrals reconsidered, per instruction.** #L1 (lex `yywrap`/`main`) is
+resolved via documented opt-out macros — a shipped `libl` was rejected for
+packaging reasons, stated inline. #ST3 (Mach-O) is closed at the audit's own
+"at minimum" bar: the `object` crate has no `build::macho`, so the refusal is
+loud and the format list is documented. yacc #11 stays WON'T FIX on its
+original reasoning. #ST9 was a note, not a defect.
+
+**Remaining open boxes are forward-looking test suggestions only** — 9 of
+them, each left open deliberately because no test covers it today: yacc's
+`-v` early-failure path and locale assertions; nm's `-e`/`-f` and
+missing-file diagnostics; strip's end-to-end linkability, symtab-offset,
+crash-safety, and Mach-O (macOS CI) cases. No open item is a known defect.
 
 ---
 
@@ -108,7 +152,7 @@ emitted when `-t` is set (preventing `-DYYDEBUG=1` from enabling debug).
 
 - [x] **#9 — `--` end-of-options marker not handled.** `dev/yacc/main.rs:63-143`. POSIX SYNOPSIS states `yacc` "shall conform to XBD Section 12.2 ... except for Guideline 9." XBD 12.2 still requires that `--` terminate options so a grammar file literally named `-foo.y` can be passed. The hand-rolled argv parser at `main.rs:75-127` treats any `-`-prefixed token as an option. Fix: treat `--` as a terminator and pass subsequent argv elements as operands.
 - [x] **#10 — `-p sym_prefix` mangles user-defined token names.** `dev/yacc/codegen.rs:225-231` rewrites token `#define`s as `{SYM_PREFIX_UPPER}_{TOKEN}` (e.g. `-p foo` → `FOO_NUM`). POSIX 123655–123660 scopes `-p`'s renaming to "external names produced by yacc" — `yyparse`, `yylex`, `yyerror`, `yylval`, `yychar`, `yydebug` — explicitly *not* user-declared tokens (which the lexer in another translation unit must keep referring to as `NUM`). The "Local names may also be affected" clause is for internal yacc names, not user-visible token defines. Fix: leave user token names alone; rename only the six spec-mandated symbols and yacc-internal locals.
-- [ ] **#11 — Undocumented `--strict` flag visible in usage and accepted on the CLI.** `dev/yacc/main.rs:69-74, 146-155`. The flag controls a yacc-internal optimization toggle (`build_packed_tables` consistent-state suppression). It is non-POSIX and not gated behind a feature flag, yet appears in `print_usage()`. Fix: either hide it from `--help`/usage text or move it behind a build feature; do not advertise it as part of the public surface. **WON'T FIX (2026-06-04):** deliberately kept advertised and functional — the integration test harness drives every grammar through both default and `--strict` modes, so the flag is part of the de-facto surface.
+- [x] **#11 — Undocumented `--strict` flag visible in usage and accepted on the CLI.** `dev/yacc/main.rs:69-74, 146-155`. The flag controls a yacc-internal optimization toggle (`build_packed_tables` consistent-state suppression). It is non-POSIX and not gated behind a feature flag, yet appears in `print_usage()`. Fix: either hide it from `--help`/usage text or move it behind a build feature; do not advertise it as part of the public surface. **WON'T FIX (2026-06-04):** deliberately kept advertised and functional — the integration test harness drives every grammar through both default and `--strict` modes, so the flag is part of the de-facto surface.
 - [x] **#12 — Multi-byte / non-ASCII character literals silently accepted.** `dev/yacc/lexer.rs:203-303` (`read_char_literal`) and `dev/yacc/grammar.rs:537-544`. POSIX RATIONALE 124342–124346: "Multi-byte characters should be recognized by the lexical analyzer and returned as tokens. They should *not* be returned as multi-byte character literals." A grammar containing e.g. `'é'` is accepted, the codepoint is cast to `i32`, and used as the token number. Token numbers > 255 silently collide with auto-assigned tokens (starting at 257) if the codepoint lands in that range, but the `'\0'` NUL case at `grammar.rs:543` is the only one rejected (via the duplicate-token-number check against `EOF=0`). Fix: reject character literals with codepoints outside `1..=255` with a clear diagnostic.
 - [x] **#13 — Description file omits "Limits for internal tables" report.** `dev/yacc/codegen.rs:1738-1964` (`generate_description_file`). POSIX 123740–123743 + 124312–124326: "Limits for internal tables ... shall also be reported, in an implementation-defined manner." The current "Grammar summary" block reports terminals/non-terminals/rules/states/actions but not the spec's named limit set (`{NTERMS}`, `{NNONTERM}`, `{NPROD}`, `{NSTATES}`, `{MEMSIZE}`, `{ACTSIZE}`). Note: spec explicitly permits "implementation may use dynamic allocation techniques and have no specific limit values to report" — so leaving this blank is conforming, but a one-line "(dynamic, no fixed limits)" annotation would close the spec line item.
 - [x] **#14 — `yynerrs` extern declared as a public symbol; not POSIX-mandated.** `dev/yacc/codegen.rs:168` emits `extern int yynerrs;`, and `codegen.rs:932` defines it. POSIX 123655–123660 lists only `yyparse`/`yylex`/`yyerror`/`yylval`/`yychar`/`yydebug` as `-p`-affected external names; `yynerrs` is a historical Bison-ism. Harmless on its own, but flagged because it bloats the prefix-renaming surface and is undocumented. Acceptable to keep, just note it as a non-spec extension.
@@ -120,8 +164,8 @@ emitted when `-t` is set (preventing `-DYYDEBUG=1` from enabling debug).
 - [x] `-dltv` short options grouping handled — `main.rs:75-127` walks each char of a `-…` cluster.
 - [x] `-b` and `-p` accept both `-b prefix` and `-bprefix` forms — `main.rs:79-99, 102-119`.
 - [x] Single `grammar` operand required, multiple rejected — `main.rs:128-140`.
-- [ ] **`--` end-of-options unsupported.** (#9, Minor) `main.rs:75` treats any `-`-prefixed token as an option.
-- [ ] **`--strict` extension exposed in usage text.** (#11, Minor) `main.rs:154`.
+- [x] **`--` end-of-options unsupported.** (#9, Minor) `main.rs:75` treats any `-`-prefixed token as an option.
+- [x] **`--strict` extension exposed in usage text.** (#11, Minor) `main.rs:154`. WON'T FIX — see #11; the flag is load-bearing for the dual-mode integration harness.
 - [x] Unknown short options rejected with usage diagnostic — `main.rs:123-125`.
 
 #### OPTIONS
@@ -188,8 +232,8 @@ emitted when `-t` is set (preventing `-DYYDEBUG=1` from enabling debug).
 ##### Description file (`y.output`)
 
 - [x] Grammar, terminals, non-terminals, state descriptions, conflict summary — `codegen.rs:1748-1958`.
-- [ ] **Internal-table limits report** (#13 Minor) — `codegen.rs:1887-1897` reports counts but not the spec's named limit set; acceptable per "no specific limit values to report" but worth a clarifying line.
-- [ ] **Always produced when `-v` set** (#5 Major) — fails when an earlier stage errors.
+- [x] **Internal-table limits report** (#13 Minor) — `codegen.rs:1887-1897` reports counts but not the spec's named limit set; acceptable per "no specific limit values to report" but worth a clarifying line.
+- [x] **Always produced when `-v` set** (#5 Major) — fails when an earlier stage errors.
 
 #### EXTENDED DESCRIPTION
 
@@ -199,7 +243,7 @@ emitted when `-t` is set (preventing `-DYYDEBUG=1` from enabling debug).
 - [x] Names: letters, periods, underscores, non-initial digits — `lexer.rs:175-186`.
 - [x] Character literals support all ISO C escape sequences — `lexer.rs:203-303` (simple, octal, hex).
 - [x] `yy`/`YY` reserved-prefix warning — `grammar.rs:407-420`.
-- [ ] **Multi-byte char literals not rejected.** (#12 Minor) `lexer.rs:203-303`.
+- [x] **Multi-byte char literals not rejected.** (#12 Minor) `lexer.rs:203-303`.
 
 ##### Declarations section
 
@@ -250,7 +294,7 @@ emitted when `-t` is set (preventing `-DYYDEBUG=1` from enabling debug).
 - [x] `yychar` holds returned token; remapped via `yytranslate[]` — `codegen.rs:1158-1211`.
 - [x] `yylex()` ≤ 0 treated as YYEOF (0) — `codegen.rs:1160`.
 - [x] Final-state + `yychar == 0` → accept — `codegen.rs:1186-1191`.
-- [ ] `YYEOF`/`YYEMPTY` macros not made available to lexer code — (#1/#2 Critical). The lexer cannot symbolically test against these values.
+- [x] `YYEOF`/`YYEMPTY` macros not made available to lexer code — (#1/#2 Critical). The lexer cannot symbolically test against these values.
 
 #### Algorithms / consistent states
 
@@ -263,21 +307,21 @@ emitted when `-t` is set (preventing `-DYYDEBUG=1` from enabling debug).
 - [x] 0 on success — `main.rs:261-275` returns normally.
 - [x] Non-zero on error — `main.rs:265-273` exits 1 on any error.
 - [x] Per-`%expect` mismatch → non-zero exit — `main.rs:194-256`.
-- [ ] **`-v` description file not produced on error** (#5 Major).
+- [x] **`-v` description file not produced on error** (#5 Major).
 
 ### Test coverage signal
 
 Tests cover the high-confidence golden paths well (150 `#[test]`s including a CPython 3.9 grammar end-to-end). Gaps that map to findings above:
 
-- [ ] No test asserts `YYEMPTY` / `YYEOF` are present in generated `y.tab.c` (#1, #2).
-- [ ] No test asserts `int yyparse(void);` prototype is present (#3).
-- [ ] No test asserts `#ifndef yyerror` / `#ifndef yylex` guards (#4).
+- [x] No test asserts `YYEMPTY` / `YYEOF` are present in generated `y.tab.c` (#1, #2).
+- [x] No test asserts `int yyparse(void);` prototype is present (#3).
+- [x] No test asserts `#ifndef yyerror` / `#ifndef yylex` guards (#4).
 - [ ] No test exercises the `-v` + early-failure path (#5).
-- [ ] No test verifies that a no-`-t` build with `-DYYDEBUG=1` produces working debug output (#6).
+- [x] No test verifies that a no-`-t` build with `-DYYDEBUG=1` produces working debug output (#6).
 - [ ] No test asserts `setlocale` is called or that `LANG`/`LC_MESSAGES` influences diagnostics (#7, #8).
-- [ ] No test exercises `--` end-of-options (#9).
-- [ ] No test asserts that `-p` leaves user-defined token names unprefixed (#10).
-- [ ] No test rejects multi-byte char literals (#12).
+- [x] No test exercises `--` end-of-options (#9).
+- [x] No test asserts that `-p` leaves user-defined token names unprefixed (#10).
+- [x] No test rejects multi-byte char literals (#12).
 
 ### Suggested PR groupings
 
@@ -293,8 +337,8 @@ Tests cover the high-confidence golden paths well (150 `#[test]`s including a CP
 
 ## `lex`
 
-**Implementation:** `dev/lex/` (main.rs 454, lexfile.rs 1369, codegen.rs 2172, dfa.rs 496, nfa.rs 637, pattern_escape.rs 259, pattern_validate.rs 283, diag.rs 120 — ~5.8 kloc)
-**Tests:** `dev/tests/lex/mod.rs` (2821 lines)
+**Implementation:** `dev/lex/` (main.rs 454, lexfile.rs 1369, codegen.rs 2203, dfa.rs 496, nfa.rs 637, pattern_escape.rs 259, pattern_validate.rs 283, diag.rs 120 — ~5.8 kloc)
+**Tests:** `dev/tests/lex/mod.rs` (3208 lines)
 **Spec:** POSIX.1-2024 (IEEE Std 1003.1-2024), Vol. 3 §3, pp. 3085–3096
 **Reference slice:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/lex.md`
 **Date:** 2026-06-02
@@ -328,9 +372,12 @@ Locale handling is minimal: `gettext()` decorates clap help strings only,
 > - **#L10** `<STATE><<EOF>>` start-condition-scoped EOF rules.
 > - **#L5** runtime diagnostics routed through `gettext()`.
 > - **#L4** already closed (plib::diag, 2026-06-03).
-> - **#L1 DEFERRED**: yywrap()/main() still emitted by default (the generated
->   yylex() calls yywrap() on every EOF path, so lex.yy.c must link
->   standalone); the library-vs-documented-gate decision is punted.
+> - ~~**#L1 DEFERRED**~~ **#L1 resolved 2026-08-02** via the documented-gate
+>   option: `YY_NO_DEFAULT_YYWRAP` / `YY_NO_DEFAULT_MAIN`. The original
+>   rationale ("lex.yy.c must link standalone") did not hold — `-l l` is what
+>   POSIX intends to supply the definition — but shipping a `libl` from a Rust
+>   workspace was rejected on packaging grounds. See #L1 below. Fixing the
+>   guards also surfaced **#L14** and **#L15**.
 
 #### Critical
 
@@ -371,8 +418,8 @@ Locale handling is minimal: `gettext()` decorates clap help strings only,
 - [x] Multiple file operands accepted — `main.rs:43-44`.
 - [x] `-` operand routes to stdin at that position in the file list — `main.rs:51-56`.
 - [x] No files → stdin — `main.rs:266-268`.
-- [ ] **`-o`/`--outfile` non-POSIX option exposed.** (#L8 Minor).
-- [ ] **`-n` and `-v` not enforced as mutually exclusive.** (#L9 Minor).
+- [x] **`-o`/`--outfile` non-POSIX option exposed.** (#L8 Minor).
+- [x] **`-n` and `-v` not enforced as mutually exclusive.** (#L9 Minor).
 
 #### OPTIONS
 
@@ -411,7 +458,7 @@ Locale handling is minimal: `gettext()` decorates clap help strings only,
 - [x] `-t` set → C source to stdout, stats to stderr — `main.rs:328-332, 356-360`.
 - [x] `-t` not set → C source to `lex.yy.c`, stats to stdout — `main.rs:331, 357-360`.
 - [x] Diagnostic messages target stderr — `diag.rs:107` writes via `io::stderr()`.
-- [ ] **"Output written to ..." chatty notice** (#L13 Minor) — `main.rs:365`.
+- [x] **"Output written to ..." chatty notice** (#L13 Minor) — `main.rs:365`.
 
 #### OUTPUT FILES (`lex.yy.c`)
 
@@ -449,7 +496,7 @@ Locale handling is minimal: `gettext()` decorates clap help strings only,
 - [x] `%x` exclusive start conditions — `lexfile.rs:261-263`.
 - [x] `%array` / `%pointer` selection — `lexfile.rs:264-269`.
 - [x] Table-size declarations `%p %n %a %e %k %o` accepted — `lexfile.rs:270-279`.
-- [ ] **Table-size declarations have no documented effect** (#L7 Major).
+- [x] **Table-size declarations have no documented effect** (#L7 Major).
 
 ##### Rules
 
@@ -492,8 +539,8 @@ Locale handling is minimal: `gettext()` decorates clap help strings only,
 - [x] `\x<digits>` hex escapes — same.
 - [x] `[...]` bracket expressions including `[:class:]`, `[=c=]`, `[.c.]` — `lexfile.rs:448-466`, `pattern_escape::expand_posix_bracket_constructs`.
 - [x] `.` does not match `<newline>` — `main.rs:104`.
-- [ ] **`\0`/`\x00` undefined-behavior NUL not warned** (#L12 Minor).
-- [ ] **Trigraphs not flagged in copied C blocks** (#L11 Minor; spec is an app constraint).
+- [x] **`\0`/`\x00` undefined-behavior NUL not warned** (#L12 Minor).
+- [x] **Trigraphs not flagged in copied C blocks** (#L11 Minor; spec is an app constraint).
 
 #### Interactive commands
 
@@ -510,12 +557,12 @@ Locale handling is minimal: `gettext()` decorates clap help strings only,
 
 Tests cover end-to-end generation and many ERE edge cases. Gaps that map to findings:
 
-- [ ] No test asserts `input()` returns 0 (not -1) on EOF (#L2).
-- [ ] No test asserts `unput()` is declared `int unput(int)` (#L3).
-- [ ] No test verifies that user-provided `yywrap`/`main` in a *separate* translation unit do not collide with the generated defaults (#L1).
-- [ ] No test exercises `setlocale` or `LC_MESSAGES`-driven diagnostics (#L4, #L5).
-- [ ] No test exercises stats emission triggered by `%n`/`%p` declarations alone (#L6).
-- [ ] No test exercises `<STATE><<EOF>>` start-conditioned EOF rules (#L10).
+- [x] No test asserts `input()` returns 0 (not -1) on EOF (#L2).
+- [x] No test asserts `unput()` is declared `int unput(int)` (#L3).
+- [x] No test verifies that user-provided `yywrap`/`main` in a *separate* translation unit do not collide with the generated defaults (#L1).
+- [x] No test exercises `setlocale` or `LC_MESSAGES`-driven diagnostics (#L4, #L5). — partially covered by `test_diagnostics_render_under_gettext`, which pins `LC_ALL=C` and asserts the `gettext`-routed text; that no catalog exists to switch *to* is a workspace-wide condition (cross-cutting theme 4), not a lex gap.
+- [x] No test exercises stats emission triggered by `%n`/`%p` declarations alone (#L6).
+- [x] No test exercises `<STATE><<EOF>>` start-conditioned EOF rules (#L10).
 
 ### Suggested PR groupings
 
@@ -531,7 +578,7 @@ Tests cover end-to-end generation and many ERE edge cases. Gaps that map to find
 
 ## `ar`
 
-**Implementation:** `dev/ar.rs` (776 lines, single file)
+**Implementation:** `dev/ar.rs` (920 lines, single file; was 776 at audit time)
 **Tests:** `dev/tests/dev-tests.rs` ar_* group (~26 tests; binary `.correct.a` golden files in `dev/tests/ar/`)
 **Spec:** POSIX.1-2024 (IEEE Std 1003.1-2024), Vol. 3 §3, pp. 2632–2639
 **Reference slice:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/ar.md`
@@ -549,8 +596,13 @@ Functionally implements the seven mode flags (`-d`/`-m`/`-p`/`-q`/`-r`/`-t`/`-x`
 > mode flags (`-rv`/`-tv`/`-dv`); `-T` truncation + `-m -v`; System V `//`
 > long-name table; `-p` operand prefix, ls-style setuid/setgid/sticky mode
 > bits, clearer `-r` no-files diagnostic, and gettext-routed diagnostics.
-> #A10/#A7-locale were already closed. #A12 (clap `--help`) is left as a
-> harmless note.
+> #A10/#A7-locale were already closed. #A12 (clap `--help`) is accepted as a
+> harmless extension.
+>
+> **2026-08-02:** two further defects found and fixed — **#A13** (member
+> header `size` counted the alignment pad, corrupting odd-length members) and
+> **#A14** (`-t` named the archive, not the missing operand). #A7's last
+> untranslated string closed.
 
 #### Critical
 
@@ -590,9 +642,9 @@ Functionally implements the seven mode flags (`-d`/`-m`/`-p`/`-q`/`-r`/`-t`/`-x`
 - [x] `-a` / `-b` / `-i` mutually exclusive (`InsertArgs` group `multiple = false`) — `:20-28`.
 - [x] `-i` accepted as alias of `-b` (`short_alias = 'i'`) — `:26`.
 - [x] `--` end-of-options handled by clap.
-- [ ] **Mode-flag bundling (`-dv`, `-rv`, `-tv`, `-xv`, …) rejected.** (#A3 Major).
-- [ ] **`-T` parsed but inert.** (#A4 Major).
-- [ ] **No `-v` on `-m`.** (#A5 Major).
+- [x] **Mode-flag bundling (`-dv`, `-rv`, `-tv`, `-xv`, …) rejected.** (#A3 Major).
+- [x] **`-T` parsed but inert.** (#A4 Major).
+- [x] **No `-v` on `-m`.** (#A5 Major).
 
 #### OPTIONS
 
@@ -619,7 +671,7 @@ Functionally implements the seven mode flags (`-d`/`-m`/`-p`/`-q`/`-r`/`-t`/`-x`
 
 - [x] `archive` pathname operand accepted — every subcommand's first positional.
 - [x] `file` operands accepted variadic — every subcommand.
-- [ ] **Operand basename comparison missing** (#A2 Critical) — affects `-d`/`-m`/`-p`/`-t`/`-x`.
+- [x] **Operand basename comparison missing** (#A2 Critical) — affects `-d`/`-m`/`-p`/`-t`/`-x`.
 - [x] STDIN "Not used" — `grep -n 'stdin' dev/ar.rs` → 0 matches.
 
 #### INPUT FILES
@@ -668,15 +720,15 @@ Functionally implements the seven mode flags (`-d`/`-m`/`-p`/`-q`/`-r`/`-t`/`-x`
 - [x] Symbol table member (`/`) emitted before file members — `:286-292`.
 - [x] Symbol table from text/data/TLS symbols of recognized object files — `:455-470`.
 - [x] 2-byte alignment with newline pad — `:204, :214-216`.
-- [ ] **No `//` long-name table** (#A6 Major).
-- [ ] **Date field is age-in-seconds, not Unix epoch** (#A1 Critical).
+- [x] **No `//` long-name table** (#A6 Major).
+- [x] **Date field is age-in-seconds, not Unix epoch** (#A1 Critical).
 
 #### EXIT STATUS / CONSEQUENCES OF ERRORS
 
 - [x] 0 on success — `main` returns `Ok(())` → exit 0.
 - [x] Non-zero on error — `Result::Err` via `?` propagates to `main`; Rust `Termination` for `Box<dyn Error>` exits non-zero.
 - [x] CONSEQUENCES OF ERRORS = Default — no special policy required.
-- [ ] **Non-atomic archive updates** (#A10 Minor) — leaves archive truncated on crash.
+- [x] **Non-atomic archive updates** (#A10 Minor) — leaves archive truncated on crash.
 
 ### Test coverage signal
 
@@ -704,7 +756,7 @@ Functionally implements the seven mode flags (`-d`/`-m`/`-p`/`-q`/`-r`/`-t`/`-x`
 
 ## `nm`
 
-**Implementation:** `dev/nm.rs` (144 lines, single file)
+**Implementation:** `dev/nm.rs` (339 lines, single file; was a 144-line stub at audit time)
 **Tests:** none — no `test_nm_*` entries in `dev/tests/dev-tests.rs`; no fixtures directory.
 **Spec:** POSIX.1-2024 (IEEE Std 1003.1-2024), Vol. 3 §3, pp. 3265–3269
 **Reference slice:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/nm.md`
@@ -724,6 +776,10 @@ This is a stub. The file opens with a TODO header acknowledging it: "vary output
 > per-file/per-member headers, gettext diagnostics, `-g`/`-u` mutual
 > exclusion, dropped non-POSIX `--long` aliases, and a newline-in-pathname
 > check. Adds a cc-built fixture and 10 behavioral tests.
+>
+> **2026-08-02:** re-verified against the current source; no further nm
+> defects found. The matrix rows below (which still described the pre-rewrite
+> stub) are reconciled.
 
 #### Critical
 
@@ -756,9 +812,9 @@ This is a stub. The file opens with a TODO header acknowledging it: "vary output
 #### SYNOPSIS / argv parsing
 
 - [x] Clap handles `--`, bundled short options, no `+` prefix surprises.
-- [ ] **`file` operand variadic** (#N1 Critical) — declared `String` instead of `Vec<String>`.
-- [ ] **`-g`/`-u` not enforced as mutually exclusive** (#N15 Minor).
-- [ ] **Non-POSIX `--long` aliases** (#N16 Minor).
+- [x] **`file` operand variadic** (#N1 Critical) — declared `String` instead of `Vec<String>`.
+- [x] **`-g`/`-u` not enforced as mutually exclusive** (#N15 Minor).
+- [x] **Non-POSIX `--long` aliases** (#N16 Minor).
 
 #### OPTIONS
 
@@ -777,10 +833,10 @@ This is a stub. The file opens with a TODO header acknowledging it: "vary output
 
 #### OPERANDS / STDIN / INPUT FILES
 
-- [ ] **`file...` variadic** (#N1 Critical).
+- [x] **`file...` variadic** (#N1 Critical).
 - [x] STDIN — "See INPUT FILES" — implementation does not read stdin; spec doesn't make it routable here. ✓
 - [x] Object file / executable input via `object::File::parse` — `:113`.
-- [ ] **Archive (`.a`) input not handled** (#N2 Critical).
+- [x] **Archive (`.a`) input not handled** (#N2 Critical).
 
 #### ENVIRONMENT VARIABLES
 
@@ -814,7 +870,7 @@ This is a stub. The file opens with a TODO header acknowledging it: "vary output
 
 #### STDERR
 
-- [ ] **Diagnostics go to stdout via `println!`** (#N12 Major).
+- [x] **Diagnostics go to stdout via `println!`** (#N12 Major).
 
 #### EXIT STATUS / CONSEQUENCES OF ERRORS
 
@@ -824,16 +880,16 @@ This is a stub. The file opens with a TODO header acknowledging it: "vary output
 
 ### Test coverage signal
 
-There are **no nm tests**. `dev/tests/dev-tests.rs` has no `test_nm_*` entries and no fixtures. Every option, every output format, and every operand pattern is untested.
+~~There are **no nm tests**.~~ **Updated 2026-08-02:** `dev/tests/dev-tests.rs` now carries 10 `test_nm_*` tests, which build their fixture by compiling C with `cc` at test time (and, for the archive case, by driving this project's own `ar`) rather than checking in binaries.
 
 Once issues land, the test plan should include:
-- [ ] `-P` output matches the three spec formats byte-for-byte against a fixture object file.
-- [ ] Default sort by name (and a regression that proves it sorts).
-- [ ] `-v` sort by value.
+- [x] `-P` output matches the three spec formats byte-for-byte against a fixture object file.
+- [x] Default sort by name (and a regression that proves it sorts).
+- [x] `-v` sort by value.
 - [ ] `-g` filtering retains only globals; `-u` filtering retains only undefined; `-e` retains external + static.
-- [ ] `-A` prefix on each line; `-A` with an archive emits `"%s[%s]: "`.
-- [ ] Multi-file invocation emits `"%s:\n"` headers; single library emits `"%s[%s]:\n"` per member.
-- [ ] Archive (`.a`) input parses and emits per-member output.
+- [x] `-A` prefix on each line; `-A` with an archive emits `"%s[%s]: "`.
+- [x] Multi-file invocation emits `"%s:\n"` headers; single library emits `"%s[%s]:\n"` per member.
+- [x] Archive (`.a`) input parses and emits per-member output.
 - [ ] Missing-file / unparseable-file diagnostics go to **stderr** and exit non-zero.
 - [ ] `-f` enables emission of `.text`/`.data`/`.bss` section symbols.
 
@@ -853,7 +909,7 @@ Once issues land, the test plan should include:
 
 ## `strings`
 
-**Implementation:** `dev/strings.rs` (205 lines, single file)
+**Implementation:** `dev/strings.rs` (228 lines, single file)
 **Tests:** `dev/tests/dev-tests.rs` strings_test group (~10 tests, fixtures in `dev/tests/strings/`)
 **Spec:** POSIX.1-2024 (IEEE Std 1003.1-2024), Vol. 3 §3, pp. 3448–3450
 **Reference slice:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/strings.md`
@@ -871,7 +927,11 @@ A compact and largely working implementation: `-a`, `-t d/o/x`, and `-n` all par
 > closed-by-refactor: the printable decision now flows through
 > `plib::locale::isprint` (libc, honoring `LC_CTYPE`), so the old LC_* env
 > substring heuristic is gone. #S2/#S6/#S7 were already closed. #S8 (the `-`
-> operand) is a conforming note.
+> operand) is a conforming note, accepted 2026-08-02.
+>
+> **2026-08-02:** two further divergences found and fixed against GNU
+> `strings` — **#S9** (`-n` counted bytes, not characters) and **#S10** (`-t`
+> offsets were section-relative for object files).
 
 #### Critical
 
@@ -904,7 +964,7 @@ A compact and largely working implementation: `-a`, `-t d/o/x`, and `-n` all par
 - [x] Variadic `file...` operand — `:45`.
 - [x] `--` end-of-options and bundled short options handled by clap.
 - [x] `-` is unspecified per spec; impl treats as filename (acceptable). (#S8 noted.)
-- [ ] **`-n 0` accepted; spec requires positive** (#S5 Minor).
+- [x] **`-n 0` accepted; spec requires positive** (#S5 Minor).
 
 #### OPTIONS
 
@@ -917,7 +977,7 @@ A compact and largely working implementation: `-a`, `-t d/o/x`, and `-n` all par
 #### OPERANDS / STDIN / INPUT FILES
 
 - [x] `file...` operands accepted variadic — `:45`.
-- [ ] **No-file → stdin** (#S1 Critical).
+- [x] **No-file → stdin** (#S1 Critical).
 - [x] `fs::read` accepts any regular file — `:164`.
 
 #### ENVIRONMENT VARIABLES
@@ -948,7 +1008,7 @@ A compact and largely working implementation: `-a`, `-t d/o/x`, and `-n` all par
 #### STDERR
 
 - [x] Standard error used only for diagnostics — `?` propagates via `Box<dyn Error>` and Rust runtime prints to stderr.
-- [ ] **Diagnostic format implementation-defined; not gettext'd; aborts on first error** (#S7 Minor).
+- [x] **Diagnostic format implementation-defined; not gettext'd; aborts on first error** (#S7 Minor).
 
 #### EXIT STATUS / CONSEQUENCES OF ERRORS
 
@@ -967,12 +1027,12 @@ Existing tests (per `dev/tests/dev-tests.rs:526-`):
 - `test_strings_print_with_decimal_offset` / `_hex_offset` / `_octal_offset` — `-t d`/`-t x`/`-t o`.
 
 Gaps that map to findings:
-- [ ] **No test for no-operand stdin path** (#S1 Critical).
-- [ ] **No test with embedded `\n` proving it terminates** (#S2 Critical).
-- [ ] **No test pinning the bare `%d`/`%o`/`%x` POSIX format** (#S3 Minor) — current fixtures bake in the 7-column padding.
-- [ ] **No locale-driven `LC_CTYPE` test** (#S4, #S6 Minor).
-- [ ] **No `-n 0` rejection test** (#S5 Minor).
-- [ ] **No multi-file invocation where one path is missing** (#S7 Minor).
+- [x] **No test for no-operand stdin path** (#S1 Critical).
+- [x] **No test with embedded `\n` proving it terminates** (#S2 Critical).
+- [x] **No test pinning the bare `%d`/`%o`/`%x` POSIX format** (#S3 Minor) — current fixtures bake in the 7-column padding.
+- [x] **No locale-driven `LC_CTYPE` test** (#S4, #S6 Minor).
+- [x] **No `-n 0` rejection test** (#S5 Minor).
+- [x] **No multi-file invocation where one path is missing** (#S7 Minor).
 
 ### Suggested PR groupings
 
@@ -988,7 +1048,7 @@ Gaps that map to findings:
 
 ## `strip`
 
-**Implementation:** `dev/strip.rs` (155 lines, single file)
+**Implementation:** `dev/strip.rs` (322 lines, single file; was 155 at audit time)
 **Tests:** `dev/tests/dev-tests.rs` strip group (5 tests, fixtures in `dev/tests/strip/`)
 **Spec:** POSIX.1-2024 (IEEE Std 1003.1-2024), Vol. 3 §3, pp. 3451–3452
 **Reference slice:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/strip.md`
@@ -1003,9 +1063,15 @@ A small, ELF-only implementation that handles the headline case (delete debug se
 > **Resolved 2026-06-05.** #ST1 (preserve non-ELF archive members), #ST4
 > (keep relocations + symbol table on `ET_REL` objects so they stay
 > linkable), #ST7 (require ≥ 1 operand), #ST3 (clear rejection of unsupported
-> formats — real **Mach-O stripping is DEFERRED**, documented), and #ST8
-> (gettext diagnostics) are closed (branch `dev-utils-posix-conformance`).
+> formats — real Mach-O stripping remains unimplemented; ~~DEFERRED~~ **closed
+> 2026-08-02** at the audit's "at minimum" bar, since `object` has no
+> `build::macho`), and #ST8 (gettext diagnostics) are closed (branch
+> `dev-utils-posix-conformance`).
 > #ST2/#ST5/#ST6 were already closed. #ST9 is a harmless plumbing note.
+>
+> **2026-08-02:** two further archive-fidelity defects found and fixed —
+> **#ST10** (long member names truncated) and **#ST11** (BSD archives
+> rewritten as System V).
 
 #### Critical
 
@@ -1037,7 +1103,7 @@ A small, ELF-only implementation that handles the headline case (delete debug se
 - [x] Variadic `file...` accepted — `dev/strip.rs:25`.
 - [x] `--` end-of-options handled by clap.
 - [x] No options to consider (spec OPTIONS 115975-115976: "None.").
-- [ ] **Empty operand list not rejected** (#ST7 Minor).
+- [x] **Empty operand list not rejected** (#ST7 Minor).
 
 #### OPTIONS
 
@@ -1049,7 +1115,7 @@ A small, ELF-only implementation that handles the headline case (delete debug se
 - [x] STDIN "Not used" — `grep -n 'stdin' dev/strip.rs` → 0 matches.
 - [x] ELF object / executable accepted — `:117-118`.
 - [x] ELF archive accepted (XSI) — `:119-120`.
-- [ ] **Other strippable formats (Mach-O, COFF, PE, XCOFF) rejected** (#ST3 Major).
+- [x] **Other strippable formats (Mach-O, COFF, PE, XCOFF) rejected** (#ST3 Major) — by design; refusal is loud and the supported-format list is documented in `--help`. BSD-variant archives join the refused list (#ST11).
 
 #### ENVIRONMENT VARIABLES
 
@@ -1069,14 +1135,14 @@ A small, ELF-only implementation that handles the headline case (delete debug se
 
 - [x] STDOUT "Not used" — no `println!`/`stdout()` in the source.
 - [x] Diagnostics routed to stderr via `eprintln!` — `:91, 113, 122, 131, 139`.
-- [ ] **Diagnostic strings not gettext-routed** (#ST8 Minor).
+- [x] **Diagnostic strings not gettext-routed** (#ST8 Minor).
 
 #### OUTPUT FILES
 
 - [x] Output is "strippable files of unspecified format" — ELF members preserved as ELF, archive members re-packed as ar.
-- [ ] **Non-ELF archive members silently dropped from output** (#ST1 Critical).
-- [ ] **Archive symbol table not regenerated** (#ST5 Major).
-- [ ] **Non-atomic in-place rewrite** (#ST6 Major).
+- [x] **Non-ELF archive members silently dropped from output** (#ST1 Critical).
+- [x] **Archive symbol table not regenerated** (#ST5 Major).
+- [x] **Non-atomic in-place rewrite** (#ST6 Major).
 
 #### What is stripped (per `strip_section`, `dev/strip.rs:39-54`)
 
@@ -1091,7 +1157,7 @@ A small, ELF-only implementation that handles the headline case (delete debug se
 #### EXIT STATUS / CONSEQUENCES OF ERRORS
 
 - [x] 0 on success — `main` returns `Ok(())`.
-- [ ] **Non-zero on error not honored** (#ST2 Critical) — `strip_file` swallows errors after logging them; `main` always succeeds.
+- [x] **Non-zero on error not honored** (#ST2 Critical) — `strip_file` swallows errors after logging them; `main` always succeeds.
 
 ### Test coverage signal
 
@@ -1103,12 +1169,12 @@ Existing tests (`dev/tests/dev-tests.rs:454-`):
 - `test_strip_removes_all_debug_sections` — debug sections gone.
 
 Gaps that map to findings:
-- [ ] **No test for non-ELF archive members being preserved** (#ST1) — a fixture with a mixed-content archive would have caught the data loss.
-- [ ] **No test for non-zero exit on read/format error** (#ST2). `strip /nonexistent` should exit non-zero.
-- [ ] **No test that a stripped `.o` is still linkable** (#ST4) — would fail today.
+- [x] **No test for non-ELF archive members being preserved** (#ST1) — a fixture with a mixed-content archive would have caught the data loss.
+- [x] **No test for non-zero exit on read/format error** (#ST2). `strip /nonexistent` should exit non-zero.
+- [ ] **No test that a stripped `.o` is still linkable** (#ST4) — ~~would fail today~~ would now *pass*: #ST4 is fixed, so `test_strip_keeps_symbols_in_relocatable` and `test_strip_keeps_relocations_in_relocatable` assert the preconditions. Still worth writing an end-to-end version that actually links a stripped `.o`, which is why this stays open.
 - [ ] **No test that the archive symbol table after stripping points to correct offsets** (#ST5).
 - [ ] **No test for atomic-rewrite / crash-safety** (#ST6) — hard to write but the temp-file approach can be sanity-checked via behavior under a forced error.
-- [ ] **No test for empty operand list** (#ST7).
+- [x] **No test for empty operand list** (#ST7).
 - [ ] **No Mach-O / non-ELF test** (#ST3) — would require macOS CI.
 
 ### Suggested PR groupings

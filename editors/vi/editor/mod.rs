@@ -353,6 +353,11 @@ impl Editor {
         self.options.readonly = readonly;
     }
 
+    /// True when a file is currently being edited.
+    pub fn has_current_file(&self) -> bool {
+        self.files.current_file().is_some()
+    }
+
     /// True when writing is disallowed, from either `-R` or `:set readonly`.
     fn is_readonly(&self) -> bool {
         self.options.readonly || self.files.is_readonly()
@@ -1969,6 +1974,11 @@ impl Editor {
     fn execute_ex(&mut self, cmd: ExCommand) -> Result<ExResult> {
         match cmd {
             ExCommand::Quit { force } => {
+                // POSIX: quit warns while more files remain in the argument
+                // list, unless forced. The modified-buffer check is in quit().
+                if !force && self.files.has_more_files() {
+                    return Err(ViError::MoreFiles);
+                }
                 self.quit(force)?;
                 Ok(ExResult::Continue)
             }
@@ -2186,8 +2196,12 @@ impl Editor {
                 let lines = self.get_lines_for_list(&range, count)?;
                 Ok(ExResult::CommandOutput(lines))
             }
-            ExCommand::Join { range, count } => {
-                self.execute_ex_join(&range, count)?;
+            ExCommand::Join {
+                range,
+                count,
+                force,
+            } => {
+                self.execute_ex_join(&range, count, force)?;
                 Ok(ExResult::Continue)
             }
             ExCommand::Put { range, register } => {

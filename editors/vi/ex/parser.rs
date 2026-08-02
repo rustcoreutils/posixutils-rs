@@ -164,6 +164,12 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
         "j" | "join" => Ok(ExCommand::Join {
             range,
             count: parse_optional_count(args),
+            force: false,
+        }),
+        "j!" | "join!" => Ok(ExCommand::Join {
+            range,
+            count: parse_optional_count(args),
+            force: true,
         }),
 
         // Set command

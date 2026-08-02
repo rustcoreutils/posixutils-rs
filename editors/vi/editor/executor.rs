@@ -26,48 +26,67 @@ impl Editor {
         &mut self,
         range: &AddressRange,
         count: Option<usize>,
+        force: bool,
     ) -> Result<()> {
         let current = self.buffer.cursor().line;
 
-        // Determine the range of lines to join
+        // Range/count interaction per ex.md §95043-95057.
+        //   count, no address     -> (., . + count)
+        //   count, one address    -> (addr, addr + count)
+        //   count, two addresses  -> (addr1, addr2 + count - 1)
+        //   no count, no address  -> (., . + 1)
+        //   no count, one address -> (addr, addr + 1)
+        // A resulting second address past the last line is clamped to it.
+        let two_addrs = range.end.is_some();
         let (start, mut end) = if range.explicit {
             range.resolve(&self.addr_ctx_at(current))?
-        } else if let Some(c) = count {
-            // No address: current line and current + count
-            (current, (current + c).min(self.buffer.line_count()))
         } else {
-            // No address, no count: current line and next line
-            (current, (current + 1).min(self.buffer.line_count()))
+            (current, current)
         };
-
-        // Apply count to extend the range if both range and count are specified
-        if let Some(c) = count {
-            if range.explicit {
-                end = (end + c - 1).min(self.buffer.line_count());
-            }
-        }
+        end = match count {
+            Some(c) if two_addrs => end + c.saturating_sub(1),
+            Some(c) => start + c,
+            None if two_addrs => end,
+            None => start + 1,
+        };
+        let end = end.min(self.buffer.line_count());
+        let end = end;
 
         if start >= end || start > self.buffer.line_count() {
             return Ok(()); // Nothing to join
         }
 
-        // Build the joined line
+        // Build the joined line following ex.md §95060-95070 exactly.
+        //
+        // `j!` joins with no modification at all. Otherwise, for each
+        // subsequent line: discard leading blanks; skip the line if that left
+        // it empty; join with no separator if the accumulated text already ends
+        // in a blank or the joined line starts with ')'; use TWO spaces if the
+        // accumulated text ends in '.'; otherwise a single space.
         let mut result = String::new();
         for line_num in start..=end {
             if let Some(line) = self.buffer.line(line_num) {
                 let content = line.content();
-                if result.is_empty() {
+                if line_num == start {
                     result = content.to_string();
-                } else {
-                    // Add space and trimmed content (POSIX: discard leading spaces)
-                    let trimmed = content.trim_start();
-                    if !trimmed.is_empty() {
-                        if !result.is_empty() && !result.ends_with(' ') {
-                            result.push(' ');
-                        }
-                        result.push_str(trimmed);
-                    }
+                    continue;
                 }
+                if force {
+                    result.push_str(content);
+                    continue;
+                }
+                let trimmed = content.trim_start_matches([' ', '\t']);
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if result.ends_with([' ', '\t']) || trimmed.starts_with(')') {
+                    // join without further modification
+                } else if result.ends_with('.') {
+                    result.push_str("  ");
+                } else {
+                    result.push(' ');
+                }
+                result.push_str(trimmed);
             }
         }
 

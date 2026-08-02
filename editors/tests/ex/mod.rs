@@ -967,3 +967,64 @@ fn test_ex_read_shell_command_inherits_stdin() {
         out
     );
 }
+
+// ============================================================================
+// Command modifier/arg gaps (audit line 345) -- part 1
+// ============================================================================
+
+#[test]
+fn test_ex_join_follows_posix_rules() {
+    // ex.md §95060-95070. The old implementation collapsed all of this into
+    // "trim leading spaces, add one space".
+    //
+    // Rule 4: current line ends in '.' -> two spaces.
+    ex_test_with_file(
+        "End of sentence.\n   next line\n",
+        "1,2j\n1l\nq!\n",
+        "End of sentence.  next line$\n",
+    );
+    // Rule 3: joined line starts with ')' -> no separator at all.
+    ex_test_with_file("foo\n  ) paren\n", "1,2j\n1l\nq!\n", "foo) paren$\n");
+    // Rule 2: a line that is empty after trimming is dropped.
+    ex_test_with_file("a\n\nb\n", "1,3j\n1l\nq!\n", "a b$\n");
+    // Rule 5: otherwise a single space.
+    ex_test_with_file("a\n   b\n", "1,2j\n1l\nq!\n", "a b$\n");
+}
+
+#[test]
+fn test_ex_join_bang_does_not_modify_lines() {
+    // §95060-95061: `j!` joins with no modification of any line, so the
+    // leading whitespace survives verbatim.
+    ex_test_with_file(
+        "End of sentence.\n   next line\n",
+        "1,2j!\n1l\nq!\n",
+        "End of sentence.   next line$\n",
+    );
+}
+
+#[test]
+fn test_ex_quit_warns_while_more_files_remain() {
+    // POSIX: `:q` warns while files remain in the argument list; `:q!` does
+    // not. Previously `:q` ignored the argument list entirely.
+    let dir = TempDir::new().unwrap();
+    let a = dir.path().join("a.txt");
+    let b = dir.path().join("b.txt");
+    fs::write(&a, "A\n").unwrap();
+    fs::write(&b, "B\n").unwrap();
+
+    let mut child = Command::new(get_binary_path("ex"))
+        .args(["-s", a.to_str().unwrap(), b.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ex");
+    child.stdin.as_mut().unwrap().write_all(b"q\nq!\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.to_lowercase().contains("more files"),
+        "plain :q should warn that more files remain, got {:?}",
+        err
+    );
+}

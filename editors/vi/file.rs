@@ -59,6 +59,11 @@ impl FileManager {
         }
     }
 
+    /// True when files after the current one remain in the argument list.
+    pub fn has_more_files(&self) -> bool {
+        self.arg_index + 1 < self.arg_list.len()
+    }
+
     /// True when `:f`/`:r` changed the current pathname since the last write.
     pub fn pathname_changed(&self) -> bool {
         self.pathname_changed

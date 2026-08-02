@@ -324,7 +324,7 @@ mandated mark-then-execute.
 
 #### OPTIONS
 - [x] `-R` CONFORMS; `-v` CONFORMS (`lib.rs`).
-- [ ] **`-c`/`+command` PARTIAL** — run unconditionally, not only on first existing-file load.
+- [x] **`-c`/`+command`** — ✓ fixed (2026-08-02): now runs only when a file was actually opened, per POSIX; it previously ran unconditionally against an empty buffer.
 - [x] **`-r`** ✓ (phase 6, #X5); **`-t`** ✓ (phase 7, #X8).  **`-s` PARTIAL** — #X3; **`-w` PARTIAL** — parsed, not applied.
 
 #### OPERANDS / STDIN
@@ -349,7 +349,7 @@ mandated mark-then-execute.
 #### Commands
 - [x] `ar co/t d m nu p pu q(!) rew se(t) u ya = # & ya` CONFORM.
 - [ ] **`g`/`v` single-pass** (#X7); **`s` gaps** (#X12); **`sh[ell]` no `-i`** (#X13).
-- [ ] **PARTIAL (modifier/arg gaps):** `a`/`i`/`c` (no `!` autoindent toggle), `cd`, `e`/`n` (`+command` & file args), `f`, `j` (`!`, two-space rule), `l` (escape table), `o`, `q` (remaining-files check), `r` (#X23), `so`, `ta`, `vi[sual]`, `w`/`wq`/`x` (#X22), `z` (`!`/multi-type), `!` (warn), `@`/`@@`.
+- [ ] **PARTIAL (modifier/arg gaps).** *Split into named items 2026-08-02; this box was one opaque checkbox covering ~15 commands.* Closed so far: **`j`** (`!` plus the full §95060-95070 rule set — two spaces after `.`, no separator before `)`, empty lines dropped — and the §95043-95057 count/address interaction), **`q`** (remaining-files check), **`r`** (#X23), **`w`/`wq`/`x`** (#X22/#X24/#X29). Still open, itemized: `a`/`i`/`c` `!` autoindent toggle, `cd`, `e`/`n` `+command` and file args, `f`, `l` escape table, `o`, `so`, `ta`, `vi[sual]`, `z` (`!`/multi-type), `!` warn message, `@`/`@@`.
 - [ ] **MISSING:** `pre[serve]`, `rec[over]`, `~` (#X18).
 
 #### `set` options

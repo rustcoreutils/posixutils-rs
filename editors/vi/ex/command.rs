@@ -94,6 +94,8 @@ pub enum ExCommand {
     Join {
         range: AddressRange,
         count: Option<usize>,
+        /// `j!` -- join without modifying any line (ex.md §95060-95061).
+        force: bool,
     },
     /// Set options (:se, :set).
     Set { args: String },

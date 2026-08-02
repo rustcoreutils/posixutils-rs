@@ -634,6 +634,118 @@ fn test_strip_preserves_non_elf_archive_members() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn test_strip_preserves_long_archive_member_names() {
+    // #ST10: a member name longer than the 16-byte header field must be
+    // written to a System V "//" string table, not truncated. The `ar` crate
+    // resolves long names on read, so truncating on write silently renamed
+    // the member and produced an archive the linker could not match.
+    const LONG: &str = "a_very_long_member_name.o";
+    assert!(LONG.len() > 16, "fixture name must exceed the header field");
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let cpath = dir.path().join("s.c");
+    let opath = dir.path().join(LONG);
+    fs::write(&cpath, "int a_symbol_here(void){return 1;}\n").unwrap();
+    assert!(std::process::Command::new("cc")
+        .args(["-c", "-o", opath.to_str().unwrap(), cpath.to_str().unwrap()])
+        .status()
+        .expect("cc")
+        .success());
+
+    let arc = dir.path().join("lib.a");
+    assert!(std::process::Command::new(env!("CARGO_BIN_EXE_ar"))
+        .args(["-r", "-c", arc.to_str().unwrap(), opath.to_str().unwrap()])
+        .status()
+        .expect("ar")
+        .success());
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_strip"))
+        .arg(&arc)
+        .output()
+        .expect("failed to run strip");
+    assert!(
+        out.status.success(),
+        "strip failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let bytes = fs::read(&arc).unwrap();
+    let archive = object::read::archive::ArchiveFile::parse(&*bytes)
+        .expect("stripped archive must still parse");
+    let names: Vec<String> = archive
+        .members()
+        .map(|m| String::from_utf8_lossy(m.unwrap().name()).to_string())
+        .collect();
+    assert!(
+        names.iter().any(|n| n == LONG),
+        "long member name must survive stripping intact, got {:?}",
+        names
+    );
+}
+
+#[test]
+fn test_strip_rejects_bsd_variant_archive() {
+    // #ST11: `!<arch>\n` is shared by the System V and BSD layouts. Our writer
+    // only speaks System V, so a BSD archive (the macOS default) must be
+    // refused rather than silently rewritten into a malformed hybrid.
+    let dir = tempfile::TempDir::new().unwrap();
+    let arc = dir.path().join("bsd.a");
+
+    // Minimal BSD archive: the `#1/<len>` header form stores the member name
+    // inline, immediately after the header, and counts it in the size field.
+    let name = b"a_long_bsd_member_name.o";
+    let mut padded_name = name.to_vec();
+    while padded_name.len() % 8 != 0 {
+        padded_name.push(0);
+    }
+    let payload = b"\x7fELF fake object payload";
+
+    let mut header = Vec::new();
+    header.extend_from_slice(format!("#1/{}", padded_name.len()).as_bytes());
+    header.resize(16, b' ');
+    let field = |v: String, n: usize| {
+        let mut f = v.into_bytes();
+        f.resize(n, b' ');
+        f
+    };
+    header.extend(field("0".into(), 12)); // mtime
+    header.extend(field("0".into(), 6)); // uid
+    header.extend(field("0".into(), 6)); // gid
+    header.extend(field("100644".into(), 8)); // mode
+    header.extend(field((padded_name.len() + payload.len()).to_string(), 10));
+    header.extend_from_slice(b"`\n");
+    assert_eq!(header.len(), 60, "archive member header must be 60 bytes");
+
+    let mut bytes = b"!<arch>\n".to_vec();
+    bytes.extend_from_slice(&header);
+    bytes.extend_from_slice(&padded_name);
+    bytes.extend_from_slice(payload);
+    fs::write(&arc, &bytes).unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_strip"))
+        .arg(&arc)
+        .output()
+        .expect("failed to run strip");
+    assert!(
+        !out.status.success(),
+        "strip must reject a BSD-variant archive rather than corrupt it"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("BSD"),
+        "diagnostic must name the unsupported variant: {}",
+        err
+    );
+    // The input must be left untouched by a refused run.
+    assert_eq!(
+        fs::read(&arc).unwrap(),
+        bytes,
+        "a refused archive must not be modified"
+    );
+}
+
 #[test]
 fn test_strip_removes_all_debug_sections() {
     const DEBUG_SECTIONS: [&[u8]; 7] = [

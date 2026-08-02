@@ -22,7 +22,17 @@ use std::{
 };
 
 #[derive(Parser)]
-#[command(version, about = gettext("strip - remove unnecessary information from strippable files"))]
+#[command(version, about = gettext("strip - remove unnecessary information from strippable files"),
+          long_about = gettext("strip - remove unnecessary information from strippable files\n\n\
+Supported input formats:\n  \
+  * ELF relocatable objects, executables, and shared objects\n  \
+  * System V / GNU `ar` archives of the above\n\n\
+Relocatable objects (ET_REL) keep their symbol table and relocations so they\n\
+remain linkable; only debugging information is removed. Executables and shared\n\
+objects additionally lose their symbol table.\n\n\
+Other formats -- Mach-O, COFF/PE, XCOFF, and BSD-variant archives -- are\n\
+rejected with a diagnostic and a non-zero exit rather than being modified or\n\
+silently passed through."))]
 struct Args {
     // POSIX SYNOPSIS makes the `file...` operand required (>= 1).
     #[arg(num_args = 1.., required = true)]

@@ -202,10 +202,10 @@ BRE veneer over an ERE engine. A handful of parsed-but-unhandled commands
 
 #### Minor
 - [x] **#V11 — `-w size` consumed but discarded.** ✓ fixed (phase 8): `-w` parses its size into `EditorOptions.window`; `Editor::set_window` applies it.
-- [ ] **#V12 — `stty` erase/kill chars not honored** (remaining, minor). Hardcoded `^H`/`^U` work for the common case; honoring `c_cc[VERASE]`/`VKILL` needs termios plumbing into insert mode. Deferred.
+- [x] **#V12 — `stty` erase/kill chars not honored** (~~remaining, minor~~). ~~Deferred.~~ **✓ fixed (2026-08-02).** `Terminal` now exposes `erase_char()`/`kill_char()` read from the termios captured *before* raw mode was entered (treating 0 and `_POSIX_VDISABLE` as "unset"), and `enter_insert` carries them into the `InsertState`. The hardcoded `^H`/`^U` still work; a configured erase/kill character now works too. Test `test_insert_honors_configured_erase_and_kill_chars`, driven at the `InsertState` level since a headless editor has no termios to read and the PTY harness cannot set `stty erase` for the child.
 - [x] **#V13 — Missing `set` options.** ✓ fixed (phase 9): `beautify`, `directory`, `edcompatible`, `mesg`, `prompt`, `redraw`, `remap`, `slowopen`, `warn` added to `Options` with set/no/query support (`prompt` is wired to the ex prompt; the rest are accepted/stored).
 - [x] **#V14 — `^L` and `^R` share one handler.** ✓ fixed (phase 8): `^L` clears the physical screen before redraw; `^R` does a plain redraw. (Per-`@`-line refresh remains a cosmetic nicety.)
-- [ ] **#V15 — NUL-in-insert (re-insert last input) not implemented** (remaining, minor). Needs cross-insert-session storage of the previous insertion. Deferred.
+- [x] **#V15 — NUL-in-insert (re-insert last input) not implemented** (~~remaining, minor~~). ~~Deferred.~~ **✓ fixed (2026-08-02).** `Editor` keeps the text of the last completed insert session and hands it to the next one, where a NUL replays it. Note the input reader maps byte 0 to `Key::Ctrl('@')`, not `Key::Char('\0')`, so the obvious match arm silently never fires — recorded because it cost a PTY round trip to find. PTY test `test_pty_vi_nul_reinserts_previous_input`.
 - [x] **#V16 — Search is imperfect BRE over ERE.** ✓ fixed (phase 4): `search.rs` now uses `plib::regex` (libc BRE). `convert_pattern` magic mode is a passthrough (libc handles `\(\) \{\} \<\>` and treats `+?|(){}` as literal); nomagic escapes metacharacters. `Substitutor` rewritten with `captures_at` + a back-reference-aware `build_replacement`. Tests: `test_substitute_bre_*`, `test_search_bre_grouping`.
 
 ### Detailed conformance matrix
@@ -243,7 +243,7 @@ BRE veneer over an ERE engine. A handful of parsed-but-unhandled commands
 
 #### Insert mode
 - [x] ESC, `^H`, `^W`, `^U`, `^T` CONFORM — `mode/insert.rs`.
-- [ ] **`^V` PARTIAL** (no visual feedback); **`^D` PARTIAL** (`0^D`/`^^D` edge cases); autoindent-on-blank PARTIAL; **stty erase/kill MISSING** (#V12); **NUL re-input MISSING** (#V15).
+- [ ] **`^V` PARTIAL** (no visual feedback); **`^D` PARTIAL** (`0^D`/`^^D` edge cases); autoindent-on-blank PARTIAL. ~~stty erase/kill MISSING (#V12)~~ ✓ fixed 2026-08-02; ~~NUL re-input MISSING (#V15)~~ ✓ fixed 2026-08-02.
 
 #### EXIT STATUS / CONSEQUENCES OF ERRORS
 - [x] 0/1 exit code propagated — `lib.rs:73-140`, `vi_main.rs:15`.

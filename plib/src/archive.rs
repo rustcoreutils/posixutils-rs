@@ -71,6 +71,134 @@ pub fn pad_metadata_field<const N: usize>(s: &str) -> io::Result<[u8; N]> {
     Ok(buf)
 }
 
+/// Longest member name that fits inline in the 16-byte header name field.
+/// The System V layout stores short names as `"<name>/"`, so one byte of the
+/// field is spent on the terminator.
+pub const MAX_INLINE_NAME: usize = 15;
+
+/// Builder for the System V `"//"` long-name string-table member.
+///
+/// Member names longer than [`MAX_INLINE_NAME`] cannot fit the 16-byte header
+/// field. System V stores them in a dedicated `"//"` member as `"<name>/\n"`
+/// records, and the owning member's name field then carries `"/<offset>"`.
+/// Both `ar` (building archives) and `strip` (rewriting them) must agree on
+/// this layout, which is why it lives here rather than in either utility.
+///
+/// Push every member name in archive order, then use [`NameTable::offset`]
+/// when writing each member header:
+///
+/// ```
+/// use plib::archive::NameTable;
+/// let mut names = NameTable::new();
+/// names.push(b"short.o");
+/// names.push(b"a_very_long_member_name.o");
+/// assert_eq!(names.offset(0), None);        // stored inline
+/// assert_eq!(names.offset(1), Some(0));     // stored in the "//" member
+/// assert!(!names.is_empty());
+/// ```
+#[derive(Debug, Default, Clone)]
+pub struct NameTable {
+    table: Vec<u8>,
+    offsets: Vec<Option<usize>>,
+}
+
+impl NameTable {
+    /// Create an empty table.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record the next member's name, in archive order.
+    pub fn push(&mut self, name: &[u8]) {
+        if name.len() > MAX_INLINE_NAME {
+            self.offsets.push(Some(self.table.len()));
+            self.table.extend_from_slice(name);
+            self.table.extend_from_slice(b"/\n");
+        } else {
+            self.offsets.push(None);
+        }
+    }
+
+    /// Offset into the `"//"` member for the `i`-th pushed name, or `None`
+    /// when the name is short enough to be stored inline.
+    pub fn offset(&self, i: usize) -> Option<usize> {
+        self.offsets.get(i).copied().flatten()
+    }
+
+    /// True when no pushed name required the string table.
+    pub fn is_empty(&self) -> bool {
+        self.table.is_empty()
+    }
+
+    /// Bytes the `"//"` member occupies in the archive, header and alignment
+    /// pad included; 0 when the table is empty and no member is emitted.
+    ///
+    /// Pass this as `prefix_bytes` to [`write_sysv_symtab`] so symbol-table
+    /// offsets account for the `"//"` member sitting between the `"/"` member
+    /// and the first file member.
+    pub fn member_bytes(&self) -> u64 {
+        if self.table.is_empty() {
+            0
+        } else {
+            MEMBER_HEADER_SIZE + self.table.len() as u64 + (self.table.len() % 2) as u64
+        }
+    }
+
+    /// Write the `"//"` member. Writes nothing when the table is empty.
+    pub fn write<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        if self.table.is_empty() {
+            return Ok(());
+        }
+        w.write_all(&pad_metadata_field::<16>("//")?)?;
+        w.write_all(&pad_metadata_field::<12>("")?)?; // date
+        w.write_all(&pad_metadata_field::<6>("")?)?; // uid
+        w.write_all(&pad_metadata_field::<6>("")?)?; // gid
+        w.write_all(&pad_metadata_field::<8>("")?)?; // mode
+        w.write_all(&pad_metadata_field::<10>(&self.table.len().to_string())?)?;
+        w.write_all(TERMINATOR)?;
+        w.write_all(&self.table)?;
+        if self.table.len() % 2 != 0 {
+            w.write_all(b"\n")?;
+        }
+        Ok(())
+    }
+}
+
+/// Build the 16-byte header name field for a member.
+///
+/// `long_name_offset` comes from [`NameTable::offset`]: `None` stores the name
+/// inline as `"<name>/"`, `Some(off)` stores the reference `"/<off>"`.
+pub fn format_name_field(name: &[u8], long_name_offset: Option<usize>) -> io::Result<[u8; 16]> {
+    let mut field = [b' '; 16];
+    match long_name_offset {
+        Some(offset) => {
+            let encoded = format!("/{}", offset);
+            if encoded.len() > field.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("archive name-table offset too large: {}", offset),
+                ));
+            }
+            field[..encoded.len()].copy_from_slice(encoded.as_bytes());
+        }
+        None => {
+            if name.len() > MAX_INLINE_NAME {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "archive member name too long for an inline header field: {} bytes, max {}",
+                        name.len(),
+                        MAX_INLINE_NAME
+                    ),
+                ));
+            }
+            field[..name.len()].copy_from_slice(name);
+            field[name.len()] = b'/';
+        }
+    }
+    Ok(field)
+}
+
 /// Write a System V `"/"` archive symbol-table member to `w`.
 ///
 /// The caller is responsible for emitting the archive magic before this
@@ -156,6 +284,58 @@ pub fn write_sysv_symtab<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn name_table_empty_when_all_names_short() {
+        let mut t = NameTable::new();
+        t.push(b"short.o");
+        t.push(b"exactly15chars_"); // 15 bytes: still inline
+        assert!(t.is_empty());
+        assert_eq!(t.member_bytes(), 0);
+        assert_eq!(t.offset(0), None);
+        assert_eq!(t.offset(1), None);
+        let mut out = Vec::new();
+        t.write(&mut out).unwrap();
+        assert!(out.is_empty(), "no // member when every name fits inline");
+    }
+
+    #[test]
+    fn name_table_records_long_names() {
+        let mut t = NameTable::new();
+        t.push(b"short.o");
+        t.push(b"a_sixteen_byte_x"); // 16 bytes: one over the inline limit
+        t.push(b"another_long_member_name.o");
+        assert_eq!(t.offset(0), None);
+        assert_eq!(t.offset(1), Some(0));
+        // "a_sixteen_byte_x/\n" is 18 bytes.
+        assert_eq!(t.offset(2), Some(18));
+
+        let mut out = Vec::new();
+        t.write(&mut out).unwrap();
+        assert_eq!(&out[..2], b"//");
+        assert_eq!(out.len() as u64, t.member_bytes());
+        assert_eq!(out.len() % 2, 0, "// member must be 2-byte aligned");
+        let payload = &out[MEMBER_HEADER_SIZE as usize..];
+        assert!(payload.starts_with(b"a_sixteen_byte_x/\n"));
+    }
+
+    #[test]
+    fn name_field_inline_and_referenced() {
+        assert_eq!(
+            &format_name_field(b"lib.o", None).unwrap(),
+            b"lib.o/          "
+        );
+        assert_eq!(
+            &format_name_field(b"ignored", Some(18)).unwrap(),
+            b"/18             "
+        );
+    }
+
+    #[test]
+    fn name_field_rejects_overlong_inline_name() {
+        // 16 bytes leaves no room for the "/" terminator.
+        assert!(format_name_field(b"a_sixteen_byte_x", None).is_err());
+    }
 
     #[test]
     fn pad_field_short() {

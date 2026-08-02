@@ -107,24 +107,42 @@ fn print_string(s: &str, starting_offset: usize, format: Option<OffsetFormat>) {
     }
 }
 
-fn print_strings(bytes: &[u8], options: OutputOptions) {
+/// Scan `bytes` for printable strings.
+///
+/// `base` is the offset of `bytes[0]` within the file being examined, so that
+/// `-t` reports a file-relative offset even when the caller is feeding us one
+/// section of an object file at a time (#S10).
+fn print_strings(bytes: &[u8], base: usize, options: OutputOptions) {
     let mut offset = 0;
     let mut print_buffer = String::new();
+
+    // POSIX 115860 counts printable *characters*, not bytes, so a run of three
+    // multi-byte characters is below a `-n 4` threshold even though it spans
+    // nine bytes (#S9). Track the byte length separately for the offset.
+    let long_enough = |buf: &String| buf.chars().count() >= options.minimum_string_length;
 
     while offset < bytes.len() {
         if let Some(c) = read_printable_char(&bytes[offset..]) {
             print_buffer.push(c);
             offset += c.len_utf8();
         } else {
-            if print_buffer.len() >= options.minimum_string_length {
-                print_string(&print_buffer, offset - print_buffer.len(), options.format);
+            if long_enough(&print_buffer) {
+                print_string(
+                    &print_buffer,
+                    base + offset - print_buffer.len(),
+                    options.format,
+                );
             }
             print_buffer.clear();
             offset += 1;
         }
     }
-    if print_buffer.len() >= options.minimum_string_length {
-        print_string(&print_buffer, offset - print_buffer.len(), options.format);
+    if long_enough(&print_buffer) {
+        print_string(
+            &print_buffer,
+            base + offset - print_buffer.len(),
+            options.format,
+        );
     }
 }
 
@@ -132,7 +150,7 @@ fn print_file(path: &OsString, output_options: OutputOptions) -> StringsResult {
     let bytes = std::fs::read(path)?;
 
     if output_options.scan_all {
-        print_strings(&bytes, output_options);
+        print_strings(&bytes, 0, output_options);
         return Ok(());
     }
 
@@ -140,11 +158,19 @@ fn print_file(path: &OsString, output_options: OutputOptions) -> StringsResult {
         for section in parsed_object.sections() {
             // skip empty sections
             if !section.kind().is_bss() {
-                print_strings(section.data()?, output_options);
+                // #S10: `-t` reports "the byte offset from the start of the
+                // file" (POSIX 115906), so each section's strings must be
+                // biased by where that section lives in the file. Sections
+                // with no file backing contribute no meaningful offset.
+                let base = section
+                    .file_range()
+                    .map(|(start, _)| start as usize)
+                    .unwrap_or(0);
+                print_strings(section.data()?, base, output_options);
             }
         }
     } else {
-        print_strings(&bytes, output_options);
+        print_strings(&bytes, 0, output_options);
     }
 
     Ok(())
@@ -167,7 +193,7 @@ fn main() {
         // POSIX OPERANDS 115878-115881: with no file operand, read stdin.
         let mut bytes = Vec::new();
         match std::io::stdin().read_to_end(&mut bytes) {
-            Ok(_) => print_strings(&bytes, args.output_options),
+            Ok(_) => print_strings(&bytes, 0, args.output_options),
             Err(err) => diag::error(&format!("{}: {}", gettext("standard input"), err)),
         }
     } else {

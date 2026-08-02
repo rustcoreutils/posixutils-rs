@@ -634,6 +634,118 @@ fn test_strip_preserves_non_elf_archive_members() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn test_strip_preserves_long_archive_member_names() {
+    // #ST10: a member name longer than the 16-byte header field must be
+    // written to a System V "//" string table, not truncated. The `ar` crate
+    // resolves long names on read, so truncating on write silently renamed
+    // the member and produced an archive the linker could not match.
+    const LONG: &str = "a_very_long_member_name.o";
+    assert!(LONG.len() > 16, "fixture name must exceed the header field");
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let cpath = dir.path().join("s.c");
+    let opath = dir.path().join(LONG);
+    fs::write(&cpath, "int a_symbol_here(void){return 1;}\n").unwrap();
+    assert!(std::process::Command::new("cc")
+        .args(["-c", "-o", opath.to_str().unwrap(), cpath.to_str().unwrap()])
+        .status()
+        .expect("cc")
+        .success());
+
+    let arc = dir.path().join("lib.a");
+    assert!(std::process::Command::new(env!("CARGO_BIN_EXE_ar"))
+        .args(["-r", "-c", arc.to_str().unwrap(), opath.to_str().unwrap()])
+        .status()
+        .expect("ar")
+        .success());
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_strip"))
+        .arg(&arc)
+        .output()
+        .expect("failed to run strip");
+    assert!(
+        out.status.success(),
+        "strip failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let bytes = fs::read(&arc).unwrap();
+    let archive = object::read::archive::ArchiveFile::parse(&*bytes)
+        .expect("stripped archive must still parse");
+    let names: Vec<String> = archive
+        .members()
+        .map(|m| String::from_utf8_lossy(m.unwrap().name()).to_string())
+        .collect();
+    assert!(
+        names.iter().any(|n| n == LONG),
+        "long member name must survive stripping intact, got {:?}",
+        names
+    );
+}
+
+#[test]
+fn test_strip_rejects_bsd_variant_archive() {
+    // #ST11: `!<arch>\n` is shared by the System V and BSD layouts. Our writer
+    // only speaks System V, so a BSD archive (the macOS default) must be
+    // refused rather than silently rewritten into a malformed hybrid.
+    let dir = tempfile::TempDir::new().unwrap();
+    let arc = dir.path().join("bsd.a");
+
+    // Minimal BSD archive: the `#1/<len>` header form stores the member name
+    // inline, immediately after the header, and counts it in the size field.
+    let name = b"a_long_bsd_member_name.o";
+    let mut padded_name = name.to_vec();
+    while padded_name.len() % 8 != 0 {
+        padded_name.push(0);
+    }
+    let payload = b"\x7fELF fake object payload";
+
+    let mut header = Vec::new();
+    header.extend_from_slice(format!("#1/{}", padded_name.len()).as_bytes());
+    header.resize(16, b' ');
+    let field = |v: String, n: usize| {
+        let mut f = v.into_bytes();
+        f.resize(n, b' ');
+        f
+    };
+    header.extend(field("0".into(), 12)); // mtime
+    header.extend(field("0".into(), 6)); // uid
+    header.extend(field("0".into(), 6)); // gid
+    header.extend(field("100644".into(), 8)); // mode
+    header.extend(field((padded_name.len() + payload.len()).to_string(), 10));
+    header.extend_from_slice(b"`\n");
+    assert_eq!(header.len(), 60, "archive member header must be 60 bytes");
+
+    let mut bytes = b"!<arch>\n".to_vec();
+    bytes.extend_from_slice(&header);
+    bytes.extend_from_slice(&padded_name);
+    bytes.extend_from_slice(payload);
+    fs::write(&arc, &bytes).unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_strip"))
+        .arg(&arc)
+        .output()
+        .expect("failed to run strip");
+    assert!(
+        !out.status.success(),
+        "strip must reject a BSD-variant archive rather than corrupt it"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("BSD"),
+        "diagnostic must name the unsupported variant: {}",
+        err
+    );
+    // The input must be left untouched by a refused run.
+    assert_eq!(
+        fs::read(&arc).unwrap(),
+        bytes,
+        "a refused archive must not be modified"
+    );
+}
+
 #[test]
 fn test_strip_removes_all_debug_sections() {
     const DEBUG_SECTIONS: [&[u8]; 7] = [
@@ -717,6 +829,111 @@ fn test_strings_utf8_file() {
         &["tests/strings/utf8.bin"],
         &[("LC_CTYPE", "C.UTF-8")],
         include_str!("strings/utf8.correct.txt"),
+    );
+}
+
+#[test]
+fn test_strings_offsets_are_file_relative_for_objects() {
+    // #S10: POSIX 115906 defines -t's offset as "from the start of the file".
+    // Scanning an object file section-by-section previously restarted the
+    // count at 0 for every section, so offsets were section-relative.
+    // Self-validating: each reported offset must actually locate that string
+    // in the file, which pins the property without hardcoding numbers.
+    let path = "tests/strings/object.o";
+    let bytes = fs::read(path).expect("object fixture");
+    let args = vec!["-t".to_string(), "d".to_string(), path.to_string()];
+    let out = plib::testing::run_test_base_with_env(
+        "strings",
+        &args,
+        b"",
+        &[("LC_CTYPE", "C"), ("LC_ALL", "C"), ("LANG", "C")],
+    );
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut checked = 0;
+    for line in stdout.lines() {
+        let (off, text) = line
+            .split_once(' ')
+            .expect("`-t d` emits \"<offset> <string>\"");
+        let off: usize = off.parse().expect("offset must be decimal");
+        assert!(
+            off + text.len() <= bytes.len(),
+            "offset {} for {:?} runs past the {}-byte file",
+            off,
+            text,
+            bytes.len()
+        );
+        assert_eq!(
+            &bytes[off..off + text.len()],
+            text.as_bytes(),
+            "offset {} does not locate {:?} in the file (section-relative?)",
+            off,
+            text
+        );
+        checked += 1;
+    }
+    assert!(checked > 1, "fixture should yield several strings");
+}
+
+#[test]
+fn test_strings_minimum_length_counts_characters_not_bytes() {
+    // #S9: POSIX 115860 counts printable *characters*. Three multi-byte
+    // characters span nine bytes, so a byte-based comparison wrongly cleared
+    // a `-n 4` threshold. GNU strings prints nothing here.
+    let dir = tempfile::TempDir::new().unwrap();
+    let f = dir.path().join("mb.bin");
+    // Three EURO SIGNs (U+20AC): 3 characters, 9 bytes.
+    fs::write(&f, "\u{20ac}\u{20ac}\u{20ac}\n").unwrap();
+
+    let args = vec!["-n".to_string(), "4".to_string(), f.display().to_string()];
+    let out = plib::testing::run_test_base_with_env(
+        "strings",
+        &args,
+        b"",
+        &[("LC_CTYPE", "C.UTF-8"), ("LC_ALL", "C.UTF-8")],
+    );
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "",
+        "a 3-character run must not satisfy -n 4 even though it spans 9 bytes"
+    );
+
+    // ...and four of them must still print, proving the threshold still works.
+    fs::write(&f, "\u{20ac}\u{20ac}\u{20ac}\u{20ac}\n").unwrap();
+    let out = plib::testing::run_test_base_with_env(
+        "strings",
+        &args,
+        b"",
+        &[("LC_CTYPE", "C.UTF-8"), ("LC_ALL", "C.UTF-8")],
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "\u{20ac}\u{20ac}\u{20ac}\u{20ac}\n"
+    );
+}
+
+#[test]
+fn test_strings_newline_terminates_a_string() {
+    // #S2: POSIX 115860 -- a printable string is terminated by <newline> or
+    // NUL. The audit flagged that no fixture contained an embedded newline,
+    // so nothing pinned this behavior.
+    let dir = tempfile::TempDir::new().unwrap();
+    let f = dir.path().join("nl.bin");
+    fs::write(&f, b"abcd\nefgh\nijkl\n").unwrap();
+
+    let args = vec![f.display().to_string()];
+    let out = plib::testing::run_test_base_with_env(
+        "strings",
+        &args,
+        b"",
+        &[("LC_CTYPE", "C"), ("LC_ALL", "C")],
+    );
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "abcd\nefgh\nijkl\n",
+        "each newline must end the current string rather than be absorbed into it"
     );
 }
 
@@ -938,6 +1155,153 @@ fn test_ar_bundled_mode_flags() {
         String::from_utf8_lossy(&dv.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&dv.stdout), "d - m.o\n");
+}
+
+/// Build an archive from `(name, contents)` pairs and return (dir, archive path).
+fn ar_make_archive(members: &[(&str, &[u8])]) -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut argv = vec!["-r".to_string(), "-c".to_string()];
+    let arc = dir.path().join("a.a");
+    argv.push(arc.to_str().unwrap().to_string());
+    for (name, data) in members {
+        let p = dir.path().join(name);
+        fs::write(&p, data).unwrap();
+        argv.push(p.to_str().unwrap().to_string());
+    }
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_ar"))
+        .args(&argv)
+        .output()
+        .expect("run ar -rc");
+    assert!(
+        out.status.success(),
+        "ar -rc failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (dir, arc)
+}
+
+#[test]
+fn test_ar_odd_length_member_roundtrip() {
+    // #A13: the header `size` field is the payload size; the 2-byte alignment
+    // pad is not part of the member. Counting the pad made `ar -x` write an
+    // extra trailing newline for every odd-length member.
+    let payload: &[u8] = b"odd";
+    assert_eq!(payload.len() % 2, 1, "fixture must be odd-length");
+    let (dir, arc) = ar_make_archive(&[("odd.txt", payload), ("even.txt", b"even")]);
+
+    let xdir = dir.path().join("x");
+    fs::create_dir(&xdir).unwrap();
+    let x = std::process::Command::new(env!("CARGO_BIN_EXE_ar"))
+        .args(["-x", arc.to_str().unwrap()])
+        .current_dir(&xdir)
+        .output()
+        .expect("run ar -x");
+    assert!(
+        x.status.success(),
+        "ar -x failed: {}",
+        String::from_utf8_lossy(&x.stderr)
+    );
+
+    let extracted = fs::read(xdir.join("odd.txt")).unwrap();
+    assert_eq!(
+        extracted,
+        payload,
+        "odd-length member must extract byte-identical (got {} bytes, want {})",
+        extracted.len(),
+        payload.len()
+    );
+    assert_eq!(fs::read(xdir.join("even.txt")).unwrap(), b"even");
+}
+
+#[test]
+fn test_ar_odd_length_member_size_field_excludes_pad() {
+    // #A13, at the byte level: the ASCII size field must read the payload
+    // length, with the pad newline following the payload uncounted.
+    let (_dir, arc) = ar_make_archive(&[("odd.txt", b"odd")]);
+    let raw = fs::read(&arc).unwrap();
+    let text = String::from_utf8_lossy(&raw);
+    let hdr = text
+        .find("odd.txt/")
+        .expect("member header must be present in the archive");
+    // Header layout after the 16-byte name: 12 date + 6 uid + 6 gid + 8 mode,
+    // then the 10-byte size field.
+    let size_at = hdr + 16 + 12 + 6 + 6 + 8;
+    let size_field = text[size_at..size_at + 10].trim();
+    assert_eq!(
+        size_field, "3",
+        "size field must be the unpadded payload length, got {:?}",
+        size_field
+    );
+}
+
+#[test]
+fn test_ar_repeated_rewrite_is_stable() {
+    // #A13: mis-counting the pad byte made each rewrite re-read the pad as
+    // payload, growing every odd-length member by one newline per pass.
+    let (dir, arc) = ar_make_archive(&[("odd.txt", b"odd")]);
+    let extra = dir.path().join("extra.txt");
+    fs::write(&extra, b"even").unwrap();
+
+    // Sample the size *before* the first rewrite: the pad byte is absorbed on
+    // pass one and the archive is stable thereafter, so a post-rewrite-only
+    // sample would miss the growth entirely.
+    let mut sizes = vec![fs::metadata(&arc).unwrap().len()];
+    for _ in 0..3 {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_ar"))
+            .args(["-r", arc.to_str().unwrap(), extra.to_str().unwrap()])
+            .output()
+            .expect("run ar -r");
+        assert!(
+            out.status.success(),
+            "ar -r failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        sizes.push(fs::metadata(&arc).unwrap().len());
+    }
+    // extra.txt is added once on the first pass, so allow that one delta and
+    // require every later pass to be a no-op in size terms.
+    assert!(
+        sizes[1..].iter().all(|s| *s == sizes[1]),
+        "archive size must not grow across repeated rewrites: {:?}",
+        sizes
+    );
+
+    // The odd-length member must still be exactly its original payload.
+    let xdir = dir.path().join("x");
+    fs::create_dir(&xdir).unwrap();
+    let x = std::process::Command::new(env!("CARGO_BIN_EXE_ar"))
+        .args(["-x", arc.to_str().unwrap(), "odd.txt"])
+        .current_dir(&xdir)
+        .output()
+        .expect("run ar -x");
+    assert!(
+        x.status.success(),
+        "ar -x failed: {}",
+        String::from_utf8_lossy(&x.stderr)
+    );
+    assert_eq!(
+        fs::read(xdir.join("odd.txt")).unwrap(),
+        b"odd",
+        "odd-length member must survive repeated archive rewrites unchanged"
+    );
+}
+
+#[test]
+fn test_ar_list_missing_operand_names_the_operand() {
+    // #A14: `ar -t arc nosuch.o` must name the missing operand, not the
+    // archive (which exists and was read successfully).
+    let (_dir, arc) = ar_make_archive(&[("present.o", b"data")]);
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_ar"))
+        .args(["-t", arc.to_str().unwrap(), "nosuch.o"])
+        .output()
+        .expect("run ar -t");
+    assert!(!out.status.success(), "missing operand must fail");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("nosuch.o"),
+        "diagnostic must name the missing operand: {}",
+        err
+    );
 }
 
 #[test]

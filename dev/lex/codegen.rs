@@ -758,7 +758,10 @@ fn write_helper_functions<W: Write>(output: &mut W, lexinfo: &LexInfo) -> io::Re
         writeln!(
             output,
             r#"/* input - read one character from input */
-static int input(void)
+/* POSIX 102013-102017 makes input() accessible to user code, so it is not
+   static; that also keeps a scanner which happens not to call it building
+   cleanly under -Wall -Werror (-Wunused-function fires only on statics). */
+int input(void)
 {{
     /* Check main buffer - unput() now always inserts directly here */
     if (YYCURSOR < YYLIMIT) {{
@@ -783,8 +786,11 @@ static int input(void)
  * Two paths: (1) if room before YYCURSOR, decrement and store there;
  *            (2) otherwise, shift buffer contents right to make room at start.
  * POSIX prototype is `int unput(int c)`; returns the pushed-back character.
+ * POSIX 102018-102021 makes unput() accessible to user code, so it is not
+ * static; that also keeps a scanner which happens not to call it building
+ * cleanly under -Wall -Werror (-Wunused-function fires only on statics).
  */
-static int unput(int c)
+int unput(int c)
 {{
     if (YYCURSOR > yy_buffer) {{
         /* Room before cursor - just back up and insert */
@@ -1940,25 +1946,47 @@ fn write_default_yywrap_main<W: Write>(
     writeln!(output, "}}")?;
     writeln!(output)?;
 
-    // Generate yywrap if not in user subroutines
-    let has_yywrap = lexinfo.user_subs.iter().any(|s| s.contains("yywrap"));
-    if !has_yywrap {
-        writeln!(output, "/* Default yywrap */")?;
+    // POSIX 102022-102031 says `yywrap()` and `main()` "shall appear only in
+    // the lex library accessible through the -l l operand", so that a
+    // conforming application can redefine them. We emit defaults anyway
+    // (nothing in this project ships a libl, and the generated yylex() calls
+    // yywrap() on every EOF path), but each is now individually suppressible
+    // so an application supplying its own definition -- in this file or in a
+    // separate translation unit -- can turn ours off instead of colliding at
+    // link time (#L1).
+    //
+    // The user_subs/external_def scan is a convenience for definitions written
+    // into the lex input itself; it cannot see a separate .c file, which is
+    // exactly why the macros exist. Match on identifier boundaries so a call
+    // to yywrap(), or a `my_yywrap`, does not suppress the definition (#L14).
+    let defines = |name: &str| {
+        lexinfo
+            .user_subs
+            .iter()
+            .chain(lexinfo.external_def.iter())
+            .any(|s| contains_identifier(s, name))
+    };
+
+    if !defines("yywrap") {
+        writeln!(
+            output,
+            "/* Default yywrap; suppress with -DYY_NO_DEFAULT_YYWRAP */"
+        )?;
+        writeln!(output, "#ifndef YY_NO_DEFAULT_YYWRAP")?;
         writeln!(output, "int yywrap(void)")?;
         writeln!(output, "{{")?;
         writeln!(output, "    return 1;")?;
         writeln!(output, "}}")?;
+        writeln!(output, "#endif")?;
         writeln!(output)?;
     }
 
-    // Generate main if not in user subroutines
-    let has_main = lexinfo
-        .user_subs
-        .iter()
-        .any(|s| s.contains("int main") || s.contains("void main"));
-    if !has_main {
-        writeln!(output, "/* Default main */")?;
-        writeln!(output, "#ifndef YY_SKIP_YYWRAP")?;
+    if !defines("main") {
+        writeln!(
+            output,
+            "/* Default main; suppress with -DYY_NO_DEFAULT_MAIN */"
+        )?;
+        writeln!(output, "#ifndef YY_NO_DEFAULT_MAIN")?;
         writeln!(output, "int main(int argc, char *argv[])")?;
         writeln!(output, "{{")?;
         writeln!(output, "    (void)argc; (void)argv;")?;

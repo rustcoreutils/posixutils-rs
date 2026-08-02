@@ -22,7 +22,17 @@ use std::{
 };
 
 #[derive(Parser)]
-#[command(version, about = gettext("strip - remove unnecessary information from strippable files"))]
+#[command(version, about = gettext("strip - remove unnecessary information from strippable files"),
+          long_about = gettext("strip - remove unnecessary information from strippable files\n\n\
+Supported input formats:\n  \
+  * ELF relocatable objects, executables, and shared objects\n  \
+  * System V / GNU `ar` archives of the above\n\n\
+Relocatable objects (ET_REL) keep their symbol table and relocations so they\n\
+remain linkable; only debugging information is removed. Executables and shared\n\
+objects additionally lose their symbol table.\n\n\
+Other formats -- Mach-O, COFF/PE, XCOFF, and BSD-variant archives -- are\n\
+rejected with a diagnostic and a non-zero exit rather than being modified or\n\
+silently passed through."))]
 struct Args {
     // POSIX SYNOPSIS makes the `file...` operand required (>= 1).
     #[arg(num_args = 1.., required = true)]
@@ -131,6 +141,24 @@ fn extract_member_symbols(data: &[u8]) -> Vec<String> {
 }
 
 fn strip_archive(data: &[u8]) -> StripResult {
+    // #ST11: `!<arch>\n` is shared by the System V and BSD layouts, and the
+    // variant is only known once headers have been parsed. The writer below
+    // only speaks System V, so rewriting a BSD archive (the macOS default)
+    // would emit a malformed hybrid: BSD stores long names inline after the
+    // header and uses a `__.SYMDEF` symbol table, neither of which we produce.
+    // Probe the headers first so we refuse before doing any work, and so the
+    // variant diagnostic wins over any per-member parse error.
+    let mut probe = ar::Archive::new(data);
+    while let Some(entry) = probe.next_entry() {
+        entry?;
+    }
+    if probe.variant() == ar::Variant::BSD {
+        return Err(gettext(
+            "BSD-variant archives are not supported (only System V/GNU archives can be rewritten)",
+        )
+        .into());
+    }
+
     let mut archive = ar::Archive::new(data);
     let mut members: Vec<StrippedMember> = Vec::new();
 
@@ -175,20 +203,35 @@ fn strip_archive(data: &[u8]) -> StripResult {
             symbols: m.symbols.clone(),
         })
         .collect();
-    plib::archive::write_sysv_symtab(&mut result, &infos, 0)?;
 
+    // #ST10: names longer than the 16-byte header field go into a System V
+    // "//" string-table member. The `ar` crate resolves long names on read, so
+    // truncating them here silently renamed members. Shared with `dev/ar.rs`
+    // through plib so both tools emit the same layout.
+    let mut names = plib::archive::NameTable::new();
     for m in &members {
-        write_member(&mut result, m)?;
+        names.push(&m.identifier);
+    }
+
+    plib::archive::write_sysv_symtab(&mut result, &infos, names.member_bytes())?;
+    names.write(&mut result)?;
+
+    for (i, m) in members.iter().enumerate() {
+        write_member(&mut result, m, names.offset(i))?;
     }
 
     Ok(result)
 }
 
-fn write_member(w: &mut Vec<u8>, m: &StrippedMember) -> Result<(), Box<dyn std::error::Error>> {
-    let mut name_field = [b' '; 16];
-    let take = m.identifier.len().min(16);
-    name_field[..take].copy_from_slice(&m.identifier[..take]);
-    w.write_all(&name_field)?;
+fn write_member(
+    w: &mut Vec<u8>,
+    m: &StrippedMember,
+    long_name_offset: Option<usize>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    w.write_all(&plib::archive::format_name_field(
+        &m.identifier,
+        long_name_offset,
+    )?)?;
     w.write_all(&plib::archive::pad_metadata_field::<12>(
         &m.mtime.to_string(),
     )?)?;

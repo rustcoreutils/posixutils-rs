@@ -437,14 +437,14 @@ pub fn parse_x86_64_fixed_letter(letter: char) -> Option<Reg> {
 /// - `l` — index registers (rsi, rdi). Same as `r` on x86_64; we map
 ///   to `Any`.
 /// - `I`, `J`, `K`, `L`, `M`, `N`, `O` — constant-range constraints
-///   used for shift counts and small-immediate operands. pcc does not
+///   used for shift counts and small-immediate operands. c17 does not
 ///   range-check; the assembler will reject if the operand is out of
 ///   range, the same failure mode GCC defaults to with mismatched
 ///   immediates.
 /// - `X` — any operand (register, memory, immediate). Same as `g`.
 ///
 /// Out of scope:
-/// - `t` (top of x87 FP stack) — pcc's register model doesn't expose
+/// - `t` (top of x87 FP stack) — c17's register model doesn't expose
 ///   ST(0) to the allocator. Code that needs `t` must use clobber
 ///   declarations instead.
 pub fn parse_x86_64_class_letter(letter: char) -> Option<OperandConstraint<Reg>> {
@@ -512,7 +512,7 @@ fn parse_gp_clobber_name(raw: &str) -> Option<Reg> {
 /// `None` if the instruction has no `AsmData` (shouldn't happen for
 /// `Opcode::Asm` in well-formed IR).
 ///
-/// Constraint-string parse errors are reported by `pcc`'s front end
+/// Constraint-string parse errors are reported by `c17`'s front end
 /// at IR-construction time (the parser already accepts these
 /// strings). Here we treat a parse error as "ignore this operand" —
 /// the existing inline-asm codegen continues to use the raw constraint

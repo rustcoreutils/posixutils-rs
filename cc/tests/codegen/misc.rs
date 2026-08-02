@@ -156,11 +156,11 @@ int main() {
 "#,
     );
     let c_path = c_file.path().to_path_buf();
-    let obj_path = std::env::temp_dir().join("pcc_debug_mega_test.o");
+    let obj_path = std::env::temp_dir().join("c17_debug_mega_test.o");
 
     // Compile with -g -c to produce object file
     let output = run_test_base(
-        "pcc",
+        "c17",
         &vec![
             "-g".to_string(),
             "-c".to_string(),
@@ -173,7 +173,7 @@ int main() {
 
     assert!(
         output.status.success(),
-        "pcc -g -c failed: {}",
+        "c17 -g -c failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
@@ -227,7 +227,7 @@ int main(void) {
     let c_path = c_file.path().to_path_buf();
 
     let output = run_test_base(
-        "pcc",
+        "c17",
         &vec![
             "-fno-pie".to_string(),
             "-S".to_string(),
@@ -240,7 +240,7 @@ int main(void) {
 
     assert!(
         output.status.success(),
-        "pcc -S -o - failed: {}",
+        "c17 -S -o - failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
@@ -269,7 +269,7 @@ int main() {
 
     // Test default CFI directives
     let output = run_test_base(
-        "pcc",
+        "c17",
         &vec![
             "-S".to_string(),
             "-o".to_string(),
@@ -281,7 +281,7 @@ int main() {
 
     assert!(
         output.status.success(),
-        "pcc -S -o - failed: {}",
+        "c17 -S -o - failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
@@ -314,7 +314,7 @@ int main() {
     let c_path = c_file.path().to_path_buf();
 
     let output = run_test_base(
-        "pcc",
+        "c17",
         &vec![
             "-S".to_string(),
             "-o".to_string(),
@@ -327,7 +327,7 @@ int main() {
 
     assert!(
         output.status.success(),
-        "pcc -S -o - --fno-unwind-tables failed: {}",
+        "c17 -S -o - --fno-unwind-tables failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
@@ -356,7 +356,7 @@ int main() {
 
     // With -g
     let output = run_test_base(
-        "pcc",
+        "c17",
         &vec![
             "-g".to_string(),
             "-S".to_string(),
@@ -369,7 +369,7 @@ int main() {
 
     assert!(
         output.status.success(),
-        "pcc -g -S -o - failed: {}",
+        "c17 -g -S -o - failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
@@ -392,7 +392,7 @@ int main() {
     let c_path = c_file.path().to_path_buf();
 
     let output = run_test_base(
-        "pcc",
+        "c17",
         &vec![
             "-S".to_string(),
             "-o".to_string(),
@@ -404,7 +404,7 @@ int main() {
 
     assert!(
         output.status.success(),
-        "pcc -S -o - failed: {}",
+        "c17 -S -o - failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
@@ -428,7 +428,7 @@ int main() {
 /// Create a temporary assembly file
 fn create_asm_file(name: &str, content: &str, extension: &str) -> tempfile::NamedTempFile {
     let mut file = tempfile::Builder::new()
-        .prefix(&format!("pcc_test_{}_", name))
+        .prefix(&format!("c17_test_{}_", name))
         .suffix(extension)
         .tempfile()
         .expect("failed to create temp file");
@@ -505,14 +505,14 @@ int main(void) {
     let asm_s_file = create_asm_file("asm_s_test", asm_s_content, ".S");
     let c_file = create_c_file("asm_main", c_content);
 
-    let obj_s = std::env::temp_dir().join(format!("pcc_asm_{}.o", std::process::id()));
-    let obj_s_upper = std::env::temp_dir().join(format!("pcc_asm_s_{}.o", std::process::id()));
-    let obj_c = std::env::temp_dir().join(format!("pcc_asm_c_{}.o", std::process::id()));
-    let exe_path = std::env::temp_dir().join(format!("pcc_asm_test_{}", std::process::id()));
+    let obj_s = std::env::temp_dir().join(format!("c17_asm_{}.o", std::process::id()));
+    let obj_s_upper = std::env::temp_dir().join(format!("c17_asm_s_{}.o", std::process::id()));
+    let obj_c = std::env::temp_dir().join(format!("c17_asm_c_{}.o", std::process::id()));
+    let exe_path = std::env::temp_dir().join(format!("c17_asm_test_{}", std::process::id()));
 
     // Step 1: Compile .s to .o
     let output = run_test_base(
-        "pcc",
+        "c17",
         &vec![
             "-c".to_string(),
             "-o".to_string(),
@@ -523,13 +523,13 @@ int main(void) {
     );
     assert!(
         output.status.success(),
-        "pcc -c .s failed: {}",
+        "c17 -c .s failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
     // Step 2: Compile .S to .o (with preprocessing)
     let output = run_test_base(
-        "pcc",
+        "c17",
         &vec![
             "-c".to_string(),
             "-o".to_string(),
@@ -540,13 +540,13 @@ int main(void) {
     );
     assert!(
         output.status.success(),
-        "pcc -c .S failed: {}",
+        "c17 -c .S failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
     // Step 3: Compile C to .o
     let output = run_test_base(
-        "pcc",
+        "c17",
         &vec![
             "-c".to_string(),
             "-o".to_string(),
@@ -557,13 +557,13 @@ int main(void) {
     );
     assert!(
         output.status.success(),
-        "pcc -c .c failed: {}",
+        "c17 -c .c failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
     // Step 4: Link all .o files
     let output = run_test_base(
-        "pcc",
+        "c17",
         &vec![
             "-o".to_string(),
             exe_path.to_string_lossy().to_string(),
@@ -575,7 +575,7 @@ int main(void) {
     );
     assert!(
         output.status.success(),
-        "pcc link failed: {}",
+        "c17 link failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
@@ -650,13 +650,13 @@ int main(void) {
     let asm_s_file = create_asm_file("asm_assembler_test", asm_s_content, ".S");
     let c_file = create_c_file("asm_assembler_main", c_content);
 
-    let obj_asm = std::env::temp_dir().join(format!("pcc_asm_macro_{}.o", std::process::id()));
-    let obj_c = std::env::temp_dir().join(format!("pcc_asm_macro_c_{}.o", std::process::id()));
-    let exe_path = std::env::temp_dir().join(format!("pcc_asm_macro_test_{}", std::process::id()));
+    let obj_asm = std::env::temp_dir().join(format!("c17_asm_macro_{}.o", std::process::id()));
+    let obj_c = std::env::temp_dir().join(format!("c17_asm_macro_c_{}.o", std::process::id()));
+    let exe_path = std::env::temp_dir().join(format!("c17_asm_macro_test_{}", std::process::id()));
 
     // Step 1: Compile .S to .o (with preprocessing, should have __ASSEMBLER__ defined)
     let output = run_test_base(
-        "pcc",
+        "c17",
         &vec![
             "-c".to_string(),
             "-o".to_string(),
@@ -667,13 +667,13 @@ int main(void) {
     );
     assert!(
         output.status.success(),
-        "pcc -c .S with __ASSEMBLER__ failed: {}",
+        "c17 -c .S with __ASSEMBLER__ failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
     // Step 2: Compile C to .o
     let output = run_test_base(
-        "pcc",
+        "c17",
         &vec![
             "-c".to_string(),
             "-o".to_string(),
@@ -684,13 +684,13 @@ int main(void) {
     );
     assert!(
         output.status.success(),
-        "pcc -c .c failed: {}",
+        "c17 -c .c failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
     // Step 3: Link
     let output = run_test_base(
-        "pcc",
+        "c17",
         &vec![
             "-o".to_string(),
             exe_path.to_string_lossy().to_string(),
@@ -701,7 +701,7 @@ int main(void) {
     );
     assert!(
         output.status.success(),
-        "pcc link failed: {}",
+        "c17 link failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
@@ -3827,7 +3827,7 @@ int main(void) {
 
 /// Regression test: float arguments to variadic functions (e.g., printf) were
 /// not promoted to double per C99 6.5.2.2p7 "default argument promotions".
-/// The ABI requires xmm0 to hold a double, but pcc passed 32-bit float bits.
+/// The ABI requires xmm0 to hold a double, but c17 passed 32-bit float bits.
 #[test]
 fn codegen_variadic_float_promotion() {
     let code = r#"
@@ -5417,7 +5417,7 @@ int main(void) {
 // observable work before its noreturn-call terminator.
 //
 // Triggered originally by CPython's fork+spawn helper, which has the form
-// `if (param != GLOBAL) { side_effect(); } work(); _exit(...);` — pcc's
+// `if (param != GLOBAL) { side_effect(); } work(); _exit(...);` — c17's
 // DCE used to treat the whole block as "trivially unreachable" because the
 // linearizer emits `Unreachable` after `_exit`, and then folded the cbr to
 // an unconditional branch into the `side_effect()` arm.

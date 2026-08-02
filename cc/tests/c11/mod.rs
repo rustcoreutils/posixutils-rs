@@ -6,7 +6,7 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// C11 tests for pcc
+// C11 tests for c17
 //
 // This module contains mega-tests for C11-era features:
 // - core: _Static_assert, _Alignof, _Noreturn, _Thread_local

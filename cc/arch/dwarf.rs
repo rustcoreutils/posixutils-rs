@@ -6,7 +6,7 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// DWARF debug information generation for pcc C99 compiler
+// DWARF debug information generation for c17 C99 compiler
 //
 
 use super::codegen::CodeGenBase;
@@ -95,7 +95,7 @@ pub fn generate_abbrev_table<I: LirInst + EmitAsm>(base: &mut CodeGenBase<I>) {
 ///
 /// # Arguments
 /// * `base` - CodeGenBase to push directives to
-/// * `producer` - Compiler identification string (e.g., "pcc 0.7.0")
+/// * `producer` - Compiler identification string (e.g., "c17 0.7.0")
 /// * `source_name` - Primary source filename
 /// * `comp_dir` - Compilation directory
 /// * `low_pc_label` - Label for start of code (e.g., ".Ltext0"), or None if no code

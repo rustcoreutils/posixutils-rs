@@ -6,7 +6,7 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// Compiler builtins tests for pcc
+// Compiler builtins tests for c17
 //
 // This module contains mega-tests for compiler builtins:
 // - bit_ops: clz, ctz, popcount, bswap

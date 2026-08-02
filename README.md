@@ -195,7 +195,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
 
 ## Stage 3 - Test coverage
 
- - [x] c99 (Development)
+ - [x] c17 (Development)
  - [x] localedef (i18n)
  - [x] tr
 

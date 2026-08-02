@@ -6,7 +6,7 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// Common test utilities for pcc integration tests
+// Common test utilities for c17 integration tests
 //
 
 use plib::testing::run_test_base;
@@ -40,7 +40,7 @@ pub const COMPILE_MATRIX: &[(&str, &[&str])] = &[("debug_opt", &["-g", "-O"])];
 /// Returns NamedTempFile which auto-deletes on drop
 pub fn create_c_file(name: &str, content: &str) -> NamedTempFile {
     let mut file = tempfile::Builder::new()
-        .prefix(&format!("pcc_test_{}_", name))
+        .prefix(&format!("c17_test_{}_", name))
         .suffix(".c")
         .tempfile()
         .expect("failed to create temp file");
@@ -66,7 +66,7 @@ fn compile_and_run_single(
     // Use thread ID and config name to make exe path unique for parallel test execution
     let thread_id = format!("{:?}", std::thread::current().id());
     let exe_path = std::env::temp_dir().join(format!(
-        "pcc_exe_{}_{}_{}",
+        "c17_exe_{}_{}_{}",
         name,
         config_name,
         thread_id.replace(|c: char| !c.is_alphanumeric(), "_")
@@ -76,11 +76,11 @@ fn compile_and_run_single(
     args.extend(extra_opts.iter().cloned());
     args.push(c_path.to_string_lossy().to_string());
 
-    let output = run_test_base("pcc", &args, &[]);
+    let output = run_test_base("c17", &args, &[]);
 
     if !output.status.success() {
         eprintln!(
-            "pcc compilation failed for {} [config: {}]:\n{}",
+            "c17 compilation failed for {} [config: {}]:\n{}",
             name,
             config_name,
             String::from_utf8_lossy(&output.stderr)
@@ -96,7 +96,7 @@ fn compile_and_run_single(
 
     // On failure, dump generated assembly for diagnosis
     if exit_code != 0 {
-        let asm_path = std::env::temp_dir().join(format!("pcc_asm_{}_{}.s", name, config_name));
+        let asm_path = std::env::temp_dir().join(format!("c17_asm_{}_{}.s", name, config_name));
         let mut asm_args = vec![
             "-S".to_string(),
             "-o".to_string(),
@@ -104,7 +104,7 @@ fn compile_and_run_single(
         ];
         asm_args.extend(extra_opts.iter().cloned());
         asm_args.push(c_path.to_string_lossy().to_string());
-        let asm_output = run_test_base("pcc", &asm_args, &[]);
+        let asm_output = run_test_base("c17", &asm_args, &[]);
         if asm_output.status.success() {
             if let Ok(asm) = std::fs::read_to_string(&asm_path) {
                 eprintln!(

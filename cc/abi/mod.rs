@@ -6,7 +6,7 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// ABI (Application Binary Interface) handling for pcc
+// ABI (Application Binary Interface) handling for c17
 //
 // This module provides platform-specific calling convention classification
 // for function parameters and return values. It serves as the contract

@@ -8,7 +8,7 @@
 //
 // Section-classification tests
 //
-// Verifies that pcc routes global variables into the appropriate object-file
+// Verifies that c17 routes global variables into the appropriate object-file
 // sections:
 //
 //   * `.rodata`        — const data without relocations
@@ -37,7 +37,7 @@ fn compile_to_asm(name: &str, content: &str) -> String {
     let c_file = create_c_file(name, content);
     let c_path = c_file.path().to_path_buf();
     let output = run_test_base(
-        "pcc",
+        "c17",
         &vec![
             "-O".to_string(),
             "-S".to_string(),
@@ -49,7 +49,7 @@ fn compile_to_asm(name: &str, content: &str) -> String {
     );
     assert!(
         output.status.success(),
-        "pcc -O -S failed for '{}':\n{}",
+        "c17 -O -S failed for '{}':\n{}",
         name,
         String::from_utf8_lossy(&output.stderr)
     );
@@ -315,7 +315,7 @@ fn sections_writable_global_stays_in_data() {
     let in_data = if cfg!(target_os = "macos") {
         asm.contains(".section __DATA,__data")
     } else {
-        // ELF .data directive is just `.data` (no `.section` prefix in pcc output).
+        // ELF .data directive is just `.data` (no `.section` prefix in c17 output).
         asm.contains("\n.data\n") || asm.starts_with(".data\n")
     };
     assert!(

@@ -141,7 +141,7 @@ pub struct OperandSpec<R> {
 /// letters that map to a generic `OperandConstraint` rather than a
 /// physical register (e.g. x86_64's `q` (byte-class register) → `Any`,
 /// `I` (immediate in `[0, 31]`) → `Imm`, aarch64's `L` (logical-
-/// immediate) → `Imm`). pcc does not validate immediate ranges; if
+/// immediate) → `Imm`). c17 does not validate immediate ranges; if
 /// the supplied operand is out of range, the assembler rejects the
 /// resulting asm template — the same failure mode GCC defaults to
 /// with mismatched immediates.

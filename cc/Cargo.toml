@@ -29,7 +29,7 @@ name = "posixutils_cc"
 path = "./lib.rs"
 
 [[bin]]
-name = "pcc"
+name = "c17"
 path = "./main.rs"
 
 [[bin]]

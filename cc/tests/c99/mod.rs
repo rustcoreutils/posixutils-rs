@@ -6,7 +6,7 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// C99 tests for pcc
+// C99 tests for c17
 //
 // This module contains mega-tests for C99-era features:
 // - types: longlong, bool, complex, float16

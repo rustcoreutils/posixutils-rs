@@ -1,8 +1,8 @@
-# Guide to working on pcc, our C99 compiler
+# Guide to working on c17, our C99 compiler
 
 ## Overview
 
-pcc is a C99 compiler with selected C11 features, targeting POSIX.2024 compliance. It supports x86-64 and AArch64 (ARM64) on Linux and macOS.
+c17 is a C99 compiler with selected C11 features, targeting POSIX.2024 compliance. It supports x86-64 and AArch64 (ARM64) on Linux and macOS.
 
 References:
 - [ISO/IEC 9899:1999 (C99)](https://www.open-std.org/jtc1/sc22/wg14/www/docs/n1256.pdf) — baseline
@@ -16,7 +16,7 @@ Testing (compiler subset): `cargo test --release -p posixutils-cc`
 
 Debugging, via stdio:
 ```
-echo 'int main() { return 42; }' | ./target/release/pcc - -S -o -
+echo 'int main() { return 42; }' | ./target/release/c17 - -S -o -
 ```
 
 ## Architecture
@@ -33,7 +33,7 @@ Key source files:
 
 | File / Dir | Purpose |
 |------------|---------|
-| `main.rs` | Driver CLI (pcc binary): arg parsing, pipeline orchestration, dump-ir stages |
+| `main.rs` | Driver CLI (c17 binary): arg parsing, pipeline orchestration, dump-ir stages |
 | `lib.rs` | Library entry point (re-exports for tests) |
 | `token/lexer.rs` | Tokenization |
 | `token/preprocess.rs` | C preprocessor (`#include`, `#define`, `#ifdef`, …) |
@@ -83,13 +83,13 @@ Examples:
 
 ```bash
 # Compile from stdin, view generated assembly
-echo 'int main() { return 42; }' | ./target/release/pcc - -S -o -
+echo 'int main() { return 42; }' | ./target/release/c17 - -S -o -
 
 # View IR for a source file
-./target/release/pcc myfile.c --dump-ir
+./target/release/c17 myfile.c --dump-ir
 
 # Using heredoc for multi-line test cases
-./target/release/pcc - -S -o - <<'EOF'
+./target/release/c17 - -S -o - <<'EOF'
 int add(int a, int b) {
     return a + b;
 }

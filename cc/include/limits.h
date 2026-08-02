@@ -1,13 +1,13 @@
 /*
- * pcc builtin limits.h - Implementation limits for C99
+ * c17 builtin limits.h - Implementation limits for C99
  *
  * This header provides the standard integer type limits defined by C99.
  * It uses compiler-predefined macros to determine the actual limits
  * for the target platform.
  */
 
-#ifndef _PCC_LIMITS_H
-#define _PCC_LIMITS_H
+#ifndef _C17_LIMITS_H
+#define _C17_LIMITS_H
 
 /* Number of bits in a char */
 #define CHAR_BIT __CHAR_BIT__
@@ -150,4 +150,4 @@
 #define __WORDSIZE 32
 #endif
 
-#endif /* _PCC_LIMITS_H */
+#endif /* _C17_LIMITS_H */

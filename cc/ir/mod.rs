@@ -6,7 +6,7 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// Intermediate Representation (IR) for pcc C99 compiler
+// Intermediate Representation (IR) for c17 C99 compiler
 // SSA-form IR with basic blocks and typed pseudo-registers
 //
 // The IR uses Single Static Assignment (SSA) form where each variable
@@ -846,7 +846,7 @@ impl Instruction {
     /// - `Opcode::Fence` — explicit C11 `atomic_thread_fence`.
     /// - `Opcode::Atomic*` — every atomic memory op (including
     ///   `Relaxed`-ordered ones — see note below).
-    /// - `Opcode::Call` — pcc has no escape/alias analysis; any
+    /// - `Opcode::Call` — c17 has no escape/alias analysis; any
     ///   external call may read or write any memory location the
     ///   callee can reach. Conservative.
     /// - `Opcode::Setjmp` / `Opcode::Longjmp` — non-local control flow
@@ -2636,7 +2636,7 @@ mod tests {
 
     #[test]
     fn test_is_memory_barrier_call_and_jmp() {
-        // Call is always a barrier (no escape analysis in pcc).
+        // Call is always a barrier (no escape analysis in c17).
         assert!(Instruction::new(Opcode::Call).is_memory_barrier());
         // setjmp/longjmp save/restore arbitrary execution context.
         assert!(Instruction::new(Opcode::Setjmp).is_memory_barrier());

@@ -301,7 +301,7 @@ where
     let mut first_pos_map: Vec<HashMap<PseudoId, usize>> = vec![HashMap::new(); num_blocks];
     let mut last_pos_map: Vec<HashMap<PseudoId, usize>> = vec![HashMap::new(); num_blocks];
     let mut defined_in: Vec<HashSet<PseudoId>> = vec![HashSet::new(); num_blocks];
-    // Per-pseudo set of defining blocks. The IR pcc hands to the
+    // Per-pseudo set of defining blocks. The IR c17 hands to the
     // allocator is *not* strictly SSA: lower::eliminate_phi_nodes
     // converts each Phi into one Copy per predecessor edge, all
     // targeting the same pseudo. A single pseudo therefore has up to
@@ -776,7 +776,7 @@ pub fn spill_gp_args_across_calls<L, R, IsArg, ExtractReg, MkStackLoc, RecordSpi
 //   2. Greedy color in MCS order: pick the lowest-index register not
 //      used by any already-colored neighbor.
 //
-// pcc's IR is not strictly SSA at the allocator boundary —
+// c17's IR is not strictly SSA at the allocator boundary —
 // `lower::eliminate_phi_nodes` introduces multi-def Copy patterns. The
 // interference graph is still well-defined: vertex u interferes with
 // vertex v iff u and v are simultaneously live somewhere in the
@@ -946,7 +946,7 @@ pub fn build_interference_graph(
 // reassigns matching `Loc`s, the surviving Copy becomes identity and
 // M9a's codegen short-circuit elides it.
 //
-// pcc uses the simplest viable strategy: walk every Copy after
+// c17 uses the simplest viable strategy: walk every Copy after
 // chordal coloring completes, and migrate the target pseudo to the
 // source's location when the migration is safe (no interference, no
 // pre-color conflict, no forbidden-set violation, no neighbor of the

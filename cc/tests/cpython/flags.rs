@@ -11,7 +11,7 @@
 
 use crate::common::compile_and_run;
 
-/// Test that pcc accepts CPython-style compiler flags without crashing
+/// Test that c17 accepts CPython-style compiler flags without crashing
 #[test]
 fn cpython_flags_ignored_flags() {
     let code = r#"

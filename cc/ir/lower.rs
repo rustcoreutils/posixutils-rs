@@ -6,7 +6,7 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// Lowering passes for pcc C99 compiler
+// Lowering passes for c17 C99 compiler
 //
 // This module contains IR-to-IR transformation passes that lower
 // high-level IR constructs to forms suitable for code generation.

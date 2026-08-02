@@ -6,9 +6,9 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// CPython build compatibility tests for pcc
+// CPython build compatibility tests for c17
 //
-// Tests for features needed to build CPython with pcc.
+// Tests for features needed to build CPython with c17.
 //
 
 mod flags;

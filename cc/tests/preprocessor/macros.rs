@@ -439,7 +439,7 @@ android_api = __ANDROID_API__
 
     // Create temp file
     let mut file = tempfile::Builder::new()
-        .prefix("pcc_test_error_")
+        .prefix("c17_test_error_")
         .suffix(".c")
         .tempfile()
         .expect("failed to create temp file");
@@ -447,9 +447,9 @@ android_api = __ANDROID_API__
         .expect("failed to write test file");
     let path = file.path().to_path_buf();
 
-    // Run pcc -E (preprocess only)
+    // Run c17 -E (preprocess only)
     let args = vec!["-E".to_string(), path.to_str().unwrap().to_string()];
-    let output = run_test_base("pcc", &args, &[]);
+    let output = run_test_base("c17", &args, &[]);
 
     // Should fail with non-zero exit code
     assert!(

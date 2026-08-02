@@ -6,7 +6,7 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// String interning for pcc C99 compiler
+// String interning for c17 C99 compiler
 //
 // This module provides a global StringTable for interning strings across all
 // compiler passes. Each unique string is stored once and referenced by a

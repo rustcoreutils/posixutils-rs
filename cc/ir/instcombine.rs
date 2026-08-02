@@ -6,7 +6,7 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// InstCombine pass for pcc C99 compiler
+// InstCombine pass for c17 C99 compiler
 //
 // This pass performs instruction combining optimizations:
 // - Constant folding: evaluate operations on constants at compile time

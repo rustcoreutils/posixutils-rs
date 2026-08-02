@@ -678,10 +678,10 @@ pub fn parse_aarch64_fixed_letter(_letter: char) -> Option<Reg> {
 /// - `S` — 32-bit absolute symbolic address (or its low bits).
 /// - `Y` — floating-point zero.
 /// - `Z` — integer zero (the `xzr`/`wzr` zero register; treated as
-///   immediate here since pcc does not directly model `xzr` as an
+///   immediate here since c17 does not directly model `xzr` as an
 ///   allocator-visible register).
 ///
-/// pcc does not range-check these immediates; the assembler will
+/// c17 does not range-check these immediates; the assembler will
 /// reject an out-of-range value, matching GCC's default behaviour.
 pub fn parse_aarch64_class_letter(letter: char) -> Option<OperandConstraint<Reg>> {
     use OperandConstraint::*;

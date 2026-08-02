@@ -4798,7 +4798,7 @@ impl CodeGenerator for X86_64CodeGen {
 
         // Generate DWARF debug sections if debug mode is enabled
         if module.debug {
-            let producer = format!("pcc {}", env!("CARGO_PKG_VERSION"));
+            let producer = format!("c17 {}", env!("CARGO_PKG_VERSION"));
             let source_name = module.source_name.as_deref().unwrap_or("unknown");
             let comp_dir = module.comp_dir.as_deref().unwrap_or(".");
 

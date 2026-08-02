@@ -3492,7 +3492,7 @@ msgid "pax - portable archive interchange"
 msgstr ""
 
 #: cc/main.rs:45
-msgid "pcc - compile standard C programs"
+msgid "c17 - compile standard C programs"
 msgstr ""
 
 #: text/pr_util/args.rs:22

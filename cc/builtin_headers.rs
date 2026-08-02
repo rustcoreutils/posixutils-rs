@@ -6,7 +6,7 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// Builtin headers for pcc
+// Builtin headers for c17
 //
 // These headers are embedded directly in the compiler binary and are
 // searched before system headers. They provide compiler-specific

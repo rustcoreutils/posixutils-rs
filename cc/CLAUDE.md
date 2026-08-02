@@ -1,4 +1,4 @@
-# cc (pcc) Development Rules
+# cc (c17) Development Rules
 
 ## Testing Requirements
 
@@ -8,7 +8,7 @@
 
 ## Determinism Invariant
 
-pcc must produce **bit-identical** assembly and object output on identical
+c17 must produce **bit-identical** assembly and object output on identical
 input across runs. Reproducible builds depend on this; subtle "works on my
 machine" bugs (where two valid orderings happen to both work locally but
 collide somewhere else) are prevented by it; and binary diffs across

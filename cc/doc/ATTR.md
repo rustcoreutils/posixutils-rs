@@ -1,6 +1,6 @@
 # Attributes
 
-This document describes attribute support in pcc.
+This document describes attribute support in c17.
 
 ## Table of Contents
 
@@ -12,7 +12,7 @@ This document describes attribute support in pcc.
 
 ## Overview
 
-pcc supports GNU-style attributes that modify function, variable, and type behavior. Attributes can be specified using:
+c17 supports GNU-style attributes that modify function, variable, and type behavior. Attributes can be specified using:
 
 1. **GNU-style attributes**: `__attribute__((name))` or `__attribute__((__name__))`
 2. **C11 keyword**: `_Noreturn`

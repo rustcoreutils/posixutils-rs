@@ -6,7 +6,7 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// Type system for pcc C99 compiler
+// Type system for c17 C99 compiler
 // Compositional type model with interning for efficient comparison
 //
 

@@ -6,7 +6,7 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// Target configuration for pcc
+// Target configuration for c17
 //
 // Handles architecture, OS, and ABI-specific settings needed for
 // preprocessing and code generation.

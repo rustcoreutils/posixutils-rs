@@ -28,6 +28,10 @@ pub enum ExCommand {
         range: AddressRange,
         file: Option<String>,
         force: bool,
+        /// True for `:x`/`:xit`, false for `:wq`. POSIX (ex.md §95537) makes
+        /// `xit` on an unmodified buffer equivalent to `quit`, whereas `wq`
+        /// always writes (#X29).
+        xit: bool,
     },
     /// Edit file (:e, :edit).
     Edit { file: Option<String>, force: bool },

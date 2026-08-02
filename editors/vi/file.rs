@@ -34,6 +34,10 @@ pub struct FileManager {
     arg_index: usize,
     /// Whether current file is read-only.
     readonly: bool,
+    /// Whether the current pathname was changed by `:f` or `:r` since the last
+    /// successful write. POSIX ex write rule 5 (ex.md §95510-95513) makes a
+    /// write to a changed-and-existing pathname fail until forced.
+    pathname_changed: bool,
 }
 
 impl Default for FileManager {
@@ -51,7 +55,23 @@ impl FileManager {
             arg_list: Vec::new(),
             arg_index: 0,
             readonly: false,
+            pathname_changed: false,
         }
+    }
+
+    /// True when `:f`/`:r` changed the current pathname since the last write.
+    pub fn pathname_changed(&self) -> bool {
+        self.pathname_changed
+    }
+
+    /// Record that `:f`/`:r` changed the current pathname (write rule 5).
+    pub fn mark_pathname_changed(&mut self) {
+        self.pathname_changed = true;
+    }
+
+    /// Clear the rule-5 flag after a successful write.
+    pub fn clear_pathname_changed(&mut self) {
+        self.pathname_changed = false;
     }
 
     /// Set the argument list of files.

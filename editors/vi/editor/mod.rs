@@ -19,7 +19,7 @@ use crate::command::CommandParser;
 use crate::error::{Result, ViError};
 use crate::ex::command::SubstituteFlags;
 use crate::ex::{parse_ex_command, AddressRange, ExCommand, ExResult};
-use crate::file::{read_file, write_file, FileManager};
+use crate::file::{read_file, write_file, write_range, FileManager};
 use crate::input::{InputReader, Key};
 use crate::mode::{enter_insert_mode, process_insert_key, InsertKind, InsertState, Mode};
 use crate::options::Options;
@@ -332,8 +332,19 @@ impl Editor {
     }
 
     /// Set read-only mode.
+    ///
+    /// POSIX describes `-R` as setting the `readonly` *edit option*, and the
+    /// `write` rules are written against that option (ex.md §95506), so `-R`
+    /// and `:set ro` must be the same state. Keeping only the `FileManager`
+    /// flag left `:set ro` unable to block a write (#X27).
     pub fn set_readonly(&mut self, readonly: bool) {
         self.files.set_readonly(readonly);
+        self.options.readonly = readonly;
+    }
+
+    /// True when writing is disallowed, from either `-R` or `:set readonly`.
+    fn is_readonly(&self) -> bool {
+        self.options.readonly || self.files.is_readonly()
     }
 
     /// Set the initial window size (the `-w size` option).
@@ -1935,12 +1946,25 @@ impl Editor {
                 append,
                 force,
             } => {
-                self.write(file.as_deref(), range.explicit, append, force)?;
+                let lines = self.write_line_range(&range)?;
+                self.write(file.as_deref(), lines, append, force)?;
                 Ok(ExResult::Continue)
             }
-            ExCommand::WriteQuit { range, file, force } => {
-                self.write(file.as_deref(), range.explicit, false, force)?;
-                self.quit(true)?;
+            ExCommand::WriteQuit {
+                range,
+                file,
+                force,
+                xit,
+            } => {
+                // #X29: `xit` on a buffer unmodified since the last complete
+                // write is just `quit` (ex.md §95537); only `wq` always writes.
+                if xit && !self.buffer.is_modified() {
+                    self.quit(force)?;
+                } else {
+                    let lines = self.write_line_range(&range)?;
+                    self.write(file.as_deref(), lines, false, force)?;
+                    self.quit(true)?;
+                }
                 Ok(ExResult::Continue)
             }
             ExCommand::Edit { file, force } => {
@@ -1983,6 +2007,9 @@ impl Editor {
             ExCommand::File { new_name } => {
                 if let Some(name) = new_name {
                     self.files.set_current_file(Some(PathBuf::from(name)));
+                    // Write rule 5: a later `:w` with no operand must not
+                    // clobber this newly-named file if it already exists.
+                    self.files.mark_pathname_changed();
                 }
                 let info = self.file_info();
                 Ok(ExResult::StatusMessage(info))
@@ -2749,18 +2776,69 @@ impl Editor {
     }
 
     /// Write buffer to file.
-    fn write(&mut self, path: Option<&str>, _range: bool, append: bool, force: bool) -> Result<()> {
+    /// Execute an ex `write`.
+    ///
+    /// `lines` is `Some((start, end))` when an explicit address range was given,
+    /// i.e. only part of the buffer is being written. It used to be flattened to
+    /// a bool and then discarded, so `:1,5w out` silently wrote the *whole*
+    /// buffer (#X24).
+    ///
+    /// Implements the numbered rules in ex.md §95502-95519. Rules 2, 3 and 5 are
+    /// overridable by `!` or the `writeany` option; rule 6 is overridable by
+    /// neither, which is why it is checked last and ignores both.
+    fn write(
+        &mut self,
+        path: Option<&str>,
+        lines: Option<(usize, usize)>,
+        append: bool,
+        force: bool,
+    ) -> Result<()> {
+        // Rule 4: no file operand means the current pathname; absent that, fail.
+        let named = path.is_some();
         let path = path
             .map(PathBuf::from)
             .or_else(|| self.files.current_file().map(|p| p.to_path_buf()))
             .ok_or(ViError::NoFileName)?;
 
-        if !force && self.files.is_readonly() {
+        let overridable = force || self.options.writeany;
+        let is_current = self.files.current_file() == Some(path.as_path());
+        let exists = path.exists();
+
+        // Rule 2: the readonly edit option blocks the write.
+        if !overridable && self.is_readonly() {
             return Err(ViError::ReadOnly);
         }
 
-        let stats = write_file(&self.buffer, &path, append)?;
-        self.buffer.mark_saved();
+        // Rule 3: writing to a named file that is not the current pathname and
+        // already exists would clobber an unrelated file.
+        if !overridable && named && !is_current && exists {
+            return Err(ViError::FileExists(path.display().to_string()));
+        }
+
+        // Rule 5: the current pathname was changed by `:f` or `:r` and the file
+        // exists -- writing would clobber a file the user did not edit. A
+        // successful write clears the flag, so later writes do not re-fail.
+        if !overridable && !named && self.files.pathname_changed() && exists {
+            return Err(ViError::FileExists(path.display().to_string()));
+        }
+
+        // Rule 6: a partial write over an existing file. Not overridable by `!`
+        // or `writeany` -- it is absent from both lists in §95516-95518.
+        if lines.is_some() && exists {
+            return Err(ViError::PartialWriteExists(path.display().to_string()));
+        }
+
+        let stats = match lines {
+            Some((start, end)) => write_range(&self.buffer, &path, start, end, append)?,
+            None => write_file(&self.buffer, &path, append)?,
+        };
+
+        // Only a complete write means the buffer is saved; a partial write
+        // leaves the buffer modified.
+        if lines.is_none() {
+            self.buffer.mark_saved();
+        }
+        self.files.clear_pathname_changed();
 
         if self.files.current_file().is_none() {
             self.files.set_current_file(Some(path.clone()));
@@ -2770,10 +2848,21 @@ impl Editor {
         Ok(())
     }
 
+    /// Resolve an ex `write` address range to the lines to write.
+    ///
+    /// `None` means the whole buffer, which is what an absent range denotes.
+    fn write_line_range(&self, range: &AddressRange) -> Result<Option<(usize, usize)>> {
+        if range.explicit {
+            Ok(Some(self.resolve_range(range)?))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Write and quit.
     fn write_and_quit(&mut self) -> Result<()> {
         if self.buffer.is_modified() {
-            self.write(None, false, false, false)?;
+            self.write(None, None, false, false)?;
         }
         self.quit(true)
     }

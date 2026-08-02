@@ -164,20 +164,159 @@ fn test_ex_read_file() {
 
 #[test]
 fn test_ex_write_file() {
-    let temp = NamedTempFile::new().unwrap();
-    let path = temp.path().to_string_lossy().to_string();
+    // Writes to a path that does not yet exist. This previously wrote to a
+    // NamedTempFile, which *creates* the file -- it only passed because ex was
+    // missing POSIX write rule 3 (§95507: a named target that is not the
+    // current pathname and already exists must fail). Verified against vim -e,
+    // which likewise refuses that write.
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("written.txt");
+    let path_str = path.to_string_lossy().to_string();
 
     run_test(TestPlan {
         cmd: "ex".to_string(),
         args: vec!["-s".to_string()],
-        stdin_data: format!("a\ntest content\n.\nw {}\nq\n", path),
+        stdin_data: format!("a\ntest content\n.\nw {}\nq\n", path_str),
         expected_out: String::new(),
         expected_err: String::new(),
         expected_exit_code: 0,
     });
 
-    let content = fs::read_to_string(temp.path()).unwrap();
+    let content = fs::read_to_string(&path).unwrap();
     assert_eq!(content, "test content\n");
+}
+
+// ============================================================================
+// POSIX write rules (ex.md §95502-95519) -- audit #X22/#X24/#X27/#X29
+// ============================================================================
+
+/// Run ex over `content` with `script`; returns (exit code, stderr, tempdir).
+fn ex_run(content: &str, args: &[&str], script: &str) -> (i32, String, TempDir) {
+    let dir = TempDir::new().unwrap();
+    let input = dir.path().join("in.txt");
+    fs::write(&input, content).unwrap();
+
+    let mut argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    argv.push(input.to_string_lossy().to_string());
+
+    let mut child = Command::new(get_binary_path("ex"))
+        .args(&argv)
+        .current_dir(dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ex");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+        dir,
+    )
+}
+
+#[test]
+fn test_ex_write_range_writes_only_that_range() {
+    // #X24: `fn write` took the range as a bool and discarded it, so a partial
+    // write silently wrote the ENTIRE buffer with no diagnostic. Byte-for-byte
+    // agreement with `vim -e` was confirmed for this case.
+    let (code, err, dir) = ex_run(
+        "L1\nL2\nL3\nL4\nL5\nL6\nL7\nL8\n",
+        &["-s"],
+        "1,3w out.txt\nq\n",
+    );
+    assert_eq!(code, 0, "partial write should succeed: {}", err);
+    let out =
+        fs::read_to_string(dir.path().join("out.txt")).expect("partial write must create target");
+    assert_eq!(
+        out, "L1\nL2\nL3\n",
+        "only the addressed lines may be written"
+    );
+}
+
+#[test]
+fn test_ex_write_range_over_existing_file_is_never_forced() {
+    // Rule 6 (§95514): a partial write to an existing file must fail, and --
+    // unlike rules 1/2/3/5 -- `!` does not override it (§95516-95518).
+    let (code, err, dir) = ex_run(
+        "L1\nL2\nL3\n",
+        &["-s"],
+        "w whole.txt\n1,2w! whole.txt\nq!\n",
+    );
+    assert_ne!(code, 0, "rule 6 must fail even with '!'");
+    assert!(
+        err.contains("exists"),
+        "diagnostic should name the existing file: {}",
+        err
+    );
+    let whole = fs::read_to_string(dir.path().join("whole.txt")).unwrap();
+    assert_eq!(whole, "L1\nL2\nL3\n", "the earlier full write must survive");
+}
+
+#[test]
+fn test_ex_write_existing_other_file_requires_force() {
+    // Rule 3 (§95507). Matches vim -e, which also refuses without '!'.
+    let (code, err, dir) = ex_run("L1\n", &["-s"], "w other.txt\nw other.txt\nq!\n");
+    assert_ne!(code, 0, "second write to the now-existing file must fail");
+    assert!(err.contains("exists"), "unexpected diagnostic: {}", err);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("other.txt")).unwrap(),
+        "L1\n"
+    );
+
+    let (code, err, _dir) = ex_run("L1\n", &["-s"], "w o.txt\nw! o.txt\nq\n");
+    assert_eq!(code, 0, "'!' must override rule 3: {}", err);
+}
+
+#[test]
+fn test_ex_set_readonly_blocks_write() {
+    // #X27: `:set ro` was disconnected from the write check, which consulted
+    // only the -R flag, so `:set ro` then `:w` silently succeeded.
+    let (code, err, _dir) = ex_run("L1\n", &["-s"], "set ro\nw\nq!\n");
+    assert_ne!(code, 0, "readonly must block the write");
+    assert!(err.to_lowercase().contains("read-only"), "got: {}", err);
+
+    let (code, err, _dir) = ex_run("L1\n", &["-s"], "set ro\nset wa\nw\nq\n");
+    assert_eq!(code, 0, "writeany must override readonly (§95518): {}", err);
+
+    let (code, err, _dir) = ex_run("L1\n", &["-s"], "set ro\nw!\nq\n");
+    assert_eq!(code, 0, "'!' must override readonly (§95516): {}", err);
+}
+
+#[test]
+fn test_ex_xit_on_unmodified_buffer_does_not_write() {
+    // #X29 (§95537): xit on a buffer unmodified since the last complete write
+    // is equivalent to quit; `:wq` by contrast always writes.
+    let dir = TempDir::new().unwrap();
+    let input = dir.path().join("in.txt");
+    fs::write(&input, "L1\nL2\n").unwrap();
+    let before = fs::metadata(&input).unwrap().modified().unwrap();
+
+    // Sleep past filesystem mtime granularity.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    let mut child = Command::new(get_binary_path("ex"))
+        .args(["-s", input.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ex");
+    child.stdin.as_mut().unwrap().write_all(b"x\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+
+    let after = fs::metadata(&input).unwrap().modified().unwrap();
+    assert_eq!(
+        before, after,
+        "xit must not rewrite a buffer that was never modified"
+    );
 }
 
 // ============================================================================

@@ -54,9 +54,10 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
         // Write commands
         "w" | "write" => parse_write(range, args, false),
         "w!" => parse_write(range, args, true),
-        "wq" => parse_write_quit(range, args, false),
-        "wq!" => parse_write_quit(range, args, true),
-        "x" | "xit" => parse_write_quit(range, args, false),
+        "wq" => parse_write_quit(range, args, false, false),
+        "wq!" => parse_write_quit(range, args, true, false),
+        "x" | "xit" => parse_write_quit(range, args, false, true),
+        "x!" | "xit!" => parse_write_quit(range, args, true, true),
 
         // Quit commands
         "q" | "quit" => Ok(ExCommand::Quit { force: false }),
@@ -498,13 +499,18 @@ fn parse_write(range: AddressRange, args: &str, force: bool) -> Result<ExCommand
 }
 
 /// Parse write-quit command.
-fn parse_write_quit(range: AddressRange, args: &str, force: bool) -> Result<ExCommand> {
+fn parse_write_quit(range: AddressRange, args: &str, force: bool, xit: bool) -> Result<ExCommand> {
     let file = if args.is_empty() {
         None
     } else {
         Some(args.to_string())
     };
-    Ok(ExCommand::WriteQuit { range, file, force })
+    Ok(ExCommand::WriteQuit {
+        range,
+        file,
+        force,
+        xit,
+    })
 }
 
 /// Parse substitute command.

@@ -42,8 +42,16 @@ pub enum ChangeKind {
     Insert,
     /// Text was deleted.
     Delete,
-    /// Text was replaced (change operation).
+    /// Text was replaced (change operation), within a single line.
     Replace,
+    /// A contiguous run of whole lines was replaced by a different run.
+    ///
+    /// [`ChangeKind::Replace`] is implemented as a within-line `delete_char`
+    /// loop plus `insert_str`, so it cannot express an edit that changes the
+    /// *number* of lines. A substitute whose replacement contains `\n` splits
+    /// one line into several and needs this variant; without it the edit would
+    /// be un-undoable and `u` would corrupt the buffer.
+    ReplaceLines,
     /// Lines were joined.
     Join,
     /// Line was split (newline inserted).
@@ -89,6 +97,21 @@ impl Change {
             inserted_text: Some(new_text),
             linewise,
             line_count,
+        }
+    }
+
+    /// Create a linewise range-replace change.
+    ///
+    /// `old_lines` are the lines currently occupying `pos.line ..`, and
+    /// `new_lines` are what replaces them. Either side may be longer.
+    pub fn replace_lines(pos: Position, old_lines: &[String], new_lines: &[String]) -> Self {
+        Self {
+            kind: ChangeKind::ReplaceLines,
+            position: pos,
+            deleted_text: Some(old_lines.join("\n")),
+            inserted_text: Some(new_lines.join("\n")),
+            linewise: true,
+            line_count: old_lines.len().max(1),
         }
     }
 }
@@ -170,6 +193,18 @@ impl UndoManager {
     }
 
     /// Record replace of text.
+    /// Record a linewise range replacement, where the run of lines starting at
+    /// `pos.line` changes length (e.g. a substitute whose replacement contains
+    /// a newline).
+    pub fn record_replace_lines(
+        &mut self,
+        pos: Position,
+        old_lines: &[String],
+        new_lines: &[String],
+    ) {
+        self.record(Change::replace_lines(pos, old_lines, new_lines));
+    }
+
     pub fn record_replace(&mut self, pos: Position, old: &str, new: &str, linewise: bool) {
         self.record(Change::replace(
             pos,
@@ -314,11 +349,40 @@ impl UndoManager {
                     buffer.insert_str(new);
                 }
             }
+            ChangeKind::ReplaceLines => {
+                let old_count = change
+                    .deleted_text
+                    .as_ref()
+                    .map(|t| t.split('\n').count())
+                    .unwrap_or(0);
+                let new_lines: Vec<&str> = change
+                    .inserted_text
+                    .as_deref()
+                    .map(|t| t.split('\n').collect())
+                    .unwrap_or_default();
+                Self::splice_lines(buffer, change.position.line, old_count, &new_lines);
+            }
             _ => {}
         }
 
         buffer.set_cursor(change.position);
         Ok(change.position)
+    }
+
+    /// Replace `old_count` lines starting at `start` with `new_lines`.
+    ///
+    /// The two runs may differ in length, which is exactly what
+    /// [`ChangeKind::ReplaceLines`] exists to express.
+    fn splice_lines(buffer: &mut Buffer, start: usize, old_count: usize, new_lines: &[&str]) {
+        if old_count > 0 {
+            let end = (start + old_count - 1).min(buffer.line_count());
+            if start <= buffer.line_count() {
+                buffer.delete_lines(start, end);
+            }
+        }
+        for (i, text) in new_lines.iter().enumerate() {
+            buffer.insert_line_after(start - 1 + i, Line::from(*text));
+        }
     }
 
     /// Apply inverse of a change (for undo).
@@ -365,6 +429,20 @@ impl UndoManager {
                 if let Some(old) = &change.deleted_text {
                     buffer.insert_str(old);
                 }
+            }
+            ChangeKind::ReplaceLines => {
+                // Undo = put the original run back in place of the new one.
+                let new_count = change
+                    .inserted_text
+                    .as_ref()
+                    .map(|t| t.split('\n').count())
+                    .unwrap_or(0);
+                let old_lines: Vec<&str> = change
+                    .deleted_text
+                    .as_deref()
+                    .map(|t| t.split('\n').collect())
+                    .unwrap_or_default();
+                Self::splice_lines(buffer, change.position.line, new_count, &old_lines);
             }
             _ => {}
         }

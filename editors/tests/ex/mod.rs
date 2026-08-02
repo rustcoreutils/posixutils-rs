@@ -866,3 +866,63 @@ fn test_ex_substitute_confirm_flag_reads_stdin() {
         "the confirmed match is substituted and the declined one is left alone"
     );
 }
+
+// ============================================================================
+// substitute with newline in the replacement -- audit #X12 remainder
+// ============================================================================
+
+#[test]
+fn test_ex_substitute_newline_splits_line() {
+    // #X12: a replacement containing a newline splits one line into several.
+    // replace_line would have stuffed the newline into a single Line.
+    // Assert on the line *count* via `nu`, not just the printed text: a single
+    // Line that merely contains a newline prints identically to two Lines, so
+    // a plain `p` comparison cannot tell the split apart from buffer
+    // corruption.
+    ex_test_with_file(
+        "a-b\nc-d\n",
+        "1s/-/\\n/\n1,$nu\nq!\n",
+        "     1\ta\n     2\tb\n     3\tc-d\n",
+    );
+}
+
+#[test]
+fn test_ex_substitute_newline_is_undoable() {
+    // The reason this was deferred: ChangeKind::Replace is a within-line
+    // delete_char loop and cannot express a change in line count, so `u`
+    // would have corrupted the buffer. ChangeKind::ReplaceLines now does.
+    // Assert the intermediate state too: the buffer must actually reach 3
+    // lines before the undo, otherwise this passes trivially against a build
+    // where no split ever happened.
+    ex_test_with_file(
+        "a-b\nc-d\n",
+        "1s/-/\\n/\n$=\nu\n$=\n1,$nu\nq!\n",
+        "3\n2\n     1\ta-b\n     2\tc-d\n",
+    );
+}
+
+#[test]
+fn test_ex_substitute_newline_over_a_range_visits_every_line() {
+    // Splitting shifts every later line down, so the loop bound has to grow
+    // with it or the tail of the range gets skipped.
+    ex_test_with_file(
+        "a-b\nc-d\n",
+        "1,$s/-/\\n/\n1,$nu\nq!\n",
+        "     1\ta\n     2\tb\n     3\tc\n     4\td\n",
+    );
+}
+
+#[test]
+fn test_ex_backslash_newline_continues_the_command() {
+    // The POSIX way to put a newline in a replacement is to escape a real
+    // newline, so the command spans two input lines:
+    //     s/-/\
+    //     /
+    // The reader used to cut the command at the newline, leaving the trailing
+    // '/' to parse as a bare search ("No previous search pattern").
+    ex_test_with_file(
+        "a-b\nc-d\n",
+        "1s/-/\\\n/\n1,$nu\nq!\n",
+        "     1\ta\n     2\tb\n     3\tc-d\n",
+    );
+}

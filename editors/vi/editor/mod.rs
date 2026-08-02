@@ -14,7 +14,7 @@
 
 mod executor;
 
-use crate::buffer::{Buffer, BufferMode, Position, Range};
+use crate::buffer::{Buffer, BufferMode, Line, Position, Range};
 use crate::command::CommandParser;
 use crate::error::{Result, ViError};
 use crate::ex::command::SubstituteFlags;
@@ -602,7 +602,25 @@ impl Editor {
             }
 
             // Remove trailing newline
-            let line = line.trim_end();
+            let mut line = line.trim_end_matches(['\n', '\r']).to_string();
+
+            // A <backslash><newline> continues the command onto the next input
+            // line, with the pair standing for a literal newline. This is how
+            // POSIX has you enter a newline in a `substitute` replacement, e.g.
+            //   s/-/\
+            //   /
+            // splits a line in two. Without this the reader cut the command at
+            // the newline and the trailing `/` parsed as a bare search.
+            while ends_with_odd_backslash(&line) {
+                line.pop(); // drop the escaping backslash
+                line.push('\n');
+                let mut cont = String::new();
+                match stdin.lock().read_line(&mut cont) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => line.push_str(cont.trim_end_matches(['\n', '\r'])),
+                }
+            }
+            let line = line.trim_end_matches([' ', '\t']);
 
             // Execute the command
             match self.execute_ex_input(line) {
@@ -2805,8 +2823,13 @@ impl Editor {
         }
         let mut total_count = 0;
         let mut printed: Vec<String> = Vec::new();
+        // `\n` in the replacement inserts lines mid-iteration, so walk the
+        // range with an explicit cursor rather than a fixed `for` range.
+        let mut line_shift = 0usize;
+        let mut line_num = start;
 
-        for line_num in start..=end {
+        while line_num <= end {
+            let _ = line_shift;
             if let Some(line) = self.buffer.line(line_num) {
                 let content = line.content().to_string();
                 let (new_content, count) = if sub.needs_confirm() && !sub.is_count_only() {
@@ -2818,6 +2841,32 @@ impl Editor {
                 };
 
                 if count > 0 && !sub.is_count_only() {
+                    // A replacement containing `\n` splits the line into
+                    // several. `replace_line` would stuff the newline into a
+                    // single Line and corrupt the buffer's invariant, and the
+                    // within-line undo record cannot express a line-count
+                    // change -- hence the linewise path (#X12).
+                    if new_content.contains('\n') {
+                        let parts: Vec<String> =
+                            new_content.split('\n').map(|s| s.to_string()).collect();
+                        self.undo.record_replace_lines(
+                            Position::new(line_num, 0),
+                            std::slice::from_ref(&content),
+                            &parts,
+                        );
+                        self.buffer.delete_lines(line_num, line_num);
+                        for (i, part) in parts.iter().enumerate() {
+                            self.buffer
+                                .insert_line_after(line_num - 1 + i, Line::from(part.as_str()));
+                        }
+                        // Later lines in the range have shifted down by the
+                        // number of extra lines introduced here.
+                        let added = parts.len() - 1;
+                        end += added;
+                        line_shift += added;
+                        total_count += count;
+                        continue;
+                    }
                     self.undo.record_replace(
                         Position::new(line_num, 0),
                         &content,
@@ -2843,6 +2892,7 @@ impl Editor {
                 }
                 total_count += count;
             }
+            line_num += 1;
         }
 
         if total_count == 0 {
@@ -3597,6 +3647,12 @@ impl Default for Editor {
     fn default() -> Self {
         Self::new(false, false).expect("Failed to create editor")
     }
+}
+
+/// True when `s` ends with an odd number of backslashes, i.e. the final
+/// backslash is escaping whatever follows (here, the newline).
+fn ends_with_odd_backslash(s: &str) -> bool {
+    s.chars().rev().take_while(|c| *c == '\\').count() % 2 == 1
 }
 
 #[cfg(test)]

@@ -915,18 +915,6 @@ impl Editor {
                     ));
                     return Ok(());
                 }
-                Key::Char('s') => {
-                    // Substitute char - delete char and enter insert
-                    self.buffer.delete_char();
-                    self.enter_insert(InsertKind::Insert);
-                    return Ok(());
-                }
-                Key::Char('S') => {
-                    // Substitute line - clear line and enter insert
-                    self.buffer.clear_line();
-                    self.enter_insert(InsertKind::InsertBol);
-                    return Ok(());
-                }
                 Key::Char('C') => {
                     // Change to end of line
                     self.buffer.delete_to_end_of_line();
@@ -1289,6 +1277,14 @@ impl Editor {
             }
             'c' => {
                 self.execute_change(cmd)?;
+            }
+            // #V17: `s` and `S` are `c` over an implied range. They used to be
+            // handled in the pre-parser fast path, which meant they saved
+            // nothing to a register, recorded no undo, and accepted neither a
+            // count (`3s`) nor a register prefix (`"as`) -- even though both
+            // keys were already in the command parser's table.
+            's' | 'S' => {
+                self.execute_substitute_command(cmd)?;
             }
             // Put commands
             'p' => {
@@ -1676,6 +1672,38 @@ impl Editor {
     }
 
     /// Execute change command.
+    /// `s` (substitute `count` characters) and `S` (substitute `count` whole
+    /// lines). Both are `c` over an implied range, so they route through the
+    /// same operator and inherit its register, undo and cursor handling.
+    fn execute_substitute_command(&mut self, cmd: &crate::command::ParsedCommand) -> Result<()> {
+        use crate::command::change;
+
+        let cursor = self.buffer.cursor();
+        let range = if cmd.command == 'S' {
+            let end_line = (cursor.line + cmd.count - 1).min(self.buffer.line_count());
+            Range::lines(cursor, Position::new(end_line, 0))
+        } else {
+            let line_len = self
+                .buffer
+                .line(cursor.line)
+                .map(|l| l.content().chars().count())
+                .unwrap_or(0);
+            let end_col = (cursor.column + cmd.count).min(line_len);
+            Range::chars(cursor, Position::new(cursor.line, end_col))
+        };
+
+        let result = change(&mut self.buffer, range, &mut self.registers, cmd.register)?;
+        self.buffer.set_cursor(result.cursor);
+        if result.enter_insert {
+            self.enter_insert(if cmd.command == 'S' {
+                InsertKind::Change
+            } else {
+                InsertKind::Insert
+            });
+        }
+        Ok(())
+    }
+
     fn execute_change(&mut self, cmd: &crate::command::ParsedCommand) -> Result<()> {
         use crate::command::{change, motion};
 

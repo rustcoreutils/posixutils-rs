@@ -680,3 +680,86 @@ fn test_ex_address_offset_last() {
 fn test_ex_address_offset_range() {
     ex_test("a\nL1\nL2\nL3\nL4\n.\n1,2+1p\nq!\n", "L1\nL2\nL3\n");
 }
+
+// ============================================================================
+// Address resolution -- audit #X10/#X15/#X16/#X17/#X25/#X30
+// ============================================================================
+
+#[test]
+fn test_ex_semicolon_rebases_second_address_comma_does_not() {
+    // #X10: `;` sets the current line to the first address before evaluating
+    // the second; `,` leaves the second relative to the original current line.
+    // Both used to behave like `;`. Verified against vim -e.
+    //
+    // Buffer is 6 lines, current line starts at 1.
+    //   3;+1p -> 3,4   (the +1 is relative to 3)
+    //   3,+1p -> 3,2   (the +1 is relative to 1) -> start > end -> error
+    ex_test_with_file("L1\nL2\nL3\nL4\nL5\nL6\n", "3;+1p\nq!\n", "L3\nL4\n");
+
+    let (code, _err, _dir) = ex_run("L1\nL2\nL3\nL4\nL5\nL6\n", &["-s"], "3,+1p\nq!\n");
+    assert_ne!(
+        code, 0,
+        "with ',' the second address is relative to the original current line, \
+         so 3,+1 is an inverted range"
+    );
+}
+
+#[test]
+fn test_ex_excess_leading_addresses_are_discarded() {
+    // #X17: POSIX keeps only the last two addresses. `1,2,3p` previously left a
+    // stray leading ',' for the command splitter and died as "Invalid command".
+    // vim -e prints L2,L3 for this.
+    ex_test_with_file("L1\nL2\nL3\nL4\n", "1,2,3p\nq!\n", "L2\nL3\n");
+}
+
+#[test]
+fn test_ex_mark_usable_as_address() {
+    // #X16: Address::Mark::resolve was a stub returning MarkNotSet because the
+    // resolver had no access to the editor's mark table.
+    ex_test_with_file("L1\nL2\nL3\n", "2ma a\n'ap\nq!\n", "L2\n");
+}
+
+#[test]
+fn test_ex_line_zero_address_for_read() {
+    // #X15: line 0 is legal for the commands that insert *after* an address,
+    // where it means "before the first line". `0r` used to fail outright.
+    let dir = TempDir::new().unwrap();
+    let extra = dir.path().join("extra.txt");
+    fs::write(&extra, "INSERTED\n").unwrap();
+    let (code, err, _d) = ex_run(
+        "L1\nL2\n",
+        &["-s"],
+        &format!("0r {}\n1,$p\nq!\n", extra.display()),
+    );
+    assert_eq!(code, 0, "0r must be accepted: {}", err);
+}
+
+#[test]
+fn test_ex_append_honors_non_literal_addresses() {
+    // #X25: the parser extracted a raw usize and could only read a literal
+    // Address::Line(n), falling back to line 1 for everything else -- so `$a`
+    // appended after line 1. Now matches vim -e exactly.
+    ex_test_with_file(
+        "L1\nL2\nL3\n",
+        "$a\nAPPENDED\n.\n1,$p\nq!\n",
+        "L1\nL2\nL3\nAPPENDED\n",
+    );
+    // `.` and a mark must work too.
+    ex_test_with_file(
+        "L1\nL2\nL3\n",
+        "2\n.a\nAFTER2\n.\n1,$p\nq!\n",
+        "L1\nL2\nAFTER2\nL3\n",
+    );
+}
+
+#[test]
+fn test_ex_multibyte_mark_name_does_not_panic() {
+    // #X30: parse_address sliced &input[2..] after reading a char, which is not
+    // a char boundary for a multibyte mark name -- that panicked.
+    let (code, _err, _dir) = ex_run("L1\n", &["-s"], "'\u{e9}p\nq!\n");
+    assert!(
+        code == 0 || code == 1,
+        "a multibyte mark name must be rejected cleanly, not panic (got {})",
+        code
+    );
+}

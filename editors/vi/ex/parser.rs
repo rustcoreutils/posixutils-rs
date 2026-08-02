@@ -86,13 +86,7 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
             if let Some(cmd) = args.strip_prefix('!') {
                 // Shell read
                 Ok(ExCommand::ShellRead {
-                    line: range.start.as_ref().and_then(|a| {
-                        if let Address::Line(n) = a {
-                            Some(*n)
-                        } else {
-                            None
-                        }
-                    }),
+                    range,
                     command: cmd.trim().to_string(),
                 })
             } else {
@@ -130,16 +124,7 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
         // Put command
         "pu" | "put" => {
             let register = args.chars().next().filter(|c| c.is_ascii_alphabetic());
-            Ok(ExCommand::Put {
-                line: range.start.as_ref().and_then(|a| {
-                    if let Address::Line(n) = a {
-                        Some(*n)
-                    } else {
-                        None
-                    }
-                }),
-                register,
-            })
+            Ok(ExCommand::Put { range, register })
         }
 
         // Copy command
@@ -201,16 +186,7 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
                 .chars()
                 .next()
                 .ok_or(ViError::InvalidCommand("mark name required".to_string()))?;
-            Ok(ExCommand::Mark {
-                line: range.start.as_ref().and_then(|a| {
-                    if let Address::Line(n) = a {
-                        Some(*n)
-                    } else {
-                        None
-                    }
-                }),
-                name,
-            })
+            Ok(ExCommand::Mark { range, name })
         }
 
         // Shell command
@@ -314,60 +290,22 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
         }
 
         // Text input commands
-        "a" | "append" => {
-            let line = range
-                .start
-                .as_ref()
-                .and_then(|a| {
-                    if let Address::Line(n) = a {
-                        Some(*n)
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or(1); // Default to current line (will be resolved later)
-            Ok(ExCommand::Append { line })
-        }
-        "i" | "insert" => {
-            let line = range
-                .start
-                .as_ref()
-                .and_then(|a| {
-                    if let Address::Line(n) = a {
-                        Some(*n)
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or(1);
-            Ok(ExCommand::Insert { line })
-        }
+        "a" | "append" => Ok(ExCommand::Append { range }),
+        "i" | "insert" => Ok(ExCommand::Insert { range }),
         "c" | "change" => Ok(ExCommand::Change { range }),
 
         // Visual and open mode commands
         "vi" | "visual" => Ok(ExCommand::Visual),
-        "o" | "open" => {
-            let line = range.start.as_ref().and_then(|a| {
-                if let Address::Line(n) = a {
-                    Some(*n)
-                } else {
-                    None
-                }
-            });
-            Ok(ExCommand::Open { line })
-        }
+        "o" | "open" => Ok(ExCommand::Open { range }),
 
         // Adjust window (z command)
         "z" => {
-            let line = range.start.as_ref().and_then(|a| {
-                if let Address::Line(n) = a {
-                    Some(*n)
-                } else {
-                    None
-                }
-            });
             let (ztype, count) = parse_z_args(args);
-            Ok(ExCommand::Z { line, ztype, count })
+            Ok(ExCommand::Z {
+                range,
+                ztype,
+                count,
+            })
         }
 
         // Shift left/right
@@ -381,16 +319,7 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
         }),
 
         // Write line number
-        "=" => {
-            let line = range.start.as_ref().and_then(|a| {
-                if let Address::Line(n) = a {
-                    Some(*n)
-                } else {
-                    None
-                }
-            });
-            Ok(ExCommand::LineNumber { line })
-        }
+        "=" => Ok(ExCommand::LineNumber { range }),
 
         // Execute buffer
         "@" | "*" => {

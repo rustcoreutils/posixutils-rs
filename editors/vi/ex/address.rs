@@ -11,9 +11,51 @@
 //!
 //! Addresses specify line numbers or patterns for ex commands.
 
-use crate::buffer::Buffer;
+use crate::buffer::{Buffer, Position};
 use crate::error::{Result, ViError};
 use plib::regex::{Regex, RegexFlags};
+
+/// Everything address resolution needs from the editor.
+///
+/// Previously `resolve` took only `(&Buffer, usize)`, which is why marks could
+/// not be resolved (#X16) and why line 0 could not be permitted for the
+/// insert-class commands (#X15) — neither piece of state was reachable. Passing
+/// a context keeps the call sites one-liners and gives later additions somewhere
+/// to go.
+pub struct AddrCtx<'a> {
+    /// The buffer being addressed.
+    pub buffer: &'a Buffer,
+    /// The current line, i.e. what `.` resolves to.
+    pub current: usize,
+    /// Mark table, indexed `a`..`z`.
+    pub marks: &'a [Option<Position>; 26],
+    /// Permit line 0. POSIX allows it for the commands that insert *after* an
+    /// address (`a`, `i`, `r`, `put`), where 0 means "before the first line".
+    pub allow_zero: bool,
+}
+
+impl<'a> AddrCtx<'a> {
+    /// Context for the common case: no marks available, line 0 rejected.
+    pub fn simple(buffer: &'a Buffer, current: usize) -> Self {
+        const NO_MARKS: [Option<Position>; 26] = [None; 26];
+        Self {
+            buffer,
+            current,
+            marks: &NO_MARKS,
+            allow_zero: false,
+        }
+    }
+
+    /// Same context, but resolving relative to a different current line.
+    fn with_current(&self, current: usize) -> AddrCtx<'a> {
+        AddrCtx {
+            buffer: self.buffer,
+            current,
+            marks: self.marks,
+            allow_zero: self.allow_zero,
+        }
+    }
+}
 
 /// An ex command address.
 #[derive(Debug, Clone)]
@@ -61,12 +103,17 @@ impl PartialEq for Address {
 
 impl Address {
     /// Resolve this address to a line number.
-    pub fn resolve(&self, buffer: &Buffer, current: usize) -> Result<usize> {
+    pub fn resolve(&self, ctx: &AddrCtx) -> Result<usize> {
+        let buffer = ctx.buffer;
+        let current = ctx.current;
         match self {
             Address::Current => Ok(current),
             Address::Last => Ok(buffer.line_count().max(1)),
             Address::Line(n) => {
-                if *n == 0 || *n > buffer.line_count() {
+                // Line 0 is legal only where the command inserts *after* the
+                // address, in which case it means "before line 1" (#X15).
+                let too_small = *n == 0 && !ctx.allow_zero;
+                if too_small || *n > buffer.line_count() {
                     Err(ViError::InvalidAddress(format!("line {}", n)))
                 } else {
                     Ok(*n)
@@ -111,8 +158,15 @@ impl Address {
                 Err(ViError::PatternNotFound(pattern.clone()))
             }
             Address::Mark(c) => {
-                // TODO: Implement marks
-                Err(ViError::MarkNotSet(*c))
+                // #X16: marks are now reachable through the context.
+                let idx = match c {
+                    'a'..='z' => (*c as u8 - b'a') as usize,
+                    _ => return Err(ViError::MarkNotSet(*c)),
+                };
+                match ctx.marks[idx] {
+                    Some(pos) if pos.line >= 1 && pos.line <= buffer.line_count() => Ok(pos.line),
+                    _ => Err(ViError::MarkNotSet(*c)),
+                }
             }
             Address::Relative(offset) => {
                 let base = current as i32;
@@ -126,7 +180,7 @@ impl Address {
                 }
             }
             Address::Offset(base, offset) => {
-                let b = base.resolve(buffer, current)? as i32;
+                let b = base.resolve(ctx)? as i32;
                 let result = b + offset;
                 if result < 1 || result > buffer.line_count() as i32 {
                     Err(ViError::InvalidAddress("address out of range".to_string()))
@@ -147,6 +201,13 @@ pub struct AddressRange {
     pub end: Option<Address>,
     /// Whether this range was explicitly specified.
     pub explicit: bool,
+    /// True when the two addresses were separated by `;` rather than `,`.
+    ///
+    /// POSIX: `;` sets the current line to the first address before the second
+    /// is evaluated, so `2;+1` is line 3. With `,` the second address is still
+    /// evaluated against the *original* current line, so `2,+1` is
+    /// current+1 (#X10). Both used to behave like `;`.
+    pub semi: bool,
 }
 
 impl AddressRange {
@@ -156,6 +217,7 @@ impl AddressRange {
             start: None,
             end: None,
             explicit: false,
+            semi: false,
         }
     }
 
@@ -165,6 +227,7 @@ impl AddressRange {
             start: Some(addr),
             end: None,
             explicit: true,
+            semi: false,
         }
     }
 
@@ -174,6 +237,7 @@ impl AddressRange {
             start: Some(start),
             end: Some(end),
             explicit: true,
+            semi: false,
         }
     }
 
@@ -183,6 +247,7 @@ impl AddressRange {
             start: Some(Address::Line(1)),
             end: Some(Address::Last),
             explicit: true,
+            semi: false,
         }
     }
 
@@ -192,18 +257,36 @@ impl AddressRange {
             start: Some(Address::Current),
             end: None,
             explicit: true,
+            semi: false,
+        }
+    }
+
+    /// Create a range whose addresses were separated by `;`.
+    pub fn range_semi(start: Address, end: Address, semi: bool) -> Self {
+        Self {
+            start: Some(start),
+            end: Some(end),
+            explicit: true,
+            semi,
         }
     }
 
     /// Resolve this range to actual line numbers.
-    pub fn resolve(&self, buffer: &Buffer, current: usize) -> Result<(usize, usize)> {
+    pub fn resolve(&self, ctx: &AddrCtx) -> Result<(usize, usize)> {
         let start = match &self.start {
-            Some(addr) => addr.resolve(buffer, current)?,
-            None => current,
+            Some(addr) => addr.resolve(ctx)?,
+            None => ctx.current,
         };
 
+        // `;` re-bases the second address on the first; `,` does not (#X10).
         let end = match &self.end {
-            Some(addr) => addr.resolve(buffer, start)?,
+            Some(addr) => {
+                if self.semi {
+                    addr.resolve(&ctx.with_current(start))?
+                } else {
+                    addr.resolve(ctx)?
+                }
+            }
             None => start,
         };
 
@@ -245,10 +328,14 @@ pub fn parse_address(input: &str) -> Option<(Address, &str)> {
                 &input[end + 2..],
             ))
         }
-        '\'' => {
-            // Mark
-            let mark = input.chars().nth(1)?;
-            Some((Address::Mark(mark), &input[2..]))
+        '\'' | '`' => {
+            // Mark. Both `'x` and `` `x `` are accepted. Slice by char
+            // boundary: `&input[2..]` panicked on a multibyte mark (#X30).
+            let mut it = input.char_indices();
+            it.next()?; // the quote
+            let (_, mark) = it.next()?;
+            let rest = it.next().map(|(i, _)| &input[i..]).unwrap_or("");
+            Some((Address::Mark(mark), rest))
         }
         '+' | '-' => {
             // Relative address
@@ -307,63 +394,75 @@ pub fn parse_address_range(input: &str) -> (AddressRange, &str) {
         return (AddressRange::all(), rest);
     }
 
-    // Try to parse first address
-    let (first_addr, rest) = match parse_address(input) {
-        Some((addr, rest)) => (Some(addr), rest),
-        None => (None, input),
-    };
+    // Accumulate every `addr[,;]addr[,;]addr...` in the chain rather than
+    // handling a single separator. POSIX discards all but the last two
+    // addresses (#X17); previously `1,2,3p` reached the command splitter with a
+    // leading `,` still attached and died as "Invalid command". `ed` does the
+    // same thing in `normalize_addrvec` (ed/parser.rs).
+    let mut addrs: Vec<Option<Address>> = Vec::new();
+    let mut seps: Vec<char> = Vec::new();
+    let mut rest = input;
 
-    // Check for any offsets after first address (e.g. `.+2`, `/re/-1`).
-    let (first_addr, rest) = if let Some(addr) = first_addr {
-        if rest.starts_with('+') || rest.starts_with('-') {
-            let (offset, rest) = parse_offset(rest);
-            if offset != 0 {
-                (Some(Address::Offset(Box::new(addr), offset)), rest)
-            } else {
-                (Some(addr), rest)
-            }
-        } else {
-            (Some(addr), rest)
-        }
-    } else {
-        (first_addr, rest)
-    };
-
-    let rest = rest.trim_start();
-
-    // Check for , or ; separator
-    if rest.starts_with(',') || rest.starts_with(';') {
-        let rest = &rest[1..];
-
-        // Try to parse second address (with an optional trailing offset).
-        let (second_addr, rest) = match parse_address(rest) {
-            Some((addr, rest)) => {
-                if rest.starts_with('+') || rest.starts_with('-') {
-                    let (offset, rest) = parse_offset(rest);
+    loop {
+        // One address, plus any trailing +n/-n offset.
+        let (addr, next) = match parse_address(rest) {
+            Some((addr, next)) => {
+                if next.starts_with('+') || next.starts_with('-') {
+                    let (offset, next) = parse_offset(next);
                     if offset != 0 {
-                        (Some(Address::Offset(Box::new(addr), offset)), rest)
+                        (Some(Address::Offset(Box::new(addr), offset)), next)
                     } else {
-                        (Some(addr), rest)
+                        (Some(addr), next)
                     }
                 } else {
-                    (Some(addr), rest)
+                    (Some(addr), next)
                 }
             }
             None => (None, rest),
         };
+        addrs.push(addr);
+        rest = next.trim_start();
 
-        if let (Some(start), Some(end)) = (first_addr.clone(), second_addr) {
-            (AddressRange::range(start, end), rest)
-        } else if let Some(start) = first_addr {
-            // Start, but no end - means from start to current
-            (AddressRange::range(start, Address::Current), rest)
-        } else {
-            (AddressRange::empty(), rest)
+        match rest.strip_prefix([',', ';']) {
+            Some(after) => {
+                seps.push(rest.chars().next().unwrap_or(','));
+                rest = after.trim_start();
+            }
+            None => break,
         }
-    } else if let Some(addr) = first_addr {
-        (AddressRange::single(addr), rest)
-    } else {
-        (AddressRange::empty(), rest)
+    }
+
+    // Nothing parsed at all: no address was present.
+    if addrs.len() == 1 && addrs[0].is_none() && seps.is_empty() {
+        return (AddressRange::empty(), rest);
+    }
+
+    // Keep only the final two addresses and the separator between them.
+    while addrs.len() > 2 {
+        addrs.remove(0);
+        seps.remove(0);
+    }
+    let semi = seps.last() == Some(&';');
+
+    match addrs.len() {
+        1 => match addrs.pop().flatten() {
+            Some(addr) => (AddressRange::single(addr), rest),
+            None => (AddressRange::empty(), rest),
+        },
+        _ => {
+            let end = addrs.pop().flatten();
+            let start = addrs.pop().flatten();
+            // An omitted address around a separator defaults per `ed`:
+            // `,` → line 1 on the left and `$`-relative current on the right;
+            // `;` → the current line.
+            let start = start.unwrap_or(if semi {
+                Address::Current
+            } else {
+                Address::Line(1)
+            });
+            let end = end.unwrap_or(Address::Current);
+            (AddressRange::range_semi(start, end, semi), rest)
+        }
     }
 }
 
@@ -423,10 +522,26 @@ mod tests {
     fn test_resolve_address() {
         let buf = Buffer::from_text("line1\nline2\nline3");
 
-        assert_eq!(Address::Current.resolve(&buf, 2).unwrap(), 2);
-        assert_eq!(Address::Last.resolve(&buf, 1).unwrap(), 3);
-        assert_eq!(Address::Line(2).resolve(&buf, 1).unwrap(), 2);
-        assert_eq!(Address::Relative(1).resolve(&buf, 2).unwrap(), 3);
-        assert_eq!(Address::Relative(-1).resolve(&buf, 2).unwrap(), 1);
+        assert_eq!(
+            Address::Current.resolve(&AddrCtx::simple(&buf, 2)).unwrap(),
+            2
+        );
+        assert_eq!(Address::Last.resolve(&AddrCtx::simple(&buf, 1)).unwrap(), 3);
+        assert_eq!(
+            Address::Line(2).resolve(&AddrCtx::simple(&buf, 1)).unwrap(),
+            2
+        );
+        assert_eq!(
+            Address::Relative(1)
+                .resolve(&AddrCtx::simple(&buf, 2))
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            Address::Relative(-1)
+                .resolve(&AddrCtx::simple(&buf, 2))
+                .unwrap(),
+            1
+        );
     }
 }

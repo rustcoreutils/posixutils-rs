@@ -16,6 +16,7 @@
 use super::Editor;
 use crate::buffer::{Line, Position, Range};
 use crate::error::{Result, ViError};
+use crate::ex::address::AddrCtx;
 use crate::ex::command::SubstituteFlags;
 use crate::ex::AddressRange;
 
@@ -30,7 +31,7 @@ impl Editor {
 
         // Determine the range of lines to join
         let (start, mut end) = if range.explicit {
-            range.resolve(&self.buffer, current)?
+            range.resolve(&self.addr_ctx_at(current))?
         } else if let Some(c) = count {
             // No address: current line and current + count
             (current, (current + c).min(self.buffer.line_count()))
@@ -112,7 +113,7 @@ impl Editor {
     /// Execute :copy command - copy lines to destination.
     pub(super) fn execute_ex_copy(&mut self, range: &AddressRange, dest: usize) -> Result<()> {
         let current = self.buffer.cursor().line;
-        let (start, end) = range.resolve(&self.buffer, current)?;
+        let (start, end) = range.resolve(&self.addr_ctx_at(current))?;
 
         // Collect the lines to copy
         let mut lines_to_copy = Vec::new();
@@ -139,7 +140,7 @@ impl Editor {
     /// Execute :move command - move lines to destination.
     pub(super) fn execute_ex_move(&mut self, range: &AddressRange, dest: usize) -> Result<()> {
         let current = self.buffer.cursor().line;
-        let (start, end) = range.resolve(&self.buffer, current)?;
+        let (start, end) = range.resolve(&self.addr_ctx_at(current))?;
 
         // Can't move lines into themselves
         if dest >= start && dest <= end {
@@ -189,8 +190,9 @@ impl Editor {
         file: Option<&str>,
     ) -> Result<()> {
         let current = self.buffer.cursor().line;
+        // #X15: `0r file` is legal -- line 0 means "insert before line 1".
         let insert_after = if range.explicit {
-            let (_, end) = range.resolve(&self.buffer, current)?;
+            let (_, end) = range.resolve(&self.addr_ctx_allow_zero())?;
             end
         } else {
             current
@@ -443,9 +445,61 @@ impl Editor {
         self.substitute(range, &pattern, &replacement, flags)
     }
 
+    /// Address-resolution context relative to `current`.
+    ///
+    /// Everything that resolves an ex address should go through this or
+    /// [`Self::resolve_range`], so marks and the line-0 rule stay consistent.
+    pub(super) fn addr_ctx_at(&self, current: usize) -> AddrCtx<'_> {
+        AddrCtx {
+            buffer: &self.buffer,
+            current,
+            marks: &self.marks,
+            allow_zero: false,
+        }
+    }
+
+    /// Context relative to the cursor's line.
+    pub(super) fn addr_ctx(&self) -> AddrCtx<'_> {
+        self.addr_ctx_at(self.buffer.cursor().line)
+    }
+
+    /// Context for the commands that insert *after* an address, where line 0 is
+    /// legal and means "before the first line" (#X15).
+    pub(super) fn addr_ctx_allow_zero(&self) -> AddrCtx<'_> {
+        AddrCtx {
+            allow_zero: true,
+            ..self.addr_ctx()
+        }
+    }
+
     /// Resolve address range to line numbers.
     pub(super) fn resolve_range(&self, range: &AddressRange) -> Result<(usize, usize)> {
-        range.resolve(&self.buffer, self.buffer.cursor().line)
+        range.resolve(&self.addr_ctx())
+    }
+
+    /// Resolve a range down to the single line an insert-class command targets.
+    ///
+    /// Returns `None` when no address was given, so the caller can apply its own
+    /// default. `allow_zero` permits line 0, meaning "before the first line".
+    ///
+    /// These commands used to receive a `usize` that the *parser* had extracted,
+    /// and the parser could only read a literal `Address::Line(n)` -- every other
+    /// address form fell back to line 1 (#X25).
+    pub(super) fn resolve_target_line(
+        &self,
+        range: &AddressRange,
+        allow_zero: bool,
+    ) -> Result<Option<usize>> {
+        if !range.explicit {
+            return Ok(None);
+        }
+        let ctx = if allow_zero {
+            self.addr_ctx_allow_zero()
+        } else {
+            self.addr_ctx()
+        };
+        let (_, end) = range.resolve(&ctx)?;
+        Ok(Some(end))
     }
 
     /// Execute ex delete command (:d).

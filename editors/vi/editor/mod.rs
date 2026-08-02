@@ -2080,7 +2080,8 @@ impl Editor {
                 self.execute_shell_command(&command)?;
                 Ok(ExResult::Continue)
             }
-            ExCommand::ShellRead { line, command } => {
+            ExCommand::ShellRead { range, command } => {
+                let line = self.resolve_target_line(&range, true)?;
                 self.execute_shell_read(line, &command)?;
                 Ok(ExResult::Continue)
             }
@@ -2096,17 +2097,23 @@ impl Editor {
                 self.execute_source(&file)?;
                 Ok(ExResult::Continue)
             }
-            ExCommand::Append { line } => {
+            ExCommand::Append { range } => {
+                let line = self
+                    .resolve_target_line(&range, true)?
+                    .unwrap_or_else(|| self.buffer.cursor().line);
                 self.ex_insert_mode = Some(ExInsertMode::Append(line));
                 Ok(ExResult::Continue)
             }
-            ExCommand::Insert { line } => {
+            ExCommand::Insert { range } => {
+                let line = self
+                    .resolve_target_line(&range, true)?
+                    .unwrap_or_else(|| self.buffer.cursor().line);
                 self.ex_insert_mode = Some(ExInsertMode::Insert(line));
                 Ok(ExResult::Continue)
             }
             ExCommand::Change { range } => {
                 let current = self.buffer.cursor().line;
-                let resolved = range.resolve(&self.buffer, current)?;
+                let resolved = range.resolve(&self.addr_ctx_at(current))?;
                 self.ex_insert_mode = Some(ExInsertMode::Change {
                     start: resolved.0,
                     end: resolved.1,
@@ -2145,7 +2152,8 @@ impl Editor {
                 self.execute_ex_join(&range, count)?;
                 Ok(ExResult::Continue)
             }
-            ExCommand::Put { line, register } => {
+            ExCommand::Put { range, register } => {
+                let line = self.resolve_target_line(&range, true)?;
                 self.execute_ex_put(line, register)?;
                 Ok(ExResult::Continue)
             }
@@ -2180,13 +2188,22 @@ impl Editor {
                     .unwrap_or_else(|_| "unknown".to_string());
                 Ok(ExResult::StatusMessage(cwd))
             }
-            ExCommand::Mark { line, name } => {
+            ExCommand::Mark { range, name } => {
+                let line = self.resolve_target_line(&range, false)?;
                 self.execute_ex_mark(line, name)?;
                 Ok(ExResult::Continue)
             }
             ExCommand::Visual => Ok(ExResult::EnterVisual),
-            ExCommand::Open { line } => Ok(ExResult::EnterOpen(line)),
-            ExCommand::Z { line, ztype, count } => {
+            ExCommand::Open { range } => {
+                let line = self.resolve_target_line(&range, false)?;
+                Ok(ExResult::EnterOpen(line))
+            }
+            ExCommand::Z {
+                range,
+                ztype,
+                count,
+            } => {
+                let line = self.resolve_target_line(&range, false)?;
                 let output = self.execute_ex_z(line, ztype, count)?;
                 Ok(ExResult::CommandOutput(output))
             }
@@ -2198,7 +2215,8 @@ impl Editor {
                 self.execute_ex_shift_right(&range, count)?;
                 Ok(ExResult::Continue)
             }
-            ExCommand::LineNumber { line } => {
+            ExCommand::LineNumber { range } => {
+                let line = self.resolve_target_line(&range, false)?;
                 let line_num = self.execute_ex_line_number(line)?;
                 Ok(ExResult::CommandOutput(vec![line_num.to_string()]))
             }
@@ -2506,7 +2524,7 @@ impl Editor {
     ) -> Result<Vec<String>> {
         let current = self.buffer.cursor().line;
         let (start, end) = if range.explicit {
-            range.resolve(&self.buffer, current)?
+            range.resolve(&self.addr_ctx_at(current))?
         } else if let Some(c) = count {
             // If count given without range, start at current line
             (current, (current + c - 1).min(self.buffer.line_count()))
@@ -2536,7 +2554,7 @@ impl Editor {
     ) -> Result<Vec<String>> {
         let current = self.buffer.cursor().line;
         let (start, end) = if range.explicit {
-            range.resolve(&self.buffer, current)?
+            range.resolve(&self.addr_ctx_at(current))?
         } else if let Some(c) = count {
             (current, (current + c - 1).min(self.buffer.line_count()))
         } else {
@@ -2561,7 +2579,7 @@ impl Editor {
     ) -> Result<Vec<String>> {
         let current = self.buffer.cursor().line;
         let (start, end) = if range.explicit {
-            range.resolve(&self.buffer, current)?
+            range.resolve(&self.addr_ctx_at(current))?
         } else if let Some(c) = count {
             (current, (current + c - 1).min(self.buffer.line_count()))
         } else {
@@ -2602,7 +2620,7 @@ impl Editor {
     ) -> Result<()> {
         let current = self.buffer.cursor().line;
         let (start, end) = if range.explicit {
-            range.resolve(&self.buffer, current)?
+            range.resolve(&self.addr_ctx_at(current))?
         } else {
             (1, self.buffer.line_count())
         };

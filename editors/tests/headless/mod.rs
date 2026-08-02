@@ -806,7 +806,7 @@ fn test_cursor_bounds() {
 }
 
 #[test]
-fn test_s_and_S_behave_as_change_operators() {
+fn test_s_and_upper_s_behave_as_change_operators() {
     // #V17: `s`/`S` were handled in the pre-parser fast path, so they saved
     // nothing to a register and recorded no undo. They are now `c` over an
     // implied range, so they must be indistinguishable from it -- including
@@ -844,7 +844,7 @@ fn test_s_accepts_a_count() {
 }
 
 #[test]
-fn test_S_substitutes_whole_lines() {
+fn test_upper_s_substitutes_whole_lines() {
     let mut editor = Editor::new_headless();
     editor.execute_keys("iL1\nL2\nL3\x1b").unwrap();
     editor.execute_keys("1G").unwrap();

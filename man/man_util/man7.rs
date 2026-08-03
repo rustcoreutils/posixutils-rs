@@ -608,4 +608,33 @@ mod tests {
         let out = render(&format!(".TH T 1\n.SH SYNOPSIS\n.B {long}\n"));
         assert!(longest_body_line(&out) <= SETTINGS.width, "{out}");
     }
+
+    #[test]
+    fn wide_characters_wrap_at_the_terminal_width() {
+        // A CJK line counted by scalars fits twice as many characters as the
+        // terminal has cells, so it wrapped at 2x the width.
+        let cjk: String = "日本語のマニュアルページ ".repeat(20);
+        let out = render(&format!(".TH T 1\n.SH DESCRIPTION\n{cjk}\n"));
+        assert!(
+            longest_body_line_cells(&out) <= SETTINGS.width,
+            "wide text exceeded the terminal width ({}):\n{}",
+            longest_body_line_cells(&out),
+            out
+        );
+    }
+
+    /// As `longest_body_line`, but measuring terminal cells.
+    ///
+    /// Measured independently of `display_width` — the function under test — so
+    /// that a renderer measuring scalars cannot agree with a check that also
+    /// measures scalars.
+    fn longest_body_line_cells(out: &str) -> usize {
+        use unicode_width::UnicodeWidthStr;
+        out.lines()
+            .skip(2)
+            .filter(|l| !l.contains("Manual"))
+            .map(UnicodeWidthStr::width)
+            .max()
+            .unwrap_or(0)
+    }
 }

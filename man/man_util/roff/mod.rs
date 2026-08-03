@@ -966,9 +966,14 @@ fn brace_delta(s: &str) -> i32 {
     opens - closes
 }
 
-/// Approximate terminal-cell width of a string for `\w'…'` (ignores escapes).
+/// Terminal-cell width of a string for `\w'…'` (ignores escapes). East Asian
+/// wide characters count as two cells and combining marks as none.
 fn display_cells(s: &str) -> usize {
-    s.chars().filter(|c| !c.is_control()).count()
+    use unicode_width::UnicodeWidthChar;
+    s.chars()
+        .filter(|c| !c.is_control())
+        .map(|c| c.width().unwrap_or(0))
+        .sum()
 }
 
 #[cfg(test)]

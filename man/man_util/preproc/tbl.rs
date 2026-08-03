@@ -15,6 +15,8 @@
 //! rule rows (`_`/`=`). Spanning, `T{`…`T}` text blocks, and box drawing are not
 //! modeled — their content is rendered inline.
 
+use crate::man_util::term::style::display_width;
+
 /// Widest rule row a table may render. See the use site.
 const MAX_TABLE_WIDTH: usize = 10_000;
 
@@ -100,7 +102,7 @@ pub fn format(body: &[String]) -> Vec<String> {
     let mut widths = vec![0usize; ncols];
     for row in &rows {
         for (c, cell) in row.iter().enumerate() {
-            widths[c] = widths[c].max(cell.chars().count());
+            widths[c] = widths[c].max(display_width(cell));
         }
     }
     // A rule row is rendered as `total` dashes, and `total` is driven by the
@@ -142,7 +144,7 @@ fn parse_tab(line: &str) -> Option<char> {
 
 /// Pad `cell` to `width` columns per `align`.
 fn pad(cell: &str, width: usize, align: Align) -> String {
-    let len = cell.chars().count();
+    let len = display_width(cell);
     if len >= width {
         return cell.to_string();
     }

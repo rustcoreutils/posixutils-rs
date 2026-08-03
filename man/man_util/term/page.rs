@@ -9,19 +9,22 @@
 
 //! Page-level assembly helpers shared by the term backend: three-part
 //! header/footer composition and blank-line collapsing. These operate on
-//! terminal cells (character counts), not bytes, so multibyte titles align.
+//! terminal cells, not bytes or scalars, so multibyte and East Asian wide
+//! titles align.
+
+use super::style::display_width;
 
 /// Compose a three-part line: `left` flush-left, `center` centered, `right`
-/// flush-right, within `width` columns. Widths are counted in characters.
+/// flush-right, within `width` columns. Widths are counted in terminal cells.
 pub fn three_part(left: &str, center: &str, right: &str, width: usize) -> String {
     let mut line = String::from(left);
-    let center_start = width.saturating_sub(center.chars().count()) / 2;
-    while line.chars().count() < center_start {
+    let center_start = width.saturating_sub(display_width(center)) / 2;
+    while display_width(&line) < center_start {
         line.push(' ');
     }
     line.push_str(center);
-    let right_start = width.saturating_sub(right.chars().count());
-    while line.chars().count() < right_start {
+    let right_start = width.saturating_sub(display_width(right));
+    while display_width(&line) < right_start {
         line.push(' ');
     }
     line.push_str(right);

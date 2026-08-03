@@ -23,13 +23,20 @@ fn is_style_marker(c: char) -> bool {
     matches!(c, STYLE_BOLD | STYLE_UL | STYLE_RESET)
 }
 
-/// Display width of `s` as a Unicode scalar count, ignoring the zero-width style
-/// markers. (Overstrike is applied only after wrapping, so no backspaces are
-/// present here.) This is not true terminal-cell width — wide/combining
-/// characters are each counted as one. For unstyled text it equals
-/// `chars().count()`.
+/// Terminal-cell width of `s`, ignoring the zero-width style markers.
+/// (Overstrike is applied only after wrapping, so no backspaces are present
+/// here.)
+///
+/// This is real cell width, not a scalar count: East Asian wide and fullwidth
+/// characters occupy two cells and combining marks occupy none, so a CJK line
+/// counted by `chars().count()` wrapped at half the terminal width and a line
+/// with combining accents wrapped early.
 pub(crate) fn display_width(s: &str) -> usize {
-    s.chars().filter(|&c| !is_style_marker(c)).count()
+    use unicode_width::UnicodeWidthChar;
+    s.chars()
+        .filter(|&c| !is_style_marker(c))
+        .map(|c| c.width().unwrap_or(0))
+        .sum()
 }
 
 /// Resolve the style markers in the fully formatted document. When `styling` is
@@ -57,4 +64,26 @@ pub(crate) fn apply_styling(content: &str, styling: bool) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::display_width;
+
+    #[test]
+    fn wide_and_combining_characters_measure_in_cells() {
+        // ASCII is one cell each.
+        assert_eq!(display_width("hello"), 5);
+        // East Asian wide and fullwidth forms occupy two cells; counting scalars
+        // wrapped CJK text at half the terminal width.
+        assert_eq!(display_width("日本語"), 6);
+        assert_eq!(display_width("ＡＢ"), 4);
+        // Combining marks occupy none; counting them wrapped accented text early.
+        assert_eq!(display_width("e\u{301}"), 1);
+        assert_eq!(display_width("a\u{300}\u{301}\u{302}"), 1);
+        // Style markers are zero-width regardless.
+        assert_eq!(display_width("\u{1}日\u{3}"), 2);
+        // Mixed script.
+        assert_eq!(display_width("ls 一覧"), 7);
+    }
 }

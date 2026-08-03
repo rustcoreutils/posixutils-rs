@@ -449,3 +449,10 @@ fn argument_count_register_is_available_in_a_macro_body() {
     assert_eq!(run(".de D\ngot \\\\n[.$]\n..\n.D x\n"), "got 1\n");
     assert_eq!(run(".de E\ngot \\\\n(.$\n..\n.E\n"), "got 0\n");
 }
+
+#[test]
+fn width_escape_counts_terminal_cells() {
+    // `\w'…'` is a width in cells: an East Asian wide character is two.
+    assert_eq!(run(".if \\w'日本'=4 yes\n"), "yes\n");
+    assert_eq!(run(".if \\w'ab'=2 yes\n"), "yes\n");
+}

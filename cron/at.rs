@@ -8,7 +8,7 @@
 //
 
 use clap::Parser;
-use cron::spool::{at, get_job_dir, print_err_and_exit};
+use cron::spool::{at, get_job_dir, print_err_and_exit, read_commands_from_stdin};
 use gettextrs::gettext;
 use timespec::Timespec;
 
@@ -16,7 +16,7 @@ use std::{
     collections::BTreeMap,
     fmt::Display,
     fs::{self, File},
-    io::{BufRead, IsTerminal, Read, Write},
+    io::Read,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     str::FromStr,
@@ -185,40 +185,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             buf
         }
-        None => read_commands_from_stdin(&time)?,
+        None => read_commands_from_stdin("at", &time)?,
     };
 
     let _ = at(args.queue, &time, cmd, args.mail).inspect_err(|err| print_err_and_exit(1, err));
 
     Ok(())
-}
-
-/// Read the at-job commands from standard input. Prompts are written only when
-/// standard input is a terminal (audit #A10).
-fn read_commands_from_stdin(time: &chrono::DateTime<chrono::Utc>) -> std::io::Result<String> {
-    let stdin = std::io::stdin();
-    let mut cmd = String::new();
-
-    if stdin.is_terminal() {
-        let mut out = std::io::stdout().lock();
-        writeln!(out, "at {}", time.to_rfc2822())?;
-        let mut line = String::new();
-        loop {
-            write!(out, "at> ")?;
-            out.flush()?;
-            line.clear();
-            if stdin.lock().read_line(&mut line)? == 0 {
-                break;
-            }
-            cmd.push_str(&line);
-        }
-        writeln!(out, "<EOT>")?;
-        out.flush()?;
-    } else {
-        stdin.lock().read_to_string(&mut cmd)?;
-    }
-
-    Ok(cmd)
 }
 
 /// Checks if the file name matches the job format

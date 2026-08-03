@@ -419,6 +419,26 @@ duplicates ~300 lines of `at.rs` verbatim instead of sharing them.
     unimplemented. Pinned by `test_at_tz_determines_the_absolute_execution_time`,
     which asserts on the spool filename's encoded minute — the only observable
     that distinguishes the zones.
+- [x] **#B9 — `batch` duplicated the submitted commands (Critical).**
+  *(Found 2026-08-03 while writing the first `batch` tests.)* `batch` read
+  stdin with its own loop that never cleared the line buffer between
+  `read_line` calls, and `read_line` *appends*: iteration *n* pushed lines
+  1..*n*, so a three-line job produced a script running its first two lines
+  **twice**. Silent, and destructive for any non-idempotent command (appending
+  to a file, sending mail, incrementing a counter). It also wrote the banner
+  and an `at> ` prompt per line to **stdout unconditionally**, so a pipeline
+  got prompt noise where POSIX reserves stdout for the `-l` listing — `at`
+  gates the same output on `stdin.is_terminal()` (#A10) but `batch` carried its
+  own copy that did not. **✓ fixed** — the correct reader is hoisted into
+  `cron/spool.rs::read_commands_from_stdin` and shared, so the two cannot drift
+  again. Tests `test_batch_does_not_duplicate_commands`,
+  `test_batch_does_not_prompt_when_stdin_is_not_a_terminal`,
+  `test_batch_submission_notice_goes_to_stderr` (all three confirmed to fail
+  against the pre-fix code).
+- [x] **#B8 — `batch`'s interactive banner and prompt announced `at`.**
+  *(Found 2026-08-03.)* Fallout from #B7 making `batch` a thin wrapper. The
+  shared reader now takes the invoking utility's name. Cosmetic; the banner is
+  not POSIX-mandated.
 - [x] **#B7 — Massive duplication of `at.rs`.** `User`, `Job`, `next_job_id`,
   `get_job_dir`, `is_user_allowed`, `job_file_name` are copy-pasted
   (`batch.rs:82-397` ≈ `at.rs:259-686`). Not a conformance issue, but it
@@ -434,8 +454,11 @@ duplicates ~300 lines of `at.rs` verbatim instead of sharing them.
 - [x] EXIT STATUS 0/>0 via `print_err_and_exit` (`batch.rs:131-134`).
 
 ### Test coverage signal
-- [ ] No tests exist for `batch` at all (submission, queue-`b` filename, stderr
-  notice, allow/deny).
+- [x] ~~No tests exist for `batch` at all~~ **✓ `cron/tests/batch/mod.rs` added
+  2026-08-03** (6 tests: submission, queue-`b` filename, stderr notice, prompt
+  gating, allow-file gating, and `at -q b -m now` equivalence). Writing them
+  immediately surfaced **#B9**, below — which is precisely what zero coverage
+  had been hiding.
 
 ---
 

@@ -481,6 +481,50 @@ unsafe fn resolve_passwd() -> Option<*const passwd> {
     }
 }
 
+/// Read at-job commands from standard input.
+///
+/// Prompts are written only when standard input is a terminal (audit #A10):
+/// in a pipeline the banner, the `at> ` prompts and `<EOT>` would otherwise be
+/// interleaved into stdout, which POSIX reserves for the `-l` listing.
+///
+/// `prog` names the invoking utility so `batch` does not announce itself as
+/// `at` (#B8).
+///
+/// Shared by `at` and `batch`. `batch` used to carry its own copy that never
+/// cleared the line buffer between `read_line` calls, so every line was
+/// re-appended to the accumulated command and earlier lines executed more than
+/// once (#B9).
+pub fn read_commands_from_stdin(
+    prog: &str,
+    time: &chrono::DateTime<chrono::Utc>,
+) -> std::io::Result<String> {
+    use std::io::{BufRead, IsTerminal, Read, Write};
+
+    let stdin = std::io::stdin();
+    let mut cmd = String::new();
+
+    if stdin.is_terminal() {
+        let mut out = std::io::stdout().lock();
+        writeln!(out, "{} {}", prog, time.to_rfc2822())?;
+        let mut line = String::new();
+        loop {
+            write!(out, "{}> ", prog)?;
+            out.flush()?;
+            line.clear();
+            if stdin.lock().read_line(&mut line)? == 0 {
+                break;
+            }
+            cmd.push_str(&line);
+        }
+        writeln!(out, "<EOT>")?;
+        out.flush()?;
+    } else {
+        stdin.lock().read_to_string(&mut cmd)?;
+    }
+
+    Ok(cmd)
+}
+
 #[cfg(test)]
 mod tests {
     use super::sh_single_quote;

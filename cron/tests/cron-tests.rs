@@ -8,5 +8,6 @@
 //
 
 mod at;
+mod batch;
 mod crond;
 mod crontab;

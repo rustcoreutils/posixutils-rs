@@ -874,9 +874,12 @@ impl MdocFormatter {
             Macro::Dd => {
                 match macro_node.nodes.is_empty() {
                     true => self.formatting_state.date = self.format_dd(""),
+                    // A `.Dd` argument that is not plain text (a stray macro, or
+                    // an escape the parser lifted out) leaves the date empty
+                    // rather than panicking — a renderer must be total.
                     false => match &macro_node.nodes[0] {
                         Element::Text(l) => self.formatting_state.date = self.format_dd(l.as_str()),
-                        _ => unreachable!(),
+                        _ => self.formatting_state.date = self.format_dd(""),
                     },
                 };
 
@@ -1016,7 +1019,9 @@ fn add_indent_to_lines(lines: Vec<String>, width: usize, offset: &OffsetType) ->
                     let indent = " ".repeat(line_indent);
                     indent.clone() + &line
                 }
-                _ => unreachable!(),
+                // `Indent`/`IndentTwo` describe a margin, not an alignment; the
+                // caller has already applied them, so the line is left as is.
+                OffsetType::Indent | OffsetType::IndentTwo => line,
             }
         })
         .collect::<Vec<_>>()
@@ -1416,7 +1421,9 @@ impl MdocFormatter {
 
     fn format_bk_block(&mut self, macro_node: MacroNode) -> String {
         let indent = self.formatting_state.current_indent;
-        let max_width = self.formatting_settings.width - indent;
+        // Nested lists accumulate indent without bound, so on a narrow terminal
+        // the indent can exceed the width; keep at least one usable column.
+        let max_width = self.formatting_settings.width.saturating_sub(indent).max(1);
 
         let mut content = String::new();
         let mut current_len = indent;
@@ -1740,8 +1747,10 @@ impl MdocFormatter {
             }
 
             let col_count = columns.len();
+            // `.Bl -column` with no column widths at all leaves `col_count` at
+            // zero, and `col_count - 1` then underflows.
             let mut total_width: usize =
-                columns.iter().map(|c| c.len()).sum::<usize>() + 2 * (col_count - 1);
+                columns.iter().map(|c| c.len()).sum::<usize>() + 2 * col_count.saturating_sub(1);
             let row_len_range = merge_row_ends(&mut table, col_count);
             let (col_widths, columns_suit_by_width) = calculate_col_widths(
                 &table,
@@ -2910,17 +2919,16 @@ impl MdocFormatter {
 
         let mut items = Vec::new();
         while let Some(el) = iter.peek() {
-            if let Element::Macro(node) = el {
-                if node.mdoc_macro == Macro::A {
-                    let el = iter.next().unwrap();
-                    if let Element::Macro(node) = el {
+            match el {
+                Element::Macro(node) if node.mdoc_macro == Macro::A => {
+                    if let Some(Element::Macro(node)) = iter.next() {
                         items.push(self.format_a(node));
                     }
-                } else {
-                    break;
                 }
-            } else {
-                unreachable!("Unexpected rule!");
+                // Anything else ends the author list and is handled below —
+                // including plain text, which `.Rs` is not supposed to contain
+                // but real pages do: sccs(1) as shipped panics here.
+                _ => break,
             }
         }
 
@@ -2951,10 +2959,15 @@ impl MdocFormatter {
                     Macro::T => self.format_t(node),
                     Macro::U => self.format_u(node),
                     Macro::V => self.format_v(node),
-                    _ => unreachable!("Rs can not contain macro: {:?}", node),
+                    // Defensive: `.Rs` is specified to hold only `%X` macros,
+                    // but format anything else rather than panicking — a
+                    // renderer must be total.
+                    _ => self.format_inline_macro(node),
                 },
-                _ => unreachable!("Unexpected element type!"),
+                Element::Text(text) => self.format_text_node(&text),
+                Element::Eoi => String::new(),
             })
+            .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -3597,15 +3610,25 @@ impl MdocFormatter {
         let mut iter = macro_node.nodes.iter();
 
         if let Some(node) = iter.next() {
+            // A leading delimiter closes the empty argument list and is written
+            // outside it; anything else — text or, as in `.Fn foo Ar bar`, a
+            // macro — is an argument.
+            let leading_delimiter = match node {
+                Element::Text(arg) => matches!(
+                    arg.as_str(),
+                    "(" | "[" | ")" | "]" | "." | "," | ":" | ";" | "!" | "?"
+                ),
+                _ => false,
+            };
             match node {
-                Element::Text(arg) => match arg.as_str() {
-                    "(" | "[" | ")" | "]" | "." | "," | ":" | ";" | "!" | "?" => {
-                        let c = iter
-                            .map(|n| self.format_node(n.clone()))
-                            .collect::<String>();
-                        return format!("{}){} {}", result, arg, c);
-                    }
-                    _ => {
+                Element::Text(arg) if leading_delimiter => {
+                    let c = iter
+                        .map(|n| self.format_node(n.clone()))
+                        .collect::<String>();
+                    return format!("{}){} {}", result, arg, c);
+                }
+                _ => {
+                    {
                         let mut prev_was_open = false;
                         let mut is_first_node = true;
 
@@ -3668,8 +3691,7 @@ impl MdocFormatter {
 
                         return result;
                     }
-                },
-                _ => unreachable!(),
+                }
             }
         };
 
@@ -3718,11 +3740,10 @@ impl MdocFormatter {
             format!("<{}>", filename)
         };
 
-        if let Some(node) = macro_node.nodes.into_iter().next() {
-            match node {
-                Element::Text(close_del) => result.push_str(close_del.as_str()),
-                _ => unreachable!(),
-            }
+        // Only a trailing delimiter is expected here; a stray macro contributes
+        // nothing rather than panicking — a renderer must be total.
+        if let Some(Element::Text(close_del)) = macro_node.nodes.into_iter().next() {
+            result.push_str(close_del.as_str());
         }
 
         result
@@ -3747,20 +3768,16 @@ impl MdocFormatter {
         let mut result = String::new();
         let mut iter = macro_node.nodes.into_iter();
 
-        if let Some(node) = iter.next() {
-            match node {
-                Element::Text(open_del) => result.push_str(open_del.as_str()),
-                _ => unreachable!(),
-            }
+        // As in `format_in`: only delimiters are expected around the library
+        // name, and anything else contributes nothing rather than panicking.
+        if let Some(Element::Text(open_del)) = iter.next() {
+            result.push_str(open_del.as_str());
         }
 
         result.push_str(&format!("library “{lib_name}”"));
 
-        if let Some(node) = iter.next() {
-            match node {
-                Element::Text(close_del) => result.push_str(close_del.as_str()),
-                _ => unreachable!(),
-            }
+        if let Some(Element::Text(close_del)) = iter.next() {
+            result.push_str(close_del.as_str());
         }
 
         result

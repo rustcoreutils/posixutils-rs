@@ -767,3 +767,57 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod malformed {
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    /// Render every page in `test_files/malformed/` and require that `man`
+    /// *terminates*, at any exit status, without crashing.
+    ///
+    /// The existing 104-page corpus is entirely well-formed, which is why a
+    /// stack overflow on a two-line page, five reachable `unreachable!()` arms
+    /// and two arithmetic underflows all survived. Each file here is a shape
+    /// that previously aborted, panicked or ran unbounded; several are taken
+    /// from pages shipped on a stock system, not invented.
+    ///
+    /// A renderer must be total: garbage in, diagnostic out — never a crash.
+    #[test]
+    fn malformed_pages_do_not_crash() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_files/malformed");
+        let mut checked = 0;
+
+        for entry in std::fs::read_dir(&dir).expect("malformed corpus present") {
+            let path = entry.expect("readable entry").path();
+            if !path.is_file() {
+                continue;
+            }
+            let output = Command::new(env!("CARGO_BIN_EXE_man"))
+                .args(["-l".as_ref(), path.as_os_str()])
+                .env("COLUMNS", "40")
+                .output()
+                .unwrap_or_else(|e| panic!("failed to run man on {}: {e}", path.display()));
+
+            // 0 (rendered) and 1 (rejected with a diagnostic) are both fine.
+            // Anything else is a panic (101) or a signal (`code()` is None).
+            let code = output.status.code();
+            assert!(
+                matches!(code, Some(0) | Some(1)),
+                "man crashed on {}: status {:?}\nstderr:\n{}",
+                path.display(),
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                output.stdout.len() < 16 << 20,
+                "man produced {} bytes for {}",
+                output.stdout.len(),
+                path.display()
+            );
+            checked += 1;
+        }
+
+        assert!(checked >= 20, "corpus shrank: only {checked} files");
+    }
+}

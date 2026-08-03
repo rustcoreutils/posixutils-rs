@@ -89,9 +89,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(queue) = args.queue {
         if !queue.is_ascii_lowercase() {
-            return Err(
-                "Invalid queue name. Queue must be a single lowercase ASCII letter.".into(),
-            );
+            return Err(gettext(
+                "Invalid queue name. Queue must be a single lowercase ASCII letter.",
+            )
+            .into());
         }
     }
 
@@ -102,12 +103,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             || args.mail
             || args.queue.is_some()
         {
-            return Err("Option '-r' cannot be used with '-l', '-t', '-m', '-q' or '-f'".into());
+            return Err(
+                gettext("Option '-r' cannot be used with '-l', '-t', '-m', '-q' or '-f'").into(),
+            );
         }
         let ids = parse_job_ids(&args.operands)?;
         if ids.is_empty() {
             // POSIX: `at -r at_job_id...` requires at least one operand.
-            return Err("at -r requires at least one at_job_id operand".into());
+            return Err(gettext("at -r requires at least one at_job_id operand").into());
         }
         remove_jobs(&ids)?;
         return Ok(());
@@ -115,11 +118,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if args.list {
         if args.time.is_some() || args.file.is_some() || args.mail {
-            return Err("Option '-l' cannot be used with '-t', '-m' or -f".into());
+            return Err(gettext("Option '-l' cannot be used with '-t', '-m' or -f").into());
         }
         let ids = parse_job_ids(&args.operands)?;
         if args.queue.is_some() && !ids.is_empty() {
-            return Err("at -l -q queuename cannot be used with at_job_id operands".into());
+            return Err(
+                gettext("at -l -q queuename cannot be used with at_job_id operands").into(),
+            );
         }
 
         let list = list_jobs(get_job_dir()?);

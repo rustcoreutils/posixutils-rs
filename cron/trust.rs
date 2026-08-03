@@ -25,6 +25,13 @@ pub enum OwnerRule {
     Root,
     /// Must be owned by root or by the given uid.
     RootOrUid(u32),
+    /// Any owner is acceptable; the caller derives the run-as identity from it.
+    ///
+    /// This used to be spelled `RootOrUid(u32::MAX)` and relied on a match arm
+    /// with a const pattern. It worked, but `u32::MAX` is exactly the
+    /// "invalid uid" sentinel, so the encoding put a security decision one
+    /// typo away from meaning its opposite (#D15).
+    Any,
 }
 
 /// The checks a file must satisfy to be trusted.
@@ -71,7 +78,7 @@ impl TrustPolicy {
             require_single_link: true,
             mode_exact: None,
             forbid_mode_bits: 0o022,
-            owner: OwnerRule::RootOrUid(u32::MAX), // accept any owner (resolved later)
+            owner: OwnerRule::Any,
         }
     }
 }
@@ -117,7 +124,7 @@ pub fn check_metadata(meta: &Metadata, policy: &TrustPolicy) -> Result<(), Trust
 
     let owner_ok = match policy.owner {
         OwnerRule::Root => meta.uid() == 0,
-        OwnerRule::RootOrUid(u32::MAX) => true,
+        OwnerRule::Any => true,
         OwnerRule::RootOrUid(uid) => meta.uid() == 0 || meta.uid() == uid,
     };
     if !owner_ok {
@@ -227,5 +234,26 @@ mod tests {
 
         // O_NOFOLLOW makes opening the symlink itself fail.
         assert!(open_trusted(&link, &TrustPolicy::crontab_spool(uid())).is_err());
+    }
+
+    #[test]
+    fn at_spool_accepts_any_owner() {
+        // #D15: the at-spool policy accepts any owner because the owner *is*
+        // the run-as identity. That used to be encoded as
+        // RootOrUid(u32::MAX) -- which happens to be the invalid-uid
+        // sentinel -- so this pins the intent rather than the encoding.
+        let policy = TrustPolicy::at_spool();
+        assert!(matches!(policy.owner, OwnerRule::Any));
+    }
+
+    #[test]
+    fn crontab_spool_still_restricts_the_owner() {
+        // The neighbouring policies must NOT have become permissive.
+        let policy = TrustPolicy::crontab_spool(1000);
+        assert!(matches!(policy.owner, OwnerRule::RootOrUid(1000)));
+        assert!(matches!(
+            TrustPolicy::system_crontab().owner,
+            OwnerRule::Root
+        ));
     }
 }

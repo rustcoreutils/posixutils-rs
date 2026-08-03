@@ -12,6 +12,7 @@ use cron::job::{Database, UserInfo};
 use cron::spool::{at_spool_dir_readonly, parse_at_job_name};
 use cron::trust::{open_trusted, TrustPolicy};
 use cron::{CRON_SPOOL_DIR, PID_FILE, SYSTEM_CRONTAB};
+use gettextrs::gettext;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use std::cmp::Ordering::{Greater, Less};
 use std::collections::HashMap;
@@ -116,7 +117,7 @@ where
             // Only warn when a file is actually present (a missing optional file
             // such as /etc/crontab is not an error).
             if path.exists() {
-                eprintln!("crond: ignoring {label}: {reason}");
+                eprintln!("crond: {} {label}: {reason}", gettext("ignoring"));
             }
         }
     }
@@ -332,7 +333,10 @@ fn run_at_job(content: &str, owner: &UserInfo) -> bool {
     }
     // SAFETY: called in the forked child before exec.
     if let Err(e) = unsafe { cron::job::drop_privileges(owner.uid, owner.gid, &owner.name) } {
-        eprintln!("crond: cannot drop privileges for at job: {e}");
+        eprintln!(
+            "crond: {}: {e}",
+            gettext("cannot drop privileges for at job")
+        );
         std::process::exit(1);
     }
     if std::env::set_current_dir(&owner.home).is_err() {

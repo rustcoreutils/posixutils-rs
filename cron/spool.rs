@@ -13,6 +13,7 @@
 //! the two stay in lock-step (audit #B7).
 
 use chrono::{DateTime, Utc};
+use gettextrs::gettext;
 use libc::{getpwuid, getuid, passwd};
 
 use std::{
@@ -107,7 +108,7 @@ pub fn at(
 
     let user = User::current().ok_or("Failed to get current user")?;
     if !is_user_allowed(&user.name) {
-        return Err(format!("Access denied for user: {}", user.name).into());
+        return Err(format!("{}: {}", gettext("Access denied for user"), user.name).into());
     }
 
     let job = Job::new(&user, std::env::current_dir()?, std::env::vars(), cmd, mail).into_script();
@@ -122,7 +123,7 @@ pub fn at(
 
     let mut file = file_opt
         .open(&file_path)
-        .map_err(|e| format!("Failed to create file with job. Reason: {e}"))?;
+        .map_err(|e| format!("{}: {e}", gettext("Failed to create file with job")))?;
 
     // Own the job file to the submitting (real) user. crond resolves an at-job's
     // run-as identity from the file's owner, so a set-uid-root `at` must not

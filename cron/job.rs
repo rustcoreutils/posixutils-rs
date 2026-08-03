@@ -8,6 +8,7 @@
 //
 
 use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, Timelike};
+use gettextrs::gettext;
 use std::collections::BTreeSet;
 use std::ffi::CStr;
 use std::iter::Peekable;
@@ -746,7 +747,10 @@ impl CronJob {
         {
             // SAFETY: called in the forked child before exec.
             if let Err(e) = unsafe { drop_privileges(uid, gid, name) } {
-                eprintln!("crond: cannot drop privileges for {name}: {e}");
+                eprintln!(
+                    "crond: {} {name}: {e}",
+                    gettext("cannot drop privileges for")
+                );
                 std::process::exit(1);
             }
         }
@@ -783,7 +787,7 @@ impl CronJob {
         let mut child = match command.spawn() {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("crond: cannot run job: {e}");
+                eprintln!("crond: {}: {e}", gettext("cannot run job"));
                 std::process::exit(1);
             }
         };

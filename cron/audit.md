@@ -313,11 +313,12 @@ supported at all), and — fatally — **submitted jobs are never executed** (#X
   (`at.rs:603-619`); spec 84778-84779 restricts to appropriate-privilege.
 - [x] **#A14 — Submission-notice date uses `%d` not `%e`.** `at.rs:459`; spec
   date is `date +"%a %b %e %T %Y"` (space-padded day) (85011-85012).
-- [ ] **#A15 — Diagnostics hardcoded English.** No `gettext()` on runtime error
-  strings (LC_MESSAGES, 84986-84989). Partial (Phase 3): `plib::diag` +
-  `init_locale` plumbing is in place and the locale is initialized before
-  parsing; string-level `gettext()` wrapping of the remaining error strings is
-  deferred.
+- [x] **#A15 — Diagnostics hardcoded English.** ~~Partial~~ **✓ completed
+  (2026-08-03).** The `plib::diag` + `init_locale` plumbing was already in
+  place; the remaining runtime strings across `at`, `crond`, `job` and `spool`
+  are now `gettext()`-wrapped, so `LC_MESSAGES` (84986-84989) governs them.
+  This closes the item rather than leaving it permanently partial, as the
+  `dev/` and `editors/` crates did with their equivalents.
 
 ### Detailed conformance matrix
 
@@ -486,6 +487,17 @@ environment** to jobs, (d) does not implement the crontab `%`/stdin command
 convention, and (e) discards job output instead of mailing it.
 
 ### Priority issues
+
+#### Minor (found post-audit)
+
+- [x] **#D15 — "any owner" was encoded as `RootOrUid(u32::MAX)`.**
+  *(Found 2026-08-03.)* `TrustPolicy::at_spool()` accepts any owner because the
+  owner *is* the run-as identity, but it expressed that with a sentinel matched
+  by a const pattern. It worked, yet `u32::MAX` is precisely the invalid-uid
+  value, which put a security decision one typo away from meaning its
+  opposite. **✓ fixed** — explicit `OwnerRule::Any`. Tests
+  `at_spool_accepts_any_owner` and `crontab_spool_still_restricts_the_owner`,
+  the latter guarding against the neighbouring policies becoming permissive.
 
 #### Critical (security)
 - [x] **#D1 — Spool files are executed with no ownership/permission/symlink

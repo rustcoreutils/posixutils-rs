@@ -19,6 +19,7 @@ pub fn eval_numeric(s: &str) -> Option<i64> {
     let mut p = Parser {
         chars: s.chars().collect(),
         pos: 0,
+        depth: 0,
     };
     let v = p.expr()?;
     p.skip_ws();
@@ -30,9 +31,17 @@ pub fn eval_numeric(s: &str) -> Option<i64> {
     Some(v)
 }
 
+/// Maximum nesting of `(`, unary `-`/`+`/`!` before an expression is rejected as
+/// malformed. `term()` and `expr()` are mutually recursive with one native frame
+/// per nesting level, so without this a line such as `.if ((((((…1` overflows the
+/// stack — which aborts the process rather than unwinding, and so cannot be
+/// contained by the caller. Real expressions nest a handful of levels at most.
+const MAX_DEPTH: u32 = 64;
+
 struct Parser {
     chars: Vec<char>,
     pos: usize,
+    depth: u32,
 }
 
 impl Parser {
@@ -95,7 +104,20 @@ impl Parser {
         Some(acc)
     }
 
+    /// Depth-guarded wrapper around [`Parser::term_inner`]. Every recursion into
+    /// the grammar passes through here, so one check covers both `(`-grouping and
+    /// the unary operators.
     fn term(&mut self) -> Option<i64> {
+        if self.depth >= MAX_DEPTH {
+            return None;
+        }
+        self.depth += 1;
+        let v = self.term_inner();
+        self.depth -= 1;
+        v
+    }
+
+    fn term_inner(&mut self) -> Option<i64> {
         self.skip_ws();
         match self.peek() {
             Some('(') => {
@@ -109,7 +131,7 @@ impl Parser {
             }
             Some('-') => {
                 self.bump();
-                Some(-self.term()?)
+                Some(self.term()?.saturating_neg())
             }
             Some('+') => {
                 self.bump();
@@ -144,23 +166,14 @@ impl Parser {
 
 fn apply(a: i64, op: char, b: i64) -> i64 {
     match op {
-        '+' => a + b,
-        '-' => a - b,
-        '*' => a * b,
-        '/' => {
-            if b != 0 {
-                a / b
-            } else {
-                0
-            }
-        }
-        '%' => {
-            if b != 0 {
-                a % b
-            } else {
-                0
-            }
-        }
+        // Saturating, not wrapping: a page is untrusted input, and a debug build
+        // (overflow-checks on) would otherwise panic on `.nr x 9999999999999999999*9`.
+        '+' => a.saturating_add(b),
+        '-' => a.saturating_sub(b),
+        '*' => a.saturating_mul(b),
+        // `checked_*` covers both division by zero and `i64::MIN / -1`.
+        '/' => a.checked_div(b).unwrap_or(0),
+        '%' => a.checked_rem(b).unwrap_or(0),
         '&' => (a != 0 && b != 0) as i64,
         ':' => (a != 0 || b != 0) as i64,
         _ => a,

@@ -267,3 +267,70 @@ fn expr_malformed_is_none() {
     assert_eq!(eval_numeric("abc"), None);
     assert_eq!(eval_numeric(""), None);
 }
+
+// ---------------------------------------------------------------------------
+// Recursion and overflow guards (#M1, #M7).
+//
+// These inputs previously overflowed the native stack, which aborts the process
+// (SIGABRT) rather than unwinding — so a `should_panic` test cannot express
+// them. Each test simply has to *return*.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn self_referential_string_register_terminates() {
+    // `.ds A \*[A]` then `\*A`: expansion of A names A. Before the guard this
+    // recursed until the stack was exhausted.
+    let out = run(".ds A \\*[A]\n\\*A\n");
+    assert!(!out.contains("\\*"), "register left unexpanded: {out:?}");
+}
+
+#[test]
+fn mutually_referential_string_registers_terminate() {
+    // A names B and B names A: a depth cap alone would still expand this pair
+    // 64 times; the in-progress name set is what actually cuts the cycle.
+    let out = run(".ds A x\\*B\n.ds B y\\*A\n\\*A\n");
+    assert_eq!(out, "xy\n");
+}
+
+#[test]
+fn deep_string_register_chain_terminates() {
+    // An acyclic but deep chain: r0 -> r1 -> ... -> rN. No name repeats, so the
+    // in-progress set never fires and only the depth cap bounds this. N is large
+    // enough that the pre-fix code exhausted the stack.
+    const N: usize = 20_000;
+    let mut src = String::new();
+    for i in 0..N {
+        src.push_str(&format!(".ds r{i} \\*[r{}]\n", i + 1));
+    }
+    src.push_str(&format!(".ds r{N} end\n\\*[r0]\n"));
+    let out = run(&src);
+    assert!(!out.is_empty());
+}
+
+#[test]
+fn self_referential_width_escape_terminates() {
+    let out = run(".ds W \\w'\\*[W]'\n\\*W\n");
+    assert!(!out.is_empty());
+}
+
+#[test]
+fn expr_deep_nesting_is_rejected_not_crashed() {
+    // 5000 open parens: `term()` and `expr()` are mutually recursive, one native
+    // frame per level.
+    let deep = format!("{}1{}", "(".repeat(5000), ")".repeat(5000));
+    assert_eq!(eval_numeric(&deep), None);
+    // Deeply nested unary operators recurse through the same path.
+    assert_eq!(eval_numeric(&format!("{}1", "-".repeat(5000))), None);
+    assert_eq!(eval_numeric(&format!("{}1", "!".repeat(5000))), None);
+    // Nesting within the supported depth still evaluates.
+    assert_eq!(eval_numeric("((((((1+2))))))"), Some(3));
+}
+
+#[test]
+fn expr_arithmetic_overflow_saturates() {
+    // Under `overflow-checks` (a debug build) these panicked.
+    assert_eq!(eval_numeric("9223372036854775807+1"), Some(i64::MAX));
+    assert_eq!(eval_numeric("9223372036854775807*2"), Some(i64::MAX));
+    assert_eq!(eval_numeric("-9223372036854775807-2"), Some(i64::MIN));
+    assert_eq!(eval_numeric("5%0"), Some(0));
+}

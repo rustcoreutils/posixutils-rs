@@ -22,7 +22,7 @@
 
 mod expr;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use expr::eval_numeric;
 
@@ -32,6 +32,10 @@ const MAX_OUTPUT_LINES: usize = 2_000_000;
 
 /// Maximum pending-line queue depth, a second runaway guard.
 const MAX_QUEUE: usize = 4_000_000;
+
+/// Maximum nesting of string-register / `\w'…'` expansion. See
+/// [`Roff::interpolate_guarded`].
+const MAX_INTERPOLATION_DEPTH: u32 = 64;
 
 /// A user-defined macro body (the lines between `.de NAME` and `..`).
 type MacroBody = Vec<String>;
@@ -592,6 +596,23 @@ impl Roff {
     /// `\*[name]` string registers, and `\w'…'` width escapes. Other escapes are
     /// left for the downstream escape layer.
     fn interpolate(&self, input: &str) -> String {
+        let mut active = HashSet::new();
+        self.interpolate_guarded(input, 0, &mut active)
+    }
+
+    /// The body of [`Roff::interpolate`], carrying the recursion guards.
+    ///
+    /// A string register may expand to text that names another register, so
+    /// expansion is inherently recursive — but a page is untrusted input, and
+    /// `.ds A \*[A]` (or a mutual pair `.ds A \*B` / `.ds B \*A`) recurses until
+    /// the native stack is exhausted, which aborts the process instead of
+    /// unwinding. `active` holds the names currently being expanded, which is
+    /// what actually breaks a cycle; `depth` additionally bounds the acyclic but
+    /// deep case (a chain of distinct registers, or nested `\w'…'`).
+    fn interpolate_guarded(&self, input: &str, depth: u32, active: &mut HashSet<String>) -> String {
+        if depth >= MAX_INTERPOLATION_DEPTH {
+            return input.to_string();
+        }
         let mut out = String::with_capacity(input.len());
         let mut chars = input.char_indices().peekable();
 
@@ -611,14 +632,20 @@ impl Roff {
                     chars.next();
                     let name = read_escape_name(&mut chars);
                     if let Some(v) = self.ds.get(&name) {
-                        // Resolve nested interpolations once.
-                        out.push_str(&self.interpolate(v));
+                        // Resolve nested interpolations, unless this register is
+                        // already being expanded further up the stack — in which
+                        // case it expands to nothing, as in groff.
+                        if active.insert(name.clone()) {
+                            let v = v.clone();
+                            out.push_str(&self.interpolate_guarded(&v, depth + 1, active));
+                            active.remove(&name);
+                        }
                     }
                 }
                 Some('w') => {
                     chars.next();
                     if let Some(width) = read_quoted(&mut chars) {
-                        let resolved = self.interpolate(&width);
+                        let resolved = self.interpolate_guarded(&width, depth + 1, active);
                         out.push_str(&display_cells(&resolved).to_string());
                     } else {
                         out.push_str("\\w");

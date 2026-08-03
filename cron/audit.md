@@ -83,6 +83,14 @@ which had **zero tests**:
 | #B8 | Minor | `batch`'s banner and prompt announced `at` |
 | #D15 | Minor | "any owner" in the at-spool trust policy was encoded as `RootOrUid(u32::MAX)` — the invalid-uid sentinel |
 
+Review caught a loose end in #D15: a unit test still constructed the *old*
+sentinel to neutralize an owner rule, so once `OwnerRule::Any` existed that
+line silently reverted to meaning "root or uid 4294967295". It kept passing
+only because `check_metadata` evaluates the mode before the owner, so
+`BadMode` won regardless — it would have broken the moment either the check
+order or the fixture's mode changed. Now `OwnerRule::Any`, with the trap
+recorded in a comment.
+
 **A note on my own process.** I wrote five unit tests for #D4/#D5 on the
 strength of the audit's test-coverage boxes claiming they were uncovered, then
 found `tests/crond/mod.rs` already had equivalents and removed the duplicates.
@@ -362,10 +370,15 @@ supported at all), and — fatally — **submitted jobs are never executed** (#X
   date is `date +"%a %b %e %T %Y"` (space-padded day) (85011-85012).
 - [x] **#A15 — Diagnostics hardcoded English.** ~~Partial~~ **✓ completed
   (2026-08-03).** The `plib::diag` + `init_locale` plumbing was already in
-  place; the remaining runtime strings across `at`, `crond`, `job` and `spool`
-  are now `gettext()`-wrapped, so `LC_MESSAGES` (84986-84989) governs them.
-  This closes the item rather than leaving it permanently partial, as the
-  `dev/` and `editors/` crates did with their equivalents.
+  place; the runtime strings across `at`, `crond`, `job` and `spool` are now
+  `gettext()`-wrapped, so `LC_MESSAGES` (84986-84989) governs them. This closes
+  the item rather than leaving it permanently partial, as the `dev/` and
+  `editors/` crates did with their equivalents.
+  *Corrected 2026-08-03 after review: the first pass wrapped a sample and then
+  marked the item complete, leaving unwrapped strings behind in `at.rs`'s
+  argument validation and `time` module and in `spool.rs`. The sweep is now
+  exhaustive — verified by grepping every `Err("…")`, `.ok_or("…")` and
+  `print_err_and_exit(_, "…")` in the crate.*
 
 ### Detailed conformance matrix
 

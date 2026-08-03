@@ -154,9 +154,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Submission path: a -t time_arg, or a timespec built from the operands.
     let time = match (&args.time, args.operands.is_empty()) {
         (Some(_), false) => {
-            return Err("a timespec and the -t option cannot be used together".into())
+            return Err(gettext("a timespec and the -t option cannot be used together").into())
         }
-        (None, true) => print_err_and_exit(1, "you need a timespec or the -t option"),
+        (None, true) => print_err_and_exit(1, gettext("you need a timespec or the -t option")),
         (Some(time_arg), true) => time::parse_time_posix(time_arg)?,
         (None, false) => {
             // Operands are concatenated and all white space stripped, per the
@@ -169,7 +169,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect();
             Timespec::from_str(&timespec)?
                 .to_date_time()
-                .ok_or("Failed to parse `timespec`: date out of range?")?
+                .ok_or_else(|| gettext("Failed to parse `timespec`: date out of range?"))?
         }
     };
 
@@ -182,11 +182,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             let mut file = File::open(path)
-                .map_err(|e| format!("Failed to open command file. Reason: {e}"))?;
+                .map_err(|e| format!("{}: {e}", gettext("Failed to open command file")))?;
 
             let mut buf = String::new();
             file.read_to_string(&mut buf)
-                .map_err(|e| format!("Failed to read command file. Reason: {e}"))?;
+                .map_err(|e| format!("{}: {e}", gettext("Failed to read command file")))?;
 
             buf
         }
@@ -268,7 +268,7 @@ fn remove_jobs(job_ids: &[u32]) -> Result<(), String> {
 
             // Only the job's owner (or root) may remove it (audit #A7).
             let meta = fs::symlink_metadata(&file_path)
-                .map_err(|e| format!("Could not stat job {}: {}", job_id, e))?;
+                .map_err(|e| format!("{} {}: {}", gettext("Could not stat job"), job_id, e))?;
             if uid != 0 && meta.uid() != uid {
                 return Err(format!("you do not own job {}", job_id));
             }
@@ -281,7 +281,11 @@ fn remove_jobs(job_ids: &[u32]) -> Result<(), String> {
                 ));
             }
         } else {
-            return Err(format!("The job with ID {} was not found.", job_id));
+            return Err(format!(
+                "{} {}",
+                gettext("The job with ID was not found:"),
+                job_id
+            ));
         }
     }
     Ok(())
@@ -318,6 +322,7 @@ where
 
 mod time {
     use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone, Utc};
+    use gettextrs::gettext;
 
     // Copy from `touch`
     pub fn parse_time_posix(time: &str) -> Result<DateTime<Utc>, Box<dyn std::error::Error>> {
@@ -378,7 +383,7 @@ mod time {
                 &time[10..12],
             ),
             _ => {
-                return Err("Invalid time format".into());
+                return Err(gettext("Invalid time format").into());
             }
         };
 
@@ -395,11 +400,11 @@ mod time {
         // instant for storage (audit #A5).
         let naive = NaiveDate::from_ymd_opt(year, month, day)
             .and_then(|d| d.and_hms_opt(hour, minute, secs))
-            .ok_or("Invalid time")?;
+            .ok_or_else(|| gettext("Invalid time"))?;
         let dt = Local
             .from_local_datetime(&naive)
             .single()
-            .ok_or("Invalid or ambiguous local time")?;
+            .ok_or_else(|| gettext("Invalid or ambiguous local time"))?;
         Ok(dt.with_timezone(&Utc))
     }
 }

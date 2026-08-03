@@ -104,9 +104,9 @@ pub fn at(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let jobno = next_job_id()?;
     let job_filename = job_file_name(jobno, queue, execution_time)
-        .ok_or("Failed to generate file name for job")?;
+        .ok_or_else(|| gettext("Failed to generate file name for job"))?;
 
-    let user = User::current().ok_or("Failed to get current user")?;
+    let user = User::current().ok_or_else(|| gettext("Failed to get current user"))?;
     if !is_user_allowed(&user.name) {
         return Err(format!("{}: {}", gettext("Access denied for user"), user.name).into());
     }

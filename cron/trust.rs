@@ -195,10 +195,17 @@ mod tests {
         fs::set_permissions(&p, fs::Permissions::from_mode(0o662)).unwrap();
 
         let meta = fs::symlink_metadata(&p).unwrap();
-        // Owner check (Root) may also trip when not running as root; the mode
-        // check is what we assert is reachable here.
+        // Neutralize the owner rule so the mode check is what this test
+        // actually exercises: the file is owned by the test user, not root.
+        //
+        // This used to say `RootOrUid(u32::MAX)`, the old "any owner"
+        // sentinel. Once that became `OwnerRule::Any` the sentinel silently
+        // reverted to meaning "root or uid 4294967295" -- the test still
+        // passed only because `check_metadata` evaluates the mode before the
+        // owner, so `BadMode` won regardless. It would have started failing
+        // the moment either the check order or the mode changed.
         let policy = TrustPolicy {
-            owner: OwnerRule::RootOrUid(u32::MAX),
+            owner: OwnerRule::Any,
             ..TrustPolicy::system_crontab()
         };
         assert_eq!(

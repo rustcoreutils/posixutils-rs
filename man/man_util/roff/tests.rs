@@ -413,3 +413,39 @@ fn request_arguments_do_not_include_a_trailing_comment() {
     assert_eq!(run(".ds A foo \\\" note\n[\\*A]\n"), "[foo]\n");
     assert_eq!(run(".nr N 40 \\\" note\n\\n(N\n"), "40\n");
 }
+
+// ---------------------------------------------------------------------------
+// Conditional and macro-expansion correctness (#M10, #M11).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parenthesised_condition_is_not_split_at_the_first_space() {
+    // The expression ends at whitespace *outside* parentheses. Splitting at the
+    // first whitespace anywhere took `(5` — truthy — and printed `> 99)` as the
+    // body. `.if (a:(b)) \{\` is the standard groff idiom; every pod2man page
+    // opens with one.
+    assert_eq!(run(".if (5 > 99) body\nafter\n"), "after\n");
+    assert_eq!(run(".if (5 < 99) body\n"), "body\n");
+    assert_eq!(run(".if (0:(1==1)) yes\n"), "yes\n");
+    assert_eq!(run(".if (1&(0)) no\nz\n"), "z\n");
+}
+
+#[test]
+fn doubled_backslash_in_a_macro_body_does_not_leak() {
+    // A macro body is written with doubled escapes so they act at call time.
+    // Copy mode reduces `\\` to `\` when the body is stored; without it the
+    // leading backslash of `\\$1` was emitted verbatim before every argument.
+    assert_eq!(run(".de G\nHello \\\\$1\n..\n.G world\n"), "Hello world\n");
+    // The single-backslash spelling keeps working.
+    assert_eq!(run(".de H\nHi \\$1\n..\n.H there\n"), "Hi there\n");
+    // A deferred register interpolation resolves at call time, not at
+    // definition time.
+    assert_eq!(run(".de S\nval \\\\n(X\n..\n.nr X 7\n.S\n"), "val 7\n");
+}
+
+#[test]
+fn argument_count_register_is_available_in_a_macro_body() {
+    assert_eq!(run(".de C\ngot \\\\n(.$\n..\n.C a b c\n"), "got 3\n");
+    assert_eq!(run(".de D\ngot \\\\n[.$]\n..\n.D x\n"), "got 1\n");
+    assert_eq!(run(".de E\ngot \\\\n(.$\n..\n.E\n"), "got 0\n");
+}

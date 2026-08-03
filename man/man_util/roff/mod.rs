@@ -262,7 +262,7 @@ impl Roff {
             if is_end {
                 break;
             }
-            body.push(line);
+            body.push(reduce_copy_mode(&line));
         }
 
         if append {
@@ -529,15 +529,11 @@ impl Roff {
             }
         }
 
-        // Numeric expression terminated by whitespace.
+        // Numeric expression terminated by whitespace outside parentheses.
         let interp = self.interpolate(s);
-        let expr = interp.split_whitespace().next().unwrap_or("");
-        let body_start = interp
-            .find(char::is_whitespace)
-            .map(|i| &interp[i..])
-            .unwrap_or("");
+        let (expr, body) = split_numeric_expr(&interp);
         let val = eval_numeric(expr).unwrap_or(0);
-        (val > 0, body_start.trim_start().to_string())
+        (val > 0, body.trim_start().to_string())
     }
 
     // ── ig / so ───────────────────────────────────────────────────────────
@@ -755,6 +751,26 @@ struct Interp {
     remaining: usize,
 }
 
+/// Split a conditional's numeric expression from the body that follows it.
+///
+/// The expression ends at the first whitespace *outside* parentheses. Splitting
+/// on the first whitespace anywhere broke the standard groff idiom: in
+/// `.if (\n(rF:(\n(.g==0)) \{\` the expression is the whole parenthesised term,
+/// but the naive split took `(0` — which evaluates truthy — and printed the
+/// remainder as body text.
+fn split_numeric_expr(s: &str) -> (&str, &str) {
+    let mut depth = 0usize;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            c if c.is_whitespace() && depth == 0 => return (&s[..i], &s[i..]),
+            _ => {}
+        }
+    }
+    (s, "")
+}
+
 /// Recognized built-in request names (used by the `d` condition).
 const BUILTIN_REQUESTS: &[&str] = &[
     "de", "am", "ds", "as", "nr", "rr", "rm", "rn", "als", "if", "ie", "el", "ig", "so", "nop",
@@ -802,6 +818,26 @@ fn tokenize(s: &str) -> Vec<String> {
 }
 
 /// Substitute `\\$1`…`\\$9`, `\\$0`, `\\$*`, `\\$@`, `\\$#` in a macro body line.
+/// Apply roff *copy mode* to a line being stored as a macro body: `\\` reduces
+/// to `\`, so an escape written `\\$1` or `\\n(x` in the source is deferred to
+/// expansion time rather than acting now.
+///
+/// Without this, `substitute_args` saw the leading backslash of `\\$1`, found no
+/// `$` after it, emitted it verbatim, and then substituted the argument — so
+/// every expanded argument was preceded by a stray `\`. Doubling is the normal
+/// way to write a macro body, so this affected essentially every `.de`.
+fn reduce_copy_mode(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' && chars.peek() == Some(&'\\') {
+            chars.next();
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn substitute_args(line: &str, name: &str, argv: &[String]) -> String {
     let mut out = String::with_capacity(line.len());
     let mut chars = line.chars().peekable();
@@ -835,11 +871,40 @@ fn substitute_args(line: &str, name: &str, argv: &[String]) -> String {
                 }
                 None => out.push_str("\\$"),
             }
+        } else if strip_argc_register(&mut chars) {
+            // `\n(.$` / `\n[.$]`: the argument count. It is a register, but one
+            // whose value exists only during this expansion, so it is resolved
+            // here rather than through the register table.
+            out.push_str(&argv.len().to_string());
         } else {
             out.push('\\');
         }
     }
     out
+}
+
+/// If the escape starting at `chars` is the argument-count register `\n(.$` or
+/// `\n[.$]`, consume it and return true.
+fn strip_argc_register(chars: &mut std::iter::Peekable<std::str::Chars>) -> bool {
+    let mut probe = chars.clone();
+    if probe.next() != Some('n') {
+        return false;
+    }
+    let closing = match probe.next() {
+        Some('(') => None,
+        Some('[') => Some(']'),
+        _ => return false,
+    };
+    if probe.next() != Some('.') || probe.next() != Some('$') {
+        return false;
+    }
+    if let Some(c) = closing {
+        if probe.next() != Some(c) {
+            return false;
+        }
+    }
+    *chars = probe;
+    true
 }
 
 /// Read an escape operand name after `\n`/`\*`: `(xx`, `[name]`, or a single char.

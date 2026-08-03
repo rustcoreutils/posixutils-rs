@@ -89,6 +89,11 @@ fn substitutions() -> &'static HashMap<&'static str, &'static str> {
         m.insert(r"\&", ""); // zero-width space
         m.insert(r"\)", ""); // zero-width space (transparent to end-of-sentence detection)
         m.insert(r"\%", ""); // zero-width space allowing hyphenation
+                             // Italic corrections: typesetter kerning with no width on a terminal.
+                             // help2man emits these on every GNU page, so they were visible as stray
+                             // `\,` and `\/` in the rendered text of most of /usr/share/man.
+        m.insert(r"\,", ""); // left italic correction
+        m.insert(r"\/", ""); // right italic correction
                              //m.insert(r"\:", "");  // zero-width space allowing line break
 
         // Lines:
@@ -4076,6 +4081,20 @@ mod tests {
     fn font_escapes_styled_when_on() {
         let out = format_styled(".Dd x\n.Dt T 1\n.Os\n.Sh D\nuse \\fBbold\\fR now\n");
         assert!(out.contains("b\u{8}bo\u{8}ol\u{8}ld\u{8}d"), "got: {out:?}");
+    }
+
+    #[test]
+    fn italic_corrections_are_removed() {
+        // `\\,` and `\\/` are typesetter kerning with no width on a terminal.
+        // help2man emits them on every GNU page, so they were visible as stray
+        // backslashes in the rendered text of most of /usr/share/man.
+        let mut formatter = MdocFormatter::new(FORMATTING_SETTINGS);
+        let out = String::from_utf8(
+            formatter.format_mdoc(get_ast(".Dd x\n.Dt T 1\n.Os\n.Sh D\nsort \\,FILE\\/ now\n")),
+        )
+        .unwrap();
+        assert!(out.contains("sort FILE now"), "got: {out:?}");
+        assert!(!out.contains('\\'), "got: {out:?}");
     }
 
     #[test]

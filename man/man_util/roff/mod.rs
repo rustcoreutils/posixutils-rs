@@ -148,6 +148,13 @@ impl Roff {
             return;
         }
 
+        // A trailing `\"` comment ends the line for a request just as it does for
+        // text, so it must not reach the request's arguments. `.de CQ \" put $1
+        // in typewriter font` otherwise took `\"` as the definition's custom end
+        // macro (`.de NAME END`), which no line ever matched — so the definition
+        // swallowed the rest of the page. That is a pod2man idiom, so it hit
+        // every perl-derived page.
+        let line = self.strip_comment(&line);
         let body = line[1..].trim_start();
         let (name, args) = split_name(body);
 

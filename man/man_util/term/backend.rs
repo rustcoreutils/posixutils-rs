@@ -115,7 +115,12 @@ impl Term {
         if !text.trim().is_empty() {
             self.has_body = true;
         }
-        self.out.push(format!("{}{}", " ".repeat(indent), text));
+        // Trailing blanks are never meaningful on a terminal, and column padding
+        // routinely produces them: tbl pads a cell containing only `\&`, then the
+        // escape layer resolves `\&` to nothing, leaving the padding behind as a
+        // 380-column run of spaces.
+        let line = format!("{}{}", " ".repeat(indent), text);
+        self.out.push(line.trim_end().to_string());
     }
 
     /// End the current line without inserting vertical space (roff `.br`).

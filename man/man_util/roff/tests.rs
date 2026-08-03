@@ -400,3 +400,16 @@ fn while_loop_budget_is_global_not_per_iteration() {
         out.len()
     );
 }
+
+#[test]
+fn request_arguments_do_not_include_a_trailing_comment() {
+    // `.de NAME END` takes a custom terminator. A trailing `\"` comment reaching
+    // the arguments made `\"` the terminator, which no line matched — so the
+    // definition swallowed the rest of the page. pod2man writes `.de CQ
+    // \" put $1 in typewriter font`, so this hit every perl-derived page.
+    let out = run(".de CQ \\\" put $1 in typewriter font\n.ft CW\n..\n.SH NAME\nkept\n");
+    assert_eq!(out, ".SH NAME\nkept\n");
+    // Other requests must not see the comment either.
+    assert_eq!(run(".ds A foo \\\" note\n[\\*A]\n"), "[foo]\n");
+    assert_eq!(run(".nr N 40 \\\" note\n\\n(N\n"), "40\n");
+}

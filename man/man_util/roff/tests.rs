@@ -334,3 +334,29 @@ fn expr_arithmetic_overflow_saturates() {
     assert_eq!(eval_numeric("-9223372036854775807-2"), Some(i64::MIN));
     assert_eq!(eval_numeric("5%0"), Some(0));
 }
+
+// ---------------------------------------------------------------------------
+// `.so` include-cycle guard (#M5).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn so_self_include_terminates() {
+    // A file that sources itself. Inclusion is flattened onto the line queue,
+    // so this is not caught by any recursion limit; before the guard it spun
+    // until the multi-million-line budget tripped, taking minutes.
+    let out = preprocess_with_loader("hello\n.so self\n", |t| {
+        (t == "self").then(|| "hello\n.so self\n".to_string())
+    });
+    assert_eq!(out.lines().filter(|l| *l == "hello").count(), 2);
+}
+
+#[test]
+fn so_mutual_include_cycle_terminates() {
+    let out = preprocess_with_loader(".so a\n", |t| match t {
+        "a" => Some("A\n.so b\n".to_string()),
+        "b" => Some("B\n.so a\n".to_string()),
+        _ => None,
+    });
+    assert!(out.contains('A') && out.contains('B'));
+    assert_eq!(out.lines().count(), 2, "cycle re-expanded: {out:?}");
+}

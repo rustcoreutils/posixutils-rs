@@ -37,6 +37,10 @@ const MAX_QUEUE: usize = 4_000_000;
 /// [`Roff::interpolate_guarded`].
 const MAX_INTERPOLATION_DEPTH: u32 = 64;
 
+/// Maximum number of distinct `.so` targets a single page may include. Each one
+/// costs a `fork`+`exec` of `cat`/`zcat`, so this bounds that too.
+const MAX_SO_INCLUDES: usize = 256;
+
 /// A user-defined macro body (the lines between `.de NAME` and `..`).
 type MacroBody = Vec<String>;
 
@@ -69,6 +73,8 @@ pub struct Roff {
     divert: Option<Diversion>,
     /// Resolves `.so` targets to file contents (None disables `.so`).
     loader: Option<SoLoader>,
+    /// `.so` targets already included, for cycle detection.
+    so_included: HashSet<String>,
 }
 
 /// Preprocess `input`, resolving `.so` targets through `loader`.
@@ -558,9 +564,18 @@ impl Roff {
 
     fn do_so(&mut self, args: &str, queue: &mut Vec<String>) {
         let target = self.interpolate(args);
-        let target = target.trim();
+        let target = target.trim().to_string();
+        // A file that sources itself, or a pair that source each other, would
+        // otherwise be re-queued forever: inclusion is flattened onto the line
+        // queue, so it hits neither a recursion limit nor — for a long while —
+        // the line budget. Each distinct target is included at most once, and
+        // the total is capped; a page legitimately sourcing the same file twice
+        // is not a thing that occurs.
+        if self.so_included.len() >= MAX_SO_INCLUDES || !self.so_included.insert(target.clone()) {
+            return;
+        }
         if let Some(loader) = &self.loader {
-            if let Some(content) = loader(target) {
+            if let Some(content) = loader(&target) {
                 let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
                 Self::push_front(queue, lines);
             }

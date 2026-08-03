@@ -16,7 +16,7 @@ use man_util::parser::{MdocDocument, MdocParser};
 use std::ffi::OsStr;
 use std::io::{self, IsTerminal, Write};
 use std::num::ParseIntError;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::str::FromStr;
 use std::string::FromUtf8Error;
@@ -460,10 +460,28 @@ fn get_man_page_from_path(path: &PathBuf) -> Result<Vec<u8>, ManError> {
     Ok(output.stdout)
 }
 
+/// Whether a roff `.so` target is safe to resolve.
+///
+/// A man page is untrusted input — it may arrive from a package, a shared
+/// `MANPATH`, or `man -l` on a downloaded file — so `.so` must not be usable to
+/// read arbitrary files and render them to the terminal. `.so /etc/passwd` did
+/// exactly that. mandoc's rule, adopted here: the target must be relative and
+/// must not walk upwards.
+fn is_safe_so_target(target: &str) -> bool {
+    let path = Path::new(target);
+    !path.is_absolute()
+        && !path
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::RootDir))
+}
+
 /// Resolve a roff `.so` include target to its (decompressed) text for the roff
 /// front-end. Tries the target as given, then under each system man root, with
 /// and without a `.gz` suffix. Returns `None` if nothing readable is found.
 fn load_so(target: &str) -> Option<String> {
+    if !is_safe_so_target(target) {
+        return None;
+    }
     let mut candidates: Vec<PathBuf> = vec![PathBuf::from(target)];
     for root in MAN_PATHS {
         candidates.push(PathBuf::from(root).join(target));
@@ -1040,4 +1058,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     std::process::exit(exit_code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_safe_so_target;
+
+    /// `.so` must not be usable to read arbitrary files. A man page is
+    /// untrusted input, and `.so /etc/passwd` rendered the password file to the
+    /// terminal with exit status 0.
+    #[test]
+    fn so_target_must_be_relative_and_not_escape() {
+        assert!(!is_safe_so_target("/etc/passwd"));
+        assert!(!is_safe_so_target("/proc/self/environ"));
+        assert!(!is_safe_so_target("../../../etc/shadow"));
+        assert!(!is_safe_so_target("man1/../../../etc/passwd"));
+        assert!(!is_safe_so_target(".."));
+
+        // Ordinary alias targets, which is what `.so` is actually for.
+        assert!(is_safe_so_target("man1/ls.1"));
+        assert!(is_safe_so_target("man3/printf.3"));
+        assert!(is_safe_so_target("./man1/ls.1"));
+    }
 }

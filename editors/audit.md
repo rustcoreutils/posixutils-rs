@@ -52,6 +52,15 @@ silent data loss.
 | — | Minor | `@@` failed with `Buffer "@" is empty` |
 | — | Minor | `j` implemented one of POSIX's five join rules |
 
+**Portability note (2026-08-03).** The spec's first worked example uses `\<`
+and `\>`, which are a **GNU regex extension, not POSIX BRE** — BSD libc
+(macOS) spells word boundaries `[[:<:]]`/`[[:>:]]` and rejects the GNU form, so
+the substitution silently did nothing and the test failed on macOS only. The
+test now selects the same three words with a bracket expression, keeping the
+expected output byte-identical. Worth remembering when reading cross-cutting
+theme 1 below, which describes `\<`/`\>` as supported: that holds on glibc,
+not on every libc this project targets.
+
 Every fix was confirmed to fail against the pre-fix code before being
 accepted. Where a reference existed it was used: `vim -e` for addressing and
 write rules, and the spec's own worked examples for substitute case

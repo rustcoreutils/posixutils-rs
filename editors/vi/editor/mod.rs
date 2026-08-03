@@ -2914,11 +2914,9 @@ impl Editor {
         let mut printed: Vec<String> = Vec::new();
         // `\n` in the replacement inserts lines mid-iteration, so walk the
         // range with an explicit cursor rather than a fixed `for` range.
-        let mut line_shift = 0usize;
         let mut line_num = start;
 
         while line_num <= end {
-            let _ = line_shift;
             if let Some(line) = self.buffer.line(line_num) {
                 let content = line.content().to_string();
                 let (new_content, count) = if sub.needs_confirm() && !sub.is_count_only() {
@@ -2950,9 +2948,7 @@ impl Editor {
                         }
                         // Later lines in the range have shifted down by the
                         // number of extra lines introduced here.
-                        let added = parts.len() - 1;
-                        end += added;
-                        line_shift += added;
+                        end += parts.len() - 1;
                         total_count += count;
                         continue;
                     }

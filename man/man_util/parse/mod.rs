@@ -11,8 +11,8 @@
 //! the same `Element`/`MacroNode`/`Macro` AST without the exponential
 //! backtracking of the PEG (no per-line nesting cap needed).
 //!
-//! The mdoc parser is being grown to parity with the pest parser behind the
-//! `MAN_PARSER=v2` switch; until it reaches full coverage, pest remains the
-//! default. Parity is validated against pest in the unit tests.
+//! These are the only parsers: pest, its grammar and the `MAN_PARSER` switch
+//! that once selected between them are gone. Coverage is validated by the
+//! formatter's snapshot tests and the integration suite.
 
 pub mod mdoc;

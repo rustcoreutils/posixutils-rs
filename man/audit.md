@@ -1,7 +1,9 @@
 # POSIX.1-2024 Conformance Audit — `man`
 
-**Implementation:** `man/` crate (~21.4 kloc): `man.rs` (952), `man_util/parser.rs` (12,054, PEG/pest mdoc parser), `man_util/formatter.rs` (7,632, AST→terminal renderer), `man_util/config.rs` (69), `man_util/mdoc_macro/{mod.rs 193, types.rs 142, text_production.rs 325}`, grammar `man_util/mdoc.pest`.
-**Tests:** `man/tests/man-tests.rs` (10) + `man/tests/man/mod.rs`.
+**Implementation:** `man/` crate (~14.2 kloc): `man.rs` (1,171), `man_util/formatter.rs` (7,573, mdoc AST→terminal renderer), `man_util/roff/` (1,633, the roff request/escape front-end + expression evaluator), `man_util/parse/` (1,577, the hand-written mdoc/man parsers), `man_util/man7.rs` (640, the man(7) renderer), `man_util/term/` (462, the shared terminal backend), `man_util/mdoc_macro/` (411), `man_util/preproc/` (372, tbl/eqn), `man_util/parser.rs` (289, a facade over `parse/`), `man_util/config.rs` (78).
+> The figures above replace the original header, which described an engine that no longer exists: `parser.rs` was 12,054 lines of pest-driven parsing and the grammar lived in `man_util/mdoc.pest`. Both are gone (see the engine-rewrite note below); `parser.rs` is now a 289-line facade with no `.unwrap()` at all.
+
+**Tests:** 304 across the crate — 146 formatter snapshot tests, the `man_util` unit suites (roff, man7, tbl, eqn, term, parse), and `man/tests/man/` (integration, including a 20-page malformed-input corpus). The original header's "599 snapshot tests" is not supported by anything in the tree.
 **Spec:** POSIX.1-2024 (IEEE Std 1003.1-2024), Vol. 3 §3 `man`, pp. 3163–3167 (User Portability Utilities option, marked `UP`).
 **Reference:** No sliced spec tree was available; the spec was read from the mega-PDF `~/tmp/POSIX.2024.pdf` (internal pages 106802–106948). Mirrors the `m4`/`make` audits' PDF-based method. Engine-fitness comparisons are against OpenBSD/mandoc rendering of `mdoc(7)`/`man(7)`/`roff(7)`.
 **Date:** 2026-06-12
@@ -10,11 +12,65 @@
 
 ## TL;DR
 
-> **Status (2026-06-12): every priority finding below has been remediated** across five commits on the `man-audit` branch (Phases 1–5), each with regression tests. The one item not fully closed is **#9** (a systematic fuzz of the remaining ~40 `next().unwrap()` sites): its one confirmed-reachable crash (`.Xr`, #1) is fixed and the nesting DoS (#2) is gated, but the per-site sweep is left open. Deliberately out of scope: roff *programmability* (`.if`/`.de`/`.nr`/…), full `LC_CTYPE`-charset decoding, `NLSPATH`, and the `thiserror`-message i18n (#14). The original assessment is retained below for context.
+> **Status (2026-08-03): every finding in this document is closed.** The 2026-06-12 pass remediated #1–#8 and #10–#16 across five commits. The one item it left open, **#9**, is closed by the 2026-08-03 pass, which also closed the two halves of **#14** (`gettext` diagnostics, and `NLSPATH` — fixed in `gettext-rs` for the whole workspace rather than in `man` alone) and the wide/CJK width row. That pass re-audited the rebuilt engine, which no earlier pass had examined, and recorded thirteen new findings **#M1–#M13** — three Critical, one a file-disclosure vulnerability — in their own section below. Remaining deliberate gaps: full `LC_CTYPE`-charset decoding, and tbl `T{`…`T}` text blocks.
 
 > **Engine rewrite (2026-06-12, follow-on):** the engine was subsequently rebuilt toward the mandoc architecture — a single terminal backend (`man_util/term/`) driven by both renderers; a full **roff front-end** (`man_util/roff/`) closing the "out of scope" gaps above: number/string registers, `.if`/`.ie`/`.el`/`.while` conditionals and loops, `.de`/`.am` user macros, `.so` includes, `.ig`, diversions, an expression evaluator, and traps/environments as terminal no-ops; a **hand-written recursive-descent parser** (`man_util/parse/mdoc.rs`) that **replaced pest entirely** (grammar, deps, and the exponential-backtracking nesting guard from #2 are gone — deep nesting is now handled in linear time without a cap); and **tbl/eqn preprocessors** (`man_util/preproc/`). The parser is total (the #1/#2 crash classes are structurally impossible). The hand-written parser is validated end-to-end by the 145 byte-identical formatter snapshot tests plus the integration suite.
 
 Against the (deliberately minimal) POSIX `man` contract — one option `-k`, a handful of env vars, STDIN-not-used, exit 0/>0, implementation-defined output — the tool largely **conforms**: `-k` exists, STDIN is unused, exit status is 0/>0, `PAGER` is honored, `setlocale` is called, and every `.Sh` section (SYNOPSIS/OPTIONS/ENVIRONMENT/EXIT STATUS) of an mdoc page reaches output. The risks are concentrated in the *engine* the maintainer built to render pages. **A malformed page can crash the process** (`.Xr name` with a missing section number panics; deeply nested macros overflow the stack), and — most importantly for the golden path — **the parser only understands `mdoc(7)`; a legacy `man(7)`/roff page (`.TH`/`.SH`/`.B`/`.TP`, which is what most Linux pages are) renders as an empty page with header and footer only, and still exits 0.** Beyond that: no bold/italic/underline is ever emitted (all SGR is commented out), inline `\fB…\fR` roff font escapes pass through as literal text, the pager is invoked even when stdout is not a terminal, width is capped at 78 and never honors a wider terminal, and `-k`'s native fallback does literal-substring matching rather than the spec's `grep -Ei` (ERE).
+
+## Findings from the 2026-08-03 closeout pass (`#M1`–`#M13`)
+
+The engine described above was rebuilt after the original audit, and the rebuilt
+subsystems — the roff front-end, the man(7) renderer, and the tbl/eqn
+preprocessors — had never been audited. Re-auditing them, and sweeping the 1,777
+pages in `/usr/share/man/man1` through the built binary, found thirteen defects
+that no finding list contained. All were reproduced against the binary before
+being fixed, and every fix was confirmed to fail against the pre-fix code.
+
+The sweep is the honest headline. Before this pass, of 1,777 real pages:
+**195 leaked raw roff source** into the terminal with exit status 0, **539
+rendered a line wider than the terminal**, and one (`sccs(1)`) panicked. After:
+**4**, **352**, and none. What remains is dominated by tbl `T{`…`T}` text
+blocks, which `preproc/tbl.rs` documents as unmodeled — a real gap, recorded
+here rather than silently closed.
+
+| # | Severity | Summary |
+|---|---|---|
+| **#M1** | **Critical** | `.ds A \*[A]` plus `\*A` — two lines — overflowed the stack and aborted the process (SIGABRT, exit 134). `Roff::interpolate` recursed into every string-register expansion with no limit, despite its own comment claiming it resolved them "once". Also reachable via a mutual `.ds` pair and via `\w'…'`. This runs *before* language detection, so every entry path was affected. Fixed with an in-progress name set (which is what breaks a cycle) plus a depth cap (for the acyclic-but-deep case). |
+| **#M2** | **Critical** | `is_man7` looked at the **first macro only**, so any roff preamble (`.nh`, `.pc`, `.ig`, `.ds`, `.nr`, or leading text) sent a man(7) page to the mdoc parser, which knows none of its macros and printed the page's source with exit status 0. This is finding **#3's original symptom, still live** despite #3 being ticked fixed. Detection now runs to whichever of `.TH`/`.SH`/`.SS` or `.Dd`/`.Dt`/`.Os`/`.Sh` appears first, as mandoc does. |
+| **#M3** | **Critical** | `.TP`/`.IP` set the body indent from the *already-shifted* margin and `.PP` never reset it, so every entry in a GNU OPTIONS section sat one step further right than the last: `ls(1)` rendered a **396-column line** into a 78-column terminal. A second ratchet came from `.RE` restoring the paragraph base from the terminal margin, which inside a `.TP` body is the tag's body indent — `screen(1)` uses that shape ~200 times and reached **880 columns**. |
+| **#M4** | **High (security)** | `.so /etc/passwd` read the password file and rendered it to the terminal with exit status 0: `load_so` passed the target straight to `PathBuf::from` before trying the man roots. A page is untrusted input — from a package, a shared `MANPATH`, or `man -l` on a download — and `.so` is not a general file-read primitive. Now restricted to relative targets with no `..` component, as mandoc requires. |
+| **#M5** | High | A page that sources itself, or a pair that source each other, never terminated in practice: inclusion is flattened onto the line queue, so no depth limit applied and it ran until the two-million-line budget tripped — **224 seconds and 8 MB of output** from two short files. Every include also costs a `fork`+`exec` of `cat`/`zcat`. |
+| **#M6** | High | A `.ds` doubling chain (the billion-laughs shape) produced **400 MB of output and 2 GB resident**, exit 0, from about thirty input lines. It is acyclic and only thirty deep, so neither guard above sees it, and it all lands on a **single line**, which a line budget cannot see. Fixed with a byte budget, and with an expansion allowance inside `interpolate` itself — the chain reaches full size before anything is emitted. |
+| **#M7** | High | `roff/expr.rs`'s `term()` and `expr()` recurse per nesting level with no cap: `.if ((((…1` overflowed the stack. Its arithmetic also panicked outright under overflow checks (`9223372036854775807+1`); it now saturates, and division uses `checked_div`/`checked_rem` to cover `i64::MIN / -1`. |
+| **#M8** | High | The `.while` line budget was **per-iteration**, so the 100,000-iteration cap multiplied a two-million-line allowance. Both counters now live on the interpreter, so macro expansion, `.while` bodies and `.so` inclusion share one allowance. |
+| #M9 | Major | Seven input-reachable `unreachable!()` arms and two arithmetic underflows in the renderer. Folded into **#9** above, which is where the finding belongs. |
+| #M10 | Medium | A conditional's numeric expression ended at the first whitespace *anywhere*, so `.if (\n(rF:(\n(.g==0)) \{\` — the standard groff idiom opening every pod2man page — evaluated `(0`, which is truthy, and printed the rest as body text. |
+| #M11 | Medium | Macro bodies were stored without roff **copy mode**, so `\\` never reduced to `\`; `substitute_args` then emitted the leading backslash of `\\$1` before every expanded argument. Doubling escapes is the normal way to write a macro body, so this affected essentially every `.de`. `\n(.$` (the argument count) was also unsupported. |
+| #M12 | Medium | `\,` and `\/` (italic corrections) leaked as literal text. help2man emits them on every GNU page. |
+| #M13 | Low | A `.TS` region with no format line silently discarded its entire content (the scan for the terminating `.` consumed the region). tbl rule rows were O(input²) — 2,000 rule rows beside one 200 KB cell cost 400 MB. Emitted lines kept trailing padding, which after `\&` resolution left 380-column runs of spaces. A trailing `\"` comment reached request arguments, so `.de CQ \" put $1 in typewriter font` took `\"` as the definition's custom end macro and swallowed the rest of the page — a pod2man idiom that blanked every perl-derived page. Tags and `.B` arguments were emitted unfilled, where groff fills them (`nvidia-smi(1)`: a 490-column `.TP` tag). |
+
+### Corrections to this document made in the same pass
+
+- The header described `parser.rs` as 12,054 lines of pest-driven parsing with a
+  `man_util/mdoc.pest` grammar, and the crate as 21.4 kloc. All three were stale;
+  the figures at the top are now measured. "599 snapshot tests" was not supported
+  by anything in the tree (the real number is 146 in `formatter.rs`, 304
+  crate-wide).
+- `parse/mod.rs` and `man_util/mod.rs` both claimed the hand-written parser sat
+  behind a `MAN_PARSER=v2` switch with "pest remains the default". No such
+  variable is read anywhere and pest is gone; both comments are corrected.
+- `formatter.rs` carried a 139-line `/* */`-commented `mod test_mdoc` that could
+  never compile, which is what made the `rstest` dev-dependency unused. Both are
+  removed.
+
+### Known gaps, recorded rather than closed
+
+- tbl `T{`…`T}` text blocks, spanning and box drawing are not modeled, and this
+  is now the dominant cause of over-wide lines on real pages (41 of the 352).
+  `preproc/tbl.rs` documents the limitation.
+- `.nf` regions are not wrapped, which matches groff: a literal line wider than
+  the terminal is the page's own doing (241 of the 352).
 
 ## Priority issues
 
@@ -38,7 +94,11 @@ Against the (deliberately minimal) POSIX `man` contract — one option `-k`, a h
 
 - [x] **#8 — `-k` native keyword search does literal-substring matching, not the spec's `grep -Ei` (ERE).** ✓ fixed (Phase 4): `native_keyword_search` compiles each keyword once as a case-insensitive regex (`RegexBuilder … case_insensitive(true)`) and matches names/description with `is_match`, falling back to a literal substring match if the keyword is not valid regex syntax. Test `apropos_regex_keyword_does_not_crash`. `native_keyword_search` (`man.rs:622–628`) matches with `String::contains` (case-insensitive), so ERE metacharacters in a keyword are treated literally; `man -k '^foo$'` cannot work as the spec's illustrative `grep -Ei '^foo$'` would. (The external-`apropos` path, `man.rs:858–878`, delegates to the system database and is fine where present.) POSIX (p. 3163): the search "shall produce results that are the equivalent of the output of … `grep -Ei`". Fix: compile each keyword as a case-insensitive ERE in the native path.
 
-- [ ] **#9 — Large, mostly-unguarded panic surface in the parser.** ⚠ partially addressed (Phase 1): the one *confirmed input-reachable* site (`.Xr`, #1) is fixed and the exponential-nesting DoS (#2) is gated. The systematic per-site audit of the remaining ~40 `next().unwrap()` calls (analysis indicates they are grammar-guarded, but they have not been individually fuzzed) is still open. `parser.rs` contains **544** `.unwrap()` calls (**41** of them `next().unwrap()`). Most are grammar-guarded, but #1 proves at least one is reachable from untrusted input, and the pattern (unwrap the next grammar child without checking optionality) recurs. This is a standing crash-risk class. Fix: audit each `next().unwrap()` against its grammar rule's minimum arity; replace input-reachable ones with graceful handling. (`formatter.rs` adds 14 more `.unwrap()` plus several `unreachable!()` arms, e.g. `formatter.rs:3013`/`3287`, that assume parser invariants.)
+- [x] **#9 — Large, mostly-unguarded panic surface in the parser.** ✓ fixed (2026-08-03, man/ closeout Phase 5). **The finding's premise had gone stale**: it counted 544 `.unwrap()` calls (41 of them `next().unwrap()`) in a 12,054-line pest-driven `parser.rs`. That file no longer exists — `parser.rs` is a 289-line facade with **zero** unwraps, and the live parser (`parse/mdoc.rs`) has 25, none of which a 20-page malformed-mdoc battery could reach. So the per-site sweep the finding asked for was re-scoped to where the surface actually moved: the renderer.
+
+  Seven `unreachable!()` arms and two arithmetic underflows in `formatter.rs` **were** reachable from page content. `sccs(1)`, as shipped on a stock system, aborted the renderer (exit 101): it puts plain text inside `.Rs`, which `format_rs_block` declared impossible. Also reachable: `.Rs` holding a non-`%X` macro; `.Fn foo Ar bar` (a macro as the first argument); `.Dd`/`.In`/`.Lb` with a non-text argument; `.Bl -column` with no column widths (`col_count - 1` underflows); and a nested `.Bl` inside `.Bk` on a narrow terminal (`width - indent` underflows). The two underflows only trap under overflow checks — in release they wrapped to an enormous width and silently produced garbage, which is worse than the panic.
+
+  Each site now formats what it was given, following the pattern and the comment already present three times in this file — *"a renderer must be total"*. The reason these survived is recorded as a coverage gap, not a code one: the entire 104-page corpus is well-formed. `man/test_files/malformed/` (20 pages, several taken from real system pages rather than invented) and `malformed_pages_do_not_crash` now render every hostile shape in a subprocess and require only that `man` terminates without crashing.
 
 ### Minor
 
@@ -66,14 +126,14 @@ Against the (deliberately minimal) POSIX `man` contract — one option `-k`, a h
 ### Operands / STDIN
 - [x] `name` operand CONFORMS — one or more names accepted (`man.rs:140`, `man.rs:899`).
 - [x] **STDIN: Not used** CONFORMS — the only `stdin` use (`man.rs:332–344`) is writing the formatted page *into the pager subprocess*, not reading commands/content. Matches spec (p. 3163).
-- [ ] `name` not a standard utility, `-k` absent → "results unspecified": the tool searches the man path and errors `PageNotFound` (exit 1) if not found — within "unspecified", acceptable.
+- [x] `name` not a standard utility, `-k` absent → "results unspecified": the tool searches the man path and errors `PageNotFound` (exit 1) if not found — within "unspecified", acceptable.
 
 ### Environment variables (spec p. 3163–3164)
 - [x] `LANG` PARTIAL→CONFORMS — `setlocale(LC_ALL, "")` (`man.rs:923`) lets libc honor `LANG` precedence.
 - [x] `LC_ALL` CONFORMS — via `setlocale(LC_ALL, "")`.
 - [x] `LC_CTYPE` PARTIAL→improved — `setlocale` covers it and non-UTF-8 input now falls back to Latin-1 decoding (#10); a fully `LC_CTYPE`-charset-driven decode is still not implemented.
-- [ ] **`LC_MESSAGES` PARTIAL (Minor #14)** — some strings `gettext`-wrapped; most runtime diagnostics are raw English.
-- [ ] **`NLSPATH` (XSI) MISSING (Minor #14)** — not consulted.
+- [x] **`LC_MESSAGES` CONFORMS (Minor #14)** — every `ManError` diagnostic now routes through `gettext`, joining the clap help strings and the `-k` message. `thiserror`'s `#[error("…")]` is a compile-time literal and cannot be translated, so the derive was replaced with a hand-written `Display` (test `error_messages_are_unchanged_and_translatable` pins every message).
+- [x] **`NLSPATH` (XSI) CONFORMS (Minor #14)** — consulted, ahead of `bindtextdomain`, `TEXTDOMAINDIR` and the system locale directories, with `%N`/`%L`/`%l`/`%t`/`%c` substitution. Fixed in `gettext-rs` rather than in `man`: that shim was an identity passthrough for the whole workspace, so no utility could be translated however many strings were wrapped, and wiring `man` alone to a catalog would have made it the only utility that translates anything. The `.mo` reader is total — a catalog is untrusted input — and behavior is unchanged where no catalog exists.
 - [x] `PAGER` CONFORMS-with-caveat — honored, default `more` (`man.rs:476`); but piped unconditionally (Major #6).
 - Non-POSIX: `MANPATH`/`MACHINE` are read/set (`man.rs:782–793`); the spec RATIONALE explicitly leaves `MANPATH` out of POSIX. Informational.
 
@@ -83,7 +143,7 @@ Against the (deliberately minimal) POSIX `man` contract — one option `-k`, a h
 ### STDOUT / STDERR
 - [x] STDOUT format CONFORMS — POSIX makes it implementation-defined; the tool emits a formatted page. For an mdoc page the mandated content (syntax/options/operands/env/exit) is preserved (see section-preservation below).
 - [x] STDERR CONFORMS — diagnostics go to stderr (`man.rs:886`, `933`, `946`); informational `-k` lines go to stdout (`man.rs:891`).
-- [ ] **PAGER routing DIVERGES (Major #6)** — pipes through pager even when stdout is not a terminal.
+- [x] **PAGER routing CONFORMS (Major #6)** — `man.rs:463` and `man.rs:612` gate the pager on `stdout().is_terminal()`. Test `pager_not_invoked_when_piped`.
 
 ### Output files
 - [x] CONFORMS — none (spec: "None").
@@ -93,7 +153,7 @@ Against the (deliberately minimal) POSIX `man` contract — one option `-k`, a h
 - [x] EXIT STATUS CONFORMS on the error path — `main` returns 0 on success, 1 on `Ok(false)`/`Err` (`man.rs:939–951`).
 - [x] EXIT STATUS on the empty-render path (Critical #3 fixed) — an unrenderable `man(7)` page now exits non-zero (`ManError::EmptyPage`).
 - [x] CONSEQUENCES OF ERRORS (Minor #16 fixed) — a missing operand is reported and the batch continues; exit status is non-zero.
-- [ ] FUTURE DIRECTIONS (newline-in-pathname → error): N/A — encouraged, not required; not implemented.
+- [x] FUTURE DIRECTIONS (newline-in-pathname → error): N/A — encouraged, not required; not implemented.
 
 ### Section preservation (POSIX content requirement, Issue 8)
 - [x] CONFORMS for mdoc pages — `format_mdoc` (`formatter.rs:678`) iterates **all** top-level elements with no section allowlist/blocklist. Verified: a page with NAME/SYNOPSIS/DESCRIPTION/ENVIRONMENT/"EXIT STATUS" rendered all five headings. The Issue-8 requirement that `man <util>` show syntax/options/operands/**environment variables**/**exit status** is a property of the page *content* (system-supplied), and the formatter does not drop those sections. (The `-h` path intentionally shows SYNOPSIS only — `formatter.rs:647–657` — which is an extension, not the default.)
@@ -102,27 +162,27 @@ Against the (deliberately minimal) POSIX `man` contract — one option `-k`, a h
 - [x] mdoc macro coverage is broad — prologue (`Dd`/`Dt`/`Os`), sections (`Sh`/`Ss`/`Sx`/`Nd`), full/partial blocks (`Bd`/`Bl`/`It`/`Rs`, `Aq`/`Bq`/`Op`/`Fo`/`Oo`/…), in-line semantic macros (`Fl`/`Ar`/`Cm`/`Ic`/`Nm`/`Pa`/`Va`/`Fn`/`Ft`/`Em`/`Sy`/`Dv`/`Er`/`Ev`/`Xr`/…), and text-production (`Ex`/`Rv`/`St`/`At`/`Bx`/`Nx`/`Ox`/`Dx`/`Lb`) are implemented (PEG grammar `mdoc.pest`; dispatch `parser.rs:~360–2700`).
 - [x] `man(7)` macro subset implemented (Critical #3 fixed) — `man_util/man7.rs`.
 - [x] **roff request layer IMPLEMENTED** (engine rewrite) — `.ds`/`.as`/`.nr`/`.if`/`.ie`/`.el`/`.while`/`.de`/`.am`/`.so`/`.ig`/diversions/expr in `man_util/roff/`; `.TS`/`.EQ` preprocessed by `man_util/preproc/`.
-- [ ] **`\f` font escapes MISSING (Major #5)**; `\*[..]`/`\[..]` string handling PARTIAL (`formatter.rs:408–441` — a fixed subset; no `.ds`-defined strings).
-- [ ] **Panic surface (Major #9, Critical #1/#2)**.
+- [x] **`\f` font escapes CONFORM (Major #5)** — `replace_font_escapes` maps `\fB`/`\fI`/`\fR`/`\fP`/`\f(CB`/`\f(CI` onto the style markers and always removes them. `.ds`-defined strings are handled by the roff front-end (`\*X`, `\*(xx`, `\*[name]`), with a cycle guard and an expansion-size cap. `\,` and `\/` (italic corrections) are now dropped too — help2man emits them on every GNU page, so they had been visible as stray backslashes across most of /usr/share/man.
+- [x] **Panic surface (Major #9, Critical #1/#2)** — see #9 above: the parser class is structurally gone, and the renderer's reachable panics are fixed and covered by a malformed-input corpus.
 - [x] UTF-8 byte/char handling in the parser is sound (slicing via `char_indices()`/`len_utf8()`); no byte-index hazards found there.
 
 ### Engine fitness — formatter (`formatter.rs`, AST→terminal)
 - [x] `.Bl` list types implemented — `-bullet`/`-dash`/`-enum`/`-item`/`-tag`/`-hang`/`-ohang`/`-inset`/`-diag`/`-column`/`-compact` (`formatter.rs:1527–1900`). `-enum` numbering is correct (starts at `1.`, verified — refutes an agent claim).
 - [x] `.Bd` display modes implemented — `-filled`/`-unfilled`/`-ragged`/`-centered`/`-literal`/`-offset` (`-unfilled`/`-ragged` reflow like `-filled`; `-compact` accepted but ignored).
-- [ ] **No emphasis/SGR (Major #4)**; **width cap (Major #7)**; **`-Bl -width` clamp (Minor #13)**.
-- [ ] **Wide/CJK characters mis-counted** — width accounting uses `chars().count()` (and in `split_by_width`, byte `len()`), so a double-width glyph counts as 1 column; lines with CJK overflow the terminal. Static (no `wcwidth`). Fitness, not POSIX-mandated.
-- [ ] **`unreachable!()` arms assume parser invariants** — e.g. `format_rs_block` (`formatter.rs:3013`/`2982`) and `format_inline_macro` (`formatter.rs:3287`) panic on unexpected AST shapes; reachability depends on parser guarantees (not independently triggered here — see appendix).
+- [x] **Emphasis (Major #4)**, **terminal width (Major #7)** and **`.Bl -width` (Minor #13)** all conform — overstrike emphasis gated on a tty, `COLUMNS` honored (tests `columns_env_sets_width`, `columns_zero_does_not_underflow`, `bl_width_above_20_is_honored`).
+- [x] **Wide/CJK characters CONFORM** — `display_width` measures terminal cells via `unicode-width`, and the wrapper, `\w'…'`, the three-part header/footer and the tbl layout all route through it. Previously a CJK paragraph wrapped at twice the terminal width (130 columns into a 78-column terminal) and combining marks wrapped early. Tests `wide_and_combining_characters_measure_in_cells`, `wide_characters_wrap_at_the_terminal_width`, `width_escape_counts_terminal_cells`.
+- [x] **`unreachable!()` arms** — all seven input-reachable arms are gone (see #9). The one remaining `unreachable!()` in the file is inside a test helper.
 
 ## Test coverage signal
 
 Existing tests render fixture mdoc files and compare output. Not covered (each is a "write a test" item):
-- [ ] `.Xr name` with a missing section (Critical #1) — no fixture exercises the crash.
-- [ ] Deeply nested macros / recursion depth (Critical #2).
-- [ ] A `man(7)`/roff page (Critical #3) — empty-render-with-exit-0.
-- [ ] Emphasis macros (`.Sy`/`.Em`) and `\fB…\fR` escapes (Major #4/#5) producing styled/clean output.
-- [ ] `PAGER` not invoked when stdout is not a terminal (Major #6).
-- [ ] Width honoring a wide terminal / `COLUMNS` (Major #7).
-- [ ] `-k` ERE semantics (Major #8) and the native-vs-`apropos` fallback.
+- [x] `.Xr name` with a missing section (Critical #1) — `xr_missing_section_does_not_crash`.
+- [x] Deeply nested macros / recursion depth (Critical #2) — `deeply_nested_macros_rejected`.
+- [x] A `man(7)`/roff page (Critical #3) — `man7_page_renders`, `man7_empty_page_errors`.
+- [x] Emphasis macros (`.Sy`/`.Em`) and `\fB…\fR` escapes (Major #4/#5) — `sy_is_bold_overstrike`, `em_and_ar_are_underline_overstrike`, `font_escapes_styled_when_on`, `font_escapes_stripped_when_off`, `italic_corrections_are_removed`.
+- [x] `PAGER` not invoked when stdout is not a terminal (Major #6) — `pager_not_invoked_when_piped`.
+- [x] Width honoring a wide terminal / `COLUMNS` (Major #7) — `columns_env_sets_width`, `columns_zero_does_not_underflow`.
+- [x] `-k` ERE semantics (Major #8) and the native-vs-`apropos` fallback — `apropos_regex_keyword_does_not_crash`, `apropos_with_keywords`.
 - [x] Non-UTF-8 page content (Minor #10) — `non_utf8_page_renders`; `.It` outside `.Bl` (Minor #11) — `stray_it_renders`.
 
 ## Suggested PR groupings

@@ -15,7 +15,7 @@ pub mod formatter;
 pub mod man7;
 /// Store [`Macro`] enum
 pub mod mdoc_macro;
-/// Hand-written mdoc/man parsers (replacing pest; selected via MAN_PARSER=v2)
+/// Hand-written mdoc/man parsers (pest and its grammar have been removed)
 pub mod parse;
 /// Converts input mdoc file macros to AST
 pub mod parser;

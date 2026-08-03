@@ -19,7 +19,6 @@ terminfo = "0.9"
 unicode-width.workspace = true
 
 [dev-dependencies]
-rstest = "0.25"
 
 [lints]
 workspace = true

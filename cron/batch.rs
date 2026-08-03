@@ -8,10 +8,8 @@
 //
 
 use chrono::Utc;
-use cron::spool::{at, print_err_and_exit};
+use cron::spool::{at, print_err_and_exit, read_commands_from_stdin};
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-
-use std::io::{BufRead, Write};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     setlocale(LocaleCategory::LcAll, "");
@@ -21,32 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // batch is `at now`: schedule for the current absolute instant (audit #B4).
     let time = Utc::now();
 
-    let cmd = {
-        let stdout = std::io::stdout();
-        let mut stdout_lock = stdout.lock();
-
-        writeln!(&mut stdout_lock, "at {}", time.to_rfc2822())?;
-        write!(&mut stdout_lock, "at> ")?;
-        stdout_lock.flush()?;
-
-        let stdin = std::io::stdin();
-        let mut stdin_lock = stdin.lock();
-
-        let mut result = Vec::new();
-        let mut buf = String::new();
-
-        while stdin_lock.read_line(&mut buf)? != 0 {
-            write!(&mut stdout_lock, "at> ")?;
-            stdout_lock.flush()?;
-
-            result.push(buf.to_owned());
-        }
-
-        writeln!(&mut stdout_lock, "<EOT>")?;
-        stdout_lock.flush()?;
-
-        result.join("\n")
-    };
+    let cmd = read_commands_from_stdin("batch", &time)?;
 
     // batch is equivalent to `at -q b -m now`.
     let _ = at(Some('b'), &time, cmd, true).inspect_err(|err| print_err_and_exit(1, err));

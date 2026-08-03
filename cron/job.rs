@@ -8,6 +8,7 @@
 //
 
 use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, Timelike};
+use gettextrs::gettext;
 use std::collections::BTreeSet;
 use std::ffi::CStr;
 use std::iter::Peekable;
@@ -746,7 +747,10 @@ impl CronJob {
         {
             // SAFETY: called in the forked child before exec.
             if let Err(e) = unsafe { drop_privileges(uid, gid, name) } {
-                eprintln!("crond: cannot drop privileges for {name}: {e}");
+                eprintln!(
+                    "crond: {} {name}: {e}",
+                    gettext("cannot drop privileges for")
+                );
                 std::process::exit(1);
             }
         }
@@ -783,7 +787,7 @@ impl CronJob {
         let mut child = match command.spawn() {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("crond: cannot run job: {e}");
+                eprintln!("crond: {}: {e}", gettext("cannot run job"));
                 std::process::exit(1);
             }
         };
@@ -1011,4 +1015,27 @@ fn convert_weekdays_to_monthdays(date: NaiveDate, days: WeekDay) -> MonthDay {
     }
 
     MonthDay(Some(result))
+}
+
+#[cfg(test)]
+mod mail_tests {
+    use super::*;
+
+    // #D8/#A9: the recipient is validated before being handed to the MTA, so a
+    // crafted MAILTO cannot inject headers or split arguments. This is the
+    // security-relevant half of the mailing path; actually piping to an MTA
+    // needs a daemon and a local sendmail.
+    //
+    // The rest of #D4/#D5 is already covered by the crond suite
+    // (job_env_defaults_and_safe_overrides, command_field_* in
+    // tests/crond/mod.rs); no need to duplicate it here.
+    #[test]
+    fn mail_recipient_validation_rejects_injection() {
+        assert!(recipient_is_safe("alice"));
+        assert!(recipient_is_safe("alice@example.com"));
+        assert!(!recipient_is_safe(""), "empty recipient");
+        assert!(!recipient_is_safe("alice root"), "embedded space");
+        assert!(!recipient_is_safe("a\nBcc: root"), "header injection");
+        assert!(!recipient_is_safe("<root>"), "angle brackets");
+    }
 }

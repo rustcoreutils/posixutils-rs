@@ -8,7 +8,7 @@
 //
 
 use clap::Parser;
-use cron::spool::{at, get_job_dir, print_err_and_exit};
+use cron::spool::{at, get_job_dir, print_err_and_exit, read_commands_from_stdin};
 use gettextrs::gettext;
 use timespec::Timespec;
 
@@ -16,7 +16,7 @@ use std::{
     collections::BTreeMap,
     fmt::Display,
     fs::{self, File},
-    io::{BufRead, IsTerminal, Read, Write},
+    io::Read,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     str::FromStr,
@@ -89,9 +89,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(queue) = args.queue {
         if !queue.is_ascii_lowercase() {
-            return Err(
-                "Invalid queue name. Queue must be a single lowercase ASCII letter.".into(),
-            );
+            return Err(gettext(
+                "Invalid queue name. Queue must be a single lowercase ASCII letter.",
+            )
+            .into());
         }
     }
 
@@ -102,12 +103,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             || args.mail
             || args.queue.is_some()
         {
-            return Err("Option '-r' cannot be used with '-l', '-t', '-m', '-q' or '-f'".into());
+            return Err(
+                gettext("Option '-r' cannot be used with '-l', '-t', '-m', '-q' or '-f'").into(),
+            );
         }
         let ids = parse_job_ids(&args.operands)?;
         if ids.is_empty() {
             // POSIX: `at -r at_job_id...` requires at least one operand.
-            return Err("at -r requires at least one at_job_id operand".into());
+            return Err(gettext("at -r requires at least one at_job_id operand").into());
         }
         remove_jobs(&ids)?;
         return Ok(());
@@ -115,11 +118,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if args.list {
         if args.time.is_some() || args.file.is_some() || args.mail {
-            return Err("Option '-l' cannot be used with '-t', '-m' or -f".into());
+            return Err(gettext("Option '-l' cannot be used with '-t', '-m' or -f").into());
         }
         let ids = parse_job_ids(&args.operands)?;
         if args.queue.is_some() && !ids.is_empty() {
-            return Err("at -l -q queuename cannot be used with at_job_id operands".into());
+            return Err(
+                gettext("at -l -q queuename cannot be used with at_job_id operands").into(),
+            );
         }
 
         let list = list_jobs(get_job_dir()?);
@@ -149,9 +154,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Submission path: a -t time_arg, or a timespec built from the operands.
     let time = match (&args.time, args.operands.is_empty()) {
         (Some(_), false) => {
-            return Err("a timespec and the -t option cannot be used together".into())
+            return Err(gettext("a timespec and the -t option cannot be used together").into())
         }
-        (None, true) => print_err_and_exit(1, "you need a timespec or the -t option"),
+        (None, true) => print_err_and_exit(1, gettext("you need a timespec or the -t option")),
         (Some(time_arg), true) => time::parse_time_posix(time_arg)?,
         (None, false) => {
             // Operands are concatenated and all white space stripped, per the
@@ -164,7 +169,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect();
             Timespec::from_str(&timespec)?
                 .to_date_time()
-                .ok_or("Failed to parse `timespec`: date out of range?")?
+                .ok_or_else(|| gettext("Failed to parse `timespec`: date out of range?"))?
         }
     };
 
@@ -177,48 +182,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             let mut file = File::open(path)
-                .map_err(|e| format!("Failed to open command file. Reason: {e}"))?;
+                .map_err(|e| format!("{}: {e}", gettext("Failed to open command file")))?;
 
             let mut buf = String::new();
             file.read_to_string(&mut buf)
-                .map_err(|e| format!("Failed to read command file. Reason: {e}"))?;
+                .map_err(|e| format!("{}: {e}", gettext("Failed to read command file")))?;
 
             buf
         }
-        None => read_commands_from_stdin(&time)?,
+        None => read_commands_from_stdin("at", &time)?,
     };
 
     let _ = at(args.queue, &time, cmd, args.mail).inspect_err(|err| print_err_and_exit(1, err));
 
     Ok(())
-}
-
-/// Read the at-job commands from standard input. Prompts are written only when
-/// standard input is a terminal (audit #A10).
-fn read_commands_from_stdin(time: &chrono::DateTime<chrono::Utc>) -> std::io::Result<String> {
-    let stdin = std::io::stdin();
-    let mut cmd = String::new();
-
-    if stdin.is_terminal() {
-        let mut out = std::io::stdout().lock();
-        writeln!(out, "at {}", time.to_rfc2822())?;
-        let mut line = String::new();
-        loop {
-            write!(out, "at> ")?;
-            out.flush()?;
-            line.clear();
-            if stdin.lock().read_line(&mut line)? == 0 {
-                break;
-            }
-            cmd.push_str(&line);
-        }
-        writeln!(out, "<EOT>")?;
-        out.flush()?;
-    } else {
-        stdin.lock().read_to_string(&mut cmd)?;
-    }
-
-    Ok(cmd)
 }
 
 /// Checks if the file name matches the job format
@@ -291,7 +268,7 @@ fn remove_jobs(job_ids: &[u32]) -> Result<(), String> {
 
             // Only the job's owner (or root) may remove it (audit #A7).
             let meta = fs::symlink_metadata(&file_path)
-                .map_err(|e| format!("Could not stat job {}: {}", job_id, e))?;
+                .map_err(|e| format!("{} {}: {}", gettext("Could not stat job"), job_id, e))?;
             if uid != 0 && meta.uid() != uid {
                 return Err(format!("you do not own job {}", job_id));
             }
@@ -304,7 +281,11 @@ fn remove_jobs(job_ids: &[u32]) -> Result<(), String> {
                 ));
             }
         } else {
-            return Err(format!("The job with ID {} was not found.", job_id));
+            return Err(format!(
+                "{} {}",
+                gettext("The job with ID was not found:"),
+                job_id
+            ));
         }
     }
     Ok(())
@@ -341,6 +322,7 @@ where
 
 mod time {
     use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone, Utc};
+    use gettextrs::gettext;
 
     // Copy from `touch`
     pub fn parse_time_posix(time: &str) -> Result<DateTime<Utc>, Box<dyn std::error::Error>> {
@@ -401,7 +383,7 @@ mod time {
                 &time[10..12],
             ),
             _ => {
-                return Err("Invalid time format".into());
+                return Err(gettext("Invalid time format").into());
             }
         };
 
@@ -418,11 +400,11 @@ mod time {
         // instant for storage (audit #A5).
         let naive = NaiveDate::from_ymd_opt(year, month, day)
             .and_then(|d| d.and_hms_opt(hour, minute, secs))
-            .ok_or("Invalid time")?;
+            .ok_or_else(|| gettext("Invalid time"))?;
         let dt = Local
             .from_local_datetime(&naive)
             .single()
-            .ok_or("Invalid or ambiguous local time")?;
+            .ok_or_else(|| gettext("Invalid or ambiguous local time"))?;
         Ok(dt.with_timezone(&Utc))
     }
 }

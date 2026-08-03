@@ -13,6 +13,7 @@
 //! the two stay in lock-step (audit #B7).
 
 use chrono::{DateTime, Utc};
+use gettextrs::gettext;
 use libc::{getpwuid, getuid, passwd};
 
 use std::{
@@ -103,11 +104,11 @@ pub fn at(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let jobno = next_job_id()?;
     let job_filename = job_file_name(jobno, queue, execution_time)
-        .ok_or("Failed to generate file name for job")?;
+        .ok_or_else(|| gettext("Failed to generate file name for job"))?;
 
-    let user = User::current().ok_or("Failed to get current user")?;
+    let user = User::current().ok_or_else(|| gettext("Failed to get current user"))?;
     if !is_user_allowed(&user.name) {
-        return Err(format!("Access denied for user: {}", user.name).into());
+        return Err(format!("{}: {}", gettext("Access denied for user"), user.name).into());
     }
 
     let job = Job::new(&user, std::env::current_dir()?, std::env::vars(), cmd, mail).into_script();
@@ -122,7 +123,7 @@ pub fn at(
 
     let mut file = file_opt
         .open(&file_path)
-        .map_err(|e| format!("Failed to create file with job. Reason: {e}"))?;
+        .map_err(|e| format!("{}: {e}", gettext("Failed to create file with job")))?;
 
     // Own the job file to the submitting (real) user. crond resolves an at-job's
     // run-as identity from the file's owner, so a set-uid-root `at` must not
@@ -444,13 +445,17 @@ impl User {
 
             let name = CStr::from_ptr(pw_name).to_str().ok()?.to_owned();
 
-            let shell = if pw_shell.is_null() {
-                std::env::var("SHELL").unwrap_or_else(|_| DEFAULT_SHELL.to_owned())
-            } else {
-                CStr::from_ptr(pw_shell)
-                    .to_str()
-                    .unwrap_or(DEFAULT_SHELL)
-                    .to_owned()
+            // #B6: POSIX (batch.md 86991-86994) makes `SHELL` authoritative for
+            // the command interpreter that runs an at-job, and mandates that
+            // when it is "unset or null, sh shall be used". Consulting the
+            // passwd shell first inverted that -- and left the unset case
+            // running the login shell rather than sh, which the spec does not
+            // permit. The passwd entry is no longer consulted for job
+            // execution; only `$SHELL`, then `sh`.
+            let _ = pw_shell;
+            let shell = match std::env::var("SHELL") {
+                Ok(v) if !v.is_empty() => v,
+                _ => DEFAULT_SHELL.to_owned(),
             };
 
             Some(Self {
@@ -475,6 +480,50 @@ unsafe fn resolve_passwd() -> Option<*const passwd> {
     } else {
         Some(pw_ptr)
     }
+}
+
+/// Read at-job commands from standard input.
+///
+/// Prompts are written only when standard input is a terminal (audit #A10):
+/// in a pipeline the banner, the `at> ` prompts and `<EOT>` would otherwise be
+/// interleaved into stdout, which POSIX reserves for the `-l` listing.
+///
+/// `prog` names the invoking utility so `batch` does not announce itself as
+/// `at` (#B8).
+///
+/// Shared by `at` and `batch`. `batch` used to carry its own copy that never
+/// cleared the line buffer between `read_line` calls, so every line was
+/// re-appended to the accumulated command and earlier lines executed more than
+/// once (#B9).
+pub fn read_commands_from_stdin(
+    prog: &str,
+    time: &chrono::DateTime<chrono::Utc>,
+) -> std::io::Result<String> {
+    use std::io::{BufRead, IsTerminal, Read, Write};
+
+    let stdin = std::io::stdin();
+    let mut cmd = String::new();
+
+    if stdin.is_terminal() {
+        let mut out = std::io::stdout().lock();
+        writeln!(out, "{} {}", prog, time.to_rfc2822())?;
+        let mut line = String::new();
+        loop {
+            write!(out, "{}> ", prog)?;
+            out.flush()?;
+            line.clear();
+            if stdin.lock().read_line(&mut line)? == 0 {
+                break;
+            }
+            cmd.push_str(&line);
+        }
+        writeln!(out, "<EOT>")?;
+        out.flush()?;
+    } else {
+        stdin.lock().read_to_string(&mut cmd)?;
+    }
+
+    Ok(cmd)
 }
 
 #[cfg(test)]

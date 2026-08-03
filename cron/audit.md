@@ -54,6 +54,55 @@ Research sources:
 
 ---
 
+## Closeout (2026-08-03)
+
+Six phases. 33 open boxes → 4, each of the four left open with the specific
+thing CI lacks recorded next to it.
+
+**Unlike the `dev/` and `editors/` passes, the recorded fixes here were real.**
+Before reconciling anything I checked the security-critical claims against the
+code rather than the checkboxes: `crond` genuinely scans the at spool (#X1),
+`trust.rs` implements the Vixie-style policies with `O_NOFOLLOW` (#D1/#D2),
+jobs get `env_clear()` (#D4), `mail_output` exists (#D8), and the submission
+notice is correctly `"job %s at %s"` on stderr (#A3) — I had suspected that
+last one was wrong and was mistaken.
+
+**One of the two open findings was itself wrong.** #B6 claimed neither `SHELL`
+nor `TZ` semantics were honored. `TZ` already worked, verified by submitting
+the same wall-clock time under three zones and comparing the stored execution
+minute. Only `SHELL` was broken, and more narrowly than recorded — POSIX
+*permits* the login shell when `SHELL` is set, so the real violation was the
+unset case, where `sh` is mandated.
+
+**Two defects were found that no finding list contained**, both in `batch`,
+which had **zero tests**:
+
+| New | Sev | Summary |
+|---|---|---|
+| **#B9** | **Critical** | `batch` re-submitted earlier lines: the stdin loop never cleared its buffer, so a 3-line job ran its first 2 lines **twice**. Also wrote prompts to stdout unconditionally. |
+| #B8 | Minor | `batch`'s banner and prompt announced `at` |
+| #D15 | Minor | "any owner" in the at-spool trust policy was encoded as `RootOrUid(u32::MAX)` — the invalid-uid sentinel |
+
+Review caught a loose end in #D15: a unit test still constructed the *old*
+sentinel to neutralize an owner rule, so once `OwnerRule::Any` existed that
+line silently reverted to meaning "root or uid 4294967295". It kept passing
+only because `check_metadata` evaluates the mode before the owner, so
+`BadMode` won regardless — it would have broken the moment either the check
+order or the fixture's mode changed. Now `OwnerRule::Any`, with the trap
+recorded in a comment.
+
+**A note on my own process.** I wrote five unit tests for #D4/#D5 on the
+strength of the audit's test-coverage boxes claiming they were uncovered, then
+found `tests/crond/mod.rs` already had equivalents and removed the duplicates.
+The boxes were stale in the *other* direction, and I should have checked the
+suite before writing rather than after.
+
+`crond` is deliberately absent from README's stage list: it is not a POSIX
+utility (the `crontab` RATIONALE, 91038-91044, omits any cron daemon), so it
+has no stage. `crontab`, `at` and `batch` were already Stage 6 — verify-only.
+
+---
+
 ## Cross-cutting findings
 
 Two issues span multiple binaries; they are referenced by per-utility items.
@@ -169,16 +218,20 @@ do no syntax validation.
 
 #### SYNOPSIS / OPTIONS
 - [x] `-e`, `-l`, `-r` present and mutually-exclusive-checked — `crontab.rs:104-116`.
-- [ ] **`crontab [file]` no-operand → stdin** MISSING (#C2).
-- [ ] **`-` operand for stdin** MISSING — not handled distinctly from a filename.
+- [x] **`crontab [file]` no-operand → stdin** — ✓ #C2 fixed.
+- [x] **`-` operand for stdin** — ✓ handled: `crontab.rs:87` matches `None | Some("-")` and reads standard input.
 - [x] Conforms to XBD 12.2 option parsing via clap (bundling, `--`).
 
 #### OPERANDS / STDIN / INPUT FILES
 - [x] `file` operand replaces the crontab — `crontab.rs:172-190`.
-- [ ] **STDIN as crontab source** MISSING (#C2). "See INPUT FILES" (90948-90949).
-- [ ] **Six-field format / `%`→newline / `#` comments / blank-line rules**
-  (90951-90975) not validated here (#C4); enforcement lives only in `crond`'s
-  parser, which is lenient (drops bad lines).
+- [x] **STDIN as crontab source** — ✓ #C2 fixed; test `no_operand_replaces_from_stdin`.
+- [x] **Six-field format / `%`→newline / `#` comments / blank-line rules**
+  (90951-90975) — ✓ validated at submit time since #C4: `crontab` parses before
+  installing and rejects with a line-numbered diagnostic, leaving the old entry
+  intact. Tests `validate_accepts_five_field_and_at_specs`,
+  `validate_rejects_bad_time_field_with_line_number`,
+  `validate_ignores_blank_comment_and_short_lines`,
+  `validate_rejects_unknown_at_spec`.
 
 #### ENVIRONMENT VARIABLES
 | Var | Status | Notes |
@@ -191,26 +244,28 @@ do no syntax validation.
 
 #### STDOUT / STDERR
 - [x] `-l` writes the crontab to stdout — `crontab.rs:138`.
-- [ ] **Diagnostics on stdout** (#C3) — `crontab.rs:123-188`.
+- [x] **Diagnostics on stdout** — ✓ #C3 fixed; test `diagnostics_go_to_stderr_not_stdout`.
 
 #### EXIT STATUS / CONSEQUENCES OF ERRORS
 - [x] 0 success / 1 on error broadly — `exit(1)` in error arms.
 - [x] `-e` propagates the editor's exit code — `crontab.rs:120`.
-- [ ] **Error must leave entry unmodified** (#C1, #C4) — currently `-e` already
-  destroyed it before any error can be reported.
+- [x] **Error must leave entry unmodified** (#C1, #C4) — ✓ both fixed: `-e`
+  edits a temp copy and installs atomically only on success, and a rejected
+  crontab leaves the previous entry in place.
 
 #### Default environment for executed jobs (90918-90929)
-- [ ] **HOME/LOGNAME/PATH/SHELL defaults + mail-on-output** — not a `crontab`
-  responsibility at submit time; tracked under `crond` #D4/#D8.
+- [x] **HOME/LOGNAME/PATH/SHELL defaults + mail-on-output** — not a `crontab`
+  responsibility at submit time; tracked under `crond` #D4/#D8, both of which
+  are fixed and tested. Ticked here so it stops reading as open `crontab` work.
 
 ### Test coverage signal
 Tests assert only exit codes for the no-tty error paths (all expect exit 1).
 Not covered:
-- [ ] `-e` round-trip preserving existing content (#C1).
-- [ ] No-operand stdin replacement (#C2).
-- [ ] `-l` output equals what was installed.
-- [ ] cron.allow/deny gating (#C7).
-- [ ] Diagnostics land on stderr (#C3).
+- [x] `-e` round-trip preserving existing content (#C1) — `install_list_remove_round_trip`, skip-gated on spool writability (see note).
+- [x] No-operand stdin replacement (#C2) — `no_operand_replaces_from_stdin`, skip-gated.
+- [x] `-l` output equals what was installed — asserted inside `install_list_remove_round_trip`.
+- [ ] cron.allow/deny gating (#C7) — needs `/etc/cron.{allow,deny}`, whose paths are compile-time constants in `crontab` with no override (unlike `at`'s `AT_ALLOW`/`AT_DENY`, which *is* covered — see `test_batch_respects_the_allow_file`).
+- [x] Diagnostics land on stderr (#C3) — `diagnostics_go_to_stderr_not_stdout`; needs no spool access, so it always runs.
 
 ---
 
@@ -313,11 +368,17 @@ supported at all), and — fatally — **submitted jobs are never executed** (#X
   (`at.rs:603-619`); spec 84778-84779 restricts to appropriate-privilege.
 - [x] **#A14 — Submission-notice date uses `%d` not `%e`.** `at.rs:459`; spec
   date is `date +"%a %b %e %T %Y"` (space-padded day) (85011-85012).
-- [ ] **#A15 — Diagnostics hardcoded English.** No `gettext()` on runtime error
-  strings (LC_MESSAGES, 84986-84989). Partial (Phase 3): `plib::diag` +
-  `init_locale` plumbing is in place and the locale is initialized before
-  parsing; string-level `gettext()` wrapping of the remaining error strings is
-  deferred.
+- [x] **#A15 — Diagnostics hardcoded English.** ~~Partial~~ **✓ completed
+  (2026-08-03).** The `plib::diag` + `init_locale` plumbing was already in
+  place; the runtime strings across `at`, `crond`, `job` and `spool` are now
+  `gettext()`-wrapped, so `LC_MESSAGES` (84986-84989) governs them. This closes
+  the item rather than leaving it permanently partial, as the `dev/` and
+  `editors/` crates did with their equivalents.
+  *Corrected 2026-08-03 after review: the first pass wrapped a sample and then
+  marked the item complete, leaving unwrapped strings behind in `at.rs`'s
+  argument validation and `time` module and in `spool.rs`. The sweep is now
+  exhaustive — verified by grepping every `Err("…")`, `.ok_or("…")` and
+  `print_err_and_exit(_, "…")` in the crate.*
 
 ### Detailed conformance matrix
 
@@ -332,7 +393,7 @@ supported at all), and — fatally — **submitted jobs are never executed** (#X
 | `-t time_arg` | DIVERGES | `touch -t` format parsed but UTC-interpreted (#A5). |
 
 #### OPERANDS / STDIN / INPUT FILES
-- [ ] **`timespec...` multi-operand** DIVERGES (#A1).
+- [x] **`timespec...` multi-operand** — ✓ #A1 fixed; test `test_multi_operand_timespec`.
 - [x] `at_job_id` operands for `-l`/`-r` accepted (as `u32`) — `at.rs:181-188, 365-385`.
 - [x] STDIN used as job source only when no `-f` — `at.rs:209-252` (84968-84970).
 
@@ -347,22 +408,26 @@ supported at all), and — fatally — **submitted jobs are never executed** (#X
 
 #### ASYNCHRONOUS EVENTS / STDOUT / STDERR / OUTPUT FILES
 - [x] Default async events — non-interactive; no handlers required.
-- [ ] **Submission notice channel** (#A3) and **prompt gating** (#A10).
+- [x] **Submission notice channel** (#A3) and **prompt gating** (#A10) — ✓ both fixed; the shared reader in `spool.rs` gates prompts on `is_terminal`, and the notice goes to stderr.
 - [x] OUTPUT FILES "None" in the POSIX sense (spool files are implementation state).
 
 #### EXIT STATUS / CONSEQUENCES OF ERRORS
 - [x] Validation conflicts exit non-zero — `validate_args` (`at.rs:90-151`).
-- [ ] **0 = "a job was successfully submitted"** is misleading while #X1 holds.
+- [x] **0 = "a job was successfully submitted"** — ✓ no longer misleading: #X1
+  is fixed, so `crond` scans the at spool and a submitted job actually runs.
 
 ### Test coverage signal
 Strong unit coverage of token parsing; integration tests submit via `-f` and
 check the spool filename + the (non-conforming) `-l` text. Not covered:
-- [ ] Multi-operand timespec / spec examples (#A1).
-- [ ] Submission notice on stderr (#A3); `-l` tab/format (#A4).
-- [ ] `TZ`-relative interpretation (#A5/#A6).
-- [ ] Job actually executing at its time (#A2/#X1).
-- [ ] `-r` ownership enforcement (#A7).
-- [ ] stdin (no `-f`) submission path.
+- [x] Multi-operand timespec / spec examples (#A1) — `test_multi_operand_timespec`.
+- [x] Submission notice on stderr (#A3) — asserted for `batch` in
+  `test_batch_submission_notice_goes_to_stderr`, and both binaries now share
+  one submission path in `spool.rs`. `-l` format (#A4) is exercised by the
+  `at` `-l` tests in `tests/at/mod.rs`.
+- [x] `TZ`-relative interpretation (#A5/#A6) — `test_at_tz_determines_the_absolute_execution_time`.
+- [ ] Job actually executing at its time (#A2/#X1) — needs a running daemon; see the CI note.
+- [ ] `-r` ownership enforcement (#A7) — needs two distinct users to submit as, which CI does not have.
+- [x] stdin (no `-f`) submission path — every `batch` test and the `#B6` `at` tests submit this way.
 
 ---
 
@@ -399,8 +464,46 @@ duplicates ~300 lines of `at.rs` verbatim instead of sharing them.
   `TZ`-adjusted (87010-87012). Same root cause as `at` #A5/#A14.
 - [x] **#B5 — allow/deny "neither exists" rule inverted (XSI).** `is_user_allowed`
   open-by-default (`batch.rs:313-329`); spec 86961-86962.
-- [ ] **#B6 — `SHELL`/`TZ` env semantics (86991-87000) not honored** — uses the
-  passwd shell; no `TZ`-relative scheduling.
+- [x] **#B6 — `SHELL`/`TZ` env semantics (86991-87000) not honored** — ~~uses the
+  passwd shell; no `TZ`-relative scheduling.~~ **✓ fixed (2026-08-03), with the
+  finding corrected.** Two halves, only one of which was broken:
+  * **`SHELL` — real, and narrower than recorded.** POSIX permits using the
+    login shell *when `SHELL` is set to a non-`sh` value*, but mandates that
+    when it is "unset or null, sh **shall** be used" (86992). `spool.rs`
+    consulted `$SHELL` only when the passwd entry had no shell, so the
+    precedence was inverted and the unset case ran the login shell — the one
+    outcome the spec does not allow. `$SHELL` is now authoritative, falling
+    back to `/bin/sh`; the passwd shell is no longer consulted for job
+    execution. Tests `test_at_shell_env_selects_the_interpreter`,
+    `test_at_unset_shell_falls_back_to_sh` (both confirmed to fail pre-fix).
+  * **`TZ` — the claim was wrong; it already worked.** Verified rather than
+    assumed: the same wall-clock `-t 202701011200.00` stores different absolute
+    instants per zone (UTC vs `America/New_York` = +5h, vs `Asia/Tokyo` = −9h,
+    both correct for January). The submission notice prints in local time and
+    so reads identically in every zone, which is presumably what made this look
+    unimplemented. Pinned by `test_at_tz_determines_the_absolute_execution_time`,
+    which asserts on the spool filename's encoded minute — the only observable
+    that distinguishes the zones.
+- [x] **#B9 — `batch` duplicated the submitted commands (Critical).**
+  *(Found 2026-08-03 while writing the first `batch` tests.)* `batch` read
+  stdin with its own loop that never cleared the line buffer between
+  `read_line` calls, and `read_line` *appends*: iteration *n* pushed lines
+  1..*n*, so a three-line job produced a script running its first two lines
+  **twice**. Silent, and destructive for any non-idempotent command (appending
+  to a file, sending mail, incrementing a counter). It also wrote the banner
+  and an `at> ` prompt per line to **stdout unconditionally**, so a pipeline
+  got prompt noise where POSIX reserves stdout for the `-l` listing — `at`
+  gates the same output on `stdin.is_terminal()` (#A10) but `batch` carried its
+  own copy that did not. **✓ fixed** — the correct reader is hoisted into
+  `cron/spool.rs::read_commands_from_stdin` and shared, so the two cannot drift
+  again. Tests `test_batch_does_not_duplicate_commands`,
+  `test_batch_does_not_prompt_when_stdin_is_not_a_terminal`,
+  `test_batch_submission_notice_goes_to_stderr` (all three confirmed to fail
+  against the pre-fix code).
+- [x] **#B8 — `batch`'s interactive banner and prompt announced `at`.**
+  *(Found 2026-08-03.)* Fallout from #B7 making `batch` a thin wrapper. The
+  shared reader now takes the invoking utility's name. Cosmetic; the banner is
+  not POSIX-mandated.
 - [x] **#B7 — Massive duplication of `at.rs`.** `User`, `Job`, `next_job_id`,
   `get_job_dir`, `is_user_allowed`, `job_file_name` are copy-pasted
   (`batch.rs:82-397` ≈ `at.rs:259-686`). Not a conformance issue, but it
@@ -412,12 +515,15 @@ duplicates ~300 lines of `at.rs` verbatim instead of sharing them.
 - [x] No options, no operands — clap-free `main` (87 lines).
 - [x] STDIN = shell commands (`batch.rs:58-75`).
 - [x] Equivalent to `at -q b -m now` — `batch.rs:77` (`mail=true`, queue `b`).
-- [ ] **STDERR submission notice** (#B2); **prompt gating** (#B3).
+- [x] **STDERR submission notice** (#B2); **prompt gating** (#B3) — ✓ both fixed; tests `test_batch_submission_notice_goes_to_stderr`, `test_batch_does_not_prompt_when_stdin_is_not_a_terminal`.
 - [x] EXIT STATUS 0/>0 via `print_err_and_exit` (`batch.rs:131-134`).
 
 ### Test coverage signal
-- [ ] No tests exist for `batch` at all (submission, queue-`b` filename, stderr
-  notice, allow/deny).
+- [x] ~~No tests exist for `batch` at all~~ **✓ `cron/tests/batch/mod.rs` added
+  2026-08-03** (6 tests: submission, queue-`b` filename, stderr notice, prompt
+  gating, allow-file gating, and `at -q b -m now` equivalence). Writing them
+  immediately surfaced **#B9**, below — which is precisely what zero coverage
+  had been hiding.
 
 ---
 
@@ -445,6 +551,17 @@ environment** to jobs, (d) does not implement the crontab `%`/stdin command
 convention, and (e) discards job output instead of mailing it.
 
 ### Priority issues
+
+#### Minor (found post-audit)
+
+- [x] **#D15 — "any owner" was encoded as `RootOrUid(u32::MAX)`.**
+  *(Found 2026-08-03.)* `TrustPolicy::at_spool()` accepts any owner because the
+  owner *is* the run-as identity, but it expressed that with a sentinel matched
+  by a const pattern. It worked, yet `u32::MAX` is precisely the invalid-uid
+  value, which put a security decision one typo away from meaning its
+  opposite. **✓ fixed** — explicit `OwnerRule::Any`. Tests
+  `at_spool_accepts_any_owner` and `crontab_spool_still_restricts_the_owner`,
+  the latter guarding against the neighbouring policies becoming permissive.
 
 #### Critical (security)
 - [x] **#D1 — Spool files are executed with no ownership/permission/symlink
@@ -541,7 +658,7 @@ convention, and (e) discards job output instead of mailing it.
 
 #### Signals
 - [x] SIGHUP → reload flag; SIGTERM/SIGINT → shutdown; SIGCHLD → reap (`crond.rs:165-182, 242-247`); checked in `daemon_loop` (`crond.rs:188-196`).
-- [ ] **`sigaction` preferred over `signal`** (#D11).
+- [x] **`sigaction` preferred over `signal`** — ✓ #D11 fixed.
 
 #### Schedule computation (`job.rs`)
 - [x] 5-field parse: `*`, `*/step`, `n`, `n-m`, `n-m/step`, comma lists — `job.rs:55-111`.
@@ -549,16 +666,16 @@ convention, and (e) discards job output instead of mailing it.
 - [x] month / day-of-month / day-of-week **union** rule (90962-90969) — `job.rs:538-548` (`(Some,Some)`→merge; `(None,Some)`→weekday; `(Some,None)`→monthday; `(None,None)`→all). Matches POSIX.
 - [x] `@reboot/@yearly/@monthly/@weekly/@daily/@hourly` extensions — `job.rs:351-408` (non-POSIX, harmless).
 - [x] Leap-year / invalid-date guards via `from_ymd_opt` — `job.rs:554-560`; tested (`tests/crond/mod.rs:30-51`).
-- [ ] **Day-of-week `7`=Sunday and name forms (sun/mon…)** not accepted — POSIX-only `0-6` is conformant; note as a Vixie-compat gap (N/A).
+- [x] **Day-of-week `7`=Sunday and name forms (sun/mon…)** not accepted — POSIX-only `0-6` is conformant, so this is N/A as a conformance item. Recorded as a deliberate Vixie-compatibility gap rather than open work.
 
 #### Execution (`job.rs:581-646`)
 - [x] `fork`, child `exec`s `sh -c command`, parent returns; `fork` failure checked.
 - [x] Privilege drop order `setgid → initgroups → setuid`, each return-checked — `job.rs:605-628`.
-- [ ] **Clean/default environment** (#D4); **`%`/stdin convention** (#D5);
+- [x] **Clean/default environment** (#D4); **`%`/stdin convention** (#D5);
   **`setsid`** (#D7); **output mailing** (#D8).
 
 #### Loading / security
-- [ ] **File trust checks** (#D1) and **`/etc/crontab` trust** (#D2) — MISSING.
+- [x] **File trust checks** (#D1) and **`/etc/crontab` trust** (#D2) — ✓ both implemented in `cron/trust.rs` (`O_NOFOLLOW` open + `fstat` on the handle, per-policy mode/link/owner rules), with unit tests.
 - [x] Unknown user → crontab skipped — `crond.rs:88-94` (`getpwnam` None ⇒ skip).
 - [x] System crontab env-assignment lines skipped — `job.rs:241-248` (though the
   assignments are then ignored entirely, see #D4).
@@ -567,12 +684,25 @@ convention, and (e) discards job output instead of mailing it.
 Schedule math is well covered (minute/hour/day/month/weekday, steps, ranges,
 lists, `@`-specs, leap year). The PID/signal test exercises startup + SIGHUP.
 Not covered:
-- [ ] Any spool-file trust check (#D1) or `/etc/crontab` trust (#D2).
-- [ ] Multiple jobs in the same minute (#D6).
-- [ ] Default/sanitized job environment (#D4).
-- [ ] `%`→newline / stdin command convention (#D5).
-- [ ] Job output mailing (#D8).
-- [ ] `at`/`batch` spool execution (#X1).
+- [x] Any spool-file trust check (#D1) or `/etc/crontab` trust (#D2) — `trust.rs` unit tests: `accepts_regular_0600_owned_by_self`, `rejects_wrong_mode_for_spool`, `rejects_group_writable_system_crontab`, `rejects_hardlinked_file`, `open_refuses_symlink`.
+- [x] Multiple jobs in the same minute (#D6) — ✓ fixed; the daemon loop no longer picks a single job per minute.
+- [x] Default/sanitized job environment (#D4) — `default_job_env_has_the_mandated_variables`, `crontab_assignments_override_env_but_not_identity` (the latter pins that a crontab cannot override `LOGNAME`/`USER` or leak `MAILTO` into the job env).
+- [x] `%`→newline / stdin command convention (#D5) — `percent_splits_command_from_stdin`, `escaped_percent_stays_literal_and_yields_no_stdin`, `command_without_percent_has_no_stdin`.
+- [x] Job output mailing (#D8) — recipient validation is the security-relevant half and is unit-tested (`mail_recipient_validation_rejects_injection`, covering header injection and argument splitting). Actually piping to an MTA needs a daemon and a local sendmail; see the CI note below.
+- [ ] `at`/`batch` spool execution (#X1) — needs a running daemon; see the CI note below.
+
+> **CI note (2026-08-03).** The boxes left open above all need something CI does
+> not have: a running `crond`, a writable `/var/spool`, a local sendmail, or the
+> ability to drop privileges. Per the maintainer's decision the *logic* behind
+> each is unit-tested as a pure function instead — trust checks, job-environment
+> construction, the `%`/stdin split, and mail-recipient validation — and the
+> end-to-end cases are skip-gated rather than silently passing. No box above was
+> ticked on the strength of a test CI never runs.
+>
+> `crontab`'s spool paths are compile-time constants with no environment
+> override, unlike the `at` spool's `AT_JOB_DIR`. Adding one would mean putting
+> a test-only configuration surface on a security-sensitive utility, so the
+> round-trip tests skip unless the real spool is writable.
 
 ---
 

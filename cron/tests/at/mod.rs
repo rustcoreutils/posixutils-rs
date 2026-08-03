@@ -348,3 +348,112 @@ fn test_multi_operand_timespec() {
 
     fs::remove_file(res_file).expect("Unable to remove test file");
 }
+
+// ============================================================================
+// SHELL / TZ environment semantics -- audit #B6
+// ============================================================================
+
+/// Submit one job with the given env and return the generated script's first
+/// line (the `#!` interpreter line) plus the spool filename.
+fn submit_and_read_script(env: &[(&str, &str)], args: &[&str]) -> (String, String) {
+    let _guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempdir().expect("tempdir");
+    let spool = dir.path().join("spool");
+    fs::create_dir_all(&spool).unwrap();
+    let allow = dir.path().join("at.allow");
+    fs::write(&allow, format!("{}\n", whoami())).unwrap();
+
+    let mut cmd = std::process::Command::new(plib::testing::get_binary_path("at"));
+    cmd.args(args)
+        .env("AT_JOB_DIR", &spool)
+        .env("AT_ALLOW", &allow)
+        .env_remove("AT_DENY")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for (k, v) in env {
+        if v.is_empty() && *k == "__UNSET_SHELL" {
+            cmd.env_remove("SHELL");
+        } else {
+            cmd.env(k, v);
+        }
+    }
+    let mut child = cmd.spawn().expect("spawn at");
+    use std::io::Write;
+    child.stdin.as_mut().unwrap().write_all(b"true\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "at failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let entry = fs::read_dir(&spool)
+        .unwrap()
+        .next()
+        .expect("a job file must be written")
+        .unwrap();
+    let name = entry.file_name().to_string_lossy().to_string();
+    let body = fs::read_to_string(entry.path()).unwrap();
+    let first = body.lines().next().unwrap_or_default().to_string();
+    (first, name)
+}
+
+fn whoami() -> String {
+    // Same identity `at` itself resolves: getpwuid(getuid()).
+    unsafe {
+        let pw = libc::getpwuid(libc::getuid());
+        assert!(!pw.is_null(), "no passwd entry for the test user");
+        std::ffi::CStr::from_ptr((*pw).pw_name)
+            .to_string_lossy()
+            .to_string()
+    }
+}
+
+#[test]
+fn test_at_shell_env_selects_the_interpreter() {
+    // #B6: POSIX (batch.md 86991-86993) makes SHELL authoritative for the
+    // command interpreter, and mandates `sh` when it is unset or null. The
+    // passwd shell used to win, so SHELL was consulted only when the passwd
+    // entry had none -- and an unset SHELL ran the login shell rather than sh.
+    let (shebang, _) =
+        submit_and_read_script(&[("SHELL", "/bin/zsh")], &["-m", "now", "+", "1", "hour"]);
+    assert_eq!(shebang, "#!/bin/zsh", "SHELL must select the interpreter");
+}
+
+#[test]
+fn test_at_unset_shell_falls_back_to_sh() {
+    // "If the variable is unset or null, sh shall be used" (86992).
+    let (shebang, _) =
+        submit_and_read_script(&[("__UNSET_SHELL", "")], &["-m", "now", "+", "1", "hour"]);
+    assert_eq!(shebang, "#!/bin/sh", "an unset SHELL must yield sh");
+
+    let (shebang, _) = submit_and_read_script(&[("SHELL", "")], &["-m", "now", "+", "1", "hour"]);
+    assert_eq!(shebang, "#!/bin/sh", "a null SHELL must yield sh");
+}
+
+#[test]
+fn test_at_tz_determines_the_absolute_execution_time() {
+    // #B6/#A5 (batch.md 86996-87000): the same wall-clock timespec submitted
+    // under different TZ values must resolve to different absolute instants.
+    // The spool filename encodes the execution minute, so it is the only
+    // observable that distinguishes them -- the submission notice is printed
+    // in local time and reads identically in every zone.
+    fn minute_of(tz: &str) -> u64 {
+        let (_, name) = submit_and_read_script(&[("TZ", tz)], &["-t", "202701011200.00"]);
+        u64::from_str_radix(&name[6..14], 16).expect("filename encodes the minute in hex")
+    }
+
+    let utc = minute_of("UTC");
+    let ny = minute_of("America/New_York");
+    let tokyo = minute_of("Asia/Tokyo");
+
+    // January: New York is UTC-5, so noon there is 5 hours later in absolute
+    // terms; Tokyo is UTC+9, so noon there is 9 hours earlier.
+    assert_eq!(
+        ny - utc,
+        5 * 60,
+        "America/New_York must be UTC-5 in January"
+    );
+    assert_eq!(utc - tokyo, 9 * 60, "Asia/Tokyo must be UTC+9");
+}

@@ -1016,3 +1016,97 @@ fn convert_weekdays_to_monthdays(date: NaiveDate, days: WeekDay) -> MonthDay {
 
     MonthDay(Some(result))
 }
+
+#[cfg(test)]
+mod job_semantics_tests {
+    use super::*;
+
+    // #D5: the crontab command field's `%` convention. The first unescaped `%`
+    // ends the command; everything after it is the job's standard input, with
+    // subsequent `%` characters becoming newlines and `\` escaping either.
+    #[test]
+    fn percent_splits_command_from_stdin() {
+        let p = parse_command_field("mail -s hi root%line one%line two");
+        assert_eq!(p.exec_line, "mail -s hi root");
+        assert_eq!(p.stdin.as_deref(), Some("line one\nline two"));
+    }
+
+    #[test]
+    fn escaped_percent_stays_literal_and_yields_no_stdin() {
+        let p = parse_command_field(r"echo 50\% done");
+        assert_eq!(p.exec_line, "echo 50% done");
+        assert!(
+            p.stdin.is_none(),
+            "an escaped % must not start the stdin section"
+        );
+    }
+
+    #[test]
+    fn command_without_percent_has_no_stdin() {
+        let p = parse_command_field("/usr/bin/backup --nightly");
+        assert_eq!(p.exec_line, "/usr/bin/backup --nightly");
+        assert!(p.stdin.is_none());
+    }
+
+    // #D4: jobs get a clean default environment (crontab.md 90918-90929), not
+    // crond's own, and the crontab may override it -- except for the identity
+    // and routing variables, which would otherwise let a crontab run as or mail
+    // to someone else.
+    #[test]
+    fn default_job_env_has_the_mandated_variables() {
+        let env = build_job_env("alice", "/home/alice", &[]);
+        let get = |k: &str| {
+            env.iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.as_str())
+                .unwrap_or_default()
+        };
+        assert_eq!(get("HOME"), "/home/alice");
+        assert_eq!(get("LOGNAME"), "alice");
+        assert_eq!(get("USER"), "alice");
+        assert_eq!(get("SHELL"), "/bin/sh");
+        assert!(!get("PATH").is_empty(), "PATH must be set");
+    }
+
+    #[test]
+    fn crontab_assignments_override_env_but_not_identity() {
+        let overrides = vec![
+            ("PATH".to_string(), "/opt/bin".to_string()),
+            ("LOGNAME".to_string(), "root".to_string()),
+            ("USER".to_string(), "root".to_string()),
+            ("MAILTO".to_string(), "attacker@example.com".to_string()),
+            ("MYVAR".to_string(), "x".to_string()),
+        ];
+        let env = build_job_env("alice", "/home/alice", &overrides);
+        let get = |k: &str| {
+            env.iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.as_str())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            get("PATH"),
+            "/opt/bin",
+            "ordinary variables are overridable"
+        );
+        assert_eq!(get("MYVAR"), "x", "new variables are added");
+        assert_eq!(get("LOGNAME"), "alice", "identity must not be overridable");
+        assert_eq!(get("USER"), "alice", "identity must not be overridable");
+        assert!(
+            !env.iter().any(|(k, _)| k == "MAILTO"),
+            "MAILTO is routing-only and must not reach the job environment"
+        );
+    }
+
+    // #D8/#A9: the mail recipient is validated before being handed to the MTA,
+    // so a crafted MAILTO cannot inject arguments or header syntax.
+    #[test]
+    fn mail_recipient_validation_rejects_injection() {
+        assert!(recipient_is_safe("alice"));
+        assert!(recipient_is_safe("alice@example.com"));
+        assert!(!recipient_is_safe(""), "empty recipient");
+        assert!(!recipient_is_safe("alice root"), "embedded space");
+        assert!(!recipient_is_safe("a\nBcc: root"), "header injection");
+        assert!(!recipient_is_safe("<root>"), "angle brackets");
+    }
+}

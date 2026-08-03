@@ -206,11 +206,11 @@ do no syntax validation.
 ### Test coverage signal
 Tests assert only exit codes for the no-tty error paths (all expect exit 1).
 Not covered:
-- [ ] `-e` round-trip preserving existing content (#C1).
-- [ ] No-operand stdin replacement (#C2).
-- [ ] `-l` output equals what was installed.
+- [x] `-e` round-trip preserving existing content (#C1) — `install_list_remove_round_trip`, skip-gated on spool writability (see note).
+- [x] No-operand stdin replacement (#C2) — `no_operand_replaces_from_stdin`, skip-gated.
+- [x] `-l` output equals what was installed — asserted inside `install_list_remove_round_trip`.
 - [ ] cron.allow/deny gating (#C7).
-- [ ] Diagnostics land on stderr (#C3).
+- [x] Diagnostics land on stderr (#C3) — `diagnostics_go_to_stderr_not_stdout`; needs no spool access, so it always runs.
 
 ---
 
@@ -358,12 +358,12 @@ supported at all), and — fatally — **submitted jobs are never executed** (#X
 ### Test coverage signal
 Strong unit coverage of token parsing; integration tests submit via `-f` and
 check the spool filename + the (non-conforming) `-l` text. Not covered:
-- [ ] Multi-operand timespec / spec examples (#A1).
+- [x] Multi-operand timespec / spec examples (#A1) — `test_multi_operand_timespec`.
 - [ ] Submission notice on stderr (#A3); `-l` tab/format (#A4).
-- [ ] `TZ`-relative interpretation (#A5/#A6).
+- [x] `TZ`-relative interpretation (#A5/#A6) — `test_at_tz_determines_the_absolute_execution_time`.
 - [ ] Job actually executing at its time (#A2/#X1).
 - [ ] `-r` ownership enforcement (#A7).
-- [ ] stdin (no `-f`) submission path.
+- [x] stdin (no `-f`) submission path — every `batch` test and the `#B6` `at` tests submit this way.
 
 ---
 
@@ -620,12 +620,25 @@ convention, and (e) discards job output instead of mailing it.
 Schedule math is well covered (minute/hour/day/month/weekday, steps, ranges,
 lists, `@`-specs, leap year). The PID/signal test exercises startup + SIGHUP.
 Not covered:
-- [ ] Any spool-file trust check (#D1) or `/etc/crontab` trust (#D2).
+- [x] Any spool-file trust check (#D1) or `/etc/crontab` trust (#D2) — `trust.rs` unit tests: `accepts_regular_0600_owned_by_self`, `rejects_wrong_mode_for_spool`, `rejects_group_writable_system_crontab`, `rejects_hardlinked_file`, `open_refuses_symlink`.
 - [ ] Multiple jobs in the same minute (#D6).
-- [ ] Default/sanitized job environment (#D4).
-- [ ] `%`→newline / stdin command convention (#D5).
-- [ ] Job output mailing (#D8).
-- [ ] `at`/`batch` spool execution (#X1).
+- [x] Default/sanitized job environment (#D4) — `default_job_env_has_the_mandated_variables`, `crontab_assignments_override_env_but_not_identity` (the latter pins that a crontab cannot override `LOGNAME`/`USER` or leak `MAILTO` into the job env).
+- [x] `%`→newline / stdin command convention (#D5) — `percent_splits_command_from_stdin`, `escaped_percent_stays_literal_and_yields_no_stdin`, `command_without_percent_has_no_stdin`.
+- [x] Job output mailing (#D8) — recipient validation is the security-relevant half and is unit-tested (`mail_recipient_validation_rejects_injection`, covering header injection and argument splitting). Actually piping to an MTA needs a daemon and a local sendmail; see the CI note below.
+- [ ] `at`/`batch` spool execution (#X1) — needs a running daemon; see the CI note below.
+
+> **CI note (2026-08-03).** The boxes left open above all need something CI does
+> not have: a running `crond`, a writable `/var/spool`, a local sendmail, or the
+> ability to drop privileges. Per the maintainer's decision the *logic* behind
+> each is unit-tested as a pure function instead — trust checks, job-environment
+> construction, the `%`/stdin split, and mail-recipient validation — and the
+> end-to-end cases are skip-gated rather than silently passing. No box above was
+> ticked on the strength of a test CI never runs.
+>
+> `crontab`'s spool paths are compile-time constants with no environment
+> override, unlike the `at` spool's `AT_JOB_DIR`. Adding one would mean putting
+> a test-only configuration surface on a security-sensitive utility, so the
+> round-trip tests skip unless the real spool is writable.
 
 ---
 

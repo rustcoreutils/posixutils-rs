@@ -804,3 +804,92 @@ fn test_cursor_bounds() {
     // Cursor should be clamped
     assert!(editor.get_cursor().column <= 2);
 }
+
+#[test]
+fn test_s_and_upper_s_behave_as_change_operators() {
+    // #V17: `s`/`S` were handled in the pre-parser fast path, so they saved
+    // nothing to a register and recorded no undo. They are now `c` over an
+    // implied range, so they must be indistinguishable from it -- including
+    // undo behavior.
+    let mut via_c = Editor::new_headless();
+    via_c.execute_keys("iabcdef\x1b0").unwrap();
+    via_c.execute_keys("clX\x1b").unwrap();
+    let c_after = via_c.get_buffer_text();
+    via_c.execute_keys("u").unwrap();
+    let c_undone = via_c.get_buffer_text();
+
+    let mut via_s = Editor::new_headless();
+    via_s.execute_keys("iabcdef\x1b0").unwrap();
+    via_s.execute_keys("sX\x1b").unwrap();
+    let s_after = via_s.get_buffer_text();
+    via_s.execute_keys("u").unwrap();
+    let s_undone = via_s.get_buffer_text();
+
+    assert_eq!(s_after, c_after, "`s` must match `cl`");
+    assert_eq!(
+        s_undone, c_undone,
+        "`s` must be undoable exactly as `cl` is -- it recorded no undo at all before"
+    );
+    assert_ne!(s_after, s_undone, "undo must actually change the buffer");
+}
+
+#[test]
+fn test_s_accepts_a_count() {
+    // The fast path ignored counts entirely, even though 's' was already in
+    // the command parser's table.
+    let mut editor = Editor::new_headless();
+    editor.execute_keys("iabcdef\x1b0").unwrap();
+    editor.execute_keys("3sX\x1b").unwrap();
+    assert_eq!(editor.get_buffer_text().trim_end(), "Xdef");
+}
+
+#[test]
+fn test_upper_s_substitutes_whole_lines() {
+    let mut editor = Editor::new_headless();
+    editor.execute_keys("iL1\nL2\nL3\x1b").unwrap();
+    editor.execute_keys("1G").unwrap();
+    editor.execute_keys("SX\x1b").unwrap();
+    let text = editor.get_buffer_text();
+    assert!(text.contains('X'), "S must replace the line: {:?}", text);
+    assert!(
+        !text.contains("L1"),
+        "the original line must be gone: {:?}",
+        text
+    );
+}
+
+#[test]
+fn test_insert_honors_configured_erase_and_kill_chars() {
+    // #V12: insert mode hardcoded ^H/^U. POSIX vi honors the terminal's
+    // `stty erase` and `stty kill` characters, which are now read from the
+    // termios captured before raw mode and carried into the insert session.
+    //
+    // Driven at the InsertState level because a headless editor has no
+    // terminal to read termios from -- the PTY suite covers the wiring.
+    use vi_rs::{process_insert_key, Buffer, InsertKind, InsertState, Key, Position};
+
+    let mut buffer = Buffer::from_text("");
+    let mut state = InsertState::new(InsertKind::Insert, Position::new(1, 0), 1);
+    state.erase_char = Some('#');
+    state.kill_char = Some('@');
+
+    for c in "abc".chars() {
+        process_insert_key(&mut buffer, Key::Char(c), &mut state).unwrap();
+    }
+    // '#' is this terminal's erase character, so it deletes rather than
+    // inserting a literal '#'.
+    process_insert_key(&mut buffer, Key::Char('#'), &mut state).unwrap();
+    assert_eq!(buffer.line(1).unwrap().content(), "ab");
+
+    // '@' is the kill character: discard back to the start of the line.
+    process_insert_key(&mut buffer, Key::Char('@'), &mut state).unwrap();
+    assert_eq!(buffer.line(1).unwrap().content(), "");
+
+    // With no erase/kill configured the same bytes are ordinary text.
+    let mut buffer = Buffer::from_text("");
+    let mut plain = InsertState::new(InsertKind::Insert, Position::new(1, 0), 1);
+    for c in "a#b".chars() {
+        process_insert_key(&mut buffer, Key::Char(c), &mut plain).unwrap();
+    }
+    assert_eq!(buffer.line(1).unwrap().content(), "a#b");
+}

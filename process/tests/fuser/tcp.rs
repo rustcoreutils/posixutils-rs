@@ -7,11 +7,10 @@
 // SPDX-License-Identifier: MIT
 //
 
-use super::fuser_test;
+use super::{fuser_test, parse_posix_pid_list};
 use std::{
     io,
     net::{TcpListener, TcpStream},
-    process::Command,
 };
 
 /// Starts a TCP server on a predefined local address and port.
@@ -55,13 +54,16 @@ fn test_fuser_tcp() {
     wait_for_tcp_server(port);
 
     fuser_test(vec![format!("{}/tcp", port)], "", 0, |_, output| {
-        let manual_output = Command::new("fuser")
-            .arg(format!("{}/tcp", port))
-            .output()
-            .unwrap();
-
         assert_eq!(output.status.code(), Some(0));
-        assert_eq!(output.stdout, manual_output.stdout);
+
+        // This test process owns the listening socket, so it must be reported.
+        let pids = parse_posix_pid_list(&output.stdout);
+        assert!(
+            pids.contains(&std::process::id()),
+            "fuser must report the process holding the TCP socket ({}), got {:?}",
+            std::process::id(),
+            pids
+        );
     });
 
     drop(server);

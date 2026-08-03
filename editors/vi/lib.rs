@@ -44,7 +44,7 @@ pub use input::{InputReader, Key};
 pub use mode::{enter_insert_mode, process_insert_key, InsertKind, InsertState, Mode};
 pub use options::Options;
 pub use register::{RegisterContent, Registers};
-pub use search::{SearchDirection, SearchState, Substitutor};
+pub use search::{SearchDirection, SearchState, SubstituteConfig, Substitutor};
 pub use shell::{ShellExecutor, ShellOutput};
 pub use ui::{
     byte_offset_to_display_col, char_width, display_col_to_byte_offset, expand_for_display,
@@ -182,11 +182,17 @@ pub fn run_editor(invoked_as: InvokedAs, args: &[String]) -> i32 {
         }
     }
 
-    // Execute initial command if specified
+    // Execute initial command if specified.
+    //
+    // POSIX runs `-c`/`+command` against the first file that is actually
+    // edited, so it is skipped when no file was opened -- previously it ran
+    // unconditionally, against an empty buffer.
     if let Some(cmd) = opts.command {
-        if let Err(e) = editor.execute_initial_command(&cmd) {
-            eprintln!("{}: {}", prog_name, e);
-            // Don't exit - continue with the editor
+        if editor.has_current_file() {
+            if let Err(e) = editor.execute_initial_command(&cmd) {
+                eprintln!("{}: {}", prog_name, e);
+                // Don't exit - continue with the editor
+            }
         }
     }
 

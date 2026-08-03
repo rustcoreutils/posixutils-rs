@@ -28,6 +28,10 @@ pub enum ExCommand {
         range: AddressRange,
         file: Option<String>,
         force: bool,
+        /// True for `:x`/`:xit`, false for `:wq`. POSIX (ex.md §95537) makes
+        /// `xit` on an unmodified buffer equivalent to `quit`, whereas `wq`
+        /// always writes (#X29).
+        xit: bool,
     },
     /// Edit file (:e, :edit).
     Edit { file: Option<String>, force: bool },
@@ -50,7 +54,7 @@ pub enum ExCommand {
     },
     /// Put text from register (:pu, :put).
     Put {
-        line: Option<usize>,
+        range: AddressRange,
         register: Option<char>,
     },
     /// Copy lines (:co, :copy, :t).
@@ -90,6 +94,8 @@ pub enum ExCommand {
     Join {
         range: AddressRange,
         count: Option<usize>,
+        /// `j!` -- join without modifying any line (ex.md §95060-95061).
+        force: bool,
     },
     /// Set options (:se, :set).
     Set { args: String },
@@ -98,12 +104,12 @@ pub enum ExCommand {
     /// Go to line (:number or just address).
     Goto { line: usize },
     /// Mark line (:ma, :mark, :k).
-    Mark { line: Option<usize>, name: char },
+    Mark { range: AddressRange, name: char },
     /// Shell command (:!, :shell).
     Shell { command: String },
     /// Shell read (:<n>r!command).
     ShellRead {
-        line: Option<usize>,
+        range: AddressRange,
         command: String,
     },
     /// Shell write (:<range>w!command).
@@ -161,18 +167,23 @@ pub enum ExCommand {
     /// Source file (execute ex commands from file) (:so, :source).
     Source { file: String },
     /// Append text after line (:a, :append).
-    Append { line: usize },
+    ///
+    /// Carries the whole `AddressRange` rather than a pre-extracted `usize`:
+    /// the parser could only pull a literal `Address::Line(n)` out and fell
+    /// back to line 1 for everything else, so `$a`, `.a`, `/re/a` and `'ma`
+    /// all silently targeted the wrong line (#X25).
+    Append { range: AddressRange },
     /// Insert text before line (:i, :insert).
-    Insert { line: usize },
+    Insert { range: AddressRange },
     /// Change lines (:c, :change).
     Change { range: AddressRange },
     /// Enter visual mode (:vi, :visual).
     Visual,
     /// Enter open mode (:o, :open).
-    Open { line: Option<usize> },
+    Open { range: AddressRange },
     /// Adjust window (:z).
     Z {
-        line: Option<usize>,
+        range: AddressRange,
         ztype: Option<char>,
         count: Option<usize>,
     },
@@ -187,7 +198,7 @@ pub enum ExCommand {
         count: Option<usize>,
     },
     /// Write line number (:=).
-    LineNumber { line: Option<usize> },
+    LineNumber { range: AddressRange },
     /// Execute buffer (:@, :*).
     Execute {
         range: AddressRange,
@@ -197,6 +208,15 @@ pub enum ExCommand {
     Suspend,
     /// Repeat substitute (:&).
     RepeatSubstitute {
+        range: AddressRange,
+        flags: SubstituteFlags,
+    },
+    /// Repeat the previous substitute's replacement against the last RE (`:~`).
+    ///
+    /// Distinct from `&`: that reuses the previous *pattern* and replacement,
+    /// while `~` takes the pattern from the most recent RE, which may have come
+    /// from a search (#X18).
+    TildeSubstitute {
         range: AddressRange,
         flags: SubstituteFlags,
     },
@@ -217,6 +237,13 @@ pub struct SubstituteFlags {
     pub count: bool,
     /// Case insensitive.
     pub ignore_case: bool,
+    /// `l` -- print changed lines in unambiguous (list) form.
+    pub list: bool,
+    /// `#` -- print changed lines with line numbers.
+    pub number: bool,
+    /// Trailing numeric count: operate on that many lines starting at the last
+    /// line of the address range (ex.md substitute synopsis).
+    pub line_count: Option<usize>,
 }
 
 impl SubstituteFlags {
@@ -230,6 +257,8 @@ impl SubstituteFlags {
                 'p' => flags.print = true,
                 'n' => flags.count = true,
                 'i' | 'I' => flags.ignore_case = true,
+                'l' => flags.list = true,
+                '#' => flags.number = true,
                 _ => {}
             }
         }

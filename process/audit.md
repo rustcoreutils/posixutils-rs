@@ -228,7 +228,7 @@ POSIX requirement and is correctly not implemented.
 | `-f` named-files | CONFORMS | `fuser.rs:1129` |
 | `-u` `(username)` + uid fallback | CONFORMS | `fuser.rs:1442-1456` |
 | PIDs → stdout; rest → stderr | CONFORMS | `print!` vs `eprint!` split |
-| PID format `" %1d"` | DIVERGES | `#F1` |
+| PID format `" %1d"` | CONFORMS | `#F1` fixed in Phase 7 (`4dd00a06`) |
 | stderr write-order (98810: info first, then all PIDs) | PARTIAL | interleaved per-pid; correct only for same-file case |
 | EXIT 0 / >0 | CONFORMS | (no-match=0 is OK, see refuted) |
 | device-number decode | DIVERGES | `#F2` |
@@ -236,9 +236,20 @@ POSIX requirement and is correctly not implemented.
 | i18n diagnostics | PARTIAL | `#C1` |
 
 ### Test coverage signal
-Present: open-fd detect, `-u` username, TCP/UDP/unix (compare vs system `fuser`).
+Present: open-fd detect, `-u` username, TCP/UDP/unix, and a `" %1d"` format
+assertion.
+
+> **2026-08-02.** The TCP/UDP tests used to compare our stdout byte-for-byte
+> against the host's `fuser`. That contradicted `#F1`: psmisc formats its PID
+> list as `" %5d"`, so the comparison passed only when the test process's PID
+> happened to have 5+ digits and failed at 4 — i.e. it broke on a
+> freshly-booted machine and passed on one with uptime. psmisc is also the
+> non-conforming side, so it was the wrong reference. Both tests now assert the
+> POSIX format directly and that the reported PID set contains the test
+> process (which owns the socket), via `parse_posix_pid_list` in
+> `process/tests/fuser/mod.rs`.
 - [ ] `-c` mount-point; `-f` block-device; multiple operands
-- [ ] PID format (`" %1d"`) assertion (proves `#F1`)
+- [x] PID format (`" %1d"`) assertion (proves `#F1`) — `test_fuser_pid_format_single_space`, plus the TCP/UDP tests since 2026-08-02.
 - [ ] `r` (root-dir) use-char; high-minor device file (proves `#F2`)
 
 ---

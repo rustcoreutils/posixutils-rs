@@ -44,6 +44,12 @@ pub enum ViError {
     FileModified,
     /// Read-only mode.
     ReadOnly,
+    /// More files remain in the argument list (`:q` without `!`).
+    MoreFiles,
+    /// Target file exists and is not the current pathname (write rules 3/5).
+    FileExists(String),
+    /// Partial write over an existing file (write rule 6; not overridable).
+    PartialWriteExists(String),
     /// Invalid option.
     InvalidOption(String),
     /// Invalid regular expression.
@@ -96,6 +102,11 @@ impl fmt::Display for ViError {
             ViError::FileNotFound(s) => write!(f, "File not found: {}", s),
             ViError::FileModified => write!(f, "No write since last change"),
             ViError::ReadOnly => write!(f, "Read-only mode"),
+            ViError::MoreFiles => write!(f, "No write since last change (more files to edit)"),
+            ViError::FileExists(p) => write!(f, "File exists: {} (use ! to override)", p),
+            ViError::PartialWriteExists(p) => {
+                write!(f, "File exists: {} (partial write cannot be forced)", p)
+            }
             ViError::InvalidOption(s) => write!(f, "Invalid option: {}", s),
             ViError::InvalidRegex(s) => write!(f, "Invalid regular expression: {}", s),
             ViError::NoAlternateFile => write!(f, "No alternate file"),

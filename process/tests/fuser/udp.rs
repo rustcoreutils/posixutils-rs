@@ -7,8 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
-use super::fuser_test;
-use std::{io, net::UdpSocket, process::Command};
+use super::{fuser_test, parse_posix_pid_list};
+use std::{io, net::UdpSocket};
 
 /// Waits for a UDP server to become available by sending a dummy message to the specified port.
 ///
@@ -50,13 +50,16 @@ fn test_fuser_udp() {
     wait_for_udp_server(port);
 
     fuser_test(vec![format!("{}/udp", port)], "", 0, |_, output| {
-        let manual_output = Command::new("fuser")
-            .arg(format!("{}/udp", port))
-            .output()
-            .unwrap();
-
         assert_eq!(output.status.code(), Some(0));
-        assert_eq!(output.stdout, manual_output.stdout);
+
+        // This test process owns the bound socket, so it must be reported.
+        let pids = parse_posix_pid_list(&output.stdout);
+        assert!(
+            pids.contains(&std::process::id()),
+            "fuser must report the process holding the UDP socket ({}), got {:?}",
+            std::process::id(),
+            pids
+        );
     });
 
     drop(server);

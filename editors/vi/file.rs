@@ -34,6 +34,10 @@ pub struct FileManager {
     arg_index: usize,
     /// Whether current file is read-only.
     readonly: bool,
+    /// Whether the current pathname was changed by `:f` or `:r` since the last
+    /// successful write. POSIX ex write rule 5 (ex.md §95510-95513) makes a
+    /// write to a changed-and-existing pathname fail until forced.
+    pathname_changed: bool,
 }
 
 impl Default for FileManager {
@@ -51,7 +55,28 @@ impl FileManager {
             arg_list: Vec::new(),
             arg_index: 0,
             readonly: false,
+            pathname_changed: false,
         }
+    }
+
+    /// True when files after the current one remain in the argument list.
+    pub fn has_more_files(&self) -> bool {
+        self.arg_index + 1 < self.arg_list.len()
+    }
+
+    /// True when `:f`/`:r` changed the current pathname since the last write.
+    pub fn pathname_changed(&self) -> bool {
+        self.pathname_changed
+    }
+
+    /// Record that `:f`/`:r` changed the current pathname (write rule 5).
+    pub fn mark_pathname_changed(&mut self) {
+        self.pathname_changed = true;
+    }
+
+    /// Clear the rule-5 flag after a successful write.
+    pub fn clear_pathname_changed(&mut self) {
+        self.pathname_changed = false;
     }
 
     /// Set the argument list of files.
@@ -303,29 +328,6 @@ impl WriteStats {
             self.bytes
         )
     }
-}
-
-/// Read output of a shell command into buffer.
-pub fn read_shell_output(buffer: &mut Buffer, line_num: usize, command: &str) -> Result<usize> {
-    use std::process::Command;
-
-    let output = Command::new("sh").arg("-c").arg(command).output()?;
-
-    if !output.status.success() {
-        return Err(ViError::InvalidCommand(
-            String::from_utf8_lossy(&output.stderr).to_string(),
-        ));
-    }
-
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut count = 0;
-
-    for (i, line) in text.lines().enumerate() {
-        buffer.insert_line_after(line_num + i, Line::from(line));
-        count += 1;
-    }
-
-    Ok(count)
 }
 
 /// Write buffer range to a shell command.

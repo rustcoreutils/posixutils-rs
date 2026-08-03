@@ -608,7 +608,7 @@ fn test_search_ignorecase() {
 
 #[test]
 fn test_substitute_simple() {
-    let sub = Substitutor::new("foo", "bar", false, false, false, false, false).unwrap();
+    let sub = Substitutor::new(SubstituteConfig::new("foo", "bar")).unwrap();
     let (result, count) = sub.substitute_line("foo baz foo");
 
     assert_eq!(result, "bar baz foo");
@@ -617,7 +617,7 @@ fn test_substitute_simple() {
 
 #[test]
 fn test_substitute_global() {
-    let sub = Substitutor::new("foo", "bar", true, false, false, false, false).unwrap();
+    let sub = Substitutor::new(SubstituteConfig::new("foo", "bar").with_global(true)).unwrap();
     let (result, count) = sub.substitute_line("foo baz foo");
 
     assert_eq!(result, "bar baz bar");
@@ -626,8 +626,8 @@ fn test_substitute_global() {
 
 #[test]
 fn test_substitute_ignorecase() {
-    // Substitutor::new(pattern, replacement, global, confirm, print, count_only, ignorecase)
-    let sub = Substitutor::new("FOO", "bar", false, false, false, false, true).unwrap();
+    // Substitutor::new(SubstituteConfig::new(pattern, replacement))
+    let sub = Substitutor::new(SubstituteConfig::new("FOO", "bar").with_ignorecase(true)).unwrap();
     let (result, count) = sub.substitute_line("foo baz FOO");
 
     // Case insensitive: "foo" matches first
@@ -637,7 +637,7 @@ fn test_substitute_ignorecase() {
 
 #[test]
 fn test_substitute_ampersand() {
-    let sub = Substitutor::new("foo", "[&]", false, false, false, false, false).unwrap();
+    let sub = Substitutor::new(SubstituteConfig::new("foo", "[&]")).unwrap();
     let (result, _) = sub.substitute_line("foo");
 
     assert_eq!(result, "[foo]");
@@ -1012,7 +1012,9 @@ fn test_address_current() {
     let buffer = Buffer::from_text("one\ntwo\nthree");
     let range = ex::AddressRange::empty();
 
-    let (start, end) = range.resolve(&buffer, 2).unwrap();
+    let (start, end) = range
+        .resolve(&ex::address::AddrCtx::simple(&buffer, 2))
+        .unwrap();
     assert_eq!(start, 2);
     assert_eq!(end, 2);
 }
@@ -1024,7 +1026,9 @@ fn test_address_line_number() {
     let buffer = Buffer::from_text("one\ntwo\nthree");
     let range = ex::AddressRange::range(Address::Line(1), Address::Line(3));
 
-    let (start, end) = range.resolve(&buffer, 1).unwrap();
+    let (start, end) = range
+        .resolve(&ex::address::AddrCtx::simple(&buffer, 1))
+        .unwrap();
     assert_eq!(start, 1);
     assert_eq!(end, 3);
 }
@@ -1036,7 +1040,9 @@ fn test_address_last() {
     let buffer = Buffer::from_text("one\ntwo\nthree");
     let range = ex::AddressRange::range(Address::Last, Address::Last);
 
-    let (start, end) = range.resolve(&buffer, 1).unwrap();
+    let (start, end) = range
+        .resolve(&ex::address::AddrCtx::simple(&buffer, 1))
+        .unwrap();
     assert_eq!(start, 3);
     assert_eq!(end, 3);
 }
@@ -1763,13 +1769,15 @@ fn test_ex_append_parsing() {
     assert!(result.is_ok());
     assert!(matches!(result.unwrap(), ExCommand::Append { .. }));
 
-    // Test with line number
+    // Test with line number. The command now carries the whole AddressRange
+    // rather than a pre-extracted usize -- the parser could only read a literal
+    // Address::Line(n) and fell back to line 1 for every other form (#X25).
     let result = parse_ex_command("5a");
     assert!(result.is_ok());
-    if let Ok(ExCommand::Append { line }) = result {
-        assert_eq!(line, 5);
+    if let Ok(ExCommand::Append { range }) = result {
+        assert_eq!(range.start, Some(vi_rs::ex::address::Address::Line(5)));
     } else {
-        panic!("Expected Append command with line 5");
+        panic!("Expected Append command addressing line 5");
     }
 }
 

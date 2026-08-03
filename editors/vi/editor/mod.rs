@@ -14,17 +14,17 @@
 
 mod executor;
 
-use crate::buffer::{Buffer, BufferMode, Position, Range};
+use crate::buffer::{Buffer, BufferMode, Line, Position, Range};
 use crate::command::CommandParser;
 use crate::error::{Result, ViError};
 use crate::ex::command::SubstituteFlags;
 use crate::ex::{parse_ex_command, AddressRange, ExCommand, ExResult};
-use crate::file::{read_file, write_file, FileManager};
+use crate::file::{read_file, write_file, write_range, FileManager};
 use crate::input::{InputReader, Key};
 use crate::mode::{enter_insert_mode, process_insert_key, InsertKind, InsertState, Mode};
 use crate::options::Options;
 use crate::register::{RegisterContent, Registers};
-use crate::search::{SearchDirection, SearchState, Substitutor};
+use crate::search::{SearchDirection, SearchState, SubstituteConfig, Substitutor};
 use crate::shell::ShellExecutor;
 use crate::ui::{Screen, Terminal, TerminalSize};
 use crate::undo::UndoManager;
@@ -175,6 +175,14 @@ pub struct Editor {
     last_find: Option<FindCommand>,
     /// Last substitution for & command.
     last_substitution: Option<LastSubstitution>,
+    /// The last regular expression used anywhere in the editor -- by a search
+    /// or by a substitute. An empty `:s//repl/` pattern reuses it (#X28).
+    last_regex: Option<String>,
+    /// Lines echoed by the most recent substitute's `p`/`l`/`#` flags.
+    substitute_output: Vec<String>,
+    /// Text from the previous insert session; a NUL in insert mode re-inserts
+    /// it (#V15).
+    previous_insert: String,
     /// Last command for . (dot) repeat.
     last_command: Option<LastCommand>,
     /// Last macro register for @@ repeat.
@@ -241,6 +249,9 @@ impl Editor {
             pending_filter: None,
             last_find: None,
             last_substitution: None,
+            last_regex: None,
+            substitute_output: Vec::new(),
+            previous_insert: String::new(),
             last_command: None,
             last_macro_register: None,
             ex_insert_mode: None,
@@ -280,6 +291,9 @@ impl Editor {
             pending_filter: None,
             last_find: None,
             last_substitution: None,
+            last_regex: None,
+            substitute_output: Vec::new(),
+            previous_insert: String::new(),
             last_command: None,
             last_macro_register: None,
             ex_insert_mode: None,
@@ -322,6 +336,9 @@ impl Editor {
             pending_filter: None,
             last_find: None,
             last_substitution: None,
+            last_regex: None,
+            substitute_output: Vec::new(),
+            previous_insert: String::new(),
             last_command: None,
             last_macro_register: None,
             ex_insert_mode: None,
@@ -332,8 +349,24 @@ impl Editor {
     }
 
     /// Set read-only mode.
+    ///
+    /// POSIX describes `-R` as setting the `readonly` *edit option*, and the
+    /// `write` rules are written against that option (ex.md §95506), so `-R`
+    /// and `:set ro` must be the same state. Keeping only the `FileManager`
+    /// flag left `:set ro` unable to block a write (#X27).
     pub fn set_readonly(&mut self, readonly: bool) {
         self.files.set_readonly(readonly);
+        self.options.readonly = readonly;
+    }
+
+    /// True when a file is currently being edited.
+    pub fn has_current_file(&self) -> bool {
+        self.files.current_file().is_some()
+    }
+
+    /// True when writing is disallowed, from either `-R` or `:set readonly`.
+    fn is_readonly(&self) -> bool {
+        self.options.readonly || self.files.is_readonly()
     }
 
     /// Set the initial window size (the `-w size` option).
@@ -580,7 +613,25 @@ impl Editor {
             }
 
             // Remove trailing newline
-            let line = line.trim_end();
+            let mut line = line.trim_end_matches(['\n', '\r']).to_string();
+
+            // A <backslash><newline> continues the command onto the next input
+            // line, with the pair standing for a literal newline. This is how
+            // POSIX has you enter a newline in a `substitute` replacement, e.g.
+            //   s/-/\
+            //   /
+            // splits a line in two. Without this the reader cut the command at
+            // the newline and the trailing `/` parsed as a bare search.
+            while ends_with_odd_backslash(&line) {
+                line.pop(); // drop the escaping backslash
+                line.push('\n');
+                let mut cont = String::new();
+                match stdin.lock().read_line(&mut cont) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => line.push_str(cont.trim_end_matches(['\n', '\r'])),
+                }
+            }
+            let line = line.trim_end_matches([' ', '\t']);
 
             // Execute the command
             match self.execute_ex_input(line) {
@@ -870,18 +921,6 @@ impl Editor {
                     ));
                     return Ok(());
                 }
-                Key::Char('s') => {
-                    // Substitute char - delete char and enter insert
-                    self.buffer.delete_char();
-                    self.enter_insert(InsertKind::Insert);
-                    return Ok(());
-                }
-                Key::Char('S') => {
-                    // Substitute line - clear line and enter insert
-                    self.buffer.clear_line();
-                    self.enter_insert(InsertKind::InsertBol);
-                    return Ok(());
-                }
                 Key::Char('C') => {
                     // Change to end of line
                     self.buffer.delete_to_end_of_line();
@@ -905,7 +944,12 @@ impl Editor {
 
     /// Enter insert mode.
     fn enter_insert(&mut self, kind: InsertKind) {
-        if let Ok(state) = enter_insert_mode(&mut self.buffer, kind) {
+        if let Ok(mut state) = enter_insert_mode(&mut self.buffer, kind) {
+            // Carry the terminal's erase/kill characters and the previous
+            // insertion into the session (#V12, #V15).
+            state.erase_char = self.terminal.erase_char();
+            state.kill_char = self.terminal.kill_char();
+            state.previous_insert = self.previous_insert.clone();
             self.mode = Mode::Insert(kind);
             self.insert_state = Some(state);
         }
@@ -919,6 +963,11 @@ impl Editor {
             if should_exit {
                 // Exited insert mode
                 self.mode = Mode::Command;
+                // Remember this session's text so a NUL in the next one can
+                // re-insert it (#V15).
+                if !state.inserted_text.is_empty() {
+                    self.previous_insert = state.inserted_text.clone();
+                }
                 // Record for undo
                 if !state.inserted_text.is_empty() {
                     self.undo
@@ -1244,6 +1293,14 @@ impl Editor {
             }
             'c' => {
                 self.execute_change(cmd)?;
+            }
+            // #V17: `s` and `S` are `c` over an implied range. They used to be
+            // handled in the pre-parser fast path, which meant they saved
+            // nothing to a register, recorded no undo, and accepted neither a
+            // count (`3s`) nor a register prefix (`"as`) -- even though both
+            // keys were already in the command parser's table.
+            's' | 'S' => {
+                self.execute_substitute_command(cmd)?;
             }
             // Put commands
             'p' => {
@@ -1631,6 +1688,38 @@ impl Editor {
     }
 
     /// Execute change command.
+    /// `s` (substitute `count` characters) and `S` (substitute `count` whole
+    /// lines). Both are `c` over an implied range, so they route through the
+    /// same operator and inherit its register, undo and cursor handling.
+    fn execute_substitute_command(&mut self, cmd: &crate::command::ParsedCommand) -> Result<()> {
+        use crate::command::change;
+
+        let cursor = self.buffer.cursor();
+        let range = if cmd.command == 'S' {
+            let end_line = (cursor.line + cmd.count - 1).min(self.buffer.line_count());
+            Range::lines(cursor, Position::new(end_line, 0))
+        } else {
+            let line_len = self
+                .buffer
+                .line(cursor.line)
+                .map(|l| l.content().chars().count())
+                .unwrap_or(0);
+            let end_col = (cursor.column + cmd.count).min(line_len);
+            Range::chars(cursor, Position::new(cursor.line, end_col))
+        };
+
+        let result = change(&mut self.buffer, range, &mut self.registers, cmd.register)?;
+        self.buffer.set_cursor(result.cursor);
+        if result.enter_insert {
+            self.enter_insert(if cmd.command == 'S' {
+                InsertKind::Change
+            } else {
+                InsertKind::Insert
+            });
+        }
+        Ok(())
+    }
+
     fn execute_change(&mut self, cmd: &crate::command::ParsedCommand) -> Result<()> {
         use crate::command::{change, motion};
 
@@ -1833,6 +1922,9 @@ impl Editor {
         if !pattern.is_empty() {
             self.search.set_pattern(&pattern, dir)?;
             self.registers.set_search(&pattern);
+            // POSIX's "last RE used in the editor" spans searches as well as
+            // substitutes, which is what `~` and an empty `s//` pattern reuse.
+            self.set_last_regex(&pattern);
         }
         self.search_next(dir)?;
         if offset != 0 {
@@ -1926,6 +2018,11 @@ impl Editor {
     fn execute_ex(&mut self, cmd: ExCommand) -> Result<ExResult> {
         match cmd {
             ExCommand::Quit { force } => {
+                // POSIX: quit warns while more files remain in the argument
+                // list, unless forced. The modified-buffer check is in quit().
+                if !force && self.files.has_more_files() {
+                    return Err(ViError::MoreFiles);
+                }
                 self.quit(force)?;
                 Ok(ExResult::Continue)
             }
@@ -1935,12 +2032,25 @@ impl Editor {
                 append,
                 force,
             } => {
-                self.write(file.as_deref(), range.explicit, append, force)?;
+                let lines = self.write_line_range(&range)?;
+                self.write(file.as_deref(), lines, append, force)?;
                 Ok(ExResult::Continue)
             }
-            ExCommand::WriteQuit { range, file, force } => {
-                self.write(file.as_deref(), range.explicit, false, force)?;
-                self.quit(true)?;
+            ExCommand::WriteQuit {
+                range,
+                file,
+                force,
+                xit,
+            } => {
+                // #X29: `xit` on a buffer unmodified since the last complete
+                // write is just `quit` (ex.md §95537); only `wq` always writes.
+                if xit && !self.buffer.is_modified() {
+                    self.quit(force)?;
+                } else {
+                    let lines = self.write_line_range(&range)?;
+                    self.write(file.as_deref(), lines, false, force)?;
+                    self.quit(true)?;
+                }
                 Ok(ExResult::Continue)
             }
             ExCommand::Edit { file, force } => {
@@ -1972,7 +2082,13 @@ impl Editor {
                 flags,
             } => {
                 self.substitute(&range, &pattern, &replacement, &flags)?;
-                Ok(ExResult::Continue)
+                // The p/l/# flags echo each changed line.
+                let printed = std::mem::take(&mut self.substitute_output);
+                if printed.is_empty() {
+                    Ok(ExResult::Continue)
+                } else {
+                    Ok(ExResult::CommandOutput(printed))
+                }
             }
             ExCommand::Goto { line } => {
                 let line = line.min(self.buffer.line_count()).max(1);
@@ -1983,6 +2099,9 @@ impl Editor {
             ExCommand::File { new_name } => {
                 if let Some(name) = new_name {
                     self.files.set_current_file(Some(PathBuf::from(name)));
+                    // Write rule 5: a later `:w` with no operand must not
+                    // clobber this newly-named file if it already exists.
+                    self.files.mark_pathname_changed();
                 }
                 let info = self.file_info();
                 Ok(ExResult::StatusMessage(info))
@@ -2053,7 +2172,8 @@ impl Editor {
                 self.execute_shell_command(&command)?;
                 Ok(ExResult::Continue)
             }
-            ExCommand::ShellRead { line, command } => {
+            ExCommand::ShellRead { range, command } => {
+                let line = self.resolve_target_line(&range, true)?;
                 self.execute_shell_read(line, &command)?;
                 Ok(ExResult::Continue)
             }
@@ -2069,17 +2189,23 @@ impl Editor {
                 self.execute_source(&file)?;
                 Ok(ExResult::Continue)
             }
-            ExCommand::Append { line } => {
+            ExCommand::Append { range } => {
+                let line = self
+                    .resolve_target_line(&range, true)?
+                    .unwrap_or_else(|| self.buffer.cursor().line);
                 self.ex_insert_mode = Some(ExInsertMode::Append(line));
                 Ok(ExResult::Continue)
             }
-            ExCommand::Insert { line } => {
+            ExCommand::Insert { range } => {
+                let line = self
+                    .resolve_target_line(&range, true)?
+                    .unwrap_or_else(|| self.buffer.cursor().line);
                 self.ex_insert_mode = Some(ExInsertMode::Insert(line));
                 Ok(ExResult::Continue)
             }
             ExCommand::Change { range } => {
                 let current = self.buffer.cursor().line;
-                let resolved = range.resolve(&self.buffer, current)?;
+                let resolved = range.resolve(&self.addr_ctx_at(current))?;
                 self.ex_insert_mode = Some(ExInsertMode::Change {
                     start: resolved.0,
                     end: resolved.1,
@@ -2114,11 +2240,16 @@ impl Editor {
                 let lines = self.get_lines_for_list(&range, count)?;
                 Ok(ExResult::CommandOutput(lines))
             }
-            ExCommand::Join { range, count } => {
-                self.execute_ex_join(&range, count)?;
+            ExCommand::Join {
+                range,
+                count,
+                force,
+            } => {
+                self.execute_ex_join(&range, count, force)?;
                 Ok(ExResult::Continue)
             }
-            ExCommand::Put { line, register } => {
+            ExCommand::Put { range, register } => {
+                let line = self.resolve_target_line(&range, true)?;
                 self.execute_ex_put(line, register)?;
                 Ok(ExResult::Continue)
             }
@@ -2153,13 +2284,22 @@ impl Editor {
                     .unwrap_or_else(|_| "unknown".to_string());
                 Ok(ExResult::StatusMessage(cwd))
             }
-            ExCommand::Mark { line, name } => {
+            ExCommand::Mark { range, name } => {
+                let line = self.resolve_target_line(&range, false)?;
                 self.execute_ex_mark(line, name)?;
                 Ok(ExResult::Continue)
             }
             ExCommand::Visual => Ok(ExResult::EnterVisual),
-            ExCommand::Open { line } => Ok(ExResult::EnterOpen(line)),
-            ExCommand::Z { line, ztype, count } => {
+            ExCommand::Open { range } => {
+                let line = self.resolve_target_line(&range, false)?;
+                Ok(ExResult::EnterOpen(line))
+            }
+            ExCommand::Z {
+                range,
+                ztype,
+                count,
+            } => {
+                let line = self.resolve_target_line(&range, false)?;
                 let output = self.execute_ex_z(line, ztype, count)?;
                 Ok(ExResult::CommandOutput(output))
             }
@@ -2171,7 +2311,8 @@ impl Editor {
                 self.execute_ex_shift_right(&range, count)?;
                 Ok(ExResult::Continue)
             }
-            ExCommand::LineNumber { line } => {
+            ExCommand::LineNumber { range } => {
+                let line = self.resolve_target_line(&range, false)?;
                 let line_num = self.execute_ex_line_number(line)?;
                 Ok(ExResult::CommandOutput(vec![line_num.to_string()]))
             }
@@ -2186,6 +2327,27 @@ impl Editor {
             ExCommand::RepeatSubstitute { range, flags } => {
                 self.execute_ex_repeat_substitute(&range, &flags)?;
                 Ok(ExResult::Continue)
+            }
+            ExCommand::TildeSubstitute { range, flags } => {
+                // `~` pairs the previous *replacement* with the last RE, which
+                // may have come from a search rather than a substitute -- that
+                // is what distinguishes it from `&` (#X18).
+                let pattern = self
+                    .last_regex()
+                    .ok_or(ViError::NoPreviousSearch)?
+                    .to_string();
+                let replacement = self
+                    .last_substitution
+                    .as_ref()
+                    .map(|l| l.replacement.clone())
+                    .ok_or(ViError::NoPreviousSubstitution)?;
+                self.substitute(&range, &pattern, &replacement, &flags)?;
+                let printed = std::mem::take(&mut self.substitute_output);
+                if printed.is_empty() {
+                    Ok(ExResult::Continue)
+                } else {
+                    Ok(ExResult::CommandOutput(printed))
+                }
             }
             ExCommand::Nop => Ok(ExResult::Continue),
             ExCommand::Tag { tag } => {
@@ -2263,8 +2425,17 @@ impl Editor {
             if let Ok(home) = std::env::var("HOME") {
                 if !home.is_empty() {
                     let exrc_path = format!("{}/.exrc", home);
-                    if let Some(content) = crate::config::read_safe_exrc(&exrc_path) {
-                        let _ = self.execute_source_content(&content);
+                    match crate::config::read_safe_exrc(&exrc_path) {
+                        Ok(Some(content)) => {
+                            let _ = self.execute_source_content(&content);
+                        }
+                        // Absent or deliberately skipped for safety: silent.
+                        Ok(None) => {}
+                        // Exists but unreadable -- say so rather than start up
+                        // as though the user had no configuration (#X21).
+                        Err(e) => {
+                            eprintln!("{}: {}", exrc_path, e);
+                        }
                     }
                 }
             }
@@ -2274,8 +2445,14 @@ impl Editor {
         if self.options.exrc {
             let local_exrc = ".exrc";
             if !crate::config::is_same_file_as_home_exrc(local_exrc) {
-                if let Some(content) = crate::config::read_safe_exrc(local_exrc) {
-                    let _ = self.execute_source_content(&content);
+                match crate::config::read_safe_exrc(local_exrc) {
+                    Ok(Some(content)) => {
+                        let _ = self.execute_source_content(&content);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        eprintln!("{}: {}", local_exrc, e);
+                    }
                 }
             }
         }
@@ -2331,8 +2508,15 @@ impl Editor {
     fn execute_shell_read(&mut self, line: Option<usize>, command: &str) -> Result<()> {
         use crate::buffer::Line;
 
-        // Capture command output
-        let output = self.shell.execute_capture(command)?;
+        // #V18: the child inherits our stdin now (#X23), so it must not find
+        // the terminal in raw mode. `execute_shell_command` already brackets
+        // its child this way; this path did not.
+        let was_raw = self.terminal.disable_raw_mode().is_ok();
+        let output = self.shell.execute_capture(command);
+        if was_raw {
+            let _ = self.terminal.enable_raw_mode();
+        }
+        let output = output?;
 
         if !output.success {
             self.set_error(&format!("shell returned {}", output.exit_code));
@@ -2479,7 +2663,7 @@ impl Editor {
     ) -> Result<Vec<String>> {
         let current = self.buffer.cursor().line;
         let (start, end) = if range.explicit {
-            range.resolve(&self.buffer, current)?
+            range.resolve(&self.addr_ctx_at(current))?
         } else if let Some(c) = count {
             // If count given without range, start at current line
             (current, (current + c - 1).min(self.buffer.line_count()))
@@ -2509,7 +2693,7 @@ impl Editor {
     ) -> Result<Vec<String>> {
         let current = self.buffer.cursor().line;
         let (start, end) = if range.explicit {
-            range.resolve(&self.buffer, current)?
+            range.resolve(&self.addr_ctx_at(current))?
         } else if let Some(c) = count {
             (current, (current + c - 1).min(self.buffer.line_count()))
         } else {
@@ -2534,7 +2718,7 @@ impl Editor {
     ) -> Result<Vec<String>> {
         let current = self.buffer.cursor().line;
         let (start, end) = if range.explicit {
-            range.resolve(&self.buffer, current)?
+            range.resolve(&self.addr_ctx_at(current))?
         } else if let Some(c) = count {
             (current, (current + c - 1).min(self.buffer.line_count()))
         } else {
@@ -2544,22 +2728,7 @@ impl Editor {
         let mut lines = Vec::new();
         for line_num in start..=end {
             if let Some(line) = self.buffer.line(line_num) {
-                // Convert non-printable characters to visible form
-                let mut listed = String::new();
-                for ch in line.content().chars() {
-                    match ch {
-                        '\t' => listed.push_str("^I"),
-                        c if c.is_ascii_control() => {
-                            // Only convert ASCII control characters (0x00-0x1F)
-                            // to ^@ through ^_ notation
-                            listed.push('^');
-                            listed.push((c as u8 + b'@') as char);
-                        }
-                        c => listed.push(c),
-                    }
-                }
-                listed.push('$'); // End of line marker
-                lines.push(listed);
+                lines.push(Self::list_form(line.content()));
             }
         }
         Ok(lines)
@@ -2575,7 +2744,7 @@ impl Editor {
     ) -> Result<()> {
         let current = self.buffer.cursor().line;
         let (start, end) = if range.explicit {
-            range.resolve(&self.buffer, current)?
+            range.resolve(&self.addr_ctx_at(current))?
         } else {
             (1, self.buffer.line_count())
         };
@@ -2699,26 +2868,90 @@ impl Editor {
         replacement: &str,
         flags: &SubstituteFlags,
     ) -> Result<()> {
-        let sub = Substitutor::new(
+        // An empty pattern reuses the last RE used in the editor -- from a
+        // search or a previous substitute (ex.md §95700). Only the editor can
+        // resolve that, which is why the parser now forwards an empty pattern
+        // instead of rejecting it.
+        let pattern = if pattern.is_empty() {
+            self.last_regex()
+                .ok_or(ViError::NoPreviousSubstitution)?
+                .to_string()
+        } else {
+            pattern.to_string()
+        };
+        let pattern = pattern.as_str();
+
+        // `~` alone as the replacement means "the previous replacement", which
+        // is how a bare `s` repeats the last substitution.
+        let prev_replacement = self
+            .last_substitution
+            .as_ref()
+            .map(|l| l.replacement.clone())
+            .unwrap_or_default();
+
+        let sub = Substitutor::new(SubstituteConfig {
             pattern,
             replacement,
-            flags.global,
-            flags.confirm,
-            flags.print,
-            flags.count,
-            self.options.ignorecase,
-        )?;
+            global: flags.global,
+            confirm: flags.confirm,
+            print: flags.print,
+            list: flags.list,
+            number: flags.number,
+            count_only: flags.count,
+            ignorecase: self.options.ignorecase,
+            prev_replacement: &prev_replacement,
+        })?;
 
-        // Resolve range
-        let (start, end) = self.resolve_range(range)?;
+        // Resolve range. A trailing numeric count re-bases the range on the
+        // last addressed line and extends it (substitute synopsis).
+        let (mut start, mut end) = self.resolve_range(range)?;
+        if let Some(n) = flags.line_count {
+            let n = n.max(1);
+            start = end;
+            end = (start + n - 1).min(self.buffer.line_count());
+        }
         let mut total_count = 0;
+        let mut printed: Vec<String> = Vec::new();
+        // `\n` in the replacement inserts lines mid-iteration, so walk the
+        // range with an explicit cursor rather than a fixed `for` range.
+        let mut line_num = start;
 
-        for line_num in start..=end {
+        while line_num <= end {
             if let Some(line) = self.buffer.line(line_num) {
                 let content = line.content().to_string();
-                let (new_content, count) = sub.substitute_line(&content);
+                let (new_content, count) = if sub.needs_confirm() && !sub.is_count_only() {
+                    sub.substitute_line_confirmed(&content, |line, s, e| {
+                        Self::confirm_substitution(line, s, e)
+                    })
+                } else {
+                    sub.substitute_line(&content)
+                };
 
                 if count > 0 && !sub.is_count_only() {
+                    // A replacement containing `\n` splits the line into
+                    // several. `replace_line` would stuff the newline into a
+                    // single Line and corrupt the buffer's invariant, and the
+                    // within-line undo record cannot express a line-count
+                    // change -- hence the linewise path (#X12).
+                    if new_content.contains('\n') {
+                        let parts: Vec<String> =
+                            new_content.split('\n').map(|s| s.to_string()).collect();
+                        self.undo.record_replace_lines(
+                            Position::new(line_num, 0),
+                            std::slice::from_ref(&content),
+                            &parts,
+                        );
+                        self.buffer.delete_lines(line_num, line_num);
+                        for (i, part) in parts.iter().enumerate() {
+                            self.buffer
+                                .insert_line_after(line_num - 1 + i, Line::from(part.as_str()));
+                        }
+                        // Later lines in the range have shifted down by the
+                        // number of extra lines introduced here.
+                        end += parts.len() - 1;
+                        total_count += count;
+                        continue;
+                    }
                     self.undo.record_replace(
                         Position::new(line_num, 0),
                         &content,
@@ -2726,9 +2959,25 @@ impl Editor {
                         false,
                     );
                     self.buffer.replace_line(line_num, &new_content)?;
+
+                    // `p`, `l` and `#` echo each changed line; `l` uses the
+                    // unambiguous form and `#` prefixes the line number.
+                    if sub.should_print() || sub.should_list() || sub.should_number() {
+                        let body = if sub.should_list() {
+                            Self::list_form(&new_content)
+                        } else {
+                            new_content.clone()
+                        };
+                        printed.push(if sub.should_number() {
+                            format!("{}\t{}", line_num, body)
+                        } else {
+                            body
+                        });
+                    }
                 }
                 total_count += count;
             }
+            line_num += 1;
         }
 
         if total_count == 0 {
@@ -2743,24 +2992,156 @@ impl Editor {
                 replacement: replacement.to_string(),
                 global: flags.global,
             });
+            // #X28: the substitute pattern becomes the last RE, so a following
+            // bare `n` or `//` reuses it.
+            self.set_last_regex(pattern);
         }
 
+        self.substitute_output = printed;
         Ok(())
     }
 
+    /// The last RE used by a search or substitute (#X28).
+    fn last_regex(&self) -> Option<&str> {
+        self.last_regex.as_deref().or_else(|| self.search.pattern())
+    }
+
+    /// Record the last RE used, so `:s//repl/` and a bare `n` agree.
+    fn set_last_regex(&mut self, pattern: &str) {
+        self.last_regex = Some(pattern.to_string());
+    }
+
+    /// Ask whether to apply one substitution (the `c` flag).
+    ///
+    /// POSIX/historical ex reads the answer from standard input, in batch as
+    /// well as interactively, so a script can answer inline. A line beginning
+    /// with `y` accepts; anything else (including EOF) declines.
+    fn confirm_substitution(line: &str, start: usize, end: usize) -> bool {
+        use std::io::{BufRead, Write};
+        let mut out = std::io::stdout();
+        let _ = writeln!(out, "{}", line);
+        let _ = writeln!(
+            out,
+            "{}{}",
+            " ".repeat(line[..start].chars().count()),
+            "^".repeat(line[start..end].chars().count().max(1))
+        );
+        let _ = out.flush();
+
+        let mut answer = String::new();
+        match std::io::stdin().lock().read_line(&mut answer) {
+            Ok(0) | Err(_) => false,
+            Ok(_) => answer.trim_start().starts_with('y'),
+        }
+    }
+
+    /// Render a line in `list` form, per ex.md §95237-95244:
+    ///
+    /// 1. characters in XBD Table 5-1 are written as their escape sequence;
+    /// 2. other non-printable characters as a three-digit octal escape per
+    ///    byte, most significant byte first;
+    /// 3. the end of the line is marked `$`, and a literal `$` is written
+    ///    `\$`.
+    ///
+    /// Shared by the `:list` command and the substitute `l` flag, which
+    /// previously disagreed -- `:l` used `^I`-style caret notation, escaped
+    /// neither backslash nor `$`, and so was not unambiguous at all.
+    fn list_form(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() + 1);
+        for c in s.chars() {
+            match c {
+                // XBD Table 5-1.
+                '\\' => out.push_str("\\\\"),
+                '\x07' => out.push_str("\\a"),
+                '\x08' => out.push_str("\\b"),
+                '\x0c' => out.push_str("\\f"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                '\x0b' => out.push_str("\\v"),
+                // A literal '$' must not be mistaken for the end marker.
+                '$' => out.push_str("\\$"),
+                c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                    out.push_str(&format!("\\{:03o}", c as u32));
+                }
+                // Non-ASCII: one octal escape per byte of the encoding.
+                c if !c.is_ascii() => {
+                    let mut buf = [0u8; 4];
+                    for b in c.encode_utf8(&mut buf).as_bytes() {
+                        out.push_str(&format!("\\{:03o}", b));
+                    }
+                }
+                c => out.push(c),
+            }
+        }
+        out.push('$');
+        out
+    }
+
     /// Write buffer to file.
-    fn write(&mut self, path: Option<&str>, _range: bool, append: bool, force: bool) -> Result<()> {
+    /// Execute an ex `write`.
+    ///
+    /// `lines` is `Some((start, end))` when an explicit address range was given,
+    /// i.e. only part of the buffer is being written. It used to be flattened to
+    /// a bool and then discarded, so `:1,5w out` silently wrote the *whole*
+    /// buffer (#X24).
+    ///
+    /// Implements the numbered rules in ex.md §95502-95519. Rules 2, 3 and 5 are
+    /// overridable by `!` or the `writeany` option; rule 6 is overridable by
+    /// neither, which is why it is checked last and ignores both.
+    fn write(
+        &mut self,
+        path: Option<&str>,
+        lines: Option<(usize, usize)>,
+        append: bool,
+        force: bool,
+    ) -> Result<()> {
+        // Rule 4: no file operand means the current pathname; absent that, fail.
+        let named = path.is_some();
         let path = path
             .map(PathBuf::from)
             .or_else(|| self.files.current_file().map(|p| p.to_path_buf()))
             .ok_or(ViError::NoFileName)?;
 
-        if !force && self.files.is_readonly() {
+        let overridable = force || self.options.writeany;
+        let is_current = self.files.current_file() == Some(path.as_path());
+        let exists = path.exists();
+
+        // Rule 2: the readonly edit option blocks the write.
+        if !overridable && self.is_readonly() {
             return Err(ViError::ReadOnly);
         }
 
-        let stats = write_file(&self.buffer, &path, append)?;
-        self.buffer.mark_saved();
+        // Rule 3: writing to a named file that is not the current pathname and
+        // already exists would clobber an unrelated file.
+        if !overridable && named && !is_current && exists {
+            return Err(ViError::FileExists(path.display().to_string()));
+        }
+
+        // Rule 5: the current pathname was changed by `:f` or `:r` and the file
+        // exists -- writing would clobber a file the user did not edit. A
+        // successful write clears the flag, so later writes do not re-fail.
+        if !overridable && !named && self.files.pathname_changed() && exists {
+            return Err(ViError::FileExists(path.display().to_string()));
+        }
+
+        // Rule 6: a partial write over an existing file. Not overridable by `!`
+        // or `writeany` -- it is absent from both lists in §95516-95518.
+        if lines.is_some() && exists {
+            return Err(ViError::PartialWriteExists(path.display().to_string()));
+        }
+
+        let stats = match lines {
+            Some((start, end)) => write_range(&self.buffer, &path, start, end, append)?,
+            None => write_file(&self.buffer, &path, append)?,
+        };
+
+        // Only a complete write means the buffer is saved; a partial write
+        // leaves the buffer modified.
+        if lines.is_none() {
+            self.buffer.mark_saved();
+        }
+        self.files.clear_pathname_changed();
 
         if self.files.current_file().is_none() {
             self.files.set_current_file(Some(path.clone()));
@@ -2770,10 +3151,21 @@ impl Editor {
         Ok(())
     }
 
+    /// Resolve an ex `write` address range to the lines to write.
+    ///
+    /// `None` means the whole buffer, which is what an absent range denotes.
+    fn write_line_range(&self, range: &AddressRange) -> Result<Option<(usize, usize)>> {
+        if range.explicit {
+            Ok(Some(self.resolve_range(range)?))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Write and quit.
     fn write_and_quit(&mut self) -> Result<()> {
         if self.buffer.is_modified() {
-            self.write(None, false, false, false)?;
+            self.write(None, None, false, false)?;
         }
         self.quit(true)
     }
@@ -3217,6 +3609,9 @@ impl Editor {
                 print: false,
                 count: false,
                 ignore_case: self.options.ignorecase,
+                list: false,
+                number: false,
+                line_count: None,
             };
             let range = AddressRange::current();
             self.substitute(&range, &last_sub.pattern, &last_sub.replacement, &flags)?;
@@ -3362,6 +3757,12 @@ impl Default for Editor {
     fn default() -> Self {
         Self::new(false, false).expect("Failed to create editor")
     }
+}
+
+/// True when `s` ends with an odd number of backslashes, i.e. the final
+/// backslash is escaping whatever follows (here, the newline).
+fn ends_with_odd_backslash(s: &str) -> bool {
+    s.chars().rev().take_while(|c| *c == '\\').count() % 2 == 1
 }
 
 #[cfg(test)]

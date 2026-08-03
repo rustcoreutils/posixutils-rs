@@ -16,6 +16,7 @@
 use super::Editor;
 use crate::buffer::{Line, Position, Range};
 use crate::error::{Result, ViError};
+use crate::ex::address::AddrCtx;
 use crate::ex::command::SubstituteFlags;
 use crate::ex::AddressRange;
 
@@ -25,48 +26,66 @@ impl Editor {
         &mut self,
         range: &AddressRange,
         count: Option<usize>,
+        force: bool,
     ) -> Result<()> {
         let current = self.buffer.cursor().line;
 
-        // Determine the range of lines to join
+        // Range/count interaction per ex.md §95043-95057.
+        //   count, no address     -> (., . + count)
+        //   count, one address    -> (addr, addr + count)
+        //   count, two addresses  -> (addr1, addr2 + count - 1)
+        //   no count, no address  -> (., . + 1)
+        //   no count, one address -> (addr, addr + 1)
+        // A resulting second address past the last line is clamped to it.
+        let two_addrs = range.end.is_some();
         let (start, mut end) = if range.explicit {
-            range.resolve(&self.buffer, current)?
-        } else if let Some(c) = count {
-            // No address: current line and current + count
-            (current, (current + c).min(self.buffer.line_count()))
+            range.resolve(&self.addr_ctx_at(current))?
         } else {
-            // No address, no count: current line and next line
-            (current, (current + 1).min(self.buffer.line_count()))
+            (current, current)
         };
-
-        // Apply count to extend the range if both range and count are specified
-        if let Some(c) = count {
-            if range.explicit {
-                end = (end + c - 1).min(self.buffer.line_count());
-            }
-        }
+        end = match count {
+            Some(c) if two_addrs => end + c.saturating_sub(1),
+            Some(c) => start + c,
+            None if two_addrs => end,
+            None => start + 1,
+        };
+        let end = end.min(self.buffer.line_count());
 
         if start >= end || start > self.buffer.line_count() {
             return Ok(()); // Nothing to join
         }
 
-        // Build the joined line
+        // Build the joined line following ex.md §95060-95070 exactly.
+        //
+        // `j!` joins with no modification at all. Otherwise, for each
+        // subsequent line: discard leading blanks; skip the line if that left
+        // it empty; join with no separator if the accumulated text already ends
+        // in a blank or the joined line starts with ')'; use TWO spaces if the
+        // accumulated text ends in '.'; otherwise a single space.
         let mut result = String::new();
         for line_num in start..=end {
             if let Some(line) = self.buffer.line(line_num) {
                 let content = line.content();
-                if result.is_empty() {
+                if line_num == start {
                     result = content.to_string();
-                } else {
-                    // Add space and trimmed content (POSIX: discard leading spaces)
-                    let trimmed = content.trim_start();
-                    if !trimmed.is_empty() {
-                        if !result.is_empty() && !result.ends_with(' ') {
-                            result.push(' ');
-                        }
-                        result.push_str(trimmed);
-                    }
+                    continue;
                 }
+                if force {
+                    result.push_str(content);
+                    continue;
+                }
+                let trimmed = content.trim_start_matches([' ', '\t']);
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if result.ends_with([' ', '\t']) || trimmed.starts_with(')') {
+                    // join without further modification
+                } else if result.ends_with('.') {
+                    result.push_str("  ");
+                } else {
+                    result.push(' ');
+                }
+                result.push_str(trimmed);
             }
         }
 
@@ -112,7 +131,7 @@ impl Editor {
     /// Execute :copy command - copy lines to destination.
     pub(super) fn execute_ex_copy(&mut self, range: &AddressRange, dest: usize) -> Result<()> {
         let current = self.buffer.cursor().line;
-        let (start, end) = range.resolve(&self.buffer, current)?;
+        let (start, end) = range.resolve(&self.addr_ctx_at(current))?;
 
         // Collect the lines to copy
         let mut lines_to_copy = Vec::new();
@@ -139,7 +158,7 @@ impl Editor {
     /// Execute :move command - move lines to destination.
     pub(super) fn execute_ex_move(&mut self, range: &AddressRange, dest: usize) -> Result<()> {
         let current = self.buffer.cursor().line;
-        let (start, end) = range.resolve(&self.buffer, current)?;
+        let (start, end) = range.resolve(&self.addr_ctx_at(current))?;
 
         // Can't move lines into themselves
         if dest >= start && dest <= end {
@@ -189,8 +208,9 @@ impl Editor {
         file: Option<&str>,
     ) -> Result<()> {
         let current = self.buffer.cursor().line;
+        // #X15: `0r file` is legal -- line 0 means "insert before line 1".
         let insert_after = if range.explicit {
-            let (_, end) = range.resolve(&self.buffer, current)?;
+            let (_, end) = range.resolve(&self.addr_ctx_allow_zero())?;
             end
         } else {
             current
@@ -443,9 +463,61 @@ impl Editor {
         self.substitute(range, &pattern, &replacement, flags)
     }
 
+    /// Address-resolution context relative to `current`.
+    ///
+    /// Everything that resolves an ex address should go through this or
+    /// [`Self::resolve_range`], so marks and the line-0 rule stay consistent.
+    pub(super) fn addr_ctx_at(&self, current: usize) -> AddrCtx<'_> {
+        AddrCtx {
+            buffer: &self.buffer,
+            current,
+            marks: &self.marks,
+            allow_zero: false,
+        }
+    }
+
+    /// Context relative to the cursor's line.
+    pub(super) fn addr_ctx(&self) -> AddrCtx<'_> {
+        self.addr_ctx_at(self.buffer.cursor().line)
+    }
+
+    /// Context for the commands that insert *after* an address, where line 0 is
+    /// legal and means "before the first line" (#X15).
+    pub(super) fn addr_ctx_allow_zero(&self) -> AddrCtx<'_> {
+        AddrCtx {
+            allow_zero: true,
+            ..self.addr_ctx()
+        }
+    }
+
     /// Resolve address range to line numbers.
     pub(super) fn resolve_range(&self, range: &AddressRange) -> Result<(usize, usize)> {
-        range.resolve(&self.buffer, self.buffer.cursor().line)
+        range.resolve(&self.addr_ctx())
+    }
+
+    /// Resolve a range down to the single line an insert-class command targets.
+    ///
+    /// Returns `None` when no address was given, so the caller can apply its own
+    /// default. `allow_zero` permits line 0, meaning "before the first line".
+    ///
+    /// These commands used to receive a `usize` that the *parser* had extracted,
+    /// and the parser could only read a literal `Address::Line(n)` -- every other
+    /// address form fell back to line 1 (#X25).
+    pub(super) fn resolve_target_line(
+        &self,
+        range: &AddressRange,
+        allow_zero: bool,
+    ) -> Result<Option<usize>> {
+        if !range.explicit {
+            return Ok(None);
+        }
+        let ctx = if allow_zero {
+            self.addr_ctx_allow_zero()
+        } else {
+            self.addr_ctx()
+        };
+        let (_, end) = range.resolve(&ctx)?;
+        Ok(Some(end))
     }
 
     /// Execute ex delete command (:d).

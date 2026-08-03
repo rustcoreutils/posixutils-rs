@@ -321,36 +321,92 @@ fn find_last_match(regex: &Regex, text: &str) -> Option<usize> {
     last_pos
 }
 
+/// Pending case conversion applied to replacement text as it is emitted.
+#[derive(Clone, Copy, PartialEq)]
+enum CaseMode {
+    None,
+    /// `\u` / `\l`: applies to the next character only.
+    OneUpper,
+    OneLower,
+    /// `\U` / `\L`: applies until `\e` or `\E`.
+    Upper,
+    Lower,
+}
+
 /// Build a `:s` replacement string for one match from its capture groups.
+///
 /// Supports `&` (whole match), `\1`-`\9` (back-references), `\&` (literal `&`),
-/// `\\` (literal backslash), and the `\n`/`\t` vi conveniences.
-fn build_replacement(template: &str, input: &str, matches: &[Match]) -> String {
+/// `\\` (literal backslash), the `\n`/`\t` vi conveniences, `~` (the previous
+/// replacement, passed in as `prev`), and the POSIX case escapes
+/// `\u \l \U \L \e \E` (ex.md §95726-95732).
+fn build_replacement(template: &str, input: &str, matches: &[Match], prev: &str) -> String {
     let mut result = String::with_capacity(template.len() + 16);
     let mut chars = template.chars();
+    // `sticky` is the \U/\L mode; `one_shot` is a pending \u/\l for one char.
+    let mut sticky = CaseMode::None;
+    let mut one_shot = CaseMode::None;
+
+    // Emit `s` honoring any pending case conversion.
+    let push = |result: &mut String, s: &str, sticky: &mut CaseMode, one: &mut CaseMode| {
+        for ch in s.chars() {
+            let converted = match *one {
+                CaseMode::OneUpper => {
+                    *one = CaseMode::None;
+                    ch.to_uppercase().collect::<String>()
+                }
+                CaseMode::OneLower => {
+                    *one = CaseMode::None;
+                    ch.to_lowercase().collect::<String>()
+                }
+                _ => match *sticky {
+                    CaseMode::Upper => ch.to_uppercase().collect::<String>(),
+                    CaseMode::Lower => ch.to_lowercase().collect::<String>(),
+                    _ => ch.to_string(),
+                },
+            };
+            result.push_str(&converted);
+        }
+    };
 
     while let Some(c) = chars.next() {
         match c {
             '&' => {
                 let m = matches[0];
-                result.push_str(&input[m.start..m.end]);
+                let text = input[m.start..m.end].to_string();
+                push(&mut result, &text, &mut sticky, &mut one_shot);
             }
+            // `~` stands for the previous replacement text (ex.md §95724).
+            '~' => push(&mut result, prev, &mut sticky, &mut one_shot),
             '\\' => match chars.next() {
                 Some('n') => result.push('\n'),
                 Some('t') => result.push('\t'),
-                Some('&') => result.push('&'),
-                Some('\\') => result.push('\\'),
+                Some('&') => push(&mut result, "&", &mut sticky, &mut one_shot),
+                Some('~') => push(&mut result, "~", &mut sticky, &mut one_shot),
+                Some('\\') => push(&mut result, "\\", &mut sticky, &mut one_shot),
+                Some('u') => one_shot = CaseMode::OneUpper,
+                Some('l') => one_shot = CaseMode::OneLower,
+                Some('U') => sticky = CaseMode::Upper,
+                Some('L') => sticky = CaseMode::Lower,
+                Some('e') | Some('E') => sticky = CaseMode::None,
                 Some(d @ '1'..='9') => {
                     let idx = d as usize - '0' as usize;
                     if let Some(m) = matches.get(idx) {
                         if m.end > m.start {
-                            result.push_str(&input[m.start..m.end]);
+                            let text = input[m.start..m.end].to_string();
+                            push(&mut result, &text, &mut sticky, &mut one_shot);
                         }
                     }
                 }
-                Some(other) => result.push(other),
+                Some(other) => {
+                    let text = other.to_string();
+                    push(&mut result, &text, &mut sticky, &mut one_shot);
+                }
                 None => result.push('\\'),
             },
-            _ => result.push(c),
+            _ => {
+                let text = c.to_string();
+                push(&mut result, &text, &mut sticky, &mut one_shot);
+            }
         }
     }
 
@@ -372,6 +428,67 @@ fn byte_to_char_offset(s: &str, byte_offset: usize) -> usize {
 
 /// Substitute engine for :s command.
 #[derive(Debug)]
+/// Everything `:s` needs, replacing what had grown to seven positional
+/// parameters.
+pub struct SubstituteConfig<'a> {
+    /// The BRE to match.
+    pub pattern: &'a str,
+    /// Replacement template.
+    pub replacement: &'a str,
+    /// `g` -- every match on the line, not just the first.
+    pub global: bool,
+    /// `c` -- confirm each substitution.
+    pub confirm: bool,
+    /// `p` -- print each changed line.
+    pub print: bool,
+    /// `l` -- print each changed line in unambiguous (`list`) form.
+    pub list: bool,
+    /// `#` -- print each changed line with its line number.
+    pub number: bool,
+    /// `n` -- report the match count without substituting.
+    pub count_only: bool,
+    /// The `ignorecase` edit option.
+    pub ignorecase: bool,
+    /// Previous replacement text, which `~` expands to (ex.md §95724).
+    pub prev_replacement: &'a str,
+}
+
+impl<'a> SubstituteConfig<'a> {
+    /// Minimal config: just a pattern and replacement, every flag off.
+    pub fn new(pattern: &'a str, replacement: &'a str) -> Self {
+        Self {
+            pattern,
+            replacement,
+            global: false,
+            confirm: false,
+            print: false,
+            list: false,
+            number: false,
+            count_only: false,
+            ignorecase: false,
+            prev_replacement: "",
+        }
+    }
+
+    /// Substitute every match on the line (`g`).
+    pub fn with_global(mut self, v: bool) -> Self {
+        self.global = v;
+        self
+    }
+
+    /// Report the match count without substituting (`n`).
+    pub fn with_count_only(mut self, v: bool) -> Self {
+        self.count_only = v;
+        self
+    }
+
+    /// Honor the `ignorecase` edit option.
+    pub fn with_ignorecase(mut self, v: bool) -> Self {
+        self.ignorecase = v;
+        self
+    }
+}
+
 pub struct Substitutor {
     /// Pattern regex.
     regex: Regex,
@@ -383,36 +500,37 @@ pub struct Substitutor {
     confirm: bool,
     /// Print flag.
     print: bool,
+    /// List flag (`l`).
+    list: bool,
+    /// Number flag (`#`).
+    number: bool,
     /// Count flag (count matches, don't substitute).
     count_only: bool,
+    /// Previous replacement, for `~`.
+    prev_replacement: String,
 }
 
 impl Substitutor {
     /// Create a new substitutor.
-    pub fn new(
-        pattern: &str,
-        replacement: &str,
-        global: bool,
-        confirm: bool,
-        print: bool,
-        count_only: bool,
-        ignorecase: bool,
-    ) -> Result<Self> {
+    pub fn new(cfg: SubstituteConfig<'_>) -> Result<Self> {
         // The :s pattern is a POSIX BRE (vi magic mode); compile via libc.
         let mut flags = RegexFlags::bre();
-        if ignorecase {
+        if cfg.ignorecase {
             flags = flags.ignore_case();
         }
         let regex =
-            Regex::new(pattern, flags).map_err(|e| ViError::InvalidPattern(e.to_string()))?;
+            Regex::new(cfg.pattern, flags).map_err(|e| ViError::InvalidPattern(e.to_string()))?;
 
         Ok(Self {
             regex,
-            replacement: replacement.to_string(),
-            global,
-            confirm,
-            print,
-            count_only,
+            replacement: cfg.replacement.to_string(),
+            global: cfg.global,
+            confirm: cfg.confirm,
+            print: cfg.print,
+            list: cfg.list,
+            number: cfg.number,
+            count_only: cfg.count_only,
+            prev_replacement: cfg.prev_replacement.to_string(),
         })
     }
 
@@ -433,7 +551,12 @@ impl Substitutor {
             let m = caps[0];
             let (ms, me) = (m.start, m.end);
             result.push_str(&line[last_end..ms]);
-            result.push_str(&build_replacement(&self.replacement, line, &caps));
+            result.push_str(&build_replacement(
+                &self.replacement,
+                line,
+                &caps,
+                &self.prev_replacement,
+            ));
             last_end = me;
             count += 1;
 
@@ -472,6 +595,68 @@ impl Substitutor {
     /// Check if print mode is on.
     pub fn should_print(&self) -> bool {
         self.print
+    }
+
+    /// True when the changed line should be shown in `list` (`l`) form.
+    pub fn should_list(&self) -> bool {
+        self.list
+    }
+
+    /// True when the changed line should be shown with its line number (`#`).
+    pub fn should_number(&self) -> bool {
+        self.number
+    }
+
+    /// Substitute in a single line, asking `confirm` whether to apply each
+    /// match. Used for the `c` flag; `substitute_line` is the unconditional
+    /// form. Returns (new_line, substitutions_applied).
+    pub fn substitute_line_confirmed<F>(&self, line: &str, mut confirm: F) -> (String, usize)
+    where
+        F: FnMut(&str, usize, usize) -> bool,
+    {
+        let mut result = String::new();
+        let mut last_end = 0usize;
+        let mut pos = 0usize;
+        let mut count = 0usize;
+
+        while let Some(caps) = self.regex.captures_at(line, pos) {
+            let m = caps[0];
+            let (ms, me) = (m.start, m.end);
+            result.push_str(&line[last_end..ms]);
+            if confirm(line, ms, me) {
+                result.push_str(&build_replacement(
+                    &self.replacement,
+                    line,
+                    &caps,
+                    &self.prev_replacement,
+                ));
+                count += 1;
+            } else {
+                result.push_str(&line[ms..me]);
+            }
+            last_end = me;
+
+            let next = if me > ms {
+                me
+            } else {
+                line[me..]
+                    .chars()
+                    .next()
+                    .map(|c| me + c.len_utf8())
+                    .unwrap_or(me + 1)
+            };
+            if next > line.len() {
+                break;
+            }
+            pos = next;
+
+            if !self.global {
+                break;
+            }
+        }
+
+        result.push_str(&line[last_end..]);
+        (result, count)
     }
 
     /// Check if count-only mode is on.
@@ -584,7 +769,7 @@ mod tests {
 
     #[test]
     fn test_substitute_simple() {
-        let sub = Substitutor::new("foo", "bar", false, false, false, false, false).unwrap();
+        let sub = Substitutor::new(SubstituteConfig::new("foo", "bar")).unwrap();
         let (result, count) = sub.substitute_line("foo baz foo");
         assert_eq!(result, "bar baz foo");
         assert_eq!(count, 1);
@@ -592,7 +777,7 @@ mod tests {
 
     #[test]
     fn test_substitute_global() {
-        let sub = Substitutor::new("foo", "bar", true, false, false, false, false).unwrap();
+        let sub = Substitutor::new(SubstituteConfig::new("foo", "bar").with_global(true)).unwrap();
         let (result, count) = sub.substitute_line("foo baz foo");
         assert_eq!(result, "bar baz bar");
         assert_eq!(count, 2);
@@ -600,7 +785,12 @@ mod tests {
 
     #[test]
     fn test_substitute_count_only() {
-        let sub = Substitutor::new("foo", "bar", true, false, false, true, false).unwrap();
+        let sub = Substitutor::new(
+            SubstituteConfig::new("foo", "bar")
+                .with_global(true)
+                .with_count_only(true),
+        )
+        .unwrap();
         let (result, count) = sub.substitute_line("foo baz foo");
         assert_eq!(result, "foo baz foo"); // Unchanged
         assert_eq!(count, 2);
@@ -608,14 +798,14 @@ mod tests {
 
     #[test]
     fn test_substitute_ampersand() {
-        let sub = Substitutor::new("foo", "[&]", false, false, false, false, false).unwrap();
+        let sub = Substitutor::new(SubstituteConfig::new("foo", "[&]")).unwrap();
         let (result, _) = sub.substitute_line("foo bar");
         assert_eq!(result, "[foo] bar");
     }
 
     #[test]
     fn test_substitute_no_match() {
-        let sub = Substitutor::new("xyz", "abc", false, false, false, false, false).unwrap();
+        let sub = Substitutor::new(SubstituteConfig::new("xyz", "abc")).unwrap();
         let (result, count) = sub.substitute_line("foo bar");
         assert_eq!(result, "foo bar");
         assert_eq!(count, 0);
@@ -625,8 +815,8 @@ mod tests {
     fn test_substitute_bre_grouping_backref() {
         // POSIX BRE \(...\) grouping with \1/\2 back-references in pattern and
         // replacement. The old ERE engine could not do in-pattern back-refs.
-        let sub =
-            Substitutor::new(r"\(a\)\(b\)", r"\2\1", true, false, false, false, false).unwrap();
+        let sub = Substitutor::new(SubstituteConfig::new(r"\(a\)\(b\)", r"\2\1").with_global(true))
+            .unwrap();
         let (result, count) = sub.substitute_line("ab ab");
         assert_eq!(result, "ba ba");
         assert_eq!(count, 2);
@@ -635,7 +825,7 @@ mod tests {
     #[test]
     fn test_substitute_bre_interval() {
         // BRE \{n\} interval.
-        let sub = Substitutor::new(r"a\{2\}", "X", false, false, false, false, false).unwrap();
+        let sub = Substitutor::new(SubstituteConfig::new(r"a\{2\}", "X")).unwrap();
         let (result, count) = sub.substitute_line("caab");
         assert_eq!(result, "cXb");
         assert_eq!(count, 1);
@@ -644,7 +834,7 @@ mod tests {
     #[test]
     fn test_substitute_bre_plus_is_literal() {
         // In BRE, '+' is an ordinary character (not "one or more").
-        let sub = Substitutor::new("a+", "X", false, false, false, false, false).unwrap();
+        let sub = Substitutor::new(SubstituteConfig::new("a+", "X")).unwrap();
         let (result, count) = sub.substitute_line("a+b");
         assert_eq!(result, "Xb");
         assert_eq!(count, 1);

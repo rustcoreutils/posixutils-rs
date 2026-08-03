@@ -10,6 +10,37 @@
 use super::fuser_test;
 use std::{fs::File, path::PathBuf, process::Command, str};
 
+/// Block until `pid` has `path` open, or a short timeout elapses.
+///
+/// Polls `/proc/<pid>/fd` on Linux; elsewhere it just yields briefly, since the
+/// tests that need this are Linux-gated anyway.
+fn wait_for_open_fd(pid: u32, path: &str) {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        #[cfg(target_os = "linux")]
+        {
+            let fd_dir = format!("/proc/{}/fd", pid);
+            if let Ok(entries) = std::fs::read_dir(&fd_dir) {
+                for e in entries.flatten() {
+                    if let Ok(target) = std::fs::read_link(e.path()) {
+                        if target.to_string_lossy() == path {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (pid, path);
+            std::thread::sleep(Duration::from_millis(200));
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Tests the basic functionality of `fuser` by ensuring it can find the PID of a process.
 ///
 /// **Setup:**
@@ -19,11 +50,12 @@ use std::{fs::File, path::PathBuf, process::Command, str};
 /// - Verifies that the PID of the process is included in the output of `fuser`.
 #[test]
 fn test_fuser_basic() {
+    // Unique per run: the path used to be a fixed `$TMPDIR/test_file`, shared
+    // with the sibling tests that cargo runs in parallel, so one test could
+    // delete the file another was still using.
     fn get_temp_file_path() -> PathBuf {
         let mut path = std::env::temp_dir();
-
-        path.push("test_file");
-
+        path.push(format!("fuser_basic_test_{}", std::process::id()));
         path
     }
     let binding = get_temp_file_path();
@@ -37,6 +69,12 @@ fn test_fuser_basic() {
         .expect("Failed to start process");
 
     let pid = process.id();
+
+    // `tail` is spawned asynchronously and has not necessarily opened the file
+    // by the time fuser scans /proc. Waiting for the descriptor to appear
+    // removes the race that made this test fail intermittently in CI; the
+    // sibling format test already sleeps for the same reason.
+    wait_for_open_fd(pid, temp_file_path);
 
     fuser_test(vec![temp_file_path.to_string()], "", 0, |_, output| {
         let stdout_str = str::from_utf8(&output.stdout).expect("Invalid UTF-8 in stdout");
@@ -59,7 +97,7 @@ fn test_fuser_basic() {
 fn test_fuser_pid_format_single_space() {
     let temp_file_path = {
         let mut path = std::env::temp_dir();
-        path.push("test_file_fmt");
+        path.push(format!("fuser_fmt_test_{}", std::process::id()));
         path
     };
     let temp_file_path = temp_file_path.to_str().unwrap();
@@ -70,7 +108,7 @@ fn test_fuser_pid_format_single_space() {
         .arg(temp_file_path)
         .spawn()
         .expect("Failed to start process");
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    wait_for_open_fd(process.id(), temp_file_path);
 
     fuser_test(vec![temp_file_path.to_string()], "", 0, |_, output| {
         let stdout = str::from_utf8(&output.stdout).expect("Invalid UTF-8 in stdout");

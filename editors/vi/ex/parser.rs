@@ -54,9 +54,10 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
         // Write commands
         "w" | "write" => parse_write(range, args, false),
         "w!" => parse_write(range, args, true),
-        "wq" => parse_write_quit(range, args, false),
-        "wq!" => parse_write_quit(range, args, true),
-        "x" | "xit" => parse_write_quit(range, args, false),
+        "wq" => parse_write_quit(range, args, false, false),
+        "wq!" => parse_write_quit(range, args, true, false),
+        "x" | "xit" => parse_write_quit(range, args, false, true),
+        "x!" | "xit!" => parse_write_quit(range, args, true, true),
 
         // Quit commands
         "q" | "quit" => Ok(ExCommand::Quit { force: false }),
@@ -85,13 +86,7 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
             if let Some(cmd) = args.strip_prefix('!') {
                 // Shell read
                 Ok(ExCommand::ShellRead {
-                    line: range.start.as_ref().and_then(|a| {
-                        if let Address::Line(n) = a {
-                            Some(*n)
-                        } else {
-                            None
-                        }
-                    }),
+                    range,
                     command: cmd.trim().to_string(),
                 })
             } else {
@@ -129,16 +124,7 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
         // Put command
         "pu" | "put" => {
             let register = args.chars().next().filter(|c| c.is_ascii_alphabetic());
-            Ok(ExCommand::Put {
-                line: range.start.as_ref().and_then(|a| {
-                    if let Address::Line(n) = a {
-                        Some(*n)
-                    } else {
-                        None
-                    }
-                }),
-                register,
-            })
+            Ok(ExCommand::Put { range, register })
         }
 
         // Copy command
@@ -178,6 +164,12 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
         "j" | "join" => Ok(ExCommand::Join {
             range,
             count: parse_optional_count(args),
+            force: false,
+        }),
+        "j!" | "join!" => Ok(ExCommand::Join {
+            range,
+            count: parse_optional_count(args),
+            force: true,
         }),
 
         // Set command
@@ -200,16 +192,7 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
                 .chars()
                 .next()
                 .ok_or(ViError::InvalidCommand("mark name required".to_string()))?;
-            Ok(ExCommand::Mark {
-                line: range.start.as_ref().and_then(|a| {
-                    if let Address::Line(n) = a {
-                        Some(*n)
-                    } else {
-                        None
-                    }
-                }),
-                name,
-            })
+            Ok(ExCommand::Mark { range, name })
         }
 
         // Shell command
@@ -313,60 +296,22 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
         }
 
         // Text input commands
-        "a" | "append" => {
-            let line = range
-                .start
-                .as_ref()
-                .and_then(|a| {
-                    if let Address::Line(n) = a {
-                        Some(*n)
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or(1); // Default to current line (will be resolved later)
-            Ok(ExCommand::Append { line })
-        }
-        "i" | "insert" => {
-            let line = range
-                .start
-                .as_ref()
-                .and_then(|a| {
-                    if let Address::Line(n) = a {
-                        Some(*n)
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or(1);
-            Ok(ExCommand::Insert { line })
-        }
+        "a" | "append" => Ok(ExCommand::Append { range }),
+        "i" | "insert" => Ok(ExCommand::Insert { range }),
         "c" | "change" => Ok(ExCommand::Change { range }),
 
         // Visual and open mode commands
         "vi" | "visual" => Ok(ExCommand::Visual),
-        "o" | "open" => {
-            let line = range.start.as_ref().and_then(|a| {
-                if let Address::Line(n) = a {
-                    Some(*n)
-                } else {
-                    None
-                }
-            });
-            Ok(ExCommand::Open { line })
-        }
+        "o" | "open" => Ok(ExCommand::Open { range }),
 
         // Adjust window (z command)
         "z" => {
-            let line = range.start.as_ref().and_then(|a| {
-                if let Address::Line(n) = a {
-                    Some(*n)
-                } else {
-                    None
-                }
-            });
             let (ztype, count) = parse_z_args(args);
-            Ok(ExCommand::Z { line, ztype, count })
+            Ok(ExCommand::Z {
+                range,
+                ztype,
+                count,
+            })
         }
 
         // Shift left/right
@@ -380,23 +325,15 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
         }),
 
         // Write line number
-        "=" => {
-            let line = range.start.as_ref().and_then(|a| {
-                if let Address::Line(n) = a {
-                    Some(*n)
-                } else {
-                    None
-                }
-            });
-            Ok(ExCommand::LineNumber { line })
-        }
+        "=" => Ok(ExCommand::LineNumber { range }),
 
         // Execute buffer
         "@" | "*" => {
-            let buffer = args
-                .chars()
-                .next()
-                .filter(|c| c.is_ascii_alphabetic() || *c == '@' || *c == '*');
+            // `@@` (and `@*`) mean "repeat the last executed buffer", so they
+            // must resolve to None here and let the executor fall back to
+            // `last_macro_register`. Treating '@' as a buffer *name* made
+            // `@@` fail with `Buffer "@" is empty`.
+            let buffer = args.chars().next().filter(|c| c.is_ascii_alphabetic());
             Ok(ExCommand::Execute { range, buffer })
         }
 
@@ -407,6 +344,17 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
         "&" => {
             let flags = SubstituteFlags::parse(args);
             Ok(ExCommand::RepeatSubstitute { range, flags })
+        }
+
+        // Repeat substitute with the LAST RE rather than the previous
+        // substitute's pattern (#X18). `&` reuses both pattern and
+        // replacement; `~` reuses the replacement but takes the pattern from
+        // the most recent RE, whether that came from a search or a substitute.
+        "~" => {
+            let (flags_str, line_count) = split_subst_flags(args);
+            let mut flags = SubstituteFlags::parse(&flags_str);
+            flags.line_count = line_count;
+            Ok(ExCommand::TildeSubstitute { range, flags })
         }
 
         // Print with line numbers (#) - alias for number
@@ -431,6 +379,7 @@ fn split_command(input: &str) -> (&str, &str) {
         Some('@') => return ("@", input[1..].trim_start()),
         Some('*') => return ("*", input[1..].trim_start()),
         Some('&') => return ("&", input[1..].trim_start()),
+        Some('~') => return ("~", input[1..].trim_start()),
         Some('#') => return ("#", input[1..].trim_start()),
         _ => {}
     }
@@ -498,33 +447,53 @@ fn parse_write(range: AddressRange, args: &str, force: bool) -> Result<ExCommand
 }
 
 /// Parse write-quit command.
-fn parse_write_quit(range: AddressRange, args: &str, force: bool) -> Result<ExCommand> {
+fn parse_write_quit(range: AddressRange, args: &str, force: bool, xit: bool) -> Result<ExCommand> {
     let file = if args.is_empty() {
         None
     } else {
         Some(args.to_string())
     };
-    Ok(ExCommand::WriteQuit { range, file, force })
+    Ok(ExCommand::WriteQuit {
+        range,
+        file,
+        force,
+        xit,
+    })
 }
 
 /// Parse substitute command.
 fn parse_substitute(range: AddressRange, args: &str) -> Result<ExCommand> {
-    // s/pattern/replacement/flags
-    if args.is_empty() {
-        return Err(ViError::NoPreviousSubstitution);
+    // s[/pattern/replacement/][flags][count]
+    //
+    // A bare `s`, and an empty pattern (`s//repl/`), both mean "reuse the last
+    // regular expression" (ex.md §95700). Both used to be rejected outright as
+    // NoPreviousSubstitution, which is a decision only the editor can make --
+    // it is the one that knows whether a previous RE exists. An empty
+    // `pattern` is therefore passed through and resolved at execution time.
+    let args = args.trim_start();
+
+    // Bare `s`, optionally followed by flags/count: `s`, `s g`, `s 3`.
+    if args.is_empty() || args.chars().next().is_some_and(|c| c.is_alphanumeric()) {
+        let (flags, line_count) = split_subst_flags(args);
+        let mut flags = SubstituteFlags::parse(&flags);
+        flags.line_count = line_count;
+        return Ok(ExCommand::Substitute {
+            range,
+            pattern: String::new(),
+            replacement: "~".to_string(),
+            flags,
+        });
     }
 
     let delim = args.chars().next().unwrap();
-    let parts: Vec<&str> = args[1..].split(delim).collect();
+    let parts: Vec<&str> = args[delim.len_utf8()..].split(delim).collect();
 
     let pattern = parts.first().unwrap_or(&"").to_string();
     let replacement = parts.get(1).unwrap_or(&"").to_string();
-    let flags_str = parts.get(2).unwrap_or(&"");
-    let flags = SubstituteFlags::parse(flags_str);
-
-    if pattern.is_empty() {
-        return Err(ViError::NoPreviousSubstitution);
-    }
+    let trailing = parts.get(2).unwrap_or(&"");
+    let (flags_str, line_count) = split_subst_flags(trailing);
+    let mut flags = SubstituteFlags::parse(&flags_str);
+    flags.line_count = line_count;
 
     Ok(ExCommand::Substitute {
         range,
@@ -532,6 +501,23 @@ fn parse_substitute(range: AddressRange, args: &str) -> Result<ExCommand> {
         replacement,
         flags,
     })
+}
+
+/// Split a substitute suffix into its flag letters and a trailing numeric
+/// count, e.g. `"g3"` -> `("g", Some(3))`.
+fn split_subst_flags(s: &str) -> (String, Option<usize>) {
+    let s = s.trim();
+    let digits_at = s
+        .char_indices()
+        .position(|(_, c)| c.is_ascii_digit())
+        .and_then(|_| s.find(|c: char| c.is_ascii_digit()));
+    match digits_at {
+        Some(i) => {
+            let (flags, num) = s.split_at(i);
+            (flags.trim().to_string(), num.trim().parse().ok())
+        }
+        None => (s.to_string(), None),
+    }
 }
 
 /// Parse global command.

@@ -375,3 +375,57 @@ fn test_pty_vi_underscore_first_nonblank() {
     let contents = std::fs::read_to_string(&file_path).unwrap();
     assert_eq!(contents, "    Xndented\n");
 }
+
+#[test]
+fn test_pty_vi_substitute_char_saves_to_register() {
+    // #V17: `s` was handled in the pre-parser fast path, so it saved nothing
+    // to a register, recorded no undo, and ignored a count. Here `3s` must
+    // replace three characters AND leave them in the unnamed register, so a
+    // following `p` can put them back.
+    let td = tempdir().unwrap();
+    let file_path = td.path().join("test.txt");
+    std::fs::write(&file_path, "abcdef\n").unwrap();
+
+    let mut vi = ViPtySession::new(&file_path, 25, 80);
+    vi.sleep_ms(500);
+    vi.keys("3sX\x1b");
+    vi.sleep_ms(100);
+    vi.keys("p");
+    vi.sleep_ms(100);
+    vi.keys(":wq\r");
+    vi.wait();
+
+    let contents = std::fs::read_to_string(&file_path).unwrap();
+    assert_eq!(
+        contents.trim_end(),
+        "Xabcdef",
+        "3s must delete three chars into the unnamed register so p restores them"
+    );
+}
+
+#[test]
+fn test_pty_vi_nul_reinserts_previous_input() {
+    // #V15: a NUL in insert mode re-inserts the text from the previous insert
+    // session. It needs cross-session storage, which is why it was deferred.
+    let td = tempdir().unwrap();
+    let file_path = td.path().join("test.txt");
+    std::fs::write(&file_path, "").unwrap();
+
+    let mut vi = ViPtySession::new(&file_path, 25, 80);
+    vi.sleep_ms(500);
+    // First session inserts "abc".
+    vi.keys("iabc\x1b");
+    vi.sleep_ms(100);
+    // Second session sends a NUL, which must replay "abc".
+    vi.keys("a\x00\x1b");
+    vi.sleep_ms(100);
+    vi.keys(":wq\r");
+    vi.wait();
+
+    let contents = std::fs::read_to_string(&file_path).unwrap();
+    assert_eq!(
+        contents.trim_end(),
+        "abcabc",
+        "NUL in insert mode must re-insert the previous session's text"
+    );
+}

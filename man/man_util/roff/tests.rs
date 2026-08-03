@@ -360,3 +360,43 @@ fn so_mutual_include_cycle_terminates() {
     assert!(out.contains('A') && out.contains('B'));
     assert_eq!(out.lines().count(), 2, "cycle re-expanded: {out:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Global output budgets (#M6, #M8).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn string_register_doubling_chain_is_bounded() {
+    // The classic billion-laughs shape, in roff: each register doubles the next.
+    // It is acyclic and only as deep as the chain, so neither the cycle set nor
+    // the depth cap sees it — 30 lines expanded to 400 MB of output and 2 GB
+    // resident. All of it lands on a single line, so a line budget cannot see it
+    // either.
+    let mut src = String::from(".ds L0 xxxxxxxxxx\n");
+    for i in 1..=30 {
+        src.push_str(&format!(".ds L{i} \\*[L{}]\\*[L{}]\n", i - 1, i - 1));
+    }
+    src.push_str("\\*[L30]\n");
+    let out = run(&src);
+    assert!(
+        out.len() <= 2 << 20,
+        "expansion not bounded: {} bytes",
+        out.len()
+    );
+}
+
+#[test]
+fn while_loop_budget_is_global_not_per_iteration() {
+    // A `.while` whose body invokes an endlessly self-recursive macro. Each
+    // iteration used to get its own two-million-line allowance, so the loop's
+    // iteration cap multiplied it: 100,000 x 2,000,000 lines. The counter is now
+    // on the interpreter, not the loop, so the whole page shares one allowance.
+    let src = ".de R\nx\n.R\n..\n.nr i 0\n\
+               .while \\n[i]<100000 \\{\\\n.R\n.nr i +1\n\\}\n";
+    let out = run(src);
+    assert!(
+        out.len() <= 80 << 20,
+        "output not bounded: {} bytes",
+        out.len()
+    );
+}

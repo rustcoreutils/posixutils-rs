@@ -41,6 +41,15 @@ const MAX_INTERPOLATION_DEPTH: u32 = 64;
 /// costs a `fork`+`exec` of `cat`/`zcat`, so this bounds that too.
 const MAX_SO_INCLUDES: usize = 256;
 
+/// Maximum text a single line's escape expansion may produce.
+const MAX_INTERPOLATION_BYTES: usize = 1 << 20;
+
+/// Maximum total output. See [`Roff::over_budget`].
+const MAX_OUTPUT_BYTES: usize = 64 << 20;
+
+/// Maximum `.while` iterations, on top of the global budget.
+const MAX_WHILE_ITERATIONS: usize = 100_000;
+
 /// A user-defined macro body (the lines between `.de NAME` and `..`).
 type MacroBody = Vec<String>;
 
@@ -75,6 +84,10 @@ pub struct Roff {
     loader: Option<SoLoader>,
     /// `.so` targets already included, for cycle detection.
     so_included: HashSet<String>,
+    /// Lines processed so far, across every nesting level. See [`Roff::over_budget`].
+    steps: usize,
+    /// Bytes emitted so far, across every nesting level.
+    out_bytes: usize,
 }
 
 /// Preprocess `input`, resolving `.so` targets through `loader`.
@@ -93,11 +106,9 @@ impl Roff {
     /// Run the interpreter over `input` and return the normalized text.
     pub fn run(mut self, input: &str) -> String {
         let mut queue: Vec<String> = input.lines().rev().map(|l| l.to_string()).collect();
-        let mut steps = 0usize;
 
         while let Some(line) = queue.pop() {
-            steps += 1;
-            if steps > MAX_OUTPUT_LINES || queue.len() > MAX_QUEUE {
+            if self.over_budget() || queue.len() > MAX_QUEUE {
                 break;
             }
             self.process_line(line, &mut queue);
@@ -115,7 +126,20 @@ impl Roff {
         }
     }
 
+    /// Whether the interpreter has spent its budget and should stop.
+    ///
+    /// Both counters are on `self` rather than local to a loop, so they are
+    /// genuinely global: `.while` bodies, macro expansions and `.so` inclusions
+    /// all draw on the same allowance. The byte counter is the one that matters
+    /// for a `.ds` doubling chain (`.ds A \*A\*A`, repeated) — that produces
+    /// exponential output on a *single* line, which a line count cannot see. It
+    /// reached 400 MB of output and 2 GB resident before this existed.
+    fn over_budget(&self) -> bool {
+        self.steps > MAX_OUTPUT_LINES || self.out_bytes > MAX_OUTPUT_BYTES
+    }
+
     fn process_line(&mut self, line: String, queue: &mut Vec<String>) {
+        self.steps += 1;
         // A control line begins with the control char `.` or the no-break `'`.
         let control = line.starts_with('.') || line.starts_with('\'');
         if !control {
@@ -194,6 +218,10 @@ impl Roff {
 
     /// Route an emitted line to the active diversion, or to the output.
     fn emit_line(&mut self, line: String) {
+        self.out_bytes = self.out_bytes.saturating_add(line.len() + 1);
+        if self.over_budget() {
+            return;
+        }
         match &mut self.divert {
             Some(d) => d.buf.push(line),
             None => self.out.push(line),
@@ -391,14 +419,15 @@ impl Roff {
         let mut iters = 0;
         while self.eval_condition(args).0 {
             iters += 1;
-            if iters > 100_000 || body.is_empty() {
+            // `self.steps` is global, so the inner budget is not reset per
+            // iteration: previously each of 100,000 iterations was allowed its
+            // own two-million-line allowance.
+            if iters > MAX_WHILE_ITERATIONS || body.is_empty() || self.over_budget() {
                 break;
             }
             let mut subq: Vec<String> = body.iter().rev().cloned().collect();
-            let mut steps = 0;
             while let Some(l) = subq.pop() {
-                steps += 1;
-                if steps > MAX_OUTPUT_LINES {
+                if self.over_budget() {
                     break;
                 }
                 self.process_line(l, &mut subq);
@@ -611,8 +640,12 @@ impl Roff {
     /// `\*[name]` string registers, and `\w'…'` width escapes. Other escapes are
     /// left for the downstream escape layer.
     fn interpolate(&self, input: &str) -> String {
-        let mut active = HashSet::new();
-        self.interpolate_guarded(input, 0, &mut active)
+        let mut state = Interp {
+            depth: 0,
+            active: HashSet::new(),
+            remaining: MAX_INTERPOLATION_BYTES,
+        };
+        self.interpolate_guarded(input, &mut state)
     }
 
     /// The body of [`Roff::interpolate`], carrying the recursion guards.
@@ -624,15 +657,37 @@ impl Roff {
     /// unwinding. `active` holds the names currently being expanded, which is
     /// what actually breaks a cycle; `depth` additionally bounds the acyclic but
     /// deep case (a chain of distinct registers, or nested `\w'…'`).
-    fn interpolate_guarded(&self, input: &str, depth: u32, active: &mut HashSet<String>) -> String {
-        if depth >= MAX_INTERPOLATION_DEPTH {
+    ///
+    /// `remaining` bounds the total text produced. Neither guard above covers the
+    /// classic doubling chain — `.ds A \*B\*B` where `B` doubles `C`, and so on —
+    /// which is acyclic, only as deep as the chain is long, and yet expands
+    /// exponentially. It produced 400 MB of output from a few dozen input lines.
+    fn interpolate_guarded(&self, input: &str, st: &mut Interp) -> String {
+        if st.depth >= MAX_INTERPOLATION_DEPTH {
             return input.to_string();
         }
         let mut out = String::with_capacity(input.len());
         let mut chars = input.char_indices().peekable();
 
+        macro_rules! emit {
+            ($s:expr) => {{
+                let s: &str = &$s;
+                if st.remaining < s.len() {
+                    st.remaining = 0;
+                    return out;
+                }
+                st.remaining -= s.len();
+                out.push_str(s);
+            }};
+        }
+
         while let Some((_, c)) = chars.next() {
             if c != '\\' {
+                if st.remaining < c.len_utf8() {
+                    st.remaining = 0;
+                    return out;
+                }
+                st.remaining -= c.len_utf8();
                 out.push(c);
                 continue;
             }
@@ -641,7 +696,7 @@ impl Roff {
                     chars.next();
                     let name = read_escape_name(&mut chars);
                     let val = self.nr.get(&name).copied().unwrap_or(0);
-                    out.push_str(&val.to_string());
+                    emit!(val.to_string());
                 }
                 Some('*') => {
                     chars.next();
@@ -650,27 +705,47 @@ impl Roff {
                         // Resolve nested interpolations, unless this register is
                         // already being expanded further up the stack — in which
                         // case it expands to nothing, as in groff.
-                        if active.insert(name.clone()) {
+                        if st.active.insert(name.clone()) {
                             let v = v.clone();
-                            out.push_str(&self.interpolate_guarded(&v, depth + 1, active));
-                            active.remove(&name);
+                            st.depth += 1;
+                            let expanded = self.interpolate_guarded(&v, st);
+                            st.depth -= 1;
+                            st.active.remove(&name);
+                            // Already charged against `remaining` by the recursive
+                            // call, so append it directly.
+                            out.push_str(&expanded);
+                            if st.remaining == 0 {
+                                return out;
+                            }
                         }
                     }
                 }
                 Some('w') => {
                     chars.next();
                     if let Some(width) = read_quoted(&mut chars) {
-                        let resolved = self.interpolate_guarded(&width, depth + 1, active);
-                        out.push_str(&display_cells(&resolved).to_string());
+                        st.depth += 1;
+                        let resolved = self.interpolate_guarded(&width, st);
+                        st.depth -= 1;
+                        emit!(display_cells(&resolved).to_string());
                     } else {
-                        out.push_str("\\w");
+                        emit!("\\w");
                     }
                 }
-                _ => out.push('\\'),
+                _ => emit!("\\"),
             }
         }
         out
     }
+}
+
+/// Mutable state threaded through [`Roff::interpolate_guarded`].
+struct Interp {
+    /// Current expansion nesting level.
+    depth: u32,
+    /// String-register names currently being expanded, for cycle detection.
+    active: HashSet<String>,
+    /// Bytes of expansion still allowed.
+    remaining: usize,
 }
 
 /// Recognized built-in request names (used by the `d` condition).

@@ -399,8 +399,26 @@ duplicates ~300 lines of `at.rs` verbatim instead of sharing them.
   `TZ`-adjusted (87010-87012). Same root cause as `at` #A5/#A14.
 - [x] **#B5 — allow/deny "neither exists" rule inverted (XSI).** `is_user_allowed`
   open-by-default (`batch.rs:313-329`); spec 86961-86962.
-- [ ] **#B6 — `SHELL`/`TZ` env semantics (86991-87000) not honored** — uses the
-  passwd shell; no `TZ`-relative scheduling.
+- [x] **#B6 — `SHELL`/`TZ` env semantics (86991-87000) not honored** — ~~uses the
+  passwd shell; no `TZ`-relative scheduling.~~ **✓ fixed (2026-08-03), with the
+  finding corrected.** Two halves, only one of which was broken:
+  * **`SHELL` — real, and narrower than recorded.** POSIX permits using the
+    login shell *when `SHELL` is set to a non-`sh` value*, but mandates that
+    when it is "unset or null, sh **shall** be used" (86992). `spool.rs`
+    consulted `$SHELL` only when the passwd entry had no shell, so the
+    precedence was inverted and the unset case ran the login shell — the one
+    outcome the spec does not allow. `$SHELL` is now authoritative, falling
+    back to `/bin/sh`; the passwd shell is no longer consulted for job
+    execution. Tests `test_at_shell_env_selects_the_interpreter`,
+    `test_at_unset_shell_falls_back_to_sh` (both confirmed to fail pre-fix).
+  * **`TZ` — the claim was wrong; it already worked.** Verified rather than
+    assumed: the same wall-clock `-t 202701011200.00` stores different absolute
+    instants per zone (UTC vs `America/New_York` = +5h, vs `Asia/Tokyo` = −9h,
+    both correct for January). The submission notice prints in local time and
+    so reads identically in every zone, which is presumably what made this look
+    unimplemented. Pinned by `test_at_tz_determines_the_absolute_execution_time`,
+    which asserts on the spool filename's encoded minute — the only observable
+    that distinguishes the zones.
 - [x] **#B7 — Massive duplication of `at.rs`.** `User`, `Job`, `next_job_id`,
   `get_job_dir`, `is_user_allowed`, `job_file_name` are copy-pasted
   (`batch.rs:82-397` ≈ `at.rs:259-686`). Not a conformance issue, but it

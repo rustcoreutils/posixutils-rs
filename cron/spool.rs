@@ -444,13 +444,17 @@ impl User {
 
             let name = CStr::from_ptr(pw_name).to_str().ok()?.to_owned();
 
-            let shell = if pw_shell.is_null() {
-                std::env::var("SHELL").unwrap_or_else(|_| DEFAULT_SHELL.to_owned())
-            } else {
-                CStr::from_ptr(pw_shell)
-                    .to_str()
-                    .unwrap_or(DEFAULT_SHELL)
-                    .to_owned()
+            // #B6: POSIX (batch.md 86991-86994) makes `SHELL` authoritative for
+            // the command interpreter that runs an at-job, and mandates that
+            // when it is "unset or null, sh shall be used". Consulting the
+            // passwd shell first inverted that -- and left the unset case
+            // running the login shell rather than sh, which the spec does not
+            // permit. The passwd entry is no longer consulted for job
+            // execution; only `$SHELL`, then `sh`.
+            let _ = pw_shell;
+            let shell = match std::env::var("SHELL") {
+                Ok(v) if !v.is_empty() => v,
+                _ => DEFAULT_SHELL.to_owned(),
             };
 
             Some(Self {

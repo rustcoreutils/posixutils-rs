@@ -193,7 +193,7 @@ emitted when `-t` is set (preventing `-DYYDEBUG=1` from enabling debug).
 | `LC_ALL` | MISSING | (#7 Major) Never read. |
 | `LC_CTYPE` | MISSING | (#7 Major) Never read; lexer always uses Rust `char` semantics. |
 | `LC_MESSAGES` | MISSING | (#7/#8 Major) No locale-driven diagnostics. |
-| `NLSPATH` (XSI) | MISSING | (#8 Major) No message catalog support. |
+| `NLSPATH` (XSI) | CONFORMS | `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 | `setlocale(LC_ALL, "")` call | MISSING | (#7 Major) Never invoked by `main()`. |
 
 #### ASYNCHRONOUS EVENTS
@@ -446,7 +446,7 @@ Locale handling is minimal: `gettext()` decorates clap help strings only,
 | `LC_COLLATE` | MISSING | (#L4 Major) Affects ranges/equivalence classes — but `pattern_escape.rs:97, 141` already assumes POSIX locale, which the spec at 101729-32 explicitly allows ("behavior is unspecified" if non-POSIX). Strictly conforming, just with an `unspecified` outcome rather than honor. |
 | `LC_CTYPE` | MISSING | (#L4 Major) Same as `LC_COLLATE` — POSIX locale assumed. |
 | `LC_MESSAGES` | MISSING | (#L4/#L5 Major) Diagnostics hardcoded English. |
-| `NLSPATH` (XSI) | MISSING | (#L5 Major) No message catalog support. |
+| `NLSPATH` (XSI) | CONFORMS | `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 | `setlocale(LC_ALL, "")` | MISSING | (#L4 Major) Never invoked. |
 
 #### ASYNCHRONOUS EVENTS
@@ -688,7 +688,7 @@ Functionally implements the seven mode flags (`-d`/`-m`/`-p`/`-q`/`-r`/`-t`/`-x`
 | `LC_CTYPE` | MISSING | (#A7 Major) UTF-8 assumed via Rust default; archive bytes handled via `OsStr`/`Vec<u8>` so single-byte content survives, but multi-byte-locale operand collation isn't honored. |
 | `LC_MESSAGES` | MISSING | (#A7 Major) All diagnostics English. |
 | `LC_TIME` | MISSING | (#A7 Major) `list_member` uses fixed `%b %e %H:%M %Y` regardless of locale. |
-| `NLSPATH` (XSI) | MISSING | (#A7 Major) No message catalog. |
+| `NLSPATH` (XSI) | CONFORMS | `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 | `TMPDIR` | MISSING | (#A11 Minor) Not used because archive is rewritten in place (#A10). |
 | `TZ` | MISSING | (#A7 Major) `DateTime::from_timestamp` is UTC; no `TZ` consultation. |
 
@@ -847,7 +847,7 @@ This is a stub. The file opens with a TODO header acknowledging it: "vary output
 | `LC_COLLATE` | MISSING | (#N5 Critical) No sort is performed at all. |
 | `LC_CTYPE` | PARTIAL | UTF-8 codeset bound at `:137` for gettext; symbol-name byte handling is via `object` crate (raw bytes). |
 | `LC_MESSAGES` | PARTIAL | (#N14 Major) `setlocale` + `textdomain` set up; clap help is `gettext`'d but runtime diagnostics are not. |
-| `NLSPATH` (XSI) | PARTIAL | Implicit via `textdomain("posixutils-rs")` + `bind_textdomain_codeset`; functional as soon as #N14 routes runtime strings through `gettext`. |
+| `NLSPATH` (XSI) | CONFORMS | Runtime strings route through `gettext` (#N14); `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 
 #### ASYNCHRONOUS EVENTS
 
@@ -988,7 +988,7 @@ A compact and largely working implementation: `-a`, `-t d/o/x`, and `-n` all par
 | `LC_ALL` | PARTIAL | (#S4 Minor) Same. |
 | `LC_CTYPE` | PARTIAL | (#S4/#S6 Minor) Substring-matched at `:72`; not used for the actual `isprint` decision. |
 | `LC_MESSAGES` | PARTIAL | `setlocale` + `textdomain` set up at `:186-188` so clap help is `gettext`'d; runtime diagnostics aren't (#S7). |
-| `NLSPATH` (XSI) | PARTIAL | Implicit via `textdomain`/`bind_textdomain_codeset`; functional once runtime strings route through `gettext`. |
+| `NLSPATH` (XSI) | CONFORMS | Runtime strings route through `gettext`; `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 
 #### ASYNCHRONOUS EVENTS
 
@@ -1089,7 +1089,7 @@ A small, ELF-only implementation that handles the headline case (delete debug se
 
 - [x] **#ST7 — Empty operand list silently succeeds; spec mandates `file...` (≥ 1).** `dev/strip.rs:25` declares `input_files: Vec<OsString>` with no `num_args = 1..` constraint, so `strip` with no arguments exits 0 with no work done. POSIX SYNOPSIS 115966 makes the operand required (the variadic `...` allows ≥ 1, not ≥ 0). Fix: `#[arg(num_args = 1.., required = true)]`.
 - [x] **#ST8 — Runtime diagnostic strings hardcoded English; `gettext` set up but unused at runtime.** `dev/strip.rs:91, 113, 122, 131, 139`. `setlocale`/`textdomain`/`bind_textdomain_codeset` are called at `:145-147` so the framework is in place — only the clap help text is decorated (`:23`). Spec ENVIRONMENT VARIABLES 115996-115998 + NLSPATH 115999. Fix: wrap each runtime string in `gettext(...)`.
-- [x] **#ST9 — `LC_*` chain not actively consulted beyond `setlocale`.** Strip's spec-listed env vars (`LANG`/`LC_ALL`/`LC_CTYPE`/`LC_MESSAGES`/`NLSPATH`) are all routed through libc via `setlocale(LC_ALL, "")`, which is correct for any libc-mediated decision — but the implementation makes no such decisions today (no `isprint`, no collation, no message catalog use). The plumbing is harmless and forward-compatible with #ST8. **Ticked 2026-08-02:** nothing to fix — `strip` is conforming precisely because it makes no locale-sensitive decisions; recorded as a note, not a defect.
+- [x] **#ST9 — `LC_*` chain not actively consulted beyond `setlocale`.** Strip's spec-listed env vars (`LANG`/`LC_ALL`/`LC_CTYPE`/`LC_MESSAGES`/`NLSPATH`) are all routed through libc via `setlocale(LC_ALL, "")`, which is correct for any libc-mediated decision — but the implementation makes no such decisions today beyond message lookup (no `isprint`, no collation). `NLSPATH` is honored via `gettext-rs` since 2026-08-04, and #ST8 routes strip's runtime strings through `gettext`, so `LC_MESSAGES` is live. The plumbing is harmless and forward-compatible with #ST8. **Ticked 2026-08-02:** nothing to fix — `strip` is conforming precisely because it makes no locale-sensitive decisions; recorded as a note, not a defect.
 - [x] **#ST11 — BSD-variant archives were rewritten as System V, producing a malformed hybrid.** *(Found 2026-08-02, outside the original audit.)* `is_archive` matches `!<arch>\n`, which both the System V and BSD layouts carry, and `ar::Archive` auto-detects the variant on read — but `strip_archive` unconditionally emitted System V headers plus a `"/"` symbol table. BSD stores long member names inline after the header (`#1/<len>`) and uses a `__.SYMDEF` symbol table, so the output was neither format. This is the macOS default archive layout; it stayed invisible because the archive tests are `#[cfg(target_os = "linux")]`-gated. **✓ fixed (2026-08-02)** — a header-only probe pass determines the variant before any work, and BSD archives are refused with a clear diagnostic and non-zero exit (same policy as the unsupported object formats, #ST3) rather than silently converted. Probing up front also keeps the variant diagnostic ahead of any per-member parse error. Test `test_strip_rejects_bsd_variant_archive`, which builds a BSD archive in-process and additionally asserts the refused input is left byte-identical.
 
 #### Major (found post-audit)
@@ -1125,7 +1125,7 @@ A small, ELF-only implementation that handles the headline case (delete debug se
 | `LC_ALL` | PARTIAL | Same. |
 | `LC_CTYPE` | PARTIAL | Same; no byte-vs-char decisions made. |
 | `LC_MESSAGES` | PARTIAL | (#ST8 Minor) `textdomain`/`bind_textdomain_codeset` set up at `:146-147`; runtime diagnostic strings not gettext'd. |
-| `NLSPATH` (XSI) | PARTIAL | Implicit via `textdomain`; effective once #ST8 lands. |
+| `NLSPATH` (XSI) | CONFORMS | #ST8 landed; `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 
 #### ASYNCHRONOUS EVENTS
 

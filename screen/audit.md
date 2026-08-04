@@ -131,7 +131,7 @@ the speed table mis-keys `B50` as `"54"`. Diagnostics are hardcoded English.
 |---|---|---|
 | `LANG`/`LC_ALL`/`LC_CTYPE` | PARTIAL | `setlocale(LC_ALL, "")` called (`stty.rs:787`); affects clap help, but byte/char interpretation of operands is plain Rust `str`. |
 | `LC_MESSAGES` | MISSING (effect) | (#8) diagnostics hardcoded English, never `gettext()`-wrapped. |
-| `NLSPATH` (XSI) | MISSING | No message-catalog wiring. |
+| `NLSPATH` (XSI) | CONFORMS | `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 
 #### ASYNCHRONOUS EVENTS
 
@@ -238,7 +238,7 @@ tolerated.
 |---|---|---|
 | `LANG`/`LC_ALL`/`LC_CTYPE` | CONFORMS | `setlocale(LC_ALL, "")` at `tabs.rs:288`. |
 | `LC_MESSAGES` | CONFORMS (plumbed) | diagnostics wrapped in `gettext()` (`tabs.rs:125,141,149,254,262,275,319,332,344`). |
-| `NLSPATH` (XSI) | MISSING | no catalog wiring (tree-wide gap). |
+| `NLSPATH` (XSI) | CONFORMS | `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 | `TERM` | CONFORMS | read via `Database::from_env`; falls back to a default terminal when unset (#T1 ✓). |
 
 #### ASYNCHRONOUS EVENTS / STDOUT / STDERR / EXIT STATUS
@@ -309,7 +309,7 @@ runs, and there is no init→fallback for a missing reset string.
 
 - [x] STDIN "Not used"; INPUT FILES "None".
 - [x] `LANG`/`LC_ALL`/`LC_CTYPE`/`LC_MESSAGES` — `setlocale(LC_ALL, "")` (`tput.rs:112`); diagnostics `gettext()`-wrapped (`tput.rs:104,134,146,154`).
-- [ ] **`NLSPATH` (XSI) MISSING** — no catalog wiring (tree-wide gap).
+- [x] **`NLSPATH` (XSI) CONFORMS** — `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04).
 - [x] `TERM` — read via `Database::from_env` (`tput.rs:141`).
 
 #### ASYNCHRONOUS EVENTS / STDOUT / STDERR

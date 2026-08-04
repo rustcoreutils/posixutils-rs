@@ -179,7 +179,7 @@ diverge.
 #### ENVIRONMENT VARIABLES
 - [x] `HOME` CONFORMS — `ed.hup` fallback path, `editor.rs:1559`.
 - [x] **`LC_COLLATE` / `LC_CTYPE`** — ✓ fixed (phase 1): bracket ranges/classes honored via libc BRE (#E8).
-- [x] **`LC_MESSAGES`** — ✓ fixed (phase 3): diagnostic strings `gettext()`-wrapped (#E8). `NLSPATH` N/A (no catalog shipped).
+- [x] **`LC_MESSAGES`** — ✓ fixed (phase 3): diagnostic strings `gettext()`-wrapped (#E8). `NLSPATH` CONFORMS — `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04).
 
 #### ASYNCHRONOUS EVENTS
 - [x] `SIGQUIT` CONFORMS (`SIG_IGN`).

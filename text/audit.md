@@ -199,7 +199,7 @@ Mostly correct on the happy path (options, column suppression, tab-lead arithmet
 | `LC_COLLATE` | MISSING | comparison uses Rust `<`, not `strcoll` (#1) |
 | `LC_CTYPE` | PARTIAL | activated; lines passed through intact |
 | `LC_MESSAGES` | PARTIAL | `textdomain` set but error path bare `eprintln!` (#3) |
-| `NLSPATH` (XSI) | PARTIAL | infra present; error path bare |
+| `NLSPATH` (XSI) | CONFORMS | XSI; `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 
 #### ASYNCHRONOUS EVENTS
 
@@ -319,7 +319,7 @@ Largely functional and handles the core splitting modes. Three correctness defec
 | `LANG`/`LC_ALL` | CONFORMS | `setlocale(LcAll, "")` line 615 |
 | `LC_COLLATE`/`LC_CTYPE` | CONFORMS | BRE via libc `regcomp` honors locale |
 | `LC_MESSAGES` | PARTIAL | `textdomain` wired; many strings still English |
-| `NLSPATH` | N/A | XSI; `bind_textdomain_codeset` present |
+| `NLSPATH` | CONFORMS | XSI; `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 
 #### ASYNCHRONOUS EVENTS
 
@@ -461,7 +461,7 @@ Note: a strictly decreasing single element (`5-3`) is rejected (correct: `low>hi
 | `LANG`/`LC_ALL` | CONFORMS | `setlocale(LcAll,"")` line 432 |
 | `LC_CTYPE` | PARTIAL | `-c` uses Rust `char` (correct for UTF-8; not other encodings) |
 | `LC_MESSAGES` | CONFORMS | gettextrs |
-| `NLSPATH` (XSI) | N/A | handled by gettextrs |
+| `NLSPATH` (XSI) | CONFORMS | XSI; `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 
 #### ASYNCHRONOUS EVENTS
 
@@ -584,7 +584,7 @@ Core diff algorithm (histogram LCS), default output, `-e`, `-f`, `-r`, `-b`, and
 | `LANG`/`LC_ALL`/`LC_CTYPE`/`LC_MESSAGES` | CONFORMS | `setlocale` + gettext |
 | `LC_TIME` | N/A→PARTIAL | context dates use `chrono::Local` (respects TZ, not LC_TIME names) |
 | `TZ` | PARTIAL | context respects TZ; unified omits timezone field (#5) |
-| `NLSPATH` | N/A | XSI |
+| `NLSPATH` | CONFORMS | XSI; `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 
 #### ASYNCHRONOUS EVENTS
 
@@ -735,7 +735,7 @@ The `UniStop` (single-integer `-t N`) path works correctly for default and custo
 | `LC_CTYPE` char interpretation | PARTIAL | byte loop ignores multibyte boundaries |
 | `LC_CTYPE` column width | MISSING | no `wcwidth` (#5) |
 | `LC_MESSAGES` | CONFORMS | textdomain + gettext |
-| `NLSPATH` | N/A | XSI |
+| `NLSPATH` | CONFORMS | XSI; `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 
 #### ASYNCHRONOUS EVENTS
 
@@ -866,7 +866,7 @@ Core folding logic is present and structurally sound, but the `-s` (break-on-spa
 | `LANG`/`LC_ALL` | CONFORMS | `setlocale(LcAll,"")` line 168 |
 | `LC_CTYPE` (column width) | MISSING | raw byte count (#2) |
 | `LC_MESSAGES` | PARTIAL | gettextrs init; English diagnostics |
-| `NLSPATH` | N/A | |
+| `NLSPATH` | CONFORMS | XSI; `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 
 #### ASYNCHRONOUS EVENTS
 
@@ -1006,7 +1006,7 @@ Broadly conformant, and the single best design decision is using POSIX `regcomp`
 | `LC_COLLATE` | PARTIAL | used by libc regex brackets; not in `-F` path |
 | `LC_CTYPE` | PARTIAL | regex OK; `-F` Unicode-only (#2) |
 | `LC_MESSAGES` | MISSING | OS error strings (#3) |
-| `NLSPATH` | N/A | XSI |
+| `NLSPATH` | CONFORMS | XSI; `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 
 #### ASYNCHRONOUS EVENTS
 
@@ -1144,7 +1144,7 @@ Largely correct. Two actionable gaps: (1) the `-` operand is not treated as stdi
 | `LANG`/`LC_ALL` | CONFORMS | `setlocale(LcAll,"")` line 145 |
 | `LC_CTYPE` | PARTIAL | byte I/O; `-n` counts newlines so fine |
 | `LC_MESSAGES` | PARTIAL | gettextrs init; hardcoded English diagnostics |
-| `NLSPATH` | PARTIAL | textdomain set |
+| `NLSPATH` | CONFORMS | XSI; `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 
 #### ASYNCHRONOUS EVENTS
 
@@ -1710,7 +1710,7 @@ The golden path — applying a single unified or context diff to an existing fil
 | `LC_CTYPE` | PARTIAL | OS-level only |
 | `LC_MESSAGES` | PARTIAL | gettextrs; yes/no prompt absent (prompt itself missing) |
 | `LC_TIME` | N/A | timestamps only recognized, not generated |
-| `NLSPATH` | N/A | XSI |
+| `NLSPATH` | CONFORMS | XSI; `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 
 #### ASYNCHRONOUS EVENTS
 
@@ -1876,7 +1876,7 @@ Solid multi-column, pagination, and option-parsing foundations. Seven conformanc
 | `LC_MESSAGES` | CONFORMS | `gettext("Page")` `pr.rs:92` |
 | `LC_TIME` | PARTIAL | `chrono::format` does not call `strftime`/`nl_langinfo`; month names always English |
 | `TZ` | CONFORMS | `chrono::Local` |
-| `NLSPATH` | N/A | gettextrs |
+| `NLSPATH` | CONFORMS | XSI; `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 
 #### ASYNCHRONOUS EVENTS
 
@@ -2490,7 +2490,7 @@ Large and well-structured, covering all four modes (translate, delete, squeeze, 
 | `LC_COLLATE` | MISSING | ranges + `-C` ordering ignore it (#1,#5) |
 | `LC_CTYPE` | MISSING | class membership hardcoded ASCII (#2) |
 | `LC_MESSAGES` | CONFORMS | gettextrs lines 297-298 |
-| `NLSPATH` | N/A | XSI |
+| `NLSPATH` | CONFORMS | XSI; `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 
 #### ASYNCHRONOUS EVENTS
 
@@ -2612,7 +2612,7 @@ The core topological sort and output format are correct. Three gaps: the `-w` op
 |---|---|---|
 | `LANG`/`LC_ALL`/`LC_CTYPE` | CONFORMS | `setlocale` line 164 |
 | `LC_MESSAGES` | PARTIAL | gettextrs; cycle line not gettext-wrapped (line 144) |
-| `NLSPATH` | N/A | |
+| `NLSPATH` | CONFORMS | XSI; `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 
 #### ASYNCHRONOUS EVENTS
 
@@ -2744,7 +2744,7 @@ Two Critical and three Major non-conformances. Most damaging: (1) `-t tablist` d
 | `LANG`/`LC_ALL` | CONFORMS | `setlocale` line 176 |
 | `LC_CTYPE` (char width) | MISSING | 1 col/char (#10) |
 | `LC_MESSAGES` | CONFORMS | textdomain + gettext |
-| `NLSPATH` | N/A | XSI |
+| `NLSPATH` | CONFORMS | XSI; `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 
 #### ASYNCHRONOUS EVENTS
 
@@ -3010,7 +3010,7 @@ Two confirmed bugs dominate: (1) a single named file operand prints no filename,
 | `LC_CTYPE` for `-m` | DIVERGES | UTF-8 bitmask, not `mblen` (#3) |
 | `LC_CTYPE` for `-w` | PARTIAL | ASCII-only `BYTE_TABLE` (#4) |
 | `LC_MESSAGES` | CONFORMS | gettextrs lines 169-170 |
-| `NLSPATH` | N/A | XSI |
+| `NLSPATH` | CONFORMS | XSI; `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 
 #### ASYNCHRONOUS EVENTS
 

@@ -896,17 +896,23 @@ fn tr_locale(args: &[&str], stdin: &[u8], locale: &str) -> Vec<u8> {
 }
 
 #[test]
-fn tr_character_classes_are_ascii_only() {
-    // #2: [:alpha:] should follow LC_CTYPE. It does not, so a non-ASCII letter
-    // survives a delete that ought to remove it.
+fn tr_character_classes_follow_lc_ctype() {
+    // POSIX 118113-118114: a class represents the characters belonging to it
+    // "as defined by the current setting of the LC_CTYPE locale category".
+    // The classes used to be hardcoded ASCII, so U+00E9 survived a delete of
+    // [:alpha:] in every locale.
     let Some(loc) = plib::testing::utf8_locale() else {
         return;
     };
     let out = tr_locale(&["-d", "[:alpha:]"], "a\u{e9}b\n".as_bytes(), &loc);
+    assert_eq!(out, b"\n", "U+00E9 is a letter in a UTF-8 locale");
+
+    // In the C locale it is not a letter, and must survive.
+    let out = tr_locale(&["-d", "[:alpha:]"], "a\u{e9}b\n".as_bytes(), "C");
     assert_eq!(
         out,
         "\u{e9}\n".as_bytes(),
-        "known gap (#2): classes are ASCII-only, so U+00E9 is not [:alpha:]"
+        "C locale has no non-ASCII letters"
     );
 }
 

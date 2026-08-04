@@ -526,6 +526,17 @@ mod parsing {
             }
         }
 
+        /// The character this represents, or `None` for a raw byte from a
+        /// `\ooo` escape, which is a byte value and not a character.
+        /// [`DataTypeWithData::convert_to_char`] panics on that case.
+        pub fn as_char(&self) -> Option<char> {
+            match self {
+                DataTypeWithData::Is7Bit(ue) => Some(char::from(*ue)),
+                DataTypeWithData::IsMultiByte(ch) => Some(*ch),
+                DataTypeWithData::Is8Bit(_) => None,
+            }
+        }
+
         pub fn convert_to_char(&self) -> char {
             match *self {
                 Self::IsMultiByte(ch) => ch,
@@ -1113,7 +1124,9 @@ mod parsing {
 }
 
 mod setup {
-    use crate::parsing::{CharOperand, CharRepetition, DataTypeWithData, EquivOperand, Operand};
+    use crate::parsing::{
+        CharOperand, CharRepetition, ClassName, DataTypeWithData, EquivOperand, Operand,
+    };
     use std::error::Error;
 
     fn add_normal_char(
@@ -1183,6 +1196,92 @@ mod setup {
 
     // TODO
     // This should be optimized
+    /// Set members that cannot be enumerated into the byte tables: character
+    /// classes, whose membership follows `LC_CTYPE`, and equivalence classes,
+    /// whose membership follows `LC_COLLATE`.
+    ///
+    /// The tables above stay the fast path — a set of plain characters never
+    /// touches this — and a character is decoded from the byte stream only when
+    /// this set is non-empty.
+    #[derive(Default)]
+    pub struct PredicateSet {
+        classes: Vec<ClassName>,
+        equivalences: Vec<EquivMatcher>,
+    }
+
+    /// One `[=c=]`, answered by libc.
+    ///
+    /// POSIX defines the equivalence class by `LC_COLLATE` (118137-118138), and
+    /// there is no portable call to enumerate one — but every POSIX regex
+    /// engine must implement `[[=c=]]` in a bracket expression, so ask it.
+    /// On glibc in a UTF-8 locale the class is a singleton, which is why this
+    /// changes no output here; on a platform or locale where it is not, this is
+    /// correct where a hardcoded "the class is the character itself" was not.
+    struct EquivMatcher {
+        regex: Option<plib::regex::Regex>,
+    }
+
+    impl EquivMatcher {
+        fn new(source: char) -> Self {
+            // A bracket expression is BRE/ERE-agnostic. If the character cannot
+            // be placed in one (it is the bracket syntax itself, say), fall
+            // back to no extra members: the literal is already in the tables.
+            let pattern = format!("[[={source}=]]");
+            EquivMatcher {
+                regex: plib::regex::Regex::new(&pattern, plib::regex::RegexFlags::bre()).ok(),
+            }
+        }
+
+        fn contains(&self, c: char) -> bool {
+            let mut buf = [0_u8; 4_usize];
+            match &self.regex {
+                Some(re) => re.is_match(c.encode_utf8(&mut buf)),
+                None => false,
+            }
+        }
+    }
+
+    impl PredicateSet {
+        pub fn is_empty(&self) -> bool {
+            self.classes.is_empty() && self.equivalences.is_empty()
+        }
+
+        pub fn push_class(&mut self, name: ClassName) {
+            self.classes.push(name);
+        }
+
+        pub fn push_equivalence(&mut self, source: char) {
+            self.equivalences.push(EquivMatcher::new(source));
+        }
+
+        pub fn contains(&self, c: char) -> bool {
+            self.classes.iter().any(|cl| cl.contains(c))
+                || self.equivalences.iter().any(|eq| eq.contains(c))
+        }
+    }
+
+    /// Decode the character beginning at `lead`, returning it with the number of
+    /// *additional* bytes it consumed. `None` when the bytes are not a complete
+    /// valid character, in which case the caller keeps its byte-wise behavior.
+    pub fn decode_char(lead: u8, next_bytes: &[u8]) -> Option<(char, usize)> {
+        if lead < 128_u8 {
+            return Some((char::from(lead), 0_usize));
+        }
+        let width = match lead {
+            0xC2..=0xDF => 2_usize,
+            0xE0..=0xEF => 3_usize,
+            0xF0..=0xF4 => 4_usize,
+            _ => return None,
+        };
+        let extra = width - 1_usize;
+        let tail = next_bytes.get(..extra)?;
+        let mut buf = [0_u8; 4_usize];
+        buf[0] = lead;
+        buf[1..width].copy_from_slice(tail);
+        let st = std::str::from_utf8(&buf[..width]).ok()?;
+        st.chars().next().map(|c| (c, extra))
+    }
+
     /// Flatten symbolic `[:class:]` operands into their ASCII members.
     ///
     /// A transitional shim: it reproduces exactly what parsing used to do, so
@@ -1567,8 +1666,7 @@ mod setup {
         string1_or_string2_operands: Vec<Operand>,
         is_string1: bool,
     ) -> Result<ForRemoval, Box<dyn Error>> {
-        let string1_or_string2_operands = flatten_classes(string1_or_string2_operands);
-
+        let mut predicates = PredicateSet::default();
         let mut equiv = Vec::<DataTypeWithData>::new();
 
         let mut seven_bit = [false; 128_usize];
@@ -1597,10 +1695,16 @@ mod setup {
                     }
                 },
                 Operand::Equiv(EquivOperand { char }) => {
+                    // The literal stays in the fast exact-match list; the
+                    // predicate covers any further members LC_COLLATE defines.
+                    if let Some(c) = char.as_char() {
+                        predicates.push_equivalence(c);
+                    }
                     equiv.push(char);
                 }
-                // `flatten_classes` replaced every class before this point.
-                Operand::Class(_) => unreachable!("classes are flattened on entry"),
+                // Membership follows LC_CTYPE, so the class stays a predicate
+                // instead of being flattened into the byte tables.
+                Operand::Class(name) => predicates.push_class(name),
             }
         }
 
@@ -1609,6 +1713,7 @@ mod setup {
             equiv,
             multi_byte,
             seven_bit,
+            predicates,
         };
 
         let for_removal = if complement {
@@ -1962,6 +2067,8 @@ mod setup {
         eight_bit: [bool; 128_usize],
         multi_byte: [Option<Vec<Search>>; 128_usize],
         equiv: Vec<DataTypeWithData>,
+        /// Members that are predicates rather than enumerable characters.
+        predicates: PredicateSet,
     }
 
     pub struct RemovalCheckResult {
@@ -1996,6 +2103,26 @@ mod setup {
                     }
                     DataTypeWithData::IsMultiByte(_) => {
                         unreachable!();
+                    }
+                }
+            }
+
+            // Only now decode a character: a set of plain characters has an
+            // empty predicate set and never reaches this.
+            if !self.predicates.is_empty() {
+                if let Some((c, extra)) = decode_char(ue, next_bytes) {
+                    if self.predicates.contains(c) {
+                        let lookahead = match extra {
+                            1_usize => Some(SearchNumberOfBytes::One),
+                            2_usize => Some(SearchNumberOfBytes::Two),
+                            3_usize => Some(SearchNumberOfBytes::Three),
+                            _ => None,
+                        };
+                        return RemovalCheckResult {
+                            matched: true,
+                            match_lookahead_length: lookahead,
+                            found_match: true,
+                        };
                     }
                 }
             }

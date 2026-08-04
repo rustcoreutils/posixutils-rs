@@ -16,6 +16,50 @@ Utilities (by source size): `asa`, `comm`, `csplit`, `cut`, `diff` (+`diff_util/
 
 ---
 
+## Test-coverage closeout (2026-08-04)
+
+The 120 open rows under the per-utility "Test coverage signal" headings are
+closed. **39 were already satisfied and had never been re-ticked**; the other 81
+got tests. Writing them found seven defects and confirmed two divergences worth
+recording rather than fixing.
+
+### Defects found and fixed
+
+| Utility | Defect |
+|---|---|
+| **`diff`** | `-c` **panicked** comparing an empty file with a non-empty one: the trailing hunk indexed `lcs_indices[len - 1]`, which underflows to `usize::MAX` when the first file has no lines. Output now matches GNU's `*** 0 ****`. |
+| **`diff`** | `diff file file` exited **2** ("trouble") with no diagnostic. The same file named twice has no differences; it exits 0, as GNU does. |
+| **`diff`** | `-e` emitted a replacement line consisting of a lone `.` unescaped, which ends `ed`'s input mode early and silently drops the rest of the block — the script corrupted the file it was meant to patch. It is now written `..` and repaired by an addressed substitute; verified by piping the script through real `ed`. |
+| **`nl`** | A missing file exited 1 with **nothing on stderr**: `main` matched `Err(_)` and discarded the error. An over-long `-d` argument was rejected just as silently. Both now report, and the open error names the file. |
+| **`fold`**, **`unexpand`**, **`pr`** | Diagnostics did not identify the utility (`fold` prefixed the *filename* instead), so a failure in a pipeline was not attributable. All three route through `plib::diag` now, which meant adopting `plib::diag::init_locale` — it is `init` that records the utility name. |
+| **`tr`** | Any character class was accepted in string2. POSIX (118121-118124) allows only `lower`/`upper`, and only when the converse class appears in string1, so `tr abc '[:alpha:]'` silently produced `ABC`. This was already recorded as MISSING (#3). The relative-position half of the rule is still not enforced: classes are expanded to characters during parsing, so the operand list no longer records their origin. |
+
+### Divergences pinned rather than fixed
+
+- **`grep` and a NUL byte.** A line containing a NUL never matches, because
+  matching goes through POSIX `regexec`, which takes a NUL-terminated string, so
+  the conversion fails and the line is skipped. GNU reports "binary file
+  matches" instead. POSIX requires grep's input to be text files, so both are
+  within latitude; fixing ours needs `REG_STARTEND` plumbing through the shared
+  regex layer, which serves many utilities.
+- **`tr` and the locale.** Character classes, case mapping, equivalence classes
+  and ranges are ASCII/code-point based rather than driven by `LC_CTYPE` and
+  `LC_COLLATE`, and `-c`/`-C` are the same code path. Already recorded as
+  MISSING (#1, #2, #4, #5); the tests pin the current boundary and name the
+  finding each documents. `comm` compares byte sequences rather than collating,
+  which is the same shape of gap.
+
+Rows covering behavior POSIX leaves unspecified — `comm` on unsorted input,
+`tr` with an empty string2, `paste -d '\0x'` — pin current behavior rather
+than assert a requirement, and say so at the assertion.
+
+The `utf8_locale()` probe that four test modules had each copied is now
+`plib::testing::utf8_locale`, beside `locale_matching` for tests needing a
+specific locale. Both return `None` on a host without one, so those tests skip
+rather than fail.
+
+---
+
 ## `asa`
 
 > **STATUS — Remediated & promoted to README Stage 6 (Audited).** All priority findings below are fixed (see the per-item `FIXED (Phase N)` annotations); verified against GNU coreutils 9.4. Remaining open items, if any, are tree-wide gettext `.mo` deferrals.

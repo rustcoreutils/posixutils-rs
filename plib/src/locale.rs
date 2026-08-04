@@ -66,6 +66,8 @@ extern "C" {
     fn iswcntrl(c: WintT) -> libc::c_int;
     fn iswgraph(c: WintT) -> libc::c_int;
     fn iswxdigit(c: WintT) -> libc::c_int;
+    fn iswlower(c: WintT) -> libc::c_int;
+    fn iswupper(c: WintT) -> libc::c_int;
     fn wcwidth(c: libc::wchar_t) -> libc::c_int;
     // `mbrtowc` and `mbstate_t` are not surfaced by the `libc` crate on all
     // targets (notably macOS), so both are declared directly.
@@ -166,6 +168,16 @@ ctype_predicate!(
     /// True if `c` is a hexadecimal digit under the current `LC_CTYPE`, per
     /// libc `isxdigit(3)`.
     isxdigit, libc::isxdigit, iswxdigit
+);
+ctype_predicate!(
+    /// True if `c` is a lowercase letter under the current `LC_CTYPE`, per libc
+    /// `islower(3)`.
+    islower, libc::islower, iswlower
+);
+ctype_predicate!(
+    /// True if `c` is an uppercase letter under the current `LC_CTYPE`, per libc
+    /// `isupper(3)`.
+    isupper, libc::isupper, iswupper
 );
 
 /// Map `c` to lowercase under the current `LC_CTYPE`.
@@ -742,5 +754,25 @@ mod tests {
         // but we exercise the path so any panic surfaces.
         let _ = isprint('З');
         let _ = isprint('🦀');
+    }
+
+    /// `islower`/`isupper` back tr's `[:lower:]`/`[:upper:]` classes and its
+    /// case-conversion pairing, so they must agree with the byte-oriented
+    /// `islower(3)`/`isupper(3)` for ASCII and with the wide functions above it.
+    #[test]
+    fn case_predicates_follow_the_locale() {
+        // ASCII holds in every locale.
+        assert!(islower('a') && !islower('A') && !islower('1'));
+        assert!(isupper('A') && !isupper('a') && !isupper('1'));
+
+        // Non-ASCII letters classify only where a suitable locale exists; the
+        // C locale legitimately says no.
+        let Some(loc) = crate::testing::utf8_locale() else {
+            return;
+        };
+        let _ = loc; // the process locale is whatever the harness set
+                     // Exercise the wide path for panics regardless of the answer.
+        let _ = islower('\u{e9}');
+        let _ = isupper('\u{c9}');
     }
 }

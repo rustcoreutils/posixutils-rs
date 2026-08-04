@@ -1021,7 +1021,7 @@ Broadly conformant, and the single best design decision is using POSIX `regcomp`
 
 | Option | Status | Notes |
 |---|---|---|
-| `-E` ERE / `-F` fixed / default BRE | CONFORMS | via libc regcomp |
+| `-E` ERE / `-F` fixed / default BRE | CONFORMS | via libc regcomp; §9.4.6 rule-6 `?` modifier only where libc has it (not macOS) |
 | null pattern matches all | CONFORMS | macOS `.*` workaround; Linux empty string |
 | multiple `-e`/`-f` combined | PARTIAL | dedup may drop patterns (#1) |
 | `-i` | PARTIAL | (#2) |
@@ -1104,7 +1104,7 @@ Not covered:
 - [x] dedup bug: two identical patterns from separate `-e` (no test confirms both retained) (#1) — `test_duplicate_patterns_are_all_used`
 - [x] `-i -F` where Unicode vs locale folding diverge (Turkish `I`/`ı`) (#2) — `grep_case_insensitive_fixed_string_folding`
 - [x] `LC_MESSAGES`-translated error messages (#3) — `grep_diagnostics_name_the_utility`
-- [x] ERE lazy quantifiers (POSIX.1-2024 §9.4.6 item 6) — `grep_ere_quantifier_followed_by_question_mark`
+- [x] ERE repetition modifier (POSIX.1-2024 §9.4.6 item 6, 6759-6765) — `grep_ere_repetition_modifier`. Platform-limited: glibc implements a duplication symbol suffixed by `?`, the BSD engine on macOS predates POSIX.2024 and rejects it (exit 2). We delegate to libc `regcomp`, so the test holds each platform to its own contract rather than pinning one engine's answer. grep never reveals match *extent*, so leftmost-shortest itself is unobservable through this utility.
 - [x] pattern file with trailing newline (empty last pattern → match-all) — `grep_pattern_file_with_a_trailing_empty_line`
 - [x] NUL-byte/binary input; `\r\n` line endings (#4) — `grep_input_containing_nul_bytes`, `grep_crlf_line_endings`
 

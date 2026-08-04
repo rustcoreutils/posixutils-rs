@@ -1494,13 +1494,36 @@ fn grep_crlf_line_endings() {
 }
 
 #[test]
-fn grep_ere_quantifier_followed_by_question_mark() {
-    // POSIX EREs have no lazy quantifiers; `+?` is `+` followed by an optional
-    // repetition of the preceding element. Pin what we do rather than leaving
-    // it untested.
+fn grep_ere_repetition_modifier() {
+    // POSIX.2024 *defines* a duplication symbol suffixed by `?`: "Each of the
+    // duplication symbols ('+', '*', '?', and intervals) can be suffixed by the
+    // repetition modifier '?' ... in which case matching behavior for that
+    // repetition shall be changed from the leftmost longest possible match to
+    // the leftmost shortest possible match" (XBD 9.4.6 rule 6, 6759-6765).
+    // This is distinct from "multiple adjacent duplication symbols" such as
+    // `a+*`, which remain undefined (6770-6771) and so are not tested here.
+    //
+    // grep reports only *whether* a line matched, never the extent of the
+    // match, so leftmost-longest vs leftmost-shortest is unobservable through
+    // this utility. What is observable is that the construct compiles and
+    // matches. We delegate to libc regcomp: glibc implements the modifier,
+    // while the BSD engine on macOS predates POSIX.2024 and rejects it as an
+    // invalid ERE (exit 2). Closing that gap would mean shipping our own regex
+    // engine, so accept either outcome -- but hold each to its own contract.
     let (out, code) = grep_stdin(&["-E", "a+?"], b"aaa\n");
-    assert_eq!(code, 0);
-    assert_eq!(String::from_utf8_lossy(&out), "aaa\n");
+    match code {
+        0 => assert_eq!(
+            String::from_utf8_lossy(&out),
+            "aaa\n",
+            "where the repetition modifier is supported, the line matches"
+        ),
+        2 => assert!(
+            out.is_empty(),
+            "a pattern the platform rejects must not also emit matches, got {:?}",
+            String::from_utf8_lossy(&out)
+        ),
+        c => panic!("`a+?` must either match (0) or be rejected (2), got exit {c}"),
+    }
 }
 
 // ---------------------------------------------------------------------------

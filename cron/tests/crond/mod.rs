@@ -13,17 +13,61 @@ use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use cron::job::Database;
 use plib::testing::{get_binary_path, run_test_base};
 use std::process::Output;
-use std::str::FromStr;
 
 fn run_crond_test(cmd: &str, args: &Vec<String>, stdin_data: &[u8]) -> Output {
     run_test_base(cmd, args, stdin_data)
 }
 
+/// Serializes the tests that start a real `crond`.
+///
+/// They share one PID file and one process table, and `crond` refuses to start
+/// a second instance, so run concurrently each test's view of "is the daemon
+/// running" depends on what the other happens to be doing at that moment.
+fn crond_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether this environment can host the daemon at all.
+///
+/// `crond` exits during startup if it cannot create and lock its PID file. On a
+/// stock Linux box `/run` is root-owned, so that is the *normal* outcome for a
+/// non-root test runner — which is why these tests observed no daemon at all
+/// there, and why the signal test passed without testing anything. macOS CI
+/// runners can write `/var/run`, so the daemon really starts and the same test
+/// exercised a completely different path.
+fn daemon_can_start() -> bool {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(cron::PID_FILE)
+        .is_ok()
+}
+
+/// Poll until `crond` processes appear (`want`) or disappear, or time out.
+fn wait_for_daemon(bin: &str, want: bool) -> Vec<i32> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let pids = pid::get_pids(bin).unwrap_or_default();
+        if pids.is_empty() != want || std::time::Instant::now() >= deadline {
+            return pids;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 #[test]
 fn no_args() {
+    let _guard = crond_guard();
     std::env::set_var("LOGNAME", "root");
     let output = run_crond_test("crond", &vec![], b"");
     assert_eq!(output.status.code(), Some(0));
+    // Leave no daemon behind: it holds the PID-file lock, so a stray one makes
+    // every later test see a `crond` it did not start, or fail to start one.
+    let _ = pid::kill(&get_binary_path("crond").to_string_lossy());
 }
 
 #[test]
@@ -170,43 +214,71 @@ fn test_month() {
     );
 }
 
+/// `SIGHUP` must make the daemon reload its crontabs, not exit.
+///
+/// The previous version of this test asserted `pids == old_pids ||
+/// !pids.is_empty()`, which holds for almost any outcome — including "no daemon
+/// ever ran", which is exactly what happens wherever the PID file is not
+/// writable. It therefore passed on Linux while testing nothing, and the first
+/// environment that could actually start the daemon (macOS CI) was also the
+/// first to run the assertion for real. It then failed, because the test read
+/// the process table the instant the parent exited, signalled whatever it found
+/// — including a second instance in the middle of exiting with "already
+/// running" — and shared all of that with a concurrently-running `no_args` that
+/// leaked its own daemon.
 #[test]
 fn test_signal() {
+    let _guard = crond_guard();
     std::env::set_var("LOGNAME", "root");
 
-    let logname = std::env::var("LOGNAME").unwrap_or("root".to_string());
-    #[cfg(target_os = "linux")]
-    let file = format!("/var/spool/cron/{logname}");
-    #[cfg(target_os = "macos")]
-    let file = format!("/var/at/tabs/{logname}");
+    let bin_path = get_binary_path("crond");
+    let bin = bin_path.to_string_lossy().to_string();
+
+    // Start from a known state: a daemon left over from another test holds the
+    // PID-file lock, so the one started below would exit as a second instance.
+    let _ = pid::kill(&bin);
+    wait_for_daemon(&bin, false);
 
     let output = run_crond_test("crond", &vec![], b"");
     assert_eq!(output.status.code(), Some(0));
 
-    // Get the binary path string for process matching
-    let bin_path = get_binary_path("crond");
-    let bin_path_str = bin_path.to_string_lossy();
+    // The parent exits as soon as it has forked, so the daemon is not
+    // necessarily in the process table yet.
+    let pids = wait_for_daemon(&bin, true);
 
-    let pids = pid::get_pids(&bin_path_str).unwrap();
-
-    if std::path::PathBuf::from_str(&file).unwrap().exists() {
-        assert!(!pids.is_empty());
+    if pids.is_empty() {
+        // No daemon: the only supported reason is that it could not create and
+        // lock its PID file. Assert that rather than returning quietly, so this
+        // path cannot mask a daemon that failed to start for some other reason.
+        assert!(
+            !daemon_can_start(),
+            "crond exited during startup even though {} is writable",
+            cron::PID_FILE
+        );
+        return;
     }
 
     for pid in &pids {
+        // SAFETY: `pid` came from the process table moments ago; sending a
+        // signal to a pid that has since exited merely fails with ESRCH.
         unsafe {
             libc::kill(*pid, libc::SIGHUP);
         }
     }
 
-    let mut old_pids = pids;
-    let mut pids = pid::get_pids(&bin_path_str).unwrap();
+    // Give the daemon time to act on the signal — or to die from it.
+    std::thread::sleep(std::time::Duration::from_millis(500));
 
-    pids.sort();
-    old_pids.sort();
-    assert!(pids == old_pids || !pids.is_empty());
+    let survivors = pid::get_pids(&bin).unwrap_or_default();
+    for pid in &pids {
+        assert!(
+            survivors.contains(pid),
+            "crond {pid} exited on SIGHUP; SIGHUP must reload the crontabs, not \
+             terminate the daemon"
+        );
+    }
 
-    pid::kill(&bin_path_str).unwrap();
+    let _ = pid::kill(&bin);
 }
 
 // Tests for @-prefix special time specifications

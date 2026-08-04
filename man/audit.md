@@ -12,19 +12,19 @@
 
 ## TL;DR
 
-> **Status (2026-08-03): every finding in this document is closed.** The 2026-06-12 pass remediated #1–#8 and #10–#16 across five commits. The one item it left open, **#9**, is closed by the 2026-08-03 pass, which also closed the two halves of **#14** (`gettext` diagnostics, and `NLSPATH` — fixed in `gettext-rs` for the whole workspace rather than in `man` alone) and the wide/CJK width row. That pass re-audited the rebuilt engine, which no earlier pass had examined, and recorded thirteen new findings **#M1–#M13** — three Critical, one a file-disclosure vulnerability — in their own section below. Remaining deliberate gaps: full `LC_CTYPE`-charset decoding, and tbl `T{`…`T}` text blocks.
+> **Status (2026-08-03): every finding in this document is closed.** The 2026-06-12 pass remediated #1–#8 and #10–#16 across five commits. The one item it left open, **#9**, is closed by the 2026-08-03 pass, which also closed the two halves of **#14** (`gettext` diagnostics, and `NLSPATH` — fixed in `gettext-rs` for the whole workspace rather than in `man` alone) and the wide/CJK width row. That pass re-audited the rebuilt engine, which no earlier pass had examined, and recorded fourteen new findings **#M1–#M14** — three Critical, one a file-disclosure vulnerability — in their own section below. Remaining deliberate gaps: full `LC_CTYPE`-charset decoding, and tbl spanning/box drawing.
 
 > **Engine rewrite (2026-06-12, follow-on):** the engine was subsequently rebuilt toward the mandoc architecture — a single terminal backend (`man_util/term/`) driven by both renderers; a full **roff front-end** (`man_util/roff/`) closing the "out of scope" gaps above: number/string registers, `.if`/`.ie`/`.el`/`.while` conditionals and loops, `.de`/`.am` user macros, `.so` includes, `.ig`, diversions, an expression evaluator, and traps/environments as terminal no-ops; a **hand-written recursive-descent parser** (`man_util/parse/mdoc.rs`) that **replaced pest entirely** (grammar, deps, and the exponential-backtracking nesting guard from #2 are gone — deep nesting is now handled in linear time without a cap); and **tbl/eqn preprocessors** (`man_util/preproc/`). The parser is total (the #1/#2 crash classes are structurally impossible). The hand-written parser is validated end-to-end by the 145 byte-identical formatter snapshot tests plus the integration suite.
 
 Against the (deliberately minimal) POSIX `man` contract — one option `-k`, a handful of env vars, STDIN-not-used, exit 0/>0, implementation-defined output — the tool largely **conforms**: `-k` exists, STDIN is unused, exit status is 0/>0, `PAGER` is honored, `setlocale` is called, and every `.Sh` section (SYNOPSIS/OPTIONS/ENVIRONMENT/EXIT STATUS) of an mdoc page reaches output. The risks are concentrated in the *engine* the maintainer built to render pages. **A malformed page can crash the process** (`.Xr name` with a missing section number panics; deeply nested macros overflow the stack), and — most importantly for the golden path — **the parser only understands `mdoc(7)`; a legacy `man(7)`/roff page (`.TH`/`.SH`/`.B`/`.TP`, which is what most Linux pages are) renders as an empty page with header and footer only, and still exits 0.** Beyond that: no bold/italic/underline is ever emitted (all SGR is commented out), inline `\fB…\fR` roff font escapes pass through as literal text, the pager is invoked even when stdout is not a terminal, width is capped at 78 and never honors a wider terminal, and `-k`'s native fallback does literal-substring matching rather than the spec's `grep -Ei` (ERE).
 
-## Findings from the 2026-08-03 closeout pass (`#M1`–`#M13`)
+## Findings from the 2026-08-03 closeout pass (`#M1`–`#M14`)
 
 The engine described above was rebuilt after the original audit, and the rebuilt
 subsystems — the roff front-end, the man(7) renderer, and the tbl/eqn
 preprocessors — had never been audited. Re-auditing them, and sweeping the 1,777
 pages in `/usr/share/man/man1` through the built binary, found thirteen defects
-that no finding list contained. All were reproduced against the binary before
+that no finding list contained (`#M14` was found on 2026-08-04, following it). All were reproduced against the binary before
 being fixed, and every fix was confirmed to fail against the pre-fix code.
 
 The sweep is the honest headline. Before this pass, of 1,777 real pages:
@@ -48,6 +48,7 @@ here rather than silently closed.
 | #M10 | Medium | A conditional's numeric expression ended at the first whitespace *anywhere*, so `.if (\n(rF:(\n(.g==0)) \{\` — the standard groff idiom opening every pod2man page — evaluated `(0`, which is truthy, and printed the rest as body text. |
 | #M11 | Medium | Macro bodies were stored without roff **copy mode**, so `\\` never reduced to `\`; `substitute_args` then emitted the leading backslash of `\\$1` before every expanded argument. Doubling escapes is the normal way to write a macro body, so this affected essentially every `.de`. `\n(.$` (the argument count) was also unsupported. |
 | #M12 | Medium | `\,` and `\/` (italic corrections) leaked as literal text. help2man emits them on every GNU page. |
+| **#M14** | Major | `T{`…`T}` text blocks were emitted as literal cell content, markers and all, on one unwrapped line — 80 real pages showed a bare `T{`. With it: per-row format sections concatenated into one, `.T&` treated as data, uncounted `s`/`^` span columns, and `tab (@)` with a space unrecognized. See the section below. |
 | #M13 | Low | A `.TS` region with no format line silently discarded its entire content (the scan for the terminating `.` consumed the region). tbl rule rows were O(input²) — 2,000 rule rows beside one 200 KB cell cost 400 MB. Emitted lines kept trailing padding, which after `\&` resolution left 380-column runs of spaces. A trailing `\"` comment reached request arguments, so `.de CQ \" put $1 in typewriter font` took `\"` as the definition's custom end macro and swallowed the rest of the page — a pod2man idiom that blanked every perl-derived page. Tags and `.B` arguments were emitted unfilled, where groff fills them (`nvidia-smi(1)`: a 490-column `.TP` tag). |
 
 ### Corrections to this document made in the same pass
@@ -64,13 +65,40 @@ here rather than silently closed.
   never compile, which is what made the `rstest` dev-dependency unused. Both are
   removed.
 
+### tbl text blocks (`#M14`, closed 2026-08-04)
+
+`T{`…`T}` marks a cell holding prose to be filled to the column's width. It was
+passed through as literal cell content, markers and all, on one unwrapped line:
+**80 of the 1,777 pages printed a bare `T{` to the terminal**, man(1)'s own page
+among them. Now none do.
+
+A block cannot be measured the way an ordinary cell is, because its extent is a
+*consequence* of the width rather than an input to it. groff diverts the block,
+lets the formatter fill it, then reads the measured width and height back from
+`\n[dl]`/`\n[dn]`; the width it fills to is `w(N)` if given, else
+`L*C/(N+1)` — emitted literally as `\n[.l]*C/(N+1)`. The same rule is used
+here, verified against groff at three column counts. Filling is left-aligned
+rather than adjusted to both margins, matching the rest of this renderer.
+
+Testing it against real pages surfaced four more defects, all fixed with it: a
+format section is a list of **per-row** formats (concatenating systemctl(1)'s
+fifteen lines made a 45-column table, so blocks filled to `L/46` — one word per
+line); `.T&` was treated as data, printing `l l l` as a table row; `s`/`^` span
+markers were not counted as columns; and `tab (@);` with a space was not
+recognized, which is why man(1) still leaked markers.
+
 ### Known gaps, recorded rather than closed
 
-- tbl `T{`…`T}` text blocks, spanning and box drawing are not modeled, and this
-  is now the dominant cause of over-wide lines on real pages (41 of the 352).
-  `preproc/tbl.rs` documents the limitation.
+- tbl **spanning and box drawing** are not modeled. A table of wide simple cells
+  can still exceed the terminal — but so can groff's: systemctl(1) renders at
+  157 columns under groff against our 156, so this is the page's own doing.
 - `.nf` regions are not wrapped, which matches groff: a literal line wider than
-  the terminal is the page's own doing (241 of the 352).
+  the terminal is likewise the page's own doing (240 of the 346 over-wide pages).
+- **Correction to the earlier framing in this section:** over-wide lines were
+  described as "dominated by tbl text blocks". Measuring against groff showed
+  that was wrong — the count is dominated by `.nf` literals, and the widest table
+  cases are ones groff renders just as wide. Line width was the wrong proxy for
+  the text-block defect; the right one was marker leakage, which was 80 pages.
 
 ## Priority issues
 

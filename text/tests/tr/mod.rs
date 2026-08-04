@@ -1050,3 +1050,18 @@ fn tr_delete_keeps_multibyte_characters_whole() {
         "\u{16CF}".as_bytes()
     );
 }
+
+#[test]
+fn tr_case_class_must_be_at_the_same_relative_position() {
+    // POSIX 118123-118124: `[:upper:]` is valid in string2 "only if the
+    // corresponding character class ... is specified in the same relative
+    // position in string1". Only the class *names* were checked before, because
+    // parsing had already flattened classes to characters and the operand list
+    // no longer recorded where they came from.
+    let err = tr_expect_error(&["x[:lower:]", "[:upper:]y"], "abc");
+    assert!(err.contains("same relative position"), "got {err:?}");
+
+    // Aligned, so accepted, and the conversion applies to the class position.
+    tr_test(&["x[:lower:]", "y[:upper:]"], "aBc", "ABC");
+    tr_test(&["x[:lower:]", "y[:upper:]"], "xbc", "yBC");
+}

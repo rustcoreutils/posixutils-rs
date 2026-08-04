@@ -328,3 +328,88 @@ fn asa_alternating_spacing() {
         "normal\n\ndouble\nnormal\n\ndouble\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Operands, `-`, `--` and error paths (audit "Test coverage signal")
+// ---------------------------------------------------------------------------
+
+use std::io::Write;
+
+/// Run `asa` with `args` against real files, returning (stdout, stderr, code).
+fn asa_run(args: &[&str]) -> (String, String, i32) {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_asa"))
+        .args(args)
+        .output()
+        .expect("failed to run asa");
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.code().unwrap_or(-1),
+    )
+}
+
+fn tmp_file(name: &str, content: &str) -> std::path::PathBuf {
+    let mut p = std::env::temp_dir();
+    p.push(format!("posixutils-asa-{}-{}", std::process::id(), name));
+    let mut f = std::fs::File::create(&p).expect("create temp file");
+    f.write_all(content.as_bytes()).expect("write temp file");
+    p
+}
+
+#[test]
+fn asa_nonexistent_file_errors() {
+    let (_, stderr, code) = asa_run(&["no-such-file-xyz"]);
+    assert_eq!(code, 1, "a missing operand must exit non-zero");
+    assert!(
+        stderr.contains("no-such-file-xyz"),
+        "the diagnostic must name the file, got {stderr:?}"
+    );
+}
+
+#[test]
+fn asa_continues_past_a_missing_file() {
+    // POSIX CONSEQUENCES OF ERRORS is Default, but the historical behavior is
+    // to process the remaining operands and still exit non-zero.
+    let good = tmp_file("good", " kept\n");
+    let (stdout, _, code) = asa_run(&["no-such-file-xyz", good.to_str().unwrap()]);
+    assert_eq!(code, 1);
+    assert!(
+        stdout.contains("kept"),
+        "later operands must still be processed, got {stdout:?}"
+    );
+    let _ = std::fs::remove_file(good);
+}
+
+#[test]
+fn asa_dash_interleaved_with_files() {
+    // `-` is stdin even when it is not the sole operand, and order is preserved.
+    let a = tmp_file("a", " first\n");
+    let b = tmp_file("b", " third\n");
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_asa"))
+        .args([a.to_str().unwrap(), "-", b.to_str().unwrap()])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn asa");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b" second\n")
+        .unwrap();
+    let out = child.wait_with_output().expect("wait asa");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout, "first\nsecond\nthird\n", "got {stdout:?}");
+    let _ = std::fs::remove_file(a);
+    let _ = std::fs::remove_file(b);
+}
+
+#[test]
+fn asa_double_dash_ends_options() {
+    // A file whose name begins with `-` is reachable only after `--`.
+    let f = tmp_file("-dashname", " body\n");
+    let (stdout, _, code) = asa_run(&["--", f.to_str().unwrap()]);
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "body\n");
+    let _ = std::fs::remove_file(f);
+}

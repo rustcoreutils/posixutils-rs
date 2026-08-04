@@ -199,3 +199,33 @@ fn comm_missing_file_error() {
         },
     );
 }
+
+// ---------------------------------------------------------------------------
+// End-of-options
+// ---------------------------------------------------------------------------
+
+#[test]
+fn comm_double_dash_allows_dash_prefixed_operands() {
+    let dir = std::env::temp_dir();
+    let mut a = dir.clone();
+    a.push(format!("-posixutils-comm-a-{}", std::process::id()));
+    let mut b = dir.clone();
+    b.push(format!("-posixutils-comm-b-{}", std::process::id()));
+    std::fs::write(&a, "x\n").expect("write a");
+    std::fs::write(&b, "x\n").expect("write b");
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_comm"))
+        .args(["--", a.to_str().unwrap(), b.to_str().unwrap()])
+        .output()
+        .expect("run comm");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // A line in both files lands in column 3.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "\t\tx\n");
+    let _ = std::fs::remove_file(a);
+    let _ = std::fs::remove_file(b);
+}

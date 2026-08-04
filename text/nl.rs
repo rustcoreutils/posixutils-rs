@@ -8,7 +8,7 @@
 //
 
 use clap::{Parser, ValueEnum};
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use plib::regex::{Regex, RegexFlags};
 use std::fs;
 use std::io::{self, BufRead, Read};
@@ -140,7 +140,13 @@ fn nl_main(args: &Args) -> io::Result<()> {
         if path.as_os_str() == "-" {
             Box::new(io::stdin().lock())
         } else {
-            Box::new(fs::File::open(path)?)
+            // Name the file in the diagnostic, as the other text utilities do;
+            // a bare "No such file or directory" does not say which operand
+            // failed.
+            Box::new(
+                fs::File::open(path)
+                    .map_err(|e| io::Error::new(e.kind(), format!("{}: {}", path.display(), e)))?,
+            )
         }
     } else {
         Box::new(io::stdin().lock())
@@ -294,9 +300,9 @@ fn nl_main(args: &Args) -> io::Result<()> {
 }
 
 fn main() -> ExitCode {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs").unwrap();
-    bind_textdomain_codeset("posixutils-rs", "UTF-8").unwrap();
+    // Sets the locale *and* the diagnostic prefix, so `plib::diag::error`
+    // identifies the utility.
+    plib::diag::init_locale("nl");
 
     let mut args = Args::parse();
 
@@ -307,12 +313,18 @@ fn main() -> ExitCode {
         2 => (),
         _ => {
             // Delimiter should be at most 2 characters.
+            plib::diag::error(&gettext("section delimiter must be at most 2 characters"));
             return ExitCode::from(1);
         }
     }
 
     match nl_main(&args) {
         Ok(_) => ExitCode::from(0),
-        Err(_) => ExitCode::from(1),
+        Err(e) => {
+            // The error was previously discarded, so `nl nosuchfile` exited 1
+            // with nothing on stderr at all.
+            plib::diag::error(&e.to_string());
+            ExitCode::from(1)
+        }
     }
 }

@@ -120,3 +120,42 @@ fn test_nl_pbre_interval() {
         expected_exit_code: 0,
     });
 }
+
+// ---------------------------------------------------------------------------
+// Error paths
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_nl_nonexistent_file_reports_and_exits_nonzero() {
+    // This exited 1 with *nothing* on stderr: `main` matched `Err(_)` and threw
+    // the error away.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nl"))
+        .arg("no-such-file-xyz")
+        .output()
+        .expect("run nl");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.starts_with("nl:"),
+        "the diagnostic must name the utility, got {stderr:?}"
+    );
+    assert!(
+        stderr.contains("no-such-file-xyz"),
+        "the diagnostic must name the file, got {stderr:?}"
+    );
+}
+
+#[test]
+fn test_nl_rejects_an_over_long_section_delimiter() {
+    // A >2-character -d argument was rejected silently.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nl"))
+        .args(["-d", "abc"])
+        .output()
+        .expect("run nl");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).starts_with("nl:"),
+        "got {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

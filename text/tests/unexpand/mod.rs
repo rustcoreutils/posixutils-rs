@@ -91,7 +91,9 @@ fn unexpand_rejects_zero_tabsize() {
         args: vec!["-t".to_string(), "0".to_string()],
         stdin_data: String::from("        x\n"),
         expected_out: String::new(),
-        expected_err: String::from("tab size must be a positive integer\n"),
+        // Prefixed with the utility name since unexpand joined the tree's
+        // shared diagnostic path.
+        expected_err: String::from("unexpand: tab size must be a positive integer\n"),
         expected_exit_code: 1,
     });
 }
@@ -150,4 +152,23 @@ fn unexpand_multibyte_column_width() {
         .unwrap();
     let out = child.wait_with_output().unwrap().stdout;
     assert_eq!(out, "世界\t    x\n".as_bytes());
+}
+
+// ---------------------------------------------------------------------------
+// Error paths
+// ---------------------------------------------------------------------------
+
+#[test]
+fn unexpand_nonexistent_file_errors_naming_the_utility() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_unexpand"))
+        .arg("no-such-file-xyz")
+        .output()
+        .expect("run unexpand");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // This printed a bare "No such file or directory" with no utility name.
+    assert!(
+        stderr.starts_with("unexpand:"),
+        "the diagnostic must name the utility, got {stderr:?}"
+    );
 }

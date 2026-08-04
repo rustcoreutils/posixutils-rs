@@ -11,7 +11,7 @@ use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use plib::io::input_stream_dashed;
 use plib::locale::{mb_char_slices, wcwidth_char};
 
@@ -143,9 +143,9 @@ fn fold_file(args: &Args, pathname: &Path) -> io::Result<()> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    // Sets the locale *and* the diagnostic prefix, so `plib::diag::error`
+    // identifies the utility.
+    plib::diag::init_locale("fold");
 
     let mut args = Args::parse();
 
@@ -159,7 +159,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for filename in &args.files {
         if let Err(e) = fold_file(&args, filename) {
             exit_code = 1;
-            eprintln!("{}: {}", filename.display(), e);
+            // Prefixed with the utility name like every other diagnostic in the
+            // tree; this printed only "<file>: <error>", so a fold failure in a
+            // pipeline was not attributable to fold.
+            plib::diag::error(&format!("{}: {}", filename.display(), e));
         }
     }
 

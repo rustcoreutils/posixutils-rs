@@ -168,3 +168,101 @@ fn fold_wide_character_width() {
     let out = run_fold_locale(&["-w", "2"], "世界\n".as_bytes(), &loc);
     assert_eq!(out, "世\n界\n".as_bytes());
 }
+
+// ---------------------------------------------------------------------------
+// Operands, error paths and control characters
+// ---------------------------------------------------------------------------
+
+fn fold_run(args: &[&str], stdin: &str) -> (String, String, i32) {
+    use std::io::Write;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_fold"))
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn fold");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().expect("wait fold");
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.code().unwrap_or(-1),
+    )
+}
+
+fn fold_tmp(name: &str, content: &str) -> std::path::PathBuf {
+    let mut p = std::env::temp_dir();
+    p.push(format!("posixutils-fold-{}-{}", std::process::id(), name));
+    std::fs::write(&p, content).expect("write temp file");
+    p
+}
+
+#[test]
+fn fold_nonexistent_file_errors_naming_the_utility() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_fold"))
+        .arg("no-such-file-xyz")
+        .output()
+        .expect("run fold");
+    assert_ne!(out.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("no-such-file-xyz"), "got {stderr:?}");
+    // The diagnostic identifies the utility, as every other one in the tree
+    // does; this printed only "<file>: <error>".
+    assert!(
+        stderr.starts_with("fold:"),
+        "diagnostic must name the utility, got {stderr:?}"
+    );
+}
+
+#[test]
+fn fold_multiple_file_operands_are_concatenated() {
+    let a = fold_tmp("f1", "aaaa\n");
+    let b = fold_tmp("f2", "bbbb\n");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_fold"))
+        .args(["-w", "2", a.to_str().unwrap(), b.to_str().unwrap()])
+        .output()
+        .expect("run fold");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "aa\naa\nbb\nbb\n");
+    let _ = std::fs::remove_file(a);
+    let _ = std::fs::remove_file(b);
+}
+
+#[test]
+fn fold_empty_input_produces_nothing() {
+    let (stdout, _, code) = fold_run(&["-w", "4"], "");
+    assert_eq!(stdout, "");
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn fold_input_without_trailing_newline() {
+    // The final fragment is still written, and no <newline> is invented.
+    let (stdout, _, code) = fold_run(&["-w", "3"], "abcde");
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "abc\nde", "got {stdout:?}");
+}
+
+#[test]
+fn fold_backspace_decrements_the_column() {
+    // POSIX: a <backspace> decreases the column position by one (not below
+    // zero), so the folded width accounts for the erased column.
+    let (stdout, _, code) = fold_run(&["-w", "3"], "ab\x08cd\n");
+    assert_eq!(code, 0);
+    // Columns: a=1 b=2 BS=1 c=2 d=3 -> the whole thing fits in three columns.
+    assert_eq!(stdout, "ab\x08cd\n", "got {stdout:?}");
+}
+
+#[test]
+fn fold_carriage_return_resets_the_column() {
+    // POSIX: a <carriage-return> sets the column position to zero.
+    let (stdout, _, code) = fold_run(&["-w", "3"], "abc\rabc\n");
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "abc\rabc\n", "got {stdout:?}");
+}

@@ -280,3 +280,106 @@ fn head_dash_operand_reads_stdin() {
         expected_exit_code: 0,
     });
 }
+
+// ---------------------------------------------------------------------------
+// Operands, headers and error paths
+// ---------------------------------------------------------------------------
+
+fn head_run(args: &[&str]) -> (String, String, i32) {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_head"))
+        .args(args)
+        .output()
+        .expect("failed to run head");
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.code().unwrap_or(-1),
+    )
+}
+
+fn head_tmp(name: &str, content: &str) -> std::path::PathBuf {
+    let mut p = std::env::temp_dir();
+    p.push(format!("posixutils-head-{}-{}", std::process::id(), name));
+    std::fs::write(&p, content).expect("write temp file");
+    p
+}
+
+#[test]
+fn head_multiple_files_get_name_headers() {
+    // POSIX STDOUT: with more than one file operand, each is preceded by
+    // "==> <pathname> <==" and separated by a blank line.
+    let a = head_tmp("h1", "a1\na2\n");
+    let b = head_tmp("h2", "b1\nb2\n");
+    let (stdout, _, code) = head_run(&["-n", "1", a.to_str().unwrap(), b.to_str().unwrap()]);
+    assert_eq!(code, 0);
+    assert_eq!(
+        stdout,
+        format!(
+            "==> {} <==\na1\n\n==> {} <==\nb1\n",
+            a.display(),
+            b.display()
+        ),
+        "got {stdout:?}"
+    );
+    let _ = std::fs::remove_file(a);
+    let _ = std::fs::remove_file(b);
+}
+
+#[test]
+fn head_single_file_has_no_header() {
+    let f = head_tmp("solo", "x\ny\n");
+    let (stdout, _, code) = head_run(&["-n", "1", f.to_str().unwrap()]);
+    assert_eq!(code, 0);
+    assert_eq!(
+        stdout, "x\n",
+        "a lone operand gets no header, got {stdout:?}"
+    );
+    let _ = std::fs::remove_file(f);
+}
+
+#[test]
+fn head_zero_count_writes_nothing_and_succeeds() {
+    let f = head_tmp("zero", "a\nb\n");
+    let p = f.to_str().unwrap();
+    let (stdout, _, code) = head_run(&["-n", "0", p]);
+    assert_eq!(stdout, "");
+    assert_eq!(code, 0, "-n 0 is not an error");
+    let (stdout, _, code) = head_run(&["-c", "0", p]);
+    assert_eq!(stdout, "");
+    assert_eq!(code, 0, "-c 0 is not an error");
+    let _ = std::fs::remove_file(f);
+}
+
+#[test]
+fn head_nonexistent_file_errors() {
+    let (_, stderr, code) = head_run(&["-n", "1", "no-such-file-xyz"]);
+    assert_ne!(code, 0);
+    assert!(stderr.contains("no-such-file-xyz"), "got {stderr:?}");
+}
+
+#[test]
+fn head_mixes_dash_with_named_files() {
+    let f = head_tmp("mix", "fromfile\n");
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_head"))
+        .args(["-n", "1", "-", f.to_str().unwrap()])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn head");
+    use std::io::Write;
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"fromstdin\n")
+        .unwrap();
+    let out = child.wait_with_output().expect("wait head");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("fromstdin"), "got {stdout:?}");
+    assert!(stdout.contains("fromfile"), "got {stdout:?}");
+    assert!(
+        stdout.contains("==>"),
+        "multiple operands get headers: {stdout:?}"
+    );
+    let _ = std::fs::remove_file(f);
+}

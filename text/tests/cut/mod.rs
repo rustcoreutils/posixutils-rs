@@ -421,3 +421,66 @@ fn test_cut_continue_after_missing_file() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "x\nx\n");
     assert_ne!(out.status.code(), Some(0));
 }
+
+// ---------------------------------------------------------------------------
+// -n and delimiter edge cases
+// ---------------------------------------------------------------------------
+
+/// First installed UTF-8 locale, if any. `-n` is defined in terms of
+/// characters, which only differ from bytes in a multi-byte locale.
+fn utf8_locale() -> Option<String> {
+    let avail = std::process::Command::new("locale")
+        .arg("-a")
+        .output()
+        .ok()?;
+    // Search case-insensitively but return the canonical spelling: glibc locale
+    // names are case-sensitive, so `LC_ALL=c.utf8` silently falls back to C.
+    let list = String::from_utf8_lossy(&avail.stdout).to_lowercase();
+    for name in ["C.UTF-8", "C.utf8", "en_US.UTF-8", "en_US.utf8"] {
+        if list.contains(&name.to_lowercase()) {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
+#[test]
+fn test_cut_n_does_not_split_a_multibyte_character() {
+    // POSIX: with -n, a byte range shall not split a multi-byte character.
+    // "h\u{e9}llo" is h, then a two-byte U+00E9; bytes 1-2 would cut it in
+    // half. In the C locale every byte *is* a character, so this only has
+    // meaning under a UTF-8 locale.
+    let Some(loc) = utf8_locale() else {
+        return;
+    };
+    let run = |args: &[&str]| -> Vec<u8> {
+        use std::io::Write;
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_cut"))
+            .args(args)
+            .env("LC_ALL", &loc)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn cut");
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all("h\u{e9}llo\n".as_bytes())
+            .unwrap();
+        child.wait_with_output().expect("wait cut").stdout
+    };
+    assert_eq!(
+        run(&["-b", "1-2", "-n"]),
+        b"h\n",
+        "the character must not be split"
+    );
+    assert_eq!(run(&["-b", "1-3", "-n"]), "h\u{e9}\n".as_bytes());
+}
+
+#[test]
+fn test_cut_backslash_delimiter() {
+    // A backslash is an ordinary delimiter character, not an escape.
+    cut_test(&["-d", "\\", "-f", "1"], "a\\b\\c\n", "a\n");
+    cut_test(&["-d", "\\", "-f", "2"], "a\\b\\c\n", "b\n");
+}

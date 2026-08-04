@@ -8,7 +8,7 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use plib::io::input_stream_dashed;
 use plib::locale::{mb_char_slices, wcwidth_char};
 use std::io::{self, BufRead, Write};
@@ -247,9 +247,9 @@ fn unexpand_line(line: &[u8], tabs: &TabStops, all_mode: bool) -> Vec<u8> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    // Sets the locale *and* the diagnostic prefix, so the error below names the
+    // utility as every other one in the tree does.
+    plib::diag::init_locale("unexpand");
 
     let args = Args::parse();
 
@@ -257,7 +257,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Err(err) = unexpand(&args) {
         exit_code = 1;
-        eprintln!("{}", err);
+        plib::diag::error(&err.to_string());
     }
 
     std::process::exit(exit_code)

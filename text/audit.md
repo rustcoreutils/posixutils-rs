@@ -118,11 +118,11 @@ Locale setup at lines 130-132 satisfies POSIX. Error message text in `eprintln!`
 ### Test coverage signal
 
 Not covered:
-- [ ] Non-existent file argument → exit 1 + diagnostic to stderr
-- [ ] Mix of valid and invalid file arguments (continue, exit 1)
-- [ ] `-` operand interleaved with real files (`asa file1 - file2`)
-- [ ] `--` end-of-options followed by a filename beginning with `-`
-- [ ] Single-byte input with no newline
+- [x] Non-existent file argument → exit 1 + diagnostic to stderr — `asa_nonexistent_file_errors`
+- [x] Mix of valid and invalid file arguments (continue, exit 1) — `asa_continues_past_a_missing_file`
+- [x] `-` operand interleaved with real files (`asa file1 - file2`) — `asa_dash_interleaved_with_files`
+- [x] `--` end-of-options followed by a filename beginning with `-` — `asa_double_dash_ends_options`
+- [x] Single-byte input with no newline — `asa_control_only_no_newline`
 
 ### Suggested PR groupings
 
@@ -237,7 +237,7 @@ Not covered:
 - [ ] LC_COLLATE non-C locale collation comparison
 - [ ] Issue 8 tiebreak (equal-collating, non-identical lines)
 - [ ] Unsorted input (document actual behavior)
-- [ ] `--` delimiter allowing operands starting with `-`
+- [x] `--` delimiter allowing operands starting with `-` — `comm_double_dash_allows_dash_prefixed_operands`
 - [ ] LC_MESSAGES affecting diagnostic text
 
 ### Suggested PR groupings
@@ -491,12 +491,12 @@ Note: a strictly decreasing single element (`5-3`) is rejected (correct: `low>hi
 
 Not covered:
 - [x] `cut -f 1` (default tab delimiter — golden-path regression) — `test_cut_f_default_tab`
-- [ ] `cut -b 1-2 -n` on a 3-byte UTF-8 character
+- [x] `cut -b 1-2 -n` on a 3-byte UTF-8 character — `test_cut_n_does_not_split_a_multibyte_character`
 - [x] continue after file error (`cut -b 1 /dev/null nonexistent other.txt`) — `test_cut_continue_after_missing_file`
 - [x] blank-separated list `cut -c "1 3 5"` — `test_cut_blank_separated_list`
 - [x] non-UTF-8 byte output (`-b` on binary data) — `test_cut_b_raw_bytes_non_utf8`
 - [x] `-` mixed with real files — `test_cut_dash_non_sole_operand`
-- [ ] backslash delimiter (`-d \\ -f 1`)
+- [x] backslash delimiter (`-d \\ -f 1`) — `test_cut_backslash_delimiter`
 
 ### Suggested PR groupings
 
@@ -911,11 +911,11 @@ Locale initialized, but the core loop is byte-oriented: no UTF-8 decode, no `wcw
 Not covered (all test inputs fit within 80 columns, so no fold ever fires):
 - [x] Any input that actually causes a fold (`-w` narrow) — `fold_custom_width`
 - [x] `-s` with an actual fold point — `fold_spaces_breaks_at_last_blank`
-- [ ] tab / backspace / carriage-return handling
+- [x] tab / backspace / carriage-return handling — `fold_backspace_decrements_the_column`, `fold_carriage_return_resets_the_column`, `fold_tab_advances_to_stop`
 - [x] multibyte / wide-character column counting — `fold_wide_character_width`
-- [ ] `-` operand as stdin; multiple file operands
-- [ ] error exit (inaccessible file)
-- [ ] word longer than width with `-s`; empty input; no trailing newline
+- [x] `-` operand as stdin; multiple file operands — `fold_dash_operand_reads_stdin`, `fold_multiple_file_operands_are_concatenated`
+- [x] error exit (inaccessible file) — `fold_nonexistent_file_errors_naming_the_utility`
+- [x] word longer than width with `-s`; empty input; no trailing newline — `fold_spaces_no_blank_falls_back_to_hard_break`, `fold_empty_input_produces_nothing`, `fold_input_without_trailing_newline`
 
 ### Suggested PR groupings
 
@@ -1187,11 +1187,11 @@ Locale initialized; two hardcoded English diagnostics (lines 162, 171) bypass ge
 
 Not covered:
 - [x] `-` as a file operand (stdin via dash) (#1) — `head_dash_operand_reads_stdin`
-- [ ] `-n 0` / `-c 0` exit-code behavior (property tests don't check exit code) (#2)
-- [ ] multiple file operands with `==> name <==` headers
-- [ ] non-existent file → non-zero exit
-- [ ] single-file header suppression
-- [ ] mixed `-` and named files
+- [x] `-n 0` / `-c 0` exit-code behavior (property tests don't check exit code) (#2) — `head_zero_count_writes_nothing_and_succeeds`
+- [x] multiple file operands with `==> name <==` headers — `head_multiple_files_get_name_headers`
+- [x] non-existent file → non-zero exit — `head_nonexistent_file_errors`
+- [x] single-file header suppression — `head_single_file_has_no_header`
+- [x] mixed `-` and named files — `head_mixes_dash_with_named_files`
 
 ### Suggested PR groupings
 
@@ -1472,7 +1472,7 @@ Not covered:
 - [ ] `-f`/`-h` with `pBRE`
 - [ ] `-l N` grouping across a section delimiter (#2)
 - [ ] `-d` with 0-length or >2-char argument
-- [ ] non-existent file → non-zero exit
+- [x] non-existent file → non-zero exit — `test_nl_nonexistent_file_reports_and_exits_nonzero`
 - [ ] line-number overflow; `-v` negative start; `-i` zero/negative
 - [ ] multiple logical pages in sequence; `-w` wider than default; multi-char `-s`
 
@@ -2394,8 +2394,8 @@ Not covered:
 - [x] file truncation during `-f`; file removal during `-f` (#4)
 - [x] `-n +0` (#3)
 - [x] `--` end-of-options with file operand (#6)
-- [ ] `-c +1` (entire file from byte 1)
-- [ ] error exit code/message when file does not exist
+- [x] `-c +1` (entire file from byte 1) — `test_tail_c_plus_one_is_the_whole_file`
+- [x] error exit code/message when file does not exist — `test_tail_nonexistent_file_errors`
 - [x] LC_MESSAGES influence on diagnostics (#5)
 
 ### Suggested PR groupings
@@ -2660,8 +2660,8 @@ Not covered:
 - [x] `-` operand as stdin (#3) — `tsort_dash_operand_reads_stdin`
 - [x] non-zero exit on cycle (tests assert exit 0) (#2) — `test_tsort_cycle_two_nodes`
 - [x] cycle count under `-w` — `test_tsort_w_counts_cycles`
-- [ ] multiple independent cycles → separate reports (#5)
-- [ ] `--` followed by a `-`-prefixed file operand
+- [x] multiple independent cycles → separate reports (#5) — `tsort_reports_each_independent_cycle`
+- [x] `--` followed by a `-`-prefixed file operand — `tsort_double_dash_allows_a_dash_prefixed_file`
 
 ### Suggested PR groupings
 
@@ -2794,7 +2794,7 @@ Not covered:
 - [ ] leading tab interacting with conversion (#9)
 - [x] multibyte/wide characters (#10) — `unexpand_multibyte_column_width`
 - [x] multiple files; `-` among multiple operands (#8) — `unexpand_dash_non_sole_operand`
-- [ ] error cases (non-existent file)
+- [x] error cases (non-existent file) — `unexpand_nonexistent_file_errors_naming_the_utility`
 
 ### Suggested PR groupings
 
@@ -3054,13 +3054,13 @@ Two confirmed bugs dominate: (1) a single named file operand prints no filename,
 Only three tests (empty, single char, two-word line), all stdin. Not covered:
 - [x] single named file operand (would expose #1) — `wc_single_file_shows_name`
 - [x] `-` operand as stdin (#2) — `wc_dash_operand_reads_stdin`
-- [ ] multiple file operands (total line, per-file filenames)
-- [ ] default output (no flags) format and column order
+- [x] multiple file operands (total line, per-file filenames) — `wc_multiple_files_report_each_and_a_total`
+- [x] default output (no flags) format and column order — `wc_default_output_is_lines_words_bytes`
 - [x] `-m` with multibyte UTF-8 input (#3) — `wc_chars_locale_aware`
-- [ ] `-l -w`/`-l -c` combined (alignment, #5)
+- [x] `-l -w`/`-l -c` combined (alignment, #5) — `wc_combined_flags_keep_column_order`
 - [x] non-ASCII word-boundary detection (#4) — `wc_words_locale_whitespace`
-- [ ] non-existent/unreadable file; exit code propagation
-- [ ] `--` end of options
+- [x] non-existent/unreadable file; exit code propagation — `wc_nonexistent_file_errors_and_exits_nonzero`
+- [x] `--` end of options — `wc_double_dash_ends_options`
 
 ### Suggested PR groupings
 

@@ -160,6 +160,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] timeout
  - [x] touch
  - [x] tput
+ - [x] tr
  - [x] true
  - [x] tsort
  - [x] tty
@@ -197,7 +198,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
 
  - [x] c17 (Development)
  - [x] localedef (i18n)
- - [x] tr
 
 ## Stage 2 - Feature-complete and POSIX compliant
 

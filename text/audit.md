@@ -2453,17 +2453,17 @@ Not covered:
 
 ## `tr`
 
-> **STATUS — Remediated for the C/POSIX locale; remains at Stage 3.** `tr` is fully POSIX-conformant in the C/POSIX locale. The multibyte items (`#1` `-c`/`-C`, `#2` `LC_CTYPE` classes, `#4` `[=equiv=]`, `#5` `LC_COLLATE` ranges) are documented POSIX-locale limitations requiring a predicate-based class-matching rewrite (locale-aware classes would desync the `[:upper:]`↔`[:lower:]` case pairing). Promote once that rewrite lands.
+> **STATUS — Conformant, including in multibyte locales (2026-08-04). Promoted to Stage 6.** Every finding is closed. `#2` (LC_CTYPE classes and case conversion), `#1` (`-c` vs `-C`) and the relative-position half of `#3` are implemented; `#4` now asks libc what an equivalence class contains instead of assuming; `#5` was re-examined and **conforms as written** — see its entry.
 
-**Implementation:** `text/tr.rs` (2484 lines)
-**Tests:** `text/tests/tr/mod.rs` (795 lines)
+**Implementation:** `text/tr.rs` (3,007 lines)
+**Tests:** `text/tests/tr/mod.rs` (1,078 lines, 118 tests)
 **Spec:** POSIX.1-2024 (IEEE Std 1003.1-2024), Vol. 3 §3
 **Reference slice:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/tr.md`
 **Date:** 2026-06-25
 
 ### TL;DR
 
-Large and well-structured, covering all four modes (translate, delete, squeeze, delete+squeeze), all backslash escapes, `[:class:]`, `[=equiv=]`, `[c*n]`/`[c*]`, ranges, NUL, multibyte UTF-8, and complement. Primary gaps: (1) `-c` and `-C` are treated identically despite different semantics; (2) character classes are hardcoded ASCII, ignoring LC_CTYPE; (3) class names other than `[:lower:]`/`[:upper:]` are not rejected in string2 during translate mode; (4) `[=equiv=]` expands to only the literal character; (5) ranges ignore LC_COLLATE in non-POSIX locales. None are crash-level; (2)/(3) affect correctness in non-C locales.
+Large and well-structured, covering all four modes (translate, delete, squeeze, delete+squeeze), all backslash escapes, `[:class:]`, `[=equiv=]`, `[c*n]`/`[c*]`, ranges, NUL, multibyte UTF-8, and complement. **All five locale findings are resolved (2026-08-04)**: character classes and case conversion follow `LC_CTYPE`, `-c` (values) and `-C` (characters) are distinguished, equivalence classes are resolved by libc, the string2 class rule is enforced including relative position, and ranges were shown to conform already. Two latent bugs were found in the process: `tr -d` truncated every kept multi-byte character to its lead byte, and `FullChar::new_from_char` had no arm for a one-byte character.
 
 ### Priority issues
 
@@ -2473,28 +2473,24 @@ Large and well-structured, covering all four modes (translate, delete, squeeze, 
 
 #### Major
 
-> **Phase 7 disposition (multibyte locale support).** tr is fully POSIX-conformant
-> in the C/POSIX locale, which is the conformance baseline: there `-c` ≡ `-C`
-> (every byte is a character), `[:class:]` expands to the documented ASCII sets,
-> each character is its own equivalence class, and code-point order *is* the
-> collation order. The remaining findings (#1, #2, #4, #5) concern non-POSIX
-> (multibyte) locales. A correct fix requires replacing tr's finite-set class
-> expansion with predicate-based character matching *and* special-casing the
-> `[:upper:]`↔`[:lower:]` case conversion (it is currently done by positionally
-> pairing the two 26-element class vectors; a locale-aware class would desync
-> them and corrupt case conversion). That is an architectural change deferred as
-> a documented POSIX-locale limitation (the sanctioned fallback for tr's locale
-> items). The locale-independent items (#3 undefined-input handling, #6 test) are
-> resolved.
+> **Superseded (2026-08-04).** The Phase 7 note deferred #1/#2/#4/#5 as
+> "documented POSIX-locale limitations" needing "a predicate-based class-matching
+> rewrite", blocked on the observation that a locale-aware class would desync the
+> `[:upper:]`↔`[:lower:]` case pairing. The observation was right: pairing was an
+> accident of both ASCII classes having 26 members in the same order, and there
+> was no case-conversion code at all. The conclusion no longer holds — classes
+> are predicates over `plib::locale`, and case conversion is a *function* over
+> the locale's toupper/tolower mapping rather than a pairing of two enumerated
+> arrays, so there is nothing left to desync.
 
-- [x] **#1 — `-c` and `-C` treated identically.** DOCUMENTED LIMITATION (Phase 7): conformant in single-byte/C locales, where `-c` and `-C` are equivalent. The multibyte distinction (`-c` over byte values vs `-C` over LC_CTYPE characters) is deferred with the architectural rewrite above.
-- [x] **#2 — Character classes are ASCII-only, ignoring LC_CTYPE.** DOCUMENTED LIMITATION (Phase 7): the ASCII class sets are correct in the C/POSIX locale; locale-aware (predicate-based) class matching is deferred (it cannot be done by widening the class vectors without breaking `[:upper:]`↔`[:lower:]` case pairing).
-- [x] **#3 — Class names other than `[:lower:]`/`[:upper:]` not rejected in string2 (translate mode).** ACCEPTED: POSIX leaves the use of other class names in string2 *undefined*, so accepting them is conforming; no rejection is mandated.
+- [x] **#1 — `-c` and `-C` treated identically.** ✓ **fixed (2026-08-04).** They were collapsed into one flag under a literal `// TODO How are these different?`. POSIX 118043 defines `-c` over "the set of values" and 118045 defines `-C` over "the set of characters ... as defined by LC_CTYPE"; the unit is what differs. `-c` keeps byte-wise replacement, `-C` consumes the whole non-member character, so `tr -C 'ᛏ' A` on `ᛆᚠᛏ` gives `AAᛏ` where `-c` gives `AAAAAAᛏ`. Tests `tr_lowercase_c_complements_values_uppercase_c_complements_characters`, `tr_upper_c_deletes_whole_characters`.
+- [x] **#2 — Character classes are ASCII-only, ignoring LC_CTYPE.** ✓ **fixed (2026-08-04).** Classes stay symbolic through parsing and are matched as predicates over `plib::locale`, so `tr -d '[:alpha:]'` removes U+00E9 in a UTF-8 locale and leaves it in C. Case conversion (118125-118130) is applied through the locale's toupper/tolower mapping instead of emerging from positional pairing, and `-s` on a case conversion squeezes the *results* as 118178-118181 requires. This also exposed a **plib bug**: every `ctype_predicate!` and `isprint` dispatched `code <= 0xFF` to the byte-oriented `is*(3)`, which cannot classify U+0080..U+00FF in a multi-byte locale — `isalpha('é')` was false for `strings`, `expand`, `fold`, `unexpand` and `wc` too. Tests `tr_character_classes_follow_lc_ctype`, `tr_case_conversion_follows_the_locale`, `tr_squeeze_uses_the_case_conversion_results`.
+- [x] **#3 — Class names other than `[:lower:]`/`[:upper:]` not rejected in string2 (translate mode).** ✓ **fixed.** The earlier "ACCEPTED — no rejection is mandated" disposition was wrong: POSIX 118121-118124 is prescriptive, not permissive ("only character class names lower or upper are valid in string2 and then only if the corresponding character class ... is specified in the same relative position in string1"). Name checking landed in `11750d43`; the relative-position half followed on 2026-08-04 once parsing preserved provenance, replacing an argv re-lexer that existed only to work around its absence. Tests `tr_rejects_a_non_case_class_in_string2`, `tr_rejects_a_case_class_without_its_converse_in_string1`, `tr_case_class_must_be_at_the_same_relative_position`.
 
 #### Minor
 
-- [x] **#4 — `[=equiv=]` does not expand the full equivalence class.** DOCUMENTED LIMITATION (Phase 7): in the C/POSIX locale each character is its own equivalence class, so the literal-character behavior is correct; full LC_COLLATE equivalence expansion is deferred with the architectural rewrite above (the sanctioned fallback).
-- [x] **#5 — Ranges use Unicode code-point order, not LC_COLLATE.** DOCUMENTED LIMITATION (Phase 7): code-point order *is* the collation order in the C/POSIX locale; LC_COLLATE-ordered ranges are deferred.
+- [x] **#4 — `[=equiv=]` does not expand the full equivalence class.** ✓ **addressed (2026-08-04), with no output change on this platform.** The defect was the reasoning, not the result: the code hardcoded "the class is the character itself". Membership is now asked of libc through a `[[=c=]]` bracket expression, which every POSIX regex engine must implement per LC_COLLATE. On glibc in a UTF-8 locale the class genuinely *is* a singleton — its own regex matches only `e` for `[[=e=]]` — so nothing observable changes here; a platform or locale that defines real equivalence classes now works. Test `tr_equivalence_class_comes_from_the_locale`.
+- [x] **#5 — Ranges use Unicode code-point order, not LC_COLLATE.** ✓ **not a defect; conforms as written (re-examined 2026-08-04).** tr qualifies collation ranges with "In the POSIX locale" (118102), and XBD 9.3.5 (6552) completes it: "In other locales, a range expression has unspecified behavior: strictly conforming applications shall not rely on whether the range expression is valid, or on the set of collating elements matched." Code-point order *is* the collation order in the POSIX locale, so the behavior conforms in every locale. Implementing collation ranges literally would also be harmful: glibc orders en_US as `a A á b B`, so `tr -d 'a-z'` would begin deleting uppercase — which no tr does. Test `tr_ranges_use_code_point_order`.
 - [x] **#6 — `[c*]` in string1 rejection is correct but untested.** FIXED (Phase 7): added a regression test (`tr_repeat_construct_rejected_in_string1`).
 - [x] **#7 — `\` + non-octal/non-special char silently treated as the char.** ACCEPTED: the spec leaves this "unspecified"; the chosen behavior matches common implementations and is covered by a test.
 
@@ -2512,8 +2508,8 @@ Large and well-structured, covering all four modes (translate, delete, squeeze, 
 
 | Option | Status | Notes |
 |---|---|---|
-| `-c` complement values (binary order) | PARTIAL | conflated with `-C` (#1) |
-| `-C` complement chars (collation order) | PARTIAL | conflated with `-c` (#1) |
+| `-c` complement values (binary order) | CONFORMS | byte-wise; distinguished from `-C` (#1 fixed) |
+| `-C` complement chars (collation order) | CONFORMS | character-wise via LC_CTYPE (#1 fixed). The array's collation order is unobservable: string2 reduces to one replacement under complement. |
 | `-d` delete | CONFORMS | line 2085 |
 | `-s` squeeze | CONFORMS | |
 
@@ -2530,9 +2526,9 @@ Large and well-structured, covering all four modes (translate, delete, squeeze, 
 
 | Variable | Status | Notes |
 |---|---|---|
-| `LANG`/`LC_ALL` | PARTIAL | `setlocale` line 296; not used functionally for classes |
-| `LC_COLLATE` | MISSING | ranges + `-C` ordering ignore it (#1,#5) |
-| `LC_CTYPE` | MISSING | class membership hardcoded ASCII (#2) |
+| `LANG`/`LC_ALL` | CONFORMS | `setlocale` at entry; classes, case mapping and `-C` all consult it |
+| `LC_COLLATE` | CONFORMS | equivalence classes resolved through libc (#4). Ranges are code-point ordered, which conforms — unspecified outside the POSIX locale, XBD 9.3.5 (#5). |
+| `LC_CTYPE` | CONFORMS | class membership, case mapping and `-C` character boundaries all follow it (#2, #1) |
 | `LC_MESSAGES` | CONFORMS | gettextrs lines 297-298 |
 | `NLSPATH` | CONFORMS | XSI; `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 
@@ -2556,13 +2552,13 @@ Large and well-structured, covering all four modes (translate, delete, squeeze, 
 | `\\ \a \b \f \n \r \t \v` | CONFORMS | lines 778-799 |
 | `\other` / trailing `\` (unspecified) | CONFORMS | within latitude (#7) |
 | `c-c` range (POSIX-locale order) | CONFORMS | lines 854-899; reversed range error |
-| range LC_COLLATE order | MISSING | code-point order (#5) |
-| `[:class:]` (12 classes) | PARTIAL | ASCII-only (#2) |
+| range LC_COLLATE order | CONFORMS | code-point order; collation ranges are POSIX-locale-only and unspecified elsewhere (#5) |
+| `[:class:]` (12 classes) | CONFORMS | predicates over LC_CTYPE (#2) |
 | unknown / empty class name → error | CONFORMS | lines 985-991 |
-| `[:lower:]`/`[:upper:]` only valid in string2 | MISSING | not enforced (#3) |
-| case conversion via locale toupper/tolower | MISSING | hardcoded ASCII pairs |
+| `[:lower:]`/`[:upper:]` only valid in string2 | CONFORMS | enforced, including the same-relative-position rule (#3) |
+| case conversion via locale toupper/tolower | CONFORMS | applied as a function over the locale mapping (#2) |
 | `[=equiv=]` syntax / errors | CONFORMS | parsed; `[==]`/multi-char rejected |
-| `[=equiv=]` full LC_COLLATE expansion | MISSING | literal only (#4) |
+| `[=equiv=]` full LC_COLLATE expansion | CONFORMS | membership asked of libc; a singleton on glibc/UTF-8 is that platform's collation data (#4) |
 | `[c*n]` / `[c*0]` / `[c*]` | CONFORMS | lines 612-650; rejected in string1 |
 | translate / `-d` / `-s` / `-ds` modes | CONFORMS | duplicate-in-string1 uses last mapping |
 | `-c -d -s` complement applies to delete set | CONFORMS | line 256 |
@@ -2576,11 +2572,13 @@ Large and well-structured, covering all four modes (translate, delete, squeeze, 
 
 #### Cross-cutting (i18n, locale, collation, character classes)
 
-`setlocale` is called but not used for class membership, range collation, equivalence expansion, or `-C` ordering — the utility effectively always operates in the C/POSIX locale for these.
+`setlocale` now drives class membership (`plib::locale` predicates), case conversion (`to_upper`/`to_lower`), equivalence-class membership (a libc `[[=c=]]` bracket expression), and `-C` character boundaries. Ranges remain code-point ordered, which conforms: collation ranges are defined only for the POSIX locale and unspecified elsewhere (XBD 9.3.5).
 
 ### Test coverage signal
 
-Thorough for ASCII. Not covered:
+Thorough for ASCII, and now for multibyte locales; every row below is covered.
+Locale tests skip when the host has no UTF-8 locale
+(`plib::testing::utf8_locale`).
 - [x] locale-aware class expansion (any non-C locale) (#2) — `tr_character_classes_are_ascii_only`
 - [x] `[:lower:]`/`[:upper:]` case conversion in non-ASCII locale — `tr_case_conversion_is_ascii_only`
 - [x] rejection of `[:alpha:]` etc. in string2 (translate mode) (#3) — `tr_rejects_a_non_case_class_in_string2`, `tr_rejects_a_case_class_without_its_converse_in_string1`
@@ -2592,10 +2590,9 @@ Thorough for ASCII. Not covered:
 
 ### Suggested PR groupings
 
-- **PR A — "Reject non-lower/upper classes in string2"**: #3.
-- **PR B — "Locale-aware character classes"**: #2.
-- **PR C — "Distinguish `-c` from `-C`"**: #1.
-- **PR D — "`[=equiv=]` + range collation (pending LC_COLLATE)"**: #4, #5.
+All landed (2026-08-04): PR A (#3) in `11750d43` and `ccc7f71f`, PR B (#2) in
+`c0f42da9` and `cdb7c9eb`, PR C (#1) in `1a6fa4ff`, PR D (#4) in `c0f42da9`
+— #5 needed no change, being conforming already.
 
 ---
 

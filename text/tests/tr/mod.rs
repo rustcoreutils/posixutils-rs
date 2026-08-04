@@ -962,31 +962,42 @@ fn tr_squeeze_uses_the_case_conversion_results() {
 }
 
 #[test]
-fn tr_equivalence_class_holds_only_the_named_character() {
-    // #4: [=e=] should expand to every character collating equally with `e`.
+fn tr_equivalence_class_comes_from_the_locale() {
+    // POSIX 118137-118138: `[=c=]` represents the characters "belonging to the
+    // same equivalence class as equiv, as defined by the current setting of the
+    // LC_COLLATE locale category". There is no portable call to enumerate one,
+    // so membership is asked of libc through a `[[=c=]]` bracket expression
+    // rather than assumed to be the character itself.
+    //
+    // On glibc in a UTF-8 locale that class really is a singleton — its own
+    // regex engine matches only `e` for `[[=e=]]` — so U+00E9 survives. That is
+    // the platform's collation data, not an approximation on our side.
     let Some(loc) = plib::testing::utf8_locale() else {
         return;
     };
-    let out = tr_locale(&["-d", "[=e=]"], "e\u{e9}\n".as_bytes(), &loc);
     assert_eq!(
-        out,
-        "\u{e9}\n".as_bytes(),
-        "known gap (#4): the equivalence class contains only `e` itself"
+        tr_locale(&["-d", "[=e=]"], "e\u{e9}\n".as_bytes(), &loc),
+        "\u{e9}\n".as_bytes()
     );
+    // The named character itself is always a member.
+    assert_eq!(tr_locale(&["-d", "[=e=]"], b"beet\n", &loc), b"bt\n");
 }
 
 #[test]
 fn tr_ranges_use_code_point_order() {
-    // #5: a range should follow LC_COLLATE. It follows code points, so `a-b`
-    // covers exactly a and b, never A or B.
+    // Conforming, not a gap. tr's `c-c` is defined "In the POSIX locale ... as
+    // defined by the collation sequence" (118102), and XBD 9.3.5 (6552) settles
+    // the rest: "In other locales, a range expression has unspecified
+    // behavior". Code-point order *is* the collation order in the POSIX locale,
+    // so `a-b` is exactly {a, b} everywhere.
+    //
+    // Following collation literally would be actively harmful: glibc's en_US
+    // orders `a A á b B`, so `tr -d 'a-z'` would start deleting uppercase.
     let Some(loc) = plib::testing::utf8_locale() else {
         return;
     };
-    let out = tr_locale(&["-d", "a-b"], b"aAbB\n", &loc);
-    assert_eq!(
-        out, b"AB\n",
-        "known gap (#5): ranges are code-point ordered"
-    );
+    assert_eq!(tr_locale(&["-d", "a-b"], b"aAbB\n", &loc), b"AB\n");
+    assert_eq!(tr_locale(&["-d", "a-b"], b"aAbB\n", "C"), b"AB\n");
 }
 
 #[test]

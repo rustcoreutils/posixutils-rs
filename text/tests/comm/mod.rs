@@ -229,3 +229,119 @@ fn comm_double_dash_allows_dash_prefixed_operands() {
     let _ = std::fs::remove_file(a);
     let _ = std::fs::remove_file(b);
 }
+
+// ---------------------------------------------------------------------------
+// Collation, ordering and diagnostics
+// ---------------------------------------------------------------------------
+
+fn comm_run(args: &[&str], env: &[(&str, &str)]) -> (String, String, i32) {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_comm"));
+    cmd.args(args);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("run comm");
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.code().unwrap_or(-1),
+    )
+}
+
+fn comm_tmp(tag: &str, content: &str) -> std::path::PathBuf {
+    let mut p = std::env::temp_dir();
+    p.push(format!("posixutils-comm-{}-{}", std::process::id(), tag));
+    std::fs::write(&p, content).expect("write temp file");
+    p
+}
+
+#[test]
+fn comm_compares_lines_bytewise_regardless_of_collation() {
+    // POSIX says the comparison follows LC_COLLATE. Ours compares byte
+    // sequences, so a pair that collates equally but differs in bytes is
+    // reported as two distinct lines rather than a common one.
+    let Some(loc) = plib::testing::utf8_locale() else {
+        return;
+    };
+    let a = comm_tmp("coll-a", "a\n");
+    let b = comm_tmp("coll-b", "a \n");
+    let (stdout, _, code) = comm_run(
+        &[a.to_str().unwrap(), b.to_str().unwrap()],
+        &[("LC_ALL", loc.as_str())],
+    );
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "a\n\ta \n", "got {stdout:?}");
+    let _ = std::fs::remove_file(a);
+    let _ = std::fs::remove_file(b);
+}
+
+#[test]
+fn comm_unsorted_input_behavior() {
+    // POSIX leaves the result unspecified when the input is not sorted. Pin
+    // what we do: the merge simply walks both files in order and emits what it
+    // finds, without diagnosing the disorder.
+    let a = comm_tmp("uns-a", "b\na\n");
+    let b = comm_tmp("uns-b", "b\n");
+    let (stdout, _, code) = comm_run(&[a.to_str().unwrap(), b.to_str().unwrap()], &[]);
+    assert_eq!(code, 0, "unsorted input is not diagnosed");
+    assert_eq!(stdout, "\t\tb\na\n", "got {stdout:?}");
+    let _ = std::fs::remove_file(a);
+    let _ = std::fs::remove_file(b);
+}
+
+#[test]
+fn comm_diagnostics_are_translatable() {
+    // The diagnostic goes through gettext, so a catalog reached via NLSPATH
+    // replaces it. Without a catalog it stays English, which is what every
+    // other test here observes.
+    let dir = std::env::temp_dir().join(format!("posixutils-comm-nls-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let mo = dir.join("posixutils-rs.de_DE.mo");
+    std::fs::write(
+        &mo,
+        mo_catalog(&[("", "Content-Type: text/plain; charset=UTF-8\n")]),
+    )
+    .expect("write catalog");
+
+    let (_, stderr, code) = comm_run(
+        &["no-such-file-xyz", "no-such-file-xyz"],
+        &[
+            ("NLSPATH", dir.join("%N.%L.mo").to_str().unwrap()),
+            ("LC_ALL", "de_DE"),
+        ],
+    );
+    assert_ne!(code, 0);
+    assert!(
+        stderr.starts_with("comm:"),
+        "the diagnostic must name the utility, got {stderr:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Build a minimal little-endian GNU `.mo` image.
+fn mo_catalog(entries: &[(&str, &str)]) -> Vec<u8> {
+    let n = entries.len() as u32;
+    let (orig_tab, desc) = (28u32, 8u32);
+    let trans_tab = orig_tab + n * desc;
+    let strings_at = trans_tab + n * desc;
+    let (mut blob, mut origs, mut transs) = (Vec::new(), Vec::new(), Vec::new());
+    for (id, s) in entries {
+        origs.push((id.len() as u32, strings_at + blob.len() as u32));
+        blob.extend_from_slice(id.as_bytes());
+        blob.push(0);
+        transs.push((s.len() as u32, strings_at + blob.len() as u32));
+        blob.extend_from_slice(s.as_bytes());
+        blob.push(0);
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(&0x9504_12deu32.to_le_bytes());
+    for w in [0, n, orig_tab, trans_tab, 0, 0] {
+        out.extend_from_slice(&w.to_le_bytes());
+    }
+    for (len, off) in origs.into_iter().chain(transs) {
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&off.to_le_bytes());
+    }
+    out.extend_from_slice(&blob);
+    out
+}

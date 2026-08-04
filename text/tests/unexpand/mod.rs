@@ -111,19 +111,7 @@ fn unexpand_default_does_not_convert_interior() {
     unexpand_test(&[], "        a        b\n", "\ta        b\n");
 }
 
-fn utf8_locale() -> Option<String> {
-    let avail = std::process::Command::new("locale")
-        .arg("-a")
-        .output()
-        .ok()?;
-    let list = String::from_utf8_lossy(&avail.stdout).to_lowercase();
-    for name in ["C.UTF-8", "C.utf8", "en_US.UTF-8", "en_US.utf8"] {
-        if list.contains(&name.to_lowercase()) {
-            return Some(name.to_string());
-        }
-    }
-    None
-}
+use plib::testing::utf8_locale;
 
 #[test]
 fn unexpand_multibyte_column_width() {

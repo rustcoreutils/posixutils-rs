@@ -73,19 +73,7 @@ fn wc_single_file_shows_name() {
     );
 }
 
-fn utf8_locale() -> Option<String> {
-    let avail = std::process::Command::new("locale")
-        .arg("-a")
-        .output()
-        .ok()?;
-    let list = String::from_utf8_lossy(&avail.stdout).to_lowercase();
-    for name in ["C.UTF-8", "C.utf8", "en_US.UTF-8", "en_US.utf8"] {
-        if list.contains(&name.to_lowercase()) {
-            return Some(name.to_string());
-        }
-    }
-    None
-}
+use plib::testing::utf8_locale;
 
 fn wc_locale(args: &[&str], input: &[u8], locale: &str) -> String {
     use std::io::Write;

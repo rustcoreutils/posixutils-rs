@@ -392,3 +392,65 @@ fn pr_merge_of_empty_files() {
     let _ = std::fs::remove_file(a);
     let _ = std::fs::remove_file(b);
 }
+
+#[test]
+fn pr_form_feed_options_differ() {
+    // -f writes an <alert> before the form feed on a pause; -F does not pause
+    // and writes neither.
+    let f = pr_tmp("ff", "l1\n");
+    let with_f = std::process::Command::new(env!("CARGO_BIN_EXE_pr"))
+        .args(["-f", "-t", f.to_str().unwrap()])
+        .output()
+        .expect("run pr -f");
+    let with_upper_f = std::process::Command::new(env!("CARGO_BIN_EXE_pr"))
+        .args(["-F", "-t", f.to_str().unwrap()])
+        .output()
+        .expect("run pr -F");
+    assert_eq!(with_f.status.code(), Some(0));
+    assert_eq!(with_upper_f.status.code(), Some(0));
+    // POSIX: the pause "shall write an <alert> to standard error", not to
+    // standard output, so the page text itself is identical.
+    assert!(
+        with_f.stderr.contains(&b'\x07'),
+        "-f writes an alert to stderr, got {:?}",
+        String::from_utf8_lossy(&with_f.stderr)
+    );
+    assert!(
+        !with_upper_f.stderr.contains(&b'\x07'),
+        "-F must not pause, got {:?}",
+        String::from_utf8_lossy(&with_upper_f.stderr)
+    );
+    assert_eq!(
+        with_f.stdout, with_upper_f.stdout,
+        "the alert is the only difference; the page text is the same"
+    );
+    let _ = std::fs::remove_file(f);
+}
+
+#[test]
+fn pr_header_date_follows_lc_time() {
+    // The page header carries a date. It must render under any locale without
+    // failing; the exact spelling is locale data, not something to pin.
+    let Some(loc) = plib::testing::utf8_locale() else {
+        return;
+    };
+    let f = pr_tmp("date", "body\n");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_pr"))
+        .arg(f.to_str().unwrap())
+        .env("LC_ALL", &loc)
+        .env("LC_TIME", &loc)
+        .output()
+        .expect("run pr");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let header = stdout
+        .lines()
+        .find(|l| l.contains("Page"))
+        .expect("a page header is written");
+    assert!(header.contains("Page 1"), "got {header:?}");
+    assert!(
+        header.contains(f.file_name().unwrap().to_str().unwrap()),
+        "the header names the file, got {header:?}"
+    );
+    let _ = std::fs::remove_file(f);
+}

@@ -452,3 +452,23 @@ fn paste_many_dash_operands() {
     let out = child.wait_with_output().expect("wait paste");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "a\tb\tc\td\n");
 }
+
+#[test]
+fn paste_multibyte_delimiter_under_lc_ctype() {
+    // The delimiter list is a list of *characters*, so a multi-byte delimiter
+    // is written whole rather than a byte at a time.
+    let Some(loc) = plib::testing::utf8_locale() else {
+        return;
+    };
+    let a = paste_tmp("mb1", "1\n2\n");
+    let b = paste_tmp("mb2", "a\nb\n");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_paste"))
+        .args(["-d", "\u{e9}", a.to_str().unwrap(), b.to_str().unwrap()])
+        .env("LC_ALL", &loc)
+        .output()
+        .expect("run paste");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(out.stdout, "1\u{e9}a\n2\u{e9}b\n".as_bytes());
+    let _ = std::fs::remove_file(a);
+    let _ = std::fs::remove_file(b);
+}

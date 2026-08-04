@@ -821,12 +821,10 @@ fn tr_expect_error(args: &[&str], stdin: &str) -> String {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn tr");
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(stdin.as_bytes())
-        .unwrap();
+    // These invocations fail during argument validation, so tr may already have
+    // exited by the time this write lands; a broken pipe is expected here, not
+    // a test failure.
+    let _ = child.stdin.as_mut().unwrap().write_all(stdin.as_bytes());
     let out = child.wait_with_output().expect("wait tr");
     assert_ne!(out.status.code(), Some(0), "expected a non-zero exit");
     String::from_utf8_lossy(&out.stderr).into_owned()
@@ -871,4 +869,101 @@ fn tr_empty_string1_and_string2() {
     // leaving it unspecified in the suite too.
     let err = tr_expect_error(&["abc", ""], "abc");
     assert!(err.contains("non-empty"), "got {err:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Locale-dependent behavior
+//
+// These pin the *current* behavior of gaps the audit already records as
+// MISSING (#1, #2, #4, #5): character classes, case mapping, equivalence
+// classes and ranges are all ASCII/code-point based rather than driven by
+// LC_CTYPE and LC_COLLATE. Making them locale-aware is a substantial change to
+// tr's parsing layer, so the tests document where the boundary is today and
+// will fail loudly when it moves.
+// ---------------------------------------------------------------------------
+
+fn tr_locale(args: &[&str], stdin: &[u8], locale: &str) -> Vec<u8> {
+    use std::io::Write;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_tr"))
+        .args(args)
+        .env("LC_ALL", locale)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn tr");
+    let _ = child.stdin.as_mut().unwrap().write_all(stdin);
+    child.wait_with_output().expect("wait tr").stdout
+}
+
+#[test]
+fn tr_character_classes_are_ascii_only() {
+    // #2: [:alpha:] should follow LC_CTYPE. It does not, so a non-ASCII letter
+    // survives a delete that ought to remove it.
+    let Some(loc) = plib::testing::utf8_locale() else {
+        return;
+    };
+    let out = tr_locale(&["-d", "[:alpha:]"], "a\u{e9}b\n".as_bytes(), &loc);
+    assert_eq!(
+        out,
+        "\u{e9}\n".as_bytes(),
+        "known gap (#2): classes are ASCII-only, so U+00E9 is not [:alpha:]"
+    );
+}
+
+#[test]
+fn tr_case_conversion_is_ascii_only() {
+    // #2: [:lower:]/[:upper:] should use the locale's toupper mapping.
+    let Some(loc) = plib::testing::utf8_locale() else {
+        return;
+    };
+    let out = tr_locale(&["[:lower:]", "[:upper:]"], "a\u{e9}\n".as_bytes(), &loc);
+    assert_eq!(
+        out,
+        "A\u{e9}\n".as_bytes(),
+        "known gap (#2): ASCII case-maps, U+00E9 does not become U+00C9"
+    );
+}
+
+#[test]
+fn tr_equivalence_class_holds_only_the_named_character() {
+    // #4: [=e=] should expand to every character collating equally with `e`.
+    let Some(loc) = plib::testing::utf8_locale() else {
+        return;
+    };
+    let out = tr_locale(&["-d", "[=e=]"], "e\u{e9}\n".as_bytes(), &loc);
+    assert_eq!(
+        out,
+        "\u{e9}\n".as_bytes(),
+        "known gap (#4): the equivalence class contains only `e` itself"
+    );
+}
+
+#[test]
+fn tr_ranges_use_code_point_order() {
+    // #5: a range should follow LC_COLLATE. It follows code points, so `a-b`
+    // covers exactly a and b, never A or B.
+    let Some(loc) = plib::testing::utf8_locale() else {
+        return;
+    };
+    let out = tr_locale(&["-d", "a-b"], b"aAbB\n", &loc);
+    assert_eq!(
+        out, b"AB\n",
+        "known gap (#5): ranges are code-point ordered"
+    );
+}
+
+#[test]
+fn tr_c_and_upper_c_behave_alike() {
+    // #1: -c complements by value and -C by character, which differ only for
+    // multi-byte characters. They are currently the same code path.
+    let Some(loc) = plib::testing::utf8_locale() else {
+        return;
+    };
+    let lower = tr_locale(&["-d", "-c", "a"], "a\u{e9}b\n".as_bytes(), &loc);
+    let upper = tr_locale(&["-d", "-C", "a"], "a\u{e9}b\n".as_bytes(), &loc);
+    assert_eq!(
+        lower, upper,
+        "known gap (#1): -c and -C are not distinguished"
+    );
+    assert_eq!(lower, b"a");
 }

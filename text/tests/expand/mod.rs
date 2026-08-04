@@ -96,20 +96,7 @@ fn expand_tab_at_col1_list_stop() {
     expand_args_test(&["-t", "4,8"], "\tX\n", "    X\n");
 }
 
-/// A usable UTF-8 locale name, or `None` if neither is installed.
-fn utf8_locale() -> Option<String> {
-    let avail = std::process::Command::new("locale")
-        .arg("-a")
-        .output()
-        .ok()?;
-    let list = String::from_utf8_lossy(&avail.stdout).to_lowercase();
-    for name in ["C.UTF-8", "C.utf8", "en_US.UTF-8", "en_US.utf8"] {
-        if list.contains(&name.to_lowercase()) {
-            return Some(name.to_string());
-        }
-    }
-    None
-}
+use plib::testing::utf8_locale;
 
 fn run_expand_locale(args: &[&str], input: &str, locale: &str) -> String {
     use std::io::Write;

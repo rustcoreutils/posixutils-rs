@@ -129,19 +129,7 @@ fn fold_tab_advances_to_stop() {
     fold_args_test(&["-w", "8"], "\tX\n", "\t\nX\n");
 }
 
-fn utf8_locale() -> Option<String> {
-    let avail = std::process::Command::new("locale")
-        .arg("-a")
-        .output()
-        .ok()?;
-    let list = String::from_utf8_lossy(&avail.stdout).to_lowercase();
-    for name in ["C.UTF-8", "C.utf8", "en_US.UTF-8", "en_US.utf8"] {
-        if list.contains(&name.to_lowercase()) {
-            return Some(name.to_string());
-        }
-    }
-    None
-}
+use plib::testing::utf8_locale;
 
 fn run_fold_locale(args: &[&str], input: &[u8], locale: &str) -> Vec<u8> {
     use std::io::Write;

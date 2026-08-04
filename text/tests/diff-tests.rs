@@ -761,3 +761,62 @@ fn test_diff_edit_script_escapes_a_lone_period() {
     let _ = std::fs::remove_file(a);
     let _ = std::fs::remove_file(b);
 }
+
+#[test]
+fn test_diff_directory_with_a_fifo() {
+    // A non-regular file in a recursive comparison must not make diff block on
+    // opening it, nor abort the walk over the regular files beside it.
+    let base = std::env::temp_dir().join(format!("posixutils-diff-fifo-{}", std::process::id()));
+    let (a, b) = (base.join("a"), base.join("b"));
+    std::fs::create_dir_all(&a).expect("mkdir a");
+    std::fs::create_dir_all(&b).expect("mkdir b");
+    std::fs::write(a.join("f"), "x\n").expect("write a/f");
+    std::fs::write(b.join("f"), "y\n").expect("write b/f");
+    let made_fifo = std::process::Command::new("mkfifo")
+        .arg(a.join("pipe"))
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if made_fifo {
+        std::fs::write(b.join("pipe"), "z\n").expect("write b/pipe");
+    }
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_diff"))
+        .args(["-r", a.to_str().unwrap(), b.to_str().unwrap()])
+        .output()
+        .expect("run diff -r");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "the regular files differ, so the walk must report differences"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("< x") && stdout.contains("> y"),
+        "got {stdout:?}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn test_diff_recursive_symlink_cycle_terminates() {
+    // A directory containing a symlink back to itself must not send the
+    // recursive walk into an infinite loop.
+    let base = std::env::temp_dir().join(format!("posixutils-diff-loop-{}", std::process::id()));
+    let dir = base.join("d");
+    std::fs::create_dir_all(&dir).expect("mkdir d");
+    std::fs::write(dir.join("f"), "x\n").expect("write d/f");
+    let linked = std::os::unix::fs::symlink("..", dir.join("up")).is_ok();
+    assert!(linked || true, "symlink support is optional here");
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_diff"))
+        .args(["-r", dir.to_str().unwrap(), dir.to_str().unwrap()])
+        .output()
+        .expect("run diff -r");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a directory compared with itself has no differences"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}

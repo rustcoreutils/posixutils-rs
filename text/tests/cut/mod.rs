@@ -426,23 +426,7 @@ fn test_cut_continue_after_missing_file() {
 // -n and delimiter edge cases
 // ---------------------------------------------------------------------------
 
-/// First installed UTF-8 locale, if any. `-n` is defined in terms of
-/// characters, which only differ from bytes in a multi-byte locale.
-fn utf8_locale() -> Option<String> {
-    let avail = std::process::Command::new("locale")
-        .arg("-a")
-        .output()
-        .ok()?;
-    // Search case-insensitively but return the canonical spelling: glibc locale
-    // names are case-sensitive, so `LC_ALL=c.utf8` silently falls back to C.
-    let list = String::from_utf8_lossy(&avail.stdout).to_lowercase();
-    for name in ["C.UTF-8", "C.utf8", "en_US.UTF-8", "en_US.utf8"] {
-        if list.contains(&name.to_lowercase()) {
-            return Some(name.to_string());
-        }
-    }
-    None
-}
+use plib::testing::utf8_locale;
 
 #[test]
 fn test_cut_n_does_not_split_a_multibyte_character() {

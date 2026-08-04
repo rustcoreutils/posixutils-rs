@@ -246,3 +246,49 @@ pub fn run_test_with_checker_and_env<F: FnMut(&TestPlan, &Output)>(
         run_test_base_with_env(&plan.cmd, &plan.args, plan.stdin_data.as_bytes(), env_vars);
     checker(&plan, &output);
 }
+
+/// Name of an installed UTF-8 locale, or `None` if the host has none.
+///
+/// Locale-dependent behavior — character boundaries, case mapping, collation,
+/// character classes — only differs from the byte-oriented C locale when a
+/// multi-byte locale is actually available, and a stripped-down container may
+/// have none. Tests that need one should return early rather than fail:
+///
+/// ```no_run
+/// let Some(locale) = plib::testing::utf8_locale() else {
+///     return;
+/// };
+/// ```
+///
+/// The search is case-insensitive but the returned name keeps its canonical
+/// spelling: glibc locale names are case-sensitive, so `LC_ALL=c.utf8` is not
+/// recognized and silently falls back to C.
+pub fn utf8_locale() -> Option<String> {
+    let avail = std::process::Command::new("locale")
+        .arg("-a")
+        .output()
+        .ok()?;
+    let list = String::from_utf8_lossy(&avail.stdout).to_lowercase();
+    for name in ["C.UTF-8", "C.utf8", "en_US.UTF-8", "en_US.utf8"] {
+        if list.contains(&name.to_lowercase()) {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
+/// Name of an installed locale matching one of `candidates`, or `None`.
+///
+/// For tests that need a *specific* locale rather than any UTF-8 one — Turkish
+/// for dotless-i case mapping, say — which most hosts do not have installed.
+pub fn locale_matching(candidates: &[&str]) -> Option<String> {
+    let avail = std::process::Command::new("locale")
+        .arg("-a")
+        .output()
+        .ok()?;
+    let list = String::from_utf8_lossy(&avail.stdout).to_lowercase();
+    candidates
+        .iter()
+        .find(|name| list.contains(&name.to_lowercase()))
+        .map(|name| (*name).to_string())
+}

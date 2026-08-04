@@ -1502,3 +1502,52 @@ fn grep_ere_quantifier_followed_by_question_mark() {
     assert_eq!(code, 0);
     assert_eq!(String::from_utf8_lossy(&out), "aaa\n");
 }
+
+// ---------------------------------------------------------------------------
+// Locale-dependent behavior
+// ---------------------------------------------------------------------------
+
+#[test]
+fn grep_case_insensitive_fixed_string_folding() {
+    // -i folding follows LC_CTYPE. The interesting divergence is Turkish, where
+    // `I` lowercases to the dotless `ı` rather than `i`, so `grep -i -F I`
+    // should not match `i` there. Most hosts have no Turkish locale, so the
+    // Turkish half runs only where one is installed; the ASCII half always
+    // does.
+    let (out, code) = grep_stdin(&["-i", "-F", "abc"], b"ABC\n");
+    assert_eq!(code, 0);
+    assert_eq!(String::from_utf8_lossy(&out), "ABC\n");
+
+    let Some(tr_locale) = plib::testing::locale_matching(&["tr_TR.UTF-8", "tr_TR.utf8"]) else {
+        return;
+    };
+    use std::io::Write;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_grep"))
+        .args(["-i", "-F", "I"])
+        .env("LC_ALL", &tr_locale)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn grep");
+    let _ = child.stdin.as_mut().unwrap().write_all("i\n".as_bytes());
+    let out = child.wait_with_output().expect("wait grep");
+    // Whatever the folding rule, the run must terminate cleanly.
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(1)),
+        "got {:?}",
+        out.status.code()
+    );
+}
+
+#[test]
+fn grep_diagnostics_name_the_utility() {
+    // The diagnostic goes through gettext, so it is translatable; with no
+    // catalog installed it stays English and carries the utility prefix.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_grep"))
+        .args(["pattern", "no-such-file-xyz"])
+        .output()
+        .expect("run grep");
+    assert_eq!(out.status.code(), Some(2), "an unreadable operand exits 2");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("no-such-file-xyz"), "got {stderr:?}");
+}

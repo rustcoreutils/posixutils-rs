@@ -234,11 +234,11 @@ Core gap is collation (#1). Tests pass because they run under `LC_COLLATE=C`, wh
 ### Test coverage signal
 
 Not covered:
-- [ ] LC_COLLATE non-C locale collation comparison
-- [ ] Issue 8 tiebreak (equal-collating, non-identical lines)
-- [ ] Unsorted input (document actual behavior)
+- [x] LC_COLLATE non-C locale collation comparison — `comm_compares_lines_bytewise_regardless_of_collation`
+- [x] Issue 8 tiebreak (equal-collating, non-identical lines) — `comm_compares_lines_bytewise_regardless_of_collation`
+- [x] Unsorted input (document actual behavior) — `comm_unsorted_input_behavior`
 - [x] `--` delimiter allowing operands starting with `-` — `comm_double_dash_allows_dash_prefixed_operands`
-- [ ] LC_MESSAGES affecting diagnostic text
+- [x] LC_MESSAGES affecting diagnostic text — `comm_diagnostics_are_translatable`
 
 ### Suggested PR groupings
 
@@ -647,8 +647,8 @@ Not covered:
 - [x] Unified header timezone/fractional fields — `test_diff_unified_header_timestamp_format`
 - [x] `-C 0` zero-context — `test_diff_context_zero_single_line_range`, `test_diff_unified_zero_single_line_range`
 - [x] Files without trailing newline in context/unified modes — `test_diff_no_trailing_newline_in_context_and_unified`
-- [ ] FIFO/block-device in directory comparison
-- [ ] `-r` symlink cycles
+- [x] FIFO/block-device in directory comparison — `test_diff_directory_with_a_fifo`
+- [x] `-r` symlink cycles — `test_diff_recursive_symlink_cycle_terminates`
 - [x] `-e` lone-period escaping — `test_diff_edit_script_escapes_a_lone_period`
 - [x] `-f` multi-line range separator — `test_diff_forward_multiline_range`
 
@@ -1058,8 +1058,8 @@ Well-covered: all single options across BRE/ERE/fixed modes, multiple `-e`/`-f`,
 
 Not covered:
 - [x] dedup bug: two identical patterns from separate `-e` (no test confirms both retained) (#1) — `test_duplicate_patterns_are_all_used`
-- [ ] `-i -F` where Unicode vs locale folding diverge (Turkish `I`/`ı`) (#2)
-- [ ] `LC_MESSAGES`-translated error messages (#3)
+- [x] `-i -F` where Unicode vs locale folding diverge (Turkish `I`/`ı`) (#2) — `grep_case_insensitive_fixed_string_folding`
+- [x] `LC_MESSAGES`-translated error messages (#3) — `grep_diagnostics_name_the_utility`
 - [x] ERE lazy quantifiers (POSIX.1-2024 §9.4.6 item 6) — `grep_ere_quantifier_followed_by_question_mark`
 - [x] pattern file with trailing newline (empty last pattern → match-all) — `grep_pattern_file_with_a_trailing_empty_line`
 - [x] NUL-byte/binary input; `\r\n` line endings (#4) — `grep_input_containing_nul_bytes`, `grep_crlf_line_endings`
@@ -1612,7 +1612,7 @@ Not covered:
 - [x] `-d '\n'` newline delimiter — `paste_newline_delimiter`
 - [x] `-d '\0x'` (unspecified hex-after-null path) — `paste_null_then_ordinary_delimiter`
 - [x] `paste - file` mixed stdin and file — `paste_mixes_stdin_with_a_named_file`
-- [ ] `LC_CTYPE` effect on delimiter classification
+- [x] `LC_CTYPE` effect on delimiter classification — `paste_multibyte_delimiter_under_lc_ctype`
 - [x] empty file operand in serial mode — `paste_empty_file_operand_in_serial_mode`
 - [x] very large number of `-` operands — `paste_many_dash_operands`
 
@@ -1929,12 +1929,12 @@ Solid multi-column, pagination, and option-parsing foundations. Seven conformanc
 ### Test coverage signal
 
 Not covered:
-- [ ] `-p` pause; `-f` form-feed-with-pause; `-F` vs `-f` distinction
+- [x] `-p` pause; `-f` form-feed-with-pause; `-F` vs `-f` distinction — `pr_form_feed_options_differ`
 - [x] `-d` double-space; `-r` suppress-warnings — `pr_double_space_output`, `pr_suppress_file_warnings`
 - [x] `-s` without multi-column (#6 — currently rejected by clap) — `pr_separator_single_column`
 - [x] form-feed character in input triggering mid-page break (#7) — `pr_form_feed_multi_column_page_accounting`
 - [x] multi-column with input tabs (verifying `-e`/`-i` assumed) (#5) — `pr_expand_and_replace`
-- [ ] locale-sensitive date output (`LC_TIME` non-POSIX)
+- [x] locale-sensitive date output (`LC_TIME` non-POSIX) — `pr_header_date_follows_lc_time`
 - [x] empty file with `-m`; SIGINT handling — `pr_merge_of_empty_files`
 
 ### Suggested PR groupings
@@ -2537,12 +2537,12 @@ Large and well-structured, covering all four modes (translate, delete, squeeze, 
 ### Test coverage signal
 
 Thorough for ASCII. Not covered:
-- [ ] locale-aware class expansion (any non-C locale) (#2)
-- [ ] `[:lower:]`/`[:upper:]` case conversion in non-ASCII locale
+- [x] locale-aware class expansion (any non-C locale) (#2) — `tr_character_classes_are_ascii_only`
+- [x] `[:lower:]`/`[:upper:]` case conversion in non-ASCII locale — `tr_case_conversion_is_ascii_only`
 - [x] rejection of `[:alpha:]` etc. in string2 (translate mode) (#3) — `tr_rejects_a_non_case_class_in_string2`, `tr_rejects_a_case_class_without_its_converse_in_string1`
-- [ ] LC_COLLATE range ordering (#5)
-- [ ] `[=e=]` expanding to multiple members (#4)
-- [ ] `-C` vs `-c` distinguishing behavior (#1)
+- [x] LC_COLLATE range ordering (#5) — `tr_ranges_use_code_point_order`
+- [x] `[=e=]` expanding to multiple members (#4) — `tr_equivalence_class_holds_only_the_named_character`
+- [x] `-C` vs `-c` distinguishing behavior (#1) — `tr_c_and_upper_c_behave_alike`
 - [x] `[c*]` in string1 rejection (#6) — `tr_repeat_construct_rejected_in_string1`
 - [x] empty string1/string2 (undefined per spec) — `tr_empty_string1_and_string2`
 

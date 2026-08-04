@@ -10,8 +10,11 @@
 use super::expr::eval_numeric;
 use super::preprocess_with_loader;
 
+/// Body-text width used by the tests; only tbl text blocks are sensitive to it.
+const TEST_LINE_LENGTH: usize = 72;
+
 fn run(s: &str) -> String {
-    preprocess_with_loader(s, |_| None)
+    preprocess_with_loader(s, TEST_LINE_LENGTH, |_| None)
 }
 
 #[test]
@@ -154,7 +157,7 @@ fn rename_and_remove() {
 
 #[test]
 fn so_inclusion_via_loader() {
-    let out = preprocess_with_loader(".so inc.man\nafter\n", |target| {
+    let out = preprocess_with_loader(".so inc.man\nafter\n", TEST_LINE_LENGTH, |target| {
         if target == "inc.man" {
             Some(".SH INCLUDED\nbody\n".to_string())
         } else {
@@ -266,4 +269,193 @@ fn expr_division_by_zero_is_zero() {
 fn expr_malformed_is_none() {
     assert_eq!(eval_numeric("abc"), None);
     assert_eq!(eval_numeric(""), None);
+}
+
+// ---------------------------------------------------------------------------
+// Recursion and overflow guards (#M1, #M7).
+//
+// These inputs previously overflowed the native stack, which aborts the process
+// (SIGABRT) rather than unwinding — so a `should_panic` test cannot express
+// them. Each test simply has to *return*.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn self_referential_string_register_terminates() {
+    // `.ds A \*[A]` then `\*A`: expansion of A names A. Before the guard this
+    // recursed until the stack was exhausted.
+    let out = run(".ds A \\*[A]\n\\*A\n");
+    assert!(!out.contains("\\*"), "register left unexpanded: {out:?}");
+}
+
+#[test]
+fn mutually_referential_string_registers_terminate() {
+    // A names B and B names A: a depth cap alone would still expand this pair
+    // 64 times; the in-progress name set is what actually cuts the cycle.
+    let out = run(".ds A x\\*B\n.ds B y\\*A\n\\*A\n");
+    assert_eq!(out, "xy\n");
+}
+
+#[test]
+fn deep_string_register_chain_terminates() {
+    // An acyclic but deep chain: r0 -> r1 -> ... -> rN. No name repeats, so the
+    // in-progress set never fires and only the depth cap bounds this. N is large
+    // enough that the pre-fix code exhausted the stack.
+    const N: usize = 20_000;
+    let mut src = String::new();
+    for i in 0..N {
+        src.push_str(&format!(".ds r{i} \\*[r{}]\n", i + 1));
+    }
+    src.push_str(&format!(".ds r{N} end\n\\*[r0]\n"));
+    let out = run(&src);
+    assert!(!out.is_empty());
+}
+
+#[test]
+fn self_referential_width_escape_terminates() {
+    let out = run(".ds W \\w'\\*[W]'\n\\*W\n");
+    assert!(!out.is_empty());
+}
+
+#[test]
+fn expr_deep_nesting_is_rejected_not_crashed() {
+    // 5000 open parens: `term()` and `expr()` are mutually recursive, one native
+    // frame per level.
+    let deep = format!("{}1{}", "(".repeat(5000), ")".repeat(5000));
+    assert_eq!(eval_numeric(&deep), None);
+    // Deeply nested unary operators recurse through the same path.
+    assert_eq!(eval_numeric(&format!("{}1", "-".repeat(5000))), None);
+    assert_eq!(eval_numeric(&format!("{}1", "!".repeat(5000))), None);
+    // Nesting within the supported depth still evaluates.
+    assert_eq!(eval_numeric("((((((1+2))))))"), Some(3));
+}
+
+#[test]
+fn expr_arithmetic_overflow_saturates() {
+    // Under `overflow-checks` (a debug build) these panicked.
+    assert_eq!(eval_numeric("9223372036854775807+1"), Some(i64::MAX));
+    assert_eq!(eval_numeric("9223372036854775807*2"), Some(i64::MAX));
+    assert_eq!(eval_numeric("-9223372036854775807-2"), Some(i64::MIN));
+    assert_eq!(eval_numeric("5%0"), Some(0));
+}
+
+// ---------------------------------------------------------------------------
+// `.so` include-cycle guard (#M5).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn so_self_include_terminates() {
+    // A file that sources itself. Inclusion is flattened onto the line queue,
+    // so this is not caught by any recursion limit; before the guard it spun
+    // until the multi-million-line budget tripped, taking minutes.
+    let out = preprocess_with_loader("hello\n.so self\n", TEST_LINE_LENGTH, |t| {
+        (t == "self").then(|| "hello\n.so self\n".to_string())
+    });
+    assert_eq!(out.lines().filter(|l| *l == "hello").count(), 2);
+}
+
+#[test]
+fn so_mutual_include_cycle_terminates() {
+    let out = preprocess_with_loader(".so a\n", TEST_LINE_LENGTH, |t| match t {
+        "a" => Some("A\n.so b\n".to_string()),
+        "b" => Some("B\n.so a\n".to_string()),
+        _ => None,
+    });
+    assert!(out.contains('A') && out.contains('B'));
+    assert_eq!(out.lines().count(), 2, "cycle re-expanded: {out:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Global output budgets (#M6, #M8).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn string_register_doubling_chain_is_bounded() {
+    // The classic billion-laughs shape, in roff: each register doubles the next.
+    // It is acyclic and only as deep as the chain, so neither the cycle set nor
+    // the depth cap sees it — 30 lines expanded to 400 MB of output and 2 GB
+    // resident. All of it lands on a single line, so a line budget cannot see it
+    // either.
+    let mut src = String::from(".ds L0 xxxxxxxxxx\n");
+    for i in 1..=30 {
+        src.push_str(&format!(".ds L{i} \\*[L{}]\\*[L{}]\n", i - 1, i - 1));
+    }
+    src.push_str("\\*[L30]\n");
+    let out = run(&src);
+    assert!(
+        out.len() <= 2 << 20,
+        "expansion not bounded: {} bytes",
+        out.len()
+    );
+}
+
+#[test]
+fn while_loop_budget_is_global_not_per_iteration() {
+    // A `.while` whose body invokes an endlessly self-recursive macro. Each
+    // iteration used to get its own two-million-line allowance, so the loop's
+    // iteration cap multiplied it: 100,000 x 2,000,000 lines. The counter is now
+    // on the interpreter, not the loop, so the whole page shares one allowance.
+    let src = ".de R\nx\n.R\n..\n.nr i 0\n\
+               .while \\n[i]<100000 \\{\\\n.R\n.nr i +1\n\\}\n";
+    let out = run(src);
+    assert!(
+        out.len() <= 80 << 20,
+        "output not bounded: {} bytes",
+        out.len()
+    );
+}
+
+#[test]
+fn request_arguments_do_not_include_a_trailing_comment() {
+    // `.de NAME END` takes a custom terminator. A trailing `\"` comment reaching
+    // the arguments made `\"` the terminator, which no line matched — so the
+    // definition swallowed the rest of the page. pod2man writes `.de CQ
+    // \" put $1 in typewriter font`, so this hit every perl-derived page.
+    let out = run(".de CQ \\\" put $1 in typewriter font\n.ft CW\n..\n.SH NAME\nkept\n");
+    assert_eq!(out, ".SH NAME\nkept\n");
+    // Other requests must not see the comment either.
+    assert_eq!(run(".ds A foo \\\" note\n[\\*A]\n"), "[foo]\n");
+    assert_eq!(run(".nr N 40 \\\" note\n\\n(N\n"), "40\n");
+}
+
+// ---------------------------------------------------------------------------
+// Conditional and macro-expansion correctness (#M10, #M11).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parenthesised_condition_is_not_split_at_the_first_space() {
+    // The expression ends at whitespace *outside* parentheses. Splitting at the
+    // first whitespace anywhere took `(5` — truthy — and printed `> 99)` as the
+    // body. `.if (a:(b)) \{\` is the standard groff idiom; every pod2man page
+    // opens with one.
+    assert_eq!(run(".if (5 > 99) body\nafter\n"), "after\n");
+    assert_eq!(run(".if (5 < 99) body\n"), "body\n");
+    assert_eq!(run(".if (0:(1==1)) yes\n"), "yes\n");
+    assert_eq!(run(".if (1&(0)) no\nz\n"), "z\n");
+}
+
+#[test]
+fn doubled_backslash_in_a_macro_body_does_not_leak() {
+    // A macro body is written with doubled escapes so they act at call time.
+    // Copy mode reduces `\\` to `\` when the body is stored; without it the
+    // leading backslash of `\\$1` was emitted verbatim before every argument.
+    assert_eq!(run(".de G\nHello \\\\$1\n..\n.G world\n"), "Hello world\n");
+    // The single-backslash spelling keeps working.
+    assert_eq!(run(".de H\nHi \\$1\n..\n.H there\n"), "Hi there\n");
+    // A deferred register interpolation resolves at call time, not at
+    // definition time.
+    assert_eq!(run(".de S\nval \\\\n(X\n..\n.nr X 7\n.S\n"), "val 7\n");
+}
+
+#[test]
+fn argument_count_register_is_available_in_a_macro_body() {
+    assert_eq!(run(".de C\ngot \\\\n(.$\n..\n.C a b c\n"), "got 3\n");
+    assert_eq!(run(".de D\ngot \\\\n[.$]\n..\n.D x\n"), "got 1\n");
+    assert_eq!(run(".de E\ngot \\\\n(.$\n..\n.E\n"), "got 0\n");
+}
+
+#[test]
+fn width_escape_counts_terminal_cells() {
+    // `\w'…'` is a width in cells: an East Asian wide character is two.
+    assert_eq!(run(".if \\w'日本'=4 yes\n"), "yes\n");
+    assert_eq!(run(".if \\w'ab'=2 yes\n"), "yes\n");
 }

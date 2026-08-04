@@ -477,6 +477,21 @@ fn main() -> Result<(), Box<dyn Error>> {
     textdomain("posixutils-rs")?;
     bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
 
+    // Install handlers via sigaction (audit #D11) *before* forking, so the
+    // daemon has them from its first instruction. Dispositions are inherited
+    // across fork, and installing them in the child instead left a window —
+    // fork, setsid, chdir, three closes and the PID-file open and lock — during
+    // which SIGHUP's default disposition still applied. That default is
+    // *terminate*, so `kill -HUP` on a daemon that had only just started killed
+    // it rather than reloading it.
+    //
+    // Handlers are async-signal-safe (atomic stores or waitpid). SIGCHLD uses
+    // SA_NOCLDSTOP to avoid stop/cont notifications.
+    install_signal(libc::SIGHUP, handle_sighup, 0);
+    install_signal(libc::SIGCHLD, handle_sigchld, libc::SA_NOCLDSTOP);
+    install_signal(libc::SIGTERM, handle_shutdown, 0);
+    install_signal(libc::SIGINT, handle_shutdown, 0);
+
     let pid = setup();
 
     match pid.cmp(&0) {
@@ -487,14 +502,6 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Acquire PID file lock (keep handle alive for the daemon's lifetime)
     let _pid_lock = acquire_lock()?;
-
-    // Install handlers via sigaction (audit #D11). Handlers are async-signal-safe
-    // (atomic stores or waitpid). SIGCHLD uses SA_NOCLDSTOP to avoid stop/cont
-    // notifications.
-    install_signal(libc::SIGHUP, handle_sighup, 0);
-    install_signal(libc::SIGCHLD, handle_sigchld, libc::SA_NOCLDSTOP);
-    install_signal(libc::SIGTERM, handle_shutdown, 0);
-    install_signal(libc::SIGINT, handle_shutdown, 0);
 
     // Run @reboot jobs at startup, and flush any already-due at/batch jobs.
     run_reboot_jobs()?;

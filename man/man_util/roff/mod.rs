@@ -22,7 +22,7 @@
 
 mod expr;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use expr::eval_numeric;
 
@@ -32,6 +32,23 @@ const MAX_OUTPUT_LINES: usize = 2_000_000;
 
 /// Maximum pending-line queue depth, a second runaway guard.
 const MAX_QUEUE: usize = 4_000_000;
+
+/// Maximum nesting of string-register / `\w'…'` expansion. See
+/// [`Roff::interpolate_guarded`].
+const MAX_INTERPOLATION_DEPTH: u32 = 64;
+
+/// Maximum number of distinct `.so` targets a single page may include. Each one
+/// costs a `fork`+`exec` of `cat`/`zcat`, so this bounds that too.
+const MAX_SO_INCLUDES: usize = 256;
+
+/// Maximum text a single line's escape expansion may produce.
+const MAX_INTERPOLATION_BYTES: usize = 1 << 20;
+
+/// Maximum total output. See [`Roff::over_budget`].
+const MAX_OUTPUT_BYTES: usize = 64 << 20;
+
+/// Maximum `.while` iterations, on top of the global budget.
+const MAX_WHILE_ITERATIONS: usize = 100_000;
 
 /// A user-defined macro body (the lines between `.de NAME` and `..`).
 type MacroBody = Vec<String>;
@@ -65,15 +82,30 @@ pub struct Roff {
     divert: Option<Diversion>,
     /// Resolves `.so` targets to file contents (None disables `.so`).
     loader: Option<SoLoader>,
+    /// `.so` targets already included, for cycle detection.
+    so_included: HashSet<String>,
+    /// Lines processed so far, across every nesting level. See [`Roff::over_budget`].
+    steps: usize,
+    /// Bytes emitted so far, across every nesting level.
+    out_bytes: usize,
+    /// Columns available to body text, for tbl text-block layout.
+    line_length: usize,
 }
 
 /// Preprocess `input`, resolving `.so` targets through `loader`.
-pub fn preprocess_with_loader<F>(input: &str, loader: F) -> String
+///
+/// `line_length` is the number of columns available to body text (the terminal
+/// width less the base indent). Only the tbl preprocessor needs it: a `T{`…`T}`
+/// text block has to be filled to some width, and unlike an ordinary cell that
+/// width cannot be derived from the content — the content's extent is a
+/// *consequence* of it. See [`crate::man_util::preproc::tbl::format`].
+pub fn preprocess_with_loader<F>(input: &str, line_length: usize, loader: F) -> String
 where
     F: Fn(&str) -> Option<String> + 'static,
 {
     let roff = Roff {
         loader: Some(Box::new(loader)),
+        line_length,
         ..Roff::default()
     };
     roff.run(input)
@@ -83,11 +115,9 @@ impl Roff {
     /// Run the interpreter over `input` and return the normalized text.
     pub fn run(mut self, input: &str) -> String {
         let mut queue: Vec<String> = input.lines().rev().map(|l| l.to_string()).collect();
-        let mut steps = 0usize;
 
         while let Some(line) = queue.pop() {
-            steps += 1;
-            if steps > MAX_OUTPUT_LINES || queue.len() > MAX_QUEUE {
+            if self.over_budget() || queue.len() > MAX_QUEUE {
                 break;
             }
             self.process_line(line, &mut queue);
@@ -105,7 +135,20 @@ impl Roff {
         }
     }
 
+    /// Whether the interpreter has spent its budget and should stop.
+    ///
+    /// Both counters are on `self` rather than local to a loop, so they are
+    /// genuinely global: `.while` bodies, macro expansions and `.so` inclusions
+    /// all draw on the same allowance. The byte counter is the one that matters
+    /// for a `.ds` doubling chain (`.ds A \*A\*A`, repeated) — that produces
+    /// exponential output on a *single* line, which a line count cannot see. It
+    /// reached 400 MB of output and 2 GB resident before this existed.
+    fn over_budget(&self) -> bool {
+        self.steps > MAX_OUTPUT_LINES || self.out_bytes > MAX_OUTPUT_BYTES
+    }
+
     fn process_line(&mut self, line: String, queue: &mut Vec<String>) {
+        self.steps += 1;
         // A control line begins with the control char `.` or the no-break `'`.
         let control = line.starts_with('.') || line.starts_with('\'');
         if !control {
@@ -114,6 +157,13 @@ impl Roff {
             return;
         }
 
+        // A trailing `\"` comment ends the line for a request just as it does for
+        // text, so it must not reach the request's arguments. `.de CQ \" put $1
+        // in typewriter font` otherwise took `\"` as the definition's custom end
+        // macro (`.de NAME END`), which no line ever matched — so the definition
+        // swallowed the rest of the page. That is a pod2man idiom, so it hit
+        // every perl-derived page.
+        let line = self.strip_comment(&line);
         let body = line[1..].trim_start();
         let (name, args) = split_name(body);
 
@@ -184,6 +234,10 @@ impl Roff {
 
     /// Route an emitted line to the active diversion, or to the output.
     fn emit_line(&mut self, line: String) {
+        self.out_bytes = self.out_bytes.saturating_add(line.len() + 1);
+        if self.over_budget() {
+            return;
+        }
         match &mut self.divert {
             Some(d) => d.buf.push(line),
             None => self.out.push(line),
@@ -217,7 +271,7 @@ impl Roff {
             if is_end {
                 break;
             }
-            body.push(line);
+            body.push(reduce_copy_mode(&line));
         }
 
         if append {
@@ -381,14 +435,15 @@ impl Roff {
         let mut iters = 0;
         while self.eval_condition(args).0 {
             iters += 1;
-            if iters > 100_000 || body.is_empty() {
+            // `self.steps` is global, so the inner budget is not reset per
+            // iteration: previously each of 100,000 iterations was allowed its
+            // own two-million-line allowance.
+            if iters > MAX_WHILE_ITERATIONS || body.is_empty() || self.over_budget() {
                 break;
             }
             let mut subq: Vec<String> = body.iter().rev().cloned().collect();
-            let mut steps = 0;
             while let Some(l) = subq.pop() {
-                steps += 1;
-                if steps > MAX_OUTPUT_LINES {
+                if self.over_budget() {
                     break;
                 }
                 self.process_line(l, &mut subq);
@@ -483,15 +538,11 @@ impl Roff {
             }
         }
 
-        // Numeric expression terminated by whitespace.
+        // Numeric expression terminated by whitespace outside parentheses.
         let interp = self.interpolate(s);
-        let expr = interp.split_whitespace().next().unwrap_or("");
-        let body_start = interp
-            .find(char::is_whitespace)
-            .map(|i| &interp[i..])
-            .unwrap_or("");
+        let (expr, body) = split_numeric_expr(&interp);
         let val = eval_numeric(expr).unwrap_or(0);
-        (val > 0, body_start.trim_start().to_string())
+        (val > 0, body.trim_start().to_string())
     }
 
     // ── ig / so ───────────────────────────────────────────────────────────
@@ -520,7 +571,7 @@ impl Roff {
     /// text so the renderer preserves the column alignment.
     fn do_tbl(&mut self, queue: &mut Vec<String>) {
         let body = Self::capture_until(queue, "TE");
-        let table = crate::man_util::preproc::tbl::format(&body);
+        let table = crate::man_util::preproc::tbl::format(&body, self.line_length);
         let mut emit = vec![".nf".to_string()];
         emit.extend(table);
         emit.push(".fi".to_string());
@@ -554,9 +605,18 @@ impl Roff {
 
     fn do_so(&mut self, args: &str, queue: &mut Vec<String>) {
         let target = self.interpolate(args);
-        let target = target.trim();
+        let target = target.trim().to_string();
+        // A file that sources itself, or a pair that source each other, would
+        // otherwise be re-queued forever: inclusion is flattened onto the line
+        // queue, so it hits neither a recursion limit nor — for a long while —
+        // the line budget. Each distinct target is included at most once, and
+        // the total is capped; a page legitimately sourcing the same file twice
+        // is not a thing that occurs.
+        if self.so_included.len() >= MAX_SO_INCLUDES || !self.so_included.insert(target.clone()) {
+            return;
+        }
         if let Some(loader) = &self.loader {
-            if let Some(content) = loader(target) {
+            if let Some(content) = loader(&target) {
                 let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
                 Self::push_front(queue, lines);
             }
@@ -592,11 +652,54 @@ impl Roff {
     /// `\*[name]` string registers, and `\w'…'` width escapes. Other escapes are
     /// left for the downstream escape layer.
     fn interpolate(&self, input: &str) -> String {
+        let mut state = Interp {
+            depth: 0,
+            active: HashSet::new(),
+            remaining: MAX_INTERPOLATION_BYTES,
+        };
+        self.interpolate_guarded(input, &mut state)
+    }
+
+    /// The body of [`Roff::interpolate`], carrying the recursion guards.
+    ///
+    /// A string register may expand to text that names another register, so
+    /// expansion is inherently recursive — but a page is untrusted input, and
+    /// `.ds A \*[A]` (or a mutual pair `.ds A \*B` / `.ds B \*A`) recurses until
+    /// the native stack is exhausted, which aborts the process instead of
+    /// unwinding. `active` holds the names currently being expanded, which is
+    /// what actually breaks a cycle; `depth` additionally bounds the acyclic but
+    /// deep case (a chain of distinct registers, or nested `\w'…'`).
+    ///
+    /// `remaining` bounds the total text produced. Neither guard above covers the
+    /// classic doubling chain — `.ds A \*B\*B` where `B` doubles `C`, and so on —
+    /// which is acyclic, only as deep as the chain is long, and yet expands
+    /// exponentially. It produced 400 MB of output from a few dozen input lines.
+    fn interpolate_guarded(&self, input: &str, st: &mut Interp) -> String {
+        if st.depth >= MAX_INTERPOLATION_DEPTH {
+            return input.to_string();
+        }
         let mut out = String::with_capacity(input.len());
         let mut chars = input.char_indices().peekable();
 
+        macro_rules! emit {
+            ($s:expr) => {{
+                let s: &str = &$s;
+                if st.remaining < s.len() {
+                    st.remaining = 0;
+                    return out;
+                }
+                st.remaining -= s.len();
+                out.push_str(s);
+            }};
+        }
+
         while let Some((_, c)) = chars.next() {
             if c != '\\' {
+                if st.remaining < c.len_utf8() {
+                    st.remaining = 0;
+                    return out;
+                }
+                st.remaining -= c.len_utf8();
                 out.push(c);
                 continue;
             }
@@ -605,30 +708,76 @@ impl Roff {
                     chars.next();
                     let name = read_escape_name(&mut chars);
                     let val = self.nr.get(&name).copied().unwrap_or(0);
-                    out.push_str(&val.to_string());
+                    emit!(val.to_string());
                 }
                 Some('*') => {
                     chars.next();
                     let name = read_escape_name(&mut chars);
                     if let Some(v) = self.ds.get(&name) {
-                        // Resolve nested interpolations once.
-                        out.push_str(&self.interpolate(v));
+                        // Resolve nested interpolations, unless this register is
+                        // already being expanded further up the stack — in which
+                        // case it expands to nothing, as in groff.
+                        if st.active.insert(name.clone()) {
+                            let v = v.clone();
+                            st.depth += 1;
+                            let expanded = self.interpolate_guarded(&v, st);
+                            st.depth -= 1;
+                            st.active.remove(&name);
+                            // Already charged against `remaining` by the recursive
+                            // call, so append it directly.
+                            out.push_str(&expanded);
+                            if st.remaining == 0 {
+                                return out;
+                            }
+                        }
                     }
                 }
                 Some('w') => {
                     chars.next();
                     if let Some(width) = read_quoted(&mut chars) {
-                        let resolved = self.interpolate(&width);
-                        out.push_str(&display_cells(&resolved).to_string());
+                        st.depth += 1;
+                        let resolved = self.interpolate_guarded(&width, st);
+                        st.depth -= 1;
+                        emit!(display_cells(&resolved).to_string());
                     } else {
-                        out.push_str("\\w");
+                        emit!("\\w");
                     }
                 }
-                _ => out.push('\\'),
+                _ => emit!("\\"),
             }
         }
         out
     }
+}
+
+/// Mutable state threaded through [`Roff::interpolate_guarded`].
+struct Interp {
+    /// Current expansion nesting level.
+    depth: u32,
+    /// String-register names currently being expanded, for cycle detection.
+    active: HashSet<String>,
+    /// Bytes of expansion still allowed.
+    remaining: usize,
+}
+
+/// Split a conditional's numeric expression from the body that follows it.
+///
+/// The expression ends at the first whitespace *outside* parentheses. Splitting
+/// on the first whitespace anywhere broke the standard groff idiom: in
+/// `.if (\n(rF:(\n(.g==0)) \{\` the expression is the whole parenthesised term,
+/// but the naive split took `(0` — which evaluates truthy — and printed the
+/// remainder as body text.
+fn split_numeric_expr(s: &str) -> (&str, &str) {
+    let mut depth = 0usize;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            c if c.is_whitespace() && depth == 0 => return (&s[..i], &s[i..]),
+            _ => {}
+        }
+    }
+    (s, "")
 }
 
 /// Recognized built-in request names (used by the `d` condition).
@@ -678,6 +827,26 @@ fn tokenize(s: &str) -> Vec<String> {
 }
 
 /// Substitute `\\$1`…`\\$9`, `\\$0`, `\\$*`, `\\$@`, `\\$#` in a macro body line.
+/// Apply roff *copy mode* to a line being stored as a macro body: `\\` reduces
+/// to `\`, so an escape written `\\$1` or `\\n(x` in the source is deferred to
+/// expansion time rather than acting now.
+///
+/// Without this, `substitute_args` saw the leading backslash of `\\$1`, found no
+/// `$` after it, emitted it verbatim, and then substituted the argument — so
+/// every expanded argument was preceded by a stray `\`. Doubling is the normal
+/// way to write a macro body, so this affected essentially every `.de`.
+fn reduce_copy_mode(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' && chars.peek() == Some(&'\\') {
+            chars.next();
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn substitute_args(line: &str, name: &str, argv: &[String]) -> String {
     let mut out = String::with_capacity(line.len());
     let mut chars = line.chars().peekable();
@@ -711,11 +880,40 @@ fn substitute_args(line: &str, name: &str, argv: &[String]) -> String {
                 }
                 None => out.push_str("\\$"),
             }
+        } else if strip_argc_register(&mut chars) {
+            // `\n(.$` / `\n[.$]`: the argument count. It is a register, but one
+            // whose value exists only during this expansion, so it is resolved
+            // here rather than through the register table.
+            out.push_str(&argv.len().to_string());
         } else {
             out.push('\\');
         }
     }
     out
+}
+
+/// If the escape starting at `chars` is the argument-count register `\n(.$` or
+/// `\n[.$]`, consume it and return true.
+fn strip_argc_register(chars: &mut std::iter::Peekable<std::str::Chars>) -> bool {
+    let mut probe = chars.clone();
+    if probe.next() != Some('n') {
+        return false;
+    }
+    let closing = match probe.next() {
+        Some('(') => None,
+        Some('[') => Some(']'),
+        _ => return false,
+    };
+    if probe.next() != Some('.') || probe.next() != Some('$') {
+        return false;
+    }
+    if let Some(c) = closing {
+        if probe.next() != Some(c) {
+            return false;
+        }
+    }
+    *chars = probe;
+    true
 }
 
 /// Read an escape operand name after `\n`/`\*`: `(xx`, `[name]`, or a single char.
@@ -777,9 +975,14 @@ fn brace_delta(s: &str) -> i32 {
     opens - closes
 }
 
-/// Approximate terminal-cell width of a string for `\w'…'` (ignores escapes).
+/// Terminal-cell width of a string for `\w'…'` (ignores escapes). East Asian
+/// wide characters count as two cells and combining marks as none.
 fn display_cells(s: &str) -> usize {
-    s.chars().filter(|c| !c.is_control()).count()
+    use unicode_width::UnicodeWidthChar;
+    s.chars()
+        .filter(|c| !c.is_control())
+        .map(|c| c.width().unwrap_or(0))
+        .sum()
 }
 
 #[cfg(test)]

@@ -16,7 +16,7 @@ use man_util::parser::{MdocDocument, MdocParser};
 use std::ffi::OsStr;
 use std::io::{self, IsTerminal, Write};
 use std::num::ParseIntError;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::str::FromStr;
 use std::string::FromUtf8Error;
@@ -142,47 +142,94 @@ struct Args {
 }
 
 /// Common errors that might occur.
-#[derive(Error, Debug)]
+///
+/// `Display` is written by hand rather than derived: POSIX lists `LC_MESSAGES`
+/// as affecting `man`, and a `thiserror` `#[error("…")]` string is a
+/// compile-time literal that cannot be routed through `gettext`.
+#[derive(Debug)]
 enum ManError {
     /// Search path to man pages isn't exists
-    #[error("man paths to man pages doesn't exist")]
     ManPaths,
 
     /// Commands for searching documentation isn't exists
-    #[error("no names specified")]
     NoNames,
 
     /// Man can't find documentation for choosen command
-    #[error("system documentation for \"{0}\" not found")]
     PageNotFound(String),
 
     /// Configuration file was not found
-    #[error("configuration file was not found: {0}")]
     ConfigFileNotFound(String),
 
     /// Can't get terminal size
-    #[error("failed to get terminal size")]
     GetTerminalSize,
 
     /// Man can't find choosen command
-    #[error("{0} command not found")]
     CommandNotFound(String),
 
     /// Can't execute command; read/write file
-    #[error("failed to execute command: {0}")]
-    Io(#[from] io::Error),
+    Io(io::Error),
 
     /// Parsing error
-    #[error("parsing error: {0}")]
-    ParseError(#[from] ParseError),
+    ParseError(ParseError),
 
     /// Not found error
-    #[error("file: {0} was not found")]
     NotFound(PathBuf),
 
     /// The page produced no renderable content (e.g. an unsupported format).
-    #[error("no renderable content in page")]
     EmptyPage,
+}
+
+impl std::fmt::Display for ManError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ManError::ManPaths => write!(f, "{}", gettext("man paths to man pages doesn't exist")),
+            ManError::NoNames => write!(f, "{}", gettext("no names specified")),
+            ManError::PageNotFound(name) => write!(
+                f,
+                "{}",
+                gettext("system documentation for \"{}\" not found").replace("{}", name)
+            ),
+            ManError::ConfigFileNotFound(path) => write!(
+                f,
+                "{}",
+                gettext("configuration file was not found: {}").replace("{}", path)
+            ),
+            ManError::GetTerminalSize => write!(f, "{}", gettext("failed to get terminal size")),
+            ManError::CommandNotFound(cmd) => {
+                write!(f, "{}", gettext("{} command not found").replace("{}", cmd))
+            }
+            ManError::Io(err) => write!(
+                f,
+                "{}",
+                gettext("failed to execute command: {}").replace("{}", &err.to_string())
+            ),
+            ManError::ParseError(err) => write!(
+                f,
+                "{}",
+                gettext("parsing error: {}").replace("{}", &err.to_string())
+            ),
+            ManError::NotFound(path) => write!(
+                f,
+                "{}",
+                gettext("file: {} was not found").replace("{}", &path.display().to_string())
+            ),
+            ManError::EmptyPage => write!(f, "{}", gettext("no renderable content in page")),
+        }
+    }
+}
+
+impl std::error::Error for ManError {}
+
+impl From<io::Error> for ManError {
+    fn from(err: io::Error) -> Self {
+        ManError::Io(err)
+    }
+}
+
+impl From<ParseError> for ManError {
+    fn from(err: ParseError) -> Self {
+        ManError::ParseError(err)
+    }
 }
 
 /// Parsing error types
@@ -460,10 +507,28 @@ fn get_man_page_from_path(path: &PathBuf) -> Result<Vec<u8>, ManError> {
     Ok(output.stdout)
 }
 
+/// Whether a roff `.so` target is safe to resolve.
+///
+/// A man page is untrusted input — it may arrive from a package, a shared
+/// `MANPATH`, or `man -l` on a downloaded file — so `.so` must not be usable to
+/// read arbitrary files and render them to the terminal. `.so /etc/passwd` did
+/// exactly that. mandoc's rule, adopted here: the target must be relative and
+/// must not walk upwards.
+fn is_safe_so_target(target: &str) -> bool {
+    let path = Path::new(target);
+    !path.is_absolute()
+        && !path
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::RootDir))
+}
+
 /// Resolve a roff `.so` include target to its (decompressed) text for the roff
 /// front-end. Tries the target as given, then under each system man root, with
 /// and without a `.gz` suffix. Returns `None` if nothing readable is found.
 fn load_so(target: &str) -> Option<String> {
+    if !is_safe_so_target(target) {
+        return None;
+    }
     let mut candidates: Vec<PathBuf> = vec![PathBuf::from(target)];
     for root in MAN_PATHS {
         candidates.push(PathBuf::from(root).join(target));
@@ -511,7 +576,11 @@ fn format_man_page(
     // conditionals, user macros, `.so` includes) and normalize the stream before
     // language detection and parsing. A page without roff programmability is
     // returned essentially unchanged.
-    let content = man_util::roff::preprocess_with_loader(&content, load_so);
+    // The available width (terminal less the base indent) reaches the roff pass
+    // only for tbl, which must choose a fill width for `T{`…`T}` text blocks
+    // before it can lay them out.
+    let line_length = formatting.width.saturating_sub(formatting.indent);
+    let content = man_util::roff::preprocess_with_loader(&content, line_length, load_so);
 
     // Legacy man(7) pages (`.TH`/`.SH`/…) are handled by a dedicated renderer;
     // the mdoc engine only understands mdoc(7) and would otherwise emit an empty
@@ -1040,4 +1109,67 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     std::process::exit(exit_code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_safe_so_target, ManError};
+
+    /// `.so` must not be usable to read arbitrary files. A man page is
+    /// untrusted input, and `.so /etc/passwd` rendered the password file to the
+    /// terminal with exit status 0.
+    #[test]
+    fn so_target_must_be_relative_and_not_escape() {
+        assert!(!is_safe_so_target("/etc/passwd"));
+        assert!(!is_safe_so_target("/proc/self/environ"));
+        assert!(!is_safe_so_target("../../../etc/shadow"));
+        assert!(!is_safe_so_target("man1/../../../etc/passwd"));
+        assert!(!is_safe_so_target(".."));
+
+        // Ordinary alias targets, which is what `.so` is actually for.
+        assert!(is_safe_so_target("man1/ls.1"));
+        assert!(is_safe_so_target("man3/printf.3"));
+        assert!(is_safe_so_target("./man1/ls.1"));
+    }
+
+    /// Every `ManError` message routes through `gettext`, so `LC_MESSAGES` can
+    /// translate it once catalogs are loaded. `thiserror`'s `#[error("…")]` is a
+    /// compile-time literal and cannot; the derive was therefore replaced with a
+    /// hand-written `Display`, and this pins the resulting text so the rewrite
+    /// did not change any diagnostic.
+    #[test]
+    fn error_messages_are_unchanged_and_translatable() {
+        use std::path::PathBuf;
+
+        let cases: Vec<(ManError, &str)> = vec![
+            (ManError::ManPaths, "man paths to man pages doesn't exist"),
+            (ManError::NoNames, "no names specified"),
+            (
+                ManError::PageNotFound("ls".into()),
+                "system documentation for \"ls\" not found",
+            ),
+            (
+                ManError::ConfigFileNotFound("/etc/man.conf".into()),
+                "configuration file was not found: /etc/man.conf",
+            ),
+            (ManError::GetTerminalSize, "failed to get terminal size"),
+            (
+                ManError::CommandNotFound("zcat".into()),
+                "zcat command not found",
+            ),
+            (
+                ManError::NotFound(PathBuf::from("/tmp/x.1")),
+                "file: /tmp/x.1 was not found",
+            ),
+            (ManError::EmptyPage, "no renderable content in page"),
+        ];
+
+        for (err, expected) in cases {
+            assert_eq!(err.to_string(), expected);
+        }
+
+        // The two wrapping variants keep their source's text.
+        let io = ManError::Io(std::io::Error::other("boom"));
+        assert_eq!(io.to_string(), "failed to execute command: boom");
+    }
 }

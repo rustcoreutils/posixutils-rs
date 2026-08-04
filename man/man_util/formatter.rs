@@ -89,6 +89,11 @@ fn substitutions() -> &'static HashMap<&'static str, &'static str> {
         m.insert(r"\&", ""); // zero-width space
         m.insert(r"\)", ""); // zero-width space (transparent to end-of-sentence detection)
         m.insert(r"\%", ""); // zero-width space allowing hyphenation
+                             // Italic corrections: typesetter kerning with no width on a terminal.
+                             // help2man emits these on every GNU page, so they were visible as stray
+                             // `\,` and `\/` in the rendered text of most of /usr/share/man.
+        m.insert(r"\,", ""); // left italic correction
+        m.insert(r"\/", ""); // right italic correction
                              //m.insert(r"\:", "");  // zero-width space allowing line break
 
         // Lines:
@@ -874,9 +879,12 @@ impl MdocFormatter {
             Macro::Dd => {
                 match macro_node.nodes.is_empty() {
                     true => self.formatting_state.date = self.format_dd(""),
+                    // A `.Dd` argument that is not plain text (a stray macro, or
+                    // an escape the parser lifted out) leaves the date empty
+                    // rather than panicking — a renderer must be total.
                     false => match &macro_node.nodes[0] {
                         Element::Text(l) => self.formatting_state.date = self.format_dd(l.as_str()),
-                        _ => unreachable!(),
+                        _ => self.formatting_state.date = self.format_dd(""),
                     },
                 };
 
@@ -1016,7 +1024,9 @@ fn add_indent_to_lines(lines: Vec<String>, width: usize, offset: &OffsetType) ->
                     let indent = " ".repeat(line_indent);
                     indent.clone() + &line
                 }
-                _ => unreachable!(),
+                // `Indent`/`IndentTwo` describe a margin, not an alignment; the
+                // caller has already applied them, so the line is left as is.
+                OffsetType::Indent | OffsetType::IndentTwo => line,
             }
         })
         .collect::<Vec<_>>()
@@ -1416,7 +1426,9 @@ impl MdocFormatter {
 
     fn format_bk_block(&mut self, macro_node: MacroNode) -> String {
         let indent = self.formatting_state.current_indent;
-        let max_width = self.formatting_settings.width - indent;
+        // Nested lists accumulate indent without bound, so on a narrow terminal
+        // the indent can exceed the width; keep at least one usable column.
+        let max_width = self.formatting_settings.width.saturating_sub(indent).max(1);
 
         let mut content = String::new();
         let mut current_len = indent;
@@ -1740,8 +1752,10 @@ impl MdocFormatter {
             }
 
             let col_count = columns.len();
+            // `.Bl -column` with no column widths at all leaves `col_count` at
+            // zero, and `col_count - 1` then underflows.
             let mut total_width: usize =
-                columns.iter().map(|c| c.len()).sum::<usize>() + 2 * (col_count - 1);
+                columns.iter().map(|c| c.len()).sum::<usize>() + 2 * col_count.saturating_sub(1);
             let row_len_range = merge_row_ends(&mut table, col_count);
             let (col_widths, columns_suit_by_width) = calculate_col_widths(
                 &table,
@@ -2910,17 +2924,16 @@ impl MdocFormatter {
 
         let mut items = Vec::new();
         while let Some(el) = iter.peek() {
-            if let Element::Macro(node) = el {
-                if node.mdoc_macro == Macro::A {
-                    let el = iter.next().unwrap();
-                    if let Element::Macro(node) = el {
+            match el {
+                Element::Macro(node) if node.mdoc_macro == Macro::A => {
+                    if let Some(Element::Macro(node)) = iter.next() {
                         items.push(self.format_a(node));
                     }
-                } else {
-                    break;
                 }
-            } else {
-                unreachable!("Unexpected rule!");
+                // Anything else ends the author list and is handled below —
+                // including plain text, which `.Rs` is not supposed to contain
+                // but real pages do: sccs(1) as shipped panics here.
+                _ => break,
             }
         }
 
@@ -2951,10 +2964,15 @@ impl MdocFormatter {
                     Macro::T => self.format_t(node),
                     Macro::U => self.format_u(node),
                     Macro::V => self.format_v(node),
-                    _ => unreachable!("Rs can not contain macro: {:?}", node),
+                    // Defensive: `.Rs` is specified to hold only `%X` macros,
+                    // but format anything else rather than panicking — a
+                    // renderer must be total.
+                    _ => self.format_inline_macro(node),
                 },
-                _ => unreachable!("Unexpected element type!"),
+                Element::Text(text) => self.format_text_node(&text),
+                Element::Eoi => String::new(),
             })
+            .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -3597,15 +3615,25 @@ impl MdocFormatter {
         let mut iter = macro_node.nodes.iter();
 
         if let Some(node) = iter.next() {
+            // A leading delimiter closes the empty argument list and is written
+            // outside it; anything else — text or, as in `.Fn foo Ar bar`, a
+            // macro — is an argument.
+            let leading_delimiter = match node {
+                Element::Text(arg) => matches!(
+                    arg.as_str(),
+                    "(" | "[" | ")" | "]" | "." | "," | ":" | ";" | "!" | "?"
+                ),
+                _ => false,
+            };
             match node {
-                Element::Text(arg) => match arg.as_str() {
-                    "(" | "[" | ")" | "]" | "." | "," | ":" | ";" | "!" | "?" => {
-                        let c = iter
-                            .map(|n| self.format_node(n.clone()))
-                            .collect::<String>();
-                        return format!("{}){} {}", result, arg, c);
-                    }
-                    _ => {
+                Element::Text(arg) if leading_delimiter => {
+                    let c = iter
+                        .map(|n| self.format_node(n.clone()))
+                        .collect::<String>();
+                    return format!("{}){} {}", result, arg, c);
+                }
+                _ => {
+                    {
                         let mut prev_was_open = false;
                         let mut is_first_node = true;
 
@@ -3668,8 +3696,7 @@ impl MdocFormatter {
 
                         return result;
                     }
-                },
-                _ => unreachable!(),
+                }
             }
         };
 
@@ -3718,11 +3745,10 @@ impl MdocFormatter {
             format!("<{}>", filename)
         };
 
-        if let Some(node) = macro_node.nodes.into_iter().next() {
-            match node {
-                Element::Text(close_del) => result.push_str(close_del.as_str()),
-                _ => unreachable!(),
-            }
+        // Only a trailing delimiter is expected here; a stray macro contributes
+        // nothing rather than panicking — a renderer must be total.
+        if let Some(Element::Text(close_del)) = macro_node.nodes.into_iter().next() {
+            result.push_str(close_del.as_str());
         }
 
         result
@@ -3747,20 +3773,16 @@ impl MdocFormatter {
         let mut result = String::new();
         let mut iter = macro_node.nodes.into_iter();
 
-        if let Some(node) = iter.next() {
-            match node {
-                Element::Text(open_del) => result.push_str(open_del.as_str()),
-                _ => unreachable!(),
-            }
+        // As in `format_in`: only delimiters are expected around the library
+        // name, and anything else contributes nothing rather than panicking.
+        if let Some(Element::Text(open_del)) = iter.next() {
+            result.push_str(open_del.as_str());
         }
 
         result.push_str(&format!("library “{lib_name}”"));
 
-        if let Some(node) = iter.next() {
-            match node {
-                Element::Text(close_del) => result.push_str(close_del.as_str()),
-                _ => unreachable!(),
-            }
+        if let Some(Element::Text(close_del)) = iter.next() {
+            result.push_str(close_del.as_str());
         }
 
         result
@@ -4059,6 +4081,20 @@ mod tests {
     fn font_escapes_styled_when_on() {
         let out = format_styled(".Dd x\n.Dt T 1\n.Os\n.Sh D\nuse \\fBbold\\fR now\n");
         assert!(out.contains("b\u{8}bo\u{8}ol\u{8}ld\u{8}d"), "got: {out:?}");
+    }
+
+    #[test]
+    fn italic_corrections_are_removed() {
+        // `\\,` and `\\/` are typesetter kerning with no width on a terminal.
+        // help2man emits them on every GNU page, so they were visible as stray
+        // backslashes in the rendered text of most of /usr/share/man.
+        let mut formatter = MdocFormatter::new(FORMATTING_SETTINGS);
+        let out = String::from_utf8(
+            formatter.format_mdoc(get_ast(".Dd x\n.Dt T 1\n.Os\n.Sh D\nsort \\,FILE\\/ now\n")),
+        )
+        .unwrap();
+        assert!(out.contains("sort FILE now"), "got: {out:?}");
+        assert!(!out.contains('\\'), "got: {out:?}");
     }
 
     #[test]
@@ -7535,142 +7571,3 @@ footer text                     January 1, 1970                    footer text";
         }
     }
 }
-
-/*
-/// Use this mod for testing whole mdoc files.
-/// Test results may differ from original mdoc
-/// formatter. So this tests will not pass
-/// successfully. This is expected behavior
-#[cfg(test)]
-mod test_mdoc {
-    use crate::man_util::formatter::tests::test_formatting;
-    use std::process::Command;
-    use rstest::rstest;
-
-    #[rstest]
-    // Small
-    #[case("./test_files/mdoc/rev.1")]
-    #[case("./test_files/mdoc/adjfreq.2")]
-    #[case("./test_files/mdoc/getgroups.2")]
-    #[case("./test_files/mdoc/sigreturn.2")]
-    #[case("./test_files/mdoc/size.1")]
-    #[case("./test_files/mdoc/fgen.1")]
-    #[case("./test_files/mdoc/getrtable.2")]
-    #[case("./test_files/mdoc/wall.1")]
-    #[case("./test_files/mdoc/getsid.2")]
-    #[case("./test_files/mdoc/ypconnect.2")]
-    #[case("./test_files/mdoc/closefrom.2")]
-    #[case("./test_files/mdoc/moptrace.1")]
-
-    //Other
-    #[case("./test_files/mdoc/rlog.1")]
-    #[case("./test_files/mdoc/access.2")]
-    #[case("./test_files/mdoc/munmap.2")]
-    #[case("./test_files/mdoc/ipcs.1")]
-    #[case("./test_files/mdoc/atq.1")]
-    #[case("./test_files/mdoc/brk.2")]
-    #[case("./test_files/mdoc/cal.1")]
-    #[case("./test_files/mdoc/minherit.2")]
-    #[case("./test_files/mdoc/cat.1")]
-    #[case("./test_files/mdoc/file.1")]
-    #[case("./test_files/mdoc/mkdir.1")]
-    #[case("./test_files/mdoc/getsockname.2")]
-    #[case("./test_files/mdoc/mlockall.2")]
-    #[case("./test_files/mdoc/cut.1")]
-
-    //without bl
-    #[case("./test_files/mdoc/umask.2")]
-    #[case("./test_files/mdoc/sched_yield.2")]
-    #[case("./test_files/mdoc/sigsuspend.2")]
-    #[case("./test_files/mdoc/mopa.out.1")]
-    #[case("./test_files/mdoc/fsync.2")]
-    #[case("./test_files/mdoc/shar.1")]
-    #[case("./test_files/mdoc/sysarch.2")]
-
-    //word as macro
-    #[case("./test_files/mdoc/fork.2")]
-    #[case("./test_files/mdoc/symlink.2")]
-    #[case("./test_files/mdoc/sync.2")]
-    #[case("./test_files/mdoc/futex.2")]
-    #[case("./test_files/mdoc/reboot.2")]
-    #[case("./test_files/mdoc/id.1")]
-    #[case("./test_files/mdoc/rename.2")]
-    #[case("./test_files/mdoc/cu.1")]
-    #[case("./test_files/mdoc/getfh.2")]
-    #[case("./test_files/mdoc/ioctl.2")]
-    #[case("./test_files/mdoc/dup.2")]
-    #[case("./test_files/mdoc/getpeername.2")]
-    #[case("./test_files/mdoc/lpq.1")]
-    #[case("./test_files/mdoc/nm.1")]
-    #[case("./test_files/mdoc/truncate.2")]
-    #[case("./test_files/mdoc/chdir.2")]
-    #[case("./test_files/mdoc/mkfifo.2")]
-    #[case("./test_files/mdoc/quotactl.2")]
-    #[case("./test_files/mdoc/send.2")]
-    #[case("./test_files/mdoc/getpriority.2")]
-    #[case("./test_files/mdoc/select.2")]
-    #[case("./test_files/mdoc/w.1")]
-    #[case("./test_files/mdoc/chflags.2")]
-    #[case("./test_files/mdoc/flock.2")]
-
-    // Bl -column
-    #[case("./test_files/mdoc/shutdown.2")]
-    #[case("./test_files/mdoc/tmux.1")]
-    #[case("./test_files/mdoc/nl.1")]
-    #[case("./test_files/mdoc/bc.1")]
-    #[case("./test_files/mdoc/mg.1")]
-    #[case("./test_files/mdoc/snmp.1")]
-    #[case("./test_files/mdoc/rdist.1")]
-
-    //Block 1
-    #[case("./test_files/mdoc/chmod.2")]
-    #[case("./test_files/mdoc/cvs.1")]
-    #[case("./test_files/mdoc/dc.1")]
-    #[case("./test_files/mdoc/flex.1")]
-    #[case("./test_files/mdoc/getdents.2")]
-    #[case("./test_files/mdoc/getitimer.2")]
-    #[case("./test_files/mdoc/getrusage.2")]
-    #[case("./test_files/mdoc/getsockopt.2")]
-
-    #[case("./test_files/mdoc/gettimeofday.2")]
-    #[case("./test_files/mdoc/ktrace.2")]
-    #[case("./test_files/mdoc/msgrcv.2")]
-    #[case("./test_files/mdoc/msgsnd.2")]
-    #[case("./test_files/mdoc/mv.1")]
-    #[case("./test_files/mdoc/poll.2")]
-    #[case("./test_files/mdoc/profil.2")]
-    #[case("./test_files/mdoc/rcs.1")]
-    #[case("./test_files/mdoc/read.2")]
-    #[case("./test_files/mdoc/rup.1")]
-    #[case("./test_files/mdoc/semget.2")]
-    #[case("./test_files/mdoc/shmctl.2")]
-    #[case("./test_files/mdoc/signify.1")]
-    #[case("./test_files/mdoc/statfs.2")]
-    #[case("./test_files/mdoc/t11.2")]
-    #[case("./test_files/mdoc/talk.1")]
-    #[case("./test_files/mdoc/write.2")]
-
-    #[case("./test_files/mdoc/diff.1")]
-    #[case("./test_files/mdoc/top.1")]
-    #[case("./test_files/mdoc/execve.2")]
-    #[case("./test_files/mdoc/open.2")]
-    #[case("./test_files/mdoc/scp.1")]
-    #[case("./test_files/mdoc/socket.2")]
-    #[case("./test_files/mdoc/socketpair.2")]
-    #[case("./test_files/mdoc/setuid.2")]
-    #[case("./test_files/mdoc/shmget.2")]
-    #[case("./test_files/mdoc/sftp.1")]
-    #[case("./test_files/mdoc/grep.1")]
-    fn format_mdoc_file(#[case] path: &str){
-        let input = std::fs::read_to_string(path).unwrap();
-        let output = Command::new("mandoc")
-            .args(["-T", "locale", path])
-            .output()
-            .unwrap()
-            .stdout;
-        let output = String::from_utf8(output).unwrap();
-        println!("Current path: {}", path);
-        test_formatting(&input, &output);
-    }
-}
-*/

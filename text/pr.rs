@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use chrono::{DateTime, Local};
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use plib::io::input_stream;
 
 use self::pr_util::{line_transform, Args, PageIterator, Parameters};
@@ -611,9 +611,9 @@ fn pr_merged(paths: &[PathBuf], params: &Parameters) -> io::Result<()> {
 }
 
 fn main() -> ExitCode {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs").unwrap();
-    bind_textdomain_codeset("posixutils-rs", "UTF-8").unwrap();
+    // Sets the locale *and* the diagnostic prefix, so the `-r`-suppressible
+    // warnings below name the utility as the rest of the tree does.
+    plib::diag::init_locale("pr");
 
     install_sigint_handler();
 
@@ -626,7 +626,7 @@ fn main() -> ExitCode {
             Ok(_) => ExitCode::SUCCESS,
             Err(e) => {
                 if !params.no_file_warnings {
-                    eprintln!("{e}");
+                    plib::diag::error(&e.to_string());
                 }
                 ExitCode::FAILURE
             }
@@ -636,7 +636,7 @@ fn main() -> ExitCode {
         for file in args.file() {
             if let Err(e) = pr_serial(file, &params) {
                 if !params.no_file_warnings {
-                    eprintln!("{e}");
+                    plib::diag::error(&e.to_string());
                 }
                 success = false;
             }

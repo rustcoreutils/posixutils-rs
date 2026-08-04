@@ -606,3 +606,158 @@ fn test_diff_unified_header_timestamp_format() {
         },
     );
 }
+
+// ---------------------------------------------------------------------------
+// Operands, exit status and boundary hunk ranges
+// ---------------------------------------------------------------------------
+
+/// Write `content` to a uniquely named temporary file and return its path.
+fn diff_tmp(tag: &str, content: &str) -> PathBuf {
+    let mut p = std::env::temp_dir();
+    p.push(format!("posixutils-diff-{}-{}", std::process::id(), tag));
+    std::fs::write(&p, content).expect("write temp file");
+    p
+}
+
+#[test]
+fn test_diff_identical_files_are_silent_and_exit_zero() {
+    let a = diff_tmp("same-a", "x\ny\n");
+    let b = diff_tmp("same-b", "x\ny\n");
+    diff_test(&[a.to_str().unwrap(), b.to_str().unwrap()], "", 0);
+    let _ = std::fs::remove_file(a);
+    let _ = std::fs::remove_file(b);
+}
+
+#[test]
+fn test_diff_exit_status_is_zero_one_two() {
+    // POSIX EXIT STATUS: 0 no differences, 1 differences, >1 an error.
+    let a = diff_tmp("st-a", "x\n");
+    let b = diff_tmp("st-b", "y\n");
+    let code = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_diff"))
+            .args(args)
+            .output()
+            .expect("run diff")
+            .status
+            .code()
+    };
+    assert_eq!(code(&[a.to_str().unwrap(), a.to_str().unwrap()]), Some(0));
+    assert_eq!(code(&[a.to_str().unwrap(), b.to_str().unwrap()]), Some(1));
+    assert_eq!(
+        code(&[a.to_str().unwrap(), "no-such-file-xyz"]),
+        Some(2),
+        "an inaccessible operand is an error, not a difference"
+    );
+    let _ = std::fs::remove_file(a);
+    let _ = std::fs::remove_file(b);
+}
+
+#[test]
+fn test_diff_stdin_operand() {
+    // A `-` operand reads standard input as one of the two files.
+    use std::io::Write;
+    let a = diff_tmp("stdin-a", "a\nb\nc\n");
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_diff"))
+        .args([a.to_str().unwrap(), "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn diff");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"a\nX\nc\n")
+        .unwrap();
+    let out = child.wait_with_output().expect("wait diff");
+    assert_eq!(out.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("2c2"), "got {stdout:?}");
+    assert!(
+        stdout.contains("< b") && stdout.contains("> X"),
+        "got {stdout:?}"
+    );
+    let _ = std::fs::remove_file(a);
+}
+
+#[test]
+fn test_diff_context_empty_range_header() {
+    // An empty first file has no LCS entries, so building the trailing hunk
+    // indexed `lcs_indices[len - 1]` and underflowed: `diff -c` panicked
+    // outright on this input. POSIX/GNU render the empty side as `*** 0 ****`.
+    let empty = diff_tmp("empty", "");
+    let one = diff_tmp("one", "x\n");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_diff"))
+        .args(["-c", empty.to_str().unwrap(), one.to_str().unwrap()])
+        .output()
+        .expect("run diff");
+    assert_eq!(out.status.code(), Some(1), "must not crash");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("*** 0 ****"), "got {stdout:?}");
+    assert!(stdout.contains("--- 1 ----"), "got {stdout:?}");
+    assert!(stdout.contains("+ x"), "got {stdout:?}");
+
+    // And the same pair the other way round.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_diff"))
+        .args(["-c", one.to_str().unwrap(), empty.to_str().unwrap()])
+        .output()
+        .expect("run diff");
+    assert_eq!(out.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("--- 0 ----"), "got {stdout:?}");
+    let _ = std::fs::remove_file(empty);
+    let _ = std::fs::remove_file(one);
+}
+
+#[test]
+fn test_diff_no_trailing_newline_in_context_and_unified() {
+    let a = diff_tmp("nonl-a", "a");
+    let b = diff_tmp("nonl-b", "b");
+    for mode in ["-c", "-u"] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_diff"))
+            .args([mode, a.to_str().unwrap(), b.to_str().unwrap()])
+            .output()
+            .expect("run diff");
+        assert_eq!(out.status.code(), Some(1));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(
+            stdout.matches("\\ No newline at end of file").count(),
+            2,
+            "{mode} must mark both sides, got {stdout:?}"
+        );
+    }
+    let _ = std::fs::remove_file(a);
+    let _ = std::fs::remove_file(b);
+}
+
+#[test]
+fn test_diff_edit_script_escapes_a_lone_period() {
+    // In an `-e` script a line consisting of a single `.` would terminate the
+    // input mode, so it must be escaped to survive being fed to `ed`.
+    let a = diff_tmp("dot-a", "x\n");
+    let b = diff_tmp("dot-b", ".\n");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_diff"))
+        .args(["-e", a.to_str().unwrap(), b.to_str().unwrap()])
+        .output()
+        .expect("run diff");
+    assert_eq!(out.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // A bare "." would end ed's input mode early and drop the rest of the
+    // block, so the content line must be escaped and repaired afterwards.
+    let lines: Vec<&str> = stdout.lines().collect();
+    let bare_dots = lines.iter().filter(|l| **l == ".").count();
+    assert_eq!(
+        bare_dots, 1,
+        "only the terminator may be a lone period, got {stdout:?}"
+    );
+    assert!(
+        lines.contains(&".."),
+        "the content line must be escaped, got {stdout:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("s/^\\.\\.$/./")),
+        "the escape must be repaired, got {stdout:?}"
+    );
+    let _ = std::fs::remove_file(a);
+    let _ = std::fs::remove_file(b);
+}

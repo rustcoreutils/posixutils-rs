@@ -328,3 +328,67 @@ fn pr_form_feed_multi_column_page_accounting() {
         "a,c,\nb,\nd,f,\ne,\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Option coverage and diagnostics
+// ---------------------------------------------------------------------------
+
+fn pr_tmp(tag: &str, content: &str) -> std::path::PathBuf {
+    let mut p = std::env::temp_dir();
+    p.push(format!("posixutils-pr-{}-{}", std::process::id(), tag));
+    std::fs::write(&p, content).expect("write temp file");
+    p
+}
+
+#[test]
+fn pr_double_space_output() {
+    // -d writes the output double-spaced.
+    let f = pr_tmp("d", "l1\nl2\n");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_pr"))
+        .args(["-d", "-t", f.to_str().unwrap()])
+        .output()
+        .expect("run pr");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "l1\n\nl2\n\n");
+    let _ = std::fs::remove_file(f);
+}
+
+#[test]
+fn pr_suppress_file_warnings() {
+    // -r writes no diagnostic for a file that cannot be opened; the exit
+    // status still reflects the failure.
+    let with = std::process::Command::new(env!("CARGO_BIN_EXE_pr"))
+        .args(["-r", "no-such-file-xyz"])
+        .output()
+        .expect("run pr");
+    assert_ne!(with.status.code(), Some(0));
+    assert!(
+        with.stderr.is_empty(),
+        "-r must suppress the diagnostic, got {:?}",
+        String::from_utf8_lossy(&with.stderr)
+    );
+
+    let without = std::process::Command::new(env!("CARGO_BIN_EXE_pr"))
+        .arg("no-such-file-xyz")
+        .output()
+        .expect("run pr");
+    assert_ne!(without.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&without.stderr);
+    assert!(!stderr.is_empty(), "without -r there must be a diagnostic");
+    // The diagnostic identifies the utility, as the rest of the tree does.
+    assert!(stderr.starts_with("pr:"), "got {stderr:?}");
+}
+
+#[test]
+fn pr_merge_of_empty_files() {
+    let a = pr_tmp("m1", "");
+    let b = pr_tmp("m2", "");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_pr"))
+        .args(["-m", "-t", a.to_str().unwrap(), b.to_str().unwrap()])
+        .output()
+        .expect("run pr");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    let _ = std::fs::remove_file(a);
+    let _ = std::fs::remove_file(b);
+}

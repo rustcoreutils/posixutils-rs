@@ -147,22 +147,14 @@ impl Hunk {
             Change::None => {}
             Change::Insert => {
                 println!("{}a", self.ln1_end);
-                for i in self.ln2_start..self.ln2_end {
-                    println!("{}", file2.line(i));
-                }
-
-                println!(".")
+                print_ed_block_lines(file2, self.ln2_start..self.ln2_end, self.ln1_end + 1);
             }
             Change::Delete => {
                 println!("{}d", self.f1_range(","));
             }
             Change::Substitute => {
                 println!("{}c", self.f1_range(","));
-                for i in self.ln2_start..self.ln2_end {
-                    println!("{}", file2.line(i));
-                }
-
-                println!(".")
+                print_ed_block_lines(file2, self.ln2_start..self.ln2_end, self.ln1_start + 1);
             }
         }
 
@@ -257,6 +249,16 @@ impl Hunks {
         num_lines1: usize,
         num_lines2: usize,
     ) {
+        // An empty first file has no LCS entries at all, so the trailing-hunk
+        // logic below would index `lcs_indices[len - 1]` and underflow. Every
+        // line of the second file is then an insertion after line 0.
+        if lcs_indices.is_empty() {
+            if num_lines2 > 0 {
+                self.add_hunk(0, 0, 0, num_lines2);
+            }
+            return;
+        }
+
         let mut hunk_start1 = 0;
         let mut hunk_end1: usize;
         let mut hunk_start2 = 0;
@@ -332,5 +334,30 @@ impl Hunks {
             ln2_end: hunk_end2,
             ln1_end: hunk_end1,
         });
+    }
+}
+
+/// Write the replacement lines of an `ed` script block, escaping any line that
+/// consists solely of `.`.
+///
+/// Such a line would otherwise end `ed`'s input mode early and silently drop
+/// the rest of the block. It is written as `..` and repaired afterwards by a
+/// substitute command addressed at the resulting line, which is what GNU diff
+/// emits. `first_line` is the line number the first written line will occupy.
+fn print_ed_block_lines(file2: &FileData, range: std::ops::Range<usize>, first_line: usize) {
+    let mut escaped = Vec::new();
+    for (offset, i) in range.enumerate() {
+        let line = file2.line(i);
+        if line == "." {
+            println!("..");
+            escaped.push(first_line + offset);
+        } else {
+            println!("{}", line);
+        }
+    }
+    println!(".");
+    // Repair in descending order so earlier addresses stay valid.
+    for line_no in escaped.into_iter().rev() {
+        println!("{line_no}s/^\\.\\.$/./");
     }
 }

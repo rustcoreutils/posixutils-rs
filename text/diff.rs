@@ -143,8 +143,10 @@ fn check_difference(args: Args) -> io::Result<DiffExitStatus> {
         return Ok(DiffExitStatus::Trouble);
     }
 
+    // The same file named twice has no differences; that is a normal result,
+    // not an error. This reported "trouble" (exit 2) with no diagnostic at all.
     if path1 == path2 {
-        return Ok(DiffExitStatus::Trouble);
+        return Ok(DiffExitStatus::NotDifferent);
     }
 
     let output_format: OutputFormat = (&args).into();

@@ -142,3 +142,51 @@ fn expand_multibyte_column_width() {
     let out = run_expand_locale(&[], "\u{e9}\tX\n", &loc);
     assert_eq!(out, "\u{e9}       X\n");
 }
+
+// ---------------------------------------------------------------------------
+// Tab-stop forms, control characters and operands
+// ---------------------------------------------------------------------------
+
+#[test]
+fn expand_single_non_default_tabsize() {
+    expand_args_test(&["-t", "4"], "a\tb\n", "a   b\n");
+    expand_args_test(&["-t", "2"], "\tx\n", "  x\n");
+}
+
+#[test]
+fn expand_tab_past_the_last_stop_becomes_one_space() {
+    // POSIX: past the last declared stop, a <tab> is replaced by a single
+    // <space>.
+    expand_args_test(&["-t", "4,8"], "aaaaaaaaa\tX\n", "aaaaaaaaa X\n");
+}
+
+#[test]
+fn expand_backspace_decrements_the_column() {
+    // POSIX: a <backspace> decreases the column count by one, so the next tab
+    // stop is computed from the decremented column.
+    expand_args_test(&["-t", "4"], "ab\x08\tc\n", "ab\x08   c\n");
+}
+
+#[test]
+fn expand_multiple_files_and_a_missing_one() {
+    let mut good = std::env::temp_dir();
+    good.push(format!("posixutils-expand-{}", std::process::id()));
+    std::fs::write(&good, "a\tb\n").expect("write temp file");
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_expand"))
+        .args([good.to_str().unwrap(), good.to_str().unwrap()])
+        .output()
+        .expect("run expand");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "a       b\na       b\n"
+    );
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_expand"))
+        .args([good.to_str().unwrap(), "no-such-file-xyz"])
+        .output()
+        .expect("run expand");
+    assert_eq!(out.status.code(), Some(1), "a missing operand must exit 1");
+    let _ = std::fs::remove_file(good);
+}

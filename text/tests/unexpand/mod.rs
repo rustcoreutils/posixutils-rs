@@ -172,3 +172,43 @@ fn unexpand_nonexistent_file_errors_naming_the_utility() {
         "the diagnostic must name the utility, got {stderr:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Tab stops and control characters
+// ---------------------------------------------------------------------------
+
+#[test]
+fn unexpand_default_stops_repeat_every_eight() {
+    // Twelve leading blanks: eight become a <tab>, the remaining four stay.
+    unexpand_test(&[], "            x\n", "\t    x\n");
+    // Sixteen become two tabs.
+    unexpand_test(&[], "                x\n", "\t\tx\n");
+}
+
+#[test]
+fn unexpand_single_tabsize_repeats() {
+    // A single -t value defines stops at every multiple of that value.
+    unexpand_test(&["-t", "4"], "        x\n", "\t\tx\n");
+    unexpand_test(&["-t", "2"], "    x\n", "\t\tx\n");
+}
+
+#[test]
+fn unexpand_tabsize_implies_all_blanks() {
+    // POSIX: -t implies -a, so interior blanks are converted too, not just the
+    // leading run.
+    unexpand_test(&["-t", "4"], "ab      cd      ef\n", "ab\t\tcd\t\tef\n");
+}
+
+#[test]
+fn unexpand_backspace_in_input() {
+    // The <backspace> is copied through; the leading blanks before it still
+    // convert.
+    unexpand_test(&[], "        \x08x\n", "\t\x08x\n");
+}
+
+#[test]
+fn unexpand_leading_tab_then_blanks() {
+    // A <tab> already at column 0 advances to column 8, so the eight blanks
+    // that follow form the next full stop.
+    unexpand_test(&[], "\t        x\n", "\t\tx\n");
+}

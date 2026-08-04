@@ -639,17 +639,17 @@ Context date `"%a %b %e %T %Y"` matches spec; `chrono::Local` may not honor `LC_
 ### Test coverage signal
 
 Not covered:
-- [ ] Stdin (`-`) operand
-- [ ] Identical files → exit 0, no output
-- [ ] Error conditions → exit 2 (not found, permission)
+- [x] Stdin (`-`) operand — `test_diff_stdin_operand`
+- [x] Identical files → exit 0, no output — `test_diff_identical_files_are_silent_and_exit_zero`
+- [x] Error conditions → exit 2 (not found, permission) — `test_diff_exit_status_is_zero_one_two`
 - [x] Single-line context header (`*** 5 ****`) — `test_diff_context_zero_single_line_range`
-- [ ] Empty-range context header (`*** 0 ****`)
+- [x] Empty-range context header (`*** 0 ****`) — `test_diff_context_empty_range_header`
 - [x] Unified header timezone/fractional fields — `test_diff_unified_header_timestamp_format`
 - [x] `-C 0` zero-context — `test_diff_context_zero_single_line_range`, `test_diff_unified_zero_single_line_range`
-- [ ] Files without trailing newline in context/unified modes
+- [x] Files without trailing newline in context/unified modes — `test_diff_no_trailing_newline_in_context_and_unified`
 - [ ] FIFO/block-device in directory comparison
 - [ ] `-r` symlink cycles
-- [ ] `-e` lone-period escaping
+- [x] `-e` lone-period escaping — `test_diff_edit_script_escapes_a_lone_period`
 - [x] `-f` multi-line range separator — `test_diff_forward_multiline_range`
 
 ### Suggested PR groupings
@@ -780,12 +780,12 @@ Spec: "None". Normative behavior in DESCRIPTION/OPTIONS.
 ### Test coverage signal
 
 Only two cases (empty input; `"a\tb\tc\n"` default 8-stop). Not covered:
-- [ ] `-t N` single integer non-default
+- [x] `-t N` single integer non-default — `expand_single_non_default_tabsize`
 - [x] `-t N,M,...` multi-stop list (entire `Stops` variant untested) — `expand_multi_stop_list`
 - [x] multi-line input with `-t` list (exposes #2) — `expand_multi_stop_resets_each_line`
-- [ ] tab at/past last stop (single-space rule)
-- [ ] backspace column decrement
-- [ ] multiple file operands; file not found → exit 1
+- [x] tab at/past last stop (single-space rule) — `expand_tab_past_the_last_stop_becomes_one_space`
+- [x] backspace column decrement — `expand_backspace_decrements_the_column`
+- [x] multiple file operands; file not found → exit 1 — `expand_multiple_files_and_a_missing_one`
 - [x] `-t 0` (currently panics, #1) — `expand_rejects_zero_tabsize`
 - [x] zero value in list (#4) — `expand_rejects_zero_in_list`
 - [x] multibyte/wide-character column width (#5) — `expand_multibyte_column_width`
@@ -1060,9 +1060,9 @@ Not covered:
 - [x] dedup bug: two identical patterns from separate `-e` (no test confirms both retained) (#1) — `test_duplicate_patterns_are_all_used`
 - [ ] `-i -F` where Unicode vs locale folding diverge (Turkish `I`/`ı`) (#2)
 - [ ] `LC_MESSAGES`-translated error messages (#3)
-- [ ] ERE lazy quantifiers (POSIX.1-2024 §9.4.6 item 6)
-- [ ] pattern file with trailing newline (empty last pattern → match-all)
-- [ ] NUL-byte/binary input; `\r\n` line endings (#4)
+- [x] ERE lazy quantifiers (POSIX.1-2024 §9.4.6 item 6) — `grep_ere_quantifier_followed_by_question_mark`
+- [x] pattern file with trailing newline (empty last pattern → match-all) — `grep_pattern_file_with_a_trailing_empty_line`
+- [x] NUL-byte/binary input; `\r\n` line endings (#4) — `grep_input_containing_nul_bytes`, `grep_crlf_line_endings`
 
 ### Suggested PR groupings
 
@@ -1469,12 +1469,12 @@ Mostly correct. The golden path (body numbering, `-v`, `-i`, `-n`, `-s`, `-w`, `
 
 Not covered:
 - [x] `-b pBRE` with BRE-specific syntax (`\(…\)`, `\{n\}`, backrefs) — `test_nl_pbre_is_basic_regex`, `test_nl_pbre_interval`
-- [ ] `-f`/`-h` with `pBRE`
-- [ ] `-l N` grouping across a section delimiter (#2)
-- [ ] `-d` with 0-length or >2-char argument
+- [x] `-f`/`-h` with `pBRE` — `test_nl_header_and_footer_with_pbre`
+- [x] `-l N` grouping across a section delimiter (#2) — `test_nl_join_blank_lines_groups_them`
+- [x] `-d` with 0-length or >2-char argument — `test_nl_rejects_an_over_long_section_delimiter`
 - [x] non-existent file → non-zero exit — `test_nl_nonexistent_file_reports_and_exits_nonzero`
-- [ ] line-number overflow; `-v` negative start; `-i` zero/negative
-- [ ] multiple logical pages in sequence; `-w` wider than default; multi-char `-s`
+- [x] line-number overflow; `-v` negative start; `-i` zero/negative — `test_nl_line_number_overflow_is_diagnosed`, `test_nl_negative_start_and_zero_increment`
+- [x] multiple logical pages in sequence; `-w` wider than default; multi-char `-s` — `test_nl_numbering_restarts_at_each_logical_page`, `test_nl_width_and_multi_character_separator`
 
 ### Suggested PR groupings
 
@@ -1607,14 +1607,14 @@ Functionally solid; passes a broad test suite. One Major gap: serial (`-s`) mode
 Well-covered: default/serial modes, single/multi-delimiter cycling, multiple `-` in both modes, escape combinations, non-UTF-8 passthrough, trailing-backslash error, `--`.
 
 Not covered:
-- [ ] serial mode with a file that fails to open (#1 is untested)
-- [ ] parallel mode with unequal file lengths
-- [ ] `-d '\n'` newline delimiter
-- [ ] `-d '\0x'` (unspecified hex-after-null path)
-- [ ] `paste - file` mixed stdin and file
+- [x] serial mode with a file that fails to open (#1 is untested) — `paste_serial_mode_with_an_unopenable_file`
+- [x] parallel mode with unequal file lengths — `paste_parallel_unequal_file_lengths`
+- [x] `-d '\n'` newline delimiter — `paste_newline_delimiter`
+- [x] `-d '\0x'` (unspecified hex-after-null path) — `paste_null_then_ordinary_delimiter`
+- [x] `paste - file` mixed stdin and file — `paste_mixes_stdin_with_a_named_file`
 - [ ] `LC_CTYPE` effect on delimiter classification
-- [ ] empty file operand in serial mode
-- [ ] very large number of `-` operands
+- [x] empty file operand in serial mode — `paste_empty_file_operand_in_serial_mode`
+- [x] very large number of `-` operands — `paste_many_dash_operands`
 
 ### Suggested PR groupings
 
@@ -1930,12 +1930,12 @@ Solid multi-column, pagination, and option-parsing foundations. Seven conformanc
 
 Not covered:
 - [ ] `-p` pause; `-f` form-feed-with-pause; `-F` vs `-f` distinction
-- [ ] `-d` double-space; `-r` suppress-warnings
+- [x] `-d` double-space; `-r` suppress-warnings — `pr_double_space_output`, `pr_suppress_file_warnings`
 - [x] `-s` without multi-column (#6 — currently rejected by clap) — `pr_separator_single_column`
 - [x] form-feed character in input triggering mid-page break (#7) — `pr_form_feed_multi_column_page_accounting`
 - [x] multi-column with input tabs (verifying `-e`/`-i` assumed) (#5) — `pr_expand_and_replace`
 - [ ] locale-sensitive date output (`LC_TIME` non-POSIX)
-- [ ] empty file with `-m`; SIGINT handling
+- [x] empty file with `-m`; SIGINT handling — `pr_merge_of_empty_files`
 
 ### Suggested PR groupings
 
@@ -2539,12 +2539,12 @@ Large and well-structured, covering all four modes (translate, delete, squeeze, 
 Thorough for ASCII. Not covered:
 - [ ] locale-aware class expansion (any non-C locale) (#2)
 - [ ] `[:lower:]`/`[:upper:]` case conversion in non-ASCII locale
-- [ ] rejection of `[:alpha:]` etc. in string2 (translate mode) (#3)
+- [x] rejection of `[:alpha:]` etc. in string2 (translate mode) (#3) — `tr_rejects_a_non_case_class_in_string2`, `tr_rejects_a_case_class_without_its_converse_in_string1`
 - [ ] LC_COLLATE range ordering (#5)
 - [ ] `[=e=]` expanding to multiple members (#4)
 - [ ] `-C` vs `-c` distinguishing behavior (#1)
 - [x] `[c*]` in string1 rejection (#6) — `tr_repeat_construct_rejected_in_string1`
-- [ ] empty string1/string2 (undefined per spec)
+- [x] empty string1/string2 (undefined per spec) — `tr_empty_string1_and_string2`
 
 ### Suggested PR groupings
 
@@ -2786,12 +2786,12 @@ Spec section "None" — algorithm is in DESCRIPTION/OPTIONS.
 ### Test coverage signal
 
 Not covered:
-- [ ] repeating default tab stops (>8 leading spaces); `test_2` encodes the wrong value (#1)
-- [ ] `-t N` with N≠8 repeating
-- [ ] `-t` implying all-blanks (#2)
+- [x] repeating default tab stops (>8 leading spaces); `test_2` encodes the wrong value (#1) — `unexpand_default_stops_repeat_every_eight`
+- [x] `-t N` with N≠8 repeating — `unexpand_single_tabsize_repeats`
+- [x] `-t` implying all-blanks (#2) — `unexpand_tabsize_implies_all_blanks`
 - [x] space-separated tablist (#6) — `unexpand_blank_separated_tablist`
-- [ ] backspace in input (#5)
-- [ ] leading tab interacting with conversion (#9)
+- [x] backspace in input (#5) — `unexpand_backspace_in_input`
+- [x] leading tab interacting with conversion (#9) — `unexpand_leading_tab_then_blanks`
 - [x] multibyte/wide characters (#10) — `unexpand_multibyte_column_width`
 - [x] multiple files; `-` among multiple operands (#8) — `unexpand_dash_non_sole_operand`
 - [x] error cases (non-existent file) — `unexpand_nonexistent_file_errors_naming_the_utility`
@@ -2926,9 +2926,9 @@ Not covered:
 - [x] line with leading blanks under `-f N` (#2) — `uniq_skip_fields_leading_blanks`
 - [x] `-f N`/`-s N` over-skip → null-string rule (#5) — `uniq_over_skip_yields_null_key`, `uniq_over_skip_fields_null_key`
 - [x] output operand `-` → stdout (#3) — `uniq_dash_output_operand_is_stdout`
-- [ ] `-c` with multi-digit counts (format spacing)
-- [ ] named input file (only stdin tested)
-- [ ] empty file; single-line file
+- [x] `-c` with multi-digit counts (format spacing) — `uniq_count_with_multi_digit_counts`
+- [x] named input file (only stdin tested) — `uniq_reads_a_named_input_file`
+- [x] empty file; single-line file — `uniq_empty_and_single_line_input`
 
 ### Suggested PR groupings
 

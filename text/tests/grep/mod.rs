@@ -1412,3 +1412,93 @@ fn test_duplicate_patterns_are_all_used() {
     // identical -e patterns still match the line exactly once.
     grep_test(&["-e", "foo", "-e", "foo"], "foo\nbar\n", "foo\n", "", 0);
 }
+
+// ---------------------------------------------------------------------------
+// Pattern-file and input edge cases
+// ---------------------------------------------------------------------------
+
+fn grep_tmp(tag: &str, content: &str) -> std::path::PathBuf {
+    let mut p = std::env::temp_dir();
+    p.push(format!("posixutils-grep-{}-{}", std::process::id(), tag));
+    std::fs::write(&p, content).expect("write temp file");
+    p
+}
+
+fn grep_stdin(args: &[&str], stdin: &[u8]) -> (Vec<u8>, i32) {
+    use std::io::Write;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_grep"))
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn grep");
+    child.stdin.as_mut().unwrap().write_all(stdin).unwrap();
+    let out = child.wait_with_output().expect("wait grep");
+    (out.stdout, out.status.code().unwrap_or(-1))
+}
+
+#[test]
+fn grep_pattern_file_with_a_trailing_empty_line() {
+    // A pattern file ending in a blank line contributes an empty pattern, and
+    // an empty BRE matches every line.
+    let one = grep_tmp("p1", "foo\n");
+    let (out, code) = grep_stdin(&["-f", one.to_str().unwrap()], b"foo\nbar\n");
+    assert_eq!(code, 0);
+    assert_eq!(String::from_utf8_lossy(&out), "foo\n");
+
+    let blank = grep_tmp("p2", "foo\n\n");
+    let (out, code) = grep_stdin(&["-f", blank.to_str().unwrap()], b"foo\nbar\n");
+    assert_eq!(code, 0);
+    assert_eq!(
+        String::from_utf8_lossy(&out),
+        "foo\nbar\n",
+        "an empty last pattern matches every line"
+    );
+    let _ = std::fs::remove_file(one);
+    let _ = std::fs::remove_file(blank);
+}
+
+#[test]
+fn grep_input_containing_nul_bytes() {
+    // POSIX requires grep's input to be text files, and a NUL byte makes a file
+    // non-text, so the behavior here is unspecified. Pin what we actually do.
+    //
+    // Lines *without* a NUL still match normally even when another line has one,
+    // so the file is not abandoned wholesale.
+    let (out, code) = grep_stdin(&["plain"], b"a\x00b\nplain\n");
+    assert_eq!(code, 0);
+    assert_eq!(String::from_utf8_lossy(&out), "plain\n");
+
+    // A line containing a NUL never matches: the match goes through POSIX
+    // `regexec`, which takes a NUL-terminated string, so the conversion fails
+    // and the line is skipped. GNU grep instead reports "binary file matches"
+    // and exits 0. Both are within the latitude the spec allows for non-text
+    // input; the divergence is recorded in the audit.
+    let (out, code) = grep_stdin(&["a"], b"a\x00b\n");
+    assert_eq!(code, 1, "a NUL-bearing line does not match");
+    assert!(out.is_empty());
+}
+
+#[test]
+fn grep_crlf_line_endings() {
+    // A <carriage-return> is part of the line's content, so `x$` does not match
+    // a line ending in CRLF, while `x\r$` does.
+    let (out, code) = grep_stdin(&["x$"], b"x\r\n");
+    assert_eq!(code, 1, "the CR is data, so `x$` must not match");
+    assert!(out.is_empty());
+
+    let (out, code) = grep_stdin(&["x"], b"x\r\n");
+    assert_eq!(code, 0);
+    assert_eq!(out, b"x\r\n", "the CR is preserved in the output");
+}
+
+#[test]
+fn grep_ere_quantifier_followed_by_question_mark() {
+    // POSIX EREs have no lazy quantifiers; `+?` is `+` followed by an optional
+    // repetition of the preceding element. Pin what we do rather than leaving
+    // it untested.
+    let (out, code) = grep_stdin(&["-E", "a+?"], b"aaa\n");
+    assert_eq!(code, 0);
+    assert_eq!(String::from_utf8_lossy(&out), "aaa\n");
+}

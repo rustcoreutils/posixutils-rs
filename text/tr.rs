@@ -71,8 +71,76 @@ Only one string may be given when deleting without squeezing repeats."
             }
         }
 
+        if let Some(st) = &self.string2 {
+            self.validate_string2_classes(st)?;
+        }
+
         Ok(())
     }
+
+    /// Enforce POSIX's restriction on `[:class:]` in string2 (118121-118124).
+    ///
+    /// > When both the -d and -s options are specified, any of the character
+    /// > class names shall be accepted in string2. Otherwise, only character
+    /// > class names lower or upper are valid in string2 and then only if the
+    /// > corresponding character class (upper and lower, respectively) is
+    /// > specified in the same relative position in string1.
+    ///
+    /// The relative-position half is not checked: classes are expanded to
+    /// characters during parsing, so the operand list no longer records which
+    /// characters came from a class. Requiring the converse class to be present
+    /// in string1 catches the cases that actually occur — `tr abc '[:alpha:]'`
+    /// and `tr abc '[:upper:]'`, both of which silently produced output before.
+    fn validate_string2_classes(&self, string2: &str) -> Result<(), String> {
+        // With both -d and -s, every class name is accepted.
+        if self.delete && self.squeeze_repeats {
+            return Ok(());
+        }
+        for class in class_names(string2) {
+            let converse = match class.as_str() {
+                "lower" => "upper",
+                "upper" => "lower",
+                other => {
+                    return Err(format!(
+                        "character class '[:{other}:]' is not valid in string2"
+                    ));
+                }
+            };
+            if !class_names(&self.string1).any(|c| c == converse) {
+                return Err(format!(
+                    "'[:{class}:]' is valid in string2 only when '[:{converse}:]' \
+                     appears in string1"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Yield the `name` of every `[:name:]` construct in `s`, in order.
+fn class_names(s: &str) -> impl Iterator<Item = String> + '_ {
+    let bytes: Vec<char> = s.chars().collect();
+    let mut i = 0_usize;
+    std::iter::from_fn(move || {
+        while i < bytes.len() {
+            // A backslash escapes the next character, so `\[` is not a construct.
+            if bytes[i] == '\\' {
+                i += 2;
+                continue;
+            }
+            if bytes[i] == '[' && bytes.get(i + 1) == Some(&':') {
+                if let Some(end) = (i + 2..bytes.len().saturating_sub(1))
+                    .find(|&j| bytes[j] == ':' && bytes[j + 1] == ']')
+                {
+                    let name: String = bytes[i + 2..end].iter().collect();
+                    i = end + 2;
+                    return Some(name);
+                }
+            }
+            i += 1;
+        }
+        None
+    })
 }
 
 /// Translates or deletes characters from standard input, according to specified arguments.

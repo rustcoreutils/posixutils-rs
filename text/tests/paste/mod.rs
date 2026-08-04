@@ -330,3 +330,125 @@ fn paste_custom_delimiters_serial() {
         "output_paste_custom_delimiters_serial.txt",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Operands, delimiters and error paths
+// ---------------------------------------------------------------------------
+
+fn paste_tmp(tag: &str, content: &str) -> std::path::PathBuf {
+    let mut p = std::env::temp_dir();
+    p.push(format!("posixutils-paste-{}-{}", std::process::id(), tag));
+    std::fs::write(&p, content).expect("write temp file");
+    p
+}
+
+#[test]
+fn paste_parallel_unequal_file_lengths() {
+    // The shorter file contributes empty fields once exhausted; the delimiter
+    // is still written.
+    let a = paste_tmp("u1", "1\n2\n3\n");
+    let b = paste_tmp("u2", "a\n");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_paste"))
+        .args([a.to_str().unwrap(), b.to_str().unwrap()])
+        .output()
+        .expect("run paste");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\ta\n2\t\n3\t\n");
+    let _ = std::fs::remove_file(a);
+    let _ = std::fs::remove_file(b);
+}
+
+#[test]
+fn paste_newline_delimiter() {
+    let a = paste_tmp("n1", "1\n2\n");
+    let b = paste_tmp("n2", "a\nb\n");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_paste"))
+        .args(["-d", "\\n", a.to_str().unwrap(), b.to_str().unwrap()])
+        .output()
+        .expect("run paste");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\na\n2\nb\n");
+    let _ = std::fs::remove_file(a);
+    let _ = std::fs::remove_file(b);
+}
+
+#[test]
+fn paste_null_then_ordinary_delimiter() {
+    // `\0` is the empty delimiter; a character after it continues the cycling
+    // list. POSIX leaves the combination unspecified, so this pins what we do.
+    let a = paste_tmp("z1", "1\n2\n3\n");
+    let b = paste_tmp("z2", "a\nb\nc\n");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_paste"))
+        .args(["-d", "\\0x", a.to_str().unwrap(), b.to_str().unwrap()])
+        .output()
+        .expect("run paste");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1a\n2b\n3c\n");
+    let _ = std::fs::remove_file(a);
+    let _ = std::fs::remove_file(b);
+}
+
+#[test]
+fn paste_serial_mode_with_an_unopenable_file() {
+    let good = paste_tmp("s1", "1\n2\n");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_paste"))
+        .args(["-s", "no-such-file-xyz", good.to_str().unwrap()])
+        .output()
+        .expect("run paste");
+    assert_eq!(out.status.code(), Some(1), "a missing operand must exit >0");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("no-such-file-xyz"), "got {stderr:?}");
+    // The readable operand is still processed.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\t2\n");
+    let _ = std::fs::remove_file(good);
+}
+
+#[test]
+fn paste_empty_file_operand_in_serial_mode() {
+    let empty = paste_tmp("e1", "");
+    let full = paste_tmp("e2", "a\n");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_paste"))
+        .args(["-s", empty.to_str().unwrap(), full.to_str().unwrap()])
+        .output()
+        .expect("run paste");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "\na\n");
+    let _ = std::fs::remove_file(empty);
+    let _ = std::fs::remove_file(full);
+}
+
+#[test]
+fn paste_mixes_stdin_with_a_named_file() {
+    use std::io::Write;
+    let f = paste_tmp("m1", "a\n");
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_paste"))
+        .args(["-", f.to_str().unwrap()])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn paste");
+    child.stdin.as_mut().unwrap().write_all(b"S\n").unwrap();
+    let out = child.wait_with_output().expect("wait paste");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "S\ta\n");
+    let _ = std::fs::remove_file(f);
+}
+
+#[test]
+fn paste_many_dash_operands() {
+    // Each `-` consumes the next line of the single standard input.
+    use std::io::Write;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_paste"))
+        .args(["-", "-", "-", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn paste");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"a\nb\nc\nd\n")
+        .unwrap();
+    let out = child.wait_with_output().expect("wait paste");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a\tb\tc\td\n");
+}

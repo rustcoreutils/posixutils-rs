@@ -236,3 +236,40 @@ fn uniq_over_skip_fields_null_key() {
     // Skipping more fields than exist also yields the null key.
     uniq_test(&["-f", "5"], "a apple\nb banana\n", "a apple\n");
 }
+
+// ---------------------------------------------------------------------------
+// Output formatting and operands
+// ---------------------------------------------------------------------------
+
+#[test]
+fn uniq_count_with_multi_digit_counts() {
+    let input = "dup\n".repeat(12);
+    uniq_test(&["-c"], &input, "12 dup\n");
+    // A single occurrence and a large run in the same stream keep the format.
+    let mut mixed = String::from("one\n");
+    mixed.push_str(&"many\n".repeat(105));
+    uniq_test(&["-c"], &mixed, "1 one\n105 many\n");
+}
+
+#[test]
+fn uniq_reads_a_named_input_file() {
+    let mut f = std::env::temp_dir();
+    f.push(format!("posixutils-uniq-{}", std::process::id()));
+    std::fs::write(&f, "a\na\nb\n").expect("write temp file");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_uniq"))
+        .arg(f.to_str().unwrap())
+        .output()
+        .expect("run uniq");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a\nb\n");
+    let _ = std::fs::remove_file(f);
+}
+
+#[test]
+fn uniq_empty_and_single_line_input() {
+    uniq_test(&[], "", "");
+    uniq_test(&[], "only\n", "only\n");
+    uniq_test(&["-c"], "only\n", "1 only\n");
+    // A single line with no trailing <newline>.
+    uniq_test(&[], "only", "only\n");
+}

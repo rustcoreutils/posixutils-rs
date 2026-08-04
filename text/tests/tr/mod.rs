@@ -807,3 +807,68 @@ fn tr_repeat_construct_rejected_in_string1() {
         expected_exit_code: 1,
     });
 }
+
+// ---------------------------------------------------------------------------
+// string2 character-class restrictions (POSIX 118121-118124)
+// ---------------------------------------------------------------------------
+
+fn tr_expect_error(args: &[&str], stdin: &str) -> String {
+    use std::io::Write;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_tr"))
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn tr");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().expect("wait tr");
+    assert_ne!(out.status.code(), Some(0), "expected a non-zero exit");
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+#[test]
+fn tr_rejects_a_non_case_class_in_string2() {
+    // "only character class names lower or upper are valid in string2".
+    // This silently translated to "ABC" instead.
+    let err = tr_expect_error(&["abc", "[:alpha:]"], "abc");
+    assert!(err.contains("[:alpha:]"), "got {err:?}");
+    for class in ["[:digit:]", "[:space:]", "[:punct:]"] {
+        tr_expect_error(&["abc", class], "abc");
+    }
+}
+
+#[test]
+fn tr_rejects_a_case_class_without_its_converse_in_string1() {
+    // "and then only if the corresponding character class (upper and lower,
+    // respectively) is specified in the same relative position in string1".
+    let err = tr_expect_error(&["abc", "[:upper:]"], "abc");
+    assert!(err.contains("[:lower:]"), "got {err:?}");
+    tr_expect_error(&["abc", "[:lower:]"], "abc");
+}
+
+#[test]
+fn tr_allows_the_paired_case_conversion_forms() {
+    tr_test(&["[:lower:]", "[:upper:]"], "aBc", "ABC");
+    tr_test(&["[:upper:]", "[:lower:]"], "aBc", "abc");
+}
+
+#[test]
+fn tr_allows_any_class_in_string2_with_both_d_and_s() {
+    // "When both the -d and -s options are specified, any of the character
+    // class names shall be accepted in string2."
+    tr_test(&["-d", "-s", "a", "[:alpha:]"], "abbc", "bc");
+}
+
+#[test]
+fn tr_empty_string1_and_string2() {
+    // Both empty: POSIX leaves this undefined; pin what we do rather than
+    // leaving it unspecified in the suite too.
+    let err = tr_expect_error(&["abc", ""], "abc");
+    assert!(err.contains("non-empty"), "got {err:?}");
+}

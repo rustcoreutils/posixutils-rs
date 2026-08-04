@@ -166,9 +166,11 @@ fn tr(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
 
-    // TODO
-    // How are these different?
+    // POSIX 118043/118045: `-c` complements the set of *values* (so a
+    // multi-byte character outside the set is replaced once per byte), `-C`
+    // the set of *characters* as defined by LC_CTYPE (replaced once).
     let complement = args.complement_char || args.complement_val;
+    let complement_chars = args.complement_char;
 
     let result = match (args.delete, args.squeeze_repeats) {
         (false, false) => {
@@ -188,6 +190,7 @@ fn tr(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
             let for_translation = setup::generate_for_translation(
                 complement,
+                complement_chars,
                 string1_operands,
                 string2_operands.as_slice(),
             )?;
@@ -211,7 +214,8 @@ fn tr(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         }
         (true, false) => {
             // "tr -d"
-            let for_removal = setup::generate_for_removal(complement, string1_operands, true)?;
+            let for_removal =
+                setup::generate_for_removal(complement, complement_chars, string1_operands, true)?;
 
             match for_removal {
                 ForRemoval::Complemented(complemented_removal) => {
@@ -242,13 +246,14 @@ fn tr(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
                     let for_translation = setup::generate_for_translation(
                         complement,
+                        complement_chars,
                         string1_operands,
                         string2_operands.as_slice(),
                     )?;
 
                     // Complement does not apply to string2
                     let squeeze_for_removal =
-                        setup::generate_for_removal(false, string2_operands, false)?;
+                        setup::generate_for_removal(false, false, string2_operands, false)?;
 
                     let ForRemoval::NotComplemented(squeeze) = squeeze_for_removal else {
                         unreachable!()
@@ -280,8 +285,12 @@ fn tr(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 None => {
-                    let for_removal =
-                        setup::generate_for_removal(complement, string1_operands, true)?;
+                    let for_removal = setup::generate_for_removal(
+                        complement,
+                        complement_chars,
+                        string1_operands,
+                        true,
+                    )?;
 
                     match for_removal {
                         ForRemoval::Complemented(bo) => {
@@ -319,10 +328,11 @@ fn tr(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
             // "The same string cannot be used for both the -d and the -s option; when both options are specified, both string1 (used for deletion) and string2 (used for squeezing) shall be required."
             let delete_for_removal =
-                setup::generate_for_removal(complement, string1_operands, true)?;
+                setup::generate_for_removal(complement, complement_chars, string1_operands, true)?;
 
             // Complement does not apply to squeeze, only delete, in this case
-            let squeeze_for_removal = setup::generate_for_removal(false, string2_operands, false)?;
+            let squeeze_for_removal =
+                setup::generate_for_removal(false, false, string2_operands, false)?;
 
             let ForRemoval::NotComplemented(squeeze) = squeeze_for_removal else {
                 unreachable!()
@@ -1314,6 +1324,19 @@ mod setup {
         out
     }
 
+    /// How many *additional* bytes the character starting at `lead` occupies,
+    /// for a `-C` complement miss: the whole character is replaced once, not
+    /// once per byte. `None` when the bytes are not a complete character, in
+    /// which case the byte-wise advance still applies.
+    fn char_wise_lookahead(lead: u8, next_bytes: &[u8]) -> Option<SearchNumberOfBytes> {
+        match decode_char(lead, next_bytes) {
+            Some((_, 1_usize)) => Some(SearchNumberOfBytes::One),
+            Some((_, 2_usize)) => Some(SearchNumberOfBytes::Two),
+            Some((_, 3_usize)) => Some(SearchNumberOfBytes::Three),
+            _ => None,
+        }
+    }
+
     /// Split out `[:lower:]`↔`[:upper:]` pairings that sit at the same relative
     /// position in the two operand lists (POSIX 118123-118130).
     ///
@@ -1360,6 +1383,7 @@ mod setup {
 
     pub fn generate_for_translation(
         complement: bool,
+        complement_chars: bool,
         string1_operands: Vec<Operand>,
         string2_operands: &[Operand],
     ) -> Result<ForTranslation, Box<dyn Error>> {
@@ -1517,6 +1541,7 @@ mod setup {
             }
 
             ForTranslation::Complemented(Box::new(ComplementedTranslation {
+                char_wise: complement_chars,
                 replacement,
                 seven_bit,
                 eight_bit,
@@ -1727,6 +1752,7 @@ mod setup {
 
     pub fn generate_for_removal(
         complement: bool,
+        complement_chars: bool,
         string1_or_string2_operands: Vec<Operand>,
         is_string1: bool,
     ) -> Result<ForRemoval, Box<dyn Error>> {
@@ -1781,7 +1807,10 @@ mod setup {
         };
 
         let for_removal = if complement {
-            ForRemoval::Complemented(Box::new(ComplementedRemoval { removal }))
+            ForRemoval::Complemented(Box::new(ComplementedRemoval {
+                removal,
+                char_wise: complement_chars,
+            }))
         } else {
             ForRemoval::NotComplemented(Box::new(NotComplementedRemoval { removal }))
         };
@@ -1992,7 +2021,59 @@ mod setup {
         }
     }
 
+    impl ComplementedTranslation {
+        /// Under `-C` a non-member character is consumed whole; under `-c` the
+        /// advance stays one byte, which is what makes `-c` replace each byte
+        /// of a multi-byte character separately.
+        #[inline]
+        fn miss_lookahead(
+            &self,
+            offset_lead: u8,
+            next_bytes: &[u8],
+        ) -> Option<SearchNumberOfBytes> {
+            if self.char_wise {
+                // `get_eight_bit_replacement` receives the lead byte already
+                // offset by 128 for table indexing.
+                char_wise_lookahead(offset_lead + 128_u8, next_bytes)
+            } else {
+                None
+            }
+        }
+    }
+
     impl Translation for ComplementedTranslation {
+        /// The complemented path decides "in the set" or "not in the set", and
+        /// the equivalence step is where a miss finally becomes a replacement.
+        /// Overridden so `-C` can consume the whole non-member character there:
+        /// the default `check` would rebuild the result and drop the lookahead.
+        #[inline]
+        fn check(&self, ue: u8, next_bytes: &[u8]) -> ReplacementCheckResult {
+            let first_check = if ue < 128_u8 {
+                self.get_seven_bit_replacement(ue)
+            } else {
+                self.get_eight_bit_replacement(ue - 128_u8, next_bytes)
+            };
+
+            if first_check.found_match {
+                return first_check;
+            }
+
+            let equiv_check = self.get_equiv_result(ue);
+            if equiv_check.found_match {
+                return equiv_check;
+            }
+
+            // Not in the set: substitute. Under `-C` the whole character goes.
+            ReplacementCheckResult {
+                match_lookahead_length: if self.char_wise {
+                    char_wise_lookahead(ue, next_bytes)
+                } else {
+                    None
+                },
+                ..equiv_check
+            }
+        }
+
         #[inline]
         fn get_seven_bit_replacement(&self, ue: u8) -> ReplacementCheckResult {
             let index = usize::from(ue);
@@ -2042,13 +2123,13 @@ mod setup {
 
                         ReplacementCheckResult {
                             replacement: Some(self.replacement),
-                            match_lookahead_length: None,
+                            match_lookahead_length: self.miss_lookahead(ue, next_bytes),
                             found_match: false,
                         }
                     }
                     None => ReplacementCheckResult {
                         replacement: Some(self.replacement),
-                        match_lookahead_length: None,
+                        match_lookahead_length: self.miss_lookahead(ue, next_bytes),
                         found_match: false,
                     },
                 }
@@ -2192,6 +2273,9 @@ mod setup {
     }
 
     pub struct ComplementedTranslation {
+        /// `-C`: complement over characters rather than byte values, so a
+        /// non-member multi-byte character is consumed and replaced whole.
+        pub char_wise: bool,
         pub replacement: FullChar,
         pub seven_bit: [bool; 128_usize],
         pub eight_bit: [bool; 128_usize],
@@ -2341,6 +2425,8 @@ mod setup {
 
     pub struct ComplementedRemoval {
         removal: RemovalShared,
+        /// See [`ComplementedTranslation::char_wise`].
+        char_wise: bool,
     }
 
     pub enum ForRemoval {
@@ -2365,6 +2451,14 @@ mod setup {
             let mut re = self.removal.check(ue, next_bytes);
 
             re.matched = !re.matched;
+
+            // A character *not* in the set is the one being acted on here, and
+            // the inner check reported no lookahead for it because it matched
+            // nothing. Under `-C` that whole character is the unit, so `tr -C`
+            // deletes or squeezes it once rather than byte by byte.
+            if self.char_wise && re.matched && re.match_lookahead_length.is_none() {
+                re.match_lookahead_length = char_wise_lookahead(ue, next_bytes);
+            }
 
             re
         }
@@ -2525,21 +2619,26 @@ mod transformation {
 
                 let removal_check_result = self.removal.check(byte_a, next_bytes);
 
-                if let Some(se) = removal_check_result.match_lookahead_length {
-                    *index += se as usize;
-                }
+                let extra_bytes = match removal_check_result.match_lookahead_length {
+                    Some(se) => se as usize,
+                    None => 0_usize,
+                };
 
-                *index += 1_usize;
+                *index += extra_bytes + 1_usize;
 
                 if removal_check_result.matched {
                     return;
                 }
 
-                // Not deleted
+                // Not deleted. The whole character must be written: the index
+                // advanced past its continuation bytes, so writing only the
+                // lead byte silently truncated every kept multi-byte character.
                 {
                     output_slice[0_usize] = byte_a;
+                    output_slice[1_usize..(1_usize + extra_bytes)]
+                        .copy_from_slice(&next_bytes[..extra_bytes]);
 
-                    *bytes_written += 1_usize;
+                    *bytes_written += 1_usize + extra_bytes;
                 }
             }
         }

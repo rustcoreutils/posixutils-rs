@@ -990,17 +990,63 @@ fn tr_ranges_use_code_point_order() {
 }
 
 #[test]
-fn tr_c_and_upper_c_behave_alike() {
-    // #1: -c complements by value and -C by character, which differ only for
-    // multi-byte characters. They are currently the same code path.
+fn tr_lowercase_c_complements_values_uppercase_c_complements_characters() {
+    // POSIX 118043: `-c` complements "the set of values"; 118045: `-C`
+    // complements "the set of characters ... as defined by LC_CTYPE". They were
+    // collapsed into one flag under a literal "How are these different?".
+    //
+    // With a multi-byte member, the unit is what differs: `-c` replaces each
+    // *byte* outside the set, `-C` each whole *character*.
     let Some(loc) = plib::testing::utf8_locale() else {
         return;
     };
-    let lower = tr_locale(&["-d", "-c", "a"], "a\u{e9}b\n".as_bytes(), &loc);
-    let upper = tr_locale(&["-d", "-C", "a"], "a\u{e9}b\n".as_bytes(), &loc);
+    let input = "\u{16C6}\u{16A0}\u{16CF}".as_bytes(); // ᛆᚠᛏ, three 3-byte characters
+
     assert_eq!(
-        lower, upper,
-        "known gap (#1): -c and -C are not distinguished"
+        tr_locale(&["-c", "\u{16CF}", "A"], input, &loc),
+        "AAAAAA\u{16CF}".as_bytes(),
+        "-c works on values: six bytes outside the set, six replacements"
     );
-    assert_eq!(lower, b"a");
+    assert_eq!(
+        tr_locale(&["-C", "\u{16CF}", "A"], input, &loc),
+        "AA\u{16CF}".as_bytes(),
+        "-C works on characters: two characters outside the set"
+    );
+}
+
+#[test]
+fn tr_upper_c_deletes_whole_characters() {
+    let Some(loc) = plib::testing::utf8_locale() else {
+        return;
+    };
+    // Keep only ᛏ. Both spellings keep it whole; the difference is the unit
+    // the *deletion* works on, which is not observable when everything else
+    // vanishes either way.
+    let input = "\u{16C6}\u{16CF}".as_bytes();
+    assert_eq!(
+        tr_locale(&["-d", "-C", "\u{16CF}"], input, &loc),
+        "\u{16CF}".as_bytes()
+    );
+    assert_eq!(
+        tr_locale(&["-d", "-c", "\u{16CF}"], input, &loc),
+        "\u{16CF}".as_bytes()
+    );
+}
+
+#[test]
+fn tr_delete_keeps_multibyte_characters_whole() {
+    // A kept multi-byte character used to be truncated to its lead byte: the
+    // index advanced past the continuation bytes but only one was written.
+    let Some(loc) = plib::testing::utf8_locale() else {
+        return;
+    };
+    assert_eq!(
+        tr_locale(&["-d", "x"], "a\u{16CF}b".as_bytes(), &loc),
+        "a\u{16CF}b".as_bytes(),
+        "a character matching nothing must survive intact"
+    );
+    assert_eq!(
+        tr_locale(&["-d", "\u{16C6}"], "\u{16C6}\u{16CF}".as_bytes(), &loc),
+        "\u{16CF}".as_bytes()
+    );
 }

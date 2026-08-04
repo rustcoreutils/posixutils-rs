@@ -75,6 +75,56 @@ Only one string may be given when deleting without squeezing repeats."
     }
 }
 
+/// Enforce POSIX's restriction on `[:class:]` in string2 (118121-118124).
+///
+/// > When both the -d and -s options are specified, any of the character class
+/// > names shall be accepted in string2. Otherwise, only character class names
+/// > lower or upper are valid in string2 and then only if the corresponding
+/// > character class (upper and lower, respectively) is specified in the same
+/// > relative position in string1.
+///
+/// The relative-position half needs to know which operand a class came from,
+/// which is why this runs on the parsed operands rather than re-lexing the raw
+/// argument as it used to.
+fn validate_string2_classes(
+    delete: bool,
+    squeeze: bool,
+    string1: &[parsing::Operand],
+    string2: &[parsing::Operand],
+) -> Result<(), String> {
+    use parsing::Operand;
+
+    // With both -d and -s, every class name is accepted.
+    if delete && squeeze {
+        return Ok(());
+    }
+
+    for (position, op) in string2.iter().enumerate() {
+        let Operand::Class(class) = op else {
+            continue;
+        };
+        let Some(converse) = class.case_converse() else {
+            return Err(format!(
+                "character class '[:{}:]' is not valid in string2",
+                class.as_str()
+            ));
+        };
+        let paired = matches!(
+            string1.get(position),
+            Some(Operand::Class(other)) if *other == converse
+        );
+        if !paired {
+            return Err(format!(
+                "'[:{}:]' is valid in string2 only when '[:{}:]' appears in the \
+                 same relative position in string1",
+                class.as_str(),
+                converse.as_str()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Translates or deletes characters from standard input, according to specified arguments.
 ///
 /// This function reads from standard input, processes the input string based on the specified arguments,
@@ -98,9 +148,20 @@ fn tr(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
 
-    // TODO
-    // How are these different?
+    if let Some(string2) = string2_operands.as_deref() {
+        validate_string2_classes(
+            args.delete,
+            args.squeeze_repeats,
+            &string1_operands,
+            string2,
+        )?;
+    }
+
+    // POSIX 118043/118045: `-c` complements the set of *values* (so a
+    // multi-byte character outside the set is replaced once per byte), `-C`
+    // the set of *characters* as defined by LC_CTYPE (replaced once).
     let complement = args.complement_char || args.complement_val;
+    let complement_chars = args.complement_char;
 
     let result = match (args.delete, args.squeeze_repeats) {
         (false, false) => {
@@ -120,6 +181,7 @@ fn tr(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
             let for_translation = setup::generate_for_translation(
                 complement,
+                complement_chars,
                 string1_operands,
                 string2_operands.as_slice(),
             )?;
@@ -143,7 +205,8 @@ fn tr(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         }
         (true, false) => {
             // "tr -d"
-            let for_removal = setup::generate_for_removal(complement, string1_operands, true)?;
+            let for_removal =
+                setup::generate_for_removal(complement, complement_chars, string1_operands, true)?;
 
             match for_removal {
                 ForRemoval::Complemented(complemented_removal) => {
@@ -174,13 +237,14 @@ fn tr(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
                     let for_translation = setup::generate_for_translation(
                         complement,
+                        complement_chars,
                         string1_operands,
                         string2_operands.as_slice(),
                     )?;
 
                     // Complement does not apply to string2
                     let squeeze_for_removal =
-                        setup::generate_for_removal(false, string2_operands, false)?;
+                        setup::generate_for_removal(false, false, string2_operands, false)?;
 
                     let ForRemoval::NotComplemented(squeeze) = squeeze_for_removal else {
                         unreachable!()
@@ -212,8 +276,12 @@ fn tr(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 None => {
-                    let for_removal =
-                        setup::generate_for_removal(complement, string1_operands, true)?;
+                    let for_removal = setup::generate_for_removal(
+                        complement,
+                        complement_chars,
+                        string1_operands,
+                        true,
+                    )?;
 
                     match for_removal {
                         ForRemoval::Complemented(bo) => {
@@ -251,10 +319,11 @@ fn tr(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
             // "The same string cannot be used for both the -d and the -s option; when both options are specified, both string1 (used for deletion) and string2 (used for squeezing) shall be required."
             let delete_for_removal =
-                setup::generate_for_removal(complement, string1_operands, true)?;
+                setup::generate_for_removal(complement, complement_chars, string1_operands, true)?;
 
             // Complement does not apply to squeeze, only delete, in this case
-            let squeeze_for_removal = setup::generate_for_removal(false, string2_operands, false)?;
+            let squeeze_for_removal =
+                setup::generate_for_removal(false, false, string2_operands, false)?;
 
             let ForRemoval::NotComplemented(squeeze) = squeeze_for_removal else {
                 unreachable!()
@@ -315,7 +384,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 mod parsing {
-    use std::iter::{self, Peekable};
+    use std::iter::Peekable;
     use std::str::Chars;
 
     use crate::setup::FullChar;
@@ -340,10 +409,112 @@ mod parsing {
         pub char: DataTypeWithData,
     }
 
+    /// One of POSIX's twelve character-class names (118116-118117).
+    ///
+    /// Kept symbolic through parsing: membership is a *predicate* over the
+    /// current `LC_CTYPE`, not a finite set of characters, and the
+    /// `[:lower:]`/`[:upper:]` pair carries the case-conversion meaning of
+    /// 118125-118130. Expanding a class to characters at parse time — as this
+    /// did — destroys both.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum ClassName {
+        Alnum,
+        Alpha,
+        Blank,
+        Cntrl,
+        Digit,
+        Graph,
+        Lower,
+        Print,
+        Punct,
+        Space,
+        Upper,
+        Xdigit,
+    }
+
+    impl ClassName {
+        pub fn parse(name: &str) -> Option<Self> {
+            Some(match name {
+                "alnum" => ClassName::Alnum,
+                "alpha" => ClassName::Alpha,
+                "blank" => ClassName::Blank,
+                "cntrl" => ClassName::Cntrl,
+                "digit" => ClassName::Digit,
+                "graph" => ClassName::Graph,
+                "lower" => ClassName::Lower,
+                "print" => ClassName::Print,
+                "punct" => ClassName::Punct,
+                "space" => ClassName::Space,
+                "upper" => ClassName::Upper,
+                "xdigit" => ClassName::Xdigit,
+                _ => return None,
+            })
+        }
+
+        pub fn as_str(self) -> &'static str {
+            match self {
+                ClassName::Alnum => "alnum",
+                ClassName::Alpha => "alpha",
+                ClassName::Blank => "blank",
+                ClassName::Cntrl => "cntrl",
+                ClassName::Digit => "digit",
+                ClassName::Graph => "graph",
+                ClassName::Lower => "lower",
+                ClassName::Print => "print",
+                ClassName::Punct => "punct",
+                ClassName::Space => "space",
+                ClassName::Upper => "upper",
+                ClassName::Xdigit => "xdigit",
+            }
+        }
+
+        /// The converse class for case conversion, if this is a case class.
+        pub fn case_converse(self) -> Option<Self> {
+            match self {
+                ClassName::Lower => Some(ClassName::Upper),
+                ClassName::Upper => Some(ClassName::Lower),
+                _ => None,
+            }
+        }
+
+        /// Membership under the current `LC_CTYPE`.
+        pub fn contains(self, c: char) -> bool {
+            match self {
+                ClassName::Alnum => plib::locale::isalnum(c),
+                ClassName::Alpha => plib::locale::isalpha(c),
+                ClassName::Blank => plib::locale::isblank(c),
+                ClassName::Cntrl => plib::locale::iscntrl(c),
+                ClassName::Digit => plib::locale::isdigit(c),
+                ClassName::Graph => plib::locale::isgraph(c),
+                ClassName::Lower => plib::locale::islower(c),
+                ClassName::Print => plib::locale::isprint(c),
+                ClassName::Punct => plib::locale::ispunct(c),
+                ClassName::Space => plib::locale::isspace(c),
+                ClassName::Upper => plib::locale::isupper(c),
+                ClassName::Xdigit => plib::locale::isxdigit(c),
+            }
+        }
+
+        /// The ASCII members of this class, in ascending code-point order.
+        ///
+        /// Used only where a class must be paired positionally with individual
+        /// characters of string2 — a case POSIX calls out as having undefined
+        /// order (118159-118162) and discourages. Set membership and case
+        /// conversion use [`ClassName::contains`] instead and never enumerate.
+        pub fn ascii_members(self) -> Vec<char> {
+            (0_u8..=127_u8)
+                .map(char::from)
+                .filter(|&c| self.contains(c))
+                .collect()
+        }
+    }
+
     #[derive(Clone)]
     pub enum Operand {
         Char(CharOperand),
         Equiv(EquivOperand),
+        /// A `[:class:]` kept symbolic; see [`ClassName`].
+        Class(ClassName),
     }
 
     // TODO
@@ -379,6 +550,17 @@ mod parsing {
             match self {
                 Self::IsMultiByte(ch) => FullChar::new_from_char(*ch),
                 Self::Is7Bit(ue) | Self::Is8Bit(ue) => FullChar::new_from_u8(*ue),
+            }
+        }
+
+        /// The character this represents, or `None` for a raw byte from a
+        /// `\ooo` escape, which is a byte value and not a character.
+        /// [`DataTypeWithData::convert_to_char`] panics on that case.
+        pub fn as_char(&self) -> Option<char> {
+            match self {
+                DataTypeWithData::Is7Bit(ue) => Some(char::from(*ue)),
+                DataTypeWithData::IsMultiByte(ch) => Some(*ch),
+                DataTypeWithData::Is8Bit(_) => None,
             }
         }
 
@@ -891,7 +1073,7 @@ mod parsing {
                                 range_inclusive
                                     .map(|ch| {
                                         Operand::Char(CharOperand {
-                                            char: categorize_char(ch),
+                                            char: crate::parsing::categorize_char(ch),
                                             char_repetition: CharRepetition::N(1_usize),
                                         })
                                     })
@@ -947,64 +1129,31 @@ mod parsing {
 
         assert!(into_iter.next() == Some(&'['));
         assert!(into_iter.next() == Some(&':'));
-
         assert!(into_iter.next_back() == Some(&']'));
         assert!(into_iter.next_back() == Some(&':'));
 
-        // TODO
-        // Performance
         let class = into_iter.collect::<String>();
 
-        let char_vec = match class.as_str() {
-            "alnum" => ('0'..='9')
-                .chain('A'..='Z')
-                .chain('a'..='z')
-                .collect::<Vec<_>>(),
-            "alpha" => ('A'..='Z').chain('a'..='z').collect::<Vec<_>>(),
-            "digit" => ('0'..='9').collect::<Vec<_>>(),
-            "lower" => ('a'..='z').collect::<Vec<_>>(),
-            "upper" => ('A'..='Z').collect::<Vec<_>>(),
-            "space" => vec![' ', '\t', '\n', '\r', '\x0b', '\x0c'],
-            "blank" => vec![' ', '\t'],
-            "cntrl" => (0_u8..=31_u8)
-                .chain(iter::once(127_u8))
-                .map(char::from)
-                .collect::<Vec<_>>(),
-            "graph" => (33_u8..=126_u8).map(char::from).collect::<Vec<_>>(),
-            "print" => (32_u8..=126_u8).map(char::from).collect::<Vec<_>>(),
-            "punct" => (33_u8..=47_u8)
-                .chain(58_u8..=64_u8)
-                .chain(91_u8..=96_u8)
-                .chain(123_u8..=126_u8)
-                .map(char::from)
-                .collect::<Vec<_>>(),
-            "xdigit" => ('0'..='9')
-                .chain('A'..='F')
-                .chain('a'..='f')
-                .collect::<Vec<_>>(),
-            "" => {
-                return Err("input '[::]' is invalid: missing character class name".to_string());
-            }
-            st => {
-                return Err(format!(
-                    "input '[:{st}:]' is invalid: invalid character class '{st}'"
-                ))
-            }
-        };
+        if class.is_empty() {
+            return Err("input '[::]' is invalid: missing character class name".to_string());
+        }
 
-        operand_vec.extend(char_vec.into_iter().map(|ch| {
-            Operand::Char(CharOperand {
-                char: categorize_char(ch),
-                char_repetition: CharRepetition::N(1_usize),
-            })
-        }));
+        // Emitted symbolically: membership follows LC_CTYPE, and the
+        // lower/upper pair carries the case-conversion meaning. Both are lost
+        // if the class is flattened to characters here.
+        let name = ClassName::parse(&class).ok_or_else(|| {
+            format!("input '[:{class}:]' is invalid: invalid character class '{class}'")
+        })?;
+        operand_vec.push(Operand::Class(name));
 
         Ok(())
     }
 }
 
 mod setup {
-    use crate::parsing::{CharOperand, CharRepetition, DataTypeWithData, EquivOperand, Operand};
+    use crate::parsing::{
+        CharOperand, CharRepetition, ClassName, DataTypeWithData, EquivOperand, Operand,
+    };
     use std::error::Error;
 
     fn add_normal_char(
@@ -1074,11 +1223,192 @@ mod setup {
 
     // TODO
     // This should be optimized
+    /// Set members that cannot be enumerated into the byte tables: character
+    /// classes, whose membership follows `LC_CTYPE`, and equivalence classes,
+    /// whose membership follows `LC_COLLATE`.
+    ///
+    /// The tables above stay the fast path — a set of plain characters never
+    /// touches this — and a character is decoded from the byte stream only when
+    /// this set is non-empty.
+    #[derive(Default)]
+    pub struct PredicateSet {
+        classes: Vec<ClassName>,
+        equivalences: Vec<EquivMatcher>,
+    }
+
+    /// One `[=c=]`, answered by libc.
+    ///
+    /// POSIX defines the equivalence class by `LC_COLLATE` (118137-118138), and
+    /// there is no portable call to enumerate one — but every POSIX regex
+    /// engine must implement `[[=c=]]` in a bracket expression, so ask it.
+    /// On glibc in a UTF-8 locale the class is a singleton, which is why this
+    /// changes no output here; on a platform or locale where it is not, this is
+    /// correct where a hardcoded "the class is the character itself" was not.
+    struct EquivMatcher {
+        regex: Option<plib::regex::Regex>,
+    }
+
+    impl EquivMatcher {
+        fn new(source: char) -> Self {
+            // A bracket expression is BRE/ERE-agnostic. If the character cannot
+            // be placed in one (it is the bracket syntax itself, say), fall
+            // back to no extra members: the literal is already in the tables.
+            let pattern = format!("[[={source}=]]");
+            EquivMatcher {
+                regex: plib::regex::Regex::new(&pattern, plib::regex::RegexFlags::bre()).ok(),
+            }
+        }
+
+        fn contains(&self, c: char) -> bool {
+            let mut buf = [0_u8; 4_usize];
+            match &self.regex {
+                Some(re) => re.is_match(c.encode_utf8(&mut buf)),
+                None => false,
+            }
+        }
+    }
+
+    impl PredicateSet {
+        pub fn is_empty(&self) -> bool {
+            self.classes.is_empty() && self.equivalences.is_empty()
+        }
+
+        pub fn push_class(&mut self, name: ClassName) {
+            self.classes.push(name);
+        }
+
+        pub fn push_equivalence(&mut self, source: char) {
+            self.equivalences.push(EquivMatcher::new(source));
+        }
+
+        pub fn contains(&self, c: char) -> bool {
+            self.classes.iter().any(|cl| cl.contains(c))
+                || self.equivalences.iter().any(|eq| eq.contains(c))
+        }
+    }
+
+    /// Decode the character beginning at `lead`, returning it with the number of
+    /// *additional* bytes it consumed. `None` when the bytes are not a complete
+    /// valid character, in which case the caller keeps its byte-wise behavior.
+    pub fn decode_char(lead: u8, next_bytes: &[u8]) -> Option<(char, usize)> {
+        if lead < 128_u8 {
+            return Some((char::from(lead), 0_usize));
+        }
+        let width = match lead {
+            0xC2..=0xDF => 2_usize,
+            0xE0..=0xEF => 3_usize,
+            0xF0..=0xF4 => 4_usize,
+            _ => return None,
+        };
+        let extra = width - 1_usize;
+        let tail = next_bytes.get(..extra)?;
+        let mut buf = [0_u8; 4_usize];
+        buf[0] = lead;
+        buf[1..width].copy_from_slice(tail);
+        let st = std::str::from_utf8(&buf[..width]).ok()?;
+        st.chars().next().map(|c| (c, extra))
+    }
+
+    /// Flatten symbolic `[:class:]` operands into their ASCII members.
+    ///
+    /// A transitional shim: it reproduces exactly what parsing used to do, so
+    /// the set builders below are unchanged while provenance becomes available
+    /// upstream. Later phases consume `Operand::Class` directly — as a
+    /// predicate for membership, and as the case-conversion signal — and this
+    /// is applied only on the paths that still need concrete characters.
+    fn flatten_classes(operands: Vec<Operand>) -> Vec<Operand> {
+        let mut out = Vec::with_capacity(operands.len());
+        for op in operands {
+            match op {
+                Operand::Class(name) => out.extend(name.ascii_members().into_iter().map(|ch| {
+                    Operand::Char(CharOperand {
+                        char: crate::parsing::categorize_char(ch),
+                        char_repetition: CharRepetition::N(1_usize),
+                    })
+                })),
+                other => out.push(other),
+            }
+        }
+        out
+    }
+
+    /// How many *additional* bytes the character starting at `lead` occupies,
+    /// for a `-C` complement miss: the whole character is replaced once, not
+    /// once per byte. `None` when the bytes are not a complete character, in
+    /// which case the byte-wise advance still applies.
+    fn char_wise_lookahead(lead: u8, next_bytes: &[u8]) -> Option<SearchNumberOfBytes> {
+        match decode_char(lead, next_bytes) {
+            Some((_, 1_usize)) => Some(SearchNumberOfBytes::One),
+            Some((_, 2_usize)) => Some(SearchNumberOfBytes::Two),
+            Some((_, 3_usize)) => Some(SearchNumberOfBytes::Three),
+            _ => None,
+        }
+    }
+
+    /// Split out `[:lower:]`↔`[:upper:]` pairings that sit at the same relative
+    /// position in the two operand lists (POSIX 118123-118130).
+    ///
+    /// Only attempted when the lists align one operand to one operand: a class
+    /// paired against individual characters has to be enumerated instead, which
+    /// is the case POSIX calls out as having undefined order (118159-118162).
+    /// Returns the folds plus the two lists with those operands removed, so the
+    /// remaining positional pairing is unaffected.
+    fn extract_case_folds(
+        string1: &[Operand],
+        string2: &[Operand],
+    ) -> Option<(Vec<CaseFold>, Vec<Operand>, Vec<Operand>)> {
+        if string1.len() != string2.len() {
+            return None;
+        }
+        let pairs: Vec<Option<CaseFold>> = string1
+            .iter()
+            .zip(string2.iter())
+            .map(|(a, b)| match (a, b) {
+                (Operand::Class(from), Operand::Class(to)) if from.case_converse() == Some(*to) => {
+                    Some(CaseFold {
+                        from: *from,
+                        to_upper: *to == ClassName::Upper,
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+
+        if pairs.iter().all(Option::is_none) {
+            return None;
+        }
+
+        let folds = pairs.iter().flatten().copied().collect::<Vec<_>>();
+        let keep = |ops: &[Operand]| -> Vec<Operand> {
+            ops.iter()
+                .zip(pairs.iter())
+                .filter(|(_, fold)| fold.is_none())
+                .map(|(op, _)| op.clone())
+                .collect()
+        };
+        Some((folds, keep(string1), keep(string2)))
+    }
+
     pub fn generate_for_translation(
         complement: bool,
+        complement_chars: bool,
         string1_operands: Vec<Operand>,
         string2_operands: &[Operand],
     ) -> Result<ForTranslation, Box<dyn Error>> {
+        // Case conversion is a function over the locale's toupper/tolower
+        // mapping, not a pairing of two enumerated arrays.
+        let (case_folds, string1_operands, string2_owned) = match (!complement)
+            .then(|| extract_case_folds(&string1_operands, string2_operands))
+            .flatten()
+        {
+            Some((folds, s1, s2)) => (folds, s1, s2),
+            None => (Vec::new(), string1_operands, string2_operands.to_vec()),
+        };
+
+        let string1_operands = flatten_classes(string1_operands);
+        let string2_flattened_classes = flatten_classes(string2_owned);
+        let string2_operands = string2_flattened_classes.as_slice();
+
         let mut char_repeating_total = 0_usize;
 
         let mut string1_operands_flattened = Vec::<Operand>::new();
@@ -1113,6 +1443,8 @@ mod setup {
                     // Take up one position?
                     string1_operands_flattened.push(op);
                 }
+                // `flatten_classes` above replaced every class with its members.
+                Operand::Class(_) => unreachable!("classes are flattened on entry"),
             }
         }
 
@@ -1151,6 +1483,8 @@ mod setup {
                         "[=c=] expressions may not appear in string2 when translating".to_owned(),
                     ));
                 }
+                // `flatten_classes` replaced every class before this point.
+                Operand::Class(_) => unreachable!("classes are flattened on entry"),
             }
         }
 
@@ -1208,11 +1542,14 @@ mod setup {
                             // Fix for `tr_equivalence_class_low_priority`
                             add_normal_char(char, &mut seven_bit, &mut eight_bit, &mut multi_byte);
                         }
+                        // `flatten_classes` replaced every class before this point.
+                        Operand::Class(_) => unreachable!("classes are flattened on entry"),
                     }
                 }
             }
 
             ForTranslation::Complemented(Box::new(ComplementedTranslation {
+                char_wise: complement_chars,
                 replacement,
                 seven_bit,
                 eight_bit,
@@ -1247,6 +1584,8 @@ mod setup {
                             Operand::Equiv(_) => {
                                 unreachable!();
                             }
+                            // `flatten_classes` replaced every class before this point.
+                            Operand::Class(_) => unreachable!("classes are flattened on entry"),
                         }
                     }
                     None => {
@@ -1302,6 +1641,8 @@ mod setup {
                     Operand::Equiv(_) => {
                         unreachable!();
                     }
+                    // `flatten_classes` replaced every class before this point.
+                    Operand::Class(_) => unreachable!("classes are flattened on entry"),
                 }
             }
 
@@ -1394,12 +1735,14 @@ mod setup {
                         add_normal_char_with_replacement(char, replacement);
                     }
                     Operand::Equiv(EquivOperand { char }) => {
-                        equiv.push((char.clone(), replacement.clone()));
+                        equiv.push((char.clone(), replacement));
 
                         // TODO
                         // Fix for `tr_equivalence_class_low_priority`
                         add_normal_char_with_replacement(char, replacement);
                     }
+                    // `flatten_classes` replaced every class before this point.
+                    Operand::Class(_) => unreachable!("classes are flattened on entry"),
                 }
             }
 
@@ -1408,6 +1751,7 @@ mod setup {
                 eight_bit,
                 multi_byte,
                 equiv,
+                case_folds,
             }))
         };
 
@@ -1416,9 +1760,11 @@ mod setup {
 
     pub fn generate_for_removal(
         complement: bool,
+        complement_chars: bool,
         string1_or_string2_operands: Vec<Operand>,
         is_string1: bool,
     ) -> Result<ForRemoval, Box<dyn Error>> {
+        let mut predicates = PredicateSet::default();
         let mut equiv = Vec::<DataTypeWithData>::new();
 
         let mut seven_bit = [false; 128_usize];
@@ -1447,8 +1793,16 @@ mod setup {
                     }
                 },
                 Operand::Equiv(EquivOperand { char }) => {
+                    // The literal stays in the fast exact-match list; the
+                    // predicate covers any further members LC_COLLATE defines.
+                    if let Some(c) = char.as_char() {
+                        predicates.push_equivalence(c);
+                    }
                     equiv.push(char);
                 }
+                // Membership follows LC_CTYPE, so the class stays a predicate
+                // instead of being flattened into the byte tables.
+                Operand::Class(name) => predicates.push_class(name),
             }
         }
 
@@ -1457,10 +1811,14 @@ mod setup {
             equiv,
             multi_byte,
             seven_bit,
+            predicates,
         };
 
         let for_removal = if complement {
-            ForRemoval::Complemented(Box::new(ComplementedRemoval { removal }))
+            ForRemoval::Complemented(Box::new(ComplementedRemoval {
+                removal,
+                char_wise: complement_chars,
+            }))
         } else {
             ForRemoval::NotComplemented(Box::new(NotComplementedRemoval { removal }))
         };
@@ -1477,7 +1835,7 @@ mod setup {
         Four = 4_u8,
     }
 
-    #[derive(Clone)]
+    #[derive(Clone, Copy)]
     pub struct FullChar {
         // TODO
         // Determine how many bytes to write by the payload?
@@ -1520,6 +1878,13 @@ mod setup {
             let st = char.encode_utf8(&mut encoding_buffer);
 
             match *st.as_bytes() {
+                // A one-byte (ASCII) character was unhandled and fell into the
+                // `unreachable!()` below; case conversion is the first caller
+                // to pass one.
+                [a] => FullChar {
+                    number_of_bytes: FullCharNumberOfBytes::One,
+                    payload: [a, 0_u8, 0_u8, 0_u8],
+                },
                 [a, b] => FullChar {
                     number_of_bytes: FullCharNumberOfBytes::Two,
                     payload: [a, b, 0_u8, 0_u8],
@@ -1568,18 +1933,22 @@ mod setup {
         Complemented(Box<ComplementedTranslation>),
     }
 
-    pub struct ReplacementCheckResult<'a> {
-        pub replacement: Option<&'a FullChar>,
+    pub struct ReplacementCheckResult {
+        pub replacement: Option<FullChar>,
         pub match_lookahead_length: Option<SearchNumberOfBytes>,
         pub found_match: bool,
     }
 
     impl Translation for NotComplementedTranslation {
+        fn case_folds(&self) -> &[CaseFold] {
+            &self.case_folds
+        }
+
         #[inline]
-        fn get_seven_bit_replacement(&self, ue: u8) -> ReplacementCheckResult<'_> {
+        fn get_seven_bit_replacement(&self, ue: u8) -> ReplacementCheckResult {
             let index = usize::from(ue);
 
-            let replacement = self.seven_bit[index].as_ref();
+            let replacement = self.seven_bit[index];
 
             ReplacementCheckResult {
                 replacement,
@@ -1589,14 +1958,10 @@ mod setup {
         }
 
         #[inline]
-        fn get_eight_bit_replacement<'a>(
-            &'a self,
-            ue: u8,
-            next_bytes: &[u8],
-        ) -> ReplacementCheckResult<'a> {
+        fn get_eight_bit_replacement(&self, ue: u8, next_bytes: &[u8]) -> ReplacementCheckResult {
             let index = usize::from(ue);
 
-            if let Some(fu) = self.eight_bit[index].as_ref() {
+            if let Some(fu) = self.eight_bit[index] {
                 ReplacementCheckResult {
                     replacement: Some(fu),
                     match_lookahead_length: None,
@@ -1615,7 +1980,7 @@ mod setup {
 
                             if test {
                                 return ReplacementCheckResult {
-                                    replacement: Some(&se.replacement),
+                                    replacement: Some(se.replacement),
                                     match_lookahead_length: Some(number_of_bytes),
                                     found_match: true,
                                 };
@@ -1638,13 +2003,13 @@ mod setup {
         }
 
         #[inline]
-        fn get_equiv_result(&self, ue: u8) -> ReplacementCheckResult<'_> {
+        fn get_equiv_result(&self, ue: u8) -> ReplacementCheckResult {
             for (da, fu) in &self.equiv {
                 match da {
                     DataTypeWithData::Is7Bit(uei) | DataTypeWithData::Is8Bit(uei) => {
                         if ue == *uei {
                             return ReplacementCheckResult {
-                                replacement: Some(fu),
+                                replacement: Some(*fu),
                                 match_lookahead_length: None,
                                 found_match: true,
                             };
@@ -1664,9 +2029,61 @@ mod setup {
         }
     }
 
-    impl Translation for ComplementedTranslation {
+    impl ComplementedTranslation {
+        /// Under `-C` a non-member character is consumed whole; under `-c` the
+        /// advance stays one byte, which is what makes `-c` replace each byte
+        /// of a multi-byte character separately.
         #[inline]
-        fn get_seven_bit_replacement(&self, ue: u8) -> ReplacementCheckResult<'_> {
+        fn miss_lookahead(
+            &self,
+            offset_lead: u8,
+            next_bytes: &[u8],
+        ) -> Option<SearchNumberOfBytes> {
+            if self.char_wise {
+                // `get_eight_bit_replacement` receives the lead byte already
+                // offset by 128 for table indexing.
+                char_wise_lookahead(offset_lead + 128_u8, next_bytes)
+            } else {
+                None
+            }
+        }
+    }
+
+    impl Translation for ComplementedTranslation {
+        /// The complemented path decides "in the set" or "not in the set", and
+        /// the equivalence step is where a miss finally becomes a replacement.
+        /// Overridden so `-C` can consume the whole non-member character there:
+        /// the default `check` would rebuild the result and drop the lookahead.
+        #[inline]
+        fn check(&self, ue: u8, next_bytes: &[u8]) -> ReplacementCheckResult {
+            let first_check = if ue < 128_u8 {
+                self.get_seven_bit_replacement(ue)
+            } else {
+                self.get_eight_bit_replacement(ue - 128_u8, next_bytes)
+            };
+
+            if first_check.found_match {
+                return first_check;
+            }
+
+            let equiv_check = self.get_equiv_result(ue);
+            if equiv_check.found_match {
+                return equiv_check;
+            }
+
+            // Not in the set: substitute. Under `-C` the whole character goes.
+            ReplacementCheckResult {
+                match_lookahead_length: if self.char_wise {
+                    char_wise_lookahead(ue, next_bytes)
+                } else {
+                    None
+                },
+                ..equiv_check
+            }
+        }
+
+        #[inline]
+        fn get_seven_bit_replacement(&self, ue: u8) -> ReplacementCheckResult {
             let index = usize::from(ue);
 
             let value_is_true = self.seven_bit[index];
@@ -1675,7 +2092,7 @@ mod setup {
                 replacement: if value_is_true {
                     None
                 } else {
-                    Some(&self.replacement)
+                    Some(self.replacement)
                 },
                 match_lookahead_length: None,
                 found_match: value_is_true,
@@ -1683,11 +2100,7 @@ mod setup {
         }
 
         #[inline]
-        fn get_eight_bit_replacement(
-            &self,
-            ue: u8,
-            next_bytes: &[u8],
-        ) -> ReplacementCheckResult<'_> {
+        fn get_eight_bit_replacement(&self, ue: u8, next_bytes: &[u8]) -> ReplacementCheckResult {
             let index = usize::from(ue);
 
             if self.eight_bit[index] {
@@ -1717,14 +2130,14 @@ mod setup {
                         }
 
                         ReplacementCheckResult {
-                            replacement: Some(&self.replacement),
-                            match_lookahead_length: None,
+                            replacement: Some(self.replacement),
+                            match_lookahead_length: self.miss_lookahead(ue, next_bytes),
                             found_match: false,
                         }
                     }
                     None => ReplacementCheckResult {
-                        replacement: Some(&self.replacement),
-                        match_lookahead_length: None,
+                        replacement: Some(self.replacement),
+                        match_lookahead_length: self.miss_lookahead(ue, next_bytes),
                         found_match: false,
                     },
                 }
@@ -1732,7 +2145,7 @@ mod setup {
         }
 
         #[inline]
-        fn get_equiv_result(&self, ue: u8) -> ReplacementCheckResult<'_> {
+        fn get_equiv_result(&self, ue: u8) -> ReplacementCheckResult {
             for da in &self.equiv {
                 match da {
                     DataTypeWithData::Is7Bit(uei) | DataTypeWithData::Is8Bit(uei) => {
@@ -1751,7 +2164,7 @@ mod setup {
             }
 
             ReplacementCheckResult {
-                replacement: Some(&self.replacement),
+                replacement: Some(self.replacement),
                 match_lookahead_length: None,
                 found_match: false,
             }
@@ -1760,7 +2173,7 @@ mod setup {
 
     pub trait Translation {
         #[inline]
-        fn check(&self, ue: u8, next_bytes: &[u8]) -> ReplacementCheckResult<'_> {
+        fn check(&self, ue: u8, next_bytes: &[u8]) -> ReplacementCheckResult {
             let first_check = if ue < 128_u8 {
                 self.get_seven_bit_replacement(ue)
             } else {
@@ -1771,18 +2184,91 @@ mod setup {
                 return first_check;
             }
 
+            // Case folds go ahead of the equivalence step, but the equivalence
+            // step stays the final fall-through: on the complemented path it
+            // returns the replacement with `found_match: false`, meaning "not in
+            // the set, so substitute" — a result, not the absence of one.
+            if !self.case_folds().is_empty() {
+                let fold_check = self.get_case_fold_result(ue, next_bytes);
+                if fold_check.found_match {
+                    return fold_check;
+                }
+            }
+
             self.get_equiv_result(ue)
         }
 
-        fn get_seven_bit_replacement(&self, ue: u8) -> ReplacementCheckResult<'_>;
+        /// Case conversion, applied per character rather than from a table.
+        /// The default has no folds, so implementations without them pay only a
+        /// slice check.
+        fn get_case_fold_result(&self, ue: u8, next_bytes: &[u8]) -> ReplacementCheckResult {
+            let folds = self.case_folds();
+            if !folds.is_empty() {
+                if let Some((c, extra)) = decode_char(ue, next_bytes) {
+                    for fold in folds {
+                        if let Some(replacement) = fold.apply(c) {
+                            let lookahead = match extra {
+                                1_usize => Some(SearchNumberOfBytes::One),
+                                2_usize => Some(SearchNumberOfBytes::Two),
+                                3_usize => Some(SearchNumberOfBytes::Three),
+                                _ => None,
+                            };
+                            return ReplacementCheckResult {
+                                replacement: Some(replacement),
+                                match_lookahead_length: lookahead,
+                                found_match: true,
+                            };
+                        }
+                    }
+                }
+            }
+            ReplacementCheckResult {
+                replacement: None,
+                match_lookahead_length: None,
+                found_match: false,
+            }
+        }
 
-        fn get_eight_bit_replacement<'a>(
-            &'a self,
-            ue: u8,
-            next_bytes: &[u8],
-        ) -> ReplacementCheckResult<'a>;
+        fn case_folds(&self) -> &[CaseFold] {
+            &[]
+        }
 
-        fn get_equiv_result(&self, ue: u8) -> ReplacementCheckResult<'_>;
+        fn get_seven_bit_replacement(&self, ue: u8) -> ReplacementCheckResult;
+
+        fn get_eight_bit_replacement(&self, ue: u8, next_bytes: &[u8]) -> ReplacementCheckResult;
+
+        fn get_equiv_result(&self, ue: u8) -> ReplacementCheckResult;
+    }
+
+    /// A `[:lower:]`↔`[:upper:]` pairing, applied as a *function* rather than a
+    /// table.
+    ///
+    /// POSIX 118125-118130: when `[:lower:]` appears in string1 and
+    /// `[:upper:]` in string2, "the arrays shall contain the characters from
+    /// the toupper mapping in the LC_CTYPE category of the current locale".
+    /// Materializing those arrays and pairing them by index — which is how case
+    /// conversion used to happen, entirely by accident of both ASCII classes
+    /// having 26 members in the same order — cannot work once the classes
+    /// follow the locale: they differ in length and in order, and the
+    /// "string2 is shorter" rule would silently pad with the last character.
+    #[derive(Clone, Copy)]
+    pub struct CaseFold {
+        pub from: ClassName,
+        pub to_upper: bool,
+    }
+
+    impl CaseFold {
+        fn apply(&self, c: char) -> Option<FullChar> {
+            if !self.from.contains(c) {
+                return None;
+            }
+            let mapped = if self.to_upper {
+                plib::locale::to_upper(c)
+            } else {
+                plib::locale::to_lower(c)
+            };
+            Some(FullChar::new_from_char(mapped))
+        }
     }
 
     pub struct NotComplementedTranslation {
@@ -1790,9 +2276,14 @@ mod setup {
         pub eight_bit: [Option<FullChar>; 256_usize],
         pub multi_byte: [Option<Vec<SearchAndReplace>>; 256_usize],
         pub equiv: Vec<(DataTypeWithData, FullChar)>,
+        /// Case-conversion pairings, consulted after the tables miss.
+        pub case_folds: Vec<CaseFold>,
     }
 
     pub struct ComplementedTranslation {
+        /// `-C`: complement over characters rather than byte values, so a
+        /// non-member multi-byte character is consumed and replaced whole.
+        pub char_wise: bool,
         pub replacement: FullChar,
         pub seven_bit: [bool; 128_usize],
         pub eight_bit: [bool; 128_usize],
@@ -1810,6 +2301,8 @@ mod setup {
         eight_bit: [bool; 128_usize],
         multi_byte: [Option<Vec<Search>>; 128_usize],
         equiv: Vec<DataTypeWithData>,
+        /// Members that are predicates rather than enumerable characters.
+        predicates: PredicateSet,
     }
 
     pub struct RemovalCheckResult {
@@ -1844,6 +2337,26 @@ mod setup {
                     }
                     DataTypeWithData::IsMultiByte(_) => {
                         unreachable!();
+                    }
+                }
+            }
+
+            // Only now decode a character: a set of plain characters has an
+            // empty predicate set and never reaches this.
+            if !self.predicates.is_empty() {
+                if let Some((c, extra)) = decode_char(ue, next_bytes) {
+                    if self.predicates.contains(c) {
+                        let lookahead = match extra {
+                            1_usize => Some(SearchNumberOfBytes::One),
+                            2_usize => Some(SearchNumberOfBytes::Two),
+                            3_usize => Some(SearchNumberOfBytes::Three),
+                            _ => None,
+                        };
+                        return RemovalCheckResult {
+                            matched: true,
+                            match_lookahead_length: lookahead,
+                            found_match: true,
+                        };
                     }
                 }
             }
@@ -1920,6 +2433,8 @@ mod setup {
 
     pub struct ComplementedRemoval {
         removal: RemovalShared,
+        /// See [`ComplementedTranslation::char_wise`].
+        char_wise: bool,
     }
 
     pub enum ForRemoval {
@@ -1944,6 +2459,14 @@ mod setup {
             let mut re = self.removal.check(ue, next_bytes);
 
             re.matched = !re.matched;
+
+            // A character *not* in the set is the one being acted on here, and
+            // the inner check reported no lookahead for it because it matched
+            // nothing. Under `-C` that whole character is the unit, so `tr -C`
+            // deletes or squeezes it once rather than byte by byte.
+            if self.char_wise && re.matched && re.match_lookahead_length.is_none() {
+                re.match_lookahead_length = char_wise_lookahead(ue, next_bytes);
+            }
 
             re
         }
@@ -2104,21 +2627,26 @@ mod transformation {
 
                 let removal_check_result = self.removal.check(byte_a, next_bytes);
 
-                if let Some(se) = removal_check_result.match_lookahead_length {
-                    *index += se as usize;
-                }
+                let extra_bytes = match removal_check_result.match_lookahead_length {
+                    Some(se) => se as usize,
+                    None => 0_usize,
+                };
 
-                *index += 1_usize;
+                *index += extra_bytes + 1_usize;
 
                 if removal_check_result.matched {
                     return;
                 }
 
-                // Not deleted
+                // Not deleted. The whole character must be written: the index
+                // advanced past its continuation bytes, so writing only the
+                // lead byte silently truncated every kept multi-byte character.
                 {
                     output_slice[0_usize] = byte_a;
+                    output_slice[1_usize..(1_usize + extra_bytes)]
+                        .copy_from_slice(&next_bytes[..extra_bytes]);
 
-                    *bytes_written += 1_usize;
+                    *bytes_written += 1_usize + extra_bytes;
                 }
             }
         }
@@ -2361,7 +2889,6 @@ mod transformation {
                 let replacement_check_result = self.translation.check(byte_a, next_bytes);
 
                 let fu_payload: [u8; 4];
-                let full_char_from_byte: FullChar;
 
                 let (byte_a_to_use, next_bytes_to_use, full_char_to_write) =
                     match replacement_check_result.replacement {
@@ -2374,11 +2901,7 @@ mod transformation {
 
                             (fu_byte_a, fu_rest, fu)
                         }
-                        None => {
-                            full_char_from_byte = FullChar::new_from_u8(byte_a);
-
-                            (byte_a, next_bytes, &full_char_from_byte)
-                        }
+                        None => (byte_a, next_bytes, FullChar::new_from_u8(byte_a)),
                     };
 
                 // TODO

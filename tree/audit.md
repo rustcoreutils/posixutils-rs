@@ -172,7 +172,7 @@ conform.
 |---|---|---|
 | `LANG` / `LC_ALL` / `LC_MESSAGES` | PARTIAL | catalog selection via `setlocale`/`textdomain`; but affirmative-response `yesexpr` is hardcoded `y` (#C8). |
 | `LC_COLLATE` / `LC_CTYPE` | MISSING | only relevant to the unimplemented `yesexpr` ERE; no other use. |
-| `NLSPATH` (XSI) | N/A | gettext domain bound via `textdomain`, not `NLSPATH`. |
+| `NLSPATH` (XSI) | CONFORMS | `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 
 #### ASYNCHRONOUS EVENTS / STDOUT / STDERR
 - [x] Default signal handling (90763-90764); cp is non-interactive apart from `-i`/`-f` prompts. `grep -nE 'SIGINT|signal|libc::signal' tree/cp.rs tree/common/copy.rs` → 0 matches (expected). Note CONSEQUENCES OF ERRORS 90781-90783 already warns partial copies are possible on signal.

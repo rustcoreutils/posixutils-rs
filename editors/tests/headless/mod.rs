@@ -893,3 +893,120 @@ fn test_insert_honors_configured_erase_and_kill_chars() {
     }
     assert_eq!(buffer.line(1).unwrap().content(), "a#b");
 }
+
+// ============================================================================
+// Undo of operators (#V19 and the defects found with it)
+// ============================================================================
+
+/// #V19. A change operator recorded no undo for the text it removed, so `u`
+/// popped an unrelated older change and `apply_inverse` deleted characters that
+/// were never inserted -- emptying the line.
+///
+/// POSIX (ex `undo`, 95443) treats a change plus its insert session as a single
+/// command, so *one* `u` restores the original. The audit entry said "a second
+/// `u`"; that expectation was itself wrong.
+#[test]
+fn test_undo_after_change_operator_restores_the_original_text() {
+    let mut editor = Editor::new_headless();
+    editor.execute_keys("iabcdef\x1b0").unwrap();
+    assert_eq!(editor.get_buffer_text().trim_end(), "abcdef");
+
+    editor.execute_keys("clX\x1b").unwrap();
+    assert_eq!(editor.get_buffer_text().trim_end(), "Xbcdef");
+
+    editor.execute_keys("u").unwrap();
+    assert_eq!(
+        editor.get_buffer_text().trim_end(),
+        "abcdef",
+        "one `u` must reverse the whole change command"
+    );
+}
+
+/// POSIX: `u` reverses "the last command that modified the contents of the edit
+/// buffer, **including undo**" (95442), so it is its own inverse.
+#[test]
+fn test_undo_is_its_own_inverse() {
+    let mut editor = Editor::new_headless();
+    editor.execute_keys("iabcdef\x1b0").unwrap();
+    editor.execute_keys("clX\x1b").unwrap();
+
+    editor.execute_keys("u").unwrap();
+    assert_eq!(editor.get_buffer_text().trim_end(), "abcdef");
+    editor.execute_keys("u").unwrap();
+    assert_eq!(
+        editor.get_buffer_text().trim_end(),
+        "Xbcdef",
+        "a second `u` must reverse the first"
+    );
+    editor.execute_keys("u").unwrap();
+    assert_eq!(editor.get_buffer_text().trim_end(), "abcdef");
+}
+
+/// `d`/`dd` recorded no undo either, though the audit ticked them CONFORM.
+#[test]
+fn test_undo_after_delete_restores_the_text() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("alpha\nbeta\ngamma");
+
+    editor.execute_keys("dd").unwrap();
+    assert!(!editor.get_buffer_text().contains("alpha"));
+    editor.execute_keys("u").unwrap();
+    assert!(
+        editor.get_buffer_text().contains("alpha"),
+        "dd must be undoable, got {:?}",
+        editor.get_buffer_text()
+    );
+
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("hello world");
+    editor.execute_keys("dw").unwrap();
+    let after = editor.get_buffer_text();
+    assert_ne!(after.trim_end(), "hello world");
+    editor.execute_keys("u").unwrap();
+    assert_eq!(editor.get_buffer_text().trim_end(), "hello world");
+}
+
+/// `C` (change to end of line) took the pre-parser fast path and recorded
+/// nothing at all.
+#[test]
+fn test_undo_after_change_to_end_of_line() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("keep this tail");
+    editor.execute_keys("0").unwrap();
+    editor.execute_keys("wCgone\x1b").unwrap();
+    assert!(editor.get_buffer_text().contains("gone"));
+
+    editor.execute_keys("u").unwrap();
+    assert_eq!(editor.get_buffer_text().trim_end(), "keep this tail");
+}
+
+/// `J` recorded nothing, and `ChangeKind::Join` is inert in both `apply_change`
+/// and `apply_inverse`, so a join could not have been undone even if recorded
+/// that way.
+#[test]
+fn test_undo_after_join_restores_the_lines() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("first\nsecond");
+
+    editor.execute_keys("J").unwrap();
+    let joined = editor.get_buffer_text();
+    assert_eq!(joined.lines().count(), 1, "J should join, got {joined:?}");
+
+    editor.execute_keys("u").unwrap();
+    let restored = editor.get_buffer_text();
+    assert_eq!(restored.lines().count(), 2, "got {restored:?}");
+    assert!(restored.contains("first") && restored.contains("second"));
+}
+
+/// An insert session that types nothing must not leave an undo entry for `u` to
+/// consume silently.
+#[test]
+fn test_empty_insert_session_leaves_no_undo_entry() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("unchanged");
+    editor.execute_keys("i\x1b").unwrap();
+    // Nothing was typed, so there is nothing to undo; `u` must not damage the
+    // buffer whether it reports an error or does nothing.
+    let _ = editor.execute_keys("u");
+    assert_eq!(editor.get_buffer_text().trim_end(), "unchanged");
+}

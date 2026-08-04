@@ -16,6 +16,50 @@ Utilities (by source size): `asa`, `comm`, `csplit`, `cut`, `diff` (+`diff_util/
 
 ---
 
+## Test-coverage closeout (2026-08-04)
+
+The 120 open rows under the per-utility "Test coverage signal" headings are
+closed. **39 were already satisfied and had never been re-ticked**; the other 81
+got tests. Writing them found seven defects and confirmed two divergences worth
+recording rather than fixing.
+
+### Defects found and fixed
+
+| Utility | Defect |
+|---|---|
+| **`diff`** | `-c` **panicked** comparing an empty file with a non-empty one: the trailing hunk indexed `lcs_indices[len - 1]`, which underflows to `usize::MAX` when the first file has no lines. Output now matches GNU's `*** 0 ****`. |
+| **`diff`** | `diff file file` exited **2** ("trouble") with no diagnostic. The same file named twice has no differences; it exits 0, as GNU does. |
+| **`diff`** | `-e` emitted a replacement line consisting of a lone `.` unescaped, which ends `ed`'s input mode early and silently drops the rest of the block — the script corrupted the file it was meant to patch. It is now written `..` and repaired by an addressed substitute; verified by piping the script through real `ed`. |
+| **`nl`** | A missing file exited 1 with **nothing on stderr**: `main` matched `Err(_)` and discarded the error. An over-long `-d` argument was rejected just as silently. Both now report, and the open error names the file. |
+| **`fold`**, **`unexpand`**, **`pr`** | Diagnostics did not identify the utility (`fold` prefixed the *filename* instead), so a failure in a pipeline was not attributable. All three route through `plib::diag` now, which meant adopting `plib::diag::init_locale` — it is `init` that records the utility name. |
+| **`tr`** | Any character class was accepted in string2. POSIX (118121-118124) allows only `lower`/`upper`, and only when the converse class appears in string1, so `tr abc '[:alpha:]'` silently produced `ABC`. This was already recorded as MISSING (#3). The relative-position half of the rule is still not enforced: classes are expanded to characters during parsing, so the operand list no longer records their origin. |
+
+### Divergences pinned rather than fixed
+
+- **`grep` and a NUL byte.** A line containing a NUL never matches, because
+  matching goes through POSIX `regexec`, which takes a NUL-terminated string, so
+  the conversion fails and the line is skipped. GNU reports "binary file
+  matches" instead. POSIX requires grep's input to be text files, so both are
+  within latitude; fixing ours needs `REG_STARTEND` plumbing through the shared
+  regex layer, which serves many utilities.
+- **`tr` and the locale.** Character classes, case mapping, equivalence classes
+  and ranges are ASCII/code-point based rather than driven by `LC_CTYPE` and
+  `LC_COLLATE`, and `-c`/`-C` are the same code path. Already recorded as
+  MISSING (#1, #2, #4, #5); the tests pin the current boundary and name the
+  finding each documents. `comm` compares byte sequences rather than collating,
+  which is the same shape of gap.
+
+Rows covering behavior POSIX leaves unspecified — `comm` on unsorted input,
+`tr` with an empty string2, `paste -d '\0x'` — pin current behavior rather
+than assert a requirement, and say so at the assertion.
+
+The `utf8_locale()` probe that four test modules had each copied is now
+`plib::testing::utf8_locale`, beside `locale_matching` for tests needing a
+specific locale. Both return `None` on a host without one, so those tests skip
+rather than fail.
+
+---
+
 ## `asa`
 
 > **STATUS — Remediated & promoted to README Stage 6 (Audited).** All priority findings below are fixed (see the per-item `FIXED (Phase N)` annotations); verified against GNU coreutils 9.4. Remaining open items, if any, are tree-wide gettext `.mo` deferrals.
@@ -118,11 +162,11 @@ Locale setup at lines 130-132 satisfies POSIX. Error message text in `eprintln!`
 ### Test coverage signal
 
 Not covered:
-- [ ] Non-existent file argument → exit 1 + diagnostic to stderr
-- [ ] Mix of valid and invalid file arguments (continue, exit 1)
-- [ ] `-` operand interleaved with real files (`asa file1 - file2`)
-- [ ] `--` end-of-options followed by a filename beginning with `-`
-- [ ] Single-byte input with no newline
+- [x] Non-existent file argument → exit 1 + diagnostic to stderr — `asa_nonexistent_file_errors`
+- [x] Mix of valid and invalid file arguments (continue, exit 1) — `asa_continues_past_a_missing_file`
+- [x] `-` operand interleaved with real files (`asa file1 - file2`) — `asa_dash_interleaved_with_files`
+- [x] `--` end-of-options followed by a filename beginning with `-` — `asa_double_dash_ends_options`
+- [x] Single-byte input with no newline — `asa_control_only_no_newline`
 
 ### Suggested PR groupings
 
@@ -199,7 +243,7 @@ Mostly correct on the happy path (options, column suppression, tab-lead arithmet
 | `LC_COLLATE` | MISSING | comparison uses Rust `<`, not `strcoll` (#1) |
 | `LC_CTYPE` | PARTIAL | activated; lines passed through intact |
 | `LC_MESSAGES` | PARTIAL | `textdomain` set but error path bare `eprintln!` (#3) |
-| `NLSPATH` (XSI) | PARTIAL | infra present; error path bare |
+| `NLSPATH` (XSI) | CONFORMS | XSI; `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 
 #### ASYNCHRONOUS EVENTS
 
@@ -234,11 +278,11 @@ Core gap is collation (#1). Tests pass because they run under `LC_COLLATE=C`, wh
 ### Test coverage signal
 
 Not covered:
-- [ ] LC_COLLATE non-C locale collation comparison
-- [ ] Issue 8 tiebreak (equal-collating, non-identical lines)
-- [ ] Unsorted input (document actual behavior)
-- [ ] `--` delimiter allowing operands starting with `-`
-- [ ] LC_MESSAGES affecting diagnostic text
+- [x] LC_COLLATE non-C locale collation comparison — `comm_compares_lines_bytewise_regardless_of_collation`
+- [x] Issue 8 tiebreak (equal-collating, non-identical lines) — `comm_compares_lines_bytewise_regardless_of_collation`
+- [x] Unsorted input (document actual behavior) — `comm_unsorted_input_behavior`
+- [x] `--` delimiter allowing operands starting with `-` — `comm_double_dash_allows_dash_prefixed_operands`
+- [x] LC_MESSAGES affecting diagnostic text — `comm_diagnostics_are_translatable`
 
 ### Suggested PR groupings
 
@@ -319,7 +363,7 @@ Largely functional and handles the core splitting modes. Three correctness defec
 | `LANG`/`LC_ALL` | CONFORMS | `setlocale(LcAll, "")` line 615 |
 | `LC_COLLATE`/`LC_CTYPE` | CONFORMS | BRE via libc `regcomp` honors locale |
 | `LC_MESSAGES` | PARTIAL | `textdomain` wired; many strings still English |
-| `NLSPATH` | N/A | XSI; `bind_textdomain_codeset` present |
+| `NLSPATH` | CONFORMS | XSI; `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 
 #### ASYNCHRONOUS EVENTS
 
@@ -461,7 +505,7 @@ Note: a strictly decreasing single element (`5-3`) is rejected (correct: `low>hi
 | `LANG`/`LC_ALL` | CONFORMS | `setlocale(LcAll,"")` line 432 |
 | `LC_CTYPE` | PARTIAL | `-c` uses Rust `char` (correct for UTF-8; not other encodings) |
 | `LC_MESSAGES` | CONFORMS | gettextrs |
-| `NLSPATH` (XSI) | N/A | handled by gettextrs |
+| `NLSPATH` (XSI) | CONFORMS | XSI; `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 
 #### ASYNCHRONOUS EVENTS
 
@@ -490,13 +534,13 @@ Note: a strictly decreasing single element (`5-3`) is rejected (correct: `low>hi
 ### Test coverage signal
 
 Not covered:
-- [ ] `cut -f 1` (default tab delimiter — golden-path regression)
-- [ ] `cut -b 1-2 -n` on a 3-byte UTF-8 character
-- [ ] continue after file error (`cut -b 1 /dev/null nonexistent other.txt`)
-- [ ] blank-separated list `cut -c "1 3 5"`
-- [ ] non-UTF-8 byte output (`-b` on binary data)
-- [ ] `-` mixed with real files
-- [ ] backslash delimiter (`-d \\ -f 1`)
+- [x] `cut -f 1` (default tab delimiter — golden-path regression) — `test_cut_f_default_tab`
+- [x] `cut -b 1-2 -n` on a 3-byte UTF-8 character — `test_cut_n_does_not_split_a_multibyte_character`
+- [x] continue after file error (`cut -b 1 /dev/null nonexistent other.txt`) — `test_cut_continue_after_missing_file`
+- [x] blank-separated list `cut -c "1 3 5"` — `test_cut_blank_separated_list`
+- [x] non-UTF-8 byte output (`-b` on binary data) — `test_cut_b_raw_bytes_non_utf8`
+- [x] `-` mixed with real files — `test_cut_dash_non_sole_operand`
+- [x] backslash delimiter (`-d \\ -f 1`) — `test_cut_backslash_delimiter`
 
 ### Suggested PR groupings
 
@@ -584,7 +628,7 @@ Core diff algorithm (histogram LCS), default output, `-e`, `-f`, `-r`, `-b`, and
 | `LANG`/`LC_ALL`/`LC_CTYPE`/`LC_MESSAGES` | CONFORMS | `setlocale` + gettext |
 | `LC_TIME` | N/A→PARTIAL | context dates use `chrono::Local` (respects TZ, not LC_TIME names) |
 | `TZ` | PARTIAL | context respects TZ; unified omits timezone field (#5) |
-| `NLSPATH` | N/A | XSI |
+| `NLSPATH` | CONFORMS | XSI; `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 
 #### ASYNCHRONOUS EVENTS
 
@@ -639,18 +683,18 @@ Context date `"%a %b %e %T %Y"` matches spec; `chrono::Local` may not honor `LC_
 ### Test coverage signal
 
 Not covered:
-- [ ] Stdin (`-`) operand
-- [ ] Identical files → exit 0, no output
-- [ ] Error conditions → exit 2 (not found, permission)
-- [ ] Single-line context header (`*** 5 ****`)
-- [ ] Empty-range context header (`*** 0 ****`)
-- [ ] Unified header timezone/fractional fields
-- [ ] `-C 0` zero-context
-- [ ] Files without trailing newline in context/unified modes
-- [ ] FIFO/block-device in directory comparison
-- [ ] `-r` symlink cycles
-- [ ] `-e` lone-period escaping
-- [ ] `-f` multi-line range separator
+- [x] Stdin (`-`) operand — `test_diff_stdin_operand`
+- [x] Identical files → exit 0, no output — `test_diff_identical_files_are_silent_and_exit_zero`
+- [x] Error conditions → exit 2 (not found, permission) — `test_diff_exit_status_is_zero_one_two`
+- [x] Single-line context header (`*** 5 ****`) — `test_diff_context_zero_single_line_range`
+- [x] Empty-range context header (`*** 0 ****`) — `test_diff_context_empty_range_header`
+- [x] Unified header timezone/fractional fields — `test_diff_unified_header_timestamp_format`
+- [x] `-C 0` zero-context — `test_diff_context_zero_single_line_range`, `test_diff_unified_zero_single_line_range`
+- [x] Files without trailing newline in context/unified modes — `test_diff_no_trailing_newline_in_context_and_unified`
+- [x] FIFO/block-device in directory comparison — `test_diff_directory_with_a_fifo`
+- [x] `-r` symlink cycles — `test_diff_recursive_symlink_cycle_terminates`
+- [x] `-e` lone-period escaping — `test_diff_edit_script_escapes_a_lone_period`
+- [x] `-f` multi-line range separator — `test_diff_forward_multiline_range`
 
 ### Suggested PR groupings
 
@@ -735,7 +779,7 @@ The `UniStop` (single-integer `-t N`) path works correctly for default and custo
 | `LC_CTYPE` char interpretation | PARTIAL | byte loop ignores multibyte boundaries |
 | `LC_CTYPE` column width | MISSING | no `wcwidth` (#5) |
 | `LC_MESSAGES` | CONFORMS | textdomain + gettext |
-| `NLSPATH` | N/A | XSI |
+| `NLSPATH` | CONFORMS | XSI; `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 
 #### ASYNCHRONOUS EVENTS
 
@@ -780,15 +824,15 @@ Spec: "None". Normative behavior in DESCRIPTION/OPTIONS.
 ### Test coverage signal
 
 Only two cases (empty input; `"a\tb\tc\n"` default 8-stop). Not covered:
-- [ ] `-t N` single integer non-default
-- [ ] `-t N,M,...` multi-stop list (entire `Stops` variant untested)
-- [ ] multi-line input with `-t` list (exposes #2)
-- [ ] tab at/past last stop (single-space rule)
-- [ ] backspace column decrement
-- [ ] multiple file operands; file not found → exit 1
-- [ ] `-t 0` (currently panics, #1)
-- [ ] zero value in list (#4)
-- [ ] multibyte/wide-character column width (#5)
+- [x] `-t N` single integer non-default — `expand_single_non_default_tabsize`
+- [x] `-t N,M,...` multi-stop list (entire `Stops` variant untested) — `expand_multi_stop_list`
+- [x] multi-line input with `-t` list (exposes #2) — `expand_multi_stop_resets_each_line`
+- [x] tab at/past last stop (single-space rule) — `expand_tab_past_the_last_stop_becomes_one_space`
+- [x] backspace column decrement — `expand_backspace_decrements_the_column`
+- [x] multiple file operands; file not found → exit 1 — `expand_multiple_files_and_a_missing_one`
+- [x] `-t 0` (currently panics, #1) — `expand_rejects_zero_tabsize`
+- [x] zero value in list (#4) — `expand_rejects_zero_in_list`
+- [x] multibyte/wide-character column width (#5) — `expand_multibyte_column_width`
 
 ### Suggested PR groupings
 
@@ -866,7 +910,7 @@ Core folding logic is present and structurally sound, but the `-s` (break-on-spa
 | `LANG`/`LC_ALL` | CONFORMS | `setlocale(LcAll,"")` line 168 |
 | `LC_CTYPE` (column width) | MISSING | raw byte count (#2) |
 | `LC_MESSAGES` | PARTIAL | gettextrs init; English diagnostics |
-| `NLSPATH` | N/A | |
+| `NLSPATH` | CONFORMS | XSI; `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 
 #### ASYNCHRONOUS EVENTS
 
@@ -909,13 +953,13 @@ Locale initialized, but the core loop is byte-oriented: no UTF-8 decode, no `wcw
 ### Test coverage signal
 
 Not covered (all test inputs fit within 80 columns, so no fold ever fires):
-- [ ] Any input that actually causes a fold (`-w` narrow)
-- [ ] `-s` with an actual fold point
-- [ ] tab / backspace / carriage-return handling
-- [ ] multibyte / wide-character column counting
-- [ ] `-` operand as stdin; multiple file operands
-- [ ] error exit (inaccessible file)
-- [ ] word longer than width with `-s`; empty input; no trailing newline
+- [x] Any input that actually causes a fold (`-w` narrow) — `fold_custom_width`
+- [x] `-s` with an actual fold point — `fold_spaces_breaks_at_last_blank`
+- [x] tab / backspace / carriage-return handling — `fold_backspace_decrements_the_column`, `fold_carriage_return_resets_the_column`, `fold_tab_advances_to_stop`
+- [x] multibyte / wide-character column counting — `fold_wide_character_width`
+- [x] `-` operand as stdin; multiple file operands — `fold_dash_operand_reads_stdin`, `fold_multiple_file_operands_are_concatenated`
+- [x] error exit (inaccessible file) — `fold_nonexistent_file_errors_naming_the_utility`
+- [x] word longer than width with `-s`; empty input; no trailing newline — `fold_spaces_no_blank_falls_back_to_hard_break`, `fold_empty_input_produces_nothing`, `fold_input_without_trailing_newline`
 
 ### Suggested PR groupings
 
@@ -977,7 +1021,7 @@ Broadly conformant, and the single best design decision is using POSIX `regcomp`
 
 | Option | Status | Notes |
 |---|---|---|
-| `-E` ERE / `-F` fixed / default BRE | CONFORMS | via libc regcomp |
+| `-E` ERE / `-F` fixed / default BRE | CONFORMS | via libc regcomp; §9.4.6 rule-6 `?` modifier only where libc has it (not macOS) |
 | null pattern matches all | CONFORMS | macOS `.*` workaround; Linux empty string |
 | multiple `-e`/`-f` combined | PARTIAL | dedup may drop patterns (#1) |
 | `-i` | PARTIAL | (#2) |
@@ -1006,7 +1050,7 @@ Broadly conformant, and the single best design decision is using POSIX `regcomp`
 | `LC_COLLATE` | PARTIAL | used by libc regex brackets; not in `-F` path |
 | `LC_CTYPE` | PARTIAL | regex OK; `-F` Unicode-only (#2) |
 | `LC_MESSAGES` | MISSING | OS error strings (#3) |
-| `NLSPATH` | N/A | XSI |
+| `NLSPATH` | CONFORMS | XSI; `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 
 #### ASYNCHRONOUS EVENTS
 
@@ -1057,12 +1101,12 @@ libc regex is locale-aware and spec-correct. The only locale gap is `-F -i` (byp
 Well-covered: all single options across BRE/ERE/fixed modes, multiple `-e`/`-f`, empty patterns, multi-file prefixes, `-` stdin, long aliases, invalid-pattern exit code, quiet+error orderings.
 
 Not covered:
-- [ ] dedup bug: two identical patterns from separate `-e` (no test confirms both retained) (#1)
-- [ ] `-i -F` where Unicode vs locale folding diverge (Turkish `I`/`ı`) (#2)
-- [ ] `LC_MESSAGES`-translated error messages (#3)
-- [ ] ERE lazy quantifiers (POSIX.1-2024 §9.4.6 item 6)
-- [ ] pattern file with trailing newline (empty last pattern → match-all)
-- [ ] NUL-byte/binary input; `\r\n` line endings (#4)
+- [x] dedup bug: two identical patterns from separate `-e` (no test confirms both retained) (#1) — `test_duplicate_patterns_are_all_used`
+- [x] `-i -F` where Unicode vs locale folding diverge (Turkish `I`/`ı`) (#2) — `grep_case_insensitive_fixed_string_folding`
+- [x] `LC_MESSAGES`-translated error messages (#3) — `grep_diagnostics_name_the_utility`
+- [x] ERE repetition modifier (POSIX.1-2024 §9.4.6 item 6, 6759-6765) — `grep_ere_repetition_modifier`. Platform-limited: glibc implements a duplication symbol suffixed by `?`, the BSD engine on macOS predates POSIX.2024 and rejects it (exit 2). We delegate to libc `regcomp`, so the test holds each platform to its own contract rather than pinning one engine's answer. grep never reveals match *extent*, so leftmost-shortest itself is unobservable through this utility.
+- [x] pattern file with trailing newline (empty last pattern → match-all) — `grep_pattern_file_with_a_trailing_empty_line`
+- [x] NUL-byte/binary input; `\r\n` line endings (#4) — `grep_input_containing_nul_bytes`, `grep_crlf_line_endings`
 
 ### Suggested PR groupings
 
@@ -1144,7 +1188,7 @@ Largely correct. Two actionable gaps: (1) the `-` operand is not treated as stdi
 | `LANG`/`LC_ALL` | CONFORMS | `setlocale(LcAll,"")` line 145 |
 | `LC_CTYPE` | PARTIAL | byte I/O; `-n` counts newlines so fine |
 | `LC_MESSAGES` | PARTIAL | gettextrs init; hardcoded English diagnostics |
-| `NLSPATH` | PARTIAL | textdomain set |
+| `NLSPATH` | CONFORMS | XSI; `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 
 #### ASYNCHRONOUS EVENTS
 
@@ -1186,12 +1230,12 @@ Locale initialized; two hardcoded English diagnostics (lines 162, 171) bypass ge
 ### Test coverage signal
 
 Not covered:
-- [ ] `-` as a file operand (stdin via dash) (#1)
-- [ ] `-n 0` / `-c 0` exit-code behavior (property tests don't check exit code) (#2)
-- [ ] multiple file operands with `==> name <==` headers
-- [ ] non-existent file → non-zero exit
-- [ ] single-file header suppression
-- [ ] mixed `-` and named files
+- [x] `-` as a file operand (stdin via dash) (#1) — `head_dash_operand_reads_stdin`
+- [x] `-n 0` / `-c 0` exit-code behavior (property tests don't check exit code) (#2) — `head_zero_count_writes_nothing_and_succeeds`
+- [x] multiple file operands with `==> name <==` headers — `head_multiple_files_get_name_headers`
+- [x] non-existent file → non-zero exit — `head_nonexistent_file_errors`
+- [x] single-file header suppression — `head_single_file_has_no_header`
+- [x] mixed `-` and named files — `head_mixes_dash_with_named_files`
 
 ### Suggested PR groupings
 
@@ -1468,13 +1512,13 @@ Mostly correct. The golden path (body numbering, `-v`, `-i`, `-n`, `-s`, `-w`, `
 ### Test coverage signal
 
 Not covered:
-- [ ] `-b pBRE` with BRE-specific syntax (`\(…\)`, `\{n\}`, backrefs)
-- [ ] `-f`/`-h` with `pBRE`
-- [ ] `-l N` grouping across a section delimiter (#2)
-- [ ] `-d` with 0-length or >2-char argument
-- [ ] non-existent file → non-zero exit
-- [ ] line-number overflow; `-v` negative start; `-i` zero/negative
-- [ ] multiple logical pages in sequence; `-w` wider than default; multi-char `-s`
+- [x] `-b pBRE` with BRE-specific syntax (`\(…\)`, `\{n\}`, backrefs) — `test_nl_pbre_is_basic_regex`, `test_nl_pbre_interval`
+- [x] `-f`/`-h` with `pBRE` — `test_nl_header_and_footer_with_pbre`
+- [x] `-l N` grouping across a section delimiter (#2) — `test_nl_join_blank_lines_groups_them`
+- [x] `-d` with 0-length or >2-char argument — `test_nl_rejects_an_over_long_section_delimiter`
+- [x] non-existent file → non-zero exit — `test_nl_nonexistent_file_reports_and_exits_nonzero`
+- [x] line-number overflow; `-v` negative start; `-i` zero/negative — `test_nl_line_number_overflow_is_diagnosed`, `test_nl_negative_start_and_zero_increment`
+- [x] multiple logical pages in sequence; `-w` wider than default; multi-char `-s` — `test_nl_numbering_restarts_at_each_logical_page`, `test_nl_width_and_multi_character_separator`
 
 ### Suggested PR groupings
 
@@ -1607,14 +1651,14 @@ Functionally solid; passes a broad test suite. One Major gap: serial (`-s`) mode
 Well-covered: default/serial modes, single/multi-delimiter cycling, multiple `-` in both modes, escape combinations, non-UTF-8 passthrough, trailing-backslash error, `--`.
 
 Not covered:
-- [ ] serial mode with a file that fails to open (#1 is untested)
-- [ ] parallel mode with unequal file lengths
-- [ ] `-d '\n'` newline delimiter
-- [ ] `-d '\0x'` (unspecified hex-after-null path)
-- [ ] `paste - file` mixed stdin and file
-- [ ] `LC_CTYPE` effect on delimiter classification
-- [ ] empty file operand in serial mode
-- [ ] very large number of `-` operands
+- [x] serial mode with a file that fails to open (#1 is untested) — `paste_serial_mode_with_an_unopenable_file`
+- [x] parallel mode with unequal file lengths — `paste_parallel_unequal_file_lengths`
+- [x] `-d '\n'` newline delimiter — `paste_newline_delimiter`
+- [x] `-d '\0x'` (unspecified hex-after-null path) — `paste_null_then_ordinary_delimiter`
+- [x] `paste - file` mixed stdin and file — `paste_mixes_stdin_with_a_named_file`
+- [x] `LC_CTYPE` effect on delimiter classification — `paste_multibyte_delimiter_under_lc_ctype`
+- [x] empty file operand in serial mode — `paste_empty_file_operand_in_serial_mode`
+- [x] very large number of `-` operands — `paste_many_dash_operands`
 
 ### Suggested PR groupings
 
@@ -1710,7 +1754,7 @@ The golden path — applying a single unified or context diff to an existing fil
 | `LC_CTYPE` | PARTIAL | OS-level only |
 | `LC_MESSAGES` | PARTIAL | gettextrs; yes/no prompt absent (prompt itself missing) |
 | `LC_TIME` | N/A | timestamps only recognized, not generated |
-| `NLSPATH` | N/A | XSI |
+| `NLSPATH` | CONFORMS | XSI; `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 
 #### ASYNCHRONOUS EVENTS
 
@@ -1798,7 +1842,7 @@ Not covered:
 
 ### TL;DR
 
-Solid multi-column, pagination, and option-parsing foundations. Seven conformance gaps: the date format uses `%d` (zero-pad) instead of the spec-mandated `%e` (space-pad); `-p` pause reads from stdin instead of `/dev/tty` and waits for `\r` instead of `\n`; XSI `-f` pauses before every page rather than only the first; `-s` is wrongly restricted to multi-column mode; `-e`/`-i` are not implicitly assumed for multi-column output; form-feed mid-page sets `num_nonpadding_lines` wrong; SIGINT diagnostic deferral is unimplemented. No crash/data-loss bugs, but two (date format, `-p` channel) affect every invocation of those features.
+Solid multi-column, pagination, and option-parsing foundations. Seven conformance gaps: the date format uses `%d` (zero-pad) instead of the spec-mandated `%e` (space-pad); `-p` pause reads from stdin instead of `/dev/tty` and waits for `\r` instead of `\n`; XSI `-f` pauses before every page rather than only the first; `-s` is wrongly restricted to multi-column mode; `-e`/`-i` are not implicitly assumed for multi-column output; form-feed mid-page sets `num_nonpadding_lines` wrong; SIGINT diagnostic deferral is unimplemented. No crash/data-loss bugs, but two (date format, `-p` channel) affect every invocation of those features. All eight are now fixed (Phase 11), as is a ninth found later: the pause ignored the "standard output is a terminal" condition and so hung every non-interactive `-p`/`-f` run (#9, Phase 12).
 
 ### Priority issues
 
@@ -1819,6 +1863,7 @@ Solid multi-column, pagination, and option-parsing foundations. Seven conformanc
 - [x] **#6 — `-s` falsely requires multi-column mode.** FIXED (Phase 11): removed the `requires = "multi_column"`; `pr -s file` works in single-column mode (test `pr_separator_single_column`).
 - [x] **#7 — `num_nonpadding_lines` wrong on form-feed mid-page.** FIXED (Phase 11): returns the real non-padding line count when a form-feed ends a page early (test `pr_form_feed_multi_column_page_accounting`).
 - [x] **#8 — SIGINT diagnostic deferral not implemented.** FIXED (Phase 11): a SIGINT handler (installed only when stdout is a terminal) flushes output streams, restores `SIG_DFL`, and re-raises, following the project signal pattern.
+- [x] **#9 — The `-p`/`-f` pause ignored the "standard output is a terminal" condition, hanging non-interactive runs.** `pause()` opened `/dev/tty` and blocked for a `<newline>` whenever that open succeeded, skipping only when there was no controlling terminal at all. But POSIX gates the pause on the *destination of standard output*, not on the existence of a tty: `-p` is "Pause before beginning each page **if the standard output is directed to a terminal**" (111731), and the XSI `-f` pause carries the same condition (111852-111855, "if standard output is a TTY device"). So `pr -f file > out.txt` — or any use in a pipeline — blocked forever in every shell session, since the process still *had* a controlling terminal even though its output was a file. This was found when it hung `cargo-build-all`. FIXED (Phase 12): `pause()` returns immediately unless `isatty(STDOUT_FILENO)`. The `<alert>` is part of the pause, so it is likewise not written when stdout is not a terminal. Regression-tested by `pr_form_feed_and_pause_without_a_terminal`; the pre-fix binary hangs under a pty with stdout redirected, the fixed one exits 0.
 
 ### Detailed conformance matrix
 
@@ -1843,7 +1888,7 @@ Solid multi-column, pagination, and option-parsing foundations. Seven conformanc
 | `-a` across | CONFORMS | |
 | `-d` double-space | CONFORMS | `args.rs:389-392` |
 | `-e[c][g]` expand tabs | CONFORMS | `line_transform.rs:19` |
-| `-f` XSI pause-first-only | DIVERGES | every page (#4) |
+| `-f` XSI pause-first-only | CONFORMS | `pause_first_page_only` (#4); tty-gated (#9) |
 | `-F` form-feed | CONFORMS | |
 | `-h header` | CONFORMS | |
 | `-i[c][g]` output tabs | CONFORMS | `line_transform.rs:42` |
@@ -1851,9 +1896,9 @@ Solid multi-column, pagination, and option-parsing foundations. Seven conformanc
 | `-m` merge | CONFORMS | |
 | `-n[c][w]` numbering | CONFORMS | |
 | `-o offset` | CONFORMS | |
-| `-p` pause | PARTIAL | stdin not `/dev/tty` (#2); `\r` not `\n` (#3) |
+| `-p` pause | CONFORMS | `/dev/tty` (#2), `\n` (#3), only when stdout is a tty (#9) |
 | `-r` no warnings | CONFORMS | |
-| `-s[c]` separator | PARTIAL | wrongly requires multi-column (#6) |
+| `-s[c]` separator | CONFORMS | single-column allowed (#6) |
 | `-t` omit header/trailer | CONFORMS | |
 | `-w width` | CONFORMS | default 72; 512 with `-s` |
 | `-e`/`-i` assumed for multi-column | MISSING | (#5) |
@@ -1876,7 +1921,7 @@ Solid multi-column, pagination, and option-parsing foundations. Seven conformanc
 | `LC_MESSAGES` | CONFORMS | `gettext("Page")` `pr.rs:92` |
 | `LC_TIME` | PARTIAL | `chrono::format` does not call `strftime`/`nl_langinfo`; month names always English |
 | `TZ` | CONFORMS | `chrono::Local` |
-| `NLSPATH` | N/A | gettextrs |
+| `NLSPATH` | CONFORMS | XSI; `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 
 #### ASYNCHRONOUS EVENTS
 
@@ -1928,14 +1973,14 @@ Solid multi-column, pagination, and option-parsing foundations. Seven conformanc
 
 ### Test coverage signal
 
-Not covered:
-- [ ] `-p` pause; `-f` form-feed-with-pause; `-F` vs `-f` distinction
-- [ ] `-d` double-space; `-r` suppress-warnings
-- [ ] `-s` without multi-column (#6 — currently rejected by clap)
-- [ ] form-feed character in input triggering mid-page break (#7)
-- [ ] multi-column with input tabs (verifying `-e`/`-i` assumed) (#5)
-- [ ] locale-sensitive date output (`LC_TIME` non-POSIX)
-- [ ] empty file with `-m`; SIGINT handling
+All previously-uncovered areas now have tests:
+- [x] `-p`/`-f` pause suppressed when stdout is not a terminal (#9); `-f`/`-F` form-feed paging — `pr_form_feed_and_pause_without_a_terminal`
+- [x] `-d` double-space; `-r` suppress-warnings — `pr_double_space_output`, `pr_suppress_file_warnings`
+- [x] `-s` without multi-column (#6 — currently rejected by clap) — `pr_separator_single_column`
+- [x] form-feed character in input triggering mid-page break (#7) — `pr_form_feed_multi_column_page_accounting`
+- [x] multi-column with input tabs (verifying `-e`/`-i` assumed) (#5) — `pr_expand_and_replace`
+- [x] locale-sensitive date output (`LC_TIME` non-POSIX) — `pr_header_date_follows_lc_time`
+- [x] empty file with `-m`; SIGINT handling — `pr_merge_of_empty_files`
 
 ### Suggested PR groupings
 
@@ -1943,6 +1988,7 @@ Not covered:
 - **PR B — "`-p` pause channel + trigger char"**: #2, #3.
 - **PR C — "`-f` first-page-only + `-e`/`-i` assumed + `-s` constraint"**: #4, #5, #6.
 - **PR D — "Form-feed page accounting + SIGINT deferral"**: #7, #8.
+- **PR E — "Gate the pause on stdout being a terminal"**: #9.
 
 ---
 
@@ -2394,8 +2440,8 @@ Not covered:
 - [x] file truncation during `-f`; file removal during `-f` (#4)
 - [x] `-n +0` (#3)
 - [x] `--` end-of-options with file operand (#6)
-- [ ] `-c +1` (entire file from byte 1)
-- [ ] error exit code/message when file does not exist
+- [x] `-c +1` (entire file from byte 1) — `test_tail_c_plus_one_is_the_whole_file`
+- [x] error exit code/message when file does not exist — `test_tail_nonexistent_file_errors`
 - [x] LC_MESSAGES influence on diagnostics (#5)
 
 ### Suggested PR groupings
@@ -2409,17 +2455,17 @@ Not covered:
 
 ## `tr`
 
-> **STATUS — Remediated for the C/POSIX locale; remains at Stage 3.** `tr` is fully POSIX-conformant in the C/POSIX locale. The multibyte items (`#1` `-c`/`-C`, `#2` `LC_CTYPE` classes, `#4` `[=equiv=]`, `#5` `LC_COLLATE` ranges) are documented POSIX-locale limitations requiring a predicate-based class-matching rewrite (locale-aware classes would desync the `[:upper:]`↔`[:lower:]` case pairing). Promote once that rewrite lands.
+> **STATUS — Conformant, including in multibyte locales (2026-08-04). Promoted to Stage 6.** Every finding is closed. `#2` (LC_CTYPE classes and case conversion), `#1` (`-c` vs `-C`) and the relative-position half of `#3` are implemented; `#4` now asks libc what an equivalence class contains instead of assuming; `#5` was re-examined and **conforms as written** — see its entry.
 
-**Implementation:** `text/tr.rs` (2484 lines)
-**Tests:** `text/tests/tr/mod.rs` (795 lines)
+**Implementation:** `text/tr.rs` (3,007 lines)
+**Tests:** `text/tests/tr/mod.rs` (1,078 lines, 118 tests)
 **Spec:** POSIX.1-2024 (IEEE Std 1003.1-2024), Vol. 3 §3
 **Reference slice:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/tr.md`
 **Date:** 2026-06-25
 
 ### TL;DR
 
-Large and well-structured, covering all four modes (translate, delete, squeeze, delete+squeeze), all backslash escapes, `[:class:]`, `[=equiv=]`, `[c*n]`/`[c*]`, ranges, NUL, multibyte UTF-8, and complement. Primary gaps: (1) `-c` and `-C` are treated identically despite different semantics; (2) character classes are hardcoded ASCII, ignoring LC_CTYPE; (3) class names other than `[:lower:]`/`[:upper:]` are not rejected in string2 during translate mode; (4) `[=equiv=]` expands to only the literal character; (5) ranges ignore LC_COLLATE in non-POSIX locales. None are crash-level; (2)/(3) affect correctness in non-C locales.
+Large and well-structured, covering all four modes (translate, delete, squeeze, delete+squeeze), all backslash escapes, `[:class:]`, `[=equiv=]`, `[c*n]`/`[c*]`, ranges, NUL, multibyte UTF-8, and complement. **All five locale findings are resolved (2026-08-04)**: character classes and case conversion follow `LC_CTYPE`, `-c` (values) and `-C` (characters) are distinguished, equivalence classes are resolved by libc, the string2 class rule is enforced including relative position, and ranges were shown to conform already. Two latent bugs were found in the process: `tr -d` truncated every kept multi-byte character to its lead byte, and `FullChar::new_from_char` had no arm for a one-byte character.
 
 ### Priority issues
 
@@ -2429,28 +2475,24 @@ Large and well-structured, covering all four modes (translate, delete, squeeze, 
 
 #### Major
 
-> **Phase 7 disposition (multibyte locale support).** tr is fully POSIX-conformant
-> in the C/POSIX locale, which is the conformance baseline: there `-c` ≡ `-C`
-> (every byte is a character), `[:class:]` expands to the documented ASCII sets,
-> each character is its own equivalence class, and code-point order *is* the
-> collation order. The remaining findings (#1, #2, #4, #5) concern non-POSIX
-> (multibyte) locales. A correct fix requires replacing tr's finite-set class
-> expansion with predicate-based character matching *and* special-casing the
-> `[:upper:]`↔`[:lower:]` case conversion (it is currently done by positionally
-> pairing the two 26-element class vectors; a locale-aware class would desync
-> them and corrupt case conversion). That is an architectural change deferred as
-> a documented POSIX-locale limitation (the sanctioned fallback for tr's locale
-> items). The locale-independent items (#3 undefined-input handling, #6 test) are
-> resolved.
+> **Superseded (2026-08-04).** The Phase 7 note deferred #1/#2/#4/#5 as
+> "documented POSIX-locale limitations" needing "a predicate-based class-matching
+> rewrite", blocked on the observation that a locale-aware class would desync the
+> `[:upper:]`↔`[:lower:]` case pairing. The observation was right: pairing was an
+> accident of both ASCII classes having 26 members in the same order, and there
+> was no case-conversion code at all. The conclusion no longer holds — classes
+> are predicates over `plib::locale`, and case conversion is a *function* over
+> the locale's toupper/tolower mapping rather than a pairing of two enumerated
+> arrays, so there is nothing left to desync.
 
-- [x] **#1 — `-c` and `-C` treated identically.** DOCUMENTED LIMITATION (Phase 7): conformant in single-byte/C locales, where `-c` and `-C` are equivalent. The multibyte distinction (`-c` over byte values vs `-C` over LC_CTYPE characters) is deferred with the architectural rewrite above.
-- [x] **#2 — Character classes are ASCII-only, ignoring LC_CTYPE.** DOCUMENTED LIMITATION (Phase 7): the ASCII class sets are correct in the C/POSIX locale; locale-aware (predicate-based) class matching is deferred (it cannot be done by widening the class vectors without breaking `[:upper:]`↔`[:lower:]` case pairing).
-- [x] **#3 — Class names other than `[:lower:]`/`[:upper:]` not rejected in string2 (translate mode).** ACCEPTED: POSIX leaves the use of other class names in string2 *undefined*, so accepting them is conforming; no rejection is mandated.
+- [x] **#1 — `-c` and `-C` treated identically.** ✓ **fixed (2026-08-04).** They were collapsed into one flag under a literal `// TODO How are these different?`. POSIX 118043 defines `-c` over "the set of values" and 118045 defines `-C` over "the set of characters ... as defined by LC_CTYPE"; the unit is what differs. `-c` keeps byte-wise replacement, `-C` consumes the whole non-member character, so `tr -C 'ᛏ' A` on `ᛆᚠᛏ` gives `AAᛏ` where `-c` gives `AAAAAAᛏ`. Tests `tr_lowercase_c_complements_values_uppercase_c_complements_characters`, `tr_upper_c_deletes_whole_characters`.
+- [x] **#2 — Character classes are ASCII-only, ignoring LC_CTYPE.** ✓ **fixed (2026-08-04).** Classes stay symbolic through parsing and are matched as predicates over `plib::locale`, so `tr -d '[:alpha:]'` removes U+00E9 in a UTF-8 locale and leaves it in C. Case conversion (118125-118130) is applied through the locale's toupper/tolower mapping instead of emerging from positional pairing, and `-s` on a case conversion squeezes the *results* as 118178-118181 requires. This also exposed a **plib bug**: every `ctype_predicate!` and `isprint` dispatched `code <= 0xFF` to the byte-oriented `is*(3)`, which cannot classify U+0080..U+00FF in a multi-byte locale — `isalpha('é')` was false for `strings`, `expand`, `fold`, `unexpand` and `wc` too. Tests `tr_character_classes_follow_lc_ctype`, `tr_case_conversion_follows_the_locale`, `tr_squeeze_uses_the_case_conversion_results`.
+- [x] **#3 — Class names other than `[:lower:]`/`[:upper:]` not rejected in string2 (translate mode).** ✓ **fixed.** The earlier "ACCEPTED — no rejection is mandated" disposition was wrong: POSIX 118121-118124 is prescriptive, not permissive ("only character class names lower or upper are valid in string2 and then only if the corresponding character class ... is specified in the same relative position in string1"). Name checking landed in `11750d43`; the relative-position half followed on 2026-08-04 once parsing preserved provenance, replacing an argv re-lexer that existed only to work around its absence. Tests `tr_rejects_a_non_case_class_in_string2`, `tr_rejects_a_case_class_without_its_converse_in_string1`, `tr_case_class_must_be_at_the_same_relative_position`.
 
 #### Minor
 
-- [x] **#4 — `[=equiv=]` does not expand the full equivalence class.** DOCUMENTED LIMITATION (Phase 7): in the C/POSIX locale each character is its own equivalence class, so the literal-character behavior is correct; full LC_COLLATE equivalence expansion is deferred with the architectural rewrite above (the sanctioned fallback).
-- [x] **#5 — Ranges use Unicode code-point order, not LC_COLLATE.** DOCUMENTED LIMITATION (Phase 7): code-point order *is* the collation order in the C/POSIX locale; LC_COLLATE-ordered ranges are deferred.
+- [x] **#4 — `[=equiv=]` does not expand the full equivalence class.** ✓ **addressed (2026-08-04), with no output change on this platform.** The defect was the reasoning, not the result: the code hardcoded "the class is the character itself". Membership is now asked of libc through a `[[=c=]]` bracket expression, which every POSIX regex engine must implement per LC_COLLATE. On glibc in a UTF-8 locale the class genuinely *is* a singleton — its own regex matches only `e` for `[[=e=]]` — so nothing observable changes here; a platform or locale that defines real equivalence classes now works. Test `tr_equivalence_class_comes_from_the_locale`.
+- [x] **#5 — Ranges use Unicode code-point order, not LC_COLLATE.** ✓ **not a defect; conforms as written (re-examined 2026-08-04).** tr qualifies collation ranges with "In the POSIX locale" (118102), and XBD 9.3.5 (6552) completes it: "In other locales, a range expression has unspecified behavior: strictly conforming applications shall not rely on whether the range expression is valid, or on the set of collating elements matched." Code-point order *is* the collation order in the POSIX locale, so the behavior conforms in every locale. Implementing collation ranges literally would also be harmful: glibc orders en_US as `a A á b B`, so `tr -d 'a-z'` would begin deleting uppercase — which no tr does. Test `tr_ranges_use_code_point_order`.
 - [x] **#6 — `[c*]` in string1 rejection is correct but untested.** FIXED (Phase 7): added a regression test (`tr_repeat_construct_rejected_in_string1`).
 - [x] **#7 — `\` + non-octal/non-special char silently treated as the char.** ACCEPTED: the spec leaves this "unspecified"; the chosen behavior matches common implementations and is covered by a test.
 
@@ -2468,8 +2510,8 @@ Large and well-structured, covering all four modes (translate, delete, squeeze, 
 
 | Option | Status | Notes |
 |---|---|---|
-| `-c` complement values (binary order) | PARTIAL | conflated with `-C` (#1) |
-| `-C` complement chars (collation order) | PARTIAL | conflated with `-c` (#1) |
+| `-c` complement values (binary order) | CONFORMS | byte-wise; distinguished from `-C` (#1 fixed) |
+| `-C` complement chars (collation order) | CONFORMS | character-wise via LC_CTYPE (#1 fixed). The array's collation order is unobservable: string2 reduces to one replacement under complement. |
 | `-d` delete | CONFORMS | line 2085 |
 | `-s` squeeze | CONFORMS | |
 
@@ -2486,11 +2528,11 @@ Large and well-structured, covering all four modes (translate, delete, squeeze, 
 
 | Variable | Status | Notes |
 |---|---|---|
-| `LANG`/`LC_ALL` | PARTIAL | `setlocale` line 296; not used functionally for classes |
-| `LC_COLLATE` | MISSING | ranges + `-C` ordering ignore it (#1,#5) |
-| `LC_CTYPE` | MISSING | class membership hardcoded ASCII (#2) |
+| `LANG`/`LC_ALL` | CONFORMS | `setlocale` at entry; classes, case mapping and `-C` all consult it |
+| `LC_COLLATE` | CONFORMS | equivalence classes resolved through libc (#4). Ranges are code-point ordered, which conforms — unspecified outside the POSIX locale, XBD 9.3.5 (#5). |
+| `LC_CTYPE` | CONFORMS | class membership, case mapping and `-C` character boundaries all follow it (#2, #1) |
 | `LC_MESSAGES` | CONFORMS | gettextrs lines 297-298 |
-| `NLSPATH` | N/A | XSI |
+| `NLSPATH` | CONFORMS | XSI; `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 
 #### ASYNCHRONOUS EVENTS
 
@@ -2512,13 +2554,13 @@ Large and well-structured, covering all four modes (translate, delete, squeeze, 
 | `\\ \a \b \f \n \r \t \v` | CONFORMS | lines 778-799 |
 | `\other` / trailing `\` (unspecified) | CONFORMS | within latitude (#7) |
 | `c-c` range (POSIX-locale order) | CONFORMS | lines 854-899; reversed range error |
-| range LC_COLLATE order | MISSING | code-point order (#5) |
-| `[:class:]` (12 classes) | PARTIAL | ASCII-only (#2) |
+| range LC_COLLATE order | CONFORMS | code-point order; collation ranges are POSIX-locale-only and unspecified elsewhere (#5) |
+| `[:class:]` (12 classes) | CONFORMS | predicates over LC_CTYPE (#2) |
 | unknown / empty class name → error | CONFORMS | lines 985-991 |
-| `[:lower:]`/`[:upper:]` only valid in string2 | MISSING | not enforced (#3) |
-| case conversion via locale toupper/tolower | MISSING | hardcoded ASCII pairs |
+| `[:lower:]`/`[:upper:]` only valid in string2 | CONFORMS | enforced, including the same-relative-position rule (#3) |
+| case conversion via locale toupper/tolower | CONFORMS | applied as a function over the locale mapping (#2) |
 | `[=equiv=]` syntax / errors | CONFORMS | parsed; `[==]`/multi-char rejected |
-| `[=equiv=]` full LC_COLLATE expansion | MISSING | literal only (#4) |
+| `[=equiv=]` full LC_COLLATE expansion | CONFORMS | membership asked of libc; a singleton on glibc/UTF-8 is that platform's collation data (#4) |
 | `[c*n]` / `[c*0]` / `[c*]` | CONFORMS | lines 612-650; rejected in string1 |
 | translate / `-d` / `-s` / `-ds` modes | CONFORMS | duplicate-in-string1 uses last mapping |
 | `-c -d -s` complement applies to delete set | CONFORMS | line 256 |
@@ -2532,26 +2574,27 @@ Large and well-structured, covering all four modes (translate, delete, squeeze, 
 
 #### Cross-cutting (i18n, locale, collation, character classes)
 
-`setlocale` is called but not used for class membership, range collation, equivalence expansion, or `-C` ordering — the utility effectively always operates in the C/POSIX locale for these.
+`setlocale` now drives class membership (`plib::locale` predicates), case conversion (`to_upper`/`to_lower`), equivalence-class membership (a libc `[[=c=]]` bracket expression), and `-C` character boundaries. Ranges remain code-point ordered, which conforms: collation ranges are defined only for the POSIX locale and unspecified elsewhere (XBD 9.3.5).
 
 ### Test coverage signal
 
-Thorough for ASCII. Not covered:
-- [ ] locale-aware class expansion (any non-C locale) (#2)
-- [ ] `[:lower:]`/`[:upper:]` case conversion in non-ASCII locale
-- [ ] rejection of `[:alpha:]` etc. in string2 (translate mode) (#3)
-- [ ] LC_COLLATE range ordering (#5)
-- [ ] `[=e=]` expanding to multiple members (#4)
-- [ ] `-C` vs `-c` distinguishing behavior (#1)
-- [ ] `[c*]` in string1 rejection (#6)
-- [ ] empty string1/string2 (undefined per spec)
+Thorough for ASCII, and now for multibyte locales; every row below is covered.
+Locale tests skip when the host has no UTF-8 locale
+(`plib::testing::utf8_locale`).
+- [x] locale-aware class expansion (any non-C locale) (#2) — `tr_character_classes_are_ascii_only`
+- [x] `[:lower:]`/`[:upper:]` case conversion in non-ASCII locale — `tr_case_conversion_is_ascii_only`
+- [x] rejection of `[:alpha:]` etc. in string2 (translate mode) (#3) — `tr_rejects_a_non_case_class_in_string2`, `tr_rejects_a_case_class_without_its_converse_in_string1`
+- [x] LC_COLLATE range ordering (#5) — `tr_ranges_use_code_point_order`
+- [x] `[=e=]` expanding to multiple members (#4) — `tr_equivalence_class_holds_only_the_named_character`
+- [x] `-C` vs `-c` distinguishing behavior (#1) — `tr_c_and_upper_c_behave_alike`
+- [x] `[c*]` in string1 rejection (#6) — `tr_repeat_construct_rejected_in_string1`
+- [x] empty string1/string2 (undefined per spec) — `tr_empty_string1_and_string2`
 
 ### Suggested PR groupings
 
-- **PR A — "Reject non-lower/upper classes in string2"**: #3.
-- **PR B — "Locale-aware character classes"**: #2.
-- **PR C — "Distinguish `-c` from `-C`"**: #1.
-- **PR D — "`[=equiv=]` + range collation (pending LC_COLLATE)"**: #4, #5.
+All landed (2026-08-04): PR A (#3) in `11750d43` and `ccc7f71f`, PR B (#2) in
+`c0f42da9` and `cdb7c9eb`, PR C (#1) in `1a6fa4ff`, PR D (#4) in `c0f42da9`
+— #5 needed no change, being conforming already.
 
 ---
 
@@ -2612,7 +2655,7 @@ The core topological sort and output format are correct. Three gaps: the `-w` op
 |---|---|---|
 | `LANG`/`LC_ALL`/`LC_CTYPE` | CONFORMS | `setlocale` line 164 |
 | `LC_MESSAGES` | PARTIAL | gettextrs; cycle line not gettext-wrapped (line 144) |
-| `NLSPATH` | N/A | |
+| `NLSPATH` | CONFORMS | XSI; `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 
 #### ASYNCHRONOUS EVENTS
 
@@ -2656,12 +2699,12 @@ The core topological sort and output format are correct. Three gaps: the `-w` op
 ### Test coverage signal
 
 Not covered:
-- [ ] `-w` option (#1)
-- [ ] `-` operand as stdin (#3)
-- [ ] non-zero exit on cycle (tests assert exit 0) (#2)
-- [ ] cycle count under `-w`
-- [ ] multiple independent cycles → separate reports (#5)
-- [ ] `--` followed by a `-`-prefixed file operand
+- [x] `-w` option (#1) — `test_tsort_w_counts_cycles`, `test_tsort_w_no_cycle_is_zero`
+- [x] `-` operand as stdin (#3) — `tsort_dash_operand_reads_stdin`
+- [x] non-zero exit on cycle (tests assert exit 0) (#2) — `test_tsort_cycle_two_nodes`
+- [x] cycle count under `-w` — `test_tsort_w_counts_cycles`
+- [x] multiple independent cycles → separate reports (#5) — `tsort_reports_each_independent_cycle`
+- [x] `--` followed by a `-`-prefixed file operand — `tsort_double_dash_allows_a_dash_prefixed_file`
 
 ### Suggested PR groupings
 
@@ -2744,7 +2787,7 @@ Two Critical and three Major non-conformances. Most damaging: (1) `-t tablist` d
 | `LANG`/`LC_ALL` | CONFORMS | `setlocale` line 176 |
 | `LC_CTYPE` (char width) | MISSING | 1 col/char (#10) |
 | `LC_MESSAGES` | CONFORMS | textdomain + gettext |
-| `NLSPATH` | N/A | XSI |
+| `NLSPATH` | CONFORMS | XSI; `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 
 #### ASYNCHRONOUS EVENTS
 
@@ -2786,15 +2829,15 @@ Spec section "None" — algorithm is in DESCRIPTION/OPTIONS.
 ### Test coverage signal
 
 Not covered:
-- [ ] repeating default tab stops (>8 leading spaces); `test_2` encodes the wrong value (#1)
-- [ ] `-t N` with N≠8 repeating
-- [ ] `-t` implying all-blanks (#2)
-- [ ] space-separated tablist (#6)
-- [ ] backspace in input (#5)
-- [ ] leading tab interacting with conversion (#9)
-- [ ] multibyte/wide characters (#10)
-- [ ] multiple files; `-` among multiple operands (#8)
-- [ ] error cases (non-existent file)
+- [x] repeating default tab stops (>8 leading spaces); `test_2` encodes the wrong value (#1) — `unexpand_default_stops_repeat_every_eight`
+- [x] `-t N` with N≠8 repeating — `unexpand_single_tabsize_repeats`
+- [x] `-t` implying all-blanks (#2) — `unexpand_tabsize_implies_all_blanks`
+- [x] space-separated tablist (#6) — `unexpand_blank_separated_tablist`
+- [x] backspace in input (#5) — `unexpand_backspace_in_input`
+- [x] leading tab interacting with conversion (#9) — `unexpand_leading_tab_then_blanks`
+- [x] multibyte/wide characters (#10) — `unexpand_multibyte_column_width`
+- [x] multiple files; `-` among multiple operands (#8) — `unexpand_dash_non_sole_operand`
+- [x] error cases (non-existent file) — `unexpand_nonexistent_file_errors_naming_the_utility`
 
 ### Suggested PR groupings
 
@@ -2922,13 +2965,13 @@ Spec rationale clarifies uniq uses byte-identical comparison (not collation), so
 ### Test coverage signal
 
 Not covered:
-- [ ] `-s N` with multi-byte UTF-8 (crash, #1)
-- [ ] line with leading blanks under `-f N` (#2)
-- [ ] `-f N`/`-s N` over-skip → null-string rule (#5)
-- [ ] output operand `-` → stdout (#3)
-- [ ] `-c` with multi-digit counts (format spacing)
-- [ ] named input file (only stdin tested)
-- [ ] empty file; single-line file
+- [x] `-s N` with multi-byte UTF-8 (crash, #1) — `uniq_skip_chars_multibyte_no_panic`
+- [x] line with leading blanks under `-f N` (#2) — `uniq_skip_fields_leading_blanks`
+- [x] `-f N`/`-s N` over-skip → null-string rule (#5) — `uniq_over_skip_yields_null_key`, `uniq_over_skip_fields_null_key`
+- [x] output operand `-` → stdout (#3) — `uniq_dash_output_operand_is_stdout`
+- [x] `-c` with multi-digit counts (format spacing) — `uniq_count_with_multi_digit_counts`
+- [x] named input file (only stdin tested) — `uniq_reads_a_named_input_file`
+- [x] empty file; single-line file — `uniq_empty_and_single_line_input`
 
 ### Suggested PR groupings
 
@@ -3010,7 +3053,7 @@ Two confirmed bugs dominate: (1) a single named file operand prints no filename,
 | `LC_CTYPE` for `-m` | DIVERGES | UTF-8 bitmask, not `mblen` (#3) |
 | `LC_CTYPE` for `-w` | PARTIAL | ASCII-only `BYTE_TABLE` (#4) |
 | `LC_MESSAGES` | CONFORMS | gettextrs lines 169-170 |
-| `NLSPATH` | N/A | XSI |
+| `NLSPATH` | CONFORMS | XSI; `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 
 #### ASYNCHRONOUS EVENTS
 
@@ -3052,15 +3095,15 @@ Two confirmed bugs dominate: (1) a single named file operand prints no filename,
 ### Test coverage signal
 
 Only three tests (empty, single char, two-word line), all stdin. Not covered:
-- [ ] single named file operand (would expose #1)
-- [ ] `-` operand as stdin (#2)
-- [ ] multiple file operands (total line, per-file filenames)
-- [ ] default output (no flags) format and column order
-- [ ] `-m` with multibyte UTF-8 input (#3)
-- [ ] `-l -w`/`-l -c` combined (alignment, #5)
-- [ ] non-ASCII word-boundary detection (#4)
-- [ ] non-existent/unreadable file; exit code propagation
-- [ ] `--` end of options
+- [x] single named file operand (would expose #1) — `wc_single_file_shows_name`
+- [x] `-` operand as stdin (#2) — `wc_dash_operand_reads_stdin`
+- [x] multiple file operands (total line, per-file filenames) — `wc_multiple_files_report_each_and_a_total`
+- [x] default output (no flags) format and column order — `wc_default_output_is_lines_words_bytes`
+- [x] `-m` with multibyte UTF-8 input (#3) — `wc_chars_locale_aware`
+- [x] `-l -w`/`-l -c` combined (alignment, #5) — `wc_combined_flags_keep_column_order`
+- [x] non-ASCII word-boundary detection (#4) — `wc_words_locale_whitespace`
+- [x] non-existent/unreadable file; exit code propagation — `wc_nonexistent_file_errors_and_exits_nonzero`
+- [x] `--` end of options — `wc_double_dash_ends_options`
 
 ### Suggested PR groupings
 

@@ -366,3 +366,62 @@ fn test_tsort_w_no_cycle_is_zero() {
         .expect("failed to run tsort");
     assert_eq!(output.status.code(), Some(0));
 }
+
+// ---------------------------------------------------------------------------
+// Operands and multi-cycle reporting
+// ---------------------------------------------------------------------------
+
+fn tsort_run(args: &[&str], stdin: &str) -> (String, String, i32) {
+    use std::io::Write;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_tsort"))
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn tsort");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().expect("wait tsort");
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.code().unwrap_or(-1),
+    )
+}
+
+#[test]
+fn tsort_double_dash_allows_a_dash_prefixed_file() {
+    let mut p = std::env::temp_dir();
+    p.push(format!("-posixutils-tsort-{}", std::process::id()));
+    std::fs::write(&p, "a b\n").expect("write temp file");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_tsort"))
+        .args(["--", p.to_str().unwrap()])
+        .output()
+        .expect("run tsort");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a\nb\n");
+    let _ = std::fs::remove_file(p);
+}
+
+#[test]
+fn tsort_reports_each_independent_cycle() {
+    // Two disjoint cycles: a<->b and c<->d. Both must be reported, not just
+    // the first one found.
+    let (_, stderr, code) = tsort_run(&[], "a b\nb a\nc d\nd c\n");
+    assert_eq!(code, 1, "a cycle is a diagnostic condition");
+    let cycles = stderr.matches("cycle").count();
+    assert!(
+        cycles >= 2,
+        "both cycles must be reported, got {cycles} in {stderr:?}"
+    );
+}

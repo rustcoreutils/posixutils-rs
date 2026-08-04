@@ -135,7 +135,7 @@ English.
 | `LC_ALL` | CONFORMS | same. |
 | `LC_CTYPE` | CONFORMS (init) | `setlocale` honors it; names are now byte-faithful `OsString` (#9 ✓ Phase 1). |
 | `LC_MESSAGES` | CONFORMS | (#6 ✓ Phase 1/4) Captions + message literals via `gettext`; OS error text via libc `strerror`. |
-| `NLSPATH` (XSI) | PARTIAL | `textdomain`/`bind_textdomain_codeset` wired (`fs/df.rs:359-360`); no explicit catalog path handling. |
+| `NLSPATH` (XSI) | CONFORMS | `textdomain`/`bind_textdomain_codeset` wired (`fs/df.rs:359-360`); `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 
 #### ASYNCHRONOUS EVENTS
 

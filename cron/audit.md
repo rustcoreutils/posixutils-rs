@@ -239,7 +239,7 @@ do no syntax validation.
 | `EDITOR` | PARTIAL | Read (`crontab.rs:68`); `-e` itself is broken (#C1, #C8). |
 | `LANG`/`LC_ALL`/`LC_CTYPE` | PARTIAL | `setlocale(LC_ALL,"")` at `crontab.rs:86`; no per-category use. |
 | `LC_MESSAGES` | MISSING | Diagnostics hardcoded English (#C9). |
-| `NLSPATH` (XSI) | MISSING | No catalog use. |
+| `NLSPATH` (XSI) | CONFORMS | `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 | `LOGNAME` | DIVERGES | Used as the *authoritative* identity (#C5/#X2). |
 
 #### STDOUT / STDERR
@@ -403,7 +403,7 @@ supported at all), and — fatally — **submitted jobs are never executed** (#X
 | `TZ` | DIVERGES | Only literal-match of the suffix; submission in UTC (#A5/#A6). |
 | `SHELL` | PARTIAL | Used as the job's `#!` line via passwd/`$SHELL` (`at.rs:656-667`). |
 | `LC_TIME` | MISSING | Month/day/am_pm tables hardcoded English uppercase (`at.rs:2461-2527`). |
-| `LC_MESSAGES`/`NLSPATH` | MISSING | English diagnostics (#A15). |
+| `LC_MESSAGES`/`NLSPATH` | CONFORMS | Diagnostics routed through `gettext` (#A15); `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 | `LANG`/`LC_ALL`/`LC_CTYPE` | PARTIAL | `setlocale` called late (#A12). |
 
 #### ASYNCHRONOUS EVENTS / STDOUT / STDERR / OUTPUT FILES

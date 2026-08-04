@@ -176,7 +176,7 @@ crashes or hangs.
 |---|---|---|
 | `LANG`/`LC_ALL`/`LC_CTYPE` | CONFORMS | `setlocale(LcAll,"")` id.rs:353 |
 | `LC_MESSAGES` | CONFORMS ✓ | `plib::diag` + `gettext()`-wrapped diagnostics (fixed #I3, phase 1); inert only until `.mo` catalogs ship (tree-wide) |
-| `NLSPATH` (XSI) | N/A | gettextrs stub-backed |
+| `NLSPATH` (XSI) | CONFORMS | `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 
 #### Asynchronous events
 - [x] Default (spec 100654). No custom handling. N/A.
@@ -308,7 +308,7 @@ case; non-conformant for the full surface.
 - [x] STDIN/`-f` fallback when no operands — CONFORMS ✓ (fixed #LG2, phase 6); one non-empty line per message. logger.rs.
 
 #### Environment variables
-- [x] LANG/LC_ALL/LC_CTYPE/LC_MESSAGES — PARTIAL. `setlocale(LcAll,"")` logger.rs:15 honors precedence; no per-category handling. NLSPATH not separately handled (acceptable).
+- [x] LANG/LC_ALL/LC_CTYPE/LC_MESSAGES — PARTIAL. `setlocale(LcAll,"")` logger.rs:15 honors precedence; no per-category handling. NLSPATH CONFORMS — `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04).
 
 #### Asynchronous events
 - [x] Default (spec 102935). No handlers. CONFORMS.
@@ -486,7 +486,7 @@ instead. The obsolete `-s` option is correctly absent (removed in Issue 6).
 | STDIN examined, not read | CONFORMS `- [x]` | `is_terminal()`. tty.rs:27 |
 | Name reported = stdin | CONFORMS ✓ | `ttyname_of(STDIN_FILENO)` only (fixed #TY1, phase 4). tty.rs |
 | Env LANG/LC_*/LC_MESSAGES | CONFORMS ✓ | `plib::diag` + `gettext`-wrapped output (fixed #TY2, phase 4). tty.rs |
-| NLSPATH (XSI) | N/A | textdomain machinery. tty.rs:22-23 |
+| NLSPATH (XSI) | CONFORMS | `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). tty.rs:22-23 |
 | Async events (Default) | N/A `- [x]` | |
 | STDOUT `"%s\n"` name when tty | CONFORMS `- [x]` | tty.rs:34 |
 | `"not a tty\n"` otherwise (to stdout) | CONFORMS `- [x]` | tty.rs:29 (informative output, correct channel) |
@@ -571,7 +571,7 @@ possibly-empty string. Treat as non-conformant and security-suspect.
 |---|---|---|
 | LANG/LC_ALL/LC_CTYPE | CONFORMS ✓ | `plib::diag::init_locale`; diagnostics `gettext`-wrapped (fixed #NG8, phase 7/8) |
 | LC_MESSAGES | CONFORMS ✓ | all diagnostics via `plib::diag` + `gettext` (fixed #NG8) |
-| NLSPATH (XSI) | N/A | gettext/textdomain used |
+| NLSPATH (XSI) | CONFORMS | `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 | SHELL | CONFORMS ✓ | honored in non-login mode (fixed #NG7, phase 7). newgrp.rs `exec_shell` |
 | HOME | CONFORMS ✓ | set + cwd in `-l` from `pw_dir`. newgrp.rs `exec_shell` |
 
@@ -812,7 +812,7 @@ rather than inferred.
 | LANG/LC_ALL | PARTIAL | only via `setlocale` 1941; no behavioral use |
 | LC_CTYPE | MISSING | no print/space classification (#TK7); peer bytes forced through UTF-8 (#TK10) |
 | LC_MESSAGES | MISSING | diagnostics not localized (#TK13) |
-| NLSPATH (XSI) | PARTIAL | textdomain set (1942-1943) but unused for diagnostics |
+| NLSPATH (XSI) | PARTIAL | `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). Diagnostics themselves are not all `gettext`-wrapped (1942-1943). |
 | TERM | MISSING | no `TERM` read; hardcoded ANSI escapes ignore terminfo (spec 116812-116814 requires determining the terminal type) |
 
 #### Asynchronous events

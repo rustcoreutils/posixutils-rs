@@ -328,3 +328,148 @@ fn pr_form_feed_multi_column_page_accounting() {
         "a,c,\nb,\nd,f,\ne,\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Option coverage and diagnostics
+// ---------------------------------------------------------------------------
+
+fn pr_tmp(tag: &str, content: &str) -> std::path::PathBuf {
+    let mut p = std::env::temp_dir();
+    p.push(format!("posixutils-pr-{}-{}", std::process::id(), tag));
+    std::fs::write(&p, content).expect("write temp file");
+    p
+}
+
+#[test]
+fn pr_double_space_output() {
+    // -d writes the output double-spaced.
+    let f = pr_tmp("d", "l1\nl2\n");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_pr"))
+        .args(["-d", "-t", f.to_str().unwrap()])
+        .output()
+        .expect("run pr");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "l1\n\nl2\n\n");
+    let _ = std::fs::remove_file(f);
+}
+
+#[test]
+fn pr_suppress_file_warnings() {
+    // -r writes no diagnostic for a file that cannot be opened; the exit
+    // status still reflects the failure.
+    let with = std::process::Command::new(env!("CARGO_BIN_EXE_pr"))
+        .args(["-r", "no-such-file-xyz"])
+        .output()
+        .expect("run pr");
+    assert_ne!(with.status.code(), Some(0));
+    assert!(
+        with.stderr.is_empty(),
+        "-r must suppress the diagnostic, got {:?}",
+        String::from_utf8_lossy(&with.stderr)
+    );
+
+    let without = std::process::Command::new(env!("CARGO_BIN_EXE_pr"))
+        .arg("no-such-file-xyz")
+        .output()
+        .expect("run pr");
+    assert_ne!(without.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&without.stderr);
+    assert!(!stderr.is_empty(), "without -r there must be a diagnostic");
+    // The diagnostic identifies the utility, as the rest of the tree does.
+    assert!(stderr.starts_with("pr:"), "got {stderr:?}");
+}
+
+#[test]
+fn pr_merge_of_empty_files() {
+    let a = pr_tmp("m1", "");
+    let b = pr_tmp("m2", "");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_pr"))
+        .args(["-m", "-t", a.to_str().unwrap(), b.to_str().unwrap()])
+        .output()
+        .expect("run pr");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    let _ = std::fs::remove_file(a);
+    let _ = std::fs::remove_file(b);
+}
+
+#[test]
+fn pr_form_feed_and_pause_without_a_terminal() {
+    // -f and -F both "use a <form-feed> for new pages, instead of the default
+    // behavior that uses a sequence of <newline> characters" (POSIX 111703,
+    // 111706). They differ only in the pause, and the pause is conditional:
+    // -f pauses "if standard output is a TTY device" (111852-111855), as does
+    // -p (111731). Standard output here is a pipe, so neither may pause -- and
+    // pr must not block on /dev/tty just because it inherited a controlling
+    // terminal, which is what `pr -f file > out` used to do, forever.
+    let f = pr_tmp("ff", &"line\n".repeat(200));
+    let run = |opts: &[&str]| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_pr"))
+            .args(opts)
+            .arg(f.to_str().unwrap())
+            .output()
+            .expect("run pr");
+        assert_eq!(out.status.code(), Some(0), "pr {opts:?} exit status");
+        out
+    };
+
+    let with_f = run(&["-f"]);
+    let with_upper_f = run(&["-F"]);
+    let with_p = run(&["-p"]);
+    let plain = run(&[]);
+
+    // Form feeds separate pages under both -f and -F, but not by default.
+    for (opt, out) in [("-f", &with_f), ("-F", &with_upper_f)] {
+        assert!(
+            out.stdout.contains(&b'\x0c'),
+            "pr {opt} separates pages with a <form-feed>"
+        );
+    }
+    assert!(
+        !plain.stdout.contains(&b'\x0c'),
+        "the default page separator is <newline> characters, not <form-feed>"
+    );
+    assert_eq!(
+        with_f.stdout, with_upper_f.stdout,
+        "-f and -F lay out pages identically; only the pause differs"
+    );
+
+    // No terminal, so no pause: no <alert> on stderr from any of them.
+    for (opt, out) in [("-f", &with_f), ("-F", &with_upper_f), ("-p", &with_p)] {
+        assert!(
+            !out.stderr.contains(&b'\x07'),
+            "pr {opt} must not alert when standard output is not a terminal, got {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let _ = std::fs::remove_file(f);
+}
+
+#[test]
+fn pr_header_date_follows_lc_time() {
+    // The page header carries a date. It must render under any locale without
+    // failing; the exact spelling is locale data, not something to pin.
+    let Some(loc) = plib::testing::utf8_locale() else {
+        return;
+    };
+    let f = pr_tmp("date", "body\n");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_pr"))
+        .arg(f.to_str().unwrap())
+        .env("LC_ALL", &loc)
+        .env("LC_TIME", &loc)
+        .output()
+        .expect("run pr");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let header = stdout
+        .lines()
+        .find(|l| l.contains("Page"))
+        .expect("a page header is written");
+    assert!(header.contains("Page 1"), "got {header:?}");
+    assert!(
+        header.contains(f.file_name().unwrap().to_str().unwrap()),
+        "the header names the file, got {header:?}"
+    );
+    let _ = std::fs::remove_file(f);
+}

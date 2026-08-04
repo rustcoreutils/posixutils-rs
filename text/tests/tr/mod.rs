@@ -807,3 +807,272 @@ fn tr_repeat_construct_rejected_in_string1() {
         expected_exit_code: 1,
     });
 }
+
+// ---------------------------------------------------------------------------
+// string2 character-class restrictions (POSIX 118121-118124)
+// ---------------------------------------------------------------------------
+
+fn tr_expect_error(args: &[&str], stdin: &str) -> String {
+    use std::io::Write;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_tr"))
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn tr");
+    // These invocations fail during argument validation, so tr may already have
+    // exited by the time this write lands; a broken pipe is expected here, not
+    // a test failure.
+    let _ = child.stdin.as_mut().unwrap().write_all(stdin.as_bytes());
+    let out = child.wait_with_output().expect("wait tr");
+    assert_ne!(out.status.code(), Some(0), "expected a non-zero exit");
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+#[test]
+fn tr_rejects_a_non_case_class_in_string2() {
+    // "only character class names lower or upper are valid in string2".
+    // This silently translated to "ABC" instead.
+    let err = tr_expect_error(&["abc", "[:alpha:]"], "abc");
+    assert!(err.contains("[:alpha:]"), "got {err:?}");
+    for class in ["[:digit:]", "[:space:]", "[:punct:]"] {
+        tr_expect_error(&["abc", class], "abc");
+    }
+}
+
+#[test]
+fn tr_rejects_a_case_class_without_its_converse_in_string1() {
+    // "and then only if the corresponding character class (upper and lower,
+    // respectively) is specified in the same relative position in string1".
+    let err = tr_expect_error(&["abc", "[:upper:]"], "abc");
+    assert!(err.contains("[:lower:]"), "got {err:?}");
+    tr_expect_error(&["abc", "[:lower:]"], "abc");
+}
+
+#[test]
+fn tr_allows_the_paired_case_conversion_forms() {
+    tr_test(&["[:lower:]", "[:upper:]"], "aBc", "ABC");
+    tr_test(&["[:upper:]", "[:lower:]"], "aBc", "abc");
+}
+
+#[test]
+fn tr_allows_any_class_in_string2_with_both_d_and_s() {
+    // "When both the -d and -s options are specified, any of the character
+    // class names shall be accepted in string2."
+    tr_test(&["-d", "-s", "a", "[:alpha:]"], "abbc", "bc");
+}
+
+#[test]
+fn tr_empty_string1_and_string2() {
+    // Both empty: POSIX leaves this undefined; pin what we do rather than
+    // leaving it unspecified in the suite too.
+    let err = tr_expect_error(&["abc", ""], "abc");
+    assert!(err.contains("non-empty"), "got {err:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Locale-dependent behavior
+//
+// These pin the *current* behavior of gaps the audit already records as
+// MISSING (#1, #2, #4, #5): character classes, case mapping, equivalence
+// classes and ranges are all ASCII/code-point based rather than driven by
+// LC_CTYPE and LC_COLLATE. Making them locale-aware is a substantial change to
+// tr's parsing layer, so the tests document where the boundary is today and
+// will fail loudly when it moves.
+// ---------------------------------------------------------------------------
+
+fn tr_locale(args: &[&str], stdin: &[u8], locale: &str) -> Vec<u8> {
+    use std::io::Write;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_tr"))
+        .args(args)
+        .env("LC_ALL", locale)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn tr");
+    let _ = child.stdin.as_mut().unwrap().write_all(stdin);
+    child.wait_with_output().expect("wait tr").stdout
+}
+
+#[test]
+fn tr_character_classes_follow_lc_ctype() {
+    // POSIX 118113-118114: a class represents the characters belonging to it
+    // "as defined by the current setting of the LC_CTYPE locale category".
+    // The classes used to be hardcoded ASCII, so U+00E9 survived a delete of
+    // [:alpha:] in every locale.
+    let Some(loc) = plib::testing::utf8_locale() else {
+        return;
+    };
+    let out = tr_locale(&["-d", "[:alpha:]"], "a\u{e9}b\n".as_bytes(), &loc);
+    assert_eq!(out, b"\n", "U+00E9 is a letter in a UTF-8 locale");
+
+    // In the C locale it is not a letter, and must survive.
+    let out = tr_locale(&["-d", "[:alpha:]"], "a\u{e9}b\n".as_bytes(), "C");
+    assert_eq!(
+        out,
+        "\u{e9}\n".as_bytes(),
+        "C locale has no non-ASCII letters"
+    );
+}
+
+#[test]
+fn tr_case_conversion_follows_the_locale() {
+    // POSIX 118125-118130: `[:lower:]` in string1 with `[:upper:]` in string2
+    // "shall be interpreted as a request for case conversion", using the
+    // toupper mapping of the current LC_CTYPE. This used to work only by
+    // accident — both ASCII classes expand to 26 characters in the same order,
+    // so pairing them by index happened to line up — and so did nothing for
+    // characters outside ASCII.
+    let Some(loc) = plib::testing::utf8_locale() else {
+        return;
+    };
+    assert_eq!(
+        tr_locale(&["[:lower:]", "[:upper:]"], "\u{e9}\n".as_bytes(), &loc),
+        "\u{c9}\n".as_bytes(),
+        "U+00E9 uppercases to U+00C9"
+    );
+    assert_eq!(
+        tr_locale(&["[:upper:]", "[:lower:]"], "\u{c9}\n".as_bytes(), &loc),
+        "\u{e9}\n".as_bytes()
+    );
+    // ASCII conversion is unchanged, in any locale.
+    assert_eq!(
+        tr_locale(&["[:lower:]", "[:upper:]"], b"abc\n", &loc),
+        b"ABC\n"
+    );
+    // The C locale has no case mapping for U+00E9, so it passes through.
+    assert_eq!(
+        tr_locale(&["[:lower:]", "[:upper:]"], "\u{e9}\n".as_bytes(), "C"),
+        "\u{e9}\n".as_bytes()
+    );
+}
+
+#[test]
+fn tr_squeeze_uses_the_case_conversion_results() {
+    // POSIX 118178-118181: in a case conversion the last operand's array holds
+    // only the *results* of the mapping, so `-s` squeezes those.
+    let Some(loc) = plib::testing::utf8_locale() else {
+        return;
+    };
+    assert_eq!(
+        tr_locale(&["-s", "[:upper:]", "[:lower:]"], b"AABB\n", &loc),
+        b"ab\n"
+    );
+}
+
+#[test]
+fn tr_equivalence_class_comes_from_the_locale() {
+    // POSIX 118137-118138: `[=c=]` represents the characters "belonging to the
+    // same equivalence class as equiv, as defined by the current setting of the
+    // LC_COLLATE locale category". There is no portable call to enumerate one,
+    // so membership is asked of libc through a `[[=c=]]` bracket expression
+    // rather than assumed to be the character itself.
+    //
+    // On glibc in a UTF-8 locale that class really is a singleton — its own
+    // regex engine matches only `e` for `[[=e=]]` — so U+00E9 survives. That is
+    // the platform's collation data, not an approximation on our side.
+    let Some(loc) = plib::testing::utf8_locale() else {
+        return;
+    };
+    assert_eq!(
+        tr_locale(&["-d", "[=e=]"], "e\u{e9}\n".as_bytes(), &loc),
+        "\u{e9}\n".as_bytes()
+    );
+    // The named character itself is always a member.
+    assert_eq!(tr_locale(&["-d", "[=e=]"], b"beet\n", &loc), b"bt\n");
+}
+
+#[test]
+fn tr_ranges_use_code_point_order() {
+    // Conforming, not a gap. tr's `c-c` is defined "In the POSIX locale ... as
+    // defined by the collation sequence" (118102), and XBD 9.3.5 (6552) settles
+    // the rest: "In other locales, a range expression has unspecified
+    // behavior". Code-point order *is* the collation order in the POSIX locale,
+    // so `a-b` is exactly {a, b} everywhere.
+    //
+    // Following collation literally would be actively harmful: glibc's en_US
+    // orders `a A á b B`, so `tr -d 'a-z'` would start deleting uppercase.
+    let Some(loc) = plib::testing::utf8_locale() else {
+        return;
+    };
+    assert_eq!(tr_locale(&["-d", "a-b"], b"aAbB\n", &loc), b"AB\n");
+    assert_eq!(tr_locale(&["-d", "a-b"], b"aAbB\n", "C"), b"AB\n");
+}
+
+#[test]
+fn tr_lowercase_c_complements_values_uppercase_c_complements_characters() {
+    // POSIX 118043: `-c` complements "the set of values"; 118045: `-C`
+    // complements "the set of characters ... as defined by LC_CTYPE". They were
+    // collapsed into one flag under a literal "How are these different?".
+    //
+    // With a multi-byte member, the unit is what differs: `-c` replaces each
+    // *byte* outside the set, `-C` each whole *character*.
+    let Some(loc) = plib::testing::utf8_locale() else {
+        return;
+    };
+    let input = "\u{16C6}\u{16A0}\u{16CF}".as_bytes(); // ᛆᚠᛏ, three 3-byte characters
+
+    assert_eq!(
+        tr_locale(&["-c", "\u{16CF}", "A"], input, &loc),
+        "AAAAAA\u{16CF}".as_bytes(),
+        "-c works on values: six bytes outside the set, six replacements"
+    );
+    assert_eq!(
+        tr_locale(&["-C", "\u{16CF}", "A"], input, &loc),
+        "AA\u{16CF}".as_bytes(),
+        "-C works on characters: two characters outside the set"
+    );
+}
+
+#[test]
+fn tr_upper_c_deletes_whole_characters() {
+    let Some(loc) = plib::testing::utf8_locale() else {
+        return;
+    };
+    // Keep only ᛏ. Both spellings keep it whole; the difference is the unit
+    // the *deletion* works on, which is not observable when everything else
+    // vanishes either way.
+    let input = "\u{16C6}\u{16CF}".as_bytes();
+    assert_eq!(
+        tr_locale(&["-d", "-C", "\u{16CF}"], input, &loc),
+        "\u{16CF}".as_bytes()
+    );
+    assert_eq!(
+        tr_locale(&["-d", "-c", "\u{16CF}"], input, &loc),
+        "\u{16CF}".as_bytes()
+    );
+}
+
+#[test]
+fn tr_delete_keeps_multibyte_characters_whole() {
+    // A kept multi-byte character used to be truncated to its lead byte: the
+    // index advanced past the continuation bytes but only one was written.
+    let Some(loc) = plib::testing::utf8_locale() else {
+        return;
+    };
+    assert_eq!(
+        tr_locale(&["-d", "x"], "a\u{16CF}b".as_bytes(), &loc),
+        "a\u{16CF}b".as_bytes(),
+        "a character matching nothing must survive intact"
+    );
+    assert_eq!(
+        tr_locale(&["-d", "\u{16C6}"], "\u{16C6}\u{16CF}".as_bytes(), &loc),
+        "\u{16CF}".as_bytes()
+    );
+}
+
+#[test]
+fn tr_case_class_must_be_at_the_same_relative_position() {
+    // POSIX 118123-118124: `[:upper:]` is valid in string2 "only if the
+    // corresponding character class ... is specified in the same relative
+    // position in string1". Only the class *names* were checked before, because
+    // parsing had already flattened classes to characters and the operand list
+    // no longer recorded where they came from.
+    let err = tr_expect_error(&["x[:lower:]", "[:upper:]y"], "abc");
+    assert!(err.contains("same relative position"), "got {err:?}");
+
+    // Aligned, so accepted, and the conversion applies to the class position.
+    tr_test(&["x[:lower:]", "y[:upper:]"], "aBc", "ABC");
+    tr_test(&["x[:lower:]", "y[:upper:]"], "xbc", "yBC");
+}

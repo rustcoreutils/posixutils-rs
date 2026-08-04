@@ -296,3 +296,35 @@ fn test_tail_c_and_n() {
         "tail: options '-c' and '-n' cannot be used together\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Byte offsets from the start, and error paths
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_tail_c_plus_one_is_the_whole_file() {
+    // POSIX: `-c +number` counts from the beginning of the file, and +1 is the
+    // first byte, so the entire file is copied.
+    run_test(TestPlan {
+        cmd: String::from("tail"),
+        args: vec![String::from("-c"), String::from("+1")],
+        stdin_data: String::from("abcdef"),
+        expected_out: String::from("abcdef"),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn test_tail_nonexistent_file_errors() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_tail"))
+        .arg("no-such-file-xyz")
+        .output()
+        .expect("run tail");
+    assert_ne!(out.status.code(), Some(0), "a missing operand must exit >0");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.starts_with("tail:"),
+        "the diagnostic must name the utility, got {stderr:?}"
+    );
+}

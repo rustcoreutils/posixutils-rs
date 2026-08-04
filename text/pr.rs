@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use chrono::{DateTime, Local};
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use plib::io::input_stream;
 
 use self::pr_util::{line_transform, Args, PageIterator, Parameters};
@@ -66,6 +66,19 @@ impl IntoIoResult for std::fmt::Result {
 // trigger from <carriage-return> to <newline>.) The response must come from
 // /dev/tty, not standard input.
 fn pause() -> io::Result<()> {
+    // POSIX -p (111731): "Pause before beginning each page **if the standard
+    // output is directed to a terminal**"; the XSI -f pause carries the same
+    // condition (111852-111855, "if standard output is a TTY device"). Pausing
+    // regardless meant `pr -p file > out` blocked forever on /dev/tty whenever
+    // the process merely *had* a controlling terminal — which is every script
+    // run from a shell. The alert is part of the pause, so it is not written
+    // either.
+    //
+    // SAFETY: isatty is thread-safe and side-effect-free on any fd number.
+    if unsafe { libc::isatty(libc::STDOUT_FILENO) } != 1 {
+        return Ok(());
+    }
+
     // Must print \a to stderr.
     eprint!("{ALERT}");
 
@@ -611,9 +624,9 @@ fn pr_merged(paths: &[PathBuf], params: &Parameters) -> io::Result<()> {
 }
 
 fn main() -> ExitCode {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs").unwrap();
-    bind_textdomain_codeset("posixutils-rs", "UTF-8").unwrap();
+    // Sets the locale *and* the diagnostic prefix, so the `-r`-suppressible
+    // warnings below name the utility as the rest of the tree does.
+    plib::diag::init_locale("pr");
 
     install_sigint_handler();
 
@@ -626,7 +639,7 @@ fn main() -> ExitCode {
             Ok(_) => ExitCode::SUCCESS,
             Err(e) => {
                 if !params.no_file_warnings {
-                    eprintln!("{e}");
+                    plib::diag::error(&e.to_string());
                 }
                 ExitCode::FAILURE
             }
@@ -636,7 +649,7 @@ fn main() -> ExitCode {
         for file in args.file() {
             if let Err(e) = pr_serial(file, &params) {
                 if !params.no_file_warnings {
-                    eprintln!("{e}");
+                    plib::diag::error(&e.to_string());
                 }
                 success = false;
             }

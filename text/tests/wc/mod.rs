@@ -73,19 +73,7 @@ fn wc_single_file_shows_name() {
     );
 }
 
-fn utf8_locale() -> Option<String> {
-    let avail = std::process::Command::new("locale")
-        .arg("-a")
-        .output()
-        .ok()?;
-    let list = String::from_utf8_lossy(&avail.stdout).to_lowercase();
-    for name in ["C.UTF-8", "C.utf8", "en_US.UTF-8", "en_US.utf8"] {
-        if list.contains(&name.to_lowercase()) {
-            return Some(name.to_string());
-        }
-    }
-    None
-}
+use plib::testing::utf8_locale;
 
 fn wc_locale(args: &[&str], input: &[u8], locale: &str) -> String {
     use std::io::Write;
@@ -118,4 +106,87 @@ fn wc_words_locale_whitespace() {
         return;
     };
     assert_eq!(wc_locale(&["-w"], "a\u{3000}b\n".as_bytes(), &loc), "2\n");
+}
+
+// ---------------------------------------------------------------------------
+// Operands, `--` and error paths
+// ---------------------------------------------------------------------------
+
+fn wc_run(args: &[&str]) -> (String, String, i32) {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_wc"))
+        .args(args)
+        .output()
+        .expect("failed to run wc");
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.code().unwrap_or(-1),
+    )
+}
+
+fn wc_tmp(name: &str, content: &str) -> std::path::PathBuf {
+    let mut p = std::env::temp_dir();
+    p.push(format!("posixutils-wc-{}-{}", std::process::id(), name));
+    std::fs::write(&p, content).expect("write temp file");
+    p
+}
+
+#[test]
+fn wc_default_output_is_lines_words_bytes() {
+    // With no options the order is <newline> <word> <byte>, per POSIX STDOUT
+    // (the same order as `-l -w -c`), and the count columns precede the name.
+    let f = wc_tmp("default", "a b\nc\n");
+    let (stdout, _, code) = wc_run(&[f.to_str().unwrap()]);
+    assert_eq!(code, 0);
+    assert_eq!(stdout, format!("2 3 6 {}\n", f.display()), "got {stdout:?}");
+    let _ = std::fs::remove_file(f);
+}
+
+#[test]
+fn wc_multiple_files_report_each_and_a_total() {
+    let a = wc_tmp("m1", "x\n");
+    let b = wc_tmp("m2", "y\nz\n");
+    let (stdout, _, code) = wc_run(&["-l", a.to_str().unwrap(), b.to_str().unwrap()]);
+    assert_eq!(code, 0);
+    assert_eq!(
+        stdout,
+        format!("1 {}\n2 {}\n3 total\n", a.display(), b.display()),
+        "got {stdout:?}"
+    );
+    let _ = std::fs::remove_file(a);
+    let _ = std::fs::remove_file(b);
+}
+
+#[test]
+fn wc_combined_flags_keep_column_order() {
+    // Selected counts always print in <newline> <word> <byte> order regardless
+    // of the order the options were given in.
+    let f = wc_tmp("combo", "a b\nc\n");
+    let p = f.to_str().unwrap();
+    let (lw, _, _) = wc_run(&["-l", "-w", p]);
+    assert_eq!(lw, format!("2 3 {}\n", f.display()), "got {lw:?}");
+    let (wl, _, _) = wc_run(&["-w", "-l", p]);
+    assert_eq!(wl, lw, "option order must not change the column order");
+    let (lc, _, _) = wc_run(&["-l", "-c", p]);
+    assert_eq!(lc, format!("2 6 {}\n", f.display()), "got {lc:?}");
+    let _ = std::fs::remove_file(f);
+}
+
+#[test]
+fn wc_nonexistent_file_errors_and_exits_nonzero() {
+    let (_, stderr, code) = wc_run(&["-l", "no-such-file-xyz"]);
+    assert_ne!(code, 0, "a missing operand must exit non-zero");
+    assert!(
+        stderr.contains("no-such-file-xyz"),
+        "the diagnostic must name the file, got {stderr:?}"
+    );
+}
+
+#[test]
+fn wc_double_dash_ends_options() {
+    let f = wc_tmp("-dashname", "one\n");
+    let (stdout, _, code) = wc_run(&["-l", "--", f.to_str().unwrap()]);
+    assert_eq!(code, 0);
+    assert_eq!(stdout, format!("1 {}\n", f.display()), "got {stdout:?}");
+    let _ = std::fs::remove_file(f);
 }

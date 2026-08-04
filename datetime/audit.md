@@ -135,7 +135,7 @@ broken. Separately, the child's exit status is discarded, so `time` always exits
 | `LANG`/`LC_ALL`/`LC_CTYPE` | CONFORMS | `setlocale(LC_ALL,"")` at `time.rs:134`. |
 | `LC_MESSAGES` | CONFORMS* | (#T4) ✓ Phase 4 routes diagnostics through `gettext`; *catalog shipping is a tree-wide deferral. |
 | `LC_NUMERIC` | N/A | Rust `{:.6}` always uses `.` radix; POSIX-locale output is correct, other locales unspecified for the default format. |
-| `NLSPATH` (XSI) | MISSING | No catalog support (tree-wide). |
+| `NLSPATH` (XSI) | CONFORMS | `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 | `PATH` | CONFORMS | Used by `Command` for utility lookup. |
 
 #### EXIT STATUS / CONSEQUENCES OF ERRORS
@@ -220,7 +220,7 @@ non-UTF-8 locale bytes can be mangled (#D4).
 | `LC_MESSAGES` | CONFORMS* | (#D3) ✓ Phase 4 routes diagnostics through `gettext`; *catalog shipping is a tree-wide deferral. |
 | `LC_TIME` | CONFORMS | `strftime` over libc honors `LC_TIME`. |
 | `TZ` | CONFORMS | `localtime_r` honors `TZ`; `-u` overrides to UTC. Verified by `tests/date/mod.rs:24-60`. |
-| `NLSPATH` (XSI) | MISSING | Tree-wide. |
+| `NLSPATH` (XSI) | CONFORMS | `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 
 #### EXIT STATUS / ASYNCHRONOUS EVENTS
 
@@ -286,7 +286,7 @@ definition.
 |---|---|---|
 | `LANG`/`LC_ALL`/`LC_CTYPE` | CONFORMS | `setlocale` at `sleep.rs:25`. |
 | `LC_MESSAGES` | PARTIAL | (#S2) clap-English diagnostics. |
-| `NLSPATH` (XSI) | MISSING | Tree-wide. |
+| `NLSPATH` (XSI) | CONFORMS | `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 
 #### EXIT STATUS
 
@@ -354,7 +354,7 @@ hardcoded English array passed through `gettext()` (which has no catalogs).
 | `LANG`/`LC_ALL`/`LC_CTYPE` | CONFORMS | `setlocale` at `cal.rs:212`. |
 | `LC_MESSAGES` | PARTIAL | Catalogs absent (tree-wide); the one error string is gettext-wrapped (`cal.rs:236`). |
 | `LC_TIME` | CONFORMS | (#C1) ✓ Phase 5: month/weekday names derived from `plib::locale::strftime` under `LC_TIME`. |
-| `NLSPATH` (XSI) | MISSING | Tree-wide. |
+| `NLSPATH` (XSI) | CONFORMS | `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 | `TZ` | CONFORMS | Current month derived from `chrono::Local::now()`, which honors `TZ` (`cal.rs:220`). |
 
 #### EXIT STATUS / ASYNCHRONOUS EVENTS / CONSEQUENCES OF ERRORS

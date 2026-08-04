@@ -47,7 +47,8 @@ silent data loss.
 | #X30 | Minor | a multibyte mark name panicked the address parser |
 | #X31 | Minor | `read_shell_output` was a dead duplicate carrying the same defect |
 | #V18 | Minor | `:r !cmd` did not drop raw mode around the child |
-| #V19 | Minor | a second `u` after any change operator empties the line *(still open)* |
+| #V19 | **Major** | no operator recorded undo; `u` was not self-inverse *(fixed 2026-08-04; re-rated from Minor — it silently destroyed buffer content)* |
+| #V20 | Minor | `U` can never restore: `save_line_original` has no callers *(open)* |
 | — | Minor | `:l` was not unambiguous: caret notation, unescaped `\` and `$` |
 | — | Minor | `@@` failed with `Buffer "@" is empty` |
 | — | Minor | `j` implemented one of POSIX's five join rules |
@@ -74,8 +75,9 @@ in the undo model, which was the honest reason it had been deferred. `TERM`
 terminfo is the one item accepted as a deliberate non-goal, with rationale
 recorded inline.
 
-**Remaining open: 3**, all genuine and itemized — #V19, the insert-mode
-`^V`/`^D`/autoindent partials, and the remaining ex command modifier gaps
+**Remaining open: 3**, all genuine and itemized — #V20 (`U` is inert), the
+insert-mode `^V`/`^D`/autoindent partials, and the remaining ex command
+modifier gaps
 (that box was one opaque checkbox covering ~15 commands; it is now a named
 list, with `j`, `q`, `r`, `w`/`wq`/`x`, `l` and `@@` struck off).
 
@@ -179,7 +181,7 @@ diverge.
 #### ENVIRONMENT VARIABLES
 - [x] `HOME` CONFORMS — `ed.hup` fallback path, `editor.rs:1559`.
 - [x] **`LC_COLLATE` / `LC_CTYPE`** — ✓ fixed (phase 1): bracket ranges/classes honored via libc BRE (#E8).
-- [x] **`LC_MESSAGES`** — ✓ fixed (phase 3): diagnostic strings `gettext()`-wrapped (#E8). `NLSPATH` N/A (no catalog shipped).
+- [x] **`LC_MESSAGES`** — ✓ fixed (phase 3): diagnostic strings `gettext()`-wrapped (#E8). `NLSPATH` CONFORMS — `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04).
 
 #### ASYNCHRONOUS EVENTS
 - [x] `SIGQUIT` CONFORMS (`SIG_IGN`).
@@ -301,8 +303,13 @@ BRE veneer over an ERE engine. A handful of parsed-but-unhandled commands
 - [x] **`^]`** ✓ tag jump (phase 7, #V5); **`^L`/`^R`** ✓ split (phase 8, #V14).
 - [x] Editing `i I a A o O c C cc d D dd x X r R y Y p P J ~ < > .` CONFORM.
 - [x] **`s`/`S`** — ✓ fixed (2026-08-02) as **#V17**. They were handled in the *pre-parser fast path* (`editor/mod.rs`, before keys reach the command parser), so besides not saving to a register they recorded **no undo** and accepted neither a count (`3s`) nor a register prefix (`"as`) — even though `'s'`/`'S'` were already in the parser's command table. Both fast-path arms are deleted; `s`/`S` now dispatch beside `c` and route through `command::operator::change`, inheriting its register, undo and cursor handling. Verified behaviorally identical to `cl`/`cc`, undo included. Tests `test_s_and_upper_s_behave_as_change_operators`, `test_s_accepts_a_count`, `test_upper_s_substitutes_whole_lines`, plus PTY `test_pty_vi_substitute_char_saves_to_register`.
-- [ ] **#V19 — a second `u` after a change operator empties the line.** *(Found 2026-08-02 while verifying #V17; pre-existing, not introduced by it.)* `cl`/`s` on `abcdef` gives `Xbcdef`; the first `u` correctly yields `bcdef` (undoing the inserted text) but a second `u` yields an empty line rather than restoring `abcdef`. Affects the shared `change` operator, so `c`, `cc`, `s` and `S` alike. Out of scope for #V17, which was about `s`/`S` reaching that path at all; recorded here rather than silently absorbed.
-- [x] `u U`, marks `m ' \``, `: / ? n N % & @ " Q ZZ ! ^^` CONFORM (search is #V16).
+- [x] **#V19 — operators recorded no undo at all; `u` was not its own inverse.** ✓ fixed (2026-08-04). *(Found 2026-08-02 while verifying #V17; pre-existing, not introduced by it.)* The symptom recorded here was that a second `u` after `cl`/`s` on `abcdef` empties the line. The cause was broader: **`change` and `execute_delete` recorded nothing**, so `c`, `cc`, `s`, `S`, `C`, `d`, `dd` and `J` were all un-undoable — the line above ticks `d`/`dd`/`C`/`J` as CONFORM, which was wrong. Since `apply_inverse` rebuilds by position and length without checking what is actually there, an unrecorded removal does not merely fail to undo: the next `u` pops an unrelated older change and deletes characters that were never inserted.
+
+  Every operator now records what it removed. Undo is per *command* rather than per edit — POSIX (ex `undo`, 95443) counts a change plus the insert session it opens as one command — which revived `begin_group`/`end_group`, previously dead code that did not coalesce. And `u` is now self-inverse, per "reverse the changes made by the last command that modified the contents of the edit buffer, **including undo**" (95442).
+
+  **The finding's own expectation was not POSIX**: it wanted a *second* `u` to restore `abcdef`. One `u` now does, because the change and its insert are one command. Fixing this also exposed a latent bug in `apply_inverse`: it restored text with `set_cursor`, which clamps the column to command-mode bounds, so text removed from the end of a line came back one column too far left (`C` on `keep this tail` undid to `keepthis tail `). Tests `test_undo_after_change_operator_restores_the_original_text`, `test_undo_is_its_own_inverse`, `test_undo_after_delete_restores_the_text`, `test_undo_after_change_to_end_of_line`, `test_undo_after_join_restores_the_lines`, `test_empty_insert_session_leaves_no_undo_entry` — five of the six fail against the pre-fix code.
+- [x] `u` CONFORMS (#V19, 2026-08-04). Marks `m ' \``, `: / ? n N % & @ " Q ZZ ! ^^` CONFORM (search is #V16).
+- [ ] **#V20 — `U` (undo current line) can never restore anything.** *(Found 2026-08-04 alongside #V19.)* `restore_line` requires `line_original`, which only `save_line_original` sets — and that function has **no callers outside undo.rs's own unit test**, so `U` always reports `NothingToUndo`. This line previously ticked `u U` as CONFORM together. Deliberately left open: reviving it needs a decision about when a line's original state is captured, which is a design question rather than a repair.
 
 #### Insert mode
 - [x] ESC, `^H`, `^W`, `^U`, `^T` CONFORM — `mode/insert.rs`.

@@ -89,7 +89,7 @@ The message-text-source grammar is only half-implemented: escape sequences and l
 - [ ] **`LC_CTYPE` MISSING** — source read as UTF-8, not LC_CTYPE-interpreted. _(DEFERRED — cross-cutting theme 4; a byte-oriented parser re-architecture, out of scope for this pass.)_
 - [x] **`LC_MESSAGES` — diagnostics routed through gettext** (GC-9, Phase 12).
 - [x] `LANG`/`LC_ALL` PARTIAL — honored only via `setlocale` (`gencat.rs:786`).
-- [ ] **`NLSPATH` PARTIAL** — not read for the utility's own diagnostics. _(DEFERRED — self-localization via NLSPATH needs catalog-loader support that `gettextrs` does not expose; the gettext *family* honors NLSPATH (Phase 9). Out of scope for the compiler utilities.)_
+- [x] **`NLSPATH` CONFORMS** — read for the utility's own diagnostics. The deferral said this needed "catalog-loader support that `gettextrs` does not expose"; that support now exists — `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04).
 
 ### Extended description (source-file grammar)
 - [x] `$ ` comment, empty lines CONFORMS (`gencat.rs:339`).
@@ -203,7 +203,7 @@ UTF-8/16/32 + ASCII transcoding with BOM detection works and is well-tested. But
 
 ### Environment variables
 - [x] **`LC_ALL`/`LC_CTYPE`/`LANG` CONFORMS** for default codeset (IC-3, Phase 4) — resolved via `nl_langinfo(CODESET)`, which honors the full chain.
-- [x] **`LC_MESSAGES` — codec diagnostics routed through gettext** (IC-9, Phase 12). `NLSPATH` N/A (gettextrs equivalent).
+- [x] **`LC_MESSAGES` — codec diagnostics routed through gettext** (IC-9, Phase 12). `NLSPATH` CONFORMS (`gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04).)
 
 ### Conversion engine
 - [x] ASCII ↔ UTF-8/16/32 (+ LE/BE) full matrix CONFORMS; UTF-16/32 **input** BOM handling CONFORMS (`utf_16.rs:46-65`, `utf_32.rs:44-63`).
@@ -254,7 +254,7 @@ The no-operand default output, the `LC_ALL > LC_* > LANG` precedence, and `local
 - [x] **category operand CONFORMS** (LO-2, Phase 5); **`charmap` operand CONFORMS** (LO-4, Phase 5).
 
 ### Environment variables
-- [x] `LANG`/`LC_ALL`/`LC_CTYPE`/`LC_MESSAGES` + precedence CONFORMS (`env.rs:41-80`). `NLSPATH` N/A.
+- [x] `LANG`/`LC_ALL`/`LC_CTYPE`/`LC_MESSAGES` + precedence CONFORMS (`env.rs:41-80`). `NLSPATH` CONFORMS — `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04).
 
 ### Output format
 - [x] `-c` category header, no-`-k` value-only format CONFORMS (`locale.rs:93-95`, `:198-200`).
@@ -316,7 +316,7 @@ Originally: `localedef` did not produce a usable locale — wrote a one-line `LC
 - [x] **`copy` recorded / `include` inlined** (LD-7, Phase 11); **`escape_char`/`comment_char`/continuation CONFORMS** (LD-6, Phase 11).
 
 ### Environment variables
-- [x] `LC_COLLATE`/`LC_CTYPE` "POSIX locale used regardless" — CONFORMS in effect (parser is byte-oriented); `LANG`/`LC_ALL`/`LC_MESSAGES` honored via `setlocale`. `NLSPATH` N/A.
+- [x] `LC_COLLATE`/`LC_CTYPE` "POSIX locale used regardless" — CONFORMS in effect (parser is byte-oriented); `LANG`/`LC_ALL`/`LC_MESSAGES` honored via `setlocale`. `NLSPATH` CONFORMS — `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04).
 
 ### Exit status / errors / stdout
 - [x] **exit table CONFORMS** (LD-5, Phase 11 — 0/1/2/>3); **`-c` over errors CONFORMS** (LD-4, Phase 11); **stdout report present** (LD-9, Phase 11).
@@ -368,7 +368,7 @@ Single-domain `.po` → `.mo` compilation, multi-line string concatenation, fuzz
 - [x] **`domain` CONFORMS** (MF-1, Phase 7); **C escapes CONFORMS** (MF-6, Phase 8); **header charset CONFORMS** (MF-7, Phase 8); **`no-c-format` CONFORMS** (MF-8, Phase 8). `#~` obsolete handling partial.
 
 ### Env / stdout / stderr / output files / exit
-- [ ] **`LC_CTYPE` PARTIAL** (input assumed UTF-8); `NLSPATH`/`LANGUAGE` N/A for the compiler. _(DEFERRED — cross-cutting theme 4.)_
+- [ ] **`LC_CTYPE` PARTIAL** (input assumed UTF-8). _(DEFERRED — cross-cutting theme 4.)_ `NLSPATH` CONFORMS — `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). `LANGUAGE` N/A for the compiler.
 - [x] STDOUT not used / STDERR diagnostics CONFORMS; `.mo` binary format N/A (unspecified).
 - [x] **default output naming CONFORMS** (MF-1/MF-3, Phase 7 — per-domain `domainname[.mo]`); **exit status CONFORMS** (MF-2, Phase 8).
 

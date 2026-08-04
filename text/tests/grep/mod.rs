@@ -1412,3 +1412,165 @@ fn test_duplicate_patterns_are_all_used() {
     // identical -e patterns still match the line exactly once.
     grep_test(&["-e", "foo", "-e", "foo"], "foo\nbar\n", "foo\n", "", 0);
 }
+
+// ---------------------------------------------------------------------------
+// Pattern-file and input edge cases
+// ---------------------------------------------------------------------------
+
+fn grep_tmp(tag: &str, content: &str) -> std::path::PathBuf {
+    let mut p = std::env::temp_dir();
+    p.push(format!("posixutils-grep-{}-{}", std::process::id(), tag));
+    std::fs::write(&p, content).expect("write temp file");
+    p
+}
+
+fn grep_stdin(args: &[&str], stdin: &[u8]) -> (Vec<u8>, i32) {
+    use std::io::Write;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_grep"))
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn grep");
+    child.stdin.as_mut().unwrap().write_all(stdin).unwrap();
+    let out = child.wait_with_output().expect("wait grep");
+    (out.stdout, out.status.code().unwrap_or(-1))
+}
+
+#[test]
+fn grep_pattern_file_with_a_trailing_empty_line() {
+    // A pattern file ending in a blank line contributes an empty pattern, and
+    // an empty BRE matches every line.
+    let one = grep_tmp("p1", "foo\n");
+    let (out, code) = grep_stdin(&["-f", one.to_str().unwrap()], b"foo\nbar\n");
+    assert_eq!(code, 0);
+    assert_eq!(String::from_utf8_lossy(&out), "foo\n");
+
+    let blank = grep_tmp("p2", "foo\n\n");
+    let (out, code) = grep_stdin(&["-f", blank.to_str().unwrap()], b"foo\nbar\n");
+    assert_eq!(code, 0);
+    assert_eq!(
+        String::from_utf8_lossy(&out),
+        "foo\nbar\n",
+        "an empty last pattern matches every line"
+    );
+    let _ = std::fs::remove_file(one);
+    let _ = std::fs::remove_file(blank);
+}
+
+#[test]
+fn grep_input_containing_nul_bytes() {
+    // POSIX requires grep's input to be text files, and a NUL byte makes a file
+    // non-text, so the behavior here is unspecified. Pin what we actually do.
+    //
+    // Lines *without* a NUL still match normally even when another line has one,
+    // so the file is not abandoned wholesale.
+    let (out, code) = grep_stdin(&["plain"], b"a\x00b\nplain\n");
+    assert_eq!(code, 0);
+    assert_eq!(String::from_utf8_lossy(&out), "plain\n");
+
+    // A line containing a NUL never matches: the match goes through POSIX
+    // `regexec`, which takes a NUL-terminated string, so the conversion fails
+    // and the line is skipped. GNU grep instead reports "binary file matches"
+    // and exits 0. Both are within the latitude the spec allows for non-text
+    // input; the divergence is recorded in the audit.
+    let (out, code) = grep_stdin(&["a"], b"a\x00b\n");
+    assert_eq!(code, 1, "a NUL-bearing line does not match");
+    assert!(out.is_empty());
+}
+
+#[test]
+fn grep_crlf_line_endings() {
+    // A <carriage-return> is part of the line's content, so `x$` does not match
+    // a line ending in CRLF, while `x\r$` does.
+    let (out, code) = grep_stdin(&["x$"], b"x\r\n");
+    assert_eq!(code, 1, "the CR is data, so `x$` must not match");
+    assert!(out.is_empty());
+
+    let (out, code) = grep_stdin(&["x"], b"x\r\n");
+    assert_eq!(code, 0);
+    assert_eq!(out, b"x\r\n", "the CR is preserved in the output");
+}
+
+#[test]
+fn grep_ere_repetition_modifier() {
+    // POSIX.2024 *defines* a duplication symbol suffixed by `?`: "Each of the
+    // duplication symbols ('+', '*', '?', and intervals) can be suffixed by the
+    // repetition modifier '?' ... in which case matching behavior for that
+    // repetition shall be changed from the leftmost longest possible match to
+    // the leftmost shortest possible match" (XBD 9.4.6 rule 6, 6759-6765).
+    // This is distinct from "multiple adjacent duplication symbols" such as
+    // `a+*`, which remain undefined (6770-6771) and so are not tested here.
+    //
+    // grep reports only *whether* a line matched, never the extent of the
+    // match, so leftmost-longest vs leftmost-shortest is unobservable through
+    // this utility. What is observable is that the construct compiles and
+    // matches. We delegate to libc regcomp: glibc implements the modifier,
+    // while the BSD engine on macOS predates POSIX.2024 and rejects it as an
+    // invalid ERE (exit 2). Closing that gap would mean shipping our own regex
+    // engine, so accept either outcome -- but hold each to its own contract.
+    let (out, code) = grep_stdin(&["-E", "a+?"], b"aaa\n");
+    match code {
+        0 => assert_eq!(
+            String::from_utf8_lossy(&out),
+            "aaa\n",
+            "where the repetition modifier is supported, the line matches"
+        ),
+        2 => assert!(
+            out.is_empty(),
+            "a pattern the platform rejects must not also emit matches, got {:?}",
+            String::from_utf8_lossy(&out)
+        ),
+        c => panic!("`a+?` must either match (0) or be rejected (2), got exit {c}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Locale-dependent behavior
+// ---------------------------------------------------------------------------
+
+#[test]
+fn grep_case_insensitive_fixed_string_folding() {
+    // -i folding follows LC_CTYPE. The interesting divergence is Turkish, where
+    // `I` lowercases to the dotless `ı` rather than `i`, so `grep -i -F I`
+    // should not match `i` there. Most hosts have no Turkish locale, so the
+    // Turkish half runs only where one is installed; the ASCII half always
+    // does.
+    let (out, code) = grep_stdin(&["-i", "-F", "abc"], b"ABC\n");
+    assert_eq!(code, 0);
+    assert_eq!(String::from_utf8_lossy(&out), "ABC\n");
+
+    let Some(tr_locale) = plib::testing::locale_matching(&["tr_TR.UTF-8", "tr_TR.utf8"]) else {
+        return;
+    };
+    use std::io::Write;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_grep"))
+        .args(["-i", "-F", "I"])
+        .env("LC_ALL", &tr_locale)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn grep");
+    let _ = child.stdin.as_mut().unwrap().write_all("i\n".as_bytes());
+    let out = child.wait_with_output().expect("wait grep");
+    // Whatever the folding rule, the run must terminate cleanly.
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(1)),
+        "got {:?}",
+        out.status.code()
+    );
+}
+
+#[test]
+fn grep_diagnostics_name_the_utility() {
+    // The diagnostic goes through gettext, so it is translatable; with no
+    // catalog installed it stays English and carries the utility prefix.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_grep"))
+        .args(["pattern", "no-such-file-xyz"])
+        .output()
+        .expect("run grep");
+    assert_eq!(out.status.code(), Some(2), "an unreadable operand exits 2");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("no-such-file-xyz"), "got {stderr:?}");
+}

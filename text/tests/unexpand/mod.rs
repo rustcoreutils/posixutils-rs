@@ -91,7 +91,9 @@ fn unexpand_rejects_zero_tabsize() {
         args: vec!["-t".to_string(), "0".to_string()],
         stdin_data: String::from("        x\n"),
         expected_out: String::new(),
-        expected_err: String::from("tab size must be a positive integer\n"),
+        // Prefixed with the utility name since unexpand joined the tree's
+        // shared diagnostic path.
+        expected_err: String::from("unexpand: tab size must be a positive integer\n"),
         expected_exit_code: 1,
     });
 }
@@ -109,19 +111,7 @@ fn unexpand_default_does_not_convert_interior() {
     unexpand_test(&[], "        a        b\n", "\ta        b\n");
 }
 
-fn utf8_locale() -> Option<String> {
-    let avail = std::process::Command::new("locale")
-        .arg("-a")
-        .output()
-        .ok()?;
-    let list = String::from_utf8_lossy(&avail.stdout).to_lowercase();
-    for name in ["C.UTF-8", "C.utf8", "en_US.UTF-8", "en_US.utf8"] {
-        if list.contains(&name.to_lowercase()) {
-            return Some(name.to_string());
-        }
-    }
-    None
-}
+use plib::testing::utf8_locale;
 
 #[test]
 fn unexpand_multibyte_column_width() {
@@ -150,4 +140,63 @@ fn unexpand_multibyte_column_width() {
         .unwrap();
     let out = child.wait_with_output().unwrap().stdout;
     assert_eq!(out, "世界\t    x\n".as_bytes());
+}
+
+// ---------------------------------------------------------------------------
+// Error paths
+// ---------------------------------------------------------------------------
+
+#[test]
+fn unexpand_nonexistent_file_errors_naming_the_utility() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_unexpand"))
+        .arg("no-such-file-xyz")
+        .output()
+        .expect("run unexpand");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // This printed a bare "No such file or directory" with no utility name.
+    assert!(
+        stderr.starts_with("unexpand:"),
+        "the diagnostic must name the utility, got {stderr:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Tab stops and control characters
+// ---------------------------------------------------------------------------
+
+#[test]
+fn unexpand_default_stops_repeat_every_eight() {
+    // Twelve leading blanks: eight become a <tab>, the remaining four stay.
+    unexpand_test(&[], "            x\n", "\t    x\n");
+    // Sixteen become two tabs.
+    unexpand_test(&[], "                x\n", "\t\tx\n");
+}
+
+#[test]
+fn unexpand_single_tabsize_repeats() {
+    // A single -t value defines stops at every multiple of that value.
+    unexpand_test(&["-t", "4"], "        x\n", "\t\tx\n");
+    unexpand_test(&["-t", "2"], "    x\n", "\t\tx\n");
+}
+
+#[test]
+fn unexpand_tabsize_implies_all_blanks() {
+    // POSIX: -t implies -a, so interior blanks are converted too, not just the
+    // leading run.
+    unexpand_test(&["-t", "4"], "ab      cd      ef\n", "ab\t\tcd\t\tef\n");
+}
+
+#[test]
+fn unexpand_backspace_in_input() {
+    // The <backspace> is copied through; the leading blanks before it still
+    // convert.
+    unexpand_test(&[], "        \x08x\n", "\t\x08x\n");
+}
+
+#[test]
+fn unexpand_leading_tab_then_blanks() {
+    // A <tab> already at column 0 advances to column 8, so the eight blanks
+    // that follow form the next full stop.
+    unexpand_test(&[], "\t        x\n", "\t\tx\n");
 }

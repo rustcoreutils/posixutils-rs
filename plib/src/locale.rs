@@ -66,6 +66,8 @@ extern "C" {
     fn iswcntrl(c: WintT) -> libc::c_int;
     fn iswgraph(c: WintT) -> libc::c_int;
     fn iswxdigit(c: WintT) -> libc::c_int;
+    fn iswlower(c: WintT) -> libc::c_int;
+    fn iswupper(c: WintT) -> libc::c_int;
     fn wcwidth(c: libc::wchar_t) -> libc::c_int;
     // `mbrtowc` and `mbstate_t` are not surfaced by the `libc` crate on all
     // targets (notably macOS), so both are declared directly.
@@ -106,16 +108,21 @@ macro_rules! ctype_predicate {
     ($(#[$meta:meta])* $name:ident, $byte_fn:path, $wide_fn:ident) => {
         $(#[$meta])*
         pub fn $name(c: char) -> bool {
-            let code = c as u32;
-            if code <= 0xFF {
+            if c.is_ascii() {
                 // SAFETY: the libc ctype function is thread-safe and
-                // side-effect-free; the argument is in [0, 255].
-                unsafe { $byte_fn(code as libc::c_int) != 0 }
+                // side-effect-free; the argument is in [0, 127].
+                unsafe { $byte_fn(c as libc::c_int) != 0 }
             } else {
+                // Anything above ASCII goes to the wide function. Dispatching
+                // on `<= 0xFF` instead would be wrong in a multi-byte locale:
+                // U+00E9 is two bytes in UTF-8, so the byte-oriented
+                // `isalpha(0xE9)` cannot classify it and answers "no". This
+                // matches the `is_ascii()` split `to_lower`/`to_upper` use.
+                //
                 // SAFETY: the libc wide-ctype function is thread-safe; `WintT`
                 // matches the platform's wint_t and every Unicode codepoint
                 // fits losslessly (the high bit is always clear).
-                unsafe { $wide_fn(code as WintT) != 0 }
+                unsafe { $wide_fn(c as u32 as WintT) != 0 }
             }
         }
     };
@@ -167,6 +174,16 @@ ctype_predicate!(
     /// libc `isxdigit(3)`.
     isxdigit, libc::isxdigit, iswxdigit
 );
+ctype_predicate!(
+    /// True if `c` is a lowercase letter under the current `LC_CTYPE`, per libc
+    /// `islower(3)`.
+    islower, libc::islower, iswlower
+);
+ctype_predicate!(
+    /// True if `c` is an uppercase letter under the current `LC_CTYPE`, per libc
+    /// `isupper(3)`.
+    isupper, libc::isupper, iswupper
+);
 
 /// Map `c` to lowercase under the current `LC_CTYPE`.
 ///
@@ -205,9 +222,9 @@ pub fn to_upper(c: char) -> char {
 /// printable; control characters (including `\n`, `\r`, `\t`, NUL) are not.
 pub fn isprint(c: char) -> bool {
     let code = c as u32;
-    if code <= 0xFF {
+    if c.is_ascii() {
         // SAFETY: libc::isprint is thread-safe and side-effect-free with
-        // any int input; we pass a value in [0, 255].
+        // any int input; we pass a value in [0, 127].
         unsafe { libc::isprint(code as libc::c_int) != 0 }
     } else {
         // SAFETY: iswprint is thread-safe; `WintT` matches the platform's
@@ -742,5 +759,50 @@ mod tests {
         // but we exercise the path so any panic surfaces.
         let _ = isprint('З');
         let _ = isprint('🦀');
+    }
+
+    /// `islower`/`isupper` back tr's `[:lower:]`/`[:upper:]` classes and its
+    /// case-conversion pairing, so they must agree with the byte-oriented
+    /// `islower(3)`/`isupper(3)` for ASCII and with the wide functions above it.
+    #[test]
+    fn case_predicates_follow_the_locale() {
+        // ASCII holds in every locale.
+        assert!(islower('a') && !islower('A') && !islower('1'));
+        assert!(isupper('A') && !isupper('a') && !isupper('1'));
+
+        // Non-ASCII letters classify only where a suitable locale exists; the
+        // C locale legitimately says no.
+        let Some(loc) = crate::testing::utf8_locale() else {
+            return;
+        };
+        let _ = loc; // the process locale is whatever the harness set
+                     // Exercise the wide path for panics regardless of the answer.
+        let _ = islower('\u{e9}');
+        let _ = isupper('\u{c9}');
+    }
+
+    /// U+0080..U+00FF are single *bytes* in Latin-1 but multi-byte in UTF-8, so
+    /// dispatching them to the byte-oriented `is*(3)` asked a question those
+    /// functions cannot answer and got "no". Every predicate sent them there.
+    #[test]
+    fn predicates_classify_latin1_range_in_a_utf8_locale() {
+        let Some(loc) = crate::testing::utf8_locale() else {
+            return;
+        };
+        // Set the process locale, then ask about U+00E9 (e-acute), which is a
+        // letter in any UTF-8 locale but not in C.
+        unsafe {
+            let c = std::ffi::CString::new(loc).unwrap();
+            libc::setlocale(libc::LC_ALL, c.as_ptr());
+        }
+        assert!(isalpha('\u{e9}'), "U+00E9 is a letter under LC_CTYPE");
+        assert!(islower('\u{e9}'));
+        assert!(isupper('\u{c9}'));
+        assert!(isprint('\u{e9}'));
+        // Restore the C locale for any test that runs after this one.
+        unsafe {
+            let c = std::ffi::CString::new("C").unwrap();
+            libc::setlocale(libc::LC_ALL, c.as_ptr());
+        }
     }
 }

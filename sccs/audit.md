@@ -373,7 +373,7 @@ shared-core #X1 (encoded bodies).
   stdin not spuriously read (verified).
 
 #### ENVIRONMENT / ASYNC / STDOUT-STDERR / OUTPUT FILES
-- [x] `setlocale` — `get.rs:537`; `LC_MESSAGES`/`NLSPATH` partial (#G11); `TZ` unused (#G12).
+- [x] `setlocale` — `get.rs:537`; `LC_MESSAGES` conforms (#G11 fixed); `NLSPATH` conforms — `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04); `TZ` unused (#G12).
 - [x] Default signals (z-file cleanup moot until #G8 exists).
 - [x] `"%s\n%d lines\n"` / `"%s\nnew delta %s\n%d lines\n"`; multi-file `"\n%s:\n"` header — exact match (`get.rs:374,421,530`).
 - [x] **`Included:`/`Excluded:` notation N/A until #G3; `No id keywords` warning MISSING (#G9).**

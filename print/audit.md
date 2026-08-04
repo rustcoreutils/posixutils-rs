@@ -90,7 +90,7 @@ helper unit tests instead.
 - [x] ~~**#7 — `ipps://` (TLS) destinations are unsupported.**~~ **WON'T-FIX (Phase 5).** Adding `ipps://` requires the `ipp` `client-tls`/`client-rustls` feature, which pulls in `rustls-native-certs` + `once_cell` + a TLS backend — contrary to the crate's explicit minimal-dependencies / no-TLS posture (`Cargo.toml`). Documented in `resolve_uri`'s doc comment as intentionally unsupported.
 - [x] **#8 — `-o` options without `=` are silently discarded.** ✓ **fixed (Phase 2).** The `split_once('=')` `else` branch now emits a gettext'd `lp: ignoring malformed -o option (expected name=value): <opt>` diagnostic to stderr before skipping. Test: `lp_o_malformed_warned`.
 - [x] **#9 — Request ID degrades to `<dest>-0` when the IPP response omits `job-id`.** ✓ **fixed (Phase 2).** `send_print_job` now returns `Err("printer response missing job-id")` (non-zero exit) instead of `.unwrap_or(0)`, honoring the unique-request-ID mandate (103065). Not unit-tested (requires a non-conformant IPP server, which the harness lacks).
-- [x] ~~**#10 — `NLSPATH` (XSI) is not explicitly honored.**~~ **WON'T-FIX (Phase 5).** `NLSPATH` is an XSI message-catalog override that no utility in the tree wires explicitly; catalog lookup goes through `gettextrs`/`setlocale` defaults. Left consistent with the rest of posixutils rather than special-casing `lp`.
+- [x] **#10 — `NLSPATH` (XSI) is now honored.** Previously marked WON'T-FIX on the grounds that "no utility in the tree wires explicitly" and that catalog lookup went through `gettextrs` defaults. That premise no longer holds: `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). `lp` picks it up through the same shim as every other utility, so no special-casing was needed after all.
 
 ### Detailed conformance matrix
 
@@ -134,7 +134,7 @@ helper unit tests instead.
 | `-d` > `LPDEST` > `PRINTER` precedence | CONFORMS | (103087–103089, 103137–103138) — `lp.rs:56-70`. |
 | `LC_TIME` | N/A | (103128–103129) Governs banner date/time strings; no banner is rendered locally (the IPP server owns it) → nothing to localize. |
 | `TZ` | N/A | (103140–103142) Same as `LC_TIME` — no local banner date/time. |
-| `NLSPATH` (XSI) | MISSING | (#10) Not explicitly read. |
+| `NLSPATH` (XSI) | CONFORMS | (#10) `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
 
 #### ASYNCHRONOUS EVENTS
 

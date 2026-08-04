@@ -922,8 +922,15 @@ impl Editor {
                     return Ok(());
                 }
                 Key::Char('C') => {
-                    // Change to end of line
-                    self.buffer.delete_to_end_of_line();
+                    // Change to end of line. `delete_to_end_of_line` returns
+                    // what it removed; recomputing it here would slice by
+                    // character where the buffer slices by byte.
+                    let at = self.buffer.cursor();
+                    self.undo.begin_group();
+                    let removed = self.buffer.delete_to_end_of_line();
+                    if !removed.is_empty() {
+                        self.undo.record_delete(at, &removed, false);
+                    }
                     self.enter_insert(InsertKind::Append);
                     return Ok(());
                 }
@@ -945,6 +952,11 @@ impl Editor {
     /// Enter insert mode.
     fn enter_insert(&mut self, kind: InsertKind) {
         if let Ok(mut state) = enter_insert_mode(&mut self.buffer, kind) {
+            // An insert session is one command. When an operator opened a group
+            // already (c/s/S/C), this call is a no-op and the operator's removal
+            // and the typed text end up in the same group, so one `u` reverses
+            // the whole change.
+            self.undo.begin_group();
             // Carry the terminal's erase/kill characters and the previous
             // insertion into the session (#V12, #V15).
             state.erase_char = self.terminal.erase_char();
@@ -973,6 +985,7 @@ impl Editor {
                     self.undo
                         .record_insert(state.start_pos, &state.inserted_text, false);
                 }
+                self.undo.end_group();
                 // Save for . (dot) repeat
                 self.last_command = Some(LastCommand::Insert {
                     kind: state.kind,
@@ -1310,7 +1323,10 @@ impl Editor {
                 self.execute_put(true, count)?;
             }
             // Undo
-            'u' => match self.undo.undo(&mut self.buffer) {
+            // POSIX: `u` reverses the last command that modified the buffer,
+            // "including undo" (ex undo, 95442), so pressing it twice returns
+            // to where you started.
+            'u' => match self.undo.undo_toggle(&mut self.buffer) {
                 Ok(pos) => {
                     self.buffer.set_cursor(pos);
                     self.set_message("1 change undone");
@@ -1326,11 +1342,33 @@ impl Editor {
             }
             // Join
             'J' => {
+                // Recorded as a line-run replacement: `ChangeKind::Join` exists
+                // but both `apply_change` and `apply_inverse` fall through its
+                // arm, so a join recorded that way could never be undone.
+                let first = self.buffer.cursor().line;
+                let mut joined = 0usize;
+                let before: Vec<String> = (0..=count)
+                    .filter_map(|i| self.buffer.line(first + i))
+                    .map(|l| l.content().to_string())
+                    .collect();
                 for _ in 0..count {
                     let line = self.buffer.cursor().line;
                     if line < self.buffer.line_count() {
                         let _ = self.buffer.join_lines(line, true);
+                        joined += 1;
                     }
+                }
+                if joined > 0 {
+                    let after: Vec<String> = self
+                        .buffer
+                        .line(first)
+                        .map(|l| vec![l.content().to_string()])
+                        .unwrap_or_default();
+                    self.undo.record_replace_lines(
+                        Position::new(first, 0),
+                        &before[..(joined + 1).min(before.len())],
+                        &after,
+                    );
                 }
             }
             // Search
@@ -1633,6 +1671,22 @@ impl Editor {
         Ok(())
     }
 
+    /// Record what an operator removed, so `u` can put it back.
+    ///
+    /// Every operator that removes text must call this: `apply_inverse` rebuilds
+    /// by position and length without checking what is actually there, so an
+    /// unrecorded removal does not merely fail to undo — the next `u` pops an
+    /// unrelated older change and destroys whatever now sits at its position
+    /// (audit #V19).
+    fn record_removal(&mut self, range: Range, result: &crate::command::OperatorResult) {
+        if let Some(text) = result.affected_text.as_deref() {
+            if !text.is_empty() {
+                let linewise = range.mode == BufferMode::Line;
+                self.undo.record_delete(range.start, text, linewise);
+            }
+        }
+    }
+
     /// Execute delete command.
     fn execute_delete(&mut self, cmd: &crate::command::ParsedCommand) -> Result<()> {
         use crate::command::delete;
@@ -1646,6 +1700,7 @@ impl Editor {
                 let end = Position::new(end_line, 0);
                 let range = Range::lines(start, end);
                 let result = delete(&mut self.buffer, range, &mut self.registers, cmd.register)?;
+                self.record_removal(range, &result);
                 self.buffer.set_cursor(result.cursor);
             } else {
                 // d + motion
@@ -1654,6 +1709,7 @@ impl Editor {
                     let range = Range::new(start, end, BufferMode::Character);
                     let result =
                         delete(&mut self.buffer, range, &mut self.registers, cmd.register)?;
+                    self.record_removal(range, &result);
                     self.buffer.set_cursor(result.cursor);
                 }
             }
@@ -1708,7 +1764,9 @@ impl Editor {
             Range::chars(cursor, Position::new(cursor.line, end_col))
         };
 
+        self.undo.begin_group();
         let result = change(&mut self.buffer, range, &mut self.registers, cmd.register)?;
+        self.record_removal(range, &result);
         self.buffer.set_cursor(result.cursor);
         if result.enter_insert {
             self.enter_insert(if cmd.command == 'S' {
@@ -1731,7 +1789,11 @@ impl Editor {
                 let start = Position::new(start_line, 0);
                 let end = Position::new(end_line, 0);
                 let range = Range::lines(start, end);
+                // The operator and the insert session it opens are one command,
+                // so a single `u` reverses both.
+                self.undo.begin_group();
                 let result = change(&mut self.buffer, range, &mut self.registers, cmd.register)?;
+                self.record_removal(range, &result);
                 self.buffer.set_cursor(result.cursor);
                 if result.enter_insert {
                     self.enter_insert(InsertKind::Change);
@@ -1766,8 +1828,10 @@ impl Editor {
                         end.column += 1;
                     }
                     let range = Range::new(start, end, BufferMode::Character);
+                    self.undo.begin_group();
                     let result =
                         change(&mut self.buffer, range, &mut self.registers, cmd.register)?;
+                    self.record_removal(range, &result);
                     // Use set_column_for_insert to allow cursor at end of line
                     // The change operation's cursor may be clamped, so use range.start
                     // which is where we want to insert (the start of the deleted text)

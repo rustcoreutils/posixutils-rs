@@ -106,32 +106,61 @@ pub fn gettext<T: Into<String>>(msgid: T) -> String {
         return msgid;
     }
 
-    let mut d = lock_domains();
-    let domain = match d.current.clone() {
-        Some(domain) => domain,
+    // Resolve what to look up, then release the lock: `catalog::load` walks the
+    // filesystem, and holding a process-wide mutex across that would let one
+    // slow or unreachable path (an automounted `NLSPATH` entry, say) stall every
+    // other thread's diagnostics.
+    let (domain, bound, cached) = {
+        let d = lock_domains();
         // With no `textdomain` call there is nothing to look up in. C gettext
         // would use "messages"; searching for it here would let an unrelated
         // system catalog answer for a utility that never asked to be
         // translated, so decline instead.
-        None => return msgid,
+        let domain = match d.current.clone() {
+            Some(domain) => domain,
+            None => return msgid,
+        };
+        let cached = d.loaded.contains_key(&(domain.clone(), locale.clone()));
+        let bound = d.bound.get(&domain).cloned();
+        (domain, bound, cached)
     };
 
-    let key = (domain.clone(), locale.clone());
-    if !d.loaded.contains_key(&key) {
-        let bound = d.bound.get(&domain).cloned();
-        let cat = catalog::load(&domain, &locale, bound.as_deref());
-        d.loaded.insert(key.clone(), cat);
+    if !cached {
+        let loaded = catalog::load(&domain, &locale, bound.as_deref());
+        // Two threads may have missed the cache and both loaded; whichever
+        // arrives first wins and the other's copy is dropped. Duplicated work,
+        // once, is cheaper than serializing every caller behind the I/O.
+        lock_domains()
+            .loaded
+            .entry((domain.clone(), locale.clone()))
+            .or_insert(loaded);
     }
-    match d.loaded.get(&key).and_then(|c| c.as_ref()) {
+
+    let d = lock_domains();
+    match d.loaded.get(&(domain, locale)).and_then(|c| c.as_ref()) {
         Some(cat) => cat.lookup(&msgid).map(str::to_string).unwrap_or(msgid),
         None => msgid,
     }
 }
 
+/// Format a diagnostic, translating it where that is possible.
+///
+/// The single-argument form is a plain message: it goes through [`gettext`] and
+/// is translated. Because the argument is a translation msgid, it must be a
+/// literal with no inline `{capture}` — those are substituted by `format!` at
+/// compile time and would leave the catalog looking up a string that no
+/// extractor ever saw.
+///
+/// The multi-argument form is **not** translated, and cannot be while it uses
+/// `format!`: `format!` requires its template to be a compile-time literal, so
+/// there is nowhere to put a string fetched at run time. Translating it needs a
+/// runtime formatter with its own placeholder syntax — the shape C uses, where
+/// the msgid keeps its `%d` and printf substitutes later. That is a workspace-
+/// wide change to all 100-odd call sites, not a change to this macro.
 #[macro_export]
 macro_rules! gettext {
     ($fmt:expr) => {
-        format!($fmt)
+        $crate::gettext($fmt)
     };
     ($fmt:expr, $($arg:tt)*) => {
         format!($fmt, $($arg)*)

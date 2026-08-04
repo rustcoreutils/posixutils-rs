@@ -82,6 +82,18 @@ impl Catalog {
         let orig_tab = word(12)? as usize;
         let trans_tab = word(16)? as usize;
 
+        // Both string tables must lie inside the file *before* anything is sized
+        // from `nstrings`. It is a `u32` straight out of an untrusted header, so
+        // reserving the message map against it first turned a 28-byte file
+        // claiming four billion strings into a 420 GB allocation and an abort —
+        // the file is far too small to hold the tables such a count implies.
+        let table_bytes = nstrings.checked_mul(DESCRIPTOR_SIZE)?;
+        if orig_tab.checked_add(table_bytes)? > data.len()
+            || trans_tab.checked_add(table_bytes)? > data.len()
+        {
+            return None;
+        }
+
         let mut messages = HashMap::with_capacity(nstrings);
         for i in 0..nstrings {
             let orig = read_string(data, orig_tab.checked_add(i * DESCRIPTOR_SIZE)?, &word)?;
@@ -377,5 +389,43 @@ mod tests {
         assert!(is_untranslated(""));
         assert!(!is_untranslated("de_DE.UTF-8"));
         assert!(!is_untranslated("fr"));
+    }
+
+    #[test]
+    fn a_huge_string_count_does_not_allocate() {
+        // A 28-byte header claiming four billion strings. The count is used as
+        // the message map's capacity, so trusting it reserves gigabytes — an
+        // abort — before a single offset has been validated.
+        let mut mo = Vec::new();
+        mo.extend_from_slice(&MO_MAGIC_LE.to_le_bytes());
+        for w in [
+            0u32,
+            u32::MAX,
+            MO_HEADER_SIZE as u32,
+            MO_HEADER_SIZE as u32,
+            0,
+            0,
+        ] {
+            mo.extend_from_slice(&w.to_le_bytes());
+        }
+        assert_eq!(mo.len(), MO_HEADER_SIZE);
+        assert!(Catalog::parse(&mo).is_none());
+
+        // The same shape at a size that would merely be very slow rather than
+        // fatal, so the check is on the tables fitting rather than on a
+        // magic threshold.
+        let mut mo = Vec::new();
+        mo.extend_from_slice(&MO_MAGIC_LE.to_le_bytes());
+        for w in [
+            0u32,
+            100_000,
+            MO_HEADER_SIZE as u32,
+            MO_HEADER_SIZE as u32,
+            0,
+            0,
+        ] {
+            mo.extend_from_slice(&w.to_le_bytes());
+        }
+        assert!(Catalog::parse(&mo).is_none());
     }
 }

@@ -383,7 +383,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 mod parsing {
-    use std::iter::{self, Peekable};
+    use std::iter::Peekable;
     use std::str::Chars;
 
     use crate::setup::FullChar;
@@ -408,10 +408,86 @@ mod parsing {
         pub char: DataTypeWithData,
     }
 
+    /// One of POSIX's twelve character-class names (118116-118117).
+    ///
+    /// Kept symbolic through parsing: membership is a *predicate* over the
+    /// current `LC_CTYPE`, not a finite set of characters, and the
+    /// `[:lower:]`/`[:upper:]` pair carries the case-conversion meaning of
+    /// 118125-118130. Expanding a class to characters at parse time — as this
+    /// did — destroys both.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum ClassName {
+        Alnum,
+        Alpha,
+        Blank,
+        Cntrl,
+        Digit,
+        Graph,
+        Lower,
+        Print,
+        Punct,
+        Space,
+        Upper,
+        Xdigit,
+    }
+
+    impl ClassName {
+        pub fn parse(name: &str) -> Option<Self> {
+            Some(match name {
+                "alnum" => ClassName::Alnum,
+                "alpha" => ClassName::Alpha,
+                "blank" => ClassName::Blank,
+                "cntrl" => ClassName::Cntrl,
+                "digit" => ClassName::Digit,
+                "graph" => ClassName::Graph,
+                "lower" => ClassName::Lower,
+                "print" => ClassName::Print,
+                "punct" => ClassName::Punct,
+                "space" => ClassName::Space,
+                "upper" => ClassName::Upper,
+                "xdigit" => ClassName::Xdigit,
+                _ => return None,
+            })
+        }
+
+        /// Membership under the current `LC_CTYPE`.
+        pub fn contains(self, c: char) -> bool {
+            match self {
+                ClassName::Alnum => plib::locale::isalnum(c),
+                ClassName::Alpha => plib::locale::isalpha(c),
+                ClassName::Blank => plib::locale::isblank(c),
+                ClassName::Cntrl => plib::locale::iscntrl(c),
+                ClassName::Digit => plib::locale::isdigit(c),
+                ClassName::Graph => plib::locale::isgraph(c),
+                ClassName::Lower => plib::locale::islower(c),
+                ClassName::Print => plib::locale::isprint(c),
+                ClassName::Punct => plib::locale::ispunct(c),
+                ClassName::Space => plib::locale::isspace(c),
+                ClassName::Upper => plib::locale::isupper(c),
+                ClassName::Xdigit => plib::locale::isxdigit(c),
+            }
+        }
+
+        /// The ASCII members of this class, in ascending code-point order.
+        ///
+        /// Used only where a class must be paired positionally with individual
+        /// characters of string2 — a case POSIX calls out as having undefined
+        /// order (118159-118162) and discourages. Set membership and case
+        /// conversion use [`ClassName::contains`] instead and never enumerate.
+        pub fn ascii_members(self) -> Vec<char> {
+            (0_u8..=127_u8)
+                .map(char::from)
+                .filter(|&c| self.contains(c))
+                .collect()
+        }
+    }
+
     #[derive(Clone)]
     pub enum Operand {
         Char(CharOperand),
         Equiv(EquivOperand),
+        /// A `[:class:]` kept symbolic; see [`ClassName`].
+        Class(ClassName),
     }
 
     // TODO
@@ -959,7 +1035,7 @@ mod parsing {
                                 range_inclusive
                                     .map(|ch| {
                                         Operand::Char(CharOperand {
-                                            char: categorize_char(ch),
+                                            char: crate::parsing::categorize_char(ch),
                                             char_repetition: CharRepetition::N(1_usize),
                                         })
                                     })
@@ -1015,57 +1091,22 @@ mod parsing {
 
         assert!(into_iter.next() == Some(&'['));
         assert!(into_iter.next() == Some(&':'));
-
         assert!(into_iter.next_back() == Some(&']'));
         assert!(into_iter.next_back() == Some(&':'));
 
-        // TODO
-        // Performance
         let class = into_iter.collect::<String>();
 
-        let char_vec = match class.as_str() {
-            "alnum" => ('0'..='9')
-                .chain('A'..='Z')
-                .chain('a'..='z')
-                .collect::<Vec<_>>(),
-            "alpha" => ('A'..='Z').chain('a'..='z').collect::<Vec<_>>(),
-            "digit" => ('0'..='9').collect::<Vec<_>>(),
-            "lower" => ('a'..='z').collect::<Vec<_>>(),
-            "upper" => ('A'..='Z').collect::<Vec<_>>(),
-            "space" => vec![' ', '\t', '\n', '\r', '\x0b', '\x0c'],
-            "blank" => vec![' ', '\t'],
-            "cntrl" => (0_u8..=31_u8)
-                .chain(iter::once(127_u8))
-                .map(char::from)
-                .collect::<Vec<_>>(),
-            "graph" => (33_u8..=126_u8).map(char::from).collect::<Vec<_>>(),
-            "print" => (32_u8..=126_u8).map(char::from).collect::<Vec<_>>(),
-            "punct" => (33_u8..=47_u8)
-                .chain(58_u8..=64_u8)
-                .chain(91_u8..=96_u8)
-                .chain(123_u8..=126_u8)
-                .map(char::from)
-                .collect::<Vec<_>>(),
-            "xdigit" => ('0'..='9')
-                .chain('A'..='F')
-                .chain('a'..='f')
-                .collect::<Vec<_>>(),
-            "" => {
-                return Err("input '[::]' is invalid: missing character class name".to_string());
-            }
-            st => {
-                return Err(format!(
-                    "input '[:{st}:]' is invalid: invalid character class '{st}'"
-                ))
-            }
-        };
+        if class.is_empty() {
+            return Err("input '[::]' is invalid: missing character class name".to_string());
+        }
 
-        operand_vec.extend(char_vec.into_iter().map(|ch| {
-            Operand::Char(CharOperand {
-                char: categorize_char(ch),
-                char_repetition: CharRepetition::N(1_usize),
-            })
-        }));
+        // Emitted symbolically: membership follows LC_CTYPE, and the
+        // lower/upper pair carries the case-conversion meaning. Both are lost
+        // if the class is flattened to characters here.
+        let name = ClassName::parse(&class).ok_or_else(|| {
+            format!("input '[:{class}:]' is invalid: invalid character class '{class}'")
+        })?;
+        operand_vec.push(Operand::Class(name));
 
         Ok(())
     }
@@ -1142,11 +1183,38 @@ mod setup {
 
     // TODO
     // This should be optimized
+    /// Flatten symbolic `[:class:]` operands into their ASCII members.
+    ///
+    /// A transitional shim: it reproduces exactly what parsing used to do, so
+    /// the set builders below are unchanged while provenance becomes available
+    /// upstream. Later phases consume `Operand::Class` directly — as a
+    /// predicate for membership, and as the case-conversion signal — and this
+    /// is applied only on the paths that still need concrete characters.
+    fn flatten_classes(operands: Vec<Operand>) -> Vec<Operand> {
+        let mut out = Vec::with_capacity(operands.len());
+        for op in operands {
+            match op {
+                Operand::Class(name) => out.extend(name.ascii_members().into_iter().map(|ch| {
+                    Operand::Char(CharOperand {
+                        char: crate::parsing::categorize_char(ch),
+                        char_repetition: CharRepetition::N(1_usize),
+                    })
+                })),
+                other => out.push(other),
+            }
+        }
+        out
+    }
+
     pub fn generate_for_translation(
         complement: bool,
         string1_operands: Vec<Operand>,
         string2_operands: &[Operand],
     ) -> Result<ForTranslation, Box<dyn Error>> {
+        let string1_operands = flatten_classes(string1_operands);
+        let string2_flattened_classes = flatten_classes(string2_operands.to_vec());
+        let string2_operands = string2_flattened_classes.as_slice();
+
         let mut char_repeating_total = 0_usize;
 
         let mut string1_operands_flattened = Vec::<Operand>::new();
@@ -1181,6 +1249,8 @@ mod setup {
                     // Take up one position?
                     string1_operands_flattened.push(op);
                 }
+                // `flatten_classes` above replaced every class with its members.
+                Operand::Class(_) => unreachable!("classes are flattened on entry"),
             }
         }
 
@@ -1219,6 +1289,8 @@ mod setup {
                         "[=c=] expressions may not appear in string2 when translating".to_owned(),
                     ));
                 }
+                // `flatten_classes` replaced every class before this point.
+                Operand::Class(_) => unreachable!("classes are flattened on entry"),
             }
         }
 
@@ -1276,6 +1348,8 @@ mod setup {
                             // Fix for `tr_equivalence_class_low_priority`
                             add_normal_char(char, &mut seven_bit, &mut eight_bit, &mut multi_byte);
                         }
+                        // `flatten_classes` replaced every class before this point.
+                        Operand::Class(_) => unreachable!("classes are flattened on entry"),
                     }
                 }
             }
@@ -1315,6 +1389,8 @@ mod setup {
                             Operand::Equiv(_) => {
                                 unreachable!();
                             }
+                            // `flatten_classes` replaced every class before this point.
+                            Operand::Class(_) => unreachable!("classes are flattened on entry"),
                         }
                     }
                     None => {
@@ -1370,6 +1446,8 @@ mod setup {
                     Operand::Equiv(_) => {
                         unreachable!();
                     }
+                    // `flatten_classes` replaced every class before this point.
+                    Operand::Class(_) => unreachable!("classes are flattened on entry"),
                 }
             }
 
@@ -1468,6 +1546,8 @@ mod setup {
                         // Fix for `tr_equivalence_class_low_priority`
                         add_normal_char_with_replacement(char, replacement);
                     }
+                    // `flatten_classes` replaced every class before this point.
+                    Operand::Class(_) => unreachable!("classes are flattened on entry"),
                 }
             }
 
@@ -1487,6 +1567,8 @@ mod setup {
         string1_or_string2_operands: Vec<Operand>,
         is_string1: bool,
     ) -> Result<ForRemoval, Box<dyn Error>> {
+        let string1_or_string2_operands = flatten_classes(string1_or_string2_operands);
+
         let mut equiv = Vec::<DataTypeWithData>::new();
 
         let mut seven_bit = [false; 128_usize];
@@ -1517,6 +1599,8 @@ mod setup {
                 Operand::Equiv(EquivOperand { char }) => {
                     equiv.push(char);
                 }
+                // `flatten_classes` replaced every class before this point.
+                Operand::Class(_) => unreachable!("classes are flattened on entry"),
             }
         }
 

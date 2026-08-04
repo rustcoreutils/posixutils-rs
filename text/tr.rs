@@ -450,6 +450,15 @@ mod parsing {
             })
         }
 
+        /// The converse class for case conversion, if this is a case class.
+        pub fn case_converse(self) -> Option<Self> {
+            match self {
+                ClassName::Lower => Some(ClassName::Upper),
+                ClassName::Upper => Some(ClassName::Lower),
+                _ => None,
+            }
+        }
+
         /// Membership under the current `LC_CTYPE`.
         pub fn contains(self, c: char) -> bool {
             match self {
@@ -1305,13 +1314,67 @@ mod setup {
         out
     }
 
+    /// Split out `[:lower:]`↔`[:upper:]` pairings that sit at the same relative
+    /// position in the two operand lists (POSIX 118123-118130).
+    ///
+    /// Only attempted when the lists align one operand to one operand: a class
+    /// paired against individual characters has to be enumerated instead, which
+    /// is the case POSIX calls out as having undefined order (118159-118162).
+    /// Returns the folds plus the two lists with those operands removed, so the
+    /// remaining positional pairing is unaffected.
+    fn extract_case_folds(
+        string1: &[Operand],
+        string2: &[Operand],
+    ) -> Option<(Vec<CaseFold>, Vec<Operand>, Vec<Operand>)> {
+        if string1.len() != string2.len() {
+            return None;
+        }
+        let pairs: Vec<Option<CaseFold>> = string1
+            .iter()
+            .zip(string2.iter())
+            .map(|(a, b)| match (a, b) {
+                (Operand::Class(from), Operand::Class(to)) if from.case_converse() == Some(*to) => {
+                    Some(CaseFold {
+                        from: *from,
+                        to_upper: *to == ClassName::Upper,
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+
+        if pairs.iter().all(Option::is_none) {
+            return None;
+        }
+
+        let folds = pairs.iter().flatten().copied().collect::<Vec<_>>();
+        let keep = |ops: &[Operand]| -> Vec<Operand> {
+            ops.iter()
+                .zip(pairs.iter())
+                .filter(|(_, fold)| fold.is_none())
+                .map(|(op, _)| op.clone())
+                .collect()
+        };
+        Some((folds, keep(string1), keep(string2)))
+    }
+
     pub fn generate_for_translation(
         complement: bool,
         string1_operands: Vec<Operand>,
         string2_operands: &[Operand],
     ) -> Result<ForTranslation, Box<dyn Error>> {
+        // Case conversion is a function over the locale's toupper/tolower
+        // mapping, not a pairing of two enumerated arrays.
+        let (case_folds, string1_operands, string2_owned) = match (!complement)
+            .then(|| extract_case_folds(&string1_operands, string2_operands))
+            .flatten()
+        {
+            Some((folds, s1, s2)) => (folds, s1, s2),
+            None => (Vec::new(), string1_operands, string2_operands.to_vec()),
+        };
+
         let string1_operands = flatten_classes(string1_operands);
-        let string2_flattened_classes = flatten_classes(string2_operands.to_vec());
+        let string2_flattened_classes = flatten_classes(string2_owned);
         let string2_operands = string2_flattened_classes.as_slice();
 
         let mut char_repeating_total = 0_usize;
@@ -1639,7 +1702,7 @@ mod setup {
                         add_normal_char_with_replacement(char, replacement);
                     }
                     Operand::Equiv(EquivOperand { char }) => {
-                        equiv.push((char.clone(), replacement.clone()));
+                        equiv.push((char.clone(), replacement));
 
                         // TODO
                         // Fix for `tr_equivalence_class_low_priority`
@@ -1655,6 +1718,7 @@ mod setup {
                 eight_bit,
                 multi_byte,
                 equiv,
+                case_folds,
             }))
         };
 
@@ -1734,7 +1798,7 @@ mod setup {
         Four = 4_u8,
     }
 
-    #[derive(Clone)]
+    #[derive(Clone, Copy)]
     pub struct FullChar {
         // TODO
         // Determine how many bytes to write by the payload?
@@ -1777,6 +1841,13 @@ mod setup {
             let st = char.encode_utf8(&mut encoding_buffer);
 
             match *st.as_bytes() {
+                // A one-byte (ASCII) character was unhandled and fell into the
+                // `unreachable!()` below; case conversion is the first caller
+                // to pass one.
+                [a] => FullChar {
+                    number_of_bytes: FullCharNumberOfBytes::One,
+                    payload: [a, 0_u8, 0_u8, 0_u8],
+                },
                 [a, b] => FullChar {
                     number_of_bytes: FullCharNumberOfBytes::Two,
                     payload: [a, b, 0_u8, 0_u8],
@@ -1825,18 +1896,22 @@ mod setup {
         Complemented(Box<ComplementedTranslation>),
     }
 
-    pub struct ReplacementCheckResult<'a> {
-        pub replacement: Option<&'a FullChar>,
+    pub struct ReplacementCheckResult {
+        pub replacement: Option<FullChar>,
         pub match_lookahead_length: Option<SearchNumberOfBytes>,
         pub found_match: bool,
     }
 
     impl Translation for NotComplementedTranslation {
+        fn case_folds(&self) -> &[CaseFold] {
+            &self.case_folds
+        }
+
         #[inline]
-        fn get_seven_bit_replacement(&self, ue: u8) -> ReplacementCheckResult<'_> {
+        fn get_seven_bit_replacement(&self, ue: u8) -> ReplacementCheckResult {
             let index = usize::from(ue);
 
-            let replacement = self.seven_bit[index].as_ref();
+            let replacement = self.seven_bit[index];
 
             ReplacementCheckResult {
                 replacement,
@@ -1846,14 +1921,10 @@ mod setup {
         }
 
         #[inline]
-        fn get_eight_bit_replacement<'a>(
-            &'a self,
-            ue: u8,
-            next_bytes: &[u8],
-        ) -> ReplacementCheckResult<'a> {
+        fn get_eight_bit_replacement(&self, ue: u8, next_bytes: &[u8]) -> ReplacementCheckResult {
             let index = usize::from(ue);
 
-            if let Some(fu) = self.eight_bit[index].as_ref() {
+            if let Some(fu) = self.eight_bit[index] {
                 ReplacementCheckResult {
                     replacement: Some(fu),
                     match_lookahead_length: None,
@@ -1872,7 +1943,7 @@ mod setup {
 
                             if test {
                                 return ReplacementCheckResult {
-                                    replacement: Some(&se.replacement),
+                                    replacement: Some(se.replacement),
                                     match_lookahead_length: Some(number_of_bytes),
                                     found_match: true,
                                 };
@@ -1895,13 +1966,13 @@ mod setup {
         }
 
         #[inline]
-        fn get_equiv_result(&self, ue: u8) -> ReplacementCheckResult<'_> {
+        fn get_equiv_result(&self, ue: u8) -> ReplacementCheckResult {
             for (da, fu) in &self.equiv {
                 match da {
                     DataTypeWithData::Is7Bit(uei) | DataTypeWithData::Is8Bit(uei) => {
                         if ue == *uei {
                             return ReplacementCheckResult {
-                                replacement: Some(fu),
+                                replacement: Some(*fu),
                                 match_lookahead_length: None,
                                 found_match: true,
                             };
@@ -1923,7 +1994,7 @@ mod setup {
 
     impl Translation for ComplementedTranslation {
         #[inline]
-        fn get_seven_bit_replacement(&self, ue: u8) -> ReplacementCheckResult<'_> {
+        fn get_seven_bit_replacement(&self, ue: u8) -> ReplacementCheckResult {
             let index = usize::from(ue);
 
             let value_is_true = self.seven_bit[index];
@@ -1932,7 +2003,7 @@ mod setup {
                 replacement: if value_is_true {
                     None
                 } else {
-                    Some(&self.replacement)
+                    Some(self.replacement)
                 },
                 match_lookahead_length: None,
                 found_match: value_is_true,
@@ -1940,11 +2011,7 @@ mod setup {
         }
 
         #[inline]
-        fn get_eight_bit_replacement(
-            &self,
-            ue: u8,
-            next_bytes: &[u8],
-        ) -> ReplacementCheckResult<'_> {
+        fn get_eight_bit_replacement(&self, ue: u8, next_bytes: &[u8]) -> ReplacementCheckResult {
             let index = usize::from(ue);
 
             if self.eight_bit[index] {
@@ -1974,13 +2041,13 @@ mod setup {
                         }
 
                         ReplacementCheckResult {
-                            replacement: Some(&self.replacement),
+                            replacement: Some(self.replacement),
                             match_lookahead_length: None,
                             found_match: false,
                         }
                     }
                     None => ReplacementCheckResult {
-                        replacement: Some(&self.replacement),
+                        replacement: Some(self.replacement),
                         match_lookahead_length: None,
                         found_match: false,
                     },
@@ -1989,7 +2056,7 @@ mod setup {
         }
 
         #[inline]
-        fn get_equiv_result(&self, ue: u8) -> ReplacementCheckResult<'_> {
+        fn get_equiv_result(&self, ue: u8) -> ReplacementCheckResult {
             for da in &self.equiv {
                 match da {
                     DataTypeWithData::Is7Bit(uei) | DataTypeWithData::Is8Bit(uei) => {
@@ -2008,7 +2075,7 @@ mod setup {
             }
 
             ReplacementCheckResult {
-                replacement: Some(&self.replacement),
+                replacement: Some(self.replacement),
                 match_lookahead_length: None,
                 found_match: false,
             }
@@ -2017,7 +2084,7 @@ mod setup {
 
     pub trait Translation {
         #[inline]
-        fn check(&self, ue: u8, next_bytes: &[u8]) -> ReplacementCheckResult<'_> {
+        fn check(&self, ue: u8, next_bytes: &[u8]) -> ReplacementCheckResult {
             let first_check = if ue < 128_u8 {
                 self.get_seven_bit_replacement(ue)
             } else {
@@ -2028,18 +2095,91 @@ mod setup {
                 return first_check;
             }
 
+            // Case folds go ahead of the equivalence step, but the equivalence
+            // step stays the final fall-through: on the complemented path it
+            // returns the replacement with `found_match: false`, meaning "not in
+            // the set, so substitute" — a result, not the absence of one.
+            if !self.case_folds().is_empty() {
+                let fold_check = self.get_case_fold_result(ue, next_bytes);
+                if fold_check.found_match {
+                    return fold_check;
+                }
+            }
+
             self.get_equiv_result(ue)
         }
 
-        fn get_seven_bit_replacement(&self, ue: u8) -> ReplacementCheckResult<'_>;
+        /// Case conversion, applied per character rather than from a table.
+        /// The default has no folds, so implementations without them pay only a
+        /// slice check.
+        fn get_case_fold_result(&self, ue: u8, next_bytes: &[u8]) -> ReplacementCheckResult {
+            let folds = self.case_folds();
+            if !folds.is_empty() {
+                if let Some((c, extra)) = decode_char(ue, next_bytes) {
+                    for fold in folds {
+                        if let Some(replacement) = fold.apply(c) {
+                            let lookahead = match extra {
+                                1_usize => Some(SearchNumberOfBytes::One),
+                                2_usize => Some(SearchNumberOfBytes::Two),
+                                3_usize => Some(SearchNumberOfBytes::Three),
+                                _ => None,
+                            };
+                            return ReplacementCheckResult {
+                                replacement: Some(replacement),
+                                match_lookahead_length: lookahead,
+                                found_match: true,
+                            };
+                        }
+                    }
+                }
+            }
+            ReplacementCheckResult {
+                replacement: None,
+                match_lookahead_length: None,
+                found_match: false,
+            }
+        }
 
-        fn get_eight_bit_replacement<'a>(
-            &'a self,
-            ue: u8,
-            next_bytes: &[u8],
-        ) -> ReplacementCheckResult<'a>;
+        fn case_folds(&self) -> &[CaseFold] {
+            &[]
+        }
 
-        fn get_equiv_result(&self, ue: u8) -> ReplacementCheckResult<'_>;
+        fn get_seven_bit_replacement(&self, ue: u8) -> ReplacementCheckResult;
+
+        fn get_eight_bit_replacement(&self, ue: u8, next_bytes: &[u8]) -> ReplacementCheckResult;
+
+        fn get_equiv_result(&self, ue: u8) -> ReplacementCheckResult;
+    }
+
+    /// A `[:lower:]`↔`[:upper:]` pairing, applied as a *function* rather than a
+    /// table.
+    ///
+    /// POSIX 118125-118130: when `[:lower:]` appears in string1 and
+    /// `[:upper:]` in string2, "the arrays shall contain the characters from
+    /// the toupper mapping in the LC_CTYPE category of the current locale".
+    /// Materializing those arrays and pairing them by index — which is how case
+    /// conversion used to happen, entirely by accident of both ASCII classes
+    /// having 26 members in the same order — cannot work once the classes
+    /// follow the locale: they differ in length and in order, and the
+    /// "string2 is shorter" rule would silently pad with the last character.
+    #[derive(Clone, Copy)]
+    pub struct CaseFold {
+        pub from: ClassName,
+        pub to_upper: bool,
+    }
+
+    impl CaseFold {
+        fn apply(&self, c: char) -> Option<FullChar> {
+            if !self.from.contains(c) {
+                return None;
+            }
+            let mapped = if self.to_upper {
+                plib::locale::to_upper(c)
+            } else {
+                plib::locale::to_lower(c)
+            };
+            Some(FullChar::new_from_char(mapped))
+        }
     }
 
     pub struct NotComplementedTranslation {
@@ -2047,6 +2187,8 @@ mod setup {
         pub eight_bit: [Option<FullChar>; 256_usize],
         pub multi_byte: [Option<Vec<SearchAndReplace>>; 256_usize],
         pub equiv: Vec<(DataTypeWithData, FullChar)>,
+        /// Case-conversion pairings, consulted after the tables miss.
+        pub case_folds: Vec<CaseFold>,
     }
 
     pub struct ComplementedTranslation {
@@ -2640,7 +2782,6 @@ mod transformation {
                 let replacement_check_result = self.translation.check(byte_a, next_bytes);
 
                 let fu_payload: [u8; 4];
-                let full_char_from_byte: FullChar;
 
                 let (byte_a_to_use, next_bytes_to_use, full_char_to_write) =
                     match replacement_check_result.replacement {
@@ -2653,11 +2794,7 @@ mod transformation {
 
                             (fu_byte_a, fu_rest, fu)
                         }
-                        None => {
-                            full_char_from_byte = FullChar::new_from_u8(byte_a);
-
-                            (byte_a, next_bytes, &full_char_from_byte)
-                        }
+                        None => (byte_a, next_bytes, FullChar::new_from_u8(byte_a)),
                     };
 
                 // TODO

@@ -917,16 +917,47 @@ fn tr_character_classes_follow_lc_ctype() {
 }
 
 #[test]
-fn tr_case_conversion_is_ascii_only() {
-    // #2: [:lower:]/[:upper:] should use the locale's toupper mapping.
+fn tr_case_conversion_follows_the_locale() {
+    // POSIX 118125-118130: `[:lower:]` in string1 with `[:upper:]` in string2
+    // "shall be interpreted as a request for case conversion", using the
+    // toupper mapping of the current LC_CTYPE. This used to work only by
+    // accident — both ASCII classes expand to 26 characters in the same order,
+    // so pairing them by index happened to line up — and so did nothing for
+    // characters outside ASCII.
     let Some(loc) = plib::testing::utf8_locale() else {
         return;
     };
-    let out = tr_locale(&["[:lower:]", "[:upper:]"], "a\u{e9}\n".as_bytes(), &loc);
     assert_eq!(
-        out,
-        "A\u{e9}\n".as_bytes(),
-        "known gap (#2): ASCII case-maps, U+00E9 does not become U+00C9"
+        tr_locale(&["[:lower:]", "[:upper:]"], "\u{e9}\n".as_bytes(), &loc),
+        "\u{c9}\n".as_bytes(),
+        "U+00E9 uppercases to U+00C9"
+    );
+    assert_eq!(
+        tr_locale(&["[:upper:]", "[:lower:]"], "\u{c9}\n".as_bytes(), &loc),
+        "\u{e9}\n".as_bytes()
+    );
+    // ASCII conversion is unchanged, in any locale.
+    assert_eq!(
+        tr_locale(&["[:lower:]", "[:upper:]"], b"abc\n", &loc),
+        b"ABC\n"
+    );
+    // The C locale has no case mapping for U+00E9, so it passes through.
+    assert_eq!(
+        tr_locale(&["[:lower:]", "[:upper:]"], "\u{e9}\n".as_bytes(), "C"),
+        "\u{e9}\n".as_bytes()
+    );
+}
+
+#[test]
+fn tr_squeeze_uses_the_case_conversion_results() {
+    // POSIX 118178-118181: in a case conversion the last operand's array holds
+    // only the *results* of the mapping, so `-s` squeezes those.
+    let Some(loc) = plib::testing::utf8_locale() else {
+        return;
+    };
+    assert_eq!(
+        tr_locale(&["-s", "[:upper:]", "[:lower:]"], b"AABB\n", &loc),
+        b"ab\n"
     );
 }
 

@@ -576,7 +576,11 @@ fn format_man_page(
     // conditionals, user macros, `.so` includes) and normalize the stream before
     // language detection and parsing. A page without roff programmability is
     // returned essentially unchanged.
-    let content = man_util::roff::preprocess_with_loader(&content, load_so);
+    // The available width (terminal less the base indent) reaches the roff pass
+    // only for tbl, which must choose a fill width for `T{`…`T}` text blocks
+    // before it can lay them out.
+    let line_length = formatting.width.saturating_sub(formatting.indent);
+    let content = man_util::roff::preprocess_with_loader(&content, line_length, load_so);
 
     // Legacy man(7) pages (`.TH`/`.SH`/…) are handled by a dedicated renderer;
     // the mdoc engine only understands mdoc(7) and would otherwise emit an empty

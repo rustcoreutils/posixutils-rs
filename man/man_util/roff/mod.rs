@@ -88,15 +88,24 @@ pub struct Roff {
     steps: usize,
     /// Bytes emitted so far, across every nesting level.
     out_bytes: usize,
+    /// Columns available to body text, for tbl text-block layout.
+    line_length: usize,
 }
 
 /// Preprocess `input`, resolving `.so` targets through `loader`.
-pub fn preprocess_with_loader<F>(input: &str, loader: F) -> String
+///
+/// `line_length` is the number of columns available to body text (the terminal
+/// width less the base indent). Only the tbl preprocessor needs it: a `T{`…`T}`
+/// text block has to be filled to some width, and unlike an ordinary cell that
+/// width cannot be derived from the content — the content's extent is a
+/// *consequence* of it. See [`crate::man_util::preproc::tbl::format`].
+pub fn preprocess_with_loader<F>(input: &str, line_length: usize, loader: F) -> String
 where
     F: Fn(&str) -> Option<String> + 'static,
 {
     let roff = Roff {
         loader: Some(Box::new(loader)),
+        line_length,
         ..Roff::default()
     };
     roff.run(input)
@@ -562,7 +571,7 @@ impl Roff {
     /// text so the renderer preserves the column alignment.
     fn do_tbl(&mut self, queue: &mut Vec<String>) {
         let body = Self::capture_until(queue, "TE");
-        let table = crate::man_util::preproc::tbl::format(&body);
+        let table = crate::man_util::preproc::tbl::format(&body, self.line_length);
         let mut emit = vec![".nf".to_string()];
         emit.extend(table);
         emit.push(".fi".to_string());

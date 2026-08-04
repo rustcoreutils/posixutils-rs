@@ -10,8 +10,11 @@
 use super::expr::eval_numeric;
 use super::preprocess_with_loader;
 
+/// Body-text width used by the tests; only tbl text blocks are sensitive to it.
+const TEST_LINE_LENGTH: usize = 72;
+
 fn run(s: &str) -> String {
-    preprocess_with_loader(s, |_| None)
+    preprocess_with_loader(s, TEST_LINE_LENGTH, |_| None)
 }
 
 #[test]
@@ -154,7 +157,7 @@ fn rename_and_remove() {
 
 #[test]
 fn so_inclusion_via_loader() {
-    let out = preprocess_with_loader(".so inc.man\nafter\n", |target| {
+    let out = preprocess_with_loader(".so inc.man\nafter\n", TEST_LINE_LENGTH, |target| {
         if target == "inc.man" {
             Some(".SH INCLUDED\nbody\n".to_string())
         } else {
@@ -344,7 +347,7 @@ fn so_self_include_terminates() {
     // A file that sources itself. Inclusion is flattened onto the line queue,
     // so this is not caught by any recursion limit; before the guard it spun
     // until the multi-million-line budget tripped, taking minutes.
-    let out = preprocess_with_loader("hello\n.so self\n", |t| {
+    let out = preprocess_with_loader("hello\n.so self\n", TEST_LINE_LENGTH, |t| {
         (t == "self").then(|| "hello\n.so self\n".to_string())
     });
     assert_eq!(out.lines().filter(|l| *l == "hello").count(), 2);
@@ -352,7 +355,7 @@ fn so_self_include_terminates() {
 
 #[test]
 fn so_mutual_include_cycle_terminates() {
-    let out = preprocess_with_loader(".so a\n", |t| match t {
+    let out = preprocess_with_loader(".so a\n", TEST_LINE_LENGTH, |t| match t {
         "a" => Some("A\n.so b\n".to_string()),
         "b" => Some("B\n.so a\n".to_string()),
         _ => None,

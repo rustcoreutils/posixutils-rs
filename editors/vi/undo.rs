@@ -117,20 +117,31 @@ impl Change {
 }
 
 /// Undo history manager.
+///
+/// Each stack entry is one *command*, not one edit. POSIX (ex `undo`, 95443)
+/// says "the global, v, open, and visual commands … are considered single
+/// commands", and a change operator is a delete plus an insert session: a
+/// single `u` must reverse both. The entries therefore hold the command's edits
+/// in application order, and undo applies their inverses in reverse.
 #[derive(Debug)]
 pub struct UndoManager {
-    /// Stack of changes for undo.
-    undo_stack: Vec<Change>,
-    /// Stack of changes for redo.
-    redo_stack: Vec<Change>,
-    /// Whether currently in an undo group.
+    /// Stack of commands available to undo; each is that command's edits in
+    /// application order.
+    undo_stack: Vec<Vec<Change>>,
+    /// Stack of commands available to redo.
+    redo_stack: Vec<Vec<Change>>,
+    /// Whether a command group is currently open (see [`UndoManager::begin_group`]).
     in_group: bool,
-    /// Current group of changes.
-    current_group: Vec<Change>,
     /// Original state of current line for U command.
     line_original: Option<(usize, String)>,
     /// Maximum undo levels (0 = unlimited).
     max_levels: usize,
+    /// Whether the last buffer-modifying operation was an undo.
+    ///
+    /// POSIX defines `u` as reversing "the last command that modified the
+    /// contents of the edit buffer, **including undo**" (95442), so `u` is its
+    /// own inverse. This is what makes it alternate.
+    last_was_undo: bool,
 }
 
 impl UndoManager {
@@ -140,45 +151,61 @@ impl UndoManager {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             in_group: false,
-            current_group: Vec::new(),
             line_original: None,
             max_levels: 0, // Unlimited
+            last_was_undo: false,
         }
     }
 
-    /// Start a group of changes that should be undone together.
+    /// Begin one command's group of edits, so a single `u` reverses all of
+    /// them. Used for a change operator and the insert session it opens.
+    ///
+    /// Nested calls are ignored: the outermost group wins, which is what makes
+    /// it safe for `enter_insert` to open a group whether or not an operator
+    /// already did.
     pub fn begin_group(&mut self) {
+        if self.in_group {
+            return;
+        }
         self.in_group = true;
-        self.current_group.clear();
+        self.undo_stack.push(Vec::new());
+        self.redo_stack.clear();
+        self.last_was_undo = false;
     }
 
-    /// End a group of changes.
+    /// End the current command's group.
     pub fn end_group(&mut self) {
-        if self.in_group {
-            self.in_group = false;
-            // Merge all changes in group into one compound change
-            // For simplicity, just push them all onto the stack
-            for change in self.current_group.drain(..) {
-                self.undo_stack.push(change);
-            }
-            // Clear redo stack on new change
-            self.redo_stack.clear();
+        if !self.in_group {
+            return;
         }
+        self.in_group = false;
+        // A group that recorded nothing (an insert session that typed nothing,
+        // say) must not leave an entry that `u` would consume silently.
+        if self.undo_stack.last().is_some_and(Vec::is_empty) {
+            self.undo_stack.pop();
+        }
+        self.trim();
     }
 
     /// Record a change.
     pub fn record(&mut self, change: Change) {
-        if self.in_group {
-            self.current_group.push(change);
-        } else {
-            self.undo_stack.push(change);
-            // Clear redo stack on new change
-            self.redo_stack.clear();
+        // Any new edit invalidates the redo history and ends an undo run.
+        self.redo_stack.clear();
+        self.last_was_undo = false;
 
-            // Limit undo levels if configured
-            if self.max_levels > 0 && self.undo_stack.len() > self.max_levels {
-                self.undo_stack.remove(0);
+        match self.undo_stack.last_mut() {
+            Some(group) if self.in_group => group.push(change),
+            _ => {
+                self.undo_stack.push(vec![change]);
+                self.trim();
             }
+        }
+    }
+
+    /// Drop the oldest commands past `max_levels`.
+    fn trim(&mut self) {
+        if self.max_levels > 0 && self.undo_stack.len() > self.max_levels {
+            self.undo_stack.remove(0);
         }
     }
 
@@ -249,28 +276,47 @@ impl UndoManager {
         matches!(&self.line_original, Some((n, _)) if *n == current_line)
     }
 
-    /// Perform undo operation.
+    /// Reverse the last command, applying its edits' inverses in reverse order.
+    ///
+    /// The reported position comes from the *first* edit of the command, which
+    /// is where POSIX puts the cursor: "set to the first line added or changed"
+    /// (95450).
     pub fn undo(&mut self, buffer: &mut Buffer) -> Result<Position> {
-        let change = self.undo_stack.pop().ok_or(ViError::NothingToUndo)?;
+        let group = self.undo_stack.pop().ok_or(ViError::NothingToUndo)?;
 
-        let pos = self.apply_inverse(&change, buffer)?;
+        let mut pos = buffer.cursor();
+        for change in group.iter().rev() {
+            pos = self.apply_inverse(change, buffer)?;
+        }
 
-        // Push to redo stack
-        self.redo_stack.push(change);
-
+        self.redo_stack.push(group);
+        self.last_was_undo = true;
         Ok(pos)
     }
 
-    /// Perform redo operation.
+    /// Re-apply the last undone command.
     pub fn redo(&mut self, buffer: &mut Buffer) -> Result<Position> {
-        let change = self.redo_stack.pop().ok_or(ViError::AtFirstChange)?;
+        let group = self.redo_stack.pop().ok_or(ViError::AtFirstChange)?;
 
-        let pos = self.apply_change(&change, buffer)?;
+        let mut pos = buffer.cursor();
+        for change in group.iter() {
+            pos = self.apply_change(change, buffer)?;
+        }
 
-        // Push back to undo stack
-        self.undo_stack.push(change);
-
+        self.undo_stack.push(group);
+        self.last_was_undo = false;
         Ok(pos)
+    }
+
+    /// The `u` command: reverse the last buffer-modifying command, *including a
+    /// previous undo*, so pressing `u` twice returns to where you started
+    /// (POSIX ex `undo`, 95442).
+    pub fn undo_toggle(&mut self, buffer: &mut Buffer) -> Result<Position> {
+        if self.last_was_undo {
+            self.redo(buffer)
+        } else {
+            self.undo(buffer)
+        }
     }
 
     /// Restore current line to original state (U command).
@@ -407,7 +453,12 @@ impl UndoManager {
             ChangeKind::Delete => {
                 // Undo delete = insert
                 if let Some(text) = &change.deleted_text {
-                    buffer.set_cursor(change.position);
+                    // `set_cursor` clamps the column to command-mode bounds
+                    // (at most `len - 1`), so text removed from the end of a
+                    // line would be restored one column too far left. Position
+                    // for insertion instead, which allows `len`.
+                    buffer.set_line(change.position.line);
+                    buffer.set_column_for_insert(change.position.column);
                     if change.linewise {
                         for (i, line) in text.lines().enumerate() {
                             buffer
@@ -455,8 +506,9 @@ impl UndoManager {
     pub fn clear(&mut self) {
         self.undo_stack.clear();
         self.redo_stack.clear();
-        self.current_group.clear();
+        self.in_group = false;
         self.line_original = None;
+        self.last_was_undo = false;
     }
 
     /// Get number of undo levels available.

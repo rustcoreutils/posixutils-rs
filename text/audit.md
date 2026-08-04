@@ -1842,7 +1842,7 @@ Not covered:
 
 ### TL;DR
 
-Solid multi-column, pagination, and option-parsing foundations. Seven conformance gaps: the date format uses `%d` (zero-pad) instead of the spec-mandated `%e` (space-pad); `-p` pause reads from stdin instead of `/dev/tty` and waits for `\r` instead of `\n`; XSI `-f` pauses before every page rather than only the first; `-s` is wrongly restricted to multi-column mode; `-e`/`-i` are not implicitly assumed for multi-column output; form-feed mid-page sets `num_nonpadding_lines` wrong; SIGINT diagnostic deferral is unimplemented. No crash/data-loss bugs, but two (date format, `-p` channel) affect every invocation of those features.
+Solid multi-column, pagination, and option-parsing foundations. Seven conformance gaps: the date format uses `%d` (zero-pad) instead of the spec-mandated `%e` (space-pad); `-p` pause reads from stdin instead of `/dev/tty` and waits for `\r` instead of `\n`; XSI `-f` pauses before every page rather than only the first; `-s` is wrongly restricted to multi-column mode; `-e`/`-i` are not implicitly assumed for multi-column output; form-feed mid-page sets `num_nonpadding_lines` wrong; SIGINT diagnostic deferral is unimplemented. No crash/data-loss bugs, but two (date format, `-p` channel) affect every invocation of those features. All eight are now fixed (Phase 11), as is a ninth found later: the pause ignored the "standard output is a terminal" condition and so hung every non-interactive `-p`/`-f` run (#9, Phase 12).
 
 ### Priority issues
 
@@ -1863,6 +1863,7 @@ Solid multi-column, pagination, and option-parsing foundations. Seven conformanc
 - [x] **#6 — `-s` falsely requires multi-column mode.** FIXED (Phase 11): removed the `requires = "multi_column"`; `pr -s file` works in single-column mode (test `pr_separator_single_column`).
 - [x] **#7 — `num_nonpadding_lines` wrong on form-feed mid-page.** FIXED (Phase 11): returns the real non-padding line count when a form-feed ends a page early (test `pr_form_feed_multi_column_page_accounting`).
 - [x] **#8 — SIGINT diagnostic deferral not implemented.** FIXED (Phase 11): a SIGINT handler (installed only when stdout is a terminal) flushes output streams, restores `SIG_DFL`, and re-raises, following the project signal pattern.
+- [x] **#9 — The `-p`/`-f` pause ignored the "standard output is a terminal" condition, hanging non-interactive runs.** `pause()` opened `/dev/tty` and blocked for a `<newline>` whenever that open succeeded, skipping only when there was no controlling terminal at all. But POSIX gates the pause on the *destination of standard output*, not on the existence of a tty: `-p` is "Pause before beginning each page **if the standard output is directed to a terminal**" (111731), and the XSI `-f` pause carries the same condition (111852-111855, "if standard output is a TTY device"). So `pr -f file > out.txt` — or any use in a pipeline — blocked forever in every shell session, since the process still *had* a controlling terminal even though its output was a file. This was found when it hung `cargo-build-all`. FIXED (Phase 12): `pause()` returns immediately unless `isatty(STDOUT_FILENO)`. The `<alert>` is part of the pause, so it is likewise not written when stdout is not a terminal. Regression-tested by `pr_form_feed_and_pause_without_a_terminal`; the pre-fix binary hangs under a pty with stdout redirected, the fixed one exits 0.
 
 ### Detailed conformance matrix
 
@@ -1887,7 +1888,7 @@ Solid multi-column, pagination, and option-parsing foundations. Seven conformanc
 | `-a` across | CONFORMS | |
 | `-d` double-space | CONFORMS | `args.rs:389-392` |
 | `-e[c][g]` expand tabs | CONFORMS | `line_transform.rs:19` |
-| `-f` XSI pause-first-only | DIVERGES | every page (#4) |
+| `-f` XSI pause-first-only | CONFORMS | `pause_first_page_only` (#4); tty-gated (#9) |
 | `-F` form-feed | CONFORMS | |
 | `-h header` | CONFORMS | |
 | `-i[c][g]` output tabs | CONFORMS | `line_transform.rs:42` |
@@ -1895,9 +1896,9 @@ Solid multi-column, pagination, and option-parsing foundations. Seven conformanc
 | `-m` merge | CONFORMS | |
 | `-n[c][w]` numbering | CONFORMS | |
 | `-o offset` | CONFORMS | |
-| `-p` pause | PARTIAL | stdin not `/dev/tty` (#2); `\r` not `\n` (#3) |
+| `-p` pause | CONFORMS | `/dev/tty` (#2), `\n` (#3), only when stdout is a tty (#9) |
 | `-r` no warnings | CONFORMS | |
-| `-s[c]` separator | PARTIAL | wrongly requires multi-column (#6) |
+| `-s[c]` separator | CONFORMS | single-column allowed (#6) |
 | `-t` omit header/trailer | CONFORMS | |
 | `-w width` | CONFORMS | default 72; 512 with `-s` |
 | `-e`/`-i` assumed for multi-column | MISSING | (#5) |
@@ -1972,8 +1973,8 @@ Solid multi-column, pagination, and option-parsing foundations. Seven conformanc
 
 ### Test coverage signal
 
-Not covered:
-- [x] `-p` pause; `-f` form-feed-with-pause; `-F` vs `-f` distinction — `pr_form_feed_options_differ`
+All previously-uncovered areas now have tests:
+- [x] `-p`/`-f` pause suppressed when stdout is not a terminal (#9); `-f`/`-F` form-feed paging — `pr_form_feed_and_pause_without_a_terminal`
 - [x] `-d` double-space; `-r` suppress-warnings — `pr_double_space_output`, `pr_suppress_file_warnings`
 - [x] `-s` without multi-column (#6 — currently rejected by clap) — `pr_separator_single_column`
 - [x] form-feed character in input triggering mid-page break (#7) — `pr_form_feed_multi_column_page_accounting`
@@ -1987,6 +1988,7 @@ Not covered:
 - **PR B — "`-p` pause channel + trigger char"**: #2, #3.
 - **PR C — "`-f` first-page-only + `-e`/`-i` assumed + `-s` constraint"**: #4, #5, #6.
 - **PR D — "Form-feed page accounting + SIGINT deferral"**: #7, #8.
+- **PR E — "Gate the pause on stdout being a terminal"**: #9.
 
 ---
 

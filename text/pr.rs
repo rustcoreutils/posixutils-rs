@@ -66,6 +66,19 @@ impl IntoIoResult for std::fmt::Result {
 // trigger from <carriage-return> to <newline>.) The response must come from
 // /dev/tty, not standard input.
 fn pause() -> io::Result<()> {
+    // POSIX -p (111731): "Pause before beginning each page **if the standard
+    // output is directed to a terminal**"; the XSI -f pause carries the same
+    // condition (111852-111855, "if standard output is a TTY device"). Pausing
+    // regardless meant `pr -p file > out` blocked forever on /dev/tty whenever
+    // the process merely *had* a controlling terminal — which is every script
+    // run from a shell. The alert is part of the pause, so it is not written
+    // either.
+    //
+    // SAFETY: isatty is thread-safe and side-effect-free on any fd number.
+    if unsafe { libc::isatty(libc::STDOUT_FILENO) } != 1 {
+        return Ok(());
+    }
+
     // Must print \a to stderr.
     eprint!("{ALERT}");
 

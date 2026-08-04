@@ -394,36 +394,55 @@ fn pr_merge_of_empty_files() {
 }
 
 #[test]
-fn pr_form_feed_options_differ() {
-    // -f writes an <alert> before the form feed on a pause; -F does not pause
-    // and writes neither.
-    let f = pr_tmp("ff", "l1\n");
-    let with_f = std::process::Command::new(env!("CARGO_BIN_EXE_pr"))
-        .args(["-f", "-t", f.to_str().unwrap()])
-        .output()
-        .expect("run pr -f");
-    let with_upper_f = std::process::Command::new(env!("CARGO_BIN_EXE_pr"))
-        .args(["-F", "-t", f.to_str().unwrap()])
-        .output()
-        .expect("run pr -F");
-    assert_eq!(with_f.status.code(), Some(0));
-    assert_eq!(with_upper_f.status.code(), Some(0));
-    // POSIX: the pause "shall write an <alert> to standard error", not to
-    // standard output, so the page text itself is identical.
+fn pr_form_feed_and_pause_without_a_terminal() {
+    // -f and -F both "use a <form-feed> for new pages, instead of the default
+    // behavior that uses a sequence of <newline> characters" (POSIX 111703,
+    // 111706). They differ only in the pause, and the pause is conditional:
+    // -f pauses "if standard output is a TTY device" (111852-111855), as does
+    // -p (111731). Standard output here is a pipe, so neither may pause -- and
+    // pr must not block on /dev/tty just because it inherited a controlling
+    // terminal, which is what `pr -f file > out` used to do, forever.
+    let f = pr_tmp("ff", &"line\n".repeat(200));
+    let run = |opts: &[&str]| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_pr"))
+            .args(opts)
+            .arg(f.to_str().unwrap())
+            .output()
+            .expect("run pr");
+        assert_eq!(out.status.code(), Some(0), "pr {opts:?} exit status");
+        out
+    };
+
+    let with_f = run(&["-f"]);
+    let with_upper_f = run(&["-F"]);
+    let with_p = run(&["-p"]);
+    let plain = run(&[]);
+
+    // Form feeds separate pages under both -f and -F, but not by default.
+    for (opt, out) in [("-f", &with_f), ("-F", &with_upper_f)] {
+        assert!(
+            out.stdout.contains(&b'\x0c'),
+            "pr {opt} separates pages with a <form-feed>"
+        );
+    }
     assert!(
-        with_f.stderr.contains(&b'\x07'),
-        "-f writes an alert to stderr, got {:?}",
-        String::from_utf8_lossy(&with_f.stderr)
-    );
-    assert!(
-        !with_upper_f.stderr.contains(&b'\x07'),
-        "-F must not pause, got {:?}",
-        String::from_utf8_lossy(&with_upper_f.stderr)
+        !plain.stdout.contains(&b'\x0c'),
+        "the default page separator is <newline> characters, not <form-feed>"
     );
     assert_eq!(
         with_f.stdout, with_upper_f.stdout,
-        "the alert is the only difference; the page text is the same"
+        "-f and -F lay out pages identically; only the pause differs"
     );
+
+    // No terminal, so no pause: no <alert> on stderr from any of them.
+    for (opt, out) in [("-f", &with_f), ("-F", &with_upper_f), ("-p", &with_p)] {
+        assert!(
+            !out.stderr.contains(&b'\x07'),
+            "pr {opt} must not alert when standard output is not a terminal, got {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     let _ = std::fs::remove_file(f);
 }
 

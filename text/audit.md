@@ -490,12 +490,12 @@ Note: a strictly decreasing single element (`5-3`) is rejected (correct: `low>hi
 ### Test coverage signal
 
 Not covered:
-- [ ] `cut -f 1` (default tab delimiter — golden-path regression)
+- [x] `cut -f 1` (default tab delimiter — golden-path regression) — `test_cut_f_default_tab`
 - [ ] `cut -b 1-2 -n` on a 3-byte UTF-8 character
-- [ ] continue after file error (`cut -b 1 /dev/null nonexistent other.txt`)
-- [ ] blank-separated list `cut -c "1 3 5"`
-- [ ] non-UTF-8 byte output (`-b` on binary data)
-- [ ] `-` mixed with real files
+- [x] continue after file error (`cut -b 1 /dev/null nonexistent other.txt`) — `test_cut_continue_after_missing_file`
+- [x] blank-separated list `cut -c "1 3 5"` — `test_cut_blank_separated_list`
+- [x] non-UTF-8 byte output (`-b` on binary data) — `test_cut_b_raw_bytes_non_utf8`
+- [x] `-` mixed with real files — `test_cut_dash_non_sole_operand`
 - [ ] backslash delimiter (`-d \\ -f 1`)
 
 ### Suggested PR groupings
@@ -642,15 +642,15 @@ Not covered:
 - [ ] Stdin (`-`) operand
 - [ ] Identical files → exit 0, no output
 - [ ] Error conditions → exit 2 (not found, permission)
-- [ ] Single-line context header (`*** 5 ****`)
+- [x] Single-line context header (`*** 5 ****`) — `test_diff_context_zero_single_line_range`
 - [ ] Empty-range context header (`*** 0 ****`)
-- [ ] Unified header timezone/fractional fields
-- [ ] `-C 0` zero-context
+- [x] Unified header timezone/fractional fields — `test_diff_unified_header_timestamp_format`
+- [x] `-C 0` zero-context — `test_diff_context_zero_single_line_range`, `test_diff_unified_zero_single_line_range`
 - [ ] Files without trailing newline in context/unified modes
 - [ ] FIFO/block-device in directory comparison
 - [ ] `-r` symlink cycles
 - [ ] `-e` lone-period escaping
-- [ ] `-f` multi-line range separator
+- [x] `-f` multi-line range separator — `test_diff_forward_multiline_range`
 
 ### Suggested PR groupings
 
@@ -781,14 +781,14 @@ Spec: "None". Normative behavior in DESCRIPTION/OPTIONS.
 
 Only two cases (empty input; `"a\tb\tc\n"` default 8-stop). Not covered:
 - [ ] `-t N` single integer non-default
-- [ ] `-t N,M,...` multi-stop list (entire `Stops` variant untested)
-- [ ] multi-line input with `-t` list (exposes #2)
+- [x] `-t N,M,...` multi-stop list (entire `Stops` variant untested) — `expand_multi_stop_list`
+- [x] multi-line input with `-t` list (exposes #2) — `expand_multi_stop_resets_each_line`
 - [ ] tab at/past last stop (single-space rule)
 - [ ] backspace column decrement
 - [ ] multiple file operands; file not found → exit 1
-- [ ] `-t 0` (currently panics, #1)
-- [ ] zero value in list (#4)
-- [ ] multibyte/wide-character column width (#5)
+- [x] `-t 0` (currently panics, #1) — `expand_rejects_zero_tabsize`
+- [x] zero value in list (#4) — `expand_rejects_zero_in_list`
+- [x] multibyte/wide-character column width (#5) — `expand_multibyte_column_width`
 
 ### Suggested PR groupings
 
@@ -909,10 +909,10 @@ Locale initialized, but the core loop is byte-oriented: no UTF-8 decode, no `wcw
 ### Test coverage signal
 
 Not covered (all test inputs fit within 80 columns, so no fold ever fires):
-- [ ] Any input that actually causes a fold (`-w` narrow)
-- [ ] `-s` with an actual fold point
+- [x] Any input that actually causes a fold (`-w` narrow) — `fold_custom_width`
+- [x] `-s` with an actual fold point — `fold_spaces_breaks_at_last_blank`
 - [ ] tab / backspace / carriage-return handling
-- [ ] multibyte / wide-character column counting
+- [x] multibyte / wide-character column counting — `fold_wide_character_width`
 - [ ] `-` operand as stdin; multiple file operands
 - [ ] error exit (inaccessible file)
 - [ ] word longer than width with `-s`; empty input; no trailing newline
@@ -1057,7 +1057,7 @@ libc regex is locale-aware and spec-correct. The only locale gap is `-F -i` (byp
 Well-covered: all single options across BRE/ERE/fixed modes, multiple `-e`/`-f`, empty patterns, multi-file prefixes, `-` stdin, long aliases, invalid-pattern exit code, quiet+error orderings.
 
 Not covered:
-- [ ] dedup bug: two identical patterns from separate `-e` (no test confirms both retained) (#1)
+- [x] dedup bug: two identical patterns from separate `-e` (no test confirms both retained) (#1) — `test_duplicate_patterns_are_all_used`
 - [ ] `-i -F` where Unicode vs locale folding diverge (Turkish `I`/`ı`) (#2)
 - [ ] `LC_MESSAGES`-translated error messages (#3)
 - [ ] ERE lazy quantifiers (POSIX.1-2024 §9.4.6 item 6)
@@ -1186,7 +1186,7 @@ Locale initialized; two hardcoded English diagnostics (lines 162, 171) bypass ge
 ### Test coverage signal
 
 Not covered:
-- [ ] `-` as a file operand (stdin via dash) (#1)
+- [x] `-` as a file operand (stdin via dash) (#1) — `head_dash_operand_reads_stdin`
 - [ ] `-n 0` / `-c 0` exit-code behavior (property tests don't check exit code) (#2)
 - [ ] multiple file operands with `==> name <==` headers
 - [ ] non-existent file → non-zero exit
@@ -1468,7 +1468,7 @@ Mostly correct. The golden path (body numbering, `-v`, `-i`, `-n`, `-s`, `-w`, `
 ### Test coverage signal
 
 Not covered:
-- [ ] `-b pBRE` with BRE-specific syntax (`\(…\)`, `\{n\}`, backrefs)
+- [x] `-b pBRE` with BRE-specific syntax (`\(…\)`, `\{n\}`, backrefs) — `test_nl_pbre_is_basic_regex`, `test_nl_pbre_interval`
 - [ ] `-f`/`-h` with `pBRE`
 - [ ] `-l N` grouping across a section delimiter (#2)
 - [ ] `-d` with 0-length or >2-char argument
@@ -1931,9 +1931,9 @@ Solid multi-column, pagination, and option-parsing foundations. Seven conformanc
 Not covered:
 - [ ] `-p` pause; `-f` form-feed-with-pause; `-F` vs `-f` distinction
 - [ ] `-d` double-space; `-r` suppress-warnings
-- [ ] `-s` without multi-column (#6 — currently rejected by clap)
-- [ ] form-feed character in input triggering mid-page break (#7)
-- [ ] multi-column with input tabs (verifying `-e`/`-i` assumed) (#5)
+- [x] `-s` without multi-column (#6 — currently rejected by clap) — `pr_separator_single_column`
+- [x] form-feed character in input triggering mid-page break (#7) — `pr_form_feed_multi_column_page_accounting`
+- [x] multi-column with input tabs (verifying `-e`/`-i` assumed) (#5) — `pr_expand_and_replace`
 - [ ] locale-sensitive date output (`LC_TIME` non-POSIX)
 - [ ] empty file with `-m`; SIGINT handling
 
@@ -2543,7 +2543,7 @@ Thorough for ASCII. Not covered:
 - [ ] LC_COLLATE range ordering (#5)
 - [ ] `[=e=]` expanding to multiple members (#4)
 - [ ] `-C` vs `-c` distinguishing behavior (#1)
-- [ ] `[c*]` in string1 rejection (#6)
+- [x] `[c*]` in string1 rejection (#6) — `tr_repeat_construct_rejected_in_string1`
 - [ ] empty string1/string2 (undefined per spec)
 
 ### Suggested PR groupings
@@ -2656,10 +2656,10 @@ The core topological sort and output format are correct. Three gaps: the `-w` op
 ### Test coverage signal
 
 Not covered:
-- [ ] `-w` option (#1)
-- [ ] `-` operand as stdin (#3)
-- [ ] non-zero exit on cycle (tests assert exit 0) (#2)
-- [ ] cycle count under `-w`
+- [x] `-w` option (#1) — `test_tsort_w_counts_cycles`, `test_tsort_w_no_cycle_is_zero`
+- [x] `-` operand as stdin (#3) — `tsort_dash_operand_reads_stdin`
+- [x] non-zero exit on cycle (tests assert exit 0) (#2) — `test_tsort_cycle_two_nodes`
+- [x] cycle count under `-w` — `test_tsort_w_counts_cycles`
 - [ ] multiple independent cycles → separate reports (#5)
 - [ ] `--` followed by a `-`-prefixed file operand
 
@@ -2789,11 +2789,11 @@ Not covered:
 - [ ] repeating default tab stops (>8 leading spaces); `test_2` encodes the wrong value (#1)
 - [ ] `-t N` with N≠8 repeating
 - [ ] `-t` implying all-blanks (#2)
-- [ ] space-separated tablist (#6)
+- [x] space-separated tablist (#6) — `unexpand_blank_separated_tablist`
 - [ ] backspace in input (#5)
 - [ ] leading tab interacting with conversion (#9)
-- [ ] multibyte/wide characters (#10)
-- [ ] multiple files; `-` among multiple operands (#8)
+- [x] multibyte/wide characters (#10) — `unexpand_multibyte_column_width`
+- [x] multiple files; `-` among multiple operands (#8) — `unexpand_dash_non_sole_operand`
 - [ ] error cases (non-existent file)
 
 ### Suggested PR groupings
@@ -2922,10 +2922,10 @@ Spec rationale clarifies uniq uses byte-identical comparison (not collation), so
 ### Test coverage signal
 
 Not covered:
-- [ ] `-s N` with multi-byte UTF-8 (crash, #1)
-- [ ] line with leading blanks under `-f N` (#2)
-- [ ] `-f N`/`-s N` over-skip → null-string rule (#5)
-- [ ] output operand `-` → stdout (#3)
+- [x] `-s N` with multi-byte UTF-8 (crash, #1) — `uniq_skip_chars_multibyte_no_panic`
+- [x] line with leading blanks under `-f N` (#2) — `uniq_skip_fields_leading_blanks`
+- [x] `-f N`/`-s N` over-skip → null-string rule (#5) — `uniq_over_skip_yields_null_key`, `uniq_over_skip_fields_null_key`
+- [x] output operand `-` → stdout (#3) — `uniq_dash_output_operand_is_stdout`
 - [ ] `-c` with multi-digit counts (format spacing)
 - [ ] named input file (only stdin tested)
 - [ ] empty file; single-line file
@@ -3052,13 +3052,13 @@ Two confirmed bugs dominate: (1) a single named file operand prints no filename,
 ### Test coverage signal
 
 Only three tests (empty, single char, two-word line), all stdin. Not covered:
-- [ ] single named file operand (would expose #1)
-- [ ] `-` operand as stdin (#2)
+- [x] single named file operand (would expose #1) — `wc_single_file_shows_name`
+- [x] `-` operand as stdin (#2) — `wc_dash_operand_reads_stdin`
 - [ ] multiple file operands (total line, per-file filenames)
 - [ ] default output (no flags) format and column order
-- [ ] `-m` with multibyte UTF-8 input (#3)
+- [x] `-m` with multibyte UTF-8 input (#3) — `wc_chars_locale_aware`
 - [ ] `-l -w`/`-l -c` combined (alignment, #5)
-- [ ] non-ASCII word-boundary detection (#4)
+- [x] non-ASCII word-boundary detection (#4) — `wc_words_locale_whitespace`
 - [ ] non-existent/unreadable file; exit code propagation
 - [ ] `--` end of options
 

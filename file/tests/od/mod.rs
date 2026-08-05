@@ -366,6 +366,38 @@ fn test_od_plus_offset_operand() {
     );
 }
 
+// POSIX (od, l. 109177): for -t c a <backslash> byte "shall be written as a
+// single <backslash>" -- it is explicitly exempt from the escape table. It is
+// still right-aligned in the same 4-column field as every other conversion, so
+// emitting a 3-character field shifts the rest of the line left by one column.
+#[test]
+fn test_od_c_backslash_column_alignment() {
+    od_test(&["-c", "-An"], "a\\b", "   a   \\   b\n");
+    od_test(&["-t", "c", "-An"], "a\\b", "   a   \\   b\n");
+}
+
+// The column shift is cumulative across a full 16-byte line.
+#[test]
+fn test_od_c_backslash_full_line() {
+    let data = "\\".repeat(16);
+    let expected = format!("{}\n", "   \\".repeat(16));
+    od_test(&["-c", "-An"], &data, &expected);
+}
+
+// With the address column present, a regression also shows up as a misaligned
+// dump rather than only as a short line.
+#[test]
+fn test_od_c_backslash_with_offsets() {
+    od_test(&["-c"], "\\abc", "0000000   \\   a   b   c\n0000004\n");
+}
+
+// -t a is unaffected: a <backslash> has no character name, so it takes the
+// graphic-character path. This pins the a/c distinction.
+#[test]
+fn test_od_a_backslash_unaffected() {
+    od_test(&["-t", "a", "-An"], "a\\b", "   a   \\   b\n");
+}
+
 // OD-6: skipping past the end of input is a diagnostic error (exit > 0).
 #[test]
 fn test_od_skip_past_eof() {

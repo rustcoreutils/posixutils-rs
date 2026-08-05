@@ -927,7 +927,14 @@ impl Formatter for CFormatter {
     fn format_value(&self, byte: u8) -> String {
         match byte {
             b'\0' => "  \\0".to_string(),
-            b'\\' => "  \\".to_string(),
+            // POSIX (l. 109177): a <backslash> is exempt from the escape table
+            // and "shall be written as a single <backslash>" -- NOT as `\\`.
+            // It still occupies the same 4-column field as every other
+            // conversion, so this arm carries three spaces, not two. Keeping
+            // the arm explicit (rather than letting the graphic-character case
+            // below handle it) documents that omitting the escape is
+            // deliberate.
+            b'\\' => "   \\".to_string(),
             b'\x07' => "  \\a".to_string(),
             b'\x08' => "  \\b".to_string(),
             b'\x0C' => "  \\f".to_string(),

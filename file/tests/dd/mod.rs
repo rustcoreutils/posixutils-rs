@@ -466,3 +466,148 @@ fn test_iflags_fullblock() {
         expected_exit_code: 0,
     });
 }
+
+// --- coverage gaps closed in the file-crate audit sweep ---
+
+/// Run dd with `args`, feeding `stdin_data`, and return (stdout, stderr, code).
+fn run_dd(args: &[&str], stdin_data: &[u8]) -> (Vec<u8>, String, Option<i32>) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let dd = plib::testing::get_binary_path("dd");
+    let mut child = Command::new(&dd)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn dd");
+    // A rejected operand makes dd exit before reading stdin, so this write can
+    // legitimately fail with EPIPE. That is a result, not a harness failure.
+    let _ = child.stdin.as_mut().unwrap().write_all(stdin_data);
+    let out = child.wait_with_output().unwrap();
+    (
+        out.stdout,
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.code(),
+    )
+}
+
+// DD-1: POSIX fixes the order in which conversions apply (sync, then swab,
+// then charset/case, then block/unblock). The order they are *named* in the
+// conv= operand must not change the result.
+#[test]
+fn test_conv_order_independence() {
+    // swab then ucase, requested both ways round.
+    let data = b"abcd";
+    let (a, _, ca) = run_dd(&["conv=swab,ucase"], data);
+    let (b, _, cb) = run_dd(&["conv=ucase,swab"], data);
+    assert_eq!(ca, Some(0));
+    assert_eq!(cb, Some(0));
+    assert_eq!(a, b, "conv= order must not affect the result");
+    // swab pairs first (badc), then upper-cases: BADC.
+    assert_eq!(a, b"BADC");
+}
+
+// DD-3: lcase/ucase go through the locale's LC_CTYPE mapping. In a UTF-8
+// locale the single-byte high range has no case mapping, so those bytes must
+// pass through untouched rather than being mangled; ASCII still maps.
+#[test]
+fn test_case_conversion_in_utf8_locale() {
+    let Some(loc) = plib::testing::utf8_locale() else {
+        eprintln!("skipping: no UTF-8 locale installed");
+        return;
+    };
+
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let dd = plib::testing::get_binary_path("dd");
+    let input: Vec<u8> = vec![b'a', b'B', 0xC3, 0xA9, b'z'];
+
+    let mut child = Command::new(&dd)
+        .arg("conv=ucase")
+        .env("LC_ALL", &loc)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn dd");
+    child.stdin.as_mut().unwrap().write_all(&input).unwrap();
+    let out = child.wait_with_output().unwrap();
+
+    assert_eq!(out.status.code(), Some(0));
+    // ASCII upper-cased; the two UTF-8 continuation bytes untouched.
+    assert_eq!(out.stdout, vec![b'A', b'B', 0xC3, 0xA9, b'Z']);
+}
+
+// DD-4: skip= on a non-seekable input counts *blocks*, not read() calls. A
+// pipe delivers short reads, so a naive implementation skips too little.
+#[test]
+fn test_skip_accumulates_short_reads_on_pipe() {
+    // 4 blocks of 512; skip 2 => the second half comes out.
+    let mut input = vec![b'A'; 1024];
+    input.extend(vec![b'B'; 1024]);
+    let (stdout, _, code) = run_dd(&["ibs=512", "obs=512", "skip=2"], &input);
+    assert_eq!(code, Some(0));
+    assert_eq!(stdout.len(), 1024);
+    assert!(
+        stdout.iter().all(|&b| b == b'B'),
+        "skip=2 with ibs=512 must drop exactly the first 1024 bytes"
+    );
+}
+
+// DD-6: the `w` (word) multiplier is not in POSIX -- the word size is not
+// portable -- so it must be rejected rather than silently treated as 2.
+#[test]
+fn test_w_multiplier_rejected() {
+    let (_, stderr, code) = run_dd(&["ibs=2w"], b"abcd");
+    assert_ne!(code, Some(0), "`w` suffix must be rejected");
+    assert!(
+        stderr.contains("suffix"),
+        "expected a suffix diagnostic, got {stderr:?}"
+    );
+}
+
+// DD-2: on SIGINT dd writes its statistics and then terminates *as if by the
+// default action*, so the parent observes a signal death (WIFSIGNALED), not a
+// plain non-zero exit.
+#[test]
+fn test_sigint_reports_stats_and_signal_death() {
+    use std::io::Read;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{Command, Stdio};
+
+    let dd = plib::testing::get_binary_path("dd");
+    // Read from a fifo-like endless source so dd is still running when signaled.
+    let mut child = Command::new(&dd)
+        .args(["if=/dev/zero", "of=/dev/null"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn dd");
+
+    // Give it a moment to get into the copy loop, then interrupt.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let pid = child.id() as libc::pid_t;
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGINT) }, 0);
+
+    let status = child.wait().expect("wait failed");
+    let mut stderr = String::new();
+    child
+        .stderr
+        .as_mut()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGINT),
+        "dd must die by SIGINT, not exit normally (status {status:?})"
+    );
+    assert!(
+        stderr.contains("records in"),
+        "statistics must still be written before dying, got {stderr:?}"
+    );
+}

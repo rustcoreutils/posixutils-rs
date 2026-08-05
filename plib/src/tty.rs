@@ -158,9 +158,14 @@ impl std::fmt::Display for OpenError {
     }
 }
 
-/// Whether `path` is lexically a safe terminal device name: under `/dev`, with
-/// no `.` or `..` component. Purely textual — no syscalls, so a hostile operand
+/// Whether `path` is lexically a safe terminal device name: an absolute path
+/// under `/dev` naming at least one entry, with no `..` (nor any other
+/// non-`Normal`) component. Purely textual — no syscalls, so a hostile operand
 /// is rejected before anything is opened.
+///
+/// A redundant `.` is accepted rather than rejected: `Path::components()` folds
+/// `.` away, so `/dev/./tty1` is literally the same path as `/dev/tty1`. Only
+/// `..`, which can escape `/dev`, survives normalization and is refused.
 fn is_safe_dev_path(path: &Path) -> bool {
     use std::path::Component;
 
@@ -174,8 +179,8 @@ fn is_safe_dev_path(path: &Path) -> bool {
     if components.next() != Some(Component::Normal("dev".as_ref())) {
         return false;
     }
-    // Everything after /dev must be an ordinary name: `/dev/../etc/passwd` and
-    // `/dev/./tty` are both refused.
+    // Everything after /dev must be an ordinary name, so `/dev/../etc/passwd`
+    // is refused. (A `.` never reaches here; see the note above.)
     let mut saw_name = false;
     for c in components {
         match c {

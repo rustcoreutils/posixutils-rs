@@ -602,10 +602,32 @@ fn find_exec_plus_splits_over_arg_max() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
-    // ~200-byte names so a few thousand files exceed a typical 2 MiB ARG_MAX.
-    let pad = "n".repeat(200);
-    const COUNT: usize = 9000;
-    for i in 0..COUNT {
+    // The file count has to be derived from the host's ARG_MAX, not fixed: a
+    // count tuned to one machine's margin silently stops splitting on a host
+    // with a larger limit or a smaller environment, and the test then passes
+    // while proving nothing.
+    //
+    // find budgets `ARG_MAX - environment - fixed overhead`, which is always
+    // strictly less than ARG_MAX, so exceeding ARG_MAX itself is sufficient.
+    // Aim for 1.5x it.
+    let arg_max = match unsafe { libc::sysconf(libc::_SC_ARG_MAX) } {
+        n if n > 0 => n as usize,
+        _ => 1 << 17,
+    };
+    if arg_max > 64 << 20 {
+        eprintln!("skipping: ARG_MAX of {arg_max} would need an unreasonable number of files");
+        std::fs::remove_dir_all(&dir).unwrap();
+        return;
+    }
+
+    const NAME_PAD: usize = 200;
+    // Mirrors find's own per-path accounting: the path, its NUL, and a pointer.
+    let per_file =
+        dir.to_string_lossy().len() + 1 + NAME_PAD + 6 + 1 + std::mem::size_of::<usize>();
+    let count = arg_max * 3 / 2 / per_file + 1;
+
+    let pad = "n".repeat(NAME_PAD);
+    for i in 0..count {
         File::create(dir.join(format!("{pad}{i:06}"))).unwrap();
     }
 
@@ -627,11 +649,13 @@ fn find_exec_plus_splits_over_arg_max() {
 
     assert!(
         counts.len() > 1,
-        "expected the file list to be split across several invocations, got {counts:?}"
+        "expected {count} files (~{} bytes of argv, ARG_MAX {arg_max}) to be split \
+         across several invocations, got {counts:?}",
+        count * per_file
     );
     assert_eq!(
         counts.iter().sum::<usize>(),
-        COUNT,
+        count,
         "every pathname must be passed exactly once across all invocations"
     );
     assert_eq!(output.status.code(), Some(0));

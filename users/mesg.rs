@@ -9,8 +9,8 @@
 
 use clap::Parser;
 use gettextrs::gettext;
+use plib::tty::{self, mesg_allowed, set_mesg};
 use std::io::{self, IsTerminal};
-use std::mem;
 use std::process::ExitCode;
 
 /// mesg - permit or deny messages
@@ -55,40 +55,7 @@ fn stat_tty() -> io::Result<(i32, libc::stat)> {
         None => return Err(io::Error::other("no terminal")),
     };
 
-    unsafe {
-        let mut st: libc::stat = mem::zeroed();
-        if libc::fstat(fd, &mut st) < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok((fd, st))
-    }
-}
-
-/// Receiving messages is allowed when group- or other-write is set on the tty.
-fn mesg_allowed(st: &libc::stat) -> bool {
-    (st.st_mode & (libc::S_IWGRP | libc::S_IWOTH)) != 0
-}
-
-/// Set or clear the group/other write bits on the terminal device.
-fn set_mesg(fd: i32, st: &libc::stat, grant: bool) -> io::Result<()> {
-    let mut mode = st.st_mode;
-
-    if grant {
-        if mesg_allowed(st) {
-            return Ok(());
-        }
-        mode |= libc::S_IWGRP | libc::S_IWOTH;
-    } else {
-        if !mesg_allowed(st) {
-            return Ok(());
-        }
-        mode &= !(libc::S_IWGRP | libc::S_IWOTH);
-    }
-
-    if unsafe { libc::fchmod(fd, mode) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    Ok((fd, tty::fstat(fd)?))
 }
 
 /// POSIX EXIT STATUS: 0 if receiving messages is allowed, 1 if not. The status

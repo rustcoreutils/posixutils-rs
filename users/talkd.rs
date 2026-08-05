@@ -28,11 +28,12 @@ use clap::Parser;
 use gettextrs::gettext;
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{self, Cursor, Write};
 use std::mem::size_of;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -377,53 +378,45 @@ fn announce_to_tty(caller: &str, callee: &str, requested_tty: &str) -> Answer {
 
     // The callee must be logged in; pick the requested tty if given, else the
     // first login terminal.
-    let entries = plib::utmpx::load();
-    let tty_line = entries
-        .iter()
-        .filter(|e| e.user == callee && e.typ == plib::platform::USER_PROCESS)
-        .find(|e| requested_tty.is_empty() || e.line == requested_tty)
-        .map(|e| e.line.clone());
-    let tty_line = match tty_line {
-        Some(l) => l,
+    let want = (!requested_tty.is_empty()).then_some(requested_tty);
+    let user_tty = match plib::tty::user_tty(callee, want) {
+        Some(t) => t,
         None => return Answer::NotHere,
     };
 
-    let tty_path = format!("/dev/{}", tty_line);
+    // A single open validates the path, lets the kernel enforce write access,
+    // and yields the handle we write through -- the permission check and the
+    // write cannot end up on different inodes. `open_for_write` also passes
+    // O_NOCTTY, without which the first announcement would make the
+    // *recipient's* terminal this daemon's controlling terminal.
+    let mut f = match plib::tty::open_for_write(&user_tty.path) {
+        Ok(f) => f,
+        Err(plib::tty::OpenError::PermissionDenied) => return Answer::PermissionDenied,
+        Err(plib::tty::OpenError::Io(e)) if e.kind() == io::ErrorKind::PermissionDenied => {
+            return Answer::PermissionDenied
+        }
+        Err(_) => return Answer::Failed,
+    };
 
-    // Honor the recipient's mesg setting (group/other write bit), unless root.
-    match mesg_permits(&tty_path) {
-        Ok(true) => {}
-        Ok(false) => return Answer::PermissionDenied,
-        Err(_) => return Answer::NotHere,
+    // Unlike `write`, talkd must honor `mesg n` even when running as root: the
+    // announcement is triggered by an unauthenticated datagram, so the
+    // recipient's stated wish is the only consent that exists. `may_write`
+    // (applied inside `open_for_write`) exempts the superuser, so re-check
+    // `mesg_allowed` on its own here.
+    match plib::tty::fstat(f.as_raw_fd()) {
+        Ok(st) if plib::tty::mesg_allowed(&st) => {}
+        Ok(_) => return Answer::PermissionDenied,
+        Err(_) => return Answer::Failed,
     }
 
-    if write_announcement(&tty_path, caller).is_err() {
+    if write_announcement(&mut f, caller).is_err() {
         return Answer::Failed;
     }
     Answer::Success
 }
 
-/// Whether the terminal at `tty_path` currently permits messages (mesg y), or
-/// the daemon is privileged.
-fn mesg_permits(tty_path: &str) -> io::Result<bool> {
-    if unsafe { libc::geteuid() } == 0 {
-        return Ok(true);
-    }
-    let mode = fs::metadata(tty_path)?.permissions().mode();
-    Ok(mode & 0o020 != 0 || mode & 0o002 != 0)
-}
-
-/// Write the talk announcement banner to the recipient's terminal, after
-/// confirming it resolves to a character device under `/dev`.
-fn write_announcement(tty_path: &str, caller: &str) -> io::Result<()> {
-    let canonical = fs::canonicalize(tty_path)?;
-    if !canonical.starts_with("/dev/") {
-        return Err(io::Error::other("not a terminal device"));
-    }
-    if !fs::metadata(&canonical)?.file_type().is_char_device() {
-        return Err(io::Error::other("not a terminal device"));
-    }
-
+/// Write the talk announcement banner to an already-open recipient terminal.
+fn write_announcement(f: &mut fs::File, caller: &str) -> io::Result<()> {
     // SECURITY: `caller` comes from an untrusted datagram and is written to the
     // recipient's terminal. Strip control characters so a hostile name cannot
     // inject terminal escape sequences (cursor/screen manipulation), and bound
@@ -439,10 +432,7 @@ fn write_announcement(tty_path: &str, caller: &str) -> io::Result<()> {
          talk: connection requested by {safe_caller}.\r\n\
          talk: respond with:  talk {safe_caller}\r\n"
     );
-    OpenOptions::new()
-        .write(true)
-        .open(&canonical)?
-        .write_all(banner.as_bytes())
+    f.write_all(banner.as_bytes())
 }
 
 fn handle_announce(registry: &mut InvitationRegistry, msg: &CtlMsg) -> CtlRes {

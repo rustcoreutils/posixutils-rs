@@ -454,3 +454,98 @@ fn find_ok_accepted() {
 fn find_ok_declined() {
     run_ok_test("n\n", false);
 }
+
+// --- -exec ... {} + aggregation (find-B) ---
+//
+// POSIX (find, ll. 98284-98298): pathnames "shall be aggregated into sets" and
+// the utility "invoked once for each set" -- the sets belong to the *primary*.
+// The order of invocations *between* different primaries is explicitly
+// unspecified, so these tests compare sorted output and never pin it.
+
+#[test]
+fn find_exec_plus_primaries_do_not_collide() {
+    // Two independent `-exec ... {} +` primaries must each receive only the
+    // pathnames their own branch matched.
+    let dir = make_fnmatch_dir("execplus", &["aaa", "bbb"]);
+    let ds = dir.to_str().unwrap();
+    let a = format!("A {ds}/aaa");
+    let b = format!("B {ds}/bbb");
+    run_test_find_sorted(
+        &[
+            ds, "-name", "aaa", "-exec", "echo", "A", "{}", "+", "-o", "-name", "bbb", "-exec",
+            "echo", "B", "{}", "+",
+        ],
+        &[&a, &b],
+        "",
+        0,
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn find_exec_plus_identical_utilities_stay_separate() {
+    // Two *textually identical* primaries are still two primaries: two sets,
+    // two invocations. Keying batches by (utility, args_before) would merge
+    // them and fail this test.
+    let dir = make_fnmatch_dir("execplus_same", &["aaa", "bbb"]);
+    let ds = dir.to_str().unwrap();
+    let a = format!("{ds}/aaa");
+    let b = format!("{ds}/bbb");
+    run_test_find_sorted(
+        &[
+            ds, "-name", "aaa", "-exec", "echo", "{}", "+", "-o", "-name", "bbb", "-exec", "echo",
+            "{}", "+",
+        ],
+        &[&a, &b],
+        "",
+        0,
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn find_exec_plus_single_primary_aggregates() {
+    // One primary still gathers every match into a single invocation. Counts
+    // arguments rather than printing them, so it is independent of readdir
+    // order.
+    let dir = make_fnmatch_dir("execplus_one", &["f1", "f2", "f3"]);
+    let ds = dir.to_str().unwrap();
+    run_test_find(
+        &[
+            ds, "-type", "f", "-exec", "sh", "-c", "echo $#", "sh", "{}", "+",
+        ],
+        "3\n",
+        "",
+        0,
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn find_exec_plus_empty_batch_not_invoked() {
+    // A primary that never matches must not be invoked with an empty set.
+    let dir = make_fnmatch_dir("execplus_empty", &["aaa"]);
+    let ds = dir.to_str().unwrap();
+    run_test_find(
+        &[ds, "-name", "no_such_name", "-exec", "echo", "X", "{}", "+"],
+        "",
+        "",
+        0,
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn find_exec_plus_exit_status() {
+    // POSIX (l. 98402): a non-zero exit from a `+`-punctuated -exec makes find
+    // exit non-zero.
+    let dir = make_fnmatch_dir("execplus_fail", &["aaa"]);
+    let ds = dir.to_str().unwrap();
+    run_test_find(
+        &[ds, "-name", "aaa", "-exec", "false", "{}", "+"],
+        "",
+        "",
+        1,
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}

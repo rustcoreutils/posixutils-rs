@@ -73,7 +73,9 @@ fn test_logger_empty_string() {
 
 #[test]
 fn test_logger_no_args() {
-    // No arguments - logs empty message
+    // No operands: messages are read from standard input (#LG2). The harness
+    // supplies empty stdin, so nothing is logged and the exit status is 0.
+    // See test_logger_reads_stdin_when_no_operands for the non-empty case.
     logger_test(&[]);
 }
 
@@ -122,4 +124,69 @@ fn test_logger_options_not_logged_as_body() {
 fn test_logger_bare_level_priority() {
     // A bare level (no facility) defaults the facility to user.
     logger_test(&["-p", "warning", "a warning message"]);
+}
+
+// --- #LG1/#LG2 coverage: option parsing and message sourcing ---
+
+/// Run logger with `args` and `stdin_data`, returning the exit code.
+fn logger_run(args: &[&str], stdin_data: &str) -> i32 {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(plib::testing::get_binary_path("logger"))
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn logger");
+    let _ = child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(stdin_data.as_bytes());
+    child.wait().expect("wait failed").code().unwrap_or(-1)
+}
+
+// #LG1: -t (tag), -i (log pid) and -p (priority) are accepted together and are
+// consumed as options rather than being logged as message text.
+#[test]
+fn test_logger_option_surface_parses() {
+    assert_eq!(
+        logger_run(&["-t", "mytag", "-i", "-p", "user.info", "hello"], ""),
+        0
+    );
+}
+
+// #LG2: with no operands, the message bodies come from standard input, one
+// message per non-empty line. (The pre-fix behavior logged a single empty
+// message and never read stdin.)
+#[test]
+fn test_logger_reads_stdin_when_no_operands() {
+    assert_eq!(logger_run(&[], "first line\nsecond line\n"), 0);
+}
+
+// #LG2: -f names a file to read messages from.
+#[test]
+fn test_logger_reads_message_file() {
+    let path = std::env::temp_dir().join("posixutils_logger_msgs");
+    std::fs::write(&path, "alpha\n\nbravo\n").unwrap();
+    assert_eq!(logger_run(&["-f", path.to_str().unwrap()], ""), 0);
+    std::fs::remove_file(&path).unwrap();
+}
+
+// -f - is standard input, per the usual convention.
+#[test]
+fn test_logger_dash_file_is_stdin() {
+    assert_eq!(logger_run(&["-f", "-"], "via dash\n"), 0);
+}
+
+// Error path (logger.rs collect_messages): an unreadable -f file exits non-zero.
+#[test]
+fn test_logger_missing_message_file_errors() {
+    assert_ne!(
+        logger_run(&["-f", "/nonexistent/logger/messages"], ""),
+        0,
+        "an unreadable -f file must be a diagnostic, not a silent success"
+    );
 }

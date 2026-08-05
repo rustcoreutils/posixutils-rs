@@ -15,5 +15,6 @@ mod mesg;
 mod newgrp;
 mod pwd;
 mod talk;
+mod talkd;
 mod tty;
 mod write;

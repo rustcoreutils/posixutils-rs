@@ -473,3 +473,35 @@ fn test_id_double_dash_operand() {
         );
     });
 }
+
+// The SYNOPSIS allows at most one `user` operand; extras are a usage error.
+#[test]
+fn test_id_rejects_multiple_operands() {
+    let output = std::process::Command::new(plib::testing::get_binary_path("id"))
+        .args(["root", "root"])
+        .output()
+        .expect("failed to run id");
+    assert!(
+        !output.status.success(),
+        "id must reject a second operand, got {output:?}"
+    );
+}
+
+// -G with -r prints the real IDs. Without a setuid harness the real and
+// effective sets coincide, but the option combination must still be accepted
+// and must still include the real GID.
+#[test]
+fn test_id_groups_real_includes_real_gid() {
+    let real_gid = unsafe { libc::getgid() };
+    let output = std::process::Command::new(plib::testing::get_binary_path("id"))
+        .args(["-G", "-r"])
+        .output()
+        .expect("failed to run id");
+    assert!(output.status.success(), "id -G -r should be accepted");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let ids: Vec<&str> = stdout.split_whitespace().collect();
+    assert!(
+        ids.contains(&real_gid.to_string().as_str()),
+        "id -G -r output {stdout:?} must contain the real gid {real_gid}"
+    );
+}

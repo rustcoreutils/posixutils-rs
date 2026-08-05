@@ -21,6 +21,7 @@ pub mod priority;
 pub mod regex;
 pub mod sccsfile;
 pub mod testing;
+pub mod tty;
 pub mod user;
 pub mod utmpx;
 

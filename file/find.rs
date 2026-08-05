@@ -143,9 +143,21 @@ enum ExecMode {
     Single { utility: String, args: Vec<String> },
     /// -exec ... {} + - batch files, {} replaced with list of pathnames
     Batch {
+        /// Index into `FindState::exec_batches`, stamped by
+        /// [`register_exec_batches`] after parsing. Unique per `-exec ... {} +`
+        /// primary: POSIX aggregates pathnames into sets *per primary*, so two
+        /// textually identical primaries must not share a set.
+        id: usize,
         utility: String,
         args_before: Vec<String>,
     },
+}
+
+/// One `-exec ... {} +` primary's aggregation set.
+struct ExecBatch {
+    utility: String,
+    args_before: Vec<String>,
+    files: Vec<PathBuf>,
 }
 
 /// A primary (test or action) in the find expression
@@ -221,8 +233,9 @@ struct EvalResult {
     matched: bool,
     /// Whether to prune this directory (not descend)
     prune: bool,
-    /// Files to pass to batched -exec
-    exec_batch_files: Vec<PathBuf>,
+    /// Files to pass to batched -exec, each tagged with the id of the primary
+    /// that matched it.
+    exec_batch_files: Vec<(usize, PathBuf)>,
 }
 
 impl EvalResult {
@@ -250,10 +263,9 @@ struct FindState {
     visited_inodes: HashSet<(u64, u64)>,
     /// Path first seen at each visited inode, for the loop diagnostic
     visited_paths: std::collections::HashMap<(u64, u64), PathBuf>,
-    /// Whether expression contains any action (-print, -exec, -ok)
-    has_action: bool,
-    /// Files accumulated for batched -exec
-    exec_batches: Vec<(ExecMode, Vec<PathBuf>)>,
+    /// One entry per `-exec ... {} +` primary, in source order; index is the
+    /// primary's stamped `id`.
+    exec_batches: Vec<ExecBatch>,
 }
 
 impl FindState {
@@ -265,7 +277,6 @@ impl FindState {
             mount: false,
             visited_inodes: HashSet::new(),
             visited_paths: std::collections::HashMap::new(),
-            has_action: false,
             exec_batches: Vec::new(),
         }
     }
@@ -612,6 +623,9 @@ fn parse_exec(tokens: &[&str], idx: &mut usize) -> Result<ExecMode, String> {
             // Batch mode: -exec utility [args...] {} +
             args.pop(); // Remove the {}
             return Ok(ExecMode::Batch {
+                // Placeholder; stamped by register_exec_batches() once the
+                // whole expression has been parsed.
+                id: 0,
                 utility,
                 args_before: args,
             });
@@ -659,6 +673,38 @@ fn has_action(expr: &Expr) -> bool {
         ),
         Expr::Not(e) => has_action(e),
         Expr::And(l, r) | Expr::Or(l, r) => has_action(l) || has_action(r),
+    }
+}
+
+/// Give every `-exec ... {} +` primary its own aggregation set, stamping each
+/// with the index of its batch.
+///
+/// POSIX (find, ll. 98284-98298) aggregates pathnames into sets *per primary*,
+/// so `-name a -exec u {} + -o -name b -exec u {} +` is two sets and two
+/// invocations even though the utility is identical. Identity therefore cannot
+/// be derived from the utility and its arguments; it has to be positional. The
+/// in-order walk below matches source order, since the trees built by
+/// `parse_or_expr`/`parse_and_expr` are left-associative.
+fn register_exec_batches(expr: &mut Expr, batches: &mut Vec<ExecBatch>) {
+    match expr {
+        Expr::Primary(Primary::Exec(ExecMode::Batch {
+            id,
+            utility,
+            args_before,
+        })) => {
+            *id = batches.len();
+            batches.push(ExecBatch {
+                utility: utility.clone(),
+                args_before: args_before.clone(),
+                files: Vec::new(),
+            });
+        }
+        Expr::Not(e) => register_exec_batches(e, batches),
+        Expr::And(l, r) | Expr::Or(l, r) => {
+            register_exec_batches(l, batches);
+            register_exec_batches(r, batches);
+        }
+        _ => {}
     }
 }
 
@@ -859,10 +905,11 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
                         }
                     }
                 }
-                ExecMode::Batch { .. } => {
-                    // Batch mode: accumulate files, always return true
+                ExecMode::Batch { id, .. } => {
+                    // Batch mode: accumulate the file into *this* primary's
+                    // set, always return true
                     let mut result = EvalResult::new(true);
-                    result.exec_batch_files.push(ctx.path.to_path_buf());
+                    result.exec_batch_files.push((*id, ctx.path.to_path_buf()));
                     result
                 }
             }
@@ -1037,12 +1084,12 @@ fn walk_tree(
     // Evaluate expression for this entry
     let result = evaluate(expr, &ctx, state);
 
-    // Handle batched exec files
-    for batch_path in result.exec_batch_files {
-        // Find matching batch or create new one
-        let batch_idx = find_or_create_batch(expr, state);
-        if let Some(idx) = batch_idx {
-            state.exec_batches[idx].1.push(batch_path);
+    // Handle batched exec files. Every id was assigned by
+    // register_exec_batches() over this same expression, so it indexes a
+    // registered batch.
+    for (id, batch_path) in result.exec_batch_files {
+        if let Some(batch) = state.exec_batches.get_mut(id) {
+            batch.files.push(batch_path);
         }
     }
 
@@ -1095,46 +1142,6 @@ fn process_children(
     }
 }
 
-/// Find or create a batch for -exec {} +
-fn find_or_create_batch(expr: &Expr, state: &mut FindState) -> Option<usize> {
-    // Find first batch exec in expression
-    fn find_batch_exec(expr: &Expr) -> Option<ExecMode> {
-        match expr {
-            Expr::Primary(Primary::Exec(mode @ ExecMode::Batch { .. })) => Some(mode.clone()),
-            Expr::Not(e) => find_batch_exec(e),
-            Expr::And(l, r) | Expr::Or(l, r) => find_batch_exec(l).or_else(|| find_batch_exec(r)),
-            _ => None,
-        }
-    }
-
-    if let Some(mode) = find_batch_exec(expr) {
-        // A batch is identified by both its utility and its leading arguments,
-        // so two `-exec util a {} +` / `-exec util b {} +` do not collide.
-        for (i, (m, _)) in state.exec_batches.iter().enumerate() {
-            if let (
-                ExecMode::Batch {
-                    utility: u1,
-                    args_before: a1,
-                },
-                ExecMode::Batch {
-                    utility: u2,
-                    args_before: a2,
-                },
-            ) = (m, &mode)
-            {
-                if u1 == u2 && a1 == a2 {
-                    return Some(i);
-                }
-            }
-        }
-        // Create new batch
-        state.exec_batches.push((mode, Vec::new()));
-        Some(state.exec_batches.len() - 1)
-    } else {
-        None
-    }
-}
-
 /// Run one `-exec ... {} +` invocation over a chunk of files. Returns whether
 /// it exited successfully.
 fn run_exec_command(utility: &str, args_before: &[String], files: &[PathBuf]) -> bool {
@@ -1163,17 +1170,17 @@ fn execute_batches(state: &mut FindState) {
         .map(|(k, v)| k.len() + v.len() + 2 + ptr)
         .sum();
 
-    for (mode, files) in state.exec_batches.drain(..) {
-        if files.is_empty() {
+    for batch in state.exec_batches.drain(..) {
+        // Batches are registered eagerly, one per primary, so a primary that
+        // never matched has an empty set and must not be invoked at all.
+        if batch.files.is_empty() {
             continue;
         }
-        let ExecMode::Batch {
+        let ExecBatch {
             utility,
             args_before,
-        } = mode
-        else {
-            continue;
-        };
+            files,
+        } = batch;
 
         let fixed: usize =
             utility.len() + 1 + ptr + args_before.iter().map(|a| a.len() + 1 + ptr).sum::<usize>();
@@ -1203,11 +1210,8 @@ fn execute_batches(state: &mut FindState) {
 fn find(args: Vec<String>) -> Result<i32, String> {
     let (symlink_mode, paths, mut expr) = parse_args(&args)?;
 
-    // Check if expression has any action
-    let expr_has_action = has_action(&expr);
-
     // If no action, wrap with implicit -print per POSIX
-    if !expr_has_action {
+    if !has_action(&expr) {
         expr = Expr::And(Box::new(expr), Box::new(Expr::Primary(Primary::Print)));
     }
 
@@ -1216,7 +1220,10 @@ fn find(args: Vec<String>) -> Result<i32, String> {
     state.depth_first = has_depth(&expr);
     state.xdev = has_xdev(&expr);
     state.mount = has_mount(&expr);
-    state.has_action = expr_has_action;
+
+    // Give every `-exec ... {} +` primary its own aggregation set, in source
+    // order, before the walk begins.
+    register_exec_batches(&mut expr, &mut state.exec_batches);
 
     let init_time = SystemTime::now();
 

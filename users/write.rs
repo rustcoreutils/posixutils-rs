@@ -10,11 +10,11 @@
 use chrono::Local;
 use clap::Parser;
 use gettextrs::gettext;
-use plib::{curuser, platform, utmpx};
-use std::fs::{File, OpenOptions};
+use plib::{curuser, tty};
+use std::fs::File;
 use std::io::{self, BufRead, Write};
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
+use std::path::Path;
 use std::process::exit;
 use std::sync::atomic::{AtomicI32, Ordering};
 
@@ -40,13 +40,8 @@ struct Args {
 /// Select the recipient terminal in an implementation-defined manner. If the
 /// user is logged in more than once, write an informational message to stdout.
 fn select_terminal(user_name: &str) -> String {
-    let user_entries: Vec<_> = utmpx::load()
-        .into_iter()
-        .filter(|entry| entry.user == user_name && entry.typ == platform::USER_PROCESS)
-        .collect();
-
-    let chosen = match user_entries.first() {
-        Some(e) => e,
+    let chosen = match tty::user_tty(user_name, None) {
+        Some(t) => t,
         None => {
             plib::diag::error(&format!(
                 "{}: {}",
@@ -58,7 +53,7 @@ fn select_terminal(user_name: &str) -> String {
     };
 
     // Spec: if logged in more than once, note the chosen terminal on stdout.
-    if user_entries.len() > 1 {
+    if chosen.login_count > 1 {
         println!(
             "{} {} {}",
             user_name,
@@ -67,56 +62,7 @@ fn select_terminal(user_name: &str) -> String {
         );
     }
 
-    format!("/dev/{}", chosen.line)
-}
-
-/// Resolve and validate the recipient terminal path: it must resolve under
-/// `/dev` and be a character device (defeats `/dev/../../etc/passwd`-style
-/// operands).
-fn validate_terminal(path: &str) -> Result<String, String> {
-    let canonical = std::fs::canonicalize(path)
-        .map_err(|e| format!("{} {}: {}", gettext("cannot access terminal"), path, e))?;
-
-    if !canonical.starts_with("/dev/") {
-        return Err(format!("{}: {}", gettext("not a terminal device"), path));
-    }
-    let meta = std::fs::metadata(&canonical)
-        .map_err(|e| format!("{} {}: {}", gettext("cannot access terminal"), path, e))?;
-    if !meta.file_type().is_char_device() {
-        return Err(format!("{}: {}", gettext("not a terminal device"), path));
-    }
-
-    Ok(canonical.to_string_lossy().into_owned())
-}
-
-/// Whether the current user may write to `terminal`'s device, honoring the
-/// recipient's `mesg` permission bits. The superuser may always write.
-fn check_write_permission(terminal: &str) -> bool {
-    // Superuser is not constrained by the recipient's mesg setting.
-    if unsafe { libc::geteuid() } == 0 {
-        return true;
-    }
-
-    match std::fs::metadata(terminal) {
-        Ok(metadata) => {
-            let mode = metadata.permissions().mode();
-            let uid = unsafe { libc::getuid() };
-            let gid = unsafe { libc::getgid() };
-
-            (metadata.uid() == uid && mode & 0o200 != 0)
-                || (metadata.gid() == gid && mode & 0o020 != 0)
-                || (mode & 0o002 != 0)
-        }
-        Err(err) => {
-            plib::diag::error(&format!(
-                "{} {}: {}",
-                gettext("cannot access terminal"),
-                terminal,
-                err
-            ));
-            false
-        }
-    }
+    chosen.path.to_string_lossy().into_owned()
 }
 
 fn get_current_date() -> String {
@@ -208,26 +154,27 @@ fn main() {
         Some(t) => format!("/dev/{}", t),
         None => select_terminal(&user_name),
     };
-    let terminal = match validate_terminal(&requested) {
-        Ok(t) => t,
-        Err(msg) => {
-            plib::diag::error(&msg);
+    // One open serves as validation, permission check and the write handle, so
+    // no other process can substitute a different inode in between.
+    let mut recipient = match tty::open_for_write(Path::new(&requested)) {
+        Ok(f) => f,
+        Err(tty::OpenError::PermissionDenied) => {
+            plib::diag::error(&gettext("permission denied"));
             exit(1);
         }
-    };
-
-    if !check_write_permission(&terminal) {
-        plib::diag::error(&gettext("permission denied"));
-        exit(1);
-    }
-
-    let mut recipient = match OpenOptions::new().write(true).open(&terminal) {
-        Ok(f) => f,
-        Err(e) => {
+        Err(tty::OpenError::BadPath) | Err(tty::OpenError::NotTerminal) => {
+            plib::diag::error(&format!(
+                "{}: {}",
+                gettext("not a terminal device"),
+                requested
+            ));
+            exit(1);
+        }
+        Err(tty::OpenError::Io(e)) => {
             plib::diag::error(&format!(
                 "{} {}: {}",
-                gettext("cannot open terminal"),
-                terminal,
+                gettext("cannot access terminal"),
+                requested,
                 e
             ));
             exit(1);

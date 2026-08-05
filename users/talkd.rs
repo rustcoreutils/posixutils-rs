@@ -16,26 +16,36 @@
 //! end-to-end on one host without exposing a network-facing root daemon. It is
 //! therefore NOT interoperable with stock/remote `talk` clients.
 //!
-//! Privilege model (audit #TD6): to deliver an announcement, talkd must write
-//! to the callee's terminal. It honors the recipient's `mesg` permission (the
-//! tty's group/other write bits) and, when not running as root, can only write
-//! to ttys that permit messages. A production network deployment would run as
-//! root and contain that privilege; this local daemon writes only to the
-//! invoking user's own mesg-enabled terminals.
+//! Privilege model (audit #TD6 — WON'T-FIX, deliberate): to deliver an
+//! announcement, talkd must write to the callee's terminal. It performs no
+//! privileged operation and is not intended to be started as root, so there is
+//! nothing to drop; `setuid`/`setgid` are absent by design rather than by
+//! oversight. The BSD `nobody:tty` inetd model exists to contain a *network*
+//! ntalkd, and adopting it here would also force the control socket open from
+//! 0600 to world-writable (audit #TD5) for no gain on a single-host daemon.
+//!
+//! Consent is enforced by the recipient's `mesg` setting instead. Unlike
+//! `write`, talkd honors `mesg n` **even when running as root**: the
+//! announcement is triggered by an unauthenticated datagram, so the recipient's
+//! stated wish is the only consent that exists. See `announce_to_tty`, which
+//! re-checks `plib::tty::mesg_allowed` rather than relying on `may_write`'s
+//! superuser exemption.
 
 use binrw::{binrw, BinReaderExt, BinWrite, Endian};
 use clap::Parser;
 use gettextrs::gettext;
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{self, Cursor, Write};
-use std::mem::size_of;
 use std::net::{Ipv4Addr, SocketAddrV4};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -50,14 +60,34 @@ type SaFamily = sa_family_t;
 /// Default socket path for local talkd (proper system location)
 pub const DEFAULT_SOCKET_PATH: &str = "/var/run/talkd.sock";
 
-/// Invitation timeout in seconds
+/// Default invitation timeout in seconds
 const INVITATION_TIMEOUT_SECS: u64 = 60;
+
+/// Default interval at which an otherwise-idle daemon wakes to expire stale
+/// invitations. Without a periodic wake the sweep ran only when a datagram
+/// arrived, so an idle daemon held invitations indefinitely past their timeout.
+const EXPIRY_TICK_SECS: u64 = 10;
 
 /// Upper bound on simultaneously-held invitations (DoS guard, audit #TD4).
 const MAX_INVITATIONS: usize = 1024;
 
+/// Error replies allowed in a burst before throttling engages.
+const ERR_REPLY_BURST: u32 = 8;
+
+/// Sustained error replies per second once the burst is spent.
+const ERR_REPLY_PER_SEC: u32 = 8;
+
+/// Minimum spacing between aggregate "suppressed N" log lines.
+const SUPPRESS_REPORT_SECS: u64 = 60;
+
 /// Protocol version
 const TALK_VERSION: u8 = 1;
+
+/// On-the-wire size of a `CTL_RESPONSE`: vers, type, answer, pad (4 bytes),
+/// id_num (4), and a 16-byte `Osockaddr`. Stated explicitly rather than as
+/// `size_of::<CtlRes>()`, which is the Rust struct's layout and only happens to
+/// agree.
+const CTL_RES_LEN: usize = 24;
 
 /// talkd - local talk daemon
 #[derive(Parser)]
@@ -70,6 +100,14 @@ struct Args {
     /// Run in foreground (don't daemonize)
     #[arg(short, long)]
     foreground: bool,
+
+    /// Seconds an unanswered invitation is retained
+    #[arg(long, default_value_t = INVITATION_TIMEOUT_SECS)]
+    invite_timeout: u64,
+
+    /// Seconds between idle expiry sweeps (testing aid)
+    #[arg(long, default_value_t = EXPIRY_TICK_SECS, hide = true)]
+    expiry_tick: u64,
 }
 
 // ============================================================================
@@ -209,7 +247,7 @@ impl CtlRes {
     }
 
     fn to_bytes(&self) -> io::Result<Vec<u8>> {
-        let mut bytes = vec![0u8; size_of::<CtlRes>()];
+        let mut bytes = vec![0u8; CTL_RES_LEN];
         let mut cursor = Cursor::new(&mut bytes[..]);
         self.write_options(&mut cursor, Endian::Big, ())
             .map_err(|e| io::Error::other(e.to_string()))?;
@@ -259,21 +297,25 @@ struct Invitation {
 struct InvitationRegistry {
     invitations: HashMap<u32, Invitation>,
     next_id: u32,
+    timeout: Duration,
 }
 
 impl InvitationRegistry {
-    fn new() -> Self {
+    fn new(timeout: Duration) -> Self {
         InvitationRegistry {
             invitations: HashMap::new(),
             next_id: 1,
+            timeout,
         }
     }
 
-    fn cleanup_expired(&mut self) {
-        let timeout = Duration::from_secs(INVITATION_TIMEOUT_SECS);
+    /// Drop every invitation past its timeout, returning how many were removed.
+    fn cleanup_expired(&mut self) -> usize {
+        let before = self.invitations.len();
         let now = Instant::now();
         self.invitations
-            .retain(|_, inv| now.duration_since(inv.timestamp) < timeout);
+            .retain(|_, inv| now.duration_since(inv.timestamp) < self.timeout);
+        before - self.invitations.len()
     }
 
     fn find_for_callee(&self, callee: &str, caller: &str) -> Option<&Invitation> {
@@ -291,7 +333,7 @@ impl InvitationRegistry {
     /// capacity (after an expiry sweep) — a bound against unauthenticated flood.
     fn insert(&mut self, invitation: Invitation) -> Option<u32> {
         if self.invitations.len() >= MAX_INVITATIONS {
-            self.cleanup_expired();
+            let _ = self.cleanup_expired();
             if self.invitations.len() >= MAX_INVITATIONS {
                 return None;
             }
@@ -377,53 +419,45 @@ fn announce_to_tty(caller: &str, callee: &str, requested_tty: &str) -> Answer {
 
     // The callee must be logged in; pick the requested tty if given, else the
     // first login terminal.
-    let entries = plib::utmpx::load();
-    let tty_line = entries
-        .iter()
-        .filter(|e| e.user == callee && e.typ == plib::platform::USER_PROCESS)
-        .find(|e| requested_tty.is_empty() || e.line == requested_tty)
-        .map(|e| e.line.clone());
-    let tty_line = match tty_line {
-        Some(l) => l,
+    let want = (!requested_tty.is_empty()).then_some(requested_tty);
+    let user_tty = match plib::tty::user_tty(callee, want) {
+        Some(t) => t,
         None => return Answer::NotHere,
     };
 
-    let tty_path = format!("/dev/{}", tty_line);
+    // A single open validates the path, lets the kernel enforce write access,
+    // and yields the handle we write through -- the permission check and the
+    // write cannot end up on different inodes. `open_for_write` also passes
+    // O_NOCTTY, without which the first announcement would make the
+    // *recipient's* terminal this daemon's controlling terminal.
+    let mut f = match plib::tty::open_for_write(&user_tty.path) {
+        Ok(f) => f,
+        Err(plib::tty::OpenError::PermissionDenied) => return Answer::PermissionDenied,
+        Err(plib::tty::OpenError::Io(e)) if e.kind() == io::ErrorKind::PermissionDenied => {
+            return Answer::PermissionDenied
+        }
+        Err(_) => return Answer::Failed,
+    };
 
-    // Honor the recipient's mesg setting (group/other write bit), unless root.
-    match mesg_permits(&tty_path) {
-        Ok(true) => {}
-        Ok(false) => return Answer::PermissionDenied,
-        Err(_) => return Answer::NotHere,
+    // Unlike `write`, talkd must honor `mesg n` even when running as root: the
+    // announcement is triggered by an unauthenticated datagram, so the
+    // recipient's stated wish is the only consent that exists. `may_write`
+    // (applied inside `open_for_write`) exempts the superuser, so re-check
+    // `mesg_allowed` on its own here.
+    match plib::tty::fstat(f.as_raw_fd()) {
+        Ok(st) if plib::tty::mesg_allowed(&st) => {}
+        Ok(_) => return Answer::PermissionDenied,
+        Err(_) => return Answer::Failed,
     }
 
-    if write_announcement(&tty_path, caller).is_err() {
+    if write_announcement(&mut f, caller).is_err() {
         return Answer::Failed;
     }
     Answer::Success
 }
 
-/// Whether the terminal at `tty_path` currently permits messages (mesg y), or
-/// the daemon is privileged.
-fn mesg_permits(tty_path: &str) -> io::Result<bool> {
-    if unsafe { libc::geteuid() } == 0 {
-        return Ok(true);
-    }
-    let mode = fs::metadata(tty_path)?.permissions().mode();
-    Ok(mode & 0o020 != 0 || mode & 0o002 != 0)
-}
-
-/// Write the talk announcement banner to the recipient's terminal, after
-/// confirming it resolves to a character device under `/dev`.
-fn write_announcement(tty_path: &str, caller: &str) -> io::Result<()> {
-    let canonical = fs::canonicalize(tty_path)?;
-    if !canonical.starts_with("/dev/") {
-        return Err(io::Error::other("not a terminal device"));
-    }
-    if !fs::metadata(&canonical)?.file_type().is_char_device() {
-        return Err(io::Error::other("not a terminal device"));
-    }
-
+/// Write the talk announcement banner to an already-open recipient terminal.
+fn write_announcement(f: &mut fs::File, caller: &str) -> io::Result<()> {
     // SECURITY: `caller` comes from an untrusted datagram and is written to the
     // recipient's terminal. Strip control characters so a hostile name cannot
     // inject terminal escape sequences (cursor/screen manipulation), and bound
@@ -439,10 +473,7 @@ fn write_announcement(tty_path: &str, caller: &str) -> io::Result<()> {
          talk: connection requested by {safe_caller}.\r\n\
          talk: respond with:  talk {safe_caller}\r\n"
     );
-    OpenOptions::new()
-        .write(true)
-        .open(&canonical)?
-        .write_all(banner.as_bytes())
+    f.write_all(banner.as_bytes())
 }
 
 fn handle_announce(registry: &mut InvitationRegistry, msg: &CtlMsg) -> CtlRes {
@@ -550,7 +581,97 @@ fn handle_delete(registry: &mut InvitationRegistry, msg: &CtlMsg) -> CtlRes {
 // Daemon Main Loop
 // ============================================================================
 
-fn daemon_loop(socket_path: &Path) -> io::Result<()> {
+/// Bounds what the daemon emits in response to unauthenticated garbage.
+///
+/// Every malformed datagram used to produce both a log line and, for a bad
+/// version or an unknown type, a reply datagram sent to an address the sender
+/// chose. A tight send loop therefore turned the daemon into a syslog flood
+/// and a packet reflector. Well-formed requests are never throttled, so
+/// legitimate clients are unaffected.
+///
+/// Deliberately global rather than per-peer: `talk` binds a fresh socket path
+/// per request, so a peer-keyed table would never see a repeat key *and* would
+/// itself grow without bound — a second denial of service.
+struct ErrorLimiter {
+    tokens: u32,
+    last_refill: Instant,
+    suppressed: u64,
+    last_report: Instant,
+}
+
+impl ErrorLimiter {
+    fn new() -> Self {
+        let now = Instant::now();
+        ErrorLimiter {
+            tokens: ERR_REPLY_BURST,
+            last_refill: now,
+            suppressed: 0,
+            last_report: now,
+        }
+    }
+
+    /// Consume a token. `false` means this reply and its log line are dropped.
+    fn allow(&mut self) -> bool {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs();
+        if elapsed > 0 {
+            let refill = elapsed.saturating_mul(ERR_REPLY_PER_SEC as u64);
+            self.tokens = self
+                .tokens
+                .saturating_add(refill.min(u32::MAX as u64) as u32)
+                .min(ERR_REPLY_BURST);
+            // Advance by whole seconds only, so sub-second remainders are not
+            // discarded by repeated calls.
+            self.last_refill += Duration::from_secs(elapsed);
+        }
+
+        if self.tokens > 0 {
+            self.tokens -= 1;
+            true
+        } else {
+            self.suppressed += 1;
+            false
+        }
+    }
+
+    /// Emit at most one aggregate line per `SUPPRESS_REPORT_SECS`, so a flood
+    /// leaves a trace without becoming the flood itself.
+    fn flush_suppressed(&mut self) {
+        if self.suppressed == 0 {
+            return;
+        }
+        let now = Instant::now();
+        if now.duration_since(self.last_report) < Duration::from_secs(SUPPRESS_REPORT_SECS) {
+            return;
+        }
+        log_err(&format!(
+            "{} {}",
+            gettext("suppressed malformed datagrams:"),
+            self.suppressed
+        ));
+        self.suppressed = 0;
+        self.last_report = now;
+    }
+}
+
+/// Whether `e` is a `SO_RCVTIMEO` expiry rather than a real error. Platforms
+/// differ: Linux reports `EAGAIN` (`WouldBlock`), others `ETIMEDOUT`.
+fn is_recv_timeout(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
+}
+
+/// Expire stale invitations, logging only when something was actually removed.
+fn sweep(registry: &mut InvitationRegistry) {
+    let n = registry.cleanup_expired();
+    if n > 0 {
+        log_info(&format!("{} {}", gettext("expired invitations:"), n));
+    }
+}
+
+fn daemon_loop(socket_path: &Path, invite_timeout: Duration, tick: Duration) -> io::Result<()> {
     // Symlink safety (#TD5): inspect the path without following links. Only
     // unlink a pre-existing path if it is a socket we own; never follow a
     // symlink an attacker may have planted to make us unlink an arbitrary file.
@@ -576,7 +697,17 @@ fn daemon_loop(socket_path: &Path) -> io::Result<()> {
     // Belt-and-suspenders: enforce 0600 explicitly.
     let _ = fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600));
 
-    let mut registry = InvitationRegistry::new();
+    // Publish the socket path for the signal handler only now that the bind has
+    // succeeded, so a signal arriving during startup cannot unlink a path this
+    // process never created.
+    publish_socket_path(socket_path)?;
+
+    // Wake periodically even with no traffic, so invitations expire on time
+    // rather than only when the next datagram happens to arrive.
+    socket.set_read_timeout(Some(tick))?;
+
+    let mut registry = InvitationRegistry::new(invite_timeout);
+    let mut limiter = ErrorLimiter::new();
     let mut buf = [0u8; 1024];
 
     log_info(&format!("{} {:?}", gettext("listening on"), socket_path));
@@ -585,34 +716,49 @@ fn daemon_loop(socket_path: &Path) -> io::Result<()> {
         // Receive message from client
         let (len, client_addr) = match socket.recv_from(&mut buf) {
             Ok(r) => r,
+            // The read timeout expired: no traffic. Sweep and wait again. This
+            // is the normal idle path and must not be logged.
+            Err(e) if is_recv_timeout(&e) => {
+                sweep(&mut registry);
+                limiter.flush_suppressed();
+                continue;
+            }
+            // Reachable now that the receive has a timeout: a timed-out socket
+            // receive is not restarted after a handler runs, even under
+            // SA_RESTART.
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => {
                 log_err(&format!("{}: {}", gettext("recv error"), e));
                 continue;
             }
         };
 
-        // Clean up expired invitations periodically
-        registry.cleanup_expired();
+        // Clean up expired invitations
+        sweep(&mut registry);
 
         // Parse the control message (a short/garbage datagram is dropped, not fatal)
         let msg = match CtlMsg::from_bytes(&buf[..len]) {
             Ok(m) => m,
             Err(e) => {
-                log_err(&format!("{}: {}", gettext("failed to parse message"), e));
+                if limiter.allow() {
+                    log_err(&format!("{}: {}", gettext("failed to parse message"), e));
+                }
                 continue;
             }
         };
 
         // Validate version
         if msg.vers != TALK_VERSION {
-            let response = CtlRes::new(
-                MessageType::try_from(msg.r#type).unwrap_or(MessageType::LookUp),
-                Answer::BadVersion,
-                msg.id_num,
-                Osockaddr::default(),
-            );
-            if let Ok(bytes) = response.to_bytes() {
-                let _ = socket.send_to_addr(&bytes, &client_addr);
+            if limiter.allow() {
+                let response = CtlRes::new(
+                    MessageType::try_from(msg.r#type).unwrap_or(MessageType::LookUp),
+                    Answer::BadVersion,
+                    msg.id_num,
+                    Osockaddr::default(),
+                );
+                if let Ok(bytes) = response.to_bytes() {
+                    let _ = socket.send_to_addr(&bytes, &client_addr);
+                }
             }
             continue;
         }
@@ -621,14 +767,16 @@ fn daemon_loop(socket_path: &Path) -> io::Result<()> {
         let msg_type = match MessageType::try_from(msg.r#type) {
             Ok(t) => t,
             Err(_) => {
-                let response = CtlRes::new(
-                    MessageType::LookUp,
-                    Answer::UnknownRequest,
-                    msg.id_num,
-                    Osockaddr::default(),
-                );
-                if let Ok(bytes) = response.to_bytes() {
-                    let _ = socket.send_to_addr(&bytes, &client_addr);
+                if limiter.allow() {
+                    let response = CtlRes::new(
+                        MessageType::LookUp,
+                        Answer::UnknownRequest,
+                        msg.id_num,
+                        Osockaddr::default(),
+                    );
+                    if let Ok(bytes) = response.to_bytes() {
+                        let _ = socket.send_to_addr(&bytes, &client_addr);
+                    }
                 }
                 continue;
             }
@@ -687,29 +835,67 @@ fn syslog_line(severity: syslog::Severity, msg: &str) {
 // Signal Handling
 // ============================================================================
 
-/// Socket path for the cleanup signal handler (audit #TD8: replaces the unsound
-/// `static mut`).
-static SOCKET_PATH: OnceLock<PathBuf> = OnceLock::new();
+/// NUL-terminated socket path published for the signal handler.
+///
+/// Built and leaked *before* the pointer is stored, so the handler performs
+/// only an atomic load — never an allocation, a `PathBuf`, or a `OnceLock`
+/// probe. Null means "nothing to unlink yet".
+static SOCKET_PATH_C: AtomicPtr<libc::c_char> = AtomicPtr::new(std::ptr::null_mut());
 
 /// Whether the daemon has detached from its controlling terminal (selects the
 /// logging sink).
 static DAEMONIZED: OnceLock<bool> = OnceLock::new();
 
+/// Async-signal-safe teardown.
+///
+/// POSIX.1-2024 XSH 2.4.3 lists `unlink()` and `_exit()` as async-signal-safe,
+/// and makes every atomic operation other than initialization so. Nothing else
+/// happens here. In particular there is no `std::process::exit`, which would
+/// run atexit handlers and TLS destructors from a signal context, and no
+/// `fs::remove_file`, which allocates a `CString` from the path.
 extern "C" fn handle_signal(_sig: libc::c_int) {
-    // Clean up the socket file on exit.
-    if let Some(path) = SOCKET_PATH.get() {
-        let _ = fs::remove_file(path);
+    let p = SOCKET_PATH_C.load(Ordering::Acquire);
+    if !p.is_null() {
+        // SAFETY: `p` was published from a leaked CString and stays valid for
+        // the life of the process. `unlink` clobbers errno, which does not
+        // matter because the next statement never returns.
+        unsafe { libc::unlink(p) };
     }
-    std::process::exit(0);
+    unsafe { libc::_exit(0) };
 }
 
-fn register_signals(socket_path: &Path) {
-    let _ = SOCKET_PATH.set(socket_path.to_path_buf());
-    for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGQUIT] {
-        unsafe {
-            libc::signal(sig, handle_signal as *const () as libc::sighandler_t);
-        }
+/// Install `handler` for `signum` via `sigaction`.
+///
+/// `SA_RESTART` is deliberately cleared: these handlers never return, so
+/// restart semantics are immaterial to them, and a timed-out socket receive is
+/// not restarted regardless. Matches the precedent in `cron/crond.rs`.
+fn install_signal(signum: libc::c_int, handler: extern "C" fn(libc::c_int)) {
+    unsafe {
+        let mut act: libc::sigaction = std::mem::zeroed();
+        act.sa_sigaction = handler as libc::sighandler_t;
+        act.sa_flags = 0;
+        libc::sigemptyset(&mut act.sa_mask);
+        libc::sigaction(signum, &act, std::ptr::null_mut());
     }
+}
+
+/// Install signal dispositions. Called before `bind`, so the default
+/// *terminate* disposition is never in force during startup.
+fn install_signal_handlers() {
+    for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGQUIT, libc::SIGHUP] {
+        install_signal(sig, handle_signal);
+    }
+}
+
+/// Publish the socket path for the handler. Called only after a successful
+/// bind, so a signal during startup cannot unlink a path we did not create.
+fn publish_socket_path(path: &Path) -> io::Result<()> {
+    let c = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::other("socket path contains NUL"))?;
+    // Leaked on purpose: a signal can arrive at any time, so the pointer must
+    // outlive every scope. One allocation for the life of the process.
+    SOCKET_PATH_C.store(c.into_raw(), Ordering::Release);
+    Ok(())
 }
 
 /// Detach from the controlling terminal (audit #TD9): double-fork, `setsid`,
@@ -765,9 +951,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = DAEMONIZED.set(false);
     }
 
-    register_signals(&args.socket);
+    install_signal_handlers();
 
-    if let Err(e) = daemon_loop(&args.socket) {
+    let invite_timeout = Duration::from_secs(args.invite_timeout.max(1));
+    let tick = Duration::from_secs(args.expiry_tick.max(1));
+
+    if let Err(e) = daemon_loop(&args.socket, invite_timeout, tick) {
         log_err(&e.to_string());
         // Clean up socket on error
         let _ = fs::remove_file(&args.socket);
@@ -783,7 +972,7 @@ mod tests {
 
     #[test]
     fn test_invitation_registry_insert_find() {
-        let mut registry = InvitationRegistry::new();
+        let mut registry = InvitationRegistry::new(Duration::from_secs(INVITATION_TIMEOUT_SECS));
 
         let inv = Invitation {
             id: 0,
@@ -804,7 +993,7 @@ mod tests {
 
     #[test]
     fn test_invitation_registry_delete() {
-        let mut registry = InvitationRegistry::new();
+        let mut registry = InvitationRegistry::new(Duration::from_secs(INVITATION_TIMEOUT_SECS));
 
         let inv = Invitation {
             id: 0,
@@ -855,7 +1044,7 @@ mod tests {
     #[test]
     fn test_invitation_table_is_bounded() {
         // The table must refuse growth past MAX_INVITATIONS (DoS guard, #TD4).
-        let mut registry = InvitationRegistry::new();
+        let mut registry = InvitationRegistry::new(Duration::from_secs(INVITATION_TIMEOUT_SECS));
         for i in 0..MAX_INVITATIONS {
             assert!(registry
                 .insert(sample_invitation(&format!("c{i}"), &format!("d{i}")))
@@ -873,7 +1062,7 @@ mod tests {
     fn test_leave_invite_refresh_updates_address() {
         // A re-invite for the same (callee, caller) refreshes the stored TCP
         // address instead of leaving a stale one (#TD11).
-        let mut registry = InvitationRegistry::new();
+        let mut registry = InvitationRegistry::new(Duration::from_secs(INVITATION_TIMEOUT_SECS));
         let id = registry
             .insert(sample_invitation("alice", "bob"))
             .expect("insert");
@@ -933,7 +1122,7 @@ mod tests {
     fn test_delete_is_id_scoped_and_ownership_checked() {
         // Audit #TD13: DELETE must remove exactly the invitation named by
         // id_num, and only for its own caller.
-        let mut registry = InvitationRegistry::new();
+        let mut registry = InvitationRegistry::new(Duration::from_secs(INVITATION_TIMEOUT_SECS));
         let mk = |callee: &str| Invitation {
             id: 0,
             caller: "alice".to_string(),

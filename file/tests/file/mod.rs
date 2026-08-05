@@ -463,3 +463,35 @@ fn file_magic_M_and_m_flag_cpio() {
         "",
     );
 }
+
+// FILE-2: the third context-sensitive default system test -- FORTRAN source.
+// The heuristic is deliberately narrow (a distinctive leading keyword), so
+// both a positive and a negative case are pinned here.
+#[test]
+fn file_context_fortran_source() {
+    let dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("tests/file");
+    let f = dir.join("ctx_fortran_tmp");
+    std::fs::write(&f, "program hello\n  implicit none\nend program hello\n").unwrap();
+    file_test_stdout(
+        &[f.to_str().unwrap()],
+        "",
+        &format!("{}: fortran program text\n", f.to_str().unwrap()),
+    );
+    std::fs::remove_file(&f).unwrap();
+}
+
+#[test]
+fn file_context_prose_is_not_fortran() {
+    // Ordinary prose that merely mentions the keywords must not be classified
+    // as FORTRAN -- the heuristic anchors at the start of a line. Content
+    // matching neither magic nor a context test falls back to "data".
+    let dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("tests/file");
+    let f = dir.join("ctx_prose_tmp");
+    std::fs::write(&f, "We rewrote the program in another language.\n").unwrap();
+    file_test_stdout(
+        &[f.to_str().unwrap()],
+        "",
+        &format!("{}: data\n", f.to_str().unwrap()),
+    );
+    std::fs::remove_file(&f).unwrap();
+}

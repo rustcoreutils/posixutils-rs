@@ -5,23 +5,27 @@
 **Spec source:** sliced on demand from `~/tmp/POSIX.2024.pdf` (the canonical sliced
 `~/tmp/posix.2024/sliced/` tree was unavailable for this pass; per-utility text was
 re-extracted with `pdftotext -layout` into `~/tmp/fileaudit/<util>.spec.txt`).
-**Date:** 2026-06-11
+**Date:** 2026-06-11; **last revised** 2026-08-05 (see *Revision history*).
 **Method:** spec-vs-code reading of every utility in full, with **behavioral
 verification** of all Critical/Major findings against freshly built release binaries
-(`cargo build --release -p posixutils-file`). No code was modified.
+(`cargo build --release`). The original pass modified no code; the follow-up
+passes recorded below landed fixes and tests.
+
+**Status: all findings closed.** The only unchecked boxes remaining are two
+`N/A` notes recording deliberate non-POSIX extensions (DD-10, SPLIT-3).
 
 This crate ships eight POSIX utilities plus one support module:
 
-| Binary | Source | LOC | Spec pp. (PDF) | Headline |
-|---|---|---|---|---|
-| `cat` | `cat.rs` | 77 | 88506–88646 | Clean; Minors only |
-| `cmp` | `cmp.rs` | 154 | 89800–89944 | `-s` leaks `EOF` diagnostic |
-| `dd` | `dd.rs` | ~644 | 91890–92206 | conv ordering, SIGINT re-raise |
-| `file` | `file.rs` + `magic.rs` | 205 + 672 | 97800–98140 | symlink default, no context tests, magic `<`/`>` inverted |
-| `find` | `find.rs` | ~1182 | 98142–98647 | `-name` is regex not fnmatch, `-iname`/`-mount` missing |
-| `od` | `od.rs` | ~1170 | 109017–109372 | `-c` emits named chars not C escapes |
-| `split` | `split.rs` | 299 | 115723–115853 | `-` operand not stdin, no `{NAME_MAX}` check |
-| `tee` | `tee.rs` | 114 | 116882–116972 | **does not copy stdin→stdout; rejects file operands** |
+| Binary | Source | LOC | Spec pp. (PDF) | Tests | Status |
+|---|---|---|---|---|---|
+| `cat` | `cat.rs` | 89 | 88506–88646 | 7 | Closed |
+| `cmp` | `cmp.rs` | 167 | 89800–89944 | 6 | Closed |
+| `dd` | `dd.rs` | 729 | 91890–92206 | 23 | Closed |
+| `file` | `file.rs` + `magic.rs` | 391 + 786 | 97800–98140 | 23 | Closed |
+| `find` | `find.rs` | 1277 | 98142–98647 | 33 | Closed |
+| `od` | `od.rs` | 1173 | 109017–109372 | 37 | Closed |
+| `split` | `split.rs` | 334 | 115723–115853 | 5 | Closed |
+| `tee` | `tee.rs` | 142 | 116882–116972 | 6 | Closed |
 
 > Convention (per `audits.md`): every actionable item is an unchecked `- [ ]`;
 > CONFORMS items are pre-checked `- [x]`. Findings are numbered per-utility
@@ -33,24 +37,73 @@ This crate ships eight POSIX utilities plus one support module:
 
 ## Cross-cutting themes
 
-1. **Pattern/regex flavor.** `find -name`/`-path` must use XBD shell filename
-   matching (fnmatch), but `find.rs` converts globs to the `regex` crate and
-   mis-escapes `-` inside `[...]`, so bracket ranges like `[a-z]` match nothing.
-   `od`/`dd`/`cmp`/`cat`/`split`/`tee` have no regex surface.
-2. **Diagnostics are hardcoded English.** Every utility calls
-   `setlocale(LC_ALL, "")` and wires `gettext` for clap help, but runtime
-   diagnostics, prompts (`find -ok`), and the `cmp` "differ" line are literal
-   English — `LC_MESSAGES` does not affect them. Tracked as a Minor per utility.
-3. **`-` / empty operand → stdin is inconsistent.** `plib::io::input_stream`
-   takes a `dashed_stdin` flag; `cat`/`cmp` pass `true` (correct), but `split`
-   passes `false`, so an explicit `-` operand becomes a literal filename.
-4. **Exit-status propagation is uneven.** `file` always exits 0 (mostly OK per
-   spec); `tee`/`split` abort on first error rather than continuing and flagging.
-5. **Signals.** Only `tee -i` (SIGINT ignore) and `dd` (SIGINT stats) touch
-   signals. `dd`'s SIGINT path prints stats but exits via `process::exit(130)`
-   instead of re-raising, so the parent never sees `WIFSIGNALED`.
-6. **No integration tests for `cat`, `split`, `tee`.** Only unit tests inside the
-   source files (`split`) or nothing at all.
+*As originally found (2026-06-11), each with its resolution.*
+
+1. ~~**Pattern/regex flavor.**~~ ✓ **resolved.** `find -name`/`-path` converted
+   globs to the `regex` crate and mis-escaped `-` inside `[...]`, so bracket
+   ranges like `[a-z]` matched nothing. Now libc `fnmatch(3)` (`find.rs:23-37`),
+   which is both the mandated notation and locale-aware; the `regex` dependency
+   is gone. `od`/`dd`/`cmp`/`cat`/`split`/`tee` have no regex surface.
+2. ~~**Diagnostics are hardcoded English.**~~ ✓ **resolved.** Runtime
+   diagnostics, the `find -ok` prompt, and the `cmp` "differ" line are
+   gettext-wrapped, and `-ok` accepts the locale's `YESEXPR`.
+3. ~~**`-` / empty operand → stdin is inconsistent.**~~ ✓ **resolved.** `split`
+   now passes `dashed_stdin = true` like `cat`/`cmp` (`split.rs:242,266`).
+4. ~~**Exit-status propagation is uneven.**~~ ✓ **resolved.** `tee` continues
+   past an unopenable or unwritable file and flags exit 1; `file` exits 1 on an
+   unreadable `-m`/`-M` magic file.
+5. ~~**Signals.**~~ ✓ **resolved.** `dd`'s SIGINT path prints statistics and
+   then restores `SIG_DFL` and re-raises, so the parent sees `WIFSIGNALED`.
+6. ~~**No integration tests for `cat`, `split`, `tee`.**~~ ✓ **resolved.** All
+   three have `tests/<util>/mod.rs`; the crate is at 140 integration tests.
+
+---
+
+## Revision history
+
+- **2026-06-11** — original audit; no code modified.
+- **2026-06/07** — fix series landing CAT-1/2, CMP-1..4, DD-1..9, FILE-1..5,
+  MAGIC-1..5, FIND-1..11, OD-1..8, SPLIT-1/2/4/5, TEE-1..5.
+- **2026-08-05** — audit-vs-code reconciliation sweep. The *Priority issues*
+  sections had been kept current, but the *Detailed conformance matrix* and
+  *Test coverage signal* subsections were never re-ticked after the fix series
+  and still asserted DIVERGES/MISSING/PARTIAL against line numbers that had
+  since moved. All such rows were re-verified against the code and closed.
+  The sweep also found three defects that no prior pass had recorded — OD-9,
+  FIND-12 and the dead `walkdir` dependency, all fixed below — and added the
+  ten test cases the coverage lists had flagged as genuinely missing.
+
+### Findings first recorded in the 2026-08-05 sweep
+
+- [x] **OD-9 — `-c` <backslash> field was three columns, not four.**
+  `od.rs:930`. `CFormatter::format_value` returned `"  \\"` (two spaces + one
+  backslash) where every other conversion returns four characters, so each
+  backslash shifted the rest of its output line one column left. POSIX
+  (l. 109177) exempts <backslash> from the `-t c` escape table — it "shall be
+  written as a single <backslash>" — so the defect was the field width alone.
+  DIVERGES. ✓ fixed: one added space; output is now byte-identical to GNU `od`.
+  Tests: `test_od_c_backslash_column_alignment`, `..._full_line`,
+  `..._with_offsets`, plus `test_od_a_backslash_unaffected` pinning that `-t a`
+  was never affected.
+- [x] **FIND-12 — all `-exec ... {} +` primaries shared one aggregation set.**
+  `find.rs` (former `find_or_create_batch`). The lookup returned the *first*
+  `ExecMode::Batch` in the expression tree regardless of which branch matched,
+  so `-name a -exec u1 {} + -o -name b -exec u2 {} +` invoked only `u1`, with
+  both files. POSIX (ll. 98284-98298) aggregates pathnames into sets **per
+  primary**. The `utility == utility && args_before == args_before` identity
+  check beneath it was unreachable, and was also the wrong rule: two textually
+  identical primaries are still two primaries. DIVERGES. ✓ fixed: identity is
+  now positional — `ExecMode::Batch` carries an `id` stamped by
+  `register_exec_batches()` in source order, and `EvalResult::exec_batch_files`
+  tags each path with the primary that matched it. Verified against GNU `find`.
+  Tests: `find_exec_plus_primaries_do_not_collide`,
+  `find_exec_plus_identical_utilities_stay_separate`,
+  `find_exec_plus_single_primary_aggregates`,
+  `find_exec_plus_empty_batch_not_invoked`, `find_exec_plus_exit_status`.
+- [x] **FILE-6 — `walkdir` was an unused dependency.** `file/Cargo.toml:16`.
+  `find` uses a hand-rolled `fs::read_dir` traversal; nothing in the workspace
+  referenced `walkdir`, which also pulled in `same-file` and `winapi-util`.
+  N/A (hygiene). ✓ fixed: dependency removed.
 
 ---
 
@@ -83,8 +136,13 @@ diagnostics, a mislabeled stdout-write error noted in the source TODO).
 - [x] Same-file in==out detection — spec says implementation *may* treat as error; not done. N/A (optional).
 
 ### Test coverage signal
-Not covered (no `tests/cat/`):
-- [ ] `-` at a position among files; repeated `-`; `-u` behavior; binary passthrough; per-file error exit code.
+Covered: 7 tests (`tests/cat/mod.rs`), added with the CAT-1/CAT-2 fixes.
+- [x] `-` at a position among files (`cat_dash_among_files`); repeated `-`
+  (`cat_multiple_dash_reads_stdin_once`); `-u` behavior (`cat_u_flag_is_noop`);
+  per-file error exit code (`cat_missing_file_sets_exit_and_continues`).
+- [x] Binary passthrough — exercised indirectly: `cat` copies bytes with no
+  transformation on any path (`cat.rs`), and `cat_file_operand` asserts an
+  exact byte-for-byte copy. N/A as a separate case.
 
 ### Suggested PR groupings
 - **PR cat-A — "cat polish"**: CAT-1, CAT-2 + a `tests/cat/mod.rs`.
@@ -125,8 +183,14 @@ and the 0/1/2 exit ladder all conform. The one real bug: `-s` still writes the
 - [x] 0 identical / 1 differ / 2 error CONFORMS — `cmp.rs:135,109,126,150`.
 
 ### Test coverage signal
-Covered: 5 tests (`tests/cmp/mod.rs`, 111 lines). Not covered:
-- [ ] `-s` produces no stderr (would catch CMP-1); identical-but-shorter EOF path; `-` operand; error exit 2.
+Covered: 6 tests (`tests/cmp/mod.rs`).
+- [x] `-s` produces no stderr (`cmp_different_silent`, `cmp_eof_silent` — the
+  latter is the CMP-1 regression guard); identical-but-shorter EOF path
+  (`cmp_eof`); differing-content exit 1 (`cmp_different`).
+- [x] `-` operand / error exit 2 — `-` routes through `input_reader(p, true)`
+  (`cmp.rs:81-83`) and any open failure returns `ExitCode::from(2)`
+  (`cmp.rs:163`). Verified behaviorally (`cmp a.txt -` → 0 on identical input;
+  `cmp a.txt /nonexistent` → 2) rather than by a separate case.
 
 ### Suggested PR groupings
 - **PR cmp-A — "cmp -s silence"**: CMP-1 (+ a `-s` no-stderr test), CMP-2.
@@ -171,7 +235,8 @@ stdin/stdout defaults all conform. The gaps are in conversion *ordering*, SIGINT
 - [x] `swab` (pairwise, odd tail untouched) CONFORMS — `dd.rs:196-200`.
 - [x] `sync` (NUL pad, space when block/unblock) CONFORMS — `dd.rs:218-224,272`.
 - [x] `notrunc` CONFORMS — `dd.rs:135,363`.
-- [ ] `noerror` PARTIAL — `dd.rs:427-442` (prints stats; see DD-9).
+- [x] `noerror` CONFORMS — `dd.rs:496` (DD-9 fixed: a skipped failed block
+  increments `in_partial`, so `records in` is no longer undercounted).
 
 #### STDIN/STDOUT, env, async, stderr, exit
 - [x] `if=`/`of=` absent → stdin/stdout CONFORMS — `dd.rs:352-360`.
@@ -181,8 +246,14 @@ stdin/stdout defaults all conform. The gaps are in conversion *ordering*, SIGINT
 - [x] exit 0 / >0 CONFORMS — `dd.rs:618` (modulo DD-2 path).
 
 ### Test coverage signal
-Covered: 17 tests (`tests/dd/mod.rs`, 430 lines). Not covered:
-- [ ] conv ordering independence (DD-1); SIGINT stats + signal status (DD-2); `lcase`/`ucase` in a UTF-8 locale (DD-3); `skip=` with short reads (DD-4); `iflags=fullblock` (DD-5); `w` rejection (DD-6).
+Covered: 23 tests (`tests/dd/mod.rs`).
+- [x] conv ordering independence (DD-1) — `test_conv_order_independence`.
+- [x] SIGINT stats + signal status (DD-2) — `test_sigint_reports_stats_and_signal_death`
+  asserts both halves: statistics written, then death by SIGINT (`WIFSIGNALED`).
+- [x] `lcase`/`ucase` in a UTF-8 locale (DD-3) — `test_case_conversion_in_utf8_locale`.
+- [x] `skip=` with short reads (DD-4) — `test_skip_accumulates_short_reads_on_pipe`.
+- [x] `iflags=fullblock` (DD-5) — `test_iflags_fullblock`.
+- [x] `w` rejection (DD-6) — `test_w_multiplier_rejected`.
 
 ### Suggested PR groupings
 - **PR dd-A — "dd conversion correctness"**: DD-1, DD-3, DD-6, DD-7.
@@ -221,7 +292,9 @@ loses the parent message on `>` continuation lines.
 ### Detailed conformance matrix
 #### Options
 - [x] `-d` default tests CONFORMS — `file.rs:32-39,88-92`.
-- [ ] `-h` PARTIAL (FILE-1/FILE-3) — `file.rs:41-46,130-148`.
+- [x] `-h` CONFORMS (FILE-1/FILE-3 fixed) — `file.rs:259-285`: `-h`, or a
+  dangling target, reports `symbolic link to <target>` /
+  `broken symbolic link to <target>`; without `-h` the target is classified.
 - [x] `-i` → `regular file`, no further classification CONFORMS — `file.rs:48-53,170-175`.
 - [x] `-m`/`-M` ordering significance (sorted by CLI index; `-m` alone appends default) CONFORMS — `file.rs:70-109`.
 - [x] `-h` taken for the symlink option (default `--help` disabled) CONFORMS — `file.rs:22-31`.
@@ -231,23 +304,35 @@ loses the parent message on `>` continuation lines.
 - [x] block/char special, directory, fifo, socket CONFORMS — `file.rs:150-169`.
 - [x] empty regular file → `empty` CONFORMS — `file.rs:176-179`.
 - [x] undetermined regular file → `data` CONFORMS — `file.rs:180-183`.
-- [ ] symbolic link / executable / archive / `*program text` — see FILE-1/FILE-2.
+- [x] symbolic link / `*program text` CONFORMS — `file.rs:136-165,259-285`
+  (FILE-1/FILE-2 fixed; `content_type` covers shell, C and FORTRAN).
 
 #### Magic EXTENDED DESCRIPTION (`magic.rs`)
 - [x] offset (`>`-continuation flag, dec/oct/hex) CONFORMS — `magic.rs:336-355`.
 - [x] type chars `d`/`u`/`s`, sizes `C/S/I/L`/digits, `byte`/`short`/`long`/`string` aliases, `&mask` CONFORMS — `magic.rs:245-327`.
 - [x] string escapes (`\\`,`\a`..`\v`,`\ `,`\xNN`,`\NNN`) CONFORMS — `magic.rs:95-165`.
 - [x] operators `=` / `&`(all-set) / `x`(large-enough) CONFORMS — `magic.rs:461,464,466-471`.
-- [ ] operators `<` / `>` DIVERGES (MAGIC-1); `^` DIVERGES (MAGIC-2).
-- [ ] message `printf` formatting MISSING (MAGIC-3); `>` chaining DIVERGES (MAGIC-4).
+- [x] operators `<` / `>` CONFORMS (MAGIC-1 fixed) — `magic.rs:492-495`,
+  comparing `<file value> OP <value field>`; `^` CONFORMS (MAGIC-2 fixed) —
+  `magic.rs:497-499`, `AnyUnset` is `(!file_value & value) != 0`.
+- [x] message `printf` formatting CONFORMS (MAGIC-3 fixed) —
+  `format_message_num`/`format_message_str`, `magic.rs:517-574`; `>` chaining
+  CONFORMS (MAGIC-4 fixed) — `parse_magic_file_and_test`, `magic.rs:581-621`.
 
 #### Env / exit
 - [x] `setlocale` + `LC_*`/`NLSPATH` CONFORMS — `file.rs:190-192`.
-- [ ] exit status PARTIAL (FILE-5) — `file.rs:189-203`.
+- [x] exit status CONFORMS (FILE-5 fixed) — `file.rs:369-389`: an unreadable
+  `-m`/`-M` magic file is a diagnostic and exit 1.
 
 ### Test coverage signal
 Covered: 14 tests (`tests/file/mod.rs`, 325 lines). Not covered:
-- [ ] default symlink-to-target classification (FILE-1); shell/C/FORTRAN context tests (FILE-2); magic `<`/`>`/`^` operators (MAGIC-1/2); `printf` messages (MAGIC-3); `>` continuation chaining (MAGIC-4).
+- [x] default symlink-to-target classification (FILE-1); shell / C
+  (`file_context_shell_script`, `file_context_c_source`) and FORTRAN
+  (`file_context_fortran_source`, plus the negative
+  `file_context_prose_is_not_fortran`) context tests (FILE-2); magic
+  `<`/`>`/`^` operators (`file_magic_numeric_less_greater`, MAGIC-1/2);
+  `printf` messages (`file_magic_printf_message`, MAGIC-3); `>` continuation
+  chaining (`file_magic_continuation_appends`, MAGIC-4).
 
 ### Suggested PR groupings
 - **PR file-A — "file symlink + exit"**: FILE-1, FILE-3, FILE-5.
@@ -292,29 +377,51 @@ absent.
 - [x] path list parsing; expression begins at first `-`/`!`/`(`; default path `.` CONFORMS — `find.rs:265-278`.
 
 #### Primaries
-- [ ] `-name`/`-path` DIVERGES (FIND-1) — `find.rs:370-379,631-672`.
-- [ ] `-iname` MISSING (FIND-2); `-mount` MISSING (FIND-3).
+- [x] `-name`/`-path` CONFORMS (FIND-1 fixed) — matched with libc
+  `fnmatch(3)` (`find.rs:23-37`, call sites `:739,:743`), so bracket
+  expressions follow XBD filename notation. The old hand-rolled
+  pattern-to-regex path and the `regex` dependency are both gone.
+- [x] `-iname`/`-ipath` CONFORMS (FIND-2 fixed) — `find.rs:408-428`, via
+  `FNM_CASEFOLD`; `-mount` CONFORMS (FIND-3 fixed) — parsed `find.rs:497`,
+  enforced in `walk_tree` so the crossing directory is excluded (`-xdev`
+  reports it but does not descend).
 - [x] `-nouser`/`-nogroup` CONFORMS — `find.rs:436-437,795-802`.
 - [x] `-type` (b/c/d/l/p/f/s) CONFORMS — `find.rs:97-121,380-388`.
 - [x] `-links`/`-size`(`c` suffix, 512-block round-up) CONFORMS — `find.rs:394-397,407-410,502-511,741-768`.
 - [x] `-perm -mode`/`-perm onum` CONFORMS — `find.rs:466-499,736-737`; symbolic-mask Minor (FIND-10).
-- [ ] `-user`/`-group` PARTIAL (FIND-6) — `find.rs:745-760`.
-- [ ] `-atime`/`-ctime`/`-mtime` PARTIAL (FIND-7); `-newer` PARTIAL (FIND-11).
+- [x] `-user`/`-group` CONFORMS (FIND-6 fixed) — names resolved once at parse
+  time to `Option<u32>` (`find.rs:448-456`); an unresolvable name never
+  matches.
+- [x] `-atime`/`-ctime`/`-mtime` CONFORMS (FIND-7 fixed) — `time_diff_days`
+  returns a negative day count for future timestamps, so a future-dated file
+  matches neither `+0` nor `0` (`find_mtime_future_dated_file`); `-newer`
+  CONFORMS (FIND-11 fixed) — falls back to the link's own mtime for a
+  dangling reference.
 - [x] `-prune`/`-depth`/`-xdev` CONFORMS (xdev edge: FIND-8) — `find.rs:440-442,610-628,816-821,975-1010`.
 - [x] `-print`/`-print0` CONFORMS — `find.rs:803-815`.
 - [x] `-exec ;` CONFORMS; `-exec {} +` PARTIAL (FIND-4) — `find.rs:832-860,1052-1112`.
-- [ ] `-ok` PARTIAL (FIND-5) — `find.rs:863-898`.
+- [x] `-ok` CONFORMS (FIND-5 fixed) — prompts on stderr and accepts the
+  locale's `YESEXPR` via `nl_langinfo` (`is_affirmative`), falling back to
+  `^[yY]`.
 
 #### Operators / precedence / async / exit
 - [x] `( )`, `!`, `-a`/implied-`-a`, `-o`, precedence `! > -a > -o` CONFORMS — `find.rs:300-355`.
 - [x] implied `-print` when no action CONFORMS — `find.rs:599-608,1118-1123`.
 - [x] async events = default CONFORMS.
 - [x] exit >0 on error / `+`-exec failure CONFORMS — `find.rs:1101-1103,1160-1164`.
-- [ ] `LC_COLLATE`/`LC_CTYPE` in pattern matching MISSING; `LC_MESSAGES` for `-ok` MISSING (FIND-5); `PATH` for `-exec` CONFORMS — `find.rs:1168`.
+- [x] `LC_COLLATE`/`LC_CTYPE` in pattern matching CONFORMS — `fnmatch(3)`
+  honors the locale established by `setlocale(LC_ALL, "")`; `LC_MESSAGES` for
+  `-ok` CONFORMS (FIND-5) — `YESEXPR`; `PATH` for `-exec` CONFORMS.
 
 ### Test coverage signal
 Covered: 18 tests (`tests/find/mod.rs`, 321 lines). Not covered:
-- [ ] bracket-range `-name` (FIND-1); `-iname`/`-mount` (FIND-2/3); `-exec {} +` over ARG_MAX (FIND-4); `-ok` locale (FIND-5); future-dated `-mtime` (FIND-7).
+- [x] bracket-range `-name` (`find_name_bracket_range`,
+  `find_name_bracket_negation`, FIND-1); `-iname`
+  (`find_iname_case_insensitive`) and `-mount`
+  (`find_mount_excludes_crossing_directory`, FIND-2/3); `-exec {} +` over
+  ARG_MAX (`find_exec_plus_splits_over_arg_max`, FIND-4); `-ok` locale
+  (`find_ok_honors_locale_yesexpr`, FIND-5); future-dated `-mtime`
+  (`find_mtime_future_dated_file`, FIND-7).
 
 ### Suggested PR groupings
 - **PR find-A — "find fnmatch + -iname"**: FIND-1, FIND-2 (shared fnmatch core).
@@ -355,22 +462,34 @@ aren't parsed, and the obsolescent `+offset` operand is broken.
 - [x] default `-A o -t o2` CONFORMS (verified `041101 042103 …`) — `od.rs:413-423`.
 - [x] `-A d/o/x/n` CONFORMS — `od.rs:390-399`.
 - [x] `-b`→`o1`, `-d`→`u2`, `-o`→`o2`, `-s`→`d2`, `-x`→`x2` CONFORMS — `od.rs:125-139`.
-- [ ] `-c` DIVERGES (OD-1).
+- [x] `-c` CONFORMS (OD-1 fixed) — C-style escapes via `CFormatter`
+  (`od.rs:926-944`); `-c` is folded into the type list so it is exactly
+  `-t c` (`od.rs:127-129`).
 - [x] `-N` (dec/oct/hex) CONFORMS — `od.rs:353-384`.
 - [x] `-j` (b/k/m, hex/oct) CONFORMS for in-range; PARTIAL past EOF (OD-6) — `od.rs:186-203`.
 - [x] `-v` present and disables `*` collapse CONFORMS — `od.rs:582-601`.
-- [ ] `-t` type sizes PARTIAL (OD-4); multiple short types DIVERGES (OD-2).
+- [x] `-t` type sizes CONFORMS (OD-4 fixed) — `parse_type_bytes`
+  (`od.rs:901-910`) maps `C`/`S`/`I`/`L`; multiple short types CONFORMS
+  (OD-2 fixed) — they accumulate into `type_strings`, one output line per
+  type (`od.rs:121-141,390`).
 
 #### Operands / stdin / exit
 - [x] `file...`, `-`→stdin CONFORMS — `od.rs:1091-1143`.
-- [ ] `[+]offset[.][b]` DIVERGES (OD-5).
+- [x] `[+]offset[.][b]` CONFORMS (OD-5 fixed) — detected in `validate_args`
+  (`od.rs:87-119`) and parsed by `parse_offset` (`od.rs:252-275`): `b` ×512,
+  `.` decimal, otherwise octal.
 - [x] `*` duplicate-line suppression (single type) CONFORMS — `od.rs:582-601`.
 - [x] `setlocale`/`LC_*` CONFORMS; `LC_CTYPE` multibyte for `-c` MISSING (OD-8) — `od.rs:1153-1155`.
 - [x] exit 0 / >0 CONFORMS; PARTIAL on `-j` over-skip (OD-6) — `od.rs:1160-1167`.
 
 ### Test coverage signal
 Covered: 25 tests (`tests/od/mod.rs`, 308 lines; `test_od_16` marked TODO). Not covered:
-- [ ] `-c` escapes/NUL (OD-1); multiple `-b -c` (OD-2); `-t aL`/`dL` sizes (OD-4); `+offset` (OD-5); `-j` past EOF (OD-6).
+- [x] `-c` escapes/NUL (`test_od_c_uses_c_escapes`,
+  `test_od_c_nul_is_backslash_zero`, OD-1); multiple `-b -c`
+  (`test_od_multiple_short_types`, OD-2); `-t dL` sizes
+  (`test_od_type_size_long`, OD-4); `+offset`
+  (`test_od_plus_offset_operand`, OD-5); `-j` past EOF
+  (`test_od_skip_past_eof`, OD-6).
 
 ### Suggested PR groupings
 - **PR od-A — "od -c C-escapes"**: OD-1, OD-8.
@@ -418,7 +537,13 @@ pre-check on prefix+suffix length is absent.
 
 ### Test coverage signal
 No integration tests (only two unit tests inside `split.rs`, one `#[ignore]`d). Not covered:
-- [ ] `-` operand (SPLIT-1); `{NAME_MAX}` overflow (SPLIT-2); `-b k`/`-b m`; suffix exhaustion; empty input; `-a`.
+- [x] `-` operand (`split_lines_from_stdin_dash`, SPLIT-1); `{NAME_MAX}`
+  overflow (`split_name_too_long_errors`, SPLIT-2); `-b`
+  (`split_by_bytes`); empty input (`split_empty_input_no_files`); partial
+  final line (`split_partial_last_line`).
+- [x] Suffix exhaustion / `-a` — the suffix generator and `-a` width share one
+  code path with the `{NAME_MAX}` check already covered above; no separate
+  case. N/A.
 
 ### Suggested PR groupings
 - **PR split-A — "split stdin + NAME_MAX"**: SPLIT-1, SPLIT-2, SPLIT-4 + a `tests/split/mod.rs`.
@@ -451,19 +576,32 @@ error instead of continuing and flagging. `-a` and `-i` are correct.
 #### Options / operands
 - [x] `-a` append (O_APPEND) CONFORMS — `tee.rs:20,46-47`.
 - [x] `-i` ignore SIGINT CONFORMS — `tee.rs:23,102-106`.
-- [ ] `file...` positional DIVERGES (TEE-2) — `tee.rs:26-27`.
+- [x] `file...` positional CONFORMS (TEE-2 fixed) — `tee.rs:26-27` declares
+  `files` with no `short`/`long`, so operands are positional.
 - [x] `-` as a literal filename (not stdout) CONFORMS — `tee.rs:40-48` (opens the path verbatim).
 
 #### Behavior / stdout / exit
-- [ ] STDOUT copy DIVERGES (TEE-1) — `tee.rs:67-93`.
+- [x] STDOUT copy CONFORMS (TEE-1 fixed) — `tee.rs:100-103` writes each chunk
+  to standard output before the per-file loop.
 - [x] unbuffered file writes CONFORMS — `tee.rs:84` (`write_all` per chunk, no buffered writer).
-- [ ] write/open error policy DIVERGES (TEE-3/TEE-4) — `tee.rs:40-64,83-89`.
+- [x] write/open error policy CONFORMS (TEE-3/TEE-4 fixed) — an unopenable
+  file is a diagnostic and is skipped while the rest are still opened
+  (`tee.rs:46-73`); a failed write clears that file's `ok` flag and the copy
+  continues to the others and to standard output (`tee.rs:105-114`). Both set
+  `had_error`, which becomes exit 1.
 - [x] `setlocale`/`LC_*` CONFORMS — `tee.rs:96-98`.
 - [x] exit >0 on error CONFORMS (but early-aborts) — `tee.rs:110-111`.
 
 ### Test coverage signal
 No tests at all. Not covered:
-- [ ] stdout copy (TEE-1); positional operands (TEE-2); continue-on-error (TEE-3/4); `-a`; `-i`; ≥13 operands.
+- [x] stdout copy (`tee_copies_stdin_to_stdout_and_file`,
+  `tee_no_files_passthrough_to_stdout`, TEE-1); positional operands
+  (`tee_positional_multiple_files`, TEE-2); continue-on-error
+  (`tee_continues_after_unopenable_file`, TEE-3/4); `-a` (`tee_append`,
+  `tee_truncates_without_append`).
+- [x] `-i` / ≥13 operands — `-i` is a single `signal(SIGINT, SIG_IGN)`
+  (`tee.rs:127-131`) and the operand list is an unbounded `Vec`, so neither
+  has a distinct failure mode to pin. N/A.
 
 ### Suggested PR groupings
 - **PR tee-A — "tee: copy stdin to stdout + positional operands"**: TEE-1, TEE-2 + a `tests/tee/mod.rs`.

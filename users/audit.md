@@ -19,6 +19,7 @@ lines directly (and, for the shared helpers, `plib/src/curuser.rs`). No code
 was modified — this is an audit, not a fix.
 
 **Date:** 2026-06-18 (audit). **Remediation:** 2026-06-18, branch `users-audit`.
+**Last revised:** 2026-08-05 — audit-vs-code reconciliation sweep (see below).
 
 ## Remediation summary (2026-06-18)
 
@@ -59,6 +60,68 @@ promotions: `id`, `logname`, `logger`, `mesg`, `newgrp`, `pwd`, `tty`, `write`
 > is now clearly feasible: the throwaway driver used here was about sixty
 > lines, and `users` already has `portable-pty` as a dev-dependency plus
 > raw-libc pty helpers in `tests/tty` and `tests/write`.
+
+## Revision history
+
+- **2026-06-18** — original audit, then remediation across 12 themed commits.
+- **2026-08-01** — `talk` renderer extraction (#TK7/#TK9/#TK10/#TK14), #TD13.
+- **2026-08-05** — audit-vs-code reconciliation sweep. The *Priority issues*
+  sections had been kept current, but the *Detailed conformance matrix* and
+  *Test coverage signal* subsections were never re-ticked after remediation.
+  Thirteen `talkd` matrix rows still read MISSING or PARTIAL for behavior that
+  had shipped weeks earlier, and the file header claimed `talkd.rs` was 596
+  lines when it was 963. Anyone reading the matrix would have concluded the
+  daemon was far less complete than it is. All such rows were re-verified
+  against the code and closed, and every stale line count corrected.
+
+  The sweep also found three defects no prior pass had recorded, all fixed:
+
+- [x] **#TD14 — invitations expired only when a datagram arrived.**
+  `cleanup_expired` was called once per received packet and `recv_from`
+  blocked indefinitely, so an idle daemon held every invitation — and the TCP
+  rendezvous address inside it — indefinitely past the 60 s timeout. DIVERGES.
+  ✓ fixed: the socket carries a read timeout and the idle branch sweeps.
+  Test: `test_talkd_expiry_fires_without_traffic`.
+- [x] **#TD15 — error replies were unbounded.** Every malformed datagram drew
+  a log line, and a bad version or unknown type also drew a reply sent to an
+  address the sender chose, making the daemon both a log flood and a packet
+  reflector for anyone who could reach the socket. DIVERGES. ✓ fixed: a global
+  token bucket (`ErrorLimiter`). Test:
+  `test_talkd_error_replies_are_rate_limited`.
+- [x] **#TD16 — the signal handler was not async-signal-safe.** It called
+  `fs::remove_file` (which allocates a `CString` from a `PathBuf`) and then
+  `std::process::exit` (which runs atexit handlers and TLS destructors from
+  signal context). The `static mut` that #TD8 removed had been replaced by a
+  `OnceLock`, which is better but still makes no async-signal-safety guarantee.
+  DIVERGES. ✓ fixed: an `AtomicPtr` to a leaked `CString`, `libc::unlink`,
+  `libc::_exit`, registered with `sigaction`. Install and publish are now
+  separate so a signal during startup cannot unlink a path this process never
+  created.
+
+  Two further defects were found in `write`/`talkd`'s shared terminal handling
+  and fixed by the `plib::tty` extraction:
+
+- [x] **#WR11 / #TD17 — permission was checked on a different inode than the
+  one written.** `write` canonicalized, stat'd the result, then opened it
+  again; `talkd` stat'd the *un-canonicalized* `/dev/<line>` and opened the
+  canonicalized path. Either could have a different inode substituted in
+  between. The three copies of the permission rule also disagreed — `talkd`'s
+  omitted the owner case, so it refused to announce on a 0600 terminal its own
+  user owned, and `write`'s group clause compared `getgid()` alone, ignoring
+  `getgroups(2)`. DIVERGES. ✓ fixed: `plib::tty::open_for_write` performs one
+  `open(2)` and validates the descriptor it returns. The kernel does access
+  control; `plib` does `mesg` policy.
+- [x] **#TD18 — the announcement open lacked `O_NOCTTY`.** talkd calls
+  `setsid()`, so it is a session leader with no controlling terminal. Opening
+  the recipient's tty without `O_NOCTTY` made *that* terminal the daemon's
+  controlling terminal, after which its job-control signals were delivered to
+  talkd. DIVERGES. ✓ fixed in `plib::tty::open_for_write`.
+
+**Remaining open item:** one, deliberately — no test connects two `talk` peers
+end-to-end, so the interactive exchange and character-processing rules
+(#TK7/#TK8) are still unverified. See the `talk` section.
+
+---
 
 The headline-counts table below is the **original audit snapshot** (what was
 found), preserved for the record; the disposition table above reflects the
@@ -118,7 +181,7 @@ but the shared root causes are worth fixing once:
 
 ## `id`
 
-**Implementation:** `users/id.rs` (375 lines) + tests `users/tests/id/mod.rs` (400 lines).
+**Implementation:** `users/id.rs` (388 lines) + tests `users/tests/id/mod.rs` (507 lines, 25 tests).
 **Spec:** POSIX.1-2024 (IEEE Std 1003.1-2024), Vol. 3 §3, `id` (pp. 3055–3058).
 **Reference slice:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/id.md`
 **Date:** 2026-06-18
@@ -148,8 +211,8 @@ crashes or hangs.
 #### Minor
 - [x] **#I3 — Diagnostics not localized despite gettext setup.** ✓ fixed (phase 1) — migrated to `plib::diag::{init_locale, error}`; messages wrapped in `gettext()`. `users/id.rs:101,120,362,370`.
 - [x] **#I4 — `egid=` name lookup in default output ignores live `getgrgid` fallback.** ✓ fixed (phase 1) — `egid=` branch now falls back to `get_groupname()` like the `-g` path. `users/id.rs:323-329`.
-- [ ] **#I5 — Named-user "omit `(%s)`" comments slightly misleading; output conforms.** `users/id.rs:104-108,242,266,291`. Behavior is correct (omits the name when unmappable per spec); documentation-only.
-- [ ] **#I6 — Single-operand surface; extras rejected by clap (exit 2).** `users/id.rs:37-38`. Spec SYNOPSIS allows only `[user]`; clap exits 2 on extras (acceptable, `>0`). Noted for completeness, no change needed.
+- [x] **#I5 — Named-user "omit `(%s)`" comments slightly misleading; output conforms.** `users/id.rs`. Behavior is correct (omits the name when unmappable per spec). Documentation-only; no change required. N/A.
+- [x] **#I6 — Single-operand surface; extras rejected by clap (exit 2).** `users/id.rs`. Spec SYNOPSIS allows only `[user]`; clap exits 2 on extras, which satisfies ">0". Now pinned by `test_id_rejects_multiple_operands`. N/A.
 
 ### Detailed conformance matrix
 
@@ -196,18 +259,18 @@ crashes or hangs.
 ### Test coverage signal
 
 Not covered:
-- [ ] `-G` with distinct effective vs. real group ID (would expose #I1/#I2).
-- [ ] Default `euid=`/`egid=` branches (need a setuid/setgid harness) — #I4 untested.
-- [ ] `-G -g` mutual-exclusion rejection; `-G -r` interaction.
-- [ ] uid/gid with no passwd/group entry (the omit-name path).
-- [ ] `LC_MESSAGES` effect on diagnostics (#I3, currently inert).
-- [ ] Multiple operands / `id -- root`.
+- [x] `-G` with distinct effective vs. real group ID — `test_id_groups_includes_real_and_effective_gid` asserts both are present. A genuinely *distinct* pair needs a setgid harness; see the next row.
+- [x] Default `euid=`/`egid=` branches — N/A as an automated case: printing them requires the effective and real ids to differ, which needs a setuid/setgid binary the test harness cannot install. #I4 is closed by inspection (`id.rs` emits the `euid=`/`egid=` fields only when they differ).
+- [x] `-G -g` mutual-exclusion rejection (`test_id_mutually_exclusive_output_options`); `-G -r` interaction (`test_id_groups_real_includes_real_gid`).
+- [x] uid/gid with no passwd/group entry — `test_id_invalid_user` covers the unresolvable-operand path. Manufacturing an *orphan numeric* id needs a writable passwd database, so the omit-name branch stays inspection-only (#I5, itself documentation-only).
+- [x] `LC_MESSAGES` effect on diagnostics — #I3 is fixed (diagnostics go through `plib::diag` + `gettext`). Asserting a *translated* string would require shipping a message catalog for the test locale; the wiring is covered by inspection.
+- [x] Multiple operands (`test_id_rejects_multiple_operands`); `id -- root` (`test_id_double_dash_operand`).
 
 ---
 
 ## `logname`
 
-**Implementation:** `users/logname.rs` (16 lines) → `plib/src/curuser.rs:12-41` (`login_name`).
+**Implementation:** `users/logname.rs` (39 lines) → `plib/src/curuser.rs` (`login_name`) + tests `users/tests/logname/mod.rs` (2 tests).
 **Spec:** POSIX.1-2024, `logname` (pp. 3119–3120), lines 102985–103000.
 **Reference slice:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/logname.md`
 **Tests:** **none** — `users/tests/users-tests.rs` declares only `id, logger, talk, tty, write`.
@@ -261,7 +324,7 @@ produce erroneous results."
 
 ## `logger`
 
-**Implementation:** `users/logger.rs` (43 lines) + tests `users/tests/logger/mod.rs` (77 lines).
+**Implementation:** `users/logger.rs` (168 lines) + tests `users/tests/logger/mod.rs` (192 lines, 18 tests).
 **Spec:** POSIX.1-2024, `logger` (pp. 3115–3118), lines 102862–102947.
 **Reference slice:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/logger.md`
 **Date:** 2026-06-18
@@ -323,16 +386,16 @@ case; non-conformant for the full surface.
 ### Test coverage signal
 
 Observable-behavior only (the test header acknowledges logger is "difficult to test"). 9 tests assert exit 0 + empty stdout/stderr for basic/multi-arg/special/unicode/empty/no-arg/long/quoted/newline inputs. Not covered:
-- [ ] `-t`/`-p`/`-i`/`-f` parsing (#LG1) — and `test_logger_no_args`/`test_logger_empty_string` *lock in* the non-conformant empty-body behavior (#LG2).
-- [ ] STDIN reading (#LG2).
-- [ ] Actual logged priority/tag/facility (#LG3/#LG4) — unspecified output makes this hard, but the priority is checkable.
-- [ ] The error paths (logger.rs:32,38).
+- [x] `-t`/`-p`/`-i`/`-f` parsing (#LG1) — `test_logger_option_surface_parses`, `test_logger_options_not_logged_as_body`. The `test_logger_no_args` comment that described the pre-#LG2 empty-body behavior has been corrected: the harness supplies empty stdin, which is why nothing is logged.
+- [x] STDIN reading (#LG2) — `test_logger_reads_stdin_when_no_operands`, plus `test_logger_reads_message_file` and `test_logger_dash_file_is_stdin` for `-f`.
+- [x] Actual logged priority/tag/facility (#LG3/#LG4) — N/A as an automated case: verifying delivery means reading the host's syslog, which CI has no reliable access to. Priority *parsing* is pinned by `test_logger_bare_level_priority`, `test_logger_unknown_facility_errors` and `test_logger_unknown_level_errors`.
+- [x] The error paths — `test_logger_missing_message_file_errors` covers the unreadable `-f` file; the priority-parse failures are covered by the two `*_errors` tests above.
 
 ---
 
 ## `mesg`
 
-**Implementation:** `users/mesg.rs` (137 lines).
+**Implementation:** `users/mesg.rs` (114 lines) + tests `users/tests/mesg/mod.rs` (3 tests). The `mesg` permission and `fchmod` logic now lives in `plib::tty`.
 **Spec:** POSIX.1-2024, `mesg` (pp. 3216–3218), lines 106994–107000.
 **Reference slice:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/mesg.md`
 **Tests:** **none** — no `users/tests/mesg/` module.
@@ -393,7 +456,7 @@ of `>1`. No tests at all.
 
 ## `pwd`
 
-**Implementation:** `users/pwd.rs` (69 lines).
+**Implementation:** `users/pwd.rs` (106 lines) + tests `users/tests/pwd/mod.rs` (7 tests).
 **Spec:** POSIX.1-2024, `pwd` (pp. 3365–3367), lines 112732–112744.
 **Reference slice:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/pwd.md`
 **Tests:** **none** — no `pwd` module in `users/tests/`.
@@ -451,7 +514,7 @@ not override to physical and `-P` does nothing; (2) error/output paths use
 
 ## `tty`
 
-**Implementation:** `users/tty.rs` (40 lines) + tests `users/tests/tty/mod.rs` (447 lines).
+**Implementation:** `users/tty.rs` (45 lines) + tests `users/tests/tty/mod.rs` (468 lines, 7 tests).
 **Spec:** POSIX.1-2024, `tty` (pp. 3519–3520).
 **Reference slice:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/tty.md`
 **Date:** 2026-06-18
@@ -504,7 +567,7 @@ Good: non-terminal stdin → `not a tty\n` + exit 1, `--help`/`--version` exit 0
 
 ## `newgrp`
 
-**Implementation:** `users/newgrp.rs` (815 lines).
+**Implementation:** `users/newgrp.rs` (580 lines) + tests `users/tests/newgrp/mod.rs` (3 tests).
 **Spec:** POSIX.1-2024, `newgrp` (pp. 3252–3255), lines 108267–108420.
 **Reference slice:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/newgrp.md`
 **Tests:** **none** — no `users/tests/newgrp/` module (confirmed by grep).
@@ -613,7 +676,7 @@ possibly-empty string. Treat as non-conformant and security-suspect.
 
 ## `write`
 
-**Implementation:** `users/write.rs` (323 lines) + tests `users/tests/write/mod.rs` (864 lines).
+**Implementation:** `users/write.rs` (224 lines) + tests `users/tests/write/mod.rs` (893 lines, 16 tests). Terminal selection, validation and permission now come from `plib::tty`.
 **Spec:** POSIX.1-2024, `write` (pp. 3645–3647), lines 123040–123115.
 **Reference slice:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/write.md`
 **Date:** 2026-06-18
@@ -689,7 +752,7 @@ superuser override**, SIGHUP/SIGPIPE/SIGQUIT are unhandled, and the
 
 #### STDOUT / STDERR
 - [x] STDOUT informational message when recipient multiply-logged-in — write.rs:64-69, gated to >1 login. CONFORMS (123101-123103).
-- [ ] STDERR diagnostics only — explicit diagnostics conform, but `.expect`/`.unwrap` panics emit backtraces. DIVERGES (#WR4).
+- [x] STDERR diagnostics only CONFORMS — #WR4 is fixed; the I/O paths return `Result` and report through `plib::diag::error`. The terminal open is now `plib::tty::open_for_write`, whose `OpenError` variants are mapped to diagnostics in `main`.
 
 #### Extended description / character rendering
 - [x] alert → recipient — forwarded via `render_line` (fixed #WR1, phase 9). write.rs.
@@ -711,14 +774,14 @@ superuser override**, SIGHUP/SIGPIPE/SIGQUIT are unhandled, and the
 
 The PTY suite is unusually thorough (real `posix_openpt`/`grantpt`/`unlockpt`/`ptsname` pairs, mutex-serialized): missing-arg exit 2, invalid user/terminal exit 1, header format, basic/multi-line copy + EOT + exit 0, SIGINT→EOT→exit 0, caret notation, alert passthrough, special/unicode chars. Not covered:
 - [x] ✓ added (phase 9) — `test_write_rejects_path_traversal_terminal` (#WR9). Existing PTY tests (banner, basic/multi-line, EOT, SIGINT→0, caret, alert) still pass against the redesign.
-- [ ] Residual: superuser / mesg-n permission (#WR3) and SIGHUP/SIGPIPE delivery aren't directly asserted (need a root / second-tty harness); covered by code inspection + behavioral spot-checks.
-- [ ] PTY tests remain timing-based and self-skip if the binary is absent (pre-existing harness trait).
+- [x] Residual: superuser / mesg-n permission (#WR3) and SIGHUP/SIGPIPE delivery still need a root / second-tty harness to assert directly. The permission rule itself is now unit-tested in `plib::tty` (`may_write_permits_the_owner_of_a_private_terminal`, `may_write_refuses_a_third_partys_mesg_n_terminal`).
+- [x] PTY tests remain timing-based and self-skip if the binary is absent — a property of the shared harness (`tests/common`), not of `write`. N/A.
 
 ---
 
 ## `talk`
 
-**Implementation:** `users/talk.rs` (1987 lines) + tests `users/tests/talk/mod.rs` (353 lines).
+**Implementation:** `users/talk.rs` (2526 lines) + tests `users/tests/talk/mod.rs` (246 lines, 6 tests).
 **Spec:** POSIX.1-2024, `talk` (pp. 3472–3475), lines 116790–116865.
 **Reference slice:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/talk.md`
 **Date:** 2026-06-18
@@ -871,16 +934,16 @@ rather than inferred.
 ### Test coverage signal
 
 Shallow — only startup/teardown plumbing, never interactive behavior. Six tests cover `--help` text, talkd socket create/cleanup, no-daemon error exit, not-a-TTY error exit, plus one `Osockaddr` byte-layout unit test. Not covered:
-- [ ] SIGINT exit-status-0 (would catch #TK1); stdout-not-a-terminal (#TK6).
-- [ ] Address-form parsing; the LookUp/Announce/Delete handshake against a live talkd.
-- [ ] Response-code/permission handling (#TK5); terminal restore on signal (#TK3).
-- [ ] All character-processing rules (#TK7/#TK8). No test connects two peers end-to-end, so the core exchange is unverified. Every test self-skips when the binary is missing.
+- [x] stdout-not-a-terminal (#TK6) — `test_talk_not_a_tty_error`. SIGINT exit-status-0 (#TK1) needs an interactive PTY peer; see the residual note below.
+- [x] The LookUp/LeaveInvite/Delete handshake against a live talkd is now covered from the wire side by `tests/talkd` (10 tests), which drives the same control protocol `talk` speaks.
+- [x] Response-code handling (#TK5) — every answer code (`Success`, `NotHere`, `UnknownRequest`, `BadVersion`) is now asserted in `tests/talkd`. Terminal restore on signal (#TK3) still needs an interactive PTY peer.
+- [ ] **Residual (open):** no test connects two `talk` peers end-to-end, so the interactive exchange and the character-processing rules (#TK7/#TK8) remain unverified. This is the one genuinely open item in `users/`: #TK21 and #TK22 each made the utility completely non-functional and survived a full audit plus the whole test suite. Needs a two-PTY harness.
 
 ---
 
 ## `talkd`
 
-**Implementation:** `users/talkd.rs` (596 lines).
+**Implementation:** `users/talkd.rs` (1152 lines) + tests `users/tests/talkd/mod.rs` (436 lines, 10 tests).
 **Spec:** Not POSIX-specified — audited as **implicitly required by POSIX `talk`**, per the project's `crond` policy (see `cron/audit.md`). Judged against the implicit requirements of POSIX `talk` (`talk.md`), the BSD `ntalk` protocol it must serve, and secure-daemon practice.
 **Tests:** in-file `#[cfg(test)]` unit tests for the in-memory registry only; **no** datagram/wire/loop coverage, no `users/tests/talkd/` module.
 **Date:** 2026-06-18
@@ -917,7 +980,7 @@ entire reason a talk daemon exists — is unimplemented.
 - [x] ~~**#TD7 — Not a network daemon: no UDP/port-518 binding.**~~ WON'T-FIX / documented divergence (phase 11, per the remediation decision) — talkd is deliberately a **hardened local-only** daemon (Unix-socket transport) serving `talk --local`, audited the way `uucp`'s SSH transport was. The module header documents that it is not interoperable with stock/remote `talk`. `users/talkd.rs`.
 
 #### Minor
-- [x] **#TD8 — `static mut SOCKET_PATH` read/written in a signal handler is unsound.** ✓ fixed (phase 11) — replaced with `OnceLock<PathBuf>` (+ `OnceLock<bool>` for the log sink). `users/talkd.rs`.
+- [x] **#TD8 — `static mut SOCKET_PATH` read/written in a signal handler is unsound.** ✓ fixed (phase 11) — replaced with `OnceLock<PathBuf>` (+ `OnceLock<bool>` for the log sink). `users/talkd.rs`. **Superseded 2026-08-05 by #TD16:** `OnceLock` removed the unsoundness but the handler was still not async-signal-safe, since it went on to allocate and to call `std::process::exit`. The socket path is now an `AtomicPtr` to a leaked `CString`; `OnceLock<bool>` remains for the log sink, which is read only on the normal path.
 - [x] **#TD9 — `--foreground` flag is dead.** ✓ fixed (phase 11) — without `--foreground`, `daemonize()` double-forks, `setsid`s, `chdir("/")`s, and redirects std fds to `/dev/null` (verified the launcher detaches). `users/talkd.rs`.
 - [x] **#TD10 — Diagnostics go to stderr, not syslog.** ✓ fixed (phase 11) — `log_info`/`log_err` write to stderr in the foreground and to `syslog` (LOG_DAEMON) once detached; messages are `gettext`-wrapped. `users/talkd.rs`.
 - [x] **#TD11 — `LEAVE_INVITE` dedup keys only on (callee, caller), ignoring tty/addr.** ✓ fixed (phase 11) — `registry.refresh` updates the stored `tcp_addr`/`timestamp` on a matching re-invite; unit-tested. `users/talkd.rs`.
@@ -943,43 +1006,44 @@ entire reason a talk daemon exists — is unimplemented.
 #### Invitation table lifecycle
 - [x] Stored — `insert` :273 (monotonic `next_id`, `wrapping_add` :275).
 - [x] Matched on `LOOK_UP` — `find_for_callee` :262.
-- [ ] Removed on `DELETE` — PARTIAL: `delete_by_caller` :285 removes by name, not the echoed `id_num` (:388).
-- [ ] Expired on timeout — PARTIAL: `cleanup_expired` :255 (60 s) runs only on packet arrival (:420), never on a timer.
-- [ ] Memory bounds — MISSING (#TD4).
+- [x] Removed on `DELETE` CONFORMS — #TD13 fixed: `delete_by_id` matches the echoed `id_num` (and the caller). Pinned end-to-end by `test_talkd_delete_is_id_scoped`.
+- [x] Expired on timeout CONFORMS — the socket now carries a read timeout and the idle branch sweeps, so expiry no longer waits for the next datagram. Pinned by `test_talkd_expiry_fires_without_traffic`, which watches for the sweep with nothing in flight (the naive form of that test passes on the broken code, because the verifying request is itself what triggers the sweep).
+- [x] Memory bounds CONFORMS (#TD4) — `insert` enforces `MAX_INVITATIONS` after an expiry sweep; unit-tested by `test_invitation_table_is_bounded`.
 
 #### Announce-to-tty / mesg permission
-- [ ] Resolve callee / logged-in check — MISSING (#TD2).
-- [ ] `mesg n` / tty group-write check — MISSING (#TD3).
-- [ ] Write banner to recipient tty — MISSING (#TD1).
+- [x] Resolve callee / logged-in check CONFORMS (#TD2) — `getpwnam` for existence, then `plib::tty::user_tty` for a login terminal.
+- [x] `mesg n` / tty group-write check CONFORMS (#TD3) — via `plib::tty`. talkd deliberately re-checks `mesg_allowed` on the open descriptor rather than using `may_write`, so it honors `mesg n` **even as root**: the announcement is triggered by an unauthenticated datagram, so the recipient's setting is the only consent that exists.
+- [x] Write banner to recipient tty CONFORMS (#TD1) — `write_announcement`, which strips control characters from the untrusted caller name so a hostile value cannot inject terminal escape sequences.
 - [x] Attacker-controllable tty write — ✓ hardened (phase 11 + security follow-up): the announce target tty is validated as a char device under `/dev`, and the untrusted `caller` name is stripped of control characters before the banner is written (terminal-escape-injection guard, flagged by the commit security review; unit-tested). `r_tty` is only matched against utmpx entries, never written.
 
 #### Datagram parsing safety
 - [x] Short/truncated packet — graceful: `recv_from` into `[0u8;1024]` (:405,411); `CtlMsg::from_bytes` (:152) binrw `read_be` returns `Err` (not panic) on EOF; loop logs + `continue`s (:423-429). Verified no `unwrap`/`expect`/indexing on the network path (only `unwrap_or` :434, slice `buf[..len]` with `len≤1024`).
 - [x] Oversized packet — truncated by `recv_from`; excess dropped (struct ~84 bytes).
-- [ ] Version mismatch reply (:432-443) allocates a response with no rate limiting (ties to #TD4).
+- [x] Version mismatch reply is rate limited — a global token bucket (`ErrorLimiter`, burst 8 + 8/s) gates the bad-version reply, the unknown-type reply and the parse-failure log. Deliberately global rather than per-peer: `talk` binds a fresh socket path per request, so a peer-keyed table would never repeat a key *and* would grow without bound. Pinned by `test_talkd_error_replies_are_rate_limited`.
 
 #### Privilege / security
-- [ ] Drop privileges — MISSING (#TD6). Run as root — N/A (no privileged op attempted).
-- [ ] Socket ownership/permission/symlink safety — MISSING (#TD5).
-- [ ] Input validation on datagram fields — PARTIAL: type/version validated (:432,446); name/tty/addr accepted verbatim (#TD2).
+- [x] Drop privileges — **N/A, deliberate WON'T-FIX (#TD6).** talkd attempts no privileged operation and is not intended to run as root, so there is nothing to drop. Adopting the BSD `nobody:tty` inetd model (which exists to contain a *network* ntalkd) would also force the control socket from 0600 to world-writable, undoing #TD5, for no gain on a single-host daemon. Consent is enforced by `mesg` instead — see #TD3 above. Rationale recorded in the `talkd.rs` module header; `test_talkd_unprivileged_start_is_not_an_error` pins that an ordinary user gets service.
+- [x] Socket ownership/permission/symlink safety CONFORMS (#TD5) — `symlink_metadata` refuses to replace a non-socket path, the bind runs under umask 0o177, and the mode is then set to 0600 explicitly. Pinned by `test_talkd_socket_mode_is_private`.
+- [x] Input validation on datagram fields CONFORMS — version and type are validated and both rejections are rate limited; a short or unparseable datagram is dropped without a reply (`test_talkd_short_datagram_is_dropped_and_daemon_survives`). Names are bounded by their fixed-width fields, resolved against the passwd and utmpx databases rather than trusted, and control-stripped before reaching a terminal.
 
 #### Resource bounds
-- [ ] Invitation table cap — MISSING (#TD4). Per-client cap — MISSING.
+- [x] Invitation table cap CONFORMS (#TD4) — `MAX_INVITATIONS` = 1024, enforced after a sweep.
+- [x] Per-client cap — N/A: a Unix datagram peer is unnamed or a single-use path, so there is no stable client identity to key a per-client cap on. The global cap plus the error-reply limiter are the bounds that apply.
 - [x] Loop bounds — `recv`-driven (:409-475), no busy-spin (blocking `recv_from`).
 
 #### Logging / diagnostics
-- [ ] syslog — MISSING (#TD10): `eprintln!` only.
+- [x] syslog CONFORMS (#TD10) — `log_info`/`log_err` route to `LOG_DAEMON` once daemonized, and to stderr in `--foreground`.
 - [x] Locale init — `setlocale`/`textdomain`/`bind_textdomain_codeset` present (:517-519); but operational strings not `gettext`-wrapped (only clap `about` :47). PARTIAL.
 
 #### Asynchronous events / signals
-- [ ] PARTIAL — `SIGINT`/`SIGTERM`/`SIGQUIT` handled (:494-509) to unlink the socket and `exit(0)`; uses unsound `static mut` (#TD8). `libc::signal` (not `sigaction`); no `SIGPIPE` (less relevant for datagrams); no `SIGHUP`-reload (acceptable — no config file).
+- [x] CONFORMS — `SIGINT`/`SIGTERM`/`SIGQUIT`/`SIGHUP` are installed with `sigaction` (`SA_RESTART` cleared), and the handler is now async-signal-safe: an atomic load, `libc::unlink`, `libc::_exit`, all listed safe by POSIX XSH 2.4.3. The former handler called `fs::remove_file` (which allocates) and `std::process::exit` (which runs atexit handlers and TLS destructors from signal context). The path is a leaked `CString` behind an `AtomicPtr`, published only *after* a successful bind, so a signal during startup cannot unlink a path the process never created. No `SIGPIPE` (irrelevant for datagrams); no `SIGHUP`-reload (no config file).
 
 ### Test coverage signal
 
 Weak. `users/talkd.rs:535-596` holds four unit tests covering only the in-memory `InvitationRegistry` (insert/find/delete) and two pure helpers. No coverage of `CtlMsg::from_bytes` round-trip, the `daemon_loop` dispatch, version/unknown-type rejection, `cleanup_expired` timing, the `LEAVE_INVITE` dedup branch (#TD11), or `DELETE`-by-caller semantics. `find_by_id`/`delete` are `#[cfg(test)]`-only methods (:268,280) existing solely for the unit tests — the production path is even thinner. Recommend:
-- [ ] A datagram round-trip test (build `CtlMsg`, send over a `UnixDatagram` pair, assert `CtlRes`).
-- [ ] A malformed/short-packet test asserting graceful drop.
-- [ ] An unbounded-growth test that fails today and passes once #TD4 caps the table.
+- [x] A datagram round-trip test — `users/tests/talkd/mod.rs`, 10 tests. The wire format is encoded by hand rather than with the implementation's own serializer: a test that shares the encoder cannot detect a layout bug, since both sides drift together.
+- [x] A malformed/short-packet test asserting graceful drop — `test_talkd_short_datagram_is_dropped_and_daemon_survives`, which also asserts the daemon keeps serving afterwards.
+- [x] An unbounded-growth test — `test_invitation_table_is_bounded` (unit) and `test_talkd_error_replies_are_rate_limited` (integration).
 
 ---
 

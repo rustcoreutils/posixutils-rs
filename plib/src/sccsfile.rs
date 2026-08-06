@@ -1754,26 +1754,27 @@ impl Drop for ZLock {
 pub mod paths {
     use std::path::{Path, PathBuf};
 
-    /// Get the g-file (gotten file) path from s-file path
-    /// /path/to/s.foo -> /path/to/foo
-    /// /path/to/SCCS/s.foo -> /path/to/foo
+    /// Get the g-file (gotten file) path from an s-file path.
+    ///
+    /// The g-file "shall be created in the current directory" (get,
+    /// 99186-99187), and "only the real user need have write permission in the
+    /// current directory" (99190) — so the name is the s-file's basename minus
+    /// the `s.` prefix, resolved against the caller's cwd, *not* against the
+    /// s-file's directory.
+    ///
+    /// This previously derived a directory from the s-file (the parent of
+    /// `SCCS/`, else the s-file's own directory). For the usual
+    /// `cd project && get SCCS/s.foo` that is the same answer, which is why it
+    /// went unnoticed; but `get ../other/SCCS/s.foo` wrote the working copy
+    /// into `../other` instead of here, and `sccs -d dir -p SCCS get mod`
+    /// aimed it at the read-only s-file's own directory and failed with
+    /// EACCES.
+    ///
+    /// `delta` and `unget` read and remove the g-file through this same
+    /// helper, so all three agree on where it lives.
     pub fn gfile_from_sfile(sfile: &Path) -> Option<PathBuf> {
         let name = sfile.file_name()?.to_str()?;
-        if let Some(gname) = name.strip_prefix("s.") {
-            // Determine g-file directory
-            let parent = sfile.parent().unwrap_or(Path::new("."));
-
-            // If s-file is in SCCS/ directory, g-file goes to parent of SCCS/
-            if parent.file_name().map(|n| n == "SCCS").unwrap_or(false) {
-                let gfile_dir = parent.parent().unwrap_or(Path::new("."));
-                Some(gfile_dir.join(gname))
-            } else {
-                // g-file goes to same directory as s-file
-                Some(parent.join(gname))
-            }
-        } else {
-            None
-        }
+        name.strip_prefix("s.").map(PathBuf::from)
     }
 
     /// Get the s-file path from g-file path
@@ -1816,14 +1817,16 @@ pub mod paths {
         sfile.with_file_name(zname)
     }
 
-    /// Get the l-file (delta summary) path from s-file
+    /// Get the l-file (delta summary) path from an s-file.
+    ///
+    /// Like the g-file, "the l-file shall be created in the current directory
+    /// if the -l option is used" (get, 99192-99194) — not beside the s-file.
     pub fn lfile_from_sfile(sfile: &Path) -> PathBuf {
         let name = sfile
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("s.unknown");
-        let lname = format!("l.{}", &name[2..]);
-        sfile.with_file_name(lname)
+        PathBuf::from(format!("l.{}", &name[2..]))
     }
 
     /// Get the x-file (temporary) path from s-file

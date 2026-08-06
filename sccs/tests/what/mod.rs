@@ -7,7 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test_with_checker, TestPlan};
+use super::common::run_test_with_checker;
+use plib::testing::TestPlan;
 use std::path::PathBuf;
 use std::process::Output;
 

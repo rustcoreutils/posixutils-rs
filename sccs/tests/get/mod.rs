@@ -7,7 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, run_test_with_checker, TestPlan};
+use super::common::{run_test, run_test_with_checker};
+use plib::testing::TestPlan;
 use std::path::PathBuf;
 use std::process::Output;
 use tempfile::TempDir;
@@ -353,4 +354,128 @@ fn get_top_delta_in_release() {
             "top SID should be 1.3, got: {stderr}"
         );
     });
+}
+
+/// The g-file "shall be created in the current directory" (spec 99186-99187),
+/// and "only the real user need have write permission in the current
+/// directory" (99190).
+///
+/// `get` used to derive the g-file's directory from the s-file — the parent of
+/// `SCCS/`, else the s-file's own directory. For the usual
+/// `cd project && get SCCS/s.foo` that gives the same answer, which is why it
+/// went unnoticed; but retrieving an s-file that lives elsewhere wrote the
+/// working copy into *that* tree instead of here. Verified against CSSC 1.4.1,
+/// which writes to the current directory.
+#[test]
+fn get_writes_the_gfile_into_the_current_directory() {
+    let project = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+
+    std::fs::create_dir(project.path().join("SCCS")).unwrap();
+    let sfile = project.path().join("SCCS/s.remote");
+    let out = super::common::run_in(
+        "admin",
+        &["-i", sfile.to_str().unwrap()],
+        project.path(),
+        "remote content\n",
+    );
+    assert!(
+        out.status.success(),
+        "admin failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Retrieve it from an unrelated directory.
+    let out = super::common::run_in("get", &[sfile.to_str().unwrap()], work.path(), "");
+    assert!(
+        out.status.success(),
+        "get failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        work.path().join("remote").exists(),
+        "the g-file belongs in the current directory"
+    );
+    assert!(
+        !project.path().join("remote").exists(),
+        "the g-file must not be written beside the SCCS directory"
+    );
+    assert_eq!(
+        std::fs::read(work.path().join("remote")).unwrap(),
+        b"remote content\n"
+    );
+}
+
+/// The l-file follows the same rule: "the l-file shall be created in the
+/// current directory if the -l option is used" (99192-99194).
+#[test]
+fn get_writes_the_lfile_into_the_current_directory() {
+    let project = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+
+    std::fs::create_dir(project.path().join("SCCS")).unwrap();
+    let sfile = project.path().join("SCCS/s.withl");
+    let out = super::common::run_in(
+        "admin",
+        &["-i", sfile.to_str().unwrap()],
+        project.path(),
+        "body\n",
+    );
+    assert!(out.status.success());
+
+    let out = super::common::run_in("get", &["-l", sfile.to_str().unwrap()], work.path(), "");
+    assert!(
+        out.status.success(),
+        "get -l failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        work.path().join("l.withl").exists(),
+        "the l-file belongs in the current directory"
+    );
+    assert!(
+        !project.path().join("SCCS/l.withl").exists() && !project.path().join("l.withl").exists(),
+        "the l-file must not be written beside the s-file"
+    );
+}
+
+/// The p-file, by contrast, is "created in the directory containing the SCCS
+/// file" (99214) — so the two rules really are different, and fixing the
+/// g-file must not have moved the p-file too.
+#[test]
+fn get_writes_the_pfile_beside_the_sfile() {
+    let project = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+
+    std::fs::create_dir(project.path().join("SCCS")).unwrap();
+    let sfile = project.path().join("SCCS/s.locked");
+    let out = super::common::run_in(
+        "admin",
+        &["-i", sfile.to_str().unwrap()],
+        project.path(),
+        "body\n",
+    );
+    assert!(out.status.success());
+
+    let out = super::common::run_in("get", &["-e", sfile.to_str().unwrap()], work.path(), "");
+    assert!(
+        out.status.success(),
+        "get -e failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        project.path().join("SCCS/p.locked").exists(),
+        "the p-file belongs beside the s-file"
+    );
+    assert!(
+        !work.path().join("p.locked").exists(),
+        "the p-file must not follow the g-file into the current directory"
+    );
+    assert!(
+        work.path().join("locked").exists(),
+        "the g-file still belongs in the current directory"
+    );
 }

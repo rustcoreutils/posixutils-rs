@@ -398,6 +398,33 @@ implemented them, contradicting the already-ticked #G2/#G3/#G4/#G7 above.)*
 #### EXIT STATUS
 - [x] 0 success / >0 error; per-file failure continues — `get.rs:544-555`. Bad `-r SID` → exit 1.
 
+#### Working-file placement *(found 2026-08-06)*
+- [x] **#G13 — the g-file and l-file were written beside the s-file, not in the
+  current directory.** `get` derived the g-file's directory from the s-file (the
+  parent of `SCCS/`, else the s-file's own directory), but the spec is explicit:
+  the g-file "shall be created in the current directory" (99186-99187), "only
+  the real user need have write permission in the current directory" (99190),
+  and the l-file likewise (99192-99194). Only the p-, z- and x-files belong
+  beside the s-file (99214, 99228).
+
+  For the usual `cd project && get SCCS/s.foo` both rules give the same answer,
+  which is why this survived; but `get ../other/SCCS/s.foo` wrote the working
+  copy into `../other`, and `sccs -d dir -p SCCS get mod` aimed it at the
+  read-only s-file's own directory and failed outright with EACCES. CSSC 1.4.1
+  writes to the current directory in both cases. Fixed in
+  `plib::sccsfile::paths::{gfile_from_sfile,lfile_from_sfile}`; `delta` and
+  `unget` read and remove the g-file through the same helper, so all three
+  agree. Tests `get_writes_the_gfile_into_the_current_directory`,
+  `..._lfile_...`, and `get_writes_the_pfile_beside_the_sfile` — the last so the
+  two rules cannot be collapsed into one.
+
+  *Test-harness consequence:* `plib::testing::run_test` cannot set a working
+  directory, so the sccs suite had been relying on the old placement to keep its
+  working files inside its TempDirs. With the fix, a run scattered g-files across
+  the `sccs/` source directory. `sccs/tests/common/` now provides cwd-aware
+  drop-in replacements that derive the directory from the plan's own s-file
+  operand.
+
 ### Test coverage gaps
 - [ ] `-c`, `-i`, `-x`, `-l`, `-L`, `-t` (all **implemented** since Phase 4 — untested, not missing); `-`/directory operands; CSSC-encoded interop fixture (#G1); z-file presence (#G8); `No id keywords` warning (#G9); `-m`/`-n`/`-g`; multi-release partial-SID.
 
@@ -557,12 +584,21 @@ and the rewritten file loses its `0444` read-only mode.
 - [x] 0 success / >0 error; per-file aggregation — `rmdel.rs:159,215`. Verified multi-file.
 
 ### Test coverage gaps
-- [ ] ~~No integration tests at all.~~ *(Stale: `tests/rmdel/mod.rs` has 4 —
+- [x] ~~No integration tests at all.~~ *(Stale: `tests/rmdel/mod.rs` has 4 —
   `rmdel_removes_leaf_delta`, `rmdel_preserves_readonly_mode` (#R3),
   `rmdel_unknown_sid_fails`, `rmdel_not_an_sccs_file_fails`.)* Still needed:
-  leaf removal marks `R` + matches CSSC bytes (#R1); non-leaf/initial
-  rejection; p-file-locked rejection; already-removed; `-`/directory operands;
-  ownership (#R2); checksum after reweave.
+  ✓ Closed 2026-08-06: leaf removal marks the delta `R` rather than deleting
+  the entry, and the rewritten file still validates — the checksum is
+  recomputed over the reweave (#R1,
+  `rmdel_marks_removed_delta_r_and_file_stays_valid`); non-leaf and initial
+  deltas refused with the file left byte-identical
+  (`rmdel_refuses_non_leaf_and_initial_deltas`); p-file-locked and
+  already-removed refused (`rmdel_refuses_edited_and_already_removed_deltas`);
+  `-`/directory operands, including that an error on an expanded operand still
+  sets the exit status (`rmdel_directory_and_stdin_operands`).
+  Cross-checked against CSSC 1.4.1: its `val` accepts our post-`rmdel` s-file
+  and its `prs -e` reports the same surviving deltas.
+- [ ] Ownership (#R2) — needs a second user; not stageable in CI.
 
 ---
 
@@ -687,14 +723,21 @@ name** (`Command::new("get")`), so the front-end breaks without `$PATH` help.
 - [x] Propagates child exit codes (`sccs.rs:602`); no command → usage exit 2; unknown command → exit 1. Verified.
 
 ### Test coverage gaps
-- [ ] ~~No integration tests at all (`sccs-tests.rs` omits `sccs` and `rmdel`).~~
+- [x] ~~No integration tests at all (`sccs-tests.rs` omits `sccs` and `rmdel`).~~
   *(Stale on both counts: `sccs-tests.rs:10-19` declares all ten modules, and
   `tests/sccs/mod.rs` has 3 — `sccs_info_reports_full_pfile_fields` (#SC3),
   `sccs_edit_resolves_siblings_without_path` (#SC2),
   `sccs_unknown_command_fails`.)* Still needed: prefix/`-d`/`-p` resolution;
-  `-r` real-user (#SC1); option-splitting (#SC4); the remaining pseudo-commands
-  (`create`, `deledit`, `diffs`, `check`, `tell`, `clean`, `unedit`, `fix`,
-  `enter`).
+  `-r` real-user (#SC1). ✓ Closed 2026-08-06: prefix / `-d` / `-p` resolution
+  (`sccs_resolves_prefix_and_subdirectory_options`), option pass-through #SC4
+  (`sccs_passes_subcommand_options_through`), and the pseudo-commands —
+  `edit`/`unedit`, `create` (including the mandated comma-rename of the
+  original, 113921-113924), `tell`/`info`/`clean`, `print`, `delget`. `enter`
+  is a historical BSD extension and is **not** in the POSIX list
+  (113901-113951), so rejecting it is correct and is pinned as such.
+  *Convention note:* SCCS option-arguments are **attached** (`-ymsg`, not
+  `-y msg`); with the separated form the driver takes the argument as a file
+  operand — and CSSC 1.4.1 does exactly the same.
 
 ---
 

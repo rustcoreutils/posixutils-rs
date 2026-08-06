@@ -286,8 +286,9 @@ Not covered:
   `test_decompress_suffixless_no_data_loss`).
 - [x] `-b 15`/`-b 16` (previously rejected) and bits value in header — #C4
   (✓ phase 5, `test_compress_bits_16_accepted_and_roundtrips`).
-- [ ] `-v` percentage output content.
-- [ ] Ownership/time preservation assertions.
+- [x] `-v` percentage output content — `test_compress_verbose_reports_compression_percentage` asserts the message names the file, says `Compression:`, and carries a parseable percentage above 50% for a highly compressible input; paired with `test_compress_without_verbose_is_silent` so it cannot pass on an unrelated message.
+- [x] Mode/time preservation — `test_compress_preserves_mode_and_mtime` and `test_uncompress_preserves_mode_and_mtime`. **These found #C5** (below). Ownership is deliberately not asserted: `chown` is best-effort and only succeeds for a privileged process (spec 90389-90392), so a non-root test can only observe a no-op.
+- [x] **#C5 — the preserved mtime was truncated to microseconds.** *(Found 2026-08-06 by the test above, which failed on its first run.)* `FileMetadata::apply_to` used `libc::utimes`, whose `struct timeval` has microsecond resolution. On any filesystem with nanosecond timestamps — ext4, APFS — the copy's mtime differed from the original's by up to 999ns, so a "preserved" time did not compare equal to the one it came from. Switched to `libc::utimensat` with `struct timespec`. The asymmetry is what gave it away: decompression appeared to preserve the time correctly, because it was re-applying an already-truncated value and truncation is idempotent.
 
 ---
 

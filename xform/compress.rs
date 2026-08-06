@@ -224,22 +224,28 @@ impl FileMetadata {
             let perms = fs::Permissions::from_mode(self.mode);
             fs::set_permissions(path, perms)?;
 
-            fn to_timeval(time: SystemTime) -> libc::timeval {
+            // utimensat, not utimes: utimes takes `struct timeval`, whose
+            // resolution is microseconds, so it silently truncated the
+            // sub-microsecond part of the timestamp. On a filesystem with
+            // nanosecond timestamps (ext4, APFS, ...) that meant the copy's
+            // mtime differed from the original's by up to 999ns — a "preserved"
+            // time that did not compare equal to the one it came from.
+            fn to_timespec(time: SystemTime) -> libc::timespec {
                 match time.duration_since(std::time::UNIX_EPOCH) {
-                    Ok(d) => libc::timeval {
+                    Ok(d) => libc::timespec {
                         tv_sec: d.as_secs() as libc::time_t,
-                        tv_usec: d.subsec_micros() as libc::suseconds_t,
+                        tv_nsec: d.subsec_nanos() as _,
                     },
-                    Err(_) => libc::timeval {
+                    Err(_) => libc::timespec {
                         tv_sec: 0,
-                        tv_usec: 0,
+                        tv_nsec: 0,
                     },
                 }
             }
 
-            let times = [to_timeval(self.atime), to_timeval(self.mtime)];
+            let times = [to_timespec(self.atime), to_timespec(self.mtime)];
             unsafe {
-                libc::utimes(path_cstr.as_ptr(), times.as_ptr());
+                libc::utimensat(libc::AT_FDCWD, path_cstr.as_ptr(), times.as_ptr(), 0);
             }
         }
 

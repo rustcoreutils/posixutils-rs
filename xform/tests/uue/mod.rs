@@ -231,7 +231,7 @@ fn uuencode_single_operand_reads_stdin() {
     let payload = "hello from stdin\n";
     let enc = run_test_base(
         &String::from("uuencode"),
-        &vec![String::from("thedata")],
+        &[String::from("thedata")],
         payload.as_bytes(),
     );
     assert_eq!(
@@ -251,7 +251,7 @@ fn uuencode_single_operand_reads_stdin() {
     // Round-trip through uudecode -o - to confirm stdin was the input.
     let dec = run_test_base(
         &String::from("uudecode"),
-        &vec![String::from("-o"), String::from("-")],
+        &[String::from("-o"), String::from("-")],
         &enc.stdout,
     );
     assert_eq!(
@@ -405,7 +405,7 @@ fn uudecode_overwrites_existing_writable_file() {
     std::fs::write(&target, b"OLD CONTENT").unwrap();
     let output = run_test_base(
         &String::from("uudecode"),
-        &vec![String::from("-o"), target.to_str().unwrap().to_string()],
+        &[String::from("-o"), target.to_str().unwrap().to_string()],
         b"begin-base64 644 ignored\naGkK\n====\n",
     );
     let code = output.status.code();
@@ -434,7 +434,7 @@ fn uudecode_readonly_target_errors() {
 
     let output = run_test_base(
         &String::from("uudecode"),
-        &vec![String::from("-o"), target.to_str().unwrap().to_string()],
+        &[String::from("-o"), target.to_str().unwrap().to_string()],
         b"begin-base64 644 ignored\naGkK\n====\n",
     );
 
@@ -458,7 +458,7 @@ fn uudecode_readonly_target_errors() {
 fn uuencode_empty_input_roundtrips() {
     // Empty input still emits a begin header, the zero-length backtick line,
     // and end; decoding it yields no bytes.
-    let enc = run_test_base(&String::from("uuencode"), &vec![String::from("empty")], b"");
+    let enc = run_test_base(&String::from("uuencode"), &[String::from("empty")], b"");
     assert_eq!(
         enc.status.code(),
         Some(0),
@@ -473,7 +473,7 @@ fn uuencode_empty_input_roundtrips() {
 
     let dec = run_test_base(
         &String::from("uudecode"),
-        &vec![String::from("-o"), String::from("-")],
+        &[String::from("-o"), String::from("-")],
         &enc.stdout,
     );
     assert_eq!(dec.status.code(), Some(0));
@@ -486,7 +486,7 @@ fn decode_pathname_to_stdout_roundtrip(decode_pathname: &str) {
     let payload = "round trip via header cookie\n";
     let enc = run_test_base(
         &String::from("uuencode"),
-        &vec![String::from(decode_pathname)],
+        &[String::from(decode_pathname)],
         payload.as_bytes(),
     );
     assert_eq!(

@@ -1297,3 +1297,177 @@ fn test_compress_bits_16_accepted_and_roundtrips(/* #C4 */) {
 
     cleanup_file(&compressed_file);
 }
+
+// =============================================================================
+// -v verbose output, and metadata preservation
+// =============================================================================
+
+/// Create a scratch file inside a caller-owned temp directory.
+///
+/// Deliberately *not* under `tests/compress/`: a failing assertion panics
+/// before any cleanup runs, and a scratch file left in the source tree is both
+/// repo trash and a hazard for the next `git add`. The `TempDir` the caller
+/// holds removes everything on unwind.
+fn scratch_file(dir: &tempfile::TempDir, name: &str, contents: &[u8]) -> PathBuf {
+    let path = dir.path().join(name);
+    let mut f = File::create(&path).unwrap();
+    f.write_all(contents).unwrap();
+    path
+}
+
+/// `-v` reports the compression achieved on stderr. The audit had no test for
+/// the *content* of that message, only that the flag was accepted.
+#[test]
+fn test_compress_verbose_reports_compression_percentage() {
+    // Highly compressible, so the percentage is comfortably positive.
+    let td = tempfile::tempdir().unwrap();
+    let source = scratch_file(&td, "verbose.txt", &b"aaaaaaaaaaaaaaaa\n".repeat(200));
+    let compressed = source.with_extension("txt.Z");
+
+    let mut reported = String::new();
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("compress"),
+            args: vec![String::from("-v"), source.to_str().unwrap().to_string()],
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            reported = String::from_utf8_lossy(&output.stderr).to_string();
+        },
+    );
+
+    assert!(
+        reported.contains("Compression:"),
+        "-v must report the compression ratio, got {reported:?}"
+    );
+    assert!(
+        reported.contains(source.to_str().unwrap()),
+        "-v must name the file, got {reported:?}"
+    );
+
+    // The percentage must be a real number, and positive for this input.
+    let pct: f64 = reported
+        .rsplit(' ')
+        .next()
+        .unwrap()
+        .trim()
+        .trim_end_matches('%')
+        .parse()
+        .unwrap_or_else(|_| panic!("could not parse a percentage out of {reported:?}"));
+    assert!(
+        pct > 50.0,
+        "200 copies of one line should compress well past 50%, got {pct}"
+    );
+
+    // The reported ratio must describe work actually done.
+    assert!(
+        compressed.exists(),
+        "compress did not produce {compressed:?}"
+    );
+    assert!(!source.exists(), "compress must remove the original");
+}
+
+/// Without `-v` nothing is written to stderr — the counterpart assertion, so
+/// the test above cannot pass just because some other message happens to match.
+#[test]
+fn test_compress_without_verbose_is_silent() {
+    let td = tempfile::tempdir().unwrap();
+    let source = scratch_file(&td, "quiet.txt", &b"aaaaaaaaaaaaaaaa\n".repeat(200));
+    let compressed = source.with_extension("txt.Z");
+
+    // run_test asserts stderr is empty.
+    run_test(TestPlan {
+        cmd: String::from("compress"),
+        args: vec![source.to_str().unwrap().to_string()],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    // Silence must mean "did the work quietly", not "did nothing".
+    assert!(
+        compressed.exists(),
+        "compress did not produce {compressed:?}"
+    );
+}
+
+/// The compressed file keeps the original's permission bits and modification
+/// time (`FileMetadata::apply_to`). Ownership is best-effort and only testable
+/// as root, so it is not asserted here.
+#[test]
+fn test_compress_preserves_mode_and_mtime() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let td = tempfile::tempdir().unwrap();
+    let source = scratch_file(
+        &td,
+        "preserve.txt",
+        &b"some content to compress\n".repeat(50),
+    );
+    let compressed = source.with_extension("txt.Z");
+
+    // A distinctive mode that will not arise by accident from the umask.
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o640)).unwrap();
+    let before = fs::metadata(&source).unwrap();
+    let want_mtime = before.modified().unwrap();
+
+    run_test(TestPlan {
+        cmd: String::from("compress"),
+        args: vec![source.to_str().unwrap().to_string()],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    let after = fs::metadata(&compressed).unwrap();
+    assert_eq!(
+        after.permissions().mode() & 0o777,
+        0o640,
+        "compress must carry the source's permission bits onto the .Z file"
+    );
+    assert_eq!(
+        after.modified().unwrap(),
+        want_mtime,
+        "compress must carry the source's mtime onto the .Z file"
+    );
+}
+
+/// Decompression restores the same metadata onto the recovered file.
+#[test]
+fn test_uncompress_preserves_mode_and_mtime() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let td = tempfile::tempdir().unwrap();
+    let source = scratch_file(&td, "restore.txt", &b"round trip content\n".repeat(50));
+    let compressed = source.with_extension("txt.Z");
+
+    run_test(TestPlan {
+        cmd: String::from("compress"),
+        args: vec![source.to_str().unwrap().to_string()],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    fs::set_permissions(&compressed, fs::Permissions::from_mode(0o604)).unwrap();
+    let want_mtime = fs::metadata(&compressed).unwrap().modified().unwrap();
+
+    run_test(TestPlan {
+        cmd: String::from("compress"),
+        args: vec![String::from("-d"), compressed.to_str().unwrap().to_string()],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    let after = fs::metadata(&source).unwrap();
+    assert_eq!(after.permissions().mode() & 0o777, 0o604);
+    assert_eq!(after.modified().unwrap(), want_mtime);
+}

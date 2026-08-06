@@ -601,7 +601,8 @@ returns a non-zero exit on a genuine error. **No Critical or Major defects.**
 - Writer-side note: the p-file `<login>` is `$USER`/`$LOGNAME` in our get/admin/delta (#X4); `sact` faithfully echoes it.
 
 ### Test coverage gaps
-- [ ] Multi-file header; directory/stdin operands; exact-format byte assertion (tests only `contains`); error-path exit (#S1).
+- [x] Multi-file header (`sact_multi_file_uses_the_pathname_header`, pinning the `"\n%s:\n"` shape and the five-field activity line rather than a `contains`), single-operand no-header counterpart, directory operand (`sact_directory_operand_expands`).
+- [x] **Error-path exit (#S1) — and this found the fix was incomplete.** #S1 was recorded fixed for *parse* failures, but `process_sfile` never checked that the s-file itself exists: it looked straight for the p-file and returned "no impending deltas" when absent. So `sact s.typo` was byte-for-byte identical to `sact` on a real file with nothing checked out — no output, no diagnostic, exit 0 — which is exactly the distinction EXIT STATUS 113803-113805 and STDERR 113796-113797 exist to draw. A nonexistent operand, and an operand that is not an SCCS file, now each produce a diagnostic and exit 1; the no-pending case still exits 0 silently (`sact_missing_operand_is_an_error`, `sact_no_pending_edit_is_silent_success`). The stale code comment claiming "cssc returns 0 for a nonexistent operand" was unverifiable — CSSC 1.4.1 has no `sact` subcommand at all.
 
 ---
 
@@ -737,7 +738,9 @@ expanded.
 - [x] 0 success / >0 error; no-pending → exit 1 — `unget.rs:213`.
 
 ### Test coverage gaps
-- [ ] Multi-file `\n%s:\n`; directory operand; `-` stdin; `-r` among several pending edits; CSSC p-file interop fixture.
+- [x] Multi-file `\n%s:\n` (`unget_multi_file_uses_the_pathname_header`); directory operand (`unget_directory_operand_expands`); `-` stdin list (`unget_dash_operand_reads_pathnames_from_stdin`); `-r` among several pending edits (`unget_r_selects_one_of_several_pending_edits`) plus the unknown-SID error leaving the p-file untouched (`unget_r_with_unknown_sid_is_an_error`).
+  Setting up two concurrent edits needs **both** the `b` and `j` flags: without `b`, `get -e -b` is *required* to be ignored (99079-99081), so there is only ever one entry to select from. Verified in passing that `-b` is correctly ignored when the flag is absent.
+- [ ] CSSC p-file interop fixture (reading a p-file CSSC wrote, and vice versa).
 
 ---
 
@@ -788,7 +791,8 @@ stdin-mode STDOUT format/order.
   (`LC_MESSAGES` hardcoded English pending #X9).
 
 ### Test coverage gaps
-- [ ] EXAMPLE from the spec; 0x20-vs-0x10 distinction; combined-bit OR cases.
+- [x] EXAMPLE from the spec (`val_reads_command_lines_from_standard_input` — `val -` reads a command line per input line and echoes only the erroring ones, per 120345-120355); 0x20-vs-0x10 distinction (`val_distinguishes_corrupted_from_unopenable`: checksum mismatch vs not-SCCS vs unopenable); 0x80 (`val_missing_file_argument_sets_high_bit`); combined-bit OR (`val_exit_status_ors_the_codes_of_all_operands`, 0x12 and 0x30, per 120336-120338).
+  *Oracle note:* CSSC 1.4.1 does **not** implement `val -` — it treats each whole input line as one filename — so it is the less conforming side here and cannot be used as an oracle for this form.
 
 ---
 
@@ -836,7 +840,7 @@ pre-Phase-11 `what.rs`, so the numbers named unrelated code.)*
 
 ### Test coverage gaps
 - [x] Binary/non-UTF-8 input (#W1) — covered by `what_binary_input_does_not_abort` (`tests/what/mod.rs:189`).
-- [ ] `-s` with multiple operands; stdin operand; two `@(#)` on one line; ELF/`.o` smoke test; multi-file mixed match/no-match exit code.
+- [x] `-s` per-file scope (`silent_stops_per_file_not_per_run` — the existing `-s` test used one operand, so per-file vs per-run was never shown); `-` is a filename, not stdin, since STDIN is "Not used" (122800-122801) (`dash_operand_is_a_filename_not_stdin`); two `@(#)` on one line are one ident, because `@(#)` is not in the terminator set (122786-122788) (`two_patterns_on_one_line_are_one_identification`) and the search resumes after a real terminator (`search_resumes_after_a_terminator`); ELF `.o` smoke test with a deterministic embedded ident (`finds_identification_in_an_elf_object`); mixed match/no-match exit (`exit_status_is_zero_when_any_file_matches`). **All verified byte-for-byte against CSSC 1.4.1**, including on an ELF binary.
 
 ---
 

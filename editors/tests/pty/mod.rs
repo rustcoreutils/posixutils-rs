@@ -429,3 +429,85 @@ fn test_pty_vi_nul_reinserts_previous_input() {
         "NUL in insert mode must re-insert the previous session's text"
     );
 }
+
+/// #V22: a TAB byte typed at a real terminal must reach the buffer.
+///
+/// This has to be a PTY test. `Editor::execute_keys` does its own
+/// byte-to-`Key` translation, so a headless test never touches
+/// `Key::from_byte` — which is exactly where TAB was being swallowed.
+#[test]
+fn test_pty_vi_tab_is_inserted() {
+    let td = tempdir().unwrap();
+    let file_path = td.path().join("tab.txt");
+    std::fs::write(&file_path, "").unwrap();
+
+    let mut vi = ViPtySession::new(&file_path, 25, 80);
+    vi.sleep_ms(500);
+    vi.keys("ia\tb\x1b");
+    vi.sleep_ms(100);
+    vi.keys(":wq\r");
+    vi.wait();
+
+    let contents = std::fs::read_to_string(&file_path).unwrap();
+    assert_eq!(
+        contents.trim_end(),
+        "a\tb",
+        "a typed TAB must land in the buffer, got {contents:?}"
+    );
+}
+
+/// #V23: `^V` followed by ESC inserts a literal ESC rather than leaving
+/// insert mode. Driven through the PTY so the escape byte goes through
+/// `InputReader::read_key`, which headless tests bypass.
+#[test]
+fn test_pty_vi_ctrl_v_inserts_literal_escape() {
+    let td = tempdir().unwrap();
+    let file_path = td.path().join("literal.txt");
+    std::fs::write(&file_path, "").unwrap();
+
+    let mut vi = ViPtySession::new(&file_path, 25, 80);
+    vi.sleep_ms(500);
+    // The ESC must be delivered in its own read. `InputReader` decides between
+    // a bare ESC and the start of an escape sequence by whether more bytes are
+    // already buffered, so writing "\x16\x1bt" in one go makes the reader take
+    // ESC+'t' as a sequence — which is what a human typing never produces.
+    vi.keys("i\x16");
+    vi.sleep_ms(100);
+    vi.keys("\x1b");
+    vi.sleep_ms(100);
+    vi.keys("tail");
+    vi.sleep_ms(100);
+    vi.keys("\x1b");
+    vi.sleep_ms(100);
+    vi.keys(":wq\r");
+    vi.wait();
+
+    let contents = std::fs::read_to_string(&file_path).unwrap();
+    assert_eq!(
+        contents.trim_end(),
+        "\x1btail",
+        "^V ESC must insert a literal ESC, got {contents:?}"
+    );
+}
+
+/// #V21: `>>` shifts by one shiftwidth, not by `shiftwidth` tab characters.
+#[test]
+fn test_pty_vi_shift_right_is_one_shiftwidth() {
+    let td = tempdir().unwrap();
+    let file_path = td.path().join("shift.txt");
+    std::fs::write(&file_path, "hello\n").unwrap();
+
+    let mut vi = ViPtySession::new(&file_path, 25, 80);
+    vi.sleep_ms(500);
+    vi.keys(">>");
+    vi.sleep_ms(100);
+    vi.keys(":wq\r");
+    vi.wait();
+
+    let contents = std::fs::read_to_string(&file_path).unwrap();
+    assert_eq!(
+        contents.trim_end(),
+        "\thello",
+        "one >> at shiftwidth 8 / tabstop 8 is a single tab, got {contents:?}"
+    );
+}

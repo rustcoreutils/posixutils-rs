@@ -53,17 +53,19 @@ silent data loss.
 | — | Minor | `@@` failed with `Buffer "@" is empty` |
 | — | Minor | `j` implemented one of POSIX's five join rules |
 
-**A second audit-the-audit pass (2026-08-06) found five more, two Critical.**
-The first three had each been ticked CONFORM by a prior pass; the last two had
-been recorded at the wrong severity. All five are open.
+**A second audit-the-audit pass (2026-08-06) found six more, three Critical.**
+Three of them had been ticked CONFORM by a prior pass, two had been recorded at
+the wrong severity, and #V27 was in no list at all. Four are now fixed.
 
-| New | Sev | Summary |
-|---|---|---|
-| #V21 | **Critical** | `>>` prepends **8 tabs** and `<<` strips **64 columns**: `shiftwidth` is passed into `shift_right`/`shift_left`'s repeat-**count** parameter. The count operand is silently dropped. Ticked CONFORM since the first pass; the tests call the functions directly and miss the wrong call path |
-| #V22 | **Critical** | TAB is silently discarded in insert mode — `Key::Tab` is never constructed (byte 9 → `Ctrl('i')`, which has no arm) |
-| #V24 | Major | `^T` indents at column 0 instead of the cursor, always by one tab, and bypasses `state.inserted_text` so `.`-repeat and undo lose it. Ticked CONFORM |
-| #V25 | Major | autoindent is **unimplemented**, not "PARTIAL" — `options.autoindent` is parsed but never read |
-| #V26 | Major | `^D` is **MISSING per spec**, not "PARTIAL": wrong precondition, wrong target (column 0, not the cursor), wrong units. Blocked on #V25 |
+| New | Sev | Summary | Status |
+|---|---|---|---|
+| #V27 | **Critical** | `u` after `A` corrupted the line: `InsertState::start_pos` was captured before the cursor was repositioned, so the undo record deleted from the wrong column. `Axy<ESC>u` on `base` left `sexy`. Also mis-anchored `^U`. Only `i` was unaffected — which is why every existing undo test passed | ✓ fixed |
+| #V21 | **Critical** | `>>` prepends **8 tabs** and `<<` strips **64 columns**: `shiftwidth` is passed into `shift_right`/`shift_left`'s repeat-**count** parameter. The count operand is silently dropped. Ticked CONFORM since the first pass; the tests call the functions directly and miss the wrong call path | ✓ fixed |
+| #V22 | **Critical** | TAB is silently discarded in insert mode — `Key::Tab` is never constructed (byte 9 → `Ctrl('i')`, which has no arm) | ✓ fixed |
+| #V23 | Major | `^V` is a total no-op, not merely lacking visual feedback | ✓ fixed |
+| #V24 | Major | `^T` indents at column 0 instead of the cursor, always by one tab, and bypasses `state.inserted_text` so `.`-repeat and undo lose it. Ticked CONFORM | ✓ fixed |
+| #V25 | Major | autoindent is **unimplemented**, not "PARTIAL" — `options.autoindent` is parsed but never read | open |
+| #V26 | Major | `^D` is **MISSING per spec**, not "PARTIAL": wrong precondition, wrong target (column 0, not the cursor), wrong units. Blocked on #V25 | open |
 
 **Portability note (2026-08-03).** The spec's first worked example uses `\<`
 and `\>`, which are a **GNU regex extension, not POSIX BRE** — BSD libc
@@ -87,9 +89,10 @@ in the undo model, which was the honest reason it had been deferred. `TERM`
 terminfo is the one item accepted as a deliberate non-goal, with rationale
 recorded inline.
 
-**Remaining open: 9** *(was recorded as 3 until the 2026-08-06 pass)* —
-#V20 (`U` is inert), #V21 (`>>`/`<<`), #V22 (TAB), #V23 (`^V`), #V24 (`^T`),
-#V25 (autoindent), #V26 (`^D`), and the remaining ex command modifier gaps
+**Remaining open: 4** *(recorded as 3 before the 2026-08-06 pass, which found
+five more plus #V27; #V21, #V22, #V23, #V24 and #V27 are now fixed)* —
+#V20 (`U` is inert), #V25 (autoindent), #V26 (`^D`, blocked on #V25), and the
+remaining ex command modifier gaps
 (that box was one opaque checkbox covering ~15 commands; it is now a named
 list, with `j`, `q`, `r`, `w`/`wq`/`x`, `l` and `@@` struck off).
 
@@ -98,6 +101,13 @@ were the ones ticked CONFORM**, not the ones left open. `<`/`>`, `^T` and TAB
 all had tests, and all three tests exercised a path the real keystroke never
 takes — direct function calls for `<`/`>`, and a `Key::Tab` variant that no
 input path constructs.
+
+The corollary, learned from #V27: **two translators that must agree will
+drift.** `Key::from_byte` and `Editor::execute_keys` each map bytes to keys,
+and TAB was wrong in both, so the headless suite happily agreed with itself
+while disagreeing with every real terminal. Where a second translator cannot be
+removed, the discriminating test has to be the unit test on the primary
+(`test_from_byte_tab_is_not_ctrl_i`) or a PTY test — not a headless one.
 
 ---
 
@@ -273,8 +283,10 @@ BRE veneer over an ERE engine. A handful of parsed-but-unhandled commands
 - [x] **#V1 — SIGWINCH not handled.** ✓ fixed (phase 5): new `vi/signals.rs` installs a SIGWINCH handler (atomic flag); the input loop catches the `EINTR` (`reader.rs` now surfaces it as `ViError::Interrupted`), calls `terminal.refresh_size()`, and `refresh_screen()` redraws at the new size. PTY test: `test_pty_vi_resize_survives_and_saves`.
 - [x] **#V2 — SIGCONT not handled.** ✓ fixed (phase 5): SIGCONT handler set; on resume the loop re-enables raw mode, re-enters the alternate screen, refreshes size, and redraws (`handle_pending_signals`).
 - [x] **#V3 — SIGHUP not handled; no buffer preservation.** ✓ fixed (phase 6): new `vi/recover.rs` + SIGHUP/SIGTERM handlers (`signals.rs`). On hangup/termination, or EOF-on-input, a modified buffer is written to a recovery file under `$TMPDIR/vi.recover` (0600) and the user is mailed (best effort). *(behaviorally verified: `kill -HUP` on a modified ex session writes the recovery file.)*
-- [ ] **#V21 — `>>` prepends 8 tabs and `<<` strips 64 columns.** *(Found 2026-08-06; missed by every prior pass, which ticked `<` `>` as CONFORM.)* `shift_right`/`shift_left` (`command/operator.rs:129,153`) take the operator **repeat count** as their third parameter — `let indent = "\t".repeat(count.max(1))` (`:137-138`) and `let shift_amount = count.max(1) * 8` (`:156`). But all four call sites pass `self.options.shiftwidth` into that slot (`editor/mod.rs:1864,1867,1879,1882`). With the default `shiftwidth = 8`, a single `>>` inserts **eight tab characters** and `<<` strips **64 columns** of indent. The `count` is silently discarded, so `3>>` shifts the same as `>>`. `operator.rs:173` separately hardcodes `removed += 8` for a tab where `options.tabstop` belongs. The unit tests at `operator.rs:421,432` and the integration tests at `tests/integration/mod.rs:404,415` call the functions directly with `1`/`4`, so none of them exercise the real call path. Fix: give both functions `(count, opts: &Options)` and compute the target in display columns.
-- [ ] **#V22 — TAB does nothing in insert mode.** *(Found 2026-08-06.)* `Key::from_byte` (`input/key.rs:59`) maps bytes `1..=26` to `Key::Ctrl`, so byte 9 becomes `Key::Ctrl('i')` and `Key::Tab` is **never constructed anywhere in the crate**. `mode/insert.rs:177` matches `Key::Tab`, and there is no `Ctrl('i')` arm, so a typed TAB falls through to `_ => {}` (`insert.rs:198`) and is silently discarded. `Editor::execute_keys` (`editor/mod.rs:437-441`) reproduces the same mapping, so headless tests agree with real input and neither catches it. Byte 27 → `Key::Escape` makes the `Key::Ctrl('[')` arm at `insert.rs:193` dead for the same reason (harmless — `Key::Escape` is handled).
+- [x] **#V21 — `>>` prepended 8 tabs and `<<` stripped 64 columns.** *(Found 2026-08-06; missed by every prior pass, which ticked `<` `>` as CONFORM.)* `shift_right`/`shift_left` took the operator **repeat count** as their third parameter — `"\t".repeat(count.max(1))` and `count.max(1) * 8` — but all four call sites passed `self.options.shiftwidth` into that slot. With the default `shiftwidth = 8`, one `>>` inserted **eight tab characters** and `<<` stripped **64 columns**. The `count` was silently discarded, so `3>>` shifted like `>>`.
+  ✓ fixed 2026-08-06. Both functions now take `(shiftwidth, tabstop, registers)` and work in display columns: `leading_blank_width` measures the existing indent against `tabstop`, `render_indent` re-emits it (POSIX 95631 permits leading blanks to be "changed into other <blank> characters"). Empty lines are skipped on `>` (95643), and `<` clamps at column 0 instead of eating text (95630-95632). The count belongs to the range, which the caller already resolves. **Also fixed while here: neither operator copied the unshifted lines to the unnamed buffer**, which 95633/95645 and 121138/121151 all require. Tests: `test_shift_right`, `test_shift_{right,left}_shiftwidth_differs_from_tabstop`, `test_shift_left_clamps_at_column_zero`, `test_shift_right_leaves_empty_lines_alone`, `test_shift_saves_unshifted_lines_to_unnamed_buffer`, headless `test_shift_right_inserts_one_shiftwidth_not_eight_tabs`, `test_shift_right_honors_set_shiftwidth`, and PTY `test_pty_vi_shift_right_is_one_shiftwidth`.
+- [x] **#V22 — TAB did nothing in insert mode.** *(Found 2026-08-06.)* `Key::from_byte` mapped bytes `1..=26` to `Key::Ctrl`, so byte 9 became `Key::Ctrl('i')` and `Key::Tab` was **never constructed anywhere in the crate**; `mode/insert.rs` matched `Key::Tab` and had no `Ctrl('i')` arm, so a typed TAB fell through the ignore-the-rest arm.
+  ✓ fixed 2026-08-06: `from_byte` maps 9 to `Key::Tab` ahead of the `1..=26` arm (byte 10 deliberately stays `Ctrl('j')` — insert mode matches it by that name), and `Editor::execute_keys` mirrors it. **The mirroring is the point**: the two translators disagreeing is what let this survive, and a headless test still cannot reach `from_byte`, so the discriminating tests are the unit test `test_from_byte_tab_is_not_ctrl_i` and PTY `test_pty_vi_tab_is_inserted`. The headless `test_tab_inserts_a_tab_in_insert_mode` passes either way and is kept only for the insert-mode half.
 
 #### Major
 - [x] **#V4 — `-r` recovery hard-errors and exits.** ✓ fixed (phase 6): `vi -r` lists recoverable buffers; `vi -r file` recovers the newest saved buffer for that file (`Editor::recover`). Stale recovery files (>14 days) are pruned at startup.
@@ -321,8 +333,8 @@ BRE veneer over an ERE engine. A handful of parsed-but-unhandled commands
 - [x] **`(` `)`** ✓ (phase 8, #V6); **`_`** ✓ (phase 8, #V7).
 - [x] Scrolling `^F ^B ^D ^U ^E ^Y z` CONFORM.
 - [x] **`^]`** ✓ tag jump (phase 7, #V5); **`^L`/`^R`** ✓ split (phase 8, #V14).
-- [x] Editing `i I a A o O c C cc d D dd x X r R y Y p P J ~ .` CONFORM.
-- [ ] **`<` / `>` DIVERGE (#V21)** — shift by 8 tabs / 64 columns and ignore the count. Previously ticked CONFORM on this line; the tests that "covered" them bypass the call path that is wrong.
+- [x] Editing `i I a A o O c C cc d D dd x X r R y Y p P J ~ .` CONFORM. *(`A`/`a`/`I`/`o`/`O` were un-undoable until #V27, 2026-08-06.)*
+- [x] **`<` / `>` (#V21)** — ✓ fixed 2026-08-06. Had shifted by 8 tabs / 64 columns and ignored the count; previously ticked CONFORM on the line above, because the tests that "covered" them bypassed the call path that was wrong.
 - [x] **`s`/`S`** — ✓ fixed (2026-08-02) as **#V17**. They were handled in the *pre-parser fast path* (`editor/mod.rs`, before keys reach the command parser), so besides not saving to a register they recorded **no undo** and accepted neither a count (`3s`) nor a register prefix (`"as`) — even though `'s'`/`'S'` were already in the parser's command table. Both fast-path arms are deleted; `s`/`S` now dispatch beside `c` and route through `command::operator::change`, inheriting its register, undo and cursor handling. Verified behaviorally identical to `cl`/`cc`, undo included. Tests `test_s_and_upper_s_behave_as_change_operators`, `test_s_accepts_a_count`, `test_upper_s_substitutes_whole_lines`, plus PTY `test_pty_vi_substitute_char_saves_to_register`.
 - [x] **#V19 — operators recorded no undo at all; `u` was not its own inverse.** ✓ fixed (2026-08-04). *(Found 2026-08-02 while verifying #V17; pre-existing, not introduced by it.)* The symptom recorded here was that a second `u` after `cl`/`s` on `abcdef` empties the line. The cause was broader: **`change` and `execute_delete` recorded nothing**, so `c`, `cc`, `s`, `S`, `C`, `d`, `dd` and `J` were all un-undoable — the line above ticks `d`/`dd`/`C`/`J` as CONFORM, which was wrong. Since `apply_inverse` rebuilds by position and length without checking what is actually there, an unrecorded removal does not merely fail to undo: the next `u` pops an unrelated older change and deletes characters that were never inserted.
 
@@ -334,9 +346,11 @@ BRE veneer over an ERE engine. A handful of parsed-but-unhandled commands
 
 #### Insert mode
 - [x] ESC, `^H`, `^W`, `^U` CONFORM — `mode/insert.rs`. ~~stty erase/kill MISSING (#V12)~~ ✓ fixed 2026-08-02; ~~NUL re-input MISSING (#V15)~~ ✓ fixed 2026-08-02.
-- [ ] **TAB MISSING (#V22)** — silently discarded; `Key::Tab` is unreachable.
-- [ ] **`^V` MISSING (#V23)** — not "no visual feedback" as this box previously read: it is a **total no-op**. `mode/insert.rs:189-192` is an empty arm whose comment defers to "the caller", but `handle_insert_key` (`editor/mod.rs:971-1009`) has no literal-next state and no pending-literal flag exists anywhere. `^Q` (the spec's synonym, 121874) is likewise unhandled. Per 121870-121883 the next character must be taken literally except `^J`/`<newline>` (where the `^V` is *discarded* and the newline behaves normally), with a transient `^` displayed at the cursor.
-- [ ] **`^T` DIVERGES (#V24)** — previously ticked CONFORM on the line above. `indent_line` (`mode/insert.rs:337-347`) does `set_column(0); insert_char('\t'); set_column(old_col + 1)`: it indents at **column 0 rather than the cursor**, always inserts exactly one tab instead of advancing to the next `shiftwidth` boundary (121846), and writes straight to the buffer without touching `state.inserted_text` — so `.`-repeat and the insert-session undo record both silently lose it.
+- [x] **TAB (#V22)** — ✓ fixed 2026-08-06; see the Critical entry above.
+- [x] **`^V` (#V23)** — not "no visual feedback" as this box previously read: it was a **total no-op**. The arm was empty, its comment deferred to "the caller", and `handle_insert_key` had no literal-next state.
+  ✓ fixed 2026-08-06. `InsertState::pending_literal` (it belongs to the session, so a pending literal cannot survive an ESC) is set by `^V` **and `^Q`** (the spec's synonym, 121874) and consumed at the top of `process_insert_key`, before any special meaning is consulted. `Key::literal_char()` does the key→character mapping. `^V` before `^J`/`<newline>` discards the `^V` and lets the newline behave normally (121875-121877). The literal goes in through `insert_char`, so `state.inserted_text` records it and both `.`-repeat and the session undo entry pick it up. The transient `^` is drawn in `refresh_screen` after the cursor move, then the cursor steps back onto it (121878-121880) — safe without bookkeeping because that is a full redraw per keystroke. Tests: `test_ctrl_v_inserts_literal_escape`, `..._literal_control_char`, `..._before_newline_is_discarded`, `..._consumes_only_one_key`, `..._literal_is_recorded_for_dot_repeat`, `test_ctrl_q_is_a_synonym_for_ctrl_v`, PTY `test_pty_vi_ctrl_v_inserts_literal_escape`.
+- [x] **`^T` (#V24)** — previously ticked CONFORM on the line above. `indent_line` did `set_column(0); insert_char('\t'); set_column(old_col + 1)`: it indented at **column 0 rather than the cursor**, always by exactly one tab instead of advancing to the next `shiftwidth` boundary (121846), and wrote straight to the buffer without touching `state.inserted_text`, so `.`-repeat and the insert-session undo record both lost it.
+  ✓ fixed 2026-08-06: it now measures the cursor's display column against `tabstop`, inserts `sw - (col % sw)` blanks at the cursor, and routes every one through `insert_char`. Tests `test_ctrl_t_indents_at_cursor_to_shiftwidth_boundary`, `test_ctrl_t_is_recorded_in_the_insert_session`.
 - [ ] **autoindent MISSING (#V25)** — not "PARTIAL" as this box previously read. `options.autoindent` (`options.rs:40`) is parsed, printed and queried (`options.rs:240,328,374,459`) but **never read** by `buffer/`, `mode/insert.rs` or `editor/`: no `o`/`O` indent derivation (121501), no indent carried across `<newline>` (121826), no autoindent-only-line discard on ESC (121912).
 - [ ] **`^D` MISSING per spec (#V26)** — the audit previously called this "PARTIAL (`0^D`/`^^D` edge cases)", but `dedent_line` (`mode/insert.rs:349-386`) is the wrong model on all three counts POSIX 121767-121788 specifies. (1) **Precondition:** `^D` applies only when the cursor follows autoindent characters, optionally plus one typed `'0'` or `'^'`; otherwise it "shall have no special meaning" (i.e. inserts a literal `\x04`, or is discarded in column 1). `dedent_line` has no precondition. (2) **Target:** `^D` erases backwards from the *cursor*; `dedent_line` unconditionally does `set_column(0)` and deletes there — that is a `<<`, not a `^D`. (3) **Units:** shiftwidth boundaries in display columns, not the hardcoded `count < 8` at `insert.rs:373`. Since `^D` is defined entirely in terms of autoindent characters, this is blocked on #V25.
 

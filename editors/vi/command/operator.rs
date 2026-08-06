@@ -125,20 +125,103 @@ pub fn yank(
     Ok(OperatorResult::cursor(cursor).with_text(text))
 }
 
+/// Width in display columns of a line's leading <blank> run, plus the byte
+/// offset of the first non-<blank>.
+///
+/// A tab advances to the next `tabstop` boundary rather than counting as a
+/// fixed width, so `\t` in column 0 with `tabstop=8` is 8 columns but `\t`
+/// after three spaces is only 5.
+fn leading_blank_width(content: &str, tabstop: usize) -> (usize, usize) {
+    let ts = tabstop.max(1);
+    let mut width = 0usize;
+    let mut offset = 0usize;
+    for (byte, c) in content.char_indices() {
+        match c {
+            '\t' => width += ts - (width % ts),
+            ' ' => width += 1,
+            _ => {
+                offset = byte;
+                return (width, offset);
+            }
+        }
+        offset = byte + c.len_utf8();
+    }
+    (width, offset)
+}
+
+/// Render an indent of `width` display columns as tabs plus spaces.
+///
+/// POSIX 95631 permits leading <blank> characters to be "changed into other
+/// <blank> characters" when shifting, so re-rendering the run is conforming.
+fn render_indent(width: usize, tabstop: usize) -> String {
+    let ts = tabstop.max(1);
+    let tabs = width / ts;
+    let spaces = width % ts;
+    let mut s = String::with_capacity(tabs + spaces);
+    for _ in 0..tabs {
+        s.push('\t');
+    }
+    for _ in 0..spaces {
+        s.push(' ');
+    }
+    s
+}
+
+/// Copy the lines about to be shifted into the unnamed buffer, in line mode.
+///
+/// POSIX 95633/95645 (ex `<`/`>`) and 121138/121151 (vi `<`/`>`) all require
+/// this; it was missing entirely.
+fn save_shift_lines(
+    buffer: &Buffer,
+    start_line: usize,
+    end_line: usize,
+    registers: &mut Registers,
+) {
+    let mut text = String::new();
+    for line_num in start_line..=end_line {
+        if let Some(line) = buffer.line(line_num) {
+            text.push_str(line.content());
+            text.push('\n');
+        }
+    }
+    if !text.is_empty() {
+        registers.set_unnamed(RegisterContent::new(text, true));
+    }
+}
+
 /// Shift right operator (>).
-pub fn shift_right(buffer: &mut Buffer, range: Range, count: usize) -> Result<OperatorResult> {
+///
+/// `shiftwidth` is the number of display columns to shift by, not a repeat
+/// count: POSIX 121149-121151 says `>` shifts "one shiftwidth ... as described
+/// by the ex > command", and the ex command's amount is the number of command
+/// characters times `shiftwidth` (95640-95642). The `count` prefix selects the
+/// *text region* instead, which the caller has already resolved into `range`.
+pub fn shift_right(
+    buffer: &mut Buffer,
+    range: Range,
+    shiftwidth: usize,
+    tabstop: usize,
+    registers: &mut Registers,
+) -> Result<OperatorResult> {
     let start_line = range.start_line();
     let end_line = range.end_line();
 
+    save_shift_lines(buffer, start_line, end_line, registers);
+
     for line_num in start_line..=end_line {
         if let Some(line) = buffer.line(line_num) {
-            if !line.is_empty() {
-                // Add tabs for shift
-                let tab_count = count.max(1);
-                let indent = "\t".repeat(tab_count);
-                let new_content = format!("{}{}", indent, line.content());
-                buffer.replace_line(line_num, &new_content)?;
+            // "Empty lines shall not be changed" (95643-95644).
+            if line.is_empty() {
+                continue;
             }
+            let content = line.content().to_string();
+            let (width, offset) = leading_blank_width(&content, tabstop);
+            let new_content = format!(
+                "{}{}",
+                render_indent(width + shiftwidth, tabstop),
+                &content[offset..]
+            );
+            buffer.replace_line(line_num, &new_content)?;
         }
     }
 
@@ -150,40 +233,39 @@ pub fn shift_right(buffer: &mut Buffer, range: Range, count: usize) -> Result<Op
 }
 
 /// Shift left operator (<).
-pub fn shift_left(buffer: &mut Buffer, range: Range, count: usize) -> Result<OperatorResult> {
+///
+/// See `shift_right` for why `shiftwidth` is a column count and not a repeat
+/// count. Shifting past column 0 clamps rather than eating text: only leading
+/// <blank> characters may be deleted or changed (95630-95632).
+pub fn shift_left(
+    buffer: &mut Buffer,
+    range: Range,
+    shiftwidth: usize,
+    tabstop: usize,
+    registers: &mut Registers,
+) -> Result<OperatorResult> {
     let start_line = range.start_line();
     let end_line = range.end_line();
-    let shift_amount = count.max(1) * 8; // Assume shiftwidth of 8
+
+    save_shift_lines(buffer, start_line, end_line, registers);
 
     for line_num in start_line..=end_line {
         if let Some(line) = buffer.line(line_num) {
-            let content = line.content();
+            let content = line.content().to_string();
             if content.is_empty() {
                 continue;
             }
 
-            // Count leading whitespace
-            let mut removed = 0;
-            let mut skip_chars = 0;
-            for c in content.chars() {
-                if removed >= shift_amount {
-                    break;
-                }
-                if c == '\t' {
-                    removed += 8;
-                    skip_chars += 1;
-                } else if c == ' ' {
-                    removed += 1;
-                    skip_chars += 1;
-                } else {
-                    break;
-                }
+            let (width, offset) = leading_blank_width(&content, tabstop);
+            if width == 0 {
+                continue;
             }
-
-            if skip_chars > 0 {
-                let new_content: String = content.chars().skip(skip_chars).collect();
-                buffer.replace_line(line_num, &new_content)?;
-            }
+            let new_content = format!(
+                "{}{}",
+                render_indent(width.saturating_sub(shiftwidth), tabstop),
+                &content[offset..]
+            );
+            buffer.replace_line(line_num, &new_content)?;
         }
     }
 
@@ -416,23 +498,99 @@ mod tests {
     #[test]
     fn test_shift_right() {
         let mut buf = Buffer::from_text("hello\nworld");
+        let mut regs = Registers::new();
         let range = Range::lines(Position::new(1, 0), Position::new(2, 0));
 
-        shift_right(&mut buf, range, 1).unwrap();
+        // One shiftwidth of 8 columns, tabstop 8 -> exactly one tab.
+        shift_right(&mut buf, range, 8, 8, &mut regs).unwrap();
 
-        assert!(buf.line(1).unwrap().content().starts_with('\t'));
-        assert!(buf.line(2).unwrap().content().starts_with('\t'));
+        assert_eq!(buf.line(1).unwrap().content(), "\thello");
+        assert_eq!(buf.line(2).unwrap().content(), "\tworld");
     }
 
     #[test]
     fn test_shift_left() {
         let mut buf = Buffer::from_text("\thello\n\tworld");
+        let mut regs = Registers::new();
         let range = Range::lines(Position::new(1, 0), Position::new(2, 0));
 
-        shift_left(&mut buf, range, 1).unwrap();
+        shift_left(&mut buf, range, 8, 8, &mut regs).unwrap();
 
-        assert!(!buf.line(1).unwrap().content().starts_with('\t'));
-        assert!(!buf.line(2).unwrap().content().starts_with('\t'));
+        assert_eq!(buf.line(1).unwrap().content(), "hello");
+        assert_eq!(buf.line(2).unwrap().content(), "world");
+    }
+
+    // #V21: shiftwidth is a column count, not a repeat count, and it is
+    // independent of tabstop. With sw=4 and ts=8 the two hardcoded 8s in the
+    // pre-fix code gave the wrong answer in both directions.
+    #[test]
+    fn test_shift_right_shiftwidth_differs_from_tabstop() {
+        let mut buf = Buffer::from_text("hello");
+        let mut regs = Registers::new();
+        let range = Range::lines(Position::new(1, 0), Position::new(1, 0));
+
+        // 0 + 4 = 4 columns; below the tabstop, so four spaces and no tab.
+        shift_right(&mut buf, range, 4, 8, &mut regs).unwrap();
+        assert_eq!(buf.line(1).unwrap().content(), "    hello");
+
+        // 4 + 4 = 8 columns; now exactly one tabstop.
+        let range = Range::lines(Position::new(1, 0), Position::new(1, 0));
+        shift_right(&mut buf, range, 4, 8, &mut regs).unwrap();
+        assert_eq!(buf.line(1).unwrap().content(), "\thello");
+    }
+
+    #[test]
+    fn test_shift_left_shiftwidth_differs_from_tabstop() {
+        // One tab is 8 columns; removing a 4-column shiftwidth leaves 4.
+        let mut buf = Buffer::from_text("\thello");
+        let mut regs = Registers::new();
+        let range = Range::lines(Position::new(1, 0), Position::new(1, 0));
+
+        shift_left(&mut buf, range, 4, 8, &mut regs).unwrap();
+        assert_eq!(buf.line(1).unwrap().content(), "    hello");
+    }
+
+    // Shifting left past column 0 clamps; only leading blanks may be removed
+    // (POSIX 95630-95632). The pre-fix code stripped up to 64 columns.
+    #[test]
+    fn test_shift_left_clamps_at_column_zero() {
+        let mut buf = Buffer::from_text("  hello");
+        let mut regs = Registers::new();
+        let range = Range::lines(Position::new(1, 0), Position::new(1, 0));
+
+        shift_left(&mut buf, range, 8, 8, &mut regs).unwrap();
+        assert_eq!(buf.line(1).unwrap().content(), "hello");
+    }
+
+    // "Empty lines shall not be changed" (POSIX 95643-95644).
+    #[test]
+    fn test_shift_right_leaves_empty_lines_alone() {
+        let mut buf = Buffer::from_text("hello\n\nworld");
+        let mut regs = Registers::new();
+        let range = Range::lines(Position::new(1, 0), Position::new(3, 0));
+
+        shift_right(&mut buf, range, 8, 8, &mut regs).unwrap();
+
+        assert_eq!(buf.line(1).unwrap().content(), "\thello");
+        assert_eq!(buf.line(2).unwrap().content(), "");
+        assert_eq!(buf.line(3).unwrap().content(), "\tworld");
+    }
+
+    // The unshifted lines go to the unnamed buffer in line mode
+    // (POSIX 95633-95634, 121138, 121151). This was missing entirely.
+    #[test]
+    fn test_shift_saves_unshifted_lines_to_unnamed_buffer() {
+        let mut buf = Buffer::from_text("hello\nworld");
+        let mut regs = Registers::new();
+        let range = Range::lines(Position::new(1, 0), Position::new(2, 0));
+
+        shift_right(&mut buf, range, 8, 8, &mut regs).unwrap();
+
+        let unnamed = regs
+            .get_unnamed()
+            .expect("shift must set the unnamed buffer");
+        assert_eq!(unnamed.text, "hello\nworld\n");
+        assert!(unnamed.linewise, "the unnamed buffer must be line mode");
     }
 
     #[test]

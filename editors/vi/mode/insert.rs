@@ -18,6 +18,7 @@ use super::mode::InsertKind;
 use crate::buffer::{char_index_at_byte, Buffer, Position};
 use crate::error::{Result, ViError};
 use crate::input::Key;
+use crate::options::Options;
 
 /// Insert mode state.
 #[derive(Debug)]
@@ -39,6 +40,11 @@ pub struct InsertState {
     /// Text inserted by the *previous* insert session, which a NUL re-inserts
     /// (#V15).
     pub previous_insert: String,
+    /// A `^V`/`^Q` was entered and the next key is taken literally (#V23).
+    ///
+    /// Lives here rather than on `Editor` so it dies with the insert session:
+    /// a pending literal must not survive an ESC.
+    pub pending_literal: bool,
 }
 
 impl InsertState {
@@ -53,6 +59,7 @@ impl InsertState {
             erase_char: None,
             kill_char: None,
             previous_insert: String::new(),
+            pending_literal: false,
         }
     }
 
@@ -123,12 +130,48 @@ pub fn enter_insert_mode(buffer: &mut Buffer, kind: InsertKind) -> Result<Insert
         }
     }
 
+    // Re-anchor to where text will actually be typed (#V27).
+    //
+    // `start_pos` was captured before the match, i.e. before the cursor was
+    // repositioned, so it was only correct for `i` (and `c`/`s`, which do not
+    // move here). For `a`, `I`, `A`, `o` and `O` it named the pre-command
+    // cursor, and both consumers -- the undo record in `handle_insert_key` and
+    // the `^U` floor in `delete_to_line_start` -- then worked from the wrong
+    // column. `A` was the worst case: `Axy<ESC>u` on "base" removed two
+    // characters from column 0 and left "sexy".
+    state.start_pos = buffer.cursor();
+
     Ok(state)
 }
 
 /// Process a key in insert mode.
 /// Returns Ok(true) if should exit insert mode.
-pub fn process_insert_key(buffer: &mut Buffer, key: Key, state: &mut InsertState) -> Result<bool> {
+pub fn process_insert_key(
+    buffer: &mut Buffer,
+    key: Key,
+    state: &mut InsertState,
+    opts: &Options,
+) -> Result<bool> {
+    // A pending ^V/^Q consumes this key literally, before any special meaning
+    // is consulted (POSIX 121870-121872).
+    if state.pending_literal {
+        state.pending_literal = false;
+        // "If a <control>-V or <control>-Q is entered before a <control>-J or
+        // <newline>, the <control>-V or <control>-Q character shall be
+        // discarded, and the <control>-J or <newline> shall behave as
+        // described in the <newline> command character" (121875-121877).
+        if matches!(key, Key::Enter | Key::Ctrl('j')) {
+            insert_newline(buffer, state);
+            return Ok(false);
+        }
+        // Route through insert_char so `inserted_text` records the literal and
+        // both '.' repeat and the insert-session undo entry pick it up.
+        if let Some(c) = key.literal_char() {
+            insert_char(buffer, c, state);
+        }
+        return Ok(false);
+    }
+
     match key {
         Key::Escape => {
             // Exit insert mode
@@ -180,15 +223,17 @@ pub fn process_insert_key(buffer: &mut Buffer, key: Key, state: &mut InsertState
         }
         Key::Ctrl('t') => {
             // Shift line right (indent)
-            indent_line(buffer);
+            indent_line(buffer, state, opts);
         }
         Key::Ctrl('d') => {
             // Shift line left (dedent)
             dedent_line(buffer);
         }
-        Key::Ctrl('v') => {
-            // Next character literal (handled by caller)
-            // For now, just ignore
+        // ^V, and its synonym ^Q (121874), take the next character literally.
+        // Nothing enters the buffer here, so the current line and column are
+        // unchanged (121882-121883).
+        Key::Ctrl('v') | Key::Ctrl('q') => {
+            state.pending_literal = true;
         }
         Key::Ctrl('[') => {
             // Also escape
@@ -334,16 +379,45 @@ fn insert_newline(buffer: &mut Buffer, state: &mut InsertState) {
     state.inserted_text.push('\n');
 }
 
-/// Indent current line (Ctrl-T).
-fn indent_line(buffer: &mut Buffer) {
-    let pos = buffer.cursor();
+/// Insert blanks at the cursor up to the next shiftwidth boundary (Ctrl-T).
+///
+/// POSIX 121843-121847: "Behave as if the user entered the minimum number of
+/// <blank> characters necessary to move the cursor forward to the column
+/// position after the next shiftwidth boundary", with the resulting column
+/// being `column + shiftwidth - ((column - 1) % shiftwidth)`.
+///
+/// The previous implementation inserted exactly one tab at *column 0* and
+/// never touched `state.inserted_text`, so it indented the wrong place by the
+/// wrong amount and `.`-repeat and undo both lost it (#V24).
+fn indent_line(buffer: &mut Buffer, state: &mut InsertState, opts: &Options) {
+    let sw = opts.shiftwidth.max(1);
+    let ts = opts.tabstop.max(1);
 
-    // Insert a tab at start of line
-    // For simplicity, use shiftwidth of 8 (tabs)
-    let old_col = pos.column;
-    buffer.set_column(0);
-    buffer.insert_char('\t');
-    buffer.set_column(old_col + 1);
+    let pos = buffer.cursor();
+    let content = buffer
+        .line(pos.line)
+        .map(|l| l.content().to_string())
+        .unwrap_or_default();
+
+    // Display column of the cursor, expanding tabs against the tabstop.
+    let mut col = 0usize;
+    for (byte, c) in content.char_indices() {
+        if byte >= pos.column {
+            break;
+        }
+        if c == '\t' {
+            col += ts - (col % ts);
+        } else {
+            col += 1;
+        }
+    }
+
+    // Blanks needed to reach the next shiftwidth boundary. Already being on a
+    // boundary advances a full shiftwidth rather than inserting nothing.
+    let needed = sw - (col % sw);
+    for _ in 0..needed {
+        insert_char(buffer, ' ', state);
+    }
 }
 
 /// Dedent current line (Ctrl-D).

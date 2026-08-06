@@ -101,17 +101,27 @@ fn classify(symbol: &Symbol<'_, '_>, section_kinds: &HashMap<SectionIndex, Secti
 
 /// Whether a symbol passes the active filters (-f/-g/-u/-e).
 fn included(symbol: &Symbol<'_, '_>, args: &Args) -> bool {
-    // The unnamed null symbol (index 0) is not part of the name list.
-    if symbol.name().map(str::is_empty).unwrap_or(true) {
-        return false;
-    }
     match symbol.kind() {
         // File-name symbols are never part of the name list.
         SymbolKind::File => return false,
         // The redundant section symbols (.text/.data/.bss) are suppressed by
         // default and only shown with -f (#N10).
-        SymbolKind::Section if !args.full => return false,
+        SymbolKind::Section => {
+            if !args.full {
+                return false;
+            }
+            // Checked before the empty-name guard below: an ELF section symbol
+            // has `st_name == 0`, so its *symbol* name is empty and the guard
+            // would drop it before -f was ever consulted — which is why -f
+            // produced output identical to the default. Its display name comes
+            // from the section it refers to (`section_symbol_name`).
+            return true;
+        }
         _ => {}
+    }
+    // The unnamed null symbol (index 0) is not part of the name list.
+    if symbol.name().map(str::is_empty).unwrap_or(true) {
+        return false;
     }
     if args.global && !symbol.is_global() {
         return false;
@@ -132,6 +142,24 @@ fn included(symbol: &Symbol<'_, '_>, args: &Args) -> bool {
     true
 }
 
+/// Display name for a symbol.
+///
+/// Section symbols carry no name of their own (ELF `st_name == 0`), so their
+/// name is that of the section they refer to — which is the whole point of
+/// `-f`, whose output is `.text`/`.data`/`.bss`.
+fn section_symbol_name(file: &object::File<'_>, symbol: &Symbol<'_, '_>) -> String {
+    if symbol.kind() == SymbolKind::Section {
+        if let SymbolSection::Section(index) = symbol.section() {
+            if let Ok(section) = file.section_by_index(index) {
+                if let Ok(name) = section.name() {
+                    return name.to_string();
+                }
+            }
+        }
+    }
+    symbol.name().unwrap_or("<unknown>").to_string()
+}
+
 /// Collect and sort the symbols of one parsed object.
 fn collect_symbols(file: &object::File<'_>, args: &Args) -> Vec<SymInfo> {
     let section_kinds: HashMap<SectionIndex, SectionKind> =
@@ -148,7 +176,7 @@ fn collect_symbols(file: &object::File<'_>, args: &Args) -> Vec<SymInfo> {
         .iter()
         .filter(|s| included(s, args))
         .map(|s| SymInfo {
-            name: s.name().unwrap_or("<unknown>").to_string(),
+            name: section_symbol_name(file, s),
             value: s.address(),
             size: s.size(),
             type_char: classify(s, &section_kinds),

@@ -1756,3 +1756,301 @@ fn test_nm_requires_operand() {
         .expect("run nm");
     assert!(!out.status.success(), "nm with no operand must fail");
 }
+
+/// A fixture with an external symbol, a static object, a static function and an
+/// undefined reference, so the `-g`/`-u`/`-e` filters can be told apart.
+const NM_SCOPE_SRC: &str = r#"
+int alpha_global = 1;
+static int beta_static = 2;
+static int gamma_static_fn(void) { return beta_static; }
+int mid_func(void) { return gamma_static_fn(); }
+extern int undef_sym(void);
+int use_undef(void) { return undef_sym(); }
+"#;
+
+// `-e` writes "only external (global) and static symbol information". For an
+// object compiled from C every symbol is one or the other, so this is not a
+// *narrowing* filter there — the assertion is that it retains both classes,
+// which is what the spec mandates. (`-g`, tested separately, is the narrowing
+// one: it drops the statics.)
+#[test]
+fn test_nm_external_and_static_filter() {
+    let td = tempfile::tempdir().unwrap();
+    let obj = nm_compile_obj(td.path(), "nmscope", NM_SCOPE_SRC);
+
+    let out = nm_run(&["-e", obj.to_str().unwrap()]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let names: Vec<&str> = stdout.lines().map(nm_line_name).collect();
+
+    for want in ["alpha_global", "mid_func", "use_undef"] {
+        assert!(
+            names.contains(&want),
+            "-e dropped external {want}: {stdout}"
+        );
+    }
+    for want in ["beta_static", "gamma_static_fn"] {
+        assert!(names.contains(&want), "-e dropped static {want}: {stdout}");
+    }
+
+    // -g is the narrowing counterpart: statics must be gone.
+    let g = nm_run(&["-g", obj.to_str().unwrap()]);
+    let g_stdout = String::from_utf8_lossy(&g.stdout);
+    let g_names: Vec<&str> = g_stdout.lines().map(nm_line_name).collect();
+    assert!(!g_names.contains(&"beta_static"), "-g kept a static");
+    assert!(g_names.contains(&"alpha_global"), "-g dropped a global");
+}
+
+// `-f` produces "full output", i.e. it adds the redundant section symbols that
+// the default suppresses.
+//
+// This did not work at all until 2026-08-06: an ELF section symbol has
+// `st_name == 0`, so its symbol name is empty, and the filter's
+// "skip unnamed symbols" guard ran *before* the `-f` check and dropped every
+// one of them. `nm -f` therefore printed exactly what plain `nm` printed. The
+// section symbol's display name comes from the section it refers to.
+#[test]
+fn test_nm_full_output_adds_section_symbols() {
+    let td = tempfile::tempdir().unwrap();
+    let obj = nm_compile_obj(td.path(), "nmfull", NM_SCOPE_SRC);
+
+    let plain = nm_run(&[obj.to_str().unwrap()]);
+    let full = nm_run(&["-f", obj.to_str().unwrap()]);
+    assert!(plain.status.success() && full.status.success());
+
+    let plain_out = String::from_utf8_lossy(&plain.stdout);
+    let full_out = String::from_utf8_lossy(&full.stdout);
+    let plain_names: Vec<&str> = plain_out.lines().map(nm_line_name).collect();
+    let full_names: Vec<&str> = full_out.lines().map(nm_line_name).collect();
+
+    assert!(
+        full_names.contains(&".text"),
+        "-f must emit the .text section symbol, got:\n{full_out}"
+    );
+    assert!(
+        !plain_names.contains(&".text"),
+        "the default must suppress section symbols, got:\n{plain_out}"
+    );
+    // -f is additive: every default symbol is still present.
+    for name in &plain_names {
+        assert!(full_names.contains(name), "-f lost {name}:\n{full_out}");
+    }
+    assert!(
+        full_names.len() > plain_names.len(),
+        "-f must add symbols, not just reorder them"
+    );
+}
+
+// A file that cannot be opened, and one that is not an object file, must both
+// be diagnosed on stderr with a non-zero exit — not silently skipped.
+#[test]
+fn test_nm_reports_unreadable_and_unparseable_files() {
+    let missing = nm_run(&["/nonexistent/object/file.o"]);
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(
+        missing.stdout.is_empty(),
+        "nothing should reach stdout for a missing file"
+    );
+    let stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(
+        stderr.contains("/nonexistent/object/file.o"),
+        "the offending path must be named: {stderr}"
+    );
+
+    // A regular file that is not an object.
+    let td = tempfile::tempdir().unwrap();
+    let junk = td.path().join("not-an-object.txt");
+    fs::write(&junk, b"this is plain text, not ELF\n").unwrap();
+
+    let bad = nm_run(&[junk.to_str().unwrap()]);
+    assert_eq!(bad.status.code(), Some(1));
+    assert!(bad.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&bad.stderr);
+    assert!(
+        stderr.contains("not-an-object.txt"),
+        "the offending path must be named: {stderr}"
+    );
+}
+
+// #ST4: end-to-end proof that a stripped relocatable object is still usable.
+// `test_strip_keeps_symbols_in_relocatable` and
+// `test_strip_keeps_relocations_in_relocatable` assert the preconditions; this
+// asserts the consequence, by actually linking the stripped object and running
+// the result.
+#[test]
+fn test_strip_relocatable_object_still_links_and_runs() {
+    let td = tempfile::tempdir().unwrap();
+
+    let lib_c = td.path().join("lib.c");
+    let main_c = td.path().join("main.c");
+    fs::write(&lib_c, "int answer(void) { return 42; }\n").unwrap();
+    fs::write(
+        &main_c,
+        "extern int answer(void);\nint main(void) { return answer() == 42 ? 0 : 1; }\n",
+    )
+    .unwrap();
+
+    let lib_o = td.path().join("lib.o");
+    let compile = |src: &std::path::Path, obj: &std::path::Path| {
+        std::process::Command::new("cc")
+            .args(["-c", "-o", obj.to_str().unwrap(), src.to_str().unwrap()])
+            .status()
+            .expect("run cc")
+            .success()
+    };
+    assert!(compile(&lib_c, &lib_o), "cc must compile the fixture");
+
+    // Strip the object that provides the symbol.
+    let before = fs::read(&lib_o).unwrap();
+    let after = strip_file(lib_o.to_str().unwrap(), &before);
+    assert!(
+        after.len() <= before.len(),
+        "strip should not grow the object"
+    );
+
+    // The link must still resolve `answer`, and the program must return 0.
+    let exe = td.path().join("prog");
+    let linked = std::process::Command::new("cc")
+        .args([
+            "-o",
+            exe.to_str().unwrap(),
+            main_c.to_str().unwrap(),
+            lib_o.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run cc for link");
+    assert!(
+        linked.status.success(),
+        "a stripped .o must still link: {}",
+        String::from_utf8_lossy(&linked.stderr)
+    );
+
+    let run = std::process::Command::new(&exe).status().expect("run prog");
+    assert!(
+        run.success(),
+        "the linked program must run correctly, got {run:?}"
+    );
+}
+
+// #ST5: after stripping an archive, the archive symbol table must still point
+// at the right member offsets — otherwise the archive links to garbage. The
+// check is end-to-end: link against the stripped archive and run the result.
+#[test]
+fn test_strip_archive_symbol_table_still_resolves() {
+    let td = tempfile::tempdir().unwrap();
+
+    // Two members, so a wrong offset in the index picks the wrong one.
+    for (name, body) in [
+        ("one", "int one_fn(void) { return 1; }\n"),
+        ("two", "int two_fn(void) { return 2; }\n"),
+    ] {
+        let c = td.path().join(format!("{name}.c"));
+        fs::write(&c, body).unwrap();
+        let o = td.path().join(format!("{name}.o"));
+        assert!(std::process::Command::new("cc")
+            .args(["-c", "-o", o.to_str().unwrap(), c.to_str().unwrap()])
+            .status()
+            .expect("run cc")
+            .success());
+    }
+
+    let archive = td.path().join("libtwo.a");
+    assert!(std::process::Command::new("ar")
+        .args([
+            "rcs",
+            archive.to_str().unwrap(),
+            td.path().join("one.o").to_str().unwrap(),
+            td.path().join("two.o").to_str().unwrap(),
+        ])
+        .status()
+        .expect("run ar")
+        .success());
+
+    let before = fs::read(&archive).unwrap();
+    let _ = strip_file(archive.to_str().unwrap(), &before);
+
+    // Pull *both* members out through the symbol table.
+    let main_c = td.path().join("main.c");
+    fs::write(
+        &main_c,
+        "extern int one_fn(void);\nextern int two_fn(void);\n\
+         int main(void) { return (one_fn() == 1 && two_fn() == 2) ? 0 : 1; }\n",
+    )
+    .unwrap();
+
+    let exe = td.path().join("prog");
+    let linked = std::process::Command::new("cc")
+        .args([
+            "-o",
+            exe.to_str().unwrap(),
+            main_c.to_str().unwrap(),
+            archive.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run cc for link");
+    assert!(
+        linked.status.success(),
+        "a stripped archive must still link via its symbol table: {}",
+        String::from_utf8_lossy(&linked.stderr)
+    );
+
+    let run = std::process::Command::new(&exe).status().expect("run prog");
+    assert!(
+        run.success(),
+        "both archive members must have been resolved correctly, got {run:?}"
+    );
+}
+
+// #ST6: strip rewrites through a temp file and renames, so a failure must
+// leave the original intact rather than a truncated file. Force the failure by
+// making the containing directory unwritable, which blocks creating the temp
+// file, and assert the input is byte-identical afterwards.
+#[test]
+fn test_strip_leaves_input_intact_when_it_cannot_write() {
+    use std::os::unix::fs::PermissionsExt;
+    // Root ignores the directory write bit, so the failure cannot be staged.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+
+    let td = tempfile::tempdir().unwrap();
+    let dir = td.path().join("locked");
+    fs::create_dir(&dir).unwrap();
+
+    let c = dir.join("obj.c");
+    fs::write(&c, "int keep_me(void) { return 7; }\n").unwrap();
+    let obj = dir.join("obj.o");
+    assert!(std::process::Command::new("cc")
+        .args(["-c", "-o", obj.to_str().unwrap(), c.to_str().unwrap()])
+        .status()
+        .expect("run cc")
+        .success());
+
+    let original = fs::read(&obj).unwrap();
+
+    // Read+execute but not write: the object is still readable, but no new
+    // file can be created alongside it.
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_strip"))
+        .arg(obj.to_str().unwrap())
+        .output()
+        .expect("run strip");
+
+    assert!(
+        !output.status.success(),
+        "strip must report failure when it cannot write"
+    );
+    assert!(
+        !output.stderr.is_empty(),
+        "a diagnostic is required on failure"
+    );
+
+    let after = fs::read(&obj).unwrap();
+    assert_eq!(
+        after, original,
+        "a failed strip must leave the input byte-identical, not truncated"
+    );
+
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+}

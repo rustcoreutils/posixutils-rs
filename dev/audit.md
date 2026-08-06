@@ -887,12 +887,12 @@ Once issues land, the test plan should include:
 - [x] Default sort by name (and a regression that proves it sorts).
 - [x] `-v` sort by value.
 - [x] `-g` filtering retains only globals (`test_nm_global_filter`); `-u` filtering retains only undefined (`test_nm_undefined_filter`).
-- [ ] `-e` retains external + static — the one selector of the three still unexercised.
+- [x] `-e` retains external + static (`test_nm_external_and_static_filter`). Note it is not a *narrowing* filter for a C-compiled object, where every symbol is already external or static; the test therefore asserts the mandated retention and uses `-g` as the narrowing counterpart in the same test.
 - [x] `-A` prefix on each line; `-A` with an archive emits `"%s[%s]: "`.
 - [x] Multi-file invocation emits `"%s:\n"` headers; single library emits `"%s[%s]:\n"` per member.
 - [x] Archive (`.a`) input parses and emits per-member output.
-- [ ] Missing-file / unparseable-file diagnostics go to **stderr** and exit non-zero.
-- [ ] `-f` enables emission of `.text`/`.data`/`.bss` section symbols.
+- [x] Missing-file / unparseable-file diagnostics go to stderr and exit non-zero (`test_nm_reports_unreadable_and_unparseable_files`, which also asserts nothing reaches stdout).
+- [x] `-f` emits section symbols (`test_nm_full_output_adds_section_symbols`) — **and this found that `-f` never worked at all.** An ELF section symbol has `st_name == 0`, so its symbol name is empty, and `included()`'s "skip unnamed symbols" guard ran *before* the `SymbolKind::Section` arm and dropped every one of them: `nm -f` printed byte-for-byte what plain `nm` printed. Fixed 2026-08-06 by testing the section kind first and resolving the display name from the referenced section (`section_symbol_name`). The test asserts `-f` is additive (every default symbol still present, strictly more symbols overall) and was confirmed to fail against the pre-fix ordering.
 
 ### Suggested PR groupings
 
@@ -1172,11 +1172,11 @@ Existing tests (`dev/tests/dev-tests.rs:454-`):
 Gaps that map to findings:
 - [x] **No test for non-ELF archive members being preserved** (#ST1) — a fixture with a mixed-content archive would have caught the data loss.
 - [x] **No test for non-zero exit on read/format error** (#ST2). `strip /nonexistent` should exit non-zero.
-- [ ] **No test that a stripped `.o` is still linkable** (#ST4) — ~~would fail today~~ would now *pass*: #ST4 is fixed, so `test_strip_keeps_symbols_in_relocatable` and `test_strip_keeps_relocations_in_relocatable` assert the preconditions. Still worth writing an end-to-end version that actually links a stripped `.o`, which is why this stays open.
-- [ ] **No test that the archive symbol table after stripping points to correct offsets** (#ST5).
-- [ ] **No test for atomic-rewrite / crash-safety** (#ST6) — hard to write but the temp-file approach can be sanity-checked via behavior under a forced error.
+- [x] **A stripped `.o` is still linkable** (#ST4) — `test_strip_relocatable_object_still_links_and_runs` compiles a two-file program, strips the object providing the symbol, links, and *runs* the result. The two precondition tests remain as the narrower checks.
+- [x] **Archive symbol table still points at correct offsets after stripping** (#ST5) — `test_strip_archive_symbol_table_still_resolves` builds a two-member archive (so a wrong offset selects the wrong member), strips it, then links and runs a program that calls into both members.
+- [x] **Atomic-rewrite behavior under a forced error** (#ST6) — `test_strip_leaves_input_intact_when_it_cannot_write` makes the containing directory read+execute-only so the temp file cannot be created, then asserts strip fails with a diagnostic *and* the input is byte-identical afterwards rather than truncated. Self-skips under root.
 - [x] **No test for empty operand list** (#ST7).
-- [ ] **No Mach-O / non-ELF test** (#ST3) — would require macOS CI.
+- [x] **No Mach-O / non-ELF test** (#ST3) — closed as **not testable here**: it needs macOS CI, and the Linux reference host cannot produce a Mach-O fixture. `test_strip_rejects_unsupported_format` covers the non-object case on this platform.
 
 ### Suggested PR groupings
 

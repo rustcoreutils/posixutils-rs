@@ -1383,3 +1383,144 @@ fn test_upper_u_refuses_after_the_line_count_changes() {
         "U must not touch the buffer once the line numbering has shifted"
     );
 }
+
+// ============================================================================
+// #V25 / #V26 — autoindent and ^D
+// ============================================================================
+
+/// `o`/`O` indent the new line to match the line the command was issued on
+/// (POSIX 121501-121502). `options.autoindent` was parsed but never read, so
+/// none of this happened before.
+#[test]
+fn test_autoindent_o_derives_indent_from_originating_line() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("\tindented");
+    editor.execute_keys(":set ai\n").unwrap();
+
+    editor.execute_keys("oNEW\x1b").unwrap();
+
+    assert_eq!(editor.get_buffer_text(), "\tindented\n\tNEW\n");
+}
+
+/// With autoindent unset the new line gets no indent at all.
+#[test]
+fn test_autoindent_unset_leaves_new_line_flush() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("\tindented");
+
+    editor.execute_keys("oNEW\x1b").unwrap();
+
+    assert_eq!(editor.get_buffer_text(), "\tindented\nNEW\n");
+}
+
+/// A <newline> in input mode carries the indent onto the next line
+/// (121826-121827).
+#[test]
+fn test_autoindent_is_carried_across_newline() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("\tbase");
+    editor.execute_keys(":set ai\n").unwrap();
+
+    editor.execute_keys("oONE\nTWO\x1b").unwrap();
+
+    assert_eq!(editor.get_buffer_text(), "\tbase\n\tONE\n\tTWO\n");
+}
+
+/// "Any autoindent characters entered on newly created lines that have no
+/// other non-<newline> characters shall be deleted" on ESC (121912-121913) —
+/// so `o<ESC>` leaves an empty line, not a line full of whitespace.
+#[test]
+fn test_autoindent_only_line_is_emptied_on_escape() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("\tbase");
+    editor.execute_keys(":set ai\n").unwrap();
+
+    editor.execute_keys("o\x1b").unwrap();
+
+    assert_eq!(editor.get_buffer_text(), "\tbase\n\n");
+}
+
+/// `^D` moves back to the column after the previous shiftwidth boundary
+/// (121781-121782), in display columns. With two tabs (16 columns at
+/// tabstop 8) and shiftwidth 4, one `^D` leaves 12 columns.
+#[test]
+fn test_ctrl_d_backs_up_one_shiftwidth() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("\t\tbase");
+    editor.execute_keys(":set ai\n").unwrap();
+    editor.execute_keys(":set sw=4\n").unwrap();
+
+    editor.execute_keys("o\x04X\x1b").unwrap();
+
+    // 12 columns at tabstop 8 renders as one tab plus four spaces.
+    assert_eq!(editor.get_buffer_text(), "\t\tbase\n\t    X\n");
+}
+
+/// `0^D` discards the whole autoindent and the `0` itself (121777).
+#[test]
+fn test_zero_ctrl_d_clears_the_whole_indent() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("\t\tbase");
+    editor.execute_keys(":set ai\n").unwrap();
+
+    editor.execute_keys("o0\x04X\x1b").unwrap();
+
+    assert_eq!(editor.get_buffer_text(), "\t\tbase\nX\n");
+}
+
+/// The one behavior that distinguishes `^^D` from `0^D`: both clear the
+/// current line's indent, but after `^^D` "the autoindent level for the next
+/// input line shall be derived from the same line from which the autoindent
+/// level for the current input line was derived" (121779-121780).
+#[test]
+fn test_caret_ctrl_d_restores_the_indent_on_the_next_line() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("\t\tbase");
+    editor.execute_keys(":set ai\n").unwrap();
+
+    editor.execute_keys("o^\x04A\nB\x1b").unwrap();
+
+    assert_eq!(
+        editor.get_buffer_text(),
+        "\t\tbase\nA\n\t\tB\n",
+        "^^D must un-indent only the current line"
+    );
+}
+
+/// The contrasting case: after `0^D` the next line does *not* get the indent
+/// back. Paired with the test above, this is what proves the two are handled
+/// differently rather than both mapped onto "clear the indent".
+#[test]
+fn test_zero_ctrl_d_does_not_restore_the_indent_on_the_next_line() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("\t\tbase");
+    editor.execute_keys(":set ai\n").unwrap();
+
+    editor.execute_keys("o0\x04A\nB\x1b").unwrap();
+
+    assert_eq!(editor.get_buffer_text(), "\t\tbase\nA\nB\n");
+}
+
+/// When the cursor does not follow autoindent characters, `^D` "shall have no
+/// special meaning" (121776) — it is appended like any other input character.
+#[test]
+fn test_ctrl_d_after_typed_text_has_no_special_meaning() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("");
+
+    editor.execute_keys("iabc\x04\x1b").unwrap();
+
+    assert_eq!(editor.get_buffer_text().trim_end(), "abc\u{4}");
+}
+
+/// In column 1 with nothing to erase, `^D` "shall be discarded and no further
+/// action taken" (121774-121775) — it must not insert a literal.
+#[test]
+fn test_ctrl_d_in_column_one_is_discarded() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("");
+
+    editor.execute_keys("i\x04X\x1b").unwrap();
+
+    assert_eq!(editor.get_buffer_text().trim_end(), "X");
+}

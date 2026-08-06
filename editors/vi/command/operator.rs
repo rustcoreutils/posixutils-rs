@@ -11,7 +11,9 @@
 //!
 //! Operators work on text ranges defined by motions or text objects.
 
-use crate::buffer::{char_index_at_byte, Buffer, BufferMode, Position, Range};
+use crate::buffer::{
+    char_index_at_byte, leading_blank_width, render_indent, Buffer, BufferMode, Position, Range,
+};
 use crate::error::{Result, ViError};
 use crate::register::{RegisterContent, Registers};
 
@@ -123,48 +125,6 @@ pub fn yank(
     let cursor = range.start;
 
     Ok(OperatorResult::cursor(cursor).with_text(text))
-}
-
-/// Width in display columns of a line's leading <blank> run, plus the byte
-/// offset of the first non-<blank>.
-///
-/// A tab advances to the next `tabstop` boundary rather than counting as a
-/// fixed width, so `\t` in column 0 with `tabstop=8` is 8 columns but `\t`
-/// after three spaces is only 5.
-fn leading_blank_width(content: &str, tabstop: usize) -> (usize, usize) {
-    let ts = tabstop.max(1);
-    let mut width = 0usize;
-    let mut offset = 0usize;
-    for (byte, c) in content.char_indices() {
-        match c {
-            '\t' => width += ts - (width % ts),
-            ' ' => width += 1,
-            _ => {
-                offset = byte;
-                return (width, offset);
-            }
-        }
-        offset = byte + c.len_utf8();
-    }
-    (width, offset)
-}
-
-/// Render an indent of `width` display columns as tabs plus spaces.
-///
-/// POSIX 95631 permits leading <blank> characters to be "changed into other
-/// <blank> characters" when shifting, so re-rendering the run is conforming.
-fn render_indent(width: usize, tabstop: usize) -> String {
-    let ts = tabstop.max(1);
-    let tabs = width / ts;
-    let spaces = width % ts;
-    let mut s = String::with_capacity(tabs + spaces);
-    for _ in 0..tabs {
-        s.push('\t');
-    }
-    for _ in 0..spaces {
-        s.push(' ');
-    }
-    s
 }
 
 /// Copy the lines about to be shifted into the unnamed buffer, in line mode.

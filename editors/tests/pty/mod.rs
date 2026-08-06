@@ -511,3 +511,30 @@ fn test_pty_vi_shift_right_is_one_shiftwidth() {
         "one >> at shiftwidth 8 / tabstop 8 is a single tab, got {contents:?}"
     );
 }
+
+/// #V25/#V26: autoindent and `^D` driven through a real terminal, so the
+/// 0x14/0x04 bytes go through `Key::from_byte` rather than the headless
+/// translator.
+#[test]
+fn test_pty_vi_autoindent_and_ctrl_d() {
+    let td = tempdir().unwrap();
+    let file_path = td.path().join("ai.txt");
+    std::fs::write(&file_path, "\t\tbase\n").unwrap();
+
+    let mut vi = ViPtySession::new(&file_path, 25, 80);
+    vi.sleep_ms(500);
+    vi.keys(":set ai\r");
+    vi.sleep_ms(100);
+    // o -> new line autoindented to "\t\t"; ^D backs up one shiftwidth (8
+    // columns at the default), leaving one tab; then type X.
+    vi.keys("o\x04X\x1b");
+    vi.sleep_ms(100);
+    vi.keys(":wq\r");
+    vi.wait();
+
+    let contents = std::fs::read_to_string(&file_path).unwrap();
+    assert_eq!(
+        contents, "\t\tbase\n\tX\n",
+        "o must autoindent and ^D must remove one shiftwidth, got {contents:?}"
+    );
+}

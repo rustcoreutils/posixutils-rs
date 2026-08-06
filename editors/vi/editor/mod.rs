@@ -963,7 +963,7 @@ impl Editor {
 
     /// Enter insert mode.
     fn enter_insert(&mut self, kind: InsertKind) {
-        if let Ok(mut state) = enter_insert_mode(&mut self.buffer, kind) {
+        if let Ok(mut state) = enter_insert_mode(&mut self.buffer, kind, &self.options) {
             // An insert session is one command. When an operator opened a group
             // already (c/s/S/C), this call is a no-op and the operator's removal
             // and the typed text end up in the same group, so one `u` reverses

@@ -155,8 +155,19 @@ sinclude, trace, and recursion. Regression fixtures added while closing the audi
 - [x] `define_undefine_operand_order`, `forward_file_order` (#16, + the reverse-order regression).
 - [x] **Multibyte** `len`/`index`/`substr`/`translit` (#10) covered by `plib` unit tests
   `mb_char_slices_*` (the m4 end-to-end case is locale-dependent, verified manually).
-- [ ] The 9 `m4_test_ignore!` fixtures (`synclines_1/2`, `syscmd_sysval`, `define_eval_order_*`,
-  `bsd`, `bsd_math`) remain disabled — known divergences to revisit (out of audit scope).
+- [x] The `m4_test_ignore!` fixtures triaged 2026-08-06 by running them
+  (`cargo test -p posixutils-m4 -- --ignored`). **Two of the nine now pass and
+  were simply being skipped**: `bsd_math` and `define_nested_first_arg` are
+  re-enabled as ordinary `m4_test!`s. Nothing recorded when they started
+  passing, which is the hazard of a permanently-ignored fixture — it stops
+  reporting in either direction.
+- [ ] Seven remain genuine divergences: `bsd`, `define_eval_order_unquoted`,
+  `define_eval_syntax_order_quoted_evaluated`, `define_eval_syntax_order_unquoted`,
+  `synclines_1`, `synclines_2`, `syscmd_sysval`. The first four are
+  define/eval evaluation-order differences, the `synclines_*` pair concerns
+  `#line` sync-line emission, and `syscmd_sysval` the `sysval` result of
+  `syscmd`. Still out of audit scope, but now enumerated by failure theme
+  rather than counted.
 
 ## Suggested PR groupings
 

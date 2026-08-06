@@ -265,11 +265,11 @@ m4_test!(undivert_nested);
 // ============================================================================
 
 m4_test_ignore!(bsd);
-m4_test_ignore!(bsd_math);
+m4_test!(bsd_math);
 m4_test_ignore!(define_eval_order_unquoted);
 m4_test_ignore!(define_eval_syntax_order_quoted_evaluated);
 m4_test_ignore!(define_eval_syntax_order_unquoted);
-m4_test_ignore!(define_nested_first_arg);
+m4_test!(define_nested_first_arg);
 m4_test_ignore!(synclines_1);
 m4_test_ignore!(synclines_2);
 m4_test_ignore!(syscmd_sysval);

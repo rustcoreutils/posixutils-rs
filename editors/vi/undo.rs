@@ -116,6 +116,22 @@ impl Change {
     }
 }
 
+/// A line as it stood when the cursor arrived on it, for the `U` command.
+#[derive(Debug, Clone)]
+struct LineSnapshot {
+    /// 1-indexed line number the snapshot was taken from.
+    line: usize,
+    /// The line's content at the moment it became the current line.
+    content: String,
+    /// The buffer's line count when the snapshot was taken.
+    ///
+    /// A bare line number stops identifying the same text as soon as lines are
+    /// inserted or removed anywhere above it, so `restore_line` refuses when
+    /// this no longer matches. Without the guard, `dd` on the snapshotted line
+    /// would leave `U` aimed at whatever text slid into its place.
+    line_count: usize,
+}
+
 /// Undo history manager.
 ///
 /// Each stack entry is one *command*, not one edit. POSIX (ex `undo`, 95443)
@@ -132,8 +148,8 @@ pub struct UndoManager {
     redo_stack: Vec<Vec<Change>>,
     /// Whether a command group is currently open (see [`UndoManager::begin_group`]).
     in_group: bool,
-    /// Original state of current line for U command.
-    line_original: Option<(usize, String)>,
+    /// The current line as it was when the cursor arrived on it, for `U`.
+    line_original: Option<LineSnapshot>,
     /// Maximum undo levels (0 = unlimited).
     max_levels: usize,
     /// Whether the last buffer-modifying operation was an undo.
@@ -241,24 +257,43 @@ impl UndoManager {
         ));
     }
 
-    /// Save original state of a line for U command.
-    pub fn save_line_original(&mut self, line_num: usize, content: &str) {
-        // Only save if not already saved for this line
-        match &self.line_original {
-            Some((n, _)) if *n == line_num => {}
-            _ => {
-                self.line_original = Some((line_num, content.to_string()));
-            }
-        }
-    }
+    /// Re-snapshot the current line if the cursor has moved to a different
+    /// line, or if the buffer's line numbering has shifted underneath the
+    /// existing snapshot.
+    ///
+    /// POSIX defines `U` as restoring the line "to its state immediately
+    /// before the most recent time that it became the current line"
+    /// (121567-121568). The trigger is therefore *cursor arrival*, not
+    /// modification — which is why no mutation site needs a hook. Call this at
+    /// the top of key dispatch: between the end of one command and the start
+    /// of the next nothing touches the buffer, so the line's content at that
+    /// moment is exactly its content when the line became current.
+    ///
+    /// The old API was a pair of `save_line_original`/`clear_line_original`
+    /// methods that no production code ever called, so `U` could never restore
+    /// anything (#V20). A single writer replaces them; a second one is what let
+    /// the first rot unnoticed.
+    pub fn sync_line_original(&mut self, buffer: &Buffer) {
+        let line = buffer.cursor().line;
+        let line_count = buffer.line_count();
 
-    /// Clear line original (when moving to different line).
-    pub fn clear_line_original(&mut self, current_line: usize) {
-        if let Some((n, _)) = &self.line_original {
-            if *n != current_line {
-                self.line_original = None;
-            }
+        let stale = match &self.line_original {
+            Some(snap) => snap.line != line || snap.line_count != line_count,
+            None => true,
+        };
+        if !stale {
+            return;
         }
+
+        let content = buffer
+            .line(line)
+            .map(|l| l.content().to_string())
+            .unwrap_or_default();
+        self.line_original = Some(LineSnapshot {
+            line,
+            content,
+            line_count,
+        });
     }
 
     /// Check if undo is available.
@@ -273,7 +308,7 @@ impl UndoManager {
 
     /// Check if line restore (U) is available.
     pub fn can_restore_line(&self, current_line: usize) -> bool {
-        matches!(&self.line_original, Some((n, _)) if *n == current_line)
+        matches!(&self.line_original, Some(snap) if snap.line == current_line)
     }
 
     /// Reverse the last command, applying its edits' inverses in reverse order.
@@ -319,33 +354,58 @@ impl UndoManager {
         }
     }
 
-    /// Restore current line to original state (U command).
+    /// Restore the current line to its state when the cursor arrived on it
+    /// (`U`).
+    ///
+    /// The snapshot is *swapped* rather than consumed, so a second `U` undoes
+    /// the first — historical vi behavior, and the only reading consistent with
+    /// `U` itself being a buffer-modifying command. The restore is also
+    /// recorded, so a following `u` reverses the `U` per "the last command that
+    /// modified the contents of the edit buffer, **including undo**" (95442).
+    ///
+    /// Refuses when the buffer's line count has changed since the snapshot
+    /// (`J`, `dd`, a linewise put): the saved line number no longer identifies
+    /// the same text, and reporting "nothing to undo" is far better than
+    /// confidently overwriting an unrelated line.
     pub fn restore_line(&mut self, buffer: &mut Buffer, current_line: usize) -> Result<Position> {
-        let (line_num, original) = self.line_original.take().ok_or(ViError::NothingToUndo)?;
-
-        if line_num != current_line {
-            self.line_original = Some((line_num, original));
+        let snap = self.line_original.as_ref().ok_or(ViError::NothingToUndo)?;
+        if snap.line != current_line || snap.line_count != buffer.line_count() {
             return Err(ViError::NothingToUndo);
         }
+        let original = snap.content.clone();
 
-        // Get current content for undo
         let current = buffer
-            .line(line_num)
+            .line(current_line)
             .map(|l| l.content().to_string())
             .unwrap_or_default();
 
-        // Record as change for potential undo
-        self.record(Change::replace(
-            Position::new(line_num, 0),
-            current,
-            original.clone(),
-            false,
-        ));
+        // Nothing was changed on this line; don't push a no-op onto the undo
+        // stack, which would make the next `u` appear to do nothing.
+        if current == original {
+            return Ok(buffer.cursor());
+        }
 
-        // Restore the line
-        buffer.replace_line(line_num, &original)?;
-        buffer.set_line(line_num);
-        buffer.move_to_first_non_blank();
+        // ReplaceLines, not Replace: `apply_inverse`'s Replace arm rebuilds
+        // character by character and cannot express a whole-line swap when the
+        // two lines differ in length.
+        self.record_replace_lines(
+            Position::new(current_line, 0),
+            std::slice::from_ref(&current),
+            std::slice::from_ref(&original),
+        );
+
+        buffer.replace_line(current_line, &original)?;
+        buffer.set_line(current_line);
+        // POSIX 121571-121572 puts the cursor at the first column of the line,
+        // not the first non-blank — the latter is the rule for `u` (121550).
+        buffer.set_column(0);
+
+        // Make `U` its own inverse.
+        self.line_original = Some(LineSnapshot {
+            line: current_line,
+            content: current,
+            line_count: buffer.line_count(),
+        });
 
         Ok(buffer.cursor())
     }
@@ -592,8 +652,8 @@ mod tests {
         let mut undo = UndoManager::new();
         let mut buf = Buffer::from_text("hello world");
 
-        // Save original
-        undo.save_line_original(1, "hello world");
+        // Snapshot happens on cursor arrival, not on modification.
+        undo.sync_line_original(&buf);
 
         // Make some changes
         buf.set_column(0);
@@ -604,6 +664,76 @@ mod tests {
         assert!(undo.can_restore_line(1));
         undo.restore_line(&mut buf, 1).unwrap();
         assert_eq!(buf.line(1).unwrap().content(), "hello world");
+        // POSIX 121571-121572: first column, not first non-blank.
+        assert_eq!(buf.cursor().column, 0);
+    }
+
+    /// `U` is its own inverse: a second `U` puts the change back.
+    #[test]
+    fn test_line_restore_is_its_own_inverse() {
+        let mut undo = UndoManager::new();
+        let mut buf = Buffer::from_text("hello world");
+        undo.sync_line_original(&buf);
+
+        buf.set_column(0);
+        buf.insert_char('X');
+        assert_eq!(buf.line(1).unwrap().content(), "Xhello world");
+
+        undo.restore_line(&mut buf, 1).unwrap();
+        assert_eq!(buf.line(1).unwrap().content(), "hello world");
+
+        undo.restore_line(&mut buf, 1).unwrap();
+        assert_eq!(buf.line(1).unwrap().content(), "Xhello world");
+    }
+
+    /// A snapshot is abandoned once the buffer's line numbering shifts, rather
+    /// than being applied to whatever text now occupies that line number.
+    #[test]
+    fn test_line_restore_refuses_after_line_count_change() {
+        let mut undo = UndoManager::new();
+        let mut buf = Buffer::from_text("one\ntwo\nthree");
+
+        buf.set_line(2);
+        undo.sync_line_original(&buf);
+        assert!(undo.can_restore_line(2));
+
+        // Delete line 1: "three" is now line 2, and the snapshot of "two" must
+        // not be written over it.
+        buf.delete_line(1).unwrap();
+        buf.set_line(2);
+
+        assert!(undo.restore_line(&mut buf, 2).is_err());
+        assert_eq!(buf.line(2).unwrap().content(), "three");
+    }
+
+    /// Restoring an unchanged line is a no-op and must not push an undo entry,
+    /// which would make the next `u` appear to do nothing.
+    #[test]
+    fn test_line_restore_unchanged_line_records_nothing() {
+        let mut undo = UndoManager::new();
+        let mut buf = Buffer::from_text("untouched");
+        undo.sync_line_original(&buf);
+
+        assert!(!undo.can_undo());
+        undo.restore_line(&mut buf, 1).unwrap();
+        assert!(!undo.can_undo(), "a no-op U must not dirty the undo stack");
+        assert_eq!(buf.line(1).unwrap().content(), "untouched");
+    }
+
+    /// Moving to another line re-snapshots, so `U` always refers to the line
+    /// the cursor is on now.
+    #[test]
+    fn test_sync_line_original_follows_the_cursor() {
+        let mut undo = UndoManager::new();
+        let mut buf = Buffer::from_text("first\nsecond");
+
+        undo.sync_line_original(&buf);
+        assert!(undo.can_restore_line(1));
+
+        buf.set_line(2);
+        undo.sync_line_original(&buf);
+        assert!(undo.can_restore_line(2));
+        assert!(!undo.can_restore_line(1));
     }
 
     #[test]

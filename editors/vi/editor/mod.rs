@@ -800,6 +800,14 @@ impl Editor {
 
     /// Handle a key in command mode.
     fn handle_command_key(&mut self, key: Key) -> Result<()> {
+        // Snapshot the current line for `U` before this command can change it
+        // (#V20). Between commands nothing touches the buffer, so the content
+        // here is the content as of when the cursor arrived on the line —
+        // which is exactly what POSIX 121567-121568 restores. The `:` keystroke
+        // is itself a command key, so ex commands get the right pre-command
+        // snapshot for free.
+        self.undo.sync_line_original(&self.buffer);
+
         // Handle control key commands first
         match key {
             Key::Ctrl('b') | Key::PageUp => {
@@ -973,6 +981,11 @@ impl Editor {
 
     /// Handle a key in insert mode.
     fn handle_insert_key(&mut self, key: Key) -> Result<()> {
+        // See `handle_command_key` — these two are the complete set of entry
+        // points, since `handle_key` and `execute_keys_from_string` both funnel
+        // through them.
+        self.undo.sync_line_original(&self.buffer);
+
         if let Some(mut state) = self.insert_state.take() {
             let should_exit = process_insert_key(&mut self.buffer, key, &mut state, &self.options)?;
 

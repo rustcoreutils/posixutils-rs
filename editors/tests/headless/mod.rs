@@ -1246,3 +1246,140 @@ fn test_ctrl_u_stops_at_the_start_of_the_insert() {
 
     assert_eq!(editor.get_buffer_text().trim_end(), "keep");
 }
+
+// ============================================================================
+// #V20 — U (undo current line)
+// ============================================================================
+
+/// `U` restores the line to its state when the cursor arrived on it.
+///
+/// It could never restore anything before: `line_original` was only written by
+/// `save_line_original`, which had no production callers, so `U` always
+/// reported "Nothing to undo".
+#[test]
+fn test_upper_u_restores_line_after_deletions() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("hello world\nsecond line");
+
+    editor.execute_keys("xxx").unwrap();
+    assert_eq!(
+        editor.get_buffer_text().lines().next().unwrap(),
+        "lo world",
+        "three x's should have removed three characters"
+    );
+
+    editor.execute_keys("U").unwrap();
+    assert_eq!(
+        editor.get_buffer_text().lines().next().unwrap(),
+        "hello world"
+    );
+    // POSIX 121571-121572: first column, not first non-blank.
+    assert_eq!(editor.get_cursor().column, 0);
+}
+
+/// A whole insert session is undone by `U`, since it all happened after the
+/// cursor arrived on the line.
+#[test]
+fn test_upper_u_restores_line_after_insert_session() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("original");
+
+    editor.execute_keys("iABC\x1b").unwrap();
+    assert_eq!(editor.get_buffer_text().trim_end(), "ABCoriginal");
+
+    editor.execute_keys("U").unwrap();
+    assert_eq!(editor.get_buffer_text().trim_end(), "original");
+}
+
+/// `U` is its own inverse — pressing it twice returns to the modified text.
+#[test]
+fn test_upper_u_is_its_own_inverse() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("hello");
+
+    editor.execute_keys("x").unwrap();
+    assert_eq!(editor.get_buffer_text().trim_end(), "ello");
+
+    editor.execute_keys("U").unwrap();
+    assert_eq!(editor.get_buffer_text().trim_end(), "hello");
+
+    editor.execute_keys("U").unwrap();
+    assert_eq!(
+        editor.get_buffer_text().trim_end(),
+        "ello",
+        "a second U must put the change back"
+    );
+}
+
+/// `U` is a buffer-modifying command, so `u` reverses it (POSIX 95442).
+#[test]
+fn test_lowercase_u_reverses_an_upper_u() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("hello");
+
+    editor.execute_keys("xx").unwrap();
+    assert_eq!(editor.get_buffer_text().trim_end(), "llo");
+
+    editor.execute_keys("U").unwrap();
+    assert_eq!(editor.get_buffer_text().trim_end(), "hello");
+
+    editor.execute_keys("u").unwrap();
+    assert_eq!(
+        editor.get_buffer_text().trim_end(),
+        "llo",
+        "u must reverse the U"
+    );
+}
+
+/// Leaving a line and coming back re-snapshots it, so `U` no longer reaches
+/// back past the return.
+#[test]
+fn test_upper_u_resnapshots_when_the_cursor_returns_to_a_line() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("first line\nsecond line");
+
+    editor.execute_keys("xx").unwrap();
+    assert_eq!(editor.get_buffer_text().lines().next().unwrap(), "rst line");
+
+    // Leave the line and come back: the snapshot is retaken from "rst line".
+    editor.execute_keys("jk").unwrap();
+    editor.execute_keys("U").unwrap();
+
+    assert_eq!(
+        editor.get_buffer_text().lines().next().unwrap(),
+        "rst line",
+        "U must not reach back past the cursor's return to the line"
+    );
+}
+
+/// `U` on an untouched line changes nothing and leaves the undo stack alone.
+#[test]
+fn test_upper_u_on_unchanged_line_is_a_noop() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("untouched\nsecond");
+
+    let _ = editor.execute_keys("U");
+    assert_eq!(
+        editor.get_buffer_text().lines().next().unwrap(),
+        "untouched"
+    );
+}
+
+/// After a command that changes the line count the snapshot is abandoned, so
+/// `U` reports nothing to undo rather than overwriting an unrelated line.
+#[test]
+fn test_upper_u_refuses_after_the_line_count_changes() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("one\ntwo\nthree");
+
+    // Join lines 1 and 2, then ask U to restore.
+    editor.execute_keys("J").unwrap();
+    let joined = editor.get_buffer_text();
+    let _ = editor.execute_keys("U");
+
+    assert_eq!(
+        editor.get_buffer_text(),
+        joined,
+        "U must not touch the buffer once the line numbering has shifted"
+    );
+}

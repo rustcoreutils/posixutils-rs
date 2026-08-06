@@ -48,7 +48,7 @@ silent data loss.
 | #X31 | Minor | `read_shell_output` was a dead duplicate carrying the same defect |
 | #V18 | Minor | `:r !cmd` did not drop raw mode around the child |
 | #V19 | **Major** | no operator recorded undo; `u` was not self-inverse *(fixed 2026-08-04; re-rated from Minor — it silently destroyed buffer content)* |
-| #V20 | Minor | `U` can never restore: `save_line_original` has no callers *(open)* |
+| #V20 | Minor | `U` can never restore: `save_line_original` has no callers *(fixed 2026-08-06)* |
 | — | Minor | `:l` was not unambiguous: caret notation, unescaped `\` and `$` |
 | — | Minor | `@@` failed with `Buffer "@" is empty` |
 | — | Minor | `j` implemented one of POSIX's five join rules |
@@ -89,9 +89,10 @@ in the undo model, which was the honest reason it had been deferred. `TERM`
 terminfo is the one item accepted as a deliberate non-goal, with rationale
 recorded inline.
 
-**Remaining open: 4** *(recorded as 3 before the 2026-08-06 pass, which found
-five more plus #V27; #V21, #V22, #V23, #V24 and #V27 are now fixed)* —
-#V20 (`U` is inert), #V25 (autoindent), #V26 (`^D`, blocked on #V25), and the
+**Remaining open: 3.** The 2026-08-06 pass raised the count from 3 to 10 (five
+missed defects plus #V27), then closed seven of them — #V20, #V21, #V22, #V23,
+#V24 and #V27, plus the missing unnamed-buffer copy on `<`/`>`. What is left is
+#V25 (autoindent, unimplemented), #V26 (`^D`, blocked on #V25), and the
 remaining ex command modifier gaps
 (that box was one opaque checkbox covering ~15 commands; it is now a named
 list, with `j`, `q`, `r`, `w`/`wq`/`x`, `l` and `@@` struck off).
@@ -342,7 +343,13 @@ BRE veneer over an ERE engine. A handful of parsed-but-unhandled commands
 
   **The finding's own expectation was not POSIX**: it wanted a *second* `u` to restore `abcdef`. One `u` now does, because the change and its insert are one command. Fixing this also exposed a latent bug in `apply_inverse`: it restored text with `set_cursor`, which clamps the column to command-mode bounds, so text removed from the end of a line came back one column too far left (`C` on `keep this tail` undid to `keepthis tail `). Tests `test_undo_after_change_operator_restores_the_original_text`, `test_undo_is_its_own_inverse`, `test_undo_after_delete_restores_the_text`, `test_undo_after_change_to_end_of_line`, `test_undo_after_join_restores_the_lines`, `test_empty_insert_session_leaves_no_undo_entry` — five of the six fail against the pre-fix code.
 - [x] `u` CONFORMS (#V19, 2026-08-04). Marks `m ' \``, `: / ? n N % & @ " Q ZZ ! ^^` CONFORM (search is #V16).
-- [ ] **#V20 — `U` (undo current line) can never restore anything.** *(Found 2026-08-04 alongside #V19.)* `restore_line` requires `line_original`, which only `save_line_original` sets — and that function has **no callers outside undo.rs's own unit test**, so `U` always reports `NothingToUndo`. This line previously ticked `u U` as CONFORM together. Deliberately left open: reviving it needs a decision about when a line's original state is captured, which is a design question rather than a repair.
+- [x] **#V20 — `U` (undo current line) could never restore anything.** *(Found 2026-08-04 alongside #V19; fixed 2026-08-06.)* `restore_line` required `line_original`, which only `save_line_original` set — and that function had **no callers outside undo.rs's own unit test**, so `U` always reported `NothingToUndo`. This line previously ticked `u U` as CONFORM together.
+
+  The open design question — *when is a line's original state captured?* — is answered by the spec itself, and the answer is why no mutation site needs a hook. POSIX 121567-121568 restores the line "to its state immediately before the most recent time that it **became the current line**": the trigger is **cursor arrival, not modification**. Since nothing touches the buffer between the end of one command and the start of the next, the line's content at key-dispatch time *is* its content as of arrival. So `sync_line_original` is called at the top of `handle_command_key` and `handle_insert_key` — the complete set of entry points, as `handle_key` and `execute_keys_from_string` both funnel through them, and `:` is itself a command key so ex commands get the right pre-command snapshot for free. Two one-line insertions, versus ~26 mutation sites for the hook-everything approach (which would also have captured *post*-mutation state at every site that records after mutating).
+
+  `line_original` is now a `LineSnapshot { line, content, line_count }`. The `line_count` guard is load-bearing: a bare line number stops identifying the same text the moment lines are added or removed above it, so after `J`/`dd`/a linewise put, `U` reports "nothing to undo" rather than confidently overwriting whatever slid into that line number. `restore_line` **swaps** rather than consumes, making `U` its own inverse, and records via `record_replace_lines` so a following `u` reverses the `U` (95442) — `Replace` cannot express a whole-line swap when the lengths differ. An unchanged line early-returns without dirtying the undo stack. **Also fixed: the cursor went to the first non-blank**, which is the rule for `u` (121550); `U` puts it in the first column (121571-121572).
+
+  `save_line_original`/`clear_line_original` are deleted — a second writer is what let the first rot unnoticed. Tests: unit `test_line_restore`, `..._is_its_own_inverse`, `..._refuses_after_line_count_change`, `..._unchanged_line_records_nothing`, `test_sync_line_original_follows_the_cursor`; headless `test_upper_u_restores_line_after_deletions`, `..._after_insert_session`, `test_upper_u_is_its_own_inverse`, `test_lowercase_u_reverses_an_upper_u`, `..._resnapshots_when_the_cursor_returns_to_a_line`, `..._on_unchanged_line_is_a_noop`, `..._refuses_after_the_line_count_changes`.
 
 #### Insert mode
 - [x] ESC, `^H`, `^W`, `^U` CONFORM — `mode/insert.rs`. ~~stty erase/kill MISSING (#V12)~~ ✓ fixed 2026-08-02; ~~NUL re-input MISSING (#V15)~~ ✓ fixed 2026-08-02.

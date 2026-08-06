@@ -223,11 +223,13 @@ Directory/`-` operands and the `No id keywords` warning are missing.
 - [x] STDOUT unused; diagnostics to stderr; 0/>0 exit, per-file continue — `admin.rs:352,362,484`.
 
 ### Test coverage gaps
-- [ ] `admin -i newfile` / `admin -t file` separate-arg form (#A1).
-- [ ] Invalid `-fZ`/`-f4` rejected (#A2).
-- [ ] Directory operand (#A3); `-` operand (#A4).
-- [ ] Cross-validation (CSSC `val` on our s-file; our `-h` on CSSC s-file).
-- [ ] Deliberate-corruption `-h`/`-z`; `-a`/`-e`/`-d` round-trip; `No id keywords` warning.
+- [x] `-i` option-argument must be **attached** (#A1) — `admin_i_option_argument_must_be_attached`. In the separated form `-i name`, `name` is an operand and is rejected as a non-s-file; CSSC 1.4.1 reads it the same way ("The 'i' keyletter can't be used with multiple files"), so the test pins the interpretation rather than a wording.
+- [x] Invalid `-fZ`/`-f4` rejected (#A2) — `admin_rejects_unrecognized_flags`, paired with `-fb`/`-fj`/`-fn` being accepted so it is not simply rejecting every `-f`.
+- [x] Directory operand (#A3) and `-` stdin list (#A4) — `admin_directory_and_stdin_operands`, each verified by reading the flag back out with `prs`.
+- [x] Deliberate-corruption `-h`/`-z` — `admin_checksum_audit_and_recompute`: an intact file passes `-h`, corrupting the body makes it fail, and `-z` makes it pass again. CSSC reports the identical stored/computed values for the same corruption.
+- [x] `-a`/`-e`/`-d` round-trip — `admin_user_list_and_flag_round_trip`.
+- [x] `No id keywords` warning — `admin_warns_when_the_body_has_no_id_keywords`, with the counterpart that a body containing `%W%` draws no warning.
+- [ ] Cross-validation fixture (CSSC `val` on our s-file, our `-h` on a CSSC-written s-file) — done ad hoc during this pass and recorded per-utility, but not yet a checked-in fixture.
 
 ---
 
@@ -522,7 +524,14 @@ re-listed per row.
 - [x] 0 success; non-zero when any file fails — `prs.rs:639,695`. Verified.
 
 ### Test coverage gaps
-- [ ] Trailing-newline assertion (#P1); multi-delta `-d` (default fixture is single-delta); `-r` no-SID (#P2); `-e`/`-l`/`-c`/`-a`; `:FL:`/`:GB:`/`:A:`/`:MR:`/`:UN:`/`:FD:`/line-stat padding; multi-file/stdin/directory; exit-code.
+- [x] Trailing newline per delta (#P1) and multi-delta `-d` — `prs_emits_one_newline_terminated_record_per_delta` builds a three-delta file, the single-delta default fixture being unable to show either.
+- [x] `-r` with no SID (#P2) — `prs_r_without_a_sid_uses_the_most_recent_delta`.
+- [x] `-e`/`-l` — `prs_earlier_and_later_selectors`; `-a` — `prs_a_includes_removed_deltas` (paired with the default omitting a `rmdel`-removed delta).
+- [x] Line-stat padding — `prs_line_statistics_are_five_digit_padded` (`:Li:`/`:Ld:`/`:Lu:` five digits, `:DL:` the slash-joined triple).
+- [x] `:A:`/`:W:`/`:Z:` what-string keywords — `prs_what_string_keywords`.
+  *Recorded divergence:* with the module-type flag unset, CSSC renders `:Y:` inside `:A:` as the literal `none` (`@(#)none p1 1.3@(#)`) while we render it empty. The spec (112350-112351) does not mandate a "none" spelling for an unset keyword, and embedding the word into a what-string is the less useful reading, so ours is kept. With the flag set the two agree byte-for-byte.
+- [x] Multi-file / directory / `-` stdin operands and the error exit code — `prs_operand_forms_and_exit_status`.
+- [ ] `-c` cutoff and the remaining `:FL:`/`:GB:`/`:MR:`/`:FD:` keywords.
 
 ---
 

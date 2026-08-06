@@ -343,3 +343,213 @@ fn prs_filename() {
         },
     );
 }
+
+use super::common::run_in;
+
+/// Build an s-file with `n` deltas in `dir`, returning its path.
+fn prs_multi_delta(dir: &std::path::Path, name: &str, n: usize) -> std::path::PathBuf {
+    let sname = format!("s.{name}");
+    let out = run_in("admin", &["-i", &sname], dir, "v1\n");
+    assert!(
+        out.status.success(),
+        "admin failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for i in 2..=n {
+        let out = run_in("get", &["-e", &sname], dir, "");
+        assert!(out.status.success(), "get -e failed");
+        std::fs::write(dir.join(name), format!("v{i}\n")).unwrap();
+        let out = run_in("delta", &["-ynext", &sname], dir, "");
+        assert!(
+            out.status.success(),
+            "delta failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    dir.join(sname)
+}
+
+/// #P1: with `-e` each delta's data specification is terminated by a newline,
+/// so the output of `-d:I:` over three deltas is exactly three lines. The
+/// default fixture elsewhere is single-delta, which cannot show this.
+#[test]
+fn prs_emits_one_newline_terminated_record_per_delta() {
+    let tmp = TempDir::new().unwrap();
+    prs_multi_delta(tmp.path(), "chain", 3);
+
+    let out = run_in("prs", &["-e", "-d:I:", "s.chain"], tmp.path(), "");
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "1.3\n1.2\n1.1\n",
+        "one newline-terminated record per delta, newest first"
+    );
+
+    // Without -e only the single default (most recent) delta is reported.
+    let out = run_in("prs", &["-d:I:", "s.chain"], tmp.path(), "");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1.3\n");
+}
+
+/// `-e` selects the given delta "and earlier", `-l` the given delta "and
+/// later" — the pair only distinguishable on a multi-delta file.
+#[test]
+fn prs_earlier_and_later_selectors() {
+    let tmp = TempDir::new().unwrap();
+    prs_multi_delta(tmp.path(), "sel", 3);
+
+    let out = run_in("prs", &["-e", "-r1.2", "-d:I:", "s.sel"], tmp.path(), "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "1.2\n1.1\n",
+        "-e must report the named delta and earlier ones"
+    );
+
+    let out = run_in("prs", &["-l", "-r1.2", "-d:I:", "s.sel"], tmp.path(), "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "1.3\n1.2\n",
+        "-l must report the named delta and later ones"
+    );
+}
+
+/// #P2: `-r` with no SID defaults to the most recently created delta and
+/// prints the default report format.
+#[test]
+fn prs_r_without_a_sid_uses_the_most_recent_delta() {
+    let tmp = TempDir::new().unwrap();
+    prs_multi_delta(tmp.path(), "nosid", 3);
+
+    let out = run_in("prs", &["-r", "s.nosid"], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "prs -r with no SID failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("1.3"),
+        "the default is the newest delta: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("MRs:") && stdout.contains("COMMENTS:"),
+        "the default report format is used: {stdout:?}"
+    );
+}
+
+/// `-a` includes deltas that `rmdel` marked removed; without it they are
+/// omitted.
+#[test]
+fn prs_a_includes_removed_deltas() {
+    let tmp = TempDir::new().unwrap();
+    prs_multi_delta(tmp.path(), "rem", 3);
+
+    let out = run_in("rmdel", &["-r", "1.3", "s.rem"], tmp.path(), "");
+    assert!(out.status.success(), "rmdel failed");
+
+    let out = run_in("prs", &["-e", "-d:I:", "s.rem"], tmp.path(), "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "1.2\n1.1\n",
+        "a removed delta is omitted by default"
+    );
+
+    let out = run_in("prs", &["-e", "-a", "-d:I:", "s.rem"], tmp.path(), "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "1.3\n1.2\n1.1\n",
+        "-a must include the removed delta"
+    );
+}
+
+/// Line statistics are zero-padded to five digits, and `:DL:` is the
+/// slash-joined triple of them.
+#[test]
+fn prs_line_statistics_are_five_digit_padded() {
+    let tmp = TempDir::new().unwrap();
+    prs_multi_delta(tmp.path(), "stats", 2);
+
+    for kw in [":Li:", ":Ld:", ":Lu:"] {
+        let out = run_in("prs", &["-d", kw, "s.stats"], tmp.path(), "");
+        let value = String::from_utf8_lossy(&out.stdout).trim_end().to_string();
+        assert_eq!(value.len(), 5, "{kw} must be five digits, got {value:?}");
+        assert!(
+            value.chars().all(|c| c.is_ascii_digit()),
+            "{kw} must be numeric, got {value:?}"
+        );
+    }
+
+    let out = run_in("prs", &["-d", ":DL:", "s.stats"], tmp.path(), "");
+    let dl = String::from_utf8_lossy(&out.stdout).trim_end().to_string();
+    let parts: Vec<&str> = dl.split('/').collect();
+    assert_eq!(parts.len(), 3, ":DL: is inserted/deleted/unchanged: {dl:?}");
+    for p in parts {
+        assert_eq!(p.len(), 5, ":DL: components are five digits: {dl:?}");
+    }
+}
+
+/// The `what`-string keywords. `:A:` is `:Z::Y: :M: :I::Z:` (spec 112350) and
+/// `:Z:` is the literal `@(#)` (112351).
+///
+/// *Recorded divergence:* when the module-type flag is unset, CSSC 1.4.1
+/// renders `:Y:` inside `:A:` as the literal `none` (`@(#)none p1 1.3@(#)`)
+/// while we render it empty. The spec does not mandate a "none" spelling for
+/// an unset keyword, and embedding the word into a what-string is the less
+/// useful reading, so ours is kept. With the flag set the two agree exactly.
+#[test]
+fn prs_what_string_keywords() {
+    let tmp = TempDir::new().unwrap();
+    prs_multi_delta(tmp.path(), "wh", 2);
+
+    let out = run_in("prs", &["-d", ":Z:", "s.wh"], tmp.path(), "");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "@(#)\n");
+
+    // With the module type flag set, :A: is fully determined.
+    let out = run_in("admin", &["-fttextfile", "s.wh"], tmp.path(), "");
+    assert!(out.status.success());
+
+    let out = run_in("prs", &["-d", ":A:", "s.wh"], tmp.path(), "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "@(#)textfile wh 1.2@(#)\n",
+        ":A: is :Z::Y: :M: :I::Z:"
+    );
+
+    let out = run_in("prs", &["-d", ":W:", "s.wh"], tmp.path(), "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "@(#)wh\t1.2\n",
+        ":W: is :Z::M:\\t:I:"
+    );
+}
+
+/// Multiple operands, a directory operand and a `-` stdin list all work, and a
+/// missing operand is an error.
+#[test]
+fn prs_operand_forms_and_exit_status() {
+    let tmp = TempDir::new().unwrap();
+    prs_multi_delta(tmp.path(), "one", 1);
+    prs_multi_delta(tmp.path(), "two", 1);
+
+    let out = run_in("prs", &["-d:M:", "s.one", "s.two"], tmp.path(), "");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("one") && stdout.contains("two"));
+
+    // Directory operand.
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::copy(tmp.path().join("s.one"), dir.join("s.one")).unwrap();
+    let out = run_in("prs", &["-d:M:", "proj"], tmp.path(), "");
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("one"));
+
+    // `-` reads the pathname list from stdin.
+    let out = run_in("prs", &["-d:M:", "-"], tmp.path(), "s.two\n");
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("two"));
+
+    // A missing operand is an error.
+    let out = run_in("prs", &["s.does-not-exist"], tmp.path(), "");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(!out.stderr.is_empty(), "a diagnostic is required");
+}

@@ -323,7 +323,7 @@ fn remove_requires_operand() {
     fs::create_dir(&dir_path).expect("Unable to create test directory");
     std::env::set_var("AT_JOB_DIR", &dir_path);
 
-    let out = plib::testing::run_test_base("at", &vec!["-r".to_string()], b"");
+    let out = plib::testing::run_test_base("at", &["-r".to_string()], b"");
     assert_eq!(out.status.code(), Some(1));
 }
 

@@ -149,7 +149,7 @@ mod property_tests {
             "-c"
         };
 
-        let output = run_test_base("head", &vec![n_or_c.to_owned(), count.to_string()], input);
+        let output = run_test_base("head", &[n_or_c.to_owned(), count.to_string()], input);
 
         let stdout = &output.stdout;
 

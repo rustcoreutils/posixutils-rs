@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, TestPlan};
+use plib::testing::{os_bytes, run_test, run_test_os, TestPlan, TestPlanOs};
 
 fn realpath_test(args: &[&str], stdout: &str, stderr: &str, expected_code: i32) {
     let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
@@ -257,4 +257,33 @@ fn realpath_newline_is_error() {
     );
 
     let _ = std::fs::remove_dir_all(&base);
+}
+
+/// `realpath` must resolve and print a pathname whose bytes are not valid
+/// UTF-8 (#R7). Both the operand and the resolved output stay byte-clean.
+///
+/// A real directory entry is needed because `-e` resolution stats the path, so
+/// this creates one with a non-UTF-8 name rather than asserting on a string.
+#[test]
+fn realpath_non_utf8_operand() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let td = tempfile::tempdir().unwrap();
+    // The temp dir path itself is valid UTF-8; only the entry name is not.
+    let mut name = td.path().as_os_str().as_bytes().to_vec();
+    name.extend_from_slice(b"/\xff\xfefile");
+    let path = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&name));
+    std::fs::write(&path, b"x").unwrap();
+
+    let mut expected = name.clone();
+    expected.push(b'\n');
+
+    run_test_os(TestPlanOs {
+        cmd: String::from("realpath"),
+        args: vec![os_bytes(b"-e"), os_bytes(&name)],
+        stdin_data: Vec::new(),
+        expected_out: expected,
+        expected_err: Vec::new(),
+        expected_exit_code: 0,
+    });
 }

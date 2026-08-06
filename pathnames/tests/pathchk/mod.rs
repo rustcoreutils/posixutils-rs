@@ -109,3 +109,54 @@ fn pathchk_multiple_operands() {
         1,
     );
 }
+
+/// Root bypasses directory permission bits entirely, so a non-searchable
+/// directory is still searchable for uid 0 and this test would assert the
+/// opposite of what happens.
+fn running_as_root() -> bool {
+    // SAFETY: geteuid is always safe; it takes no arguments and cannot fail.
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// #P5: a path whose containing directory lacks search permission must be
+/// diagnosed. `check_searchable` runs `access(dir, X_OK)` on the deepest
+/// existing directory; this is the test that proves it fires.
+///
+/// Self-skips under root rather than being `#[ignore]`d, matching the pattern
+/// used by `tree/tests/chown` and `xform/tests/uue`.
+#[test]
+fn pathchk_non_searchable_directory() {
+    if running_as_root() {
+        return;
+    }
+
+    let td = tempfile::tempdir().unwrap();
+    let locked = td.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+
+    // Readable but not searchable: 0o600 clears the execute bit.
+    std::fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+
+    let target = locked.join("file");
+    let target = target.to_str().unwrap();
+    pathchk_test(
+        &[target],
+        &format!("pathchk: {}: directory is not searchable\n", target),
+        1,
+    );
+
+    // Restore search permission so the TempDir can clean itself up.
+    std::fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+}
+
+/// The same path is fine once the directory is searchable — otherwise the test
+/// above could pass for the wrong reason (e.g. a length check firing).
+#[test]
+fn pathchk_searchable_directory_is_accepted() {
+    let td = tempfile::tempdir().unwrap();
+    let open = td.path().join("open");
+    std::fs::create_dir(&open).unwrap();
+
+    let target = open.join("file");
+    pathchk_test(&[target.to_str().unwrap()], "", 0);
+}

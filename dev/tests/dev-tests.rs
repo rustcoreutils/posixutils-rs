@@ -995,7 +995,7 @@ fn test_strings_print_with_octal_offset() {
 fn test_strings_reads_stdin_when_no_operand() {
     // POSIX: with no file operand, strings reads standard input.
     let input = b"\x00\x00hello\x00\x00world\x00";
-    let output = plib::testing::run_test_base("strings", &vec![], input);
+    let output = plib::testing::run_test_base("strings", &[], input);
     assert_eq!(String::from_utf8_lossy(&output.stdout), "hello\nworld\n");
     assert!(output.status.success());
     assert_eq!(String::from_utf8_lossy(&output.stderr), "");

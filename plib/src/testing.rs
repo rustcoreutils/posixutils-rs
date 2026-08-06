@@ -7,6 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::ffi::OsString;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
@@ -71,6 +72,34 @@ pub struct TestPlanU8 {
     pub expected_exit_code: i32,
 }
 
+/// A plan whose arguments and expectations are raw bytes rather than `String`.
+///
+/// `TestPlan::args` is `Vec<String>`, so it cannot express an operand that is
+/// not valid UTF-8 — and POSIX pathname operands are byte strings, not
+/// character strings. Utilities that are byte-clean internally therefore had no
+/// way to prove it, and the one test in the tree that needed such an argument
+/// (`display/tests/echo`) dropped to a raw `Command`. Expectations are `Vec<u8>`
+/// for the same reason: a lossy-UTF-8 comparison would mask exactly the
+/// corruption these tests exist to catch.
+pub struct TestPlanOs {
+    pub cmd: String,
+    pub args: Vec<OsString>,
+    pub stdin_data: Vec<u8>,
+    pub expected_out: Vec<u8>,
+    pub expected_err: Vec<u8>,
+    pub expected_exit_code: i32,
+}
+
+/// Build an `OsString` from raw bytes, including sequences that are not valid
+/// UTF-8.
+///
+/// Unix-only, which is where the byte-oriented pathname tests run.
+#[cfg(unix)]
+pub fn os_bytes(bytes: &[u8]) -> OsString {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::OsStr::from_bytes(bytes).to_os_string()
+}
+
 /// Spawn a child process, retrying transient OS-level failures.
 ///
 /// The test suite runs many tests in parallel, each forking child processes
@@ -117,7 +146,19 @@ fn spawn_with_retry(command: &mut Command, cmd: &str) -> std::process::Child {
 /// Use this when tests need specific environment configuration.
 pub fn run_test_base_with_env(
     cmd: &str,
-    args: &Vec<String>,
+    args: &[String],
+    stdin_data: &[u8],
+    env_vars: &[(&str, &str)],
+) -> Output {
+    let os_args: Vec<OsString> = args.iter().map(OsString::from).collect();
+    run_test_base_os(cmd, &os_args, stdin_data, env_vars)
+}
+
+/// Core runner: like [`run_test_base_with_env`] but takes `OsString` arguments,
+/// so operands need not be valid UTF-8.
+pub fn run_test_base_os(
+    cmd: &str,
+    args: &[OsString],
     stdin_data: &[u8],
     env_vars: &[(&str, &str)],
 ) -> Output {
@@ -178,7 +219,7 @@ pub fn run_test_base_with_env(
 }
 
 /// Run a test command (without custom environment variables)
-pub fn run_test_base(cmd: &str, args: &Vec<String>, stdin_data: &[u8]) -> Output {
+pub fn run_test_base(cmd: &str, args: &[String], stdin_data: &[u8]) -> Output {
     run_test_base_with_env(cmd, args, stdin_data, &[])
 }
 
@@ -195,6 +236,26 @@ pub fn run_test(plan: TestPlan) {
     if plan.expected_exit_code == 0 {
         assert!(output.status.success());
     }
+}
+
+/// Run a [`TestPlanOs`], asserting stdout, stderr and exit code byte-exactly.
+pub fn run_test_os(plan: TestPlanOs) {
+    let output = run_test_base_os(&plan.cmd, &plan.args, &plan.stdin_data, &[]);
+
+    assert_eq!(
+        output.stdout,
+        plan.expected_out,
+        "stdout mismatch: got {:?}, expected {:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&plan.expected_out)
+    );
+    assert_eq!(
+        output.stderr,
+        plan.expected_err,
+        "stderr mismatch: got {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(plan.expected_exit_code));
 }
 
 pub fn run_test_u8(plan: TestPlanU8) {

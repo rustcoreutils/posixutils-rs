@@ -14,7 +14,7 @@ use cron::job::Database;
 use plib::testing::{get_binary_path, run_test_base};
 use std::process::Output;
 
-fn run_crond_test(cmd: &str, args: &Vec<String>, stdin_data: &[u8]) -> Output {
+fn run_crond_test(cmd: &str, args: &[String], stdin_data: &[u8]) -> Output {
     run_test_base(cmd, args, stdin_data)
 }
 
@@ -63,7 +63,7 @@ fn wait_for_daemon(bin: &str, want: bool) -> Vec<i32> {
 fn no_args() {
     let _guard = crond_guard();
     std::env::set_var("LOGNAME", "root");
-    let output = run_crond_test("crond", &vec![], b"");
+    let output = run_crond_test("crond", &[], b"");
     assert_eq!(output.status.code(), Some(0));
     // Leave no daemon behind: it holds the PID-file lock, so a stray one makes
     // every later test see a `crond` it did not start, or fail to start one.
@@ -239,7 +239,7 @@ fn test_signal() {
     let _ = pid::kill(&bin);
     wait_for_daemon(&bin, false);
 
-    let output = run_crond_test("crond", &vec![], b"");
+    let output = run_crond_test("crond", &[], b"");
     assert_eq!(output.status.code(), Some(0));
 
     // The parent exits as soon as it has forked, so the daemon is not

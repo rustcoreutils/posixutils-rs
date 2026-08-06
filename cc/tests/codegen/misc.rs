@@ -161,7 +161,7 @@ int main() {
     // Compile with -g -c to produce object file
     let output = run_test_base(
         "c17",
-        &vec![
+        &[
             "-g".to_string(),
             "-c".to_string(),
             "-o".to_string(),
@@ -228,7 +228,7 @@ int main(void) {
 
     let output = run_test_base(
         "c17",
-        &vec![
+        &[
             "-fno-pie".to_string(),
             "-S".to_string(),
             "-o".to_string(),
@@ -270,7 +270,7 @@ int main() {
     // Test default CFI directives
     let output = run_test_base(
         "c17",
-        &vec![
+        &[
             "-S".to_string(),
             "-o".to_string(),
             "-".to_string(),
@@ -315,7 +315,7 @@ int main() {
 
     let output = run_test_base(
         "c17",
-        &vec![
+        &[
             "-S".to_string(),
             "-o".to_string(),
             "-".to_string(),
@@ -357,7 +357,7 @@ int main() {
     // With -g
     let output = run_test_base(
         "c17",
-        &vec![
+        &[
             "-g".to_string(),
             "-S".to_string(),
             "-o".to_string(),
@@ -393,7 +393,7 @@ int main() {
 
     let output = run_test_base(
         "c17",
-        &vec![
+        &[
             "-S".to_string(),
             "-o".to_string(),
             "-".to_string(),
@@ -513,7 +513,7 @@ int main(void) {
     // Step 1: Compile .s to .o
     let output = run_test_base(
         "c17",
-        &vec![
+        &[
             "-c".to_string(),
             "-o".to_string(),
             obj_s.to_string_lossy().to_string(),
@@ -530,7 +530,7 @@ int main(void) {
     // Step 2: Compile .S to .o (with preprocessing)
     let output = run_test_base(
         "c17",
-        &vec![
+        &[
             "-c".to_string(),
             "-o".to_string(),
             obj_s_upper.to_string_lossy().to_string(),
@@ -547,7 +547,7 @@ int main(void) {
     // Step 3: Compile C to .o
     let output = run_test_base(
         "c17",
-        &vec![
+        &[
             "-c".to_string(),
             "-o".to_string(),
             obj_c.to_string_lossy().to_string(),
@@ -564,7 +564,7 @@ int main(void) {
     // Step 4: Link all .o files
     let output = run_test_base(
         "c17",
-        &vec![
+        &[
             "-o".to_string(),
             exe_path.to_string_lossy().to_string(),
             obj_c.to_string_lossy().to_string(),
@@ -657,7 +657,7 @@ int main(void) {
     // Step 1: Compile .S to .o (with preprocessing, should have __ASSEMBLER__ defined)
     let output = run_test_base(
         "c17",
-        &vec![
+        &[
             "-c".to_string(),
             "-o".to_string(),
             obj_asm.to_string_lossy().to_string(),
@@ -674,7 +674,7 @@ int main(void) {
     // Step 2: Compile C to .o
     let output = run_test_base(
         "c17",
-        &vec![
+        &[
             "-c".to_string(),
             "-o".to_string(),
             obj_c.to_string_lossy().to_string(),
@@ -691,7 +691,7 @@ int main(void) {
     // Step 3: Link
     let output = run_test_base(
         "c17",
-        &vec![
+        &[
             "-o".to_string(),
             exe_path.to_string_lossy().to_string(),
             obj_c.to_string_lossy().to_string(),

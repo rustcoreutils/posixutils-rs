@@ -124,3 +124,126 @@ fn nohup_out_created_mode_0600() {
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// Allocate a pseudo-terminal, returning (master, slave) fds.
+fn open_pty() -> (libc::c_int, libc::c_int) {
+    let mut master: libc::c_int = 0;
+    let mut slave: libc::c_int = 0;
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut::<libc::c_char>(),
+            std::ptr::null_mut::<libc::termios>(),
+            std::ptr::null_mut::<libc::winsize>(),
+        )
+    };
+    assert_eq!(rc, 0, "openpty failed");
+    (master, slave)
+}
+
+// #NH2: when nohup.out cannot be created in the current directory, output goes
+// to $HOME/nohup.out — and the fallback must read the HOME *environment
+// variable*, not a platform home-directory lookup, since those disagree
+// whenever HOME is overridden.
+#[test]
+fn nohup_out_falls_back_to_home_when_cwd_is_unwritable() {
+    use std::os::unix::io::FromRawFd;
+    use std::process::{Command, Stdio};
+
+    // Root ignores the write bit, so the fallback would never trigger.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+
+    let base = std::env::temp_dir().join(format!("posixutils_nohup_home_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let unwritable = base.join("cwd");
+    let home = base.join("home");
+    std::fs::create_dir_all(&unwritable).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+
+    // Searchable but not writable, so creating ./nohup.out fails.
+    std::fs::set_permissions(&unwritable, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let (master, slave) = open_pty();
+    let bin = get_binary_path("nohup");
+    let status = unsafe {
+        Command::new(bin)
+            .current_dir(&unwritable)
+            .env("HOME", &home)
+            .args(["sh", "-c", "echo fallback-marker"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::from_raw_fd(slave))
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+            .wait()
+            .unwrap()
+    };
+    unsafe { libc::close(master) };
+    assert!(status.success());
+
+    assert!(
+        !unwritable.join("nohup.out").exists(),
+        "nothing should have been created in the unwritable directory"
+    );
+    let fallback = home.join("nohup.out");
+    let contents = std::fs::read_to_string(&fallback)
+        .unwrap_or_else(|e| panic!("expected {fallback:?} to exist: {e}"));
+    assert!(
+        contents.contains("fallback-marker"),
+        "the child's output should be in $HOME/nohup.out, got {contents:?}"
+    );
+    assert_eq!(
+        std::fs::metadata(&fallback).unwrap().permissions().mode() & 0o777,
+        0o600,
+        "the fallback file must also be created 0600"
+    );
+
+    std::fs::set_permissions(&unwritable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+// #NH3: "If standard error is a terminal, it shall be redirected to the same
+// file description as standard output." So with stdout a *pipe* (no
+// redirection) and stderr a terminal, stderr must follow stdout onto the pipe
+// rather than staying on the terminal or going to nohup.out.
+#[test]
+fn nohup_stderr_follows_stdout_when_stdout_is_not_a_terminal() {
+    use std::os::unix::io::FromRawFd;
+    use std::process::{Command, Stdio};
+
+    let tmp = std::env::temp_dir().join(format!("posixutils_nohup_err_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    let (master, slave) = open_pty();
+    let bin = get_binary_path("nohup");
+    let output = unsafe {
+        Command::new(bin)
+            .current_dir(&tmp)
+            .args(["sh", "-c", "echo to-stderr >&2"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped()) // a pipe: no redirection happens
+            .stderr(Stdio::from_raw_fd(slave)) // a terminal: must follow stdout
+            .spawn()
+            .unwrap()
+            .wait_with_output()
+            .unwrap()
+    };
+    unsafe { libc::close(master) };
+
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("to-stderr"),
+        "the child's stderr must arrive on stdout's pipe, got {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        !tmp.join("nohup.out").exists(),
+        "no nohup.out should be created when stdout is not a terminal"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}

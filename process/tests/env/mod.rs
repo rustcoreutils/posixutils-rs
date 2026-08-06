@@ -110,3 +110,45 @@ fn env_invalid_name_is_utility() {
 fn env_double_dash() {
     env_exit(vec!["--", "/nonexistent/utility/xyz"], 127);
 }
+
+// With no utility operand, env writes the current environment to stdout, one
+// NAME=value per line (spec 94060-94062). The suite's other tests all use -i,
+// so nothing exercised the inherited-environment dump.
+#[test]
+fn env_no_operand_dumps_inherited_environment() {
+    let output = plib::testing::run_test_base_with_env(
+        "env",
+        &[],
+        b"",
+        &[("POSIXUTILS_ENV_PROBE", "sentinel-value")],
+    );
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l == "POSIXUTILS_ENV_PROBE=sentinel-value"),
+        "env must dump the inherited environment, got:\n{stdout}"
+    );
+}
+
+// `env -i` with no assignments and no utility clears the environment, so there
+// is nothing to print. Paired with the test above: together they show the dump
+// reflects the environment rather than being unconditional.
+#[test]
+fn env_ignore_with_no_assignments_prints_nothing() {
+    let output = plib::testing::run_test_base_with_env(
+        "env",
+        &["-i".to_string()],
+        b"",
+        &[("POSIXUTILS_ENV_PROBE", "sentinel-value")],
+    );
+
+    assert!(output.status.success());
+    assert!(
+        output.stdout.is_empty(),
+        "env -i must print nothing, got {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}

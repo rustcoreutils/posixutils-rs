@@ -35,9 +35,14 @@ struct Args {
     #[arg(help = gettext("The utility to be invoked"))]
     utility: String,
 
+    // `allow_hyphen_values` alongside `trailing_var_arg`: without it clap tries
+    // to parse the utility's own options as time's, so `time sh -c '...'` and
+    // `time ls -l` failed with "unexpected argument found". Every token after
+    // UTILITY belongs to the utility (XBD 12.2 Guideline 9).
     #[arg(
         name = "ARGUMENT",
         trailing_var_arg = true,
+        allow_hyphen_values = true,
         help = gettext("Arguments for the utility")
     )]
     arguments: Vec<String>,

@@ -38,7 +38,14 @@ struct Args {
     #[arg(help = gettext("Utility to invoke"))]
     util: String,
 
-    #[arg(help = gettext("Utility arguments"))]
+    // See the note in `timeout.rs`: `trailing_var_arg` + `allow_hyphen_values`
+    // are both needed, or the utility's own options are parsed as nice's and
+    // `nice ls -l` fails with "unexpected argument found".
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        help = gettext("Utility arguments")
+    )]
     util_args: Vec<String>,
 }
 

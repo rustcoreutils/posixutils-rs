@@ -156,3 +156,85 @@ fn test_locale_abbrev_weekday_and_month_c() {
         },
     );
 }
+
+// #D2: unusual `+format` operands. A bare `+` is an empty format — it must
+// print just the terminating newline, not error or echo the `+`. The suite only
+// ever fed well-formed formats.
+#[test]
+fn test_format_empty_prints_only_a_newline() {
+    let mut plan = date_plan(&["+"]);
+    plan.expected_out = String::from("\n");
+    run_test_with_env(plan, &[("TZ", "UTC0")]);
+}
+
+// `%%` is a literal percent; text outside conversions passes through verbatim.
+#[test]
+fn test_format_literal_text_and_percent() {
+    let mut plan = date_plan(&["+%%"]);
+    plan.expected_out = String::from("%\n");
+    run_test_with_env(plan, &[("TZ", "UTC0")]);
+
+    let mut plan = date_plan(&["+no conversions here"]);
+    plan.expected_out = String::from("no conversions here\n");
+    run_test_with_env(plan, &[("TZ", "UTC0")]);
+}
+
+// `%n` and `%t` are a <newline> and a <tab> (spec 91600-91603), and a
+// conversion may be embedded in surrounding literal text.
+#[test]
+fn test_format_newline_tab_and_embedded_conversion() {
+    let mut plan = date_plan(&["+%n"]);
+    plan.expected_out = String::from("\n\n");
+    run_test_with_env(plan, &[("TZ", "UTC0")]);
+
+    let mut plan = date_plan(&["+%t"]);
+    plan.expected_out = String::from("\t\n");
+    run_test_with_env(plan, &[("TZ", "UTC0")]);
+
+    // The year is the one field that is stable enough to pin exactly.
+    run_test_with_checker_and_env(
+        date_plan(&["+start[%Y]end"]),
+        &[("TZ", "UTC0")],
+        |_, output| {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.starts_with("start[") && stdout.trim_end().ends_with("]end"),
+                "literal text around a conversion must pass through, got {stdout:?}"
+            );
+        },
+    );
+}
+
+// #D4: the `-u` *set* form. Setting the clock needs privilege, so an
+// unprivileged run must fail cleanly with a diagnostic and a non-zero status —
+// not panic, and not silently succeed. This exercises the set-time branch,
+// which no test reached before.
+#[test]
+fn test_utc_set_form_fails_cleanly_without_privilege() {
+    // Root would actually set the system clock; never do that in a test.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+
+    run_test_with_checker_and_env(
+        date_plan(&["-u", "010203042026"]),
+        &[("TZ", "UTC0")],
+        |_, output| {
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "an unprivileged set must exit non-zero"
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("failed to set time"),
+                "a diagnostic is required, got {stderr:?}"
+            );
+            assert!(
+                output.stdout.is_empty(),
+                "the set form must not write to stdout, got {:?}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        },
+    );
+}

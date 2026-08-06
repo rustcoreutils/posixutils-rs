@@ -415,3 +415,159 @@ fn test_negative_pid_syntax() {
         );
     });
 }
+
+// STDOUT format for `-l` (spec 101560-101562): "%s%c" per signal, where the
+// name is uppercase without the SIG prefix and the separator is a <newline> or
+// a <space>, with a <newline> after the last one. The existing tests only
+// assert that particular names appear.
+#[test]
+fn test_list_all_signals_uses_posix_separator_format() {
+    let kill_path = get_kill_binary_path();
+    let output = Command::new(&kill_path)
+        .arg("-l")
+        .output()
+        .expect("Failed to run kill -l");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("kill -l output must be UTF-8");
+
+    assert!(
+        stdout.ends_with('\n'),
+        "the last signal's separator must be a newline, got {stdout:?}"
+    );
+
+    for name in stdout.split_whitespace() {
+        assert!(
+            !name.starts_with("SIG"),
+            "names must be written without the SIG prefix, got {name:?}"
+        );
+        assert_eq!(
+            name,
+            name.to_uppercase(),
+            "names must be uppercase, got {name:?}"
+        );
+    }
+
+    // Sanity: the list is real, not empty.
+    let names: Vec<&str> = stdout.split_whitespace().collect();
+    assert!(names.contains(&"HUP") && names.contains(&"KILL") && names.contains(&"TERM"));
+}
+
+// `kill -l exit_status` uses the other format, "%s\n" (101564-101565): exactly
+// one name and nothing else.
+#[test]
+fn test_list_exit_status_prints_one_name_and_newline() {
+    let kill_path = get_kill_binary_path();
+    let output = Command::new(&kill_path)
+        .args(["-l", "9"])
+        .output()
+        .expect("Failed to run kill -l 9");
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "KILL\n");
+}
+
+// #K2: `-l` takes an *optional* exit_status operand, so an option following it
+// must not be swallowed as that operand. Here `-s TERM` must still be parsed as
+// the signal option, leaving the command to fail for the real reason (no PID
+// given) rather than for a bogus "invalid exit status".
+#[test]
+fn test_list_option_does_not_consume_a_following_option() {
+    let kill_path = get_kill_binary_path();
+    let output = Command::new(&kill_path)
+        .args(["-l", "-s", "TERM"])
+        .output()
+        .expect("Failed to run kill -l -s TERM");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("exit status"),
+        "-s must not be misread as -l's exit_status operand, got {stderr:?}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "the command should fail for the missing PID operand"
+    );
+}
+
+// A negative pid addresses a process group (spec 101529-101531). The existing
+// test only checks that the syntax parses; this one puts a child into a process
+// group of its own and asserts the signal is actually delivered to the group.
+#[test]
+fn test_negative_pid_signals_the_process_group() {
+    use std::os::unix::process::CommandExt;
+
+    // setsid() in the child makes it a session and process-group leader, so its
+    // pgid equals its pid. That is deterministic — an earlier version of this
+    // test scanned `ps -C sleep` for a pgid and intermittently picked up a
+    // `sleep` belonging to a concurrently-running test in the same suite.
+    let mut child = unsafe {
+        Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            })
+            .spawn()
+    }
+    .expect("Failed to spawn sleep in its own session");
+
+    let pgid = child.id() as i32;
+    thread::sleep(Duration::from_millis(100));
+
+    // `--` before the negative operand, per spec 101524: "If the first pid
+    // operand is negative, it should be preceded by \"--\" to keep it from being
+    // interpreted as an option." (A negative pid that is *not* first needs no
+    // `--`; that form is covered by
+    // `test_negative_pid_after_positive_needs_no_dash_dash`.)
+    let kill_path = get_kill_binary_path();
+    let output = Command::new(&kill_path)
+        .args(["-TERM", "--", &format!("-{}", pgid)])
+        .output()
+        .expect("Failed to run kill on a process group");
+    assert!(
+        output.status.success(),
+        "kill -TERM -- -{pgid} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The group's only member must have been terminated by the signal.
+    let status = child.wait().expect("Failed to wait for the group member");
+    assert!(
+        !status.success(),
+        "the process group member should have been signalled, got {status:?}"
+    );
+}
+
+// The spec's own EXAMPLE (101599-101601) is `kill -s KILL 100 -165`, sending
+// SIGKILL to pid 100 and to process group 165 — with no `--`. Only the *first*
+// pid operand needs the separator (101524), so a negative operand in any later
+// position must be accepted as a process group.
+#[test]
+fn test_negative_pid_after_positive_needs_no_dash_dash() {
+    let kill_path = get_kill_binary_path();
+    // Both targets are chosen not to exist, so the expected outcome is two
+    // ESRCH diagnostics — which is only reachable if both were parsed as pid
+    // operands rather than one of them being eaten as an option.
+    let output = Command::new(&kill_path)
+        .args(["-s", "TERM", "999999", "-999998"])
+        .output()
+        .expect("Failed to run kill");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("No process ID specified"),
+        "-999998 must be read as a pid operand, not an option: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("999999") && stderr.contains("-999998"),
+        "both operands should be reported: {stderr:?}"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}

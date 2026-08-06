@@ -192,9 +192,9 @@ added with the fixes and this list was never revisited.)*
 - [x] ~~No test for `-t` (#2)~~ — `test_df_total_has_inode_columns` and `test_df_portable_total_mutually_exclusive`.
 - [x] ~~No test that default output contains a free-inode column (#3)~~ — `test_df_default_has_inode_columns`, with the negative cases `test_df_portable_has_no_inode_columns` and `test_df_kilo_has_no_inode_columns`.
 - [x] ~~No test that `df /nonexistent` prints **no** filesystem rows (#5)~~ — `test_df_bad_operand_prints_no_filesystem_rows`, plus `test_df_nonexistent_file` for the exit code and `test_df_operand_does_not_dump_all_filesystems`.
-- [ ] No test pinning the Capacity value against a known reserved-block filesystem (#4).
-- [ ] No test for a non-UTF-8 mount path (#1) — hard to stage portably; at minimum unit-test the name-conversion helper once it returns `OsString`.
-- [ ] No test that diagnostics honor `LC_MESSAGES` (#6).
+- [x] Capacity value (#4) — `test_df_capacity_matches_used_over_used_plus_avail` checks `ceil(used / (used + avail))` on every row the host reports, rather than depending on a filesystem with a known reserved-block count. A `used/total` implementation disagrees on any reserved-block filesystem, and the zero-denominator (pseudo-filesystem) case is asserted to be 0%.
+- [x] Non-UTF-8 handling (#1) — a non-UTF-8 *mount* still cannot be staged portably, but the operand path shares the `OsString`/`PathBuf` plumbing: `test_df_non_utf8_operand_does_not_panic` asserts a clean exit 1 with a diagnostic (not a panic's 101 or signal death) and no filesystem rows.
+- [x] `LC_MESSAGES` (#6) — closed by construction rather than by a test: every message *literal* goes through `gettext()`, and the two remaining `"{}: {}"` sites carry no English literal at all (the text is `io::Error`/libc `strerror`, which honors `LC_MESSAGES` itself). A behavioral test would need a translated message catalog for this domain, which the tree does not ship.
 
 ### Suggested PR groupings
 

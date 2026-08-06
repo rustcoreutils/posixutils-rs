@@ -346,3 +346,221 @@ fn test_not_foreground_ok() {
 fn test_foreground_ok() {
     timeout_test_extended(&["-f", "5", SPAWN_CHILD], "", Some(0), false);
 }
+
+// #T2: "the child's signal dispositions shall be the same as the disposition
+// that timeout inherited" (spec 117593-117598), except for the -s signal.
+// timeout installs SIG_IGN for SIGTTIN/SIGTTOU on itself while managing the
+// child, and used to reset both to SIG_DFL in the child unconditionally — so a
+// child launched under an already-ignoring parent came out with the wrong
+// disposition.
+//
+// The probe reads the child's own /proc status: SigIgn is a bitmask of ignored
+// signals, so bit (signo-1) tells us what the child actually inherited.
+#[test]
+#[cfg(target_os = "linux")]
+fn test_child_inherits_ignored_sigttin_sigttou() {
+    // Launch: sh (ignoring SIGTTIN/SIGTTOU) -> timeout -> sh (reports SigIgn).
+    // `trap '' TTIN TTOU` makes the outer shell ignore both, and that
+    // disposition is what timeout inherits and must pass on.
+    let timeout_bin = get_binary_path("timeout");
+    let script = format!(
+        "trap '' TTIN TTOU; exec {} 10 sh -c 'grep ^SigIgn: /proc/self/status'",
+        timeout_bin.display()
+    );
+
+    let out = Command::new("sh")
+        .args(["-c", &script])
+        .output()
+        .expect("failed to run the SIGTTIN/SIGTTOU probe");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mask_hex = stdout
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_else(|| panic!("unexpected SigIgn line: {stdout:?}"));
+    let mask = u64::from_str_radix(mask_hex, 16).expect("SigIgn should be hex");
+
+    let ignored = |signo: i32| mask & (1u64 << (signo - 1)) != 0;
+    assert!(
+        ignored(libc::SIGTTIN),
+        "child must inherit SIGTTIN ignored, SigIgn={mask_hex}"
+    );
+    assert!(
+        ignored(libc::SIGTTOU),
+        "child must inherit SIGTTOU ignored, SigIgn={mask_hex}"
+    );
+}
+
+// The counterpart: when the parent does *not* ignore them, the child must not
+// come out ignoring them either. Without this, the test above would also pass
+// an implementation that ignored the two signals unconditionally.
+#[test]
+#[cfg(target_os = "linux")]
+fn test_child_does_not_inherit_ignored_sigttin_when_parent_does_not() {
+    let timeout_bin = get_binary_path("timeout");
+    let script = format!(
+        "exec {} 10 sh -c 'grep ^SigIgn: /proc/self/status'",
+        timeout_bin.display()
+    );
+
+    let out = Command::new("sh")
+        .args(["-c", &script])
+        .output()
+        .expect("failed to run the SIGTTIN probe");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mask_hex = stdout.split_whitespace().nth(1).unwrap();
+    let mask = u64::from_str_radix(mask_hex, 16).unwrap();
+
+    assert_eq!(
+        mask & (1u64 << (libc::SIGTTIN - 1)),
+        0,
+        "child must not ignore SIGTTIN when the parent did not, SigIgn={mask_hex}"
+    );
+}
+
+// #T3: timeout forwards "the signal it received" to the child for any signal
+// whose default action is to terminate (spec 117587-117591), not just the five
+// it originally handled. A SIGUSR1 to timeout used to kill it silently and
+// orphan the child.
+//
+// Send SIGUSR1 to timeout and require that the child sees it: the child traps
+// USR1 and prints a marker, so the marker proves forwarding rather than the
+// child merely dying.
+#[test]
+fn test_forwards_sigusr1_to_the_child() {
+    let timeout_bin = get_binary_path("timeout");
+
+    let child = Command::new(&timeout_bin)
+        .args([
+            "20",
+            "sh",
+            "-c",
+            "trap 'echo GOT-USR1; exit 0' USR1; while :; do sleep 0.1; done",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn timeout");
+
+    // Let the child install its trap.
+    thread::sleep(Duration::from_millis(500));
+
+    unsafe { libc::kill(child.id() as i32, libc::SIGUSR1) };
+
+    let out = child
+        .wait_with_output()
+        .expect("failed to wait for timeout");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("GOT-USR1"),
+        "SIGUSR1 must be forwarded to the child, got stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+// Same for SIGPIPE, the case the audit called out specifically: its default
+// action terminates, so it must be forwarded rather than silently killing
+// timeout and orphaning the child.
+#[test]
+fn test_forwards_sigpipe_to_the_child() {
+    let timeout_bin = get_binary_path("timeout");
+
+    let child = Command::new(&timeout_bin)
+        .args([
+            "20",
+            "sh",
+            "-c",
+            "trap 'echo GOT-PIPE; exit 0' PIPE; while :; do sleep 0.1; done",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn timeout");
+
+    thread::sleep(Duration::from_millis(500));
+
+    unsafe { libc::kill(child.id() as i32, libc::SIGPIPE) };
+
+    let out = child
+        .wait_with_output()
+        .expect("failed to wait for timeout");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("GOT-PIPE"),
+        "SIGPIPE must be forwarded to the child, got stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+// A utility invoked under timeout may take its own options. Until 2026-08-06,
+// `trailing_var_arg` was set but `allow_hyphen_values` was not, so clap tried
+// to parse the utility's first hyphenated argument as one of timeout's own
+// options and rejected it: `timeout 5 ls -l`, `timeout 5 grep -c ...` and
+// `timeout 5 sh -c '...'` all failed with "unexpected argument found" (#T5).
+#[test]
+fn test_utility_arguments_may_start_with_a_hyphen() {
+    let timeout_bin = get_binary_path("timeout");
+
+    let out = Command::new(&timeout_bin)
+        .args(["10", "echo", "-n", "hyphenated"])
+        .output()
+        .expect("failed to run timeout");
+
+    assert!(
+        out.status.success(),
+        "timeout rejected the utility's own option: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hyphenated");
+}
+
+// The same for an option that happens to collide with one of timeout's own
+// short options: after DURATION and UTILITY, `-s` belongs to the utility.
+#[test]
+fn test_utility_option_colliding_with_timeouts_own_is_passed_through() {
+    let timeout_bin = get_binary_path("timeout");
+
+    // `sh -c` collides with nothing, but `-s` is timeout's signal option.
+    // Here it must reach `sh`, which treats `-s` as "read commands from stdin".
+    let out = Command::new(&timeout_bin)
+        .args(["10", "sh", "-c", "echo passed-through"])
+        .output()
+        .expect("failed to run timeout");
+
+    assert!(
+        out.status.success(),
+        "timeout rejected `sh -c`: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim_end(),
+        "passed-through"
+    );
+}
+
+// timeout's *own* options must still parse when they precede the operands, so
+// the fix above cannot have been "stop parsing options entirely".
+#[test]
+fn test_timeouts_own_options_still_parse_before_operands() {
+    let timeout_bin = get_binary_path("timeout");
+
+    for args in [
+        vec!["-s", "KILL", "10", "echo", "ok"],
+        vec!["--signal-name", "KILL", "10", "echo", "ok"],
+        vec!["-p", "10", "echo", "ok"],
+    ] {
+        let out = Command::new(&timeout_bin)
+            .args(&args)
+            .output()
+            .expect("failed to run timeout");
+        assert!(
+            out.status.success(),
+            "timeout {args:?} failed: {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim_end(), "ok");
+    }
+}

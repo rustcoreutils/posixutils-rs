@@ -594,3 +594,27 @@ fn xargs_exit_code_126_cannot_invoke() {
     let _ = fs::remove_file(&non_exec_file);
     let _ = fs::remove_dir(&test_dir);
 }
+
+// #X4: `-E` and `-I` together. The suite covers each flag alone
+// (`xargs_with_eofstr`, `xargs_insert_mode`) but nothing combined them, and the
+// EOF string used to be ignored once insert mode was active.
+#[test]
+fn xargs_eof_string_honored_in_insert_mode() {
+    xargs_test(
+        "a\nSTOP\nb\n",
+        "[a]\n",
+        vec!["-E", "STOP", "-I", "{}", "echo", "[{}]"],
+    );
+}
+
+// The counterpart: with a different EOF string the STOP line is ordinary data,
+// so all three lines are processed. Without this, the test above could pass
+// because insert mode had stopped after one line for an unrelated reason.
+#[test]
+fn xargs_insert_mode_without_matching_eof_string_processes_all_lines() {
+    xargs_test(
+        "a\nSTOP\nb\n",
+        "[a]\n[STOP]\n[b]\n",
+        vec!["-E", "HALT", "-I", "{}", "echo", "[{}]"],
+    );
+}

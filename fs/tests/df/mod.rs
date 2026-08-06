@@ -250,3 +250,88 @@ fn test_df_help() {
     assert!(stdout.contains("-k"), "Help should mention -k option");
     assert!(stdout.contains("-P"), "Help should mention -P option");
 }
+
+// #4: Capacity is `used / (used + avail)` rounded up, where `avail` is the
+// space available to unprivileged users (`f_bavail`). The formula has unit
+// tests (`capacity_percent_*`), but nothing pinned it through the real binary.
+//
+// Rather than depend on a filesystem with a known reserved-block count, this
+// checks the invariant on every row the host reports: with a reserved-block
+// filesystem the denominator is smaller than the total, so a `used/total`
+// implementation disagrees here. It is skipped for rows with a zero
+// denominator (pseudo-filesystems like /proc), which report 0%.
+#[test]
+fn test_df_capacity_matches_used_over_used_plus_avail() {
+    // -P gives the fixed six-column format: Filesystem, blocks, Used,
+    // Available, Capacity, "Mounted on".
+    let output = run_df_test(vec!["-P"]);
+    let mut checked = 0;
+
+    for row in output.lines().skip(1) {
+        let cols: Vec<&str> = row.split_whitespace().collect();
+        if cols.len() < 6 {
+            continue;
+        }
+        let (Ok(used), Ok(avail)) = (cols[2].parse::<u64>(), cols[3].parse::<u64>()) else {
+            continue;
+        };
+        let Some(pct) = cols[4]
+            .strip_suffix('%')
+            .and_then(|p| p.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let denom = used + avail;
+        if denom == 0 {
+            assert_eq!(pct, 0, "a zero denominator must report 0%, row: {row}");
+            continue;
+        }
+
+        let expected = (used as f64 / denom as f64 * 100.0).ceil() as u64;
+        assert_eq!(
+            pct, expected,
+            "Capacity must be ceil(used / (used + avail)); row: {row}"
+        );
+        checked += 1;
+    }
+
+    assert!(
+        checked > 0,
+        "no filesystem row was usable for the capacity check:\n{output}"
+    );
+}
+
+// #1: mount names and operands are carried as OsString/PathBuf and displayed
+// with to_string_lossy, so bytes that are not valid UTF-8 can no longer abort
+// the utility. A non-UTF-8 *mount* cannot be staged portably, but the same
+// plumbing handles operands: df must diagnose this one and exit non-zero
+// without panicking.
+#[test]
+fn test_df_non_utf8_operand_does_not_panic() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let operand = std::ffi::OsStr::from_bytes(b"/nonexistent/\xff\xfepath");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_df"))
+        .arg(operand)
+        .output()
+        .expect("Failed to execute df");
+
+    // A panic would be signal death or exit 101; this must be an ordinary
+    // diagnostic-and-exit-1.
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "df must fail cleanly on an unresolvable non-UTF-8 operand, stderr={:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.stderr.is_empty(),
+        "a diagnostic is required for a bad operand"
+    );
+    // And per #5, no filesystem rows are dumped for an unmatched operand.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.lines().count() <= 1,
+        "no filesystem rows should be printed, got {stdout:?}"
+    );
+}

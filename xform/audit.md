@@ -90,7 +90,7 @@ i18n / future-direction gaps remain. No Critical or Major issues.
 - [x] No-operand → pathname + leading space omitted CONFORMS —
   `filename_prefix` is `""` when the path is empty (`cksum.rs:52-58`), matching
   spec 89630.
-- [ ] **`-` operand N/A** — passed to `input_stream(.., false)` so `-` is a
+- [x] **`-` operand N/A** — passed to `input_stream(.., false)` so `-` is a
   literal filename, not stdin (`cksum.rs:36`). Spec makes `-`-as-stdin
   optional ("if the implementation treats the `-` as meaning standard input",
   89606-89608), so this is conforming-by-omission.

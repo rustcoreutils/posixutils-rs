@@ -213,6 +213,30 @@ fn test_df_portable_total_mutually_exclusive() {
     );
 }
 
+// The mount table is read from /proc/self/mounts with /etc/mtab as a fallback.
+// Reading only /etc/mtab made df fail outright wherever that file was stale or
+// absent even though the kernel list was readable, so this pins that df still
+// enumerates real mounted filesystems and that the root mount is among them.
+#[test]
+fn test_df_enumerates_mounts_including_root() {
+    let output = run_df_test(vec![]);
+    let rows: Vec<&str> = output.lines().skip(1).filter(|l| !l.is_empty()).collect();
+
+    assert!(
+        !rows.is_empty(),
+        "df listed no filesystems; the mount table was not read. Output:\n{}",
+        output
+    );
+    // "Mounted on" is the last column; its index differs between the default
+    // and -P layouts, so match on the last field rather than a fixed position.
+    assert!(
+        rows.iter()
+            .any(|row| row.split_whitespace().next_back() == Some("/")),
+        "df did not report the root mount. Output:\n{}",
+        output
+    );
+}
+
 #[test]
 fn test_df_help() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_df"))

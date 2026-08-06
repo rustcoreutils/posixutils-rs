@@ -14,6 +14,13 @@ use std::ffi::{CStr, CString};
 use std::io;
 use std::sync::Mutex;
 
+/// The kernel's authoritative mount list. Preferred over `/etc/mtab`: it is
+/// always present and always current, whereas `/etc/mtab` is a userspace file
+/// that can be stale, or absent entirely on a system that never created it.
+const _PATH_PROC_MOUNTS: &CStr = c"/proc/self/mounts";
+
+/// The traditional userspace mount table. On most modern systems this is a
+/// symlink to `/proc/self/mounts`, so it is only reached when that read fails.
 const _PATH_MOUNTED: &CStr = c"/etc/mtab";
 
 /// The mtab (contraction of mounted file systems table) file
@@ -42,9 +49,17 @@ pub struct MountEntity {
 }
 
 impl MountTable {
-    /// Open system mtab file
+    /// Open the system mount table.
+    ///
+    /// Tries `/proc/self/mounts` first and falls back to `/etc/mtab`. Reading
+    /// only `/etc/mtab` meant `df` failed outright on any system where that
+    /// file was stale or missing, even though the kernel list was readable.
+    /// The fallback keeps non-Linux and `/proc`-less environments working.
     pub fn open_system() -> Result<Self, io::Error> {
-        Self::open(_PATH_MOUNTED, c"r")
+        match Self::open(_PATH_PROC_MOUNTS, c"r") {
+            Ok(table) => Ok(table),
+            Err(_) => Self::open(_PATH_MOUNTED, c"r"),
+        }
     }
 
     /// Open mtab file

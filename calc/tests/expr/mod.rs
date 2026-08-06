@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, TestPlan};
+use plib::testing::{locale_matching, run_test, run_test_with_env, TestPlan};
 
 // success: result is neither null nor zero (exit 0)
 fn expr_test(args: &[&str], expected_output: &str) {
@@ -127,4 +127,65 @@ fn expr_match() {
     expr_test_status(&["abc", ":", "a\\(x*\\)"], "\n", "", 1);
     // subexpression present but no match at all -> null (exit 1)
     expr_test_status(&["abc", ":", "x\\(y\\)"], "\n", "", 1);
+}
+
+// Run one comparison under an explicit locale.
+fn expr_test_locale(locale: &str, args: &[&str], expected_out: &str, code: i32) {
+    let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
+
+    run_test_with_env(
+        TestPlan {
+            cmd: String::from("expr"),
+            args: str_args,
+            stdin_data: String::new(),
+            expected_out: String::from(expected_out),
+            expected_err: String::new(),
+            expected_exit_code: code,
+        },
+        &[("LC_ALL", locale)],
+    );
+}
+
+// String comparison must use the collating sequence of the current locale
+// (POSIX 94588-94590), not byte order.
+//
+// The discriminator is a case-crossing pair. In the C locale the collating
+// sequence is byte order, so 'B' (0x42) sorts before 'a' (0x61) and `a < B` is
+// false. Under glibc's en_US.UTF-8 the primary weight is the letter rather than
+// the byte, so `a < B` is true. A byte-wise implementation returns the same
+// answer under both locales, which is what this catches.
+//
+// Self-skips when no suitable locale is installed: with only C/POSIX available
+// there is no second collating sequence to compare against.
+#[test]
+fn expr_string_compare_honors_lc_collate() {
+    let Some(locale) = locale_matching(&["en_US.UTF-8", "en_US.utf8"]) else {
+        return;
+    };
+
+    // C locale: byte order.
+    expr_test_locale("C", &["a", "<", "B"], "0\n", 1);
+    expr_test_locale("C", &["B", "<", "a"], "1\n", 0);
+
+    // Collating locale: the opposite answer for the same operands.
+    expr_test_locale(&locale, &["a", "<", "B"], "1\n", 0);
+    expr_test_locale(&locale, &["B", "<", "a"], "0\n", 1);
+
+    // The remaining relational operators route through the same comparison,
+    // so they flip together. `cmpop` falls back to string compare whenever
+    // either operand is non-numeric, which is why this is not just `<`.
+    expr_test_locale("C", &["a", ">", "B"], "1\n", 0);
+    expr_test_locale(&locale, &["a", ">", "B"], "0\n", 1);
+    expr_test_locale("C", &["a", ">=", "B"], "1\n", 0);
+    expr_test_locale(&locale, &["a", "<=", "B"], "1\n", 0);
+
+    // Equality is locale-independent for these operands, in both locales.
+    expr_test_locale("C", &["a", "=", "a"], "1\n", 0);
+    expr_test_locale(&locale, &["a", "=", "a"], "1\n", 0);
+    expr_test_locale(&locale, &["a", "!=", "b"], "1\n", 0);
+
+    // Integer comparison must not be affected: `cmpop` only reaches `cmpstr`
+    // when an operand is not an integer.
+    expr_test_locale(&locale, &["10", ">", "9"], "1\n", 0);
+    expr_test_locale(&locale, &["9", "<", "10"], "1\n", 0);
 }

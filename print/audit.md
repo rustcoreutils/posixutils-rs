@@ -169,7 +169,7 @@ helper unit tests instead.
 - [x] **i18n** — `setlocale` + `textdomain` + `bind_textdomain_codeset` + `gettext`-wrapped diagnostics and clap help (`lp.rs:17, 23-50, 230-232`). The cleanest i18n wiring of the crates audited so far.
 - [x] **Regex** — N/A (lp does no pattern matching).
 - [x] **Signals** — N/A (Default).
-- [ ] **Robustness** — ~~`job-id` `unwrap_or(0)` (#9)~~ ✓ fixed (`lp.rs:222`). Remaining: `args.copies as i32` (#6) at `lp.rs:160` is an unchecked cast whose safety lives 125 lines away in a clap attribute (`value_parser!(u32).range(1..=i64::from(i32::MAX))`, `lp.rs:34`) — correct today, but the invariant is not local to the cast. No panics/`unwrap()` on external input otherwise (`read_input`/`send_print_job` return `Result`).
+- [x] **Robustness** — ~~`job-id` `unwrap_or(0)` (#9)~~ ✓ fixed (`lp.rs:222`). ~~`args.copies as i32` (#6)~~ ✓ fixed 2026-08-06: the unchecked cast is now `i32::try_from(args.copies).unwrap_or(i32::MAX)` (`lp.rs:158-162`), so the invariant is local to the conversion rather than living 120 lines away in the clap `value_parser!(u32).range(1..=i32::MAX)` attribute (`lp.rs:34`). Boundary pinned on both sides by `lp_n_copies_at_i32_max_accepted` and `lp_n_copies_overflow_rejected`. No panics/`unwrap()` on external input otherwise (`read_input`/`send_print_job` return `Result`).
 
 ### Test coverage signal
 

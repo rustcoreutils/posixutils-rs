@@ -428,6 +428,41 @@ fn lp_n_copies_overflow_rejected() {
     );
 }
 
+/// `-n i32::MAX` is the largest accepted value and must survive the u32->i32
+/// conversion on the way into the IPP `copies` attribute. Paired with
+/// `lp_n_copies_overflow_rejected` above, this pins both sides of the boundary.
+#[test]
+fn lp_n_copies_at_i32_max_accepted() {
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("lp"),
+            args: vec![
+                "-n".to_string(),
+                i32::MAX.to_string(),
+                "-d".to_string(),
+                "ipp://localhost/ipp/print".to_string(),
+            ],
+            stdin_data: String::from("test data"),
+            expected_out: String::from(""),
+            expected_err: String::from(""),
+            expected_exit_code: 1,
+        },
+        &[("LPDEST", ""), ("PRINTER", "")],
+        |_, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // Accepted by clap, so the failure must come from the connection,
+            // not from argument validation.
+            assert!(
+                !stderr.contains("error: invalid value"),
+                "Expected -n {} to be accepted, got: {}",
+                i32::MAX,
+                stderr
+            );
+            assert_eq!(output.status.code(), Some(1));
+        },
+    );
+}
+
 /// Test that a malformed -o option (no '=') produces a warning
 #[test]
 fn lp_o_malformed_warned() {

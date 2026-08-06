@@ -174,10 +174,12 @@ English.
 
 - [x] RAII `setmntent`/`getmntent`/`endmntent` wrapper with a mutex around the
   non-thread-safe `getmntent` — `fs/mntent.rs:44-96`. Sound.
-- [ ] Reads `/etc/mtab` (`_PATH_MOUNTED`, `fs/mntent.rs:17`). On modern systems
-  this is usually a symlink to `/proc/self/mounts`, so it works, but a stale or
-  absent `/etc/mtab` would make `df` fail where `/proc/mounts` would succeed.
-  Track as Minor; consider `/proc/self/mounts` directly. (Not a spec item.)
+- [x] ~~Reads `/etc/mtab` only.~~ ✓ fixed 2026-08-06. `open_system` now tries
+  `/proc/self/mounts` first and falls back to `/etc/mtab` (`fs/mntent.rs:17-24,
+  50-60`), so a stale or absent `/etc/mtab` no longer makes `df` fail where the
+  kernel list is readable; the fallback keeps non-Linux and `/proc`-less
+  environments working. Test `test_df_enumerates_mounts_including_root`.
+  (Not a spec item.)
 - Feeds #1: the `CStr`→`String` conversion happens in `df.rs`, not here, so the
   helper itself is byte-faithful; the panic is on the consumer side.
 

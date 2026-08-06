@@ -239,7 +239,7 @@ Not covered:
 ## `sleep`
 
 **Implementation:** `datetime/sleep.rs` (39 lines)
-**Tests:** none (no `datetime/tests/sleep/`).
+**Tests:** `datetime/tests/sleep/mod.rs` (4 tests; none existed at audit time).
 **Spec:** POSIX.1-2024, Vol. 3 §3, pp. 3433–3435
 **Reference slice:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/sleep.md`
 **Date:** 2026-06-24

@@ -56,6 +56,14 @@ Nothing crashes the *process* except `what` on its single most important input
 (any binary). No utility corrupts a CSSC-readable s-file (CSSC `val`/`get`/`prt`
 accept our output everywhere except encoded files).
 
+**Status as of 2026-08-06.** The five themes above describe the *original*
+findings; all of them have since been fixed. Theme 1 (#X1) closed in Phase 3,
+theme 2 in Phase 4 (`paths::expand_operands`), theme 4's `get` options in
+Phase 4, z-file locking in Phase 12, theme 5's diagnostics in Phase 13, and
+`what`'s binary handling in Phase 11. **What remains open in this crate is
+test coverage, not conformance** — see the per-utility "Test coverage gaps"
+boxes below.
+
 ---
 
 ## Cross-cutting findings (`plib::sccsfile` + shared patterns)
@@ -353,20 +361,24 @@ shared-core #X1 (encoded bodies).
 ### Detailed conformance matrix
 
 #### SYNOPSIS / OPTIONS
+
+*(Table corrected 2026-08-06: six rows still read MISSING long after Phase 4
+implemented them, contradicting the already-ticked #G2/#G3/#G4/#G7 above.)*
+
 | Opt | Status | Notes (file:line) |
 |---|---|---|
 | `-r SID` | CONFORMS | `get.rs:27,186`; exact/partial/R.L verified incl. multi-release. |
-| `-c cutoff` | MISSING | (#G2). |
-| `-e` | CONFORMS | `get.rs:30`; p-file + 0644 g-file match CSSC. |
-| `-b` | CONFORMS | `get.rs:33,230`. |
-| `-i list` / `-x list` | MISSING | (#G3). |
-| `-k` | CONFORMS | `get.rs:36,444`; implied by `-e`. |
-| `-l` / `-L` | MISSING | (#G4). |
-| `-p` | CONFORMS | `get.rs:39`; body→stdout, info→stderr; verified. |
-| `-s` | CONFORMS | `get.rs:42`; suppresses info incl. multi-file header. |
-| `-m` / `-n` | CONFORMS | `get.rs:48,51`; `<SID>\t…` / `<module>\t…` match CSSC. |
-| `-g` | CONFORMS | `get.rs:45,428`; no g-file, SID printed. |
-| `-t` | MISSING | (#G7). |
+| `-c cutoff` | CONFORMS | `get.rs:30`; `parse_cutoff`/`delta_after_cutoff` `get.rs:86,157`, applied `:742-753`. 2-digit-year pivot. (#G2) |
+| `-e` | CONFORMS | `get.rs:50`; p-file + 0644 g-file match CSSC. |
+| `-b` | CONFORMS | `get.rs:53,230`. |
+| `-i list` / `-x list` | CONFORMS | `get.rs:33,36`; serial resolution `:725-734`, `-i` predecessor chains `:757`. (#G3) |
+| `-k` | CONFORMS | `get.rs:56,444`; implied by `-e`. |
+| `-l` / `-L` | CONFORMS | `get.rs:39,42`; `render`/writer `:589,632` select l-file vs stdout. l-file is byte-identical to CSSC. (#G4) |
+| `-p` | CONFORMS | `get.rs:59`; body→stdout, info→stderr; verified. |
+| `-s` | CONFORMS | `get.rs:62`; suppresses info incl. multi-file header. |
+| `-m` / `-n` | CONFORMS | `get.rs:68,71`; `<SID>\t…` / `<module>\t…` match CSSC. |
+| `-g` | CONFORMS | `get.rs:65,428`; no g-file, SID printed. |
+| `-t` | CONFORMS | `get.rs:45`; top-delta selection `:679`. (#G7) |
 
 #### OPERANDS / STDIN
 - [x] **`-` MISSING (#G5); directory MISSING (#G6).** Real-file operands CONFORM;
@@ -387,7 +399,7 @@ shared-core #X1 (encoded bodies).
 - [x] 0 success / >0 error; per-file failure continues — `get.rs:544-555`. Bad `-r SID` → exit 1.
 
 ### Test coverage gaps
-- [ ] `-c`, `-i`, `-x`, `-l`, `-L`, `-t` (all MISSING); `-`/directory operands; CSSC-encoded interop fixture (#G1); z-file presence (#G8); `No id keywords` warning (#G9); `-m`/`-n`/`-g`; multi-release partial-SID.
+- [ ] `-c`, `-i`, `-x`, `-l`, `-L`, `-t` (all **implemented** since Phase 4 — untested, not missing); `-`/directory operands; CSSC-encoded interop fixture (#G1); z-file presence (#G8); `No id keywords` warning (#G9); `-m`/`-n`/`-g`; multi-release partial-SID.
 
 ---
 
@@ -545,7 +557,12 @@ and the rewritten file loses its `0444` read-only mode.
 - [x] 0 success / >0 error; per-file aggregation — `rmdel.rs:159,215`. Verified multi-file.
 
 ### Test coverage gaps
-- [ ] No integration tests at all. Need: leaf removal marks `R` + matches CSSC bytes (#R1); non-leaf/initial rejection; p-file rejection; nonexistent/already-removed; `-`/directory operands; ownership (#R2); mode preservation (#R3).
+- [ ] ~~No integration tests at all.~~ *(Stale: `tests/rmdel/mod.rs` has 4 —
+  `rmdel_removes_leaf_delta`, `rmdel_preserves_readonly_mode` (#R3),
+  `rmdel_unknown_sid_fails`, `rmdel_not_an_sccs_file_fails`.)* Still needed:
+  leaf removal marks `R` + matches CSSC bytes (#R1); non-leaf/initial
+  rejection; p-file-locked rejection; already-removed; `-`/directory operands;
+  ownership (#R2); checksum after reweave.
 
 ---
 
@@ -669,7 +686,14 @@ name** (`Command::new("get")`), so the front-end breaks without `$PATH` help.
 - [x] Propagates child exit codes (`sccs.rs:602`); no command → usage exit 2; unknown command → exit 1. Verified.
 
 ### Test coverage gaps
-- [ ] No integration tests at all (`sccs-tests.rs` omits `sccs` and `rmdel`). Need: prefix/`-d`/`-p` resolution; `-r` real-user (#SC1); sibling resolution without `$PATH` (#SC2); each pseudo-command; `info` fields (#SC3); option-splitting (#SC4).
+- [ ] ~~No integration tests at all (`sccs-tests.rs` omits `sccs` and `rmdel`).~~
+  *(Stale on both counts: `sccs-tests.rs:10-19` declares all ten modules, and
+  `tests/sccs/mod.rs` has 3 — `sccs_info_reports_full_pfile_fields` (#SC3),
+  `sccs_edit_resolves_siblings_without_path` (#SC2),
+  `sccs_unknown_command_fails`.)* Still needed: prefix/`-d`/`-p` resolution;
+  `-r` real-user (#SC1); option-splitting (#SC4); the remaining pseudo-commands
+  (`create`, `deledit`, `diffs`, `check`, `tell`, `clean`, `unedit`, `fix`,
+  `enter`).
 
 ---
 
@@ -780,6 +804,7 @@ terminators, multiple matches, `-s`, multi-file headers, and the 0/1 exit rule
 are byte-identical to CSSC. But one Critical defect defeats the utility's primary
 purpose: **`what` aborts on the first file containing non-UTF-8 bytes** — i.e.
 virtually every binary/`.o`/`a.out`, exactly what `what` exists to scan.
+*(#W1 fixed in Phase 11; the paragraph above is kept as the original finding.)*
 
 ### Priority issues
 
@@ -792,22 +817,26 @@ virtually every binary/`.o`/`a.out`, exactly what `what` exists to scan.
 #### Minor
 - [x] ~~**#W2 — Error message format/order differs from CSSC**~~ — WON'T FIX:
   cosmetic only; both go to stderr with a non-zero exit. CONFORMS in substance.
-- [x] **#W3 — Hardcoded-English "Cannot open file" (#X9).** `what.rs:72`. ✓ Phase 13 (#X9).
+- [x] **#W3 — Hardcoded-English "Cannot open file" (#X9).** `what.rs:124`. ✓ Phase 13 (#X9).
 - [x] **#W4 — `-s` buffers the whole file before stopping.** ✓ Phase 11: the
-  byte scanner now returns immediately on the first ident under `-s`.
+  byte scanner now returns immediately on the first ident under `-s`
+  (`what.rs:66-67` → `:86`).
 
 ### Detailed conformance matrix
-- [x] `-s` CONFORMS — `what.rs:21-25,37`; verified (two idents on one line → only first).
-- [x] STDIN not used; **INPUT FILES "any file type" DIVERGES for non-UTF-8 (#W1).**
-- [x] `setlocale` (`what.rs:55`); `LC_MESSAGES` partial (#W3); default signals.
-- [x] `"%s:\n"` header per file (even with zero matches) then `"\t%s\n"` per ident — `what.rs:46,66`; verified.
-- [x] Ident terminates at `" > \n \ NUL` or EOF; resumes scanning — `what.rs:41,48`; verified each terminator.
-- [x] Exit 0 if ≥1 match, 1 otherwise — `what.rs:77`; verified (match/no-match/nonexistent/no-operand/mixed). **#W1 corrupts this** for a non-UTF-8 first file.
+
+*(Citations re-anchored 2026-08-06; every line below still pointed at the
+pre-Phase-11 `what.rs`, so the numbers named unrelated code.)*
+
+- [x] `-s` CONFORMS — `what.rs:21-25` (arg), `:66-67,86` (early return); verified (two idents on one line → only first).
+- [x] STDIN not used; **INPUT FILES "any file type" CONFORMS** — `process_file` (`what.rs:38-99`) reads via `fill_buf`/`consume` and scans `&[u8]` for `MARKER: &[u8] = b"@(#)"` (`:39`), accumulating into `Vec<u8>` (`:45`) and emitting with `write_all` (`:59,93`). It never UTF-8-decodes; the doc comment at `:31-37` states this. *(This line read DIVERGES until 2026-08-06, five audit passes after #W1 was fixed.)*
+- [x] `setlocale`; `LC_MESSAGES` (#W3 ✓ Phase 13); default signals.
+- [x] `"%s:\n"` header per file (even with zero matches) then `"\t%s\n"` per ident; verified.
+- [x] Ident terminates at `" > \n \ NUL` or EOF; resumes scanning — byte-valued predicate `what.rs:40`; verified each terminator.
+- [x] Exit 0 if ≥1 match, 1 otherwise — `what.rs:130`; verified (match/no-match/nonexistent/no-operand/mixed). Byte-safe: a per-file open error warns and continues (`:123-126`).
 
 ### Test coverage gaps
-- [ ] Binary/non-UTF-8 input (#W1) — the single most important use case; the
-  existing `special_characters.txt` only has NUL inside valid UTF-8. Multi-file
-  mixed match/no-match exit; two `@(#)` on one line; ELF/`.o` smoke test.
+- [x] Binary/non-UTF-8 input (#W1) — covered by `what_binary_input_does_not_abort` (`tests/what/mod.rs:189`).
+- [ ] `-s` with multiple operands; stdin operand; two `@(#)` on one line; ELF/`.o` smoke test; multi-file mixed match/no-match exit code.
 
 ---
 

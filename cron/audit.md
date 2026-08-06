@@ -434,7 +434,7 @@ check the spool filename + the (non-conforming) `-l` text. Not covered:
 ## `batch`
 
 **Implementation:** `cron/batch.rs` (396 lines — largely a copy of `at.rs` internals)
-**Tests:** none dedicated.
+**Tests:** `cron/tests/batch/mod.rs` (6 tests; none existed at audit time).
 **Spec:** POSIX.1-2024, Vol. 3 §3, pp. 2695–2698
 **Reference slice:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/batch.md`
 

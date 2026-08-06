@@ -94,7 +94,7 @@ real expression parser before it can be called conformant.
 #### STDIN / INPUT FILES / ENVIRONMENT
 - [x] STDIN not used — CONFORMS.
 - [x] `setlocale(LC_ALL,"")` + `textdomain` present — CONFORMS. `expr.rs:366-368`.
-- [ ] **LC_COLLATE not honored for `=`/`!=` string compare** — DIVERGES (uses Rust `==`/`Ord`, byte order). `expr.rs:166-173`. Minor; fold into #E6/i18n work.
+- [ ] **LC_COLLATE not honored for string compare** — DIVERGES (uses Rust `==`/`Ord`, byte order). `cmpstr`, `expr.rs:174-189`. *(Citation and scope corrected 2026-08-06: the old `expr.rs:166-173` is `cmpint`, which is correct as written; and the defect covers **all six** relational operators, not just `=`/`!=` — `cmpop` (`:191`) falls back to `cmpstr` whenever either side is non-numeric, so `<`, `<=`, `>`, `>=` compare by byte order too.)* `plib::locale::strcoll` (`plib/src/locale.rs:274`) already exists and is used by `cc/ctags.rs:384` and `cc/cxref.rs:533`; `calc` already depends on `plib`. Minor; fold into #E6/i18n work.
 
 #### STDOUT / STDERR
 - [x] Result + `<newline>` to stdout — CONFORMS. `expr.rs:375`.
@@ -111,7 +111,7 @@ Now covered (added in Phases 1–2): operator precedence; `:` matching
 (anchoring, `\(...\)` capture, char-vs-byte length); divide/remainder by zero;
 exit-status assertions (0/1/2); `--` handling; multibyte operands.
 Still not covered:
-- [ ] LC_COLLATE-sensitive `=`/`!=` string comparison.
+- [ ] LC_COLLATE-sensitive string comparison (all six relational operators).
 
 ---
 

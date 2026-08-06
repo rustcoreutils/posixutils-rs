@@ -155,35 +155,44 @@ helper unit tests instead.
 - [x] "copy the input files to an output destination" (103057) — full upload via IPP `print-job` (`lp.rs:122-168`).
 - [x] "If such a device is not available … exit with a non-zero exit status" (103059–103061) — IPP send/connect failure → `Err` → exit 1 (`lp.rs:166-179`).
 - [x] "exclusive access to the device" during writing (103062–103064) — delegated to the IPP server. N/A locally.
-- [x] "associate a unique request ID with each request" (103065) — `<dest>-<job-id>` from the IPP response (`lp.rs:182-190`); degrades to `-0` on a non-conformant server (#9).
+- [x] "associate a unique request ID with each request" (103065) — `<dest>-<job-id>` from the IPP response. ~~degrades to `-0` on a non-conformant server (#9)~~ ✓ fixed: `job_id` is an `Option<i32>` terminated by `ok_or_else(|| gettext("printer response missing job-id"))` (`lp.rs:215-222`), so a response lacking `job-id` is an error rather than a fabricated `-0`.
 - [x] Banner page (103066–103068) — the IPP server's responsibility; `-o` can suppress per implementation. N/A locally.
 
 #### EXIT STATUS / CONSEQUENCES OF ERRORS
 
 - [x] 0 when all input processed (103157) — `do_lp` returns `Ok(())` → `ExitCode::SUCCESS` (`lp.rs:236-237`).
 - [x] >0 on no-device / error (103158) — any `Err` → `ExitCode::FAILURE` (`lp.rs:238-241`).
-- [ ] **First-error aborts remaining operands** (#5) — `lp.rs:215, 218`. Permitted (CONSEQUENCES = Default, 103159–103160) but worth a continue-and-accumulate policy.
+- [x] ~~**First-error aborts remaining operands** (#5)~~ ✓ fixed — the operand loop is `do_lp` (`lp.rs:371-403`) and already continues: a `read_input` failure (`:379-386`) and a `send_print_job` failure (`:389-396`) each `eprintln!`, set `had_error = true`, and `continue`. `:410` returns `Ok(had_error)`, which `main` (`:413-421`) maps to the exit code. The policy is stated in a comment at `:365-367`. *(This box cited `lp.rs:215, 218`, which is now the job-id extraction — the citation went stale when the fix landed and the box was never re-checked.)*
 
 #### Cross-cutting
 
 - [x] **i18n** — `setlocale` + `textdomain` + `bind_textdomain_codeset` + `gettext`-wrapped diagnostics and clap help (`lp.rs:17, 23-50, 230-232`). The cleanest i18n wiring of the crates audited so far.
 - [x] **Regex** — N/A (lp does no pattern matching).
 - [x] **Signals** — N/A (Default).
-- [ ] **Robustness** — `args.copies as i32` overflow (#6); `job-id` `unwrap_or(0)` (#9). No panics/`unwrap()` on external input otherwise (`read_input`/`send_print_job` return `Result`).
+- [ ] **Robustness** — ~~`job-id` `unwrap_or(0)` (#9)~~ ✓ fixed (`lp.rs:222`). Remaining: `args.copies as i32` (#6) at `lp.rs:160` is an unchecked cast whose safety lives 125 lines away in a clap attribute (`value_parser!(u32).range(1..=i64::from(i32::MAX))`, `lp.rs:34`) — correct today, but the invariant is not local to the cast. No panics/`unwrap()` on external input otherwise (`read_input`/`send_print_job` return `Result`).
 
 ### Test coverage signal
 
-16 tests cover the option surface, env-var precedence, `-`/stdin routing, and
-error paths well (they assert "printer error" reached, i.e. options were
-accepted, since no IPP server is present in CI). Gaps that map to findings:
+22 tests (`tests/lp/mod.rs`, 694 lines) cover the option surface, env-var
+precedence, `-`/stdin routing, and error paths well (they assert "printer
+error" reached, i.e. options were accepted, since no IPP server is present in
+CI). That last clause is the shared root cause of every gap below: **no test
+gets past the connection failure**, so no success-path behavior is asserted at
+all. Closing them needs a stub IPP responder on an ephemeral port.
 
-- [ ] No test asserts `-m` actually sends mail (#1) — current test only checks `-m` is *accepted*.
-- [ ] No test asserts `-w` actually writes to the terminal (#2) — same.
+Gaps that map to findings:
+
+- [x] ~~No test feeds a bare printer **name** (non-URI) (#4)~~ — `lp_bare_name_resolves_to_localhost` (`tests/lp/mod.rs:56`) asserts the name resolves rather than being rejected.
+- [x] ~~No test covers multi-file partial-failure continuation (#5)~~ — `lp_multifile_continues_on_error` (`:185`) feeds a nonexistent file then `-`, and asserts both the per-operand diagnostic and that the second operand was still processed.
+- [x] ~~No test covers `-n` > `i32::MAX` overflow (#6)~~ — `lp_n_copies_overflow_rejected` (`:402`) feeds `3000000000` and asserts clap's exit 2.
+
+Genuinely open — **all four need the stub IPP responder**, since each asserts
+behavior that only happens after a job is accepted:
+
+- [ ] No test asserts `-m` actually sends mail (#1) — `lp_m_option_accepted` only checks `-m` is *accepted*.
+- [ ] No test asserts `-w` actually writes to the terminal (#2) — same, via `lp_w_option_accepted`.
 - [ ] No test exercises the no-destination *success* path / system default (#3).
-- [ ] No test feeds a bare printer **name** (non-URI) and asserts the intended behavior (#4).
-- [ ] No test covers multi-file partial-failure continuation (#5).
-- [ ] No test covers `-n` > `i32::MAX` overflow (#6).
-- [ ] No test covers a successful job (request-ID-to-stdout format, `-s` suppression on success) — all current tests stop at the connection failure.
+- [ ] No test covers a successful job (request-ID-to-stdout format, `-s` suppression on success).
 
 ### Suggested PR groupings
 

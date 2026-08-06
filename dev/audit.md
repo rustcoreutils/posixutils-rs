@@ -757,7 +757,7 @@ Functionally implements the seven mode flags (`-d`/`-m`/`-p`/`-q`/`-r`/`-t`/`-x`
 ## `nm`
 
 **Implementation:** `dev/nm.rs` (339 lines, single file; was a 144-line stub at audit time)
-**Tests:** none — no `test_nm_*` entries in `dev/tests/dev-tests.rs`; no fixtures directory.
+**Tests:** 10 `test_nm_*` in `dev/tests/dev-tests.rs:1570-1758` (none existed at audit time). Fixtures are compiled at test time with `cc` into a `TempDir` by `nm_compile_obj` (`:1531`) rather than committed; `nm_run` (`:1552`) uses `env!("CARGO_BIN_EXE_nm")`.
 **Spec:** POSIX.1-2024 (IEEE Std 1003.1-2024), Vol. 3 §3, pp. 3265–3269
 **Reference slice:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/nm.md`
 **Date:** 2026-06-02
@@ -886,7 +886,8 @@ Once issues land, the test plan should include:
 - [x] `-P` output matches the three spec formats byte-for-byte against a fixture object file.
 - [x] Default sort by name (and a regression that proves it sorts).
 - [x] `-v` sort by value.
-- [ ] `-g` filtering retains only globals; `-u` filtering retains only undefined; `-e` retains external + static.
+- [x] `-g` filtering retains only globals (`test_nm_global_filter`); `-u` filtering retains only undefined (`test_nm_undefined_filter`).
+- [ ] `-e` retains external + static — the one selector of the three still unexercised.
 - [x] `-A` prefix on each line; `-A` with an archive emits `"%s[%s]: "`.
 - [x] Multi-file invocation emits `"%s:\n"` headers; single library emits `"%s[%s]:\n"` per member.
 - [x] Archive (`.a`) input parses and emits per-member output.

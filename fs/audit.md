@@ -183,12 +183,14 @@ English.
 
 ### Test coverage signal
 
-Existing tests (`fs/tests/df/mod.rs`) cover the header strings for default/`-k`/`-P`/`-k -P`, a `/` operand, a nonexistent-operand exit code, and `--help`. Gaps that map to findings:
+`fs/tests/df/mod.rs` has 14 tests (raw `Command` + `env!("CARGO_BIN_EXE_df")`,
+not `TestPlan`). *(Three boxes below were ticked 2026-08-06 — the tests were
+added with the fixes and this list was never revisited.)*
 
-- [ ] No test for `-t` (#2) — currently would assert an error.
-- [ ] No test that default output contains a free-inode column (#3).
+- [x] ~~No test for `-t` (#2)~~ — `test_df_total_has_inode_columns` and `test_df_portable_total_mutually_exclusive`.
+- [x] ~~No test that default output contains a free-inode column (#3)~~ — `test_df_default_has_inode_columns`, with the negative cases `test_df_portable_has_no_inode_columns` and `test_df_kilo_has_no_inode_columns`.
+- [x] ~~No test that `df /nonexistent` prints **no** filesystem rows (#5)~~ — `test_df_bad_operand_prints_no_filesystem_rows`, plus `test_df_nonexistent_file` for the exit code and `test_df_operand_does_not_dump_all_filesystems`.
 - [ ] No test pinning the Capacity value against a known reserved-block filesystem (#4).
-- [ ] No test that `df /nonexistent` (or an unmatched valid path) prints **no** filesystem rows (#5).
 - [ ] No test for a non-UTF-8 mount path (#1) — hard to stage portably; at minimum unit-test the name-conversion helper once it returns `OsString`.
 - [ ] No test that diagnostics honor `LC_MESSAGES` (#6).
 

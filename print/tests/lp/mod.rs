@@ -727,3 +727,216 @@ fn lp_stdin_dash_argument() {
         },
     );
 }
+
+// ===========================================================================
+// Stub IPP responder
+//
+// Every other test in this file stops at the connection failure, which is why
+// no success-path behavior was asserted at all. This is the smallest server
+// that lp will accept a job from: it speaks just enough IPP-over-HTTP
+// (RFC 8010) to answer Print-Job with a job-id.
+// ===========================================================================
+
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+
+/// Assemble an IPP response body granting the job the given id.
+fn ipp_ok_response(request_id: u32, job_id: i32) -> Vec<u8> {
+    fn put_attr(buf: &mut Vec<u8>, tag: u8, name: &str, value: &[u8]) {
+        buf.push(tag);
+        buf.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        buf.extend_from_slice(name.as_bytes());
+        buf.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        buf.extend_from_slice(value);
+    }
+
+    let mut b = Vec::new();
+    b.extend_from_slice(&[0x01, 0x01]); // version 1.1
+    b.extend_from_slice(&0u16.to_be_bytes()); // successful-ok
+    b.extend_from_slice(&request_id.to_be_bytes());
+
+    b.push(0x01); // operation-attributes-tag
+    put_attr(&mut b, 0x47, "attributes-charset", b"utf-8");
+    put_attr(&mut b, 0x48, "attributes-natural-language", b"en-us");
+
+    b.push(0x02); // job-attributes-tag
+    put_attr(&mut b, 0x21, "job-id", &job_id.to_be_bytes()); // integer
+    put_attr(&mut b, 0x23, "job-state", &9i32.to_be_bytes()); // enum: completed
+
+    b.push(0x03); // end-of-attributes-tag
+    b
+}
+
+/// Read one HTTP request and reply with `body`.
+fn serve_one(mut stream: TcpStream, job_id: i32) {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+
+    // Read headers, then exactly Content-Length bytes of body.
+    let (header_end, content_length) = loop {
+        let n = match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => n,
+        };
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let headers = String::from_utf8_lossy(&buf[..pos]).to_lowercase();
+            let len = headers
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            break (pos + 4, len);
+        }
+    };
+    while buf.len() < header_end + content_length {
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+
+    // The request-id is bytes 4..8 of the IPP body; echo it back.
+    let body = &buf[header_end..];
+    let request_id = if body.len() >= 8 {
+        u32::from_be_bytes([body[4], body[5], body[6], body[7]])
+    } else {
+        1
+    };
+
+    let ipp = ipp_ok_response(request_id, job_id);
+    let mut resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/ipp\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        ipp.len()
+    )
+    .into_bytes();
+    resp.extend_from_slice(&ipp);
+    let _ = stream.write_all(&resp);
+    let _ = stream.flush();
+}
+
+/// Bind an ephemeral port and serve `count` requests on a background thread.
+/// Returns the `ipp://` URI to point lp at, or `None` if binding failed.
+fn spawn_ipp_stub(job_id: i32, count: usize) -> Option<(String, std::thread::JoinHandle<()>)> {
+    let listener = TcpListener::bind("127.0.0.1:0").ok()?;
+    let port = listener.local_addr().ok()?.port();
+
+    let handle = std::thread::spawn(move || {
+        for _ in 0..count {
+            match listener.accept() {
+                Ok((stream, _)) => serve_one(stream, job_id),
+                Err(_) => break,
+            }
+        }
+    });
+
+    Some((format!("ipp://127.0.0.1:{}/printers/stub", port), handle))
+}
+
+/// A job the printer accepts writes "request id is <dest>-<job-id>" to stdout
+/// (POSIX 103065, 103150-103152) and exits 0.
+#[test]
+fn lp_successful_job_prints_request_id() {
+    let Some((uri, handle)) = spawn_ipp_stub(4242, 1) else {
+        return; // cannot bind a port in this environment
+    };
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("lp"),
+            args: vec![String::from("-d"), uri.clone()],
+            stdin_data: String::from("job payload"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("LPDEST", ""), ("PRINTER", "")],
+        |_, output| {
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "a job the printer accepted must exit 0; stderr={:?}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(stdout, format!("request id is {}-4242\n", uri));
+        },
+    );
+
+    let _ = handle.join();
+}
+
+/// `-s` suppresses the request-ID line on success — the case that could not be
+/// reached while every test stopped at the connection failure.
+#[test]
+fn lp_silent_suppresses_the_request_id_on_success() {
+    let Some((uri, handle)) = spawn_ipp_stub(77, 1) else {
+        return;
+    };
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("lp"),
+            args: vec![String::from("-s"), String::from("-d"), uri.clone()],
+            stdin_data: String::from("job payload"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("LPDEST", ""), ("PRINTER", "")],
+        |_, output| {
+            assert_eq!(output.status.code(), Some(0));
+            assert!(
+                output.stdout.is_empty(),
+                "-s must suppress the request ID, got {:?}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        },
+    );
+
+    let _ = handle.join();
+}
+
+/// Each accepted operand gets its own request ID line, in operand order.
+#[test]
+fn lp_multiple_files_each_report_a_request_id() {
+    let Some((uri, handle)) = spawn_ipp_stub(5, 2) else {
+        return;
+    };
+
+    let td = std::env::temp_dir().join(format!("posixutils_lp_multi_{}", std::process::id()));
+    std::fs::create_dir_all(&td).unwrap();
+    let a = td.join("a.txt");
+    let b = td.join("b.txt");
+    std::fs::write(&a, b"alpha").unwrap();
+    std::fs::write(&b, b"beta").unwrap();
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("lp"),
+            args: vec![
+                String::from("-d"),
+                uri.clone(),
+                a.to_str().unwrap().to_string(),
+                b.to_str().unwrap().to_string(),
+            ],
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("LPDEST", ""), ("PRINTER", "")],
+        |_, output| {
+            assert_eq!(output.status.code(), Some(0));
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let lines: Vec<&str> = stdout.lines().collect();
+            assert_eq!(lines.len(), 2, "one request ID per operand, got {stdout:?}");
+            for line in lines {
+                assert_eq!(line, format!("request id is {}-5", uri));
+            }
+        },
+    );
+
+    let _ = handle.join();
+    let _ = std::fs::remove_dir_all(&td);
+}

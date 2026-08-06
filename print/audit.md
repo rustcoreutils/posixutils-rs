@@ -186,13 +186,15 @@ Gaps that map to findings:
 - [x] ~~No test covers multi-file partial-failure continuation (#5)~~ — `lp_multifile_continues_on_error` (`:185`) feeds a nonexistent file then `-`, and asserts both the per-operand diagnostic and that the second operand was still processed.
 - [x] ~~No test covers `-n` > `i32::MAX` overflow (#6)~~ — `lp_n_copies_overflow_rejected` (`:402`) feeds `3000000000` and asserts clap's exit 2.
 
-Genuinely open — **all four need the stub IPP responder**, since each asserts
-behavior that only happens after a job is accepted:
+A **stub IPP responder** now lives in `tests/lp/mod.rs`: it binds an ephemeral
+port and speaks just enough IPP-over-HTTP (RFC 8010) to answer Print-Job with a
+job-id, so the success path is finally reachable. It self-skips if it cannot
+bind.
 
-- [ ] No test asserts `-m` actually sends mail (#1) — `lp_m_option_accepted` only checks `-m` is *accepted*.
-- [ ] No test asserts `-w` actually writes to the terminal (#2) — same, via `lp_w_option_accepted`.
-- [ ] No test exercises the no-destination *success* path / system default (#3).
-- [ ] No test covers a successful job (request-ID-to-stdout format, `-s` suppression on success).
+- [x] A successful job writes `request id is <dest>-<job-id>` and exits 0 (`lp_successful_job_prints_request_id`); `-s` suppresses it (`lp_silent_suppresses_the_request_id_on_success`); each accepted operand gets its own line (`lp_multiple_files_each_report_a_request_id`).
+- [ ] No test asserts `-m` actually sends mail (#1) — `lp_m_option_accepted` only checks `-m` is *accepted*. Beyond the stub, this needs the mail transport intercepted: `notify_after_print` polls the printer to a terminal job state and then shells out to a mailer. Left open deliberately rather than asserted weakly.
+- [ ] No test asserts `-w` actually writes to the terminal (#2) — same shape as #1, plus a PTY to observe the write.
+- [ ] No test exercises the no-destination *success* path / system default (#3) — needs a configured system default printer, which the stub cannot supply (lp reaches it only via `LPDEST`/`PRINTER` or `-d`).
 
 ### Suggested PR groupings
 

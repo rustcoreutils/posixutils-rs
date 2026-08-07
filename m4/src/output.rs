@@ -181,6 +181,9 @@ impl Output {
     pub fn divert(&mut self, divert_number: i64) -> Result<()> {
         // Any positive buffer number is accepted (POSIX requires 1–9 and leaves
         // larger numbers implementation-defined; GNU m4 supports them).
+        if self.divert_number != divert_number {
+            self.input.invalidate_syncline_position();
+        }
         self.divert_number = divert_number;
         Ok(())
     }
@@ -204,12 +207,23 @@ impl Output {
             // Nothing was ever diverted to this buffer.
             None => return Ok(()),
         };
-        let mut buffer = buffer.borrow_mut();
-        buffer.0.rewind()?;
-        let n = std::io::copy(&mut buffer.0, self)?;
+        let text = {
+            let mut buffer = buffer.borrow_mut();
+            let text = std::mem::take(buffer.0.get_mut());
+            buffer.0.rewind()?;
+            text
+        };
+        let n = text.len();
+        // Splice the buffer verbatim. Its `#line` directives were already
+        // written when the text was diverted, so re-running it through
+        // `write_synced` would both duplicate them and renumber the copy
+        // against the wrong stream.
+        self.write_raw(&text)?;
+        // What follows resumes at an input line unrelated to where the
+        // diverted text came from.
+        self.input
+            .resume_after_raw_output(text.last() != Some(&b'\n'));
         log::debug!("Output::undivert({buffer_number:?}): Undiverted {n} bytes.");
-        buffer.0.get_mut().clear();
-        debug_assert!(buffer.0.get_ref().is_empty());
         Ok(())
     }
 }
@@ -241,20 +255,31 @@ impl TryFrom<usize> for DivertBufferNumber {
 }
 
 impl Output {
-    /// Write `buf` to `output`, inserting `#line` directives after each newline
-    /// when line synchronization is enabled.
+    /// Write `buf` to `output`, letting the input state insert `#line`
+    /// directives when line synchronization is enabled. See
+    /// [`crate::input::InputState::write_synced`].
     fn write_synced(&mut self, output: &mut dyn Write, buf: &[u8]) -> std::io::Result<usize> {
-        if self.input.sync_lines() {
-            let mut n = 0;
-            for c in buf {
-                n += output.write(&[*c])?;
-                if *c == b'\n' {
-                    self.input.emit_syncline(output, true)?;
-                }
+        self.input.write_synced(output, buf)
+    }
+
+    /// Write `buf` to the current diversion target without inserting any `#line`
+    /// directives. Used by `undivert`, whose text already carries its own.
+    fn write_raw(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        match self.diversion_key() {
+            // The `let` bindings keep the `Rc` alive for as long as the borrow
+            // taken from it; returning the expression directly would drop it
+            // while the guard is still live.
+            DiversionTarget::Stdout => {
+                let stdout = self.stdout.clone();
+                let result = stdout.borrow_mut().write_all(buf);
+                result
             }
-            Ok(n)
-        } else {
-            output.write(buf)
+            DiversionTarget::Discard => Ok(()),
+            DiversionTarget::Buffer(key) => {
+                let buffer = self.divert_buffers.entry(key).or_default().clone();
+                let result = buffer.borrow_mut().0.write_all(buf);
+                result
+            }
         }
     }
 }

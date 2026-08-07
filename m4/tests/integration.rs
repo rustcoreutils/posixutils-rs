@@ -140,17 +140,6 @@ macro_rules! m4_test {
     };
 }
 
-// Macro for ignored tests
-macro_rules! m4_test_ignore {
-    ($name:ident) => {
-        #[test]
-        #[ignore]
-        fn $name() {
-            run_test(load_fixture(stringify!($name)));
-        }
-    };
-}
-
 // Macro for expect_error tests
 macro_rules! m4_test_expect_error {
     ($name:ident) => {
@@ -256,6 +245,10 @@ m4_test!(reverse);
 m4_test!(shift);
 m4_test!(sinclude);
 m4_test!(substr);
+m4_test!(synclines_1);
+m4_test!(synclines_2);
+m4_test!(synclines_divert);
+m4_test!(synclines_literals);
 m4_test!(syscmd_sysval);
 m4_test!(trace);
 m4_test!(translit);
@@ -266,16 +259,6 @@ m4_test!(undivert);
 m4_test!(undivert_2);
 m4_test!(undivert_current);
 m4_test!(undivert_nested);
-
-// ============================================================================
-// Ignored tests
-// ============================================================================
-
-// `-s` still follows a BSD-style emission scheme; the fixtures encode GNU's
-// lazy scheme (short `#line N` form, attribution to the source of the next
-// output byte). See `m4/audit.md`.
-m4_test_ignore!(synclines_1);
-m4_test_ignore!(synclines_2);
 
 // ============================================================================
 // Expect error tests (stderr may not match exactly)

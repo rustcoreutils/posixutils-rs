@@ -38,7 +38,7 @@ impl State {
     ) -> crate::Result<Self> {
         let input_state = InputStateRef::new(InputState::new(line_synchronization));
         for i in input {
-            input_state.input_push(i, &mut *stdout.borrow_mut())?;
+            input_state.input_push(i);
         }
         Ok(Self {
             output: OutputState {

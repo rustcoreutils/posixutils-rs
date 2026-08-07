@@ -7,7 +7,7 @@ buffers 1–9, in-memory), `lexer.rs` (160, `MacroName` + libc ctype), `preceden
 `error.rs` (158), and `macros/{mod.rs 229, builtin.rs 1066, eval.rs 190,
 user_defined.rs 99, trace.rs 79}`.
 **Tests:** `m4/tests/integration.rs` (282) driving `m4/fixtures/integration_tests/*`
-(≈60 enabled fixtures, 9 ignored, 7 expect-error). No inline `#[test]` units.
+(≈60 enabled fixtures, none ignored, 7 expect-error). No inline `#[test]` units.
 **Spec:** POSIX.1-2024 (IEEE Std 1003.1-2024), Vol. 3 §3, pp. 3090–3100.
 **Reference:** no sliced spec tree exists on this host; the `m4` section was
 extracted from `~/tmp/POSIX.2024.pdf` (`pdftotext` lines 150010–150620) into
@@ -145,7 +145,7 @@ instead of continuing, and all string handling is **byte-, not character-based**
 Enabled fixtures cover define/pushdef/popdef, divert/undivert (incl. nested), eval,
 ifelse, ifdef, incr/index/len/substr/translit, dnl, shift, m4wrap, m4exit, include/
 sinclude, trace, and recursion. Regression fixtures added while closing the audit
-(now 91 passing / 2 ignored):
+(now 95 passing / 0 ignored):
 
 - [x] `index_empty_second_arg` (#1); `eval_divide_by_zero`, `eval_modulo_by_zero` (#2).
 - [x] `eval_radix` (#3), `eval_base_literals` (#4), `eval_shift_precedence` (#5).
@@ -194,14 +194,34 @@ sinclude, trace, and recursion. Regression fixtures added while closing the audi
     while our own output sits in a buffered writer, so the child's output jumped
     ahead of text we had already produced. Fixed by flushing stdout and stderr
     before the spawn.
-- [ ] `synclines_1` / `synclines_2` remain ignored — the one genuine feature
-  divergence of the seven. `-s` is implemented, but emits reactively after every
-  output newline using the reader's already-advanced line number, so it never
-  produces GNU's short `#line N` form, misattributes lines, and emits both
-  duplicate and missing directives. The fixtures are a faithful GNU oracle
-  (verified byte-identical to GNU 1.4.19's output); the misleading "matches the
-  BSD algorithm" comment in `synclines_2.out` describes the *implementation*,
-  not the expectation. Fix is a lazy emission state machine — see the plan.
+- [x] `synclines_1` / `synclines_2` — the one genuine feature divergence of the
+  seven, now fixed; **no fixture in the crate is ignored any more** (95 passing).
+  `-s` was implemented but emitted *reactively*, after every output newline,
+  using the reader's already-advanced line number, plus an unconditional
+  directive whenever an input was pushed or popped. It therefore never produced
+  the short `#line N` form, misattributed lines, and emitted both duplicate and
+  missing directives. Replaced with GNU's lazy scheme (`InputState::write_synced`):
+  a directive is written immediately *before* the first byte of an output line,
+  only when the output has drifted from the input line that byte came from, and
+  carries the file name only when the input file changed. Two further rules fell
+  out of matching GNU:
+  - **Diversions.** `divert` to a different buffer and `undivert` both invalidate
+    the tracked position, and `undivert` now splices its buffer verbatim
+    (`Output::write_raw`) rather than re-running it through the syncing writer,
+    which had been duplicating the directives the text already carried and
+    renumbering the copy against the wrong stream.
+  - **Comments and quoted strings are never split.** At most one directive is
+    written for a literal, ahead of its first output line, and none at all if it
+    began part-way through a line. POSIX ties `-s` to the c17 preprocessor phase
+    (`m4.md:103756`), where a `#line` landing inside a C comment or string
+    literal would corrupt the translation unit; GNU, which scans a whole literal
+    into one token before shipping it, arrives at the same rule.
+  Verified byte-identical to GNU m4 1.4.19 — both streams and exit status — on
+  `synclines_1`, `synclines_2`, and on new fixtures `synclines_divert`
+  (divert/undivert) and `synclines_literals` (multi-line comment from a macro
+  expansion, literal multi-line comment, multi-line quoted string, and a
+  multi-line expansion that is *not* a literal), plus ad-hoc checks of
+  include-and-return and stdin naming.
 
 ## Suggested PR groupings
 

@@ -1,0 +1,3 @@
+stdout=#line 6 "fixtures/integration_tests/args/synclines_literals.m4"\nA\n<<lit1\nlit2>>\nB\n<<x1\nx2>>\n#line 11\nD\nE s1\ns2 F\nG q1\n#line 14\nq2 H\nI\n
+stderr=
+status=0

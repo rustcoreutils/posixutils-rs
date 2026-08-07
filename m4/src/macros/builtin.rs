@@ -342,10 +342,9 @@ impl IncludeMacro {
         let file = std::fs::File::open(&path)
             .map_err(crate::Error::from)
             .add_context(|| format!("Error opening file {path:?}"))?;
-        state.input.input_push(
-            Input::new(InputRead::File { file, path }),
-            &mut *state.output.output.stdout().borrow_mut(),
-        )?;
+        state
+            .input
+            .input_push(Input::new(InputRead::File { file, path }));
         Ok(state)
     }
 }
@@ -365,11 +364,9 @@ impl MacroImplementation for IncludeMacro {
             // aborting.
             match std::fs::File::open(&path) {
                 Ok(file) => {
-                    let syncline_output = state.output.output.stdout();
-                    state.input.input_push(
-                        Input::new(InputRead::File { file, path }),
-                        &mut *syncline_output.borrow_mut(),
-                    )?;
+                    state
+                        .input
+                        .input_push(Input::new(InputRead::File { file, path }));
                 }
                 Err(error) => {
                     let msg = gettext("cannot open `{}': {}")

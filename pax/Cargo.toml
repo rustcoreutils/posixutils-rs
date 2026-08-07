@@ -17,6 +17,12 @@ requires_root = ["posixutils_test_all"]
 libc.workspace = true
 clap.workspace = true
 gettext-rs.workspace = true
+# Outside CLAUDE.md's preferred set (std, clap, libc, regex, chrono), and kept
+# deliberately: it backs `-z`, which is not in POSIX pax, but also the
+# transparent gzip detection on read (main.rs `is_gzip(peek) || args.gzip`), so
+# dropping it would stop `.tar.gz` archives being readable at all rather than
+# merely removing a flag. Reviewed and retained; do not re-flag without
+# addressing the read path.
 libflate = "2"
 plib = { path = "../plib" }
 

@@ -42,12 +42,17 @@ pub fn run_in(cmd: &str, args: &[&str], cwd: &Path, stdin: &str) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap_or_else(|e| panic!("spawn {cmd}: {e}"));
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(stdin.as_bytes())
-        .unwrap();
+    // A utility that rejects its arguments exits without ever reading stdin,
+    // which closes the read end and makes this write fail with EPIPE. That is
+    // the child behaving correctly, not a test failure, so only a genuine I/O
+    // error is worth panicking over.
+    let mut sink = child.stdin.take().expect("piped stdin");
+    match sink.write_all(stdin.as_bytes()) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(e) => panic!("write stdin to {cmd}: {e}"),
+    }
+    drop(sink);
     child.wait_with_output().expect("wait")
 }
 

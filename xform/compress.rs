@@ -236,13 +236,28 @@ impl FileMetadata {
                         tv_sec: d.as_secs() as libc::time_t,
                         tv_nsec: d.subsec_nanos() as _,
                     },
-                    Err(_) => libc::timespec {
-                        tv_sec: 0,
-                        tv_nsec: 0,
-                    },
+                    // A pre-1970 timestamp: the error carries how far *before*
+                    // the epoch the time is, which is a negative tv_sec.
+                    // tv_nsec has to stay in [0, 1e9), so a sub-second
+                    // remainder borrows one second from tv_sec.
+                    Err(e) => {
+                        let d = e.duration();
+                        let (secs, nsec) = match d.subsec_nanos() {
+                            0 => (-(d.as_secs() as i64), 0),
+                            n => (-(d.as_secs() as i64) - 1, 1_000_000_000 - n as i64),
+                        };
+                        libc::timespec {
+                            tv_sec: secs as libc::time_t,
+                            tv_nsec: nsec as _,
+                        }
+                    }
                 }
             }
 
+            // Best effort, like the chown above: timestamp preservation is a
+            // courtesy on top of an output file that is already complete and
+            // correct, so a failure here must not turn into a non-zero exit.
+            // Both call sites discard this function's result for that reason.
             let times = [to_timespec(self.atime), to_timespec(self.mtime)];
             unsafe {
                 libc::utimensat(libc::AT_FDCWD, path_cstr.as_ptr(), times.as_ptr(), 0);

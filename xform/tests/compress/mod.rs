@@ -1437,6 +1437,55 @@ fn test_compress_preserves_mode_and_mtime() {
     );
 }
 
+/// A timestamp older than the epoch survives the round trip. `duration_since`
+/// reports pre-1970 times as an error carrying the distance *before* the epoch,
+/// which must be turned into a negative `tv_sec` rather than collapsed onto
+/// 1970-01-01.
+#[test]
+fn test_compress_preserves_pre_epoch_mtime() {
+    let td = tempfile::tempdir().unwrap();
+    let source = scratch_file(&td, "old.txt", &b"ancient content\n".repeat(50));
+    let compressed = source.with_extension("txt.Z");
+
+    // 1960-01-01T00:00:00.25Z: negative seconds plus a sub-second part, so the
+    // borrow into tv_nsec is exercised as well.
+    let times = [
+        libc::timespec {
+            tv_sec: -315_619_200,
+            tv_nsec: 250_000_000,
+        },
+        libc::timespec {
+            tv_sec: -315_619_200,
+            tv_nsec: 250_000_000,
+        },
+    ];
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(source.as_os_str().as_bytes()).unwrap();
+    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) };
+    assert_eq!(rc, 0, "test setup: {}", std::io::Error::last_os_error());
+
+    let want_mtime = fs::metadata(&source).unwrap().modified().unwrap();
+    assert!(
+        want_mtime < std::time::UNIX_EPOCH,
+        "test setup: the filesystem did not keep a pre-epoch mtime"
+    );
+
+    run_test(TestPlan {
+        cmd: String::from("compress"),
+        args: vec![source.to_str().unwrap().to_string()],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    assert_eq!(
+        fs::metadata(&compressed).unwrap().modified().unwrap(),
+        want_mtime,
+        "a pre-epoch mtime must be preserved, not collapsed to the epoch"
+    );
+}
+
 /// Decompression restores the same metadata onto the recovered file.
 #[test]
 fn test_uncompress_preserves_mode_and_mtime() {

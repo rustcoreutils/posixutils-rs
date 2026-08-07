@@ -716,19 +716,24 @@ fn format_with_spec(info: &ListEntryInfo, spec: FormatSpec) -> String {
         literal
     };
 
+    // Width and precision count characters, not bytes: `%.N` is a precision on
+    // the string value, and a byte index would both split a multi-byte
+    // character (`String::truncate` panics on a non-boundary index) and
+    // mis-align a column holding a non-ASCII name.
     if let Some(precision) = spec.precision {
-        if rendered.len() > precision {
-            rendered.truncate(precision);
+        if let Some((byte_idx, _)) = rendered.char_indices().nth(precision) {
+            rendered.truncate(byte_idx);
         }
     }
 
     if let Some(width) = spec.width {
-        if rendered.len() < width {
-            let padding = width - rendered.len();
+        let chars = rendered.chars().count();
+        if chars < width {
+            let padding = " ".repeat(width - chars);
             if spec.left_justify {
-                rendered.push_str(&" ".repeat(padding));
+                rendered.push_str(&padding);
             } else {
-                rendered = format!("{}{}", " ".repeat(padding), rendered);
+                rendered.insert_str(0, &padding);
             }
         }
     }
@@ -1040,6 +1045,40 @@ mod tests {
         };
         let result = format_list_entry("%F", &info);
         assert_eq!(result, "path/to/file.txt");
+    }
+
+    /// `%.N` is a precision on the string, so it counts characters. Applying it
+    /// as a byte index panicked whenever the cut landed inside a multi-byte
+    /// character -- `%.1F` on any name with a non-ASCII first character.
+    #[test]
+    fn test_format_list_entry_precision_is_char_counted() {
+        let info = ListEntryInfo {
+            path: "élan.txt",
+            mode: 0o644,
+            size: 0,
+            mtime: 0,
+            atime: None,
+            ctime: None,
+            uid: 0,
+            gid: 0,
+            uname: Some("ünïcode"),
+            gname: None,
+            link_target: None,
+            entry_type: EntryType::Regular,
+            devmajor: 0,
+            devminor: 0,
+        };
+
+        // 'é' is two bytes; a byte-indexed truncate(1) split it and aborted.
+        assert_eq!(format_list_entry("%.1F", &info), "é");
+        assert_eq!(format_list_entry("%.3F", &info), "éla");
+        assert_eq!(format_list_entry("%.1u", &info), "ü");
+        // A precision at or beyond the length leaves the value intact.
+        assert_eq!(format_list_entry("%.99F", &info), "élan.txt");
+
+        // Width padding is also a character count, so a non-ASCII name lines up
+        // with an ASCII one of the same length.
+        assert_eq!(format_list_entry("%10F", &info), "  élan.txt");
     }
 
     #[test]

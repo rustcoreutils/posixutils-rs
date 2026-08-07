@@ -957,6 +957,31 @@ impl SccsFile {
         self.header.deltas.iter().find(|d| d.serial == serial)
     }
 
+    /// Serials of every delta on the ancestor chain from `end` back to
+    /// `start`, inclusive.
+    ///
+    /// This is what a `lo-hi` element of an SCCS list option-argument denotes
+    /// (`get -i`/`-x`, `delta -g`). Returns `None` when either SID is unknown
+    /// or `start` is not an ancestor of `end` — the case the spec singles out
+    /// for a diagnostic.
+    pub fn ancestor_chain(&self, start: &Sid, end: &Sid) -> Option<Vec<u16>> {
+        let start = self.find_delta_by_sid(start)?;
+        let end = self.find_delta_by_sid(end)?;
+
+        let mut serials = Vec::new();
+        let mut cur = end.serial;
+        loop {
+            serials.push(cur);
+            if cur == start.serial {
+                return Some(serials);
+            }
+            match self.find_delta_by_serial(cur) {
+                Some(d) if d.pred_serial != 0 => cur = d.pred_serial,
+                _ => return None,
+            }
+        }
+    }
+
     /// Find delta by SID
     pub fn find_delta_by_sid(&self, sid: &Sid) -> Option<&DeltaEntry> {
         self.header.deltas.iter().find(|d| &d.sid == sid)

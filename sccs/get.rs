@@ -168,28 +168,6 @@ fn delta_after_cutoff(delta: &DeltaEntry, cutoff: (u16, u8, u8, u8, u8, u8)) -> 
 
 /// Resolve a comma/space-separated SID list (e.g. "1.2,1.3") into the set of
 /// delta serial numbers. Unknown SIDs are reported and skipped.
-/// Every delta on the ancestor chain from `end` back to `start`, inclusive.
-///
-/// Returns `None` when `start` is not an ancestor of `end`, which is the case
-/// the spec singles out for a diagnostic (99090-99092).
-fn resolve_sid_range(sccs: &SccsFile, start: &Sid, end: &Sid) -> Option<Vec<u16>> {
-    let start = sccs.find_delta_by_sid(start)?;
-    let end = sccs.find_delta_by_sid(end)?;
-
-    let mut serials = Vec::new();
-    let mut cur = end.serial;
-    loop {
-        serials.push(cur);
-        if cur == start.serial {
-            return Some(serials);
-        }
-        match sccs.find_delta_by_serial(cur) {
-            Some(d) if d.pred_serial != 0 => cur = d.pred_serial,
-            _ => return None,
-        }
-    }
-}
-
 /// Resolve an -i/-x option-argument into delta serials.
 ///
 /// The list grammar is `<list> ::= <range> | <list> , <range>` with
@@ -203,7 +181,7 @@ fn resolve_sid_list(sccs: &SccsFile, list: &str) -> Result<Vec<u16>, String> {
                 (Ok(l), Ok(h)) => (l, h),
                 _ => return Err(format!("{}: {}", tok, gettext("invalid SID range"))),
             };
-            match resolve_sid_range(sccs, &lo_sid, &hi_sid) {
+            match sccs.ancestor_chain(&lo_sid, &hi_sid) {
                 Some(mut r) => serials.append(&mut r),
                 // "A diagnostic message shall be written if the first SID in
                 // the range is not an ancestor of the second SID."

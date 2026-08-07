@@ -311,7 +311,28 @@ it from stdin / prompting. The `v`-flag MR-validation `shall` is unimplemented
 - [x] **`^Am` path unreachable (#D1); `v`-flag validation absent (#D2).**
 
 ### Test coverage gaps
-- [ ] `-m`/MR + `v`-flag required-MR error; `-g` ignore-list; stdin comment (piped + tty); `-p` format; `-`/directory operands; SIGINT cleanup; `-r` among multiple edits; checked-in CSSC interop fixture.
+- [x] Closed 2026-08-07. `-m`/MR + `v`-flag, `-g`, stdin comment and `-p`
+  format were already covered — the box was stale for those. Newly covered:
+  `-`/directory operands (`delta_directory_and_stdin_operands`), `-r` among
+  multiple pending edits including the ambiguity diagnostic
+  (`delta_r_selects_among_multiple_pending_edits`), and SIGINT cleanup
+  (`delta_sigint_removes_transient_files`, which parks delta on the comment
+  read with the z-lock held, signals it, and checks no z-/x-file survives).
+  One defect fell out, #D3 below. CSSC interop fixture dispositioned as for
+  `get` — CSSC does not implement `delta -g` at all, so it cannot serve as the
+  oracle here in any case.
+
+#### `-g` SID ranges *(found 2026-08-07)*
+- [x] **#D3 — `delta -g` did not implement SID ranges.** The option-argument is
+  "a list (see get for the definition of list)" (92229), so an element may be
+  `lo-hi`, but `resolve_ignore_list` split only on ',', space and tab. `-g1.2-1.3`
+  was reported as "no such delta" and then *skipped*, so the delta was recorded
+  with an empty ignore-list — a silently wrong history entry that re-running
+  delta cannot repair. Ranges now resolve through the shared
+  `SccsFile::ancestor_chain` (moved to plib so `get -i`/`-x` and `delta -g`
+  cannot drift apart), and a non-ancestor range aborts before the s-file is
+  touched. Tests `delta_g_accepts_a_sid_range`,
+  `delta_g_rejects_a_range_that_is_not_an_ancestor_chain`.
 
 ---
 

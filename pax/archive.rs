@@ -178,15 +178,26 @@ impl HardLinkTracker {
     /// Check if we've seen this file before (by dev/ino)
     /// Returns the original path if this is a hard link
     pub fn check(&mut self, entry: &ArchiveEntry) -> Option<PathBuf> {
-        if entry.nlink <= 1 {
+        self.check_ids(entry.dev, entry.ino, entry.nlink, &entry.path)
+    }
+
+    /// The same, for a caller that holds the ids directly rather than an entry.
+    ///
+    /// `record` is what a later link to the same file will be pointed at: the
+    /// archive member path when writing, the destination path when copying.
+    /// That difference is the only reason copy mode used to carry its own copy
+    /// of this type -- one which re-stat'd every file the caller had already
+    /// stat'd.
+    pub fn check_ids(&mut self, dev: u64, ino: u64, nlink: u32, record: &Path) -> Option<PathBuf> {
+        if nlink <= 1 {
             return None;
         }
 
-        let key = (entry.dev, entry.ino);
+        let key = (dev, ino);
         if let Some(original) = self.seen.get(&key) {
             Some(original.clone())
         } else {
-            self.seen.insert(key, entry.path.clone());
+            self.seen.insert(key, record.to_path_buf());
             None
         }
     }

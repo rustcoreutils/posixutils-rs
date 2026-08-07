@@ -13,11 +13,11 @@
 //! without creating an intermediate archive. Hard links are created
 //! between source and destination when possible (with -l option).
 
+use crate::archive::HardLinkTracker;
 use crate::error::{PaxError, PaxResult};
 use crate::interactive::{InteractivePrompter, RenameResult};
 use crate::pattern::{matches_any, Pattern};
 use crate::subst::{apply_substitutions, SubstResult, Substitution};
-use std::collections::HashMap;
 use std::fs::{self, File, Permissions};
 use std::io::{Read, Write};
 #[cfg(unix)]
@@ -62,47 +62,6 @@ pub struct CopyOptions {
     /// Process file-creation mask, applied to the mode of copied files when the
     /// mode is not explicitly preserved (no `-p p`/`-p e`).
     pub umask: u32,
-}
-
-/// Tracks hard links during copy to preserve link structure
-#[derive(Debug, Default)]
-struct HardLinkTracker {
-    /// Maps (dev, ino) to the destination path
-    seen: HashMap<(u64, u64), PathBuf>,
-}
-
-impl HardLinkTracker {
-    fn new() -> Self {
-        HardLinkTracker {
-            seen: HashMap::new(),
-        }
-    }
-
-    /// Check if we've seen this file before (by dev/ino)
-    /// Returns the destination path if this is a hard link to a file we already copied
-    #[cfg(unix)]
-    fn check(&mut self, src_path: &Path, dest_path: &Path) -> PaxResult<Option<PathBuf>> {
-        let metadata = fs::symlink_metadata(src_path)?;
-
-        // Only track files with multiple links
-        if metadata.nlink() <= 1 {
-            return Ok(None);
-        }
-
-        let key = (metadata.dev(), metadata.ino());
-        if let Some(original_dest) = self.seen.get(&key) {
-            Ok(Some(original_dest.clone()))
-        } else {
-            self.seen.insert(key, dest_path.to_path_buf());
-            Ok(None)
-        }
-    }
-
-    #[cfg(not(unix))]
-    fn check(&mut self, _src_path: &Path, _dest_path: &Path) -> PaxResult<Option<PathBuf>> {
-        // Hard link tracking not supported on non-Unix
-        Ok(None)
-    }
 }
 
 /// Copy files to a destination directory
@@ -551,7 +510,13 @@ fn copy_file(
     }
 
     // Check if this is a hard link to a file we already copied
-    if let Some(link_target) = link_tracker.check(src, dest)? {
+    // The caller already stat'd this file, so pass the ids straight through.
+    if let Some(link_target) = link_tracker.check_ids(
+        metadata.dev(),
+        metadata.ino(),
+        metadata.nlink() as u32,
+        dest,
+    ) {
         // Create hard link to the already-copied file
         if dest.exists() {
             fs::remove_file(dest)?;

@@ -544,6 +544,8 @@ fn build_entry(path: &Path, metadata: &Metadata, entry_type: EntryType) -> PaxRe
         entry.mtime_nsec = metadata.mtime_nsec() as u32;
         entry.atime = Some(metadata.atime() as u64);
         entry.atime_nsec = metadata.atime_nsec() as u32;
+        entry.ctime = Some(metadata.ctime() as u64);
+        entry.ctime_nsec = metadata.ctime_nsec() as u32;
         entry.dev = metadata.dev();
         entry.ino = metadata.ino();
         entry.nlink = metadata.nlink() as u32;

@@ -54,6 +54,12 @@ pub struct ArchiveEntry {
     pub atime: Option<u64>,
     /// Access time nanoseconds (for pax format)
     pub atime_nsec: u32,
+    /// Inode change time (seconds since epoch). Not a POSIX pax keyword -- see
+    /// `ExtendedHeader::ctime` -- but carried so archives that do record one can
+    /// be listed, and so `-o times` can write one.
+    pub ctime: Option<u64>,
+    /// Change time nanoseconds (for pax format)
+    pub ctime_nsec: u32,
     /// Type of entry
     pub entry_type: EntryType,
     /// Link target for symlinks and hardlinks
@@ -87,6 +93,8 @@ impl ArchiveEntry {
             mtime_nsec: 0,
             atime: None,
             atime_nsec: 0,
+            ctime: None,
+            ctime_nsec: 0,
             entry_type,
             link_target: None,
             uname: None,

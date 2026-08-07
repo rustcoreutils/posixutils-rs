@@ -199,6 +199,8 @@ fn print_entry<W: Write>(
             mode: entry.mode,
             size: entry.size,
             mtime: entry.mtime,
+            atime: entry.atime,
+            ctime: entry.ctime,
             uid: entry.uid,
             gid: entry.gid,
             uname: entry.uname.as_deref(),

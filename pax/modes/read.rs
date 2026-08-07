@@ -234,6 +234,12 @@ fn apply_keyword_overrides(entry: &mut ArchiveEntry, opts: &crate::options::Form
                     entry.atime_nsec = (t.fract() * 1_000_000_000.0) as u32;
                 }
             }
+            "ctime" => {
+                if let Ok(t) = value.parse::<f64>() {
+                    entry.ctime = Some(t as u64);
+                    entry.ctime_nsec = (t.fract() * 1_000_000_000.0) as u32;
+                }
+            }
             _ => {}
         }
     }

@@ -89,6 +89,16 @@ pub struct ExtendedHeader {
     pub atime: Option<PaxTime>,
     /// mtime - file modification time
     pub mtime: Option<PaxTime>,
+    /// ctime - inode change time.
+    ///
+    /// Not a POSIX keyword: IEEE Std 1003.1-2001/Cor 2-2004 (XCU/TC2/D6/25)
+    /// removed it because `st_ctime` is an inode change time, not the file
+    /// creation time the keyword claimed to hold. It survives as a widely
+    /// written extension (star, GNU tar), and rule 7 of the listopt format
+    /// admits implementation extensions, so it is parsed for listing and
+    /// written under `-o times`. It is never restored on extract -- POSIX
+    /// gives no portable way to set it.
+    pub ctime: Option<PaxTime>,
     /// path - file pathname
     pub path: Option<String>,
     /// linkpath - link target pathname
@@ -194,6 +204,9 @@ impl ExtendedHeader {
             "mtime" => {
                 self.mtime = Some(parse_pax_time(value)?);
             }
+            "ctime" => {
+                self.ctime = Some(parse_pax_time(value)?);
+            }
             "path" => {
                 self.path = Some(value.to_string());
             }
@@ -269,6 +282,9 @@ impl ExtendedHeader {
         if let Some(mtime) = self.mtime {
             write_if_allowed("mtime", &format_pax_time(mtime));
         }
+        if let Some(ctime) = self.ctime {
+            write_if_allowed("ctime", &format_pax_time(ctime));
+        }
         if let Some(ref path) = self.path {
             write_if_allowed("path", path);
         }
@@ -303,6 +319,7 @@ impl ExtendedHeader {
             ("hdrcharset", self.hdrcharset.is_some()),
             ("atime", self.atime.is_some()),
             ("mtime", self.mtime.is_some()),
+            ("ctime", self.ctime.is_some()),
             ("path", self.path.is_some()),
             ("linkpath", self.linkpath.is_some()),
             ("size", self.size.is_some()),
@@ -331,6 +348,7 @@ impl ExtendedHeader {
                 "hdrcharset",
                 "atime",
                 "mtime",
+                "ctime",
                 "path",
                 "linkpath",
                 "size",
@@ -399,6 +417,14 @@ impl ExtendedHeader {
                 entry.atime_nsec = atime.nsec;
             }
         }
+        // Carried onto the entry so `-o listopt=%(ctime)T` can report it. The
+        // extractor never applies it to the filesystem.
+        if keep("ctime") {
+            if let Some(ctime) = self.ctime {
+                entry.ctime = Some(ctime.sec as u64);
+                entry.ctime_nsec = ctime.nsec;
+            }
+        }
     }
 
     /// Create extended header with options controlling what to include
@@ -457,6 +483,16 @@ impl ExtendedHeader {
                 None => (entry.mtime as i64, entry.mtime_nsec),
             };
             header.atime = Some(PaxTime { sec, nsec });
+
+            // ctime alongside it. POSIX's `times` keyword names only atime and
+            // mtime, but every implementation that writes one writes all three,
+            // and an archive without it cannot answer `%(ctime)T`.
+            if let Some(ctime) = entry.ctime {
+                header.ctime = Some(PaxTime {
+                    sec: ctime as i64,
+                    nsec: entry.ctime_nsec,
+                });
+            }
         }
 
         // uname/gname with non-ASCII characters

@@ -428,7 +428,39 @@ implemented them, contradicting the already-ticked #G2/#G3/#G4/#G7 above.)*
   operand.
 
 ### Test coverage gaps
-- [ ] `-c`, `-i`, `-x`, `-l`, `-L`, `-t` (all **implemented** since Phase 4 — untested, not missing); `-`/directory operands; CSSC-encoded interop fixture (#G1); z-file presence (#G8); `No id keywords` warning (#G9); `-m`/`-n`/`-g`; multi-release partial-SID.
+- [x] Closed 2026-08-07. `-m`/`-n`/`-g`, z-file (#G8), `No id keywords`
+  including the `i`-flag fatal path (#G9), `-`/directory operands, and the
+  multi-release partial-SID cases are now covered; `-c`, `-l`, `-L`, `-t` and
+  `-x` were re-probed against CSSC 1.4.1 and already matched, so the box was
+  stale for those. Two genuine defects fell out of the re-probe and are
+  recorded as #G14 and #G15 below. Cutoff semantics that nothing had exercised
+  — omitted units defaulting to their *maximum*, non-numeric separators, and
+  the [69,99]→19xx year window — are covered by
+  `get_cutoff_omitted_units_default_to_maximum`.
+
+  The CSSC-encoded interop fixture (#G1) is **not** being staged: CI hosts have
+  no CSSC, so a checked-in fixture would be an opaque blob nobody could
+  regenerate, and a skip-if-absent test would never run in CI. CSSC interop was
+  verified ad hoc throughout this and the preceding passes and is recorded
+  per-utility; that is the disposition, not a deferred task.
+
+#### `-i`/`-x` SID ranges *(found 2026-08-07)*
+- [x] **#G14 — `-i`/`-x` did not implement SID ranges.** The option-argument is
+  `<list> ::= <range> | <list> , <range>` with `<range> ::= SID | SID - SID`
+  (99085-99087), but `resolve_sid_list` split only on ',' and space. So
+  `-i1.1-1.3` was diagnosed as "invalid SID" and then, worse, the run
+  *continued* and retrieved a version built from the wrong delta set. A SID
+  never contains '-', so the separator is unambiguous. Ranges now resolve to
+  the ancestor chain from the second SID back to the first, and a range whose
+  first SID is not an ancestor of the second is fatal rather than silently
+  retrieving something else — the diagnostic 99090-99092 mandates. CSSC agrees
+  on both. Tests `get_include_accepts_a_sid_range`,
+  `get_rejects_a_range_that_is_not_an_ancestor_chain`.
+
+- [x] **#G15 — `-x` overrode `-i` for a delta named by both.** `-i` was applied
+  to the delta set before `-x`, so exclusion won. `-i` is "forced to be
+  applied" (99084) and must outrank "forced not to be applied"; CSSC resolves
+  the overlap the same way. The two blocks are now ordered `-x` then `-i`.
 
 ---
 

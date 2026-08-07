@@ -256,6 +256,87 @@ fn get_include_excluded_notation() {
     });
 }
 
+/// An -i/-x option-argument is a comma-separated list whose elements may be
+/// SID ranges: `<list> ::= <range> | <list> , <range>`, `<range> ::= SID |
+/// SID - SID` (99085-99087). A SID never contains '-', so the separator is
+/// unambiguous.
+#[test]
+fn get_include_accepts_a_sid_range() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::copy(fixture_path("s.multi"), tmp.path().join("s.multi")).unwrap();
+
+    // Baseline: excluding 1.2 and 1.3 reverts both of their changes.
+    let out = super::common::run_in("get", &["-p", "-s", "-x1.2,1.3", "s.multi"], tmp.path(), "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "line1\nline2\nline3\n",
+        "-x must drop both named deltas"
+    );
+
+    // -i names the same two deltas as a range and wins: "forced to be
+    // applied" (99084) outranks "forced not to be applied".
+    let out = super::common::run_in(
+        "get",
+        &["-p", "-s", "-x1.2,1.3", "-i1.2-1.3", "s.multi"],
+        tmp.path(),
+        "",
+    );
+    assert!(
+        out.status.success(),
+        "get -i range failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "line1\nmodified-line2\nline3\nline4\n",
+        "an -i range must force its whole span back in"
+    );
+
+    // A range spanning the entire history behaves the same way.
+    let out = super::common::run_in(
+        "get",
+        &["-p", "-s", "-x1.2,1.3", "-i1.1-1.3", "s.multi"],
+        tmp.path(),
+        "",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "line1\nmodified-line2\nline3\nline4\n"
+    );
+}
+
+/// "A diagnostic message shall be written if the first SID in the range is not
+/// an ancestor of the second SID in the range" (99090-99092). Retrieving some
+/// other version instead would silently hand back text nobody asked for, so
+/// the run stops.
+#[test]
+fn get_rejects_a_range_that_is_not_an_ancestor_chain() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::copy(fixture_path("s.multi"), tmp.path().join("s.multi")).unwrap();
+
+    let out = super::common::run_in("get", &["-p", "-s", "-i1.3-1.1", "s.multi"], tmp.path(), "");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a reversed range must not be retrieved anyway"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "no text may be written for a rejected range, got {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("ancestor"),
+        "expected the ancestry diagnostic, got {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A syntactically broken range is rejected the same way.
+    let out = super::common::run_in("get", &["-p", "-s", "-ix-y", "s.multi"], tmp.path(), "");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+}
+
 #[test]
 fn get_cutoff_excludes_newer_deltas() {
     // -c cutoff between delta 1.2 (22:24:57) and 1.3 (22:25:05) drops 1.3.
@@ -267,6 +348,57 @@ fn get_cutoff_excludes_newer_deltas() {
             fixture.to_string_lossy().into(),
         ],
         "line1\nline2\nline3\nline4\n",
+    );
+}
+
+/// The cutoff's omitted trailing units default to their *maximum*, not their
+/// minimum: "-c 7502 is equivalent to -c 750228235959" (99063-99065). Getting
+/// this backwards would silently exclude every delta in the named period
+/// rather than including them.
+///
+/// The fixture's deltas are 1.1 @ 25/12/12 22:24:47, 1.2 @ 22:24:57 and
+/// 1.3 @ 22:25:05, so a cutoff can separate them at second granularity.
+#[test]
+fn get_cutoff_omitted_units_default_to_maximum() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::copy(fixture_path("s.multi"), tmp.path().join("s.multi")).unwrap();
+
+    let text = |args: &[&str]| -> String {
+        let out = super::common::run_in("get", args, tmp.path(), "");
+        assert!(
+            out.status.success(),
+            "get {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    const ALL: &str = "line1\nmodified-line2\nline3\nline4\n";
+    // Year alone means the end of that year, so every delta is in.
+    assert_eq!(text(&["-p", "-s", "-c25", "s.multi"]), ALL);
+    assert_eq!(text(&["-p", "-s", "-c2512", "s.multi"]), ALL);
+    // Down to the minute: seconds default to 59, so 22:24:57 is in and
+    // 22:25:05 is out.
+    assert_eq!(
+        text(&["-p", "-s", "-c2512122224", "s.multi"]),
+        "line1\nline2\nline3\nline4\n",
+        "seconds must default to 59, keeping the 22:24:57 delta"
+    );
+
+    // "Any number of non-numeric characters may separate the various 2-digit
+    // pieces" (99066-99068).
+    assert_eq!(
+        text(&["-p", "-s", "-c25/12/12 22:24:57", "s.multi"]),
+        "line1\nline2\nline3\nline4\n",
+        "a punctuated cutoff must parse the same as the bare digits"
+    );
+
+    // Two-digit years in [69,99] are 19xx (99057-99058), so 1969 predates
+    // every delta and nothing is retrieved.
+    assert_eq!(
+        text(&["-p", "-s", "-c69", "s.multi"]),
+        "",
+        "-c69 means 1969, which is before the whole history"
     );
 }
 

@@ -168,9 +168,56 @@ fn delta_after_cutoff(delta: &DeltaEntry, cutoff: (u16, u8, u8, u8, u8, u8)) -> 
 
 /// Resolve a comma/space-separated SID list (e.g. "1.2,1.3") into the set of
 /// delta serial numbers. Unknown SIDs are reported and skipped.
-fn resolve_sid_list(sccs: &SccsFile, list: &str) -> Vec<u16> {
+/// Every delta on the ancestor chain from `end` back to `start`, inclusive.
+///
+/// Returns `None` when `start` is not an ancestor of `end`, which is the case
+/// the spec singles out for a diagnostic (99090-99092).
+fn resolve_sid_range(sccs: &SccsFile, start: &Sid, end: &Sid) -> Option<Vec<u16>> {
+    let start = sccs.find_delta_by_sid(start)?;
+    let end = sccs.find_delta_by_sid(end)?;
+
+    let mut serials = Vec::new();
+    let mut cur = end.serial;
+    loop {
+        serials.push(cur);
+        if cur == start.serial {
+            return Some(serials);
+        }
+        match sccs.find_delta_by_serial(cur) {
+            Some(d) if d.pred_serial != 0 => cur = d.pred_serial,
+            _ => return None,
+        }
+    }
+}
+
+/// Resolve an -i/-x option-argument into delta serials.
+///
+/// The list grammar is `<list> ::= <range> | <list> , <range>` with
+/// `<range> ::= SID | SID - SID` (99085-99087). A SID never contains '-', so
+/// the separator is unambiguous.
+fn resolve_sid_list(sccs: &SccsFile, list: &str) -> Result<Vec<u16>, String> {
     let mut serials = Vec::new();
     for tok in list.split([',', ' ']).filter(|s| !s.is_empty()) {
+        if let Some((lo, hi)) = tok.split_once('-') {
+            let (lo_sid, hi_sid) = match (lo.parse::<Sid>(), hi.parse::<Sid>()) {
+                (Ok(l), Ok(h)) => (l, h),
+                _ => return Err(format!("{}: {}", tok, gettext("invalid SID range"))),
+            };
+            match resolve_sid_range(sccs, &lo_sid, &hi_sid) {
+                Some(mut r) => serials.append(&mut r),
+                // "A diagnostic message shall be written if the first SID in
+                // the range is not an ancestor of the second SID."
+                None => {
+                    return Err(format!(
+                        "{}: {}",
+                        tok,
+                        gettext("first SID in range is not an ancestor of the second")
+                    ))
+                }
+            }
+            continue;
+        }
+
         match tok.parse::<Sid>() {
             Ok(sid) => {
                 if let Some(d) = sccs.find_delta_by_sid(&sid) {
@@ -184,7 +231,7 @@ fn resolve_sid_list(sccs: &SccsFile, list: &str) -> Vec<u16> {
             }
         }
     }
-    serials
+    Ok(serials)
 }
 
 /// True if `ancestor` is `serial` itself or appears in `serial`'s predecessor
@@ -793,16 +840,26 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
     let info_to_stderr = args.to_stdout || args.lfile_stdout;
 
     // Resolve -i / -x SID lists into delta serials.
-    let included_serials: Vec<u16> = args
-        .include
-        .as_deref()
-        .map(|l| resolve_sid_list(&sccs, l))
-        .unwrap_or_default();
-    let excluded_serials: Vec<u16> = args
-        .exclude
-        .as_deref()
-        .map(|l| resolve_sid_list(&sccs, l))
-        .unwrap_or_default();
+    // A malformed range is fatal: silently retrieving a version the caller did
+    // not ask for is worse than refusing, and the g-file would otherwise be
+    // written from the wrong delta set.
+    let mut list_error = None;
+    let mut resolve = |list: Option<&str>| -> Vec<u16> {
+        match list.map(|l| resolve_sid_list(&sccs, l)) {
+            Some(Ok(v)) => v,
+            Some(Err(e)) => {
+                list_error.get_or_insert(e);
+                Vec::new()
+            }
+            None => Vec::new(),
+        }
+    };
+    let included_serials: Vec<u16> = resolve(args.include.as_deref());
+    let excluded_serials: Vec<u16> = resolve(args.exclude.as_deref());
+    if let Some(e) = list_error {
+        eprintln!("get: {}: {}", sfile_path.display(), e);
+        return Ok(false);
+    }
 
     // Compute applied set, then apply -c cutoff and -i/-x adjustments.
     let mut applied_set = sccs
@@ -822,18 +879,6 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
                 .map(|d| !delta_after_cutoff(d, cutoff))
                 .unwrap_or(false)
         });
-    }
-
-    // -i: force-include the listed deltas (and their predecessor chains).
-    for &inc in &included_serials {
-        let mut cur = inc;
-        while cur != 0 {
-            applied_set.insert(cur);
-            match sccs.find_delta_by_serial(cur) {
-                Some(d) => cur = d.pred_serial,
-                None => break,
-            }
-        }
     }
 
     // -x: force-exclude the listed deltas. Only the named deltas are dropped
@@ -864,6 +909,21 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
                 .map(|d| d.sid)
                 .unwrap_or_default()
         });
+    }
+
+    // -i: force-include the listed deltas and their predecessor chains. This
+    // runs after -x, not before: -i is "forced to be applied" (99084), so a
+    // delta named by both options ends up applied. CSSC resolves the overlap
+    // the same way.
+    for &inc in &included_serials {
+        let mut cur = inc;
+        while cur != 0 {
+            applied_set.insert(cur);
+            match sccs.find_delta_by_serial(cur) {
+                Some(d) => cur = d.pred_serial,
+                None => break,
+            }
+        }
     }
 
     // Print SID info and -i/-x notation (unless silent)

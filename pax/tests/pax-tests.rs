@@ -18,6 +18,7 @@ mod malformed;
 mod multivolume;
 mod options;
 mod privileges;
+mod security;
 mod special;
 mod subst;
 mod update;

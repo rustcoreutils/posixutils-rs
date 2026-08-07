@@ -1399,3 +1399,56 @@ fn test_option_listopt_time_keyword_absent_from_archive() {
         "mtime must still render without -o times"
     );
 }
+
+/// `-o delete=` and `-o keyword:=value` were honored on extract but silently
+/// ignored on list: list mode built the pax reader without its options and
+/// never applied the keyword overrides, so a listing could disagree with what
+/// extracting the same archive would produce.
+#[cfg(unix)]
+#[test]
+fn test_option_list_honors_keyword_override() {
+    let temp = TempDir::new().unwrap();
+    let (archive, _) = archive_with_times(&temp);
+
+    // Forcing the path changes what the listing must report.
+    let out = run_pax(&["-f", archive.to_str().unwrap(), "-o", "path:=forced.txt"]);
+    assert_success(&out, "list with a keyword override");
+    assert!(
+        stdout_str(&out).lines().any(|l| l == "forced.txt"),
+        "list mode must apply -o keyword:=value: {}",
+        stdout_str(&out)
+    );
+}
+
+/// `-o delete=atime` suppresses the record, so the listing must stop reporting
+/// it -- the same keyword filtering extraction already performed.
+#[cfg(unix)]
+#[test]
+fn test_option_list_honors_delete() {
+    let temp = TempDir::new().unwrap();
+    let (archive, _) = archive_with_times(&temp);
+
+    assert!(
+        !listopt_with(&archive, "%(atime)T", &["-o", "delete=atime"]).contains("Jul"),
+        "-o delete=atime must remove the record from the listing too"
+    );
+    assert!(
+        listopt(&archive, "%(atime)T").contains("Jul"),
+        "and without it the atime is still reported"
+    );
+}
+
+#[cfg(unix)]
+fn listopt_with(archive: &std::path::Path, format: &str, extra: &[&str]) -> String {
+    let mut args: Vec<String> = vec![
+        "-f".into(),
+        archive.to_str().unwrap().into(),
+        "-o".into(),
+        format!("listopt={}", format),
+    ];
+    args.extend(extra.iter().map(|s| s.to_string()));
+    let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let out = run_pax(&refs);
+    assert_success(&out, "pax list with listopt");
+    stdout_str(&out).trim_end().to_string()
+}

@@ -217,7 +217,10 @@ fn extract_entries<R: ArchiveReader>(archive: &mut R, options: &ReadOptions) -> 
 /// standard keywords that map onto an entry field are handled; unknown keywords
 /// have no extraction effect. `delete=` is handled in the pax reader (so the
 /// ustar value remains), not here.
-fn apply_keyword_overrides(entry: &mut ArchiveEntry, opts: &crate::options::FormatOptions) {
+pub(crate) fn apply_keyword_overrides(
+    entry: &mut ArchiveEntry,
+    opts: &crate::options::FormatOptions,
+) {
     for (keyword, value) in opts.per_file_options() {
         match keyword.as_str() {
             "uid" => {

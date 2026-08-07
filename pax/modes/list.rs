@@ -56,7 +56,10 @@ pub fn list_archive<R: Read, W: Write>(
             list_entries(&mut archive, writer, options)
         }
         ArchiveFormat::Pax => {
-            let mut archive = PaxReader::new(reader);
+            // Same as read mode: without the options the reader ignores
+            // `-o delete=`, so a keyword suppressed on extract was still shown
+            // in the listing.
+            let mut archive = PaxReader::new(reader).with_options(options.format_options.clone());
             list_entries(&mut archive, writer, options)
         }
     }
@@ -87,6 +90,9 @@ fn list_entries<R: ArchiveReader, W: Write>(
                 archive.skip_data()?;
                 continue;
             }
+            // `-o keyword:=value` forces a value regardless of what the archive
+            // carried, and the listing must report what extraction would use.
+            crate::modes::read::apply_keyword_overrides(&mut entry, &options.format_options);
             // Apply substitutions
             if !options.substitutions.is_empty() {
                 let path_str = entry.path.to_string_lossy();

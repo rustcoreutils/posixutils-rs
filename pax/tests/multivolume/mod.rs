@@ -260,16 +260,23 @@ fn test_multi_volume_multiple_files() {
     }
 }
 
+/// A member whose data does not fit in one volume must be diagnosed.
+///
+/// pax does not split a member across volumes: volumes contain whole members.
+/// Previously the size check guarded only the 512-byte header, so the payload
+/// streamed past the tape length and produced a single over-length volume that
+/// silently violated the limit the user asked for.
+///
+/// This test replaces one that asserted `success() || code().is_some()` and so
+/// could never fail.
 #[test]
-fn test_multi_volume_split_small() {
+fn test_multi_volume_member_larger_than_volume_is_diagnosed() {
     let temp = TempDir::new().unwrap();
     let src_dir = temp.path().join("source");
     let archive = temp.path().join("multi.tar");
 
-    // Create a file larger than the tape length to force a split
     fs::create_dir(&src_dir).unwrap();
     let mut f = File::create(src_dir.join("large.txt")).unwrap();
-    // Write 5KB of data
     for _ in 0..100 {
         writeln!(
             f,
@@ -278,9 +285,9 @@ fn test_multi_volume_split_small() {
         .unwrap();
     }
     drop(f);
+    let size = fs::metadata(src_dir.join("large.txt")).unwrap().len();
+    assert!(size > 2048, "test file must exceed the tape length");
 
-    // Create multi-volume archive with small tape length to force multiple volumes
-    // Set tape length to 2KB to ensure we get at least 2 volumes
     let output = run_pax_in_dir(
         &[
             "-w",
@@ -297,27 +304,52 @@ fn test_multi_volume_split_small() {
         &src_dir,
     );
 
-    // For now, just check that it doesn't crash
-    // The implementation should handle the split even if we can't fully test extraction
-    // of split archives without the reader part being integrated
+    assert_failure(&output, "a member larger than the volume");
+    let stderr = stderr_str(&output);
     assert!(
-        output.status.success() || output.status.code().is_some(),
-        "pax should either succeed or fail gracefully: {:?}",
-        stderr_str(&output)
+        stderr.contains("large.txt") && stderr.contains("volume"),
+        "the diagnostic should name the member and the volume limit: {stderr}"
     );
-
-    // If successful, verify the archive was created
-    if output.status.success() {
-        assert!(archive.exists(), "First volume should be created");
-
-        // Check verbose output mentions volumes
-        let stderr = stderr_str(&output);
-        // Volume 1 should always be mentioned
+    // Whatever was written must not exceed the requested volume size.
+    if archive.exists() {
         assert!(
-            stderr.contains("volume 1") || stderr.contains("volume"),
-            "Verbose output should mention volumes"
+            fs::metadata(&archive).unwrap().len() <= 2048,
+            "a volume must never exceed --tape-length"
         );
     }
+}
+
+/// -M writes ustar headers unconditionally. Asking for a different interchange
+/// format has to be refused rather than silently downgraded.
+#[test]
+fn test_multi_volume_rejects_non_ustar_format() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("mv.tar");
+    fs::create_dir(&src_dir).unwrap();
+    fs::write(src_dir.join("f.txt"), b"x").unwrap();
+
+    let output = run_pax_in_dir(
+        &[
+            "-w",
+            "-M",
+            "--tape-length",
+            "1000000",
+            "-x",
+            "pax",
+            "-f",
+            archive.to_str().unwrap(),
+            "f.txt",
+        ],
+        &src_dir,
+    );
+
+    assert_failure(&output, "-M with -x pax");
+    assert!(
+        stderr_str(&output).contains("multi-volume"),
+        "the diagnostic should explain that -M is ustar-only: {}",
+        stderr_str(&output)
+    );
 }
 
 // ==================== Multi-Volume Read Tests ====================

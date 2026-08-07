@@ -28,6 +28,10 @@
 //!
 //! ## Limitations
 //!
+//! - pax does not *write* split members: a volume holds whole members only, and
+//!   a member too large for one volume is refused with a diagnostic. The 'M'
+//!   continuation handling below is therefore read-only, kept because archives
+//!   produced by GNU tar do contain split members.
 //! - Only supported for ustar format (not cpio)
 //! - Compression is not supported with multi-volume
 //! - Volume scripts are executed synchronously
@@ -80,19 +84,6 @@ pub struct MultiVolumeWriter {
     options: MultiVolumeOptions,
     /// Current output file
     writer: Option<File>,
-    /// Entry being split (if any)
-    pending_entry: Option<SplitEntry>,
-}
-
-/// Information about a file being split across volumes
-#[derive(Clone)]
-struct SplitEntry {
-    /// Original entry metadata
-    entry: ArchiveEntry,
-    /// Bytes of file data already written
-    bytes_written: u64,
-    /// Total file size
-    total_size: u64,
 }
 
 impl MultiVolumeWriter {
@@ -106,7 +97,6 @@ impl MultiVolumeWriter {
             volume_size,
             options,
             writer: None,
-            pending_entry: None,
         };
 
         // Open first volume
@@ -156,13 +146,6 @@ impl MultiVolumeWriter {
         }
 
         self.writer = Some(File::create(&path)?);
-
-        // If we have a pending split entry, write its continuation header
-        if self.pending_entry.is_some() {
-            // Clone the split entry to avoid borrow conflict
-            let split = self.pending_entry.clone().unwrap();
-            self.write_continuation_header(&split)?;
-        }
 
         Ok(())
     }
@@ -218,53 +201,6 @@ impl MultiVolumeWriter {
         Ok(())
     }
 
-    /// Write a continuation header for a split file
-    fn write_continuation_header(&mut self, split: &SplitEntry) -> PaxResult<()> {
-        let writer = self
-            .writer
-            .as_mut()
-            .ok_or_else(|| PaxError::Io(io::Error::other("no writer")))?;
-
-        let mut header = [0u8; BLOCK_SIZE];
-
-        // Write file name (truncated if necessary)
-        let path_str = split.entry.path.to_string_lossy();
-        let path_bytes = path_str.as_bytes();
-        let name_len = std::cmp::min(path_bytes.len(), 100);
-        header[0..name_len].copy_from_slice(&path_bytes[..name_len]);
-
-        // Mode, uid, gid
-        write_octal(&mut header[100..], split.entry.mode as u64, 8);
-        write_octal(&mut header[108..], split.entry.uid as u64, 8);
-        write_octal(&mut header[116..], split.entry.gid as u64, 8);
-
-        // Size (remaining bytes)
-        let remaining = split.total_size - split.bytes_written;
-        write_octal(&mut header[124..], remaining, 12);
-
-        // Mtime
-        write_octal(&mut header[136..], split.entry.mtime, 12);
-
-        // Typeflag = 'M' for continuation
-        header[156] = GNUTYPE_MULTIVOL;
-
-        // Magic and version
-        header[257..263].copy_from_slice(b"ustar\0");
-        header[263..265].copy_from_slice(b"00");
-
-        // GNU extension: offset at bytes 369-380
-        write_octal(&mut header[369..], split.bytes_written, 12);
-
-        // Calculate and write checksum
-        let checksum = calculate_checksum(&header);
-        write_octal(&mut header[148..], checksum as u64, 8);
-
-        writer.write_all(&header)?;
-        self.bytes_written += BLOCK_SIZE as u64;
-
-        Ok(())
-    }
-
     /// Check if we need to switch volumes
     fn check_volume_space(&mut self, needed: u64) -> PaxResult<bool> {
         if self.bytes_written + needed > self.volume_size {
@@ -277,8 +213,22 @@ impl MultiVolumeWriter {
 
 impl ArchiveWriter for MultiVolumeWriter {
     fn write_entry(&mut self, entry: &ArchiveEntry) -> PaxResult<()> {
+        // A member is never divided between volumes, so it has to fit in one
+        // whole. Refuse it up front: the alternative is streaming the payload
+        // past the tape length and producing a volume that silently exceeds the
+        // limit the user asked for.
+        let needed = BLOCK_SIZE as u64 + entry.size.div_ceil(BLOCK_SIZE as u64) * BLOCK_SIZE as u64;
+        if needed > self.volume_size {
+            return Err(PaxError::InvalidFormat(format!(
+                "{}: {} bytes does not fit in a {}-byte volume",
+                entry.path.display(),
+                entry.size,
+                self.volume_size
+            )));
+        }
+
         // Check if we have space for at least the header
-        if self.check_volume_space(BLOCK_SIZE as u64)? {
+        if self.check_volume_space(needed)? {
             self.open_next_volume()?;
         }
 
@@ -352,8 +302,6 @@ pub struct MultiVolumeReader {
     current_size: u64,
     /// Bytes read from current entry
     bytes_read: u64,
-    /// Current entry being read (for continuation across volumes)
-    current_entry: Option<ArchiveEntry>,
     /// Total size of current entry (may span volumes)
     total_entry_size: u64,
     /// Total bytes read from current entry across all volumes
@@ -371,7 +319,6 @@ impl MultiVolumeReader {
             options,
             current_size: 0,
             bytes_read: 0,
-            current_entry: None,
             total_entry_size: 0,
             total_bytes_read: 0,
             in_split_file: false,
@@ -641,7 +588,6 @@ impl ArchiveReader for MultiVolumeReader {
             self.bytes_read = 0;
             self.total_entry_size = entry.size;
             self.total_bytes_read = 0;
-            self.current_entry = Some(entry.clone());
             self.in_split_file = false;
 
             return Ok(Some(entry));
@@ -857,7 +803,6 @@ mod tests {
             volume_size: 1024,
             options,
             writer: None,
-            pending_entry: None,
         };
 
         assert_eq!(writer.volume_path(1), PathBuf::from("/tmp/test.tar"));

@@ -409,11 +409,14 @@ fn run_write_multi_volume(
         PaxError::InvalidFormat("multi-volume mode requires -f archive".to_string())
     })?;
 
-    // Multi-volume only works with ustar format
-    if format == ArchiveFormat::Cpio {
-        return Err(PaxError::InvalidFormat(
-            "multi-volume is not supported for cpio format".to_string(),
-        ));
+    // The multi-volume writer emits ustar headers unconditionally, so any other
+    // interchange format has to be refused rather than silently downgraded.
+    if format != ArchiveFormat::Ustar {
+        // Name the format the way the user spells it on the command line.
+        return Err(PaxError::InvalidFormat(format!(
+            "multi-volume mode writes the ustar format only, not {}",
+            format!("{:?}", format).to_lowercase()
+        )));
     }
 
     // Tape length is required for multi-volume

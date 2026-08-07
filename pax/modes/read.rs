@@ -293,7 +293,14 @@ fn should_extract(
     let expand_subtree = !options.dir_only;
     let matching_pattern = find_matching_pattern_subtree(&options.patterns, &path, expand_subtree)
         .or_else(|| {
-            find_matching_pattern_subtree(&options.patterns, path_stripped, expand_subtree)
+            // Only worth a second pass when stripping actually changed
+            // something; otherwise this repeats the first pass verbatim for
+            // every non-matching member.
+            if std::ptr::eq(path_stripped, path.as_ref() as &str) {
+                None
+            } else {
+                find_matching_pattern_subtree(&options.patterns, path_stripped, expand_subtree)
+            }
         });
 
     match matching_pattern {

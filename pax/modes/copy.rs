@@ -126,9 +126,8 @@ pub fn copy_files(files: &[PathBuf], dest_dir: &Path, options: &CopyOptions) -> 
     }
 
     let mut link_tracker = HardLinkTracker::new();
-    #[cfg(unix)]
-    let initial_dev: Option<u64> = None;
-    #[cfg(not(unix))]
+    // No filesystem is established until a directory is descended into; the
+    // per-directory splits below are the ones that matter for -X.
     let initial_dev: Option<u64> = None;
 
     // Create interactive prompter if needed

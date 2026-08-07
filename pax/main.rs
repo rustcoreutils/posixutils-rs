@@ -35,7 +35,7 @@ use multivolume::{MultiVolumeOptions, MultiVolumeReader};
 use options::FormatOptions;
 use pattern::Pattern;
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use subst::Substitution;
@@ -265,9 +265,13 @@ fn run_list(args: &Args) -> PaxResult<()> {
     }
 
     let (reader, format) = open_archive_for_read(args)?;
-    let mut stdout = io::stdout().lock();
+    // StdoutLock is a LineWriter, so an unbuffered listing costs one write(2)
+    // per member (two under -o listopt). Buffer it.
+    let mut stdout = io::BufWriter::new(io::stdout().lock());
 
-    modes::list_archive(reader, &mut stdout, format, &options)
+    modes::list_archive(reader, &mut stdout, format, &options)?;
+    stdout.flush()?;
+    Ok(())
 }
 
 /// Run list mode with multi-volume support

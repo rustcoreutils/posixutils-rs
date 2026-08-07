@@ -77,9 +77,8 @@ fn write_files<W: ArchiveWriter>(
     options: &WriteOptions,
 ) -> PaxResult<()> {
     let mut link_tracker = HardLinkTracker::new();
-    #[cfg(unix)]
-    let initial_dev: Option<u64> = None;
-    #[cfg(not(unix))]
+    // No filesystem is established until a directory is descended into; the
+    // per-directory splits below are the ones that matter for -X.
     let initial_dev: Option<u64> = None;
 
     // Create interactive prompter if needed
@@ -595,8 +594,8 @@ fn build_entry(path: &Path, metadata: &Metadata, entry_type: EntryType) -> PaxRe
     // Try to get user/group names
     #[cfg(unix)]
     {
-        entry.uname = get_username(entry.uid);
-        entry.gname = get_groupname(entry.gid);
+        entry.uname = cached_username(entry.uid);
+        entry.gname = cached_groupname(entry.gid);
     }
 
     Ok(entry)
@@ -604,6 +603,39 @@ fn build_entry(path: &Path, metadata: &Metadata, entry_type: EntryType) -> PaxRe
 
 /// Get username from uid
 #[cfg(unix)]
+/// uid/gid to name lookups, memoized for the life of the process.
+///
+/// build_entry needs both for every member, and getpwuid/getgrgid are not
+/// cached by libc: under a `files` backend each call is an open/read/close of
+/// /etc/passwd or /etc/group, and under LDAP or SSSD a network round trip. A
+/// file hierarchy almost always has one or two distinct owners, so a tree of
+/// 100,000 files made 200,000 lookups where two would do.
+fn cached_username(uid: u32) -> Option<String> {
+    thread_local! {
+        static USERS: std::cell::RefCell<std::collections::HashMap<u32, Option<String>>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    USERS.with(|c| {
+        c.borrow_mut()
+            .entry(uid)
+            .or_insert_with(|| get_username(uid))
+            .clone()
+    })
+}
+
+fn cached_groupname(gid: u32) -> Option<String> {
+    thread_local! {
+        static GROUPS: std::cell::RefCell<std::collections::HashMap<u32, Option<String>>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    GROUPS.with(|c| {
+        c.borrow_mut()
+            .entry(gid)
+            .or_insert_with(|| get_groupname(gid))
+            .clone()
+    })
+}
+
 fn get_username(uid: u32) -> Option<String> {
     unsafe {
         let pw = libc::getpwuid(uid);

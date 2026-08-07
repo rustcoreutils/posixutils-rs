@@ -331,7 +331,12 @@ impl ExtendedHeader {
         if let Some(ref gname) = self.gname {
             rec!("gname", gname);
         }
-        for (key, value) in &self.extra {
+        // Sorted: iterating a HashMap made the record order differ between runs
+        // of the same command, so two invocations produced different bytes for
+        // the same input -- hostile to reproducible builds and to diffing.
+        let mut extra: Vec<_> = self.extra.iter().collect();
+        extra.sort_by(|a, b| a.0.cmp(b.0));
+        for (key, value) in extra {
             rec!(key.as_str(), value.as_str());
         }
 
@@ -364,7 +369,9 @@ impl ExtendedHeader {
 
         // Also write any per-file options that weren't already present in the header
         // (e.g., user can add custom keywords via -o keyword:=value)
-        for (key, value) in per_file {
+        let mut per_file_sorted: Vec<_> = per_file.iter().collect();
+        per_file_sorted.sort_by(|a, b| a.0.cmp(b.0));
+        for (key, value) in per_file_sorted {
             if options.should_delete_keyword(key) {
                 continue;
             }
@@ -857,7 +864,9 @@ impl<W: Write> PaxWriter<W> {
 
         // Build extended header data from global options
         let mut data = Vec::new();
-        for (key, value) in global_opts {
+        let mut global_sorted: Vec<_> = global_opts.iter().collect();
+        global_sorted.sort_by(|a, b| a.0.cmp(b.0));
+        for (key, value) in global_sorted {
             // Skip special keywords that aren't actual extended header fields
             if special_keywords.contains(&key.as_str()) {
                 continue;

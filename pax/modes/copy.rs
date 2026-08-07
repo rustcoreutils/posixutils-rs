@@ -141,8 +141,9 @@ pub fn copy_files(files: &[PathBuf], dest_dir: &Path, options: &CopyOptions) -> 
     for path in files {
         // Diagnose a per-operand failure and set a non-zero exit, but continue
         // copying the remaining operands (POSIX CONSEQUENCES OF ERRORS).
-        if let Err(e) = copy_path(
+        if let Err(e) = copy_member(
             path,
+            &member_name(path),
             dest_dir,
             options,
             &mut link_tracker,
@@ -157,37 +158,55 @@ pub fn copy_files(files: &[PathBuf], dest_dir: &Path, options: &CopyOptions) -> 
     Ok(())
 }
 
-/// Copy a single path (file or directory) to the destination
-fn copy_path(
+/// The archive-relative name a source path would be stored under, and so the
+/// name it is restored to beneath the destination directory.
+///
+/// POSIX defines a copy as an archive round-trip, and write mode stores an
+/// operand under the path the user gave it. Naming the destination after the
+/// basename instead put `pax -r -w a/b/c dest` at `dest/c`, which no round trip
+/// through an archive could produce. Leading slashes and `.`/`..` components
+/// are dropped, exactly as extraction sanitizes a member name.
+fn member_name(src: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut out = PathBuf::new();
+    for comp in src.components() {
+        match comp {
+            Component::Normal(c) => out.push(c),
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
+        }
+    }
+    out
+}
+
+/// Copy one source path, and its subtree if it is a directory, to `member`
+/// beneath `dest_root`.
+///
+/// This is the single walk for both command-line operands and everything found
+/// by recursion. It used to be two functions -- `copy_path` for operands and
+/// `copy_path_to_dest` for their descendants -- and the second had never
+/// acquired the first's `-s` substitution and pattern selection, so both
+/// applied only to paths typed on the command line.
+#[allow(clippy::too_many_arguments)]
+fn copy_member(
     src: &Path,
-    dest_dir: &Path,
+    member: &Path,
+    dest_root: &Path,
     options: &CopyOptions,
     link_tracker: &mut HardLinkTracker,
     initial_dev: Option<u64>,
     is_cli_arg: bool,
     prompter: &mut Option<InteractivePrompter>,
 ) -> PaxResult<()> {
-    // Handle special case of "." - copy contents directly to destination
-    let src_str = src.to_string_lossy();
-    if src_str == "." {
-        return copy_current_dir_contents(
-            src,
-            dest_dir,
-            options,
-            link_tracker,
-            initial_dev,
-            prompter,
-        );
-    }
-
-    // Get metadata (following symlinks if requested)
     let follow = should_follow_symlink(options, is_cli_arg);
     let metadata = if follow {
         fs::metadata(src)
     } else {
         fs::symlink_metadata(src)
     };
-
     let metadata = match metadata {
         Ok(m) => m,
         Err(e) => {
@@ -196,65 +215,75 @@ fn copy_path(
         }
     };
 
-    // Check pattern matching
-    let path_str = src.to_string_lossy();
-    let matches = matches_any(&options.patterns, &path_str);
-    let should_copy = if options.exclude { !matches } else { matches };
-
-    if !should_copy {
-        return Ok(());
+    // Selection and substitution both act on the member name, so they reach
+    // every file in the subtree rather than only the operands.
+    let member_str = member.to_string_lossy().to_string();
+    if !options.patterns.is_empty() {
+        let matches = matches_any(&options.patterns, &member_str);
+        if options.exclude == matches {
+            return Ok(());
+        }
     }
 
-    // Check one_file_system
     #[cfg(unix)]
     {
         if options.one_file_system {
-            let dev = metadata.dev();
             if let Some(initial) = initial_dev {
-                if dev != initial {
+                if metadata.dev() != initial {
                     return Ok(());
                 }
             }
         }
     }
 
-    // Apply substitutions first (per POSIX: -s applies before -i)
-    let dest_name = if !options.substitutions.is_empty() {
-        match apply_substitutions(&options.substitutions, &path_str) {
-            SubstResult::Unchanged => src
-                .file_name()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(".")),
-            SubstResult::Changed(new_path) => PathBuf::from(new_path),
-            SubstResult::Empty => return Ok(()), // Skip this file
-        }
+    // -s applies before -i (POSIX: the order of -o, -p and -s is significant).
+    let member = if options.substitutions.is_empty() {
+        member.to_path_buf()
     } else {
-        src.file_name()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."))
+        match apply_substitutions(&options.substitutions, &member_str) {
+            SubstResult::Unchanged => member.to_path_buf(),
+            SubstResult::Changed(new_name) => PathBuf::from(new_name),
+            SubstResult::Empty => return Ok(()), // a null name means skip
+        }
     };
 
-    // Handle interactive rename
-    let dest_name = if let Some(ref mut p) = prompter {
-        let name_str = dest_name.to_string_lossy();
-        match p.prompt(&name_str)? {
+    let member = if let Some(ref mut p) = prompter {
+        match p.prompt(&member.to_string_lossy())? {
             RenameResult::Skip => return Ok(()),
-            RenameResult::UseOriginal => dest_name,
+            RenameResult::UseOriginal => member,
             RenameResult::Rename(new_name) => new_name,
         }
     } else {
-        dest_name
+        member
     };
 
-    // Compute destination path using the (possibly renamed) name
-    let dest = dest_dir.join(&dest_name);
+    if member.as_os_str().is_empty() {
+        // The operand was `.`: its children carry the names, not itself.
+        return copy_directory(
+            src,
+            dest_root,
+            member.as_path(),
+            options,
+            link_tracker,
+            &metadata,
+            prompter,
+        );
+    }
 
-    // Check no_clobber
+    let dest = dest_root.join(&member);
+
+    // A member may name directories the walk has not created yet (`a/b/c` given
+    // as an operand). POSIX requires the intermediate directories be made with
+    // the normal file-creation action.
+    if let Some(parent) = dest.parent() {
+        if !parent.exists() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+
     if options.no_clobber && dest.exists() {
         return Ok(());
     }
-
-    // Check update mode (-u): only copy if source is newer than dest
     if options.update && !is_source_newer(&metadata, &dest) {
         return Ok(());
     }
@@ -264,54 +293,21 @@ fn copy_path(
     }
 
     if metadata.is_dir() {
-        copy_directory(src, &dest, options, link_tracker, &metadata, prompter)?;
+        copy_directory(
+            src,
+            dest_root,
+            &member,
+            options,
+            link_tracker,
+            &metadata,
+            prompter,
+        )?;
     } else if metadata.is_symlink() {
         copy_symlink(src, &dest, &metadata, options)?;
     } else if metadata.is_file() {
         copy_file(src, &dest, options, link_tracker, &metadata)?;
     } else if let Err(e) = copy_special_file(&dest, &metadata, options) {
         crate::error::report_error(src.display(), e);
-    }
-
-    Ok(())
-}
-
-/// Copy contents of current directory to destination (for "." argument)
-fn copy_current_dir_contents(
-    src: &Path,
-    dest_dir: &Path,
-    options: &CopyOptions,
-    link_tracker: &mut HardLinkTracker,
-    initial_dev: Option<u64>,
-    prompter: &mut Option<InteractivePrompter>,
-) -> PaxResult<()> {
-    let entries = match fs::read_dir(src) {
-        Ok(e) => e,
-        Err(e) => {
-            crate::error::report_error(src.display(), e);
-            return Ok(());
-        }
-    };
-
-    for entry in entries {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => {
-                crate::error::report_error(src.display(), e);
-                continue;
-            }
-        };
-
-        let child_src = entry.path();
-        copy_path(
-            &child_src,
-            dest_dir,
-            options,
-            link_tracker,
-            initial_dev,
-            false,
-            prompter,
-        )?;
     }
 
     Ok(())
@@ -366,19 +362,22 @@ fn is_source_newer(src_metadata: &fs::Metadata, dest: &Path) -> bool {
 /// Copy a directory and its contents
 fn copy_directory(
     src: &Path,
-    dest: &Path,
+    dest_root: &Path,
+    member: &Path,
     options: &CopyOptions,
     link_tracker: &mut HardLinkTracker,
     metadata: &fs::Metadata,
     prompter: &mut Option<InteractivePrompter>,
 ) -> PaxResult<()> {
+    let dest = dest_root.join(member);
+
     // Create the destination directory. Its own attributes are applied on the
     // way back out, not here: an archived mode without write or search
     // permission (0555, say) would otherwise stop us creating the very files
     // that belong inside it, and any mode/owner/time set now would be
     // invalidated by populating it anyway.
     if !dest.exists() {
-        fs::create_dir(dest)?;
+        fs::create_dir(&dest)?;
     }
 
     // Recurse into directory unless no_recurse
@@ -409,111 +408,29 @@ fn copy_directory(
                 }
             };
 
-            let child_src = entry.path();
-            let child_name = entry.file_name();
-            let child_dest = dest.join(&child_name);
-
-            // Recurse with the child paths
-            copy_path_to_dest(
-                &child_src,
-                &child_dest,
+            // The child's member name extends its parent's, so selection and
+            // substitution see the same pathname an archive would record.
+            copy_member(
+                &entry.path(),
+                &member.join(entry.file_name()),
+                dest_root,
                 options,
                 link_tracker,
                 initial_dev,
+                false,
                 prompter,
             )?;
         }
     }
 
+    // `.` as an operand has no directory of its own to stamp: its children were
+    // copied straight into the destination root.
+    if member.as_os_str().is_empty() {
+        return Ok(());
+    }
+
     // Now that the subtree exists, give the directory its archived attributes.
-    restore_all(dest, metadata, options)
-}
-
-/// Copy a path directly to a specific destination (used for recursion)
-fn copy_path_to_dest(
-    src: &Path,
-    dest: &Path,
-    options: &CopyOptions,
-    link_tracker: &mut HardLinkTracker,
-    initial_dev: Option<u64>,
-    prompter: &mut Option<InteractivePrompter>,
-) -> PaxResult<()> {
-    // Get metadata
-    let follow = options.dereference;
-    let metadata = if follow {
-        fs::metadata(src)
-    } else {
-        fs::symlink_metadata(src)
-    };
-
-    let metadata = match metadata {
-        Ok(m) => m,
-        Err(e) => {
-            crate::error::report_error(src.display(), e);
-            return Ok(());
-        }
-    };
-
-    // Check one_file_system
-    #[cfg(unix)]
-    {
-        if options.one_file_system {
-            let dev = metadata.dev();
-            if let Some(initial) = initial_dev {
-                if dev != initial {
-                    return Ok(());
-                }
-            }
-        }
-    }
-
-    // Handle interactive rename if enabled
-    let actual_dest = if let Some(ref mut p) = prompter {
-        let path_str = src.to_string_lossy();
-        match p.prompt(&path_str)? {
-            RenameResult::Skip => return Ok(()),
-            RenameResult::UseOriginal => dest.to_path_buf(),
-            RenameResult::Rename(new_name) => {
-                // Use the new name as the destination, but in the same parent directory
-                dest.parent().map(|p| p.join(&new_name)).unwrap_or(new_name)
-            }
-        }
-    } else {
-        dest.to_path_buf()
-    };
-
-    // Check no_clobber
-    if options.no_clobber && actual_dest.exists() {
-        return Ok(());
-    }
-
-    // Check update mode (-u): only copy if source is newer than dest
-    if options.update && !is_source_newer(&metadata, &actual_dest) {
-        return Ok(());
-    }
-
-    if options.verbose {
-        eprintln!("{}", src.display());
-    }
-
-    if metadata.is_dir() {
-        copy_directory(
-            src,
-            &actual_dest,
-            options,
-            link_tracker,
-            &metadata,
-            prompter,
-        )?;
-    } else if metadata.is_symlink() {
-        copy_symlink(src, &actual_dest, &metadata, options)?;
-    } else if metadata.is_file() {
-        copy_file(src, &actual_dest, options, link_tracker, &metadata)?;
-    } else if let Err(e) = copy_special_file(&actual_dest, &metadata, options) {
-        crate::error::report_error(src.display(), e);
-    }
-
-    Ok(())
+    restore_all(&dest, metadata, options)
 }
 
 /// Recreate a special file (FIFO or device node) at `dest`.
@@ -878,9 +795,12 @@ mod tests {
             ..Default::default()
         };
 
-        copy_files(&[src_file], dest_dir.path(), &options).unwrap();
+        copy_files(std::slice::from_ref(&src_file), dest_dir.path(), &options).unwrap();
 
-        let dest_file = dest_dir.path().join("test.txt");
+        // An absolute operand is stored under its path with the leading slash
+        // removed, exactly as an archive would record it, so that is where it
+        // is restored beneath the destination.
+        let dest_file = dest_dir.path().join(member_name(&src_file));
         assert!(dest_file.exists());
         assert_eq!(fs::read_to_string(&dest_file).unwrap(), "hello world");
     }
@@ -898,9 +818,9 @@ mod tests {
 
         let options = CopyOptions::default();
 
-        copy_files(&[subdir], dest_dir.path(), &options).unwrap();
+        copy_files(std::slice::from_ref(&subdir), dest_dir.path(), &options).unwrap();
 
-        let copied_subdir = dest_dir.path().join("subdir");
+        let copied_subdir = dest_dir.path().join(member_name(&subdir));
         assert!(copied_subdir.is_dir());
         assert_eq!(
             fs::read_to_string(copied_subdir.join("file1.txt")).unwrap(),
@@ -921,8 +841,9 @@ mod tests {
         let src_file = src_dir.path().join("test.txt");
         fs::write(&src_file, "new content").unwrap();
 
-        // Create existing dest file
-        let dest_file = dest_dir.path().join("test.txt");
+        // Create existing dest file at the member path the copy will target.
+        let dest_file = dest_dir.path().join(member_name(&src_file));
+        fs::create_dir_all(dest_file.parent().unwrap()).unwrap();
         fs::write(&dest_file, "existing content").unwrap();
 
         let options = CopyOptions {
@@ -951,9 +872,9 @@ mod tests {
 
         let options = CopyOptions::default();
 
-        copy_files(&[src_link], dest_dir.path(), &options).unwrap();
+        copy_files(std::slice::from_ref(&src_link), dest_dir.path(), &options).unwrap();
 
-        let dest_link = dest_dir.path().join("link.txt");
+        let dest_link = dest_dir.path().join(member_name(&src_link));
         assert!(dest_link.symlink_metadata().unwrap().is_symlink());
         assert_eq!(
             fs::read_link(&dest_link).unwrap().to_str().unwrap(),

@@ -55,13 +55,12 @@ fn test_copy_mode_file() {
     // Create destination directory
     fs::create_dir(&dst_dir).unwrap();
 
-    // Copy single file
-    let output = run_pax(&[
-        "-r",
-        "-w",
-        src_file.to_str().unwrap(),
-        dst_dir.to_str().unwrap(),
-    ]);
+    // Copy single file. The operand is relative to src_dir, so the member name
+    // -- and the destination beneath dst_dir -- is just "test.txt".
+    let output = run_pax_in_dir(
+        &["-r", "-w", "test.txt", dst_dir.to_str().unwrap()],
+        &src_dir,
+    );
     assert_success(&output, "pax copy");
 
     // Verify file was copied
@@ -89,13 +88,8 @@ fn test_copy_mode_directory() {
     // Create destination directory
     fs::create_dir(&dst_dir).unwrap();
 
-    // Copy directory
-    let output = run_pax(&[
-        "-r",
-        "-w",
-        subdir.to_str().unwrap(),
-        dst_dir.to_str().unwrap(),
-    ]);
+    // Copy directory, naming it relative to src_dir.
+    let output = run_pax_in_dir(&["-r", "-w", "mydir", dst_dir.to_str().unwrap()], &src_dir);
     assert_success(&output, "pax copy");
 
     // Verify directory was copied
@@ -197,13 +191,10 @@ fn test_copy_mode_link() {
     fs::create_dir(&dst_dir).unwrap();
 
     // Copy with -l (hard link mode)
-    let output = run_pax(&[
-        "-r",
-        "-w",
-        "-l",
-        src_file.to_str().unwrap(),
-        dst_dir.to_str().unwrap(),
-    ]);
+    let output = run_pax_in_dir(
+        &["-r", "-w", "-l", "link_test.txt", dst_dir.to_str().unwrap()],
+        &src_dir,
+    );
     assert_success(&output, "pax copy");
 
     // Verify file exists and has same inode (hard link)
@@ -237,12 +228,10 @@ fn test_copy_mode_symlink() {
     fs::create_dir(&dst_dir).unwrap();
 
     // Copy symlink (without -L, so symlink itself is copied)
-    let output = run_pax(&[
-        "-r",
-        "-w",
-        src_dir.join("symlink.txt").to_str().unwrap(),
-        dst_dir.to_str().unwrap(),
-    ]);
+    let output = run_pax_in_dir(
+        &["-r", "-w", "symlink.txt", dst_dir.to_str().unwrap()],
+        &src_dir,
+    );
     assert_success(&output, "pax copy");
 
     // Verify symlink was copied as symlink
@@ -277,14 +266,17 @@ fn test_copy_mode_multiple_files() {
     fs::create_dir(&dst_dir).unwrap();
 
     // Copy multiple files
-    let output = run_pax(&[
-        "-r",
-        "-w",
-        src_dir.join("file1.txt").to_str().unwrap(),
-        src_dir.join("file2.txt").to_str().unwrap(),
-        src_dir.join("file3.txt").to_str().unwrap(),
-        dst_dir.to_str().unwrap(),
-    ]);
+    let output = run_pax_in_dir(
+        &[
+            "-r",
+            "-w",
+            "file1.txt",
+            "file2.txt",
+            "file3.txt",
+            dst_dir.to_str().unwrap(),
+        ],
+        &src_dir,
+    );
     assert_success(&output, "pax copy");
 
     // Verify all files were copied
@@ -529,4 +521,104 @@ fn test_copy_mode_readonly_directory_gets_its_contents() {
     // Leave the tree removable for TempDir's cleanup.
     fs::set_permissions(&copied_dir, fs::Permissions::from_mode(0o755)).unwrap();
     fs::set_permissions(&ro, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// `-s` renamed only the paths typed on the command line: the walk used a
+/// second function for everything below an operand, and that one had never
+/// gained the substitution step. A rename applied to a directory operand
+/// therefore left every file inside it untouched.
+#[test]
+fn test_copy_mode_substitution_applies_below_operand() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let dst_dir = temp.path().join("dest");
+    fs::create_dir_all(src_dir.join("tree/sub")).unwrap();
+    fs::create_dir(&dst_dir).unwrap();
+    fs::write(src_dir.join("tree/sub/keep.txt"), b"a").unwrap();
+    fs::write(src_dir.join("tree/sub/drop.o"), b"b").unwrap();
+
+    let output = run_pax_in_dir(
+        &[
+            "-r",
+            "-w",
+            "-s",
+            ",\\.txt$,.renamed,",
+            "tree",
+            dst_dir.to_str().unwrap(),
+        ],
+        &src_dir,
+    );
+    assert_success(&output, "copy with -s");
+
+    assert!(
+        dst_dir.join("tree/sub/keep.renamed").exists(),
+        "-s must rename a file found by recursion, not just an operand"
+    );
+    assert!(
+        !dst_dir.join("tree/sub/keep.txt").exists(),
+        "the original name must not also be present"
+    );
+}
+
+/// A substitution to the empty string means "skip this file", and that too has
+/// to reach the whole subtree.
+#[test]
+fn test_copy_mode_substitution_skips_below_operand() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let dst_dir = temp.path().join("dest");
+    fs::create_dir_all(src_dir.join("tree")).unwrap();
+    fs::create_dir(&dst_dir).unwrap();
+    fs::write(src_dir.join("tree/keep.txt"), b"a").unwrap();
+    fs::write(src_dir.join("tree/drop.o"), b"b").unwrap();
+
+    let output = run_pax_in_dir(
+        &[
+            "-r",
+            "-w",
+            "-s",
+            ",^.*\\.o$,,",
+            "tree",
+            dst_dir.to_str().unwrap(),
+        ],
+        &src_dir,
+    );
+    assert_success(&output, "copy with a deleting -s");
+
+    assert!(dst_dir.join("tree/keep.txt").exists(), "keep.txt must copy");
+    assert!(
+        !dst_dir.join("tree/drop.o").exists(),
+        "a member whose name substitutes to empty must be skipped"
+    );
+}
+
+/// POSIX defines a copy as "as if the copied files were written to a pax format
+/// archive file and then subsequently extracted". Writing `a/b/c` records the
+/// member `a/b/c` and extracting it recreates that path, so the copy must too --
+/// it used to name the destination after the basename alone, producing
+/// `dest/c`, which no archive round trip could yield.
+#[test]
+fn test_copy_mode_destination_uses_member_path() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let dst_dir = temp.path().join("dest");
+    fs::create_dir_all(src_dir.join("a/b")).unwrap();
+    fs::create_dir(&dst_dir).unwrap();
+    fs::write(src_dir.join("a/b/c.txt"), b"nested").unwrap();
+
+    let output = run_pax_in_dir(
+        &["-r", "-w", "a/b/c.txt", dst_dir.to_str().unwrap()],
+        &src_dir,
+    );
+    assert_success(&output, "copy a multi-component operand");
+
+    assert_eq!(
+        fs::read_to_string(dst_dir.join("a/b/c.txt")).unwrap_or_default(),
+        "nested",
+        "a multi-component operand keeps its path under the destination"
+    );
+    assert!(
+        !dst_dir.join("c.txt").exists(),
+        "and must not be flattened to its basename"
+    );
 }

@@ -39,6 +39,10 @@ pub struct CopyOptions {
     pub preserve_perms: bool,
     /// Preserve modification time
     pub preserve_mtime: bool,
+    /// Preserve access time
+    pub preserve_atime: bool,
+    /// Preserve owner and group
+    pub preserve_owner: bool,
     /// Create hard links instead of copying
     pub link: bool,
     /// Follow symlinks on command line
@@ -262,10 +266,10 @@ fn copy_path(
     if metadata.is_dir() {
         copy_directory(src, &dest, options, link_tracker, &metadata, prompter)?;
     } else if metadata.is_symlink() {
-        copy_symlink(src, &dest)?;
+        copy_symlink(src, &dest, &metadata, options)?;
     } else if metadata.is_file() {
         copy_file(src, &dest, options, link_tracker, &metadata)?;
-    } else if let Err(e) = copy_special_file(&dest, &metadata) {
+    } else if let Err(e) = copy_special_file(&dest, &metadata, options) {
         crate::error::report_error(src.display(), e);
     }
 
@@ -368,13 +372,14 @@ fn copy_directory(
     metadata: &fs::Metadata,
     prompter: &mut Option<InteractivePrompter>,
 ) -> PaxResult<()> {
-    // Create the destination directory
+    // Create the destination directory. Its own attributes are applied on the
+    // way back out, not here: an archived mode without write or search
+    // permission (0555, say) would otherwise stop us creating the very files
+    // that belong inside it, and any mode/owner/time set now would be
+    // invalidated by populating it anyway.
     if !dest.exists() {
         fs::create_dir(dest)?;
     }
-
-    // Set permissions
-    set_permissions(dest, metadata, options)?;
 
     // Recurse into directory unless no_recurse
     if !options.no_recurse {
@@ -420,10 +425,8 @@ fn copy_directory(
         }
     }
 
-    // Set times after contents are copied
-    set_times(dest, metadata, options)?;
-
-    Ok(())
+    // Now that the subtree exists, give the directory its archived attributes.
+    restore_all(dest, metadata, options)
 }
 
 /// Copy a path directly to a specific destination (used for recursion)
@@ -503,10 +506,10 @@ fn copy_path_to_dest(
             prompter,
         )?;
     } else if metadata.is_symlink() {
-        copy_symlink(src, &actual_dest)?;
+        copy_symlink(src, &actual_dest, &metadata, options)?;
     } else if metadata.is_file() {
         copy_file(src, &actual_dest, options, link_tracker, &metadata)?;
-    } else if let Err(e) = copy_special_file(&actual_dest, &metadata) {
+    } else if let Err(e) = copy_special_file(&actual_dest, &metadata, options) {
         crate::error::report_error(src.display(), e);
     }
 
@@ -520,7 +523,7 @@ fn copy_path_to_dest(
 /// recreated and are reported as an unsupported type. The error message is
 /// context-free; the caller adds the pathname via `report_error`.
 #[cfg(unix)]
-fn copy_special_file(dest: &Path, metadata: &fs::Metadata) -> PaxResult<()> {
+fn copy_special_file(dest: &Path, metadata: &fs::Metadata, options: &CopyOptions) -> PaxResult<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::FileTypeExt;
@@ -563,18 +566,30 @@ fn copy_special_file(dest: &Path, metadata: &fs::Metadata) -> PaxResult<()> {
         )));
     }
 
-    Ok(())
+    // mkfifo and mknod both apply the process umask, so the mode they were
+    // given is not necessarily the mode on disk; and neither carries ownership
+    // or times. Extraction restores all three here, so a copy must too.
+    restore_all(dest, metadata, options)
 }
 
 #[cfg(not(unix))]
-fn copy_special_file(_dest: &Path, _metadata: &fs::Metadata) -> PaxResult<()> {
+fn copy_special_file(
+    _dest: &Path,
+    _metadata: &fs::Metadata,
+    _options: &CopyOptions,
+) -> PaxResult<()> {
     Err(PaxError::InvalidFormat(gettextrs::gettext(
         "unsupported file type",
     )))
 }
 
 /// Copy a symlink
-fn copy_symlink(src: &Path, dest: &Path) -> PaxResult<()> {
+fn copy_symlink(
+    src: &Path,
+    dest: &Path,
+    metadata: &fs::Metadata,
+    options: &CopyOptions,
+) -> PaxResult<()> {
     let target = fs::read_link(src)?;
 
     // Remove existing file if present
@@ -593,7 +608,7 @@ fn copy_symlink(src: &Path, dest: &Path) -> PaxResult<()> {
             .or_else(|_| std::os::windows::fs::symlink_dir(&target, dest))?;
     }
 
-    Ok(())
+    restore_symlink_attrs(dest, metadata, options)
 }
 
 /// Copy a regular file
@@ -699,39 +714,127 @@ fn set_permissions(path: &Path, metadata: &fs::Metadata, options: &CopyOptions) 
     Ok(())
 }
 
-/// Set file modification time
+/// Restore access and modification times on a copied file.
+///
+/// POSIX describes a copy as behaving "as if the copied files were written to a
+/// pax format archive file and then subsequently extracted", so this has to
+/// match what extraction does: the two times are independent, each is preserved
+/// only when its `-p` flag says so, and both carry nanoseconds. The previous
+/// implementation called `utimes` with the source *mtime* in both slots and
+/// `tv_usec: 0`, so it overwrote the destination's access time with an
+/// unrelated value and discarded all sub-second precision.
+#[cfg(unix)]
 fn set_times(path: &Path, metadata: &fs::Metadata, options: &CopyOptions) -> PaxResult<()> {
-    if !options.preserve_mtime {
+    if !options.preserve_mtime && !options.preserve_atime {
         return Ok(());
     }
 
-    #[cfg(unix)]
-    {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-
-        let mtime = metadata.mtime();
-
-        let path_cstr = CString::new(path.as_os_str().as_bytes())
-            .map_err(|_| PaxError::InvalidHeader("path contains null".to_string()))?;
-
-        let times = [
-            libc::timeval {
-                tv_sec: mtime as libc::time_t,
-                tv_usec: 0,
-            },
-            libc::timeval {
-                tv_sec: mtime as libc::time_t,
-                tv_usec: 0,
-            },
-        ];
-
-        unsafe {
-            libc::utimes(path_cstr.as_ptr(), times.as_ptr());
+    let atime = if options.preserve_atime {
+        libc::timespec {
+            tv_sec: metadata.atime() as libc::time_t,
+            tv_nsec: metadata.atime_nsec() as _,
         }
+    } else {
+        // Leave this one as the filesystem set it at creation.
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        }
+    };
+    let mtime = if options.preserve_mtime {
+        libc::timespec {
+            tv_sec: metadata.mtime() as libc::time_t,
+            tv_nsec: metadata.mtime_nsec() as _,
+        }
+    } else {
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        }
+    };
+
+    utimensat_nofollow(path, [atime, mtime])
+}
+
+/// `utimensat` on the path itself, never on a symlink's target.
+#[cfg(unix)]
+fn utimensat_nofollow(path: &Path, times: [libc::timespec; 2]) -> PaxResult<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path_cstr = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| PaxError::InvalidHeader("path contains null".to_string()))?;
+    let r = unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            path_cstr.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if r != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_times(_path: &Path, _metadata: &fs::Metadata, _options: &CopyOptions) -> PaxResult<()> {
+    Ok(())
+}
+
+/// Restore ownership, when `-p o`/`-p e` asked for it and the process can.
+///
+/// Copy mode had no equivalent of this at all, so `-p o` and `-p e` were silent
+/// no-ops there. Ownership must be restored before the mode, because chown
+/// clears the set-user-ID and set-group-ID bits.
+#[cfg(unix)]
+fn set_owner(path: &Path, metadata: &fs::Metadata, options: &CopyOptions) -> PaxResult<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    if !options.preserve_owner {
+        return Ok(());
     }
 
+    let path_cstr = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| PaxError::InvalidHeader("path contains null".to_string()))?;
+    let r = unsafe {
+        libc::fchownat(
+            libc::AT_FDCWD,
+            path_cstr.as_ptr(),
+            metadata.uid(),
+            metadata.gid(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    // Best effort: only a sufficiently privileged process can give a file away,
+    // and failing to is not a reason to fail the copy.
+    let _ = r;
     Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_owner(_path: &Path, _metadata: &fs::Metadata, _options: &CopyOptions) -> PaxResult<()> {
+    Ok(())
+}
+
+/// Owner, then mode, then times -- the order extraction uses.
+fn restore_all(path: &Path, metadata: &fs::Metadata, options: &CopyOptions) -> PaxResult<()> {
+    set_owner(path, metadata, options)?;
+    set_permissions(path, metadata, options)?;
+    set_times(path, metadata, options)
+}
+
+/// Same, for a symlink: its mode is meaningless and `fchmodat(AT_SYMLINK_NOFOLLOW)`
+/// is not portable, so only owner and times are restored.
+fn restore_symlink_attrs(
+    path: &Path,
+    metadata: &fs::Metadata,
+    options: &CopyOptions,
+) -> PaxResult<()> {
+    set_owner(path, metadata, options)?;
+    set_times(path, metadata, options)
 }
 
 /// Read file list from stdin (one path per line)

@@ -530,6 +530,8 @@ fn run_copy(args: &Args) -> PaxResult<()> {
         verbose: args.verbose,
         preserve_perms: should_preserve_perms(&args.privs),
         preserve_mtime: should_preserve_mtime(&args.privs),
+        preserve_atime: should_preserve_atime(&args.privs),
+        preserve_owner: should_preserve_owner(&args.privs),
         link: args.link,
         cli_dereference: args.cli_dereference,
         dereference: args.dereference,

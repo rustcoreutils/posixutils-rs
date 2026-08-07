@@ -767,13 +767,62 @@ fn ipp_ok_response(request_id: u32, job_id: i32) -> Vec<u8> {
     b
 }
 
+/// Decode a chunked transfer-encoding body out of `raw`, refilling from
+/// `stream` until the terminating zero-length chunk arrives.
+///
+/// Returns `None` if the peer hangs up before the body is complete.
+fn read_chunked(stream: &mut TcpStream, raw: &mut Vec<u8>, mut pos: usize) -> Option<Vec<u8>> {
+    let mut chunk = [0u8; 4096];
+    let mut body = Vec::new();
+
+    loop {
+        // Refill until the chunk-size line terminator is in hand.
+        let line_end = loop {
+            if let Some(off) = raw[pos..].windows(2).position(|w| w == b"\r\n") {
+                break pos + off;
+            }
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => return None,
+                Ok(n) => raw.extend_from_slice(&chunk[..n]),
+            }
+        };
+
+        // "<hex-size>[;chunk-ext]" — the extension is not used by ureq, but
+        // ignoring it costs one split.
+        let line = String::from_utf8_lossy(&raw[pos..line_end]);
+        let size = usize::from_str_radix(line.split(';').next()?.trim(), 16).ok()?;
+        pos = line_end + 2;
+
+        // A zero-length chunk ends the body; trailers are ignored.
+        if size == 0 {
+            return Some(body);
+        }
+
+        // Refill until the whole chunk plus its trailing CRLF has arrived.
+        while raw.len() < pos + size + 2 {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => return None,
+                Ok(n) => raw.extend_from_slice(&chunk[..n]),
+            }
+        }
+        body.extend_from_slice(&raw[pos..pos + size]);
+        pos += size + 2;
+    }
+}
+
 /// Read one HTTP request and reply with `body`.
+///
+/// The body has to be consumed in full before replying: `lp`'s IPP client
+/// streams the print payload, and answering early makes the server close the
+/// connection while the client is still writing, which the client reports as
+/// "Peer disconnected". That is a race, so it showed up as an intermittent
+/// failure rather than a consistent one.
 fn serve_one(mut stream: TcpStream, job_id: i32) {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
 
-    // Read headers, then exactly Content-Length bytes of body.
-    let (header_end, content_length) = loop {
+    // Read the headers, then the body framed the way they say it is.
+    let (header_end, content_length, chunked) = loop {
         let n = match stream.read(&mut chunk) {
             Ok(0) | Err(_) => return,
             Ok(n) => n,
@@ -786,18 +835,32 @@ fn serve_one(mut stream: TcpStream, job_id: i32) {
                 .find_map(|l| l.strip_prefix("content-length:"))
                 .and_then(|v| v.trim().parse::<usize>().ok())
                 .unwrap_or(0);
-            break (pos + 4, len);
+            // ureq (via the ipp crate) streams the payload, so the request
+            // arrives chunked with no Content-Length at all.
+            let chunked = headers
+                .lines()
+                .filter_map(|l| l.strip_prefix("transfer-encoding:"))
+                .any(|v| v.contains("chunked"));
+            break (pos + 4, len, chunked);
         }
     };
-    while buf.len() < header_end + content_length {
-        match stream.read(&mut chunk) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+
+    let body = if chunked {
+        match read_chunked(&mut stream, &mut buf, header_end) {
+            Some(body) => body,
+            None => return,
         }
-    }
+    } else {
+        while buf.len() < header_end + content_length {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+        }
+        buf[header_end..].to_vec()
+    };
 
     // The request-id is bytes 4..8 of the IPP body; echo it back.
-    let body = &buf[header_end..];
     let request_id = if body.len() >= 8 {
         u32::from_be_bytes([body[4], body[5], body[6], body[7]])
     } else {
@@ -885,7 +948,12 @@ fn lp_silent_suppresses_the_request_id_on_success() {
         },
         &[("LPDEST", ""), ("PRINTER", "")],
         |_, output| {
-            assert_eq!(output.status.code(), Some(0));
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "stderr={:?}",
+                String::from_utf8_lossy(&output.stderr)
+            );
             assert!(
                 output.stdout.is_empty(),
                 "-s must suppress the request ID, got {:?}",
@@ -927,7 +995,12 @@ fn lp_multiple_files_each_report_a_request_id() {
         },
         &[("LPDEST", ""), ("PRINTER", "")],
         |_, output| {
-            assert_eq!(output.status.code(), Some(0));
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "stderr={:?}",
+                String::from_utf8_lossy(&output.stderr)
+            );
             let stdout = String::from_utf8_lossy(&output.stdout);
             let lines: Vec<&str> = stdout.lines().collect();
             assert_eq!(lines.len(), 2, "one request ID per operand, got {stdout:?}");

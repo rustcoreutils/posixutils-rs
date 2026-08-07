@@ -753,26 +753,6 @@ fn restore_symlink_attrs(
     set_times(path, metadata, options)
 }
 
-/// Read file list from stdin (one path per line)
-pub fn read_file_list<R: std::io::Read>(reader: R) -> PaxResult<Vec<PathBuf>> {
-    use std::io::BufRead;
-
-    let reader = std::io::BufReader::new(reader);
-    let mut files = Vec::new();
-
-    for line in reader.lines() {
-        let line = line?;
-        // `lines()` already strips the trailing newline. Keep the rest verbatim
-        // so pathnames with leading/trailing spaces survive; skip only a wholly
-        // empty line (e.g. a trailing blank line).
-        if !line.is_empty() {
-            files.push(PathBuf::from(line));
-        }
-    }
-
-    Ok(files)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

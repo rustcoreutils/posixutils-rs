@@ -891,7 +891,7 @@ const PERM_TRIPLETS: &[PermTriplet] = &[
 ];
 
 /// Format mode as symbolic string (like ls -l)
-fn format_mode_symbolic(mode: u32, entry_type: EntryType) -> String {
+pub(crate) fn format_mode_symbolic(mode: u32, entry_type: EntryType) -> String {
     let mut s = String::with_capacity(10);
 
     // File type (from entry_type, not mode bits - tar stores type separately)
@@ -918,7 +918,7 @@ fn format_mode_symbolic(mode: u32, entry_type: EntryType) -> String {
 }
 
 /// Format time in traditional ls -l style
-fn format_time_traditional(mtime: u64) -> String {
+pub(crate) fn format_time_traditional(mtime: u64) -> String {
     // POSIX `ls -l`-style time, formatted via libc strftime (localtime_r), so TZ
     // and LC_TIME take effect: date+time when recent, date+year otherwise.
     use std::time::{SystemTime, UNIX_EPOCH};

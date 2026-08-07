@@ -522,7 +522,7 @@ fn run_copy(args: &Args) -> PaxResult<()> {
 
     let (files, dest_dir) = if args.files_and_patterns.len() == 1 {
         // Only destination provided, read file list from stdin
-        let files = modes::copy::read_file_list(io::stdin())?;
+        let files = modes::write::read_file_list(io::stdin())?;
         let dest = PathBuf::from(&args.files_and_patterns[0]);
         (files, dest)
     } else {

@@ -328,3 +328,55 @@ fn test_copy_mode_stdin_file_list() {
         "stdin2.txt should exist"
     );
 }
+
+/// `-c` inverts pattern matching, but in write and copy mode the operands are
+/// the files to archive, not patterns. Copy mode used to feed an empty pattern
+/// list to an inverted match, so every file failed selection and `pax -r -w -c
+/// src dest` copied nothing while exiting 0 -- silent data loss for a script
+/// that removes the source afterwards. Write mode ignored -c outright.
+#[test]
+fn test_copy_mode_rejects_dash_c() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let dst_dir = temp.path().join("dest");
+    fs::create_dir(&src_dir).unwrap();
+    fs::create_dir(&dst_dir).unwrap();
+    fs::write(src_dir.join("keep.txt"), b"payload").unwrap();
+
+    let output = run_pax_in_dir(
+        &["-r", "-w", "-c", "source", dst_dir.to_str().unwrap()],
+        temp.path(),
+    );
+
+    assert_failure(&output, "copy mode with -c");
+    assert!(
+        stderr_str(&output).contains("-c"),
+        "the diagnostic should name the option: {}",
+        stderr_str(&output)
+    );
+    // Above all: it must not silently report success having copied nothing.
+    assert!(
+        !dst_dir.join("source").exists(),
+        "nothing should have been copied"
+    );
+}
+
+#[test]
+fn test_write_mode_rejects_dash_c() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("out.tar");
+    fs::create_dir(&src_dir).unwrap();
+    fs::write(src_dir.join("f.txt"), b"x").unwrap();
+
+    let output = run_pax_in_dir(
+        &["-w", "-c", "-f", archive.to_str().unwrap(), "f.txt"],
+        &src_dir,
+    );
+    assert_failure(&output, "write mode with -c");
+    assert!(
+        stderr_str(&output).contains("-c"),
+        "the diagnostic should name the option: {}",
+        stderr_str(&output)
+    );
+}

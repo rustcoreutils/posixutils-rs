@@ -343,7 +343,24 @@ fn run_read_multi_volume(args: &Args, options: &ReadOptions) -> PaxResult<()> {
 }
 
 /// Run write/create mode
+/// `-c` inverts the sense of the pattern operands, which only list and read
+/// mode have: in write and copy mode the operands name the files to process.
+/// Refusing it is better than the two things pax did before -- copy mode
+/// inverted a match against an empty pattern list, so every file failed
+/// selection and nothing was copied while the exit status stayed 0, and write
+/// mode ignored the flag entirely.
+fn reject_dash_c(args: &Args, mode: &str) -> PaxResult<()> {
+    if args.exclude {
+        return Err(PaxError::InvalidFormat(format!(
+            "-c selects archive members by pattern and does not apply to {} mode",
+            mode
+        )));
+    }
+    Ok(())
+}
+
 fn run_write(args: &Args) -> PaxResult<()> {
+    reject_dash_c(args, "write")?;
     let files = get_files_to_archive(args)?;
     let substitutions = parse_substitutions(args)?;
     let format_options = parse_format_options(args)?;
@@ -477,6 +494,8 @@ fn run_append(args: &Args) -> PaxResult<()> {
 
 /// Run copy mode (-r -w)
 fn run_copy(args: &Args) -> PaxResult<()> {
+    reject_dash_c(args, "copy")?;
+
     // In copy mode, the last argument is the destination directory
     // All other arguments are files/directories to copy
     if args.files_and_patterns.is_empty() {
@@ -500,12 +519,13 @@ fn run_copy(args: &Args) -> PaxResult<()> {
         (files, dest)
     };
 
-    let patterns = compile_patterns(&[])?; // No patterns in copy mode for file selection
+    // Copy mode has no pattern operands: every operand is a source pathname.
+    let patterns = compile_patterns(&[])?;
     let substitutions = parse_substitutions(args)?;
 
     let options = CopyOptions {
         patterns,
-        exclude: args.exclude,
+        exclude: false,
         no_clobber: args.no_clobber,
         verbose: args.verbose,
         preserve_perms: should_preserve_perms(&args.privs),

@@ -1783,22 +1783,22 @@ fn test_nm_external_and_static_filter() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let names: Vec<&str> = stdout.lines().map(nm_line_name).collect();
 
+    // Mach-O prefixes user symbols with '_', so match on a suffix.
+    let has = |names: &[&str], want: &str| names.iter().any(|n| n.ends_with(want));
+
     for want in ["alpha_global", "mid_func", "use_undef"] {
-        assert!(
-            names.contains(&want),
-            "-e dropped external {want}: {stdout}"
-        );
+        assert!(has(&names, want), "-e dropped external {want}: {stdout}");
     }
     for want in ["beta_static", "gamma_static_fn"] {
-        assert!(names.contains(&want), "-e dropped static {want}: {stdout}");
+        assert!(has(&names, want), "-e dropped static {want}: {stdout}");
     }
 
     // -g is the narrowing counterpart: statics must be gone.
     let g = nm_run(&["-g", obj.to_str().unwrap()]);
     let g_stdout = String::from_utf8_lossy(&g.stdout);
     let g_names: Vec<&str> = g_stdout.lines().map(nm_line_name).collect();
-    assert!(!g_names.contains(&"beta_static"), "-g kept a static");
-    assert!(g_names.contains(&"alpha_global"), "-g dropped a global");
+    assert!(!has(&g_names, "beta_static"), "-g kept a static");
+    assert!(has(&g_names, "alpha_global"), "-g dropped a global");
 }
 
 // `-f` produces "full output", i.e. it adds the redundant section symbols that
@@ -1809,6 +1809,10 @@ fn test_nm_external_and_static_filter() {
 // "skip unnamed symbols" guard ran *before* the `-f` check and dropped every
 // one of them. `nm -f` therefore printed exactly what plain `nm` printed. The
 // section symbol's display name comes from the section it refers to.
+//
+// ELF-specific: a Mach-O symbol table (what `cc` produces on macOS) has no
+// section-symbol equivalent to add, so there is nothing for `-f` to do there.
+#[cfg(target_os = "linux")]
 #[test]
 fn test_nm_full_output_adds_section_symbols() {
     let td = tempfile::tempdir().unwrap();
@@ -1877,6 +1881,10 @@ fn test_nm_reports_unreadable_and_unparseable_files() {
 // `test_strip_keeps_relocations_in_relocatable` assert the preconditions; this
 // asserts the consequence, by actually linking the stripped object and running
 // the result.
+//
+// ELF-specific: cc produces Mach-O on macOS, which strip (intentionally) does
+// not support.
+#[cfg(target_os = "linux")]
 #[test]
 fn test_strip_relocatable_object_still_links_and_runs() {
     let td = tempfile::tempdir().unwrap();
@@ -1935,6 +1943,10 @@ fn test_strip_relocatable_object_still_links_and_runs() {
 // #ST5: after stripping an archive, the archive symbol table must still point
 // at the right member offsets — otherwise the archive links to garbage. The
 // check is end-to-end: link against the stripped archive and run the result.
+//
+// ELF/GNU-ar specific: on macOS cc emits Mach-O and `ar` writes the BSD format,
+// neither of which strip rewrites.
+#[cfg(target_os = "linux")]
 #[test]
 fn test_strip_archive_symbol_table_still_resolves() {
     let td = tempfile::tempdir().unwrap();

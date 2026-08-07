@@ -229,7 +229,14 @@ Directory/`-` operands and the `No id keywords` warning are missing.
 - [x] Deliberate-corruption `-h`/`-z` — `admin_checksum_audit_and_recompute`: an intact file passes `-h`, corrupting the body makes it fail, and `-z` makes it pass again. CSSC reports the identical stored/computed values for the same corruption.
 - [x] `-a`/`-e`/`-d` round-trip — `admin_user_list_and_flag_round_trip`.
 - [x] `No id keywords` warning — `admin_warns_when_the_body_has_no_id_keywords`, with the counterpart that a body containing `%W%` draws no warning.
-- [ ] Cross-validation fixture (CSSC `val` on our s-file, our `-h` on a CSSC-written s-file) — done ad hoc during this pass and recorded per-utility, but not yet a checked-in fixture.
+- [x] Cross-validation fixture — **dispositioned 2026-08-07, not staged.** CI
+  hosts have no CSSC, so the fixture could only take one of two shapes and
+  neither is worth having: a checked-in s-file nobody can regenerate without
+  installing CSSC, or a skip-if-absent test that never actually runs in CI and
+  so protects nothing. CSSC cross-validation was performed ad hoc throughout
+  this and the preceding passes and the findings are recorded per-utility
+  (#G13, #G14, #G15, #D3, #P3, #P4 all came out of it). That is the coverage;
+  the fixture would only have restated it less reliably.
 
 ---
 
@@ -685,7 +692,14 @@ and the rewritten file loses its `0444` read-only mode.
   sets the exit status (`rmdel_directory_and_stdin_operands`).
   Cross-checked against CSSC 1.4.1: its `val` accepts our post-`rmdel` s-file
   and its `prs -e` reports the same surviving deltas.
-- [ ] Ownership (#R2) — needs a second user; not stageable in CI.
+- [x] Ownership (#R2) — **WON'T DO, 2026-08-07.** The check itself is
+  implemented; what is untestable is the scenario. Exercising it needs a delta
+  owned by a second, different user, which the suite cannot arrange: it runs as
+  one unprivileged user, and the alternatives are worse than the gap. An
+  env-gated test (`SCCS_TEST_UID2=...`) would be dead weight in CI, where the
+  variable is never set, and a root-only test that drops privileges would put
+  privilege manipulation into the test suite to cover one branch. `cron/audit.md`
+  disposes of its `-r` ownership box the same way, for the same reason.
 
 ---
 
@@ -870,7 +884,14 @@ expanded.
 ### Test coverage gaps
 - [x] Multi-file `\n%s:\n` (`unget_multi_file_uses_the_pathname_header`); directory operand (`unget_directory_operand_expands`); `-` stdin list (`unget_dash_operand_reads_pathnames_from_stdin`); `-r` among several pending edits (`unget_r_selects_one_of_several_pending_edits`) plus the unknown-SID error leaving the p-file untouched (`unget_r_with_unknown_sid_is_an_error`).
   Setting up two concurrent edits needs **both** the `b` and `j` flags: without `b`, `get -e -b` is *required* to be ignored (99079-99081), so there is only ever one entry to select from. Verified in passing that `-b` is correctly ignored when the flag is absent.
-- [ ] CSSC p-file interop fixture (reading a p-file CSSC wrote, and vice versa).
+- [x] p-file interop — closed 2026-08-07, without a CSSC fixture. Every other
+  p-file test builds the file with our own `get`, so writer and reader could
+  drift from the spec together and the suite would stay green. Rather than
+  check in a CSSC-written p-file that CI could not regenerate,
+  `unget_reads_a_hand_written_pfile` writes the documented format by hand —
+  `"%s %s %s %s%s%s\n"` with the optional ` -i<list>` / ` -x<list>` fields
+  (99216-99226) — which is byte-for-byte what CSSC produces. That tests the
+  interop property the box was after and runs everywhere.
 
 ---
 

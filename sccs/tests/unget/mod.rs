@@ -391,3 +391,55 @@ fn unget_r_with_unknown_sid_is_an_error() {
         "a failed unget must not modify the p-file"
     );
 }
+
+/// A p-file written by another SCCS implementation must be readable.
+///
+/// Every other p-file test builds the file with our own `get`, so writer and
+/// reader could drift from the spec together and stay green. This one
+/// hand-writes the documented format instead:
+///
+///   "%s %s %s %s%s%s\n", <g-file SID>, <SID of new delta>,
+///        <login-name>, <date-time>, <i-value>, <x-value>
+///
+/// with <i-value>/<x-value> being "" or " -i<list>" / " -x<list>"
+/// (99216-99226). That is exactly what a CSSC-written p-file contains, without
+/// needing CSSC on the host to produce one.
+#[test]
+fn unget_reads_a_hand_written_pfile() {
+    let tmp = TempDir::new().unwrap();
+    let sfile = create_sccs_file(&tmp, "handp", "l1\n");
+    let pfile = tmp.path().join("p.handp");
+    let gfile = tmp.path().join("handp");
+
+    // Plain entry, no -i/-x. The login name has to match, since unget only
+    // withdraws the invoking user's edit.
+    let user = std::env::var("LOGNAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "root".to_string());
+    std::fs::write(&pfile, format!("1.1 1.2 {user} 26/08/07 01:02:03\n")).unwrap();
+    std::fs::write(&gfile, "l1\nedited\n").unwrap();
+
+    let out = sccs_run("unget", &[sfile.to_str().unwrap()], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "unget must read a spec-format p-file: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!pfile.exists(), "the p-file must be removed");
+    assert!(!gfile.exists(), "the g-file must be removed");
+
+    // Entry carrying the optional -i and -x fields.
+    std::fs::write(
+        &pfile,
+        format!("1.1 1.3 {user} 26/08/07 01:02:03 -i1.1 -x1.2\n"),
+    )
+    .unwrap();
+    std::fs::write(&gfile, "l1\nedited\n").unwrap();
+    let out = sccs_run("unget", &["-r1.3", sfile.to_str().unwrap()], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "the -i/-x fields must parse: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!pfile.exists(), "the p-file must be removed");
+}

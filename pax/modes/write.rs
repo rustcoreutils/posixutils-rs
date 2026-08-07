@@ -172,14 +172,16 @@ fn write_path<W: ArchiveWriter>(
     };
 
     // Handle invalid filename characters according to -o invalid=action
-    let (archive_path, _needs_binary_charset) = match handle_invalid_filename(
+    // The extended header carries the encoding, so hdrcharset is decided by the
+    // pax writer from the bytes it is given; nothing else needs to be threaded
+    // through here.
+    let archive_path = match handle_invalid_filename(
         &archive_path,
         options.format_options.invalid_action,
         prompter,
     )? {
-        InvalidHandleResult::Use(p) => (p, false),
+        InvalidHandleResult::Use(p) | InvalidHandleResult::Binary(p) => p,
         InvalidHandleResult::Skip => return Ok(()),
-        InvalidHandleResult::Binary(p) => (p, true), // TODO: pass to entry for hdrcharset
     };
 
     if options.verbose {
@@ -301,8 +303,13 @@ fn handle_invalid_filename(
             Ok(InvalidHandleResult::Use(sanitize_path(path)))
         }
         InvalidAction::Binary => {
-            // Mark for binary charset header, use lossy path
-            Ok(InvalidHandleResult::Binary(sanitize_path(path)))
+            // Keep the bytes exactly as they are. The pax writer announces them
+            // with hdrcharset=BINARY and records the pathname unencoded, which
+            // is the whole point of this action -- running the name through
+            // to_string_lossy first, as this used to, replaced every invalid
+            // byte with U+FFFD irreversibly and made `binary` behave
+            // identically to `write`.
+            Ok(InvalidHandleResult::Binary(path.to_path_buf()))
         }
     }
 }

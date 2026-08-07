@@ -348,3 +348,63 @@ fn test_stdin_file_list_preserves_leading_space() {
         "listing should preserve the leading space: {listing:?}"
     );
 }
+
+/// `-o invalid=binary` must announce the member with hdrcharset=BINARY and
+/// record its pathname as unencoded bytes. It used to run the name through
+/// to_string_lossy first, replacing every invalid byte with U+FFFD
+/// irreversibly, which made `binary` produce byte-identical output to `write`.
+///
+/// Linux-only: APFS and HFS+ reject a filename that is not well-formed UTF-8,
+/// so the fixture cannot exist on macOS.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_pax_invalid_binary_preserves_raw_name() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let dst_dir = temp.path().join("dest");
+    let archive = temp.path().join("bin.pax");
+    fs::create_dir(&src_dir).unwrap();
+    fs::create_dir(&dst_dir).unwrap();
+
+    let raw = b"na\xffme.txt";
+    let name = std::ffi::OsStr::from_bytes(raw);
+    fs::write(src_dir.join(name), b"payload").unwrap();
+
+    let output = run_pax_in_dir(
+        &[
+            "-w",
+            "-x",
+            "pax",
+            "-o",
+            "invalid=binary",
+            "-f",
+            archive.to_str().unwrap(),
+            ".",
+        ],
+        &src_dir,
+    );
+    assert_success(&output, "write with -o invalid=binary");
+
+    let bytes = fs::read(&archive).unwrap();
+    assert!(
+        bytes
+            .windows(b"hdrcharset=BINARY".len())
+            .any(|w| w == b"hdrcharset=BINARY"),
+        "the member must be announced as BINARY"
+    );
+    assert!(
+        bytes.windows(raw.len()).any(|w| w == raw),
+        "the pathname must appear in the archive as unencoded bytes"
+    );
+    // The ustar name field beside the record is a best-effort fallback for
+    // readers that do not parse extended headers, so it may well be lossy; the
+    // path= record is what has to be exact, and is asserted above.
+
+    let output = run_pax_in_dir(&["-r", "-f", archive.to_str().unwrap()], &dst_dir);
+    assert_success(&output, "extract a BINARY member");
+    assert_eq!(
+        fs::read_to_string(dst_dir.join(name)).unwrap_or_default(),
+        "payload",
+        "the member must round-trip under its original byte name"
+    );
+}

@@ -27,7 +27,9 @@ use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType};
 use crate::error::{is_eof_error, PaxError, PaxResult};
 use crate::options::FormatOptions;
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::io::{Read, Write};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 
 const BLOCK_SIZE: usize = 512;
@@ -99,10 +101,14 @@ pub struct ExtendedHeader {
     /// written under `-o times`. It is never restored on extract -- POSIX
     /// gives no portable way to set it.
     pub ctime: Option<PaxTime>,
-    /// path - file pathname
-    pub path: Option<String>,
-    /// linkpath - link target pathname
-    pub linkpath: Option<String>,
+    /// path - file pathname, as raw bytes.
+    ///
+    /// Not a String: a pathname is a byte string on Unix, and a member whose
+    /// name is not valid UTF-8 must round-trip unchanged when
+    /// `hdrcharset=BINARY` says so.
+    pub path: Option<Vec<u8>>,
+    /// linkpath - link target pathname, as raw bytes
+    pub linkpath: Option<Vec<u8>>,
     /// size - file size
     pub size: Option<u64>,
     /// uid - user ID
@@ -163,6 +169,19 @@ impl ExtendedHeader {
         // Value: try UTF-8 first, but SCHILY.xattr.* and some others can be binary
         // For binary-capable keywords, skip if not valid UTF-8
         let value_bytes = &record[eq_pos + 1..];
+        // A pathname keyword keeps its bytes whatever they are; under
+        // hdrcharset=BINARY they are deliberately not UTF-8.
+        match keyword {
+            "path" => {
+                self.path = Some(value_bytes.to_vec());
+                return Ok(());
+            }
+            "linkpath" => {
+                self.linkpath = Some(value_bytes.to_vec());
+                return Ok(());
+            }
+            _ => {}
+        }
         if let Ok(value) = std::str::from_utf8(value_bytes) {
             self.set_keyword(keyword, value)
         } else if keyword.starts_with("SCHILY.xattr.") {
@@ -188,10 +207,10 @@ impl ExtendedHeader {
                 self.ctime = Some(parse_pax_time(value)?);
             }
             "path" => {
-                self.path = Some(value.to_string());
+                self.path = Some(value.as_bytes().to_vec());
             }
             "linkpath" => {
-                self.linkpath = Some(value.to_string());
+                self.linkpath = Some(value.as_bytes().to_vec());
             }
             "size" => {
                 self.size =
@@ -238,56 +257,82 @@ impl ExtendedHeader {
         let mut data = Vec::new();
         let per_file = options.per_file_options();
 
-        // Helper to write a record if keyword is not in delete patterns
-        // Also checks for per-file overrides (keyword:=value)
-        let mut write_if_allowed = |keyword: &str, default_value: &str| {
+        // Write a record unless the keyword is deleted, honoring any per-file
+        // `keyword:=value` override. Plain functions rather than closures so the
+        // text and raw-bytes forms can both append to `data`.
+        fn write_if_allowed_bytes(
+            data: &mut Vec<u8>,
+            options: &FormatOptions,
+            per_file: &HashMap<String, String>,
+            keyword: &str,
+            default_value: &[u8],
+        ) {
             if options.should_delete_keyword(keyword) {
                 return;
             }
-            // Check for per-file override
-            let value = per_file
-                .get(keyword)
-                .map(|s| s.as_str())
-                .unwrap_or(default_value);
-            write_pax_record(&mut data, keyword, value);
-        };
+            match per_file.get(keyword) {
+                Some(v) => write_pax_record_bytes(data, keyword, v.as_bytes()),
+                None => write_pax_record_bytes(data, keyword, default_value),
+            }
+        }
+
+        fn write_if_allowed(
+            data: &mut Vec<u8>,
+            options: &FormatOptions,
+            per_file: &HashMap<String, String>,
+            keyword: &str,
+            default_value: &str,
+        ) {
+            write_if_allowed_bytes(data, options, per_file, keyword, default_value.as_bytes());
+        }
+
+        macro_rules! rec {
+            ($kw:expr, $val:expr) => {
+                write_if_allowed(&mut data, options, per_file, $kw, $val)
+            };
+        }
+        macro_rules! rec_bytes {
+            ($kw:expr, $val:expr) => {
+                write_if_allowed_bytes(&mut data, options, per_file, $kw, $val)
+            };
+        }
 
         // Write hdrcharset first so readers know the encoding of subsequent fields
         if let Some(ref charset) = self.hdrcharset {
-            write_if_allowed("hdrcharset", charset);
+            rec!("hdrcharset", charset);
         }
         if let Some(atime) = self.atime {
-            write_if_allowed("atime", &format_pax_time(atime));
+            rec!("atime", &format_pax_time(atime));
         }
         if let Some(mtime) = self.mtime {
-            write_if_allowed("mtime", &format_pax_time(mtime));
+            rec!("mtime", &format_pax_time(mtime));
         }
         if let Some(ctime) = self.ctime {
-            write_if_allowed("ctime", &format_pax_time(ctime));
+            rec!("ctime", &format_pax_time(ctime));
         }
         if let Some(ref path) = self.path {
-            write_if_allowed("path", path);
+            rec_bytes!("path", path);
         }
         if let Some(ref linkpath) = self.linkpath {
-            write_if_allowed("linkpath", linkpath);
+            rec_bytes!("linkpath", linkpath);
         }
         if let Some(size) = self.size {
-            write_if_allowed("size", &size.to_string());
+            rec!("size", &size.to_string());
         }
         if let Some(uid) = self.uid {
-            write_if_allowed("uid", &uid.to_string());
+            rec!("uid", &uid.to_string());
         }
         if let Some(gid) = self.gid {
-            write_if_allowed("gid", &gid.to_string());
+            rec!("gid", &gid.to_string());
         }
         if let Some(ref uname) = self.uname {
-            write_if_allowed("uname", uname);
+            rec!("uname", uname);
         }
         if let Some(ref gname) = self.gname {
-            write_if_allowed("gname", gname);
+            rec!("gname", gname);
         }
         for (key, value) in &self.extra {
-            write_if_allowed(key, value);
+            rec!(key.as_str(), value.as_str());
         }
 
         // Per-file overrides (`-o keyword:=value`) for *standard* keywords whose
@@ -352,12 +397,12 @@ impl ExtendedHeader {
         let keep = |kw: &str| !opts.should_delete_keyword(kw);
         if keep("path") {
             if let Some(ref path) = self.path {
-                entry.path = PathBuf::from(path);
+                entry.path = PathBuf::from(OsString::from_vec(path.clone()));
             }
         }
         if keep("linkpath") {
             if let Some(ref linkpath) = self.linkpath {
-                entry.link_target = Some(PathBuf::from(linkpath));
+                entry.link_target = Some(PathBuf::from(OsString::from_vec(linkpath.clone())));
             }
         }
         if keep("size") {
@@ -421,17 +466,32 @@ impl ExtendedHeader {
         // when it has no '/' at a position that leaves a <= NAME_LEN tail
         // (e.g. a 190-byte "dir/<185-byte-basename>"). Without this record the
         // ustar fallback in split_path() silently truncates the name.
+        let path_bytes = entry.path.as_os_str().as_bytes();
         let path_str = ustar_path_string(entry);
-        if try_split_path(&path_str).is_none() {
-            header.path = Some(entry.path.to_string_lossy().into_owned());
+        let path_is_binary = std::str::from_utf8(path_bytes).is_err();
+        if try_split_path(&path_str).is_none() || path_is_binary {
+            // A non-UTF-8 name has no faithful ustar spelling, so it always
+            // needs the record regardless of length.
+            header.path = Some(path_bytes.to_vec());
         }
 
         // Link path needs extended header if too long
+        let mut link_is_binary = false;
         if let Some(ref link) = entry.link_target {
-            let link_str = link.to_string_lossy();
-            if link_str.len() > LINKNAME_LEN {
-                header.linkpath = Some(link_str.to_string());
+            let link_bytes = link.as_os_str().as_bytes();
+            link_is_binary = std::str::from_utf8(link_bytes).is_err();
+            if link_bytes.len() > LINKNAME_LEN || link_is_binary {
+                header.linkpath = Some(link_bytes.to_vec());
             }
+        }
+
+        // POSIX -o invalid=binary: a member whose name cannot be represented in
+        // the header character set is announced with hdrcharset=BINARY, and its
+        // pathname records carry unencoded bytes. Without this the name was run
+        // through to_string_lossy and every invalid byte became U+FFFD --
+        // irreversibly, and identically to -o invalid=write.
+        if path_is_binary || link_is_binary {
+            header.hdrcharset = Some("BINARY".to_string());
         }
 
         // Size > 8GB needs extended header
@@ -554,6 +614,32 @@ fn format_pax_time(time: PaxTime) -> String {
         let frac = format!("{:09}", time.nsec);
         format!("{}.{}", time.sec, frac.trim_end_matches('0'))
     }
+}
+
+/// Write a pax extended header record whose value is raw bytes.
+///
+/// The record length counts bytes, not characters, so this is also the correct
+/// path for any value that merely happens to be UTF-8.
+fn write_pax_record_bytes(data: &mut Vec<u8>, keyword: &str, value: &[u8]) {
+    let mut content = Vec::with_capacity(keyword.len() + value.len() + 3);
+    content.push(b' ');
+    content.extend_from_slice(keyword.as_bytes());
+    content.push(b'=');
+    content.extend_from_slice(value);
+    content.push(b'\n');
+
+    // Length includes itself, so it has to be solved for.
+    let mut len = content.len() + 1;
+    loop {
+        let total = len.to_string().len() + content.len();
+        if total == len {
+            break;
+        }
+        len = total;
+    }
+
+    data.extend_from_slice(len.to_string().as_bytes());
+    data.extend_from_slice(&content);
 }
 
 /// Write a pax extended header record
@@ -1339,7 +1425,7 @@ mod tests {
     #[test]
     fn test_extended_header_roundtrip() {
         let mut ext = ExtendedHeader::new();
-        ext.path = Some("/very/long/path/that/exceeds/ustar/limits".to_string());
+        ext.path = Some(b"/very/long/path/that/exceeds/ustar/limits".to_vec());
         ext.size = Some(10000000000);
         ext.mtime = Some(PaxTime {
             sec: 1234567890,

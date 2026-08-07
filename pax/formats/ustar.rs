@@ -413,7 +413,7 @@ fn build_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
 }
 
 /// Split path into name (max 100) and prefix (max 155)
-fn split_path(entry: &ArchiveEntry) -> PaxResult<(String, String)> {
+pub(crate) fn split_path(entry: &ArchiveEntry) -> PaxResult<(String, String)> {
     let path_str = entry.path.to_string_lossy();
 
     // Add trailing slash for directories

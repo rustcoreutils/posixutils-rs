@@ -645,3 +645,53 @@ fn test_multi_volume_roundtrip() {
         "nested.txt content mismatch"
     );
 }
+
+/// The ustar header splits a long pathname across the 100-byte name field and
+/// the 155-byte prefix field. multivolume's own writer only ever wrote the name
+/// field, so a path over 100 bytes was silently truncated -- while its own
+/// reader parses the prefix, making the format asymmetric with itself.
+#[test]
+fn test_multi_volume_long_path_not_truncated() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("long.tar");
+    let dst_dir = temp.path().join("dest");
+
+    // 3 x 40-char components plus separators: >100 bytes, but splittable at a
+    // '/' within the prefix field, so ustar can represent it exactly.
+    let deep = format!("{}/{}/{}", "a".repeat(40), "b".repeat(40), "c".repeat(40));
+    let full = src_dir.join(&deep);
+    fs::create_dir_all(full.parent().unwrap()).unwrap();
+    fs::write(&full, b"deep content\n").unwrap();
+    assert!(deep.len() > 100, "test path must exceed the name field");
+
+    let output = run_pax_in_dir(
+        &[
+            "-w",
+            "-M",
+            "--tape-length",
+            "1000000",
+            "-x",
+            "ustar",
+            "-f",
+            archive.to_str().unwrap(),
+            &deep,
+        ],
+        &src_dir,
+    );
+    assert_success(&output, "pax -M write long path");
+
+    let listing = stdout_str(&run_pax(&["-f", archive.to_str().unwrap()]));
+    assert!(
+        listing.lines().any(|l| l == deep),
+        "-M must not truncate a path the ustar prefix field can hold.\nwanted: {deep}\ngot: {listing}"
+    );
+
+    fs::create_dir(&dst_dir).unwrap();
+    let output = run_pax_in_dir(&["-r", "-f", archive.to_str().unwrap()], &dst_dir);
+    assert_success(&output, "pax extract long path");
+    assert_eq!(
+        fs::read_to_string(dst_dir.join(&deep)).unwrap(),
+        "deep content\n"
+    );
+}

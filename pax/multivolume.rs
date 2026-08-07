@@ -767,11 +767,14 @@ fn calculate_checksum(header: &[u8; BLOCK_SIZE]) -> u32 {
 fn build_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
     let mut header = [0u8; BLOCK_SIZE];
 
-    // Write file name (truncated if necessary)
-    let path_str = entry.path.to_string_lossy();
-    let path_bytes = path_str.as_bytes();
-    let name_len = std::cmp::min(path_bytes.len(), 100);
-    header[0..name_len].copy_from_slice(&path_bytes[..name_len]);
+    // Write the pathname across the name and prefix fields. Truncating to the
+    // 100-byte name field silently corrupted any longer path -- and this file's
+    // own parse_header reads the prefix back, so the format was asymmetric with
+    // itself. split_path errors rather than truncating when even the pair
+    // cannot hold the path.
+    let (name, prefix) = crate::formats::ustar::split_path(entry)?;
+    header[0..name.len()].copy_from_slice(name.as_bytes());
+    header[345..345 + prefix.len()].copy_from_slice(prefix.as_bytes());
 
     // Mode, uid, gid
     write_octal(&mut header[100..], entry.mode as u64, 8);
@@ -797,12 +800,16 @@ fn build_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
     };
     header[156] = typeflag;
 
-    // Link name for symlinks/hardlinks
+    // Link name for symlinks/hardlinks. The linkname field has no prefix
+    // companion, so an over-long target is an error rather than a silent
+    // truncation that would extract to the wrong file.
     if let Some(ref target) = entry.link_target {
         let target_str = target.to_string_lossy();
         let target_bytes = target_str.as_bytes();
-        let link_len = std::cmp::min(target_bytes.len(), 100);
-        header[157..157 + link_len].copy_from_slice(&target_bytes[..link_len]);
+        if target_bytes.len() > 100 {
+            return Err(PaxError::PathTooLong(target_str.into_owned()));
+        }
+        header[157..157 + target_bytes.len()].copy_from_slice(target_bytes);
     }
 
     // Magic and version

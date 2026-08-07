@@ -14,6 +14,7 @@ mod archive;
 mod compression;
 mod copy;
 mod list;
+mod malformed;
 mod multivolume;
 mod options;
 mod privileges;

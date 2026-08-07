@@ -138,61 +138,41 @@ impl ExtendedHeader {
                 break;
             }
 
-            // Find the space after length
-            let space_pos = data[pos..].iter().position(|&b| b == b' ').ok_or_else(|| {
-                PaxError::InvalidHeader("invalid extended header format".to_string())
-            })?;
-
-            // Parse length
-            let len_str = std::str::from_utf8(&data[pos..pos + space_pos]).map_err(|_| {
-                PaxError::InvalidHeader("invalid extended header length".to_string())
-            })?;
-            let record_len: usize = len_str.parse().map_err(|_| {
-                PaxError::InvalidHeader("invalid extended header length".to_string())
-            })?;
-
-            if pos + record_len > data.len() {
-                return Err(PaxError::InvalidHeader(
-                    "extended header record extends past end".to_string(),
-                ));
-            }
-
-            // Extract keyword=value (after space, before newline)
-            let record_start = pos + space_pos + 1;
-            let record_end = pos + record_len - 1; // Exclude trailing newline
-
-            if record_end <= record_start {
-                pos += record_len;
-                continue;
-            }
-
-            let record_data = &data[record_start..record_end];
-
-            // Find the '=' separator in raw bytes
-            if let Some(eq_pos) = record_data.iter().position(|&b| b == b'=') {
-                // Keyword must be valid UTF-8
-                let keyword = std::str::from_utf8(&record_data[..eq_pos]).map_err(|_| {
-                    PaxError::InvalidHeader("invalid UTF-8 in extended header keyword".to_string())
-                })?;
-
-                // Value: try UTF-8 first, but SCHILY.xattr.* and some others can be binary
-                // For binary-capable keywords, skip if not valid UTF-8
-                let value_bytes = &record_data[eq_pos + 1..];
-                if let Ok(value) = std::str::from_utf8(value_bytes) {
-                    header.set_keyword(keyword, value)?;
-                } else if keyword.starts_with("SCHILY.xattr.") {
-                    // Binary extended attributes - skip silently (we don't support xattrs)
-                } else {
-                    // Other keywords with invalid UTF-8 - try lossy conversion
-                    let value = String::from_utf8_lossy(value_bytes);
-                    header.set_keyword(keyword, &value)?;
-                }
-            }
-
+            let (record_len, value_start) = parse_record_len(data, pos)?;
+            // record_len is at least value_start - pos + 1, so the trailing
+            // <newline> is inside the record and this cannot underflow.
+            header.apply_record(&data[value_start..pos + record_len - 1])?;
             pos += record_len;
         }
 
         Ok(header)
+    }
+
+    /// Interpret one `keyword=value` record body (the record without its length
+    /// field, <space> and trailing <newline>).
+    fn apply_record(&mut self, record: &[u8]) -> PaxResult<()> {
+        let Some(eq_pos) = record.iter().position(|&b| b == b'=') else {
+            return Ok(()); // no separator: not a record we can use
+        };
+
+        // Keyword must be valid UTF-8
+        let keyword = std::str::from_utf8(&record[..eq_pos]).map_err(|_| {
+            PaxError::InvalidHeader("invalid UTF-8 in extended header keyword".to_string())
+        })?;
+
+        // Value: try UTF-8 first, but SCHILY.xattr.* and some others can be binary
+        // For binary-capable keywords, skip if not valid UTF-8
+        let value_bytes = &record[eq_pos + 1..];
+        if let Ok(value) = std::str::from_utf8(value_bytes) {
+            self.set_keyword(keyword, value)
+        } else if keyword.starts_with("SCHILY.xattr.") {
+            // Binary extended attributes - skip silently (we don't support xattrs)
+            Ok(())
+        } else {
+            // Other keywords with invalid UTF-8 - try lossy conversion
+            let value = String::from_utf8_lossy(value_bytes);
+            self.set_keyword(keyword, &value)
+        }
     }
 
     /// Set a keyword value
@@ -509,6 +489,38 @@ impl ExtendedHeader {
 
         header
     }
+}
+
+/// Read the `"<len> "` prefix of the record starting at `pos`, returning the
+/// record's total length and the offset of its `keyword=value` body.
+///
+/// The length is the record's own byte count including the length field itself,
+/// so it must exceed that field plus the <space> plus the trailing <newline>. A
+/// length of 0 is the case that matters: it once wrapped `pos + len - 1` to
+/// `usize::MAX` and aborted on the slice, and it would never advance `pos`, so
+/// even a bounds-checked slice would spin forever.
+fn parse_record_len(data: &[u8], pos: usize) -> PaxResult<(usize, usize)> {
+    let bad_len = || PaxError::InvalidHeader("invalid extended header length".to_string());
+
+    let space_pos = data[pos..]
+        .iter()
+        .position(|&b| b == b' ')
+        .ok_or_else(|| PaxError::InvalidHeader("invalid extended header format".to_string()))?;
+
+    let len_str = std::str::from_utf8(&data[pos..pos + space_pos]).map_err(|_| bad_len())?;
+    let record_len: usize = len_str.parse().map_err(|_| bad_len())?;
+
+    let value_start = pos + space_pos + 1;
+    if record_len <= space_pos + 1 {
+        return Err(bad_len());
+    }
+    if pos + record_len > data.len() {
+        return Err(PaxError::InvalidHeader(
+            "extended header record extends past end".to_string(),
+        ));
+    }
+
+    Ok((record_len, value_start))
 }
 
 /// Parse pax time format (decimal seconds with optional fractional part)

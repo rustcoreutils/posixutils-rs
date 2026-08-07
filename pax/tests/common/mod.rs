@@ -152,6 +152,30 @@ pub fn assert_failure(output: &Output, context: &str) {
     );
 }
 
+/// Assert the command exited with exactly `code`. `assert_failure` only
+/// distinguishes zero from non-zero; POSIX pins specific statuses, and a
+/// process killed by a signal (a panic reaching abort) has no code at all --
+/// which this reports as such rather than as a plain inequality.
+pub fn assert_exit_code(output: &Output, code: i32, context: &str) {
+    match output.status.code() {
+        Some(actual) => assert_eq!(
+            actual,
+            code,
+            "{} exited {} (wanted {})\nstderr: {}",
+            context,
+            actual,
+            code,
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        None => panic!(
+            "{} was killed by a signal rather than exiting {}\nstderr: {}",
+            context,
+            code,
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    }
+}
+
 /// Get stdout as string
 pub fn stdout_str(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).to_string()

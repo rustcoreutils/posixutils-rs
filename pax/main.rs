@@ -489,7 +489,19 @@ fn run_append(args: &Args) -> PaxResult<()> {
     };
 
     let requested_format = args.format.map(ArchiveFormat::from);
-    modes::append_to_archive(archive_path, &files, &options, requested_format)
+    // Appended members are blocked like any other write; append used to bypass
+    // the blocked writer entirely and so ignored -b.
+    let record_size = match args.blocksize {
+        Some(bs) => parse_blocksize(bs)?,
+        None => DEFAULT_RECORD_SIZE,
+    };
+    modes::append_to_archive(
+        archive_path,
+        &files,
+        &options,
+        requested_format,
+        record_size,
+    )
 }
 
 /// Run copy mode (-r -w)

@@ -737,12 +737,11 @@ pub struct PaxWriter<W: Write> {
 }
 
 impl<W: Write> PaxWriter<W> {
-    /// Create a new pax writer with default options
-    pub fn new(writer: W) -> Self {
-        Self::with_options(writer, FormatOptions::default())
-    }
-
-    /// Create a new pax writer with specified options
+    /// Create a new pax writer with specified options.
+    ///
+    /// There is deliberately no options-free constructor: the one caller that
+    /// used it was append mode, where it silently discarded every `-o` option
+    /// the user had passed.
     pub fn with_options(writer: W, options: FormatOptions) -> Self {
         PaxWriter {
             writer,

@@ -399,20 +399,22 @@ fn test_operator_put_before() {
 #[test]
 fn test_operator_shift_right() {
     let mut buffer = Buffer::from_text("hello\nworld");
+    let mut registers = Registers::new();
 
     let range = Range::lines(Position::new(1, 0), Position::new(1, 0));
-    let _result = command::shift_right(&mut buffer, range, 1).unwrap();
+    let _result = command::shift_right(&mut buffer, range, 8, 8, &mut registers).unwrap();
 
-    // shift_right adds tabs, not spaces
-    assert!(buffer.line(1).unwrap().content().starts_with("\t"));
+    // One shiftwidth of 8 columns renders as a single tab at tabstop 8.
+    assert_eq!(buffer.line(1).unwrap().content(), "\thello");
 }
 
 #[test]
 fn test_operator_shift_left() {
     let mut buffer = Buffer::from_text("    hello\n    world");
+    let mut registers = Registers::new();
 
     let range = Range::lines(Position::new(1, 0), Position::new(1, 0));
-    let _result = command::shift_left(&mut buffer, range, 4).unwrap();
+    let _result = command::shift_left(&mut buffer, range, 4, 8, &mut registers).unwrap();
 
     assert_eq!(buffer.line(1).unwrap().content(), "hello");
 }
@@ -936,11 +938,12 @@ fn test_insert_mode_basic() {
     let mut buffer = Buffer::from_text("hello");
     buffer.set_cursor(Position::new(1, 0));
 
-    let state = enter_insert_mode(&mut buffer, InsertKind::Insert).unwrap();
+    let state = enter_insert_mode(&mut buffer, InsertKind::Insert, &Options::default()).unwrap();
     assert_eq!(state.kind, InsertKind::Insert);
 
     let mut state = state;
-    let exit = process_insert_key(&mut buffer, Key::Char('X'), &mut state).unwrap();
+    let exit =
+        process_insert_key(&mut buffer, Key::Char('X'), &mut state, &Options::default()).unwrap();
     assert!(!exit);
     assert_eq!(buffer.line(1).unwrap().content(), "Xhello");
 }
@@ -950,7 +953,7 @@ fn test_insert_mode_append() {
     let mut buffer = Buffer::from_text("hello");
     buffer.set_cursor(Position::new(1, 2));
 
-    let _state = enter_insert_mode(&mut buffer, InsertKind::Append).unwrap();
+    let _state = enter_insert_mode(&mut buffer, InsertKind::Append, &Options::default()).unwrap();
     assert_eq!(buffer.cursor().column, 3); // Moved one right
 }
 
@@ -959,7 +962,8 @@ fn test_insert_mode_append_eol() {
     let mut buffer = Buffer::from_text("hello");
     buffer.set_cursor(Position::new(1, 0));
 
-    let _state = enter_insert_mode(&mut buffer, InsertKind::AppendEol).unwrap();
+    let _state =
+        enter_insert_mode(&mut buffer, InsertKind::AppendEol, &Options::default()).unwrap();
     // 'A' should put cursor AFTER the last character (position 5 for "hello")
     // so that inserted text appears after existing text
     assert_eq!(buffer.cursor().column, 5);
@@ -969,7 +973,8 @@ fn test_insert_mode_append_eol() {
 fn test_insert_mode_open_below() {
     let mut buffer = Buffer::from_text("hello");
 
-    let _state = enter_insert_mode(&mut buffer, InsertKind::OpenBelow).unwrap();
+    let _state =
+        enter_insert_mode(&mut buffer, InsertKind::OpenBelow, &Options::default()).unwrap();
     assert_eq!(buffer.line_count(), 2);
     assert_eq!(buffer.cursor().line, 2);
 }
@@ -978,7 +983,8 @@ fn test_insert_mode_open_below() {
 fn test_insert_mode_open_above() {
     let mut buffer = Buffer::from_text("hello");
 
-    let _state = enter_insert_mode(&mut buffer, InsertKind::OpenAbove).unwrap();
+    let _state =
+        enter_insert_mode(&mut buffer, InsertKind::OpenAbove, &Options::default()).unwrap();
     assert_eq!(buffer.line_count(), 2);
     assert_eq!(buffer.cursor().line, 1);
 }
@@ -986,9 +992,11 @@ fn test_insert_mode_open_above() {
 #[test]
 fn test_insert_mode_escape() {
     let mut buffer = Buffer::from_text("hello");
-    let mut state = enter_insert_mode(&mut buffer, InsertKind::Insert).unwrap();
+    let mut state =
+        enter_insert_mode(&mut buffer, InsertKind::Insert, &Options::default()).unwrap();
 
-    let exit = process_insert_key(&mut buffer, Key::Escape, &mut state).unwrap();
+    let exit =
+        process_insert_key(&mut buffer, Key::Escape, &mut state, &Options::default()).unwrap();
     assert!(exit);
 }
 
@@ -996,10 +1004,13 @@ fn test_insert_mode_escape() {
 fn test_insert_mode_backspace() {
     let mut buffer = Buffer::from_text("hello");
     buffer.set_cursor(Position::new(1, 2));
-    let mut state = enter_insert_mode(&mut buffer, InsertKind::Insert).unwrap();
+    let mut state =
+        enter_insert_mode(&mut buffer, InsertKind::Insert, &Options::default()).unwrap();
 
-    let _ = process_insert_key(&mut buffer, Key::Char('X'), &mut state).unwrap();
-    let _ = process_insert_key(&mut buffer, Key::Backspace, &mut state).unwrap();
+    let _ =
+        process_insert_key(&mut buffer, Key::Char('X'), &mut state, &Options::default()).unwrap();
+    let _ =
+        process_insert_key(&mut buffer, Key::Backspace, &mut state, &Options::default()).unwrap();
     assert_eq!(buffer.line(1).unwrap().content(), "hello");
 }
 

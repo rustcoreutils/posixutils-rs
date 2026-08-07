@@ -77,9 +77,8 @@ fn write_files<W: ArchiveWriter>(
     options: &WriteOptions,
 ) -> PaxResult<()> {
     let mut link_tracker = HardLinkTracker::new();
-    #[cfg(unix)]
-    let initial_dev: Option<u64> = None;
-    #[cfg(not(unix))]
+    // No filesystem is established until a directory is descended into; the
+    // per-directory splits below are the ones that matter for -X.
     let initial_dev: Option<u64> = None;
 
     // Create interactive prompter if needed
@@ -172,14 +171,16 @@ fn write_path<W: ArchiveWriter>(
     };
 
     // Handle invalid filename characters according to -o invalid=action
-    let (archive_path, _needs_binary_charset) = match handle_invalid_filename(
+    // The extended header carries the encoding, so hdrcharset is decided by the
+    // pax writer from the bytes it is given; nothing else needs to be threaded
+    // through here.
+    let archive_path = match handle_invalid_filename(
         &archive_path,
         options.format_options.invalid_action,
         prompter,
     )? {
-        InvalidHandleResult::Use(p) => (p, false),
+        InvalidHandleResult::Use(p) | InvalidHandleResult::Binary(p) => p,
         InvalidHandleResult::Skip => return Ok(()),
-        InvalidHandleResult::Binary(p) => (p, true), // TODO: pass to entry for hdrcharset
     };
 
     if options.verbose {
@@ -301,8 +302,13 @@ fn handle_invalid_filename(
             Ok(InvalidHandleResult::Use(sanitize_path(path)))
         }
         InvalidAction::Binary => {
-            // Mark for binary charset header, use lossy path
-            Ok(InvalidHandleResult::Binary(sanitize_path(path)))
+            // Keep the bytes exactly as they are. The pax writer announces them
+            // with hdrcharset=BINARY and records the pathname unencoded, which
+            // is the whole point of this action -- running the name through
+            // to_string_lossy first, as this used to, replaced every invalid
+            // byte with U+FFFD irreversibly and made `binary` behave
+            // identically to `write`.
+            Ok(InvalidHandleResult::Binary(path.to_path_buf()))
         }
     }
 }
@@ -482,18 +488,26 @@ fn write_file<W: ArchiveWriter>(
 
     // Check for hard link
     if let Some(original_path) = link_tracker.check(&entry) {
-        entry.entry_type = EntryType::Hardlink;
-        entry.link_target = Some(original_path);
+        // Only claim the link in formats that can express one. cpio cannot, so
+        // recording the type there would degrade the member to a regular file
+        // -- and combined with the size=0 below, to an empty one.
+        let linkable = archive.supports_hardlinks();
+        if linkable {
+            entry.entry_type = EntryType::Hardlink;
+            entry.link_target = Some(original_path);
+        }
 
-        // Per POSIX: -o linkdata means write file contents for each hard link
-        // By default, hard links have size=0 and no data
-        if !options.format_options.link_data {
+        // Per POSIX: -o linkdata means write file contents for each hard link.
+        // By default a hard link has size=0 and no data -- but only where the
+        // format records the linkage, otherwise the contents are the only copy
+        // of the data this member will ever have.
+        if linkable && !options.format_options.link_data {
             entry.size = 0;
             archive.write_entry(&entry)?;
             archive.finish_entry()?;
             return Ok(());
         }
-        // With linkdata, fall through to write the file contents
+        // Otherwise fall through and write the file contents.
     }
 
     // Write regular file
@@ -544,6 +558,8 @@ fn build_entry(path: &Path, metadata: &Metadata, entry_type: EntryType) -> PaxRe
         entry.mtime_nsec = metadata.mtime_nsec() as u32;
         entry.atime = Some(metadata.atime() as u64);
         entry.atime_nsec = metadata.atime_nsec() as u32;
+        entry.ctime = Some(metadata.ctime() as u64);
+        entry.ctime_nsec = metadata.ctime_nsec() as u32;
         entry.dev = metadata.dev();
         entry.ino = metadata.ino();
         entry.nlink = metadata.nlink() as u32;
@@ -578,8 +594,8 @@ fn build_entry(path: &Path, metadata: &Metadata, entry_type: EntryType) -> PaxRe
     // Try to get user/group names
     #[cfg(unix)]
     {
-        entry.uname = get_username(entry.uid);
-        entry.gname = get_groupname(entry.gid);
+        entry.uname = cached_username(entry.uid);
+        entry.gname = cached_groupname(entry.gid);
     }
 
     Ok(entry)
@@ -587,6 +603,39 @@ fn build_entry(path: &Path, metadata: &Metadata, entry_type: EntryType) -> PaxRe
 
 /// Get username from uid
 #[cfg(unix)]
+/// uid/gid to name lookups, memoized for the life of the process.
+///
+/// build_entry needs both for every member, and getpwuid/getgrgid are not
+/// cached by libc: under a `files` backend each call is an open/read/close of
+/// /etc/passwd or /etc/group, and under LDAP or SSSD a network round trip. A
+/// file hierarchy almost always has one or two distinct owners, so a tree of
+/// 100,000 files made 200,000 lookups where two would do.
+fn cached_username(uid: u32) -> Option<String> {
+    thread_local! {
+        static USERS: std::cell::RefCell<std::collections::HashMap<u32, Option<String>>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    USERS.with(|c| {
+        c.borrow_mut()
+            .entry(uid)
+            .or_insert_with(|| get_username(uid))
+            .clone()
+    })
+}
+
+fn cached_groupname(gid: u32) -> Option<String> {
+    thread_local! {
+        static GROUPS: std::cell::RefCell<std::collections::HashMap<u32, Option<String>>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    GROUPS.with(|c| {
+        c.borrow_mut()
+            .entry(gid)
+            .or_insert_with(|| get_groupname(gid))
+            .clone()
+    })
+}
+
 fn get_username(uid: u32) -> Option<String> {
     unsafe {
         let pw = libc::getpwuid(uid);

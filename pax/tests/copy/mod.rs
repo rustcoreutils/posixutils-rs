@@ -55,13 +55,12 @@ fn test_copy_mode_file() {
     // Create destination directory
     fs::create_dir(&dst_dir).unwrap();
 
-    // Copy single file
-    let output = run_pax(&[
-        "-r",
-        "-w",
-        src_file.to_str().unwrap(),
-        dst_dir.to_str().unwrap(),
-    ]);
+    // Copy single file. The operand is relative to src_dir, so the member name
+    // -- and the destination beneath dst_dir -- is just "test.txt".
+    let output = run_pax_in_dir(
+        &["-r", "-w", "test.txt", dst_dir.to_str().unwrap()],
+        &src_dir,
+    );
     assert_success(&output, "pax copy");
 
     // Verify file was copied
@@ -89,13 +88,8 @@ fn test_copy_mode_directory() {
     // Create destination directory
     fs::create_dir(&dst_dir).unwrap();
 
-    // Copy directory
-    let output = run_pax(&[
-        "-r",
-        "-w",
-        subdir.to_str().unwrap(),
-        dst_dir.to_str().unwrap(),
-    ]);
+    // Copy directory, naming it relative to src_dir.
+    let output = run_pax_in_dir(&["-r", "-w", "mydir", dst_dir.to_str().unwrap()], &src_dir);
     assert_success(&output, "pax copy");
 
     // Verify directory was copied
@@ -197,13 +191,10 @@ fn test_copy_mode_link() {
     fs::create_dir(&dst_dir).unwrap();
 
     // Copy with -l (hard link mode)
-    let output = run_pax(&[
-        "-r",
-        "-w",
-        "-l",
-        src_file.to_str().unwrap(),
-        dst_dir.to_str().unwrap(),
-    ]);
+    let output = run_pax_in_dir(
+        &["-r", "-w", "-l", "link_test.txt", dst_dir.to_str().unwrap()],
+        &src_dir,
+    );
     assert_success(&output, "pax copy");
 
     // Verify file exists and has same inode (hard link)
@@ -237,12 +228,10 @@ fn test_copy_mode_symlink() {
     fs::create_dir(&dst_dir).unwrap();
 
     // Copy symlink (without -L, so symlink itself is copied)
-    let output = run_pax(&[
-        "-r",
-        "-w",
-        src_dir.join("symlink.txt").to_str().unwrap(),
-        dst_dir.to_str().unwrap(),
-    ]);
+    let output = run_pax_in_dir(
+        &["-r", "-w", "symlink.txt", dst_dir.to_str().unwrap()],
+        &src_dir,
+    );
     assert_success(&output, "pax copy");
 
     // Verify symlink was copied as symlink
@@ -277,14 +266,17 @@ fn test_copy_mode_multiple_files() {
     fs::create_dir(&dst_dir).unwrap();
 
     // Copy multiple files
-    let output = run_pax(&[
-        "-r",
-        "-w",
-        src_dir.join("file1.txt").to_str().unwrap(),
-        src_dir.join("file2.txt").to_str().unwrap(),
-        src_dir.join("file3.txt").to_str().unwrap(),
-        dst_dir.to_str().unwrap(),
-    ]);
+    let output = run_pax_in_dir(
+        &[
+            "-r",
+            "-w",
+            "file1.txt",
+            "file2.txt",
+            "file3.txt",
+            dst_dir.to_str().unwrap(),
+        ],
+        &src_dir,
+    );
     assert_success(&output, "pax copy");
 
     // Verify all files were copied
@@ -326,5 +318,307 @@ fn test_copy_mode_stdin_file_list() {
     assert!(
         dst_dir.join("stdin2.txt").exists(),
         "stdin2.txt should exist"
+    );
+}
+
+/// `-c` inverts pattern matching, but in write and copy mode the operands are
+/// the files to archive, not patterns. Copy mode used to feed an empty pattern
+/// list to an inverted match, so every file failed selection and `pax -r -w -c
+/// src dest` copied nothing while exiting 0 -- silent data loss for a script
+/// that removes the source afterwards. Write mode ignored -c outright.
+#[test]
+fn test_copy_mode_rejects_dash_c() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let dst_dir = temp.path().join("dest");
+    fs::create_dir(&src_dir).unwrap();
+    fs::create_dir(&dst_dir).unwrap();
+    fs::write(src_dir.join("keep.txt"), b"payload").unwrap();
+
+    let output = run_pax_in_dir(
+        &["-r", "-w", "-c", "source", dst_dir.to_str().unwrap()],
+        temp.path(),
+    );
+
+    assert_failure(&output, "copy mode with -c");
+    assert!(
+        stderr_str(&output).contains("-c"),
+        "the diagnostic should name the option: {}",
+        stderr_str(&output)
+    );
+    // Above all: it must not silently report success having copied nothing.
+    assert!(
+        !dst_dir.join("source").exists(),
+        "nothing should have been copied"
+    );
+}
+
+#[test]
+fn test_write_mode_rejects_dash_c() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("out.tar");
+    fs::create_dir(&src_dir).unwrap();
+    fs::write(src_dir.join("f.txt"), b"x").unwrap();
+
+    let output = run_pax_in_dir(
+        &["-w", "-c", "-f", archive.to_str().unwrap(), "f.txt"],
+        &src_dir,
+    );
+    assert_failure(&output, "write mode with -c");
+    assert!(
+        stderr_str(&output).contains("-c"),
+        "the diagnostic should name the option: {}",
+        stderr_str(&output)
+    );
+}
+
+/// Set a file's atime and mtime to fixed values, nanoseconds included.
+#[cfg(unix)]
+fn set_times_ns(path: &std::path::Path, atime: (i64, i64), mtime: (i64, i64)) {
+    use std::os::unix::ffi::OsStrExt;
+    let times = [
+        libc::timespec {
+            tv_sec: atime.0 as libc::time_t,
+            tv_nsec: atime.1 as _,
+        },
+        libc::timespec {
+            tv_sec: mtime.0 as libc::time_t,
+            tv_nsec: mtime.1 as _,
+        },
+    ];
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0) };
+    assert_eq!(rc, 0, "utimensat: {}", std::io::Error::last_os_error());
+}
+
+/// POSIX: a copy behaves "as if the copied files were written to a pax format
+/// archive file and then subsequently extracted". Extraction restores atime and
+/// mtime separately and at nanosecond resolution; copy mode instead called
+/// utimes with the source *mtime* in both slots and tv_usec hardcoded to 0, so
+/// it clobbered the destination access time and dropped all sub-second
+/// precision.
+#[cfg(unix)]
+#[test]
+fn test_copy_mode_preserves_atime_and_subsecond_mtime() {
+    use std::os::unix::fs::MetadataExt;
+
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let dst_dir = temp.path().join("dest");
+    fs::create_dir(&src_dir).unwrap();
+    fs::create_dir(&dst_dir).unwrap();
+
+    let src_file = src_dir.join("timed.txt");
+    fs::write(&src_file, b"content").unwrap();
+    // Distinct instants so an mtime-in-both-slots bug is visible.
+    set_times_ns(&src_file, (1_058_356_800, 0), (1_055_678_400, 123_456_789));
+
+    let want = fs::metadata(&src_file).unwrap();
+    let (want_atime, want_mtime, want_nsec) = (want.atime(), want.mtime(), want.mtime_nsec());
+
+    let output = run_pax_in_dir(
+        &["-r", "-w", "-p", "e", "source", dst_dir.to_str().unwrap()],
+        temp.path(),
+    );
+    assert_success(&output, "copy preserving times");
+
+    let got = fs::metadata(dst_dir.join("source").join("timed.txt"))
+        .unwrap_or_else(|e| panic!("copied file missing: {e}"));
+    assert_eq!(got.mtime(), want_mtime, "mtime not preserved");
+    assert_eq!(
+        got.atime(),
+        want_atime,
+        "atime must be the source's access time, not its mtime"
+    );
+    if want_nsec != 0 {
+        assert_eq!(
+            got.mtime_nsec(),
+            want_nsec,
+            "sub-second mtime must survive the copy"
+        );
+    }
+}
+
+/// mkfifo and mknod apply the process umask, so a special file needs an
+/// explicit chmod afterwards -- which extraction does and copy mode did not,
+/// along with never restoring times or ownership for these types.
+#[cfg(unix)]
+#[test]
+fn test_copy_mode_restores_fifo_mode() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let dst_dir = temp.path().join("dest");
+    fs::create_dir(&src_dir).unwrap();
+    fs::create_dir(&dst_dir).unwrap();
+
+    let fifo = src_dir.join("pipe");
+    let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    if unsafe { libc::mkfifo(c.as_ptr(), 0o600) } != 0 {
+        eprintln!("Skipping FIFO test: mkfifo failed");
+        return;
+    }
+    // A mode with bits the default umask would strip.
+    fs::set_permissions(&fifo, fs::Permissions::from_mode(0o666)).unwrap();
+
+    let output = run_pax_in_dir(
+        &["-r", "-w", "-p", "e", "source", dst_dir.to_str().unwrap()],
+        temp.path(),
+    );
+    assert_success(&output, "copy a FIFO");
+
+    let got = fs::symlink_metadata(dst_dir.join("source").join("pipe"))
+        .unwrap_or_else(|e| panic!("copied FIFO missing: {e}"));
+    assert_eq!(
+        got.permissions().mode() & 0o777,
+        0o666,
+        "a copied FIFO must keep its mode, not the umask's"
+    );
+}
+
+/// A directory whose archived mode denies write or search permission must still
+/// receive its contents: the mode belongs on the directory only once the
+/// subtree below it exists. Applying it at creation time made every child fail
+/// with EACCES, and stamped a mtime that populating the directory then
+/// invalidated.
+#[cfg(unix)]
+#[test]
+fn test_copy_mode_readonly_directory_gets_its_contents() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let dst_dir = temp.path().join("dest");
+    fs::create_dir(&src_dir).unwrap();
+    fs::create_dir(&dst_dir).unwrap();
+
+    let ro = src_dir.join("ro");
+    fs::create_dir(&ro).unwrap();
+    fs::write(ro.join("inside.txt"), b"must survive").unwrap();
+    fs::set_permissions(&ro, fs::Permissions::from_mode(0o555)).unwrap();
+
+    let output = run_pax_in_dir(
+        &["-r", "-w", "-p", "e", "source", dst_dir.to_str().unwrap()],
+        temp.path(),
+    );
+
+    let copied_dir = dst_dir.join("source").join("ro");
+    assert_eq!(
+        fs::read_to_string(copied_dir.join("inside.txt")).unwrap_or_default(),
+        "must survive",
+        "a read-only directory must still receive its contents: {}",
+        stderr_str(&output)
+    );
+    assert_eq!(
+        fs::metadata(&copied_dir).unwrap().permissions().mode() & 0o777,
+        0o555,
+        "and must end up with its archived mode"
+    );
+
+    // Leave the tree removable for TempDir's cleanup.
+    fs::set_permissions(&copied_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&ro, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// `-s` renamed only the paths typed on the command line: the walk used a
+/// second function for everything below an operand, and that one had never
+/// gained the substitution step. A rename applied to a directory operand
+/// therefore left every file inside it untouched.
+#[test]
+fn test_copy_mode_substitution_applies_below_operand() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let dst_dir = temp.path().join("dest");
+    fs::create_dir_all(src_dir.join("tree/sub")).unwrap();
+    fs::create_dir(&dst_dir).unwrap();
+    fs::write(src_dir.join("tree/sub/keep.txt"), b"a").unwrap();
+    fs::write(src_dir.join("tree/sub/drop.o"), b"b").unwrap();
+
+    let output = run_pax_in_dir(
+        &[
+            "-r",
+            "-w",
+            "-s",
+            ",\\.txt$,.renamed,",
+            "tree",
+            dst_dir.to_str().unwrap(),
+        ],
+        &src_dir,
+    );
+    assert_success(&output, "copy with -s");
+
+    assert!(
+        dst_dir.join("tree/sub/keep.renamed").exists(),
+        "-s must rename a file found by recursion, not just an operand"
+    );
+    assert!(
+        !dst_dir.join("tree/sub/keep.txt").exists(),
+        "the original name must not also be present"
+    );
+}
+
+/// A substitution to the empty string means "skip this file", and that too has
+/// to reach the whole subtree.
+#[test]
+fn test_copy_mode_substitution_skips_below_operand() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let dst_dir = temp.path().join("dest");
+    fs::create_dir_all(src_dir.join("tree")).unwrap();
+    fs::create_dir(&dst_dir).unwrap();
+    fs::write(src_dir.join("tree/keep.txt"), b"a").unwrap();
+    fs::write(src_dir.join("tree/drop.o"), b"b").unwrap();
+
+    let output = run_pax_in_dir(
+        &[
+            "-r",
+            "-w",
+            "-s",
+            ",^.*\\.o$,,",
+            "tree",
+            dst_dir.to_str().unwrap(),
+        ],
+        &src_dir,
+    );
+    assert_success(&output, "copy with a deleting -s");
+
+    assert!(dst_dir.join("tree/keep.txt").exists(), "keep.txt must copy");
+    assert!(
+        !dst_dir.join("tree/drop.o").exists(),
+        "a member whose name substitutes to empty must be skipped"
+    );
+}
+
+/// POSIX defines a copy as "as if the copied files were written to a pax format
+/// archive file and then subsequently extracted". Writing `a/b/c` records the
+/// member `a/b/c` and extracting it recreates that path, so the copy must too --
+/// it used to name the destination after the basename alone, producing
+/// `dest/c`, which no archive round trip could yield.
+#[test]
+fn test_copy_mode_destination_uses_member_path() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let dst_dir = temp.path().join("dest");
+    fs::create_dir_all(src_dir.join("a/b")).unwrap();
+    fs::create_dir(&dst_dir).unwrap();
+    fs::write(src_dir.join("a/b/c.txt"), b"nested").unwrap();
+
+    let output = run_pax_in_dir(
+        &["-r", "-w", "a/b/c.txt", dst_dir.to_str().unwrap()],
+        &src_dir,
+    );
+    assert_success(&output, "copy a multi-component operand");
+
+    assert_eq!(
+        fs::read_to_string(dst_dir.join("a/b/c.txt")).unwrap_or_default(),
+        "nested",
+        "a multi-component operand keeps its path under the destination"
+    );
+    assert!(
+        !dst_dir.join("c.txt").exists(),
+        "and must not be flattened to its basename"
     );
 }

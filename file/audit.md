@@ -220,7 +220,7 @@ stdin/stdout defaults all conform. The gaps are in conversion *ordering*, SIGINT
 - [x] **DD-7 — `cbs=` not required-checked for `ascii`/`ebcdic`/`ibm`/`block`/`unblock`.** `dd.rs:494-521`. Spec requires `cbs` for these; impl accepts `cbs=0`. PARTIAL. ✓ fixed in dd-A — `conv=block`/`unblock` with `cbs=0` is rejected.
 - [x] **DD-8 — non-`noerror` read error exits without printing stats.** `dd.rs:634`. Spec is ambiguous, but historical `dd` prints stats on every termination. Minor. ✓ fixed in dd-B — stats are printed before aborting on a non-noerror read error.
 - [x] **DD-9 — `noerror` skip path does not count the failed block.** `dd.rs:440-441`. May undercount `records in`. Minor. ✓ fixed in dd-B — a skipped (failed) noerror block increments in_partial.
-- [ ] **DD-10 — `m`/`g`/`c` multiplier suffixes are extensions** beyond POSIX `b`/`k`/`x`. `dd.rs:537,541-542`. N/A (harmless extension; note only).
+- [x] **DD-10 — `m`/`g`/`c` multiplier suffixes are extensions** beyond POSIX `b`/`k`/`x`. `dd.rs:537,541-542`. N/A (harmless extension; note only).
 
 ### Detailed conformance matrix
 #### Operands
@@ -514,7 +514,7 @@ pre-check on prefix+suffix length is absent.
 - [x] **SPLIT-2 — no `{NAME_MAX}` check on prefix + suffix length.** `split.rs:115-147`. Spec §115748-115751 / §115764: if `name`+`suffix_length` would exceed `{NAME_MAX}`, fail with a diagnostic and create no files. MISSING. Fix: validate before opening the first output. ✓ fixed in split-A — `name_max_for()` checks basename(prefix)+suffix_length against `pathconf(_PC_NAME_MAX)` before any file is created.
 
 #### Minor
-- [ ] **SPLIT-3 — `-b` `g` suffix is a non-POSIX extension.** `split.rs:199-201`. POSIX defines only `k`/`m`. N/A (harmless; note only).
+- [x] **SPLIT-3 — `-b` `g` suffix is a non-POSIX extension.** `split.rs:199-201`. POSIX defines only `k`/`m`. N/A (harmless; note only).
 - [x] **SPLIT-4 — `-b` size `n*mul` can overflow.** `split.rs:209-210`. Wrapping multiply in release. Minor. ✓ fixed in split-A — `checked_mul`.
 - [x] **SPLIT-5 — suffix-exhaustion message is non-standard.** `split.rs:131-134` (`"maximum suffix reached"`). Minor. ✓ fixed in split-A — clearer gettext message.
 

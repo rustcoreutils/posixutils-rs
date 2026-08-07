@@ -248,15 +248,21 @@ read/list. There are **no crashes/hangs**.
 - [x] **#25 — `-o listopt` value is comma-split.** *(Fixed, Phase 6.)* `options.rs:158-171` splits a
   `listopt` value on unescaped commas; spec 110238-110243: `listopt=format` must
   be the final keyword and all remaining characters are the format string.
-- [~] **#26 — non-UTF-8 path bytes are lossily mangled** (`to_string_lossy` in
-  `ustar.rs:352,404,452`); ASCII/UTF-8 names are fine. cpio TRAILER header
-  carries `c_mode=100644` (`cpio.rs:286`) where GNU writes `000000` — harmless.
-  **Documented WON'T-FIX (Phase 8).** Both items are cosmetic or non-data-losing
-  on the supported path: the cpio TRAILER `c_mode` is ignored by readers (they
-  key off the `TRAILER!!!` name), and exact non-UTF-8 byte preservation would
-  require threading raw `OsStr`/byte paths through the entire entry/format stack
-  (a cross-cutting rewrite); ASCII/UTF-8 pathnames — the overwhelming common
-  case — round-trip correctly today.
+- [x] **#26 — non-UTF-8 path bytes are lossily mangled.** **Fixed for `-x pax`.**
+  `ExtendedHeader.path`/`.linkpath` are now `Vec<u8>` rather than `String`, and
+  `from_entry` emits `hdrcharset=BINARY` with unencoded pathname records for a
+  member whose name is not valid UTF-8, which is what POSIX defines
+  `-o invalid=binary` to do. Previously `binary` ran the name through
+  `to_string_lossy` before any format saw it, so every invalid byte became
+  U+FFFD irreversibly and `binary`, `UTF-8` and `write` all produced identical
+  output. Regression test: `test_pax_invalid_binary_preserves_raw_name`
+  (Linux-only; APFS/HFS+ refuse to create such a name).
+  Still lossy for `-x ustar`/`-x cpio`, which have nowhere to record the
+  encoding — the ustar name field beside the record remains a best-effort
+  fallback for readers that do not parse extended headers.
+  Separately: the cpio TRAILER header carries `c_mode=100644` (`cpio.rs:286`)
+  where GNU writes `000000` — harmless and still WON'T-FIX, since readers key
+  off the `TRAILER!!!` name.
 
 ## Non-POSIX extensions (note; keep, document)
 

@@ -12,7 +12,9 @@
 use crate::error::{Result, ViError};
 use std::io::{self, Write};
 use std::os::unix::io::AsRawFd;
-use termios::{tcsetattr, Termios, ECHO, ICANON, ICRNL, ISIG, IXON, OPOST, TCSAFLUSH, VMIN, VTIME};
+use termios::{
+    tcsetattr, Termios, ECHO, ICANON, ICRNL, IEXTEN, ISIG, IXON, OPOST, TCSAFLUSH, VMIN, VTIME,
+};
 
 /// Terminal size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +62,40 @@ impl Terminal {
         }
     }
 
+    /// The raw-mode settings vi drives the terminal with.
+    ///
+    /// Split out from [`Self::enable_raw_mode`] so the flag arithmetic can be
+    /// asserted without a tty: the `IEXTEN` clearing below only *manifests* on
+    /// BSD-derived systems, so a behavioral test for it cannot run on Linux.
+    fn raw_termios(original: Termios) -> Termios {
+        let mut raw = original;
+
+        // Input flags: disable ICRNL (translate CR to NL), IXON (XON/XOFF flow control)
+        raw.c_iflag &= !(ICRNL | IXON);
+
+        // Output flags: disable OPOST (post-processing)
+        raw.c_oflag &= !(OPOST);
+
+        // Local flags: disable ECHO, ICANON (canonical mode), ISIG (signals)
+        // and IEXTEN (implementation-defined input processing).
+        //
+        // IEXTEN matters for `^V`. On BSD-derived systems, including macOS, it
+        // enables the line discipline's VLNEXT "literal next" handling even
+        // with ICANON off: the driver eats the `^V` and passes the following
+        // byte through itself, so vi never sees the `^V` and reads the next
+        // byte as an ordinary key. `^V ESC` then left insert mode instead of
+        // inserting a literal ESC. Linux only applies VLNEXT under ICANON,
+        // which is already cleared above, which is why this went unnoticed
+        // there.
+        raw.c_lflag &= !(ECHO | ICANON | ISIG | IEXTEN);
+
+        // Control characters: read returns after 1 byte, no timeout
+        raw.c_cc[VMIN] = 1;
+        raw.c_cc[VTIME] = 0;
+
+        raw
+    }
+
     /// Enable raw mode.
     pub fn enable_raw_mode(&mut self) -> Result<()> {
         if self.raw_mode {
@@ -71,21 +107,7 @@ impl Terminal {
 
         self.original_termios = Some(original);
 
-        let mut raw = original;
-
-        // Input flags: disable ICRNL (translate CR to NL), IXON (XON/XOFF flow control)
-        raw.c_iflag &= !(ICRNL | IXON);
-
-        // Output flags: disable OPOST (post-processing)
-        raw.c_oflag &= !(OPOST);
-
-        // Local flags: disable ECHO, ICANON (canonical mode), ISIG (signals)
-        raw.c_lflag &= !(ECHO | ICANON | ISIG);
-
-        // Control characters: read returns after 1 byte, no timeout
-        raw.c_cc[VMIN] = 1;
-        raw.c_cc[VTIME] = 0;
-
+        let raw = Self::raw_termios(original);
         tcsetattr(stdin_fd, TCSAFLUSH, &raw).map_err(ViError::Io)?;
 
         self.raw_mode = true;
@@ -386,5 +408,42 @@ mod tests {
             assert!(size.cols >= 10);
             assert!(size.rows >= 2);
         }
+    }
+
+    /// `^V` (VLNEXT) must reach vi, not be consumed by the line discipline.
+    ///
+    /// On BSD-derived systems, including macOS, IEXTEN enables the driver's
+    /// "literal next" handling even with ICANON off, so a set IEXTEN makes the
+    /// tty swallow the `^V` and hand vi the following byte as an ordinary key
+    /// -- `^V ESC` leaves insert mode instead of inserting a literal ESC.
+    /// Linux only applies VLNEXT under ICANON, so the behavioral PTY test for
+    /// this cannot fail here; assert the flag arithmetic directly instead.
+    #[test]
+    fn test_raw_mode_clears_iexten_and_friends() {
+        // Start from a termios with every local flag set, so a flag surviving
+        // the mask is unambiguous rather than an artifact of the host default.
+        let mut original: Termios = unsafe { std::mem::zeroed() };
+        original.c_lflag = !0;
+        original.c_iflag = !0;
+        original.c_oflag = !0;
+
+        let raw = Terminal::raw_termios(original);
+
+        assert_eq!(
+            raw.c_lflag & IEXTEN,
+            0,
+            "IEXTEN must be cleared: ^V has to reach vi"
+        );
+        assert_eq!(raw.c_lflag & ICANON, 0, "ICANON must be cleared");
+        assert_eq!(raw.c_lflag & ECHO, 0, "ECHO must be cleared");
+        assert_eq!(raw.c_lflag & ISIG, 0, "ISIG must be cleared");
+        assert_eq!(
+            raw.c_iflag & (ICRNL | IXON),
+            0,
+            "ICRNL/IXON must be cleared"
+        );
+        assert_eq!(raw.c_oflag & OPOST, 0, "OPOST must be cleared");
+        assert_eq!(raw.c_cc[VMIN], 1, "read must return after one byte");
+        assert_eq!(raw.c_cc[VTIME], 0, "read must not time out");
     }
 }

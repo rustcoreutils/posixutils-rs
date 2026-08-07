@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, TestPlan};
+use plib::testing::{os_bytes, run_test, run_test_os, TestPlan, TestPlanOs};
 
 #[test]
 fn dirname_basic() {
@@ -114,5 +114,33 @@ fn dirname_newline_is_error() {
         expected_out: String::new(),
         expected_err: String::from("dirname: result contains a newline character\n"),
         expected_exit_code: 1,
+    });
+}
+
+/// A pathname operand is a byte string, so `dirname` must pass through bytes
+/// that are not valid UTF-8 (#D1). See `basename_non_utf8_operand` for why this
+/// needs `TestPlanOs` rather than `TestPlan`.
+#[test]
+fn dirname_non_utf8_operand() {
+    run_test_os(TestPlanOs {
+        cmd: String::from("dirname"),
+        args: vec![os_bytes(b"/tmp/\xff\xfedir/file")],
+        stdin_data: Vec::new(),
+        expected_out: b"/tmp/\xff\xfedir\n".to_vec(),
+        expected_err: Vec::new(),
+        expected_exit_code: 0,
+    });
+}
+
+/// A non-UTF-8 basename with no directory part still yields ".".
+#[test]
+fn dirname_non_utf8_bare_name() {
+    run_test_os(TestPlanOs {
+        cmd: String::from("dirname"),
+        args: vec![os_bytes(b"\xff\xfename")],
+        stdin_data: Vec::new(),
+        expected_out: b".\n".to_vec(),
+        expected_err: Vec::new(),
+        expected_exit_code: 0,
     });
 }

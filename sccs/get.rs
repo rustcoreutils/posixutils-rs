@@ -168,9 +168,34 @@ fn delta_after_cutoff(delta: &DeltaEntry, cutoff: (u16, u8, u8, u8, u8, u8)) -> 
 
 /// Resolve a comma/space-separated SID list (e.g. "1.2,1.3") into the set of
 /// delta serial numbers. Unknown SIDs are reported and skipped.
-fn resolve_sid_list(sccs: &SccsFile, list: &str) -> Vec<u16> {
+/// Resolve an -i/-x option-argument into delta serials.
+///
+/// The list grammar is `<list> ::= <range> | <list> , <range>` with
+/// `<range> ::= SID | SID - SID` (99085-99087). A SID never contains '-', so
+/// the separator is unambiguous.
+fn resolve_sid_list(sccs: &SccsFile, list: &str) -> Result<Vec<u16>, String> {
     let mut serials = Vec::new();
     for tok in list.split([',', ' ']).filter(|s| !s.is_empty()) {
+        if let Some((lo, hi)) = tok.split_once('-') {
+            let (lo_sid, hi_sid) = match (lo.parse::<Sid>(), hi.parse::<Sid>()) {
+                (Ok(l), Ok(h)) => (l, h),
+                _ => return Err(format!("{}: {}", tok, gettext("invalid SID range"))),
+            };
+            match sccs.ancestor_chain(&lo_sid, &hi_sid) {
+                Some(mut r) => serials.append(&mut r),
+                // "A diagnostic message shall be written if the first SID in
+                // the range is not an ancestor of the second SID."
+                None => {
+                    return Err(format!(
+                        "{}: {}",
+                        tok,
+                        gettext("first SID in range is not an ancestor of the second")
+                    ))
+                }
+            }
+            continue;
+        }
+
         match tok.parse::<Sid>() {
             Ok(sid) => {
                 if let Some(d) = sccs.find_delta_by_sid(&sid) {
@@ -184,7 +209,7 @@ fn resolve_sid_list(sccs: &SccsFile, list: &str) -> Vec<u16> {
             }
         }
     }
-    serials
+    Ok(serials)
 }
 
 /// True if `ancestor` is `serial` itself or appears in `serial`'s predecessor
@@ -324,7 +349,22 @@ fn expand_keywords(
     result
 }
 
-/// Find the delta to retrieve based on -r option
+/// Applied (non-removed) deltas. A delta withdrawn by `rmdel` keeps its place
+/// in the file and its SID stays reserved, but it has no text to retrieve, so
+/// it must never be selected as the target.
+fn applied_deltas(sccs: &SccsFile) -> impl Iterator<Item = &DeltaEntry> {
+    sccs.header
+        .deltas
+        .iter()
+        .filter(|d| d.delta_type == plib::sccsfile::DeltaType::Normal)
+}
+
+/// Find the delta to retrieve based on -r option.
+///
+/// Implements the "SID Retrieved" column of the POSIX get(1) SID table
+/// (99233-99253). A release-only `-r R` is not merely a lookup: R may name a
+/// release that does not exist yet, in which case the retrieved delta comes
+/// from a neighbouring release (mR above, hR below).
 fn find_target_delta<'a>(
     sccs: &'a SccsFile,
     requested_sid: Option<&str>,
@@ -340,29 +380,44 @@ fn find_target_delta<'a>(
                 .parse()
                 .map_err(|_| format!("{}: {}", gettext("Invalid SID"), sid_str))?;
 
-            // Try exact match first
+            // Try exact match first, but only for a delta that still has text:
+            // an rmdel'd SID is reserved, not retrievable.
             if let Some(delta) = sccs.find_delta_by_sid(&sid) {
-                return Ok(delta);
+                if delta.delta_type == plib::sccsfile::DeltaType::Normal {
+                    return Ok(delta);
+                }
             }
 
-            // Partial SID handling
             if sid.is_partial() {
-                // Only release specified - find highest level in that release
-                let matching = sccs
-                    .header
-                    .deltas
-                    .iter()
+                // "R": the highest level within release R (R.mL).
+                if let Some(d) = applied_deltas(sccs)
                     .filter(|d| d.sid.rel == sid.rel && d.sid.is_trunk())
-                    .max_by(|a, b| a.sid.cmp(&b.sid));
+                    .max_by(|a, b| a.sid.cmp(&b.sid))
+                {
+                    return Ok(d);
+                }
 
-                matching
+                // Release R holds no applied delta. R > mR retrieves the trunk
+                // head mR.mL (and goes on to create R.1); R < mR retrieves
+                // hR.mL, hR being the highest existing release below R.
+                let trunk_head = sccs
+                    .get_trunk_head()
+                    .ok_or_else(|| gettext("No deltas in file"))?;
+                if sid.rel > trunk_head.sid.rel {
+                    return Ok(trunk_head);
+                }
+                applied_deltas(sccs)
+                    .filter(|d| d.sid.is_trunk() && d.sid.rel < sid.rel)
+                    .max_by(|a, b| a.sid.cmp(&b.sid))
                     .ok_or_else(|| format!("{} {}", gettext("No delta found for release"), sid.rel))
-            } else if sid.lev != 0 && sid.br == 0 && sid.seq == 0 {
-                // R.L specified - exact trunk match
-                sccs.find_delta_by_sid(&sid)
+            } else if sid.br != 0 && sid.seq == 0 {
+                // "R.L.B": the highest sequence on that branch (R.L.B.mS).
+                applied_deltas(sccs)
+                    .filter(|d| d.sid.same_branch(&sid))
+                    .max_by(|a, b| a.sid.cmp(&b.sid))
                     .ok_or_else(|| format!("{} {} {}", gettext("SID"), sid, gettext("not found")))
             } else {
-                // Full SID - must match exactly
+                // R.L and R.L.B.S must match an applied delta exactly.
                 Err(format!(
                     "{} {} {}",
                     gettext("SID"),
@@ -423,10 +478,50 @@ fn find_top_delta<'a>(
         })
 }
 
-/// Compute new SID for editing
-fn compute_new_sid(sccs: &SccsFile, target: &DeltaEntry, create_branch: bool) -> Sid {
-    if create_branch && sccs.branch_enabled() {
-        // Create branch: R.L.(max_branch+1).1
+/// Does any delta already succeed `target` on the line it sits on?
+///
+/// For a trunk delta that means any later trunk delta, in this release or a
+/// higher one; for a branch delta, a higher sequence on the same branch. The
+/// scan deliberately includes rmdel'd deltas: their SIDs stay reserved, so a
+/// successor must not be minted on top of one.
+fn has_successor(sccs: &SccsFile, target: &DeltaEntry) -> bool {
+    sccs.header.deltas.iter().any(|d| {
+        if target.sid.is_trunk() {
+            d.sid.is_trunk() && d.sid > target.sid
+        } else {
+            d.sid.same_branch(&target.sid) && d.sid.seq > target.sid.seq
+        }
+    })
+}
+
+/// Compute the SID of the delta to be created, i.e. the "SID of Delta to be
+/// Created" column of the POSIX get(1) SID table (99233-99253).
+///
+/// The table reduces to one rule plus one special case: branch off the
+/// retrieved delta whenever -b was given (and the b flag permits it) or the
+/// retrieved delta already has a successor; otherwise extend its line. The
+/// special case is a release-only -r naming a release above the newest one,
+/// which forces the first delta of that new release.
+fn compute_new_sid(
+    sccs: &SccsFile,
+    target: &DeltaEntry,
+    create_branch: bool,
+    requested_sid: Option<&Sid>,
+) -> Sid {
+    let branching = create_branch && sccs.branch_enabled();
+
+    // "R > mR": force creation of the first delta in a new release (99237).
+    // -b outranks it, per 99239.
+    if !branching {
+        if let Some(req) = requested_sid {
+            if req.is_partial() && req.rel > target.sid.rel {
+                return Sid::trunk(req.rel, 1);
+            }
+        }
+    }
+
+    if branching || has_successor(sccs, target) {
+        // Branch off the retrieved delta: R.L.(mB+1).1
         let max_branch = sccs
             .header
             .deltas
@@ -704,7 +799,8 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
             Err(e) => return Err(e),
         };
 
-        let new_sid = compute_new_sid(&sccs, target, args.branch);
+        let requested: Option<Sid> = args.sid.as_deref().and_then(|s| s.parse().ok());
+        let new_sid = compute_new_sid(&sccs, target, args.branch, requested.as_ref());
 
         // Check for existing edit lock (unless joint edit is allowed)
         if !sccs.joint_edit() {
@@ -722,16 +818,26 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
     let info_to_stderr = args.to_stdout || args.lfile_stdout;
 
     // Resolve -i / -x SID lists into delta serials.
-    let included_serials: Vec<u16> = args
-        .include
-        .as_deref()
-        .map(|l| resolve_sid_list(&sccs, l))
-        .unwrap_or_default();
-    let excluded_serials: Vec<u16> = args
-        .exclude
-        .as_deref()
-        .map(|l| resolve_sid_list(&sccs, l))
-        .unwrap_or_default();
+    // A malformed range is fatal: silently retrieving a version the caller did
+    // not ask for is worse than refusing, and the g-file would otherwise be
+    // written from the wrong delta set.
+    let mut list_error = None;
+    let mut resolve = |list: Option<&str>| -> Vec<u16> {
+        match list.map(|l| resolve_sid_list(&sccs, l)) {
+            Some(Ok(v)) => v,
+            Some(Err(e)) => {
+                list_error.get_or_insert(e);
+                Vec::new()
+            }
+            None => Vec::new(),
+        }
+    };
+    let included_serials: Vec<u16> = resolve(args.include.as_deref());
+    let excluded_serials: Vec<u16> = resolve(args.exclude.as_deref());
+    if let Some(e) = list_error {
+        eprintln!("get: {}: {}", sfile_path.display(), e);
+        return Ok(false);
+    }
 
     // Compute applied set, then apply -c cutoff and -i/-x adjustments.
     let mut applied_set = sccs
@@ -751,18 +857,6 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
                 .map(|d| !delta_after_cutoff(d, cutoff))
                 .unwrap_or(false)
         });
-    }
-
-    // -i: force-include the listed deltas (and their predecessor chains).
-    for &inc in &included_serials {
-        let mut cur = inc;
-        while cur != 0 {
-            applied_set.insert(cur);
-            match sccs.find_delta_by_serial(cur) {
-                Some(d) => cur = d.pred_serial,
-                None => break,
-            }
-        }
     }
 
     // -x: force-exclude the listed deltas. Only the named deltas are dropped
@@ -793,6 +887,21 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
                 .map(|d| d.sid)
                 .unwrap_or_default()
         });
+    }
+
+    // -i: force-include the listed deltas and their predecessor chains. This
+    // runs after -x, not before: -i is "forced to be applied" (99084), so a
+    // delta named by both options ends up applied. CSSC resolves the overlap
+    // the same way.
+    for &inc in &included_serials {
+        let mut cur = inc;
+        while cur != 0 {
+            applied_set.insert(cur);
+            match sccs.find_delta_by_serial(cur) {
+                Some(d) => cur = d.pred_serial,
+                None => break,
+            }
+        }
     }
 
     // Print SID info and -i/-x notation (unless silent)
@@ -837,6 +946,22 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
         write_lfile(&sccs, sfile_path, &applied_set, args.lfile_stdout)?;
     }
 
+    // Record the pending edit. This happens before retrieval, not after: -g
+    // suppresses the g-file but not the lock, and `get -e -g` announcing a new
+    // delta while leaving no p-file behind would hand the caller a lock that
+    // does not exist.
+    if args.edit {
+        if let Some(ns) = new_sid {
+            create_pfile_entry(
+                sfile_path,
+                &target_sid,
+                &ns,
+                args.include.clone(),
+                args.exclude.clone(),
+            )?;
+        }
+    }
+
     // If -g, skip actual retrieval
     if args.no_get {
         return Ok(true);
@@ -863,18 +988,6 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
             fs::write(&gfile_path, &raw)?;
             let mode = if args.edit { 0o644 } else { 0o444 };
             fs::set_permissions(&gfile_path, fs::Permissions::from_mode(mode))?;
-        }
-
-        if args.edit {
-            if let Some(ns) = new_sid {
-                create_pfile_entry(
-                    sfile_path,
-                    &target_sid,
-                    &ns,
-                    args.include.clone(),
-                    args.exclude.clone(),
-                )?;
-            }
         }
 
         if !args.silent {
@@ -998,19 +1111,6 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
         let mode = if args.edit { 0o644 } else { 0o444 };
         let perms = fs::Permissions::from_mode(mode);
         fs::set_permissions(&gfile_path, perms)?;
-    }
-
-    // Create p-file if editing
-    if args.edit {
-        if let Some(ns) = new_sid {
-            create_pfile_entry(
-                sfile_path,
-                &target_sid,
-                &ns,
-                args.include.clone(),
-                args.exclude.clone(),
-            )?;
-        }
     }
 
     // Print line count (unless silent)

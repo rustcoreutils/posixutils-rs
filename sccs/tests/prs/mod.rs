@@ -7,7 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test_with_checker, TestPlan};
+use super::common::run_test_with_checker;
+use plib::testing::TestPlan;
 use std::process::Output;
 use tempfile::TempDir;
 
@@ -341,4 +342,326 @@ fn prs_filename() {
             assert!(stdout.contains("s.test"), "should show filename");
         },
     );
+}
+
+use super::common::run_in;
+
+/// Build an s-file with `n` deltas in `dir`, returning its path.
+fn prs_multi_delta(dir: &std::path::Path, name: &str, n: usize) -> std::path::PathBuf {
+    let sname = format!("s.{name}");
+    let out = run_in("admin", &["-i", &sname], dir, "v1\n");
+    assert!(
+        out.status.success(),
+        "admin failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for i in 2..=n {
+        let out = run_in("get", &["-e", &sname], dir, "");
+        assert!(out.status.success(), "get -e failed");
+        std::fs::write(dir.join(name), format!("v{i}\n")).unwrap();
+        let out = run_in("delta", &["-ynext", &sname], dir, "");
+        assert!(
+            out.status.success(),
+            "delta failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    dir.join(sname)
+}
+
+/// #P1: with `-e` each delta's data specification is terminated by a newline,
+/// so the output of `-d:I:` over three deltas is exactly three lines. The
+/// default fixture elsewhere is single-delta, which cannot show this.
+#[test]
+fn prs_emits_one_newline_terminated_record_per_delta() {
+    let tmp = TempDir::new().unwrap();
+    prs_multi_delta(tmp.path(), "chain", 3);
+
+    let out = run_in("prs", &["-e", "-d:I:", "s.chain"], tmp.path(), "");
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "1.3\n1.2\n1.1\n",
+        "one newline-terminated record per delta, newest first"
+    );
+
+    // Without -e only the single default (most recent) delta is reported.
+    let out = run_in("prs", &["-d:I:", "s.chain"], tmp.path(), "");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1.3\n");
+}
+
+/// `-e` selects the given delta "and earlier", `-l` the given delta "and
+/// later" — the pair only distinguishable on a multi-delta file.
+#[test]
+fn prs_earlier_and_later_selectors() {
+    let tmp = TempDir::new().unwrap();
+    prs_multi_delta(tmp.path(), "sel", 3);
+
+    let out = run_in("prs", &["-e", "-r1.2", "-d:I:", "s.sel"], tmp.path(), "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "1.2\n1.1\n",
+        "-e must report the named delta and earlier ones"
+    );
+
+    let out = run_in("prs", &["-l", "-r1.2", "-d:I:", "s.sel"], tmp.path(), "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "1.3\n1.2\n",
+        "-l must report the named delta and later ones"
+    );
+}
+
+/// #P2: `-r` with no SID defaults to the most recently created delta and
+/// prints the default report format.
+#[test]
+fn prs_r_without_a_sid_uses_the_most_recent_delta() {
+    let tmp = TempDir::new().unwrap();
+    prs_multi_delta(tmp.path(), "nosid", 3);
+
+    let out = run_in("prs", &["-r", "s.nosid"], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "prs -r with no SID failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("1.3"),
+        "the default is the newest delta: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("MRs:") && stdout.contains("COMMENTS:"),
+        "the default report format is used: {stdout:?}"
+    );
+}
+
+/// `-a` includes deltas that `rmdel` marked removed; without it they are
+/// omitted.
+#[test]
+fn prs_a_includes_removed_deltas() {
+    let tmp = TempDir::new().unwrap();
+    prs_multi_delta(tmp.path(), "rem", 3);
+
+    let out = run_in("rmdel", &["-r", "1.3", "s.rem"], tmp.path(), "");
+    assert!(out.status.success(), "rmdel failed");
+
+    let out = run_in("prs", &["-e", "-d:I:", "s.rem"], tmp.path(), "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "1.2\n1.1\n",
+        "a removed delta is omitted by default"
+    );
+
+    let out = run_in("prs", &["-e", "-a", "-d:I:", "s.rem"], tmp.path(), "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "1.3\n1.2\n1.1\n",
+        "-a must include the removed delta"
+    );
+}
+
+/// Line statistics are zero-padded to five digits, and `:DL:` is the
+/// slash-joined triple of them.
+#[test]
+fn prs_line_statistics_are_five_digit_padded() {
+    let tmp = TempDir::new().unwrap();
+    prs_multi_delta(tmp.path(), "stats", 2);
+
+    for kw in [":Li:", ":Ld:", ":Lu:"] {
+        let out = run_in("prs", &["-d", kw, "s.stats"], tmp.path(), "");
+        let value = String::from_utf8_lossy(&out.stdout).trim_end().to_string();
+        assert_eq!(value.len(), 5, "{kw} must be five digits, got {value:?}");
+        assert!(
+            value.chars().all(|c| c.is_ascii_digit()),
+            "{kw} must be numeric, got {value:?}"
+        );
+    }
+
+    let out = run_in("prs", &["-d", ":DL:", "s.stats"], tmp.path(), "");
+    let dl = String::from_utf8_lossy(&out.stdout).trim_end().to_string();
+    let parts: Vec<&str> = dl.split('/').collect();
+    assert_eq!(parts.len(), 3, ":DL: is inserted/deleted/unchanged: {dl:?}");
+    for p in parts {
+        assert_eq!(p.len(), 5, ":DL: components are five digits: {dl:?}");
+    }
+}
+
+/// The `what`-string keywords. `:A:` is `:Z::Y: :M: :I::Z:` (spec 112350) and
+/// `:Z:` is the literal `@(#)` (112351).
+///
+/// *Recorded divergence:* when the module-type flag is unset, CSSC 1.4.1
+/// renders `:Y:` inside `:A:` as the literal `none` (`@(#)none p1 1.3@(#)`)
+/// while we render it empty. The spec does not mandate a "none" spelling for
+/// an unset keyword, and embedding the word into a what-string is the less
+/// useful reading, so ours is kept. With the flag set the two agree exactly.
+#[test]
+fn prs_what_string_keywords() {
+    let tmp = TempDir::new().unwrap();
+    prs_multi_delta(tmp.path(), "wh", 2);
+
+    let out = run_in("prs", &["-d", ":Z:", "s.wh"], tmp.path(), "");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "@(#)\n");
+
+    // With the module type flag set, :A: is fully determined.
+    let out = run_in("admin", &["-fttextfile", "s.wh"], tmp.path(), "");
+    assert!(out.status.success());
+
+    let out = run_in("prs", &["-d", ":A:", "s.wh"], tmp.path(), "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "@(#)textfile wh 1.2@(#)\n",
+        ":A: is :Z::Y: :M: :I::Z:"
+    );
+
+    let out = run_in("prs", &["-d", ":W:", "s.wh"], tmp.path(), "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "@(#)wh\t1.2\n",
+        ":W: is :Z::M:\\t:I:"
+    );
+}
+
+/// Multiple operands, a directory operand and a `-` stdin list all work, and a
+/// missing operand is an error.
+#[test]
+fn prs_operand_forms_and_exit_status() {
+    let tmp = TempDir::new().unwrap();
+    prs_multi_delta(tmp.path(), "one", 1);
+    prs_multi_delta(tmp.path(), "two", 1);
+
+    let out = run_in("prs", &["-d:M:", "s.one", "s.two"], tmp.path(), "");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("one") && stdout.contains("two"));
+
+    // Directory operand.
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::copy(tmp.path().join("s.one"), dir.join("s.one")).unwrap();
+    let out = run_in("prs", &["-d:M:", "proj"], tmp.path(), "");
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("one"));
+
+    // `-` reads the pathname list from stdin.
+    let out = run_in("prs", &["-d:M:", "-"], tmp.path(), "s.two\n");
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("two"));
+
+    // A missing operand is an error.
+    let out = run_in("prs", &["s.does-not-exist"], tmp.path(), "");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(!out.stderr.is_empty(), "a diagnostic is required");
+}
+
+/// The `-c` cutoff applies whether or not `-e`/`-l` is given: "No changes
+/// (deltas) to the SCCS file that were created after the specified cutoff
+/// date-time shall be included in the output" (112241-112243) is unconditional,
+/// and the synopsis at 112215 makes `[-e|-l]` optional in the `-c` form.
+///
+/// Uses the checked-in fixture, whose deltas are pinned at 25/12/12 22:24:47
+/// (1.1), 22:24:57 (1.2) and 22:25:05 (1.3), so the expectations do not depend
+/// on when the suite runs.
+#[test]
+fn prs_cutoff_applies_without_e_or_l() {
+    let tmp = TempDir::new().unwrap();
+    let sfile = tmp.path().join("s.multi");
+    std::fs::copy(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/s.multi"),
+        &sfile,
+    )
+    .unwrap();
+
+    let sids = |args: &[&str]| -> String {
+        let out = run_in("prs", args, tmp.path(), "");
+        assert!(
+            out.status.success(),
+            "prs {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    // Cutoff after the whole history: the newest delta is still reported.
+    assert_eq!(sids(&["-c25", "-d:I:", "s.multi"]), "1.3\n");
+
+    // Cutoff before the whole history: nothing survives it. Without the fix
+    // this printed 1.3, because -c was parsed and then ignored.
+    assert_eq!(
+        sids(&["-c2412", "-d:I:", "s.multi"]),
+        "",
+        "a cutoff before every delta must exclude them all"
+    );
+
+    // -e and -l keep working, and agree on the same boundary.
+    assert_eq!(
+        sids(&["-e", "-c2512122224", "-d:I:", "s.multi"]),
+        "1.2\n1.1\n",
+        "-e takes everything up to and including the cutoff"
+    );
+    assert_eq!(
+        sids(&["-l", "-c251212222500", "-d:I:", "s.multi"]),
+        "1.3\n",
+        "-l takes everything from the cutoff onward"
+    );
+}
+
+/// The cutoff's year is always two digits with the [69,99]=19xx / [00,68]=20xx
+/// pivot (112236-112237). There is no 4-digit-year form to infer.
+#[test]
+fn prs_cutoff_year_is_always_two_digits() {
+    let tmp = TempDir::new().unwrap();
+    let sfile = tmp.path().join("s.multi");
+    std::fs::copy(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/s.multi"),
+        &sfile,
+    )
+    .unwrap();
+
+    let sids = |args: &[&str]| -> String {
+        let out = run_in("prs", args, tmp.path(), "");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    // "2512" is December 2025, not the year 2512. Reading it as a 4-digit year
+    // put the cutoff five centuries out and let every delta through.
+    assert_eq!(
+        sids(&["-e", "-c2512", "-d:I:", "s.multi"]),
+        "1.3\n1.2\n1.1\n",
+        "2512 means December 2025, which is after the whole fixture"
+    );
+    assert_eq!(
+        sids(&["-e", "-c2511", "-d:I:", "s.multi"]),
+        "",
+        "November 2025 precedes the fixture's deltas"
+    );
+
+    // 69-99 select the 20th century, so these precede everything.
+    assert_eq!(sids(&["-e", "-c99", "-d:I:", "s.multi"]), "");
+    assert_eq!(sids(&["-e", "-c69", "-d:I:", "s.multi"]), "");
+}
+
+/// An out-of-range cutoff component is rejected rather than ignored. Dropping
+/// an unparseable `-c` would report every delta, which reads as a successful
+/// query rather than a rejected one.
+#[test]
+fn prs_cutoff_invalid_field_rejected() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::copy(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/s.multi"),
+        tmp.path().join("s.multi"),
+    )
+    .unwrap();
+
+    for bad in ["-c251312", "-c25121225", "-c2512122260"] {
+        let out = run_in("prs", &["-e", bad, "-d:I:", "s.multi"], tmp.path(), "");
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{bad} must be rejected, got stdout {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(out.stdout.is_empty(), "{bad} must not report deltas anyway");
+        assert!(!out.stderr.is_empty(), "{bad} needs a diagnostic");
+    }
 }

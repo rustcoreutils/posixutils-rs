@@ -27,6 +27,17 @@ struct Args {
 }
 
 fn process_sfile(sfile: &Path, show_header: bool) -> io::Result<bool> {
+    // A named operand that does not exist is an error (EXIT STATUS 113805,
+    // ">0 An error occurred"), not a quiet "no impending deltas". Without this
+    // check `sact s.typo` was byte-for-byte indistinguishable from `sact` on a
+    // real file with nothing checked out: no output, no diagnostic, exit 0.
+    if !sfile.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            gettext("no such SCCS file"),
+        ));
+    }
+
     // Check if p-file exists
     let pfile = paths::pfile_from_sfile(sfile);
 
@@ -130,12 +141,19 @@ fn main() -> ExitCode {
                 if process_directory(file, show_header, &mut had_error).is_err() {
                     had_error = true;
                 }
-            } else if paths::is_sfile(file) && process_sfile(file, show_header).is_err() {
+            } else if paths::is_sfile(file) {
+                if let Err(e) = process_sfile(file, show_header) {
+                    // STDERR is "used only for optional informative messages
+                    // concerning SCCS files with no impending deltas, and for
+                    // diagnostic messages" (113796-113797) — so say what went
+                    // wrong rather than failing silently.
+                    eprintln!("sact: {}: {}", file.display(), e);
+                    had_error = true;
+                }
+            } else {
+                eprintln!("sact: {}: {}", file.display(), gettext("not an SCCS file"));
                 had_error = true;
             }
-            // A named operand that is neither a directory nor a recognizable
-            // SCCS file is silently ignored (cssc returns 0 for a nonexistent
-            // operand), matching the no-impending-delta success case.
         }
     }
 

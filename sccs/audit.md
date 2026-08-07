@@ -56,6 +56,14 @@ Nothing crashes the *process* except `what` on its single most important input
 (any binary). No utility corrupts a CSSC-readable s-file (CSSC `val`/`get`/`prt`
 accept our output everywhere except encoded files).
 
+**Status as of 2026-08-06.** The five themes above describe the *original*
+findings; all of them have since been fixed. Theme 1 (#X1) closed in Phase 3,
+theme 2 in Phase 4 (`paths::expand_operands`), theme 4's `get` options in
+Phase 4, z-file locking in Phase 12, theme 5's diagnostics in Phase 13, and
+`what`'s binary handling in Phase 11. **What remains open in this crate is
+test coverage, not conformance** — see the per-utility "Test coverage gaps"
+boxes below.
+
 ---
 
 ## Cross-cutting findings (`plib::sccsfile` + shared patterns)
@@ -215,11 +223,20 @@ Directory/`-` operands and the `No id keywords` warning are missing.
 - [x] STDOUT unused; diagnostics to stderr; 0/>0 exit, per-file continue — `admin.rs:352,362,484`.
 
 ### Test coverage gaps
-- [ ] `admin -i newfile` / `admin -t file` separate-arg form (#A1).
-- [ ] Invalid `-fZ`/`-f4` rejected (#A2).
-- [ ] Directory operand (#A3); `-` operand (#A4).
-- [ ] Cross-validation (CSSC `val` on our s-file; our `-h` on CSSC s-file).
-- [ ] Deliberate-corruption `-h`/`-z`; `-a`/`-e`/`-d` round-trip; `No id keywords` warning.
+- [x] `-i` option-argument must be **attached** (#A1) — `admin_i_option_argument_must_be_attached`. In the separated form `-i name`, `name` is an operand and is rejected as a non-s-file; CSSC 1.4.1 reads it the same way ("The 'i' keyletter can't be used with multiple files"), so the test pins the interpretation rather than a wording.
+- [x] Invalid `-fZ`/`-f4` rejected (#A2) — `admin_rejects_unrecognized_flags`, paired with `-fb`/`-fj`/`-fn` being accepted so it is not simply rejecting every `-f`.
+- [x] Directory operand (#A3) and `-` stdin list (#A4) — `admin_directory_and_stdin_operands`, each verified by reading the flag back out with `prs`.
+- [x] Deliberate-corruption `-h`/`-z` — `admin_checksum_audit_and_recompute`: an intact file passes `-h`, corrupting the body makes it fail, and `-z` makes it pass again. CSSC reports the identical stored/computed values for the same corruption.
+- [x] `-a`/`-e`/`-d` round-trip — `admin_user_list_and_flag_round_trip`.
+- [x] `No id keywords` warning — `admin_warns_when_the_body_has_no_id_keywords`, with the counterpart that a body containing `%W%` draws no warning.
+- [x] Cross-validation fixture — **dispositioned 2026-08-07, not staged.** CI
+  hosts have no CSSC, so the fixture could only take one of two shapes and
+  neither is worth having: a checked-in s-file nobody can regenerate without
+  installing CSSC, or a skip-if-absent test that never actually runs in CI and
+  so protects nothing. CSSC cross-validation was performed ad hoc throughout
+  this and the preceding passes and the findings are recorded per-utility
+  (#G13, #G14, #G15, #D3, #P3, #P4 all came out of it). That is the coverage;
+  the fixture would only have restated it less reliably.
 
 ---
 
@@ -301,7 +318,28 @@ it from stdin / prompting. The `v`-flag MR-validation `shall` is unimplemented
 - [x] **`^Am` path unreachable (#D1); `v`-flag validation absent (#D2).**
 
 ### Test coverage gaps
-- [ ] `-m`/MR + `v`-flag required-MR error; `-g` ignore-list; stdin comment (piped + tty); `-p` format; `-`/directory operands; SIGINT cleanup; `-r` among multiple edits; checked-in CSSC interop fixture.
+- [x] Closed 2026-08-07. `-m`/MR + `v`-flag, `-g`, stdin comment and `-p`
+  format were already covered — the box was stale for those. Newly covered:
+  `-`/directory operands (`delta_directory_and_stdin_operands`), `-r` among
+  multiple pending edits including the ambiguity diagnostic
+  (`delta_r_selects_among_multiple_pending_edits`), and SIGINT cleanup
+  (`delta_sigint_removes_transient_files`, which parks delta on the comment
+  read with the z-lock held, signals it, and checks no z-/x-file survives).
+  One defect fell out, #D3 below. CSSC interop fixture dispositioned as for
+  `get` — CSSC does not implement `delta -g` at all, so it cannot serve as the
+  oracle here in any case.
+
+#### `-g` SID ranges *(found 2026-08-07)*
+- [x] **#D3 — `delta -g` did not implement SID ranges.** The option-argument is
+  "a list (see get for the definition of list)" (92229), so an element may be
+  `lo-hi`, but `resolve_ignore_list` split only on ',', space and tab. `-g1.2-1.3`
+  was reported as "no such delta" and then *skipped*, so the delta was recorded
+  with an empty ignore-list — a silently wrong history entry that re-running
+  delta cannot repair. Ranges now resolve through the shared
+  `SccsFile::ancestor_chain` (moved to plib so `get -i`/`-x` and `delta -g`
+  cannot drift apart), and a non-ancestor range aborts before the s-file is
+  touched. Tests `delta_g_accepts_a_sid_range`,
+  `delta_g_rejects_a_range_that_is_not_an_ancestor_chain`.
 
 ---
 
@@ -353,20 +391,24 @@ shared-core #X1 (encoded bodies).
 ### Detailed conformance matrix
 
 #### SYNOPSIS / OPTIONS
+
+*(Table corrected 2026-08-06: six rows still read MISSING long after Phase 4
+implemented them, contradicting the already-ticked #G2/#G3/#G4/#G7 above.)*
+
 | Opt | Status | Notes (file:line) |
 |---|---|---|
 | `-r SID` | CONFORMS | `get.rs:27,186`; exact/partial/R.L verified incl. multi-release. |
-| `-c cutoff` | MISSING | (#G2). |
-| `-e` | CONFORMS | `get.rs:30`; p-file + 0644 g-file match CSSC. |
-| `-b` | CONFORMS | `get.rs:33,230`. |
-| `-i list` / `-x list` | MISSING | (#G3). |
-| `-k` | CONFORMS | `get.rs:36,444`; implied by `-e`. |
-| `-l` / `-L` | MISSING | (#G4). |
-| `-p` | CONFORMS | `get.rs:39`; body→stdout, info→stderr; verified. |
-| `-s` | CONFORMS | `get.rs:42`; suppresses info incl. multi-file header. |
-| `-m` / `-n` | CONFORMS | `get.rs:48,51`; `<SID>\t…` / `<module>\t…` match CSSC. |
-| `-g` | CONFORMS | `get.rs:45,428`; no g-file, SID printed. |
-| `-t` | MISSING | (#G7). |
+| `-c cutoff` | CONFORMS | `get.rs:30`; `parse_cutoff`/`delta_after_cutoff` `get.rs:86,157`, applied `:742-753`. 2-digit-year pivot. (#G2) |
+| `-e` | CONFORMS | `get.rs:50`; p-file + 0644 g-file match CSSC. |
+| `-b` | CONFORMS | `get.rs:53,230`. |
+| `-i list` / `-x list` | CONFORMS | `get.rs:33,36`; serial resolution `:725-734`, `-i` predecessor chains `:757`. (#G3) |
+| `-k` | CONFORMS | `get.rs:56,444`; implied by `-e`. |
+| `-l` / `-L` | CONFORMS | `get.rs:39,42`; `render`/writer `:589,632` select l-file vs stdout. l-file is byte-identical to CSSC. (#G4) |
+| `-p` | CONFORMS | `get.rs:59`; body→stdout, info→stderr; verified. |
+| `-s` | CONFORMS | `get.rs:62`; suppresses info incl. multi-file header. |
+| `-m` / `-n` | CONFORMS | `get.rs:68,71`; `<SID>\t…` / `<module>\t…` match CSSC. |
+| `-g` | CONFORMS | `get.rs:65,428`; no g-file, SID printed. |
+| `-t` | CONFORMS | `get.rs:45`; top-delta selection `:679`. (#G7) |
 
 #### OPERANDS / STDIN
 - [x] **`-` MISSING (#G5); directory MISSING (#G6).** Real-file operands CONFORM;
@@ -386,8 +428,67 @@ shared-core #X1 (encoded bodies).
 #### EXIT STATUS
 - [x] 0 success / >0 error; per-file failure continues — `get.rs:544-555`. Bad `-r SID` → exit 1.
 
+#### Working-file placement *(found 2026-08-06)*
+- [x] **#G13 — the g-file and l-file were written beside the s-file, not in the
+  current directory.** `get` derived the g-file's directory from the s-file (the
+  parent of `SCCS/`, else the s-file's own directory), but the spec is explicit:
+  the g-file "shall be created in the current directory" (99186-99187), "only
+  the real user need have write permission in the current directory" (99190),
+  and the l-file likewise (99192-99194). Only the p-, z- and x-files belong
+  beside the s-file (99214, 99228).
+
+  For the usual `cd project && get SCCS/s.foo` both rules give the same answer,
+  which is why this survived; but `get ../other/SCCS/s.foo` wrote the working
+  copy into `../other`, and `sccs -d dir -p SCCS get mod` aimed it at the
+  read-only s-file's own directory and failed outright with EACCES. CSSC 1.4.1
+  writes to the current directory in both cases. Fixed in
+  `plib::sccsfile::paths::{gfile_from_sfile,lfile_from_sfile}`; `delta` and
+  `unget` read and remove the g-file through the same helper, so all three
+  agree. Tests `get_writes_the_gfile_into_the_current_directory`,
+  `..._lfile_...`, and `get_writes_the_pfile_beside_the_sfile` — the last so the
+  two rules cannot be collapsed into one.
+
+  *Test-harness consequence:* `plib::testing::run_test` cannot set a working
+  directory, so the sccs suite had been relying on the old placement to keep its
+  working files inside its TempDirs. With the fix, a run scattered g-files across
+  the `sccs/` source directory. `sccs/tests/common/` now provides cwd-aware
+  drop-in replacements that derive the directory from the plan's own s-file
+  operand.
+
 ### Test coverage gaps
-- [ ] `-c`, `-i`, `-x`, `-l`, `-L`, `-t` (all MISSING); `-`/directory operands; CSSC-encoded interop fixture (#G1); z-file presence (#G8); `No id keywords` warning (#G9); `-m`/`-n`/`-g`; multi-release partial-SID.
+- [x] Closed 2026-08-07. `-m`/`-n`/`-g`, z-file (#G8), `No id keywords`
+  including the `i`-flag fatal path (#G9), `-`/directory operands, and the
+  multi-release partial-SID cases are now covered; `-c`, `-l`, `-L`, `-t` and
+  `-x` were re-probed against CSSC 1.4.1 and already matched, so the box was
+  stale for those. Two genuine defects fell out of the re-probe and are
+  recorded as #G14 and #G15 below. Cutoff semantics that nothing had exercised
+  — omitted units defaulting to their *maximum*, non-numeric separators, and
+  the [69,99]→19xx year window — are covered by
+  `get_cutoff_omitted_units_default_to_maximum`.
+
+  The CSSC-encoded interop fixture (#G1) is **not** being staged: CI hosts have
+  no CSSC, so a checked-in fixture would be an opaque blob nobody could
+  regenerate, and a skip-if-absent test would never run in CI. CSSC interop was
+  verified ad hoc throughout this and the preceding passes and is recorded
+  per-utility; that is the disposition, not a deferred task.
+
+#### `-i`/`-x` SID ranges *(found 2026-08-07)*
+- [x] **#G14 — `-i`/`-x` did not implement SID ranges.** The option-argument is
+  `<list> ::= <range> | <list> , <range>` with `<range> ::= SID | SID - SID`
+  (99085-99087), but `resolve_sid_list` split only on ',' and space. So
+  `-i1.1-1.3` was diagnosed as "invalid SID" and then, worse, the run
+  *continued* and retrieved a version built from the wrong delta set. A SID
+  never contains '-', so the separator is unambiguous. Ranges now resolve to
+  the ancestor chain from the second SID back to the first, and a range whose
+  first SID is not an ancestor of the second is fatal rather than silently
+  retrieving something else — the diagnostic 99090-99092 mandates. CSSC agrees
+  on both. Tests `get_include_accepts_a_sid_range`,
+  `get_rejects_a_range_that_is_not_an_ancestor_chain`.
+
+- [x] **#G15 — `-x` overrode `-i` for a delta named by both.** `-i` was applied
+  to the delta set before `-x`, so exclusion won. `-i` is "forced to be
+  applied" (99084) and must outrank "forced not to be applied"; CSSC resolves
+  the overlap the same way. The two blocks are now ordered `-x` then `-i`.
 
 ---
 
@@ -483,7 +584,39 @@ re-listed per row.
 - [x] 0 success; non-zero when any file fails — `prs.rs:639,695`. Verified.
 
 ### Test coverage gaps
-- [ ] Trailing-newline assertion (#P1); multi-delta `-d` (default fixture is single-delta); `-r` no-SID (#P2); `-e`/`-l`/`-c`/`-a`; `:FL:`/`:GB:`/`:A:`/`:MR:`/`:UN:`/`:FD:`/line-stat padding; multi-file/stdin/directory; exit-code.
+- [x] Trailing newline per delta (#P1) and multi-delta `-d` — `prs_emits_one_newline_terminated_record_per_delta` builds a three-delta file, the single-delta default fixture being unable to show either.
+- [x] `-r` with no SID (#P2) — `prs_r_without_a_sid_uses_the_most_recent_delta`.
+- [x] `-e`/`-l` — `prs_earlier_and_later_selectors`; `-a` — `prs_a_includes_removed_deltas` (paired with the default omitting a `rmdel`-removed delta).
+- [x] Line-stat padding — `prs_line_statistics_are_five_digit_padded` (`:Li:`/`:Ld:`/`:Lu:` five digits, `:DL:` the slash-joined triple).
+- [x] `:A:`/`:W:`/`:Z:` what-string keywords — `prs_what_string_keywords`.
+  *Recorded divergence:* with the module-type flag unset, CSSC renders `:Y:` inside `:A:` as the literal `none` (`@(#)none p1 1.3@(#)`) while we render it empty. The spec (112350-112351) does not mandate a "none" spelling for an unset keyword, and embedding the word into a what-string is the less useful reading, so ours is kept. With the flag set the two agree byte-for-byte.
+- [x] Multi-file / directory / `-` stdin operands and the error exit code — `prs_operand_forms_and_exit_status`.
+- [x] Closed 2026-08-07. `:FL:`, `:GB:`, `:MR:` and `:FD:` were re-probed
+  against CSSC 1.4.1 on a fixture carrying flags, a description and an MR, and
+  matched byte-for-byte — stale box. `-c` did not: two defects, #P3 and #P4.
+
+#### `-c` cutoff *(found 2026-08-07)*
+- [x] **#P3 — the cutoff was ignored unless `-e` or `-l` was given.** The
+  no-`-e`/`-l` arm of the delta filter was a stub whose only content was the
+  comment "This will be handled differently", so `prs -c<date>` reported the
+  newest delta whatever the cutoff said. 112241-112243 states the rule
+  unconditionally, and the synopsis at 112215 makes `[-e|-l]` optional in the
+  `-c` form, so the cutoff now applies in all three forms; only `-l` inverts
+  the comparison. CSSC refuses `-c` without `-e`/`-l` outright ("Either the -e
+  or -l switch must used with a cutoff date"), so it cannot arbitrate here and
+  the spec governs.
+
+- [x] **#P4 — the cutoff year was guessed as 4-digit.** `parse_cutoff` treated
+  a >=4-digit argument whose first two digits were >= 19 as a 4-digit year, so
+  the conforming `-c2508` (August 2025) became the year 2508 and let every
+  delta through. POSIX defines only the 2-digit YY with the [69,99]=19xx /
+  [00,68]=20xx pivot (112236-112237); there is no 4-digit form to infer. `get`
+  never had this — its `parse_cutoff` was already 2-digit-only — so the two
+  had silently diverged. While here, `prs` also gained the component-range
+  check `get` already had (month 13, hour 25) and now rejects an unparseable
+  `-c` instead of dropping it, which had reported every delta and looked like
+  a successful query. Tests `prs_cutoff_applies_without_e_or_l`,
+  `prs_cutoff_year_is_always_two_digits`, `prs_cutoff_invalid_field_rejected`.
 
 ---
 
@@ -545,7 +678,28 @@ and the rewritten file loses its `0444` read-only mode.
 - [x] 0 success / >0 error; per-file aggregation — `rmdel.rs:159,215`. Verified multi-file.
 
 ### Test coverage gaps
-- [ ] No integration tests at all. Need: leaf removal marks `R` + matches CSSC bytes (#R1); non-leaf/initial rejection; p-file rejection; nonexistent/already-removed; `-`/directory operands; ownership (#R2); mode preservation (#R3).
+- [x] ~~No integration tests at all.~~ *(Stale: `tests/rmdel/mod.rs` has 4 —
+  `rmdel_removes_leaf_delta`, `rmdel_preserves_readonly_mode` (#R3),
+  `rmdel_unknown_sid_fails`, `rmdel_not_an_sccs_file_fails`.)* Still needed:
+  ✓ Closed 2026-08-06: leaf removal marks the delta `R` rather than deleting
+  the entry, and the rewritten file still validates — the checksum is
+  recomputed over the reweave (#R1,
+  `rmdel_marks_removed_delta_r_and_file_stays_valid`); non-leaf and initial
+  deltas refused with the file left byte-identical
+  (`rmdel_refuses_non_leaf_and_initial_deltas`); p-file-locked and
+  already-removed refused (`rmdel_refuses_edited_and_already_removed_deltas`);
+  `-`/directory operands, including that an error on an expanded operand still
+  sets the exit status (`rmdel_directory_and_stdin_operands`).
+  Cross-checked against CSSC 1.4.1: its `val` accepts our post-`rmdel` s-file
+  and its `prs -e` reports the same surviving deltas.
+- [x] Ownership (#R2) — **WON'T DO, 2026-08-07.** The check itself is
+  implemented; what is untestable is the scenario. Exercising it needs a delta
+  owned by a second, different user, which the suite cannot arrange: it runs as
+  one unprivileged user, and the alternatives are worse than the gap. An
+  env-gated test (`SCCS_TEST_UID2=...`) would be dead weight in CI, where the
+  variable is never set, and a root-only test that drops privileges would put
+  privilege manipulation into the test suite to cover one branch. `cron/audit.md`
+  disposes of its `-r` ownership box the same way, for the same reason.
 
 ---
 
@@ -584,7 +738,8 @@ returns a non-zero exit on a genuine error. **No Critical or Major defects.**
 - Writer-side note: the p-file `<login>` is `$USER`/`$LOGNAME` in our get/admin/delta (#X4); `sact` faithfully echoes it.
 
 ### Test coverage gaps
-- [ ] Multi-file header; directory/stdin operands; exact-format byte assertion (tests only `contains`); error-path exit (#S1).
+- [x] Multi-file header (`sact_multi_file_uses_the_pathname_header`, pinning the `"\n%s:\n"` shape and the five-field activity line rather than a `contains`), single-operand no-header counterpart, directory operand (`sact_directory_operand_expands`).
+- [x] **Error-path exit (#S1) — and this found the fix was incomplete.** #S1 was recorded fixed for *parse* failures, but `process_sfile` never checked that the s-file itself exists: it looked straight for the p-file and returned "no impending deltas" when absent. So `sact s.typo` was byte-for-byte identical to `sact` on a real file with nothing checked out — no output, no diagnostic, exit 0 — which is exactly the distinction EXIT STATUS 113803-113805 and STDERR 113796-113797 exist to draw. A nonexistent operand, and an operand that is not an SCCS file, now each produce a diagnostic and exit 1; the no-pending case still exits 0 silently (`sact_missing_operand_is_an_error`, `sact_no_pending_edit_is_silent_success`). The stale code comment claiming "cssc returns 0 for a nonexistent operand" was unverifiable — CSSC 1.4.1 has no `sact` subcommand at all.
 
 ---
 
@@ -669,7 +824,21 @@ name** (`Command::new("get")`), so the front-end breaks without `$PATH` help.
 - [x] Propagates child exit codes (`sccs.rs:602`); no command → usage exit 2; unknown command → exit 1. Verified.
 
 ### Test coverage gaps
-- [ ] No integration tests at all (`sccs-tests.rs` omits `sccs` and `rmdel`). Need: prefix/`-d`/`-p` resolution; `-r` real-user (#SC1); sibling resolution without `$PATH` (#SC2); each pseudo-command; `info` fields (#SC3); option-splitting (#SC4).
+- [x] ~~No integration tests at all (`sccs-tests.rs` omits `sccs` and `rmdel`).~~
+  *(Stale on both counts: `sccs-tests.rs:10-19` declares all ten modules, and
+  `tests/sccs/mod.rs` has 3 — `sccs_info_reports_full_pfile_fields` (#SC3),
+  `sccs_edit_resolves_siblings_without_path` (#SC2),
+  `sccs_unknown_command_fails`.)* Still needed: prefix/`-d`/`-p` resolution;
+  `-r` real-user (#SC1). ✓ Closed 2026-08-06: prefix / `-d` / `-p` resolution
+  (`sccs_resolves_prefix_and_subdirectory_options`), option pass-through #SC4
+  (`sccs_passes_subcommand_options_through`), and the pseudo-commands —
+  `edit`/`unedit`, `create` (including the mandated comma-rename of the
+  original, 113921-113924), `tell`/`info`/`clean`, `print`, `delget`. `enter`
+  is a historical BSD extension and is **not** in the POSIX list
+  (113901-113951), so rejecting it is correct and is pinned as such.
+  *Convention note:* SCCS option-arguments are **attached** (`-ymsg`, not
+  `-y msg`); with the separated form the driver takes the argument as a file
+  operand — and CSSC 1.4.1 does exactly the same.
 
 ---
 
@@ -713,7 +882,16 @@ expanded.
 - [x] 0 success / >0 error; no-pending → exit 1 — `unget.rs:213`.
 
 ### Test coverage gaps
-- [ ] Multi-file `\n%s:\n`; directory operand; `-` stdin; `-r` among several pending edits; CSSC p-file interop fixture.
+- [x] Multi-file `\n%s:\n` (`unget_multi_file_uses_the_pathname_header`); directory operand (`unget_directory_operand_expands`); `-` stdin list (`unget_dash_operand_reads_pathnames_from_stdin`); `-r` among several pending edits (`unget_r_selects_one_of_several_pending_edits`) plus the unknown-SID error leaving the p-file untouched (`unget_r_with_unknown_sid_is_an_error`).
+  Setting up two concurrent edits needs **both** the `b` and `j` flags: without `b`, `get -e -b` is *required* to be ignored (99079-99081), so there is only ever one entry to select from. Verified in passing that `-b` is correctly ignored when the flag is absent.
+- [x] p-file interop — closed 2026-08-07, without a CSSC fixture. Every other
+  p-file test builds the file with our own `get`, so writer and reader could
+  drift from the spec together and the suite would stay green. Rather than
+  check in a CSSC-written p-file that CI could not regenerate,
+  `unget_reads_a_hand_written_pfile` writes the documented format by hand —
+  `"%s %s %s %s%s%s\n"` with the optional ` -i<list>` / ` -x<list>` fields
+  (99216-99226) — which is byte-for-byte what CSSC produces. That tests the
+  interop property the box was after and runs everywhere.
 
 ---
 
@@ -764,7 +942,8 @@ stdin-mode STDOUT format/order.
   (`LC_MESSAGES` hardcoded English pending #X9).
 
 ### Test coverage gaps
-- [ ] EXAMPLE from the spec; 0x20-vs-0x10 distinction; combined-bit OR cases.
+- [x] EXAMPLE from the spec (`val_reads_command_lines_from_standard_input` — `val -` reads a command line per input line and echoes only the erroring ones, per 120345-120355); 0x20-vs-0x10 distinction (`val_distinguishes_corrupted_from_unopenable`: checksum mismatch vs not-SCCS vs unopenable); 0x80 (`val_missing_file_argument_sets_high_bit`); combined-bit OR (`val_exit_status_ors_the_codes_of_all_operands`, 0x12 and 0x30, per 120336-120338).
+  *Oracle note:* CSSC 1.4.1 does **not** implement `val -` — it treats each whole input line as one filename — so it is the less conforming side here and cannot be used as an oracle for this form.
 
 ---
 
@@ -780,6 +959,7 @@ terminators, multiple matches, `-s`, multi-file headers, and the 0/1 exit rule
 are byte-identical to CSSC. But one Critical defect defeats the utility's primary
 purpose: **`what` aborts on the first file containing non-UTF-8 bytes** — i.e.
 virtually every binary/`.o`/`a.out`, exactly what `what` exists to scan.
+*(#W1 fixed in Phase 11; the paragraph above is kept as the original finding.)*
 
 ### Priority issues
 
@@ -792,22 +972,26 @@ virtually every binary/`.o`/`a.out`, exactly what `what` exists to scan.
 #### Minor
 - [x] ~~**#W2 — Error message format/order differs from CSSC**~~ — WON'T FIX:
   cosmetic only; both go to stderr with a non-zero exit. CONFORMS in substance.
-- [x] **#W3 — Hardcoded-English "Cannot open file" (#X9).** `what.rs:72`. ✓ Phase 13 (#X9).
+- [x] **#W3 — Hardcoded-English "Cannot open file" (#X9).** `what.rs:124`. ✓ Phase 13 (#X9).
 - [x] **#W4 — `-s` buffers the whole file before stopping.** ✓ Phase 11: the
-  byte scanner now returns immediately on the first ident under `-s`.
+  byte scanner now returns immediately on the first ident under `-s`
+  (`what.rs:66-67` → `:86`).
 
 ### Detailed conformance matrix
-- [x] `-s` CONFORMS — `what.rs:21-25,37`; verified (two idents on one line → only first).
-- [x] STDIN not used; **INPUT FILES "any file type" DIVERGES for non-UTF-8 (#W1).**
-- [x] `setlocale` (`what.rs:55`); `LC_MESSAGES` partial (#W3); default signals.
-- [x] `"%s:\n"` header per file (even with zero matches) then `"\t%s\n"` per ident — `what.rs:46,66`; verified.
-- [x] Ident terminates at `" > \n \ NUL` or EOF; resumes scanning — `what.rs:41,48`; verified each terminator.
-- [x] Exit 0 if ≥1 match, 1 otherwise — `what.rs:77`; verified (match/no-match/nonexistent/no-operand/mixed). **#W1 corrupts this** for a non-UTF-8 first file.
+
+*(Citations re-anchored 2026-08-06; every line below still pointed at the
+pre-Phase-11 `what.rs`, so the numbers named unrelated code.)*
+
+- [x] `-s` CONFORMS — `what.rs:21-25` (arg), `:66-67,86` (early return); verified (two idents on one line → only first).
+- [x] STDIN not used; **INPUT FILES "any file type" CONFORMS** — `process_file` (`what.rs:38-99`) reads via `fill_buf`/`consume` and scans `&[u8]` for `MARKER: &[u8] = b"@(#)"` (`:39`), accumulating into `Vec<u8>` (`:45`) and emitting with `write_all` (`:59,93`). It never UTF-8-decodes; the doc comment at `:31-37` states this. *(This line read DIVERGES until 2026-08-06, five audit passes after #W1 was fixed.)*
+- [x] `setlocale`; `LC_MESSAGES` (#W3 ✓ Phase 13); default signals.
+- [x] `"%s:\n"` header per file (even with zero matches) then `"\t%s\n"` per ident; verified.
+- [x] Ident terminates at `" > \n \ NUL` or EOF; resumes scanning — byte-valued predicate `what.rs:40`; verified each terminator.
+- [x] Exit 0 if ≥1 match, 1 otherwise — `what.rs:130`; verified (match/no-match/nonexistent/no-operand/mixed). Byte-safe: a per-file open error warns and continues (`:123-126`).
 
 ### Test coverage gaps
-- [ ] Binary/non-UTF-8 input (#W1) — the single most important use case; the
-  existing `special_characters.txt` only has NUL inside valid UTF-8. Multi-file
-  mixed match/no-match exit; two `@(#)` on one line; ELF/`.o` smoke test.
+- [x] Binary/non-UTF-8 input (#W1) — covered by `what_binary_input_does_not_abort` (`tests/what/mod.rs:189`).
+- [x] `-s` per-file scope (`silent_stops_per_file_not_per_run` — the existing `-s` test used one operand, so per-file vs per-run was never shown); `-` is a filename, not stdin, since STDIN is "Not used" (122800-122801) (`dash_operand_is_a_filename_not_stdin`); two `@(#)` on one line are one ident, because `@(#)` is not in the terminator set (122786-122788) (`two_patterns_on_one_line_are_one_identification`) and the search resumes after a real terminator (`search_resumes_after_a_terminator`); ELF `.o` smoke test with a deterministic embedded ident (`finds_identification_in_an_elf_object`); mixed match/no-match exit (`exit_status_is_zero_when_any_file_matches`). **All verified byte-for-byte against CSSC 1.4.1**, including on an ELF binary.
 
 ---
 

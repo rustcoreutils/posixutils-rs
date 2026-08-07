@@ -866,7 +866,7 @@ fn test_insert_honors_configured_erase_and_kill_chars() {
     //
     // Driven at the InsertState level because a headless editor has no
     // terminal to read termios from -- the PTY suite covers the wiring.
-    use vi_rs::{process_insert_key, Buffer, InsertKind, InsertState, Key, Position};
+    use vi_rs::{process_insert_key, Buffer, InsertKind, InsertState, Key, Options, Position};
 
     let mut buffer = Buffer::from_text("");
     let mut state = InsertState::new(InsertKind::Insert, Position::new(1, 0), 1);
@@ -874,22 +874,22 @@ fn test_insert_honors_configured_erase_and_kill_chars() {
     state.kill_char = Some('@');
 
     for c in "abc".chars() {
-        process_insert_key(&mut buffer, Key::Char(c), &mut state).unwrap();
+        process_insert_key(&mut buffer, Key::Char(c), &mut state, &Options::default()).unwrap();
     }
     // '#' is this terminal's erase character, so it deletes rather than
     // inserting a literal '#'.
-    process_insert_key(&mut buffer, Key::Char('#'), &mut state).unwrap();
+    process_insert_key(&mut buffer, Key::Char('#'), &mut state, &Options::default()).unwrap();
     assert_eq!(buffer.line(1).unwrap().content(), "ab");
 
     // '@' is the kill character: discard back to the start of the line.
-    process_insert_key(&mut buffer, Key::Char('@'), &mut state).unwrap();
+    process_insert_key(&mut buffer, Key::Char('@'), &mut state, &Options::default()).unwrap();
     assert_eq!(buffer.line(1).unwrap().content(), "");
 
     // With no erase/kill configured the same bytes are ordinary text.
     let mut buffer = Buffer::from_text("");
     let mut plain = InsertState::new(InsertKind::Insert, Position::new(1, 0), 1);
     for c in "a#b".chars() {
-        process_insert_key(&mut buffer, Key::Char(c), &mut plain).unwrap();
+        process_insert_key(&mut buffer, Key::Char(c), &mut plain, &Options::default()).unwrap();
     }
     assert_eq!(buffer.line(1).unwrap().content(), "a#b");
 }
@@ -1009,4 +1009,518 @@ fn test_empty_insert_session_leaves_no_undo_entry() {
     // buffer whether it reports an error or does nothing.
     let _ = editor.execute_keys("u");
     assert_eq!(editor.get_buffer_text().trim_end(), "unchanged");
+}
+
+// ============================================================================
+// #V21 / #V22 / #V23 / #V24 — shift width, TAB, ^V literal, ^T
+// ============================================================================
+
+/// `>>` shifts by one shiftwidth, not by `shiftwidth` tabs.
+///
+/// `shiftwidth` was being passed into `shift_right`'s repeat-**count**
+/// parameter, so the default `shiftwidth = 8` produced `"\t".repeat(8)` — eight
+/// tab characters, 64 columns — on every `>>`.
+#[test]
+fn test_shift_right_inserts_one_shiftwidth_not_eight_tabs() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("hello");
+
+    editor.execute_keys(">>").unwrap();
+
+    let line = editor.get_buffer_text().lines().next().unwrap().to_string();
+    assert_eq!(
+        line, "\thello",
+        "default shiftwidth 8 at tabstop 8 is one tab, got {line:?}"
+    );
+    assert_eq!(
+        line.chars().filter(|c| *c == '\t').count(),
+        1,
+        "got {line:?}"
+    );
+}
+
+/// `<<` removes one shiftwidth, not 64 columns.
+#[test]
+fn test_shift_left_removes_one_shiftwidth() {
+    let mut editor = Editor::new_headless();
+    // Two tabs = 16 columns; one `<<` at shiftwidth 8 must leave 8.
+    editor.set_buffer_text("\t\thello");
+
+    editor.execute_keys("<<").unwrap();
+
+    let line = editor.get_buffer_text().lines().next().unwrap().to_string();
+    assert_eq!(line, "\thello", "got {line:?}");
+}
+
+/// `:set sw=4` must actually change the shift amount.
+#[test]
+fn test_shift_right_honors_set_shiftwidth() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("hello");
+
+    editor.execute_keys(":set sw=4\n").unwrap();
+    editor.execute_keys(">>").unwrap();
+
+    let line = editor.get_buffer_text().lines().next().unwrap().to_string();
+    assert_eq!(
+        line, "    hello",
+        "4 columns is below tabstop 8, so four spaces, got {line:?}"
+    );
+}
+
+/// Shifting left past column 0 clamps instead of eating the text.
+#[test]
+fn test_shift_left_clamps_at_column_zero() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("  hello");
+
+    editor.execute_keys("<<").unwrap();
+
+    assert_eq!(editor.get_buffer_text().lines().next().unwrap(), "hello");
+}
+
+/// #V22: a typed TAB must reach the buffer. `Key::Tab` was unreachable —
+/// `from_byte` mapped byte 9 to `Ctrl('i')`, which had no arm — so TAB fell
+/// through the ignore-everything-else arm and vanished.
+#[test]
+fn test_tab_inserts_a_tab_in_insert_mode() {
+    let mut editor = Editor::new_headless();
+
+    editor.execute_keys("ia\tb\x1b").unwrap();
+
+    assert_eq!(editor.get_buffer_text().trim_end(), "a\tb");
+}
+
+/// #V23: `^V` takes the next character literally, ESC included, rather than
+/// letting it end the insert session.
+#[test]
+fn test_ctrl_v_inserts_literal_escape() {
+    let mut editor = Editor::new_headless();
+
+    // i ^V ESC ESC  -> one literal 0x1b in the buffer, then leave insert mode.
+    editor.execute_keys("i\x16\x1b\x1b").unwrap();
+
+    assert_eq!(editor.get_buffer_text().trim_end(), "\x1b");
+    assert!(matches!(editor.get_mode(), Mode::Command));
+}
+
+/// A literalized control character must not trigger its normal insert-mode
+/// action. `^D` would otherwise dedent.
+#[test]
+fn test_ctrl_v_inserts_literal_control_char() {
+    let mut editor = Editor::new_headless();
+
+    editor.execute_keys("iX\x16\x04Y\x1b").unwrap();
+
+    assert_eq!(editor.get_buffer_text().trim_end(), "X\x04Y");
+}
+
+/// POSIX 121875-121877: a `^V` before a <newline> is *discarded* and the
+/// newline behaves normally, so this must split the line rather than insert a
+/// literal carriage return.
+#[test]
+fn test_ctrl_v_before_newline_is_discarded() {
+    let mut editor = Editor::new_headless();
+
+    editor.execute_keys("iA\x16\nB\x1b").unwrap();
+
+    let text = editor.get_buffer_text();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines, vec!["A", "B"], "got {text:?}");
+}
+
+/// The pending-literal flag is consumed by exactly one key.
+#[test]
+fn test_ctrl_v_consumes_only_one_key() {
+    let mut editor = Editor::new_headless();
+
+    editor.execute_keys("i\x16aa\x1b").unwrap();
+
+    assert_eq!(editor.get_buffer_text().trim_end(), "aa");
+}
+
+/// `^Q` is the spec's synonym for `^V` (121874).
+#[test]
+fn test_ctrl_q_is_a_synonym_for_ctrl_v() {
+    let mut editor = Editor::new_headless();
+
+    editor.execute_keys("i\x11\x1b\x1b").unwrap();
+
+    assert_eq!(editor.get_buffer_text().trim_end(), "\x1b");
+}
+
+/// A literal inserted via `^V` is part of the insert session, so `.` repeats it.
+/// The old empty `^V` arm never touched `inserted_text`.
+#[test]
+fn test_ctrl_v_literal_is_recorded_for_dot_repeat() {
+    let mut editor = Editor::new_headless();
+
+    editor.execute_keys("i\x16\x02\x1b").unwrap();
+    editor.execute_keys(".").unwrap();
+
+    let text = editor.get_buffer_text();
+    assert_eq!(
+        text.trim_end().matches('\x02').count(),
+        2,
+        "`.` must repeat the literal, got {text:?}"
+    );
+}
+
+/// #V24: `^T` inserts blanks at the *cursor* up to the next shiftwidth
+/// boundary, not a single tab at column 0.
+#[test]
+fn test_ctrl_t_indents_at_cursor_to_shiftwidth_boundary() {
+    let mut editor = Editor::new_headless();
+    editor.execute_keys(":set sw=4\n").unwrap();
+
+    // Type "ab", then ^T: the cursor is at column 2, so the next 4-column
+    // boundary is 4, i.e. two blanks. Then type "c".
+    editor.execute_keys("iab\x14c\x1b").unwrap();
+
+    assert_eq!(editor.get_buffer_text().trim_end(), "ab  c");
+}
+
+/// `^T` goes through the insert-session record, so `u` removes it along with
+/// the rest of the session and `.` can repeat it.
+#[test]
+fn test_ctrl_t_is_recorded_in_the_insert_session() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("base");
+    editor.execute_keys(":set sw=4\n").unwrap();
+
+    editor.execute_keys("A\x14x\x1b").unwrap();
+    let after = editor.get_buffer_text().trim_end().to_string();
+    assert_ne!(after, "base", "^T + x must have changed the line");
+
+    editor.execute_keys("u").unwrap();
+    assert_eq!(
+        editor.get_buffer_text().trim_end(),
+        "base",
+        "undo must remove the ^T blanks too"
+    );
+}
+
+/// #V27: `u` after an insert session must remove exactly what was typed.
+///
+/// `InsertState::start_pos` was captured before `enter_insert_mode`
+/// repositioned the cursor, so it was only right for `i`. For `A` it named the
+/// pre-command column, and the undo record then deleted that many characters
+/// from the wrong place: `Axy<ESC>u` on "base" left "sexy" — two characters
+/// removed from column 0 instead of the two that were appended.
+#[test]
+fn test_undo_after_append_removes_only_the_appended_text() {
+    for (keys, typed) in [
+        ("Axy\x1b", "basexy"), // A - append at end of line
+        ("axy\x1b", "bxyase"), // a - append after cursor
+        ("Ixy\x1b", "xybase"), // I - insert at first non-blank
+        ("ixy\x1b", "xybase"), // i - insert before cursor (was already right)
+    ] {
+        let mut editor = Editor::new_headless();
+        editor.set_buffer_text("base");
+
+        editor.execute_keys(keys).unwrap();
+        assert_eq!(
+            editor.get_buffer_text().trim_end(),
+            typed,
+            "typing {keys:?} produced the wrong text"
+        );
+
+        editor.execute_keys("u").unwrap();
+        assert_eq!(
+            editor.get_buffer_text().trim_end(),
+            "base",
+            "undo after {keys:?} must restore the original line exactly"
+        );
+    }
+}
+
+/// `^U` in insert mode deletes back to the start of the *insert*, not past it
+/// into pre-existing text. This shares the `start_pos` anchor with #V27.
+#[test]
+fn test_ctrl_u_stops_at_the_start_of_the_insert() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("keep");
+
+    // Append "junk", then ^U: only "junk" may go.
+    editor.execute_keys("Ajunk\x15\x1b").unwrap();
+
+    assert_eq!(editor.get_buffer_text().trim_end(), "keep");
+}
+
+// ============================================================================
+// #V20 — U (undo current line)
+// ============================================================================
+
+/// `U` restores the line to its state when the cursor arrived on it.
+///
+/// It could never restore anything before: `line_original` was only written by
+/// `save_line_original`, which had no production callers, so `U` always
+/// reported "Nothing to undo".
+#[test]
+fn test_upper_u_restores_line_after_deletions() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("hello world\nsecond line");
+
+    editor.execute_keys("xxx").unwrap();
+    assert_eq!(
+        editor.get_buffer_text().lines().next().unwrap(),
+        "lo world",
+        "three x's should have removed three characters"
+    );
+
+    editor.execute_keys("U").unwrap();
+    assert_eq!(
+        editor.get_buffer_text().lines().next().unwrap(),
+        "hello world"
+    );
+    // POSIX 121571-121572: first column, not first non-blank.
+    assert_eq!(editor.get_cursor().column, 0);
+}
+
+/// A whole insert session is undone by `U`, since it all happened after the
+/// cursor arrived on the line.
+#[test]
+fn test_upper_u_restores_line_after_insert_session() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("original");
+
+    editor.execute_keys("iABC\x1b").unwrap();
+    assert_eq!(editor.get_buffer_text().trim_end(), "ABCoriginal");
+
+    editor.execute_keys("U").unwrap();
+    assert_eq!(editor.get_buffer_text().trim_end(), "original");
+}
+
+/// `U` is its own inverse — pressing it twice returns to the modified text.
+#[test]
+fn test_upper_u_is_its_own_inverse() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("hello");
+
+    editor.execute_keys("x").unwrap();
+    assert_eq!(editor.get_buffer_text().trim_end(), "ello");
+
+    editor.execute_keys("U").unwrap();
+    assert_eq!(editor.get_buffer_text().trim_end(), "hello");
+
+    editor.execute_keys("U").unwrap();
+    assert_eq!(
+        editor.get_buffer_text().trim_end(),
+        "ello",
+        "a second U must put the change back"
+    );
+}
+
+/// `U` is a buffer-modifying command, so `u` reverses it (POSIX 95442).
+#[test]
+fn test_lowercase_u_reverses_an_upper_u() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("hello");
+
+    editor.execute_keys("xx").unwrap();
+    assert_eq!(editor.get_buffer_text().trim_end(), "llo");
+
+    editor.execute_keys("U").unwrap();
+    assert_eq!(editor.get_buffer_text().trim_end(), "hello");
+
+    editor.execute_keys("u").unwrap();
+    assert_eq!(
+        editor.get_buffer_text().trim_end(),
+        "llo",
+        "u must reverse the U"
+    );
+}
+
+/// Leaving a line and coming back re-snapshots it, so `U` no longer reaches
+/// back past the return.
+#[test]
+fn test_upper_u_resnapshots_when_the_cursor_returns_to_a_line() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("first line\nsecond line");
+
+    editor.execute_keys("xx").unwrap();
+    assert_eq!(editor.get_buffer_text().lines().next().unwrap(), "rst line");
+
+    // Leave the line and come back: the snapshot is retaken from "rst line".
+    editor.execute_keys("jk").unwrap();
+    editor.execute_keys("U").unwrap();
+
+    assert_eq!(
+        editor.get_buffer_text().lines().next().unwrap(),
+        "rst line",
+        "U must not reach back past the cursor's return to the line"
+    );
+}
+
+/// `U` on an untouched line changes nothing and leaves the undo stack alone.
+#[test]
+fn test_upper_u_on_unchanged_line_is_a_noop() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("untouched\nsecond");
+
+    let _ = editor.execute_keys("U");
+    assert_eq!(
+        editor.get_buffer_text().lines().next().unwrap(),
+        "untouched"
+    );
+}
+
+/// After a command that changes the line count the snapshot is abandoned, so
+/// `U` reports nothing to undo rather than overwriting an unrelated line.
+#[test]
+fn test_upper_u_refuses_after_the_line_count_changes() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("one\ntwo\nthree");
+
+    // Join lines 1 and 2, then ask U to restore.
+    editor.execute_keys("J").unwrap();
+    let joined = editor.get_buffer_text();
+    let _ = editor.execute_keys("U");
+
+    assert_eq!(
+        editor.get_buffer_text(),
+        joined,
+        "U must not touch the buffer once the line numbering has shifted"
+    );
+}
+
+// ============================================================================
+// #V25 / #V26 — autoindent and ^D
+// ============================================================================
+
+/// `o`/`O` indent the new line to match the line the command was issued on
+/// (POSIX 121501-121502). `options.autoindent` was parsed but never read, so
+/// none of this happened before.
+#[test]
+fn test_autoindent_o_derives_indent_from_originating_line() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("\tindented");
+    editor.execute_keys(":set ai\n").unwrap();
+
+    editor.execute_keys("oNEW\x1b").unwrap();
+
+    assert_eq!(editor.get_buffer_text(), "\tindented\n\tNEW\n");
+}
+
+/// With autoindent unset the new line gets no indent at all.
+#[test]
+fn test_autoindent_unset_leaves_new_line_flush() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("\tindented");
+
+    editor.execute_keys("oNEW\x1b").unwrap();
+
+    assert_eq!(editor.get_buffer_text(), "\tindented\nNEW\n");
+}
+
+/// A <newline> in input mode carries the indent onto the next line
+/// (121826-121827).
+#[test]
+fn test_autoindent_is_carried_across_newline() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("\tbase");
+    editor.execute_keys(":set ai\n").unwrap();
+
+    editor.execute_keys("oONE\nTWO\x1b").unwrap();
+
+    assert_eq!(editor.get_buffer_text(), "\tbase\n\tONE\n\tTWO\n");
+}
+
+/// "Any autoindent characters entered on newly created lines that have no
+/// other non-<newline> characters shall be deleted" on ESC (121912-121913) —
+/// so `o<ESC>` leaves an empty line, not a line full of whitespace.
+#[test]
+fn test_autoindent_only_line_is_emptied_on_escape() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("\tbase");
+    editor.execute_keys(":set ai\n").unwrap();
+
+    editor.execute_keys("o\x1b").unwrap();
+
+    assert_eq!(editor.get_buffer_text(), "\tbase\n\n");
+}
+
+/// `^D` moves back to the column after the previous shiftwidth boundary
+/// (121781-121782), in display columns. With two tabs (16 columns at
+/// tabstop 8) and shiftwidth 4, one `^D` leaves 12 columns.
+#[test]
+fn test_ctrl_d_backs_up_one_shiftwidth() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("\t\tbase");
+    editor.execute_keys(":set ai\n").unwrap();
+    editor.execute_keys(":set sw=4\n").unwrap();
+
+    editor.execute_keys("o\x04X\x1b").unwrap();
+
+    // 12 columns at tabstop 8 renders as one tab plus four spaces.
+    assert_eq!(editor.get_buffer_text(), "\t\tbase\n\t    X\n");
+}
+
+/// `0^D` discards the whole autoindent and the `0` itself (121777).
+#[test]
+fn test_zero_ctrl_d_clears_the_whole_indent() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("\t\tbase");
+    editor.execute_keys(":set ai\n").unwrap();
+
+    editor.execute_keys("o0\x04X\x1b").unwrap();
+
+    assert_eq!(editor.get_buffer_text(), "\t\tbase\nX\n");
+}
+
+/// The one behavior that distinguishes `^^D` from `0^D`: both clear the
+/// current line's indent, but after `^^D` "the autoindent level for the next
+/// input line shall be derived from the same line from which the autoindent
+/// level for the current input line was derived" (121779-121780).
+#[test]
+fn test_caret_ctrl_d_restores_the_indent_on_the_next_line() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("\t\tbase");
+    editor.execute_keys(":set ai\n").unwrap();
+
+    editor.execute_keys("o^\x04A\nB\x1b").unwrap();
+
+    assert_eq!(
+        editor.get_buffer_text(),
+        "\t\tbase\nA\n\t\tB\n",
+        "^^D must un-indent only the current line"
+    );
+}
+
+/// The contrasting case: after `0^D` the next line does *not* get the indent
+/// back. Paired with the test above, this is what proves the two are handled
+/// differently rather than both mapped onto "clear the indent".
+#[test]
+fn test_zero_ctrl_d_does_not_restore_the_indent_on_the_next_line() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("\t\tbase");
+    editor.execute_keys(":set ai\n").unwrap();
+
+    editor.execute_keys("o0\x04A\nB\x1b").unwrap();
+
+    assert_eq!(editor.get_buffer_text(), "\t\tbase\nA\nB\n");
+}
+
+/// When the cursor does not follow autoindent characters, `^D` "shall have no
+/// special meaning" (121776) — it is appended like any other input character.
+#[test]
+fn test_ctrl_d_after_typed_text_has_no_special_meaning() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("");
+
+    editor.execute_keys("iabc\x04\x1b").unwrap();
+
+    assert_eq!(editor.get_buffer_text().trim_end(), "abc\u{4}");
+}
+
+/// In column 1 with nothing to erase, `^D` "shall be discarded and no further
+/// action taken" (121774-121775) — it must not insert a literal.
+#[test]
+fn test_ctrl_d_in_column_one_is_discarded() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("");
+
+    editor.execute_keys("i\x04X\x1b").unwrap();
+
+    assert_eq!(editor.get_buffer_text().trim_end(), "X");
 }

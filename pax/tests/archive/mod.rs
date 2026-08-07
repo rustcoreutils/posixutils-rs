@@ -157,6 +157,53 @@ fn test_hardlink_roundtrip() {
     assert_eq!(m1.ino(), m2.ino(), "Extracted files should share inode");
 }
 
+/// cpio has no hard-link representation of its own: build_mode maps Hardlink
+/// onto a regular file. Zeroing the member size for the second link therefore
+/// stored a 0-byte file with no data at all, and the reader -- which returns it
+/// as Regular -- never relinked it. The content was silently lost.
+///
+/// POSIX (pax EXTENDED DESCRIPTION): for a format that does not store contents
+/// with each name causing a hard link, the data shall be restored from the
+/// original file or a diagnostic given. Writing the contents for every link
+/// satisfies the first; the extracted files are separate inodes, which is
+/// permitted, but neither may be empty.
+#[cfg(unix)]
+#[test]
+fn test_cpio_hardlink_preserves_content() {
+    use std::os::unix::fs::MetadataExt;
+
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("links.cpio");
+    let dst_dir = temp.path().join("dest");
+
+    fs::create_dir(&src_dir).unwrap();
+    let body = "Shared content that must survive\n";
+    fs::write(src_dir.join("file1.txt"), body).unwrap();
+    fs::hard_link(src_dir.join("file1.txt"), src_dir.join("file2.txt")).unwrap();
+    assert_eq!(
+        fs::metadata(src_dir.join("file1.txt")).unwrap().nlink(),
+        2,
+        "source files must really be linked"
+    );
+
+    let output = run_pax_in_dir(
+        &["-w", "-x", "cpio", "-f", archive.to_str().unwrap(), "."],
+        &src_dir,
+    );
+    assert_success(&output, "pax write cpio hard link");
+
+    fs::create_dir(&dst_dir).unwrap();
+    let output = run_pax_in_dir(&["-r", "-f", archive.to_str().unwrap()], &dst_dir);
+    assert_success(&output, "pax read cpio hard link");
+
+    for name in ["file1.txt", "file2.txt"] {
+        let got = fs::read_to_string(dst_dir.join(name))
+            .unwrap_or_else(|e| panic!("{name} missing after extract: {e}"));
+        assert_eq!(got, body, "{name} lost its contents through cpio");
+    }
+}
+
 #[test]
 fn test_cross_tool_tar_read() {
     // This test verifies we can read tar archives created by system tar

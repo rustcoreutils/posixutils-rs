@@ -276,25 +276,17 @@ fn test_copy_mode_recreates_fifo() {
 /// A trailing <space> is a legitimate ustar pathname character: it must survive
 /// a write/list/extract round-trip (the name field is NUL-terminated, not
 /// space-trimmed).
-#[test]
-fn test_ustar_trailing_space_in_name_roundtrip() {
+fn trailing_space_roundtrip(format: &str) {
     let temp = TempDir::new().unwrap();
     let src_dir = temp.path().join("source");
     let dst_dir = temp.path().join("dest");
-    let archive = temp.path().join("space.tar");
+    let archive = temp.path().join(format!("space-{}.tar", format));
 
     fs::create_dir(&src_dir).unwrap();
     fs::write(src_dir.join("name "), b"hi").unwrap();
 
     let output = run_pax_in_dir(
-        &[
-            "-w",
-            "-x",
-            "ustar",
-            "-f",
-            archive.to_str().unwrap(),
-            "name ",
-        ],
+        &["-w", "-x", format, "-f", archive.to_str().unwrap(), "name "],
         &src_dir,
     );
     assert_success(&output, "pax write trailing-space name");
@@ -302,7 +294,7 @@ fn test_ustar_trailing_space_in_name_roundtrip() {
     let listing = stdout_str(&run_pax(&["-f", archive.to_str().unwrap()]));
     assert!(
         listing.lines().any(|l| l == "name "),
-        "listing should preserve the trailing space: {listing:?}"
+        "-x {format}: listing should preserve the trailing space: {listing:?}"
     );
 
     fs::create_dir(&dst_dir).unwrap();
@@ -310,8 +302,26 @@ fn test_ustar_trailing_space_in_name_roundtrip() {
     assert_success(&output, "pax extract trailing-space name");
     assert!(
         dst_dir.join("name ").exists(),
-        "extracted file must keep its trailing space"
+        "-x {format}: extracted file must keep its trailing space"
     );
+}
+
+#[test]
+fn test_ustar_trailing_space_in_name_roundtrip() {
+    trailing_space_roundtrip("ustar");
+}
+
+/// The pax reader parsed name/prefix/linkname with the space-trimming helper
+/// used for uname/gname, so a trailing space was silently dropped even though
+/// the ustar reader had already been fixed for exactly this.
+#[test]
+fn test_pax_trailing_space_in_name_roundtrip() {
+    trailing_space_roundtrip("pax");
+}
+
+#[test]
+fn test_cpio_trailing_space_in_name_roundtrip() {
+    trailing_space_roundtrip("cpio");
 }
 
 /// A pathname read from the -w stdin file list keeps a leading space (the list
@@ -336,5 +346,65 @@ fn test_stdin_file_list_preserves_leading_space() {
     assert!(
         listing.lines().any(|l| l == " lead"),
         "listing should preserve the leading space: {listing:?}"
+    );
+}
+
+/// `-o invalid=binary` must announce the member with hdrcharset=BINARY and
+/// record its pathname as unencoded bytes. It used to run the name through
+/// to_string_lossy first, replacing every invalid byte with U+FFFD
+/// irreversibly, which made `binary` produce byte-identical output to `write`.
+///
+/// Linux-only: APFS and HFS+ reject a filename that is not well-formed UTF-8,
+/// so the fixture cannot exist on macOS.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_pax_invalid_binary_preserves_raw_name() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let dst_dir = temp.path().join("dest");
+    let archive = temp.path().join("bin.pax");
+    fs::create_dir(&src_dir).unwrap();
+    fs::create_dir(&dst_dir).unwrap();
+
+    let raw = b"na\xffme.txt";
+    let name = std::ffi::OsStr::from_bytes(raw);
+    fs::write(src_dir.join(name), b"payload").unwrap();
+
+    let output = run_pax_in_dir(
+        &[
+            "-w",
+            "-x",
+            "pax",
+            "-o",
+            "invalid=binary",
+            "-f",
+            archive.to_str().unwrap(),
+            ".",
+        ],
+        &src_dir,
+    );
+    assert_success(&output, "write with -o invalid=binary");
+
+    let bytes = fs::read(&archive).unwrap();
+    assert!(
+        bytes
+            .windows(b"hdrcharset=BINARY".len())
+            .any(|w| w == b"hdrcharset=BINARY"),
+        "the member must be announced as BINARY"
+    );
+    assert!(
+        bytes.windows(raw.len()).any(|w| w == raw),
+        "the pathname must appear in the archive as unencoded bytes"
+    );
+    // The ustar name field beside the record is a best-effort fallback for
+    // readers that do not parse extended headers, so it may well be lossy; the
+    // path= record is what has to be exact, and is asserted above.
+
+    let output = run_pax_in_dir(&["-r", "-f", archive.to_str().unwrap()], &dst_dir);
+    assert_success(&output, "extract a BINARY member");
+    assert_eq!(
+        fs::read_to_string(dst_dir.join(name)).unwrap_or_default(),
+        "payload",
+        "the member must round-trip under its original byte name"
     );
 }

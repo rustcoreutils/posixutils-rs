@@ -273,7 +273,7 @@ Not covered:
 **Implementation:** `users/logname.rs` (39 lines) → `plib/src/curuser.rs` (`login_name`) + tests `users/tests/logname/mod.rs` (2 tests).
 **Spec:** POSIX.1-2024, `logname` (pp. 3119–3120), lines 102985–103000.
 **Reference slice:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/logname.md`
-**Tests:** **none** — `users/tests/users-tests.rs` declares only `id, logger, talk, tty, write`.
+**Tests:** `users/tests/logname/mod.rs` (2 tests; none existed at audit time — `users-tests.rs:10-20` now declares all eleven modules).
 **Date:** 2026-06-18
 
 ### TL;DR
@@ -398,7 +398,7 @@ Observable-behavior only (the test header acknowledges logger is "difficult to t
 **Implementation:** `users/mesg.rs` (114 lines) + tests `users/tests/mesg/mod.rs` (3 tests). The `mesg` permission and `fchmod` logic now lives in `plib::tty`.
 **Spec:** POSIX.1-2024, `mesg` (pp. 3216–3218), lines 106994–107000.
 **Reference slice:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/mesg.md`
-**Tests:** **none** — no `users/tests/mesg/` module.
+**Tests:** `users/tests/mesg/mod.rs` (3 tests; none existed at audit time).
 **Date:** 2026-06-18
 
 ### TL;DR
@@ -459,7 +459,7 @@ of `>1`. No tests at all.
 **Implementation:** `users/pwd.rs` (106 lines) + tests `users/tests/pwd/mod.rs` (7 tests).
 **Spec:** POSIX.1-2024, `pwd` (pp. 3365–3367), lines 112732–112744.
 **Reference slice:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/pwd.md`
-**Tests:** **none** — no `pwd` module in `users/tests/`.
+**Tests:** `users/tests/pwd/mod.rs` (7 tests; none existed at audit time).
 **Date:** 2026-06-18
 
 ### TL;DR
@@ -570,7 +570,7 @@ Good: non-terminal stdin → `not a tty\n` + exit 1, `--help`/`--version` exit 0
 **Implementation:** `users/newgrp.rs` (580 lines) + tests `users/tests/newgrp/mod.rs` (3 tests).
 **Spec:** POSIX.1-2024, `newgrp` (pp. 3252–3255), lines 108267–108420.
 **Reference slice:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/newgrp.md`
-**Tests:** **none** — no `users/tests/newgrp/` module (confirmed by grep).
+**Tests:** `users/tests/newgrp/mod.rs` (3 tests; none existed at audit time).
 **Date:** 2026-06-18
 
 ### TL;DR

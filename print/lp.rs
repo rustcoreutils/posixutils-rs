@@ -153,12 +153,12 @@ fn send_print_job(
         builder = builder.job_title(name);
     }
 
-    // Set copies if more than 1
+    // Set copies if more than 1. The clap `range(1..=i32::MAX)` above already
+    // bounds this, but saturate here too so the invariant is local to the
+    // conversion rather than living 120 lines away in an attribute.
     if args.copies > 1 {
-        builder = builder.attribute(IppAttribute::new(
-            "copies",
-            IppValue::Integer(args.copies as i32),
-        ));
+        let copies = i32::try_from(args.copies).unwrap_or(i32::MAX);
+        builder = builder.attribute(IppAttribute::new("copies", IppValue::Integer(copies)));
     }
 
     // Apply -o options as IPP attributes

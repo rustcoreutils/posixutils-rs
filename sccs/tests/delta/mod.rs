@@ -7,7 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, run_test_with_checker, TestPlan};
+use super::common::{run_test, run_test_with_checker};
+use plib::testing::TestPlan;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Output;
@@ -404,6 +405,81 @@ fn delta_g_records_ignored() {
     assert!(content.contains("\x01g 2"), "should record ^Ag 2");
 }
 
+/// `-g list` takes "a list (see get for the definition of list)" (92229), so
+/// an element may be an inclusive SID range, not just a single SID.
+#[test]
+fn delta_g_accepts_a_sid_range() {
+    let tmp = TempDir::new().unwrap();
+    let (sfile, _pfile, gfile) = setup_sccs_file(&tmp, "grange", "l1\n");
+
+    // Build 1.2 (serial 2) and 1.3 (serial 3).
+    get_for_editing(&sfile);
+    fs::write(&gfile, "l1\nl2\n").unwrap();
+    run_delta(&sfile, "c1");
+    get_for_editing(&sfile);
+    fs::write(&gfile, "l1\nl2\nl3\n").unwrap();
+    run_delta(&sfile, "c2");
+
+    // A range names both of them at once.
+    get_for_editing(&sfile);
+    fs::write(&gfile, "l1\nl2\nl3\nl4\n").unwrap();
+    let out = super::common::run_in(
+        "delta",
+        &["-yc3", "-g1.2-1.3", sfile.to_str().unwrap()],
+        tmp.path(),
+        "",
+    );
+    assert!(
+        out.status.success(),
+        "delta -g with a range failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let content = fs::read_to_string(&sfile).unwrap();
+    assert!(
+        content.contains("\x01g 2 3") || content.contains("\x01g 3 2"),
+        "the range must record both serials, got the ignore line: {:?}",
+        content
+            .lines()
+            .find(|l| l.starts_with("\x01g"))
+            .unwrap_or("<none>")
+    );
+}
+
+/// A range whose first SID is not an ancestor of the second is rejected before
+/// anything is written: baking a silently wrong ignore-list into the history
+/// is not recoverable by re-running delta.
+#[test]
+fn delta_g_rejects_a_range_that_is_not_an_ancestor_chain() {
+    let tmp = TempDir::new().unwrap();
+    let (sfile, _pfile, gfile) = setup_sccs_file(&tmp, "gbad", "l1\n");
+
+    get_for_editing(&sfile);
+    fs::write(&gfile, "l1\nl2\n").unwrap();
+    run_delta(&sfile, "c1");
+
+    let before = fs::read_to_string(&sfile).unwrap();
+    get_for_editing(&sfile);
+    fs::write(&gfile, "l1\nl2\nl3\n").unwrap();
+    let out = super::common::run_in(
+        "delta",
+        &["-yc2", "-g1.2-1.1", sfile.to_str().unwrap()],
+        tmp.path(),
+        "",
+    );
+    assert_eq!(out.status.code(), Some(1), "a reversed range must fail");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("ancestor"),
+        "expected the ancestry diagnostic, got {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&sfile).unwrap(),
+        before,
+        "a rejected -g list must leave the s-file untouched"
+    );
+}
+
 #[test]
 fn delta_p_normal_diff_format() {
     let tmp = TempDir::new().unwrap();
@@ -506,4 +582,180 @@ fn delta_blocked_by_existing_zfile() {
     // Our manually-created lock must be left intact (delta must not remove a
     // lock it did not create).
     assert!(zfile.exists(), "foreign z-file must not be removed");
+}
+
+/// A directory operand expands to the SCCS files inside it, and `-` reads the
+/// pathname list from standard input (92258+). The g-file is resolved against
+/// the current directory in both cases, matching `get`'s placement rule.
+#[test]
+fn delta_directory_and_stdin_operands() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::create_dir(tmp.path().join("proj")).unwrap();
+    super::common::run_in("admin", &["-i", "proj/s.mod"], tmp.path(), "body\n");
+
+    // Directory operand.
+    super::common::run_in("get", &["-e", "proj/s.mod"], tmp.path(), "");
+    fs::write(tmp.path().join("mod"), "body2\n").unwrap();
+    let out = super::common::run_in("delta", &["-yviadir", "proj"], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "delta <dir> failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("1.2"),
+        "expected the new SID, got {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // '-' operand: the list comes from stdin, so -y is required (92255).
+    super::common::run_in("get", &["-e", "proj/s.mod"], tmp.path(), "");
+    fs::write(tmp.path().join("mod"), "body3\n").unwrap();
+    let out = super::common::run_in("delta", &["-yviastdin", "-"], tmp.path(), "proj/s.mod\n");
+    assert!(
+        out.status.success(),
+        "delta - failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("1.3"));
+}
+
+/// "-r ... shall be necessary only if two or more outstanding get commands for
+/// editing on the same SCCS file were done by the same person" (92219-92224).
+/// Without it the ambiguity has to be diagnosed rather than guessed at.
+#[test]
+fn delta_r_selects_among_multiple_pending_edits() {
+    let tmp = TempDir::new().unwrap();
+    let (sfile, _pfile, gfile) = setup_sccs_file(&tmp, "multi", "l1\n");
+
+    // Joint edit plus branching, so one user can hold two locks at once.
+    super::common::run_in(
+        "admin",
+        &["-fj", "-fb", sfile.to_str().unwrap()],
+        tmp.path(),
+        "",
+    );
+    super::common::run_in("get", &["-e", sfile.to_str().unwrap()], tmp.path(), "");
+    super::common::run_in(
+        "get",
+        &["-e", "-b", sfile.to_str().unwrap()],
+        tmp.path(),
+        "",
+    );
+
+    let pfile = fs::read_to_string(tmp.path().join("p.multi")).unwrap();
+    assert_eq!(
+        pfile.lines().count(),
+        2,
+        "fixture needs two pending edits, got {pfile:?}"
+    );
+
+    // Ambiguous without -r.
+    fs::write(&gfile, "l1\nEDIT\n").unwrap();
+    let out = super::common::run_in(
+        "delta",
+        &["-yambig", sfile.to_str().unwrap()],
+        tmp.path(),
+        "",
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "two pending edits must be ambiguous"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("-r"),
+        "the diagnostic must name the option that resolves it, got {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // -r names the branch edit, and that is the SID committed.
+    let out = super::common::run_in(
+        "delta",
+        &["-ypick", "-r1.1.1.1", sfile.to_str().unwrap()],
+        tmp.path(),
+        "",
+    );
+    assert!(
+        out.status.success(),
+        "delta -r failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("1.1.1.1"),
+        "expected the branch SID, got {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // The trunk edit is still pending afterwards.
+    let pfile = fs::read_to_string(tmp.path().join("p.multi")).unwrap();
+    assert_eq!(pfile.lines().count(), 1, "the other edit must survive");
+    assert!(pfile.contains("1.2"), "the trunk edit remains: {pfile:?}");
+}
+
+/// SIGINT during a delta must leave no transient files behind. delta takes the
+/// z-file lock before it reads the comment from standard input, so leaving the
+/// pipe open parks it with the lock held and the x-file temporary in play.
+///
+/// Without the cleanup registry a stale z.<name> survives the interrupt and
+/// every later get -e / delta on that file fails with "being edited" until
+/// somebody removes it by hand.
+#[test]
+fn delta_sigint_removes_transient_files() {
+    use std::process::{Command, Stdio};
+
+    let tmp = TempDir::new().unwrap();
+    let (sfile, _pfile, gfile) = setup_sccs_file(&tmp, "sigint", "l1\n");
+    get_for_editing(&sfile);
+    fs::write(&gfile, "l1\nl2\n").unwrap();
+
+    // No -y, and stdin is a pipe we never write to or close: delta blocks
+    // reading the comment.
+    let mut child = Command::new(plib::testing::get_binary_path("delta"))
+        .arg(sfile.to_str().unwrap())
+        .current_dir(tmp.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn delta");
+
+    // Wait for the lock to appear rather than sleeping a fixed amount.
+    let zfile = tmp.path().join("z.sigint");
+    let mut waited = 0;
+    while !zfile.exists() && waited < 5000 {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        waited += 10;
+    }
+    assert!(
+        zfile.exists(),
+        "delta should hold the z-file lock while blocked"
+    );
+
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) };
+    let _ = child.wait().expect("wait for delta");
+
+    assert!(
+        !zfile.exists(),
+        "SIGINT must remove the z-file lock, not strand it"
+    );
+    let strays: Vec<String> = fs::read_dir(tmp.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("x.") || n.starts_with("z."))
+        .collect();
+    assert!(
+        strays.is_empty(),
+        "SIGINT left transient files behind: {strays:?}"
+    );
+
+    // The s-file must be untouched: the interrupted delta was never recorded.
+    let out = super::common::run_in(
+        "get",
+        &["-p", "-s", sfile.to_str().unwrap()],
+        tmp.path(),
+        "",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "l1\n");
 }

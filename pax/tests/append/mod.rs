@@ -407,3 +407,158 @@ fn test_append_format_mismatch_rejected() {
     );
     assert_success(&out, "append with matching -x format");
 }
+
+/// Append mode used to carry its own stale copy of the write traversal, which
+/// had never gained -s substitutions. A rename applied while appending was
+/// silently ignored, so the member went into the archive under its real name
+/// and extracting it later overwrote the source.
+#[test]
+fn test_append_applies_substitutions() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("app.tar");
+    fs::create_dir(&src_dir).unwrap();
+    fs::write(src_dir.join("first.txt"), b"one").unwrap();
+    fs::write(src_dir.join("second.txt"), b"two").unwrap();
+
+    assert_success(
+        &run_pax_in_dir(
+            &[
+                "-w",
+                "-x",
+                "ustar",
+                "-f",
+                archive.to_str().unwrap(),
+                "first.txt",
+            ],
+            &src_dir,
+        ),
+        "create archive",
+    );
+    assert_success(
+        &run_pax_in_dir(
+            &[
+                "-w",
+                "-a",
+                "-s",
+                ",second,renamed,",
+                "-f",
+                archive.to_str().unwrap(),
+                "second.txt",
+            ],
+            &src_dir,
+        ),
+        "append with -s",
+    );
+
+    let listing = stdout_str(&run_pax(&["-f", archive.to_str().unwrap()]));
+    assert!(
+        listing.lines().any(|l| l == "renamed.txt"),
+        "-s must rename the appended member: {listing}"
+    );
+    assert!(
+        !listing.lines().any(|l| l == "second.txt"),
+        "the original name must not also appear: {listing}"
+    );
+    assert!(
+        listing.lines().any(|l| l == "first.txt"),
+        "the pre-existing member must survive: {listing}"
+    );
+}
+
+/// The fork also built the pax writer without its options, so every -o keyword
+/// was discarded when appending.
+#[test]
+fn test_append_honors_format_options() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("app.pax");
+    fs::create_dir(&src_dir).unwrap();
+    fs::write(src_dir.join("a.txt"), b"one").unwrap();
+    fs::write(src_dir.join("b.txt"), b"two").unwrap();
+
+    assert_success(
+        &run_pax_in_dir(
+            &["-w", "-x", "pax", "-f", archive.to_str().unwrap(), "a.txt"],
+            &src_dir,
+        ),
+        "create pax archive",
+    );
+    assert_success(
+        &run_pax_in_dir(
+            &[
+                "-w",
+                "-a",
+                "-o",
+                "times",
+                "-f",
+                archive.to_str().unwrap(),
+                "b.txt",
+            ],
+            &src_dir,
+        ),
+        "append with -o times",
+    );
+
+    let bytes = fs::read(&archive).unwrap();
+    let needle = b" atime=";
+    let count = bytes
+        .windows(needle.len())
+        .filter(|w| *w == needle.as_slice())
+        .count();
+    assert_eq!(
+        count, 1,
+        "-o times must record an atime for the appended member"
+    );
+}
+
+/// Appending shorter content than the tail it replaces must not leave the old
+/// end-of-archive marker and record padding behind.
+#[test]
+fn test_append_truncates_the_old_tail() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("app.tar");
+    fs::create_dir(&src_dir).unwrap();
+    fs::write(src_dir.join("big.txt"), vec![b'x'; 40_000]).unwrap();
+    fs::write(src_dir.join("small.txt"), b"s").unwrap();
+
+    assert_success(
+        &run_pax_in_dir(
+            &[
+                "-w",
+                "-x",
+                "ustar",
+                "-f",
+                archive.to_str().unwrap(),
+                "big.txt",
+            ],
+            &src_dir,
+        ),
+        "create archive",
+    );
+    assert_success(
+        &run_pax_in_dir(
+            &["-w", "-a", "-f", archive.to_str().unwrap(), "small.txt"],
+            &src_dir,
+        ),
+        "append",
+    );
+
+    // Both members must list, and the archive must still be readable through to
+    // its end -- a stale tail past the new marker shows up as trailing garbage.
+    let listing = stdout_str(&run_pax(&["-f", archive.to_str().unwrap()]));
+    assert!(
+        listing.lines().any(|l| l == "big.txt") && listing.lines().any(|l| l == "small.txt"),
+        "both members must be listed: {listing}"
+    );
+
+    let dst = temp.path().join("dest");
+    fs::create_dir(&dst).unwrap();
+    assert_success(
+        &run_pax_in_dir(&["-r", "-f", archive.to_str().unwrap()], &dst),
+        "extract the appended archive",
+    );
+    assert_eq!(fs::read_to_string(dst.join("small.txt")).unwrap(), "s");
+    assert_eq!(fs::metadata(dst.join("big.txt")).unwrap().len(), 40_000);
+}

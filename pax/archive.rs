@@ -54,6 +54,12 @@ pub struct ArchiveEntry {
     pub atime: Option<u64>,
     /// Access time nanoseconds (for pax format)
     pub atime_nsec: u32,
+    /// Inode change time (seconds since epoch). Not a POSIX pax keyword -- see
+    /// `ExtendedHeader::ctime` -- but carried so archives that do record one can
+    /// be listed, and so `-o times` can write one.
+    pub ctime: Option<u64>,
+    /// Change time nanoseconds (for pax format)
+    pub ctime_nsec: u32,
     /// Type of entry
     pub entry_type: EntryType,
     /// Link target for symlinks and hardlinks
@@ -87,6 +93,8 @@ impl ArchiveEntry {
             mtime_nsec: 0,
             atime: None,
             atime_nsec: 0,
+            ctime: None,
+            ctime_nsec: 0,
             entry_type,
             link_target: None,
             uname: None,
@@ -139,6 +147,17 @@ pub trait ArchiveWriter {
 
     /// Write the archive trailer
     fn finish(&mut self) -> PaxResult<()>;
+
+    /// Whether this format can record that a member is a hard link to another
+    /// member, so that only the first occurrence needs to carry the data.
+    ///
+    /// cpio cannot: it has no link typeflag, and a `Hardlink` entry degrades to
+    /// a regular file. A writer that returns `false` is given the full contents
+    /// of every link instead, which POSIX permits ("the data shall be restored
+    /// from the original file") and which is the only way not to lose it.
+    fn supports_hardlinks(&self) -> bool {
+        true
+    }
 }
 
 /// Tracks hard links during archive creation
@@ -159,15 +178,26 @@ impl HardLinkTracker {
     /// Check if we've seen this file before (by dev/ino)
     /// Returns the original path if this is a hard link
     pub fn check(&mut self, entry: &ArchiveEntry) -> Option<PathBuf> {
-        if entry.nlink <= 1 {
+        self.check_ids(entry.dev, entry.ino, entry.nlink, &entry.path)
+    }
+
+    /// The same, for a caller that holds the ids directly rather than an entry.
+    ///
+    /// `record` is what a later link to the same file will be pointed at: the
+    /// archive member path when writing, the destination path when copying.
+    /// That difference is the only reason copy mode used to carry its own copy
+    /// of this type -- one which re-stat'd every file the caller had already
+    /// stat'd.
+    pub fn check_ids(&mut self, dev: u64, ino: u64, nlink: u32, record: &Path) -> Option<PathBuf> {
+        if nlink <= 1 {
             return None;
         }
 
-        let key = (entry.dev, entry.ino);
+        let key = (dev, ino);
         if let Some(original) = self.seen.get(&key) {
             Some(original.clone())
         } else {
-            self.seen.insert(key, entry.path.clone());
+            self.seen.insert(key, record.to_path_buf());
             None
         }
     }

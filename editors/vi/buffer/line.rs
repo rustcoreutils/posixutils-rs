@@ -24,6 +24,65 @@ pub fn char_index_at_byte(content: &str, byte_offset: usize) -> usize {
     char_index
 }
 
+/// Width in display columns of a string's leading <blank> run, plus the byte
+/// offset of the first non-<blank>.
+///
+/// A tab advances to the next `tabstop` boundary rather than counting as a
+/// fixed width, so `\t` in column 0 with `tabstop=8` is 8 columns but `\t`
+/// after three spaces is only 5.
+pub fn leading_blank_width(content: &str, tabstop: usize) -> (usize, usize) {
+    let ts = tabstop.max(1);
+    let mut width = 0usize;
+    let mut offset = 0usize;
+    for (byte, c) in content.char_indices() {
+        match c {
+            '\t' => width += ts - (width % ts),
+            ' ' => width += 1,
+            _ => return (width, byte),
+        }
+        offset = byte + c.len_utf8();
+    }
+    (width, offset)
+}
+
+/// Display column of a byte offset within a line, expanding tabs.
+pub fn display_col(content: &str, byte_offset: usize, tabstop: usize) -> usize {
+    let ts = tabstop.max(1);
+    let mut col = 0usize;
+    for (byte, c) in content.char_indices() {
+        if byte >= byte_offset {
+            break;
+        }
+        if c == '\t' {
+            col += ts - (col % ts);
+        } else {
+            col += 1;
+        }
+    }
+    col
+}
+
+/// Render an indent of `width` display columns as tabs followed by spaces.
+///
+/// This is the form POSIX prescribes for autoindent (ex `autoindent`,
+/// 95739-95741: "using first as many <tab> characters as possible, as
+/// determined by the editor option tabstop, and then using <space>
+/// characters"), and it is permitted when shifting, where leading blanks may be
+/// "changed into other <blank> characters" (95631).
+pub fn render_indent(width: usize, tabstop: usize) -> String {
+    let ts = tabstop.max(1);
+    let tabs = width / ts;
+    let spaces = width % ts;
+    let mut s = String::with_capacity(tabs + spaces);
+    for _ in 0..tabs {
+        s.push('\t');
+    }
+    for _ in 0..spaces {
+        s.push(' ');
+    }
+    s
+}
+
 /// A single line in the edit buffer.
 ///
 /// Lines do NOT include the trailing newline character.

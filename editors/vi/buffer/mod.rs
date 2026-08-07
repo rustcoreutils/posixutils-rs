@@ -17,5 +17,5 @@ mod line;
 mod position;
 
 pub use buffer::Buffer;
-pub use line::{char_index_at_byte, Line};
+pub use line::{char_index_at_byte, display_col, leading_blank_width, render_indent, Line};
 pub use position::{BufferMode, Position, Range};

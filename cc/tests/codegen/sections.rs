@@ -38,7 +38,7 @@ fn compile_to_asm(name: &str, content: &str) -> String {
     let c_path = c_file.path().to_path_buf();
     let output = run_test_base(
         "c17",
-        &vec![
+        &[
             "-O".to_string(),
             "-S".to_string(),
             "-o".to_string(),

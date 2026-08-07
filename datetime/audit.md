@@ -154,7 +154,8 @@ broken. Separately, the child's exit status is discarded, so `time` always exits
 Not covered:
 - [x] No test asserts the reported `user`/`sys` values are non-zero for a CPU-bound child (would catch #T1/#T2). — ✓ Phase 1 `cpu_bound_child_reports_nonzero_cpu_time`.
 - [x] No test asserts `time` propagates a non-zero child exit code (#T3). — ✓ Phase 1 `propagates_child_exit_status`.
-- [ ] No test asserts 126/127 mapping (only "not provided"/clap errors are exercised; `tests/time/mod.rs:51-57`). (127 behaviorally spot-checked; no automated assertion yet.)
+- [x] 126/127 mapping — `reports_127_when_the_utility_is_not_found`, `reports_126_when_the_utility_cannot_be_invoked`.
+- [x] **The timed utility may take its own options** — `utility_arguments_may_start_with_a_hyphen`, with `own_p_option_still_parses_before_the_utility` as the counterpart. This closes `time`'s share of the cross-cutting `#C4` recorded in `process/audit.md`: `trailing_var_arg` was set but `allow_hyphen_values` was not, so `time ls -l` and `time sh -c '...'` both failed with "unexpected argument found". Every prior test invoked a utility with no options, which is why a full audit missed it.
 
 ---
 
@@ -231,15 +232,15 @@ non-UTF-8 locale bytes can be mangled (#D4).
 
 Not covered:
 - [x] No test exercises the set-time path at all (would catch #D1) — ✓ Phase 3 added a `century_boundaries` unit test over the `infer_century` helper (set-time itself needs privilege).
-- [ ] No test asserts `+`-empty / unusual formats (#D2).
-- [ ] No test for `-u` set-form or non-UTF-8 locale output (#D4).
+- [x] `+`-empty and unusual formats (#D2) — `test_format_empty_prints_only_a_newline`, `test_format_literal_text_and_percent`, `test_format_newline_tab_and_embedded_conversion` (`%n`, `%t`, and a conversion embedded in literal text).
+- [x] `-u` set-form (#D4) — `test_utc_set_form_fails_cleanly_without_privilege` reaches the set-time branch, which no test entered before, and asserts a diagnostic plus exit 1 with nothing on stdout. Self-skips under root, which would actually set the system clock. *(Non-UTF-8 locale output is not asserted: only C/C.utf8/en_US.utf8 are installed on the reference host, and none produce non-UTF-8 output.)*
 
 ---
 
 ## `sleep`
 
 **Implementation:** `datetime/sleep.rs` (39 lines)
-**Tests:** none (no `datetime/tests/sleep/`).
+**Tests:** `datetime/tests/sleep/mod.rs` (4 tests; none existed at audit time).
 **Spec:** POSIX.1-2024, Vol. 3 §3, pp. 3433–3435
 **Reference slice:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/sleep.md`
 **Date:** 2026-06-24

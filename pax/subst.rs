@@ -146,15 +146,6 @@ impl Substitution {
             new_result.push_str(&replacement);
             new_result.push_str(&result[match_end..]);
 
-            // Update position for next iteration
-            // Move past the replacement (or at least one char to avoid infinite loop)
-            let new_pos = match_start + replacement.len();
-            pos = if new_pos > match_start {
-                new_pos
-            } else {
-                match_start + 1
-            };
-
             result = new_result;
 
             // If not global, stop after first replacement
@@ -162,9 +153,9 @@ impl Substitution {
                 break;
             }
 
-            // Don't go past the end
-            if pos >= result.len() {
-                break;
+            match next_scan_pos(&result, match_start, match_end, replacement.len()) {
+                Some(next) if next < result.len() => pos = next,
+                _ => break,
             }
         }
 
@@ -182,6 +173,36 @@ impl Substitution {
             SubstResult::Changed(result)
         }
     }
+}
+
+/// Where a global substitution resumes scanning, as a byte offset into the
+/// rewritten string. `None` once the scan has reached the end.
+///
+/// Whether to step over a character depends on what the *match* consumed, not
+/// on how long the replacement is:
+///
+/// - a non-empty match was consumed, so scanning continues just past the
+///   replacement. Keying this off `replacement.len()` instead meant a deletion
+///   (`-s ',a,,g'`) also skipped the character after each match, leaving about
+///   half the occurrences in place.
+/// - an empty match consumed nothing, so one character of the subject must be
+///   stepped over as well. Otherwise the same position matches forever and the
+///   string grows without bound -- `-s ',x*,-,g'` never terminated.
+///
+/// Stepping by a whole character, rather than one byte, keeps the offset on a
+/// UTF-8 boundary for the next match.
+fn next_scan_pos(
+    result: &str,
+    match_start: usize,
+    match_end: usize,
+    replacement_len: usize,
+) -> Option<usize> {
+    let resume = match_start + replacement_len;
+    if match_end > match_start {
+        return Some(resume);
+    }
+    let next_char = result[resume..].chars().next()?;
+    Some(resume + next_char.len_utf8())
 }
 
 /// Build the replacement string from template and match groups
@@ -390,6 +411,43 @@ mod tests {
             s.apply("foo_foo_foo"),
             SubstResult::Changed("bar_bar_bar".to_string())
         );
+    }
+
+    /// A `g` substitution with an empty replacement is a deletion. The loop
+    /// advanced past a whole character whenever the *replacement* was empty,
+    /// rather than only when the *match* was empty, so every deletion skipped
+    /// the character following it and roughly half the matches survived.
+    #[test]
+    fn test_apply_global_deletion() {
+        let s = Substitution::parse("/a//g").unwrap();
+        assert_eq!(s.apply("aab"), SubstResult::Changed("b".to_string()));
+        assert_eq!(s.apply("banana"), SubstResult::Changed("bnn".to_string()));
+
+        // Deleting a multi-character match, adjacent occurrences.
+        let s = Substitution::parse("/ab//g").unwrap();
+        assert_eq!(s.apply("xababy"), SubstResult::Changed("xy".to_string()));
+    }
+
+    /// Shortening (but non-empty) replacements hit the same advance logic.
+    #[test]
+    fn test_apply_global_shortening() {
+        let s = Substitution::parse("/aa/a/g").unwrap();
+        assert_eq!(s.apply("aaaa"), SubstResult::Changed("aa".to_string()));
+    }
+
+    /// The one-character bump that guards against an empty match must land on a
+    /// character boundary; a non-ASCII subject would otherwise slice mid-char.
+    #[test]
+    fn test_apply_global_empty_match_non_ascii() {
+        // `x*` matches empty at every position.
+        let s = Substitution::parse("/x*/-/g").unwrap();
+        match s.apply("éöü") {
+            SubstResult::Changed(_) => {}
+            other => panic!("expected a substitution, got {:?}", other),
+        }
+
+        let s = Substitution::parse("/é//g").unwrap();
+        assert_eq!(s.apply("éaéb"), SubstResult::Changed("ab".to_string()));
     }
 
     #[test]

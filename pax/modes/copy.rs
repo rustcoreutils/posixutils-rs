@@ -13,11 +13,11 @@
 //! without creating an intermediate archive. Hard links are created
 //! between source and destination when possible (with -l option).
 
+use crate::archive::HardLinkTracker;
 use crate::error::{PaxError, PaxResult};
 use crate::interactive::{InteractivePrompter, RenameResult};
 use crate::pattern::{matches_any, Pattern};
 use crate::subst::{apply_substitutions, SubstResult, Substitution};
-use std::collections::HashMap;
 use std::fs::{self, File, Permissions};
 use std::io::{Read, Write};
 #[cfg(unix)]
@@ -39,6 +39,10 @@ pub struct CopyOptions {
     pub preserve_perms: bool,
     /// Preserve modification time
     pub preserve_mtime: bool,
+    /// Preserve access time
+    pub preserve_atime: bool,
+    /// Preserve owner and group
+    pub preserve_owner: bool,
     /// Create hard links instead of copying
     pub link: bool,
     /// Follow symlinks on command line
@@ -58,47 +62,6 @@ pub struct CopyOptions {
     /// Process file-creation mask, applied to the mode of copied files when the
     /// mode is not explicitly preserved (no `-p p`/`-p e`).
     pub umask: u32,
-}
-
-/// Tracks hard links during copy to preserve link structure
-#[derive(Debug, Default)]
-struct HardLinkTracker {
-    /// Maps (dev, ino) to the destination path
-    seen: HashMap<(u64, u64), PathBuf>,
-}
-
-impl HardLinkTracker {
-    fn new() -> Self {
-        HardLinkTracker {
-            seen: HashMap::new(),
-        }
-    }
-
-    /// Check if we've seen this file before (by dev/ino)
-    /// Returns the destination path if this is a hard link to a file we already copied
-    #[cfg(unix)]
-    fn check(&mut self, src_path: &Path, dest_path: &Path) -> PaxResult<Option<PathBuf>> {
-        let metadata = fs::symlink_metadata(src_path)?;
-
-        // Only track files with multiple links
-        if metadata.nlink() <= 1 {
-            return Ok(None);
-        }
-
-        let key = (metadata.dev(), metadata.ino());
-        if let Some(original_dest) = self.seen.get(&key) {
-            Ok(Some(original_dest.clone()))
-        } else {
-            self.seen.insert(key, dest_path.to_path_buf());
-            Ok(None)
-        }
-    }
-
-    #[cfg(not(unix))]
-    fn check(&mut self, _src_path: &Path, _dest_path: &Path) -> PaxResult<Option<PathBuf>> {
-        // Hard link tracking not supported on non-Unix
-        Ok(None)
-    }
 }
 
 /// Copy files to a destination directory
@@ -122,9 +85,8 @@ pub fn copy_files(files: &[PathBuf], dest_dir: &Path, options: &CopyOptions) -> 
     }
 
     let mut link_tracker = HardLinkTracker::new();
-    #[cfg(unix)]
-    let initial_dev: Option<u64> = None;
-    #[cfg(not(unix))]
+    // No filesystem is established until a directory is descended into; the
+    // per-directory splits below are the ones that matter for -X.
     let initial_dev: Option<u64> = None;
 
     // Create interactive prompter if needed
@@ -137,8 +99,9 @@ pub fn copy_files(files: &[PathBuf], dest_dir: &Path, options: &CopyOptions) -> 
     for path in files {
         // Diagnose a per-operand failure and set a non-zero exit, but continue
         // copying the remaining operands (POSIX CONSEQUENCES OF ERRORS).
-        if let Err(e) = copy_path(
+        if let Err(e) = copy_member(
             path,
+            &member_name(path),
             dest_dir,
             options,
             &mut link_tracker,
@@ -153,37 +116,55 @@ pub fn copy_files(files: &[PathBuf], dest_dir: &Path, options: &CopyOptions) -> 
     Ok(())
 }
 
-/// Copy a single path (file or directory) to the destination
-fn copy_path(
+/// The archive-relative name a source path would be stored under, and so the
+/// name it is restored to beneath the destination directory.
+///
+/// POSIX defines a copy as an archive round-trip, and write mode stores an
+/// operand under the path the user gave it. Naming the destination after the
+/// basename instead put `pax -r -w a/b/c dest` at `dest/c`, which no round trip
+/// through an archive could produce. Leading slashes and `.`/`..` components
+/// are dropped, exactly as extraction sanitizes a member name.
+fn member_name(src: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut out = PathBuf::new();
+    for comp in src.components() {
+        match comp {
+            Component::Normal(c) => out.push(c),
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
+        }
+    }
+    out
+}
+
+/// Copy one source path, and its subtree if it is a directory, to `member`
+/// beneath `dest_root`.
+///
+/// This is the single walk for both command-line operands and everything found
+/// by recursion. It used to be two functions -- `copy_path` for operands and
+/// `copy_path_to_dest` for their descendants -- and the second had never
+/// acquired the first's `-s` substitution and pattern selection, so both
+/// applied only to paths typed on the command line.
+#[allow(clippy::too_many_arguments)]
+fn copy_member(
     src: &Path,
-    dest_dir: &Path,
+    member: &Path,
+    dest_root: &Path,
     options: &CopyOptions,
     link_tracker: &mut HardLinkTracker,
     initial_dev: Option<u64>,
     is_cli_arg: bool,
     prompter: &mut Option<InteractivePrompter>,
 ) -> PaxResult<()> {
-    // Handle special case of "." - copy contents directly to destination
-    let src_str = src.to_string_lossy();
-    if src_str == "." {
-        return copy_current_dir_contents(
-            src,
-            dest_dir,
-            options,
-            link_tracker,
-            initial_dev,
-            prompter,
-        );
-    }
-
-    // Get metadata (following symlinks if requested)
     let follow = should_follow_symlink(options, is_cli_arg);
     let metadata = if follow {
         fs::metadata(src)
     } else {
         fs::symlink_metadata(src)
     };
-
     let metadata = match metadata {
         Ok(m) => m,
         Err(e) => {
@@ -192,65 +173,75 @@ fn copy_path(
         }
     };
 
-    // Check pattern matching
-    let path_str = src.to_string_lossy();
-    let matches = matches_any(&options.patterns, &path_str);
-    let should_copy = if options.exclude { !matches } else { matches };
-
-    if !should_copy {
-        return Ok(());
+    // Selection and substitution both act on the member name, so they reach
+    // every file in the subtree rather than only the operands.
+    let member_str = member.to_string_lossy().to_string();
+    if !options.patterns.is_empty() {
+        let matches = matches_any(&options.patterns, &member_str);
+        if options.exclude == matches {
+            return Ok(());
+        }
     }
 
-    // Check one_file_system
     #[cfg(unix)]
     {
         if options.one_file_system {
-            let dev = metadata.dev();
             if let Some(initial) = initial_dev {
-                if dev != initial {
+                if metadata.dev() != initial {
                     return Ok(());
                 }
             }
         }
     }
 
-    // Apply substitutions first (per POSIX: -s applies before -i)
-    let dest_name = if !options.substitutions.is_empty() {
-        match apply_substitutions(&options.substitutions, &path_str) {
-            SubstResult::Unchanged => src
-                .file_name()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(".")),
-            SubstResult::Changed(new_path) => PathBuf::from(new_path),
-            SubstResult::Empty => return Ok(()), // Skip this file
-        }
+    // -s applies before -i (POSIX: the order of -o, -p and -s is significant).
+    let member = if options.substitutions.is_empty() {
+        member.to_path_buf()
     } else {
-        src.file_name()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."))
+        match apply_substitutions(&options.substitutions, &member_str) {
+            SubstResult::Unchanged => member.to_path_buf(),
+            SubstResult::Changed(new_name) => PathBuf::from(new_name),
+            SubstResult::Empty => return Ok(()), // a null name means skip
+        }
     };
 
-    // Handle interactive rename
-    let dest_name = if let Some(ref mut p) = prompter {
-        let name_str = dest_name.to_string_lossy();
-        match p.prompt(&name_str)? {
+    let member = if let Some(ref mut p) = prompter {
+        match p.prompt(&member.to_string_lossy())? {
             RenameResult::Skip => return Ok(()),
-            RenameResult::UseOriginal => dest_name,
+            RenameResult::UseOriginal => member,
             RenameResult::Rename(new_name) => new_name,
         }
     } else {
-        dest_name
+        member
     };
 
-    // Compute destination path using the (possibly renamed) name
-    let dest = dest_dir.join(&dest_name);
+    if member.as_os_str().is_empty() {
+        // The operand was `.`: its children carry the names, not itself.
+        return copy_directory(
+            src,
+            dest_root,
+            member.as_path(),
+            options,
+            link_tracker,
+            &metadata,
+            prompter,
+        );
+    }
 
-    // Check no_clobber
+    let dest = dest_root.join(&member);
+
+    // A member may name directories the walk has not created yet (`a/b/c` given
+    // as an operand). POSIX requires the intermediate directories be made with
+    // the normal file-creation action.
+    if let Some(parent) = dest.parent() {
+        if !parent.exists() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+
     if options.no_clobber && dest.exists() {
         return Ok(());
     }
-
-    // Check update mode (-u): only copy if source is newer than dest
     if options.update && !is_source_newer(&metadata, &dest) {
         return Ok(());
     }
@@ -260,54 +251,21 @@ fn copy_path(
     }
 
     if metadata.is_dir() {
-        copy_directory(src, &dest, options, link_tracker, &metadata, prompter)?;
-    } else if metadata.is_symlink() {
-        copy_symlink(src, &dest)?;
-    } else if metadata.is_file() {
-        copy_file(src, &dest, options, link_tracker, &metadata)?;
-    } else if let Err(e) = copy_special_file(&dest, &metadata) {
-        crate::error::report_error(src.display(), e);
-    }
-
-    Ok(())
-}
-
-/// Copy contents of current directory to destination (for "." argument)
-fn copy_current_dir_contents(
-    src: &Path,
-    dest_dir: &Path,
-    options: &CopyOptions,
-    link_tracker: &mut HardLinkTracker,
-    initial_dev: Option<u64>,
-    prompter: &mut Option<InteractivePrompter>,
-) -> PaxResult<()> {
-    let entries = match fs::read_dir(src) {
-        Ok(e) => e,
-        Err(e) => {
-            crate::error::report_error(src.display(), e);
-            return Ok(());
-        }
-    };
-
-    for entry in entries {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => {
-                crate::error::report_error(src.display(), e);
-                continue;
-            }
-        };
-
-        let child_src = entry.path();
-        copy_path(
-            &child_src,
-            dest_dir,
+        copy_directory(
+            src,
+            dest_root,
+            &member,
             options,
             link_tracker,
-            initial_dev,
-            false,
+            &metadata,
             prompter,
         )?;
+    } else if metadata.is_symlink() {
+        copy_symlink(src, &dest, &metadata, options)?;
+    } else if metadata.is_file() {
+        copy_file(src, &dest, options, link_tracker, &metadata)?;
+    } else if let Err(e) = copy_special_file(&dest, &metadata, options) {
+        crate::error::report_error(src.display(), e);
     }
 
     Ok(())
@@ -362,19 +320,23 @@ fn is_source_newer(src_metadata: &fs::Metadata, dest: &Path) -> bool {
 /// Copy a directory and its contents
 fn copy_directory(
     src: &Path,
-    dest: &Path,
+    dest_root: &Path,
+    member: &Path,
     options: &CopyOptions,
     link_tracker: &mut HardLinkTracker,
     metadata: &fs::Metadata,
     prompter: &mut Option<InteractivePrompter>,
 ) -> PaxResult<()> {
-    // Create the destination directory
-    if !dest.exists() {
-        fs::create_dir(dest)?;
-    }
+    let dest = dest_root.join(member);
 
-    // Set permissions
-    set_permissions(dest, metadata, options)?;
+    // Create the destination directory. Its own attributes are applied on the
+    // way back out, not here: an archived mode without write or search
+    // permission (0555, say) would otherwise stop us creating the very files
+    // that belong inside it, and any mode/owner/time set now would be
+    // invalidated by populating it anyway.
+    if !dest.exists() {
+        fs::create_dir(&dest)?;
+    }
 
     // Recurse into directory unless no_recurse
     if !options.no_recurse {
@@ -404,113 +366,29 @@ fn copy_directory(
                 }
             };
 
-            let child_src = entry.path();
-            let child_name = entry.file_name();
-            let child_dest = dest.join(&child_name);
-
-            // Recurse with the child paths
-            copy_path_to_dest(
-                &child_src,
-                &child_dest,
+            // The child's member name extends its parent's, so selection and
+            // substitution see the same pathname an archive would record.
+            copy_member(
+                &entry.path(),
+                &member.join(entry.file_name()),
+                dest_root,
                 options,
                 link_tracker,
                 initial_dev,
+                false,
                 prompter,
             )?;
         }
     }
 
-    // Set times after contents are copied
-    set_times(dest, metadata, options)?;
-
-    Ok(())
-}
-
-/// Copy a path directly to a specific destination (used for recursion)
-fn copy_path_to_dest(
-    src: &Path,
-    dest: &Path,
-    options: &CopyOptions,
-    link_tracker: &mut HardLinkTracker,
-    initial_dev: Option<u64>,
-    prompter: &mut Option<InteractivePrompter>,
-) -> PaxResult<()> {
-    // Get metadata
-    let follow = options.dereference;
-    let metadata = if follow {
-        fs::metadata(src)
-    } else {
-        fs::symlink_metadata(src)
-    };
-
-    let metadata = match metadata {
-        Ok(m) => m,
-        Err(e) => {
-            crate::error::report_error(src.display(), e);
-            return Ok(());
-        }
-    };
-
-    // Check one_file_system
-    #[cfg(unix)]
-    {
-        if options.one_file_system {
-            let dev = metadata.dev();
-            if let Some(initial) = initial_dev {
-                if dev != initial {
-                    return Ok(());
-                }
-            }
-        }
-    }
-
-    // Handle interactive rename if enabled
-    let actual_dest = if let Some(ref mut p) = prompter {
-        let path_str = src.to_string_lossy();
-        match p.prompt(&path_str)? {
-            RenameResult::Skip => return Ok(()),
-            RenameResult::UseOriginal => dest.to_path_buf(),
-            RenameResult::Rename(new_name) => {
-                // Use the new name as the destination, but in the same parent directory
-                dest.parent().map(|p| p.join(&new_name)).unwrap_or(new_name)
-            }
-        }
-    } else {
-        dest.to_path_buf()
-    };
-
-    // Check no_clobber
-    if options.no_clobber && actual_dest.exists() {
+    // `.` as an operand has no directory of its own to stamp: its children were
+    // copied straight into the destination root.
+    if member.as_os_str().is_empty() {
         return Ok(());
     }
 
-    // Check update mode (-u): only copy if source is newer than dest
-    if options.update && !is_source_newer(&metadata, &actual_dest) {
-        return Ok(());
-    }
-
-    if options.verbose {
-        eprintln!("{}", src.display());
-    }
-
-    if metadata.is_dir() {
-        copy_directory(
-            src,
-            &actual_dest,
-            options,
-            link_tracker,
-            &metadata,
-            prompter,
-        )?;
-    } else if metadata.is_symlink() {
-        copy_symlink(src, &actual_dest)?;
-    } else if metadata.is_file() {
-        copy_file(src, &actual_dest, options, link_tracker, &metadata)?;
-    } else if let Err(e) = copy_special_file(&actual_dest, &metadata) {
-        crate::error::report_error(src.display(), e);
-    }
-
-    Ok(())
+    // Now that the subtree exists, give the directory its archived attributes.
+    restore_all(&dest, metadata, options)
 }
 
 /// Recreate a special file (FIFO or device node) at `dest`.
@@ -520,7 +398,7 @@ fn copy_path_to_dest(
 /// recreated and are reported as an unsupported type. The error message is
 /// context-free; the caller adds the pathname via `report_error`.
 #[cfg(unix)]
-fn copy_special_file(dest: &Path, metadata: &fs::Metadata) -> PaxResult<()> {
+fn copy_special_file(dest: &Path, metadata: &fs::Metadata, options: &CopyOptions) -> PaxResult<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::FileTypeExt;
@@ -563,18 +441,30 @@ fn copy_special_file(dest: &Path, metadata: &fs::Metadata) -> PaxResult<()> {
         )));
     }
 
-    Ok(())
+    // mkfifo and mknod both apply the process umask, so the mode they were
+    // given is not necessarily the mode on disk; and neither carries ownership
+    // or times. Extraction restores all three here, so a copy must too.
+    restore_all(dest, metadata, options)
 }
 
 #[cfg(not(unix))]
-fn copy_special_file(_dest: &Path, _metadata: &fs::Metadata) -> PaxResult<()> {
+fn copy_special_file(
+    _dest: &Path,
+    _metadata: &fs::Metadata,
+    _options: &CopyOptions,
+) -> PaxResult<()> {
     Err(PaxError::InvalidFormat(gettextrs::gettext(
         "unsupported file type",
     )))
 }
 
 /// Copy a symlink
-fn copy_symlink(src: &Path, dest: &Path) -> PaxResult<()> {
+fn copy_symlink(
+    src: &Path,
+    dest: &Path,
+    metadata: &fs::Metadata,
+    options: &CopyOptions,
+) -> PaxResult<()> {
     let target = fs::read_link(src)?;
 
     // Remove existing file if present
@@ -593,7 +483,7 @@ fn copy_symlink(src: &Path, dest: &Path) -> PaxResult<()> {
             .or_else(|_| std::os::windows::fs::symlink_dir(&target, dest))?;
     }
 
-    Ok(())
+    restore_symlink_attrs(dest, metadata, options)
 }
 
 /// Copy a regular file
@@ -620,7 +510,13 @@ fn copy_file(
     }
 
     // Check if this is a hard link to a file we already copied
-    if let Some(link_target) = link_tracker.check(src, dest)? {
+    // The caller already stat'd this file, so pass the ids straight through.
+    if let Some(link_target) = link_tracker.check_ids(
+        metadata.dev(),
+        metadata.ino(),
+        metadata.nlink() as u32,
+        dest,
+    ) {
         // Create hard link to the already-copied file
         if dest.exists() {
             fs::remove_file(dest)?;
@@ -699,59 +595,127 @@ fn set_permissions(path: &Path, metadata: &fs::Metadata, options: &CopyOptions) 
     Ok(())
 }
 
-/// Set file modification time
+/// Restore access and modification times on a copied file.
+///
+/// POSIX describes a copy as behaving "as if the copied files were written to a
+/// pax format archive file and then subsequently extracted", so this has to
+/// match what extraction does: the two times are independent, each is preserved
+/// only when its `-p` flag says so, and both carry nanoseconds. The previous
+/// implementation called `utimes` with the source *mtime* in both slots and
+/// `tv_usec: 0`, so it overwrote the destination's access time with an
+/// unrelated value and discarded all sub-second precision.
+#[cfg(unix)]
 fn set_times(path: &Path, metadata: &fs::Metadata, options: &CopyOptions) -> PaxResult<()> {
-    if !options.preserve_mtime {
+    if !options.preserve_mtime && !options.preserve_atime {
         return Ok(());
     }
 
-    #[cfg(unix)]
-    {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-
-        let mtime = metadata.mtime();
-
-        let path_cstr = CString::new(path.as_os_str().as_bytes())
-            .map_err(|_| PaxError::InvalidHeader("path contains null".to_string()))?;
-
-        let times = [
-            libc::timeval {
-                tv_sec: mtime as libc::time_t,
-                tv_usec: 0,
-            },
-            libc::timeval {
-                tv_sec: mtime as libc::time_t,
-                tv_usec: 0,
-            },
-        ];
-
-        unsafe {
-            libc::utimes(path_cstr.as_ptr(), times.as_ptr());
+    let atime = if options.preserve_atime {
+        libc::timespec {
+            tv_sec: metadata.atime() as libc::time_t,
+            tv_nsec: metadata.atime_nsec() as _,
         }
-    }
+    } else {
+        // Leave this one as the filesystem set it at creation.
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        }
+    };
+    let mtime = if options.preserve_mtime {
+        libc::timespec {
+            tv_sec: metadata.mtime() as libc::time_t,
+            tv_nsec: metadata.mtime_nsec() as _,
+        }
+    } else {
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        }
+    };
 
+    utimensat_nofollow(path, [atime, mtime])
+}
+
+/// `utimensat` on the path itself, never on a symlink's target.
+#[cfg(unix)]
+fn utimensat_nofollow(path: &Path, times: [libc::timespec; 2]) -> PaxResult<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path_cstr = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| PaxError::InvalidHeader("path contains null".to_string()))?;
+    let r = unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            path_cstr.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if r != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
     Ok(())
 }
 
-/// Read file list from stdin (one path per line)
-pub fn read_file_list<R: std::io::Read>(reader: R) -> PaxResult<Vec<PathBuf>> {
-    use std::io::BufRead;
+#[cfg(not(unix))]
+fn set_times(_path: &Path, _metadata: &fs::Metadata, _options: &CopyOptions) -> PaxResult<()> {
+    Ok(())
+}
 
-    let reader = std::io::BufReader::new(reader);
-    let mut files = Vec::new();
+/// Restore ownership, when `-p o`/`-p e` asked for it and the process can.
+///
+/// Copy mode had no equivalent of this at all, so `-p o` and `-p e` were silent
+/// no-ops there. Ownership must be restored before the mode, because chown
+/// clears the set-user-ID and set-group-ID bits.
+#[cfg(unix)]
+fn set_owner(path: &Path, metadata: &fs::Metadata, options: &CopyOptions) -> PaxResult<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
 
-    for line in reader.lines() {
-        let line = line?;
-        // `lines()` already strips the trailing newline. Keep the rest verbatim
-        // so pathnames with leading/trailing spaces survive; skip only a wholly
-        // empty line (e.g. a trailing blank line).
-        if !line.is_empty() {
-            files.push(PathBuf::from(line));
-        }
+    if !options.preserve_owner {
+        return Ok(());
     }
 
-    Ok(files)
+    let path_cstr = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| PaxError::InvalidHeader("path contains null".to_string()))?;
+    let r = unsafe {
+        libc::fchownat(
+            libc::AT_FDCWD,
+            path_cstr.as_ptr(),
+            metadata.uid(),
+            metadata.gid(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    // Best effort: only a sufficiently privileged process can give a file away,
+    // and failing to is not a reason to fail the copy.
+    let _ = r;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_owner(_path: &Path, _metadata: &fs::Metadata, _options: &CopyOptions) -> PaxResult<()> {
+    Ok(())
+}
+
+/// Owner, then mode, then times -- the order extraction uses.
+fn restore_all(path: &Path, metadata: &fs::Metadata, options: &CopyOptions) -> PaxResult<()> {
+    set_owner(path, metadata, options)?;
+    set_permissions(path, metadata, options)?;
+    set_times(path, metadata, options)
+}
+
+/// Same, for a symlink: its mode is meaningless and `fchmodat(AT_SYMLINK_NOFOLLOW)`
+/// is not portable, so only owner and times are restored.
+fn restore_symlink_attrs(
+    path: &Path,
+    metadata: &fs::Metadata,
+    options: &CopyOptions,
+) -> PaxResult<()> {
+    set_owner(path, metadata, options)?;
+    set_times(path, metadata, options)
 }
 
 #[cfg(test)]
@@ -775,9 +739,12 @@ mod tests {
             ..Default::default()
         };
 
-        copy_files(&[src_file], dest_dir.path(), &options).unwrap();
+        copy_files(std::slice::from_ref(&src_file), dest_dir.path(), &options).unwrap();
 
-        let dest_file = dest_dir.path().join("test.txt");
+        // An absolute operand is stored under its path with the leading slash
+        // removed, exactly as an archive would record it, so that is where it
+        // is restored beneath the destination.
+        let dest_file = dest_dir.path().join(member_name(&src_file));
         assert!(dest_file.exists());
         assert_eq!(fs::read_to_string(&dest_file).unwrap(), "hello world");
     }
@@ -795,9 +762,9 @@ mod tests {
 
         let options = CopyOptions::default();
 
-        copy_files(&[subdir], dest_dir.path(), &options).unwrap();
+        copy_files(std::slice::from_ref(&subdir), dest_dir.path(), &options).unwrap();
 
-        let copied_subdir = dest_dir.path().join("subdir");
+        let copied_subdir = dest_dir.path().join(member_name(&subdir));
         assert!(copied_subdir.is_dir());
         assert_eq!(
             fs::read_to_string(copied_subdir.join("file1.txt")).unwrap(),
@@ -818,8 +785,9 @@ mod tests {
         let src_file = src_dir.path().join("test.txt");
         fs::write(&src_file, "new content").unwrap();
 
-        // Create existing dest file
-        let dest_file = dest_dir.path().join("test.txt");
+        // Create existing dest file at the member path the copy will target.
+        let dest_file = dest_dir.path().join(member_name(&src_file));
+        fs::create_dir_all(dest_file.parent().unwrap()).unwrap();
         fs::write(&dest_file, "existing content").unwrap();
 
         let options = CopyOptions {
@@ -848,9 +816,9 @@ mod tests {
 
         let options = CopyOptions::default();
 
-        copy_files(&[src_link], dest_dir.path(), &options).unwrap();
+        copy_files(std::slice::from_ref(&src_link), dest_dir.path(), &options).unwrap();
 
-        let dest_link = dest_dir.path().join("link.txt");
+        let dest_link = dest_dir.path().join(member_name(&src_link));
         assert!(dest_link.symlink_metadata().unwrap().is_symlink());
         assert_eq!(
             fs::read_link(&dest_link).unwrap().to_str().unwrap(),

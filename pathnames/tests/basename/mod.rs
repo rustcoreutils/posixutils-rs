@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, TestPlan};
+use plib::testing::{os_bytes, run_test, run_test_os, TestPlan, TestPlanOs};
 
 #[test]
 fn basename_basic() {
@@ -142,5 +142,39 @@ fn basename_newline_is_error() {
         expected_out: String::new(),
         expected_err: String::from("basename: result contains a newline character\n"),
         expected_exit_code: 1,
+    });
+}
+
+/// A pathname operand is a byte string, not a character string, so `basename`
+/// must pass through bytes that are not valid UTF-8 (#B4).
+///
+/// `TestPlan::args` is `Vec<String>` and cannot express such an operand, which
+/// is why this box sat open as "code path is byte-clean; explicit test
+/// deferred". `TestPlanOs` takes `OsString` arguments and compares output
+/// byte-exactly — a lossy comparison would mask the very corruption being
+/// tested for.
+#[test]
+fn basename_non_utf8_operand() {
+    // 0xFF and 0xFE are not valid UTF-8 in any position.
+    run_test_os(TestPlanOs {
+        cmd: String::from("basename"),
+        args: vec![os_bytes(b"/tmp/\xff\xfename")],
+        stdin_data: Vec::new(),
+        expected_out: b"\xff\xfename\n".to_vec(),
+        expected_err: Vec::new(),
+        expected_exit_code: 0,
+    });
+}
+
+/// The suffix operand must be byte-compared too, not UTF-8-decoded.
+#[test]
+fn basename_non_utf8_suffix() {
+    run_test_os(TestPlanOs {
+        cmd: String::from("basename"),
+        args: vec![os_bytes(b"/tmp/file\xff\xfe"), os_bytes(b"\xff\xfe")],
+        stdin_data: Vec::new(),
+        expected_out: b"file\n".to_vec(),
+        expected_err: Vec::new(),
+        expected_exit_code: 0,
     });
 }

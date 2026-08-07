@@ -7,7 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, run_test_with_checker, TestPlan};
+use super::common::{run_test, run_test_with_checker};
+use plib::testing::TestPlan;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Output;
@@ -402,4 +403,242 @@ fn admin_m_with_v_flag() {
 
     let content = fs::read_to_string(&sfile).unwrap();
     assert!(content.contains("BUG42"), "MR number should be recorded");
+}
+
+use super::common::run_in;
+
+/// Create `s.<name>` in `dir` from `content`, returning its path.
+fn admin_create(dir: &std::path::Path, name: &str, content: &str) -> PathBuf {
+    let sname = format!("s.{name}");
+    let out = run_in("admin", &["-i", &sname], dir, content);
+    assert!(
+        out.status.success(),
+        "admin -i failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    dir.join(sname)
+}
+
+/// #A1: SCCS option-arguments are **attached**, so `-i` takes its value as
+/// `-iname`. In the separated form `-i name`, `name` is an operand — and an
+/// operand that is not an s-file is an error.
+///
+/// CSSC 1.4.1 reads it the same way (it reports "The 'i' keyletter can't be
+/// used with multiple files"), so this pins the interpretation rather than a
+/// particular wording.
+#[test]
+fn admin_i_option_argument_must_be_attached() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("src.txt"), b"seed content\n").unwrap();
+
+    // Attached: the file supplies the initial body.
+    let out = run_in("admin", &["-isrc.txt", "s.attached"], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "admin -isrc.txt failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(tmp.path().join("s.attached").exists());
+
+    let out = run_in("get", &["-p", "-s", "s.attached"], tmp.path(), "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "seed content\n",
+        "the attached form must take the body from the named file"
+    );
+
+    // Separated: `src.txt` becomes an operand and is rejected as a non-s-file.
+    let out = run_in("admin", &["-i", "src.txt", "s.separated"], tmp.path(), "");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "the separated form must be an error"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("src.txt"),
+        "the offending operand should be named: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// #A2: an unrecognized `-f` flag letter is rejected. `Z` is not an SCCS flag
+/// and `4` is not a flag at all, so both must be diagnosed rather than
+/// silently stored — otherwise a typo would set a flag nothing consults.
+#[test]
+fn admin_rejects_unrecognized_flags() {
+    let tmp = TempDir::new().unwrap();
+    let s = admin_create(tmp.path(), "flags", "body\n");
+    let sname = s.file_name().unwrap().to_str().unwrap();
+
+    for bad in ["-fZ", "-f4"] {
+        let out = run_in("admin", &[bad, sname], tmp.path(), "");
+        assert_eq!(out.status.code(), Some(1), "{bad} must be rejected");
+        assert!(!out.stderr.is_empty(), "a diagnostic is required for {bad}");
+    }
+
+    // Real flags still work, so the check is not simply rejecting every -f.
+    for good in ["-fb", "-fj", "-fn"] {
+        let out = run_in("admin", &[good, sname], tmp.path(), "");
+        assert!(
+            out.status.success(),
+            "{good} should be accepted: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// #A3/#A4: a directory operand expands to the s-files it contains, and a lone
+/// `-` reads the pathname list from standard input.
+#[test]
+fn admin_directory_and_stdin_operands() {
+    // Directory.
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir(&dir).unwrap();
+    let s = admin_create(tmp.path(), "indir", "body\n");
+    std::fs::rename(&s, dir.join("s.indir")).unwrap();
+
+    let out = run_in("admin", &["-fb", "proj"], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "admin <dir> failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = run_in("prs", &["-d:FL:", "proj/s.indir"], tmp.path(), "");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("branch"),
+        "the flag should have been set on the file inside the directory: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // `-` stdin list.
+    let tmp2 = TempDir::new().unwrap();
+    admin_create(tmp2.path(), "viastdin", "body\n");
+    let out = run_in("admin", &["-fj", "-"], tmp2.path(), "s.viastdin\n");
+    assert!(
+        out.status.success(),
+        "admin - failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = run_in("prs", &["-d:FL:", "s.viastdin"], tmp2.path(), "");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("joint edit"),
+        "the flag should have been set via the stdin list: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// `-a` adds an authorized user, `-e` erases one, and `-d` deletes a flag —
+/// a round trip through the s-file's header.
+#[test]
+fn admin_user_list_and_flag_round_trip() {
+    let tmp = TempDir::new().unwrap();
+    let s = admin_create(tmp.path(), "rt", "body\n");
+    let sname = s.file_name().unwrap().to_str().unwrap();
+
+    let read_kw = |kw: &str| -> String {
+        let out = run_in("prs", &[&format!("-d:{kw}:"), sname], tmp.path(), "");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    // Empty user list reads as "none".
+    assert_eq!(read_kw("UN"), "none", "a fresh file has no user list");
+
+    let out = run_in("admin", &["-atestuser", sname], tmp.path(), "");
+    assert!(out.status.success());
+    assert_eq!(read_kw("UN"), "testuser", "-a must add the user");
+
+    let out = run_in("admin", &["-etestuser", sname], tmp.path(), "");
+    assert!(out.status.success());
+    assert_eq!(read_kw("UN"), "none", "-e must remove the user");
+
+    // Flags: set then delete.
+    let out = run_in("admin", &["-fn", sname], tmp.path(), "");
+    assert!(out.status.success());
+    assert!(
+        read_kw("FL").contains("null delta"),
+        "-fn must set the flag"
+    );
+
+    let out = run_in("admin", &["-dn", sname], tmp.path(), "");
+    assert!(out.status.success());
+    assert!(
+        !read_kw("FL").contains("null delta"),
+        "-dn must delete the flag"
+    );
+}
+
+/// `-h` audits the stored checksum and `-z` recomputes it. Deliberately
+/// corrupting the body must make `-h` fail, and `-z` must then make it pass
+/// again — the pair is what makes either meaningful.
+///
+/// Cross-checked against CSSC 1.4.1, which reports the identical stored and
+/// computed values for the same corruption.
+#[test]
+fn admin_checksum_audit_and_recompute() {
+    let tmp = TempDir::new().unwrap();
+    let s = admin_create(tmp.path(), "sum", "body line\n");
+    let sname = s.file_name().unwrap().to_str().unwrap();
+
+    // A freshly written file passes the audit.
+    let out = run_in("admin", &["-h", sname], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "-h on an intact file should pass: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Corrupt the body without touching the stored checksum.
+    let mut perms = fs::metadata(&s).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(false);
+    fs::set_permissions(&s, perms).unwrap();
+    let mut data = fs::read(&s).unwrap();
+    let at = data
+        .windows(4)
+        .position(|w| w == b"body")
+        .expect("body text must be present");
+    data[at..at + 4].copy_from_slice(b"XXXX");
+    fs::write(&s, &data).unwrap();
+
+    let out = run_in("admin", &["-h", sname], tmp.path(), "");
+    assert_eq!(out.status.code(), Some(1), "-h must detect the corruption");
+    assert!(!out.stderr.is_empty(), "a checksum diagnostic is required");
+
+    // -z recomputes, after which the audit passes again.
+    let out = run_in("admin", &["-z", sname], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "-z failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = run_in("admin", &["-h", sname], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "-h must pass after -z recomputes the checksum"
+    );
+}
+
+/// A body with no `%X%` keyword draws the "No id keywords" warning on stderr,
+/// but is not an error.
+#[test]
+fn admin_warns_when_the_body_has_no_id_keywords() {
+    let tmp = TempDir::new().unwrap();
+
+    let out = run_in("admin", &["-i", "s.nokw"], tmp.path(), "plain text\n");
+    assert!(out.status.success(), "the warning must not be fatal");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("No id keywords"),
+        "expected the warning, got {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // With a keyword present there is no such warning.
+    let out = run_in("admin", &["-i", "s.withkw"], tmp.path(), "%W%\ntext\n");
+    assert!(out.status.success());
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("No id keywords"),
+        "a body containing %W% must not draw the warning: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

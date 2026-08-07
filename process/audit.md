@@ -91,12 +91,44 @@ found) for the utility-launcher family (`env`, `nice`, `nohup`, `timeout`,
 exec error through `main() -> Result<…>`'s `?`, so Rust's default harness prints
 the error and exits **1** for every case (see `#E1`, `#NC2`).
 
+### `#C4` — utility-wrappers rejected the utility's own options *(found 2026-08-06)*
+
+**Critical, and it made three of the five wrappers unusable for most real
+commands.** `env`, `nice` and `timeout` all take a utility plus its arguments as
+trailing operands. Only `xargs` and `nohup` declared that operand list in a way
+clap could handle; the other three let clap try to parse the *utility's* first
+hyphenated argument as one of their own options:
+
+    $ timeout 5 ls -l          -> timeout: unexpected argument found
+    $ env sh -c 'echo hi'      -> error: unexpected argument '-c' found
+    $ nice ls -l               -> error: unexpected argument '-c' found
+
+`timeout` already had `trailing_var_arg = true`, which is why this looked
+handled; on its own that flag does not stop clap from matching a leading-hyphen
+token against the command's own options. `allow_hyphen_values = true` is the
+part that was missing. XBD 12.2 Guideline 9 puts all of a utility's options
+before its operands, so once DURATION/UTILITY (or the `name=value` list and the
+utility) have been consumed, every remaining token belongs to the utility.
+
+- [x] **`#C4`** ✓ fixed 2026-08-06 in `process/timeout.rs`, `process/env.rs`,
+  `process/nice.rs` — and in `datetime/time.rs`, which had the identical defect
+  (see `datetime/audit.md`). Regression tests
+  `test_utility_arguments_may_start_with_a_hyphen`,
+  `test_utility_option_colliding_with_timeouts_own_is_passed_through`, and
+  `test_timeouts_own_options_still_parse_before_operands` — the last so the fix
+  cannot be "stop parsing options at all".
+
+  Worth noting how this survived: every existing wrapper test invoked a utility
+  with **no options** (`true`, `false`, `echo hi`, or a helper `.sh` script), so
+  a suite of 132 process tests plus a full audit pass never once exercised the
+  common case.
+
 ---
 
 ## `env`
 
 **Implementation:** `process/env.rs` (116 lines)
-**Tests:** none (no `process/tests/env/`)
+**Tests:** `process/tests/env/mod.rs` (12 tests; none existed at audit time)
 **Spec:** POSIX.1-2024, Vol. 3 §3, `env` (slice lines 94028–94100)
 
 ### TL;DR
@@ -105,7 +137,9 @@ Core behavior is correct: inherit env, `-i` clear, `name=value` merge, utility
 exec with the modified environment, and the no-utility stdout dump. One genuine
 Critical: exec failures never produce exit 126/127 (always 1). The clap layer
 leaks a non-POSIX `--ignore-env` long option and intercepts `--help`/`--version`.
-No tests exist.
+No tests exist. *(As of 2026-08-06: #E1 is fixed — `env.rs:114` routes exec
+failures through `plib::exec::exec_error_exit`, which maps `NotFound` → 127 and
+everything else → 126 (`plib/src/exec.rs:37-48`) — and 12 tests now exist.)*
 
 ### Priority issues
 
@@ -151,16 +185,18 @@ No tests exist.
 | `--` end-of-options | CONFORMS | clap default |
 | `-` operand (unspecified) | N/A | spec 94038 leaves it unspecified |
 | EXIT 0 / utility status | CONFORMS | `exec` replaces image |
-| EXIT 126 / 127 | MISSING | `#E1` |
+| EXIT 126 / 127 | CONFORMS | `#E1` fixed — `env.rs:114` → `plib::exec::exec_error_exit` (`plib/src/exec.rs:37-48`) |
 | ASYNCHRONOUS EVENTS | CONFORMS | "Default"; no handlers needed |
 | STDERR i18n | PARTIAL | `#C1` |
 | `setlocale`/`textdomain` | CONFORMS | `env.rs:100-102` |
 
-### Test coverage signal (none today)
-- [ ] no-arg dump; `-i` empties; `-i FOO=bar` exact; `name=value` override
-- [ ] `env /nonexistent` → 127; `env /etc/passwd` (non-exec) → 126 (proves `#E1`)
-- [ ] `--` delimiter; `A=B` after utility name treated as utility arg
-- [ ] exit-status passthrough
+### Test coverage signal
+*(Header read "(none today)" until 2026-08-06; `tests/env/mod.rs` has 12 tests.)*
+- [x] `-i FOO=bar` exact (`env_ignore_single`); `-i` dump sorted (`env_ignore_sorted`, `#E4`); `name=value` override (`env_ignore_override`); `=` inside a value (`env_value_with_equals`).
+- [x] `env /nonexistent` → 127 (`env_not_found`); non-executable → 126 (`env_not_executable`) — both prove `#E1`.
+- [x] `--` delimiter (`env_double_dash`); an operand whose name part is invalid is the utility, not an assignment (`env_invalid_name_is_utility`, `#E5`).
+- [x] exit-status passthrough (`env_status_passthrough_true`/`_false`).
+- [x] Bare `env` dumps the inherited environment (`env_no_operand_dumps_inherited_environment`); bare `env -i` prints nothing (`env_ignore_with_no_assignments_prints_nothing`).
 
 ---
 
@@ -313,16 +349,17 @@ items remain (i18n, list-format, a `-l -opt` edge case).
 | i18n diagnostics | PARTIAL | `#C1` |
 
 ### Test coverage signal
-Strong (delivery, `-l` numeric/128+N, signal 0, `--`, multiple pids). Gaps:
-- [ ] `-l` exact `%s%c` format; actual negative-pid (process-group) delivery
-- [ ] `-l -s …` edge case (proves `#K2`)
+Strong — 25 tests (delivery, `-l` numeric/128+N, signal 0, `--`, multiple pids). Gaps:
+- [x] `-l` `%s%c` format — `test_list_all_signals_uses_posix_separator_format` (uppercase, no `SIG` prefix, trailing newline) and `test_list_exit_status_prints_one_name_and_newline` for the `"%s\n"` form.
+- [x] Negative-pid **delivery** — `test_negative_pid_signals_the_process_group` puts a child in its own session via `setsid()` in `pre_exec` (so its pgid is its pid, and no other test's children can be caught) and asserts the member dies. `test_negative_pid_after_positive_needs_no_dash_dash` covers the spec's own EXAMPLE form (101599-101601), where a non-leading negative operand needs no `--`.
+- [x] `-l -s …` edge case (`test_list_option_does_not_consume_a_following_option`, proves `#K2`).
 
 ---
 
 ## `nice`
 
 **Implementation:** `process/nice.rs` (70 lines)
-**Tests:** none
+**Tests:** `process/tests/nice/mod.rs` (7 tests; none existed at audit time)
 **Spec:** POSIX.1-2024, Vol. 3 §3, `nice` (slice lines 108426–108540)
 
 ### TL;DR
@@ -368,22 +405,22 @@ nice value — and the increment is artificially clamped to `[-30, 29]` by clap.
 | `utility [argument…]` exec | CONFORMS | `nice.rs:44-51` |
 | Failed nice still execs utility | DIVERGES | `#NC1` |
 | EXIT utility status | CONFORMS (success path) | `exec` replaces image |
-| EXIT 126 / 127 | MISSING | `#NC2` |
+| EXIT 126 / 127 | CONFORMS | `#NC2` fixed — `nice.rs:84` → `exec_error_exit`; proved by `nice_not_found`/`nice_not_executable` |
 | `setlocale`/`textdomain` | CONFORMS | `nice.rs:54-56` |
 | i18n diagnostics | PARTIAL | `#C1` |
 | ASYNCHRONOUS EVENTS | CONFORMS | "Default" |
 
-### Test coverage signal (none today)
-- [ ] default increment runs; `-n 5` applied; unprivileged negative increment
-  still execs (proves `#NC1`); `nonexistent`→127; non-exec file→126;
-  `-n 40` accepted (proves `#NC3`)
+### Test coverage signal
+*(Header read "(none today)" until 2026-08-06; `tests/nice/mod.rs` has 7 tests
+covering every item this box listed.)*
+- [x] default increment runs (`nice_default_runs`); `-n 5` applied (`nice_positive_increment`); unprivileged negative increment still execs (`nice_negative_increment_still_runs`, proves `#NC1`); `nonexistent`→127 (`nice_not_found`); non-exec→126 (`nice_not_executable`); large increment accepted (`nice_large_increment_accepted`, proves `#NC3`); status passthrough (`nice_status_passthrough`).
 
 ---
 
 ## `nohup`
 
 **Implementation:** `process/nohup.rs` (145 lines)
-**Tests:** none
+**Tests:** `process/tests/nohup/mod.rs` (5 tests; none existed at audit time)
 **Spec:** POSIX.1-2024, Vol. 3 §3, `nohup` (slice lines 108886–108996)
 
 ### TL;DR
@@ -443,18 +480,20 @@ instead of the controlled error path.
 | File-open failure handling | DIVERGES (panic) | `#NH4` |
 | i18n diagnostics | PARTIAL | `#C1` |
 
-### Test coverage signal (none today)
-- [ ] stdout-tty → nohup.out created mode 0600 in cwd (proves `#NH1`)
-- [ ] cwd unwritable → `$HOME/nohup.out` honoring a set `$HOME` (proves `#NH2`)
-- [ ] stdout=pipe, stderr=tty → stderr follows stdout fd (proves `#NH3`)
-- [ ] SIGHUP ignored in child; not-found→127; non-exec→126; status passthrough
+### Test coverage signal
+*(Header read "(none today)" until 2026-08-06; `tests/nohup/mod.rs` has 5 tests
+and allocates a real PTY via `libc::openpty` at `:95`.)*
+- [x] stdout-tty → nohup.out created mode 0600 in cwd (`nohup_out_created_mode_0600`, proves `#NH1`)
+- [x] SIGHUP ignored in child (`nohup_sighup_ignored_in_child`); not-found→127 (`nohup_not_found`); non-exec→126 (`nohup_not_executable`); status passthrough (`nohup_status_passthrough`)
+- [x] cwd unwritable → `$HOME/nohup.out` honoring a set `$HOME` (`nohup_out_falls_back_to_home_when_cwd_is_unwritable`, proves `#NH2`; also asserts the fallback file is 0600). Self-skips under root, which ignores the write bit.
+- [x] stdout=pipe, stderr=tty → stderr follows stdout fd (`nohup_stderr_follows_stdout_when_stdout_is_not_a_terminal`, proves `#NH3`; also asserts no `nohup.out` is created).
 
 ---
 
 ## `renice`
 
 **Implementation:** `process/renice.rs` (137 lines) + `plib::priority`
-**Tests:** none
+**Tests:** `process/tests/renice/mod.rs` (7 tests; none existed at audit time)
 **Spec:** POSIX.1-2024, Vol. 3 §3, `renice` (slice lines 113200–113330)
 
 ### TL;DR
@@ -506,14 +545,14 @@ rejected; and the `-n` range excludes `+20`.
 | `ID...` (≥1) | DIVERGES | `#RN1` |
 | ID `0` accepted | DIVERGES | `#RN3` |
 | clamp to PRIO_MIN/MAX | CONFORMS | `renice.rs:131` |
-| per-ID continue + EXIT >0 | MISSING | `#RN2` |
+| per-ID continue + EXIT >0 | CONFORMS | `#RN2` fixed — `renice.rs:131,138` continue past a failed ID, `:149` exits `diag::exit_status()`; proved by `renice_partial_failure_continues` |
 | EXIT 0 success | CONFORMS | `renice.rs:136` |
 | i18n diagnostics | PARTIAL | `#C1` |
 
-### Test coverage signal (none today)
-- [ ] single PID; multiple PIDs in one call (proves `#RN1`); `-g`; `-u name`;
-  `-u 0`; partial-failure continuation (proves `#RN2`); `-n 20` accepted
-  (proves `#RN4`); ID `0` accepted (proves `#RN3`)
+### Test coverage signal
+*(Header read "(none today)" until 2026-08-06; `tests/renice/mod.rs` has 7 tests.)*
+- [x] multiple PIDs in one call (`renice_multiple_ids`, proves `#RN1`); partial-failure continuation (`renice_partial_failure_continues`, proves `#RN2`); `+20` accepted (`renice_range_plus_twenty`, proves `#RN4`); ID `0` accepted (`renice_id_zero_accepted`, proves `#RN3`); unknown user (`renice_unknown_user`); invalid id; missing increment.
+- [x] `-g` (`renice_group_id_type_is_applied`, against a dedicated process group created with `setsid()` so concurrent test children cannot race it, plus `renice_unknown_group_fails`) and `-u name` (`renice_user_id_type_accepts_a_name`, resolving our own login name through the passwd database).
 
 ---
 
@@ -588,10 +627,10 @@ forwarded where the spec says any terminate-default signal must be.
 | i18n diagnostics | PARTIAL | `#C1` |
 
 ### Test coverage signal
-Broad (124/125/126/127, suffixes, `-p`/`-f`, kill). Gaps:
-- [ ] sub-second duration precision (proves `#T1`); `-k` fractional time
-- [ ] child inherits ignored SIGTTIN/SIGTTOU (proves `#T2`)
-- [ ] forwarding SIGUSR1/SIGPIPE to the timeout process (proves `#T3`)
+Broad — 31 tests (124/125/126/127, suffixes, `-p`/`-f`, kill). Gaps:
+- [x] sub-second duration precision (`test_fractional_duration_times_out`, `test_fractional_duration_suffix_times_out`, proves `#T1`); `-k` fractional time (`test_fractional_kill_after`).
+- [x] child inherits ignored SIGTTIN/SIGTTOU (`test_child_inherits_ignored_sigttin_sigttou`, proves `#T2`; reads the child's own `/proc/self/status` `SigIgn` mask, paired with `test_child_does_not_inherit_ignored_sigttin_when_parent_does_not` so it cannot pass for an implementation that ignores them unconditionally). Linux-gated on `/proc`.
+- [x] forwarding SIGUSR1/SIGPIPE (`test_forwards_sigusr1_to_the_child`, `test_forwards_sigpipe_to_the_child`, prove `#T3`; the child traps the signal and prints a marker, so the assertion is on forwarding rather than on the child merely dying).
 
 ---
 
@@ -670,10 +709,10 @@ byte-to-`char` cast in the word-splitter corrupts multibyte UTF-8 arguments.
 | i18n diagnostics | PARTIAL | `#C1` |
 
 ### Test coverage signal
-Broad (n/s/L/I/E/0/x, quoting, escapes, 126/127/255). Gaps:
-- [ ] `-r` + empty input invoke-once (proves `#X1`; fix `xargs_empty_input`)
-- [ ] multibyte UTF-8 argument round-trip (proves `#X2`); newline-in-quotes error
-- [ ] `-E` + `-I` interaction (proves `#X4`)
+Broad — 41 tests (n/s/L/I/E/0/x, quoting, escapes, 126/127/255). Gaps:
+- [x] `-r` + empty input (`xargs_empty_input_no_run_if_empty`), plus the no-`-r` invoke-once cases (`xargs_empty_input_runs_once`, `xargs_blank_input_runs_once`, `xargs_whitespace_only_input`) — proves `#X1`.
+- [x] multibyte UTF-8 argument round-trip (`xargs_utf8_argument`, `xargs_utf8_multiple`, proves `#X2`); newline-in-quotes error (`xargs_newline_in_quote_errors`, `#X3`).
+- [x] `-E` + `-I` interaction (`xargs_eof_string_honored_in_insert_mode`, proves `#X4`), paired with `xargs_insert_mode_without_matching_eof_string_processes_all_lines` so a premature stop for any other reason would not pass.
 
 ---
 

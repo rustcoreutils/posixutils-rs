@@ -56,6 +56,26 @@ pub fn run_pax_with_stdin_bytes(args: &[&str], stdin_data: &[u8]) -> Output {
     child.wait_with_output().expect("Failed to wait for pax")
 }
 
+/// Run pax with raw stdin bytes, in a specific directory. Extraction targets
+/// the working directory, so a test that feeds a hand-built archive to `-r`
+/// needs both at once.
+pub fn run_pax_with_stdin_bytes_in_dir(args: &[&str], stdin_data: &[u8], dir: &Path) -> Output {
+    use std::process::Stdio;
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_pax"));
+    cmd.args(args)
+        .current_dir(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().expect("Failed to spawn pax");
+    if let Some(ref mut stdin) = child.stdin {
+        stdin.write_all(stdin_data).expect("Failed to write stdin");
+    }
+
+    child.wait_with_output().expect("Failed to wait for pax")
+}
+
 /// Run pax with given arguments in a specific directory
 pub fn run_pax_in_dir(args: &[&str], dir: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_pax"))
@@ -150,6 +170,30 @@ pub fn assert_failure(output: &Output, context: &str) {
         context,
         String::from_utf8_lossy(&output.stdout)
     );
+}
+
+/// Assert the command exited with exactly `code`. `assert_failure` only
+/// distinguishes zero from non-zero; POSIX pins specific statuses, and a
+/// process killed by a signal (a panic reaching abort) has no code at all --
+/// which this reports as such rather than as a plain inequality.
+pub fn assert_exit_code(output: &Output, code: i32, context: &str) {
+    match output.status.code() {
+        Some(actual) => assert_eq!(
+            actual,
+            code,
+            "{} exited {} (wanted {})\nstderr: {}",
+            context,
+            actual,
+            code,
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        None => panic!(
+            "{} was killed by a signal rather than exiting {}\nstderr: {}",
+            context,
+            code,
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    }
 }
 
 /// Get stdout as string

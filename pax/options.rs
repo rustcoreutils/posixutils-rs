@@ -29,6 +29,10 @@ pub struct ListEntryInfo<'a> {
     pub mode: u32,
     pub size: u64,
     pub mtime: u64,
+    /// Access time, when the archive member carried an `atime` record.
+    pub atime: Option<u64>,
+    /// Change time, when the archive member carried a `ctime` record.
+    pub ctime: Option<u64>,
     pub uid: u32,
     pub gid: u32,
     pub uname: Option<&'a str>,
@@ -87,7 +91,8 @@ pub struct FormatOptions {
     pub delete_patterns: Vec<String>,
     /// Pre-compiled delete patterns for efficient matching
     delete_patterns_compiled: Vec<Pattern>,
-    /// Times option (include atime/mtime in extended headers)
+    /// Times option (include atime/mtime -- and, as an extension, ctime -- in
+    /// extended headers)
     pub include_times: bool,
     /// Linkdata option (write contents for hard links)
     pub link_data: bool,
@@ -470,6 +475,16 @@ fn fmt_device(info: &ListEntryInfo) -> String {
     format!("{},{}", info.devmajor, info.devminor)
 }
 
+/// Bare `%D`. Rule 10: with no keyword to fall back on, a non-device entry
+/// renders as a single <space>.
+fn fmt_device_or_space(info: &ListEntryInfo) -> String {
+    if is_device(info) {
+        fmt_device(info)
+    } else {
+        " ".to_string()
+    }
+}
+
 fn fmt_size(info: &ListEntryInfo) -> String {
     info.size.to_string()
 }
@@ -478,8 +493,10 @@ fn fmt_mtime_trad(info: &ListEntryInfo) -> String {
     format_time_traditional(info.mtime)
 }
 
-fn fmt_mtime_iso(info: &ListEntryInfo) -> String {
-    format_time_iso(info.mtime)
+/// Bare `%T`. Rule 8: the default keyword is mtime and the default subformat is
+/// `%b %e %H:%M %Y`.
+fn fmt_mtime_posix(info: &ListEntryInfo) -> String {
+    strftime_or_secs(info.mtime, DEFAULT_TIME_SUBFORMAT)
 }
 
 fn fmt_username(info: &ListEntryInfo) -> String {
@@ -520,10 +537,10 @@ const FORMAT_SPECIFIERS: &[(char, FormatHandler)] = &[
     ('l', fmt_link_target),
     ('m', fmt_mode_octal),
     ('M', fmt_mode_symbolic),
-    ('D', fmt_device),
+    ('D', fmt_device_or_space),
     ('s', fmt_size),
     ('t', fmt_mtime_trad),
-    ('T', fmt_mtime_iso),
+    ('T', fmt_mtime_posix),
     ('u', fmt_username),
     ('g', fmt_groupname),
     ('U', fmt_uid),
@@ -582,8 +599,9 @@ fn unescape_backslashes(s: &str) -> String {
 /// - `%m` - permission mode (octal)
 /// - `%M` - permission mode (symbolic like ls -l)
 /// - `%s` - file size in bytes
-/// - `%t` - modification time
-/// - `%T` - modification time (ISO format)
+/// - `%t` - modification time, `ls -l` style (extension)
+/// - `%T` - time, default keyword `mtime`, default subformat `%b %e %H:%M %Y`
+/// - `%D` - device of a block/char special file
 /// - `%u` - owner username
 /// - `%g` - group name
 /// - `%U` - owner uid
@@ -685,13 +703,11 @@ fn parse_number(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<
 
 fn format_with_spec(info: &ListEntryInfo, spec: FormatSpec) -> String {
     let mut rendered = if let Some(ref keyword) = spec.keyword {
-        // POSIX `%(keyword)X` substitution. For the `T` time conversion the
-        // keyword may carry an `=subformat` tail; here the keyword names the
-        // time field and the (optional) subformat is currently rendered with
-        // the default time layout.
-        let (kw, _subformat) = keyword.split_once('=').unwrap_or((keyword.as_str(), ""));
-        keyword_value(info, kw.trim(), spec.spec)
-            .unwrap_or_else(|| format!("%({}){}", keyword, spec.spec))
+        match keyword_value(info, keyword, spec.spec) {
+            KeywordValue::Value(v) => v,
+            KeywordValue::Absent => String::new(),
+            KeywordValue::Unknown => format!("%({}){}", keyword, spec.spec),
+        }
     } else if let Some((_, handler)) = FORMAT_SPECIFIERS.iter().find(|(ch, _)| *ch == spec.spec) {
         handler(info)
     } else {
@@ -700,19 +716,24 @@ fn format_with_spec(info: &ListEntryInfo, spec: FormatSpec) -> String {
         literal
     };
 
+    // Width and precision count characters, not bytes: `%.N` is a precision on
+    // the string value, and a byte index would both split a multi-byte
+    // character (`String::truncate` panics on a non-boundary index) and
+    // mis-align a column holding a non-ASCII name.
     if let Some(precision) = spec.precision {
-        if rendered.len() > precision {
-            rendered.truncate(precision);
+        if let Some((byte_idx, _)) = rendered.char_indices().nth(precision) {
+            rendered.truncate(byte_idx);
         }
     }
 
     if let Some(width) = spec.width {
-        if rendered.len() < width {
-            let padding = width - rendered.len();
+        let chars = rendered.chars().count();
+        if chars < width {
+            let padding = " ".repeat(width - chars);
             if spec.left_justify {
-                rendered.push_str(&" ".repeat(padding));
+                rendered.push_str(&padding);
             } else {
-                rendered = format!("{}{}", " ".repeat(padding), rendered);
+                rendered.insert_str(0, &padding);
             }
         }
     }
@@ -720,12 +741,66 @@ fn format_with_spec(info: &ListEntryInfo, spec: FormatSpec) -> String {
     rendered
 }
 
+/// Outcome of resolving a `%(keyword)` listopt substitution.
+enum KeywordValue {
+    /// The keyword resolved to this rendered value.
+    Value(String),
+    /// A keyword we recognize, for which this archive member carried no record
+    /// (an `atime` request against an archive written without `-o times`, say).
+    /// POSIX rule 7 defines the result as the value from the extended header,
+    /// and there is none, so it contributes nothing.
+    Absent,
+    /// Not a keyword we know: the caller echoes the specification literally.
+    Unknown,
+}
+
+/// The seconds value of a time-valued keyword, if this entry carries one.
+/// The outer `Option` distinguishes "not a time keyword" from "no record".
+fn time_keyword(info: &ListEntryInfo, keyword: &str) -> Option<Option<u64>> {
+    match keyword {
+        "mtime" => Some(Some(info.mtime)),
+        "atime" => Some(info.atime),
+        // ctime is not a POSIX keyword (it was removed by
+        // IEEE Std 1003.1-2001/Cor 2-2004 because st_ctime is not a creation
+        // time), but it is written by star/GNU tar and rule 7 admits
+        // implementation extensions, so archives carrying one can be listed.
+        "ctime" => Some(info.ctime),
+        _ => None,
+    }
+}
+
+/// Whether the `D` conversion's device rendering applies to this entry.
+fn is_device(info: &ListEntryInfo) -> bool {
+    matches!(
+        info.entry_type,
+        EntryType::BlockDevice | EntryType::CharDevice
+    )
+}
+
 /// Resolve a POSIX `%(keyword)X` listopt substitution to its rendered value.
 ///
-/// `keyword` is the extended-header keyword named between the parentheses and
-/// `conversion` is the trailing conversion character (`s`, `d`, `T`, `M`, ...).
-/// Returns `None` for an unknown keyword so the caller can echo it literally.
-fn keyword_value(info: &ListEntryInfo, keyword: &str, conversion: char) -> Option<String> {
+/// `field` is the text between the parentheses -- a keyword, optionally with an
+/// `=subformat` tail for the `T` conversion -- and `conversion` is the trailing
+/// conversion character (`s`, `d`, `T`, `M`, ...).
+fn keyword_value(info: &ListEntryInfo, field: &str, conversion: char) -> KeywordValue {
+    // Rule 8: the T conversion character may be preceded by
+    // `(keyword=subformat)`, where subformat is a date format.
+    let (keyword, subformat) = match field.split_once('=') {
+        Some((kw, sub)) => (kw.trim(), sub),
+        None => (field.trim(), DEFAULT_TIME_SUBFORMAT),
+    };
+
+    if let Some(seconds) = time_keyword(info, keyword) {
+        return match seconds {
+            // Only `T` renders a calendar time; s/d yield the raw seconds.
+            Some(secs) if conversion == 'T' => {
+                KeywordValue::Value(strftime_or_secs(secs, subformat))
+            }
+            Some(secs) => KeywordValue::Value(secs.to_string()),
+            None => KeywordValue::Absent,
+        };
+    }
+
     let value = match keyword {
         "path" | "name" => fmt_fullpath(info),
         "size" => info.size.to_string(),
@@ -734,31 +809,25 @@ fn keyword_value(info: &ListEntryInfo, keyword: &str, conversion: char) -> Optio
         "uname" => info.uname.unwrap_or("").to_string(),
         "gname" => info.gname.unwrap_or("").to_string(),
         "linkpath" => info.link_target.unwrap_or("").to_string(),
-        "mtime" => {
-            // The `T` conversion renders a calendar time; any other conversion
-            // (s/d) yields the raw seconds.
-            if conversion == 'T' {
-                format_time_traditional(info.mtime)
-            } else {
-                info.mtime.to_string()
-            }
-        }
-        // atime/ctime are not carried by the listing entry, so leave them
-        // unsupported (echoed literally) rather than aliasing them to mtime.
         "mode" => format!("{:o}", info.mode),
-        _ => return None,
+        _ => return KeywordValue::Unknown,
     };
 
-    // For the mode/device/symlink special conversions, honor the conversion
-    // character even when a keyword was given (e.g. `%(path)F`).
+    // The mode/pathname/symlink conversions describe how to render the entry
+    // rather than which field to read, so they still apply when a keyword was
+    // given (e.g. `%(path)F`).
     let rendered = match conversion {
         'M' => format_mode_symbolic(info.mode, info.entry_type),
         'F' => fmt_fullpath(info),
         'L' => fmt_link_target(info),
-        'D' => fmt_device(info),
+        // Rule 10: D names the device of a block/character special file. When
+        // that does not apply and a keyword was given, it degrades to
+        // `%(keyword)u` -- so `%(size)D` on a regular file prints the size.
+        'D' if is_device(info) => fmt_device(info),
+        'D' => value,
         _ => value,
     };
-    Some(rendered)
+    KeywordValue::Value(rendered)
 }
 
 /// Entry type to file type character mapping for symbolic mode display
@@ -822,7 +891,7 @@ const PERM_TRIPLETS: &[PermTriplet] = &[
 ];
 
 /// Format mode as symbolic string (like ls -l)
-fn format_mode_symbolic(mode: u32, entry_type: EntryType) -> String {
+pub(crate) fn format_mode_symbolic(mode: u32, entry_type: EntryType) -> String {
     let mut s = String::with_capacity(10);
 
     // File type (from entry_type, not mode bits - tar stores type separately)
@@ -849,7 +918,7 @@ fn format_mode_symbolic(mode: u32, entry_type: EntryType) -> String {
 }
 
 /// Format time in traditional ls -l style
-fn format_time_traditional(mtime: u64) -> String {
+pub(crate) fn format_time_traditional(mtime: u64) -> String {
     // POSIX `ls -l`-style time, formatted via libc strftime (localtime_r), so TZ
     // and LC_TIME take effect: date+time when recent, date+year otherwise.
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -866,9 +935,15 @@ fn format_time_traditional(mtime: u64) -> String {
     plib::locale::strftime(fmt, mtime as i64).unwrap_or_else(|_| mtime.to_string())
 }
 
-/// Format time in ISO 8601 form (`%Y-%m-%dT%H:%M:%S`), TZ-aware via strftime.
-fn format_time_iso(mtime: u64) -> String {
-    plib::locale::strftime("%Y-%m-%dT%H:%M:%S", mtime as i64).unwrap_or_else(|_| mtime.to_string())
+/// The default subformat of the listopt `T` conversion (POSIX pax EXTENDED
+/// DESCRIPTION, rule 8). Unlike `ls -l`, it is fixed: the year is always shown
+/// and never traded against the time of day.
+const DEFAULT_TIME_SUBFORMAT: &str = "%b %e %H:%M %Y";
+
+/// Render `secs` through `subformat`, TZ- and LC_TIME-aware via strftime,
+/// falling back to the raw seconds if the subformat cannot be rendered.
+fn strftime_or_secs(secs: u64, subformat: &str) -> String {
+    plib::locale::strftime(subformat, secs as i64).unwrap_or_else(|_| secs.to_string())
 }
 
 #[cfg(test)]
@@ -957,6 +1032,8 @@ mod tests {
             mode: 0o644,
             size: 1234,
             mtime: 0,
+            atime: None,
+            ctime: None,
             uid: 1000,
             gid: 1000,
             uname: Some("user"),
@@ -970,6 +1047,40 @@ mod tests {
         assert_eq!(result, "path/to/file.txt");
     }
 
+    /// `%.N` is a precision on the string, so it counts characters. Applying it
+    /// as a byte index panicked whenever the cut landed inside a multi-byte
+    /// character -- `%.1F` on any name with a non-ASCII first character.
+    #[test]
+    fn test_format_list_entry_precision_is_char_counted() {
+        let info = ListEntryInfo {
+            path: "élan.txt",
+            mode: 0o644,
+            size: 0,
+            mtime: 0,
+            atime: None,
+            ctime: None,
+            uid: 0,
+            gid: 0,
+            uname: Some("ünïcode"),
+            gname: None,
+            link_target: None,
+            entry_type: EntryType::Regular,
+            devmajor: 0,
+            devminor: 0,
+        };
+
+        // 'é' is two bytes; a byte-indexed truncate(1) split it and aborted.
+        assert_eq!(format_list_entry("%.1F", &info), "é");
+        assert_eq!(format_list_entry("%.3F", &info), "éla");
+        assert_eq!(format_list_entry("%.1u", &info), "ü");
+        // A precision at or beyond the length leaves the value intact.
+        assert_eq!(format_list_entry("%.99F", &info), "élan.txt");
+
+        // Width padding is also a character count, so a non-ASCII name lines up
+        // with an ASCII one of the same length.
+        assert_eq!(format_list_entry("%10F", &info), "  élan.txt");
+    }
+
     #[test]
     fn test_format_list_entry_complex() {
         let info = ListEntryInfo {
@@ -977,6 +1088,8 @@ mod tests {
             mode: 0o755,
             size: 4096,
             mtime: 0,
+            atime: None,
+            ctime: None,
             uid: 1000,
             gid: 1000,
             uname: Some("alice"),
@@ -997,6 +1110,8 @@ mod tests {
             mode: 0o644,
             size: 4096,
             mtime: 0,
+            atime: None,
+            ctime: None,
             uid: 1000,
             gid: 1000,
             uname: Some("alice"),
@@ -1092,6 +1207,8 @@ mod tests {
             mode: 0o660,
             size: 0,
             mtime: 0,
+            atime: None,
+            ctime: None,
             uid: 0,
             gid: 0,
             uname: Some("root"),
@@ -1114,6 +1231,8 @@ mod tests {
             mode: 0o755,
             size: 0,
             mtime: 0,
+            atime: None,
+            ctime: None,
             uid: 0,
             gid: 0,
             uname: None,
@@ -1132,6 +1251,8 @@ mod tests {
             mode: 0o777,
             size: 0,
             mtime: 0,
+            atime: None,
+            ctime: None,
             uid: 0,
             gid: 0,
             uname: None,
@@ -1146,21 +1267,25 @@ mod tests {
     }
 
     #[test]
-    fn test_format_time_iso() {
+    fn test_strftime_or_secs_subformat() {
         // The exact value is timezone-dependent (strftime via localtime_r), so
-        // assert the ISO 8601 shape `YYYY-MM-DDTHH:MM:SS` rather than a fixed UTC
-        // instant.
-        let result = format_time_iso(1704067200);
-        let bytes = result.as_bytes();
+        // assert the shape the subformat asks for rather than a fixed UTC
+        // instant. An ISO 8601 layout is now reachable as a `T` subformat.
+        let result = strftime_or_secs(1704067200, "%Y-%m-%dT%H:%M:%S");
         assert_eq!(result.len(), 19, "unexpected ISO length: {result}");
         assert_eq!(&result[4..5], "-");
         assert_eq!(&result[7..8], "-");
         assert_eq!(&result[10..11], "T");
-        assert_eq!(&result[13..14], ":");
-        assert_eq!(&result[16..17], ":");
         assert!(
-            bytes[..4].iter().all(|b| b.is_ascii_digit()),
+            result.as_bytes()[..4].iter().all(|b| b.is_ascii_digit()),
             "year should be digits: {result}"
+        );
+
+        // The POSIX default subformat always carries a four-digit year.
+        let default = strftime_or_secs(1704067200, DEFAULT_TIME_SUBFORMAT);
+        assert!(
+            default.ends_with("2023") || default.ends_with("2024"),
+            "default subformat must end in the year: {default}"
         );
     }
 }

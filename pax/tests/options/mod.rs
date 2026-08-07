@@ -709,7 +709,13 @@ fn test_option_listopt_mode_symbolic_directory() {
 }
 
 /// Test that %D format specifier works (issue #531)
-/// Previously showed literal `%D` instead of device major,minor
+/// Previously showed literal `%D` instead of a device rendering.
+///
+/// POSIX rule 10 gives `D` as the device of a block/character special file;
+/// where that does not apply and no keyword was given -- a regular file under a
+/// bare `%D` -- the conversion is equivalent to a single <space>. (The
+/// keyword form, `%(size)D`, is covered by
+/// `test_option_listopt_device_conversion_falls_back_to_keyword`.)
 #[test]
 fn test_option_listopt_device_specifier() {
     let temp = TempDir::new().unwrap();
@@ -732,16 +738,20 @@ fn test_option_listopt_device_specifier() {
     assert_success(&output, "pax list with listopt=%D");
 
     let listing = stdout_str(&output);
-    // For regular files, devmajor and devminor are 0, so should show "0,0"
-    assert!(
-        listing.contains("0,0"),
-        "Device specifier should show 'major,minor' format (0,0 for regular files), not literal '%D'. Got: {}",
-        listing
-    );
     assert!(
         !listing.contains("%D"),
         "Should NOT show literal '%D'. Got: {}",
         listing
+    );
+    let line = listing
+        .lines()
+        .find(|l| l.ends_with("device_test.txt"))
+        .unwrap_or_else(|| panic!("no line for the test file. Got: {}", listing));
+    // One space from %D, one from the literal space in "%D %f".
+    assert_eq!(
+        line, "  device_test.txt",
+        "a regular file's bare %D must render as a single space. Got: {:?}",
+        line
     );
 }
 
@@ -776,10 +786,16 @@ fn test_option_listopt_mode_and_device_combined() {
         listing
     );
 
-    // Should have device info (0,0 for regular files)
+    // %D is not applicable to a regular file and carries no keyword, so it
+    // contributes a single space between the mode and the size (POSIX rule 10).
     assert!(
-        listing.contains("0,0"),
-        "Should show device info. Got: {}",
+        !listing.contains("%D"),
+        "Should NOT show literal '%D'. Got: {}",
+        listing
+    );
+    assert!(
+        listing.lines().any(|l| l.ends_with("  14 combined.txt")),
+        "Should show mode, the space from %D, size and name. Got: {}",
         listing
     );
 
@@ -1130,4 +1146,309 @@ fn test_pax_o_delete_mtime_on_extract() {
         nsec_del, 0,
         "delete=mtime must drop the sub-second precision"
     );
+}
+
+/// Set a file's atime and mtime to fixed epoch seconds so listopt time
+/// renderings are deterministic. Both instants are mid-year and mid-day, so the
+/// year and month names are the same in every time zone the tests might run in.
+#[cfg(unix)]
+fn set_times(path: &std::path::Path, atime: i64, mtime: i64) {
+    use std::os::unix::ffi::OsStrExt;
+    let times = [
+        libc::timespec {
+            tv_sec: atime as libc::time_t,
+            tv_nsec: 0,
+        },
+        libc::timespec {
+            tv_sec: mtime as libc::time_t,
+            tv_nsec: 0,
+        },
+    ];
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) };
+    assert_eq!(rc, 0, "utimensat: {}", std::io::Error::last_os_error());
+}
+
+/// 2003-06-15 12:00:00 UTC / 2003-07-16 12:00:00 UTC.
+#[cfg(unix)]
+const T_MTIME: i64 = 1_055_678_400;
+#[cfg(unix)]
+const T_ATIME: i64 = 1_058_356_800;
+
+/// Build a one-file pax archive carrying atime/mtime/ctime records, and return
+/// (archive path, file size).
+#[cfg(unix)]
+fn archive_with_times(temp: &TempDir) -> (std::path::PathBuf, usize) {
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("times.pax");
+    fs::create_dir(&src_dir).unwrap();
+    let body = b"listopt time test\n";
+    fs::write(src_dir.join("timed.txt"), body).unwrap();
+    set_times(&src_dir.join("timed.txt"), T_ATIME, T_MTIME);
+
+    assert_success(
+        &run_pax_in_dir(
+            &[
+                "-w",
+                "-x",
+                "pax",
+                "-o",
+                "times",
+                "-f",
+                archive.to_str().unwrap(),
+                "timed.txt",
+            ],
+            &src_dir,
+        ),
+        "write pax archive with -o times",
+    );
+    (archive, body.len())
+}
+
+#[cfg(unix)]
+fn listopt(archive: &std::path::Path, format: &str) -> String {
+    let out = run_pax(&[
+        "-f",
+        archive.to_str().unwrap(),
+        "-o",
+        &format!("listopt={}", format),
+    ]);
+    assert_success(&out, "pax list with listopt");
+    stdout_str(&out).trim_end().to_string()
+}
+
+/// POSIX rule 7 lists every pax extended-header keyword as usable in
+/// `%(keyword)`, and the EXAMPLES section spells out `%(atime)T`. atime was
+/// echoed back literally instead of being rendered.
+#[cfg(unix)]
+#[test]
+fn test_option_listopt_atime_keyword() {
+    let temp = TempDir::new().unwrap();
+    let (archive, _) = archive_with_times(&temp);
+
+    let atime = listopt(&archive, "%(atime)T");
+    assert!(
+        !atime.contains("%(atime)"),
+        "%(atime)T must be rendered, not echoed literally (got: {})",
+        atime
+    );
+    assert!(
+        atime.contains("Jul") && atime.contains("2003"),
+        "%(atime)T must render the archived access time (got: {})",
+        atime
+    );
+
+    // ... and it must be the access time, not an alias for mtime.
+    let mtime = listopt(&archive, "%(mtime)T");
+    assert!(
+        mtime.contains("Jun") && mtime.contains("2003"),
+        "%(mtime)T must render the modification time (got: {})",
+        mtime
+    );
+    assert_ne!(atime, mtime, "atime and mtime must render distinctly");
+}
+
+/// POSIX rule 8: the `T` conversion defaults to the mtime keyword and to the
+/// `%b %e %H:%M %Y` subformat. Bare `%T` rendered ISO 8601 and neither form
+/// emitted the year.
+#[cfg(unix)]
+#[test]
+fn test_option_listopt_time_default_subformat() {
+    let temp = TempDir::new().unwrap();
+    let (archive, _) = archive_with_times(&temp);
+
+    let bare = listopt(&archive, "%T");
+    assert!(
+        bare.contains("Jun") && bare.contains("2003") && bare.contains("12:00"),
+        "bare %T must default to mtime in `%b %e %H:%M %Y` form (got: {})",
+        bare
+    );
+    assert!(
+        !bare.contains("2003-06"),
+        "bare %T must not use ISO 8601 (got: {})",
+        bare
+    );
+    assert_eq!(
+        bare,
+        listopt(&archive, "%(mtime)T"),
+        "bare %T and %(mtime)T must agree"
+    );
+}
+
+/// POSIX rule 8 also allows `(keyword=subformat)`, where subformat is a date
+/// format. The subformat was parsed and then discarded.
+#[cfg(unix)]
+#[test]
+fn test_option_listopt_time_subformat() {
+    let temp = TempDir::new().unwrap();
+    let (archive, _) = archive_with_times(&temp);
+
+    let iso = listopt(&archive, "%(mtime=%Y-%m-%d)T");
+    assert!(
+        iso.starts_with("2003-06-1"),
+        "the T subformat must be honored (got: {})",
+        iso
+    );
+    let atime_year = listopt(&archive, "%(atime=%Y)T");
+    assert_eq!(atime_year, "2003", "subformat must apply to atime too");
+}
+
+/// POSIX rule 10: `D` names the device of a block/character special file; when
+/// that is not applicable and a keyword is given, it is equivalent to
+/// `%(keyword)u`. For a regular file `%(size)D` rendered the (meaningless)
+/// device pair instead of the size -- the exact spelling the spec's EXAMPLES
+/// section uses.
+#[cfg(unix)]
+#[test]
+fn test_option_listopt_device_conversion_falls_back_to_keyword() {
+    let temp = TempDir::new().unwrap();
+    let (archive, size) = archive_with_times(&temp);
+
+    assert_eq!(
+        listopt(&archive, "%(size)D"),
+        size.to_string(),
+        "%(size)D on a regular file must render the size"
+    );
+
+    // The full example from the pax EXAMPLES section must come out sensibly.
+    let example = listopt(&archive, "%M %(atime)T %(size)D %(name)s");
+    assert!(
+        example.starts_with("-rw")
+            && example.contains("Jul")
+            && example.contains(&size.to_string())
+            && example.ends_with("timed.txt"),
+        "the POSIX EXAMPLES listopt must render every field (got: {})",
+        example
+    );
+}
+
+/// ctime is not a POSIX keyword, but `-o times` records one and listing can
+/// report it -- the interop other implementations expect. There is no portable
+/// way to set a file's ctime, so this asserts the record round-trips rather
+/// than pinning an instant: `utimensat` above updated the inode, so the ctime
+/// is "recently", and in particular it is neither of the fixed times.
+#[cfg(unix)]
+#[test]
+fn test_option_listopt_ctime_keyword() {
+    let temp = TempDir::new().unwrap();
+    let (archive, _) = archive_with_times(&temp);
+
+    let ctime = listopt(&archive, "%(ctime)T");
+    assert!(
+        !ctime.contains("%(ctime)") && !ctime.is_empty(),
+        "-o times must record a ctime that %(ctime)T can render (got: {})",
+        ctime
+    );
+    assert!(
+        !ctime.contains("2003"),
+        "ctime is the inode change time, not one of the archived 2003 stamps (got: {})",
+        ctime
+    );
+
+    // The raw seconds form must agree with the rendered one.
+    let secs = listopt(&archive, "%(ctime)d");
+    assert!(
+        secs.chars().all(|c| c.is_ascii_digit()) && !secs.is_empty(),
+        "%(ctime)d must yield the raw seconds (got: {})",
+        secs
+    );
+}
+
+/// POSIX's `times` keyword is what obliges pax to write atime/mtime records, so
+/// an archive written without it carries none. A `%(atime)T` against such an
+/// archive names a keyword we understand that simply has no value here, so it
+/// contributes nothing rather than echoing the specification back.
+#[cfg(unix)]
+#[test]
+fn test_option_listopt_time_keyword_absent_from_archive() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("plain.pax");
+    fs::create_dir(&src_dir).unwrap();
+    fs::write(src_dir.join("plain.txt"), b"no times\n").unwrap();
+
+    assert_success(
+        &run_pax_in_dir(
+            &[
+                "-w",
+                "-x",
+                "pax",
+                "-f",
+                archive.to_str().unwrap(),
+                "plain.txt",
+            ],
+            &src_dir,
+        ),
+        "write pax archive without -o times",
+    );
+
+    assert_eq!(
+        listopt(&archive, "%(atime)T"),
+        "",
+        "an unrecorded atime must render empty"
+    );
+    // An unknown keyword still echoes, so the two cases stay distinguishable.
+    assert_eq!(
+        listopt(&archive, "%(nosuchkeyword)s"),
+        "%(nosuchkeyword)s",
+        "an unknown keyword must still be echoed literally"
+    );
+    // mtime is always available from the ustar header.
+    assert!(
+        listopt(&archive, "%(mtime)T").contains("20"),
+        "mtime must still render without -o times"
+    );
+}
+
+/// `-o delete=` and `-o keyword:=value` were honored on extract but silently
+/// ignored on list: list mode built the pax reader without its options and
+/// never applied the keyword overrides, so a listing could disagree with what
+/// extracting the same archive would produce.
+#[cfg(unix)]
+#[test]
+fn test_option_list_honors_keyword_override() {
+    let temp = TempDir::new().unwrap();
+    let (archive, _) = archive_with_times(&temp);
+
+    // Forcing the path changes what the listing must report.
+    let out = run_pax(&["-f", archive.to_str().unwrap(), "-o", "path:=forced.txt"]);
+    assert_success(&out, "list with a keyword override");
+    assert!(
+        stdout_str(&out).lines().any(|l| l == "forced.txt"),
+        "list mode must apply -o keyword:=value: {}",
+        stdout_str(&out)
+    );
+}
+
+/// `-o delete=atime` suppresses the record, so the listing must stop reporting
+/// it -- the same keyword filtering extraction already performed.
+#[cfg(unix)]
+#[test]
+fn test_option_list_honors_delete() {
+    let temp = TempDir::new().unwrap();
+    let (archive, _) = archive_with_times(&temp);
+
+    assert!(
+        !listopt_with(&archive, "%(atime)T", &["-o", "delete=atime"]).contains("Jul"),
+        "-o delete=atime must remove the record from the listing too"
+    );
+    assert!(
+        listopt(&archive, "%(atime)T").contains("Jul"),
+        "and without it the atime is still reported"
+    );
+}
+
+#[cfg(unix)]
+fn listopt_with(archive: &std::path::Path, format: &str, extra: &[&str]) -> String {
+    let mut args: Vec<String> = vec![
+        "-f".into(),
+        archive.to_str().unwrap().into(),
+        "-o".into(),
+        format!("listopt={}", format),
+    ];
+    args.extend(extra.iter().map(|s| s.to_string()));
+    let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let out = run_pax(&refs);
+    assert_success(&out, "pax list with listopt");
+    stdout_str(&out).trim_end().to_string()
 }

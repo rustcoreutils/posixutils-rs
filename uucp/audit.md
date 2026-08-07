@@ -280,8 +280,15 @@ list/kill/rejuvenate/filter/conflicts). Gaps that map to findings:
 
 - [x] No test asserts `uux` cross-system output routing or the `>!file`
   (null-system ⇒ local) semantics (#UX1). ✓ Phase 3: unit tests added.
-- [ ] No test asserts `LC_MESSAGES` affects diagnostics (#G1) — expected to fail
-  until diagnostics are `gettext()`-wrapped.
+- [x] No test asserts `LC_MESSAGES` affects diagnostics (#G1) — ~~expected to
+  fail until diagnostics are `gettext()`-wrapped~~. Closed 2026-08-06 as
+  **blocked on a tree-wide concern, not on this crate**: the code-side
+  prerequisite is done (`uucp.rs`, `uustat.rs`, `uux.rs` each wrap 14-17
+  diagnostics in `gettext`), but the tree ships `.po` sources under `locale/`
+  and no compiled `.mo` catalogs, so `gettext()` is an identity map at runtime
+  and a behavioral assertion would be vacuous. Same disposition as `fs` #6 and
+  the `datetime` cross-cutting note. Re-open when catalogs are built and
+  installed.
 - [x] No test pins the `-j` job-ID semantics for immediate vs `-r` transfers (#UC1). ✓ Phase 4 (`test_uustat_with_queued_job` asserts the `-r -j` ID is the listed ID).
 - [x] No test exercises `-k`/`-r` ownership enforcement across users (#G3). ✓ Phase 2.
 - [x] No test for remote `~user` expansion (#UC2). — N/A (WON'T FIX).

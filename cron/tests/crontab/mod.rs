@@ -10,37 +10,37 @@
 use plib::testing::run_test_base;
 use std::process::Output;
 
-fn run_cron_test(cmd: &str, args: &Vec<String>, stdin_data: &[u8]) -> Output {
+fn run_cron_test(cmd: &str, args: &[String], stdin_data: &[u8]) -> Output {
     run_test_base(cmd, args, stdin_data)
 }
 
 #[test]
 fn no_args() {
-    let output = run_cron_test("crontab", &vec![], b"");
+    let output = run_cron_test("crontab", &[], b"");
     assert_eq!(output.status.code(), Some(1));
 }
 
 #[test]
 fn dash_e() {
-    let output = run_cron_test("crontab", &vec!["-e".to_string()], b"");
+    let output = run_cron_test("crontab", &["-e".to_string()], b"");
     assert_eq!(output.status.code(), Some(1));
 }
 
 #[test]
 fn dash_l() {
-    let output = run_cron_test("crontab", &vec!["-l".to_string()], b"");
+    let output = run_cron_test("crontab", &["-l".to_string()], b"");
     assert_eq!(output.status.code(), Some(1));
 }
 
 #[test]
 fn dash_r() {
-    let output = run_cron_test("crontab", &vec!["-r".to_string()], b"");
+    let output = run_cron_test("crontab", &["-r".to_string()], b"");
     assert_eq!(output.status.code(), Some(1));
 }
 
 #[test]
 fn too_many_args() {
-    let output = run_cron_test("crontab", &vec!["-erl".to_string()], b"");
+    let output = run_cron_test("crontab", &["-erl".to_string()], b"");
     assert_eq!(output.status.code(), Some(1));
 }
 
@@ -109,7 +109,7 @@ fn diagnostics_go_to_stderr_not_stdout() {
     // so this needs no spool access.
     let output = run_cron_test(
         "crontab",
-        &vec!["one".to_string(), "two".to_string(), "three".to_string()],
+        &["one".to_string(), "two".to_string(), "three".to_string()],
         b"",
     );
     assert_ne!(output.status.code(), Some(0), "this invocation must fail");
@@ -140,10 +140,10 @@ fn install_list_remove_round_trip() {
     let content = "*/5 * * * * echo hello\n";
     std::fs::write(&src, content).unwrap();
 
-    let out = run_cron_test("crontab", &vec![src.to_string_lossy().to_string()], b"");
+    let out = run_cron_test("crontab", &[src.to_string_lossy().to_string()], b"");
     assert_eq!(out.status.code(), Some(0), "install failed");
 
-    let out = run_cron_test("crontab", &vec!["-l".to_string()], b"");
+    let out = run_cron_test("crontab", &["-l".to_string()], b"");
     assert_eq!(out.status.code(), Some(0), "list failed");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
@@ -151,7 +151,7 @@ fn install_list_remove_round_trip() {
         "-l must reproduce exactly what was installed"
     );
 
-    let out = run_cron_test("crontab", &vec!["-r".to_string()], b"");
+    let out = run_cron_test("crontab", &["-r".to_string()], b"");
     assert_eq!(out.status.code(), Some(0), "remove failed");
 }
 
@@ -166,11 +166,11 @@ fn no_operand_replaces_from_stdin() {
     }
 
     let content = "0 3 * * * /usr/bin/backup\n";
-    let out = run_cron_test("crontab", &vec![], content.as_bytes());
+    let out = run_cron_test("crontab", &[], content.as_bytes());
     assert_eq!(out.status.code(), Some(0), "stdin replacement failed");
 
-    let out = run_cron_test("crontab", &vec!["-l".to_string()], b"");
+    let out = run_cron_test("crontab", &["-l".to_string()], b"");
     assert_eq!(String::from_utf8_lossy(&out.stdout), content);
 
-    let _ = run_cron_test("crontab", &vec!["-r".to_string()], b"");
+    let _ = run_cron_test("crontab", &["-r".to_string()], b"");
 }

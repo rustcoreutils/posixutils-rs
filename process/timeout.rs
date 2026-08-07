@@ -70,7 +70,21 @@ struct Args {
     #[arg(name = "UTILITY", help=gettext("The utility to execute."))]
     utility: String,
 
-    #[arg(name = "ARGUMENT", trailing_var_arg = true, help=gettext("Arguments to pass to the utility."))]
+    // `allow_hyphen_values` is what makes `timeout 5 ls -l` work. Without it,
+    // `trailing_var_arg` alone still lets clap try to parse a leading-hyphen
+    // token as one of timeout's own options, so *any* utility invoked with an
+    // option failed with "unexpected argument found" — `timeout 5 ls -l`,
+    // `timeout 5 grep -c ...`, `timeout 5 sh -c '...'`.
+    //
+    // XBD 12.2 Guideline 9 puts all of timeout's options before its operands,
+    // so once DURATION and UTILITY have been consumed every remaining token
+    // belongs to the utility, hyphen or not.
+    #[arg(
+        name = "ARGUMENT",
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        help = gettext("Arguments to pass to the utility.")
+    )]
     arguments: Vec<String>,
 }
 

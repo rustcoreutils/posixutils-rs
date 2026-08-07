@@ -428,6 +428,41 @@ fn lp_n_copies_overflow_rejected() {
     );
 }
 
+/// `-n i32::MAX` is the largest accepted value and must survive the u32->i32
+/// conversion on the way into the IPP `copies` attribute. Paired with
+/// `lp_n_copies_overflow_rejected` above, this pins both sides of the boundary.
+#[test]
+fn lp_n_copies_at_i32_max_accepted() {
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("lp"),
+            args: vec![
+                "-n".to_string(),
+                i32::MAX.to_string(),
+                "-d".to_string(),
+                "ipp://localhost/ipp/print".to_string(),
+            ],
+            stdin_data: String::from("test data"),
+            expected_out: String::from(""),
+            expected_err: String::from(""),
+            expected_exit_code: 1,
+        },
+        &[("LPDEST", ""), ("PRINTER", "")],
+        |_, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // Accepted by clap, so the failure must come from the connection,
+            // not from argument validation.
+            assert!(
+                !stderr.contains("error: invalid value"),
+                "Expected -n {} to be accepted, got: {}",
+                i32::MAX,
+                stderr
+            );
+            assert_eq!(output.status.code(), Some(1));
+        },
+    );
+}
+
 /// Test that a malformed -o option (no '=') produces a warning
 #[test]
 fn lp_o_malformed_warned() {
@@ -691,4 +726,290 @@ fn lp_stdin_dash_argument() {
             );
         },
     );
+}
+
+// ===========================================================================
+// Stub IPP responder
+//
+// Every other test in this file stops at the connection failure, which is why
+// no success-path behavior was asserted at all. This is the smallest server
+// that lp will accept a job from: it speaks just enough IPP-over-HTTP
+// (RFC 8010) to answer Print-Job with a job-id.
+// ===========================================================================
+
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+
+/// Assemble an IPP response body granting the job the given id.
+fn ipp_ok_response(request_id: u32, job_id: i32) -> Vec<u8> {
+    fn put_attr(buf: &mut Vec<u8>, tag: u8, name: &str, value: &[u8]) {
+        buf.push(tag);
+        buf.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        buf.extend_from_slice(name.as_bytes());
+        buf.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        buf.extend_from_slice(value);
+    }
+
+    let mut b = Vec::new();
+    b.extend_from_slice(&[0x01, 0x01]); // version 1.1
+    b.extend_from_slice(&0u16.to_be_bytes()); // successful-ok
+    b.extend_from_slice(&request_id.to_be_bytes());
+
+    b.push(0x01); // operation-attributes-tag
+    put_attr(&mut b, 0x47, "attributes-charset", b"utf-8");
+    put_attr(&mut b, 0x48, "attributes-natural-language", b"en-us");
+
+    b.push(0x02); // job-attributes-tag
+    put_attr(&mut b, 0x21, "job-id", &job_id.to_be_bytes()); // integer
+    put_attr(&mut b, 0x23, "job-state", &9i32.to_be_bytes()); // enum: completed
+
+    b.push(0x03); // end-of-attributes-tag
+    b
+}
+
+/// Decode a chunked transfer-encoding body out of `raw`, refilling from
+/// `stream` until the terminating zero-length chunk arrives.
+///
+/// Returns `None` if the peer hangs up before the body is complete.
+fn read_chunked(stream: &mut TcpStream, raw: &mut Vec<u8>, mut pos: usize) -> Option<Vec<u8>> {
+    let mut chunk = [0u8; 4096];
+    let mut body = Vec::new();
+
+    loop {
+        // Refill until the chunk-size line terminator is in hand.
+        let line_end = loop {
+            if let Some(off) = raw[pos..].windows(2).position(|w| w == b"\r\n") {
+                break pos + off;
+            }
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => return None,
+                Ok(n) => raw.extend_from_slice(&chunk[..n]),
+            }
+        };
+
+        // "<hex-size>[;chunk-ext]" — the extension is not used by ureq, but
+        // ignoring it costs one split.
+        let line = String::from_utf8_lossy(&raw[pos..line_end]);
+        let size = usize::from_str_radix(line.split(';').next()?.trim(), 16).ok()?;
+        pos = line_end + 2;
+
+        // A zero-length chunk ends the body; trailers are ignored.
+        if size == 0 {
+            return Some(body);
+        }
+
+        // Refill until the whole chunk plus its trailing CRLF has arrived.
+        while raw.len() < pos + size + 2 {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => return None,
+                Ok(n) => raw.extend_from_slice(&chunk[..n]),
+            }
+        }
+        body.extend_from_slice(&raw[pos..pos + size]);
+        pos += size + 2;
+    }
+}
+
+/// Read one HTTP request and reply with `body`.
+///
+/// The body has to be consumed in full before replying: `lp`'s IPP client
+/// streams the print payload, and answering early makes the server close the
+/// connection while the client is still writing, which the client reports as
+/// "Peer disconnected". That is a race, so it showed up as an intermittent
+/// failure rather than a consistent one.
+fn serve_one(mut stream: TcpStream, job_id: i32) {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+
+    // Read the headers, then the body framed the way they say it is.
+    let (header_end, content_length, chunked) = loop {
+        let n = match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => n,
+        };
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let headers = String::from_utf8_lossy(&buf[..pos]).to_lowercase();
+            let len = headers
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            // ureq (via the ipp crate) streams the payload, so the request
+            // arrives chunked with no Content-Length at all.
+            let chunked = headers
+                .lines()
+                .filter_map(|l| l.strip_prefix("transfer-encoding:"))
+                .any(|v| v.contains("chunked"));
+            break (pos + 4, len, chunked);
+        }
+    };
+
+    let body = if chunked {
+        match read_chunked(&mut stream, &mut buf, header_end) {
+            Some(body) => body,
+            None => return,
+        }
+    } else {
+        while buf.len() < header_end + content_length {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+        }
+        buf[header_end..].to_vec()
+    };
+
+    // The request-id is bytes 4..8 of the IPP body; echo it back.
+    let request_id = if body.len() >= 8 {
+        u32::from_be_bytes([body[4], body[5], body[6], body[7]])
+    } else {
+        1
+    };
+
+    let ipp = ipp_ok_response(request_id, job_id);
+    let mut resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/ipp\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        ipp.len()
+    )
+    .into_bytes();
+    resp.extend_from_slice(&ipp);
+    let _ = stream.write_all(&resp);
+    let _ = stream.flush();
+}
+
+/// Bind an ephemeral port and serve `count` requests on a background thread.
+/// Returns the `ipp://` URI to point lp at, or `None` if binding failed.
+fn spawn_ipp_stub(job_id: i32, count: usize) -> Option<(String, std::thread::JoinHandle<()>)> {
+    let listener = TcpListener::bind("127.0.0.1:0").ok()?;
+    let port = listener.local_addr().ok()?.port();
+
+    let handle = std::thread::spawn(move || {
+        for _ in 0..count {
+            match listener.accept() {
+                Ok((stream, _)) => serve_one(stream, job_id),
+                Err(_) => break,
+            }
+        }
+    });
+
+    Some((format!("ipp://127.0.0.1:{}/printers/stub", port), handle))
+}
+
+/// A job the printer accepts writes "request id is <dest>-<job-id>" to stdout
+/// (POSIX 103065, 103150-103152) and exits 0.
+#[test]
+fn lp_successful_job_prints_request_id() {
+    let Some((uri, handle)) = spawn_ipp_stub(4242, 1) else {
+        return; // cannot bind a port in this environment
+    };
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("lp"),
+            args: vec![String::from("-d"), uri.clone()],
+            stdin_data: String::from("job payload"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("LPDEST", ""), ("PRINTER", "")],
+        |_, output| {
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "a job the printer accepted must exit 0; stderr={:?}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(stdout, format!("request id is {}-4242\n", uri));
+        },
+    );
+
+    let _ = handle.join();
+}
+
+/// `-s` suppresses the request-ID line on success — the case that could not be
+/// reached while every test stopped at the connection failure.
+#[test]
+fn lp_silent_suppresses_the_request_id_on_success() {
+    let Some((uri, handle)) = spawn_ipp_stub(77, 1) else {
+        return;
+    };
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("lp"),
+            args: vec![String::from("-s"), String::from("-d"), uri.clone()],
+            stdin_data: String::from("job payload"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("LPDEST", ""), ("PRINTER", "")],
+        |_, output| {
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "stderr={:?}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                output.stdout.is_empty(),
+                "-s must suppress the request ID, got {:?}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        },
+    );
+
+    let _ = handle.join();
+}
+
+/// Each accepted operand gets its own request ID line, in operand order.
+#[test]
+fn lp_multiple_files_each_report_a_request_id() {
+    let Some((uri, handle)) = spawn_ipp_stub(5, 2) else {
+        return;
+    };
+
+    let td = std::env::temp_dir().join(format!("posixutils_lp_multi_{}", std::process::id()));
+    std::fs::create_dir_all(&td).unwrap();
+    let a = td.join("a.txt");
+    let b = td.join("b.txt");
+    std::fs::write(&a, b"alpha").unwrap();
+    std::fs::write(&b, b"beta").unwrap();
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("lp"),
+            args: vec![
+                String::from("-d"),
+                uri.clone(),
+                a.to_str().unwrap().to_string(),
+                b.to_str().unwrap().to_string(),
+            ],
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("LPDEST", ""), ("PRINTER", "")],
+        |_, output| {
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "stderr={:?}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let lines: Vec<&str> = stdout.lines().collect();
+            assert_eq!(lines.len(), 2, "one request ID per operand, got {stdout:?}");
+            for line in lines {
+                assert_eq!(line, format!("request id is {}-5", uri));
+            }
+        },
+    );
+
+    let _ = handle.join();
+    let _ = std::fs::remove_dir_all(&td);
 }

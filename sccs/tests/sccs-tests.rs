@@ -7,6 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
+mod common;
+
 mod admin;
 mod delta;
 mod get;

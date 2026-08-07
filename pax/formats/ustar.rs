@@ -285,7 +285,7 @@ fn parse_string(bytes: &[u8]) -> String {
 /// These are NUL-terminated and a trailing <space> is a legitimate pathname
 /// character, so only the NUL terminator delimits the value — unlike the
 /// space-padded fields, no whitespace is trimmed.
-fn parse_path_field(bytes: &[u8]) -> String {
+pub(crate) fn parse_path_field(bytes: &[u8]) -> String {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     String::from_utf8_lossy(&bytes[..end]).to_string()
 }
@@ -413,7 +413,7 @@ fn build_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
 }
 
 /// Split path into name (max 100) and prefix (max 155)
-fn split_path(entry: &ArchiveEntry) -> PaxResult<(String, String)> {
+pub(crate) fn split_path(entry: &ArchiveEntry) -> PaxResult<(String, String)> {
     let path_str = entry.path.to_string_lossy();
 
     // Add trailing slash for directories

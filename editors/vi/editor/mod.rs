@@ -434,6 +434,10 @@ impl Editor {
                 '\x1b' => Key::Escape,
                 '\n' | '\r' => Key::Enter,
                 '\x7f' => Key::Backspace,
+                // Must mirror `Key::from_byte` exactly, or headless tests
+                // agree with each other while disagreeing with real input —
+                // which is how #V22 (TAB discarded) survived.
+                '\t' => Key::Tab,
                 c if c.is_ascii_control() => {
                     // Convert control characters (Ctrl-A = 0x01, etc.)
                     let ctrl_char = (c as u8 + b'@') as char;
@@ -796,6 +800,14 @@ impl Editor {
 
     /// Handle a key in command mode.
     fn handle_command_key(&mut self, key: Key) -> Result<()> {
+        // Snapshot the current line for `U` before this command can change it
+        // (#V20). Between commands nothing touches the buffer, so the content
+        // here is the content as of when the cursor arrived on the line —
+        // which is exactly what POSIX 121567-121568 restores. The `:` keystroke
+        // is itself a command key, so ex commands get the right pre-command
+        // snapshot for free.
+        self.undo.sync_line_original(&self.buffer);
+
         // Handle control key commands first
         match key {
             Key::Ctrl('b') | Key::PageUp => {
@@ -951,7 +963,7 @@ impl Editor {
 
     /// Enter insert mode.
     fn enter_insert(&mut self, kind: InsertKind) {
-        if let Ok(mut state) = enter_insert_mode(&mut self.buffer, kind) {
+        if let Ok(mut state) = enter_insert_mode(&mut self.buffer, kind, &self.options) {
             // An insert session is one command. When an operator opened a group
             // already (c/s/S/C), this call is a no-op and the operator's removal
             // and the typed text end up in the same group, so one `u` reverses
@@ -969,8 +981,13 @@ impl Editor {
 
     /// Handle a key in insert mode.
     fn handle_insert_key(&mut self, key: Key) -> Result<()> {
+        // See `handle_command_key` — these two are the complete set of entry
+        // points, since `handle_key` and `execute_keys_from_string` both funnel
+        // through them.
+        self.undo.sync_line_original(&self.buffer);
+
         if let Some(mut state) = self.insert_state.take() {
-            let should_exit = process_insert_key(&mut self.buffer, key, &mut state)?;
+            let should_exit = process_insert_key(&mut self.buffer, key, &mut state, &self.options)?;
 
             if should_exit {
                 // Exited insert mode
@@ -1861,10 +1878,22 @@ impl Editor {
                 let end = Position::new(end_line, 0);
                 let range = Range::lines(start, end);
                 if is_right {
-                    let result = shift_right(&mut self.buffer, range, self.options.shiftwidth)?;
+                    let result = shift_right(
+                        &mut self.buffer,
+                        range,
+                        self.options.shiftwidth,
+                        self.options.tabstop,
+                        &mut self.registers,
+                    )?;
                     self.buffer.set_cursor(result.cursor);
                 } else {
-                    let result = shift_left(&mut self.buffer, range, self.options.shiftwidth)?;
+                    let result = shift_left(
+                        &mut self.buffer,
+                        range,
+                        self.options.shiftwidth,
+                        self.options.tabstop,
+                        &mut self.registers,
+                    )?;
                     self.buffer.set_cursor(result.cursor);
                 }
             } else {
@@ -1876,10 +1905,22 @@ impl Editor {
                     let range =
                         Range::lines(Position::new(start_line, 0), Position::new(end_line, 0));
                     if is_right {
-                        let result = shift_right(&mut self.buffer, range, self.options.shiftwidth)?;
+                        let result = shift_right(
+                            &mut self.buffer,
+                            range,
+                            self.options.shiftwidth,
+                            self.options.tabstop,
+                            &mut self.registers,
+                        )?;
                         self.buffer.set_cursor(result.cursor);
                     } else {
-                        let result = shift_left(&mut self.buffer, range, self.options.shiftwidth)?;
+                        let result = shift_left(
+                            &mut self.buffer,
+                            range,
+                            self.options.shiftwidth,
+                            self.options.tabstop,
+                            &mut self.registers,
+                        )?;
                         self.buffer.set_cursor(result.cursor);
                     }
                 }
@@ -3436,6 +3477,21 @@ impl Editor {
                 .move_cursor(size.rows, (self.ex_input.len() + 2) as u16)?;
         } else {
             self.terminal.move_cursor(display_line, display_col)?;
+
+            // "For purposes of the display only, the editor shall behave as if
+            // a '^' character was entered, and the cursor shall be positioned
+            // as if overwriting the '^' character" (121878-121880). Nothing
+            // enters the buffer, so we draw over the cell and step back onto
+            // it. Safe without extra bookkeeping because this is a full redraw
+            // per keystroke — the next refresh erases the '^'.
+            if self
+                .insert_state
+                .as_ref()
+                .is_some_and(|s| s.pending_literal)
+            {
+                self.terminal.write_str("^")?;
+                self.terminal.move_cursor(display_line, display_col)?;
+            }
         }
 
         self.terminal.show_cursor()?;

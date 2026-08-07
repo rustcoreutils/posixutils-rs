@@ -96,7 +96,7 @@ implemented — so `basename /usr/bin/env env` prints `bin` instead of `env`.
 - [x] suffix identical to result (`env env`→`env`) (#B2)
 - [x] suffix + trailing slash (`src/dir/ ir`→`d`) (#B3)
 - [x] leading-hyphen operand, `--` separator (#B5), embedded-newline error (#B6)
-- [ ] non-UTF-8 operand (#B4) — code path is byte-clean; explicit test deferred (TestPlan args are UTF-8 strings)
+- [x] non-UTF-8 operand (#B4) — `basename_non_utf8_operand` and `basename_non_utf8_suffix`. *(Was deferred because `TestPlan::args` is `Vec<String>`; `plib::testing::TestPlanOs` now takes `OsString` args and compares byte-exactly, which is what makes the claim checkable.)*
 
 ---
 
@@ -147,7 +147,7 @@ components (which `PathBuf` does) and forbids removing non-final `..` (which
 - [x] non-final `..` preservation (`a/../b` → `a/..`)
 - [x] redundant-slash input (`/usr//bin` → `/usr`)
 - [x] embedded-newline error (#D3)
-- [ ] non-UTF-8 operand (#D1) — code path is byte-clean; explicit test deferred (TestPlan args are UTF-8 strings)
+- [x] non-UTF-8 operand (#D1) — `dirname_non_utf8_operand`, `dirname_non_utf8_bare_name`, via `TestPlanOs`.
 
 ---
 
@@ -217,7 +217,7 @@ New `pathnames/tests/pathchk/mod.rs` (9 tests):
 - [x] `pathchk -p 'a b'` and `-p 'a*b'` → exit 1 (#P4)
 - [x] `pathchk -P -- -foo` and `pathchk -P ''` → exit 1
 - [x] over-long component / over-long path (#P6)
-- [ ] search-permission (#P5) — logic in place; explicit test deferred (needs a non-searchable dir; root bypasses)
+- [x] search-permission (#P5) — `pathchk_non_searchable_directory` creates a 0o600 directory and asserts the diagnostic, paired with `pathchk_searchable_directory_is_accepted` so it cannot pass for the wrong reason. Self-skips under root (which bypasses the permission bits), following the `tree/tests/chown` pattern rather than `#[ignore]`.
 
 ---
 
@@ -283,7 +283,7 @@ existing tests codify this lexical-only behavior, so they will need updating.
 - [x] `-E` on `regfile/` (trailing slash → "Not a directory")
 - [x] `-E` on `dir/symlink-to-missing` → expanded target path (and missing-parent → error)
 - [x] embedded-newline error (#R9)
-- [ ] non-UTF-8 operand (#R7) — output path is byte-clean; explicit test deferred
+- [x] non-UTF-8 operand (#R7) — `realpath_non_utf8_operand` creates a real directory entry whose name is not valid UTF-8 and resolves it with `-e`, asserting the output bytes exactly.
 
 ---
 

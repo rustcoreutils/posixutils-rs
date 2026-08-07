@@ -33,7 +33,14 @@ struct Args {
     )]
     ignore_env: bool,
 
-    #[arg(help = gettext("NAME=VALUE pairs, the utility to invoke, and its arguments"))]
+    // See the note in `timeout.rs`. env's operand list ends with the utility
+    // and its arguments, so a leading-hyphen token after the utility name must
+    // be passed through rather than parsed as one of env's own options.
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        help = gettext("NAME=VALUE pairs, the utility to invoke, and its arguments")
+    )]
     operands: Vec<String>,
 }
 

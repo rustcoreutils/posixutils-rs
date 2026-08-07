@@ -94,7 +94,7 @@ real expression parser before it can be called conformant.
 #### STDIN / INPUT FILES / ENVIRONMENT
 - [x] STDIN not used — CONFORMS.
 - [x] `setlocale(LC_ALL,"")` + `textdomain` present — CONFORMS. `expr.rs:366-368`.
-- [ ] **LC_COLLATE not honored for `=`/`!=` string compare** — DIVERGES (uses Rust `==`/`Ord`, byte order). `expr.rs:166-173`. Minor; fold into #E6/i18n work.
+- [x] **LC_COLLATE honored for string compare** — ✓ fixed 2026-08-06. `cmpstr` (`expr.rs:174-196`) now routes through `plib::locale::strcoll` (`plib/src/locale.rs:274`, libc `strcoll(3)`), per POSIX 94588-94590 "the collating sequence of the current locale". *(Citation and scope were both wrong: the old `expr.rs:166-173` is `cmpint`, which was always correct; and the defect covered **all six** relational operators, not just `=`/`!=`, because `cmpop` (`:198`) falls back to `cmpstr` whenever either side is non-numeric.)* Test `expr_string_compare_honors_lc_collate` uses a case-crossing pair as the discriminator — `a < B` is false under C (byte order, `B`=0x42 < `a`=0x61) and true under `en_US.UTF-8` — and self-skips when no collating locale is installed. Verified to fail against the pre-fix code.
 
 #### STDOUT / STDERR
 - [x] Result + `<newline>` to stdout — CONFORMS. `expr.rs:375`.
@@ -111,7 +111,7 @@ Now covered (added in Phases 1–2): operator precedence; `:` matching
 (anchoring, `\(...\)` capture, char-vs-byte length); divide/remainder by zero;
 exit-status assertions (0/1/2); `--` handling; multibyte operands.
 Still not covered:
-- [ ] LC_COLLATE-sensitive `=`/`!=` string comparison.
+- [x] LC_COLLATE-sensitive string comparison (all six relational operators) — `expr_string_compare_honors_lc_collate`.
 
 ---
 

@@ -514,12 +514,34 @@ fn remove_pfile_entry(sfile_path: &Path, entry_to_remove: &PfileEntry) -> io::Re
     Ok(())
 }
 
-/// Resolve a comma/space-separated `-g` list into delta serial numbers. Each
-/// token may be a SID (e.g. `1.2`) or a bare serial number. Unknown tokens are
-/// reported and skipped.
-fn resolve_ignore_list(sccs: &SccsFile, list: &str) -> Vec<u16> {
+/// Resolve a `-g` list into delta serial numbers.
+///
+/// The option-argument is a list "as defined by get" (92229), so each
+/// comma-separated element may be a single SID or an inclusive `lo-hi` range.
+/// A bare serial number is also accepted as a convenience. Unknown tokens are
+/// reported and skipped; a range whose first SID is not an ancestor of the
+/// second is fatal, matching `get -i`/`-x`.
+fn resolve_ignore_list(sccs: &SccsFile, list: &str) -> Result<Vec<u16>, String> {
     let mut serials = Vec::new();
     for tok in list.split([',', ' ', '\t']).filter(|s| !s.is_empty()) {
+        if let Some((lo, hi)) = tok.split_once('-') {
+            let (lo_sid, hi_sid) = match (lo.parse::<Sid>(), hi.parse::<Sid>()) {
+                (Ok(l), Ok(h)) => (l, h),
+                _ => return Err(format!("{}: {}", tok, gettext("invalid SID range"))),
+            };
+            match sccs.ancestor_chain(&lo_sid, &hi_sid) {
+                Some(mut r) => serials.append(&mut r),
+                None => {
+                    return Err(format!(
+                        "{}: {}",
+                        tok,
+                        gettext("first SID in range is not an ancestor of the second")
+                    ))
+                }
+            }
+            continue;
+        }
+
         if let Ok(sid) = tok.parse::<Sid>() {
             if let Some(d) = sccs.find_delta_by_sid(&sid) {
                 serials.push(d.serial);
@@ -535,7 +557,7 @@ fn resolve_ignore_list(sccs: &SccsFile, list: &str) -> Vec<u16> {
         }
         eprintln!("delta: {}: {}", tok, gettext("no such delta"));
     }
-    serials
+    Ok(serials)
 }
 
 /// Determine the MR list for the new delta, honoring the `v` flag.
@@ -709,9 +731,17 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
     };
     let comment = gather_comment(args, stdin_consumed);
 
-    // Resolve -g list (SIDs or serial numbers) into serial numbers to ignore.
+    // Resolve -g list (SIDs, ranges or serial numbers) into serials to ignore.
+    // A malformed range aborts before anything is written: recording the delta
+    // with a silently wrong ignore-list would bake the mistake into history.
     let ignored = match &args.glist {
-        Some(list) => resolve_ignore_list(&sccs, list),
+        Some(list) => match resolve_ignore_list(&sccs, list) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("delta: {}: {}", sfile_path.display(), e);
+                return Ok(false);
+            }
+        },
         None => Vec::new(),
     };
 

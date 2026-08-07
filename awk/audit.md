@@ -55,7 +55,7 @@ drops fields** (Major).
 
 - [x] **#8 — `substr(s,m,n)` with `m<1` keeps `n` characters from position 1 instead of from `m`.** `builtins.rs:332` clamps `m` to `1.0` then `builtins.rs:336` takes `n` chars, so leading positions below 1 are not counted against `n`. POSIX 85895-85898 defines the result as "the at most n-character substring … that begins at position m". Verified: `substr("hello",-1,3)`→`hel` and `substr("hello",0,2)`→`he`; nawk/gawk give `h` and `h`. The code comment acknowledges the `<1` case is "not specified", so this is a divergence-from-common-behavior rather than a hard `shall`; remaining substr edges (`m`/`n` fractional truncation, negative `n`→empty, over-long `n` clamp) are correct. **✓ Fixed:** substr now computes the character window `[max(m,1), m+n)` clamped to the string, so out-of-range leading positions consume `n`; test `test_awk_substr_edges`.
 
-- [ ] **#9 — Division / modulo by zero yields `inf`/`-nan` with no diagnostic and exit 0.** `awk 'BEGIN{print 1/0}'` → `inf` (exit 0); `1%0` → `-nan`. POSIX 85426-85428 makes the result undefined (ISO C error case), so this is conforming-but-surprising; most awks emit a fatal "division by zero" diagnostic. Consider emitting a diagnostic and non-zero exit. **Left as-is (intentional):** current behavior is POSIX-conforming (undefined → `inf`/`-nan`); not changed to avoid breaking programs that rely on the IEEE result.
+- [x] **#9 — Division / modulo by zero yields `inf`/`-nan` with no diagnostic and exit 0.** `awk 'BEGIN{print 1/0}'` → `inf` (exit 0); `1%0` → `-nan`. POSIX 85426-85428 makes the result undefined (ISO C error case), so this is conforming-but-surprising; most awks emit a fatal "division by zero" diagnostic. Consider emitting a diagnostic and non-zero exit. **Left as-is (intentional):** current behavior is POSIX-conforming (undefined → `inf`/`-nan`); not changed to avoid breaking programs that rely on the IEEE result.
 
 - [x] **#10 — `tolower`/`toupper` use Unicode default case mapping, not the `LC_CTYPE` mapping.** `builtins.rs:339-349` call Rust `to_lowercase()`/`to_uppercase()`. POSIX 85899-85906 ties the mapping to "the LC_CTYPE category of the current locale". Practical impact is small (ASCII identical); flagged for strict-conformance completeness, consistent with the `plib::locale` direction taken in `dev/audit.md`. **✓ Fixed:** added `plib::locale::to_lower`/`to_upper` (libc `tolower`/`towlower`); awk maps each character through them. Tests `plib locale::tests::to_lower_upper_ascii`, `test_awk_case_mapping`.
 
@@ -63,7 +63,7 @@ drops fields** (Major).
 
 - [x] **#12 — `split(s,a,"")` performs a per-character split.** `record.rs:76-77` maps an empty FS to `Null` → one element per character. POSIX 85876 calls a null `fs` "unspecified", so this is conforming; worth a one-line doc note since it is an observable choice (`split("abc",a,"")` → 3 elements). Likewise FS="" for record field splitting is the same unspecified-but-defined char split. **✓ Documented:** comment added at the `FieldSeparator::Null` construction noting the gawk-compatible per-character behavior.
 
-- [ ] **#13 — clap exposes `--help`/`-h`/`--version`/`-V`.** `awk/main.rs:24-45`. These are non-POSIX but standard and harmless. `--` end-of-options and unknown-option rejection are handled by clap (both verified working). No action required beyond noting the extension surface.
+- [x] **#13 — clap exposes `--help`/`-h`/`--version`/`-V`.** `awk/main.rs:24-45`. These are non-POSIX but standard and harmless. `--` end-of-options and unknown-option rejection are handled by clap (both verified working). No action required beyond noting the extension surface.
 
 ## Detailed conformance matrix
 
@@ -209,7 +209,7 @@ drops fields** (Major).
 ### EXIT STATUS / CONSEQUENCES OF ERRORS
 - [x] 0 on success, >0 on error; `exit [expr]` overrides — `main.rs:47-54,98`, `mod.rs` exit propagation. Verified.
 - [x] Compile/runtime errors → diagnostic to stderr + exit 1 — `main.rs:47-55`.
-- [ ] **Division/modulo by zero: no diagnostic, exit 0** (#9) — arithmetic ops.
+- [x] **Division/modulo by zero: no diagnostic, exit 0** (#9) — closed as intentional; see #9 above. POSIX 85426-85428 makes the result undefined (ISO C error case), so `inf`/`-nan` conforms, and changing it would break programs relying on the IEEE result.
 - [x] Inaccessible file operand → diagnostic + terminate — file readers in `io.rs`/`mod.rs`.
 
 ### Cross-cutting

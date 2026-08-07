@@ -27,7 +27,9 @@ use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType};
 use crate::error::{is_eof_error, PaxError, PaxResult};
 use crate::options::FormatOptions;
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::io::{Read, Write};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 
 const BLOCK_SIZE: usize = 512;
@@ -89,10 +91,24 @@ pub struct ExtendedHeader {
     pub atime: Option<PaxTime>,
     /// mtime - file modification time
     pub mtime: Option<PaxTime>,
-    /// path - file pathname
-    pub path: Option<String>,
-    /// linkpath - link target pathname
-    pub linkpath: Option<String>,
+    /// ctime - inode change time.
+    ///
+    /// Not a POSIX keyword: IEEE Std 1003.1-2001/Cor 2-2004 (XCU/TC2/D6/25)
+    /// removed it because `st_ctime` is an inode change time, not the file
+    /// creation time the keyword claimed to hold. It survives as a widely
+    /// written extension (star, GNU tar), and rule 7 of the listopt format
+    /// admits implementation extensions, so it is parsed for listing and
+    /// written under `-o times`. It is never restored on extract -- POSIX
+    /// gives no portable way to set it.
+    pub ctime: Option<PaxTime>,
+    /// path - file pathname, as raw bytes.
+    ///
+    /// Not a String: a pathname is a byte string on Unix, and a member whose
+    /// name is not valid UTF-8 must round-trip unchanged when
+    /// `hdrcharset=BINARY` says so.
+    pub path: Option<Vec<u8>>,
+    /// linkpath - link target pathname, as raw bytes
+    pub linkpath: Option<Vec<u8>>,
     /// size - file size
     pub size: Option<u64>,
     /// uid - user ID
@@ -128,61 +144,54 @@ impl ExtendedHeader {
                 break;
             }
 
-            // Find the space after length
-            let space_pos = data[pos..].iter().position(|&b| b == b' ').ok_or_else(|| {
-                PaxError::InvalidHeader("invalid extended header format".to_string())
-            })?;
-
-            // Parse length
-            let len_str = std::str::from_utf8(&data[pos..pos + space_pos]).map_err(|_| {
-                PaxError::InvalidHeader("invalid extended header length".to_string())
-            })?;
-            let record_len: usize = len_str.parse().map_err(|_| {
-                PaxError::InvalidHeader("invalid extended header length".to_string())
-            })?;
-
-            if pos + record_len > data.len() {
-                return Err(PaxError::InvalidHeader(
-                    "extended header record extends past end".to_string(),
-                ));
-            }
-
-            // Extract keyword=value (after space, before newline)
-            let record_start = pos + space_pos + 1;
-            let record_end = pos + record_len - 1; // Exclude trailing newline
-
-            if record_end <= record_start {
-                pos += record_len;
-                continue;
-            }
-
-            let record_data = &data[record_start..record_end];
-
-            // Find the '=' separator in raw bytes
-            if let Some(eq_pos) = record_data.iter().position(|&b| b == b'=') {
-                // Keyword must be valid UTF-8
-                let keyword = std::str::from_utf8(&record_data[..eq_pos]).map_err(|_| {
-                    PaxError::InvalidHeader("invalid UTF-8 in extended header keyword".to_string())
-                })?;
-
-                // Value: try UTF-8 first, but SCHILY.xattr.* and some others can be binary
-                // For binary-capable keywords, skip if not valid UTF-8
-                let value_bytes = &record_data[eq_pos + 1..];
-                if let Ok(value) = std::str::from_utf8(value_bytes) {
-                    header.set_keyword(keyword, value)?;
-                } else if keyword.starts_with("SCHILY.xattr.") {
-                    // Binary extended attributes - skip silently (we don't support xattrs)
-                } else {
-                    // Other keywords with invalid UTF-8 - try lossy conversion
-                    let value = String::from_utf8_lossy(value_bytes);
-                    header.set_keyword(keyword, &value)?;
-                }
-            }
-
+            let (record_len, value_start) = parse_record_len(data, pos)?;
+            // record_len is at least value_start - pos + 1, so the trailing
+            // <newline> is inside the record and this cannot underflow.
+            header.apply_record(&data[value_start..pos + record_len - 1])?;
             pos += record_len;
         }
 
         Ok(header)
+    }
+
+    /// Interpret one `keyword=value` record body (the record without its length
+    /// field, <space> and trailing <newline>).
+    fn apply_record(&mut self, record: &[u8]) -> PaxResult<()> {
+        let Some(eq_pos) = record.iter().position(|&b| b == b'=') else {
+            return Ok(()); // no separator: not a record we can use
+        };
+
+        // Keyword must be valid UTF-8
+        let keyword = std::str::from_utf8(&record[..eq_pos]).map_err(|_| {
+            PaxError::InvalidHeader("invalid UTF-8 in extended header keyword".to_string())
+        })?;
+
+        // Value: try UTF-8 first, but SCHILY.xattr.* and some others can be binary
+        // For binary-capable keywords, skip if not valid UTF-8
+        let value_bytes = &record[eq_pos + 1..];
+        // A pathname keyword keeps its bytes whatever they are; under
+        // hdrcharset=BINARY they are deliberately not UTF-8.
+        match keyword {
+            "path" => {
+                self.path = Some(value_bytes.to_vec());
+                return Ok(());
+            }
+            "linkpath" => {
+                self.linkpath = Some(value_bytes.to_vec());
+                return Ok(());
+            }
+            _ => {}
+        }
+        if let Ok(value) = std::str::from_utf8(value_bytes) {
+            self.set_keyword(keyword, value)
+        } else if keyword.starts_with("SCHILY.xattr.") {
+            // Binary extended attributes - skip silently (we don't support xattrs)
+            Ok(())
+        } else {
+            // Other keywords with invalid UTF-8 - try lossy conversion
+            let value = String::from_utf8_lossy(value_bytes);
+            self.set_keyword(keyword, &value)
+        }
     }
 
     /// Set a keyword value
@@ -194,11 +203,14 @@ impl ExtendedHeader {
             "mtime" => {
                 self.mtime = Some(parse_pax_time(value)?);
             }
+            "ctime" => {
+                self.ctime = Some(parse_pax_time(value)?);
+            }
             "path" => {
-                self.path = Some(value.to_string());
+                self.path = Some(value.as_bytes().to_vec());
             }
             "linkpath" => {
-                self.linkpath = Some(value.to_string());
+                self.linkpath = Some(value.as_bytes().to_vec());
             }
             "size" => {
                 self.size =
@@ -245,53 +257,87 @@ impl ExtendedHeader {
         let mut data = Vec::new();
         let per_file = options.per_file_options();
 
-        // Helper to write a record if keyword is not in delete patterns
-        // Also checks for per-file overrides (keyword:=value)
-        let mut write_if_allowed = |keyword: &str, default_value: &str| {
+        // Write a record unless the keyword is deleted, honoring any per-file
+        // `keyword:=value` override. Plain functions rather than closures so the
+        // text and raw-bytes forms can both append to `data`.
+        fn write_if_allowed_bytes(
+            data: &mut Vec<u8>,
+            options: &FormatOptions,
+            per_file: &HashMap<String, String>,
+            keyword: &str,
+            default_value: &[u8],
+        ) {
             if options.should_delete_keyword(keyword) {
                 return;
             }
-            // Check for per-file override
-            let value = per_file
-                .get(keyword)
-                .map(|s| s.as_str())
-                .unwrap_or(default_value);
-            write_pax_record(&mut data, keyword, value);
-        };
+            match per_file.get(keyword) {
+                Some(v) => write_pax_record_bytes(data, keyword, v.as_bytes()),
+                None => write_pax_record_bytes(data, keyword, default_value),
+            }
+        }
+
+        fn write_if_allowed(
+            data: &mut Vec<u8>,
+            options: &FormatOptions,
+            per_file: &HashMap<String, String>,
+            keyword: &str,
+            default_value: &str,
+        ) {
+            write_if_allowed_bytes(data, options, per_file, keyword, default_value.as_bytes());
+        }
+
+        macro_rules! rec {
+            ($kw:expr, $val:expr) => {
+                write_if_allowed(&mut data, options, per_file, $kw, $val)
+            };
+        }
+        macro_rules! rec_bytes {
+            ($kw:expr, $val:expr) => {
+                write_if_allowed_bytes(&mut data, options, per_file, $kw, $val)
+            };
+        }
 
         // Write hdrcharset first so readers know the encoding of subsequent fields
         if let Some(ref charset) = self.hdrcharset {
-            write_if_allowed("hdrcharset", charset);
+            rec!("hdrcharset", charset);
         }
         if let Some(atime) = self.atime {
-            write_if_allowed("atime", &format_pax_time(atime));
+            rec!("atime", &format_pax_time(atime));
         }
         if let Some(mtime) = self.mtime {
-            write_if_allowed("mtime", &format_pax_time(mtime));
+            rec!("mtime", &format_pax_time(mtime));
+        }
+        if let Some(ctime) = self.ctime {
+            rec!("ctime", &format_pax_time(ctime));
         }
         if let Some(ref path) = self.path {
-            write_if_allowed("path", path);
+            rec_bytes!("path", path);
         }
         if let Some(ref linkpath) = self.linkpath {
-            write_if_allowed("linkpath", linkpath);
+            rec_bytes!("linkpath", linkpath);
         }
         if let Some(size) = self.size {
-            write_if_allowed("size", &size.to_string());
+            rec!("size", &size.to_string());
         }
         if let Some(uid) = self.uid {
-            write_if_allowed("uid", &uid.to_string());
+            rec!("uid", &uid.to_string());
         }
         if let Some(gid) = self.gid {
-            write_if_allowed("gid", &gid.to_string());
+            rec!("gid", &gid.to_string());
         }
         if let Some(ref uname) = self.uname {
-            write_if_allowed("uname", uname);
+            rec!("uname", uname);
         }
         if let Some(ref gname) = self.gname {
-            write_if_allowed("gname", gname);
+            rec!("gname", gname);
         }
-        for (key, value) in &self.extra {
-            write_if_allowed(key, value);
+        // Sorted: iterating a HashMap made the record order differ between runs
+        // of the same command, so two invocations produced different bytes for
+        // the same input -- hostile to reproducible builds and to diffing.
+        let mut extra: Vec<_> = self.extra.iter().collect();
+        extra.sort_by(|a, b| a.0.cmp(b.0));
+        for (key, value) in extra {
+            rec!(key.as_str(), value.as_str());
         }
 
         // Per-file overrides (`-o keyword:=value`) for *standard* keywords whose
@@ -303,6 +349,7 @@ impl ExtendedHeader {
             ("hdrcharset", self.hdrcharset.is_some()),
             ("atime", self.atime.is_some()),
             ("mtime", self.mtime.is_some()),
+            ("ctime", self.ctime.is_some()),
             ("path", self.path.is_some()),
             ("linkpath", self.linkpath.is_some()),
             ("size", self.size.is_some()),
@@ -322,7 +369,9 @@ impl ExtendedHeader {
 
         // Also write any per-file options that weren't already present in the header
         // (e.g., user can add custom keywords via -o keyword:=value)
-        for (key, value) in per_file {
+        let mut per_file_sorted: Vec<_> = per_file.iter().collect();
+        per_file_sorted.sort_by(|a, b| a.0.cmp(b.0));
+        for (key, value) in per_file_sorted {
             if options.should_delete_keyword(key) {
                 continue;
             }
@@ -331,6 +380,7 @@ impl ExtendedHeader {
                 "hdrcharset",
                 "atime",
                 "mtime",
+                "ctime",
                 "path",
                 "linkpath",
                 "size",
@@ -354,12 +404,12 @@ impl ExtendedHeader {
         let keep = |kw: &str| !opts.should_delete_keyword(kw);
         if keep("path") {
             if let Some(ref path) = self.path {
-                entry.path = PathBuf::from(path);
+                entry.path = PathBuf::from(OsString::from_vec(path.clone()));
             }
         }
         if keep("linkpath") {
             if let Some(ref linkpath) = self.linkpath {
-                entry.link_target = Some(PathBuf::from(linkpath));
+                entry.link_target = Some(PathBuf::from(OsString::from_vec(linkpath.clone())));
             }
         }
         if keep("size") {
@@ -399,6 +449,14 @@ impl ExtendedHeader {
                 entry.atime_nsec = atime.nsec;
             }
         }
+        // Carried onto the entry so `-o listopt=%(ctime)T` can report it. The
+        // extractor never applies it to the filesystem.
+        if keep("ctime") {
+            if let Some(ctime) = self.ctime {
+                entry.ctime = Some(ctime.sec as u64);
+                entry.ctime_nsec = ctime.nsec;
+            }
+        }
     }
 
     /// Create extended header with options controlling what to include
@@ -415,17 +473,32 @@ impl ExtendedHeader {
         // when it has no '/' at a position that leaves a <= NAME_LEN tail
         // (e.g. a 190-byte "dir/<185-byte-basename>"). Without this record the
         // ustar fallback in split_path() silently truncates the name.
+        let path_bytes = entry.path.as_os_str().as_bytes();
         let path_str = ustar_path_string(entry);
-        if try_split_path(&path_str).is_none() {
-            header.path = Some(entry.path.to_string_lossy().into_owned());
+        let path_is_binary = std::str::from_utf8(path_bytes).is_err();
+        if try_split_path(&path_str).is_none() || path_is_binary {
+            // A non-UTF-8 name has no faithful ustar spelling, so it always
+            // needs the record regardless of length.
+            header.path = Some(path_bytes.to_vec());
         }
 
         // Link path needs extended header if too long
+        let mut link_is_binary = false;
         if let Some(ref link) = entry.link_target {
-            let link_str = link.to_string_lossy();
-            if link_str.len() > LINKNAME_LEN {
-                header.linkpath = Some(link_str.to_string());
+            let link_bytes = link.as_os_str().as_bytes();
+            link_is_binary = std::str::from_utf8(link_bytes).is_err();
+            if link_bytes.len() > LINKNAME_LEN || link_is_binary {
+                header.linkpath = Some(link_bytes.to_vec());
             }
+        }
+
+        // POSIX -o invalid=binary: a member whose name cannot be represented in
+        // the header character set is announced with hdrcharset=BINARY, and its
+        // pathname records carry unencoded bytes. Without this the name was run
+        // through to_string_lossy and every invalid byte became U+FFFD --
+        // irreversibly, and identically to -o invalid=write.
+        if path_is_binary || link_is_binary {
+            header.hdrcharset = Some("BINARY".to_string());
         }
 
         // Size > 8GB needs extended header
@@ -457,6 +530,16 @@ impl ExtendedHeader {
                 None => (entry.mtime as i64, entry.mtime_nsec),
             };
             header.atime = Some(PaxTime { sec, nsec });
+
+            // ctime alongside it. POSIX's `times` keyword names only atime and
+            // mtime, but every implementation that writes one writes all three,
+            // and an archive without it cannot answer `%(ctime)T`.
+            if let Some(ctime) = entry.ctime {
+                header.ctime = Some(PaxTime {
+                    sec: ctime as i64,
+                    nsec: entry.ctime_nsec,
+                });
+            }
         }
 
         // uname/gname with non-ASCII characters
@@ -473,6 +556,38 @@ impl ExtendedHeader {
 
         header
     }
+}
+
+/// Read the `"<len> "` prefix of the record starting at `pos`, returning the
+/// record's total length and the offset of its `keyword=value` body.
+///
+/// The length is the record's own byte count including the length field itself,
+/// so it must exceed that field plus the <space> plus the trailing <newline>. A
+/// length of 0 is the case that matters: it once wrapped `pos + len - 1` to
+/// `usize::MAX` and aborted on the slice, and it would never advance `pos`, so
+/// even a bounds-checked slice would spin forever.
+fn parse_record_len(data: &[u8], pos: usize) -> PaxResult<(usize, usize)> {
+    let bad_len = || PaxError::InvalidHeader("invalid extended header length".to_string());
+
+    let space_pos = data[pos..]
+        .iter()
+        .position(|&b| b == b' ')
+        .ok_or_else(|| PaxError::InvalidHeader("invalid extended header format".to_string()))?;
+
+    let len_str = std::str::from_utf8(&data[pos..pos + space_pos]).map_err(|_| bad_len())?;
+    let record_len: usize = len_str.parse().map_err(|_| bad_len())?;
+
+    let value_start = pos + space_pos + 1;
+    if record_len <= space_pos + 1 {
+        return Err(bad_len());
+    }
+    if pos + record_len > data.len() {
+        return Err(PaxError::InvalidHeader(
+            "extended header record extends past end".to_string(),
+        ));
+    }
+
+    Ok((record_len, value_start))
 }
 
 /// Parse pax time format (decimal seconds with optional fractional part)
@@ -506,6 +621,32 @@ fn format_pax_time(time: PaxTime) -> String {
         let frac = format!("{:09}", time.nsec);
         format!("{}.{}", time.sec, frac.trim_end_matches('0'))
     }
+}
+
+/// Write a pax extended header record whose value is raw bytes.
+///
+/// The record length counts bytes, not characters, so this is also the correct
+/// path for any value that merely happens to be UTF-8.
+fn write_pax_record_bytes(data: &mut Vec<u8>, keyword: &str, value: &[u8]) {
+    let mut content = Vec::with_capacity(keyword.len() + value.len() + 3);
+    content.push(b' ');
+    content.extend_from_slice(keyword.as_bytes());
+    content.push(b'=');
+    content.extend_from_slice(value);
+    content.push(b'\n');
+
+    // Length includes itself, so it has to be solved for.
+    let mut len = content.len() + 1;
+    loop {
+        let total = len.to_string().len() + content.len();
+        if total == len {
+            break;
+        }
+        len = total;
+    }
+
+    data.extend_from_slice(len.to_string().as_bytes());
+    data.extend_from_slice(&content);
 }
 
 /// Write a pax extended header record
@@ -689,12 +830,11 @@ pub struct PaxWriter<W: Write> {
 }
 
 impl<W: Write> PaxWriter<W> {
-    /// Create a new pax writer with default options
-    pub fn new(writer: W) -> Self {
-        Self::with_options(writer, FormatOptions::default())
-    }
-
-    /// Create a new pax writer with specified options
+    /// Create a new pax writer with specified options.
+    ///
+    /// There is deliberately no options-free constructor: the one caller that
+    /// used it was append mode, where it silently discarded every `-o` option
+    /// the user had passed.
     pub fn with_options(writer: W, options: FormatOptions) -> Self {
         PaxWriter {
             writer,
@@ -724,7 +864,9 @@ impl<W: Write> PaxWriter<W> {
 
         // Build extended header data from global options
         let mut data = Vec::new();
-        for (key, value) in global_opts {
+        let mut global_sorted: Vec<_> = global_opts.iter().collect();
+        global_sorted.sort_by(|a, b| a.0.cmp(b.0));
+        for (key, value) in global_sorted {
             // Skip special keywords that aren't actual extended header fields
             if special_keywords.contains(&key.as_str()) {
                 continue;
@@ -991,8 +1133,9 @@ fn calculate_checksum(header: &[u8; BLOCK_SIZE]) -> u32 {
 
 /// Parse a ustar header into an ArchiveEntry
 fn parse_ustar_header(header: &[u8; BLOCK_SIZE]) -> PaxResult<ArchiveEntry> {
-    let name = parse_string(&header[NAME_OFF..NAME_OFF + NAME_LEN]);
-    let prefix = parse_string(&header[PREFIX_OFF..PREFIX_OFF + PREFIX_LEN]);
+    let name = crate::formats::ustar::parse_path_field(&header[NAME_OFF..NAME_OFF + NAME_LEN]);
+    let prefix =
+        crate::formats::ustar::parse_path_field(&header[PREFIX_OFF..PREFIX_OFF + PREFIX_LEN]);
 
     let path = build_path(&prefix, &name);
 
@@ -1005,7 +1148,8 @@ fn parse_ustar_header(header: &[u8; BLOCK_SIZE]) -> PaxResult<ArchiveEntry> {
     let typeflag = header[TYPEFLAG_OFF];
     let entry_type = parse_typeflag(typeflag)?;
 
-    let linkname = parse_string(&header[LINKNAME_OFF..LINKNAME_OFF + LINKNAME_LEN]);
+    let linkname =
+        crate::formats::ustar::parse_path_field(&header[LINKNAME_OFF..LINKNAME_OFF + LINKNAME_LEN]);
     let link_target = if !linkname.is_empty() {
         Some(PathBuf::from(linkname))
     } else {
@@ -1290,7 +1434,7 @@ mod tests {
     #[test]
     fn test_extended_header_roundtrip() {
         let mut ext = ExtendedHeader::new();
-        ext.path = Some("/very/long/path/that/exceeds/ustar/limits".to_string());
+        ext.path = Some(b"/very/long/path/that/exceeds/ustar/limits".to_vec());
         ext.size = Some(10000000000);
         ext.mtime = Some(PaxTime {
             sec: 1234567890,

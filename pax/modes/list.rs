@@ -12,7 +12,9 @@
 use crate::archive::{ArchiveEntry, ArchiveFormat, ArchiveReader, EntryType};
 use crate::error::PaxResult;
 use crate::formats::{CpioReader, PaxReader, UstarReader};
-use crate::options::{format_list_entry, FormatOptions, ListEntryInfo};
+use crate::options::{
+    format_list_entry, format_mode_symbolic, format_time_traditional, FormatOptions, ListEntryInfo,
+};
 use crate::pattern::{find_matching_pattern_subtree, Pattern};
 use crate::subst::{apply_substitutions, SubstResult, Substitution};
 use std::collections::HashSet;
@@ -56,7 +58,10 @@ pub fn list_archive<R: Read, W: Write>(
             list_entries(&mut archive, writer, options)
         }
         ArchiveFormat::Pax => {
-            let mut archive = PaxReader::new(reader);
+            // Same as read mode: without the options the reader ignores
+            // `-o delete=`, so a keyword suppressed on extract was still shown
+            // in the listing.
+            let mut archive = PaxReader::new(reader).with_options(options.format_options.clone());
             list_entries(&mut archive, writer, options)
         }
     }
@@ -87,6 +92,9 @@ fn list_entries<R: ArchiveReader, W: Write>(
                 archive.skip_data()?;
                 continue;
             }
+            // `-o keyword:=value` forces a value regardless of what the archive
+            // carried, and the listing must report what extraction would use.
+            crate::modes::read::apply_keyword_overrides(&mut entry, &options.format_options);
             // Apply substitutions
             if !options.substitutions.is_empty() {
                 let path_str = entry.path.to_string_lossy();
@@ -152,7 +160,14 @@ fn should_list(
     let expand_subtree = !options.dir_only;
     let matching_pattern = find_matching_pattern_subtree(&options.patterns, &path, expand_subtree)
         .or_else(|| {
-            find_matching_pattern_subtree(&options.patterns, path_stripped, expand_subtree)
+            // Only worth a second pass when stripping actually changed
+            // something; otherwise this repeats the first pass verbatim for
+            // every non-matching member.
+            if std::ptr::eq(path_stripped, path.as_ref() as &str) {
+                None
+            } else {
+                find_matching_pattern_subtree(&options.patterns, path_stripped, expand_subtree)
+            }
         });
 
     match matching_pattern {
@@ -199,6 +214,8 @@ fn print_entry<W: Write>(
             mode: entry.mode,
             size: entry.size,
             mtime: entry.mtime,
+            atime: entry.atime,
+            ctime: entry.ctime,
             uid: entry.uid,
             gid: entry.gid,
             uname: entry.uname.as_deref(),
@@ -224,12 +241,12 @@ fn print_entry<W: Write>(
 
 /// Print verbose ls -l style output
 fn print_verbose<W: Write>(writer: &mut W, entry: &ArchiveEntry) -> PaxResult<()> {
-    let mode_str = format_mode(entry);
+    let mode_str = format_mode_symbolic(entry.mode, entry.entry_type);
     let nlink = entry.nlink;
     let owner = format_owner(entry);
     let group = format_group(entry);
     let size = entry.size;
-    let mtime = format_mtime(entry.mtime);
+    let mtime = format_time_traditional(entry.mtime);
     let path = &entry.path;
 
     let link_suffix = format_link_suffix(entry);
@@ -250,67 +267,6 @@ fn print_verbose<W: Write>(writer: &mut W, entry: &ArchiveEntry) -> PaxResult<()
     Ok(())
 }
 
-/// Format mode string like "drwxr-xr-x"
-fn format_mode(entry: &ArchiveEntry) -> String {
-    let mut s = String::with_capacity(10);
-
-    // File type
-    s.push(match entry.entry_type {
-        EntryType::Directory => 'd',
-        EntryType::Symlink => 'l',
-        // A hard link is a regular file with a link count > 1; POSIX `ls -l`
-        // (and the pax `-v` listing) shows it with the regular-file type char.
-        EntryType::Hardlink => '-',
-        EntryType::BlockDevice => 'b',
-        EntryType::CharDevice => 'c',
-        EntryType::Fifo => 'p',
-        EntryType::Socket => 's',
-        EntryType::Regular => '-',
-    });
-
-    // User permissions
-    s.push(if entry.mode & 0o400 != 0 { 'r' } else { '-' });
-    s.push(if entry.mode & 0o200 != 0 { 'w' } else { '-' });
-    s.push(format_execute_bit(entry.mode, 0o100, 0o4000));
-
-    // Group permissions
-    s.push(if entry.mode & 0o040 != 0 { 'r' } else { '-' });
-    s.push(if entry.mode & 0o020 != 0 { 'w' } else { '-' });
-    s.push(format_execute_bit(entry.mode, 0o010, 0o2000));
-
-    // Other permissions
-    s.push(if entry.mode & 0o004 != 0 { 'r' } else { '-' });
-    s.push(if entry.mode & 0o002 != 0 { 'w' } else { '-' });
-    s.push(format_execute_bit(entry.mode, 0o001, 0o1000));
-
-    s
-}
-
-/// Format execute bit with setuid/setgid/sticky handling
-fn format_execute_bit(mode: u32, exec_bit: u32, special_bit: u32) -> char {
-    let has_exec = mode & exec_bit != 0;
-    let has_special = mode & special_bit != 0;
-
-    match (has_exec, has_special) {
-        (true, true) => {
-            if special_bit == 0o1000 {
-                't'
-            } else {
-                's'
-            }
-        }
-        (false, true) => {
-            if special_bit == 0o1000 {
-                'T'
-            } else {
-                'S'
-            }
-        }
-        (true, false) => 'x',
-        (false, false) => '-',
-    }
-}
-
 /// Format owner name or uid
 fn format_owner(entry: &ArchiveEntry) -> String {
     entry.uname.clone().unwrap_or_else(|| entry.uid.to_string())
@@ -319,25 +275,6 @@ fn format_owner(entry: &ArchiveEntry) -> String {
 /// Format group name or gid
 fn format_group(entry: &ArchiveEntry) -> String {
     entry.gname.clone().unwrap_or_else(|| entry.gid.to_string())
-}
-
-/// Format modification time
-fn format_mtime(mtime: u64) -> String {
-    // POSIX `ls -l`-style time: a date+time for recent members, a date+year for
-    // members older than ~6 months (or in the future). Formatting goes through
-    // libc strftime via localtime_r, so TZ and LC_TIME (month names) take effect.
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let age = now - mtime as i64;
-    let six_months: i64 = 180 * 24 * 60 * 60;
-    let recent = (0..six_months).contains(&age);
-
-    let fmt = if recent { "%b %e %H:%M" } else { "%b %e  %Y" };
-    plib::locale::strftime(fmt, mtime as i64).unwrap_or_else(|_| mtime.to_string())
 }
 
 /// Format link suffix for symlinks and hardlinks

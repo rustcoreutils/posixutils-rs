@@ -172,17 +172,24 @@ fn cmpint(lhs: i128, rhs: i128, op: CmpOp) -> Token {
 }
 
 // compare two strings
+//
+// POSIX 94588-94590 requires the relational operators to compare strings using
+// "the collating sequence of the current locale", so this must go through
+// `strcoll(3)` rather than Rust's byte-wise `Ord`. Every operator is affected,
+// not just `<`/`>`: in locales where two distinct strings collate equal, `=`
+// must report equality.
 fn cmpstr(lhs: &Token, rhs: &Token, op: CmpOp) -> Result<Token, &'static str> {
     let lhs = token_to_string(lhs)?;
     let rhs = token_to_string(rhs)?;
 
+    let ord = plib::locale::strcoll(&lhs, &rhs);
     let result: bool = match op {
-        CmpOp::EQ => lhs == rhs,
-        CmpOp::NE => lhs != rhs,
-        CmpOp::GT => lhs > rhs,
-        CmpOp::LT => lhs < rhs,
-        CmpOp::GE => lhs >= rhs,
-        CmpOp::LE => lhs <= rhs,
+        CmpOp::EQ => ord.is_eq(),
+        CmpOp::NE => ord.is_ne(),
+        CmpOp::GT => ord.is_gt(),
+        CmpOp::LT => ord.is_lt(),
+        CmpOp::GE => ord.is_ge(),
+        CmpOp::LE => ord.is_le(),
     };
 
     Ok(Token::Integer(result as i128))

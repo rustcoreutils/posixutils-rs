@@ -101,28 +101,26 @@ fn classify(symbol: &Symbol<'_, '_>, section_kinds: &HashMap<SectionIndex, Secti
 
 /// Whether a symbol passes the active filters (-f/-g/-u/-e).
 fn included(symbol: &Symbol<'_, '_>, args: &Args) -> bool {
+    let is_section = symbol.kind() == SymbolKind::Section;
     match symbol.kind() {
         // File-name symbols are never part of the name list.
         SymbolKind::File => return false,
         // The redundant section symbols (.text/.data/.bss) are suppressed by
         // default and only shown with -f (#N10).
-        SymbolKind::Section => {
-            if !args.full {
-                return false;
-            }
-            // Checked before the empty-name guard below: an ELF section symbol
-            // has `st_name == 0`, so its *symbol* name is empty and the guard
-            // would drop it before -f was ever consulted — which is why -f
-            // produced output identical to the default. Its display name comes
-            // from the section it refers to (`section_symbol_name`).
-            return true;
-        }
+        SymbolKind::Section if !args.full => return false,
         _ => {}
     }
-    // The unnamed null symbol (index 0) is not part of the name list.
-    if symbol.name().map(str::is_empty).unwrap_or(true) {
+    // The unnamed null symbol (index 0) is not part of the name list. A section
+    // symbol is exempt: an ELF section symbol has `st_name == 0`, so its
+    // *symbol* name is empty and this guard would drop it before -f was ever
+    // consulted — which is why -f produced output identical to the default. Its
+    // display name comes from the section it refers to (`section_symbol_name`).
+    if !is_section && symbol.name().map(str::is_empty).unwrap_or(true) {
         return false;
     }
+    // Only the empty-name guard is skipped. -f is additive — it un-suppresses
+    // the redundant symbols — so the restrictive filters below still apply, and
+    // a section symbol is neither undefined (-u) nor global (-g).
     if args.global && !symbol.is_global() {
         return false;
     }

@@ -1672,6 +1672,45 @@ fn test_nm_undefined_filter() {
     assert!(stdout.contains("undef_sym"));
 }
 
+/// `-f` is additive: it un-suppresses the redundant section symbols, but it
+/// must not switch off the restrictive filters. POSIX gives `-u` as "write only
+/// undefined symbols" and `-g` as "write only external (global) symbol
+/// information", and a section symbol is neither undefined nor global.
+#[test]
+fn test_nm_full_output_still_honors_filters() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let obj = nm_compile_obj(dir.path(), "t", NM_SRC);
+    let path = obj.to_str().unwrap();
+
+    let out = nm_run(&["-u", "-f", path]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in stdout.lines() {
+        assert_eq!(
+            nm_line_type(line),
+            "U",
+            "-u -f must keep only undefined symbols: {}",
+            line
+        );
+    }
+    assert!(
+        stdout.contains("undef_sym"),
+        "-u -f still has to report the undefined symbol: {}",
+        stdout
+    );
+
+    let out = nm_run(&["-g", "-f", path]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in stdout.lines() {
+        assert!(
+            nm_line_type(line).chars().all(|c| c.is_ascii_uppercase()),
+            "-g -f must keep only global symbols: {}",
+            line
+        );
+    }
+}
+
 #[test]
 fn test_nm_print_name_prefix() {
     // #N4: -A prefixes every line with the object pathname.

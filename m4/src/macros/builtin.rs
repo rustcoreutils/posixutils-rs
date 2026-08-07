@@ -1116,7 +1116,7 @@ impl MacroImplementation for SyscmdMacro {
     fn evaluate(
         &self,
         mut state: State,
-        _stderr: &mut dyn Write,
+        stderr: &mut dyn Write,
         frame: StackFrame,
     ) -> Result<State> {
         let first_arg = frame
@@ -1124,6 +1124,12 @@ impl MacroImplementation for SyscmdMacro {
             .into_iter()
             .next()
             .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
+        // The child inherits our file descriptors and writes straight to fd 1,
+        // while our own output is still sitting in a buffered writer. Flush
+        // first so the child's output appears after the text we already
+        // produced rather than jumping ahead of it.
+        state.output.output.stdout().borrow_mut().flush()?;
+        stderr.flush()?;
         let status = system(&first_arg)?;
         state.last_syscmd_status = Some(status);
         Ok(state)

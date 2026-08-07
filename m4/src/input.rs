@@ -196,6 +196,9 @@ pub struct Input {
     pub pushback_buffer: Vec<u8>,
     pub line_number: usize,
     pub syncline_line_number: usize,
+    /// A `<newline>` has been consumed but not yet accounted for. See
+    /// [`Input::get_next_character`].
+    pending_newline: bool,
 }
 
 impl Input {
@@ -205,6 +208,7 @@ impl Input {
             pushback_buffer: Vec::new(),
             line_number: 1,
             syncline_line_number: 0,
+            pending_newline: false,
         }
     }
 
@@ -221,8 +225,18 @@ impl Input {
 
         let c = buf[0];
 
-        if c == b'\n' {
+        // `line_number` names the line the character being returned sits on, so
+        // a `<newline>` only advances it once the first character of the next
+        // line is consumed. Advancing eagerly misattributes a diagnostic raised
+        // by a macro call that ends at end-of-line to the following line, since
+        // deciding whether the macro name is followed by `(` already consumes
+        // the `<newline>`.
+        if self.pending_newline {
             self.line_number += 1;
+            self.pending_newline = false;
+        }
+        if c == b'\n' {
+            self.pending_newline = true;
         }
 
         Ok(c)

@@ -145,7 +145,7 @@ instead of continuing, and all string handling is **byte-, not character-based**
 Enabled fixtures cover define/pushdef/popdef, divert/undivert (incl. nested), eval,
 ifelse, ifdef, incr/index/len/substr/translit, dnl, shift, m4wrap, m4exit, include/
 sinclude, trace, and recursion. Regression fixtures added while closing the audit
-(now 83 passing / 9 ignored):
+(now 91 passing / 2 ignored):
 
 - [x] `index_empty_second_arg` (#1); `eval_divide_by_zero`, `eval_modulo_by_zero` (#2).
 - [x] `eval_radix` (#3), `eval_base_literals` (#4), `eval_shift_precedence` (#5).
@@ -161,13 +161,47 @@ sinclude, trace, and recursion. Regression fixtures added while closing the audi
   re-enabled as ordinary `m4_test!`s. Nothing recorded when they started
   passing, which is the hazard of a permanently-ignored fixture — it stops
   reporting in either direction.
-- [ ] Seven remain genuine divergences: `bsd`, `define_eval_order_unquoted`,
-  `define_eval_syntax_order_quoted_evaluated`, `define_eval_syntax_order_unquoted`,
-  `synclines_1`, `synclines_2`, `syscmd_sysval`. The first four are
-  define/eval evaluation-order differences, the `synclines_*` pair concerns
-  `#line` sync-line emission, and `syscmd_sysval` the `sysval` result of
-  `syscmd`. Still out of audit scope, but now enumerated by failure theme
-  rather than counted.
+- [x] The remaining seven were re-triaged 2026-08-07 against GNU m4 1.4.19 as an
+  oracle. **The earlier "seven genuine divergences, four of them define/eval
+  evaluation-order" characterization was wrong on both counts.** Five now pass
+  and are re-enabled as ordinary `m4_test!`s; only the `synclines_*` pair
+  remains ignored. What each actually was:
+  - `bsd` — **not an evaluation-order divergence at all**: pure fixture drift.
+    `bsd.m4` had been edited after `bsd.out` was captured (comment block
+    duplicated, `ack(2,3)` → `ack(1,1)`); every line involved is an m4 comment
+    passed through verbatim. Our output is byte-identical to GNU's, on both
+    streams. `.out` regenerated.
+  - `define_eval_order_unquoted` — the computed result (`6`) was always right.
+    The `.out` predated the Phase D change that made the `invalid macro name`
+    warning unconditional: the third `define`'s unquoted first argument really
+    does expand to `5`, so warning is correct. (GNU 1.4.19 is silent here;
+    POSIX leaves an invalid macro name unspecified and we keep the warning.)
+    `.out` refreshed, `.args` added so the diagnostic names the file.
+  - `define_eval_syntax_order_unquoted` — two staleness bugs, no code bug: the
+    `.out` baked in a *file* path while the harness fed the fixture on stdin
+    (fixed with a `.args` file), and `status=0` predated the Phase A/D decision
+    that a bad `eval` expression sets a non-zero exit. We diverge from GNU here
+    deliberately — GNU exits 0 — because POSIX requires `>0` on error.
+  - `define_eval_syntax_order_quoted_evaluated` — same two staleness bugs, plus
+    one real defect: the diagnostic named line 2 for a call ending at the end of
+    line 1. `Input::line_number` was advanced the moment a `<newline>` was read,
+    and deciding whether a macro name is followed by `(` already consumes it.
+    Fixed by deferring the advance until the first character of the next line is
+    consumed, so the number names the line of the character being returned.
+    Now matches GNU exactly.
+  - `syscmd_sysval` — **not about `sysval`**, whose values were already correct.
+    An output-interleaving bug: `syscmd` spawns `sh -c` with fd 1 inherited
+    while our own output sits in a buffered writer, so the child's output jumped
+    ahead of text we had already produced. Fixed by flushing stdout and stderr
+    before the spawn.
+- [ ] `synclines_1` / `synclines_2` remain ignored — the one genuine feature
+  divergence of the seven. `-s` is implemented, but emits reactively after every
+  output newline using the reader's already-advanced line number, so it never
+  produces GNU's short `#line N` form, misattributes lines, and emits both
+  duplicate and missing directives. The fixtures are a faithful GNU oracle
+  (verified byte-identical to GNU 1.4.19's output); the misleading "matches the
+  BSD algorithm" comment in `synclines_2.out` describes the *implementation*,
+  not the expectation. Fix is a lazy emission state machine — see the plan.
 
 ## Suggested PR groupings
 

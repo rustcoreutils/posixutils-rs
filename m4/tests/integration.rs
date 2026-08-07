@@ -176,17 +176,23 @@ macro_rules! m4_test_regex {
 // Standard tests
 // ============================================================================
 
+m4_test!(bsd);
+m4_test!(bsd_math);
 m4_test!(changecom);
 m4_test!(changequote);
 m4_test!(decr);
 m4_test!(define);
 m4_test!(define_args);
+m4_test!(define_eval_order_unquoted);
+m4_test!(define_eval_syntax_order_quoted_evaluated);
 m4_test!(define_eval_syntax_order_quoted_unevaluated);
+m4_test!(define_eval_syntax_order_unquoted);
 m4_test!(define_hanging_quotes);
 m4_test!(define_invalid_macro_name);
 m4_test!(define_iterative);
 m4_test!(define_iterative_2);
 m4_test!(define_nested);
+m4_test!(define_nested_first_arg);
 m4_test!(define_order_defined);
 m4_test!(define_order_undefined);
 m4_test!(define_pushpopdef_undefine);
@@ -250,6 +256,7 @@ m4_test!(reverse);
 m4_test!(shift);
 m4_test!(sinclude);
 m4_test!(substr);
+m4_test!(syscmd_sysval);
 m4_test!(trace);
 m4_test!(translit);
 m4_test!(translit_single_arg);
@@ -264,15 +271,11 @@ m4_test!(undivert_nested);
 // Ignored tests
 // ============================================================================
 
-m4_test_ignore!(bsd);
-m4_test!(bsd_math);
-m4_test_ignore!(define_eval_order_unquoted);
-m4_test_ignore!(define_eval_syntax_order_quoted_evaluated);
-m4_test_ignore!(define_eval_syntax_order_unquoted);
-m4_test!(define_nested_first_arg);
+// `-s` still follows a BSD-style emission scheme; the fixtures encode GNU's
+// lazy scheme (short `#line N` form, attribution to the source of the next
+// output byte). See `m4/audit.md`.
 m4_test_ignore!(synclines_1);
 m4_test_ignore!(synclines_2);
-m4_test_ignore!(syscmd_sysval);
 
 // ============================================================================
 // Expect error tests (stderr may not match exactly)

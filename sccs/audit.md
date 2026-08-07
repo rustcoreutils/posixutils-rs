@@ -584,7 +584,32 @@ re-listed per row.
 - [x] `:A:`/`:W:`/`:Z:` what-string keywords — `prs_what_string_keywords`.
   *Recorded divergence:* with the module-type flag unset, CSSC renders `:Y:` inside `:A:` as the literal `none` (`@(#)none p1 1.3@(#)`) while we render it empty. The spec (112350-112351) does not mandate a "none" spelling for an unset keyword, and embedding the word into a what-string is the less useful reading, so ours is kept. With the flag set the two agree byte-for-byte.
 - [x] Multi-file / directory / `-` stdin operands and the error exit code — `prs_operand_forms_and_exit_status`.
-- [ ] `-c` cutoff and the remaining `:FL:`/`:GB:`/`:MR:`/`:FD:` keywords.
+- [x] Closed 2026-08-07. `:FL:`, `:GB:`, `:MR:` and `:FD:` were re-probed
+  against CSSC 1.4.1 on a fixture carrying flags, a description and an MR, and
+  matched byte-for-byte — stale box. `-c` did not: two defects, #P3 and #P4.
+
+#### `-c` cutoff *(found 2026-08-07)*
+- [x] **#P3 — the cutoff was ignored unless `-e` or `-l` was given.** The
+  no-`-e`/`-l` arm of the delta filter was a stub whose only content was the
+  comment "This will be handled differently", so `prs -c<date>` reported the
+  newest delta whatever the cutoff said. 112241-112243 states the rule
+  unconditionally, and the synopsis at 112215 makes `[-e|-l]` optional in the
+  `-c` form, so the cutoff now applies in all three forms; only `-l` inverts
+  the comparison. CSSC refuses `-c` without `-e`/`-l` outright ("Either the -e
+  or -l switch must used with a cutoff date"), so it cannot arbitrate here and
+  the spec governs.
+
+- [x] **#P4 — the cutoff year was guessed as 4-digit.** `parse_cutoff` treated
+  a >=4-digit argument whose first two digits were >= 19 as a 4-digit year, so
+  the conforming `-c2508` (August 2025) became the year 2508 and let every
+  delta through. POSIX defines only the 2-digit YY with the [69,99]=19xx /
+  [00,68]=20xx pivot (112236-112237); there is no 4-digit form to infer. `get`
+  never had this — its `parse_cutoff` was already 2-digit-only — so the two
+  had silently diverged. While here, `prs` also gained the component-range
+  check `get` already had (month 13, hour 25) and now rejects an unparseable
+  `-c` instead of dropping it, which had reported every delta and looked like
+  a successful query. Tests `prs_cutoff_applies_without_e_or_l`,
+  `prs_cutoff_year_is_always_two_digits`, `prs_cutoff_invalid_field_rejected`.
 
 ---
 

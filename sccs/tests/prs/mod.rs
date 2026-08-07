@@ -553,3 +553,115 @@ fn prs_operand_forms_and_exit_status() {
     assert_eq!(out.status.code(), Some(1));
     assert!(!out.stderr.is_empty(), "a diagnostic is required");
 }
+
+/// The `-c` cutoff applies whether or not `-e`/`-l` is given: "No changes
+/// (deltas) to the SCCS file that were created after the specified cutoff
+/// date-time shall be included in the output" (112241-112243) is unconditional,
+/// and the synopsis at 112215 makes `[-e|-l]` optional in the `-c` form.
+///
+/// Uses the checked-in fixture, whose deltas are pinned at 25/12/12 22:24:47
+/// (1.1), 22:24:57 (1.2) and 22:25:05 (1.3), so the expectations do not depend
+/// on when the suite runs.
+#[test]
+fn prs_cutoff_applies_without_e_or_l() {
+    let tmp = TempDir::new().unwrap();
+    let sfile = tmp.path().join("s.multi");
+    std::fs::copy(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/s.multi"),
+        &sfile,
+    )
+    .unwrap();
+
+    let sids = |args: &[&str]| -> String {
+        let out = run_in("prs", args, tmp.path(), "");
+        assert!(
+            out.status.success(),
+            "prs {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    // Cutoff after the whole history: the newest delta is still reported.
+    assert_eq!(sids(&["-c25", "-d:I:", "s.multi"]), "1.3\n");
+
+    // Cutoff before the whole history: nothing survives it. Without the fix
+    // this printed 1.3, because -c was parsed and then ignored.
+    assert_eq!(
+        sids(&["-c2412", "-d:I:", "s.multi"]),
+        "",
+        "a cutoff before every delta must exclude them all"
+    );
+
+    // -e and -l keep working, and agree on the same boundary.
+    assert_eq!(
+        sids(&["-e", "-c2512122224", "-d:I:", "s.multi"]),
+        "1.2\n1.1\n",
+        "-e takes everything up to and including the cutoff"
+    );
+    assert_eq!(
+        sids(&["-l", "-c251212222500", "-d:I:", "s.multi"]),
+        "1.3\n",
+        "-l takes everything from the cutoff onward"
+    );
+}
+
+/// The cutoff's year is always two digits with the [69,99]=19xx / [00,68]=20xx
+/// pivot (112236-112237). There is no 4-digit-year form to infer.
+#[test]
+fn prs_cutoff_year_is_always_two_digits() {
+    let tmp = TempDir::new().unwrap();
+    let sfile = tmp.path().join("s.multi");
+    std::fs::copy(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/s.multi"),
+        &sfile,
+    )
+    .unwrap();
+
+    let sids = |args: &[&str]| -> String {
+        let out = run_in("prs", args, tmp.path(), "");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    // "2512" is December 2025, not the year 2512. Reading it as a 4-digit year
+    // put the cutoff five centuries out and let every delta through.
+    assert_eq!(
+        sids(&["-e", "-c2512", "-d:I:", "s.multi"]),
+        "1.3\n1.2\n1.1\n",
+        "2512 means December 2025, which is after the whole fixture"
+    );
+    assert_eq!(
+        sids(&["-e", "-c2511", "-d:I:", "s.multi"]),
+        "",
+        "November 2025 precedes the fixture's deltas"
+    );
+
+    // 69-99 select the 20th century, so these precede everything.
+    assert_eq!(sids(&["-e", "-c99", "-d:I:", "s.multi"]), "");
+    assert_eq!(sids(&["-e", "-c69", "-d:I:", "s.multi"]), "");
+}
+
+/// An out-of-range cutoff component is rejected rather than ignored. Dropping
+/// an unparseable `-c` would report every delta, which reads as a successful
+/// query rather than a rejected one.
+#[test]
+fn prs_cutoff_invalid_field_rejected() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::copy(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/s.multi"),
+        tmp.path().join("s.multi"),
+    )
+    .unwrap();
+
+    for bad in ["-c251312", "-c25121225", "-c2512122260"] {
+        let out = run_in("prs", &["-e", bad, "-d:I:", "s.multi"], tmp.path(), "");
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{bad} must be rejected, got stdout {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(out.stdout.is_empty(), "{bad} must not report deltas anyway");
+        assert!(!out.stderr.is_empty(), "{bad} needs a diagnostic");
+    }
+}

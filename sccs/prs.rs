@@ -524,16 +524,13 @@ fn parse_cutoff(cutoff: &str) -> Option<(u16, u8, u8, u8, u8, u8)> {
         return None;
     }
 
-    // Parse year (required)
-    let (year, rest) = if len >= 4 && digits[0..2].parse::<u16>().unwrap_or(0) >= 19 {
-        // 4-digit year
-        (digits[0..4].parse().ok()?, &digits[4..])
-    } else {
-        // 2-digit year
-        let yy: u16 = digits[0..2].parse().ok()?;
-        let year = if yy < 69 { 2000 + yy } else { 1900 + yy };
-        (year, &digits[2..])
-    };
+    // POSIX -c uses a 2-digit year (YY) with the documented century pivot:
+    // 69-99 => 1900+, 00-68 => 2000+ (112236-112237). There is no 4-digit-year
+    // form: guessing one from "the first two digits look like a century"
+    // misreads conforming input, e.g. -c2508 (August 2025) became year 2508.
+    let yy: u16 = digits[0..2].parse().ok()?;
+    let year = if yy < 69 { 2000 + yy } else { 1900 + yy };
+    let rest = &digits[2..];
 
     let month = if rest.len() >= 2 {
         rest[0..2].parse().unwrap_or(12)
@@ -568,6 +565,13 @@ fn parse_cutoff(cutoff: &str) -> Option<(u16, u8, u8, u8, u8, u8)> {
     } else {
         59
     };
+
+    // Reject an out-of-range component rather than filtering nonsensically:
+    // `-c251312` (month 13) or an hour of 25 would otherwise silently select
+    // some arbitrary set of deltas. `get` applies the same check.
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 59 {
+        return None;
+    }
 
     Some((year, month, day, hour, min, sec))
 }
@@ -651,8 +655,18 @@ fn prs_file(sfile: &Path, args: &Args) -> io::Result<bool> {
         None => None,
     };
 
-    // Parse cutoff if specified
-    let cutoff = args.cutoff.as_ref().and_then(|c| parse_cutoff(c));
+    // Parse cutoff if specified. An unparseable one is an error: silently
+    // dropping it would report every delta, which looks like a successful
+    // query rather than a rejected one.
+    let cutoff = match args.cutoff.as_deref() {
+        Some(c) => Some(parse_cutoff(c).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{}: '{}'", gettext("Invalid cutoff date"), c),
+            )
+        })?),
+        None => None,
+    };
 
     // Determine which deltas to process
     let deltas: Vec<&DeltaEntry> = sccs
@@ -685,19 +699,19 @@ fn prs_file(sfile: &Path, args: &Args) -> io::Result<bool> {
                 }
             }
 
-            // Filter by cutoff
+            // Filter by cutoff. "No changes (deltas) to the SCCS file that
+            // were created after the specified cutoff date-time shall be
+            // included in the output" (112241-112243) is unconditional, so it
+            // applies without -e/-l too — the synopsis at 112215 makes -e|-l
+            // optional in the -c form. Only -l inverts the comparison, since
+            // it asks for deltas at or later than the cutoff.
             if let Some(cutoff) = cutoff {
-                if args.earlier {
-                    if !delta_before_cutoff(d, cutoff) {
-                        return false;
-                    }
-                } else if args.later {
+                if args.later {
                     if !delta_after_cutoff(d, cutoff) {
                         return false;
                     }
-                } else {
-                    // Find the last delta before cutoff
-                    // This will be handled differently
+                } else if !delta_before_cutoff(d, cutoff) {
+                    return false;
                 }
             }
 

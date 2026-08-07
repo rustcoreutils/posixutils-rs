@@ -1039,8 +1039,9 @@ fn calculate_checksum(header: &[u8; BLOCK_SIZE]) -> u32 {
 
 /// Parse a ustar header into an ArchiveEntry
 fn parse_ustar_header(header: &[u8; BLOCK_SIZE]) -> PaxResult<ArchiveEntry> {
-    let name = parse_string(&header[NAME_OFF..NAME_OFF + NAME_LEN]);
-    let prefix = parse_string(&header[PREFIX_OFF..PREFIX_OFF + PREFIX_LEN]);
+    let name = crate::formats::ustar::parse_path_field(&header[NAME_OFF..NAME_OFF + NAME_LEN]);
+    let prefix =
+        crate::formats::ustar::parse_path_field(&header[PREFIX_OFF..PREFIX_OFF + PREFIX_LEN]);
 
     let path = build_path(&prefix, &name);
 
@@ -1053,7 +1054,8 @@ fn parse_ustar_header(header: &[u8; BLOCK_SIZE]) -> PaxResult<ArchiveEntry> {
     let typeflag = header[TYPEFLAG_OFF];
     let entry_type = parse_typeflag(typeflag)?;
 
-    let linkname = parse_string(&header[LINKNAME_OFF..LINKNAME_OFF + LINKNAME_LEN]);
+    let linkname =
+        crate::formats::ustar::parse_path_field(&header[LINKNAME_OFF..LINKNAME_OFF + LINKNAME_LEN]);
     let link_target = if !linkname.is_empty() {
         Some(PathBuf::from(linkname))
     } else {

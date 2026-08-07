@@ -285,7 +285,7 @@ fn parse_string(bytes: &[u8]) -> String {
 /// These are NUL-terminated and a trailing <space> is a legitimate pathname
 /// character, so only the NUL terminator delimits the value — unlike the
 /// space-padded fields, no whitespace is trimmed.
-fn parse_path_field(bytes: &[u8]) -> String {
+pub(crate) fn parse_path_field(bytes: &[u8]) -> String {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     String::from_utf8_lossy(&bytes[..end]).to_string()
 }

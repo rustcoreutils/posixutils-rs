@@ -1882,13 +1882,20 @@ pub mod paths {
 
         let mut out = Vec::new();
         if operands.len() == 1 && operands[0].as_os_str() == "-" {
+            // "Non-SCCS files and unreadable files shall be silently ignored"
+            // (get 99128, delta 92266, unget 119264, admin 84123). A list piped
+            // from `ls` or `find` routinely names ordinary files, and
+            // diagnosing them would both spam stderr and fail the exit status.
             let stdin = std::io::stdin();
             for line in stdin.lock().lines().map_while(Result::ok) {
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
                 }
-                push(PathBuf::from(trimmed), &mut out);
+                let path = PathBuf::from(trimmed);
+                if path.is_dir() || is_sfile(&path) {
+                    push(path, &mut out);
+                }
             }
         } else {
             for op in operands {

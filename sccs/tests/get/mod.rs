@@ -479,3 +479,386 @@ fn get_writes_the_pfile_beside_the_sfile() {
         "the g-file still belongs in the current directory"
     );
 }
+
+/// `-m` prefixes each line with the SID of the delta that inserted it, `-n`
+/// with the module name, and the two combine (module name, tab, SID, tab).
+#[test]
+fn get_line_prefix_options() {
+    let tmp = TempDir::new().unwrap();
+    let out = super::common::run_in("admin", &["-i", "s.pfx"], tmp.path(), "line one\n");
+    assert!(out.status.success());
+
+    let out = super::common::run_in("get", &["-p", "-s", "-m", "s.pfx"], tmp.path(), "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "1.1\tline one\n",
+        "-m prefixes the inserting delta's SID"
+    );
+
+    let out = super::common::run_in("get", &["-p", "-s", "-n", "s.pfx"], tmp.path(), "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "pfx\tline one\n",
+        "-n prefixes the module name"
+    );
+
+    let out = super::common::run_in("get", &["-p", "-s", "-m", "-n", "s.pfx"], tmp.path(), "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "pfx\t1.1\tline one\n",
+        "-n -m prefixes the module name then the SID"
+    );
+}
+
+/// `-g` suppresses retrieval: the SID is reported but no g-file is written.
+/// Useful for verifying a SID exists without materializing it.
+#[test]
+fn get_g_suppresses_retrieval() {
+    let tmp = TempDir::new().unwrap();
+    let out = super::common::run_in("admin", &["-i", "s.nog"], tmp.path(), "body\n");
+    assert!(out.status.success());
+
+    let out = super::common::run_in("get", &["-g", "s.nog"], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "get -g failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !tmp.path().join("nog").exists(),
+        "-g must not create a g-file"
+    );
+
+    // A SID that does not exist is still an error under -g.
+    let out = super::common::run_in("get", &["-g", "-r9.9", "s.nog"], tmp.path(), "");
+    assert_eq!(out.status.code(), Some(1), "-g must still validate the SID");
+}
+
+/// #G8: `get -e` takes the z-file lock while it works and releases it
+/// afterwards; the p-file, by contrast, persists to record the pending edit.
+#[test]
+fn get_edit_leaves_pfile_but_no_zfile() {
+    let tmp = TempDir::new().unwrap();
+    let out = super::common::run_in("admin", &["-i", "s.lock"], tmp.path(), "body\n");
+    assert!(out.status.success());
+
+    let out = super::common::run_in("get", &["-e", "s.lock"], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "get -e failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        tmp.path().join("p.lock").exists(),
+        "the p-file records the pending edit"
+    );
+    assert!(
+        !tmp.path().join("z.lock").exists(),
+        "the z-file lock must be released when get finishes"
+    );
+
+    // Absence after the fact is also what "the lock is never taken" looks
+    // like, so prove the lock is real from the other side: a z-file left by
+    // another get must block this one.
+    std::fs::write(tmp.path().join("z.lock"), "1\n").unwrap();
+    let out = super::common::run_in("get", &["-e", "s.lock"], tmp.path(), "");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an existing z-file must block get -e"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("being edited"),
+        "expected the lock diagnostic, got {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        tmp.path().join("z.lock").exists(),
+        "get must not remove a z-file it did not create"
+    );
+}
+
+/// #G9: a body with no `%X%` keyword draws the "No id keywords" warning, which
+/// is a warning rather than an error — unless the `i` flag makes it fatal.
+#[test]
+fn get_no_id_keywords_warning() {
+    let tmp = TempDir::new().unwrap();
+    let out = super::common::run_in("admin", &["-i", "s.nokw"], tmp.path(), "plain text\n");
+    assert!(out.status.success());
+
+    let out = super::common::run_in("get", &["s.nokw"], tmp.path(), "");
+    assert!(out.status.success(), "the warning must not be fatal");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("No id keywords"),
+        "expected the warning, got {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A body containing a keyword draws no such warning. Assert the retrieval
+    // actually succeeded too: on its own, "stderr lacks this substring" is
+    // equally true of a get that died before it ever looked for keywords.
+    let out = super::common::run_in("admin", &["-i", "s.withkw"], tmp.path(), "%W%\ntext\n");
+    assert!(out.status.success());
+    let out = super::common::run_in("get", &["s.withkw"], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "get s.withkw failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("No id keywords"),
+        "a body with %W% must not warn: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let g = std::fs::read_to_string(tmp.path().join("withkw")).expect("g-file");
+    assert!(
+        g.starts_with("@(#)withkw\t1.1") && g.ends_with("text\n"),
+        "%W% must expand in the g-file, got {g:?}"
+    );
+
+    // The `i` flag turns the warning into a fatal error: exit 1, no g-file.
+    let out = super::common::run_in("admin", &["-i", "-fi", "s.ikw"], tmp.path(), "plain text\n");
+    assert!(
+        out.status.success(),
+        "admin -fi failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = super::common::run_in("get", &["s.ikw"], tmp.path(), "");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "the i flag must make a keyword-less body fatal; stderr={:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("No id keywords"),
+        "expected the fatal diagnostic, got {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !tmp.path().join("ikw").exists(),
+        "the fatal path must not leave a g-file"
+    );
+}
+
+/// Directory and `-` (stdin list) operands both expand.
+#[test]
+fn get_directory_and_stdin_operands() {
+    // Directory operand: the s-file inside is retrieved, and the g-file lands
+    // in the current directory (99186-99187), not inside the directory.
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir(&dir).unwrap();
+    let out = super::common::run_in("admin", &["-i", "proj/s.indir"], tmp.path(), "body\n");
+    assert!(
+        out.status.success(),
+        "admin failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = super::common::run_in("get", &["proj"], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "get <dir> failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        tmp.path().join("indir").exists(),
+        "the g-file belongs in the current directory"
+    );
+    assert!(
+        !dir.join("indir").exists(),
+        "no second g-file beside the s-file"
+    );
+    // Expanding a directory yields a named file, so the pathname header is
+    // required even though one operand was given.
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("proj/s.indir:"),
+        "a directory operand must print the pathname header, got {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // `-` reads the pathname list from stdin.
+    let tmp2 = TempDir::new().unwrap();
+    let out = super::common::run_in("admin", &["-i", "s.viastdin"], tmp2.path(), "body\n");
+    assert!(out.status.success());
+    let out = super::common::run_in("get", &["-"], tmp2.path(), "s.viastdin\n");
+    assert!(
+        out.status.success(),
+        "get - failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(tmp2.path().join("viastdin").exists());
+
+    // "Non-SCCS files and unreadable files shall be silently ignored" (99128).
+    // A list piped from `ls`/`find` names ordinary files as a matter of
+    // course; they must not produce a diagnostic or spoil the exit status.
+    std::fs::write(tmp2.path().join("README"), "notes\n").unwrap();
+    std::fs::remove_file(tmp2.path().join("viastdin")).unwrap();
+    let out = super::common::run_in("get", &["-"], tmp2.path(), "README\ns.viastdin\n");
+    assert!(
+        out.status.success(),
+        "a non-SCCS line must not fail the run: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("README"),
+        "a non-SCCS line must be ignored silently, got {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        tmp2.path().join("viastdin").exists(),
+        "the real s-file in the list is still retrieved"
+    );
+}
+
+/// A partial SID names a release, and `get -r<release>` retrieves that
+/// release's most recent delta — the multi-release case the single-release
+/// fixtures cannot show.
+#[test]
+fn get_partial_sid_selects_within_a_release() {
+    let tmp = TempDir::new().unwrap();
+    let out = super::common::run_in("admin", &["-i", "s.rel"], tmp.path(), "r1\n");
+    assert!(out.status.success());
+
+    // Build 1.2, then start release 2 to get 2.1.
+    for (body, args) in [
+        ("r2\n", vec!["-e", "s.rel"]),
+        ("r3\n", vec!["-e", "-r2", "s.rel"]),
+    ] {
+        let out = super::common::run_in("get", &args, tmp.path(), "");
+        assert!(
+            out.status.success(),
+            "get {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::fs::write(tmp.path().join("rel"), body).unwrap();
+        let out = super::common::run_in("delta", &["-ynext", "s.rel"], tmp.path(), "");
+        assert!(
+            out.status.success(),
+            "delta failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // -r1 selects the newest delta in release 1, not the newest overall.
+    let out = super::common::run_in("get", &["-p", "-s", "-r1", "s.rel"], tmp.path(), "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "r2\n",
+        "-r1 must select the last delta of release 1"
+    );
+
+    // No -r selects the newest overall, which is in release 2.
+    let out = super::common::run_in("get", &["-p", "-s", "s.rel"], tmp.path(), "");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "r3\n");
+
+    // A release above the newest one retrieves the trunk head rather than
+    // failing: mR.mL is the text, and it is release R that gets created.
+    let out = super::common::run_in("get", &["-p", "-s", "-r9", "s.rel"], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "-r9 must fall back to the trunk head: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "r3\n");
+}
+
+/// The "SID of Delta to be Created" column of the POSIX get SID table
+/// (99233-99253). Each row picks between extending the retrieved delta's line
+/// and branching off it, and the two are not interchangeable: minting a trunk
+/// successor where the table calls for a branch silently collides with a SID
+/// that already exists.
+#[test]
+fn get_edit_new_sid_follows_the_posix_table() {
+    let tmp = TempDir::new().unwrap();
+    let out = super::common::run_in("admin", &["-i", "s.tbl"], tmp.path(), "r1\n");
+    assert!(out.status.success());
+
+    // Build trunk 1.1, 1.2, 2.1.
+    for (body, args) in [
+        ("r2\n", vec!["-e", "s.tbl"]),
+        ("r3\n", vec!["-e", "-r2", "s.tbl"]),
+    ] {
+        super::common::run_ok("get", &args, tmp.path(), "");
+        std::fs::write(tmp.path().join("tbl"), body).unwrap();
+        super::common::run_ok("delta", &["-ynext", "s.tbl"], tmp.path(), "");
+    }
+
+    // `get -e -g` announces the new SID without retrieving, so each row can be
+    // probed without disturbing the history — but it must still take the lock,
+    // so drop the p-file between probes.
+    let announced = |args: &[&str]| -> String {
+        let out = super::common::run_in("get", args, tmp.path(), "");
+        assert!(
+            out.status.success(),
+            "get {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            tmp.path().join("p.tbl").exists(),
+            "get -e -g must still record the pending edit in the p-file"
+        );
+        let _ = std::fs::remove_file(tmp.path().join("p.tbl"));
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .replace('\n', " ")
+    };
+
+    // R = mR: extend the trunk (99238).
+    assert_eq!(
+        announced(&["-e", "-g", "-r2", "s.tbl"]),
+        "2.1 new delta 2.2"
+    );
+    // R > mR: force the first delta of a new release (99237).
+    assert_eq!(
+        announced(&["-e", "-g", "-r5", "s.tbl"]),
+        "2.1 new delta 5.1"
+    );
+    // R < mR with a trunk successor in a higher release: branch (99243).
+    assert_eq!(
+        announced(&["-e", "-g", "-r1", "s.tbl"]),
+        "1.2 new delta 1.2.1.1"
+    );
+    // R.L with a trunk successor: branch, not the already-taken 1.2 (99247).
+    assert_eq!(
+        announced(&["-e", "-g", "-r1.1", "s.tbl"]),
+        "1.1 new delta 1.1.1.1"
+    );
+    // R.L with no trunk successor: extend the trunk (99245).
+    assert_eq!(
+        announced(&["-e", "-g", "-r2.1", "s.tbl"]),
+        "2.1 new delta 2.2"
+    );
+    // No SID at all: the trunk head of the newest release (99235).
+    assert_eq!(announced(&["-e", "-g", "s.tbl"]), "2.1 new delta 2.2");
+}
+
+/// A delta withdrawn by `rmdel` keeps its SID but has no text, so it must not
+/// be selected as the target of a release-only `-r`.
+#[test]
+fn get_skips_a_removed_delta() {
+    let tmp = TempDir::new().unwrap();
+    let out = super::common::run_in("admin", &["-i", "s.rm"], tmp.path(), "r1\n");
+    assert!(out.status.success());
+
+    super::common::run_ok("get", &["-e", "s.rm"], tmp.path(), "");
+    std::fs::write(tmp.path().join("rm"), "r2\n").unwrap();
+    super::common::run_ok("delta", &["-ynext", "s.rm"], tmp.path(), "");
+    super::common::run_ok("rmdel", &["-r1.2", "s.rm"], tmp.path(), "");
+
+    // -r1 must fall back to 1.1, the newest delta in release 1 that still has
+    // text; selecting the removed 1.2 retrieves an empty file.
+    let out = super::common::run_in("get", &["-p", "-s", "-r1", "s.rm"], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "get -r1 failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "r1\n",
+        "a removed delta must not be retrieved"
+    );
+}

@@ -250,6 +250,13 @@ impl<W: Write> CpioWriter<W> {
 }
 
 impl<W: Write> ArchiveWriter for CpioWriter<W> {
+    /// cpio has no link typeflag: `build_mode` maps `EntryType::Hardlink` onto
+    /// `C_ISREG`, and the reader hands it back as a plain regular file. Each
+    /// link must therefore carry its own copy of the data.
+    fn supports_hardlinks(&self) -> bool {
+        false
+    }
+
     fn write_entry(&mut self, entry: &ArchiveEntry) -> PaxResult<()> {
         let ino = if entry.ino == 0 {
             self.next_inode()

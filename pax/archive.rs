@@ -147,6 +147,17 @@ pub trait ArchiveWriter {
 
     /// Write the archive trailer
     fn finish(&mut self) -> PaxResult<()>;
+
+    /// Whether this format can record that a member is a hard link to another
+    /// member, so that only the first occurrence needs to carry the data.
+    ///
+    /// cpio cannot: it has no link typeflag, and a `Hardlink` entry degrades to
+    /// a regular file. A writer that returns `false` is given the full contents
+    /// of every link instead, which POSIX permits ("the data shall be restored
+    /// from the original file") and which is the only way not to lose it.
+    fn supports_hardlinks(&self) -> bool {
+        true
+    }
 }
 
 /// Tracks hard links during archive creation

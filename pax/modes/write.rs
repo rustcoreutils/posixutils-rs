@@ -482,18 +482,26 @@ fn write_file<W: ArchiveWriter>(
 
     // Check for hard link
     if let Some(original_path) = link_tracker.check(&entry) {
-        entry.entry_type = EntryType::Hardlink;
-        entry.link_target = Some(original_path);
+        // Only claim the link in formats that can express one. cpio cannot, so
+        // recording the type there would degrade the member to a regular file
+        // -- and combined with the size=0 below, to an empty one.
+        let linkable = archive.supports_hardlinks();
+        if linkable {
+            entry.entry_type = EntryType::Hardlink;
+            entry.link_target = Some(original_path);
+        }
 
-        // Per POSIX: -o linkdata means write file contents for each hard link
-        // By default, hard links have size=0 and no data
-        if !options.format_options.link_data {
+        // Per POSIX: -o linkdata means write file contents for each hard link.
+        // By default a hard link has size=0 and no data -- but only where the
+        // format records the linkage, otherwise the contents are the only copy
+        // of the data this member will ever have.
+        if linkable && !options.format_options.link_data {
             entry.size = 0;
             archive.write_entry(&entry)?;
             archive.finish_entry()?;
             return Ok(());
         }
-        // With linkdata, fall through to write the file contents
+        // Otherwise fall through and write the file contents.
     }
 
     // Write regular file

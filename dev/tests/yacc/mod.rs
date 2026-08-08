@@ -3935,3 +3935,149 @@ fn test_diagnostics_render_under_gettext() {
         stderr
     );
 }
+
+// --- i18n: LC_MESSAGES actually selects a translation (#7, #8) ---
+
+/// Build a minimal `.mo` catalog holding a single translation.
+///
+/// The shipped `.po` catalogs are ~99.5% empty `msgstr ""`, and `.mo` files are
+/// only produced by `make locale`, so setting `LC_MESSAGES` on this workspace
+/// changes nothing observable. Synthesizing a catalog is the only way to prove
+/// the diagnostic path is genuinely translatable rather than merely wrapped in
+/// `gettext()`.
+fn write_mo(path: &std::path::Path, msgid: &str, msgstr: &str) {
+    let (msgid, msgstr) = (msgid.as_bytes(), msgstr.as_bytes());
+    let n: u32 = 1;
+    let header = 28u32;
+    let orig_tab = header;
+    let trans_tab = orig_tab + n * 8;
+    let strings = trans_tab + n * 8;
+
+    let mut out: Vec<u8> = Vec::new();
+    let w = |v: u32, out: &mut Vec<u8>| out.extend_from_slice(&v.to_le_bytes());
+    w(0x950412de, &mut out); // magic, little-endian
+    w(0, &mut out); // revision
+    w(n, &mut out); // number of strings
+    w(orig_tab, &mut out);
+    w(trans_tab, &mut out);
+    w(0, &mut out); // hash table size
+    w(
+        strings + msgid.len() as u32 + 1 + msgstr.len() as u32 + 1,
+        &mut out,
+    );
+
+    // Descriptor tables: (length, offset) per string, originals then
+    // translations, each NUL-terminated in the string area.
+    let msgid_off = strings;
+    let msgstr_off = strings + msgid.len() as u32 + 1;
+    w(msgid.len() as u32, &mut out);
+    w(msgid_off, &mut out);
+    w(msgstr.len() as u32, &mut out);
+    w(msgstr_off, &mut out);
+
+    out.extend_from_slice(msgid);
+    out.push(0);
+    out.extend_from_slice(msgstr);
+    out.push(0);
+
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, out).unwrap();
+}
+
+#[test]
+fn test_lc_messages_selects_a_translated_diagnostic() {
+    // The domain is the workspace's, bound by `plib::diag::init_locale`.
+    const DOMAIN: &str = "posixutils-rs";
+    // A locale name that need not exist on the host: the catalog lookup is
+    // driven by the environment, not by whether setlocale can honour it.
+    const LOCALE: &str = "xx_XX";
+    const MSGID: &str = "no grammar file specified";
+    const MSGSTR: &str = "TRANSLATED-no-grammar-file";
+
+    let temp_dir = TempDir::new().unwrap();
+    let catalog = temp_dir
+        .path()
+        .join(LOCALE)
+        .join("LC_MESSAGES")
+        .join(format!("{DOMAIN}.mo"));
+    write_mo(&catalog, MSGID, MSGSTR);
+
+    // With the catalog in view, the diagnostic must come out translated.
+    let translated = Command::new(env!("CARGO_BIN_EXE_yacc"))
+        .current_dir(temp_dir.path())
+        .env("TEXTDOMAINDIR", temp_dir.path())
+        .env("LC_ALL", LOCALE)
+        .output()
+        .expect("failed to execute yacc-rs");
+    assert!(!translated.status.success(), "no operand must fail");
+    let stderr = String::from_utf8_lossy(&translated.stderr);
+    assert!(
+        stderr.contains(MSGSTR),
+        "LC_MESSAGES must select the catalog's text, got {stderr:?}"
+    );
+
+    // ...and under C it must be the original, since POSIX requires the C locale
+    // to produce untranslated messages.
+    let untranslated = Command::new(env!("CARGO_BIN_EXE_yacc"))
+        .current_dir(temp_dir.path())
+        .env("TEXTDOMAINDIR", temp_dir.path())
+        .env("LC_ALL", "C")
+        .output()
+        .expect("failed to execute yacc-rs");
+    let stderr = String::from_utf8_lossy(&untranslated.stderr);
+    assert!(
+        stderr.contains(MSGID) && !stderr.contains(MSGSTR),
+        "the C locale must produce the untranslated message, got {stderr:?}"
+    );
+}
+
+// --- -v description file: the abort stages not already covered (#5) ---
+
+#[test]
+fn test_description_file_produced_on_lexer_error() {
+    // The existing coverage injects the failure at the grammar-build stage.
+    // An unterminated `%{ ... %}` block fails in the lexer, well before that,
+    // and `-v` must still leave a description file behind.
+    let temp_dir = TempDir::new().unwrap();
+    let grammar_path = temp_dir.path().join("lex.y");
+    fs::write(&grammar_path, "%{\nunterminated prologue\n%%\n").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
+        .current_dir(temp_dir.path())
+        .args(["-v", grammar_path.to_str().unwrap()])
+        .output()
+        .expect("failed to execute yacc-rs");
+
+    assert!(!output.status.success(), "an unterminated %{{ must fail");
+    assert!(
+        temp_dir.path().join("y.output").exists(),
+        "-v must write a description file even when the lexer aborts; \
+         stderr={:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn test_description_stub_does_not_clobber_a_real_output_file() {
+    // On the success path codegen writes the full description, so the abort
+    // stub must never overwrite one that is already there.
+    let temp_dir = TempDir::new().unwrap();
+    let grammar_path = temp_dir.path().join("bad.y");
+    fs::write(&grammar_path, "%%\nexpr : UNDEFINED_NONTERMINAL ;\n").unwrap();
+
+    let existing = temp_dir.path().join("y.output");
+    fs::write(&existing, "PRE-EXISTING DESCRIPTION\n").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
+        .current_dir(temp_dir.path())
+        .args(["-v", grammar_path.to_str().unwrap()])
+        .output()
+        .expect("failed to execute yacc-rs");
+
+    assert!(!output.status.success(), "this grammar must fail");
+    assert_eq!(
+        fs::read_to_string(&existing).unwrap(),
+        "PRE-EXISTING DESCRIPTION\n",
+        "the abort stub must not overwrite an existing description file"
+    );
+}

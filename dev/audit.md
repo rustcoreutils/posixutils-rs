@@ -316,9 +316,29 @@ Tests cover the high-confidence golden paths well (150 `#[test]`s including a CP
 - [x] No test asserts `YYEMPTY` / `YYEOF` are present in generated `y.tab.c` (#1, #2).
 - [x] No test asserts `int yyparse(void);` prototype is present (#3).
 - [x] No test asserts `#ifndef yyerror` / `#ifndef yylex` guards (#4).
-- [ ] No test exercises the `-v` + early-failure path (#5).
+- [x] The `-v` + early-failure path (#5) — this box was **already stale** when
+  written: `test_description_file_produced_on_error`,
+  `test_description_file_reports_table_limits` and
+  `test_description_stub_write_failure_warns` cover it. Two residual cases added
+  2026-08-08: an abort in the **lexer** (an unterminated `%{` prologue), since
+  the existing tests all inject at the grammar-build stage, and the rule that
+  the stub must not overwrite an existing `y.output` — on the success path
+  codegen has already written the real description there.
 - [x] No test verifies that a no-`-t` build with `-DYYDEBUG=1` produces working debug output (#6).
-- [ ] No test asserts `setlocale` is called or that `LANG`/`LC_MESSAGES` influences diagnostics (#7, #8).
+- [x] `LC_MESSAGES` influences diagnostics (#7, #8) — closed 2026-08-08 by
+  `test_lc_messages_selects_a_translated_diagnostic`, which synthesizes a
+  one-entry `.mo` in a tempdir, points `TEXTDOMAINDIR` at it, and asserts the
+  diagnostic comes out translated under `LC_ALL=xx_XX` and untranslated under
+  `LC_ALL=C`. Synthesizing was necessary: the shipped `.po` catalogs are ~99.5%
+  empty `msgstr ""` and `.mo` files are only produced by `make locale`, so
+  setting `LC_MESSAGES` on this workspace otherwise changes nothing observable
+  — **no test in the repo had ever asserted a translated diagnostic.** The
+  locale need not be installed, since the vendored gettext resolves the message
+  locale from the environment (`LC_ALL`/`LC_MESSAGES`/`LANG`) rather than from
+  `setlocale`. That is also why `setlocale` itself is not asserted here: it is
+  called first thing in `main` (`dev/yacc/main.rs:348` →
+  `plib/src/diag.rs:110-116`), but yacc has no `LC_CTYPE`-visible behaviour to
+  observe it through, its lexer being `char`-based.
 - [x] No test exercises `--` end-of-options (#9).
 - [x] No test asserts that `-p` leaves user-defined token names unprefixed (#10).
 - [x] No test rejects multi-byte char literals (#12).

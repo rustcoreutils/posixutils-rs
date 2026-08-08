@@ -739,7 +739,7 @@ fn spawn_input_thread(
                     for c in text.chars() {
                         // The peer's stream is display-only: nothing it sends is
                         // echoed back, so the transmit half of `apply` is dropped.
-                        if let Err(e) = apply(c, &keys, &mut win, &mut handle) {
+                        if let Err(e) = apply(c, &keys, &mut win, &mut handle, Origin::Peer) {
                             eprintln!("Error rendering peer input: {}", e);
                             break;
                         }
@@ -996,6 +996,19 @@ fn decode_pending(pending: &mut Vec<u8>) -> String {
     }
 }
 
+/// Which side a character arrived from.
+///
+/// The two directions are the same render path but not the same effect: an
+/// alert is meant for the *recipient*, so it is forwarded when typed locally
+/// and rung when it arrives from the peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    /// Typed by the local user; the returned bytes go to the peer.
+    Local,
+    /// Received from the peer; the returned bytes are discarded.
+    Peer,
+}
+
 /// Apply one character to a window, returning what should be transmitted.
 ///
 /// This is the single render path for both directions: the local user's typing
@@ -1005,11 +1018,28 @@ fn decode_pending(pending: &mut Vec<u8>) -> String {
 ///
 /// Returns the bytes to forward to the other side, which is empty for purely
 /// local effects such as Ctrl-L refresh (spec 116757).
-fn apply<W: Write>(c: char, keys: &KeyMap, win: &mut Window, out: &mut W) -> io::Result<Vec<u8>> {
+fn apply<W: Write>(
+    c: char,
+    keys: &KeyMap,
+    win: &mut Window,
+    out: &mut W,
+    origin: Origin,
+) -> io::Result<Vec<u8>> {
     match classify(c, keys) {
         Action::Alert => {
-            // 116756: alerts the *recipient*, so it is forwarded, not drawn.
-            Ok(vec![0x07])
+            // 116756: "alerts the recipient's terminal". Typed locally it is
+            // forwarded rather than drawn; arriving from the peer it is what
+            // rings this terminal. Returning it either way meant the receive
+            // path, which discards the transmit half, swallowed the bell
+            // entirely, so ^G did nothing at all end to end.
+            match origin {
+                Origin::Local => Ok(vec![0x07]),
+                Origin::Peer => {
+                    out.write_all(&[0x07])?;
+                    out.flush()?;
+                    Ok(Vec::new())
+                }
+            }
         }
         Action::Refresh => {
             win.repaint(out)?;
@@ -1099,7 +1129,7 @@ fn handle_stdin_input(
         }
 
         for c in text.chars() {
-            let outgoing = apply(c, &keys, &mut win, &mut out)?;
+            let outgoing = apply(c, &keys, &mut win, &mut out, Origin::Local)?;
             if !outgoing.is_empty() {
                 send_bytes(&write_stream, &outgoing)?;
             }
@@ -2320,7 +2350,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let mut sent: Vec<u8> = Vec::new();
         for c in chars.chars() {
-            sent.extend(apply(c, &keys, win, &mut out).unwrap());
+            sent.extend(apply(c, &keys, win, &mut out, Origin::Local).unwrap());
         }
         (String::from_utf8_lossy(&out).into_owned(), sent)
     }

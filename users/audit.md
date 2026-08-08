@@ -912,7 +912,7 @@ rather than inferred.
 | Split two-window layout | PARTIAL | one divider line (1425-1447); raw ANSI, no curses |
 | Connection status messages | PARTIAL | "[Waiting…]"/"[Ringing…]" (508,518,1043); wording differs from spec examples |
 | `Message from …` announce text | MISSING | not generated (relies on talkd) |
-| alert / Ctrl-L / erase / kill / print-space | MISSING | only `\x08`/`\x7f` backspace (714,951) (#TK7) |
+| alert / Ctrl-L / erase / kill / print-space | CONFORMS | `classify`/`apply` (903-1054) implement the full rule set; covered by unit tests and, since 2026-08-08, end to end by the two-peer PTY tests (#TK7) |
 | EOF / interrupt + notify peer | DIVERGES | (#TK8) |
 
 #### Terminal restore on exit
@@ -937,7 +937,25 @@ Shallow — only startup/teardown plumbing, never interactive behavior. Six test
 - [x] stdout-not-a-terminal (#TK6) — `test_talk_not_a_tty_error`. SIGINT exit-status-0 (#TK1) needs an interactive PTY peer; see the residual note below.
 - [x] The LookUp/LeaveInvite/Delete handshake against a live talkd is now covered from the wire side by `tests/talkd` (10 tests), which drives the same control protocol `talk` speaks.
 - [x] Response-code handling (#TK5) — every answer code (`Success`, `NotHere`, `UnknownRequest`, `BadVersion`) is now asserted in `tests/talkd`. Terminal restore on signal (#TK3) still needs an interactive PTY peer.
-- [ ] **Residual (open):** no test connects two `talk` peers end-to-end, so the interactive exchange and the character-processing rules (#TK7/#TK8) remain unverified. This is the one genuinely open item in `users/`: #TK21 and #TK22 each made the utility completely non-functional and survived a full audit plus the whole test suite. Needs a two-PTY harness.
+- [x] **Residual — closed 2026-08-08.** `tests/talk` now brings up a talkd on a
+  private `TALKD_SOCKET` and connects **two `talk` peers, each on its own
+  pseudo-terminal**, asserting the end-to-end rules: typed text reaches the
+  peer; `^G` alerts the recipient and `^L` does not travel (116756-116757);
+  erase and kill are applied on both screens (116758); a control character
+  arrives as its printable `^X` stand-in and never raw (116769); and a
+  multi-byte character survives the split reads of #TK10. Both peers call the
+  same user, since talkd's `find_for_callee` matches on
+  `callee == local_name && caller == remote_name`; the tests self-skip when no
+  PTY, binary, or rendezvous is available.
+
+  It immediately earned its keep: **an incoming `^G` never rang the recipient's
+  terminal.** `apply` returned the bell as bytes *to forward*, and the receive
+  path discards the transmit half — so the one thing 116756 says the character
+  is for ("alerts the recipient's terminal") did not happen at either end.
+  `apply` now takes an `Origin`, forwarding the bell when typed locally and
+  writing it to the terminal when it arrives from the peer. This is the third
+  defect in this utility of exactly the kind that survives a full audit and the
+  whole test suite because nothing connects two peers.
 
 ---
 

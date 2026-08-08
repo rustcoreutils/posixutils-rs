@@ -274,3 +274,45 @@ fn gencat_two_messages_in_a_set_do_not_overrun_the_array() {
     assert!(catalog.windows(6).any(|w| w == b"first\0"));
     assert!(catalog.windows(7).any(|w| w == b"second\0"));
 }
+
+/// A field separator is a *single* `<blank>`; any further blanks belong to the
+/// message text.
+///
+/// POSIX gencat (98956-98957): "the fields of a message text source line are
+/// separated by a single <blank> character. Any other <blank> characters are
+/// considered to be part of the subsequent field." Indented message text — the
+/// usual shape of menu and usage strings — must therefore survive into the
+/// catalog. `split_field` skipped the whole run of blanks, silently
+/// left-trimming every such message; the `splitn(2, char::is_whitespace)` it
+/// replaced kept them.
+#[test]
+fn gencat_keeps_blanks_after_the_first_separator() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let msg_path = temp.path().join("indent.msg");
+    let cat_path = temp.path().join("indent.cat");
+    std::fs::write(&msg_path, b"$set 1\n1    indented text\n2 plain text\n").unwrap();
+
+    let status = std::process::Command::new(plib::testing::get_binary_path("gencat"))
+        .arg(&cat_path)
+        .arg(&msg_path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let mut catalog = Vec::new();
+    File::open(&cat_path)
+        .unwrap()
+        .read_to_end(&mut catalog)
+        .unwrap();
+
+    assert!(
+        catalog.windows(17).any(|w| w == b"   indented text\0"),
+        "the three blanks after the separator belong to the message text"
+    );
+    // The single separating blank is still consumed, so an ordinary message is
+    // unaffected.
+    assert!(
+        catalog.windows(11).any(|w| w == b"plain text\0"),
+        "a single separating blank must still be consumed"
+    );
+}

@@ -310,20 +310,19 @@ fn trim_end(s: &[u8]) -> &[u8] {
     }
 }
 
-/// Split `s` at the first <blank>, returning the field before it and the rest
-/// with leading <blank>s removed. `None` for the second element means there was
-/// no <blank> at all.
+/// Split `s` at the first <blank>, returning the field before it and everything
+/// after that one separator. `None` for the second element means there was no
+/// <blank> at all.
+///
+/// Exactly one byte is consumed, because 98956-98957 says "the fields of a
+/// message text source line are separated by a single <blank> character. Any
+/// other <blank> characters are considered to be part of the subsequent field."
+/// Skipping the whole run instead silently left-trimmed every indented message
+/// — menu and usage text, typically — out of the compiled catalog.
 fn split_field(s: &[u8]) -> (&[u8], Option<&[u8]>) {
     match s.iter().position(|b| b.is_ascii_whitespace()) {
         None => (s, None),
-        Some(i) => {
-            let rest = &s[i..];
-            let start = rest
-                .iter()
-                .position(|b| !b.is_ascii_whitespace())
-                .unwrap_or(rest.len());
-            (&s[..i], Some(&rest[start..]))
-        }
+        Some(i) => (&s[..i], Some(&s[i + 1..])),
     }
 }
 

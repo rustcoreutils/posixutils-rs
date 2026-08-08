@@ -592,7 +592,11 @@ impl Editor {
                     }
                 }
 
-                let typed = line.trim_end().to_string();
+                // Strip only the line terminator: in text input mode a
+                // trailing <blank> the user typed is content, and trimming it
+                // here discarded a line entered as blanks before
+                // `accept_ex_insert_line` could tell it apart from an empty one.
+                let typed = line.trim_end_matches(['\n', '\r']).to_string();
                 match self.accept_ex_insert_line(&typed) {
                     Ok(true) => {
                         if !self.silent_mode {
@@ -1110,8 +1114,10 @@ impl Editor {
 
     /// Accept one completed line of ex text input.
     ///
-    /// `typed` is the whole line, autoindent prefix included. Returns true when
-    /// the terminator was seen and the collected text has been inserted.
+    /// `typed` is what the user entered for this line; the autoindent characters
+    /// are held separately in `ex_insert_indent` and prepended below, because ex
+    /// supplies them as a prompt rather than the user typing them. Returns true
+    /// when the terminator was seen and the collected text has been inserted.
     ///
     /// "Terminate the current line. If there are no characters other than
     /// autoindent characters on the line, all characters on the line shall be
@@ -1132,8 +1138,11 @@ impl Editor {
         }
         let indent = std::mem::take(&mut self.ex_insert_indent);
         // "If there are no characters other than autoindent characters on the
-        // line, all characters on the line shall be discarded."
-        let line = if typed.trim().is_empty() {
+        // line, all characters on the line shall be discarded." Since `typed`
+        // excludes the autoindent prefix, that condition is exactly "the user
+        // entered nothing" -- testing `trim()` instead also threw away a line
+        // the user deliberately typed as blanks.
+        let line = if typed.is_empty() {
             String::new()
         } else {
             format!("{indent}{typed}")

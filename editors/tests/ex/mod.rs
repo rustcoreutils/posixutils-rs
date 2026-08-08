@@ -1391,3 +1391,90 @@ fn test_ex_z_blank_before_the_type_is_an_error() {
     // A blank before a *count* is still legal -- the rule is scoped to the type.
     ex_test_with_file("l1\nl2\nl3\nl4\n", "1z 2\nq!\n", "l1\nl2\n");
 }
+
+// ============================================================================
+// Argument splitting and text input, from review
+// ============================================================================
+
+#[test]
+fn test_ex_next_honours_escaped_blanks_in_filenames() {
+    // `split_plus_command` honours `\ ` per §94954-94955 and then the operands
+    // were split with `split_whitespace`, which tore `my\ file.txt` into two
+    // and left the backslash on the first, so `:n` opened a file named `my\`.
+    let dir = TempDir::new().unwrap();
+    let spaced = dir.path().join("my file.txt");
+    let plain = dir.path().join("plain.txt");
+    fs::write(&spaced, "SPACED\n").unwrap();
+    fs::write(&plain, "PLAIN\n").unwrap();
+
+    let escaped = spaced.to_string_lossy().replace(' ', "\\ ");
+    ex_test(
+        &format!("n {escaped} {}\n1,$p\nq!\n", plain.to_string_lossy()),
+        "SPACED\n",
+    );
+    // ...and the second entry of that argument list is still reachable.
+    ex_test(
+        &format!("n {escaped} {}\nn\n1,$p\nq!\n", plain.to_string_lossy()),
+        "PLAIN\n",
+    );
+}
+
+#[test]
+fn test_ex_read_backslash_only_escapes_a_bang() {
+    // §95285-95286 gives the <backslash> one job: suppressing the
+    // `!`-means-command reading. Stripping it unconditionally renamed every
+    // path, so `:r \tmp/x` looked for `tmp/x`.
+    // Unescaped, `!` marks the rest as a command to run.
+    ex_test("r !echo hello\n1,$p\nq!\n", "hello\n");
+
+    // Escaped, it names a file instead -- so this must *not* run echo, and must
+    // fail looking for a file whose name begins with '!'.
+    let (out, err) = ex_output(&["-s"], "r \\!echo hello\n1,$p\nq!\n");
+    assert!(
+        !out.contains("hello"),
+        "`r \\!echo` must not run the command, got {out:?}"
+    );
+    assert!(
+        !err.is_empty(),
+        "reading a file named `!echo ...` must fail"
+    );
+
+    // A backslash before anything else is part of the pathname, not an escape.
+    // The file below exists; naming it with a leading backslash must not find
+    // it, which is what stripping the backslash unconditionally used to do.
+    let dir = TempDir::new().unwrap();
+    let real = dir.path().join("x");
+    fs::write(&real, "CONTENT\n").unwrap();
+
+    let (out, err) = ex_output(
+        &["-s"],
+        &format!("r \\{}\n1,$p\nq!\n", real.to_string_lossy()),
+    );
+    assert!(
+        !out.contains("CONTENT"),
+        "`r \\{}` names a path starting with a backslash, which does not \
+         exist; it must not read the unescaped file. Got {out:?}",
+        real.to_string_lossy()
+    );
+    assert!(!err.is_empty(), "the nonexistent path must be diagnosed");
+
+    // ...and without the backslash the same file reads fine, so the test above
+    // is not passing merely because the path was unreadable.
+    ex_test(
+        &format!("r {}\n1,$p\nq!\n", real.to_string_lossy()),
+        "CONTENT\n",
+    );
+}
+
+#[test]
+fn test_ex_autoindent_keeps_a_line_typed_as_blanks() {
+    // §94742-94743 discards a line with "no characters other than autoindent
+    // characters". The autoindent prefix is held apart from what the user
+    // types, so that condition is "the user entered nothing" -- testing the
+    // trimmed input also discarded a line deliberately typed as spaces.
+    ex_test_with_file(
+        "    base\n",
+        "1a!\none\n  \ntwo\n.\n1,$p\nq!\n",
+        "    base\n    one\n      \n      two\n",
+    );
+}

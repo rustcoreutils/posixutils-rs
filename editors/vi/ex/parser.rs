@@ -99,7 +99,14 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
                     command: cmd.trim().to_string(),
                 })
             } else {
-                let file = args.strip_prefix('\\').unwrap_or(args);
+                // The <backslash> has exactly one job here: suppressing the
+                // `!`-means-command reading (95285-95286). Stripping it from
+                // every argument renamed ordinary relative paths, so `:r \tmp/x`
+                // looked for `tmp/x` and reported a path the user never typed.
+                let file = match args.strip_prefix('\\') {
+                    Some(rest) if rest.starts_with('!') => rest,
+                    _ => args,
+                };
                 Ok(ExCommand::Read {
                     range,
                     file: if file.is_empty() {
@@ -237,7 +244,7 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
             let (command, rest) = split_plus_command(args);
             Ok(ExCommand::Next {
                 force,
-                files: rest.split_whitespace().map(String::from).collect(),
+                files: split_escaped_fields(rest),
                 command,
             })
         }
@@ -706,12 +713,25 @@ pub(crate) fn split_plus_command(args: &str) -> (Option<String>, &str) {
     let Some(body) = args.strip_prefix('+') else {
         return (None, args);
     };
-    let mut cmd = String::new();
+    let (mut cmd, rest) = take_escaped_field(body);
+    // A bare `+` is the historical "start at the last line".
+    if cmd.is_empty() {
+        cmd.push('$');
+    }
+    (Some(cmd), rest)
+}
+
+/// Take one <blank>-delimited field from the front of `s`, removing the
+/// <backslash> escapes that protect a <blank> from ending it (94954-94955).
+///
+/// Returns the unescaped field and the remainder with leading <blank>s removed.
+fn take_escaped_field(s: &str) -> (String, &str) {
+    let mut field = String::new();
     let mut escaped = false;
-    let mut end = body.len();
-    for (i, c) in body.char_indices() {
+    let mut end = s.len();
+    for (i, c) in s.char_indices() {
         if escaped {
-            cmd.push(c);
+            field.push(c);
             escaped = false;
         } else if c == '\\' {
             escaped = true;
@@ -719,14 +739,29 @@ pub(crate) fn split_plus_command(args: &str) -> (Option<String>, &str) {
             end = i;
             break;
         } else {
-            cmd.push(c);
+            field.push(c);
         }
     }
-    // A bare `+` is the historical "start at the last line".
-    if cmd.is_empty() {
-        cmd.push('$');
+    (field, s[end..].trim_start())
+}
+
+/// Split `s` into <blank>-delimited fields, honouring the same <backslash>
+/// escapes as [`split_plus_command`].
+///
+/// `str::split_whitespace` would tear `my\ file.txt` into two operands and leave
+/// the backslash in the first, so the argument list `:next` builds named files
+/// that do not exist.
+fn split_escaped_fields(s: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut rest = s.trim_start();
+    while !rest.is_empty() {
+        let (field, tail) = take_escaped_field(rest);
+        if !field.is_empty() {
+            fields.push(field);
+        }
+        rest = tail;
     }
-    (Some(cmd), body[end..].trim_start())
+    fields
 }
 
 /// Parse the `/pattern/` argument of the `open` command (95212-95216).

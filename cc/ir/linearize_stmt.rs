@@ -68,6 +68,27 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
 
             Stmt::Return(expr) => {
+                // C99 6.8.6.4p1: a `return` with an expression may not appear
+                // in a void function, and one without an expression may not
+                // appear in a function that returns a value. Both used to
+                // compile clean.
+                let declared_ret = self.current_func.as_ref().map(|f| f.return_type);
+                if let Some(rt) = declared_ret {
+                    let returns_void = self.types.kind(rt) == TypeKind::Void;
+                    match expr {
+                        Some(e) if returns_void => {
+                            error(e.pos, "'return' with a value in a function returning void")
+                        }
+                        None if !returns_void => error(
+                            // `Stmt` carries no position, so fall back to the
+                            // last expression lowered in this function.
+                            self.current_pos.unwrap_or_default(),
+                            "'return' with no value in a function returning non-void",
+                        ),
+                        _ => {}
+                    }
+                }
+
                 if let Some(e) = expr {
                     let expr_typ = self.expr_type(e);
                     // Get the function's actual return type for proper conversion
@@ -1215,10 +1236,32 @@ impl<'a> super::linearize::Linearizer<'a> {
             Stmt::Case(expr) => {
                 // Extract constant value from case expression
                 if let Some(val) = self.eval_const_expr(expr) {
-                    case_values.push(val as i64); // switch cases truncated to i64
+                    let val = val as i64; // switch cases truncated to i64
+                                          // C99 6.8.4.2p3: no two case constants may be equal.
+                                          // Consumption looks the value up with `.position()`, which
+                                          // finds the first match, so a duplicate silently re-entered
+                                          // the earlier case's block and merged the two bodies.
+                    if case_values.contains(&val) {
+                        error(
+                            expr.pos,
+                            &format!("duplicate case value '{}' in switch", val),
+                        );
+                    }
+                    case_values.push(val);
+                } else {
+                    // A non-constant label can never match; it used to be
+                    // dropped without a word.
+                    error(expr.pos, "case label is not an integer constant expression");
                 }
             }
             Stmt::Default => {
+                // C99 6.8.4.2p3: at most one default label per switch.
+                if *has_default {
+                    error(
+                        self.current_pos.unwrap_or_default(),
+                        "multiple default labels in one switch",
+                    );
+                }
                 *has_default = true;
             }
             // Recursively check labeled statements

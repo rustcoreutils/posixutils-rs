@@ -248,6 +248,16 @@ pub struct Parser<'a> {
     /// Explicit alignment from _Alignas in current declaration
     /// Cleared after each declaration is parsed.
     pending_alignas: Option<u32>,
+    /// Set by `parse_type_specifier`: whether the specifier list actually
+    /// named a type, rather than defaulting to `int`.
+    ///
+    /// C99 removed implicit int, but defaulting is still the right *recovery*
+    /// — the declarator after it is usually fine — so the flag lets each
+    /// caller decide whether a diagnostic belongs at its own position.
+    /// `parse_type_specifier` has seven callers, and some of them (an abstract
+    /// parameter declarator, a K&R identifier list) legitimately reach it with
+    /// no specifier.
+    saw_explicit_type: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -265,6 +275,7 @@ impl<'a> Parser<'a> {
             types,
             pos: 0,
             pending_alignas: None,
+            saw_explicit_type: true,
         }
     }
 
@@ -1491,7 +1502,9 @@ impl Parser<'_> {
         }
 
         // Parse type specifiers
+        let decl_pos = self.current_pos();
         let base_type = self.parse_type_specifier()?;
+        self.check_implicit_int(decl_pos);
         // Skip __attribute__ between type and declarator (GCC extension)
         self.skip_extensions();
 
@@ -1600,6 +1613,20 @@ impl Parser<'_> {
                 // Bind typedef to symbol table (after parsing initializer, which
                 // is forbidden for typedefs anyway)
                 if has_name && is_typedef {
+                    // A typedef of a variably modified type keeps a side-channel
+                    // `vla_sizes` that only the ordinary declarator paths carry
+                    // forward, so the typedef became indistinguishable from an
+                    // incomplete array `int a[]`. Worse, the local-declaration
+                    // linearizer checks `STATIC` and `vla_sizes.is_empty()` but
+                    // never `TYPEDEF`, so a block-scope `typedef int A[n];` was
+                    // lowered as a runtime VLA allocation. File scope already
+                    // rejects this; reject it here too rather than miscompile.
+                    if !vla_sizes.is_empty() {
+                        return Err(ParseError::new(
+                            "typedef of a variable-length array type is not supported",
+                            decl_pos,
+                        ));
+                    }
                     // Apply __attribute__((aligned(N))) to typedef type
                     if let Some(align) = self.pending_alignas {
                         let mut aligned_type = self.types.get(typ).clone();
@@ -1607,6 +1634,7 @@ impl Parser<'_> {
                             Some(aligned_type.explicit_align.map_or(align, |e| e.max(align)));
                         typ = self.types.intern(aligned_type);
                     }
+                    self.check_typedef_redefinition(name, typ, decl_pos);
                     let sym = Symbol::typedef(name, typ, self.symbols.depth());
                     if let Ok(id) = self.symbols.declare(sym) {
                         symbol_id = Some(id);
@@ -1739,6 +1767,22 @@ impl Parser<'_> {
                         if let Some(inner_type) = self.try_parse_type_name() {
                             self.expect_special(b')')?;
                             // Return the type with ATOMIC modifier
+                            // C17 6.7.2.4p3: the type name in `_Atomic(T)`
+                            // shall not be an array or a function type.
+                            let inner_kind = self.types.kind(inner_type);
+                            if matches!(inner_kind, TypeKind::Array | TypeKind::Function) {
+                                diag::error(
+                                    self.current_pos(),
+                                    &format!(
+                                        "'_Atomic' cannot be applied to {} type",
+                                        if inner_kind == TypeKind::Array {
+                                            "an array"
+                                        } else {
+                                            "a function"
+                                        }
+                                    ),
+                                );
+                            }
                             let inner = self.types.get(inner_type).clone();
                             return Ok(Type {
                                 modifiers: modifiers | inner.modifiers | TypeModifiers::ATOMIC,
@@ -1947,6 +1991,7 @@ impl Parser<'_> {
 
         // If we parsed a typedef, return that with any trailing modifiers applied
         if let Some(typedef_type_id) = typedef_base {
+            self.saw_explicit_type = true;
             let typedef_type = self.types.get(typedef_type_id);
             let mut result = typedef_type.clone();
             // Strip TYPEDEF modifier - we're using the typedef, not defining one
@@ -1955,8 +2000,62 @@ impl Parser<'_> {
             return Ok(result);
         }
 
+        // `signed x;` and `unsigned x;` name a type without setting `base_kind`
+        // — those two only ever set a modifier — so they are explicit even
+        // though the kind defaults. `short`/`long` do set the kind.
+        self.saw_explicit_type = base_kind.is_some()
+            || modifiers.intersects(TypeModifiers::SIGNED | TypeModifiers::UNSIGNED);
+
         let kind = base_kind.unwrap_or(TypeKind::Int);
         Ok(Type::with_modifiers(kind, modifiers))
+    }
+
+    /// Diagnose redefining a typedef name with an incompatible type.
+    ///
+    /// C11/C17 6.7p3 legalized redefining a typedef, but only to a *compatible*
+    /// type. Every `declare()` caller discards `SymbolError::Redefinition` and
+    /// reuses the existing symbol, so an incompatible redefinition silently
+    /// kept the first type — strictly worse than C89, where any redefinition
+    /// was flagged.
+    fn check_typedef_redefinition(&mut self, name: StringId, new_type: TypeId, pos: Position) {
+        let Some(existing_id) = self.symbols.lookup_id(name, Namespace::Ordinary) else {
+            return;
+        };
+        let existing = self.symbols.get(existing_id);
+        if !existing.is_typedef() {
+            return;
+        }
+        let old_type = existing.typ;
+        if self.types.types_compatible(old_type, new_type) {
+            return;
+        }
+        let spelled = self.idents.get_opt(name).unwrap_or("").to_string();
+        diag::error(
+            pos,
+            &format!(
+                "typedef '{}' redefined with an incompatible type ('{}' then '{}')",
+                spelled,
+                self.types.get(old_type),
+                self.types.get(new_type),
+            ),
+        );
+    }
+
+    /// Diagnose a declaration that named no type (C99 removed implicit int;
+    /// 6.7.2p2 makes "at least one type specifier shall be given" a
+    /// constraint). Call after `parse_type_specifier` at a site where a type is
+    /// genuinely required.
+    fn check_implicit_int(&mut self, pos: Position) {
+        if !self.saw_explicit_type {
+            diag::error(
+                pos,
+                "type specifier missing; implicit 'int' was removed in C99",
+            );
+            // Keep the defaulted `int` and carry on: the declarator that
+            // follows is usually well-formed, and one diagnostic per
+            // declaration reads better than a cascade.
+            self.saw_explicit_type = true;
+        }
     }
 
     /// Parse an enum specifier
@@ -3033,6 +3132,7 @@ impl Parser<'_> {
         let decl_pos = self.current_pos();
         // Parse type specifier
         let base_type = self.parse_type_specifier()?;
+        self.check_implicit_int(decl_pos);
         // Skip __attribute__ between type and declarator (GCC extension)
         self.skip_extensions();
         // Check modifiers before interning (storage class specifiers)
@@ -3165,6 +3265,7 @@ impl Parser<'_> {
                             Some(aligned_type.explicit_align.map_or(align, |e| e.max(align)));
                         typ = self.types.intern(aligned_type);
                     }
+                    self.check_typedef_redefinition(name, typ, decl_pos);
                     let sym = Symbol::typedef(name, typ, self.symbols.depth());
                     self.symbols
                         .declare(sym)
@@ -3358,6 +3459,7 @@ impl Parser<'_> {
                 // Add to symbol table and capture SymbolId
                 // C allows multiple declarations of the same variable at file scope
                 let symbol_id = if is_typedef {
+                    self.check_typedef_redefinition(name, full_typ, decl_pos);
                     let sym = Symbol::typedef(name, full_typ, self.symbols.depth());
                     self.symbols
                         .declare(sym)
@@ -3515,6 +3617,7 @@ impl Parser<'_> {
                 // C allows multiple declarations of the same function
                 let symbol_id = if is_typedef {
                     // Function type typedef: typedef void my_func(void);
+                    self.check_typedef_redefinition(name, func_type_id, decl_pos);
                     let sym = Symbol::typedef(name, func_type_id, self.symbols.depth());
                     self.symbols
                         .declare(sym)
@@ -3654,6 +3757,7 @@ impl Parser<'_> {
                     Some(aligned_type.explicit_align.map_or(align, |e| e.max(align)));
                 var_type_id = self.types.intern(aligned_type);
             }
+            self.check_typedef_redefinition(name, var_type_id, self.current_pos());
             let sym = Symbol::typedef(name, var_type_id, self.symbols.depth());
             symbol = Some(match self.symbols.declare(sym) {
                 Ok(id) => id,
@@ -3737,6 +3841,7 @@ impl Parser<'_> {
 
             // Bind typedef to symbol table (after parsing initializer, which is forbidden anyway)
             if is_typedef {
+                self.check_typedef_redefinition(decl_name, decl_type, decl_pos);
                 let sym = Symbol::typedef(decl_name, decl_type, self.symbols.depth());
                 decl_symbol = Some(match self.symbols.declare(sym) {
                     Ok(id) => id,

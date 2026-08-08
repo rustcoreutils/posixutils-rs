@@ -1441,9 +1441,11 @@ impl<'a> Parser<'a> {
                 );
             } else if self.is_special(b'(') {
                 // Function call
+                let call_pos = self.current_pos();
                 self.advance();
                 let args = self.parse_argument_list()?;
                 self.expect_special(b')')?;
+                self.check_call_arity(&expr, &args, call_pos);
 
                 // Get the return type from the function type
                 // The func expression should have type TypeKind::Function
@@ -1490,6 +1492,72 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse function argument list
+    /// Check a call against the callee's prototype (C99 6.5.2.2p2).
+    ///
+    /// Done at parse time rather than in the linearizer: the same `TypeId` is
+    /// available here, but the positions are far better — `call_pos` and every
+    /// argument's own position are live, whereas by linearization the only
+    /// position left points at whichever sub-expression was lowered last.
+    fn check_call_arity(&self, callee: &Expr, args: &[Expr], call_pos: Position) {
+        // Resolve through a function pointer, as the return-type logic does.
+        let func_type = callee.typ.and_then(|t| match self.types.kind(t) {
+            TypeKind::Function => Some(t),
+            TypeKind::Pointer => self
+                .types
+                .base_type(t)
+                .filter(|&b| self.types.kind(b) == TypeKind::Function),
+            _ => None,
+        });
+        let Some(func_type) = func_type else { return };
+
+        // `params == None` means no prototype is visible: either an
+        // unprototyped K&R declaration, where no check is permitted, or an
+        // undeclared callee, which already produced its own diagnostic and
+        // carries a dummy `int` type.
+        let ft = self.types.get(func_type);
+        let Some(params) = ft.params.as_ref() else {
+            return;
+        };
+        let required = params.len();
+
+        let variadic = ft.variadic;
+
+        // `int f(void)` and `int f()` both intern as an empty parameter list,
+        // but they mean opposite things: the first takes no arguments, the
+        // second leaves them unspecified and accepts any number. Telling them
+        // apart needs a "no prototype" marker on the function type, which the
+        // ABI, inliner and linearizer all read — too much reach for one
+        // diagnostic. So the zero-parameter case is skipped, and
+        // `int f(void); f(1);` goes undiagnosed. Every prototype with at least
+        // one parameter is checked.
+        if required == 0 && !variadic {
+            return;
+        }
+        let wrong = if variadic {
+            args.len() < required
+        } else {
+            args.len() != required
+        };
+        if !wrong {
+            return;
+        }
+
+        let expected = if variadic {
+            format!("at least {}", required)
+        } else {
+            required.to_string()
+        };
+        diag::error(
+            call_pos,
+            &format!(
+                "call expects {} argument{}, but {} given",
+                expected,
+                if required == 1 { "" } else { "s" },
+                args.len()
+            ),
+        );
+    }
+
     fn parse_argument_list(&mut self) -> ParseResult<Vec<Expr>> {
         let mut args = Vec::with_capacity(DEFAULT_ARG_LIST_CAPACITY);
 

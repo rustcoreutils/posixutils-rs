@@ -180,6 +180,80 @@ pub fn run_c17(args: &[&str]) -> C17Run {
     }
 }
 
+/// Compile `content` and require it to be **rejected** with a diagnostic
+/// containing `expected`.
+///
+/// Nothing could express this before: `compile_and_run` collapses a compile
+/// failure into the sentinel `-1`, indistinguishable from a program that exits
+/// `-1`, and discards stderr to the test log. So the suites proved that
+/// accepted programs run correctly, never that invalid programs are diagnosed
+/// — which is how a dozen missing constraint checks went unnoticed.
+///
+/// Compiles with `-S` to a scratch file: that path runs the whole front end and
+/// passes both error checkpoints (after parsing and after linearization), while
+/// `--dump-ast` returns before linearization and would miss anything the
+/// linearizer diagnoses. There is no `-fsyntax-only`.
+pub fn compile_expect_error(name: &str, content: &str, expected: &str) {
+    let c_file = create_c_file(name, content);
+    let asm = tempfile::Builder::new()
+        .prefix(&format!("c17_reject_{}_", name))
+        .suffix(".s")
+        .tempfile()
+        .expect("failed to create temp file");
+
+    let args = vec![
+        "-S".to_string(),
+        "-o".to_string(),
+        asm.path().to_string_lossy().to_string(),
+        c_file.path().to_string_lossy().to_string(),
+    ];
+    let output = run_test_base("c17", &args, &[]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "'{}' should have been rejected but compiled cleanly.\nSource:\n{}\nstderr:\n{}",
+        name,
+        content,
+        stderr
+    );
+    assert!(
+        stderr.contains(expected),
+        "'{}' was rejected, but no diagnostic mentioned {:?}.\nstderr:\n{}",
+        name,
+        expected,
+        stderr
+    );
+}
+
+/// Compile `content` and require it to be **accepted**.
+///
+/// The companion to `compile_expect_error`: every new constraint check needs a
+/// case proving it does not fire on legal code.
+pub fn compile_expect_ok(name: &str, content: &str) {
+    let c_file = create_c_file(name, content);
+    let asm = tempfile::Builder::new()
+        .prefix(&format!("c17_accept_{}_", name))
+        .suffix(".s")
+        .tempfile()
+        .expect("failed to create temp file");
+
+    let args = vec![
+        "-S".to_string(),
+        "-o".to_string(),
+        asm.path().to_string_lossy().to_string(),
+        c_file.path().to_string_lossy().to_string(),
+    ];
+    let output = run_test_base("c17", &args, &[]);
+    assert!(
+        output.status.success(),
+        "'{}' should have compiled, but was rejected.\nSource:\n{}\nstderr:\n{}",
+        name,
+        content,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// Preprocess `content` with `-E` and return the run.
 ///
 /// Every other preprocessor test asserts on the exit code of a compiled

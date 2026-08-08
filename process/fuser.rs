@@ -330,19 +330,23 @@ mod linux {
         mount: bool,
         named_files: bool,
     ) -> Result<Vec<Names>, io::Error> {
-        let (
-            mut names,
-            mut unix_socket_list,
-            mut mount_list,
-            mut device_list,
-            mut inode_list,
-            mut need_check_map,
-        ) = init_defaults(file);
+        let (mut names, mut unix_socket_list, mut mount_list) = init_defaults(file);
         fill_unix_cache(&mut unix_socket_list)?;
 
         let net_dev = find_net_dev()?;
 
         for name in names.iter_mut() {
+            // Per-operand, and scoped to the loop body so it cannot be
+            // otherwise. `handle_file_namespace` assigns only *one* of the two
+            // lists depending on the operand's type, and `need_check_map` is
+            // only ever set to true, so when these were hoisted out of the loop
+            // the previous operand's device or inode stayed live and
+            // `-c`/block-device semantics latched on for every operand after
+            // the first one to use them.
+            let mut device_list = DeviceList::default();
+            let mut inode_list = InodeList::default();
+            let mut need_check_map = false;
+
             name.name_space = determine_namespace(&name.filename);
             match name.name_space {
                 NameSpace::File => handle_file_namespace(
@@ -1207,41 +1211,18 @@ mod linux {
         Ok(())
     }
 
-    /// Initializes and returns default values.
+    /// Initialize the state shared across every operand: one `Names` per file
+    /// path, plus the empty UNIX-socket and mount caches.
     ///
-    /// # Arguments
-    ///
-    /// * `file` - A vector of `PathBuf` representing the file paths used to initialize `Names` objects.
-    ///
-    /// # Returns
-    ///
-    /// Returns a tuple containing:
-    ///
-    /// * Default-initialized `Vec<Names>`, UnixSocketList`, `MountList`, `DeviceList`, `InodeList`, `IpConnections` (TCP), and `IpConnections` (UDP).
-    /// * A boolean value set to `false`, indicating the initial state.
-    fn init_defaults(
-        files: Vec<PathBuf>,
-    ) -> (
-        Vec<Names>,
-        UnixSocketList,
-        MountList,
-        DeviceList,
-        InodeList,
-        bool,
-    ) {
+    /// The per-operand device and inode matching state deliberately lives
+    /// inside the operand loop instead, so it cannot be shared by construction.
+    fn init_defaults(files: Vec<PathBuf>) -> (Vec<Names>, UnixSocketList, MountList) {
         let names_vec = files
             .iter()
             .map(|path| Names::new(path.clone(), NameSpace::default(), vec![]))
             .collect();
 
-        (
-            names_vec,
-            UnixSocketList::default(),
-            MountList::default(),
-            DeviceList::default(),
-            InodeList::default(),
-            false,
-        )
+        (names_vec, UnixSocketList::default(), MountList::default())
     }
 }
 

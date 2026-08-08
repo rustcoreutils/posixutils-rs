@@ -11,6 +11,7 @@ use plib::testing::{run_test_with_checker, TestPlan};
 use std::process::Output;
 
 mod basic;
+mod modes;
 #[cfg(target_os = "linux")]
 mod tcp;
 #[cfg(target_os = "linux")]

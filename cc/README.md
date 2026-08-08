@@ -123,6 +123,18 @@ Off by default:
   literals — `"What??!"` becomes `"What|"` — and `??` is far likelier to appear
   by accident than by intent. GCC and Clang default them off for the same reason.
 
+## Runtime dependencies
+
+`c17` does not implement translation phase 8 itself. It shells out to `as` to
+assemble and to `cc` to link, so **both must be on `$PATH`**. There is no crt
+object selection, no dynamic-linker path resolution, and no explicit `-lc` or
+`-lgcc` anywhere in the crate.
+
+This is a deliberate choice and it satisfies the implicit `-l c` and the
+executable-permission mandates transitively, since every conforming host `cc`
+does those things. The consequence worth knowing is that `c17` inherits the
+host driver's crt and runtime-library decisions rather than making its own.
+
 ## Code Quality
 
 Please run `cargo fmt` before committing code, and `cargo clippy` regularly while working. Code should build without warnings.

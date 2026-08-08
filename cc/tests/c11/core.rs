@@ -349,3 +349,34 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("c11_predefined_macros_mega", code, &[]), 0);
 }
+
+/// #X10: the c11 checklist marked anonymous struct/union members *inside a
+/// union* unimplemented, but the parser has always used one shared
+/// member-parsing path whose anonymous branch is gated only on
+/// `is_struct_or_union && is_special(b';')` — no `is_union` restriction. So
+/// they already worked; what was missing was a test to tick the boxes against.
+#[test]
+fn c11_anonymous_members_inside_a_union() {
+    let src = r#"
+        union U {
+            struct { int a; int b; };   /* anonymous struct in a union */
+            union  { long c; };         /* anonymous union in a union  */
+            char raw[16];
+        };
+        int main(void) {
+            union U u;
+            u.a = 1;
+            u.b = 2;
+            if (u.a != 1) return 1;
+            /* The anonymous union overlays the same storage. */
+            u.c = 0;
+            if (u.a != 0) return 2;
+            /* Members are promoted into the enclosing union's scope. */
+            u.raw[0] = 7;
+            if (u.raw[0] != 7) return 3;
+            if (sizeof(union U) < sizeof(long)) return 4;
+            return 0;
+        }
+    "#;
+    assert_eq!(compile_and_run("c11_anon_members_in_union", src, &[]), 0);
+}

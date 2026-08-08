@@ -135,8 +135,8 @@
 ### 5.2 Anonymous Struct/Union Members
 - [x] Unnamed struct member within struct
 - [x] Unnamed union member within struct
-- [ ] Unnamed struct member within union
-- [ ] Unnamed union member within union
+- [x] Unnamed struct member within union
+- [x] Unnamed union member within union
 - [x] Direct field access through containing type
 - [x] Nested anonymous structs/unions
 - [x] Initialization of anonymous members
@@ -196,8 +196,8 @@
 
 - [x] Unnamed struct member in enclosing struct
 - [x] Unnamed union member in enclosing struct
-- [ ] Unnamed struct member in enclosing union
-- [ ] Unnamed union member in enclosing union
+- [x] Unnamed struct member in enclosing union
+- [x] Unnamed union member in enclosing union
 - [x] Direct field access through containing type
 - [x] Nested anonymous structs/unions
 - [x] Initialization of anonymous members

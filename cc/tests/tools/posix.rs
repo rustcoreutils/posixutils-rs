@@ -883,3 +883,225 @@ fn tools_diagnostics_go_to_stderr() {
         );
     }
 }
+
+// ============================================================================
+// Residual rows from the 2026-08-08 stale-box sweep
+// ============================================================================
+
+/// A locale whose collation differs from byte order, or `None` on a host that
+/// has none installed.
+fn collating_locale() -> Option<String> {
+    plib::testing::locale_matching(&["en_US.UTF-8", "en_US.utf8", "en_GB.UTF-8"])
+}
+
+/// The identifiers a tool lists, in the order it listed them.
+fn listed_names(bin: &str, args: &[&str], locale: &str) -> Vec<String> {
+    let (stdout, _, _) = run_env(bin, args, &[("LC_ALL", locale)]);
+    stdout
+        .lines()
+        .filter_map(|l| {
+            let t = l.trim_start_matches(|c: char| c.is_ascii_digit() || c.is_whitespace());
+            t.split(|c: char| c == ':' || c.is_whitespace())
+                .next()
+                .filter(|w| !w.is_empty())
+                .map(String::from)
+        })
+        .collect()
+}
+
+/// `cflow` accepts a `.y` operand: it runs yacc and analyzes the generated C.
+/// Object-file and `.l` operands were covered; `.y` never was.
+#[test]
+fn cflow_processes_yacc_input() {
+    if Command::new("yacc").arg("--version").output().is_err()
+        && Command::new("bison").arg("--version").output().is_err()
+    {
+        eprintln!("skipping cflow_processes_yacc_input: no yacc/bison on this host");
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let path = src(
+        &dir,
+        "g.y",
+        "%{\n#include <stdio.h>\nint yylex(void);\nvoid yyerror(const char *);\n%}\n\
+         %%\nunit: /* empty */ ;\n%%\n\
+         int yylex(void) { return 0; }\nvoid yyerror(const char *s) { (void)s; }\n",
+    );
+
+    let (stdout, stderr, code) = run("cflow", &[&path]);
+    assert_eq!(code, 0, "cflow on a .y operand failed: {}", stderr);
+    assert!(
+        stdout.contains("yyparse") || stdout.contains("yylex"),
+        "expected the generated parser's functions in the graph:\n{}",
+        stdout
+    );
+    assert!(
+        !stderr.contains("/tmp/"),
+        "diagnostics must name the operand, not the generated file:\n{}",
+        stderr
+    );
+}
+
+/// The existing `LC_COLLATE` tests for `cflow -r` and `ctags -x` asserted only
+/// the POSIX-locale order, which *is* byte order — so they passed against the
+/// unfixed `BTreeMap` iteration and could not tell fixed from broken. These
+/// compare two locales, which differ only if collation is really consulted.
+#[test]
+fn tools_collation_actually_depends_on_the_locale() {
+    let Some(locale) = collating_locale() else {
+        eprintln!("skipping tools_collation_actually_depends_on_the_locale: no suitable locale");
+        return;
+    };
+    let dir = TempDir::new().unwrap();
+    // Byte order puts Banana first (uppercase sorts low); a UTF-8 locale does not.
+    let path = src(
+        &dir,
+        "coll.c",
+        "int Banana(void){return 0;}\nint apple(void){return 0;}\nint cherry(void){return 0;}\n",
+    );
+
+    for (bin, args) in [
+        ("ctags", vec!["-x", path.as_str()]),
+        ("cflow", vec!["-r", path.as_str()]),
+    ] {
+        let posix = listed_names(bin, &args, "C");
+        let other = listed_names(bin, &args, &locale);
+        assert!(
+            !posix.is_empty(),
+            "{} produced no listing under LC_ALL=C",
+            bin
+        );
+        assert_ne!(
+            posix, other,
+            "{} ordering did not change with LC_ALL={}, so LC_COLLATE is not consulted.\n\
+             C: {:?}\n{}: {:?}",
+            bin, locale, posix, locale, other
+        );
+    }
+}
+
+/// `ctags` with no `-f` writes a file named `tags`. Every other test passes
+/// `-f`, so the default was never exercised.
+#[test]
+fn ctags_default_output_file_is_tags() {
+    let dir = TempDir::new().unwrap();
+    let path = src(&dir, "d.c", "int only_one(void){return 0;}\n");
+
+    // Run with the scratch dir as cwd so the default lands there.
+    let cwd = TempDir::new().unwrap();
+    let out = Command::new(exe_for("ctags"))
+        .arg(&path)
+        .current_dir(cwd.path())
+        .output()
+        .expect("failed to run ctags");
+    assert!(
+        out.status.success(),
+        "ctags failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let tags = cwd.path().join("tags");
+    assert!(tags.exists(), "ctags wrote no 'tags' file");
+    let body = fs::read_to_string(&tags).unwrap();
+    assert!(
+        body.contains("only_one"),
+        "tags file lacks the tag:\n{}",
+        body
+    );
+}
+
+/// `/` and `\` inside a search pattern must be escaped, or the pattern ends
+/// early and the editor jumps nowhere. The behavior was right; nothing pinned it.
+#[test]
+fn ctags_escapes_slash_in_patterns() {
+    let dir = TempDir::new().unwrap();
+    let path = src(&dir, "e.c", "int slashy(void) { return 1/2; } /* a/b */\n");
+    let tags = dir.path().join("e.tags").to_str().unwrap().to_string();
+
+    let (_, stderr, code) = run("ctags", &["-f", &tags, &path]);
+    assert_eq!(code, 0, "{}", stderr);
+
+    let body = fs::read_to_string(&tags).unwrap();
+    let pattern = body.split('\t').nth(2).unwrap_or("").trim_end();
+    assert!(
+        pattern.contains("1\\/2"),
+        "the '/' in the body must be escaped: {}",
+        pattern
+    );
+    assert!(
+        pattern.starts_with("/^") && pattern.ends_with("$/"),
+        "pattern must keep its anchors: {}",
+        pattern
+    );
+}
+
+/// `ctags` reproduces the source bytes in a pattern, whatever the encoding.
+/// `String::from_utf8_lossy` replaced each invalid byte with U+FFFD, so the
+/// pattern no longer matched the line it pointed at.
+#[test]
+fn ctags_pattern_preserves_source_bytes() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("b.c");
+    // A lone 0xE9 — valid Latin-1, invalid UTF-8 — inside a string literal.
+    let mut bytes = b"int greet(void) { return (int)\"caf".to_vec();
+    bytes.push(0xE9);
+    bytes.extend_from_slice(b"\"[0]; }\n");
+    fs::write(&path, &bytes).unwrap();
+    let tags = dir.path().join("b.tags").to_str().unwrap().to_string();
+
+    let (_, stderr, code) = run("ctags", &["-f", &tags, path.to_str().unwrap()]);
+    assert_eq!(code, 0, "{}", stderr);
+
+    let body = fs::read(&tags).unwrap();
+    assert!(
+        body.contains(&0xE9),
+        "the source byte 0xE9 did not survive into the tags file"
+    );
+    assert!(
+        !body.windows(3).any(|w| w == [0xEF, 0xBF, 0xBD]),
+        "the pattern contains U+FFFD, so it cannot match the source line"
+    );
+}
+
+/// ctags.md 91292: "the file shall be sorted by identifier". A plain append
+/// sorted only within the block it added, leaving the file a run of separately
+/// sorted blocks — which the binary search in vi/ex relies on not happening.
+#[test]
+fn ctags_append_keeps_the_whole_file_sorted() {
+    let dir = TempDir::new().unwrap();
+    let a = src(
+        &dir,
+        "a1.c",
+        "int mmm(void){return 0;}\nint zzz(void){return 0;}\n",
+    );
+    let b = src(
+        &dir,
+        "a2.c",
+        "int aaa(void){return 0;}\nint nnn(void){return 0;}\n",
+    );
+    let tags = dir.path().join("ap.tags").to_str().unwrap().to_string();
+
+    assert_eq!(run("ctags", &["-f", &tags, &a]).2, 0);
+    assert_eq!(run("ctags", &["-a", "-f", &tags, &b]).2, 0);
+
+    let body = fs::read_to_string(&tags).unwrap();
+    let names: Vec<&str> = body.lines().filter_map(|l| l.split('\t').next()).collect();
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        names, sorted,
+        "the tags file is not globally sorted after -a: {:?}",
+        names
+    );
+
+    // A first -a with no existing file must work.
+    let fresh = dir.path().join("fresh.tags").to_str().unwrap().to_string();
+    assert_eq!(run("ctags", &["-a", "-f", &fresh, &a]).2, 0);
+    assert!(fs::metadata(&fresh).is_ok());
+
+    // Re-appending the same input must not duplicate entries.
+    let before = fs::read_to_string(&tags).unwrap().lines().count();
+    assert_eq!(run("ctags", &["-a", "-f", &tags, &b]).2, 0);
+    let after = fs::read_to_string(&tags).unwrap().lines().count();
+    assert_eq!(before, after, "re-appending the same file duplicated tags");
+}

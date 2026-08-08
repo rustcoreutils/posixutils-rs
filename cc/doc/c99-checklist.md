@@ -4,6 +4,15 @@
 > **Purpose:** Exhaustive verification checklist for C99 compiler implementation  
 > **Project:** POSIX Utils Rust C Compiler
 
+> **Accuracy note (2026-08-08).** This checklist previously marked several
+> items `[x]` that the compiler merely *parsed without complaint* — implicit
+> int, duplicate `case` labels, `return` against the function's type, call
+> arity, typedefs of VLA types, and the `__STDC_IEC_559__` family among them.
+> `cc/audit.md` #L8 recorded that it "treats 'parses without panicking' as
+> 'conforms'" and should not be used as compliance evidence. The entries have
+> been corrected against the remediation phases; where an item is genuinely
+> unimplemented it now says so.
+
 ---
 
 ## Table of Contents
@@ -348,8 +357,8 @@
 - [x] `goto identifier;`
 - [x] `continue;`
 - [x] `break;`
-- [x] `return;`
-- [x] `return expression;`
+- [x] `return;` — diagnosed in a non-void function since Phase 5 (#L3)
+- [x] `return expression;` — diagnosed in a void function since Phase 5 (#L3)
 - [x] `goto` into block (jump past VLA — undefined)
 
 ---
@@ -561,7 +570,7 @@
 - [x] Adjacent string literal concatenation
 - [x] Escape sequences in strings
 - [x] Wide string literal `L"hello"`
-- [x] Adjacent wide/narrow string concatenation rules
+- [x] Adjacent wide/narrow string concatenation rules — implemented in Phase 6 (#L4); previously the mixed form was rejected
 - [x] Null termination
 - [x] Modifying string literal (undefined behavior)
 
@@ -577,7 +586,7 @@
 - [x] VLA in prototype `f(int n, int a[*])`
 - [x] Multi-dimensional VLA
 - [x] Pointer to VLA
-- [x] Typedef of VLA type (variably modified type)
+- [ ] Typedef of VLA type (variably modified type) — **rejected** with a diagnostic (Phase 5, #L5). It was previously accepted and then lowered as a runtime VLA allocation, which was a miscompile
 - [x] VLA in `for` loop scope
 - [x] Goto/switch jumping into VLA scope (undefined)
 
@@ -790,9 +799,9 @@
 - [x] `__STDC_HOSTED__` — 1 if hosted *(C99)*
 
 ### 12.2 Conditionally Defined Macros (C99)
-- [x] `__STDC_IEC_559__` — IEEE 754 floating-point
-- [x] `__STDC_IEC_559_COMPLEX__` — IEEE 754 complex
-- [x] `__STDC_ISO_10646__` — ISO 10646 yyyymmL
+- [x] `__STDC_IEC_559__` — IEEE 754 floating-point (actually defined since Phase 7, #P7; it did not exist when this was first ticked)
+- [ ] `__STDC_IEC_559_COMPLEX__` — IEEE 754 complex. **Deliberately not defined**: `float _Complex` and `long double _Complex` do not work (audit #C1/#C2), so claiming Annex G would be false
+- [x] `__STDC_ISO_10646__` — ISO 10646 yyyymmL (actually defined since Phase 7, #P7)
 
 ### 12.3 Predefined Identifier (Not Macro)
 - [x] `__func__` — current function name *(C99)*
@@ -853,7 +862,7 @@
 - [x] 4095 characters in string literal (after concatenation)
 - [x] 65535 bytes in an object
 - [x] 15 nesting levels of `#include`
-- [x] 1023 case labels in switch
+- [x] 1023 case labels in switch — duplicates are now diagnosed (Phase 5, #L2)
 - [x] 1023 members in struct or union
 - [x] 1023 enumeration constants in enum
 - [x] 63 levels of nested struct/union in declaration

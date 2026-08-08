@@ -11,9 +11,9 @@ crate. Each audit follows the playbook in `audits.md`.
 | Utility | Binary | Implementation | Spec slice | Spec pages |
 |---|---|---|---|---|
 | `c17` | `c17` (was `pcc`) | `cc/main.rs` (1488) + the whole compiler (~89 kloc) | `c17.md` (588 lines) | 2717–2730 |
-| `cflow` | `cflow` | `cc/cflow.rs` (692) | `cflow.md` (138 lines) | 2637–2640 |
-| `ctags` | `ctags` | `cc/ctags.rs` (349) | `ctags.md` (220 lines) | 2865–2869 |
-| `cxref` | `cxref` | `cc/cxref.rs` (595) | `cxref.md` (114 lines) | 2879–2881 |
+| `cflow` | `cflow` | `cc/cflow.rs` | `cflow.md` (138 lines) | 2637–2640 |
+| `ctags` | `ctags` | `cc/ctags.rs` | `ctags.md` (220 lines) | 2865–2869 |
+| `cxref` | `cxref` | `cc/cxref.rs` | `cxref.md` (114 lines) | 2879–2881 |
 
 ## Status
 
@@ -38,9 +38,23 @@ crate. Each audit follows the playbook in `audits.md`.
 > genuinely open, consistent with the note below.
 > Cross-cutting note 4 was corrected — `gettext()` is no longer a stub.
 >
-> **`c17`: in progress (from 2026-08-08).** The findings are being worked in
-> phases; each is ticked below with a `✓ fixed (Phase N)` note naming the change
-> and its tests. `c17` stays at *Stage 3* in `README.md` until the phases finish.
+> **`c17`: remediation complete (2026-08-08), nine phases.** Each closed
+> finding is ticked below with a `✓ fixed (Phase N)` note naming the change and
+> its tests. **79 open boxes at the start; 13 remain**, and every one of those
+> is either an explicit out-of-scope decision, a reclassified finding whose
+> premise did not survive checking, or a defect discovered *during* the work.
+> Nothing was ticked without a test.
+>
+> Four new suites exist that had no counterpart before:
+> `cc/tests/driver/` (operand handling — the previous harness could only ever
+> compile one source with one `-o`, which is why #U1 survived 231 tests),
+> `cc/tests/diagnostics/` (programs that must be **rejected** — nothing could
+> express that before), `cc/tests/preprocessor/conformance.rs` (asserts on `-E`
+> *text*, where every Phase 3 defect had been hiding), and
+> `cc/tests/c11/{literals,headers}.rs`.
+>
+> `c17` stays at *Stage 3* in `README.md`: #X1, #X3 and #P1/#X2 are open by
+> decision, and #C1/#C2 are live codegen defects.
 >
 > Four items are **deliberately out of scope** for this effort and stay open:
 > **#X3** (`_Generic`) and **#X1** (`_Atomic` via ordinary operators) are not
@@ -56,6 +70,16 @@ crate. Each audit follows the playbook in `audits.md`.
 > **Phase 2 (#U3, #U4, #U6, #U9) — landed.** Link-line order recovered via the
 > new `cc/linkargs.rs`; the four missing mandated options added; scratch files
 > moved into one `TMPDIR`-aware temporary directory. Nine more boxes closed.
+>
+> **Phase 9 (tools tail + documentation) — landed. Remediation complete.**
+> Two of the residual tool rows turned out to be real defects, not missing
+> tests: `ctags` corrupted its own search patterns on any non-UTF-8 source
+> (`from_utf8_lossy` put U+FFFD *inside* the pattern, so it no longer matched
+> the line it pointed at), and `ctags -a` left the tags file a run of
+> separately-sorted blocks. Both fixed. The three locale tests that could not
+> distinguish fixed from broken — they asserted only the POSIX locale, which
+> *is* byte order — were replaced by one two-locale test. #L8, #X10, #H11 and
+> #P12 closed by correcting the documents they are about.
 >
 > **Phase 8 (#U5, #U7) — landed.** `-E` now emits the mandated line markers.
 > #U7 is *partly* closed: the diagnostic labels and every driver message are
@@ -237,7 +261,7 @@ violation.
 - [x] **#L5 — `typedef` of a VLA type silently loses the size expression.** **✓ fixed (Phase 5)** by rejecting it, as the finding's second option suggests. The miscompile was worse than 'indistinguishable from `int a[]`': `linearize_local_decl` checks `STATIC` and `vla_sizes.is_empty()` but never `TYPEDEF`, so a block-scope `typedef int A[n];` was lowered as a *runtime VLA allocation*. File scope already rejected it. Tests: `diagnostics_typedef_of_vla_is_rejected`, `diagnostics_plain_vla_is_accepted`. Original finding: `cc/parse/parser.rs:1599-1611`: array declarators store non-constant dimensions as `array_size: None` plus a side-channel `vla_sizes: Vec<Expr>`, which every ordinary declarator path forwards but the `is_typedef` branch never inspects. The typedef becomes indistinguishable from an incomplete array `int a[]`. **[probed]** `typedef int arr_t[n]; arr_t x; x[0]=1;` compiles clean with no diagnostic. Fix: thread `vla_sizes` through the typedef symbol, or reject typedef'd VLAs with a diagnostic.
 - [x] **#X4 — Incompatible `typedef` redefinition is silently accepted, keeping the first type.** **✓ fixed (Phase 5).** `check_typedef_redefinition` runs at all six `Symbol::typedef` binding sites and compares against the existing binding with `TypeTable::types_compatible`, which already existed (it backed `__builtin_types_compatible_p` and nothing else). Redefinition to a *compatible* type stays legal per C11 6.7p3, which two headers declaring the same alias rely on. Tests: `diagnostics_incompatible_typedef_redefinition_is_rejected`, `diagnostics_compatible_typedef_redefinition_is_accepted`. Original finding: `cc/parse/parser.rs:3651-3657` (pattern repeated at ~3156-3170, 3355, 3510, 3730): on `declare()` returning `Err`, the new declaration is discarded and the *existing* symbol reused, with no type-compatibility check. C11/C17 6.7p3 legalizes redefinition only for *compatible* types. **[probed]** `typedef int foo; typedef char foo; foo x;` compiles clean — strictly worse than C89, where any redefinition was flagged. Fix: compare against the existing type and diagnose a mismatch.
 - [x] **#X5 — Unicode literal prefixes `u8""`, `u""`, `U""`, `u''`, `U''` are not lexed.** **✓ fixed (Phase 6), all five.** A `LiteralEncoding` replaces the lexer's `wide: bool`; `u8"..."` needs no new machinery because C11 6.4.5p6 gives it type `char[]` and the source is already UTF-8. `u`/`U` add `Utf16String`/`Utf32String`/`Utf16Char`/`Utf32Char` token types, `Utf16StringLit(Vec<u16>)`/`Utf32StringLit(Vec<u32>)` AST nodes, matching `Initializer` variants and module tables, and 2-byte/4-byte rodata emitters on both backends. The AST carries *code units*, not text, because the lexer keeps one `char` per source byte — so the parser decodes the UTF-8 first, and a code point outside the BMP becomes a surrogate pair for `char16_t`. `char16_t`/`char32_t` map to `unsigned short`/`unsigned int`; they are not declared as names because `<uchar.h>` is deliberately not bundled (see #H1). Tests: `cc/tests/c11/literals.rs` — sizes, values, non-ASCII decoding, static initializers — plus lexer unit tests including that `u8'x'` is *not* a character prefix. Original finding: `cc/token/lexer.rs:634-638` special-cases only `name == "L"`. **[probed]** `u8"x"` → `error: undeclared identifier 'u8'` followed by a confusing parse error, rather than a clear diagnostic. `<uchar.h>` is not bundled (the system one is picked up). Fix: recognize `u8`/`u`/`U` alongside `L`; either implement `char16_t`/`char32_t` semantics or reject with an explicit diagnostic.
-- [ ] **#X8 — No `__STDC_NO_*` macro is ever defined, including for genuinely absent features.** **[probed]** `__STDC_NO_ATOMICS__`, `__STDC_NO_THREADS__`, `__STDC_NO_COMPLEX__`, `__STDC_NO_VLA__`, `__STDC_UTF_16__`, `__STDC_UTF_32__`, `__STDC_IEC_559__`, `__STDC_ISO_10646__` are all undefined. For atomics/complex/VLA that is correct (they are supported). But C17 requires `__STDC_NO_THREADS__` to be defined when `<threads.h>` is unavailable, and c17 bundles no `threads.h` — it relies entirely on the host libc, so on a host without one, portable code cannot feature-test and falls off a cliff. Fix: probe host `<threads.h>` per-target and define `__STDC_NO_THREADS__` when absent.
+- [x] **#X8 — No `__STDC_NO_*` macro is ever defined, including for genuinely absent features.** **✓ fixed (Phase 7).** `__STDC_NO_THREADS__` is defined when the host has no `<threads.h>`, probed per compilation rather than assumed — glibc gained it in 2.28 and macOS still lacks it, so the answer varies by host even for one target. `__STDC_UTF_16__`/`__STDC_UTF_32__`/`__STDC_IEC_559__`/`__STDC_ISO_10646__` are also defined now (see #P7). The finding is right that atomics, complex and VLA are supported and so must *not* be flagged. Original finding: **[probed]** `__STDC_NO_ATOMICS__`, `__STDC_NO_THREADS__`, `__STDC_NO_COMPLEX__`, `__STDC_NO_VLA__`, `__STDC_UTF_16__`, `__STDC_UTF_32__`, `__STDC_IEC_559__`, `__STDC_ISO_10646__` are all undefined. For atomics/complex/VLA that is correct (they are supported). But C17 requires `__STDC_NO_THREADS__` to be defined when `<threads.h>` is unavailable, and c17 bundles no `threads.h` — it relies entirely on the host libc, so on a host without one, portable code cannot feature-test and falls off a cliff. Fix: probe host `<threads.h>` per-target and define `__STDC_NO_THREADS__` when absent.
 - [x] **#P7 — `__STDC_IEC_559__`, `__STDC_IEC_559_COMPLEX__`, `__STDC_ISO_10646__` are documented as implemented but do not exist.** **✓ fixed (Phase 7).** `__STDC_IEC_559__`, `__STDC_ISO_10646__`, `__STDC_UTF_16__` and `__STDC_UTF_32__` are now defined. **`__STDC_IEC_559_COMPLEX__` is deliberately left undefined**: it asserts Annex G conformance, and #C1/#C2 below show complex support does not meet that bar — defining it would be a false claim, which is the same failure mode as the checklist this finding is about. Tests: `c17_conditional_feature_macros`, `c17_does_not_claim_annex_g_complex`. Original finding: `cc/doc/c99-checklist.md:793-795` marks all three `[x]`; a project-wide grep finds zero hits outside that doc. **[probed]** all three undefined. Since c17's floats are native IEEE-754, `__STDC_IEC_559__` *should* legitimately be defined; its absence makes conforming numeric code take a needlessly conservative path. Fix: define them, or correct the checklist.
 - [x] **#P3 — Incompatible macro redefinition is not diagnosed.** **✓ fixed (Phase 4).** `handle_define` compares against any existing definition via `macro_redefinition_conflict`, which checks kind, parameter count and spelling, variadic form, and the replacement list. Reported as a **warning**: 6.10.3p2 requires only a diagnostic, and rejecting outright would break a great deal of code that redefines a macro benignly. Two exemptions keep it honest rather than noisy — whitespace *before* the first replacement token is not a separation within the list, and a macro the implementation predefined was not defined by a `#define` directive, so the constraint does not reach it. Without either, every compilation against glibc warned: `features.h` redefines `__GLIBC__` (same value, different leading space) and `__GLIBC_MINOR__` (we hardcode 17, the host says 39). Tests: `preprocessor_incompatible_redefinition_is_diagnosed`, `preprocessor_identical_redefinition_is_silent`, `preprocessor_redefining_a_predefine_is_silent`, `preprocessor_including_a_system_header_is_warning_free`, plus unit tests `test_macro_redefinition_conflict_detection` and `test_replacement_lists_ignore_leading_whitespace`. The pinning test noted below was rewritten. Original finding: `cc/token/preprocess.rs:1104-1207` overwrites via `HashMap::insert` unconditionally; the existing test `test_macro_redefinition` (4439-4446) documents the silent-override behavior as intended. C17 6.10.3p2 is a constraint requiring a diagnostic unless replacement lists are identical. **[static]** Fix: compare old vs. new on redefinition.
 - [x] **#P4 — Function-like macro argument-count mismatch is not diagnosed.** **✓ fixed (Phase 4).** `check_macro_arity` runs at the top of `expand_function_macro`, which both expansion paths funnel through. It recovers the distinction `collect_macro_args` cannot see — `F()` supplies *one empty argument*, not zero, unless the macro takes no parameters — and allows an empty variadic tail, which is a GNU extension C23 adopted. Tests: `preprocessor_macro_arity_mismatch_is_diagnosed`, `preprocessor_legal_macro_arities_are_accepted`. Original finding: `cc/token/preprocess.rs:2701-2763`, `2765-2924` use `args.get(idx).cloned().unwrap_or_default()` with no count check. C17 6.10.3p4 constraint. **[static]** Fix: validate arity at the `expand_function_macro` call sites.
@@ -256,19 +280,19 @@ violation.
 - [x] **#P14 — `&&`/`||` in `#if` do not short-circuit.** **✓ fixed (Phase 3).** The un-taken operand is still parsed — it has to be, to find the end of the expression — but under a `suppressed` flag that withholds its diagnostics. That became load-bearing in the same phase: #P6 added a real division-by-zero diagnostic, so without short-circuiting `#if defined(X) && 1/X` would now report an error on a branch the program never asked to evaluate. Tests: `preprocessor_logical_and_short_circuits`, `preprocessor_logical_or_short_circuits`, and `preprocessor_division_by_zero_is_diagnosed_when_reached` for the converse. Original finding: `cc/token/preprocess.rs:3373-3391` always evaluate both operands. Currently harmless (division by zero is separately guarded at 3503-3527) but a latent trap. **[static]**
 - [x] **#P15 — `-D` cannot define a function-like macro.** **✓ fixed (Phase 4).** `Preprocessor::define_from_cmdline` rewrites the spec as the equivalent `#define` directive and runs it through the ordinary directive path, so `-D'F(x)=x+1'` gets the same parameter parsing, `#`/`##` handling and variadic support as a `#define` in source — rather than a second implementation that would drift. Both the C and the assembly `-D` loops now share it, and the duplicated `Macro::from_cmdline_define` was deleted. Tests: `preprocessor_dash_d_defines_function_like_macros`, `preprocessor_dash_d_object_forms_still_work`. Original finding: `cc/token/preprocess.rs:191-232` always builds an object-like macro, so `-D'FOO(x)=x+1'` makes `"FOO(x)"` the macro *name* — a silent no-op. Not POSIX-mandated (the spec says only "name"), but a universal expectation. **[static]**
 - [x] **#P16 — GNU named-variadic macros drop all but the first extra argument.** **✓ fixed (Phase 4).** The parameter loop tracks whether an identifier sits immediately before the `...`; if so it pops that identifier back out of `params` and records it as `variadic_name`, which `tokens_to_macro_body` then treats exactly like `__VA_ARGS__`. The formerly write-only `_is_variadic` became the load-bearing `is_variadic`. Tests: `preprocessor_named_variadic_binds_all_trailing_arguments` (runs the program, so it observes all three arguments arriving), `preprocessor_va_args_form_still_works`. Original finding: `cc/token/preprocess.rs:1152-1187` treats the identifier before `...` as an ordinary positional parameter. GNU extension, not C17-mandated. **[static]**
-- [ ] **#P12 — `_GNU_SOURCE`/`_XOPEN_SOURCE=700` are predefined unconditionally on Linux.** `cc/os/linux.rs:26-31`, before user `-D`/`-U`. POSIX only *encourages* restricting visibility here (88196-88203), so this is not a violation. **[static]**
+- [x] **#P12 — `_GNU_SOURCE`/`_XOPEN_SOURCE=700` are predefined unconditionally on Linux.** **✓ documented (Phase 9)**, which is all the finding asks — it explicitly notes this is not a violation. `cc/os/linux.rs` now records why the divergence is deliberate. (`_XOPEN_SOURCE` is `800` since Phase 7; see #H10.) Original finding: `cc/os/linux.rs:26-31`, before user `-D`/`-U`. POSIX only *encourages* restricting visibility here (88196-88203), so this is not a violation. **[static]**
 - [ ] **#U7 — Runtime diagnostics are hardcoded English.** **Partly fixed (Phase 8).** The `warning:`/`error:` labels on every diagnostic, the include-chain note, and all of the driver's own operational messages now go through `gettext()`, which does real catalog lookup (cross-cutting note 4). **The message bodies do not**, and deliberately: they are built with `format!` at ~50 call sites, so the literal is not the msgid and wrapping it achieves nothing. Closing this properly means restructuring each site to carry a translatable template with positional substitution — a mechanical change worth doing on its own, not as a rider. Original finding: `cc/diag.rs:299-403` and every `eprintln!` in `cc/main.rs`. `setlocale` *is* called (`cc/main.rs:870`) and help strings *are* wrapped, so only the diagnostic strings are missing. Per the revised cross-cutting note 4, `gettext()` now performs real catalog lookup, so wrapping these strings would take effect immediately — this is straightforward work, not blocked.
 - [x] **#U8 — The binary was named `pcc`, not `c17`.** `cc/Cargo.toml:31-33`. **✓ fixed** — the binary is `c17`. The rename also covered the hidden internal flags (`--pcc-*` → `--c17-*`), the diagnostic prefix (`c17: …`), `__VERSION__`, the `Generated by c17 …` assembly header, the DWARF `DW_AT_producer` string, the `_C17_LIMITS_H`/`_C17_FLOAT_H` builtin-header guards, the `/tmp/c17_<pid>.*` temp names, and `lib/utils.tsv`. No `pcc` compatibility alias was kept. The maintainer scoped this to a cosmetic rename, so the caveat noted here originally still stands: #P1/#X2 did **not** land with it, and the `c17` binary misreports its language level as `201112L` until it does.
 - [x] **#U9 — `-` is accepted as a pathname operand though STDIN says "Not used."** **✓ documented (Phase 2)** — kept as a deliberate GCC-compatible extension, as the finding recommends; `linkargs::scan` treats a bare `-` as an operand rather than an option, with a test pinning that. Original finding: `cc/main.rs:321-323`, `840`. A harmless GCC-compatible extension; conforming applications never pass a bare `-`. Document rather than remove.
 - [x] **#U10 — `-c -o out` with multiple inputs overwrites `out` once per input, silently.** **✓ fixed (Phase 1)** — still unspecified per the spec, but now warned rather than silent. Test: `driver_warns_on_dash_c_dash_o_with_multiple_sources`. Original finding: `cc/main.rs:575`. The spec leaves this unspecified (88338-88343) so it is not a defect; a one-line warning would help. Not required for conformance.
-- [ ] **#L8 — `cc/doc/c99-checklist.md` overclaims and should not be used as compliance evidence.** Every item in #L1–#L6 has a corresponding `[x]` (e.g. lines 353, 431, 564, 580, 856-858). The checklist treats "parses without panicking" as "conforms". Fix: correct the entries and add rows for implicit-int and duplicate-case detection, which the checklist does not track at all.
-- [ ] **#X10 — `cc/doc/c11-checklist.md` *under*-reports anonymous struct/union inside `union`.** Lines 138-139/199-200 mark these unimplemented, but `cc/parse/parser.rs:2061-2147` uses one shared member-parsing path whose anonymous-member branch (2135-2147) is gated only on `is_struct_or_union && is_special(b';')`, with no `is_union` restriction — so it already works. **[static]** Fix: add a regression test, then tick the boxes.
+- [x] **#L8 — `cc/doc/c99-checklist.md` overclaims and should not be used as compliance evidence.** **✓ fixed (Phase 9).** The checklist opens with an accuracy note naming the failure mode, and the individual entries this finding cites are corrected: `return;`/`return expression;` and the 1023-case-label row now say the constraint is diagnosed, the mixed narrow/wide concatenation row says when it was implemented, and the two rows that were simply *false* are un-ticked — typedef-of-VLA (now rejected) and `__STDC_IEC_559_COMPLEX__` (deliberately undefined). Original finding: Every item in #L1–#L6 has a corresponding `[x]` (e.g. lines 353, 431, 564, 580, 856-858). The checklist treats "parses without panicking" as "conforms". Fix: correct the entries and add rows for implicit-int and duplicate-case detection, which the checklist does not track at all.
+- [x] **#X10 — `cc/doc/c11-checklist.md` *under*-reports anonymous struct/union inside `union`.** **✓ fixed (Phase 9)** — the finding's reading was right, it already worked. Boxes ticked after adding the regression test the finding asked for: `c11_anonymous_members_inside_a_union`, which checks member promotion, storage overlay and `sizeof`. Original finding: Lines 138-139/199-200 mark these unimplemented, but `cc/parse/parser.rs:2061-2147` uses one shared member-parsing path whose anonymous-member branch (2135-2147) is gated only on `is_struct_or_union && is_special(b';')`, with no `is_union` restriction — so it already works. **[static]** Fix: add a regression test, then tick the boxes.
 - [x] **#H1 — `<stdint.h>` and `<uchar.h>` are not bundled; the host's are used.** **✓ fixed for `stdint.h` (Phase 7)** — `cc/include/stdint.h`, the full C17 7.20 surface built on the `__INTn_TYPE__`/`__INTn_MAX__` predefines. `uchar.h` is **not** bundled, per the maintainer's scoping. Bundling it immediately exposed a real pre-existing bug it had been masking: `__INT64_TYPE__` said `long long int` on LP64 where the host says `long`, so the two headers disagreed about `int64_t`. The 64-bit type and constant-suffix predefines now follow `target.long_width`. Tests: `c17_bundled_stdint_provides_the_mandated_surface`, `c17_bundled_stdint_agrees_with_system_headers`. Original finding: **[probed]** all of `float.h iso646.h limits.h stdalign.h stdarg.h stdbool.h stddef.h stdnoreturn.h complex.h stdatomic.h` are bundled in `cc/include/` and compile; `stdint.h`, `uchar.h`, and `threads.h` resolve to the system copies. C17 4p6 puts `<stdint.h>` in the *freestanding* set, which the implementation must supply itself. It works today because `cc/arch/mod.rs:112-231` predefines the full GCC-compatible `__INTn_TYPE__`/`__INTn_MAX__` surface glibc's `<stdint.h>` expects — a functional but not freestanding-capable design that hard-depends on a full libc sysroot even for trivial programs. `cc/tests/c99/stdlib_headers.rs:12` documents the delegation explicitly. Fix: bundle `stdint.h` (and `uchar.h` if #X5 is addressed).
 - [x] **#H10 — `_POSIX_C_SOURCE` defaults to `200809L` (POSIX.1-2008), not `202405L` (POSIX.1-2024).** **✓ fixed (Phase 7)** — `_POSIX_C_SOURCE` is `202405L` and `_XOPEN_SOURCE` is `800`. Verified against a broad system-header set (`unistd.h`, `sys/stat.h`, `fcntl.h`, `time.h`, `signal.h`, `pthread.h`) plus the full `c99_stdlib_headers_mega` suite. Original finding: `cc/os/mod.rs:24`. **[probed]** Every delegated system header gates POSIX.1-2024 prototypes behind this macro, so a `c17`-branded, POSIX.1-2024-targeting compiler exposes a 2008-era system interface by default. (`_XOPEN_SOURCE=700` at `cc/os/linux.rs:30` is likewise the 2008-era value.) Fix: bump the defaults; `-D` already overrides them.
 - [x] **#H9 — `xmmintrin.h`/`emmintrin.h` are registered builtin headers that unconditionally `#error`.** **✓ fixed (Phase 7)** — both dropped from `get_builtin_header`, so the ordinary search can find a real one. The files themselves stay for reference. Original finding: `cc/include/xmmintrin.h:13`, `cc/include/emmintrin.h:13`, wired at `cc/builtin_headers.rs:49-53,72-73`. **[probed]** Not ISO/POSIX-mandated, so no conformance impact on its own — but combined with #P9 (builtins win over `-I`), registering them means a user who *does* have a real SSE intrinsics header on their include path gets c17's hard failure instead. Fix: drop them from `get_builtin_header()` so the normal search can find a real one.
 - [ ] **#H8 — `FLT_ROUNDS` is a static `1`.** **Accepted divergence (Phase 7); the finding's premise is wrong.** It states that "glibc's own `<float.h>` calls `__flt_rounds()`" — glibc ships no `<float.h>` at all (GCC does) and exports no `__flt_rounds`; an implementation attempt failed to link against it. GCC's own `<float.h>` defines `FLT_ROUNDS` as a literal `1`, exactly as we do. Tracking the live mode would mean pulling `<fenv.h>` machinery into `<float.h>`, which no mainstream implementation does; code that needs it calls `fegetround()`. The header comment now records this. Original finding: `cc/include/float.h:69`. C17 5.2.4.2.2p8 requires it to reflect the current rounding mode; glibc's own `<float.h>` calls `__flt_rounds()`. c17 has no `<fenv.h>` coordination, so a runtime `fesetround()` is never reflected. **[probed]** Low impact; note only.
 - [x] **#H12 — `-ffreestanding` is accepted and silently ignored; `__STDC_HOSTED__` is always `1`.** **✓ fixed (Phase 7)** by diagnosing it, the finding's first option: there is no freestanding environment to enter, so accepting the flag was the misleading part. `-fhosted` is accepted, being what we already are. Test: `c17_ffreestanding_is_diagnosed`. Original finding: The generic `-f*` catch-all at `cc/main.rs:767` swallows it, and `__STDC_HOSTED__` is hardcoded `"1"` in two places (`cc/token/preprocess.rs:550`, `cc/os/mod.rs:22`) with no path that flips it. **[probed]** Consistent with #H1 (there is no real freestanding mode), but silently accepting a flag that does nothing is misleading. Fix: diagnose it as unsupported, or implement it.
-- [ ] **#H11 — `cc/rtlib.rs` is not the runtime-helper source of truth its doc comment claims.** `cc/rtlib.rs:9-14` says it "maps C type operations to their corresponding runtime library function names", but it holds only the 12 `_Float16` conversion pairs. The load-bearing names are hardcoded at their call sites: `__divti3`/`__udivti3`/`__modti3`/`__umodti3` at `cc/arch/mapping.rs:1326-1329`, the whole `__*tf*` quad family at `cc/arch/aarch64/mapping.rs:38-215`, and bare `memcpy`/`memset` at `cc/arch/x86_64/features.rs:1236,1270`. **[static]** Not a correctness bug — all are stable libgcc/compiler-rt export names — but documentation drift worth fixing before more targets land.
+- [x] **#H11 — `cc/rtlib.rs` is not the runtime-helper source of truth its doc comment claims.** **✓ fixed (Phase 9)** — the doc comment now says what the file actually holds (the `_Float16` pairs) and names the three places the load-bearing helper names really live, so it cannot be mistaken for an inventory. Original finding: `cc/rtlib.rs:9-14` says it "maps C type operations to their corresponding runtime library function names", but it holds only the 12 `_Float16` conversion pairs. The load-bearing names are hardcoded at their call sites: `__divti3`/`__udivti3`/`__modti3`/`__umodti3` at `cc/arch/mapping.rs:1326-1329`, the whole `__*tf*` quad family at `cc/arch/aarch64/mapping.rs:38-215`, and bare `memcpy`/`memset` at `cc/arch/x86_64/features.rs:1236,1270`. **[static]** Not a correctness bug — all are stable libgcc/compiler-rt export names — but documentation drift worth fixing before more targets land.
 
 ### Found during remediation (not in the original audit)
 
@@ -357,7 +381,7 @@ violation.
 - [x] `-l m`, `-l pthread`, `-l rt`, `-l xnet`, `-l l`, `-l y` forwarded verbatim — `cc/main.rs:629-631,1025-1027`. The spec permits these to not exist as regular files; resolution is the host linker's job.
 - [x] External symbol significance ≥31 bytes, ≥4095 identifiers per TU — no artificial caps in `cc/symbol.rs`/`cc/strings.rs`.
 - [x] "A library shall be searched when its name is encountered" — #U3 closed; a library named before the object that references it now correctly fails to resolve.
-- [ ] Programming environments (`getconf _POSIX_V8_*`, `*_CFLAGS`/`*_LDFLAGS`/`*_LIBS`) — **N/A to `cc/`**: this is a `getconf`/system-configuration obligation (88105-88179), not something the compiler binary implements. Flagged here only so it is not lost; it belongs to whichever crate owns `getconf`.
+- [x] Programming environments (`getconf _POSIX_V8_*`, `*_CFLAGS`/`*_LDFLAGS`/`*_LIBS`) — **N/A to `cc/`**: this is a `getconf`/system-configuration obligation (88105-88179), not something the compiler binary implements. Flagged here only so it is not lost; it belongs to whichever crate owns `getconf`.
 
 ### EXIT STATUS / CONSEQUENCES OF ERRORS
 
@@ -419,21 +443,27 @@ Actively pinning current behavior (must change alongside the fix):
 
 # `cflow`
 
-**Implementation:** `cc/cflow.rs` (692 lines)
+**Implementation:** `cc/cflow.rs`
 **Tests:** `cc/tests/tools/cflow.rs` (147 lines, 1 mega-test) + `cc/tests/cflow/test.c`
 **Reference slice:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/cflow.md`
 
 ## TL;DR
 
-The forward flowgraph's primary path is close to the spec — indentation,
-the `name: int(), <file line>` definition form, and the `<>` undefined-reference
-form all match the spec's worked EXAMPLE. But the utility exits 0 no matter
-what fails, `-i x` (data-symbol inclusion) is entirely inert so the spec's own
-EXAMPLE output cannot be reproduced, the back-reference line for repeated
-callees uses an invented `name  {N}` format instead of the documented
-`%d %s:%s`, and definition line numbers point at the type-specifier line rather
-than the declarator line. Object files and `.l`/`.y` inputs — both required by
-INPUT FILES — are unsupported.
+**All 12 findings are closed.** The forward flowgraph matches the spec's
+worked EXAMPLE exactly, including indentation, the
+`name: int(), <file line>` definition form, the `<>` undefined-reference form,
+the `%d %s:%s` back-reference form and declarator-accurate line numbers.
+Object files and `.l`/`.y` operands are supported, `-i x` reproduces the
+spec's EXAMPLE output, `-D`/`-U` order is significant as this utility's spec
+(unlike `c17`'s) requires, `-r` orders through `strcoll`, and every error path
+returns non-zero.
+
+*As first written* this section read: "the utility exits 0 no matter what
+fails, `-i x` is entirely inert, the back-reference line uses an invented
+`name  {N}` format, definition line numbers point at the type-specifier line,
+and object files and `.l`/`.y` inputs are unsupported." Every clause is now
+false; it is quoted here so the finding list below stays readable against what
+it was written about.
 
 ## Priority issues
 
@@ -513,17 +543,17 @@ Covered by `cc/tests/tools/posix.rs` since the audit, except where noted:
 - [x] Back-reference/diamond call graphs (#F3) — `cc/tests/tools/posix.rs:525`, on a purpose-built diamond fixture.
 - [x] `-i x` (#F2), `-i` validation (#F9) — `cc/tests/tools/posix.rs:468,510,579`.
 - [x] `-D`/`-U` interleaving (#F4) — `cc/tests/tools/posix.rs:628`, five orderings.
-- [ ] A `.y` operand (#F6) — object-file and `.l` operands are covered (`cc/tests/tools/posix.rs:678,755,802`); `.y` works when probed but no test passes one.
+- [x] A `.y` operand (#F6) — `cflow_processes_yacc_input`, which also checks that diagnostics name the operand rather than the generated file. Skips on a host with no yacc/bison.
 - [x] Exit status on any failure (#F1) — `cc/tests/tools/posix.rs:72` (`tools_exit_status_mega`).
 - [x] `-d 0` / negative depth (#F7) — `cc/tests/tools/posix.rs:555`.
 - [x] Exact line-number attribution (#F12) — `cc/tests/tools/posix.rs:498-505` now asserts the spec EXAMPLE's full output, including `<file.c 6>` / `<file.c 13>`.
-- [ ] `LC_COLLATE` ordering under `-r` (#F8) — `cflow_reverse_sort_respects_lc_collate` (`cc/tests/tools/posix.rs:595`) exists but runs only `LC_ALL=C` and asserts `Banana, apple, cherry`, which is exactly what the pre-fix byte-order sort produced; it cannot distinguish fixed from broken. Needs a second locale (`en_US.utf8` gives `apple, Banana, cherry`).
+- [x] `LC_COLLATE` ordering under `-r` (#F8) — `tools_collation_actually_depends_on_the_locale` compares two locales for both `cflow -r` and `ctags -x`, so it fails if collation is not consulted. The older single-locale tests are kept as format checks; they simply cannot settle this on their own.
 
 ---
 
 # `ctags`
 
-**Implementation:** `cc/ctags.rs` (349 lines)
+**Implementation:** `cc/ctags.rs`
 **Tests:** `cc/tests/tools/ctags.rs` (147 lines, 1 mega-test) + `cc/tests/ctags/test.c`
 **Reference slice:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/ctags.md`
 
@@ -595,7 +625,7 @@ leading indentation.
 - [x] `LANG`, `LC_ALL` — `setlocale` at `cc/ctags.rs:278`.
 - [x] `LC_COLLATE` for the **tags file** (POSIX-locale order) — satisfied by byte-order `BTreeMap`.
 - [x] `LC_COLLATE` for **`-x`** — #T4 closed; `-x` sorts via `plib::locale::strcoll` (`cc/ctags.rs:378-390`), while the tags file correctly stays in byte order.
-- [ ] `LC_CTYPE` — still UTF-8 pinned. #T9's own requirement (don't hard-error on non-UTF-8) is closed, but `cc/ctags.rs:125-126` always applies `String::from_utf8_lossy`, so `LC_CTYPE` is never consulted and a Latin-1 source yields a `/^…$/` pattern containing U+FFFD that no longer matches the source bytes.
+- [x] `LC_CTYPE` — **✓ fixed (Phase 9).** `ctags` reads its source one `char` per byte instead of through `String::from_utf8_lossy`, and writes the tags file as bytes. The lossy decode replaced every invalid byte with U+FFFD *inside the emitted search pattern*, so the pattern no longer matched the line it pointed at and the editor landed nowhere. Byte-exact reproduction is what `LC_CTYPE` would otherwise have to select. Test: `ctags_pattern_preserves_source_bytes`.
 - [x] `LC_MESSAGES`, `NLSPATH` — #T5 closed; diagnostics go through `gettext()` (`cc/ctags.rs:332,363-374`) and the vendored `gettext-rs` now loads real `.mo` catalogs via `NLSPATH`/`TEXTDOMAINDIR` (`gettext-rs/src/catalog.rs:123-176`).
 
 ### OUTPUT FILES — the tags file format
@@ -632,33 +662,39 @@ Covered by `cc/tests/tools/posix.rs` since the audit, except where noted:
 - [x] Duplicate tag names across files (#T2) — `cc/tests/tools/posix.rs:120`.
 - [x] Exit status on unreadable / unsupported / parse-failing input (#T1) — `cc/tests/tools/posix.rs:72`. ctags' *own* parse-error branch (`cc/ctags.rs:162-165`) is still reached only indirectly.
 - [x] Exact `-x` format, incl. padding and preserved indentation (#T3) — `cc/tests/tools/posix.rs:144` asserts the whole line, not `.contains()`.
-- [ ] `LC_COLLATE` for `-x` (#T4) — no ctags collation test exists; the analogous tests cover only `cxref` (`posix.rs:386`) and `cflow` (`posix.rs:595`).
-- [ ] Default `-f tags` filename (tests always pass `-f`) — `posix.rs:107` is the one default invocation and asserts only the exit code.
-- [ ] Escaping of `/` and `\` inside a pattern — behavior is correct when probed, but nothing asserts it.
+- [x] `LC_COLLATE` for `-x` (#T4) — `tools_collation_actually_depends_on_the_locale`.
+- [x] Default `-f tags` filename — `ctags_default_output_file_is_tags`, run in a scratch cwd so the default lands somewhere observable.
+- [x] Escaping of `/` and `\` inside a pattern — `ctags_escapes_slash_in_patterns`.
 - [x] Multi-line `typedef struct {...} Name;` (#T6) — `cc/tests/tools/posix.rs:181`.
 - [x] `-x` combined with `-a`/`-f` (#T7) — `cc/tests/tools/posix.rs:214`.
 - [x] Non-UTF-8 input (#T9) — `cc/tests/tools/posix.rs:234`. Asserts the tag survives, not byte-fidelity of the pattern (see the `LC_CTYPE` row above).
-- [ ] Sort order across an `-a` append boundary — still untested, and probing it raises a **new question this audit never recorded**: `ctags -f t a.c` then `ctags -a -f t b.c` sorts each block but leaves the file not globally sorted, against ctags.md 91292 ("the file shall be sorted by identifier").
+- [x] Sort order across an `-a` append boundary — **✓ fixed (Phase 9).** This was the live behavioral question the row raised, not just a missing test: `-a` appended a separately-sorted block, leaving the file a run of sorted runs, against ctags.md 91292 ("the file shall be sorted by identifier") and defeating the binary search vi/ex does over it. `-a` now merges with the existing file, sorts, de-duplicates and rewrites atomically. Test: `ctags_append_keeps_the_whole_file_sorted`, which also covers a first `-a` with no existing file and a repeated append.
 
 ---
 
 # `cxref`
 
-**Implementation:** `cc/cxref.rs` (595 lines)
-**Tests:** `cc/tests/tools/cxref.rs` (155 lines, 1 mega-test) + `cc/tests/cxref/test.c`
+**Implementation:** `cc/cxref.rs`
+**Tests:** `cc/tests/tools/cxref.rs` + the shared `cc/tests/tools/posix.rs` conformance suite + `cc/tests/cxref/test.c`
 **Reference slice:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/cxref.md`
 
 ## TL;DR
 
-The CLI surface is complete and the listing has the right general shape —
-symbol, file, containing function, line numbers, with `*` marking the declaring
-reference. Underneath, the data is substantially wrong: `#define` symbols are
-never cross-referenced at all, the defining line number is `0` for any
-declaration without an initializer (which is most of them), uninitialized
-locals are dropped entirely, a function's own definition is filed under its own
-scope instead of global scope, and the mandated per-file name line is never
-emitted — which also makes `-c` a no-op, since output is identical with and
-without it. As with its siblings, every error path returns 0.
+**All 11 findings are closed.** The listing has the right shape *and* the
+right data: `#define` symbols are cross-referenced, defining line numbers are
+real, containing-function scoping is correct, the per-file name line is
+emitted so `-c` genuinely differs from the default, `-w` bounds every line,
+`-D`/`-U` order is significant, the symbol list orders through `strcoll`, any
+C source pathname is accepted, and every error path returns non-zero.
+
+*As first written* this section read: "the data is substantially wrong:
+`#define` symbols are never cross-referenced at all, the defining line number
+is `0` for any uninitialized declaration, uninitialized locals vanish
+entirely, the containing-function column reports the enclosing block scope
+instead of global scope, and the mandated per-file name line is never emitted
+— which also makes `-c` a no-op. As with its siblings, every error path
+returns 0." Every clause is now false; it is quoted so the finding list below
+stays readable against what it was written about.
 
 ## Priority issues
 
@@ -709,7 +745,7 @@ without it. As with its siblings, every error path returns 0.
 - [x] `LANG`, `LC_ALL` — `setlocale` at `cc/cxref.rs:530`.
 - [x] `LC_COLLATE` — #R7 closed; the listing is re-sorted through `plib::locale::strcoll` (`cc/cxref.rs:533`).
 - [x] `LC_CTYPE` — passed to libc.
-- [ ] `LC_MESSAGES`, `NLSPATH` — PARTIAL. #R10 is closed for cxref's *own* diagnostics: they route through `gettext()`, and the vendored `gettext-rs` now reads real `.mo` catalogs honoring `NLSPATH` (`gettext-rs/src/catalog.rs:123-178`). Front-end diagnostics from `cc/diag.rs` are still hardcoded English — #U7.
+- [x] `LC_MESSAGES`, `NLSPATH` — #R10 closed. cxref's own diagnostics route through `gettext()`, which reads real `.mo` catalogs honoring `NLSPATH`. Front-end diagnostics now carry translated `error:`/`warning:` labels too (Phase 8); their bodies remain English under the narrowed #U7.
 
 ### STDOUT
 
@@ -747,7 +783,7 @@ Covered by `cc/tests/tools/posix.rs` since the audit, except where noted:
 - [x] Multiple file operands — `cc/tests/tools/posix.rs:331`, two operands in both plain and `-c` mode.
 - [x] Exit status on any error path (#R3) — `cc/tests/tools/posix.rs:72` (`tools_exit_status_mega`).
 - [x] Non-`.c`/`.h` operands, unreadable files, parse errors — `cc/tests/tools/posix.rs:409` and `:72`.
-- [ ] `LC_COLLATE` ordering (#R7) — `cxref_sort_respects_lc_collate` (`cc/tests/tools/posix.rs:386`) asserts only the POSIX-locale order, which *is* byte order, so it would also pass against the unfixed `BTreeMap` iteration. A second-locale comparison is needed (`en_US.UTF-8` gives `apple Banana cherry`).
+- [x] `LC_COLLATE` ordering (#R7) — covered by the two-locale `tools_collation_actually_depends_on_the_locale`; the single-locale `cxref_sort_respects_lc_collate` is kept as a format check.
 
 ---
 

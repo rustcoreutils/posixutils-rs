@@ -52,6 +52,10 @@ crate. Each audit follows the playbook in `audits.md`.
 > **Phase 1 (#U1, #U2, #U10) — landed.** The driver was restructured to compile
 > every operand and then link once. Nine boxes closed. New suite:
 > `cc/tests/driver/mod.rs`.
+>
+> **Phase 2 (#U3, #U4, #U6, #U9) — landed.** Link-line order recovered via the
+> new `cc/linkargs.rs`; the four missing mandated options added; scratch files
+> moved into one `TMPDIR`-aware temporary directory. Nine more boxes closed.
 
 ---
 
@@ -183,10 +187,10 @@ violation.
 
 ### Major
 
-- [ ] **#U3 — `-L`/`-l`/`-R` ordering relative to each other and to pathname operands is architecturally lost.** `cc/main.rs:78` (`files: Vec<String>`), `199-203`, `624-636`, `1016-1031`: clap collects each flag into its own `Vec`, then the link line emits *all* `-L` then *all* `-l`, always after all objects. The spec deviates from XBD 12.2 specifically to say this order is significant (87866-87867), and EXAMPLE 3 depends on it. **[static]** — the source structure makes the interleaving unrecoverable after parsing. Fix: pre-scan raw argv for `-L`/`-l`/`-R`, preserving a single ordered stream mirrored onto the link command.
-- [ ] **#U4 — `-B mode`, `-G`, `-R directory`, and `-s` are unimplemented.** 4 of the 14 mandated options. **[probed]** each is rejected by clap as `unexpected argument`. `--shared`/`-fPIC` exist as GCC-compat long flags but are not the POSIX short options, and there is no runpath emission (`-R`) or strip (`-s`) path at all. Fix: add all four; wire `-G` to the existing `--shared`/PIC path, `-R` to `-Wl,-rpath`, `-s` to a strip step, `-B dynamic` to library-selection preference.
+- [x] **#U3 — `-L`/`-l`/`-R` ordering relative to each other and to pathname operands is architecturally lost.** **✓ fixed (Phase 2).** New `cc/linkargs.rs` rescans the normalized argument vector into one ordered `Vec<LinkArg>`; `build_link_line` then substitutes each source operand's compiled object at its own position, so a library is searched where its name is encountered. If the rescan ever disagrees with what clap collected — the drift risk in its `VALUE_OPTIONS` table — it falls back to the old unordered shape rather than emitting a scrambled link line. Tests: `driver_library_order_is_significant` (two archives defining the same symbol; swapping `-lQ`/`-lP` changes the program's result) and `driver_library_named_before_its_user_does_not_resolve`. Original finding: `cc/main.rs:78` (`files: Vec<String>`), `199-203`, `624-636`, `1016-1031`: clap collects each flag into its own `Vec`, then the link line emits *all* `-L` then *all* `-l`, always after all objects. The spec deviates from XBD 12.2 specifically to say this order is significant (87866-87867), and EXAMPLE 3 depends on it. **[static]** — the source structure makes the interleaving unrecoverable after parsing. Fix: pre-scan raw argv for `-L`/`-l`/`-R`, preserving a single ordered stream mirrored onto the link command.
+- [x] **#U4 — `-B mode`, `-G`, `-R directory`, and `-s` are unimplemented.** **✓ fixed (Phase 2).** All four added. `-G` shares the existing `--shared` path via `producing_shared()`; `-R` becomes `-Wl,-rpath,dir` in place; `-s` passes `-s` to the link; `-B dynamic|static` becomes `-Wl,-Bdynamic`/`-Wl,-Bstatic` ahead of the libraries it governs, and static binding is restored to dynamic before the host driver's implicit libc/libgcc_s, which are not shipped as archives. An unknown `-B` mode is diagnosed. Tests: `driver_accepts_mandated_options`, `driver_rejects_unknown_binding_mode`, `driver_dash_s_strips_symbols`. Original finding: 4 of the 14 mandated options. **[probed]** each is rejected by clap as `unexpected argument`. `--shared`/`-fPIC` exist as GCC-compat long flags but are not the POSIX short options, and there is no runpath emission (`-R`) or strip (`-s`) path at all. Fix: add all four; wire `-G` to the existing `--shared`/PIC path, `-R` to `-Wl,-rpath`, `-s` to a strip step, `-B dynamic` to library-selection preference.
 - [ ] **#U5/#P8 — `-E` emits none of the mandated `# <line> "<file>"` markers.** `cc/main.rs:356-361`, `401-408` explicitly skip tokens whose text starts with `<STREAM`. STDOUT (88032-88038) says the `-E` output *shall* contain at least one such line for each file processed via `#include`; RATIONALE (88370-88374) states the purpose is makefile dependency generation. **[probed]** `c17 -E t.c | grep -c '^# [0-9]'` → `0`. Fix: emit `# {line} "{path}"` on stream transitions instead of discarding the markers.
-- [ ] **#U6 — `TMPDIR` is ignored; temp files use predictable names in a world-writable directory.** `cc/main.rs:567,600,941,947` hardcode `format!("/tmp/c17_{}.s", process::id())` etc. **[probed]** grep for `TMPDIR` across `cc/*.rs` returns zero matches; a run leaves `/tmp/c17_<pid>.o`. ENVIRONMENT VARIABLES (88020-88022) requires `TMPDIR` to override the temp directory. Separately, a predictable name in `/tmp` is a symlink/pre-creation hazard. Fix: honor `TMPDIR`, and create temp files with `O_EXCL` + randomized names (or use the `tempfile` crate already in dev-dependencies).
+- [x] **#U6 — `TMPDIR` is ignored; temp files use predictable names in a world-writable directory.** **✓ fixed (Phase 2).** One `tempfile::TempDir` per run holds every intermediate. `tempfile` places it under `TMPDIR` when set and creates it `O_EXCL` with a random name, which closes the symlink/pre-creation hazard; dropping it removes the tree, so the five best-effort `remove_file` calls that every `?` and `process::exit` used to bypass are gone. The one `process::exit` that outlives it drops it explicitly first. Test: `driver_honors_tmpdir_and_cleans_up`. Original finding: `cc/main.rs:567,600,941,947` hardcode `format!("/tmp/c17_{}.s", process::id())` etc. **[probed]** grep for `TMPDIR` across `cc/*.rs` returns zero matches; a run leaves `/tmp/c17_<pid>.o`. ENVIRONMENT VARIABLES (88020-88022) requires `TMPDIR` to override the temp directory. Separately, a predictable name in `/tmp` is a symlink/pre-creation hazard. Fix: honor `TMPDIR`, and create temp files with `O_EXCL` + randomized names (or use the `tempfile` crate already in dev-dependencies).
 - [ ] **#P6 — `#if` arithmetic is signed-`i64` only; large unsigned constants silently become 0.** `cc/token/preprocess.rs:3732-3744` (`i64::from_str_radix(...).unwrap_or(0)`). C17 6.10.1p4 requires `intmax_t`/`uintmax_t` arithmetic. **[probed]** `#if 0xFFFFFFFFFFFFFFFF` takes the *false* branch. Any `SIZE_MAX`/`UINTMAX_MAX`-style feature test silently misfires. Fix: parse into `u64`/`i128` and thread signedness through `ExprEvaluator`.
 - [ ] **#P9 — Builtin headers shadow the user's own headers for quoted includes.** `cc/token/preprocess.rs:1694-1762`: `get_builtin_header` is consulted at 1701-1709, *before* the quote-form same-directory lookup at 1721-1726. The `""` form must search the including file's directory first (87905-87910). **[probed]** a local `stddef.h` next to the source is ignored in favor of the builtin. Any project with its own `limits.h`/`float.h`/`stdbool.h`/`complex.h`/`iso646.h`/`stddef.h` is silently miscompiled. Fix: for quote-form includes, search dir-of-file and `-I` dirs before builtins.
 - [ ] **#X3 — `_Generic` is unimplemented.** Zero matches in `cc/parse/expression.rs`, `ast.rs`, `parser.rs`. **[probed]** `_Generic(1, int: 1, default: 0)` → `error: undeclared identifier '_Generic'` then a cascade of parse errors. Blocks strictly-conforming C11/C17 source and any real `<tgmath.h>`. Fix: add as a primary-expression production, lvalue-convert the controlling expression's type per 6.5.1.1p2, match by type compatibility, enforce the "no two compatible associations / at most one default" constraints, and emit only the selected branch.
@@ -218,7 +222,7 @@ violation.
 - [ ] **#P12 — `_GNU_SOURCE`/`_XOPEN_SOURCE=700` are predefined unconditionally on Linux.** `cc/os/linux.rs:26-31`, before user `-D`/`-U`. POSIX only *encourages* restricting visibility here (88196-88203), so this is not a violation. **[static]**
 - [ ] **#U7 — Runtime diagnostics are hardcoded English.** `cc/diag.rs:299-403` and every `eprintln!` in `cc/main.rs`. `setlocale` *is* called (`cc/main.rs:870`) and help strings *are* wrapped, so only the diagnostic strings are missing. Per the revised cross-cutting note 4, `gettext()` now performs real catalog lookup, so wrapping these strings would take effect immediately — this is straightforward work, not blocked.
 - [x] **#U8 — The binary was named `pcc`, not `c17`.** `cc/Cargo.toml:31-33`. **✓ fixed** — the binary is `c17`. The rename also covered the hidden internal flags (`--pcc-*` → `--c17-*`), the diagnostic prefix (`c17: …`), `__VERSION__`, the `Generated by c17 …` assembly header, the DWARF `DW_AT_producer` string, the `_C17_LIMITS_H`/`_C17_FLOAT_H` builtin-header guards, the `/tmp/c17_<pid>.*` temp names, and `lib/utils.tsv`. No `pcc` compatibility alias was kept. The maintainer scoped this to a cosmetic rename, so the caveat noted here originally still stands: #P1/#X2 did **not** land with it, and the `c17` binary misreports its language level as `201112L` until it does.
-- [ ] **#U9 — `-` is accepted as a pathname operand though STDIN says "Not used."** `cc/main.rs:321-323`, `840`. A harmless GCC-compatible extension; conforming applications never pass a bare `-`. Document rather than remove.
+- [x] **#U9 — `-` is accepted as a pathname operand though STDIN says "Not used."** **✓ documented (Phase 2)** — kept as a deliberate GCC-compatible extension, as the finding recommends; `linkargs::scan` treats a bare `-` as an operand rather than an option, with a test pinning that. Original finding: `cc/main.rs:321-323`, `840`. A harmless GCC-compatible extension; conforming applications never pass a bare `-`. Document rather than remove.
 - [x] **#U10 — `-c -o out` with multiple inputs overwrites `out` once per input, silently.** **✓ fixed (Phase 1)** — still unspecified per the spec, but now warned rather than silent. Test: `driver_warns_on_dash_c_dash_o_with_multiple_sources`. Original finding: `cc/main.rs:575`. The spec leaves this unspecified (88338-88343) so it is not a defect; a one-line warning would help. Not required for conformance.
 - [ ] **#L8 — `cc/doc/c99-checklist.md` overclaims and should not be used as compliance evidence.** Every item in #L1–#L6 has a corresponding `[x]` (e.g. lines 353, 431, 564, 580, 856-858). The checklist treats "parses without panicking" as "conforms". Fix: correct the entries and add rows for implicit-int and duplicate-case detection, which the checklist does not track at all.
 - [ ] **#X10 — `cc/doc/c11-checklist.md` *under*-reports anonymous struct/union inside `union`.** Lines 138-139/199-200 mark these unimplemented, but `cc/parse/parser.rs:2061-2147` uses one shared member-parsing path whose anonymous-member branch (2135-2147) is gated only on `is_struct_or_union && is_special(b';')`, with no `is_union` restriction — so it already works. **[static]** Fix: add a regression test, then tick the boxes.
@@ -241,28 +245,28 @@ violation.
 - [x] Grouping option letters "need not be recognized" — spec-permissive, N/A.
 - [x] `--` end-of-options — **[probed]** `c17 -c -- t.c` works.
 - [x] At least one pathname operand required — `cc/main.rs:78`.
-- [ ] `-L`/`-l`/`-R` order significant — **MISSING**, #U3.
+- [x] `-L`/`-l`/`-R` order significant — #U3 closed; recovered by `cc/linkargs.rs` and emitted in argument order.
 
 ### OPTIONS
 
 | Option | Status | Evidence |
 |---|---|---|
-| `-B mode` | **MISSING** | #U4 |
+| `-B mode` | CONFORMS | `-Wl,-Bstatic`/`-Bdynamic`; unknown mode diagnosed |
 | `-c` | CONFORMS | `cc/main.rs:134-135,573-594` |
 | `-D name[=value]` | CONFORMS | `cc/main.rs:116-117`; **[probed]** default value is `1` |
 | `-D`/`-U` precedence (`-U` wins regardless of order) | CONFORMS | `cc/token/preprocess.rs:3800-3818`; **[probed]** both orders leave the name undefined — exactly as 87878-87880 requires |
 | `-D` limits (≥2048 bytes, ≥256 names) | CONFORMS | unbounded `Vec` |
 | `-E` | PARTIAL | works, but no line markers — #U5 |
-| `-G` | **MISSING** | #U4 |
+| `-G` | CONFORMS | shares the `--shared` path (`producing_shared`) |
 | `-g` | CONFORMS | `cc/main.rs:147-148,578-579,602-603` |
 | `-I directory` | CONFORMS | `cc/main.rs:122-123`; order preserved, unbounded (≥10 floor met) |
 | `-I` search algorithm (`""` vs `<>`) | CONFORMS *except builtins* | `cc/token/preprocess.rs:1720-1737` matches 87905-87910 precisely; but builtins pre-empt it — #P9 |
-| `-L directory` | PARTIAL | forwarded, ordering lost — #U3 |
-| `-l library` | PARTIAL | forwarded; `.so`-vs-`.a` selection delegated to the host linker (acceptable); interspersion lost — #U3 |
+| `-L directory` | CONFORMS | ordering recovered by `cc/linkargs.rs` |
+| `-l library` | CONFORMS | `.so`-vs-`.a` selection delegated to the host linker (acceptable), now steerable with `-B`; interspersion preserved |
 | `-O optlevel` | CONFORMS | `cc/main.rs:184-186`; `cc/opt.rs:72-75` disables all passes at `0`; omitted ⇒ `0` (spec: default unspecified) |
-| `-o outfile` | CONFORMS (single-file) | `cc/main.rs:552,575,597` |
-| `-R directory` | **MISSING** | #U4 |
-| `-s` | **MISSING** | #U4 |
+| `-o outfile` | CONFORMS | names the link output, or the single `-c` object; `-c` with several sources warns (#U10) |
+| `-R directory` | CONFORMS | emitted as `-Wl,-rpath,dir` in operand order |
+| `-s` | CONFORMS | passed to the link |
 | `-U name` | CONFORMS | `cc/main.rs:119-120` |
 
 ### OPERANDS
@@ -287,7 +291,7 @@ violation.
 | `LANG`, `LC_ALL`, `LC_CTYPE` | CONFORMS | `setlocale(LcAll,"")` at `cc/main.rs:870` forwards to libc |
 | `LC_MESSAGES` | PARTIAL | locale set, diagnostics hardcoded English — #U7 |
 | `NLSPATH` (XSI) | PARTIAL | `gettext()` honors it (cross-cutting note 4), but `c17`'s own diagnostics are unwrapped — #U7 |
-| `TMPDIR` (XSI) | **MISSING** | #U6 |
+| `TMPDIR` (XSI) | CONFORMS | one `tempfile::TempDir` per run |
 
 ### ASYNCHRONOUS EVENTS
 
@@ -309,7 +313,7 @@ violation.
 
 - [x] `-l m`, `-l pthread`, `-l rt`, `-l xnet`, `-l l`, `-l y` forwarded verbatim — `cc/main.rs:629-631,1025-1027`. The spec permits these to not exist as regular files; resolution is the host linker's job.
 - [x] External symbol significance ≥31 bytes, ≥4095 identifiers per TU — no artificial caps in `cc/symbol.rs`/`cc/strings.rs`.
-- [ ] "A library shall be searched when its name is encountered" — same defect as #U3.
+- [x] "A library shall be searched when its name is encountered" — #U3 closed; a library named before the object that references it now correctly fails to resolve.
 - [ ] Programming environments (`getconf _POSIX_V8_*`, `*_CFLAGS`/`*_LDFLAGS`/`*_LIBS`) — **N/A to `cc/`**: this is a `getconf`/system-configuration obligation (88105-88179), not something the compiler binary implements. Flagged here only so it is not lost; it belongs to whichever crate owns `getconf`.
 
 ### EXIT STATUS / CONSEQUENCES OF ERRORS
@@ -352,10 +356,10 @@ qualifiers, `#include_next`, `#warning`, digraphs, and the C23 one-argument
 Not covered:
 - [x] More than one `.c`/`.i` operand in a single invocation — `cc/tests/driver/mod.rs` now drives the binary with a raw argv via the new `common::run_c17` helper; `driver_multiple_sources_do_not_share_temp_files` also pins that per-source scratch names do not collide.
 - [x] A `.c` operand combined with a `.o`/`.a`/`.so` operand (spec EXAMPLE 1) — `driver_links_source_with_object_operand`, plus `driver_object_operand_may_come_first` for the reverse order.
-- [ ] `-L`/`-l` interleaved with pathname operands (spec EXAMPLE 3).
-- [ ] `-B`, `-G`, `-R`, `-s` (they do not exist).
+- [x] `-L`/`-l` interleaved with pathname operands (spec EXAMPLE 3) — `driver_library_order_is_significant` and `driver_library_named_before_its_user_does_not_resolve`, plus `linkargs`' own `spec_example_3_interleaving_is_preserved` unit test.
+- [x] `-B`, `-G`, `-R`, `-s` — `driver_accepts_mandated_options`, `driver_rejects_unknown_binding_mode`, `driver_dash_s_strips_symbols`.
 - [ ] `-E` output containing `# <line> "<file>"` markers.
-- [ ] `TMPDIR` honored for temp files.
+- [x] `TMPDIR` honored for temp files — `driver_honors_tmpdir_and_cleans_up`, which also asserts nothing is left behind.
 - [x] A compile error on a non-final operand followed by a later successful one — `driver_continues_past_a_failing_operand`.
 - [ ] Negative-path diagnostics generally: there is **no** test asserting that a malformed program is *rejected*. The suites prove accepted programs run correctly, not that invalid programs are diagnosed. A `cc/tests/diagnostics/` suite asserting `error_count() > 0` for #L1–#L6, #P3–#P5, #X4, #X9 would close the largest structural gap.
 - [ ] Bare `#` null directive; macro redefinition/arity diagnostics; large `#if` hex constants; comment-as-whitespace stringification; trigraphs.

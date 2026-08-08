@@ -72,9 +72,13 @@ fn compile_and_run_single(
         thread_id.replace(|c: char| !c.is_alphanumeric(), "_")
     ));
 
+    // The source operand goes before `extra_opts`, because those may contain
+    // `-l` and a library is searched where its name is encountered — naming it
+    // ahead of the object that references it resolves nothing. This is the
+    // ordinary `c17 prog.c -lm` shape.
     let mut args = vec!["-o".to_string(), exe_path.to_string_lossy().to_string()];
-    args.extend(extra_opts.iter().cloned());
     args.push(c_path.to_string_lossy().to_string());
+    args.extend(extra_opts.iter().cloned());
 
     let output = run_test_base("c17", &args, &[]);
 
@@ -102,8 +106,8 @@ fn compile_and_run_single(
             "-o".to_string(),
             asm_path.to_string_lossy().to_string(),
         ];
-        asm_args.extend(extra_opts.iter().cloned());
         asm_args.push(c_path.to_string_lossy().to_string());
+        asm_args.extend(extra_opts.iter().cloned());
         let asm_output = run_test_base("c17", &asm_args, &[]);
         if asm_output.status.success() {
             if let Ok(asm) = std::fs::read_to_string(&asm_path) {

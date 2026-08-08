@@ -21,6 +21,7 @@ pub mod builtins;
 pub mod diag;
 pub mod ir;
 pub mod kw;
+pub mod linkargs;
 pub mod opt;
 pub mod os;
 pub mod parse;

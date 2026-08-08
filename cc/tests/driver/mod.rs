@@ -270,6 +270,181 @@ fn driver_early_exit_modes_do_not_link() {
     );
 }
 
+// ============================================================================
+// #U3 — -L/-l order relative to the operands is significant
+// ============================================================================
+
+/// Build two archives that define the same symbol with different values, so
+/// the link order is observable in the program's exit status.
+fn build_rival_archives(w: &WorkDir) -> PathBuf {
+    let libdir = w.join("libdir");
+    std::fs::create_dir_all(&libdir).unwrap();
+
+    for (name, value) in [("Q", 1), ("P", 2)] {
+        let src = w.write(
+            &format!("{}.c", name),
+            &format!("int which(void){{return {};}}\n", value),
+        );
+        let obj = w.join(&format!("{}.o", name));
+        assert!(run_c17(&["-c", &s(&src), "-o", &s(&obj)]).success);
+        let ar = Command::new("ar")
+            .arg("rcs")
+            .arg(libdir.join(format!("lib{}.a", name)))
+            .arg(&obj)
+            .status()
+            .expect("failed to run ar");
+        assert!(ar.success(), "ar failed for lib{}", name);
+    }
+    libdir
+}
+
+/// "A library shall be searched when its name is encountered" — so the first
+/// `-l` naming a definition wins, and swapping the two changes the result.
+#[test]
+fn driver_library_order_is_significant() {
+    let w = WorkDir::new("liborder");
+    let libdir = build_rival_archives(&w);
+    let user = w.write(
+        "usr.c",
+        "int which(void);\nint main(void){return which();}\n",
+    );
+    let ldir = format!("-L{}", libdir.to_string_lossy());
+
+    let exe1 = w.join("ord1");
+    let r = run_c17(&[&s(&user), &ldir, "-lQ", "-lP", "-o", &s(&exe1)]);
+    assert!(r.success, "-lQ -lP link failed: {}", r.stderr);
+    assert_eq!(run_exe(&exe1), 1, "-lQ came first, so libQ must win");
+
+    let exe2 = w.join("ord2");
+    let r = run_c17(&[&s(&user), &ldir, "-lP", "-lQ", "-o", &s(&exe2)]);
+    assert!(r.success, "-lP -lQ link failed: {}", r.stderr);
+    assert_eq!(run_exe(&exe2), 2, "-lP came first, so libP must win");
+}
+
+/// An archive named *before* the object that references it is searched too
+/// early to satisfy that reference. This is the observable consequence of
+/// honoring position, and it fails only if ordering is really preserved.
+#[test]
+fn driver_library_named_before_its_user_does_not_resolve() {
+    let w = WorkDir::new("libearly");
+    let libdir = build_rival_archives(&w);
+    let user = w.write(
+        "usr.c",
+        "int which(void);\nint main(void){return which();}\n",
+    );
+    let ldir = format!("-L{}", libdir.to_string_lossy());
+    let exe = w.join("early");
+
+    let r = run_c17(&[&ldir, "-lQ", &s(&user), "-o", &s(&exe)]);
+    assert!(
+        !r.success,
+        "a library searched before its user must leave the reference unresolved"
+    );
+}
+
+// ============================================================================
+// #U4 — the four previously missing mandated options
+// ============================================================================
+
+#[test]
+fn driver_accepts_mandated_options() {
+    let w = WorkDir::new("u4opts");
+    let src = w.write("t.c", "int main(void){return 0;}\n");
+
+    for opts in [
+        vec!["-B", "dynamic"],
+        vec!["-B", "static"],
+        vec!["-R", "/tmp"],
+        vec!["-s"],
+    ] {
+        let exe = w.join(&format!("t_{}", opts.join("_").replace('/', "_")));
+        let mut argv: Vec<&str> = opts.clone();
+        let src_s = s(&src);
+        let exe_s = s(&exe);
+        argv.extend(["-o", &exe_s, &src_s]);
+        let r = run_c17(&argv);
+        assert!(r.success, "{:?} rejected: {}", opts, r.stderr);
+        assert!(exe.exists(), "{:?} produced no executable", opts);
+        assert_eq!(run_exe(&exe), 0);
+    }
+}
+
+/// `-B` takes only the two modes the spec names.
+#[test]
+fn driver_rejects_unknown_binding_mode() {
+    let w = WorkDir::new("badbind");
+    let src = w.write("t.c", "int main(void){return 0;}\n");
+    let exe = w.join("t.out");
+
+    let r = run_c17(&["-B", "bogus", &s(&src), "-o", &s(&exe)]);
+    assert!(!r.success, "-B bogus must be rejected");
+    assert!(
+        r.stderr.contains("-B"),
+        "expected a diagnostic naming -B, got:\n{}",
+        r.stderr
+    );
+}
+
+/// `-s` strips the symbol table.
+#[test]
+fn driver_dash_s_strips_symbols() {
+    let w = WorkDir::new("strip");
+    let src = w.write(
+        "t.c",
+        "int helper_symbol(void){return 1;}\nint main(void){return helper_symbol()-1;}\n",
+    );
+    let plain = w.join("plain");
+    let stripped = w.join("stripped");
+
+    assert!(run_c17(&[&s(&src), "-o", &s(&plain)]).success);
+    assert!(run_c17(&["-s", &s(&src), "-o", &s(&stripped)]).success);
+
+    let plain_len = std::fs::metadata(&plain).unwrap().len();
+    let stripped_len = std::fs::metadata(&stripped).unwrap().len();
+    assert!(
+        stripped_len < plain_len,
+        "-s should shrink the binary: {} vs {}",
+        stripped_len,
+        plain_len
+    );
+    assert_eq!(run_exe(&stripped), 0, "stripped binary must still run");
+}
+
+// ============================================================================
+// #U6 — TMPDIR and scratch-file hygiene
+// ============================================================================
+
+/// Intermediates go under `TMPDIR` (XSI, 88020-88022) and leave nothing behind.
+#[test]
+fn driver_honors_tmpdir_and_cleans_up() {
+    let w = WorkDir::new("tmpdir");
+    let tmp = w.join("mytmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let src = w.write("t.c", "int main(void){return 0;}\n");
+    let exe = w.join("t.out");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_c17"))
+        .env("TMPDIR", &tmp)
+        .arg(&src)
+        .args(["-o"])
+        .arg(&exe)
+        .output()
+        .expect("failed to run c17");
+    assert!(
+        out.status.success(),
+        "compile under TMPDIR failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(exe.exists());
+
+    let leftovers: Vec<_> = std::fs::read_dir(&tmp).unwrap().collect();
+    assert!(
+        leftovers.is_empty(),
+        "c17 left {} entries in TMPDIR",
+        leftovers.len()
+    );
+}
+
 /// Compiling several sources in one process must not let them collide over a
 /// shared scratch filename.
 #[test]

@@ -469,7 +469,7 @@ mandated mark-then-execute.
 #### Commands
 - [x] `ar co/t d m nu p pu q(!) rew se(t) u ya = # & ya` CONFORM.
 - [x] ~~**`g`/`v` single-pass** (#X7)~~ ✓ examined and conforming (collects matching lines first, then executes); ~~**`s` gaps** (#X12)~~ ✓ closed 2026-08-02; ~~**`sh[ell]` no `-i`** (#X13)~~ ✓ fixed (`ShellExecutor::interactive` passes `-i`).
-- [ ] **PARTIAL (modifier/arg gaps).** *Split into named items 2026-08-02; this box was one opaque checkbox covering ~15 commands.* Closed so far: **`j`** (`!` plus the full §95060-95070 rule set — two spaces after `.`, no separator before `)`, empty lines dropped — and the §95043-95057 count/address interaction), **`q`** (remaining-files check), **`r`** (#X23), **`w`/`wq`/`x`** (#X22/#X24/#X29). Also closed: **`l`** (full §95237-95244 escape table — XBD Table 5-1 sequences, three-digit octal per byte otherwise, `\$` for a literal `$`; it had been `^I`-style caret notation that escaped neither backslash nor `$`, so `:l` was not unambiguous, which is the entire point of the command) and **`@@`** (the parser took the second `@` as a buffer *name*, so it failed with `Buffer "@" is empty` instead of repeating the last buffer). `cd`, `so` and `ta` were probed and already work.
+- [x] **PARTIAL (modifier/arg gaps)** — closed 2026-08-08. *Split into named items 2026-08-02; this box was one opaque checkbox covering ~15 commands.* Closed so far: **`j`** (`!` plus the full §95060-95070 rule set — two spaces after `.`, no separator before `)`, empty lines dropped — and the §95043-95057 count/address interaction), **`q`** (remaining-files check), **`r`** (#X23), **`w`/`wq`/`x`** (#X22/#X24/#X29). Also closed: **`l`** (full §95237-95244 escape table — XBD Table 5-1 sequences, three-digit octal per byte otherwise, `\$` for a literal `$`; it had been `^I`-style caret notation that escaped neither backslash nor `$`, so `:l` was not unambiguous, which is the entire point of the command) and **`@@`** (the parser took the second `@` as a buffer *name*, so it failed with `Buffer "@" is empty` instead of repeating the last buffer). `cd`, `so` and `ta` were probed and already work.
   Closed 2026-08-08 by a **structural fix**: `split_command` treated `!` as part
   of the command *name*, so every forced form needed its own literal match arm
   (`"w!"`, `"q!"`, `"e!"`, `"j!"`, ...) — which is exactly why the commands that
@@ -499,7 +499,25 @@ mandated mark-then-execute.
   crate*. Threading `force` through also gave `cd`/`chdir`, `rec[over]`, `ta[g]`
   and `su[spend]` the modified-buffer and autowrite rules their synopses call for.
 
-  Still open, itemized: `e`/`n` `+command` and file args, `vi[sual]` arguments.
+  The remainder closed the same day: **`e[dit]`** and **`n[ext]`** now split a
+  leading `+command` (blank-delimited, `\`-escaped blanks, §94954-94955) and run
+  it once the buffer has been replaced (§94956-94957); `:e +2 file` used to open
+  a file *named* `+2 file`. **`n[ext]`** also takes its `file ...` operands,
+  which replace the argument list (§95181-95184) — `ExCommand::Next` had no field
+  for them, so `:n a b` was silently a plain `:n` — and honours `autowrite`
+  rather than refusing outright on a modified buffer (§95178-95180).
+  **`vi[sual]`** carries its arguments through to the executor, which is the only
+  place that knows which of the command's two synopses applies: in open or visual
+  mode it behaves as `edit` (§95473-95474), and otherwise it is
+  `[1addr] vi[sual][type][count][flags]` (§95472), setting the current line from
+  the address, the `window` option from the count, and the top of the display
+  from the type character (§95481-95489). It had been a bare `ExCommand::Visual`
+  with everything discarded.
+
+  One pre-existing bug surfaced on the way: a bare non-literal address was
+  rejected outright — the parser only turned `Address::Line(n)` into a `Goto` and
+  returned "unresolved address" for anything else, so `:$`, `:.+2`, `:'a` and
+  `:/re/` on their own were errors. They now resolve against the buffer.
 - [x] ~~**MISSING:** `pre[serve]`, `rec[over]`~~ ✓ both added (phase 6); ~~`~` (#X18)~~ ✓ added 2026-08-02.
 
 #### `set` options

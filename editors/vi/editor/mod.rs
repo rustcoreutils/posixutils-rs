@@ -2249,15 +2249,12 @@ impl Editor {
                 }
                 Ok(ExResult::Continue)
             }
-            ExCommand::Edit { file, force } => {
-                if !force && self.buffer.is_modified() {
-                    return Err(ViError::FileModified);
-                }
-                if let Some(path) = file {
-                    self.open(&path)?;
-                } else if let Some(path) = self.files.current_file().map(|p| p.to_path_buf()) {
-                    self.open(&path.to_string_lossy())?;
-                }
+            ExCommand::Edit {
+                file,
+                force,
+                command,
+            } => {
+                self.edit_file(file.as_deref(), force, command.as_deref())?;
                 Ok(ExResult::Continue)
             }
             ExCommand::Set { args } => {
@@ -2286,6 +2283,14 @@ impl Editor {
                     Ok(ExResult::CommandOutput(printed))
                 }
             }
+            ExCommand::GotoAddress { range } => {
+                if let Some(line) = self.resolve_target_line(&range, false)? {
+                    let line = line.min(self.buffer.line_count()).max(1);
+                    self.buffer.set_line(line);
+                    self.buffer.move_to_first_non_blank();
+                }
+                Ok(ExResult::Continue)
+            }
             ExCommand::Goto { line } => {
                 let line = line.min(self.buffer.line_count()).max(1);
                 self.buffer.set_line(line);
@@ -2310,12 +2315,32 @@ impl Editor {
                 self.undo.redo(&mut self.buffer)?;
                 Ok(ExResult::Continue)
             }
-            ExCommand::Next { force } => {
+            ExCommand::Next {
+                force,
+                files,
+                command,
+            } => {
+                // "an error, unless the file is successfully written as
+                // specified by the autowrite option" (95178-95180).
                 if !force && self.buffer.is_modified() {
-                    return Err(ViError::FileModified);
+                    if self.options.autowrite {
+                        let lines = self.write_line_range(&crate::ex::AddressRange::empty())?;
+                        self.write(None, lines, false, false)?;
+                    } else {
+                        return Err(ViError::FileModified);
+                    }
                 }
-                let path = self.files.next_file()?;
+                let path = if files.is_empty() {
+                    self.files.next_file()?
+                } else {
+                    // "Set the argument list to the specified filenames ... set
+                    // the current pathname to the first filename specified."
+                    self.files
+                        .set_args(files.iter().map(PathBuf::from).collect());
+                    PathBuf::from(&files[0])
+                };
                 self.open(&path.to_string_lossy())?;
+                self.run_plus_command(command.as_deref())?;
                 Ok(ExResult::Continue)
             }
             ExCommand::Previous { force } => {
@@ -2516,7 +2541,7 @@ impl Editor {
                 self.execute_ex_mark(line, name)?;
                 Ok(ExResult::Continue)
             }
-            ExCommand::Visual => Ok(ExResult::EnterVisual),
+            ExCommand::Visual { range, force, args } => self.execute_ex_visual(range, force, &args),
             ExCommand::Open { range, pattern } => {
                 let line = self.resolve_target_line(&range, false)?;
                 // "If pattern is empty ... or not specified, the last regular
@@ -2598,6 +2623,104 @@ impl Editor {
                 Ok(ExResult::Continue)
             }
         }
+    }
+
+    /// `e[dit][!][+command][file]` (94946-94957).
+    fn edit_file(&mut self, file: Option<&str>, force: bool, command: Option<&str>) -> Result<()> {
+        if !force && self.buffer.is_modified() {
+            return Err(ViError::FileModified);
+        }
+        if let Some(path) = file {
+            self.open(path)?;
+        } else if let Some(path) = self.files.current_file().map(|p| p.to_path_buf()) {
+            self.open(&path.to_string_lossy())?;
+        }
+        self.run_plus_command(command)
+    }
+
+    /// Run a `+command` argument, "immediately after the contents of the edit
+    /// buffer have been replaced and the current line and column have been set"
+    /// (94956-94957).
+    fn run_plus_command(&mut self, command: Option<&str>) -> Result<()> {
+        let Some(command) = command else {
+            return Ok(());
+        };
+        // A `+command` is specified, so the current line starts at the last
+        // line of the buffer (94961-94963) before the command runs.
+        let last = self.buffer.line_count();
+        if last > 0 {
+            self.buffer.set_line(last);
+            self.buffer.move_to_first_non_blank();
+        }
+        self.execute_ex_input(command)
+    }
+
+    /// `vi[sual]`, whose synopsis depends on the current mode.
+    ///
+    /// "If ex is currently in open or visual mode, the Synopsis and behavior of
+    /// the visual command shall be the same as the edit command" (95473-95474);
+    /// otherwise it is `[1addr] vi[sual][type][count][flags]` (95472) and enters
+    /// visual mode with the addressed line placed as `type` directs.
+    fn execute_ex_visual(
+        &mut self,
+        range: crate::ex::AddressRange,
+        force: bool,
+        args: &str,
+    ) -> Result<ExResult> {
+        if !self.ex_standalone_mode {
+            let (command, file) = crate::ex::parser::split_plus_command(args.trim());
+            let file = (!file.is_empty()).then_some(file);
+            self.edit_file(file, force, command.as_deref())?;
+            return Ok(ExResult::Continue);
+        }
+
+        let line = self.resolve_target_line(&range, false)?;
+        let args = args.trim();
+        let vtype = args
+            .chars()
+            .next()
+            .filter(|c| matches!(c, '+' | '-' | '.' | '^'));
+        let rest = match vtype {
+            Some(c) => &args[c.len_utf8()..],
+            None => args,
+        };
+        // "If count is specified, the value of the window edit option shall be
+        // set to count ... before being used by the type character"
+        // (95478-95480).
+        if let Ok(count) = rest.trim().parse::<usize>() {
+            if count >= 1 {
+                self.options.window = count;
+            }
+        }
+
+        let target = line.unwrap_or_else(|| self.buffer.cursor().line).max(1);
+        self.buffer.set_line(target);
+        self.buffer.move_to_first_non_blank();
+
+        // "If type is not specified, it shall be as if a type of '+' was
+        // specified" (95481-95489).
+        let window = self.options.window.max(1);
+        let top = match vtype.unwrap_or('+') {
+            // Beginning of the line at the top of the display.
+            '+' => target,
+            // End of the line at the bottom of the display.
+            '-' => target.saturating_sub(window - 1).max(1),
+            // Beginning of the line in the middle of the display.
+            '.' => target.saturating_sub(window / 2).max(1),
+            // "If the specified line is less than or equal to the value of the
+            // window edit option, set the line to 1; otherwise, decrement the
+            // line by the value of the window edit option minus 1."
+            '^' => {
+                if target <= window {
+                    1
+                } else {
+                    (target - (window - 1)).max(1)
+                }
+            }
+            _ => target,
+        };
+        self.screen.set_top_line(top);
+        Ok(ExResult::EnterVisual)
     }
 
     /// Execute :source command - read and execute ex commands from file.

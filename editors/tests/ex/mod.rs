@@ -1223,3 +1223,106 @@ fn test_ex_shell_escape_warns_about_unsaved_changes() {
         "an unmodified buffer must not warn: {out:?}"
     );
 }
+
+// ============================================================================
+// Command modifier/arg gaps -- part 4 (argument lists and +command)
+// ============================================================================
+
+#[test]
+fn test_ex_edit_accepts_a_plus_command() {
+    // `e[dit][!][+command][file]` (§94946). The whole argument string used to
+    // be taken as the filename, so this opened a file literally named
+    // "+2 <path>".
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("three.txt");
+    fs::write(&path, "one\ntwo\nthree\n").unwrap();
+    let path = path.to_string_lossy().to_string();
+
+    // `+2` runs `:2`, so the current line is 2 and `.p` prints "two".
+    ex_test(&format!("e +2 {path}\n.p\nq!\n"), "two\n");
+    // A bare `+` starts at the last line.
+    ex_test(&format!("e + {path}\n.p\nq!\n"), "three\n");
+    // Without a +command the file still opens normally.
+    ex_test(&format!("e {path}\n1,$p\nq!\n"), "one\ntwo\nthree\n");
+}
+
+#[test]
+fn test_ex_edit_plus_command_blanks_can_be_escaped() {
+    // "<blank> characters within the +command can be escaped by preceding them
+    // with a <backslash> character" (§94954-94955).
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("f.txt");
+    fs::write(&path, "alpha\nbeta\n").unwrap();
+    let path = path.to_string_lossy().to_string();
+
+    // The replacement text holds a <blank>, escaped so the +command is not
+    // split there and the rest taken as the filename.
+    ex_test(
+        &format!("e +2s/beta/B\\ E/ {path}\n1,$p\nq!\n"),
+        "alpha\nB E\n",
+    );
+    // Unescaped, the same blank ends the +command, leaving an unterminated
+    // substitute and taking `E/` as the start of the filename.
+    let (_, err) = ex_output(&["-s"], &format!("e +2s/beta/B E/ {path}\n1,$p\nq!\n"));
+    assert!(
+        !err.is_empty(),
+        "an unescaped blank should split the +command"
+    );
+}
+
+#[test]
+fn test_ex_next_replaces_the_argument_list() {
+    // "Set the argument list to the specified filenames ... set the current
+    // pathname to the first filename specified" (§95181-95184). The file list
+    // was discarded outright, so `:n a b` behaved as a plain `:n`.
+    let dir = TempDir::new().unwrap();
+    let a = dir.path().join("a.txt");
+    let b = dir.path().join("b.txt");
+    fs::write(&a, "AAA\n").unwrap();
+    fs::write(&b, "BBB\n").unwrap();
+    let (a, b) = (
+        a.to_string_lossy().to_string(),
+        b.to_string_lossy().to_string(),
+    );
+
+    // Start with no argument list at all; `:n a b` must set one and open `a`.
+    ex_test(&format!("n {a} {b}\n1,$p\nq!\n"), "AAA\n");
+    // ...and a following `:n` walks to the second entry of that new list.
+    ex_test(&format!("n {a} {b}\nn\n1,$p\nq!\n"), "BBB\n");
+    // `:n` also takes a +command.
+    ex_test(&format!("n +$ {a} {b}\n.p\nq!\n"), "AAA\n");
+}
+
+#[test]
+fn test_ex_next_honours_autowrite() {
+    // "it shall be an error, unless the file is successfully written as
+    // specified by the autowrite option" (§95178-95180).
+    let dir = TempDir::new().unwrap();
+    let a = dir.path().join("a.txt");
+    let b = dir.path().join("b.txt");
+    fs::write(&a, "AAA\n").unwrap();
+    fs::write(&b, "BBB\n").unwrap();
+    let (a_path, b_path) = (
+        a.to_string_lossy().to_string(),
+        b.to_string_lossy().to_string(),
+    );
+
+    // Without autowrite a modified buffer refuses.
+    let (_, err) = ex_output(&["-s", &a_path, &b_path], "a\nextra\n.\nn\nq!\n");
+    assert!(
+        !err.is_empty(),
+        "`:n` on a modified buffer should be an error without autowrite"
+    );
+
+    // With autowrite it writes and moves on.
+    let (out, _) = ex_output(
+        &["-s", &a_path, &b_path],
+        "set autowrite\na\nextra\n.\nn\n1,$p\nq!\n",
+    );
+    assert_eq!(out, "BBB\n", "expected to advance to the second file");
+    assert_eq!(
+        fs::read_to_string(&a).unwrap(),
+        "AAA\nextra\n",
+        "autowrite should have written the first file back"
+    );
+}

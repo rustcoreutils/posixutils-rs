@@ -33,8 +33,10 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
                     if let Address::Line(n) = addr {
                         return Ok(ExCommand::Goto { line: *n });
                     }
-                    // For other address types, we need a buffer to resolve
-                    return Err(ViError::InvalidCommand("unresolved address".to_string()));
+                    // Anything else (`$`, `.+2`, `'a`, `/re/`) needs the buffer
+                    // to resolve, so hand the range to the executor rather than
+                    // refusing: `:$` on its own is a perfectly ordinary command.
+                    return Ok(ExCommand::GotoAddress { range });
                 }
                 (Some(_), Some(_)) => {
                     // Range specified but no command
@@ -64,15 +66,19 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
         // Quit commands
         "q" | "quit" => Ok(ExCommand::Quit { force }),
 
-        // Edit commands
-        "e" | "edit" => Ok(ExCommand::Edit {
-            file: if args.is_empty() {
-                None
-            } else {
-                Some(args.to_string())
-            },
-            force,
-        }),
+        // Edit commands: `e[dit][!][+command][file]` (94946).
+        "e" | "edit" => {
+            let (command, file) = split_plus_command(args);
+            Ok(ExCommand::Edit {
+                file: if file.is_empty() {
+                    None
+                } else {
+                    Some(file.to_string())
+                },
+                force,
+                command,
+            })
+        }
 
         // Read command
         //
@@ -224,8 +230,17 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
         }),
         "pwd" => Ok(ExCommand::Pwd),
 
-        // Arg list commands
-        "n" | "next" => Ok(ExCommand::Next { force }),
+        // Arg list commands: `n[ext][!][+command][file ...]` (95177). The file
+        // list, when given, replaces the argument list (95181-95184); it used
+        // to be discarded entirely, so `:n a b` was a plain `:n`.
+        "n" | "next" => {
+            let (command, rest) = split_plus_command(args);
+            Ok(ExCommand::Next {
+                force,
+                files: rest.split_whitespace().map(String::from).collect(),
+                command,
+            })
+        }
         "prev" | "previous" => Ok(ExCommand::Previous { force }),
         "rew" | "rewind" => Ok(ExCommand::Rewind { force }),
         "ar" | "args" => Ok(ExCommand::Args),
@@ -306,8 +321,19 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
             toggle_autoindent: force,
         }),
 
-        // Visual and open mode commands
-        "vi" | "visual" => Ok(ExCommand::Visual),
+        // Visual and open mode commands.
+        //
+        // `vi[sual]` has two synopses: in open or visual mode it behaves as
+        // `edit` (95473-95474), otherwise it is
+        // `[1addr] vi[sual][type][count][flags]` (95472). Only the executor
+        // knows which mode is current, so the arguments are carried through
+        // unparsed rather than guessed at here — `+` is both a `+command`
+        // introducer and a window type character.
+        "vi" | "visual" => Ok(ExCommand::Visual {
+            range,
+            force,
+            args: args.to_string(),
+        }),
         "o" | "open" => {
             let pattern = parse_open_pattern(args);
             Ok(ExCommand::Open { range, pattern })
@@ -670,6 +696,39 @@ fn parse_line_number(args: &str) -> Result<usize> {
         .map_err(|_| ViError::InvalidAddress("invalid line number".to_string()))
 }
 
+/// Split a leading `+command` argument from `args`.
+///
+/// "The +command option shall be <blank>-delimited; <blank> characters within
+/// the +command can be escaped by preceding them with a <backslash> character"
+/// (94954-94955). Returns the command with those escapes removed, and the rest
+/// of the argument string.
+pub(crate) fn split_plus_command(args: &str) -> (Option<String>, &str) {
+    let Some(body) = args.strip_prefix('+') else {
+        return (None, args);
+    };
+    let mut cmd = String::new();
+    let mut escaped = false;
+    let mut end = body.len();
+    for (i, c) in body.char_indices() {
+        if escaped {
+            cmd.push(c);
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c.is_whitespace() {
+            end = i;
+            break;
+        } else {
+            cmd.push(c);
+        }
+    }
+    // A bare `+` is the historical "start at the last line".
+    if cmd.is_empty() {
+        cmd.push('$');
+    }
+    (Some(cmd), body[end..].trim_start())
+}
+
 /// Parse the `/pattern/` argument of the `open` command (95212-95216).
 ///
 /// The trailing delimiter may be omitted, an empty pattern means "the last
@@ -768,7 +827,7 @@ mod tests {
     #[test]
     fn test_parse_edit() {
         let cmd = parse_ex_command("e newfile.txt").unwrap();
-        if let ExCommand::Edit { file, force } = cmd {
+        if let ExCommand::Edit { file, force, .. } = cmd {
             assert_eq!(file, Some("newfile.txt".to_string()));
             assert!(!force);
         } else {

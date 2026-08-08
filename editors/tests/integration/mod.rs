@@ -732,7 +732,7 @@ fn test_ex_write_quit() {
 #[test]
 fn test_ex_edit() {
     let cmd = ex::parse_ex_command("e test.txt").unwrap();
-    if let ExCommand::Edit { file, force } = cmd {
+    if let ExCommand::Edit { file, force, .. } = cmd {
         assert_eq!(file, Some("test.txt".to_string()));
         assert!(!force);
     }
@@ -1366,7 +1366,7 @@ fn test_ex_read_file() {
 #[test]
 fn test_ex_next_prev() {
     let cmd = ex::parse_ex_command("n").unwrap();
-    assert!(matches!(cmd, ExCommand::Next { force: false }));
+    assert!(matches!(cmd, ExCommand::Next { force: false, .. }));
 
     let cmd = ex::parse_ex_command("prev").unwrap();
     assert!(matches!(cmd, ExCommand::Previous { force: false }));

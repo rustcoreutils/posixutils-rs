@@ -34,7 +34,13 @@ pub enum ExCommand {
         xit: bool,
     },
     /// Edit file (:e, :edit).
-    Edit { file: Option<String>, force: bool },
+    Edit {
+        file: Option<String>,
+        force: bool,
+        /// `e[dit][!][+command][file]`: an ex command to run once the buffer
+        /// has been replaced (94954-94957).
+        command: Option<String>,
+    },
     /// Read file into buffer (:r, :read).
     Read {
         range: AddressRange,
@@ -103,6 +109,9 @@ pub enum ExCommand {
     File { new_name: Option<String> },
     /// Go to line (:number or just address).
     Goto { line: usize },
+    /// Go to an address given on its own, when it is not a literal line number
+    /// (`:$`, `:.+2`, `:'a`, `:/re/`) and so needs the buffer to resolve.
+    GotoAddress { range: AddressRange },
     /// Mark line (:ma, :mark, :k).
     Mark { range: AddressRange, name: char },
     /// Shell command (:!, :shell).
@@ -131,7 +140,14 @@ pub enum ExCommand {
     /// Push working directory (:pwd).
     Pwd,
     /// Next file in arg list (:n, :next).
-    Next { force: bool },
+    Next {
+        force: bool,
+        /// `n[ext][!][+command][file ...]`: when non-empty, these replace the
+        /// argument list (95181-95184).
+        files: Vec<String>,
+        /// An ex command to run once the buffer has been replaced (95194-95197).
+        command: Option<String>,
+    },
     /// Previous file in arg list (:N, :prev, :previous).
     Previous { force: bool },
     /// Rewind to first file (:rew, :rewind).
@@ -204,8 +220,16 @@ pub enum ExCommand {
         /// `c!` toggles autoindent for this command only (94910-94912).
         toggle_autoindent: bool,
     },
-    /// Enter visual mode (:vi, :visual).
-    Visual,
+    /// Enter visual mode, or re-edit a file (:vi, :visual).
+    Visual {
+        range: AddressRange,
+        force: bool,
+        /// Raw arguments: `[type][count][flags]` in ex command mode, or
+        /// `[+command][file]` in open or visual mode (95472-95474). `+` is both
+        /// a window type character and the `+command` introducer, so only the
+        /// executor, which knows the current mode, can tell them apart.
+        args: String,
+    },
     /// Enter open mode (:o, :open).
     Open {
         range: AddressRange,

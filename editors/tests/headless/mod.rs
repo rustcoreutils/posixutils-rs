@@ -1563,3 +1563,34 @@ fn test_file_info_reports_modification() {
     let msg = editor.get_message().unwrap_or_default().to_string();
     assert!(msg.contains("[Modified]"), "expected [Modified] in {msg:?}");
 }
+
+// ============================================================================
+// `:vi[sual]` as `edit` (ex.md §95473-95474)
+// ============================================================================
+
+/// "If ex is currently in open or visual mode, the Synopsis and behavior of the
+/// visual command shall be the same as the edit command", which includes its
+/// `[+command][file]` arguments. `:vi` used to parse to a bare `Visual` with the
+/// arguments thrown away.
+#[test]
+fn test_visual_command_in_visual_mode_edits_a_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v.txt");
+    std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+
+    let mut editor = Editor::new_headless();
+    editor
+        .execute_keys(&format!(":vi +2 {}\n", path.display()))
+        .unwrap();
+
+    assert!(
+        editor.get_buffer_text().contains("three"),
+        "expected the file to have been loaded: {:?}",
+        editor.get_buffer_text()
+    );
+    assert_eq!(
+        editor.get_cursor().line,
+        2,
+        "expected the +command to have moved to line 2"
+    );
+}

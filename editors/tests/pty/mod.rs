@@ -13,11 +13,12 @@
 //! behavior by checking file contents after editing operations.
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
-use tempfile::tempdir;
+use tempfile::{tempdir, TempDir};
 
 /// Write key sequence to PTY master.
 fn write_keys<W: Write>(w: &mut W, s: &str) {
@@ -536,5 +537,52 @@ fn test_pty_vi_autoindent_and_ctrl_d() {
     assert_eq!(
         contents, "\t\tbase\n\tX\n",
         "o must autoindent and ^D must remove one shiftwidth, got {contents:?}"
+    );
+}
+
+/// `:vi[sual]` in ex command mode takes `[1addr][type][count]`
+/// (ex.md §95472-95490): the addressed line becomes the current line and the
+/// count sets the `window` edit option. The command used to be parsed as a bare
+/// `ExCommand::Visual` with its arguments discarded, so `:5vi` entered visual
+/// mode with the cursor wherever it already was.
+#[test]
+fn test_pty_ex_visual_honours_address_and_count() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("lines.txt");
+    fs::write(&path, "one\ntwo\nthree\nfour\nfive\nsix\n").unwrap();
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 10,
+            cols: 40,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+
+    let mut cmd = CommandBuilder::new(plib::testing::get_binary_path("ex"));
+    cmd.arg(&path);
+    cmd.env("TERM", "vt100");
+    let mut child = pair.slave.spawn_command(cmd).unwrap();
+    drop(pair.slave);
+    spawn_reader_drain(pair.master.try_clone_reader().unwrap());
+    let mut writer = pair.master.take_writer().unwrap();
+
+    // In ex command mode there is no leading colon. `4vi3` -> current line 4,
+    // window 3. Deleting the first character of the current line and then
+    // writing proves which line the address selected.
+    write_keys(&mut writer, "4vi3\r");
+    thread::sleep(Duration::from_millis(200));
+    write_keys(&mut writer, "x");
+    thread::sleep(Duration::from_millis(100));
+    write_keys(&mut writer, ":wq\r");
+
+    wait_with_timeout(&mut child, Duration::from_secs(5));
+
+    let content = fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        content, "one\ntwo\nthree\nour\nfive\nsix\n",
+        "expected `4vi3` to leave the cursor on line 4"
     );
 }

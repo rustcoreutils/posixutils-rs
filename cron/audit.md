@@ -264,7 +264,16 @@ Not covered:
 - [x] `-e` round-trip preserving existing content (#C1) — `install_list_remove_round_trip`, skip-gated on spool writability (see note).
 - [x] No-operand stdin replacement (#C2) — `no_operand_replaces_from_stdin`, skip-gated.
 - [x] `-l` output equals what was installed — asserted inside `install_list_remove_round_trip`.
-- [ ] cron.allow/deny gating (#C7) — needs `/etc/cron.{allow,deny}`, whose paths are compile-time constants in `crontab` with no override (unlike `at`'s `AT_ALLOW`/`AT_DENY`, which *is* covered — see `test_batch_respects_the_allow_file`).
+- [x] cron.allow/deny gating (#C7) — closed 2026-08-08. `crontab` now honors
+  `CRON_ALLOW`/`CRON_DENY` via the shared `allow_deny_paths` helper (see the
+  revised CI note below for why this reverses the earlier decision, and how it
+  is guarded). Three tests cover the decision: a user absent from a present
+  `cron.allow` is refused while a listed one gets past the gate; a user named in
+  `cron.deny` is refused while an empty `cron.deny` permits everyone; and an
+  existing-but-unreadable `cron.allow` fails closed. They resolve the user from
+  the **real uid**, the way `crontab` does — reading `$LOGNAME` would be wrong
+  per #X2 and is not even stable here, since `tests/crond` sets `LOGNAME=root`
+  in the shared test process.
 - [x] Diagnostics land on stderr (#C3) — `diagnostics_go_to_stderr_not_stdout`; needs no spool access, so it always runs.
 
 ---
@@ -699,10 +708,19 @@ Not covered:
 > end-to-end cases are skip-gated rather than silently passing. No box above was
 > ticked on the strength of a test CI never runs.
 >
-> `crontab`'s spool paths are compile-time constants with no environment
-> override, unlike the `at` spool's `AT_JOB_DIR`. Adding one would mean putting
-> a test-only configuration surface on a security-sensitive utility, so the
-> round-trip tests skip unless the real spool is writable.
+> **Revised 2026-08-08.** That reasoning still holds for the *spool*
+> (`CRON_SPOOL_DIR` remains a compile-time constant, and the round-trip tests
+> still skip unless the real spool is writable), but it was applied too broadly:
+> it also left the **allow/deny gating** untestable, and those are a different
+> risk. A redirected spool controls where jobs are *written*; a redirected allow
+> file can only permit or refuse the invoking user's own crontab. `crontab` now
+> takes `CRON_ALLOW`/`CRON_DENY` overrides through the same
+> `allow_deny_paths` helper `at` already used for `AT_ALLOW`/`AT_DENY`, lifted
+> into `cron/lib.rs` and shared by both — honored only when real uid ==
+> effective uid, so a set-uid `crontab` cannot be pointed at attacker-chosen
+> files. That guard is load-bearing here beyond the usual caution: with neither
+> file present the fallback is "privileged users only", so a redirected pair
+> would otherwise flip the default from root-only to everyone.
 
 ---
 

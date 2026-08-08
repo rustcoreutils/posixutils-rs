@@ -8,7 +8,7 @@
 //
 
 use clap::Parser;
-use cron::{CRON_ALLOW, CRON_DENY, CRON_SPOOL_DIR};
+use cron::{allow_deny_paths, CRON_ALLOW, CRON_DENY, CRON_SPOOL_DIR};
 use gettextrs::gettext;
 use std::env;
 use std::fs;
@@ -35,8 +35,11 @@ struct CronArgs {
 /// Check whether a user is allowed to use crontab per the cron.allow/cron.deny
 /// rules (audit #C7).
 fn is_user_allowed(username: &str) -> bool {
+    let (allow_file, deny_file) =
+        allow_deny_paths("CRON_ALLOW", CRON_ALLOW, "CRON_DENY", CRON_DENY);
+
     // If cron.allow exists, only the users listed in it are permitted.
-    match fs::read_to_string(CRON_ALLOW) {
+    match fs::read_to_string(&allow_file) {
         Ok(content) => return content.lines().any(|line| line.trim() == username),
         // An existing-but-unreadable allow file fails closed.
         Err(e) if e.kind() != ErrorKind::NotFound => return false,
@@ -45,7 +48,7 @@ fn is_user_allowed(username: &str) -> bool {
 
     // Otherwise, if cron.deny exists, everyone not listed is permitted (an empty
     // cron.deny therefore permits all users).
-    match fs::read_to_string(CRON_DENY) {
+    match fs::read_to_string(&deny_file) {
         Ok(content) => return !content.lines().any(|line| line.trim() == username),
         Err(e) if e.kind() != ErrorKind::NotFound => return false,
         Err(_) => {}

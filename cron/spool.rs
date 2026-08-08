@@ -376,23 +376,10 @@ fn read_user_file(file_path: &str) -> std::io::Result<HashSet<String>> {
 }
 
 /// Locations of the at.allow / at.deny files. The implementation-defined
-/// location is `/etc`; the `AT_ALLOW` / `AT_DENY` overrides are honored only
-/// when not running set-uid (real uid == effective uid), so a set-uid `at`
-/// cannot be tricked into reading attacker-chosen allow/deny files.
+/// location is `/etc`; see [`crate::allow_deny_paths`] for how the `AT_ALLOW` /
+/// `AT_DENY` overrides are guarded.
 fn allow_deny_paths() -> (String, String) {
-    // SAFETY: getuid()/geteuid() never fail.
-    let overridable = unsafe { libc::getuid() == libc::geteuid() };
-    let pick = |var: &str, default: &str| {
-        if overridable {
-            env::var(var).unwrap_or_else(|_| default.to_string())
-        } else {
-            default.to_string()
-        }
-    };
-    (
-        pick("AT_ALLOW", "/etc/at.allow"),
-        pick("AT_DENY", "/etc/at.deny"),
-    )
+    crate::allow_deny_paths("AT_ALLOW", "/etc/at.allow", "AT_DENY", "/etc/at.deny")
 }
 
 pub fn is_user_allowed(user: &str) -> bool {

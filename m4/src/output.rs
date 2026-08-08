@@ -213,6 +213,17 @@ impl Output {
             buffer.0.rewind()?;
             text
         };
+        // An existing-but-empty diversion splices nothing, so nothing about the
+        // output's position changed. Falling through would call
+        // `resume_after_raw_output(true)` — because `None != Some('\n')` — and
+        // claim the output had ended mid-line, which swallowed the next `-s`
+        // directive entirely. `undivert_all()` at end of input re-visits every
+        // buffer key, including ones an earlier `undivert` already emptied, so
+        // this fires without the user writing a second `undivert` at all.
+        if text.is_empty() {
+            return Ok(());
+        }
+
         let n = text.len();
         // Splice the buffer verbatim. Its `#line` directives were already
         // written when the text was diverted, so re-running it through

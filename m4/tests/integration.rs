@@ -249,6 +249,7 @@ m4_test!(synclines_1);
 m4_test!(synclines_2);
 m4_test!(synclines_divert);
 m4_test!(synclines_literals);
+m4_test!(synclines_undivert_empty);
 m4_test!(syscmd_sysval);
 m4_test!(trace);
 m4_test!(translit);

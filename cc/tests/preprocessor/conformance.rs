@@ -591,3 +591,112 @@ fn preprocessor_missing_include_is_still_an_error() {
         "a missing include must be diagnosed"
     );
 }
+
+// ============================================================================
+// #U5 — `-E` line markers
+// ============================================================================
+
+/// STDOUT (88032-88038): the `-E` output shall contain at least one
+/// `# <line> "<file>"` line for each file processed via `#include`.
+/// RATIONALE (88370-88374) names makefile dependency generation as the point.
+/// None were emitted at all — the markers were discarded outright.
+#[test]
+fn preprocessor_emits_line_markers_for_includes() {
+    let dir = tempfile::Builder::new()
+        .prefix("c17_markers_")
+        .tempdir()
+        .unwrap();
+    let inc = dir.path().join("inc");
+    std::fs::create_dir_all(&inc).unwrap();
+    std::fs::write(inc.join("h1.h"), "int from_header(void);\n").unwrap();
+    let src = dir.path().join("m.c");
+    std::fs::write(&src, "#include \"h1.h\"\nint from_main(void);\n").unwrap();
+
+    let r = run_c17(&[
+        "-E",
+        &format!("-I{}", inc.to_string_lossy()),
+        &src.to_string_lossy(),
+    ]);
+    assert!(r.success, "{}", r.stderr);
+
+    let markers: Vec<&str> = r
+        .stdout
+        .lines()
+        .filter(|l| l.starts_with("# ") && l.contains('"'))
+        .collect();
+    assert!(
+        markers.len() >= 2,
+        "expected a marker for the primary source and for the include, got {:?}\n{}",
+        markers,
+        r.stdout
+    );
+    assert!(
+        markers[0].contains("m.c"),
+        "the first marker must name the primary source: {:?}",
+        markers
+    );
+    assert!(
+        markers.iter().any(|m| m.contains("h1.h")),
+        "no marker for the included file: {:?}",
+        markers
+    );
+    // Entering a file is flagged 1, returning to one is flagged 2 (GCC's
+    // convention), so a consumer can follow the nesting.
+    assert!(
+        markers.iter().any(|m| m.ends_with(" 1")),
+        "no 'entering' marker: {:?}",
+        markers
+    );
+    assert!(
+        markers.iter().any(|m| m.ends_with(" 2")),
+        "no 'returning' marker: {:?}",
+        markers
+    );
+}
+
+/// A source with no `#include` still gets one marker naming it.
+#[test]
+fn preprocessor_emits_a_marker_without_includes() {
+    let r = preprocess_text("marker_solo", "int only_main;\n", &[]);
+    assert!(r.success, "{}", r.stderr);
+    assert!(
+        r.stdout.lines().any(|l| l.starts_with("# 1 \"")),
+        "expected a leading marker:\n{}",
+        r.stdout
+    );
+}
+
+/// The markers must not break the output as C: `-E` output is a valid `.i`
+/// operand, and the spec says a `.i` is not re-preprocessed.
+#[test]
+fn preprocessor_output_with_markers_still_compiles() {
+    let dir = tempfile::Builder::new()
+        .prefix("c17_marker_recompile_")
+        .tempdir()
+        .unwrap();
+    let src = dir.path().join("r.c");
+    std::fs::write(
+        &src,
+        "#include <stdio.h>\nint main(void){ printf(\"ok\\n\"); return 0; }\n",
+    )
+    .unwrap();
+    let i = dir.path().join("r.i");
+    let exe = dir.path().join("r.out");
+
+    let r = run_c17(&["-E", &src.to_string_lossy()]);
+    assert!(r.success, "{}", r.stderr);
+    assert!(
+        r.stdout.contains("# "),
+        "no markers in the preprocessed output"
+    );
+    std::fs::write(&i, &r.stdout).unwrap();
+
+    let r = run_c17(&[&i.to_string_lossy(), "-o", &exe.to_string_lossy()]);
+    assert!(
+        r.success,
+        "preprocessed output with markers failed to compile: {}",
+        r.stderr
+    );
+    let out = std::process::Command::new(&exe).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ok");
+}

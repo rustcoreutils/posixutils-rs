@@ -435,7 +435,29 @@ fn process_file(
     );
 
     if args.preprocess_only {
-        // Output preprocessed tokens
+        // Output preprocessed tokens.
+        //
+        // STDOUT (88032-88038) requires the -E output to carry at least one
+        // `# <line> "<file>"` line for each file processed via #include, so
+        // that a consumer can attribute the text; RATIONALE (88370-88374)
+        // names makefile dependency generation as the purpose. The markers
+        // were being discarded outright.
+        //
+        // `include_file` strips the included stream's begin/end tokens, so the
+        // transition is detected from `pos.stream` instead. The trailing flag
+        // follows GCC: 1 on entering a file, 2 on returning to one.
+        // Start by naming the primary source, as GCC does: a consumer needs
+        // that even when the first token comes from an #include.
+        //
+        // The line numbers are physical. `#line` is *not* reflected: it sets
+        // state on the preprocessor and is never recorded in the stream
+        // registry, so `effective_position` cannot see it either — the same
+        // pre-existing gap that keeps parser diagnostics on physical lines.
+        println!("# 1 \"{}\"", display_path);
+        let mut emitted_marker_for: Vec<u16> = vec![stream_id];
+        let mut current_stream: Option<u16> = Some(stream_id);
+        let mut at_line_start = true;
+
         let mut iter = preprocessed.iter().peekable();
         while let Some(token) = iter.next() {
             if args.verbose {
@@ -456,11 +478,27 @@ fn process_file(
                 {
                     continue;
                 }
+
+                if current_stream != Some(token.pos.stream) {
+                    let (name, line, _) = diag::effective_position(token.pos);
+                    let returning = emitted_marker_for.contains(&token.pos.stream);
+                    if !returning {
+                        emitted_marker_for.push(token.pos.stream);
+                    }
+                    if !at_line_start {
+                        println!();
+                    }
+                    println!("# {} \"{}\" {}", line, name, if returning { 2 } else { 1 });
+                    current_stream = Some(token.pos.stream);
+                }
+
                 print!("{}", text);
+                at_line_start = false;
                 // Check next token to determine separator
                 if let Some(next) = iter.peek() {
                     if next.pos.newline {
                         println!();
+                        at_line_start = true;
                     } else {
                         // Need a space if:
                         // 1. Original had whitespace, OR
@@ -870,7 +908,10 @@ fn preprocess_args() -> Vec<String> {
             // lie. Diagnose instead. `-fhosted` is what we already are.
             if arg == "-ffreestanding" {
                 eprintln!(
-                    "c17: -ffreestanding is not supported: no freestanding environment is provided"
+                    "c17: {}",
+                    gettext(
+                        "-ffreestanding is not supported: no freestanding environment is provided"
+                    )
                 );
                 std::process::exit(1);
             }
@@ -1193,7 +1234,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Handle unsupported machine flags early
     if !args.unsupported_mflags.is_empty() {
         for flag in &args.unsupported_mflags {
-            eprintln!("c17: unsupported machine flag: {}", flag);
+            eprintln!("c17: {}: {}", gettext("unsupported machine flag"), flag);
         }
         std::process::exit(1);
     }
@@ -1211,7 +1252,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match Target::from_triple(triple) {
             Some(t) => t,
             None => {
-                eprintln!("c17: unsupported target: {}", triple);
+                eprintln!("c17: {}: {}", gettext("unsupported target"), triple);
                 std::process::exit(1);
             }
         }
@@ -1225,8 +1266,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("compiler-rt") => RuntimeLib::CompilerRt,
         Some(other) => {
             eprintln!(
-                "c17: unknown rtlib '{}' (use 'libgcc' or 'compiler-rt')",
-                other
+                "c17: {}: '{}' ({})",
+                gettext("unknown runtime library"),
+                other,
+                gettext("use 'libgcc' or 'compiler-rt'")
             );
             std::process::exit(1);
         }
@@ -1244,7 +1287,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for op in &operands {
         if op.kind == OperandKind::Unknown {
-            eprintln!("c17: warning: unrecognized file type: {}", op.path);
+            eprintln!(
+                "c17: {}: {}: {}",
+                gettext("warning"),
+                gettext("unrecognized file type"),
+                op.path
+            );
         }
     }
 
@@ -1259,14 +1307,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // producing one object.
     if args.compile_only && args.output.is_some() && source_count > 1 {
         eprintln!(
-            "c17: warning: -o ignored for all but the last of {} source operands with -c",
+            "c17: {}: {} ({})",
+            gettext("warning"),
+            gettext("-o applies only to the last source operand with -c"),
             source_count
         );
     }
 
     if let Some(mode) = args.binding.as_deref() {
         if mode != "dynamic" && mode != "static" {
-            eprintln!("c17: -B: expected 'dynamic' or 'static', got '{}'", mode);
+            eprintln!(
+                "c17: -B: {}: '{}'",
+                gettext("expected 'dynamic' or 'static'"),
+                mode
+            );
             std::process::exit(1);
         }
     }

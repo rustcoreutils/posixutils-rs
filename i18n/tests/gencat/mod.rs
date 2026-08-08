@@ -168,3 +168,73 @@ fn gencat_sets_and_messagess_with_quote_unset() {
         Vec::new(),
     );
 }
+
+// ============================================================================
+// LC_CTYPE-driven byte interpretation (cross-cutting theme 4)
+// ============================================================================
+
+/// A message file is a text file in whatever codeset `LC_CTYPE` describes, not
+/// necessarily UTF-8. The parser used `read_to_string`, so a perfectly valid
+/// Latin-1 (or EUC-JP, or Shift-JIS) source was rejected outright before a
+/// single line had been looked at. The bytes must also reach the catalog
+/// unchanged: nothing may re-encode them.
+#[test]
+fn gencat_preserves_non_utf8_message_bytes() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let msg_path = temp.path().join("latin1.msg");
+    let cat_path = temp.path().join("latin1.cat");
+
+    // "caf<E9>" in Latin-1: 0xE9 is not valid UTF-8 on its own.
+    let mut source = Vec::new();
+    source.extend_from_slice(b"$set 1\n1 caf\xe9\n");
+    std::fs::write(&msg_path, &source).unwrap();
+
+    let status = std::process::Command::new(plib::testing::get_binary_path("gencat"))
+        .arg(&cat_path)
+        .arg(&msg_path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "gencat rejected a Latin-1 message file");
+
+    let mut catalog = Vec::new();
+    File::open(&cat_path)
+        .unwrap()
+        .read_to_end(&mut catalog)
+        .unwrap();
+    assert!(
+        catalog.windows(4).any(|w| w == b"caf\xe9"),
+        "the message bytes must reach the catalog verbatim, not re-encoded"
+    );
+    // The UTF-8 encoding of U+00E9 is the corruption this guards against.
+    assert!(
+        !catalog.windows(2).any(|w| w == b"\xc3\xa9"),
+        "0xE9 was UTF-8 encoded into two bytes"
+    );
+}
+
+/// `\ddd` names a *byte*, so a high octal escape must produce one byte.
+#[test]
+fn gencat_octal_escape_above_7f_is_one_byte() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let msg_path = temp.path().join("octal.msg");
+    let cat_path = temp.path().join("octal.cat");
+    // \351 == 0xE9.
+    std::fs::write(&msg_path, b"$set 1\n1 caf\\351\n").unwrap();
+
+    let status = std::process::Command::new(plib::testing::get_binary_path("gencat"))
+        .arg(&cat_path)
+        .arg(&msg_path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let mut catalog = Vec::new();
+    File::open(&cat_path)
+        .unwrap()
+        .read_to_end(&mut catalog)
+        .unwrap();
+    assert!(
+        catalog.windows(4).any(|w| w == b"caf\xe9"),
+        r"\351 must expand to the single byte 0xE9"
+    );
+}

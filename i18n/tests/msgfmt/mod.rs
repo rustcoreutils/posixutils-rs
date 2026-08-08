@@ -324,3 +324,66 @@ msgstr ""
 
     assert!(mo_path.exists());
 }
+
+// ============================================================================
+// LC_CTYPE-driven byte interpretation (cross-cutting theme 4)
+// ============================================================================
+
+/// A `.po` file is text in whatever codeset `LC_CTYPE` describes. The parser
+/// read lines into a `String`, so a valid Latin-1 (or EUC-JP, or Shift-JIS)
+/// catalog was rejected outright, and the bytes must now reach the `.mo`
+/// unchanged.
+#[test]
+fn test_msgfmt_preserves_non_utf8_message_bytes() {
+    let temp_dir = TempDir::new().unwrap();
+    let po_path = temp_dir.path().join("latin1.po");
+    let mo_path = temp_dir.path().join("latin1.mo");
+
+    // "caf<E9>" in Latin-1; 0xE9 is not valid UTF-8 on its own.
+    let mut po = Vec::new();
+    po.extend_from_slice(b"msgid \"cafe\"\nmsgstr \"caf\xe9\"\n");
+    fs::write(&po_path, &po).unwrap();
+
+    let status = std::process::Command::new(plib::testing::get_binary_path("msgfmt"))
+        .arg("-o")
+        .arg(&mo_path)
+        .arg(&po_path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "msgfmt rejected a Latin-1 .po file");
+
+    let mo = fs::read(&mo_path).unwrap();
+    assert!(
+        mo.windows(4).any(|w| w == b"caf\xe9"),
+        "the message bytes must reach the .mo verbatim, not re-encoded"
+    );
+    assert!(
+        !mo.windows(2).any(|w| w == b"\xc3\xa9"),
+        "0xE9 was UTF-8 encoded into two bytes"
+    );
+}
+
+/// `\xNN` and `\ooo` name a *byte*. Pushing them through `char` UTF-8 encoded
+/// every value above 0x7F into two bytes on the way into the `.mo`.
+#[test]
+fn test_msgfmt_high_escapes_are_single_bytes() {
+    let temp_dir = TempDir::new().unwrap();
+    let po_path = temp_dir.path().join("esc.po");
+    let mo_path = temp_dir.path().join("esc.mo");
+    // \xe9 and \351 are both 0xE9.
+    fs::write(&po_path, "msgid \"a\"\nmsgstr \"\\xe9\\351\"\n").unwrap();
+
+    let status = std::process::Command::new(plib::testing::get_binary_path("msgfmt"))
+        .arg("-o")
+        .arg(&mo_path)
+        .arg(&po_path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let mo = fs::read(&mo_path).unwrap();
+    assert!(
+        mo.windows(2).any(|w| w == b"\xe9\xe9"),
+        r"\xe9 and \351 must each expand to the single byte 0xE9"
+    );
+}

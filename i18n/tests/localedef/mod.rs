@@ -279,3 +279,32 @@ fn test_localedef_empty_input() {
         },
     );
 }
+
+/// A locale source is a text file in whatever codeset `LC_CTYPE` describes, so
+/// `read_to_string` rejected a valid non-UTF-8 source before a single line had
+/// been looked at. (Faithfully *preserving* that character data awaits LD-1,
+/// the deferred compiled-locale writer; today it is only validated.)
+#[test]
+fn localedef_accepts_a_non_utf8_source() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    let mut source = Vec::new();
+    source.extend_from_slice(b"LC_IDENTIFICATION\n");
+    // A comment holding a lone 0xE9, which is not valid UTF-8.
+    source.extend_from_slice(b"# caf\xe9\n");
+    source.extend_from_slice(b"title \"test\"\n");
+    source.extend_from_slice(b"END LC_IDENTIFICATION\n");
+    std::fs::write(&src, &source).unwrap();
+
+    let out = std::process::Command::new(plib::testing::get_binary_path("localedef"))
+        .arg("-i")
+        .arg(&src)
+        .arg(temp.path().join("out"))
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("invalid utf-8") && !stderr.contains("stream did not contain"),
+        "a non-UTF-8 source must not be rejected for its encoding: {stderr}"
+    );
+}

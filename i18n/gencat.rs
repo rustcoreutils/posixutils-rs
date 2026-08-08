@@ -11,6 +11,7 @@ use byteorder::{BigEndian, ByteOrder, LittleEndian, NativeEndian, WriteBytesExt}
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::io::input_stream;
+use plib::locale::mb_char_slices;
 use std::{
     cell::RefCell,
     collections::BTreeMap,
@@ -58,8 +59,13 @@ pub struct Msg {
     /// The message id
     pub msg_id: usize,
 
-    /// The message text
-    pub msg: String,
+    /// The message text.
+    ///
+    /// Bytes, not a `String`: POSIX has `LC_CTYPE` decide how the source file's
+    /// bytes are interpreted, so a catalog may legitimately hold text in a
+    /// codeset that is not UTF-8. Reading it as a `String` rejected such a file
+    /// outright.
+    pub msg: Vec<u8>,
 
     pub hconst: String,
 
@@ -274,10 +280,69 @@ impl Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+/// Split `input` into lines on <newline>, discarding a trailing <carriage-return>
+/// so a CRLF-terminated source parses the same as an LF-terminated one.
+fn split_lines(input: &[u8]) -> Vec<&[u8]> {
+    input
+        .split(|&b| b == b'\n')
+        .map(|line| line.strip_suffix(b"\r".as_slice()).unwrap_or(line))
+        .collect()
+}
+
+/// The <blank>-trimmed span of `s`. The POSIX <blank>s are single bytes in
+/// every codeset the standard admits, so this needs no character scan.
+fn trim(s: &[u8]) -> &[u8] {
+    let start = s.iter().position(|b| !b.is_ascii_whitespace());
+    match start {
+        None => &[],
+        Some(start) => {
+            let end = s.iter().rposition(|b| !b.is_ascii_whitespace()).unwrap();
+            &s[start..=end]
+        }
+    }
+}
+
+/// The <blank>-trimmed tail of `s`.
+fn trim_end(s: &[u8]) -> &[u8] {
+    match s.iter().rposition(|b| !b.is_ascii_whitespace()) {
+        None => &[],
+        Some(end) => &s[..=end],
+    }
+}
+
+/// Split `s` at the first <blank>, returning the field before it and the rest
+/// with leading <blank>s removed. `None` for the second element means there was
+/// no <blank> at all.
+fn split_field(s: &[u8]) -> (&[u8], Option<&[u8]>) {
+    match s.iter().position(|b| b.is_ascii_whitespace()) {
+        None => (s, None),
+        Some(i) => {
+            let rest = &s[i..];
+            let start = rest
+                .iter()
+                .position(|b| !b.is_ascii_whitespace())
+                .unwrap_or(rest.len());
+            (&s[..i], Some(&rest[start..]))
+        }
+    }
+}
+
+/// Parse an ASCII decimal field, for the grammar's numeric tokens.
+fn parse_number<T: std::str::FromStr>(field: &[u8]) -> Result<T, ()> {
+    std::str::from_utf8(field)
+        .map_err(|_| ())?
+        .parse()
+        .map_err(|_| ())
+}
+
 /// Return `true` if `s` ends with an unescaped (odd count of) trailing
 /// backslash, indicating a line continuation per the POSIX gencat grammar.
-fn ends_with_continuation(s: &str) -> bool {
-    s.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1
+///
+/// Byte-oriented: `\` is a single byte in every encoding POSIX admits, and a
+/// trailing byte of a multibyte character can never be `0x5C` in a
+/// POSIX-conforming codeset, so counting bytes is safe here.
+fn ends_with_continuation(s: &[u8]) -> bool {
+    s.iter().rev().take_while(|&&c| c == b'\\').count() % 2 == 1
 }
 
 /// Process the C-style escape sequences defined for gencat message text:
@@ -285,37 +350,51 @@ fn ends_with_continuation(s: &str) -> bool {
 /// followed by any other character is discarded, leaving that character
 /// (per "the <backslash> shall be ignored"). A trailing backslash with no
 /// following character is dropped.
-fn process_escapes(s: &str) -> String {
-    let mut out = String::new();
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
+///
+/// Byte-oriented, so a message may hold text in any encoding the current
+/// `LC_CTYPE` describes: bytes that are not part of an escape are copied
+/// through untouched, and `\ddd` names a byte, not a code point. Scanning is
+/// per character (`mb_char_slices`) so a multibyte character whose trailing
+/// byte happens to be `0x5C` cannot be mistaken for a backslash.
+fn process_escapes(s: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    let chars = mb_char_slices(s);
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
+        i += 1;
+        if ch != b"\\" {
+            out.extend_from_slice(ch);
             continue;
         }
-        match chars.next() {
-            Some('n') => out.push('\n'),
-            Some('t') => out.push('\t'),
-            Some('v') => out.push('\x0b'),
-            Some('b') => out.push('\x08'),
-            Some('r') => out.push('\r'),
-            Some('f') => out.push('\x0c'),
-            Some('\\') => out.push('\\'),
-            Some(d @ '0'..='7') => {
-                let mut val = d.to_digit(8).unwrap();
+        let Some(&next) = chars.get(i) else {
+            // A trailing backslash with no following character is dropped.
+            break;
+        };
+        i += 1;
+        match next {
+            b"n" => out.push(b'\n'),
+            b"t" => out.push(b'\t'),
+            b"v" => out.push(0x0b),
+            b"b" => out.push(0x08),
+            b"r" => out.push(b'\r'),
+            b"f" => out.push(0x0c),
+            b"\\" => out.push(b'\\'),
+            [d @ b'0'..=b'7'] => {
+                let mut val = u32::from(d - b'0');
                 for _ in 0..2 {
-                    match chars.peek() {
-                        Some(n @ '0'..='7') => {
-                            val = val * 8 + n.to_digit(8).unwrap();
-                            chars.next();
+                    match chars.get(i) {
+                        Some([n @ b'0'..=b'7']) => {
+                            val = val * 8 + u32::from(n - b'0');
+                            i += 1;
                         }
                         _ => break,
                     }
                 }
-                out.push(char::from(val as u8));
+                out.push(val as u8);
             }
-            Some(other) => out.push(other),
-            None => {}
+            // "the <backslash> shall be ignored", leaving the character.
+            other => out.extend_from_slice(other),
         }
     }
     out
@@ -363,16 +442,20 @@ impl MessageCatalog {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut file = input_stream(input_path, true)?;
 
-        let mut input = String::new();
-        file.read_to_string(&mut input)?;
+        let mut input = Vec::new();
+        file.read_to_end(&mut input)?;
 
-        Self::parse_str(&input, catfile_catalog)
+        Self::parse_bytes(&input, catfile_catalog)
     }
 
-    /// Parse message-text source from an in-memory string. Split out from
+    /// Parse message-text source from an in-memory buffer. Split out from
     /// [`parse`](Self::parse) so the grammar can be unit-tested directly.
-    pub fn parse_str(
-        input: &str,
+    ///
+    /// Takes bytes rather than a `&str`: the grammar's own tokens (`$set`,
+    /// `$quote`, digits, <blank>) are ASCII, but the message text is whatever
+    /// the current `LC_CTYPE` says it is, so it must survive verbatim.
+    pub fn parse_bytes(
+        input: &[u8],
         catfile_catalog: Option<MessageCatalog>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut catalog = match catfile_catalog {
@@ -396,35 +479,37 @@ impl MessageCatalog {
         //
         // i guess this will be useful when we have some qutoe character and sets and then we have another quote character
         // and sets
-        let mut quote_char: Option<char> = None;
+        let mut quote_char: Option<&[u8]> = None;
 
-        let lines: Vec<&str> = input.lines().collect();
+        let lines: Vec<&[u8]> = split_lines(input);
         let mut line_num = 0;
         while line_num < lines.len() {
-            let line = lines[line_num].trim();
+            let line = trim(lines[line_num]);
 
             // Skip empty lines and comments
-            if line.is_empty() || line.starts_with("$ ") {
+            if line.is_empty() || line.starts_with(b"$ ") {
                 line_num += 1;
                 continue;
             }
 
-            if line.starts_with("$quote") {
-                if let Some(rem) = line.strip_prefix("$quote") {
-                    let c = rem.trim();
+            if line.starts_with(b"$quote") {
+                if let Some(rem) = line.strip_prefix(b"$quote".as_slice()) {
+                    let c = trim(rem);
                     if c.is_empty() {
                         // unset quote character
                         quote_char = None;
-                    } else if c.chars().count() == 1 {
-                        quote_char = c.chars().next();
+                    } else if mb_char_slices(c).len() == 1 {
+                        // A single *character* under the current LC_CTYPE, which
+                        // may be more than one byte.
+                        quote_char = Some(c);
                     } else {
                         return Err(Box::new(ParseError::InvalidQuoteChar(
                             line_num + 1,
-                            line.to_string(),
+                            String::from_utf8_lossy(line).into_owned(),
                         )));
                     }
                 }
-            } else if line.starts_with("$delset") {
+            } else if line.starts_with(b"$delset") {
                 // the gnu implementation seems to just remove those sets from the "array" (both - little endian and big endian)
                 // and it preserves those datain the string pool too(weird, they(GNU devs) might need to improve on that)
                 // but we are going to remove the set from the catalog itself(check the hexdump btw for $delset)
@@ -432,13 +517,16 @@ impl MessageCatalog {
                 // The question remains, are we diverting from the specification?
                 // Hmm..no coz the specification doesn't mention anything about the implementation details(it was GNU's choice to do that)
                 // and the GNU implementation is just one of the many ways to implement it, and the catopen will interpret it the sameway
-                if let Some(rem) = line.strip_prefix("$delset") {
+                if let Some(rem) = line.strip_prefix(b"$delset".as_slice()) {
                     // Only the first token is the set number; any remaining text
                     // on the line is a comment.
-                    let first = rem.split_whitespace().next().unwrap_or("");
-                    let set_id = first
-                        .parse::<u32>()
-                        .map_err(|e| Box::new(ParseError::ParseSetNumber(line_num, e)))?;
+                    let (first, _) = split_field(trim(rem));
+                    let set_id = parse_number::<u32>(first).map_err(|_| {
+                        Box::new(ParseError::InvalidLine(
+                            line_num + 1,
+                            String::from_utf8_lossy(line).into_owned(),
+                        ))
+                    })?;
 
                     if set_id == 0 || set_id > NL_SETMAX {
                         return Err(Box::new(ParseError::InvalidSetNumber(line_num, set_id)));
@@ -446,20 +534,23 @@ impl MessageCatalog {
 
                     catalog.cat.delete_set(set_id);
                 }
-            } else if line.starts_with("$set") {
-                if let Some(rem) = line.strip_prefix("$set") {
-                    let parts: Vec<&str> = rem.trim().splitn(2, char::is_whitespace).collect();
+            } else if line.starts_with(b"$set") {
+                if let Some(rem) = line.strip_prefix(b"$set".as_slice()) {
+                    let (number, comment) = split_field(trim(rem));
 
-                    if parts.is_empty() {
+                    if number.is_empty() {
                         return Err(Box::new(ParseError::NoSetNumber(
                             line_num,
-                            line.to_string(),
+                            String::from_utf8_lossy(line).into_owned(),
                         )));
                     }
 
-                    let set_id = parts[0]
-                        .parse::<u32>()
-                        .map_err(|e| Box::new(ParseError::ParseSetNumber(line_num, e)))?;
+                    let set_id = parse_number::<u32>(number).map_err(|_| {
+                        Box::new(ParseError::InvalidLine(
+                            line_num + 1,
+                            String::from_utf8_lossy(line).into_owned(),
+                        ))
+                    })?;
 
                     if set_id == 0 || set_id > NL_SETMAX {
                         return Err(Box::new(ParseError::InvalidSetNumber(line_num, set_id)));
@@ -479,20 +570,22 @@ impl MessageCatalog {
                         // we'll reuse the same set if we collide
                         current_set = Some(existing_set);
                     } else {
-                        let comment = parts.get(1).map(|&s| s.to_string()).unwrap_or_default();
+                        let comment = comment
+                            .map(|c| String::from_utf8_lossy(c).into_owned())
+                            .unwrap_or_default();
                         current_set = Some(catalog.add_set(set_id, comment));
                     }
                 }
             } else {
-                let parts: Vec<&str> = line.splitn(2, char::is_whitespace).collect();
+                let (number, rest) = split_field(line);
                 // The message-number field must be a number; anything else is
                 // an invalid line.
-                let msg_id = match parts[0].parse::<usize>() {
+                let msg_id = match parse_number::<usize>(number) {
                     Ok(n) => n,
                     Err(_) => {
                         return Err(Box::new(ParseError::InvalidLine(
                             line_num + 1,
-                            line.to_string(),
+                            String::from_utf8_lossy(line).into_owned(),
                         )));
                     }
                 };
@@ -505,7 +598,7 @@ impl MessageCatalog {
                     return Err(Box::new(ParseError::InvalidMsgNumber(line_num + 1, msg_id)));
                 }
 
-                if parts.len() == 1 {
+                let Some(rest) = rest else {
                     // A message-number with no separating <blank> and no text
                     // deletes the message from the current set.
                     if let Some(set) = current_set.as_ref() {
@@ -513,28 +606,25 @@ impl MessageCatalog {
                     }
                     line_num += 1;
                     continue;
-                }
+                };
 
                 // Assemble the message text, honoring trailing-backslash line
                 // continuation (the backslash is discarded and the following
                 // physical line is appended without an intervening newline).
-                let mut text = parts[1].to_string();
+                let mut text = rest.to_vec();
                 while ends_with_continuation(&text) {
                     text.pop();
                     line_num += 1;
                     match lines.get(line_num) {
-                        Some(next) => text.push_str(next.trim_end()),
+                        Some(next) => text.extend_from_slice(trim_end(next)),
                         None => break,
                     }
                 }
 
                 // Strip a surrounding pair of quote characters, if set.
                 if let Some(q) = quote_char {
-                    if text.chars().count() >= 2 && text.starts_with(q) && text.ends_with(q) {
-                        let mut it = text.chars();
-                        it.next();
-                        it.next_back();
-                        text = it.as_str().to_string();
+                    if text.len() >= 2 * q.len() && text.starts_with(q) && text.ends_with(q) {
+                        text = text[q.len()..text.len() - q.len()].to_vec();
                     }
                 }
 
@@ -572,7 +662,7 @@ impl MessageCatalog {
         new_set
     }
 
-    fn add_msg(&self, set: &Rc<RefCell<Set>>, msg_id: usize, msg: String) {
+    fn add_msg(&self, set: &Rc<RefCell<Set>>, msg_id: usize, msg: Vec<u8>) {
         // If a message with this id already exists in the set, the new text
         // replaces the old per the POSIX merge rule (rather than appending a
         // duplicate).
@@ -706,7 +796,7 @@ impl MessageCatalog {
                 array[idx + 2] = string_pool.len() as u32;
 
                 // add the message to the string pool
-                string_pool.extend_from_slice(msg.msg.as_bytes());
+                string_pool.extend_from_slice(&msg.msg);
                 string_pool.push(0); // Null terminator
 
                 current_msg = msg.next.clone();
@@ -720,7 +810,7 @@ impl MessageCatalog {
         mut input: T,
     ) -> Result<MessageCatalog, Box<dyn std::error::Error>> {
         let mut catalog = MessageCatalog::new(false);
-        let mut set_msg: BTreeMap<u32, BTreeMap<u32, String>> = BTreeMap::new();
+        let mut set_msg: BTreeMap<u32, BTreeMap<u32, Vec<u8>>> = BTreeMap::new();
 
         let mut buf: Vec<u8> = Vec::new();
         input.read_to_end(&mut buf)?;
@@ -784,7 +874,10 @@ impl MessageCatalog {
                     .unwrap_or(string_pool.len() - string_offset)
                     + string_offset;
 
-                let msg = String::from_utf8_lossy(&string_pool[string_offset..msg_end]).to_string();
+                // Kept as bytes: an existing catalog may hold text in any
+                // codeset, and re-encoding it through a lossy UTF-8 conversion
+                // would corrupt it on merge.
+                let msg = string_pool[string_offset..msg_end].to_vec();
                 set_msg.entry(set_id).or_default().insert(msg_id, msg);
             }
         }
@@ -895,7 +988,7 @@ impl MessageCatalog {
                 let mut msg = msg.borrow_mut();
                 let msg_offset = file.stream_position()? - data_offset;
                 msg.offset = msg_offset as i64;
-                file.write_all(msg.msg.as_bytes())?;
+                file.write_all(&msg.msg)?;
 
                 // null terminator
                 file.write_u8(0)?;
@@ -1021,7 +1114,8 @@ mod tests {
         n
     }
 
-    fn msg_text(cat: &MessageCatalog, set_id: u32, msg_id: usize) -> Option<String> {
+    /// The stored bytes for a message, or `None` if it is absent.
+    fn msg_bytes(cat: &MessageCatalog, set_id: u32, msg_id: usize) -> Option<Vec<u8>> {
         let set = cat.cat.find_set(set_id)?;
         let mut cur = set.borrow().first_msg.clone();
         while let Some(m) = cur {
@@ -1033,46 +1127,51 @@ mod tests {
         None
     }
 
+    /// The stored text, for assertions over messages that are valid UTF-8.
+    fn msg_text(cat: &MessageCatalog, set_id: u32, msg_id: usize) -> Option<String> {
+        msg_bytes(cat, set_id, msg_id).map(|b| String::from_utf8(b).expect("utf-8 message"))
+    }
+
     #[test]
     fn process_escapes_handles_c_sequences() {
-        assert_eq!(process_escapes(r"Hello\tWorld"), "Hello\tWorld");
-        assert_eq!(process_escapes(r"a\nb\r"), "a\nb\r");
-        assert_eq!(process_escapes(r"\\"), "\\");
-        assert_eq!(process_escapes(r"\101"), "A"); // octal 101 == 'A'
-        assert_eq!(process_escapes(r"\1"), "\u{1}");
-        assert_eq!(process_escapes(r"\q"), "q"); // unknown escape: backslash dropped
+        assert_eq!(process_escapes(br"Hello\tWorld"), b"Hello\tWorld");
+        assert_eq!(process_escapes(br"a\nb\r"), b"a\nb\r");
+        assert_eq!(process_escapes(br"\\"), b"\\");
+        assert_eq!(process_escapes(br"\101"), b"A"); // octal 101 == 'A'
+        assert_eq!(process_escapes(br"\1"), b"\x01");
+        assert_eq!(process_escapes(br"\q"), b"q"); // unknown escape: backslash dropped
     }
 
     #[test]
     fn ends_with_continuation_counts_backslashes() {
-        assert!(ends_with_continuation(r"abc\"));
-        assert!(!ends_with_continuation(r"abc\\"));
-        assert!(ends_with_continuation(r"abc\\\"));
-        assert!(!ends_with_continuation("abc"));
+        assert!(ends_with_continuation(br"abc\"));
+        assert!(!ends_with_continuation(br"abc\\"));
+        assert!(ends_with_continuation(br"abc\\\"));
+        assert!(!ends_with_continuation(b"abc"));
     }
 
     #[test]
     fn gc1_message_escapes_expanded_in_catalog() {
-        let cat = MessageCatalog::parse_str("$set 1\n1 Hello\\tWorld\n", None).unwrap();
+        let cat = MessageCatalog::parse_bytes(b"$set 1\n1 Hello\\tWorld\n", None).unwrap();
         assert_eq!(msg_text(&cat, 1, 1).as_deref(), Some("Hello\tWorld"));
     }
 
     #[test]
     fn gc3_line_continuation_joins_text() {
-        let cat = MessageCatalog::parse_str("$set 1\n1 Hello\\\nWorld\n", None).unwrap();
+        let cat = MessageCatalog::parse_bytes(b"$set 1\n1 Hello\\\nWorld\n", None).unwrap();
         assert_eq!(msg_text(&cat, 1, 1).as_deref(), Some("HelloWorld"));
     }
 
     #[test]
     fn gc4_colliding_msgid_is_replaced_not_appended() {
-        let cat = MessageCatalog::parse_str("$set 1\n1 First\n1 Second\n", None).unwrap();
+        let cat = MessageCatalog::parse_bytes(b"$set 1\n1 First\n1 Second\n", None).unwrap();
         assert_eq!(msg_text(&cat, 1, 1).as_deref(), Some("Second"));
         assert_eq!(count_msgs(&cat, 1), 1);
     }
 
     #[test]
     fn gc6_bare_number_deletes_message() {
-        let cat = MessageCatalog::parse_str("$set 1\n1 Hello\n2 Bye\n1\n", None).unwrap();
+        let cat = MessageCatalog::parse_bytes(b"$set 1\n1 Hello\n2 Bye\n1\n", None).unwrap();
         assert_eq!(msg_text(&cat, 1, 1), None);
         assert_eq!(msg_text(&cat, 1, 2).as_deref(), Some("Bye"));
         assert_eq!(count_msgs(&cat, 1), 1);
@@ -1082,26 +1181,26 @@ mod tests {
     fn gc5_multiple_msgfiles_merge_in_order() {
         // main() threads the accumulated catalog through successive parses;
         // emulate that here.
-        let first = MessageCatalog::parse_str("$set 1\n1 First\n", None).unwrap();
-        let merged = MessageCatalog::parse_str("$set 2\n1 Second\n", Some(first)).unwrap();
+        let first = MessageCatalog::parse_bytes(b"$set 1\n1 First\n", None).unwrap();
+        let merged = MessageCatalog::parse_bytes(b"$set 2\n1 Second\n", Some(first)).unwrap();
         assert_eq!(msg_text(&merged, 1, 1).as_deref(), Some("First"));
         assert_eq!(msg_text(&merged, 2, 1).as_deref(), Some("Second"));
     }
 
     #[test]
     fn gc7_delset_allows_trailing_comment_and_validates_range() {
-        let cat =
-            MessageCatalog::parse_str("$set 1\n1 X\n$delset 1 this is a comment\n", None).unwrap();
+        let cat = MessageCatalog::parse_bytes(b"$set 1\n1 X\n$delset 1 this is a comment\n", None)
+            .unwrap();
         assert!(cat.cat.find_set(1).is_none());
-        assert!(MessageCatalog::parse_str("$delset 0\n", None).is_err());
-        assert!(MessageCatalog::parse_str("$delset 99999\n", None).is_err());
+        assert!(MessageCatalog::parse_bytes(b"$delset 0\n", None).is_err());
+        assert!(MessageCatalog::parse_bytes(b"$delset 99999\n", None).is_err());
     }
 
     #[test]
     fn gc8_message_number_range_enforced() {
-        assert!(MessageCatalog::parse_str("$set 1\n0 X\n", None).is_err());
-        assert!(MessageCatalog::parse_str("$set 1\n99999 X\n", None).is_err());
-        assert!(MessageCatalog::parse_str("$set 1\n1 X\n", None).is_ok());
+        assert!(MessageCatalog::parse_bytes(b"$set 1\n0 X\n", None).is_err());
+        assert!(MessageCatalog::parse_bytes(b"$set 1\n99999 X\n", None).is_err());
+        assert!(MessageCatalog::parse_bytes(b"$set 1\n1 X\n", None).is_ok());
     }
 
     #[test]

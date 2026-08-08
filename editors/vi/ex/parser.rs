@@ -770,11 +770,25 @@ fn parse_open_pattern(args: &str) -> Option<String> {
 /// "If there are <blank> characters between the type argument and the preceding
 /// z command name or optional '!' character, it shall be an error" (95554-95555).
 fn parse_z_args(args: &str) -> Result<(Option<char>, usize, Option<usize>)> {
+    const TYPES: [char; 5] = ['+', '-', '.', '=', '^'];
+
+    // "If there are <blank> characters between the type argument and the
+    // preceding z command name or optional '!' character, it shall be an error"
+    // (95554-95555). This is why `args` arrives untrimmed. A <blank> before a
+    // *count* is still legal -- the rule names only the type argument.
+    let trimmed = args.trim_start();
+    if trimmed.len() != args.len() && trimmed.starts_with(TYPES) {
+        return Err(ViError::InvalidCommand(
+            "z: no <blank> may precede the type character".into(),
+        ));
+    }
+    let args = trimmed;
+
     if args.is_empty() {
         return Ok((None, 0, None));
     }
     let first = args.chars().next().unwrap();
-    if !['+', '-', '.', '=', '^'].contains(&first) {
+    if !TYPES.contains(&first) {
         // No type: the whole argument is the count.
         return Ok((None, 0, args.trim().parse().ok()));
     }
@@ -788,11 +802,7 @@ fn parse_z_args(args: &str) -> Result<(Option<char>, usize, Option<usize>)> {
     }
     let rest = &args[repeats * first.len_utf8()..];
     // A different type character following the run is a malformed type.
-    if rest
-        .chars()
-        .next()
-        .is_some_and(|c| ['+', '-', '.', '=', '^'].contains(&c))
-    {
+    if rest.chars().next().is_some_and(|c| TYPES.contains(&c)) {
         return Err(ViError::InvalidCommand("z: mixed type characters".into()));
     }
     Ok((Some(first), repeats, rest.trim().parse().ok()))

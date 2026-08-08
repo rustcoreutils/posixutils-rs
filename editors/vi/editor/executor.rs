@@ -281,6 +281,16 @@ impl Editor {
                 .max(1),
             None => 2 * self.options.scroll,
         };
+        // "If count is zero, nothing shall be written" (95574). Every type's
+        // displacement formula also degenerates at zero -- `repeats * count - 1`
+        // and `(repeats + 1) * count - 1` would underflow `usize`, aborting the
+        // editor in a build with overflow checks and wrapping into a spurious
+        // out-of-buffer error without them. Reachable as a literal `z-0`, and
+        // via `2 * scroll` when `scroll` is set to 0.
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+
         let last = self.buffer.line_count();
         let mut target_line = line.unwrap_or_else(|| self.buffer.cursor().line);
 
@@ -300,29 +310,26 @@ impl Editor {
         // rather than a clamp.
         let repeats = repeats.max(1);
         let start_line = match ztype {
-            // "(((number of '+' characters) -1) x count) +1"
+            // "(((number of '+' characters) -1) x count) +1", and lines are
+            // written "starting at the new value of line" -- including for a
+            // single `+`, whose displacement is 1. Returning `target_line` here
+            // re-displayed the line the user was already on.
             Some('+') => {
-                let advance = (repeats - 1) * count + 1;
+                let advance = (repeats - 1).saturating_mul(count) + 1;
                 let start = target_line + advance;
                 if start > last {
                     return Err(ViError::InvalidAddress("z: past end of buffer".to_string()));
                 }
-                // `z+` alone means "the screenful after this one", which starts
-                // at the following line.
-                if repeats == 1 {
-                    target_line
-                } else {
-                    start
-                }
+                start
             }
             // "(((number of '-' characters) x count) -1)"
-            Some('-') => decrement_or_err(target_line, repeats * count - 1)?,
+            Some('-') => decrement_or_err(target_line, repeats.saturating_mul(count) - 1)?,
             Some('.') | Some('=') => {
                 // Centred: half a screen either side.
                 target_line.saturating_sub(count / 2).max(1)
             }
             // "(((number of 'ˆ' characters) +1) x count) -1"
-            Some('^') => decrement_or_err(target_line, (repeats + 1) * count - 1)?,
+            Some('^') => decrement_or_err(target_line, (repeats + 1).saturating_mul(count) - 1)?,
             _ => target_line,
         };
 

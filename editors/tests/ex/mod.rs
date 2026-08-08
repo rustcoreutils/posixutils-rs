@@ -1326,3 +1326,68 @@ fn test_ex_next_honours_autowrite() {
         "autowrite should have written the first file back"
     );
 }
+
+// ============================================================================
+// `:z` regressions found by review
+// ============================================================================
+
+#[test]
+fn test_ex_z_zero_count_does_not_panic() {
+    // `repeats * count - 1` and `(repeats + 1) * count - 1` underflow `usize`
+    // when count is 0, aborting the editor and losing the buffer in any build
+    // with overflow checks. A literal `z-0` reaches it, and so does `z-` after
+    // `:set scroll=0`, since the default count is `2 * scroll`.
+    //
+    // POSIX 95574 step 1: "If count is zero, nothing shall be written."
+    // In a release build the subtraction wraps rather than panicking, and the
+    // huge displacement then fails the bounds check -- so the observable
+    // symptom is a spurious *error*. Asserting the specified outcome (nothing
+    // written, nothing diagnosed) catches both builds.
+    for cmd in ["1z-0", "1z^0", "1z+0", "1z.0"] {
+        let (out, err) = ex_output(&["-s"], &format!("a\na\nb\nc\n.\n{cmd}\nq!\n"));
+        assert_eq!(out, "", "a zero count must write nothing, got {out:?}");
+        assert!(
+            err.is_empty(),
+            "`{cmd}` must not be an error: a zero count writes nothing, and the \
+             displacement stays within the buffer. Got {err:?}"
+        );
+    }
+
+    // The default count is `2 * scroll`, so `scroll=0` reaches the same path
+    // without a literal zero anywhere in the command.
+    let (out, err) = ex_output(&["-s"], "a\na\nb\nc\n.\nset scroll=0\n2z-\nq!\n");
+    assert_eq!(out, "", "scroll=0 must write nothing, got {out:?}");
+    assert!(err.is_empty(), "`z-` with scroll=0 must not error: {err:?}");
+}
+
+#[test]
+fn test_ex_z_plus_starts_the_following_screenful() {
+    // ex.md §95567-95571: for `+` the specified line is incremented by
+    // `(((number of '+') - 1) x count) + 1` and lines are written "starting at
+    // the new value of line". The single-`+` arm computed that value, used it
+    // for the bounds check, then discarded it -- so `z+` re-displayed the line
+    // the user was already on and never reached the end of the screenful.
+    let file = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\n";
+    ex_test_with_file(file, "1z+3\nq!\n", "l2\nl3\nl4\n");
+    // Two `+` characters displace by ((2-1) x count) + 1, unchanged.
+    ex_test_with_file(file, "1z++3\nq!\n", "l5\nl6\nl7\n");
+    // No type at all still starts at the specified line.
+    ex_test_with_file(file, "1z3\nq!\n", "l1\nl2\nl3\n");
+}
+
+#[test]
+fn test_ex_z_blank_before_the_type_is_an_error() {
+    // ex.md §95554-95555: "If there are <blank> characters between the type
+    // argument and the preceding z command name or optional '!' character, it
+    // shall be an error." The blank made `parse_z_args` miss the type entirely
+    // and fall through to its count branch, so `z -` silently scrolled forward.
+    for cmd in ["z -", "z .", "z  +", "z!  -"] {
+        let (_, err) = ex_output(&["-s"], &format!("a\na\nb\nc\n.\n{cmd}\nq!\n"));
+        assert!(
+            !err.is_empty(),
+            "`{cmd}` must be an error: a <blank> may not precede the type"
+        );
+    }
+    // A blank before a *count* is still legal -- the rule is scoped to the type.
+    ex_test_with_file("l1\nl2\nl3\nl4\n", "1z 2\nq!\n", "l1\nl2\n");
+}

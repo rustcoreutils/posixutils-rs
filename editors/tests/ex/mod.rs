@@ -1059,3 +1059,422 @@ fn test_ex_at_at_repeats_last_buffer() {
     // as a buffer *name*, so it failed with `Buffer "@" is empty`.
     ex_test_with_file("s/o/O/\nooo\n", "1y a\n2\n@a\n@@\n2p\nq!\n", "OOo\n");
 }
+
+// ============================================================================
+// Command modifier/arg gaps -- part 3 (the `!` modifier and z/o/f/! arguments)
+// ============================================================================
+
+/// Run ex and return (stdout, stderr) without asserting on either.
+fn ex_output(args: &[&str], stdin: &str) -> (String, String) {
+    let mut child = Command::new(get_binary_path("ex"))
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ex");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    (
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+#[test]
+fn test_ex_bang_is_rejected_on_commands_that_do_not_take_one() {
+    // ex.md §94854-94857 defines '!' as a modifier only for the commands whose
+    // synopsis spells it. The parser used to fold '!' into the command *name*,
+    // so a bang on any other command was silently swallowed.
+    let (_, err) = ex_output(&["-s"], "pwd!\nq!\n");
+    assert!(
+        !err.is_empty(),
+        "`:pwd!` should be rejected, got no diagnostic"
+    );
+
+    // ...while a command that does take one still works.
+    let (out, _) = ex_output(&["-s"], "a\nx\n.\nq!\n");
+    assert_eq!(out, "");
+}
+
+#[test]
+fn test_ex_bang_must_be_adjacent_to_the_command_name() {
+    // "the '!' character shall only act as a modifier if there is no <blank>
+    // between it and the command name" (§94854-94857). With a blank, `:q !`
+    // is not the forced quit, so a modified buffer must still refuse.
+    let (_, err) = ex_output(&["-s"], "a\nx\n.\nq !\n");
+    assert!(
+        !err.is_empty(),
+        "`:q !` must not be read as the forced quit"
+    );
+}
+
+#[test]
+fn test_ex_read_bang_runs_a_command_rather_than_forcing() {
+    // `read` is one of the three commands whose '!' is not a modifier
+    // (§94854-94857, §95268): `:r!cmd` reads the command's output.
+    ex_test("r!echo hello\n1,$p\nq!\n", "hello\n");
+    // ...and a <backslash> suppresses that meaning (§95285-95286), so this
+    // names a file rather than a command.
+    let (_, err) = ex_output(&["-s"], "r\\!nosuchfile\nq!\n");
+    assert!(
+        !err.is_empty(),
+        "`:r \\!nosuchfile` should try to read a file and fail"
+    );
+}
+
+#[test]
+fn test_ex_append_bang_toggles_autoindent() {
+    // §94894-94896: '!' toggles the autoindent edit option for the duration of
+    // the command only, and §94705-94707 has ex supply the autoindent
+    // characters as the input prompt. With autoindent off, `:a!` turns it on,
+    // so both appended lines pick up the indent of the line they follow.
+    ex_test_with_file(
+        "    base\n",
+        "1a!\none\ntwo\n.\n1,$p\nq!\n",
+        "    base\n    one\n    two\n",
+    );
+    // Without the bang and with autoindent off, nothing is supplied.
+    ex_test_with_file(
+        "    base\n",
+        "1a\none\ntwo\n.\n1,$p\nq!\n",
+        "    base\none\ntwo\n",
+    );
+    // And with autoindent set, the bang turns it back off.
+    ex_test_with_file(
+        "    base\n",
+        "set autoindent\n1a!\none\ntwo\n.\n1,$p\nq!\n",
+        "    base\none\ntwo\n",
+    );
+    // The `.` terminator is still recognised while indent is being supplied
+    // (the autoindent characters are a prompt, not input), and a line holding
+    // nothing but autoindent is discarded (§94742-94743).
+    ex_test_with_file(
+        "    base\n",
+        "1a!\none\n\ntwo\n.\n1,$p\nq!\n",
+        "    base\n    one\n\n    two\n",
+    );
+}
+
+#[test]
+fn test_ex_change_count_extends_the_range() {
+    // `c[hange][!][count]` -- count is "equivalent to specifying an additional
+    // address ... equal to the last address specified plus count-1"
+    // (§94785-94789), so `1c2` replaces lines 1 and 2.
+    ex_test_with_file(
+        "one\ntwo\nthree\n",
+        "1c2\nNEW\n.\n1,$p\nq!\n",
+        "NEW\nthree\n",
+    );
+}
+
+#[test]
+fn test_ex_z_repeated_type_characters_scroll_further() {
+    // §95562-95592 defines the displacement in terms of the *number* of type
+    // characters, so `z--` is not `z-`. Only the first character used to be
+    // read, making every repeat a no-op.
+    let file = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\n";
+    // `6z-2` -> decrement by (1 x 2) - 1 = 1, so start at line 5, 2 lines.
+    ex_test_with_file(file, "6z-2\nq!\n", "l5\nl6\n");
+    // `6z--2` -> decrement by (2 x 2) - 1 = 3, so start at line 3, 2 lines.
+    ex_test_with_file(file, "6z--2\nq!\n", "l3\nl4\n");
+    // `.` may not be repeated (§95572).
+    let (_, err) = ex_output(&["-s"], "a\nx\n.\n1z..\nq!\n");
+    assert!(!err.is_empty(), "`z..` should be an error");
+}
+
+#[test]
+fn test_ex_z_past_the_end_is_an_error() {
+    // "If incrementing the current line would cause it to be greater than the
+    // last line in the edit buffer, it shall be an error." (§95552-95553)
+    let (_, err) = ex_output(&["-s"], "a\nonly\n.\n$\nz\nq!\n");
+    assert!(!err.is_empty(), "`z` on the last line should be an error");
+    // Likewise running off the front (§95564).
+    let (_, err) = ex_output(&["-s"], "a\na\nb\nc\n.\n1z-5\nq!\n");
+    assert!(!err.is_empty(), "`1z-5` should be an error");
+}
+
+#[test]
+fn test_ex_shell_escape_warns_about_unsaved_changes() {
+    // §95607-95608: "a warning message shall be written if the edit buffer has
+    // been modified since the last complete write, and the warn edit option is
+    // set". The `warn` option was read nowhere in the crate.
+    let (out, _) = ex_output(&["-s"], "a\nx\n.\n!true\nq!\n");
+    assert!(
+        out.contains("No write since last change"),
+        "expected the warn message in {out:?}"
+    );
+
+    // `set nowarn` suppresses it...
+    let (out, _) = ex_output(&["-s"], "set nowarn\na\nx\n.\n!true\nq!\n");
+    assert!(
+        !out.contains("No write since last change"),
+        "`set nowarn` should suppress the warning: {out:?}"
+    );
+    // ...and an unmodified buffer never triggers it.
+    let (out, _) = ex_output(&["-s"], "!true\nq!\n");
+    assert!(
+        !out.contains("No write since last change"),
+        "an unmodified buffer must not warn: {out:?}"
+    );
+}
+
+// ============================================================================
+// Command modifier/arg gaps -- part 4 (argument lists and +command)
+// ============================================================================
+
+#[test]
+fn test_ex_edit_accepts_a_plus_command() {
+    // `e[dit][!][+command][file]` (§94946). The whole argument string used to
+    // be taken as the filename, so this opened a file literally named
+    // "+2 <path>".
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("three.txt");
+    fs::write(&path, "one\ntwo\nthree\n").unwrap();
+    let path = path.to_string_lossy().to_string();
+
+    // `+2` runs `:2`, so the current line is 2 and `.p` prints "two".
+    ex_test(&format!("e +2 {path}\n.p\nq!\n"), "two\n");
+    // A bare `+` starts at the last line.
+    ex_test(&format!("e + {path}\n.p\nq!\n"), "three\n");
+    // Without a +command the file still opens normally.
+    ex_test(&format!("e {path}\n1,$p\nq!\n"), "one\ntwo\nthree\n");
+}
+
+#[test]
+fn test_ex_edit_plus_command_blanks_can_be_escaped() {
+    // "<blank> characters within the +command can be escaped by preceding them
+    // with a <backslash> character" (§94954-94955).
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("f.txt");
+    fs::write(&path, "alpha\nbeta\n").unwrap();
+    let path = path.to_string_lossy().to_string();
+
+    // The replacement text holds a <blank>, escaped so the +command is not
+    // split there and the rest taken as the filename.
+    ex_test(
+        &format!("e +2s/beta/B\\ E/ {path}\n1,$p\nq!\n"),
+        "alpha\nB E\n",
+    );
+    // Unescaped, the same blank ends the +command, leaving an unterminated
+    // substitute and taking `E/` as the start of the filename.
+    let (_, err) = ex_output(&["-s"], &format!("e +2s/beta/B E/ {path}\n1,$p\nq!\n"));
+    assert!(
+        !err.is_empty(),
+        "an unescaped blank should split the +command"
+    );
+}
+
+#[test]
+fn test_ex_next_replaces_the_argument_list() {
+    // "Set the argument list to the specified filenames ... set the current
+    // pathname to the first filename specified" (§95181-95184). The file list
+    // was discarded outright, so `:n a b` behaved as a plain `:n`.
+    let dir = TempDir::new().unwrap();
+    let a = dir.path().join("a.txt");
+    let b = dir.path().join("b.txt");
+    fs::write(&a, "AAA\n").unwrap();
+    fs::write(&b, "BBB\n").unwrap();
+    let (a, b) = (
+        a.to_string_lossy().to_string(),
+        b.to_string_lossy().to_string(),
+    );
+
+    // Start with no argument list at all; `:n a b` must set one and open `a`.
+    ex_test(&format!("n {a} {b}\n1,$p\nq!\n"), "AAA\n");
+    // ...and a following `:n` walks to the second entry of that new list.
+    ex_test(&format!("n {a} {b}\nn\n1,$p\nq!\n"), "BBB\n");
+    // `:n` also takes a +command.
+    ex_test(&format!("n +$ {a} {b}\n.p\nq!\n"), "AAA\n");
+}
+
+#[test]
+fn test_ex_next_honours_autowrite() {
+    // "it shall be an error, unless the file is successfully written as
+    // specified by the autowrite option" (§95178-95180).
+    let dir = TempDir::new().unwrap();
+    let a = dir.path().join("a.txt");
+    let b = dir.path().join("b.txt");
+    fs::write(&a, "AAA\n").unwrap();
+    fs::write(&b, "BBB\n").unwrap();
+    let (a_path, b_path) = (
+        a.to_string_lossy().to_string(),
+        b.to_string_lossy().to_string(),
+    );
+
+    // Without autowrite a modified buffer refuses.
+    let (_, err) = ex_output(&["-s", &a_path, &b_path], "a\nextra\n.\nn\nq!\n");
+    assert!(
+        !err.is_empty(),
+        "`:n` on a modified buffer should be an error without autowrite"
+    );
+
+    // With autowrite it writes and moves on.
+    let (out, _) = ex_output(
+        &["-s", &a_path, &b_path],
+        "set autowrite\na\nextra\n.\nn\n1,$p\nq!\n",
+    );
+    assert_eq!(out, "BBB\n", "expected to advance to the second file");
+    assert_eq!(
+        fs::read_to_string(&a).unwrap(),
+        "AAA\nextra\n",
+        "autowrite should have written the first file back"
+    );
+}
+
+// ============================================================================
+// `:z` regressions found by review
+// ============================================================================
+
+#[test]
+fn test_ex_z_zero_count_does_not_panic() {
+    // `repeats * count - 1` and `(repeats + 1) * count - 1` underflow `usize`
+    // when count is 0, aborting the editor and losing the buffer in any build
+    // with overflow checks. A literal `z-0` reaches it, and so does `z-` after
+    // `:set scroll=0`, since the default count is `2 * scroll`.
+    //
+    // POSIX 95574 step 1: "If count is zero, nothing shall be written."
+    // In a release build the subtraction wraps rather than panicking, and the
+    // huge displacement then fails the bounds check -- so the observable
+    // symptom is a spurious *error*. Asserting the specified outcome (nothing
+    // written, nothing diagnosed) catches both builds.
+    for cmd in ["1z-0", "1z^0", "1z+0", "1z.0"] {
+        let (out, err) = ex_output(&["-s"], &format!("a\na\nb\nc\n.\n{cmd}\nq!\n"));
+        assert_eq!(out, "", "a zero count must write nothing, got {out:?}");
+        assert!(
+            err.is_empty(),
+            "`{cmd}` must not be an error: a zero count writes nothing, and the \
+             displacement stays within the buffer. Got {err:?}"
+        );
+    }
+
+    // The default count is `2 * scroll`, so `scroll=0` reaches the same path
+    // without a literal zero anywhere in the command.
+    let (out, err) = ex_output(&["-s"], "a\na\nb\nc\n.\nset scroll=0\n2z-\nq!\n");
+    assert_eq!(out, "", "scroll=0 must write nothing, got {out:?}");
+    assert!(err.is_empty(), "`z-` with scroll=0 must not error: {err:?}");
+}
+
+#[test]
+fn test_ex_z_plus_starts_the_following_screenful() {
+    // ex.md §95567-95571: for `+` the specified line is incremented by
+    // `(((number of '+') - 1) x count) + 1` and lines are written "starting at
+    // the new value of line". The single-`+` arm computed that value, used it
+    // for the bounds check, then discarded it -- so `z+` re-displayed the line
+    // the user was already on and never reached the end of the screenful.
+    let file = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\n";
+    ex_test_with_file(file, "1z+3\nq!\n", "l2\nl3\nl4\n");
+    // Two `+` characters displace by ((2-1) x count) + 1, unchanged.
+    ex_test_with_file(file, "1z++3\nq!\n", "l5\nl6\nl7\n");
+    // No type at all still starts at the specified line.
+    ex_test_with_file(file, "1z3\nq!\n", "l1\nl2\nl3\n");
+}
+
+#[test]
+fn test_ex_z_blank_before_the_type_is_an_error() {
+    // ex.md §95554-95555: "If there are <blank> characters between the type
+    // argument and the preceding z command name or optional '!' character, it
+    // shall be an error." The blank made `parse_z_args` miss the type entirely
+    // and fall through to its count branch, so `z -` silently scrolled forward.
+    for cmd in ["z -", "z .", "z  +", "z!  -"] {
+        let (_, err) = ex_output(&["-s"], &format!("a\na\nb\nc\n.\n{cmd}\nq!\n"));
+        assert!(
+            !err.is_empty(),
+            "`{cmd}` must be an error: a <blank> may not precede the type"
+        );
+    }
+    // A blank before a *count* is still legal -- the rule is scoped to the type.
+    ex_test_with_file("l1\nl2\nl3\nl4\n", "1z 2\nq!\n", "l1\nl2\n");
+}
+
+// ============================================================================
+// Argument splitting and text input, from review
+// ============================================================================
+
+#[test]
+fn test_ex_next_honours_escaped_blanks_in_filenames() {
+    // `split_plus_command` honours `\ ` per §94954-94955 and then the operands
+    // were split with `split_whitespace`, which tore `my\ file.txt` into two
+    // and left the backslash on the first, so `:n` opened a file named `my\`.
+    let dir = TempDir::new().unwrap();
+    let spaced = dir.path().join("my file.txt");
+    let plain = dir.path().join("plain.txt");
+    fs::write(&spaced, "SPACED\n").unwrap();
+    fs::write(&plain, "PLAIN\n").unwrap();
+
+    let escaped = spaced.to_string_lossy().replace(' ', "\\ ");
+    ex_test(
+        &format!("n {escaped} {}\n1,$p\nq!\n", plain.to_string_lossy()),
+        "SPACED\n",
+    );
+    // ...and the second entry of that argument list is still reachable.
+    ex_test(
+        &format!("n {escaped} {}\nn\n1,$p\nq!\n", plain.to_string_lossy()),
+        "PLAIN\n",
+    );
+}
+
+#[test]
+fn test_ex_read_backslash_only_escapes_a_bang() {
+    // §95285-95286 gives the <backslash> one job: suppressing the
+    // `!`-means-command reading. Stripping it unconditionally renamed every
+    // path, so `:r \tmp/x` looked for `tmp/x`.
+    // Unescaped, `!` marks the rest as a command to run.
+    ex_test("r !echo hello\n1,$p\nq!\n", "hello\n");
+
+    // Escaped, it names a file instead -- so this must *not* run echo, and must
+    // fail looking for a file whose name begins with '!'.
+    let (out, err) = ex_output(&["-s"], "r \\!echo hello\n1,$p\nq!\n");
+    assert!(
+        !out.contains("hello"),
+        "`r \\!echo` must not run the command, got {out:?}"
+    );
+    assert!(
+        !err.is_empty(),
+        "reading a file named `!echo ...` must fail"
+    );
+
+    // A backslash before anything else is part of the pathname, not an escape.
+    // The file below exists; naming it with a leading backslash must not find
+    // it, which is what stripping the backslash unconditionally used to do.
+    let dir = TempDir::new().unwrap();
+    let real = dir.path().join("x");
+    fs::write(&real, "CONTENT\n").unwrap();
+
+    let (out, err) = ex_output(
+        &["-s"],
+        &format!("r \\{}\n1,$p\nq!\n", real.to_string_lossy()),
+    );
+    assert!(
+        !out.contains("CONTENT"),
+        "`r \\{}` names a path starting with a backslash, which does not \
+         exist; it must not read the unescaped file. Got {out:?}",
+        real.to_string_lossy()
+    );
+    assert!(!err.is_empty(), "the nonexistent path must be diagnosed");
+
+    // ...and without the backslash the same file reads fine, so the test above
+    // is not passing merely because the path was unreadable.
+    ex_test(
+        &format!("r {}\n1,$p\nq!\n", real.to_string_lossy()),
+        "CONTENT\n",
+    );
+}
+
+#[test]
+fn test_ex_autoindent_keeps_a_line_typed_as_blanks() {
+    // §94742-94743 discards a line with "no characters other than autoindent
+    // characters". The autoindent prefix is held apart from what the user
+    // types, so that condition is "the user entered nothing" -- testing the
+    // trimmed input also discarded a line deliberately typed as spaces.
+    ex_test_with_file(
+        "    base\n",
+        "1a!\none\n  \ntwo\n.\n1,$p\nq!\n",
+        "    base\n    one\n      \n      two\n",
+    );
+}

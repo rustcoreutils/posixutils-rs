@@ -1,0 +1,3 @@
+stdout=#line 1 "fixtures/integration_tests/args/synclines_divert.m4"\none\n#line 4 "fixtures/integration_tests/args/synclines_divert.m4"\n\nthree\n#line 2 "fixtures/integration_tests/args/synclines_divert.m4"\n\ntwo\n#line 6 "fixtures/integration_tests/args/synclines_divert.m4"\n\nfour\n
+stderr=
+status=0

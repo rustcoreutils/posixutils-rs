@@ -120,6 +120,17 @@ pub enum LastCommand {
     },
 }
 
+/// The <blank> prefix of `line`, used as the autoindent level for the next
+/// input line.
+fn leading_blanks(line: &str) -> &str {
+    let end = line
+        .char_indices()
+        .find(|(_, c)| !matches!(c, ' ' | '\t'))
+        .map(|(i, _)| i)
+        .unwrap_or(line.len());
+    &line[..end]
+}
+
 /// Ex text input mode state (:a, :i, :c commands).
 #[derive(Debug, Clone)]
 pub enum ExInsertMode {
@@ -189,6 +200,14 @@ pub struct Editor {
     last_macro_register: Option<char>,
     /// Ex text input mode (:a, :i, :c).
     ex_insert_mode: Option<ExInsertMode>,
+    /// Whether autoindent applies to the ex text input currently being
+    /// collected: the `autoindent` edit option, toggled by a `!` on the
+    /// `a`/`i`/`c` command (94894-94896).
+    ex_insert_autoindent: bool,
+    /// The autoindent characters ex supplies as the prompt for the next input
+    /// line (94705-94707). Held apart from what the user types, so the `.`
+    /// terminator is still recognised on an indented line.
+    ex_insert_indent: String,
     /// Accumulated text for ex insert mode.
     ex_insert_text: Vec<String>,
     /// Whether running in ex standalone mode (line-oriented).
@@ -255,6 +274,8 @@ impl Editor {
             last_command: None,
             last_macro_register: None,
             ex_insert_mode: None,
+            ex_insert_autoindent: false,
+            ex_insert_indent: String::new(),
             ex_insert_text: Vec::new(),
             ex_standalone_mode: false,
             silent_mode: false,
@@ -297,6 +318,8 @@ impl Editor {
             last_command: None,
             last_macro_register: None,
             ex_insert_mode: None,
+            ex_insert_autoindent: false,
+            ex_insert_indent: String::new(),
             ex_insert_text: Vec::new(),
             ex_standalone_mode: true,
             silent_mode: true,
@@ -342,6 +365,8 @@ impl Editor {
             last_command: None,
             last_macro_register: None,
             ex_insert_mode: None,
+            ex_insert_autoindent: false,
+            ex_insert_indent: String::new(),
             ex_insert_text: Vec::new(),
             ex_standalone_mode: false,
             silent_mode: false,
@@ -567,22 +592,27 @@ impl Editor {
                     }
                 }
 
-                let line = line.trim_end();
-                if line == "." {
-                    // End of text input
-                    if let Err(e) = self.finalize_ex_insert() {
+                // Strip only the line terminator: in text input mode a
+                // trailing <blank> the user typed is content, and trimming it
+                // here discarded a line entered as blanks before
+                // `accept_ex_insert_line` could tell it apart from an empty one.
+                let typed = line.trim_end_matches(['\n', '\r']).to_string();
+                match self.accept_ex_insert_line(&typed) {
+                    Ok(true) => {
+                        if !self.silent_mode {
+                            if let Some(msg) = &self.message {
+                                println!("{}", msg);
+                            }
+                        }
+                        self.message = None;
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
                         if !self.silent_mode {
                             eprintln!("{}", e);
                         }
-                    } else if !self.silent_mode {
-                        if let Some(msg) = &self.message {
-                            println!("{}", msg);
-                        }
+                        self.message = None;
                     }
-                    self.message = None;
-                } else {
-                    // Accumulate text
-                    self.ex_insert_text.push(line.to_string());
                 }
                 continue;
             }
@@ -1057,21 +1087,89 @@ impl Editor {
         Ok(())
     }
 
+    /// Enter ex text input mode, seeding the first input line's autoindent.
+    ///
+    /// "If the autoindent edit option is set, ex shall prompt for input using
+    /// autoindent characters" (94705-94707), and a `!` on the command toggles
+    /// the option for the duration of that command only.
+    fn begin_ex_insert(&mut self, mode: ExInsertMode, toggle_autoindent: bool) {
+        self.ex_insert_autoindent = self.options.autoindent != toggle_autoindent;
+        self.ex_insert_indent.clear();
+        if self.ex_insert_autoindent {
+            // Indent from the line the input follows, which for `i` and `c` is
+            // the line before the insertion point.
+            let source = match &mode {
+                ExInsertMode::Append(line) => *line,
+                ExInsertMode::Insert(line) => line.saturating_sub(1),
+                ExInsertMode::Change { start, .. } => start.saturating_sub(1),
+            };
+            self.ex_insert_indent = self
+                .buffer
+                .line(source)
+                .map(|l| leading_blanks(l.content()).to_string())
+                .unwrap_or_default();
+        }
+        self.ex_insert_mode = Some(mode);
+    }
+
+    /// Accept one completed line of ex text input.
+    ///
+    /// `typed` is what the user entered for this line; the autoindent characters
+    /// are held separately in `ex_insert_indent` and prepended below, because ex
+    /// supplies them as a prompt rather than the user typing them. Returns true
+    /// when the terminator was seen and the collected text has been inserted.
+    ///
+    /// "Terminate the current line. If there are no characters other than
+    /// autoindent characters on the line, all characters on the line shall be
+    /// discarded. Prompt for text input on a new line ... If the autoindent edit
+    /// option is set, an appropriate number of autoindent characters shall be
+    /// added as a prefix to the line." (94742-94746)
+    fn accept_ex_insert_line(&mut self, typed: &str) -> Result<bool> {
+        // The terminator is tested against what the user actually entered: the
+        // autoindent characters are a prompt ex supplied, not input, so an
+        // indented `.` still ends the text.
+        if typed == "." {
+            self.finalize_ex_insert()?;
+            return Ok(true);
+        }
+        if !self.ex_insert_autoindent {
+            self.ex_insert_text.push(typed.to_string());
+            return Ok(false);
+        }
+        let indent = std::mem::take(&mut self.ex_insert_indent);
+        // "If there are no characters other than autoindent characters on the
+        // line, all characters on the line shall be discarded." Since `typed`
+        // excludes the autoindent prefix, that condition is exactly "the user
+        // entered nothing" -- testing `trim()` instead also threw away a line
+        // the user deliberately typed as blanks.
+        let line = if typed.is_empty() {
+            String::new()
+        } else {
+            format!("{indent}{typed}")
+        };
+        // Carry the level forward from the line as it was entered, so a line
+        // that held nothing but autoindent does not reset it.
+        self.ex_insert_indent = if line.is_empty() {
+            indent
+        } else {
+            leading_blanks(&line).to_string()
+        };
+        self.ex_insert_text.push(line);
+        Ok(false)
+    }
+
     /// Handle a key in ex text input mode (:a, :i, :c).
     fn handle_ex_insert_key(&mut self, key: Key) -> Result<()> {
         match key {
             Key::Enter => {
-                let line = std::mem::take(&mut self.ex_input);
-                // Check for terminator (line containing only .)
-                if line == "." {
-                    self.finalize_ex_insert()?;
-                } else {
-                    self.ex_insert_text.push(line);
-                }
+                let typed = std::mem::take(&mut self.ex_input);
+                self.accept_ex_insert_line(&typed)?;
             }
             Key::Escape => {
                 // Cancel ex insert mode
                 self.ex_insert_mode = None;
+                self.ex_insert_autoindent = false;
+                self.ex_insert_indent.clear();
                 self.ex_insert_text.clear();
                 self.ex_input.clear();
                 self.mode = Mode::Command;
@@ -1092,6 +1190,8 @@ impl Editor {
         use crate::buffer::Line;
 
         if let Some(mode) = self.ex_insert_mode.take() {
+            self.ex_insert_autoindent = false;
+            self.ex_insert_indent.clear();
             let lines = std::mem::take(&mut self.ex_insert_text);
 
             match mode {
@@ -2158,15 +2258,12 @@ impl Editor {
                 }
                 Ok(ExResult::Continue)
             }
-            ExCommand::Edit { file, force } => {
-                if !force && self.buffer.is_modified() {
-                    return Err(ViError::FileModified);
-                }
-                if let Some(path) = file {
-                    self.open(&path)?;
-                } else if let Some(path) = self.files.current_file().map(|p| p.to_path_buf()) {
-                    self.open(&path.to_string_lossy())?;
-                }
+            ExCommand::Edit {
+                file,
+                force,
+                command,
+            } => {
+                self.edit_file(file.as_deref(), force, command.as_deref())?;
                 Ok(ExResult::Continue)
             }
             ExCommand::Set { args } => {
@@ -2195,6 +2292,14 @@ impl Editor {
                     Ok(ExResult::CommandOutput(printed))
                 }
             }
+            ExCommand::GotoAddress { range } => {
+                if let Some(line) = self.resolve_target_line(&range, false)? {
+                    let line = line.min(self.buffer.line_count()).max(1);
+                    self.buffer.set_line(line);
+                    self.buffer.move_to_first_non_blank();
+                }
+                Ok(ExResult::Continue)
+            }
             ExCommand::Goto { line } => {
                 let line = line.min(self.buffer.line_count()).max(1);
                 self.buffer.set_line(line);
@@ -2219,12 +2324,32 @@ impl Editor {
                 self.undo.redo(&mut self.buffer)?;
                 Ok(ExResult::Continue)
             }
-            ExCommand::Next { force } => {
+            ExCommand::Next {
+                force,
+                files,
+                command,
+            } => {
+                // "an error, unless the file is successfully written as
+                // specified by the autowrite option" (95178-95180).
                 if !force && self.buffer.is_modified() {
-                    return Err(ViError::FileModified);
+                    if self.options.autowrite {
+                        let lines = self.write_line_range(&crate::ex::AddressRange::empty())?;
+                        self.write(None, lines, false, false)?;
+                    } else {
+                        return Err(ViError::FileModified);
+                    }
                 }
-                let path = self.files.next_file()?;
+                let path = if files.is_empty() {
+                    self.files.next_file()?
+                } else {
+                    // "Set the argument list to the specified filenames ... set
+                    // the current pathname to the first filename specified."
+                    self.files
+                        .set_args(files.iter().map(PathBuf::from).collect());
+                    PathBuf::from(&files[0])
+                };
                 self.open(&path.to_string_lossy())?;
+                self.run_plus_command(command.as_deref())?;
                 Ok(ExResult::Continue)
             }
             ExCommand::Previous { force } => {
@@ -2259,7 +2384,11 @@ impl Editor {
                     Err(e) => Ok(ExResult::Error(format!("preserve failed: {}", e))),
                 }
             }
-            ExCommand::Recover { file } => {
+            ExCommand::Recover { file, force } => {
+                // 95293-95294: without `!`, a modified buffer is an error.
+                if !force && self.buffer.is_modified() {
+                    return Err(ViError::FileModified);
+                }
                 self.recover(file.as_deref())?;
                 Ok(ExResult::Continue)
             }
@@ -2294,27 +2423,47 @@ impl Editor {
                 self.execute_source(&file)?;
                 Ok(ExResult::Continue)
             }
-            ExCommand::Append { range } => {
+            ExCommand::Append {
+                range,
+                toggle_autoindent,
+            } => {
                 let line = self
                     .resolve_target_line(&range, true)?
                     .unwrap_or_else(|| self.buffer.cursor().line);
-                self.ex_insert_mode = Some(ExInsertMode::Append(line));
+                self.begin_ex_insert(ExInsertMode::Append(line), toggle_autoindent);
                 Ok(ExResult::Continue)
             }
-            ExCommand::Insert { range } => {
+            ExCommand::Insert {
+                range,
+                toggle_autoindent,
+            } => {
                 let line = self
                     .resolve_target_line(&range, true)?
                     .unwrap_or_else(|| self.buffer.cursor().line);
-                self.ex_insert_mode = Some(ExInsertMode::Insert(line));
+                self.begin_ex_insert(ExInsertMode::Insert(line), toggle_autoindent);
                 Ok(ExResult::Continue)
             }
-            ExCommand::Change { range } => {
+            ExCommand::Change {
+                range,
+                count,
+                toggle_autoindent,
+            } => {
                 let current = self.buffer.cursor().line;
                 let resolved = range.resolve(&self.addr_ctx_at(current))?;
-                self.ex_insert_mode = Some(ExInsertMode::Change {
-                    start: resolved.0,
-                    end: resolved.1,
-                });
+                // "count ... shall be equivalent to specifying an additional
+                // address ... equal to the last address specified plus count-1"
+                // (94785-94789).
+                let end = match count {
+                    Some(n) if n >= 1 => (resolved.1 + n - 1).min(self.buffer.line_count()),
+                    _ => resolved.1,
+                };
+                self.begin_ex_insert(
+                    ExInsertMode::Change {
+                        start: resolved.0,
+                        end,
+                    },
+                    toggle_autoindent,
+                );
                 Ok(ExResult::Continue)
             }
             ExCommand::Delete {
@@ -2379,7 +2528,14 @@ impl Editor {
                 self.execute_ex_global(&range, &pattern, &command, invert)?;
                 Ok(ExResult::Continue)
             }
-            ExCommand::Cd { path } => {
+            ExCommand::Cd { path, force } => {
+                // 94925-94926: without `!`, changing directory with a modified
+                // buffer and a relative current pathname is an error, since the
+                // buffer could no longer be written back to where it came from.
+                let relative_pathname = self.files.current_file().is_some_and(|p| !p.is_absolute());
+                if !force && self.buffer.is_modified() && relative_pathname {
+                    return Err(ViError::FileModified);
+                }
                 self.execute_ex_cd(path.as_deref())?;
                 Ok(ExResult::Continue)
             }
@@ -2394,18 +2550,26 @@ impl Editor {
                 self.execute_ex_mark(line, name)?;
                 Ok(ExResult::Continue)
             }
-            ExCommand::Visual => Ok(ExResult::EnterVisual),
-            ExCommand::Open { range } => {
+            ExCommand::Visual { range, force, args } => self.execute_ex_visual(range, force, &args),
+            ExCommand::Open { range, pattern } => {
                 let line = self.resolve_target_line(&range, false)?;
+                // "If pattern is empty ... or not specified, the last regular
+                // expression used in the editor shall be used" (95212-95214).
+                if let Some(pattern) = pattern {
+                    self.search
+                        .set_pattern(&pattern, crate::search::SearchDirection::Forward)?;
+                }
                 Ok(ExResult::EnterOpen(line))
             }
             ExCommand::Z {
                 range,
                 ztype,
+                type_count,
                 count,
+                full_screen,
             } => {
                 let line = self.resolve_target_line(&range, false)?;
-                let output = self.execute_ex_z(line, ztype, count)?;
+                let output = self.execute_ex_z(line, ztype, type_count, count, full_screen)?;
                 Ok(ExResult::CommandOutput(output))
             }
             ExCommand::ShiftLeft { range, count } => {
@@ -2425,8 +2589,8 @@ impl Editor {
                 self.execute_ex_execute(&range, buffer)?;
                 Ok(ExResult::Continue)
             }
-            ExCommand::Suspend => {
-                self.execute_ex_suspend()?;
+            ExCommand::Suspend { force } => {
+                self.execute_ex_suspend(force)?;
                 Ok(ExResult::Continue)
             }
             ExCommand::RepeatSubstitute { range, flags } => {
@@ -2455,7 +2619,11 @@ impl Editor {
                 }
             }
             ExCommand::Nop => Ok(ExResult::Continue),
-            ExCommand::Tag { tag } => {
+            ExCommand::Tag { tag, force } => {
+                // 95408: without `!`, replacing a modified buffer is an error.
+                if !force && self.buffer.is_modified() {
+                    return Err(ViError::FileModified);
+                }
                 self.goto_tag(&tag)?;
                 Ok(ExResult::Continue)
             }
@@ -2464,6 +2632,104 @@ impl Editor {
                 Ok(ExResult::Continue)
             }
         }
+    }
+
+    /// `e[dit][!][+command][file]` (94946-94957).
+    fn edit_file(&mut self, file: Option<&str>, force: bool, command: Option<&str>) -> Result<()> {
+        if !force && self.buffer.is_modified() {
+            return Err(ViError::FileModified);
+        }
+        if let Some(path) = file {
+            self.open(path)?;
+        } else if let Some(path) = self.files.current_file().map(|p| p.to_path_buf()) {
+            self.open(&path.to_string_lossy())?;
+        }
+        self.run_plus_command(command)
+    }
+
+    /// Run a `+command` argument, "immediately after the contents of the edit
+    /// buffer have been replaced and the current line and column have been set"
+    /// (94956-94957).
+    fn run_plus_command(&mut self, command: Option<&str>) -> Result<()> {
+        let Some(command) = command else {
+            return Ok(());
+        };
+        // A `+command` is specified, so the current line starts at the last
+        // line of the buffer (94961-94963) before the command runs.
+        let last = self.buffer.line_count();
+        if last > 0 {
+            self.buffer.set_line(last);
+            self.buffer.move_to_first_non_blank();
+        }
+        self.execute_ex_input(command)
+    }
+
+    /// `vi[sual]`, whose synopsis depends on the current mode.
+    ///
+    /// "If ex is currently in open or visual mode, the Synopsis and behavior of
+    /// the visual command shall be the same as the edit command" (95473-95474);
+    /// otherwise it is `[1addr] vi[sual][type][count][flags]` (95472) and enters
+    /// visual mode with the addressed line placed as `type` directs.
+    fn execute_ex_visual(
+        &mut self,
+        range: crate::ex::AddressRange,
+        force: bool,
+        args: &str,
+    ) -> Result<ExResult> {
+        if !self.ex_standalone_mode {
+            let (command, file) = crate::ex::parser::split_plus_command(args.trim());
+            let file = (!file.is_empty()).then_some(file);
+            self.edit_file(file, force, command.as_deref())?;
+            return Ok(ExResult::Continue);
+        }
+
+        let line = self.resolve_target_line(&range, false)?;
+        let args = args.trim();
+        let vtype = args
+            .chars()
+            .next()
+            .filter(|c| matches!(c, '+' | '-' | '.' | '^'));
+        let rest = match vtype {
+            Some(c) => &args[c.len_utf8()..],
+            None => args,
+        };
+        // "If count is specified, the value of the window edit option shall be
+        // set to count ... before being used by the type character"
+        // (95478-95480).
+        if let Ok(count) = rest.trim().parse::<usize>() {
+            if count >= 1 {
+                self.options.window = count;
+            }
+        }
+
+        let target = line.unwrap_or_else(|| self.buffer.cursor().line).max(1);
+        self.buffer.set_line(target);
+        self.buffer.move_to_first_non_blank();
+
+        // "If type is not specified, it shall be as if a type of '+' was
+        // specified" (95481-95489).
+        let window = self.options.window.max(1);
+        let top = match vtype.unwrap_or('+') {
+            // Beginning of the line at the top of the display.
+            '+' => target,
+            // End of the line at the bottom of the display.
+            '-' => target.saturating_sub(window - 1).max(1),
+            // Beginning of the line in the middle of the display.
+            '.' => target.saturating_sub(window / 2).max(1),
+            // "If the specified line is less than or equal to the value of the
+            // window edit option, set the line to 1; otherwise, decrement the
+            // line by the value of the window edit option minus 1."
+            '^' => {
+                if target <= window {
+                    1
+                } else {
+                    (target - (window - 1)).max(1)
+                }
+            }
+            _ => target,
+        };
+        self.screen.set_top_line(top);
+        Ok(ExResult::EnterVisual)
     }
 
     /// Execute :source command - read and execute ex commands from file.
@@ -2566,9 +2832,21 @@ impl Editor {
     }
 
     /// Execute a shell command (:! or :shell).
+    ///
+    /// "In addition, a warning message shall be written if the edit buffer has
+    /// been modified since the last complete write, and the warn edit option is
+    /// set." (95607-95608) The `warn` option existed but was read nowhere, so
+    /// `:!cmd` on a modified buffer said nothing.
     fn execute_shell_command(&mut self, command: &str) -> Result<()> {
+        let warn = self.options.warn && self.buffer.is_modified();
+
         // Temporarily restore terminal to cooked mode
         self.terminal.disable_raw_mode()?;
+
+        if warn {
+            println!();
+            println!("[No write since last change]");
+        }
 
         let result = if command.is_empty() {
             // :shell - start interactive shell
@@ -2908,7 +3186,17 @@ impl Editor {
     }
 
     /// Execute :suspend or :stop command - suspend the editor.
-    fn execute_ex_suspend(&mut self) -> Result<()> {
+    /// `su[spend][!]`.
+    ///
+    /// "These commands shall be affected by the autowrite and writeany edit
+    /// options" (95405): with `autowrite` set and a modified buffer, write it
+    /// out before suspending unless `!` was given.
+    fn execute_ex_suspend(&mut self, force: bool) -> Result<()> {
+        if !force && self.options.autowrite && self.buffer.is_modified() {
+            let lines = self.write_line_range(&crate::ex::AddressRange::empty())?;
+            self.write(None, lines, false, false)?;
+        }
+
         // Only restore terminal if we're in visual mode (raw mode active)
         if !self.ex_standalone_mode {
             self.terminal.disable_raw_mode()?;
@@ -3538,24 +3826,39 @@ impl Editor {
     }
 
     /// Get file info string.
+    /// The `:f` / `^G` informational message.
+    ///
+    /// 94981-94987 lists what it must contain: the current pathname, or that
+    /// there is none; the current line number and the number of lines in the
+    /// buffer, or that the buffer is empty; the fact that the buffer has been
+    /// modified since the last complete write, if so; and the fact that the
+    /// readonly edit option is set, if so.
     fn file_info(&self) -> String {
-        let name = self
-            .files
-            .current_file()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "[No Name]".to_string());
+        let mut parts = Vec::new();
+        parts.push(match self.files.current_file() {
+            Some(p) => format!("\"{}\"", p.display()),
+            None => "[No file]".to_string(),
+        });
+        if self.options.readonly {
+            parts.push("[Read only]".to_string());
+        }
+        if self.buffer.is_modified() {
+            parts.push("[Modified]".to_string());
+        }
 
-        let modified = if self.buffer.is_modified() { "[+]" } else { "" };
         let lines = self.buffer.line_count();
-        let cursor = self.buffer.cursor();
-
-        format!(
-            "\"{}\" {} {} lines --{}%--",
-            name,
-            modified,
-            lines,
-            (cursor.line * 100).checked_div(lines).unwrap_or(0)
-        )
+        if lines == 0 {
+            parts.push("--No lines in buffer--".to_string());
+        } else {
+            let cursor = self.buffer.cursor();
+            parts.push(format!(
+                "line {} of {} --{}%--",
+                cursor.line,
+                lines,
+                cursor.line * 100 / lines
+            ));
+        }
+        parts.join(" ")
     }
 
     /// Set a message.

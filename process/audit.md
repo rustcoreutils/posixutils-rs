@@ -284,9 +284,25 @@ assertion.
 > POSIX format directly and that the reported PID set contains the test
 > process (which owns the socket), via `parse_posix_pid_list` in
 > `process/tests/fuser/mod.rs`.
-- [ ] `-c` mount-point; `-f` block-device; multiple operands
+- [x] `-c` mount-point; `-f` block-device; multiple operands — `tests/fuser/modes.rs`
+  (2026-08-08). These are the two arms of the `use_device_mode` decision in
+  `handle_file_namespace`, and the multiple-operand case turned up a **real
+  bug**: the device and inode lists were created once, *outside* the operand
+  loop, and that function assigns only one of them depending on the operand's
+  type, so the previous operand's device stayed live for the next one — and
+  `need_check_map`, only ever set to true, latched the `/proc/<pid>/maps` scan
+  on for every operand after the first to use it. `fuser <block-device> <quiet
+  file>` reported the whole file system's users against the quiet file. All
+  three are now locals scoped to the loop body, so they cannot be shared by
+  construction. The test uses a bare block device rather than `-c`, since `-c`
+  applies to *every* operand and both reporting is then correct.
 - [x] PID format (`" %1d"`) assertion (proves `#F1`) — `test_fuser_pid_format_single_space`, plus the TCP/UDP tests since 2026-08-02.
-- [ ] `r` (root-dir) use-char; high-minor device file (proves `#F2`)
+- [x] `r` (root-dir) use-char; high-minor device file (proves `#F2`) —
+  `tests/fuser/modes.rs` (2026-08-08). Both live behind device mode: `check_map`
+  runs only when `need_check_map` is set, which only `-c` or a bare block device
+  does, so these are the same test as the `-c` one. The high-minor case finds a
+  mounted file system whose minor number exceeds 255 from `/proc/self/mountinfo`
+  and skips when the system has none.
 
 ---
 

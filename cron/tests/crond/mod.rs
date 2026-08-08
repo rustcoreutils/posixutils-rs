@@ -47,6 +47,45 @@ fn daemon_can_start() -> bool {
         .is_ok()
 }
 
+/// The pid `crond` recorded in its PID file, if the file holds one.
+///
+/// This is the authoritative daemon pid. Matching on the process table instead
+/// also catches the short-lived workers `run_job`/`run_at_job` fork: those never
+/// exec, so they keep the daemon's command name for as long as their job runs.
+fn daemon_pid() -> Option<i32> {
+    std::fs::read_to_string(cron::PID_FILE)
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Whether `pid` still exists. Signal 0 performs the permission and existence
+/// checks without delivering anything.
+fn is_alive(pid: i32) -> bool {
+    // SAFETY: kill() with signal 0 has no effect beyond returning an error for
+    // a pid that does not exist.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Poll until the PID file names a live daemon that is not `previous`, so a
+/// stale pid left by an earlier test cannot be mistaken for the one just
+/// started.
+fn wait_for_daemon_pid(previous: Option<i32>) -> Option<i32> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(pid) = daemon_pid() {
+            if Some(pid) != previous && is_alive(pid) {
+                return Some(pid);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 /// Poll until `crond` processes appear (`want`) or disappear, or time out.
 fn wait_for_daemon(bin: &str, want: bool) -> Vec<i32> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -226,6 +265,30 @@ fn test_month() {
 /// — including a second instance in the middle of exiting with "already
 /// running" — and shared all of that with a concurrently-running `no_args` that
 /// leaked its own daemon.
+/// `is_alive` must distinguish a running process from a reaped one.
+///
+/// The daemon-survival assertion rests entirely on this, and on Linux the
+/// assertion itself never executes (crond cannot create its PID file under a
+/// root-owned `/run`), so without this the new liveness check would be
+/// completely untested outside macOS CI.
+#[test]
+fn is_alive_distinguishes_live_and_dead_pids() {
+    assert!(
+        is_alive(std::process::id() as i32),
+        "this process must report as alive"
+    );
+
+    let mut child = std::process::Command::new("true")
+        .spawn()
+        .expect("spawn /bin/true");
+    let pid = child.id() as i32;
+    child.wait().expect("reap child");
+    assert!(
+        !is_alive(pid),
+        "a reaped child must not report as alive (pid {pid})"
+    );
+}
+
 #[test]
 fn test_signal() {
     let _guard = crond_guard();
@@ -238,15 +301,14 @@ fn test_signal() {
     // PID-file lock, so the one started below would exit as a second instance.
     let _ = pid::kill(&bin);
     wait_for_daemon(&bin, false);
+    let stale = daemon_pid();
 
     let output = run_crond_test("crond", &[], b"");
     assert_eq!(output.status.code(), Some(0));
 
-    // The parent exits as soon as it has forked, so the daemon is not
-    // necessarily in the process table yet.
-    let pids = wait_for_daemon(&bin, true);
-
-    if pids.is_empty() {
+    // The parent exits as soon as it has forked, so the daemon has not
+    // necessarily recorded its pid yet.
+    let Some(pid) = wait_for_daemon_pid(stale) else {
         // No daemon: the only supported reason is that it could not create and
         // lock its PID file. Assert that rather than returning quietly, so this
         // path cannot mask a daemon that failed to start for some other reason.
@@ -256,27 +318,32 @@ fn test_signal() {
             cron::PID_FILE
         );
         return;
+    };
+
+    // Signal the daemon, and *only* the daemon. Signalling every process whose
+    // `ps` command matches the crond binary also hits the workers `run_job` and
+    // `run_at_job` fork for each due job: those never exec, so they carry the
+    // daemon's command name until their job finishes and then exit on their own.
+    // Requiring those to survive is what failed on macOS, where the daemon
+    // really runs — on Linux `/run` is root-owned, crond never starts, and this
+    // assertion has never once executed.
+    //
+    // SAFETY: `pid` was alive moments ago; signalling a pid that has since
+    // exited merely fails with ESRCH.
+    unsafe {
+        libc::kill(pid, libc::SIGHUP);
     }
 
-    for pid in &pids {
-        // SAFETY: `pid` came from the process table moments ago; sending a
-        // signal to a pid that has since exited merely fails with ESRCH.
-        unsafe {
-            libc::kill(*pid, libc::SIGHUP);
-        }
-    }
-
-    // Give the daemon time to act on the signal — or to die from it.
+    // Give the daemon time to act on the signal — or to die from it. SIGHUP
+    // interrupts its `nanosleep`, so the reload happens promptly rather than at
+    // the next minute boundary.
     std::thread::sleep(std::time::Duration::from_millis(500));
 
-    let survivors = pid::get_pids(&bin).unwrap_or_default();
-    for pid in &pids {
-        assert!(
-            survivors.contains(pid),
-            "crond {pid} exited on SIGHUP; SIGHUP must reload the crontabs, not \
-             terminate the daemon"
-        );
-    }
+    assert!(
+        is_alive(pid),
+        "crond {pid} exited on SIGHUP; SIGHUP must reload the crontabs, not \
+         terminate the daemon"
+    );
 
     let _ = pid::kill(&bin);
 }

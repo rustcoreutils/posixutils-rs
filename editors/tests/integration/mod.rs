@@ -732,7 +732,7 @@ fn test_ex_write_quit() {
 #[test]
 fn test_ex_edit() {
     let cmd = ex::parse_ex_command("e test.txt").unwrap();
-    if let ExCommand::Edit { file, force } = cmd {
+    if let ExCommand::Edit { file, force, .. } = cmd {
         assert_eq!(file, Some("test.txt".to_string()));
         assert!(!force);
     }
@@ -1366,7 +1366,7 @@ fn test_ex_read_file() {
 #[test]
 fn test_ex_next_prev() {
     let cmd = ex::parse_ex_command("n").unwrap();
-    assert!(matches!(cmd, ExCommand::Next { force: false }));
+    assert!(matches!(cmd, ExCommand::Next { force: false, .. }));
 
     let cmd = ex::parse_ex_command("prev").unwrap();
     assert!(matches!(cmd, ExCommand::Previous { force: false }));
@@ -1785,7 +1785,7 @@ fn test_ex_append_parsing() {
     // Address::Line(n) and fell back to line 1 for every other form (#X25).
     let result = parse_ex_command("5a");
     assert!(result.is_ok());
-    if let Ok(ExCommand::Append { range }) = result {
+    if let Ok(ExCommand::Append { range, .. }) = result {
         assert_eq!(range.start, Some(vi_rs::ex::address::Address::Line(5)));
     } else {
         panic!("Expected Append command addressing line 5");

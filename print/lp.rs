@@ -287,21 +287,43 @@ fn recipient_is_safe(recipient: &str) -> bool {
             .all(|c| !c.is_control() && !c.is_whitespace() && c != '<' && c != '>')
 }
 
-/// Best-effort delivery of a completion mail via the local sendmail program.
-fn send_mail(recipient: &str, subject: &str, body: &str) -> bool {
-    if !recipient_is_safe(recipient) {
-        return false;
+/// The local mail transport program.
+///
+/// The implementation-defined locations are the historical sendmail paths.
+/// `LP_SENDMAIL` overrides them, honored only when the process carries no
+/// elevated privilege — real and effective uid *and gid* all equal — so an `lp`
+/// installed set-uid or set-gid cannot be tricked into executing an
+/// attacker-chosen program. The group half is the one that matters here: print
+/// spoolers are conventionally installed set-gid `lp`/`daemon`, and a uid-only
+/// check would hand that group to whatever `LP_SENDMAIL` names.
+///
+/// This is also what makes `-m` testable at all: without it the only way to
+/// observe a completion mail is to have a real MTA installed.
+fn sendmail_program() -> Option<String> {
+    if plib::curuser::real_and_effective_ids_match() {
+        if let Ok(path) = std::env::var("LP_SENDMAIL") {
+            if !path.is_empty() {
+                return Some(path);
+            }
+        }
     }
-    let sendmail = [
+    [
         "/usr/sbin/sendmail",
         "/usr/lib/sendmail",
         "/usr/bin/sendmail",
     ]
     .into_iter()
-    .find(|p| Path::new(p).exists());
-    let sendmail = match sendmail {
-        Some(p) => p,
-        None => return false,
+    .find(|p| Path::new(p).exists())
+    .map(str::to_string)
+}
+
+/// Best-effort delivery of a completion mail via the local sendmail program.
+fn send_mail(recipient: &str, subject: &str, body: &str) -> bool {
+    if !recipient_is_safe(recipient) {
+        return false;
+    }
+    let Some(sendmail) = sendmail_program() else {
+        return false;
     };
     let mut child = match Command::new(sendmail)
         .args(["-t", "-oi"])

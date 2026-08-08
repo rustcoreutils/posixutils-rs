@@ -106,7 +106,7 @@ fn main() {
 
     let mut exit_code = 0;
     // Messages accumulated per output domain. The default domain is "messages".
-    let mut domains: HashMap<String, HashMap<String, String>> = HashMap::new();
+    let mut domains: HashMap<String, HashMap<Vec<u8>, Vec<u8>>> = HashMap::new();
     // Domains in first-seen order, for stable output.
     let mut domain_order: Vec<String> = Vec::new();
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
@@ -185,13 +185,13 @@ fn main() {
             // Add to messages
             if entry.is_plural() {
                 // Plural message: key is "msgid\0msgid_plural"
-                let key = format!(
-                    "{}\0{}",
-                    entry.msgid,
-                    entry.msgid_plural.as_ref().unwrap_or(&String::new())
-                );
+                let mut key = entry.msgid.clone();
+                key.push(0);
+                if let Some(plural) = entry.msgid_plural.as_ref() {
+                    key.extend_from_slice(plural);
+                }
                 // Value is null-separated plural forms
-                let value = entry.msgstr.join("\0");
+                let value = entry.msgstr.join(&0u8);
                 messages.insert(key, value);
             } else if !entry.msgstr.is_empty() {
                 messages.insert(entry.msgid.clone(), entry.msgstr[0].clone());
@@ -221,7 +221,7 @@ fn main() {
         if let Some(ref output) = args.output {
             // -o: all `domain` directives are ignored; everything is written to
             // the single named output file.
-            let mut merged: HashMap<String, String> = HashMap::new();
+            let mut merged: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
             for domain in &domain_order {
                 if let Some(messages) = domains.get(domain) {
                     for (k, v) in messages {
@@ -312,8 +312,9 @@ fn is_c_format(flags: &[String]) -> bool {
 
 /// True if exactly one of `a`/`b` starts with a newline, or exactly one ends
 /// with a newline (the abnormality the spec describes).
-fn boundary_newline_mismatch(a: &str, b: &str) -> bool {
-    (a.starts_with('\n') != b.starts_with('\n')) || (a.ends_with('\n') != b.ends_with('\n'))
+fn boundary_newline_mismatch(a: &[u8], b: &[u8]) -> bool {
+    (a.first() == Some(&b'\n')) != (b.first() == Some(&b'\n'))
+        || (a.last() == Some(&b'\n')) != (b.last() == Some(&b'\n'))
 }
 
 /// Validate a PO entry, recording genuine abnormalities as errors (affecting the
@@ -364,8 +365,10 @@ fn validate_entry(
 
         // Abnormality: c-format conversion specifiers differ in number or type.
         if c_format {
-            let src_specs = format_signatures(source);
-            let dst_specs = format_signatures(msgstr);
+            // Conversion specifications are ASCII, so the check reads the
+            // message as text; the bytes themselves are untouched.
+            let src_specs = format_signatures(&String::from_utf8_lossy(source));
+            let dst_specs = format_signatures(&String::from_utf8_lossy(msgstr));
             if src_specs != dst_specs {
                 diagnostics.push(Diagnostic {
                     file: file.clone(),
@@ -466,9 +469,12 @@ fn print_statistics(translated: usize, fuzzy: usize, untranslated: usize) {
 }
 
 /// Truncate a string for display, respecting character boundaries.
-fn truncate(s: &str, max_len: usize) -> String {
+fn truncate(s: &[u8], max_len: usize) -> String {
+    // A diagnostic is text, so the message bytes are decoded lossily here even
+    // though they are carried through to the `.mo` verbatim.
+    let s = String::from_utf8_lossy(s);
     if s.chars().count() <= max_len {
-        s.to_string()
+        s.into_owned()
     } else {
         let truncated: String = s.chars().take(max_len).collect();
         format!("{}...", truncated)
@@ -478,12 +484,12 @@ fn truncate(s: &str, max_len: usize) -> String {
 /// Write the .mo file
 fn write_mo_file(
     path: &PathBuf,
-    messages: &HashMap<String, String>,
+    messages: &HashMap<Vec<u8>, Vec<u8>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Sort messages (empty string first, then lexicographically)
-    let mut entries: Vec<(&str, &str)> = messages
+    let mut entries: Vec<(&[u8], &[u8])> = messages
         .iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .map(|(k, v)| (k.as_slice(), v.as_slice()))
         .collect();
     entries.sort_by(|a, b| a.0.cmp(b.0));
 
@@ -505,14 +511,14 @@ fn write_mo_file(
         let orig_offset = strings_offset + string_data.len() as u32;
         let orig_len = msgid.len() as u32;
         orig_descriptors.push((orig_len, orig_offset));
-        string_data.extend_from_slice(msgid.as_bytes());
+        string_data.extend_from_slice(msgid);
         string_data.push(0); // null terminator
 
         // Translation string
         let trans_offset = strings_offset + string_data.len() as u32;
         let trans_len = msgstr.len() as u32;
         trans_descriptors.push((trans_len, trans_offset));
-        string_data.extend_from_slice(msgstr.as_bytes());
+        string_data.extend_from_slice(msgstr);
         string_data.push(0); // null terminator
     }
 

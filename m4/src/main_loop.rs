@@ -36,6 +36,7 @@ pub(crate) fn process(mut state: State, stderr: &mut dyn Write) -> crate::error:
         {
             log::trace!("Stripping quotes");
             let mut quotation_level: usize = 1;
+            state.input.enter_literal_scan();
 
             'inside_quote: loop {
                 l = state.input.get_next_character()?;
@@ -71,11 +72,13 @@ pub(crate) fn process(mut state: State, stderr: &mut dyn Write) -> crate::error:
                     break 'inside_quote;
                 }
             }
+            state.input.leave_literal_scan();
         } else if state.output.stack.is_empty() // Parse comments
             && state.parse_config.comment_enabled && state
                 .input
                 .look_ahead(t, &state.parse_config.comment_open_tag)?
         {
+            state.input.enter_literal_scan();
             state
                 .output
                 .write_all(&state.parse_config.comment_open_tag)?;
@@ -96,6 +99,7 @@ pub(crate) fn process(mut state: State, stderr: &mut dyn Write) -> crate::error:
                 }
                 state.output.write_all(&[t])?;
             }
+            state.input.leave_literal_scan();
         } else if t == b'_' || is_alpha(t) {
             // Possibly a macro to be evaluated.
             let definition = state.parse_macro(t, &mut token)?;
@@ -134,13 +138,9 @@ pub(crate) fn process(mut state: State, stderr: &mut dyn Write) -> crate::error:
                 }
                 break 'main_loop;
             }
+            // Returning to the enclosing file re-arms the `-s` file name; the
+            // directive itself is written lazily, before the next output byte.
             state.input.input_pop();
-            log::debug!("EOF synclines");
-            if state.input.sync_lines() {
-                state
-                    .input
-                    .emit_syncline(&mut *state.output.output.stdout().borrow_mut(), false)?;
-            }
             continue 'main_loop;
         } else if state.output.stack.is_empty() {
             // not in a macro
@@ -203,6 +203,7 @@ pub(crate) fn process(mut state: State, stderr: &mut dyn Write) -> crate::error:
                         .input
                         .look_ahead(t, &state.parse_config.comment_open_tag)?
                     {
+                        state.input.enter_literal_scan();
                         state
                             .output
                             .write_all(&state.parse_config.comment_open_tag)?;
@@ -223,6 +224,7 @@ pub(crate) fn process(mut state: State, stderr: &mut dyn Write) -> crate::error:
                             }
                             state.output.write_all(&[t])?;
                         }
+                        state.input.leave_literal_scan();
                     } else {
                         state.output.write_all(&[t])?;
                     }

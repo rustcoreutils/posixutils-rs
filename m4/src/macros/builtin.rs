@@ -342,10 +342,9 @@ impl IncludeMacro {
         let file = std::fs::File::open(&path)
             .map_err(crate::Error::from)
             .add_context(|| format!("Error opening file {path:?}"))?;
-        state.input.input_push(
-            Input::new(InputRead::File { file, path }),
-            &mut *state.output.output.stdout().borrow_mut(),
-        )?;
+        state
+            .input
+            .input_push(Input::new(InputRead::File { file, path }));
         Ok(state)
     }
 }
@@ -365,11 +364,9 @@ impl MacroImplementation for IncludeMacro {
             // aborting.
             match std::fs::File::open(&path) {
                 Ok(file) => {
-                    let syncline_output = state.output.output.stdout();
-                    state.input.input_push(
-                        Input::new(InputRead::File { file, path }),
-                        &mut *syncline_output.borrow_mut(),
-                    )?;
+                    state
+                        .input
+                        .input_push(Input::new(InputRead::File { file, path }));
                 }
                 Err(error) => {
                     let msg = gettext("cannot open `{}': {}")
@@ -1116,7 +1113,7 @@ impl MacroImplementation for SyscmdMacro {
     fn evaluate(
         &self,
         mut state: State,
-        _stderr: &mut dyn Write,
+        stderr: &mut dyn Write,
         frame: StackFrame,
     ) -> Result<State> {
         let first_arg = frame
@@ -1124,6 +1121,12 @@ impl MacroImplementation for SyscmdMacro {
             .into_iter()
             .next()
             .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
+        // The child inherits our file descriptors and writes straight to fd 1,
+        // while our own output is still sitting in a buffered writer. Flush
+        // first so the child's output appears after the text we already
+        // produced rather than jumping ahead of it.
+        state.output.output.stdout().borrow_mut().flush()?;
+        stderr.flush()?;
         let status = system(&first_arg)?;
         state.last_syscmd_status = Some(status);
         Ok(state)

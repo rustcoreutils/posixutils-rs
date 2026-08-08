@@ -1,0 +1,3 @@
+stdout=#line 4 "fixtures/integration_tests/args/synclines_undivert_empty.m4"\nbefore\n#line 2 "fixtures/integration_tests/args/synclines_undivert_empty.m4"\ninside\n#line 7 "fixtures/integration_tests/args/synclines_undivert_empty.m4"\nafter\ntail\n
+stderr=
+status=0

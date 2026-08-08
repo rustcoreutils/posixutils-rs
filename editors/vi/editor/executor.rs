@@ -255,32 +255,81 @@ impl Editor {
     }
 
     /// Execute :z command - adjust window display.
+    ///
+    /// `z[!][type ...][count][flags]` (95550-95595). `repeats` is how many times
+    /// the type character was given: POSIX defines the displacement in terms of
+    /// that number, so `z--` and `z++` move further than `z-` and `z+`.
     pub(super) fn execute_ex_z(
         &mut self,
         line: Option<usize>,
         ztype: Option<char>,
+        repeats: usize,
         count: Option<usize>,
+        full_screen: bool,
     ) -> Result<Vec<String>> {
-        let scroll = self.options.scroll;
-        let count = count.unwrap_or(2 * scroll);
-        let mut target_line = line.unwrap_or_else(|| self.buffer.cursor().line);
-
-        // If no type and no line, advance to next line
-        if line.is_none() && ztype.is_none() {
-            target_line = (target_line + 1).min(self.buffer.line_count());
+        // "If count is specified, the value of the window edit option shall be
+        // set to count. If count is omitted, it shall default to 2 times the
+        // value of the scroll edit option, or if ! was specified, the number of
+        // lines in the display minus 1." (95556-95558)
+        let count = match count {
+            Some(n) => {
+                self.options.window = n;
+                n
+            }
+            None if full_screen => (self.terminal.size().rows as usize)
+                .saturating_sub(1)
+                .max(1),
+            None => 2 * self.options.scroll,
+        };
+        // "If count is zero, nothing shall be written" (95574). Every type's
+        // displacement formula also degenerates at zero -- `repeats * count - 1`
+        // and `(repeats + 1) * count - 1` would underflow `usize`, aborting the
+        // editor in a build with overflow checks and wrapping into a spurious
+        // out-of-buffer error without them. Reachable as a literal `z-0`, and
+        // via `2 * scroll` when `scroll` is set to 0.
+        if count == 0 {
+            return Ok(Vec::new());
         }
 
-        // Adjust target based on type
-        let start_line = match ztype {
-            Some('+') => target_line,
-            Some('-') => target_line.saturating_sub(count - 1).max(1),
-            Some('.') | Some('=') => {
-                // Center on this line
-                let half = count / 2;
-                target_line.saturating_sub(half).max(1)
+        let last = self.buffer.line_count();
+        let mut target_line = line.unwrap_or_else(|| self.buffer.cursor().line);
+
+        // "If no line is specified, the current line shall be the default; if
+        // type is omitted as well, the current line value shall first be
+        // incremented by 1. If incrementing the current line would cause it to
+        // be greater than the last line ... it shall be an error."
+        if line.is_none() && ztype.is_none() {
+            if target_line >= last {
+                return Err(ViError::InvalidAddress("z: at end of buffer".to_string()));
             }
-            Some('^') => target_line.saturating_sub(2 * count - 1).max(1),
-            None => target_line,
+            target_line += 1;
+        }
+
+        // Displacements are defined per type in terms of the number of type
+        // characters given; going off either end of the buffer is an error
+        // rather than a clamp.
+        let repeats = repeats.max(1);
+        let start_line = match ztype {
+            // "(((number of '+' characters) -1) x count) +1", and lines are
+            // written "starting at the new value of line" -- including for a
+            // single `+`, whose displacement is 1. Returning `target_line` here
+            // re-displayed the line the user was already on.
+            Some('+') => {
+                let advance = (repeats - 1).saturating_mul(count) + 1;
+                let start = target_line + advance;
+                if start > last {
+                    return Err(ViError::InvalidAddress("z: past end of buffer".to_string()));
+                }
+                start
+            }
+            // "(((number of '-' characters) x count) -1)"
+            Some('-') => decrement_or_err(target_line, repeats.saturating_mul(count) - 1)?,
+            Some('.') | Some('=') => {
+                // Centred: half a screen either side.
+                target_line.saturating_sub(count / 2).max(1)
+            }
+            // "(((number of 'ˆ' characters) +1) x count) -1"
+            Some('^') => decrement_or_err(target_line, (repeats + 1).saturating_mul(count) - 1)?,
             _ => target_line,
         };
 
@@ -578,4 +627,12 @@ impl Editor {
 
         Ok(())
     }
+}
+
+/// Decrement `line` by `delta`, or fail as POSIX requires when the result
+/// would be less than 1 (95564, 95590).
+fn decrement_or_err(line: usize, delta: usize) -> Result<usize> {
+    line.checked_sub(delta)
+        .filter(|n| *n >= 1)
+        .ok_or_else(|| ViError::InvalidAddress("z: before start of buffer".to_string()))
 }

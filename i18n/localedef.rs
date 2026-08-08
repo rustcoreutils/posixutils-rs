@@ -19,8 +19,7 @@ use posixutils_i18n::locale_lib::types::{
     LC_MESSAGES_KEYWORDS, LC_MONETARY_KEYWORDS, LC_NUMERIC_KEYWORDS, LC_TIME_KEYWORDS,
 };
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::exit;
 
@@ -255,24 +254,31 @@ fn main() {
     exit(exit_code);
 }
 
+/// Read a locale source, which is not required to be UTF-8.
+///
+/// POSIX has `LC_CTYPE` decide how a source file's bytes are interpreted, so
+/// `read_to_string` rejected a perfectly valid source in any other codeset
+/// before a single line had been looked at. The grammar this parser recognises
+/// — keywords, `<symbolic-names>`, and the `escape_char`/`comment_char`
+/// directives — is ASCII, so the bytes are read first and decoded for parsing.
+/// Non-ASCII character *data* is currently only validated against the charmap,
+/// never emitted, because compiling a real locale is the deferred LD-1; when
+/// that lands the data will need to be carried as bytes rather than decoded here.
+fn read_source(path: &Path) -> Result<String, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {}", path.display(), e))?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 /// Read input from file or stdin
 fn read_input(input_path: &Option<PathBuf>) -> Result<String, String> {
     match input_path {
-        Some(path) => {
-            let file = File::open(path).map_err(|e| format!("{}: {}", path.display(), e))?;
-            let mut reader = BufReader::new(file);
-            let mut content = String::new();
-            reader
-                .read_to_string(&mut content)
-                .map_err(|e| format!("{}: {}", path.display(), e))?;
-            Ok(content)
-        }
+        Some(path) => read_source(path),
         None => {
-            let mut content = String::new();
+            let mut content = Vec::new();
             std::io::stdin()
-                .read_to_string(&mut content)
+                .read_to_end(&mut content)
                 .map_err(|e| format!("stdin: {}", e))?;
-            Ok(content)
+            Ok(String::from_utf8_lossy(&content).into_owned())
         }
     }
 }
@@ -366,7 +372,7 @@ fn parse_source(
                 continue;
             }
             let path = base_dir.join(name);
-            match std::fs::read_to_string(&path) {
+            match read_source(&path) {
                 Ok(included) => {
                     let inc_dir = path
                         .parent()
@@ -465,8 +471,7 @@ fn parse_category_line(
 /// Parse the symbolic names defined in a charmap file (LD-2). Returns an error
 /// if the file cannot be read.
 fn parse_charmap_symbols(path: &Path) -> Result<HashSet<String>, String> {
-    let content =
-        std::fs::read_to_string(path).map_err(|e| format!("{}: {}", path.display(), e))?;
+    let content = read_source(path)?;
     let mut symbols = HashSet::new();
     let mut in_charmap = false;
     for line in content.lines() {

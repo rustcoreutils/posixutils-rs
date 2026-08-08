@@ -1524,3 +1524,73 @@ fn test_ctrl_d_in_column_one_is_discarded() {
 
     assert_eq!(editor.get_buffer_text().trim_end(), "X");
 }
+
+// ============================================================================
+// `:file` informational message (ex.md §94981-94987)
+// ============================================================================
+
+/// The message must carry the current pathname (or say there is none), the
+/// current line and the line count (or say the buffer is empty), and the fact
+/// that the buffer has been modified. It used to report only the name, a `[+]`
+/// marker and a percentage, with no current line number at all.
+#[test]
+fn test_file_info_reports_position_and_state() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("one\ntwo\nthree\n");
+    editor.execute_keys(":2\n:f\n").unwrap();
+
+    let msg = editor.get_message().unwrap_or_default().to_string();
+    assert!(
+        msg.contains("line 2 of 3"),
+        "expected the current line and line count in {msg:?}"
+    );
+    assert!(
+        !msg.contains("[Modified]"),
+        "a buffer that was only navigated is not modified: {msg:?}"
+    );
+    assert!(
+        msg.contains("[No file]"),
+        "with no pathname the message must say so: {msg:?}"
+    );
+}
+
+#[test]
+fn test_file_info_reports_modification() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("one\n");
+    editor.execute_keys("ix\x1b:f\n").unwrap();
+
+    let msg = editor.get_message().unwrap_or_default().to_string();
+    assert!(msg.contains("[Modified]"), "expected [Modified] in {msg:?}");
+}
+
+// ============================================================================
+// `:vi[sual]` as `edit` (ex.md §95473-95474)
+// ============================================================================
+
+/// "If ex is currently in open or visual mode, the Synopsis and behavior of the
+/// visual command shall be the same as the edit command", which includes its
+/// `[+command][file]` arguments. `:vi` used to parse to a bare `Visual` with the
+/// arguments thrown away.
+#[test]
+fn test_visual_command_in_visual_mode_edits_a_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v.txt");
+    std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+
+    let mut editor = Editor::new_headless();
+    editor
+        .execute_keys(&format!(":vi +2 {}\n", path.display()))
+        .unwrap();
+
+    assert!(
+        editor.get_buffer_text().contains("three"),
+        "expected the file to have been loaded: {:?}",
+        editor.get_buffer_text()
+    );
+    assert_eq!(
+        editor.get_cursor().line,
+        2,
+        "expected the +command to have moved to line 2"
+    );
+}

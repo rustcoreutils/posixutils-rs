@@ -341,7 +341,15 @@ manual testing (terminfo-dependent).
 Not covered:
 - [x] `tput clear` emits the terminal's `clear` sequence — `test_tput_clear_xterm`.
 - [x] Multi-operand continue / valid-before-invalid behavior (#T3) — `test_tput_valid_then_invalid_operand`, `test_tput_multiple_valid_operands`.
-- [ ] `init`/`reset` file-capability (`if`/`rf`/`iprog`) handling (#T1) — exercised manually (few terminfo entries carry these caps; no portable fixture).
+- [x] `init`/`reset` file-capability (`if`/`rf`/`iprog`) handling (#T1) — closed
+  2026-08-08. There *is* a portable fixture: a compiled terminfo entry written
+  straight into a tempdir in the legacy binary format and selected with
+  `TERMINFO`, which needs neither `tic` nor a terminal that happens to carry
+  these capabilities. Four tests: `if` emits the file's *contents* (not its
+  name) in the POSIX order is1, is2, if, is3, and `iprog` actually runs the
+  program it names; `rf` likewise for rs1, rs2, rf, rs3; a terminal with no
+  reset strings falls back to its init sequence; and an *unreadable* `rf` does
+  not count as "reset emitted", so the fallback still fires.
 
 ---
 

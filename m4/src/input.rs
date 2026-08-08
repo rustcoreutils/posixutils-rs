@@ -16,10 +16,26 @@ use std::{
 
 use crate::EOF;
 
+/// Sentinel for [`InputState::output_current_line`] meaning "the input file
+/// changed": the next directive emitted must carry the file name.
+const SYNCLINE_FILE_CHANGED: i64 = -1;
+
 #[derive(Default)]
 pub struct InputState {
     pub line_synchronization: bool,
     pub input: Vec<Input>,
+    /// The input line the emitted output is notionally sitting on, for `-s`.
+    /// Negative means the input file changed and the next directive must name
+    /// it. See [`InputState::write_synced`].
+    output_current_line: i64,
+    /// Whether the next byte written starts a new output line.
+    start_of_output_line: bool,
+    /// Nesting depth of comment / quoted-string scanning. See
+    /// [`InputState::enter_literal_scan`].
+    literal_scan_depth: usize,
+    /// Whether the current literal has already had a directive decision made
+    /// for it; further output lines inside it are not eligible.
+    literal_line_start_checked: bool,
 }
 
 impl InputState {
@@ -27,25 +43,117 @@ impl InputState {
         Self {
             line_synchronization,
             input: Vec::new(),
+            output_current_line: SYNCLINE_FILE_CHANGED,
+            start_of_output_line: true,
+            literal_scan_depth: 0,
+            literal_line_start_checked: false,
         }
     }
 
-    pub fn input_push(
-        &mut self,
-        mut input: Input,
-        syncline_output: &mut dyn Write,
-    ) -> std::io::Result<()> {
-        if self.line_synchronization {
-            input.emit_syncline(syncline_output, false)?;
+    /// Enter a comment or quoted string. A literal is treated as one unit for
+    /// `-s`: at most one `#line` directive is written for it, ahead of its first
+    /// output line. Later output lines inside the same literal still advance the
+    /// counter but never get a directive of their own.
+    ///
+    /// POSIX ties `-s` to the c17 preprocessor phase, where a directive landing
+    /// in the middle of a C comment or string literal would corrupt the
+    /// translation unit — so a literal is never split, however far the output
+    /// has drifted from the input. The drift is corrected by the first directive
+    /// after the literal ends. GNU m4, which scans a whole comment or string
+    /// into a single token before shipping it, arrives at the same rule.
+    pub fn enter_literal_scan(&mut self) {
+        if self.literal_scan_depth == 0 {
+            // A literal that begins part-way through an output line gets no
+            // directive at all: the decision for the line it started on was
+            // already made, for the text in front of it.
+            self.literal_line_start_checked = !self.start_of_output_line;
         }
+        self.literal_scan_depth += 1;
+    }
 
+    pub fn leave_literal_scan(&mut self) {
+        self.literal_scan_depth = self.literal_scan_depth.saturating_sub(1);
+    }
+
+    pub fn input_push(&mut self, input: Input) {
+        // Entering a new file does not emit anything by itself: the directive is
+        // written lazily, before the first byte of the next output line, and
+        // this makes it carry the new file name when it is.
+        self.output_current_line = SYNCLINE_FILE_CHANGED;
         self.input.push(input);
-
-        Ok(())
     }
 
     pub fn input_pop(&mut self) -> Option<Input> {
-        self.input.pop()
+        let popped = self.input.pop();
+        // Returning to the enclosing file is a file change too.
+        self.output_current_line = SYNCLINE_FILE_CHANGED;
+        popped
+    }
+
+    /// Forget where the output is, so the next `-s` directive is written in the
+    /// long `#line N "FILE"` form. Called whenever the output stream changes
+    /// underfoot — a `divert` to a different buffer, or an `undivert` splicing
+    /// text captured at unrelated input lines — since the position tracked for
+    /// one stream says nothing about the next.
+    pub fn invalidate_syncline_position(&mut self) {
+        self.output_current_line = SYNCLINE_FILE_CHANGED;
+    }
+
+    /// Account for bytes written straight to the output, bypassing
+    /// [`InputState::write_synced`] (see `Output::write_raw`). `mid_line` says
+    /// whether those bytes left the output part-way through a line.
+    pub fn resume_after_raw_output(&mut self, mid_line: bool) {
+        self.invalidate_syncline_position();
+        self.start_of_output_line = !mid_line;
+    }
+
+    /// Write `buf` to `output`, preceding each output line with a `#line`
+    /// directive when line synchronization (`-s`) is on and the output has
+    /// drifted from the input line the text came from.
+    ///
+    /// Directives are emitted lazily — immediately before the first byte of an
+    /// output line, never after a newline — so a directive is only ever written
+    /// when a byte actually follows it, and it describes the source of that
+    /// byte. The file name is included only when the input file changed;
+    /// otherwise the short `#line N` form is used.
+    pub fn write_synced(&mut self, output: &mut dyn Write, buf: &[u8]) -> std::io::Result<usize> {
+        if !self.line_synchronization {
+            return output.write(buf);
+        }
+
+        let line = self.current_line_number() as i64;
+        let mut n = 0;
+        for c in buf {
+            if self.start_of_output_line {
+                self.start_of_output_line = false;
+                self.output_current_line += 1;
+                let eligible = if self.literal_scan_depth > 0 {
+                    !std::mem::replace(&mut self.literal_line_start_checked, true)
+                } else {
+                    true
+                };
+                if self.output_current_line != line && eligible {
+                    let file_changed = self.output_current_line < 1;
+                    write!(output, "#line {line}")?;
+                    if file_changed {
+                        // Only now is the path worth building.
+                        let (name, _) = self.current_location();
+                        if !name.is_empty() {
+                            output.write_all(b" \"")?;
+                            output.write_all(&name)?;
+                            output.write_all(b"\"")?;
+                        }
+                    }
+                    output.write_all(b"\n")?;
+                    self.output_current_line = line;
+                }
+            }
+            n += output.write(std::slice::from_ref(c))?;
+            if *c == b'\n' {
+                self.start_of_output_line = true;
+            }
+        }
+        Ok(n)
     }
 
     /// Get the next character to be parsed. First it tries to get one from the pushback buffer,
@@ -101,15 +209,15 @@ impl InputState {
         Ok(true)
     }
 
-    fn emit_syncline(
-        &mut self,
-        output: &mut dyn Write,
-        check_line_numbers: bool,
-    ) -> std::io::Result<()> {
-        self.input
-            .last_mut()
-            .expect("at least one input")
-            .emit_syncline(output, check_line_numbers)
+    /// The current line number of the active input, without the allocation
+    /// [`InputState::current_location`] makes for the name.
+    ///
+    /// `write_synced` consults this for every byte it writes, and the main loop
+    /// writes plain text a byte at a time, so building a `Vec<u8>` of the path
+    /// there cost an allocation per output byte under `-s`. The name is only
+    /// needed on the rare path that actually emits a directive.
+    pub fn current_line_number(&self) -> usize {
+        self.input.last().map(|i| i.line_number).unwrap_or(0)
     }
 
     /// The name and current line number of the active input, for diagnostics
@@ -148,8 +256,8 @@ impl InputStateRef {
         self.0.borrow_mut().input_pop()
     }
 
-    pub fn input_push(&self, input: Input, syncline_output: &mut dyn Write) -> std::io::Result<()> {
-        self.0.borrow_mut().input_push(input, syncline_output)
+    pub fn input_push(&self, input: Input) {
+        self.0.borrow_mut().input_push(input)
     }
 
     pub fn input_len(&self) -> usize {
@@ -172,18 +280,24 @@ impl InputStateRef {
         self.0.borrow_mut().look_ahead(c, token)
     }
 
-    pub fn emit_syncline(
-        &mut self,
-        output: &mut dyn Write,
-        check_line_numbers: bool,
-    ) -> std::io::Result<()> {
-        self.0
-            .borrow_mut()
-            .emit_syncline(output, check_line_numbers)
+    pub fn write_synced(&self, output: &mut dyn Write, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.borrow_mut().write_synced(output, buf)
     }
 
-    pub fn sync_lines(&self) -> bool {
-        self.0.borrow().line_synchronization
+    pub fn invalidate_syncline_position(&self) {
+        self.0.borrow_mut().invalidate_syncline_position()
+    }
+
+    pub fn resume_after_raw_output(&self, mid_line: bool) {
+        self.0.borrow_mut().resume_after_raw_output(mid_line)
+    }
+
+    pub fn enter_literal_scan(&self) {
+        self.0.borrow_mut().enter_literal_scan()
+    }
+
+    pub fn leave_literal_scan(&self) {
+        self.0.borrow_mut().leave_literal_scan()
     }
 
     pub fn current_location(&self) -> (Vec<u8>, usize) {
@@ -195,7 +309,9 @@ pub struct Input {
     pub input: InputRead,
     pub pushback_buffer: Vec<u8>,
     pub line_number: usize,
-    pub syncline_line_number: usize,
+    /// A `<newline>` has been consumed but not yet accounted for. See
+    /// [`Input::get_next_character`].
+    pending_newline: bool,
 }
 
 impl Input {
@@ -204,7 +320,7 @@ impl Input {
             input,
             pushback_buffer: Vec::new(),
             line_number: 1,
-            syncline_line_number: 0,
+            pending_newline: false,
         }
     }
 
@@ -221,47 +337,21 @@ impl Input {
 
         let c = buf[0];
 
-        if c == b'\n' {
+        // `line_number` names the line the character being returned sits on, so
+        // a `<newline>` only advances it once the first character of the next
+        // line is consumed. Advancing eagerly misattributes a diagnostic raised
+        // by a macro call that ends at end-of-line to the following line, since
+        // deciding whether the macro name is followed by `(` already consumes
+        // the `<newline>`.
+        if self.pending_newline {
             self.line_number += 1;
+            self.pending_newline = false;
+        }
+        if c == b'\n' {
+            self.pending_newline = true;
         }
 
         Ok(c)
-    }
-
-    fn emit_syncline(
-        &mut self,
-        output: &mut dyn Write,
-        check_line_numbers: bool,
-    ) -> std::io::Result<()> {
-        let name = match &self.input {
-            InputRead::File { path, .. } => path.as_os_str().as_encoded_bytes(),
-            InputRead::Stdin(_) => b"stdin",
-        };
-
-        log::debug!(
-            "Input::emit_syncline(): {} {check_line_numbers}",
-            String::from_utf8_lossy(name)
-        );
-        if check_line_numbers {
-            log::debug!(
-                "Input::emit_syncline(): syncline_line_number:{},line_number:{}",
-                self.syncline_line_number,
-                self.line_number
-            );
-            self.syncline_line_number += 1;
-            if self.syncline_line_number == self.line_number {
-                return Ok(());
-            }
-        }
-
-        output.write_all(b"#line ")?;
-        write!(output, "{}", self.line_number)?;
-        output.write_all(b" \"")?;
-        output.write_all(name)?;
-        output.write_all(b"\"\n")?;
-
-        self.syncline_line_number = self.line_number;
-        Ok(())
     }
 }
 

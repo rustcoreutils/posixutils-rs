@@ -1716,8 +1716,11 @@ dependencies = [
  "clap",
  "gettext-rs",
  "ipp",
+ "libc",
  "num-traits",
  "plib",
+ "portable-pty",
+ "tempfile",
 ]
 
 [[package]]
@@ -1754,6 +1757,7 @@ dependencies = [
  "libc",
  "plib",
  "portable-pty",
+ "tempfile",
  "terminfo 0.8.0",
  "termios",
 ]

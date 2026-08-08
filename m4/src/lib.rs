@@ -184,10 +184,9 @@ pub fn run_impl<STDOUT: Write + 'static, STDERR: Write>(
         for item in &args.items {
             apply_define_item(&mut state, item);
         }
-        state.input.input_push(
-            Input::new(InputRead::Stdin(std::io::stdin())),
-            &mut *stdout.borrow_mut(),
-        )?;
+        state
+            .input
+            .input_push(Input::new(InputRead::Stdin(std::io::stdin())));
         state = main_loop::process(state, &mut stderr)?;
     } else {
         // Process -D/-U options and file operands in command-line order so a
@@ -218,9 +217,7 @@ pub fn run_impl<STDOUT: Write + 'static, STDERR: Write>(
                             while state.input.input_len() > 0 {
                                 state.input.input_pop();
                             }
-                            state
-                                .input
-                                .input_push(Input::new(read), &mut *stdout.borrow_mut())?;
+                            state.input.input_push(Input::new(read));
                             state = main_loop::process(state, &mut stderr)?;
                         }
                         // An unreadable file operand is a recoverable error (GNU

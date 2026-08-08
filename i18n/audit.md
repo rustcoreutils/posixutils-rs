@@ -278,30 +278,72 @@ The no-operand default output, the `LC_ALL > LC_* > LANG` precedence, and `local
 **Spec:** POSIX.1-2024 `localedef` (extract `~/tmp/i18n-spec/localedef.txt`)
 
 ## TL;DR
-**Phase 11 (bounded) status:** the parser and CLI behavior are now spec-conformant — `-f charmap` is opened/validated, `LC_CTYPE`/`LC_COLLATE` symbolic references are parsed and checked against the charmap, `escape_char`/`comment_char`/line-continuation and `copy`/`include` directives are honored, the full POSIX keyword set is recognized, the 0/1/2/>3 exit-status table is implemented, and successfully processed categories are reported on stdout. **Deferred (LD-1):** `localedef` still writes a marker file rather than a real libc-consumable compiled locale; emitting a true compiled-locale binary (or delegating to host `localedef`) is out of scope for this pass, so `localedef` remains at README "Stage 3 — Test coverage".
+**Phase 11 (bounded) status:** the parser and CLI behavior are now spec-conformant — `-f charmap` is opened/validated, `LC_CTYPE`/`LC_COLLATE` symbolic references are parsed and checked against the charmap, `escape_char`/`comment_char`/line-continuation and `copy`/`include` directives are honored, the full POSIX keyword set is recognized, the 0/1/2/>3 exit-status table is implemented, and successfully processed categories are reported on stdout. **Closed (LD-1, 2026-08-08):** `localedef` no longer writes a marker file, and no longer reports a success it did not achieve. A source that parses cleanly now exits 3 — "the capability to create new locales is not supported by the implementation" — which is POSIX's own answer for an implementation without that capability. `localedef` therefore moves to README "Stage 6 — Audited".
 
 Originally: `localedef` did not produce a usable locale — wrote a one-line `LC_IDENTIFICATION` marker, never opened the `-f charmap`, never parsed `LC_CTYPE`/`LC_COLLATE`, ignored `-u`, didn't resolve `copy`/`include`, mishandled `escape_char`/`comment_char` and line continuation, and collapsed the 0/1/2/3/>3 exit-status table to 0/1/4.
 
 ## Priority issues
 
 ### Critical
-- [ ] **LD-1 — No usable locale is produced.** _(DEFERRED — see decision note below.)_ `write_locale` writes only `…/LC_IDENTIFICATION`; the parsed category data is not compiled to a libc-consumable binary. Producing a real compiled-locale writer (or delegating to host `localedef`) is out of scope for this audit pass; `localedef` therefore stays at README "Stage 3 — Test coverage". Fix: emit a real compiled locale or delegate to host `localedef`.
+- [x] **LD-1 — No usable locale is produced.** ✓ closed 2026-08-08, though not
+  by either route this box proposed. POSIX already provides the answer: exit
+  **3**, "The capability to create new locales is not supported by the
+  implementation" (102796), and 102680-102684 makes that capability an
+  implementation-defined choice — "It is implementation-defined whether users
+  have the capability to create new locales."
+
+  So declining to create locales is *conforming*. What was not conforming is
+  what the utility did: `write_locale` dropped an `LC_IDENTIFICATION` file
+  holding the single line `locale: <name>` and returned **exit 0**, whose
+  defined meaning is "No errors occurred and the locales were successfully
+  created" (102792). Nothing usable existed. That is the same false-success
+  shape as `lp`'s no-destination bug, and worse than reporting nothing, because
+  a script testing `$?` was told everything worked.
+
+  `write_locale` is gone; no filesystem output is produced on any path. All the
+  parsing and validation (LD-2..LD-13) is untouched and still runs *first*, so a
+  bad source is diagnosed on its own terms rather than swallowed by a blanket 3:
+  an unreadable charmap still exits 2, and errors — or warnings without `-c` —
+  still exit > 3. Exits 0 and 1 both assert that locales *were created* and are
+  now unreachable. The stdout category report stays: 102766 asks for the
+  categories successfully **processed**, not created.
+
+  Both routes this box named were rejected, and why is worth recording. Emitting
+  a real compiled locale means writing glibc's undocumented, version-coupled
+  binary format — and the parser collects only symbolic *references* for
+  `LC_CTYPE`/`LC_COLLATE`, not class tables or collation weights, so it needs a
+  whole compiler first; musl and macOS differ entirely, and this workspace builds
+  on Linux and macOS. Delegating to host `localedef` contradicts theme 5 below,
+  ships nothing usable on macOS, and would make the behaviour vary per machine.
+
+  `-v` had been left inert by LD-11 (which made warnings unconditional) and its
+  only remaining use was the removed "created locale at" message; it now reports
+  that the source parsed and validated, which is the useful fact alongside the
+  status. The status itself is explained on stderr unconditionally — an
+  unexplained exit 3 would be unhelpful, and 102768 reserves stderr for
+  diagnostics, which declining to do what was asked is.
+
+  **Note for the next reader:** `getconf POSIX2_LOCALEDEF` reports 200809 on
+  glibc and must keep doing so — `sys/getconf.rs` answers from
+  `sysconf(_SC_2_LOCALEDEF)`, which describes the *system*, whose libc does
+  support locale creation. Our `localedef` describes itself. Seeing getconf say
+  "supported" while this utility exits 3 is consistent, not a bug.
 - [x] **LD-2 — `-f charmap` never read.** ✓ fixed (Phase 11, parsing): `parse_charmap_symbols` opens and validates the charmap; an unreadable charmap exits 2 (unsupported charset, no output). The symbolic names are parsed and used to validate LC_CTYPE/LC_COLLATE references. _(The charmap-driven encoding *compilation* remains part of the deferred LD-1.)_
 - [x] **LD-3 — `LC_CTYPE` and `LC_COLLATE` entirely unparsed.** ✓ fixed (Phase 11, parsing): both categories are now parsed; their `<symbolic>` references are collected and validated against the charmap, emitting a warning (per spec, for these two categories) when a symbol is absent. _(Full classification/collation *compilation* is part of the deferred LD-1.)_
 
 ### Major
 - [x] **LD-4 — `-c` overrides hard errors.** ✓ fixed (Phase 11): output is created only when `!has_errors`; `-c` now gates warnings only, never errors.
-- [x] **LD-5 — Exit codes 2 and 3 never returned.** ✓ fixed (Phase 11): 0 = created/no warnings, 1 = created/warnings (`-c`), 2 = unsupported charset (unreadable charmap), no output, and > 3 (4) = errors — or warnings without `-c` — with no output. (3 "creation unsupported" is intentionally not used while a marker locale is still written; that relates to the deferred LD-1.)
+- [x] **LD-5 — Exit codes 2 and 3 never returned.** ✓ fixed (Phase 11): 0 = created/no warnings, 1 = created/warnings (`-c`), 2 = unsupported charset (unreadable charmap), no output, and > 3 (4) = errors — or warnings without `-c` — with no output. (3 "creation unsupported" is now the outcome for a source that parses cleanly — see LD-1 — and 0/1 are unreachable, since both assert that a locale was created.)
 - [x] **LD-6 — `escape_char`/`comment_char` directives ignored.** ✓ fixed (Phase 11): both directives are honored, and a line ending in the active `escape_char` is joined with the next (line continuation).
-- [x] **LD-7 — `copy` not resolved; `include` not recognized.** ✓ fixed (Phase 11): `copy` is recorded for every category, and `include "file"` is recognized and inlined (depth-guarded; an unreadable include is an error). _(Resolving a `copy` against an already-installed locale needs the compiled-locale store from the deferred LD-1.)_
-- [x] **LD-8 — `-u code_set_name` parsed but unused.** ✓ acceptable (Phase 11): the codeset only affects the deferred binary-encoding step (LD-1); it is accepted and otherwise inert, which is harmless for the parsing/validation this pass covers.
+- [x] **LD-7 — `copy` not resolved; `include` not recognized.** ✓ fixed (Phase 11): `copy` is recorded for every category, and `include "file"` is recognized and inlined (depth-guarded; an unreadable include is an error). _(Resolving a `copy` against an already-installed locale would need a compiled-locale store, which this implementation does not have; see LD-1.)_
+- [x] **LD-8 — `-u code_set_name` parsed but unused.** ✓ acceptable (Phase 11): the codeset would only affect a binary-encoding step this implementation does not perform (LD-1); it is accepted and otherwise inert, which is harmless for the parsing and validation the utility does do.
 - [x] **LD-9 — No stdout success report.** ✓ fixed (Phase 11): on success the processed category names are written to standard output.
 
 ### Minor
 - [x] **LD-10 — `LC_MONETARY` missing 9 keywords, `LC_TIME` missing 11.** ✓ fixed (Phase 11): keyword recognition is driven by the full POSIX keyword lists (`locale_lib::types::LC_*_KEYWORDS`); the per-keyword typed fields (and their dead-code underscores) are gone, and an unrecognized keyword is warned about.
 - [x] **LD-11 — Warnings suppressed unless `-v`.** ✓ fixed (Phase 11): all diagnostics (warnings included) are written to standard error regardless of `-v`.
 - [x] **LD-12 — `END <category>` not validated.** ✓ fixed (Phase 11): `END x` must match the open category (mismatch is an error), and a section header must be one of the known `LC_*` category names.
-- [x] **LD-13 — Non-slash `name` writes to `$TMPDIR/locale/<name>`.** ✓ acceptable (Phase 11): the spec makes a non-slash `name` "interpreted in an implementation-defined manner"; the chosen location is implementation-defined and conformant. The "public" placement depends on the deferred compiled-locale writer (LD-1).
+- [x] **LD-13 — Non-slash `name` writes to `$TMPDIR/locale/<name>`.** ✓ acceptable (Phase 11): the spec makes a non-slash `name` "interpreted in an implementation-defined manner"; the chosen location is implementation-defined and conformant. Moot in practice: no locale is written at all (LD-1), so neither placement occurs.
 
 ## Conformance matrix
 
@@ -443,6 +485,6 @@ Small, themed PRs land more easily than one mega-PR. Roughly in priority order:
 - **PR H — "msgfmt checks"** (Major): MF-2 (exit status), MF-4 (`-c -v` gating), MF-5 (newline check), MF-6 (C escapes in po_file), MF-7 (bare charset), MF-8 (`no-c-format`).
 - **PR I — "gettext/ngettext spec compliance"** (Major): GT-1 (`-E`), GT-2/GT-10 (newline + tests), NG-1 (`[textdomain]` operand), GT-3 (NLSPATH), GT-5 (mo_file plural index).
 - **PR J — "xgettext output conformance"** (Major): XG-1 (`.po`), XG-2 (`-x`), XG-3 (extraction order), XG-4 (`-j` dedup), XG-5 (operand extension), XG-6 (`_l` keywords).
-- **PR K — "localedef: real locale output"** (Critical, large): LD-1/LD-2/LD-3 — the big one; either implement a compiled-locale writer + charmap/LC_CTYPE/LC_COLLATE parsing, or delegate to host `localedef`. Likely several sub-PRs.
+- **PR K — "localedef: real locale output"** (Critical, large): LD-2/LD-3 landed as charmap and `LC_CTYPE`/`LC_COLLATE` parsing; LD-1 landed as POSIX's exit 3 rather than a compiled-locale writer or delegation to the host tool. See LD-1 for why both of those were rejected.
 - **PR L — "localedef exit codes & directives"** (Major): LD-4 (`-c` over errors), LD-5 (exit 2/3), LD-6 (escape_char/comment_char/continuation), LD-7 (`copy`/`include`), LD-9 (stdout report).
 - **PR M — "crate-wide i18n diagnostics"** (Minor): wrap runtime diagnostics in `gettext()` across all eight utilities (theme 2); honor `NLSPATH`/`LANGUAGE` (theme 3).

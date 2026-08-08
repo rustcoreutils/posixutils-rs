@@ -54,12 +54,13 @@ fn test_localedef_minimal() {
             stdin_data: String::new(),
             expected_out: String::new(),
             expected_err: String::new(),
-            expected_exit_code: 0,
+            expected_exit_code: 3,
         },
         |_plan, output: &Output| {
-            assert!(
-                output.status.success() || output.status.code() == Some(1),
-                "localedef should succeed or return warnings"
+            assert_eq!(
+                output.status.code(),
+                Some(3),
+                "a clean source parses, but creating locales is unsupported (102796)"
             );
         },
     );
@@ -84,12 +85,13 @@ fn test_localedef_continue_warnings() {
             stdin_data: String::new(),
             expected_out: String::new(),
             expected_err: String::new(),
-            expected_exit_code: 0,
+            expected_exit_code: 3,
         },
         |_plan, output: &Output| {
-            assert!(
-                output.status.success(),
-                "localedef -c should succeed with warnings"
+            assert_eq!(
+                output.status.code(),
+                Some(3),
+                "-c tolerates warnings, but exit 1 asserts a locale was created"
             );
         },
     );
@@ -115,11 +117,22 @@ fn test_localedef_verbose() {
             stdin_data: String::new(),
             expected_out: String::new(),
             expected_err: String::new(),
-            expected_exit_code: 0,
+            expected_exit_code: 3,
         },
         |_plan, output: &Output| {
-            // With -v, should have some output
-            assert!(output.status.success(), "localedef -v should succeed");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                output.status.code(),
+                Some(3),
+                "-v does not change the outcome"
+            );
+            // -v is otherwise inert since LD-11 made warnings unconditional; it
+            // now reports that the source itself was fine, which is the useful
+            // fact alongside the creation-unsupported status.
+            assert!(
+                stderr.contains("parsed and validated successfully"),
+                "-v should say the source validated: {stderr:?}"
+            );
         },
     );
 }
@@ -148,10 +161,12 @@ fn test_localedef_reports_categories() {
             stdin_data: String::new(),
             expected_out: String::new(),
             expected_err: String::new(),
-            expected_exit_code: 0,
+            expected_exit_code: 3,
         },
         |_plan, output: &Output| {
-            assert_eq!(output.status.code(), Some(0));
+            // 102766 asks for the categories successfully *processed*, so the
+            // report survives even though no locale is created.
+            assert_eq!(output.status.code(), Some(3));
             let stdout = String::from_utf8_lossy(&output.stdout);
             assert!(stdout.contains("LC_NUMERIC"), "stdout report: {stdout:?}");
         },
@@ -268,12 +283,14 @@ fn test_localedef_empty_input() {
             stdin_data: String::new(),
             expected_out: String::new(),
             expected_err: String::new(),
-            expected_exit_code: 0,
+            expected_exit_code: 3,
         },
         |_plan, output: &Output| {
-            // Empty input should still work with -c
-            assert!(
-                output.status.success(),
+            // Empty input is still a clean parse, so it reaches the same
+            // creation-unsupported answer rather than an error.
+            assert_eq!(
+                output.status.code(),
+                Some(3),
                 "localedef should handle empty input with -c"
             );
         },
@@ -282,8 +299,9 @@ fn test_localedef_empty_input() {
 
 /// A locale source is a text file in whatever codeset `LC_CTYPE` describes, so
 /// `read_to_string` rejected a valid non-UTF-8 source before a single line had
-/// been looked at. (Faithfully *preserving* that character data awaits LD-1,
-/// the deferred compiled-locale writer; today it is only validated.)
+/// been looked at. The character data is validated rather than preserved, which
+/// is all this implementation can do: it does not compile locales (LD-1) and
+/// says so with exit 3.
 #[test]
 fn localedef_accepts_a_non_utf8_source() {
     let temp = tempfile::TempDir::new().unwrap();
@@ -307,4 +325,83 @@ fn localedef_accepts_a_non_utf8_source() {
         !stderr.contains("invalid utf-8") && !stderr.contains("stream did not contain"),
         "a non-UTF-8 source must not be rejected for its encoding: {stderr}"
     );
+}
+
+/// A clean source must report "creating locales is not supported" and leave
+/// nothing behind.
+///
+/// POSIX 102796 defines exit 3 as "The capability to create new locales is not
+/// supported by the implementation", and 102680-102684 makes that capability
+/// implementation-defined. This implementation parses and validates a locale
+/// source but cannot compile one, so 3 is the honest answer.
+///
+/// It used to drop an `LC_IDENTIFICATION` marker holding the single line
+/// `locale: <name>` and exit **0**, whose defined meaning is "No errors occurred
+/// and the locales were successfully created" — telling a script testing `$?`
+/// that everything worked when nothing usable existed.
+#[test]
+fn localedef_reports_creation_unsupported_and_writes_nothing() {
+    let temp_dir = TempDir::new().unwrap();
+    let locale_src = create_minimal_locale(&temp_dir);
+    let out = temp_dir.path().join("built_locale");
+
+    let output = std::process::Command::new(plib::testing::get_binary_path("localedef"))
+        .arg("-i")
+        .arg(&locale_src)
+        .arg(&out)
+        .output()
+        .expect("run localedef");
+
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "a clean source must report creation-unsupported; stderr={:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !out.exists(),
+        "no locale is created, so nothing may be written to {}",
+        out.display()
+    );
+    // 102766: "report all categories successfully processed" -- processed, not
+    // created, so the report still belongs on stdout.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("LC_NUMERIC") && stdout.contains("LC_MESSAGES"),
+        "the processed categories must still be reported: {stdout:?}"
+    );
+    // An unexplained exit 3 would be unhelpful.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not supported"),
+        "the status must be explained on stderr: {stderr:?}"
+    );
+}
+
+/// Warnings accepted with `-c` reach the same answer: nothing is created, so
+/// exit 1 ("warnings occurred and the locales were successfully created") is
+/// unreachable and 3 is correct.
+#[test]
+fn localedef_creation_unsupported_applies_with_c_too() {
+    let temp_dir = TempDir::new().unwrap();
+    let src = temp_dir.path().join("warn.locale");
+    let mut file = File::create(&src).unwrap();
+    write!(
+        file,
+        "LC_NUMERIC\ndecimal_point \".\"\nbogus_keyword \"x\"\nEND LC_NUMERIC\n"
+    )
+    .unwrap();
+    drop(file);
+    let out = temp_dir.path().join("warn_locale");
+
+    let output = std::process::Command::new(plib::testing::get_binary_path("localedef"))
+        .arg("-c")
+        .arg("-i")
+        .arg(&src)
+        .arg(&out)
+        .output()
+        .expect("run localedef");
+
+    assert_eq!(output.status.code(), Some(3), "-c with warnings -> 3");
+    assert!(!out.exists(), "nothing may be written");
 }

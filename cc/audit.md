@@ -38,10 +38,20 @@ crate. Each audit follows the playbook in `audits.md`.
 > genuinely open, consistent with the note below.
 > Cross-cutting note 4 was corrected — `gettext()` is no longer a stub.
 >
-> **`c17`: open.** Its 49 findings are deliberately untouched — the
-> maintainer scoped this round to the three standalone utilities. `c17` remains
-> at *Stage 3* in `README.md`, which is correct while #U1 (multi-translation-unit
-> compilation fails outright), #P2, #X1, #P1/#X2 and #L1 are open.
+> **`c17`: in progress (from 2026-08-08).** The findings are being worked in
+> phases; each is ticked below with a `✓ fixed (Phase N)` note naming the change
+> and its tests. `c17` stays at *Stage 3* in `README.md` until the phases finish.
+>
+> Four items are **deliberately out of scope** for this effort and stay open:
+> **#X3** (`_Generic`) and **#X1** (`_Atomic` via ordinary operators) are not
+> being implemented; **#P1/#X2** stays at `201112L` — the version constant will
+> not be raised until full C17 is available, and **no `-std=` multi-version
+> switching will be added**; **#L7** was never reproduced. Because #P1/#X2 is out
+> of scope, the row pinning `cc/tests/c11/core.rs:301` to `201112L` stays as-is.
+>
+> **Phase 1 (#U1, #U2, #U10) — landed.** The driver was restructured to compile
+> every operand and then link once. Nine boxes closed. New suite:
+> `cc/tests/driver/mod.rs`.
 
 ---
 
@@ -164,8 +174,8 @@ violation.
 
 ### Critical
 
-- [ ] **#U1 — Multi-translation-unit compilation is broken; `.o`/`.a`/`.so` operands are dropped.** `cc/main.rs:918-1057` (esp. 920-922, 1049-1054) and `596-648`. With any `.c`/`.i` operand present, the driver loops `for path in &source_files { process_file(...) }`, and each iteration independently assembles *that file alone* and links it *alone* to `exe_file`. `object_files` (line 922) is only consumed in the `source_files.is_empty()` branch. **[probed]** `c17 m1.c m2.c -o mA` → `undefined reference to 'helper'`, no output produced, exit 1. `c17 m1.c m2.o -o mB` → same. This breaks spec EXAMPLE 1 (`c17 foo.c bar.o`) and EXAMPLE 3 (`c17 -L /a/b/c main.o a.c -l Q b.c -l p`) outright; `c17 -o foobar foo.o bar.o` (objects only) does work. Fix: restructure `main()` into two phases — compile every source operand to a `.o`, then perform exactly one link that includes every produced object plus every `.o`/`.a`/`.so` operand, in argument order.
-- [ ] **#U2 — A compile error on one source operand aborts the run instead of continuing.** `cc/main.rs:1049-1054` calls `std::process::exit(1)` on the first `Err`. CONSEQUENCES OF ERRORS (88185-88187): *"it shall write a diagnostic ... and continue to compile other source code operands, but it shall not perform the link phase and it shall return a non-zero exit status."* **[probed]** `c17 -c bad.c good.c` produces **neither** `bad.o` nor `good.o`; `good.c` is never attempted. Fix: accumulate an error flag, `continue` past a failing file, gate the link on that flag, exit non-zero at the end.
+- [x] **#U1 — Multi-translation-unit compilation is broken; `.o`/`.a`/`.so` operands are dropped.** **✓ fixed (Phase 1).** `main()` now classifies operands in one ordered pass (`Operand::classify`), compiles each source to an object via `process_file` — which no longer links — and performs exactly one `link_objects` call over every produced object plus every `.o`/`.a`/`.so` operand, in argument order. Objects with no `-o` now link to `a.out` instead of doing nothing. Tests: `cc/tests/driver/mod.rs` (`driver_links_multiple_sources`, `driver_links_source_with_object_operand`, `driver_object_operand_may_come_first`, `driver_links_objects_without_dash_o`). Original finding: `cc/main.rs:918-1057` (esp. 920-922, 1049-1054) and `596-648`. With any `.c`/`.i` operand present, the driver loops `for path in &source_files { process_file(...) }`, and each iteration independently assembles *that file alone* and links it *alone* to `exe_file`. `object_files` (line 922) is only consumed in the `source_files.is_empty()` branch. **[probed]** `c17 m1.c m2.c -o mA` → `undefined reference to 'helper'`, no output produced, exit 1. `c17 m1.c m2.o -o mB` → same. This breaks spec EXAMPLE 1 (`c17 foo.c bar.o`) and EXAMPLE 3 (`c17 -L /a/b/c main.o a.c -l Q b.c -l p`) outright; `c17 -o foobar foo.o bar.o` (objects only) does work. Fix: restructure `main()` into two phases — compile every source operand to a `.o`, then perform exactly one link that includes every produced object plus every `.o`/`.a`/`.so` operand, in argument order.
+- [x] **#U2 — A compile error on one source operand aborts the run instead of continuing.** **✓ fixed (Phase 1).** The operand loop records a `failed` flag and continues; the link is gated on it and the process exits 1 at the end. `diag::reset_counts()` lost its `#[cfg(test)]` gate and is called between translation units, because the error state is a sticky process-global that would otherwise fail every file after the first. Tests: `driver_continues_past_a_failing_operand`, `driver_error_state_does_not_leak_between_operands`. Original finding: `cc/main.rs:1049-1054` calls `std::process::exit(1)` on the first `Err`. CONSEQUENCES OF ERRORS (88185-88187): *"it shall write a diagnostic ... and continue to compile other source code operands, but it shall not perform the link phase and it shall return a non-zero exit status."* **[probed]** `c17 -c bad.c good.c` produces **neither** `bad.o` nor `good.o`; `good.c` is never attempted. Fix: accumulate an error flag, `continue` past a failing file, gate the link on that flag, exit non-zero at the end.
 - [ ] **#P2 — The null directive `#` deletes the following line of source.** `cc/token/preprocess.rs:892-917`. `handle_directive` unconditionally does `iter.next()` to fetch the directive name without checking `pos.newline`, so a bare `#` (a valid no-op per C17 6.10p7) consumes the *first token of the next line*, misclassifies it as a directive name, and `skip_to_eol` eats the rest of that line. **[probed]** input `#\nint kept_one;\nint kept_two;` produces only `int kept_two;` plus a bogus `warning: unknown preprocessor directive #int`. Silent source deletion. Fix: if the fetched token has `pos.newline == true` (or `iter.next()` is `None`), treat as the null directive and return.
 - [ ] **#X1 — `_Atomic` objects accessed via ordinary operators compile to non-atomic code.** `cc/ir/ssa.rs:148` is the only consumer of `is_atomic` anywhere in the IR or codegen (zero hits under `cc/arch/`), and its sole effect is to block SSA register promotion — the same treatment as `volatile`. **[probed]** on `atomic_int g`: `g += 1` emits `movl (%r11),%eax` / `movl %ecx,(%r11)` with **no `lock` prefix and no fence**, while `atomic_fetch_add(&g,1)` correctly emits `lock xaddl`. `g = 5` emits a plain `movl` (not a seq_cst store). This violates C11/C17 6.5.16.2p3 (atomic compound assignment is a single atomic RMW) and the basic data-race freedom guarantee of 6.7.2.4/6.7.3. Code that looks correct races silently. Fix: in the linearizer, detect an `_Atomic`-qualified lvalue in assignment/compound-assignment/`++`/`--` and emit `AtomicStore`/`AtomicFetchAdd`/`AtomicFetchSub`/CAS-loop IR (those opcodes already exist) with `memory_order_seq_cst`.
 - [ ] **#P1/#X2 — `__STDC_VERSION__` is `201112L`; the compiler cannot claim C17.** `cc/token/preprocess.rs:549`, hardcoded, with no `-std=` gate (`-std=` is accepted and discarded at `cc/main.rs:710-712`). **[probed]** `int v = __STDC_VERSION__;` preprocesses to `201112L`. The `pcc`→`c17` rename (#U8) has since landed *without* this fix, so the binary now advertises a name it does not live up to: any source doing `#if __STDC_VERSION__ >= 201710L` takes the wrong branch. That makes this the highest-priority open item in the file. Fix: add `-std=c17|c11|c99|gnu*` threading a `CStd` enum into `init_predefined_macros`, defaulting to `201710L`.
@@ -209,7 +219,7 @@ violation.
 - [ ] **#U7 — Runtime diagnostics are hardcoded English.** `cc/diag.rs:299-403` and every `eprintln!` in `cc/main.rs`. `setlocale` *is* called (`cc/main.rs:870`) and help strings *are* wrapped, so only the diagnostic strings are missing. Per the revised cross-cutting note 4, `gettext()` now performs real catalog lookup, so wrapping these strings would take effect immediately — this is straightforward work, not blocked.
 - [x] **#U8 — The binary was named `pcc`, not `c17`.** `cc/Cargo.toml:31-33`. **✓ fixed** — the binary is `c17`. The rename also covered the hidden internal flags (`--pcc-*` → `--c17-*`), the diagnostic prefix (`c17: …`), `__VERSION__`, the `Generated by c17 …` assembly header, the DWARF `DW_AT_producer` string, the `_C17_LIMITS_H`/`_C17_FLOAT_H` builtin-header guards, the `/tmp/c17_<pid>.*` temp names, and `lib/utils.tsv`. No `pcc` compatibility alias was kept. The maintainer scoped this to a cosmetic rename, so the caveat noted here originally still stands: #P1/#X2 did **not** land with it, and the `c17` binary misreports its language level as `201112L` until it does.
 - [ ] **#U9 — `-` is accepted as a pathname operand though STDIN says "Not used."** `cc/main.rs:321-323`, `840`. A harmless GCC-compatible extension; conforming applications never pass a bare `-`. Document rather than remove.
-- [ ] **#U10 — `-c -o out` with multiple inputs overwrites `out` once per input, silently.** `cc/main.rs:575`. The spec leaves this unspecified (88338-88343) so it is not a defect; a one-line warning would help. Not required for conformance.
+- [x] **#U10 — `-c -o out` with multiple inputs overwrites `out` once per input, silently.** **✓ fixed (Phase 1)** — still unspecified per the spec, but now warned rather than silent. Test: `driver_warns_on_dash_c_dash_o_with_multiple_sources`. Original finding: `cc/main.rs:575`. The spec leaves this unspecified (88338-88343) so it is not a defect; a one-line warning would help. Not required for conformance.
 - [ ] **#L8 — `cc/doc/c99-checklist.md` overclaims and should not be used as compliance evidence.** Every item in #L1–#L6 has a corresponding `[x]` (e.g. lines 353, 431, 564, 580, 856-858). The checklist treats "parses without panicking" as "conforms". Fix: correct the entries and add rows for implicit-int and duplicate-case detection, which the checklist does not track at all.
 - [ ] **#X10 — `cc/doc/c11-checklist.md` *under*-reports anonymous struct/union inside `union`.** Lines 138-139/199-200 mark these unimplemented, but `cc/parse/parser.rs:2061-2147` uses one shared member-parsing path whose anonymous-member branch (2135-2147) is gated only on `is_struct_or_union && is_special(b';')`, with no `is_union` restriction — so it already works. **[static]** Fix: add a regression test, then tick the boxes.
 - [ ] **#H1 — `<stdint.h>` and `<uchar.h>` are not bundled; the host's are used.** **[probed]** all of `float.h iso646.h limits.h stdalign.h stdarg.h stdbool.h stddef.h stdnoreturn.h complex.h stdatomic.h` are bundled in `cc/include/` and compile; `stdint.h`, `uchar.h`, and `threads.h` resolve to the system copies. C17 4p6 puts `<stdint.h>` in the *freestanding* set, which the implementation must supply itself. It works today because `cc/arch/mod.rs:112-231` predefines the full GCC-compatible `__INTn_TYPE__`/`__INTn_MAX__` surface glibc's `<stdint.h>` expects — a functional but not freestanding-capable design that hard-depends on a full libc sysroot even for trivial programs. `cc/tests/c99/stdlib_headers.rs:12` documents the delegation explicitly. Fix: bundle `stdint.h` (and `uchar.h` if #X5 is addressed).
@@ -260,7 +270,7 @@ violation.
 - [x] `file.c`, `file.i` — `cc/main.rs:838-840`; **[probed]** `.i` from `c17 -E` recompiles.
 - [x] `file.o`, `file.a`, `file.so` (incl. versioned `libfoo.so.N`) recognized — `cc/main.rs:849-856`.
 - [x] Unrecognized suffixes warned and skipped — `cc/main.rs:925-929`; spec calls this implementation-defined.
-- [ ] Operands actually combined into one link — **MISSING**, #U1.
+- [x] Operands actually combined into one link — #U1 closed; one `link_objects` call covers every operand in argument order.
 
 ### STDIN / INPUT FILES / OUTPUT FILES
 
@@ -268,7 +278,7 @@ violation.
 - [x] `-c` without `-o` produces `$(basename pathname .c).o` — `cc/main.rs:539-548,575`; **[probed]**.
 - [x] `a.out` default — `cc/main.rs:597`; **[probed]**.
 - [x] Executable permission bits `S_IRWXU|S_IRWXG|S_IRWXO` minus umask — **[probed]** `a.out` is `0775` under `umask 0002`. Delegated to the host linker, which satisfies the mandate.
-- [ ] `.o`/`.a`/`.so` operands linked — **MISSING**, #U1.
+- [x] `.o`/`.a`/`.so` operands linked — #U1 closed; object operands join the link inputs in place.
 
 ### ENVIRONMENT VARIABLES
 
@@ -306,7 +316,7 @@ violation.
 
 - [x] `0` on success, `>0` on error — **[probed]** compile error exits 1; the only `exit(0)` calls are legitimate info queries (`--print-targets` etc.).
 - [x] Link failure diagnosed to stderr with non-zero exit — `cc/main.rs:610-611,640-641,1037-1039`; **[probed]**.
-- [ ] Continue compiling remaining operands after an error — **MISSING**, #U2.
+- [x] Continue compiling remaining operands after an error — #U2 closed.
 
 ### ISO C language conformance summary
 
@@ -340,13 +350,13 @@ qualifiers, `#include_next`, `#warning`, digraphs, and the C23 one-argument
 ## Test coverage signal
 
 Not covered:
-- [ ] More than one `.c`/`.i` operand in a single invocation — `cc/tests/common/mod.rs:57-125` always builds exactly one source and one `-o`. Would have caught #U1 immediately.
-- [ ] A `.c` operand combined with a `.o`/`.a`/`.so` operand (spec EXAMPLE 1).
+- [x] More than one `.c`/`.i` operand in a single invocation — `cc/tests/driver/mod.rs` now drives the binary with a raw argv via the new `common::run_c17` helper; `driver_multiple_sources_do_not_share_temp_files` also pins that per-source scratch names do not collide.
+- [x] A `.c` operand combined with a `.o`/`.a`/`.so` operand (spec EXAMPLE 1) — `driver_links_source_with_object_operand`, plus `driver_object_operand_may_come_first` for the reverse order.
 - [ ] `-L`/`-l` interleaved with pathname operands (spec EXAMPLE 3).
 - [ ] `-B`, `-G`, `-R`, `-s` (they do not exist).
 - [ ] `-E` output containing `# <line> "<file>"` markers.
 - [ ] `TMPDIR` honored for temp files.
-- [ ] A compile error on a non-final operand followed by a later successful one.
+- [x] A compile error on a non-final operand followed by a later successful one — `driver_continues_past_a_failing_operand`.
 - [ ] Negative-path diagnostics generally: there is **no** test asserting that a malformed program is *rejected*. The suites prove accepted programs run correctly, not that invalid programs are diagnosed. A `cc/tests/diagnostics/` suite asserting `error_count() > 0` for #L1–#L6, #P3–#P5, #X4, #X9 would close the largest structural gap.
 - [ ] Bare `#` null directive; macro redefinition/arity diagnostics; large `#if` hex constants; comment-as-whitespace stringification; trigraphs.
 - [ ] `_Atomic` via plain operators — a naive test would *pass* today (#X1 only manifests under concurrency or assembly inspection), so the test must assert on generated assembly containing `lock`.

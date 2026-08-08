@@ -310,12 +310,29 @@ fn print_stats(
     eprintln!();
 }
 
+/// Where a compiled source operand's object file goes.
+enum ObjectName {
+    /// `-c`: a named object file the user keeps.
+    Keep(String),
+    /// Link mode: a temporary this process owns and removes after linking.
+    Temp(String),
+}
+
+/// What compiling one source operand produced.
+enum Compiled {
+    /// No object: an early-exit mode (`-E`, `-S`, `--dump-*`) ran instead.
+    Nothing,
+    /// An object file, plus whether it is a temporary this process must remove.
+    Object { path: String, temporary: bool },
+}
+
 fn process_file(
     path: &str,
     streams: &mut StreamTable,
     args: &Args,
     target: &Target,
-) -> io::Result<()> {
+    obj_name: &ObjectName,
+) -> io::Result<Compiled> {
     // Read file (or stdin if path is "-")
     let mut buffer = Vec::new();
     let display_path = if path == "-" {
@@ -366,7 +383,7 @@ fn process_file(
         if !args.verbose {
             println!();
         }
-        return Ok(());
+        return Ok(Compiled::Nothing);
     }
 
     // Preprocess (may add new identifiers from included files)
@@ -442,7 +459,7 @@ fn process_file(
                 "preprocessing failed",
             ));
         }
-        return Ok(());
+        return Ok(Compiled::Nothing);
     }
 
     // Create symbol table and type table BEFORE parsing
@@ -472,7 +489,7 @@ fn process_file(
 
     if args.dump_ast {
         println!("{:#?}", ast);
-        return Ok(());
+        return Ok(Compiled::Nothing);
     }
 
     // Linearize to IR
@@ -513,7 +530,7 @@ fn process_file(
     dump_ir(args, &module, "post-opt");
 
     if args.dump_ir.is_some() && !should_dump_ir(args, "post-lower") {
-        return Ok(());
+        return Ok(Compiled::Nothing);
     }
 
     // Lower IR (phi elimination, etc.)
@@ -522,7 +539,7 @@ fn process_file(
     dump_ir(args, &module, "post-lower");
 
     if args.dump_ir.is_some() {
-        return Ok(());
+        return Ok(Compiled::Nothing);
     }
 
     // Generate assembly
@@ -560,49 +577,31 @@ fn process_file(
                 eprintln!("Wrote assembly to {}", asm_file);
             }
         }
-        return Ok(());
+        return Ok(Compiled::Nothing);
     }
 
-    // Write temporary assembly file
-    let temp_asm = format!("/tmp/c17_{}.s", std::process::id());
+    // Write the assembly to a scratch file for the assembler. The name is
+    // qualified by the source stem: several operands are compiled in one
+    // process now, so a per-process name alone would collide between them.
+    let temp_asm = format!("/tmp/c17_{}_{}.s", std::process::id(), stem);
     {
         let mut file = File::create(&temp_asm)?;
         file.write_all(asm.as_bytes())?;
     }
 
-    if args.compile_only {
-        // Assemble to object file
-        let obj_file = args.output.clone().unwrap_or_else(|| format!("{}.o", stem));
+    // Assemble. The caller decided where the object goes; this function no
+    // longer links, so that one link can cover every operand — POSIX EXAMPLE 1
+    // and EXAMPLE 3 both combine sources with objects and libraries.
+    let (obj_file, temporary) = match obj_name {
+        ObjectName::Keep(p) => (p.clone(), false),
+        ObjectName::Temp(p) => (p.clone(), true),
+    };
 
-        let mut as_cmd = Command::new("as");
-        if args.debug > 0 {
-            as_cmd.arg("-g");
-        }
-        let status = as_cmd.args(["-o", &obj_file, &temp_asm]).status()?;
-
-        // Clean up temp file
-        let _ = std::fs::remove_file(&temp_asm);
-
-        if !status.success() {
-            return Err(io::Error::other("assembler failed"));
-        }
-
-        if args.verbose {
-            eprintln!("Wrote object file to {}", obj_file);
-        }
-        return Ok(());
-    }
-
-    // Full compile: assemble and link to executable
-    let exe_file = args.output.clone().unwrap_or_else(|| "a.out".to_string());
-
-    // Assemble
-    let temp_obj = format!("/tmp/c17_{}.o", std::process::id());
     let mut as_cmd = Command::new("as");
     if args.debug > 0 {
         as_cmd.arg("-g");
     }
-    let status = as_cmd.args(["-o", &temp_obj, &temp_asm]).status()?;
+    let status = as_cmd.args(["-o", &obj_file, &temp_asm]).status()?;
 
     let _ = std::fs::remove_file(&temp_asm);
 
@@ -610,41 +609,52 @@ fn process_file(
         return Err(io::Error::other("assembler failed"));
     }
 
-    // Link
+    if args.verbose && !temporary {
+        eprintln!("Wrote object file to {}", obj_file);
+    }
+
+    Ok(Compiled::Object {
+        path: obj_file,
+        temporary,
+    })
+}
+
+/// Link `objects` into `exe_file`, in the order given.
+fn link_objects(
+    objects: &[String],
+    exe_file: &str,
+    args: &Args,
+    target: &Target,
+) -> io::Result<()> {
     let mut link_cmd = Command::new("cc");
-    // Pass -shared flag for shared library creation
     if args.shared {
         link_cmd.arg("-shared");
-    } else if pie_mode {
+    } else if pie_enabled(args, target) {
         link_cmd.arg("-pie");
     } else {
         link_cmd.arg("-no-pie");
     }
-    link_cmd.args(["-o", &exe_file, &temp_obj]);
-    // Add library search paths
+    link_cmd.args(["-o", exe_file]);
+    for obj in objects {
+        link_cmd.arg(obj);
+    }
     for lib_path in &args.lib_paths {
         link_cmd.arg(format!("-L{}", lib_path));
     }
-    // Add libraries
     for lib in &args.libraries {
         link_cmd.arg(format!("-l{}", lib));
     }
-    // Add extra linker flags
     for flag in &args.linker_flags {
         link_cmd.arg(flag);
     }
-    let status = link_cmd.status()?;
 
-    let _ = std::fs::remove_file(&temp_obj);
-
-    if !status.success() {
+    if !link_cmd.status()?.success() {
         return Err(io::Error::other("linker failed"));
     }
 
     if args.verbose {
-        eprintln!("Wrote executable to {}", exe_file);
+        eprintln!("Linked {} object files to {}", objects.len(), exe_file);
     }
-
     Ok(())
 }
 
@@ -855,6 +865,120 @@ fn is_object_file(path: &str) -> bool {
         || path.contains(".so.") // versioned .so files like libz.so.1.3.1
 }
 
+/// What kind of thing a pathname operand names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OperandKind {
+    /// `.c`, `.i`, or a bare `-`.
+    Source,
+    /// `.s` or `.S`.
+    Asm,
+    /// `.o`, `.a`, `.so`, `.dylib`, or a versioned `.so.N`.
+    Object,
+    /// Anything else: warned about and skipped.
+    Unknown,
+}
+
+/// A pathname operand together with its kind, keeping argument order.
+#[derive(Debug, Clone)]
+struct Operand {
+    path: String,
+    kind: OperandKind,
+}
+
+impl Operand {
+    fn classify(path: String) -> Self {
+        let kind = if is_source_file(&path) {
+            OperandKind::Source
+        } else if is_asm_file(&path) {
+            OperandKind::Asm
+        } else if is_object_file(&path) {
+            OperandKind::Object
+        } else {
+            OperandKind::Unknown
+        };
+        Operand { path, kind }
+    }
+}
+
+/// The file stem used to name a source operand's outputs.
+fn operand_stem(path: &str) -> &str {
+    if path == "-" {
+        return "stdin";
+    }
+    Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("a")
+}
+
+/// Decide where a source operand's object file goes.
+fn source_object_name(path: &str, args: &Args) -> ObjectName {
+    let stem = operand_stem(path);
+    if args.compile_only {
+        // -c writes an object the user keeps. `-o` names it; otherwise it is
+        // $(basename operand .c).o in the current directory.
+        ObjectName::Keep(args.output.clone().unwrap_or_else(|| format!("{}.o", stem)))
+    } else {
+        ObjectName::Temp(format!("/tmp/c17_{}_{}.o", std::process::id(), stem))
+    }
+}
+
+/// Assemble a `.s`/`.S` operand.
+///
+/// Returns the object path, or `None` when `-c` wrote a named object that is
+/// not a link input.
+fn assemble_operand(path: &str, args: &Args, target: &Target) -> io::Result<Option<String>> {
+    let stem = operand_stem(path);
+    let obj_file = if args.compile_only {
+        args.output.clone().unwrap_or_else(|| format!("{}.o", stem))
+    } else {
+        format!("/tmp/c17_{}_{}.o", std::process::id(), stem)
+    };
+
+    // .S files need preprocessing, .s files do not.
+    let asm_to_assemble = if path.ends_with(".S") {
+        let temp_s = format!("/tmp/c17_{}_{}.s", std::process::id(), stem);
+        let content = std::fs::read(path)?;
+        let asm_config = AsmPreprocessConfig {
+            defines: &args.defines,
+            undefines: &args.undefines,
+            include_paths: &args.include_paths,
+            no_std_inc: args.no_std_inc,
+        };
+        let preprocessed = preprocess_asm_file(&content, target, path, &asm_config);
+        // Catch #error, a missing include, and friends.
+        if diag::has_error() != 0 {
+            diag::reset_counts();
+            return Err(io::Error::other("preprocessing failed"));
+        }
+        std::fs::write(&temp_s, &preprocessed)?;
+        temp_s
+    } else {
+        path.to_string()
+    };
+
+    let mut as_cmd = Command::new("as");
+    if args.debug > 0 {
+        as_cmd.arg("-g");
+    }
+    as_cmd.args(["-o", &obj_file, &asm_to_assemble]);
+    let status = as_cmd.status()?;
+
+    if path.ends_with(".S") {
+        let _ = std::fs::remove_file(&asm_to_assemble);
+    }
+
+    if !status.success() {
+        return Err(io::Error::other("assembler failed"));
+    }
+
+    if args.compile_only {
+        Ok(None)
+    } else {
+        Ok(Some(obj_file))
+    }
+}
+
 /// Determine whether PIE should be enabled for this compilation.
 fn pie_enabled(args: &Args, target: &Target) -> bool {
     if args.shared || args.fno_pie {
@@ -916,141 +1040,104 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => RuntimeLib::default_for_target(&target),
     };
 
-    // Separate source files, assembly files, and object files
-    let source_files: Vec<&String> = args.files.iter().filter(|f| is_source_file(f)).collect();
-    let asm_files: Vec<&String> = args.files.iter().filter(|f| is_asm_file(f)).collect();
-    let object_files: Vec<&String> = args.files.iter().filter(|f| is_object_file(f)).collect();
-
-    // Warn about unrecognized file types
-    for file in &args.files {
-        if !is_source_file(file) && !is_asm_file(file) && !is_object_file(file) {
-            eprintln!("c17: warning: unrecognized file type: {}", file);
-        }
-    }
-
-    // Process assembly files: preprocess .S files, then assemble both .s and .S to .o
-    let mut asm_objects: Vec<String> = Vec::new();
-    for asm_path in &asm_files {
-        let stem = Path::new(asm_path)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("out");
-        let obj_file = if args.compile_only {
-            args.output.clone().unwrap_or_else(|| format!("{}.o", stem))
-        } else {
-            format!("/tmp/c17_{}_{}.o", std::process::id(), stem)
-        };
-
-        // .S files need preprocessing, .s files don't
-        let asm_to_assemble = if asm_path.ends_with(".S") {
-            // Preprocess with internal preprocessor (assembly mode)
-            let temp_s = format!("/tmp/c17_{}_{}.s", std::process::id(), stem);
-            let content = match std::fs::read(asm_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("c17: cannot read '{}': {}", asm_path, e);
-                    std::process::exit(1);
-                }
-            };
-            let asm_config = AsmPreprocessConfig {
-                defines: &args.defines,
-                undefines: &args.undefines,
-                include_paths: &args.include_paths,
-                no_std_inc: args.no_std_inc,
-            };
-            let preprocessed = preprocess_asm_file(&content, &target, asm_path, &asm_config);
-            // Check for preprocessor errors (e.g., #error directive, missing include)
-            if diag::has_error() != 0 {
-                eprintln!("c17: preprocessing failed for {}", asm_path);
-                std::process::exit(1);
-            }
-            if let Err(e) = std::fs::write(&temp_s, &preprocessed) {
-                eprintln!("c17: cannot write '{}': {}", temp_s, e);
-                std::process::exit(1);
-            }
-            temp_s
-        } else {
-            (*asm_path).clone()
-        };
-
-        // Assemble
-        let mut as_cmd = Command::new("as");
-        if args.debug > 0 {
-            as_cmd.arg("-g");
-        }
-        as_cmd.args(["-o", &obj_file, &asm_to_assemble]);
-        let status = as_cmd.status()?;
-
-        // Clean up temp preprocessed file
-        if asm_path.ends_with(".S") {
-            let _ = std::fs::remove_file(&asm_to_assemble);
-        }
-
-        if !status.success() {
-            eprintln!("c17: assembler failed for {}", asm_path);
-            std::process::exit(1);
-        }
-
-        if !args.compile_only {
-            asm_objects.push(obj_file);
-        }
-    }
-
-    // If we only have object files (including from assembly) and an output is specified, just link them
-    let all_objects: Vec<&String> = object_files
+    // Classify operands in a single pass so that argument order survives.
+    // The spec deviates from XBD 12.2 to make that order significant
+    // (87866-87867), and EXAMPLE 3 depends on it.
+    let operands: Vec<Operand> = args
+        .files
         .iter()
-        .copied()
-        .chain(asm_objects.iter())
+        .map(|f| Operand::classify(f.clone()))
         .collect();
-    if source_files.is_empty() && !all_objects.is_empty() && args.output.is_some() {
-        let exe_file = args.output.clone().unwrap();
-        let mut link_cmd = Command::new("cc");
-        // Pass -shared flag for shared library creation
-        if args.shared {
-            link_cmd.arg("-shared");
-        } else if pie_enabled(&args, &target) {
-            link_cmd.arg("-pie");
-        } else {
-            link_cmd.arg("-no-pie");
+
+    for op in &operands {
+        if op.kind == OperandKind::Unknown {
+            eprintln!("c17: warning: unrecognized file type: {}", op.path);
         }
-        link_cmd.args(["-o", &exe_file]);
-        for obj in &all_objects {
-            link_cmd.arg(*obj);
-        }
-        // Add library search paths
-        for lib_path in &args.lib_paths {
-            link_cmd.arg(format!("-L{}", lib_path));
-        }
-        // Add libraries
-        for lib in &args.libraries {
-            link_cmd.arg(format!("-l{}", lib));
-        }
-        // Add extra linker flags
-        for flag in &args.linker_flags {
-            link_cmd.arg(flag);
-        }
-        let status = link_cmd.status()?;
-        // Clean up temp assembly objects
-        for obj in &asm_objects {
-            let _ = std::fs::remove_file(obj);
-        }
-        if !status.success() {
-            eprintln!("c17: linker failed");
-            std::process::exit(1);
-        }
-        if args.verbose {
-            eprintln!("Linked {} object files to {}", all_objects.len(), exe_file);
-        }
-        return Ok(());
+    }
+
+    let source_count = operands
+        .iter()
+        .filter(|o| o.kind == OperandKind::Source)
+        .count();
+
+    // A single -o names one output. With -c and several sources it would name
+    // each of them in turn, so every object but the last is overwritten. The
+    // spec leaves this unspecified (88338-88343); say so rather than silently
+    // producing one object.
+    if args.compile_only && args.output.is_some() && source_count > 1 {
+        eprintln!(
+            "c17: warning: -o ignored for all but the last of {} source operands with -c",
+            source_count
+        );
     }
 
     let mut streams = StreamTable::new();
+    // Objects to link, in operand order.
+    let mut link_inputs: Vec<String> = Vec::new();
+    // The subset of those we created and must clean up.
+    let mut temp_objects: Vec<String> = Vec::new();
+    // CONSEQUENCES OF ERRORS (88185-88187): diagnose, keep compiling the
+    // remaining operands, skip the link, exit non-zero.
+    let mut failed = false;
 
-    for path in &source_files {
-        if let Err(e) = process_file(path, &mut streams, &args, &target) {
-            eprintln!("c17: {}: {}", path, e);
-            std::process::exit(1);
+    for op in &operands {
+        match op.kind {
+            OperandKind::Unknown => {}
+            OperandKind::Object => link_inputs.push(op.path.clone()),
+            OperandKind::Asm => match assemble_operand(&op.path, &args, &target) {
+                Ok(Some(obj)) => {
+                    temp_objects.push(obj.clone());
+                    link_inputs.push(obj);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("c17: {}: {}", op.path, e);
+                    failed = true;
+                }
+            },
+            OperandKind::Source => {
+                let obj_name = source_object_name(&op.path, &args);
+                match process_file(&op.path, &mut streams, &args, &target, &obj_name) {
+                    Ok(Compiled::Nothing) => {}
+                    Ok(Compiled::Object { path, temporary }) => {
+                        if temporary {
+                            temp_objects.push(path.clone());
+                            link_inputs.push(path);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("c17: {}: {}", op.path, e);
+                        failed = true;
+                    }
+                }
+                // Error state is global and sticky, so clear it before the
+                // next operand — otherwise one bad file fails all the rest.
+                diag::reset_counts();
+            }
         }
+    }
+
+    let link_phase = !args.compile_only
+        && !args.asm_only
+        && !args.preprocess_only
+        && !args.dump_tokens
+        && !args.dump_ast
+        && args.dump_ir.is_none();
+
+    if !failed && link_phase && !link_inputs.is_empty() {
+        let exe_file = args.output.clone().unwrap_or_else(|| "a.out".to_string());
+        if let Err(e) = link_objects(&link_inputs, &exe_file, &args, &target) {
+            eprintln!("c17: {}", e);
+            failed = true;
+        }
+    }
+
+    for obj in &temp_objects {
+        let _ = std::fs::remove_file(obj);
+    }
+
+    if failed {
+        std::process::exit(1);
     }
 
     Ok(())

@@ -14,6 +14,7 @@
 // - c11/: C11 features (core, atomics)
 // - builtins/: Compiler builtins (bit_ops, memory, intrinsics, math, has_feature)
 // - codegen/: Code generation (regalloc, inline_asm, pic, misc)
+// - driver/: Driver operand handling (multi-TU link, option ordering)
 // - preprocessor/: Preprocessor (macros)
 // - misc/: Miscellaneous (setjmp, stmt_expr)
 // - tools/: Tool tests (cflow, ctags, cxref)
@@ -26,6 +27,7 @@ mod c99;
 mod codegen;
 mod common;
 mod cpython;
+mod driver;
 mod misc;
 mod preprocessor;
 mod tools;

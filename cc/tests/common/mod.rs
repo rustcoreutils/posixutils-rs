@@ -149,3 +149,29 @@ pub fn compile_and_run(name: &str, content: &str, extra_opts: &[String]) -> i32 
 pub fn compile_and_run_optimized(name: &str, content: &str) -> i32 {
     compile_and_run_single(name, content, &["-O1".to_string()], "optimized_only")
 }
+
+// ============================================================================
+// Arbitrary-argv driver invocation
+// ============================================================================
+
+/// The result of invoking `c17` with an arbitrary argument vector.
+pub struct C17Run {
+    pub stdout: String,
+    pub stderr: String,
+    pub success: bool,
+}
+
+/// Invoke `c17` with exactly `args`.
+///
+/// `compile_and_run` always builds one source with one `-o`, which cannot
+/// express the multi-operand and option-ordering cases the POSIX spec's
+/// EXAMPLE 1 and EXAMPLE 3 describe. Driver tests need the raw vector.
+pub fn run_c17(args: &[&str]) -> C17Run {
+    let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    let output = run_test_base("c17", &owned, &[]);
+    C17Run {
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        success: output.status.success(),
+    }
+}

@@ -284,8 +284,12 @@ pub fn warning_count() -> u32 {
     WARNING_COUNT.load(Ordering::Relaxed)
 }
 
-/// Reset error/warning counts
-#[cfg(test)]
+/// Reset error/warning counts.
+///
+/// The driver compiles every source operand in one process (POSIX requires it
+/// to continue past a failing operand), so this state has to be cleared between
+/// translation units — otherwise the first file's errors make every later file
+/// look like it failed too.
 pub fn reset_counts() {
     ERROR_COUNT.store(0, Ordering::Relaxed);
     WARNING_COUNT.store(0, Ordering::Relaxed);

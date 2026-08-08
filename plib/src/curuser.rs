@@ -9,6 +9,20 @@
 
 use std::ffi::CStr;
 
+/// Whether the real and effective user *and group* IDs all match, i.e. the
+/// process carries no elevated privilege from its executable's mode bits.
+///
+/// Use this before honouring an environment variable that names a file to read
+/// or a program to execute. Checking only `getuid() == geteuid()` is the common
+/// mistake: it is true for a **set-gid** binary, and set-gid is how the
+/// utilities that need this are conventionally installed — `crontab` set-gid
+/// `crontab` so it can write the spool, `lp` set-gid `lp`/`daemon`. A guard
+/// that misses that case protects nothing in the deployment that matters.
+pub fn real_and_effective_ids_match() -> bool {
+    // SAFETY: getuid/geteuid/getgid/getegid never fail and take no arguments.
+    unsafe { libc::getuid() == libc::geteuid() && libc::getgid() == libc::getegid() }
+}
+
 /// Return the login name strictly via `getlogin(3)`, with no environment or
 /// password-database fallback.
 ///
@@ -82,4 +96,42 @@ pub fn tty() -> Option<String> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::real_and_effective_ids_match;
+
+    /// An ordinary test process inherits no set-uid or set-gid bit, so every
+    /// caller that gates an environment override on this must see it as true —
+    /// otherwise the overrides those utilities' tests depend on would be
+    /// silently ignored and the tests would pass for the wrong reason.
+    #[test]
+    fn ids_match_in_an_unprivileged_process() {
+        assert!(
+            real_and_effective_ids_match(),
+            "a plain `cargo test` process should carry no elevated privilege"
+        );
+    }
+
+    /// The check must consider the group, not only the user. A uid-only guard
+    /// is true for a set-gid binary, which is how `crontab` and `lp` are
+    /// conventionally installed.
+    #[test]
+    fn ids_match_considers_the_group() {
+        // SAFETY: these getters never fail.
+        let (uid, euid, gid, egid) = unsafe {
+            (
+                libc::getuid(),
+                libc::geteuid(),
+                libc::getgid(),
+                libc::getegid(),
+            )
+        };
+        assert_eq!(
+            real_and_effective_ids_match(),
+            uid == euid && gid == egid,
+            "the guard must be the conjunction of both comparisons"
+        );
+    }
 }

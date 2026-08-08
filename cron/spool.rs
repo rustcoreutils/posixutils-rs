@@ -45,11 +45,11 @@ pub const DEFAULT_DIRECTORY: &str = "/var/spool/atjobs/";
 /// On Linux: checks the `AT_JOB_DIR` environment variable, then predefined directories.
 /// On macOS: checks or creates the `/var/at/jobs` directory.
 pub fn get_job_dir() -> Result<String, String> {
-    // Check `AT_JOB_DIR` environment variable
-    if let Ok(env_dir) = env::var("AT_JOB_DIR") {
-        if Path::new(&env_dir).exists() {
-            return Ok(env_dir);
-        }
+    // Check `AT_JOB_DIR` environment variable, under the same guard as the
+    // allow/deny overrides: this one redirects where jobs are *written*, so an
+    // `at` running with elevated privilege must ignore it entirely.
+    if let Some(env_dir) = job_dir_override() {
+        return Ok(env_dir);
     }
     #[cfg(target_os = "linux")]
     {
@@ -246,11 +246,8 @@ fn current_umask() -> libc::mode_t {
 /// Locate the at spool directory without creating it (used by the daemon, which
 /// must not fabricate the spool). Mirrors [`get_job_dir`]'s search order.
 pub fn at_spool_dir_readonly() -> Option<PathBuf> {
-    if let Ok(env_dir) = env::var("AT_JOB_DIR") {
-        let p = PathBuf::from(env_dir);
-        if p.exists() {
-            return Some(p);
-        }
+    if let Some(env_dir) = job_dir_override() {
+        return Some(PathBuf::from(env_dir));
     }
 
     #[cfg(target_os = "linux")]
@@ -373,6 +370,22 @@ fn read_user_file(file_path: &str) -> std::io::Result<HashSet<String>> {
         .lines()
         .map(|line| line.trim().to_string())
         .collect())
+}
+
+/// The `AT_JOB_DIR` spool override, if it is set, exists, and may be honored.
+///
+/// Guarded exactly like the allow/deny overrides (see
+/// [`crate::allow_deny_paths`]): honored only when the process carries no
+/// elevated privilege. It was previously read with no check at all, which is
+/// the wider hole of the two — the allow/deny pair only decides whether the
+/// invoking user may submit, whereas this decides which directory a set-uid or
+/// set-gid `at` writes jobs into.
+fn job_dir_override() -> Option<String> {
+    if !plib::curuser::real_and_effective_ids_match() {
+        return None;
+    }
+    let dir = env::var("AT_JOB_DIR").ok()?;
+    Path::new(&dir).exists().then_some(dir)
 }
 
 /// Locations of the at.allow / at.deny files. The implementation-defined

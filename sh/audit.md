@@ -12,6 +12,16 @@
 **Date:** 2026-06-16
 **Method:** static spec-vs-code audit (11 delegated section passes), **plus behavioral verification of every Critical/Major candidate** against the built `target/release/sh`, `dash`, and `bash --posix`. Findings marked **[V]** were reproduced on the binary; **[V-refuted]** notes claims that behavioral testing disproved; **[S]** are static-only (interactive/job-control paths hard to drive in CI).
 
+**Stale-box sweep (2026-08-08).** Every unchecked box was re-probed against the
+current binary. Eight rollup rows were fully closed by later phases and are now
+ticked; nine more were closed only in part and have been narrowed so each names
+just the residual gap (the previously-listed findings that *did* close are
+recorded parenthetically). The five DEFERRED findings stay unchecked by design.
+The sweep also **re-graded #20's remainder from Minor to Critical**: a here-document
+delimiter split by a backslash-newline aborts the process at
+`parse/lexer/command_lexer.rs:504`. That is an eighth process-aborting panic,
+found after the TL;DR below was written.
+
 ## TL;DR
 
 The shell is **broad and largely feature-complete** — all 15 special and 16 regular built-ins exist, every expansion type and redirection operator is present, real `fork`-based subshell/pipeline/job semantics work, and the golden paths (pipelines, lists, `if`/`for`/`while`/`case` structure, functions, here-docs, command substitution, most parameter expansions, globbing of real files) conform. But behavioral testing surfaced **seven Critical defects, including five process-aborting panics and two silent-wrong-result bugs on extremely common paths**: `case` pattern matching is **unanchored** (so `case ab in a)` matches — every `case` can take the wrong branch); `read -r x y` **panics**; `$((1/0))` and `$((5%0))` **panic**; an unreadable/missing script file **panics** instead of exiting 127; a `[]]` bracket pattern **panics**; and **`set -u` is completely inert** (unset variables expand to empty with status 0, defeating the safety option). Beyond these, ~30 Major gaps cluster in: POSIX.1-2024 additions not yet implemented (`$'...'`, `;&`, `set -o pipefail`, `{varname}<` IO_LOCATION), arithmetic edge cases (no unary chaining, no comma operator), error/exit-status semantics (`return` ignores `$?`, `command` returns 1 not 127, signal status off-by-one, special-builtin expansion errors don't abort), `break`/`continue` escaping function boundaries, symbolic `umask`, glob skipping symlinks, non-re-inputtable `-p`/list output quoting, and the `ENV`/`MAIL*` startup machinery. i18n is initialized but no runtime diagnostics are `gettext`-wrapped. None of the findings required exotic input — all reproduce with one-line scripts.
@@ -93,41 +103,41 @@ The shell is **broad and largely feature-complete** — all 15 special and 16 re
 - [x] Operator longest-match set `& && ( ) ; ;; | || < > >> <& >& <> >| << <<-` — `command_lexer.rs:229-253`. **[V]**
 - [x] `#` comment only at word start; here-doc inline scan; `<<-` tab strip — `command_lexer.rs:474-507`. **[V]**
 - [x] 16 reserved words recognized; `[[`/`function`/`select`/`time` correctly NOT reserved — `command_lexer.rs:253-268`. Reserved words are lexer-unconditional (parser re-absorbs them as argument words via `as_word_str`), so alias substitution never applies to a reserved word used as an argument (Minor, spec calls this "unspecified").
-- [ ] **`$'…'` dollar-single-quotes (#20).** Backslash-newline removal mid-token is incomplete (`mod.rs:295`, Minor).
+- [ ] **Backslash-newline removal mid-token is incomplete.** `$'…'` (#20) is **done** — `parse/lexer/mod.rs:290-303` plus the word lexer; `printf '%s' $'a\tb'` emits a real tab. What remains is line continuation: it is removed only in the word lexer, never during token recognition, so a reserved word split across lines (a line ending `i\` followed by a line starting `f true; then …`) fails with `'if' not found`, and — **re-graded from Minor to Critical** — a here-document *delimiter* split the same way **panics the process**: `assert_eq!(here_document.start_delimiter, here_document.end_delimiter)` at `parse/lexer/command_lexer.rs:504` aborts with exit 101 where bash and dash both succeed.
 
 ### Parameters & variables (§2.5)
 - [x] `$1..$9` single-digit, `${10}` braced multi-digit, `$0` not positional — `word_parser.rs:60,123-198`. **[V]**
 - [x] `$@`/`"$@"` split to separate words, `$*`/`"$*"` join on first IFS, `$#`, `$?`, `$$`, `$!`, `$0` — `wordexp/parameter.rs:89-161`. **[V]** (`$*` join verified.)
 - [x] `IFS`, `PATH`, `HOME`, `PS1/PS2/PS4`, `OPTIND/OPTARG`, `FCEDIT`, `HISTFILE/HISTSIZE` consulted — see `shell/mod.rs:972-988`, `history.rs`, `getopts.rs`.
-- [ ] **`$-` omits `i` for interactive shells** (`set.rs:212`, Minor); **PWD/OLDPWD/PPID/LINENO gaps (#53)**; **ENV unprocessed (#35)**; **`$!` lifetime** — `background_jobs.current()` can change after job cleanup (`jobs.rs:212`, Minor).
+- [ ] **`$-` omits `i` for interactive shells** — `SetOptions` (`builtin/set.rs:70-95`) has no interactive field and `to_string_short` (`set.rs:218-253`) never pushes `'i'`; a PTY probe of `echo $-` gives `hm`. **`$!` lifetime** — `sh -c 'sleep 0.05 & p=$!; wait; echo [$!]'` prints `[]` where bash and dash retain the pid. _(#53 and #35 are **closed**: `PWD`/`OLDPWD`/`LINENO` all behave; PPID being unchanged in a subshell is spec-required, so that sub-claim was never a defect. `ENV` is sourced for interactive shells at `main.rs:258`.)_
 
 ### Word expansions (§2.6)
 - [x] Expansion order (tilde→param→cmdsub→arith, then field-split, then glob, then quote-removal); field splitting only on unquoted expansion results — `wordexp/mod.rs:164-248`. **[V]**
 - [x] IFS rules (default on unset, no-split on empty, whitespace-run collapse, non-ws single delimiter) — `wordexp/mod.rs:110-157`.
 - [x] Command substitution `$(…)`/backtick in a real subshell, trailing newlines stripped, results not re-expanded — `shell/mod.rs:896-914`.
 - [x] Glob `*`/`?`/`[...]`, no-match→literal, leading-`.`/`/` rules, `set -f` disables, locale-collated sort — `wordexp/pathname.rs`, `pattern/mod.rs:153-190`. **[V]** (literal `.` does NOT match `?` — **[V-refuted]** any concern).
-- [ ] **Tilde HOME-unset error (#30); `${x:=}` eager (#9); `${#}` bytes (#39); glob symlinks (#24).** `${x:?}` correctly exits non-interactive (**[V]**).
+- [x] **Tilde HOME-unset (#30); `${x:=}` eager (#9); `${#}` bytes (#39); glob symlinks (#24) — all closed.** Probed: `env -u HOME sh -c 'echo ~'`→`~`; `x=set; echo "${x:=$(echo SIDE>&2;echo W)}"`→`set` with no side effect; `x=héllo; echo ${#x}`→`5`; a glob lists FIFOs and symlinks alongside regular files. `${x:?}` correctly exits non-interactive (**[V]**).
 
 ### Arithmetic expansion (§2.6.4)
 - [x] Full C operator set with correct precedence/associativity; assignment ops write back; ternary short-circuits; octal/hex/decimal constants; `&&`/`||` short-circuit — `wordexp/arithmetic.rs:244-620`. **[V]** (octal `010`→8, hex `0x1f`→31, ternary→7).
 - [x] Overflow on `+`/`-`/`*` and out-of-range shift **wrap** in the release binary (no panic) — **[V-refuted]** the "overflow/shift panic" concern for release builds (they panic only in debug/`cargo test`; still worth `wrapping_*` for test-suite safety). `0x` with no digits returns a clean error, not a panic — **[V-refuted]**.
-- [ ] **Div/mod by zero panic (#3,#4); unary chaining (#26); comma operator (#40); non-integer var silent-0 (#41); `set -u` not honored (#7).**
+- [x] **Div/mod by zero (#3,#4); unary chaining (#26); comma operator (#40); non-integer var (#41); `set -u` (#7) — all closed.** Probed: `$((1/0))` and `$((5%0))` report `division by zero` with status 1 instead of panicking; `$((!!0)) $((- -1))`→`0 1`; `$((1,2,3))`→`3`; `x=abc; $((x))`→`0`, matching bash's recursive evaluation; `set -u` errors on both `$undef` and `$((novar))`.
 
 ### Redirection (§2.7)
 - [x] All operators incl. `<>`, `>|`, `<&`/`>&` dup & `-` close, here-doc/`<<-`; default fds (0 in, 1 out); left-to-right order; redirect word gets expansion but not field-split/glob — `shell/opened_files.rs`, `parse/command.rs`. **[V]** (`exec 3>file; echo >&3` persists — **[V-refuted]** the "special-builtin redirect not persistent" claim).
-- [ ] **noclobber non-atomic/file-type (#44); IO_NUMBER cap (#43); IO_LOCATION (#57).**
+- [ ] **IO_LOCATION (#57)** remains unimplemented — see the DEFERRED entry above. _(#44 is **closed**: `shell/opened_files.rs:70` uses `.create_new(true)`, so `set -C` is atomic and now permits a FIFO. #43 is **closed**: `exec 5000>f; echo hi >&5000` works.)_
 
 ### Exit status & errors (§2.8) / Shell execution environment (§2.13)
 - [x] 127 command-not-found, 126 not-executable, syntax-error→2, blank/comment script→0, subshell inherits files/cwd/umask/functions/options, only exported vars passed to execve — `shell/mod.rs`, `os/mod.rs:211-217`. **[V]**
-- [ ] **Signal status off-by-one (#12); special-builtin expansion-error no-exit (#13); command_file-not-found panic (#6).**
+- [x] **Signal status off-by-one (#12); special-builtin expansion-error no-exit (#13); command_file-not-found panic (#6) — all closed.** Probed: `kill -TERM $$`→143 and `-INT`→130; `set -u; : ${undef}` exits 1 without running the next command; `sh /nonexistent`→127 with no panic.
 
 ### Shell commands & grammar (§2.9, §2.10)
 - [x] Simple commands (assignment/redirect ordering), pipelines + `!` negation in subshells, `&&`/`||`/`;`/`&` lists, `()`/`{}`/`for`/`case`/`if`/`while`/`until`, `for name; do`→`"$@"`, here-doc wiring — `parse/command_parser.rs`. **[V]**
-- [ ] **`;&` (#21); function linebreak/trailing-redirect (#23); `pipefail` exit selection (#14); declaration-utility assignment-expansion** (`export a=~` etc., §2.9.1, Minor-Major).
+- [ ] **Declaration-utility assignment-expansion** (§2.9.1, Minor-Major) is the only part still open: `HOME=/H sh -c 'export a=~; echo $a'` yields `~` where both bash and dash yield `/H`; same for `readonly b=~` and `export p=~/b:~/c`. Plain `v=~` is correct. _(#21 **closed** — `case a in a) echo A;& b) echo B;; esac`→`A\nB`. #14 **closed** — `set -o pipefail; false|true`→1, `set +o`→0. #23's linebreak half **closed**; its trailing-redirect-on-a-function-definition half is separately DEFERRED above.)_
 
 ### Job control (§2.11) / Signals & traps (§2.12)
 - [x] `set -m` default-on interactive; bg jobs get own pgid; `tcsetpgrp` for pipelines; SIGTTIN/TTOU/TSTP ignored under `-m`; `%`-job syntax (`%%`/`%+`/`%-`/`%N`/`%?str`/`%str`); subshell resets caught traps to default, keeps ignored; EXIT trap fires; only exported env to children — `os/signals.rs:318-335`, `jobs.rs:91-115`, `main.rs:235-243`. **[V]** SIGQUIT/SIGTERM ignored interactive; SIGINT caught no-op.
-- [ ] **Async signal/stdin (#33); wait EINTR (#32); exit-in-EXIT-trap (#37); jobs signaled-state (#38); notification timing without `set -b`** (Minor).
+- [ ] **Async signal/stdin (#33)** is the only part still open — see the DEFERRED entry above. _(#32 **closed** — a trapped `USR1` during `wait` runs the handler and returns 0, no panic. #37 **closed** — `trap 'echo IN-EXIT-TRAP; exit 5' EXIT` exits 5 with no recursion. #38 **closed** — `JobState::Signaled` at `jobs.rs:35,50,161`; a PTY shows `[1]+ Terminated (SIGTERM)  sleep 20 &`. Notification timing without `set -b` probes correct: the report lands before the next prompt.)_
 
 ### Pattern matching notation (§2.14)
 - [x] `?`/`*`/bracket ranges/`[:class:]`/`[.sym.]`/`[=eq=]` parsed; negation via `!`; `/` and leading-`.` not matched by wildcards — `pattern/parse.rs`, `pattern/mod.rs`. **[V]** digit-class, negation.
@@ -152,11 +162,11 @@ The shell is **broad and largely feature-complete** — all 15 special and 16 re
 
 ### sh utility page (§3)
 - [x] Short options `-abCefhimnuvx`, `+`-forms, `-o/+o name`, `-c`, `-s`, `-i`; bundling; single `-` operand; positional from operands; ASYNCHRONOUS EVENTS (SIGINT caught no-op, SIGQUIT/SIGTERM ignored interactive, SIGTTIN/TTOU/TSTP under `-m`); empty `-c ''`→0; blank-script→0 — `cli/args.rs`, `main.rs:235-243`. **[V]**
-- [ ] **`--` end-of-options (#22); command_file-not-found→127 (#6); 126 ENOEXEC for the script operand; 128 on unrecoverable read error; interactive detection stderr (#36); ENV (#35); MAIL* (#50).**
+- [ ] **128 on an unrecoverable read error** is the only part still open: `main.rs:326-338` maps `NotFound`→127 and *everything else*→126, so `sh /proc/self/mem` exits 126 where sh.md:115097 requires 128. _(#22 **closed** — `sh -- -c 'echo hi'`→127 with no "invalid option". #6 **closed** — a missing script exits 127. 126 ENOEXEC **closed** — `sh /bin/true`→126. #36 **closed** — `cli/terminal.rs:117` tests stdin **and** stderr. #35 **closed** — ENV is sourced. #50 **closed** — `MAILPATH`/`MAILCHECK` at `shell/mod.rs:1110-1121`.)_
 
 ### Command-line editing (vi-mode, §3 EXTENDED DESCRIPTION)
 - [x] Insert mode (newline/ESC/`^V`), motions (`l h w W e E b B ^ $ 0 | f F t T ; ,`), edits (`a A i I R c C S r _ x X d D y Y`), history (`k/- j/+` `/pat` `?pat` `n N`), meta (`= \ * ~ .` `^L`), save buffer — `cli/vi/{mod,cursor,word}.rs`, `shell/history.rs`. ~60% coverage. **[S]**
-- [ ] **vi-mode gaps (#55).**
+- [x] **vi-mode gaps (#55) — closed.** All named gaps are implemented: `u`/`U` with a real snapshot swap (`cli/vi/mod.rs:735-745`), `[n]v` external editor (`:498`), `@letter` (`:467`), insert-mode `^W` (`:882-894`), `[n]G` (`:771-789`), `#` auto-execute (`:390-398`), `p`/`P` honoring a count (`:712-733`), EOF only at line start (`:871-876`), and `VERASE`/`VKILL` read from termios (`cli/terminal.rs:46,54`).
 
 ### Regular built-ins (§3) — per-utility verdicts
 | Utility | Verdict | Headline finding(s) |
@@ -178,15 +188,17 @@ The shell is **broad and largely feature-complete** — all 15 special and 16 re
 
 ## Test coverage signal
 
-The 135 integration tests + 100 fixtures cover the conforming golden paths well but have **no behavioral coverage** for the defect clusters below — every Critical reproduced trivially yet none is caught:
-- [ ] `case`/pattern anchoring and bracket edge cases (#1, #2, #8) — no test asserts `case ab in a)` does *not* match, or that `[]]`/`[.*^]` work.
-- [ ] Arithmetic error paths (#3, #4) and unary chaining/comma (#26, #40).
-- [ ] `read -r`/multi-var/line-continuation (#5, #19); `set -u` enforcement (#7).
-- [ ] CLI: missing script file (#6), `--` (#22), exit codes 126/127/128.
-- [ ] `return $?` (#10), `break`/`continue` across functions (#11), signal exit status (#12).
-- [ ] Job control: bg/fg/jobs/wait/kill-as-job-control, `fc`/history, `hash`, `ulimit`, `cd` CDPATH/`-P`, `getopts` OPTIND.
-- [ ] POSIX.1-2024 additions: `$'…'`, `;&`, `set -o pipefail`.
-- [ ] vi-mode commands (interactive; consider a scripted PTY harness).
+The audit recorded **no behavioral coverage** for the defect clusters below.
+Most have since been closed by regression tests in `sh/tests/integration.rs`;
+the rows that remain unticked name only what is still uncovered.
+- [x] `case`/pattern anchoring and bracket edge cases (#1, #2, #8) — `integration.rs:1485` `case_pattern_is_anchored`, `:1413` `bracket_close_first_is_literal_no_panic`, `:1879` `bracket_literal_members_match` (`[.*^]`, `[.]`, `[a^]`).
+- [x] Arithmetic error paths (#3, #4) and unary chaining/comma (#26, #40) — `integration.rs:1420,1427` (`div`/`mod` by zero), `:1580,1589` (`arithmetic_unary_operators_chain`, `arithmetic_comma_operator`).
+- [x] `read -r`/multi-var/line-continuation (#5, #19); `set -u` enforcement (#7) — `integration.rs:1443` `read_with_options_before_vars_no_panic`, `:1760` `read_honors_backslash_newline_continuation`, `:1499,1508` `nounset_*`.
+- [ ] CLI exit codes **126** (ENOEXEC/not-executable) and **128** (unrecoverable read error) — still unasserted anywhere. _(#6 and #22 are covered: `integration.rs:1456` `missing_command_file_exits_127_not_panic`, `:1681` `double_dash_ends_options`, plus `:1530` `command_not_found_exits_127`.)_
+- [ ] `continue` crossing a function boundary (#11) — `tests/sh/builtin/continue.sh` is loops-only and no test calls a function from inside a caller's loop. _(#10 and #12 are covered: `integration.rs:1555` `return_with_no_operand_uses_dollar_question`, `:1538` `signal_terminated_status_is_128_plus_signal`; `break`-across-functions at `:1566`.)_
+- [ ] Job control: `bg`/`fg` (zero hits in `sh/tests/`), `jobs` listing/state, `fc`/history behavior, `hash`, `ulimit`, `cd` CDPATH/`-P` — all still uncovered; the `fc` and `cd` unit tests only exercise argument parsing. _(Covered: `getopts` OPTIND at `integration.rs:1730` `getopts_optind_is_a_plain_integer`; `wait`+`kill` as job control at `:1538`; `jobs` bare-id error path at `:1477`.)_
+- [x] POSIX.1-2024 additions: `$'…'`, `;&`, `set -o pipefail` — `integration.rs:1648` `dollar_single_quote_escapes`, `:1660` `case_semi_and_falls_through`, `:1706` `pipefail_derives_pipeline_status`.
+- [ ] vi-mode commands — still no PTY harness anywhere in `sh/tests/`; the only vi tests (`cli/vi/cursor.rs:259`, `cli/vi/word.rs`) are helper-level and never execute a `CommandOp`.
 
 ## Suggested PR groupings
 

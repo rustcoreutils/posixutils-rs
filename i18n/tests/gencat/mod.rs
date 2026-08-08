@@ -238,3 +238,39 @@ fn gencat_octal_escape_above_7f_is_one_byte() {
         r"\351 must expand to the single byte 0xE9"
     );
 }
+
+/// Two messages in one set must not overrun the catalog's hash array.
+///
+/// The sizing pass measured collision depth with `msg_id * set_id` while the
+/// fill pass placed messages with `msg_id * (set_id + 1)`. The array is sized
+/// `best_size * best_depth * 3` from the first hash, so the second could probe
+/// past its end: `$set 1` with messages 1 and 2 both land in slot 0 at
+/// `best_size` 2, needing depth 2 against an array built for depth 1.
+/// Pre-existing, and reachable with the smallest catalog that has a collision.
+#[test]
+fn gencat_two_messages_in_a_set_do_not_overrun_the_array() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let msg_path = temp.path().join("two.msg");
+    let cat_path = temp.path().join("two.cat");
+    std::fs::write(&msg_path, b"$set 1\n1 first\n2 second\n").unwrap();
+
+    let out = std::process::Command::new(plib::testing::get_binary_path("gencat"))
+        .arg(&cat_path)
+        .arg(&msg_path)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("panicked"),
+        "gencat panicked on a two-message set: {stderr}"
+    );
+    assert!(out.status.success(), "gencat failed: {stderr}");
+
+    let mut catalog = Vec::new();
+    File::open(&cat_path)
+        .unwrap()
+        .read_to_end(&mut catalog)
+        .unwrap();
+    assert!(catalog.windows(6).any(|w| w == b"first\0"));
+    assert!(catalog.windows(7).any(|w| w == b"second\0"));
+}

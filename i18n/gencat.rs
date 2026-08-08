@@ -727,6 +727,16 @@ impl MessageCatalog {
         }
     }
 
+    /// Slot for a message in the catalog's open-addressed array.
+    ///
+    /// Shared by the sizing pass and the fill pass so the two cannot disagree about
+    /// where a message lands — which is what let the fill probe run off the end of
+    /// an array sized by the other hash.
+    #[cfg(not(target_os = "macos"))]
+    fn catalog_hash(set_id: u32, msg_id: usize, size: usize) -> usize {
+        ((set_id + 1) as usize * msg_id) % size
+    }
+
     #[cfg(not(target_os = "macos"))]
     fn compute_optimal_size(&self) -> (usize, usize) {
         let mut best_total = usize::MAX;
@@ -746,7 +756,15 @@ impl MessageCatalog {
 
                 while let Some(msg) = current_msg {
                     let msg = msg.borrow();
-                    let idx = (msg.msg_id * set.set_id as usize) % act_size;
+                    // Must be the *same* hash `fill_arrays` uses. It was
+                    // `msg_id * set_id` here and `msg_id * (set_id + 1)` there,
+                    // so the depth measured while sizing did not describe the
+                    // collisions that actually occurred, and the array — sized
+                    // `best_size * best_depth * 3` — was overrun by the probe.
+                    // `$set 1` with messages 1 and 2 was enough: both hash to
+                    // slot 0 at `best_size` 2, giving depth 2 against an array
+                    // sized for depth 1.
+                    let idx = Self::catalog_hash(set.set_id, msg.msg_id, act_size);
                     deep[idx] += 1;
 
                     if deep[idx] > act_depth {
@@ -785,7 +803,7 @@ impl MessageCatalog {
 
             while let Some(msg) = current_msg {
                 let msg = msg.borrow();
-                let mut idx = (((set.set_id + 1) as usize * msg.msg_id) % best_size) * 3;
+                let mut idx = Self::catalog_hash(set.set_id, msg.msg_id, best_size) * 3;
 
                 while array[idx] != 0 {
                     idx += best_size * 3;

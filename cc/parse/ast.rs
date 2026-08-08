@@ -184,6 +184,12 @@ pub enum ExprKind {
 
     /// Wide string literal (L"...")
     WideStringLit(String),
+    /// `u"..."` — the literal's `char16_t` code units, surrogate pairs already
+    /// formed. Held as units rather than text because the element width is
+    /// what codegen emits.
+    Utf16StringLit(Vec<u16>),
+    /// `U"..."` — the literal's `char32_t` code points.
+    Utf32StringLit(Vec<u32>),
 
     /// Identifier (variable reference)
     /// Symbol is None only for builtins like __func__ that need special handling

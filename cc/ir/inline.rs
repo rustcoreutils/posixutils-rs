@@ -1243,7 +1243,9 @@ fn collect_func_refs_from_initializer(
         | Initializer::Int(_)
         | Initializer::Float(_)
         | Initializer::String(_)
-        | Initializer::WideString(_) => {}
+        | Initializer::WideString(_)
+        | Initializer::Utf16String(_)
+        | Initializer::Utf32String(_) => {}
     }
 }
 

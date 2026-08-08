@@ -34,6 +34,71 @@ pub enum LexerMode {
 // Token Types
 // ============================================================================
 
+/// Apply translation phase 1 trigraph replacement to a source buffer.
+///
+/// C17 5.2.1.1 still mandates the nine trigraphs; they were removed in C23,
+/// and POSIX's own RATIONALE (88224) notes that *not* supporting them is the
+/// non-conforming choice. They are nonetheless off by default here, behind
+/// `-trigraphs`, because the replacement applies everywhere including inside
+/// string literals — `"What??!"` silently becomes `"What|"` — and real code is
+/// far more likely to contain `??` by accident than by intent. GCC ships them
+/// off by default for the same reason.
+///
+/// Done as a whole-buffer pre-pass rather than inside `nextchar`, because
+/// phase 1 precedes line splicing (so `??/` at end of line must be able to
+/// become a splice) and because `peekchar` is a separate non-mutating scanner
+/// that would have to mirror the rule exactly.
+///
+/// Returns the original buffer untouched when it contains no trigraph.
+pub fn replace_trigraphs(buf: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    /// The third character of each trigraph, and what `??x` becomes.
+    const TRIGRAPHS: &[(u8, u8)] = &[
+        (b'=', b'#'),
+        (b'(', b'['),
+        (b'/', b'\\'),
+        (b')', b']'),
+        (b'\'', b'^'),
+        (b'<', b'{'),
+        (b'!', b'|'),
+        (b'>', b'}'),
+        (b'-', b'~'),
+    ];
+
+    if !buf.windows(2).any(|w| w == b"??") {
+        return std::borrow::Cow::Borrowed(buf);
+    }
+
+    let mut out = Vec::with_capacity(buf.len());
+    let mut i = 0;
+    while i < buf.len() {
+        if i + 2 < buf.len() && buf[i] == b'?' && buf[i + 1] == b'?' {
+            if let Some(&(_, repl)) = TRIGRAPHS.iter().find(|(c, _)| *c == buf[i + 2]) {
+                out.push(repl);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(buf[i]);
+        i += 1;
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// The encoding prefix on a character or string literal (C11 6.4.4.4, 6.4.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiteralEncoding {
+    /// No prefix.
+    Narrow,
+    /// `u8` — a string of `char`, guaranteed UTF-8. Strings only.
+    Utf8,
+    /// `L` — `wchar_t`.
+    Wide,
+    /// `u` — `char16_t`.
+    Utf16,
+    /// `U` — `char32_t`.
+    Utf32,
+}
+
 /// Token types for C99 preprocessing tokens
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenType {
@@ -41,8 +106,16 @@ pub enum TokenType {
     Number,
     Char,
     WideChar,
+    /// `u'x'` — a `char16_t` constant (C11 6.4.4.4).
+    Utf16Char,
+    /// `U'x'` — a `char32_t` constant.
+    Utf32Char,
     String,
     WideString,
+    /// `u"..."` — a `char16_t` string literal (C11 6.4.5).
+    Utf16String,
+    /// `U"..."` — a `char32_t` string literal.
+    Utf32String,
     Special,
     StreamBegin,
     StreamEnd,
@@ -110,6 +183,16 @@ pub enum TokenValue {
     Char(String),       // Character literal content
     WideString(String), // Wide string literal
     WideChar(String),   // Wide character literal
+    /// `u"..."` content. Held as a Rust `String`; the 16-bit code units are
+    /// produced at emission, so a code point outside the BMP becomes a
+    /// surrogate pair there rather than being lost here.
+    Utf16String(String),
+    /// `U"..."` content.
+    Utf32String(String),
+    /// `u'x'` content.
+    Utf16Char(String),
+    /// `U'x'` content.
+    Utf32Char(String),
 }
 
 // ============================================================================
@@ -631,10 +714,20 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
                 self.nextchar(); // Now consume it
                 name.push(cu as char);
             } else {
-                // Check for L"..." or L'...' (wide string/char)
-                if name == "L" && (cu == b'"' || cu == b'\'') {
-                    self.nextchar(); // Consume the quote
-                    return self.get_string_or_char(cu, true);
+                // An encoding prefix directly before a quote: L, u, U, u8
+                // (C11 6.4.4.4 / 6.4.5). `u8` applies to strings only.
+                if cu == b'"' || cu == b'\'' {
+                    let enc = match name.as_str() {
+                        "L" => Some(LiteralEncoding::Wide),
+                        "u" => Some(LiteralEncoding::Utf16),
+                        "U" => Some(LiteralEncoding::Utf32),
+                        "u8" if cu == b'"' => Some(LiteralEncoding::Utf8),
+                        _ => None,
+                    };
+                    if let Some(enc) = enc {
+                        self.nextchar(); // Consume the quote
+                        return self.get_string_or_char(cu, enc);
+                    }
                 }
                 break;
             }
@@ -679,7 +772,7 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
     }
 
     /// Get a string or character literal
-    fn get_string_or_char(&mut self, delim: u8, wide: bool) -> Token {
+    fn get_string_or_char(&mut self, delim: u8, enc: LiteralEncoding) -> Token {
         let pos = self.pos();
         let mut content = String::new();
         let mut escape = false;
@@ -742,15 +835,29 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
         }
 
         let (typ, value) = if delim == b'"' {
-            if wide {
-                (TokenType::WideString, TokenValue::WideString(content))
-            } else {
-                (TokenType::String, TokenValue::String(content))
+            match enc {
+                // A `u8"..."` literal has type `char[]` (C11 6.4.5p6), and the
+                // source is already UTF-8, so it is an ordinary narrow string.
+                LiteralEncoding::Narrow | LiteralEncoding::Utf8 => {
+                    (TokenType::String, TokenValue::String(content))
+                }
+                LiteralEncoding::Wide => (TokenType::WideString, TokenValue::WideString(content)),
+                LiteralEncoding::Utf16 => {
+                    (TokenType::Utf16String, TokenValue::Utf16String(content))
+                }
+                LiteralEncoding::Utf32 => {
+                    (TokenType::Utf32String, TokenValue::Utf32String(content))
+                }
             }
-        } else if wide {
-            (TokenType::WideChar, TokenValue::WideChar(content))
         } else {
-            (TokenType::Char, TokenValue::Char(content))
+            match enc {
+                LiteralEncoding::Narrow | LiteralEncoding::Utf8 => {
+                    (TokenType::Char, TokenValue::Char(content))
+                }
+                LiteralEncoding::Wide => (TokenType::WideChar, TokenValue::WideChar(content)),
+                LiteralEncoding::Utf16 => (TokenType::Utf16Char, TokenValue::Utf16Char(content)),
+                LiteralEncoding::Utf32 => (TokenType::Utf32Char, TokenValue::Utf32Char(content)),
+            }
         };
 
         Token::with_value(typ, pos, value)
@@ -799,7 +906,7 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
 
         // Check for string/char literals
         if class & QUOTE != 0 {
-            return Some(self.get_string_or_char(first, false));
+            return Some(self.get_string_or_char(first, LiteralEncoding::Narrow));
         }
 
         // Check for .digit (floating point number)
@@ -1144,6 +1251,34 @@ pub fn show_token(token: &Token, strings: &StringTable) -> String {
                 "<wchar?>".to_string()
             }
         }
+        TokenType::Utf16String => {
+            if let TokenValue::Utf16String(s) = &token.value {
+                format!("u\"{}\"", s)
+            } else {
+                "<u16string?>".to_string()
+            }
+        }
+        TokenType::Utf32String => {
+            if let TokenValue::Utf32String(s) = &token.value {
+                format!("U\"{}\"", s)
+            } else {
+                "<u32string?>".to_string()
+            }
+        }
+        TokenType::Utf16Char => {
+            if let TokenValue::Utf16Char(s) = &token.value {
+                format!("u'{}'", s)
+            } else {
+                "<u16char?>".to_string()
+            }
+        }
+        TokenType::Utf32Char => {
+            if let TokenValue::Utf32Char(s) = &token.value {
+                format!("U'{}'", s)
+            } else {
+                "<u32char?>".to_string()
+            }
+        }
         TokenType::Special => {
             if let TokenValue::Special(v) = &token.value {
                 show_special(*v)
@@ -1163,6 +1298,10 @@ pub fn token_type_name(typ: TokenType) -> &'static str {
         TokenType::WideChar => "WCHAR",
         TokenType::String => "STRING",
         TokenType::WideString => "WSTRING",
+        TokenType::Utf16Char => "U16CHAR",
+        TokenType::Utf32Char => "U32CHAR",
+        TokenType::Utf16String => "U16STRING",
+        TokenType::Utf32String => "U32STRING",
         TokenType::Special => "SPECIAL",
         TokenType::StreamBegin => "STREAM_BEGIN",
         TokenType::StreamEnd => "STREAM_END",
@@ -1242,6 +1381,68 @@ pub fn tokens_to_text(tokens: &[Token], strings: &StringTable) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn test_replace_trigraphs() {
+        // All nine sequences of C17 5.2.1.1.
+        assert_eq!(
+            replace_trigraphs(b"??=??(??/??)??'??<??!??>??-").as_ref(),
+            br"#[\]^{|}~"
+        );
+        // A buffer with no trigraph is returned untouched.
+        assert!(matches!(
+            replace_trigraphs(b"int main(void) { return 0; }"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        // `??` not followed by a trigraph character stays literal — this is
+        // the case that makes the feature opt-in.
+        assert_eq!(replace_trigraphs(b"What??!").as_ref(), b"What|");
+        assert_eq!(replace_trigraphs(b"What??x").as_ref(), b"What??x");
+        assert_eq!(replace_trigraphs(b"a??").as_ref(), b"a??");
+        // Overlapping question marks: only a complete `??x` is replaced.
+        assert_eq!(replace_trigraphs(b"???=").as_ref(), b"?#");
+    }
+
+    #[test]
+    fn test_literal_encoding_prefixes() {
+        let mut strings = StringTable::new();
+        let src = br#"u8"a" u"b" U"c" L"d" u'e' U'f' L'g' "h" 'i'"#;
+        let tokens = Tokenizer::new(src, 0, &mut strings).tokenize();
+        let kinds: Vec<TokenType> = tokens
+            .iter()
+            .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
+            .map(|t| t.typ)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                // u8"..." has type char[], so it is an ordinary narrow string.
+                TokenType::String,
+                TokenType::Utf16String,
+                TokenType::Utf32String,
+                TokenType::WideString,
+                TokenType::Utf16Char,
+                TokenType::Utf32Char,
+                TokenType::WideChar,
+                TokenType::String,
+                TokenType::Char,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_u8_prefix_only_applies_to_strings() {
+        // There is no `u8'x'` character constant in C11, so `u8` before a
+        // quote must stay an identifier.
+        let mut strings = StringTable::new();
+        let tokens = Tokenizer::new(b"u8'x'", 0, &mut strings).tokenize();
+        let kinds: Vec<TokenType> = tokens
+            .iter()
+            .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
+            .map(|t| t.typ)
+            .collect();
+        assert_eq!(kinds, vec![TokenType::Ident, TokenType::Char]);
+    }
     use super::*;
 
     fn tokenize_str(input: &str) -> (Vec<Token>, StringTable) {

@@ -345,6 +345,28 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
                     self.push_directive(Directive::Zero(size - wide_string_bytes));
                 }
             }
+            Initializer::Utf16String(units) => {
+                // char16_t: 2 bytes per code unit.
+                for &u in units {
+                    self.push_directive(Directive::Short(u as i64));
+                }
+                self.push_directive(Directive::Short(0));
+                let emitted = (units.len() + 1) * 2;
+                if size > emitted {
+                    self.push_directive(Directive::Zero(size - emitted));
+                }
+            }
+            Initializer::Utf32String(units) => {
+                // char32_t: 4 bytes per code point.
+                for &u in units {
+                    self.push_directive(Directive::Long(u as i64));
+                }
+                self.push_directive(Directive::Long(0));
+                let emitted = (units.len() + 1) * 4;
+                if size > emitted {
+                    self.push_directive(Directive::Zero(size - emitted));
+                }
+            }
             Initializer::Array {
                 elem_size,
                 total_size,
@@ -444,6 +466,40 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             self.push_directive(Directive::Long(0));
         }
 
+        self.push_directive(Directive::Text);
+    }
+
+    /// Emit `u"..."` literals referenced by address.
+    pub fn emit_utf16_strings(&mut self, strings: &[(String, Vec<u16>)]) {
+        if strings.is_empty() {
+            return;
+        }
+        self.push_directive(Directive::Rodata);
+        self.push_directive(Directive::Align(2)); // char16_t
+        for (label, units) in strings {
+            self.push_directive(Directive::local_label(label));
+            for &u in units {
+                self.push_directive(Directive::Short(u as i64));
+            }
+            self.push_directive(Directive::Short(0));
+        }
+        self.push_directive(Directive::Text);
+    }
+
+    /// Emit `U"..."` literals referenced by address.
+    pub fn emit_utf32_strings(&mut self, strings: &[(String, Vec<u32>)]) {
+        if strings.is_empty() {
+            return;
+        }
+        self.push_directive(Directive::Rodata);
+        self.push_directive(Directive::Align(4)); // char32_t
+        for (label, units) in strings {
+            self.push_directive(Directive::local_label(label));
+            for &u in units {
+                self.push_directive(Directive::Long(u as i64));
+            }
+            self.push_directive(Directive::Long(0));
+        }
         self.push_directive(Directive::Text);
     }
 }

@@ -651,6 +651,7 @@ impl Walker {
                 include_paths: &[],
                 no_std_inc: true,
                 no_builtin_inc: true,
+                trigraphs: false,
             },
         );
 

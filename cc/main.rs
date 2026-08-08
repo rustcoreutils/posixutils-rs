@@ -42,8 +42,8 @@ use symbol::SymbolTable;
 use target::Os;
 use target::Target;
 use token::{
-    preprocess_asm_file, preprocess_with_defines, show_token, token_type_name, AsmPreprocessConfig,
-    PreprocessConfig, StreamTable, Tokenizer,
+    preprocess_asm_file, preprocess_with_defines, replace_trigraphs, show_token, token_type_name,
+    AsmPreprocessConfig, PreprocessConfig, StreamTable, Tokenizer,
 };
 
 // ============================================================================
@@ -219,6 +219,13 @@ struct Args {
     #[arg(short = 's', help = gettext("Strip symbol table and relocation information"))]
     strip: bool,
 
+    /// Enable translation phase 1 trigraph replacement.
+    ///
+    /// Off by default: the replacement applies everywhere, including inside
+    /// string literals, so `"What??!"` would silently become `"What|"`.
+    #[arg(long = "trigraphs", help = gettext("Enable trigraph replacement (C17 5.2.1.1)"))]
+    trigraphs: bool,
+
     /// Disable builtin function recognition (GCC compatibility)
     /// c17 does not implicitly recognize standard library functions as builtins,
     /// so this flag is accepted for compatibility but has no effect.
@@ -363,6 +370,13 @@ fn process_file(
         path
     };
 
+    // Translation phase 1, before anything else looks at the bytes.
+    let buffer = if args.trigraphs {
+        replace_trigraphs(&buffer).into_owned()
+    } else {
+        buffer
+    };
+
     // Create stream
     let stream_id = streams.add(display_path.to_string());
 
@@ -416,6 +430,7 @@ fn process_file(
             include_paths: &args.include_paths,
             no_std_inc: args.no_std_inc,
             no_builtin_inc: args.no_builtin_inc,
+            trigraphs: args.trigraphs,
         },
     );
 

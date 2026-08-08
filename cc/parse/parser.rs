@@ -1430,6 +1430,11 @@ impl Parser<'_> {
                 // size is number of chars + 1 for null terminator
                 Some(s.chars().count() + 1)
             }
+            // char16_t/char32_t literals already carry code units, so the
+            // element count is the unit count. The *byte* size follows from
+            // the element type, which is set separately below.
+            ExprKind::Utf16StringLit(units) => Some(units.len() + 1),
+            ExprKind::Utf32StringLit(units) => Some(units.len() + 1),
             _ => None,
         };
 

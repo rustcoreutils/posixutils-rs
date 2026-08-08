@@ -206,8 +206,12 @@ impl Macro {
                             TokenValue::String(s) => MacroTokenValue::String(s.clone()),
                             TokenValue::Char(c) => MacroTokenValue::Char(c.clone()),
                             TokenValue::Special(code) => MacroTokenValue::Special(*code),
-                            TokenValue::WideString(s) => MacroTokenValue::String(s.clone()),
-                            TokenValue::WideChar(c) => MacroTokenValue::Char(c.clone()),
+                            TokenValue::WideString(s)
+                            | TokenValue::Utf16String(s)
+                            | TokenValue::Utf32String(s) => MacroTokenValue::String(s.clone()),
+                            TokenValue::WideChar(c)
+                            | TokenValue::Utf16Char(c)
+                            | TokenValue::Utf32Char(c) => MacroTokenValue::Char(c.clone()),
                             TokenValue::None => MacroTokenValue::None,
                         };
                         MacroToken {
@@ -387,6 +391,8 @@ pub struct Preprocessor<'a> {
 
     /// Whether to use builtin headers (disabled by -nobuiltininc or -nostdinc)
     use_builtin_headers: bool,
+    /// Apply translation phase 1 trigraph replacement to included files.
+    trigraphs: bool,
 
     /// Whether to use system include paths (disabled by -nostdinc)
     use_system_headers: bool,
@@ -555,6 +561,7 @@ impl<'a> Preprocessor<'a> {
             compile_time,
             preprocess_depth: 0,
             use_builtin_headers: true,
+            trigraphs: false,
             use_system_headers: true,
             current_include_path_index: None,
             lexer_mode: LexerMode::C,
@@ -1489,8 +1496,12 @@ impl<'a> Preprocessor<'a> {
             TokenValue::String(s) => MacroTokenValue::String(s.clone()),
             TokenValue::Char(c) => MacroTokenValue::Char(c.clone()),
             TokenValue::Special(code) => MacroTokenValue::Special(*code),
-            TokenValue::WideString(s) => MacroTokenValue::String(s.clone()),
-            TokenValue::WideChar(c) => MacroTokenValue::Char(c.clone()),
+            TokenValue::WideString(s) | TokenValue::Utf16String(s) | TokenValue::Utf32String(s) => {
+                MacroTokenValue::String(s.clone())
+            }
+            TokenValue::WideChar(c) | TokenValue::Utf16Char(c) | TokenValue::Utf32Char(c) => {
+                MacroTokenValue::Char(c.clone())
+            }
             TokenValue::None => MacroTokenValue::None,
         };
 
@@ -2392,6 +2403,14 @@ impl<'a> Preprocessor<'a> {
             }
         };
 
+        // Translation phase 1 applies to an included file just as it does to
+        // the primary source, and before the include-guard scan looks at it.
+        let content = if self.trigraphs {
+            crate::token::lexer::replace_trigraphs(&content).into_owned()
+        } else {
+            content
+        };
+
         // Check for include guard optimization: if file starts with #ifndef MACRO
         // or #if !defined(MACRO) and that macro is already defined, skip the include.
         // This allows circular includes protected by guards to work correctly.
@@ -2797,10 +2816,18 @@ impl<'a> Preprocessor<'a> {
                     }
                 }
                 TokenValue::Number(n) => result.push_str(n),
-                TokenValue::String(s) | TokenValue::WideString(s) => {
-                    if matches!(&token.value, TokenValue::WideString(_)) {
-                        result.push('L');
-                    }
+                TokenValue::String(s)
+                | TokenValue::WideString(s)
+                | TokenValue::Utf16String(s)
+                | TokenValue::Utf32String(s) => {
+                    // The encoding prefix is part of the spelling, so it must
+                    // survive stringification (C99 6.10.3.2p2).
+                    result.push_str(match &token.value {
+                        TokenValue::WideString(_) => "L",
+                        TokenValue::Utf16String(_) => "u",
+                        TokenValue::Utf32String(_) => "U",
+                        _ => "",
+                    });
                     // C99 6.10.3.2p2: insert \ before each " and \ including delimiters
                     result.push('\\');
                     result.push('"');
@@ -2813,10 +2840,16 @@ impl<'a> Preprocessor<'a> {
                     result.push('\\');
                     result.push('"');
                 }
-                TokenValue::Char(c) | TokenValue::WideChar(c) => {
-                    if matches!(&token.value, TokenValue::WideChar(_)) {
-                        result.push('L');
-                    }
+                TokenValue::Char(c)
+                | TokenValue::WideChar(c)
+                | TokenValue::Utf16Char(c)
+                | TokenValue::Utf32Char(c) => {
+                    result.push_str(match &token.value {
+                        TokenValue::WideChar(_) => "L",
+                        TokenValue::Utf16Char(_) => "u",
+                        TokenValue::Utf32Char(_) => "U",
+                        _ => "",
+                    });
                     // C99 6.10.3.2p2: insert \ before each " and \ in char constants
                     result.push('\'');
                     for ch in c.chars() {
@@ -3293,22 +3326,20 @@ impl<'a> Preprocessor<'a> {
                 let id = idents.intern(name);
                 TokenValue::Ident(id)
             }
-            MacroTokenValue::String(s) => {
-                // Check original token type to handle WideString correctly
-                if mt.typ == TokenType::WideString {
-                    TokenValue::WideString(s.clone())
-                } else {
-                    TokenValue::String(s.clone())
-                }
-            }
-            MacroTokenValue::Char(c) => {
-                // Check original token type to handle WideChar correctly
-                if mt.typ == TokenType::WideChar {
-                    TokenValue::WideChar(c.clone())
-                } else {
-                    TokenValue::Char(c.clone())
-                }
-            }
+            // The macro body collapses every string/char encoding into one
+            // variant, so the original token type is what recovers it.
+            MacroTokenValue::String(s) => match mt.typ {
+                TokenType::WideString => TokenValue::WideString(s.clone()),
+                TokenType::Utf16String => TokenValue::Utf16String(s.clone()),
+                TokenType::Utf32String => TokenValue::Utf32String(s.clone()),
+                _ => TokenValue::String(s.clone()),
+            },
+            MacroTokenValue::Char(c) => match mt.typ {
+                TokenType::WideChar => TokenValue::WideChar(c.clone()),
+                TokenType::Utf16Char => TokenValue::Utf16Char(c.clone()),
+                TokenType::Utf32Char => TokenValue::Utf32Char(c.clone()),
+                _ => TokenValue::Char(c.clone()),
+            },
             MacroTokenValue::Special(code) => TokenValue::Special(*code),
             _ => TokenValue::None,
         };
@@ -3936,11 +3967,13 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
             }
         }
 
-        // Handle character literal (including wide char L'x')
+        // Handle character literal (any encoding prefix: L'x', u'x', U'x')
         if let Some(tok) = self.current() {
             let char_str = match &tok.value {
-                TokenValue::Char(c) => Some(c.clone()),
-                TokenValue::WideChar(c) => Some(c.clone()),
+                TokenValue::Char(c)
+                | TokenValue::WideChar(c)
+                | TokenValue::Utf16Char(c)
+                | TokenValue::Utf32Char(c) => Some(c.clone()),
                 _ => None,
             };
             if let Some(char_str) = char_str {
@@ -4132,6 +4165,8 @@ pub struct PreprocessConfig<'a> {
     pub no_std_inc: bool,
     /// If true, disable builtin headers (-nobuiltininc)
     pub no_builtin_inc: bool,
+    /// If true, apply translation phase 1 trigraph replacement (-trigraphs).
+    pub trigraphs: bool,
 }
 
 /// Preprocess tokens with command-line defines and undefines
@@ -4162,6 +4197,7 @@ pub fn preprocess_with_defines(
     if config.no_builtin_inc {
         pp.use_builtin_headers = false;
     }
+    pp.trigraphs = config.trigraphs;
 
     // Add -I include paths
     for path in config.include_paths {

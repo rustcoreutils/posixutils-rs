@@ -3921,6 +3921,14 @@ impl CodeGenerator for Aarch64CodeGen {
             self.base.emit_wide_strings(&module.wide_strings);
         }
 
+        // Emit char16_t / char32_t string literals
+        if !module.utf16_strings.is_empty() {
+            self.base.emit_utf16_strings(&module.utf16_strings);
+        }
+        if !module.utf32_strings.is_empty() {
+            self.base.emit_utf32_strings(&module.utf32_strings);
+        }
+
         // Emit text start label for DWARF debug info (before first function)
         // Must be in .text section — emit .text first since globals may leave us in .data
         if module.debug && !module.functions.is_empty() {

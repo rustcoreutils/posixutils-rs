@@ -1205,7 +1205,9 @@ impl<'a> Linearizer<'a> {
             | ExprKind::FloatLit(_)
             | ExprKind::CharLit(_)
             | ExprKind::StringLit(_)
-            | ExprKind::WideStringLit(_) => true,
+            | ExprKind::WideStringLit(_)
+            | ExprKind::Utf16StringLit(_)
+            | ExprKind::Utf32StringLit(_) => true,
 
             // Identifiers are pure unless volatile
             ExprKind::Ident(_) => {
@@ -4057,6 +4059,16 @@ impl<'a> Linearizer<'a> {
 
             ExprKind::WideStringLit(s) => {
                 let label = self.module.add_wide_string(s.clone());
+                self.emit_string_sym(expr, label)
+            }
+
+            ExprKind::Utf16StringLit(u) => {
+                let label = self.module.add_utf16_string(u.clone());
+                self.emit_string_sym(expr, label)
+            }
+
+            ExprKind::Utf32StringLit(u) => {
+                let label = self.module.add_utf32_string(u.clone());
                 self.emit_string_sym(expr, label)
             }
 

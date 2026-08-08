@@ -718,7 +718,10 @@ impl<'a> super::linearize::Linearizer<'a> {
                         && list.len() == 1
                         && matches!(
                             list[0].value.kind,
-                            ExprKind::StringLit(_) | ExprKind::WideStringLit(_)
+                            ExprKind::StringLit(_)
+                                | ExprKind::WideStringLit(_)
+                                | ExprKind::Utf16StringLit(_)
+                                | ExprKind::Utf32StringLit(_)
                         )
                         && self.types.kind(elem_type) == TypeKind::Array;
                     if is_string_for_char_array {

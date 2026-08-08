@@ -502,7 +502,7 @@
 - [x] Extended characters
 - [x] Universal character names `\uXXXX` *(C99 new)*
 - [x] Universal character names `\UXXXXXXXX` *(C99 new)*
-- N/A Trigraphs (??=, ??(, ??/, etc.) — *will not implement: deprecated in C99, removed in C11*
+- [x] Trigraphs (??=, ??(, ??/, etc.) — implemented behind `--trigraphs`, off by default. *(Deprecated in C99 and removed in **C23**, not C11: C17 still requires them.)*
 - [x] Digraphs (<:, :>, <%, %>, %:, %:%:) *(C99 new)*
 
 ### 9.2 Tokens

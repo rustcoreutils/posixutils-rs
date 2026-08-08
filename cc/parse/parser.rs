@@ -2015,6 +2015,28 @@ impl Parser<'_> {
         Ok(Type::with_modifiers(kind, modifiers))
     }
 
+    /// Drop the storage-class bits from a type, leaving only what it denotes.
+    ///
+    /// These describe the *declaration*, not the type, so two names for the
+    /// same type can differ in them and still be compatible.
+    fn strip_declaration_modifiers(&mut self, id: TypeId) -> TypeId {
+        const DECL_ONLY: TypeModifiers = TypeModifiers::TYPEDEF
+            .union(TypeModifiers::EXTERN)
+            .union(TypeModifiers::STATIC)
+            .union(TypeModifiers::AUTO)
+            .union(TypeModifiers::REGISTER)
+            .union(TypeModifiers::THREAD_LOCAL)
+            .union(TypeModifiers::INLINE);
+
+        let t = self.types.get(id);
+        if !t.modifiers.intersects(DECL_ONLY) {
+            return id;
+        }
+        let mut stripped = t.clone();
+        stripped.modifiers = stripped.modifiers.difference(DECL_ONLY);
+        self.types.intern(stripped)
+    }
+
     /// Diagnose redefining a typedef name with an incompatible type.
     ///
     /// C11/C17 6.7p3 legalized redefining a typedef, but only to a *compatible*
@@ -2031,6 +2053,13 @@ impl Parser<'_> {
             return;
         }
         let old_type = existing.typ;
+        // Compare the types the two names denote, not how they were spelled.
+        // A typedef's recorded type may still carry the TYPEDEF bit and the
+        // storage class from its declaration, and glibc reaches most of these
+        // names through a second typedef (`typedef __int16_t int16_t;`), so
+        // comparing raw modifiers reports two identical `short`s as different.
+        let old_type = self.strip_declaration_modifiers(old_type);
+        let new_type = self.strip_declaration_modifiers(new_type);
         if self.types.types_compatible(old_type, new_type) {
             return;
         }

@@ -55,4 +55,14 @@ double _Complex cpow(double _Complex, double _Complex);
 double _Complex csqrt(double _Complex);
 double _Complex cproj(double _Complex);
 
+/* Exact complex construction (C11 7.3.9.5-7).
+
+   These exist precisely because `x + y*I` cannot construct a value whose
+   imaginary part is a NaN or an infinity: the multiplication and addition
+   propagate the special value into the real part too. __builtin_complex
+   assembles the two halves directly. */
+#define CMPLX(x, y)  __builtin_complex((double)(x), (double)(y))
+#define CMPLXF(x, y) __builtin_complex((float)(x), (float)(y))
+#define CMPLXL(x, y) __builtin_complex((long double)(x), (long double)(y))
+
 #endif /* _COMPLEX_H */

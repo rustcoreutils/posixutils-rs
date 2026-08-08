@@ -863,6 +863,18 @@ fn preprocess_args() -> Vec<String> {
         } else if arg.starts_with("-fsanitize") {
             // Sanitizer flags - silently ignore (c17 doesn't support sanitizers)
             i += 1;
+        } else if arg == "-ffreestanding" || arg == "-fhosted" {
+            // Not swallowed by the catch-all below: there is no freestanding
+            // mode to enter (see #H1 — we do not bundle the freestanding
+            // header set), so accepting the flag and ignoring it would be a
+            // lie. Diagnose instead. `-fhosted` is what we already are.
+            if arg == "-ffreestanding" {
+                eprintln!(
+                    "c17: -ffreestanding is not supported: no freestanding environment is provided"
+                );
+                std::process::exit(1);
+            }
+            i += 1;
         } else if arg.starts_with("-f") && !arg.starts_with("-fno-builtin") {
             // Catch-all: silently ignore any other -f* flag we don't handle
             i += 1;

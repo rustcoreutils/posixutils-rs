@@ -43,14 +43,12 @@ pub const ISO646_H: &str = include_str!("include/iso646.h");
 /// Builtin float.h - floating-point characteristics
 pub const FLOAT_H: &str = include_str!("include/float.h");
 
+/// Builtin stdint.h - C17 7.20 exact/minimum/fastest-width integer types.
+/// Part of the freestanding header set (C17 4p6), so we must supply it.
+pub const STDINT_H: &str = include_str!("include/stdint.h");
+
 /// Builtin cpuid.h - CPU feature detection (x86/x64)
 pub const CPUID_H: &str = include_str!("include/cpuid.h");
-
-/// Builtin xmmintrin.h - SSE intrinsics
-pub const XMMINTRIN_H: &str = include_str!("include/xmmintrin.h");
-
-/// Builtin emmintrin.h - SSE2 intrinsics
-pub const EMMINTRIN_H: &str = include_str!("include/emmintrin.h");
 
 /// Look up a builtin header by name
 ///
@@ -68,9 +66,12 @@ pub fn get_builtin_header(name: &str) -> Option<&'static str> {
         "stdatomic.h" => Some(STDATOMIC_H),
         "stdnoreturn.h" => Some(STDNORETURN_H),
         "float.h" => Some(FLOAT_H),
+        "stdint.h" => Some(STDINT_H),
         "cpuid.h" => Some(CPUID_H),
-        "xmmintrin.h" => Some(XMMINTRIN_H),
-        "emmintrin.h" => Some(EMMINTRIN_H),
+        // xmmintrin.h and emmintrin.h are deliberately NOT registered. Their
+        // bundled bodies are a bare #error, and registering them meant a user
+        // with a real SSE intrinsics header on the include path got our hard
+        // failure instead of theirs. Unregistered, the normal search finds it.
         _ => None,
     }
 }

@@ -109,35 +109,44 @@ pub fn get_limit_macros(target: &Target) -> Vec<(&'static str, &'static str)> {
 
 /// Get type definition macros (for <stdint.h> and <stddef.h> compatibility)
 /// These define the underlying C type for various abstract types
-pub fn get_type_macros(_target: &Target) -> Vec<(&'static str, &'static str)> {
+pub fn get_type_macros(target: &Target) -> Vec<(&'static str, &'static str)> {
+    // On LP64 the 64-bit exact/least/fast types are `long`, not `long long`.
+    // They are distinct types even at the same width, so getting this wrong
+    // makes our <stdint.h> and the host's disagree about int64_t — which is
+    // exactly what surfaced when <stdint.h> stopped being delegated.
+    let (s64, u64_) = if target.long_width == 64 {
+        ("long int", "long unsigned int")
+    } else {
+        ("long long int", "long long unsigned int")
+    };
     vec![
         // Fixed-width integer types
         ("__INT8_TYPE__", "signed char"),
         ("__INT16_TYPE__", "short"),
         ("__INT32_TYPE__", "int"),
-        ("__INT64_TYPE__", "long long int"),
+        ("__INT64_TYPE__", s64),
         ("__UINT8_TYPE__", "unsigned char"),
         ("__UINT16_TYPE__", "unsigned short"),
         ("__UINT32_TYPE__", "unsigned int"),
-        ("__UINT64_TYPE__", "long long unsigned int"),
+        ("__UINT64_TYPE__", u64_),
         // Least-width integer types (same as fixed-width for common targets)
         ("__INT_LEAST8_TYPE__", "signed char"),
         ("__INT_LEAST16_TYPE__", "short"),
         ("__INT_LEAST32_TYPE__", "int"),
-        ("__INT_LEAST64_TYPE__", "long long int"),
+        ("__INT_LEAST64_TYPE__", s64),
         ("__UINT_LEAST8_TYPE__", "unsigned char"),
         ("__UINT_LEAST16_TYPE__", "unsigned short"),
         ("__UINT_LEAST32_TYPE__", "unsigned int"),
-        ("__UINT_LEAST64_TYPE__", "long long unsigned int"),
+        ("__UINT_LEAST64_TYPE__", u64_),
         // Fast integer types (same as fixed-width for common targets)
         ("__INT_FAST8_TYPE__", "signed char"),
         ("__INT_FAST16_TYPE__", "short"),
         ("__INT_FAST32_TYPE__", "int"),
-        ("__INT_FAST64_TYPE__", "long long int"),
+        ("__INT_FAST64_TYPE__", s64),
         ("__UINT_FAST8_TYPE__", "unsigned char"),
         ("__UINT_FAST16_TYPE__", "unsigned short"),
         ("__UINT_FAST32_TYPE__", "unsigned int"),
-        ("__UINT_FAST64_TYPE__", "long long unsigned int"),
+        ("__UINT_FAST64_TYPE__", u64_),
         // Pointer-width types (always 64-bit on our targets)
         ("__SIZE_TYPE__", "long unsigned int"),
         ("__PTRDIFF_TYPE__", "long int"),
@@ -216,17 +225,24 @@ pub fn get_stdint_limit_macros(_target: &Target) -> Vec<(&'static str, &'static 
 }
 
 /// Get integer constant suffix macros (for <stdint.h> compatibility)
-pub fn get_suffix_macros(_target: &Target) -> Vec<(&'static str, &'static str)> {
+pub fn get_suffix_macros(target: &Target) -> Vec<(&'static str, &'static str)> {
+    // Must agree with get_type_macros: an INT64_C() constant has to come out
+    // the same type as int64_t.
+    let (c64, uc64) = if target.long_width == 64 {
+        ("L", "UL")
+    } else {
+        ("LL", "ULL")
+    };
     vec![
         // Fixed-width suffixes
         ("__INT8_C_SUFFIX__", ""),
         ("__INT16_C_SUFFIX__", ""),
         ("__INT32_C_SUFFIX__", ""),
-        ("__INT64_C_SUFFIX__", "LL"),
+        ("__INT64_C_SUFFIX__", c64),
         ("__UINT8_C_SUFFIX__", ""),
         ("__UINT16_C_SUFFIX__", ""),
         ("__UINT32_C_SUFFIX__", "U"),
-        ("__UINT64_C_SUFFIX__", "ULL"),
+        ("__UINT64_C_SUFFIX__", uc64),
         // intmax_t suffixes (64-bit uses L suffix on all our targets)
         ("__INTMAX_C_SUFFIX__", "L"),
         ("__UINTMAX_C_SUFFIX__", "UL"),

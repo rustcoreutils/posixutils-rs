@@ -27,7 +27,7 @@ pub fn get_macros() -> Vec<(&'static str, Option<&'static str>)> {
         // Feature test macros
         ("_GNU_SOURCE", Some("1")),
         ("_DEFAULT_SOURCE", Some("1")),
-        ("_XOPEN_SOURCE", Some("700")),
+        ("_XOPEN_SOURCE", Some("800")),
         ("_XOPEN_SOURCE_EXTENDED", Some("1")),
     ]
 }

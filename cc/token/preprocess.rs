@@ -569,13 +569,12 @@ impl<'a> Preprocessor<'a> {
             line_file_override: None,
         };
 
-        // Initialize predefined macros
-        pp.init_predefined_macros();
-
-        // Initialize include paths from OS
+        // Include paths first: __STDC_NO_THREADS__ is decided by probing them.
         for path in os::get_include_paths(target) {
             pp.system_include_paths.push(path.to_string());
         }
+
+        pp.init_predefined_macros();
 
         pp
     }
@@ -586,6 +585,32 @@ impl<'a> Preprocessor<'a> {
         self.define_macro(Macro::predefined("__STDC__", Some("1")));
         self.define_macro(Macro::predefined("__STDC_VERSION__", Some("201112L"))); // C11
         self.define_macro(Macro::predefined("__STDC_HOSTED__", Some("1")));
+
+        // C17 6.10.8.3 conditional feature macros.
+        //
+        // Floating point is native IEEE-754 on both targets, so
+        // __STDC_IEC_559__ is warranted; without it, conforming numeric code
+        // takes a needlessly conservative path. wchar_t holds Unicode code
+        // points on the supported platforms, which is what
+        // __STDC_ISO_10646__ asserts (the value is the Unicode revision, as
+        // GCC reports it).
+        self.define_macro(Macro::predefined("__STDC_IEC_559__", Some("1")));
+        self.define_macro(Macro::predefined("__STDC_ISO_10646__", Some("201706L")));
+        self.define_macro(Macro::predefined("__STDC_UTF_16__", Some("1")));
+        self.define_macro(Macro::predefined("__STDC_UTF_32__", Some("1")));
+
+        // __STDC_IEC_559_COMPLEX__ is deliberately NOT defined. It asserts
+        // conformance to Annex G, and complex support does not meet that bar:
+        // `float _Complex` silently loses its imaginary part and
+        // `long double _Complex` emits an invalid instruction. See cc/audit.md.
+
+        // C17 4p6: an implementation that does not provide <threads.h> shall
+        // define __STDC_NO_THREADS__, so portable code can feature-test rather
+        // than fail at the include. We bundle no threads.h and rely on the
+        // host's, so this is a question about the host.
+        if !self.host_has_threads_header() {
+            self.define_macro(Macro::predefined("__STDC_NO_THREADS__", Some("1")));
+        }
 
         // GCC compatibility macros (required by system headers)
         self.define_macro(Macro::predefined("__GNUC__", Some("4")));
@@ -731,6 +756,16 @@ impl<'a> Preprocessor<'a> {
             BuiltinMacro::HasIncludeNext,
             true,
         ));
+    }
+
+    /// Whether the host provides `<threads.h>` on any system include path.
+    ///
+    /// Probed rather than assumed: glibc gained it in 2.28, musl has it, and
+    /// macOS still does not, so the answer varies by host even for one target.
+    fn host_has_threads_header(&self) -> bool {
+        self.system_include_paths
+            .iter()
+            .any(|dir| Path::new(dir).join("threads.h").exists())
     }
 
     /// Define a macro

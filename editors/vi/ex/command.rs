@@ -123,7 +123,11 @@ pub enum ExCommand {
         command: String,
     },
     /// Change directory (:cd, :chdir).
-    Cd { path: Option<String> },
+    Cd {
+        path: Option<String>,
+        /// `chd[ir]!` proceeds even with a modified buffer (94925-94926).
+        force: bool,
+    },
     /// Push working directory (:pwd).
     Pwd,
     /// Next file in arg list (:n, :next).
@@ -151,7 +155,11 @@ pub enum ExCommand {
     /// Remove abbreviation (:una, :unabbreviate).
     Unabbreviate { lhs: String },
     /// Open tag (:ta, :tag).
-    Tag { tag: String },
+    Tag {
+        tag: String,
+        /// `ta[g]!` discards changes rather than refusing (95408).
+        force: bool,
+    },
     /// Pop tag stack (:po, :pop).
     Pop,
     /// Display tags (:tags).
@@ -163,7 +171,11 @@ pub enum ExCommand {
     /// Preserve the edit buffer for later recovery (:pre, :preserve).
     Preserve,
     /// Recover a buffer saved by a previous session (:rec, :recover).
-    Recover { file: Option<String> },
+    Recover {
+        file: Option<String>,
+        /// `rec[over]!` proceeds even with a modified buffer (95293-95294).
+        force: bool,
+    },
     /// Source file (execute ex commands from file) (:so, :source).
     Source { file: String },
     /// Append text after line (:a, :append).
@@ -172,20 +184,46 @@ pub enum ExCommand {
     /// the parser could only pull a literal `Address::Line(n)` out and fell
     /// back to line 1 for everything else, so `$a`, `.a`, `/re/a` and `'ma`
     /// all silently targeted the wrong line (#X25).
-    Append { range: AddressRange },
+    Append {
+        range: AddressRange,
+        /// `a!` toggles the autoindent edit option for this command only
+        /// (94894-94896).
+        toggle_autoindent: bool,
+    },
     /// Insert text before line (:i, :insert).
-    Insert { range: AddressRange },
+    Insert {
+        range: AddressRange,
+        /// `i!` toggles autoindent for this command only (95034-95036).
+        toggle_autoindent: bool,
+    },
     /// Change lines (:c, :change).
-    Change { range: AddressRange },
+    Change {
+        range: AddressRange,
+        /// `c[hange][!][count]`: count extends the range as an extra address.
+        count: Option<usize>,
+        /// `c!` toggles autoindent for this command only (94910-94912).
+        toggle_autoindent: bool,
+    },
     /// Enter visual mode (:vi, :visual).
     Visual,
     /// Enter open mode (:o, :open).
-    Open { range: AddressRange },
+    Open {
+        range: AddressRange,
+        /// `o[pen] /pattern/`: `None` means "the last RE used in the editor"
+        /// (95212-95214).
+        pattern: Option<String>,
+    },
     /// Adjust window (:z).
     Z {
         range: AddressRange,
         ztype: Option<char>,
+        /// How many times the type character was repeated; `z--` and `z++`
+        /// scroll further than `z-` and `z+` (95562-95592).
+        type_count: usize,
         count: Option<usize>,
+        /// `z!` defaults count to the number of lines in the display minus one
+        /// rather than twice the scroll option (95556-95558).
+        full_screen: bool,
     },
     /// Shift left (:<).
     ShiftLeft {
@@ -205,7 +243,10 @@ pub enum ExCommand {
         buffer: Option<char>,
     },
     /// Suspend editor (:suspend, :stop, :sus).
-    Suspend,
+    Suspend {
+        /// `su[spend]!` suspends without an automatic write (95405).
+        force: bool,
+    },
     /// Repeat substitute (:&).
     RepeatSubstitute {
         range: AddressRange,
@@ -273,6 +314,18 @@ pub enum MapMode {
     Command,
     /// Insert mode.
     Insert,
+}
+
+impl MapMode {
+    /// `map!` / `unmap!` address the text input mode map list (95090-95092);
+    /// without the bang they address the command mode list.
+    pub fn for_bang(bang: bool) -> Self {
+        if bang {
+            MapMode::Insert
+        } else {
+            MapMode::Command
+        }
+    }
 }
 
 /// Result of executing an ex command.

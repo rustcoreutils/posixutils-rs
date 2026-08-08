@@ -1059,3 +1059,167 @@ fn test_ex_at_at_repeats_last_buffer() {
     // as a buffer *name*, so it failed with `Buffer "@" is empty`.
     ex_test_with_file("s/o/O/\nooo\n", "1y a\n2\n@a\n@@\n2p\nq!\n", "OOo\n");
 }
+
+// ============================================================================
+// Command modifier/arg gaps -- part 3 (the `!` modifier and z/o/f/! arguments)
+// ============================================================================
+
+/// Run ex and return (stdout, stderr) without asserting on either.
+fn ex_output(args: &[&str], stdin: &str) -> (String, String) {
+    let mut child = Command::new(get_binary_path("ex"))
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ex");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    (
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+#[test]
+fn test_ex_bang_is_rejected_on_commands_that_do_not_take_one() {
+    // ex.md §94854-94857 defines '!' as a modifier only for the commands whose
+    // synopsis spells it. The parser used to fold '!' into the command *name*,
+    // so a bang on any other command was silently swallowed.
+    let (_, err) = ex_output(&["-s"], "pwd!\nq!\n");
+    assert!(
+        !err.is_empty(),
+        "`:pwd!` should be rejected, got no diagnostic"
+    );
+
+    // ...while a command that does take one still works.
+    let (out, _) = ex_output(&["-s"], "a\nx\n.\nq!\n");
+    assert_eq!(out, "");
+}
+
+#[test]
+fn test_ex_bang_must_be_adjacent_to_the_command_name() {
+    // "the '!' character shall only act as a modifier if there is no <blank>
+    // between it and the command name" (§94854-94857). With a blank, `:q !`
+    // is not the forced quit, so a modified buffer must still refuse.
+    let (_, err) = ex_output(&["-s"], "a\nx\n.\nq !\n");
+    assert!(
+        !err.is_empty(),
+        "`:q !` must not be read as the forced quit"
+    );
+}
+
+#[test]
+fn test_ex_read_bang_runs_a_command_rather_than_forcing() {
+    // `read` is one of the three commands whose '!' is not a modifier
+    // (§94854-94857, §95268): `:r!cmd` reads the command's output.
+    ex_test("r!echo hello\n1,$p\nq!\n", "hello\n");
+    // ...and a <backslash> suppresses that meaning (§95285-95286), so this
+    // names a file rather than a command.
+    let (_, err) = ex_output(&["-s"], "r\\!nosuchfile\nq!\n");
+    assert!(
+        !err.is_empty(),
+        "`:r \\!nosuchfile` should try to read a file and fail"
+    );
+}
+
+#[test]
+fn test_ex_append_bang_toggles_autoindent() {
+    // §94894-94896: '!' toggles the autoindent edit option for the duration of
+    // the command only, and §94705-94707 has ex supply the autoindent
+    // characters as the input prompt. With autoindent off, `:a!` turns it on,
+    // so both appended lines pick up the indent of the line they follow.
+    ex_test_with_file(
+        "    base\n",
+        "1a!\none\ntwo\n.\n1,$p\nq!\n",
+        "    base\n    one\n    two\n",
+    );
+    // Without the bang and with autoindent off, nothing is supplied.
+    ex_test_with_file(
+        "    base\n",
+        "1a\none\ntwo\n.\n1,$p\nq!\n",
+        "    base\none\ntwo\n",
+    );
+    // And with autoindent set, the bang turns it back off.
+    ex_test_with_file(
+        "    base\n",
+        "set autoindent\n1a!\none\ntwo\n.\n1,$p\nq!\n",
+        "    base\none\ntwo\n",
+    );
+    // The `.` terminator is still recognised while indent is being supplied
+    // (the autoindent characters are a prompt, not input), and a line holding
+    // nothing but autoindent is discarded (§94742-94743).
+    ex_test_with_file(
+        "    base\n",
+        "1a!\none\n\ntwo\n.\n1,$p\nq!\n",
+        "    base\n    one\n\n    two\n",
+    );
+}
+
+#[test]
+fn test_ex_change_count_extends_the_range() {
+    // `c[hange][!][count]` -- count is "equivalent to specifying an additional
+    // address ... equal to the last address specified plus count-1"
+    // (§94785-94789), so `1c2` replaces lines 1 and 2.
+    ex_test_with_file(
+        "one\ntwo\nthree\n",
+        "1c2\nNEW\n.\n1,$p\nq!\n",
+        "NEW\nthree\n",
+    );
+}
+
+#[test]
+fn test_ex_z_repeated_type_characters_scroll_further() {
+    // §95562-95592 defines the displacement in terms of the *number* of type
+    // characters, so `z--` is not `z-`. Only the first character used to be
+    // read, making every repeat a no-op.
+    let file = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\n";
+    // `6z-2` -> decrement by (1 x 2) - 1 = 1, so start at line 5, 2 lines.
+    ex_test_with_file(file, "6z-2\nq!\n", "l5\nl6\n");
+    // `6z--2` -> decrement by (2 x 2) - 1 = 3, so start at line 3, 2 lines.
+    ex_test_with_file(file, "6z--2\nq!\n", "l3\nl4\n");
+    // `.` may not be repeated (§95572).
+    let (_, err) = ex_output(&["-s"], "a\nx\n.\n1z..\nq!\n");
+    assert!(!err.is_empty(), "`z..` should be an error");
+}
+
+#[test]
+fn test_ex_z_past_the_end_is_an_error() {
+    // "If incrementing the current line would cause it to be greater than the
+    // last line in the edit buffer, it shall be an error." (§95552-95553)
+    let (_, err) = ex_output(&["-s"], "a\nonly\n.\n$\nz\nq!\n");
+    assert!(!err.is_empty(), "`z` on the last line should be an error");
+    // Likewise running off the front (§95564).
+    let (_, err) = ex_output(&["-s"], "a\na\nb\nc\n.\n1z-5\nq!\n");
+    assert!(!err.is_empty(), "`1z-5` should be an error");
+}
+
+#[test]
+fn test_ex_shell_escape_warns_about_unsaved_changes() {
+    // §95607-95608: "a warning message shall be written if the edit buffer has
+    // been modified since the last complete write, and the warn edit option is
+    // set". The `warn` option was read nowhere in the crate.
+    let (out, _) = ex_output(&["-s"], "a\nx\n.\n!true\nq!\n");
+    assert!(
+        out.contains("No write since last change"),
+        "expected the warn message in {out:?}"
+    );
+
+    // `set nowarn` suppresses it...
+    let (out, _) = ex_output(&["-s"], "set nowarn\na\nx\n.\n!true\nq!\n");
+    assert!(
+        !out.contains("No write since last change"),
+        "`set nowarn` should suppress the warning: {out:?}"
+    );
+    // ...and an unmodified buffer never triggers it.
+    let (out, _) = ex_output(&["-s"], "!true\nq!\n");
+    assert!(
+        !out.contains("No write since last change"),
+        "an unmodified buffer must not warn: {out:?}"
+    );
+}

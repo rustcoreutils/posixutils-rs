@@ -470,7 +470,36 @@ mandated mark-then-execute.
 - [x] `ar co/t d m nu p pu q(!) rew se(t) u ya = # & ya` CONFORM.
 - [x] ~~**`g`/`v` single-pass** (#X7)~~ ✓ examined and conforming (collects matching lines first, then executes); ~~**`s` gaps** (#X12)~~ ✓ closed 2026-08-02; ~~**`sh[ell]` no `-i`** (#X13)~~ ✓ fixed (`ShellExecutor::interactive` passes `-i`).
 - [ ] **PARTIAL (modifier/arg gaps).** *Split into named items 2026-08-02; this box was one opaque checkbox covering ~15 commands.* Closed so far: **`j`** (`!` plus the full §95060-95070 rule set — two spaces after `.`, no separator before `)`, empty lines dropped — and the §95043-95057 count/address interaction), **`q`** (remaining-files check), **`r`** (#X23), **`w`/`wq`/`x`** (#X22/#X24/#X29). Also closed: **`l`** (full §95237-95244 escape table — XBD Table 5-1 sequences, three-digit octal per byte otherwise, `\$` for a literal `$`; it had been `^I`-style caret notation that escaped neither backslash nor `$`, so `:l` was not unambiguous, which is the entire point of the command) and **`@@`** (the parser took the second `@` as a buffer *name*, so it failed with `Buffer "@" is empty` instead of repeating the last buffer). `cd`, `so` and `ta` were probed and already work.
-  Still open, itemized: `a`/`i`/`c` `!` autoindent toggle, `e`/`n` `+command` and file args, `f`, `o`, `vi[sual]`, `z` (`!`/multi-type), `!` warn message.
+  Closed 2026-08-08 by a **structural fix**: `split_command` treated `!` as part
+  of the command *name*, so every forced form needed its own literal match arm
+  (`"w!"`, `"q!"`, `"e!"`, `"j!"`, ...) — which is exactly why the commands that
+  were never given one silently swallowed the bang. It now strips a trailing `!`
+  once into a `force` flag, which also enforces §94854-94857's adjacency rule in
+  one place, and a bang on a command whose synopsis does not spell `[!]` is now a
+  syntax error rather than being ignored. `read` keeps its own handling, since
+  §94854-94857 exempts it (along with `write` and `!`): `:r!cmd` runs a command
+  whether or not a <blank> separates the bang, and a <backslash> suppresses that
+  meaning (§95285-95286).
+
+  On that base: **`a`/`i`/`c` `!`** now toggles autoindent for the duration of
+  the command — which meant implementing ex-input autoindent at all, since ex
+  text input never supplied indent characters and so had nothing to toggle
+  (§94705-94707 for the prompt, §94742-94746 for the per-line rules; the
+  terminator is tested against what was typed, so an indented `.` still ends the
+  input). **`c`** also honours its `[count]` as an extra address (§94785-94789).
+  **`z`** reads the whole run of type characters, so `z--`/`z++`/`z^^` displace
+  by the POSIX formulas rather than being read as a single character, rejects a
+  repeated `.`/`=`, errors instead of clamping at either end of the buffer, and
+  `z!` defaults the count to a full display rather than twice `scroll`.
+  **`o[pen]`** parses its `/pattern/` argument, empty meaning the last RE.
+  **`f`** now reports the current line and line count, `[No file]`, `[Modified]`
+  and `[Read only]` per §94981-94987, instead of just a name, a `[+]` and a
+  percentage. **`!`** honours the `warn` edit option (§95607-95608), which was
+  declared, defaulted, settable and printable but read *nowhere else in the
+  crate*. Threading `force` through also gave `cd`/`chdir`, `rec[over]`, `ta[g]`
+  and `su[spend]` the modified-buffer and autowrite rules their synopses call for.
+
+  Still open, itemized: `e`/`n` `+command` and file args, `vi[sual]` arguments.
 - [x] ~~**MISSING:** `pre[serve]`, `rec[over]`~~ ✓ both added (phase 6); ~~`~` (#X18)~~ ✓ added 2026-08-02.
 
 #### `set` options

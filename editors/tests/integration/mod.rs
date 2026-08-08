@@ -1785,7 +1785,7 @@ fn test_ex_append_parsing() {
     // Address::Line(n) and fell back to line 1 for every other form (#X25).
     let result = parse_ex_command("5a");
     assert!(result.is_ok());
-    if let Ok(ExCommand::Append { range }) = result {
+    if let Ok(ExCommand::Append { range, .. }) = result {
         assert_eq!(range.start, Some(vi_rs::ex::address::Address::Line(5)));
     } else {
         panic!("Expected Append command addressing line 5");

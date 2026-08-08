@@ -814,16 +814,24 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
         if class & COMMENT != 0 {
             match self.mode {
                 LexerMode::C => {
-                    // C mode: // and /* */ comments
+                    // C mode: // and /* */ comments.
+                    //
+                    // Translation phase 3 replaces each comment with one space,
+                    // so the token after a comment is "preceded by whitespace"
+                    // even when no actual space is there. That flag is what
+                    // `#` stringification and -E spacing read, so without it
+                    // `S(a/**/b)` stringified as "ab" instead of "a b".
                     let next = self.peekchar();
                     if next == b'/' as i32 {
                         self.nextchar();
                         self.skip_line_comment();
+                        self.whitespace = true;
                         return None; // No token, continue tokenizing
                     }
                     if next == b'*' as i32 {
                         self.nextchar();
                         self.skip_block_comment();
+                        self.whitespace = true;
                         return None; // No token, continue tokenizing
                     }
                 }

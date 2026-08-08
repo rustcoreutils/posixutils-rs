@@ -179,3 +179,22 @@ pub fn run_c17(args: &[&str]) -> C17Run {
         success: output.status.success(),
     }
 }
+
+/// Preprocess `content` with `-E` and return the run.
+///
+/// Every other preprocessor test asserts on the exit code of a compiled
+/// program, which cannot see spacing, stringification, or which branch of a
+/// `#if` survived. This looks at the text.
+pub fn preprocess_text(name: &str, content: &str, extra_opts: &[&str]) -> C17Run {
+    let c_file = create_c_file(name, content);
+    let mut args = vec!["-E".to_string()];
+    args.extend(extra_opts.iter().map(|s| s.to_string()));
+    args.push(c_file.path().to_string_lossy().to_string());
+
+    let output = run_test_base("c17", &args, &[]);
+    C17Run {
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        success: output.status.success(),
+    }
+}

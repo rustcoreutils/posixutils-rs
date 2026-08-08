@@ -889,6 +889,17 @@ impl<'a> Preprocessor<'a> {
     ) where
         I: Iterator<Item = Token>,
     {
+        // C17 6.10p7: a `#` alone on a line is the null directive and has no
+        // effect. Check before consuming, because the next token belongs to the
+        // *next* line — taking it unconditionally treated that line's first
+        // token as a directive name and then `skip_to_eol` ate the rest of it,
+        // silently deleting a line of source.
+        match iter.peek() {
+            None => return,
+            Some(next) if next.pos.newline => return,
+            Some(_) => {}
+        }
+
         // Get the directive name
         let directive_token = match iter.next() {
             Some(t) => t,
@@ -930,7 +941,7 @@ impl<'a> Preprocessor<'a> {
             crate::kw::PP_ERROR => self.handle_error(iter, &hash_token.pos, idents),
             crate::kw::WARNING => self.handle_warning(iter, &hash_token.pos, idents),
             crate::kw::PRAGMA => self.handle_pragma(iter, idents),
-            crate::kw::LINE => self.handle_line(iter, idents),
+            crate::kw::LINE => self.handle_line(iter, idents, hash_token.pos),
             _ => {
                 // Unknown directive
                 if !self.is_skipping() {
@@ -1560,7 +1571,7 @@ impl<'a> Preprocessor<'a> {
     /// Evaluate a preprocessor expression
     fn evaluate_expression(&self, tokens: &[Token], idents: &IdentTable) -> bool {
         let mut evaluator = ExprEvaluator::new(self, idents);
-        evaluator.evaluate(tokens) != 0
+        evaluator.evaluate(tokens).is_true()
     }
 
     /// Handle #include
@@ -1697,17 +1708,6 @@ impl<'a> Preprocessor<'a> {
         is_system: bool,
         is_include_next: bool,
     ) -> Option<(IncludeSource, Option<usize>)> {
-        // For #include_next, skip builtin headers entirely
-        if !is_include_next {
-            // Check builtin headers first (before any filesystem search)
-            // Builtin headers take precedence for standard names like stdarg.h
-            if self.use_builtin_headers {
-                if let Some(content) = builtin_headers::get_builtin_header(filename) {
-                    return Some((IncludeSource::Builtin(content), None));
-                }
-            }
-        }
-
         // Absolute path
         if filename.starts_with('/') {
             let path = PathBuf::from(filename);
@@ -1717,7 +1717,8 @@ impl<'a> Preprocessor<'a> {
             return None;
         }
 
-        // For quoted includes (not #include_next), first check relative to current file
+        // The `"..."` form searches the including file's own directory first
+        // (c17.md 87905-87910), then proceeds as for the `<...>` form.
         if !is_system && !is_include_next {
             let relative_path = Path::new(&self.current_dir).join(filename);
             if relative_path.exists() {
@@ -1725,14 +1726,24 @@ impl<'a> Preprocessor<'a> {
             }
         }
 
-        // Check -I include paths (for both quoted and angle bracket includes)
-        // Per C standard, -I paths are searched for all includes
+        // Then -I, for both forms.
         if !is_include_next {
             for dir in &self.quote_include_paths {
                 let path = Path::new(dir).join(filename);
                 if path.exists() {
                     return Some((IncludeSource::File(path), None));
                 }
+            }
+        }
+
+        // Bundled headers stand in for the compiler's own include directory,
+        // so they come after the user's search paths — a project that ships
+        // its own limits.h or stddef.h must win. They used to be consulted
+        // before any filesystem search, which silently shadowed those.
+        // #include_next skips them entirely.
+        if !is_include_next && self.use_builtin_headers {
+            if let Some(content) = builtin_headers::get_builtin_header(filename) {
+                return Some((IncludeSource::Builtin(content), None));
             }
         }
 
@@ -2538,8 +2549,12 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Handle #line directive
-    fn handle_line<I>(&mut self, iter: &mut std::iter::Peekable<I>, idents: &mut IdentTable)
-    where
+    fn handle_line<I>(
+        &mut self,
+        iter: &mut std::iter::Peekable<I>,
+        idents: &mut IdentTable,
+        directive_pos: Position,
+    ) where
         I: Iterator<Item = Token>,
     {
         if self.is_skipping() {
@@ -2550,17 +2565,45 @@ impl<'a> Preprocessor<'a> {
         let tokens = self.collect_to_eol(iter);
         let tokens = self.expand_if_tokens(&tokens, idents);
         if tokens.is_empty() {
+            diag::error(directive_pos, "#line requires a line number");
             return;
         }
 
-        // First token must be a line number
+        // C17 6.10.4p3: the operand is a digit sequence in [1, 2147483647].
+        // These used to return silently, so a typo just did nothing.
         let line_num = match &tokens[0].value {
             TokenValue::Number(n) => match n.parse::<u32>() {
-                Ok(num) => num,
-                Err(_) => return,
+                Ok(num) if (1..=2147483647).contains(&num) => num,
+                Ok(_) => {
+                    diag::error(
+                        tokens[0].pos,
+                        &format!("#line number '{}' is out of range [1, 2147483647]", n),
+                    );
+                    return;
+                }
+                Err(_) => {
+                    diag::error(
+                        tokens[0].pos,
+                        &format!("#line requires a decimal line number, found '{}'", n),
+                    );
+                    return;
+                }
             },
-            _ => return,
+            _ => {
+                diag::error(tokens[0].pos, "#line requires a decimal line number");
+                return;
+            }
         };
+
+        // Only a string literal may follow, and nothing may follow that.
+        if tokens.len() > 1 && !matches!(&tokens[1].value, TokenValue::String(_)) {
+            diag::error(tokens[1].pos, "#line filename must be a string literal");
+            return;
+        }
+        if tokens.len() > 2 {
+            diag::error(tokens[2].pos, "extra tokens after #line directive");
+            return;
+        }
 
         // The #line directive takes effect on the next line, so
         // current_physical_line is the line of the directive + 1
@@ -3273,11 +3316,76 @@ impl<'a> Preprocessor<'a> {
 // Expression Evaluator for #if
 // ============================================================================
 
+/// A value in a `#if` expression.
+///
+/// C17 6.10.1p4 requires `#if` arithmetic to be done in `intmax_t` and
+/// `uintmax_t`, which is 64-bit on every target here. Both domains are carried
+/// in an `i128` so a `u64` value is representable exactly and *signed*
+/// comparison of the carrier is already the correct unsigned comparison once
+/// both sides have been promoted. Results are wrapped back to 64 bits after
+/// every operation, so overflow behaves as it does in the target's arithmetic.
+///
+/// This replaces a plain `i64` that silently mapped anything out of range to
+/// `0`, so `#if 0xFFFFFFFFFFFFFFFF` took the false branch and `__UINT64_MAX__`
+/// evaluated as zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PpValue {
+    /// The value: a sign-extended i64 when signed, a zero-extended u64 when not.
+    v: i128,
+    unsigned: bool,
+}
+
+impl PpValue {
+    fn signed(v: i128) -> Self {
+        PpValue {
+            v: v as i64 as i128,
+            unsigned: false,
+        }
+    }
+
+    fn unsigned(v: i128) -> Self {
+        PpValue {
+            v: v as u64 as i128,
+            unsigned: true,
+        }
+    }
+
+    fn from_parts(v: i128, unsigned: bool) -> Self {
+        if unsigned {
+            Self::unsigned(v)
+        } else {
+            Self::signed(v)
+        }
+    }
+
+    fn is_true(self) -> bool {
+        self.v != 0
+    }
+
+    /// The carrier, for operations that do not apply the usual conversions.
+    fn raw(self) -> i128 {
+        self.v
+    }
+
+    /// Apply the usual arithmetic conversions: if either operand is unsigned,
+    /// both are taken in the unsigned domain and so is the result.
+    fn promote(a: PpValue, b: PpValue) -> (i128, i128, bool) {
+        if a.unsigned || b.unsigned {
+            (a.v as u64 as i128, b.v as u64 as i128, true)
+        } else {
+            (a.v, b.v, false)
+        }
+    }
+}
+
 struct ExprEvaluator<'a, 'b> {
     pp: &'a Preprocessor<'b>,
     idents: &'a IdentTable,
     tokens: Vec<Token>,
     pos: usize,
+    /// Set while parsing a short-circuited operand, whose diagnostics must not
+    /// fire — the whole point of `&&`/`||` not evaluating that side.
+    suppressed: bool,
 }
 
 impl<'a, 'b> ExprEvaluator<'a, 'b> {
@@ -3287,36 +3395,14 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
             idents,
             tokens: Vec::new(),
             pos: 0,
+            suppressed: false,
         }
     }
 
-    fn evaluate(&mut self, tokens: &[Token]) -> i64 {
+    fn evaluate(&mut self, tokens: &[Token]) -> PpValue {
         self.tokens = tokens.to_vec();
         self.pos = 0;
         self.expr_ternary()
-    }
-
-    /// Ternary operator has lowest precedence: cond ? true_val : false_val
-    fn expr_ternary(&mut self) -> i64 {
-        let cond = self.expr_or();
-        if self.is_special(b'?' as u32) {
-            self.advance();
-            let true_val = self.expr_ternary();
-            if self.is_special(b':' as u32) {
-                self.advance();
-            } else {
-                let pos = self.current().map(|t| t.pos).unwrap_or_default();
-                diag::error(pos, "expected ':' in conditional expression");
-            }
-            let false_val = self.expr_ternary();
-            if cond != 0 {
-                true_val
-            } else {
-                false_val
-            }
-        } else {
-            cond
-        }
     }
 
     fn current(&self) -> Option<&Token> {
@@ -3357,80 +3443,127 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
     }
 
     // Operator precedence (lowest to highest):
-    // ||
-    // &&
-    // |
-    // ^
-    // &
-    // == !=
-    // < <= > >=
-    // << >>
-    // + -
-    // * / %
-    // ! ~ - + (unary)
-    // defined, primary
+    // ?: || && | ^ & ==/!= relational shift additive multiplicative unary
 
-    fn expr_or(&mut self) -> i64 {
+    /// Ternary operator has lowest precedence: cond ? true_val : false_val
+    fn expr_ternary(&mut self) -> PpValue {
+        let cond = self.expr_or();
+        if self.is_special(b'?' as u32) {
+            self.advance();
+            let true_val = self.expr_ternary();
+            if self.is_special(b':' as u32) {
+                self.advance();
+            } else {
+                let pos = self.current().map(|t| t.pos).unwrap_or_default();
+                diag::error(pos, "expected ':' in conditional expression");
+            }
+            let false_val = self.expr_ternary();
+            if cond.is_true() {
+                true_val
+            } else {
+                false_val
+            }
+        } else {
+            cond
+        }
+    }
+
+    fn expr_or(&mut self) -> PpValue {
         let mut left = self.expr_and();
         while self.is_special(SpecialToken::LogicalOr as u32) {
             self.advance();
-            let right = self.expr_and();
-            left = if left != 0 || right != 0 { 1 } else { 0 };
+            // C17 6.5.14p4: the right operand is not evaluated if the left
+            // compares unequal to 0. Parsing must still consume it.
+            if left.is_true() {
+                self.skip_expr_and();
+                left = PpValue::signed(1);
+            } else {
+                let right = self.expr_and();
+                left = PpValue::signed(i128::from(right.is_true()));
+            }
         }
         left
     }
 
-    fn expr_and(&mut self) -> i64 {
+    fn expr_and(&mut self) -> PpValue {
         let mut left = self.expr_bitor();
         while self.is_special(SpecialToken::LogicalAnd as u32) {
             self.advance();
-            let right = self.expr_bitor();
-            left = if left != 0 && right != 0 { 1 } else { 0 };
+            // C17 6.5.13p4: the right operand is not evaluated if the left
+            // compares equal to 0.
+            if left.is_true() {
+                let right = self.expr_bitor();
+                left = PpValue::signed(i128::from(right.is_true()));
+            } else {
+                self.skip_expr_bitor();
+                left = PpValue::signed(0);
+            }
         }
         left
     }
 
-    fn expr_bitor(&mut self) -> i64 {
+    /// Parse and discard an `&&` operand, for the short-circuited case.
+    fn skip_expr_and(&mut self) {
+        let saved = self.suppressed;
+        self.suppressed = true;
+        let _ = self.expr_and();
+        self.suppressed = saved;
+    }
+
+    /// Parse and discard a `||` operand, for the short-circuited case.
+    fn skip_expr_bitor(&mut self) {
+        let saved = self.suppressed;
+        self.suppressed = true;
+        let _ = self.expr_bitor();
+        self.suppressed = saved;
+    }
+
+    fn expr_bitor(&mut self) -> PpValue {
         let mut left = self.expr_bitxor();
         while self.is_special(b'|' as u32) {
             self.advance();
             let right = self.expr_bitxor();
-            left |= right;
+            let (a, b, u) = PpValue::promote(left, right);
+            left = PpValue::from_parts(a | b, u);
         }
         left
     }
 
-    fn expr_bitxor(&mut self) -> i64 {
+    fn expr_bitxor(&mut self) -> PpValue {
         let mut left = self.expr_bitand();
         while self.is_special(b'^' as u32) {
             self.advance();
             let right = self.expr_bitand();
-            left ^= right;
+            let (a, b, u) = PpValue::promote(left, right);
+            left = PpValue::from_parts(a ^ b, u);
         }
         left
     }
 
-    fn expr_bitand(&mut self) -> i64 {
+    fn expr_bitand(&mut self) -> PpValue {
         let mut left = self.expr_equality();
         while self.is_special(b'&' as u32) {
             self.advance();
             let right = self.expr_equality();
-            left &= right;
+            let (a, b, u) = PpValue::promote(left, right);
+            left = PpValue::from_parts(a & b, u);
         }
         left
     }
 
-    fn expr_equality(&mut self) -> i64 {
+    fn expr_equality(&mut self) -> PpValue {
         let mut left = self.expr_relational();
         loop {
             if self.is_special(SpecialToken::Equal as u32) {
                 self.advance();
                 let right = self.expr_relational();
-                left = if left == right { 1 } else { 0 };
+                let (a, b, _) = PpValue::promote(left, right);
+                left = PpValue::signed(i128::from(a == b));
             } else if self.is_special(SpecialToken::NotEqual as u32) {
                 self.advance();
                 let right = self.expr_relational();
-                left = if left != right { 1 } else { 0 };
+                let (a, b, _) = PpValue::promote(left, right);
+                left = PpValue::signed(i128::from(a != b));
             } else {
                 break;
             }
@@ -3438,109 +3571,129 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
         left
     }
 
-    fn expr_relational(&mut self) -> i64 {
+    fn expr_relational(&mut self) -> PpValue {
+        // `promote` puts both operands in the same domain first, so a plain
+        // i128 comparison is already the unsigned one when either side is
+        // unsigned — that is the point of carrying values in the wider type.
+        const LT: u32 = b'<' as u32;
+        const GT: u32 = b'>' as u32;
+        let lte = SpecialToken::Lte as u32;
+        let gte = SpecialToken::Gte as u32;
+
         let mut left = self.expr_shift();
         loop {
-            if self.is_special(b'<' as u32) {
-                self.advance();
-                let right = self.expr_shift();
-                left = if left < right { 1 } else { 0 };
-            } else if self.is_special(b'>' as u32) {
-                self.advance();
-                let right = self.expr_shift();
-                left = if left > right { 1 } else { 0 };
-            } else if self.is_special(SpecialToken::Lte as u32) {
-                self.advance();
-                let right = self.expr_shift();
-                left = if left <= right { 1 } else { 0 };
-            } else if self.is_special(SpecialToken::Gte as u32) {
-                self.advance();
-                let right = self.expr_shift();
-                left = if left >= right { 1 } else { 0 };
-            } else {
-                break;
-            }
+            let op = [LT, GT, lte, gte].into_iter().find(|&t| self.is_special(t));
+            let Some(op) = op else { break };
+            self.advance();
+            let right = self.expr_shift();
+            let (a, b, _) = PpValue::promote(left, right);
+            let result = match op {
+                LT => a < b,
+                GT => a > b,
+                t if t == lte => a <= b,
+                _ => a >= b,
+            };
+            left = PpValue::signed(i128::from(result));
         }
         left
     }
 
-    fn expr_shift(&mut self) -> i64 {
+    fn expr_shift(&mut self) -> PpValue {
         let mut left = self.expr_additive();
         loop {
-            if self.is_special(SpecialToken::LeftShift as u32) {
-                self.advance();
-                let right = self.expr_additive();
-                left <<= right;
-            } else if self.is_special(SpecialToken::RightShift as u32) {
-                self.advance();
-                let right = self.expr_additive();
-                left >>= right;
-            } else {
+            let is_left = self.is_special(SpecialToken::LeftShift as u32);
+            if !is_left && !self.is_special(SpecialToken::RightShift as u32) {
                 break;
             }
+            self.advance();
+            let right = self.expr_additive();
+            // A shift does not apply the usual arithmetic conversions: the
+            // result takes the left operand's type (C17 6.5.7p3). A count
+            // outside [0, 64) is undefined; clamp rather than panic.
+            let count = right.v.clamp(0, 63) as u32;
+            let v = if is_left {
+                left.raw() << count
+            } else if left.unsigned {
+                ((left.raw() as u64) >> count) as i128
+            } else {
+                (left.raw() as i64 >> count) as i128
+            };
+            left = PpValue::from_parts(v, left.unsigned);
         }
         left
     }
 
-    fn expr_additive(&mut self) -> i64 {
+    fn expr_additive(&mut self) -> PpValue {
         let mut left = self.expr_multiplicative();
         loop {
-            if self.is_special(b'+' as u32) {
-                self.advance();
-                let right = self.expr_multiplicative();
-                left += right;
-            } else if self.is_special(b'-' as u32) {
-                self.advance();
-                let right = self.expr_multiplicative();
-                left -= right;
-            } else {
+            let is_add = self.is_special(b'+' as u32);
+            if !is_add && !self.is_special(b'-' as u32) {
                 break;
             }
+            self.advance();
+            let right = self.expr_multiplicative();
+            let (a, b, u) = PpValue::promote(left, right);
+            let v = if is_add {
+                a.wrapping_add(b)
+            } else {
+                a.wrapping_sub(b)
+            };
+            left = PpValue::from_parts(v, u);
         }
         left
     }
 
-    fn expr_multiplicative(&mut self) -> i64 {
+    fn expr_multiplicative(&mut self) -> PpValue {
         let mut left = self.expr_unary();
         loop {
-            if self.is_special(b'*' as u32) {
-                self.advance();
-                let right = self.expr_unary();
-                left *= right;
+            let op = if self.is_special(b'*' as u32) {
+                b'*'
             } else if self.is_special(b'/' as u32) {
-                self.advance();
-                let right = self.expr_unary();
-                if right != 0 {
-                    left /= right;
-                }
+                b'/'
             } else if self.is_special(b'%' as u32) {
-                self.advance();
-                let right = self.expr_unary();
-                if right != 0 {
-                    left %= right;
-                }
+                b'%'
             } else {
                 break;
-            }
+            };
+            // Capture the operator's own position: by the time the divisor is
+            // known, `current()` has moved past the end of the expression.
+            let op_pos = self.current().map(|t| t.pos).unwrap_or_default();
+            self.advance();
+            let right = self.expr_unary();
+            let (a, b, u) = PpValue::promote(left, right);
+            let v = match op {
+                b'*' => a.wrapping_mul(b),
+                _ if b == 0 => {
+                    // Only diagnose when this operand is actually reached; a
+                    // short-circuited `#if defined(X) && 1/X` must stay quiet.
+                    if !self.suppressed {
+                        diag::error(op_pos, "division by zero in preprocessor expression");
+                    }
+                    0
+                }
+                b'/' => a.wrapping_div(b),
+                _ => a.wrapping_rem(b),
+            };
+            left = PpValue::from_parts(v, u);
         }
         left
     }
 
-    fn expr_unary(&mut self) -> i64 {
+    fn expr_unary(&mut self) -> PpValue {
         if self.is_special(b'!' as u32) {
             self.advance();
             let val = self.expr_unary();
-            return if val == 0 { 1 } else { 0 };
+            return PpValue::signed(i128::from(!val.is_true()));
         }
         if self.is_special(b'~' as u32) {
             self.advance();
             let val = self.expr_unary();
-            return !val;
+            return PpValue::from_parts(!val.raw(), val.unsigned);
         }
         if self.is_special(b'-' as u32) {
             self.advance();
             let val = self.expr_unary();
-            return -val;
+            return PpValue::from_parts(val.raw().wrapping_neg(), val.unsigned);
         }
         if self.is_special(b'+' as u32) {
             self.advance();
@@ -3549,35 +3702,35 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
         self.expr_primary()
     }
 
-    fn expr_primary(&mut self) -> i64 {
+    fn expr_primary(&mut self) -> PpValue {
         // Handle defined(X) or defined X
         if self.is_ident("defined") {
             self.advance();
-            return self.eval_defined();
+            return PpValue::signed(self.eval_defined() as i128);
         }
 
         // Handle __has_attribute(X)
         if self.is_ident("__has_attribute") {
             self.advance();
-            return self.eval_has_attribute();
+            return PpValue::signed(self.eval_has_attribute() as i128);
         }
 
         // Handle __has_builtin(X)
         if self.is_ident("__has_builtin") {
             self.advance();
-            return self.eval_has_builtin_expr();
+            return PpValue::signed(self.eval_has_builtin_expr() as i128);
         }
 
         // Handle __has_feature(X) and __has_extension(X)
         if self.is_ident("__has_feature") || self.is_ident("__has_extension") {
             self.advance();
-            return self.eval_has_feature();
+            return PpValue::signed(self.eval_has_feature() as i128);
         }
 
         // Handle parenthesized expression
         if self.is_special(b'(' as u32) {
             self.advance();
-            let val = self.expr_or();
+            let val = self.expr_ternary();
             if self.is_special(b')' as u32) {
                 self.advance();
             }
@@ -3603,14 +3756,14 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
             if let Some(char_str) = char_str {
                 self.advance();
                 if char_str.is_empty() {
-                    return 0;
+                    return PpValue::signed(0);
                 }
                 // Pack all chars big-endian (GCC-compatible)
                 let mut val: i64 = 0;
                 for c in char_str.chars() {
                     val = (val << 8) | (c as i64);
                 }
-                return val;
+                return PpValue::signed(val as i128);
             }
         }
 
@@ -3619,11 +3772,11 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
         if let Some(tok) = self.current() {
             if matches!(&tok.value, TokenValue::Ident(_)) {
                 self.advance();
-                return 0;
+                return PpValue::signed(0);
             }
         }
 
-        0
+        PpValue::signed(0)
     }
 
     fn eval_defined(&mut self) -> i64 {
@@ -3729,17 +3882,45 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
         }
     }
 
-    fn parse_number(&self, s: &str) -> i64 {
-        let s = s.trim_end_matches(['u', 'U', 'l', 'L']);
+    /// Parse an integer preprocessing token into a `PpValue`.
+    ///
+    /// The value is unsigned if it carries a `u`/`U` suffix, or if it does not
+    /// fit in `intmax_t` but does fit in `uintmax_t` (C17 6.4.4.1p5). Parsing
+    /// into `u64` first is what makes `#if 0xFFFFFFFFFFFFFFFF` work; the old
+    /// `i64::from_str_radix(...).unwrap_or(0)` turned every such constant into
+    /// a silent zero.
+    fn parse_number(&self, s: &str) -> PpValue {
+        let digits = s.trim_end_matches(['u', 'U', 'l', 'L']);
+        let suffix = &s[digits.len()..];
+        let suffix_unsigned = suffix.contains('u') || suffix.contains('U');
 
-        if s.starts_with("0x") || s.starts_with("0X") {
-            i64::from_str_radix(&s[2..], 16).unwrap_or(0)
-        } else if s.starts_with("0b") || s.starts_with("0B") {
-            i64::from_str_radix(&s[2..], 2).unwrap_or(0)
-        } else if s.starts_with('0') && s.len() > 1 && s.chars().nth(1).unwrap().is_ascii_digit() {
-            i64::from_str_radix(&s[1..], 8).unwrap_or(0)
+        let (body, radix) = if let Some(hex) = digits
+            .strip_prefix("0x")
+            .or_else(|| digits.strip_prefix("0X"))
+        {
+            (hex, 16)
+        } else if let Some(bin) = digits
+            .strip_prefix("0b")
+            .or_else(|| digits.strip_prefix("0B"))
+        {
+            (bin, 2)
+        } else if digits.len() > 1
+            && digits.starts_with('0')
+            && digits[1..].starts_with(|c: char| c.is_ascii_digit())
+        {
+            (&digits[1..], 8)
         } else {
-            s.parse().unwrap_or(0)
+            (digits, 10)
+        };
+
+        match u64::from_str_radix(body, radix) {
+            Ok(v) => {
+                // Too large for intmax_t means the constant's type is
+                // uintmax_t, even without a suffix.
+                let unsigned = suffix_unsigned || v > i64::MAX as u64;
+                PpValue::from_parts(v as i128, unsigned)
+            }
+            Err(_) => PpValue::signed(0),
         }
     }
 }

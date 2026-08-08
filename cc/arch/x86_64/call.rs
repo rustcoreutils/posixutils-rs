@@ -47,10 +47,14 @@ impl X86_64CodeGen {
         for (i, arg_class) in abi_info.params.iter().enumerate() {
             // Check if this is a long double argument - these are always passed
             // BY VALUE on the stack per System V AMD64 ABI (not via pointer)
+            // `long double _Complex` also has kind LongDouble, but it is 32
+            // bytes rather than 16 and is classified COMPLEX_X87 (MEMORY), so
+            // it must fall through to the Indirect arm below and get its real
+            // size counted — not be treated as a 2-qword scalar.
             let is_longdouble = insn
                 .arg_types
                 .get(i)
-                .is_some_and(|&ty| types.kind(ty) == TypeKind::LongDouble);
+                .is_some_and(|&ty| types.kind(ty) == TypeKind::LongDouble && !types.is_complex(ty));
 
             if is_longdouble {
                 // Long double is always passed on the stack by value (16 bytes = 2 qwords)
@@ -140,6 +144,35 @@ impl X86_64CodeGen {
         for &i in info.stack_arg_indices.iter().rev() {
             let arg = insn.src[i];
             let arg_type = insn.arg_types.get(i).copied();
+
+            // MEMORY class first: a large aggregate or a `long double
+            // _Complex`. The arg pseudo holds the value's address; copy it to
+            // the stack a qword at a time. Checked ahead of the FP tests
+            // because a complex type carries its base's kind, so
+            // `long double _Complex` would otherwise be mistaken for a
+            // 16-byte scalar long double and only half of it copied.
+            if let Some(bytes) =
+                arg_type.and_then(|t| crate::arch::lir::memory_class_bytes(types, t))
+            {
+                let num_qwords = bytes.div_ceil(8);
+                let base = self.address_of_pseudo(arg);
+                for q in (0..num_qwords).rev() {
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(MemAddr::BaseOffset {
+                            base,
+                            offset: (q * 8) as i32,
+                        }),
+                        dst: GpOperand::Reg(Reg::Rax),
+                    });
+                    self.push_lir(X86Inst::Push {
+                        src: GpOperand::Reg(Reg::Rax),
+                    });
+                }
+                stack_args += num_qwords;
+                continue;
+            }
+
             let is_fp = if let Some(typ) = arg_type {
                 types.is_float(typ)
             } else {
@@ -216,34 +249,7 @@ impl X86_64CodeGen {
                     stack_args += 2;
                     continue;
                 }
-                // Check if this is a large struct arg (> 16 bytes, MEMORY class)
-                let is_large_struct = arg_type.is_some_and(|t| {
-                    let k = types.kind(t);
-                    (k == TypeKind::Struct || k == TypeKind::Union) && types.size_bits(t) > 128
-                });
-                if is_large_struct {
-                    // Large struct: arg pseudo is the struct's ADDRESS. Copy all
-                    // qwords to the stack in reverse order (stack grows down).
-                    let struct_bytes =
-                        arg_type.map(|t| types.size_bits(t) / 8).unwrap_or(8) as usize;
-                    let num_qwords = struct_bytes.div_ceil(8);
-                    self.emit_move(arg, Reg::R11, 64); // Load struct base address
-                    for q in (0..num_qwords).rev() {
-                        self.push_lir(X86Inst::Mov {
-                            size: OperandSize::B64,
-                            src: GpOperand::Mem(MemAddr::BaseOffset {
-                                base: Reg::R11,
-                                offset: (q * 8) as i32,
-                            }),
-                            dst: GpOperand::Reg(Reg::Rax),
-                        });
-                        self.push_lir(X86Inst::Push {
-                            src: GpOperand::Reg(Reg::Rax),
-                        });
-                    }
-                    stack_args += num_qwords;
-                    continue;
-                }
+                // (Large aggregates are handled by the MEMORY-class arm above.)
                 let arg_size = if let Some(typ) = arg_type {
                     types.size_bits(typ).max(32)
                 } else {
@@ -377,14 +383,28 @@ impl X86_64CodeGen {
             };
 
             if is_complex {
+                // §3.2.3, by base type:
+                //   long double _Complex -> COMPLEX_X87, passed in memory.
+                //     Already in `stack_arg_indices`, so there is nothing to
+                //     put in a register — and nothing *can* be: an x87 value
+                //     has no XMM form, which is what produced `movt %xmm0`.
+                //   float _Complex       -> one eightbyte, both halves packed
+                //                           into a single XMM.
+                //   double _Complex      -> two eightbytes, XMM(n) and XMM(n+1).
+                let base = types.complex_base(arg_type.unwrap());
+                if types.kind(base) == TypeKind::LongDouble {
+                    continue;
+                }
+                let packed = types.size_bits(arg_type.unwrap()) <= 64;
                 self.setup_complex_arg(
                     arg,
                     arg_type,
                     fp_arg_regs[fp_arg_idx],
-                    fp_arg_regs[fp_arg_idx + 1],
+                    // Only read for the two-register form.
+                    fp_arg_regs[(fp_arg_idx + 1).min(fp_arg_regs.len() - 1)],
                     types,
                 );
-                fp_arg_idx += 2;
+                fp_arg_idx += if packed { 1 } else { 2 };
             } else if is_fp {
                 let fp_size = if let Some(typ) = arg_type {
                     types.size_bits(typ)
@@ -529,50 +549,84 @@ impl X86_64CodeGen {
         types: &TypeTable,
     ) {
         let arg_loc = self.get_location(arg);
-        let (fp_size, imag_offset) = complex_fp_info(types, &self.base.target, arg_type.unwrap());
+        let complex_ty = arg_type.unwrap();
+        let (fp_size, imag_offset) = complex_fp_info(types, &self.base.target, complex_ty);
+
+        // `float _Complex` is a single eightbyte: both floats live in the low
+        // 64 bits of one XMM. Loading the halves into two registers left the
+        // imaginary part somewhere the callee never looks — `cimagf` read 0
+        // while `crealf` happened to be right, a silent wrong answer. One
+        // 64-bit move carries the whole value, mirroring what the *return*
+        // path has always done.
+        let packed = types.size_bits(complex_ty) <= 64;
+        let load_size = if packed { FpSize::Double } else { fp_size };
 
         match arg_loc {
             Loc::Stack(offset) => {
                 let adjusted = offset + self.callee_saved_offset;
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B64,
-                    src: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: -adjusted,
-                    }),
-                    dst: GpOperand::Reg(Reg::R11),
-                });
+                // A symbol's slot *is* the complex value; a temp's slot holds
+                // a pointer to it. A call returning complex yields the former
+                // (`__cret_N`), so unconditionally loading the slot as a
+                // pointer read the value's bytes as an address — `f(g())`
+                // faulted in the callee.
+                let is_symbol = self
+                    .pseudos
+                    .iter()
+                    .find(|p| p.id == arg)
+                    .is_some_and(|p| matches!(p.kind, crate::ir::PseudoKind::Sym(_)));
+                if is_symbol {
+                    self.push_lir(X86Inst::Lea {
+                        dst: Reg::R11,
+                        addr: MemAddr::BaseOffset {
+                            base: Reg::Rbp,
+                            offset: -adjusted,
+                        },
+                    });
+                } else {
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(MemAddr::BaseOffset {
+                            base: Reg::Rbp,
+                            offset: -adjusted,
+                        }),
+                        dst: GpOperand::Reg(Reg::R11),
+                    });
+                }
                 self.push_lir(X86Inst::MovFp {
-                    size: fp_size,
+                    size: load_size,
                     src: XmmOperand::Mem(MemAddr::BaseOffset {
                         base: Reg::R11,
                         offset: 0,
                     }),
                     dst: XmmOperand::Reg(real_reg),
                 });
-                self.push_lir(X86Inst::MovFp {
-                    size: fp_size,
-                    src: XmmOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::R11,
-                        offset: imag_offset,
-                    }),
-                    dst: XmmOperand::Reg(imag_reg),
-                });
+                if !packed {
+                    self.push_lir(X86Inst::MovFp {
+                        size: fp_size,
+                        src: XmmOperand::Mem(MemAddr::BaseOffset {
+                            base: Reg::R11,
+                            offset: imag_offset,
+                        }),
+                        dst: XmmOperand::Reg(imag_reg),
+                    });
+                }
             }
             Loc::Reg(r) => {
                 self.push_lir(X86Inst::MovFp {
-                    size: fp_size,
+                    size: load_size,
                     src: XmmOperand::Mem(MemAddr::BaseOffset { base: r, offset: 0 }),
                     dst: XmmOperand::Reg(real_reg),
                 });
-                self.push_lir(X86Inst::MovFp {
-                    size: fp_size,
-                    src: XmmOperand::Mem(MemAddr::BaseOffset {
-                        base: r,
-                        offset: imag_offset,
-                    }),
-                    dst: XmmOperand::Reg(imag_reg),
-                });
+                if !packed {
+                    self.push_lir(X86Inst::MovFp {
+                        size: fp_size,
+                        src: XmmOperand::Mem(MemAddr::BaseOffset {
+                            base: r,
+                            offset: imag_offset,
+                        }),
+                        dst: XmmOperand::Reg(imag_reg),
+                    });
+                }
             }
             _ => {}
         }
@@ -635,7 +689,9 @@ impl X86_64CodeGen {
                 }
                 // Check for complex return (two SSE registers)
                 if classes.len() == 2 && classes.iter().all(|c| *c == RegClass::Sse) {
-                    let is_complex_result = insn.typ.is_some_and(|t| types.is_complex(t));
+                    let is_complex_result = insn.typ.is_some_and(|t| {
+                        types.is_complex(t) && crate::arch::lir::complex_sse_regs(types, t) > 0
+                    });
                     if is_complex_result {
                         self.handle_complex_return(insn, &dst_loc, types);
                         return;
@@ -659,7 +715,9 @@ impl X86_64CodeGen {
                 // HFA returns (primarily AArch64, but handle for completeness)
                 // Complex types are similar - return in XMM0, XMM1
                 if *count == 2 {
-                    let is_complex_result = insn.typ.is_some_and(|t| types.is_complex(t));
+                    let is_complex_result = insn.typ.is_some_and(|t| {
+                        types.is_complex(t) && crate::arch::lir::complex_sse_regs(types, t) > 0
+                    });
                     if is_complex_result {
                         self.handle_complex_return(insn, &dst_loc, types);
                         return;
@@ -677,9 +735,34 @@ impl X86_64CodeGen {
                 self.emit_move_to_loc(Reg::Rax, &dst_loc, ret_size);
             }
             ArgClass::X87 { .. } => {
-                // Long double returned in ST(0) - store to destination
-                let dst_addr = self.get_x87_mem_addr(target);
-                self.push_lir(X86Inst::X87Store { addr: dst_addr });
+                let is_complex_x87 = insn.typ.is_some_and(|t| {
+                    types.is_complex(t) && crate::arch::lir::complex_sse_regs(types, t) == 0
+                });
+                if is_complex_x87 {
+                    // COMPLEX_X87: st(0) holds the real part and st(1) the
+                    // imaginary one. `fstpt` pops, so storing st(0) brings the
+                    // imaginary part to the top for the second store. Both
+                    // must be popped or the x87 stack leaks across the call.
+                    let base = types.complex_base(insn.typ.unwrap());
+                    let imag_off = (types.size_bits(base) / 8) as i32;
+                    let base_addr = self.address_of_pseudo(target);
+                    self.push_lir(X86Inst::X87Store {
+                        addr: MemAddr::BaseOffset {
+                            base: base_addr,
+                            offset: 0,
+                        },
+                    });
+                    self.push_lir(X86Inst::X87Store {
+                        addr: MemAddr::BaseOffset {
+                            base: base_addr,
+                            offset: imag_off,
+                        },
+                    });
+                } else {
+                    // Long double returned in ST(0) - store to destination
+                    let dst_addr = self.get_x87_mem_addr(target);
+                    self.push_lir(X86Inst::X87Store { addr: dst_addr });
+                }
             }
             ArgClass::Ignore => {
                 // Void return, nothing to do

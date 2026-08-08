@@ -25,6 +25,7 @@ use super::codegen::X86_64CodeGen;
 use super::lir::{GpOperand, MemAddr, X86Inst, X87BinOp};
 use super::regalloc::{Loc, Reg};
 use crate::arch::lir::{CondCode, OperandSize};
+use crate::ir::PseudoKind;
 use crate::ir::{Instruction, Opcode, PseudoId};
 use crate::types::{TypeKind, TypeTable};
 
@@ -66,11 +67,36 @@ impl X86_64CodeGen {
                 }
             }
             Loc::Stack(offset) => {
-                // addr is a local variable on stack - load directly from it
+                // Same distinction as the store side: a symbol's slot is the
+                // variable's storage, a temp's slot holds a *pointer* to
+                // storage allocated elsewhere. Loading from the slot directly
+                // in the second case read the pointer bits as a float — which
+                // is where the NaNs came from — and at a non-zero offset read
+                // past the frame entirely.
+                let is_symbol = self
+                    .pseudos
+                    .iter()
+                    .find(|p| p.id == addr)
+                    .is_some_and(|p| matches!(p.kind, PseudoKind::Sym(_)));
                 let adjusted = offset + self.callee_saved_offset;
-                MemAddr::BaseOffset {
-                    base: Reg::Rbp,
-                    offset: -(adjusted) + insn.offset as i32,
+                if is_symbol {
+                    MemAddr::BaseOffset {
+                        base: Reg::Rbp,
+                        offset: -(adjusted) + insn.offset as i32,
+                    }
+                } else {
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(MemAddr::BaseOffset {
+                            base: Reg::Rbp,
+                            offset: -adjusted,
+                        }),
+                        dst: GpOperand::Reg(Reg::R11),
+                    });
+                    MemAddr::BaseOffset {
+                        base: Reg::R11,
+                        offset: insn.offset as i32,
+                    }
                 }
             }
             Loc::Global(name) => {
@@ -141,11 +167,39 @@ impl X86_64CodeGen {
                 }
             }
             Loc::Stack(offset) => {
-                // addr is a local variable on stack - store directly to it
+                // A stack slot means one of two different things, exactly as
+                // in the integer store path: for a *symbol* pseudo the slot is
+                // the variable's storage, but for a temp it holds a *pointer*
+                // to storage allocated elsewhere. Treating the second case
+                // like the first wrote the value over the pointer itself —
+                // and, at a non-zero offset, past the end of the frame into
+                // the caller's. That is what made a `long double _Complex`
+                // return corrupt the stack.
+                let is_symbol = self
+                    .pseudos
+                    .iter()
+                    .find(|p| p.id == addr)
+                    .is_some_and(|p| matches!(p.kind, PseudoKind::Sym(_)));
                 let adjusted = offset + self.callee_saved_offset;
-                MemAddr::BaseOffset {
-                    base: Reg::Rbp,
-                    offset: -(adjusted) + insn.offset as i32,
+                if is_symbol {
+                    MemAddr::BaseOffset {
+                        base: Reg::Rbp,
+                        offset: -(adjusted) + insn.offset as i32,
+                    }
+                } else {
+                    // Load the pointer, then address through it.
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(MemAddr::BaseOffset {
+                            base: Reg::Rbp,
+                            offset: -adjusted,
+                        }),
+                        dst: GpOperand::Reg(Reg::R11),
+                    });
+                    MemAddr::BaseOffset {
+                        base: Reg::R11,
+                        offset: insn.offset as i32,
+                    }
                 }
             }
             Loc::Global(name) => {
@@ -317,6 +371,73 @@ impl X86_64CodeGen {
 
     /// Get memory address for x87 operand.
     /// Long doubles are always in memory per System V AMD64 ABI.
+    /// Materialize the *address* of a pseudo's storage into a register.
+    ///
+    /// A stack slot means one of two things: for a symbol pseudo the slot is
+    /// the object's storage, so its address is `lea`'d; for a temp the slot
+    /// holds a pointer to storage elsewhere, so the pointer is loaded. Getting
+    /// this backwards reads a value's bytes as an address, which is how
+    /// passing a call's complex result — whose result local is a symbol —
+    /// faulted in the callee.
+    ///
+    /// Needed wherever a multi-part value is addressed from a common base: a
+    /// `long double _Complex`'s two halves, or a MEMORY-class argument copied
+    /// to the stack.
+    pub(super) fn address_of_pseudo(&mut self, pseudo: PseudoId) -> Reg {
+        let loc = self.get_location(pseudo);
+        match loc {
+            Loc::Reg(r) => r,
+            Loc::Stack(offset) => {
+                let adjusted = offset + self.callee_saved_offset;
+                let is_symbol = self
+                    .pseudos
+                    .iter()
+                    .find(|p| p.id == pseudo)
+                    .is_some_and(|p| matches!(p.kind, PseudoKind::Sym(_)));
+                if is_symbol {
+                    // The slot *is* the storage: take its address.
+                    self.push_lir(X86Inst::Lea {
+                        dst: Reg::R11,
+                        addr: MemAddr::BaseOffset {
+                            base: Reg::Rbp,
+                            offset: -adjusted,
+                        },
+                    });
+                } else {
+                    // The slot holds a pointer to the storage.
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(MemAddr::BaseOffset {
+                            base: Reg::Rbp,
+                            offset: -adjusted,
+                        }),
+                        dst: GpOperand::Reg(Reg::R11),
+                    });
+                }
+                Reg::R11
+            }
+            Loc::IncomingArg(offset) => {
+                self.push_lir(X86Inst::Lea {
+                    dst: Reg::R11,
+                    addr: MemAddr::BaseOffset {
+                        base: Reg::Rbp,
+                        offset,
+                    },
+                });
+                Reg::R11
+            }
+            _ => {
+                // Fall back to the scalar path's address and take it.
+                let addr = self.get_x87_mem_addr(pseudo);
+                self.push_lir(X86Inst::Lea {
+                    dst: Reg::R11,
+                    addr,
+                });
+                Reg::R11
+            }
+        }
+    }
+
     pub(super) fn get_x87_mem_addr(&mut self, pseudo: PseudoId) -> MemAddr {
         let loc = self.get_location(pseudo);
         match loc {

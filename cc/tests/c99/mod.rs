@@ -16,6 +16,7 @@
 
 mod c99_features_gaps;
 mod complex;
+mod complex_abi;
 mod expressions;
 mod features;
 mod initializers;

@@ -268,6 +268,46 @@ pub enum CallTarget<R> {
 // Complex Type Helpers
 // ============================================================================
 
+/// How many SSE registers a complex argument occupies under System V AMD64.
+///
+/// §3.2.3 classifies the three complex types differently, and only
+/// `double _Complex` is the familiar register pair:
+///
+/// - `float _Complex` is 8 bytes: **one** eightbyte, so one XMM holds both
+///   halves packed into its low 64 bits.
+/// - `double _Complex` is 16 bytes: two eightbytes, two XMMs.
+/// - `long double _Complex` is COMPLEX_X87 and passed in memory, so it takes
+///   **no** SSE register. An x87 value has no XMM form at all — trying to move
+///   one through an XMM is what produced the invalid `movt %xmm0` mnemonic.
+pub fn complex_sse_regs(types: &TypeTable, complex_typ: TypeId) -> usize {
+    let base = types.complex_base(complex_typ);
+    match types.kind(base) {
+        TypeKind::LongDouble => 0,
+        _ if types.size_bits(complex_typ) <= 64 => 1,
+        _ => 2,
+    }
+}
+
+/// Bytes this type occupies when it is passed in memory (MEMORY class), or
+/// `None` when it is passed in registers.
+///
+/// Two kinds qualify: an aggregate too large for the register pair, and
+/// `long double _Complex`, which System V classifies COMPLEX_X87. Both are
+/// copied onto the stack by value, so they share one code path — the callers
+/// used to spell this as `kind == Struct || kind == Union`, which quietly
+/// excluded the complex case and sent it down the SSE path instead.
+pub fn memory_class_bytes(types: &TypeTable, typ: TypeId) -> Option<usize> {
+    let kind = types.kind(typ);
+    let bits = types.size_bits(typ);
+    if (kind == TypeKind::Struct || kind == TypeKind::Union) && bits > 128 {
+        return Some((bits / 8) as usize);
+    }
+    if types.is_complex(typ) && complex_sse_regs(types, typ) == 0 {
+        return Some((bits / 8) as usize);
+    }
+    None
+}
+
 /// Get FpSize and element offset for a complex type's components.
 /// Returns (FpSize for each component, byte offset to imaginary part).
 ///

@@ -212,14 +212,38 @@ impl Abi for SysVAmd64Abi {
             };
         }
 
-        // Complex types - check BEFORE is_float since complex has Float/Double kind
-        // Complex types are passed as two separate FP values in SSE registers
+        // Complex types - check BEFORE is_float, since a complex type carries
+        // the Float/Double/LongDouble kind of its base.
+        //
+        // §3.2.3 classifies the three differently, and it is not "two SSE
+        // eightbytes" for any of them but `double _Complex`:
+        //
+        //   float _Complex        8 bytes  -> ONE eightbyte, class SSE. Both
+        //                                     floats are packed into the low
+        //                                     64 bits of a single XMM.
+        //   double _Complex      16 bytes  -> two eightbytes, both SSE.
+        //   long double _Complex 32 bytes  -> COMPLEX_X87, which is passed in
+        //                                     MEMORY. There is no XMM form; a
+        //                                     value in an x87 slot cannot be
+        //                                     moved through one.
         if types.is_complex(ty) {
             let base_ty = types.complex_base(ty);
+            if types.kind(base_ty) == TypeKind::LongDouble {
+                return ArgClass::Indirect {
+                    align: 16,
+                    size_bits,
+                };
+            }
             let base_bits = types.size_bits(base_ty);
+            let total_bits = base_bits * 2;
+            let classes = if total_bits <= 64 {
+                vec![RegClass::Sse]
+            } else {
+                vec![RegClass::Sse, RegClass::Sse]
+            };
             return ArgClass::Direct {
-                classes: vec![RegClass::Sse, RegClass::Sse],
-                size_bits: base_bits * 2,
+                classes,
+                size_bits: total_bits,
             };
         }
 
@@ -298,14 +322,32 @@ impl Abi for SysVAmd64Abi {
             };
         }
 
-        // Complex types - check BEFORE is_float since complex has Float/Double kind
-        // Complex types returned in XMM0 and XMM1
+        // Complex types - check BEFORE is_float, as in `classify_param`.
+        //
+        //   float _Complex        -> XMM0, both halves packed in one eightbyte
+        //   double _Complex       -> XMM0 (real) + XMM1 (imag)
+        //   long double _Complex  -> COMPLEX_X87: st(0) and st(1). We return
+        //                            it indirectly instead, which keeps the
+        //                            value correct within a translation unit
+        //                            without inventing an x87 register pair
+        //                            the rest of the backend cannot model. See
+        //                            #C2 in cc/audit.md.
         if types.is_complex(ty) {
             let base_ty = types.complex_base(ty);
+            if types.kind(base_ty) == TypeKind::LongDouble {
+                // COMPLEX_X87: real in st(0), imaginary in st(1).
+                return ArgClass::X87 { size_bits };
+            }
             let base_bits = types.size_bits(base_ty);
+            let total_bits = base_bits * 2;
+            let classes = if total_bits <= 64 {
+                vec![RegClass::Sse]
+            } else {
+                vec![RegClass::Sse, RegClass::Sse]
+            };
             return ArgClass::Direct {
-                classes: vec![RegClass::Sse, RegClass::Sse],
-                size_bits: base_bits * 2,
+                classes,
+                size_bits: total_bits,
             };
         }
 

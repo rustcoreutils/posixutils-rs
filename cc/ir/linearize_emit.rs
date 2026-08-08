@@ -1065,33 +1065,50 @@ impl<'a> super::linearize::Linearizer<'a> {
         // For complex type assignment, handle specially - copy real and imag parts
         if self.types.is_complex(target_typ) && op == AssignOp::Assign {
             let target_addr = self.linearize_lvalue(target);
-            let value_addr = self.linearize_lvalue(value);
-            let base_typ = self.types.complex_base(target_typ);
-            let base_size = self.types.size_bits(base_typ);
-            let base_bytes = (base_size / 8) as i64;
+            // A complex-valued expression lowers to the address of the local
+            // holding it, and the source is often an rvalue (a call result,
+            // `__builtin_complex(...)`), which has no lvalue to take.
+            let value_addr = if self.types.is_complex(value_typ) {
+                self.linearize_expr(value)
+            } else {
+                self.linearize_lvalue(value)
+            };
 
-            // Load and store real part
+            // The two sides may have *different* base precisions — assigning a
+            // `double _Complex` to a `long double _Complex` is an ordinary
+            // conversion. Reading the source with the target's base type and
+            // stride, as this did, loaded 16 bytes from an 8-byte real part
+            // and then read 16 bytes past the end of the source object.
+            let dst_base = self.types.complex_base(target_typ);
+            let dst_size = self.types.size_bits(dst_base);
+            let dst_stride = (dst_size / 8) as i64;
+
+            let src_base = if self.types.is_complex(value_typ) {
+                self.types.complex_base(value_typ)
+            } else {
+                dst_base
+            };
+            let src_size = self.types.size_bits(src_base);
+            let src_stride = (src_size / 8) as i64;
+
+            // Real part
             let real = self.alloc_pseudo();
-            self.emit(Instruction::load(real, value_addr, 0, base_typ, base_size));
-            self.emit(Instruction::store(
-                real,
-                target_addr,
-                0,
-                base_typ,
-                base_size,
-            ));
+            self.emit(Instruction::load(real, value_addr, 0, src_base, src_size));
+            let real = self.emit_convert(real, src_base, dst_base);
+            self.emit(Instruction::store(real, target_addr, 0, dst_base, dst_size));
 
-            // Load and store imaginary part
+            // Imaginary part
             let imag = self.alloc_pseudo();
             self.emit(Instruction::load(
-                imag, value_addr, base_bytes, base_typ, base_size,
+                imag, value_addr, src_stride, src_base, src_size,
             ));
+            let imag = self.emit_convert(imag, src_base, dst_base);
             self.emit(Instruction::store(
                 imag,
                 target_addr,
-                base_bytes,
-                base_typ,
-                base_size,
+                dst_stride,
+                dst_base,
+                dst_size,
             ));
 
             return real; // Return real part as the result value

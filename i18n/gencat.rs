@@ -12,13 +12,13 @@ use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::io::input_stream;
 use plib::locale::mb_char_slices;
+use posixutils_i18n::bytes::{trim, trim_end};
 use std::{
     cell::RefCell,
     collections::BTreeMap,
     fmt::Display,
     fs::File,
     io::{self, Cursor, Read, Seek, Write},
-    num::ParseIntError,
     path::{Path, PathBuf},
     rc::Rc,
 };
@@ -230,7 +230,6 @@ struct CatFileMagicHeader {
 #[derive(Debug)]
 pub enum ParseError {
     NoSetNumber(usize, String),
-    ParseSetNumber(usize, ParseIntError),
     InvalidSetNumber(usize, u32),
     InvalidMsgNumber(usize, usize),
     SetNumberNotInAscending(usize, u32, u32),
@@ -248,12 +247,6 @@ impl Display for ParseError {
                 write!(
                     f,
                     "No set number available at line {line_num} with content {parse_int_error}"
-                )
-            }
-            ParseError::ParseSetNumber(line_num, line_content) => {
-                write!(
-                    f,
-                    "Unable to parse set number at line {line_num} with content {line_content}"
                 )
             }
             ParseError::InvalidSetNumber(line_num, set_num) => {
@@ -287,27 +280,6 @@ fn split_lines(input: &[u8]) -> Vec<&[u8]> {
         .split(|&b| b == b'\n')
         .map(|line| line.strip_suffix(b"\r".as_slice()).unwrap_or(line))
         .collect()
-}
-
-/// The <blank>-trimmed span of `s`. The POSIX <blank>s are single bytes in
-/// every codeset the standard admits, so this needs no character scan.
-fn trim(s: &[u8]) -> &[u8] {
-    let start = s.iter().position(|b| !b.is_ascii_whitespace());
-    match start {
-        None => &[],
-        Some(start) => {
-            let end = s.iter().rposition(|b| !b.is_ascii_whitespace()).unwrap();
-            &s[start..=end]
-        }
-    }
-}
-
-/// The <blank>-trimmed tail of `s`.
-fn trim_end(s: &[u8]) -> &[u8] {
-    match s.iter().rposition(|b| !b.is_ascii_whitespace()) {
-        None => &[],
-        Some(end) => &s[..=end],
-    }
 }
 
 /// Split `s` at the first <blank>, returning the field before it and everything

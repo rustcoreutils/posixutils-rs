@@ -121,8 +121,7 @@ impl InputState {
             return output.write(buf);
         }
 
-        let (name, line) = self.current_location();
-        let line = line as i64;
+        let line = self.current_line_number() as i64;
         let mut n = 0;
         for c in buf {
             if self.start_of_output_line {
@@ -136,10 +135,14 @@ impl InputState {
                 if self.output_current_line != line && eligible {
                     let file_changed = self.output_current_line < 1;
                     write!(output, "#line {line}")?;
-                    if file_changed && !name.is_empty() {
-                        output.write_all(b" \"")?;
-                        output.write_all(&name)?;
-                        output.write_all(b"\"")?;
+                    if file_changed {
+                        // Only now is the path worth building.
+                        let (name, _) = self.current_location();
+                        if !name.is_empty() {
+                            output.write_all(b" \"")?;
+                            output.write_all(&name)?;
+                            output.write_all(b"\"")?;
+                        }
                     }
                     output.write_all(b"\n")?;
                     self.output_current_line = line;
@@ -204,6 +207,17 @@ impl InputState {
         }
 
         Ok(true)
+    }
+
+    /// The current line number of the active input, without the allocation
+    /// [`InputState::current_location`] makes for the name.
+    ///
+    /// `write_synced` consults this for every byte it writes, and the main loop
+    /// writes plain text a byte at a time, so building a `Vec<u8>` of the path
+    /// there cost an allocation per output byte under `-s`. The name is only
+    /// needed on the rare path that actually emits a directive.
+    pub fn current_line_number(&self) -> usize {
+        self.input.last().map(|i| i.line_number).unwrap_or(0)
     }
 
     /// The name and current line number of the active input, for diagnostics

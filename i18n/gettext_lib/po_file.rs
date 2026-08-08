@@ -25,6 +25,7 @@
 //! - msgstr "translation" - translation (for singular)
 //! - msgstr[N] "translation" - plural translations
 
+use crate::bytes::trim;
 use std::io::{BufRead, BufReader, Read};
 
 /// A single message entry from a .po file
@@ -135,15 +136,6 @@ fn is_domain_directive(line: &[u8]) -> bool {
     } else {
         false
     }
-}
-
-/// The <blank>-trimmed span of `s`.
-fn trim(s: &[u8]) -> &[u8] {
-    let Some(start) = s.iter().position(|b| !b.is_ascii_whitespace()) else {
-        return &[];
-    };
-    let end = s.iter().rposition(|b| !b.is_ascii_whitespace()).unwrap();
-    &s[start..=end]
 }
 
 /// Parser for .po files

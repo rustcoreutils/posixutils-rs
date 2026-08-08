@@ -51,6 +51,67 @@ pub struct MacroParam {
     pub index: usize,
 }
 
+/// Describe how a redefinition differs from the existing definition, or `None`
+/// when C17 6.10.3p2 permits it (same kind, same parameter spelling, identical
+/// replacement list).
+///
+/// "Identical" covers white-space separation as well as spelling, but all
+/// white-space separations count as identical — which is exactly what
+/// `MacroToken::whitespace` records.
+///
+/// Whitespace *before the first* replacement token is not a separation within
+/// the list, so it is ignored. That matters in practice: a predefined macro's
+/// body is built from a bare value with no leading space, while the same
+/// definition written as `#define __GLIBC__ 2` in a header has one — and
+/// glibc's `features.h` redefines several macros we predefine, which would
+/// otherwise warn on every single compilation.
+fn macro_redefinition_conflict(old: &Macro, new: &Macro) -> Option<&'static str> {
+    if old.builtin.is_some() {
+        return Some("it is a built-in macro");
+    }
+    // The constraint governs redefinition "by another #define preprocessing
+    // directive". A macro the implementation supplied is not one, and holding
+    // headers to it is pure noise: we predefine __GLIBC_MINOR__ as 17 while
+    // the host's features.h defines the true value, so every compilation
+    // against glibc would warn.
+    if old.predefined {
+        return None;
+    }
+    if old.is_function != new.is_function {
+        return Some("one definition is function-like and the other is not");
+    }
+    if old.is_function {
+        if old.params.len() != new.params.len() {
+            return Some("the definitions take different numbers of parameters");
+        }
+        if old
+            .params
+            .iter()
+            .zip(&new.params)
+            .any(|(a, b)| a.name != b.name)
+        {
+            return Some("the parameters are spelled differently");
+        }
+        if old.is_variadic != new.is_variadic || old.variadic_name != new.variadic_name {
+            return Some("the definitions disagree about the variadic parameter");
+        }
+    }
+    if !replacement_lists_identical(&old.body, &new.body) {
+        return Some("the replacement lists differ");
+    }
+    None
+}
+
+/// Compare two replacement lists, ignoring whitespace before the first token.
+fn replacement_lists_identical(a: &[MacroToken], b: &[MacroToken]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).enumerate().all(|(i, (x, y))| {
+        x.typ == y.typ && x.value == y.value && (i == 0 || x.whitespace == y.whitespace)
+    })
+}
+
 /// A macro definition (object-like or function-like)
 #[derive(Debug, Clone)]
 pub struct Macro {
@@ -62,14 +123,22 @@ pub struct Macro {
     pub is_function: bool,
     /// Parameters for function-like macros
     pub params: Vec<MacroParam>,
-    /// Is this a variadic macro (...)? (reserved for future use)
-    pub _is_variadic: bool,
+    /// Is this a variadic macro (`...`)?
+    pub is_variadic: bool,
+    /// For the GNU named-variadic form `#define F(a, rest...)`, the name bound
+    /// to the trailing arguments. `None` means the C99 spelling, where they
+    /// are reached through `__VA_ARGS__`.
+    pub variadic_name: Option<String>,
     /// Built-in expand function (for __LINE__, __FILE__, etc.)
     pub builtin: Option<BuiltinMacro>,
+    /// True when the implementation supplied this macro (a predefine, a
+    /// keyword alias, or a `-D` on the command line) rather than a `#define`
+    /// directive in a translation unit.
+    pub predefined: bool,
 }
 
 /// A token stored in a macro body
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MacroToken {
     pub typ: TokenType,
     pub value: MacroTokenValue,
@@ -77,7 +146,7 @@ pub struct MacroToken {
 }
 
 /// Value of a macro token
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MacroTokenValue {
     None,
     Number(String),
@@ -156,8 +225,10 @@ impl Macro {
             body,
             is_function: false,
             params: vec![],
-            _is_variadic: false,
+            is_variadic: false,
+            variadic_name: None,
             builtin: None,
+            predefined: true,
         }
     }
 
@@ -180,54 +251,10 @@ impl Macro {
             body,
             is_function: false,
             params: vec![],
-            _is_variadic: false,
+            is_variadic: false,
+            variadic_name: None,
             builtin: None,
-        }
-    }
-
-    /// Create a predefined macro from a command-line -D value.
-    /// The value is tokenized properly so -DFOO=123 becomes a number token,
-    /// -DFOO=bar becomes an identifier token, etc.
-    pub fn from_cmdline_define(name: &str, value: &str) -> Self {
-        // Tokenize the value string
-        let mut idents = IdentTable::new();
-        let mut tokenizer = Tokenizer::new(value.as_bytes(), 0, &mut idents);
-        let tokens = tokenizer.tokenize();
-
-        // Convert tokens to macro tokens, skipping stream markers
-        let body: Vec<MacroToken> = tokens
-            .iter()
-            .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
-            .enumerate()
-            .map(|(i, token)| {
-                let value = match &token.value {
-                    TokenValue::Number(n) => MacroTokenValue::Number(n.clone()),
-                    TokenValue::Ident(id) => {
-                        let ident_name = idents.get_opt(*id).unwrap_or("").to_string();
-                        MacroTokenValue::Ident(ident_name)
-                    }
-                    TokenValue::String(s) => MacroTokenValue::String(s.clone()),
-                    TokenValue::Char(c) => MacroTokenValue::Char(c.clone()),
-                    TokenValue::Special(code) => MacroTokenValue::Special(*code),
-                    TokenValue::WideString(s) => MacroTokenValue::String(s.clone()),
-                    TokenValue::WideChar(c) => MacroTokenValue::Char(c.clone()),
-                    TokenValue::None => MacroTokenValue::None,
-                };
-                MacroToken {
-                    typ: token.typ,
-                    value,
-                    whitespace: i > 0 && token.pos.whitespace,
-                }
-            })
-            .collect();
-
-        Self {
-            name: name.to_string(),
-            body,
-            is_function: false,
-            params: vec![],
-            _is_variadic: false,
-            builtin: None,
+            predefined: true,
         }
     }
 
@@ -247,8 +274,10 @@ impl Macro {
             body,
             is_function: false,
             params: vec![],
-            _is_variadic: false,
+            is_variadic: false,
+            variadic_name: None,
             builtin: None,
+            predefined: true,
         }
     }
 
@@ -266,8 +295,10 @@ impl Macro {
             } else {
                 vec![]
             },
-            _is_variadic: false,
+            is_variadic: false,
+            variadic_name: None,
             builtin: Some(builtin),
+            predefined: true,
         }
     }
 }
@@ -698,6 +729,35 @@ impl<'a> Preprocessor<'a> {
     /// Define a macro
     pub fn define_macro(&mut self, mac: Macro) {
         self.macros.insert(mac.name.clone(), mac);
+    }
+
+    /// Apply one command-line `-D` specification.
+    ///
+    /// The spec is rewritten as the equivalent `#define` directive and run
+    /// through the ordinary directive path, so `-D'F(x)=x+1'` gets the same
+    /// parameter parsing, `#`/`##` handling and variadic support as a `#define`
+    /// in source. Building an object-like macro directly made `"F(x)"` the
+    /// macro *name* — a silent no-op, since no such identifier can ever be
+    /// written in a translation unit.
+    pub fn define_from_cmdline(&mut self, spec: &str, idents: &mut IdentTable) {
+        // `-DNAME` with no `=` defines NAME as 1.
+        let text = match spec.find('=') {
+            Some(eq) => format!("{} {}\n", &spec[..eq], &spec[eq + 1..]),
+            None => format!("{} 1\n", spec),
+        };
+
+        let stream_id = diag::init_stream("<command-line>");
+        let tokens = {
+            let mut tokenizer = Tokenizer::new(text.as_bytes(), stream_id, idents);
+            tokenizer.tokenize()
+        };
+        // handle_define expects to start at the macro name, and stream markers
+        // would be taken for one.
+        let mut iter = tokens
+            .into_iter()
+            .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
+            .peekable();
+        self.handle_define(&mut iter, idents);
     }
 
     /// Undefine a macro
@@ -1148,9 +1208,10 @@ impl<'a> Preprocessor<'a> {
         };
 
         // Check if function-like macro (immediate '(' without whitespace)
-        let mut params = Vec::new();
+        let mut params: Vec<MacroParam> = Vec::new();
         let mut is_function = false;
-        let mut _is_variadic = false;
+        let mut is_variadic = false;
+        let mut variadic_name = None;
 
         if let Some(next) = iter.peek() {
             if !next.pos.whitespace {
@@ -1161,6 +1222,13 @@ impl<'a> Preprocessor<'a> {
 
                         // Parse parameters
                         let mut param_index = 0;
+                        // Whether the token just parsed was an identifier with
+                        // no comma after it yet. `...` directly behind such an
+                        // identifier is the GNU named-variadic spelling
+                        // `#define F(a, rest...)`, where `rest` names the
+                        // trailing arguments rather than being a parameter of
+                        // its own.
+                        let mut ident_immediately_before = false;
                         while let Some(param_tok) = iter.next() {
                             if param_tok.pos.newline {
                                 break;
@@ -1168,9 +1236,23 @@ impl<'a> Preprocessor<'a> {
 
                             match &param_tok.value {
                                 TokenValue::Special(c) if *c == b')' as u32 => break,
-                                TokenValue::Special(c) if *c == b',' as u32 => continue,
+                                TokenValue::Special(c) if *c == b',' as u32 => {
+                                    ident_immediately_before = false;
+                                    continue;
+                                }
                                 TokenValue::Special(c) if *c == SpecialToken::Ellipsis as u32 => {
-                                    _is_variadic = true;
+                                    is_variadic = true;
+                                    if ident_immediately_before {
+                                        // Rebind the identifier: it is the name
+                                        // of the variadic part, not a positional
+                                        // parameter. Leaving it in `params` made
+                                        // it match only the *first* trailing
+                                        // argument and pushed the __VA_ARGS__
+                                        // start index one too far.
+                                        if let Some(p) = params.pop() {
+                                            variadic_name = Some(p.name);
+                                        }
+                                    }
                                     // Consume closing paren
                                     for t in iter.by_ref() {
                                         if t.pos.newline {
@@ -1191,6 +1273,7 @@ impl<'a> Preprocessor<'a> {
                                             index: param_index,
                                         });
                                         param_index += 1;
+                                        ident_immediately_before = true;
                                     }
                                 }
                                 _ => {}
@@ -1203,16 +1286,35 @@ impl<'a> Preprocessor<'a> {
 
         // Collect body tokens
         let body_tokens = self.collect_to_eol(iter);
-        let body = self.tokens_to_macro_body(&body_tokens, &params, idents);
+        let body = self.tokens_to_macro_body(
+            &body_tokens,
+            &params,
+            variadic_name.as_deref(),
+            is_function,
+            idents,
+        );
 
         let mac = Macro {
             name: name.clone(),
             body,
             is_function,
             params,
-            _is_variadic,
+            is_variadic,
+            variadic_name,
             builtin: None,
+            predefined: false,
         };
+
+        // C17 6.10.3p2: a macro may be redefined only by a definition of the
+        // same kind, with the same parameter spelling and an identical
+        // replacement list. Diagnose as a warning rather than an error: the
+        // standard requires only a diagnostic, and rejecting outright would
+        // break a great deal of code that redefines a macro benignly.
+        if let Some(existing) = self.macros.get(&name) {
+            if let Some(why) = macro_redefinition_conflict(existing, &mac) {
+                diag::warning(name_token.pos, &format!("'{}' redefined: {}", name, why));
+            }
+        }
 
         self.define_macro(mac);
     }
@@ -1222,8 +1324,35 @@ impl<'a> Preprocessor<'a> {
         &self,
         tokens: &[Token],
         params: &[MacroParam],
+        variadic_name: Option<&str>,
+        is_function: bool,
         idents: &IdentTable,
     ) -> Vec<MacroToken> {
+        // C17 6.10.3.3p1: `##` shall occur at neither end of a replacement
+        // list. Both used to become a literal `#`/`##` token instead.
+        let is_paste = |t: &Token| {
+            matches!(&t.value, TokenValue::Special(c)
+                if *c == SpecialToken::HashHash as u32)
+        };
+        if let Some(first) = tokens.first() {
+            if is_paste(first) {
+                diag::error(
+                    first.pos,
+                    "'##' cannot appear at the start of a macro replacement list",
+                );
+            }
+        }
+        if tokens.len() > 1 {
+            if let Some(last) = tokens.last() {
+                if is_paste(last) {
+                    diag::error(
+                        last.pos,
+                        "'##' cannot appear at the end of a macro replacement list",
+                    );
+                }
+            }
+        }
+
         let mut body = Vec::new();
         let mut i = 0;
 
@@ -1270,8 +1399,9 @@ impl<'a> Preprocessor<'a> {
                                     i += 2;
                                     continue;
                                 }
-                                // Check for __VA_ARGS__
-                                if name == "__VA_ARGS__" {
+                                // Check for __VA_ARGS__, or the GNU named
+                                // variadic that stands in for it.
+                                if name == "__VA_ARGS__" || Some(name) == variadic_name {
                                     body.push(MacroToken {
                                         typ: TokenType::Special,
                                         value: MacroTokenValue::Stringify(params.len()),
@@ -1282,6 +1412,13 @@ impl<'a> Preprocessor<'a> {
                                 }
                             }
                         }
+                    }
+
+                    // C17 6.10.3.2p1: in a function-like macro each `#` shall
+                    // be followed by a parameter. It used to fall through to a
+                    // literal `#` token with no diagnostic.
+                    if is_function {
+                        diag::error(token.pos, "'#' is not followed by a macro parameter");
                     }
                 }
 
@@ -1300,8 +1437,9 @@ impl<'a> Preprocessor<'a> {
             // Check for parameter reference or __VA_ARGS__
             if let TokenValue::Ident(id) = &token.value {
                 if let Some(name) = idents.get_opt(*id) {
-                    // Check if it's __VA_ARGS__
-                    if name == "__VA_ARGS__" {
+                    // Check if it's __VA_ARGS__, or the GNU named variadic
+                    // that stands in for it.
+                    if name == "__VA_ARGS__" || Some(name) == variadic_name {
                         body.push(MacroToken {
                             typ: TokenType::Ident,
                             value: MacroTokenValue::VaArgs,
@@ -2806,6 +2944,56 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Expand a function-like macro
+    /// C17 6.10.3p4: a function-like macro invocation must supply as many
+    /// arguments as the definition has parameters (and at least that many for a
+    /// variadic one).
+    ///
+    /// Substitution used `args.get(idx).unwrap_or_default()`, so a missing
+    /// argument silently became empty and an extra one was silently dropped.
+    fn check_macro_arity(&self, mac: &Macro, args: &[Vec<Token>], pos: &Position) {
+        // `collect_macro_args` yields no arguments at all for `F()`. That spells
+        // *one empty argument* unless the macro takes none, so recover the
+        // distinction here rather than in the collector, which cannot see the
+        // definition.
+        let supplied = if args.is_empty() {
+            if mac.params.is_empty() && !mac.is_variadic {
+                0
+            } else {
+                1
+            }
+        } else {
+            args.len()
+        };
+        let required = mac.params.len();
+
+        // The variadic part may be empty; that is a GNU extension C23 adopted,
+        // and rejecting it would break a great deal of existing code.
+        let wrong = if mac.is_variadic {
+            supplied < required
+        } else {
+            supplied != required
+        };
+        if !wrong {
+            return;
+        }
+
+        let expected = if mac.is_variadic {
+            format!("at least {}", required)
+        } else {
+            required.to_string()
+        };
+        diag::error(
+            *pos,
+            &format!(
+                "macro '{}' requires {} argument{}, but {} given",
+                mac.name,
+                expected,
+                if required == 1 { "" } else { "s" },
+                supplied
+            ),
+        );
+    }
+
     fn expand_function_macro(
         &mut self,
         mac: &Macro,
@@ -2813,6 +3001,8 @@ impl<'a> Preprocessor<'a> {
         pos: &Position,
         idents: &mut IdentTable,
     ) -> Option<Vec<Token>> {
+        self.check_macro_arity(mac, args, pos);
+
         // Note: Don't add to expanding set yet - arguments need to be fully expanded first.
         // The expanding set is only used during the rescan phase to prevent infinite recursion.
 
@@ -3980,17 +4170,7 @@ pub fn preprocess_with_defines(
 
     // Process -D defines
     for def in config.defines {
-        if let Some(eq_pos) = def.find('=') {
-            // -DNAME=VALUE - tokenize the value properly
-            let name = &def[..eq_pos];
-            let value = &def[eq_pos + 1..];
-            let mac = Macro::from_cmdline_define(name, value);
-            pp.define_macro(mac);
-        } else {
-            // -DNAME (define to 1)
-            let mac = Macro::predefined(def, Some("1"));
-            pp.define_macro(mac);
-        }
+        pp.define_from_cmdline(def, idents);
     }
 
     // Process -U undefines
@@ -4077,17 +4257,7 @@ pub fn preprocess_asm_file(
 
     // Process -D defines
     for def in config.defines {
-        if let Some(eq_pos) = def.find('=') {
-            // -DNAME=VALUE
-            let name = &def[..eq_pos];
-            let value = &def[eq_pos + 1..];
-            let mac = Macro::from_cmdline_define(name, value);
-            pp.define_macro(mac);
-        } else {
-            // -DNAME (define to 1)
-            let mac = Macro::predefined(def, Some("1"));
-            pp.define_macro(mac);
-        }
+        pp.define_from_cmdline(def, &mut strings);
     }
 
     // Process -U undefines
@@ -4618,12 +4788,91 @@ second
 
     #[test]
     fn test_macro_redefinition() {
-        // Macro redefinition should use latest value
+        // An incompatible redefinition is diagnosed (C17 6.10.3p2) but is not
+        // fatal: the standard requires only a diagnostic, and rejecting would
+        // break a great deal of code that redefines a macro benignly. The
+        // later definition wins, as it always has.
+        //
+        // This test used to assert the silent override *as intended*, which is
+        // why the constraint went unimplemented.
         let input = "#define X 1\n#define X 2\nX";
         let (tokens, idents) = preprocess_str(input);
         let strs = get_token_strings(&tokens, &idents);
         assert!(strs.contains(&"2".to_string()));
         assert!(!strs.contains(&"1".to_string()));
+    }
+
+    #[test]
+    fn test_macro_redefinition_conflict_detection() {
+        // Build a macro as if it came from a `#define` directive: the
+        // implementation-predefined flag exempts a macro from the constraint,
+        // which is not what is under test here.
+        fn obj(name: &str, value: &str) -> Macro {
+            let mut m = Macro::predefined(name, Some(value));
+            m.predefined = false;
+            m
+        }
+
+        // Identical replacement lists are permitted.
+        assert!(macro_redefinition_conflict(&obj("A", "1"), &obj("A", "1")).is_none());
+        // Differing ones are not.
+        assert!(macro_redefinition_conflict(&obj("A", "1"), &obj("A", "2")).is_some());
+
+        // Object-like versus function-like.
+        let mut fnlike = obj("A", "1");
+        fnlike.is_function = true;
+        fnlike.params = vec![MacroParam {
+            name: "x".into(),
+            index: 0,
+        }];
+        assert!(macro_redefinition_conflict(&obj("A", "1"), &fnlike).is_some());
+
+        // Same shape, differently spelled parameters.
+        let mut renamed = fnlike.clone();
+        renamed.params = vec![MacroParam {
+            name: "y".into(),
+            index: 0,
+        }];
+        assert!(macro_redefinition_conflict(&fnlike, &renamed).is_some());
+
+        // A parameter list that matches is fine.
+        assert!(macro_redefinition_conflict(&fnlike, &fnlike.clone()).is_none());
+    }
+
+    #[test]
+    fn test_replacement_lists_ignore_leading_whitespace() {
+        // Whitespace before the first replacement token is not a separation
+        // *within* the list. Without this, every compilation against glibc
+        // warned: we predefine __GLIBC__ with no leading space, while
+        // features.h writes `#define __GLIBC__ 2` with one.
+        let a = vec![MacroToken {
+            typ: TokenType::Number,
+            value: MacroTokenValue::Number("2".into()),
+            whitespace: false,
+        }];
+        let b = vec![MacroToken {
+            typ: TokenType::Number,
+            value: MacroTokenValue::Number("2".into()),
+            whitespace: true,
+        }];
+        assert!(replacement_lists_identical(&a, &b));
+
+        // But whitespace between tokens still counts.
+        let two = |ws: bool| {
+            vec![
+                MacroToken {
+                    typ: TokenType::Number,
+                    value: MacroTokenValue::Number("1".into()),
+                    whitespace: false,
+                },
+                MacroToken {
+                    typ: TokenType::Number,
+                    value: MacroTokenValue::Number("2".into()),
+                    whitespace: ws,
+                },
+            ]
+        };
+        assert!(!replacement_lists_identical(&two(true), &two(false)));
     }
 
     // ========================================================================

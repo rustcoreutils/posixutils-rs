@@ -313,6 +313,269 @@ fn preprocessor_builtin_headers_still_resolve() {
     assert_has(&r.stdout, "int n =", "#P9 regression");
 }
 
+// ============================================================================
+// #P3 — incompatible macro redefinition
+// ============================================================================
+
+/// C17 6.10.3p2 requires a diagnostic when a macro is redefined by anything
+/// but an identical definition. A warning satisfies it; making this fatal
+/// would reject a great deal of code that redefines a macro benignly.
+#[test]
+fn preprocessor_incompatible_redefinition_is_diagnosed() {
+    for (name, src, why) in [
+        (
+            "redef_value",
+            "#define A 1\n#define A 2\nint x = A;\n",
+            "different replacement list",
+        ),
+        (
+            "redef_kind",
+            "#define C 1\n#define C(x) x\nint z;\n",
+            "object-like then function-like",
+        ),
+        (
+            "redef_params",
+            "#define D(a) a\n#define D(b) b\nint w;\n",
+            "differently spelled parameters",
+        ),
+        (
+            "redef_arity",
+            "#define E(a) a\n#define E(a,b) a\nint v;\n",
+            "different parameter counts",
+        ),
+    ] {
+        let r = preprocess_text(name, src, &[]);
+        assert!(
+            r.stderr.contains("redefined"),
+            "a redefinition with a {} must be diagnosed; stderr was:\n{}",
+            why,
+            r.stderr
+        );
+    }
+}
+
+/// An identical redefinition is explicitly legal and must stay silent — this
+/// is the common idiom where two headers define the same macro the same way.
+#[test]
+fn preprocessor_identical_redefinition_is_silent() {
+    for (name, src) in [
+        ("redef_same", "#define A 1\n#define A 1\nint x = A;\n"),
+        (
+            "redef_same_fn",
+            "#define B(x) (x)\n#define B(x) (x)\nint y = B(2);\n",
+        ),
+        // All white-space separations count as identical (6.10.3p1).
+        (
+            "redef_spacing",
+            "#define C(x) (x + 1)\n#define C(x) (x   +   1)\nint z = C(2);\n",
+        ),
+    ] {
+        let r = preprocess_text(name, src, &[]);
+        assert!(
+            !r.stderr.contains("redefined"),
+            "an identical redefinition must not be diagnosed; stderr was:\n{}",
+            r.stderr
+        );
+    }
+}
+
+/// A `#define` that redefines a macro the *implementation* predefined is not
+/// the `#define`-versus-`#define` conflict the constraint governs.
+#[test]
+fn preprocessor_redefining_a_predefine_is_silent() {
+    let r = preprocess_text(
+        "redef_predefined",
+        "#define __GNUC_MINOR__ 99\nint x = __GNUC_MINOR__;\n",
+        &[],
+    );
+    assert!(
+        !r.stderr.contains("redefined"),
+        "redefining an implementation predefine must not warn; stderr was:\n{}",
+        r.stderr
+    );
+    assert_has(&r.stdout, "99", "the redefinition still takes effect");
+}
+
+/// The reason that exemption matters: glibc's `features.h` redefines several
+/// macros we predefine (`__GLIBC_MINOR__` among them, where we hardcode 17 and
+/// the host says 39). Without it, every compilation against glibc would warn.
+#[test]
+fn preprocessor_including_a_system_header_is_warning_free() {
+    let r = preprocess_text("sys_header_quiet", "#include <stdio.h>\nint x;\n", &[]);
+    assert!(
+        !r.stderr.contains("redefined"),
+        "a plain system include must not produce redefinition warnings; stderr was:\n{}",
+        r.stderr
+    );
+}
+
+// ============================================================================
+// #P4 — macro argument count
+// ============================================================================
+
+#[test]
+fn preprocessor_macro_arity_mismatch_is_diagnosed() {
+    for (name, src, why) in [
+        (
+            "arity_few",
+            "#define F(a,b) (a+b)\nint x = F(1);\n",
+            "too few",
+        ),
+        (
+            "arity_many",
+            "#define F(a,b) (a+b)\nint x = F(1,2,3);\n",
+            "too many",
+        ),
+        (
+            "arity_variadic_short",
+            "#define V(a,b,...) (a)\nint x = V(1);\n",
+            "fewer than the named parameters of a variadic macro",
+        ),
+    ] {
+        let r = preprocess_text(name, src, &[]);
+        assert!(
+            r.stderr.contains("error"),
+            "{} arguments must be diagnosed; stderr was:\n{}",
+            why,
+            r.stderr
+        );
+    }
+}
+
+/// The legal shapes must stay quiet — especially `F()` for a one-parameter
+/// macro, which supplies one *empty* argument, not zero.
+#[test]
+fn preprocessor_legal_macro_arities_are_accepted() {
+    for (name, src) in [
+        ("arity_empty_arg", "#define G(x) (x)\nint a = G();\n"),
+        ("arity_zero_params", "#define H() 7\nint a = H();\n"),
+        ("arity_exact", "#define I(a,b) (a+b)\nint a = I(1,2);\n"),
+        (
+            "arity_variadic_empty",
+            "#define V(a,...) (a)\nint a = V(1);\n",
+        ),
+        (
+            "arity_variadic_full",
+            "#define V(a,...) (a)\nint a = V(1,2,3);\n",
+        ),
+    ] {
+        let r = preprocess_text(name, src, &[]);
+        assert!(
+            !r.stderr.contains("error"),
+            "a legal invocation was rejected; stderr was:\n{}",
+            r.stderr
+        );
+    }
+}
+
+// ============================================================================
+// #P5 — `#` and `##` placement
+// ============================================================================
+
+#[test]
+fn preprocessor_paste_at_either_end_is_diagnosed() {
+    for (name, src) in [
+        ("paste_lead", "#define BAD(a) ## a\nint x;\n"),
+        ("paste_trail", "#define BAD(a) a ##\nint x;\n"),
+    ] {
+        let r = preprocess_text(name, src, &[]);
+        assert!(
+            r.stderr.contains("error"),
+            "'##' at the edge of a replacement list must be diagnosed (6.10.3.3p1); stderr:\n{}",
+            r.stderr
+        );
+    }
+}
+
+#[test]
+fn preprocessor_stringify_without_a_parameter_is_diagnosed() {
+    let r = preprocess_text("hash_nonparam", "#define S(x) # y\nint a;\n", &[]);
+    assert!(
+        r.stderr.contains("error"),
+        "'#' not followed by a parameter must be diagnosed (6.10.3.2p1); stderr:\n{}",
+        r.stderr
+    );
+}
+
+/// The legal uses, plus the case that is legal only because the macro is
+/// object-like — there `#` is an ordinary token.
+#[test]
+fn preprocessor_legal_hash_forms_are_accepted() {
+    for (name, src) in [
+        ("paste_ok", "#define OK(a,b) a ## b\nint OK(x,y);\n"),
+        ("hash_ok", "#define S(x) #x\nconst char *s = S(ok);\n"),
+        ("hash_object_like", "#define OBJ # notaparam\nint a;\n"),
+    ] {
+        let r = preprocess_text(name, src, &[]);
+        assert!(
+            !r.stderr.contains("error"),
+            "a legal use of #/## was rejected; stderr was:\n{}",
+            r.stderr
+        );
+    }
+}
+
+// ============================================================================
+// #P15 — `-D` may define a function-like macro
+// ============================================================================
+
+/// `-D'FOO(x)=x+1'` used to make `"FOO(x)"` the macro *name*, which no source
+/// file can ever reference — a silent no-op.
+#[test]
+fn preprocessor_dash_d_defines_function_like_macros() {
+    let r = preprocess_text("dashd_fn", "int x = FOO(1);\n", &["-DFOO(x)=x+1"]);
+    assert!(r.success, "{}", r.stderr);
+    assert_lacks(&r.stdout, "FOO(", "#P15: the macro must have expanded");
+    assert_has(&r.stdout, "1", "#P15");
+
+    let r = preprocess_text(
+        "dashd_fn2",
+        "int y = BAR(2,3);\n",
+        &["-DBAR(a,b)=((a)*(b))"],
+    );
+    assert!(r.success, "{}", r.stderr);
+    assert_lacks(&r.stdout, "BAR(", "#P15");
+    assert_has(&r.stdout, "2", "#P15");
+    assert_has(&r.stdout, "3", "#P15");
+}
+
+/// The object-like `-D` forms must keep working.
+#[test]
+fn preprocessor_dash_d_object_forms_still_work() {
+    let r = preprocess_text("dashd_obj", "int a = P;\nint b = Q;\n", &["-DP=42", "-DQ"]);
+    assert!(r.success, "{}", r.stderr);
+    assert_has(&r.stdout, "42", "#P15 -DNAME=VALUE");
+    assert_has(&r.stdout, "int b = 1", "#P15 bare -DNAME defines it as 1");
+}
+
+// ============================================================================
+// #P16 — GNU named variadic macros
+// ============================================================================
+
+/// `#define LOG(fmt, args...)` binds *all* trailing arguments to `args`. It
+/// used to be parsed as an ordinary positional parameter, so it captured only
+/// the first — and pushed the `__VA_ARGS__` start index one too far.
+#[test]
+fn preprocessor_named_variadic_binds_all_trailing_arguments() {
+    let src = "#include <stdio.h>\n\
+               #define LOG(fmt, args...) printf(fmt, args)\n\
+               int main(void){ LOG(\"%d %d %d\\n\", 1, 2, 3); return 0; }\n";
+    assert_eq!(
+        crate::common::compile_and_run("named_variadic", src, &[]),
+        0,
+        "a named variadic macro must forward every trailing argument"
+    );
+}
+
+/// The C99 `__VA_ARGS__` spelling must be unaffected.
+#[test]
+fn preprocessor_va_args_form_still_works() {
+    let src = "#include <stdio.h>\n\
+               #define LOG2(fmt, ...) printf(fmt, __VA_ARGS__)\n\
+               int main(void){ LOG2(\"%d %d %d\\n\", 4, 5, 6); return 0; }\n";
+    assert_eq!(crate::common::compile_and_run("va_args_form", src, &[]), 0);
+}
+
 /// Sanity check for the two shadowing tests above: a header that really is
 /// absent must still be diagnosed, so a silently-skipped `#include` cannot
 /// make them pass vacuously.

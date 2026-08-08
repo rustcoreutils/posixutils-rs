@@ -8,6 +8,8 @@
 //
 
 use plib::testing::{run_test_with_checker_and_env, run_test_with_env, TestPlan};
+use std::fs;
+use tempfile::TempDir;
 
 /// Test that lp fails when no destination is specified
 #[test]
@@ -79,74 +81,6 @@ fn lp_bare_name_resolves_to_localhost() {
                 stderr
             );
             assert_eq!(output.status.code(), Some(1));
-        },
-    );
-}
-
-/// Test that -m option is accepted (stub implementation)
-#[test]
-fn lp_m_option_accepted() {
-    run_test_with_checker_and_env(
-        TestPlan {
-            cmd: String::from("lp"),
-            args: vec![
-                "-m".to_string(),
-                "-d".to_string(),
-                "ipp://localhost/ipp/print".to_string(),
-            ],
-            stdin_data: String::from("test data"),
-            expected_out: String::from(""),
-            expected_err: String::from(""),
-            expected_exit_code: 1,
-        },
-        &[("LPDEST", ""), ("PRINTER", "")],
-        |_, output| {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // -m should be accepted; any failure should be printer error, not option error
-            assert!(
-                !stderr.contains("-m option not supported"),
-                "Expected -m to be accepted, but got: {}",
-                stderr
-            );
-            assert!(
-                stderr.contains("printer error"),
-                "Expected printer error (no printer available), got: {}",
-                stderr
-            );
-        },
-    );
-}
-
-/// Test that -w option is accepted (stub implementation)
-#[test]
-fn lp_w_option_accepted() {
-    run_test_with_checker_and_env(
-        TestPlan {
-            cmd: String::from("lp"),
-            args: vec![
-                "-w".to_string(),
-                "-d".to_string(),
-                "ipp://localhost/ipp/print".to_string(),
-            ],
-            stdin_data: String::from("test data"),
-            expected_out: String::from(""),
-            expected_err: String::from(""),
-            expected_exit_code: 1,
-        },
-        &[("LPDEST", ""), ("PRINTER", "")],
-        |_, output| {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // -w should be accepted; any failure should be printer error, not option error
-            assert!(
-                !stderr.contains("-w option not supported"),
-                "Expected -w to be accepted, but got: {}",
-                stderr
-            );
-            assert!(
-                stderr.contains("printer error"),
-                "Expected printer error (no printer available), got: {}",
-                stderr
-            );
         },
     );
 }
@@ -1012,4 +946,196 @@ fn lp_multiple_files_each_report_a_request_id() {
 
     let _ = handle.join();
     let _ = std::fs::remove_dir_all(&td);
+}
+
+// ============================================================================
+// -m and -w: the notifications themselves, not just that the option parses
+//
+// `lp_m_option_accepted` and `lp_w_option_accepted` used to assert only that
+// the flag was accepted and that the connection then failed, which says nothing
+// about whether a completion mail or terminal write ever happens. The IPP stub
+// answers `job-state = 9` (completed) on its first poll, so `wait_for_job`
+// returns immediately and the notification path runs for real. Each submitted
+// job adds one Get-Job-Attributes request on top of the Print-Job, so the stub
+// must serve two.
+// ============================================================================
+
+/// `-m`: "mail sent to the user after the files have been printed"
+/// (lp DESCRIPTION). `LP_SENDMAIL` points at a recorder so the message can be
+/// read back; without it the only way to observe this is a real MTA.
+#[test]
+fn lp_m_mails_the_user_when_the_job_completes() {
+    let Some((uri, handle)) = spawn_ipp_stub(4321, 2) else {
+        return; // cannot bind a port in this environment
+    };
+    let dir = TempDir::new().unwrap();
+    let recorded = dir.path().join("mail.txt");
+    let recorder = dir.path().join("fake-sendmail");
+    fs::write(
+        &recorder,
+        format!("#!/bin/sh\nexec cat > {}\n", recorded.to_string_lossy()),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&recorder, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("lp"),
+            args: vec![String::from("-m"), String::from("-d"), uri.clone()],
+            stdin_data: String::from("job payload"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[
+            ("LPDEST", ""),
+            ("PRINTER", ""),
+            ("LP_SENDMAIL", recorder.to_str().unwrap()),
+        ],
+        |_, output| {
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "stderr={:?}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        },
+    );
+
+    let _ = handle.join();
+
+    let message = fs::read_to_string(&recorded)
+        .expect("-m must invoke the mail transport after the job completes");
+    assert!(
+        message.contains("To: "),
+        "expected an addressed message, got {message:?}"
+    );
+    assert!(
+        message.contains(&format!("{}-4321", uri)),
+        "the mail body must name the request ID of the completed job, got {message:?}"
+    );
+}
+
+/// `-m` with `LP_SENDMAIL` pointing at nothing still succeeds: the mail is
+/// best-effort and must not fail the print job.
+#[test]
+fn lp_m_failure_to_mail_does_not_fail_the_job() {
+    let Some((uri, handle)) = spawn_ipp_stub(99, 2) else {
+        return;
+    };
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("lp"),
+            args: vec![String::from("-m"), String::from("-d"), uri.clone()],
+            stdin_data: String::from("job payload"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[
+            ("LPDEST", ""),
+            ("PRINTER", ""),
+            ("LP_SENDMAIL", "/nonexistent/sendmail"),
+        ],
+        |_, output| {
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "an undeliverable notification must not fail the job; stderr={:?}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.is_empty(),
+                "a best-effort mail failure must stay silent, got {stderr:?}"
+            );
+        },
+    );
+
+    let _ = handle.join();
+}
+
+/// `-w`: "write a message on the user's terminal after the files have been
+/// printed". The message goes to `/dev/tty`, so `lp` has to run on a
+/// pseudo-terminal for it to be observable at all.
+#[test]
+#[cfg(target_os = "linux")]
+fn lp_w_writes_to_the_terminal_when_the_job_completes() {
+    let Some((uri, handle)) = spawn_ipp_stub(555, 2) else {
+        return;
+    };
+
+    let pty = match portable_pty::native_pty_system().openpty(portable_pty::PtySize {
+        rows: 24,
+        cols: 80,
+        pixel_width: 0,
+        pixel_height: 0,
+    }) {
+        Ok(p) => p,
+        Err(_) => {
+            println!("Skipping: no PTY available");
+            let _ = handle.join();
+            return;
+        }
+    };
+
+    let mut cmd = portable_pty::CommandBuilder::new(plib::testing::get_binary_path("lp"));
+    cmd.arg("-w");
+    cmd.arg("-d");
+    cmd.arg(&uri);
+    cmd.env("LPDEST", "");
+    cmd.env("PRINTER", "");
+    cmd.env("TERM", "vt100");
+    // With no file operands lp reads the job from standard input, which is the
+    // terminal here, so give it one instead.
+    let dir = TempDir::new().unwrap();
+    let job = dir.path().join("job.txt");
+    fs::write(&job, b"job payload").unwrap();
+    cmd.arg(&job);
+
+    let mut child = pty.slave.spawn_command(cmd).unwrap();
+    drop(pty.slave);
+
+    let mut reader = pty.master.try_clone_reader().unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let sink = std::sync::Arc::clone(&seen);
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match std::io::Read::read(&mut reader, &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => sink
+                    .lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(&buf[..n])),
+            }
+        }
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
+        if child.try_wait().ok().flatten().is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = handle.join();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    let text = seen.lock().unwrap().clone();
+    assert!(
+        text.contains("print job completed"),
+        "-w must write a completion message to the terminal, saw {text:?}"
+    );
+    assert!(
+        text.contains(&format!("{}-555", uri)),
+        "the terminal message must name the request ID, saw {text:?}"
+    );
 }

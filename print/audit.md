@@ -192,9 +192,32 @@ job-id, so the success path is finally reachable. It self-skips if it cannot
 bind.
 
 - [x] A successful job writes `request id is <dest>-<job-id>` and exits 0 (`lp_successful_job_prints_request_id`); `-s` suppresses it (`lp_silent_suppresses_the_request_id_on_success`); each accepted operand gets its own line (`lp_multiple_files_each_report_a_request_id`).
-- [ ] No test asserts `-m` actually sends mail (#1) — `lp_m_option_accepted` only checks `-m` is *accepted*. Beyond the stub, this needs the mail transport intercepted: `notify_after_print` polls the printer to a terminal job state and then shells out to a mailer. Left open deliberately rather than asserted weakly.
-- [ ] No test asserts `-w` actually writes to the terminal (#2) — same shape as #1, plus a PTY to observe the write.
-- [ ] No test exercises the no-destination *success* path / system default (#3) — needs a configured system default printer, which the stub cannot supply (lp reaches it only via `LPDEST`/`PRINTER` or `-d`).
+- [x] `-m` actually sends mail (#1) — closed 2026-08-08. The IPP stub already
+  answered `job-state = 9` on its first poll, so `wait_for_job` returns at once
+  and the notification path runs for real; the stub just needed to serve the
+  extra Get-Job-Attributes request each submitted job adds. The remaining
+  blocker was that `send_mail` hardcoded the three historical sendmail paths
+  with no injection point, so `LP_SENDMAIL` now overrides them — honored only
+  when real uid == effective uid, exactly as `at` guards `AT_ALLOW`/`AT_DENY`
+  (`cron/spool.rs:378-396`), so a set-uid `lp` cannot be tricked into running an
+  attacker-chosen program. `lp_m_mails_the_user_when_the_job_completes` points
+  it at a recorder script and asserts the message is addressed and names the
+  completed job's request ID; a companion test asserts an undeliverable
+  notification stays silent and does not fail the print job. This replaces
+  `lp_m_option_accepted`, which asserted only that the flag parsed and the
+  connection then failed.
+- [x] `-w` actually writes to the terminal (#2) — closed 2026-08-08.
+  `write_to_terminal` opens `/dev/tty`, so `lp` is run on a pseudo-terminal and
+  the master is drained to observe it: `lp_w_writes_to_the_terminal_when_the_job_completes`
+  asserts the completion message reaches the terminal and names the request ID.
+  Self-skips when no PTY can be allocated. Replaces `lp_w_option_accepted`.
+- [ ] No test exercises the no-destination *success* path / system default (#3)
+  — still open, and deliberately so. `lp` reaches a destination only through
+  `-d`, `LPDEST` or `PRINTER`; the "system default printer" branch by definition
+  takes none of those, so there is nothing a test can point at the stub with. It
+  needs a configured system default on the host, which CI does not have and
+  which the in-process stub cannot supply. Unlike #1 and #2, no test-only hook
+  would help: the code path is selected by the *absence* of configuration.
 
 ### Suggested PR groupings
 

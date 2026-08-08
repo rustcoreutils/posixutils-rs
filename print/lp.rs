@@ -287,21 +287,41 @@ fn recipient_is_safe(recipient: &str) -> bool {
             .all(|c| !c.is_control() && !c.is_whitespace() && c != '<' && c != '>')
 }
 
-/// Best-effort delivery of a completion mail via the local sendmail program.
-fn send_mail(recipient: &str, subject: &str, body: &str) -> bool {
-    if !recipient_is_safe(recipient) {
-        return false;
+/// The local mail transport program.
+///
+/// The implementation-defined locations are the historical sendmail paths.
+/// `LP_SENDMAIL` overrides them, honored only when not running set-uid (real
+/// uid == effective uid), so a set-uid `lp` cannot be tricked into executing an
+/// attacker-chosen program. This mirrors how `at` treats `AT_ALLOW`/`AT_DENY`
+/// (`cron/spool.rs`), and is what makes `-m` testable at all: without it the
+/// only way to observe a completion mail is to have a real MTA installed.
+fn sendmail_program() -> Option<String> {
+    // SAFETY: getuid()/geteuid() never fail.
+    let overridable = unsafe { libc::getuid() == libc::geteuid() };
+    if overridable {
+        if let Ok(path) = std::env::var("LP_SENDMAIL") {
+            if !path.is_empty() {
+                return Some(path);
+            }
+        }
     }
-    let sendmail = [
+    [
         "/usr/sbin/sendmail",
         "/usr/lib/sendmail",
         "/usr/bin/sendmail",
     ]
     .into_iter()
-    .find(|p| Path::new(p).exists());
-    let sendmail = match sendmail {
-        Some(p) => p,
-        None => return false,
+    .find(|p| Path::new(p).exists())
+    .map(str::to_string)
+}
+
+/// Best-effort delivery of a completion mail via the local sendmail program.
+fn send_mail(recipient: &str, subject: &str, body: &str) -> bool {
+    if !recipient_is_safe(recipient) {
+        return false;
+    }
+    let Some(sendmail) = sendmail_program() else {
+        return false;
     };
     let mut child = match Command::new(sendmail)
         .args(["-t", "-oi"])

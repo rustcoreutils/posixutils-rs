@@ -11,7 +11,7 @@ use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use libc::{getegid, getgid, getuid, setgid, setuid};
 use plib::regex::{Regex, RegexFlags};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::{stdout, BufRead, BufReader, Cursor, Read, Seek, SeekFrom, Write};
@@ -952,11 +952,62 @@ impl Seek for SpillReader {
     }
 }
 
+/// One visited display line: where it starts, and which line of the file it
+/// belongs to (folding makes one file line span several display lines).
+#[derive(Clone, Copy)]
+struct LinePos {
+    offset: u64,
+    source_line: usize,
+}
+
+/// A display line kept permanently, so a position far behind the cursor can be
+/// recovered by seeking here and re-scanning forward.
+#[derive(Clone, Copy)]
+struct Anchor {
+    display_line: usize,
+    offset: u64,
+    source_line: usize,
+}
+
+/// Display lines between consecutive anchors, initially. Doubles whenever the
+/// anchor table fills, so the table's size — not the input's — is what bounds
+/// the memory.
+const ANCHOR_INTERVAL_INIT: usize = 256;
+
+/// Ceiling on retained anchors. At 24 bytes each this is a few MiB, whatever
+/// the input's size.
+const MAX_ANCHORS: usize = 1 << 17;
+
+/// How many consecutive display lines are kept densely behind the cursor, so
+/// ordinary backward scrolling costs nothing.
+const TRAIL_CAP: usize = 8192;
+
+/// Drop every second anchor, halving the table while keeping the first entry
+/// and leaving the survivors evenly spaced at twice the old interval.
+fn decimate_anchors(anchors: &mut Vec<Anchor>) {
+    let mut keep = false;
+    anchors.retain(|_| {
+        keep = !keep;
+        keep
+    });
+}
+
 /// Universal cursor that can read lines, seek
 /// over any [`SeekRead`] source
 struct SeekPositions {
-    /// Buffer with previous seek positions of all lines beginnings
-    positions: Vec<u64>,
+    /// The display lines immediately behind (and including) the cursor, newest
+    /// last. Bounded by [`TRAIL_CAP`]; older lines live only in `anchors`.
+    trail: VecDeque<LinePos>,
+    /// 1-based index of the display line the cursor is on. Formerly this was
+    /// `positions.len()` — that identity is what made the index grow without
+    /// bound, since the line number could not be known without keeping every
+    /// entry that preceded it.
+    display_line: usize,
+    /// Sparse checkpoints, ascending by `display_line`, always starting at
+    /// display line 1. See [`SeekPositions::rebuild_trail_ending_at`].
+    anchors: Vec<Anchor>,
+    /// Current spacing between anchors; doubles on each decimation.
+    anchor_interval: usize,
     /// Terminal width for spliting long lines. If [`None`], lines not splited by length
     line_len: Option<usize>,
     /// Total size of the source in bytes, when it is knowable without reading
@@ -971,12 +1022,6 @@ struct SeekPositions {
     squeeze_lines: bool,
     /// `-u`: suppress underlining and bold
     plain: bool,
-    /// Source line number at each entry of `positions`.
-    ///
-    /// A folded line occupies several display lines but is one line of the
-    /// file, so the two counts diverge; POSIX 107629 asks for "the line
-    /// number in the file".
-    source_lines: Vec<usize>,
     /// Iteration over [`SeekPositions`] buffer has reached end
     is_ended: bool,
 }
@@ -1015,8 +1060,17 @@ impl SeekPositions {
             // The first line starts at offset 0, so the cursor begins on line
             // 1.  (The scan this replaced left `positions` in exactly this
             // state as a side effect; stating it is clearer than deriving it.)
-            positions: vec![0],
-            source_lines: vec![1],
+            trail: VecDeque::from([LinePos {
+                offset: 0,
+                source_line: 1,
+            }]),
+            display_line: 1,
+            anchors: vec![Anchor {
+                display_line: 1,
+                offset: 0,
+                source_line: 1,
+            }],
+            anchor_interval: ANCHOR_INTERVAL_INIT,
             line_len,
             total_bytes,
             source,
@@ -1090,23 +1144,107 @@ impl SeekPositions {
 
     /// Returns current seek position
     fn current(&self) -> u64 {
-        *self.positions.last().unwrap_or(&0)
+        self.trail.back().map(|e| e.offset).unwrap_or(0)
     }
 
     /// Returns current line index
     fn current_line(&self) -> usize {
-        self.positions.len()
+        self.display_line
     }
 
     /// Line number *in the file* at the current position, as distinct from
     /// the display line, which folding makes larger.
     fn current_source_line(&self) -> usize {
-        self.source_lines.last().copied().unwrap_or(1)
+        self.trail.back().map(|e| e.source_line).unwrap_or(1)
+    }
+
+    /// Index of the oldest display line the dense trail still holds.
+    fn trail_start(&self) -> usize {
+        self.display_line + 1 - self.trail.len()
+    }
+
+    /// Record a checkpoint for the line just stepped onto, if it is due.
+    ///
+    /// When the table fills, every second entry is dropped and the interval
+    /// doubles. The kept entries are exactly those at display lines
+    /// `1 + k*2*interval`, so the table stays regularly spaced and the rule for
+    /// the next anchor is unchanged.
+    fn note_anchor(&mut self, pos: LinePos) {
+        // Anchors sit at display lines 1, 1+interval, 1+2*interval, ... The
+        // interval only ever starts at ANCHOR_INTERVAL_INIT and doubles, so it
+        // is always greater than 1 and this is a plain congruence test.
+        if self.display_line % self.anchor_interval != 1 {
+            return;
+        }
+        if self
+            .anchors
+            .last()
+            .is_some_and(|a| a.display_line >= self.display_line)
+        {
+            return;
+        }
+        self.anchors.push(Anchor {
+            display_line: self.display_line,
+            offset: pos.offset,
+            source_line: pos.source_line,
+        });
+        if self.anchors.len() > MAX_ANCHORS {
+            decimate_anchors(&mut self.anchors);
+            self.anchor_interval *= 2;
+        }
+    }
+
+    /// Move the cursor to `anchor` and make it the whole of the dense trail.
+    fn jump_to_anchor(&mut self, anchor: Anchor) {
+        self.display_line = anchor.display_line;
+        self.trail.clear();
+        self.trail.push_back(LinePos {
+            offset: anchor.offset,
+            source_line: anchor.source_line,
+        });
+        let _ = self.buffer.seek(SeekFrom::Start(anchor.offset));
+    }
+
+    /// The last anchor at or before display line `target`.
+    fn anchor_at_or_before(&self, target: usize) -> Option<Anchor> {
+        let idx = self.anchors.partition_point(|a| a.display_line <= target);
+        idx.checked_sub(1).map(|i| self.anchors[i])
+    }
+
+    /// Re-establish a dense trail ending at display line `target`, for a
+    /// backward step that has run off the front of the trail.
+    ///
+    /// Seeks to the nearest anchor *strictly before* `target` — so the rebuilt
+    /// trail holds at least the two entries a backward step needs — and walks
+    /// forward from there. That costs at most one anchor interval of rendering,
+    /// and then serves that many further backward steps for free.
+    fn rebuild_trail_ending_at(&mut self, target: usize) -> bool {
+        let Some(anchor) = target
+            .checked_sub(1)
+            .and_then(|before| self.anchor_at_or_before(before))
+        else {
+            return false;
+        };
+        self.jump_to_anchor(anchor);
+        while self.display_line < target {
+            if self.step_forward().is_none() {
+                return false;
+            }
+        }
+        true
     }
 
     /// Sets current line to [`position`]
     fn set_current(&mut self, position: usize) {
         self.is_ended = false;
+        // A backward jump past the dense trail restarts from the nearest
+        // anchor instead of stepping back a line at a time, which would
+        // rebuild the trail repeatedly on the way.
+        if position >= 1 && position < self.trail_start() {
+            if let Some(anchor) = self.anchor_at_or_before(position) {
+                self.jump_to_anchor(anchor);
+            }
+        }
         while self.current_line() != position {
             if self.current_line() < position && self.next().is_none() {
                 self.is_ended = true;
@@ -1208,11 +1346,9 @@ impl SeekPositions {
     }
 }
 
-impl Iterator for SeekPositions {
-    type Item = u64;
-
-    /// Iter over [`SeekRead`] buffer lines in forward direction
-    fn next(&mut self) -> Option<Self::Item> {
+impl SeekPositions {
+    /// Advance one display line, maintaining the trail and the anchor table.
+    fn step_forward(&mut self) -> Option<u64> {
         let current_position = self.current();
         let line = self.render_at(current_position)?;
         if line.bytes == 0 {
@@ -1246,23 +1382,58 @@ impl Iterator for SeekPositions {
         if self.buffer.seek(SeekFrom::Start(next_position)).is_err() {
             return None;
         }
-        let source_line =
-            self.source_lines.last().copied().unwrap_or(1) + usize::from(line.ended_at_newline);
-        self.positions.push(next_position);
-        self.source_lines.push(source_line);
+        let source_line = self.current_source_line() + usize::from(line.ended_at_newline);
+        let pos = LinePos {
+            offset: next_position,
+            source_line,
+        };
+        self.trail.push_back(pos);
+        if self.trail.len() > TRAIL_CAP {
+            self.trail.pop_front();
+        }
+        self.display_line += 1;
+        self.note_anchor(pos);
         Some(next_position)
+    }
+
+    /// Retreat one display line, restoring the trail from an anchor if this
+    /// step falls off the front of it.
+    fn step_back(&mut self) -> Option<u64> {
+        if self.display_line == 0 {
+            return None;
+        }
+        // Line 1 is the front of the source: stepping back off it leaves the
+        // cursor "before" it, at offset 0, as the dense index did.
+        if self.display_line == 1 {
+            self.display_line = 0;
+            self.trail.clear();
+            let _ = self.buffer.seek(SeekFrom::Start(0));
+            return None;
+        }
+        if self.trail.len() < 2 && !self.rebuild_trail_ending_at(self.display_line) {
+            return None;
+        }
+        self.trail.pop_back();
+        self.display_line -= 1;
+        let offset = self.current();
+        let _ = self.buffer.seek(SeekFrom::Start(offset));
+        Some(offset)
+    }
+}
+
+impl Iterator for SeekPositions {
+    type Item = u64;
+
+    /// Iter over [`SeekRead`] buffer lines in forward direction
+    fn next(&mut self) -> Option<Self::Item> {
+        self.step_forward()
     }
 }
 
 impl DoubleEndedIterator for SeekPositions {
     /// Iter over [`SeekRead`] buffer lines in backward direction
     fn next_back(&mut self) -> Option<Self::Item> {
-        let _ = self.positions.pop();
-        let _ = self.source_lines.pop();
-        let _ = self
-            .buffer
-            .seek(SeekFrom::Start(*self.positions.last().unwrap_or(&0)));
-        self.positions.last().cloned()
+        self.step_back()
     }
 }
 
@@ -4401,5 +4572,183 @@ mod tests {
         assert!(find_tags_files(Path::new(&dir.join("missing"))).is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    use super::{decimate_anchors, Anchor, SeekPositions, Source, MAX_ANCHORS, TRAIL_CAP};
+    use std::io::Cursor;
+
+    fn positions_over(text: &str, line_len: Option<usize>) -> SeekPositions {
+        SeekPositions::new(
+            Source::Buffer(Cursor::new(text.to_string())),
+            line_len,
+            false,
+            false,
+        )
+        .expect("buffer source")
+    }
+
+    /// `n` numbered lines, long enough that folding at 20 columns makes the
+    /// display-line count exceed the file-line count.
+    fn numbered_lines(n: usize) -> String {
+        (1..=n)
+            .map(|i| format!("line {i} ----------------------------\n"))
+            .collect()
+    }
+
+    /// Walk from the top, collecting `(offset, source_line)` for every display
+    /// line. This is the dense index the implementation deliberately no longer
+    /// keeps, so it serves as the oracle.
+    fn scan_all(text: &str, line_len: Option<usize>) -> Vec<(u64, usize)> {
+        let mut sp = positions_over(text, line_len);
+        let mut out = vec![(sp.current(), sp.current_source_line())];
+        while sp.next().is_some() {
+            out.push((sp.current(), sp.current_source_line()));
+        }
+        out
+    }
+
+    #[test]
+    fn decimate_anchors_keeps_every_other_starting_with_the_first() {
+        let mut anchors: Vec<Anchor> = (0..8)
+            .map(|i| Anchor {
+                display_line: 1 + i * 10,
+                offset: (i * 100) as u64,
+                source_line: 1 + i,
+            })
+            .collect();
+        decimate_anchors(&mut anchors);
+        assert_eq!(
+            anchors.iter().map(|a| a.display_line).collect::<Vec<_>>(),
+            vec![1, 21, 41, 61],
+            "survivors must stay evenly spaced at twice the interval, \
+             and must still include display line 1"
+        );
+
+        // An odd length keeps the extra entry rather than dropping it, so the
+        // table never loses its most recent anchor.
+        let mut anchors: Vec<Anchor> = (0..5)
+            .map(|i| Anchor {
+                display_line: 1 + i * 10,
+                offset: 0,
+                source_line: 1,
+            })
+            .collect();
+        decimate_anchors(&mut anchors);
+        assert_eq!(
+            anchors.iter().map(|a| a.display_line).collect::<Vec<_>>(),
+            vec![1, 21, 41]
+        );
+    }
+
+    #[test]
+    fn seek_positions_index_stays_bounded_while_scrolling() {
+        // Enough display lines to overflow the dense trail several times over.
+        let lines = TRAIL_CAP * 3;
+        let text = numbered_lines(lines);
+        let mut sp = positions_over(&text, Some(20));
+
+        let mut visited = 1usize;
+        while sp.next().is_some() {
+            visited += 1;
+            assert!(
+                sp.trail.len() <= TRAIL_CAP,
+                "dense trail grew past its cap at display line {visited}"
+            );
+            assert!(
+                sp.anchors.len() <= MAX_ANCHORS + 1,
+                "anchor table grew past its cap at display line {visited}"
+            );
+        }
+
+        assert!(
+            visited > TRAIL_CAP * 2,
+            "test needs to outrun the trail cap, only reached {visited} lines"
+        );
+        // The whole point: what is retained is a function of the caps, not of
+        // how far the user scrolled.
+        assert!(
+            sp.trail.len() <= TRAIL_CAP,
+            "trail holds {} entries for {visited} display lines",
+            sp.trail.len()
+        );
+        assert!(
+            sp.anchors.len() * sp.anchor_interval >= visited - sp.anchor_interval,
+            "anchors too sparse to reach every line: {} anchors at interval {}",
+            sp.anchors.len(),
+            sp.anchor_interval
+        );
+        // The dense index kept one entry per display line visited. This is the
+        // regression guard: retained state must be a small fraction of that.
+        let retained = sp.trail.len() + sp.anchors.len();
+        assert!(
+            retained * 2 < visited,
+            "retained {retained} entries for {visited} display lines visited"
+        );
+    }
+
+    #[test]
+    fn seek_positions_walks_back_across_the_trail_boundary() {
+        let lines = TRAIL_CAP + 500;
+        let text = numbered_lines(lines);
+        let expected = scan_all(&text, Some(20));
+        assert!(
+            expected.len() > TRAIL_CAP + 1,
+            "need more display lines than the trail holds, got {}",
+            expected.len()
+        );
+
+        let mut sp = positions_over(&text, Some(20));
+        while sp.next().is_some() {}
+        let last = sp.current_line();
+
+        // Step all the way back to line 1. Everything older than the trail has
+        // to be recovered from an anchor and re-scanned; the offsets and source
+        // line numbers must come back identical.
+        for line in (1..last).rev() {
+            assert!(sp.next_back().is_some(), "stepping back to line {line}");
+            assert_eq!(sp.current_line(), line);
+            assert_eq!(
+                (sp.current(), sp.current_source_line()),
+                expected[line - 1],
+                "line {line} differs after rebuilding the trail from an anchor"
+            );
+        }
+    }
+
+    #[test]
+    fn seek_positions_jumps_backwards_via_anchors() {
+        let lines = TRAIL_CAP * 2;
+        let text = numbered_lines(lines);
+        let expected = scan_all(&text, Some(20));
+
+        let mut sp = positions_over(&text, Some(20));
+        while sp.next().is_some() {}
+        let last = sp.current_line();
+
+        // Jump far enough back that the trail cannot hold the answer, then
+        // forward again, alternating, as `G`, `:N` and mark-goto do.
+        for target in [last / 2, 3, last - 1, TRAIL_CAP + 7, 1] {
+            sp.set_current(target);
+            assert_eq!(sp.current_line(), target);
+            assert_eq!(
+                (sp.current(), sp.current_source_line()),
+                expected[target - 1],
+                "jumping to line {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn seek_positions_stepping_back_off_the_first_line_matches_the_old_index() {
+        let mut sp = positions_over("a\nb\nc\n", None);
+        assert_eq!(sp.current_line(), 1);
+        // The dense index popped its only entry here, leaving the cursor at
+        // offset 0 with a line count of 0; callers rely on that.
+        assert!(sp.next_back().is_none());
+        assert_eq!(sp.current_line(), 0);
+        assert_eq!(sp.current(), 0);
+        // And stepping forward again re-enters at line 1.
+        assert!(sp.next().is_some());
+        assert_eq!(sp.current_line(), 1);
     }
 }

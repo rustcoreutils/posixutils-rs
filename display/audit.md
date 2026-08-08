@@ -445,13 +445,33 @@ test written for a neighboring finding. All are fixed except the last.
   non-ASCII line was refused with `MoreError::SetOutside`. Also fixed: two
   `usize` underflows (`content_lines_len - 1`, `line_len - 4`) and a prompt
   wider than the terminal refusing to draw rather than truncating.
-- [ ] **The line index is still unbounded.** `positions` grows 8 bytes per
-  display line *visited* — bounded by how far the user scrolls, so unlike the
-  two defects above it cannot be hit by merely opening a file, but `G` on a very
-  large pipe still indexes every line on the way to the end (~200 GB for a 1 TB
-  input of 40-byte lines). Deliberately deferred: the fix is anchoring the index
-  every Nth line and re-scanning between anchors, which is independent of the
-  render work. `less` keeps a growing line index too.
+- [x] **The line index is now bounded.** It used to grow with every display line
+  *visited* — and by 16 bytes, not the 8 recorded here before: `positions`
+  (`u64` offsets) had a parallel dense `source_lines` (`usize`), so the estimate
+  for a 1 TB input of 40-byte lines was ~400 GB, not ~200 GB. Only reachable by
+  scrolling, not by opening a file, but `G` on a very large input indexed every
+  line on the way to the end.
+
+  The obstacle was that `current_line()` **was** `positions.len()`: the display
+  line number could not be known without keeping every entry before it. That
+  identity is gone. `SeekPositions` now carries an explicit `display_line`
+  counter, a dense `trail` of the most recent `TRAIL_CAP` (8192) display lines
+  so ordinary backward scrolling stays O(1), and a sparse `anchors` table
+  sampled every `ANCHOR_INTERVAL_INIT` (256) lines. A backward step that falls
+  off the front of the trail seeks to the nearest anchor and re-scans forward,
+  costing at most one interval of rendering and then serving that many further
+  steps for free; `set_current` uses the same anchors so a long backward jump
+  does not re-render everything in between. When the anchor table reaches
+  `MAX_ANCHORS` (2^17) every second entry is dropped and the interval doubles,
+  so retained state is a function of the caps, not of the input's size.
+
+  Measured, driving `more` through a PTY on a 50 MB / 1.2M-line file and
+  pressing `G`: peak RSS **22.2 MB before, 3.7 MB after** — and flat, 3.74 MB
+  for a 300k-line input against 3.75 MB for a 1.2M-line one. Unit tests
+  (`seek_positions_*` in `more.rs`) assert the caps hold while scrolling, that
+  retained entries stay a small fraction of the lines visited, and that offsets
+  and source line numbers recovered by re-scanning from an anchor are identical
+  to a dense forward scan.
 
 # Crate-level summary — `display/`
 

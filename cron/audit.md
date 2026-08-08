@@ -398,7 +398,7 @@ supported at all), and — fatally — **submitted jobs are never executed** (#X
 | `-l` | PARTIAL | Output format wrong (#A4); listing works (`at.rs:171-194`). |
 | `-m` | PARTIAL | Header only; no mail (#A9). |
 | `-q queuename` | PARTIAL | Lowercase-letter validation (`at.rs:140-147`); used in filename + `-l` filter. |
-| `-r` | DIVERGES | No ownership check (#A7); takes numeric ids only. |
+| `-r` | CONFORMS | Ownership enforced (#A7 fixed): `remove_jobs` (`at.rs:255-290`) refuses unless `uid == 0` or the job file's owner matches, stat'ed with `symlink_metadata` so a symlink cannot redirect the check. Takes numeric ids only. |
 | `-t time_arg` | DIVERGES | `touch -t` format parsed but UTC-interpreted (#A5). |
 
 #### OPERANDS / STDIN / INPUT FILES
@@ -435,7 +435,11 @@ check the spool filename + the (non-conforming) `-l` text. Not covered:
   `at` `-l` tests in `tests/at/mod.rs`.
 - [x] `TZ`-relative interpretation (#A5/#A6) — `test_at_tz_determines_the_absolute_execution_time`.
 - [ ] Job actually executing at its time (#A2/#X1) — needs a running daemon; see the CI note.
-- [ ] `-r` ownership enforcement (#A7) — needs two distinct users to submit as, which CI does not have.
+- [ ] `-r` ownership enforcement (#A7) — needs two distinct users to submit as,
+  which CI does not have. The *enforcement* is present and was re-verified
+  2026-08-08 (`at.rs:255-290`); only the two-user test is missing, so unlike
+  print's #3 this box is labelled correctly. The `-r` options-matrix row still
+  read "DIVERGES | No ownership check" and has been corrected.
 - [x] stdin (no `-f`) submission path — every `batch` test and the `#B6` `at` tests submit this way.
 
 ---

@@ -53,26 +53,40 @@ struct Args {
     files: Vec<PathBuf>,
 }
 
-/// Get the printer destination from args or environment
-fn get_destination(args: &Args) -> Result<String, String> {
-    // Priority: -d > LPDEST > PRINTER
-    if let Some(ref dest) = args.dest {
-        return Ok(dest.clone());
-    }
+/// The destination used when none is named.
+///
+/// POSIX 103086-103087: "If −d is not specified, and neither the LPDEST nor
+/// PRINTER environment variable is set, an unspecified destination is used."
+/// The destination is unspecified, but one *is* used — declining to select any
+/// and failing is not conforming. This is the implementation-defined choice:
+/// the local IPP server's `default` queue, reached the same way a bare name
+/// given to `-d` would be.
+const DEFAULT_DESTINATION: &str = "ipp://localhost/printers/default";
 
-    if let Ok(dest) = env::var("LPDEST") {
-        if !dest.is_empty() {
-            return Ok(dest);
+/// Choose the destination from the option and the two environment variables.
+///
+/// Split from the environment lookup so the precedence rules are testable
+/// without mutating process-global state: 103087-103088 makes `-d` take
+/// precedence over `LPDEST`, which takes precedence over `PRINTER`.
+fn choose_destination(dest: Option<&str>, lpdest: Option<&str>, printer: Option<&str>) -> String {
+    if let Some(dest) = dest {
+        return dest.to_string();
+    }
+    for value in [lpdest, printer].into_iter().flatten() {
+        if !value.is_empty() {
+            return value.to_string();
         }
     }
+    DEFAULT_DESTINATION.to_string()
+}
 
-    if let Ok(dest) = env::var("PRINTER") {
-        if !dest.is_empty() {
-            return Ok(dest);
-        }
-    }
-
-    Err(gettext("no destination specified"))
+/// Get the printer destination from args or environment.
+fn get_destination(args: &Args) -> String {
+    choose_destination(
+        args.dest.as_deref(),
+        env::var("LPDEST").ok().as_deref(),
+        env::var("PRINTER").ok().as_deref(),
+    )
 }
 
 /// Resolve a destination string into an IPP URI.
@@ -374,7 +388,7 @@ fn notify_after_print(uri: &Uri, args: &Args, jobs: &[(i32, String)]) {
 /// error (bad destination) that aborts before any file is processed.
 fn do_lp(mut args: Args) -> Result<bool, String> {
     // Get and validate destination (fatal — aborts before processing files).
-    let dest = get_destination(&args)?;
+    let dest = get_destination(&args);
     let uri = resolve_uri(&dest)?;
 
     // Determine input sources
@@ -486,5 +500,39 @@ mod tests {
         assert!(!recipient_is_safe("a\nb"));
         assert!(!recipient_is_safe("a<b"));
         assert!(!recipient_is_safe("a>b"));
+    }
+
+    /// 103086-103087: with no `-d` and neither variable set, "an unspecified
+    /// destination is used" — a destination *is* selected. Returning an error
+    /// instead, as this did, means no destination is used at all, so `lp file`
+    /// on a machine with a working default printer failed outright.
+    #[test]
+    fn no_destination_falls_back_to_the_default() {
+        assert_eq!(choose_destination(None, None, None), DEFAULT_DESTINATION);
+        // An empty variable is not a destination, so it must not shadow it.
+        assert_eq!(
+            choose_destination(None, Some(""), Some("")),
+            DEFAULT_DESTINATION
+        );
+    }
+
+    /// 103087-103088: "-d dest shall take precedence over LPDEST, which in turn
+    /// shall take precedence over PRINTER."
+    #[test]
+    fn destination_precedence_is_d_then_lpdest_then_printer() {
+        assert_eq!(
+            choose_destination(Some("opt"), Some("lpdest"), Some("printer")),
+            "opt"
+        );
+        assert_eq!(
+            choose_destination(None, Some("lpdest"), Some("printer")),
+            "lpdest"
+        );
+        assert_eq!(choose_destination(None, None, Some("printer")), "printer");
+        // An empty LPDEST falls through to PRINTER rather than winning.
+        assert_eq!(
+            choose_destination(None, Some(""), Some("printer")),
+            "printer"
+        );
     }
 }

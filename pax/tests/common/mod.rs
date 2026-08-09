@@ -39,6 +39,21 @@ pub fn run_pax_with_stdin(args: &[&str], stdin_data: Option<&str>) -> Output {
     }
 }
 
+/// Run pax with extra environment variables set.
+///
+/// pax calls `tzset()` at startup so that `$TZ` selects the zone its `-v` and
+/// `listopt` times are rendered in; a test that pins an hour has to pin the
+/// zone too, or it only passes where local time happens to equal the one the
+/// fixture was written in.
+pub fn run_pax_with_env(args: &[&str], vars: &[(&str, &str)]) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_pax"));
+    cmd.args(args);
+    for (name, value) in vars {
+        cmd.env(name, value);
+    }
+    cmd.output().expect("Failed to run pax")
+}
+
 /// Run pax with given arguments and binary stdin data, return output
 pub fn run_pax_with_stdin_bytes(args: &[&str], stdin_data: &[u8]) -> Output {
     use std::process::Stdio;

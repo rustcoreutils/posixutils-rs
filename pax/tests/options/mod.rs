@@ -1205,14 +1205,26 @@ fn archive_with_times(temp: &TempDir) -> (std::path::PathBuf, usize) {
     (archive, body.len())
 }
 
+/// The zone the listing helpers below render times in.
+///
+/// T_ATIME and T_MTIME are instants in UTC, and pax renders a time in the
+/// zone $TZ names. Without pinning it, every assertion about an hour -- and,
+/// far enough east or west, about a day or month -- would hold only on a
+/// machine whose local time is UTC.
+#[cfg(unix)]
+const LISTING_TZ: (&str, &str) = ("TZ", "UTC0");
+
 #[cfg(unix)]
 fn listopt(archive: &std::path::Path, format: &str) -> String {
-    let out = run_pax(&[
-        "-f",
-        archive.to_str().unwrap(),
-        "-o",
-        &format!("listopt={}", format),
-    ]);
+    let out = run_pax_with_env(
+        &[
+            "-f",
+            archive.to_str().unwrap(),
+            "-o",
+            &format!("listopt={}", format),
+        ],
+        &[LISTING_TZ],
+    );
     assert_success(&out, "pax list with listopt");
     stdout_str(&out).trim_end().to_string()
 }
@@ -1448,7 +1460,7 @@ fn listopt_with(archive: &std::path::Path, format: &str, extra: &[&str]) -> Stri
     ];
     args.extend(extra.iter().map(|s| s.to_string()));
     let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    let out = run_pax(&refs);
+    let out = run_pax_with_env(&refs, &[LISTING_TZ]);
     assert_success(&out, "pax list with listopt");
     stdout_str(&out).trim_end().to_string()
 }

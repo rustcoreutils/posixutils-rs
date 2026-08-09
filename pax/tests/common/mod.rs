@@ -39,6 +39,21 @@ pub fn run_pax_with_stdin(args: &[&str], stdin_data: Option<&str>) -> Output {
     }
 }
 
+/// Run pax with extra environment variables set.
+///
+/// pax calls `tzset()` at startup so that `$TZ` selects the zone its `-v` and
+/// `listopt` times are rendered in; a test that pins an hour has to pin the
+/// zone too, or it only passes where local time happens to equal the one the
+/// fixture was written in.
+pub fn run_pax_with_env(args: &[&str], vars: &[(&str, &str)]) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_pax"));
+    cmd.args(args);
+    for (name, value) in vars {
+        cmd.env(name, value);
+    }
+    cmd.output().expect("Failed to run pax")
+}
+
 /// Run pax with given arguments and binary stdin data, return output
 pub fn run_pax_with_stdin_bytes(args: &[&str], stdin_data: &[u8]) -> Output {
     use std::process::Stdio;
@@ -104,6 +119,76 @@ pub fn run_pax_in_dir_with_stdin(args: &[&str], dir: &Path, stdin_data: &str) ->
     }
 
     child.wait_with_output().expect("Failed to wait for pax")
+}
+
+/// Path of a compatibility front-end (`tar` or `cpio`).
+///
+/// Both are symlinks to the pax binary created by `pax/build.rs`, and the
+/// binary picks its command-line parser from argv[0], so they live beside the
+/// pax executable cargo built for this test run.
+pub fn front_end(name: &str) -> std::path::PathBuf {
+    let path = Path::new(env!("CARGO_BIN_EXE_pax")).with_file_name(name);
+    assert!(
+        path.exists(),
+        "{} is missing; pax/build.rs should have symlinked it to pax",
+        path.display()
+    );
+    path
+}
+
+/// Run `tar` or `cpio` in `dir`, feeding `stdin_data` if given.
+pub fn run_front_end(name: &str, args: &[&str], dir: &Path, stdin_data: Option<&[u8]>) -> Output {
+    use std::process::Stdio;
+    let mut child = Command::new(front_end(name))
+        .args(args)
+        .current_dir(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to spawn {}: {}", name, e));
+
+    {
+        // Dropping stdin closes it, so a child reading a name list from a pipe
+        // sees EOF instead of blocking forever.
+        let mut stdin = child.stdin.take().expect("stdin was piped");
+        if let Some(data) = stdin_data {
+            match stdin.write_all(data) {
+                Ok(()) => {}
+                // A front-end that rejects its command line exits before it
+                // ever reads the name list, which closes the read end of this
+                // pipe. That is the behavior under test, so losing the write is
+                // the expected outcome, not a harness failure. Whether the
+                // write lands at all is a race the child usually loses on
+                // macOS and usually wins on Linux.
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+                Err(e) => panic!("failed to write stdin to {}: {}", name, e),
+            }
+        }
+    }
+
+    child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("failed to wait for {}: {}", name, e))
+}
+
+/// Run `tar` in `dir`.
+pub fn run_tar(args: &[&str], dir: &Path) -> Output {
+    run_front_end("tar", args, dir, None)
+}
+
+/// Run `cpio` in `dir` with `stdin_data` on standard input.
+pub fn run_cpio(args: &[&str], dir: &Path, stdin_data: &[u8]) -> Output {
+    run_front_end("cpio", args, dir, Some(stdin_data))
+}
+
+/// Whether a system tool of this name can be run, for the cross-tool checks.
+pub fn have_tool(name: &str) -> bool {
+    Command::new(name)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// Create a test directory with standard test files

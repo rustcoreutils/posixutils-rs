@@ -211,6 +211,13 @@ Because it is a FAQ, the major differences between this project and uutils are:
 
 (none)
 
+## Non-POSIX extensions
+
+Utilities provided beyond those POSIX specifies.
+
+ * tar - pax compatibility front-end, forcing the ustar format (Archive)
+ * cpio - pax compatibility front-end, forcing the cpio format (Archive)
+
 ## Installation
 
 These are "core" utilities of any operating system.  Production packaging in the future will be done on a per-distro basis in a distro-specific way.

@@ -275,6 +275,59 @@ read/list. There are **no crashes/hangs**.
   this is legal; it is ustar-only and incompatible with `-z`. Inflates the CLI;
   document as an extension.
 
+- [x] **`-x bcpio` / `-x sv4cpio` / `-x sv4crc`** — the historic pax spellings
+  for the old binary and the SVR4 "newc" cpio headers (`formats/cpio.rs`).
+  POSIX pax names only `cpio` (odc); the reader already accepted all four, so
+  these close the gap on the write side and are what `cpio -H` maps onto.
+
+## tar and cpio compatibility front-ends
+
+`tar` and `cpio` are symlinks to the `pax` binary (created by `pax/build.rs`);
+`cli::ProgramMode::detect` picks the parser from argv[0]. Each front-end is
+*only* a command-line translator into the internal `Args` — traversal, header
+codecs and extraction are the same code pax uses. See `cli/tar.rs` and
+`cli/cpio.rs`, whose `--help` text is the authoritative option list.
+
+The subset is deliberately smaller than GNU's: enough for existing scripts,
+without adopting the whole GNU surface. **An option outside the subset is
+rejected with a diagnostic naming it, never silently ignored** — so a script
+relying on one fails loudly instead of quietly producing a wrong archive.
+
+Supported for `tar`: `-c -x -t -r -u`, `-f -v -z -C -b -p -m -h -k -O -T -X -P`,
+`--format=`, `--exclude=`, `--exclude-from=`, `--strip-components=`, `--null`,
+`--no-recursion`, `--same-owner`/`--no-same-owner`, `--help`, `--version`, and
+the old-style bundled first operand (`tar cvf archive.tar dir`).
+
+Supported for `cpio`: `-o -i -p`, `-t -v -d -m -u -B -C -H -c -F -I -O -L -a -l
+-f -r -A -0 -E`, `--quiet`, `--no-absolute-filenames`, `--help`, `--version`.
+
+Deliberate divergences, all of them documented rather than hidden:
+
+- **`tar -j/-J/-Z`, `--bzip2/--xz/--lzma`** — refused. Only gzip is built in.
+- **`tar -P` / `cpio --absolute-filenames`** — accepted on create (where `-P`
+  merely keeps the leading `/` in the stored name), refused on extract.
+  Honoring it there would mean disabling the extraction sandbox in
+  `modes/read.rs`, which is the one guarantee read mode makes.
+- **`tar -C`** — a single directory only. GNU applies each `-C` at the point it
+  appears among the operands; a second one is an error rather than a silently
+  wrong archive.
+- **`tar -A`, `-w`, `-S`, `-W`** — refused (no concatenation, confirmation,
+  sparse detection or verification).
+- **`cpio -d`** — accepted and does nothing: pax always creates the leading
+  directories a member needs. The difference is permissive.
+- **`cpio` block count** — `N blocks` is written to stderr after `-o` and `-i`,
+  but not after `-p`, which moves no archive.
+- **`cpio -s/-S/-b`, `-V`, `-R`, `-M`, `-H hpbin/hpodc`** — refused.
+- **`tar -t -v` listing format** — pax's `ls -l` style, not GNU tar's
+  `owner/group` column layout.
+
+Two defaults are taken from the compat tool rather than from pax, because the
+archive would otherwise be wrong or wasteful: `cpio -o` writes the old binary
+format (GNU's default) unless `-H` says otherwise, and uses a 512-byte I/O
+block rather than the 5120 POSIX assigns the cpio format — the archive is
+padded out to it, so at 5120 a two-block archive would be written, and
+reported, as ten.
+
 ## Detailed conformance matrix
 
 ### CLI / options (per-option)

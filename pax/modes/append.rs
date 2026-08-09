@@ -20,13 +20,15 @@
 //! Note: Only ustar and pax formats are supported. Appending to cpio
 //! is problematic due to device/inode conflicts (per POSIX).
 
-use crate::archive::ArchiveFormat;
+use crate::archive::{ArchiveFormat, ArchiveReader};
 use crate::blocked_io::BlockedWriter;
 use crate::error::{PaxError, PaxResult};
+use crate::formats::{CpioReader, PaxReader, UstarReader};
 use crate::modes::write::WriteOptions;
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const BLOCK_SIZE: usize = 512;
 
@@ -34,9 +36,10 @@ const BLOCK_SIZE: usize = 512;
 pub fn append_to_archive(
     archive_path: &PathBuf,
     files: &[PathBuf],
-    options: &WriteOptions,
+    options: &mut WriteOptions,
     requested_format: Option<ArchiveFormat>,
     record_size: usize,
+    update: bool,
 ) -> PaxResult<()> {
     // Open archive for read+write
     let mut file = OpenOptions::new()
@@ -66,6 +69,14 @@ pub fn append_to_archive(
         ));
     }
 
+    // -u needs the times the archive already records. The decision itself is
+    // made per member during the traversal below, not on the operands: an
+    // operand is usually a directory, and what has to be compared is each
+    // member name it expands to, after -s has had its say.
+    if update {
+        options.update_times = Some(archived_mtimes(archive_path, format)?);
+    }
+
     // Find the end-of-archive position (two zero blocks)
     let append_pos = find_end_of_archive(&mut file)?;
 
@@ -90,6 +101,43 @@ pub fn append_to_archive(
     file.set_len(end)?;
 
     Ok(())
+}
+
+/// The latest modification time recorded for each member name in the archive.
+///
+/// A name can appear more than once -- that is what appending does -- and the
+/// most recent copy is the one an extraction would produce, so it is the one
+/// `-u` has to compare against.
+fn archived_mtimes(archive_path: &Path, format: ArchiveFormat) -> PaxResult<HashMap<PathBuf, u64>> {
+    let file = File::open(archive_path)?;
+    let mut mtimes: HashMap<PathBuf, u64> = HashMap::new();
+
+    fn collect<R: ArchiveReader>(
+        archive: &mut R,
+        mtimes: &mut HashMap<PathBuf, u64>,
+    ) -> PaxResult<()> {
+        while let Some(entry) = archive.read_entry()? {
+            // A directory is stored as "dir/" but named "dir" while being
+            // written, so the trailing slash comes off here and the lookup
+            // side spells it the same way.
+            let name = entry.path.to_string_lossy();
+            let key = PathBuf::from(name.trim_end_matches('/'));
+            mtimes
+                .entry(key)
+                .and_modify(|t| *t = std::cmp::max(*t, entry.mtime))
+                .or_insert(entry.mtime);
+            archive.skip_data()?;
+        }
+        Ok(())
+    }
+
+    match format {
+        ArchiveFormat::Ustar => collect(&mut UstarReader::new(file), &mut mtimes)?,
+        ArchiveFormat::Pax => collect(&mut PaxReader::new(file), &mut mtimes)?,
+        ArchiveFormat::Cpio => collect(&mut CpioReader::new(file), &mut mtimes)?,
+    }
+
+    Ok(mtimes)
 }
 
 /// Detect archive format from file

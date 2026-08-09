@@ -11,10 +11,12 @@
 
 use crate::archive::{ArchiveEntry, ArchiveFormat, ArchiveWriter, EntryType, HardLinkTracker};
 use crate::error::PaxResult;
-use crate::formats::{CpioWriter, PaxWriter, UstarWriter};
+use crate::formats::{checksum_bytes, CpioFormat, CpioWriter, PaxWriter, UstarWriter};
 use crate::interactive::{InteractivePrompter, RenameResult};
 use crate::options::{FormatOptions, InvalidAction};
+use crate::pattern::{matches_excluded, Pattern};
 use crate::subst::{apply_substitutions, SubstResult, Substitution};
+use std::collections::HashMap;
 use std::fs::{self, File, Metadata};
 use std::io::{Read, Write};
 #[cfg(unix)]
@@ -42,6 +44,56 @@ pub struct WriteOptions {
     pub substitutions: Vec<Substitution>,
     /// Format-specific options (-o option)
     pub format_options: FormatOptions,
+    /// cpio header flavor to emit; only consulted for `ArchiveFormat::Cpio`
+    pub cpio_format: CpioFormat,
+    /// Names not to archive (tar `--exclude` / `-X`)
+    pub exclude_patterns: Vec<Pattern>,
+    /// `-u` when appending: the modification time already recorded for each
+    /// member name in the archive being extended.
+    ///
+    /// The key is the *member* name -- what the file is stored as, after `-s`
+    /// and any rename -- because that is what a later extraction resolves, and
+    /// it is not the pathname the file was named by on the command line.
+    pub update_times: Option<HashMap<PathBuf, u64>>,
+}
+
+impl WriteOptions {
+    /// Whether `-u` should leave this member out because the archive already
+    /// holds a copy of that name no older than the file.
+    ///
+    /// False whenever `-u` is not in force or the name is new to the archive,
+    /// so an unfiltered run writes everything.
+    fn is_up_to_date(&self, archive_path: &Path, metadata: &Metadata) -> bool {
+        let Some(times) = &self.update_times else {
+            return false;
+        };
+        // Directory members are stored with a trailing slash; archived_mtimes
+        // strips it so both sides of this lookup spell the name the same way.
+        let name = archive_path.to_string_lossy();
+        let name = Path::new(name.trim_end_matches('/'));
+        let Some(&member_mtime) = times.get(name) else {
+            return false;
+        };
+        file_mtime_secs(metadata) <= member_mtime
+    }
+}
+
+/// A file's modification time in whole seconds, the resolution every header
+/// format records.
+fn file_mtime_secs(metadata: &Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        metadata.mtime().max(0) as u64
+    }
+    #[cfg(not(unix))]
+    {
+        metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
 }
 
 /// Create an archive from files
@@ -58,7 +110,7 @@ pub fn create_archive<W: Write>(
             archive.finish()
         }
         ArchiveFormat::Cpio => {
-            let mut archive = CpioWriter::new(writer);
+            let mut archive = CpioWriter::with_format(writer, options.cpio_format);
             write_files(&mut archive, files, options)?;
             archive.finish()
         }
@@ -117,6 +169,13 @@ fn write_path<W: ArchiveWriter>(
     is_cli_arg: bool,
     prompter: &mut Option<InteractivePrompter>,
 ) -> PaxResult<()> {
+    // Exclusion is decided on the name as traversed, before -s renaming, and
+    // before stat: an excluded directory returns here, so its whole subtree is
+    // skipped without the caller needing an ancestor check.
+    if matches_excluded(&options.exclude_patterns, &path.to_string_lossy()) {
+        return Ok(());
+    }
+
     // Get metadata
     let follow = should_follow_symlink(options, is_cli_arg);
     let metadata = if follow {
@@ -182,6 +241,16 @@ fn write_path<W: ArchiveWriter>(
         InvalidHandleResult::Use(p) | InvalidHandleResult::Binary(p) => p,
         InvalidHandleResult::Skip => return Ok(()),
     };
+
+    // -u is decided here rather than on the operands, because this is the
+    // first point at which the member name exists: -s and an interactive
+    // rename have been applied, so the name being looked up is the one an
+    // extraction would resolve. A directory is never skipped outright -- the
+    // whole point of -u is to pick up a file that changed underneath one that
+    // did not -- so only its own entry is suppressed, inside write_directory.
+    if !metadata.is_dir() && options.is_up_to_date(&archive_path, &metadata) {
+        return Ok(());
+    }
 
     if options.verbose {
         eprintln!("{}", path.display());
@@ -323,10 +392,13 @@ fn write_directory<W: ArchiveWriter>(
     link_tracker: &mut HardLinkTracker,
     prompter: &mut Option<InteractivePrompter>,
 ) -> PaxResult<()> {
-    // Write directory entry
-    let entry = build_entry(archive_path, metadata, EntryType::Directory)?;
-    archive.write_entry(&entry)?;
-    archive.finish_entry()?;
+    // Write directory entry, unless -u says the archive already has one no
+    // older than this. The subtree below is still walked either way.
+    if !options.is_up_to_date(archive_path, metadata) {
+        let entry = build_entry(archive_path, metadata, EntryType::Directory)?;
+        archive.write_entry(&entry)?;
+        archive.finish_entry()?;
+    }
 
     // Recurse into directory unless no_recurse
     if !options.no_recurse {
@@ -384,6 +456,9 @@ fn write_symlink<W: ArchiveWriter>(
     // For cpio format, the symlink target is written as file data
     // Set size to target length so cpio writer includes it
     entry.size = target_str.len() as u64;
+    if archive.needs_data_checksum() {
+        entry.data_checksum = Some(checksum_bytes(0, target_str.as_bytes()));
+    }
 
     archive.write_entry(&entry)?;
     // Write the symlink target as data (needed for cpio format)
@@ -510,6 +585,12 @@ fn write_file<W: ArchiveWriter>(
         // Otherwise fall through and write the file contents.
     }
 
+    // The cpio "crc" format records the data checksum in the header, ahead of
+    // the data, so that one format costs an extra read of the file.
+    if archive.needs_data_checksum() {
+        entry.data_checksum = Some(file_checksum(src_path)?);
+    }
+
     // Write regular file
     archive.write_entry(&entry)?;
 
@@ -526,6 +607,20 @@ fn write_file<W: ArchiveWriter>(
     }
 
     Ok(())
+}
+
+/// Sum a file's bytes for the cpio "crc" format's c_check field
+fn file_checksum(path: &Path) -> PaxResult<u32> {
+    let mut file = File::open(path)?;
+    let mut buf = [0u8; 8192];
+    let mut sum = 0u32;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            return Ok(sum);
+        }
+        sum = checksum_bytes(sum, &buf[..n]);
+    }
 }
 
 /// Copy file data to archive
@@ -672,22 +767,50 @@ pub fn write_files_to_archive<W: ArchiveWriter>(
 
 /// Read file list from stdin (one path per line)
 pub fn read_file_list<R: Read>(reader: R) -> PaxResult<Vec<PathBuf>> {
+    read_file_list_sep(reader, b'\n')
+}
+
+/// Read a list of pathnames separated by `sep`.
+///
+/// `sep` is `b'\n'` for the usual `find | pax` pipeline and `b'\0'` for the
+/// `find -print0` pipeline that tar's `--null` and cpio's `-0` select, which is
+/// the only way a pathname containing a newline survives the trip.
+pub fn read_file_list_sep<R: Read>(reader: R, sep: u8) -> PaxResult<Vec<PathBuf>> {
     use std::io::BufRead;
 
-    let reader = std::io::BufReader::new(reader);
+    let mut reader = std::io::BufReader::new(reader);
     let mut files = Vec::new();
+    let mut buf = Vec::new();
 
-    for line in reader.lines() {
-        let line = line?;
-        // `lines()` already strips the trailing newline. Keep the rest verbatim
-        // so pathnames with leading/trailing spaces survive; skip only a wholly
-        // empty line (e.g. a trailing blank line).
-        if !line.is_empty() {
-            files.push(PathBuf::from(line));
+    loop {
+        buf.clear();
+        if reader.read_until(sep, &mut buf)? == 0 {
+            return Ok(files);
+        }
+        if buf.last() == Some(&sep) {
+            buf.pop();
+        }
+        // Keep the name verbatim so pathnames with leading or trailing spaces
+        // survive; skip only a wholly empty entry (e.g. a trailing separator).
+        if !buf.is_empty() {
+            files.push(path_from_bytes(&buf));
         }
     }
+}
 
-    Ok(files)
+/// Turn a pathname read from a file list into a `PathBuf`.
+///
+/// A pathname is bytes, not text, so on unix the bytes are kept exactly --
+/// which is the point of reading the list this way rather than by lines.
+#[cfg(unix)]
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    PathBuf::from(std::ffi::OsStr::from_bytes(bytes).to_owned())
+}
+
+#[cfg(not(unix))]
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
 }
 
 /// Reset access time of a file to the specified time

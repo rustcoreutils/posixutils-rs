@@ -13,7 +13,7 @@ use crate::archive::{ArchiveEntry, ArchiveFormat, ArchiveReader, EntryType, Extr
 use crate::error::{PaxError, PaxResult};
 use crate::formats::{CpioReader, PaxReader, UstarReader};
 use crate::interactive::{InteractivePrompter, RenameResult};
-use crate::pattern::{find_matching_pattern_subtree, Pattern};
+use crate::pattern::{find_matching_pattern_subtree, matches_excluded, Pattern};
 use crate::subst::{apply_substitutions, SubstResult, Substitution};
 use std::collections::HashSet;
 use std::ffi::{CStr, CString, OsString};
@@ -57,6 +57,13 @@ pub struct ReadOptions {
     /// `-d`: a directory pattern matches only the directory itself, not its
     /// subtree.
     pub dir_only: bool,
+    /// Members not to extract (tar `--exclude` / `-X`)
+    pub exclude_patterns: Vec<Pattern>,
+    /// Leading pathname components to drop (tar `--strip-components`)
+    pub strip_components: usize,
+    /// Write member contents to standard output instead of creating files
+    /// (tar `-O`)
+    pub to_stdout: bool,
 }
 
 impl Default for ReadOptions {
@@ -77,6 +84,9 @@ impl Default for ReadOptions {
             umask: 0,
             format_options: crate::options::FormatOptions::default(),
             dir_only: false,
+            exclude_patterns: Vec::new(),
+            strip_components: 0,
+            to_stdout: false,
         }
     }
 }
@@ -156,6 +166,32 @@ fn extract_entries<R: ArchiveReader>(archive: &mut R, options: &ReadOptions) -> 
                         // Skip this entry
                         archive.skip_data()?;
                         continue;
+                    }
+                }
+            }
+
+            // --strip-components reshapes the member name before it is offered
+            // for renaming, so an interactive prompt shows the name that will
+            // actually be created. A member with no components left over names
+            // nothing to extract and is dropped, as GNU tar does.
+            if options.strip_components > 0 {
+                let name = entry.path.to_string_lossy().into_owned();
+                match strip_leading_components(&name, options.strip_components) {
+                    Some(stripped) => entry.path = PathBuf::from(stripped),
+                    None => {
+                        archive.skip_data()?;
+                        continue;
+                    }
+                }
+                // A hard link's target is another member name, so it has to be
+                // stripped in step. A symlink's target is not: it is resolved in
+                // the extracted tree and must be left alone.
+                if entry.entry_type == EntryType::Hardlink {
+                    if let Some(target) = &entry.link_target {
+                        let target = target.to_string_lossy().into_owned();
+                        entry.link_target =
+                            strip_leading_components(&target, options.strip_components)
+                                .map(PathBuf::from);
                     }
                 }
             }
@@ -265,6 +301,33 @@ pub(crate) fn apply_keyword_overrides(
     }
 }
 
+/// Drop the first `n` pathname components from an archive member name.
+///
+/// Returns `None` when the name has no more than `n` components, in which case
+/// nothing is left to name a file and the member is skipped -- GNU tar's
+/// behavior for `--strip-components`. Empty and `.` components are not counted,
+/// so `./a/b` strips the same way `a/b` does; a trailing slash is preserved so a
+/// directory member stays recognizable as one.
+pub(crate) fn strip_leading_components(name: &str, n: usize) -> Option<String> {
+    if n == 0 {
+        return Some(name.to_string());
+    }
+
+    let mut parts: Vec<&str> = name
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    if parts.len() <= n {
+        return None;
+    }
+
+    let mut stripped = parts.split_off(n).join("/");
+    if name.ends_with('/') {
+        stripped.push('/');
+    }
+    Some(stripped)
+}
+
 /// Check if entry should be extracted
 /// Returns:
 /// - None: entry should not be extracted (doesn't match patterns or excluded)
@@ -276,6 +339,12 @@ fn should_extract(
     matched_patterns: &mut HashSet<usize>,
 ) -> Option<bool> {
     let path = entry.path.to_string_lossy();
+
+    // tar's exclusion list is independent of the pattern operands and wins over
+    // them, so it is applied to the stored name before anything else.
+    if matches_excluded(&options.exclude_patterns, &path) {
+        return None;
+    }
 
     // Try matching against both the full path and the path with "./" prefix stripped
     let path_stripped = path.strip_prefix("./").unwrap_or(&path);
@@ -338,6 +407,12 @@ fn extract_entry<R: ArchiveReader>(
     tree: &DirTree,
     pending_dirs: &mut Vec<(MemberPath, ArchiveEntry)>,
 ) -> PaxResult<()> {
+    // -O turns extraction into a dump: nothing is created on disk, so none of
+    // the pathname resolution below applies.
+    if options.to_stdout {
+        return copy_member_to_stdout(archive, entry, options);
+    }
+
     let Some(member) = MemberPath::parse(&entry.path)? else {
         // The member names nothing to create (`.`, or only `..`/root parts).
         archive.skip_data()?;
@@ -397,12 +472,48 @@ fn extract_entry<R: ArchiveReader>(
         EntryType::Socket => {
             // Sockets cannot be extracted from archives
             if options.verbose {
-                eprintln!("pax: skipping socket: {}", member.display.display());
+                eprintln!(
+                    "{}: skipping socket: {}",
+                    crate::error::program_name(),
+                    member.display.display()
+                );
             }
             archive.skip_data()?;
         }
     }
 
+    Ok(())
+}
+
+/// Write a member's contents to standard output (tar `-O`).
+///
+/// Only members that carry data produce any; a directory, symlink or device
+/// contributes nothing, which is what makes `tar -xOf a.tar dir` a usable way to
+/// concatenate everything under a directory. The name still goes to stderr
+/// under `-v`, so the two streams stay separable.
+fn copy_member_to_stdout<R: ArchiveReader>(
+    archive: &mut R,
+    entry: &ArchiveEntry,
+    options: &ReadOptions,
+) -> PaxResult<()> {
+    if options.verbose {
+        eprintln!("{}", entry.path.display());
+    }
+
+    if matches!(entry.entry_type, EntryType::Regular | EntryType::Hardlink) {
+        let mut stdout = std::io::stdout().lock();
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = archive.read_data(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            stdout.write_all(&buf[..n])?;
+        }
+        stdout.flush()?;
+    }
+
+    archive.skip_data()?;
     Ok(())
 }
 
@@ -855,7 +966,7 @@ fn is_archive_newer_at(entry: &ArchiveEntry, dirfd: BorrowedFd<'_>, name: &CStr)
     if r != 0 {
         return true; // nothing there: extract it
     }
-    entry.mtime as i64 > st.st_mtime as i64
+    entry.mtime as i64 > st.st_mtime
 }
 
 /// Set file permissions
@@ -1033,6 +1144,32 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_strip_leading_components() {
+        assert_eq!(
+            strip_leading_components("a/b/c", 0).as_deref(),
+            Some("a/b/c")
+        );
+        assert_eq!(strip_leading_components("a/b/c", 1).as_deref(), Some("b/c"));
+        assert_eq!(strip_leading_components("a/b/c", 2).as_deref(), Some("c"));
+
+        // Nothing is left to name a file, so the member is dropped.
+        assert_eq!(strip_leading_components("a/b/c", 3), None);
+        assert_eq!(strip_leading_components("a/b/c", 4), None);
+        assert_eq!(strip_leading_components("a", 1), None);
+
+        // "." and empty components are noise, not components: "./a/b" strips
+        // exactly the way "a/b" does.
+        assert_eq!(strip_leading_components("./a/b", 1).as_deref(), Some("b"));
+        assert_eq!(
+            strip_leading_components("a//b/c", 1).as_deref(),
+            Some("b/c")
+        );
+
+        // A directory member keeps its trailing slash.
+        assert_eq!(strip_leading_components("a/b/", 1).as_deref(), Some("b/"));
+    }
 
     /// Without explicit `-p p`/`-p e` the extracted mode is the archived mode
     /// masked by the umask (normal file-creation action); with preservation the

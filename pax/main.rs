@@ -9,6 +9,7 @@
 
 mod archive;
 mod blocked_io;
+mod cli;
 mod compression;
 mod error;
 mod formats;
@@ -21,11 +22,14 @@ mod subst;
 
 use archive::{ArchiveFormat, ArchiveWriter};
 use blocked_io::{
-    default_record_size, parse_blocksize, BlockedReader, BlockedWriter, DEFAULT_RECORD_SIZE,
+    default_record_size, parse_blocksize, BlockedReader, BlockedWriter, ByteCounter,
+    DEFAULT_RECORD_SIZE, TAR_BLOCK_SIZE,
 };
 use clap::{Parser, ValueEnum};
+use cli::ProgramMode;
 use compression::{is_gzip, GzipReader, GzipWriter};
 use error::{PaxError, PaxResult};
+use formats::CpioFormat;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use modes::copy::CopyOptions;
 use modes::list::ListOptions;
@@ -41,9 +45,17 @@ use std::process::ExitCode;
 use subst::Substitution;
 
 /// Archive formats supported by pax
-#[derive(ValueEnum, Clone, Debug, Copy)]
+///
+/// The three cpio spellings are the historic pax names for the same container
+/// with different header flavors: `cpio` is the POSIX octet-oriented (odc)
+/// header, `bcpio` the old binary one, and `sv4cpio` / `sv4crc` the SVR4 "newc"
+/// headers without and with a data checksum.
+#[derive(ValueEnum, Clone, Debug, Copy, PartialEq, Eq)]
 enum Format {
+    Bcpio,
     Cpio,
+    Sv4cpio,
+    Sv4crc,
     Pax,
     Ustar,
 }
@@ -51,15 +63,31 @@ enum Format {
 impl From<Format> for ArchiveFormat {
     fn from(f: Format) -> Self {
         match f {
-            Format::Cpio => ArchiveFormat::Cpio,
+            Format::Bcpio | Format::Cpio | Format::Sv4cpio | Format::Sv4crc => ArchiveFormat::Cpio,
             Format::Pax => ArchiveFormat::Pax,
             Format::Ustar => ArchiveFormat::Ustar,
         }
     }
 }
 
+impl From<Format> for CpioFormat {
+    fn from(f: Format) -> Self {
+        match f {
+            Format::Bcpio => CpioFormat::Binary,
+            Format::Sv4cpio => CpioFormat::Newc,
+            Format::Sv4crc => CpioFormat::NewcCrc,
+            // Irrelevant for the non-cpio formats; odc is the pax default.
+            _ => CpioFormat::Odc,
+        }
+    }
+}
+
 /// pax - portable archive interchange
-#[derive(Parser, Debug)]
+///
+/// This is also the internal option representation the `tar` and `cpio`
+/// front-ends translate their own command lines into; the `#[arg(skip)]` fields
+/// at the end back options those two have and pax does not.
+#[derive(Parser, Debug, Default)]
 #[command(author, version, about = gettext("pax - portable archive interchange"), long_about)]
 struct Args {
     #[arg(short, long = "read", help = gettext("Read an archive file from standard input"))]
@@ -142,6 +170,28 @@ struct Args {
 
     #[arg(help = gettext("Pathnames, patterns and file operands to be processed"))]
     files_and_patterns: Vec<String>,
+
+    /// tar `-C`: change to this directory before operating. Applied after the
+    /// `-f` pathname has been resolved, since that one is relative to the
+    /// directory the command was invoked from.
+    #[arg(skip)]
+    chdir: Option<PathBuf>,
+
+    /// tar `--exclude` / `-X`: names never archived, listed or extracted
+    #[arg(skip)]
+    exclude_patterns: Vec<String>,
+
+    /// tar `--strip-components`: leading pathname components to drop
+    #[arg(skip)]
+    strip_components: usize,
+
+    /// tar `-O`: write member contents to standard output
+    #[arg(skip)]
+    to_stdout: bool,
+
+    /// cpio: report the archive size as a count of 512-byte blocks on stderr
+    #[arg(skip)]
+    report_blocks: bool,
 }
 
 /// Operation mode
@@ -172,9 +222,19 @@ fn main() -> ExitCode {
         unsafe { tzset() };
     }
 
-    let args = Args::parse();
+    // tar and cpio are the same binary under a different argv[0]; each parses
+    // its own historic command line and hands back the same internal options.
+    let program = ProgramMode::detect();
+    error::set_program_name(program.name());
+    let args = match program {
+        ProgramMode::Pax => Ok(Args::parse()),
+        ProgramMode::Tar => cli::tar::parse(std::env::args().collect()),
+        ProgramMode::Cpio => cli::cpio::parse(std::env::args().collect()),
+    };
 
-    match run(args) {
+    let result = args.and_then(run);
+
+    match result {
         // A clean return still maps to a non-zero exit if any per-file failure or
         // unmatched operand was diagnosed along the way (POSIX CONSEQUENCES OF
         // ERRORS: diagnose and continue, but exit non-zero).
@@ -185,14 +245,15 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             }
         }
+        Err(PaxError::EarlyExit) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("pax: {}", e);
+            eprintln!("{}: {}", program.name(), e);
             ExitCode::FAILURE
         }
     }
 }
 
-fn run(args: Args) -> PaxResult<()> {
+fn run(mut args: Args) -> PaxResult<()> {
     // Validate mutually exclusive options
     if args.gzip && args.append {
         return Err(PaxError::InvalidFormat(
@@ -200,15 +261,59 @@ fn run(args: Args) -> PaxResult<()> {
         ));
     }
 
+    apply_chdir(&mut args)?;
+
     let mode = determine_mode(&args);
 
-    match mode {
-        PaxMode::List => run_list(&args),
-        PaxMode::Read => run_read(&args),
-        PaxMode::Write => run_write(&args),
-        PaxMode::Append => run_append(&args),
+    // Counts the archive bytes read or written, for the block total cpio
+    // reports when it is done.
+    let archive_bytes = ByteCounter::default();
+
+    let result = match mode {
+        PaxMode::List => run_list(&args, &archive_bytes),
+        PaxMode::Read => run_read(&args, &archive_bytes),
+        PaxMode::Write => run_write(&args, &archive_bytes),
+        PaxMode::Append => run_append(&args, &archive_bytes),
         PaxMode::Copy => run_copy(&args),
+    };
+
+    // cpio reports the size of the archive it just handled. Copy mode moves no
+    // archive at all, so there is nothing to report there.
+    if args.report_blocks && !matches!(mode, PaxMode::Copy) && result.is_ok() {
+        let bytes = archive_bytes.load(std::sync::atomic::Ordering::Relaxed);
+        let blocks = bytes.div_ceil(TAR_BLOCK_SIZE as u64);
+        // cpio says "1 block", not "1 blocks".
+        let unit = if blocks == 1 { "block" } else { "blocks" };
+        eprintln!("{} {}", blocks, unit);
     }
+
+    result
+}
+
+/// Honor tar's `-C`, changing the working directory before anything else runs.
+///
+/// The archive named by `-f` is resolved first: it is relative to the directory
+/// the command was invoked from, not to the one being changed into, which is
+/// what makes `tar -C /dst -xf archive.tar` work.
+fn apply_chdir(args: &mut Args) -> PaxResult<()> {
+    let Some(dir) = args.chdir.take() else {
+        return Ok(());
+    };
+
+    if let Some(archive) = args.archive.take() {
+        args.archive = Some(if archive.is_absolute() {
+            archive
+        } else {
+            std::env::current_dir()?.join(archive)
+        });
+    }
+
+    std::env::set_current_dir(&dir).map_err(|e| {
+        PaxError::Io(io::Error::new(
+            e.kind(),
+            format!("{}: {}", dir.display(), e),
+        ))
+    })
 }
 
 /// Determine operation mode from arguments
@@ -244,7 +349,7 @@ fn parse_substitutions(args: &Args) -> PaxResult<Vec<Substitution>> {
 }
 
 /// Run list mode
-fn run_list(args: &Args) -> PaxResult<()> {
+fn run_list(args: &Args, archive_bytes: &ByteCounter) -> PaxResult<()> {
     let patterns = compile_patterns(&args.files_and_patterns)?;
     let format_options = parse_format_options(args)?;
     let substitutions = parse_substitutions(args)?;
@@ -257,6 +362,8 @@ fn run_list(args: &Args) -> PaxResult<()> {
         substitutions,
         first_match: args.first_match,
         dir_only: args.dir_no_follow,
+        exclude_patterns: compile_patterns(&args.exclude_patterns)?,
+        strip_components: args.strip_components,
     };
 
     // Check for multi-volume mode
@@ -264,7 +371,7 @@ fn run_list(args: &Args) -> PaxResult<()> {
         return run_list_multi_volume(args, &options);
     }
 
-    let (reader, format) = open_archive_for_read(args)?;
+    let (reader, format) = open_archive_for_read(args, archive_bytes)?;
     // StdoutLock is a LineWriter, so an unbuffered listing costs one write(2)
     // per member (two under -o listopt). Buffer it.
     let mut stdout = io::BufWriter::new(io::stdout().lock());
@@ -295,7 +402,7 @@ fn run_list_multi_volume(args: &Args, options: &ListOptions) -> PaxResult<()> {
 }
 
 /// Run read/extract mode
-fn run_read(args: &Args) -> PaxResult<()> {
+fn run_read(args: &Args, archive_bytes: &ByteCounter) -> PaxResult<()> {
     let patterns = compile_patterns(&args.files_and_patterns)?;
     let substitutions = parse_substitutions(args)?;
     let format_options = parse_format_options(args)?;
@@ -316,6 +423,9 @@ fn run_read(args: &Args) -> PaxResult<()> {
         umask: current_umask(),
         format_options,
         dir_only: args.dir_no_follow,
+        exclude_patterns: compile_patterns(&args.exclude_patterns)?,
+        strip_components: args.strip_components,
+        to_stdout: args.to_stdout,
     };
 
     // Check for multi-volume mode
@@ -323,7 +433,7 @@ fn run_read(args: &Args) -> PaxResult<()> {
         return run_read_multi_volume(args, &options);
     }
 
-    let (reader, format) = open_archive_for_read(args)?;
+    let (reader, format) = open_archive_for_read(args, archive_bytes)?;
     modes::extract_archive(reader, format, &options)
 }
 
@@ -363,12 +473,13 @@ fn reject_dash_c(args: &Args, mode: &str) -> PaxResult<()> {
     Ok(())
 }
 
-fn run_write(args: &Args) -> PaxResult<()> {
+fn run_write(args: &Args, archive_bytes: &ByteCounter) -> PaxResult<()> {
     reject_dash_c(args, "write")?;
     let files = get_files_to_archive(args)?;
     let substitutions = parse_substitutions(args)?;
     let format_options = parse_format_options(args)?;
 
+    let selected = args.format.unwrap_or(Format::Ustar);
     let options = WriteOptions {
         cli_dereference: args.cli_dereference,
         dereference: args.dereference,
@@ -379,9 +490,13 @@ fn run_write(args: &Args) -> PaxResult<()> {
         reset_atime: args.reset_atime,
         substitutions,
         format_options,
+        cpio_format: CpioFormat::from(selected),
+        exclude_patterns: compile_patterns(&args.exclude_patterns)?,
+        // -u selects among existing members, which write mode has none of.
+        update_times: None,
     };
 
-    let format = ArchiveFormat::from(args.format.unwrap_or(Format::Ustar));
+    let format = ArchiveFormat::from(selected);
 
     // Check for multi-volume mode
     if args.multi_volume {
@@ -395,24 +510,25 @@ fn run_write(args: &Args) -> PaxResult<()> {
         None => default_record_size(format),
     };
 
+    let counter = || ByteCounter::clone(archive_bytes);
     if let Some(ref path) = args.archive {
         let file = File::create(path)?;
         if args.gzip {
             let gzip_writer = GzipWriter::new(file)?;
-            let blocked_writer = BlockedWriter::new(gzip_writer, record_size);
+            let blocked_writer = BlockedWriter::with_counter(gzip_writer, record_size, counter());
             modes::create_archive(blocked_writer, &files, format, &options)
         } else {
-            let blocked_writer = BlockedWriter::new(file, record_size);
+            let blocked_writer = BlockedWriter::with_counter(file, record_size, counter());
             modes::create_archive(blocked_writer, &files, format, &options)
         }
     } else {
         let stdout = io::stdout().lock();
         if args.gzip {
             let gzip_writer = GzipWriter::new(stdout)?;
-            let blocked_writer = BlockedWriter::new(gzip_writer, record_size);
+            let blocked_writer = BlockedWriter::with_counter(gzip_writer, record_size, counter());
             modes::create_archive(blocked_writer, &files, format, &options)
         } else {
-            let blocked_writer = BlockedWriter::new(stdout, record_size);
+            let blocked_writer = BlockedWriter::with_counter(stdout, record_size, counter());
             modes::create_archive(blocked_writer, &files, format, &options)
         }
     }
@@ -463,7 +579,7 @@ fn run_write_multi_volume(
 }
 
 /// Run append mode (-w -a)
-fn run_append(args: &Args) -> PaxResult<()> {
+fn run_append(args: &Args, archive_bytes: &ByteCounter) -> PaxResult<()> {
     // Append mode requires an archive file (not stdin/stdout)
     let archive_path = args
         .archive
@@ -473,14 +589,14 @@ fn run_append(args: &Args) -> PaxResult<()> {
     // Check if archive exists - if not, create it instead of appending
     if !archive_path.exists() {
         // Fall back to create mode
-        return run_write(args);
+        return run_write(args, archive_bytes);
     }
 
     let files = get_files_to_archive(args)?;
     let substitutions = parse_substitutions(args)?;
     let format_options = parse_format_options(args)?;
 
-    let options = WriteOptions {
+    let mut options = WriteOptions {
         cli_dereference: args.cli_dereference,
         dereference: args.dereference,
         no_recurse: args.dir_no_follow,
@@ -490,6 +606,10 @@ fn run_append(args: &Args) -> PaxResult<()> {
         reset_atime: args.reset_atime,
         substitutions,
         format_options,
+        cpio_format: args.format.map(CpioFormat::from).unwrap_or_default(),
+        exclude_patterns: compile_patterns(&args.exclude_patterns)?,
+        // Filled in by append_to_archive once it knows the archive's format.
+        update_times: None,
     };
 
     let requested_format = args.format.map(ArchiveFormat::from);
@@ -502,9 +622,10 @@ fn run_append(args: &Args) -> PaxResult<()> {
     modes::append_to_archive(
         archive_path,
         &files,
-        &options,
+        &mut options,
         requested_format,
         record_size,
+        args.update,
     )
 }
 
@@ -563,7 +684,10 @@ fn run_copy(args: &Args) -> PaxResult<()> {
 }
 
 /// Open archive for reading with format detection
-fn open_archive_for_read(args: &Args) -> PaxResult<(Box<dyn Read>, ArchiveFormat)> {
+fn open_archive_for_read(
+    args: &Args,
+    archive_bytes: &ByteCounter,
+) -> PaxResult<(Box<dyn Read>, ArchiveFormat)> {
     // Determine record size for blocked I/O. On read the format is auto-detected
     // after this point, so an unspecified -b just sets the read granularity.
     let record_size = match args.blocksize {
@@ -591,7 +715,8 @@ fn open_archive_for_read(args: &Args) -> PaxResult<(Box<dyn Read>, ArchiveFormat
     };
 
     // Wrap in blocked reader for proper tape drive support
-    let blocked_reader = BlockedReader::new(reader, record_size);
+    let blocked_reader =
+        BlockedReader::with_counter(reader, record_size, ByteCounter::clone(archive_bytes));
 
     // For format detection, we need to peek at the (decompressed) archive
     let mut buf_reader = PeekReader::new(Box::new(blocked_reader), 512);

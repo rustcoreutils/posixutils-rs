@@ -256,6 +256,31 @@ pub fn matches_any(patterns: &[Pattern], path: &str) -> bool {
     patterns.iter().any(|p| p.matches(path))
 }
 
+/// Check whether `path` is excluded by any of `patterns` (tar's `--exclude`).
+///
+/// Unlike the pax pattern operands, tar exclusion patterns are *unanchored*: a
+/// pattern is tried against the whole name and against every suffix that starts
+/// just after a `/`, so `--exclude=build` drops `src/build` and `--exclude=*.o`
+/// drops `src/obj/x.o`. An empty list excludes nothing -- note this is the
+/// opposite of `matches_any`, where no patterns means "match everything".
+pub fn matches_excluded(patterns: &[Pattern], path: &str) -> bool {
+    if patterns.is_empty() {
+        return false;
+    }
+    // A directory member arrives as "dir/"; match it as "dir".
+    let path = path.strip_suffix('/').unwrap_or(path);
+    let mut suffix = path;
+    loop {
+        if patterns.iter().any(|p| p.matches(suffix)) {
+            return true;
+        }
+        match suffix.find('/') {
+            Some(slash) => suffix = &suffix[slash + 1..],
+            None => return false,
+        }
+    }
+}
+
 /// Find the index of the first pattern that matches the given path
 /// Returns None if no pattern matches, or if patterns is empty (which means "match all")
 pub fn find_matching_pattern(patterns: &[Pattern], path: &str) -> Option<usize> {
@@ -302,6 +327,35 @@ pub fn find_matching_pattern_subtree(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_matches_excluded_is_unanchored() {
+        let pats = vec![Pattern::new("build").unwrap()];
+        // The pattern is tried against the whole name and every suffix that
+        // starts after a slash, so a bare component matches at any depth.
+        assert!(matches_excluded(&pats, "build"));
+        assert!(matches_excluded(&pats, "src/build"));
+        assert!(matches_excluded(&pats, "a/b/build"));
+        // ...but only on a whole component boundary.
+        assert!(!matches_excluded(&pats, "rebuild"));
+        assert!(!matches_excluded(&pats, "src/rebuild"));
+        assert!(!matches_excluded(&pats, "build/x"));
+
+        // A directory member arrives with a trailing slash and still matches.
+        assert!(matches_excluded(&pats, "src/build/"));
+
+        // An empty list excludes nothing -- the opposite of matches_any, where
+        // no patterns means "everything".
+        assert!(!matches_excluded(&[], "anything"));
+    }
+
+    #[test]
+    fn test_matches_excluded_glob() {
+        let pats = vec![Pattern::new("*.o").unwrap()];
+        assert!(matches_excluded(&pats, "x.o"));
+        assert!(matches_excluded(&pats, "src/obj/x.o"));
+        assert!(!matches_excluded(&pats, "x.c"));
+    }
 
     #[test]
     fn test_literal() {

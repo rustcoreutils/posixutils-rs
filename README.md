@@ -217,6 +217,17 @@ Utilities provided beyond those POSIX specifies.
 
  * tar - pax compatibility front-end, forcing the ustar format (Archive)
  * cpio - pax compatibility front-end, forcing the cpio format (Archive)
+ * crond - cron daemon executing crontab, at and batch jobs (cron cat.)
+ * talkd - local-only talk daemon, Unix socket rather than UDP port 518 (Users)
+
+`tar` and `cpio` are installed as symlinks to `pax`, which picks its
+command-line parser from `argv[0]`.  Three further symlinks name
+POSIX-specified utilities and are not extensions: `ex` -> vi, and
+`zcat` / `uncompress` -> compress.
+
+See [NONPOSIX.md](NONPOSIX.md) for the full inventory of non-POSIX extensions:
+extra options, language and syntax extensions, environment variables, file
+formats, and our choices where POSIX leaves behavior unspecified.
 
 ## Installation
 

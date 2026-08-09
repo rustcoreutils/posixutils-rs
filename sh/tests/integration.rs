@@ -2221,6 +2221,36 @@ mod audit_regressions {
         });
     }
 
+    // ----- Phase 6: built-in output and option handling -----
+
+    #[test]
+    fn unalias_a_accepts_operands_and_terminates_its_diagnostic() {
+        test_script("alias x=y; unalias -a x; echo rc=$?\n", "rc=0\n");
+        set_env_vars();
+        run_script_with_checker("unalias nope1 nope2\n", |output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(stderr.lines().count(), 2, "got {stderr:?}");
+            assert!(stderr.ends_with('\n'), "got {stderr:?}");
+        });
+    }
+
+    #[test]
+    fn fc_option_order_does_not_matter() {
+        // `-n` and `-r` qualify the other options; `fc -nl` is the common
+        // spelling and must behave like `fc -ln`.
+        set_env_vars();
+        for script in ["fc -nl\n", "fc -ln\n", "fc -n -l\n"] {
+            run_script_with_checker(script, |output| {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(!stderr.contains("can only be"), "got {stderr:?}");
+            });
+        }
+        // `-n` still requires `-l`, and `-r` still conflicts with `-s`.
+        expect_clean_failure("fc -n\n");
+        expect_clean_failure("fc -s -r\n");
+        expect_clean_failure("fc -r -s\n");
+    }
+
     #[test]
     fn fc_out_of_range_endpoints_do_not_underflow() {
         // `fc -l 0` and out-of-range endpoints must clamp, never underflow.

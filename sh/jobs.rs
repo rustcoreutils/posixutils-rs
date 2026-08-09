@@ -65,16 +65,18 @@ pub struct Job {
 }
 
 impl Job {
+    /// `jobs -l`: the POSIX format with the process id before the state.
     pub fn to_string_long(&self) -> String {
         format!(
-            "[{}]{} {} {}    {}\n",
+            "[{}] {} {} {} {}\n",
             self.number, self.position, self.pid, self.state, self.command
         )
     }
 
+    /// The POSIX `jobs` format: `"[%d] %c %s %s\n"`.
     pub fn to_string_short(&self) -> String {
         format!(
-            "[{}]{} {}    {}\n",
+            "[{}] {} {} {}\n",
             self.number, self.position, self.state, self.command
         )
     }

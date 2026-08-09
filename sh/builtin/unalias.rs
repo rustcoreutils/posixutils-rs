@@ -22,9 +22,8 @@ impl BuiltinUtility for Unalias {
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
         if args.first().is_some_and(|arg| arg == "-a") {
-            if args.len() > 1 {
-                return Err(gettext("unalias: too many arguments").into());
-            }
+            // `-a` removes every alias; any further operands are redundant but
+            // not an error (dash and bash accept them too).
             shell.alias_table.clear();
             return Ok(0);
         }
@@ -33,7 +32,7 @@ impl BuiltinUtility for Unalias {
         let args = skip_option_terminator(args);
         for alias in args {
             if shell.alias_table.remove(alias).is_none() {
-                opened_files.write_err(format!("unalias: '{alias}' not found "));
+                opened_files.write_err(format!("unalias: '{alias}' {}\n", gettext("not found")));
                 status = 1;
             }
         }

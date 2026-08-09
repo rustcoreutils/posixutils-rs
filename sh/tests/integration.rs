@@ -7,6 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
+mod pty;
+
 use plib::testing::{run_test, run_test_with_checker, TestPlan};
 use std::path::Path;
 use std::process::Output;
@@ -1195,6 +1197,14 @@ mod builtin {
     }
 
     #[test]
+    fn null_utility() {
+        test_script(
+            include_str!("sh/builtin/null_utility.sh"),
+            include_str!("sh/builtin/null_utility.out"),
+        );
+    }
+
+    #[test]
     fn unset_variable() {
         test_script(
             include_str!("sh/builtin/unset_variable.sh"),
@@ -2323,6 +2333,91 @@ mod audit_regressions {
         });
         let _ = std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644));
         let _ = std::fs::remove_file(&script);
+    }
+
+    // ----- Phase 8: coverage for previously untested behaviour -----
+
+    #[test]
+    fn continue_does_not_escape_a_function() {
+        // The loop-depth counter has to be function-scoped, or `continue` in a
+        // function unwinds the caller's loop.
+        test_script(
+            "for x in 1 2; do f() { continue; }; f; echo in$x; done; echo done\n",
+            "in1\nin2\ndone\n",
+        );
+        test_script(
+            "f() { continue; }\nfor x in 1 2; do f; echo in$x; done\necho done\n",
+            "in1\nin2\ndone\n",
+        );
+    }
+
+    #[test]
+    fn cd_searches_cdpath_and_reports_the_directory_it_found() {
+        set_env_vars();
+        let base = Path::new(concat!(env!("CARGO_TARGET_TMPDIR"), "/sh_test_write_dir"))
+            .join("cdpath_test");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("first/sub")).unwrap();
+        std::fs::create_dir_all(base.join("second/sub")).unwrap();
+        // The first matching CDPATH entry wins, and the resolved directory is
+        // written to standard output.
+        run_successfully_and(
+            &format!(
+                "CDPATH='{first}:{second}'; cd sub; pwd\n",
+                first = base.join("first").display(),
+                second = base.join("second").display(),
+            ),
+            |out| {
+                let expected = base.join("first/sub");
+                assert_eq!(
+                    out,
+                    format!("{}\n{}\n", expected.display(), expected.display())
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn cd_resolves_dot_dot_lexically_unless_physical() {
+        set_env_vars();
+        let base = Path::new(concat!(env!("CARGO_TARGET_TMPDIR"), "/sh_test_write_dir"))
+            .join("cd_dotdot_test");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("real/inner")).unwrap();
+        std::os::unix::fs::symlink(base.join("real/inner"), base.join("link")).unwrap();
+        // -L (the default) removes `link/..` lexically, landing back in base.
+        run_successfully_and(
+            &format!("cd '{}/link'; cd ..; pwd\n", base.display()),
+            |out| assert_eq!(out, format!("{}\n", base.display())),
+        );
+        // -P follows the symbolic link first, so `..` lands in real/.
+        run_successfully_and(
+            &format!("cd '{}/link'; cd -P ..; pwd\n", base.display()),
+            |out| assert_eq!(out, format!("{}\n", base.join("real").display())),
+        );
+    }
+
+    #[test]
+    fn hash_forgets_remembered_locations_when_path_changes() {
+        set_env_vars();
+        // `hash name` remembers a location, `hash` lists it, and assigning to
+        // PATH clears the table.
+        run_successfully_and(
+            "saved=$PATH\nhash true\nbefore=$(hash)\nPATH=/nonexistent\nafter=$(hash)\n\
+             PATH=$saved\necho \"[$before][$after]\"\n",
+            |out| {
+                assert!(
+                    out.contains("true"),
+                    "expected a remembered location: {out:?}"
+                );
+                assert!(out.ends_with("[]\n"), "expected an empty table: {out:?}");
+            },
+        );
+        // The not-found diagnostic goes to stderr, not stdout.
+        run_script_with_checker("hash no_such_command_xyz\n", |output| {
+            assert!(String::from_utf8_lossy(&output.stdout).is_empty());
+            assert!(!String::from_utf8_lossy(&output.stderr).is_empty());
+        });
     }
 
     #[test]

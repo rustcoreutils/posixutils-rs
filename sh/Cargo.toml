@@ -11,6 +11,10 @@ gettext-rs.workspace = true
 libc.workspace = true
 plib = { path = "../plib" }
 
+[dev-dependencies]
+portable-pty = "0.9"
+tempfile.workspace = true
+
 [lints]
 workspace = true
 

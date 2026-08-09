@@ -777,7 +777,6 @@ pub fn read_file_list<R: Read>(reader: R) -> PaxResult<Vec<PathBuf>> {
 /// the only way a pathname containing a newline survives the trip.
 pub fn read_file_list_sep<R: Read>(reader: R, sep: u8) -> PaxResult<Vec<PathBuf>> {
     use std::io::BufRead;
-    use std::os::unix::ffi::OsStrExt;
 
     let mut reader = std::io::BufReader::new(reader);
     let mut files = Vec::new();
@@ -794,9 +793,24 @@ pub fn read_file_list_sep<R: Read>(reader: R, sep: u8) -> PaxResult<Vec<PathBuf>
         // Keep the name verbatim so pathnames with leading or trailing spaces
         // survive; skip only a wholly empty entry (e.g. a trailing separator).
         if !buf.is_empty() {
-            files.push(PathBuf::from(std::ffi::OsStr::from_bytes(&buf).to_owned()));
+            files.push(path_from_bytes(&buf));
         }
     }
+}
+
+/// Turn a pathname read from a file list into a `PathBuf`.
+///
+/// A pathname is bytes, not text, so on unix the bytes are kept exactly --
+/// which is the point of reading the list this way rather than by lines.
+#[cfg(unix)]
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    PathBuf::from(std::ffi::OsStr::from_bytes(bytes).to_owned())
+}
+
+#[cfg(not(unix))]
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
 }
 
 /// Reset access time of a file to the specified time

@@ -441,6 +441,94 @@ fn test_tar_append_and_update() {
     );
 }
 
+/// -u has to compare each *member*, by the name it is stored under. Comparing
+/// the operand instead got both of these wrong: an absolute pathname is stored
+/// with its leading slash removed, so it never matched and was re-appended on
+/// every run; and a directory operand was judged by its own mtime, so a file
+/// that changed underneath an untouched directory was silently not appended.
+#[test]
+fn test_tar_update_compares_member_names_not_operands() {
+    let temp = TempDir::new().unwrap();
+    let src = setup(temp.path());
+
+    let absolute = src.join("a.txt");
+    let absolute = absolute.to_str().unwrap();
+    assert_success(
+        &run_tar(&["-cf", "abs.tar", absolute], temp.path()),
+        "tar -cf",
+    );
+    let after_create = members(temp.path(), "abs.tar");
+    assert_success(
+        &run_tar(&["-uf", "abs.tar", absolute], temp.path()),
+        "tar -uf",
+    );
+    assert_success(
+        &run_tar(&["-uf", "abs.tar", absolute], temp.path()),
+        "tar -uf",
+    );
+    assert_eq!(
+        members(temp.path(), "abs.tar"),
+        after_create,
+        "an unchanged file must not be re-appended just because the operand \
+         was absolute and the member name is not"
+    );
+}
+
+#[test]
+fn test_tar_update_appends_a_changed_file_under_an_unchanged_directory() {
+    let temp = TempDir::new().unwrap();
+    let src = setup(temp.path());
+
+    assert_success(&run_tar(&["-cf", "../d.tar", "sub"], &src), "tar -cf");
+    assert_eq!(
+        members(temp.path(), "d.tar"),
+        vec![
+            "sub".to_string(),
+            "sub/b.txt".to_string(),
+            "sub/c.o".to_string()
+        ]
+    );
+
+    // Change one file and push its timestamp past the archived one. The
+    // directory's own mtime is left alone, which is the case that used to
+    // make -u skip the whole subtree.
+    fs::write(src.join("sub/b.txt"), "changed\n").unwrap();
+    let archived =
+        filetime::FileTime::from_last_modification_time(&fs::metadata(src.join("sub")).unwrap());
+    filetime::set_file_mtime(
+        src.join("sub/b.txt"),
+        filetime::FileTime::from_unix_time(archived.unix_seconds() + 120, 0),
+    )
+    .unwrap();
+
+    assert_success(&run_tar(&["-uf", "../d.tar", "sub"], &src), "tar -uf");
+    assert_eq!(
+        members(temp.path(), "d.tar"),
+        vec![
+            "sub".to_string(),
+            "sub/b.txt".to_string(),
+            "sub/b.txt".to_string(),
+            "sub/c.o".to_string(),
+        ],
+        "only the changed member should have been appended"
+    );
+
+    // Re-running with nothing changed appends nothing at all.
+    let before = members(temp.path(), "d.tar");
+    assert_success(&run_tar(&["-uf", "../d.tar", "sub"], &src), "tar -uf");
+    assert_eq!(members(temp.path(), "d.tar"), before);
+
+    // And extraction yields the updated contents, since the appended copy
+    // comes last.
+    let dest = temp.path().join("dest");
+    fs::create_dir(&dest).unwrap();
+    assert_success(&run_tar(&["-xf", "../d.tar"], &dest), "tar -xf");
+    assert_eq!(
+        fs::read_to_string(dest.join("sub/b.txt")).unwrap(),
+        "changed\n"
+    );
+}
+
 #[test]
 fn test_tar_no_recursion() {
     let temp = TempDir::new().unwrap();

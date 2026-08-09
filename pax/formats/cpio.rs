@@ -745,7 +745,7 @@ fn build_odc_header(entry: &ArchiveEntry, ino: u64, namesize: usize) -> PaxResul
     write_octal_field_masked(&mut header, entry.gid as u64, 6);
 
     // c_nlink
-    write_octal_field(&mut header, entry.nlink as u64, 6)?;
+    write_octal_field(&mut header, header_nlink(entry), 6)?;
 
     // c_rdev (device major/minor for block/char devices)
     write_octal_field(&mut header, packed_rdev(entry), 6)?;

@@ -492,6 +492,8 @@ fn run_write(args: &Args, archive_bytes: &ByteCounter) -> PaxResult<()> {
         format_options,
         cpio_format: CpioFormat::from(selected),
         exclude_patterns: compile_patterns(&args.exclude_patterns)?,
+        // -u selects among existing members, which write mode has none of.
+        update_times: None,
     };
 
     let format = ArchiveFormat::from(selected);
@@ -594,7 +596,7 @@ fn run_append(args: &Args, archive_bytes: &ByteCounter) -> PaxResult<()> {
     let substitutions = parse_substitutions(args)?;
     let format_options = parse_format_options(args)?;
 
-    let options = WriteOptions {
+    let mut options = WriteOptions {
         cli_dereference: args.cli_dereference,
         dereference: args.dereference,
         no_recurse: args.dir_no_follow,
@@ -606,6 +608,8 @@ fn run_append(args: &Args, archive_bytes: &ByteCounter) -> PaxResult<()> {
         format_options,
         cpio_format: args.format.map(CpioFormat::from).unwrap_or_default(),
         exclude_patterns: compile_patterns(&args.exclude_patterns)?,
+        // Filled in by append_to_archive once it knows the archive's format.
+        update_times: None,
     };
 
     let requested_format = args.format.map(ArchiveFormat::from);
@@ -618,7 +622,7 @@ fn run_append(args: &Args, archive_bytes: &ByteCounter) -> PaxResult<()> {
     modes::append_to_archive(
         archive_path,
         &files,
-        &options,
+        &mut options,
         requested_format,
         record_size,
         args.update,

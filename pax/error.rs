@@ -121,9 +121,11 @@ pub fn program_name() -> &'static str {
     }
 }
 
-/// Write a per-item diagnostic to standard error in the `pax: <context>: <err>`
-/// form and flag the run as failed, so that processing can continue (per POSIX)
-/// while the final exit status is still non-zero.
+/// Write a per-item diagnostic to standard error in the
+/// `<program>: <context>: <err>` form -- `pax`, or `tar`/`cpio` when a
+/// compatibility front-end is driving -- and flag the run as failed, so that
+/// processing can continue (per POSIX) while the final exit status is still
+/// non-zero.
 pub fn report_error(context: impl fmt::Display, err: impl fmt::Display) {
     eprintln!("{}: {}: {}", program_name(), context, err);
     note_error();

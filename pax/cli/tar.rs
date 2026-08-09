@@ -20,12 +20,16 @@ use std::path::PathBuf;
 const PROG: &str = "tar";
 
 /// Every short option this parser recognizes, whether it is supported or
-/// explicitly refused.
+/// explicitly refused. `apply_short` has an arm for each of these; a letter
+/// listed here but unhandled there would report itself as "unrecognized",
+/// which is the one thing this set exists to avoid.
 ///
 /// The set doubles as the test for tar's old-style first operand (`tar cvf`):
-/// a leading argument made entirely of these letters is a bundle of options,
-/// anything else is an operand. Keeping the set closed is what stops a file
-/// named, say, `cat` from being mistaken for one.
+/// a leading argument is a bundle only if *every* character is one of these,
+/// so a name containing anything else -- `src`, `readme`, `build` -- is an
+/// operand. It cannot do better than that: a first operand spelled entirely
+/// in option letters, such as `cat`, is read as options, and every historic
+/// tar has the same ambiguity, because that is what the convention costs.
 const OPTION_LETTERS: &str = "cxtrufvzCpmhkOTXPbjJZAwSWaolNgGMRVdin";
 
 /// Short options that consume an argument.
@@ -163,6 +167,45 @@ fn apply_short(
         'w' => return Err(unsupported(PROG, "-w", "no interactive confirmation")),
         'S' => return Err(unsupported(PROG, "-S", "sparse files are not detected")),
         'W' => return Err(unsupported(PROG, "-W", "archives are not verified")),
+        'a' => {
+            return Err(unsupported(
+                PROG,
+                "-a",
+                "the compressor is not chosen from the archive suffix",
+            ))
+        }
+        'd' => {
+            return Err(unsupported(
+                PROG,
+                "-d",
+                "archives are not compared against the filesystem",
+            ))
+        }
+        'i' => {
+            return Err(unsupported(
+                PROG,
+                "-i",
+                "zero blocks are not ignored mid-archive",
+            ))
+        }
+        'l' => {
+            return Err(unsupported(
+                PROG,
+                "-l",
+                "hard-link completeness is not checked",
+            ))
+        }
+        'n' => return Err(unsupported(PROG, "-n", "the archive is not seekable")),
+        'g' | 'G' | 'N' => {
+            return Err(unsupported(
+                PROG,
+                &format!("-{}", c),
+                "no incremental or date-based selection",
+            ))
+        }
+        'M' => return Err(unsupported(PROG, "-M", "no multi-volume archives")),
+        'R' => return Err(unsupported(PROG, "-R", "block numbers are not reported")),
+        'V' => return Err(unsupported(PROG, "-V", "no archive labels")),
         _ => return Err(unknown(PROG, &format!("-{}", c))),
     }
     Ok(())
@@ -437,6 +480,26 @@ mod tests {
         assert!(args.verbose);
         assert_eq!(args.archive.as_deref(), Some(Path::new("out.tar")));
         assert_eq!(args.files_and_patterns, vec!["dir".to_string()]);
+    }
+
+    #[test]
+    fn test_every_option_letter_reports_itself() {
+        // OPTION_LETTERS is what decides whether a bare first operand is an
+        // old-style bundle, so a letter listed there but missing from
+        // apply_short would answer "unrecognized option" -- exactly the
+        // answer the closed set exists to prevent.
+        for c in OPTION_LETTERS.chars() {
+            let err = match tar(&[&format!("-{}", c), "x"]) {
+                Ok(_) => continue,
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                !err.contains("unrecognized"),
+                "-{} is in OPTION_LETTERS but apply_short does not handle it: {}",
+                c,
+                err
+            );
+        }
     }
 
     #[test]

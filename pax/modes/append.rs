@@ -36,7 +36,7 @@ const BLOCK_SIZE: usize = 512;
 pub fn append_to_archive(
     archive_path: &PathBuf,
     files: &[PathBuf],
-    options: &WriteOptions,
+    options: &mut WriteOptions,
     requested_format: Option<ArchiveFormat>,
     record_size: usize,
     update: bool,
@@ -69,20 +69,13 @@ pub fn append_to_archive(
         ));
     }
 
-    // -u drops the operands that are no newer than the member already in the
-    // archive, so only genuinely updated files are appended.
-    let selected: Vec<PathBuf>;
-    let files = if update {
-        let archived = archived_mtimes(archive_path, format)?;
-        selected = files
-            .iter()
-            .filter(|path| is_newer_than_member(path, &archived))
-            .cloned()
-            .collect();
-        &selected[..]
-    } else {
-        files
-    };
+    // -u needs the times the archive already records. The decision itself is
+    // made per member during the traversal below, not on the operands: an
+    // operand is usually a directory, and what has to be compared is each
+    // member name it expands to, after -s has had its say.
+    if update {
+        options.update_times = Some(archived_mtimes(archive_path, format)?);
+    }
 
     // Find the end-of-archive position (two zero blocks)
     let append_pos = find_end_of_archive(&mut file)?;
@@ -124,8 +117,13 @@ fn archived_mtimes(archive_path: &Path, format: ArchiveFormat) -> PaxResult<Hash
         mtimes: &mut HashMap<PathBuf, u64>,
     ) -> PaxResult<()> {
         while let Some(entry) = archive.read_entry()? {
+            // A directory is stored as "dir/" but named "dir" while being
+            // written, so the trailing slash comes off here and the lookup
+            // side spells it the same way.
+            let name = entry.path.to_string_lossy();
+            let key = PathBuf::from(name.trim_end_matches('/'));
             mtimes
-                .entry(entry.path.clone())
+                .entry(key)
                 .and_modify(|t| *t = std::cmp::max(*t, entry.mtime))
                 .or_insert(entry.mtime);
             archive.skip_data()?;
@@ -140,36 +138,6 @@ fn archived_mtimes(archive_path: &Path, format: ArchiveFormat) -> PaxResult<Hash
     }
 
     Ok(mtimes)
-}
-
-/// Whether `path` should be appended under `-u`.
-///
-/// A file with no member of that name is new and always appended. Otherwise it
-/// is appended only if it is strictly newer, so a re-run with nothing changed
-/// adds nothing. A file that cannot be stat'ed is left to the write pass, which
-/// reports the failure properly.
-fn is_newer_than_member(path: &Path, archived: &HashMap<PathBuf, u64>) -> bool {
-    let Some(&member_mtime) = archived.get(path) else {
-        return true;
-    };
-    let Ok(metadata) = std::fs::symlink_metadata(path) else {
-        return true;
-    };
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        metadata.mtime() > member_mtime as i64
-    }
-    #[cfg(not(unix))]
-    {
-        metadata
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() > member_mtime)
-            .unwrap_or(true)
-    }
 }
 
 /// Detect archive format from file

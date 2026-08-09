@@ -16,6 +16,7 @@ use crate::interactive::{InteractivePrompter, RenameResult};
 use crate::options::{FormatOptions, InvalidAction};
 use crate::pattern::{matches_excluded, Pattern};
 use crate::subst::{apply_substitutions, SubstResult, Substitution};
+use std::collections::HashMap;
 use std::fs::{self, File, Metadata};
 use std::io::{Read, Write};
 #[cfg(unix)]
@@ -47,6 +48,52 @@ pub struct WriteOptions {
     pub cpio_format: CpioFormat,
     /// Names not to archive (tar `--exclude` / `-X`)
     pub exclude_patterns: Vec<Pattern>,
+    /// `-u` when appending: the modification time already recorded for each
+    /// member name in the archive being extended.
+    ///
+    /// The key is the *member* name -- what the file is stored as, after `-s`
+    /// and any rename -- because that is what a later extraction resolves, and
+    /// it is not the pathname the file was named by on the command line.
+    pub update_times: Option<HashMap<PathBuf, u64>>,
+}
+
+impl WriteOptions {
+    /// Whether `-u` should leave this member out because the archive already
+    /// holds a copy of that name no older than the file.
+    ///
+    /// False whenever `-u` is not in force or the name is new to the archive,
+    /// so an unfiltered run writes everything.
+    fn is_up_to_date(&self, archive_path: &Path, metadata: &Metadata) -> bool {
+        let Some(times) = &self.update_times else {
+            return false;
+        };
+        // Directory members are stored with a trailing slash; archived_mtimes
+        // strips it so both sides of this lookup spell the name the same way.
+        let name = archive_path.to_string_lossy();
+        let name = Path::new(name.trim_end_matches('/'));
+        let Some(&member_mtime) = times.get(name) else {
+            return false;
+        };
+        file_mtime_secs(metadata) <= member_mtime
+    }
+}
+
+/// A file's modification time in whole seconds, the resolution every header
+/// format records.
+fn file_mtime_secs(metadata: &Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        metadata.mtime().max(0) as u64
+    }
+    #[cfg(not(unix))]
+    {
+        metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
 }
 
 /// Create an archive from files
@@ -195,6 +242,16 @@ fn write_path<W: ArchiveWriter>(
         InvalidHandleResult::Skip => return Ok(()),
     };
 
+    // -u is decided here rather than on the operands, because this is the
+    // first point at which the member name exists: -s and an interactive
+    // rename have been applied, so the name being looked up is the one an
+    // extraction would resolve. A directory is never skipped outright -- the
+    // whole point of -u is to pick up a file that changed underneath one that
+    // did not -- so only its own entry is suppressed, inside write_directory.
+    if !metadata.is_dir() && options.is_up_to_date(&archive_path, &metadata) {
+        return Ok(());
+    }
+
     if options.verbose {
         eprintln!("{}", path.display());
     }
@@ -335,10 +392,13 @@ fn write_directory<W: ArchiveWriter>(
     link_tracker: &mut HardLinkTracker,
     prompter: &mut Option<InteractivePrompter>,
 ) -> PaxResult<()> {
-    // Write directory entry
-    let entry = build_entry(archive_path, metadata, EntryType::Directory)?;
-    archive.write_entry(&entry)?;
-    archive.finish_entry()?;
+    // Write directory entry, unless -u says the archive already has one no
+    // older than this. The subtree below is still walked either way.
+    if !options.is_up_to_date(archive_path, metadata) {
+        let entry = build_entry(archive_path, metadata, EntryType::Directory)?;
+        archive.write_entry(&entry)?;
+        archive.finish_entry()?;
+    }
 
     // Recurse into directory unless no_recurse
     if !options.no_recurse {

@@ -327,6 +327,15 @@ fn c99_complex_return_of_an_rvalue() {
 /// Previously the prologue's register guard simply skipped the copy when the
 /// value had spilled, leaving the parameter uninitialized, and shifted every
 /// argument after it.
+///
+/// x86_64 only. AArch64 has the same gap — `aarch64/codegen.rs`'s prologue
+/// likewise skips the copy when `fp_arg_idx + 1` runs past the register file —
+/// but the rule for what happens next is not the same one: AAPCS64 §6.4.2 sets
+/// NSRN to 8 once an argument is laid out on the stack, so *every* later
+/// floating-point argument follows it there, where System V leaves the unused
+/// registers available. Closing it means implementing that, and the audit
+/// records it (#H13) rather than guessing at it from the wrong architecture.
+#[cfg(target_arch = "x86_64")]
 #[test]
 fn c99_complex_argument_spilled_to_the_stack() {
     let src = r#"

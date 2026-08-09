@@ -422,11 +422,16 @@ impl Aarch64CodeGen {
 
         match arg_loc {
             Loc::Stack(offset) => {
-                // Complex value is stored directly on stack, load both parts
+                // The argument pseudo holds the *address* of the complex value
+                // (`Linearizer::complex_operand_addr`), so the slot has to be
+                // loaded and then dereferenced. Reading the slot as though it
+                // were the value worked only while the pointer happened to
+                // stay in a register, and produced garbage the moment it was
+                // spilled — the `Loc::Reg` arm below already dereferences.
                 let actual_offset = self.stack_offset(offset);
-                self.push_lir(Aarch64Inst::LdrFp {
-                    size: fp_size,
-                    dst: real_reg,
+                self.push_lir(Aarch64Inst::Ldr {
+                    size: OperandSize::B64,
+                    dst: Reg::X9,
                     addr: MemAddr::BaseOffset {
                         base: Reg::X29,
                         offset: actual_offset,
@@ -434,10 +439,18 @@ impl Aarch64CodeGen {
                 });
                 self.push_lir(Aarch64Inst::LdrFp {
                     size: fp_size,
+                    dst: real_reg,
+                    addr: MemAddr::BaseOffset {
+                        base: Reg::X9,
+                        offset: 0,
+                    },
+                });
+                self.push_lir(Aarch64Inst::LdrFp {
+                    size: fp_size,
                     dst: imag_reg,
                     addr: MemAddr::BaseOffset {
-                        base: Reg::X29,
-                        offset: actual_offset + imag_offset,
+                        base: Reg::X9,
+                        offset: imag_offset,
                     },
                 });
             }

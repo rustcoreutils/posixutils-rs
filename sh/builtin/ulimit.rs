@@ -96,7 +96,13 @@ struct UlimitArgs {
 impl UlimitArgs {
     fn parse(args: &[String]) -> Result<Self, String> {
         if args.is_empty() {
-            return Err("ulimit: missing argument".to_string());
+            // POSIX: with no options other than -H/-S, -f is implied, and
+            // without a newlimit operand the default is -S.
+            return Ok(UlimitArgs {
+                limit: LimitType::Soft,
+                resource: ResourceLimit::FSize,
+                newlimit: None,
+            });
         }
         let mut option_parser = OptionParser::new(args);
         let mut limit = None;
@@ -175,24 +181,31 @@ impl UlimitArgs {
     }
 }
 
-fn get_limits(resource: libc::c_int) -> libc::rlimit {
+fn get_limits(resource: libc::c_int) -> Result<libc::rlimit, String> {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
     };
     let result = unsafe { libc::getrlimit(resource as _, &mut limit) };
     if result < 0 {
-        panic!("invalid call to getrlimit")
+        return Err(format!(
+            "ulimit: cannot read limit ({})",
+            get_current_errno_value()
+        ));
     }
-    limit
+    Ok(limit)
 }
 
-fn get_limit(resource: libc::c_int, hard_limit: bool, divisor: libc::rlim_t) -> LimitQuantity {
-    let limits = get_limits(resource);
+fn get_limit(
+    resource: libc::c_int,
+    hard_limit: bool,
+    divisor: libc::rlim_t,
+) -> Result<LimitQuantity, String> {
+    let limits = get_limits(resource)?;
     if hard_limit {
-        LimitQuantity::new(limits.rlim_max, divisor)
+        Ok(LimitQuantity::new(limits.rlim_max, divisor))
     } else {
-        LimitQuantity::new(limits.rlim_cur, divisor)
+        Ok(LimitQuantity::new(limits.rlim_cur, divisor))
     }
 }
 
@@ -202,12 +215,19 @@ fn set_limit(
     limit_type: LimitType,
     multiplier: libc::rlim_t,
 ) -> Result<(), String> {
-    let mut limits = get_limits(resource);
+    let mut limits = get_limits(resource)?;
     let newlimit = newlimit.into_rlim_t(multiplier)?;
     match limit_type {
         LimitType::Soft => {
+            // Only a privileged process may raise the hard limit, and `-S`
+            // asks for the soft limit alone; refuse rather than silently
+            // widening the hard limit.
+            if limits.rlim_max != libc::RLIM_INFINITY
+                && (newlimit == libc::RLIM_INFINITY || newlimit > limits.rlim_max)
+            {
+                return Err("ulimit: soft limit above hard limit".to_string());
+            }
             limits.rlim_cur = newlimit;
-            limits.rlim_max = limits.rlim_max.max(newlimit);
         }
         LimitType::Hard => {
             limits.rlim_max = newlimit;
@@ -226,6 +246,61 @@ fn set_limit(
     }
     Ok(())
 }
+
+/// A resource `ulimit` can report, with the labelled form used by `-a`.
+struct ResourceInfo {
+    resource: ResourceLimit,
+    libc_resource: libc::c_int,
+    /// short phrase, units and option letter, as `-a` prints them
+    description: &'static str,
+    /// native units per reported unit
+    divisor: libc::rlim_t,
+}
+
+const RESOURCES: &[ResourceInfo] = &[
+    ResourceInfo {
+        resource: ResourceLimit::Core,
+        libc_resource: libc::RLIMIT_CORE as libc::c_int,
+        description: "core file size (-c)             [blocks]",
+        divisor: 512,
+    },
+    ResourceInfo {
+        resource: ResourceLimit::Data,
+        libc_resource: libc::RLIMIT_DATA as libc::c_int,
+        description: "data seg size (-d)                 [KiB]",
+        divisor: 1024,
+    },
+    ResourceInfo {
+        resource: ResourceLimit::FSize,
+        libc_resource: libc::RLIMIT_FSIZE as libc::c_int,
+        description: "file size (-f)                  [blocks]",
+        divisor: 512,
+    },
+    ResourceInfo {
+        resource: ResourceLimit::NoFile,
+        libc_resource: libc::RLIMIT_NOFILE as libc::c_int,
+        description: "open files (-n)                         ",
+        divisor: 1,
+    },
+    ResourceInfo {
+        resource: ResourceLimit::Stack,
+        libc_resource: libc::RLIMIT_STACK as libc::c_int,
+        description: "stack size (-s)                    [KiB]",
+        divisor: 1024,
+    },
+    ResourceInfo {
+        resource: ResourceLimit::Cpu,
+        libc_resource: libc::RLIMIT_CPU as libc::c_int,
+        description: "cpu time (-t)                  [seconds]",
+        divisor: 1,
+    },
+    ResourceInfo {
+        resource: ResourceLimit::As,
+        libc_resource: libc::RLIMIT_AS as libc::c_int,
+        description: "virtual memory (-v)                [KiB]",
+        divisor: 1024,
+    },
+];
 
 pub struct Ulimit;
 
@@ -269,49 +344,25 @@ impl BuiltinUtility for Ulimit {
                 ResourceLimit::All => unreachable!(),
             }
         } else {
-            assert_ne!(args.limit, LimitType::Both);
-            let all = args.resource == ResourceLimit::All;
             let hard_limit = args.limit == LimitType::Hard;
-            if args.resource == ResourceLimit::Core || all {
+            if args.resource == ResourceLimit::All {
+                for info in RESOURCES {
+                    opened_files.write_out(format!(
+                        "{} {}\n",
+                        info.description,
+                        get_limit(info.libc_resource, hard_limit, info.divisor)?
+                    ));
+                }
+            } else {
+                // POSIX: a single limit value is written as "%1d\n", or
+                // "unlimited\n" when the resource has no numeric limit.
+                let info = RESOURCES
+                    .iter()
+                    .find(|info| info.resource == args.resource)
+                    .ok_or_else(|| "ulimit: unknown resource".to_string())?;
                 opened_files.write_out(format!(
-                    "core file size (-c)             [blocks] {}\n",
-                    get_limit(libc::RLIMIT_CORE as libc::c_int, hard_limit, 512)
-                ));
-            }
-            if args.resource == ResourceLimit::Data || all {
-                opened_files.write_out(format!(
-                    "data seg size (-d)                 [KiB] {}\n",
-                    get_limit(libc::RLIMIT_DATA as libc::c_int, hard_limit, 1024)
-                ));
-            }
-            if args.resource == ResourceLimit::FSize || all {
-                opened_files.write_out(format!(
-                    "file size (-f)                  [blocks] {}\n",
-                    get_limit(libc::RLIMIT_FSIZE as libc::c_int, hard_limit, 512)
-                ));
-            }
-            if args.resource == ResourceLimit::NoFile || all {
-                opened_files.write_out(format!(
-                    "open files (-n)                          {}\n",
-                    get_limit(libc::RLIMIT_NOFILE as libc::c_int, hard_limit, 1)
-                ));
-            }
-            if args.resource == ResourceLimit::Stack || all {
-                opened_files.write_out(format!(
-                    "stack size (-s)                    [KiB] {}\n",
-                    get_limit(libc::RLIMIT_STACK as libc::c_int, hard_limit, 1024)
-                ));
-            }
-            if args.resource == ResourceLimit::Cpu || all {
-                opened_files.write_out(format!(
-                    "cpu time (-t)                  [seconds] {}\n",
-                    get_limit(libc::RLIMIT_CPU as libc::c_int, hard_limit, 1)
-                ));
-            }
-            if args.resource == ResourceLimit::As || all {
-                opened_files.write_out(format!(
-                    "virtual memory (-v)                [KiB] {}\n",
-                    get_limit(libc::RLIMIT_AS as libc::c_int, hard_limit, 1024)
+                    "{}\n",
+                    get_limit(info.libc_resource, hard_limit, info.divisor)?
                 ));
             }
         }

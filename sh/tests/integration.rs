@@ -2108,6 +2108,51 @@ mod audit_regressions {
         });
     }
 
+    // ----- Phase 4: ulimit conformance -----
+
+    #[test]
+    fn ulimit_reports_a_single_limit_as_a_bare_value() {
+        // POSIX: "%1d\n", or "unlimited\n" for a resource with no numeric
+        // limit. The labelled form belongs to -a only.
+        set_env_vars();
+        for script in [
+            "ulimit -f\n",
+            "ulimit\n",
+            "ulimit -S -f\n",
+            "ulimit -H -f\n",
+        ] {
+            run_successfully_and(script, |out| {
+                let value = out.trim_end_matches('\n');
+                assert!(
+                    value == "unlimited" || value.chars().all(|c| c.is_ascii_digit()),
+                    "expected a bare limit value, got {out:?}"
+                );
+            });
+        }
+        // -a keeps the labelled, one-line-per-resource form.
+        run_successfully_and("ulimit -a\n", |out| {
+            assert!(out.contains("file size (-f)"), "got {out:?}");
+            assert!(out.lines().count() >= 5, "got {out:?}");
+        });
+    }
+
+    #[test]
+    fn ulimit_with_no_options_reports_the_soft_file_size_limit() {
+        set_env_vars();
+        run_successfully_and("ulimit -f 100\nulimit\n", |out| assert_eq!(out, "100\n"));
+    }
+
+    #[test]
+    fn ulimit_soft_limit_may_not_exceed_the_hard_limit() {
+        // Raising the hard limit needs privilege, so `-S` must refuse rather
+        // than silently widening it.
+        expect_clean_failure("ulimit -f 100\nulimit -S -f 200\n");
+        run_successfully_and(
+            "ulimit -f 100\nulimit -S -f 50\nulimit -S -f\nulimit -H -f\n",
+            |out| assert_eq!(out, "50\n100\n"),
+        );
+    }
+
     #[test]
     fn fc_out_of_range_endpoints_do_not_underflow() {
         // `fc -l 0` and out-of-range endpoints must clamp, never underflow.

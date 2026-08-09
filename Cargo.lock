@@ -1769,6 +1769,8 @@ dependencies = [
  "gettext-rs",
  "libc",
  "plib",
+ "portable-pty",
+ "tempfile",
 ]
 
 [[package]]

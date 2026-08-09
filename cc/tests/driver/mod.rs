@@ -462,3 +462,55 @@ fn driver_multiple_sources_do_not_share_temp_files() {
     assert!(r.success, "three-source link failed: {}", r.stderr);
     assert_eq!(run_exe(&exe), 0);
 }
+
+/// Operands are compiled into one shared scratch directory now that the link
+/// happens once. Naming each object after the source's *stem* means
+/// `a/util.c` and `b/util.c` both become `util.o`: the second overwrites the
+/// first, and the link line then names that one object twice.
+#[test]
+fn driver_distinguishes_operands_with_the_same_basename() {
+    let w = WorkDir::new("samestem");
+    std::fs::create_dir_all(w.join("a")).unwrap();
+    std::fs::create_dir_all(w.join("b")).unwrap();
+    let main = w.write(
+        "m.c",
+        "int fa(void);int fb(void);int main(void){return fa()+fb();}\n",
+    );
+    let a = w.write("a/util.c", "int fa(void){return 3;}\n");
+    let b = w.write("b/util.c", "int fb(void){return 4;}\n");
+    let exe = w.join("same");
+
+    let r = run_c17(&[&s(&main), &s(&a), &s(&b), "-o", &s(&exe)]);
+    assert!(
+        r.success,
+        "two operands sharing a basename must not collide: {}{}",
+        r.stdout, r.stderr
+    );
+    assert_eq!(run_exe(&exe), 7, "wrong object linked");
+}
+
+/// The same collision, but between a source and an object operand that share
+/// a stem — the object must not be overwritten by the compile of the source.
+#[test]
+fn driver_source_does_not_clobber_a_like_named_object_operand() {
+    let w = WorkDir::new("stemobj");
+    std::fs::create_dir_all(w.join("sub")).unwrap();
+    let helper = w.write("sub/util.c", "int fb(void){return 4;}\n");
+    let obj = w.join("util.o");
+    let r = run_c17(&["-c", &s(&helper), "-o", &s(&obj)]);
+    assert!(
+        r.success,
+        "compiling the helper failed: {}{}",
+        r.stdout, r.stderr
+    );
+
+    let main = w.write("util.c", "int fb(void);int main(void){return fb()+3;}\n");
+    let exe = w.join("mixed");
+    let r = run_c17(&[&s(&main), &s(&obj), "-o", &s(&exe)]);
+    assert!(
+        r.success,
+        "source and object sharing a stem must not collide: {}{}",
+        r.stdout, r.stderr
+    );
+    assert_eq!(run_exe(&exe), 7);
+}

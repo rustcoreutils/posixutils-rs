@@ -212,3 +212,157 @@ fn c99_complex_argument_register_accounting() {
     "#;
     assert_eq!(compile_and_run("c99_complex_reg_accounting", src, &[]), 0);
 }
+
+// ============================================================================
+// Value-versus-address regressions found in review of the #C1/#C2 fix
+// ============================================================================
+
+/// A complex object's stack slot *is* its storage, but a temporary's slot
+/// holds a pointer to it. The #C1/#C2 fix switched the complex paths from
+/// `linearize_lvalue` to `linearize_expr` to make rvalues work, and applied
+/// the `is_lvalue` guard on the argument path but not on assignment — so
+/// `g = w` between two complex variables loaded the float bits and used them
+/// as the source address.
+#[test]
+fn c99_complex_assignment_between_lvalues() {
+    let src = r#"
+        static float _Complex fg;
+        static double _Complex dg;
+        static long double _Complex lg;
+        struct box { double _Complex z; };
+
+        static void store(double _Complex a, double _Complex *p) { *p = a; }
+
+        int main(void) {
+            /* variable -> global, each base type */
+            float _Complex fw = __builtin_complex(1.0f, 2.0f);
+            fg = fw;
+            float *pf = (float *)&fg;
+            if (pf[0] != 1.0f || pf[1] != 2.0f) return 1;
+
+            double _Complex dw = __builtin_complex(3.0, 4.0);
+            dg = dw;
+            double *pd = (double *)&dg;
+            if (pd[0] != 3.0 || pd[1] != 4.0) return 2;
+
+            long double _Complex lw = __builtin_complex(5.0L, 6.0L);
+            lg = lw;
+            long double *pl = (long double *)&lg;
+            if (pl[0] != 5.0L || pl[1] != 6.0L) return 3;
+
+            /* through a pointer, i.e. `*p = a` */
+            double _Complex out;
+            store(dw, &out);
+            double *po = (double *)&out;
+            if (po[0] != 3.0 || po[1] != 4.0) return 4;
+
+            /* from a struct member, and back into one */
+            struct box b;
+            b.z = dw;
+            double _Complex fromMember = b.z;
+            double *pm = (double *)&fromMember;
+            if (pm[0] != 3.0 || pm[1] != 4.0) return 5;
+
+            /* from a dereference */
+            double _Complex *q = &dw;
+            double _Complex deref = *q;
+            double *pq = (double *)&deref;
+            if (pq[0] != 3.0 || pq[1] != 4.0) return 6;
+            return 0;
+        }
+    "#;
+    assert_eq!(compile_and_run("c99_complex_assign_lvalue", src, &[]), 0);
+}
+
+/// The same value-versus-address confusion on the `return` path: returning a
+/// complex *rvalue* (the result of a call, or of arithmetic) must not ask for
+/// its address as though it were a variable.
+#[test]
+fn c99_complex_return_of_an_rvalue() {
+    let src = r#"
+        static double _Complex mk(double a, double b) {
+            return __builtin_complex(a, b);
+        }
+        /* returns the result of another call — an rvalue */
+        static double _Complex fwd(void) { return mk(3.0, 4.0); }
+        /* returns the result of arithmetic — also an rvalue */
+        static double _Complex sum(double _Complex x, double _Complex y) {
+            return x + y;
+        }
+        static float _Complex fmk(float a, float b) {
+            return __builtin_complex(a, b);
+        }
+        static float _Complex ffwd(void) { return fmk(1.5f, 2.5f); }
+        static long double _Complex lmk(long double a, long double b) {
+            return __builtin_complex(a, b);
+        }
+        static long double _Complex lfwd(void) { return lmk(7.0L, 8.0L); }
+
+        int main(void) {
+            double _Complex r = fwd();
+            double *p = (double *)&r;
+            if (p[0] != 3.0 || p[1] != 4.0) return 1;
+
+            double _Complex s = sum(__builtin_complex(1.0, 2.0),
+                                    __builtin_complex(10.0, 20.0));
+            p = (double *)&s;
+            if (p[0] != 11.0 || p[1] != 22.0) return 2;
+
+            float _Complex fr = ffwd();
+            float *pf = (float *)&fr;
+            if (pf[0] != 1.5f || pf[1] != 2.5f) return 3;
+
+            long double _Complex lr = lfwd();
+            long double *pl = (long double *)&lr;
+            if (pl[0] != 7.0L || pl[1] != 8.0L) return 4;
+            return 0;
+        }
+    "#;
+    assert_eq!(compile_and_run("c99_complex_return_rvalue", src, &[]), 0);
+}
+
+/// A complex argument that does not fit in the remaining FP registers is
+/// passed in memory. Both halves have to agree: the caller must write the
+/// value to the stack, and the callee's prologue must copy it into the local.
+/// Previously the prologue's register guard simply skipped the copy when the
+/// value had spilled, leaving the parameter uninitialized, and shifted every
+/// argument after it.
+#[test]
+fn c99_complex_argument_spilled_to_the_stack() {
+    let src = r#"
+        static double wide(double a, double b, double c, double d,
+                           double e, double f, double g, double h,
+                           double _Complex z, double after) {
+            double *p = (double *)&z;
+            return a + b + c + d + e + f + g + h
+                 + p[0] * 100.0 + p[1] * 1000.0 + after;
+        }
+        /* Seven doubles leave one XMM free — not enough for a two-eightbyte
+           complex, so it goes to memory while `after` still gets a register. */
+        static double straddle(double a, double b, double c, double d,
+                               double e, double f, double g,
+                               double _Complex z, double after) {
+            double *p = (double *)&z;
+            return a + b + c + d + e + f + g
+                 + p[0] * 100.0 + p[1] * 1000.0 + after;
+        }
+        static float narrow(float a, float b, float c, float d,
+                            float e, float f, float g, float h,
+                            float _Complex z, float after) {
+            float *p = (float *)&z;
+            return a + b + c + d + e + f + g + h
+                 + p[0] * 100.0f + p[1] * 1000.0f + after;
+        }
+
+        int main(void) {
+            if (wide(1, 1, 1, 1, 1, 1, 1, 1,
+                     __builtin_complex(2.0, 3.0), 5.0) != 3213.0) return 1;
+            if (straddle(1, 1, 1, 1, 1, 1, 1,
+                         __builtin_complex(2.0, 3.0), 5.0) != 3212.0) return 2;
+            if (narrow(1, 1, 1, 1, 1, 1, 1, 1,
+                       __builtin_complex(2.0f, 3.0f), 5.0f) != 3213.0f) return 3;
+            return 0;
+        }
+    "#;
+    assert_eq!(compile_and_run("c99_complex_arg_spilled", src, &[]), 0);
+}

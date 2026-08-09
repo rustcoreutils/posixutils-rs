@@ -236,3 +236,37 @@ fn c17_trigraphs_affect_string_literals_only_when_enabled() {
         "without --trigraphs the ?? must survive verbatim"
     );
 }
+
+/// `u"..."` / `U"..."` initializing an *automatic* array. The static and
+/// pointer forms were covered; the local-declaration path has its own
+/// initializer chain, and with no arm for these it fell through to the scalar
+/// case and stored the literal's address into the array's first element.
+#[test]
+fn c11_local_array_from_utf16_and_utf32_literals() {
+    // Spelled with the underlying types rather than `char16_t`/`char32_t`,
+    // because those come from <uchar.h>, which is not in the bundled set and
+    // is not present on every host SDK. What is under test is the array
+    // initializer path, not the typedef.
+    let src = r#"
+        int main(void) {
+            unsigned short a[] = u"hi";
+            if (a[0] != 0x68 || a[1] != 0x69 || a[2] != 0) return 1;
+
+            unsigned int b[] = U"hi";
+            if (b[0] != 0x68 || b[1] != 0x69 || b[2] != 0) return 2;
+
+            /* an explicit bound, and a non-ASCII code point */
+            unsigned short c[4] = u"aé";
+            if (c[0] != 0x61 || c[1] != 0x00e9 || c[2] != 0 || c[3] != 0) return 3;
+
+            unsigned int d[3] = U"éz";
+            if (d[0] != 0x00e9 || d[1] != 0x7a || d[2] != 0) return 4;
+
+            /* the narrow and wide forms must keep working alongside them */
+            char n[] = "hi";
+            if (n[0] != 'h' || n[2] != 0) return 5;
+            return 0;
+        }
+    "#;
+    assert_eq!(compile_and_run("c11_local_utf_array", src, &[]), 0);
+}

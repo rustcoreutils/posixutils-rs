@@ -298,3 +298,122 @@ fn diagnostics_preexisting_constraints_still_fire() {
         "read-only",
     );
 }
+
+// ============================================================================
+// Regressions found in review: checks that fired on legal code
+// ============================================================================
+
+/// #L1's implicit-int check is driven by a parser-wide `saw_explicit_type`
+/// flag. The struct/union/enum/typeof arms of `parse_type_specifier` return
+/// early without setting it, so a specifier-less call — a K&R identifier list,
+/// whose undeclared parameters have type `int` by C17 6.9.1p6 — left the flag
+/// false and the *next* declaration inherited the complaint.
+#[test]
+fn diagnostics_kr_parameter_list_does_not_poison_the_next_declaration() {
+    compile_expect_ok(
+        "kr_then_struct",
+        "struct S { int a; };\n\
+         int f(a) { return a; }\n\
+         struct S s;\n\
+         int main(void){ s.a = f(1); return s.a - 1; }\n",
+    );
+    // The same staleness via enum, union, and a typedef'd name.
+    compile_expect_ok(
+        "kr_then_enum",
+        "enum E { E0 };\nint f(a) { return a; }\nenum E e;\nint g(void){ return (int)e; }\n",
+    );
+    compile_expect_ok(
+        "kr_then_union",
+        "union U { int a; };\nint f(a) { return a; }\nunion U u;\nint g(void){ return u.a; }\n",
+    );
+}
+
+/// #X4 compares a typedef against whatever `lookup_id` finds, which is the
+/// innermost *visible* binding in any enclosing scope. Shadowing a file-scope
+/// typedef inside a block is legal C, not a redefinition.
+#[test]
+fn diagnostics_typedef_may_be_shadowed_in_an_inner_scope() {
+    compile_expect_ok(
+        "typedef_shadow_block",
+        "typedef int T;\nint main(void){ typedef double T; T x = 1.5; return x == 1.5 ? 0 : 1; }\n",
+    );
+    // Nested blocks, and a shadow that reverts when the scope closes.
+    compile_expect_ok(
+        "typedef_shadow_nested",
+        "typedef int T;\n\
+         int main(void){\n\
+           { typedef char T; T c = 'a'; if (sizeof(T) != 1) return 1; }\n\
+           { typedef double T; if (sizeof(T) != 8) return 2; }\n\
+           return sizeof(T) == sizeof(int) ? 0 : 3;\n\
+         }\n",
+    );
+    // A function parameter may also shadow a file-scope typedef name.
+    compile_expect_ok(
+        "typedef_shadow_param",
+        "typedef int T;\nint f(int T){ return T; }\nint main(void){ return f(0); }\n",
+    );
+    // ...but a genuine same-scope conflict must still be caught.
+    compile_expect_error(
+        "typedef_conflict_same_scope",
+        "typedef int T;\ntypedef double T;\n",
+        "incompatible type",
+    );
+}
+
+/// #L3 rejected every `return expr;` in a void function. C17 6.8.6.4p1 forbids
+/// returning a *value*; an expression of type `void` has none, and
+/// `return f();` where `f` returns void is the ordinary tail-call wrapper.
+#[test]
+fn diagnostics_return_of_a_void_expression_is_accepted() {
+    compile_expect_ok(
+        "return_void_call",
+        "static int n;\nstatic void inner(void){ n = 1; }\n\
+         static void outer(void){ return inner(); }\n\
+         int main(void){ outer(); return n - 1; }\n",
+    );
+    // A cast to void, and a comma expression ending in one.
+    compile_expect_ok(
+        "return_void_cast",
+        "static int n;\nvoid f(void){ return (void)n; }\n",
+    );
+    compile_expect_ok(
+        "return_void_conditional",
+        "static void a(void); static void b(void);\n\
+         void f(int c){ return c ? a() : b(); }\n\
+         static void a(void){} static void b(void){}\n",
+    );
+    // Returning an actual value from void is still an error.
+    compile_expect_error(
+        "return_int_from_void",
+        "void f(void){ return 1; }\n",
+        "'return' with a value in a function returning void",
+    );
+}
+
+/// #L2's "not an integer constant expression" fires wherever `eval_const_expr`
+/// returns nothing — but that evaluator is partial, so its gaps became compile
+/// errors on valid labels. What it cannot fold it must not condemn.
+#[test]
+fn diagnostics_foldable_case_labels_are_accepted() {
+    compile_expect_ok(
+        "case_cast_from_double",
+        "int f(int x){ switch(x){ case (int)2.0: return 13; default: return 0; } }\n",
+    );
+    compile_expect_ok(
+        "case_cast_from_float_expr",
+        "int f(int x){ switch(x){ case (int)(1.5 * 2.0): return 1;\n\
+         case (int)'a': return 2; default: return 0; } }\n",
+    );
+    compile_expect_ok(
+        "case_enum_and_arithmetic",
+        "enum E { A = 3, B };\n\
+         int f(int x){ switch(x){ case A: return 1; case B + 1: return 2;\n\
+         case sizeof(int): return 3; default: return 0; } }\n",
+    );
+    // A label naming a runtime variable is still rejected.
+    compile_expect_error(
+        "case_runtime_value",
+        "int f(int x, int y){switch(x){case y: return 1;} return 0;}\n",
+        "not an integer constant expression",
+    );
+}

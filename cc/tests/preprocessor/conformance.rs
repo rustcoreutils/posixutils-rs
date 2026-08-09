@@ -700,3 +700,36 @@ fn preprocessor_output_with_markers_still_compiles() {
     let out = std::process::Command::new(&exe).output().unwrap();
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ok");
 }
+
+/// C17 6.10.3.2p2: `#` produces a literal whose spelling is the argument's
+/// original spelling — white space between tokens collapses to one space, and
+/// white space that was not there does not appear. `stringify_arg` inserted a
+/// separator between every pair of tokens, which the direct form hid (its
+/// tokens still carried their source spacing) but the two-level
+/// `XSTR(x)`/`STR(x)` idiom exposed, since the inner argument arrives already
+/// expanded.
+#[test]
+fn c17_nested_stringification_preserves_spelling() {
+    let r = preprocess_text(
+        "c17_nested_stringify",
+        "#define STR(x) #x\n\
+         #define XSTR(x) STR(x)\n\
+         #define VER 1\n\
+         direct STR(1+2)\n\
+         nested XSTR(1+2)\n\
+         index  XSTR(a[0]+b[1])\n\
+         call   XSTR(f(1,2))\n\
+         expand XSTR(VER)\n\
+         spaced XSTR( 1  +  2 )\n",
+        &[],
+    );
+    assert!(r.success, "{}", r.stderr);
+    assert_has(&r.stdout, "direct \"1+2\"", "direct stringification");
+    assert_has(&r.stdout, "nested \"1+2\"", "nested stringification");
+    assert_has(&r.stdout, "index \"a[0]+b[1]\"", "nested with subscripts");
+    assert_has(&r.stdout, "call \"f(1,2)\"", "nested with a call");
+    assert_has(&r.stdout, "expand \"1\"", "argument macro-expanded first");
+    // Interior white space collapses to exactly one space; leading and
+    // trailing are deleted.
+    assert_has(&r.stdout, "spaced \"1 + 2\"", "interior space collapses");
+}

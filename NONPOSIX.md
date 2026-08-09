@@ -4,14 +4,15 @@ posixutils-rs takes POSIX.1-2024 (IEEE Std 1003.1-2024) as its baseline
 specification, then adds only the non-POSIX behavior that users cannot live
 without.  It is *not* a goal to be compatible with GNU utilities.
 
-This document is the complete inventory of what we ship beyond the standard:
-extra utilities, extra options, language and syntax extensions, extra
-environment variables, extra file formats, and the notable choices we have made
-where POSIX leaves behavior unspecified.
+This document covers two things: **additions** — utilities, options,
+environment variables, syntax and formats that POSIX does not define at all —
+and **deviations** — places where we behave differently from what POSIX
+specifies.
 
-Anything not listed here is intended to be plain POSIX.  Per-utility
-conformance detail lives in the `audit.md` file of each crate
-(`text/audit.md`, `tree/audit.md`, and so on).
+It does not record our choices in the areas POSIX leaves unspecified or
+implementation-defined, nor unimplemented corners of the standard.  Those are
+tracked per utility in the `audit.md` file of each crate (`text/audit.md`,
+`tree/audit.md`, and so on).
 
 ## Utilities beyond POSIX
 
@@ -32,7 +33,7 @@ POSIX utilities that have no binary of their own — `cd`, `read`, `umask`,
 
 ## Project-wide conventions
 
-Two extensions apply across nearly the whole suite and are not repeated per
+Two additions apply across nearly the whole suite and are not repeated per
 utility below:
 
  * **Long-option aliases.**  Most utilities accept a GNU-style long option as
@@ -47,11 +48,6 @@ utility below:
 
 ## Extensions by utility
 
-### asa
-
- * A `<hyphen>` in the carriage-control column triples the line spacing.  POSIX
-   leaves unrecognized control characters unspecified.
-
 ### at
 
  * `AT_ALLOW`, `AT_DENY` — override the `at.allow` / `at.deny` pathnames.
@@ -64,17 +60,13 @@ utility below:
  * C-style floating-point literal suffixes `f`, `l`, `F`, `L` are accepted in
    awk source.
  * `RS` accepts a multi-character string or a regular expression.  POSIX
-   defines only the first character (and `""` for paragraph mode).
- * `FS=""` and `split(s, a, "")` split into individual characters.
- * `cmd | getline` advances `NR`.
- * Division or modulo by zero yields an IEEE `inf` / `nan` rather than an
-   error.
+   defines only the first character.
 
 ### bc
 
  * Interactive line editing and command history.
- * Numbers are 128-bit fixed-width integers, not arbitrary precision;
-   overflow is an error.  `BC_SCALE_MAX` and `BC_BASE_MAX` report `2147483647`.
+ * Numbers are 128-bit fixed-width integers, and overflow is an error.  POSIX
+   requires arbitrary precision.
 
 ### c17
 
@@ -99,7 +91,7 @@ Options beyond the POSIX set (`-B -c -D -E -G -g -I -L -l -O -o -R -s -U`):
  * A bare `-` operand is accepted as a pathname.  POSIX says standard input is
    "Not used".
 
-Language and preprocessor extensions:
+Language and preprocessor additions:
 
  * `__attribute__` (and `__attribute`), with `noreturn unused aligned packed
    deprecated weak section visibility constructor destructor used noinline
@@ -128,18 +120,10 @@ Language and preprocessor extensions:
  * `__GNUC__`, `__GNUC_MINOR__`, `__GNUC_PATCHLEVEL__`, `__VERSION__` and
    `__GNUC_STDC_INLINE__` are predefined.
  * On Linux, `_GNU_SOURCE`, `_XOPEN_SOURCE=800` and `_XOPEN_SOURCE_EXTENDED`
-   are predefined unconditionally.  POSIX only encourages restricting symbol
-   visibility.
+   are predefined unconditionally.
 
-Deliberate limits, for completeness: `-std=` is accepted and discarded —
-`__STDC_VERSION__` is always `201112L` — and `__STDC_IEC_559_COMPLEX__` is left
-undefined rather than falsely claiming Annex G.
-
-### chmod
-
- * A symbolic or fewer-than-five-digit octal mode preserves the set-user-ID and
-   set-group-ID bits on directories.  POSIX leaves set-ID handling on
-   non-regular files implementation-defined.
+Deviation: `-std=` is accepted and discarded — `__STDC_VERSION__` is always
+`201112L`, not the `201710L` the utility's name implies.
 
 ### chown
 
@@ -149,20 +133,17 @@ undefined rather than falsely claiming Annex G.
 ### compress / uncompress / zcat
 
  * A `-` operand names standard input.  The `compress` spec never mentions it.
- * `uncompress` looks for `file`, then `file.Z`, then `file.gz`.  POSIX permits
-   additional suffixes.
+ * `uncompress` looks for `file`, then `file.Z`, then `file.gz`.
 
 ### cp
 
  * `-r` is accepted as a short alias for `-R`.  POSIX.1-2024 removed `-r`.
  * A `source/.` operand copies the contents of `source` rather than the
    directory itself.
- * `-H` and `-L` require `-R`.
- * Destination special files are created mode `0644`.
 
 ### cpio
 
-The whole utility is an extension: a compatibility front-end over `pax`
+The whole utility is an addition: a compatibility front-end over `pax`
 accepting the historic cpio command line.
 
  * Modes `-o`, `-i`, `-p`; options `-t -v -d -m -u -a -l -L -f -r -A -0 -B -E
@@ -175,7 +156,7 @@ accepting the historic cpio command line.
 
 ### crond
 
-The whole daemon is an extension; POSIX specifies `crontab`, `at` and `batch`
+The whole daemon is an addition; POSIX specifies `crontab`, `at` and `batch`
 but no daemon to run them.  Behavior follows Vixie cron:
 
  * `@reboot`, `@yearly`, `@annually`, `@monthly`, `@weekly`, `@daily`,
@@ -183,9 +164,6 @@ but no daemon to run them.  Behavior follows Vixie cron:
  * Step syntax `*/N` and `min-max/N` in any field.
  * `NAME=value` environment assignments inside crontab files.
  * A six-field system crontab at `/etc/crontab` carrying a user-name column.
-
-Note that day-of-week `7` for Sunday and the `sun` / `mon` name forms are
-deliberately *not* accepted.
 
 ### crontab
 
@@ -201,7 +179,7 @@ deliberately *not* accepted.
 ### df
 
  * Failure to enumerate a mounted filesystem does not set a non-zero exit
-   status, matching GNU coreutils.
+   status.
 
 ### diff
 
@@ -209,9 +187,8 @@ deliberately *not* accepted.
 
 ### echo
 
- * A first operand of `-n` suppresses the trailing newline *and* XSI backslash
-   escapes are still processed — the BSD and System V behaviors combined.
-   POSIX makes a leading `-n` implementation-defined.
+ * A first operand of `-n` suppresses the trailing newline.  XSI backslash
+   escapes are still processed.  POSIX gives `echo` no options.
 
 ### ed
 
@@ -229,7 +206,7 @@ deliberately *not* accepted.
 ### gettext / ngettext
 
  * `LANGUAGE` — a colon-separated locale priority list, honored ahead of the
-   `LC_*` variables.  A GNU gettext extension.
+   `LC_*` variables.
 
 ### kill
 
@@ -245,14 +222,15 @@ deliberately *not* accepted.
 ### localedef
 
  * `-v` — verbose.
- * `-u code_set_name` — accepted but has no effect.
 
 ### lp
 
- * The destination is an IPP URI.  There is no CUPS integration, no local
-   spool directory, no `/dev/lp` device and no default-printer concept; POSIX
-   leaves the destination format, queuing and device unspecified.
- * `ipps://` (IPP over TLS) is not supported, to avoid a TLS dependency.
+ * `lp` is a thin IPP client.  There is no CUPS integration, no local spool
+   directory and no `/dev/lp` device.  A destination given to `-d`, `LPDEST`
+   or `PRINTER` is either an `ipp://` URI used verbatim, or a bare printer
+   name resolved against the local IPP server as
+   `ipp://localhost/printers/<name>`; with none of the three set, the
+   destination is `ipp://localhost/printers/default`.
  * `USER`, `LOGNAME` — used for the job originator.
  * `LP_SENDMAIL` — the program invoked for `-m`.
 
@@ -262,10 +240,7 @@ deliberately *not* accepted.
  * `maketemp` — accepted as an alias for `mkstemp`.  POSIX.1-2024 removed
    `maketemp`; here it creates and closes a file, unlike the historical macro.
  * `eval` accepts `0b` / `0B` binary literals.
- * Diversion numbers greater than 9 are supported.  POSIX calls these
-   implementation-defined.
- * Diversions are buffered in memory rather than in temporary files.
- * Errors exit non-zero.  GNU m4 exits 0.
+ * Diversion numbers greater than 9.
 
 ### make
 
@@ -274,54 +249,33 @@ deliberately *not* accepted.
    POSIX.
  * `export` directive.  POSIX mentions it only in the rationale.
  * `:=` assignment.  POSIX defines `=`, `::=`, `:::=`, `!=`, `?=` and `+=`.
- * `-p` output is a structured debug dump; POSIX leaves the format
-   unspecified.
-
-`PROJECTDIR` and runtime `.SCCS_GET` retrieval — both optional XSI features —
-are not implemented.
 
 ### man
 
-POSIX specifies only `-k`.  Every other option is an extension:
+POSIX specifies only `-k`.  Every other option is an addition:
 
  * `-a` / `--all`, `-C` / `--config-file`, `-c` / `--copy`, `-f` / `--whatis`,
    `-h` / `--synopsis`, `-l` / `--local-file`, `-M` (replace the search path),
    `-m` (augment it), `-S` (architecture), `-s` (section), `-w` (list
    pathnames), and `--apropos` as a long form of `-k`.
- * `MANPATH`, `MACHINE`, `COLUMNS` — the rationale explicitly excludes
-   `MANPATH` from POSIX.
+ * `MANPATH`, `MACHINE`, `COLUMNS`.
  * `MAN_BLESS` — regenerates test snapshots; test tooling only.
-
-roff programmability (`.if`, `.ie`, `.de`, `.nr`, `.ds`, `.so`) and tbl
-spanning / box drawing are deliberately out of scope.
 
 ### more
 
  * `-d` / `--test` — hidden test hook.
  * Input is decoded as UTF-8 regardless of `LC_CTYPE`, so text stays readable
    under `LC_ALL=C`.
- * A literal `<backslash>` is not escaped in the non-printable display; POSIX
-   scopes escaping to non-printable characters.
- * `<tab>` expands to 8-column stops.
 
 ### newgrp
 
  * `SHELL` is consulted for the shell to exec.  POSIX derives it from the user
    database.
- * A `-` operand reports "no such group" and then execs the shell anyway.
-   POSIX leaves `-` unspecified here.
 
 ### nm
 
  * Symbol type letters `C` (common) and `r` (read-only data), beyond the
    letters POSIX names.
-
-### od
-
- * `-c` and `-t c` render each byte as a C escape rather than attempting
-   multibyte character rendering.
- * `-t f` uses Rust's default floating-point field width.  POSIX leaves the
-   width implementation-defined.
 
 ### patch
 
@@ -339,21 +293,16 @@ spanning / box drawing are deliberately out of scope.
    binary cpio header and the SVR4 "newc" headers without and with a data
    checksum.  POSIX names only `cpio` (odc), `pax` and `ustar`.  All three are
    readable and writable, and the cpio reader auto-detects any of them.
- * The cpio `TRAILER!!!` record carries `c_mode=100644`; GNU cpio writes
-   `000000`.  Readers key off the name, not the mode.
 
 ### pr
 
  * `-N number` / `--first-line-number number` — start line counting at
    `number`.
  * `--prettify-headers`.
- * `-i` is not implicitly assumed for multi-column output, matching GNU `pr`
-   byte for byte.
 
 ### printf
 
- * The `%a`, `%A`, `%e`, `%E`, `%f`, `%F`, `%g` and `%G` conversions.  POSIX
-   encourages but does not require them.
+ * The `%a`, `%A`, `%e`, `%E`, `%f`, `%F`, `%g` and `%G` conversions.
 
 ### prs
 
@@ -362,7 +311,7 @@ spanning / box drawing are deliberately out of scope.
 ### readlink
 
  * `-f` — canonicalize the whole path, resolving every component.  POSIX
-   defines only `-n`.  Symlink chains are bounded at 40 links.
+   defines only `-n`.
  * `-v` — accepted, no effect.
 
 ### realpath
@@ -379,38 +328,24 @@ spanning / box drawing are deliberately out of scope.
 
 ### sed
 
- * The `I` command — a non-POSIX variant of `l`, sharing the same octal escape
-   renderer.
+ * The `I` command — a non-POSIX variant of `l`.
  * `PROJECT_NAME` — selects the gettext text domain.
-
-Note that address `0` is rejected: the GNU `0,/re/` form is not implemented.
 
 ### sh
 
  * `PS1`, `PS2` and `PS4` undergo full expansion.  POSIX specifies parameter
    expansion only.
- * `PS1` defaults to `\$ `, using the bash-style prompt escape rather than a
-   literal `$ `.
+ * `PS1` defaults to `\$ `, using the bash-style prompt escape rather than the
+   literal `$ ` POSIX specifies.
  * `$(( x ))` recursively evaluates the *value* of `x` as an arithmetic
    expression, matching bash.  With `x=1+2` the result is `3`.
  * `break` and `continue` outside any loop are non-fatal no-ops, matching dash
-   and bash, rather than a shell-aborting special-builtin error.
- * `cd ""` is an error — stricter than bash and dash (Austin Group Defect
-   1047).
- * `set -u` on an unset parameter exits 1, not bash's 127.
-
-### sort
-
- * `-d`, `-i` and `-n` may be combined freely.
+   and bash, rather than the shell-aborting special-builtin error POSIX
+   requires.
 
 ### split
 
  * A `g` suffix on the `-b` argument.  POSIX defines `k` and `m`.
-
-### tabs
-
- * `--rep-0`, `--a2`, `--c2` and `--c3` are the spellings used for the POSIX
-   `-0`, `-a2`, `-c2` and `-c3` options.
 
 ### talk
 
@@ -420,20 +355,16 @@ Note that address `0` is rejected: the GNU `0,/re/` form is not implemented.
 
 ### talkd
 
-The whole daemon is an extension.  Notable properties:
+The whole daemon is an addition.
 
  * It serves the BSD ntalk control protocol over a Unix-domain datagram socket
    (default `/var/run/talkd.sock`), not UDP port 518.  It is therefore *not*
    interoperable with stock or remote `talk` clients.
  * `-s` / `--socket`, `-f` / `--foreground`, `--invite-timeout`.
- * It performs no privileged operation and is not meant to run as root, so it
-   contains no `setuid` / `setgid` privilege drop.
- * It honors the recipient's `mesg n` setting even when running as root.
- * Error replies are rate-limited globally (burst 8, 8/s).
 
 ### tar
 
-The whole utility is an extension: a compatibility front-end over `pax`
+The whole utility is an addition: a compatibility front-end over `pax`
 accepting the historic tar command line, deliberately a smaller subset than
 GNU tar.
 
@@ -441,7 +372,6 @@ GNU tar.
    `--format=`, `--exclude=`, `--exclude-from=`, `--strip-components=`,
    `--null`, `--no-recursion`, `--same-owner` / `--no-same-owner`, plus the
    long spellings and the old-style bundled first operand.
- * `-t -v` uses the `ls -l` listing layout.
  * `-j`, `-J` and `-Z` are refused; `-P` / `--absolute-names` is refused on
    extract; only a single `-C` is accepted; `-A`, `-w`, `-S` and `-W` are
    refused.  All refusals are diagnosed rather than ignored.
@@ -450,14 +380,7 @@ GNU tar.
 
  * `-ef`, `-nt` and `-ot` binary primaries.
  * The `-a` and `-o` operators and `(` / `)` grouping, which POSIX.1-2024
-   removed.  These work uniformly across the three-, four- and
-   more-than-four-argument forms; POSIX leaves behavior above four arguments
-   unspecified.
-
-### uniq
-
- * `-c` combined with `-d` or `-u` is a hard error rather than an unspecified
-   combination.
+   removed.
 
 ### uucp / uux / uustat
 
@@ -466,22 +389,19 @@ GNU tar.
  * `UUCP_SPOOL` — override the spool directory.
  * A remote `~user` path is not expanded: remote paths are single-quoted before
    being handed to SSH, which also defeats remote globbing.
- * Multi-hop `a!b!path` routes are diagnosed and refused; store-and-forward
-   routing is obsolete.
+ * Multi-hop `a!b!path` routes are diagnosed and refused.
 
 No `uucp`, `uux` or `uustat` *options* are extensions.
 
 ### vi / ex
 
- * `+command` — an initial ex command.  Historical, not in the SYNOPSIS.
+ * `+command` — an initial ex command.
  * `-s` and `-v` are accepted by `vi`; POSIX defines them for `ex` only.
  * `set expandtab` / `et`, and `set backup`.
  * The ex commands `:pwd`, `:prev` / `:previous`, `:red` / `:redo`,
    `:po` / `:pop`, `:tags`, and `:h` / `:help`.
  * `COLUMNS`, `LINES` and `TMPDIR` are consulted.  POSIX names `EXINIT`,
    `HOME`, `SHELL` and `TERM`.
- * `TERM` is read but no terminfo lookup is performed; the editor drives the
-   terminal itself.
 
 ### who
 
@@ -490,8 +410,7 @@ No `uucp`, `uux` or `uustat` *options* are extensions.
 ### xgettext
 
  * Rust (`.rs`) source files are parsed for translatable strings in addition to
-   C.  The spec covers C-language source only.  This is what builds this
-   project's own message catalogs.
+   C.
 
 ### yacc
 

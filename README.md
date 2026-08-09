@@ -86,8 +86,8 @@ POSIX-specified utilities and are not extensions: `ex` -> vi, and
 `zcat` / `uncompress` -> compress.
 
 See [NONPOSIX.md](NONPOSIX.md) for the full inventory of non-POSIX extensions:
-extra options, language and syntax extensions, environment variables, file
-formats, and our choices where POSIX leaves behavior unspecified.
+extra options, language and syntax extensions, environment variables and file
+formats, plus the places where we deviate from what POSIX specifies.
 
 ## Installation
 

@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::os::signals::Signal;
+use crate::os::signals::{Signal, TermSignal};
 use crate::os::{waitpid, OsResult, Pid, WaitStatus};
 use std::fmt::{Display, Formatter, Write};
 
@@ -32,7 +32,7 @@ impl Display for JobPosition {
 pub enum JobState {
     Done(libc::c_int),
     /// Terminated by a signal (must display distinctly and name the signal).
-    Signaled(Signal),
+    Signaled(TermSignal),
     Running,
     Stopped,
 }
@@ -155,7 +155,7 @@ impl JobManager {
                     job.state_should_be_reported = true;
                 }
                 WaitStatus::Signaled { signal, .. } => {
-                    if signal == Signal::SigStop {
+                    if signal.is(Signal::SigStop) {
                         job.state = JobState::Stopped;
                     } else {
                         job.state = JobState::Signaled(signal);

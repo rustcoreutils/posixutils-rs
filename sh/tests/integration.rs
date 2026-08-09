@@ -1889,4 +1889,163 @@ mod audit_regressions {
         test_script("case m in [a-z]) echo M;; *) echo NO;; esac\n", "M\n");
         test_script("case 5 in [[:digit:]]) echo M;; *) echo NO;; esac\n", "M\n");
     }
+
+    // ----- Phase 1 (round 2): remaining process-aborting panics -----
+
+    #[test]
+    fn here_document_allows_trailing_tokens_on_the_same_line() {
+        // The here-document body starts on the *next* line; whatever follows
+        // the delimiter on the current line is still part of the command.
+        test_script("cat <<EOF | tr a-z A-Z\nhi\nEOF\n", "HI\n");
+        test_script("cat <<A <<B\nfirst\nA\nsecond\nB\n", "second\n");
+        run_successfully_and(
+            "f=\"$TEST_WRITE_DIR/heredoc_redirect\"; rm -f \"$f\"; \
+             cat <<EOF > \"$f\"\nhi\nEOF\ncat \"$f\"; rm -f \"$f\"\n",
+            |out| assert_eq!(out, "hi\n"),
+        );
+    }
+
+    #[test]
+    fn here_document_delimiter_may_follow_blanks() {
+        // POSIX token recognition: '<<' is an operator, so blanks may separate
+        // it from the delimiter word.
+        test_script("cat << EOF\nhi\nEOF\n", "hi\n");
+        test_script("cat <<\tEOF\nhi\nEOF\n", "hi\n");
+    }
+
+    #[test]
+    fn here_document_dash_strips_tabs_from_terminator() {
+        // `<<-` strips leading tabs from the body *and* from the terminator.
+        test_script("cat <<-EOF\n\thi\n\tEOF\n", "hi\n");
+    }
+
+    #[test]
+    fn here_document_delimiter_split_by_line_continuation() {
+        // A '\'-newline inside the delimiter word is removed like anywhere else.
+        test_script("cat <<EO\\\nF\nhi\nEOF\n", "hi\n");
+    }
+
+    #[test]
+    fn cd_physical_accepts_a_relative_operand() {
+        // `cd -P <relative>` must resolve to an absolute directory; leaving
+        // PWD relative later trips an internal absolute-path invariant.
+        set_env_vars();
+        let dir = Path::new(concat!(env!("CARGO_TARGET_TMPDIR"), "/sh_test_write_dir"))
+            .join("cd_physical_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        run_successfully_and(
+            &format!(
+                "cd '{}' && cd -P sub && pwd && for f in *; do echo \"[$f]\"; done\n",
+                dir.display()
+            ),
+            |out| {
+                assert_eq!(out, format!("{}/sub\n[*]\n", dir.display()));
+            },
+        );
+    }
+
+    #[test]
+    fn interactive_with_non_terminal_stdin_does_not_panic() {
+        // `sh -i` is allowed even when stdin is not a terminal.
+        set_env_vars();
+        run_test_with_checker(
+            TestPlan {
+                cmd: "sh".to_string(),
+                args: vec!["-i".to_string()],
+                stdin_data: "echo hi\nexit 0\n".to_string(),
+                expected_out: String::new(),
+                expected_err: String::new(),
+                expected_exit_code: 0,
+            },
+            |_, output| {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(!stderr.contains("panicked"), "shell panicked: {stderr}");
+                assert!(String::from_utf8_lossy(&output.stdout).contains("hi"));
+            },
+        );
+    }
+
+    #[test]
+    fn case_pattern_may_expand_to_several_fields() {
+        // `$@` still expands to one field per parameter; a pattern is a single
+        // word, so the fields are joined with a space (as dash and bash do).
+        test_script(
+            "set -- a b; case 'a b' in $@) echo M;; *) echo NO;; esac\n",
+            "M\n",
+        );
+        test_script(
+            "set -- a b; case a in $@) echo M;; *) echo NO;; esac\n",
+            "NO\n",
+        );
+        // A case pattern is not field-split, so IFS does not apply to it.
+        test_script(
+            "IFS=,; v='a,b'; case 'a,b' in $v) echo M;; *) echo NO;; esac\n",
+            "M\n",
+        );
+    }
+
+    #[test]
+    fn pipeline_writer_is_signalled_when_the_reader_exits() {
+        // The shell must not keep the last pipe's read end open while waiting
+        // for the writers, or `yes | head` never terminates.
+        run_successfully_and("yes | head -n 3\n", |out| assert_eq!(out, "y\ny\ny\n"));
+        run_successfully_and("yes | head -n 5 | wc -l\n", |out| {
+            assert_eq!(out.trim(), "5")
+        });
+    }
+
+    #[test]
+    fn command_substitution_exceeding_the_pipe_buffer() {
+        // The child blocks writing once the pipe fills, so the shell has to
+        // drain the pipe before waiting for it.
+        run_successfully_and(
+            "x=$(yes 0123456789012345678901234567890123456789 | head -n 20000); echo ${#x}\n",
+            // 20000 lines of 40 characters plus a newline each, less the
+            // trailing newline that command substitution strips.
+            |out| assert_eq!(out, "819999\n"),
+        );
+    }
+
+    #[test]
+    fn command_substitution_drops_nul_bytes() {
+        // A NUL cannot be carried in a shell word; dropping it must not abort
+        // the pattern-matching code paths that use C strings.
+        test_script("x=$(printf 'a\\0b'); echo \"[$x]\"\n", "[ab]\n");
+        test_script(
+            "x=$(printf 'a\\0b'); case \"$x\" in ab) echo M;; *) echo NO;; esac\n",
+            "M\n",
+        );
+        test_script("x=$(printf 'a\\0b'); echo \"[${x#a}]\"\n", "[b]\n");
+    }
+
+    #[test]
+    fn builtin_output_to_an_unwritable_descriptor_does_not_panic() {
+        // stdout redirected to a read-only file: report an error, do not abort.
+        set_env_vars();
+        run_script_with_checker("exec 1</dev/null; export -p\necho done >&2\n", |output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!stderr.contains("panicked"), "shell panicked: {stderr}");
+            assert_ne!(output.status.code(), Some(101));
+        });
+    }
+
+    #[test]
+    fn fc_out_of_range_endpoints_do_not_underflow() {
+        // `fc -l 0` and out-of-range endpoints must clamp, never underflow.
+        // The listing itself depends on $HISTFILE, so only the shell's
+        // survival is asserted here.
+        set_env_vars();
+        for script in [
+            "echo one\necho two\nfc -l 0 >/dev/null 2>&1\necho done\n",
+            "echo one\nfc -l 100 200 >/dev/null 2>&1\necho done\n",
+            "echo one\nfc -l -n 0 500 >/dev/null 2>&1\necho done\n",
+        ] {
+            run_script_with_checker(script, |output| {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(!stderr.contains("panicked"), "shell panicked: {stderr}");
+                assert!(String::from_utf8_lossy(&output.stdout).ends_with("done\n"));
+            });
+        }
+    }
 }

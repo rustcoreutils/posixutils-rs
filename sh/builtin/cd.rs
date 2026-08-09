@@ -162,14 +162,16 @@ impl BuiltinUtility for Cd {
                     curr_path = OsString::from_vec(dir.as_bytes().to_vec());
                 }
 
+                let old_working_dir = std::env::current_dir().map_err(io_err_to_string)?;
+
                 if !handle_dot_dot_physically {
                     if curr_path.as_bytes().first().is_none_or(|c| *c != b'/') {
-                        let mut new_curr_path = shell
-                            .environment
-                            .get_str_value("PWD")
-                            .unwrap_or_default()
-                            .as_bytes()
-                            .to_vec();
+                        // `PWD` is normally absolute, but fall back to the real
+                        // working directory so the result is never relative.
+                        let mut new_curr_path = match shell.environment.get_str_value("PWD") {
+                            Some(pwd) if pwd.starts_with('/') => pwd.as_bytes().to_vec(),
+                            _ => old_working_dir.as_os_str().as_bytes().to_vec(),
+                        };
                         if new_curr_path.last().is_some_and(|c| *c != b'/') {
                             new_curr_path.push(b'/');
                         }
@@ -180,8 +182,16 @@ impl BuiltinUtility for Cd {
                     curr_path = OsString::from_vec(lexical_normalize(curr_path.as_bytes()));
                 }
 
-                let old_working_dir = std::env::current_dir().map_err(io_err_to_string)?;
                 chdir(AsRef::<OsStr>::as_ref(&curr_path)).map_err(io_err_to_string)?;
+                if handle_dot_dot_physically {
+                    // -P: the new working directory is whatever the kernel
+                    // resolved, with symbolic links already followed. `PWD`
+                    // must be absolute, so ask for it rather than reusing the
+                    // (possibly relative) operand.
+                    curr_path = std::env::current_dir()
+                        .map_err(io_err_to_string)?
+                        .into_os_string();
+                }
                 if used_cdpath {
                     opened_files.write_out(format!("{}\n", curr_path.to_string_lossy()));
                 }

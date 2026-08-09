@@ -16,9 +16,9 @@ use crate::cli::terminal::Terminal;
 use crate::jobs::{JobManager, JobState};
 use crate::nonempty::NonEmpty;
 use crate::os::errno::Errno;
-use crate::os::signals::{kill, signal_to_exit_status, Signal, SignalManager};
+use crate::os::signals::{kill, Signal, SignalManager};
 use crate::os::{
-    close, dup2, exec, find_command, fork, getpgid, getpgrp, is_process_in_foreground, pipe,
+    close, dup, dup2, exec, find_command, fork, getpgid, getpgrp, is_process_in_foreground, pipe,
     setpgid, tcsetpgrp, waitpid, ExecError, ForkResult, OsError, OsResult, Pid, WaitStatus,
 };
 use crate::parse::command::{
@@ -38,7 +38,7 @@ use std::collections::HashMap;
 use std::ffi::{CString, OsString};
 use std::fmt::{Display, Formatter};
 use std::fs::File;
-use std::io::{read_to_string, Read};
+use std::io::Read;
 use std::os::fd::{AsRawFd, IntoRawFd};
 use std::path::Path;
 use std::rc::Rc;
@@ -243,14 +243,14 @@ impl Shell {
         loop {
             match waitpid(child_pid, true, true)? {
                 WaitStatus::Exited { exit_status } => return Ok(exit_status),
-                WaitStatus::Signaled { signal, .. } => return Ok(signal_to_exit_status(signal)),
+                WaitStatus::Signaled { signal, .. } => return Ok(signal.exit_status()),
                 WaitStatus::Stopped { signal } => {
                     self.background_jobs.add_job(
                         child_pid,
                         self.last_pipeline_command.clone(),
                         JobState::Stopped,
                     );
-                    return Ok(signal_to_exit_status(signal));
+                    return Ok(signal.exit_status());
                 }
                 WaitStatus::StillAlive => {
                     self.handle_async_events();
@@ -625,7 +625,13 @@ impl Shell {
         ignore_errexit: bool,
     ) -> CommandExecutionResult<i32> {
         let arg = expand_word_to_string(&arg.word, false, self)?;
-        let arg_cstr = CString::new(arg).expect("invalid pattern");
+        // A NUL cannot appear in a C string; treat the value as ending there.
+        let arg_cstr = CString::new(arg).unwrap_or_else(|err| {
+            let pos = err.nul_position();
+            let mut bytes = err.into_vec();
+            bytes.truncate(pos);
+            CString::new(bytes).expect("truncated at the first NUL")
+        });
         for (index, case) in cases.iter().enumerate() {
             let mut matched = false;
             for pattern in &case.pattern {
@@ -812,6 +818,11 @@ impl Shell {
                         self.exit(1);
                     }
 
+                    // Keep a copy of the real stdin: after the last command has
+                    // run, fd 0 still holds the final pipe's read end, and the
+                    // writers upstream would never see EPIPE while this process
+                    // waits for them (`yes | head` would hang forever).
+                    let saved_stdin = dup(libc::STDIN_FILENO).ok();
                     let mut current_stdin = libc::STDIN_FILENO;
                     let mut head_pids = Vec::new();
                     for command in pipeline.commands.head() {
@@ -842,6 +853,12 @@ impl Shell {
                     dup2(current_stdin, libc::STDIN_FILENO)?;
                     let return_status = self.interpret_command(pipeline.commands.last(), false);
                     close(current_stdin)?;
+                    // Drop the pipe's read end from fd 0 as well, so that the
+                    // upstream writers can be signalled and reaped below.
+                    if let Some(saved_stdin) = saved_stdin {
+                        dup2(saved_stdin, libc::STDIN_FILENO)?;
+                        close(saved_stdin)?;
+                    }
                     // Wait for every command in the pipeline to finish (POSIX
                     // requires it), reaping the head commands so they are not
                     // left running as orphans (e.g. `sleep 5 | true`).
@@ -1006,17 +1023,29 @@ impl Shell {
             }
             ForkResult::Parent { child } => {
                 drop(write_pipe);
-                match waitpid(child, false, false)? {
-                    WaitStatus::Exited { .. } | WaitStatus::Signaled { .. } => {
-                        let read_file = File::from(read_pipe);
-                        let mut output = read_to_string(&read_file).unwrap();
-                        let new_len = output.trim_end_matches('\n').len();
-                        output.truncate(new_len);
-                        Ok(output)
-                    }
-                    // no other results possible without specifying flags in waitpid
-                    _ => unreachable!(),
-                }
+                // Drain the pipe *before* waiting: a child whose output exceeds
+                // the pipe buffer blocks in write() until it is read, so
+                // waiting first would deadlock.
+                let mut bytes = Vec::new();
+                File::from(read_pipe)
+                    .read_to_end(&mut bytes)
+                    .map_err(|err| {
+                        CommandExecutionError::ExpansionError(format!(
+                            "command substitution: {err}"
+                        ))
+                    })?;
+                waitpid(child, false, false)?;
+                // The shell represents words as UTF-8 strings; bytes that are
+                // not valid UTF-8 cannot be carried through, so substitute
+                // replacement characters rather than aborting.
+                // POSIX leaves NUL bytes in command output unspecified; drop
+                // them (as bash does) so they cannot reach the pattern and
+                // C-string code paths.
+                bytes.retain(|&b| b != 0);
+                let mut output = String::from_utf8_lossy(&bytes).into_owned();
+                let new_len = output.trim_end_matches('\n').len();
+                output.truncate(new_len);
+                Ok(output)
             }
         }
     }

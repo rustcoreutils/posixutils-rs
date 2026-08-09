@@ -215,7 +215,16 @@ impl OpenedFiles {
                     .map_err(|_| std::io::Error::last_os_error())
                     .map(|_| ())
             }
-            _ => unreachable!(),
+            // The descriptor was closed, or redirected to something that
+            // cannot be written to (a read-only file, a here-document).
+            Some(OpenedFile::ReadFile(_)) | Some(OpenedFile::HereDocument(_)) | None => {
+                Err(std::io::Error::from_raw_os_error(libc::EBADF))
+            }
+            // `exec 1<&0`: writing goes to the shell's stdin descriptor, which
+            // succeeds when it is open for writing too (a terminal).
+            Some(OpenedFile::Stdin) => write(libc::STDIN_FILENO, contents.as_bytes())
+                .map_err(|_| std::io::Error::last_os_error())
+                .map(|_| ()),
         };
         match result {
             Ok(_) => {}

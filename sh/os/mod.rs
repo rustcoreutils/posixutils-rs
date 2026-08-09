@@ -8,7 +8,7 @@
 //
 
 use crate::os::errno::{get_current_errno_value, Errno};
-use crate::os::signals::Signal;
+use crate::os::signals::TermSignal;
 use crate::shell::environment::Environment;
 use crate::shell::opened_files::{OpenedFile, OpenedFiles};
 use std::convert::Infallible;
@@ -106,10 +106,17 @@ pub fn pipe() -> OsResult<(OwnedFd, OwnedFd)> {
     if pipe_result < 0 {
         return Err(OsError::from_current_errno("pipe"));
     }
-    assert_eq!(pipe_result, 0, "invalid result for libc::pipe");
     let fd0 = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
     let fd1 = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
     Ok((fd0, fd1))
+}
+
+pub fn dup(fd: RawFd) -> OsResult<RawFd> {
+    let dup_result = unsafe { libc::dup(fd) };
+    if dup_result < 0 {
+        return Err(OsError::from_current_errno("dup"));
+    }
+    Ok(dup_result)
 }
 
 pub fn dup2(old_fd: RawFd, new_fd: RawFd) -> OsResult<RawFd> {
@@ -122,8 +129,8 @@ pub fn dup2(old_fd: RawFd, new_fd: RawFd) -> OsResult<RawFd> {
 
 pub enum WaitStatus {
     Exited { exit_status: libc::c_int },
-    Signaled { signal: Signal },
-    Stopped { signal: Signal },
+    Signaled { signal: TermSignal },
+    Stopped { signal: TermSignal },
     StillAlive,
 }
 
@@ -145,17 +152,17 @@ pub fn waitpid(pid: Pid, no_hang: bool, untraced: bool) -> OsResult<WaitStatus> 
         let exit_status = libc::WEXITSTATUS(status);
         Ok(WaitStatus::Exited { exit_status })
     } else if libc::WIFSIGNALED(status) {
-        let raw_signal = libc::WTERMSIG(status);
         Ok(WaitStatus::Signaled {
-            signal: Signal::try_from(raw_signal).expect("invalid signal"),
+            signal: TermSignal(libc::WTERMSIG(status)),
         })
     } else if libc::WIFSTOPPED(status) {
-        let raw_stop_signal = libc::WSTOPSIG(status);
         Ok(WaitStatus::Stopped {
-            signal: Signal::try_from(raw_stop_signal).expect("invalid signal"),
+            signal: TermSignal(libc::WSTOPSIG(status)),
         })
     } else {
-        unreachable!()
+        // WIFCONTINUED, or a status this shell does not ask for; the child is
+        // still around, so report it as such rather than aborting.
+        Ok(WaitStatus::StillAlive)
     }
 }
 
@@ -215,14 +222,14 @@ pub fn exec(
         .collect::<Vec<CString>>();
     let mut env_ptr_vec = env.iter().map(|s| s.as_ptr()).collect::<Vec<_>>();
     env_ptr_vec.push(std::ptr::null());
-    let exit_status = unsafe {
+    // execve only returns on failure
+    unsafe {
         libc::execve(
             command.as_ptr(),
             args_ptr_vec.as_ptr(),
             env_ptr_vec.as_ptr(),
         )
     };
-    assert_eq!(exit_status, -1, "invalid return status from execve");
     Err(ExecError::CannotExecute(get_current_errno_value()))
 }
 

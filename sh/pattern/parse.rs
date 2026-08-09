@@ -157,7 +157,14 @@ impl<'w> Parser<'w> {
                     self.chars = lit.chars();
                     self.advance();
                 }
-                _ => panic!("non literal word part in pattern parsing"),
+                ExpandedWordPart::FieldEnd => {
+                    // A pattern is a single word, but `$@` still expands to one
+                    // field per positional parameter; join them with a space,
+                    // as dash and bash do.
+                    self.inside_quoted_string = false;
+                    self.chars = " ".chars();
+                    self.advance();
+                }
             }
         } else {
             self.lookahead = Token::Eof;

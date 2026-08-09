@@ -62,11 +62,10 @@ impl Pattern {
         if self.pattern_string.is_empty() || s.is_empty() {
             return s;
         }
-        assert!(
-            !s.as_bytes().contains(&b'\0'),
-            "trying to match a string containing null"
-        );
+        // A NUL terminates the byte string used for matching, so it cannot be
+        // part of the subject; drop any that slipped in.
         let mut bytes = s.into_bytes();
+        bytes.retain(|&b| b != 0);
         bytes.push(b'\0');
         let mut prefix_end = 0;
         for i in 1..bytes.len() - 1 {
@@ -111,11 +110,10 @@ impl Pattern {
         if self.pattern_string.is_empty() || s.is_empty() {
             return s;
         }
-        assert!(
-            !s.as_bytes().contains(&b'\0'),
-            "trying to match a string containing null"
-        );
+        // A NUL terminates the byte string used for matching, so it cannot be
+        // part of the subject; drop any that slipped in.
         let mut bytes = s.into_bytes();
+        bytes.retain(|&b| b != 0);
         bytes.push(b'\0');
         let mut suffix_start = bytes.len();
         for i in (1..bytes.len() - 1).rev() {

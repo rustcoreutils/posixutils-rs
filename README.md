@@ -16,9 +16,9 @@ normal Rust programs."
 
 Core POSIX specification: https://pubs.opengroup.org/onlinepubs/9699919799/   (Old, free edition.  POSIX.2024 was just released.)
 
-## WANTED:  Volunteers!
+## Volunteers and contributors welcome!
 
-Contributions are welcome!  Developers and non-developers alike, please read [CONTRIBUTING](CONTRIBUTING.md) for details.
+Contributions are welcome!  Developers and non-developers alike, humans and agents, please read [CONTRIBUTING](CONTRIBUTING.md) for details.
 
 **Note:** This project accepts contributions via **GitHub Issues only** (not Pull Requests). See CONTRIBUTING.md for details on this policy.
 
@@ -33,183 +33,43 @@ bloat.
 
 ## Similar projects
 
-A similar project from the author, written in C++, is
-https://github.com/jgarzik/posixutils
-
-A project with more narrow scope, with the aim of GNU coreutils compatibility, is uutils: https://github.com/uutils/coreutils
+A project with more narrow scope, with the aim of GNU coreutils compatibility, is **uutils**: https://github.com/uutils/coreutils
 
 Because it is a FAQ, the major differences between this project and uutils are:
 1. Wider scope:  posixutils is far more ambitious than uutils from a breadth standpoint:  posixutils will include bc, m4, c99 compiler, a cron daemon etc.   uutils is far more limited in the scope of programs covered, mimicing GNU coreutils.
 2. More minimalist:  Each posixutils utility _implementation_ is intentionally more minimalist, intending to avoid the bloat of supporting rarely-used, non-POSIX features.  Our common denominator and baseline is the POSIX spec, then add non-POSIX features that users cannot live without.
 3. Transportable:  Each posixutils utility should look like normal Rust code, easily stand alone with little-or-no deps, and be used in another project.   This project is MIT-licensed, not GPL licensed, to aid in that transportability goal.
 
-## Utility status
+A similar project from the author, written in C++ and the genesis of this project, is https://github.com/jgarzik/posixutils
 
-## Stage 6 - Audited
+## Utilities
 
- - [x] admin (SCCS)
- - [x] ar (Development)
- - [x] asa
- - [x] at (cron cat.)
- - [x] awk
- - [x] basename
- - [x] batch (cron cat.)
- - [x] bc
- - [x] cal
- - [x] cat
- - [x] cflow (Development)
- - [x] chgrp
- - [x] chmod
- - [x] chown
- - [x] cksum
- - [x] cmp
- - [x] comm
- - [x] compress (compress cat.)
- - [x] cp
- - [x] crontab (cron cat.)
- - [x] csplit
- - [x] ctags (Development)
- - [x] cut
- - [x] cxref (Development)
- - [x] date
- - [x] dd
- - [x] delta (SCCS)
- - [x] df
- - [x] diff
- - [x] dirname
- - [x] du
- - [x] echo
- - [x] ed (Editors)
- - [x] env
- - [x] ex (Editors)
- - [x] expand
- - [x] expr
- - [x] false
- - [x] file
- - [x] find
- - [x] fold
- - [x] fuser
- - [x] gencat (i18n)
- - [x] get (SCCS)
- - [x] getconf
- - [x] gettext (i18n)
- - [x] grep
- - [x] head
- - [x] iconv (i18n)
- - [x] id
- - [x] ipcrm (IPC)
- - [x] ipcs (IPC)
- - [x] join
- - [x] kill
- - [x] lex (Development)
- - [x] link
- - [x] ln
- - [x] locale (i18n)
- - [x] localedef (i18n)
- - [x] logger
- - [x] logname
- - [x] lp
- - [x] ls
- - [x] m4
- - [x] mailx
- - [x] make
- - [x] man
- - [x] mesg
- - [x] mkdir
- - [x] mkfifo
- - [x] more
- - [x] msgfmt (i18n)
- - [x] mv
- - [x] newgrp
- - [x] ngettext (i18n)
- - [x] nice
- - [x] nl
- - [x] nm (Development)
- - [x] nohup
- - [x] od
- - [x] paste
- - [x] patch
- - [x] pathchk
- - [x] pax
- - [x] pr
- - [x] printf
- - [x] prs (SCCS)
- - [x] ps
- - [x] pwd
- - [x] readlink
- - [x] realpath
- - [x] renice
- - [x] rm
- - [x] rmdel (SCCS)
- - [x] rmdir
- - [x] sact (SCCS)
- - [x] sccs (SCCS)
- - [x] sed
- - [x] sh
- - [x] sleep
- - [x] sort
- - [x] split
- - [x] strings
- - [x] strip (Development)
- - [x] stty
- - [x] tabs
- - [x] talk (with talkd local daemon)
- - [x] tail
- - [x] tee
- - [x] test
- - [x] time
- - [x] timeout
- - [x] touch
- - [x] tput
- - [x] tr
- - [x] true
- - [x] tsort
- - [x] tty
- - [x] uname
- - [x] uncompress (compress cat.)
- - [x] unexpand
- - [x] unget (SCCS)
- - [x] uniq
- - [x] unlink
- - [x] uucp (UUCP)
- - [x] uudecode (uue)
- - [x] uuencode (uue)
- - [x] uustat (UUCP)
- - [x] uux (UUCP)
- - [x] val (SCCS)
- - [x] vi (Editors)
- - [x] wc
- - [x] what (SCCS)
- - [x] who
- - [x] write
- - [x] xargs
- - [x] xgettext (i18n)
- - [x] yacc (Development)
- - [x] zcat (compress cat.)
+140+ utilities, grouped by category and sorted alphabetically within each.
 
-## Stage 5 - Fully Translated to 2+ languages
+`lib/utils.tsv` maps each utility to the source file or directory that
+implements it.
 
-(none)
-
-## Stage 4 - Code coverage
-
-(none)
-
-## Stage 3 - Test coverage
-
- - [x] c17 (Development)
-
-## Stage 2 - Feature-complete and POSIX compliant
-
-(none)
-
-## Stage 1 - Rough draft
-
-(none)
-
-## Stage 0 - Not started
-
-(none)
+| Category | Utilities |
+|---|---|
+| Archive | cpio, pax, tar |
+| Calculation | bc, expr |
+| Cron | at, batch, crond, crontab |
+| Date and time | cal, date, sleep, time |
+| Development | ar, c17, cflow, ctags, cxref, lex, m4, make, nm, strings, strip, yacc |
+| Editors | ed, ex, vi |
+| Files and directories | cat, chgrp, chmod, chown, cmp, cp, dd, df, du, file, find, link, ln, ls, mkdir, mkfifo, mv, od, readlink, rm, rmdir, split, tee, touch, unlink |
+| Internationalization | gencat, gettext, iconv, locale, localedef, msgfmt, ngettext, xgettext |
+| Mail and messaging | mailx, mesg, talk, talkd, write |
+| Pathnames | basename, dirname, pathchk, realpath |
+| Printing | lp |
+| Process management | env, fuser, kill, nice, nohup, ps, renice, timeout, xargs |
+| SCCS | admin, delta, get, prs, rmdel, sact, sccs, unget, val, what |
+| Shell | echo, false, printf, sh, test, true |
+| System and users | getconf, id, ipcrm, ipcs, logger, logname, man, newgrp, pwd, tty, uname, who |
+| Terminal | more, stty, tabs, tput |
+| Text processing | asa, awk, comm, csplit, cut, diff, expand, fold, grep, head, join, nl, paste, patch, pr, sed, sort, tail, tr, tsort, unexpand, uniq, wc |
+| Transform and encoding | cksum, compress, uncompress, uudecode, uuencode, zcat |
+| UUCP | uucp, uustat, uux |
 
 ## Non-POSIX extensions
 

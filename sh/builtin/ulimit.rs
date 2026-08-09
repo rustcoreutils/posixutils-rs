@@ -176,7 +176,18 @@ impl UlimitArgs {
                 resource,
                 newlimit,
             }),
-            (None, None) => Err("ulimit: invalid arguments".to_string()),
+            // POSIX synopsis is `ulimit [-f] [blocks]`: with no resource
+            // option, -f is implied, and a newlimit with neither -H nor -S
+            // sets both limits.
+            (None, None) => Ok(UlimitArgs {
+                limit: if newlimit.is_some() {
+                    LimitType::Both
+                } else {
+                    LimitType::Soft
+                },
+                resource: ResourceLimit::FSize,
+                newlimit,
+            }),
         }
     }
 }

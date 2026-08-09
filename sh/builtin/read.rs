@@ -45,9 +45,26 @@ fn read_byte(fd: RawFd) -> Result<Option<u8>, BuiltinError> {
     }
 }
 
+/// The `PS2` continuation prompt, written through the shell's own standard
+/// error so that a redirection of the built-in's stderr is honored.
+#[derive(Clone, Copy)]
+struct Prompt<'a> {
+    prompt: &'a str,
+    opened_files: &'a OpenedFiles,
+}
+
+impl Prompt<'_> {
+    fn write(&self) {
+        self.opened_files.write_err(self.prompt);
+    }
+}
+
 struct ReadResult {
     contents: ExpandedWord,
     reached_eof: bool,
+    /// Bytes taken from a here-document, which has no file offset of its own
+    /// and so must be shortened by the caller. Meaningless for real fds.
+    consumed_bytes: usize,
 }
 
 fn read_until_from_non_blocking_fd(
@@ -55,7 +72,7 @@ fn read_until_from_non_blocking_fd(
     fd: RawFd,
     delimiter: u8,
     backslash_escape: bool,
-    continuation_prompt: Option<&str>,
+    continuation_prompt: Option<Prompt<'_>>,
 ) -> Result<ReadResult, BuiltinError> {
     let mut buffer = Vec::new();
     let mut result = ExpandedWord::default();
@@ -66,8 +83,8 @@ fn read_until_from_non_blocking_fd(
                 escape_next = false;
                 if next == delimiter {
                     // backslash-<delimiter>: line continuation.
-                    if let Some(prompt) = continuation_prompt {
-                        eprint!("{prompt}");
+                    if let Some(prompt) = &continuation_prompt {
+                        prompt.write();
                     }
                     continue;
                 } else if next == b'\\' {
@@ -97,6 +114,7 @@ fn read_until_from_non_blocking_fd(
     Ok(ReadResult {
         contents: result,
         reached_eof: false,
+        consumed_bytes: 0,
     })
 }
 
@@ -104,7 +122,7 @@ fn read_until_from_file(
     fd: RawFd,
     delimiter: u8,
     backslash_escape: bool,
-    continuation_prompt: Option<&str>,
+    continuation_prompt: Option<Prompt<'_>>,
 ) -> Result<ReadResult, BuiltinError> {
     let mut buffer = Vec::new();
     let mut result = ExpandedWord::default();
@@ -116,8 +134,8 @@ fn read_until_from_file(
             if next == delimiter {
                 // backslash-<delimiter> is a line continuation: drop both and
                 // keep reading (the delimiter is usually <newline>).
-                if let Some(prompt) = continuation_prompt {
-                    eprint!("{prompt}");
+                if let Some(prompt) = &continuation_prompt {
+                    prompt.write();
                 }
                 continue;
             } else if next == b'\\' {
@@ -145,6 +163,7 @@ fn read_until_from_file(
     Ok(ReadResult {
         contents: result,
         reached_eof,
+        consumed_bytes: 0,
     })
 }
 
@@ -152,7 +171,7 @@ fn read_from_stdin(
     shell: &mut Shell,
     delimiter: u8,
     backslash_escape: bool,
-    continuation_prompt: Option<&str>,
+    continuation_prompt: Option<Prompt<'_>>,
 ) -> Result<ReadResult, BuiltinError> {
     if std::io::stdin().is_terminal() {
         let original_terminal_settings = shell.terminal.reset();
@@ -184,9 +203,11 @@ fn read_from_here_document(content: &str, delimiter: u8, backslash_escape: bool)
     let mut result = ExpandedWord::default();
     let mut reached_eof = true;
     let mut escape_next = false;
-    for c in content.chars() {
+    let mut consumed_bytes = content.len();
+    for (offset, c) in content.char_indices() {
         if c == delimiter as char {
             reached_eof = false;
+            consumed_bytes = offset + c.len_utf8();
             break;
         }
         if backslash_escape && c == '\\' {
@@ -214,6 +235,7 @@ fn read_from_here_document(content: &str, delimiter: u8, backslash_escape: bool)
     ReadResult {
         contents: result,
         reached_eof,
+        consumed_bytes,
     }
 }
 
@@ -222,15 +244,25 @@ fn read_until(
     file: &OpenedFile,
     delimiter: u8,
     backslash_escape: bool,
+    opened_files: &OpenedFiles,
 ) -> Result<ReadResult, BuiltinError> {
-    // An interactive shell writes PS2 to stderr for each line continuation
-    // that `read` consumes (only possible without -r).
-    let continuation_prompt = if shell.is_interactive && backslash_escape {
+    // PS2 is written for each line continuation `read` consumes (only possible
+    // without -r), but only when the shell is interactive *and* the input is
+    // actually the terminal -- prompting for text coming from a file would be
+    // noise. It goes through the shell's stderr so redirection is honored.
+    let prompt_ps2 = shell.is_interactive
+        && backslash_escape
+        && matches!(file, OpenedFile::Stdin)
+        && std::io::stdin().is_terminal();
+    let continuation_prompt = if prompt_ps2 {
         Some(shell.get_ps2())
     } else {
         None
     };
-    let continuation_prompt = continuation_prompt.as_deref();
+    let continuation_prompt = continuation_prompt.as_deref().map(|prompt| Prompt {
+        prompt,
+        opened_files,
+    });
     match file {
         OpenedFile::Stdin => {
             read_from_stdin(shell, delimiter, backslash_escape, continuation_prompt)
@@ -247,11 +279,16 @@ fn read_until(
             backslash_escape,
             continuation_prompt,
         ),
-        OpenedFile::HereDocument(contents) => Ok(read_from_here_document(
-            contents,
-            delimiter,
-            backslash_escape,
-        )),
+        OpenedFile::HereDocument(contents) => {
+            // A here-document has no file offset, so the text just read is
+            // removed from the shared buffer; the next `read` continues after
+            // it, as it would with a real descriptor.
+            let result = read_from_here_document(&contents.borrow(), delimiter, backslash_escape);
+            let mut remaining = contents.borrow_mut();
+            let consumed = result.consumed_bytes.min(remaining.len());
+            remaining.drain(..consumed);
+            Ok(result)
+        }
         _ => Err(gettext("read: invalid standard input").into()),
     }
 }
@@ -305,8 +342,15 @@ impl BuiltinUtility for BuiltinRead {
 
         let stdin = opened_files
             .get_file(STDIN_FILENO)
+            .cloned()
             .ok_or(BuiltinError::from("read: standard input is not opened"))?;
-        let input = read_until(shell, stdin, delim.unwrap_or(b'\n'), backslash_escape)?;
+        let input = read_until(
+            shell,
+            &stdin,
+            delim.unwrap_or(b'\n'),
+            backslash_escape,
+            opened_files,
+        )?;
 
         let fields = split_fields(
             input.contents,

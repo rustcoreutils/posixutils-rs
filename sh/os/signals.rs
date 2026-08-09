@@ -407,18 +407,6 @@ impl SignalManager {
     }
 }
 
-/// The signal a `128 + signo` exit status stands for, if any. POSIX 2.15 makes
-/// `exit n` with such a status terminate the shell by that signal.
-pub fn signal_from_exit_status(status: libc::c_int) -> Option<Signal> {
-    if !(129..=192).contains(&status) {
-        return None;
-    }
-    Signal::try_from(status - 128)
-        .ok()
-        // the shell cannot raise these on itself in a meaningful way
-        .filter(|&signal| signal != Signal::SigKill && signal != Signal::SigStop)
-}
-
 /// A signal number reported by `wait`. A child may be killed by a signal the
 /// shell has no name for (SIGPWR, SIGSTKFLT, the realtime signals, …), so the
 /// raw number is kept rather than forced into [`Signal`].

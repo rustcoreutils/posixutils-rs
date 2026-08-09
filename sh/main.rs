@@ -20,7 +20,7 @@ use os::signals::{
 };
 use std::error::Error;
 use std::io;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::os::fd::AsRawFd;
 use std::time::Duration;
 
@@ -237,6 +237,44 @@ fn vi_repl(shell: &mut Shell) {
     }
 }
 
+/// Reads and runs commands without the line editor.
+///
+/// `sh -i` may be handed a pipe or a file for standard input. The shell is
+/// still interactive (it prompts, and job control is on), but the editor would
+/// redraw the line into that output, so it is skipped entirely.
+fn non_terminal_repl(shell: &mut Shell) -> ! {
+    let mut program_buffer = String::new();
+    loop {
+        report_mail(shell);
+        if program_buffer.is_empty() {
+            eprint!("{}", shell.get_ps1());
+        } else {
+            eprint!("{}", shell.get_ps2());
+        }
+        let mut line = String::new();
+        match io::stdin().read_line(&mut line) {
+            Ok(0) => shell.exit(shell.last_pipeline_exit_status),
+            Ok(_) => {}
+            // POSIX: an unrecoverable read error exits 128.
+            Err(_) => shell.exit(128),
+        }
+        program_buffer.push_str(&line);
+        match shell.execute_program(&program_buffer) {
+            Ok(_) => program_buffer.clear(),
+            Err(syntax_err) => {
+                if !syntax_err.could_be_resolved_with_more_input {
+                    eprintln!(
+                        "sh({}): syntax error: {}",
+                        syntax_err.lineno, syntax_err.message
+                    );
+                    program_buffer.clear();
+                }
+            }
+        }
+        shell.handle_async_events();
+    }
+}
+
 fn interactive_shell(shell: &mut Shell) {
     if is_process_in_foreground() {
         let pgid = getpgrp();
@@ -266,6 +304,9 @@ fn interactive_shell(shell: &mut Shell) {
                 }
             }
         }
+    }
+    if !io::stdin().is_terminal() {
+        non_terminal_repl(shell);
     }
     loop {
         if shell.set_options.vi {

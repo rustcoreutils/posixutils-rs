@@ -11,6 +11,7 @@ use crate::os::write;
 use crate::parse::command::{IORedirectionKind, Redirection, RedirectionKind};
 use crate::shell::{CommandExecutionError, Shell};
 use crate::wordexp::expand_word_to_string;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
@@ -32,7 +33,10 @@ pub enum OpenedFile {
     ReadFile(Rc<File>),
     WriteFile(Rc<File>),
     ReadWriteFile(Rc<File>),
-    HereDocument(String),
+    /// A here-document. The remaining text is shared between clones of
+    /// `OpenedFiles`, the way a real descriptor shares its file offset, so
+    /// that `read` in a loop consumes successive lines.
+    HereDocument(Rc<RefCell<String>>),
 }
 
 fn io_err_to_redirection_err(err: std::io::Error) -> CommandExecutionError {
@@ -192,13 +196,13 @@ impl OpenedFiles {
                     let contents = expand_word_to_string(&contents.word, false, shell)?;
                     self.opened_files.insert(
                         redir.file_descriptor.unwrap_or(STDIN_FILENO),
-                        OpenedFile::HereDocument(contents),
+                        OpenedFile::HereDocument(Rc::new(RefCell::new(contents))),
                     );
                 }
                 RedirectionKind::QuotedHereDocument { contents, .. } => {
                     self.opened_files.insert(
                         redir.file_descriptor.unwrap_or(STDIN_FILENO),
-                        OpenedFile::HereDocument(contents.clone()),
+                        OpenedFile::HereDocument(Rc::new(RefCell::new(contents.clone()))),
                     );
                 }
             }

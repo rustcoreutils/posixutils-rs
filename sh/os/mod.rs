@@ -202,7 +202,7 @@ pub fn exec(
             | OpenedFile::ReadWriteFile(file) => file.as_raw_fd(),
             OpenedFile::HereDocument(contents) => {
                 let (read_pipe, write_pipe) = pipe()?;
-                write(write_pipe.as_raw_fd(), contents.as_bytes())?;
+                write(write_pipe.as_raw_fd(), contents.borrow().as_bytes())?;
                 dup2(read_pipe.as_raw_fd(), dest)?;
                 continue;
             }

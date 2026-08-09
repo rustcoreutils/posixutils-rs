@@ -119,23 +119,30 @@ impl<'s> SourceString<'s> {
             .peek(self.current_str())
     }
 
+    /// Consumes exactly one character, crossing into later parts as needed.
+    ///
+    /// Crossing a part boundary must not be a step of its own: `lookahead`
+    /// already peeks into the next part, so a caller that peeks and then
+    /// advances once would otherwise see the same character twice.
     fn advance_char(&mut self) {
-        if self.read_state.reached_eof {
-            return;
-        }
-
-        if let Some(char) = self
-            .read_state
-            .current_part_char_iter
-            .next(self.parts[self.read_state.current_part].text.as_ref())
-        {
-            if char == '\n' && self.parts[self.read_state.current_part].in_original_string {
-                self.read_state.line_no += 1;
+        while !self.read_state.reached_eof {
+            if let Some(char) = self
+                .read_state
+                .current_part_char_iter
+                .next(self.parts[self.read_state.current_part].text.as_ref())
+            {
+                if char == '\n' && self.parts[self.read_state.current_part].in_original_string {
+                    self.read_state.line_no += 1;
+                }
+                if self.read_state.current_part == self.parts.len() - 1 && self.peek().is_none() {
+                    self.read_state.reached_eof = true;
+                }
+                return;
             }
-            if self.read_state.current_part == self.parts.len() - 1 && self.peek().is_none() {
+            if self.read_state.current_part + 1 == self.parts.len() {
                 self.read_state.reached_eof = true;
+                return;
             }
-        } else {
             self.read_state.current_part += 1;
             self.read_state.current_part_char_iter = IndexIter::default();
         }

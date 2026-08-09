@@ -2170,34 +2170,27 @@ mod audit_regressions {
 
     // ----- Phase 5: exit status, $-, $!, exec -----
 
+    // `/proc/self/mem` is the only readily available file that opens but fails
+    // to read; there is no portable equivalent, so this one is Linux-only.
+    #[cfg(target_os = "linux")]
     #[test]
     fn unrecoverable_read_error_exits_128() {
-        // sh.md: 128 when commands cannot be read; 127 for a missing file and
-        // 126 for one that is not a shell script.
+        // sh.md: 128 when commands cannot be read.
         set_env_vars();
         expect_cli_exit_code(vec!["/proc/self/mem".to_string()], "", 128);
     }
 
     #[test]
     fn non_script_command_file_exits_126() {
+        // A command_file that is not valid text is ENOEXEC-like: 126, not 127.
+        // Build it here rather than naming a system path, which differs across
+        // platforms (`/bin/true` does not exist on macOS).
         set_env_vars();
-        expect_cli_exit_code(vec!["/bin/true".to_string()], "", 126);
-    }
-
-    #[test]
-    fn exit_with_a_signal_status_terminates_by_that_signal() {
-        // POSIX 2.15: `exit n` for an n that encodes termination by a signal
-        // makes the shell terminate by that signal.
-        set_env_vars();
-        run_script_with_checker("exit 143\n", |output| {
-            use std::os::unix::process::ExitStatusExt;
-            assert_eq!(
-                output.status.signal(),
-                Some(15),
-                "expected termination by SIGTERM, got {:?}",
-                output.status
-            );
-        });
+        let dir = Path::new(concat!(env!("CARGO_TARGET_TMPDIR"), "/sh_test_write_dir"));
+        std::fs::create_dir_all(dir).unwrap();
+        let binary = dir.join("not_a_script.bin");
+        std::fs::write(&binary, [0x7f, b'E', b'L', b'F', 0xff, 0xfe]).unwrap();
+        expect_cli_exit_code(vec![binary.to_string_lossy().into_owned()], "", 126);
     }
 
     #[test]
@@ -2208,8 +2201,19 @@ mod audit_regressions {
             "",
             127,
         );
+        // A file that exists but cannot be executed is 126. Build it here
+        // rather than naming a system path, which differs across platforms
+        // (`/etc/hostname` does not exist on macOS).
+        let dir = Path::new(concat!(env!("CARGO_TARGET_TMPDIR"), "/sh_test_write_dir"));
+        std::fs::create_dir_all(dir).unwrap();
+        let not_executable = dir.join("not_executable");
+        std::fs::write(&not_executable, "data\n").unwrap();
+        std::fs::set_permissions(&not_executable, std::fs::Permissions::from_mode(0o644)).unwrap();
         expect_cli_exit_code(
-            vec!["-c".to_string(), "exec /etc/hostname".to_string()],
+            vec![
+                "-c".to_string(),
+                format!("exec '{}'", not_executable.display()),
+            ],
             "",
             126,
         );
@@ -2418,6 +2422,59 @@ mod audit_regressions {
             assert!(String::from_utf8_lossy(&output.stdout).is_empty());
             assert!(!String::from_utf8_lossy(&output.stderr).is_empty());
         });
+    }
+
+    // ----- Review follow-up: regressions found by the branch review -----
+
+    #[test]
+    fn here_document_may_be_followed_by_a_closing_operator() {
+        // The remainder of the `<<` line is pushed back as a new source part;
+        // an operator starting exactly at that boundary must be consumed once,
+        // not lexed twice.
+        test_script("(cat <<EOF\nx\nEOF\n)\n", "x\n");
+        test_script("case a in\na) cat <<EOF\nx\nEOF\n;;\nesac\n", "x\n");
+        test_script("f() (cat <<EOF\nx\nEOF\n)\nf\n", "x\n");
+        test_script("{ cat <<EOF\nx\nEOF\n}\n", "x\n");
+    }
+
+    #[test]
+    fn exit_with_a_signal_status_is_a_normal_exit() {
+        // POSIX 2.15: `exit n` for n in 0..255 exits with that status and
+        // performs no signal side effects such as a core dump.
+        set_env_vars();
+        for status in [130, 134, 143] {
+            run_script_with_checker(&format!("exit {status}\n"), |output| {
+                use std::os::unix::process::ExitStatusExt;
+                assert_eq!(output.status.signal(), None, "expected a normal exit");
+                assert_eq!(output.status.code(), Some(status));
+            });
+        }
+        // A subshell exiting with such a status must not signal its parent.
+        run_script_with_checker("(exit 130)\necho alive\nexit 7\n", |output| {
+            assert_eq!(String::from_utf8_lossy(&output.stdout), "alive\n");
+            assert_eq!(output.status.code(), Some(7));
+        });
+    }
+
+    #[test]
+    fn read_consumes_successive_here_document_lines() {
+        test_script(
+            "while read l; do echo \"got:$l\"; done <<EOF\na\nb\nEOF\n",
+            "got:a\ngot:b\n",
+        );
+    }
+
+    #[test]
+    fn ulimit_accepts_a_bare_newlimit_operand() {
+        // POSIX synopsis is `ulimit [-f] [blocks]`, so -f is implied.
+        run_successfully_and("ulimit 2000\nulimit -f\n", |out| assert_eq!(out, "2000\n"));
+    }
+
+    #[test]
+    fn bg_reports_a_job_that_has_already_terminated() {
+        // Only an already-*running* job is a silent success; a finished job is
+        // still an error.
+        expect_clean_failure("set -m\nsleep 0.05 &\nsleep 0.3\nbg %1\n");
     }
 
     #[test]

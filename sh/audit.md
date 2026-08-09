@@ -165,7 +165,7 @@ The shell is **broad and largely feature-complete** — all 15 special and 16 re
 | `break`/`continue` | DIVERGES | cross-function escape (#11); `continue` name (#45). |
 | `return` | DIVERGES | default `$?` (#10). |
 | `exec` | CONFORMS | replaces process; redirections persist (**[V]**). Not-found→127, not-executable→126; an interactive non-subshell shell survives a failed exec. |
-| `exit` | CONFORMS | EXIT-trap recursion (#37) fixed; §2.15 signal mapping for a `128+signo` status implemented. |
+| `exit` | CONFORMS | EXIT-trap recursion (#37) fixed. `exit n` for 0–255 is a normal exit with that status, as dash and bash do; see #75. |
 | `export`/`readonly` | PARTIAL | `-p` quoting (#25); `readonly` error string (#46). |
 | `set` | PARTIAL | `pipefail` (#14); no-arg/`+o` value quoting (#25). |
 | `shift` | CONFORMS | `builtin/shift.rs`. |
@@ -253,6 +253,23 @@ regression test in `sh/tests/integration.rs`.
 - [x] **#69 — `yes | head -n 3` never terminates.** The pipeline subshell kept the last pipe's read end on fd 0 while waiting for the writers, so they never saw EPIPE. **[V]** dash exits 0 immediately. Fixed by restoring the saved stdin before the wait.
 - [x] **#70 — Command substitution deadlocks on output larger than the pipe buffer.** `execute_in_subshell` waited for the child before draining the pipe. **[V]** `x=$(seq 1 100000)` hung forever. The pipe is now drained first.
 
+### Regressions caught by the branch review (2026-08-09)
+
+A high-effort multi-agent review of the branch, run after the nine remediation
+commits, found that three of those commits had introduced regressions and that
+two long-standing bugs sat in code they rewrote. All are fixed, each with the
+regression test that should have existed.
+
+- [x] **#75 — `exit n` re-raised a signal for any status in 129..=192.** This was a misreading of §2.15: the clause about terminating by a signal does not apply to `exit n` for 0 ≤ n ≤ 255, which must be an ordinary exit with status n and must create no core image. **[V]** `sh -c 'exit 134'` died with `Aborted (core dumped)` where dash and bash both exit 134. Worse, the `kill` targeted `self.shell_pid`, which a forked subshell never updates, so `sh -c '(exit 130); echo alive; exit 7'` killed the *parent* shell. The re-raise is removed entirely.
+- [x] **#76 — An operator immediately after a here-document was lexed twice.** `SourceString::advance_char` stepped to the next source part without consuming a character, so a token starting exactly at the boundary created by the here-document pushback (#60) was emitted twice. **[V]** `(cat <<EOF … EOF )`, a paren function body, and a `;;` after a here-document in a `case` item all became syntax errors. `advance_char` now consumes a character across the boundary, matching what `lookahead` already peeked.
+- [x] **#77 — `wait <pid>` removed a job that had merely stopped.** `wait_child_process` also returns for a stopped child (it waits with `WUNTRACED`), so a live stopped job was dropped from the table and became unreachable by `fg`/`bg`. It also registered a *duplicate* entry for a job it already knew. Both fixed; the wait now reports whether the child actually terminated.
+- [x] **#78 — `bg` reported success for a terminated job.** The #48 change replaced the "already running" error with an unconditional success, which also swallowed `Done`/`Signaled`. Only an already-running job is a silent success now.
+- [x] **#79 — `read` from a here-document never advanced.** A here-document had no read position, so `while read l; do …; done <<EOF` re-read the first line forever. **[V]** (pre-existing, in code this branch rewrote). `OpenedFile::HereDocument` now holds its remaining text in an `Rc<RefCell<String>>`, shared between clones of `OpenedFiles` the way a real descriptor shares its file offset.
+- [x] **#80 — `ulimit <blocks>` was rejected.** The catch-all arm errored even when a newlimit had been parsed, so the POSIX `ulimit [-f] [blocks]` form never worked. **[V]** (pre-existing). `-f` is now implied, and a newlimit with neither `-H` nor `-S` sets both limits.
+- [x] **#81 — `read`'s PS2 prompt ignored redirection.** It was gated only on the shell being interactive, not on the input being the terminal, and went out through `eprint!` rather than the shell's own stderr. Now it prompts only for terminal input and honors a redirection of the built-in's stderr.
+- [x] **#82 — `sh -i` with non-terminal input emitted terminal control sequences.** Fixing the panic (#62) left the line editor running with nowhere to draw. An interactive shell whose stdin is not a terminal now reads lines plainly, still prompting on stderr.
+- [x] **#83 — The declaration-utility check read unexpanded word text.** `command $c v=~` with `c=export` missed, because the `command` branch scanned raw source text while the name came from expanded fields. The decision is now made from expanded words in one pass.
+
 ### Major
 
 - [x] **#71 — `ulimit` reports a single limit in the `-a` labelled format.** POSIX requires `"%1d\n"` / `"unlimited\n"` when `-a` is absent and at most one resource option is given. **[V]** `ulimit -f` printed `file size (-f)  [blocks] unlimited`; dash prints `unlimited`. Also fixed with it: a bare `ulimit` errored instead of defaulting to `-S -f`, `getrlimit` failure was a `panic!`, and `-S` silently widened the hard limit (which an unprivileged process cannot do) instead of refusing a soft limit above it.
@@ -279,6 +296,15 @@ per-phase discipline. Four of the five deferrals are now implemented (#33, #48,
 optional-by-grammar feature, kept as an accepted gap. The pass also fixed the 15
 newly found defects recorded above (#60–#74): nine further process-aborting
 panics, two hangs, and four wrong-result or output-conformance bugs.
+
+A high-effort multi-agent review of the finished branch then caught nine more
+(#75–#83): three of the nine commits had introduced regressions — an operator
+after a here-document was lexed twice, `exit n` re-raised a signal and could
+kill the parent shell, and `wait` dropped a stopped job — and two long-standing
+bugs (`read` from a here-document, `ulimit <blocks>`) were sitting in code those
+commits rewrote. All are fixed and covered by tests. The lesson recorded here:
+a green suite meant the paths the suite knew about, not the ones the changes
+newly reached.
 
 The phases were: (1) panics and hangs, (2) line continuation during token
 recognition, (3) declaration-utility assignment expansion, (4) `ulimit`,

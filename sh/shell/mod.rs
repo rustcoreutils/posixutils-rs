@@ -16,9 +16,7 @@ use crate::cli::terminal::Terminal;
 use crate::jobs::{JobManager, JobState};
 use crate::nonempty::NonEmpty;
 use crate::os::errno::Errno;
-use crate::os::signals::{
-    handle_signal_default, kill, signal_from_exit_status, Signal, SignalManager,
-};
+use crate::os::signals::{kill, Signal, SignalManager};
 use crate::os::{
     close, dup, dup2, exec, find_command, fork, getpgid, getpgrp, is_process_in_foreground, pipe,
     setpgid, tcsetpgrp, waitpid, ExecError, ForkResult, OsError, OsResult, Pid, WaitStatus,
@@ -224,17 +222,35 @@ fn split_mailpath_entry(entry: &str) -> (String, Option<String>) {
     (path, None)
 }
 
-/// POSIX 2.9.1 declaration utilities: `export` and `readonly`, plus `command`
-/// when it invokes one of them.
-fn is_declaration_utility(name: &str, words: &[WordPair]) -> bool {
-    match name {
-        "export" | "readonly" => true,
-        "command" => words
-            .iter()
-            .skip(1)
-            .find(|word| !word.as_string.starts_with('-'))
-            .is_some_and(|word| word.as_string == "export" || word.as_string == "readonly"),
-        _ => false,
+/// Whether the command being built is a POSIX 2.9.1 declaration utility.
+///
+/// `export` and `readonly` are, and so is `command` once its own options are
+/// past and the utility it invokes turns out to be one of them — which is only
+/// known after that operand has been expanded, hence `Pending`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeclarationUtility {
+    No,
+    Pending,
+    Yes,
+}
+
+impl DeclarationUtility {
+    /// Classifies the command name, as an already-expanded field.
+    fn from_name(name: &str) -> Self {
+        match name {
+            "export" | "readonly" => Self::Yes,
+            "command" => Self::Pending,
+            _ => Self::No,
+        }
+    }
+
+    /// Refines a `Pending` verdict with `command`'s next expanded word.
+    fn resolve(self, word: &str) -> Self {
+        match self {
+            Self::Pending if word.starts_with('-') => Self::Pending,
+            Self::Pending => Self::from_name(word),
+            other => other,
+        }
     }
 }
 
@@ -264,29 +280,37 @@ impl Shell {
         if self.is_interactive && !self.is_subshell {
             write_history_to_file(&self.history, &self.environment);
         }
-        // POSIX 2.15: when `n` is a status that would result from termination
-        // by a signal, the shell shall terminate by that signal, taking no
-        // other action associated with it.
-        if let Some(signal) = signal_from_exit_status(code) {
-            self.signal_manager.reset();
-            unsafe { handle_signal_default(signal) };
-            let _ = kill(self.shell_pid, Some(signal));
-        }
+        // POSIX 2.15: `exit n` for 0 <= n <= 255 exits *normally* with status
+        // n. The shell must not re-raise the signal a `128+signo` status would
+        // stand for -- that would dump core and, from a subshell, signal the
+        // parent. dash and bash both exit normally here.
         std::process::exit(code);
     }
 
     pub fn wait_child_process(&mut self, child_pid: Pid) -> OsResult<i32> {
+        self.wait_child_process_result(child_pid)
+            .map(|(status, _)| status)
+    }
+
+    /// Waits for `child_pid`, returning its status and whether it actually
+    /// terminated. A stopped child also ends the wait, but it is still alive
+    /// and must stay in the job table.
+    pub fn wait_child_process_result(&mut self, child_pid: Pid) -> OsResult<(i32, bool)> {
         loop {
             match waitpid(child_pid, true, true)? {
-                WaitStatus::Exited { exit_status } => return Ok(exit_status),
-                WaitStatus::Signaled { signal, .. } => return Ok(signal.exit_status()),
+                WaitStatus::Exited { exit_status } => return Ok((exit_status, true)),
+                WaitStatus::Signaled { signal, .. } => return Ok((signal.exit_status(), true)),
                 WaitStatus::Stopped { signal } => {
-                    self.background_jobs.add_job(
-                        child_pid,
-                        self.last_pipeline_command.clone(),
-                        JobState::Stopped,
-                    );
-                    return Ok(signal.exit_status());
+                    // Only register the job if it is not one already, or the
+                    // table would gain a duplicate under a new number.
+                    if !self.background_jobs.mark_stopped_by_pid(child_pid) {
+                        self.background_jobs.add_job(
+                            child_pid,
+                            self.last_pipeline_command.clone(),
+                            JobState::Stopped,
+                        );
+                    }
+                    return Ok((signal.exit_status(), false));
                 }
                 WaitStatus::StillAlive => {
                     self.handle_async_events();
@@ -587,17 +611,22 @@ impl Shell {
         // assignments are expanded as assignments (tilde expansion after `=`
         // and after each `:`) and are not field-split or globbed. The command
         // name decides this, so the first word is expanded on its own.
-        let mut declaration_utility = false;
+        let mut declaration_utility = DeclarationUtility::No;
         for (index, word_pair) in simple_command.words.iter().enumerate() {
-            if index > 0 && declaration_utility && is_assignment_shaped(&word_pair.as_string) {
+            if declaration_utility == DeclarationUtility::Yes
+                && index > 0
+                && is_assignment_shaped(&word_pair.as_string)
+            {
                 expanded_words.push(expand_declaration_operand(&word_pair.word, self)?);
                 continue;
             }
             let fields = expand_word(&word_pair.word, false, self)?;
-            if index == 0 {
-                declaration_utility = fields
-                    .first()
-                    .is_some_and(|name| is_declaration_utility(name, &simple_command.words));
+            if let Some(first) = fields.first() {
+                declaration_utility = if index == 0 {
+                    DeclarationUtility::from_name(first)
+                } else {
+                    declaration_utility.resolve(first)
+                };
             }
             expanded_words.extend(fields);
         }

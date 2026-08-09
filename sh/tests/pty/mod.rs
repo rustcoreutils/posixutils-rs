@@ -169,8 +169,11 @@ fn jobs_reports_a_signal_terminated_job_distinctly() {
 fn fg_returns_the_jobs_exit_status() {
     let mut sh = ShPtySession::new();
     let out = sh.path("status");
-    sh.line("sh -c 'sleep 0.2; exit 7' &");
+    // Long enough that `fg` reliably attaches to a job that is still running,
+    // even on a slow CI machine.
+    sh.line("sh -c 'sleep 1; exit 7' &");
     sh.line("fg");
+    thread::sleep(Duration::from_millis(1200));
     sh.line(&format!("echo $? > '{}'", out.display()));
     let dir = sh.exit();
     assert_eq!(read_result(&dir.path().join("status")).trim(), "7");

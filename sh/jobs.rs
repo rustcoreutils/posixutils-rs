@@ -221,6 +221,18 @@ impl JobManager {
         self.jobs.last_mut()
     }
 
+    /// Marks an already-known job as stopped. Returns false when `pid` is not
+    /// in the table, so the caller can register it instead of duplicating it.
+    pub fn mark_stopped_by_pid(&mut self, pid: Pid) -> bool {
+        if let Some(job) = self.jobs.iter_mut().find(|job| job.pid == pid) {
+            job.state = JobState::Stopped;
+            job.state_should_be_reported = true;
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn remove_job_by_pid(&mut self, pid: Pid) -> Option<Job> {
         let index = self.jobs.iter().position(|job| job.pid == pid)?;
         let job = self.jobs.remove(index);

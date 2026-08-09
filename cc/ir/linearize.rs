@@ -14,7 +14,7 @@ use super::mem2reg::mem2reg;
 use super::ssa::ssa_convert;
 use super::{
     BasicBlock, BasicBlockId, CallAbiInfo, Function, Initializer, Instruction, MemoryOrder, Module,
-    Opcode, Pseudo, PseudoId,
+    Opcode, Pseudo, PseudoId, PseudoKind,
 };
 use crate::abi::{get_abi_for_conv, CallingConv};
 use crate::diag::{error, get_all_stream_names, Position};
@@ -790,6 +790,10 @@ impl<'a> Linearizer<'a> {
             self.two_reg_return_type = Some(func.return_type);
         }
 
+        // A complex `Ret` carries an address; a call's result slot holds the
+        // value. The inliner has to know not to splice across that boundary.
+        ir_func.returns_complex = self.types.is_complex(func.return_type);
+
         // Add parameters
         // For struct/union parameters, we need to copy them to local storage
         // so member access works properly
@@ -1132,16 +1136,11 @@ impl<'a> Linearizer<'a> {
 
     /// Emit large struct return via hidden pointer (sret)
     pub(crate) fn emit_sret_return(&mut self, e: &Expr, sret_ptr: PseudoId, struct_size: u32) {
-        // A complex-valued expression already lowers to the *address* of the
-        // local holding it, and it is usually an rvalue — `return
-        // __builtin_complex(...)` has no lvalue to take. Asking
-        // `linearize_lvalue` for one yielded a bogus address and the copy
-        // below faulted.
-        let src_addr = if e.typ.is_some_and(|t| self.types.is_complex(t)) {
-            self.linearize_expr(e)
-        } else {
-            self.linearize_lvalue(e)
-        };
+        // Only structs and unions return through a hidden pointer
+        // (`returns_via_hidden_pointer`), so `e` is always an aggregate here —
+        // complex returns take the register path and go through
+        // `complex_operand_addr`.
+        let src_addr = self.linearize_lvalue(e);
         let struct_bytes = struct_size as i64 / 8;
         let mut byte_offset = 0i64;
 
@@ -1419,6 +1418,59 @@ impl<'a> Linearizer<'a> {
 
         // Couldn't resolve, return original
         type_id
+    }
+
+    /// The address of a complex-valued expression, whichever kind it is.
+    ///
+    /// Complex values live in memory and travel by address, and every complex
+    /// path (argument, assignment, return) needs that one address. Three
+    /// different expression shapes produce it three different ways:
+    ///
+    /// - an **lvalue** has an address to take, so `linearize_lvalue`;
+    /// - a **call** returning complex yields a `Sym` pseudo whose own stack
+    ///   slot *is* the returned value, so its address has to be taken;
+    /// - every other **rvalue** — `__builtin_complex(...)`, `x + y` — already
+    ///   lowers to a temp holding a pointer to the value, which is the answer
+    ///   as it stands.
+    ///
+    /// Each caller used to pick one of these by hand, and they did not agree.
+    /// Both ways of being wrong are silent and fatal: asking an rvalue for its
+    /// lvalue yields a bogus pointer, and handing a consumer the value's own
+    /// bits gets them dereferenced as an address. Which crash you got depended
+    /// on the syntax at the use site.
+    pub(crate) fn complex_operand_addr(&mut self, expr: &Expr) -> PseudoId {
+        let is_lvalue = matches!(
+            expr.kind,
+            ExprKind::Ident(_)
+                | ExprKind::Member { .. }
+                | ExprKind::Arrow { .. }
+                | ExprKind::Index { .. }
+                | ExprKind::Unary {
+                    op: crate::parse::ast::UnaryOp::Deref,
+                    ..
+                }
+                | ExprKind::CompoundLiteral { .. }
+        );
+        if is_lvalue {
+            return self.linearize_lvalue(expr);
+        }
+        let typ = self.expr_type(expr);
+        let val = self.linearize_expr(expr);
+        // A `Sym`'s slot holds the value itself; anything else already holds a
+        // pointer to it. Deciding here, where the pseudo's kind is known, is
+        // what lets every consumer treat the result as a plain address.
+        let slot_is_the_value = self
+            .current_func
+            .as_ref()
+            .and_then(|f| f.get_pseudo(val))
+            .is_some_and(|p| matches!(p.kind, PseudoKind::Sym(_)));
+        if !slot_is_the_value {
+            return val;
+        }
+        let addr = self.alloc_reg_pseudo();
+        let ptr_type = self.types.pointer_to(typ);
+        self.emit(Instruction::sym_addr(addr, val, ptr_type));
+        addr
     }
 
     /// Linearize an expression as an lvalue (get its address)
@@ -2327,36 +2379,8 @@ impl<'a> Linearizer<'a> {
             } else if self.types.is_complex(arg_type) {
                 // Complex types: pass address, codegen loads real/imag into XMM registers
                 // Type stays as complex (not pointer) so codegen knows it's complex.
-                //
-                // A complex expression already lowers to the address of the
-                // local holding it, and the argument is often an rvalue —
-                // `f(g())`, `f(__builtin_complex(...))` — which has no lvalue
-                // to take. Asking for one yielded a bogus address.
                 arg_types_vec.push(arg_type);
-                // An lvalue yields its address through `linearize_lvalue`. An
-                // rvalue — `f(g())`, `f(__builtin_complex(...))` — has no
-                // lvalue to take, but a complex expression already lowers to
-                // the address of the local holding its value, so
-                // `linearize_expr` is the right question there. Asking
-                // `linearize_lvalue` for an rvalue's address produced a bogus
-                // pointer and the callee faulted dereferencing it.
-                let is_lvalue = matches!(
-                    a.kind,
-                    ExprKind::Ident(_)
-                        | ExprKind::Member { .. }
-                        | ExprKind::Arrow { .. }
-                        | ExprKind::Index { .. }
-                        | ExprKind::Unary {
-                            op: crate::parse::ast::UnaryOp::Deref,
-                            ..
-                        }
-                        | ExprKind::CompoundLiteral { .. }
-                );
-                if is_lvalue {
-                    self.linearize_lvalue(a)
-                } else {
-                    self.linearize_expr(a)
-                }
+                self.complex_operand_addr(a)
             } else if arg_kind == TypeKind::Array {
                 // Array decay to pointer (C99 6.3.2.1)
                 // This applies to both fixed-size arrays and VLAs
@@ -2822,12 +2846,12 @@ impl<'a> Linearizer<'a> {
             // For complex types, we need addresses to load real/imag parts
             // If an operand is not complex (e.g., real scalar), promote it
             let left_addr = if self.types.is_complex(left_typ) {
-                self.linearize_lvalue(left)
+                self.complex_operand_at_precision(left, result_typ)
             } else {
                 self.promote_real_to_complex(left, result_typ)
             };
             let right_addr = if self.types.is_complex(right_typ) {
-                self.linearize_lvalue(right)
+                self.complex_operand_at_precision(right, result_typ)
             } else {
                 self.promote_real_to_complex(right, result_typ)
             };

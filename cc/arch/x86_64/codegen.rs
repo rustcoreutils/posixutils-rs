@@ -134,6 +134,52 @@ impl X86_64CodeGen {
         }
     }
 
+    /// Copy a memory-class parameter from the incoming argument area into the
+    /// local the rest of the function reads.
+    ///
+    /// Register-class arguments that ran out of registers arrive on the stack
+    /// like any MEMORY-class one, but unlike a `long double` — which is simply
+    /// used in place — a complex or two-SSE-struct parameter has a local, and
+    /// the prologue is what fills it. `bytes` is the type's real size, copied a
+    /// qword at a time through R10 (reserved, never allocated).
+    fn copy_incoming_arg_to_local(
+        &mut self,
+        func: &crate::ir::Function,
+        param_name: &str,
+        arg_pseudo: crate::ir::PseudoId,
+        bytes: i32,
+    ) {
+        let Some(Loc::IncomingArg(src_offset)) = self.locations.get(arg_pseudo) else {
+            return;
+        };
+        let Some(local) = func.locals.get(param_name) else {
+            return;
+        };
+        let Some(Loc::Stack(dst_offset)) = self.locations.get_ref(local.sym) else {
+            return;
+        };
+        let dst_offset = *dst_offset;
+        let mut copied = 0;
+        while copied < bytes {
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Mem(MemAddr::BaseOffset {
+                    base: Reg::Rbp,
+                    offset: src_offset + copied,
+                }),
+                dst: GpOperand::Reg(Reg::R10),
+            });
+            // Locals grow downward from `dst_offset`, so later bytes sit at a
+            // smaller offset — the same convention `stack_mem` encodes.
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Reg(Reg::R10),
+                dst: GpOperand::Mem(self.stack_mem(dst_offset - copied)),
+            });
+            copied += 8;
+        }
+    }
+
     /// Convert a Loc to a GpOperand for LIR
     pub(super) fn loc_to_gp_operand(&self, loc: &Loc) -> GpOperand {
         match loc {
@@ -681,7 +727,24 @@ impl X86_64CodeGen {
 
                         if (is_complex || is_two_sse_struct) && sse_regs > 0 {
                             // Look up the local variable (same name as param) for stack location
-                            if fp_arg_idx + sse_regs <= fp_arg_regs.len() {
+                            if fp_arg_idx + sse_regs > fp_arg_regs.len() {
+                                // Spilled: the caller wrote the value into the
+                                // incoming argument area, so copy it into the
+                                // local rather than reading registers that hold
+                                // something else. Skipping the copy entirely, as
+                                // this used to, left the parameter uninitialized.
+                                self.copy_incoming_arg_to_local(
+                                    func,
+                                    &func.params[i].0,
+                                    pseudo.id,
+                                    (type_size_bits / 8) as i32,
+                                );
+                                // A memory-class argument consumes no XMM
+                                // registers; the ones it did not fit in stay
+                                // available to the arguments that follow.
+                                break;
+                            }
+                            {
                                 // Find the local for this parameter by name
                                 let param_name = &func.params[i].0;
                                 if let Some(local) = func.locals.get(param_name) {

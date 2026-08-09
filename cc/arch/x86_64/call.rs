@@ -76,6 +76,13 @@ impl X86_64CodeGen {
                     if !has_gp || !has_fp {
                         stack_arg_indices.push(i);
                         total_stack_qwords += gp_needed.max(fp_needed).max(1);
+                        // §3.2.3 step 5: an argument that does not fit goes to
+                        // memory *whole* and consumes no registers, so the ones
+                        // it did not fit in remain for later arguments.
+                        // Counting them here disagreed with `setup_register_args`,
+                        // which skips stack arguments without advancing its own
+                        // index — so the two sides picked different registers.
+                        continue;
                     }
                     temp_int_idx += gp_needed;
                     temp_fp_idx += fp_needed;
@@ -145,15 +152,20 @@ impl X86_64CodeGen {
             let arg = insn.src[i];
             let arg_type = insn.arg_types.get(i).copied();
 
-            // MEMORY class first: a large aggregate or a `long double
-            // _Complex`. The arg pseudo holds the value's address; copy it to
-            // the stack a qword at a time. Checked ahead of the FP tests
-            // because a complex type carries its base's kind, so
-            // `long double _Complex` would otherwise be mistaken for a
+            // MEMORY class first: a large aggregate, a `long double _Complex`,
+            // or any complex value that ran out of registers — reaching this
+            // loop at all means it is going to memory. The arg pseudo holds the
+            // value's address; copy it to the stack a qword at a time. Checked
+            // ahead of the FP tests because a complex type carries its base's
+            // kind, so `long double _Complex` would otherwise be mistaken for a
             // 16-byte scalar long double and only half of it copied.
-            if let Some(bytes) =
-                arg_type.and_then(|t| crate::arch::lir::memory_class_bytes(types, t))
-            {
+            if let Some(bytes) = arg_type.and_then(|t| {
+                crate::arch::lir::memory_class_bytes(types, t).or_else(|| {
+                    types
+                        .is_complex(t)
+                        .then(|| (types.size_bits(t) / 8) as usize)
+                })
+            }) {
                 let num_qwords = bytes.div_ceil(8);
                 let base = self.address_of_pseudo(arg);
                 for q in (0..num_qwords).rev() {

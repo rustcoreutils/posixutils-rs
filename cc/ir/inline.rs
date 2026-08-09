@@ -91,6 +91,8 @@ pub struct InlineCandidate {
     pub uses_alloca: bool,
     /// Number of times this function is called in the module
     pub call_count: usize,
+    /// Whether the function returns a complex value (should not inline)
+    pub returns_complex: bool,
 }
 
 /// Build a map of function name -> call count across the entire module in a single pass.
@@ -127,6 +129,7 @@ pub fn analyze_all_functions(module: &Module) -> HashMap<String, InlineCandidate
 fn analyze_function(func: &Function, call_counts: &HashMap<String, usize>) -> InlineCandidate {
     let mut candidate = InlineCandidate {
         has_inline_hint: func.is_inline,
+        returns_complex: func.returns_complex,
         ..Default::default()
     };
 
@@ -177,6 +180,16 @@ fn should_inline(
 ) -> bool {
     // Never inline if disqualifying conditions
     if candidate.uses_varargs || candidate.is_recursive || candidate.uses_alloca {
+        return false;
+    }
+
+    // A complex `Ret` yields the address of the value, but a call's result
+    // pseudo is a local whose slot holds the value itself. Splicing the body
+    // in hands the caller an address where it expects the value, and the
+    // difference is invisible — it reads the first eight bytes of the pointer
+    // as a double. Bridging the two needs the base type and stride, which the
+    // optimizer has no `TypeTable` to look up. See `Function::returns_complex`.
+    if candidate.returns_complex {
         return false;
     }
 
@@ -1362,6 +1375,7 @@ mod tests {
             is_recursive: false,
             uses_varargs: false,
             uses_alloca: false,
+            returns_complex: false,
             call_count: 1,
         };
 
@@ -1377,6 +1391,7 @@ mod tests {
             is_recursive: false,
             uses_varargs: true,
             uses_alloca: false,
+            returns_complex: false,
             call_count: 1,
         };
 
@@ -1392,6 +1407,7 @@ mod tests {
             is_recursive: true,
             uses_varargs: false,
             uses_alloca: false,
+            returns_complex: false,
             call_count: 1,
         };
 
@@ -1407,6 +1423,7 @@ mod tests {
             is_recursive: false,
             uses_varargs: false,
             uses_alloca: false,
+            returns_complex: false,
             call_count: 1,
         };
 
@@ -1422,6 +1439,7 @@ mod tests {
             is_recursive: false,
             uses_varargs: false,
             uses_alloca: false,
+            returns_complex: false,
             call_count: 1,
         };
 

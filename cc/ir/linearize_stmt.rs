@@ -103,7 +103,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     } else if let Some(ret_type) = self.two_reg_return_type {
                         self.emit_two_reg_return(e, ret_type);
                     } else if self.types.is_complex(expr_typ) {
-                        let addr = self.linearize_lvalue(e);
+                        let addr = self.complex_operand_addr(e);
                         let typ_size = self.types.size_bits(func_ret_type);
                         self.emit(Instruction::ret_typed(Some(addr), func_ret_type, typ_size));
                     } else {
@@ -353,17 +353,28 @@ impl<'a> super::linearize::Linearizer<'a> {
                     let base_bytes = (base_bits / 8) as i64;
 
                     if self.types.is_complex(init_typ) {
-                        // Complex-to-complex: linearize_expr returns an address
-                        // to a temp containing the complex value. Copy from temp.
-                        let value_addr = self.linearize_expr(init);
+                        let value_addr = self.complex_operand_addr(init);
+
+                        // The initializer may have a different base precision
+                        // than the object — and usually does, because `I` is
+                        // `__builtin_complex(0.0, 1.0)`, a *double* complex, so
+                        // `float _Complex f = 2.0f + 3.0f*I;` is a conversion.
+                        // Reading the source with the target's base type and
+                        // stride mismatched both the width and the step.
+                        let src_base = self.types.complex_base(init_typ);
+                        let src_bits = self.types.size_bits(src_base);
+                        let src_bytes = (src_bits / 8) as i64;
+
                         let val_real = self.alloc_pseudo();
                         let val_imag = self.alloc_pseudo();
                         self.emit(Instruction::load(
-                            val_real, value_addr, 0, base_typ, base_bits,
+                            val_real, value_addr, 0, src_base, src_bits,
                         ));
                         self.emit(Instruction::load(
-                            val_imag, value_addr, base_bytes, base_typ, base_bits,
+                            val_imag, value_addr, src_bytes, src_base, src_bits,
                         ));
+                        let val_real = self.emit_convert(val_real, src_base, base_typ);
+                        let val_imag = self.emit_convert(val_imag, src_base, base_typ);
                         self.emit(Instruction::store(val_real, sym_id, 0, base_typ, base_bits));
                         self.emit(Instruction::store(
                             val_imag, sym_id, base_bytes, base_typ, base_bits,

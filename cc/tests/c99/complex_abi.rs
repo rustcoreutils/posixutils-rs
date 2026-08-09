@@ -366,3 +366,63 @@ fn c99_complex_argument_spilled_to_the_stack() {
     "#;
     assert_eq!(compile_and_run("c99_complex_arg_spilled", src, &[]), 0);
 }
+
+/// #C4: mixed-precision complex arithmetic and initialization.
+///
+/// This is not an exotic case — `<complex.h>` defines `I` as
+/// `__builtin_complex(0.0, 1.0)`, a **double** complex, so the textbook
+/// spelling `x + y*I` is a conversion at every precision except `double`.
+/// Both the binary operator and the initializer read the source with the
+/// *target's* base type and stride, so an 8-byte-strided value read with a
+/// 16-byte stride picked up the wrong bytes: `3.0L * I` gave `0 + 9i`.
+#[test]
+fn c99_complex_mixed_precision() {
+    let src = r#"
+        #include <complex.h>
+        int main(void) {
+            /* the spelling every C book uses, at all three precisions */
+            float _Complex f = 2.0f + 3.0f * I;
+            float *pf = (float *)&f;
+            if (pf[0] != 2.0f || pf[1] != 3.0f) return 1;
+
+            double _Complex d = 2.0 + 3.0 * I;
+            double *pd = (double *)&d;
+            if (pd[0] != 2.0 || pd[1] != 3.0) return 2;
+
+            long double _Complex l = 2.0L + 3.0L * I;
+            long double *pl = (long double *)&l;
+            if (pl[0] != 2.0L || pl[1] != 3.0L) return 3;
+
+            /* the multiply alone, which is where the stride went wrong */
+            long double _Complex m = 3.0L * I;
+            pl = (long double *)&m;
+            if (pl[0] != 0.0L || pl[1] != 3.0L) return 4;
+
+            /* narrowing as well as widening */
+            double _Complex wide = __builtin_complex(1.5, 2.5);
+            float _Complex narrow = wide;
+            pf = (float *)&narrow;
+            if (pf[0] != 1.5f || pf[1] != 2.5f) return 5;
+
+            long double _Complex wider = wide;
+            pl = (long double *)&wider;
+            if (pl[0] != 1.5L || pl[1] != 2.5L) return 6;
+
+            /* assignment, not just initialization */
+            float _Complex assigned;
+            assigned = wide;
+            pf = (float *)&assigned;
+            if (pf[0] != 1.5f || pf[1] != 2.5f) return 7;
+
+            /* both operands complex, different precisions */
+            long double _Complex mixed = wider + wide;
+            pl = (long double *)&mixed;
+            if (pl[0] != 3.0L || pl[1] != 5.0L) return 8;
+            return 0;
+        }
+    "#;
+    assert_eq!(
+        compile_and_run("c99_complex_mixed_precision", src, &["-lm".to_string()]),
+        0
+    );
+}

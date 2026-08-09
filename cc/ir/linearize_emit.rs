@@ -678,6 +678,46 @@ impl<'a> super::linearize::Linearizer<'a> {
         result
     }
 
+    /// The address of a complex operand, converted to `complex_typ` if its own
+    /// base precision differs.
+    ///
+    /// `emit_complex_binary` reads both operands with the *result* type's base
+    /// type and stride, which is only correct when everything already agrees.
+    /// It rarely does: `<complex.h>` defines `I` as `__builtin_complex(0.0,
+    /// 1.0)`, a **double** complex, so `3.0L * I` mixes precisions. Reading an
+    /// 8-byte-strided value with a 16-byte stride picked up the wrong bytes
+    /// entirely — `3.0L * I` came out as `0 + 9i`.
+    pub(crate) fn complex_operand_at_precision(
+        &mut self,
+        expr: &Expr,
+        complex_typ: TypeId,
+    ) -> PseudoId {
+        let src_typ = self.expr_type(expr);
+        let addr = self.complex_operand_addr(expr);
+
+        let src_base = self.types.complex_base(src_typ);
+        let dst_base = self.types.complex_base(complex_typ);
+        if src_base == dst_base {
+            return addr;
+        }
+
+        let src_bits = self.types.size_bits(src_base);
+        let src_bytes = (src_bits / 8) as i64;
+        let dst_bits = self.types.size_bits(dst_base);
+        let dst_bytes = (dst_bits / 8) as i64;
+
+        let result = self.alloc_local_temp(complex_typ);
+        for (src_off, dst_off) in [(0, 0), (src_bytes, dst_bytes)] {
+            let part = self.alloc_pseudo();
+            self.emit(Instruction::load(part, addr, src_off, src_base, src_bits));
+            let part = self.emit_convert(part, src_base, dst_base);
+            self.emit(Instruction::store(
+                part, result, dst_off, dst_base, dst_bits,
+            ));
+        }
+        result
+    }
+
     /// Complex values are stored as two adjacent float/double values (real, imag)
     /// This function expands complex ops to operations on the component parts
     pub(crate) fn emit_complex_binary(
@@ -1065,11 +1105,8 @@ impl<'a> super::linearize::Linearizer<'a> {
         // For complex type assignment, handle specially - copy real and imag parts
         if self.types.is_complex(target_typ) && op == AssignOp::Assign {
             let target_addr = self.linearize_lvalue(target);
-            // A complex-valued expression lowers to the address of the local
-            // holding it, and the source is often an rvalue (a call result,
-            // `__builtin_complex(...)`), which has no lvalue to take.
             let value_addr = if self.types.is_complex(value_typ) {
-                self.linearize_expr(value)
+                self.complex_operand_addr(value)
             } else {
                 self.linearize_lvalue(value)
             };

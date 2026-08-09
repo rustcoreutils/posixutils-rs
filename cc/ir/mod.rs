@@ -1441,6 +1441,18 @@ pub struct Function {
     /// the inliner must generate an explicit struct copy from the caller's
     /// address argument into the local.
     pub implicit_param_copies: Vec<ImplicitParamCopy>,
+    /// Does this function return a complex value?
+    ///
+    /// Complex returns are the one place where the two representations of a
+    /// complex value meet: the callee's `Ret` carries the *address* of the
+    /// value, while at a call site the backend stores the returned registers
+    /// into the result local, so that pseudo's slot holds the value itself.
+    /// Inlining splices the callee's body in and drops the call, which would
+    /// hand the caller an address where it expects a value.
+    ///
+    /// Bridging the two needs the base type and stride, and the optimizer has
+    /// no `TypeTable` to ask, so such functions are simply not inlined.
+    pub returns_complex: bool,
     /// Block ID -> index in `blocks` vec (O(1) lookup)
     block_idx: HashMap<BasicBlockId, usize>,
     /// Pseudo ID -> index in `pseudos` vec (O(1) lookup)
@@ -1463,6 +1475,7 @@ impl Default for Function {
             is_noreturn: false,
             is_inline: false,
             implicit_param_copies: Vec::new(),
+            returns_complex: false,
             block_idx: HashMap::with_capacity(DEFAULT_BLOCK_CAPACITY),
             pseudo_idx: HashMap::with_capacity(DEFAULT_PSEUDO_CAPACITY),
         }

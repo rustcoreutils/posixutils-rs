@@ -1184,10 +1184,14 @@ impl RegAlloc {
                     self.fp_pseudos.insert(pseudo_id);
                     fp_arg_idx += sse_regs;
                 } else {
+                    // Not enough XMM registers left for every eightbyte, so
+                    // §3.2.3 step 5 puts the *whole* argument in memory — and
+                    // it consumes no registers at all, leaving them for the
+                    // arguments that follow. Advancing `fp_arg_idx` here moved
+                    // every later floating-point parameter one slot along.
                     self.locations
                         .insert(pseudo_id, Loc::IncomingArg(stack_arg_offset));
-                    stack_arg_offset += 16;
-                    fp_arg_idx += sse_regs;
+                    stack_arg_offset += (((types.size_bits(*typ) / 8) as i32) + 7) & !7;
                 }
             } else if is_fp {
                 if fp_arg_idx < fp_arg_regs.len() {

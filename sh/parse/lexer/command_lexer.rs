@@ -219,6 +219,26 @@ impl<'s> SourceString<'s> {
         }
     }
 
+    /// Removes `\`-newline line continuations at the current position and
+    /// reports whether any were removed. Token recognition happens after
+    /// continuation removal (POSIX §2.2.1), so operators, IO_NUMBERs and
+    /// reserved words may all be split across lines.
+    fn skip_line_continuations(&mut self) -> bool {
+        let mut removed = false;
+        while self.lookahead() == '\\' {
+            let before_backslash = self.read_state.clone();
+            self.advance_char();
+            if self.lookahead() == '\n' {
+                self.advance_char();
+                removed = true;
+            } else {
+                self.read_state = before_backslash;
+                break;
+            }
+        }
+        removed
+    }
+
     fn currently_processing_tag(&self, tag: &str) -> bool {
         self.parts[self.read_state.current_part]
             .provenance
@@ -380,7 +400,14 @@ impl<'src> CommandToken<'src> {
     }
 
     fn word(word: Cow<'src, str>) -> Self {
-        match word.as_ref() {
+        // A reserved word may be split by a line continuation (`i\`+newline+`f`),
+        // which is removed before token recognition.
+        let unsplit = if word.contains('\\') {
+            strip_line_continuations(word.as_ref())
+        } else {
+            None
+        };
+        match unsplit.as_deref().unwrap_or(word.as_ref()) {
             "!" => CommandToken::Bang,
             "{" => CommandToken::LBrace,
             "}" => CommandToken::RBrace,
@@ -400,6 +427,22 @@ impl<'src> CommandToken<'src> {
             _ => CommandToken::Word(word),
         }
     }
+}
+
+/// Removes `\`-newline line continuations from a word so that a reserved word
+/// split across lines is still recognized. Returns `None` when the word carries
+/// any other quoting, which would keep it an ordinary word regardless.
+fn strip_line_continuations(word: &str) -> Option<String> {
+    let mut result = String::with_capacity(word.len());
+    let mut chars = word.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if chars.next() == Some('\n') => {}
+            '\\' | '\'' | '"' | '`' | '$' => return None,
+            _ => result.push(c),
+        }
+    }
+    Some(result)
 }
 
 fn advance_and_return<Tok>(lex: &mut CommandLexer, complete_token: Tok) -> Tok {
@@ -462,8 +505,12 @@ impl Lexer for CommandLexer<'_> {
 
 impl<'src> CommandLexer<'src> {
     fn skip_blanks(&mut self) {
-        while is_blank(self.source.lookahead()) {
-            self.source.advance_char();
+        loop {
+            if is_blank(self.source.lookahead()) {
+                self.source.advance_char();
+            } else if !self.source.skip_line_continuations() {
+                break;
+            }
         }
     }
 
@@ -583,6 +630,8 @@ impl<'src> CommandLexer<'src> {
             // multi-character operators all start with a single character
             // operator
             self.source.advance_char();
+            // a continuation may split the two characters of an operator
+            self.source.skip_line_continuations();
 
             let complete_token = match partial_token {
                 CommandToken::And => match self.source.lookahead() {
@@ -603,6 +652,7 @@ impl<'src> CommandLexer<'src> {
                     '>' => advance_and_return(self, CommandToken::LessGreat),
                     '<' => {
                         self.source.advance_char();
+                        self.source.skip_line_continuations();
                         if self.source.lookahead() == '-' {
                             self.source.advance_char();
                             self.read_here_document(true)?
@@ -629,10 +679,12 @@ impl<'src> CommandLexer<'src> {
 
                 let mut number = d.to_digit(10).unwrap();
                 self.source.advance_char();
+                self.source.skip_line_continuations();
                 while let Some(d) = self.source.lookahead().to_digit(10) {
                     number = number.saturating_mul(10);
                     number = number.saturating_add(d);
                     self.source.advance_char();
+                    self.source.skip_line_continuations();
                 }
                 if self.source.lookahead() == '>' || self.source.lookahead() == '<' {
                     CommandToken::IoNumber(number)

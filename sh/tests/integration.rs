@@ -2030,6 +2030,49 @@ mod audit_regressions {
         });
     }
 
+    // ----- Phase 2: line continuation during token recognition -----
+
+    #[test]
+    fn line_continuation_inside_a_reserved_word() {
+        test_script("i\\\nf true; then echo YES; fi\n", "YES\n");
+        test_script("if true; then echo A; f\\\ni\n", "A\n");
+        test_script("for x in 1; do\\\n echo D$x; done\n", "D1\n");
+        // Quoting still keeps a reserved word an ordinary word.
+        test_script("f() { echo fn; }; 'f'\n", "fn\n");
+    }
+
+    #[test]
+    fn line_continuation_inside_an_operator() {
+        test_script("true &\\\n& echo AND\n", "AND\n");
+        test_script("false |\\\n| echo OR\n", "OR\n");
+        test_script("case a in a) echo C;\\\n; esac\n", "C\n");
+        run_successfully_and(
+            "f=\"$TEST_WRITE_DIR/lc_append\"; rm -f \"$f\"; \
+             echo X >\\\n> \"$f\"; cat \"$f\"; rm -f \"$f\"\n",
+            |out| assert_eq!(out, "X\n"),
+        );
+    }
+
+    #[test]
+    fn line_continuation_inside_an_io_number() {
+        run_successfully_and(
+            "f=\"$TEST_WRITE_DIR/lc_ionum\"; rm -f \"$f\"; \
+             echo Y 1\\\n> \"$f\"; cat \"$f\"; rm -f \"$f\"\n",
+            |out| assert_eq!(out, "Y\n"),
+        );
+    }
+
+    #[test]
+    fn escaped_backslash_before_a_newline_in_double_quotes() {
+        // `\\` is a literal backslash, so the newline after it is literal too
+        // rather than a line continuation.
+        test_script("echo \"a\\\\\nb\"\n", "a\\\nb\n");
+        // A backslash only escapes $ ` \" \\ and <newline> inside double quotes.
+        test_script("echo \"\\$(echo hi)\"\n", "$(echo hi)\n");
+        test_script("echo \"a\\\nb\"\n", "ab\n");
+        test_script("echo \"a\\nb\"\n", "a\\nb\n");
+    }
+
     #[test]
     fn fc_out_of_range_endpoints_do_not_underflow() {
         // `fc -l 0` and out-of-range endpoints must clamp, never underflow.

@@ -858,12 +858,23 @@ impl<'a> Linearizer<'a> {
                     struct_params.push((name, param.symbol, param.typ, pseudo_id));
                 }
             } else if self.types.is_complex(param.typ) {
-                // `long double _Complex` is MEMORY class: it arrives on the
-                // stack, not in FP registers, so it is handled like a large
-                // aggregate — the pseudo already names its incoming address.
-                // Treating it as a register-passed complex left the local
-                // never filled, and the callee read zeros.
-                if crate::arch::lir::memory_class_bytes(self.types, param.typ).is_some() {
+                // Does this complex parameter arrive by address or in
+                // registers? Ask the *target's* ABI: on x86_64 only
+                // `long double _Complex` is MEMORY class, but on Apple
+                // aarch64 `long double` is a plain double, so all three are
+                // ordinary two-register HFAs there.
+                //
+                // Getting it wrong is not a missing copy but a duplicated
+                // one: the address path emits a load from the incoming
+                // pointer while the prologue also stores the argument
+                // registers into the same local, and the load wins — reading
+                // whatever happened to be in the first integer register.
+                let abi = get_abi_for_conv(CallingConv::C, self.target);
+                let by_address = matches!(
+                    abi.classify_param(param.typ, self.types),
+                    crate::abi::ArgClass::Indirect { .. }
+                );
+                if by_address {
                     struct_params.push((name, param.symbol, param.typ, pseudo_id));
                 } else {
                     // Complex parameters: copy to local storage so real/imag access works

@@ -215,12 +215,15 @@ impl JobManager {
         self.job_index(id).map(|i| &mut self.jobs[i])
     }
 
-    pub fn current(&self) -> Option<&Job> {
-        self.jobs.last()
-    }
-
     pub fn current_mut(&mut self) -> Option<&mut Job> {
         self.jobs.last_mut()
+    }
+
+    pub fn remove_job_by_pid(&mut self, pid: Pid) -> Option<Job> {
+        let index = self.jobs.iter().position(|job| job.pid == pid)?;
+        let job = self.jobs.remove(index);
+        self.update_positions();
+        Some(job)
     }
 
     pub fn remove_job(&mut self, id: JobId) -> Option<Job> {

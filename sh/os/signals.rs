@@ -343,6 +343,18 @@ impl SignalManager {
         }
     }
 
+    /// Re-installs `saved`'s dispositions, after a `reset()` that turned out
+    /// not to be followed by replacing the process (a failed `exec`).
+    pub fn restore(&mut self, saved: Self) {
+        for signal in SIGNALS {
+            let signal = *signal;
+            if signal == Signal::SigKill || signal == Signal::SigStop {
+                continue;
+            }
+            self.set_action(signal, saved.actions[signal as usize].clone());
+        }
+    }
+
     pub fn set_action(&mut self, signal: Signal, action: TrapAction) {
         assert!(signal != Signal::SigKill && signal != Signal::SigStop);
 
@@ -393,6 +405,18 @@ impl SignalManager {
     pub fn get_sigint_count(&self) -> u32 {
         self.sigint_count
     }
+}
+
+/// The signal a `128 + signo` exit status stands for, if any. POSIX 2.15 makes
+/// `exit n` with such a status terminate the shell by that signal.
+pub fn signal_from_exit_status(status: libc::c_int) -> Option<Signal> {
+    if !(129..=192).contains(&status) {
+        return None;
+    }
+    Signal::try_from(status - 128)
+        .ok()
+        // the shell cannot raise these on itself in a meaningful way
+        .filter(|&signal| signal != Signal::SigKill && signal != Signal::SigStop)
 }
 
 /// A signal number reported by `wait`. A child may be killed by a signal the

@@ -95,6 +95,8 @@ pub struct SetOptions {
     pub vi: bool,
     /// -o pipefail
     pub pipefail: bool,
+    /// -i; reported by `$-` but not settable with `set`
+    pub interactive: bool,
 }
 
 impl Default for SetOptions {
@@ -115,6 +117,7 @@ impl Default for SetOptions {
             nolog: false,
             vi: false,
             pipefail: false,
+            interactive: false,
         }
     }
 }
@@ -234,6 +237,9 @@ impl SetOptions {
         }
         if self.hashall {
             result.push('h');
+        }
+        if self.interactive {
+            result.push('i');
         }
         if self.monitor {
             result.push('m');

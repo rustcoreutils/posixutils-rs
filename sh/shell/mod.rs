@@ -16,7 +16,9 @@ use crate::cli::terminal::Terminal;
 use crate::jobs::{JobManager, JobState};
 use crate::nonempty::NonEmpty;
 use crate::os::errno::Errno;
-use crate::os::signals::{kill, Signal, SignalManager};
+use crate::os::signals::{
+    handle_signal_default, kill, signal_from_exit_status, Signal, SignalManager,
+};
 use crate::os::{
     close, dup, dup2, exec, find_command, fork, getpgid, getpgrp, is_process_in_foreground, pipe,
     setpgid, tcsetpgrp, waitpid, ExecError, ForkResult, OsError, OsResult, Pid, WaitStatus,
@@ -192,6 +194,9 @@ pub struct Shell {
     pub getopts_state: (usize, usize),
     /// Time of the last mail check and the last-seen mtime of each mail file.
     pub mail_check: MailCheck,
+    /// `$!`: the process id of the most recent asynchronous command. It stays
+    /// set once the job has been waited for and removed from the job table.
+    pub last_background_pid: Option<Pid>,
 }
 
 #[derive(Default, Clone)]
@@ -258,6 +263,14 @@ impl Shell {
         self.execute_action(exit_action);
         if self.is_interactive && !self.is_subshell {
             write_history_to_file(&self.history, &self.environment);
+        }
+        // POSIX 2.15: when `n` is a status that would result from termination
+        // by a signal, the shell shall terminate by that signal, taking no
+        // other action associated with it.
+        if let Some(signal) = signal_from_exit_status(code) {
+            self.signal_manager.reset();
+            unsafe { handle_signal_default(signal) };
+            let _ = kill(self.shell_pid, Some(signal));
         }
         std::process::exit(code);
     }
@@ -346,37 +359,55 @@ impl Shell {
         }
     }
 
-    pub fn exec(&mut self, command: OsString, args: &[String], opened_files: &OpenedFiles) -> ! {
+    /// Replaces the shell process with `command`. Returns only when the exec
+    /// failed, giving the diagnostic and the status POSIX prescribes for it;
+    /// the caller decides whether to exit (see `exec_and_exit`).
+    pub fn try_exec(
+        &mut self,
+        command: OsString,
+        args: &[String],
+        opened_files: &OpenedFiles,
+    ) -> (String, i32) {
+        let saved_signals = self.signal_manager.clone();
         self.signal_manager.reset();
-        match exec(command.clone(), args, opened_files, &self.environment).unwrap_err() {
-            ExecError::OsError(err) => {
-                self.eprint(&format!("{err}\n"));
-                self.exit(1)
-            }
-            ExecError::CannotExecute(errno) => {
-                if errno == Errno::ENOEXEC {
-                    match execute_file_as_script(self, Path::new(&command)) {
-                        Ok(status) => self.exit(status),
-                        Err(ScriptExecutionError::ParsingError(err)) => {
-                            self.eprint(&format!(
-                                "sh: parsing error ({}): {}\n",
-                                err.lineno, err.message
-                            ));
-                            self.exit(2)
-                        }
-                        Err(ScriptExecutionError::IoError(_)) => {
-                            // fallthrough to the default error
+        let failure =
+            match exec(command.clone(), args, opened_files, &self.environment).unwrap_err() {
+                ExecError::OsError(err) => (format!("{err}\n"), 126),
+                ExecError::CannotExecute(errno) => {
+                    if errno == Errno::ENOEXEC {
+                        match execute_file_as_script(self, Path::new(&command)) {
+                            Ok(status) => self.exit(status),
+                            Err(ScriptExecutionError::ParsingError(err)) => {
+                                self.eprint(&format!(
+                                    "sh: parsing error ({}): {}\n",
+                                    err.lineno, err.message
+                                ));
+                                self.exit(2)
+                            }
+                            Err(ScriptExecutionError::IoError(_)) => {
+                                // fallthrough to the default error
+                            }
                         }
                     }
+                    (
+                        format!(
+                            "sh: failed to execute {} ({})\n",
+                            command.to_string_lossy(),
+                            errno
+                        ),
+                        126,
+                    )
                 }
-                self.eprint(&format!(
-                    "sh: failed to execute {} ({})\n",
-                    command.to_string_lossy(),
-                    errno
-                ));
-                self.exit(126);
-            }
-        }
+            };
+        // the process was not replaced after all, so the shell keeps its traps
+        self.signal_manager.restore(saved_signals);
+        failure
+    }
+
+    pub fn exec(&mut self, command: OsString, args: &[String], opened_files: &OpenedFiles) -> ! {
+        let (message, status) = self.try_exec(command, args, opened_files);
+        self.eprint(&message);
+        self.exit(status)
     }
 
     pub fn fork_and_exec(
@@ -1019,6 +1050,7 @@ impl Shell {
                     self.exit(status);
                 }
                 Ok(ForkResult::Parent { child }) => {
+                    self.last_background_pid = Some(child);
                     self.background_jobs
                         .add_job(child, conjunction.to_string(), JobState::Running);
                     0
@@ -1128,9 +1160,11 @@ impl Shell {
     pub fn initialize_from_system(
         program_name: String,
         args: Vec<String>,
-        set_options: SetOptions,
+        mut set_options: SetOptions,
         is_interactive: bool,
     ) -> Shell {
+        // `$-` reports `i` for an interactive shell; `set` cannot change it.
+        set_options.interactive = is_interactive;
         // > If a variable is initialized from the environment, it shall be marked for
         // > export immediately
         let mut environment =
@@ -1290,6 +1324,7 @@ impl Default for Shell {
             getopts_state: (0, 0),
             mail_check: MailCheck::default(),
             terminal: Terminal::default(),
+            last_background_pid: None,
         }
     }
 }

@@ -150,9 +150,8 @@ fn expand_simple_parameter_into(
                 }
                 SpecialParameter::Bang => expanded_word.append(
                     shell
-                        .background_jobs
-                        .current()
-                        .map(|job| job.pid.to_string())
+                        .last_background_pid
+                        .map(|pid| pid.to_string())
                         .unwrap_or_default(),
                     inside_double_quotes,
                     true,
@@ -443,9 +442,20 @@ mod tests {
             ),
             "".to_string()
         );
+        // `$!` is latched when an asynchronous command is started and, unlike
+        // the job table, survives the job being waited for.
+        shell.last_background_pid = Some(123);
         shell
             .background_jobs
             .add_job(123, "cmd".to_string(), JobState::Running);
+        assert_eq!(
+            expand_parameter_to_string(
+                ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Bang)),
+                &mut shell
+            ),
+            "123".to_string()
+        );
+        shell.background_jobs.remove_job_by_pid(123);
         assert_eq!(
             expand_parameter_to_string(
                 ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Bang)),

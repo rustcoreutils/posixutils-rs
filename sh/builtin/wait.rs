@@ -39,6 +39,8 @@ impl BuiltinUtility for Wait {
             for pid in pids {
                 let pid = parse_pid(pid, shell).map_err(|err| format!("wait: {err}"))?;
                 status = wait_for_pid(pid, shell);
+                // the job has been reaped, so it is no longer a known job
+                shell.background_jobs.remove_job_by_pid(pid);
             }
         }
 

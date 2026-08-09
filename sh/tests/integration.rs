@@ -149,12 +149,16 @@ fn test_script_expect_error_status_and_stdout(script: &str, stdout: Option<&str>
 }
 
 fn expect_exit_code(script: &str, exit_code: i32) {
+    expect_cli_exit_code(vec!["-s".to_string()], script, exit_code)
+}
+
+fn expect_cli_exit_code(args: Vec<String>, stdin: &str, exit_code: i32) {
     set_env_vars();
     run_test_with_checker(
         TestPlan {
             cmd: "sh".to_string(),
-            args: vec!["-s".to_string()],
-            stdin_data: script.to_string(),
+            args,
+            stdin_data: stdin.to_string(),
             expected_out: "".to_string(),
             expected_err: "".to_string(),
             expected_exit_code: 0,
@@ -2151,6 +2155,70 @@ mod audit_regressions {
             "ulimit -f 100\nulimit -S -f 50\nulimit -S -f\nulimit -H -f\n",
             |out| assert_eq!(out, "50\n100\n"),
         );
+    }
+
+    // ----- Phase 5: exit status, $-, $!, exec -----
+
+    #[test]
+    fn unrecoverable_read_error_exits_128() {
+        // sh.md: 128 when commands cannot be read; 127 for a missing file and
+        // 126 for one that is not a shell script.
+        set_env_vars();
+        expect_cli_exit_code(vec!["/proc/self/mem".to_string()], "", 128);
+    }
+
+    #[test]
+    fn non_script_command_file_exits_126() {
+        set_env_vars();
+        expect_cli_exit_code(vec!["/bin/true".to_string()], "", 126);
+    }
+
+    #[test]
+    fn exit_with_a_signal_status_terminates_by_that_signal() {
+        // POSIX 2.15: `exit n` for an n that encodes termination by a signal
+        // makes the shell terminate by that signal.
+        set_env_vars();
+        run_script_with_checker("exit 143\n", |output| {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(
+                output.status.signal(),
+                Some(15),
+                "expected termination by SIGTERM, got {:?}",
+                output.status
+            );
+        });
+    }
+
+    #[test]
+    fn exec_reports_127_when_the_command_is_not_found() {
+        set_env_vars();
+        expect_cli_exit_code(
+            vec!["-c".to_string(), "exec no_such_command_xyz".to_string()],
+            "",
+            127,
+        );
+        expect_cli_exit_code(
+            vec!["-c".to_string(), "exec /etc/hostname".to_string()],
+            "",
+            126,
+        );
+    }
+
+    #[test]
+    fn dollar_bang_survives_wait() {
+        // `$!` names the most recent background command, and stays set after
+        // `wait` has reaped it.
+        run_successfully_and(
+            "sleep 0.05 & p=$!; wait; test \"$!\" = \"$p\" && echo same\n",
+            |out| assert_eq!(out, "same\n"),
+        );
+    }
+
+    #[test]
+    fn wait_removes_the_job_it_reaped() {
+        run_successfully_and("sleep 0.05 & p=$!; wait $p; echo \"[$(jobs)]\"\n", |out| {
+            assert_eq!(out, "[]\n")
+        });
     }
 
     #[test]

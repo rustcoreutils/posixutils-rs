@@ -327,12 +327,15 @@ fn main() -> Result<(), Box<dyn Error>> {
                 Ok(file_contents) => execute_string(&file_contents, &mut shell),
                 Err(err) => {
                     eprintln!("sh: {file}: {err}");
-                    // POSIX EXIT STATUS: 127 if the command_file could not be found,
-                    // otherwise treat it as not executable (ENOEXEC-like) -> 126.
-                    let status = if err.kind() == std::io::ErrorKind::NotFound {
-                        127
-                    } else {
-                        126
+                    // POSIX EXIT STATUS: 127 when the command_file could not be
+                    // found, 128 for an unrecoverable read error, otherwise
+                    // treat it as not executable (ENOEXEC-like) -> 126.
+                    let status = match err.kind() {
+                        std::io::ErrorKind::NotFound => 127,
+                        std::io::ErrorKind::InvalidData | std::io::ErrorKind::PermissionDenied => {
+                            126
+                        }
+                        _ => 128,
                     };
                     std::process::exit(status);
                 }

@@ -324,6 +324,14 @@ fn driver_library_order_is_significant() {
 /// An archive named *before* the object that references it is searched too
 /// early to satisfy that reference. This is the observable consequence of
 /// honoring position, and it fails only if ordering is really preserved.
+///
+/// Linux only. The negative half of this pair depends on the *linker's*
+/// one-pass archive semantics, which is a GNU ld property, not a POSIX
+/// guarantee: Apple's linker resolves across every archive it is given
+/// regardless of order, so naming a library early still satisfies a later
+/// reference. `driver_library_order_is_significant` covers the positive
+/// direction — that c17 preserves the order it was given — everywhere.
+#[cfg(target_os = "linux")]
 #[test]
 fn driver_library_named_before_its_user_does_not_resolve() {
     let w = WorkDir::new("libearly");

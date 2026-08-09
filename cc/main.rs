@@ -722,11 +722,24 @@ fn link_objects(
     // -B selects which form of a library `-l` prefers. GNU ld spells this
     // -Bstatic / -Bdynamic and it is positional, so it goes ahead of the
     // libraries it governs.
+    //
+    // Apple's linker has neither spelling and rejects both outright — it has
+    // no general way to say "prefer the archive", only naming the .a directly.
+    // Dynamic is what it does anyway, so honoring `-B dynamic` there means
+    // emitting nothing; `-B static` cannot be honored, and saying so is better
+    // than a link that silently ignores it.
+    let gnu_binding = target.os != Os::MacOS;
     match args.binding.as_deref() {
-        Some("static") => {
+        Some("static") if gnu_binding => {
             link_cmd.arg("-Wl,-Bstatic");
         }
-        Some("dynamic") => {
+        Some("static") => {
+            eprintln!(
+                "{}",
+                gettext("c17: warning: -B static: this platform's linker cannot prefer archives")
+            );
+        }
+        Some("dynamic") if gnu_binding => {
             link_cmd.arg("-Wl,-Bdynamic");
         }
         _ => {}
@@ -754,7 +767,7 @@ fn link_objects(
     // -B governs only the libraries named on the command line. The host driver
     // appends its own (libc, libgcc_s) after everything here, and those are not
     // usually available as archives, so binding is restored before them.
-    if args.binding.as_deref() == Some("static") {
+    if args.binding.as_deref() == Some("static") && gnu_binding {
         link_cmd.arg("-Wl,-Bdynamic");
     }
 

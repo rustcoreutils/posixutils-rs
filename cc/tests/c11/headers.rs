@@ -211,3 +211,47 @@ fn c17_long_double_round_trip() {
     "#;
     assert_eq!(compile_and_run("c17_long_double_round_trip", src, &[]), 0);
 }
+
+/// #X8: `__STDC_NO_THREADS__` is a claim about the host, so the only thing
+/// worth asserting is that the claim is true. Whether it holds varies —
+/// glibc ships `<threads.h>`, macOS SDKs do not — so a test that demands one
+/// answer is testing the build machine, not the compiler.
+#[test]
+fn c11_no_threads_macro_agrees_with_the_host() {
+    let r = preprocess_text(
+        "c11_threads_probe",
+        "#ifdef __STDC_NO_THREADS__\nNOTHREADS\n#else\nHASTHREADS\n#endif\n",
+        &[],
+    );
+    assert!(r.success, "{}", r.stderr);
+    let claims_threads = r.stdout.contains("HASTHREADS");
+
+    let src = "#include <threads.h>\nint main(void){ return 0; }\n";
+    let compiles = {
+        let dir = tempfile::Builder::new()
+            .prefix("c11_threads_")
+            .tempdir()
+            .unwrap();
+        let c = dir.path().join("t.c");
+        std::fs::write(&c, src).unwrap();
+        let asm = dir.path().join("t.s");
+        run_c17(&["-S", &c.to_string_lossy(), "-o", &asm.to_string_lossy()]).success
+    };
+
+    assert_eq!(
+        claims_threads,
+        compiles,
+        "__STDC_NO_THREADS__ is {}, but <threads.h> {} — the macro must \
+         describe the host it was built for",
+        if claims_threads {
+            "undefined"
+        } else {
+            "defined"
+        },
+        if compiles {
+            "compiles"
+        } else {
+            "does not compile"
+        },
+    );
+}

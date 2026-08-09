@@ -27,9 +27,8 @@ pub fn get_macros() -> Vec<(&'static str, Option<&'static str>)> {
         ("__REGISTER_PREFIX__", Some("")),
         ("__USER_LABEL_PREFIX__", Some("")),
         // Long double is 80-bit extended precision (padded to 128 bits)
-        ("__SIZEOF_LONG_DOUBLE__", Some("16")),
-        ("__LDBL_MANT_DIG__", Some("64")),
-        ("__LDBL_DIG__", Some("18")),
+        // `long double` is described by `get_float_limit_macros` and
+        // `get_additional_sizeof_macros`; see the note in the aarch64 list.
         // SSE is baseline for x86_64
         ("__SSE__", Some("1")),
         ("__SSE2__", Some("1")),

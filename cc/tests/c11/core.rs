@@ -304,11 +304,10 @@ int main(void) {
 
     // ========== __STDC_NO_THREADS__ (returns 10-19) ==========
 
-    // Hosted implementation: threads available via system headers
-    // __STDC_NO_THREADS__ must NOT be defined
-    #ifdef __STDC_NO_THREADS__
-    return 10;
-    #endif
+    // Not asserted here: whether this is defined depends on whether the host
+    // ships <threads.h>, and macOS SDKs do not. That the macro agrees with the
+    // host either way is what matters, and
+    // `c11_no_threads_macro_agrees_with_the_host` checks it.
 
     // ========== Atomics ARE supported (returns 20-29) ==========
 

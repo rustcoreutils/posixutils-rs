@@ -10,9 +10,8 @@ The goal is to create clean, race-free userland utilities that are POSIX
 compliant, maximizing compatibility with existing shell scripts while
 minimizing bloat.
 
-Implementation goals include clean, safe Rust code and maximal use of
-small Rust community crates.  This project's utilities should "look like
-normal Rust programs."
+Implementation goals include clean, safe Rust code and minimal deps beyond
+std and libc.  This project's utilities should "look like normal Rust programs."
 
 Core POSIX specification: https://pubs.opengroup.org/onlinepubs/9699919799/   (Old, free edition.  POSIX.2024 was just released.)
 

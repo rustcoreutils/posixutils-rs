@@ -39,7 +39,7 @@ pub enum LexerMode {
 /// C17 5.2.1.1 still mandates the nine trigraphs; they were removed in C23,
 /// and POSIX's own RATIONALE (88224) notes that *not* supporting them is the
 /// non-conforming choice. They are nonetheless off by default here, behind
-/// `-trigraphs`, because the replacement applies everywhere including inside
+/// `--trigraphs`, because the replacement applies everywhere including inside
 /// string literals — `"What??!"` silently becomes `"What|"` — and real code is
 /// far more likely to contain `??` by accident than by intent. GCC ships them
 /// off by default for the same reason.
@@ -64,7 +64,13 @@ pub fn replace_trigraphs(buf: &[u8]) -> std::borrow::Cow<'_, [u8]> {
         (b'-', b'~'),
     ];
 
-    if !buf.windows(2).any(|w| w == b"??") {
+    // Test for a *complete* trigraph, not a bare `??`: source that pairs two
+    // question marks without forming one — `"Really??"` — is exactly the
+    // common case, and has nothing to replace.
+    let has_trigraph = buf
+        .windows(3)
+        .any(|w| w[0] == b'?' && w[1] == b'?' && TRIGRAPHS.iter().any(|(c, _)| *c == w[2]));
+    if !has_trigraph {
         return std::borrow::Cow::Borrowed(buf);
     }
 
@@ -1399,6 +1405,16 @@ mod tests {
         assert_eq!(replace_trigraphs(b"What??!").as_ref(), b"What|");
         assert_eq!(replace_trigraphs(b"What??x").as_ref(), b"What??x");
         assert_eq!(replace_trigraphs(b"a??").as_ref(), b"a??");
+        // ...and is borrowed, not copied: a `??` that forms no trigraph must
+        // not cost an allocation, or the doc's promise is only half true.
+        assert!(matches!(
+            replace_trigraphs(b"puts(\"Really??\");"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            replace_trigraphs(b"a??"),
+            std::borrow::Cow::Borrowed(_)
+        ));
         // Overlapping question marks: only a complete `??x` is replaced.
         assert_eq!(replace_trigraphs(b"???=").as_ref(), b"?#");
     }

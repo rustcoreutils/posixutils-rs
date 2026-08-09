@@ -4200,7 +4200,7 @@ pub struct PreprocessConfig<'a> {
     pub no_std_inc: bool,
     /// If true, disable builtin headers (-nobuiltininc)
     pub no_builtin_inc: bool,
-    /// If true, apply translation phase 1 trigraph replacement (-trigraphs).
+    /// If true, apply translation phase 1 trigraph replacement (--trigraphs).
     pub trigraphs: bool,
 }
 

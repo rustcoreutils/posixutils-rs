@@ -55,6 +55,7 @@ fn read_until_from_non_blocking_fd(
     fd: RawFd,
     delimiter: u8,
     backslash_escape: bool,
+    continuation_prompt: Option<&str>,
 ) -> Result<ReadResult, BuiltinError> {
     let mut buffer = Vec::new();
     let mut result = ExpandedWord::default();
@@ -65,6 +66,9 @@ fn read_until_from_non_blocking_fd(
                 escape_next = false;
                 if next == delimiter {
                     // backslash-<delimiter>: line continuation.
+                    if let Some(prompt) = continuation_prompt {
+                        eprint!("{prompt}");
+                    }
                     continue;
                 } else if next == b'\\' {
                     buffer.push(b'\\');
@@ -100,6 +104,7 @@ fn read_until_from_file(
     fd: RawFd,
     delimiter: u8,
     backslash_escape: bool,
+    continuation_prompt: Option<&str>,
 ) -> Result<ReadResult, BuiltinError> {
     let mut buffer = Vec::new();
     let mut result = ExpandedWord::default();
@@ -111,6 +116,9 @@ fn read_until_from_file(
             if next == delimiter {
                 // backslash-<delimiter> is a line continuation: drop both and
                 // keep reading (the delimiter is usually <newline>).
+                if let Some(prompt) = continuation_prompt {
+                    eprint!("{prompt}");
+                }
                 continue;
             } else if next == b'\\' {
                 buffer.push(b'\\');
@@ -144,6 +152,7 @@ fn read_from_stdin(
     shell: &mut Shell,
     delimiter: u8,
     backslash_escape: bool,
+    continuation_prompt: Option<&str>,
 ) -> Result<ReadResult, BuiltinError> {
     if std::io::stdin().is_terminal() {
         let original_terminal_settings = shell.terminal.reset();
@@ -154,13 +163,19 @@ fn read_from_stdin(
             std::io::stdin().as_raw_fd(),
             delimiter,
             backslash_escape,
+            continuation_prompt,
         );
 
         shell.terminal.set(original_terminal_settings);
 
         result
     } else {
-        read_until_from_file(std::io::stdin().as_raw_fd(), delimiter, backslash_escape)
+        read_until_from_file(
+            std::io::stdin().as_raw_fd(),
+            delimiter,
+            backslash_escape,
+            continuation_prompt,
+        )
     }
 }
 
@@ -208,14 +223,30 @@ fn read_until(
     delimiter: u8,
     backslash_escape: bool,
 ) -> Result<ReadResult, BuiltinError> {
+    // An interactive shell writes PS2 to stderr for each line continuation
+    // that `read` consumes (only possible without -r).
+    let continuation_prompt = if shell.is_interactive && backslash_escape {
+        Some(shell.get_ps2())
+    } else {
+        None
+    };
+    let continuation_prompt = continuation_prompt.as_deref();
     match file {
-        OpenedFile::Stdin => read_from_stdin(shell, delimiter, backslash_escape),
-        OpenedFile::ReadFile(file) => {
-            read_until_from_file(file.as_raw_fd(), delimiter, backslash_escape)
+        OpenedFile::Stdin => {
+            read_from_stdin(shell, delimiter, backslash_escape, continuation_prompt)
         }
-        OpenedFile::ReadWriteFile(file) => {
-            read_until_from_file(file.as_raw_fd(), delimiter, backslash_escape)
-        }
+        OpenedFile::ReadFile(file) => read_until_from_file(
+            file.as_raw_fd(),
+            delimiter,
+            backslash_escape,
+            continuation_prompt,
+        ),
+        OpenedFile::ReadWriteFile(file) => read_until_from_file(
+            file.as_raw_fd(),
+            delimiter,
+            backslash_escape,
+            continuation_prompt,
+        ),
         OpenedFile::HereDocument(contents) => Ok(read_from_here_document(
             contents,
             delimiter,
@@ -283,17 +314,36 @@ impl BuiltinUtility for BuiltinRead {
             vars.len(),
         );
 
+        // POSIX EXIT STATUS: 1 means end-of-file, so an assignment failure has
+        // to report something greater than 1.
+        let mut assignment_failed = false;
         for i in 0..fields.len() {
-            shell
+            if shell
                 .assign_global(vars[i].clone(), fields[i].to_string())
-                .map_err(|_| format!("read: cannot set readonly variable {}", vars[i]))?;
+                .is_err()
+            {
+                opened_files.write_err(format!(
+                    "read: {} {}\n",
+                    gettext("cannot set readonly variable"),
+                    vars[i]
+                ));
+                assignment_failed = true;
+            }
         }
         if fields.len() < vars.len() {
             for var in &vars[fields.len()..] {
-                shell
-                    .assign_global(var.clone(), String::new())
-                    .map_err(|_| format!("read: cannot set readonly variable {}", var))?;
+                if shell.assign_global(var.clone(), String::new()).is_err() {
+                    opened_files.write_err(format!(
+                        "read: {} {}\n",
+                        gettext("cannot set readonly variable"),
+                        var
+                    ));
+                    assignment_failed = true;
+                }
             }
+        }
+        if assignment_failed {
+            return Ok(2);
         }
 
         if input.reached_eof {

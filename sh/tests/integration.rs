@@ -1388,6 +1388,7 @@ mod builtin {
 /// audit issue number. Tests are grouped by remediation phase.
 mod audit_regressions {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     /// Asserts the script fails (non-zero exit) WITHOUT panicking (a Rust
     /// panic surfaces as exit code 101 and a "panicked" message on stderr).
@@ -2249,6 +2250,79 @@ mod audit_regressions {
         expect_clean_failure("fc -n\n");
         expect_clean_failure("fc -s -r\n");
         expect_clean_failure("fc -r -s\n");
+    }
+
+    // ----- Phase 7: previously deferred findings -----
+
+    #[test]
+    fn async_list_reads_from_dev_null_without_job_control() {
+        // POSIX 2.11: with job control disabled, an asynchronous list gets
+        // /dev/null for standard input unless it redirects it itself.
+        set_env_vars();
+        run_test_with_checker(
+            TestPlan {
+                cmd: "sh".to_string(),
+                args: vec!["-s".to_string()],
+                stdin_data: "{ read x; echo \"child got [$x] rc=$?\"; } &\nsleep 0.3\n".to_string(),
+                expected_out: String::new(),
+                expected_err: String::new(),
+                expected_exit_code: 0,
+            },
+            |_, output| {
+                assert_eq!(
+                    String::from_utf8_lossy(&output.stdout),
+                    "child got [] rc=1\n"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn async_list_ignores_sigint_without_job_control() {
+        run_successfully_and(
+            "{ sleep 0.4; echo CHILD-SURVIVED; } &\nsleep 0.05\nkill -INT $!\nwait\n",
+            |out| assert_eq!(out, "CHILD-SURVIVED\n"),
+        );
+    }
+
+    #[test]
+    fn bg_on_an_already_running_job_succeeds() {
+        // POSIX: a job already running in the background needs no action.
+        run_successfully_and("set -m\nsleep 0.2 & bg %1\necho rc=$?\n", |out| {
+            assert!(out.ends_with("rc=0\n"), "got {out:?}")
+        });
+    }
+
+    #[test]
+    fn read_reports_an_assignment_error_above_end_of_file() {
+        // POSIX read EXIT STATUS: 1 is end-of-file, >1 is an error.
+        set_env_vars();
+        run_script_with_checker("read x </dev/null; echo rc=$?\n", |output| {
+            assert_eq!(String::from_utf8_lossy(&output.stdout), "rc=1\n");
+        });
+        run_script_with_checker(
+            "readonly x=1\nprintf 'a\\n' | { read x; echo rc=$?; }\n",
+            |output| {
+                assert_eq!(String::from_utf8_lossy(&output.stdout), "rc=2\n");
+            },
+        );
+    }
+
+    #[test]
+    fn dot_reports_an_unreadable_file() {
+        set_env_vars();
+        let dir = Path::new(concat!(env!("CARGO_TARGET_TMPDIR"), "/sh_test_write_dir"));
+        std::fs::create_dir_all(dir).unwrap();
+        let script = dir.join("dot_unreadable.sh");
+        std::fs::write(&script, "echo nope\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o000)).unwrap();
+        run_script_with_checker(&format!(". '{}'\n", script.display()), |output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("cannot open file"), "got {stderr:?}");
+            assert!(!output.status.success());
+        });
+        let _ = std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644));
+        let _ = std::fs::remove_file(&script);
     }
 
     #[test]

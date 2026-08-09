@@ -1046,6 +1046,17 @@ impl Shell {
                     self.become_subshell();
                     // should never fail
                     setpgid(0, 0).expect("failed to create process group for background job");
+                    if !self.set_options.monitor {
+                        // POSIX 2.11: without job control, an asynchronous list
+                        // ignores SIGINT and SIGQUIT and reads from /dev/null,
+                        // so it neither competes for the terminal nor dies with
+                        // the foreground job.
+                        self.signal_manager
+                            .set_action(Signal::SigInt, TrapAction::Ignore);
+                        self.signal_manager
+                            .set_action(Signal::SigQuit, TrapAction::Ignore);
+                        self.opened_files.redirect_stdin_to_dev_null();
+                    }
                     let status = self.interpret_and_or_list(&conjunction.elements, false);
                     self.exit(status);
                 }

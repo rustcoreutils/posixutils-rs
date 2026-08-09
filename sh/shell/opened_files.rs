@@ -242,6 +242,21 @@ impl OpenedFiles {
         self.write_file(STDERR_FILENO, string.as_ref());
     }
 
+    /// Points standard input at `/dev/null`, unless it has already been
+    /// redirected explicitly (POSIX 2.11, asynchronous lists).
+    pub fn redirect_stdin_to_dev_null(&mut self) {
+        if !matches!(
+            self.opened_files.get(&STDIN_FILENO),
+            Some(OpenedFile::Stdin)
+        ) {
+            return;
+        }
+        if let Ok(file) = File::options().read(true).open("/dev/null") {
+            self.opened_files
+                .insert(STDIN_FILENO, OpenedFile::ReadFile(Rc::new(file)));
+        }
+    }
+
     pub fn get_file(&self, fileno: u32) -> Option<&OpenedFile> {
         self.opened_files.get(&fileno)
     }

@@ -20,10 +20,11 @@ fn run_background_job(
     opened_files: &mut OpenedFiles,
 ) -> Result<(), String> {
     if job.state != JobState::Stopped {
-        return Err(format!(
-            "bg: job {arg} is already running in the background"
-        ));
+        // POSIX: a job that is already running in the background needs no
+        // action; this is not an error.
+        return Ok(());
     }
+    let _ = arg;
     kill(job.pid, Some(Signal::SigCont))
         .map_err(|err| format!("bg: failed to resume job {arg} ({err})"))?;
     opened_files.write_out(format!("[{}] {}\n", job.number, job.command));
@@ -42,12 +43,6 @@ impl BuiltinUtility for Bg {
         if !shell.set_options.monitor {
             return Err(gettext("bg: cannot use bg when job control is disabled").into());
         }
-        if !shell.is_interactive {
-            return Err(gettext("bg: cannot use bg in a non-interactive shell").into());
-        }
-        if shell.is_subshell {
-            return Err(gettext("bg: cannot use bg in a subshell environment").into());
-        }
 
         let mut status = 0;
         let args = skip_option_terminator(args);
@@ -58,7 +53,7 @@ impl BuiltinUtility for Bg {
                     status = 1;
                 }
             } else {
-                opened_files.write_err("bg: no background jobs");
+                opened_files.write_err(gettext("bg: no background jobs\n"));
                 status = 1;
             }
         } else {
@@ -71,12 +66,13 @@ impl BuiltinUtility for Bg {
                                 status = 1;
                             }
                         } else {
-                            opened_files.write_err(format!("bg: '{arg}' no such job"));
+                            opened_files
+                                .write_err(format!("bg: '{arg}' {}\n", gettext("no such job")));
                             status = 1;
                         }
                     }
                     Err(_) => {
-                        opened_files.write_err(format!("bg: '{arg}' no such job"));
+                        opened_files.write_err(format!("bg: '{arg}' {}\n", gettext("no such job")));
                         status = 1
                     }
                 }

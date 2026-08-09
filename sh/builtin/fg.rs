@@ -49,12 +49,6 @@ impl BuiltinUtility for Fg {
         if !shell.set_options.monitor {
             return Err(gettext("fg: cannot use fg when job control is disabled").into());
         }
-        if !shell.is_interactive {
-            return Err(gettext("fg: cannot use fg in a non-interactive shell").into());
-        }
-        if shell.is_subshell {
-            return Err(gettext("fg: cannot use fg in a subshell environment").into());
-        }
 
         let mut status = 0;
         let args = skip_option_terminator(args);
@@ -68,7 +62,7 @@ impl BuiltinUtility for Fg {
                     }
                 }
             } else {
-                opened_files.write_err("fg: no background jobs");
+                opened_files.write_err(gettext("fg: no background jobs\n"));
                 status = 1;
             }
         } else {
@@ -84,12 +78,13 @@ impl BuiltinUtility for Fg {
                                 }
                             }
                         } else {
-                            opened_files.write_err(format!("fg: '{arg}' no such job"));
+                            opened_files
+                                .write_err(format!("fg: '{arg}' {}\n", gettext("no such job")));
                             status = 1;
                         }
                     }
                     Err(_) => {
-                        opened_files.write_err(format!("fg: '{arg}' no such job"));
+                        opened_files.write_err(format!("fg: '{arg}' {}\n", gettext("no such job")));
                         status = 1
                     }
                 }

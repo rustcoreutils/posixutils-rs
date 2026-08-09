@@ -9,6 +9,7 @@
 
 use crate::parse::word::{Parameter, ParameterExpansion, SpecialParameter};
 use crate::shell::{CommandExecutionError, Shell};
+use crate::wordexp::tilde::TildeMode;
 use crate::wordexp::{
     expand_word_to_string, simple_word_expansion_into, word_to_pattern, ExpandedWord,
     ExpansionResult,
@@ -209,7 +210,7 @@ pub fn expand_parameter_into(
                 shell,
             );
             if parameter_type.is_unset() || (*default_on_null && parameter_type.is_null()) {
-                simple_word_expansion_into(expanded_word, default, false, shell)?;
+                simple_word_expansion_into(expanded_word, default, TildeMode::Word, shell)?;
             }
             expanded_word.extend(expanded_parameter);
         }
@@ -282,7 +283,7 @@ pub fn expand_parameter_into(
             if !parameter_type.is_unset()
                 && (!parameter_type.is_null() || *substitute_null_with_word)
             {
-                simple_word_expansion_into(expanded_word, word, false, shell)?
+                simple_word_expansion_into(expanded_word, word, TildeMode::Word, shell)?
             }
         }
         ParameterExpansion::StrLen(parameter) => {

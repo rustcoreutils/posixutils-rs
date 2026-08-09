@@ -2073,6 +2073,41 @@ mod audit_regressions {
         test_script("echo \"a\\nb\"\n", "a\\nb\n");
     }
 
+    // ----- Phase 3: declaration-utility assignment expansion (POSIX 2.9.1) --
+
+    #[test]
+    fn declaration_utilities_tilde_expand_assignment_operands() {
+        set_env_vars();
+        run_successfully_and("HOME=/H; export a=~; echo \"$a\"\n", |out| {
+            assert_eq!(out, "/H\n")
+        });
+        run_successfully_and("HOME=/H; export p=~/b:~/c; echo \"$p\"\n", |out| {
+            assert_eq!(out, "/H/b:/H/c\n")
+        });
+        run_successfully_and("HOME=/H; readonly b=~; echo \"$b\"\n", |out| {
+            assert_eq!(out, "/H\n")
+        });
+        run_successfully_and("HOME=/H; command export c=~; echo \"$c\"\n", |out| {
+            assert_eq!(out, "/H\n")
+        });
+        // A plain assignment already worked and must keep working.
+        run_successfully_and("HOME=/H; v=~; echo \"$v\"\n", |out| assert_eq!(out, "/H\n"));
+    }
+
+    #[test]
+    fn declaration_utility_operands_are_not_split_or_globbed() {
+        set_env_vars();
+        // The value of an assignment-shaped operand is a single field even
+        // when it contains IFS characters.
+        run_successfully_and("IFS=:; export v=a:b:c; echo \"$v\"\n", |out| {
+            assert_eq!(out, "a:b:c\n")
+        });
+        // Non-assignment operands keep their ordinary expansion.
+        run_successfully_and("HOME=/H; export -p >/dev/null; x=~; echo \"$x\"\n", |out| {
+            assert_eq!(out, "/H\n")
+        });
+    }
+
     #[test]
     fn fc_out_of_range_endpoints_do_not_underflow() {
         // `fc -l 0` and out-of-range endpoints must clamp, never underflow.

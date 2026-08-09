@@ -25,14 +25,16 @@ use crate::parse::command::{
     Assignment, CaseItem, Command, CommandType, CompleteCommand, CompoundCommand, Conjunction,
     FunctionDefinition, If, LogicalOp, Name, Pipeline, Redirection, SimpleCommand,
 };
-use crate::parse::command_parser::CommandParser;
+use crate::parse::command_parser::{is_valid_name, CommandParser};
 use crate::parse::word::WordPair;
 use crate::parse::word_parser::parse_word;
 use crate::parse::{AliasTable, ParserError};
 use crate::shell::environment::{CannotModifyReadonly, Environment, Value};
 use crate::shell::history::{initialize_history_from_system, write_history_to_file, History};
 use crate::shell::opened_files::OpenedFiles;
-use crate::wordexp::{expand_word, expand_word_to_string, word_to_pattern};
+use crate::wordexp::{
+    expand_declaration_operand, expand_word, expand_word_to_string, word_to_pattern,
+};
 use gettextrs::gettext;
 use std::collections::HashMap;
 use std::ffi::{CString, OsString};
@@ -215,6 +217,27 @@ fn split_mailpath_entry(entry: &str) -> (String, Option<String>) {
         }
     }
     (path, None)
+}
+
+/// POSIX 2.9.1 declaration utilities: `export` and `readonly`, plus `command`
+/// when it invokes one of them.
+fn is_declaration_utility(name: &str, words: &[WordPair]) -> bool {
+    match name {
+        "export" | "readonly" => true,
+        "command" => words
+            .iter()
+            .skip(1)
+            .find(|word| !word.as_string.starts_with('-'))
+            .is_some_and(|word| word.as_string == "export" || word.as_string == "readonly"),
+        _ => false,
+    }
+}
+
+/// True for a word of the form `name=…`, whose value a declaration utility
+/// expands as if it were an assignment.
+fn is_assignment_shaped(word: &str) -> bool {
+    word.split_once('=')
+        .is_some_and(|(name, _)| is_valid_name(name))
 }
 
 impl Shell {
@@ -529,8 +552,23 @@ impl Shell {
         let mut expanded_words = Vec::new();
         // reset
         self.last_command_substitution_status = 0;
-        for word_pair in &simple_command.words {
-            expanded_words.extend(expand_word(&word_pair.word, false, self)?);
+        // POSIX 2.9.1: for a declaration utility, operands that look like
+        // assignments are expanded as assignments (tilde expansion after `=`
+        // and after each `:`) and are not field-split or globbed. The command
+        // name decides this, so the first word is expanded on its own.
+        let mut declaration_utility = false;
+        for (index, word_pair) in simple_command.words.iter().enumerate() {
+            if index > 0 && declaration_utility && is_assignment_shaped(&word_pair.as_string) {
+                expanded_words.push(expand_declaration_operand(&word_pair.word, self)?);
+                continue;
+            }
+            let fields = expand_word(&word_pair.word, false, self)?;
+            if index == 0 {
+                declaration_utility = fields
+                    .first()
+                    .is_some_and(|name| is_declaration_utility(name, &simple_command.words));
+            }
+            expanded_words.extend(fields);
         }
         if self.set_options.xtrace {
             self.trace(&expanded_words);

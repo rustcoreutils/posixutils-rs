@@ -20,13 +20,15 @@
 //! Note: Only ustar and pax formats are supported. Appending to cpio
 //! is problematic due to device/inode conflicts (per POSIX).
 
-use crate::archive::ArchiveFormat;
+use crate::archive::{ArchiveFormat, ArchiveReader};
 use crate::blocked_io::BlockedWriter;
 use crate::error::{PaxError, PaxResult};
+use crate::formats::{CpioReader, PaxReader, UstarReader};
 use crate::modes::write::WriteOptions;
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const BLOCK_SIZE: usize = 512;
 
@@ -37,6 +39,7 @@ pub fn append_to_archive(
     options: &WriteOptions,
     requested_format: Option<ArchiveFormat>,
     record_size: usize,
+    update: bool,
 ) -> PaxResult<()> {
     // Open archive for read+write
     let mut file = OpenOptions::new()
@@ -66,6 +69,21 @@ pub fn append_to_archive(
         ));
     }
 
+    // -u drops the operands that are no newer than the member already in the
+    // archive, so only genuinely updated files are appended.
+    let selected: Vec<PathBuf>;
+    let files = if update {
+        let archived = archived_mtimes(archive_path, format)?;
+        selected = files
+            .iter()
+            .filter(|path| is_newer_than_member(path, &archived))
+            .cloned()
+            .collect();
+        &selected[..]
+    } else {
+        files
+    };
+
     // Find the end-of-archive position (two zero blocks)
     let append_pos = find_end_of_archive(&mut file)?;
 
@@ -90,6 +108,68 @@ pub fn append_to_archive(
     file.set_len(end)?;
 
     Ok(())
+}
+
+/// The latest modification time recorded for each member name in the archive.
+///
+/// A name can appear more than once -- that is what appending does -- and the
+/// most recent copy is the one an extraction would produce, so it is the one
+/// `-u` has to compare against.
+fn archived_mtimes(archive_path: &Path, format: ArchiveFormat) -> PaxResult<HashMap<PathBuf, u64>> {
+    let file = File::open(archive_path)?;
+    let mut mtimes: HashMap<PathBuf, u64> = HashMap::new();
+
+    fn collect<R: ArchiveReader>(
+        archive: &mut R,
+        mtimes: &mut HashMap<PathBuf, u64>,
+    ) -> PaxResult<()> {
+        while let Some(entry) = archive.read_entry()? {
+            mtimes
+                .entry(entry.path.clone())
+                .and_modify(|t| *t = std::cmp::max(*t, entry.mtime))
+                .or_insert(entry.mtime);
+            archive.skip_data()?;
+        }
+        Ok(())
+    }
+
+    match format {
+        ArchiveFormat::Ustar => collect(&mut UstarReader::new(file), &mut mtimes)?,
+        ArchiveFormat::Pax => collect(&mut PaxReader::new(file), &mut mtimes)?,
+        ArchiveFormat::Cpio => collect(&mut CpioReader::new(file), &mut mtimes)?,
+    }
+
+    Ok(mtimes)
+}
+
+/// Whether `path` should be appended under `-u`.
+///
+/// A file with no member of that name is new and always appended. Otherwise it
+/// is appended only if it is strictly newer, so a re-run with nothing changed
+/// adds nothing. A file that cannot be stat'ed is left to the write pass, which
+/// reports the failure properly.
+fn is_newer_than_member(path: &Path, archived: &HashMap<PathBuf, u64>) -> bool {
+    let Some(&member_mtime) = archived.get(path) else {
+        return true;
+    };
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return true;
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.mtime() > member_mtime as i64
+    }
+    #[cfg(not(unix))]
+    {
+        metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() > member_mtime)
+            .unwrap_or(true)
+    }
 }
 
 /// Detect archive format from file

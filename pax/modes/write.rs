@@ -11,9 +11,10 @@
 
 use crate::archive::{ArchiveEntry, ArchiveFormat, ArchiveWriter, EntryType, HardLinkTracker};
 use crate::error::PaxResult;
-use crate::formats::{CpioWriter, PaxWriter, UstarWriter};
+use crate::formats::{checksum_bytes, CpioFormat, CpioWriter, PaxWriter, UstarWriter};
 use crate::interactive::{InteractivePrompter, RenameResult};
 use crate::options::{FormatOptions, InvalidAction};
+use crate::pattern::{matches_excluded, Pattern};
 use crate::subst::{apply_substitutions, SubstResult, Substitution};
 use std::fs::{self, File, Metadata};
 use std::io::{Read, Write};
@@ -42,6 +43,10 @@ pub struct WriteOptions {
     pub substitutions: Vec<Substitution>,
     /// Format-specific options (-o option)
     pub format_options: FormatOptions,
+    /// cpio header flavor to emit; only consulted for `ArchiveFormat::Cpio`
+    pub cpio_format: CpioFormat,
+    /// Names not to archive (tar `--exclude` / `-X`)
+    pub exclude_patterns: Vec<Pattern>,
 }
 
 /// Create an archive from files
@@ -58,7 +63,7 @@ pub fn create_archive<W: Write>(
             archive.finish()
         }
         ArchiveFormat::Cpio => {
-            let mut archive = CpioWriter::new(writer);
+            let mut archive = CpioWriter::with_format(writer, options.cpio_format);
             write_files(&mut archive, files, options)?;
             archive.finish()
         }
@@ -117,6 +122,13 @@ fn write_path<W: ArchiveWriter>(
     is_cli_arg: bool,
     prompter: &mut Option<InteractivePrompter>,
 ) -> PaxResult<()> {
+    // Exclusion is decided on the name as traversed, before -s renaming, and
+    // before stat: an excluded directory returns here, so its whole subtree is
+    // skipped without the caller needing an ancestor check.
+    if matches_excluded(&options.exclude_patterns, &path.to_string_lossy()) {
+        return Ok(());
+    }
+
     // Get metadata
     let follow = should_follow_symlink(options, is_cli_arg);
     let metadata = if follow {
@@ -384,6 +396,9 @@ fn write_symlink<W: ArchiveWriter>(
     // For cpio format, the symlink target is written as file data
     // Set size to target length so cpio writer includes it
     entry.size = target_str.len() as u64;
+    if archive.needs_data_checksum() {
+        entry.data_checksum = Some(checksum_bytes(0, target_str.as_bytes()));
+    }
 
     archive.write_entry(&entry)?;
     // Write the symlink target as data (needed for cpio format)
@@ -510,6 +525,12 @@ fn write_file<W: ArchiveWriter>(
         // Otherwise fall through and write the file contents.
     }
 
+    // The cpio "crc" format records the data checksum in the header, ahead of
+    // the data, so that one format costs an extra read of the file.
+    if archive.needs_data_checksum() {
+        entry.data_checksum = Some(file_checksum(src_path)?);
+    }
+
     // Write regular file
     archive.write_entry(&entry)?;
 
@@ -526,6 +547,20 @@ fn write_file<W: ArchiveWriter>(
     }
 
     Ok(())
+}
+
+/// Sum a file's bytes for the cpio "crc" format's c_check field
+fn file_checksum(path: &Path) -> PaxResult<u32> {
+    let mut file = File::open(path)?;
+    let mut buf = [0u8; 8192];
+    let mut sum = 0u32;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            return Ok(sum);
+        }
+        sum = checksum_bytes(sum, &buf[..n]);
+    }
 }
 
 /// Copy file data to archive
@@ -672,22 +707,36 @@ pub fn write_files_to_archive<W: ArchiveWriter>(
 
 /// Read file list from stdin (one path per line)
 pub fn read_file_list<R: Read>(reader: R) -> PaxResult<Vec<PathBuf>> {
+    read_file_list_sep(reader, b'\n')
+}
+
+/// Read a list of pathnames separated by `sep`.
+///
+/// `sep` is `b'\n'` for the usual `find | pax` pipeline and `b'\0'` for the
+/// `find -print0` pipeline that tar's `--null` and cpio's `-0` select, which is
+/// the only way a pathname containing a newline survives the trip.
+pub fn read_file_list_sep<R: Read>(reader: R, sep: u8) -> PaxResult<Vec<PathBuf>> {
     use std::io::BufRead;
+    use std::os::unix::ffi::OsStrExt;
 
-    let reader = std::io::BufReader::new(reader);
+    let mut reader = std::io::BufReader::new(reader);
     let mut files = Vec::new();
+    let mut buf = Vec::new();
 
-    for line in reader.lines() {
-        let line = line?;
-        // `lines()` already strips the trailing newline. Keep the rest verbatim
-        // so pathnames with leading/trailing spaces survive; skip only a wholly
-        // empty line (e.g. a trailing blank line).
-        if !line.is_empty() {
-            files.push(PathBuf::from(line));
+    loop {
+        buf.clear();
+        if reader.read_until(sep, &mut buf)? == 0 {
+            return Ok(files);
+        }
+        if buf.last() == Some(&sep) {
+            buf.pop();
+        }
+        // Keep the name verbatim so pathnames with leading or trailing spaces
+        // survive; skip only a wholly empty entry (e.g. a trailing separator).
+        if !buf.is_empty() {
+            files.push(PathBuf::from(std::ffi::OsStr::from_bytes(&buf).to_owned()));
         }
     }
-
-    Ok(files)
 }
 
 /// Reset access time of a file to the specified time

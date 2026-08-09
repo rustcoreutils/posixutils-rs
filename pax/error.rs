@@ -9,7 +9,7 @@
 
 use std::fmt;
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 /// Error type for pax operations
 #[derive(Debug)]
@@ -24,6 +24,11 @@ pub enum PaxError {
     PathTooLong(String),
     /// Pattern matching error
     PatternError(String),
+    /// Malformed command line: the message is already a complete diagnostic
+    Usage(String),
+    /// Nothing left to do and nothing went wrong -- `--help` and `--version`
+    /// have already written their output and want a success exit.
+    EarlyExit,
 }
 
 impl fmt::Display for PaxError {
@@ -40,6 +45,8 @@ impl fmt::Display for PaxError {
             PaxError::InvalidHeader(msg) => write!(f, "{}: {}", gettext("Invalid header"), msg),
             PaxError::PathTooLong(path) => write!(f, "{}: {}", gettext("Path too long"), path),
             PaxError::PatternError(msg) => write!(f, "{}: {}", gettext("Pattern error"), msg),
+            PaxError::Usage(msg) => write!(f, "{}", msg),
+            PaxError::EarlyExit => Ok(()),
         }
     }
 }
@@ -90,10 +97,34 @@ pub fn had_error() -> bool {
     HAD_ERROR.load(Ordering::Relaxed)
 }
 
+/// The name this run was invoked under: `pax`, or `tar`/`cpio` when the
+/// compatibility front-ends are driving. Diagnostics are prefixed with it, so a
+/// script that greps its own stderr sees the command it actually ran.
+static PROGRAM_NAME: AtomicU8 = AtomicU8::new(0);
+
+/// Record which command line was parsed, for diagnostic prefixes.
+pub fn set_program_name(name: &'static str) {
+    let code = match name {
+        "tar" => 1,
+        "cpio" => 2,
+        _ => 0,
+    };
+    PROGRAM_NAME.store(code, Ordering::Relaxed);
+}
+
+/// The name to prefix diagnostics with.
+pub fn program_name() -> &'static str {
+    match PROGRAM_NAME.load(Ordering::Relaxed) {
+        1 => "tar",
+        2 => "cpio",
+        _ => "pax",
+    }
+}
+
 /// Write a per-item diagnostic to standard error in the `pax: <context>: <err>`
 /// form and flag the run as failed, so that processing can continue (per POSIX)
 /// while the final exit status is still non-zero.
 pub fn report_error(context: impl fmt::Display, err: impl fmt::Display) {
-    eprintln!("pax: {}: {}", context, err);
+    eprintln!("{}: {}: {}", program_name(), context, err);
     note_error();
 }

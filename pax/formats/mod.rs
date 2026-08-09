@@ -13,6 +13,6 @@ pub mod cpio;
 pub mod pax;
 pub mod ustar;
 
-pub use cpio::{CpioReader, CpioWriter};
+pub use cpio::{checksum_bytes, CpioFormat, CpioReader, CpioWriter};
 pub use pax::{PaxReader, PaxWriter};
 pub use ustar::{UstarReader, UstarWriter};

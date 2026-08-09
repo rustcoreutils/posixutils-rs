@@ -78,6 +78,13 @@ pub struct ArchiveEntry {
     pub devmajor: u32,
     /// Device minor number (for block/char devices)
     pub devminor: u32,
+    /// Sum of the member's data bytes, modulo 2^32.
+    ///
+    /// Only the cpio "crc" format (magic 070702) needs one, and it needs it in
+    /// the header -- which is written before the data. A writer that returns
+    /// true from `ArchiveWriter::needs_data_checksum` asks its caller to fill
+    /// this in first; every other format leaves it `None`.
+    pub data_checksum: Option<u32>,
 }
 
 impl ArchiveEntry {
@@ -104,6 +111,7 @@ impl ArchiveEntry {
             nlink: 1,
             devmajor: 0,
             devminor: 0,
+            data_checksum: None,
         }
     }
 
@@ -157,6 +165,15 @@ pub trait ArchiveWriter {
     /// from the original file") and which is the only way not to lose it.
     fn supports_hardlinks(&self) -> bool {
         true
+    }
+
+    /// Whether `write_entry` needs `ArchiveEntry::data_checksum` filled in.
+    ///
+    /// True only for the cpio "crc" format, whose c_check field sits in the
+    /// header ahead of the data it covers. Callers that say true here must read
+    /// the member's contents once to sum them before handing over the entry.
+    fn needs_data_checksum(&self) -> bool {
+        false
     }
 }
 

@@ -15,7 +15,7 @@ use crate::formats::{CpioReader, PaxReader, UstarReader};
 use crate::options::{
     format_list_entry, format_mode_symbolic, format_time_traditional, FormatOptions, ListEntryInfo,
 };
-use crate::pattern::{find_matching_pattern_subtree, Pattern};
+use crate::pattern::{find_matching_pattern_subtree, matches_excluded, Pattern};
 use crate::subst::{apply_substitutions, SubstResult, Substitution};
 use std::collections::HashSet;
 use std::io::{Read, Write};
@@ -39,6 +39,10 @@ pub struct ListOptions {
     /// `-d`: a directory pattern matches only the directory itself, not its
     /// subtree.
     pub dir_only: bool,
+    /// Members not to list (tar `--exclude` / `-X`)
+    pub exclude_patterns: Vec<Pattern>,
+    /// Leading pathname components to drop (tar `--strip-components`)
+    pub strip_components: usize,
 }
 
 /// List archive contents
@@ -112,6 +116,19 @@ fn list_entries<R: ArchiveReader, W: Write>(
                     }
                 }
             }
+            // --strip-components reshapes the name the listing reports, so that
+            // `tar -t` shows what `tar -x` would create.
+            if options.strip_components > 0 {
+                let name = entry.path.to_string_lossy().into_owned();
+                match crate::modes::read::strip_leading_components(&name, options.strip_components)
+                {
+                    Some(stripped) => entry.path = PathBuf::from(stripped),
+                    None => {
+                        archive.skip_data()?;
+                        continue;
+                    }
+                }
+            }
             if let Err(e) = print_entry(writer, &entry, options) {
                 crate::error::report_error(entry.path.display(), e);
             }
@@ -143,6 +160,12 @@ fn should_list(
     matched_patterns: &mut HashSet<usize>,
 ) -> Option<bool> {
     let path = entry.path.to_string_lossy();
+
+    // tar's exclusion list is independent of the pattern operands and wins over
+    // them, so it is applied to the stored name before anything else.
+    if matches_excluded(&options.exclude_patterns, &path) {
+        return None;
+    }
 
     // Try matching against both the full path and the path with "./" prefix stripped
     let path_stripped = path.strip_prefix("./").unwrap_or(&path);

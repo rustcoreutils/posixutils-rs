@@ -69,14 +69,53 @@ const BIN_MAGIC: u16 = 0o070707; // Binary magic as 16-bit value
 const TRAILER: &str = "TRAILER!!!";
 
 /// cpio format variant
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum CpioFormat {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CpioFormat {
     /// POSIX octet-oriented (odc) format
+    #[default]
     Odc,
     /// SVR4 new ASCII format (newc)
     Newc,
+    /// SVR4 new ASCII format with a data checksum (newc, magic 070702)
+    NewcCrc,
     /// Old binary format
     Binary,
+}
+
+impl CpioFormat {
+    /// Byte alignment the format requires for the header+name and the data.
+    ///
+    /// The ASCII odc format is unaligned; newc pads both to 4 bytes and the old
+    /// binary format to the 2-byte word it stores its fields in.
+    fn alignment(self) -> usize {
+        match self {
+            CpioFormat::Odc => 1,
+            CpioFormat::Newc | CpioFormat::NewcCrc => 4,
+            CpioFormat::Binary => 2,
+        }
+    }
+
+    /// Fixed header size in bytes, excluding the pathname that follows it.
+    fn header_size(self) -> usize {
+        match self {
+            CpioFormat::Odc => ODC_HEADER_SIZE,
+            CpioFormat::Newc | CpioFormat::NewcCrc => NEWC_HEADER_SIZE,
+            CpioFormat::Binary => BIN_HEADER_SIZE,
+        }
+    }
+}
+
+/// Fold `data` into a running cpio "crc" checksum.
+///
+/// Despite the name the 070702 format uses no CRC polynomial: c_check is simply
+/// the sum of every data byte as an unsigned 32-bit quantity.
+pub fn checksum_bytes(acc: u32, data: &[u8]) -> u32 {
+    data.iter().fold(acc, |a, &b| a.wrapping_add(b as u32))
+}
+
+/// Bytes of padding needed to bring `len` up to a multiple of `align`.
+fn pad_len(len: u64, align: u64) -> usize {
+    ((align - (len % align)) % align) as usize
 }
 
 // c_mode file type bits
@@ -171,7 +210,12 @@ impl<R: Read> ArchiveReader for CpioReader<R> {
                 let mut header = [0u8; NEWC_HEADER_SIZE - 6];
                 self.read_exact(&mut header)?;
                 let (entry, padding) = parse_newc_header(&header, &mut self.reader)?;
-                (CpioFormat::Newc, entry, padding)
+                let variant = if &magic6 == NEWC_CRC_MAGIC {
+                    CpioFormat::NewcCrc
+                } else {
+                    CpioFormat::Newc
+                };
+                (variant, entry, padding)
             } else {
                 return Err(PaxError::InvalidFormat(format!(
                     "bad cpio magic: {:?}",
@@ -225,16 +269,19 @@ impl<R: Read> ArchiveReader for CpioReader<R> {
 /// cpio archive writer
 pub struct CpioWriter<W: Write> {
     writer: W,
+    /// Header flavor emitted for every member
+    format: CpioFormat,
     bytes_written: u64,
     current_size: u64,
     inode_counter: u64,
 }
 
 impl<W: Write> CpioWriter<W> {
-    /// Create a new cpio writer
-    pub fn new(writer: W) -> Self {
+    /// Create a new cpio writer emitting `format`
+    pub fn with_format(writer: W, format: CpioFormat) -> Self {
         CpioWriter {
             writer,
+            format,
             bytes_written: 0,
             current_size: 0,
             inode_counter: 1,
@@ -247,6 +294,15 @@ impl<W: Write> CpioWriter<W> {
         self.inode_counter += 1;
         ino
     }
+
+    /// Emit `n` NUL bytes of alignment padding (`n` is under 4 by construction)
+    fn pad(&mut self, n: usize) -> PaxResult<()> {
+        const PADDING: [u8; 4] = [0; 4];
+        if n > 0 {
+            self.writer.write_all(&PADDING[..n])?;
+        }
+        Ok(())
+    }
 }
 
 impl<W: Write> ArchiveWriter for CpioWriter<W> {
@@ -257,6 +313,10 @@ impl<W: Write> ArchiveWriter for CpioWriter<W> {
         false
     }
 
+    fn needs_data_checksum(&self) -> bool {
+        self.format == CpioFormat::NewcCrc
+    }
+
     fn write_entry(&mut self, entry: &ArchiveEntry) -> PaxResult<()> {
         let ino = if entry.ino == 0 {
             self.next_inode()
@@ -264,13 +324,26 @@ impl<W: Write> ArchiveWriter for CpioWriter<W> {
             entry.ino
         };
 
-        let header = build_header(entry, ino)?;
-        self.writer.write_all(&header)?;
-
-        // Write filename including NUL
+        // The name is stored NUL-terminated and c_namesize counts the NUL.
         let name = entry.path.to_string_lossy();
+        let namesize = name.len() + 1;
+
+        let header = match self.format {
+            CpioFormat::Odc => build_odc_header(entry, ino, namesize)?,
+            CpioFormat::Newc | CpioFormat::NewcCrc => {
+                build_newc_header(entry, ino, namesize, self.format)?
+            }
+            CpioFormat::Binary => build_bin_header(entry, ino, namesize)?,
+        };
+        self.writer.write_all(&header)?;
         self.writer.write_all(name.as_bytes())?;
         self.writer.write_all(&[0])?;
+
+        // newc aligns the header plus its name to 4 bytes, the old binary
+        // format to 2; odc is unaligned and pads nothing.
+        let align = self.format.alignment() as u64;
+        let pad = pad_len((self.format.header_size() + namesize) as u64, align);
+        self.pad(pad)?;
 
         self.bytes_written = 0;
         self.current_size = entry.size;
@@ -284,8 +357,12 @@ impl<W: Write> ArchiveWriter for CpioWriter<W> {
     }
 
     fn finish_entry(&mut self) -> PaxResult<()> {
-        // cpio doesn't need padding between entries
-        Ok(())
+        // Pad against the declared size, not the bytes actually handed over:
+        // that is what the reader derives its own padding from, so the two stay
+        // in step even if a member was short.
+        let align = self.format.alignment() as u64;
+        let pad = pad_len(self.current_size, align);
+        self.pad(pad)
     }
 
     fn finish(&mut self) -> PaxResult<()> {
@@ -626,8 +703,26 @@ fn parse_mode_type(mode: u32) -> EntryType {
 // Header building functions
 // ============================================================================
 
-/// Build a cpio header (ODC format for writing)
-fn build_header(entry: &ArchiveEntry, ino: u64) -> PaxResult<Vec<u8>> {
+/// Device major/minor packed into a single traditional cpio c_rdev field.
+fn packed_rdev(entry: &ArchiveEntry) -> u64 {
+    if entry.is_device() {
+        ((entry.devmajor as u64 & 0xff) << 8) | (entry.devminor as u64 & 0xff)
+    } else {
+        0
+    }
+}
+
+/// Link count as recorded in a header.
+///
+/// No real cpio ever writes zero here, and a reader that trusts the field would
+/// see a file with no names at all, so synthesized entries (the trailer, and
+/// anything built without stat data) are floored at one.
+fn header_nlink(entry: &ArchiveEntry) -> u64 {
+    std::cmp::max(entry.nlink, 1) as u64
+}
+
+/// Build a cpio ODC (POSIX octet-oriented) header
+fn build_odc_header(entry: &ArchiveEntry, ino: u64, namesize: usize) -> PaxResult<Vec<u8>> {
     let mut header = Vec::with_capacity(ODC_HEADER_SIZE);
 
     // c_magic
@@ -653,22 +748,120 @@ fn build_header(entry: &ArchiveEntry, ino: u64) -> PaxResult<Vec<u8>> {
     write_octal_field(&mut header, entry.nlink as u64, 6)?;
 
     // c_rdev (device major/minor for block/char devices)
-    let rdev = if entry.is_device() {
-        ((entry.devmajor as u64 & 0xff) << 8) | (entry.devminor as u64 & 0xff)
-    } else {
-        0
-    };
-    write_octal_field(&mut header, rdev, 6)?;
+    write_octal_field(&mut header, packed_rdev(entry), 6)?;
 
     // c_mtime
     write_octal_field(&mut header, entry.mtime, 11)?;
 
     // c_namesize (including NUL)
-    let namesize = entry.path.to_string_lossy().len() + 1;
     write_octal_field(&mut header, namesize as u64, 6)?;
 
     // c_filesize
     write_octal_field(&mut header, entry.size, 11)?;
+
+    Ok(header)
+}
+
+/// Build a cpio SVR4 "newc" header, with or without the 070702 data checksum.
+///
+/// Every field is eight hex digits. The identity fields (c_ino, c_dev*) are
+/// masked on overflow for the same reason as in ODC -- they only group hard
+/// links -- while the fields the reader frames the stream with are rejected if
+/// they do not fit.
+fn build_newc_header(
+    entry: &ArchiveEntry,
+    ino: u64,
+    namesize: usize,
+    format: CpioFormat,
+) -> PaxResult<Vec<u8>> {
+    let mut header = Vec::with_capacity(NEWC_HEADER_SIZE);
+
+    header.extend_from_slice(if format == CpioFormat::NewcCrc {
+        NEWC_CRC_MAGIC
+    } else {
+        NEWC_MAGIC
+    });
+
+    write_hex_field_masked(&mut header, ino);
+    write_hex_field(&mut header, build_mode(entry) as u64, "c_mode")?;
+    write_hex_field_masked(&mut header, entry.uid as u64);
+    write_hex_field_masked(&mut header, entry.gid as u64);
+    write_hex_field(&mut header, header_nlink(entry), "c_nlink")?;
+    write_hex_field(&mut header, entry.mtime, "c_mtime")?;
+    write_hex_field(&mut header, entry.size, "c_filesize")?;
+
+    // c_devmajor / c_devminor describe the filesystem the member came from;
+    // parse_newc_header folds them back into ArchiveEntry::dev the same way.
+    write_hex_field_masked(&mut header, (entry.dev >> 8) & 0xff);
+    write_hex_field_masked(&mut header, entry.dev & 0xff);
+
+    // c_rdevmajor / c_rdevminor describe the device a member *is*.
+    let (rdevmajor, rdevminor) = if entry.is_device() {
+        (entry.devmajor as u64, entry.devminor as u64)
+    } else {
+        (0, 0)
+    };
+    write_hex_field_masked(&mut header, rdevmajor);
+    write_hex_field_masked(&mut header, rdevminor);
+
+    write_hex_field(&mut header, namesize as u64, "c_namesize")?;
+
+    // c_check is zero for 070701. For 070702 it is the unsigned sum of every
+    // data byte, which the caller supplies because it precedes the data here.
+    let check = match format {
+        CpioFormat::NewcCrc => entry.data_checksum.unwrap_or(0) as u64,
+        _ => 0,
+    };
+    write_hex_field(&mut header, check, "c_check")?;
+
+    Ok(header)
+}
+
+/// Build an old binary cpio header.
+///
+/// Fields are 16-bit words in host byte order; c_mtime and c_filesize are two
+/// such words, most significant first. Nothing wider than 16 bits (or 32 for
+/// those two) can be expressed, which is why this format is only a sensible
+/// default for the small trees historic cpio was used on.
+fn build_bin_header(entry: &ArchiveEntry, ino: u64, namesize: usize) -> PaxResult<Vec<u8>> {
+    let mut header = Vec::with_capacity(BIN_HEADER_SIZE);
+
+    let mut push_u16 = |val: u64| header.extend_from_slice(&(val as u16).to_ne_bytes());
+
+    push_u16(BIN_MAGIC as u64);
+    push_u16(entry.dev & 0xffff);
+    push_u16(ino & 0xffff);
+    push_u16(build_mode(entry) as u64 & 0xffff);
+    push_u16(entry.uid as u64 & 0xffff);
+    push_u16(entry.gid as u64 & 0xffff);
+    push_u16(header_nlink(entry) & 0xffff);
+    push_u16(packed_rdev(entry));
+
+    if entry.mtime > u32::MAX as u64 {
+        return Err(PaxError::InvalidHeader(format!(
+            "modification time {} does not fit the binary cpio format",
+            entry.mtime
+        )));
+    }
+    push_u16(entry.mtime >> 16);
+    push_u16(entry.mtime & 0xffff);
+
+    if namesize > u16::MAX as usize {
+        return Err(PaxError::InvalidHeader(format!(
+            "pathname of {} bytes does not fit the binary cpio format",
+            namesize - 1
+        )));
+    }
+    push_u16(namesize as u64);
+
+    if entry.size > u32::MAX as u64 {
+        return Err(PaxError::InvalidHeader(format!(
+            "file size {} does not fit the binary cpio format",
+            entry.size
+        )));
+    }
+    push_u16(entry.size >> 16);
+    push_u16(entry.size & 0xffff);
 
     Ok(header)
 }
@@ -722,6 +915,35 @@ fn write_octal_field_masked(buf: &mut Vec<u8>, val: u64, width: usize) {
     let bytes = s.as_bytes();
     // Keep the last `width` digits (low-order), zero-filled if shorter.
     buf.extend_from_slice(&bytes[bytes.len() - width..]);
+}
+
+/// Width of every field in a cpio newc header.
+const NEWC_FIELD_WIDTH: usize = 8;
+
+/// Write an eight-digit hex newc field, rejecting a value that does not fit.
+///
+/// `field` names the header member for the diagnostic; it is used for the
+/// fields whose value the reader needs verbatim to frame or restore the member.
+fn write_hex_field(buf: &mut Vec<u8>, val: u64, field: &str) -> PaxResult<()> {
+    let s = format!("{:0width$X}", val, width = NEWC_FIELD_WIDTH);
+    if s.len() > NEWC_FIELD_WIDTH {
+        return Err(PaxError::InvalidHeader(format!(
+            "value {} too large for the {} field of the cpio newc format",
+            val, field
+        )));
+    }
+    buf.extend_from_slice(s.as_bytes());
+    Ok(())
+}
+
+/// Write an eight-digit hex newc identity field, masking on overflow.
+///
+/// As with the ODC identity fields, c_ino / c_dev* / c_uid / c_gid only need to
+/// be self-consistent within the archive, and real inode numbers routinely
+/// exceed 32 bits.
+fn write_hex_field_masked(buf: &mut Vec<u8>, val: u64) {
+    let s = format!("{:0width$X}", val & 0xffff_ffff, width = NEWC_FIELD_WIDTH);
+    buf.extend_from_slice(s.as_bytes());
 }
 
 // ============================================================================
@@ -790,6 +1012,131 @@ mod tests {
         // One larger overflows and must be rejected, not truncated.
         let mut buf = Vec::new();
         assert!(write_octal_field(&mut buf, 0o100_000_000_000, 11).is_err());
+    }
+
+    #[test]
+    fn test_pad_len_matches_format_alignment() {
+        // odc is unaligned; newc pads to 4, the old binary format to 2.
+        assert_eq!(pad_len(7, CpioFormat::Odc.alignment() as u64), 0);
+        assert_eq!(pad_len(110 + 11, 4), 3);
+        assert_eq!(pad_len(112, 4), 0);
+        assert_eq!(pad_len(26 + 11, 2), 1);
+        assert_eq!(pad_len(0, 4), 0);
+    }
+
+    #[test]
+    fn test_checksum_bytes_is_a_plain_sum() {
+        assert_eq!(checksum_bytes(0, b""), 0);
+        assert_eq!(checksum_bytes(0, b"\x01\x02\x03"), 6);
+        // It accumulates across calls, so a streamed file sums the same way.
+        assert_eq!(checksum_bytes(checksum_bytes(0, b"\x01"), b"\x02"), 3);
+        // And it wraps rather than panicking on a large file.
+        assert_eq!(checksum_bytes(u32::MAX, b"\x01"), 0);
+    }
+
+    #[test]
+    fn test_build_newc_header_layout() {
+        let entry = ArchiveEntry {
+            path: PathBuf::from("hello"),
+            mode: 0o644,
+            uid: 7,
+            gid: 9,
+            size: 0x1234,
+            mtime: 0x5678,
+            nlink: 1,
+            entry_type: EntryType::Regular,
+            data_checksum: Some(0xABCD),
+            ..Default::default()
+        };
+
+        let plain = build_newc_header(&entry, 0x11, 6, CpioFormat::Newc).unwrap();
+        assert_eq!(plain.len(), NEWC_HEADER_SIZE);
+        assert_eq!(&plain[0..6], NEWC_MAGIC);
+        assert_eq!(&plain[6..14], b"00000011"); // c_ino
+        assert_eq!(&plain[14..22], b"000081A4"); // c_mode: C_ISREG | 0644
+        assert_eq!(&plain[22..30], b"00000007"); // c_uid
+        assert_eq!(&plain[30..38], b"00000009"); // c_gid
+        assert_eq!(&plain[38..46], b"00000001"); // c_nlink
+        assert_eq!(&plain[46..54], b"00005678"); // c_mtime
+        assert_eq!(&plain[54..62], b"00001234"); // c_filesize
+        assert_eq!(&plain[94..102], b"00000006"); // c_namesize
+        assert_eq!(&plain[102..110], b"00000000"); // c_check is zero for 070701
+
+        // The checksummed variant differs only in its magic and c_check.
+        let crc = build_newc_header(&entry, 0x11, 6, CpioFormat::NewcCrc).unwrap();
+        assert_eq!(&crc[0..6], NEWC_CRC_MAGIC);
+        assert_eq!(&crc[102..110], b"0000ABCD");
+        assert_eq!(&crc[6..102], &plain[6..102]);
+    }
+
+    #[test]
+    fn test_build_newc_header_masks_identities_but_rejects_framing() {
+        let mut entry = ArchiveEntry {
+            path: PathBuf::from("x"),
+            entry_type: EntryType::Regular,
+            // A real inode number well past what eight hex digits hold.
+            ino: 0x1_2345_6789,
+            ..Default::default()
+        };
+        // c_ino only groups hard links, so it is masked rather than refused.
+        let header = build_newc_header(&entry, entry.ino, 2, CpioFormat::Newc).unwrap();
+        assert_eq!(&header[6..14], b"23456789");
+
+        // c_filesize frames the stream, so an unrepresentable value is an error
+        // instead of a silently truncated one.
+        entry.size = 0x1_0000_0000;
+        assert!(build_newc_header(&entry, 1, 2, CpioFormat::Newc).is_err());
+    }
+
+    #[test]
+    fn test_build_bin_header_layout_and_limits() {
+        let entry = ArchiveEntry {
+            path: PathBuf::from("hello"),
+            mode: 0o644,
+            size: 0x1_2345,
+            mtime: 0x8_9ABC,
+            entry_type: EntryType::Regular,
+            ..Default::default()
+        };
+
+        let header = build_bin_header(&entry, 3, 6).unwrap();
+        assert_eq!(header.len(), BIN_HEADER_SIZE);
+        let word = |i: usize| u16::from_ne_bytes([header[i * 2], header[i * 2 + 1]]);
+        assert_eq!(word(0), BIN_MAGIC);
+        assert_eq!(word(2), 3); // c_ino
+        assert_eq!(word(3), (C_ISREG | 0o644) as u16); // c_mode
+                                                       // c_mtime and c_filesize are two words each, most significant first,
+                                                       // and sit after c_rdev at word 7.
+        assert_eq!(word(8), 0x0008);
+        assert_eq!(word(9), 0x9ABC);
+        assert_eq!(word(10), 6); // c_namesize
+        assert_eq!(word(11), 0x0001);
+        assert_eq!(word(12), 0x2345);
+
+        // The 16-bit format cannot describe a file past 4 GiB.
+        let too_big = ArchiveEntry {
+            size: u32::MAX as u64 + 1,
+            ..entry
+        };
+        assert!(build_bin_header(&too_big, 3, 6).is_err());
+    }
+
+    #[test]
+    fn test_header_nlink_never_writes_zero() {
+        // The trailer, and anything built without stat data, has nlink 0; no
+        // real cpio writes that, and a reader would see a file with no names.
+        let synthesized = ArchiveEntry {
+            nlink: 0,
+            ..Default::default()
+        };
+        assert_eq!(header_nlink(&synthesized), 1);
+        assert_eq!(
+            header_nlink(&ArchiveEntry {
+                nlink: 3,
+                ..synthesized
+            }),
+            3
+        );
     }
 
     #[test]

@@ -21,6 +21,17 @@
 use crate::error::{PaxError, PaxResult};
 use std::io::{Read, Write};
 use std::mem::ManuallyDrop;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+/// A running count of archive bytes moved through a `BlockedReader` or
+/// `BlockedWriter`.
+///
+/// cpio reports the size of the archive it just read or wrote as a count of
+/// 512-byte blocks, and the blocked layer is the only place that sees the whole
+/// stream. The handle is shared so a caller can keep it after the reader or
+/// writer has been moved into the mode implementation.
+pub type ByteCounter = Arc<AtomicU64>;
 
 /// Default blocking factor (number of 512-byte blocks per record)
 pub const DEFAULT_BLOCKING_FACTOR: usize = 20;
@@ -50,11 +61,13 @@ pub struct BlockedReader<R: Read> {
     valid: usize,
     /// Whether we've reached EOF
     eof: bool,
+    /// Total bytes read from the underlying reader
+    counter: ByteCounter,
 }
 
 impl<R: Read> BlockedReader<R> {
-    /// Create a new blocked reader with the specified record size
-    pub fn new(reader: R, record_size: usize) -> Self {
+    /// Create a blocked reader that adds every byte it reads to `counter`
+    pub fn with_counter(reader: R, record_size: usize, counter: ByteCounter) -> Self {
         BlockedReader {
             reader,
             record_size,
@@ -62,6 +75,7 @@ impl<R: Read> BlockedReader<R> {
             pos: 0,
             valid: 0,
             eof: false,
+            counter,
         }
     }
 
@@ -91,6 +105,7 @@ impl<R: Read> BlockedReader<R> {
             self.buffer[n..].fill(0);
         }
 
+        self.counter.fetch_add(n as u64, Ordering::Relaxed);
         self.valid = n;
         self.pos = 0;
         Ok(n)
@@ -132,17 +147,25 @@ pub struct BlockedWriter<W: Write> {
     pos: usize,
     /// Whether finish() has been called (to avoid double-flush in Drop)
     finished: bool,
+    /// Total bytes written to the underlying writer
+    counter: ByteCounter,
 }
 
 impl<W: Write> BlockedWriter<W> {
     /// Create a new blocked writer with the specified record size
     pub fn new(writer: W, record_size: usize) -> Self {
+        Self::with_counter(writer, record_size, ByteCounter::default())
+    }
+
+    /// Create a blocked writer that adds every byte it writes to `counter`
+    pub fn with_counter(writer: W, record_size: usize, counter: ByteCounter) -> Self {
         BlockedWriter {
             writer: ManuallyDrop::new(writer),
             record_size,
             buffer: vec![0u8; record_size],
             pos: 0,
             finished: false,
+            counter,
         }
     }
 
@@ -159,6 +182,8 @@ impl<W: Write> BlockedWriter<W> {
 
         // Write exactly one record
         self.writer.write_all(&self.buffer)?;
+        self.counter
+            .fetch_add(self.buffer.len() as u64, Ordering::Relaxed);
 
         self.pos = 0;
         Ok(())
@@ -343,7 +368,7 @@ mod tests {
         data[..5].copy_from_slice(b"Hello");
 
         let cursor = Cursor::new(data);
-        let mut reader = BlockedReader::new(cursor, 1024);
+        let mut reader = BlockedReader::with_counter(cursor, 1024, ByteCounter::default());
 
         let mut buf = [0u8; 100];
         let n = reader.read(&mut buf).unwrap();
@@ -360,7 +385,7 @@ mod tests {
         data[1024..1029].copy_from_slice(b"World");
 
         let cursor = Cursor::new(data);
-        let mut reader = BlockedReader::new(cursor, 1024);
+        let mut reader = BlockedReader::with_counter(cursor, 1024, ByteCounter::default());
 
         // Read across record boundary
         let mut buf = vec![0u8; 2048];
@@ -386,7 +411,7 @@ mod tests {
 
         // Read with blocking
         let cursor = Cursor::new(written);
-        let mut reader = BlockedReader::new(cursor, 512);
+        let mut reader = BlockedReader::with_counter(cursor, 512, ByteCounter::default());
         let mut result = vec![0u8; original.len()];
         reader.read_exact(&mut result).unwrap();
 

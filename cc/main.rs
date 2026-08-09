@@ -357,6 +357,7 @@ fn process_file(
     target: &Target,
     obj_name: &ObjectName,
     scratch: &Path,
+    operand_id: usize,
 ) -> io::Result<Compiled> {
     // Read file (or stdin if path is "-")
     let mut buffer = Vec::new();
@@ -654,7 +655,7 @@ fn process_file(
     // Write the assembly to a scratch file for the assembler. It lives in the
     // per-run scratch directory, so the name only has to be unique within this
     // process — several operands are compiled in one run now.
-    let temp_asm = scratch_path(scratch, stem, "s");
+    let temp_asm = scratch_path(scratch, operand_id, stem, "s");
     {
         let mut file = File::create(&temp_asm)?;
         file.write_all(asm.as_bytes())?;
@@ -1048,9 +1049,14 @@ impl Operand {
 /// need no PID or randomness of their own: the directory is unpredictable,
 /// created with `O_EXCL`, and removed when the run ends. That closes both the
 /// old `/tmp/c17_<pid>.s` symlink hazard and the leak on every early exit.
-fn scratch_path(scratch: &Path, stem: &str, ext: &str) -> String {
+///
+/// The name is prefixed with the operand's position because one run now
+/// compiles every operand into this one directory, and a file stem is not
+/// unique across them: `c17 a/util.c b/util.c` gave both the same `util.o`,
+/// so the second silently overwrote the first and the link named it twice.
+fn scratch_path(scratch: &Path, operand_id: usize, stem: &str, ext: &str) -> String {
     scratch
-        .join(format!("{}.{}", stem, ext))
+        .join(format!("{}-{}.{}", operand_id, stem, ext))
         .to_string_lossy()
         .into_owned()
 }
@@ -1067,14 +1073,14 @@ fn operand_stem(path: &str) -> &str {
 }
 
 /// Decide where a source operand's object file goes.
-fn source_object_name(path: &str, args: &Args, scratch: &Path) -> ObjectName {
+fn source_object_name(path: &str, args: &Args, scratch: &Path, operand_id: usize) -> ObjectName {
     let stem = operand_stem(path);
     if args.compile_only {
         // -c writes an object the user keeps. `-o` names it; otherwise it is
         // $(basename operand .c).o in the current directory.
         ObjectName::Keep(args.output.clone().unwrap_or_else(|| format!("{}.o", stem)))
     } else {
-        ObjectName::Temp(scratch_path(scratch, stem, "o"))
+        ObjectName::Temp(scratch_path(scratch, operand_id, stem, "o"))
     }
 }
 
@@ -1087,17 +1093,18 @@ fn assemble_operand(
     args: &Args,
     target: &Target,
     scratch: &Path,
+    operand_id: usize,
 ) -> io::Result<Option<String>> {
     let stem = operand_stem(path);
     let obj_file = if args.compile_only {
         args.output.clone().unwrap_or_else(|| format!("{}.o", stem))
     } else {
-        scratch_path(scratch, stem, "o")
+        scratch_path(scratch, operand_id, stem, "o")
     };
 
     // .S files need preprocessing, .s files do not.
     let asm_to_assemble = if path.ends_with(".S") {
-        let temp_s = scratch_path(scratch, stem, "s");
+        let temp_s = scratch_path(scratch, operand_id, stem, "s");
         let content = std::fs::read(path)?;
         let asm_config = AsmPreprocessConfig {
             defines: &args.defines,
@@ -1343,16 +1350,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match op.kind {
             OperandKind::Unknown => {}
             OperandKind::Object => operand_objects[idx] = Some(op.path.clone()),
-            OperandKind::Asm => match assemble_operand(&op.path, &args, &target, scratch.path()) {
-                Ok(Some(obj)) => operand_objects[idx] = Some(obj),
-                Ok(None) => {}
-                Err(e) => {
-                    eprintln!("c17: {}: {}", op.path, e);
-                    failed = true;
+            OperandKind::Asm => {
+                match assemble_operand(&op.path, &args, &target, scratch.path(), idx) {
+                    Ok(Some(obj)) => operand_objects[idx] = Some(obj),
+                    Ok(None) => {}
+                    Err(e) => {
+                        eprintln!("c17: {}: {}", op.path, e);
+                        failed = true;
+                    }
                 }
-            },
+            }
             OperandKind::Source => {
-                let obj_name = source_object_name(&op.path, &args, scratch.path());
+                let obj_name = source_object_name(&op.path, &args, scratch.path(), idx);
                 match process_file(
                     &op.path,
                     &mut streams,
@@ -1360,6 +1369,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &target,
                     &obj_name,
                     scratch.path(),
+                    idx,
                 ) {
                     Ok(Compiled::Nothing) => {}
                     Ok(Compiled::Object { path, temporary }) => {

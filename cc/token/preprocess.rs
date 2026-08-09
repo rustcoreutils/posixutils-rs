@@ -3121,8 +3121,18 @@ impl<'a> Preprocessor<'a> {
                             if matches!(tok.typ, TokenType::StreamBegin | TokenType::StreamEnd) {
                                 continue;
                             }
+                            // Re-point the token at the invocation for
+                            // diagnostics, but keep whether it was preceded by
+                            // white space: that belongs to the argument's own
+                            // spelling, and 6.10.3.2p2 makes `#` reproduce it.
+                            // Taking `whitespace` from the invocation site gave
+                            // every expanded token one, so the two-level
+                            // `XSTR(x)`/`STR(x)` idiom turned `1+2` into
+                            // `"1 + 2"` while the direct `STR(1+2)` was right.
+                            let whitespace = tok.pos.whitespace;
                             tok.pos = *pos;
                             tok.pos.newline = false;
+                            tok.pos.whitespace = whitespace;
                             result.push(tok);
                         }
                     }

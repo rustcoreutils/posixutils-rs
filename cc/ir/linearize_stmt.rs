@@ -286,67 +286,44 @@ impl<'a> super::linearize::Linearizer<'a> {
                         self.emit_aggregate_zero(sym_id, typ);
                     }
                     self.linearize_init_list(sym_id, typ, elements);
-                } else if let ExprKind::StringLit(s) = &init.kind {
-                    // String literal initialization of char array
-                    // Copy the string bytes to the local array
+                } else if let Some(units) = Self::string_literal_units(&init.kind) {
+                    // A string literal initializing an automatic object. An
+                    // array gets the code units copied in; a pointer gets the
+                    // literal's address.
+                    //
+                    // All four encodings share this path. `u"..."` and
+                    // `U"..."` had no arm at all, so they fell through to the
+                    // scalar case below and stored the literal's *address*
+                    // into the array's first element.
                     if self.types.kind(typ) == TypeKind::Array {
-                        let elem_type = self.types.base_type(typ).unwrap_or(self.types.char_id);
-                        let elem_size = self.types.size_bits(elem_type);
-
-                        // Copy each byte from string literal to local array
-                        for (i, byte) in s.bytes().enumerate() {
-                            let byte_val = self.emit_const(byte as i128, elem_type);
-                            self.emit(Instruction::store(
-                                byte_val, sym_id, i as i64, elem_type, elem_size,
-                            ));
-                        }
-                        // Store null terminator
-                        let null_val = self.emit_const(0, elem_type);
-                        self.emit(Instruction::store(
-                            null_val,
-                            sym_id,
-                            s.chars().count() as i64,
-                            elem_type,
-                            elem_size,
-                        ));
-                    } else {
-                        // Pointer initialized with string literal - store the address
-                        let val = self.linearize_expr(init);
-                        let init_type = self.expr_type(init);
-                        let converted = self.emit_convert(val, init_type, typ);
-                        let size = self.types.size_bits(typ);
-                        self.emit(Instruction::store(converted, sym_id, 0, typ, size));
-                    }
-                } else if let ExprKind::WideStringLit(s) = &init.kind {
-                    // Wide string literal initialization of wchar_t array
-                    // Copy the wide string chars to the local array (4 bytes each)
-                    if self.types.kind(typ) == TypeKind::Array {
-                        let elem_type = self.types.base_type(typ).unwrap_or(self.types.int_id);
+                        let default_elem = match init.kind {
+                            ExprKind::StringLit(_) => self.types.char_id,
+                            _ => self.types.int_id,
+                        };
+                        let elem_type = self.types.base_type(typ).unwrap_or(default_elem);
                         let elem_size = self.types.size_bits(elem_type);
                         let elem_bytes = (elem_size / 8) as i64;
 
-                        // Copy each wchar_t from wide string literal to local array
-                        for (i, ch) in s.chars().enumerate() {
-                            let ch_val = self.emit_const(ch as i128, elem_type);
+                        for (i, unit) in units.iter().enumerate() {
+                            let val = self.emit_const(*unit, elem_type);
                             self.emit(Instruction::store(
-                                ch_val,
+                                val,
                                 sym_id,
                                 (i as i64) * elem_bytes,
                                 elem_type,
                                 elem_size,
                             ));
                         }
-                        // Store null terminator
                         let null_val = self.emit_const(0, elem_type);
                         self.emit(Instruction::store(
                             null_val,
                             sym_id,
-                            (s.chars().count() as i64) * elem_bytes,
+                            (units.len() as i64) * elem_bytes,
                             elem_type,
                             elem_size,
                         ));
                     } else {
-                        // Pointer initialized with wide string literal - store the address
+                        // Pointer initialized with a string literal — store the address
                         let val = self.linearize_expr(init);
                         let init_type = self.expr_type(init);
                         let converted = self.emit_convert(val, init_type, typ);
@@ -1332,6 +1309,23 @@ impl<'a> super::linearize::Linearizer<'a> {
     ///
     /// C99 6.6 defines integer constant expressions. This function evaluates
     /// expressions that can be computed at compile time.
+    /// The code units a string literal contributes to an array initializer,
+    /// or `None` if this is not a string literal.
+    ///
+    /// A narrow literal's parsed form holds one C byte per Rust `char`, so the
+    /// units are the scalar values — iterating `bytes()` UTF-8-encodes anything
+    /// at or above 0x80, which turned `char a[] = "\x80"` into the two bytes
+    /// 0xC2 0x80 and left the array one byte short of what `sizeof` reported.
+    fn string_literal_units(kind: &ExprKind) -> Option<Vec<i128>> {
+        match kind {
+            ExprKind::StringLit(s) => Some(s.chars().map(|c| (c as u32 as u8) as i128).collect()),
+            ExprKind::WideStringLit(s) => Some(s.chars().map(|c| c as u32 as i128).collect()),
+            ExprKind::Utf16StringLit(u) => Some(u.iter().map(|c| *c as i128).collect()),
+            ExprKind::Utf32StringLit(u) => Some(u.iter().map(|c| *c as i128).collect()),
+            _ => None,
+        }
+    }
+
     /// Does this expression *provably* depend on a runtime value?
     ///
     /// The complement of "constant" is not "unfoldable": `eval_const_expr` is a

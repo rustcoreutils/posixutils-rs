@@ -1422,8 +1422,12 @@ impl Parser<'_> {
             ExprKind::InitList { elements } => Some(self.array_size_from_elements(elements)),
             ExprKind::StringLit(s) => {
                 // For char array initialized with string literal,
-                // size is string length + 1 for null terminator
-                Some(s.len() + 1)
+                // size is string length + 1 for null terminator.
+                //
+                // One C byte per `char`, so count chars: `len()` is the UTF-8
+                // encoded length, which over-counts every byte at or above
+                // 0x80 — `char a[] = "\x80";` came out as 3 bytes, not 2.
+                Some(s.chars().count() + 1)
             }
             ExprKind::WideStringLit(s) => {
                 // For wchar_t array initialized with wide string literal,

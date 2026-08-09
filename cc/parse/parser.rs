@@ -1684,7 +1684,16 @@ impl Parser<'_> {
     }
 
     /// Parse a type specifier
-    fn parse_type_specifier(&mut self) -> ParseResult<Type> {
+    /// Parse a type specifier, reporting whether one was actually present.
+    ///
+    /// The flag has to be written on *every* path out, including the early
+    /// returns for struct/union/enum/typeof. Leaving a stale value behind is
+    /// invisible until the next declaration inherits it: a K&R identifier list
+    /// — whose parameters are `int` by C17 6.9.1p6, so no specifier appears —
+    /// left it false, and the *following* `struct S s;` drew "type specifier
+    /// missing". Returning it rather than assigning a field is what makes the
+    /// compiler check the paths.
+    fn parse_type_specifier_inner(&mut self) -> ParseResult<(Type, bool)> {
         let mut modifiers = TypeModifiers::empty();
         let mut base_kind: Option<TypeKind> = None;
         // Track typedef type separately - we continue parsing after a typedef
@@ -1789,10 +1798,13 @@ impl Parser<'_> {
                                 );
                             }
                             let inner = self.types.get(inner_type).clone();
-                            return Ok(Type {
-                                modifiers: modifiers | inner.modifiers | TypeModifiers::ATOMIC,
-                                ..inner
-                            });
+                            return Ok((
+                                Type {
+                                    modifiers: modifiers | inner.modifiers | TypeModifiers::ATOMIC,
+                                    ..inner
+                                },
+                                true,
+                            ));
                         } else {
                             return Err(ParseError::new(
                                 "expected type-name in _Atomic(...)",
@@ -1937,10 +1949,13 @@ impl Parser<'_> {
                         self.expect_special(b')')?;
                         // Return the type with any modifiers
                         let result_type = self.types.get(typ).clone();
-                        return Ok(Type {
-                            modifiers: modifiers | result_type.modifiers,
-                            ..result_type
-                        });
+                        return Ok((
+                            Type {
+                                modifiers: modifiers | result_type.modifiers,
+                                ..result_type
+                            },
+                            true,
+                        ));
                     }
 
                     // Not a type name, try expression
@@ -1950,10 +1965,13 @@ impl Parser<'_> {
                     // Get the type of the expression
                     let expr_type_id = expr.typ.unwrap_or(self.types.int_id);
                     let result_type = self.types.get(expr_type_id).clone();
-                    return Ok(Type {
-                        modifiers: modifiers | result_type.modifiers,
-                        ..result_type
-                    });
+                    return Ok((
+                        Type {
+                            modifiers: modifiers | result_type.modifiers,
+                            ..result_type
+                        },
+                        true,
+                    ));
                 }
                 crate::kw::ENUM => {
                     let mut enum_type = self.parse_enum_specifier()?;
@@ -1961,21 +1979,21 @@ impl Parser<'_> {
                     let trailing_mods = self.consume_type_qualifiers();
                     // Apply any modifiers we collected
                     enum_type.modifiers |= modifiers | trailing_mods;
-                    return Ok(enum_type);
+                    return Ok((enum_type, true));
                 }
                 crate::kw::STRUCT => {
                     let mut struct_type = self.parse_struct_or_union_specifier(false)?;
                     // Consume trailing qualifiers (e.g., "struct foo const")
                     let trailing_mods = self.consume_type_qualifiers();
                     struct_type.modifiers |= modifiers | trailing_mods;
-                    return Ok(struct_type);
+                    return Ok((struct_type, true));
                 }
                 crate::kw::UNION => {
                     let mut union_type = self.parse_struct_or_union_specifier(true)?;
                     // Consume trailing qualifiers (e.g., "union foo const")
                     let trailing_mods = self.consume_type_qualifiers();
                     union_type.modifiers |= modifiers | trailing_mods;
-                    return Ok(union_type);
+                    return Ok((union_type, true));
                 }
                 _ => {
                     // Check if it's a typedef name
@@ -1996,23 +2014,29 @@ impl Parser<'_> {
 
         // If we parsed a typedef, return that with any trailing modifiers applied
         if let Some(typedef_type_id) = typedef_base {
-            self.saw_explicit_type = true;
             let typedef_type = self.types.get(typedef_type_id);
             let mut result = typedef_type.clone();
             // Strip TYPEDEF modifier - we're using the typedef, not defining one
             result.modifiers &= !TypeModifiers::TYPEDEF;
             result.modifiers |= modifiers;
-            return Ok(result);
+            return Ok((result, true));
         }
 
         // `signed x;` and `unsigned x;` name a type without setting `base_kind`
         // — those two only ever set a modifier — so they are explicit even
         // though the kind defaults. `short`/`long` do set the kind.
-        self.saw_explicit_type = base_kind.is_some()
+        let explicit = base_kind.is_some()
             || modifiers.intersects(TypeModifiers::SIGNED | TypeModifiers::UNSIGNED);
 
         let kind = base_kind.unwrap_or(TypeKind::Int);
-        Ok(Type::with_modifiers(kind, modifiers))
+        Ok((Type::with_modifiers(kind, modifiers), explicit))
+    }
+
+    /// Parse a type specifier and record whether one was present.
+    fn parse_type_specifier(&mut self) -> ParseResult<Type> {
+        let (typ, explicit) = self.parse_type_specifier_inner()?;
+        self.saw_explicit_type = explicit;
+        Ok(typ)
     }
 
     /// Drop the storage-class bits from a type, leaving only what it denotes.
@@ -2050,6 +2074,15 @@ impl Parser<'_> {
         };
         let existing = self.symbols.get(existing_id);
         if !existing.is_typedef() {
+            return;
+        }
+        // 6.7p3 governs a *repeat* declaration, which means the same scope.
+        // `lookup_id` answers with the innermost visible binding from any
+        // enclosing scope, so without this a block-scope `typedef double T;`
+        // shadowing a file-scope `typedef int T;` — perfectly legal, and what
+        // shadowing is for — was reported as an incompatible redefinition and
+        // failed the translation unit.
+        if existing.scope_depth != self.symbols.depth() {
             return;
         }
         let old_type = existing.typ;

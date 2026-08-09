@@ -76,7 +76,14 @@ impl<'a> super::linearize::Linearizer<'a> {
                 if let Some(rt) = declared_ret {
                     let returns_void = self.types.kind(rt) == TypeKind::Void;
                     match expr {
-                        Some(e) if returns_void => {
+                        // 6.8.6.4p1 forbids returning a *value*. An expression
+                        // of type `void` has none, so `return f();` where `f`
+                        // returns void — the ordinary tail-call wrapper, which
+                        // GCC and Clang both accept — is not a violation.
+                        Some(e)
+                            if returns_void
+                                && self.types.kind(self.expr_type(e)) != TypeKind::Void =>
+                        {
                             error(e.pos, "'return' with a value in a function returning void")
                         }
                         None if !returns_void => error(
@@ -1262,10 +1269,21 @@ impl<'a> super::linearize::Linearizer<'a> {
                         );
                     }
                     case_values.push(val);
-                } else {
+                } else if self.expr_is_runtime(expr) {
                     // A non-constant label can never match; it used to be
                     // dropped without a word.
                     error(expr.pos, "case label is not an integer constant expression");
+                } else {
+                    // Constant in principle, but `eval_const_expr` is a partial
+                    // evaluator and could not fold it. Saying the program is
+                    // invalid would be a false claim about the source — this is
+                    // our limit, not its error. Either way the label cannot be
+                    // emitted, so it still has to be reported rather than
+                    // silently dropped.
+                    error(
+                        expr.pos,
+                        "case label is a constant expression this compiler cannot evaluate",
+                    );
                 }
             }
             Stmt::Default => {
@@ -1314,6 +1332,83 @@ impl<'a> super::linearize::Linearizer<'a> {
     ///
     /// C99 6.6 defines integer constant expressions. This function evaluates
     /// expressions that can be computed at compile time.
+    /// Does this expression *provably* depend on a runtime value?
+    ///
+    /// The complement of "constant" is not "unfoldable": `eval_const_expr` is a
+    /// partial evaluator, so treating everything it declines as a constraint
+    /// violation turned each of its gaps into a rejection of valid code. This
+    /// answers the narrower question, and answers `false` when unsure — a
+    /// conservative direction, because the caller's fallback blames the
+    /// compiler rather than the program.
+    fn expr_is_runtime(&self, expr: &Expr) -> bool {
+        match &expr.kind {
+            // Reading an object, calling a function, or writing anything.
+            ExprKind::Ident(sym) => !self.symbols.get(*sym).is_enum_constant(),
+            ExprKind::Call { .. }
+            | ExprKind::Assign { .. }
+            | ExprKind::PostInc(_)
+            | ExprKind::PostDec(_)
+            | ExprKind::Member { .. }
+            | ExprKind::Arrow { .. }
+            | ExprKind::Index { .. }
+            | ExprKind::CompoundLiteral { .. }
+            | ExprKind::FuncName => true,
+
+            ExprKind::Unary { op, operand } => {
+                matches!(op, UnaryOp::PreInc | UnaryOp::PreDec | UnaryOp::Deref)
+                    || self.expr_is_runtime(operand)
+            }
+            ExprKind::Binary { left, right, .. } => {
+                self.expr_is_runtime(left) || self.expr_is_runtime(right)
+            }
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                self.expr_is_runtime(cond)
+                    || self.expr_is_runtime(then_expr)
+                    || self.expr_is_runtime(else_expr)
+            }
+            ExprKind::Cast { expr: inner, .. } => self.expr_is_runtime(inner),
+
+            // `sizeof` and `_Alignof` do not evaluate their operand, and
+            // literals are constant. Anything else: not proven either way.
+            _ => false,
+        }
+    }
+
+    /// Fold a floating constant expression, for the arithmetic C permits
+    /// inside one. Only reachable through a cast to an integer type — the
+    /// value of a `case` label is still an integer.
+    fn eval_const_float(&self, expr: &Expr) -> Option<f64> {
+        match &expr.kind {
+            ExprKind::FloatLit(v) => Some(*v),
+            ExprKind::IntLit(v) => Some(*v as f64),
+            ExprKind::CharLit(c) => Some(*c as u8 as i8 as f64),
+            ExprKind::Cast {
+                expr: inner,
+                cast_type,
+            } if self.types.is_float(*cast_type) => self.eval_const_float(inner),
+            ExprKind::Unary {
+                op: UnaryOp::Neg,
+                operand,
+            } => self.eval_const_float(operand).map(|v| -v),
+            ExprKind::Binary { op, left, right } => {
+                let l = self.eval_const_float(left)?;
+                let r = self.eval_const_float(right)?;
+                match op {
+                    BinaryOp::Add => Some(l + r),
+                    BinaryOp::Sub => Some(l - r),
+                    BinaryOp::Mul => Some(l * r),
+                    BinaryOp::Div if r != 0.0 => Some(l / r),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn eval_const_expr(&self, expr: &Expr) -> Option<i128> {
         match &expr.kind {
             ExprKind::IntLit(val) => Some(*val as i128),
@@ -1513,7 +1608,20 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
 
             // Cast to integer type - evaluate inner expression
-            ExprKind::Cast { expr: inner, .. } => self.eval_const_expr(inner),
+            ExprKind::Cast {
+                expr: inner,
+                cast_type,
+            } => self.eval_const_expr(inner).or_else(|| {
+                // `(int)2.0` is an integer constant expression (6.6p6: a cast
+                // of a floating constant is allowed as long as it is the
+                // immediate operand of a cast). Without this the fold failed
+                // and a valid case label was rejected as non-constant.
+                if self.types.is_integer(*cast_type) {
+                    self.eval_const_float(inner).map(|f| f as i128)
+                } else {
+                    None
+                }
+            }),
 
             // __builtin_offsetof(type, member-designator) - compile-time constant
             ExprKind::OffsetOf { type_id, path } => {

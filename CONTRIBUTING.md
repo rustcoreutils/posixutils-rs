@@ -6,7 +6,7 @@
 
 ### Why Issues Instead of PRs?
 
-This project uses AI-assisted coding for development. In this workflow:
+PRs are not scalable in the age of AI, and are typically recreated or rewritten, leading to duplication of effort.
 
 - **PRs lose context**: A pull request shows *what* changed, but not *why* or *how* decisions were made. The AI prompts, design discussions, and iterative refinements that produced the code are invisible.
 - **PRs are hard to review**: AI-generated PRs tend to be large, touching many files, making thorough review impractical.
@@ -26,7 +26,7 @@ The more context you provide, the better the result. Include:
 - **Test cases**: Input files, expected output files
 - **Feature rationale**: Why is this feature needed? What use cases?
 
-Think of your issue as providing context for an AI coding agent. The richer the context, the better the implementation.
+In other words, everything that made an RFE, feature req or bug report great in the pre-AI world still applies today.
 
 ### Contribution Types
 
@@ -54,16 +54,6 @@ Build: `cargo build --release`
 Test all (long, more than 15 minutes on some hosts) `cargo test --release`
 
 Test (one module): `cargo test --release -p posixutils-SOMECRATE`
-
-### Utility lifecycle:  Stages of Maturity
-
-1. Rough draft:  Core algorithm implemented.  Bugs may exist.  Many options not yet implemented.
-2. Feature complete:  Believed to be complete per POSIX specification.
-3. Test coverage:  Integration tests, positive and negative, are complete, pass 100%
-4. Code coverage:  Automated code coverage data indicates 100%
-5. Translated:  All strings are internationalized, including common OS errors for common error cases.
-6. Audited:  An external party has reviewed and tested for correctness, 
-   POSIX compliance, security, races and similar issues.
 
 ### For Maintainers: Commit Standards
 

@@ -5,7 +5,7 @@ asa	text/asa.rs
 at	cron/at.rs
 awk	awk/
 basename	pathnames/basename.rs
-batch	process/batch.rs
+batch	cron/batch.rs
 bc	calc/bc.rs
 c17	cc/
 cal	datetime/cal.rs
@@ -19,6 +19,8 @@ cmp	file/cmp.rs
 comm	text/comm.rs
 compress	xform/compress.rs
 cp	tree/cp.rs
+cpio	pax/
+crond	cron/crond.rs
 crontab	cron/crontab.rs
 csplit	text/csplit.rs
 ctags	cc/ctags.rs
@@ -34,7 +36,7 @@ du	tree/du.rs
 echo	display/echo.rs
 ed	editors/ed_main.rs
 env	process/env.rs
-ex	editors/ex_main.rs
+ex	editors/vi_main.rs
 expand	text/expand.rs
 expr	calc/expr.rs
 false	misc/false.rs
@@ -54,6 +56,7 @@ ipcrm	sys/ipcrm.rs
 ipcs	sys/ipcs.rs
 join	text/join.rs
 kill	process/kill.rs
+lex	dev/lex/
 link	tree/link.rs
 ln	tree/ln.rs
 locale	i18n/locale.rs
@@ -107,6 +110,8 @@ stty	screen/stty.rs
 tabs	screen/tabs.rs
 tail	text/tail.rs
 talk	users/talk.rs
+talkd	users/talkd.rs
+tar	pax/
 tee	file/tee.rs
 test	misc/test.rs
 time	datetime/time.rs
@@ -118,7 +123,7 @@ true	misc/true.rs
 tsort	text/tsort.rs
 tty	users/tty.rs
 uname	sys/uname.rs
-uncompress	xform/uncompress.rs
+uncompress	xform/compress.rs
 unexpand	text/unexpand.rs
 unget	sccs/unget.rs
 uniq	text/uniq.rs
@@ -137,3 +142,4 @@ write	users/write.rs
 xargs	process/xargs.rs
 xgettext	i18n/xgettext.rs
 yacc	dev/yacc/
+zcat	xform/compress.rs

@@ -260,6 +260,22 @@ fn test_cpio_pass_through_requires_one_destination() {
     assert!(stderr_str(&out).contains("exactly one destination"));
 }
 
+/// Rejecting a command line means exiting before the name list is read, which
+/// closes the pipe the test is still writing to. Whether the write lands is a
+/// race -- one Linux CI lost while macOS won -- so it is forced here with a
+/// payload far larger than any pipe buffer: the diagnostic must still come
+/// back rather than the write blowing up.
+#[test]
+fn test_cpio_rejects_a_bad_command_line_without_draining_stdin() {
+    let temp = TempDir::new().unwrap();
+    let src = setup(temp.path());
+    let flood = "./a.txt\n".repeat(200_000);
+
+    let out = run_cpio(&["-pdm", "one", "two"], &src, flood.as_bytes());
+    assert_failure(&out, "cpio -p with two destinations and a large stdin");
+    assert!(stderr_str(&out).contains("exactly one destination"));
+}
+
 #[test]
 fn test_cpio_preserves_mtime_only_with_dash_m() {
     let temp = TempDir::new().unwrap();

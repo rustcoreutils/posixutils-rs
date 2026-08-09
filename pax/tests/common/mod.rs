@@ -153,7 +153,17 @@ pub fn run_front_end(name: &str, args: &[&str], dir: &Path, stdin_data: Option<&
         // sees EOF instead of blocking forever.
         let mut stdin = child.stdin.take().expect("stdin was piped");
         if let Some(data) = stdin_data {
-            stdin.write_all(data).expect("failed to write stdin");
+            match stdin.write_all(data) {
+                Ok(()) => {}
+                // A front-end that rejects its command line exits before it
+                // ever reads the name list, which closes the read end of this
+                // pipe. That is the behavior under test, so losing the write is
+                // the expected outcome, not a harness failure. Whether the
+                // write lands at all is a race the child usually loses on
+                // macOS and usually wins on Linux.
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+                Err(e) => panic!("failed to write stdin to {}: {}", name, e),
+            }
         }
     }
 

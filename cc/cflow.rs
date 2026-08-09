@@ -913,8 +913,12 @@ fn process_file(
     let mut buffer = Vec::new();
     reader.read_to_end(&mut buffer)?;
 
-    // Create stream
-    let stream_id = streams.add(path.to_string());
+    // Register the stream under the operand the user named, not `path`. For a
+    // `.l`/`.y` operand those differ: `path` is a generated temporary that is
+    // deleted when the run ends, so naming it in a diagnostic tells the reader
+    // nothing. Every diagnostic routed through `diag` — not just the parse
+    // error handled below — resolves its filename through this registration.
+    let stream_id = streams.add(display.to_string());
 
     // Create string table for identifier interning
     let mut strings = StringTable::new();
@@ -950,6 +954,7 @@ fn process_file(
                 include_paths,
                 no_std_inc: false,
                 no_builtin_inc: false,
+                trigraphs: false,
             },
         )
     };

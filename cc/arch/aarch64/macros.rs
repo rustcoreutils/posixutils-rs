@@ -27,10 +27,10 @@ pub fn get_macros() -> Vec<(&'static str, Option<&'static str>)> {
         // Register size
         ("__REGISTER_PREFIX__", Some("")),
         ("__USER_LABEL_PREFIX__", Some("")),
-        // Long double is 128-bit IEEE quad precision on AArch64
-        ("__SIZEOF_LONG_DOUBLE__", Some("16")),
-        ("__LDBL_MANT_DIG__", Some("113")),
-        ("__LDBL_DIG__", Some("33")),
+        // `long double` is described entirely by `get_float_limit_macros`
+        // and `get_additional_sizeof_macros`, which know the OS as well as the
+        // architecture — it is quad on aarch64 Linux but plain double on
+        // Apple, and this list cannot tell them apart.
         // char is unsigned on ARM by default
         ("__CHAR_UNSIGNED__", Some("1")),
         // SIMD

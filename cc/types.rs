@@ -406,9 +406,21 @@ impl Type {
             return false;
         }
 
+        // `signed` is redundant on every integer type except char, where
+        // `signed char`, `unsigned char` and plain `char` really are three
+        // distinct types (C17 6.2.5p15). Elsewhere `signed short` and `short`
+        // name the same type, and treating the bit as significant made two
+        // spellings of int16_t look incompatible.
+        let redundant_signed = if self.kind == TypeKind::Char {
+            TypeModifiers::empty()
+        } else {
+            TypeModifiers::SIGNED
+        };
+        let ignored = QUALIFIERS.union(redundant_signed);
+
         // Compare modifiers (ignoring top-level qualifiers)
-        let self_mods = self.modifiers.difference(QUALIFIERS);
-        let other_mods = other.modifiers.difference(QUALIFIERS);
+        let self_mods = self.modifiers.difference(ignored);
+        let other_mods = other.modifiers.difference(ignored);
         if self_mods != other_mods {
             return false;
         }

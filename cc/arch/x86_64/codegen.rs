@@ -14,7 +14,9 @@
 
 use crate::abi::{get_abi, Abi, ArgClass, RegClass};
 use crate::arch::codegen::{is_variadic_function, BswapSize, CodeGenBase, CodeGenerator, UnaryOp};
-use crate::arch::lir::{complex_fp_info, CondCode, Directive, FpSize, Label, OperandSize, Symbol};
+use crate::arch::lir::{
+    complex_fp_info, complex_sse_regs, CondCode, Directive, FpSize, Label, OperandSize, Symbol,
+};
 use crate::arch::x86_64::float::f64_to_f16_bits;
 use crate::arch::x86_64::lir::{GpOperand, MemAddr, ShiftCount, X86Inst, XmmOperand};
 use crate::arch::x86_64::regalloc::{Loc, Reg, RegAlloc, XmmReg};
@@ -129,6 +131,52 @@ impl X86_64CodeGen {
                 base: Reg::Rbp,
                 offset: -(offset + self.callee_saved_offset),
             }
+        }
+    }
+
+    /// Copy a memory-class parameter from the incoming argument area into the
+    /// local the rest of the function reads.
+    ///
+    /// Register-class arguments that ran out of registers arrive on the stack
+    /// like any MEMORY-class one, but unlike a `long double` — which is simply
+    /// used in place — a complex or two-SSE-struct parameter has a local, and
+    /// the prologue is what fills it. `bytes` is the type's real size, copied a
+    /// qword at a time through R10 (reserved, never allocated).
+    fn copy_incoming_arg_to_local(
+        &mut self,
+        func: &crate::ir::Function,
+        param_name: &str,
+        arg_pseudo: crate::ir::PseudoId,
+        bytes: i32,
+    ) {
+        let Some(Loc::IncomingArg(src_offset)) = self.locations.get(arg_pseudo) else {
+            return;
+        };
+        let Some(local) = func.locals.get(param_name) else {
+            return;
+        };
+        let Some(Loc::Stack(dst_offset)) = self.locations.get_ref(local.sym) else {
+            return;
+        };
+        let dst_offset = *dst_offset;
+        let mut copied = 0;
+        while copied < bytes {
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Mem(MemAddr::BaseOffset {
+                    base: Reg::Rbp,
+                    offset: src_offset + copied,
+                }),
+                dst: GpOperand::Reg(Reg::R10),
+            });
+            // Locals grow downward from `dst_offset`, so later bytes sit at a
+            // smaller offset — the same convention `stack_mem` encodes.
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Reg(Reg::R10),
+                dst: GpOperand::Mem(self.stack_mem(dst_offset - copied)),
+            });
+            copied += 8;
         }
     }
 
@@ -609,8 +657,9 @@ impl X86_64CodeGen {
                             // Still need to count this arg for register assignment tracking
                             let is_fp = types.is_float(*typ);
                             let is_complex = types.is_complex(*typ);
-                            let is_longdouble =
-                                types.kind(*typ) == crate::types::TypeKind::LongDouble;
+                            let is_longdouble = types.kind(*typ)
+                                == crate::types::TypeKind::LongDouble
+                                && !is_complex;
                             let is_int128 = types.kind(*typ) == TypeKind::Int128;
                             let is_medium_struct = !is_complex
                                 && (types.kind(*typ) == crate::types::TypeKind::Struct
@@ -618,7 +667,7 @@ impl X86_64CodeGen {
                                 && type_size_bits > 64
                                 && type_size_bits <= 128;
                             if is_complex {
-                                fp_arg_idx += 2;
+                                fp_arg_idx += complex_sse_regs(types, *typ);
                             } else if is_int128 {
                                 int_arg_idx += 2;
                             } else if is_medium_struct {
@@ -665,11 +714,37 @@ impl X86_64CodeGen {
                                             && classes.iter().all(|c| *c == crate::abi::RegClass::Sse)
                                 )
                             };
-                        if is_complex || is_two_sse_struct {
-                            // Complex argument - uses TWO consecutive XMM registers
-                            // double _Complex: XMM0+XMM1, XMM2+XMM3, etc.
+                        // How many SSE registers this argument actually occupies.
+                        // A struct of two doubles always takes two; a complex
+                        // type depends on its base (see `complex_sse_regs`).
+                        let sse_regs = if is_two_sse_struct {
+                            2
+                        } else if is_complex {
+                            complex_sse_regs(types, *typ)
+                        } else {
+                            0
+                        };
+
+                        if (is_complex || is_two_sse_struct) && sse_regs > 0 {
                             // Look up the local variable (same name as param) for stack location
-                            if fp_arg_idx + 1 < fp_arg_regs.len() {
+                            if fp_arg_idx + sse_regs > fp_arg_regs.len() {
+                                // Spilled: the caller wrote the value into the
+                                // incoming argument area, so copy it into the
+                                // local rather than reading registers that hold
+                                // something else. Skipping the copy entirely, as
+                                // this used to, left the parameter uninitialized.
+                                self.copy_incoming_arg_to_local(
+                                    func,
+                                    &func.params[i].0,
+                                    pseudo.id,
+                                    (type_size_bits / 8) as i32,
+                                );
+                                // A memory-class argument consumes no XMM
+                                // registers; the ones it did not fit in stay
+                                // available to the arguments that follow.
+                                break;
+                            }
+                            {
                                 // Find the local for this parameter by name
                                 let param_name = &func.params[i].0;
                                 if let Some(local) = func.locals.get(param_name) {
@@ -683,24 +758,38 @@ impl X86_64CodeGen {
                                         } else {
                                             complex_fp_info(types, &self.base.target, *typ)
                                         };
-                                        // Store real part from first XMM register
-                                        self.push_lir(X86Inst::MovFp {
-                                            size: fp_size,
-                                            src: XmmOperand::Reg(fp_arg_regs[fp_arg_idx]),
-                                            dst: XmmOperand::Mem(self.stack_mem(offset)),
-                                        });
-                                        // Store imag part from second XMM register
-                                        self.push_lir(X86Inst::MovFp {
-                                            size: fp_size,
-                                            src: XmmOperand::Reg(fp_arg_regs[fp_arg_idx + 1]),
-                                            dst: XmmOperand::Mem(
-                                                self.stack_mem(offset - imag_offset),
-                                            ),
-                                        });
+                                        if sse_regs == 1 {
+                                            // `float _Complex`: one eightbyte
+                                            // holding both halves. A single
+                                            // 64-bit store writes the whole
+                                            // value; storing the halves from
+                                            // two registers read one the
+                                            // caller never set.
+                                            self.push_lir(X86Inst::MovFp {
+                                                size: FpSize::Double,
+                                                src: XmmOperand::Reg(fp_arg_regs[fp_arg_idx]),
+                                                dst: XmmOperand::Mem(self.stack_mem(offset)),
+                                            });
+                                        } else {
+                                            // Store real part from first XMM register
+                                            self.push_lir(X86Inst::MovFp {
+                                                size: fp_size,
+                                                src: XmmOperand::Reg(fp_arg_regs[fp_arg_idx]),
+                                                dst: XmmOperand::Mem(self.stack_mem(offset)),
+                                            });
+                                            // Store imag part from second XMM register
+                                            self.push_lir(X86Inst::MovFp {
+                                                size: fp_size,
+                                                src: XmmOperand::Reg(fp_arg_regs[fp_arg_idx + 1]),
+                                                dst: XmmOperand::Mem(
+                                                    self.stack_mem(offset - imag_offset),
+                                                ),
+                                            });
+                                        }
                                     }
                                 }
                             }
-                            fp_arg_idx += 2; // Complex uses two XMM registers
+                            fp_arg_idx += sse_regs;
                         } else if types.kind(*typ) == crate::types::TypeKind::LongDouble {
                             // Long double is passed on the stack per System V AMD64 ABI
                             // No XMM register move needed - already at IncomingArg offset
@@ -850,7 +939,18 @@ impl X86_64CodeGen {
         // Struct returns depend on ABI classification (SSE for all-float structs)
         if let Some(src) = insn.src.first() {
             let src_loc = self.get_location(*src);
-            let is_complex = insn.typ.is_some_and(|t| types.is_complex(t));
+            // `long double _Complex` is COMPLEX_X87 and returns through the
+            // hidden pointer, not in XMM registers — it has no XMM form, and
+            // trying to give it one is what emitted `movt %xmm0`.
+            let is_complex = insn.typ.is_some_and(|t| {
+                types.is_complex(t) && crate::arch::lir::complex_sse_regs(types, t) > 0
+            });
+            // `long double _Complex` is COMPLEX_X87: st(0) and st(1), never
+            // XMM. It needs its own arm — `is_float` deliberately excludes
+            // complex types, so it never reaches the FP path below.
+            let is_complex_x87 = insn.typ.is_some_and(|t| {
+                types.is_complex(t) && crate::arch::lir::complex_sse_regs(types, t) == 0
+            });
             let is_fp = matches!(src_loc, Loc::Xmm(_) | Loc::FImm(..))
                 || insn.typ.is_some_and(|t| types.is_float(t));
 
@@ -1089,6 +1189,25 @@ impl X86_64CodeGen {
                     }
                     _ => {}
                 }
+            } else if is_complex_x87 {
+                // Real in st(0), imaginary in st(1). The x87 register file is
+                // a stack, so push the imaginary part first and the real part
+                // second to leave them in that order.
+                let base = types.complex_base(insn.typ.unwrap());
+                let imag_off = (types.size_bits(base) / 8) as i32;
+                let base_addr = self.address_of_pseudo(*src);
+                self.push_lir(X86Inst::X87Load {
+                    addr: MemAddr::BaseOffset {
+                        base: base_addr,
+                        offset: imag_off,
+                    },
+                });
+                self.push_lir(X86Inst::X87Load {
+                    addr: MemAddr::BaseOffset {
+                        base: base_addr,
+                        offset: 0,
+                    },
+                });
             } else if is_fp {
                 // Check for long double - return in ST(0) per x86-64 ABI
                 let is_longdouble = insn
@@ -4766,6 +4885,14 @@ impl CodeGenerator for X86_64CodeGen {
         // Emit wide string literals
         if !module.wide_strings.is_empty() {
             self.base.emit_wide_strings(&module.wide_strings);
+        }
+
+        // Emit char16_t / char32_t string literals
+        if !module.utf16_strings.is_empty() {
+            self.base.emit_utf16_strings(&module.utf16_strings);
+        }
+        if !module.utf32_strings.is_empty() {
+            self.base.emit_utf32_strings(&module.utf32_strings);
         }
 
         // Emit text start label for DWARF debug info (before first function)

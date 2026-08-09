@@ -462,6 +462,7 @@ fn process_file(
             include_paths,
             no_std_inc: false,
             no_builtin_inc: false,
+            trigraphs: false,
         },
     );
 

@@ -1441,6 +1441,18 @@ pub struct Function {
     /// the inliner must generate an explicit struct copy from the caller's
     /// address argument into the local.
     pub implicit_param_copies: Vec<ImplicitParamCopy>,
+    /// Does this function return a complex value?
+    ///
+    /// Complex returns are the one place where the two representations of a
+    /// complex value meet: the callee's `Ret` carries the *address* of the
+    /// value, while at a call site the backend stores the returned registers
+    /// into the result local, so that pseudo's slot holds the value itself.
+    /// Inlining splices the callee's body in and drops the call, which would
+    /// hand the caller an address where it expects a value.
+    ///
+    /// Bridging the two needs the base type and stride, and the optimizer has
+    /// no `TypeTable` to ask, so such functions are simply not inlined.
+    pub returns_complex: bool,
     /// Block ID -> index in `blocks` vec (O(1) lookup)
     block_idx: HashMap<BasicBlockId, usize>,
     /// Pseudo ID -> index in `pseudos` vec (O(1) lookup)
@@ -1463,6 +1475,7 @@ impl Default for Function {
             is_noreturn: false,
             is_inline: false,
             implicit_param_copies: Vec::new(),
+            returns_complex: false,
             block_idx: HashMap::with_capacity(DEFAULT_BLOCK_CAPACITY),
             pseudo_idx: HashMap::with_capacity(DEFAULT_PSEUDO_CAPACITY),
         }
@@ -1659,6 +1672,10 @@ pub enum Initializer {
     String(String),
     /// Wide string literal initializer (for wchar_t arrays)
     WideString(String),
+    /// A `u"..."` initializer: char16_t code units.
+    Utf16String(Vec<u16>),
+    /// A `U"..."` initializer: char32_t code points.
+    Utf32String(Vec<u32>),
     /// Array initializer: element size in bytes, list of (offset, initializer) pairs
     /// Elements not listed are zero-initialized
     Array {
@@ -1695,6 +1712,8 @@ impl Initializer {
             // by a string literal is zero iff every byte is `\0`.
             Initializer::String(s) => s.chars().all(|c| c == '\0'),
             Initializer::WideString(s) => s.chars().all(|c| c == '\0'),
+            Initializer::Utf16String(u) => u.iter().all(|&c| c == 0),
+            Initializer::Utf32String(u) => u.iter().all(|&c| c == 0),
             Initializer::Array { elements, .. } => {
                 elements.iter().all(|(_, init)| init.is_all_zero())
             }
@@ -1724,7 +1743,9 @@ impl Initializer {
             | Initializer::Int(_)
             | Initializer::Float(_)
             | Initializer::String(_)
-            | Initializer::WideString(_) => false,
+            | Initializer::WideString(_)
+            | Initializer::Utf16String(_)
+            | Initializer::Utf32String(_) => false,
         }
     }
 }
@@ -1737,6 +1758,8 @@ impl fmt::Display for Initializer {
             Initializer::Float(v) => write!(f, "{}", v),
             Initializer::String(s) => write!(f, "\"{}\"", s.escape_default()),
             Initializer::WideString(s) => write!(f, "L\"{}\"", s.escape_default()),
+            Initializer::Utf16String(u) => write!(f, "u\"<{} units>\"", u.len()),
+            Initializer::Utf32String(u) => write!(f, "U\"<{} units>\"", u.len()),
             Initializer::Array {
                 total_size,
                 elements,
@@ -1846,6 +1869,10 @@ pub struct Module {
     pub strings: Vec<(String, String)>,
     /// Wide string literals (label, content)
     pub wide_strings: Vec<(String, String)>,
+    /// `u"..."` literals referenced by address, as char16_t code units.
+    pub utf16_strings: Vec<(String, Vec<u16>)>,
+    /// `U"..."` literals referenced by address, as char32_t code points.
+    pub utf32_strings: Vec<(String, Vec<u32>)>,
     /// Generate debug info
     pub debug: bool,
     /// Source file paths (stream id -> path) for .file directives
@@ -1961,6 +1988,20 @@ impl Module {
     pub fn add_wide_string(&mut self, content: String) -> String {
         let label = format!(".LWC{}", self.wide_strings.len());
         self.wide_strings.push((label.clone(), content));
+        label
+    }
+
+    /// Intern a `u"..."` literal and return its label.
+    pub fn add_utf16_string(&mut self, units: Vec<u16>) -> String {
+        let label = format!(".LU16C{}", self.utf16_strings.len());
+        self.utf16_strings.push((label.clone(), units));
+        label
+    }
+
+    /// Intern a `U"..."` literal and return its label.
+    pub fn add_utf32_string(&mut self, units: Vec<u32>) -> String {
+        let label = format!(".LU32C{}", self.utf32_strings.len());
+        self.utf32_strings.push((label.clone(), units));
         label
     }
 }

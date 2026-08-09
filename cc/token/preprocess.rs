@@ -51,6 +51,67 @@ pub struct MacroParam {
     pub index: usize,
 }
 
+/// Describe how a redefinition differs from the existing definition, or `None`
+/// when C17 6.10.3p2 permits it (same kind, same parameter spelling, identical
+/// replacement list).
+///
+/// "Identical" covers white-space separation as well as spelling, but all
+/// white-space separations count as identical — which is exactly what
+/// `MacroToken::whitespace` records.
+///
+/// Whitespace *before the first* replacement token is not a separation within
+/// the list, so it is ignored. That matters in practice: a predefined macro's
+/// body is built from a bare value with no leading space, while the same
+/// definition written as `#define __GLIBC__ 2` in a header has one — and
+/// glibc's `features.h` redefines several macros we predefine, which would
+/// otherwise warn on every single compilation.
+fn macro_redefinition_conflict(old: &Macro, new: &Macro) -> Option<&'static str> {
+    if old.builtin.is_some() {
+        return Some("it is a built-in macro");
+    }
+    // The constraint governs redefinition "by another #define preprocessing
+    // directive". A macro the implementation supplied is not one, and holding
+    // headers to it is pure noise: we predefine __GLIBC_MINOR__ as 17 while
+    // the host's features.h defines the true value, so every compilation
+    // against glibc would warn.
+    if old.predefined {
+        return None;
+    }
+    if old.is_function != new.is_function {
+        return Some("one definition is function-like and the other is not");
+    }
+    if old.is_function {
+        if old.params.len() != new.params.len() {
+            return Some("the definitions take different numbers of parameters");
+        }
+        if old
+            .params
+            .iter()
+            .zip(&new.params)
+            .any(|(a, b)| a.name != b.name)
+        {
+            return Some("the parameters are spelled differently");
+        }
+        if old.is_variadic != new.is_variadic || old.variadic_name != new.variadic_name {
+            return Some("the definitions disagree about the variadic parameter");
+        }
+    }
+    if !replacement_lists_identical(&old.body, &new.body) {
+        return Some("the replacement lists differ");
+    }
+    None
+}
+
+/// Compare two replacement lists, ignoring whitespace before the first token.
+fn replacement_lists_identical(a: &[MacroToken], b: &[MacroToken]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).enumerate().all(|(i, (x, y))| {
+        x.typ == y.typ && x.value == y.value && (i == 0 || x.whitespace == y.whitespace)
+    })
+}
+
 /// A macro definition (object-like or function-like)
 #[derive(Debug, Clone)]
 pub struct Macro {
@@ -62,14 +123,22 @@ pub struct Macro {
     pub is_function: bool,
     /// Parameters for function-like macros
     pub params: Vec<MacroParam>,
-    /// Is this a variadic macro (...)? (reserved for future use)
-    pub _is_variadic: bool,
+    /// Is this a variadic macro (`...`)?
+    pub is_variadic: bool,
+    /// For the GNU named-variadic form `#define F(a, rest...)`, the name bound
+    /// to the trailing arguments. `None` means the C99 spelling, where they
+    /// are reached through `__VA_ARGS__`.
+    pub variadic_name: Option<String>,
     /// Built-in expand function (for __LINE__, __FILE__, etc.)
     pub builtin: Option<BuiltinMacro>,
+    /// True when the implementation supplied this macro (a predefine, a
+    /// keyword alias, or a `-D` on the command line) rather than a `#define`
+    /// directive in a translation unit.
+    pub predefined: bool,
 }
 
 /// A token stored in a macro body
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MacroToken {
     pub typ: TokenType,
     pub value: MacroTokenValue,
@@ -77,7 +146,7 @@ pub struct MacroToken {
 }
 
 /// Value of a macro token
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MacroTokenValue {
     None,
     Number(String),
@@ -137,8 +206,12 @@ impl Macro {
                             TokenValue::String(s) => MacroTokenValue::String(s.clone()),
                             TokenValue::Char(c) => MacroTokenValue::Char(c.clone()),
                             TokenValue::Special(code) => MacroTokenValue::Special(*code),
-                            TokenValue::WideString(s) => MacroTokenValue::String(s.clone()),
-                            TokenValue::WideChar(c) => MacroTokenValue::Char(c.clone()),
+                            TokenValue::WideString(s)
+                            | TokenValue::Utf16String(s)
+                            | TokenValue::Utf32String(s) => MacroTokenValue::String(s.clone()),
+                            TokenValue::WideChar(c)
+                            | TokenValue::Utf16Char(c)
+                            | TokenValue::Utf32Char(c) => MacroTokenValue::Char(c.clone()),
                             TokenValue::None => MacroTokenValue::None,
                         };
                         MacroToken {
@@ -156,8 +229,10 @@ impl Macro {
             body,
             is_function: false,
             params: vec![],
-            _is_variadic: false,
+            is_variadic: false,
+            variadic_name: None,
             builtin: None,
+            predefined: true,
         }
     }
 
@@ -180,54 +255,10 @@ impl Macro {
             body,
             is_function: false,
             params: vec![],
-            _is_variadic: false,
+            is_variadic: false,
+            variadic_name: None,
             builtin: None,
-        }
-    }
-
-    /// Create a predefined macro from a command-line -D value.
-    /// The value is tokenized properly so -DFOO=123 becomes a number token,
-    /// -DFOO=bar becomes an identifier token, etc.
-    pub fn from_cmdline_define(name: &str, value: &str) -> Self {
-        // Tokenize the value string
-        let mut idents = IdentTable::new();
-        let mut tokenizer = Tokenizer::new(value.as_bytes(), 0, &mut idents);
-        let tokens = tokenizer.tokenize();
-
-        // Convert tokens to macro tokens, skipping stream markers
-        let body: Vec<MacroToken> = tokens
-            .iter()
-            .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
-            .enumerate()
-            .map(|(i, token)| {
-                let value = match &token.value {
-                    TokenValue::Number(n) => MacroTokenValue::Number(n.clone()),
-                    TokenValue::Ident(id) => {
-                        let ident_name = idents.get_opt(*id).unwrap_or("").to_string();
-                        MacroTokenValue::Ident(ident_name)
-                    }
-                    TokenValue::String(s) => MacroTokenValue::String(s.clone()),
-                    TokenValue::Char(c) => MacroTokenValue::Char(c.clone()),
-                    TokenValue::Special(code) => MacroTokenValue::Special(*code),
-                    TokenValue::WideString(s) => MacroTokenValue::String(s.clone()),
-                    TokenValue::WideChar(c) => MacroTokenValue::Char(c.clone()),
-                    TokenValue::None => MacroTokenValue::None,
-                };
-                MacroToken {
-                    typ: token.typ,
-                    value,
-                    whitespace: i > 0 && token.pos.whitespace,
-                }
-            })
-            .collect();
-
-        Self {
-            name: name.to_string(),
-            body,
-            is_function: false,
-            params: vec![],
-            _is_variadic: false,
-            builtin: None,
+            predefined: true,
         }
     }
 
@@ -247,8 +278,10 @@ impl Macro {
             body,
             is_function: false,
             params: vec![],
-            _is_variadic: false,
+            is_variadic: false,
+            variadic_name: None,
             builtin: None,
+            predefined: true,
         }
     }
 
@@ -266,8 +299,10 @@ impl Macro {
             } else {
                 vec![]
             },
-            _is_variadic: false,
+            is_variadic: false,
+            variadic_name: None,
             builtin: Some(builtin),
+            predefined: true,
         }
     }
 }
@@ -356,6 +391,8 @@ pub struct Preprocessor<'a> {
 
     /// Whether to use builtin headers (disabled by -nobuiltininc or -nostdinc)
     use_builtin_headers: bool,
+    /// Apply translation phase 1 trigraph replacement to included files.
+    trigraphs: bool,
 
     /// Whether to use system include paths (disabled by -nostdinc)
     use_system_headers: bool,
@@ -524,6 +561,7 @@ impl<'a> Preprocessor<'a> {
             compile_time,
             preprocess_depth: 0,
             use_builtin_headers: true,
+            trigraphs: false,
             use_system_headers: true,
             current_include_path_index: None,
             lexer_mode: LexerMode::C,
@@ -531,13 +569,12 @@ impl<'a> Preprocessor<'a> {
             line_file_override: None,
         };
 
-        // Initialize predefined macros
-        pp.init_predefined_macros();
-
-        // Initialize include paths from OS
+        // Include paths first: __STDC_NO_THREADS__ is decided by probing them.
         for path in os::get_include_paths(target) {
             pp.system_include_paths.push(path.to_string());
         }
+
+        pp.init_predefined_macros();
 
         pp
     }
@@ -548,6 +585,32 @@ impl<'a> Preprocessor<'a> {
         self.define_macro(Macro::predefined("__STDC__", Some("1")));
         self.define_macro(Macro::predefined("__STDC_VERSION__", Some("201112L"))); // C11
         self.define_macro(Macro::predefined("__STDC_HOSTED__", Some("1")));
+
+        // C17 6.10.8.3 conditional feature macros.
+        //
+        // Floating point is native IEEE-754 on both targets, so
+        // __STDC_IEC_559__ is warranted; without it, conforming numeric code
+        // takes a needlessly conservative path. wchar_t holds Unicode code
+        // points on the supported platforms, which is what
+        // __STDC_ISO_10646__ asserts (the value is the Unicode revision, as
+        // GCC reports it).
+        self.define_macro(Macro::predefined("__STDC_IEC_559__", Some("1")));
+        self.define_macro(Macro::predefined("__STDC_ISO_10646__", Some("201706L")));
+        self.define_macro(Macro::predefined("__STDC_UTF_16__", Some("1")));
+        self.define_macro(Macro::predefined("__STDC_UTF_32__", Some("1")));
+
+        // __STDC_IEC_559_COMPLEX__ is deliberately NOT defined. It asserts
+        // conformance to Annex G, and complex support does not meet that bar:
+        // `float _Complex` silently loses its imaginary part and
+        // `long double _Complex` emits an invalid instruction. See cc/audit.md.
+
+        // C17 4p6: an implementation that does not provide <threads.h> shall
+        // define __STDC_NO_THREADS__, so portable code can feature-test rather
+        // than fail at the include. We bundle no threads.h and rely on the
+        // host's, so this is a question about the host.
+        if !self.host_has_threads_header() {
+            self.define_macro(Macro::predefined("__STDC_NO_THREADS__", Some("1")));
+        }
 
         // GCC compatibility macros (required by system headers)
         self.define_macro(Macro::predefined("__GNUC__", Some("4")));
@@ -695,9 +758,48 @@ impl<'a> Preprocessor<'a> {
         ));
     }
 
+    /// Whether the host provides `<threads.h>` on any system include path.
+    ///
+    /// Probed rather than assumed: glibc gained it in 2.28, musl has it, and
+    /// macOS still does not, so the answer varies by host even for one target.
+    fn host_has_threads_header(&self) -> bool {
+        self.system_include_paths
+            .iter()
+            .any(|dir| Path::new(dir).join("threads.h").exists())
+    }
+
     /// Define a macro
     pub fn define_macro(&mut self, mac: Macro) {
         self.macros.insert(mac.name.clone(), mac);
+    }
+
+    /// Apply one command-line `-D` specification.
+    ///
+    /// The spec is rewritten as the equivalent `#define` directive and run
+    /// through the ordinary directive path, so `-D'F(x)=x+1'` gets the same
+    /// parameter parsing, `#`/`##` handling and variadic support as a `#define`
+    /// in source. Building an object-like macro directly made `"F(x)"` the
+    /// macro *name* — a silent no-op, since no such identifier can ever be
+    /// written in a translation unit.
+    pub fn define_from_cmdline(&mut self, spec: &str, idents: &mut IdentTable) {
+        // `-DNAME` with no `=` defines NAME as 1.
+        let text = match spec.find('=') {
+            Some(eq) => format!("{} {}\n", &spec[..eq], &spec[eq + 1..]),
+            None => format!("{} 1\n", spec),
+        };
+
+        let stream_id = diag::init_stream("<command-line>");
+        let tokens = {
+            let mut tokenizer = Tokenizer::new(text.as_bytes(), stream_id, idents);
+            tokenizer.tokenize()
+        };
+        // handle_define expects to start at the macro name, and stream markers
+        // would be taken for one.
+        let mut iter = tokens
+            .into_iter()
+            .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
+            .peekable();
+        self.handle_define(&mut iter, idents);
     }
 
     /// Undefine a macro
@@ -889,6 +991,17 @@ impl<'a> Preprocessor<'a> {
     ) where
         I: Iterator<Item = Token>,
     {
+        // C17 6.10p7: a `#` alone on a line is the null directive and has no
+        // effect. Check before consuming, because the next token belongs to the
+        // *next* line — taking it unconditionally treated that line's first
+        // token as a directive name and then `skip_to_eol` ate the rest of it,
+        // silently deleting a line of source.
+        match iter.peek() {
+            None => return,
+            Some(next) if next.pos.newline => return,
+            Some(_) => {}
+        }
+
         // Get the directive name
         let directive_token = match iter.next() {
             Some(t) => t,
@@ -930,7 +1043,7 @@ impl<'a> Preprocessor<'a> {
             crate::kw::PP_ERROR => self.handle_error(iter, &hash_token.pos, idents),
             crate::kw::WARNING => self.handle_warning(iter, &hash_token.pos, idents),
             crate::kw::PRAGMA => self.handle_pragma(iter, idents),
-            crate::kw::LINE => self.handle_line(iter, idents),
+            crate::kw::LINE => self.handle_line(iter, idents, hash_token.pos),
             _ => {
                 // Unknown directive
                 if !self.is_skipping() {
@@ -1137,9 +1250,10 @@ impl<'a> Preprocessor<'a> {
         };
 
         // Check if function-like macro (immediate '(' without whitespace)
-        let mut params = Vec::new();
+        let mut params: Vec<MacroParam> = Vec::new();
         let mut is_function = false;
-        let mut _is_variadic = false;
+        let mut is_variadic = false;
+        let mut variadic_name = None;
 
         if let Some(next) = iter.peek() {
             if !next.pos.whitespace {
@@ -1150,6 +1264,13 @@ impl<'a> Preprocessor<'a> {
 
                         // Parse parameters
                         let mut param_index = 0;
+                        // Whether the token just parsed was an identifier with
+                        // no comma after it yet. `...` directly behind such an
+                        // identifier is the GNU named-variadic spelling
+                        // `#define F(a, rest...)`, where `rest` names the
+                        // trailing arguments rather than being a parameter of
+                        // its own.
+                        let mut ident_immediately_before = false;
                         while let Some(param_tok) = iter.next() {
                             if param_tok.pos.newline {
                                 break;
@@ -1157,9 +1278,23 @@ impl<'a> Preprocessor<'a> {
 
                             match &param_tok.value {
                                 TokenValue::Special(c) if *c == b')' as u32 => break,
-                                TokenValue::Special(c) if *c == b',' as u32 => continue,
+                                TokenValue::Special(c) if *c == b',' as u32 => {
+                                    ident_immediately_before = false;
+                                    continue;
+                                }
                                 TokenValue::Special(c) if *c == SpecialToken::Ellipsis as u32 => {
-                                    _is_variadic = true;
+                                    is_variadic = true;
+                                    if ident_immediately_before {
+                                        // Rebind the identifier: it is the name
+                                        // of the variadic part, not a positional
+                                        // parameter. Leaving it in `params` made
+                                        // it match only the *first* trailing
+                                        // argument and pushed the __VA_ARGS__
+                                        // start index one too far.
+                                        if let Some(p) = params.pop() {
+                                            variadic_name = Some(p.name);
+                                        }
+                                    }
                                     // Consume closing paren
                                     for t in iter.by_ref() {
                                         if t.pos.newline {
@@ -1180,6 +1315,7 @@ impl<'a> Preprocessor<'a> {
                                             index: param_index,
                                         });
                                         param_index += 1;
+                                        ident_immediately_before = true;
                                     }
                                 }
                                 _ => {}
@@ -1192,16 +1328,35 @@ impl<'a> Preprocessor<'a> {
 
         // Collect body tokens
         let body_tokens = self.collect_to_eol(iter);
-        let body = self.tokens_to_macro_body(&body_tokens, &params, idents);
+        let body = self.tokens_to_macro_body(
+            &body_tokens,
+            &params,
+            variadic_name.as_deref(),
+            is_function,
+            idents,
+        );
 
         let mac = Macro {
             name: name.clone(),
             body,
             is_function,
             params,
-            _is_variadic,
+            is_variadic,
+            variadic_name,
             builtin: None,
+            predefined: false,
         };
+
+        // C17 6.10.3p2: a macro may be redefined only by a definition of the
+        // same kind, with the same parameter spelling and an identical
+        // replacement list. Diagnose as a warning rather than an error: the
+        // standard requires only a diagnostic, and rejecting outright would
+        // break a great deal of code that redefines a macro benignly.
+        if let Some(existing) = self.macros.get(&name) {
+            if let Some(why) = macro_redefinition_conflict(existing, &mac) {
+                diag::warning(name_token.pos, &format!("'{}' redefined: {}", name, why));
+            }
+        }
 
         self.define_macro(mac);
     }
@@ -1211,8 +1366,35 @@ impl<'a> Preprocessor<'a> {
         &self,
         tokens: &[Token],
         params: &[MacroParam],
+        variadic_name: Option<&str>,
+        is_function: bool,
         idents: &IdentTable,
     ) -> Vec<MacroToken> {
+        // C17 6.10.3.3p1: `##` shall occur at neither end of a replacement
+        // list. Both used to become a literal `#`/`##` token instead.
+        let is_paste = |t: &Token| {
+            matches!(&t.value, TokenValue::Special(c)
+                if *c == SpecialToken::HashHash as u32)
+        };
+        if let Some(first) = tokens.first() {
+            if is_paste(first) {
+                diag::error(
+                    first.pos,
+                    "'##' cannot appear at the start of a macro replacement list",
+                );
+            }
+        }
+        if tokens.len() > 1 {
+            if let Some(last) = tokens.last() {
+                if is_paste(last) {
+                    diag::error(
+                        last.pos,
+                        "'##' cannot appear at the end of a macro replacement list",
+                    );
+                }
+            }
+        }
+
         let mut body = Vec::new();
         let mut i = 0;
 
@@ -1259,8 +1441,9 @@ impl<'a> Preprocessor<'a> {
                                     i += 2;
                                     continue;
                                 }
-                                // Check for __VA_ARGS__
-                                if name == "__VA_ARGS__" {
+                                // Check for __VA_ARGS__, or the GNU named
+                                // variadic that stands in for it.
+                                if name == "__VA_ARGS__" || Some(name) == variadic_name {
                                     body.push(MacroToken {
                                         typ: TokenType::Special,
                                         value: MacroTokenValue::Stringify(params.len()),
@@ -1271,6 +1454,13 @@ impl<'a> Preprocessor<'a> {
                                 }
                             }
                         }
+                    }
+
+                    // C17 6.10.3.2p1: in a function-like macro each `#` shall
+                    // be followed by a parameter. It used to fall through to a
+                    // literal `#` token with no diagnostic.
+                    if is_function {
+                        diag::error(token.pos, "'#' is not followed by a macro parameter");
                     }
                 }
 
@@ -1289,8 +1479,9 @@ impl<'a> Preprocessor<'a> {
             // Check for parameter reference or __VA_ARGS__
             if let TokenValue::Ident(id) = &token.value {
                 if let Some(name) = idents.get_opt(*id) {
-                    // Check if it's __VA_ARGS__
-                    if name == "__VA_ARGS__" {
+                    // Check if it's __VA_ARGS__, or the GNU named variadic
+                    // that stands in for it.
+                    if name == "__VA_ARGS__" || Some(name) == variadic_name {
                         body.push(MacroToken {
                             typ: TokenType::Ident,
                             value: MacroTokenValue::VaArgs,
@@ -1340,8 +1531,12 @@ impl<'a> Preprocessor<'a> {
             TokenValue::String(s) => MacroTokenValue::String(s.clone()),
             TokenValue::Char(c) => MacroTokenValue::Char(c.clone()),
             TokenValue::Special(code) => MacroTokenValue::Special(*code),
-            TokenValue::WideString(s) => MacroTokenValue::String(s.clone()),
-            TokenValue::WideChar(c) => MacroTokenValue::Char(c.clone()),
+            TokenValue::WideString(s) | TokenValue::Utf16String(s) | TokenValue::Utf32String(s) => {
+                MacroTokenValue::String(s.clone())
+            }
+            TokenValue::WideChar(c) | TokenValue::Utf16Char(c) | TokenValue::Utf32Char(c) => {
+                MacroTokenValue::Char(c.clone())
+            }
             TokenValue::None => MacroTokenValue::None,
         };
 
@@ -1560,7 +1755,7 @@ impl<'a> Preprocessor<'a> {
     /// Evaluate a preprocessor expression
     fn evaluate_expression(&self, tokens: &[Token], idents: &IdentTable) -> bool {
         let mut evaluator = ExprEvaluator::new(self, idents);
-        evaluator.evaluate(tokens) != 0
+        evaluator.evaluate(tokens).is_true()
     }
 
     /// Handle #include
@@ -1697,17 +1892,6 @@ impl<'a> Preprocessor<'a> {
         is_system: bool,
         is_include_next: bool,
     ) -> Option<(IncludeSource, Option<usize>)> {
-        // For #include_next, skip builtin headers entirely
-        if !is_include_next {
-            // Check builtin headers first (before any filesystem search)
-            // Builtin headers take precedence for standard names like stdarg.h
-            if self.use_builtin_headers {
-                if let Some(content) = builtin_headers::get_builtin_header(filename) {
-                    return Some((IncludeSource::Builtin(content), None));
-                }
-            }
-        }
-
         // Absolute path
         if filename.starts_with('/') {
             let path = PathBuf::from(filename);
@@ -1717,7 +1901,8 @@ impl<'a> Preprocessor<'a> {
             return None;
         }
 
-        // For quoted includes (not #include_next), first check relative to current file
+        // The `"..."` form searches the including file's own directory first
+        // (c17.md 87905-87910), then proceeds as for the `<...>` form.
         if !is_system && !is_include_next {
             let relative_path = Path::new(&self.current_dir).join(filename);
             if relative_path.exists() {
@@ -1725,14 +1910,24 @@ impl<'a> Preprocessor<'a> {
             }
         }
 
-        // Check -I include paths (for both quoted and angle bracket includes)
-        // Per C standard, -I paths are searched for all includes
+        // Then -I, for both forms.
         if !is_include_next {
             for dir in &self.quote_include_paths {
                 let path = Path::new(dir).join(filename);
                 if path.exists() {
                     return Some((IncludeSource::File(path), None));
                 }
+            }
+        }
+
+        // Bundled headers stand in for the compiler's own include directory,
+        // so they come after the user's search paths — a project that ships
+        // its own limits.h or stddef.h must win. They used to be consulted
+        // before any filesystem search, which silently shadowed those.
+        // #include_next skips them entirely.
+        if !is_include_next && self.use_builtin_headers {
+            if let Some(content) = builtin_headers::get_builtin_header(filename) {
+                return Some((IncludeSource::Builtin(content), None));
             }
         }
 
@@ -2243,6 +2438,14 @@ impl<'a> Preprocessor<'a> {
             }
         };
 
+        // Translation phase 1 applies to an included file just as it does to
+        // the primary source, and before the include-guard scan looks at it.
+        let content = if self.trigraphs {
+            crate::token::lexer::replace_trigraphs(&content).into_owned()
+        } else {
+            content
+        };
+
         // Check for include guard optimization: if file starts with #ifndef MACRO
         // or #if !defined(MACRO) and that macro is already defined, skip the include.
         // This allows circular includes protected by guards to work correctly.
@@ -2538,8 +2741,12 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Handle #line directive
-    fn handle_line<I>(&mut self, iter: &mut std::iter::Peekable<I>, idents: &mut IdentTable)
-    where
+    fn handle_line<I>(
+        &mut self,
+        iter: &mut std::iter::Peekable<I>,
+        idents: &mut IdentTable,
+        directive_pos: Position,
+    ) where
         I: Iterator<Item = Token>,
     {
         if self.is_skipping() {
@@ -2550,17 +2757,45 @@ impl<'a> Preprocessor<'a> {
         let tokens = self.collect_to_eol(iter);
         let tokens = self.expand_if_tokens(&tokens, idents);
         if tokens.is_empty() {
+            diag::error(directive_pos, "#line requires a line number");
             return;
         }
 
-        // First token must be a line number
+        // C17 6.10.4p3: the operand is a digit sequence in [1, 2147483647].
+        // These used to return silently, so a typo just did nothing.
         let line_num = match &tokens[0].value {
             TokenValue::Number(n) => match n.parse::<u32>() {
-                Ok(num) => num,
-                Err(_) => return,
+                Ok(num) if (1..=2147483647).contains(&num) => num,
+                Ok(_) => {
+                    diag::error(
+                        tokens[0].pos,
+                        &format!("#line number '{}' is out of range [1, 2147483647]", n),
+                    );
+                    return;
+                }
+                Err(_) => {
+                    diag::error(
+                        tokens[0].pos,
+                        &format!("#line requires a decimal line number, found '{}'", n),
+                    );
+                    return;
+                }
             },
-            _ => return,
+            _ => {
+                diag::error(tokens[0].pos, "#line requires a decimal line number");
+                return;
+            }
         };
+
+        // Only a string literal may follow, and nothing may follow that.
+        if tokens.len() > 1 && !matches!(&tokens[1].value, TokenValue::String(_)) {
+            diag::error(tokens[1].pos, "#line filename must be a string literal");
+            return;
+        }
+        if tokens.len() > 2 {
+            diag::error(tokens[2].pos, "extra tokens after #line directive");
+            return;
+        }
 
         // The #line directive takes effect on the next line, so
         // current_physical_line is the line of the directive + 1
@@ -2616,10 +2851,18 @@ impl<'a> Preprocessor<'a> {
                     }
                 }
                 TokenValue::Number(n) => result.push_str(n),
-                TokenValue::String(s) | TokenValue::WideString(s) => {
-                    if matches!(&token.value, TokenValue::WideString(_)) {
-                        result.push('L');
-                    }
+                TokenValue::String(s)
+                | TokenValue::WideString(s)
+                | TokenValue::Utf16String(s)
+                | TokenValue::Utf32String(s) => {
+                    // The encoding prefix is part of the spelling, so it must
+                    // survive stringification (C99 6.10.3.2p2).
+                    result.push_str(match &token.value {
+                        TokenValue::WideString(_) => "L",
+                        TokenValue::Utf16String(_) => "u",
+                        TokenValue::Utf32String(_) => "U",
+                        _ => "",
+                    });
                     // C99 6.10.3.2p2: insert \ before each " and \ including delimiters
                     result.push('\\');
                     result.push('"');
@@ -2632,10 +2875,16 @@ impl<'a> Preprocessor<'a> {
                     result.push('\\');
                     result.push('"');
                 }
-                TokenValue::Char(c) | TokenValue::WideChar(c) => {
-                    if matches!(&token.value, TokenValue::WideChar(_)) {
-                        result.push('L');
-                    }
+                TokenValue::Char(c)
+                | TokenValue::WideChar(c)
+                | TokenValue::Utf16Char(c)
+                | TokenValue::Utf32Char(c) => {
+                    result.push_str(match &token.value {
+                        TokenValue::WideChar(_) => "L",
+                        TokenValue::Utf16Char(_) => "u",
+                        TokenValue::Utf32Char(_) => "U",
+                        _ => "",
+                    });
                     // C99 6.10.3.2p2: insert \ before each " and \ in char constants
                     result.push('\'');
                     for ch in c.chars() {
@@ -2763,6 +3012,56 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Expand a function-like macro
+    /// C17 6.10.3p4: a function-like macro invocation must supply as many
+    /// arguments as the definition has parameters (and at least that many for a
+    /// variadic one).
+    ///
+    /// Substitution used `args.get(idx).unwrap_or_default()`, so a missing
+    /// argument silently became empty and an extra one was silently dropped.
+    fn check_macro_arity(&self, mac: &Macro, args: &[Vec<Token>], pos: &Position) {
+        // `collect_macro_args` yields no arguments at all for `F()`. That spells
+        // *one empty argument* unless the macro takes none, so recover the
+        // distinction here rather than in the collector, which cannot see the
+        // definition.
+        let supplied = if args.is_empty() {
+            if mac.params.is_empty() && !mac.is_variadic {
+                0
+            } else {
+                1
+            }
+        } else {
+            args.len()
+        };
+        let required = mac.params.len();
+
+        // The variadic part may be empty; that is a GNU extension C23 adopted,
+        // and rejecting it would break a great deal of existing code.
+        let wrong = if mac.is_variadic {
+            supplied < required
+        } else {
+            supplied != required
+        };
+        if !wrong {
+            return;
+        }
+
+        let expected = if mac.is_variadic {
+            format!("at least {}", required)
+        } else {
+            required.to_string()
+        };
+        diag::error(
+            *pos,
+            &format!(
+                "macro '{}' requires {} argument{}, but {} given",
+                mac.name,
+                expected,
+                if required == 1 { "" } else { "s" },
+                supplied
+            ),
+        );
+    }
+
     fn expand_function_macro(
         &mut self,
         mac: &Macro,
@@ -2770,6 +3069,8 @@ impl<'a> Preprocessor<'a> {
         pos: &Position,
         idents: &mut IdentTable,
     ) -> Option<Vec<Token>> {
+        self.check_macro_arity(mac, args, pos);
+
         // Note: Don't add to expanding set yet - arguments need to be fully expanded first.
         // The expanding set is only used during the rescan phase to prevent infinite recursion.
 
@@ -2820,8 +3121,18 @@ impl<'a> Preprocessor<'a> {
                             if matches!(tok.typ, TokenType::StreamBegin | TokenType::StreamEnd) {
                                 continue;
                             }
+                            // Re-point the token at the invocation for
+                            // diagnostics, but keep whether it was preceded by
+                            // white space: that belongs to the argument's own
+                            // spelling, and 6.10.3.2p2 makes `#` reproduce it.
+                            // Taking `whitespace` from the invocation site gave
+                            // every expanded token one, so the two-level
+                            // `XSTR(x)`/`STR(x)` idiom turned `1+2` into
+                            // `"1 + 2"` while the direct `STR(1+2)` was right.
+                            let whitespace = tok.pos.whitespace;
                             tok.pos = *pos;
                             tok.pos.newline = false;
+                            tok.pos.whitespace = whitespace;
                             result.push(tok);
                         }
                     }
@@ -3060,22 +3371,20 @@ impl<'a> Preprocessor<'a> {
                 let id = idents.intern(name);
                 TokenValue::Ident(id)
             }
-            MacroTokenValue::String(s) => {
-                // Check original token type to handle WideString correctly
-                if mt.typ == TokenType::WideString {
-                    TokenValue::WideString(s.clone())
-                } else {
-                    TokenValue::String(s.clone())
-                }
-            }
-            MacroTokenValue::Char(c) => {
-                // Check original token type to handle WideChar correctly
-                if mt.typ == TokenType::WideChar {
-                    TokenValue::WideChar(c.clone())
-                } else {
-                    TokenValue::Char(c.clone())
-                }
-            }
+            // The macro body collapses every string/char encoding into one
+            // variant, so the original token type is what recovers it.
+            MacroTokenValue::String(s) => match mt.typ {
+                TokenType::WideString => TokenValue::WideString(s.clone()),
+                TokenType::Utf16String => TokenValue::Utf16String(s.clone()),
+                TokenType::Utf32String => TokenValue::Utf32String(s.clone()),
+                _ => TokenValue::String(s.clone()),
+            },
+            MacroTokenValue::Char(c) => match mt.typ {
+                TokenType::WideChar => TokenValue::WideChar(c.clone()),
+                TokenType::Utf16Char => TokenValue::Utf16Char(c.clone()),
+                TokenType::Utf32Char => TokenValue::Utf32Char(c.clone()),
+                _ => TokenValue::Char(c.clone()),
+            },
             MacroTokenValue::Special(code) => TokenValue::Special(*code),
             _ => TokenValue::None,
         };
@@ -3273,11 +3582,76 @@ impl<'a> Preprocessor<'a> {
 // Expression Evaluator for #if
 // ============================================================================
 
+/// A value in a `#if` expression.
+///
+/// C17 6.10.1p4 requires `#if` arithmetic to be done in `intmax_t` and
+/// `uintmax_t`, which is 64-bit on every target here. Both domains are carried
+/// in an `i128` so a `u64` value is representable exactly and *signed*
+/// comparison of the carrier is already the correct unsigned comparison once
+/// both sides have been promoted. Results are wrapped back to 64 bits after
+/// every operation, so overflow behaves as it does in the target's arithmetic.
+///
+/// This replaces a plain `i64` that silently mapped anything out of range to
+/// `0`, so `#if 0xFFFFFFFFFFFFFFFF` took the false branch and `__UINT64_MAX__`
+/// evaluated as zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PpValue {
+    /// The value: a sign-extended i64 when signed, a zero-extended u64 when not.
+    v: i128,
+    unsigned: bool,
+}
+
+impl PpValue {
+    fn signed(v: i128) -> Self {
+        PpValue {
+            v: v as i64 as i128,
+            unsigned: false,
+        }
+    }
+
+    fn unsigned(v: i128) -> Self {
+        PpValue {
+            v: v as u64 as i128,
+            unsigned: true,
+        }
+    }
+
+    fn from_parts(v: i128, unsigned: bool) -> Self {
+        if unsigned {
+            Self::unsigned(v)
+        } else {
+            Self::signed(v)
+        }
+    }
+
+    fn is_true(self) -> bool {
+        self.v != 0
+    }
+
+    /// The carrier, for operations that do not apply the usual conversions.
+    fn raw(self) -> i128 {
+        self.v
+    }
+
+    /// Apply the usual arithmetic conversions: if either operand is unsigned,
+    /// both are taken in the unsigned domain and so is the result.
+    fn promote(a: PpValue, b: PpValue) -> (i128, i128, bool) {
+        if a.unsigned || b.unsigned {
+            (a.v as u64 as i128, b.v as u64 as i128, true)
+        } else {
+            (a.v, b.v, false)
+        }
+    }
+}
+
 struct ExprEvaluator<'a, 'b> {
     pp: &'a Preprocessor<'b>,
     idents: &'a IdentTable,
     tokens: Vec<Token>,
     pos: usize,
+    /// Set while parsing a short-circuited operand, whose diagnostics must not
+    /// fire — the whole point of `&&`/`||` not evaluating that side.
+    suppressed: bool,
 }
 
 impl<'a, 'b> ExprEvaluator<'a, 'b> {
@@ -3287,36 +3661,14 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
             idents,
             tokens: Vec::new(),
             pos: 0,
+            suppressed: false,
         }
     }
 
-    fn evaluate(&mut self, tokens: &[Token]) -> i64 {
+    fn evaluate(&mut self, tokens: &[Token]) -> PpValue {
         self.tokens = tokens.to_vec();
         self.pos = 0;
         self.expr_ternary()
-    }
-
-    /// Ternary operator has lowest precedence: cond ? true_val : false_val
-    fn expr_ternary(&mut self) -> i64 {
-        let cond = self.expr_or();
-        if self.is_special(b'?' as u32) {
-            self.advance();
-            let true_val = self.expr_ternary();
-            if self.is_special(b':' as u32) {
-                self.advance();
-            } else {
-                let pos = self.current().map(|t| t.pos).unwrap_or_default();
-                diag::error(pos, "expected ':' in conditional expression");
-            }
-            let false_val = self.expr_ternary();
-            if cond != 0 {
-                true_val
-            } else {
-                false_val
-            }
-        } else {
-            cond
-        }
     }
 
     fn current(&self) -> Option<&Token> {
@@ -3357,80 +3709,127 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
     }
 
     // Operator precedence (lowest to highest):
-    // ||
-    // &&
-    // |
-    // ^
-    // &
-    // == !=
-    // < <= > >=
-    // << >>
-    // + -
-    // * / %
-    // ! ~ - + (unary)
-    // defined, primary
+    // ?: || && | ^ & ==/!= relational shift additive multiplicative unary
 
-    fn expr_or(&mut self) -> i64 {
+    /// Ternary operator has lowest precedence: cond ? true_val : false_val
+    fn expr_ternary(&mut self) -> PpValue {
+        let cond = self.expr_or();
+        if self.is_special(b'?' as u32) {
+            self.advance();
+            let true_val = self.expr_ternary();
+            if self.is_special(b':' as u32) {
+                self.advance();
+            } else {
+                let pos = self.current().map(|t| t.pos).unwrap_or_default();
+                diag::error(pos, "expected ':' in conditional expression");
+            }
+            let false_val = self.expr_ternary();
+            if cond.is_true() {
+                true_val
+            } else {
+                false_val
+            }
+        } else {
+            cond
+        }
+    }
+
+    fn expr_or(&mut self) -> PpValue {
         let mut left = self.expr_and();
         while self.is_special(SpecialToken::LogicalOr as u32) {
             self.advance();
-            let right = self.expr_and();
-            left = if left != 0 || right != 0 { 1 } else { 0 };
+            // C17 6.5.14p4: the right operand is not evaluated if the left
+            // compares unequal to 0. Parsing must still consume it.
+            if left.is_true() {
+                self.skip_expr_and();
+                left = PpValue::signed(1);
+            } else {
+                let right = self.expr_and();
+                left = PpValue::signed(i128::from(right.is_true()));
+            }
         }
         left
     }
 
-    fn expr_and(&mut self) -> i64 {
+    fn expr_and(&mut self) -> PpValue {
         let mut left = self.expr_bitor();
         while self.is_special(SpecialToken::LogicalAnd as u32) {
             self.advance();
-            let right = self.expr_bitor();
-            left = if left != 0 && right != 0 { 1 } else { 0 };
+            // C17 6.5.13p4: the right operand is not evaluated if the left
+            // compares equal to 0.
+            if left.is_true() {
+                let right = self.expr_bitor();
+                left = PpValue::signed(i128::from(right.is_true()));
+            } else {
+                self.skip_expr_bitor();
+                left = PpValue::signed(0);
+            }
         }
         left
     }
 
-    fn expr_bitor(&mut self) -> i64 {
+    /// Parse and discard an `&&` operand, for the short-circuited case.
+    fn skip_expr_and(&mut self) {
+        let saved = self.suppressed;
+        self.suppressed = true;
+        let _ = self.expr_and();
+        self.suppressed = saved;
+    }
+
+    /// Parse and discard a `||` operand, for the short-circuited case.
+    fn skip_expr_bitor(&mut self) {
+        let saved = self.suppressed;
+        self.suppressed = true;
+        let _ = self.expr_bitor();
+        self.suppressed = saved;
+    }
+
+    fn expr_bitor(&mut self) -> PpValue {
         let mut left = self.expr_bitxor();
         while self.is_special(b'|' as u32) {
             self.advance();
             let right = self.expr_bitxor();
-            left |= right;
+            let (a, b, u) = PpValue::promote(left, right);
+            left = PpValue::from_parts(a | b, u);
         }
         left
     }
 
-    fn expr_bitxor(&mut self) -> i64 {
+    fn expr_bitxor(&mut self) -> PpValue {
         let mut left = self.expr_bitand();
         while self.is_special(b'^' as u32) {
             self.advance();
             let right = self.expr_bitand();
-            left ^= right;
+            let (a, b, u) = PpValue::promote(left, right);
+            left = PpValue::from_parts(a ^ b, u);
         }
         left
     }
 
-    fn expr_bitand(&mut self) -> i64 {
+    fn expr_bitand(&mut self) -> PpValue {
         let mut left = self.expr_equality();
         while self.is_special(b'&' as u32) {
             self.advance();
             let right = self.expr_equality();
-            left &= right;
+            let (a, b, u) = PpValue::promote(left, right);
+            left = PpValue::from_parts(a & b, u);
         }
         left
     }
 
-    fn expr_equality(&mut self) -> i64 {
+    fn expr_equality(&mut self) -> PpValue {
         let mut left = self.expr_relational();
         loop {
             if self.is_special(SpecialToken::Equal as u32) {
                 self.advance();
                 let right = self.expr_relational();
-                left = if left == right { 1 } else { 0 };
+                let (a, b, _) = PpValue::promote(left, right);
+                left = PpValue::signed(i128::from(a == b));
             } else if self.is_special(SpecialToken::NotEqual as u32) {
                 self.advance();
                 let right = self.expr_relational();
-                left = if left != right { 1 } else { 0 };
+                let (a, b, _) = PpValue::promote(left, right);
+                left = PpValue::signed(i128::from(a != b));
             } else {
                 break;
             }
@@ -3438,109 +3837,129 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
         left
     }
 
-    fn expr_relational(&mut self) -> i64 {
+    fn expr_relational(&mut self) -> PpValue {
+        // `promote` puts both operands in the same domain first, so a plain
+        // i128 comparison is already the unsigned one when either side is
+        // unsigned — that is the point of carrying values in the wider type.
+        const LT: u32 = b'<' as u32;
+        const GT: u32 = b'>' as u32;
+        let lte = SpecialToken::Lte as u32;
+        let gte = SpecialToken::Gte as u32;
+
         let mut left = self.expr_shift();
         loop {
-            if self.is_special(b'<' as u32) {
-                self.advance();
-                let right = self.expr_shift();
-                left = if left < right { 1 } else { 0 };
-            } else if self.is_special(b'>' as u32) {
-                self.advance();
-                let right = self.expr_shift();
-                left = if left > right { 1 } else { 0 };
-            } else if self.is_special(SpecialToken::Lte as u32) {
-                self.advance();
-                let right = self.expr_shift();
-                left = if left <= right { 1 } else { 0 };
-            } else if self.is_special(SpecialToken::Gte as u32) {
-                self.advance();
-                let right = self.expr_shift();
-                left = if left >= right { 1 } else { 0 };
-            } else {
-                break;
-            }
+            let op = [LT, GT, lte, gte].into_iter().find(|&t| self.is_special(t));
+            let Some(op) = op else { break };
+            self.advance();
+            let right = self.expr_shift();
+            let (a, b, _) = PpValue::promote(left, right);
+            let result = match op {
+                LT => a < b,
+                GT => a > b,
+                t if t == lte => a <= b,
+                _ => a >= b,
+            };
+            left = PpValue::signed(i128::from(result));
         }
         left
     }
 
-    fn expr_shift(&mut self) -> i64 {
+    fn expr_shift(&mut self) -> PpValue {
         let mut left = self.expr_additive();
         loop {
-            if self.is_special(SpecialToken::LeftShift as u32) {
-                self.advance();
-                let right = self.expr_additive();
-                left <<= right;
-            } else if self.is_special(SpecialToken::RightShift as u32) {
-                self.advance();
-                let right = self.expr_additive();
-                left >>= right;
-            } else {
+            let is_left = self.is_special(SpecialToken::LeftShift as u32);
+            if !is_left && !self.is_special(SpecialToken::RightShift as u32) {
                 break;
             }
+            self.advance();
+            let right = self.expr_additive();
+            // A shift does not apply the usual arithmetic conversions: the
+            // result takes the left operand's type (C17 6.5.7p3). A count
+            // outside [0, 64) is undefined; clamp rather than panic.
+            let count = right.v.clamp(0, 63) as u32;
+            let v = if is_left {
+                left.raw() << count
+            } else if left.unsigned {
+                ((left.raw() as u64) >> count) as i128
+            } else {
+                (left.raw() as i64 >> count) as i128
+            };
+            left = PpValue::from_parts(v, left.unsigned);
         }
         left
     }
 
-    fn expr_additive(&mut self) -> i64 {
+    fn expr_additive(&mut self) -> PpValue {
         let mut left = self.expr_multiplicative();
         loop {
-            if self.is_special(b'+' as u32) {
-                self.advance();
-                let right = self.expr_multiplicative();
-                left += right;
-            } else if self.is_special(b'-' as u32) {
-                self.advance();
-                let right = self.expr_multiplicative();
-                left -= right;
-            } else {
+            let is_add = self.is_special(b'+' as u32);
+            if !is_add && !self.is_special(b'-' as u32) {
                 break;
             }
+            self.advance();
+            let right = self.expr_multiplicative();
+            let (a, b, u) = PpValue::promote(left, right);
+            let v = if is_add {
+                a.wrapping_add(b)
+            } else {
+                a.wrapping_sub(b)
+            };
+            left = PpValue::from_parts(v, u);
         }
         left
     }
 
-    fn expr_multiplicative(&mut self) -> i64 {
+    fn expr_multiplicative(&mut self) -> PpValue {
         let mut left = self.expr_unary();
         loop {
-            if self.is_special(b'*' as u32) {
-                self.advance();
-                let right = self.expr_unary();
-                left *= right;
+            let op = if self.is_special(b'*' as u32) {
+                b'*'
             } else if self.is_special(b'/' as u32) {
-                self.advance();
-                let right = self.expr_unary();
-                if right != 0 {
-                    left /= right;
-                }
+                b'/'
             } else if self.is_special(b'%' as u32) {
-                self.advance();
-                let right = self.expr_unary();
-                if right != 0 {
-                    left %= right;
-                }
+                b'%'
             } else {
                 break;
-            }
+            };
+            // Capture the operator's own position: by the time the divisor is
+            // known, `current()` has moved past the end of the expression.
+            let op_pos = self.current().map(|t| t.pos).unwrap_or_default();
+            self.advance();
+            let right = self.expr_unary();
+            let (a, b, u) = PpValue::promote(left, right);
+            let v = match op {
+                b'*' => a.wrapping_mul(b),
+                _ if b == 0 => {
+                    // Only diagnose when this operand is actually reached; a
+                    // short-circuited `#if defined(X) && 1/X` must stay quiet.
+                    if !self.suppressed {
+                        diag::error(op_pos, "division by zero in preprocessor expression");
+                    }
+                    0
+                }
+                b'/' => a.wrapping_div(b),
+                _ => a.wrapping_rem(b),
+            };
+            left = PpValue::from_parts(v, u);
         }
         left
     }
 
-    fn expr_unary(&mut self) -> i64 {
+    fn expr_unary(&mut self) -> PpValue {
         if self.is_special(b'!' as u32) {
             self.advance();
             let val = self.expr_unary();
-            return if val == 0 { 1 } else { 0 };
+            return PpValue::signed(i128::from(!val.is_true()));
         }
         if self.is_special(b'~' as u32) {
             self.advance();
             let val = self.expr_unary();
-            return !val;
+            return PpValue::from_parts(!val.raw(), val.unsigned);
         }
         if self.is_special(b'-' as u32) {
             self.advance();
             let val = self.expr_unary();
-            return -val;
+            return PpValue::from_parts(val.raw().wrapping_neg(), val.unsigned);
         }
         if self.is_special(b'+' as u32) {
             self.advance();
@@ -3549,35 +3968,35 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
         self.expr_primary()
     }
 
-    fn expr_primary(&mut self) -> i64 {
+    fn expr_primary(&mut self) -> PpValue {
         // Handle defined(X) or defined X
         if self.is_ident("defined") {
             self.advance();
-            return self.eval_defined();
+            return PpValue::signed(self.eval_defined() as i128);
         }
 
         // Handle __has_attribute(X)
         if self.is_ident("__has_attribute") {
             self.advance();
-            return self.eval_has_attribute();
+            return PpValue::signed(self.eval_has_attribute() as i128);
         }
 
         // Handle __has_builtin(X)
         if self.is_ident("__has_builtin") {
             self.advance();
-            return self.eval_has_builtin_expr();
+            return PpValue::signed(self.eval_has_builtin_expr() as i128);
         }
 
         // Handle __has_feature(X) and __has_extension(X)
         if self.is_ident("__has_feature") || self.is_ident("__has_extension") {
             self.advance();
-            return self.eval_has_feature();
+            return PpValue::signed(self.eval_has_feature() as i128);
         }
 
         // Handle parenthesized expression
         if self.is_special(b'(' as u32) {
             self.advance();
-            let val = self.expr_or();
+            let val = self.expr_ternary();
             if self.is_special(b')' as u32) {
                 self.advance();
             }
@@ -3593,24 +4012,26 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
             }
         }
 
-        // Handle character literal (including wide char L'x')
+        // Handle character literal (any encoding prefix: L'x', u'x', U'x')
         if let Some(tok) = self.current() {
             let char_str = match &tok.value {
-                TokenValue::Char(c) => Some(c.clone()),
-                TokenValue::WideChar(c) => Some(c.clone()),
+                TokenValue::Char(c)
+                | TokenValue::WideChar(c)
+                | TokenValue::Utf16Char(c)
+                | TokenValue::Utf32Char(c) => Some(c.clone()),
                 _ => None,
             };
             if let Some(char_str) = char_str {
                 self.advance();
                 if char_str.is_empty() {
-                    return 0;
+                    return PpValue::signed(0);
                 }
                 // Pack all chars big-endian (GCC-compatible)
                 let mut val: i64 = 0;
                 for c in char_str.chars() {
                     val = (val << 8) | (c as i64);
                 }
-                return val;
+                return PpValue::signed(val as i128);
             }
         }
 
@@ -3619,11 +4040,11 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
         if let Some(tok) = self.current() {
             if matches!(&tok.value, TokenValue::Ident(_)) {
                 self.advance();
-                return 0;
+                return PpValue::signed(0);
             }
         }
 
-        0
+        PpValue::signed(0)
     }
 
     fn eval_defined(&mut self) -> i64 {
@@ -3729,17 +4150,45 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
         }
     }
 
-    fn parse_number(&self, s: &str) -> i64 {
-        let s = s.trim_end_matches(['u', 'U', 'l', 'L']);
+    /// Parse an integer preprocessing token into a `PpValue`.
+    ///
+    /// The value is unsigned if it carries a `u`/`U` suffix, or if it does not
+    /// fit in `intmax_t` but does fit in `uintmax_t` (C17 6.4.4.1p5). Parsing
+    /// into `u64` first is what makes `#if 0xFFFFFFFFFFFFFFFF` work; the old
+    /// `i64::from_str_radix(...).unwrap_or(0)` turned every such constant into
+    /// a silent zero.
+    fn parse_number(&self, s: &str) -> PpValue {
+        let digits = s.trim_end_matches(['u', 'U', 'l', 'L']);
+        let suffix = &s[digits.len()..];
+        let suffix_unsigned = suffix.contains('u') || suffix.contains('U');
 
-        if s.starts_with("0x") || s.starts_with("0X") {
-            i64::from_str_radix(&s[2..], 16).unwrap_or(0)
-        } else if s.starts_with("0b") || s.starts_with("0B") {
-            i64::from_str_radix(&s[2..], 2).unwrap_or(0)
-        } else if s.starts_with('0') && s.len() > 1 && s.chars().nth(1).unwrap().is_ascii_digit() {
-            i64::from_str_radix(&s[1..], 8).unwrap_or(0)
+        let (body, radix) = if let Some(hex) = digits
+            .strip_prefix("0x")
+            .or_else(|| digits.strip_prefix("0X"))
+        {
+            (hex, 16)
+        } else if let Some(bin) = digits
+            .strip_prefix("0b")
+            .or_else(|| digits.strip_prefix("0B"))
+        {
+            (bin, 2)
+        } else if digits.len() > 1
+            && digits.starts_with('0')
+            && digits[1..].starts_with(|c: char| c.is_ascii_digit())
+        {
+            (&digits[1..], 8)
         } else {
-            s.parse().unwrap_or(0)
+            (digits, 10)
+        };
+
+        match u64::from_str_radix(body, radix) {
+            Ok(v) => {
+                // Too large for intmax_t means the constant's type is
+                // uintmax_t, even without a suffix.
+                let unsigned = suffix_unsigned || v > i64::MAX as u64;
+                PpValue::from_parts(v as i128, unsigned)
+            }
+            Err(_) => PpValue::signed(0),
         }
     }
 }
@@ -3761,6 +4210,8 @@ pub struct PreprocessConfig<'a> {
     pub no_std_inc: bool,
     /// If true, disable builtin headers (-nobuiltininc)
     pub no_builtin_inc: bool,
+    /// If true, apply translation phase 1 trigraph replacement (--trigraphs).
+    pub trigraphs: bool,
 }
 
 /// Preprocess tokens with command-line defines and undefines
@@ -3791,6 +4242,7 @@ pub fn preprocess_with_defines(
     if config.no_builtin_inc {
         pp.use_builtin_headers = false;
     }
+    pp.trigraphs = config.trigraphs;
 
     // Add -I include paths
     for path in config.include_paths {
@@ -3799,17 +4251,7 @@ pub fn preprocess_with_defines(
 
     // Process -D defines
     for def in config.defines {
-        if let Some(eq_pos) = def.find('=') {
-            // -DNAME=VALUE - tokenize the value properly
-            let name = &def[..eq_pos];
-            let value = &def[eq_pos + 1..];
-            let mac = Macro::from_cmdline_define(name, value);
-            pp.define_macro(mac);
-        } else {
-            // -DNAME (define to 1)
-            let mac = Macro::predefined(def, Some("1"));
-            pp.define_macro(mac);
-        }
+        pp.define_from_cmdline(def, idents);
     }
 
     // Process -U undefines
@@ -3896,17 +4338,7 @@ pub fn preprocess_asm_file(
 
     // Process -D defines
     for def in config.defines {
-        if let Some(eq_pos) = def.find('=') {
-            // -DNAME=VALUE
-            let name = &def[..eq_pos];
-            let value = &def[eq_pos + 1..];
-            let mac = Macro::from_cmdline_define(name, value);
-            pp.define_macro(mac);
-        } else {
-            // -DNAME (define to 1)
-            let mac = Macro::predefined(def, Some("1"));
-            pp.define_macro(mac);
-        }
+        pp.define_from_cmdline(def, &mut strings);
     }
 
     // Process -U undefines
@@ -4437,12 +4869,91 @@ second
 
     #[test]
     fn test_macro_redefinition() {
-        // Macro redefinition should use latest value
+        // An incompatible redefinition is diagnosed (C17 6.10.3p2) but is not
+        // fatal: the standard requires only a diagnostic, and rejecting would
+        // break a great deal of code that redefines a macro benignly. The
+        // later definition wins, as it always has.
+        //
+        // This test used to assert the silent override *as intended*, which is
+        // why the constraint went unimplemented.
         let input = "#define X 1\n#define X 2\nX";
         let (tokens, idents) = preprocess_str(input);
         let strs = get_token_strings(&tokens, &idents);
         assert!(strs.contains(&"2".to_string()));
         assert!(!strs.contains(&"1".to_string()));
+    }
+
+    #[test]
+    fn test_macro_redefinition_conflict_detection() {
+        // Build a macro as if it came from a `#define` directive: the
+        // implementation-predefined flag exempts a macro from the constraint,
+        // which is not what is under test here.
+        fn obj(name: &str, value: &str) -> Macro {
+            let mut m = Macro::predefined(name, Some(value));
+            m.predefined = false;
+            m
+        }
+
+        // Identical replacement lists are permitted.
+        assert!(macro_redefinition_conflict(&obj("A", "1"), &obj("A", "1")).is_none());
+        // Differing ones are not.
+        assert!(macro_redefinition_conflict(&obj("A", "1"), &obj("A", "2")).is_some());
+
+        // Object-like versus function-like.
+        let mut fnlike = obj("A", "1");
+        fnlike.is_function = true;
+        fnlike.params = vec![MacroParam {
+            name: "x".into(),
+            index: 0,
+        }];
+        assert!(macro_redefinition_conflict(&obj("A", "1"), &fnlike).is_some());
+
+        // Same shape, differently spelled parameters.
+        let mut renamed = fnlike.clone();
+        renamed.params = vec![MacroParam {
+            name: "y".into(),
+            index: 0,
+        }];
+        assert!(macro_redefinition_conflict(&fnlike, &renamed).is_some());
+
+        // A parameter list that matches is fine.
+        assert!(macro_redefinition_conflict(&fnlike, &fnlike.clone()).is_none());
+    }
+
+    #[test]
+    fn test_replacement_lists_ignore_leading_whitespace() {
+        // Whitespace before the first replacement token is not a separation
+        // *within* the list. Without this, every compilation against glibc
+        // warned: we predefine __GLIBC__ with no leading space, while
+        // features.h writes `#define __GLIBC__ 2` with one.
+        let a = vec![MacroToken {
+            typ: TokenType::Number,
+            value: MacroTokenValue::Number("2".into()),
+            whitespace: false,
+        }];
+        let b = vec![MacroToken {
+            typ: TokenType::Number,
+            value: MacroTokenValue::Number("2".into()),
+            whitespace: true,
+        }];
+        assert!(replacement_lists_identical(&a, &b));
+
+        // But whitespace between tokens still counts.
+        let two = |ws: bool| {
+            vec![
+                MacroToken {
+                    typ: TokenType::Number,
+                    value: MacroTokenValue::Number("1".into()),
+                    whitespace: false,
+                },
+                MacroToken {
+                    typ: TokenType::Number,
+                    value: MacroTokenValue::Number("2".into()),
+                    whitespace: ws,
+                },
+            ]
+        };
+        assert!(!replacement_lists_identical(&two(true), &two(false)));
     }
 
     // ========================================================================

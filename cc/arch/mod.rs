@@ -23,7 +23,7 @@ pub mod x86_64;
 // Re-export inline asm support traits and functions
 pub use codegen::{substitute_asm_operands, AsmOperandFormatter, AsmOperandSlot};
 
-use crate::target::{Arch, Target};
+use crate::target::{Arch, Os, Target};
 
 /// Get architecture-specific predefined macros as (name, value) pairs
 pub fn get_arch_macros(target: &Target) -> Vec<(&'static str, Option<&'static str>)> {
@@ -109,35 +109,45 @@ pub fn get_limit_macros(target: &Target) -> Vec<(&'static str, &'static str)> {
 
 /// Get type definition macros (for <stdint.h> and <stddef.h> compatibility)
 /// These define the underlying C type for various abstract types
-pub fn get_type_macros(_target: &Target) -> Vec<(&'static str, &'static str)> {
+pub fn get_type_macros(target: &Target) -> Vec<(&'static str, &'static str)> {
+    // The 64-bit exact/least/fast types are distinct types even at the same
+    // width, so getting this wrong makes our <stdint.h> and the host's
+    // disagree about int64_t — which is exactly what surfaced when
+    // <stdint.h> stopped being delegated. Every target is LP64, so the choice
+    // is the platform's convention, not the width: Darwin says `long long`.
+    let (s64, u64_) = if target.int64_is_long_long() {
+        ("long long int", "long long unsigned int")
+    } else {
+        ("long int", "long unsigned int")
+    };
     vec![
         // Fixed-width integer types
         ("__INT8_TYPE__", "signed char"),
         ("__INT16_TYPE__", "short"),
         ("__INT32_TYPE__", "int"),
-        ("__INT64_TYPE__", "long long int"),
+        ("__INT64_TYPE__", s64),
         ("__UINT8_TYPE__", "unsigned char"),
         ("__UINT16_TYPE__", "unsigned short"),
         ("__UINT32_TYPE__", "unsigned int"),
-        ("__UINT64_TYPE__", "long long unsigned int"),
+        ("__UINT64_TYPE__", u64_),
         // Least-width integer types (same as fixed-width for common targets)
         ("__INT_LEAST8_TYPE__", "signed char"),
         ("__INT_LEAST16_TYPE__", "short"),
         ("__INT_LEAST32_TYPE__", "int"),
-        ("__INT_LEAST64_TYPE__", "long long int"),
+        ("__INT_LEAST64_TYPE__", s64),
         ("__UINT_LEAST8_TYPE__", "unsigned char"),
         ("__UINT_LEAST16_TYPE__", "unsigned short"),
         ("__UINT_LEAST32_TYPE__", "unsigned int"),
-        ("__UINT_LEAST64_TYPE__", "long long unsigned int"),
+        ("__UINT_LEAST64_TYPE__", u64_),
         // Fast integer types (same as fixed-width for common targets)
         ("__INT_FAST8_TYPE__", "signed char"),
         ("__INT_FAST16_TYPE__", "short"),
         ("__INT_FAST32_TYPE__", "int"),
-        ("__INT_FAST64_TYPE__", "long long int"),
+        ("__INT_FAST64_TYPE__", s64),
         ("__UINT_FAST8_TYPE__", "unsigned char"),
         ("__UINT_FAST16_TYPE__", "unsigned short"),
         ("__UINT_FAST32_TYPE__", "unsigned int"),
-        ("__UINT_FAST64_TYPE__", "long long unsigned int"),
+        ("__UINT_FAST64_TYPE__", u64_),
         // Pointer-width types (always 64-bit on our targets)
         ("__SIZE_TYPE__", "long unsigned int"),
         ("__PTRDIFF_TYPE__", "long int"),
@@ -216,17 +226,24 @@ pub fn get_stdint_limit_macros(_target: &Target) -> Vec<(&'static str, &'static 
 }
 
 /// Get integer constant suffix macros (for <stdint.h> compatibility)
-pub fn get_suffix_macros(_target: &Target) -> Vec<(&'static str, &'static str)> {
+pub fn get_suffix_macros(target: &Target) -> Vec<(&'static str, &'static str)> {
+    // Must agree with get_type_macros: an INT64_C() constant has to come out
+    // the same type as int64_t.
+    let (c64, uc64) = if target.int64_is_long_long() {
+        ("LL", "ULL")
+    } else {
+        ("L", "UL")
+    };
     vec![
         // Fixed-width suffixes
         ("__INT8_C_SUFFIX__", ""),
         ("__INT16_C_SUFFIX__", ""),
         ("__INT32_C_SUFFIX__", ""),
-        ("__INT64_C_SUFFIX__", "LL"),
+        ("__INT64_C_SUFFIX__", c64),
         ("__UINT8_C_SUFFIX__", ""),
         ("__UINT16_C_SUFFIX__", ""),
         ("__UINT32_C_SUFFIX__", "U"),
-        ("__UINT64_C_SUFFIX__", "ULL"),
+        ("__UINT64_C_SUFFIX__", uc64),
         // intmax_t suffixes (64-bit uses L suffix on all our targets)
         ("__INTMAX_C_SUFFIX__", "L"),
         ("__UINTMAX_C_SUFFIX__", "UL"),
@@ -338,7 +355,14 @@ pub fn get_format_macros(_target: &Target) -> Vec<(&'static str, &'static str)> 
 }
 
 /// Get additional sizeof macros
-pub fn get_additional_sizeof_macros(_target: &Target) -> Vec<(&'static str, &'static str)> {
+pub fn get_additional_sizeof_macros(target: &Target) -> Vec<(&'static str, &'static str)> {
+    // 16 bytes for the x87 80-bit format and for IEEE binary128 alike; Apple's
+    // aarch64 `long double` is a `double` and occupies 8.
+    let sizeof_long_double = if target.arch == Arch::Aarch64 && target.os == Os::MacOS {
+        "8"
+    } else {
+        "16"
+    };
     vec![
         // size_t and ptrdiff_t sizes (always 8 bytes on 64-bit)
         ("__SIZEOF_SIZE_T__", "8"),
@@ -346,6 +370,7 @@ pub fn get_additional_sizeof_macros(_target: &Target) -> Vec<(&'static str, &'st
         // wchar_t and wint_t sizes
         ("__SIZEOF_WCHAR_T__", "4"),
         ("__SIZEOF_WINT_T__", "4"),
+        ("__SIZEOF_LONG_DOUBLE__", sizeof_long_double),
     ]
 }
 
@@ -370,7 +395,13 @@ pub fn get_misc_macros(_target: &Target) -> Vec<(&'static str, &'static str)> {
 }
 
 /// Get floating-point limit macros (IEEE 754)
-pub fn get_float_limit_macros(_target: &Target) -> Vec<(&'static str, &'static str)> {
+pub fn get_float_limit_macros(target: &Target) -> Vec<(&'static str, &'static str)> {
+    // `long double` is three different types across our targets, and these
+    // macros are the only description of it a program gets. Hardcoding the
+    // x86_64 values everywhere told macOS/aarch64 code that LDBL_EPSILON was
+    // 1.08e-19 when the type is really a 64-bit double, so `1.0L + LDBL_EPSILON`
+    // compared equal to 1.0L and <float.h> was simply lying.
+    let ldbl = LongDoubleLimits::for_target(target);
     vec![
         // Float16 (16-bit IEEE 754 binary16, half precision)
         (
@@ -440,37 +471,184 @@ pub fn get_float_limit_macros(_target: &Target) -> Vec<(&'static str, &'static s
         ("__DBL_HAS_DENORM__", "1"),
         ("__DBL_HAS_INFINITY__", "1"),
         ("__DBL_HAS_QUIET_NAN__", "1"),
-        // Long double (80-bit x87 extended on x86_64, 128-bit on aarch64)
-        // Using x86_64 values as default
-        (
-            "__LDBL_MIN__",
-            "3.36210314311209350626267781732175260e-4932L",
-        ),
-        (
-            "__LDBL_MAX__",
-            "1.18973149535723176502126385303097021e+4932L",
-        ),
-        (
-            "__LDBL_EPSILON__",
-            "1.08420217248550443400745280086994171e-19L",
-        ),
-        (
-            "__LDBL_DENORM_MIN__",
-            "3.64519953188247460252840593361941982e-4951L",
-        ),
-        ("__LDBL_MANT_DIG__", "64"),
-        ("__LDBL_DIG__", "18"),
-        ("__LDBL_MIN_EXP__", "(-16381)"),
-        ("__LDBL_MAX_EXP__", "16384"),
-        ("__LDBL_MIN_10_EXP__", "(-4931)"),
-        ("__LDBL_MAX_10_EXP__", "4932"),
+        // Long double — see `LongDoubleLimits`.
+        ("__LDBL_MIN__", ldbl.min),
+        ("__LDBL_MAX__", ldbl.max),
+        ("__LDBL_EPSILON__", ldbl.epsilon),
+        ("__LDBL_DENORM_MIN__", ldbl.denorm_min),
+        ("__LDBL_MANT_DIG__", ldbl.mant_dig),
+        ("__LDBL_DIG__", ldbl.dig),
+        ("__LDBL_MIN_EXP__", ldbl.min_exp),
+        ("__LDBL_MAX_EXP__", ldbl.max_exp),
+        ("__LDBL_MIN_10_EXP__", ldbl.min_10_exp),
+        ("__LDBL_MAX_10_EXP__", ldbl.max_10_exp),
         ("__LDBL_HAS_DENORM__", "1"),
         ("__LDBL_HAS_INFINITY__", "1"),
         ("__LDBL_HAS_QUIET_NAN__", "1"),
         // Decimal digits for exact conversion
         ("__FLT_DECIMAL_DIG__", "9"),
         ("__DBL_DECIMAL_DIG__", "17"),
-        ("__LDBL_DECIMAL_DIG__", "21"),
-        ("__DECIMAL_DIG__", "21"),
+        ("__LDBL_DECIMAL_DIG__", ldbl.decimal_dig),
+        ("__DECIMAL_DIG__", ldbl.decimal_dig),
     ]
+}
+
+/// The <float.h> description of `long double`, which is a different type on
+/// each of our targets:
+///
+/// - **x86_64**: the x87 80-bit extended format, padded to 16 bytes.
+/// - **aarch64 Linux/FreeBSD**: IEEE 754 binary128 (true quad precision).
+/// - **aarch64 macOS**: Apple makes `long double` an alias for `double`.
+struct LongDoubleLimits {
+    min: &'static str,
+    max: &'static str,
+    epsilon: &'static str,
+    denorm_min: &'static str,
+    mant_dig: &'static str,
+    dig: &'static str,
+    min_exp: &'static str,
+    max_exp: &'static str,
+    min_10_exp: &'static str,
+    max_10_exp: &'static str,
+    decimal_dig: &'static str,
+}
+
+impl LongDoubleLimits {
+    fn for_target(target: &Target) -> Self {
+        match (target.arch, target.os) {
+            // Apple aarch64: long double *is* double.
+            (Arch::Aarch64, Os::MacOS) => Self {
+                min: "2.22507385850720138309023271733240406e-308L",
+                max: "1.79769313486231570814527423731704357e+308L",
+                epsilon: "2.22044604925031308084726333618164062e-16L",
+                denorm_min: "4.94065645841246544176568792868221372e-324L",
+                mant_dig: "53",
+                dig: "15",
+                min_exp: "(-1021)",
+                max_exp: "1024",
+                min_10_exp: "(-307)",
+                max_10_exp: "308",
+                decimal_dig: "17",
+            },
+            // aarch64 elsewhere: IEEE binary128.
+            (Arch::Aarch64, _) => Self {
+                min: "3.36210314311209350626267781732175260e-4932L",
+                max: "1.18973149535723176508575932662800702e+4932L",
+                epsilon: "1.92592994438723585305597794258492732e-34L",
+                denorm_min: "6.47517511943802511092443895822764655e-4966L",
+                mant_dig: "113",
+                dig: "33",
+                min_exp: "(-16381)",
+                max_exp: "16384",
+                min_10_exp: "(-4931)",
+                max_10_exp: "4932",
+                decimal_dig: "36",
+            },
+            // x86_64: x87 80-bit extended.
+            _ => Self {
+                min: "3.36210314311209350626267781732175260e-4932L",
+                max: "1.18973149535723176502126385303097021e+4932L",
+                epsilon: "1.08420217248550443400745280086994171e-19L",
+                denorm_min: "3.64519953188247460252840593361941982e-4951L",
+                mant_dig: "64",
+                dig: "18",
+                min_exp: "(-16381)",
+                max_exp: "16384",
+                min_10_exp: "(-4931)",
+                max_10_exp: "4932",
+                decimal_dig: "21",
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::target::Os;
+
+    fn macro_value(macros: &[(&'static str, &'static str)], name: &str) -> String {
+        macros
+            .iter()
+            .find(|(n, _)| *n == name)
+            .unwrap_or_else(|| panic!("{} is not defined", name))
+            .1
+            .to_string()
+    }
+
+    /// `long double` is a different type on each target, and these macros are
+    /// the only description of it a program gets. They were hardcoded to the
+    /// x86_64 values everywhere, so `<float.h>` told macOS/aarch64 code that
+    /// LDBL_EPSILON was 1.08e-19 for a type that is really a 64-bit double.
+    #[test]
+    fn long_double_limits_describe_the_target() {
+        for (arch, os, mant_dig, sizeof) in [
+            (Arch::X86_64, Os::Linux, "64", "16"),   // x87 80-bit extended
+            (Arch::X86_64, Os::MacOS, "64", "16"),   // likewise
+            (Arch::Aarch64, Os::Linux, "113", "16"), // IEEE binary128
+            (Arch::Aarch64, Os::MacOS, "53", "8"),   // Apple: long double == double
+        ] {
+            let target = Target::new(arch, os);
+            let floats = get_float_limit_macros(&target);
+            assert_eq!(
+                macro_value(&floats, "__LDBL_MANT_DIG__"),
+                mant_dig,
+                "__LDBL_MANT_DIG__ on {:?}/{:?}",
+                arch,
+                os
+            );
+            assert_eq!(
+                macro_value(
+                    &get_additional_sizeof_macros(&target),
+                    "__SIZEOF_LONG_DOUBLE__"
+                ),
+                sizeof,
+                "__SIZEOF_LONG_DOUBLE__ on {:?}/{:?}",
+                arch,
+                os
+            );
+            // The epsilon has to belong to the same format as the mantissa.
+            let eps = macro_value(&floats, "__LDBL_EPSILON__");
+            let expected_exp = match mant_dig {
+                "53" => "e-16",
+                "64" => "e-19",
+                _ => "e-34",
+            };
+            assert!(
+                eps.contains(expected_exp),
+                "__LDBL_EPSILON__ {} does not match a {}-bit mantissa on {:?}/{:?}",
+                eps,
+                mant_dig,
+                arch,
+                os
+            );
+        }
+    }
+
+    /// Our `<stdint.h>` has to name the same type the host's headers do.
+    /// Every target is LP64, so the width does not settle it: Linux says
+    /// `long`, Darwin says `long long`, and they are distinct types.
+    #[test]
+    fn int64_spelling_follows_the_platform() {
+        for (os, ty, suffix) in [
+            (Os::Linux, "long int", "L"),
+            (Os::FreeBSD, "long int", "L"),
+            (Os::MacOS, "long long int", "LL"),
+        ] {
+            let target = Target::new(Arch::X86_64, os);
+            assert_eq!(
+                macro_value(&get_type_macros(&target), "__INT64_TYPE__"),
+                ty,
+                "__INT64_TYPE__ on {:?}",
+                os
+            );
+            // INT64_C() must produce that same type.
+            assert_eq!(
+                macro_value(&get_suffix_macros(&target), "__INT64_C_SUFFIX__"),
+                suffix,
+                "__INT64_C_SUFFIX__ on {:?}",
+                os
+            );
+        }
+    }
 }

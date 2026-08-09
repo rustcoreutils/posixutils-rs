@@ -29,6 +29,26 @@ const MAX_AGGREGATE_BITS: u32 = 128;
 /// Maximum number of HFA/HVA elements.
 const MAX_HFA_ELEMENTS: u8 = 4;
 
+/// The HFA element type for a complex value, or `None` if it cannot be passed
+/// in V registers.
+///
+/// A `_Complex` is a two-member homogeneous aggregate, so the only question is
+/// how wide a member is — and that is a question about *width*, not about how
+/// the type is spelled. Apple makes `long double` a 64-bit double, so
+/// `long double _Complex` is an ordinary pair of doubles there; matching on
+/// `TypeKind::LongDouble` instead sent it by reference, disagreeing with clang
+/// about every such argument and return.
+///
+/// On aarch64 Linux `long double` really is IEEE binary128, and `HfaBase` has
+/// no 128-bit form, so that one still goes indirect.
+fn complex_hfa_base(ty: TypeId, types: &TypeTable) -> Option<HfaBase> {
+    match types.size_bits(types.complex_base(ty)) {
+        32 => Some(HfaBase::Float32),
+        64 => Some(HfaBase::Float64),
+        _ => None,
+    }
+}
+
 /// AAPCS64 ABI implementation.
 #[derive(Debug, Clone, Default)]
 pub struct Aapcs64Abi;
@@ -200,38 +220,30 @@ impl Abi for Aapcs64Abi {
             };
         }
 
+        // Complex types: a two-member HFA, in V registers.
+        //
+        // Must be tested BEFORE `is_float`, because a complex type carries its
+        // *base's* kind — `float _Complex` answers `TypeKind::Float`. Testing
+        // the other way round classified every complex parameter as a single
+        // scalar V register, so the imaginary half was never passed and every
+        // later floating-point argument sat one register too high.
+        // `classify_return` already had the order right.
+        if types.is_complex(ty) {
+            if let Some(base) = complex_hfa_base(ty, types) {
+                return ArgClass::Hfa { base, count: 2 };
+            }
+            return ArgClass::Indirect {
+                align: 16,
+                size_bits,
+            };
+        }
+
         // Floating-point types - pass in V registers
         if is_float(kind) {
             return ArgClass::Direct {
                 classes: vec![RegClass::Sse], // Using Sse for FP registers
                 size_bits,
             };
-        }
-
-        // Complex types
-        if types.is_complex(ty) {
-            let base_ty = types.complex_base(ty);
-            let base_kind = types.kind(base_ty);
-
-            if base_kind == TypeKind::Float {
-                // Complex float: HFA-like with 2 floats
-                return ArgClass::Hfa {
-                    base: HfaBase::Float32,
-                    count: 2,
-                };
-            } else if base_kind == TypeKind::Double {
-                // Complex double: HFA-like with 2 doubles
-                return ArgClass::Hfa {
-                    base: HfaBase::Float64,
-                    count: 2,
-                };
-            } else {
-                // Complex long double: pass by reference
-                return ArgClass::Indirect {
-                    align: 16,
-                    size_bits,
-                };
-            }
         }
 
         // Aggregate types (struct, union)
@@ -300,26 +312,13 @@ impl Abi for Aapcs64Abi {
         // Complex types - return as HFA (must check BEFORE is_float since complex
         // types have TypeKind::Float/Double/LongDouble)
         if types.is_complex(ty) {
-            let base_ty = types.complex_base(ty);
-            let base_kind = types.kind(base_ty);
-
-            if base_kind == TypeKind::Float {
-                return ArgClass::Hfa {
-                    base: HfaBase::Float32,
-                    count: 2,
-                };
-            } else if base_kind == TypeKind::Double {
-                return ArgClass::Hfa {
-                    base: HfaBase::Float64,
-                    count: 2,
-                };
-            } else {
-                // Complex long double via sret
-                return ArgClass::Indirect {
-                    align: 16,
-                    size_bits,
-                };
+            if let Some(base) = complex_hfa_base(ty, types) {
+                return ArgClass::Hfa { base, count: 2 };
             }
+            return ArgClass::Indirect {
+                align: 16,
+                size_bits,
+            };
         }
 
         // Floating-point types (non-complex) - return in V0
@@ -385,5 +384,63 @@ mod tests {
         let abi = Aapcs64Abi::new();
         // Just ensure it constructs
         assert_eq!(format!("{:?}", abi), "Aapcs64Abi");
+    }
+
+    /// A complex value is a two-member HFA whose element width — not whose
+    /// type *name* — decides the register class. Apple's `long double` is a
+    /// 64-bit double, so `long double _Complex` belongs in two D registers
+    /// like any other pair of doubles; matching on `TypeKind::LongDouble`
+    /// sent it by reference and disagreed with clang.
+    #[test]
+    fn complex_is_classified_by_element_width() {
+        use crate::target::{Arch, Os, Target};
+
+        let abi = Aapcs64Abi::new();
+        let two_f32 = ArgClass::Hfa {
+            base: HfaBase::Float32,
+            count: 2,
+        };
+        let two_f64 = ArgClass::Hfa {
+            base: HfaBase::Float64,
+            count: 2,
+        };
+
+        for (os, long_double) in [
+            (Os::MacOS, two_f64.clone()),
+            (
+                Os::Linux,
+                ArgClass::Indirect {
+                    align: 16,
+                    size_bits: 256,
+                },
+            ),
+        ] {
+            let target = Target::new(Arch::Aarch64, os);
+            let types = TypeTable::new(&target);
+
+            for classify in [
+                Aapcs64Abi::classify_param as fn(&Aapcs64Abi, TypeId, &TypeTable) -> ArgClass,
+                Aapcs64Abi::classify_return,
+            ] {
+                assert_eq!(
+                    classify(&abi, types.complex_float_id, &types),
+                    two_f32,
+                    "float _Complex on {:?}",
+                    os
+                );
+                assert_eq!(
+                    classify(&abi, types.complex_double_id, &types),
+                    two_f64,
+                    "double _Complex on {:?}",
+                    os
+                );
+                assert_eq!(
+                    classify(&abi, types.complex_longdouble_id, &types),
+                    long_double,
+                    "long double _Complex on {:?}",
+                    os
+                );
+            }
+        }
     }
 }

@@ -120,6 +120,18 @@ impl Target {
         }
     }
 
+    /// Does this platform spell the exact-width 64-bit integers `long long`?
+    ///
+    /// Every target here is LP64, so `long` is 64 bits and either spelling is
+    /// wide enough — but they are *distinct types*, and our `<stdint.h>` has to
+    /// name the same one the host's headers do or a translation unit including
+    /// both is rejected. Linux and the BSDs use `long`; Darwin uses
+    /// `long long`, and picking by width alone made every macOS build that
+    /// reached a system header fail on `int64_t`.
+    pub fn int64_is_long_long(&self) -> bool {
+        self.os == Os::MacOS
+    }
+
     /// Detect host architecture at runtime
     fn detect_arch() -> Arch {
         #[cfg(target_arch = "x86_64")]

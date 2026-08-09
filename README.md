@@ -105,6 +105,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] link
  - [x] ln
  - [x] locale (i18n)
+ - [x] localedef (i18n)
  - [x] logger
  - [x] logname
  - [x] lp
@@ -197,7 +198,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
 ## Stage 3 - Test coverage
 
  - [x] c17 (Development)
- - [x] localedef (i18n)
 
 ## Stage 2 - Feature-complete and POSIX compliant
 

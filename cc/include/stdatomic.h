@@ -36,6 +36,37 @@ typedef _Atomic(unsigned long)      atomic_ulong;
 typedef _Atomic(long long)          atomic_llong;
 typedef _Atomic(unsigned long long) atomic_ullong;
 
+/* The remaining mandated aliases of C11 7.17.6.1. These are spelled against
+   the compiler's own __*_TYPE__ predefines rather than <stdint.h>, so that
+   including <stdatomic.h> alone is enough. */
+typedef _Atomic(__WCHAR_TYPE__)     atomic_wchar_t;
+typedef _Atomic(unsigned short)     atomic_char16_t;
+typedef _Atomic(unsigned int)       atomic_char32_t;
+typedef _Atomic(__INTPTR_TYPE__)    atomic_intptr_t;
+typedef _Atomic(__UINTPTR_TYPE__)   atomic_uintptr_t;
+typedef _Atomic(__SIZE_TYPE__)      atomic_size_t;
+typedef _Atomic(__PTRDIFF_TYPE__)   atomic_ptrdiff_t;
+typedef _Atomic(__INTMAX_TYPE__)    atomic_intmax_t;
+typedef _Atomic(__UINTMAX_TYPE__)   atomic_uintmax_t;
+
+typedef _Atomic(__INT_LEAST8_TYPE__)    atomic_int_least8_t;
+typedef _Atomic(__UINT_LEAST8_TYPE__)   atomic_uint_least8_t;
+typedef _Atomic(__INT_LEAST16_TYPE__)   atomic_int_least16_t;
+typedef _Atomic(__UINT_LEAST16_TYPE__)  atomic_uint_least16_t;
+typedef _Atomic(__INT_LEAST32_TYPE__)   atomic_int_least32_t;
+typedef _Atomic(__UINT_LEAST32_TYPE__)  atomic_uint_least32_t;
+typedef _Atomic(__INT_LEAST64_TYPE__)   atomic_int_least64_t;
+typedef _Atomic(__UINT_LEAST64_TYPE__)  atomic_uint_least64_t;
+
+typedef _Atomic(__INT_FAST8_TYPE__)     atomic_int_fast8_t;
+typedef _Atomic(__UINT_FAST8_TYPE__)    atomic_uint_fast8_t;
+typedef _Atomic(__INT_FAST16_TYPE__)    atomic_int_fast16_t;
+typedef _Atomic(__UINT_FAST16_TYPE__)   atomic_uint_fast16_t;
+typedef _Atomic(__INT_FAST32_TYPE__)    atomic_int_fast32_t;
+typedef _Atomic(__UINT_FAST32_TYPE__)   atomic_uint_fast32_t;
+typedef _Atomic(__INT_FAST64_TYPE__)    atomic_int_fast64_t;
+typedef _Atomic(__UINT_FAST64_TYPE__)   atomic_uint_fast64_t;
+
 /* Initialization (C11 7.17.2) */
 #define ATOMIC_VAR_INIT(value) (value)
 #define atomic_init(obj, val) __c11_atomic_init(obj, val)
@@ -114,5 +145,12 @@ typedef struct atomic_flag { atomic_bool _Value; } atomic_flag;
 #define ATOMIC_LONG_LOCK_FREE      __GCC_ATOMIC_LONG_LOCK_FREE
 #define ATOMIC_LLONG_LOCK_FREE     __GCC_ATOMIC_LLONG_LOCK_FREE
 #define ATOMIC_POINTER_LOCK_FREE   __GCC_ATOMIC_POINTER_LOCK_FREE
+
+/* atomic_is_lock_free (C11 7.17.5.1).
+
+   Both supported targets implement every atomic operation up to pointer width
+   without a lock, and nothing wider, so the answer follows from the object's
+   size. The argument is evaluated only by sizeof, as the standard requires. */
+#define atomic_is_lock_free(obj) (sizeof(*(obj)) <= sizeof(void *))
 
 #endif /* _STDATOMIC_H */

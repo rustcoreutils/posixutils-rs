@@ -7,24 +7,70 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test_with_checker_and_env, run_test_with_env, TestPlan};
+use plib::testing::{run_test_with_checker_and_env, TestPlan};
 use std::fs;
 use tempfile::TempDir;
 
-/// Test that lp fails when no destination is specified
+/// With no `-d` and neither variable set, lp must still choose a destination.
+///
+/// POSIX 103086-103087: "If -d is not specified, and neither the LPDEST nor
+/// PRINTER environment variable is set, an unspecified destination is used."
+/// The destination is unspecified; that one is used is not. This test
+/// previously asserted the opposite — that lp exits with "no destination
+/// specified" — which is what kept the gap open: the audit recorded it as a
+/// missing *test*, while a test was in fact pinning the non-conforming
+/// behaviour in place.
+///
+/// Reaching the default printer is not expected to succeed on a build machine,
+/// so the assertion is that lp got as far as *trying* it. Exiting non-zero
+/// there is conforming: ">0 No output device was available" (103158).
 #[test]
-fn lp_no_destination_error() {
-    // Use empty strings to clear the environment variables in the subprocess
-    run_test_with_env(
+fn lp_no_destination_uses_the_default() {
+    run_test_with_checker_and_env(
         TestPlan {
             cmd: String::from("lp"),
             args: vec![],
             stdin_data: String::from("test data"),
-            expected_out: String::from(""),
-            expected_err: String::from("lp: no destination specified\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
             expected_exit_code: 1,
         },
         &[("LPDEST", ""), ("PRINTER", "")],
+        |_, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !stderr.contains("no destination specified"),
+                "lp must select a destination rather than refusing: {stderr}"
+            );
+            assert!(
+                stderr.contains("ipp://localhost/printers/default"),
+                "the diagnostic must name the default destination it tried: {stderr}"
+            );
+        },
+    );
+}
+
+/// `LPDEST` and `PRINTER` still take effect, so the default cannot be masking a
+/// destination the user actually named.
+#[test]
+fn lp_environment_destination_overrides_the_default() {
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("lp"),
+            args: vec![],
+            stdin_data: String::from("test data"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 1,
+        },
+        &[("LPDEST", "from_lpdest"), ("PRINTER", "from_printer")],
+        |_, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("from_lpdest"),
+                "LPDEST takes precedence over PRINTER and over the default: {stderr}"
+            );
+        },
     );
 }
 

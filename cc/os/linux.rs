@@ -24,10 +24,18 @@ pub fn get_macros() -> Vec<(&'static str, Option<&'static str>)> {
         ("__GLIBC_MINOR__", Some("17")), // Conservative baseline
         // Thread model
         ("_REENTRANT", Some("1")),
-        // Feature test macros
+        // Feature test macros.
+        //
+        // These are predefined unconditionally, before any user -D/-U, so a
+        // translation unit cannot get a strictly-POSIX view of the system
+        // headers by leaving them out. POSIX only *encourages* restricting
+        // visibility here (88196-88203), so this is a deliberate divergence
+        // rather than a violation -- it matches what a GCC install on a glibc
+        // system effectively provides, and unsetting them breaks a great deal
+        // of code that assumes GNU extensions are visible. Recorded as #P12.
         ("_GNU_SOURCE", Some("1")),
         ("_DEFAULT_SOURCE", Some("1")),
-        ("_XOPEN_SOURCE", Some("700")),
+        ("_XOPEN_SOURCE", Some("800")),
         ("_XOPEN_SOURCE_EXTENDED", Some("1")),
     ]
 }

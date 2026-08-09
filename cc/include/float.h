@@ -65,7 +65,13 @@
 #define DBL_MIN __DBL_MIN__
 #define LDBL_MIN __LDBL_MIN__
 
-// Addition rounds to 0: zero, 1: nearest, 2: +inf, 3: -inf, -1: unknown
+// Addition rounds to 0: zero, 1: nearest, 2: +inf, 3: -inf, -1: unknown.
+//
+// C17 5.2.4.2.2p8 says this reflects the *current* rounding mode, so strictly
+// it should track fesetround(). It does not, and deliberately: GCC's own
+// <float.h> also defines it as a literal 1, glibc ships no <float.h> and
+// exports no __flt_rounds, and tracking the mode would mean pulling <fenv.h>
+// machinery into <float.h>. Code that needs the live value calls fegetround().
 #define FLT_ROUNDS 1
 
 // C99/C11 additions

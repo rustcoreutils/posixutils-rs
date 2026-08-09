@@ -9,6 +9,7 @@
 // Diagnostic and stream management module for c17 C99 compiler
 //
 
+use gettextrs::gettext;
 use std::cell::RefCell;
 use std::fmt;
 use std::io::{self, Write};
@@ -216,6 +217,15 @@ pub fn init_included_stream(name: &str, include_pos: Position) -> u16 {
     STREAMS.with(|s| s.borrow_mut().add_included(name.to_string(), include_pos))
 }
 
+/// Resolve a position to `(file, line, column)`, honoring any `#line`
+/// directive in effect for that stream.
+///
+/// The `-E` line markers need this: `#line` renames the stream for the reader,
+/// and a marker that ignored it would contradict the diagnostics.
+pub fn effective_position(pos: Position) -> (String, u32, u16) {
+    STREAMS.with(|s| s.borrow().effective_position(pos))
+}
+
 /// Get stream name by ID (for tests)
 #[cfg(test)]
 pub fn stream_name(id: u16) -> String {
@@ -284,8 +294,12 @@ pub fn warning_count() -> u32 {
     WARNING_COUNT.load(Ordering::Relaxed)
 }
 
-/// Reset error/warning counts
-#[cfg(test)]
+/// Reset error/warning counts.
+///
+/// The driver compiles every source operand in one process (POSIX requires it
+/// to continue past a failing operand), so this state has to be cleared between
+/// translation units — otherwise the first file's errors make every later file
+/// look like it failed too.
 pub fn reset_counts() {
     ERROR_COUNT.store(0, Ordering::Relaxed);
     WARNING_COUNT.store(0, Ordering::Relaxed);
@@ -304,10 +318,17 @@ enum DiagLevel {
 }
 
 impl DiagLevel {
-    fn prefix(&self) -> &'static str {
+    /// The `warning: ` / `error: ` label, translated.
+    ///
+    /// These two words appear on every diagnostic the compiler emits, so they
+    /// are where translation buys the most for the least fragmentation. The
+    /// message bodies are built with `format!` at their call sites, which
+    /// makes them unusable as msgids without restructuring every one — see
+    /// #U7 in cc/audit.md.
+    fn prefix(&self) -> String {
         match self {
-            DiagLevel::Warning => "warning: ",
-            DiagLevel::Error => "error: ",
+            DiagLevel::Warning => format!("{}: ", gettext("warning")),
+            DiagLevel::Error => format!("{}: ", gettext("error")),
         }
     }
 }
@@ -376,7 +397,13 @@ fn do_diag(level: DiagLevel, pos: Position, msg: &str) {
                 .map(|st| st.name.clone())
                 .unwrap_or_else(|| "<unknown>".to_string())
         });
-        eprintln!("{}: note: in included file{}:", base, chain);
+        eprintln!(
+            "{}: {}: {}{}:",
+            base,
+            gettext("note"),
+            gettext("in included file"),
+            chain
+        );
     }
 
     // Print the diagnostic

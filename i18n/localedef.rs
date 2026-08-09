@@ -222,34 +222,51 @@ fn main() {
         );
     }
 
-    // LD-4: a detected error never produces output, even with -c. Warnings
-    // produce output only with -c.
-    let create_output = !has_errors && (args.force || !has_warnings);
+    // LD-4: a detected error never yields a locale, even with -c. Warnings are
+    // tolerated only with -c. This says the source is fit to compile, not that
+    // anything was written -- see the exit-status note below.
+    let would_create = !has_errors && (args.force || !has_warnings);
 
-    if create_output {
-        if let Err(e) = write_locale(&args.name, &definition, args.verbose) {
-            eprintln!("localedef: {}", e);
-            exit(4);
-        }
-        // LD-9: report the categories successfully processed.
+    if would_create {
+        // LD-9. STDOUT is specified as "report all categories successfully
+        // processed" (102766) -- processed, not created -- so parsing and
+        // validating them earns the report even though no locale is produced.
         for category in &definition.order {
             println!("{}", category);
         }
+
+        // Say why the exit status is 3. An unexplained non-zero status is
+        // unhelpful, and STDERR is "used only for diagnostic messages" (102768)
+        // -- declining to do what was asked is exactly that.
+        eprintln!(
+            "localedef: {}",
+            gettext("creating locales is not supported by this implementation")
+        );
+        if args.verbose {
+            eprintln!(
+                "localedef: {}",
+                gettext("the locale source was parsed and validated successfully")
+            );
+        }
     }
 
-    // LD-5: 0 = created, no warnings; 1 = created, warnings; >3 = errors or
-    // warnings with no output created. (Exit 2 for an unsupported charset is
-    // handled above; 3 — "creating locales unsupported" — is not used since a
-    // marker locale is still written.)
-    let exit_code = if create_output {
-        if has_warnings {
-            1
-        } else {
-            0
-        }
-    } else {
-        4
-    };
+    // LD-1/LD-5. Exit 0 means "the locales were successfully created" and 1
+    // means "warnings occurred and the locales were successfully created"
+    // (102792-102793). This implementation parses and validates a locale source
+    // but cannot compile one, so both would be false and neither is reachable.
+    // POSIX provides the honest answer: 3, "The capability to create new locales
+    // is not supported by the implementation" (102796), which 102680-102684
+    // makes an implementation-defined choice.
+    //
+    // It previously wrote an `LC_IDENTIFICATION` file holding the line
+    // `locale: <name>` and exited 0, telling a script testing `$?` that a locale
+    // had been created when nothing usable existed.
+    //
+    // Validation still runs first, so a bad source is diagnosed on its own
+    // terms rather than swallowed by a blanket 3: an unreadable charmap exits 2
+    // earlier in this function, and errors -- or warnings without -c -- exit
+    // > 3 here.
+    let exit_code = if would_create { 3 } else { 4 };
 
     exit(exit_code);
 }
@@ -513,38 +530,4 @@ fn extract_symbols(line: &str) -> Vec<String> {
         }
     }
     out
-}
-
-/// Write the compiled locale
-fn write_locale(name: &str, _definition: &LocaleDefinition, verbose: bool) -> Result<(), String> {
-    // Determine output path
-    let output_path = if name.contains('/') {
-        PathBuf::from(name)
-    } else {
-        // Write to user's locale directory or a temp location
-        let mut path = std::env::temp_dir();
-        path.push("locale");
-        path.push(name);
-        path
-    };
-
-    // Create directory
-    if let Some(parent) = output_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("cannot create directory: {}", e))?;
-    }
-
-    // For now, just create a marker file
-    // A full implementation would write the binary locale format
-    let marker_path = output_path.join("LC_IDENTIFICATION");
-    std::fs::create_dir_all(&output_path)
-        .map_err(|e| format!("cannot create locale directory: {}", e))?;
-
-    std::fs::write(&marker_path, format!("locale: {}\n", name))
-        .map_err(|e| format!("cannot write locale data: {}", e))?;
-
-    if verbose {
-        eprintln!("localedef: created locale at {}", output_path.display());
-    }
-
-    Ok(())
 }

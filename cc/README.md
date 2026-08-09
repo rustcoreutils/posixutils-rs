@@ -114,7 +114,26 @@ Not yet implemented (features we want to add):
 
 Will not implement:
 - C99 `_Imaginary` type (removed in C11; no mainstream compiler implements it)
-- C89 trigraphs (deprecated in C99, removed in C11; GCC/Clang disable by default)
+
+Off by default:
+- Trigraphs. They were deprecated in C99 but **not removed until C23**, so C17
+  still mandates them and POSIX's RATIONALE notes that supporting them is the
+  conforming behavior. `--trigraphs` enables translation phase 1. The default
+  is off because the replacement applies everywhere, including inside string
+  literals — `"What??!"` becomes `"What|"` — and `??` is far likelier to appear
+  by accident than by intent. GCC and Clang default them off for the same reason.
+
+## Runtime dependencies
+
+`c17` does not implement translation phase 8 itself. It shells out to `as` to
+assemble and to `cc` to link, so **both must be on `$PATH`**. There is no crt
+object selection, no dynamic-linker path resolution, and no explicit `-lc` or
+`-lgcc` anywhere in the crate.
+
+This is a deliberate choice and it satisfies the implicit `-l c` and the
+executable-permission mandates transitively, since every conforming host `cc`
+does those things. The consequence worth knowing is that `c17` inherits the
+host driver's crt and runtime-library decisions rather than making its own.
 
 ## Code Quality
 

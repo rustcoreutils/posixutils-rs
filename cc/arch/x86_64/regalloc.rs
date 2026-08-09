@@ -940,7 +940,7 @@ impl RegAlloc {
         let constraint_points = result.constraint_points;
         let call_positions = find_call_positions(func, is_call_like_x86_64);
 
-        self.spill_args_across_calls(func, &intervals, &call_positions);
+        self.spill_args_across_calls(func, types, &intervals, &call_positions);
         self.spill_args_across_constraints(func, &intervals, &constraint_points);
         self.allocate_alloca_to_stack(func);
         self.run_chordal_color(func, types, intervals, &call_positions, &constraint_points);
@@ -1164,20 +1164,35 @@ impl RegAlloc {
                 // the pseudo will get a stack slot from normal allocation.
                 fp_arg_idx += 2;
             } else if is_complex {
-                // Complex: uses two consecutive XMM registers
-                if fp_arg_idx + 1 < fp_arg_regs.len() {
-                    self.locations
-                        .insert(pseudo_id, Loc::Xmm(fp_arg_regs[fp_arg_idx]));
-                    self.free_xmm_regs.retain(|&r| {
-                        r != fp_arg_regs[fp_arg_idx] && r != fp_arg_regs[fp_arg_idx + 1]
-                    });
-                    self.fp_pseudos.insert(pseudo_id);
-                } else {
+                // How many XMM registers this complex type actually occupies:
+                // one for `float _Complex` (both halves packed into a single
+                // eightbyte), two for `double _Complex`, none for
+                // `long double _Complex`, which is COMPLEX_X87 and arrives on
+                // the stack. Consuming two unconditionally pushed every later
+                // floating-point parameter one register along, so a `float`
+                // after a `float _Complex` was read from the wrong register.
+                let sse_regs = crate::arch::lir::complex_sse_regs(types, *typ);
+                if sse_regs == 0 {
                     self.locations
                         .insert(pseudo_id, Loc::IncomingArg(stack_arg_offset));
-                    stack_arg_offset += 16;
+                    stack_arg_offset += (types.size_bits(*typ) / 8) as i32;
+                } else if fp_arg_idx + sse_regs <= fp_arg_regs.len() {
+                    self.locations
+                        .insert(pseudo_id, Loc::Xmm(fp_arg_regs[fp_arg_idx]));
+                    let used = &fp_arg_regs[fp_arg_idx..fp_arg_idx + sse_regs];
+                    self.free_xmm_regs.retain(|r| !used.contains(r));
+                    self.fp_pseudos.insert(pseudo_id);
+                    fp_arg_idx += sse_regs;
+                } else {
+                    // Not enough XMM registers left for every eightbyte, so
+                    // §3.2.3 step 5 puts the *whole* argument in memory — and
+                    // it consumes no registers at all, leaving them for the
+                    // arguments that follow. Advancing `fp_arg_idx` here moved
+                    // every later floating-point parameter one slot along.
+                    self.locations
+                        .insert(pseudo_id, Loc::IncomingArg(stack_arg_offset));
+                    stack_arg_offset += (((types.size_bits(*typ) / 8) as i32) + 7) & !7;
                 }
-                fp_arg_idx += 2;
             } else if is_fp {
                 if fp_arg_idx < fp_arg_regs.len() {
                     self.locations
@@ -1240,7 +1255,8 @@ impl RegAlloc {
     /// Spill arguments in caller-saved registers if their interval crosses a call
     fn spill_args_across_calls(
         &mut self,
-        _func: &Function,
+        func: &Function,
+        types: &TypeTable,
         intervals: &[LiveInterval],
         call_positions: &[usize],
     ) {
@@ -1275,8 +1291,32 @@ impl RegAlloc {
         // All XMM registers are caller-saved on x86-64 SysV ABI, and any float
         // computation within the function may reuse the same XMM register,
         // clobbering the parameter value.
+        //
+        // A *complex* parameter is excluded. It arrives in one or two XMM
+        // registers depending on its base type, and the prologue in
+        // `store_args_to_stack` already knows how to place both halves into
+        // the parameter's own local. Spilling it here would save a single
+        // register into an unrelated 8-byte slot -- losing the imaginary half
+        // of a `double _Complex` -- and, because the pseudo would then be
+        // marked already-spilled, suppress that correct handling entirely.
+        let complex_arg_pseudos: HashSet<PseudoId> = func
+            .pseudos
+            .iter()
+            .filter_map(|p| match p.kind {
+                PseudoKind::Arg(idx) => func
+                    .params
+                    .get(idx as usize)
+                    .filter(|(_, typ)| types.is_complex(*typ))
+                    .map(|_| p.id),
+                _ => None,
+            })
+            .collect();
+
         let xmm_arg_regs = XmmReg::arg_regs();
         for interval in intervals {
+            if complex_arg_pseudos.contains(&interval.pseudo) {
+                continue;
+            }
             if let Some(Loc::Xmm(xmm)) = self.locations.get(&interval.pseudo) {
                 if xmm_arg_regs.contains(xmm) && interval.start == 0 {
                     // This is a function parameter in an XMM register — always spill

@@ -1075,7 +1075,7 @@ impl RegAlloc {
     /// - First 8 FP args in V0-V7 (D0-D7 for doubles, S0-S7 for floats)
     /// - Remaining args go on the stack in parameter order (not separated by type)
     fn allocate_arguments(&mut self, func: &Function, types: &TypeTable) {
-        use crate::abi::{Aapcs64Abi, ArgClass, RegClass};
+        use crate::abi::{Aapcs64Abi, ArgClass, HfaBase, RegClass};
         use crate::arch::regalloc::AbiLowering;
 
         let int_arg_regs = Reg::arg_regs();
@@ -1123,6 +1123,41 @@ impl RegAlloc {
                         stack_arg_offset += 8;
                     }
                     fp_arg_idx += 1;
+                }
+                // HFA — a `_Complex`, or a small homogeneous struct: `count`
+                // consecutive V registers. The prologue writes them into the
+                // parameter's local; what has to be right here is the *count*,
+                // so later arguments look in the right place.
+                //
+                // Falling through to the catch-all below took a GP register
+                // and never touched `fp_arg_idx`, so a `float` following a
+                // `float _Complex` was read from V0 — the register holding
+                // the complex value's real part.
+                ArgClass::Hfa { base, count } => {
+                    let count = *count as usize;
+                    let elem_bytes = match base {
+                        HfaBase::Float32 => 4,
+                        HfaBase::Float64 => 8,
+                    };
+                    if fp_arg_idx + count <= fp_arg_regs.len() {
+                        self.locations
+                            .insert(pseudo, Loc::VReg(fp_arg_regs[fp_arg_idx]));
+                        let used = &fp_arg_regs[fp_arg_idx..fp_arg_idx + count];
+                        self.free_fp_regs.retain(|r| !used.contains(r));
+                        self.fp_pseudos.insert(pseudo);
+                        fp_arg_idx += count;
+                    } else {
+                        self.locations.insert(pseudo, Loc::Stack(stack_arg_offset));
+                        self.fp_pseudos.insert(pseudo);
+                        stack_arg_offset += ((count * elem_bytes) as i32 + 7) & !7;
+                        // AAPCS64 §6.4.2: once an argument is laid out on the
+                        // stack, NSRN is set to 8 and every later
+                        // floating-point argument follows it there — unlike
+                        // System V, which leaves the unused registers free.
+                        // (The prologue still does not copy a spilled HFA into
+                        // its local; that is #H13.)
+                        fp_arg_idx = fp_arg_regs.len();
+                    }
                 }
                 // __int128: two consecutive GP registers when available.
                 // The value always lives in a 16-byte aligned local stack

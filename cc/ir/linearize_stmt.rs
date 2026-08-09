@@ -68,6 +68,34 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
 
             Stmt::Return(expr) => {
+                // C99 6.8.6.4p1: a `return` with an expression may not appear
+                // in a void function, and one without an expression may not
+                // appear in a function that returns a value. Both used to
+                // compile clean.
+                let declared_ret = self.current_func.as_ref().map(|f| f.return_type);
+                if let Some(rt) = declared_ret {
+                    let returns_void = self.types.kind(rt) == TypeKind::Void;
+                    match expr {
+                        // 6.8.6.4p1 forbids returning a *value*. An expression
+                        // of type `void` has none, so `return f();` where `f`
+                        // returns void — the ordinary tail-call wrapper, which
+                        // GCC and Clang both accept — is not a violation.
+                        Some(e)
+                            if returns_void
+                                && self.types.kind(self.expr_type(e)) != TypeKind::Void =>
+                        {
+                            error(e.pos, "'return' with a value in a function returning void")
+                        }
+                        None if !returns_void => error(
+                            // `Stmt` carries no position, so fall back to the
+                            // last expression lowered in this function.
+                            self.current_pos.unwrap_or_default(),
+                            "'return' with no value in a function returning non-void",
+                        ),
+                        _ => {}
+                    }
+                }
+
                 if let Some(e) = expr {
                     let expr_typ = self.expr_type(e);
                     // Get the function's actual return type for proper conversion
@@ -82,7 +110,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     } else if let Some(ret_type) = self.two_reg_return_type {
                         self.emit_two_reg_return(e, ret_type);
                     } else if self.types.is_complex(expr_typ) {
-                        let addr = self.linearize_lvalue(e);
+                        let addr = self.complex_operand_addr(e);
                         let typ_size = self.types.size_bits(func_ret_type);
                         self.emit(Instruction::ret_typed(Some(addr), func_ret_type, typ_size));
                     } else {
@@ -258,67 +286,44 @@ impl<'a> super::linearize::Linearizer<'a> {
                         self.emit_aggregate_zero(sym_id, typ);
                     }
                     self.linearize_init_list(sym_id, typ, elements);
-                } else if let ExprKind::StringLit(s) = &init.kind {
-                    // String literal initialization of char array
-                    // Copy the string bytes to the local array
+                } else if let Some(units) = Self::string_literal_units(&init.kind) {
+                    // A string literal initializing an automatic object. An
+                    // array gets the code units copied in; a pointer gets the
+                    // literal's address.
+                    //
+                    // All four encodings share this path. `u"..."` and
+                    // `U"..."` had no arm at all, so they fell through to the
+                    // scalar case below and stored the literal's *address*
+                    // into the array's first element.
                     if self.types.kind(typ) == TypeKind::Array {
-                        let elem_type = self.types.base_type(typ).unwrap_or(self.types.char_id);
-                        let elem_size = self.types.size_bits(elem_type);
-
-                        // Copy each byte from string literal to local array
-                        for (i, byte) in s.bytes().enumerate() {
-                            let byte_val = self.emit_const(byte as i128, elem_type);
-                            self.emit(Instruction::store(
-                                byte_val, sym_id, i as i64, elem_type, elem_size,
-                            ));
-                        }
-                        // Store null terminator
-                        let null_val = self.emit_const(0, elem_type);
-                        self.emit(Instruction::store(
-                            null_val,
-                            sym_id,
-                            s.chars().count() as i64,
-                            elem_type,
-                            elem_size,
-                        ));
-                    } else {
-                        // Pointer initialized with string literal - store the address
-                        let val = self.linearize_expr(init);
-                        let init_type = self.expr_type(init);
-                        let converted = self.emit_convert(val, init_type, typ);
-                        let size = self.types.size_bits(typ);
-                        self.emit(Instruction::store(converted, sym_id, 0, typ, size));
-                    }
-                } else if let ExprKind::WideStringLit(s) = &init.kind {
-                    // Wide string literal initialization of wchar_t array
-                    // Copy the wide string chars to the local array (4 bytes each)
-                    if self.types.kind(typ) == TypeKind::Array {
-                        let elem_type = self.types.base_type(typ).unwrap_or(self.types.int_id);
+                        let default_elem = match init.kind {
+                            ExprKind::StringLit(_) => self.types.char_id,
+                            _ => self.types.int_id,
+                        };
+                        let elem_type = self.types.base_type(typ).unwrap_or(default_elem);
                         let elem_size = self.types.size_bits(elem_type);
                         let elem_bytes = (elem_size / 8) as i64;
 
-                        // Copy each wchar_t from wide string literal to local array
-                        for (i, ch) in s.chars().enumerate() {
-                            let ch_val = self.emit_const(ch as i128, elem_type);
+                        for (i, unit) in units.iter().enumerate() {
+                            let val = self.emit_const(*unit, elem_type);
                             self.emit(Instruction::store(
-                                ch_val,
+                                val,
                                 sym_id,
                                 (i as i64) * elem_bytes,
                                 elem_type,
                                 elem_size,
                             ));
                         }
-                        // Store null terminator
                         let null_val = self.emit_const(0, elem_type);
                         self.emit(Instruction::store(
                             null_val,
                             sym_id,
-                            (s.chars().count() as i64) * elem_bytes,
+                            (units.len() as i64) * elem_bytes,
                             elem_type,
                             elem_size,
                         ));
                     } else {
-                        // Pointer initialized with wide string literal - store the address
+                        // Pointer initialized with a string literal — store the address
                         let val = self.linearize_expr(init);
                         let init_type = self.expr_type(init);
                         let converted = self.emit_convert(val, init_type, typ);
@@ -332,17 +337,28 @@ impl<'a> super::linearize::Linearizer<'a> {
                     let base_bytes = (base_bits / 8) as i64;
 
                     if self.types.is_complex(init_typ) {
-                        // Complex-to-complex: linearize_expr returns an address
-                        // to a temp containing the complex value. Copy from temp.
-                        let value_addr = self.linearize_expr(init);
+                        let value_addr = self.complex_operand_addr(init);
+
+                        // The initializer may have a different base precision
+                        // than the object — and usually does, because `I` is
+                        // `__builtin_complex(0.0, 1.0)`, a *double* complex, so
+                        // `float _Complex f = 2.0f + 3.0f*I;` is a conversion.
+                        // Reading the source with the target's base type and
+                        // stride mismatched both the width and the step.
+                        let src_base = self.types.complex_base(init_typ);
+                        let src_bits = self.types.size_bits(src_base);
+                        let src_bytes = (src_bits / 8) as i64;
+
                         let val_real = self.alloc_pseudo();
                         let val_imag = self.alloc_pseudo();
                         self.emit(Instruction::load(
-                            val_real, value_addr, 0, base_typ, base_bits,
+                            val_real, value_addr, 0, src_base, src_bits,
                         ));
                         self.emit(Instruction::load(
-                            val_imag, value_addr, base_bytes, base_typ, base_bits,
+                            val_imag, value_addr, src_bytes, src_base, src_bits,
                         ));
+                        let val_real = self.emit_convert(val_real, src_base, base_typ);
+                        let val_imag = self.emit_convert(val_imag, src_base, base_typ);
                         self.emit(Instruction::store(val_real, sym_id, 0, base_typ, base_bits));
                         self.emit(Instruction::store(
                             val_imag, sym_id, base_bytes, base_typ, base_bits,
@@ -697,7 +713,10 @@ impl<'a> super::linearize::Linearizer<'a> {
                         && list.len() == 1
                         && matches!(
                             list[0].value.kind,
-                            ExprKind::StringLit(_) | ExprKind::WideStringLit(_)
+                            ExprKind::StringLit(_)
+                                | ExprKind::WideStringLit(_)
+                                | ExprKind::Utf16StringLit(_)
+                                | ExprKind::Utf32StringLit(_)
                         )
                         && self.types.kind(elem_type) == TypeKind::Array;
                     if is_string_for_char_array {
@@ -1215,10 +1234,43 @@ impl<'a> super::linearize::Linearizer<'a> {
             Stmt::Case(expr) => {
                 // Extract constant value from case expression
                 if let Some(val) = self.eval_const_expr(expr) {
-                    case_values.push(val as i64); // switch cases truncated to i64
+                    let val = val as i64; // switch cases truncated to i64
+                                          // C99 6.8.4.2p3: no two case constants may be equal.
+                                          // Consumption looks the value up with `.position()`, which
+                                          // finds the first match, so a duplicate silently re-entered
+                                          // the earlier case's block and merged the two bodies.
+                    if case_values.contains(&val) {
+                        error(
+                            expr.pos,
+                            &format!("duplicate case value '{}' in switch", val),
+                        );
+                    }
+                    case_values.push(val);
+                } else if self.expr_is_runtime(expr) {
+                    // A non-constant label can never match; it used to be
+                    // dropped without a word.
+                    error(expr.pos, "case label is not an integer constant expression");
+                } else {
+                    // Constant in principle, but `eval_const_expr` is a partial
+                    // evaluator and could not fold it. Saying the program is
+                    // invalid would be a false claim about the source — this is
+                    // our limit, not its error. Either way the label cannot be
+                    // emitted, so it still has to be reported rather than
+                    // silently dropped.
+                    error(
+                        expr.pos,
+                        "case label is a constant expression this compiler cannot evaluate",
+                    );
                 }
             }
             Stmt::Default => {
+                // C99 6.8.4.2p3: at most one default label per switch.
+                if *has_default {
+                    error(
+                        self.current_pos.unwrap_or_default(),
+                        "multiple default labels in one switch",
+                    );
+                }
                 *has_default = true;
             }
             // Recursively check labeled statements
@@ -1257,6 +1309,100 @@ impl<'a> super::linearize::Linearizer<'a> {
     ///
     /// C99 6.6 defines integer constant expressions. This function evaluates
     /// expressions that can be computed at compile time.
+    /// The code units a string literal contributes to an array initializer,
+    /// or `None` if this is not a string literal.
+    ///
+    /// A narrow literal's parsed form holds one C byte per Rust `char`, so the
+    /// units are the scalar values — iterating `bytes()` UTF-8-encodes anything
+    /// at or above 0x80, which turned `char a[] = "\x80"` into the two bytes
+    /// 0xC2 0x80 and left the array one byte short of what `sizeof` reported.
+    fn string_literal_units(kind: &ExprKind) -> Option<Vec<i128>> {
+        match kind {
+            ExprKind::StringLit(s) => Some(s.chars().map(|c| (c as u32 as u8) as i128).collect()),
+            ExprKind::WideStringLit(s) => Some(s.chars().map(|c| c as u32 as i128).collect()),
+            ExprKind::Utf16StringLit(u) => Some(u.iter().map(|c| *c as i128).collect()),
+            ExprKind::Utf32StringLit(u) => Some(u.iter().map(|c| *c as i128).collect()),
+            _ => None,
+        }
+    }
+
+    /// Does this expression *provably* depend on a runtime value?
+    ///
+    /// The complement of "constant" is not "unfoldable": `eval_const_expr` is a
+    /// partial evaluator, so treating everything it declines as a constraint
+    /// violation turned each of its gaps into a rejection of valid code. This
+    /// answers the narrower question, and answers `false` when unsure — a
+    /// conservative direction, because the caller's fallback blames the
+    /// compiler rather than the program.
+    fn expr_is_runtime(&self, expr: &Expr) -> bool {
+        match &expr.kind {
+            // Reading an object, calling a function, or writing anything.
+            ExprKind::Ident(sym) => !self.symbols.get(*sym).is_enum_constant(),
+            ExprKind::Call { .. }
+            | ExprKind::Assign { .. }
+            | ExprKind::PostInc(_)
+            | ExprKind::PostDec(_)
+            | ExprKind::Member { .. }
+            | ExprKind::Arrow { .. }
+            | ExprKind::Index { .. }
+            | ExprKind::CompoundLiteral { .. }
+            | ExprKind::FuncName => true,
+
+            ExprKind::Unary { op, operand } => {
+                matches!(op, UnaryOp::PreInc | UnaryOp::PreDec | UnaryOp::Deref)
+                    || self.expr_is_runtime(operand)
+            }
+            ExprKind::Binary { left, right, .. } => {
+                self.expr_is_runtime(left) || self.expr_is_runtime(right)
+            }
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                self.expr_is_runtime(cond)
+                    || self.expr_is_runtime(then_expr)
+                    || self.expr_is_runtime(else_expr)
+            }
+            ExprKind::Cast { expr: inner, .. } => self.expr_is_runtime(inner),
+
+            // `sizeof` and `_Alignof` do not evaluate their operand, and
+            // literals are constant. Anything else: not proven either way.
+            _ => false,
+        }
+    }
+
+    /// Fold a floating constant expression, for the arithmetic C permits
+    /// inside one. Only reachable through a cast to an integer type — the
+    /// value of a `case` label is still an integer.
+    fn eval_const_float(&self, expr: &Expr) -> Option<f64> {
+        match &expr.kind {
+            ExprKind::FloatLit(v) => Some(*v),
+            ExprKind::IntLit(v) => Some(*v as f64),
+            ExprKind::CharLit(c) => Some(*c as u8 as i8 as f64),
+            ExprKind::Cast {
+                expr: inner,
+                cast_type,
+            } if self.types.is_float(*cast_type) => self.eval_const_float(inner),
+            ExprKind::Unary {
+                op: UnaryOp::Neg,
+                operand,
+            } => self.eval_const_float(operand).map(|v| -v),
+            ExprKind::Binary { op, left, right } => {
+                let l = self.eval_const_float(left)?;
+                let r = self.eval_const_float(right)?;
+                match op {
+                    BinaryOp::Add => Some(l + r),
+                    BinaryOp::Sub => Some(l - r),
+                    BinaryOp::Mul => Some(l * r),
+                    BinaryOp::Div if r != 0.0 => Some(l / r),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn eval_const_expr(&self, expr: &Expr) -> Option<i128> {
         match &expr.kind {
             ExprKind::IntLit(val) => Some(*val as i128),
@@ -1456,7 +1602,20 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
 
             // Cast to integer type - evaluate inner expression
-            ExprKind::Cast { expr: inner, .. } => self.eval_const_expr(inner),
+            ExprKind::Cast {
+                expr: inner,
+                cast_type,
+            } => self.eval_const_expr(inner).or_else(|| {
+                // `(int)2.0` is an integer constant expression (6.6p6: a cast
+                // of a floating constant is allowed as long as it is the
+                // immediate operand of a cast). Without this the fold failed
+                // and a valid case label was rejected as non-constant.
+                if self.types.is_integer(*cast_type) {
+                    self.eval_const_float(inner).map(|f| f as i128)
+                } else {
+                    None
+                }
+            }),
 
             // __builtin_offsetof(type, member-designator) - compile-time constant
             ExprKind::OffsetOf { type_id, path } => {

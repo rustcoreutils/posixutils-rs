@@ -8,10 +8,19 @@
 //
 // Runtime library function names for soft-float and complex operations.
 //
-// This module maps C type operations to their corresponding runtime library
-// function names. Both libgcc and compiler-rt provide the same function names
-// for these operations, so the rtlib choice only affects which library gets
-// linked, not the generated code.
+// This module holds the `_Float16` conversion helpers, and only those.
+//
+// It is NOT the single source of truth for runtime-helper names, despite once
+// claiming to be: the load-bearing ones are written at their call sites --
+// __divti3/__udivti3/__modti3/__umodti3 in arch/mapping.rs, the whole __*tf*
+// IEEE-quad family in arch/aarch64/mapping.rs, and bare memcpy/memset in
+// arch/x86_64/features.rs. That is not a correctness problem (all are stable
+// libgcc and compiler-rt export names) but it does mean this file cannot be
+// read as an inventory.
+//
+// Both libgcc and compiler-rt provide the same names for these operations, so
+// the rtlib choice only affects which library gets linked, not the generated
+// code.
 //
 // Naming convention for floating-point suffixes:
 // - sf = single float (32-bit)

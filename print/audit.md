@@ -211,13 +211,32 @@ bind.
   the master is drained to observe it: `lp_w_writes_to_the_terminal_when_the_job_completes`
   asserts the completion message reaches the terminal and names the request ID.
   Self-skips when no PTY can be allocated. Replaces `lp_w_option_accepted`.
-- [ ] No test exercises the no-destination *success* path / system default (#3)
-  — still open, and deliberately so. `lp` reaches a destination only through
-  `-d`, `LPDEST` or `PRINTER`; the "system default printer" branch by definition
-  takes none of those, so there is nothing a test can point at the stub with. It
-  needs a configured system default on the host, which CI does not have and
-  which the in-process stub cannot supply. Unlike #1 and #2, no test-only hook
-  would help: the code path is selected by the *absence* of configuration.
+- [x] No-destination handling (#3) — closed 2026-08-08, and it was **not the
+  test gap this box described**. `get_destination` returned
+  `Err("no destination specified")` when `-d`, `LPDEST` and `PRINTER` were all
+  absent, so `lp file` on a machine with a working default printer failed
+  outright. POSIX 103086-103087 is explicit: "If −d is not specified, and
+  neither the LPDEST nor PRINTER environment variable is set, an unspecified
+  destination is used." The *destination* is unspecified; that one is used is
+  not. This was an implementation gap, and the earlier rationale here — that it
+  needed a configured system default printer CI could not supply — was wrong
+  about which half was missing.
+
+  What kept it open is worth recording: `lp_no_destination_error` **asserted the
+  non-conforming behaviour**, requiring stderr to be exactly
+  `lp: no destination specified`. The box said no test covered the path while a
+  test was in fact pinning the defect in place.
+
+  `lp` now falls back to `DEFAULT_DESTINATION` (`ipp://localhost/printers/default`,
+  the implementation-defined choice POSIX leaves open) and reaches it through
+  the same `resolve_uri`/submit path as a bare name given to `-d`. The
+  precedence rules moved into a pure `choose_destination`, so `-d` > `LPDEST` >
+  `PRINTER` > default is unit-tested without mutating process-global
+  environment. `lp_no_destination_uses_the_default` asserts lp gets as far as
+  *trying* the default rather than refusing; failing to reach a printer on a
+  build machine is itself conforming (">0 No output device was available",
+  103158). The end-to-end success beyond destination selection is shared with
+  the already-tested `-d` path.
 
 ### Suggested PR groupings
 

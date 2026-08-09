@@ -171,6 +171,26 @@ impl<'a> super::linearize::Linearizer<'a> {
                 }
             }
 
+            // char16_t / char32_t string literals, same shape as the wide
+            // case: embedded for an array, interned and referenced otherwise.
+            ExprKind::Utf16StringLit(units) => {
+                if self.types.kind(typ) == TypeKind::Array {
+                    Initializer::Utf16String(units.clone())
+                } else {
+                    let label = self.module.add_utf16_string(units.clone());
+                    Initializer::SymAddr(label)
+                }
+            }
+
+            ExprKind::Utf32StringLit(units) => {
+                if self.types.kind(typ) == TypeKind::Array {
+                    Initializer::Utf32String(units.clone())
+                } else {
+                    let label = self.module.add_utf32_string(units.clone());
+                    Initializer::SymAddr(label)
+                }
+            }
+
             // Negative literal (fast path for simple cases)
             ExprKind::Unary {
                 op: UnaryOp::Neg,
@@ -448,7 +468,11 @@ impl<'a> super::linearize::Linearizer<'a> {
         // without brace elision (C99 6.7.8p14)
         if matches!(
             element.value.kind,
-            ExprKind::InitList { .. } | ExprKind::StringLit(_) | ExprKind::WideStringLit(_)
+            ExprKind::InitList { .. }
+                | ExprKind::StringLit(_)
+                | ExprKind::WideStringLit(_)
+                | ExprKind::Utf16StringLit(_)
+                | ExprKind::Utf32StringLit(_)
         ) {
             return false;
         }
@@ -698,7 +722,10 @@ impl<'a> super::linearize::Linearizer<'a> {
                         && list.len() == 1
                         && matches!(
                             list[0].value.kind,
-                            ExprKind::StringLit(_) | ExprKind::WideStringLit(_)
+                            ExprKind::StringLit(_)
+                                | ExprKind::WideStringLit(_)
+                                | ExprKind::Utf16StringLit(_)
+                                | ExprKind::Utf32StringLit(_)
                         )
                         && self.types.kind(elem_type) == TypeKind::Array;
                     let elem_init = if is_string_for_char_array {

@@ -14,7 +14,7 @@ use super::mem2reg::mem2reg;
 use super::ssa::ssa_convert;
 use super::{
     BasicBlock, BasicBlockId, CallAbiInfo, Function, Initializer, Instruction, MemoryOrder, Module,
-    Opcode, Pseudo, PseudoId,
+    Opcode, Pseudo, PseudoId, PseudoKind,
 };
 use crate::abi::{get_abi_for_conv, CallingConv};
 use crate::diag::{error, get_all_stream_names, Position};
@@ -698,6 +698,20 @@ impl<'a> Linearizer<'a> {
     // Function linearization
     // ========================================================================
 
+    /// Whether a return value of this type comes back through a hidden
+    /// pointer (sret) rather than in registers.
+    ///
+    /// `long double _Complex` deliberately does *not*: System V classifies it
+    /// COMPLEX_X87 and returns it in st(0)/st(1), and complex multiply and
+    /// divide are lowered to libgcc's `__mulxc3`/`__divxc3`, which follow that
+    /// convention. Returning it indirectly would silently disagree with the
+    /// very library calls the arithmetic depends on.
+    fn returns_via_hidden_pointer(&self, typ: TypeId) -> bool {
+        let kind = self.types.kind(typ);
+        (kind == TypeKind::Struct || kind == TypeKind::Union)
+            && self.types.size_bits(typ) > self.target.max_aggregate_register_bits
+    }
+
     pub(crate) fn linearize_function(&mut self, func: &FunctionDef) {
         // Set current position for debug info (function definition location)
         self.current_pos = Some(func.pos);
@@ -751,8 +765,7 @@ impl<'a> Linearizer<'a> {
         // Check if function returns a large struct
         // Large structs are returned via a hidden first parameter (sret)
         // that points to caller-allocated space
-        let returns_large_struct = (ret_kind == TypeKind::Struct || ret_kind == TypeKind::Union)
-            && self.types.size_bits(func.return_type) > self.target.max_aggregate_register_bits;
+        let returns_large_struct = self.returns_via_hidden_pointer(func.return_type);
 
         // Argument index offset: if returning large struct, first arg is hidden return pointer
         let arg_offset: u32 = if returns_large_struct { 1 } else { 0 };
@@ -776,6 +789,10 @@ impl<'a> Linearizer<'a> {
         if returns_two_reg_struct {
             self.two_reg_return_type = Some(func.return_type);
         }
+
+        // A complex `Ret` carries an address; a call's result slot holds the
+        // value. The inliner has to know not to splice across that boundary.
+        ir_func.returns_complex = self.types.is_complex(func.return_type);
 
         // Add parameters
         // For struct/union parameters, we need to copy them to local storage
@@ -841,16 +858,36 @@ impl<'a> Linearizer<'a> {
                     struct_params.push((name, param.symbol, param.typ, pseudo_id));
                 }
             } else if self.types.is_complex(param.typ) {
-                // Complex parameters: copy to local storage so real/imag access works
-                // Unlike structs, complex types are passed in FP registers per ABI,
-                // so we create local storage and the codegen handles the register split
-                complex_params.push((
-                    name,
-                    param.symbol,
-                    param.typ,
-                    pseudo_id,
-                    i as u32 + arg_offset,
-                ));
+                // Does this complex parameter arrive by address or in
+                // registers? Ask the *target's* ABI: on x86_64 only
+                // `long double _Complex` is MEMORY class, but on Apple
+                // aarch64 `long double` is a plain double, so all three are
+                // ordinary two-register HFAs there.
+                //
+                // Getting it wrong is not a missing copy but a duplicated
+                // one: the address path emits a load from the incoming
+                // pointer while the prologue also stores the argument
+                // registers into the same local, and the load wins — reading
+                // whatever happened to be in the first integer register.
+                let abi = get_abi_for_conv(CallingConv::C, self.target);
+                let by_address = matches!(
+                    abi.classify_param(param.typ, self.types),
+                    crate::abi::ArgClass::Indirect { .. }
+                );
+                if by_address {
+                    struct_params.push((name, param.symbol, param.typ, pseudo_id));
+                } else {
+                    // Complex parameters: copy to local storage so real/imag access works
+                    // These are passed in FP registers per ABI, so we create local
+                    // storage and the codegen handles the register split.
+                    complex_params.push((
+                        name,
+                        param.symbol,
+                        param.typ,
+                        pseudo_id,
+                        i as u32 + arg_offset,
+                    ));
+                }
             } else {
                 // Store all scalar parameters to locals so SSA conversion can properly
                 // handle reassignment with phi nodes. If the parameter is never modified,
@@ -1110,6 +1147,10 @@ impl<'a> Linearizer<'a> {
 
     /// Emit large struct return via hidden pointer (sret)
     pub(crate) fn emit_sret_return(&mut self, e: &Expr, sret_ptr: PseudoId, struct_size: u32) {
+        // Only structs and unions return through a hidden pointer
+        // (`returns_via_hidden_pointer`), so `e` is always an aggregate here —
+        // complex returns take the register path and go through
+        // `complex_operand_addr`.
         let src_addr = self.linearize_lvalue(e);
         let struct_bytes = struct_size as i64 / 8;
         let mut byte_offset = 0i64;
@@ -1205,7 +1246,9 @@ impl<'a> Linearizer<'a> {
             | ExprKind::FloatLit(_)
             | ExprKind::CharLit(_)
             | ExprKind::StringLit(_)
-            | ExprKind::WideStringLit(_) => true,
+            | ExprKind::WideStringLit(_)
+            | ExprKind::Utf16StringLit(_)
+            | ExprKind::Utf32StringLit(_) => true,
 
             // Identifiers are pure unless volatile
             ExprKind::Ident(_) => {
@@ -1386,6 +1429,59 @@ impl<'a> Linearizer<'a> {
 
         // Couldn't resolve, return original
         type_id
+    }
+
+    /// The address of a complex-valued expression, whichever kind it is.
+    ///
+    /// Complex values live in memory and travel by address, and every complex
+    /// path (argument, assignment, return) needs that one address. Three
+    /// different expression shapes produce it three different ways:
+    ///
+    /// - an **lvalue** has an address to take, so `linearize_lvalue`;
+    /// - a **call** returning complex yields a `Sym` pseudo whose own stack
+    ///   slot *is* the returned value, so its address has to be taken;
+    /// - every other **rvalue** — `__builtin_complex(...)`, `x + y` — already
+    ///   lowers to a temp holding a pointer to the value, which is the answer
+    ///   as it stands.
+    ///
+    /// Each caller used to pick one of these by hand, and they did not agree.
+    /// Both ways of being wrong are silent and fatal: asking an rvalue for its
+    /// lvalue yields a bogus pointer, and handing a consumer the value's own
+    /// bits gets them dereferenced as an address. Which crash you got depended
+    /// on the syntax at the use site.
+    pub(crate) fn complex_operand_addr(&mut self, expr: &Expr) -> PseudoId {
+        let is_lvalue = matches!(
+            expr.kind,
+            ExprKind::Ident(_)
+                | ExprKind::Member { .. }
+                | ExprKind::Arrow { .. }
+                | ExprKind::Index { .. }
+                | ExprKind::Unary {
+                    op: crate::parse::ast::UnaryOp::Deref,
+                    ..
+                }
+                | ExprKind::CompoundLiteral { .. }
+        );
+        if is_lvalue {
+            return self.linearize_lvalue(expr);
+        }
+        let typ = self.expr_type(expr);
+        let val = self.linearize_expr(expr);
+        // A `Sym`'s slot holds the value itself; anything else already holds a
+        // pointer to it. Deciding here, where the pseudo's kind is known, is
+        // what lets every consumer treat the result as a plain address.
+        let slot_is_the_value = self
+            .current_func
+            .as_ref()
+            .and_then(|f| f.get_pseudo(val))
+            .is_some_and(|p| matches!(p.kind, PseudoKind::Sym(_)));
+        if !slot_is_the_value {
+            return val;
+        }
+        let addr = self.alloc_reg_pseudo();
+        let ptr_type = self.types.pointer_to(typ);
+        self.emit(Instruction::sym_addr(addr, val, ptr_type));
+        addr
     }
 
     /// Linearize an expression as an lvalue (get its address)
@@ -2111,13 +2207,14 @@ impl<'a> Linearizer<'a> {
         // Two-register structs (9-16 bytes): allocate local storage, codegen stores two regs
         let typ_kind = self.types.kind(typ);
         let struct_size_bits = self.types.size_bits(typ);
-        let returns_large_struct = (typ_kind == TypeKind::Struct || typ_kind == TypeKind::Union)
-            && struct_size_bits > self.target.max_aggregate_register_bits;
+        let returns_large_struct = self.returns_via_hidden_pointer(typ);
         let returns_two_reg_struct = (typ_kind == TypeKind::Struct || typ_kind == TypeKind::Union)
             && struct_size_bits > 64
             && struct_size_bits <= 128
             && !returns_large_struct;
-        let returns_complex = self.types.is_complex(typ);
+        // `long double _Complex` comes back through the hidden pointer above,
+        // not in registers.
+        let returns_complex = self.types.is_complex(typ) && !returns_large_struct;
 
         let (result_sym, mut arg_vals, mut arg_types_vec) = if returns_large_struct {
             // Allocate local storage for the return value
@@ -2292,9 +2389,9 @@ impl<'a> Linearizer<'a> {
                 }
             } else if self.types.is_complex(arg_type) {
                 // Complex types: pass address, codegen loads real/imag into XMM registers
-                // Type stays as complex (not pointer) so codegen knows it's complex
+                // Type stays as complex (not pointer) so codegen knows it's complex.
                 arg_types_vec.push(arg_type);
-                self.linearize_lvalue(a)
+                self.complex_operand_addr(a)
             } else if arg_kind == TypeKind::Array {
                 // Array decay to pointer (C99 6.3.2.1)
                 // This applies to both fixed-size arrays and VLAs
@@ -2760,12 +2857,12 @@ impl<'a> Linearizer<'a> {
             // For complex types, we need addresses to load real/imag parts
             // If an operand is not complex (e.g., real scalar), promote it
             let left_addr = if self.types.is_complex(left_typ) {
-                self.linearize_lvalue(left)
+                self.complex_operand_at_precision(left, result_typ)
             } else {
                 self.promote_real_to_complex(left, result_typ)
             };
             let right_addr = if self.types.is_complex(right_typ) {
-                self.linearize_lvalue(right)
+                self.complex_operand_at_precision(right, result_typ)
             } else {
                 self.promote_real_to_complex(right, result_typ)
             };
@@ -4057,6 +4154,16 @@ impl<'a> Linearizer<'a> {
 
             ExprKind::WideStringLit(s) => {
                 let label = self.module.add_wide_string(s.clone());
+                self.emit_string_sym(expr, label)
+            }
+
+            ExprKind::Utf16StringLit(u) => {
+                let label = self.module.add_utf16_string(u.clone());
+                self.emit_string_sym(expr, label)
+            }
+
+            ExprKind::Utf32StringLit(u) => {
+                let label = self.module.add_utf32_string(u.clone());
                 self.emit_string_sym(expr, label)
             }
 

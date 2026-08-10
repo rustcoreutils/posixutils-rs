@@ -298,6 +298,24 @@ fn diagnostics_atomic_on_array_is_rejected() {
     );
 }
 
+/// The specifier form is not the only way to reach C17 6.7.3p3. The bare
+/// qualifier applied to a typedef that names an array or function type is the
+/// other, and it only set a modifier bit -- so both of these were accepted.
+/// gcc rejects them.
+#[test]
+fn diagnostics_atomic_qualifier_on_array_or_function_typedef_is_rejected() {
+    compile_expect_error(
+        "atomic_typedef_array",
+        "typedef int A[4];\n_Atomic A x;\n",
+        "'_Atomic' cannot be applied to an array type",
+    );
+    compile_expect_error(
+        "atomic_typedef_function",
+        "typedef int F(void);\n_Atomic F f;\n",
+        "'_Atomic' cannot be applied to a function type",
+    );
+}
+
 /// `_Atomic int a[3]` is an array *of* atomic ints, which is legal — the
 /// qualifier lands on the element type, not the array.
 #[test]
@@ -309,6 +327,15 @@ fn diagnostics_atomic_qualified_forms_are_accepted() {
     compile_expect_ok(
         "ok_atomic_array_of",
         "#include <stdatomic.h>\n_Atomic int arr[3];\nint main(void){return 0;}\n",
+    );
+    // A typedef naming an ordinary object type is fine.
+    compile_expect_ok(
+        "ok_atomic_typedef_struct",
+        "typedef struct S{int a;} T;\n_Atomic T t;\nint main(void){return 0;}\n",
+    );
+    compile_expect_ok(
+        "ok_atomic_typedef_int",
+        "typedef int I;\n_Atomic I v;\nint main(void){return 0;}\n",
     );
 }
 

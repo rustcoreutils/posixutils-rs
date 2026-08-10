@@ -2038,8 +2038,33 @@ impl Parser<'_> {
 
     /// Parse a type specifier and record whether one was present.
     fn parse_type_specifier(&mut self) -> ParseResult<Type> {
+        let pos = self.current_pos();
         let (typ, explicit) = self.parse_type_specifier_inner()?;
         self.saw_explicit_type = explicit;
+
+        // C17 6.7.3p3: the _Atomic *qualifier* shall not be applied to an array
+        // or function type. The specifier form `_Atomic(T)` is checked where it
+        // is parsed, but the qualifier form only sets a bit, so
+        //
+        //     typedef int A[4];   _Atomic A x;
+        //     typedef int F(void); _Atomic F f;
+        //
+        // both slipped through -- the only way to reach the constraint, since
+        // `_Atomic int a[4]` is an array *of* atomic ints and perfectly legal.
+        if typ.modifiers.contains(TypeModifiers::ATOMIC) {
+            let what = match typ.kind {
+                TypeKind::Array => Some("an array"),
+                TypeKind::Function => Some("a function"),
+                _ => None,
+            };
+            if let Some(what) = what {
+                diag::error(
+                    pos,
+                    &format!("'_Atomic' cannot be applied to {} type", what),
+                );
+            }
+        }
+
         Ok(typ)
     }
 

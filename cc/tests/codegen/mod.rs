@@ -12,6 +12,7 @@
 //
 
 pub mod asm_probe;
+mod atomics_asm;
 mod cross_abi;
 mod determinism;
 mod inline_asm;

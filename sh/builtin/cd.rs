@@ -99,6 +99,32 @@ fn lexical_normalize(path: &[u8]) -> Vec<u8> {
     result
 }
 
+/// The directory `cd` is leaving, as POSIX defines it: the value of `PWD`,
+/// which preserves the symbolic links the shell walked through. `PWD` is only
+/// unusable in a shell that inherited a broken environment, so fall back to
+/// the real working directory then.
+fn current_logical_dir(shell: &Shell) -> Result<OsString, String> {
+    match shell.environment.get_str_value("PWD") {
+        Some(pwd) if pwd.starts_with('/') => Ok(OsString::from(pwd)),
+        _ => std::env::current_dir()
+            .map(PathBuf::into_os_string)
+            .map_err(io_err_to_string),
+    }
+}
+
+/// Prefixes `path` with `base` when it is not already absolute.
+fn make_absolute(path: &OsStr, base: &OsStr) -> OsString {
+    if path.as_bytes().first() == Some(&b'/') {
+        return path.to_os_string();
+    }
+    let mut result = base.as_bytes().to_vec();
+    if result.last().is_some_and(|c| *c != b'/') {
+        result.push(b'/');
+    }
+    result.extend_from_slice(path.as_bytes());
+    OsString::from_vec(result)
+}
+
 pub struct Cd;
 
 impl BuiltinUtility for Cd {
@@ -162,22 +188,10 @@ impl BuiltinUtility for Cd {
                     curr_path = OsString::from_vec(dir.as_bytes().to_vec());
                 }
 
-                let old_working_dir = std::env::current_dir().map_err(io_err_to_string)?;
+                let old_working_dir = current_logical_dir(shell)?;
 
                 if !handle_dot_dot_physically {
-                    if curr_path.as_bytes().first().is_none_or(|c| *c != b'/') {
-                        // `PWD` is normally absolute, but fall back to the real
-                        // working directory so the result is never relative.
-                        let mut new_curr_path = match shell.environment.get_str_value("PWD") {
-                            Some(pwd) if pwd.starts_with('/') => pwd.as_bytes().to_vec(),
-                            _ => old_working_dir.as_os_str().as_bytes().to_vec(),
-                        };
-                        if new_curr_path.last().is_some_and(|c| *c != b'/') {
-                            new_curr_path.push(b'/');
-                        }
-                        new_curr_path.extend(curr_path.as_bytes());
-                        curr_path = OsString::from_vec(new_curr_path)
-                    }
+                    curr_path = make_absolute(&curr_path, &old_working_dir);
                     // -L: resolve `..` lexically, do NOT follow symbolic links.
                     curr_path = OsString::from_vec(lexical_normalize(curr_path.as_bytes()));
                 }
@@ -187,10 +201,17 @@ impl BuiltinUtility for Cd {
                     // -P: the new working directory is whatever the kernel
                     // resolved, with symbolic links already followed. `PWD`
                     // must be absolute, so ask for it rather than reusing the
-                    // (possibly relative) operand.
-                    curr_path = std::env::current_dir()
-                        .map_err(io_err_to_string)?
-                        .into_os_string();
+                    // (possibly relative) operand. The directory has already
+                    // changed at this point, so a `getcwd` failure (unreadable
+                    // parent, directory removed under us) must not abort `cd`
+                    // and leave `PWD` describing the old location -- fall back
+                    // to the operand made absolute instead.
+                    curr_path = match std::env::current_dir() {
+                        Ok(dir) => dir.into_os_string(),
+                        Err(_) => OsString::from_vec(lexical_normalize(
+                            make_absolute(&curr_path, &old_working_dir).as_bytes(),
+                        )),
+                    };
                 }
                 if used_cdpath {
                     opened_files.write_out(format!("{}\n", curr_path.to_string_lossy()));
@@ -209,7 +230,7 @@ impl BuiltinUtility for Cd {
                     .get_str_value("OLDPWD")
                     .map(|s| s.to_string())
                 {
-                    let old_working_dir = std::env::current_dir().unwrap();
+                    let old_working_dir = current_logical_dir(shell)?;
                     let oldpwd_ostr = OsString::from(oldpwd.clone());
                     chdir(&oldpwd_ostr).map_err(io_err_to_string)?;
                     shell.current_directory = oldpwd_ostr;

@@ -2627,4 +2627,52 @@ mod audit_regressions {
             "[a\\]\n[b]\n",
         );
     }
+
+    #[test]
+    fn cd_sets_oldpwd_from_pwd_not_from_getcwd() {
+        // POSIX: OLDPWD is set to the value of PWD, so the symbolic links the
+        // shell walked through survive; getcwd would have resolved them away.
+        set_env_vars();
+        let dir = Path::new(concat!(env!("CARGO_TARGET_TMPDIR"), "/sh_test_write_dir"))
+            .join("cd_oldpwd_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        std::os::unix::fs::symlink("real", dir.join("lnk")).unwrap();
+        run_successfully_and(
+            &format!(
+                "cd '{0}/lnk'\ncd '{0}'\necho \"$OLDPWD\"\ncd - >/dev/null\necho \"$PWD\"\n",
+                dir.display()
+            ),
+            |out| {
+                assert_eq!(
+                    out,
+                    format!("{0}/lnk\n{0}/lnk\n", dir.display()),
+                    "OLDPWD lost the logical path"
+                )
+            },
+        );
+        // `-P` still reports the resolved path.
+        run_successfully_and(
+            &format!("cd -P '{}/lnk'\necho \"$PWD\"\n", dir.display()),
+            |out| assert_eq!(out, format!("{}/real\n", dir.display())),
+        );
+    }
+
+    #[test]
+    fn cd_physical_survives_a_failing_getcwd() {
+        // The chdir has already happened when getcwd runs, so a failure there
+        // must not report an error and leave PWD describing the old location.
+        set_env_vars();
+        let dir = Path::new(concat!(env!("CARGO_TARGET_TMPDIR"), "/sh_test_write_dir"))
+            .join("cd_physical_getcwd");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("gone")).unwrap();
+        run_successfully_and(
+            &format!(
+                "cd '{0}/gone'\nrmdir '{0}/gone'\ncd -P .\necho \"[$PWD]\"\n",
+                dir.display()
+            ),
+            |out| assert_eq!(out, format!("[{}/gone]\n", dir.display())),
+        );
+    }
 }

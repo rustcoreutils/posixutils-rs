@@ -433,3 +433,63 @@ fn c99_complex_mixed_precision() {
         0
     );
 }
+
+/// Assigning a *real* to a complex object is a conversion, not a copy.
+///
+/// C99 6.3.1.7 gives the result that value as its real part and a zero
+/// imaginary part. The complex-assignment path took the address of the
+/// right-hand side unconditionally, which treats a non-lvalue as one:
+/// `dc = 1.0` emitted `movabsq $4607182418800017408, %r11` -- the bit pattern
+/// of 1.0 -- and then dereferenced it, so every such assignment segfaulted.
+///
+/// Pre-existing on main; found while testing atomic aggregates.
+#[test]
+fn c99_assigning_a_real_to_a_complex_converts() {
+    let src = r#"
+        #include <string.h>
+
+        double _Complex g;
+        float _Complex gf;
+        long double _Complex gl;
+
+        int main(void) {
+            /* Global, double. */
+            g = 1.0;
+            double parts[2];
+            memcpy(parts, &g, sizeof parts);
+            if (parts[0] != 1.0 || parts[1] != 0.0) return 1;
+
+            /* Local. */
+            double _Complex l = __builtin_complex(9.0, 9.0);
+            l = 2.5;
+            memcpy(parts, &l, sizeof parts);
+            if (parts[0] != 2.5 || parts[1] != 0.0) return 2;
+
+            /* An integer right-hand side converts too. */
+            l = 3;
+            memcpy(parts, &l, sizeof parts);
+            if (parts[0] != 3.0 || parts[1] != 0.0) return 3;
+
+            /* float _Complex, whose base is narrower than the value. */
+            gf = 1.5;
+            float fparts[2];
+            memcpy(fparts, &gf, sizeof fparts);
+            if (fparts[0] != 1.5f || fparts[1] != 0.0f) return 4;
+
+            /* long double _Complex, whose base is wider. */
+            gl = 4.25;
+            long double lparts[2];
+            memcpy(lparts, &gl, sizeof lparts);
+            if (lparts[0] != 4.25L || lparts[1] != 0.0L) return 5;
+
+            /* A previously-nonzero imaginary part must be cleared. */
+            l = __builtin_complex(7.0, 8.0);
+            l = 1.0;
+            memcpy(parts, &l, sizeof parts);
+            if (parts[1] != 0.0) return 6;
+
+            return 0;
+        }
+    "#;
+    assert_eq!(compile_and_run("c99_real_to_complex_assign", src, &[]), 0);
+}

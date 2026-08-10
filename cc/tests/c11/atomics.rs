@@ -580,3 +580,75 @@ int main(void) {
         0
     );
 }
+
+/// Two atomic results live at the same time must not alias.
+///
+/// Both backends leave an atomic's result in a fixed register the instruction
+/// requires -- RAX on x86_64, X0/X1/X2 on aarch64 -- and both then *overwrote*
+/// the allocator's assignment for the result pseudo with that register. So any
+/// expression holding two atomic results at once collapsed them into one.
+///
+/// The register-clobber declarations added earlier do not help here: they stop
+/// *other* pseudos being parked in those registers, but the codegen was
+/// discarding the allocator's answer for the atomic's own result.
+#[test]
+fn c11_two_atomic_results_do_not_alias() {
+    let code = r#"
+#include <stdatomic.h>
+
+atomic_int a, b;
+_Atomic unsigned char ca, cb;
+
+/* Builtins: two fetch-adds summed in one expression. */
+static int two_builtins(void) {
+    return __c11_atomic_fetch_add(&a, 1, __ATOMIC_SEQ_CST)
+         + __c11_atomic_fetch_add(&b, 1, __ATOMIC_SEQ_CST);
+}
+
+/* Ordinary operators, which now lower to the same opcodes. */
+static int two_compound(void) { return (a += 10) + (b += 20); }
+
+/* Plain reads: every _Atomic rvalue read is an AtomicLoad now, and on
+   aarch64 they all landed in X0. */
+static int two_reads(void) { return a + b; }
+
+/* Three at once, to catch a fix that only handles pairs. */
+static int three_reads(void) { return a + b + (int)ca; }
+
+/* Exchange and CAS use different fixed registers again. */
+static int two_exchanges(void) {
+    return __c11_atomic_exchange(&a, 5, __ATOMIC_SEQ_CST)
+         + __c11_atomic_exchange(&b, 6, __ATOMIC_SEQ_CST);
+}
+
+int main(void) {
+    a = 100; b = 7;
+    if (two_builtins() != 107) return 1;      /* old values, 100 + 7 */
+    if (a != 101 || b != 8) return 2;
+
+    a = 1; b = 2;
+    if (two_compound() != 33) return 3;       /* new values, 11 + 22 */
+
+    a = 40; b = 2;
+    if (two_reads() != 42) return 4;
+
+    a = 40; b = 2; ca = 3;
+    if (three_reads() != 45) return 5;
+
+    a = 11; b = 22;
+    if (two_exchanges() != 33) return 6;      /* old values */
+    if (a != 5 || b != 6) return 7;
+
+    /* Narrow widths take the sign/zero-extension path on the way out. */
+    ca = 200; cb = 55;
+    if ((int)ca + (int)cb != 255) return 8;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c11_atomic_no_alias", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("c11_atomic_no_alias_opt", code),
+        0
+    );
+}

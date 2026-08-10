@@ -3341,7 +3341,15 @@ impl Aarch64CodeGen {
             dst: Reg::X0,
         });
 
-        self.locations.set(target, Loc::Reg(Reg::X0));
+        // The instruction leaves the result in a fixed scratch register, but
+        // the allocator gave this pseudo its own location. Overwriting that
+        // made every atomic result alias the same register, so two atomic
+        // reads in one expression collapsed into one -- `x + y` on two
+        // _Atomic ints returned `y + y`. Move it where the allocator expects.
+        let dst_loc = self.get_location(target);
+        if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::X0) {
+            self.emit_move_to_loc(Reg::X0, &dst_loc, size.max(32));
+        }
     }
 
     /// Emit atomic store
@@ -3421,7 +3429,15 @@ impl Aarch64CodeGen {
         });
 
         // Result: X1 = old value
-        self.locations.set(target, Loc::Reg(Reg::X1));
+        // The instruction leaves the result in a fixed scratch register, but
+        // the allocator gave this pseudo its own location. Overwriting that
+        // made every atomic result alias the same register, so two atomic
+        // reads in one expression collapsed into one -- `x + y` on two
+        // _Atomic ints returned `y + y`. Move it where the allocator expects.
+        let dst_loc = self.get_location(target);
+        if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::X1) {
+            self.emit_move_to_loc(Reg::X1, &dst_loc, size.max(32));
+        }
     }
 
     /// Emit atomic compare-and-swap using LL/SC
@@ -3528,7 +3544,15 @@ impl Aarch64CodeGen {
         // Done label
         self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(done_label)));
 
-        self.locations.set(target, Loc::Reg(Reg::X2));
+        // The instruction leaves the result in a fixed scratch register, but
+        // the allocator gave this pseudo its own location. Overwriting that
+        // made every atomic result alias the same register, so two atomic
+        // reads in one expression collapsed into one -- `x + y` on two
+        // _Atomic ints returned `y + y`. Move it where the allocator expects.
+        let dst_loc = self.get_location(target);
+        if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::X2) {
+            self.emit_move_to_loc(Reg::X2, &dst_loc, size.max(32));
+        }
     }
 
     /// Emit atomic fetch-and-add using LL/SC
@@ -3587,7 +3611,15 @@ impl Aarch64CodeGen {
         });
 
         // Result: X1 = old value
-        self.locations.set(target, Loc::Reg(Reg::X1));
+        // The instruction leaves the result in a fixed scratch register, but
+        // the allocator gave this pseudo its own location. Overwriting that
+        // made every atomic result alias the same register, so two atomic
+        // reads in one expression collapsed into one -- `x + y` on two
+        // _Atomic ints returned `y + y`. Move it where the allocator expects.
+        let dst_loc = self.get_location(target);
+        if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::X1) {
+            self.emit_move_to_loc(Reg::X1, &dst_loc, size.max(32));
+        }
     }
 
     /// Emit atomic fetch-and-subtract using LL/SC
@@ -3646,7 +3678,15 @@ impl Aarch64CodeGen {
         });
 
         // Result: X1 = old value
-        self.locations.set(target, Loc::Reg(Reg::X1));
+        // The instruction leaves the result in a fixed scratch register, but
+        // the allocator gave this pseudo its own location. Overwriting that
+        // made every atomic result alias the same register, so two atomic
+        // reads in one expression collapsed into one -- `x + y` on two
+        // _Atomic ints returned `y + y`. Move it where the allocator expects.
+        let dst_loc = self.get_location(target);
+        if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::X1) {
+            self.emit_move_to_loc(Reg::X1, &dst_loc, size.max(32));
+        }
     }
 
     /// Emit atomic fetch-and-AND using LL/SC
@@ -3741,7 +3781,15 @@ impl Aarch64CodeGen {
         });
 
         // Result: X1 = old value
-        self.locations.set(target, Loc::Reg(Reg::X1));
+        // The instruction leaves the result in a fixed scratch register, but
+        // the allocator gave this pseudo its own location. Overwriting that
+        // made every atomic result alias the same register, so two atomic
+        // reads in one expression collapsed into one -- `x + y` on two
+        // _Atomic ints returned `y + y`. Move it where the allocator expects.
+        let dst_loc = self.get_location(target);
+        if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::X1) {
+            self.emit_move_to_loc(Reg::X1, &dst_loc, size.max(32));
+        }
     }
 
     /// Emit memory fence

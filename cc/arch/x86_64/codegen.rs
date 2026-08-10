@@ -4338,7 +4338,15 @@ impl X86_64CodeGen {
 
         // Result (old value) is in RAX
         self.extend_narrow_atomic_result(insn, types);
-        self.locations.set(target, Loc::Reg(Reg::Rax));
+        // The result is in RAX because the instruction requires it, but the
+        // allocator assigned this pseudo its own location. Overwriting that
+        // assignment made every atomic result alias RAX, so two atomic results
+        // live at once collapsed into one: `f(&a) + f(&b)` became `add %rax,
+        // %rax`. Move it to where the allocator expects instead.
+        let dst_loc = self.get_location(target);
+        if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::Rax) {
+            self.emit_move_to_loc(Reg::Rax, &dst_loc, size.max(32));
+        }
     }
 
     /// Emit atomic compare-and-swap
@@ -4523,7 +4531,15 @@ impl X86_64CodeGen {
         });
 
         // Result (success flag) is in RAX
-        self.locations.set(target, Loc::Reg(Reg::Rax));
+        // The result is in RAX because the instruction requires it, but the
+        // allocator assigned this pseudo its own location. Overwriting that
+        // assignment made every atomic result alias RAX, so two atomic results
+        // live at once collapsed into one: `f(&a) + f(&b)` became `add %rax,
+        // %rax`. Move it to where the allocator expects instead.
+        let dst_loc = self.get_location(target);
+        if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::Rax) {
+            self.emit_move_to_loc(Reg::Rax, &dst_loc, size.max(32));
+        }
     }
 
     /// Widen a narrow atomic result in RAX to a full 32-bit register value.
@@ -4596,7 +4612,15 @@ impl X86_64CodeGen {
 
         // Result (old value) is in RAX
         self.extend_narrow_atomic_result(insn, types);
-        self.locations.set(target, Loc::Reg(Reg::Rax));
+        // The result is in RAX because the instruction requires it, but the
+        // allocator assigned this pseudo its own location. Overwriting that
+        // assignment made every atomic result alias RAX, so two atomic results
+        // live at once collapsed into one: `f(&a) + f(&b)` became `add %rax,
+        // %rax`. Move it to where the allocator expects instead.
+        let dst_loc = self.get_location(target);
+        if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::Rax) {
+            self.emit_move_to_loc(Reg::Rax, &dst_loc, size.max(32));
+        }
     }
 
     /// Emit atomic fetch-and-subtract
@@ -4633,7 +4657,15 @@ impl X86_64CodeGen {
 
         // Result (old value) is in RAX
         self.extend_narrow_atomic_result(insn, types);
-        self.locations.set(target, Loc::Reg(Reg::Rax));
+        // The result is in RAX because the instruction requires it, but the
+        // allocator assigned this pseudo its own location. Overwriting that
+        // assignment made every atomic result alias RAX, so two atomic results
+        // live at once collapsed into one: `f(&a) + f(&b)` became `add %rax,
+        // %rax`. Move it to where the allocator expects instead.
+        let dst_loc = self.get_location(target);
+        if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::Rax) {
+            self.emit_move_to_loc(Reg::Rax, &dst_loc, size.max(32));
+        }
     }
 
     /// Emit atomic fetch-and-and
@@ -4735,7 +4767,15 @@ impl X86_64CodeGen {
 
         // Result (old value) is in RAX
         self.extend_narrow_atomic_result(insn, types);
-        self.locations.set(target, Loc::Reg(Reg::Rax));
+        // The result is in RAX because the instruction requires it, but the
+        // allocator assigned this pseudo its own location. Overwriting that
+        // assignment made every atomic result alias RAX, so two atomic results
+        // live at once collapsed into one: `f(&a) + f(&b)` became `add %rax,
+        // %rax`. Move it to where the allocator expects instead.
+        let dst_loc = self.get_location(target);
+        if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::Rax) {
+            self.emit_move_to_loc(Reg::Rax, &dst_loc, size.max(32));
+        }
     }
 
     /// Emit memory fence

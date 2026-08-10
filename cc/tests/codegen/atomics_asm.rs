@@ -236,3 +236,43 @@ void add_f(void) { f += 1.5f; }
     assert_body_contains(&asm, "add_d", "ldaxr", "FP RMW is an LL/SC loop");
     assert_body_contains(&asm, "add_d", "stlxr", "FP RMW is an LL/SC loop");
 }
+
+/// Two atomic reads in one expression must end up in different registers.
+///
+/// aarch64's `emit_atomic_load` leaves its result in X0 and used to overwrite
+/// the allocator's assignment with it, so `x + y` on two `_Atomic int`s emitted
+/// `ldar w0` twice and returned `y + y`. x86_64 had the same shape with RAX.
+///
+/// Asserted on assembly because this architecture is not executed by the
+/// behavioural suite on an x86_64 host.
+#[test]
+fn codegen_atomic_results_get_distinct_registers() {
+    let src = r#"
+#include <stdatomic.h>
+atomic_int x, y;
+int sum(void) { return x + y; }
+"#;
+
+    let asm = asm_for("atomic_distinct_arm", AARCH64_LINUX, src);
+    let body = super::asm_probe::body_of(&asm, "sum");
+    // Both loads are still ldar into the fixed register...
+    assert_eq!(
+        body.matches("ldar").count(),
+        2,
+        "expected two acquire loads:\n{body}"
+    );
+    // ...but the first result must be copied out before the second lands,
+    // or one of them is lost.
+    assert!(
+        body.contains("mov w") || body.contains("mov x"),
+        "the first atomic result must be moved out of the fixed register \
+         before the second overwrites it:\n{body}"
+    );
+
+    let asm = asm_for("atomic_distinct_x86", X86_64_LINUX, src);
+    let body = super::asm_probe::body_of(&asm, "sum");
+    assert!(
+        !body.contains("addl %eax, %eax") && !body.contains("add %eax, %eax"),
+        "the two atomic results aliased in RAX:\n{body}"
+    );
+}

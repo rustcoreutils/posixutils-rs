@@ -3,9 +3,11 @@
 ## Table of Contents
 
 - [Technical Debt](#technical-debt)
+- [Known Divergences](#known-divergences)
 - [Future Features](#future-features)
 - [Optimization Passes](#optimization-passes)
 - [Assembly Peephole Optimizations](#assembly-peephole-optimizations)
+- [External Test Suites](#external-test-suites)
 
 ## Technical Debt
 
@@ -58,6 +60,20 @@ and the acceptance gate has to raise the stack to measure correctness.
 4. Spill to stack when needed
 
 ---
+
+## Known Divergences
+
+Behaviours where c17 differs from gcc on the same source. None is a
+translation-limit or a diagnostic gap; each silently changes what the program
+does or claims.
+
+| Area | Divergence |
+|------|-----------|
+| `__attribute__((constructor))` / `((destructor))` | Accepted, never run |
+| `__attribute__((noinline))` | Accepted, may be inlined anyway at `-O2` |
+| `_FORTIFY_SOURCE` | Compiles, but `__builtin_object_size` always answers "unknown", so nothing is actually checked |
+| `_Complex` with static storage | Cannot be initialized at all; gcc accepts `1.0 + 2.0*I` and `CMPLX(...)` |
+| `isnan()` on a `long double` | 65535 rather than 1, because `__builtin_isnan` is absent and glibc falls back to `__isnanl` |
 
 ## Future Features
 
@@ -112,6 +128,11 @@ Convert constant branches to unconditional jumps. Merge simple blocks. Remove ju
 #### Copy Propagation & SSA Cleanup
 
 `t1 = x; y = t1;` → `y = x`. Simplify φ-nodes where all incoming operands are same.
+
+**Blocked.** An attempt at this surfaced a register-allocator defect that is
+still open: a non-variadic `Arg` pseudo's location is computed off the wrong
+frame base (spill slot versus callee frame). Any pass that merges pseudos
+trips it, so copy propagation cannot land until that is fixed.
 
 #### Local CSE / Value Numbering
 

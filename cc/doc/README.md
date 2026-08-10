@@ -2,6 +2,11 @@
 
 This directory contains detailed documentation for the c17 C compiler.
 
+c17 implements **C17 (ISO/IEC 9899:2018) only**, plus selected GNU extensions.
+There is one language mode: `-std=` is accepted because build systems pass it
+unconditionally, but a request for an older revision is reported rather than
+honoured (`-Wno-c17-dialect` silences it).
+
 ## Documents
 
 | Document | Description |
@@ -39,14 +44,18 @@ says less than the audit's record of what was actually probed.
   - Bit operations (`__builtin_ctz/clz/popcount` families)
   - Control flow (`__builtin_unreachable`)
   - Non-local jumps (`setjmp`, `longjmp`)
+  - Complex construction (`__builtin_complex`)
+  - Fortification (`__builtin_object_size`, the `__builtin___*_chk` family)
+  - and what is **not** implemented, where the absence is observable
 
 ### Development
 
 - **TODO & Roadmap**: [TODO.md](TODO.md)
   - Technical debt items
-  - C11 feature implementation plans
+  - Remaining feature work
   - Optimization passes roadmap
   - Assembly peephole optimizations
+  - External test suites not yet run
 
 ## See Also
 

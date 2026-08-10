@@ -29,8 +29,22 @@ Attributes fall into three categories based on implementation depth:
 |-----------|-----------|--------|
 | `noreturn` | Functions | Emits trap after call; enables DCE |
 | `packed` | Structs/unions | Removes padding from layout |
+| `aligned` | Types, variables | Raises alignment; `.align` on a variable, layout and `_Alignof` on a type. Verified to match gcc |
 | `sysv_abi` | Functions | Forces System V AMD64 calling convention |
 | `ms_abi` | Functions | Forces Win64 calling convention |
+
+### Accepted but with no effect, and the program can tell
+
+These change behaviour under gcc, so ignoring them is a divergence rather than
+a harmless omission. Recorded here so the list below is not read as "all
+equally harmless".
+
+| Attribute | What gcc does | What c17 does |
+|-----------|---------------|---------------|
+| `constructor` | Runs the function before `main` | Never runs it |
+| `destructor` | Runs the function after `main` | Never runs it |
+| `noinline` | Keeps the call | May inline anyway at `-O2` |
+| `always_inline` | Forces inlining | Left to the inliner's own heuristics |
 
 ### Parsed and accepted (no semantic effect)
 
@@ -39,16 +53,11 @@ These are parsed by `__attribute__((...))`, reported by `__has_attribute()`, but
 | Attribute | Description |
 |-----------|-------------|
 | `unused` | Suppress unused warnings |
-| `aligned` | Alignment specification |
 | `deprecated` | Mark as deprecated |
 | `weak` | Weak symbol linkage |
 | `section` | Place in named section |
 | `visibility` | Symbol visibility (default, hidden, protected) |
-| `constructor` | Run before main |
-| `destructor` | Run after main |
 | `used` | Prevent dead-stripping |
-| `noinline` | Prevent inlining |
-| `always_inline` | Force inlining |
 | `hot` | Optimize for speed |
 | `cold` | Optimize for size |
 | `warn_unused_result` | Warn if return value ignored |

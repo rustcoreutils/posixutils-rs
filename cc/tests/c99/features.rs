@@ -411,3 +411,54 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("scope_shadowing_deep", code, &[]), 0);
 }
+
+/// C99 6.4.4.2 hex floats name a binary value directly, so a long significand
+/// must survive the parse intact.
+///
+/// The significand was accumulated in a `u64` and divided by
+/// `1u64 << (4 * digits)`. Sixteen fraction digits make that a shift of 64,
+/// which wraps to a shift of 0 in a release build, so
+/// `0x1.0000000000000002p+0` evaluated to **3.0** -- wrong by a factor of
+/// three, with no diagnostic, in a feature the conformance matrix listed as
+/// passing. Values are checked against arithmetic that cannot use the same
+/// parser, so a repeat of the bug cannot satisfy both sides.
+#[test]
+fn c99_hex_float_long_significand() {
+    let code = r#"
+#include <float.h>
+
+int main(void) {
+    /* Just above 1.0: the case that used to yield 3.0. */
+    double a = 0x1.0000000000000002p+0;
+    if (a < 1.0 || a > 1.0000000001) return 1;
+
+    /* Exactly representable, so the comparison is not a near-miss. */
+    if (0x1.8p+0 != 1.5) return 2;
+    if (0x2p+3 != 16.0) return 3;
+    if (0x.8p+1 != 1.0) return 4;
+    if (0x8.p-3 != 1.0) return 5;
+
+    /* Wider than the mantissa: 2^124 - 1 rounds to 2^124. */
+    double wide = 0xfffffffffffffffffffffffffffffffp0;
+    double two124 = 1.0;
+    for (int i = 0; i < 124; i++) two124 *= 2.0;
+    if (wide != two124) return 6;
+
+    /* The extremes of the exponent range, reached without passing through
+       an intermediate infinity or zero. */
+    if (0x1p-1074 <= 0.0) return 7;          /* smallest subnormal */
+    if (0x1p-1080 != 0.0) return 8;          /* underflows */
+    if (0x1p+2000 <= DBL_MAX) return 9;      /* overflows to infinity */
+
+    /* A 16-digit fraction at float precision too. */
+    float f = 0x1.000002p+0f;
+    if (f <= 1.0f) return 10;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c99_hex_float_long_significand", code, &[]),
+        0
+    );
+}

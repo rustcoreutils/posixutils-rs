@@ -4911,6 +4911,53 @@ fn test_hex_float_with_exponent() {
     assert_eq!(expr.typ, Some(types.double_id));
 }
 
+/// A hex float names a binary value exactly, so a long significand must not be
+/// mangled by the accumulator that reads it.
+///
+/// The significand was read into a `u64` and divided by `1u64 << (4 * digits)`.
+/// At 16 fraction digits that shift is 64, which wraps to a shift of 0 in
+/// release builds -- so `0x1.0000000000000002p0` came out as **3.0** instead of
+/// a value just above 1. Wrong by a factor of three, silently, in a C99
+/// feature the conformance matrix listed as passing.
+#[test]
+fn test_hex_float_long_significand_is_not_mangled() {
+    // 16 fraction digits: exactly the width that used to wrap.
+    let (expr, _types, _, _) = parse_expr("0x1.0000000000000002p+0").unwrap();
+    match expr.kind {
+        ExprKind::FloatLit(v) => {
+            assert!(
+                (v - 1.0).abs() < 1e-15,
+                "0x1.0000000000000002p0 is just above 1.0, got {v}"
+            );
+        }
+        other => panic!("expected FloatLit, got {other:?}"),
+    }
+
+    // 31 significand digits, all set: 2^124 - 1, which rounds to 2^124 at
+    // double precision. Exercises a significand far wider than the mantissa.
+    let (expr, _types, _, _) = parse_expr("0xfffffffffffffffffffffffffffffffp0").unwrap();
+    match expr.kind {
+        ExprKind::FloatLit(v) => assert_eq!(v, f64::powi(2.0, 124), "got {v}"),
+        other => panic!("expected FloatLit, got {other:?}"),
+    }
+}
+
+/// Exponents beyond double's range must not be reached through an infinity.
+#[test]
+fn test_hex_float_extreme_exponents() {
+    for (src, want) in [
+        ("0x1p-1074", f64::from_bits(1)), // smallest subnormal
+        ("0x1p-1080", 0.0),               // underflows to zero
+        ("0x1p+2000", f64::INFINITY),     // overflows to infinity
+    ] {
+        let (expr, _types, _, _) = parse_expr(src).unwrap();
+        match expr.kind {
+            ExprKind::FloatLit(v) => assert_eq!(v, want, "{src}"),
+            other => panic!("expected FloatLit for {src}, got {other:?}"),
+        }
+    }
+}
+
 // ========================================================================
 // Alignment tests
 // ========================================================================

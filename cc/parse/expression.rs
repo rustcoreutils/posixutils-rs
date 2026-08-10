@@ -3416,46 +3416,95 @@ impl<'a> Parser<'a> {
     /// Parse a hexadecimal floating-point literal (C99 feature)
     /// Format: 0x[hex-mantissa]p[±exponent] where mantissa can have decimal point
     /// Value = significand × 2^exponent
-    fn parse_hex_float(s: &str) -> Result<f64, ()> {
-        // Strip 0x prefix
+    /// Decompose a hex float literal into an exact `(mantissa, exp2)` pair,
+    /// where the value is `mantissa * 2^exp2` with `mantissa` an integer.
+    ///
+    /// C99 6.4.4.2 hex floats name a binary value directly, so this is exact
+    /// -- no decimal rounding is involved -- for any literal whose significand
+    /// fits 128 bits. Beyond that the tail is folded into a sticky low bit,
+    /// which is enough to round correctly at every width we support.
+    ///
+    /// Returned separately from [`parse_hex_float`] so a wider target format
+    /// can use the full significand rather than whatever survived an `f64`.
+    fn parse_hex_float_parts(s: &str) -> Result<(u128, i32), ()> {
         let s = s
             .strip_prefix("0x")
             .or_else(|| s.strip_prefix("0X"))
             .ok_or(())?;
 
-        // Find 'p' or 'P' separator for exponent
         let p_pos = s.find(['p', 'P']).ok_or(())?;
         let (mantissa_str, exp_str) = s.split_at(p_pos);
-        let exp_str = &exp_str[1..]; // Skip the 'p'/'P'
+        let exponent: i32 = exp_str[1..].parse().map_err(|_| ())?;
 
-        // Parse mantissa (may have decimal point)
-        let (int_part, frac_part) = if let Some(dot_pos) = mantissa_str.find('.') {
-            (&mantissa_str[..dot_pos], &mantissa_str[dot_pos + 1..])
-        } else {
-            (mantissa_str, "")
+        let (int_part, frac_part) = match mantissa_str.find('.') {
+            Some(dot) => (&mantissa_str[..dot], &mantissa_str[dot + 1..]),
+            None => (mantissa_str, ""),
         };
-
-        // Convert hex mantissa to f64
-        let int_val = if int_part.is_empty() {
-            0u64
-        } else {
-            u64::from_str_radix(int_part, 16).map_err(|_| ())?
-        };
-
-        let mut mantissa = int_val as f64;
-
-        // Add fractional part: each hex digit after dot is worth 1/16, 1/256, etc.
-        if !frac_part.is_empty() {
-            let frac_val = u64::from_str_radix(frac_part, 16).map_err(|_| ())?;
-            let frac_bits = frac_part.len() * 4; // 4 bits per hex digit
-            mantissa += frac_val as f64 / (1u64 << frac_bits) as f64;
+        if int_part.is_empty() && frac_part.is_empty() {
+            return Err(());
         }
 
-        // Parse exponent (base 10 number representing power of 2)
-        let exponent: i32 = exp_str.parse().map_err(|_| ())?;
+        // Accumulate the significand as an integer, remembering how far the
+        // radix point moved. A u128 holds 32 hex digits; the previous code
+        // used a u64 and shifted by `4 * digits`, so a 16-digit fraction
+        // shifted by 64 -- which wraps to a shift of 0 in release, turning
+        // `0x1.0000000000000002p0` into 3.0 rather than a value near 1.
+        let mut mantissa: u128 = 0;
+        let mut exp2 = exponent;
+        let mut sticky = false;
+        let mut seen_digit = false;
 
-        // Calculate final value: mantissa × 2^exponent
-        Ok(mantissa * (2.0_f64).powi(exponent))
+        for (i, c) in int_part.chars().chain(frac_part.chars()).enumerate() {
+            let d = c.to_digit(16).ok_or(())? as u128;
+            let in_fraction = i >= int_part.chars().count();
+
+            if mantissa.leading_zeros() >= 4 {
+                mantissa = (mantissa << 4) | d;
+                if in_fraction {
+                    exp2 -= 4;
+                }
+            } else {
+                // No room left: the digit only contributes to rounding. An
+                // integer digit still scales the value.
+                sticky |= d != 0;
+                if !in_fraction {
+                    exp2 += 4;
+                }
+            }
+            seen_digit = true;
+        }
+        if !seen_digit {
+            return Err(());
+        }
+
+        if sticky {
+            mantissa |= 1;
+        }
+        Ok((mantissa, exp2))
+    }
+
+    /// Parse a hex float literal (C99 6.4.4.2) to `f64`.
+    fn parse_hex_float(s: &str) -> Result<f64, ()> {
+        let (mantissa, exp2) = Self::parse_hex_float_parts(s)?;
+        // `u128 as f64` rounds once, correctly; scaling by a power of two after
+        // that is exact until it overflows or goes subnormal.
+        Ok(Self::scale_pow2(mantissa as f64, exp2))
+    }
+
+    /// Multiply by `2^exp` without overflowing the exponent mid-way.
+    ///
+    /// `powi` on a large exponent produces an infinity before the
+    /// multiplication can bring it back into range, so step through it.
+    fn scale_pow2(mut value: f64, mut exp: i32) -> f64 {
+        while exp > 1023 {
+            value *= f64::powi(2.0, 1023);
+            exp -= 1023;
+        }
+        while exp < -1022 {
+            value *= f64::powi(2.0, -1022);
+            exp += 1022;
+        }
+        value * f64::powi(2.0, exp)
     }
 
     /// Parse an escape sequence starting at position i (after the backslash).

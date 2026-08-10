@@ -12,7 +12,7 @@
 // Note: These are single-threaded tests that verify correct code generation.
 //
 
-use crate::common::compile_and_run;
+use crate::common::{compile_and_run, compile_and_run_optimized};
 
 // ============================================================================
 // Mega-test: C11 atomic operations (__c11_atomic_* builtins)
@@ -339,4 +339,137 @@ int main(void) {
 }
 "#;
     assert_eq!(compile_and_run("stdatomic_mega", code, &[]), 0);
+}
+
+// ============================================================================
+// Register clobbers and operand widths
+// ============================================================================
+
+/// Regression test: the atomic emitters use RAX/RCX (and R8/R9 for the CAS
+/// operand spill) on x86_64, and X0/X1/X2/X8 on aarch64, as fixed scratch --
+/// all of which are in the allocatable pool. Neither register allocator
+/// declared them, so any pseudo the allocator parked there whose live range
+/// crossed an atomic operation was silently destroyed.
+///
+/// This needs enough simultaneously-live values to push the allocator into
+/// those registers; a small function never hits it, which is why the existing
+/// atomics tests all passed.
+#[test]
+fn c11_atomics_do_not_clobber_live_values() {
+    let code = r#"
+#include <stdatomic.h>
+
+atomic_int g;
+
+/* Six live ints bracketing a fetch_add. Before the fix this returned 22
+   instead of 31: the atomic destroyed values held in RAX/RCX. */
+static int across_fetch_add(int a, int b, int c, int d, int e, int f) {
+    int old = __c11_atomic_fetch_add(&g, 1, __ATOMIC_SEQ_CST);
+    return old + a + b + c + d + e + f;
+}
+
+/* CAS spills three operands and writes RAX, RCX, R8 and R9. */
+static int across_cas(int a, int b, int c, int d, int e, int f) {
+    int expected = 100;
+    __c11_atomic_compare_exchange_strong(&g, &expected, 200,
+                                         __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    return a + b + c + d + e + f;
+}
+
+static int across_exchange(int a, int b, int c, int d, int e, int f) {
+    int old = __c11_atomic_exchange(&g, 7, __ATOMIC_SEQ_CST);
+    return old + a + b + c + d + e + f;
+}
+
+int main(void) {
+    __c11_atomic_store(&g, 10, __ATOMIC_SEQ_CST);
+    if (across_fetch_add(1, 2, 3, 4, 5, 6) != 31) return 1;
+
+    __c11_atomic_store(&g, 100, __ATOMIC_SEQ_CST);
+    if (across_cas(1, 2, 3, 4, 5, 6) != 21) return 2;
+    if (__c11_atomic_load(&g, __ATOMIC_SEQ_CST) != 200) return 3;
+
+    __c11_atomic_store(&g, 50, __ATOMIC_SEQ_CST);
+    if (across_exchange(1, 2, 3, 4, 5, 6) != 71) return 4;
+    if (__c11_atomic_load(&g, __ATOMIC_SEQ_CST) != 7) return 5;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c11_atomics_clobber", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("c11_atomics_clobber_opt", code),
+        0
+    );
+}
+
+/// Regression test: every x86_64 atomic emitter widened its *memory* operand to
+/// 32 bits (`insn.size.max(32)`), so an 8- or 16-bit atomic read-modify-write
+/// read and wrote the adjacent bytes. A `lock xaddl` on a byte field carried
+/// into its neighbour.
+///
+/// The narrow result also has to be sign- or zero-extended to fill the register
+/// the consumer reads, with the same signedness rule ordinary loads use.
+#[test]
+fn c11_atomics_narrow_widths_do_not_touch_neighbours() {
+    let code = r#"
+#include <stdatomic.h>
+
+/* Four adjacent atomic bytes. Incrementing `a` from 255 wraps it to 0; if the
+   operation is 32 bits wide, the carry lands in `b`. */
+struct Bytes { _Atomic unsigned char a, b, c, d; };
+static struct Bytes bytes = { 255, 10, 20, 30 };
+
+struct Shorts { _Atomic unsigned short a, b; };
+static struct Shorts shorts = { 65535, 1234 };
+
+_Atomic signed char sc;
+_Atomic unsigned char uc;
+_Atomic short sh;
+
+int main(void) {
+    /* ---- carry must not escape the byte ---- */
+    __c11_atomic_fetch_add(&bytes.a, 1, __ATOMIC_SEQ_CST);
+    if (bytes.a != 0) return 1;
+    if (bytes.b != 10) return 2;
+    if (bytes.c != 20) return 3;
+    if (bytes.d != 30) return 4;
+
+    __c11_atomic_fetch_add(&shorts.a, 1, __ATOMIC_SEQ_CST);
+    if (shorts.a != 0) return 5;
+    if (shorts.b != 1234) return 6;
+
+    /* Bit operations go through the CAS loop; same requirement. */
+    bytes.b = 0xFF;
+    __c11_atomic_fetch_and(&bytes.b, 0x0F, __ATOMIC_SEQ_CST);
+    if (bytes.b != 0x0F) return 7;
+    if (bytes.c != 20) return 8;
+
+    bytes.c = 0;
+    __c11_atomic_fetch_or(&bytes.c, 0xF0, __ATOMIC_SEQ_CST);
+    if (bytes.c != 0xF0) return 9;
+    if (bytes.d != 30) return 10;
+
+    /* An exchange writes the whole operand. */
+    __c11_atomic_exchange(&bytes.d, 99, __ATOMIC_SEQ_CST);
+    if (bytes.d != 99) return 11;
+    if (bytes.c != 0xF0) return 12;
+
+    /* ---- narrow results carry the right signedness ---- */
+    __c11_atomic_store(&sc, -100, __ATOMIC_SEQ_CST);
+    if (__c11_atomic_fetch_add(&sc, 1, __ATOMIC_SEQ_CST) != -100) return 20;
+    if (__c11_atomic_load(&sc, __ATOMIC_SEQ_CST) != -99) return 21;
+
+    __c11_atomic_store(&uc, 200, __ATOMIC_SEQ_CST);
+    if (__c11_atomic_fetch_add(&uc, 1, __ATOMIC_SEQ_CST) != 200) return 22;
+
+    __c11_atomic_store(&sh, -30000, __ATOMIC_SEQ_CST);
+    if (__c11_atomic_fetch_sub(&sh, 1, __ATOMIC_SEQ_CST) != -30000) return 23;
+    if (__c11_atomic_load(&sh, __ATOMIC_SEQ_CST) != -30001) return 24;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c11_atomics_narrow", code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("c11_atomics_narrow_opt", code), 0);
 }

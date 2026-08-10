@@ -20,25 +20,49 @@
 
 use crate::common::{compile_expect_ok, preprocess_text, run_c17};
 
-/// Every `-std=` spelling c17 accepts, C17 and older alike.
-const ACCEPTED: &[&str] = &[
+/// The `-std=` spellings that name C17 itself. Exhaustive.
+const C17_SPELLINGS: &[&str] = &[
     "c17",
     "c18",
     "gnu17",
     "gnu18",
     "iso9899:2017",
+    "iso9899:2018",
+];
+
+/// The `-std=` spellings naming an older revision. Exhaustive.
+///
+/// Together with `C17_SPELLINGS` this is every spelling `classify_std`
+/// accepts, so "every accepted spelling behaves identically" is a claim these
+/// tests actually check rather than sample.
+const OLDER_SPELLINGS: &[&str] = &[
     "c89",
     "c90",
+    "c9x",
+    "c99",
+    "c1x",
+    "c11",
     "gnu89",
     "gnu90",
-    "c99",
+    "gnu9x",
     "gnu99",
-    "c11",
+    "gnu1x",
     "gnu11",
     "iso9899:1990",
+    "iso9899:199409",
+    "iso9899:199x",
     "iso9899:1999",
     "iso9899:2011",
 ];
+
+/// Every `-std=` spelling c17 accepts.
+fn accepted() -> Vec<&'static str> {
+    C17_SPELLINGS
+        .iter()
+        .chain(OLDER_SPELLINGS)
+        .copied()
+        .collect()
+}
 
 /// Expand a single macro under a `-std=` spelling and return the replacement.
 ///
@@ -83,7 +107,7 @@ fn c17_version_macro_is_c17_whatever_std_says() {
         "201710L"
     );
 
-    for spec in ACCEPTED {
+    for spec in accepted() {
         let got = expand_under(
             "std_version",
             Some(&format!("-std={spec}")),
@@ -103,7 +127,7 @@ fn c17_never_defines_strict_ansi() {
         "__STRICT_ANSI__"
     ));
 
-    for spec in ACCEPTED {
+    for spec in accepted() {
         let got = expand_under(
             "strict_ansi",
             Some(&format!("-std={spec}")),
@@ -221,7 +245,7 @@ fn c17_rejects_an_unknown_std() {
 #[test]
 fn c17_accepts_every_documented_std_spelling() {
     // The negative test above cannot pass vacuously: these must all work.
-    for spec in ACCEPTED {
+    for spec in accepted() {
         compile_expect_ok(
             &format!("std_ok_{}", spec.replace(':', "_")),
             "int main(void) { return 0; }\n",
@@ -283,7 +307,7 @@ fn c17_glibc_minor_matches_the_host() {
 /// so the least it can do is not pretend otherwise.
 #[test]
 fn c17_warns_that_an_older_std_was_not_honoured() {
-    for spec in ["c89", "c90", "gnu89", "c99", "gnu99", "c11", "gnu11"] {
+    for spec in OLDER_SPELLINGS {
         let run = run_c17(&[&format!("-std={spec}"), "--print-targets"]);
         assert!(run.success, "-std={spec} must still be accepted");
         assert!(
@@ -297,7 +321,7 @@ fn c17_warns_that_an_older_std_was_not_honoured() {
 /// A C17 spelling asks for what we compile, so there is nothing to report.
 #[test]
 fn c17_does_not_warn_for_a_c17_std() {
-    for spec in ["c17", "c18", "gnu17", "gnu18", "iso9899:2017"] {
+    for spec in C17_SPELLINGS {
         let run = run_c17(&[&format!("-std={spec}"), "--print-targets"]);
         assert!(run.success, "-std={spec} must be accepted");
         assert!(

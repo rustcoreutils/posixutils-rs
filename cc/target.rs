@@ -40,19 +40,24 @@ pub enum StdRequest {
 /// error. A typo must not pass silently — accepting and discarding a `-std=`
 /// is how `__STDC_VERSION__` once came to disagree with the binary's own name.
 pub fn classify_std(spec: &str) -> Option<StdRequest> {
-    let name = match spec.strip_prefix("gnu") {
-        Some(rest) => rest,
-        None => match spec.strip_prefix('c') {
-            Some(rest) => rest,
-            None => spec.strip_prefix("iso9899:")?,
-        },
-    };
+    // The revision names are keyed to their prefix, as in gcc: `c` and `gnu`
+    // take the short forms, `iso9899:` the years. Accepting any number after
+    // any prefix would let `c1990` or `iso9899:99` through -- spellings no
+    // compiler defines, and far likelier a typo than a request.
+    if let Some(year) = spec.strip_prefix("iso9899:") {
+        return match year {
+            "2017" | "2018" => Some(StdRequest::C17),
+            "1990" | "199409" | "199x" | "1999" | "2011" => Some(StdRequest::Older),
+            _ => None,
+        };
+    }
 
-    match name {
-        "17" | "18" | "2017" | "2018" => Some(StdRequest::C17),
-        "89" | "90" | "1990" | "199409" | "99" | "9x" | "1999" | "11" | "1x" | "2011" => {
-            Some(StdRequest::Older)
-        }
+    let rev = spec
+        .strip_prefix("gnu")
+        .or_else(|| spec.strip_prefix('c'))?;
+    match rev {
+        "17" | "18" => Some(StdRequest::C17),
+        "89" | "90" | "9x" | "99" | "1x" | "11" => Some(StdRequest::Older),
         _ => None,
     }
 }
@@ -290,17 +295,45 @@ mod tests {
         for spec in [
             "c89",
             "c90",
+            "c9x",
+            "c99",
+            "c1x",
+            "c11",
             "gnu89",
             "gnu90",
-            "c99",
+            "gnu9x",
             "gnu99",
-            "c11",
+            "gnu1x",
             "gnu11",
             "iso9899:1990",
+            "iso9899:199409",
+            "iso9899:199x",
             "iso9899:1999",
             "iso9899:2011",
         ] {
             assert_eq!(classify_std(spec), Some(StdRequest::Older), "{spec}");
+        }
+    }
+
+    /// A revision name belongs to its prefix. Mixing them is a typo, and gcc
+    /// rejects each of these too.
+    #[test]
+    fn test_classify_std_does_not_mix_prefix_and_revision_forms() {
+        for spec in [
+            "c1990",
+            "c199409",
+            "c1999",
+            "c2011",
+            "c2017",
+            "gnu1990",
+            "gnu1999",
+            "iso9899:89",
+            "iso9899:90",
+            "iso9899:99",
+            "iso9899:11",
+            "iso9899:17",
+        ] {
+            assert!(classify_std(spec).is_none(), "{spec} should be rejected");
         }
     }
 

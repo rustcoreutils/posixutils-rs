@@ -261,6 +261,19 @@ struct Args {
 /// The `-Wno-` name for the "`-std=` was not honoured" warning.
 const STD_DIALECT_WARNING: &str = "c17-dialect";
 
+/// Print a warning about the command line, unless `-w` turned warnings off.
+///
+/// These have no source position -- they are about the invocation, not a
+/// translation unit -- so they cannot go through `diag`, which keys everything
+/// on a `Position`. They still have to answer to `-w`, or its own help text
+/// ("Suppress all warnings") is untrue.
+fn driver_warning(msg: &str) {
+    if diag::warnings_suppressed() {
+        return;
+    }
+    eprintln!("c17: {}: {}", gettext("warning"), msg);
+}
+
 impl Args {
     /// Classify `-std=`, if one was given.
     ///
@@ -772,10 +785,9 @@ fn link_objects(
             link_cmd.arg("-Wl,-Bstatic");
         }
         Some("static") => {
-            eprintln!(
-                "{}",
-                gettext("c17: warning: -B static: this platform's linker cannot prefer archives")
-            );
+            driver_warning(&gettext(
+                "-B static: this platform's linker cannot prefer archives",
+            ));
         }
         Some("dynamic") if gnu_binding => {
             link_cmd.arg("-Wl,-Bdynamic");
@@ -1339,14 +1351,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // __STDC_VERSION__ disagree with the binary's own name once already.
         Ok(Some(StdRequest::Older)) if !args.warning_suppressed(STD_DIALECT_WARNING) => {
             let spec = args.c17_std.as_deref().unwrap_or_default();
-            eprintln!(
-                "c17: {}: {}",
-                gettext("warning"),
-                gettext_args(
-                    "'-std={0}' ignored; c17 compiles C17 (ISO/IEC 9899:2018) only",
-                    &[spec]
-                )
-            );
+            driver_warning(&gettext_args(
+                "'-std={0}' ignored; c17 compiles C17 (ISO/IEC 9899:2018) only",
+                &[spec],
+            ));
         }
         Ok(_) => {}
     }
@@ -1399,12 +1407,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for op in &operands {
         if op.kind == OperandKind::Unknown {
-            eprintln!(
-                "c17: {}: {}: {}",
-                gettext("warning"),
+            driver_warning(&format!(
+                "{}: {}",
                 gettext("unrecognized file type"),
                 op.path
-            );
+            ));
         }
     }
 
@@ -1418,12 +1425,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // spec leaves this unspecified (88338-88343); say so rather than silently
     // producing one object.
     if args.compile_only && args.output.is_some() && source_count > 1 {
-        eprintln!(
-            "c17: {}: {} ({})",
-            gettext("warning"),
+        driver_warning(&format!(
+            "{} ({})",
             gettext("-o applies only to the last source operand with -c"),
             source_count
-        );
+        ));
     }
 
     if let Some(mode) = args.binding.as_deref() {

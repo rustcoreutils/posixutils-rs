@@ -120,3 +120,70 @@ fn codegen_x86_64_long_double_complex_uses_x87() {
         body
     );
 }
+
+/// A `_Complex` that runs out of V registers is laid on the stack, and both
+/// sides have to agree about it (#H13).
+///
+/// The caller used to push the argument pseudo twice and move it with
+/// `emit_fp_move`, which for a complex pseudo -- holding the value's *address*
+/// -- wrote the pointer's bit pattern into both halves. The callee's prologue
+/// simply skipped the copy, leaving the parameter uninitialized.
+///
+/// Runs from any host via `--target`.
+#[test]
+fn codegen_aarch64_stacked_complex_argument_is_dereferenced() {
+    let src = r#"
+        double _Complex sink(double _Complex a, double _Complex b,
+                             double _Complex c, double _Complex d,
+                             double _Complex e);
+        double _Complex call5(double _Complex a, double _Complex b,
+                              double _Complex c, double _Complex d,
+                              double _Complex e) {
+            return sink(a, b, c, d, e);
+        }
+    "#;
+    let asm = super::asm_probe::asm_for("stacked_complex", "aarch64-unknown-linux-gnu", src);
+    let body = super::asm_probe::body_of(&asm, "call5");
+
+    // The fifth complex goes to the outgoing stack area, written as two
+    // separate elements loaded out of the value's address.
+    assert!(
+        body.contains("[sp]") || body.contains("[sp, #0]"),
+        "the stacked complex must be written to the outgoing area:\n{body}"
+    );
+    assert!(
+        body.contains("ldr d") || body.contains("ldr s"),
+        "both elements must be loaded from the value's address:\n{body}"
+    );
+    // Writing the address itself into the slot is the bug this pins.
+    assert!(
+        !body.contains("fmov d16, x"),
+        "the argument's address must not be stored as if it were the value:\n{body}"
+    );
+}
+
+/// AAPCS64 §6.4.2: once any argument is laid out on the stack, NSRN is 8, so
+/// every later floating-point argument goes to the stack too -- the registers
+/// the over-large argument did not fit into are *not* reused. System V does the
+/// opposite, which is why the x86_64 fix could not simply be copied.
+#[test]
+fn codegen_aarch64_nsrn_saturates_after_a_stacked_argument() {
+    let src = r#"
+        void sink(double a, double b, double c, double d,
+                  double e, double f, double g,
+                  double _Complex z, double after);
+        void call(double _Complex z) {
+            sink(1, 2, 3, 4, 5, 6, 7, z, 9.0);
+        }
+    "#;
+    let asm = super::asm_probe::asm_for("nsrn_saturate", "aarch64-unknown-linux-gnu", src);
+    let body = super::asm_probe::body_of(&asm, "call");
+
+    // Seven doubles consume d0-d6. The complex needs two registers and only d7
+    // remains, so it is stacked -- and `after` must then be stacked as well
+    // rather than taking the free d7.
+    assert!(
+        !body.contains("d7,"),
+        "no floating-point argument may use d7 after an argument is stacked:\n{body}"
+    );
+}

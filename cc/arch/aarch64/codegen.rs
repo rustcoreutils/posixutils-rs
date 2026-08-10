@@ -963,6 +963,50 @@ impl Aarch64CodeGen {
     }
 
     /// Move arguments from registers to their allocated stack locations
+    /// Copy a stack-passed two-element floating-point argument (a `_Complex`
+    /// or a two-element HFA) into the parameter's local.
+    ///
+    /// The register-passed path stores straight from the argument registers;
+    /// this is the overflow case, where the value already sits in the caller's
+    /// outgoing area and only needs moving to where the body looks for it.
+    /// V16 is a scratch V register, not part of the argument sequence.
+    fn copy_stacked_pair_to_local(
+        &mut self,
+        func: &Function,
+        param_idx: usize,
+        typ: TypeId,
+        types: &TypeTable,
+        pseudo: PseudoId,
+    ) {
+        let param_name = &func.params[param_idx].0;
+        let Some(local) = func.locals.get(param_name) else {
+            return;
+        };
+        let Some(&Loc::Stack(local_off)) = self.locations.get_ref(local.sym) else {
+            return;
+        };
+        // The incoming argument's slot, as assigned by allocate_arguments.
+        let Some(&Loc::Stack(incoming_off)) = self.locations.get_ref(pseudo) else {
+            return;
+        };
+
+        let (fp_size, elem_bytes) = complex_fp_info(types, &self.base.target, typ);
+
+        for step in 0..2 {
+            let delta = (step as i32) * elem_bytes;
+            self.push_lir(Aarch64Inst::LdrFp {
+                size: fp_size,
+                dst: VReg::V16,
+                addr: self.stack_mem_plus(incoming_off, delta),
+            });
+            self.push_lir(Aarch64Inst::StrFp {
+                size: fp_size,
+                src: VReg::V16,
+                addr: self.stack_mem_plus(local_off, delta),
+            });
+        }
+    }
+
     fn store_args_to_stack(&mut self, func: &Function, types: &TypeTable, alloc: &RegAlloc) {
         // AAPCS64: integer args in X0-X7, FP args in D0-D7 (separate counters)
         // Note: sret uses X8, so regular args still start at X0
@@ -1057,6 +1101,17 @@ impl Aarch64CodeGen {
                                         });
                                     }
                                 }
+                            } else {
+                                // AAPCS64 §6.4.2: the argument did not fit in
+                                // the V registers, so the caller laid it on the
+                                // stack. The prologue still has to copy it into
+                                // the parameter's local, which is what the body
+                                // reads -- without this the local was left
+                                // uninitialized and the parameter read as
+                                // garbage (#H13). regalloc has already assigned
+                                // the incoming slot; find it and shuttle both
+                                // elements through V16.
+                                self.copy_stacked_pair_to_local(func, i, *typ, types, pseudo.id);
                             }
                             fp_arg_idx += 2;
                         } else if is_fp {

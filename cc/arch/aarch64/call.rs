@@ -148,6 +148,11 @@ impl Aarch64CodeGen {
             is_fp: bool,
             size: u32,
             typ: Option<TypeId>,
+            /// A `_Complex` laid on the stack: the pseudo holds the value's
+            /// *address*, and both elements must be dereferenced out of it
+            /// into one 2-element slot. Pushing the pseudo twice as if it were
+            /// two scalars wrote the pointer's bit pattern into both halves.
+            complex_pair: bool,
         }
         let mut stack_args_info: Vec<StackArg> = Vec::new();
         let mut int_arg_idx = 0;
@@ -206,19 +211,21 @@ impl Aarch64CodeGen {
                     }
                     fp_arg_idx += 2;
                 } else {
-                    // Complex on stack needs 2 slots
                     stack_args_info.push(StackArg {
                         pseudo: arg,
                         is_fp: true,
                         size: arg_size,
                         typ: arg_type,
+                        complex_pair: true,
                     });
-                    stack_args_info.push(StackArg {
-                        pseudo: arg,
-                        is_fp: true,
-                        size: arg_size,
-                        typ: arg_type,
-                    });
+                    // AAPCS64 §6.4.2: once anything is laid out on the stack,
+                    // NSRN becomes 8 and every later floating-point argument
+                    // follows it there. Unlike System V, the registers this
+                    // argument did not fit into are *not* left available. The
+                    // callee's allocator already implements this rule; without
+                    // it here the two sides disagreed about where the next FP
+                    // argument lived.
+                    fp_arg_idx = fp_arg_regs.len();
                 }
             } else if is_fp {
                 if fp_arg_idx < fp_arg_regs.len() {
@@ -235,6 +242,7 @@ impl Aarch64CodeGen {
                         is_fp: true,
                         size: arg_size,
                         typ: arg_type,
+                        complex_pair: false,
                     });
                 }
             } else if arg_type.is_some_and(|t| types.kind(t) == crate::types::TypeKind::Int128) {
@@ -275,6 +283,7 @@ impl Aarch64CodeGen {
                         is_fp: false,
                         size: 128,
                         typ: arg_type,
+                        complex_pair: false,
                     });
                 }
             } else if int_arg_idx < int_arg_regs.len() {
@@ -286,6 +295,7 @@ impl Aarch64CodeGen {
                     is_fp: false,
                     size: arg_size,
                     typ: arg_type,
+                    complex_pair: false,
                 });
             }
         }
@@ -357,6 +367,37 @@ impl Aarch64CodeGen {
                 offset += 16;
                 continue;
             }
+            if stack_arg.complex_pair {
+                // The pseudo holds the *address* of the complex value, so both
+                // elements are loaded out of it -- the same dereference
+                // setup_complex_arg performs for the register-passed case.
+                let typ = stack_arg.typ.expect("complex arg without a type");
+                let (fp_size, imag_offset) = complex_fp_info(types, &self.base.target, typ);
+                let addr = self.load_complex_arg_address(stack_arg.pseudo);
+
+                for (step, elem_off) in [(0i32, 0i32), (1, imag_offset)].into_iter() {
+                    self.push_lir(Aarch64Inst::LdrFp {
+                        size: fp_size,
+                        dst: VReg::V16,
+                        addr: MemAddr::BaseOffset {
+                            base: addr,
+                            offset: elem_off,
+                        },
+                    });
+                    self.push_lir(Aarch64Inst::StrFp {
+                        size: fp_size,
+                        src: VReg::V16,
+                        addr: MemAddr::BaseOffset {
+                            base: Reg::SP,
+                            offset: offset + step * imag_offset,
+                        },
+                    });
+                }
+                // AAPCS64 rounds each stacked argument up to 8 bytes; the
+                // callee's allocator uses the same rule, so the two agree.
+                offset += ((2 * imag_offset) + 7) & !7;
+                continue;
+            }
             if stack_arg.is_fp {
                 // Use type info for proper FP size determination
                 self.emit_fp_move(
@@ -409,6 +450,35 @@ impl Aarch64CodeGen {
     }
 
     /// Set up a complex number argument (real + imaginary in two V registers)
+    /// Load the address a complex-argument pseudo holds into a scratch
+    /// register, and return that register.
+    ///
+    /// `Linearizer::complex_operand_addr` makes the pseudo an address, so
+    /// every consumer has to dereference it; reading the slot as though it
+    /// were the value only appeared to work while the pointer stayed in a
+    /// register.
+    fn load_complex_arg_address(&mut self, arg: PseudoId) -> Reg {
+        match self.get_location(arg) {
+            Loc::Reg(r) => r,
+            Loc::Stack(offset) => {
+                let actual = self.stack_offset(offset);
+                self.push_lir(Aarch64Inst::Ldr {
+                    size: OperandSize::B64,
+                    dst: Reg::X9,
+                    addr: MemAddr::BaseOffset {
+                        base: Reg::X29,
+                        offset: actual,
+                    },
+                });
+                Reg::X9
+            }
+            _ => {
+                self.emit_move(arg, Reg::X9, 64);
+                Reg::X9
+            }
+        }
+    }
+
     fn setup_complex_arg(
         &mut self,
         arg: PseudoId,

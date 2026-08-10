@@ -14,13 +14,14 @@ use crate::os::{getpgrp, is_process_in_foreground, tcsetpgrp};
 use crate::shell::Shell;
 use cli::terminal::read_nonblocking_char;
 use cli::vi::{Action, ViEditor};
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use os::signals::{
     handle_signal_ignore, handle_signal_write_to_signal_buffer, setup_signal_handling, Signal,
 };
 use std::error::Error;
+use std::fs::File;
 use std::io;
-use std::io::{IsTerminal, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::os::fd::AsRawFd;
 use std::time::Duration;
 
@@ -35,6 +36,37 @@ pub mod pattern;
 mod shell;
 mod utils;
 mod wordexp;
+
+/// Reads a `command_file` operand, pairing each failure with the exit status
+/// POSIX prescribes for it: 127 when the file could not be found, 126 when it
+/// was found but cannot serve as a script, and 128 only for an unrecoverable
+/// read error. The distinction is which step failed, not which errno came
+/// back, so the open and the read are done separately.
+fn read_command_file(path: &str) -> Result<String, (io::Error, i32)> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) => {
+            let status = if err.kind() == io::ErrorKind::NotFound {
+                127
+            } else {
+                126
+            };
+            return Err((err, status));
+        }
+    };
+    // Opening a directory succeeds; it still cannot be executed, so it is a
+    // 126 rather than the read error it would otherwise look like.
+    if file.metadata().is_ok_and(|metadata| metadata.is_dir()) {
+        return Err((io::Error::other(gettext("Is a directory")), 126));
+    }
+    let mut contents = String::new();
+    match file.read_to_string(&mut contents) {
+        Ok(_) => Ok(contents),
+        // Not text at all: an [ENOEXEC] error, which POSIX maps to 126.
+        Err(err) if err.kind() == io::ErrorKind::InvalidData => Err((err, 126)),
+        Err(err) => Err((err, 128)),
+    }
+}
 
 fn execute_string(string: &str, shell: &mut Shell) {
     match shell.execute_program(string) {
@@ -364,20 +396,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             ExecutionMode::ReadCommandsFromString(command_string) => {
                 execute_string(&command_string, &mut shell);
             }
-            ExecutionMode::ReadFromFile(file) => match std::fs::read_to_string(&file) {
+            ExecutionMode::ReadFromFile(file) => match read_command_file(&file) {
                 Ok(file_contents) => execute_string(&file_contents, &mut shell),
-                Err(err) => {
+                Err((err, status)) => {
                     eprintln!("sh: {file}: {err}");
-                    // POSIX EXIT STATUS: 127 when the command_file could not be
-                    // found, 128 for an unrecoverable read error, otherwise
-                    // treat it as not executable (ENOEXEC-like) -> 126.
-                    let status = match err.kind() {
-                        std::io::ErrorKind::NotFound => 127,
-                        std::io::ErrorKind::InvalidData | std::io::ErrorKind::PermissionDenied => {
-                            126
-                        }
-                        _ => 128,
-                    };
                     std::process::exit(status);
                 }
             },

@@ -2597,4 +2597,18 @@ mod audit_regressions {
         // An assignment has its own status, taken from the substitution too.
         test_script("x=$(exit 5)\necho \"[$?]\"\n", "[5]\n");
     }
+
+    #[test]
+    fn a_command_file_that_cannot_be_used_exits_126() {
+        // POSIX: 127 only when the command_file could not be found, 126 when
+        // it was found but could not be invoked. Statuses above 128 are
+        // reserved for death by a signal.
+        set_env_vars();
+        let dir = Path::new(concat!(env!("CARGO_TARGET_TMPDIR"), "/sh_test_write_dir"))
+            .join("command_file_status");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        expect_cli_exit_code(vec![dir.display().to_string()], "", 126);
+        expect_cli_exit_code(vec![format!("{}/no/such/file", dir.display())], "", 127);
+    }
 }

@@ -473,3 +473,110 @@ int main(void) {
     assert_eq!(compile_and_run("c11_atomics_narrow", code, &[]), 0);
     assert_eq!(compile_and_run_optimized("c11_atomics_narrow_opt", code), 0);
 }
+
+// ============================================================================
+// `_Atomic` through ordinary operators (audit #X1)
+// ============================================================================
+
+/// Every operator form on an `_Atomic` object, at every lock-free width and
+/// through every lvalue shape.
+///
+/// These are behavioral, so they establish that the *values* are right. That
+/// the operations are actually atomic is asserted on the generated assembly in
+/// `cc/tests/codegen/atomics_asm.rs` -- a behavioral test cannot see the
+/// difference, which is why the pre-existing `_Atomic int x; x = 100;` case
+/// passed for years against a plain `movl`.
+#[test]
+fn c11_atomic_operators_mega() {
+    let code = r#"
+#include <stdatomic.h>
+
+atomic_int g;
+_Atomic unsigned char b;
+_Atomic short h;
+_Atomic long l;
+_Atomic unsigned u;
+_Atomic double d;
+_Atomic _Bool flag;
+
+struct S { _Atomic int a; _Atomic int b; };
+static struct S s;
+static _Atomic int obj = 7;
+static _Atomic int arr[4];
+
+static int arr_ints[8] = {0,1,2,3,4,5,6,7};
+_Atomic(int *) p;
+
+int main(void) {
+    /* ---------- 1-19: int, every operator ---------- */
+    g = 10;      if (g != 10) return 1;
+    g += 5;      if (g != 15) return 2;
+    g -= 3;      if (g != 12) return 3;
+    g *= 2;      if (g != 24) return 4;
+    g /= 4;      if (g != 6)  return 5;
+    g %= 4;      if (g != 2)  return 6;
+    g <<= 3;     if (g != 16) return 7;
+    g >>= 2;     if (g != 4)  return 8;
+    g &= 6;      if (g != 4)  return 9;
+    g |= 1;      if (g != 5)  return 10;
+    g ^= 3;      if (g != 6)  return 11;
+
+    /* ---------- 20-29: the value of the expression ---------- */
+    g = 10;
+    if ((g += 5) != 15) return 20;   /* compound yields the NEW value */
+    if (g++ != 15) return 21;        /* postfix yields the OLD value */
+    if (g != 16) return 22;
+    if (++g != 17) return 23;        /* prefix yields the NEW value */
+    if (g-- != 17) return 24;
+    if (--g != 15) return 25;
+    if ((g = 42) != 42) return 26;   /* plain assignment yields the value */
+
+    /* ---------- 30-39: narrow widths wrap correctly ---------- */
+    b = 250; b += 3;  if (b != 253) return 30;
+    b++;              if (b != 254) return 31;
+    b = 255; b++;     if (b != 0)   return 32;   /* wraps, no carry out */
+    h = -30000; h -= 1; if (h != -30001) return 33;
+    l = 1; l <<= 40;  if (l != (1L << 40)) return 34;
+    u = 0; u--;       if (u != 0xFFFFFFFFu) return 35;
+
+    /* ---------- 40-49: floating point goes through the CAS loop ---- */
+    d = 1.5;  d += 2.25;  if (d != 3.75) return 40;
+    d *= 2.0;             if (d != 7.5)  return 41;
+    d -= 0.5;             if (d != 7.0)  return 42;
+    d /= 2.0;             if (d != 3.5)  return 43;
+
+    /* ---------- 50-59: _Bool renormalizes ---------- */
+    flag = 0;
+    flag++;            if (flag != 1) return 50;
+    if (++flag != 1)   return 51;    /* already 1, stays 1 */
+
+    /* ---------- 60-69: member lvalues ---------- */
+    s.a = 1;  s.a += 4;  if (s.a != 5) return 60;
+    s.b = 2;  s.b++;     if (s.b != 3) return 61;
+    if (s.a != 5) return 62;         /* neighbour untouched */
+
+    /* ---------- 70-79: deref and index lvalues ---------- */
+    {
+        _Atomic int *q = &obj;
+        *q += 3;   if (*q != 10) return 70;
+        (*q)++;    if (obj != 11) return 71;
+    }
+    arr[1] = 5;  arr[1] *= 3;  if (arr[1] != 15) return 72;
+    if (arr[0] != 0 || arr[2] != 0) return 73;
+
+    /* ---------- 80-89: atomic pointer arithmetic scales ---------- */
+    p = arr_ints;
+    p += 3;  if (*p != 3) return 80;
+    p++;     if (*p != 4) return 81;
+    p--;     if (*p != 3) return 82;
+    p -= 2;  if (*p != 1) return 83;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c11_atomic_operators", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("c11_atomic_operators_opt", code),
+        0
+    );
+}

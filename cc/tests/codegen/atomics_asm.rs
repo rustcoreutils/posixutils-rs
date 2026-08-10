@@ -144,3 +144,95 @@ int f(void) { return __c11_atomic_fetch_or(&g, 8, __ATOMIC_SEQ_CST); }
         super::asm_probe::body_of(&asm, "f")
     );
 }
+
+/// The audit item this whole series exists for: `_Atomic` accessed through
+/// *ordinary operators* must produce the same hardware guarantees as the
+/// `<stdatomic.h>` builtins. It used to emit a plain load and a plain store.
+#[test]
+fn codegen_atomic_operators_are_atomic() {
+    let src = r#"
+#include <stdatomic.h>
+atomic_int g;
+void assign(void)   { g = 5; }
+void add(void)      { g += 3; }
+void sub(void)      { g -= 3; }
+void and_(void)     { g &= 7; }
+void mul(void)      { g *= 3; }
+void shl(void)      { g <<= 2; }
+void preinc(void)   { ++g; }
+void postinc(void)  { g++; }
+void predec(void)   { --g; }
+int  read(void)     { return g; }
+
+/* Control: identical shapes on a plain int. */
+int plain;
+void plain_assign(void) { plain = 5; }
+void plain_add(void)    { plain += 3; }
+void plain_inc(void)    { plain++; }
+int  plain_read(void)   { return plain; }
+"#;
+
+    let asm = asm_for("atomic_ops_operators_x86", X86_64_LINUX, src);
+
+    // A sequentially consistent store is an exchange, not a mov.
+    assert_body_contains(&asm, "assign", "xchg", "`g = 5` must be a seq_cst store");
+    // Native read-modify-write forms.
+    for f in ["add", "sub", "preinc", "postinc", "predec"] {
+        assert_body_contains(&asm, f, "lock xadd", "must be one locked RMW");
+    }
+    // Operators with no native atomic form use a locked CAS loop.
+    for f in ["and_", "mul", "shl"] {
+        assert_body_contains(&asm, f, "lock cmpxchg", "must use a locked CAS loop");
+    }
+
+    // The controls must stay unsynchronized, or the assertions above prove
+    // nothing about `_Atomic` in particular.
+    for f in ["plain_assign", "plain_add", "plain_inc"] {
+        assert_body_lacks(&asm, f, "lock", "a plain int must not be locked");
+        assert_body_lacks(&asm, f, "xchg", "nor exchanged");
+    }
+
+    let asm = asm_for("atomic_ops_operators_arm", AARCH64_LINUX, src);
+    assert_body_contains(&asm, "assign", "stlr", "seq_cst store on aarch64");
+    assert_body_contains(&asm, "read", "ldar", "seq_cst load on aarch64");
+    for f in ["add", "sub", "preinc", "postinc", "mul", "and_"] {
+        assert_body_contains(&asm, f, "ldaxr", "RMW is an LL/SC loop");
+        assert_body_contains(&asm, f, "stlxr", "RMW is an LL/SC loop");
+    }
+    assert_body_lacks(
+        &asm,
+        "plain_add",
+        "ldaxr",
+        "a plain int must not be exclusive",
+    );
+    assert_body_lacks(&asm, "plain_read", "ldar", "nor acquire-ordered");
+}
+
+/// A floating-point atomic has no native RMW anywhere, so it must go through
+/// the CAS loop -- and the value has to survive the trip between the FP and
+/// general-purpose register files, which is where it used to become zero.
+#[test]
+fn codegen_atomic_float_operators_use_a_cas_loop() {
+    let src = r#"
+#include <stdatomic.h>
+_Atomic double d;
+_Atomic float f;
+void add_d(void) { d += 1.5; }
+void add_f(void) { f += 1.5f; }
+"#;
+    let asm = asm_for("atomic_float_x86", X86_64_LINUX, src);
+    assert_body_contains(&asm, "add_d", "lock cmpxchg", "FP RMW needs a locked CAS");
+    assert_body_contains(&asm, "add_f", "lock cmpxchg", "FP RMW needs a locked CAS");
+    // The bit pattern must move between the register files rather than being
+    // replaced with a zero immediate.
+    assert_body_contains(
+        &asm,
+        "add_d",
+        "movq",
+        "the double's bits must cross to a GP register",
+    );
+
+    let asm = asm_for("atomic_float_arm", AARCH64_LINUX, src);
+    assert_body_contains(&asm, "add_d", "ldaxr", "FP RMW is an LL/SC loop");
+    assert_body_contains(&asm, "add_d", "stlxr", "FP RMW is an LL/SC loop");
+}

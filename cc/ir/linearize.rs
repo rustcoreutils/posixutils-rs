@@ -2575,6 +2575,12 @@ impl<'a> Linearizer<'a> {
 
     /// Linearize a post-increment or post-decrement expression
     pub(crate) fn linearize_postop(&mut self, operand: &Expr, is_inc: bool) -> PseudoId {
+        // `x++` on an atomic object is one read-modify-write, and its value is
+        // the value *before* the operation -- exactly what fetch-add returns.
+        if let Some(result) = self.try_emit_atomic_incdec(operand, is_inc, false) {
+            return result;
+        }
+
         let val = self.linearize_expr(operand);
         let typ = self.expr_type(operand);
         let is_float = self.types.is_float(typ);
@@ -2913,6 +2919,13 @@ impl<'a> Linearizer<'a> {
 
         // Handle PreInc/PreDec specially - they need store-back
         if op == UnaryOp::PreInc || op == UnaryOp::PreDec {
+            // On an atomic object this is one read-modify-write whose value is
+            // the *new* one (C17 6.5.3.1p2 defines ++E as E += 1).
+            if let Some(result) = self.try_emit_atomic_incdec(operand, op == UnaryOp::PreInc, true)
+            {
+                return result;
+            }
+
             // For deref operands like *s++, compute the lvalue address once
             // to avoid re-evaluating side effects (PostInc etc.) when storing back.
             let deref_addr = if let ExprKind::Unary {
@@ -4141,6 +4154,16 @@ impl<'a> Linearizer<'a> {
     pub(crate) fn linearize_expr(&mut self, expr: &Expr) -> PseudoId {
         // Set current position for debug info
         self.current_pos = Some(expr.pos);
+
+        // Every rvalue read of an `_Atomic` object is itself an atomic
+        // operation (C17 6.7.3). This is the single funnel for reads, so
+        // branching here covers initializers, conditions, call arguments and
+        // operands alike. On x86 a plain aligned load already is sequentially
+        // consistent, but on aarch64 this is the difference between `ldr` and
+        // `ldar`.
+        if let Some(lv) = self.atomic_lvalue(expr) {
+            return self.emit_atomic_load(&lv);
+        }
 
         match &expr.kind {
             ExprKind::IntLit(val) => {

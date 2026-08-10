@@ -1102,6 +1102,16 @@ impl<'a> super::linearize::Linearizer<'a> {
         let target_typ = self.expr_type(target);
         let value_typ = self.expr_type(value);
 
+        // An assignment to an `_Atomic` object is an atomic store, and a
+        // compound assignment is a single atomic read-modify-write
+        // (C17 6.5.16.2p3) -- not the load/compute/store this would otherwise
+        // emit. Branch before the complex and struct early-returns below so
+        // those shapes reach atomic_lvalue's diagnostic rather than silently
+        // block-copying.
+        if let Some(result) = self.try_emit_atomic_assign(op, target, value) {
+            return result;
+        }
+
         // For complex type assignment, handle specially - copy real and imag parts
         if self.types.is_complex(target_typ) && op == AssignOp::Assign {
             let target_addr = self.linearize_lvalue(target);

@@ -652,3 +652,74 @@ int main(void) {
         0
     );
 }
+
+/// `_Atomic _Bool` increment stores the *converted* value.
+///
+/// C17 6.3.1.2 makes conversion to `_Bool` yield 0 or 1, and a compound
+/// assignment stores the converted result. A native fetch-and-add cannot
+/// express that -- it adds to the stored byte -- so `b = 1; b++` left 2 in
+/// memory and `b = 0; b--` left 255. The non-atomic paths this intercepted
+/// both normalized before storing, so it was a regression.
+#[test]
+fn c11_atomic_bool_stays_normalized() {
+    let code = r#"
+#include <stdatomic.h>
+_Atomic _Bool b;
+
+int main(void) {
+    b = 1; b++;   if ((int)b != 1) return 1;   /* not 2 */
+    b = 0; b++;   if ((int)b != 1) return 2;
+    b = 1; b--;   if ((int)b != 0) return 3;
+    b = 0; b--;   if ((int)b != 1) return 4;   /* (_Bool)(-1) is 1, not 255 */
+    b = 0; b += 5; if ((int)b != 1) return 5;
+    b = 1; b -= 1; if ((int)b != 0) return 6;
+
+    /* The value of the expression follows the same rule. */
+    b = 1; if ((int)(b++) != 1) return 10;     /* postfix: old value */
+    b = 0; if ((int)(++b) != 1) return 11;     /* prefix: stored value */
+    b = 0; if ((int)(b--) != 0) return 12;
+    if ((int)b != 1) return 13;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c11_atomic_bool", code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("c11_atomic_bool_opt", code), 0);
+}
+
+/// An `_Atomic` type c17 cannot operate on lock-free must still *compile*.
+///
+/// Rejecting it outright was a source-compatibility regression: gcc lowers an
+/// 8-byte `_Atomic struct` to a single lock-free cmpxchg with no libatomic
+/// reference, so code that built with gcc -- and with c17 before the atomic
+/// operators landed -- stopped compiling. It now warns and falls back to the
+/// ordinary access, which is honest where the previous silence was not.
+#[test]
+fn c11_atomic_aggregate_still_compiles() {
+    let code = r#"
+#include <stdatomic.h>
+
+struct P { int a, b; };
+_Atomic struct P g;
+_Atomic long double ld;
+
+int main(void) {
+    struct P v = { 3, 4 };
+    g = v;
+    struct P r = g;
+    if (r.a != 3 || r.b != 4) return 1;
+
+    ld = 2.5L;
+    if ((double)ld != 2.5) return 2;
+
+    /* `_Atomic double _Complex` is deliberately absent: assigning to a
+       complex *global* segfaults with or without _Atomic, on this branch and
+       on main alike. That is a separate pre-existing defect, recorded in
+       doc/TODO.md, and folding it in here would make this test fail for a
+       reason it is not about. */
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c11_atomic_aggregate", code, &[]), 0);
+}

@@ -51,7 +51,7 @@ impl Linearizer<'_> {
     /// lock-based fallbacks in libatomic, which this compiler does not link.
     fn is_lock_free(&self, typ: TypeId) -> bool {
         let kind = self.types.kind(typ);
-        let scalar = matches!(
+        let is_scalar = matches!(
             kind,
             TypeKind::Bool
                 | TypeKind::Char
@@ -63,8 +63,9 @@ impl Linearizer<'_> {
                 | TypeKind::Pointer
                 | TypeKind::Float
                 | TypeKind::Double
-        );
-        scalar && matches!(self.types.size_bits(typ), 8 | 16 | 32 | 64)
+        ) && !self.types.is_complex(typ);
+
+        is_scalar && matches!(self.types.size_bits(typ), 8 | 16 | 32 | 64)
     }
 
     /// Recognize an `_Atomic` lvalue and produce its address.
@@ -98,10 +99,24 @@ impl Linearizer<'_> {
         }
 
         if !self.is_lock_free(typ) {
-            diag::error_args(
+            // Warn and fall through to the ordinary (non-atomic) path.
+            //
+            // An error here was a source-compatibility regression: gcc lowers
+            // an 8-byte `_Atomic struct` to a single lock-free cmpxchg with no
+            // libatomic reference, so code that built with gcc -- and with c17
+            // before the atomic operators landed -- stopped compiling.
+            //
+            // Doing it properly means operating on the aggregate's bits as an
+            // integer, which needs the linearizer's value-versus-address
+            // conventions for small aggregates to agree first: assignment
+            // wants an address while initialization wants a value, so a single
+            // representation is wrong for one of them. Until that is settled, a
+            // warning is honest where the previous silence was not, and it does
+            // not risk a subtly wrong implementation. Recorded in doc/TODO.md.
+            diag::warning_args(
                 expr.pos,
-                "atomic operation on '{0}' ({1} bytes) is not lock-free; \
-                 c17 does not link libatomic",
+                "access to '{0}' ({1} bytes) is not atomic: c17 provides \
+                 lock-free atomics only for 1, 2, 4 and 8-byte scalars",
                 &[
                     &self.types.get(typ).to_string(),
                     &self.types.size_bytes(typ).to_string(),
@@ -214,8 +229,15 @@ impl Linearizer<'_> {
         op: Opcode,
         value: PseudoId,
     ) -> PseudoId {
-        if let Some(atomic_op) = Self::atomic_opcode_for(op) {
-            return self.emit_atomic_op(atomic_op, lv, Some(value));
+        // `_Bool` cannot use a native fetch-and-op: the value stored must be
+        // the *converted* result, so `b = 1; b++` leaves 1 rather than 2, and
+        // `b = 0; b--` leaves 1 rather than 255. Only the CAS loop can apply
+        // that conversion before the store.
+        let needs_conversion = self.types.kind(lv.elem_typ) == TypeKind::Bool;
+        if !needs_conversion {
+            if let Some(atomic_op) = Self::atomic_opcode_for(op) {
+                return self.emit_atomic_op(atomic_op, lv, Some(value));
+            }
         }
         self.emit_atomic_cas_loop(lv, op, value)
     }
@@ -247,6 +269,14 @@ impl Linearizer<'_> {
         self.emit(Instruction::load(old, exp_addr, 0, elem_typ, bits));
         let new = self.alloc_reg_pseudo();
         self.emit(Instruction::binop(op, new, old, value, elem_typ, bits));
+        // C17 6.3.1.2: converting to _Bool yields 0 or 1, and a compound
+        // assignment stores the converted result. Without this the raw sum
+        // reaches memory and an _Atomic _Bool holds 2 or 255.
+        let new = if self.types.kind(elem_typ) == TypeKind::Bool {
+            self.emit_convert(new, self.types.int_id, elem_typ)
+        } else {
+            new
+        };
 
         let ok = self.alloc_reg_pseudo();
         let order = self.emit_const(ORDER as i128, self.types.int_id);

@@ -2495,4 +2495,44 @@ mod audit_regressions {
             });
         }
     }
+
+    // ----- Review follow-up (round 2) -----
+
+    #[test]
+    fn here_document_inside_a_command_substitution() {
+        // `WordLexer::next_line` used to stop *at* the newline instead of
+        // consuming it, so scanning the extent of a here-document inside
+        // `$(...)` looped on the same empty line forever.
+        test_script("x=$(cat <<EOF\nhi\nEOF\n)\necho \"[$x]\"\n", "[hi]\n");
+        test_script("x=$(cat <<-EOF\n\thi\n\tEOF\n)\necho \"[$x]\"\n", "[hi]\n");
+        test_script(
+            "x=$(cat <<EOF | tr a-z A-Z\nhi\nEOF\n)\necho \"[$x]\"\n",
+            "[HI]\n",
+        );
+        test_script(
+            "x=$(cat <<'E'\n$notexpanded\nE\n)\necho \"$x\"\n",
+            "$notexpanded\n",
+        );
+    }
+
+    #[test]
+    fn here_document_larger_than_the_pipe_buffer() {
+        // The body used to be written into a pipe nobody was reading yet, so
+        // anything past the 64KiB pipe capacity blocked the shell forever.
+        let body = "0123456789abcdefghijklmnopqrstuvwxyz\n".repeat(4000);
+        let expected = format!("{}\n", body.len());
+        run_successfully_and(&format!("wc -c <<EOF\n{body}EOF\n"), |out| {
+            assert_eq!(out.trim_start(), expected)
+        });
+    }
+
+    #[test]
+    fn here_document_descriptor_is_seekable_and_reusable() {
+        // A here-document redirection behaves like a file, so successive
+        // reads continue where the previous one stopped.
+        test_script(
+            "exec 3<<EOF\nfirst\nsecond\nEOF\nread a <&3\nread b <&3\necho \"[$a][$b]\"\n",
+            "[first][second]\n",
+        );
+    }
 }

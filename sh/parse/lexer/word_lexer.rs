@@ -177,10 +177,24 @@ impl Lexer for WordLexer<'_> {
 
     fn next_line(&mut self) -> Cow<'_, str> {
         let start = self.position;
-        while self.lookahead != '\n' {
+        while !self.reached_eof && self.lookahead != '\n' {
             self.advance()
         }
-        self.source[start..self.position].into()
+        // `position` is the index of the lookahead character, and it stops
+        // moving once the iterator is exhausted, so at EOF the line runs to
+        // the end of the source.
+        let end = if self.reached_eof {
+            self.source.len()
+        } else {
+            self.position
+        };
+        let line = &self.source[start..end];
+        // The terminating newline belongs to this line: leaving it in place
+        // would make the next call return the same (empty) line forever.
+        if !self.reached_eof {
+            self.advance();
+        }
+        line.into()
     }
 
     fn next_word(&mut self) -> ParseResult<Cow<'_, str>> {

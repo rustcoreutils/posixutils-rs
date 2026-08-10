@@ -3855,12 +3855,18 @@ impl Aarch64CodeGen {
                 });
             }
             Loc::Stack(offset) => {
-                let adjusted = offset + (self.frame_size - self.callee_saved_size);
+                // Address through the frame pointer, as every other path in
+                // this backend does ("FP-relative for alloca safety"). This
+                // used its own SP-relative arithmetic, which is wrong the
+                // moment anything moves SP: the atomic CAS loop allocates its
+                // expected-value slot with alloc_local_temp, whose Alloca does
+                // exactly that, and the pointer was then read back 16 bytes
+                // off -- from the saved LR slot.
                 self.push_lir(Aarch64Inst::Ldr {
                     size: op_size,
                     addr: MemAddr::BaseOffset {
-                        base: Reg::SP,
-                        offset: adjusted,
+                        base: self.stack_base_reg(offset),
+                        offset: self.stack_offset(offset),
                     },
                     dst: reg,
                 });
@@ -3868,13 +3874,31 @@ impl Aarch64CodeGen {
             Loc::Global(name) => {
                 self.emit_load_global(&name, reg, op_size);
             }
-            _ => {
-                // Default: load 0
-                self.push_lir(Aarch64Inst::Mov {
-                    size: op_size,
-                    src: GpOperand::Imm(0),
+            // A floating-point value has to cross to the general-purpose file
+            // as its bit pattern. Falling through to a zero immediate here is
+            // what made every _Atomic float/double operation store 0 -- the
+            // x86_64 twin of this function was fixed for exactly that and this
+            // one was missed.
+            Loc::VReg(v) => {
+                self.push_lir(Aarch64Inst::FmovToGp {
+                    size: if size <= 32 {
+                        FpSize::Single
+                    } else {
+                        FpSize::Double
+                    },
+                    src: v,
                     dst: reg,
                 });
+            }
+            Loc::FImm(f, imm_size) => {
+                let bits = if imm_size == 16 {
+                    super::f64_to_f16_bits(f) as i64
+                } else if imm_size == 32 {
+                    (f as f32).to_bits() as i64
+                } else {
+                    f.to_bits() as i64
+                };
+                self.emit_mov_imm(reg, bits, 64);
             }
         }
     }

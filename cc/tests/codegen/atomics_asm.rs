@@ -276,3 +276,74 @@ int sum(void) { return x + y; }
         "the two atomic results aliased in RAX:\n{body}"
     );
 }
+
+/// aarch64: an `_Atomic` floating-point value must reach the atomic
+/// instruction as its bit pattern, not as zero.
+///
+/// `emit_mov_to_reg`'s `_ => load 0` fallback swallowed `Loc::VReg` and
+/// `Loc::FImm`, so `_Atomic double d; d = 1.5;` stored 0.0. The x86_64 twin of
+/// that function was fixed for exactly this and this one was missed.
+#[test]
+fn codegen_aarch64_atomic_float_carries_its_bits() {
+    let src = r#"
+#include <stdatomic.h>
+_Atomic double d;
+_Atomic float f;
+void set_const(void) { d = 1.5; }
+void set_param(float v) { f = v; }
+"#;
+    let asm = asm_for("atomic_fp_bits_arm", AARCH64_LINUX, src);
+
+    // 1.5 as an IEEE double is 0x3FF8000000000000; the high half is 0x3FF8,
+    // which movk materializes as 16376 << 48.
+    let body = super::asm_probe::body_of(&asm, "set_const");
+    assert!(
+        body.contains("movk") && body.contains("16376"),
+        "the constant's bit pattern must be materialized, not replaced by zero:\n{body}"
+    );
+    assert!(
+        !body.contains("mov x0, #0\n    stlr") && !body.contains("mov w0, #0\n    stlr"),
+        "a zero immediate reached the store:\n{body}"
+    );
+
+    // A float parameter arrives in a V register and must cross to the GP file.
+    assert_body_contains(
+        &asm,
+        "set_param",
+        "fmov",
+        "an FP operand must move across as its bits, not be zeroed",
+    );
+}
+
+/// aarch64: the CAS loop's expected-value slot must be addressed through the
+/// frame pointer.
+///
+/// `emit_mov_to_reg` computed its own SP-relative offset while every other path
+/// in the backend uses X29 ("FP-relative for alloca safety"). `alloc_local_temp`
+/// emits an Alloca that moves SP, so the pointer was stored at [x29, #N] and
+/// read back from [sp, #N] -- 16 bytes off, landing on the saved LR slot.
+#[test]
+fn codegen_aarch64_cas_temp_is_frame_relative() {
+    let src = r#"
+#include <stdatomic.h>
+_Atomic int a;
+void mul(void) { a *= 3; }
+"#;
+    let asm = asm_for("cas_temp_arm", AARCH64_LINUX, src);
+    let body = super::asm_probe::body_of(&asm, "mul");
+
+    // The Alloca moves SP, which is what made the mismatch observable.
+    assert!(
+        body.contains("sub sp, sp"),
+        "expected the temp allocation to move SP:\n{body}"
+    );
+    // Every access to the temp pointer must go through x29, not sp.
+    assert!(
+        !body.contains("ldr x11, [sp,") && !body.contains("ldr x16, [sp,"),
+        "the CAS temp pointer must not be read SP-relative:\n{body}"
+    );
+    assert!(
+        body.contains("str x") && body.contains("[x29,"),
+        "the CAS temp pointer must be frame-relative:\n{body}"
+    );
+}

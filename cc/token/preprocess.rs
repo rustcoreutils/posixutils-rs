@@ -25,7 +25,7 @@ use crate::arch;
 use crate::builtin_headers;
 use crate::diag;
 use crate::os;
-use crate::target::{CStd, LangOpts, Target};
+use crate::target::{Target, STDC_VERSION};
 use gettextrs::gettext;
 
 const DEFAULT_MACRO_CAPACITY: usize = 32;
@@ -342,9 +342,6 @@ pub struct Preprocessor<'a> {
     /// Target configuration
     target: &'a Target,
 
-    /// Language dialect selected by `-std=`
-    lang: LangOpts,
-
     /// Macro definitions
     macros: HashMap<String, Macro>,
 
@@ -538,7 +535,7 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Create a new preprocessor
-    pub fn new(target: &'a Target, filename: &str, lang: LangOpts) -> Self {
+    pub fn new(target: &'a Target, filename: &str) -> Self {
         let current_dir = Path::new(filename)
             .parent()
             .map(|p| p.to_string_lossy().to_string())
@@ -548,7 +545,6 @@ impl<'a> Preprocessor<'a> {
 
         let mut pp = Self {
             target,
-            lang,
             macros: HashMap::with_capacity(DEFAULT_MACRO_CAPACITY),
             cond_stack: Vec::with_capacity(DEFAULT_COND_STACK_CAPACITY),
             system_include_paths: Vec::with_capacity(DEFAULT_INCLUDE_PATH_CAPACITY),
@@ -586,19 +582,16 @@ impl<'a> Preprocessor<'a> {
 
     /// Initialize predefined macros
     fn init_predefined_macros(&mut self) {
-        // Standard C macros
+        // Standard C macros. c17 compiles one language -- C17 plus the GNU
+        // extensions it has always provided -- so the version is fixed.
+        // `-std=` cannot change it; see `classify_std`.
         self.define_macro(Macro::predefined("__STDC__", Some("1")));
-        // C89 predates __STDC_VERSION__ entirely, so it is left undefined there.
-        if let Some(version) = self.lang.std.version_macro() {
-            self.define_macro(Macro::predefined("__STDC_VERSION__", Some(version)));
-        }
+        self.define_macro(Macro::predefined("__STDC_VERSION__", Some(STDC_VERSION)));
         self.define_macro(Macro::predefined("__STDC_HOSTED__", Some("1")));
 
-        // C17 4p8: a strictly-conforming (non-GNU) dialect advertises itself,
-        // and system headers use this to hide their extensions.
-        if !self.lang.gnu {
-            self.define_macro(Macro::predefined("__STRICT_ANSI__", Some("1")));
-        }
+        // __STRICT_ANSI__ is never defined: there is no strict mode to
+        // advertise, and claiming one would tell system headers to hide the
+        // extensions this compiler does provide.
 
         // C17 6.10.8.3 conditional feature macros.
         //
@@ -611,13 +604,9 @@ impl<'a> Preprocessor<'a> {
         self.define_macro(Macro::predefined("__STDC_IEC_559__", Some("1")));
         self.define_macro(Macro::predefined("__STDC_ISO_10646__", Some("201706L")));
 
-        // __STDC_UTF_16__ / __STDC_UTF_32__ describe char16_t / char32_t, which
-        // C11 introduced. Defining them under -std=c99 would assert a property
-        // of types that dialect does not have.
-        if self.lang.std >= CStd::C11 {
-            self.define_macro(Macro::predefined("__STDC_UTF_16__", Some("1")));
-            self.define_macro(Macro::predefined("__STDC_UTF_32__", Some("1")));
-        }
+        // __STDC_UTF_16__ / __STDC_UTF_32__ describe char16_t / char32_t.
+        self.define_macro(Macro::predefined("__STDC_UTF_16__", Some("1")));
+        self.define_macro(Macro::predefined("__STDC_UTF_32__", Some("1")));
 
         // __STDC_IEC_559_COMPLEX__ is deliberately NOT defined. It asserts
         // conformance to Annex G, and complex support does not meet that bar:
@@ -627,9 +616,8 @@ impl<'a> Preprocessor<'a> {
         // C17 4p6: an implementation that does not provide <threads.h> shall
         // define __STDC_NO_THREADS__, so portable code can feature-test rather
         // than fail at the include. We bundle no threads.h and rely on the
-        // host's, so this is a question about the host. The macro itself is a
-        // C11 addition, so it says nothing under an earlier dialect.
-        if self.lang.std >= CStd::C11 && !self.host_has_threads_header() {
+        // host's, so this is purely a question about the host.
+        if !self.host_has_threads_header() {
             self.define_macro(Macro::predefined("__STDC_NO_THREADS__", Some("1")));
         }
 
@@ -720,17 +708,10 @@ impl<'a> Preprocessor<'a> {
             self.define_macro(Macro::predefined(name, Some(value)));
         }
 
-        // OS macros.
-        //
-        // A strict dialect may only predefine names in the implementation's
-        // reserved namespace, so `unix` and `linux` are dropped while
-        // `__unix__` and `__linux__` stay. Filtering on the leading underscore
-        // rather than an explicit deny-list means a new non-reserved macro
-        // added to an OS table cannot silently leak into `-std=c17`.
+        // OS macros, including the unreserved `unix` / `linux` spellings.
+        // Predefining names outside the implementation's reserved namespace is
+        // a GNU extension, and this compiler is always in that mode.
         for (name, value) in os::get_os_macros(self.target) {
-            if !self.lang.gnu && !name.starts_with('_') {
-                continue;
-            }
             self.define_macro(Macro::predefined(name, value.as_deref()));
         }
 
@@ -4264,8 +4245,6 @@ pub struct PreprocessConfig<'a> {
     pub no_builtin_inc: bool,
     /// If true, apply translation phase 1 trigraph replacement (--trigraphs).
     pub trigraphs: bool,
-    /// Language dialect selected by `-std=` (default `gnu17`).
-    pub lang: LangOpts,
 }
 
 /// Preprocess tokens with command-line defines and undefines
@@ -4286,7 +4265,7 @@ pub fn preprocess_with_defines(
     filename: &str,
     config: &PreprocessConfig<'_>,
 ) -> Vec<Token> {
-    let mut pp = Preprocessor::new(target, filename, config.lang);
+    let mut pp = Preprocessor::new(target, filename);
 
     // Handle -nostdinc and -nobuiltininc flags
     if config.no_std_inc {
@@ -4365,10 +4344,10 @@ pub fn preprocess_asm_file(
         tokenizer.tokenize()
     };
 
-    // Create preprocessor with assembly-specific predefined macros. The dialect
-    // is irrelevant here — the C standard macros are undefined immediately
-    // below — so the default keeps the assembly path independent of `-std=`.
-    let mut pp = Preprocessor::new(target, filename, LangOpts::default());
+    // Create preprocessor with assembly-specific predefined macros. The C
+    // standard macros are undefined immediately below, so nothing the language
+    // mode contributes survives into an assembly translation unit.
+    let mut pp = Preprocessor::new(target, filename);
 
     // Use assembly lexer mode for included files as well
     pp.lexer_mode = LexerMode::Assembly;
@@ -4570,7 +4549,7 @@ mod tests {
     #[test]
     fn test_predefined_stdc() {
         let target = Target::host();
-        let pp = Preprocessor::new(&target, "test.c", LangOpts::default());
+        let pp = Preprocessor::new(&target, "test.c");
         assert!(pp.is_defined("__STDC__"));
         assert!(pp.is_defined("__STDC_VERSION__"));
     }
@@ -4578,7 +4557,7 @@ mod tests {
     #[test]
     fn test_predefined_arch() {
         let target = Target::host();
-        let pp = Preprocessor::new(&target, "test.c", LangOpts::default());
+        let pp = Preprocessor::new(&target, "test.c");
 
         // Should have either x86_64 or aarch64 defined
         assert!(pp.is_defined("__x86_64__") || pp.is_defined("__aarch64__"));

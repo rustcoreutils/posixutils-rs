@@ -14,86 +14,46 @@
 
 use std::fmt;
 
-/// The C standard revision selected by `-std=`.
-///
-/// This is the *language dialect*, deliberately kept separate from `Target`,
-/// which describes the *machine*. The two are independent: any dialect can be
-/// compiled for any target.
-///
-/// Ordered oldest-to-newest so `>=` answers "at least this revision".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum CStd {
-    C89,
-    C99,
-    C11,
-    C17,
-}
+/// The value of `__STDC_VERSION__`. c17 compiles one language: C17, the
+/// ISO/IEC 9899:2018 revision POSIX.2024 binds the `c17` utility to.
+pub const STDC_VERSION: &str = "201710L";
 
-impl CStd {
-    /// The value of `__STDC_VERSION__`, or `None` for C89 which does not
-    /// define it at all (it was introduced by Amendment 1).
-    pub fn version_macro(self) -> Option<&'static str> {
-        match self {
-            CStd::C89 => None,
-            CStd::C99 => Some("199901L"),
-            CStd::C11 => Some("201112L"),
-            CStd::C17 => Some("201710L"),
-        }
-    }
-}
-
-/// Language dialect: a standard revision plus whether GNU extensions are
-/// advertised (`-std=gnu17` vs `-std=c17`).
+/// What a `-std=` argument asks for.
 ///
-/// The default is `gnu17`, which is what POSIX.2024 requires of the `c17`
-/// utility (the ISO C standard it names is ISO/IEC 9899:2018) combined with the
-/// GNU extensions this compiler has always provided.
+/// c17 implements a single language — C17 plus the GNU extensions it has always
+/// provided — so this classifies the request rather than selecting a dialect.
+/// Language *versions* and *extension sets* are not switchable: there is one
+/// mode, and `-std=` exists only because build systems pass it unconditionally.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LangOpts {
-    /// The standard revision.
-    pub std: CStd,
-    /// True for the `gnu*` spellings: GNU extensions are advertised, and
-    /// predefined macros outside the reserved namespace (`unix`, `linux`) are
-    /// provided. False for the strict `c*` spellings, which additionally
-    /// define `__STRICT_ANSI__`.
-    pub gnu: bool,
+pub enum StdRequest {
+    /// A C17 spelling (`c17`, `c18`, `gnu17`, `gnu18`, `iso9899:2017/2018`) —
+    /// what we compile anyway, so it passes without comment.
+    C17,
+    /// An older revision (`c89`, `c99`, `c11`, the `gnu*` and `iso9899:`
+    /// equivalents). Accepted and compiled as C17; the driver says so.
+    Older,
 }
 
-impl Default for LangOpts {
-    fn default() -> Self {
-        Self {
-            std: CStd::C17,
-            gnu: true,
+/// Classify the argument of `-std=`, e.g. `c17`, `gnu11`, `iso9899:1999`.
+///
+/// Returns `None` for an unrecognized spelling, which the driver reports as an
+/// error. A typo must not pass silently — accepting and discarding a `-std=`
+/// is how `__STDC_VERSION__` once came to disagree with the binary's own name.
+pub fn classify_std(spec: &str) -> Option<StdRequest> {
+    let name = match spec.strip_prefix("gnu") {
+        Some(rest) => rest,
+        None => match spec.strip_prefix('c') {
+            Some(rest) => rest,
+            None => spec.strip_prefix("iso9899:")?,
+        },
+    };
+
+    match name {
+        "17" | "18" | "2017" | "2018" => Some(StdRequest::C17),
+        "89" | "90" | "1990" | "199409" | "99" | "9x" | "1999" | "11" | "1x" | "2011" => {
+            Some(StdRequest::Older)
         }
-    }
-}
-
-impl LangOpts {
-    /// Parse the argument of `-std=`, e.g. `c17`, `gnu11`, `iso9899:1999`.
-    ///
-    /// Returns `None` for an unrecognized spelling, which the driver reports as
-    /// an error rather than silently ignoring — accepting and discarding a
-    /// dialect request is how the version macro came to disagree with the
-    /// binary's own name.
-    pub fn parse(spec: &str) -> Option<Self> {
-        let (name, gnu) = match spec.strip_prefix("gnu") {
-            Some(rest) => (rest, true),
-            None => match spec.strip_prefix('c') {
-                Some(rest) => (rest, false),
-                // The `iso9899:` spellings are always strict.
-                None => (spec.strip_prefix("iso9899:")?, false),
-            },
-        };
-
-        let std = match name {
-            "89" | "90" | "1990" | "199409" => CStd::C89,
-            "99" | "9x" | "1999" => CStd::C99,
-            "11" | "1x" | "2011" => CStd::C11,
-            "17" | "18" | "2017" | "2018" => CStd::C17,
-            _ => return None,
-        };
-
-        Some(Self { std, gnu })
+        _ => None,
     }
 }
 
@@ -312,57 +272,43 @@ mod tests {
         assert!(target.char_signed); // x86 default
     }
 
+    /// Every accepted spelling is classified; the `c`/`gnu` prefix does not
+    /// change the answer, because it no longer selects anything.
     #[test]
-    fn test_std_version_macros() {
-        assert_eq!(CStd::C89.version_macro(), None);
-        assert_eq!(CStd::C99.version_macro(), Some("199901L"));
-        assert_eq!(CStd::C11.version_macro(), Some("201112L"));
-        assert_eq!(CStd::C17.version_macro(), Some("201710L"));
-    }
-
-    #[test]
-    fn test_default_dialect_is_gnu17() {
-        let lang = LangOpts::default();
-        assert_eq!(lang.std, CStd::C17);
-        assert!(lang.gnu);
-    }
-
-    #[test]
-    fn test_parse_std_spellings() {
-        for (spec, std, gnu) in [
-            ("c89", CStd::C89, false),
-            ("c90", CStd::C89, false),
-            ("gnu89", CStd::C89, true),
-            ("c99", CStd::C99, false),
-            ("gnu99", CStd::C99, true),
-            ("c11", CStd::C11, false),
-            ("gnu11", CStd::C11, true),
-            ("c17", CStd::C17, false),
-            ("c18", CStd::C17, false),
-            ("gnu17", CStd::C17, true),
-            ("gnu18", CStd::C17, true),
-            ("iso9899:1990", CStd::C89, false),
-            ("iso9899:1999", CStd::C99, false),
-            ("iso9899:2017", CStd::C17, false),
+    fn test_classify_std_spellings() {
+        for spec in [
+            "c17",
+            "c18",
+            "gnu17",
+            "gnu18",
+            "iso9899:2017",
+            "iso9899:2018",
         ] {
-            let lang = LangOpts::parse(spec).unwrap_or_else(|| panic!("{spec} should parse"));
-            assert_eq!(lang.std, std, "{spec}");
-            assert_eq!(lang.gnu, gnu, "{spec}");
+            assert_eq!(classify_std(spec), Some(StdRequest::C17), "{spec}");
+        }
+
+        for spec in [
+            "c89",
+            "c90",
+            "gnu89",
+            "gnu90",
+            "c99",
+            "gnu99",
+            "c11",
+            "gnu11",
+            "iso9899:1990",
+            "iso9899:1999",
+            "iso9899:2011",
+        ] {
+            assert_eq!(classify_std(spec), Some(StdRequest::Older), "{spec}");
         }
     }
 
     #[test]
-    fn test_parse_std_rejects_unknown() {
+    fn test_classify_std_rejects_unknown() {
         for spec in ["c42", "gnu42", "c++17", "", "iso9899:1234", "nonsense"] {
-            assert!(LangOpts::parse(spec).is_none(), "{spec} should be rejected");
+            assert!(classify_std(spec).is_none(), "{spec} should be rejected");
         }
-    }
-
-    #[test]
-    fn test_std_ordering() {
-        assert!(CStd::C17 > CStd::C11);
-        assert!(CStd::C11 > CStd::C99);
-        assert!(CStd::C99 > CStd::C89);
     }
 
     #[test]

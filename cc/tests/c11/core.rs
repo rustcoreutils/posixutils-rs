@@ -297,10 +297,10 @@ fn c11_predefined_macros_mega() {
 int main(void) {
     // ========== __STDC_VERSION__ (returns 1-9) ==========
 
-    // The default dialect is gnu17, so the compiler reports C17. It used to
-    // report 201112L regardless, which is what made the `c17` name a lie
-    // (audit #P1/#X2). `-std=` selects other values; see
-    // `c17_std_selects_the_version_macro`.
+    // c17 compiles C17, so it reports C17. It used to report 201112L
+    // regardless, which is what made the `c17` name a lie (audit #P1/#X2).
+    // `-std=` cannot change this -- there is one language mode; see
+    // `c17_version_macro_is_c17_whatever_std_says`.
     #if __STDC_VERSION__ != 201710L
     return 1;
     #endif

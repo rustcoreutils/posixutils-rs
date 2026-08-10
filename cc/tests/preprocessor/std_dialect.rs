@@ -6,16 +6,41 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// `-std=` dialect selection (audit #P1/#X2) and host glibc detection (#C3).
+// `-std=` as a compatibility shim, and host glibc detection (#C3).
 //
-// Before this, `-std=` was accepted and thrown away, and `__STDC_VERSION__`
-// was hardcoded to C11's 201112L no matter what -- so a binary named `c17`
-// took the wrong branch of `#if __STDC_VERSION__ >= 201710L`.
+// c17 implements one language: C17 (ISO/IEC 9899:2018) plus the GNU extensions
+// it has always provided. `-std=` cannot select a different one. It survives
+// only because build systems pass it unconditionally -- CPython's configure
+// adds `-std=c11` whenever the compiler identifies as GCC-like, without ever
+// probing whether it is accepted -- so rejecting it would break real builds.
+//
+// These tests pin that in both directions: every accepted spelling produces the
+// same predefined macros, and a typo is still an error.
 //
 
 use crate::common::{compile_expect_ok, preprocess_text, run_c17};
 
-/// Expand a single macro under a dialect and return the replacement text.
+/// Every `-std=` spelling c17 accepts, C17 and older alike.
+const ACCEPTED: &[&str] = &[
+    "c17",
+    "c18",
+    "gnu17",
+    "gnu18",
+    "iso9899:2017",
+    "c89",
+    "c90",
+    "gnu89",
+    "gnu90",
+    "c99",
+    "gnu99",
+    "c11",
+    "gnu11",
+    "iso9899:1990",
+    "iso9899:1999",
+    "iso9899:2011",
+];
+
+/// Expand a single macro under a `-std=` spelling and return the replacement.
 ///
 /// The marker keeps the interesting line findable in `-E` output, which also
 /// carries line markers and blank lines.
@@ -47,62 +72,48 @@ fn is_undefined(value: &str, macro_name: &str) -> bool {
 }
 
 #[test]
-fn c17_std_selects_the_version_macro() {
-    // Values match ISO: C89 predates the macro, C99/C11/C17 as published.
+fn c17_version_macro_is_c17_whatever_std_says() {
     // C17 (ISO/IEC 9899:2018) is a defect-report revision of C11 that adds no
-    // features, so 201710L is the only externally visible difference.
-    for (flag, expected) in [
-        ("-std=c89", None),
-        ("-std=gnu89", None),
-        ("-std=c90", None),
-        ("-std=c99", Some("199901L")),
-        ("-std=gnu99", Some("199901L")),
-        ("-std=c11", Some("201112L")),
-        ("-std=gnu11", Some("201112L")),
-        ("-std=c17", Some("201710L")),
-        ("-std=c18", Some("201710L")),
-        ("-std=gnu17", Some("201710L")),
-        ("-std=iso9899:1999", Some("199901L")),
-        ("-std=iso9899:2017", Some("201710L")),
-    ] {
-        let got = expand_under("std_version", Some(flag), "__STDC_VERSION__");
-        match expected {
-            Some(want) => assert_eq!(got, want, "{flag}"),
-            None => assert!(
-                is_undefined(&got, "__STDC_VERSION__"),
-                "{flag} should leave __STDC_VERSION__ undefined, got {got}"
-            ),
-        }
+    // features, and it is the language POSIX.2024 binds the `c17` utility to
+    // (line 87830). It is what we compile, so it is what we report -- asking
+    // for an older revision does not change the answer, it only means the
+    // request could not be honoured.
+    assert_eq!(
+        expand_under("std_default", None, "__STDC_VERSION__"),
+        "201710L"
+    );
+
+    for spec in ACCEPTED {
+        let got = expand_under(
+            "std_version",
+            Some(&format!("-std={spec}")),
+            "__STDC_VERSION__",
+        );
+        assert_eq!(got, "201710L", "-std={spec}");
     }
 }
 
 #[test]
-fn c17_default_dialect_is_c17() {
-    // POSIX.2024 defines the `c17` utility's language as "section 6 of the ISO
-    // C standard" (87830), which for POSIX.2024 is ISO/IEC 9899:2018. So C17
-    // must be the default, not something you opt into.
-    let got = expand_under("std_default", None, "__STDC_VERSION__");
-    assert_eq!(got, "201710L");
-}
+fn c17_never_defines_strict_ansi() {
+    // There is no strict mode to advertise. Claiming one would tell system
+    // headers to hide the extensions this compiler does provide, which is
+    // exactly backwards.
+    assert!(is_undefined(
+        &expand_under("strict_default", None, "__STRICT_ANSI__"),
+        "__STRICT_ANSI__"
+    ));
 
-#[test]
-fn c17_strict_dialects_define_strict_ansi() {
-    for flag in ["-std=c89", "-std=c99", "-std=c11", "-std=c17"] {
-        let got = expand_under("strict_ansi", Some(flag), "__STRICT_ANSI__");
-        assert_eq!(got, "1", "{flag} should define __STRICT_ANSI__");
-    }
-
-    for flag in ["-std=gnu89", "-std=gnu99", "-std=gnu11", "-std=gnu17"] {
-        let got = expand_under("strict_ansi_gnu", Some(flag), "__STRICT_ANSI__");
+    for spec in ACCEPTED {
+        let got = expand_under(
+            "strict_ansi",
+            Some(&format!("-std={spec}")),
+            "__STRICT_ANSI__",
+        );
         assert!(
             is_undefined(&got, "__STRICT_ANSI__"),
-            "{flag} must not define __STRICT_ANSI__, got {got}"
+            "-std={spec} must not define __STRICT_ANSI__, got {got}"
         );
     }
-
-    // The default is a GNU dialect.
-    let got = expand_under("strict_ansi_default", None, "__STRICT_ANSI__");
-    assert!(is_undefined(&got, "__STRICT_ANSI__"));
 }
 
 /// The unreserved and reserved OS macros for the host this test runs on.
@@ -120,54 +131,35 @@ fn host_os_macros() -> (&'static [&'static str], &'static [&'static str]) {
 }
 
 #[test]
-fn c17_strict_dialects_drop_unreserved_macros() {
-    // A strict dialect may only predefine names in the implementation's
-    // reserved namespace, so `unix`/`linux` go away while `__unix__` stays.
-    // Otherwise a conforming program may not use them as identifiers.
+fn c17_always_predefines_the_unreserved_os_macros() {
+    // Predefining names outside the implementation's reserved namespace is a
+    // GNU extension, and this compiler is always in that mode -- so `unix` and
+    // `linux` are there no matter how `-std=` is spelled, alongside the
+    // reserved `__unix__` / `__linux__`.
     let (unreserved, reserved) = host_os_macros();
 
-    for macro_name in unreserved {
-        let strict = expand_under("unreserved_strict", Some("-std=c17"), macro_name);
-        assert!(
-            is_undefined(&strict, macro_name),
-            "-std=c17 must not predefine `{macro_name}`, got {strict}"
+    for macro_name in unreserved.iter().chain(reserved) {
+        assert_eq!(
+            expand_under("os_default", None, macro_name),
+            "1",
+            "{macro_name} should be predefined by default"
         );
-    }
-
-    // The reserved spellings survive in every dialect.
-    for macro_name in reserved {
-        let strict = expand_under("reserved_strict", Some("-std=c17"), macro_name);
-        assert_eq!(strict, "1", "{macro_name} should survive -std=c17");
-    }
-}
-
-#[test]
-fn c17_gnu_dialects_keep_unreserved_macros() {
-    // Pinned in both directions so `c17_strict_dialects_drop_unreserved_macros`
-    // cannot pass by simply never defining these.
-    let (unreserved, _) = host_os_macros();
-    for macro_name in unreserved {
-        let gnu = expand_under("unreserved_gnu", Some("-std=gnu17"), macro_name);
-        assert_eq!(gnu, "1", "-std=gnu17 should predefine `{macro_name}`");
-    }
-}
-
-#[test]
-fn c17_c11_only_macros_are_absent_before_c11() {
-    // __STDC_UTF_16__/__STDC_UTF_32__ assert a property of char16_t/char32_t,
-    // types C11 introduced. Claiming them under -std=c99 would be false.
-    for macro_name in ["__STDC_UTF_16__", "__STDC_UTF_32__"] {
-        for flag in ["-std=c89", "-std=c99"] {
-            let got = expand_under("utf_pre_c11", Some(flag), macro_name);
-            assert!(
-                is_undefined(&got, macro_name),
-                "{flag} must not define {macro_name}, got {got}"
-            );
+        for spec in ["c17", "gnu17", "c11", "c89"] {
+            let got = expand_under("os_macros", Some(&format!("-std={spec}")), macro_name);
+            assert_eq!(got, "1", "-std={spec} should predefine `{macro_name}`");
         }
+    }
+}
 
-        for flag in ["-std=c11", "-std=c17"] {
-            let got = expand_under("utf_c11", Some(flag), macro_name);
-            assert_eq!(got, "1", "{flag} should define {macro_name}");
+#[test]
+fn c17_always_defines_the_unicode_macros() {
+    // __STDC_UTF_16__ / __STDC_UTF_32__ describe char16_t / char32_t. Those
+    // types exist here unconditionally, so the macros do too.
+    for macro_name in ["__STDC_UTF_16__", "__STDC_UTF_32__"] {
+        assert_eq!(expand_under("utf_default", None, macro_name), "1");
+        for spec in ["c89", "c99", "c11", "c17"] {
+            let got = expand_under("utf", Some(&format!("-std={spec}")), macro_name);
+            assert_eq!(got, "1", "-std={spec} should define {macro_name}");
         }
     }
 }
@@ -177,56 +169,44 @@ fn c17_c11_only_macros_are_absent_before_c11() {
 /// Every occurrence used to be forwarded to a clap `Option<String>`, so a
 /// second one was a fatal "cannot be used multiple times". Build systems
 /// accumulate `-std=` routinely -- one from configure's CFLAGS, another from a
-/// makefile -- and gcc accepts it. `-O` in the same rewriter already did this.
+/// makefile -- and gcc accepts it.
+///
+/// Now that every accepted spelling compiles the same language, last-wins is
+/// observable through *validation* rather than through a macro value: a bad
+/// spelling matters only if it is the one that survives.
 #[test]
 fn c17_repeated_std_takes_the_last() {
-    assert_eq!(
-        expand_under("std_repeat", None, "__STDC_VERSION__"),
-        "201710L"
-    );
-
-    let run = preprocess_text(
-        "std_repeat_two",
-        "MARKER __STDC_VERSION__ MARKER\n",
-        &["-std=c99", "-std=c11"],
-    );
+    let run = run_c17(&["-std=c99", "-std=c11", "--print-targets"]);
     assert!(
         run.success,
         "repeated -std= must be accepted: {}",
         run.stderr
     );
-    let line = run
-        .stdout
-        .lines()
-        .find(|l| l.starts_with("MARKER"))
-        .unwrap_or_else(|| panic!("no marker line:\n{}", run.stdout));
+
+    // A typo in the last position is still an error...
+    let run = run_c17(&["-std=c11", "-std=c42", "--print-targets"]);
+    assert!(!run.success, "the last -std= should win and be rejected");
     assert!(
-        line.contains("201112L"),
-        "the last -std= should win, got: {line}"
+        run.stderr.contains("c42"),
+        "diagnostic should name the surviving spelling, got: {}",
+        run.stderr
     );
 
-    // And the other way round, so this cannot pass by always picking one.
-    let run = preprocess_text(
-        "std_repeat_rev",
-        "MARKER __STDC_VERSION__ MARKER\n",
-        &["-std=c11", "-std=c99"],
-    );
-    assert!(run.success);
-    let line = run
-        .stdout
-        .lines()
-        .find(|l| l.starts_with("MARKER"))
-        .unwrap();
+    // ...and one that is overridden is not, so this cannot pass by always
+    // rejecting.
+    let run = run_c17(&["-std=c42", "-std=c11", "--print-targets"]);
     assert!(
-        line.contains("199901L"),
-        "the last -std= should win, got: {line}"
+        run.success,
+        "an overridden bad -std= should not be reported: {}",
+        run.stderr
     );
 }
 
 #[test]
 fn c17_rejects_an_unknown_std() {
     // Accepting and discarding a dialect request is exactly how the version
-    // macro came to disagree with the binary's own name.
+    // macro came to disagree with the binary's own name. A typo must not pass
+    // silently just because the value would have been ignored anyway.
     for spec in ["c42", "gnu42", "c++17", "nonsense"] {
         let run = run_c17(&[&format!("-std={spec}"), "--print-targets"]);
         assert!(!run.success, "-std={spec} should be rejected");
@@ -241,24 +221,7 @@ fn c17_rejects_an_unknown_std() {
 #[test]
 fn c17_accepts_every_documented_std_spelling() {
     // The negative test above cannot pass vacuously: these must all work.
-    for spec in [
-        "c89",
-        "c90",
-        "gnu89",
-        "gnu90",
-        "c99",
-        "gnu99",
-        "c11",
-        "gnu11",
-        "c17",
-        "c18",
-        "gnu17",
-        "gnu18",
-        "iso9899:1990",
-        "iso9899:1999",
-        "iso9899:2011",
-        "iso9899:2017",
-    ] {
+    for spec in ACCEPTED {
         compile_expect_ok(
             &format!("std_ok_{}", spec.replace(':', "_")),
             "int main(void) { return 0; }\n",

@@ -40,7 +40,7 @@ use parse::Parser as CParser;
 use strings::StringTable;
 use symbol::SymbolTable;
 use target::Os;
-use target::{LangOpts, Target};
+use target::{classify_std, StdRequest, Target};
 use token::{
     preprocess_asm_file, preprocess_with_defines, replace_trigraphs, show_token, token_type_name,
     AsmPreprocessConfig, PreprocessConfig, StreamTable, Tokenizer,
@@ -254,15 +254,15 @@ struct Args {
 }
 
 impl Args {
-    /// The language dialect requested by `-std=`, defaulting to `gnu17`.
+    /// Classify `-std=`, if one was given.
     ///
-    /// Returns the offending spelling on failure so the caller can name it in
-    /// the diagnostic. `main` validates this before compiling anything, so
-    /// later callers may treat a failure as unreachable.
-    fn lang_opts(&self) -> Result<LangOpts, &str> {
+    /// c17 compiles one language, so this cannot select anything -- it only
+    /// separates a spelling we recognize from a typo. Returns the offending
+    /// spelling on failure so the caller can name it in the diagnostic.
+    fn std_request(&self) -> Result<Option<StdRequest>, &str> {
         match &self.c17_std {
-            None => Ok(LangOpts::default()),
-            Some(spec) => LangOpts::parse(spec).ok_or(spec.as_str()),
+            None => Ok(None),
+            Some(spec) => classify_std(spec).map(Some).ok_or(spec.as_str()),
         }
     }
 }
@@ -453,8 +453,6 @@ fn process_file(
             no_std_inc: args.no_std_inc,
             no_builtin_inc: args.no_builtin_inc,
             trigraphs: args.trigraphs,
-            // main() has already rejected an unknown -std=.
-            lang: args.lang_opts().unwrap_or_default(),
         },
     );
 
@@ -1303,9 +1301,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    // Validate the dialect alongside the other argument checks, before any
-    // early-return path, so an unknown -std= is never silently accepted.
-    if let Err(spec) = args.lang_opts() {
+    // Validate -std= alongside the other argument checks, before any
+    // early-return path, so a typo is never silently accepted.
+    if let Err(spec) = args.std_request() {
         eprintln!(
             "c17: {}: '{}'",
             gettext("unrecognized C standard for -std="),
@@ -1596,21 +1594,25 @@ mod tests {
     }
 
     #[test]
-    fn test_lang_opts_from_args() {
+    fn test_std_request_from_args() {
         let parse = |argv: &[&str]| {
             let argv = run_preprocess(argv);
             Args::parse_from(argv)
         };
 
-        assert_eq!(parse(&["foo.c"]).lang_opts(), Ok(LangOpts::default()));
+        // No -std= at all is not a request; the language is C17 either way.
+        assert_eq!(parse(&["foo.c"]).std_request(), Ok(None));
         assert_eq!(
-            parse(&["-std=c99", "foo.c"]).lang_opts(),
-            Ok(LangOpts {
-                std: target::CStd::C99,
-                gnu: false
-            })
+            parse(&["-std=c17", "foo.c"]).std_request(),
+            Ok(Some(StdRequest::C17))
         );
-        assert_eq!(parse(&["-std=c42", "foo.c"]).lang_opts(), Err("c42"));
+        // Recognized but older: accepted, and reported as not honoured.
+        assert_eq!(
+            parse(&["-std=c99", "foo.c"]).std_request(),
+            Ok(Some(StdRequest::Older))
+        );
+        // A typo is still an error, not a silently ignored value.
+        assert_eq!(parse(&["-std=c42", "foo.c"]).std_request(), Err("c42"));
     }
 
     #[test]

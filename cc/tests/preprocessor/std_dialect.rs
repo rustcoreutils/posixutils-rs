@@ -274,3 +274,76 @@ fn c17_glibc_minor_matches_the_host() {
         "__GLIBC_MINOR__ should match features.h, not a hardcoded baseline"
     );
 }
+
+/// Asking for an older revision is accepted but not honoured, and c17 says so.
+///
+/// Silence would be the same failure the audit filed against `-std=` in the
+/// first place: a flag taken and thrown away, leaving the user to believe a
+/// request was met. The compiler cannot honour it -- there is one language --
+/// so the least it can do is not pretend otherwise.
+#[test]
+fn c17_warns_that_an_older_std_was_not_honoured() {
+    for spec in ["c89", "c90", "gnu89", "c99", "gnu99", "c11", "gnu11"] {
+        let run = run_c17(&[&format!("-std={spec}"), "--print-targets"]);
+        assert!(run.success, "-std={spec} must still be accepted");
+        assert!(
+            run.stderr.contains("warning") && run.stderr.contains(spec),
+            "-std={spec} should warn and name the spelling, got: {}",
+            run.stderr
+        );
+    }
+}
+
+/// A C17 spelling asks for what we compile, so there is nothing to report.
+#[test]
+fn c17_does_not_warn_for_a_c17_std() {
+    for spec in ["c17", "c18", "gnu17", "gnu18", "iso9899:2017"] {
+        let run = run_c17(&[&format!("-std={spec}"), "--print-targets"]);
+        assert!(run.success, "-std={spec} must be accepted");
+        assert!(
+            !run.stderr.contains("warning"),
+            "-std={spec} matches what c17 compiles and must be silent, got: {}",
+            run.stderr
+        );
+    }
+
+    // Nor when no dialect was requested at all.
+    let run = run_c17(&["--print-targets"]);
+    assert!(!run.stderr.contains("warning"), "got: {}", run.stderr);
+}
+
+/// The warning is suppressible, because build systems emit `-std=` per
+/// translation unit: CPython alone would print it some 500 times.
+#[test]
+fn c17_dialect_warning_can_be_silenced() {
+    for silencer in ["-w", "-Wno-c17-dialect"] {
+        let run = run_c17(&["-std=c11", silencer, "--print-targets"]);
+        assert!(run.success, "{silencer} should be accepted: {}", run.stderr);
+        assert!(
+            !run.stderr.contains("warning"),
+            "{silencer} should silence the dialect warning, got: {}",
+            run.stderr
+        );
+    }
+
+    // An unrelated -Wno- must not silence it, or the flag name means nothing.
+    let run = run_c17(&["-std=c11", "-Wno-unused", "--print-targets"]);
+    assert!(
+        run.stderr.contains("warning"),
+        "-Wno-unused should leave the dialect warning alone, got: {}",
+        run.stderr
+    );
+}
+
+/// `-w` is a warning switch, not a dialect one: it must not hide a typo.
+#[test]
+fn c17_suppression_does_not_hide_an_unknown_std() {
+    for silencer in ["-w", "-Wno-c17-dialect"] {
+        let run = run_c17(&["-std=c42", silencer, "--print-targets"]);
+        assert!(
+            !run.success,
+            "{silencer} must not turn an unknown -std= into a pass"
+        );
+        assert!(run.stderr.contains("c42"), "got: {}", run.stderr);
+    }
+}

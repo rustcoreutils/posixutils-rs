@@ -13,7 +13,7 @@ use gettextrs::{gettext, gettext_args, ngettext_args};
 use std::cell::RefCell;
 use std::fmt;
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 // ============================================================================
 // Source Position
@@ -272,6 +272,22 @@ static HAS_ERROR: AtomicU32 = AtomicU32::new(0);
 static ERROR_COUNT: AtomicU32 = AtomicU32::new(0);
 static WARNING_COUNT: AtomicU32 = AtomicU32::new(0);
 
+/// Set by `-w`: warnings are counted but not printed.
+///
+/// Counting them still is deliberate -- `-w` is about output, and a caller
+/// asking how many warnings a translation unit produced should get the truth.
+static SUPPRESS_WARNINGS: AtomicBool = AtomicBool::new(false);
+
+/// Suppress warning output for the rest of the process (`-w`).
+pub fn suppress_warnings() {
+    SUPPRESS_WARNINGS.store(true, Ordering::Relaxed);
+}
+
+/// Are warnings being printed?
+pub fn warnings_suppressed() -> bool {
+    SUPPRESS_WARNINGS.load(Ordering::Relaxed)
+}
+
 /// Get current error state
 pub fn has_error() -> u32 {
     HAS_ERROR.load(Ordering::Relaxed)
@@ -378,6 +394,9 @@ fn do_diag(level: DiagLevel, pos: Position, msg: &str) {
         }
         DiagLevel::Warning => {
             WARNING_COUNT.fetch_add(1, Ordering::Relaxed);
+            if warnings_suppressed() {
+                return;
+            }
         }
     }
 

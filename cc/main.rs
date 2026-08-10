@@ -30,7 +30,9 @@ mod token;
 mod types;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{
+    bind_textdomain_codeset, gettext, gettext_args, setlocale, textdomain, LocaleCategory,
+};
 use std::fs::File;
 use std::io::{self, BufReader, Read, Write};
 use std::path::Path;
@@ -190,6 +192,9 @@ struct Args {
           num_args = 0..=1, default_missing_value = "extra", help = gettext("Warning flags (e.g., -Wall, -Wextra, -Wno-unused)"))]
     warnings: Vec<String>,
 
+    #[arg(short = 'w', help = gettext("Suppress all warnings"))]
+    no_warnings: bool,
+
     #[arg(long = "pedantic", hide = true, help = gettext("Pedantic mode (compatibility)"))]
     pedantic: bool,
 
@@ -253,6 +258,9 @@ struct Args {
     unsupported_mflags: Vec<String>,
 }
 
+/// The `-Wno-` name for the "`-std=` was not honoured" warning.
+const STD_DIALECT_WARNING: &str = "c17-dialect";
+
 impl Args {
     /// Classify `-std=`, if one was given.
     ///
@@ -264,6 +272,15 @@ impl Args {
             None => Ok(None),
             Some(spec) => classify_std(spec).map(Some).ok_or(spec.as_str()),
         }
+    }
+
+    /// Is the warning named `name` turned off, by `-w` or `-Wno-<name>`?
+    fn warning_suppressed(&self, name: &str) -> bool {
+        self.no_warnings
+            || self
+                .warnings
+                .iter()
+                .any(|w| w.strip_prefix("no-") == Some(name))
     }
 }
 
@@ -1301,15 +1318,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
+    if args.no_warnings {
+        diag::suppress_warnings();
+    }
+
     // Validate -std= alongside the other argument checks, before any
     // early-return path, so a typo is never silently accepted.
-    if let Err(spec) = args.std_request() {
-        eprintln!(
-            "c17: {}: '{}'",
-            gettext("unrecognized C standard for -std="),
-            spec
-        );
-        std::process::exit(1);
+    match args.std_request() {
+        Err(spec) => {
+            eprintln!(
+                "c17: {}: '{}'",
+                gettext("unrecognized C standard for -std="),
+                spec
+            );
+            std::process::exit(1);
+        }
+        // Say plainly that an older revision was not honoured. c17 compiles
+        // C17 and only C17, so the flag is accepted -- build systems pass it
+        // unconditionally -- but silently ignoring it is what let
+        // __STDC_VERSION__ disagree with the binary's own name once already.
+        Ok(Some(StdRequest::Older)) if !args.warning_suppressed(STD_DIALECT_WARNING) => {
+            let spec = args.c17_std.as_deref().unwrap_or_default();
+            eprintln!(
+                "c17: {}: {}",
+                gettext("warning"),
+                gettext_args(
+                    "'-std={0}' ignored; c17 compiles C17 (ISO/IEC 9899:2018) only",
+                    &[spec]
+                )
+            );
+        }
+        Ok(_) => {}
     }
 
     // Handle --print-targets

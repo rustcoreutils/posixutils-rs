@@ -2691,13 +2691,7 @@ impl<'a> Linearizer<'a> {
                 let base_struct_type = self.expr_type(expr);
                 let struct_type = self.resolve_struct_type(base_struct_type);
                 if let Some(member_info) = self.types.find_member(struct_type, *member) {
-                    self.emit(Instruction::store(
-                        final_result,
-                        base,
-                        member_info.offset as i64,
-                        typ,
-                        store_size,
-                    ));
+                    self.emit_member_store(base, &member_info, final_result);
                 }
             }
             ExprKind::Arrow { expr, member } => {
@@ -2707,13 +2701,7 @@ impl<'a> Linearizer<'a> {
                 let base_struct_type = self.types.base_type(ptr_type).unwrap_or(typ);
                 let struct_type = self.resolve_struct_type(base_struct_type);
                 if let Some(member_info) = self.types.find_member(struct_type, *member) {
-                    self.emit(Instruction::store(
-                        final_result,
-                        ptr,
-                        member_info.offset as i64,
-                        typ,
-                        store_size,
-                    ));
+                    self.emit_member_store(ptr, &member_info, final_result);
                 }
             }
             ExprKind::Index { array, index } => {
@@ -3025,13 +3013,7 @@ impl<'a> Linearizer<'a> {
                     let base_struct_type = self.expr_type(expr);
                     let struct_type = self.resolve_struct_type(base_struct_type);
                     if let Some(member_info) = self.types.find_member(struct_type, *member) {
-                        self.emit(Instruction::store(
-                            final_result,
-                            base,
-                            member_info.offset as i64,
-                            typ,
-                            store_size,
-                        ));
+                        self.emit_member_store(base, &member_info, final_result);
                     }
                 }
                 ExprKind::Arrow { expr, member } => {
@@ -3041,13 +3023,7 @@ impl<'a> Linearizer<'a> {
                     let base_struct_type = self.types.base_type(ptr_type).unwrap_or(typ);
                     let struct_type = self.resolve_struct_type(base_struct_type);
                     if let Some(member_info) = self.types.find_member(struct_type, *member) {
-                        self.emit(Instruction::store(
-                            final_result,
-                            ptr,
-                            member_info.offset as i64,
-                            typ,
-                            store_size,
-                        ));
+                        self.emit_member_store(ptr, &member_info, final_result);
                     }
                 }
                 ExprKind::Unary {

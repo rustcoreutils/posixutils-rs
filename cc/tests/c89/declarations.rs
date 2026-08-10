@@ -317,3 +317,83 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("c89_declarations_mega", code, &[]), 0);
 }
+
+/// `++` and `--` on a bitfield must change only that field.
+///
+/// They did not: the increment path stored its result with a plain store of
+/// the whole storage unit, so the value landed at bit 0 and every neighbour
+/// sharing the unit was wiped. On `struct A{unsigned a:3;int b:5;unsigned
+/// c:1;signed d:4;}` holding `{7,5,1,-8}`, `a.b++` gave `6 0 0 0` where gcc
+/// gives `7 6 1 -8` -- literally the value 6 written at offset 0.
+///
+/// Assignment and compound assignment were always correct, because they went
+/// through `emit_bitfield_store`; the increment path simply did not. All four
+/// now share `emit_member_store`.
+#[test]
+fn c89_bitfield_increment_leaves_neighbours_alone() {
+    let code = r#"
+#include <stdio.h>
+#include <string.h>
+
+struct A { unsigned a:3; int b:5; unsigned c:1; signed d:4; };
+struct U { unsigned x:4; unsigned y:4; };
+
+static int check(struct A got, unsigned a, int b, unsigned c, int d) {
+    return got.a == a && got.b == b && got.c == c && got.d == d;
+}
+
+static struct A by_value(struct A v) { v.b++; return v; }
+
+int main(void) {
+    struct A base = {7, 5, 1, -8};
+    struct A t;
+
+    t = base; t.b++;   if (!check(t, 7, 6, 1, -8)) return 1;
+    t = base; ++t.b;   if (!check(t, 7, 6, 1, -8)) return 2;
+    t = base; t.b--;   if (!check(t, 7, 4, 1, -8)) return 3;
+    t = base; --t.b;   if (!check(t, 7, 4, 1, -8)) return 4;
+
+    /* Each field in turn, so a wrong bit offset cannot pass by luck. */
+    t = base; t.a++;   if (!check(t, 0, 5, 1, -8)) return 5;   /* 7+1 wraps 3 bits */
+    t = base; t.c++;   if (!check(t, 7, 5, 0, -8)) return 6;   /* 1+1 wraps 1 bit  */
+    t = base; t.d++;   if (!check(t, 7, 5, 1, -7)) return 7;
+
+    /* The value of the expression: postfix is the old value, prefix the new. */
+    t = base; if (t.b++ != 5) return 8;
+    t = base; if (++t.b != 6) return 9;
+
+    /* Signed wrap at the field's width, not the storage unit's. */
+    t = base; t.b = 15; t.b++;  if (t.b != -16) return 10;
+    t = base; t.b = -16; t.b--; if (t.b != 15) return 11;
+
+    /* Every access path, since each had its own store. */
+    struct A arr[2] = {{7,5,1,-8}, {7,5,1,-8}};
+    arr[1].b++;
+    if (!check(arr[1], 7, 6, 1, -8)) return 12;
+    if (!check(arr[0], 7, 5, 1, -8)) return 13;
+
+    t = base;
+    struct A *p = &t; p->b++;
+    if (!check(t, 7, 6, 1, -8)) return 14;
+
+    t = base; t = by_value(t);
+    if (!check(t, 7, 6, 1, -8)) return 15;
+
+    /* Two fields in one unit, so a full-unit write is unmissable. */
+    struct U u = {5, 6}; u.x++;
+    if (u.x != 6 || u.y != 6) return 16;
+
+    /* Compound and plain assignment, which always worked -- pinned so a fix
+       to one path cannot regress the other. */
+    t = base; t.b += 1;      if (!check(t, 7, 6, 1, -8)) return 17;
+    t = base; t.b = t.b + 1; if (!check(t, 7, 6, 1, -8)) return 18;
+    t = base; t.b = 6;       if (!check(t, 7, 6, 1, -8)) return 19;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c89_bitfield_increment_leaves_neighbours_alone", code, &[]),
+        0
+    );
+}

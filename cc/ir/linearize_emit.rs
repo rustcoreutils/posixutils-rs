@@ -304,6 +304,46 @@ impl<'a> super::linearize::Linearizer<'a> {
         result
     }
 
+    /// Store `value` into a struct member at `base`, honouring a bitfield's
+    /// placement within its storage unit.
+    ///
+    /// A plain `Instruction::store` writes the whole storage unit, which for a
+    /// bitfield overwrites every neighbour sharing it -- and, because the value
+    /// is written at bit 0, gets the field itself wrong too. Assignment and
+    /// compound assignment already went through `emit_bitfield_store`; `++` and
+    /// `--` did not, which is the entire bug behind `s.field++` corrupting the
+    /// struct around it.
+    pub(crate) fn emit_member_store(
+        &mut self,
+        base: PseudoId,
+        member_info: &MemberInfo,
+        value: PseudoId,
+    ) {
+        if let (Some(bit_offset), Some(bit_width), Some(storage_size)) = (
+            member_info.bit_offset,
+            member_info.bit_width,
+            member_info.storage_unit_size,
+        ) {
+            self.emit_bitfield_store(
+                base,
+                member_info.offset,
+                bit_offset,
+                bit_width,
+                storage_size,
+                value,
+            );
+        } else {
+            let size = self.types.size_bits(member_info.typ);
+            self.emit(Instruction::store(
+                value,
+                base,
+                member_info.offset as i64,
+                member_info.typ,
+                size,
+            ));
+        }
+    }
+
     /// Emit code to store a value into a bitfield
     pub(crate) fn emit_bitfield_store(
         &mut self,

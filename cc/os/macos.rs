@@ -10,32 +10,35 @@
 //
 
 /// Get macOS-specific predefined macros
-pub fn get_macros() -> Vec<(&'static str, Option<&'static str>)> {
+pub fn get_macros() -> Vec<(&'static str, Option<String>)> {
     vec![
         // Darwin/macOS identification
-        ("__APPLE__", Some("1")),
-        ("__MACH__", Some("1")),
-        ("__DARWIN__", Some("1")),
+        ("__APPLE__", Some("1".into())),
+        ("__MACH__", Some("1".into())),
+        ("__DARWIN__", Some("1".into())),
         // Mach-O binary format
-        ("__MACH_O__", Some("1")),
+        ("__MACH_O__", Some("1".into())),
         // BSD compatibility
         ("__FreeBSD__", None), // Not defined
         ("__NetBSD__", None),  // Not defined
         // Apple extensions
-        ("__APPLE_CC__", Some("1")),
+        ("__APPLE_CC__", Some("1".into())),
         // Disable _FORTIFY_SOURCE — macOS headers redirect memset/memcpy/strcpy
         // to __memset_chk etc. which requires full fortification builtin support
-        ("_FORTIFY_SOURCE", Some("0")),
+        ("_FORTIFY_SOURCE", Some("0".into())),
         // Darwin/BSD feature test macros - enables SIGWINCH, SA_RESTART, etc.
-        ("_DARWIN_C_SOURCE", Some("1")),
+        ("_DARWIN_C_SOURCE", Some("1".into())),
         // POSIX threads
-        ("_REENTRANT", Some("1")),
+        ("_REENTRANT", Some("1".into())),
         // Version - match current macOS version (26.0.0 = macOS Tahoe)
         (
             "__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__",
-            Some("260000"),
+            Some("260000".into()),
         ),
-        ("__ENVIRONMENT_OS_VERSION_MIN_REQUIRED__", Some("260000")),
+        (
+            "__ENVIRONMENT_OS_VERSION_MIN_REQUIRED__",
+            Some("260000".into()),
+        ),
     ]
 }
 

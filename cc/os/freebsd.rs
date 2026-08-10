@@ -10,18 +10,18 @@
 //
 
 /// Get FreeBSD-specific predefined macros
-pub fn get_macros() -> Vec<(&'static str, Option<&'static str>)> {
+pub fn get_macros() -> Vec<(&'static str, Option<String>)> {
     vec![
         // FreeBSD identification
-        ("__FreeBSD__", Some("13")), // Conservative version
-        ("__FreeBSD_kernel__", Some("1")),
+        ("__FreeBSD__", Some("13".into())), // Conservative version
+        ("__FreeBSD_kernel__", Some("1".into())),
         // ELF binary format
-        ("__ELF__", Some("1")),
+        ("__ELF__", Some("1".into())),
         // BSD compatibility
-        ("BSD", Some("199506")),
-        ("__BSD_VISIBLE", Some("1")),
+        ("BSD", Some("199506".into())),
+        ("__BSD_VISIBLE", Some("1".into())),
         // POSIX threads
-        ("_REENTRANT", Some("1")),
+        ("_REENTRANT", Some("1".into())),
     ]
 }
 

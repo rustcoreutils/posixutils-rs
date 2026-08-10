@@ -40,7 +40,7 @@ use parse::Parser as CParser;
 use strings::StringTable;
 use symbol::SymbolTable;
 use target::Os;
-use target::Target;
+use target::{LangOpts, Target};
 use token::{
     preprocess_asm_file, preprocess_with_defines, replace_trigraphs, show_token, token_type_name,
     AsmPreprocessConfig, PreprocessConfig, StreamTable, Tokenizer,
@@ -193,6 +193,13 @@ struct Args {
     #[arg(long = "pedantic", hide = true, help = gettext("Pedantic mode (compatibility)"))]
     pedantic: bool,
 
+    /// C standard dialect, from `-std=` (rewritten by `preprocess_args_from`).
+    ///
+    /// Hidden because the user-facing spelling is `-std=`, which clap cannot
+    /// express directly.
+    #[arg(long = "c17-std", hide = true, value_name = "std")]
+    c17_std: Option<String>,
+
     /// Print compilation statistics (for capacity tuning)
     #[arg(long = "stats", help = gettext("Print compilation statistics"))]
     stats: bool,
@@ -244,6 +251,20 @@ struct Args {
     /// Unsupported machine flags captured by preprocess_args
     #[arg(long = "c17-unsupported-mflag", action = clap::ArgAction::Append, value_name = "flag", hide = true)]
     unsupported_mflags: Vec<String>,
+}
+
+impl Args {
+    /// The language dialect requested by `-std=`, defaulting to `gnu17`.
+    ///
+    /// Returns the offending spelling on failure so the caller can name it in
+    /// the diagnostic. `main` validates this before compiling anything, so
+    /// later callers may treat a failure as unreachable.
+    fn lang_opts(&self) -> Result<LangOpts, &str> {
+        match &self.c17_std {
+            None => Ok(LangOpts::default()),
+            Some(spec) => LangOpts::parse(spec).ok_or(spec.as_str()),
+        }
+    }
 }
 
 /// Valid stage names for --dump-ir.
@@ -432,6 +453,8 @@ fn process_file(
             no_std_inc: args.no_std_inc,
             no_builtin_inc: args.no_builtin_inc,
             trigraphs: args.trigraphs,
+            // main() has already rejected an unknown -std=.
+            lang: args.lang_opts().unwrap_or_default(),
         },
     );
 
@@ -794,11 +817,19 @@ fn is_valid_opt_level(s: &str) -> bool {
     matches!(s, "0" | "1" | "2" | "3" | "s" | "z" | "fast" | "g")
 }
 
+/// Preprocess this process's command-line arguments for gcc compatibility.
+fn preprocess_args() -> Vec<String> {
+    preprocess_args_from(std::env::args().collect())
+}
+
 /// Preprocess command-line arguments for gcc compatibility.
 /// - Converts -Wall → -W all, -Wextra → -W extra, etc.
 /// - Handles -O flag: standalone -O followed by non-level becomes -O1
-fn preprocess_args() -> Vec<String> {
-    let raw_args: Vec<String> = std::env::args().collect();
+///
+/// Takes the raw argument vector rather than reading the environment so the
+/// unit tests exercise this exact function. They previously re-implemented it,
+/// and the copy had already drifted.
+fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
     let mut result = Vec::with_capacity(raw_args.len());
     let mut i = 0;
     let mut o_flag_idx: Option<usize> = None; // index into result of the -O flag
@@ -858,8 +889,10 @@ fn preprocess_args() -> Vec<String> {
             result.push("-B".to_string());
             result.push(arg[2..].to_string());
             i += 1;
-        } else if arg.starts_with("-std=") {
-            // -std=c99, -std=c11, etc. - ignore (c17 is C99)
+        } else if let Some(spec) = arg.strip_prefix("-std=") {
+            // -std=c17 → --c17-std c17 (internal flag), so clap can see it.
+            result.push("--c17-std".to_string());
+            result.push(spec.to_string());
             i += 1;
         } else if arg == "-fPIC" || arg == "-fpic" {
             // -fPIC / -fpic → --c17-fpic (internal flag) (first one only)
@@ -1259,6 +1292,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
+    // Validate the dialect alongside the other argument checks, before any
+    // early-return path, so an unknown -std= is never silently accepted.
+    if let Err(spec) = args.lang_opts() {
+        eprintln!(
+            "c17: {}: '{}'",
+            gettext("unrecognized C standard for -std="),
+            spec
+        );
+        std::process::exit(1);
+    }
+
     // Handle --print-targets
     if args.print_targets {
         println!("  Registered Targets:");
@@ -1513,123 +1557,49 @@ mod tests {
     // ========================================================================
 
     fn run_preprocess(args: &[&str]) -> Vec<String> {
-        // Simulate preprocess_args logic with all flag handling
         let raw_args: Vec<String> = std::iter::once("c17".to_string())
             .chain(args.iter().map(|s| s.to_string()))
             .collect();
+        preprocess_args_from(raw_args)
+    }
 
-        let mut result = Vec::with_capacity(raw_args.len());
-        let mut i = 0;
-        let mut o_flag_idx: Option<usize> = None;
-        let mut seen_fpic = false;
+    #[test]
+    fn test_preprocess_std_is_forwarded_not_dropped() {
+        // -std= used to be consumed and discarded here, which is why
+        // __STDC_VERSION__ could not follow it (audit #P1/#X2).
+        let result = run_preprocess(&["-std=c11", "foo.c"]);
+        assert!(result.contains(&"--c17-std".to_string()));
+        assert!(result.contains(&"c11".to_string()));
+        assert!(!result.iter().any(|a| a.starts_with("-std=")));
+        // The operand survives alongside it.
+        assert!(result.contains(&"foo.c".to_string()));
+    }
 
-        while i < raw_args.len() {
-            let arg = &raw_args[i];
+    #[test]
+    fn test_preprocess_std_keeps_unknown_spelling_for_diagnosis() {
+        // The rewriter does not validate; `main` reports the bad spelling so
+        // the diagnostic can quote it.
+        let result = run_preprocess(&["-std=c42", "foo.c"]);
+        assert!(result.contains(&"--c17-std".to_string()));
+        assert!(result.contains(&"c42".to_string()));
+    }
 
-            if arg == "-O" {
-                let new_flag = if i + 1 < raw_args.len() && is_valid_opt_level(&raw_args[i + 1]) {
-                    let flag = format!("-O{}", raw_args[i + 1]);
-                    i += 2;
-                    flag
-                } else {
-                    i += 1;
-                    "-O1".to_string()
-                };
-                if let Some(idx) = o_flag_idx {
-                    result[idx] = new_flag;
-                } else {
-                    o_flag_idx = Some(result.len());
-                    result.push(new_flag);
-                }
-            } else if arg.starts_with("-O") && arg.len() > 2 {
-                if let Some(idx) = o_flag_idx {
-                    result[idx] = arg.clone();
-                } else {
-                    o_flag_idx = Some(result.len());
-                    result.push(arg.clone());
-                }
-                i += 1;
-            } else if arg.starts_with("-W") && arg.len() > 2 && !arg.starts_with("-Wl,") {
-                result.push("-W".to_string());
-                result.push(arg[2..].to_string());
-                i += 1;
-            } else if arg.starts_with("-L") && arg.len() > 2 {
-                result.push("-L".to_string());
-                result.push(arg[2..].to_string());
-                i += 1;
-            } else if arg.starts_with("-l") && arg.len() > 2 {
-                result.push("-l".to_string());
-                result.push(arg[2..].to_string());
-                i += 1;
-            } else if arg.starts_with("-std=") {
-                i += 1;
-            } else if arg == "-fPIC" || arg == "-fpic" {
-                if !seen_fpic {
-                    result.push("--c17-fpic".to_string());
-                    seen_fpic = true;
-                }
-                i += 1;
-            } else if arg == "-fPIE" || arg == "-fpie" {
-                result.push("--c17-fpie".to_string());
-                i += 1;
-            } else if arg == "-fno-pie" {
-                result.push("--c17-fno-pie".to_string());
-                i += 1;
-            } else if arg == "-shared" {
-                result.push("--shared".to_string());
-                i += 1;
-            } else if arg == "-fno-builtin" {
-                result.push("--fno-builtin".to_string());
-                i += 1;
-            } else if let Some(func) = arg.strip_prefix("-fno-builtin-") {
-                result.push("--c17-fno-builtin-func".to_string());
-                result.push(func.to_string());
-                i += 1;
-            } else if arg.starts_with("-m") && arg.len() > 2 {
-                // Machine flags - unsupported (SIMD/arch not supported yet)
-                result.push(format!("--c17-unsupported-mflag={}", arg));
-                i += 1;
-            } else if (arg.starts_with("-f") && !arg.starts_with("-fno-builtin"))
-                || arg == "-p"
-                || arg == "-pg"
-                || arg == "-pipe"
-            {
-                // Silently ignore -f* flags, profiling flags, -pipe
-                i += 1;
-            } else if arg == "-pie" {
-                result.push("--c17-fpie".to_string());
-                result.push("--c17-linker-flag=-pie".to_string());
-                i += 1;
-            } else if arg == "-no-pie" {
-                result.push("--c17-fno-pie".to_string());
-                result.push("--c17-linker-flag=-no-pie".to_string());
-                i += 1;
-            } else if let Some(wl_args) = arg.strip_prefix("-Wl,") {
-                for flag in wl_args.split(',') {
-                    result.push(format!("--c17-linker-flag={}", flag));
-                }
-                i += 1;
-            } else if arg == "-Xlinker" {
-                if i + 1 < raw_args.len() {
-                    result.push(format!("--c17-linker-flag={}", raw_args[i + 1]));
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            } else if arg == "-pthread" {
-                result.push("--c17-linker-flag=-pthread".to_string());
-                result.push("-D".to_string());
-                result.push("_REENTRANT".to_string());
-                i += 1;
-            } else if arg == "-rdynamic" {
-                result.push("--c17-linker-flag=-rdynamic".to_string());
-                i += 1;
-            } else {
-                result.push(arg.clone());
-                i += 1;
-            }
-        }
-        result
+    #[test]
+    fn test_lang_opts_from_args() {
+        let parse = |argv: &[&str]| {
+            let argv = run_preprocess(argv);
+            Args::parse_from(argv)
+        };
+
+        assert_eq!(parse(&["foo.c"]).lang_opts(), Ok(LangOpts::default()));
+        assert_eq!(
+            parse(&["-std=c99", "foo.c"]).lang_opts(),
+            Ok(LangOpts {
+                std: target::CStd::C99,
+                gnu: false
+            })
+        );
+        assert_eq!(parse(&["-std=c42", "foo.c"]).lang_opts(), Err("c42"));
     }
 
     #[test]

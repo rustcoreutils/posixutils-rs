@@ -14,3 +14,4 @@
 mod conformance;
 mod directives;
 mod macros;
+mod std_dialect;

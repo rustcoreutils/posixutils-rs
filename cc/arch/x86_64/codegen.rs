@@ -4800,11 +4800,40 @@ impl X86_64CodeGen {
                     dst: GpOperand::Reg(reg),
                 });
             }
-            _ => {
-                // Default: load 0
+            // A caller-passed stack argument. Reachable whenever an atomic
+            // operand is the seventh or later parameter; it used to fall to
+            // the `load 0` default below, which for an address operand meant
+            // dereferencing a null pointer.
+            Loc::IncomingArg(offset) => {
                 self.push_lir(X86Inst::Mov {
                     size: op_size,
-                    src: GpOperand::Imm(0),
+                    src: GpOperand::Mem(MemAddr::BaseOffset {
+                        base: Reg::Rbp,
+                        offset,
+                    }),
+                    dst: GpOperand::Reg(reg),
+                });
+            }
+            // The atomic operations move values through general-purpose
+            // registers, so a floating-point operand has to come across as its
+            // bit pattern. Silently loading 0 here is what made every
+            // `_Atomic float`/`_Atomic double` operation produce zero.
+            Loc::Xmm(x) => {
+                self.push_lir(X86Inst::MovXmmGp {
+                    size: op_size,
+                    src: x,
+                    dst: reg,
+                });
+            }
+            Loc::FImm(v, bits) => {
+                let pattern: i64 = if bits <= 32 {
+                    (v as f32).to_bits() as i64
+                } else {
+                    v.to_bits() as i64
+                };
+                self.push_lir(X86Inst::Mov {
+                    size: op_size,
+                    src: GpOperand::Imm(pattern),
                     dst: GpOperand::Reg(reg),
                 });
             }

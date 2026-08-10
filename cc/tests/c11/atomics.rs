@@ -723,3 +723,64 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("c11_atomic_aggregate", code, &[]), 0);
 }
+
+/// C17 6.7.6.1: `_Atomic` is a type qualifier, so it may appear in the
+/// qualifier run after a `*` — `int *_Atomic p;` is an atomic pointer to int.
+///
+/// It parsed inside a function and failed at file scope, because the pointer
+/// qualifier loop existed in three copies and only one listed `_Atomic`. At
+/// file scope it fell through to the name position instead, so `int *_Atomic;`
+/// was quietly accepted as declaring a variable named `_Atomic`.
+#[test]
+fn c11_atomic_pointer_qualifier() {
+    let code = r#"
+#include <stdatomic.h>
+
+static int target = 41;
+/* At file scope: the path that used to fail. */
+int *_Atomic g_ptr;
+int *const _Atomic g_cptr = &target;
+
+int main(void) {
+    /* And inside a function, which always worked — pinned so the two paths
+       cannot drift apart again. */
+    int *_Atomic p;
+    atomic_store(&p, &target);
+    if (atomic_load(&p) != &target) return 1;
+
+    atomic_store(&g_ptr, &target);
+    if (*atomic_load(&g_ptr) != 41) return 2;
+    if (*g_cptr != 41) return 3;
+
+    /* The qualifier is order-independent, like const and restrict. */
+    int *_Atomic const q = &target;
+    if (*q != 41) return 4;
+
+    /* An atomic pointer really is atomic: exchange returns the old value. */
+    static int other = 7;
+    int *old = atomic_exchange(&g_ptr, &other);
+    if (old != &target) return 5;
+    if (*atomic_load(&g_ptr) != 7) return 6;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c11_atomic_pointer_qualifier", code, &[]),
+        0
+    );
+}
+
+/// C17 6.7.6.2: an array declarator's qualifier list also admits `_Atomic`.
+#[test]
+fn c11_atomic_in_array_declarator() {
+    let code = r#"
+void f(int a[_Atomic 4]);
+void f(int a[_Atomic 4]) { (void)a; }
+int main(void) { int v[4] = {0}; f(v); return 0; }
+"#;
+    assert_eq!(
+        compile_and_run("c11_atomic_in_array_declarator", code, &[]),
+        0
+    );
+}

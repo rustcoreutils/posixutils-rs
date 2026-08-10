@@ -2542,6 +2542,33 @@ impl Parser<'_> {
         }
     }
 
+    /// Consume the type-qualifier run after a `*` in a declarator.
+    ///
+    /// C17 6.7.6.1 lets any type qualifier appear there, `_Atomic` included:
+    /// `int *_Atomic p;` declares an atomic pointer to int. Three copies of
+    /// this loop had drifted apart and only the one in `parse_declarator`
+    /// listed `_Atomic`, so the same declaration parsed inside a function and
+    /// failed at file scope -- where `_Atomic` fell through to the name
+    /// position and was taken as the identifier instead.
+    fn parse_pointer_qualifiers(&mut self) -> TypeModifiers {
+        let mut modifiers = TypeModifiers::empty();
+        while self.peek() == TokenType::Ident {
+            let Some(name_id) = self.get_ident_id(self.current()) else {
+                break;
+            };
+            match name_id {
+                crate::kw::CONST => modifiers |= TypeModifiers::CONST,
+                crate::kw::VOLATILE => modifiers |= TypeModifiers::VOLATILE,
+                crate::kw::RESTRICT => modifiers |= TypeModifiers::RESTRICT,
+                crate::kw::ATOMIC => modifiers |= TypeModifiers::ATOMIC,
+                _ if super::is_nullability_qualifier(name_id) => {}
+                _ => break,
+            }
+            self.advance();
+        }
+        modifiers
+    }
+
     /// Parse a declarator (name and type modifiers)
     ///
     /// C declarators are parsed "inside-out". For example, `int (*p)[3]`:
@@ -2559,35 +2586,7 @@ impl Parser<'_> {
             self.advance();
             let mut ptr_modifiers = TypeModifiers::empty();
 
-            // Parse pointer qualifiers (const, volatile, restrict, _Atomic, nullability)
-            while self.peek() == TokenType::Ident {
-                if let Some(name_id) = self.get_ident_id(self.current()) {
-                    match name_id {
-                        crate::kw::CONST => {
-                            self.advance();
-                            ptr_modifiers |= TypeModifiers::CONST;
-                        }
-                        crate::kw::VOLATILE => {
-                            self.advance();
-                            ptr_modifiers |= TypeModifiers::VOLATILE;
-                        }
-                        crate::kw::RESTRICT => {
-                            self.advance();
-                            ptr_modifiers |= TypeModifiers::RESTRICT;
-                        }
-                        crate::kw::ATOMIC => {
-                            self.advance();
-                            ptr_modifiers |= TypeModifiers::ATOMIC;
-                        }
-                        _ if super::is_nullability_qualifier(name_id) => {
-                            self.advance();
-                        }
-                        _ => break,
-                    }
-                } else {
-                    break;
-                }
-            }
+            ptr_modifiers |= self.parse_pointer_qualifiers();
             pointer_modifiers.push(ptr_modifiers);
         }
 
@@ -2654,10 +2653,14 @@ impl Parser<'_> {
             while self.peek() == TokenType::Ident {
                 if let Some(name_id) = self.get_ident_id(self.current()) {
                     match name_id {
+                        // C17 6.7.6.2: the array declarator of a parameter
+                        // takes a type-qualifier list, which includes
+                        // `_Atomic`, and optionally `static`.
                         crate::kw::STATIC
                         | crate::kw::CONST
                         | crate::kw::VOLATILE
-                        | crate::kw::RESTRICT => {
+                        | crate::kw::RESTRICT
+                        | crate::kw::ATOMIC => {
                             self.advance();
                         }
                         _ => break,
@@ -2914,31 +2917,7 @@ impl Parser<'_> {
             self.advance();
             let mut ptr_modifiers = TypeModifiers::empty();
 
-            // Parse pointer qualifiers
-            while self.peek() == TokenType::Ident {
-                if let Some(name_id) = self.get_ident_id(self.current()) {
-                    match name_id {
-                        crate::kw::CONST => {
-                            self.advance();
-                            ptr_modifiers |= TypeModifiers::CONST;
-                        }
-                        crate::kw::VOLATILE => {
-                            self.advance();
-                            ptr_modifiers |= TypeModifiers::VOLATILE;
-                        }
-                        crate::kw::RESTRICT => {
-                            self.advance();
-                            ptr_modifiers |= TypeModifiers::RESTRICT;
-                        }
-                        _ if super::is_nullability_qualifier(name_id) => {
-                            self.advance();
-                        }
-                        _ => break,
-                    }
-                } else {
-                    break;
-                }
-            }
+            ptr_modifiers |= self.parse_pointer_qualifiers();
 
             let ptr_type = Type {
                 kind: TypeKind::Pointer,
@@ -3409,31 +3388,7 @@ impl Parser<'_> {
             self.advance();
             let mut ptr_modifiers = TypeModifiers::empty();
 
-            // Parse pointer qualifiers
-            while self.peek() == TokenType::Ident {
-                if let Some(name_id) = self.get_ident_id(self.current()) {
-                    match name_id {
-                        crate::kw::CONST => {
-                            self.advance();
-                            ptr_modifiers |= TypeModifiers::CONST;
-                        }
-                        crate::kw::VOLATILE => {
-                            self.advance();
-                            ptr_modifiers |= TypeModifiers::VOLATILE;
-                        }
-                        crate::kw::RESTRICT => {
-                            self.advance();
-                            ptr_modifiers |= TypeModifiers::RESTRICT;
-                        }
-                        _ if super::is_nullability_qualifier(name_id) => {
-                            self.advance();
-                        }
-                        _ => break,
-                    }
-                } else {
-                    break;
-                }
-            }
+            ptr_modifiers |= self.parse_pointer_qualifiers();
 
             let ptr_type = Type {
                 kind: TypeKind::Pointer,

@@ -4958,6 +4958,39 @@ fn test_hex_float_extreme_exponents() {
     }
 }
 
+/// C17 6.7.6.1: `_Atomic` is a type qualifier, so it belongs in the qualifier
+/// run after a `*` exactly like `const`.
+///
+/// Three copies of that loop had drifted apart and only the one in
+/// `parse_declarator` listed `_Atomic`, so `int *_Atomic p;` parsed inside a
+/// function and failed at file scope -- and worse, `int *_Atomic;` was
+/// *accepted*, because `_Atomic` fell through to the name position and became
+/// the identifier. Both file-scope paths (`parse_external_decl` and
+/// `parse_function_def`) now share one helper with the declarator's.
+#[test]
+fn test_atomic_is_a_pointer_qualifier() {
+    for src in [
+        "int *_Atomic p;",
+        "int *const _Atomic p;",
+        "int *_Atomic const p;",
+        "int *restrict _Atomic p;",
+        "static int *_Atomic p;",
+    ] {
+        let parsed = parse_decl(src);
+        assert!(parsed.is_ok(), "{src} should parse: {:?}", parsed.err());
+    }
+}
+
+/// The qualifier must not be usable as the declared name.
+#[test]
+fn test_atomic_is_not_an_identifier() {
+    assert!(
+        parse_decl("int *_Atomic;").is_err(),
+        "`int *_Atomic;` names nothing and must be rejected, not treated as a \
+         declaration of a variable called _Atomic"
+    );
+}
+
 // ========================================================================
 // Alignment tests
 // ========================================================================

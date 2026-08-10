@@ -263,3 +263,80 @@ fn codegen_aarch64_long_double_complex_compiles() {
         "a long double _Complex returns in q0/q1, not through an sret pointer:\n{body}"
     );
 }
+
+/// A stacked two-element floating-point argument must be copied at its own
+/// element size.
+///
+/// `copy_stacked_pair_to_local` derived the stride with `complex_fp_info`,
+/// which answers `(Double, 8)` for anything that is not complex -- including a
+/// `struct { float x, y; }`, whose elements are 4 bytes. So an HFA-2 struct was
+/// copied at twice its stride, reading 8 bytes past the incoming slot and
+/// writing 8 bytes past the local, and the callee saw garbage.
+#[test]
+fn codegen_aarch64_stacked_hfa_uses_its_own_element_size() {
+    let src = r#"
+        struct P { float x, y; };
+        float f(double a, double b, double c, double d,
+                double e, double g, double h, double i,
+                struct P p) { return p.x + p.y; }
+    "#;
+    let asm = super::asm_probe::asm_for("stacked_hfa", "aarch64-unknown-linux-gnu", src);
+    let body = super::asm_probe::body_of(&asm, "f");
+
+    // Elements are floats, so the copy must use S registers.
+    assert!(
+        body.contains("ldr s") && body.contains("str s"),
+        "a {{float,float}} HFA must be copied 4 bytes at a time:\n{body}"
+    );
+    // A D-register copy of the pair is the bug: 8-byte stride on 4-byte
+    // elements. (Other D accesses in the function are the eight double
+    // parameters, so restrict the check to the scratch register the copy uses.)
+    assert!(
+        !body.contains("ldr d16") && !body.contains("str d16"),
+        "the pair was copied at double stride:\n{body}"
+    );
+}
+
+/// The outgoing-argument area must be as large as what is written into it.
+///
+/// The reservation counted 16 bytes only when `size == 128`, so a
+/// `long double _Complex` (256 bits) reserved 8 -- rounded to 16 -- while the
+/// store loop wrote two Q registers, 32 bytes, straight through the caller's
+/// own frame.
+#[test]
+fn codegen_aarch64_stacked_complex_reservation_covers_the_writes() {
+    let src = r#"
+        void g(long double _Complex, long double _Complex, long double _Complex,
+               long double _Complex, long double _Complex);
+        void call5(long double _Complex a) { g(a, a, a, a, a); }
+    "#;
+    let asm = super::asm_probe::asm_for("stacked_reserve", "aarch64-unknown-linux-gnu", src);
+    let body = super::asm_probe::body_of(&asm, "call5");
+
+    // Find the outgoing-area reservation and the highest offset written.
+    let reserved: i32 = body
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("sub sp, sp, #"))
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no outgoing-area reservation in:\n{body}"));
+
+    let mut highest = 0i32;
+    for line in body.lines() {
+        let t = line.trim();
+        if !t.starts_with("str q") {
+            continue;
+        }
+        if t.ends_with("[sp]") {
+            highest = highest.max(16);
+        } else if let Some(rest) = t.split("[sp, #").nth(1) {
+            if let Ok(off) = rest.trim_end_matches(']').parse::<i32>() {
+                highest = highest.max(off + 16);
+            }
+        }
+    }
+
+    assert!(
+        highest <= reserved,
+        "writes reach {highest} bytes but only {reserved} were reserved:\n{body}"
+    );
+}

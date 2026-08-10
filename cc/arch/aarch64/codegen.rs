@@ -970,6 +970,31 @@ impl Aarch64CodeGen {
     /// this is the overflow case, where the value already sits in the caller's
     /// outgoing area and only needs moving to where the body looks for it.
     /// V16 is a scratch V register, not part of the argument sequence.
+    /// Element size and FP width for a two-element floating-point argument.
+    ///
+    /// A `_Complex` and a two-element HFA are both passed in a V-register pair
+    /// but their element sizes come from different places: the complex base
+    /// type, or the ABI's HFA classification. `complex_fp_info` answers
+    /// `(Double, 8)` for anything that is not complex -- including a
+    /// `struct { float x, y; }`, whose elements are 4 bytes -- so using it for
+    /// both copied HFAs at twice their stride, reading and writing 8 bytes
+    /// past each end.
+    fn two_element_fp_info(&self, typ: TypeId, types: &TypeTable) -> (FpSize, i32) {
+        if types.is_complex(typ) {
+            return complex_fp_info(types, &self.base.target, typ);
+        }
+        use crate::abi::HfaBase;
+        let abi = get_abi_for_conv(CallingConv::C, &self.base.target);
+        match abi.classify_param(typ, types) {
+            ArgClass::Hfa { base, .. } => match base {
+                HfaBase::Float32 => (FpSize::Single, 4),
+                HfaBase::Float64 => (FpSize::Double, 8),
+                HfaBase::Float128 => (FpSize::Quad, 16),
+            },
+            _ => (FpSize::Double, 8),
+        }
+    }
+
     fn copy_stacked_pair_to_local(
         &mut self,
         func: &Function,
@@ -990,7 +1015,7 @@ impl Aarch64CodeGen {
             return;
         };
 
-        let (fp_size, elem_bytes) = complex_fp_info(types, &self.base.target, typ);
+        let (fp_size, elem_bytes) = self.two_element_fp_info(typ, types);
 
         for step in 0..2i32 {
             let delta = step * elem_bytes;
@@ -1070,24 +1095,8 @@ impl Aarch64CodeGen {
                                     if let Some(&Loc::Stack(offset)) =
                                         self.locations.get_ref(local.sym)
                                     {
-                                        let (fp_size, second_offset) = if is_hfa_two {
-                                            // HFA-2: use ABI classification to get base type
-                                            let abi =
-                                                get_abi_for_conv(CallingConv::C, &self.base.target);
-                                            match abi.classify_param(*typ, types) {
-                                                ArgClass::Hfa { base, .. } => {
-                                                    use crate::abi::HfaBase;
-                                                    match base {
-                                                        HfaBase::Float32 => (FpSize::Single, 4),
-                                                        HfaBase::Float64 => (FpSize::Double, 8),
-                                                        HfaBase::Float128 => (FpSize::Quad, 16),
-                                                    }
-                                                }
-                                                _ => (FpSize::Double, 8),
-                                            }
-                                        } else {
-                                            complex_fp_info(types, &self.base.target, *typ)
-                                        };
+                                        let (fp_size, second_offset) =
+                                            self.two_element_fp_info(*typ, types);
                                         // Store first element from first FP register
                                         self.push_lir(Aarch64Inst::StrFp {
                                             size: fp_size,

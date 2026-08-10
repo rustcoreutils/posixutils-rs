@@ -15,6 +15,7 @@ use super::regalloc::{Loc, Reg, VReg};
 use crate::abi::{ArgClass, HfaBase, RegClass};
 use crate::arch::lir::{complex_fp_info, CallTarget, FpSize, OperandSize, Symbol};
 use crate::ir::{Instruction, PseudoId};
+use crate::target::Target;
 use crate::types::{TypeId, TypeKind, TypeTable};
 
 impl Aarch64CodeGen {
@@ -153,6 +154,29 @@ impl Aarch64CodeGen {
             /// into one 2-element slot. Pushing the pseudo twice as if it were
             /// two scalars wrote the pointer's bit pattern into both halves.
             complex_pair: bool,
+        }
+
+        impl StackArg {
+            /// Bytes this argument occupies in the outgoing area.
+            ///
+            /// The reservation below and the store loop further down both need
+            /// this, and computing it twice is how a 256-bit complex came to
+            /// reserve 8 bytes and write 32 -- straight through the caller's
+            /// own frame. AAPCS64 rounds each stacked argument up to 8, which
+            /// is also what the callee's allocator does.
+            fn slot_bytes(&self, types: &TypeTable, target: &Target) -> i32 {
+                if self.complex_pair {
+                    let elem = self
+                        .typ
+                        .map(|t| complex_fp_info(types, target, t).1)
+                        .unwrap_or(8);
+                    return ((2 * elem) + 7) & !7;
+                }
+                if self.size == 128 {
+                    return 16;
+                }
+                8
+            }
         }
         let mut stack_args_info: Vec<StackArg> = Vec::new();
         let mut int_arg_idx = 0;
@@ -305,10 +329,10 @@ impl Aarch64CodeGen {
             return 0;
         }
 
-        // Pre-allocate stack space for all stack args (8 bytes each, 16 for int128, 16-byte aligned)
+        // Pre-allocate stack space for all stack args, 16-byte aligned.
         let stack_bytes: i32 = stack_args_info
             .iter()
-            .map(|a| if a.size == 128 { 16 } else { 8 })
+            .map(|a| a.slot_bytes(types, &self.base.target))
             .sum();
         let aligned_bytes = (stack_bytes + 15) & !15;
 
@@ -395,7 +419,7 @@ impl Aarch64CodeGen {
                 }
                 // AAPCS64 rounds each stacked argument up to 8 bytes; the
                 // callee's allocator uses the same rule, so the two agree.
-                offset += ((2 * imag_offset) + 7) & !7;
+                offset += stack_arg.slot_bytes(types, &self.base.target);
                 continue;
             }
             if stack_arg.is_fp {

@@ -6,7 +6,7 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// IR validator for c17 C99 compiler
+// IR validator for c17 C17 compiler
 //
 // The validator enforces structural invariants the IR is required to
 // satisfy at well-defined pipeline points (between optimization passes

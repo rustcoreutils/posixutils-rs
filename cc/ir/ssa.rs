@@ -6,7 +6,7 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// SSA Conversion for c17 C99 compiler
+// SSA Conversion for c17 C17 compiler
 //
 // Converts memory-based local variables to SSA form:
 // - Inserts phi nodes at dominance frontiers

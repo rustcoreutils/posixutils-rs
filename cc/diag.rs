@@ -6,7 +6,7 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// Diagnostic and stream management module for c17 C99 compiler
+// Diagnostic and stream management module for c17 C17 compiler
 //
 
 use gettextrs::{gettext, gettext_args, ngettext_args};

@@ -6,7 +6,7 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// Function inlining pass for c17 C99 compiler
+// Function inlining pass for c17 C17 compiler
 //
 // This pass inlines small functions at their call sites. The inlining
 // is performed at the IR level so that subsequent optimization passes

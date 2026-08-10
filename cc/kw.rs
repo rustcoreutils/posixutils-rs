@@ -6,7 +6,7 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// Pre-interned keyword system for c17 C99 compiler
+// Pre-interned keyword system for c17 C17 compiler
 //
 // All well-known strings (C keywords, builtins, attribute names, preprocessor
 // directives) are pre-interned at StringTable creation time. Each gets a

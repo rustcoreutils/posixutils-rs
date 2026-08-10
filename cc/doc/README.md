@@ -8,9 +8,12 @@ This directory contains detailed documentation for the c17 C compiler.
 |----------|-------------|
 | [ATTR.md](ATTR.md) | Function attributes (`__attribute__`, `_Noreturn`, `__has_attribute`) |
 | [BUILTIN.md](BUILTIN.md) | Compiler builtin functions (`__builtin_*`) |
-| [c99-checklist.md](c99-checklist.md) | C99 (ISO/IEC 9899:1999) conformance checklist |
-| [c11-checklist.md](c11-checklist.md) | C11 delta over C99 (ISO/IEC 9899:2011) — only new/changed/removed items |
 | [TODO.md](TODO.md) | Technical debt, future features, and optimization passes |
+
+Conformance is tracked in [../audit.md](../audit.md). The C99 and C11
+checklists that used to live here were retired once satisfied: they had served
+their purpose, and a checklist of 885 ticked boxes is a maintenance burden that
+says less than the audit's record of what was actually probed.
 
 ## Quick Links
 

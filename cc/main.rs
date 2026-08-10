@@ -6,7 +6,7 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// c17 - A POSIX C99 compiler
+// c17 - A POSIX C17 compiler
 //
 
 #![recursion_limit = "512"]

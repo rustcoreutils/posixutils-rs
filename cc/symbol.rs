@@ -6,7 +6,7 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// Symbol table for c17 C99 compiler
+// Symbol table for c17 C17 compiler
 // Scope-aware symbol management with C99 namespace support
 //
 

@@ -6,7 +6,7 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// Intermediate Representation (IR) for c17 C99 compiler
+// Intermediate Representation (IR) for c17 C17 compiler
 // SSA-form IR with basic blocks and typed pseudo-registers
 //
 // The IR uses Single Static Assignment (SSA) form where each variable

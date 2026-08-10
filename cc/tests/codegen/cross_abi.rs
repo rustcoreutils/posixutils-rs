@@ -340,3 +340,74 @@ fn codegen_aarch64_stacked_complex_reservation_covers_the_writes() {
         "writes reach {highest} bytes but only {reserved} were reserved:\n{body}"
     );
 }
+
+/// `_Float16` is lowered to native half-precision instructions, which are an
+/// ARMv8.2-A extension. Without a `.arch` directive declaring it, GNU as
+/// rejects every one of them ("selected processor does not support `fmov
+/// h17,h0'"), so any translation unit touching `_Float16` failed to assemble on
+/// aarch64 Linux. Apple's assembler enables fp16 for its own targets, which is
+/// why macOS never saw it.
+#[test]
+fn codegen_aarch64_declares_fp16_for_elf() {
+    let src = "_Float16 add(_Float16 a, _Float16 b) { return a + b; }";
+
+    let elf = super::asm_probe::asm_for("fp16_elf", "aarch64-unknown-linux-gnu", src);
+    assert!(
+        elf.contains(".arch") && elf.contains("fp16"),
+        "an ELF aarch64 file using _Float16 must declare the fp16 extension:\n{elf}"
+    );
+    // The instructions the directive exists for.
+    assert!(
+        elf.contains("fmov h") || elf.contains("fadd h"),
+        "expected native half-precision instructions:\n{elf}"
+    );
+
+    // Mach-O has no .arch directive.
+    let macho = super::asm_probe::asm_for("fp16_macho", "aarch64-apple-darwin", src);
+    assert!(
+        !macho.contains(".arch"),
+        "Mach-O does not use .arch:\n{macho}"
+    );
+}
+
+/// A spilled binary128 needs a 16-byte, 16-byte-aligned stack slot.
+///
+/// Every aarch64 FP spill used a hardcoded 8 bytes. That is right for a float
+/// or a double and wrong for `long double` on this target: the two halves of a
+/// `long double _Complex` were given slots 8 bytes apart and then written with
+/// `str q`, so they overlapped -- and the resulting offsets were not multiples
+/// of 16 either, which the assembler rejects outright ("immediate offset out of
+/// range").
+#[test]
+fn codegen_aarch64_quad_spill_slots_are_16_byte_aligned() {
+    let src = r#"
+        long double _Complex add(long double _Complex a, long double _Complex b) {
+            long double _Complex s = a + b;
+            long double _Complex t = s + a;
+            return t + b;
+        }
+    "#;
+    let asm = super::asm_probe::asm_for("quad_spill", "aarch64-unknown-linux-gnu", src);
+
+    // Every quad access must use an offset the instruction can encode: a
+    // multiple of 16 in the scaled form, or -256..255 unscaled.
+    let mut checked = 0;
+    for line in asm.lines() {
+        let t = line.trim();
+        if !(t.starts_with("ldr q") || t.starts_with("str q")) {
+            continue;
+        }
+        let Some(rest) = t.split(", #").nth(1) else {
+            continue;
+        };
+        let Ok(off) = rest.trim_end_matches(']').parse::<i32>() else {
+            continue;
+        };
+        checked += 1;
+        assert!(
+            (off % 16 == 0 && (0..=65520).contains(&off)) || (-256..=255).contains(&off),
+            "offset {off} is not encodable by ldr/str q:\n{t}"
+        );
+    }
+    assert!(checked > 0, "expected some quad accesses:\n{asm}");
+}

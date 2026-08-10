@@ -996,8 +996,20 @@ impl EmitAsm for Aarch64Inst {
 
             Aarch64Inst::AdrpGotPage { sym, dst } => {
                 let sym_name = sym.format_for_target(target);
-                // GOT page access - only used on macOS for external symbols
-                let _ = writeln!(out, "    adrp {}, {}@GOTPAGE", dst.name64(), sym_name);
+                // The GOT relocation spelling is per object format. `@GOTPAGE`
+                // is Mach-O; ELF writes `:got:`. This emitted the Mach-O form
+                // unconditionally -- its comment even said "macOS only" -- but
+                // needs_got_access fires for every extern symbol on every
+                // target, so GNU as saw `adrp x0, stdout@GOTPAGE` and rejected
+                // it as "unexpected characters following instruction".
+                match target.os {
+                    Os::MacOS => {
+                        let _ = writeln!(out, "    adrp {}, {}@GOTPAGE", dst.name64(), sym_name);
+                    }
+                    _ => {
+                        let _ = writeln!(out, "    adrp {}, :got:{}", dst.name64(), sym_name);
+                    }
+                }
             }
 
             Aarch64Inst::AddSymOffset { sym, base, dst } => {
@@ -1064,14 +1076,27 @@ impl EmitAsm for Aarch64Inst {
 
             Aarch64Inst::LdrSymGotPageOff { sym, base, dst } => {
                 let sym_name = sym.format_for_target(target);
-                // GOT page offset load - loads the address from GOT (macOS only)
-                let _ = writeln!(
-                    out,
-                    "    ldr {}, [{}, {}@GOTPAGEOFF]",
-                    dst.name64(),
-                    base.name64(),
-                    sym_name
-                );
+                // As above: `@GOTPAGEOFF` is Mach-O, `:got_lo12:` is ELF.
+                match target.os {
+                    Os::MacOS => {
+                        let _ = writeln!(
+                            out,
+                            "    ldr {}, [{}, {}@GOTPAGEOFF]",
+                            dst.name64(),
+                            base.name64(),
+                            sym_name
+                        );
+                    }
+                    _ => {
+                        let _ = writeln!(
+                            out,
+                            "    ldr {}, [{}, :got_lo12:{}]",
+                            dst.name64(),
+                            base.name64(),
+                            sym_name
+                        );
+                    }
+                }
             }
 
             // TLS Instructions

@@ -194,10 +194,24 @@ impl Aarch64CodeGen {
         self.base.emit_loc(insn);
     }
 
-    /// Emit file header (delegates to base)
-    #[inline]
+    /// Emit file header, declaring the ISA extensions this backend uses.
+    ///
+    /// `_Float16` is lowered to native half-precision instructions (`fmov h0`,
+    /// `fadd h0, h1, h2`), which are an ARMv8.2-A extension. GNU as defaults to
+    /// plain armv8-a and rejects every one of them with "selected processor
+    /// does not support", so any translation unit touching `_Float16` failed to
+    /// assemble on Linux. Apple's assembler enables fp16 for its own targets,
+    /// which is why macOS never saw this.
+    ///
+    /// `+fp16` is added to the base architecture rather than raising it to
+    /// armv8.2-a, so nothing else about the ISA baseline changes. Mach-O does
+    /// not use `.arch`, so it is emitted only for ELF targets.
     fn emit_header(&mut self) {
         self.base.emit_header();
+        if self.base.target.os != Os::MacOS {
+            self.base
+                .push_directive(Directive::Raw(".arch armv8-a+fp16".into()));
+        }
     }
 
     /// Emit a global variable (delegates to base)

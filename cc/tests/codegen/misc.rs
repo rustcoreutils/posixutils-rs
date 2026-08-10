@@ -5582,3 +5582,62 @@ int main(void) {
         "GP value corrupted across inline asm that declared the host register in its clobber list"
     );
 }
+
+/// A wide `long double` initializer must reach memory in the target's own
+/// format, not truncated to the `double` it was parsed into.
+///
+/// Both the global and the local path used to write the raw `f64` encoding:
+/// the global emitted a single 8-byte `.quad` under a `.size` of 16, and the
+/// local went through the 128-bit *integer* copy helper, which moves the low
+/// half through a general-purpose register and zero-fills the rest. On
+/// aarch64, where `long double` is binary128, `3.14159...L` therefore landed
+/// as a denormal near zero and compared less than `3.14L`.
+#[test]
+fn codegen_long_double_initializer_keeps_its_value() {
+    let code = r#"
+#include <float.h>
+
+static long double g_pi = 3.14159265358979323846L;
+/* Placed right after g_pi: an under-sized g_pi would run into it. */
+static long double g_next = 7.5L;
+static _Float16 g_half = 1.5f;
+static short g_after_half = 0x1234;
+
+static long double ld_ident(long double v) { return v; }
+
+int main(void) {
+    if (g_pi < 3.14L || g_pi > 3.15L) return 1;
+    if (g_next != 7.5L) return 2;
+    if (g_half != 1.5f) return 3;
+    if (g_after_half != 0x1234) return 4;
+
+    /* Local initialization from a wide literal. */
+    long double l = 3.14159265358979323846L;
+    if (l < 3.14L || l > 3.15L) return 5;
+    if (l != g_pi) return 6;
+
+    /* Hex float, and a power of two that is exact in every format. */
+    long double p = 0x1.0p3L;
+    if (p != 8.0L) return 7;
+
+    /* Copy through a call return value, which is where a 128-bit value moved
+       via a general-purpose register loses its upper half. */
+    if (ld_ident(l) != l) return 8;
+
+    long double arr[3];
+    arr[0] = l; arr[1] = p; arr[2] = -l;
+    if (arr[0] != l || arr[1] != p || arr[2] != -l) return 9;
+
+    /* More mantissa than a double can hold: if the slot ever narrows to 64
+       bits on a target where it is wider, this comes back equal to 1. */
+    long double eps = 1.0L + LDBL_EPSILON;
+    if (sizeof(long double) > sizeof(double) && eps == 1.0L) return 10;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_long_double_initializer_keeps_its_value", code, &[]),
+        0
+    );
+}

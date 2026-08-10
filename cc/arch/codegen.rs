@@ -286,6 +286,51 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         self.emit_initializer_data(&global.init, size as usize);
     }
 
+    /// Emit a floating constant as `size` bytes in the target's format.
+    ///
+    /// `size` is the storage size of the declared type, so it selects the
+    /// format: 2 is `_Float16`, 4 is binary32, 8 is binary64, and 16 is
+    /// whatever `long double` means here -- binary128 on aarch64, an x87
+    /// 80-bit extended padded to 16 bytes on x86_64.
+    ///
+    /// Both wide cases used to fall through to a bare `.quad` of the `f64`
+    /// encoding: half the object went unemitted (while `.size` still claimed
+    /// 16, so the next symbol's bytes were read as the tail), and the bits
+    /// that were emitted meant a different number in the wider format.
+    fn emit_float_initializer(&mut self, val: f64, size: usize) {
+        match size {
+            2 => {
+                // IEEE-754 binary16 is the same encoding on both targets; the
+                // two backends carry byte-identical copies of this conversion.
+                let bits = crate::arch::aarch64::f64_to_f16_bits(val);
+                self.push_directive(Directive::Short(bits as i64));
+            }
+            4 => {
+                let bits = (val as f32).to_bits();
+                self.push_directive(Directive::Long(bits as i64));
+            }
+            16 => {
+                let (lo, hi) = match self.target.arch {
+                    crate::target::Arch::Aarch64 => crate::arch::aarch64::f64_to_f128_bits(val),
+                    crate::target::Arch::X86_64 => {
+                        let bytes = crate::arch::x86_64::x87::f64_to_x87_extended(val);
+                        let mut lo = [0u8; 8];
+                        let mut hi = [0u8; 8];
+                        lo.copy_from_slice(&bytes[..8]);
+                        hi.copy_from_slice(&bytes[8..]);
+                        (u64::from_le_bytes(lo), u64::from_le_bytes(hi))
+                    }
+                };
+                self.push_directive(Directive::Quad(lo as i64));
+                self.push_directive(Directive::Quad(hi as i64));
+            }
+            _ => {
+                // double - emit as 64-bit IEEE 754
+                self.push_directive(Directive::Quad(val.to_bits() as i64));
+            }
+        }
+    }
+
     /// Emit data for an initializer, recursively handling complex types
     pub fn emit_initializer_data(&mut self, init: &Initializer, size: usize) {
         match init {
@@ -309,17 +354,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
                     }
                 }
             }
-            Initializer::Float(val) => {
-                if size == 4 {
-                    // float - emit as 32-bit IEEE 754
-                    let bits = (*val as f32).to_bits();
-                    self.push_directive(Directive::Long(bits as i64));
-                } else {
-                    // double - emit as 64-bit IEEE 754
-                    let bits = val.to_bits();
-                    self.push_directive(Directive::Quad(bits as i64));
-                }
-            }
+            Initializer::Float(val) => self.emit_float_initializer(*val, size),
             Initializer::String(s) => {
                 // Emit string as .ascii (without null terminator)
                 // Then zero-fill the remaining bytes (which includes the null terminator)

@@ -1228,3 +1228,73 @@ int main(void) {
         "the address computation for a \"=m\" output must survive DCE"
     );
 }
+
+/// The `"=m"` fix has to reach the *register allocator*, not just DCE.
+///
+/// DCE learning that a memory output reads its pseudo stopped the address
+/// computation being deleted, but the allocator's own use-collectors --
+/// live-interval bounds, liveness propagation, the interference graph's def
+/// set and live set, and next-use distance -- all still classified such an
+/// output as a pure def. So the address register stayed free for the
+/// allocator to hand to another operand of the same asm, and the store went
+/// through an input's value as a pointer.
+///
+/// Enough inputs are needed to make the allocator actually reuse the register;
+/// a one-operand asm never exhibits it, which is why the first version of this
+/// test passed on x86_64 while the bug was still live.
+#[test]
+fn codegen_asm_memory_output_address_survives_register_allocation() {
+    let code = r#"
+#include <string.h>
+
+struct Out { unsigned v0, v1, v2, v3, v4, v5; };
+
+/* Six register inputs alongside a memory output. The output's address must
+   not be assigned a register that one of the inputs also gets. */
+static unsigned write_through_m(unsigned a, unsigned b, unsigned c,
+                                unsigned d, unsigned e, unsigned f) {
+    unsigned out = 0;
+#if defined(__x86_64__)
+    __asm__ __volatile__ ("movl %1, %0"
+                          : "=m"(out)
+                          : "r"(a), "r"(b), "r"(c), "r"(d), "r"(e), "r"(f));
+#elif defined(__aarch64__)
+    __asm__ __volatile__ ("str %w1, %0"
+                          : "=m"(out)
+                          : "r"(a), "r"(b), "r"(c), "r"(d), "r"(e), "r"(f));
+#else
+    out = a;
+    (void)b; (void)c; (void)d; (void)e; (void)f;
+#endif
+    return out;
+}
+
+int main(void) {
+    /* The first input is what the asm stores, so the result must be it and
+       not some other operand's value or a wild read. */
+    if (write_through_m(11u, 22u, 33u, 44u, 55u, 66u) != 11u) return 1;
+    if (write_through_m(99u, 1u, 2u, 3u, 4u, 5u) != 99u) return 2;
+
+    /* Neighbouring locals must be untouched: a store through the wrong
+       pointer usually lands somewhere else on the frame. */
+    volatile unsigned before = 0xAAAAAAAAu;
+    unsigned got = write_through_m(7u, 0u, 0u, 0u, 0u, 0u);
+    volatile unsigned after = 0xBBBBBBBBu;
+    if (got != 7u) return 3;
+    if (before != 0xAAAAAAAAu) return 4;
+    if (after != 0xBBBBBBBBu) return 5;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("asm_memory_output_regalloc", code, &[]),
+        0,
+        "a \"=m\" output's address must not be reallocated to another operand"
+    );
+    assert_eq!(
+        compile_and_run_optimized("asm_memory_output_regalloc_opt", code),
+        0,
+        "the same, once the allocator is under real pressure"
+    );
+}

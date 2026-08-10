@@ -96,7 +96,7 @@ The shell is **broad and largely feature-complete** — all 15 special and 16 re
 - [x] **#45 — `continue` error messages say "break".** `builtin/control_flow.rs:63`. ✓ fixed in Phase 4 (with #11).
 - [x] **#46 — `readonly -p` with extra operands emits "export: too many arguments".** `builtin/readonly.rs:27` (copy-paste).
 - [x] **#47 — `unset -f -v` rejected as "multiple options".** `builtin/unset.rs:26`. POSIX does not forbid combining them.
-- [x] **#48 — `bg`/`fg` hard-error in non-interactive/subshell contexts** where the spec only says "may"; `bg` errors on an already-running job instead of the spec's silent success. `builtin/bg.rs:21`, `bg.rs:44`, `fg.rs:49`. ✓ fixed in Phase 7 (2026-08-09): `bg` on an already-running job is a no-op returning 0, and the extra non-interactive/subshell refusals are gone (only the spec-mandated "job control disabled" refusal remains). Their diagnostics also gained the missing newline.
+- [x] **#48 — `bg`/`fg` hard-error in non-interactive/subshell contexts** where the spec only says "may"; `bg` errors on an already-running job instead of the spec's silent success. `builtin/bg.rs:21`, `bg.rs:44`, `fg.rs:49`. ✓ fixed in Phase 7 (2026-08-09): `bg` on an already-running job is a no-op returning 0, and the non-interactive refusal is gone. Their diagnostics also gained the missing newline. The subshell refusal was subsequently restored (see #86): the spec's "may" is permission this implementation cannot honor, because a subshell's job table is a doomed pre-fork copy.
 - [x] **#49 — Signal-name parsing is over-strict.** `os/signals.rs:88` matches only exact upper/exact lower case (no mixed case), rejects a `SIG` prefix, and omits `KILL`/`STOP` from `from_str` (so `trap '' KILL` errors). `kill -l` itself *does* list `KILL` and `kill -l 9 → KILL` works (**[V-refuted]** the "SIGKILL missing from `kill -l`" claim). ✓ fixed in Phase 8 (from_str is case-independent, accepts a SIG prefix and numbers, includes KILL).
 - [x] **#50 — `MAIL`/`MAILCHECK`/`MAILPATH` mail-notification is unimplemented.** No references in-tree. User Portability Utilities feature; **[S]**. ✓ fixed in Phase 9 (MAILPATH-precedence, MAILCHECK throttle, mtime-change notification before the prompt).
 - [x] **#51 — `read` emits no `PS2` continuation prompt; `read` field error returns 1 not >1.** `builtin/read.rs`. ✓ fixed in Phase 7 (2026-08-09): an interactive shell writes `$PS2` to stderr for each backslash-<newline> continuation `read` consumes (only reachable without `-r`), and an assignment failure returns 2 — POSIX reserves 1 for end-of-file and >1 for an error.
@@ -270,6 +270,22 @@ regression test that should have existed.
 - [x] **#82 — `sh -i` with non-terminal input emitted terminal control sequences.** Fixing the panic (#62) left the line editor running with nowhere to draw. An interactive shell whose stdin is not a terminal now reads lines plainly, still prompting on stderr.
 - [x] **#83 — The declaration-utility check read unexpanded word text.** `command $c v=~` with `c=export` missed, because the `command` branch scanned raw source text while the name came from expanded fields. The decision is now made from expanded words in one pass.
 
+### Second review round (2026-08-10)
+
+A second high-effort review of the branch found ten more defects, again split
+between regressions the branch introduced and long-standing bugs in the code it
+touched. All are fixed with regression tests.
+
+- [x] **#84 — A here-document inside `$( … )` spun at 100% CPU forever.** `WordLexer::next_line` stopped *at* the newline instead of consuming it, so scanning the extent of the here-document re-read the same empty line without end. **[V]** (pre-existing; the `<<-` terminator fix of #64 turned it from a spurious syntax error into a hang for `<<-` too). `x=$(cat <<EOF … EOF )` now works, as does the `<<-` form and a here-document followed by a pipeline on the same line.
+- [x] **#85 — A here-document larger than the pipe buffer deadlocked the shell.** `os::exec` wrote the whole body into a pipe that nothing was reading yet, so anything past the 64KiB capacity blocked in `write()` forever. **[V]** (pre-existing) `wc -c <<EOF` with a 70KB body hung; dash prints the count. The body now goes into an immediately-unlinked temporary file, which has no capacity limit and — unlike a pipe — is seekable, matching how a redirection from a here-document behaves.
+- [x] **#86 — `fg`/`bg` in a subshell corrupted the parent's job table.** The #48 change dropped the subshell refusal along with the non-interactive one, but POSIX only *permits* them to work in a subshell. This shell's job table is a pre-fork copy, so `( bg %1 )` left the parent reporting a running job as stopped forever, and `( fg %1 )` waited on a pid that is not its child and printed a raw `waitpid: no child processes`. **[V]** The subshell refusal is restored; the non-interactive relaxation (which is correct — the job really is that shell's child) stays.
+- [x] **#87 — Pipelines leaked descriptors into their commands.** The `dup(stdin)` added for #69 had no `FD_CLOEXEC` and was inherited by every utility in the pipeline; the pipe read/write ends and the signal self-pipe leaked the same way. **[V]** `true | ls /proc/self/fd` showed four extra descriptors that dash does not. The saved stdin is now an `OwnedFd` duplicated with `F_DUPFD_CLOEXEC`, the pipe ends are closed before the command runs, and the signal pipe is close-on-exec.
+- [x] **#88 — A directory command_file exited 128 instead of 126.** The #75-era rewrite sent every unclassified `io::Error` to 128, but POSIX reserves >128 for death by a signal and prescribes 126 for a command_file that is found but cannot be used. **[V]** `sh <dir>` exited 128 where bash exits 126. The status now follows which step failed rather than which errno came back: 127 when the open says not-found, 126 for any other open failure or a non-text/directory file, 128 only for a genuine read error (`/proc/self/mem`).
+- [x] **#89 — `$?` after a bare `$( … )` was always 0.** `execute_in_subshell` discarded the child's wait status, so nothing ever assigned `last_command_substitution_status`. **[V]** `$(exit 3); echo $?` printed 0; bash and dash print 3.
+- [x] **#90 — `read` ignored a line continuation in a quoted here-document.** The delimiter test ran before the escaped-character test, so backslash-<newline> ended the line instead of continuing it — disagreeing with `read_until_from_file`, which handles it correctly. **[V]** Only quoted here-documents expose it; an unquoted body has the continuation removed by the shell's own expansion.
+- [x] **#91 — `cd` set `OLDPWD` from `getcwd` instead of `PWD`.** POSIX says `OLDPWD` shall be set to the value of `PWD`, which keeps the symbolic links the shell walked through; `getcwd` had already resolved them away, so `cd -` landed in the physical directory. **[V]** against bash. The `cd -` branch also dropped an `unwrap()` on `getcwd`.
+- [x] **#92 — `cd -P` could fail after the directory had already changed.** `getcwd` ran after the `chdir` and propagated its error, so a failure there (an unreadable parent, or the directory removed underneath) reported an error and left `PWD` describing the old location while the process had already moved. It now falls back to the operand made absolute.
+
 ### Major
 
 - [x] **#71 — `ulimit` reports a single limit in the `-a` labelled format.** POSIX requires `"%1d\n"` / `"unlimited\n"` when `-a` is absent and at most one resource option is given. **[V]** `ulimit -f` printed `file size (-f)  [blocks] unlimited`; dash prints `unlimited`. Also fixed with it: a bare `ulimit` errored instead of defaulting to `-S -f`, `getrlimit` failure was a `panic!`, and `-S` silently widened the hard limit (which an unprivileged process cannot do) instead of refusing a soft limit above it.
@@ -306,17 +322,26 @@ commits rewrote. All are fixed and covered by tests. The lesson recorded here:
 a green suite meant the paths the suite knew about, not the ones the changes
 newly reached.
 
+A second review round then caught ten more (#84–#92): four regressions from the
+remediation itself (the `<<-` terminator fix reaching a broken command-substitution
+path, the dropped `fg`/`bg` subshell guard, a leaked `dup(stdin)`, and a
+command_file status pushed to 128) and six long-standing bugs in the code those
+commits rewrote (a >64KiB here-document deadlock, `$?` after a bare command
+substitution, `read` line continuations, and two `cd` defects). Same lesson,
+applied one level deeper: the code a fix *reaches* needs the same scrutiny as
+the code it edits.
+
 The phases were: (1) panics and hangs, (2) line continuation during token
 recognition, (3) declaration-utility assignment expansion, (4) `ulimit`,
 (5) exit statuses / `$-` / `$!` / `exec`, (6) `unalias` / `fc` / `jobs` output,
 (7) the four deferrals, (8) the PTY harness and the untested built-ins,
 (9) this document.
 
-**Verification.** The `sh` suite is green at 256 unit + 226 integration tests
+**Verification.** The `sh` suite is green at 256 unit + 241 integration tests
 (including `audit_regressions` and the new `pty` module), with zero
 `cargo clippy --all-targets` warnings and clean `cargo fmt`. The full workspace
-`cargo test --release` passes. Behavioral parity was re-checked against `dash`
-and `bash --posix` for every fix.
+`cargo test --release` passes (8597 tests). Behavioral parity was re-checked
+against `dash` and `bash --posix` for every fix.
 
 `sh` keeps its audited standing, now with the interactive surface under test
 rather than assumed. (The README no longer carries per-utility stage lists —

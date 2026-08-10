@@ -777,8 +777,20 @@ pub fn get_constraint_info_aarch64(insn: &Instruction) -> Option<(Vec<Reg>, Vec<
     if let Some(t) = insn.target {
         involved.push(t);
     }
-    involved.extend(insn.src.iter().copied());
+    // The atomic emitters keep their source values live across the writes to
+    // their fixed scratch registers, so unlike the other opcodes here their
+    // sources are not exempt from the clobber set.
+    if !insn.op.is_atomic() {
+        involved.extend(insn.src.iter().copied());
+    }
     let mut clobbers: Vec<Reg> = AARCH64_SCRATCH_REGS.to_vec();
+    // The atomic emitters additionally use X0/X1/X2 (and X8 for the store-
+    // exclusive status) as fixed scratch. Those *are* in Reg::allocatable(),
+    // so without declaring them a live pseudo the allocator placed there is
+    // destroyed by any atomic operation its range crosses.
+    if insn.op.is_atomic() {
+        clobbers.extend([Reg::X0, Reg::X1, Reg::X2, Reg::X8]);
+    }
     clobbers.sort();
     clobbers.dedup();
 

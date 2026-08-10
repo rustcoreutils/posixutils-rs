@@ -300,6 +300,26 @@ impl Opcode {
         )
     }
 
+    /// True for the atomic memory operations (not `Fence`, which touches no
+    /// address and needs no scratch registers).
+    ///
+    /// Both backends lower these through fixed scratch registers that are in
+    /// the allocatable pool, so the register allocator has to know.
+    pub fn is_atomic(self) -> bool {
+        matches!(
+            self,
+            Opcode::AtomicLoad
+                | Opcode::AtomicStore
+                | Opcode::AtomicSwap
+                | Opcode::AtomicCas
+                | Opcode::AtomicFetchAdd
+                | Opcode::AtomicFetchSub
+                | Opcode::AtomicFetchAnd
+                | Opcode::AtomicFetchOr
+                | Opcode::AtomicFetchXor
+        )
+    }
+
     /// Get the opcode name for display
     pub fn name(&self) -> &'static str {
         match self {

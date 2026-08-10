@@ -2611,4 +2611,20 @@ mod audit_regressions {
         expect_cli_exit_code(vec![dir.display().to_string()], "", 126);
         expect_cli_exit_code(vec![format!("{}/no/such/file", dir.display())], "", 127);
     }
+
+    #[test]
+    fn read_honors_line_continuations_in_a_quoted_here_document() {
+        // The escaped-character test has to precede the delimiter test, or a
+        // backslash-<newline> ends the line instead of continuing it. Quoted
+        // here-documents are the only way to get one this far: the shell's
+        // own expansion removes it from an unquoted body.
+        test_script(
+            "while read l; do echo \"[$l]\"; done <<'E'\na\\\nb\nE\n",
+            "[ab]\n",
+        );
+        test_script(
+            "while read -r l; do echo \"[$l]\"; done <<'E'\na\\\nb\nE\n",
+            "[a\\]\n[b]\n",
+        );
+    }
 }

@@ -205,29 +205,31 @@ fn read_from_here_document(content: &str, delimiter: u8, backslash_escape: bool)
     let mut escape_next = false;
     let mut consumed_bytes = content.len();
     for (offset, c) in content.char_indices() {
+        // An escaped character is taken literally, so the delimiter test must
+        // come after this one: backslash-<delimiter> is a line continuation,
+        // not the end of the line (same rule as `read_until_from_file`).
+        if escape_next {
+            escape_next = false;
+            if c == delimiter as char {
+                continue;
+            } else if c == '\\' {
+                buffer.push('\\');
+            } else {
+                result.append(std::mem::take(&mut buffer), false, true);
+                result.append(c.to_string(), true, true);
+            }
+            continue;
+        }
         if c == delimiter as char {
             reached_eof = false;
             consumed_bytes = offset + c.len_utf8();
             break;
         }
         if backslash_escape && c == '\\' {
-            if escape_next {
-                buffer.push('\\');
-                escape_next = false;
-            } else {
-                escape_next = true
-            }
+            escape_next = true;
             continue;
         }
-
-        if escape_next {
-            result.append(buffer, false, true);
-            result.append(c.to_string(), true, true);
-            buffer = String::new();
-            escape_next = false;
-        } else {
-            buffer.push(c);
-        }
+        buffer.push(c);
     }
     if !buffer.is_empty() {
         result.append(buffer, false, true);

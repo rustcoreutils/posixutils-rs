@@ -215,8 +215,140 @@ impl LocaleCategory {
     }
 }
 
+/// Translate `msgid`, then substitute positional arguments into it.
+///
+/// This is the runtime formatter the [`gettext!`] doc comment describes as
+/// missing. `format!` cannot serve here: it requires a compile-time literal
+/// template, so there is nowhere to put a string fetched from a catalog at run
+/// time. The msgid keeps its placeholders and they are filled in afterwards.
+///
+/// Placeholders are **positional** — `{0}`, `{1}`, … — rather than sequential
+/// `{}`, and that is the point. A translator frequently has to reorder the
+/// substitutions, because the order the arguments appear in an English sentence
+/// is not the order they appear in every language. A scheme that can only fill
+/// holes left to right, like the `.replacen("{}", v, 1)` chains open-coded in
+/// `m4` and `man`, cannot express that.
+///
+/// An index with no corresponding argument is left as written, so a mistranslated
+/// catalog degrades to a visibly odd message rather than a panic or a silently
+/// dropped value. `{{` and `}}` are literal braces.
+///
+/// ```
+/// # use gettextrs::gettext_args;
+/// // The catalog is keyed on the msgid, so the *untranslated* result here is
+/// // just the substitution.
+/// assert_eq!(gettext_args("{0} and {1}", &["a", "b"]), "a and b");
+/// // A translation may reorder them.
+/// assert_eq!(gettext_args("{1} then {0}", &["a", "b"]), "b then a");
+/// ```
+pub fn gettext_args(msgid: &str, args: &[&str]) -> String {
+    let template = gettext(msgid);
+    let mut out = String::with_capacity(template.len() + args.len() * 8);
+    let mut chars = template.char_indices().peekable();
+
+    while let Some((_, c)) = chars.next() {
+        match c {
+            '{' => {
+                // `{{` is a literal brace.
+                if chars.peek().map(|&(_, c)| c) == Some('{') {
+                    chars.next();
+                    out.push('{');
+                    continue;
+                }
+                // Collect the digits up to the closing brace.
+                let mut index = String::new();
+                let mut closed = false;
+                for (_, c) in chars.by_ref() {
+                    if c == '}' {
+                        closed = true;
+                        break;
+                    }
+                    index.push(c);
+                }
+                match index.parse::<usize>().ok().filter(|_| closed) {
+                    Some(i) if i < args.len() => out.push_str(args[i]),
+                    // Out of range, non-numeric, or unterminated: reproduce it
+                    // verbatim. A bad catalog should look wrong, not crash.
+                    _ => {
+                        out.push('{');
+                        out.push_str(&index);
+                        if closed {
+                            out.push('}');
+                        }
+                    }
+                }
+            }
+            '}' => {
+                if chars.peek().map(|&(_, c)| c) == Some('}') {
+                    chars.next();
+                }
+                out.push('}');
+            }
+            _ => out.push(c),
+        }
+    }
+
+    out
+}
+
+/// Translate a message that differs between the singular and plural cases.
+///
+/// English needs only the two forms, but a catalog may define more and select
+/// among them with its own rule; until the catalog format carries that rule,
+/// this picks by `n == 1`, which is correct for English and for the
+/// untranslated case. Both forms are msgids so an extractor sees them.
+///
+/// Exists because two of `cc`'s diagnostics bake the English pluralization
+/// into the sentence -- "call expects 1 argument" versus "2 arguments" -- and
+/// no amount of positional substitution can fix that from outside.
+pub fn ngettext_args(singular: &str, plural: &str, n: usize, args: &[&str]) -> String {
+    gettext_args(if n == 1 { singular } else { plural }, args)
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn gettext_args_substitutes_positionally() {
+        assert_eq!(gettext_args("{0} and {1}", &["a", "b"]), "a and b");
+        // The whole reason for positional indices: a translation may need a
+        // different word order than the English original.
+        assert_eq!(gettext_args("{1} then {0}", &["a", "b"]), "b then a");
+        // An argument may be used more than once, or not at all.
+        assert_eq!(gettext_args("{0}{0}", &["x", "y"]), "xx");
+        assert_eq!(gettext_args("{1}", &["x", "y"]), "y");
+    }
+
+    #[test]
+    fn gettext_args_handles_literal_braces() {
+        assert_eq!(gettext_args("{{0}}", &["a"]), "{0}");
+        assert_eq!(gettext_args("{{{0}}}", &["a"]), "{a}");
+        assert_eq!(gettext_args("no braces", &["a"]), "no braces");
+    }
+
+    /// A mistranslated catalog must not panic or silently swallow a value.
+    #[test]
+    fn gettext_args_degrades_visibly_on_a_bad_template() {
+        // Index past the end of the arguments.
+        assert_eq!(gettext_args("{5}", &["a"]), "{5}");
+        // Not a number.
+        assert_eq!(gettext_args("{name}", &["a"]), "{name}");
+        // Unterminated.
+        assert_eq!(gettext_args("{0", &["a"]), "{0");
+        // No arguments at all.
+        assert_eq!(gettext_args("{0}", &[]), "{0}");
+    }
+
+    #[test]
+    fn ngettext_args_picks_by_count() {
+        let one = "expects {0} argument";
+        let many = "expects {0} arguments";
+        assert_eq!(ngettext_args(one, many, 1, &["1"]), "expects 1 argument");
+        assert_eq!(ngettext_args(one, many, 2, &["2"]), "expects 2 arguments");
+        // Zero takes the plural in English.
+        assert_eq!(ngettext_args(one, many, 0, &["0"]), "expects 0 arguments");
+    }
+
     use super::*;
 
     #[test]

@@ -18,6 +18,7 @@
 //
 
 use crate::abi::{get_abi_for_conv, ArgClass, CallingConv};
+use crate::arch::aarch64::features::{VA_GR_SAVE_BYTES, VA_VR_SAVE_BYTES};
 use crate::arch::aarch64::lir::{Aarch64Inst, DmbOption, GpOperand, MemAddr};
 use crate::arch::aarch64::regalloc::{Loc, Reg, RegAlloc, VReg};
 use crate::arch::codegen::{is_variadic_function, BswapSize, CodeGenBase, CodeGenerator, UnaryOp};
@@ -54,6 +55,11 @@ pub struct Aarch64CodeGen {
     pub(super) reg_save_area_size: i32,
     /// Number of fixed GP parameters (for variadic functions)
     pub(super) num_fixed_gp_params: usize,
+    /// Number of fixed FP/SIMD parameters (for variadic functions)
+    pub(super) num_fixed_fp_params: usize,
+    /// Bytes of incoming stack arguments consumed by named parameters
+    /// (for variadic functions whose named parameters overflow the registers)
+    pub(super) named_stack_param_bytes: i32,
     /// External symbols (need GOT access on macOS)
     pub(super) extern_symbols: HashSet<String>,
     /// Thread-local storage symbols (need TLS access)
@@ -95,6 +101,8 @@ impl Aarch64CodeGen {
             reg_save_area_offset: 0,
             reg_save_area_size: 0,
             num_fixed_gp_params: 0,
+            num_fixed_fp_params: 0,
+            named_stack_param_bytes: 0,
             extern_symbols: HashSet::new(),
             tls_symbols: HashSet::new(),
             shared_mode: false,
@@ -255,12 +263,20 @@ impl Aarch64CodeGen {
             callee_saved.push(Reg::X19);
         }
 
-        // For variadic functions on Linux/FreeBSD, we need extra space for the register save area
-        // AAPCS64: 8 GP regs (x0-x7) * 8 bytes = 64 bytes
+        // For variadic functions on Linux/FreeBSD, we need extra space for the register save area.
+        // AAPCS64 va_list reads unnamed arguments out of *two* save areas: the
+        // GP one (x0-x7, 8 bytes each = 64) and the SIMD/FP one (q0-q7, 16
+        // bytes each = 128). Only the GP half used to be reserved, so a
+        // `va_arg(ap, double)` read whatever the caller left in the GP slots
+        // -- the incoming d0-d7 were never spilled anywhere.
         // On Darwin (macOS/iOS), variadic args are passed on the stack by the caller,
         // so we don't need a register save area.
         let is_darwin = self.base.target.os == crate::target::Os::MacOS;
-        let reg_save_area_size: i32 = if is_variadic && !is_darwin { 64 } else { 0 };
+        let reg_save_area_size: i32 = if is_variadic && !is_darwin {
+            VA_GR_SAVE_BYTES + VA_VR_SAVE_BYTES
+        } else {
+            0
+        };
 
         // Calculate total frame size
         // Need space for: fp/lr (16 bytes) + GP callee-saved + FP callee-saved + local vars + reg save area
@@ -337,13 +353,32 @@ impl Aarch64CodeGen {
             self.emit_variadic_save_area();
         }
 
-        // Count fixed GP parameters for va_start
+        // Measure what the named parameters consumed, for va_start
         if is_variadic {
-            self.num_fixed_gp_params = func
-                .params
-                .iter()
-                .filter(|(_, typ)| !types.is_float(*typ))
-                .count();
+            // AAPCS64 assigns named parameters to the two register banks
+            // independently, and `va_start` has to skip exactly what they
+            // consumed in each. Both saturate at 8; a named parameter that
+            // arrives after its bank is full lands on the stack instead, and
+            // `__stack` has to start past those too.
+            let mut ngrn = 0usize;
+            let mut nsrn = 0usize;
+            let mut named_stack = 0i32;
+            for (_, typ) in &func.params {
+                let bank = if types.is_float(*typ) {
+                    &mut nsrn
+                } else {
+                    &mut ngrn
+                };
+                if *bank < 8 {
+                    *bank += 1;
+                } else {
+                    let bytes = types.size_bits(*typ).div_ceil(8).max(1) as i32;
+                    named_stack += (bytes + 7) & !7;
+                }
+            }
+            self.num_fixed_gp_params = ngrn;
+            self.num_fixed_fp_params = nsrn;
+            self.named_stack_param_bytes = named_stack;
         }
 
         // Store spilled arguments before any calls can clobber them
@@ -939,17 +974,34 @@ impl Aarch64CodeGen {
     }
 
     /// Save argument registers to the register save area for variadic functions (Linux/FreeBSD)
+    ///
+    /// Layout, from `reg_save_area_offset`: x0-x7 (8 bytes each), then q0-q7
+    /// (16 bytes each). `va_start` derives `__gr_top` / `__vr_top` from the
+    /// ends of the two halves, and `__gr_offs` / `__vr_offs` count backwards
+    /// from there, so the order here is what those offsets mean.
     fn emit_variadic_save_area(&mut self) {
-        // AAPCS64: x0-x7 are saved at reg_save_area_offset from FP
         let arg_regs = Reg::arg_regs();
         for (i, reg) in arg_regs.iter().enumerate() {
-            // Each register at offset: reg_save_area_offset + (i * 8)
             let offset = self.reg_save_area_offset + (i as i32 * 8);
             self.push_lir(Aarch64Inst::Str {
                 size: OperandSize::B64,
                 src: *reg,
                 addr: MemAddr::BaseOffset {
                     base: Reg::X29, // fp
+                    offset,
+                },
+            });
+        }
+
+        // The SIMD half stores whole q registers: a `long double` unnamed
+        // argument is binary128 and occupies the full 16-byte slot.
+        for (i, vreg) in VReg::arg_regs().iter().enumerate() {
+            let offset = self.reg_save_area_offset + VA_GR_SAVE_BYTES + (i as i32 * 16);
+            self.push_lir(Aarch64Inst::StrFp {
+                size: FpSize::Quad,
+                src: *vreg,
+                addr: MemAddr::BaseOffset {
+                    base: Reg::X29,
                     offset,
                 },
             });

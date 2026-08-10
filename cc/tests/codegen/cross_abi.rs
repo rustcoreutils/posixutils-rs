@@ -445,3 +445,91 @@ fn codegen_aarch64_long_double_moves_as_quad() {
         "a binary128 value must not be stored as a 64-bit half plus zero:\n{body}"
     );
 }
+
+/// AAPCS64 hands unnamed floating arguments in v0-v7, so a variadic function
+/// has to spill them alongside x0-x7 before `va_arg` can find them.
+///
+/// The backend saved only the general-purpose half and walked `ap` as a flat
+/// pointer across it, which meant `va_arg(ap, double)` read a GP slot while
+/// the caller's d0-d7 were never written to memory at all. This asserts on
+/// the whole `va_list` record, since a save area nothing points at is no
+/// better than no save area.
+#[test]
+fn codegen_aarch64_variadic_saves_fp_registers() {
+    let src = r#"
+        #include <stdarg.h>
+        double sum_d(int n, ...) {
+            va_list ap; va_start(ap, n);
+            double t = 0.0;
+            for (int i = 0; i < n; i++) t += va_arg(ap, double);
+            va_end(ap);
+            return t;
+        }
+    "#;
+
+    let asm = asm_for("va_fp_save", "aarch64-unknown-linux-gnu", src);
+    let body = body_of(&asm, "sum_d");
+
+    for q in 0..8 {
+        assert!(
+            body.contains(&format!("str q{q}, [x29,")),
+            "q{q} must be spilled to the variadic save area; \
+             without it va_arg(ap, double) reads an uninitialized slot:\n{body}"
+        );
+    }
+
+    // __vr_offs (+28) starts at -(8 * 16) with no named FP parameters, and
+    // __gr_offs (+24) at -(7 * 8) after the one named `int`. Both are stored
+    // as 32-bit fields.
+    assert!(
+        body.contains("str w9, [x1, #28]") || body.contains("str w9, [x11, #28]"),
+        "va_start must initialize __vr_offs at +28:\n{body}"
+    );
+    assert!(
+        body.contains(", #24]"),
+        "va_start must initialize __gr_offs at +24:\n{body}"
+    );
+
+    // The double must be fetched through the *FP* offset field, not the GP one.
+    assert!(
+        body.contains("ldr w9, [x11, #28]"),
+        "va_arg(ap, double) must consult __vr_offs (+28), not __gr_offs:\n{body}"
+    );
+    assert!(
+        body.contains("ldr x16, [x11, #16]"),
+        "va_arg(ap, double) must read the slot relative to __vr_top (+16):\n{body}"
+    );
+}
+
+/// An integer `va_arg` on aarch64 must use the general-purpose fields, so the
+/// two banks advance independently.
+#[test]
+fn codegen_aarch64_variadic_integer_uses_gp_fields() {
+    let src = r#"
+        #include <stdarg.h>
+        int sum_i(int n, ...) {
+            va_list ap; va_start(ap, n);
+            int t = 0;
+            for (int i = 0; i < n; i++) t += va_arg(ap, int);
+            va_end(ap);
+            return t;
+        }
+    "#;
+
+    let asm = asm_for("va_gp", "aarch64-unknown-linux-gnu", src);
+    let body = body_of(&asm, "sum_i");
+
+    assert!(
+        body.contains("ldr w9, [x11, #24]"),
+        "va_arg(ap, int) must consult __gr_offs (+24):\n{body}"
+    );
+    assert!(
+        body.contains("ldr x16, [x11, #8]"),
+        "va_arg(ap, int) must read the slot relative to __gr_top (+8):\n{body}"
+    );
+    // GP slots are 8 bytes, not the 16 a SIMD slot takes.
+    assert!(
+        body.contains("add x10, x9, #8"),
+        "a GP slot advances __gr_offs by 8:\n{body}"
+    );
+}

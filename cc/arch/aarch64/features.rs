@@ -502,7 +502,12 @@ impl Aarch64CodeGen {
             });
         }
 
-        for offset in (0..bytes).step_by(16) {
+        // Pairs first, then a single register for any 8-byte remainder. The
+        // pair step has to be gated on a *full* 16 bytes remaining: Darwin's
+        // va_list is 8 bytes, and copying it with one `stp` wrote 8 bytes past
+        // the destination, over whatever the frame held next.
+        let mut offset = 0;
+        while bytes - offset >= 16 {
             self.push_lir(Aarch64Inst::Ldp {
                 size: OperandSize::B64,
                 addr: MemAddr::BaseOffset {
@@ -521,9 +526,9 @@ impl Aarch64CodeGen {
                     offset,
                 },
             });
+            offset += 16;
         }
-        if bytes % 16 != 0 {
-            let offset = bytes - (bytes % 16);
+        while bytes - offset >= 8 {
             self.push_lir(Aarch64Inst::Ldr {
                 size: OperandSize::B64,
                 addr: MemAddr::BaseOffset {
@@ -540,6 +545,7 @@ impl Aarch64CodeGen {
                     offset,
                 },
             });
+            offset += 8;
         }
     }
 

@@ -533,3 +533,55 @@ fn codegen_aarch64_variadic_integer_uses_gp_fields() {
         "a GP slot advances __gr_offs by 8:\n{body}"
     );
 }
+
+/// `va_copy` must move exactly as many bytes as the target's `va_list` holds.
+///
+/// The two aarch64 targets disagree about that size: Linux/FreeBSD use the
+/// 32-byte AAPCS64 record, Darwin a single pointer. Copying the Darwin one
+/// with a 16-byte `stp` -- which a `step_by(16)` loop still emits for an
+/// 8-byte object -- wrote 8 bytes past the destination, over whatever the
+/// frame held next, and crashed every `va_copy` test on macOS.
+#[test]
+fn codegen_aarch64_va_copy_matches_the_va_list_size() {
+    let src = r#"
+        #include <stdarg.h>
+        long f(int n, ...) {
+            va_list ap, ap2;
+            va_start(ap, n);
+            va_copy(ap2, ap);
+            long s = va_arg(ap, long) + va_arg(ap2, long);
+            va_end(ap); va_end(ap2);
+            return s;
+        }
+    "#;
+
+    // The destination pointer is pinned in x16, so stores through it are
+    // exactly the bytes va_copy writes.
+    let count = |asm: &str, needle: &str| asm.matches(needle).count();
+
+    let linux = asm_for("va_copy_linux", "aarch64-unknown-linux-gnu", src);
+    let l = body_of(&linux, "f");
+    assert_eq!(
+        count(l, "stp x9, x10, [x16"),
+        2,
+        "a 32-byte va_list is two pairs:\n{l}"
+    );
+    assert_eq!(
+        count(l, "str x9, [x16"),
+        0,
+        "32 bytes divides evenly; no single-register tail belongs here:\n{l}"
+    );
+
+    let darwin = asm_for("va_copy_darwin", "aarch64-apple-darwin", src);
+    let d = body_of(&darwin, "f");
+    assert_eq!(
+        count(d, "stp x9, x10, [x16"),
+        0,
+        "an 8-byte va_list must not be copied with a 16-byte pair store:\n{d}"
+    );
+    assert_eq!(
+        count(d, "str x9, [x16"),
+        1,
+        "a Darwin va_list is one 8-byte store:\n{d}"
+    );
+}

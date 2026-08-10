@@ -249,6 +249,16 @@ pub unsafe fn setup_signal_handling() {
             get_current_errno_value()
         );
     }
+    // This pipe belongs to the shell alone; the utilities it execs must not
+    // inherit either end.
+    for fd in [read_pipe.as_raw_fd(), write_pipe.as_raw_fd()] {
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            panic!(
+                "failed to set close-on-exec on the signal buffer ({})",
+                get_current_errno_value()
+            );
+        }
+    }
     SIGNAL_WRITE = Some(write_pipe.into_raw_fd());
     SIGNAL_READ = Some(read_pipe.into_raw_fd());
 }

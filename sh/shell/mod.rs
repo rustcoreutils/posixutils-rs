@@ -18,8 +18,8 @@ use crate::nonempty::NonEmpty;
 use crate::os::errno::Errno;
 use crate::os::signals::{kill, Signal, SignalManager};
 use crate::os::{
-    close, dup, dup2, exec, find_command, fork, getpgid, getpgrp, is_process_in_foreground, pipe,
-    setpgid, tcsetpgrp, waitpid, ExecError, ForkResult, OsError, OsResult, Pid, WaitStatus,
+    close, dup2, dup_cloexec, exec, find_command, fork, getpgid, getpgrp, is_process_in_foreground,
+    pipe, setpgid, tcsetpgrp, waitpid, ExecError, ForkResult, OsError, OsResult, Pid, WaitStatus,
 };
 use crate::parse::command::{
     Assignment, CaseItem, Command, CommandType, CompleteCommand, CompoundCommand, Conjunction,
@@ -919,8 +919,10 @@ impl Shell {
                     // Keep a copy of the real stdin: after the last command has
                     // run, fd 0 still holds the final pipe's read end, and the
                     // writers upstream would never see EPIPE while this process
-                    // waits for them (`yes | head` would hang forever).
-                    let saved_stdin = dup(libc::STDIN_FILENO).ok();
+                    // waits for them (`yes | head` would hang forever). It is
+                    // close-on-exec so the pipeline's utilities never see it,
+                    // and an `OwnedFd` so the error paths below cannot leak it.
+                    let saved_stdin = dup_cloexec(libc::STDIN_FILENO).ok();
                     let mut current_stdin = libc::STDIN_FILENO;
                     let mut head_pids = Vec::new();
                     for command in pipeline.commands.head() {
@@ -931,12 +933,20 @@ impl Shell {
                                 setpgid(0, pipeline_pgid)
                                     .expect("failed to set process group for pipeline subcommand");
                                 drop(read_pipe);
+                                let write_stdout = write_pipe.into_raw_fd();
                                 dup2(current_stdin, libc::STDIN_FILENO)?;
-                                dup2(write_pipe.as_raw_fd(), libc::STDOUT_FILENO)?;
-                                let return_status = self.interpret_command(command, false);
+                                dup2(write_stdout, libc::STDOUT_FILENO)?;
+                                // fds 0 and 1 now hold both ends; the extra
+                                // copies must go before the command runs, or
+                                // it inherits descriptors it never asked for
+                                // (and upstream writers never see EPIPE).
                                 if current_stdin != libc::STDIN_FILENO {
                                     close(current_stdin)?;
                                 }
+                                if write_stdout != libc::STDOUT_FILENO {
+                                    close(write_stdout)?;
+                                }
+                                let return_status = self.interpret_command(command, false);
                                 self.exit(return_status);
                             }
                             ForkResult::Parent { child } => {
@@ -949,13 +959,14 @@ impl Shell {
                         }
                     }
                     dup2(current_stdin, libc::STDIN_FILENO)?;
+                    if current_stdin != libc::STDIN_FILENO {
+                        close(current_stdin)?;
+                    }
                     let return_status = self.interpret_command(pipeline.commands.last(), false);
-                    close(current_stdin)?;
                     // Drop the pipe's read end from fd 0 as well, so that the
                     // upstream writers can be signalled and reaped below.
                     if let Some(saved_stdin) = saved_stdin {
-                        dup2(saved_stdin, libc::STDIN_FILENO)?;
-                        close(saved_stdin)?;
+                        dup2(saved_stdin.as_raw_fd(), libc::STDIN_FILENO)?;
                     }
                     // Wait for every command in the pipeline to finish (POSIX
                     // requires it), reaping the head commands so they are not

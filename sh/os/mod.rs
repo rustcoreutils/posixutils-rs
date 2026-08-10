@@ -125,12 +125,14 @@ pub fn pipe() -> OsResult<(OwnedFd, OwnedFd)> {
     Ok((fd0, fd1))
 }
 
-pub fn dup(fd: RawFd) -> OsResult<RawFd> {
-    let dup_result = unsafe { libc::dup(fd) };
+/// `dup` that marks the copy close-on-exec, so it is not inherited by the
+/// utilities the shell execs.
+pub fn dup_cloexec(fd: RawFd) -> OsResult<OwnedFd> {
+    let dup_result = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
     if dup_result < 0 {
-        return Err(OsError::from_current_errno("dup"));
+        return Err(OsError::from_current_errno("fcntl"));
     }
-    Ok(dup_result)
+    Ok(unsafe { OwnedFd::from_raw_fd(dup_result) })
 }
 
 pub fn dup2(old_fd: RawFd, new_fd: RawFd) -> OsResult<RawFd> {

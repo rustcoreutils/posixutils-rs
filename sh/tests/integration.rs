@@ -2566,4 +2566,24 @@ mod audit_regressions {
             assert_eq!(out, "ok\n")
         });
     }
+
+    #[test]
+    fn pipelines_do_not_leak_descriptors_to_their_commands() {
+        // Only fds 0, 1 and 2 (plus whatever the utility opens itself) may
+        // reach a pipeline member.
+        if !Path::new("/proc/self/fd").exists() {
+            return;
+        }
+        for script in [
+            "true | ls /proc/self/fd\n",
+            "ls /proc/self/fd | cat\n",
+            "true | true | ls /proc/self/fd\n",
+        ] {
+            run_successfully_and(script, |out| {
+                let fds: Vec<&str> = out.split_whitespace().collect();
+                // 0, 1, 2 and the descriptor `ls` opened to read the directory.
+                assert_eq!(fds.len(), 4, "leaked descriptors: {fds:?}");
+            });
+        }
+    }
 }

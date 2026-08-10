@@ -10,6 +10,7 @@
 use crate::builtin::{skip_option_terminator, BuiltinResult, SpecialBuiltinUtility};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use gettextrs::gettext;
 
 pub struct Exec;
 
@@ -26,10 +27,28 @@ impl SpecialBuiltinUtility for Exec {
             return Ok(0);
         }
 
-        let command = shell
-            .find_command(&args[0], "", true)
-            .ok_or(format!("exec: {}: command not found", args[0]))?;
+        let Some(command) = shell.find_command(&args[0], "", true) else {
+            // POSIX: 127 when the command is not found, 126 when it is found
+            // but cannot be invoked.
+            opened_files.write_err(format!(
+                "{}: {}: {}\n",
+                gettext("exec"),
+                args[0],
+                gettext("command not found")
+            ));
+            if shell.is_interactive && !shell.is_subshell {
+                return Ok(127);
+            }
+            shell.exit(127);
+        };
 
-        shell.exec(command, args, opened_files)
+        // An interactive shell must survive a failed `exec`; any other shell
+        // exits with the failure status.
+        let (message, status) = shell.try_exec(command, args, opened_files);
+        opened_files.write_err(message);
+        if shell.is_interactive && !shell.is_subshell {
+            return Ok(status);
+        }
+        shell.exit(status)
     }
 }

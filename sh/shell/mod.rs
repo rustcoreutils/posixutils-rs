@@ -16,29 +16,31 @@ use crate::cli::terminal::Terminal;
 use crate::jobs::{JobManager, JobState};
 use crate::nonempty::NonEmpty;
 use crate::os::errno::Errno;
-use crate::os::signals::{kill, signal_to_exit_status, Signal, SignalManager};
+use crate::os::signals::{kill, Signal, SignalManager};
 use crate::os::{
-    close, dup2, exec, find_command, fork, getpgid, getpgrp, is_process_in_foreground, pipe,
-    setpgid, tcsetpgrp, waitpid, ExecError, ForkResult, OsError, OsResult, Pid, WaitStatus,
+    close, dup2, dup_cloexec, exec, find_command, fork, getpgid, getpgrp, is_process_in_foreground,
+    pipe, setpgid, tcsetpgrp, waitpid, ExecError, ForkResult, OsError, OsResult, Pid, WaitStatus,
 };
 use crate::parse::command::{
     Assignment, CaseItem, Command, CommandType, CompleteCommand, CompoundCommand, Conjunction,
     FunctionDefinition, If, LogicalOp, Name, Pipeline, Redirection, SimpleCommand,
 };
-use crate::parse::command_parser::CommandParser;
+use crate::parse::command_parser::{is_valid_name, CommandParser};
 use crate::parse::word::WordPair;
 use crate::parse::word_parser::parse_word;
 use crate::parse::{AliasTable, ParserError};
 use crate::shell::environment::{CannotModifyReadonly, Environment, Value};
 use crate::shell::history::{initialize_history_from_system, write_history_to_file, History};
 use crate::shell::opened_files::OpenedFiles;
-use crate::wordexp::{expand_word, expand_word_to_string, word_to_pattern};
+use crate::wordexp::{
+    expand_declaration_operand, expand_word, expand_word_to_string, word_to_pattern,
+};
 use gettextrs::gettext;
 use std::collections::HashMap;
 use std::ffi::{CString, OsString};
 use std::fmt::{Display, Formatter};
 use std::fs::File;
-use std::io::{read_to_string, Read};
+use std::io::Read;
 use std::os::fd::{AsRawFd, IntoRawFd};
 use std::path::Path;
 use std::rc::Rc;
@@ -190,6 +192,9 @@ pub struct Shell {
     pub getopts_state: (usize, usize),
     /// Time of the last mail check and the last-seen mtime of each mail file.
     pub mail_check: MailCheck,
+    /// `$!`: the process id of the most recent asynchronous command. It stays
+    /// set once the job has been waited for and removed from the job table.
+    pub last_background_pid: Option<Pid>,
 }
 
 #[derive(Default, Clone)]
@@ -217,6 +222,45 @@ fn split_mailpath_entry(entry: &str) -> (String, Option<String>) {
     (path, None)
 }
 
+/// Whether the command being built is a POSIX 2.9.1 declaration utility.
+///
+/// `export` and `readonly` are, and so is `command` once its own options are
+/// past and the utility it invokes turns out to be one of them — which is only
+/// known after that operand has been expanded, hence `Pending`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeclarationUtility {
+    No,
+    Pending,
+    Yes,
+}
+
+impl DeclarationUtility {
+    /// Classifies the command name, as an already-expanded field.
+    fn from_name(name: &str) -> Self {
+        match name {
+            "export" | "readonly" => Self::Yes,
+            "command" => Self::Pending,
+            _ => Self::No,
+        }
+    }
+
+    /// Refines a `Pending` verdict with `command`'s next expanded word.
+    fn resolve(self, word: &str) -> Self {
+        match self {
+            Self::Pending if word.starts_with('-') => Self::Pending,
+            Self::Pending => Self::from_name(word),
+            other => other,
+        }
+    }
+}
+
+/// True for a word of the form `name=…`, whose value a declaration utility
+/// expands as if it were an assignment.
+fn is_assignment_shaped(word: &str) -> bool {
+    word.split_once('=')
+        .is_some_and(|(name, _)| is_valid_name(name))
+}
+
 impl Shell {
     fn become_subshell(&mut self) {
         self.signal_manager.reset();
@@ -236,21 +280,37 @@ impl Shell {
         if self.is_interactive && !self.is_subshell {
             write_history_to_file(&self.history, &self.environment);
         }
+        // POSIX 2.15: `exit n` for 0 <= n <= 255 exits *normally* with status
+        // n. The shell must not re-raise the signal a `128+signo` status would
+        // stand for -- that would dump core and, from a subshell, signal the
+        // parent. dash and bash both exit normally here.
         std::process::exit(code);
     }
 
     pub fn wait_child_process(&mut self, child_pid: Pid) -> OsResult<i32> {
+        self.wait_child_process_result(child_pid)
+            .map(|(status, _)| status)
+    }
+
+    /// Waits for `child_pid`, returning its status and whether it actually
+    /// terminated. A stopped child also ends the wait, but it is still alive
+    /// and must stay in the job table.
+    pub fn wait_child_process_result(&mut self, child_pid: Pid) -> OsResult<(i32, bool)> {
         loop {
             match waitpid(child_pid, true, true)? {
-                WaitStatus::Exited { exit_status } => return Ok(exit_status),
-                WaitStatus::Signaled { signal, .. } => return Ok(signal_to_exit_status(signal)),
+                WaitStatus::Exited { exit_status } => return Ok((exit_status, true)),
+                WaitStatus::Signaled { signal, .. } => return Ok((signal.exit_status(), true)),
                 WaitStatus::Stopped { signal } => {
-                    self.background_jobs.add_job(
-                        child_pid,
-                        self.last_pipeline_command.clone(),
-                        JobState::Stopped,
-                    );
-                    return Ok(signal_to_exit_status(signal));
+                    // Only register the job if it is not one already, or the
+                    // table would gain a duplicate under a new number.
+                    if !self.background_jobs.mark_stopped_by_pid(child_pid) {
+                        self.background_jobs.add_job(
+                            child_pid,
+                            self.last_pipeline_command.clone(),
+                            JobState::Stopped,
+                        );
+                    }
+                    return Ok((signal.exit_status(), false));
                 }
                 WaitStatus::StillAlive => {
                     self.handle_async_events();
@@ -323,37 +383,55 @@ impl Shell {
         }
     }
 
-    pub fn exec(&mut self, command: OsString, args: &[String], opened_files: &OpenedFiles) -> ! {
+    /// Replaces the shell process with `command`. Returns only when the exec
+    /// failed, giving the diagnostic and the status POSIX prescribes for it;
+    /// the caller decides whether to exit (see `exec_and_exit`).
+    pub fn try_exec(
+        &mut self,
+        command: OsString,
+        args: &[String],
+        opened_files: &OpenedFiles,
+    ) -> (String, i32) {
+        let saved_signals = self.signal_manager.clone();
         self.signal_manager.reset();
-        match exec(command.clone(), args, opened_files, &self.environment).unwrap_err() {
-            ExecError::OsError(err) => {
-                self.eprint(&format!("{err}\n"));
-                self.exit(1)
-            }
-            ExecError::CannotExecute(errno) => {
-                if errno == Errno::ENOEXEC {
-                    match execute_file_as_script(self, Path::new(&command)) {
-                        Ok(status) => self.exit(status),
-                        Err(ScriptExecutionError::ParsingError(err)) => {
-                            self.eprint(&format!(
-                                "sh: parsing error ({}): {}\n",
-                                err.lineno, err.message
-                            ));
-                            self.exit(2)
-                        }
-                        Err(ScriptExecutionError::IoError(_)) => {
-                            // fallthrough to the default error
+        let failure =
+            match exec(command.clone(), args, opened_files, &self.environment).unwrap_err() {
+                ExecError::OsError(err) => (format!("{err}\n"), 126),
+                ExecError::CannotExecute(errno) => {
+                    if errno == Errno::ENOEXEC {
+                        match execute_file_as_script(self, Path::new(&command)) {
+                            Ok(status) => self.exit(status),
+                            Err(ScriptExecutionError::ParsingError(err)) => {
+                                self.eprint(&format!(
+                                    "sh: parsing error ({}): {}\n",
+                                    err.lineno, err.message
+                                ));
+                                self.exit(2)
+                            }
+                            Err(ScriptExecutionError::IoError(_)) => {
+                                // fallthrough to the default error
+                            }
                         }
                     }
+                    (
+                        format!(
+                            "sh: failed to execute {} ({})\n",
+                            command.to_string_lossy(),
+                            errno
+                        ),
+                        126,
+                    )
                 }
-                self.eprint(&format!(
-                    "sh: failed to execute {} ({})\n",
-                    command.to_string_lossy(),
-                    errno
-                ));
-                self.exit(126);
-            }
-        }
+            };
+        // the process was not replaced after all, so the shell keeps its traps
+        self.signal_manager.restore(saved_signals);
+        failure
+    }
+
+    pub fn exec(&mut self, command: OsString, args: &[String], opened_files: &OpenedFiles) -> ! {
+        let (message, status) = self.try_exec(command, args, opened_files);
+        self.eprint(&message);
+        self.exit(status)
     }
 
     pub fn fork_and_exec(
@@ -529,8 +607,28 @@ impl Shell {
         let mut expanded_words = Vec::new();
         // reset
         self.last_command_substitution_status = 0;
-        for word_pair in &simple_command.words {
-            expanded_words.extend(expand_word(&word_pair.word, false, self)?);
+        // POSIX 2.9.1: for a declaration utility, operands that look like
+        // assignments are expanded as assignments (tilde expansion after `=`
+        // and after each `:`) and are not field-split or globbed. The command
+        // name decides this, so the first word is expanded on its own.
+        let mut declaration_utility = DeclarationUtility::No;
+        for (index, word_pair) in simple_command.words.iter().enumerate() {
+            if declaration_utility == DeclarationUtility::Yes
+                && index > 0
+                && is_assignment_shaped(&word_pair.as_string)
+            {
+                expanded_words.push(expand_declaration_operand(&word_pair.word, self)?);
+                continue;
+            }
+            let fields = expand_word(&word_pair.word, false, self)?;
+            if let Some(first) = fields.first() {
+                declaration_utility = if index == 0 {
+                    DeclarationUtility::from_name(first)
+                } else {
+                    declaration_utility.resolve(first)
+                };
+            }
+            expanded_words.extend(fields);
         }
         if self.set_options.xtrace {
             self.trace(&expanded_words);
@@ -625,7 +723,13 @@ impl Shell {
         ignore_errexit: bool,
     ) -> CommandExecutionResult<i32> {
         let arg = expand_word_to_string(&arg.word, false, self)?;
-        let arg_cstr = CString::new(arg).expect("invalid pattern");
+        // A NUL cannot appear in a C string; treat the value as ending there.
+        let arg_cstr = CString::new(arg).unwrap_or_else(|err| {
+            let pos = err.nul_position();
+            let mut bytes = err.into_vec();
+            bytes.truncate(pos);
+            CString::new(bytes).expect("truncated at the first NUL")
+        });
         for (index, case) in cases.iter().enumerate() {
             let mut matched = false;
             for pattern in &case.pattern {
@@ -812,6 +916,13 @@ impl Shell {
                         self.exit(1);
                     }
 
+                    // Keep a copy of the real stdin: after the last command has
+                    // run, fd 0 still holds the final pipe's read end, and the
+                    // writers upstream would never see EPIPE while this process
+                    // waits for them (`yes | head` would hang forever). It is
+                    // close-on-exec so the pipeline's utilities never see it,
+                    // and an `OwnedFd` so the error paths below cannot leak it.
+                    let saved_stdin = dup_cloexec(libc::STDIN_FILENO).ok();
                     let mut current_stdin = libc::STDIN_FILENO;
                     let mut head_pids = Vec::new();
                     for command in pipeline.commands.head() {
@@ -822,12 +933,20 @@ impl Shell {
                                 setpgid(0, pipeline_pgid)
                                     .expect("failed to set process group for pipeline subcommand");
                                 drop(read_pipe);
+                                let write_stdout = write_pipe.into_raw_fd();
                                 dup2(current_stdin, libc::STDIN_FILENO)?;
-                                dup2(write_pipe.as_raw_fd(), libc::STDOUT_FILENO)?;
-                                let return_status = self.interpret_command(command, false);
+                                dup2(write_stdout, libc::STDOUT_FILENO)?;
+                                // fds 0 and 1 now hold both ends; the extra
+                                // copies must go before the command runs, or
+                                // it inherits descriptors it never asked for
+                                // (and upstream writers never see EPIPE).
                                 if current_stdin != libc::STDIN_FILENO {
                                     close(current_stdin)?;
                                 }
+                                if write_stdout != libc::STDOUT_FILENO {
+                                    close(write_stdout)?;
+                                }
+                                let return_status = self.interpret_command(command, false);
                                 self.exit(return_status);
                             }
                             ForkResult::Parent { child } => {
@@ -840,8 +959,15 @@ impl Shell {
                         }
                     }
                     dup2(current_stdin, libc::STDIN_FILENO)?;
+                    if current_stdin != libc::STDIN_FILENO {
+                        close(current_stdin)?;
+                    }
                     let return_status = self.interpret_command(pipeline.commands.last(), false);
-                    close(current_stdin)?;
+                    // Drop the pipe's read end from fd 0 as well, so that the
+                    // upstream writers can be signalled and reaped below.
+                    if let Some(saved_stdin) = saved_stdin {
+                        dup2(saved_stdin.as_raw_fd(), libc::STDIN_FILENO)?;
+                    }
                     // Wait for every command in the pipeline to finish (POSIX
                     // requires it), reaping the head commands so they are not
                     // left running as orphans (e.g. `sleep 5 | true`).
@@ -960,10 +1086,22 @@ impl Shell {
                     self.become_subshell();
                     // should never fail
                     setpgid(0, 0).expect("failed to create process group for background job");
+                    if !self.set_options.monitor {
+                        // POSIX 2.11: without job control, an asynchronous list
+                        // ignores SIGINT and SIGQUIT and reads from /dev/null,
+                        // so it neither competes for the terminal nor dies with
+                        // the foreground job.
+                        self.signal_manager
+                            .set_action(Signal::SigInt, TrapAction::Ignore);
+                        self.signal_manager
+                            .set_action(Signal::SigQuit, TrapAction::Ignore);
+                        self.opened_files.redirect_stdin_to_dev_null();
+                    }
                     let status = self.interpret_and_or_list(&conjunction.elements, false);
                     self.exit(status);
                 }
                 Ok(ForkResult::Parent { child }) => {
+                    self.last_background_pid = Some(child);
                     self.background_jobs
                         .add_job(child, conjunction.to_string(), JobState::Running);
                     0
@@ -1006,17 +1144,36 @@ impl Shell {
             }
             ForkResult::Parent { child } => {
                 drop(write_pipe);
-                match waitpid(child, false, false)? {
-                    WaitStatus::Exited { .. } | WaitStatus::Signaled { .. } => {
-                        let read_file = File::from(read_pipe);
-                        let mut output = read_to_string(&read_file).unwrap();
-                        let new_len = output.trim_end_matches('\n').len();
-                        output.truncate(new_len);
-                        Ok(output)
-                    }
-                    // no other results possible without specifying flags in waitpid
-                    _ => unreachable!(),
-                }
+                // Drain the pipe *before* waiting: a child whose output exceeds
+                // the pipe buffer blocks in write() until it is read, so
+                // waiting first would deadlock.
+                let mut bytes = Vec::new();
+                File::from(read_pipe)
+                    .read_to_end(&mut bytes)
+                    .map_err(|err| {
+                        CommandExecutionError::ExpansionError(format!(
+                            "command substitution: {err}"
+                        ))
+                    })?;
+                // POSIX 2.9.1: when a command consists only of substitutions,
+                // its exit status is that of the last one, so the status has
+                // to be recorded rather than discarded.
+                self.last_command_substitution_status = match waitpid(child, false, false)? {
+                    WaitStatus::Exited { exit_status } => exit_status,
+                    WaitStatus::Signaled { signal } => signal.exit_status(),
+                    WaitStatus::Stopped { .. } | WaitStatus::StillAlive => 0,
+                };
+                // The shell represents words as UTF-8 strings; bytes that are
+                // not valid UTF-8 cannot be carried through, so substitute
+                // replacement characters rather than aborting.
+                // POSIX leaves NUL bytes in command output unspecified; drop
+                // them (as bash does) so they cannot reach the pattern and
+                // C-string code paths.
+                bytes.retain(|&b| b != 0);
+                let mut output = String::from_utf8_lossy(&bytes).into_owned();
+                let new_len = output.trim_end_matches('\n').len();
+                output.truncate(new_len);
+                Ok(output)
             }
         }
     }
@@ -1061,9 +1218,11 @@ impl Shell {
     pub fn initialize_from_system(
         program_name: String,
         args: Vec<String>,
-        set_options: SetOptions,
+        mut set_options: SetOptions,
         is_interactive: bool,
     ) -> Shell {
+        // `$-` reports `i` for an interactive shell; `set` cannot change it.
+        set_options.interactive = is_interactive;
         // > If a variable is initialized from the environment, it shall be marked for
         // > export immediately
         let mut environment =
@@ -1223,6 +1382,7 @@ impl Default for Shell {
             getopts_state: (0, 0),
             mail_check: MailCheck::default(),
             terminal: Terminal::default(),
+            last_background_pid: None,
         }
     }
 }

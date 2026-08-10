@@ -7,6 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
+mod pty;
+
 use plib::testing::{run_test, run_test_with_checker, TestPlan};
 use std::path::Path;
 use std::process::Output;
@@ -149,12 +151,16 @@ fn test_script_expect_error_status_and_stdout(script: &str, stdout: Option<&str>
 }
 
 fn expect_exit_code(script: &str, exit_code: i32) {
+    expect_cli_exit_code(vec!["-s".to_string()], script, exit_code)
+}
+
+fn expect_cli_exit_code(args: Vec<String>, stdin: &str, exit_code: i32) {
     set_env_vars();
     run_test_with_checker(
         TestPlan {
             cmd: "sh".to_string(),
-            args: vec!["-s".to_string()],
-            stdin_data: script.to_string(),
+            args,
+            stdin_data: stdin.to_string(),
             expected_out: "".to_string(),
             expected_err: "".to_string(),
             expected_exit_code: 0,
@@ -1191,6 +1197,14 @@ mod builtin {
     }
 
     #[test]
+    fn null_utility() {
+        test_script(
+            include_str!("sh/builtin/null_utility.sh"),
+            include_str!("sh/builtin/null_utility.out"),
+        );
+    }
+
+    #[test]
     fn unset_variable() {
         test_script(
             include_str!("sh/builtin/unset_variable.sh"),
@@ -1384,6 +1398,7 @@ mod builtin {
 /// audit issue number. Tests are grouped by remediation phase.
 mod audit_regressions {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     /// Asserts the script fails (non-zero exit) WITHOUT panicking (a Rust
     /// panic surfaces as exit code 101 and a "panicked" message on stderr).
@@ -1888,5 +1903,794 @@ mod audit_regressions {
         test_script("case d in [!abc]) echo M;; *) echo NO;; esac\n", "M\n");
         test_script("case m in [a-z]) echo M;; *) echo NO;; esac\n", "M\n");
         test_script("case 5 in [[:digit:]]) echo M;; *) echo NO;; esac\n", "M\n");
+    }
+
+    // ----- Phase 1 (round 2): remaining process-aborting panics -----
+
+    #[test]
+    fn here_document_allows_trailing_tokens_on_the_same_line() {
+        // The here-document body starts on the *next* line; whatever follows
+        // the delimiter on the current line is still part of the command.
+        test_script("cat <<EOF | tr a-z A-Z\nhi\nEOF\n", "HI\n");
+        test_script("cat <<A <<B\nfirst\nA\nsecond\nB\n", "second\n");
+        run_successfully_and(
+            "f=\"$TEST_WRITE_DIR/heredoc_redirect\"; rm -f \"$f\"; \
+             cat <<EOF > \"$f\"\nhi\nEOF\ncat \"$f\"; rm -f \"$f\"\n",
+            |out| assert_eq!(out, "hi\n"),
+        );
+    }
+
+    #[test]
+    fn here_document_delimiter_may_follow_blanks() {
+        // POSIX token recognition: '<<' is an operator, so blanks may separate
+        // it from the delimiter word.
+        test_script("cat << EOF\nhi\nEOF\n", "hi\n");
+        test_script("cat <<\tEOF\nhi\nEOF\n", "hi\n");
+    }
+
+    #[test]
+    fn here_document_dash_strips_tabs_from_terminator() {
+        // `<<-` strips leading tabs from the body *and* from the terminator.
+        test_script("cat <<-EOF\n\thi\n\tEOF\n", "hi\n");
+    }
+
+    #[test]
+    fn here_document_delimiter_split_by_line_continuation() {
+        // A '\'-newline inside the delimiter word is removed like anywhere else.
+        test_script("cat <<EO\\\nF\nhi\nEOF\n", "hi\n");
+    }
+
+    #[test]
+    fn cd_physical_accepts_a_relative_operand() {
+        // `cd -P <relative>` must resolve to an absolute directory; leaving
+        // PWD relative later trips an internal absolute-path invariant.
+        set_env_vars();
+        let dir = Path::new(concat!(env!("CARGO_TARGET_TMPDIR"), "/sh_test_write_dir"))
+            .join("cd_physical_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        run_successfully_and(
+            &format!(
+                "cd '{}' && cd -P sub && pwd && for f in *; do echo \"[$f]\"; done\n",
+                dir.display()
+            ),
+            |out| {
+                assert_eq!(out, format!("{}/sub\n[*]\n", dir.display()));
+            },
+        );
+    }
+
+    #[test]
+    fn interactive_with_non_terminal_stdin_does_not_panic() {
+        // `sh -i` is allowed even when stdin is not a terminal.
+        set_env_vars();
+        run_test_with_checker(
+            TestPlan {
+                cmd: "sh".to_string(),
+                args: vec!["-i".to_string()],
+                stdin_data: "echo hi\nexit 0\n".to_string(),
+                expected_out: String::new(),
+                expected_err: String::new(),
+                expected_exit_code: 0,
+            },
+            |_, output| {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(!stderr.contains("panicked"), "shell panicked: {stderr}");
+                assert!(String::from_utf8_lossy(&output.stdout).contains("hi"));
+            },
+        );
+    }
+
+    #[test]
+    fn case_pattern_may_expand_to_several_fields() {
+        // `$@` still expands to one field per parameter; a pattern is a single
+        // word, so the fields are joined with a space (as dash and bash do).
+        test_script(
+            "set -- a b; case 'a b' in $@) echo M;; *) echo NO;; esac\n",
+            "M\n",
+        );
+        test_script(
+            "set -- a b; case a in $@) echo M;; *) echo NO;; esac\n",
+            "NO\n",
+        );
+        // A case pattern is not field-split, so IFS does not apply to it.
+        test_script(
+            "IFS=,; v='a,b'; case 'a,b' in $v) echo M;; *) echo NO;; esac\n",
+            "M\n",
+        );
+    }
+
+    #[test]
+    fn pipeline_writer_is_signalled_when_the_reader_exits() {
+        // The shell must not keep the last pipe's read end open while waiting
+        // for the writers, or `yes | head` never terminates.
+        run_successfully_and("yes | head -n 3\n", |out| assert_eq!(out, "y\ny\ny\n"));
+        run_successfully_and("yes | head -n 5 | wc -l\n", |out| {
+            assert_eq!(out.trim(), "5")
+        });
+    }
+
+    #[test]
+    fn command_substitution_exceeding_the_pipe_buffer() {
+        // The child blocks writing once the pipe fills, so the shell has to
+        // drain the pipe before waiting for it.
+        run_successfully_and(
+            "x=$(yes 0123456789012345678901234567890123456789 | head -n 20000); echo ${#x}\n",
+            // 20000 lines of 40 characters plus a newline each, less the
+            // trailing newline that command substitution strips.
+            |out| assert_eq!(out, "819999\n"),
+        );
+    }
+
+    #[test]
+    fn command_substitution_drops_nul_bytes() {
+        // A NUL cannot be carried in a shell word; dropping it must not abort
+        // the pattern-matching code paths that use C strings.
+        test_script("x=$(printf 'a\\0b'); echo \"[$x]\"\n", "[ab]\n");
+        test_script(
+            "x=$(printf 'a\\0b'); case \"$x\" in ab) echo M;; *) echo NO;; esac\n",
+            "M\n",
+        );
+        test_script("x=$(printf 'a\\0b'); echo \"[${x#a}]\"\n", "[b]\n");
+    }
+
+    #[test]
+    fn builtin_output_to_an_unwritable_descriptor_does_not_panic() {
+        // stdout redirected to a read-only file: report an error, do not abort.
+        set_env_vars();
+        run_script_with_checker("exec 1</dev/null; export -p\necho done >&2\n", |output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!stderr.contains("panicked"), "shell panicked: {stderr}");
+            assert_ne!(output.status.code(), Some(101));
+        });
+    }
+
+    // ----- Phase 2: line continuation during token recognition -----
+
+    #[test]
+    fn line_continuation_inside_a_reserved_word() {
+        test_script("i\\\nf true; then echo YES; fi\n", "YES\n");
+        test_script("if true; then echo A; f\\\ni\n", "A\n");
+        test_script("for x in 1; do\\\n echo D$x; done\n", "D1\n");
+        // Quoting still keeps a reserved word an ordinary word.
+        test_script("f() { echo fn; }; 'f'\n", "fn\n");
+    }
+
+    #[test]
+    fn line_continuation_inside_an_operator() {
+        test_script("true &\\\n& echo AND\n", "AND\n");
+        test_script("false |\\\n| echo OR\n", "OR\n");
+        test_script("case a in a) echo C;\\\n; esac\n", "C\n");
+        run_successfully_and(
+            "f=\"$TEST_WRITE_DIR/lc_append\"; rm -f \"$f\"; \
+             echo X >\\\n> \"$f\"; cat \"$f\"; rm -f \"$f\"\n",
+            |out| assert_eq!(out, "X\n"),
+        );
+    }
+
+    #[test]
+    fn line_continuation_inside_an_io_number() {
+        run_successfully_and(
+            "f=\"$TEST_WRITE_DIR/lc_ionum\"; rm -f \"$f\"; \
+             echo Y 1\\\n> \"$f\"; cat \"$f\"; rm -f \"$f\"\n",
+            |out| assert_eq!(out, "Y\n"),
+        );
+    }
+
+    #[test]
+    fn escaped_backslash_before_a_newline_in_double_quotes() {
+        // `\\` is a literal backslash, so the newline after it is literal too
+        // rather than a line continuation.
+        test_script("echo \"a\\\\\nb\"\n", "a\\\nb\n");
+        // A backslash only escapes $ ` \" \\ and <newline> inside double quotes.
+        test_script("echo \"\\$(echo hi)\"\n", "$(echo hi)\n");
+        test_script("echo \"a\\\nb\"\n", "ab\n");
+        test_script("echo \"a\\nb\"\n", "a\\nb\n");
+    }
+
+    // ----- Phase 3: declaration-utility assignment expansion (POSIX 2.9.1) --
+
+    #[test]
+    fn declaration_utilities_tilde_expand_assignment_operands() {
+        set_env_vars();
+        run_successfully_and("HOME=/H; export a=~; echo \"$a\"\n", |out| {
+            assert_eq!(out, "/H\n")
+        });
+        run_successfully_and("HOME=/H; export p=~/b:~/c; echo \"$p\"\n", |out| {
+            assert_eq!(out, "/H/b:/H/c\n")
+        });
+        run_successfully_and("HOME=/H; readonly b=~; echo \"$b\"\n", |out| {
+            assert_eq!(out, "/H\n")
+        });
+        run_successfully_and("HOME=/H; command export c=~; echo \"$c\"\n", |out| {
+            assert_eq!(out, "/H\n")
+        });
+        // A plain assignment already worked and must keep working.
+        run_successfully_and("HOME=/H; v=~; echo \"$v\"\n", |out| assert_eq!(out, "/H\n"));
+    }
+
+    #[test]
+    fn declaration_utility_operands_are_not_split_or_globbed() {
+        set_env_vars();
+        // The value of an assignment-shaped operand is a single field even
+        // when it contains IFS characters.
+        run_successfully_and("IFS=:; export v=a:b:c; echo \"$v\"\n", |out| {
+            assert_eq!(out, "a:b:c\n")
+        });
+        // Non-assignment operands keep their ordinary expansion.
+        run_successfully_and("HOME=/H; export -p >/dev/null; x=~; echo \"$x\"\n", |out| {
+            assert_eq!(out, "/H\n")
+        });
+    }
+
+    // ----- Phase 4: ulimit conformance -----
+
+    #[test]
+    fn ulimit_reports_a_single_limit_as_a_bare_value() {
+        // POSIX: "%1d\n", or "unlimited\n" for a resource with no numeric
+        // limit. The labelled form belongs to -a only.
+        set_env_vars();
+        for script in [
+            "ulimit -f\n",
+            "ulimit\n",
+            "ulimit -S -f\n",
+            "ulimit -H -f\n",
+        ] {
+            run_successfully_and(script, |out| {
+                let value = out.trim_end_matches('\n');
+                assert!(
+                    value == "unlimited" || value.chars().all(|c| c.is_ascii_digit()),
+                    "expected a bare limit value, got {out:?}"
+                );
+            });
+        }
+        // -a keeps the labelled, one-line-per-resource form.
+        run_successfully_and("ulimit -a\n", |out| {
+            assert!(out.contains("file size (-f)"), "got {out:?}");
+            assert!(out.lines().count() >= 5, "got {out:?}");
+        });
+    }
+
+    #[test]
+    fn ulimit_with_no_options_reports_the_soft_file_size_limit() {
+        set_env_vars();
+        run_successfully_and("ulimit -f 100\nulimit\n", |out| assert_eq!(out, "100\n"));
+    }
+
+    #[test]
+    fn ulimit_soft_limit_may_not_exceed_the_hard_limit() {
+        // Raising the hard limit needs privilege, so `-S` must refuse rather
+        // than silently widening it.
+        expect_clean_failure("ulimit -f 100\nulimit -S -f 200\n");
+        run_successfully_and(
+            "ulimit -f 100\nulimit -S -f 50\nulimit -S -f\nulimit -H -f\n",
+            |out| assert_eq!(out, "50\n100\n"),
+        );
+    }
+
+    // ----- Phase 5: exit status, $-, $!, exec -----
+
+    // `/proc/self/mem` is the only readily available file that opens but fails
+    // to read; there is no portable equivalent, so this one is Linux-only.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unrecoverable_read_error_exits_128() {
+        // sh.md: 128 when commands cannot be read.
+        set_env_vars();
+        expect_cli_exit_code(vec!["/proc/self/mem".to_string()], "", 128);
+    }
+
+    #[test]
+    fn non_script_command_file_exits_126() {
+        // A command_file that is not valid text is ENOEXEC-like: 126, not 127.
+        // Build it here rather than naming a system path, which differs across
+        // platforms (`/bin/true` does not exist on macOS).
+        set_env_vars();
+        let dir = Path::new(concat!(env!("CARGO_TARGET_TMPDIR"), "/sh_test_write_dir"));
+        std::fs::create_dir_all(dir).unwrap();
+        let binary = dir.join("not_a_script.bin");
+        std::fs::write(&binary, [0x7f, b'E', b'L', b'F', 0xff, 0xfe]).unwrap();
+        expect_cli_exit_code(vec![binary.to_string_lossy().into_owned()], "", 126);
+    }
+
+    #[test]
+    fn exec_reports_127_when_the_command_is_not_found() {
+        set_env_vars();
+        expect_cli_exit_code(
+            vec!["-c".to_string(), "exec no_such_command_xyz".to_string()],
+            "",
+            127,
+        );
+        // A file that exists but cannot be executed is 126. Build it here
+        // rather than naming a system path, which differs across platforms
+        // (`/etc/hostname` does not exist on macOS).
+        let dir = Path::new(concat!(env!("CARGO_TARGET_TMPDIR"), "/sh_test_write_dir"));
+        std::fs::create_dir_all(dir).unwrap();
+        let not_executable = dir.join("not_executable");
+        std::fs::write(&not_executable, "data\n").unwrap();
+        std::fs::set_permissions(&not_executable, std::fs::Permissions::from_mode(0o644)).unwrap();
+        expect_cli_exit_code(
+            vec![
+                "-c".to_string(),
+                format!("exec '{}'", not_executable.display()),
+            ],
+            "",
+            126,
+        );
+    }
+
+    #[test]
+    fn dollar_bang_survives_wait() {
+        // `$!` names the most recent background command, and stays set after
+        // `wait` has reaped it.
+        run_successfully_and(
+            "sleep 0.05 & p=$!; wait; test \"$!\" = \"$p\" && echo same\n",
+            |out| assert_eq!(out, "same\n"),
+        );
+    }
+
+    #[test]
+    fn wait_removes_the_job_it_reaped() {
+        run_successfully_and("sleep 0.05 & p=$!; wait $p; echo \"[$(jobs)]\"\n", |out| {
+            assert_eq!(out, "[]\n")
+        });
+    }
+
+    // ----- Phase 6: built-in output and option handling -----
+
+    #[test]
+    fn unalias_a_accepts_operands_and_terminates_its_diagnostic() {
+        test_script("alias x=y; unalias -a x; echo rc=$?\n", "rc=0\n");
+        set_env_vars();
+        run_script_with_checker("unalias nope1 nope2\n", |output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(stderr.lines().count(), 2, "got {stderr:?}");
+            assert!(stderr.ends_with('\n'), "got {stderr:?}");
+        });
+    }
+
+    #[test]
+    fn fc_option_order_does_not_matter() {
+        // `-n` and `-r` qualify the other options; `fc -nl` is the common
+        // spelling and must behave like `fc -ln`.
+        set_env_vars();
+        for script in ["fc -nl\n", "fc -ln\n", "fc -n -l\n"] {
+            run_script_with_checker(script, |output| {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(!stderr.contains("can only be"), "got {stderr:?}");
+            });
+        }
+        // `-n` still requires `-l`, and `-r` still conflicts with `-s`.
+        expect_clean_failure("fc -n\n");
+        expect_clean_failure("fc -s -r\n");
+        expect_clean_failure("fc -r -s\n");
+    }
+
+    // ----- Phase 7: previously deferred findings -----
+
+    #[test]
+    fn async_list_reads_from_dev_null_without_job_control() {
+        // POSIX 2.11: with job control disabled, an asynchronous list gets
+        // /dev/null for standard input unless it redirects it itself.
+        set_env_vars();
+        run_test_with_checker(
+            TestPlan {
+                cmd: "sh".to_string(),
+                args: vec!["-s".to_string()],
+                stdin_data: "{ read x; echo \"child got [$x] rc=$?\"; } &\nsleep 0.3\n".to_string(),
+                expected_out: String::new(),
+                expected_err: String::new(),
+                expected_exit_code: 0,
+            },
+            |_, output| {
+                assert_eq!(
+                    String::from_utf8_lossy(&output.stdout),
+                    "child got [] rc=1\n"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn async_list_ignores_sigint_without_job_control() {
+        run_successfully_and(
+            "{ sleep 0.4; echo CHILD-SURVIVED; } &\nsleep 0.05\nkill -INT $!\nwait\n",
+            |out| assert_eq!(out, "CHILD-SURVIVED\n"),
+        );
+    }
+
+    #[test]
+    fn bg_on_an_already_running_job_succeeds() {
+        // POSIX: a job already running in the background needs no action.
+        run_successfully_and("set -m\nsleep 0.2 & bg %1\necho rc=$?\n", |out| {
+            assert!(out.ends_with("rc=0\n"), "got {out:?}")
+        });
+    }
+
+    #[test]
+    fn read_reports_an_assignment_error_above_end_of_file() {
+        // POSIX read EXIT STATUS: 1 is end-of-file, >1 is an error.
+        set_env_vars();
+        run_script_with_checker("read x </dev/null; echo rc=$?\n", |output| {
+            assert_eq!(String::from_utf8_lossy(&output.stdout), "rc=1\n");
+        });
+        run_script_with_checker(
+            "readonly x=1\nprintf 'a\\n' | { read x; echo rc=$?; }\n",
+            |output| {
+                assert_eq!(String::from_utf8_lossy(&output.stdout), "rc=2\n");
+            },
+        );
+    }
+
+    #[test]
+    fn dot_reports_an_unreadable_file() {
+        set_env_vars();
+        let dir = Path::new(concat!(env!("CARGO_TARGET_TMPDIR"), "/sh_test_write_dir"));
+        std::fs::create_dir_all(dir).unwrap();
+        let script = dir.join("dot_unreadable.sh");
+        std::fs::write(&script, "echo nope\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o000)).unwrap();
+        run_script_with_checker(&format!(". '{}'\n", script.display()), |output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("cannot open file"), "got {stderr:?}");
+            assert!(!output.status.success());
+        });
+        let _ = std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644));
+        let _ = std::fs::remove_file(&script);
+    }
+
+    // ----- Phase 8: coverage for previously untested behaviour -----
+
+    #[test]
+    fn continue_does_not_escape_a_function() {
+        // The loop-depth counter has to be function-scoped, or `continue` in a
+        // function unwinds the caller's loop.
+        test_script(
+            "for x in 1 2; do f() { continue; }; f; echo in$x; done; echo done\n",
+            "in1\nin2\ndone\n",
+        );
+        test_script(
+            "f() { continue; }\nfor x in 1 2; do f; echo in$x; done\necho done\n",
+            "in1\nin2\ndone\n",
+        );
+    }
+
+    #[test]
+    fn cd_searches_cdpath_and_reports_the_directory_it_found() {
+        set_env_vars();
+        let base = Path::new(concat!(env!("CARGO_TARGET_TMPDIR"), "/sh_test_write_dir"))
+            .join("cdpath_test");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("first/sub")).unwrap();
+        std::fs::create_dir_all(base.join("second/sub")).unwrap();
+        // The first matching CDPATH entry wins, and the resolved directory is
+        // written to standard output.
+        run_successfully_and(
+            &format!(
+                "CDPATH='{first}:{second}'; cd sub; pwd\n",
+                first = base.join("first").display(),
+                second = base.join("second").display(),
+            ),
+            |out| {
+                let expected = base.join("first/sub");
+                assert_eq!(
+                    out,
+                    format!("{}\n{}\n", expected.display(), expected.display())
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn cd_resolves_dot_dot_lexically_unless_physical() {
+        set_env_vars();
+        let base = Path::new(concat!(env!("CARGO_TARGET_TMPDIR"), "/sh_test_write_dir"))
+            .join("cd_dotdot_test");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("real/inner")).unwrap();
+        std::os::unix::fs::symlink(base.join("real/inner"), base.join("link")).unwrap();
+        // -L (the default) removes `link/..` lexically, landing back in base.
+        run_successfully_and(
+            &format!("cd '{}/link'; cd ..; pwd\n", base.display()),
+            |out| assert_eq!(out, format!("{}\n", base.display())),
+        );
+        // -P follows the symbolic link first, so `..` lands in real/.
+        run_successfully_and(
+            &format!("cd '{}/link'; cd -P ..; pwd\n", base.display()),
+            |out| assert_eq!(out, format!("{}\n", base.join("real").display())),
+        );
+    }
+
+    #[test]
+    fn hash_forgets_remembered_locations_when_path_changes() {
+        set_env_vars();
+        // `hash name` remembers a location, `hash` lists it, and assigning to
+        // PATH clears the table.
+        run_successfully_and(
+            "saved=$PATH\nhash true\nbefore=$(hash)\nPATH=/nonexistent\nafter=$(hash)\n\
+             PATH=$saved\necho \"[$before][$after]\"\n",
+            |out| {
+                assert!(
+                    out.contains("true"),
+                    "expected a remembered location: {out:?}"
+                );
+                assert!(out.ends_with("[]\n"), "expected an empty table: {out:?}");
+            },
+        );
+        // The not-found diagnostic goes to stderr, not stdout.
+        run_script_with_checker("hash no_such_command_xyz\n", |output| {
+            assert!(String::from_utf8_lossy(&output.stdout).is_empty());
+            assert!(!String::from_utf8_lossy(&output.stderr).is_empty());
+        });
+    }
+
+    // ----- Review follow-up: regressions found by the branch review -----
+
+    #[test]
+    fn here_document_may_be_followed_by_a_closing_operator() {
+        // The remainder of the `<<` line is pushed back as a new source part;
+        // an operator starting exactly at that boundary must be consumed once,
+        // not lexed twice.
+        test_script("(cat <<EOF\nx\nEOF\n)\n", "x\n");
+        test_script("case a in\na) cat <<EOF\nx\nEOF\n;;\nesac\n", "x\n");
+        test_script("f() (cat <<EOF\nx\nEOF\n)\nf\n", "x\n");
+        test_script("{ cat <<EOF\nx\nEOF\n}\n", "x\n");
+    }
+
+    #[test]
+    fn exit_with_a_signal_status_is_a_normal_exit() {
+        // POSIX 2.15: `exit n` for n in 0..255 exits with that status and
+        // performs no signal side effects such as a core dump.
+        set_env_vars();
+        for status in [130, 134, 143] {
+            run_script_with_checker(&format!("exit {status}\n"), |output| {
+                use std::os::unix::process::ExitStatusExt;
+                assert_eq!(output.status.signal(), None, "expected a normal exit");
+                assert_eq!(output.status.code(), Some(status));
+            });
+        }
+        // A subshell exiting with such a status must not signal its parent.
+        run_script_with_checker("(exit 130)\necho alive\nexit 7\n", |output| {
+            assert_eq!(String::from_utf8_lossy(&output.stdout), "alive\n");
+            assert_eq!(output.status.code(), Some(7));
+        });
+    }
+
+    #[test]
+    fn read_consumes_successive_here_document_lines() {
+        test_script(
+            "while read l; do echo \"got:$l\"; done <<EOF\na\nb\nEOF\n",
+            "got:a\ngot:b\n",
+        );
+    }
+
+    #[test]
+    fn ulimit_accepts_a_bare_newlimit_operand() {
+        // POSIX synopsis is `ulimit [-f] [blocks]`, so -f is implied.
+        run_successfully_and("ulimit 2000\nulimit -f\n", |out| assert_eq!(out, "2000\n"));
+    }
+
+    #[test]
+    fn bg_reports_a_job_that_has_already_terminated() {
+        // Only an already-*running* job is a silent success; a finished job is
+        // still an error.
+        expect_clean_failure("set -m\nsleep 0.05 &\nsleep 0.3\nbg %1\n");
+    }
+
+    #[test]
+    fn fc_out_of_range_endpoints_do_not_underflow() {
+        // `fc -l 0` and out-of-range endpoints must clamp, never underflow.
+        // The listing itself depends on $HISTFILE, so only the shell's
+        // survival is asserted here.
+        set_env_vars();
+        for script in [
+            "echo one\necho two\nfc -l 0 >/dev/null 2>&1\necho done\n",
+            "echo one\nfc -l 100 200 >/dev/null 2>&1\necho done\n",
+            "echo one\nfc -l -n 0 500 >/dev/null 2>&1\necho done\n",
+        ] {
+            run_script_with_checker(script, |output| {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(!stderr.contains("panicked"), "shell panicked: {stderr}");
+                assert!(String::from_utf8_lossy(&output.stdout).ends_with("done\n"));
+            });
+        }
+    }
+
+    // ----- Review follow-up (round 2) -----
+
+    #[test]
+    fn here_document_inside_a_command_substitution() {
+        // `WordLexer::next_line` used to stop *at* the newline instead of
+        // consuming it, so scanning the extent of a here-document inside
+        // `$(...)` looped on the same empty line forever.
+        test_script("x=$(cat <<EOF\nhi\nEOF\n)\necho \"[$x]\"\n", "[hi]\n");
+        test_script("x=$(cat <<-EOF\n\thi\n\tEOF\n)\necho \"[$x]\"\n", "[hi]\n");
+        test_script(
+            "x=$(cat <<EOF | tr a-z A-Z\nhi\nEOF\n)\necho \"[$x]\"\n",
+            "[HI]\n",
+        );
+        test_script(
+            "x=$(cat <<'E'\n$notexpanded\nE\n)\necho \"$x\"\n",
+            "$notexpanded\n",
+        );
+    }
+
+    #[test]
+    fn here_document_larger_than_the_pipe_buffer() {
+        // The body used to be written into a pipe nobody was reading yet, so
+        // anything past the 64KiB pipe capacity blocked the shell forever.
+        let body = "0123456789abcdefghijklmnopqrstuvwxyz\n".repeat(4000);
+        let expected = format!("{}\n", body.len());
+        run_successfully_and(&format!("wc -c <<EOF\n{body}EOF\n"), |out| {
+            assert_eq!(out.trim_start(), expected)
+        });
+    }
+
+    #[test]
+    fn here_document_descriptor_is_seekable_and_reusable() {
+        // A here-document redirection behaves like a file, so successive
+        // reads continue where the previous one stopped.
+        test_script(
+            "exec 3<<EOF\nfirst\nsecond\nEOF\nread a <&3\nread b <&3\necho \"[$a][$b]\"\n",
+            "[first][second]\n",
+        );
+    }
+
+    #[test]
+    fn fg_and_bg_refuse_to_run_in_a_subshell() {
+        // POSIX only *permits* them to work there. This shell's job table is
+        // a pre-fork copy, so a subshell would resume the job while leaving
+        // the parent convinced it is still stopped.
+        for builtin in ["fg", "bg"] {
+            run_script_with_checker(
+                &format!("set -m\nsleep 1 &\n( {builtin} %1 )\njobs\n"),
+                |output| {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    assert!(
+                        stderr.contains("subshell"),
+                        "expected a subshell refusal, got: {stderr}"
+                    );
+                    assert!(!stderr.contains("no child processes"), "raw errno leaked");
+                    // The parent's view of the job must be untouched.
+                    assert!(String::from_utf8_lossy(&output.stdout).contains("Running"));
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn fg_still_works_in_a_non_interactive_shell() {
+        // Only the subshell case is refused; POSIX allows `fg` in a
+        // non-interactive shell and the job really is this shell's child.
+        run_successfully_and("set -m\nsleep 0.05 &\nfg %1 >/dev/null\necho ok\n", |out| {
+            assert_eq!(out, "ok\n")
+        });
+    }
+
+    #[test]
+    fn pipelines_do_not_leak_descriptors_to_their_commands() {
+        // A pipeline member must see exactly what a plain command sees. That
+        // is not a fixed set: a shell passes the descriptors it inherited on
+        // to its children, and the test harness may hold some open. So the
+        // single-command case is the baseline, and the question is only
+        // whether the pipeline machinery adds anything of its own.
+        if !Path::new("/proc/self/fd").exists() {
+            return;
+        }
+        let open_fds = |script: &str| {
+            let fds = std::cell::RefCell::new(Vec::new());
+            run_successfully_and(script, |out| {
+                let mut listed: Vec<u32> = out
+                    .split_whitespace()
+                    .filter_map(|fd| fd.parse().ok())
+                    .collect();
+                listed.sort_unstable();
+                *fds.borrow_mut() = listed;
+            });
+            fds.into_inner()
+        };
+        let baseline = open_fds("ls /proc/self/fd\n");
+        for script in [
+            "true | ls /proc/self/fd\n",
+            "ls /proc/self/fd | cat\n",
+            "true | true | ls /proc/self/fd\n",
+        ] {
+            let fds = open_fds(script);
+            assert_eq!(
+                fds.len(),
+                baseline.len(),
+                "`{}` leaked descriptors: {fds:?} vs baseline {baseline:?}",
+                script.trim_end()
+            );
+        }
+    }
+
+    #[test]
+    fn exit_status_of_a_bare_command_substitution() {
+        // POSIX 2.9.1: a command consisting only of substitutions takes the
+        // exit status of the last one.
+        test_script("$(exit 3)\necho \"[$?]\"\n", "[3]\n");
+        test_script("$(true)\necho \"[$?]\"\n", "[0]\n");
+        test_script("false\n$(exit 3)\necho \"[$?]\"\n", "[3]\n");
+        // An assignment has its own status, taken from the substitution too.
+        test_script("x=$(exit 5)\necho \"[$?]\"\n", "[5]\n");
+    }
+
+    #[test]
+    fn a_command_file_that_cannot_be_used_exits_126() {
+        // POSIX: 127 only when the command_file could not be found, 126 when
+        // it was found but could not be invoked. Statuses above 128 are
+        // reserved for death by a signal.
+        set_env_vars();
+        let dir = Path::new(concat!(env!("CARGO_TARGET_TMPDIR"), "/sh_test_write_dir"))
+            .join("command_file_status");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        expect_cli_exit_code(vec![dir.display().to_string()], "", 126);
+        expect_cli_exit_code(vec![format!("{}/no/such/file", dir.display())], "", 127);
+    }
+
+    #[test]
+    fn read_honors_line_continuations_in_a_quoted_here_document() {
+        // The escaped-character test has to precede the delimiter test, or a
+        // backslash-<newline> ends the line instead of continuing it. Quoted
+        // here-documents are the only way to get one this far: the shell's
+        // own expansion removes it from an unquoted body.
+        test_script(
+            "while read l; do echo \"[$l]\"; done <<'E'\na\\\nb\nE\n",
+            "[ab]\n",
+        );
+        test_script(
+            "while read -r l; do echo \"[$l]\"; done <<'E'\na\\\nb\nE\n",
+            "[a\\]\n[b]\n",
+        );
+    }
+
+    #[test]
+    fn cd_sets_oldpwd_from_pwd_not_from_getcwd() {
+        // POSIX: OLDPWD is set to the value of PWD, so the symbolic links the
+        // shell walked through survive; getcwd would have resolved them away.
+        set_env_vars();
+        let dir = Path::new(concat!(env!("CARGO_TARGET_TMPDIR"), "/sh_test_write_dir"))
+            .join("cd_oldpwd_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        std::os::unix::fs::symlink("real", dir.join("lnk")).unwrap();
+        run_successfully_and(
+            &format!(
+                "cd '{0}/lnk'\ncd '{0}'\necho \"$OLDPWD\"\ncd - >/dev/null\necho \"$PWD\"\n",
+                dir.display()
+            ),
+            |out| {
+                assert_eq!(
+                    out,
+                    format!("{0}/lnk\n{0}/lnk\n", dir.display()),
+                    "OLDPWD lost the logical path"
+                )
+            },
+        );
+        // `-P` still reports the resolved path.
+        run_successfully_and(
+            &format!("cd -P '{}/lnk'\necho \"$PWD\"\n", dir.display()),
+            |out| assert_eq!(out, format!("{}/real\n", dir.display())),
+        );
+    }
+
+    #[test]
+    fn cd_physical_survives_a_failing_getcwd() {
+        // The chdir has already happened when getcwd runs, so a failure there
+        // must not report an error and leave PWD describing the old location.
+        set_env_vars();
+        let dir = Path::new(concat!(env!("CARGO_TARGET_TMPDIR"), "/sh_test_write_dir"))
+            .join("cd_physical_getcwd");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("gone")).unwrap();
+        run_successfully_and(
+            &format!(
+                "cd '{0}/gone'\nrmdir '{0}/gone'\ncd -P .\necho \"[$PWD]\"\n",
+                dir.display()
+            ),
+            |out| assert_eq!(out, format!("[{}/gone]\n", dir.display())),
+        );
     }
 }

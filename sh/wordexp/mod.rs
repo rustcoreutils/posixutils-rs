@@ -14,7 +14,7 @@ use crate::wordexp::arithmetic::expand_arithmetic_expression_into;
 use crate::wordexp::expanded_word::{ExpandedWord, ExpandedWordPart};
 use crate::wordexp::parameter::expand_parameter_into;
 use crate::wordexp::pathname::glob;
-use crate::wordexp::tilde::tilde_expansion;
+use crate::wordexp::tilde::{tilde_expansion, TildeMode};
 use std::path::Path;
 
 mod arithmetic;
@@ -161,11 +161,11 @@ pub fn split_fields(
 fn simple_word_expansion_into(
     result: &mut ExpandedWord,
     word: &Word,
-    is_assignment: bool,
+    tilde_mode: TildeMode,
     shell: &mut Shell,
 ) -> ExpansionResult<()> {
     let mut word = word.clone();
-    tilde_expansion(&mut word, is_assignment, &shell.environment)
+    tilde_expansion(&mut word, tilde_mode, &shell.environment)
         .map_err(CommandExecutionError::ExpansionError)?;
     for part in word.parts.into_iter() {
         match part {
@@ -203,8 +203,27 @@ pub fn expand_word_to_string(
     is_assignment: bool,
     shell: &mut Shell,
 ) -> ExpansionResult<String> {
+    let tilde_mode = if is_assignment {
+        TildeMode::AssignmentValue
+    } else {
+        TildeMode::Word
+    };
     let mut expanded_word = ExpandedWord::default();
-    simple_word_expansion_into(&mut expanded_word, word, is_assignment, shell)?;
+    simple_word_expansion_into(&mut expanded_word, word, tilde_mode, shell)?;
+    Ok(expanded_word.to_string())
+}
+
+/// Expands a `name=value` operand of a declaration utility (POSIX 2.9.1): the
+/// value gets the tilde expansion of an assignment, and the result is a single
+/// field (no field splitting, no pathname expansion).
+pub fn expand_declaration_operand(word: &Word, shell: &mut Shell) -> ExpansionResult<String> {
+    let mut expanded_word = ExpandedWord::default();
+    simple_word_expansion_into(
+        &mut expanded_word,
+        word,
+        TildeMode::DeclarationOperand,
+        shell,
+    )?;
     Ok(expanded_word.to_string())
 }
 
@@ -214,8 +233,13 @@ pub fn expand_word(
     is_assignment: bool,
     shell: &mut Shell,
 ) -> ExpansionResult<Vec<String>> {
+    let tilde_mode = if is_assignment {
+        TildeMode::AssignmentValue
+    } else {
+        TildeMode::Word
+    };
     let mut expanded_word = ExpandedWord::default();
-    simple_word_expansion_into(&mut expanded_word, word, is_assignment, shell)?;
+    simple_word_expansion_into(&mut expanded_word, word, tilde_mode, shell)?;
     let ifs = shell.environment.get_str_value("IFS");
     let mut result = Vec::new();
     for field in split_fields(expanded_word, ifs, usize::MAX) {
@@ -248,7 +272,7 @@ pub fn expand_word(
 
 pub fn word_to_pattern(word: &Word, shell: &mut Shell) -> ExpansionResult<Pattern> {
     let mut expanded_word = ExpandedWord::default();
-    simple_word_expansion_into(&mut expanded_word, word, false, shell)?;
+    simple_word_expansion_into(&mut expanded_word, word, TildeMode::Word, shell)?;
     Pattern::new(&expanded_word).map_err(CommandExecutionError::ExpansionError)
 }
 

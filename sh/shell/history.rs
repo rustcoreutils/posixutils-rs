@@ -97,14 +97,17 @@ impl History {
         match end_point {
             EndPoint::CommandNumber(n) => {
                 if let Some(first) = self.entries.front() {
-                    if n < first.command_number {
-                        // safe since there is at least one element
+                    let index = if n < first.command_number {
+                        // command numbers wrap around at `max_size`; safe since
+                        // there is at least one element
                         let last_command_number = self.entries.back().unwrap().command_number;
-                        let commands_in_between = (last_command_number - n) as usize;
-                        Ok(self.entries.len() - commands_in_between - 1)
+                        let commands_in_between = last_command_number.saturating_sub(n) as usize;
+                        self.entries.len().saturating_sub(commands_in_between + 1)
                     } else {
-                        Ok((n - first.command_number) as usize)
-                    }
+                        (n - first.command_number) as usize
+                    };
+                    // POSIX: endpoints outside the history are clamped to it.
+                    Ok(index.min(self.entries.len() - 1))
                 } else {
                     Ok(0)
                 }

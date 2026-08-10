@@ -7,8 +7,9 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::parse::lexer::{is_blank, remove_delimiter_from_here_document, HereDocument, Lexer};
-use crate::parse::ParseResult;
+use crate::parse::lexer::word_lexer::remove_quotes;
+use crate::parse::lexer::{is_blank, Lexer};
+use crate::parse::{ParseResult, ParserError};
 use std::borrow::Cow;
 use std::fmt::{Display, Formatter};
 
@@ -118,23 +119,30 @@ impl<'s> SourceString<'s> {
             .peek(self.current_str())
     }
 
+    /// Consumes exactly one character, crossing into later parts as needed.
+    ///
+    /// Crossing a part boundary must not be a step of its own: `lookahead`
+    /// already peeks into the next part, so a caller that peeks and then
+    /// advances once would otherwise see the same character twice.
     fn advance_char(&mut self) {
-        if self.read_state.reached_eof {
-            return;
-        }
-
-        if let Some(char) = self
-            .read_state
-            .current_part_char_iter
-            .next(self.parts[self.read_state.current_part].text.as_ref())
-        {
-            if char == '\n' && self.parts[self.read_state.current_part].in_original_string {
-                self.read_state.line_no += 1;
+        while !self.read_state.reached_eof {
+            if let Some(char) = self
+                .read_state
+                .current_part_char_iter
+                .next(self.parts[self.read_state.current_part].text.as_ref())
+            {
+                if char == '\n' && self.parts[self.read_state.current_part].in_original_string {
+                    self.read_state.line_no += 1;
+                }
+                if self.read_state.current_part == self.parts.len() - 1 && self.peek().is_none() {
+                    self.read_state.reached_eof = true;
+                }
+                return;
             }
-            if self.read_state.current_part == self.parts.len() - 1 && self.peek().is_none() {
+            if self.read_state.current_part + 1 == self.parts.len() {
                 self.read_state.reached_eof = true;
+                return;
             }
-        } else {
             self.read_state.current_part += 1;
             self.read_state.current_part_char_iter = IndexIter::default();
         }
@@ -216,6 +224,26 @@ impl<'s> SourceString<'s> {
                 .next()
                 .unwrap()
         }
+    }
+
+    /// Removes `\`-newline line continuations at the current position and
+    /// reports whether any were removed. Token recognition happens after
+    /// continuation removal (POSIX §2.2.1), so operators, IO_NUMBERs and
+    /// reserved words may all be split across lines.
+    fn skip_line_continuations(&mut self) -> bool {
+        let mut removed = false;
+        while self.lookahead() == '\\' {
+            let before_backslash = self.read_state.clone();
+            self.advance_char();
+            if self.lookahead() == '\n' {
+                self.advance_char();
+                removed = true;
+            } else {
+                self.read_state = before_backslash;
+                break;
+            }
+        }
+        removed
     }
 
     fn currently_processing_tag(&self, tag: &str) -> bool {
@@ -379,7 +407,14 @@ impl<'src> CommandToken<'src> {
     }
 
     fn word(word: Cow<'src, str>) -> Self {
-        match word.as_ref() {
+        // A reserved word may be split by a line continuation (`i\`+newline+`f`),
+        // which is removed before token recognition.
+        let unsplit = if word.contains('\\') {
+            strip_line_continuations(word.as_ref())
+        } else {
+            None
+        };
+        match unsplit.as_deref().unwrap_or(word.as_ref()) {
             "!" => CommandToken::Bang,
             "{" => CommandToken::LBrace,
             "}" => CommandToken::RBrace,
@@ -399,6 +434,22 @@ impl<'src> CommandToken<'src> {
             _ => CommandToken::Word(word),
         }
     }
+}
+
+/// Removes `\`-newline line continuations from a word so that a reserved word
+/// split across lines is still recognized. Returns `None` when the word carries
+/// any other quoting, which would keep it an ordinary word regardless.
+fn strip_line_continuations(word: &str) -> Option<String> {
+    let mut result = String::with_capacity(word.len());
+    let mut chars = word.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if chars.next() == Some('\n') => {}
+            '\\' | '\'' | '"' | '`' | '$' => return None,
+            _ => result.push(c),
+        }
+    }
+    Some(result)
 }
 
 fn advance_and_return<Tok>(lex: &mut CommandLexer, complete_token: Tok) -> Tok {
@@ -461,8 +512,12 @@ impl Lexer for CommandLexer<'_> {
 
 impl<'src> CommandLexer<'src> {
     fn skip_blanks(&mut self) {
-        while is_blank(self.source.lookahead()) {
-            self.source.advance_char();
+        loop {
+            if is_blank(self.source.lookahead()) {
+                self.source.advance_char();
+            } else if !self.source.skip_line_continuations() {
+                break;
+            }
         }
     }
 
@@ -473,38 +528,96 @@ impl<'src> CommandLexer<'src> {
         Ok(result)
     }
 
+    /// Reads a `<<` / `<<-` redirection.
+    ///
+    /// Only the delimiter word lives on the `<<` line; the here-document body
+    /// starts on the *next* line, and whatever else follows the delimiter
+    /// (`| cmd`, `> file`, a second `<<`, …) is still part of the command. The
+    /// body is therefore consumed here and the remainder of the `<<` line is
+    /// pushed back so it is tokenized next — which also makes a second
+    /// here-document on the same line pick up its body after the first one's
+    /// terminator, as POSIX requires.
     fn read_here_document(&mut self, remove_leading_tabs: bool) -> ParseResult<CommandToken<'src>> {
-        let start = self.source.read_state.clone();
-        let is_quoted = self.skip_here_document()?;
-        let here_document = remove_delimiter_from_here_document(
-            self.source.substr(&start, &self.source.read_state),
-        );
+        let start_lineno = self.source.line_no();
 
-        let here_document = if remove_leading_tabs {
-            let mut contents = String::new();
-            for line in here_document.contents.lines() {
-                contents.push_str(line.trim_start_matches('\t'));
-                contents.push('\n');
+        // `<<` is an operator, so blanks may separate it from the delimiter.
+        self.skip_blanks();
+        let delimiter_start = self.source.read_state.clone();
+        self.skip_word_token(None, false)?;
+        let start_delimiter = self
+            .source
+            .substr(&delimiter_start, &self.source.read_state);
+        if start_delimiter.is_empty() {
+            return Err(ParserError::new(
+                start_lineno,
+                "missing here-document delimiter",
+                self.reached_eof(),
+            ));
+        }
+        let (is_quoted, end_delimiter) = remove_quotes(start_delimiter.as_ref());
+
+        // Save the rest of the `<<` line; it is re-inserted below.
+        let rest_of_line_start = self.source.read_state.clone();
+        while !self.reached_eof() {
+            let c = self.source.lookahead();
+            self.source.advance_char();
+            if c == '\n' {
+                break;
             }
-            HereDocument {
-                contents: contents.into(),
-                start_delimiter: here_document.start_delimiter,
-                end_delimiter: here_document.end_delimiter,
+        }
+        let rest_of_line = self
+            .source
+            .substr(&rest_of_line_start, &self.source.read_state);
+
+        let body_start = self.source.read_state.clone();
+        let body_end;
+        loop {
+            if self.reached_eof() {
+                return Err(ParserError::new(
+                    start_lineno,
+                    "unterminated here-document",
+                    true,
+                ));
             }
+            let line_start = self.source.read_state.clone();
+            let line = self.next_line();
+            let line = line.trim_end_matches('\n');
+            // `<<-` also strips leading tabs from the terminator line.
+            let line = if remove_leading_tabs {
+                line.trim_start_matches('\t')
+            } else {
+                line
+            };
+            if line == end_delimiter {
+                body_end = line_start;
+                break;
+            }
+        }
+        let contents = self.source.substr(&body_start, &body_end);
+        self.source
+            .insert_string_after_last_char(rest_of_line, "here-document");
+
+        let contents = if remove_leading_tabs {
+            let mut stripped = String::new();
+            for line in contents.lines() {
+                stripped.push_str(line.trim_start_matches('\t'));
+                stripped.push('\n');
+            }
+            Cow::Owned(stripped)
         } else {
-            here_document
+            contents
         };
+
         if is_quoted {
             Ok(CommandToken::QuotedHereDocument {
-                start_delimiter: here_document.start_delimiter,
-                end_delimiter: here_document.end_delimiter,
-                contents: here_document.contents,
+                start_delimiter,
+                end_delimiter: end_delimiter.into(),
+                contents,
             })
         } else {
-            assert_eq!(here_document.start_delimiter, here_document.end_delimiter);
             Ok(CommandToken::HereDocument {
-                delimiter: here_document.start_delimiter,
-                contents: here_document.contents,
+                delimiter: end_delimiter.into(),
+                contents,
             })
         }
     }
@@ -524,6 +637,8 @@ impl<'src> CommandLexer<'src> {
             // multi-character operators all start with a single character
             // operator
             self.source.advance_char();
+            // a continuation may split the two characters of an operator
+            self.source.skip_line_continuations();
 
             let complete_token = match partial_token {
                 CommandToken::And => match self.source.lookahead() {
@@ -544,6 +659,7 @@ impl<'src> CommandLexer<'src> {
                     '>' => advance_and_return(self, CommandToken::LessGreat),
                     '<' => {
                         self.source.advance_char();
+                        self.source.skip_line_continuations();
                         if self.source.lookahead() == '-' {
                             self.source.advance_char();
                             self.read_here_document(true)?
@@ -570,10 +686,12 @@ impl<'src> CommandLexer<'src> {
 
                 let mut number = d.to_digit(10).unwrap();
                 self.source.advance_char();
+                self.source.skip_line_continuations();
                 while let Some(d) = self.source.lookahead().to_digit(10) {
                     number = number.saturating_mul(10);
                     number = number.saturating_add(d);
                     self.source.advance_char();
+                    self.source.skip_line_continuations();
                 }
                 if self.source.lookahead() == '>' || self.source.lookahead() == '<' {
                     CommandToken::IoNumber(number)
@@ -631,7 +749,13 @@ mod tests {
     fn lex_token(token: &str) -> CommandToken<'_> {
         let mut lex = CommandLexer::new(token);
         let token = lex.next_token().unwrap().0;
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Eof);
+        // A here-document pushes the remainder of its line back, so a trailing
+        // newline may still be pending.
+        let mut next = lex.next_token().unwrap().0;
+        if next == CommandToken::Newline {
+            next = lex.next_token().unwrap().0;
+        }
+        assert_eq!(next, CommandToken::Eof);
         token
     }
 

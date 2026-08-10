@@ -249,6 +249,16 @@ pub unsafe fn setup_signal_handling() {
             get_current_errno_value()
         );
     }
+    // This pipe belongs to the shell alone; the utilities it execs must not
+    // inherit either end.
+    for fd in [read_pipe.as_raw_fd(), write_pipe.as_raw_fd()] {
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            panic!(
+                "failed to set close-on-exec on the signal buffer ({})",
+                get_current_errno_value()
+            );
+        }
+    }
     SIGNAL_WRITE = Some(write_pipe.into_raw_fd());
     SIGNAL_READ = Some(read_pipe.into_raw_fd());
 }
@@ -343,6 +353,18 @@ impl SignalManager {
         }
     }
 
+    /// Re-installs `saved`'s dispositions, after a `reset()` that turned out
+    /// not to be followed by replacing the process (a failed `exec`).
+    pub fn restore(&mut self, saved: Self) {
+        for signal in SIGNALS {
+            let signal = *signal;
+            if signal == Signal::SigKill || signal == Signal::SigStop {
+                continue;
+            }
+            self.set_action(signal, saved.actions[signal as usize].clone());
+        }
+    }
+
     pub fn set_action(&mut self, signal: Signal, action: TrapAction) {
         assert!(signal != Signal::SigKill && signal != Signal::SigStop);
 
@@ -395,10 +417,29 @@ impl SignalManager {
     }
 }
 
-pub fn signal_to_exit_status(signal: Signal) -> libc::c_int {
-    // Must be 128 + the real signal number (e.g. SIGINT -> 130), not the enum
-    // discriminant. `From<Signal> for i32` maps to the libc signal numbers.
-    128 + i32::from(signal)
+/// A signal number reported by `wait`. A child may be killed by a signal the
+/// shell has no name for (SIGPWR, SIGSTKFLT, the realtime signals, …), so the
+/// raw number is kept rather than forced into [`Signal`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TermSignal(pub libc::c_int);
+
+impl TermSignal {
+    pub fn exit_status(self) -> libc::c_int {
+        128 + self.0
+    }
+
+    pub fn is(self, signal: Signal) -> bool {
+        self.0 == i32::from(signal)
+    }
+}
+
+impl Display for TermSignal {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match Signal::try_from(self.0) {
+            Ok(signal) => write!(f, "{signal}"),
+            Err(_) => write!(f, "{}", self.0),
+        }
+    }
 }
 
 pub fn kill(pid: Pid, signal: Option<Signal>) -> OsResult<()> {
@@ -407,4 +448,24 @@ pub fn kill(pid: Pid, signal: Option<Signal>) -> OsResult<()> {
         return Err(OsError::from_current_errno("kill"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn term_signal_exit_status_is_128_plus_the_signal_number() {
+        assert_eq!(TermSignal(libc::SIGTERM).exit_status(), 128 + libc::SIGTERM);
+        assert_eq!(TermSignal(libc::SIGINT).exit_status(), 130);
+    }
+
+    #[test]
+    fn term_signal_names_unknown_signals_by_number() {
+        // A child may be killed by a signal this shell has no name for (the
+        // realtime signals, SIGPWR, …); that must not abort the shell.
+        assert_eq!(TermSignal(libc::SIGTERM).to_string(), "TERM");
+        assert_eq!(TermSignal(64).to_string(), "64");
+        assert_eq!(TermSignal(64).exit_status(), 192);
+    }
 }

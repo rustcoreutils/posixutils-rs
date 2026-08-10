@@ -12,6 +12,7 @@ use crate::os::find_command;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::{execute_file_as_script, ScriptExecutionError, Shell};
 use gettextrs::gettext;
+use std::fs::File;
 use std::path::Path;
 
 pub struct Dot;
@@ -30,10 +31,22 @@ impl SpecialBuiltinUtility for Dot {
         }
 
         let path = shell.environment.get_str_value("PATH").unwrap_or_default();
-        let file_path = if let Some(file_path) = find_command(&args[0], path) {
-            file_path
-        } else {
-            return Err(format!("dot: {}, no such file or directory\n", args[0]).into());
+        // `find_command` is shared with command lookup, where executability
+        // rather than readability is the gate, so check readability here: the
+        // dot utility reads the file, it does not execute it.
+        let file_path = match find_command(&args[0], path) {
+            Some(file_path) if File::open(&file_path).is_ok() => file_path,
+            Some(file_path) => {
+                return Err(format!(
+                    "dot: {}: {}\n",
+                    file_path.to_string_lossy(),
+                    gettext("cannot open file")
+                )
+                .into())
+            }
+            None => {
+                return Err(format!("dot: {}, no such file or directory\n", args[0]).into());
+            }
         };
 
         std::mem::swap(&mut shell.opened_files, opened_files);

@@ -284,24 +284,23 @@ impl<'src> WordParser<'src> {
                 }
                 WordToken::Backslash => {
                     if inside_double_quotes {
-                        self.advance();
-                        match self.lookahead {
-                            WordToken::Dollar | WordToken::Char('$') => {
-                                current_literal.push('$');
-                                self.advance();
-                            }
-                            WordToken::DoubleQuote => {
-                                current_literal.push('"');
-                                self.advance();
-                            }
-                            WordToken::Backslash => {
+                        // Inside double quotes a backslash only escapes `$`,
+                        // '`', `"`, `\` and <newline>. The escaped character is
+                        // taken raw rather than re-lexed, so `\\` followed by a
+                        // newline stays a literal backslash and a literal
+                        // newline instead of becoming a line continuation, and
+                        // `\$(cmd)` stays literal text.
+                        match self.lexer.next_char() {
+                            Some(c @ ('$' | '`' | '"' | '\\')) => current_literal.push(c),
+                            // backslash-newline is still a line continuation
+                            Some('\n') => {}
+                            Some(other) => {
                                 current_literal.push('\\');
-                                self.advance();
+                                current_literal.push(other);
                             }
-                            _ => {
-                                current_literal.push('\\');
-                            }
+                            None => current_literal.push('\\'),
                         }
+                        self.advance();
                     } else {
                         push_literal(&mut current_literal, &mut word_parts, false);
                         current_literal.push(self.lexer.next_char().unwrap());

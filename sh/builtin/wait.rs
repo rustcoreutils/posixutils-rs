@@ -13,14 +13,16 @@ use crate::os::Pid;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
 
-fn wait_for_pid(pid: Pid, shell: &mut Shell) -> i32 {
-    match shell.wait_child_process(pid) {
-        Ok(exit_status) => exit_status,
+/// Waits for `pid`, returning its status and whether it actually terminated
+/// (the wait also ends when the child merely stops).
+fn wait_for_pid(pid: Pid, shell: &mut Shell) -> (i32, bool) {
+    match shell.wait_child_process_result(pid) {
+        Ok(result) => result,
         // No such child (already reaped or never existed).
-        Err(err) if err.errno == Errno::ECHILD => 127,
+        Err(err) if err.errno == Errno::ECHILD => (127, true),
         // Any other error (e.g. EINTR from a trapped signal) must not abort the
         // shell; report a non-zero status rather than panicking.
-        Err(_) => 127,
+        Err(_) => (127, false),
     }
 }
 
@@ -38,7 +40,13 @@ impl BuiltinUtility for Wait {
         } else {
             for pid in pids {
                 let pid = parse_pid(pid, shell).map_err(|err| format!("wait: {err}"))?;
-                status = wait_for_pid(pid, shell);
+                let terminated;
+                (status, terminated) = wait_for_pid(pid, shell);
+                if terminated {
+                    // reaped, so it is no longer a known job; a merely stopped
+                    // child is still alive and must stay in the table
+                    shell.background_jobs.remove_job_by_pid(pid);
+                }
             }
         }
 

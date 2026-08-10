@@ -8,14 +8,14 @@
 //
 
 use crate::os::errno::{get_current_errno_value, Errno};
-use crate::os::signals::Signal;
+use crate::os::signals::TermSignal;
 use crate::shell::environment::Environment;
 use crate::shell::opened_files::{OpenedFile, OpenedFiles};
 use std::convert::Infallible;
 use std::ffi::{CString, OsStr, OsString};
 use std::fmt::{Display, Formatter};
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 
@@ -73,6 +73,20 @@ pub fn write(fd: RawFd, bytes: &[u8]) -> OsResult<usize> {
     Ok(bytes_written as usize)
 }
 
+pub fn write_all(fd: RawFd, mut bytes: &[u8]) -> OsResult<()> {
+    while !bytes.is_empty() {
+        let written = write(fd, bytes)?;
+        if written == 0 {
+            return Err(OsError {
+                command: "write",
+                errno: Errno::EIO,
+            });
+        }
+        bytes = &bytes[written..];
+    }
+    Ok(())
+}
+
 pub fn read(fd: RawFd, buf: &mut [u8]) -> OsResult<usize> {
     let bytes_read = unsafe { libc::read(fd, buf.as_ptr() as *mut libc::c_void, buf.len()) };
     if bytes_read < 0 {
@@ -106,10 +120,19 @@ pub fn pipe() -> OsResult<(OwnedFd, OwnedFd)> {
     if pipe_result < 0 {
         return Err(OsError::from_current_errno("pipe"));
     }
-    assert_eq!(pipe_result, 0, "invalid result for libc::pipe");
     let fd0 = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
     let fd1 = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
     Ok((fd0, fd1))
+}
+
+/// `dup` that marks the copy close-on-exec, so it is not inherited by the
+/// utilities the shell execs.
+pub fn dup_cloexec(fd: RawFd) -> OsResult<OwnedFd> {
+    let dup_result = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if dup_result < 0 {
+        return Err(OsError::from_current_errno("fcntl"));
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(dup_result) })
 }
 
 pub fn dup2(old_fd: RawFd, new_fd: RawFd) -> OsResult<RawFd> {
@@ -122,8 +145,8 @@ pub fn dup2(old_fd: RawFd, new_fd: RawFd) -> OsResult<RawFd> {
 
 pub enum WaitStatus {
     Exited { exit_status: libc::c_int },
-    Signaled { signal: Signal },
-    Stopped { signal: Signal },
+    Signaled { signal: TermSignal },
+    Stopped { signal: TermSignal },
     StillAlive,
 }
 
@@ -145,17 +168,17 @@ pub fn waitpid(pid: Pid, no_hang: bool, untraced: bool) -> OsResult<WaitStatus> 
         let exit_status = libc::WEXITSTATUS(status);
         Ok(WaitStatus::Exited { exit_status })
     } else if libc::WIFSIGNALED(status) {
-        let raw_signal = libc::WTERMSIG(status);
         Ok(WaitStatus::Signaled {
-            signal: Signal::try_from(raw_signal).expect("invalid signal"),
+            signal: TermSignal(libc::WTERMSIG(status)),
         })
     } else if libc::WIFSTOPPED(status) {
-        let raw_stop_signal = libc::WSTOPSIG(status);
         Ok(WaitStatus::Stopped {
-            signal: Signal::try_from(raw_stop_signal).expect("invalid signal"),
+            signal: TermSignal(libc::WSTOPSIG(status)),
         })
     } else {
-        unreachable!()
+        // WIFCONTINUED, or a status this shell does not ask for; the child is
+        // still around, so report it as such rather than aborting.
+        Ok(WaitStatus::StillAlive)
     }
 }
 
@@ -165,6 +188,39 @@ pub fn close(fd: RawFd) -> OsResult<()> {
         return Err(OsError::from_current_errno("close"));
     }
     Ok(())
+}
+
+/// Materializes a here-document body as a readable descriptor.
+///
+/// A pipe cannot be used: nothing reads it until the command is exec'd, so a
+/// body larger than the pipe buffer would block the writer forever. An
+/// immediately-unlinked temporary file has no such limit and, unlike a pipe,
+/// is seekable, which is what a redirection from a here-document behaves like.
+pub fn here_document_fd(contents: &[u8]) -> OsResult<OwnedFd> {
+    let dir = std::env::var_os("TMPDIR").unwrap_or_else(|| OsString::from("/tmp"));
+    let mut template = dir.into_vec();
+    if template.last() != Some(&b'/') {
+        template.push(b'/');
+    }
+    template.extend_from_slice(b"sh-heredoc-XXXXXX\0");
+
+    // mkstemp replaces the trailing Xs in place and creates the file with mode
+    // 0600, so the body is never visible to other users.
+    let fd = unsafe { libc::mkstemp(template.as_mut_ptr() as *mut libc::c_char) };
+    if fd < 0 {
+        return Err(OsError::from_current_errno("mkstemp"));
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    // Unlink right away: the descriptor keeps the contents alive, and nothing
+    // is left behind even if the shell dies before the command finishes.
+    if unsafe { libc::unlink(template.as_ptr() as *const libc::c_char) } < 0 {
+        return Err(OsError::from_current_errno("unlink"));
+    }
+    write_all(fd.as_raw_fd(), contents)?;
+    if unsafe { libc::lseek(fd.as_raw_fd(), 0, libc::SEEK_SET) } < 0 {
+        return Err(OsError::from_current_errno("lseek"));
+    }
+    Ok(fd)
 }
 
 pub enum ExecError {
@@ -194,9 +250,14 @@ pub fn exec(
             | OpenedFile::WriteFile(file)
             | OpenedFile::ReadWriteFile(file) => file.as_raw_fd(),
             OpenedFile::HereDocument(contents) => {
-                let (read_pipe, write_pipe) = pipe()?;
-                write(write_pipe.as_raw_fd(), contents.as_bytes())?;
-                dup2(read_pipe.as_raw_fd(), dest)?;
+                let here_document = here_document_fd(contents.borrow().as_bytes())?.into_raw_fd();
+                // mkstemp may well hand back the descriptor the redirection
+                // targets (e.g. `exec 3<<EOF` with fd 3 free), and closing it
+                // after a no-op dup2 would leave the target closed.
+                if here_document != dest {
+                    dup2(here_document, dest)?;
+                    close(here_document)?;
+                }
                 continue;
             }
         };
@@ -215,14 +276,14 @@ pub fn exec(
         .collect::<Vec<CString>>();
     let mut env_ptr_vec = env.iter().map(|s| s.as_ptr()).collect::<Vec<_>>();
     env_ptr_vec.push(std::ptr::null());
-    let exit_status = unsafe {
+    // execve only returns on failure
+    unsafe {
         libc::execve(
             command.as_ptr(),
             args_ptr_vec.as_ptr(),
             env_ptr_vec.as_ptr(),
         )
     };
-    assert_eq!(exit_status, -1, "invalid return status from execve");
     Err(ExecError::CannotExecute(get_current_errno_value()))
 }
 

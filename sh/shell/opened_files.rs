@@ -11,6 +11,7 @@ use crate::os::write;
 use crate::parse::command::{IORedirectionKind, Redirection, RedirectionKind};
 use crate::shell::{CommandExecutionError, Shell};
 use crate::wordexp::expand_word_to_string;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
@@ -32,7 +33,10 @@ pub enum OpenedFile {
     ReadFile(Rc<File>),
     WriteFile(Rc<File>),
     ReadWriteFile(Rc<File>),
-    HereDocument(String),
+    /// A here-document. The remaining text is shared between clones of
+    /// `OpenedFiles`, the way a real descriptor shares its file offset, so
+    /// that `read` in a loop consumes successive lines.
+    HereDocument(Rc<RefCell<String>>),
 }
 
 fn io_err_to_redirection_err(err: std::io::Error) -> CommandExecutionError {
@@ -192,13 +196,13 @@ impl OpenedFiles {
                     let contents = expand_word_to_string(&contents.word, false, shell)?;
                     self.opened_files.insert(
                         redir.file_descriptor.unwrap_or(STDIN_FILENO),
-                        OpenedFile::HereDocument(contents),
+                        OpenedFile::HereDocument(Rc::new(RefCell::new(contents))),
                     );
                 }
                 RedirectionKind::QuotedHereDocument { contents, .. } => {
                     self.opened_files.insert(
                         redir.file_descriptor.unwrap_or(STDIN_FILENO),
-                        OpenedFile::HereDocument(contents.clone()),
+                        OpenedFile::HereDocument(Rc::new(RefCell::new(contents.clone()))),
                     );
                 }
             }
@@ -215,7 +219,16 @@ impl OpenedFiles {
                     .map_err(|_| std::io::Error::last_os_error())
                     .map(|_| ())
             }
-            _ => unreachable!(),
+            // The descriptor was closed, or redirected to something that
+            // cannot be written to (a read-only file, a here-document).
+            Some(OpenedFile::ReadFile(_)) | Some(OpenedFile::HereDocument(_)) | None => {
+                Err(std::io::Error::from_raw_os_error(libc::EBADF))
+            }
+            // `exec 1<&0`: writing goes to the shell's stdin descriptor, which
+            // succeeds when it is open for writing too (a terminal).
+            Some(OpenedFile::Stdin) => write(libc::STDIN_FILENO, contents.as_bytes())
+                .map_err(|_| std::io::Error::last_os_error())
+                .map(|_| ()),
         };
         match result {
             Ok(_) => {}
@@ -231,6 +244,21 @@ impl OpenedFiles {
 
     pub fn write_err<S: AsRef<str>>(&self, string: S) {
         self.write_file(STDERR_FILENO, string.as_ref());
+    }
+
+    /// Points standard input at `/dev/null`, unless it has already been
+    /// redirected explicitly (POSIX 2.11, asynchronous lists).
+    pub fn redirect_stdin_to_dev_null(&mut self) {
+        if !matches!(
+            self.opened_files.get(&STDIN_FILENO),
+            Some(OpenedFile::Stdin)
+        ) {
+            return;
+        }
+        if let Ok(file) = File::options().read(true).open("/dev/null") {
+            self.opened_files
+                .insert(STDIN_FILENO, OpenedFile::ReadFile(Rc::new(file)));
+        }
     }
 
     pub fn get_file(&self, fileno: u32) -> Option<&OpenedFile> {

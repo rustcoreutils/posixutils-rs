@@ -7,6 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+use crate::parse::command_parser::is_valid_name;
 use crate::parse::word::{Word, WordPart};
 use crate::shell::environment::Environment;
 use std::ffi::{c_char, CStr, CString};
@@ -60,94 +61,109 @@ fn expand_home(
     }
 }
 
-/// performs tilde expansion on `unquoted_start`. Assumes that `unquoted_start` starts with
-/// `~`
-fn tilde_expansion_simple(
-    unquoted_start: &str,
-    is_assignment: bool,
+/// Expands `~` at the start of `value` and after each unquoted `:` in it, as
+/// required for the value of an assignment.
+fn expand_assignment_value(
+    value: &str,
     env: &Environment,
     user_home: &dyn UsersHomeDirs,
 ) -> Result<String, String> {
-    if is_assignment {
-        let mut result = String::with_capacity(unquoted_start.len());
-        for sub in unquoted_start.split(':') {
-            if sub.starts_with('~') {
-                let prefix_end = sub.find('/').unwrap_or(sub.len());
-                let login_name = &sub[1..prefix_end];
-                result += &expand_home(login_name, env, user_home)?;
-                result += &sub[prefix_end..];
-            } else {
-                result += sub
-            }
+    let mut result = String::with_capacity(value.len());
+    for (i, sub) in value.split(':').enumerate() {
+        if i > 0 {
             result.push(':');
         }
-        // removes last ':'
-        result.pop();
-        Ok(result)
-    } else {
-        let prefix_end = unquoted_start.find('/').unwrap_or(unquoted_start.len());
-        let login_name = &unquoted_start[1..prefix_end];
-        let mut result = expand_home(login_name, env, user_home)?;
-        result += &unquoted_start[prefix_end..];
-        Ok(result)
+        if let Some(rest) = sub.strip_prefix('~') {
+            let prefix_end = rest.find('/').unwrap_or(rest.len());
+            result += &expand_home(&rest[..prefix_end], env, user_home)?;
+            result += &rest[prefix_end..];
+        } else {
+            result += sub;
+        }
     }
+    Ok(result)
+}
+
+/// Expands a leading `~`, as required for an ordinary word. Assumes `word`
+/// starts with `~`.
+fn expand_word_tilde(
+    word: &str,
+    env: &Environment,
+    user_home: &dyn UsersHomeDirs,
+) -> Result<String, String> {
+    let prefix_end = word.find('/').unwrap_or(word.len());
+    let mut result = expand_home(&word[1..prefix_end], env, user_home)?;
+    result += &word[prefix_end..];
+    Ok(result)
+}
+
+/// Where a word appears, which decides how much tilde expansion it gets.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TildeMode {
+    /// An ordinary word: only a leading `~` expands.
+    Word,
+    /// The value of an assignment: a leading `~` and a `~` after each unquoted
+    /// `:` expand.
+    AssignmentValue,
+    /// A `name=value` operand of a declaration utility (POSIX 2.9.1): like
+    /// `AssignmentValue`, applied to the text after the first `=`.
+    DeclarationOperand,
 }
 
 fn expand_tilde_with_custom_users_home_dirs(
     word: &mut Word,
-    is_assignment: bool,
+    mode: TildeMode,
     env: &Environment,
     user_home: &dyn UsersHomeDirs,
 ) -> Result<(), String> {
     let unquoted_start = if let Some(WordPart::UnquotedLiteral(start)) = word.parts.first() {
-        start.as_str()
+        start.clone()
     } else {
         return Ok(());
     };
 
-    if is_assignment {
-        if unquoted_start.starts_with('~') {
-            word.parts[0] = WordPart::QuotedLiteral(tilde_expansion_simple(
-                unquoted_start,
-                true,
-                env,
-                user_home,
-            )?);
-        }
-        for i in 1..word.parts.len() {
-            if let WordPart::UnquotedLiteral(lit) = &word.parts[i] {
-                if let Some(prefix_start) = lit.find(":~") {
-                    word.parts[i] = WordPart::QuotedLiteral(tilde_expansion_simple(
-                        &lit[prefix_start + 1..],
-                        true,
-                        env,
-                        user_home,
-                    )?)
-                }
-            }
-        }
-    } else {
+    if mode == TildeMode::Word {
         if !unquoted_start.starts_with('~') {
             return Ok(());
         }
         // > The pathname resulting from tilde expansion shall be treated as if
         // > quoted to prevent it being altered by field splitting and pathname expansion.
-        word.parts[0] = WordPart::QuotedLiteral(tilde_expansion_simple(
-            unquoted_start,
-            false,
-            env,
-            user_home,
-        )?);
+        word.parts[0] =
+            WordPart::QuotedLiteral(expand_word_tilde(&unquoted_start, env, user_home)?);
+        return Ok(());
+    }
+
+    // The part of the first literal that is an assignment value, and whatever
+    // precedes it (the `name=` of a declaration utility operand).
+    let (prefix, value) = if mode == TildeMode::DeclarationOperand {
+        match unquoted_start.split_once('=') {
+            Some((name, value)) if is_valid_name(name) => {
+                (&unquoted_start[..name.len() + 1], value)
+            }
+            // not `name=value` after all, so nothing here is an assignment
+            _ => return Ok(()),
+        }
+    } else {
+        ("", unquoted_start.as_str())
+    };
+    let expanded = expand_assignment_value(value, env, user_home)?;
+    if expanded != value {
+        word.parts[0] = WordPart::QuotedLiteral(format!("{prefix}{expanded}"));
+    }
+    for i in 1..word.parts.len() {
+        if let WordPart::UnquotedLiteral(lit) = &word.parts[i] {
+            if let Some(prefix_start) = lit.find(":~") {
+                let expanded = expand_assignment_value(&lit[prefix_start + 1..], env, user_home)?;
+                word.parts[i] =
+                    WordPart::QuotedLiteral(format!("{}{}", &lit[..=prefix_start], expanded));
+            }
+        }
     }
     Ok(())
 }
 
-pub fn tilde_expansion(
-    word: &mut Word,
-    is_assignment: bool,
-    env: &Environment,
-) -> Result<(), String> {
-    expand_tilde_with_custom_users_home_dirs(word, is_assignment, env, &DefaultUsersHomeDirs)
+pub fn tilde_expansion(word: &mut Word, mode: TildeMode, env: &Environment) -> Result<(), String> {
+    expand_tilde_with_custom_users_home_dirs(word, mode, env, &DefaultUsersHomeDirs)
 }
 
 #[cfg(test)]
@@ -171,13 +187,13 @@ mod tests {
 
     fn expand_tilde(
         word_str: &str,
-        is_assignment: bool,
+        mode: TildeMode,
         env_home: &str,
         users_home_dirs: TestUsersHomeDirs,
     ) -> Word {
         let env = Environment::from([("HOME".to_string(), Value::new(env_home.to_string()))]);
         let mut word = unquoted_literal(word_str);
-        expand_tilde_with_custom_users_home_dirs(&mut word, is_assignment, &env, &users_home_dirs)
+        expand_tilde_with_custom_users_home_dirs(&mut word, mode, &env, &users_home_dirs)
             .expect("expansion failure");
         word
     }
@@ -185,7 +201,12 @@ mod tests {
     #[test]
     fn expand_tilde_from_env() {
         assert_eq!(
-            expand_tilde("~", false, "test_home", TestUsersHomeDirs::default()),
+            expand_tilde(
+                "~",
+                TildeMode::Word,
+                "test_home",
+                TestUsersHomeDirs::default()
+            ),
             quoted_literal("test_home")
         );
     }
@@ -196,7 +217,7 @@ mod tests {
             users_home_dirs: [("test_user".to_string(), "test_home".to_string())].into(),
         };
         assert_eq!(
-            expand_tilde("~test_user", false, "test_home", users_home_dirs),
+            expand_tilde("~test_user", TildeMode::Word, "test_home", users_home_dirs),
             quoted_literal("test_home")
         );
     }
@@ -206,7 +227,7 @@ mod tests {
         assert_eq!(
             expand_tilde(
                 "~/test1:~:~/test3",
-                true,
+                TildeMode::AssignmentValue,
                 "/home/test_user",
                 TestUsersHomeDirs::default()
             ),
@@ -215,7 +236,7 @@ mod tests {
         assert_eq!(
             expand_tilde(
                 "~/test1:~:~/test3",
-                true,
+                TildeMode::AssignmentValue,
                 "/home/test_user",
                 TestUsersHomeDirs {
                     users_home_dirs: [

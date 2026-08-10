@@ -305,7 +305,8 @@ impl Debug for Errno {
             libc::ETXTBSY => write!(f, "ETXTBSY: text file busy"),
             libc::EWOULDBLOCK => write!(f, "EWOULDBLOCK: operation would block"),
             libc::EXDEV => write!(f, "EXDEV: improper hard link"),
-            other => unreachable!("invalid errno value {}", other),
+            // Not every errno the kernel can return is named here.
+            other => write!(f, "errno {other}"),
         }
     }
 }

@@ -68,9 +68,6 @@ impl<'s> FcArgs<'s> {
         {
             match option {
                 'r' => {
-                    if action == Action::Reexecute {
-                        return Err("fc: cannot use -r and -s".to_string());
-                    }
                     reverse = true;
                 }
                 'e' => {
@@ -87,9 +84,6 @@ impl<'s> FcArgs<'s> {
                     action = Action::List;
                 }
                 'n' => {
-                    if action != Action::List {
-                        return Err("fc: -n can only be specified after -l".to_string());
-                    }
                     suppress_command_number = true;
                 }
                 's' => {
@@ -100,6 +94,15 @@ impl<'s> FcArgs<'s> {
                 }
                 other => return Err(format!("fc: invalid option -{other}")),
             }
+        }
+
+        // `-n` and `-r` qualify the other options, so their position among
+        // them does not matter; validate once the whole option list is known.
+        if suppress_command_number && action != Action::List {
+            return Err("fc: -n can only be used with -l".to_string());
+        }
+        if reverse && action == Action::Reexecute {
+            return Err("fc: cannot use -r and -s".to_string());
         }
 
         let first_operand = option_parser.next_argument();

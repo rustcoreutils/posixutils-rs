@@ -9,6 +9,7 @@
 
 use crate::parse::word::{Parameter, ParameterExpansion, SpecialParameter};
 use crate::shell::{CommandExecutionError, Shell};
+use crate::wordexp::tilde::TildeMode;
 use crate::wordexp::{
     expand_word_to_string, simple_word_expansion_into, word_to_pattern, ExpandedWord,
     ExpansionResult,
@@ -149,9 +150,8 @@ fn expand_simple_parameter_into(
                 }
                 SpecialParameter::Bang => expanded_word.append(
                     shell
-                        .background_jobs
-                        .current()
-                        .map(|job| job.pid.to_string())
+                        .last_background_pid
+                        .map(|pid| pid.to_string())
                         .unwrap_or_default(),
                     inside_double_quotes,
                     true,
@@ -209,7 +209,7 @@ pub fn expand_parameter_into(
                 shell,
             );
             if parameter_type.is_unset() || (*default_on_null && parameter_type.is_null()) {
-                simple_word_expansion_into(expanded_word, default, false, shell)?;
+                simple_word_expansion_into(expanded_word, default, TildeMode::Word, shell)?;
             }
             expanded_word.extend(expanded_parameter);
         }
@@ -282,7 +282,7 @@ pub fn expand_parameter_into(
             if !parameter_type.is_unset()
                 && (!parameter_type.is_null() || *substitute_null_with_word)
             {
-                simple_word_expansion_into(expanded_word, word, false, shell)?
+                simple_word_expansion_into(expanded_word, word, TildeMode::Word, shell)?
             }
         }
         ParameterExpansion::StrLen(parameter) => {
@@ -442,9 +442,20 @@ mod tests {
             ),
             "".to_string()
         );
+        // `$!` is latched when an asynchronous command is started and, unlike
+        // the job table, survives the job being waited for.
+        shell.last_background_pid = Some(123);
         shell
             .background_jobs
             .add_job(123, "cmd".to_string(), JobState::Running);
+        assert_eq!(
+            expand_parameter_to_string(
+                ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Bang)),
+                &mut shell
+            ),
+            "123".to_string()
+        );
+        shell.background_jobs.remove_job_by_pid(123);
         assert_eq!(
             expand_parameter_to_string(
                 ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Bang)),

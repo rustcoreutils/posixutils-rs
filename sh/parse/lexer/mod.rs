@@ -57,9 +57,16 @@ trait Lexer {
         Ok(())
     }
 
-    fn skip_here_document(&mut self) -> ParseResult<bool> {
+    /// Consumes a here-document (delimiter word, body and terminator) without
+    /// recording it. Used when only the extent of the surrounding construct
+    /// matters, e.g. while scanning a command substitution.
+    fn skip_here_document(&mut self, remove_leading_tabs: bool) -> ParseResult<()> {
         let start_lineno = self.line_no();
-        let (quoted_terminator, end) = remove_quotes(self.next_word()?.as_ref());
+        // `<<` is an operator, so blanks may separate it from the delimiter.
+        while is_blank(self.lookahead()) {
+            self.advance();
+        }
+        let (_, end) = remove_quotes(self.next_word()?.as_ref());
         loop {
             if self.reached_eof() {
                 return Err(ParserError::new(
@@ -69,11 +76,17 @@ trait Lexer {
                 ));
             }
             let line = self.next_line();
-            if line.trim_end_matches('\n') == end {
+            let line = line.trim_end_matches('\n');
+            let line = if remove_leading_tabs {
+                line.trim_start_matches('\t')
+            } else {
+                line
+            };
+            if line == end {
                 break;
             }
         }
-        Ok(quoted_terminator)
+        Ok(())
     }
 
     fn skip_single_quoted_string(&mut self) -> ParseResult<()> {
@@ -156,12 +169,11 @@ trait Lexer {
                     self.advance();
                     if self.lookahead() == '<' {
                         self.advance();
-                        if self.lookahead() == '-' {
+                        let remove_leading_tabs = self.lookahead() == '-';
+                        if remove_leading_tabs {
                             self.advance();
-                            self.skip_here_document()?;
-                        } else {
-                            self.skip_here_document()?;
                         }
+                        self.skip_here_document(remove_leading_tabs)?;
                     }
                     // don't advance char
                     continue;
@@ -333,30 +345,5 @@ trait Lexer {
             ));
         }
         Ok(())
-    }
-}
-
-struct HereDocument<'src> {
-    start_delimiter: Cow<'src, str>,
-    end_delimiter: Cow<'src, str>,
-    contents: Cow<'src, str>,
-}
-
-fn remove_delimiter_from_here_document(here_document: Cow<str>) -> HereDocument {
-    let start_delimiter_end = here_document.find('\n').unwrap();
-    let end_delimiter_start = here_document.trim_end_matches('\n').rfind('\n').unwrap();
-    match here_document {
-        Cow::Borrowed(str) => HereDocument {
-            start_delimiter: str[0..start_delimiter_end].into(),
-            end_delimiter: str[end_delimiter_start + 1..].trim_end_matches('\n').into(),
-            contents: str[start_delimiter_end + 1..=end_delimiter_start].into(),
-        },
-        Cow::Owned(str) => HereDocument {
-            start_delimiter: str[0..start_delimiter_end].to_owned().into(),
-            end_delimiter: str[end_delimiter_start + 1..].to_owned().into(),
-            contents: str[start_delimiter_end + 1..=end_delimiter_start]
-                .to_owned()
-                .into(),
-        },
     }
 }

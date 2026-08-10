@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::os::signals::Signal;
+use crate::os::signals::{Signal, TermSignal};
 use crate::os::{waitpid, OsResult, Pid, WaitStatus};
 use std::fmt::{Display, Formatter, Write};
 
@@ -32,7 +32,7 @@ impl Display for JobPosition {
 pub enum JobState {
     Done(libc::c_int),
     /// Terminated by a signal (must display distinctly and name the signal).
-    Signaled(Signal),
+    Signaled(TermSignal),
     Running,
     Stopped,
 }
@@ -65,16 +65,18 @@ pub struct Job {
 }
 
 impl Job {
+    /// `jobs -l`: the POSIX format with the process id before the state.
     pub fn to_string_long(&self) -> String {
         format!(
-            "[{}]{} {} {}    {}\n",
+            "[{}] {} {} {} {}\n",
             self.number, self.position, self.pid, self.state, self.command
         )
     }
 
+    /// The POSIX `jobs` format: `"[%d] %c %s %s\n"`.
     pub fn to_string_short(&self) -> String {
         format!(
-            "[{}]{} {}    {}\n",
+            "[{}] {} {} {}\n",
             self.number, self.position, self.state, self.command
         )
     }
@@ -155,7 +157,7 @@ impl JobManager {
                     job.state_should_be_reported = true;
                 }
                 WaitStatus::Signaled { signal, .. } => {
-                    if signal == Signal::SigStop {
+                    if signal.is(Signal::SigStop) {
                         job.state = JobState::Stopped;
                     } else {
                         job.state = JobState::Signaled(signal);
@@ -215,12 +217,27 @@ impl JobManager {
         self.job_index(id).map(|i| &mut self.jobs[i])
     }
 
-    pub fn current(&self) -> Option<&Job> {
-        self.jobs.last()
-    }
-
     pub fn current_mut(&mut self) -> Option<&mut Job> {
         self.jobs.last_mut()
+    }
+
+    /// Marks an already-known job as stopped. Returns false when `pid` is not
+    /// in the table, so the caller can register it instead of duplicating it.
+    pub fn mark_stopped_by_pid(&mut self, pid: Pid) -> bool {
+        if let Some(job) = self.jobs.iter_mut().find(|job| job.pid == pid) {
+            job.state = JobState::Stopped;
+            job.state_should_be_reported = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn remove_job_by_pid(&mut self, pid: Pid) -> Option<Job> {
+        let index = self.jobs.iter().position(|job| job.pid == pid)?;
+        let job = self.jobs.remove(index);
+        self.update_positions();
+        Some(job)
     }
 
     pub fn remove_job(&mut self, id: JobId) -> Option<Job> {

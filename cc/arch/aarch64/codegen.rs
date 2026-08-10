@@ -992,8 +992,8 @@ impl Aarch64CodeGen {
 
         let (fp_size, elem_bytes) = complex_fp_info(types, &self.base.target, typ);
 
-        for step in 0..2 {
-            let delta = (step as i32) * elem_bytes;
+        for step in 0..2i32 {
+            let delta = step * elem_bytes;
             self.push_lir(Aarch64Inst::LdrFp {
                 size: fp_size,
                 dst: VReg::V16,

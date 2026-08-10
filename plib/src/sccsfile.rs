@@ -1700,6 +1700,43 @@ extern "C" fn sigint_cleanup_handler(_sig: libc::c_int) {
     }
 }
 
+/// Blocks SIGINT for the lifetime of the guard, restoring the previous mask on
+/// drop.
+///
+/// Used to close the gap between a file existing on disk and the cleanup
+/// registry knowing about it. For files written with `fs::write` the gap is
+/// avoided by registering first, which is what the x-file paths do. That does
+/// not work for a lock taken with `create_new`: if the create then fails
+/// because another process holds the lock, an interrupt arriving in between
+/// would unlink *their* file. Deferring the signal is exact, and costs one
+/// syscall pair.
+struct SigintBlock {
+    saved: libc::sigset_t,
+}
+
+impl SigintBlock {
+    fn new() -> Self {
+        unsafe {
+            let mut mask: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut mask);
+            libc::sigaddset(&mut mask, libc::SIGINT);
+            let mut saved: libc::sigset_t = std::mem::zeroed();
+            // pthread_sigmask rather than sigprocmask: correct in a threaded
+            // process too, and identical in a single-threaded one.
+            libc::pthread_sigmask(libc::SIG_BLOCK, &mask, &mut saved);
+            SigintBlock { saved }
+        }
+    }
+}
+
+impl Drop for SigintBlock {
+    fn drop(&mut self) {
+        unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &self.saved, std::ptr::null_mut());
+        }
+    }
+}
+
 /// Install the SIGINT handler that unlinks all registered temp/lock files and
 /// exits with status 130. Idempotent enough to call once at the start of a
 /// mutating command's `main`.
@@ -1746,20 +1783,36 @@ impl ZLock {
 
         let zfile = paths::zfile_from_sfile(sfile);
 
+        // Create and register as one unit, with SIGINT deferred across it.
+        // Registering afterwards left a window -- a write, a flush and a chmod
+        // wide -- in which the lock existed on disk but the handler did not
+        // know to remove it. An interrupt landing there stranded z.<name>, and
+        // every later `get -e` / `delta` on that file failed with "being
+        // edited" until somebody deleted it by hand: exactly the state the
+        // registry exists to prevent.
+        let blocked = SigintBlock::new();
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&zfile)?;
-
-        // Record the locking PID, matching historical SCCS / CSSC.
-        writeln!(f, "{}", std::process::id())?;
-        f.flush()?;
-
-        // SCCS z-files are read-only (r--r--r--).
-        std::fs::set_permissions(&zfile, std::fs::Permissions::from_mode(0o444))?;
-
-        // Ensure SIGINT removes the lock.
         register_cleanup(&zfile);
+        drop(blocked);
+
+        // The lock is registered from here on, so an interrupt removes it --
+        // but a *failure* has to do the same by hand, or the file it just
+        // created outlives the process that failed to fill it in.
+        let filled = (|| -> io::Result<()> {
+            // Record the locking PID, matching historical SCCS / CSSC.
+            writeln!(f, "{}", std::process::id())?;
+            f.flush()?;
+            // SCCS z-files are read-only (r--r--r--).
+            std::fs::set_permissions(&zfile, std::fs::Permissions::from_mode(0o444))
+        })();
+        if let Err(e) = filled {
+            unregister_cleanup(&zfile);
+            let _ = std::fs::remove_file(&zfile);
+            return Err(e);
+        }
 
         Ok(ZLock { zfile })
     }

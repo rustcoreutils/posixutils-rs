@@ -833,6 +833,7 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
     let mut result = Vec::with_capacity(raw_args.len());
     let mut i = 0;
     let mut o_flag_idx: Option<usize> = None; // index into result of the -O flag
+    let mut std_flag_idx: Option<usize> = None; // index into result of the -std= value
     let mut seen_fpic = false;
 
     while i < raw_args.len() {
@@ -891,8 +892,18 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
             i += 1;
         } else if let Some(spec) = arg.strip_prefix("-std=") {
             // -std=c17 → --c17-std c17 (internal flag), so clap can see it.
-            result.push("--c17-std".to_string());
-            result.push(spec.to_string());
+            //
+            // Last one wins, as in gcc. Passing each occurrence through would
+            // make a second -std= a fatal "cannot be used multiple times",
+            // and build systems routinely accumulate one from configure and
+            // another from a makefile. -O just above does the same thing.
+            if let Some(idx) = std_flag_idx {
+                result[idx] = spec.to_string();
+            } else {
+                result.push("--c17-std".to_string());
+                std_flag_idx = Some(result.len());
+                result.push(spec.to_string());
+            }
             i += 1;
         } else if arg == "-fPIC" || arg == "-fpic" {
             // -fPIC / -fpic → --c17-fpic (internal flag) (first one only)

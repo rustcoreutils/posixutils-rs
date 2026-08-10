@@ -105,12 +105,28 @@ fn c17_strict_dialects_define_strict_ansi() {
     assert!(is_undefined(&got, "__STRICT_ANSI__"));
 }
 
+/// The unreserved and reserved OS macros for the host this test runs on.
+///
+/// `linux`/`__linux__` do not exist on Darwin, so asserting on them there
+/// tested the build machine rather than the compiler. `unix`/`__unix__` are
+/// common to both.
+fn host_os_macros() -> (&'static [&'static str], &'static [&'static str]) {
+    if cfg!(target_os = "linux") {
+        (&["unix", "linux"], &["__unix__", "__linux__"])
+    } else {
+        // macOS and the BSDs predefine the unix pair but not the linux one.
+        (&["unix"], &["__unix__"])
+    }
+}
+
 #[test]
 fn c17_strict_dialects_drop_unreserved_macros() {
     // A strict dialect may only predefine names in the implementation's
     // reserved namespace, so `unix`/`linux` go away while `__unix__` stays.
     // Otherwise a conforming program may not use them as identifiers.
-    for macro_name in ["unix", "linux"] {
+    let (unreserved, reserved) = host_os_macros();
+
+    for macro_name in unreserved {
         let strict = expand_under("unreserved_strict", Some("-std=c17"), macro_name);
         assert!(
             is_undefined(&strict, macro_name),
@@ -119,7 +135,7 @@ fn c17_strict_dialects_drop_unreserved_macros() {
     }
 
     // The reserved spellings survive in every dialect.
-    for macro_name in ["__unix__", "__linux__"] {
+    for macro_name in reserved {
         let strict = expand_under("reserved_strict", Some("-std=c17"), macro_name);
         assert_eq!(strict, "1", "{macro_name} should survive -std=c17");
     }
@@ -129,7 +145,8 @@ fn c17_strict_dialects_drop_unreserved_macros() {
 fn c17_gnu_dialects_keep_unreserved_macros() {
     // Pinned in both directions so `c17_strict_dialects_drop_unreserved_macros`
     // cannot pass by simply never defining these.
-    for macro_name in ["unix", "linux"] {
+    let (unreserved, _) = host_os_macros();
+    for macro_name in unreserved {
         let gnu = expand_under("unreserved_gnu", Some("-std=gnu17"), macro_name);
         assert_eq!(gnu, "1", "-std=gnu17 should predefine `{macro_name}`");
     }
@@ -153,6 +170,57 @@ fn c17_c11_only_macros_are_absent_before_c11() {
             assert_eq!(got, "1", "{flag} should define {macro_name}");
         }
     }
+}
+
+/// Repeating `-std=` is last-wins, as in gcc.
+///
+/// Every occurrence used to be forwarded to a clap `Option<String>`, so a
+/// second one was a fatal "cannot be used multiple times". Build systems
+/// accumulate `-std=` routinely -- one from configure's CFLAGS, another from a
+/// makefile -- and gcc accepts it. `-O` in the same rewriter already did this.
+#[test]
+fn c17_repeated_std_takes_the_last() {
+    assert_eq!(
+        expand_under("std_repeat", None, "__STDC_VERSION__"),
+        "201710L"
+    );
+
+    let run = preprocess_text(
+        "std_repeat_two",
+        "MARKER __STDC_VERSION__ MARKER\n",
+        &["-std=c99", "-std=c11"],
+    );
+    assert!(
+        run.success,
+        "repeated -std= must be accepted: {}",
+        run.stderr
+    );
+    let line = run
+        .stdout
+        .lines()
+        .find(|l| l.starts_with("MARKER"))
+        .unwrap_or_else(|| panic!("no marker line:\n{}", run.stdout));
+    assert!(
+        line.contains("201112L"),
+        "the last -std= should win, got: {line}"
+    );
+
+    // And the other way round, so this cannot pass by always picking one.
+    let run = preprocess_text(
+        "std_repeat_rev",
+        "MARKER __STDC_VERSION__ MARKER\n",
+        &["-std=c11", "-std=c99"],
+    );
+    assert!(run.success);
+    let line = run
+        .stdout
+        .lines()
+        .find(|l| l.starts_with("MARKER"))
+        .unwrap();
+    assert!(
+        line.contains("199901L"),
+        "the last -std= should win, got: {line}"
+    );
 }
 
 #[test]

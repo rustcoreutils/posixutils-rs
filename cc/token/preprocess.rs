@@ -1411,7 +1411,7 @@ impl<'a> Preprocessor<'a> {
             if is_paste(first) {
                 diag::error(
                     first.pos,
-                    "'##' cannot appear at the start of a macro replacement list",
+                    &gettext("'##' cannot appear at the start of a macro replacement list"),
                 );
             }
         }
@@ -1420,7 +1420,7 @@ impl<'a> Preprocessor<'a> {
                 if is_paste(last) {
                     diag::error(
                         last.pos,
-                        "'##' cannot appear at the end of a macro replacement list",
+                        &gettext("'##' cannot appear at the end of a macro replacement list"),
                     );
                 }
             }
@@ -2725,7 +2725,7 @@ impl<'a> Preprocessor<'a> {
                         } else {
                             diag::warning(
                                 pos,
-                                "expected FP_CONTRACT, FENV_ACCESS, or CX_LIMITED_RANGE after #pragma STDC",
+                                &gettext("expected FP_CONTRACT, FENV_ACCESS, or CX_LIMITED_RANGE after #pragma STDC"),
                             );
                         }
 

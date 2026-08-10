@@ -22,6 +22,7 @@ use crate::token::lexer::{IdentTable, Position, SpecialToken, Token, TokenType, 
 use crate::types::{
     CompositeType, EnumConstant, StructMember, Type, TypeId, TypeKind, TypeModifiers, TypeTable,
 };
+use gettextrs::gettext;
 use std::fmt;
 
 const DEFAULT_MEMBER_CAPACITY: usize = 16;
@@ -2140,7 +2141,7 @@ impl Parser<'_> {
         if !self.saw_explicit_type {
             diag::error(
                 pos,
-                "type specifier missing; implicit 'int' was removed in C99",
+                &gettext("type specifier missing; implicit 'int' was removed in C99"),
             );
             // Keep the defaulted `int` and carry on: the declarator that
             // follows is usually well-formed, and one diagnostic per
@@ -2205,7 +2206,7 @@ impl Parser<'_> {
             if constants.is_empty() {
                 diag::warning(
                     self.current_pos(),
-                    "empty enum definition is a GNU extension",
+                    &gettext("empty enum definition is a GNU extension"),
                 );
             }
 
@@ -3042,7 +3043,7 @@ impl Parser<'_> {
                 if params.is_empty() {
                     diag::warning(
                         self.current_pos(),
-                        "ISO C requires a named argument before '...'",
+                        &gettext("ISO C requires a named argument before '...'"),
                     );
                 }
                 self.advance();
@@ -4182,7 +4183,7 @@ impl Parser<'_> {
         if width == 1 && !self.types.is_unsigned(typ_id) && kind != TypeKind::Bool {
             diag::warning(
                 self.current_pos(),
-                "single-bit signed bit-field has dubious values",
+                &gettext("single-bit signed bit-field has dubious values"),
             );
         }
 

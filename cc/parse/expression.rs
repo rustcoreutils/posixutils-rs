@@ -1408,7 +1408,7 @@ impl<'a> Parser<'a> {
                     if kind != TypeKind::Struct && kind != TypeKind::Union {
                         diag::error(
                             dot_pos,
-                            "request for member in something not a structure or union",
+                            &gettext("request for member in something not a structure or union"),
                         );
                         self.types.int_id
                     } else if let Some(info) = self.types.find_member(resolved, member) {
@@ -1442,7 +1442,9 @@ impl<'a> Parser<'a> {
                         if kind != TypeKind::Struct && kind != TypeKind::Union {
                             diag::error(
                                 arrow_pos,
-                                "request for member in something not a structure or union",
+                                &gettext(
+                                    "request for member in something not a structure or union",
+                                ),
                             );
                             self.types.int_id
                         } else if let Some(info) = self.types.find_member(resolved, member) {
@@ -1562,7 +1564,9 @@ impl<'a> Parser<'a> {
                     Some(prev) if prev != kind && !mixed_reported => {
                         diag::error(
                             start_pos,
-                            "concatenation of string literals with different encoding prefixes",
+                            &gettext(
+                                "concatenation of string literals with different encoding prefixes",
+                            ),
                         );
                         mixed_reported = true;
                     }
@@ -2000,7 +2004,7 @@ impl<'a> Parser<'a> {
                 if default_pos.is_some() {
                     diag::error(
                         assoc_pos,
-                        "_Generic selection has more than one 'default' association",
+                        &gettext("_Generic selection has more than one 'default' association"),
                     );
                 } else {
                     default_pos = Some(assoc_pos);

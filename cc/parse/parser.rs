@@ -3200,6 +3200,20 @@ impl Parser<'_> {
             }));
         }
 
+        // A stray `;` at file scope is an empty declaration. C17 6.7p2 makes it
+        // a constraint violation, but GCC and Clang accept it by default (they
+        // warn only under -pedantic) and it is common in real source: any
+        // function-like macro that expands to nothing and is invoked with a
+        // trailing semicolon produces one. CPython's `_Py_DECLARE_STR()` is
+        // exactly that. Consume it before reaching the type specifier, which
+        // would otherwise report a spurious "type specifier missing".
+        if self.is_special(b';') {
+            self.advance();
+            return Ok(ExternalDecl::Declaration(Declaration {
+                declarators: vec![],
+            }));
+        }
+
         let decl_pos = self.current_pos();
         // Parse type specifier
         let base_type = self.parse_type_specifier()?;

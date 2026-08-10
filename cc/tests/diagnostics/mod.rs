@@ -43,6 +43,37 @@ fn diagnostics_implicit_int_is_rejected() {
     );
 }
 
+/// A stray `;` at file scope is an empty declaration, not a declaration with a
+/// missing type specifier. It reached `check_implicit_int` and was rejected
+/// with a wrong message, which broke any source using a function-like macro
+/// that expands to nothing -- CPython's `_Py_DECLARE_STR()` is one, and this
+/// failed the CPython acceptance build.
+///
+/// C17 6.7p2 does make it a constraint violation, but GCC and Clang accept it
+/// by default and warn only under -pedantic, so accepting it is what real
+/// source expects.
+#[test]
+fn diagnostics_empty_declaration_is_accepted() {
+    for (name, src) in [
+        ("empty_decl_bare", ";\nint main(void){return 0;}\n"),
+        ("empty_decl_repeated", ";;;\nint main(void){return 0;}\n"),
+        (
+            "empty_decl_between_declarations",
+            "int a;\n;\nint b;\nint main(void){return 0;}\n",
+        ),
+        (
+            "empty_decl_from_empty_macro",
+            "#define DECLARE(x)\nDECLARE(thing);\nint main(void){return 0;}\n",
+        ),
+        (
+            "empty_decl_after_function",
+            "int f(void){return 0;};\nint main(void){return f();}\n",
+        ),
+    ] {
+        compile_expect_ok(name, src);
+    }
+}
+
 /// The predicate is subtler than "no base kind was set": `signed`/`unsigned`
 /// name a type while only setting a modifier, and `short`/`long` set the kind.
 /// Everything here must still compile.

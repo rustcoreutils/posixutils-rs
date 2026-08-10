@@ -3889,91 +3889,69 @@ impl<'a> Linearizer<'a> {
         }
     }
 
+    /// Build one `__c11_atomic_*` builtin from its already-parsed operands.
+    ///
+    /// Every builtin except the compare-exchange pair and the fences has the
+    /// same shape: linearize the pointer, take the pointee's type and width,
+    /// and emit `op [ptr, value?, order]`. Eleven hand-written copies of that
+    /// is how the operand convention drifted out of the linearizer's reach in
+    /// the first place -- `AsmConstraint::is_memory` had the same problem.
+    fn emit_c11_atomic_builtin(
+        &mut self,
+        op: Opcode,
+        ptr: &Expr,
+        val: Option<&Expr>,
+        order: Option<&Expr>,
+    ) -> PseudoId {
+        let ptr_val = self.linearize_expr(ptr);
+        let value = val.map(|v| self.linearize_expr(v));
+
+        // `atomic_init` carries no order argument: it is a non-atomic store,
+        // so it is emitted as a relaxed one.
+        let (order_val, memory_order) = match order {
+            Some(o) => (self.linearize_expr(o), self.eval_memory_order(o)),
+            None => (
+                self.emit_const(MemoryOrder::Relaxed as i128, self.types.int_id),
+                MemoryOrder::Relaxed,
+            ),
+        };
+
+        let ptr_type = self.expr_type(ptr);
+        let elem_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
+        let size = self.types.size_bits(elem_type);
+        let result = self.alloc_pseudo();
+
+        let mut insn = Instruction::new(op).with_target(result).with_src(ptr_val);
+        if let Some(v) = value {
+            insn = insn.with_src(v);
+        }
+        insn = insn
+            .with_src(order_val)
+            .with_type_and_size(elem_type, size)
+            .with_memory_order(memory_order);
+        self.emit(insn);
+        result
+    }
+
     pub(crate) fn linearize_c11_atomic(&mut self, expr: &Expr) -> PseudoId {
         match &expr.kind {
             // ================================================================
             // Atomic builtins (Clang __c11_atomic_* for C11 stdatomic.h)
             // ================================================================
             ExprKind::C11AtomicInit { ptr, val } => {
-                // atomic_init is a non-atomic store (no memory ordering)
-                let ptr_val = self.linearize_expr(ptr);
-                let value = self.linearize_expr(val);
-                let ptr_type = self.expr_type(ptr);
-                let elem_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
-                let size = self.types.size_bits(elem_type);
-                let result = self.alloc_pseudo();
-
-                // Use AtomicStore with Relaxed ordering for init
-                let insn = Instruction::new(Opcode::AtomicStore)
-                    .with_target(result)
-                    .with_src(ptr_val)
-                    .with_src(value)
-                    .with_src(self.emit_const(0, self.types.int_id)) // Relaxed = 0
-                    .with_type_and_size(elem_type, size)
-                    .with_memory_order(MemoryOrder::Relaxed);
-                self.emit(insn);
-                result
+                self.emit_c11_atomic_builtin(Opcode::AtomicStore, ptr, Some(val), None)
             }
 
             ExprKind::C11AtomicLoad { ptr, order } => {
-                let ptr_val = self.linearize_expr(ptr);
-                let order_val = self.linearize_expr(order);
-                let memory_order = self.eval_memory_order(order);
-                let ptr_type = self.expr_type(ptr);
-                let result_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
-                let size = self.types.size_bits(result_type);
-                let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::AtomicLoad)
-                    .with_target(result)
-                    .with_src(ptr_val)
-                    .with_src(order_val)
-                    .with_type_and_size(result_type, size)
-                    .with_memory_order(memory_order);
-                self.emit(insn);
-                result
+                self.emit_c11_atomic_builtin(Opcode::AtomicLoad, ptr, None, Some(order))
             }
 
             ExprKind::C11AtomicStore { ptr, val, order } => {
-                let ptr_val = self.linearize_expr(ptr);
-                let value = self.linearize_expr(val);
-                let order_val = self.linearize_expr(order);
-                let memory_order = self.eval_memory_order(order);
-                let ptr_type = self.expr_type(ptr);
-                let elem_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
-                let size = self.types.size_bits(elem_type);
-                let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::AtomicStore)
-                    .with_target(result)
-                    .with_src(ptr_val)
-                    .with_src(value)
-                    .with_src(order_val)
-                    .with_type_and_size(elem_type, size)
-                    .with_memory_order(memory_order);
-                self.emit(insn);
-                result
+                self.emit_c11_atomic_builtin(Opcode::AtomicStore, ptr, Some(val), Some(order))
             }
 
             ExprKind::C11AtomicExchange { ptr, val, order } => {
-                let ptr_val = self.linearize_expr(ptr);
-                let value = self.linearize_expr(val);
-                let order_val = self.linearize_expr(order);
-                let memory_order = self.eval_memory_order(order);
-                let ptr_type = self.expr_type(ptr);
-                let result_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
-                let size = self.types.size_bits(result_type);
-                let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::AtomicSwap)
-                    .with_target(result)
-                    .with_src(ptr_val)
-                    .with_src(value)
-                    .with_src(order_val)
-                    .with_type_and_size(result_type, size)
-                    .with_memory_order(memory_order);
-                self.emit(insn);
-                result
+                self.emit_c11_atomic_builtin(Opcode::AtomicSwap, ptr, Some(val), Some(order))
             }
 
             ExprKind::C11AtomicCompareExchangeStrong {
@@ -4014,108 +3992,23 @@ impl<'a> Linearizer<'a> {
             }
 
             ExprKind::C11AtomicFetchAdd { ptr, val, order } => {
-                let ptr_val = self.linearize_expr(ptr);
-                let value = self.linearize_expr(val);
-                let order_val = self.linearize_expr(order);
-                let memory_order = self.eval_memory_order(order);
-                let ptr_type = self.expr_type(ptr);
-                let result_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
-                let size = self.types.size_bits(result_type);
-                let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::AtomicFetchAdd)
-                    .with_target(result)
-                    .with_src(ptr_val)
-                    .with_src(value)
-                    .with_src(order_val)
-                    .with_type_and_size(result_type, size)
-                    .with_memory_order(memory_order);
-                self.emit(insn);
-                result
+                self.emit_c11_atomic_builtin(Opcode::AtomicFetchAdd, ptr, Some(val), Some(order))
             }
 
             ExprKind::C11AtomicFetchSub { ptr, val, order } => {
-                let ptr_val = self.linearize_expr(ptr);
-                let value = self.linearize_expr(val);
-                let order_val = self.linearize_expr(order);
-                let memory_order = self.eval_memory_order(order);
-                let ptr_type = self.expr_type(ptr);
-                let result_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
-                let size = self.types.size_bits(result_type);
-                let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::AtomicFetchSub)
-                    .with_target(result)
-                    .with_src(ptr_val)
-                    .with_src(value)
-                    .with_src(order_val)
-                    .with_type_and_size(result_type, size)
-                    .with_memory_order(memory_order);
-                self.emit(insn);
-                result
+                self.emit_c11_atomic_builtin(Opcode::AtomicFetchSub, ptr, Some(val), Some(order))
             }
 
             ExprKind::C11AtomicFetchAnd { ptr, val, order } => {
-                let ptr_val = self.linearize_expr(ptr);
-                let value = self.linearize_expr(val);
-                let order_val = self.linearize_expr(order);
-                let memory_order = self.eval_memory_order(order);
-                let ptr_type = self.expr_type(ptr);
-                let result_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
-                let size = self.types.size_bits(result_type);
-                let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::AtomicFetchAnd)
-                    .with_target(result)
-                    .with_src(ptr_val)
-                    .with_src(value)
-                    .with_src(order_val)
-                    .with_type_and_size(result_type, size)
-                    .with_memory_order(memory_order);
-                self.emit(insn);
-                result
+                self.emit_c11_atomic_builtin(Opcode::AtomicFetchAnd, ptr, Some(val), Some(order))
             }
 
             ExprKind::C11AtomicFetchOr { ptr, val, order } => {
-                let ptr_val = self.linearize_expr(ptr);
-                let value = self.linearize_expr(val);
-                let order_val = self.linearize_expr(order);
-                let memory_order = self.eval_memory_order(order);
-                let ptr_type = self.expr_type(ptr);
-                let result_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
-                let size = self.types.size_bits(result_type);
-                let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::AtomicFetchOr)
-                    .with_target(result)
-                    .with_src(ptr_val)
-                    .with_src(value)
-                    .with_src(order_val)
-                    .with_type_and_size(result_type, size)
-                    .with_memory_order(memory_order);
-                self.emit(insn);
-                result
+                self.emit_c11_atomic_builtin(Opcode::AtomicFetchOr, ptr, Some(val), Some(order))
             }
 
             ExprKind::C11AtomicFetchXor { ptr, val, order } => {
-                let ptr_val = self.linearize_expr(ptr);
-                let value = self.linearize_expr(val);
-                let order_val = self.linearize_expr(order);
-                let memory_order = self.eval_memory_order(order);
-                let ptr_type = self.expr_type(ptr);
-                let result_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
-                let size = self.types.size_bits(result_type);
-                let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::AtomicFetchXor)
-                    .with_target(result)
-                    .with_src(ptr_val)
-                    .with_src(value)
-                    .with_src(order_val)
-                    .with_type_and_size(result_type, size)
-                    .with_memory_order(memory_order);
-                self.emit(insn);
-                result
+                self.emit_c11_atomic_builtin(Opcode::AtomicFetchXor, ptr, Some(val), Some(order))
             }
 
             ExprKind::C11AtomicThreadFence { order } => {

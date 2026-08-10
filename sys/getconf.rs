@@ -521,6 +521,63 @@ fn load_confstr_mapping() -> HashMap<&'static str, libc::c_int> {
                 _CS_POSIX_V7_LPBIG_OFFBIG_LIBS,
             ),
             ("POSIX_V7_LPBIG_OFFBIG_LIBS", _CS_POSIX_V7_LPBIG_OFFBIG_LIBS),
+            // POSIX_V8 environment strings (c17, 88157-88176).
+            //
+            // POSIX.2024 is Issue 8, so V8 is the mandated spelling; Austin
+            // Group Defect 1330 renamed the V7 names without changing the
+            // environments they describe. glibc's confstr has no separate
+            // _CS_POSIX_V8_* for the same query, so these alias V7. The bare
+            // `POSIX_V8_*` spellings resolve through the `_CS_` fallback in
+            // `is_confstr_var`, so only these entries are needed.
+            (
+                "_CS_POSIX_V8_ILP32_OFF32_CFLAGS",
+                _CS_POSIX_V7_ILP32_OFF32_CFLAGS,
+            ),
+            (
+                "_CS_POSIX_V8_ILP32_OFF32_LDFLAGS",
+                _CS_POSIX_V7_ILP32_OFF32_LDFLAGS,
+            ),
+            (
+                "_CS_POSIX_V8_ILP32_OFF32_LIBS",
+                _CS_POSIX_V7_ILP32_OFF32_LIBS,
+            ),
+            (
+                "_CS_POSIX_V8_ILP32_OFFBIG_CFLAGS",
+                _CS_POSIX_V7_ILP32_OFFBIG_CFLAGS,
+            ),
+            (
+                "_CS_POSIX_V8_ILP32_OFFBIG_LDFLAGS",
+                _CS_POSIX_V7_ILP32_OFFBIG_LDFLAGS,
+            ),
+            (
+                "_CS_POSIX_V8_ILP32_OFFBIG_LIBS",
+                _CS_POSIX_V7_ILP32_OFFBIG_LIBS,
+            ),
+            (
+                "_CS_POSIX_V8_LP64_OFF64_CFLAGS",
+                _CS_POSIX_V7_LP64_OFF64_CFLAGS,
+            ),
+            (
+                "_CS_POSIX_V8_LP64_OFF64_LDFLAGS",
+                _CS_POSIX_V7_LP64_OFF64_LDFLAGS,
+            ),
+            ("_CS_POSIX_V8_LP64_OFF64_LIBS", _CS_POSIX_V7_LP64_OFF64_LIBS),
+            (
+                "_CS_POSIX_V8_LPBIG_OFFBIG_CFLAGS",
+                _CS_POSIX_V7_LPBIG_OFFBIG_CFLAGS,
+            ),
+            (
+                "_CS_POSIX_V8_LPBIG_OFFBIG_LDFLAGS",
+                _CS_POSIX_V7_LPBIG_OFFBIG_LDFLAGS,
+            ),
+            (
+                "_CS_POSIX_V8_LPBIG_OFFBIG_LIBS",
+                _CS_POSIX_V7_LPBIG_OFFBIG_LIBS,
+            ),
+            (
+                "_CS_POSIX_V8_WIDTH_RESTRICTED_ENVS",
+                _CS_POSIX_V7_WIDTH_RESTRICTED_ENVS,
+            ),
         ])
     }
 }
@@ -577,6 +634,28 @@ fn lookup_limit_constant(var: &str) -> Option<i64> {
 
 fn load_sysconf_mapping() -> HashMap<&'static str, libc::c_int> {
     HashMap::from([
+        // Programming environments (c17, 88106-88176). POSIX.2024 is Issue 8,
+        // so the mandated spelling is V8; the environments themselves are
+        // unchanged from V7, and no libc defines a separate _SC_V8_* for what
+        // is the same query, so these alias the V7 constants. Both spellings
+        // are accepted because build scripts written against either issue have
+        // to keep working.
+        ("_POSIX_V8_ILP32_OFF32", libc::_SC_V7_ILP32_OFF32),
+        ("_POSIX_V8_ILP32_OFFBIG", libc::_SC_V7_ILP32_OFFBIG),
+        ("_POSIX_V8_LP64_OFF64", libc::_SC_V7_LP64_OFF64),
+        ("_POSIX_V8_LPBIG_OFFBIG", libc::_SC_V7_LPBIG_OFFBIG),
+        ("_SC_V8_ILP32_OFF32", libc::_SC_V7_ILP32_OFF32),
+        ("_SC_V8_ILP32_OFFBIG", libc::_SC_V7_ILP32_OFFBIG),
+        ("_SC_V8_LP64_OFF64", libc::_SC_V7_LP64_OFF64),
+        ("_SC_V8_LPBIG_OFFBIG", libc::_SC_V7_LPBIG_OFFBIG),
+        ("_POSIX_V7_ILP32_OFF32", libc::_SC_V7_ILP32_OFF32),
+        ("_POSIX_V7_ILP32_OFFBIG", libc::_SC_V7_ILP32_OFFBIG),
+        ("_POSIX_V7_LP64_OFF64", libc::_SC_V7_LP64_OFF64),
+        ("_POSIX_V7_LPBIG_OFFBIG", libc::_SC_V7_LPBIG_OFFBIG),
+        ("_SC_V7_ILP32_OFF32", libc::_SC_V7_ILP32_OFF32),
+        ("_SC_V7_ILP32_OFFBIG", libc::_SC_V7_ILP32_OFFBIG),
+        ("_SC_V7_LP64_OFF64", libc::_SC_V7_LP64_OFF64),
+        ("_SC_V7_LPBIG_OFFBIG", libc::_SC_V7_LPBIG_OFFBIG),
         ("_SC_ARG_MAX", libc::_SC_ARG_MAX),
         ("_SC_CHILD_MAX", libc::_SC_CHILD_MAX),
         ("_SC_CLK_TCK", libc::_SC_CLK_TCK),

@@ -22,6 +22,7 @@ use crate::token::lexer::{IdentTable, Position, SpecialToken, Token, TokenType, 
 use crate::types::{
     CompositeType, EnumConstant, StructMember, Type, TypeId, TypeKind, TypeModifiers, TypeTable,
 };
+use gettextrs::gettext;
 use std::fmt;
 
 const DEFAULT_MEMBER_CAPACITY: usize = 16;
@@ -1789,16 +1790,14 @@ impl Parser<'_> {
                             // shall not be an array or a function type.
                             let inner_kind = self.types.kind(inner_type);
                             if matches!(inner_kind, TypeKind::Array | TypeKind::Function) {
-                                diag::error(
+                                diag::error_args(
                                     self.current_pos(),
-                                    &format!(
-                                        "'_Atomic' cannot be applied to {} type",
-                                        if inner_kind == TypeKind::Array {
-                                            "an array"
-                                        } else {
-                                            "a function"
-                                        }
-                                    ),
+                                    "'_Atomic' cannot be applied to {0} type",
+                                    &[if inner_kind == TypeKind::Array {
+                                        "an array"
+                                    } else {
+                                        "a function"
+                                    }],
                                 );
                             }
                             let inner = self.types.get(inner_type).clone();
@@ -2038,8 +2037,30 @@ impl Parser<'_> {
 
     /// Parse a type specifier and record whether one was present.
     fn parse_type_specifier(&mut self) -> ParseResult<Type> {
+        let pos = self.current_pos();
         let (typ, explicit) = self.parse_type_specifier_inner()?;
         self.saw_explicit_type = explicit;
+
+        // C17 6.7.3p3: the _Atomic *qualifier* shall not be applied to an array
+        // or function type. The specifier form `_Atomic(T)` is checked where it
+        // is parsed, but the qualifier form only sets a bit, so
+        //
+        //     typedef int A[4];   _Atomic A x;
+        //     typedef int F(void); _Atomic F f;
+        //
+        // both slipped through -- the only way to reach the constraint, since
+        // `_Atomic int a[4]` is an array *of* atomic ints and perfectly legal.
+        if typ.modifiers.contains(TypeModifiers::ATOMIC) {
+            let what = match typ.kind {
+                TypeKind::Array => Some("an array"),
+                TypeKind::Function => Some("a function"),
+                _ => None,
+            };
+            if let Some(what) = what {
+                diag::error_args(pos, "'_Atomic' cannot be applied to {0} type", &[what]);
+            }
+        }
+
         Ok(typ)
     }
 
@@ -2101,14 +2122,14 @@ impl Parser<'_> {
             return;
         }
         let spelled = self.idents.get_opt(name).unwrap_or("").to_string();
-        diag::error(
+        diag::error_args(
             pos,
-            &format!(
-                "typedef '{}' redefined with an incompatible type ('{}' then '{}')",
-                spelled,
-                self.types.get(old_type),
-                self.types.get(new_type),
-            ),
+            "typedef '{0}' redefined with an incompatible type ('{1}' then '{2}')",
+            &[
+                &spelled.to_string(),
+                &self.types.get(old_type).to_string(),
+                &self.types.get(new_type).to_string(),
+            ],
         );
     }
 
@@ -2120,7 +2141,7 @@ impl Parser<'_> {
         if !self.saw_explicit_type {
             diag::error(
                 pos,
-                "type specifier missing; implicit 'int' was removed in C99",
+                &gettext("type specifier missing; implicit 'int' was removed in C99"),
             );
             // Keep the defaulted `int` and carry on: the declarator that
             // follows is usually well-formed, and one diagnostic per
@@ -2185,7 +2206,7 @@ impl Parser<'_> {
             if constants.is_empty() {
                 diag::warning(
                     self.current_pos(),
-                    "empty enum definition is a GNU extension",
+                    &gettext("empty enum definition is a GNU extension"),
                 );
             }
 
@@ -3022,7 +3043,7 @@ impl Parser<'_> {
                 if params.is_empty() {
                     diag::warning(
                         self.current_pos(),
-                        "ISO C requires a named argument before '...'",
+                        &gettext("ISO C requires a named argument before '...'"),
                     );
                 }
                 self.advance();
@@ -3195,6 +3216,20 @@ impl Parser<'_> {
         if self.is_static_assert() {
             self.parse_static_assert()?;
             // Return empty declaration - static_assert produces nothing
+            return Ok(ExternalDecl::Declaration(Declaration {
+                declarators: vec![],
+            }));
+        }
+
+        // A stray `;` at file scope is an empty declaration. C17 6.7p2 makes it
+        // a constraint violation, but GCC and Clang accept it by default (they
+        // warn only under -pedantic) and it is common in real source: any
+        // function-like macro that expands to nothing and is invoked with a
+        // trailing semicolon produces one. CPython's `_Py_DECLARE_STR()` is
+        // exactly that. Consume it before reaching the type specifier, which
+        // would otherwise report a spurious "type specifier missing".
+        if self.is_special(b';') {
+            self.advance();
             return Ok(ExternalDecl::Declaration(Declaration {
                 declarators: vec![],
             }));
@@ -4148,7 +4183,7 @@ impl Parser<'_> {
         if width == 1 && !self.types.is_unsigned(typ_id) && kind != TypeKind::Bool {
             diag::warning(
                 self.current_pos(),
-                "single-bit signed bit-field has dubious values",
+                &gettext("single-bit signed bit-field has dubious values"),
             );
         }
 

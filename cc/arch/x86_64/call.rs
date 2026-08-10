@@ -227,7 +227,7 @@ impl X86_64CodeGen {
                     src: GpOperand::Imm(8),
                     dst: Reg::Rsp,
                 });
-                let fp_lir_size = FpSize::from_bits(fp_size);
+                let fp_lir_size = FpSize::from_bits(fp_size, &self.base.target);
                 self.push_lir(X86Inst::MovFp {
                     size: fp_lir_size,
                     src: XmmOperand::Reg(XmmReg::Xmm15),
@@ -739,6 +739,11 @@ impl X86_64CodeGen {
                 let size_bits = match base {
                     crate::abi::HfaBase::Float32 => 32,
                     crate::abi::HfaBase::Float64 => 64,
+                    // System V has no HFA concept and `long double` is x87
+                    // there, so this classification never reaches x86_64.
+                    crate::abi::HfaBase::Float128 => {
+                        unreachable!("binary128 HFA is an AAPCS64 classification")
+                    }
                 };
                 self.emit_fp_move_from_xmm(XmmReg::Xmm0, &dst_loc, size_bits);
             }

@@ -186,8 +186,12 @@ define_keywords! {
     (CASE,              "case",              STMT_KW),
     (DEFAULT,           "default",           STMT_KW),
 
-    // ---- Sizeof / Alignof ----
+    // ---- Sizeof / Alignof / Generic ----
     (SIZEOF,            "sizeof",            0),
+    // _Generic introduces a primary expression, so it carries no tag. A
+    // TYPE_SPEC or DECL_START tag would make is_declaration_start and
+    // try_parse_type_name's entry gate mistake it for the start of a type.
+    (GENERIC,           "_Generic",          0),
     (ALIGNOF,           "_Alignof",          0),
     (GNU_ALIGNOF,       "__alignof__",       0),
     (GNU_ALIGNOF2,      "__alignof",         0),

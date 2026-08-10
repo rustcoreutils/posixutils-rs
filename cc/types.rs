@@ -386,9 +386,27 @@ impl Type {
         Self::enum_type(CompositeType::incomplete(Some(tag)))
     }
 
+    /// Modifiers that describe a *declaration* rather than a type.
+    ///
+    /// C17 6.7.1p1 keeps storage-class specifiers out of the type, and the
+    /// function specifiers of 6.7.4 likewise qualify the declaration. They ride
+    /// along on `Type` because the parser collects all specifiers into one bag,
+    /// and they leak into places that only ever wanted the type: the return
+    /// type of `static int f(void)` carried `STATIC`, so a call to it was not
+    /// compatible with `int`. Invisible to `sizeof`, fatal to any comparison.
+    pub const DECL_SPECIFIERS: TypeModifiers = TypeModifiers::STATIC
+        .union(TypeModifiers::EXTERN)
+        .union(TypeModifiers::REGISTER)
+        .union(TypeModifiers::AUTO)
+        .union(TypeModifiers::TYPEDEF)
+        .union(TypeModifiers::THREAD_LOCAL)
+        .union(TypeModifiers::INLINE)
+        .union(TypeModifiers::NORETURN);
+
     /// Check if two types are compatible (for __builtin_types_compatible_p)
-    /// This ignores top-level qualifiers (const, volatile, restrict)
-    /// but otherwise requires types to be identical.
+    /// This ignores top-level qualifiers (const, volatile, restrict) and the
+    /// declaration specifiers above, but otherwise requires types to be
+    /// identical.
     /// Note: Different enum types are NOT compatible, even if they have
     /// the same underlying integer type.
     ///
@@ -416,7 +434,9 @@ impl Type {
         } else {
             TypeModifiers::SIGNED
         };
-        let ignored = QUALIFIERS.union(redundant_signed);
+        let ignored = QUALIFIERS
+            .union(redundant_signed)
+            .union(Self::DECL_SPECIFIERS);
 
         // Compare modifiers (ignoring top-level qualifiers)
         let self_mods = self.modifiers.difference(ignored);
@@ -1132,6 +1152,21 @@ impl TypeTable {
         }
     }
 
+    /// Is `va_list` a plain pointer on this target, rather than an aggregate?
+    ///
+    /// Everywhere else it is something whose *address* travels: SysV x86_64
+    /// spells it `__va_list_tag[1]`, an array, and AAPCS64 uses a 32-byte
+    /// record that is passed by reference. Darwin on aarch64 puts every
+    /// variadic argument on the stack and spells `va_list` as `char *`, so
+    /// there is nothing to decay -- the pointer itself is the value, and
+    /// handing a callee its address gives it a pointer to a pointer.
+    pub fn va_list_is_pointer(&self) -> bool {
+        matches!(
+            (self.target_arch, self.target_os),
+            (Arch::Aarch64, Os::MacOS)
+        )
+    }
+
     /// Get va_list alignment in bytes based on target architecture
     fn va_list_alignment(&self) -> usize {
         8 // All supported platforms use 8-byte alignment for va_list
@@ -1201,6 +1236,34 @@ impl TypeTable {
         }
         // Compare underlying types
         self.get(id1).types_compatible(self.get(id2))
+    }
+
+    /// Check if two types are compatible *and* identically qualified.
+    ///
+    /// `types_compatible` deliberately ignores top-level qualifiers, which is
+    /// what `__builtin_types_compatible_p` documents. C17 6.7.3p10 is stricter:
+    /// "for two qualified types to be compatible, both shall have the
+    /// identically qualified version of a compatible type". `_Generic` needs
+    /// the strict rule in both directions -- `int` and `const int` may coexist
+    /// as associations because they are *not* compatible, and the `const int`
+    /// association can never be selected because the controlling expression has
+    /// been lvalue-converted to an unqualified type.
+    pub fn types_compatible_qualified(&self, id1: TypeId, id2: TypeId) -> bool {
+        if id1 == id2 {
+            return true;
+        }
+
+        const QUALIFIERS: TypeModifiers = TypeModifiers::CONST
+            .union(TypeModifiers::VOLATILE)
+            .union(TypeModifiers::RESTRICT)
+            .union(TypeModifiers::ATOMIC);
+
+        let (t1, t2) = (self.get(id1), self.get(id2));
+        if t1.modifiers.intersection(QUALIFIERS) != t2.modifiers.intersection(QUALIFIERS) {
+            return false;
+        }
+
+        t1.types_compatible(t2)
     }
 
     /// Compute struct layout with natural alignment

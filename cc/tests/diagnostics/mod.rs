@@ -43,6 +43,37 @@ fn diagnostics_implicit_int_is_rejected() {
     );
 }
 
+/// A stray `;` at file scope is an empty declaration, not a declaration with a
+/// missing type specifier. It reached `check_implicit_int` and was rejected
+/// with a wrong message, which broke any source using a function-like macro
+/// that expands to nothing -- CPython's `_Py_DECLARE_STR()` is one, and this
+/// failed the CPython acceptance build.
+///
+/// C17 6.7p2 does make it a constraint violation, but GCC and Clang accept it
+/// by default and warn only under -pedantic, so accepting it is what real
+/// source expects.
+#[test]
+fn diagnostics_empty_declaration_is_accepted() {
+    for (name, src) in [
+        ("empty_decl_bare", ";\nint main(void){return 0;}\n"),
+        ("empty_decl_repeated", ";;;\nint main(void){return 0;}\n"),
+        (
+            "empty_decl_between_declarations",
+            "int a;\n;\nint b;\nint main(void){return 0;}\n",
+        ),
+        (
+            "empty_decl_from_empty_macro",
+            "#define DECLARE(x)\nDECLARE(thing);\nint main(void){return 0;}\n",
+        ),
+        (
+            "empty_decl_after_function",
+            "int f(void){return 0;};\nint main(void){return f();}\n",
+        ),
+    ] {
+        compile_expect_ok(name, src);
+    }
+}
+
 /// The predicate is subtler than "no base kind was set": `signed`/`unsigned`
 /// name a type while only setting a modifier, and `short`/`long` set the kind.
 /// Everything here must still compile.
@@ -267,6 +298,24 @@ fn diagnostics_atomic_on_array_is_rejected() {
     );
 }
 
+/// The specifier form is not the only way to reach C17 6.7.3p3. The bare
+/// qualifier applied to a typedef that names an array or function type is the
+/// other, and it only set a modifier bit -- so both of these were accepted.
+/// gcc rejects them.
+#[test]
+fn diagnostics_atomic_qualifier_on_array_or_function_typedef_is_rejected() {
+    compile_expect_error(
+        "atomic_typedef_array",
+        "typedef int A[4];\n_Atomic A x;\n",
+        "'_Atomic' cannot be applied to an array type",
+    );
+    compile_expect_error(
+        "atomic_typedef_function",
+        "typedef int F(void);\n_Atomic F f;\n",
+        "'_Atomic' cannot be applied to a function type",
+    );
+}
+
 /// `_Atomic int a[3]` is an array *of* atomic ints, which is legal — the
 /// qualifier lands on the element type, not the array.
 #[test]
@@ -278,6 +327,15 @@ fn diagnostics_atomic_qualified_forms_are_accepted() {
     compile_expect_ok(
         "ok_atomic_array_of",
         "#include <stdatomic.h>\n_Atomic int arr[3];\nint main(void){return 0;}\n",
+    );
+    // A typedef naming an ordinary object type is fine.
+    compile_expect_ok(
+        "ok_atomic_typedef_struct",
+        "typedef struct S{int a;} T;\n_Atomic T t;\nint main(void){return 0;}\n",
+    );
+    compile_expect_ok(
+        "ok_atomic_typedef_int",
+        "typedef int I;\n_Atomic I v;\nint main(void){return 0;}\n",
     );
 }
 
@@ -416,4 +474,80 @@ fn diagnostics_foldable_case_labels_are_accepted() {
         "int f(int x, int y){switch(x){case y: return 1;} return 0;}\n",
         "not an integer constant expression",
     );
+}
+
+// ============================================================================
+// #X3 — `_Generic` constraint violations (C17 6.5.1.1p2)
+// ============================================================================
+
+#[test]
+fn diagnostics_generic_without_a_matching_association_is_rejected() {
+    compile_expect_error(
+        "generic_no_match",
+        "int f(void){ char x=0; return _Generic(x, int:1, long:2); }\n",
+        "not compatible with any association",
+    );
+}
+
+#[test]
+fn diagnostics_generic_duplicate_default_is_rejected() {
+    compile_expect_error(
+        "generic_two_defaults",
+        "int f(void){ return _Generic(1, int:1, default:2, default:3); }\n",
+        "more than one 'default'",
+    );
+}
+
+#[test]
+fn diagnostics_generic_compatible_associations_are_rejected() {
+    compile_expect_error(
+        "generic_dup_type",
+        "int f(void){ return _Generic(1, int:1, int:2); }\n",
+        "two associations with compatible type",
+    );
+    // A typedef names the same type, so it collides too. This only works
+    // because a typedef's TypeId no longer carries the TYPEDEF bit.
+    compile_expect_error(
+        "generic_dup_typedef",
+        "typedef int MyInt; int f(void){ return _Generic(1, int:1, MyInt:2); }\n",
+        "two associations with compatible type",
+    );
+}
+
+/// The negative tests above must not pass by rejecting every `_Generic`.
+///
+/// `int` and `const int` are *not* compatible (C17 6.7.3p10 requires
+/// identically qualified versions), so both may appear -- even though the
+/// `const int` arm can never be selected, since the controlling expression is
+/// lvalue-converted to an unqualified type.
+#[test]
+fn diagnostics_generic_valid_forms_are_accepted() {
+    for (name, src) in [
+        (
+            "generic_basic",
+            "int f(void){ return _Generic(1, int:1, default:0); }\n",
+        ),
+        (
+            "generic_default_only",
+            "int f(void){ return _Generic((void*)0, default:7); }\n",
+        ),
+        (
+            "generic_qualified_sibling",
+            "int f(void){ return _Generic(1, int:1, const int:2); }\n",
+        ),
+        (
+            "generic_no_default_but_matches",
+            "int f(void){ return _Generic(1, int:1, long:2); }\n",
+        ),
+        (
+            "generic_nested",
+            "int f(void){ return _Generic(1.0, double: _Generic(1, int:5, default:0), default:0); }\n",
+        ),
+        (
+            "generic_static_fn_call",
+            "static int g(void){return 1;} int f(void){ return _Generic(g(), int:1, default:0); }\n",
+        ),
+    ] {
+        compile_expect_ok(name, src);
+    }
 }

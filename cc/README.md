@@ -2,7 +2,7 @@
 
 ## Overview
 
-c17 is a C99 compiler with selected C11 features, targeting POSIX.2024 compliance. It supports x86-64 and AArch64 (ARM64) on Linux and macOS.
+c17 is a C17 compiler (ISO/IEC 9899:2018) targeting POSIX.2024 compliance. C17 is a defect-report revision of C11 and adds no features over it, so the language delta tracked below is C11's. It supports x86-64 and AArch64 (ARM64) on Linux and macOS.
 
 References:
 - [ISO/IEC 9899:1999 (C99)](https://www.open-std.org/jtc1/sc22/wg14/www/docs/n1256.pdf) — baseline
@@ -103,11 +103,10 @@ EOF
 
 Supported:
 - C99 standard (see [doc/c99-checklist.md](doc/c99-checklist.md))
-- C11 deltas: `_Atomic` / `<stdatomic.h>`, `_Noreturn`, `_Static_assert`, `_Alignas` / `_Alignof`, `_Thread_local` (Local-Exec and Initial-Exec models), anonymous struct/union members. See [doc/c11-checklist.md](doc/c11-checklist.md) for full delta.
+- C11 deltas: `_Generic`, `_Atomic` / `<stdatomic.h>` (including access through ordinary operators), `<tgmath.h>`, `_Noreturn`, `_Static_assert`, `_Alignas` / `_Alignof`, `_Thread_local` (Local-Exec and Initial-Exec models), anonymous struct/union members, Unicode literals. See [doc/c11-checklist.md](doc/c11-checklist.md) for full delta.
 - GCC-compatible inline assembly: extended asm with constraints, clobbers, named operands, matching constraints, `asm goto` with labels
 
 Not yet implemented (features we want to add):
-- C11 `_Generic` type-generic selection
 - TLS General-Dynamic model (for `_Thread_local` in shared libraries — `__tls_get_addr` path)
 - `-fverbose-asm`
 - assembly peephole optimizations

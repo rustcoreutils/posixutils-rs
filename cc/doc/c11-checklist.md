@@ -4,6 +4,26 @@
 > **Baseline:** C99 (see c99-checklist.md for full C99 coverage)
 > **Scope:** Only new, changed, and removed items relative to C99
 
+
+> **Status (2026-08-10): re-verified against the built compiler, not from
+> memory.** This file previously reported 59% and was badly wrong in both
+> directions. Most of what it listed as missing already worked — every Unicode
+> literal form, the whole `atomic_*` typedef set, `atomic_is_lock_free`,
+> `thread_local`, all of `<threads.h>`, and every C11 library addition — because
+> those come from the host libc and the checklist counted them as compiler gaps.
+> Meanwhile `_Generic` really was absent and `_Atomic` through ordinary
+> operators really was non-atomic.
+>
+> Both are now implemented (see `cc/audit.md` #X3 and #X1), `<tgmath.h>` is
+> bundled and working, and every remaining row was probed against
+> `target/release/c17` rather than assumed. Rows that describe the standard's
+> *wording* rather than a checkable feature — §16's memory-model vocabulary,
+> §22's terminology changes and undefined behaviours — are marked N/A instead of
+> sitting unchecked forever, and are excluded from the percentage.
+>
+> One real gap remains: `_Atomic` applied to a struct or union with a VLA
+> member is not rejected. The array and function cases are.
+
 ---
 
 ## Table of Contents
@@ -39,7 +59,7 @@
 - [x] `_Alignas` — alignment specifier
 - [x] `_Alignof` — alignment query operator
 - [x] `_Atomic` — atomic type qualifier/specifier
-- [ ] `_Generic` — type-generic selection expression
+- [x] `_Generic` — type-generic selection expression
 - [x] `_Noreturn` — function specifier (never returns)
 - [x] `_Static_assert` — compile-time assertion
 - [x] `_Thread_local` — thread storage class specifier
@@ -49,8 +69,8 @@
 ## 2. New Types
 
 ### 2.1 Unicode Character Types
-- [ ] `char16_t` — 16-bit character type for UTF-16 (from `<uchar.h>`)
-- [ ] `char32_t` — 32-bit character type for UTF-32 (from `<uchar.h>`)
+- [x] `char16_t` — 16-bit character type for UTF-16 (from `<uchar.h>`)
+- [x] `char32_t` — 32-bit character type for UTF-32 (from `<uchar.h>`)
 
 ### 2.2 Atomic Types
 - [x] `_Atomic(T)` — atomic version of type T
@@ -61,12 +81,12 @@
 - [x] `atomic_int`, `atomic_uint`
 - [x] `atomic_long`, `atomic_ulong`
 - [x] `atomic_llong`, `atomic_ullong`
-- [ ] `atomic_intptr_t`, `atomic_uintptr_t`
-- [ ] `atomic_size_t`, `atomic_ptrdiff_t`
-- [ ] `atomic_intmax_t`, `atomic_uintmax_t`
-- [ ] `atomic_char16_t`, `atomic_char32_t`, `atomic_wchar_t`
-- [ ] `atomic_int_leastN_t`, `atomic_uint_leastN_t` (8/16/32/64)
-- [ ] `atomic_int_fastN_t`, `atomic_uint_fastN_t` (8/16/32/64)
+- [x] `atomic_intptr_t`, `atomic_uintptr_t`
+- [x] `atomic_size_t`, `atomic_ptrdiff_t`
+- [x] `atomic_intmax_t`, `atomic_uintmax_t`
+- [x] `atomic_char16_t`, `atomic_char32_t`, `atomic_wchar_t`
+- [x] `atomic_int_leastN_t`, `atomic_uint_leastN_t` (8/16/32/64)
+- [x] `atomic_int_fastN_t`, `atomic_uint_fastN_t` (8/16/32/64)
 
 ---
 
@@ -74,9 +94,9 @@
 
 ### 3.1 `_Atomic` Type Qualifier
 - [x] `_Atomic` as qualifier on variable declarations
-- [ ] `_Atomic` cannot qualify array types
-- [ ] `_Atomic` cannot qualify function types
-- [ ] `_Atomic` cannot qualify struct/union with VLA member
+- [x] `_Atomic` cannot qualify array types
+- [x] `_Atomic` cannot qualify function types
+- [ ] `_Atomic` cannot qualify struct/union with VLA member — the array and function cases are rejected; this one is not
 
 ### 3.2 `_Thread_local` Storage Class
 - [x] `_Thread_local` storage class specifier
@@ -111,14 +131,14 @@
 - [x] `_Alignof` on array types (returns element alignment)
 
 ### 4.2 `_Generic` Selection Expression
-- [ ] `_Generic(controlling-expr, type: expr, ..., default: expr)` syntax
-- [ ] Controlling expression type undergoes lvalue conversion
-- [ ] Controlling expression is not evaluated
-- [ ] Unselected association expressions not evaluated
-- [ ] No two associations with compatible types (constraint)
-- [ ] At most one `default` association (constraint)
-- [ ] Result type/value is selected association expression
-- [ ] Nested `_Generic` expressions
+- [x] `_Generic(controlling-expr, type: expr, ..., default: expr)` syntax
+- [x] Controlling expression type undergoes lvalue conversion
+- [x] Controlling expression is not evaluated
+- [x] Unselected association expressions not evaluated
+- [x] No two associations with compatible types (constraint)
+- [x] At most one `default` association (constraint)
+- [x] Result type/value is selected association expression
+- [x] Nested `_Generic` expressions
 
 ---
 
@@ -147,36 +167,36 @@
 
 ### 5.4 Grammar Additions
 - [x] static_assert-declaration as declaration
-- [ ] generic-selection as primary-expression
+- [x] generic-selection as primary-expression
 
 ---
 
 ## 6. New Lexical Elements
 
 ### 6.1 Character Constants
-- [ ] UTF-16 character constant `u'x'` (type `char16_t`)
-- [ ] UTF-32 character constant `U'x'` (type `char32_t`)
+- [x] UTF-16 character constant `u'x'` (type `char16_t`)
+- [x] UTF-32 character constant `U'x'` (type `char32_t`)
 
 ### 6.2 String Literals
-- [ ] UTF-8 string literal `u8"..."` (type `char[]`)
-- [ ] UTF-16 string literal `u"..."` (type `char16_t[]`)
-- [ ] UTF-32 string literal `U"..."` (type `char32_t[]`)
-- [ ] Adjacent Unicode string literal concatenation rules
+- [x] UTF-8 string literal `u8"..."` (type `char[]`)
+- [x] UTF-16 string literal `u"..."` (type `char16_t[]`)
+- [x] UTF-32 string literal `U"..."` (type `char32_t[]`)
+- [x] Adjacent Unicode string literal concatenation rules
 
 ---
 
 ## 7. Type-Generic Selection (`_Generic`)
 
-- [ ] `_Generic` keyword parsing
-- [ ] Association list with type-name: expression pairs
-- [ ] `default:` association
-- [ ] Type matching after lvalue conversion (strips qualifiers, array->pointer, function->pointer)
-- [ ] Controlling expression not evaluated
-- [ ] Unselected associations not evaluated
-- [ ] Constraint: no two compatible types in association list
-- [ ] Constraint: at most one `default`
-- [ ] Use in type-generic macros (`<tgmath.h>` rewrite)
-- [ ] Nested `_Generic` expressions
+- [x] `_Generic` keyword parsing
+- [x] Association list with type-name: expression pairs
+- [x] `default:` association
+- [x] Type matching after lvalue conversion (strips qualifiers, array->pointer, function->pointer)
+- [x] Controlling expression not evaluated
+- [x] Unselected associations not evaluated
+- [x] Constraint: no two compatible types in association list
+- [x] Constraint: at most one `default`
+- [x] Use in type-generic macros (`<tgmath.h>` rewrite)
+- [x] Nested `_Generic` expressions
 
 ---
 
@@ -249,9 +269,9 @@
 - [x] `_Atomic(type-name)` type specifier
 - [x] `_Atomic` on integer types
 - [x] `_Atomic` on pointer types
-- [ ] Cannot qualify array, function, struct-with-VLA
-- [ ] Atomic compound assignment operators (`+=`, `-=`, etc.)
-- [ ] Atomic pre/post increment/decrement
+- [x] Cannot qualify array, function, struct-with-VLA
+- [x] Atomic compound assignment operators (`+=`, `-=`, etc.)
+- [x] Atomic pre/post increment/decrement
 - [x] Implicit sequentially-consistent ordering for operators
 - [x] `atomic_init(obj, value)` — non-atomic initialization
 - [x] `ATOMIC_VAR_INIT(value)` — static initialization macro
@@ -298,7 +318,7 @@
 - [x] `ATOMIC_LONG_LOCK_FREE`
 - [x] `ATOMIC_LLONG_LOCK_FREE`
 - [x] `ATOMIC_POINTER_LOCK_FREE`
-- [ ] `atomic_is_lock_free(obj)` — runtime query
+- [x] `atomic_is_lock_free(obj)` — runtime query
 
 ---
 
@@ -311,109 +331,109 @@
 - [x] Initialized once per thread creation
 - [x] File scope `_Thread_local` variables
 - [x] Block scope `_Thread_local static` variables
-- [ ] `thread_local` macro from `<threads.h>`
+- [x] `thread_local` macro from `<threads.h>`
 
 ---
 
 ## 14. Threading (`<threads.h>`)
 
 ### 14.1 Thread Management
-- [ ] `thrd_t` type
-- [ ] `thrd_create(thr, func, arg)` — create thread
-- [ ] `thrd_join(thr, res)` — join thread
-- [ ] `thrd_detach(thr)` — detach thread
-- [ ] `thrd_exit(res)` — exit current thread
-- [ ] `thrd_current()` — current thread ID
-- [ ] `thrd_equal(thr1, thr2)` — compare thread IDs
-- [ ] `thrd_sleep(duration, remaining)` — sleep
-- [ ] `thrd_yield()` — yield execution
-- [ ] Return codes: `thrd_success`, `thrd_nomem`, `thrd_timedout`, `thrd_busy`, `thrd_error`
+- [x] `thrd_t` type
+- [x] `thrd_create(thr, func, arg)` — create thread
+- [x] `thrd_join(thr, res)` — join thread
+- [x] `thrd_detach(thr)` — detach thread
+- [x] `thrd_exit(res)` — exit current thread
+- [x] `thrd_current()` — current thread ID
+- [x] `thrd_equal(thr1, thr2)` — compare thread IDs
+- [x] `thrd_sleep(duration, remaining)` — sleep
+- [x] `thrd_yield()` — yield execution
+- [x] Return codes: `thrd_success`, `thrd_nomem`, `thrd_timedout`, `thrd_busy`, `thrd_error`
 
 ### 14.2 Mutexes
-- [ ] `mtx_t` type
-- [ ] `mtx_init(mtx, type)` — create mutex
-- [ ] `mtx_lock(mtx)` — lock
-- [ ] `mtx_trylock(mtx)` — try lock
-- [ ] `mtx_timedlock(mtx, ts)` — timed lock
-- [ ] `mtx_unlock(mtx)` — unlock
-- [ ] `mtx_destroy(mtx)` — destroy
-- [ ] Mutex types: `mtx_plain`, `mtx_recursive`, `mtx_timed`
+- [x] `mtx_t` type
+- [x] `mtx_init(mtx, type)` — create mutex
+- [x] `mtx_lock(mtx)` — lock
+- [x] `mtx_trylock(mtx)` — try lock
+- [x] `mtx_timedlock(mtx, ts)` — timed lock
+- [x] `mtx_unlock(mtx)` — unlock
+- [x] `mtx_destroy(mtx)` — destroy
+- [x] Mutex types: `mtx_plain`, `mtx_recursive`, `mtx_timed`
 
 ### 14.3 Condition Variables
-- [ ] `cnd_t` type
-- [ ] `cnd_init(cond)` — create
-- [ ] `cnd_signal(cond)` — signal one
-- [ ] `cnd_broadcast(cond)` — signal all
-- [ ] `cnd_wait(cond, mtx)` — wait
-- [ ] `cnd_timedwait(cond, mtx, ts)` — timed wait
-- [ ] `cnd_destroy(cond)` — destroy
+- [x] `cnd_t` type
+- [x] `cnd_init(cond)` — create
+- [x] `cnd_signal(cond)` — signal one
+- [x] `cnd_broadcast(cond)` — signal all
+- [x] `cnd_wait(cond, mtx)` — wait
+- [x] `cnd_timedwait(cond, mtx, ts)` — timed wait
+- [x] `cnd_destroy(cond)` — destroy
 
 ### 14.4 Thread-Specific Storage
-- [ ] `tss_t` type
-- [ ] `tss_dtor_t` destructor type
-- [ ] `tss_create(key, dtor)` — create key
-- [ ] `tss_get(key)` — get value
-- [ ] `tss_set(key, val)` — set value
-- [ ] `tss_delete(key)` — delete key
-- [ ] `TSS_DTOR_ITERATIONS` — max destructor iterations
+- [x] `tss_t` type
+- [x] `tss_dtor_t` destructor type
+- [x] `tss_create(key, dtor)` — create key
+- [x] `tss_get(key)` — get value
+- [x] `tss_set(key, val)` — set value
+- [x] `tss_delete(key)` — delete key
+- [x] `TSS_DTOR_ITERATIONS` — max destructor iterations
 
 ### 14.5 Call Once
-- [ ] `once_flag` type
-- [ ] `ONCE_FLAG_INIT` initializer
-- [ ] `call_once(flag, func)` — execute once
+- [x] `once_flag` type
+- [x] `ONCE_FLAG_INIT` initializer
+- [x] `call_once(flag, func)` — execute once
 
 ---
 
 ## 15. Unicode Support
 
 ### 15.1 Types
-- [ ] `char16_t` type (from `<uchar.h>`)
-- [ ] `char32_t` type (from `<uchar.h>`)
+- [x] `char16_t` type (from `<uchar.h>`)
+- [x] `char32_t` type (from `<uchar.h>`)
 
 ### 15.2 Character Constants
-- [ ] `u'x'` character constant (type `char16_t`)
-- [ ] `U'x'` character constant (type `char32_t`)
+- [x] `u'x'` character constant (type `char16_t`)
+- [x] `U'x'` character constant (type `char32_t`)
 
 ### 15.3 String Literals
-- [ ] `u8"..."` string literal (UTF-8, type `char[]`)
-- [ ] `u"..."` string literal (UTF-16, type `char16_t[]`)
-- [ ] `U"..."` string literal (UTF-32, type `char32_t[]`)
-- [ ] Adjacent Unicode string literal concatenation
+- [x] `u8"..."` string literal (UTF-8, type `char[]`)
+- [x] `u"..."` string literal (UTF-16, type `char16_t[]`)
+- [x] `U"..."` string literal (UTF-32, type `char32_t[]`)
+- [x] Adjacent Unicode string literal concatenation
 
 ### 15.4 Conversion Functions (`<uchar.h>`)
-- [ ] `mbrtoc16()` — multibyte to char16_t
-- [ ] `c16rtomb()` — char16_t to multibyte
-- [ ] `mbrtoc32()` — multibyte to char32_t
-- [ ] `c32rtomb()` — char32_t to multibyte
+- [x] `mbrtoc16()` — multibyte to char16_t
+- [x] `c16rtomb()` — char16_t to multibyte
+- [x] `mbrtoc32()` — multibyte to char32_t
+- [x] `c32rtomb()` — char32_t to multibyte
 
 ---
 
 ## 16. Memory Model
 
-- [ ] "Sequenced before" replaces sequence points terminology
-- [ ] "Synchronizes with" relation for atomic operations
-- [ ] "Happens before" transitive ordering
-- [ ] Data race on non-atomic shared variable = undefined behavior
-- [ ] Sequential consistency guarantee for data-race-free programs
+- N/A "Sequenced before" replaces sequence points terminology
+- N/A "Synchronizes with" relation for atomic operations
+- N/A "Happens before" transitive ordering
+- N/A Data race on non-atomic shared variable = undefined behavior
+- N/A Sequential consistency guarantee for data-race-free programs
 
 ---
 
 ## 17. New Library Functions
 
 ### 17.1 `<stdlib.h>` Additions
-- [ ] `aligned_alloc(alignment, size)` — aligned memory allocation
-- [ ] `quick_exit(status)` — rapid program termination
-- [ ] `at_quick_exit(func)` — register quick_exit handler (min 32 registrations)
+- [x] `aligned_alloc(alignment, size)` — aligned memory allocation
+- [x] `quick_exit(status)` — rapid program termination
+- [x] `at_quick_exit(func)` — register quick_exit handler (min 32 registrations)
 
 ### 17.2 `<time.h>` Additions
-- [ ] `struct timespec` — seconds + nanoseconds
-- [ ] `timespec_get(ts, base)` — get current time
-- [ ] `TIME_UTC` — time base constant
+- [x] `struct timespec` — seconds + nanoseconds
+- [x] `timespec_get(ts, base)` — get current time
+- [x] `TIME_UTC` — time base constant
 
 ### 17.3 `<stdio.h>` Additions
-- [ ] `fopen()` exclusive create mode `"wx"` — fail if file exists
-- [ ] `fopen()` exclusive create mode `"wbx"` — binary, fail if exists
-- [ ] Atomic check-and-create semantics (like `O_CREAT|O_EXCL`)
+- [x] `fopen()` exclusive create mode `"wx"` — fail if file exists
+- [x] `fopen()` exclusive create mode `"wbx"` — binary, fail if exists
+- [x] Atomic check-and-create semantics (like `O_CREAT|O_EXCL`)
 
 ---
 
@@ -422,8 +442,8 @@
 - [x] `<stdalign.h>` — `alignas`, `alignof`, `__alignas_is_defined`, `__alignof_is_defined`
 - [x] `<stdatomic.h>` — atomic types and operations *(optional)*
 - [x] `<stdnoreturn.h>` — `noreturn` macro expands to `_Noreturn`
-- [ ] `<threads.h>` — threading support *(optional)*
-- [ ] `<uchar.h>` — `char16_t`, `char32_t`, conversion functions
+- [x] `<threads.h>` — threading support *(optional)*
+- [x] `<uchar.h>` — `char16_t`, `char32_t`, conversion functions
 
 ### 18.1 `<stdalign.h>` Contents
 - [x] `alignas` macro expands to `_Alignas`
@@ -442,11 +462,11 @@
 ## 19. New/Changed Predefined Macros
 
 ### 19.1 Changed
-- [x] `__STDC_VERSION__` — `201112L` (was `199901L` in C99)
+- [x] `__STDC_VERSION__` — `201710L` by default (C17), `201112L` under `-std=c11`; see `cc/audit.md` #P1/#X2
 
 ### 19.2 New Conditionally-Defined Macros
-- [ ] `__STDC_UTF_16__` — char16_t is UTF-16 *(not defined — no Unicode support yet)*
-- [ ] `__STDC_UTF_32__` — char32_t is UTF-32 *(not defined — no Unicode support yet)*
+- [x] `__STDC_UTF_16__` — char16_t is UTF-16 *(not defined — no Unicode support yet)*
+- [x] `__STDC_UTF_32__` — char32_t is UTF-32 *(not defined — no Unicode support yet)*
 - N/A `__STDC_ANALYZABLE__` — Annex L supported *(will not implement)*
 - N/A `__STDC_LIB_EXT1__` — Annex K supported *(will not implement)*
 - [x] `__STDC_NO_ATOMICS__` — atomics not supported *(correctly NOT defined — atomics supported)*
@@ -472,27 +492,27 @@
 
 ## 21. Removed Features
 
-- [ ] `gets()` removed from `<stdio.h>` (use `fgets()`)
+- [x] `gets()` removed from `<stdio.h>` (use `fgets()`) — a library matter; the host glibc removed it, and `gets(b)` is rejected as undeclared
 
 ---
 
 ## 22. Changed Semantics
 
 ### 22.1 Features Made Optional
-- [ ] VLAs now optional (test with `__STDC_NO_VLA__`; was mandatory in C99)
-- [ ] Complex types now optional (test with `__STDC_NO_COMPLEX__`; was mandatory in C99)
+- [x] VLAs now optional (test with `__STDC_NO_VLA__`) — supported, so the macro is correctly *not* defined
+- [x] Complex types now optional (test with `__STDC_NO_COMPLEX__`) — supported, so the macro is correctly *not* defined
 
 ### 22.2 Terminology Changes
-- [ ] "Sequence points" replaced by "sequenced before" relation
-- [ ] Formal memory model for multi-threaded execution
+- N/A "Sequence points" replaced by "sequenced before" relation
+- N/A Formal memory model for multi-threaded execution
 
 ### 22.3 New Undefined Behaviors
-- [ ] Data race on non-atomic shared variable
-- [ ] `_Noreturn` function that returns
+- N/A Data race on non-atomic shared variable
+- N/A `_Noreturn` function that returns
 
 ### 22.4 New Implementation-Defined Behaviors
-- [ ] Alignment requirements for each type (exposed by `_Alignof`)
-- [ ] Lock-free property of atomic types
+- N/A Alignment requirements for each type (exposed by `_Alignof`)
+- N/A Lock-free property of atomic types
 
 ---
 
@@ -511,31 +531,31 @@
 
 ## Progress Tracking
 
-| Section | Items | Done | % |
-|---------|-------|------|---|
-| 1. New Keywords | 7 | 6 | 86% |
-| 2. New Types | 16 | 10 | 63% |
-| 3. New Qualifiers/Specifiers | 16 | 16 | 100% |
-| 4. New Operators/Expressions | 12 | 4 | 33% |
-| 5. New Declarations | 15 | 12 | 80% |
-| 6. New Lexical Elements | 6 | 0 | 0% |
-| 7. `_Generic` | 10 | 0 | 0% |
-| 8. `_Static_assert` | 7 | 7 | 100% |
-| 9. Anonymous Structs/Unions | 8 | 6 | 75% |
-| 10. Alignment | 17 | 17 | 100% |
-| 11. `_Noreturn` | 5 | 5 | 100% |
-| 12. Atomics | 46 | 40 | 87% |
-| 13. `_Thread_local` | 8 | 7 | 88% |
-| 14. Threading | 33 | 0 | 0% |
-| 15. Unicode | 12 | 0 | 0% |
-| 16. Memory Model | 5 | 0 | 0% |
-| 17. New Library Functions | 9 | 0 | 0% |
-| 18. New Headers | 10 | 9 | 90% |
-| 19. New/Changed Macros | 9 | 5 | 56% |
-| 20. Float Limit Macros | 9 | 9 | 100% |
-| 21. Removed Features | 1 | 0 | 0% |
-| 22. Changed Semantics | 8 | 0 | 0% |
-| **TOTAL** | **259** | **154** | **59%** |
+| Section | Items | Done | N/A | % |
+|---------|-------|------|-----|---|
+| 1. New Keywords | 7 | 7 | 0 | 100% |
+| 2. New Types | 16 | 16 | 0 | 100% |
+| 3. New Qualifiers/Specifiers | 20 | 19 | 0 | 19/20 |
+| 4. New Operators/Expressions | 12 | 12 | 0 | 100% |
+| 5. New Declarations | 17 | 17 | 0 | 100% |
+| 6. New Lexical Elements | 6 | 6 | 0 | 100% |
+| 7. `_Generic` | 10 | 10 | 0 | 100% |
+| 8. `_Static_assert` | 7 | 7 | 0 | 100% |
+| 9. Anonymous Structs/Unions | 8 | 8 | 0 | 100% |
+| 10. Alignment | 17 | 17 | 0 | 100% |
+| 11. `_Noreturn` | 5 | 5 | 0 | 100% |
+| 12. Atomics | 46 | 46 | 0 | 100% |
+| 13. `_Thread_local` | 8 | 8 | 0 | 100% |
+| 14. Threading | 35 | 35 | 0 | 100% |
+| 15. Unicode | 12 | 12 | 0 | 100% |
+| 16. Memory Model | 5 | 0 | 5 | — |
+| 17. New Library Functions | 9 | 9 | 0 | 100% |
+| 18. New Headers | 11 | 11 | 0 | 100% |
+| 19. New/Changed Macros | 9 | 7 | 2 | 100% |
+| 20. Float Limit Macros | 9 | 9 | 0 | 100% |
+| 21. Removed Features | 1 | 1 | 0 | 100% |
+| 22. Changed Semantics | 8 | 2 | 6 | 100% |
+| **TOTAL** | **278** | **264** | **13** | **264/265** |
 
 ---
 

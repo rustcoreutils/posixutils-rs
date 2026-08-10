@@ -777,12 +777,50 @@ pub fn get_constraint_info_aarch64(insn: &Instruction) -> Option<(Vec<Reg>, Vec<
     if let Some(t) = insn.target {
         involved.push(t);
     }
-    involved.extend(insn.src.iter().copied());
+    // The atomic emitters keep their source values live across the writes to
+    // their fixed scratch registers, so unlike the other opcodes here their
+    // sources are not exempt from the clobber set.
+    if !insn.op.is_atomic() {
+        involved.extend(insn.src.iter().copied());
+    }
     let mut clobbers: Vec<Reg> = AARCH64_SCRATCH_REGS.to_vec();
+    // The atomic emitters additionally use X0/X1/X2 (and X8 for the store-
+    // exclusive status) as fixed scratch. Those *are* in Reg::allocatable(),
+    // so without declaring them a live pseudo the allocator placed there is
+    // destroyed by any atomic operation its range crosses.
+    if insn.op.is_atomic() {
+        clobbers.extend([Reg::X0, Reg::X1, Reg::X2, Reg::X8]);
+    }
     clobbers.sort();
     clobbers.dedup();
 
     Some((clobbers, involved))
+}
+
+/// Bytes a spilled floating-point pseudo needs on the stack.
+///
+/// Every FP spill used a hardcoded 8. That is right for a float or a double and
+/// wrong for IEEE binary128, which is 16 bytes and 16-byte aligned: the two
+/// halves of a `long double _Complex` were handed slots 8 bytes apart and then
+/// written with `str q`, so they overlapped, and the resulting offsets were not
+/// multiples of 16 either -- which the assembler rejects outright for `ldr q`
+/// ("immediate offset out of range").
+///
+/// The defining instruction carries the width, exactly as the `FVal` case above
+/// reads it for an immediate.
+fn fp_pseudo_bytes(func: &Function, pseudo: PseudoId) -> i32 {
+    let bits = func
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insns)
+        .find(|insn| insn.target == Some(pseudo))
+        .map(|insn| insn.size)
+        .unwrap_or(64);
+    if bits > 64 {
+        16
+    } else {
+        8
+    }
 }
 
 /// AArch64 codegen scratch registers covered by the C5
@@ -1138,6 +1176,7 @@ impl RegAlloc {
                     let elem_bytes = match base {
                         HfaBase::Float32 => 4,
                         HfaBase::Float64 => 8,
+                        HfaBase::Float128 => 16,
                     };
                     if fp_arg_idx + count <= fp_arg_regs.len() {
                         self.locations
@@ -1485,7 +1524,8 @@ impl RegAlloc {
                 let crosses_call = interval_crosses_call(interval, call_positions);
                 let crosses_block = self.live_out.iter().any(|lo| lo.contains(&interval.pseudo));
                 if crosses_call || crosses_block {
-                    self.alloc_stack_slot(interval, 8, 8, true);
+                    let bytes = fp_pseudo_bytes(func, interval.pseudo);
+                    self.alloc_stack_slot(interval, bytes, bytes, true);
                     continue;
                 }
                 vreg_candidates.insert(interval.pseudo);
@@ -1764,7 +1804,8 @@ impl RegAlloc {
                 start,
             );
             if let Some(interval) = Self::interval_by_pseudo(intervals, spilled) {
-                self.alloc_stack_slot(interval, 8, 8, true);
+                let bytes = fp_pseudo_bytes(func, interval.pseudo);
+                self.alloc_stack_slot(interval, bytes, bytes, true);
             }
         }
     }
@@ -1830,7 +1871,8 @@ impl RegAlloc {
                 start,
             );
             if let Some(interval) = Self::interval_by_pseudo(intervals, spilled) {
-                self.alloc_stack_slot(interval, 8, 8, true);
+                let bytes = fp_pseudo_bytes(func, interval.pseudo);
+                self.alloc_stack_slot(interval, bytes, bytes, true);
             }
         }
     }

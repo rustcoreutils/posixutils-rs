@@ -11,6 +11,8 @@
 // Tests for register allocation, inline assembly, PIC, optimization, and debug info.
 //
 
+pub mod asm_probe;
+mod atomics_asm;
 mod cross_abi;
 mod determinism;
 mod inline_asm;

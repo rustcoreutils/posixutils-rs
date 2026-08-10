@@ -2398,10 +2398,12 @@ impl<'a> Linearizer<'a> {
                 let elem_type = self.types.base_type(arg_type).unwrap_or(self.types.int_id);
                 arg_types_vec.push(self.types.pointer_to(elem_type));
                 self.linearize_expr(a)
-            } else if arg_kind == TypeKind::VaList {
+            } else if arg_kind == TypeKind::VaList && !self.types.va_list_is_pointer() {
                 // va_list decay to pointer (C99 7.15.1)
                 // va_list is defined as __va_list_tag[1] (an array), so it decays to
-                // a pointer when passed to a function taking va_list parameter
+                // a pointer when passed to a function taking va_list parameter.
+                // Where va_list is already a pointer there is nothing to decay, and
+                // the ordinary scalar path below passes it by value.
                 arg_types_vec.push(self.types.pointer_to(arg_type));
                 self.linearize_lvalue(a)
             } else if arg_kind == TypeKind::Function {
@@ -2446,18 +2448,34 @@ impl<'a> Linearizer<'a> {
                     }
                 }
 
-                // C99 6.5.2.2p7: Default argument promotions for variadic args.
-                // float/_Float16 are promoted to double; integer promotions
-                // also apply (already handled above for integers).
+                // C99 6.5.2.2p7: default argument promotions for variadic args.
+                //
+                // Both halves have to happen here. The formal-parameter
+                // conversion above is guarded by `arg_idx < params.len()`, and
+                // a variadic argument is by definition at or past that bound,
+                // so it never runs for these -- an earlier comment claimed
+                // integers were "already handled above", which was false and is
+                // what left `printf("%02x", (unsigned char)c)` printing
+                // ffffff80 for a negative `signed char` (audit #C5). The cast
+                // itself emits no IR, because emit_convert short-circuits
+                // same-size integer conversions, so without an explicit
+                // promotion the pseudo still holds the sign-extended load.
                 if let Some(va_start) = variadic_arg_start {
-                    if arg_idx >= va_start
-                        && matches!(
-                            self.types.kind(arg_type),
-                            TypeKind::Float | TypeKind::Float16
-                        )
-                    {
-                        val = self.emit_convert(val, arg_type, self.types.double_id);
-                        arg_type = self.types.double_id;
+                    if arg_idx >= va_start {
+                        let promoted = match self.types.kind(arg_type) {
+                            // float and _Float16 promote to double.
+                            TypeKind::Float | TypeKind::Float16 => Some(self.types.double_id),
+                            // _Bool, char and short promote to int.
+                            _ => {
+                                let promoted = self.integer_promote(arg_type);
+                                (promoted != arg_type).then_some(promoted)
+                            }
+                        };
+
+                        if let Some(promoted) = promoted {
+                            val = self.emit_convert(val, arg_type, promoted);
+                            arg_type = promoted;
+                        }
                     }
                 }
 
@@ -2559,6 +2577,12 @@ impl<'a> Linearizer<'a> {
 
     /// Linearize a post-increment or post-decrement expression
     pub(crate) fn linearize_postop(&mut self, operand: &Expr, is_inc: bool) -> PseudoId {
+        // `x++` on an atomic object is one read-modify-write, and its value is
+        // the value *before* the operation -- exactly what fetch-add returns.
+        if let Some(result) = self.try_emit_atomic_incdec(operand, is_inc, false) {
+            return result;
+        }
+
         let val = self.linearize_expr(operand);
         let typ = self.expr_type(operand);
         let is_float = self.types.is_float(typ);
@@ -2897,6 +2921,13 @@ impl<'a> Linearizer<'a> {
 
         // Handle PreInc/PreDec specially - they need store-back
         if op == UnaryOp::PreInc || op == UnaryOp::PreDec {
+            // On an atomic object this is one read-modify-write whose value is
+            // the *new* one (C17 6.5.3.1p2 defines ++E as E += 1).
+            if let Some(result) = self.try_emit_atomic_incdec(operand, op == UnaryOp::PreInc, true)
+            {
+                return result;
+            }
+
             // For deref operands like *s++, compute the lvalue address once
             // to avoid re-evaluating side effects (PostInc etc.) when storing back.
             let deref_addr = if let ExprKind::Unary {
@@ -3177,9 +3208,10 @@ impl<'a> Linearizer<'a> {
                 let elem_type = self.types.base_type(local.typ).unwrap_or(self.types.int_id);
                 let ptr_type = self.types.pointer_to(elem_type);
                 self.emit(Instruction::sym_addr(result, local.sym, ptr_type));
-            } else if type_kind == TypeKind::VaList {
+            } else if type_kind == TypeKind::VaList && !self.types.va_list_is_pointer() {
                 // va_list is defined as __va_list_tag[1] (an array type), so it decays to
-                // a pointer when used in expressions (C99 6.3.2.1, 7.15.1)
+                // a pointer when used in expressions (C99 6.3.2.1, 7.15.1). A target
+                // whose va_list is itself a pointer falls through to the scalar load.
                 if local.is_indirect {
                     // va_list parameter: local holds a pointer to the va_list struct
                     // Load the pointer value (array decay already happened at call site)
@@ -3240,7 +3272,7 @@ impl<'a> Linearizer<'a> {
             // Functions decay to function pointers, va_list decays to pointer (C99 6.3.2.1, 7.15.1),
             // and large structs can't be loaded into registers - for all cases, return the address
             else if type_kind == TypeKind::Function
-                || type_kind == TypeKind::VaList
+                || (type_kind == TypeKind::VaList && !self.types.va_list_is_pointer())
                 || ((type_kind == TypeKind::Struct || type_kind == TypeKind::Union) && size > 64)
             {
                 let result = self.alloc_pseudo();
@@ -3860,91 +3892,69 @@ impl<'a> Linearizer<'a> {
         }
     }
 
+    /// Build one `__c11_atomic_*` builtin from its already-parsed operands.
+    ///
+    /// Every builtin except the compare-exchange pair and the fences has the
+    /// same shape: linearize the pointer, take the pointee's type and width,
+    /// and emit `op [ptr, value?, order]`. Eleven hand-written copies of that
+    /// is how the operand convention drifted out of the linearizer's reach in
+    /// the first place -- `AsmConstraint::is_memory` had the same problem.
+    fn emit_c11_atomic_builtin(
+        &mut self,
+        op: Opcode,
+        ptr: &Expr,
+        val: Option<&Expr>,
+        order: Option<&Expr>,
+    ) -> PseudoId {
+        let ptr_val = self.linearize_expr(ptr);
+        let value = val.map(|v| self.linearize_expr(v));
+
+        // `atomic_init` carries no order argument: it is a non-atomic store,
+        // so it is emitted as a relaxed one.
+        let (order_val, memory_order) = match order {
+            Some(o) => (self.linearize_expr(o), self.eval_memory_order(o)),
+            None => (
+                self.emit_const(MemoryOrder::Relaxed as i128, self.types.int_id),
+                MemoryOrder::Relaxed,
+            ),
+        };
+
+        let ptr_type = self.expr_type(ptr);
+        let elem_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
+        let size = self.types.size_bits(elem_type);
+        let result = self.alloc_pseudo();
+
+        let mut insn = Instruction::new(op).with_target(result).with_src(ptr_val);
+        if let Some(v) = value {
+            insn = insn.with_src(v);
+        }
+        insn = insn
+            .with_src(order_val)
+            .with_type_and_size(elem_type, size)
+            .with_memory_order(memory_order);
+        self.emit(insn);
+        result
+    }
+
     pub(crate) fn linearize_c11_atomic(&mut self, expr: &Expr) -> PseudoId {
         match &expr.kind {
             // ================================================================
             // Atomic builtins (Clang __c11_atomic_* for C11 stdatomic.h)
             // ================================================================
             ExprKind::C11AtomicInit { ptr, val } => {
-                // atomic_init is a non-atomic store (no memory ordering)
-                let ptr_val = self.linearize_expr(ptr);
-                let value = self.linearize_expr(val);
-                let ptr_type = self.expr_type(ptr);
-                let elem_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
-                let size = self.types.size_bits(elem_type);
-                let result = self.alloc_pseudo();
-
-                // Use AtomicStore with Relaxed ordering for init
-                let insn = Instruction::new(Opcode::AtomicStore)
-                    .with_target(result)
-                    .with_src(ptr_val)
-                    .with_src(value)
-                    .with_src(self.emit_const(0, self.types.int_id)) // Relaxed = 0
-                    .with_type_and_size(elem_type, size)
-                    .with_memory_order(MemoryOrder::Relaxed);
-                self.emit(insn);
-                result
+                self.emit_c11_atomic_builtin(Opcode::AtomicStore, ptr, Some(val), None)
             }
 
             ExprKind::C11AtomicLoad { ptr, order } => {
-                let ptr_val = self.linearize_expr(ptr);
-                let order_val = self.linearize_expr(order);
-                let memory_order = self.eval_memory_order(order);
-                let ptr_type = self.expr_type(ptr);
-                let result_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
-                let size = self.types.size_bits(result_type);
-                let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::AtomicLoad)
-                    .with_target(result)
-                    .with_src(ptr_val)
-                    .with_src(order_val)
-                    .with_type_and_size(result_type, size)
-                    .with_memory_order(memory_order);
-                self.emit(insn);
-                result
+                self.emit_c11_atomic_builtin(Opcode::AtomicLoad, ptr, None, Some(order))
             }
 
             ExprKind::C11AtomicStore { ptr, val, order } => {
-                let ptr_val = self.linearize_expr(ptr);
-                let value = self.linearize_expr(val);
-                let order_val = self.linearize_expr(order);
-                let memory_order = self.eval_memory_order(order);
-                let ptr_type = self.expr_type(ptr);
-                let elem_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
-                let size = self.types.size_bits(elem_type);
-                let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::AtomicStore)
-                    .with_target(result)
-                    .with_src(ptr_val)
-                    .with_src(value)
-                    .with_src(order_val)
-                    .with_type_and_size(elem_type, size)
-                    .with_memory_order(memory_order);
-                self.emit(insn);
-                result
+                self.emit_c11_atomic_builtin(Opcode::AtomicStore, ptr, Some(val), Some(order))
             }
 
             ExprKind::C11AtomicExchange { ptr, val, order } => {
-                let ptr_val = self.linearize_expr(ptr);
-                let value = self.linearize_expr(val);
-                let order_val = self.linearize_expr(order);
-                let memory_order = self.eval_memory_order(order);
-                let ptr_type = self.expr_type(ptr);
-                let result_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
-                let size = self.types.size_bits(result_type);
-                let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::AtomicSwap)
-                    .with_target(result)
-                    .with_src(ptr_val)
-                    .with_src(value)
-                    .with_src(order_val)
-                    .with_type_and_size(result_type, size)
-                    .with_memory_order(memory_order);
-                self.emit(insn);
-                result
+                self.emit_c11_atomic_builtin(Opcode::AtomicSwap, ptr, Some(val), Some(order))
             }
 
             ExprKind::C11AtomicCompareExchangeStrong {
@@ -3985,108 +3995,23 @@ impl<'a> Linearizer<'a> {
             }
 
             ExprKind::C11AtomicFetchAdd { ptr, val, order } => {
-                let ptr_val = self.linearize_expr(ptr);
-                let value = self.linearize_expr(val);
-                let order_val = self.linearize_expr(order);
-                let memory_order = self.eval_memory_order(order);
-                let ptr_type = self.expr_type(ptr);
-                let result_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
-                let size = self.types.size_bits(result_type);
-                let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::AtomicFetchAdd)
-                    .with_target(result)
-                    .with_src(ptr_val)
-                    .with_src(value)
-                    .with_src(order_val)
-                    .with_type_and_size(result_type, size)
-                    .with_memory_order(memory_order);
-                self.emit(insn);
-                result
+                self.emit_c11_atomic_builtin(Opcode::AtomicFetchAdd, ptr, Some(val), Some(order))
             }
 
             ExprKind::C11AtomicFetchSub { ptr, val, order } => {
-                let ptr_val = self.linearize_expr(ptr);
-                let value = self.linearize_expr(val);
-                let order_val = self.linearize_expr(order);
-                let memory_order = self.eval_memory_order(order);
-                let ptr_type = self.expr_type(ptr);
-                let result_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
-                let size = self.types.size_bits(result_type);
-                let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::AtomicFetchSub)
-                    .with_target(result)
-                    .with_src(ptr_val)
-                    .with_src(value)
-                    .with_src(order_val)
-                    .with_type_and_size(result_type, size)
-                    .with_memory_order(memory_order);
-                self.emit(insn);
-                result
+                self.emit_c11_atomic_builtin(Opcode::AtomicFetchSub, ptr, Some(val), Some(order))
             }
 
             ExprKind::C11AtomicFetchAnd { ptr, val, order } => {
-                let ptr_val = self.linearize_expr(ptr);
-                let value = self.linearize_expr(val);
-                let order_val = self.linearize_expr(order);
-                let memory_order = self.eval_memory_order(order);
-                let ptr_type = self.expr_type(ptr);
-                let result_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
-                let size = self.types.size_bits(result_type);
-                let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::AtomicFetchAnd)
-                    .with_target(result)
-                    .with_src(ptr_val)
-                    .with_src(value)
-                    .with_src(order_val)
-                    .with_type_and_size(result_type, size)
-                    .with_memory_order(memory_order);
-                self.emit(insn);
-                result
+                self.emit_c11_atomic_builtin(Opcode::AtomicFetchAnd, ptr, Some(val), Some(order))
             }
 
             ExprKind::C11AtomicFetchOr { ptr, val, order } => {
-                let ptr_val = self.linearize_expr(ptr);
-                let value = self.linearize_expr(val);
-                let order_val = self.linearize_expr(order);
-                let memory_order = self.eval_memory_order(order);
-                let ptr_type = self.expr_type(ptr);
-                let result_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
-                let size = self.types.size_bits(result_type);
-                let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::AtomicFetchOr)
-                    .with_target(result)
-                    .with_src(ptr_val)
-                    .with_src(value)
-                    .with_src(order_val)
-                    .with_type_and_size(result_type, size)
-                    .with_memory_order(memory_order);
-                self.emit(insn);
-                result
+                self.emit_c11_atomic_builtin(Opcode::AtomicFetchOr, ptr, Some(val), Some(order))
             }
 
             ExprKind::C11AtomicFetchXor { ptr, val, order } => {
-                let ptr_val = self.linearize_expr(ptr);
-                let value = self.linearize_expr(val);
-                let order_val = self.linearize_expr(order);
-                let memory_order = self.eval_memory_order(order);
-                let ptr_type = self.expr_type(ptr);
-                let result_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
-                let size = self.types.size_bits(result_type);
-                let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::AtomicFetchXor)
-                    .with_target(result)
-                    .with_src(ptr_val)
-                    .with_src(value)
-                    .with_src(order_val)
-                    .with_type_and_size(result_type, size)
-                    .with_memory_order(memory_order);
-                self.emit(insn);
-                result
+                self.emit_c11_atomic_builtin(Opcode::AtomicFetchXor, ptr, Some(val), Some(order))
             }
 
             ExprKind::C11AtomicThreadFence { order } => {
@@ -4125,6 +4050,16 @@ impl<'a> Linearizer<'a> {
     pub(crate) fn linearize_expr(&mut self, expr: &Expr) -> PseudoId {
         // Set current position for debug info
         self.current_pos = Some(expr.pos);
+
+        // Every rvalue read of an `_Atomic` object is itself an atomic
+        // operation (C17 6.7.3). This is the single funnel for reads, so
+        // branching here covers initializers, conditions, call arguments and
+        // operands alike. On x86 a plain aligned load already is sequentially
+        // consistent, but on aarch64 this is the difference between `ldr` and
+        // `ldar`.
+        if let Some(lv) = self.atomic_lvalue(expr) {
+            return self.emit_atomic_load(&lv);
+        }
 
         match &expr.kind {
             ExprKind::IntLit(val) => {

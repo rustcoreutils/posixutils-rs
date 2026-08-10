@@ -13,7 +13,7 @@
 // that uses these shared operand and size types.
 //
 
-use crate::target::{Os, Target};
+use crate::target::{Arch, Os, Target};
 use crate::types::{TypeId, TypeKind, TypeTable};
 use std::fmt::{self, Write};
 
@@ -88,16 +88,33 @@ pub enum FpSize {
     /// 80-bit x87 extended precision (long double on x86-64)
     /// Stored in 128-bit (16-byte) slots per ABI
     Extended,
+    /// 128-bit IEEE 754 binary128 (long double on aarch64/Linux).
+    ///
+    /// Deliberately distinct from `Extended`: they are the same *slot* size
+    /// and nothing else. x87 extended has a 64-bit mantissa and its own
+    /// instruction set; binary128 has 113 bits and, on aarch64, lives in a
+    /// whole Q register with its arithmetic in libgcc. Conflating them is what
+    /// made `from_bits(128)` answer `Extended` on aarch64 and route quad loads
+    /// through x87 paths that do not exist there.
+    Quad,
 }
 
 impl FpSize {
-    /// Create from bit count
-    pub fn from_bits(bits: u32) -> Self {
+    /// Create from bit count, for a given target.
+    ///
+    /// The target is required because 128 bits is ambiguous on its own: it is
+    /// x87 extended on x86-64 and IEEE binary128 on aarch64. Asking without
+    /// saying which machine is how quad-precision loads ended up on the x87
+    /// path.
+    pub fn from_bits(bits: u32, target: &Target) -> Self {
         match bits {
             0..=16 => FpSize::Half,
             17..=32 => FpSize::Single,
             33..=64 => FpSize::Double,
-            _ => FpSize::Extended, // 80-bit x87 (stored as 128)
+            _ => match target.arch {
+                Arch::Aarch64 => FpSize::Quad,
+                Arch::X86_64 => FpSize::Extended,
+            },
         }
     }
 
@@ -119,9 +136,14 @@ impl FpSize {
 
     /// Create from type with fallback to size-based detection.
     /// Preferred method when both type and size information are available.
-    pub fn from_type_or_bits(typ: Option<TypeId>, size: u32, types: &TypeTable) -> Self {
+    pub fn from_type_or_bits(
+        typ: Option<TypeId>,
+        size: u32,
+        types: &TypeTable,
+        target: &Target,
+    ) -> Self {
         typ.map(|t| Self::from_type_kind(types.kind(t)))
-            .unwrap_or_else(|| Self::from_bits(size.max(32)))
+            .unwrap_or_else(|| Self::from_bits(size.max(32), target))
     }
 
     /// x86-64 SSE instruction suffix (ss for single, sd for double)
@@ -133,6 +155,9 @@ impl FpSize {
             FpSize::Single => "ss",
             FpSize::Double => "sd",
             FpSize::Extended => "t", // x87 uses 't' suffix (fldt, fstpt)
+            FpSize::Quad => {
+                unreachable!("binary128 has no SSE form; x86-64 long double is x87 Extended")
+            }
         }
     }
 
@@ -143,6 +168,9 @@ impl FpSize {
             FpSize::Single => "ps",
             FpSize::Double => "pd",
             FpSize::Extended => "pd", // x87 doesn't have packed ops, fallback
+            FpSize::Quad => {
+                unreachable!("binary128 has no SSE form; x86-64 long double is x87 Extended")
+            }
         }
     }
 }
@@ -154,6 +182,7 @@ impl fmt::Display for FpSize {
             FpSize::Single => write!(f, "f32"),
             FpSize::Double => write!(f, "f64"),
             FpSize::Extended => write!(f, "f80"),
+            FpSize::Quad => write!(f, "f128"),
         }
     }
 }
@@ -323,11 +352,15 @@ pub fn complex_fp_info(types: &TypeTable, target: &Target, complex_typ: TypeId) 
         TypeKind::Double => (FpSize::Double, 8),
         TypeKind::LongDouble => {
             // On macOS AArch64, long double == double
-            if target.os == Os::MacOS && target.arch == crate::target::Arch::Aarch64 {
+            if target.os == Os::MacOS && target.arch == Arch::Aarch64 {
                 (FpSize::Double, 8)
+            } else if target.arch == Arch::Aarch64 {
+                // AArch64 base standard: IEEE binary128 in a whole Q register.
+                // Returning Extended here sent quad loads and stores down the
+                // x87 path, which does not exist on this target.
+                (FpSize::Quad, 16)
             } else {
-                // x86-64: 80-bit extended precision (padded to 16 bytes)
-                // AArch64/Linux: 128-bit IEEE quad (16 bytes)
+                // x86-64: 80-bit extended precision, padded to 16 bytes.
                 (FpSize::Extended, 16)
             }
         }
@@ -998,16 +1031,58 @@ mod tests {
 
     #[test]
     fn test_fp_size() {
-        assert_eq!(FpSize::from_bits(16), FpSize::Half);
-        assert_eq!(FpSize::from_bits(32), FpSize::Single);
-        assert_eq!(FpSize::from_bits(64), FpSize::Double);
-        assert_eq!(FpSize::from_bits(80), FpSize::Extended);
-        assert_eq!(FpSize::from_bits(128), FpSize::Extended); // 128-bit maps to Extended
+        use crate::target::Os;
+        let x86 = Target::new(Arch::X86_64, Os::Linux);
+        let arm = Target::new(Arch::Aarch64, Os::Linux);
+
+        // The narrow sizes are target-independent.
+        for t in [&x86, &arm] {
+            assert_eq!(FpSize::from_bits(16, t), FpSize::Half);
+            assert_eq!(FpSize::from_bits(32, t), FpSize::Single);
+            assert_eq!(FpSize::from_bits(64, t), FpSize::Double);
+        }
+
+        // 128 bits is the whole reason from_bits needs a target: it is x87
+        // extended on x86-64 and IEEE binary128 on aarch64, and answering
+        // Extended for both is what sent quad loads down the x87 path.
+        assert_eq!(FpSize::from_bits(80, &x86), FpSize::Extended);
+        assert_eq!(FpSize::from_bits(128, &x86), FpSize::Extended);
+        assert_eq!(FpSize::from_bits(128, &arm), FpSize::Quad);
 
         assert_eq!(FpSize::Half.x86_suffix(), "ss");
         assert_eq!(FpSize::Single.x86_suffix(), "ss");
         assert_eq!(FpSize::Double.x86_suffix(), "sd");
         assert_eq!(FpSize::Extended.x86_suffix(), "t");
+    }
+
+    /// The `f64` a floating literal is stored as, widened to the binary128
+    /// encoding AAPCS64 requires. Values checked against the IEEE-754 layout:
+    /// a 15-bit exponent biased by 16383 and a 112-bit mantissa.
+    #[test]
+    fn test_f64_to_f128_bits() {
+        use crate::arch::aarch64::f64_to_f128_bits;
+
+        // 1.5 = 1.1b x 2^0 -> exponent 16383, mantissa top bit set.
+        assert_eq!(f64_to_f128_bits(1.5), (0, 0x3FFF_8000_0000_0000));
+        // 1.0 -> exponent 16383, mantissa zero.
+        assert_eq!(f64_to_f128_bits(1.0), (0, 0x3FFF_0000_0000_0000));
+        // 2.0 -> exponent 16384.
+        assert_eq!(f64_to_f128_bits(2.0), (0, 0x4000_0000_0000_0000));
+        // Signed zeroes keep only the sign bit.
+        assert_eq!(f64_to_f128_bits(0.0), (0, 0));
+        assert_eq!(f64_to_f128_bits(-0.0), (0, 0x8000_0000_0000_0000));
+        // -1.5 is 1.5 with the sign bit.
+        assert_eq!(f64_to_f128_bits(-1.5), (0, 0xBFFF_8000_0000_0000));
+        // Infinities saturate the exponent with a zero mantissa.
+        assert_eq!(f64_to_f128_bits(f64::INFINITY), (0, 0x7FFF_0000_0000_0000));
+        assert_eq!(
+            f64_to_f128_bits(f64::NEG_INFINITY),
+            (0, 0xFFFF_0000_0000_0000)
+        );
+        // A NaN keeps a non-zero mantissa and the saturated exponent.
+        let (lo, hi) = f64_to_f128_bits(f64::NAN);
+        assert_eq!(hi >> 48 & 0x7FFF, 0x7FFF);
+        assert!(hi & 0x0000_FFFF_FFFF_FFFF != 0 || lo != 0);
     }
 
     #[test]

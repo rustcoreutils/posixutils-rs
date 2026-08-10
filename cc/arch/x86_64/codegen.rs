@@ -4237,8 +4237,12 @@ impl X86_64CodeGen {
         let target = insn.target.expect("atomic store needs target");
         let addr = insn.src[0];
         let value = insn.src[1];
+        // The memory operand must be exactly as wide as the object; widening
+        // it to 32 bits made an 8- or 16-bit atomic read-modify-write touch
+        // its neighbours. Register moves still use at least 32 bits.
+        let mem_size = insn.size;
         let size = insn.size.max(32);
-        let op_size = OperandSize::from_bits(size);
+        let op_size = OperandSize::from_bits(mem_size);
 
         // For SeqCst, use XCHG which provides full barrier
         // For weaker orderings, regular store + optional SFENCE is sufficient
@@ -4305,12 +4309,16 @@ impl X86_64CodeGen {
     }
 
     /// Emit atomic exchange (swap)
-    fn emit_atomic_swap(&mut self, insn: &Instruction, _types: &TypeTable) {
+    fn emit_atomic_swap(&mut self, insn: &Instruction, types: &TypeTable) {
         let target = insn.target.expect("atomic swap needs target");
         let addr = insn.src[0];
         let value = insn.src[1];
+        // The memory operand must be exactly as wide as the object; widening
+        // it to 32 bits made an 8- or 16-bit atomic read-modify-write touch
+        // its neighbours. Register moves still use at least 32 bits.
+        let mem_size = insn.size;
         let size = insn.size.max(32);
-        let op_size = OperandSize::from_bits(size);
+        let op_size = OperandSize::from_bits(mem_size);
 
         let value_loc = self.get_location(value);
         let addr_loc = self.get_location(addr);
@@ -4329,7 +4337,16 @@ impl X86_64CodeGen {
         });
 
         // Result (old value) is in RAX
-        self.locations.set(target, Loc::Reg(Reg::Rax));
+        self.extend_narrow_atomic_result(insn, types);
+        // The result is in RAX because the instruction requires it, but the
+        // allocator assigned this pseudo its own location. Overwriting that
+        // assignment made every atomic result alias RAX, so two atomic results
+        // live at once collapsed into one: `f(&a) + f(&b)` became `add %rax,
+        // %rax`. Move it to where the allocator expects instead.
+        let dst_loc = self.get_location(target);
+        if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::Rax) {
+            self.emit_move_to_loc(Reg::Rax, &dst_loc, size.max(32));
+        }
     }
 
     /// Emit atomic compare-and-swap
@@ -4338,9 +4355,12 @@ impl X86_64CodeGen {
         let addr = insn.src[0];
         let expected_ptr = insn.src[1];
         let desired = insn.src[2];
+        // As above: the compare-and-exchange must be exactly as wide as the
+        // object, or it reads and writes adjacent bytes.
+        let mem_size = insn.size;
         let size = insn.size.max(32);
 
-        let op_size = OperandSize::from_bits(size);
+        let op_size = OperandSize::from_bits(mem_size);
 
         let addr_loc = self.get_location(addr);
         let expected_loc = self.get_location(expected_ptr);
@@ -4511,16 +4531,68 @@ impl X86_64CodeGen {
         });
 
         // Result (success flag) is in RAX
-        self.locations.set(target, Loc::Reg(Reg::Rax));
+        // The result is in RAX because the instruction requires it, but the
+        // allocator assigned this pseudo its own location. Overwriting that
+        // assignment made every atomic result alias RAX, so two atomic results
+        // live at once collapsed into one: `f(&a) + f(&b)` became `add %rax,
+        // %rax`. Move it to where the allocator expects instead.
+        let dst_loc = self.get_location(target);
+        if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::Rax) {
+            self.emit_move_to_loc(Reg::Rax, &dst_loc, size.max(32));
+        }
+    }
+
+    /// Widen a narrow atomic result in RAX to a full 32-bit register value.
+    ///
+    /// An 8- or 16-bit atomic operation leaves only the low bits of RAX
+    /// meaningful; every consumer expects at least 32. Extend with the same
+    /// signedness rule `emit_load` uses, so `_Atomic signed char` reads back
+    /// negative rather than as a large positive.
+    fn extend_narrow_atomic_result(&mut self, insn: &Instruction, types: &TypeTable) {
+        let mem_size = insn.size;
+        if mem_size >= 32 {
+            return;
+        }
+
+        let is_unsigned = insn.typ.is_some_and(|t| {
+            if types.is_unsigned(t) {
+                true
+            } else if types.is_plain_char(t) {
+                !self.base.target.char_signed
+            } else {
+                false
+            }
+        });
+
+        let src_size = OperandSize::from_bits(mem_size);
+        if is_unsigned {
+            self.push_lir(X86Inst::Movzx {
+                src_size,
+                dst_size: OperandSize::B32,
+                src: GpOperand::Reg(Reg::Rax),
+                dst: Reg::Rax,
+            });
+        } else {
+            self.push_lir(X86Inst::Movsx {
+                src_size,
+                dst_size: OperandSize::B32,
+                src: GpOperand::Reg(Reg::Rax),
+                dst: Reg::Rax,
+            });
+        }
     }
 
     /// Emit atomic fetch-and-add
-    fn emit_atomic_fetch_add(&mut self, insn: &Instruction, _types: &TypeTable) {
+    fn emit_atomic_fetch_add(&mut self, insn: &Instruction, types: &TypeTable) {
         let target = insn.target.expect("atomic fetch_add needs target");
         let addr = insn.src[0];
         let value = insn.src[1];
+        // The memory operand must be exactly as wide as the object; widening
+        // it to 32 bits made an 8- or 16-bit atomic read-modify-write touch
+        // its neighbours. Register moves still use at least 32 bits.
+        let mem_size = insn.size;
         let size = insn.size.max(32);
-        let op_size = OperandSize::from_bits(size);
+        let op_size = OperandSize::from_bits(mem_size);
 
         let value_loc = self.get_location(value);
         let addr_loc = self.get_location(addr);
@@ -4539,16 +4611,29 @@ impl X86_64CodeGen {
         });
 
         // Result (old value) is in RAX
-        self.locations.set(target, Loc::Reg(Reg::Rax));
+        self.extend_narrow_atomic_result(insn, types);
+        // The result is in RAX because the instruction requires it, but the
+        // allocator assigned this pseudo its own location. Overwriting that
+        // assignment made every atomic result alias RAX, so two atomic results
+        // live at once collapsed into one: `f(&a) + f(&b)` became `add %rax,
+        // %rax`. Move it to where the allocator expects instead.
+        let dst_loc = self.get_location(target);
+        if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::Rax) {
+            self.emit_move_to_loc(Reg::Rax, &dst_loc, size.max(32));
+        }
     }
 
     /// Emit atomic fetch-and-subtract
-    fn emit_atomic_fetch_sub(&mut self, insn: &Instruction, _types: &TypeTable) {
+    fn emit_atomic_fetch_sub(&mut self, insn: &Instruction, types: &TypeTable) {
         let target = insn.target.expect("atomic fetch_sub needs target");
         let addr = insn.src[0];
         let value = insn.src[1];
+        // The memory operand must be exactly as wide as the object; widening
+        // it to 32 bits made an 8- or 16-bit atomic read-modify-write touch
+        // its neighbours. Register moves still use at least 32 bits.
+        let mem_size = insn.size;
         let size = insn.size.max(32);
-        let op_size = OperandSize::from_bits(size);
+        let op_size = OperandSize::from_bits(mem_size);
 
         let value_loc = self.get_location(value);
         let addr_loc = self.get_location(addr);
@@ -4571,32 +4656,45 @@ impl X86_64CodeGen {
         });
 
         // Result (old value) is in RAX
-        self.locations.set(target, Loc::Reg(Reg::Rax));
+        self.extend_narrow_atomic_result(insn, types);
+        // The result is in RAX because the instruction requires it, but the
+        // allocator assigned this pseudo its own location. Overwriting that
+        // assignment made every atomic result alias RAX, so two atomic results
+        // live at once collapsed into one: `f(&a) + f(&b)` became `add %rax,
+        // %rax`. Move it to where the allocator expects instead.
+        let dst_loc = self.get_location(target);
+        if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::Rax) {
+            self.emit_move_to_loc(Reg::Rax, &dst_loc, size.max(32));
+        }
     }
 
     /// Emit atomic fetch-and-and
-    fn emit_atomic_fetch_and(&mut self, insn: &Instruction, _types: &TypeTable) {
-        self.emit_atomic_fetch_bitop(insn, AtomicBitOp::And);
+    fn emit_atomic_fetch_and(&mut self, insn: &Instruction, types: &TypeTable) {
+        self.emit_atomic_fetch_bitop(insn, AtomicBitOp::And, types);
     }
 
     /// Emit atomic fetch-and-or
-    fn emit_atomic_fetch_or(&mut self, insn: &Instruction, _types: &TypeTable) {
-        self.emit_atomic_fetch_bitop(insn, AtomicBitOp::Or);
+    fn emit_atomic_fetch_or(&mut self, insn: &Instruction, types: &TypeTable) {
+        self.emit_atomic_fetch_bitop(insn, AtomicBitOp::Or, types);
     }
 
     /// Emit atomic fetch-and-xor
-    fn emit_atomic_fetch_xor(&mut self, insn: &Instruction, _types: &TypeTable) {
-        self.emit_atomic_fetch_bitop(insn, AtomicBitOp::Xor);
+    fn emit_atomic_fetch_xor(&mut self, insn: &Instruction, types: &TypeTable) {
+        self.emit_atomic_fetch_bitop(insn, AtomicBitOp::Xor, types);
     }
 
     /// Helper for atomic fetch bitwise operations (AND, OR, XOR)
     /// Uses CMPXCHG loop since x86 doesn't have LOCK AND/OR/XOR that return old value
-    fn emit_atomic_fetch_bitop(&mut self, insn: &Instruction, op: AtomicBitOp) {
+    fn emit_atomic_fetch_bitop(&mut self, insn: &Instruction, op: AtomicBitOp, types: &TypeTable) {
         let target = insn.target.expect("atomic fetch needs target");
         let addr = insn.src[0];
         let value = insn.src[1];
+        // The memory operand must be exactly as wide as the object; widening
+        // it to 32 bits made an 8- or 16-bit atomic read-modify-write touch
+        // its neighbours. Register moves still use at least 32 bits.
+        let mem_size = insn.size;
         let size = insn.size.max(32);
-        let op_size = OperandSize::from_bits(size);
+        let op_size = OperandSize::from_bits(mem_size);
 
         let value_loc = self.get_location(value);
         let addr_loc = self.get_location(addr);
@@ -4668,7 +4766,16 @@ impl X86_64CodeGen {
         });
 
         // Result (old value) is in RAX
-        self.locations.set(target, Loc::Reg(Reg::Rax));
+        self.extend_narrow_atomic_result(insn, types);
+        // The result is in RAX because the instruction requires it, but the
+        // allocator assigned this pseudo its own location. Overwriting that
+        // assignment made every atomic result alias RAX, so two atomic results
+        // live at once collapsed into one: `f(&a) + f(&b)` became `add %rax,
+        // %rax`. Move it to where the allocator expects instead.
+        let dst_loc = self.get_location(target);
+        if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::Rax) {
+            self.emit_move_to_loc(Reg::Rax, &dst_loc, size.max(32));
+        }
     }
 
     /// Emit memory fence
@@ -4733,11 +4840,40 @@ impl X86_64CodeGen {
                     dst: GpOperand::Reg(reg),
                 });
             }
-            _ => {
-                // Default: load 0
+            // A caller-passed stack argument. Reachable whenever an atomic
+            // operand is the seventh or later parameter; it used to fall to
+            // the `load 0` default below, which for an address operand meant
+            // dereferencing a null pointer.
+            Loc::IncomingArg(offset) => {
                 self.push_lir(X86Inst::Mov {
                     size: op_size,
-                    src: GpOperand::Imm(0),
+                    src: GpOperand::Mem(MemAddr::BaseOffset {
+                        base: Reg::Rbp,
+                        offset,
+                    }),
+                    dst: GpOperand::Reg(reg),
+                });
+            }
+            // The atomic operations move values through general-purpose
+            // registers, so a floating-point operand has to come across as its
+            // bit pattern. Silently loading 0 here is what made every
+            // `_Atomic float`/`_Atomic double` operation produce zero.
+            Loc::Xmm(x) => {
+                self.push_lir(X86Inst::MovXmmGp {
+                    size: op_size,
+                    src: x,
+                    dst: reg,
+                });
+            }
+            Loc::FImm(v, bits) => {
+                let pattern: i64 = if bits <= 32 {
+                    (v as f32).to_bits() as i64
+                } else {
+                    v.to_bits() as i64
+                };
+                self.push_lir(X86Inst::Mov {
+                    size: op_size,
+                    src: GpOperand::Imm(pattern),
                     dst: GpOperand::Reg(reg),
                 });
             }

@@ -50,6 +50,16 @@ pub const STDINT_H: &str = include_str!("include/stdint.h");
 /// Builtin cpuid.h - CPU feature detection (x86/x64)
 pub const CPUID_H: &str = include_str!("include/cpuid.h");
 
+/// Builtin tgmath.h - C11 7.25 type-generic math macros.
+///
+/// Registered rather than left to the host, unlike xmmintrin.h below, because
+/// this body is genuinely better here: every glibc <tgmath.h> needs compiler
+/// internals c17 lacks (__builtin_tgmath, or __builtin_classify_type plus
+/// __real__) and #errors out before reaching any of them unless
+/// __HAVE_FLOAT128 agrees with __HAVE_FLOAT64X. A user's own tgmath.h still
+/// wins: builtin headers are searched after the includer's directory and -I.
+pub const TGMATH_H: &str = include_str!("include/tgmath.h");
+
 /// Look up a builtin header by name
 ///
 /// Returns the header content if found, None otherwise.
@@ -68,6 +78,7 @@ pub fn get_builtin_header(name: &str) -> Option<&'static str> {
         "float.h" => Some(FLOAT_H),
         "stdint.h" => Some(STDINT_H),
         "cpuid.h" => Some(CPUID_H),
+        "tgmath.h" => Some(TGMATH_H),
         // xmmintrin.h and emmintrin.h are deliberately NOT registered. Their
         // bundled bodies are a bare #error, and registering them meant a user
         // with a real SSE intrinsics header on the include path got our hard

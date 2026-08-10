@@ -255,3 +255,113 @@ fn c11_no_threads_macro_agrees_with_the_host() {
         },
     );
 }
+
+// ============================================================================
+// <tgmath.h> — C11 7.25 type-generic math
+// ============================================================================
+
+/// The bundled `<tgmath.h>` dispatches over float / double / long double and
+/// their complex counterparts.
+///
+/// It is bundled rather than delegated because no glibc `<tgmath.h>` is usable
+/// here: each one needs compiler internals c17 lacks (`__builtin_tgmath` for
+/// GCC >= 8, `__builtin_classify_type` and `__real__` for the older path), and
+/// every version `#error`s out before reaching them unless `__HAVE_FLOAT128`
+/// agrees with `__HAVE_FLOAT64X` -- which is decided solely by the `__GNUC__`
+/// version c17 advertises.
+#[test]
+fn c17_tgmath_dispatches_by_type() {
+    let src = r#"
+        #include <tgmath.h>
+
+        int main(void) {
+            float f = 4.0f;
+            double d = 4.0;
+            long double l = 4.0L;
+
+            /* ---- real, one argument: the result keeps the argument's type,
+                    which is what makes the dispatch observable ---- */
+            if (sqrt(f) != 2.0f) return 1;
+            if (sqrt(d) != 2.0) return 2;
+            if (sqrt(l) != 2.0L) return 3;
+
+            if (fabs(-3.0f) != 3.0f) return 4;
+            if (fabs(-3.0) != 3.0) return 5;
+            if (fabs(-3.0L) != 3.0L) return 6;
+
+            /* ---- an integer argument promotes to double ---- */
+            if (sqrt(16) != 4.0) return 7;
+            if (ceil(1) != 1.0) return 8;
+
+            /* ---- real, two arguments: dispatched on the combined type ---- */
+            if (pow(2.0, 10.0) != 1024.0) return 10;
+            if (pow(2.0f, 10.0f) != 1024.0f) return 11;
+            if (pow(2.0L, 10.0L) != 1024.0L) return 12;
+            if (atan2(0.0, 1.0) != 0.0) return 13;
+            if (fmax(1.0f, 2.0f) != 2.0f) return 14;
+            if (fmin(1.0, 2.0) != 1.0) return 15;
+            if (fmod(7.0, 4.0) != 3.0) return 16;
+            if (hypot(3.0, 4.0) != 5.0) return 17;
+
+            /* ---- rounding family ---- */
+            if (ceil(1.2) != 2.0) return 20;
+            if (floor(1.8f) != 1.0f) return 21;
+            if (trunc(-1.8) != -1.0) return 22;
+            if (round(1.5) != 2.0) return 23;
+
+            /* ---- three arguments ---- */
+            if (fma(2.0, 3.0, 4.0) != 10.0) return 30;
+
+            /* ---- an argument with a side effect must be evaluated exactly
+                    once: the controlling expression of _Generic is not
+                    evaluated, so `n` must end at 1 ---- */
+            int n = 0;
+            double side = sqrt((n++, 4.0));
+            if (side != 2.0) return 40;
+            if (n != 1) return 41;
+
+            return 0;
+        }
+    "#;
+    assert_eq!(
+        compile_and_run("c17_tgmath_real", src, &["-lm".to_string()]),
+        0
+    );
+}
+
+#[test]
+fn c17_tgmath_handles_complex() {
+    let src = r#"
+        #include <tgmath.h>
+
+        int main(void) {
+            double _Complex z = 1.0 + 0.0 * I;
+            float _Complex zf = 1.0f + 0.0f * I;
+
+            /* A real-or-complex macro selects the complex function. */
+            double _Complex e = exp(z);
+            if (creal(e) < 2.71 || creal(e) > 2.72) return 1;
+            float _Complex ef = exp(zf);
+            if (crealf(ef) < 2.71f || crealf(ef) > 2.72f) return 2;
+
+            /* fabs of a complex is cabs, and yields a real. */
+            if (fabs(z) != 1.0) return 3;
+
+            /* Complex-only macros. */
+            if (creal(z) != 1.0) return 4;
+            if (cimag(z) != 0.0) return 5;
+            if (creal(conj(z)) != 1.0) return 6;
+
+            /* They accept a real argument too, treating it as a complex
+               value with a zero imaginary part. */
+            if (creal(2.0) != 2.0) return 7;
+            if (cimag(2.0) != 0.0) return 8;
+
+            return 0;
+        }
+    "#;
+    assert_eq!(
+        compile_and_run("c17_tgmath_complex", src, &["-lm".to_string()]),
+        0
+    );
+}

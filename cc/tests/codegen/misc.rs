@@ -3825,6 +3825,97 @@ int main(void) {
     );
 }
 
+/// Regression test: narrow *integer* arguments to variadic functions were not
+/// promoted to int per C99 6.5.2.2p7, so `printf("%02x", (unsigned char)c)`
+/// with a negative `signed char` printed `ffffff80` where gcc prints `80`
+/// (audit #C5).
+///
+/// The formal-parameter conversion in the linearizer is guarded by
+/// `arg_idx < params.len()`, which is never true for a variadic argument, so
+/// nothing promoted these. The cast alone emits no IR either, because
+/// `emit_convert` short-circuits same-size integer conversions -- leaving the
+/// sign-extended value from the load in place.
+///
+/// Every case is checked in both directions (cast and bare) so the test cannot
+/// pass by promoting too eagerly, and the sibling float test above cannot catch
+/// any of this because all of its integer arguments are already `int`.
+#[test]
+fn codegen_variadic_narrow_integer_promotion() {
+    let code = r#"
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    char buf[64];
+
+    /* The original repro: a negative signed char cast to unsigned char.
+       The cast is same-size, so it emits no conversion of its own. */
+    signed char sc = -128;
+    snprintf(buf, sizeof(buf), "%02x", (unsigned char)sc);
+    if (strcmp(buf, "80") != 0) return 1;
+
+    /* Same shape one width up. */
+    short s = -1;
+    snprintf(buf, sizeof(buf), "%04x", (unsigned short)s);
+    if (strcmp(buf, "ffff") != 0) return 2;
+
+    /* Without a cast, a negative signed char sign-extends to int. */
+    snprintf(buf, sizeof(buf), "%d", sc);
+    if (strcmp(buf, "-128") != 0) return 3;
+
+    /* An unsigned char variable zero-extends. */
+    unsigned char uc = 200;
+    snprintf(buf, sizeof(buf), "%d", uc);
+    if (strcmp(buf, "200") != 0) return 4;
+
+    /* A negative short sign-extends. */
+    short neg = -12345;
+    snprintf(buf, sizeof(buf), "%d", neg);
+    if (strcmp(buf, "-12345") != 0) return 5;
+
+    /* An unsigned short zero-extends. */
+    unsigned short us = 60000;
+    snprintf(buf, sizeof(buf), "%d", us);
+    if (strcmp(buf, "60000") != 0) return 6;
+
+    /* _Bool promotes to int. */
+    _Bool b = 1;
+    snprintf(buf, sizeof(buf), "%d", b);
+    if (strcmp(buf, "1") != 0) return 7;
+
+    /* char through a cast that narrows from int. */
+    snprintf(buf, sizeof(buf), "%d", (signed char)300);
+    if (strcmp(buf, "44") != 0) return 8;
+
+    /* Routing through a variable was always correct -- the stack reload
+       zero-extends -- so this pins that the fix did not break it. */
+    unsigned char via_var = (unsigned char)sc;
+    snprintf(buf, sizeof(buf), "%02x", via_var);
+    if (strcmp(buf, "80") != 0) return 9;
+
+    /* An outer widening cast was also always correct. */
+    snprintf(buf, sizeof(buf), "%02x", (unsigned)(unsigned char)sc);
+    if (strcmp(buf, "80") != 0) return 10;
+
+    /* Several narrow arguments in one call, mixed with an int. */
+    snprintf(buf, sizeof(buf), "%02x,%d,%04x", (unsigned char)sc, 7, (unsigned short)s);
+    if (strcmp(buf, "80,7,ffff") != 0) return 11;
+
+    /* A narrow argument after the format string in a wide call, to exercise
+       the stack-passed side of the ABI rather than only registers. */
+    snprintf(buf, sizeof(buf), "%d%d%d%d%d%d%d%02x",
+             1, 2, 3, 4, 5, 6, 7, (unsigned char)sc);
+    if (strcmp(buf, "123456780") != 0) return 12;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_variadic_narrow_integer_promotion", code, &[]),
+        0
+    );
+}
+
 /// Regression test: float arguments to variadic functions (e.g., printf) were
 /// not promoted to double per C99 6.5.2.2p7 "default argument promotions".
 /// The ABI requires xmm0 to hold a double, but c17 passed 32-bit float bits.
@@ -5489,5 +5580,161 @@ int main(void) {
         compile_and_run("gp_live_across_inline_asm_clobber", code, &[]),
         0,
         "GP value corrupted across inline asm that declared the host register in its clobber list"
+    );
+}
+
+/// A wide `long double` initializer must reach memory in the target's own
+/// format, not truncated to the `double` it was parsed into.
+///
+/// Both the global and the local path used to write the raw `f64` encoding:
+/// the global emitted a single 8-byte `.quad` under a `.size` of 16, and the
+/// local went through the 128-bit *integer* copy helper, which moves the low
+/// half through a general-purpose register and zero-fills the rest. On
+/// aarch64, where `long double` is binary128, `3.14159...L` therefore landed
+/// as a denormal near zero and compared less than `3.14L`.
+#[test]
+fn codegen_long_double_initializer_keeps_its_value() {
+    let code = r#"
+#include <float.h>
+
+static long double g_pi = 3.14159265358979323846L;
+/* Placed right after g_pi: an under-sized g_pi would run into it. */
+static long double g_next = 7.5L;
+static _Float16 g_half = 1.5f;
+static short g_after_half = 0x1234;
+
+static long double ld_ident(long double v) { return v; }
+
+int main(void) {
+    if (g_pi < 3.14L || g_pi > 3.15L) return 1;
+    if (g_next != 7.5L) return 2;
+    if (g_half != 1.5f) return 3;
+    if (g_after_half != 0x1234) return 4;
+
+    /* Local initialization from a wide literal. */
+    long double l = 3.14159265358979323846L;
+    if (l < 3.14L || l > 3.15L) return 5;
+    if (l != g_pi) return 6;
+
+    /* Hex float, and a power of two that is exact in every format. */
+    long double p = 0x1.0p3L;
+    if (p != 8.0L) return 7;
+
+    /* Copy through a call return value, which is where a 128-bit value moved
+       via a general-purpose register loses its upper half. */
+    if (ld_ident(l) != l) return 8;
+
+    long double arr[3];
+    arr[0] = l; arr[1] = p; arr[2] = -l;
+    if (arr[0] != l || arr[1] != p || arr[2] != -l) return 9;
+
+    /* More mantissa than a double can hold: if the slot ever narrows to 64
+       bits on a target where it is wider, this comes back equal to 1. */
+    long double eps = 1.0L + LDBL_EPSILON;
+    if (sizeof(long double) > sizeof(double) && eps == 1.0L) return 10;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_long_double_initializer_keeps_its_value", code, &[]),
+        0
+    );
+}
+
+/// Floating-point variadic arguments must survive the callee's `va_arg`.
+///
+/// AAPCS64 hands unnamed floating arguments in v0-v7 and reads them back
+/// through `__vr_top` / `__vr_offs`, but the aarch64 backend saved only x0-x7
+/// and walked `ap` as a flat pointer over that GP area. Every
+/// `va_arg(ap, double)` therefore read a general-purpose slot while the actual
+/// values sat in v0-v7, unspilled. The cases past eight arguments also cover
+/// the spill to the caller's stack, which is a different path again.
+#[test]
+fn codegen_variadic_floating_arguments() {
+    let code = r#"
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
+
+static double sum_d(int n, ...) {
+    va_list ap; va_start(ap, n);
+    double t = 0.0;
+    for (int i = 0; i < n; i++) t += va_arg(ap, double);
+    va_end(ap);
+    return t;
+}
+
+/* Alternating classes: the two register banks advance independently, so a
+   shared cursor would interleave them wrongly. */
+static double sum_mixed(int n, ...) {
+    va_list ap; va_start(ap, n);
+    double t = 0.0;
+    for (int i = 0; i < n; i++) {
+        t += (double)va_arg(ap, int);
+        t += va_arg(ap, double);
+    }
+    va_end(ap);
+    return t;
+}
+
+static long double sum_ld(int n, ...) {
+    va_list ap; va_start(ap, n);
+    long double t = 0.0L;
+    for (int i = 0; i < n; i++) t += va_arg(ap, long double);
+    va_end(ap);
+    return t;
+}
+
+static double twice(int n, ...) {
+    va_list ap, copy;
+    va_start(ap, n);
+    va_copy(copy, ap);
+    double a = 0.0, b = 0.0;
+    for (int i = 0; i < n; i++) a += va_arg(ap, double);
+    for (int i = 0; i < n; i++) b += va_arg(copy, double);
+    va_end(copy);
+    va_end(ap);
+    return a + b;
+}
+
+/* Hands the list to libc, which decodes it per the real platform ABI. */
+static int fmt(char *buf, size_t n, const char *f, ...) {
+    va_list ap; va_start(ap, f);
+    int r = vsnprintf(buf, n, f, ap);
+    va_end(ap);
+    return r;
+}
+
+static int near(double a, double b) { double d = a - b; return d < 0.01 && d > -0.01; }
+
+int main(void) {
+    if (!near(sum_d(2, 1.5, 2.5), 4.0)) return 1;
+
+    /* Nine doubles: the ninth has to come off the stack. */
+    if (!near(sum_d(9, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0), 45.0)) return 2;
+
+    /* Float arguments are promoted to double by the caller. */
+    float fa = 1.5f, fb = 2.5f;
+    if (!near(sum_d(2, fa, fb), 4.0)) return 3;
+
+    if (!near(sum_mixed(3, 1, 1.5, 2, 2.5, 3, 3.5), 13.5)) return 4;
+
+    long double lsum = sum_ld(3, 1.5L, 2.5L, 4.0L);
+    if (lsum != 8.0L) return 5;
+
+    if (!near(twice(3, 1.0, 2.0, 4.0), 14.0)) return 6;
+
+    char buf[64];
+    int r = fmt(buf, sizeof buf, "%d %.2f %d %.2f", 7, 1.25, 9, 2.5);
+    if (r < 0) return 7;
+    if (strcmp(buf, "7 1.25 9 2.50") != 0) return 8;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_variadic_floating_arguments", code, &[]),
+        0
     );
 }

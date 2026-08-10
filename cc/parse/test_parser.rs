@@ -5075,3 +5075,73 @@ fn test_int128_struct_member() {
     // 32 * 16 = 512 bytes
     assert_eq!(types.size_bytes(typ), 512);
 }
+
+// ============================================================================
+// C11 `_Generic` type-generic selection (C17 6.5.1.1)
+// ============================================================================
+
+/// `_Generic` is resolved at parse time and the *selected* association's
+/// expression is returned verbatim -- there is no `ExprKind::Generic`. These
+/// tests assert exactly that, since it is the property everything downstream
+/// (constant folding, `cflow`/`cxref` visitors, the linearizer's exhaustive
+/// match) relies on.
+#[test]
+fn test_generic_selects_matching_association() {
+    let (expr, _types, _strings, _symbols) =
+        parse_expr("_Generic(1, int: 11, double: 22, default: 33)").unwrap();
+    assert!(matches!(expr.kind, ExprKind::IntLit(11)));
+}
+
+#[test]
+fn test_generic_falls_back_to_default() {
+    let (expr, _types, _strings, _symbols) =
+        parse_expr("_Generic(1.0f, int: 11, double: 22, default: 33)").unwrap();
+    assert!(matches!(expr.kind, ExprKind::IntLit(33)));
+}
+
+#[test]
+fn test_generic_selects_by_float_type() {
+    let (expr, _types, _strings, _symbols) =
+        parse_expr("_Generic(1.0, int: 11, double: 22, default: 33)").unwrap();
+    assert!(matches!(expr.kind, ExprKind::IntLit(22)));
+}
+
+/// The result carries the selected expression's own type, not the controlling
+/// expression's.
+#[test]
+fn test_generic_result_type_is_the_selected_arm() {
+    let (expr, types, _strings, _symbols) =
+        parse_expr("_Generic(1, int: 1.5, default: 2)").unwrap();
+    assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Double);
+}
+
+#[test]
+fn test_generic_nested() {
+    let (expr, _types, _strings, _symbols) =
+        parse_expr("_Generic(1, int: _Generic(1.0, double: 7, default: 8), default: 9)").unwrap();
+    assert!(matches!(expr.kind, ExprKind::IntLit(7)));
+}
+
+/// A `default`-only selection is legal and always chosen.
+#[test]
+fn test_generic_default_only() {
+    let (expr, _types, _strings, _symbols) = parse_expr("_Generic(1, default: 5)").unwrap();
+    assert!(matches!(expr.kind, ExprKind::IntLit(5)));
+}
+
+/// The controlling expression contributes its type after lvalue conversion,
+/// so a qualified type selects the unqualified association (6.5.1.1p2).
+#[test]
+fn test_generic_strips_qualifiers_from_the_controlling_type() {
+    let (expr, _types, _strings, _symbols) =
+        parse_expr("_Generic((const int)1, int: 11, default: 22)").unwrap();
+    assert!(matches!(expr.kind, ExprKind::IntLit(11)));
+}
+
+/// `default` need not come last, and association order does not matter.
+#[test]
+fn test_generic_default_may_precede_associations() {
+    let (expr, _types, _strings, _symbols) =
+        parse_expr("_Generic(1, default: 33, int: 11)").unwrap();
+    assert!(matches!(expr.kind, ExprKind::IntLit(11)));
+}

@@ -19,6 +19,7 @@ pub mod dominate;
 pub mod inline;
 pub mod instcombine;
 pub mod linearize;
+mod linearize_atomic;
 mod linearize_emit;
 mod linearize_init;
 mod linearize_stmt;
@@ -297,6 +298,26 @@ impl Opcode {
                 | Opcode::AtomicFetchOr
                 | Opcode::AtomicFetchXor
                 | Opcode::Fence
+        )
+    }
+
+    /// True for the atomic memory operations (not `Fence`, which touches no
+    /// address and needs no scratch registers).
+    ///
+    /// Both backends lower these through fixed scratch registers that are in
+    /// the allocatable pool, so the register allocator has to know.
+    pub fn is_atomic(self) -> bool {
+        matches!(
+            self,
+            Opcode::AtomicLoad
+                | Opcode::AtomicStore
+                | Opcode::AtomicSwap
+                | Opcode::AtomicCas
+                | Opcode::AtomicFetchAdd
+                | Opcode::AtomicFetchSub
+                | Opcode::AtomicFetchAnd
+                | Opcode::AtomicFetchOr
+                | Opcode::AtomicFetchXor
         )
     }
 
@@ -642,6 +663,44 @@ pub struct AsmConstraint {
     pub constraint: String,
     /// Size of the operand in bits (8, 16, 32, 64), derived from the C type
     pub size: u32,
+}
+
+impl AsmConstraint {
+    /// True when the assembler receives this operand as a memory reference
+    /// rather than a value in a register.
+    ///
+    /// This matters for liveness in a way that is easy to miss: a memory
+    /// *output* still **reads** its pseudo, because the pseudo holds the
+    /// address the assembly writes through. Treating `"=m"` as write-only let
+    /// DCE delete the instruction that materialized the address, leaving the
+    /// emitted `fnstcw (%rax)` to fault on whatever happened to be in the
+    /// register. Anything that computes uses must call this.
+    ///
+    /// A constraint may offer several alternatives (`"rm"`); it is only a
+    /// memory operand if no register/immediate alternative is available.
+    pub fn is_memory(&self) -> bool {
+        let mut has_memory_class = false;
+        let mut has_non_memory_class = false;
+
+        for c in self.constraint.chars() {
+            match c {
+                'm' | 'o' | 'V' | 'Q' => has_memory_class = true,
+                // Register classes.
+                'r' | 'a' | 'b' | 'c' | 'd' | 'S' | 'D' | 'q' | 'R' | 'l' => {
+                    has_non_memory_class = true
+                }
+                // Immediate / general classes. `g` and `X` allow memory but
+                // also allow a register, so they do not force one.
+                'i' | 'n' | 'g' | 'X' | 'I' | 'J' | 'K' | 'L' | 'M' | 'N' | 'O' | 'Y' | 'Z' => {
+                    has_non_memory_class = true
+                }
+                // Modifiers, matching digits, anything unknown.
+                _ => {}
+            }
+        }
+
+        has_memory_class && !has_non_memory_class
+    }
 }
 
 /// Data for an inline assembly instruction

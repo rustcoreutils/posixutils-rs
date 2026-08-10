@@ -40,7 +40,7 @@ impl X86_64CodeGen {
         let addr_loc = self.get_location(addr);
 
         // Use type-aware FP size determination
-        let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types);
+        let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types, &self.base.target);
 
         match addr_loc {
             Loc::Reg(r) => {
@@ -152,7 +152,7 @@ impl X86_64CodeGen {
             _ => return,
         };
         // Use type-aware FP size determination
-        let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types);
+        let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types, &self.base.target);
 
         // IMPORTANT: Check address location BEFORE emit_fp_move, because emit_fp_move
         // may clobber RAX when loading immediate values. If addr is in RAX, we need
@@ -303,7 +303,7 @@ impl X86_64CodeGen {
             _ => XmmReg::Xmm15,
         };
         // Use type-aware FP size determination
-        let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types);
+        let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types, &self.base.target);
 
         // Helper to emit the FP binop LIR instruction
         let emit_fp_binop_lir = |cg: &mut Self, src: XmmOperand, dst: XmmReg| match insn.op {
@@ -441,7 +441,7 @@ impl X86_64CodeGen {
             _ => XmmReg::Xmm15,
         };
         // Use type-aware FP size determination
-        let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types);
+        let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types, &self.base.target);
 
         // Move source to destination
         self.emit_fp_move(
@@ -514,7 +514,7 @@ impl X86_64CodeGen {
             None => return,
         };
         // Use type-aware FP size determination
-        let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types);
+        let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types, &self.base.target);
         let move_size = Self::size_from_type(insn.typ, insn.size, types);
 
         // Use Xmm15 as the work register for src1 (Xmm15/Xmm14 are
@@ -677,7 +677,7 @@ impl X86_64CodeGen {
             _ => XmmReg::Xmm15,
         };
 
-        let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types);
+        let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types, &self.base.target);
         let is_unsigned_64 = insn.op == Opcode::UCvtF && src_size == 64;
 
         // Move integer to R10 first (scratch register)
@@ -806,7 +806,8 @@ impl X86_64CodeGen {
         };
 
         // Move float to XMM15 (reserved scratch — see emit_fp_binop).
-        let fp_size = FpSize::from_type_or_bits(insn.src_typ, insn.src_size, types);
+        let fp_size =
+            FpSize::from_type_or_bits(insn.src_typ, insn.src_size, types, &self.base.target);
         self.emit_fp_move(
             src,
             XmmReg::Xmm15,
@@ -901,7 +902,8 @@ impl X86_64CodeGen {
             _ => {
                 // Same type or types unknown, just move if needed
                 if dst_xmm != src_xmm {
-                    let dst_fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types);
+                    let dst_fp_size =
+                        FpSize::from_type_or_bits(insn.typ, insn.size, types, &self.base.target);
                     self.push_lir(X86Inst::MovFp {
                         size: dst_fp_size,
                         src: XmmOperand::Reg(src_xmm),
@@ -940,7 +942,7 @@ impl X86_64CodeGen {
     pub(super) fn emit_fp_imm_to_xmm(&mut self, value: f64, xmm: XmmReg, size: u32) {
         if value == 0.0 {
             // Use xorps/xorpd to zero the register (faster)
-            let fp_size = FpSize::from_bits(size);
+            let fp_size = FpSize::from_bits(size, &self.base.target);
             self.push_lir(X86Inst::XorFp {
                 size: fp_size,
                 src: xmm,
@@ -990,7 +992,7 @@ impl X86_64CodeGen {
     /// Move a value to an XMM register
     pub(super) fn emit_fp_move(&mut self, src: PseudoId, dst: XmmReg, size: u32) {
         let src_loc = self.get_location(src);
-        let fp_size = FpSize::from_bits(size);
+        let fp_size = FpSize::from_bits(size, &self.base.target);
 
         match src_loc {
             Loc::Xmm(x) if x == dst => {
@@ -1093,7 +1095,7 @@ impl X86_64CodeGen {
 
     /// Move from XMM register to a location
     pub(super) fn emit_fp_move_from_xmm(&mut self, src: XmmReg, dst: &Loc, size: u32) {
-        let fp_size = FpSize::from_bits(size);
+        let fp_size = FpSize::from_bits(size, &self.base.target);
 
         match dst {
             Loc::Xmm(x) if *x == src => {

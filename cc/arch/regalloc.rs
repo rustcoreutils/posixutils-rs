@@ -358,8 +358,16 @@ where
                     }
                     for output in &asm.outputs {
                         let p = output.pseudo;
-                        def_blocks.entry(p).or_default().insert(idx);
-                        defined_in[idx].insert(p);
+                        // A *memory* output reads its pseudo: the pseudo holds
+                        // the address the assembly writes through, so it is a
+                        // use like any input. Recording it as a def made the
+                        // address computation look dead on entry and let the
+                        // allocator hand the register to another operand of the
+                        // same asm.
+                        if !output.is_memory() {
+                            def_blocks.entry(p).or_default().insert(idx);
+                            defined_in[idx].insert(p);
+                        }
                         first_pos_map[idx].entry(p).or_insert(ipos);
                         last_pos_map[idx].insert(p, ipos);
                     }
@@ -480,7 +488,20 @@ where
                         }
                     }
                     for output in &asm.outputs {
-                        defined_so_far.insert(output.pseudo);
+                        // See above: a memory output is a use of the address.
+                        if output.is_memory() {
+                            if !defined_so_far.contains(&output.pseudo) {
+                                propagate_use(
+                                    idx,
+                                    output.pseudo,
+                                    &mut live_in,
+                                    &mut live_out,
+                                    &mut worklist,
+                                );
+                            }
+                        } else {
+                            defined_so_far.insert(output.pseudo);
+                        }
                     }
                 }
             }
@@ -879,7 +900,8 @@ pub fn build_interference_graph(
             if insn.op == Opcode::Asm {
                 if let Some(asm) = &insn.asm_data {
                     for output in &asm.outputs {
-                        if candidates.contains(&output.pseudo) {
+                        // A memory output defines nothing; it reads an address.
+                        if !output.is_memory() && candidates.contains(&output.pseudo) {
                             defs.push(output.pseudo);
                         }
                     }
@@ -927,6 +949,13 @@ pub fn build_interference_graph(
                     for input in &asm.inputs {
                         if candidates.contains(&input.pseudo) {
                             live.insert(input.pseudo);
+                        }
+                    }
+                    // A memory output is read, not written: its address must
+                    // stay live across the asm.
+                    for output in &asm.outputs {
+                        if output.is_memory() && candidates.contains(&output.pseudo) {
+                            live.insert(output.pseudo);
                         }
                     }
                 }
@@ -1100,6 +1129,13 @@ pub fn compute_use_positions(func: &Function) -> BTreeMap<PseudoId, Vec<usize>> 
                 if let Some(asm) = &insn.asm_data {
                     for input in &asm.inputs {
                         uses.entry(input.pseudo).or_default().push(pos);
+                    }
+                    // A memory output's address is used here too, so the
+                    // next-use distance must count it.
+                    for output in &asm.outputs {
+                        if output.is_memory() {
+                            uses.entry(output.pseudo).or_default().push(pos);
+                        }
                     }
                 }
             }

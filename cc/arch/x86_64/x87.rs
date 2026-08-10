@@ -144,6 +144,76 @@ impl X86_64CodeGen {
     /// Pattern:
     ///   fldt   src(%rbp)       ; load value to ST(0)
     ///   fstpt  dst(%rbp)       ; store to destination
+    /// `va_arg` for an x87 `long double`.
+    ///
+    /// SysV AMD64 classifies `long double` as X87/X87UP, a class that is never
+    /// passed in a register: every one of them sits in the caller's overflow
+    /// area, 16-byte aligned and 16 bytes wide. `emit_va_arg_float` models
+    /// only the SSE class, so it went looking in the XMM save area and read a
+    /// `double`-sized hole -- the argument always came back as zero.
+    pub(super) fn emit_va_arg_x87(&mut self, ap_base: Reg, ap_base_offset: i32, dst_loc: &Loc) {
+        let Loc::Stack(dst_offset) = dst_loc else {
+            // An x87 value only ever lives in a stack slot; without one there
+            // is nowhere to pop ST(0) to, and pushing it would unbalance the
+            // x87 stack.
+            return;
+        };
+
+        let overflow = MemAddr::BaseOffset {
+            base: ap_base,
+            offset: ap_base_offset + 8,
+        };
+
+        // r10 = overflow_arg_area rounded up to the type's 16-byte alignment.
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Mem(overflow.clone()),
+            dst: GpOperand::Reg(Reg::R10),
+        });
+        self.push_lir(X86Inst::Add {
+            size: OperandSize::B64,
+            src: GpOperand::Imm(15),
+            dst: Reg::R10,
+        });
+        self.push_lir(X86Inst::And {
+            size: OperandSize::B64,
+            src: GpOperand::Imm(-16),
+            dst: Reg::R10,
+        });
+
+        self.push_lir(X86Inst::X87Load {
+            addr: MemAddr::BaseOffset {
+                base: Reg::R10,
+                offset: 0,
+            },
+        });
+
+        // overflow_arg_area advances past the whole 16-byte slot.
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::R10),
+            dst: GpOperand::Reg(Reg::R11),
+        });
+        self.push_lir(X86Inst::Add {
+            size: OperandSize::B64,
+            src: GpOperand::Imm(16),
+            dst: Reg::R11,
+        });
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::R11),
+            dst: GpOperand::Mem(overflow),
+        });
+
+        let adjusted_offset = -(*dst_offset + self.callee_saved_offset);
+        self.push_lir(X86Inst::X87Store {
+            addr: MemAddr::BaseOffset {
+                base: Reg::Rbp,
+                offset: adjusted_offset,
+            },
+        });
+    }
+
     pub(super) fn emit_x87_store(&mut self, insn: &Instruction) {
         let (addr, value) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&a), Some(&v)) => (a, v),

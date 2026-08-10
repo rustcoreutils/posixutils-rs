@@ -18,6 +18,6 @@ pub mod lir;
 pub mod macros;
 pub(crate) mod mapping;
 pub mod regalloc;
-mod x87;
+pub(crate) mod x87;
 
 pub use macros::get_macros;

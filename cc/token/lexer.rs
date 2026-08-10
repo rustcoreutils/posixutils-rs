@@ -12,6 +12,7 @@
 
 use crate::diag;
 use crate::strings::{StringId, StringTable};
+use gettextrs::gettext;
 
 // Re-export Position for use by other modules
 pub use crate::diag::Position;
@@ -788,7 +789,7 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             let c = self.nextchar();
             if c == EOF {
                 // Unterminated string/char - emit warning
-                diag::warning(pos, "End of file in middle of string");
+                diag::warning(pos, &gettext("End of file in middle of string"));
                 break;
             }
             let cu = c as u8;
@@ -796,7 +797,7 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             // Check for \x without hex digits
             if want_hex {
                 if !cu.is_ascii_hexdigit() {
-                    diag::warning(pos, "\\x used with no following hex digits");
+                    diag::warning(pos, &gettext("\\x used with no following hex digits"));
                 }
                 want_hex = false;
             }
@@ -825,9 +826,10 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             if cu == b'\n' {
                 // Error: newline in string/char literal - emit warning
                 let delim_char = if delim == b'"' { '"' } else { '\'' };
-                diag::warning(
+                diag::warning_args(
                     pos,
-                    &format!("missing terminating {} character", delim_char),
+                    "missing terminating {0} character",
+                    &[&delim_char.to_string()],
                 );
                 break;
             }
@@ -837,7 +839,7 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
 
         // Check for trailing \x at end of string
         if want_hex {
-            diag::warning(pos, "\\x used with no following hex digits");
+            diag::warning(pos, &gettext("\\x used with no following hex digits"));
         }
 
         let (typ, value) = if delim == b'"' {
@@ -895,7 +897,7 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             let curr = next;
             if curr == EOF {
                 // Unterminated comment - emit warning
-                diag::warning(pos, "End of file in the middle of a comment");
+                diag::warning(pos, &gettext("End of file in the middle of a comment"));
                 break;
             }
             next = self.nextchar();

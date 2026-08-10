@@ -157,16 +157,26 @@ pub enum Aarch64Inst {
     },
 
     /// ADRP - Form PC-relative address to 4KB page
-    Adrp { sym: Symbol, dst: Reg },
+    Adrp {
+        sym: Symbol,
+        dst: Reg,
+    },
 
     /// ADRP for GOT access (macOS only)
     /// Emits: adrp dst, sym@GOTPAGE
-    AdrpGotPage { sym: Symbol, dst: Reg },
+    AdrpGotPage {
+        sym: Symbol,
+        dst: Reg,
+    },
 
     /// ADD with symbol page offset (used with ADRP)
     /// macOS: add dst, base, symbol@PAGEOFF
     /// Linux: add dst, base, :lo12:symbol
-    AddSymOffset { sym: Symbol, base: Reg, dst: Reg },
+    AddSymOffset {
+        sym: Symbol,
+        base: Reg,
+        dst: Reg,
+    },
 
     /// LDR with symbol page offset (used with ADRP)
     /// macOS: ldr dst, [base, symbol@PAGEOFF]
@@ -180,23 +190,45 @@ pub enum Aarch64Inst {
 
     /// LDR with GOT page offset (macOS only, for external symbols)
     /// Emits: ldr dst, [base, sym@GOTPAGEOFF]
-    LdrSymGotPageOff { sym: Symbol, base: Reg, dst: Reg },
+    LdrSymGotPageOff {
+        sym: Symbol,
+        base: Reg,
+        dst: Reg,
+    },
 
     /// MRS - Move system register to general-purpose register
     /// Used for TLS: mrs dst, tpidr_el0
-    Mrs { sysreg: &'static str, dst: Reg },
+    Mrs {
+        sysreg: &'static str,
+        dst: Reg,
+    },
 
     /// TLS Local Exec: add dst, base, :tprel_hi12:sym
-    AddTprelHi12 { sym: Symbol, base: Reg, dst: Reg },
+    AddTprelHi12 {
+        sym: Symbol,
+        base: Reg,
+        dst: Reg,
+    },
 
     /// TLS Local Exec: add dst, base, :tprel_lo12_nc:sym
-    AddTprelLo12Nc { sym: Symbol, base: Reg, dst: Reg },
+    AddTprelLo12Nc {
+        sym: Symbol,
+        base: Reg,
+        dst: Reg,
+    },
 
     /// TLS Initial Exec: adrp dst, :gottpoff:sym
-    AdrpGottpoff { sym: Symbol, dst: Reg },
+    AdrpGottpoff {
+        sym: Symbol,
+        dst: Reg,
+    },
 
     /// TLS Initial Exec: ldr dst, [base, :gottpoff_lo12:sym]
-    LdrGottpoffLo12 { sym: Symbol, base: Reg, dst: Reg },
+    LdrGottpoffLo12 {
+        sym: Symbol,
+        base: Reg,
+        dst: Reg,
+    },
 
     // ========================================================================
     // Integer Arithmetic
@@ -354,7 +386,10 @@ pub enum Aarch64Inst {
     },
 
     /// CSET - Conditional set (set to 1 if condition true, else 0)
-    Cset { cond: CondCode, dst: Reg },
+    Cset {
+        cond: CondCode,
+        dst: Reg,
+    },
 
     /// CSEL - Conditional select
     Csel {
@@ -383,22 +418,36 @@ pub enum Aarch64Inst {
     },
 
     /// SXTW - Sign extend word to doubleword
-    Sxtw { src: Reg, dst: Reg },
+    Sxtw {
+        src: Reg,
+        dst: Reg,
+    },
 
     /// UXTB - Zero extend byte (AND with 0xFF)
-    Uxtb { src: Reg, dst: Reg },
+    Uxtb {
+        src: Reg,
+        dst: Reg,
+    },
 
     /// UXTH - Zero extend halfword (AND with 0xFFFF)
-    Uxth { src: Reg, dst: Reg },
+    Uxth {
+        src: Reg,
+        dst: Reg,
+    },
 
     // ========================================================================
     // Control Flow
     // ========================================================================
     /// B - Unconditional branch
-    B { target: Label },
+    B {
+        target: Label,
+    },
 
     /// B.cond - Conditional branch
-    BCond { cond: CondCode, target: Label },
+    BCond {
+        cond: CondCode,
+        target: Label,
+    },
 
     /// CBNZ - Compare and Branch if Not Zero
     /// Used for atomic LL/SC retry loops
@@ -409,26 +458,52 @@ pub enum Aarch64Inst {
     },
 
     /// BL - Branch with link (function call)
-    Bl { target: CallTarget<Reg> },
+    Bl {
+        target: CallTarget<Reg>,
+    },
 
     /// RET - Return from subroutine
     Ret,
 
     /// BRK - Software breakpoint (trap)
     /// Used for __builtin_unreachable() to signal unreachable code
-    Brk { imm: u16 },
+    Brk {
+        imm: u16,
+    },
 
     // ========================================================================
     // Floating-Point (Scalar)
     // ========================================================================
     /// FMOV - FP move (between FP regs or GP<->FP)
-    FmovReg { size: FpSize, src: VReg, dst: VReg },
+    FmovReg {
+        size: FpSize,
+        src: VReg,
+        dst: VReg,
+    },
 
     /// FMOV - Move from GP to FP register
-    FmovFromGp { size: FpSize, src: Reg, dst: VReg },
+    FmovFromGp {
+        size: FpSize,
+        src: Reg,
+        dst: VReg,
+    },
 
     /// FMOV - Move from FP to GP register
-    FmovToGp { size: FpSize, src: VReg, dst: Reg },
+    /// INS Vd.D[lane], Xn — insert a 64-bit GP value into a vector lane.
+    ///
+    /// The only way to build a 128-bit value in a V register from general
+    /// registers: `fmov` covers lane 0, this covers lane 1.
+    InsGpToVecD {
+        lane: u8,
+        src: Reg,
+        dst: VReg,
+    },
+
+    FmovToGp {
+        size: FpSize,
+        src: VReg,
+        dst: Reg,
+    },
 
     /// LDR (FP) - Load FP register
     LdrFp {
@@ -503,7 +578,11 @@ pub enum Aarch64Inst {
     },
 
     /// FNEG - FP negate
-    Fneg { size: FpSize, src: VReg, dst: VReg },
+    Fneg {
+        size: FpSize,
+        src: VReg,
+        dst: VReg,
+    },
 
     /// FCMP - FP compare
     Fcmp {
@@ -513,7 +592,10 @@ pub enum Aarch64Inst {
     },
 
     /// FCMP with zero
-    FcmpZero { size: FpSize, src: VReg },
+    FcmpZero {
+        size: FpSize,
+        src: VReg,
+    },
 
     /// SCVTF - Signed int to FP
     Scvtf {
@@ -656,7 +738,11 @@ pub enum Aarch64Inst {
     },
 
     /// UMULH - Unsigned multiply high (upper 64 bits of 64x64->128 multiply)
-    Umulh { src1: Reg, src2: Reg, dst: Reg },
+    Umulh {
+        src1: Reg,
+        src2: Reg,
+        dst: Reg,
+    },
 
     // ========================================================================
     // Directives (Architecture-Independent)
@@ -910,8 +996,20 @@ impl EmitAsm for Aarch64Inst {
 
             Aarch64Inst::AdrpGotPage { sym, dst } => {
                 let sym_name = sym.format_for_target(target);
-                // GOT page access - only used on macOS for external symbols
-                let _ = writeln!(out, "    adrp {}, {}@GOTPAGE", dst.name64(), sym_name);
+                // The GOT relocation spelling is per object format. `@GOTPAGE`
+                // is Mach-O; ELF writes `:got:`. This emitted the Mach-O form
+                // unconditionally -- its comment even said "macOS only" -- but
+                // needs_got_access fires for every extern symbol on every
+                // target, so GNU as saw `adrp x0, stdout@GOTPAGE` and rejected
+                // it as "unexpected characters following instruction".
+                match target.os {
+                    Os::MacOS => {
+                        let _ = writeln!(out, "    adrp {}, {}@GOTPAGE", dst.name64(), sym_name);
+                    }
+                    _ => {
+                        let _ = writeln!(out, "    adrp {}, :got:{}", dst.name64(), sym_name);
+                    }
+                }
             }
 
             Aarch64Inst::AddSymOffset { sym, base, dst } => {
@@ -978,14 +1076,27 @@ impl EmitAsm for Aarch64Inst {
 
             Aarch64Inst::LdrSymGotPageOff { sym, base, dst } => {
                 let sym_name = sym.format_for_target(target);
-                // GOT page offset load - loads the address from GOT (macOS only)
-                let _ = writeln!(
-                    out,
-                    "    ldr {}, [{}, {}@GOTPAGEOFF]",
-                    dst.name64(),
-                    base.name64(),
-                    sym_name
-                );
+                // As above: `@GOTPAGEOFF` is Mach-O, `:got_lo12:` is ELF.
+                match target.os {
+                    Os::MacOS => {
+                        let _ = writeln!(
+                            out,
+                            "    ldr {}, [{}, {}@GOTPAGEOFF]",
+                            dst.name64(),
+                            base.name64(),
+                            sym_name
+                        );
+                    }
+                    _ => {
+                        let _ = writeln!(
+                            out,
+                            "    ldr {}, [{}, :got_lo12:{}]",
+                            dst.name64(),
+                            base.name64(),
+                            sym_name
+                        );
+                    }
+                }
             }
 
             // TLS Instructions
@@ -1381,10 +1492,17 @@ impl EmitAsm for Aarch64Inst {
 
             // Floating-Point
             Aarch64Inst::FmovReg { size, src, dst } => {
+                // `fmov` has no 128-bit form. A whole-register copy is the
+                // vector move, which is what gcc emits for `long double`.
+                if *size == FpSize::Quad {
+                    let _ = writeln!(out, "    mov {}.16b, {}.16b", dst.name_v(), src.name_v());
+                    return;
+                }
                 let name = match size {
                     FpSize::Half => (src.name_h(), dst.name_h()),
                     FpSize::Single => (src.name_s(), dst.name_s()),
                     FpSize::Double => (src.name_d(), dst.name_d()),
+                    FpSize::Quad => unreachable!("handled above"),
                     FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
                 };
                 let _ = writeln!(out, "    fmov {}, {}", name.1, name.0);
@@ -1395,15 +1513,27 @@ impl EmitAsm for Aarch64Inst {
                     FpSize::Half => dst.name_h(),
                     FpSize::Single => dst.name_s(),
                     FpSize::Double => dst.name_d(),
+                    FpSize::Quad => dst.name_q(),
                     FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
                 };
                 let gp_name = match size {
                     FpSize::Half => src.name32(), // half is moved via 32-bit GP
                     FpSize::Single => src.name32(),
                     FpSize::Double => src.name64(),
+                    FpSize::Quad => unreachable!("a binary128 value does not fit one X register"),
                     FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
                 };
                 let _ = writeln!(out, "    fmov {}, {}", fp_name, gp_name);
+            }
+
+            Aarch64Inst::InsGpToVecD { lane, src, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    mov {}.d[{}], {}",
+                    dst.name_v(),
+                    lane,
+                    src.name64()
+                );
             }
 
             Aarch64Inst::FmovToGp { size, src, dst } => {
@@ -1411,12 +1541,14 @@ impl EmitAsm for Aarch64Inst {
                     FpSize::Half => src.name_h(),
                     FpSize::Single => src.name_s(),
                     FpSize::Double => src.name_d(),
+                    FpSize::Quad => unreachable!("a binary128 value does not fit one X register"),
                     FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
                 };
                 let gp_name = match size {
                     FpSize::Half => dst.name32(), // half is moved via 32-bit GP
                     FpSize::Single => dst.name32(),
                     FpSize::Double => dst.name64(),
+                    FpSize::Quad => unreachable!("a binary128 value does not fit one X register"),
                     FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
                 };
                 let _ = writeln!(out, "    fmov {}, {}", gp_name, fp_name);
@@ -1427,6 +1559,8 @@ impl EmitAsm for Aarch64Inst {
                     FpSize::Half => dst.name_h(),
                     FpSize::Single => dst.name_s(),
                     FpSize::Double => dst.name_d(),
+                    // AAPCS64 keeps binary128 in a whole Q register.
+                    FpSize::Quad => dst.name_q(),
                     FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
                 };
                 let _ = writeln!(out, "    ldr {}, {}", name, addr.format());
@@ -1437,6 +1571,7 @@ impl EmitAsm for Aarch64Inst {
                     FpSize::Half => src.name_h(),
                     FpSize::Single => src.name_s(),
                     FpSize::Double => src.name_d(),
+                    FpSize::Quad => src.name_q(),
                     FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
                 };
                 let _ = writeln!(out, "    str {}, {}", name, addr.format());
@@ -1452,6 +1587,7 @@ impl EmitAsm for Aarch64Inst {
                     FpSize::Half => (src1.name_h(), src2.name_h()),
                     FpSize::Single => (src1.name_s(), src2.name_s()),
                     FpSize::Double => (src1.name_d(), src2.name_d()),
+                    FpSize::Quad => (src1.name_q(), src2.name_q()),
                     FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
                 };
                 let _ = writeln!(out, "    stp {}, {}, {}", name1, name2, addr.format());
@@ -1467,6 +1603,7 @@ impl EmitAsm for Aarch64Inst {
                     FpSize::Half => (dst1.name_h(), dst2.name_h()),
                     FpSize::Single => (dst1.name_s(), dst2.name_s()),
                     FpSize::Double => (dst1.name_d(), dst2.name_d()),
+                    FpSize::Quad => (dst1.name_q(), dst2.name_q()),
                     FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
                 };
                 let _ = writeln!(out, "    ldp {}, {}, {}", name1, name2, addr.format());
@@ -1483,6 +1620,7 @@ impl EmitAsm for Aarch64Inst {
                     FpSize::Half => dst.name_h(),
                     FpSize::Single => dst.name_s(),
                     FpSize::Double => dst.name_d(),
+                    FpSize::Quad => dst.name_q(),
                     FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
                 };
                 match target.os {
@@ -1839,6 +1977,7 @@ fn size_bits(size: FpSize) -> u32 {
         FpSize::Half => 16,
         FpSize::Single => 32,
         FpSize::Double => 64,
+        FpSize::Quad => 128,
         FpSize::Extended => 80, // x87 not used on AArch64, but provide size
     }
 }

@@ -9,6 +9,30 @@
 
 ## Technical Debt
 
+### Floating literals are stored as `f64`
+
+**Location**: `ExprKind::FloatLit(f64)` in `cc/parse/ast.rs`
+
+**Issue**: Every floating literal is parsed into an `f64`, so any value outside
+double's range is lost before the type system ever sees it. `LDBL_MAX`
+evaluates to `inf` on x86-64, where `long double` is x87 80-bit and holds it
+comfortably; gcc prints `1.18973e+4932`.
+
+**Consequence**: `long double` constants are silently limited to 53 bits of
+mantissa and double's exponent range. `c17_long_double_round_trip` passes only
+because `inf` compares equal to itself.
+
+**Cost of fixing**: touches the AST, the constant folder, and both backends'
+immediate paths (`Loc::FImm` is `(f64, u32)`).
+
+### Stack frames are larger than gcc's
+
+CPython hardcodes `C_RECURSION_LIMIT 10000` (`Include/cpython/pystate.h`),
+tuned to gcc's frame sizes. Twelve of its test files deliberately recurse to
+that limit and blow the default 8 MB stack under c17 before the counter trips;
+they pass with `ulimit -s 65536`. Not a miscompile, but a real quality gap —
+and the acceptance gate has to raise the stack to measure correctness.
+
 ### R10 reserved globally for division scratch
 
 **Location**: `arch/x86_64/regalloc.rs` lines 187-208
@@ -27,22 +51,18 @@
 
 ## Future Features
 
-### C11 `_Generic` Type-Generic Selection
+### C11 Atomics — remaining semantic validation
 
-```c
-#define cbrt(x) _Generic((x), float: cbrtf, long double: cbrtl, default: cbrt)(x)
-```
+The type system, parser, IR, linearizer, both code generators, `<stdatomic.h>`,
+and access through ordinary operators are all done. `_Atomic` on an array or
+function type is rejected.
 
-**Status:** Not started
-**Complexity:** Moderate
-
-### C11 Atomics — Semantic Validation (Phase 8)
-
-Phases 1-7 (type system, parser, IR, linearizer, x86-64/ARM64 codegen, stdatomic.h) are done.
-
-**Remaining:** Phase 8 semantic validation:
+**Remaining:**
+- Reject `_Atomic` on a struct or union with a VLA member (the array and
+  function cases are handled)
+- Accept `_Atomic` after `*` in a declarator: `int *_Atomic p;` fails to parse
+  while `int *const p;` does not
 - Reject `&(atomic_struct.member)`
-- Validate `sizeof` on atomic type returns atomic size
 
 ### C11 Thread-Local Storage — Dynamic Model
 

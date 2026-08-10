@@ -5747,3 +5747,185 @@ fn test_bitfield_storage_type() {
     assert_eq!(linearizer.bitfield_storage_type(3), types.uint_id);
     assert_eq!(linearizer.bitfield_storage_type(16), types.uint_id);
 }
+
+// ============================================================================
+// `_Atomic` through ordinary operators (audit #X1)
+// ============================================================================
+
+/// Build `void test(T x) { x <op>= 1; }` with T either `_Atomic int` or
+/// plain `int`, and linearize it.
+///
+/// The operand is a parameter because the linearizer registers scalar
+/// parameters as ordinary locals, which is the same lvalue shape a local
+/// declaration produces -- and it keeps the AST small.
+fn compound_module(op: AssignOp, atomic: bool) -> (TestContext, Module) {
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+
+    // `_Atomic int` -- the qualifier is a modifier on the type. The
+    // non-atomic build of the same function is the control: it shows how many
+    // plain memory operations the shape costs when nothing is atomic.
+    let atomic_int = if atomic {
+        let mut t = ctx.types.get(ctx.types.int_id).clone();
+        t.modifiers |= TypeModifiers::ATOMIC;
+        ctx.types.intern(t)
+    } else {
+        ctx.types.int_id
+    };
+    let x_sym = ctx.var("x", atomic_int);
+
+    let assign = Expr::typed_unpositioned(
+        ExprKind::Assign {
+            op,
+            target: Box::new(Expr::var_typed(x_sym, atomic_int)),
+            value: Box::new(Expr::typed_unpositioned(
+                ExprKind::IntLit(1),
+                ctx.types.int_id,
+            )),
+        },
+        atomic_int,
+    );
+
+    let func = FunctionDef {
+        return_type: ctx.types.void_id,
+        name: test_id,
+        params: vec![Parameter {
+            symbol: Some(x_sym),
+            typ: atomic_int,
+        }],
+        body: Stmt::Block(vec![BlockItem::Statement(Box::new(Stmt::Expr(assign)))]),
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
+    };
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+    let module = ctx.linearize(&tu);
+    (ctx, module)
+}
+
+fn count_op(module: &Module, op: Opcode) -> usize {
+    module.functions[0]
+        .blocks
+        .iter()
+        .map(|bb| bb.insns.iter().filter(|i| i.op == op).count())
+        .sum()
+}
+
+/// `x += 1` must become one atomic read-modify-write, and must not leave the
+/// plain load/store pair behind that made it a silent data race.
+#[test]
+fn test_atomic_compound_assign_uses_fetch_add() {
+    let (_ctx, module) = compound_module(AssignOp::AddAssign, true);
+
+    assert_eq!(
+        count_op(&module, Opcode::AtomicFetchAdd),
+        1,
+        "expected exactly one AtomicFetchAdd"
+    );
+    // The non-atomic control emits load / add / store. The atomic version
+    // must emit neither the load nor the store -- one instruction replaces
+    // all three. (A plain Store remains in both: the parameter prologue.)
+    let (_c, control) = compound_module(AssignOp::AddAssign, false);
+    assert!(
+        count_op(&control, Opcode::Load) > 0,
+        "control should load the object"
+    );
+    assert_eq!(
+        count_op(&module, Opcode::Load),
+        0,
+        "an atomic compound assignment must not load the object separately"
+    );
+    assert_eq!(
+        count_op(&module, Opcode::Store),
+        count_op(&control, Opcode::Store) - 1,
+        "the object's store must have become atomic"
+    );
+
+    // The operation is sequentially consistent and carries the object's width.
+    let insn = module.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|bb| bb.insns.iter())
+        .find(|i| i.op == Opcode::AtomicFetchAdd)
+        .unwrap();
+    assert_eq!(insn.memory_order, MemoryOrder::SeqCst);
+    assert_eq!(insn.size, 32);
+    assert_eq!(insn.src.len(), 3, "expected [addr, value, order]");
+}
+
+/// `x -= 1` maps to the native subtract form rather than the CAS loop.
+#[test]
+fn test_atomic_compound_assign_uses_fetch_sub() {
+    let (_ctx, module) = compound_module(AssignOp::SubAssign, true);
+    assert_eq!(count_op(&module, Opcode::AtomicFetchSub), 1);
+    assert_eq!(count_op(&module, Opcode::AtomicCas), 0);
+}
+
+/// The bitwise operators have native atomic forms too.
+#[test]
+fn test_atomic_compound_assign_bitops_are_native() {
+    for (op, want) in [
+        (AssignOp::AndAssign, Opcode::AtomicFetchAnd),
+        (AssignOp::OrAssign, Opcode::AtomicFetchOr),
+        (AssignOp::XorAssign, Opcode::AtomicFetchXor),
+    ] {
+        let (_ctx, module) = compound_module(op, true);
+        assert_eq!(count_op(&module, want), 1, "{:?} should use {:?}", op, want);
+        assert_eq!(count_op(&module, Opcode::AtomicCas), 0);
+    }
+}
+
+/// Multiplication has no native atomic form, so it becomes a
+/// compare-and-swap retry loop: a seeding atomic load, one CAS, and a
+/// conditional branch back to the block containing the CAS.
+#[test]
+fn test_atomic_compound_assign_without_native_op_uses_a_cas_loop() {
+    let (_ctx, module) = compound_module(AssignOp::MulAssign, true);
+
+    assert_eq!(count_op(&module, Opcode::AtomicCas), 1, "one CAS");
+    assert_eq!(count_op(&module, Opcode::AtomicLoad), 1, "one seeding load");
+    assert_eq!(
+        count_op(&module, Opcode::AtomicFetchAdd),
+        0,
+        "must not use a native fetch-op"
+    );
+
+    let func = &module.functions[0];
+    assert!(
+        func.blocks.len() >= 3,
+        "a CAS loop needs entry, loop and exit blocks, got {}",
+        func.blocks.len()
+    );
+
+    // The block holding the CAS must end in a conditional branch whose false
+    // edge returns to itself -- otherwise the loop cannot retry.
+    let cas_bb = func
+        .blocks
+        .iter()
+        .find(|bb| bb.insns.iter().any(|i| i.op == Opcode::AtomicCas))
+        .expect("no block contains the CAS");
+    let terminator = cas_bb.insns.last().expect("empty block");
+    assert_eq!(
+        terminator.op,
+        Opcode::Cbr,
+        "the CAS block must end in a conditional branch"
+    );
+}
+
+/// `x = 1` is a single atomic store, not a plain one.
+#[test]
+fn test_atomic_plain_assign_uses_atomic_store() {
+    let (_ctx, module) = compound_module(AssignOp::Assign, true);
+    assert_eq!(count_op(&module, Opcode::AtomicStore), 1);
+
+    let (_c, control) = compound_module(AssignOp::Assign, false);
+    assert_eq!(
+        count_op(&module, Opcode::Store),
+        count_op(&control, Opcode::Store) - 1,
+        "the object's store must have become atomic (the remaining plain \
+         Store is the parameter prologue, present in both)"
+    );
+}

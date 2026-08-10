@@ -1102,14 +1102,52 @@ impl<'a> super::linearize::Linearizer<'a> {
         let target_typ = self.expr_type(target);
         let value_typ = self.expr_type(value);
 
+        // An assignment to an `_Atomic` object is an atomic store, and a
+        // compound assignment is a single atomic read-modify-write
+        // (C17 6.5.16.2p3) -- not the load/compute/store this would otherwise
+        // emit. Branch before the complex and struct early-returns below so
+        // those shapes reach atomic_lvalue's diagnostic rather than silently
+        // block-copying.
+        if let Some(result) = self.try_emit_atomic_assign(op, target, value) {
+            return result;
+        }
+
         // For complex type assignment, handle specially - copy real and imag parts
         if self.types.is_complex(target_typ) && op == AssignOp::Assign {
             let target_addr = self.linearize_lvalue(target);
-            let value_addr = if self.types.is_complex(value_typ) {
-                self.complex_operand_addr(value)
-            } else {
-                self.linearize_lvalue(value)
-            };
+
+            // Assigning a *real* to a complex is a conversion, not a copy:
+            // C99 6.3.1.7 gives the result that value as its real part and a
+            // zero imaginary part. Taking the address of the right-hand side
+            // here treated a non-lvalue as one -- `dc = 1.0` produced
+            // `movabsq $4607182418800017408, %r11` (the bit pattern of 1.0)
+            // followed by a dereference of it, so any such assignment
+            // segfaulted, for locals and globals alike.
+            if !self.types.is_complex(value_typ) {
+                let dst_base = self.types.complex_base(target_typ);
+                let dst_size = self.types.size_bits(dst_base);
+                let dst_stride = (dst_size / 8) as i64;
+
+                let real = self.linearize_expr(value);
+                let real = self.emit_convert(real, value_typ, dst_base);
+                self.emit(Instruction::store(real, target_addr, 0, dst_base, dst_size));
+
+                let zero = if self.types.is_float(dst_base) {
+                    self.emit_fconst(0.0, dst_base)
+                } else {
+                    self.emit_const(0, dst_base)
+                };
+                self.emit(Instruction::store(
+                    zero,
+                    target_addr,
+                    dst_stride,
+                    dst_base,
+                    dst_size,
+                ));
+                return target_addr;
+            }
+
+            let value_addr = self.complex_operand_addr(value);
 
             // The two sides may have *different* base precisions — assigning a
             // `double _Complex` to a `long double _Complex` is an ordinary

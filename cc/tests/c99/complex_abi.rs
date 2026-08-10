@@ -328,14 +328,12 @@ fn c99_complex_return_of_an_rvalue() {
 /// value had spilled, leaving the parameter uninitialized, and shifted every
 /// argument after it.
 ///
-/// x86_64 only. AArch64 has the same gap — `aarch64/codegen.rs`'s prologue
-/// likewise skips the copy when `fp_arg_idx + 1` runs past the register file —
-/// but the rule for what happens next is not the same one: AAPCS64 §6.4.2 sets
-/// NSRN to 8 once an argument is laid out on the stack, so *every* later
-/// floating-point argument follows it there, where System V leaves the unused
-/// registers available. Closing it means implementing that, and the audit
-/// records it (#H13) rather than guessing at it from the wrong architecture.
-#[cfg(target_arch = "x86_64")]
+/// Runs on both architectures. AArch64 had the same gap, but not the same
+/// rule for what follows: AAPCS64 §6.4.2 sets NSRN to 8 once an argument is
+/// laid out on the stack, so *every* later floating-point argument follows it
+/// there, where System V leaves the unused registers available. Both sides now
+/// implement that, so the `#[cfg(target_arch = "x86_64")]` this carried while
+/// #H13 was open is gone -- macOS CI executes it on aarch64.
 #[test]
 fn c99_complex_argument_spilled_to_the_stack() {
     let src = r#"
@@ -434,4 +432,64 @@ fn c99_complex_mixed_precision() {
         compile_and_run("c99_complex_mixed_precision", src, &["-lm".to_string()]),
         0
     );
+}
+
+/// Assigning a *real* to a complex object is a conversion, not a copy.
+///
+/// C99 6.3.1.7 gives the result that value as its real part and a zero
+/// imaginary part. The complex-assignment path took the address of the
+/// right-hand side unconditionally, which treats a non-lvalue as one:
+/// `dc = 1.0` emitted `movabsq $4607182418800017408, %r11` -- the bit pattern
+/// of 1.0 -- and then dereferenced it, so every such assignment segfaulted.
+///
+/// Pre-existing on main; found while testing atomic aggregates.
+#[test]
+fn c99_assigning_a_real_to_a_complex_converts() {
+    let src = r#"
+        #include <string.h>
+
+        double _Complex g;
+        float _Complex gf;
+        long double _Complex gl;
+
+        int main(void) {
+            /* Global, double. */
+            g = 1.0;
+            double parts[2];
+            memcpy(parts, &g, sizeof parts);
+            if (parts[0] != 1.0 || parts[1] != 0.0) return 1;
+
+            /* Local. */
+            double _Complex l = __builtin_complex(9.0, 9.0);
+            l = 2.5;
+            memcpy(parts, &l, sizeof parts);
+            if (parts[0] != 2.5 || parts[1] != 0.0) return 2;
+
+            /* An integer right-hand side converts too. */
+            l = 3;
+            memcpy(parts, &l, sizeof parts);
+            if (parts[0] != 3.0 || parts[1] != 0.0) return 3;
+
+            /* float _Complex, whose base is narrower than the value. */
+            gf = 1.5;
+            float fparts[2];
+            memcpy(fparts, &gf, sizeof fparts);
+            if (fparts[0] != 1.5f || fparts[1] != 0.0f) return 4;
+
+            /* long double _Complex, whose base is wider. */
+            gl = 4.25;
+            long double lparts[2];
+            memcpy(lparts, &gl, sizeof lparts);
+            if (lparts[0] != 4.25L || lparts[1] != 0.0L) return 5;
+
+            /* A previously-nonzero imaginary part must be cleared. */
+            l = __builtin_complex(7.0, 8.0);
+            l = 1.0;
+            memcpy(parts, &l, sizeof parts);
+            if (parts[1] != 0.0) return 6;
+
+            return 0;
+        }
+    "#;
+    assert_eq!(compile_and_run("c99_real_to_complex_assign", src, &[]), 0);
 }

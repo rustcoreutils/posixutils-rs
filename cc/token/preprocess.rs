@@ -25,7 +25,8 @@ use crate::arch;
 use crate::builtin_headers;
 use crate::diag;
 use crate::os;
-use crate::target::Target;
+use crate::target::{CStd, LangOpts, Target};
+use gettextrs::gettext;
 
 const DEFAULT_MACRO_CAPACITY: usize = 32;
 const DEFAULT_COND_STACK_CAPACITY: usize = 8;
@@ -341,6 +342,9 @@ pub struct Preprocessor<'a> {
     /// Target configuration
     target: &'a Target,
 
+    /// Language dialect selected by `-std=`
+    lang: LangOpts,
+
     /// Macro definitions
     macros: HashMap<String, Macro>,
 
@@ -534,7 +538,7 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Create a new preprocessor
-    pub fn new(target: &'a Target, filename: &str) -> Self {
+    pub fn new(target: &'a Target, filename: &str, lang: LangOpts) -> Self {
         let current_dir = Path::new(filename)
             .parent()
             .map(|p| p.to_string_lossy().to_string())
@@ -544,6 +548,7 @@ impl<'a> Preprocessor<'a> {
 
         let mut pp = Self {
             target,
+            lang,
             macros: HashMap::with_capacity(DEFAULT_MACRO_CAPACITY),
             cond_stack: Vec::with_capacity(DEFAULT_COND_STACK_CAPACITY),
             system_include_paths: Vec::with_capacity(DEFAULT_INCLUDE_PATH_CAPACITY),
@@ -583,8 +588,17 @@ impl<'a> Preprocessor<'a> {
     fn init_predefined_macros(&mut self) {
         // Standard C macros
         self.define_macro(Macro::predefined("__STDC__", Some("1")));
-        self.define_macro(Macro::predefined("__STDC_VERSION__", Some("201112L"))); // C11
+        // C89 predates __STDC_VERSION__ entirely, so it is left undefined there.
+        if let Some(version) = self.lang.std.version_macro() {
+            self.define_macro(Macro::predefined("__STDC_VERSION__", Some(version)));
+        }
         self.define_macro(Macro::predefined("__STDC_HOSTED__", Some("1")));
+
+        // C17 4p8: a strictly-conforming (non-GNU) dialect advertises itself,
+        // and system headers use this to hide their extensions.
+        if !self.lang.gnu {
+            self.define_macro(Macro::predefined("__STRICT_ANSI__", Some("1")));
+        }
 
         // C17 6.10.8.3 conditional feature macros.
         //
@@ -596,8 +610,14 @@ impl<'a> Preprocessor<'a> {
         // GCC reports it).
         self.define_macro(Macro::predefined("__STDC_IEC_559__", Some("1")));
         self.define_macro(Macro::predefined("__STDC_ISO_10646__", Some("201706L")));
-        self.define_macro(Macro::predefined("__STDC_UTF_16__", Some("1")));
-        self.define_macro(Macro::predefined("__STDC_UTF_32__", Some("1")));
+
+        // __STDC_UTF_16__ / __STDC_UTF_32__ describe char16_t / char32_t, which
+        // C11 introduced. Defining them under -std=c99 would assert a property
+        // of types that dialect does not have.
+        if self.lang.std >= CStd::C11 {
+            self.define_macro(Macro::predefined("__STDC_UTF_16__", Some("1")));
+            self.define_macro(Macro::predefined("__STDC_UTF_32__", Some("1")));
+        }
 
         // __STDC_IEC_559_COMPLEX__ is deliberately NOT defined. It asserts
         // conformance to Annex G, and complex support does not meet that bar:
@@ -607,8 +627,9 @@ impl<'a> Preprocessor<'a> {
         // C17 4p6: an implementation that does not provide <threads.h> shall
         // define __STDC_NO_THREADS__, so portable code can feature-test rather
         // than fail at the include. We bundle no threads.h and rely on the
-        // host's, so this is a question about the host.
-        if !self.host_has_threads_header() {
+        // host's, so this is a question about the host. The macro itself is a
+        // C11 addition, so it says nothing under an earlier dialect.
+        if self.lang.std >= CStd::C11 && !self.host_has_threads_header() {
             self.define_macro(Macro::predefined("__STDC_NO_THREADS__", Some("1")));
         }
 
@@ -699,13 +720,18 @@ impl<'a> Preprocessor<'a> {
             self.define_macro(Macro::predefined(name, Some(value)));
         }
 
-        // OS macros
+        // OS macros.
+        //
+        // A strict dialect may only predefine names in the implementation's
+        // reserved namespace, so `unix` and `linux` are dropped while
+        // `__unix__` and `__linux__` stay. Filtering on the leading underscore
+        // rather than an explicit deny-list means a new non-reserved macro
+        // added to an OS table cannot silently leak into `-std=c17`.
         for (name, value) in os::get_os_macros(self.target) {
-            if let Some(v) = value {
-                self.define_macro(Macro::predefined(name, Some(v)));
-            } else {
-                self.define_macro(Macro::predefined(name, None));
+            if !self.lang.gnu && !name.starts_with('_') {
+                continue;
             }
+            self.define_macro(Macro::predefined(name, value.as_deref()));
         }
 
         // Builtin macros
@@ -1048,9 +1074,10 @@ impl<'a> Preprocessor<'a> {
                 // Unknown directive
                 if !self.is_skipping() {
                     let name = idents.get_opt(directive_id).unwrap_or("unknown");
-                    diag::warning(
+                    diag::warning_args(
                         hash_token.pos,
-                        &format!("unknown preprocessor directive #{}", name),
+                        "unknown preprocessor directive #{0}",
+                        &[name],
                     );
                 }
                 self.skip_to_eol(iter);
@@ -1354,7 +1381,11 @@ impl<'a> Preprocessor<'a> {
         // break a great deal of code that redefines a macro benignly.
         if let Some(existing) = self.macros.get(&name) {
             if let Some(why) = macro_redefinition_conflict(existing, &mac) {
-                diag::warning(name_token.pos, &format!("'{}' redefined: {}", name, why));
+                diag::warning_args(
+                    name_token.pos,
+                    "'{0}' redefined: {1}",
+                    &[&name.to_string(), why],
+                );
             }
         }
 
@@ -1380,7 +1411,7 @@ impl<'a> Preprocessor<'a> {
             if is_paste(first) {
                 diag::error(
                     first.pos,
-                    "'##' cannot appear at the start of a macro replacement list",
+                    &gettext("'##' cannot appear at the start of a macro replacement list"),
                 );
             }
         }
@@ -1389,7 +1420,7 @@ impl<'a> Preprocessor<'a> {
                 if is_paste(last) {
                     diag::error(
                         last.pos,
-                        "'##' cannot appear at the end of a macro replacement list",
+                        &gettext("'##' cannot appear at the end of a macro replacement list"),
                     );
                 }
             }
@@ -1460,7 +1491,10 @@ impl<'a> Preprocessor<'a> {
                     // be followed by a parameter. It used to fall through to a
                     // literal `#` token with no diagnostic.
                     if is_function {
-                        diag::error(token.pos, "'#' is not followed by a macro parameter");
+                        diag::error(
+                            token.pos,
+                            &gettext("'#' is not followed by a macro parameter"),
+                        );
                     }
                 }
 
@@ -1777,7 +1811,7 @@ impl<'a> Preprocessor<'a> {
         // Collect the include path tokens
         let path_tokens = self.collect_to_eol(iter);
         if path_tokens.is_empty() {
-            diag::error(hash_token.pos, "expected filename after #include");
+            diag::error(hash_token.pos, &gettext("expected filename after #include"));
             return;
         }
 
@@ -1808,7 +1842,7 @@ impl<'a> Preprocessor<'a> {
         let (filename, is_system) = self.parse_include_path(&expanded_tokens, idents);
 
         if filename.is_empty() {
-            diag::error(hash_token.pos, "empty filename in #include");
+            diag::error(hash_token.pos, &gettext("empty filename in #include"));
             return;
         }
 
@@ -1825,7 +1859,11 @@ impl<'a> Preprocessor<'a> {
                 }
             }
         } else {
-            diag::error(hash_token.pos, &format!("'{}': file not found", filename));
+            diag::error_args(
+                hash_token.pos,
+                "'{0}': file not found",
+                &[&filename.to_string()],
+            );
         }
     }
 
@@ -2430,9 +2468,10 @@ impl<'a> Preprocessor<'a> {
         let content = match fs::read(path) {
             Ok(c) => c,
             Err(e) => {
-                diag::error(
+                diag::error_args(
                     hash_token.pos,
-                    &format!("cannot read '{}': {}", path.display(), e),
+                    "cannot read '{0}': {1}",
+                    &[&path.display().to_string(), &e.to_string()],
                 );
                 return;
             }
@@ -2457,21 +2496,20 @@ impl<'a> Preprocessor<'a> {
 
         // Check for include cycle (only error if no include guard protects it)
         if self.include_stack.contains(&canonical) {
-            diag::error(
+            diag::error_args(
                 hash_token.pos,
-                &format!("recursive include of '{}'", path.display()),
+                "recursive include of '{0}'",
+                &[&path.display().to_string()],
             );
             return;
         }
 
         // Check include depth
         if self.include_depth >= self.max_include_depth {
-            diag::error(
+            diag::error_args(
                 hash_token.pos,
-                &format!(
-                    "#include nested too deeply (max {})",
-                    self.max_include_depth
-                ),
+                "#include nested too deeply (max {0})",
+                &[&self.max_include_depth.to_string()],
             );
             return;
         }
@@ -2538,12 +2576,10 @@ impl<'a> Preprocessor<'a> {
     ) {
         // Check include depth
         if self.include_depth >= self.max_include_depth {
-            diag::error(
+            diag::error_args(
                 hash_token.pos,
-                &format!(
-                    "#include nested too deeply (max {})",
-                    self.max_include_depth
-                ),
+                "#include nested too deeply (max {0})",
+                &[&self.max_include_depth.to_string()],
             );
             return;
         }
@@ -2598,7 +2634,7 @@ impl<'a> Preprocessor<'a> {
 
         let tokens = self.collect_to_eol(iter);
         let msg = self.tokens_to_text(&tokens, idents);
-        diag::error(*pos, &format!("#error {}", msg));
+        diag::error_args(*pos, "#error {0}", &[&msg.to_string()]);
     }
 
     /// Handle #warning
@@ -2617,7 +2653,7 @@ impl<'a> Preprocessor<'a> {
 
         let tokens = self.collect_to_eol(iter);
         let msg = self.tokens_to_text(&tokens, idents);
-        diag::warning(*pos, &format!("#warning {}", msg));
+        diag::warning_args(*pos, "#warning {0}", &[&msg.to_string()]);
     }
 
     /// Handle #pragma
@@ -2681,12 +2717,15 @@ impl<'a> Preprocessor<'a> {
                             if valid_arg {
                                 iter.next(); // consume ON/OFF/DEFAULT
                             } else {
-                                diag::warning(pos, "expected ON, OFF, or DEFAULT for #pragma STDC");
+                                diag::warning(
+                                    pos,
+                                    &gettext("expected ON, OFF, or DEFAULT for #pragma STDC"),
+                                );
                             }
                         } else {
                             diag::warning(
                                 pos,
-                                "expected FP_CONTRACT, FENV_ACCESS, or CX_LIMITED_RANGE after #pragma STDC",
+                                &gettext("expected FP_CONTRACT, FENV_ACCESS, or CX_LIMITED_RANGE after #pragma STDC"),
                             );
                         }
 
@@ -2757,7 +2796,7 @@ impl<'a> Preprocessor<'a> {
         let tokens = self.collect_to_eol(iter);
         let tokens = self.expand_if_tokens(&tokens, idents);
         if tokens.is_empty() {
-            diag::error(directive_pos, "#line requires a line number");
+            diag::error(directive_pos, &gettext("#line requires a line number"));
             return;
         }
 
@@ -2767,33 +2806,44 @@ impl<'a> Preprocessor<'a> {
             TokenValue::Number(n) => match n.parse::<u32>() {
                 Ok(num) if (1..=2147483647).contains(&num) => num,
                 Ok(_) => {
-                    diag::error(
+                    diag::error_args(
                         tokens[0].pos,
-                        &format!("#line number '{}' is out of range [1, 2147483647]", n),
+                        "#line number '{0}' is out of range [1, 2147483647]",
+                        &[&n.to_string()],
                     );
                     return;
                 }
                 Err(_) => {
-                    diag::error(
+                    diag::error_args(
                         tokens[0].pos,
-                        &format!("#line requires a decimal line number, found '{}'", n),
+                        "#line requires a decimal line number, found '{0}'",
+                        &[&n.to_string()],
                     );
                     return;
                 }
             },
             _ => {
-                diag::error(tokens[0].pos, "#line requires a decimal line number");
+                diag::error(
+                    tokens[0].pos,
+                    &gettext("#line requires a decimal line number"),
+                );
                 return;
             }
         };
 
         // Only a string literal may follow, and nothing may follow that.
         if tokens.len() > 1 && !matches!(&tokens[1].value, TokenValue::String(_)) {
-            diag::error(tokens[1].pos, "#line filename must be a string literal");
+            diag::error(
+                tokens[1].pos,
+                &gettext("#line filename must be a string literal"),
+            );
             return;
         }
         if tokens.len() > 2 {
-            diag::error(tokens[2].pos, "extra tokens after #line directive");
+            diag::error(
+                tokens[2].pos,
+                &gettext("extra tokens after #line directive"),
+            );
             return;
         }
 
@@ -2999,12 +3049,10 @@ impl<'a> Preprocessor<'a> {
 
         // Check for unterminated macro call (EOF before closing ')')
         if !found_closing_paren {
-            crate::diag::error(
+            crate::diag::error_args(
                 *macro_pos,
-                &format!(
-                    "unterminated argument list invoking macro \"{}\"",
-                    macro_name
-                ),
+                "unterminated argument list invoking macro \"{0}\"",
+                &[macro_name],
             );
         }
 
@@ -3050,15 +3098,14 @@ impl<'a> Preprocessor<'a> {
         } else {
             required.to_string()
         };
-        diag::error(
+        // Both forms are msgids: the singular/plural split is part of the
+        // English sentence and cannot be substituted in from outside.
+        diag::error_plural(
             *pos,
-            &format!(
-                "macro '{}' requires {} argument{}, but {} given",
-                mac.name,
-                expected,
-                if required == 1 { "" } else { "s" },
-                supplied
-            ),
+            "macro '{0}' requires {1} argument, but {2} given",
+            "macro '{0}' requires {1} arguments, but {2} given",
+            required,
+            &[&mac.name, &expected, &supplied.to_string()],
         );
     }
 
@@ -3559,7 +3606,8 @@ impl<'a> Preprocessor<'a> {
                     "c_static_assert" |
                     "c_alignas" |
                     "c_alignof" |
-                    "c_thread_local"
+                    "c_thread_local" |
+                    "c_generic_selections"
                 )
             }
             _ => false,
@@ -3721,7 +3769,7 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
                 self.advance();
             } else {
                 let pos = self.current().map(|t| t.pos).unwrap_or_default();
-                diag::error(pos, "expected ':' in conditional expression");
+                diag::error(pos, &gettext("expected ':' in conditional expression"));
             }
             let false_val = self.expr_ternary();
             if cond.is_true() {
@@ -3933,7 +3981,10 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
                     // Only diagnose when this operand is actually reached; a
                     // short-circuited `#if defined(X) && 1/X` must stay quiet.
                     if !self.suppressed {
-                        diag::error(op_pos, "division by zero in preprocessor expression");
+                        diag::error(
+                            op_pos,
+                            &gettext("division by zero in preprocessor expression"),
+                        );
                     }
                     0
                 }
@@ -4140,7 +4191,8 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
             "c_static_assert" |
             "c_alignas" |
             "c_alignof" |
-            "c_thread_local"
+            "c_thread_local" |
+            "c_generic_selections"
         );
 
         if supported {
@@ -4212,6 +4264,8 @@ pub struct PreprocessConfig<'a> {
     pub no_builtin_inc: bool,
     /// If true, apply translation phase 1 trigraph replacement (--trigraphs).
     pub trigraphs: bool,
+    /// Language dialect selected by `-std=` (default `gnu17`).
+    pub lang: LangOpts,
 }
 
 /// Preprocess tokens with command-line defines and undefines
@@ -4232,7 +4286,7 @@ pub fn preprocess_with_defines(
     filename: &str,
     config: &PreprocessConfig<'_>,
 ) -> Vec<Token> {
-    let mut pp = Preprocessor::new(target, filename);
+    let mut pp = Preprocessor::new(target, filename, config.lang);
 
     // Handle -nostdinc and -nobuiltininc flags
     if config.no_std_inc {
@@ -4311,8 +4365,10 @@ pub fn preprocess_asm_file(
         tokenizer.tokenize()
     };
 
-    // Create preprocessor with assembly-specific predefined macros
-    let mut pp = Preprocessor::new(target, filename);
+    // Create preprocessor with assembly-specific predefined macros. The dialect
+    // is irrelevant here — the C standard macros are undefined immediately
+    // below — so the default keeps the assembly path independent of `-std=`.
+    let mut pp = Preprocessor::new(target, filename, LangOpts::default());
 
     // Use assembly lexer mode for included files as well
     pp.lexer_mode = LexerMode::Assembly;
@@ -4514,7 +4570,7 @@ mod tests {
     #[test]
     fn test_predefined_stdc() {
         let target = Target::host();
-        let pp = Preprocessor::new(&target, "test.c");
+        let pp = Preprocessor::new(&target, "test.c", LangOpts::default());
         assert!(pp.is_defined("__STDC__"));
         assert!(pp.is_defined("__STDC_VERSION__"));
     }
@@ -4522,7 +4578,7 @@ mod tests {
     #[test]
     fn test_predefined_arch() {
         let target = Target::host();
-        let pp = Preprocessor::new(&target, "test.c");
+        let pp = Preprocessor::new(&target, "test.c", LangOpts::default());
 
         // Should have either x86_64 or aarch64 defined
         assert!(pp.is_defined("__x86_64__") || pp.is_defined("__aarch64__"));

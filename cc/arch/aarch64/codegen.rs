@@ -18,6 +18,7 @@
 //
 
 use crate::abi::{get_abi_for_conv, ArgClass, CallingConv};
+use crate::arch::aarch64::features::{VA_GR_SAVE_BYTES, VA_VR_SAVE_BYTES};
 use crate::arch::aarch64::lir::{Aarch64Inst, DmbOption, GpOperand, MemAddr};
 use crate::arch::aarch64::regalloc::{Loc, Reg, RegAlloc, VReg};
 use crate::arch::codegen::{is_variadic_function, BswapSize, CodeGenBase, CodeGenerator, UnaryOp};
@@ -54,6 +55,11 @@ pub struct Aarch64CodeGen {
     pub(super) reg_save_area_size: i32,
     /// Number of fixed GP parameters (for variadic functions)
     pub(super) num_fixed_gp_params: usize,
+    /// Number of fixed FP/SIMD parameters (for variadic functions)
+    pub(super) num_fixed_fp_params: usize,
+    /// Bytes of incoming stack arguments consumed by named parameters
+    /// (for variadic functions whose named parameters overflow the registers)
+    pub(super) named_stack_param_bytes: i32,
     /// External symbols (need GOT access on macOS)
     pub(super) extern_symbols: HashSet<String>,
     /// Thread-local storage symbols (need TLS access)
@@ -95,6 +101,8 @@ impl Aarch64CodeGen {
             reg_save_area_offset: 0,
             reg_save_area_size: 0,
             num_fixed_gp_params: 0,
+            num_fixed_fp_params: 0,
+            named_stack_param_bytes: 0,
             extern_symbols: HashSet::new(),
             tls_symbols: HashSet::new(),
             shared_mode: false,
@@ -194,10 +202,24 @@ impl Aarch64CodeGen {
         self.base.emit_loc(insn);
     }
 
-    /// Emit file header (delegates to base)
-    #[inline]
+    /// Emit file header, declaring the ISA extensions this backend uses.
+    ///
+    /// `_Float16` is lowered to native half-precision instructions (`fmov h0`,
+    /// `fadd h0, h1, h2`), which are an ARMv8.2-A extension. GNU as defaults to
+    /// plain armv8-a and rejects every one of them with "selected processor
+    /// does not support", so any translation unit touching `_Float16` failed to
+    /// assemble on Linux. Apple's assembler enables fp16 for its own targets,
+    /// which is why macOS never saw this.
+    ///
+    /// `+fp16` is added to the base architecture rather than raising it to
+    /// armv8.2-a, so nothing else about the ISA baseline changes. Mach-O does
+    /// not use `.arch`, so it is emitted only for ELF targets.
     fn emit_header(&mut self) {
         self.base.emit_header();
+        if self.base.target.os != Os::MacOS {
+            self.base
+                .push_directive(Directive::Raw(".arch armv8-a+fp16".into()));
+        }
     }
 
     /// Emit a global variable (delegates to base)
@@ -241,12 +263,20 @@ impl Aarch64CodeGen {
             callee_saved.push(Reg::X19);
         }
 
-        // For variadic functions on Linux/FreeBSD, we need extra space for the register save area
-        // AAPCS64: 8 GP regs (x0-x7) * 8 bytes = 64 bytes
+        // For variadic functions on Linux/FreeBSD, we need extra space for the register save area.
+        // AAPCS64 va_list reads unnamed arguments out of *two* save areas: the
+        // GP one (x0-x7, 8 bytes each = 64) and the SIMD/FP one (q0-q7, 16
+        // bytes each = 128). Only the GP half used to be reserved, so a
+        // `va_arg(ap, double)` read whatever the caller left in the GP slots
+        // -- the incoming d0-d7 were never spilled anywhere.
         // On Darwin (macOS/iOS), variadic args are passed on the stack by the caller,
         // so we don't need a register save area.
         let is_darwin = self.base.target.os == crate::target::Os::MacOS;
-        let reg_save_area_size: i32 = if is_variadic && !is_darwin { 64 } else { 0 };
+        let reg_save_area_size: i32 = if is_variadic && !is_darwin {
+            VA_GR_SAVE_BYTES + VA_VR_SAVE_BYTES
+        } else {
+            0
+        };
 
         // Calculate total frame size
         // Need space for: fp/lr (16 bytes) + GP callee-saved + FP callee-saved + local vars + reg save area
@@ -323,13 +353,32 @@ impl Aarch64CodeGen {
             self.emit_variadic_save_area();
         }
 
-        // Count fixed GP parameters for va_start
+        // Measure what the named parameters consumed, for va_start
         if is_variadic {
-            self.num_fixed_gp_params = func
-                .params
-                .iter()
-                .filter(|(_, typ)| !types.is_float(*typ))
-                .count();
+            // AAPCS64 assigns named parameters to the two register banks
+            // independently, and `va_start` has to skip exactly what they
+            // consumed in each. Both saturate at 8; a named parameter that
+            // arrives after its bank is full lands on the stack instead, and
+            // `__stack` has to start past those too.
+            let mut ngrn = 0usize;
+            let mut nsrn = 0usize;
+            let mut named_stack = 0i32;
+            for (_, typ) in &func.params {
+                let bank = if types.is_float(*typ) {
+                    &mut nsrn
+                } else {
+                    &mut ngrn
+                };
+                if *bank < 8 {
+                    *bank += 1;
+                } else {
+                    let bytes = types.size_bits(*typ).div_ceil(8).max(1) as i32;
+                    named_stack += (bytes + 7) & !7;
+                }
+            }
+            self.num_fixed_gp_params = ngrn;
+            self.num_fixed_fp_params = nsrn;
+            self.named_stack_param_bytes = named_stack;
         }
 
         // Store spilled arguments before any calls can clobber them
@@ -925,17 +974,34 @@ impl Aarch64CodeGen {
     }
 
     /// Save argument registers to the register save area for variadic functions (Linux/FreeBSD)
+    ///
+    /// Layout, from `reg_save_area_offset`: x0-x7 (8 bytes each), then q0-q7
+    /// (16 bytes each). `va_start` derives `__gr_top` / `__vr_top` from the
+    /// ends of the two halves, and `__gr_offs` / `__vr_offs` count backwards
+    /// from there, so the order here is what those offsets mean.
     fn emit_variadic_save_area(&mut self) {
-        // AAPCS64: x0-x7 are saved at reg_save_area_offset from FP
         let arg_regs = Reg::arg_regs();
         for (i, reg) in arg_regs.iter().enumerate() {
-            // Each register at offset: reg_save_area_offset + (i * 8)
             let offset = self.reg_save_area_offset + (i as i32 * 8);
             self.push_lir(Aarch64Inst::Str {
                 size: OperandSize::B64,
                 src: *reg,
                 addr: MemAddr::BaseOffset {
                     base: Reg::X29, // fp
+                    offset,
+                },
+            });
+        }
+
+        // The SIMD half stores whole q registers: a `long double` unnamed
+        // argument is binary128 and occupies the full 16-byte slot.
+        for (i, vreg) in VReg::arg_regs().iter().enumerate() {
+            let offset = self.reg_save_area_offset + VA_GR_SAVE_BYTES + (i as i32 * 16);
+            self.push_lir(Aarch64Inst::StrFp {
+                size: FpSize::Quad,
+                src: *vreg,
+                addr: MemAddr::BaseOffset {
+                    base: Reg::X29,
                     offset,
                 },
             });
@@ -963,6 +1029,75 @@ impl Aarch64CodeGen {
     }
 
     /// Move arguments from registers to their allocated stack locations
+    /// Copy a stack-passed two-element floating-point argument (a `_Complex`
+    /// or a two-element HFA) into the parameter's local.
+    ///
+    /// The register-passed path stores straight from the argument registers;
+    /// this is the overflow case, where the value already sits in the caller's
+    /// outgoing area and only needs moving to where the body looks for it.
+    /// V16 is a scratch V register, not part of the argument sequence.
+    /// Element size and FP width for a two-element floating-point argument.
+    ///
+    /// A `_Complex` and a two-element HFA are both passed in a V-register pair
+    /// but their element sizes come from different places: the complex base
+    /// type, or the ABI's HFA classification. `complex_fp_info` answers
+    /// `(Double, 8)` for anything that is not complex -- including a
+    /// `struct { float x, y; }`, whose elements are 4 bytes -- so using it for
+    /// both copied HFAs at twice their stride, reading and writing 8 bytes
+    /// past each end.
+    fn two_element_fp_info(&self, typ: TypeId, types: &TypeTable) -> (FpSize, i32) {
+        if types.is_complex(typ) {
+            return complex_fp_info(types, &self.base.target, typ);
+        }
+        use crate::abi::HfaBase;
+        let abi = get_abi_for_conv(CallingConv::C, &self.base.target);
+        match abi.classify_param(typ, types) {
+            ArgClass::Hfa { base, .. } => match base {
+                HfaBase::Float32 => (FpSize::Single, 4),
+                HfaBase::Float64 => (FpSize::Double, 8),
+                HfaBase::Float128 => (FpSize::Quad, 16),
+            },
+            _ => (FpSize::Double, 8),
+        }
+    }
+
+    fn copy_stacked_pair_to_local(
+        &mut self,
+        func: &Function,
+        param_idx: usize,
+        typ: TypeId,
+        types: &TypeTable,
+        pseudo: PseudoId,
+    ) {
+        let param_name = &func.params[param_idx].0;
+        let Some(local) = func.locals.get(param_name) else {
+            return;
+        };
+        let Some(&Loc::Stack(local_off)) = self.locations.get_ref(local.sym) else {
+            return;
+        };
+        // The incoming argument's slot, as assigned by allocate_arguments.
+        let Some(&Loc::Stack(incoming_off)) = self.locations.get_ref(pseudo) else {
+            return;
+        };
+
+        let (fp_size, elem_bytes) = self.two_element_fp_info(typ, types);
+
+        for step in 0..2i32 {
+            let delta = step * elem_bytes;
+            self.push_lir(Aarch64Inst::LdrFp {
+                size: fp_size,
+                dst: VReg::V16,
+                addr: self.stack_mem_plus(incoming_off, delta),
+            });
+            self.push_lir(Aarch64Inst::StrFp {
+                size: fp_size,
+                src: VReg::V16,
+                addr: self.stack_mem_plus(local_off, delta),
+            });
+        }
+    }
+
     fn store_args_to_stack(&mut self, func: &Function, types: &TypeTable, alloc: &RegAlloc) {
         // AAPCS64: integer args in X0-X7, FP args in D0-D7 (separate counters)
         // Note: sret uses X8, so regular args still start at X0
@@ -1026,23 +1161,8 @@ impl Aarch64CodeGen {
                                     if let Some(&Loc::Stack(offset)) =
                                         self.locations.get_ref(local.sym)
                                     {
-                                        let (fp_size, second_offset) = if is_hfa_two {
-                                            // HFA-2: use ABI classification to get base type
-                                            let abi =
-                                                get_abi_for_conv(CallingConv::C, &self.base.target);
-                                            match abi.classify_param(*typ, types) {
-                                                ArgClass::Hfa { base, .. } => {
-                                                    use crate::abi::HfaBase;
-                                                    match base {
-                                                        HfaBase::Float32 => (FpSize::Single, 4),
-                                                        HfaBase::Float64 => (FpSize::Double, 8),
-                                                    }
-                                                }
-                                                _ => (FpSize::Double, 8),
-                                            }
-                                        } else {
-                                            complex_fp_info(types, &self.base.target, *typ)
-                                        };
+                                        let (fp_size, second_offset) =
+                                            self.two_element_fp_info(*typ, types);
                                         // Store first element from first FP register
                                         self.push_lir(Aarch64Inst::StrFp {
                                             size: fp_size,
@@ -1057,6 +1177,17 @@ impl Aarch64CodeGen {
                                         });
                                     }
                                 }
+                            } else {
+                                // AAPCS64 §6.4.2: the argument did not fit in
+                                // the V registers, so the caller laid it on the
+                                // stack. The prologue still has to copy it into
+                                // the parameter's local, which is what the body
+                                // reads -- without this the local was left
+                                // uninitialized and the parameter read as
+                                // garbage (#H13). regalloc has already assigned
+                                // the incoming slot; find it and shuttle both
+                                // elements through V16.
+                                self.copy_stacked_pair_to_local(func, i, *typ, types, pseudo.id);
                             }
                             fp_arg_idx += 2;
                         } else if is_fp {
@@ -1152,7 +1283,12 @@ impl Aarch64CodeGen {
         if let Some(&src) = insn.src.first() {
             let src_loc = self.get_location(src);
             let is_complex = insn.typ.is_some_and(|t| types.is_complex(t));
-            let is_fp = matches!(src_loc, Loc::VReg(_) | Loc::FImm(..));
+            // Decide by *type* first, not only by where the value happens to
+            // sit. A `long double` produced by an rtlib call lands on the
+            // stack, so a location-only test sent it out through emit_move and
+            // returned it in x0 instead of q0.
+            let is_fp = insn.typ.is_some_and(|t| types.is_float(t))
+                || matches!(src_loc, Loc::VReg(_) | Loc::FImm(..));
             // Check for HFA-2 struct return (e.g., {double, double}).
             // Compute the HFA FP size once; None means not an HFA-2.
             let hfa_two_fp_size: Option<FpSize> = if !is_complex {
@@ -1169,6 +1305,7 @@ impl Aarch64CodeGen {
                                 Some(match base {
                                     HfaBase::Float32 => FpSize::Single,
                                     HfaBase::Float64 => FpSize::Double,
+                                    HfaBase::Float128 => FpSize::Quad,
                                 })
                             }
                             _ => None,
@@ -1686,7 +1823,7 @@ impl Aarch64CodeGen {
             }
 
             Opcode::Store => {
-                self.emit_store(insn);
+                self.emit_store(insn, types);
             }
 
             Opcode::Call => {
@@ -2474,7 +2611,7 @@ impl Aarch64CodeGen {
         }
     }
 
-    fn emit_store(&mut self, insn: &Instruction) {
+    fn emit_store(&mut self, insn: &Instruction, types: &TypeTable) {
         // Use actual size for memory stores (8, 16, 32, 64 bits)
         let mem_size = insn.size;
 
@@ -2482,6 +2619,20 @@ impl Aarch64CodeGen {
             (Some(&a), Some(&v)) => (a, v),
             _ => return,
         };
+
+        // Floating-point stores need the FP path, as they do on x86_64 -- this
+        // dispatch was missing entirely here. A 128-bit `long double` therefore
+        // fell through to emit_struct_store below, whose operand match ends in
+        // `_ => return` and so *silently dropped the store* when the value was
+        // in a V register. That, not the FpSize mapping, is why assigning a
+        // long double to a global produced no instruction at all (#H4).
+        let value_loc = self.get_location(value);
+        let is_fp = insn.typ.is_some_and(|t| types.is_float(t))
+            || matches!(value_loc, Loc::VReg(_) | Loc::FImm(..));
+        if is_fp {
+            self.emit_fp_store(insn, types);
+            return;
+        }
 
         // For struct stores (size > 64), we need to copy multiple words
         // The value is a symbol containing the struct data
@@ -2976,8 +3127,14 @@ impl Aarch64CodeGen {
             }
         });
 
-        // Handle 128-bit integer copy
-        if actual_size == 128 {
+        // Handle 128-bit integer copy.
+        //
+        // Only integers: a 128-bit `long double` is binary128, and this path
+        // moves the low 64 bits through a general-purpose register. That
+        // truncated an `FImm` to its *f64* encoding (and a `VReg` to its low
+        // lane), so `long double a = 3.14159...L;` landed a denormal on the
+        // stack. FP goes through `emit_fp_move`, which assembles both halves.
+        if actual_size == 128 && !is_fp_copy {
             if let Loc::Stack(dst_offset) = dst_loc {
                 self.emit_int128_move_to_stack(src, dst_offset);
             }
@@ -3265,7 +3422,15 @@ impl Aarch64CodeGen {
             dst: Reg::X0,
         });
 
-        self.locations.set(target, Loc::Reg(Reg::X0));
+        // The instruction leaves the result in a fixed scratch register, but
+        // the allocator gave this pseudo its own location. Overwriting that
+        // made every atomic result alias the same register, so two atomic
+        // reads in one expression collapsed into one -- `x + y` on two
+        // _Atomic ints returned `y + y`. Move it where the allocator expects.
+        let dst_loc = self.get_location(target);
+        if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::X0) {
+            self.emit_move_to_loc(Reg::X0, &dst_loc, size.max(32));
+        }
     }
 
     /// Emit atomic store
@@ -3345,7 +3510,15 @@ impl Aarch64CodeGen {
         });
 
         // Result: X1 = old value
-        self.locations.set(target, Loc::Reg(Reg::X1));
+        // The instruction leaves the result in a fixed scratch register, but
+        // the allocator gave this pseudo its own location. Overwriting that
+        // made every atomic result alias the same register, so two atomic
+        // reads in one expression collapsed into one -- `x + y` on two
+        // _Atomic ints returned `y + y`. Move it where the allocator expects.
+        let dst_loc = self.get_location(target);
+        if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::X1) {
+            self.emit_move_to_loc(Reg::X1, &dst_loc, size.max(32));
+        }
     }
 
     /// Emit atomic compare-and-swap using LL/SC
@@ -3452,7 +3625,15 @@ impl Aarch64CodeGen {
         // Done label
         self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(done_label)));
 
-        self.locations.set(target, Loc::Reg(Reg::X2));
+        // The instruction leaves the result in a fixed scratch register, but
+        // the allocator gave this pseudo its own location. Overwriting that
+        // made every atomic result alias the same register, so two atomic
+        // reads in one expression collapsed into one -- `x + y` on two
+        // _Atomic ints returned `y + y`. Move it where the allocator expects.
+        let dst_loc = self.get_location(target);
+        if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::X2) {
+            self.emit_move_to_loc(Reg::X2, &dst_loc, size.max(32));
+        }
     }
 
     /// Emit atomic fetch-and-add using LL/SC
@@ -3511,7 +3692,15 @@ impl Aarch64CodeGen {
         });
 
         // Result: X1 = old value
-        self.locations.set(target, Loc::Reg(Reg::X1));
+        // The instruction leaves the result in a fixed scratch register, but
+        // the allocator gave this pseudo its own location. Overwriting that
+        // made every atomic result alias the same register, so two atomic
+        // reads in one expression collapsed into one -- `x + y` on two
+        // _Atomic ints returned `y + y`. Move it where the allocator expects.
+        let dst_loc = self.get_location(target);
+        if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::X1) {
+            self.emit_move_to_loc(Reg::X1, &dst_loc, size.max(32));
+        }
     }
 
     /// Emit atomic fetch-and-subtract using LL/SC
@@ -3570,7 +3759,15 @@ impl Aarch64CodeGen {
         });
 
         // Result: X1 = old value
-        self.locations.set(target, Loc::Reg(Reg::X1));
+        // The instruction leaves the result in a fixed scratch register, but
+        // the allocator gave this pseudo its own location. Overwriting that
+        // made every atomic result alias the same register, so two atomic
+        // reads in one expression collapsed into one -- `x + y` on two
+        // _Atomic ints returned `y + y`. Move it where the allocator expects.
+        let dst_loc = self.get_location(target);
+        if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::X1) {
+            self.emit_move_to_loc(Reg::X1, &dst_loc, size.max(32));
+        }
     }
 
     /// Emit atomic fetch-and-AND using LL/SC
@@ -3665,7 +3862,15 @@ impl Aarch64CodeGen {
         });
 
         // Result: X1 = old value
-        self.locations.set(target, Loc::Reg(Reg::X1));
+        // The instruction leaves the result in a fixed scratch register, but
+        // the allocator gave this pseudo its own location. Overwriting that
+        // made every atomic result alias the same register, so two atomic
+        // reads in one expression collapsed into one -- `x + y` on two
+        // _Atomic ints returned `y + y`. Move it where the allocator expects.
+        let dst_loc = self.get_location(target);
+        if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::X1) {
+            self.emit_move_to_loc(Reg::X1, &dst_loc, size.max(32));
+        }
     }
 
     /// Emit memory fence
@@ -3731,12 +3936,18 @@ impl Aarch64CodeGen {
                 });
             }
             Loc::Stack(offset) => {
-                let adjusted = offset + (self.frame_size - self.callee_saved_size);
+                // Address through the frame pointer, as every other path in
+                // this backend does ("FP-relative for alloca safety"). This
+                // used its own SP-relative arithmetic, which is wrong the
+                // moment anything moves SP: the atomic CAS loop allocates its
+                // expected-value slot with alloc_local_temp, whose Alloca does
+                // exactly that, and the pointer was then read back 16 bytes
+                // off -- from the saved LR slot.
                 self.push_lir(Aarch64Inst::Ldr {
                     size: op_size,
                     addr: MemAddr::BaseOffset {
-                        base: Reg::SP,
-                        offset: adjusted,
+                        base: self.stack_base_reg(offset),
+                        offset: self.stack_offset(offset),
                     },
                     dst: reg,
                 });
@@ -3744,13 +3955,31 @@ impl Aarch64CodeGen {
             Loc::Global(name) => {
                 self.emit_load_global(&name, reg, op_size);
             }
-            _ => {
-                // Default: load 0
-                self.push_lir(Aarch64Inst::Mov {
-                    size: op_size,
-                    src: GpOperand::Imm(0),
+            // A floating-point value has to cross to the general-purpose file
+            // as its bit pattern. Falling through to a zero immediate here is
+            // what made every _Atomic float/double operation store 0 -- the
+            // x86_64 twin of this function was fixed for exactly that and this
+            // one was missed.
+            Loc::VReg(v) => {
+                self.push_lir(Aarch64Inst::FmovToGp {
+                    size: if size <= 32 {
+                        FpSize::Single
+                    } else {
+                        FpSize::Double
+                    },
+                    src: v,
                     dst: reg,
                 });
+            }
+            Loc::FImm(f, imm_size) => {
+                let bits = if imm_size == 16 {
+                    super::f64_to_f16_bits(f) as i64
+                } else if imm_size == 32 {
+                    (f as f32).to_bits() as i64
+                } else {
+                    f.to_bits() as i64
+                };
+                self.emit_mov_imm(reg, bits, 64);
             }
         }
     }

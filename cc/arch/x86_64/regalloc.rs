@@ -263,6 +263,22 @@ pub fn opcode_constraints(op: Opcode) -> RegConstraints {
         Opcode::VaArg => RegConstraints {
             clobbers: &[Reg::Rax, Reg::Rcx],
         },
+        // The atomic emitters use RAX/RCX as fixed scratch (and R8/R9 for the
+        // CAS operand spill), all of which are allocatable. Undeclared, any
+        // pseudo the allocator parked there whose live range crossed an atomic
+        // operation was silently corrupted -- six live ints bracketing one
+        // __c11_atomic_fetch_add summed to 22 instead of 31.
+        Opcode::AtomicLoad
+        | Opcode::AtomicStore
+        | Opcode::AtomicSwap
+        | Opcode::AtomicCas
+        | Opcode::AtomicFetchAdd
+        | Opcode::AtomicFetchSub
+        | Opcode::AtomicFetchAnd
+        | Opcode::AtomicFetchOr
+        | Opcode::AtomicFetchXor => RegConstraints {
+            clobbers: &[Reg::Rax, Reg::Rcx, Reg::R8, Reg::R9],
+        },
         _ => RegConstraints::NONE,
     }
 }
@@ -706,9 +722,12 @@ pub fn get_constraint_info(insn: &Instruction) -> Option<(Vec<Reg>, Vec<PseudoId
     if let Some(t) = insn.target {
         involved.push(t);
     }
-    // For VaArg, sources should NOT be in clobbered registers,
-    // so we don't add them to involved_pseudos
-    if insn.op != Opcode::VaArg {
+    // An instruction's own sources are normally exempt from its clobber set,
+    // because the codegen helper reads them before touching its scratch
+    // registers. That is false for VaArg and for the atomic operations: both
+    // write their scratch registers while the source values are still needed,
+    // so a source parked in one of them is destroyed.
+    if insn.op != Opcode::VaArg && !insn.op.is_atomic() {
         involved.extend(insn.src.iter().copied());
     }
 

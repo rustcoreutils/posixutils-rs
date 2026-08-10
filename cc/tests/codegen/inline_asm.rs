@@ -1147,3 +1147,154 @@ int main(void) {
         "sync_synchronize pattern must hold at -O1 too"
     );
 }
+
+// ============================================================================
+// Memory-constrained output operands ("=m")
+// ============================================================================
+
+/// Regression test: a memory *output* operand reads its pseudo -- the pseudo
+/// holds the address the assembly writes through -- but DCE's use-collector
+/// looked only at `asm_data.inputs`. At `-O` and above it therefore deleted the
+/// instruction that materialized the address, and the emitted store went
+/// through whatever the register happened to hold.
+///
+/// Found via the CPython acceptance build: `_Py_get_387controlword`
+/// (`Python/pymath.c`) is exactly this shape, and c17 compiled its
+/// `fnstcw %0` to `fnstcw (%rax)` with RAX left at 0 from an earlier zero-fill
+/// -- a null-pointer write that segfaulted the bootstrap interpreter.
+///
+/// The `-O0` path was always correct, so this must run optimized to mean
+/// anything.
+#[test]
+fn codegen_asm_memory_output_survives_optimization() {
+    let code = r#"
+/* Store through a "=m" output, then read the object back. If the address
+   computation is dropped, this either faults or writes somewhere else. */
+static int store_via_m(void) {
+    int out = 0;
+#if defined(__x86_64__)
+    __asm__ __volatile__ ("movl $1234, %0" : "=m" (out));
+#elif defined(__aarch64__)
+    {
+        int tmp = 1234;
+        __asm__ __volatile__ ("str %w1, %0" : "=m" (out) : "r" (tmp));
+    }
+#else
+    out = 1234;
+#endif
+    return out;
+}
+
+/* Same, but with the object surrounded by other locals so a stray write
+   would land on a neighbour rather than faulting. */
+static int store_via_m_neighbours(int *before, int *after) {
+    int lo = 11;
+    int out = 0;
+    int hi = 22;
+#if defined(__x86_64__)
+    __asm__ __volatile__ ("movl $77, %0" : "=m" (out));
+#elif defined(__aarch64__)
+    {
+        int tmp = 77;
+        __asm__ __volatile__ ("str %w1, %0" : "=m" (out) : "r" (tmp));
+    }
+#else
+    out = 77;
+#endif
+    *before = lo;
+    *after = hi;
+    return out;
+}
+
+int main(void) {
+    if (store_via_m() != 1234) return 1;
+
+    int before = 0, after = 0;
+    if (store_via_m_neighbours(&before, &after) != 77) return 2;
+    if (before != 11) return 3;
+    if (after != 22) return 4;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("asm_memory_output_operand", code, &[]),
+        0,
+        "a \"=m\" output must write the named object"
+    );
+    assert_eq!(
+        compile_and_run_optimized("asm_memory_output_operand_opt", code),
+        0,
+        "the address computation for a \"=m\" output must survive DCE"
+    );
+}
+
+/// The `"=m"` fix has to reach the *register allocator*, not just DCE.
+///
+/// DCE learning that a memory output reads its pseudo stopped the address
+/// computation being deleted, but the allocator's own use-collectors --
+/// live-interval bounds, liveness propagation, the interference graph's def
+/// set and live set, and next-use distance -- all still classified such an
+/// output as a pure def. So the address register stayed free for the
+/// allocator to hand to another operand of the same asm, and the store went
+/// through an input's value as a pointer.
+///
+/// Enough inputs are needed to make the allocator actually reuse the register;
+/// a one-operand asm never exhibits it, which is why the first version of this
+/// test passed on x86_64 while the bug was still live.
+#[test]
+fn codegen_asm_memory_output_address_survives_register_allocation() {
+    let code = r#"
+#include <string.h>
+
+struct Out { unsigned v0, v1, v2, v3, v4, v5; };
+
+/* Six register inputs alongside a memory output. The output's address must
+   not be assigned a register that one of the inputs also gets. */
+static unsigned write_through_m(unsigned a, unsigned b, unsigned c,
+                                unsigned d, unsigned e, unsigned f) {
+    unsigned out = 0;
+#if defined(__x86_64__)
+    __asm__ __volatile__ ("movl %1, %0"
+                          : "=m"(out)
+                          : "r"(a), "r"(b), "r"(c), "r"(d), "r"(e), "r"(f));
+#elif defined(__aarch64__)
+    __asm__ __volatile__ ("str %w1, %0"
+                          : "=m"(out)
+                          : "r"(a), "r"(b), "r"(c), "r"(d), "r"(e), "r"(f));
+#else
+    out = a;
+    (void)b; (void)c; (void)d; (void)e; (void)f;
+#endif
+    return out;
+}
+
+int main(void) {
+    /* The first input is what the asm stores, so the result must be it and
+       not some other operand's value or a wild read. */
+    if (write_through_m(11u, 22u, 33u, 44u, 55u, 66u) != 11u) return 1;
+    if (write_through_m(99u, 1u, 2u, 3u, 4u, 5u) != 99u) return 2;
+
+    /* Neighbouring locals must be untouched: a store through the wrong
+       pointer usually lands somewhere else on the frame. */
+    volatile unsigned before = 0xAAAAAAAAu;
+    unsigned got = write_through_m(7u, 0u, 0u, 0u, 0u, 0u);
+    volatile unsigned after = 0xBBBBBBBBu;
+    if (got != 7u) return 3;
+    if (before != 0xAAAAAAAAu) return 4;
+    if (after != 0xBBBBBBBBu) return 5;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("asm_memory_output_regalloc", code, &[]),
+        0,
+        "a \"=m\" output's address must not be reallocated to another operand"
+    );
+    assert_eq!(
+        compile_and_run_optimized("asm_memory_output_regalloc_opt", code),
+        0,
+        "the same, once the allocator is under real pressure"
+    );
+}

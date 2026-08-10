@@ -404,7 +404,9 @@ impl X86_64CodeGen {
             _ => return,
         };
 
-        if types.is_float(arg_type) {
+        if types.kind(arg_type) == crate::types::TypeKind::LongDouble {
+            self.emit_va_arg_x87(base_reg, base_offset, &dst_loc);
+        } else if types.is_float(arg_type) {
             self.emit_va_arg_float(
                 base_reg,
                 base_offset,

@@ -5641,3 +5641,100 @@ int main(void) {
         0
     );
 }
+
+/// Floating-point variadic arguments must survive the callee's `va_arg`.
+///
+/// AAPCS64 hands unnamed floating arguments in v0-v7 and reads them back
+/// through `__vr_top` / `__vr_offs`, but the aarch64 backend saved only x0-x7
+/// and walked `ap` as a flat pointer over that GP area. Every
+/// `va_arg(ap, double)` therefore read a general-purpose slot while the actual
+/// values sat in v0-v7, unspilled. The cases past eight arguments also cover
+/// the spill to the caller's stack, which is a different path again.
+#[test]
+fn codegen_variadic_floating_arguments() {
+    let code = r#"
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
+
+static double sum_d(int n, ...) {
+    va_list ap; va_start(ap, n);
+    double t = 0.0;
+    for (int i = 0; i < n; i++) t += va_arg(ap, double);
+    va_end(ap);
+    return t;
+}
+
+/* Alternating classes: the two register banks advance independently, so a
+   shared cursor would interleave them wrongly. */
+static double sum_mixed(int n, ...) {
+    va_list ap; va_start(ap, n);
+    double t = 0.0;
+    for (int i = 0; i < n; i++) {
+        t += (double)va_arg(ap, int);
+        t += va_arg(ap, double);
+    }
+    va_end(ap);
+    return t;
+}
+
+static long double sum_ld(int n, ...) {
+    va_list ap; va_start(ap, n);
+    long double t = 0.0L;
+    for (int i = 0; i < n; i++) t += va_arg(ap, long double);
+    va_end(ap);
+    return t;
+}
+
+static double twice(int n, ...) {
+    va_list ap, copy;
+    va_start(ap, n);
+    va_copy(copy, ap);
+    double a = 0.0, b = 0.0;
+    for (int i = 0; i < n; i++) a += va_arg(ap, double);
+    for (int i = 0; i < n; i++) b += va_arg(copy, double);
+    va_end(copy);
+    va_end(ap);
+    return a + b;
+}
+
+/* Hands the list to libc, which decodes it per the real platform ABI. */
+static int fmt(char *buf, size_t n, const char *f, ...) {
+    va_list ap; va_start(ap, f);
+    int r = vsnprintf(buf, n, f, ap);
+    va_end(ap);
+    return r;
+}
+
+static int near(double a, double b) { double d = a - b; return d < 0.01 && d > -0.01; }
+
+int main(void) {
+    if (!near(sum_d(2, 1.5, 2.5), 4.0)) return 1;
+
+    /* Nine doubles: the ninth has to come off the stack. */
+    if (!near(sum_d(9, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0), 45.0)) return 2;
+
+    /* Float arguments are promoted to double by the caller. */
+    float fa = 1.5f, fb = 2.5f;
+    if (!near(sum_d(2, fa, fb), 4.0)) return 3;
+
+    if (!near(sum_mixed(3, 1, 1.5, 2, 2.5, 3, 3.5), 13.5)) return 4;
+
+    long double lsum = sum_ld(3, 1.5L, 2.5L, 4.0L);
+    if (lsum != 8.0L) return 5;
+
+    if (!near(twice(3, 1.0, 2.0, 4.0), 14.0)) return 6;
+
+    char buf[64];
+    int r = fmt(buf, sizeof buf, "%d %.2f %d %.2f", 7, 1.25, 9, 2.5);
+    if (r < 0) return 7;
+    if (strcmp(buf, "7 1.25 9 2.50") != 0) return 8;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_variadic_floating_arguments", code, &[]),
+        0
+    );
+}

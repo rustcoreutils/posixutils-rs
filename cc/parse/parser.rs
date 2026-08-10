@@ -1789,16 +1789,14 @@ impl Parser<'_> {
                             // shall not be an array or a function type.
                             let inner_kind = self.types.kind(inner_type);
                             if matches!(inner_kind, TypeKind::Array | TypeKind::Function) {
-                                diag::error(
+                                diag::error_args(
                                     self.current_pos(),
-                                    &format!(
-                                        "'_Atomic' cannot be applied to {} type",
-                                        if inner_kind == TypeKind::Array {
-                                            "an array"
-                                        } else {
-                                            "a function"
-                                        }
-                                    ),
+                                    "'_Atomic' cannot be applied to {0} type",
+                                    &[if inner_kind == TypeKind::Array {
+                                        "an array"
+                                    } else {
+                                        "a function"
+                                    }],
                                 );
                             }
                             let inner = self.types.get(inner_type).clone();
@@ -2058,10 +2056,7 @@ impl Parser<'_> {
                 _ => None,
             };
             if let Some(what) = what {
-                diag::error(
-                    pos,
-                    &format!("'_Atomic' cannot be applied to {} type", what),
-                );
+                diag::error_args(pos, "'_Atomic' cannot be applied to {0} type", &[what]);
             }
         }
 
@@ -2126,14 +2121,14 @@ impl Parser<'_> {
             return;
         }
         let spelled = self.idents.get_opt(name).unwrap_or("").to_string();
-        diag::error(
+        diag::error_args(
             pos,
-            &format!(
-                "typedef '{}' redefined with an incompatible type ('{}' then '{}')",
-                spelled,
-                self.types.get(old_type),
-                self.types.get(new_type),
-            ),
+            "typedef '{0}' redefined with an incompatible type ('{1}' then '{2}')",
+            &[
+                &spelled.to_string(),
+                &self.types.get(old_type).to_string(),
+                &self.types.get(new_type).to_string(),
+            ],
         );
     }
 

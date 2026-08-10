@@ -9,7 +9,7 @@
 // Diagnostic and stream management module for c17 C99 compiler
 //
 
-use gettextrs::gettext;
+use gettextrs::{gettext, gettext_args, ngettext_args};
 use std::cell::RefCell;
 use std::fmt;
 use std::io::{self, Write};
@@ -441,6 +441,34 @@ pub fn warning(pos: Position, msg: &str) {
 /// Print an error message
 pub fn error(pos: Position, msg: &str) {
     do_diag(DiagLevel::Error, pos, msg);
+}
+
+/// Print a warning built from a translatable template.
+///
+/// `template` is the msgid and must be a literal, with positional `{0}`/`{1}`
+/// placeholders for the substitutions. That is the difference from passing a
+/// `format!` result to [`warning`]: `format!` bakes the values in at compile
+/// time, leaving the catalog to be searched for a string no extractor ever saw,
+/// so the message can never be translated.
+pub fn warning_args(pos: Position, template: &str, args: &[&str]) {
+    do_diag(DiagLevel::Warning, pos, &gettext_args(template, args));
+}
+
+/// Print an error built from a translatable template. See [`warning_args`].
+pub fn error_args(pos: Position, template: &str, args: &[&str]) {
+    do_diag(DiagLevel::Error, pos, &gettext_args(template, args));
+}
+
+/// Print an error whose wording depends on a count.
+///
+/// Both forms are msgids. English needs only two; a catalog may define its own
+/// rule for others.
+pub fn error_plural(pos: Position, singular: &str, plural: &str, n: usize, args: &[&str]) {
+    do_diag(
+        DiagLevel::Error,
+        pos,
+        &ngettext_args(singular, plural, n, args),
+    );
 }
 
 // ============================================================================

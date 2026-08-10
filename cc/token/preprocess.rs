@@ -26,6 +26,7 @@ use crate::builtin_headers;
 use crate::diag;
 use crate::os;
 use crate::target::{CStd, LangOpts, Target};
+use gettextrs::gettext;
 
 const DEFAULT_MACRO_CAPACITY: usize = 32;
 const DEFAULT_COND_STACK_CAPACITY: usize = 8;
@@ -1073,9 +1074,10 @@ impl<'a> Preprocessor<'a> {
                 // Unknown directive
                 if !self.is_skipping() {
                     let name = idents.get_opt(directive_id).unwrap_or("unknown");
-                    diag::warning(
+                    diag::warning_args(
                         hash_token.pos,
-                        &format!("unknown preprocessor directive #{}", name),
+                        "unknown preprocessor directive #{0}",
+                        &[name],
                     );
                 }
                 self.skip_to_eol(iter);
@@ -1379,7 +1381,11 @@ impl<'a> Preprocessor<'a> {
         // break a great deal of code that redefines a macro benignly.
         if let Some(existing) = self.macros.get(&name) {
             if let Some(why) = macro_redefinition_conflict(existing, &mac) {
-                diag::warning(name_token.pos, &format!("'{}' redefined: {}", name, why));
+                diag::warning_args(
+                    name_token.pos,
+                    "'{0}' redefined: {1}",
+                    &[&name.to_string(), why],
+                );
             }
         }
 
@@ -1485,7 +1491,10 @@ impl<'a> Preprocessor<'a> {
                     // be followed by a parameter. It used to fall through to a
                     // literal `#` token with no diagnostic.
                     if is_function {
-                        diag::error(token.pos, "'#' is not followed by a macro parameter");
+                        diag::error(
+                            token.pos,
+                            &gettext("'#' is not followed by a macro parameter"),
+                        );
                     }
                 }
 
@@ -1802,7 +1811,7 @@ impl<'a> Preprocessor<'a> {
         // Collect the include path tokens
         let path_tokens = self.collect_to_eol(iter);
         if path_tokens.is_empty() {
-            diag::error(hash_token.pos, "expected filename after #include");
+            diag::error(hash_token.pos, &gettext("expected filename after #include"));
             return;
         }
 
@@ -1833,7 +1842,7 @@ impl<'a> Preprocessor<'a> {
         let (filename, is_system) = self.parse_include_path(&expanded_tokens, idents);
 
         if filename.is_empty() {
-            diag::error(hash_token.pos, "empty filename in #include");
+            diag::error(hash_token.pos, &gettext("empty filename in #include"));
             return;
         }
 
@@ -1850,7 +1859,11 @@ impl<'a> Preprocessor<'a> {
                 }
             }
         } else {
-            diag::error(hash_token.pos, &format!("'{}': file not found", filename));
+            diag::error_args(
+                hash_token.pos,
+                "'{0}': file not found",
+                &[&filename.to_string()],
+            );
         }
     }
 
@@ -2455,9 +2468,10 @@ impl<'a> Preprocessor<'a> {
         let content = match fs::read(path) {
             Ok(c) => c,
             Err(e) => {
-                diag::error(
+                diag::error_args(
                     hash_token.pos,
-                    &format!("cannot read '{}': {}", path.display(), e),
+                    "cannot read '{0}': {1}",
+                    &[&path.display().to_string(), &e.to_string()],
                 );
                 return;
             }
@@ -2482,21 +2496,20 @@ impl<'a> Preprocessor<'a> {
 
         // Check for include cycle (only error if no include guard protects it)
         if self.include_stack.contains(&canonical) {
-            diag::error(
+            diag::error_args(
                 hash_token.pos,
-                &format!("recursive include of '{}'", path.display()),
+                "recursive include of '{0}'",
+                &[&path.display().to_string()],
             );
             return;
         }
 
         // Check include depth
         if self.include_depth >= self.max_include_depth {
-            diag::error(
+            diag::error_args(
                 hash_token.pos,
-                &format!(
-                    "#include nested too deeply (max {})",
-                    self.max_include_depth
-                ),
+                "#include nested too deeply (max {0})",
+                &[&self.max_include_depth.to_string()],
             );
             return;
         }
@@ -2563,12 +2576,10 @@ impl<'a> Preprocessor<'a> {
     ) {
         // Check include depth
         if self.include_depth >= self.max_include_depth {
-            diag::error(
+            diag::error_args(
                 hash_token.pos,
-                &format!(
-                    "#include nested too deeply (max {})",
-                    self.max_include_depth
-                ),
+                "#include nested too deeply (max {0})",
+                &[&self.max_include_depth.to_string()],
             );
             return;
         }
@@ -2623,7 +2634,7 @@ impl<'a> Preprocessor<'a> {
 
         let tokens = self.collect_to_eol(iter);
         let msg = self.tokens_to_text(&tokens, idents);
-        diag::error(*pos, &format!("#error {}", msg));
+        diag::error_args(*pos, "#error {0}", &[&msg.to_string()]);
     }
 
     /// Handle #warning
@@ -2642,7 +2653,7 @@ impl<'a> Preprocessor<'a> {
 
         let tokens = self.collect_to_eol(iter);
         let msg = self.tokens_to_text(&tokens, idents);
-        diag::warning(*pos, &format!("#warning {}", msg));
+        diag::warning_args(*pos, "#warning {0}", &[&msg.to_string()]);
     }
 
     /// Handle #pragma
@@ -2706,7 +2717,10 @@ impl<'a> Preprocessor<'a> {
                             if valid_arg {
                                 iter.next(); // consume ON/OFF/DEFAULT
                             } else {
-                                diag::warning(pos, "expected ON, OFF, or DEFAULT for #pragma STDC");
+                                diag::warning(
+                                    pos,
+                                    &gettext("expected ON, OFF, or DEFAULT for #pragma STDC"),
+                                );
                             }
                         } else {
                             diag::warning(
@@ -2782,7 +2796,7 @@ impl<'a> Preprocessor<'a> {
         let tokens = self.collect_to_eol(iter);
         let tokens = self.expand_if_tokens(&tokens, idents);
         if tokens.is_empty() {
-            diag::error(directive_pos, "#line requires a line number");
+            diag::error(directive_pos, &gettext("#line requires a line number"));
             return;
         }
 
@@ -2792,33 +2806,44 @@ impl<'a> Preprocessor<'a> {
             TokenValue::Number(n) => match n.parse::<u32>() {
                 Ok(num) if (1..=2147483647).contains(&num) => num,
                 Ok(_) => {
-                    diag::error(
+                    diag::error_args(
                         tokens[0].pos,
-                        &format!("#line number '{}' is out of range [1, 2147483647]", n),
+                        "#line number '{0}' is out of range [1, 2147483647]",
+                        &[&n.to_string()],
                     );
                     return;
                 }
                 Err(_) => {
-                    diag::error(
+                    diag::error_args(
                         tokens[0].pos,
-                        &format!("#line requires a decimal line number, found '{}'", n),
+                        "#line requires a decimal line number, found '{0}'",
+                        &[&n.to_string()],
                     );
                     return;
                 }
             },
             _ => {
-                diag::error(tokens[0].pos, "#line requires a decimal line number");
+                diag::error(
+                    tokens[0].pos,
+                    &gettext("#line requires a decimal line number"),
+                );
                 return;
             }
         };
 
         // Only a string literal may follow, and nothing may follow that.
         if tokens.len() > 1 && !matches!(&tokens[1].value, TokenValue::String(_)) {
-            diag::error(tokens[1].pos, "#line filename must be a string literal");
+            diag::error(
+                tokens[1].pos,
+                &gettext("#line filename must be a string literal"),
+            );
             return;
         }
         if tokens.len() > 2 {
-            diag::error(tokens[2].pos, "extra tokens after #line directive");
+            diag::error(
+                tokens[2].pos,
+                &gettext("extra tokens after #line directive"),
+            );
             return;
         }
 
@@ -3024,12 +3049,10 @@ impl<'a> Preprocessor<'a> {
 
         // Check for unterminated macro call (EOF before closing ')')
         if !found_closing_paren {
-            crate::diag::error(
+            crate::diag::error_args(
                 *macro_pos,
-                &format!(
-                    "unterminated argument list invoking macro \"{}\"",
-                    macro_name
-                ),
+                "unterminated argument list invoking macro \"{0}\"",
+                &[macro_name],
             );
         }
 
@@ -3075,15 +3098,14 @@ impl<'a> Preprocessor<'a> {
         } else {
             required.to_string()
         };
-        diag::error(
+        // Both forms are msgids: the singular/plural split is part of the
+        // English sentence and cannot be substituted in from outside.
+        diag::error_plural(
             *pos,
-            &format!(
-                "macro '{}' requires {} argument{}, but {} given",
-                mac.name,
-                expected,
-                if required == 1 { "" } else { "s" },
-                supplied
-            ),
+            "macro '{0}' requires {1} argument, but {2} given",
+            "macro '{0}' requires {1} arguments, but {2} given",
+            required,
+            &[&mac.name, &expected, &supplied.to_string()],
         );
     }
 
@@ -3747,7 +3769,7 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
                 self.advance();
             } else {
                 let pos = self.current().map(|t| t.pos).unwrap_or_default();
-                diag::error(pos, "expected ':' in conditional expression");
+                diag::error(pos, &gettext("expected ':' in conditional expression"));
             }
             let false_val = self.expr_ternary();
             if cond.is_true() {
@@ -3959,7 +3981,10 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
                     // Only diagnose when this operand is actually reached; a
                     // short-circuited `#if defined(X) && 1/X` must stay quiet.
                     if !self.suppressed {
-                        diag::error(op_pos, "division by zero in preprocessor expression");
+                        diag::error(
+                            op_pos,
+                            &gettext("division by zero in preprocessor expression"),
+                        );
                     }
                     0
                 }

@@ -98,14 +98,14 @@ impl Linearizer<'_> {
         }
 
         if !self.is_lock_free(typ) {
-            diag::error(
+            diag::error_args(
                 expr.pos,
-                &format!(
-                    "atomic operation on '{}' ({} bytes) is not lock-free; \
-                     c17 does not link libatomic",
-                    self.types.get(typ),
-                    self.types.size_bytes(typ)
-                ),
+                "atomic operation on '{0}' ({1} bytes) is not lock-free; \
+                 c17 does not link libatomic",
+                &[
+                    &self.types.get(typ).to_string(),
+                    &self.types.size_bytes(typ).to_string(),
+                ],
             );
             return None;
         }

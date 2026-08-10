@@ -18,6 +18,7 @@ use crate::strings::StringId;
 use crate::symbol::{Namespace, Symbol};
 use crate::token::lexer::{Position, SpecialToken, TokenType, TokenValue};
 use crate::types::{Type, TypeId, TypeKind, TypeModifiers};
+use gettextrs::gettext;
 
 const DEFAULT_ARG_LIST_CAPACITY: usize = 8;
 const DEFAULT_INIT_CAPACITY: usize = 8;
@@ -1414,7 +1415,7 @@ impl<'a> Parser<'a> {
                         info.typ
                     } else {
                         let member_name = self.idents.get_opt(member).unwrap_or("<unknown>");
-                        diag::error(dot_pos, &format!("has no member named '{}'", member_name));
+                        diag::error_args(dot_pos, "has no member named '{0}'", &[member_name]);
                         self.types.int_id
                     }
                 } else {
@@ -1448,9 +1449,10 @@ impl<'a> Parser<'a> {
                             info.typ
                         } else {
                             let member_name = self.idents.get_opt(member).unwrap_or("<unknown>");
-                            diag::error(
+                            diag::error_args(
                                 arrow_pos,
-                                &format!("has no member named '{}'", member_name),
+                                "has no member named '{0}'",
+                                &[member_name],
                             );
                             self.types.int_id
                         }
@@ -1689,14 +1691,15 @@ impl<'a> Parser<'a> {
         } else {
             required.to_string()
         };
-        diag::error(
+        // The singular/plural split is baked into the English sentence, so no
+        // amount of substitution fixes it from outside -- both forms have to be
+        // msgids.
+        diag::error_plural(
             call_pos,
-            &format!(
-                "call expects {} argument{}, but {} given",
-                expected,
-                if required == 1 { "" } else { "s" },
-                args.len()
-            ),
+            "call expects {0} argument, but {1} given",
+            "call expects {0} arguments, but {1} given",
+            required,
+            &[&expected, &args.len().to_string()],
         );
     }
 
@@ -1750,7 +1753,7 @@ impl<'a> Parser<'a> {
                         .modifiers(base_type_id)
                         .contains(TypeModifiers::CONST)
                     {
-                        diag::error(pos, "assignment of read-only location");
+                        diag::error(pos, &gettext("assignment of read-only location"));
                         return; // Don't duplicate with the general const check
                     }
                 }
@@ -1768,9 +1771,10 @@ impl<'a> Parser<'a> {
                     }
                     _ => String::new(),
                 };
-                diag::error(
+                diag::error_args(
                     pos,
-                    &format!("assignment of read-only variable{}", var_name),
+                    "assignment of read-only variable{0}",
+                    &[&var_name.to_string()],
                 );
             }
         }
@@ -2014,12 +2018,10 @@ impl<'a> Parser<'a> {
                     self.types.types_compatible_qualified(*seen_typ, assoc_typ)
                 }) {
                     let _ = prev;
-                    diag::error(
+                    diag::error_args(
                         assoc_pos,
-                        &format!(
-                            "_Generic selection has two associations with compatible type '{}'",
-                            self.types.get(assoc_typ)
-                        ),
+                        "_Generic selection has two associations with compatible type '{0}'",
+                        &[&self.types.get(assoc_typ).to_string()],
                     );
                 } else {
                     seen.push((assoc_typ, assoc_pos));
@@ -2043,12 +2045,10 @@ impl<'a> Parser<'a> {
         match selected.or(default_expr) {
             Some(expr) => Ok(expr),
             None => {
-                diag::error(
+                diag::error_args(
                     token_pos,
-                    &format!(
-                        "_Generic selector of type '{}' is not compatible with any association",
-                        self.types.get(selector)
-                    ),
+                    "_Generic selector of type '{0}' is not compatible with any association",
+                    &[&self.types.get(selector).to_string()],
                 );
                 // Recover with a typed zero so one bad selection does not
                 // cascade through the rest of the expression.
@@ -3012,7 +3012,7 @@ impl<'a> Parser<'a> {
                             ));
                         }
                         // Not declared — return 0 as fallback
-                        diag::error(token_pos, &format!("undeclared function '{}'", real_name));
+                        diag::error_args(token_pos, "undeclared function '{0}'", &[real_name]);
                         Ok(Self::typed_expr(
                             ExprKind::IntLit(0),
                             self.types.int_id,
@@ -3085,7 +3085,7 @@ impl<'a> Parser<'a> {
                         // C99 6.5.1: Undeclared identifier is an error
                         // (implicit int was removed in C99)
                         let name_str = self.idents.get_opt(name_id).unwrap_or("");
-                        diag::error(token_pos, &format!("undeclared identifier '{}'", name_str));
+                        diag::error_args(token_pos, "undeclared identifier '{0}'", &[name_str]);
                         // Return a dummy expression to continue parsing
                         Ok(Self::typed_expr(
                             ExprKind::IntLit(0),

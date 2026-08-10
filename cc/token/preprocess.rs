@@ -609,9 +609,18 @@ impl<'a> Preprocessor<'a> {
         self.define_macro(Macro::predefined("__STDC_UTF_32__", Some("1")));
 
         // __STDC_IEC_559_COMPLEX__ is deliberately NOT defined. It asserts
-        // conformance to Annex G, and complex support does not meet that bar:
-        // `float _Complex` silently loses its imaginary part and
-        // `long double _Complex` emits an invalid instruction. See cc/audit.md.
+        // conformance to Annex G. The original reason -- that complex support
+        // was broken outright -- no longer holds: #C1/#C2 are fixed, and the
+        // arithmetic is now byte-identical to gcc's at float, double and long
+        // double. What is still missing is G.5.1p4: an infinite operand must
+        // give an infinite result even against a NaN, and
+        // `CMPLX(INFINITY,0) * CMPLX(NAN,NAN)` yields NaN here.
+        //
+        // gcc fails that same rule and defines the macro regardless, so this
+        // is a deliberate divergence: the macro is a claim about the
+        // arithmetic, and the arithmetic does not support it yet. Pinned by
+        // `c17_complex_infinity_rules_match_gcc`, which fails the day G.5.1
+        // is implemented -- the signal to revisit this rather than inherit it.
 
         // C17 4p6: an implementation that does not provide <threads.h> shall
         // define __STDC_NO_THREADS__, so portable code can feature-test rather

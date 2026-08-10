@@ -135,9 +135,22 @@ fn c17_conditional_feature_macros() {
     );
 }
 
-/// `__STDC_IEC_559_COMPLEX__` asserts Annex G conformance, which complex
-/// support does not meet (see cc/audit.md). It must stay undefined rather
-/// than claim something untrue.
+/// `__STDC_IEC_559_COMPLEX__` asserts Annex G conformance. It stays undefined,
+/// but the reason has changed and is worth stating precisely.
+///
+/// It was undefined because complex support was broken -- `float _Complex` lost
+/// its imaginary part, `long double _Complex` emitted an invalid instruction.
+/// Both are fixed, and c17's complex arithmetic is now byte-identical to gcc's
+/// at all three precisions. What is still missing is G.5.1p4: an infinite
+/// operand must give an infinite result even when the other operand is a NaN,
+/// and `CMPLX(INFINITY,0) * CMPLX(NAN,NAN)` gives NaN here.
+///
+/// gcc fails that same rule and defines the macro anyway, so this is a
+/// deliberate divergence rather than an oversight: the macro is a claim about
+/// the arithmetic, and the arithmetic does not yet support it. See
+/// `c17_complex_infinity_rules_match_gcc`, which pins the behaviour so the
+/// day G.5.1 is implemented, this decision gets revisited rather than
+/// inherited.
 #[test]
 fn c17_does_not_claim_annex_g_complex() {
     let r = preprocess_text(
@@ -150,6 +163,68 @@ fn c17_does_not_claim_annex_g_complex() {
         r.stdout.contains("honest"),
         "__STDC_IEC_559_COMPLEX__ must not be defined:\n{}",
         r.stdout
+    );
+}
+
+/// The complex arithmetic behind the `__STDC_IEC_559_COMPLEX__` decision.
+///
+/// Two things are pinned. The parts of Annex G that c17 *does* get right, so a
+/// regression in complex lowering is caught here rather than in whatever
+/// numeric code notices first -- these all agree with gcc, verified
+/// differentially at float, double and long double. And the one rule it gets
+/// wrong, G.5.1p4, which is the whole reason the macro stays undefined.
+///
+/// If the G.5.1 case ever starts passing, this test fails, and that is the
+/// signal to define the macro rather than let the decision go stale.
+#[test]
+fn c17_complex_infinity_rules_match_gcc() {
+    let src = r#"
+#include <complex.h>
+#include <math.h>
+
+int main(void) {
+    double _Complex inf_c = CMPLX(INFINITY, 0.0);
+    double _Complex nan_c = CMPLX(NAN, NAN);
+
+    /* G.5.1: infinity over a finite value stays infinite. */
+    double _Complex d = inf_c / CMPLX(2.0, 0.0);
+    if (!isinf(creal(d))) return 1;
+
+    /* ...and a finite value over an infinity is a zero. */
+    double _Complex z = CMPLX(2.0, 0.0) / inf_c;
+    if (creal(z) != 0.0 || cimag(z) != 0.0) return 2;
+
+    /* G.6p2: cproj folds every infinity onto one point on the real axis,
+       whichever part is infinite. */
+    if (!isinf(creal(cproj(CMPLX(INFINITY, 2.0))))) return 3;
+    if (!isinf(creal(cproj(CMPLX(1.0, INFINITY))))) return 4;
+    if (creal(cproj(CMPLX(-INFINITY, -0.0))) <= 0.0) return 5;
+
+    /* G.6.3.1: clog's branch cut runs along the negative real axis, and the
+       sign of a zero imaginary part decides which side we are on. */
+    if (cimag(clog(CMPLX(-1.0, 0.0))) <= 0.0) return 6;
+    if (cimag(clog(CMPLX(-1.0, -0.0))) >= 0.0) return 7;
+
+    /* The same rules hold at the other two precisions -- these were the
+       precisions that used to be miscompiled outright (#C1/#C2). */
+    float _Complex fz = CMPLXF(2.0f, 0.0f) / CMPLXF(INFINITY, 0.0f);
+    if (crealf(fz) != 0.0f) return 8;
+    long double _Complex lz = CMPLXL(2.0L, 0.0L) / CMPLXL(INFINITY, 0.0L);
+    if (creall(lz) != 0.0L) return 9;
+
+    /* G.5.1p4 is NOT met: an infinite operand should give an infinite result
+       even against a NaN. It gives NaN, exactly as gcc does -- which is why
+       __STDC_IEC_559_COMPLEX__ stays undefined. Asserted in the failing
+       direction on purpose: this is the gate on that decision.  */
+    double _Complex m = inf_c * nan_c;
+    if (isinf(creal(m)) || isinf(cimag(m))) return 10;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c17_complex_infinity_rules", src, &["-lm".to_string()]),
+        0
     );
 }
 

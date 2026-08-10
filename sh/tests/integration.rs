@@ -2569,21 +2569,39 @@ mod audit_regressions {
 
     #[test]
     fn pipelines_do_not_leak_descriptors_to_their_commands() {
-        // Only fds 0, 1 and 2 (plus whatever the utility opens itself) may
-        // reach a pipeline member.
+        // A pipeline member must see exactly what a plain command sees. That
+        // is not a fixed set: a shell passes the descriptors it inherited on
+        // to its children, and the test harness may hold some open. So the
+        // single-command case is the baseline, and the question is only
+        // whether the pipeline machinery adds anything of its own.
         if !Path::new("/proc/self/fd").exists() {
             return;
         }
+        let open_fds = |script: &str| {
+            let fds = std::cell::RefCell::new(Vec::new());
+            run_successfully_and(script, |out| {
+                let mut listed: Vec<u32> = out
+                    .split_whitespace()
+                    .filter_map(|fd| fd.parse().ok())
+                    .collect();
+                listed.sort_unstable();
+                *fds.borrow_mut() = listed;
+            });
+            fds.into_inner()
+        };
+        let baseline = open_fds("ls /proc/self/fd\n");
         for script in [
             "true | ls /proc/self/fd\n",
             "ls /proc/self/fd | cat\n",
             "true | true | ls /proc/self/fd\n",
         ] {
-            run_successfully_and(script, |out| {
-                let fds: Vec<&str> = out.split_whitespace().collect();
-                // 0, 1, 2 and the descriptor `ls` opened to read the directory.
-                assert_eq!(fds.len(), 4, "leaked descriptors: {fds:?}");
-            });
+            let fds = open_fds(script);
+            assert_eq!(
+                fds.len(),
+                baseline.len(),
+                "`{}` leaked descriptors: {fds:?} vs baseline {baseline:?}",
+                script.trim_end()
+            );
         }
     }
 

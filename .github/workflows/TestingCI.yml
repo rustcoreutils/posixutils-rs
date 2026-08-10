@@ -60,6 +60,32 @@ jobs:
       - name: Run tests
         run: cargo test --release --verbose
 
+  # aarch64 Linux. The only place `long double` is IEEE binary128 -- macOS
+  # makes it a 64-bit double and x86_64 uses x87 80-bit -- so it is the only
+  # runner that can adjudicate the quad-precision codegen (audit #H4), which
+  # was deferred twice for want of exactly this.
+  linux-aarch64:
+    needs: lint
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: System info
+        run: |
+          echo "=== Architecture ==="
+          uname -a
+          echo "=== Toolchain ==="
+          rustc --version
+          cc --version || true
+      - name: Fetch
+        run: cargo fetch
+      - name: Build
+        run: cargo build --release --verbose
+      - name: Run tests
+        run: cargo test --release --verbose
+
   macos-homebrew:
     needs: lint
     runs-on: macos-latest

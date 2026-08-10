@@ -652,7 +652,6 @@ impl Walker {
                 no_std_inc: true,
                 no_builtin_inc: true,
                 trigraphs: false,
-                lang: Default::default(),
             },
         );
 

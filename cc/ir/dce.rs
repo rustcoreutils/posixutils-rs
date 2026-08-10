@@ -6,7 +6,7 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// Dead Code Elimination (DCE) pass for c17 C99 compiler
+// Dead Code Elimination (DCE) pass for c17 C17 compiler
 //
 // This pass removes instructions whose results are never used.
 // It uses a mark-sweep algorithm:

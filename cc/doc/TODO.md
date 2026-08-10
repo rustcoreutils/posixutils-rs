@@ -146,3 +146,14 @@ Post-codegen peephole optimizations on generated assembly.
 | `imul $1, %rax, %rax` | Delete (multiply by 1) |
 | `cmp $0, %rax; je L` | `test %rax, %rax; je L` (shorter) |
 | `mov $imm, %rax; add %rax, %rbx` | `add $imm, %rbx` if imm fits |
+
+## External Test Suites
+
+Carried over from the retired C99 checklist, where they sat as unticked
+conformance boxes. They are not conformance gaps -- they are test-coverage
+work, and were never a claim about the language.
+
+| Suite | Note |
+|-------|------|
+| GCC torture tests (C99 subset) | Not run against c17 |
+| clang test suite (C99 subset) | Not run against c17 |

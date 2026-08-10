@@ -6,7 +6,7 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// Linearizer for c17 C99 compiler
+// Linearizer for c17 C17 compiler
 // Converts AST to SSA-form IR with basic blocks and typed pseudo-registers
 //
 

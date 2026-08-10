@@ -657,7 +657,15 @@ impl X86_64CodeGen {
             }
         } else if !src_is_longdouble && dst_is_longdouble {
             // Float/double -> long double
-            // Handle different source locations
+            //
+            // The load width has to match how the source is *stored*, which is
+            // not always what its C type says: a constant goes into the
+            // 8-byte double pool whatever its type, so a `float` one must
+            // still be read with `fldl`. Reading it with `flds` took the low
+            // half of the double and produced 0 -- `long double x = 1.5f;`
+            // came out as zero, and so did every `INFINITY` reaching a long
+            // double, since <math.h> spells it `__builtin_inff()`.
+            let mut load_as_float = src_is_float;
             let src_addr = match &src_loc {
                 Loc::Xmm(xmm_reg) => {
                     // XMM register - store to scratch memory first
@@ -681,17 +689,22 @@ impl X86_64CodeGen {
                     scratch
                 }
                 Loc::FImm(val, _) => {
-                    // Float/double immediate - create constant in rodata
+                    // Float/double immediate - create constant in rodata.
+                    // `double_constants` is emitted as `.quad`, so this is a
+                    // 64-bit object regardless of the expression's type. The
+                    // f64 holds the f32 value exactly, so reading it as a
+                    // double is both correct and lossless.
                     let bits = val.to_bits();
                     let label = format!(".Ldbl_const_{}", bits);
                     self.double_constants.insert(bits, *val);
+                    load_as_float = false;
                     MemAddr::RipRelative(crate::arch::lir::Symbol::local(label))
                 }
                 _ => get_mem_addr(&src_loc, self),
             };
 
             // Load as float/double to x87
-            if src_is_float {
+            if load_as_float {
                 // Load float (32-bit)
                 self.push_lir(X86Inst::X87LoadFloat { addr: src_addr });
             } else {

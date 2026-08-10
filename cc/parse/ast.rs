@@ -6,7 +6,7 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// Abstract Syntax Tree for c17 C99 compiler
+// Abstract Syntax Tree for c17 C17 compiler
 // Type-annotated AST for C99 with expressions, statements, and declarations
 //
 

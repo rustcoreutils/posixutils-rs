@@ -1,12 +1,12 @@
-# Guide to working on c17, our C99 compiler
+# Guide to working on c17, our C17 compiler
 
 ## Overview
 
-c17 is a C17 compiler (ISO/IEC 9899:2018) targeting POSIX.2024 compliance. C17 is a defect-report revision of C11 and adds no features over it, so the language delta tracked below is C11's. It supports x86-64 and AArch64 (ARM64) on Linux and macOS.
+c17 implements **C17 (ISO/IEC 9899:2018) only**, plus selected GNU extensions, targeting POSIX.2024 compliance. C17 is a defect-report revision of C11 and adds no features over it. There is one language mode: no `-std=` switching between revisions, and no strict-versus-GNU axis. `-std=` is still accepted, because build systems pass it unconditionally, but a request for an older revision is reported rather than honoured (silence it with `-Wno-c17-dialect`). It supports x86-64 and AArch64 (ARM64) on Linux and macOS.
 
 References:
-- [ISO/IEC 9899:1999 (C99)](https://www.open-std.org/jtc1/sc22/wg14/www/docs/n1256.pdf) — baseline
-- [ISO/IEC 9899:2011 (C11)](https://www.open-std.org/jtc1/sc22/wg14/www/docs/n1570.pdf) — delta tracked in [doc/c11-checklist.md](doc/c11-checklist.md)
+- [ISO/IEC 9899:2011 (C11)](https://www.open-std.org/jtc1/sc22/wg14/www/docs/n1570.pdf) — C17 is this plus defect reports; the published C17 text is not free
+- Conformance findings and known divergences: [audit.md](audit.md)
 
 ## Quick start
 
@@ -102,8 +102,8 @@ EOF
 ## Current Limitations
 
 Supported:
-- C99 standard (see [doc/c99-checklist.md](doc/c99-checklist.md))
-- C11 deltas: `_Generic`, `_Atomic` / `<stdatomic.h>` (including access through ordinary operators), `<tgmath.h>`, `_Noreturn`, `_Static_assert`, `_Alignas` / `_Alignof`, `_Thread_local` (Local-Exec and Initial-Exec models), anonymous struct/union members, Unicode literals. See [doc/c11-checklist.md](doc/c11-checklist.md) for full delta.
+- The C17 language, C99 baseline and all C11 additions alike
+- C11 additions: `_Generic`, `_Atomic` / `<stdatomic.h>` (including access through ordinary operators), `<tgmath.h>`, `_Noreturn`, `_Static_assert`, `_Alignas` / `_Alignof`, `_Thread_local` (Local-Exec and Initial-Exec models), anonymous struct/union members, Unicode literals
 - GCC-compatible inline assembly: extended asm with constraints, clobbers, named operands, matching constraints, `asm goto` with labels
 
 Not yet implemented (features we want to add):
@@ -112,7 +112,10 @@ Not yet implemented (features we want to add):
 - assembly peephole optimizations
 
 Will not implement:
-- C99 `_Imaginary` type (removed in C11; no mainstream compiler implements it)
+- `_Imaginary` types. Optional in C99, C11 and C17 alike -- never removed,
+  as this line used to claim. Neither gcc nor clang implements them: gcc
+  rejects `_Imaginary double x;` outright and leaves `_Imaginary_I` undefined,
+  while still defining `__STDC_IEC_559_COMPLEX__`.
 
 Off by default:
 - Trigraphs. They were deprecated in C99 but **not removed until C23**, so C17

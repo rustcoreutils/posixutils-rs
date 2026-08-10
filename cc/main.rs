@@ -6,7 +6,7 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// c17 - A POSIX C99 compiler
+// c17 - A POSIX C17 compiler
 //
 
 #![recursion_limit = "512"]
@@ -30,7 +30,9 @@ mod token;
 mod types;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{
+    bind_textdomain_codeset, gettext, gettext_args, setlocale, textdomain, LocaleCategory,
+};
 use std::fs::File;
 use std::io::{self, BufReader, Read, Write};
 use std::path::Path;
@@ -40,7 +42,7 @@ use parse::Parser as CParser;
 use strings::StringTable;
 use symbol::SymbolTable;
 use target::Os;
-use target::{LangOpts, Target};
+use target::{classify_std, StdRequest, Target};
 use token::{
     preprocess_asm_file, preprocess_with_defines, replace_trigraphs, show_token, token_type_name,
     AsmPreprocessConfig, PreprocessConfig, StreamTable, Tokenizer,
@@ -190,6 +192,9 @@ struct Args {
           num_args = 0..=1, default_missing_value = "extra", help = gettext("Warning flags (e.g., -Wall, -Wextra, -Wno-unused)"))]
     warnings: Vec<String>,
 
+    #[arg(short = 'w', help = gettext("Suppress all warnings"))]
+    no_warnings: bool,
+
     #[arg(long = "pedantic", hide = true, help = gettext("Pedantic mode (compatibility)"))]
     pedantic: bool,
 
@@ -253,17 +258,42 @@ struct Args {
     unsupported_mflags: Vec<String>,
 }
 
+/// The `-Wno-` name for the "`-std=` was not honoured" warning.
+const STD_DIALECT_WARNING: &str = "c17-dialect";
+
+/// Print a warning about the command line, unless `-w` turned warnings off.
+///
+/// These have no source position -- they are about the invocation, not a
+/// translation unit -- so they cannot go through `diag`, which keys everything
+/// on a `Position`. They still have to answer to `-w`, or its own help text
+/// ("Suppress all warnings") is untrue.
+fn driver_warning(msg: &str) {
+    if diag::warnings_suppressed() {
+        return;
+    }
+    eprintln!("c17: {}: {}", gettext("warning"), msg);
+}
+
 impl Args {
-    /// The language dialect requested by `-std=`, defaulting to `gnu17`.
+    /// Classify `-std=`, if one was given.
     ///
-    /// Returns the offending spelling on failure so the caller can name it in
-    /// the diagnostic. `main` validates this before compiling anything, so
-    /// later callers may treat a failure as unreachable.
-    fn lang_opts(&self) -> Result<LangOpts, &str> {
+    /// c17 compiles one language, so this cannot select anything -- it only
+    /// separates a spelling we recognize from a typo. Returns the offending
+    /// spelling on failure so the caller can name it in the diagnostic.
+    fn std_request(&self) -> Result<Option<StdRequest>, &str> {
         match &self.c17_std {
-            None => Ok(LangOpts::default()),
-            Some(spec) => LangOpts::parse(spec).ok_or(spec.as_str()),
+            None => Ok(None),
+            Some(spec) => classify_std(spec).map(Some).ok_or(spec.as_str()),
         }
+    }
+
+    /// Is the warning named `name` turned off, by `-w` or `-Wno-<name>`?
+    fn warning_suppressed(&self, name: &str) -> bool {
+        self.no_warnings
+            || self
+                .warnings
+                .iter()
+                .any(|w| w.strip_prefix("no-") == Some(name))
     }
 }
 
@@ -453,8 +483,6 @@ fn process_file(
             no_std_inc: args.no_std_inc,
             no_builtin_inc: args.no_builtin_inc,
             trigraphs: args.trigraphs,
-            // main() has already rejected an unknown -std=.
-            lang: args.lang_opts().unwrap_or_default(),
         },
     );
 
@@ -757,10 +785,9 @@ fn link_objects(
             link_cmd.arg("-Wl,-Bstatic");
         }
         Some("static") => {
-            eprintln!(
-                "{}",
-                gettext("c17: warning: -B static: this platform's linker cannot prefer archives")
-            );
+            driver_warning(&gettext(
+                "-B static: this platform's linker cannot prefer archives",
+            ));
         }
         Some("dynamic") if gnu_binding => {
             link_cmd.arg("-Wl,-Bdynamic");
@@ -1303,15 +1330,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    // Validate the dialect alongside the other argument checks, before any
-    // early-return path, so an unknown -std= is never silently accepted.
-    if let Err(spec) = args.lang_opts() {
-        eprintln!(
-            "c17: {}: '{}'",
-            gettext("unrecognized C standard for -std="),
-            spec
-        );
-        std::process::exit(1);
+    if args.no_warnings {
+        diag::suppress_warnings();
+    }
+
+    // Validate -std= alongside the other argument checks, before any
+    // early-return path, so a typo is never silently accepted.
+    match args.std_request() {
+        Err(spec) => {
+            eprintln!(
+                "c17: {}: '{}'",
+                gettext("unrecognized C standard for -std="),
+                spec
+            );
+            std::process::exit(1);
+        }
+        // Say plainly that an older revision was not honoured. c17 compiles
+        // C17 and only C17, so the flag is accepted -- build systems pass it
+        // unconditionally -- but silently ignoring it is what let
+        // __STDC_VERSION__ disagree with the binary's own name once already.
+        Ok(Some(StdRequest::Older)) if !args.warning_suppressed(STD_DIALECT_WARNING) => {
+            let spec = args.c17_std.as_deref().unwrap_or_default();
+            driver_warning(&gettext_args(
+                "'-std={0}' ignored; c17 compiles C17 (ISO/IEC 9899:2018) only",
+                &[spec],
+            ));
+        }
+        Ok(_) => {}
     }
 
     // Handle --print-targets
@@ -1362,12 +1407,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for op in &operands {
         if op.kind == OperandKind::Unknown {
-            eprintln!(
-                "c17: {}: {}: {}",
-                gettext("warning"),
+            driver_warning(&format!(
+                "{}: {}",
                 gettext("unrecognized file type"),
                 op.path
-            );
+            ));
         }
     }
 
@@ -1381,12 +1425,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // spec leaves this unspecified (88338-88343); say so rather than silently
     // producing one object.
     if args.compile_only && args.output.is_some() && source_count > 1 {
-        eprintln!(
-            "c17: {}: {} ({})",
-            gettext("warning"),
+        driver_warning(&format!(
+            "{} ({})",
             gettext("-o applies only to the last source operand with -c"),
             source_count
-        );
+        ));
     }
 
     if let Some(mode) = args.binding.as_deref() {
@@ -1596,21 +1639,25 @@ mod tests {
     }
 
     #[test]
-    fn test_lang_opts_from_args() {
+    fn test_std_request_from_args() {
         let parse = |argv: &[&str]| {
             let argv = run_preprocess(argv);
             Args::parse_from(argv)
         };
 
-        assert_eq!(parse(&["foo.c"]).lang_opts(), Ok(LangOpts::default()));
+        // No -std= at all is not a request; the language is C17 either way.
+        assert_eq!(parse(&["foo.c"]).std_request(), Ok(None));
         assert_eq!(
-            parse(&["-std=c99", "foo.c"]).lang_opts(),
-            Ok(LangOpts {
-                std: target::CStd::C99,
-                gnu: false
-            })
+            parse(&["-std=c17", "foo.c"]).std_request(),
+            Ok(Some(StdRequest::C17))
         );
-        assert_eq!(parse(&["-std=c42", "foo.c"]).lang_opts(), Err("c42"));
+        // Recognized but older: accepted, and reported as not honoured.
+        assert_eq!(
+            parse(&["-std=c99", "foo.c"]).std_request(),
+            Ok(Some(StdRequest::Older))
+        );
+        // A typo is still an error, not a silently ignored value.
+        assert_eq!(parse(&["-std=c42", "foo.c"]).std_request(), Err("c42"));
     }
 
     #[test]

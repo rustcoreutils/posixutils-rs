@@ -6,7 +6,7 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// Parser for c17 C99 compiler
+// Parser for c17 C17 compiler
 // Recursive descent parser with Pratt-style precedence climbing
 //
 

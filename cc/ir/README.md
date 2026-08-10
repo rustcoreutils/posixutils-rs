@@ -1,6 +1,6 @@
 # IR Reference
 
-SSA-form intermediate representation for c17 C99 compiler. Inspired by Linus Torvalds' sparse IR.
+SSA-form intermediate representation for the c17 C17 compiler. Inspired by Linus Torvalds' sparse IR.
 
 ## Core Concepts
 

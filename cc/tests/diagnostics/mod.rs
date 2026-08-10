@@ -339,6 +339,36 @@ fn diagnostics_atomic_qualified_forms_are_accepted() {
     );
 }
 
+/// C17 6.7.2.4p3 also bars `_Atomic` on a variably-modified type. c17 needs no
+/// separate check for that, because such a struct or union cannot be formed in
+/// the first place — both routes to one are already closed earlier in the
+/// parse, and an unreachable constraint would be dead code.
+///
+/// Pinned here so the reasoning is checkable: if either gate below is ever
+/// relaxed, `_Atomic` grows a real hole and these tests say where to look.
+#[test]
+fn diagnostics_variably_modified_aggregates_cannot_be_formed() {
+    // Directly: C99 6.7.5.2 forbids a VLA member outright.
+    compile_expect_error(
+        "vla_member",
+        "void f(int n){ struct S { int a[n]; } s; (void)s; }\n",
+        "variable length arrays cannot be structure or union members",
+    );
+    // And through a typedef, which is the only way to smuggle the
+    // variably-modified part past the member declarator (#L5).
+    compile_expect_error(
+        "vm_member_via_typedef",
+        "void f(int n){ typedef int A[n]; struct S { A x; } s; (void)s; }\n",
+        "typedef of a variable-length array type",
+    );
+    // So the _Atomic spelling fails on the type, never reaching the qualifier.
+    compile_expect_error(
+        "atomic_vla_member",
+        "void f(int n){ _Atomic struct S { int a[n]; } s; (void)s; }\n",
+        "variable length arrays cannot be structure or union members",
+    );
+}
+
 // ============================================================================
 // Checks that already existed — pinned so the new suite covers them too
 // ============================================================================

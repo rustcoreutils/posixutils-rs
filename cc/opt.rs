@@ -6,7 +6,7 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// Optimization infrastructure for c17 C99 compiler
+// Optimization infrastructure for c17 C17 compiler
 //
 // This module provides the optimization pass runner and common utilities
 // used by optimization passes (InstCombine, DCE, etc.).

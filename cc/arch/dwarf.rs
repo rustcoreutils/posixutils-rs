@@ -6,7 +6,7 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// DWARF debug information generation for c17 C99 compiler
+// DWARF debug information generation for c17 C17 compiler
 //
 
 use super::codegen::CodeGenBase;

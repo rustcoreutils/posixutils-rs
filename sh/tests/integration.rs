@@ -2586,4 +2586,15 @@ mod audit_regressions {
             });
         }
     }
+
+    #[test]
+    fn exit_status_of_a_bare_command_substitution() {
+        // POSIX 2.9.1: a command consisting only of substitutions takes the
+        // exit status of the last one.
+        test_script("$(exit 3)\necho \"[$?]\"\n", "[3]\n");
+        test_script("$(true)\necho \"[$?]\"\n", "[0]\n");
+        test_script("false\n$(exit 3)\necho \"[$?]\"\n", "[3]\n");
+        // An assignment has its own status, taken from the substitution too.
+        test_script("x=$(exit 5)\necho \"[$?]\"\n", "[5]\n");
+    }
 }

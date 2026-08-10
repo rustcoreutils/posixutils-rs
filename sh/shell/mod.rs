@@ -1155,7 +1155,14 @@ impl Shell {
                             "command substitution: {err}"
                         ))
                     })?;
-                waitpid(child, false, false)?;
+                // POSIX 2.9.1: when a command consists only of substitutions,
+                // its exit status is that of the last one, so the status has
+                // to be recorded rather than discarded.
+                self.last_command_substitution_status = match waitpid(child, false, false)? {
+                    WaitStatus::Exited { exit_status } => exit_status,
+                    WaitStatus::Signaled { signal } => signal.exit_status(),
+                    WaitStatus::Stopped { .. } | WaitStatus::StillAlive => 0,
+                };
                 // The shell represents words as UTF-8 strings; bytes that are
                 // not valid UTF-8 cannot be carried through, so substitute
                 // replacement characters rather than aborting.

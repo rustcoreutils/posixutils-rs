@@ -378,7 +378,13 @@ violation.
 
 - [x] **#C6 — A `float` constant converted to `long double` is read at the wrong width, yielding 0.** **✓ fixed.** `long double x = 1.5f;` produced `0`. Converting float or double to x87 long double loads the source from memory, and the load width came from the expression's C *type*; but a constant is materialised into `double_constants`, emitted as `.quad`, so it is 8 bytes whatever its type. A float-typed one was then read back with `flds`, taking the low half of the double — zero for any value whose significant bits sit in the top half. Pool constants now load as doubles, which is lossless since the f64 holds the f32 value exactly. Runtime conversions were always correct, which is why nothing caught it. Found while verifying Annex G, and the reason that verification was worth doing rather than asserting: `<math.h>` spells `INFINITY` as `__builtin_inff()` — a **float** — so *every* `long double` infinity in a program was silently `0`, which is how `CMPLX(INFINITY,0)/CMPLX(2,0)` came out finite. Test: `c17_complex_infinity_rules_match_gcc`.
 
-- [ ] **#C7 — `isnan()` on a `long double` returns 65535 rather than 1.** **Open, Minor.** C99 7.12.3.4 requires only "a nonzero value", so this is conforming and `if (isnan(x))` behaves correctly — but it differs from gcc, breaks the idiom `isnan(x) == 1`, and `0xFFFF` looks like a 16-bit classification result reaching the caller without being narrowed to a 0/1 `int`. Noticed while probing Annex G; not chased, because it is neither a miscompile nor in that phase's scope. **[probed]** `long double n = 0.0L/0.0L; printf("%d", isnan(n))` → gcc `1`, c17 `65535`.
+- [ ] **#C7 — `isnan()` on a `long double` returns 65535 rather than 1.** **Open, Minor — and the original diagnosis was wrong.** It is not a narrowing bug in our call path: `__isnanl` returns 65535 under **gcc too**, because that is what glibc's function returns (raw class bits), and c17 calling it directly matches gcc exactly. The difference is which branch of `<math.h>` is taken. gcc supplies `__builtin_isnan`, so glibc's `isnan` expands to nothing but the builtin, which gcc lowers to 0/1. c17 supplies no such builtin, so the header falls back to its `sizeof` ternary and calls `__isnanl`. **[probed]** `extern int __isnanl(long double);` called directly gives 65535 under both compilers; `gcc -E` shows `isnan(x)` expanding to the builtin while c17 expands to the ternary. C99 7.12.3.4 requires only "a nonzero value", so both are conforming and `if (isnan(x))` works either way — but `isnan(x) == 1` differs. Real fix: implement the `__builtin_isnan` / `__builtin_isinf` / `__builtin_isfinite` family, which is a feature rather than the one-line narrowing this entry implied.
+
+- [x] **#C8 — A long hex float significand wrapped to a wrong value.** **✓ fixed.** `0x1.0000000000000002p+0` evaluated to **3.0**. The significand was read into a `u64` and divided by `1u64 << (4 * digits)`; sixteen fraction digits make that a shift of 64, which wraps to a shift of 0 in a release build, so the fraction was added whole rather than scaled — and `u64::from_str_radix` overflowed on the same input. Wrong by a factor of three, silently, in a C99 feature the matrix below lists as conforming. Now decomposed exactly (integer significand plus binary exponent, sticky bit beyond 128 bits) and converted once. Verified differentially against gcc across 16-digit fractions, 31-digit significands, both ends of the exponent range, subnormals, and the leading/trailing-dot forms. Tests: `c99_hex_float_long_significand`, `test_hex_float_long_significand_is_not_mangled`.
+
+- [x] **#C9 — `_Atomic` was not accepted as a pointer qualifier at file scope.** **✓ fixed.** `int *_Atomic p;` parsed inside a function and failed at file scope, and `int *_Atomic;` was *accepted* there — with no qualifier arm to consume it, `_Atomic` fell through to the name position and declared a variable called `_Atomic`. gcc rejects that. C17 6.7.6.1 puts a type-qualifier list after `*` and 6.7.3 makes `_Atomic` one. The loop existed in three copies (`parse_declarator`, `parse_function_def`, `parse_external_decl`) and only the first had been updated; all three now share one helper. `_Atomic` was also missing from the array declarator's qualifier list (6.7.6.2), so `void f(int a[_Atomic 4]);` was rejected outright.
+
+- [ ] **#C10 — A keyword can be used as a declarator name.** **Open, Minor.** **[probed]** `int sizeof;`, `int _Alignof;` and `int *_Generic;` are all accepted; gcc rejects each with "expected identifier". The declarator's name position takes any `TokenType::Ident`, and this compiler pre-interns keywords as identifiers, so nothing distinguishes them there. Found while fixing #C9, which was one instance of it — `_Atomic` reaching that position is what made `int *_Atomic;` a declaration. Not fixed with #C9 because a blanket rejection risks the extension keywords that are deliberately usable as identifiers (`typeof` among them, which gcc itself accepts here), so it needs its own pass over `cc/kw.rs`'s tags rather than a quick guard.
 
 ### Not confirmed
 
@@ -436,13 +442,13 @@ violation.
 | Var | Status | Notes |
 |---|---|---|
 | `LANG`, `LC_ALL`, `LC_CTYPE` | CONFORMS | `setlocale(LcAll,"")` at `cc/main.rs:870` forwards to libc |
-| `LC_MESSAGES` | PARTIAL | labels and driver messages translated; diagnostic bodies still English — #U7 |
-| `NLSPATH` (XSI) | PARTIAL | `gettext()` honors it (cross-cutting note 4), but `c17`'s own diagnostics are unwrapped — #U7 |
+| `LC_MESSAGES` | CONFORMS | #U7 closed; diagnostic bodies go through `gettext_args` with positional placeholders |
+| `NLSPATH` (XSI) | CONFORMS | `gettext()` honors it, and #U7 wrapped c17's own diagnostics |
 | `TMPDIR` (XSI) | CONFORMS | one `tempfile::TempDir` per run |
 
 ### ASYNCHRONOUS EVENTS
 
-- [x] "Default" — no handlers installed, which is the conforming baseline. Temp files are not cleaned up if the process is signalled (see #U6's fix, which would also address this).
+- [x] "Default" — no handlers installed, which is what the spec requires, so this row is closed rather than deferred. Temp files are not removed if the process is signalled; that is a tidiness gap, not a conformance one, since ASYNCHRONOUS EVENTS mandates default handling.
 
 ### STDOUT / STDERR
 
@@ -481,11 +487,11 @@ violation.
 | Include cycle/depth guard | CONFORMS — **[probed]** a self-including header exits 1, no hang (`max_include_depth = 200`) |
 | Macro expansion (blue paint, rescanning, `##` placemarkers) | CONFORMS |
 | `#if` constant expressions | CONFORMS — #P6, #P14 closed |
-| Predefined macros | PARTIAL — #P1, #P7, #X8 |
+| Predefined macros | CONFORMS — #P1, #P7 and #X8 all closed |
 | C89 core | CONFORMS (declarators, bitfields, storage classes, tentative definitions, promotions) |
 | C99 | CONFORMS for everything audited (VLAs, designated initializers, compound literals, flexible array members, `restrict`, `inline`, `_Bool`, `long long`, `_Complex`, `__func__`, UCNs, hex floats) |
-| C11 | PARTIAL — `_Static_assert`, `_Alignas`/`_Alignof`, `_Noreturn`, `_Thread_local`, anonymous struct/union, and the explicit atomic API all work. Gaps: #X1, #X3, #X6, #X7 |
-| C17 | NOT CLAIMED — #P1/#X2. C17 is DR-only; DR 412 (`_Static_assert` as a struct member) is honored at `cc/parse/parser.rs:2116-2120`. DR 423 is moot until `_Generic` exists |
+| C11 | CONFORMS for everything audited — #X1, #X3, #X6 and #X7 are all closed, so `_Generic`, `_Atomic` through ordinary operators, the full `<stdatomic.h>` and the `CMPLX` macros join the rest |
+| C17 | CLAIMED — `__STDC_VERSION__` is `201710L`, and it is the only language c17 compiles. C17 is DR-only; DR 412 (`_Static_assert` as a struct member) is honored at `cc/parse/parser.rs`, and DR 423 is live now that `_Generic` exists |
 | Translation limits (C99 5.2.4.1) | CONFORMS — `Vec`/`BTreeMap`-backed throughout; `cc/tests/c99/translation_limits.rs` exercises 130-member structs, 20 params, 30 cases. Residual risk: the recursive-descent parser has no explicit depth guard, so very deep nesting depends on stack size |
 | Diagnostics for constraint violations (C17 5.1.1.3) | CONFORMS for everything audited — the pre-existing set plus implicit int, duplicate/non-constant `case`, multiple `default`, `return` type, call arity, typedef redefinition, `_Atomic` on an array, and the four preprocessor constraints. Residual: a zero-parameter prototype's call arity (see #L6) |
 

@@ -16,7 +16,17 @@
 **Issue**: Every floating literal is parsed into an `f64`, so any value outside
 double's range is lost before the type system ever sees it. `LDBL_MAX`
 evaluates to `inf` on x86-64, where `long double` is x87 80-bit and holds it
-comfortably; gcc prints `1.18973e+4932`.
+comfortably; gcc prints `1.18973e+4932`. `LDBL_MIN` underflows to `0` the same
+way, and a literal needing 54-64 mantissa bits is silently rounded:
+`3.14159265358979323846L` differs from gcc's bits from the 53rd onward.
+
+**Groundwork done**: `parse_hex_float_parts` (`cc/parse/expression.rs`) already
+returns the exact `(significand, exp2)` decomposition, so hex literals need no
+further parsing work -- only a way to carry the result past `ExprKind::FloatLit`,
+`Initializer::Float` and `Loc::FImm`, all of which hold an `f64`. Of the 47
+`FImm` sites across the two backends, ~12 bind the value; the rest pass it
+through. A decimal literal outside double's range additionally needs a
+decimal-to-binary conversion at width, which is the larger part.
 
 **Consequence**: `long double` constants are silently limited to 53 bits of
 mantissa and double's exponent range. `c17_long_double_round_trip` passes only
@@ -58,11 +68,17 @@ and access through ordinary operators are all done. `_Atomic` on an array or
 function type is rejected.
 
 **Remaining:**
-- Reject `_Atomic` on a struct or union with a VLA member (the array and
-  function cases are handled)
-- Accept `_Atomic` after `*` in a declarator: `int *_Atomic p;` fails to parse
-  while `int *const p;` does not
-- Reject `&(atomic_struct.member)`
+- Warn on member access of an atomic struct or union, as gcc does
+  ("accessing a member of an atomic structure"). C11 6.5.2.3p5 makes it
+  undefined behaviour rather than a constraint violation, so this is a
+  warning, not the rejection an earlier version of this list called for.
+
+Two entries that used to sit here were removed after being probed rather than
+implemented. Rejecting `_Atomic` on a struct or union with a VLA member is
+unreachable: such a type cannot be formed at all, since a VLA member is
+rejected outright and the typedef route is rejected at the typedef. And
+`int *_Atomic p;` now parses -- it was a qualifier-list bug at file scope, not
+a missing feature.
 
 ### C11 Thread-Local Storage — Dynamic Model
 

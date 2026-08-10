@@ -710,7 +710,7 @@
 - [x] `<iso646.h>` — alternative spellings
 - [x] `<stdbool.h>` — boolean type and values
 - [x] `<stdint.h>` — integer types
-- [x] `<tgmath.h>` — type-generic math
+- [x] `<tgmath.h>` — type-generic math. Bundled in `cc/include/`, written in `_Generic`: no glibc version is usable, since each needs `__builtin_tgmath` or `__builtin_classify_type`+`__real__` and `#error`s out unless `__HAVE_FLOAT128` agrees with `__HAVE_FLOAT64X`
 - [x] `<wchar.h>` — wide character utilities
 - [x] `<wctype.h>` — wide character classification
 

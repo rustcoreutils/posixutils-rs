@@ -1245,9 +1245,15 @@ impl<'a> Parser<'a> {
 
         // Get the base type - either from typedef or from built-in type specifiers
         let mut result_id = if let Some(typedef_type_id) = typedef_base {
-            // Apply trailing modifiers to the typedef type
-            if !modifiers.is_empty() {
-                let typedef_type = self.types.get(typedef_type_id);
+            // Drop the TYPEDEF bit either way. It records how the name was
+            // *declared*, not anything about the type, and leaving it on made a
+            // typedef's type differ from the type it aliases -- so
+            // `__builtin_types_compatible_p(int, MyInt)` answered 0, and
+            // `_Generic` could neither match nor reject a typedef'd
+            // association. The trailing-modifier path already cleared it; the
+            // bare path did not.
+            let typedef_type = self.types.get(typedef_type_id);
+            if !modifiers.is_empty() || typedef_type.modifiers.contains(TypeModifiers::TYPEDEF) {
                 let mut result = typedef_type.clone();
                 result.modifiers &= !TypeModifiers::TYPEDEF;
                 result.modifiers |= modifiers;

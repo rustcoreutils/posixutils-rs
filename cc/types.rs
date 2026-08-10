@@ -386,9 +386,27 @@ impl Type {
         Self::enum_type(CompositeType::incomplete(Some(tag)))
     }
 
+    /// Modifiers that describe a *declaration* rather than a type.
+    ///
+    /// C17 6.7.1p1 keeps storage-class specifiers out of the type, and the
+    /// function specifiers of 6.7.4 likewise qualify the declaration. They ride
+    /// along on `Type` because the parser collects all specifiers into one bag,
+    /// and they leak into places that only ever wanted the type: the return
+    /// type of `static int f(void)` carried `STATIC`, so a call to it was not
+    /// compatible with `int`. Invisible to `sizeof`, fatal to any comparison.
+    pub const DECL_SPECIFIERS: TypeModifiers = TypeModifiers::STATIC
+        .union(TypeModifiers::EXTERN)
+        .union(TypeModifiers::REGISTER)
+        .union(TypeModifiers::AUTO)
+        .union(TypeModifiers::TYPEDEF)
+        .union(TypeModifiers::THREAD_LOCAL)
+        .union(TypeModifiers::INLINE)
+        .union(TypeModifiers::NORETURN);
+
     /// Check if two types are compatible (for __builtin_types_compatible_p)
-    /// This ignores top-level qualifiers (const, volatile, restrict)
-    /// but otherwise requires types to be identical.
+    /// This ignores top-level qualifiers (const, volatile, restrict) and the
+    /// declaration specifiers above, but otherwise requires types to be
+    /// identical.
     /// Note: Different enum types are NOT compatible, even if they have
     /// the same underlying integer type.
     ///
@@ -416,7 +434,9 @@ impl Type {
         } else {
             TypeModifiers::SIGNED
         };
-        let ignored = QUALIFIERS.union(redundant_signed);
+        let ignored = QUALIFIERS
+            .union(redundant_signed)
+            .union(Self::DECL_SPECIFIERS);
 
         // Compare modifiers (ignoring top-level qualifiers)
         let self_mods = self.modifiers.difference(ignored);

@@ -21,47 +21,7 @@
 // everywhere.
 //
 
-use crate::common::run_c17;
-
-/// Emit assembly for `src` at `triple` and return it.
-fn asm_for(name: &str, triple: &str, src: &str) -> String {
-    let dir = tempfile::Builder::new()
-        .prefix(&format!("c17_cross_{}_", name))
-        .tempdir()
-        .expect("failed to create work dir");
-    let c = dir.path().join("t.c");
-    std::fs::write(&c, src).expect("failed to write source");
-    let s = dir.path().join("t.s");
-
-    let r = run_c17(&[
-        "--target",
-        triple,
-        "-S",
-        "-O",
-        &c.to_string_lossy(),
-        "-o",
-        &s.to_string_lossy(),
-    ]);
-    assert!(
-        r.success,
-        "c17 --target {} failed for {}:\n{}{}",
-        triple, name, r.stdout, r.stderr
-    );
-    std::fs::read_to_string(&s).expect("no assembly produced")
-}
-
-/// The body of function `name`, from its label to `.cfi_endproc`.
-fn body_of<'a>(asm: &'a str, name: &str) -> &'a str {
-    let label = format!("\n{}:\n", name);
-    let underscored = format!("\n_{}:\n", name);
-    let start = asm
-        .find(&label)
-        .or_else(|| asm.find(&underscored))
-        .unwrap_or_else(|| panic!("no function {} in:\n{}", name, asm));
-    let rest = &asm[start..];
-    let end = rest.find(".cfi_endproc").unwrap_or(rest.len());
-    &rest[..end]
-}
+use super::asm_probe::{asm_for, body_of};
 
 /// AAPCS64 passes a `_Complex` as a two-element HFA, so it occupies **two**
 /// V registers and the next floating-point parameter starts after both.

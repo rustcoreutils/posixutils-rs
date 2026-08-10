@@ -2385,33 +2385,30 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// register allocator doesn't share registers between inputs and
     /// outputs anyway.
     pub(crate) fn parse_asm_constraint(&self, constraint: &str) -> (bool, bool, Option<usize>) {
-        let mut has_memory_class = false;
-        let mut has_non_memory_class = false;
         let mut is_readwrite = false;
         let mut matching = None;
 
         for c in constraint.chars() {
             match c {
                 '+' => is_readwrite = true,
-                '&' | '=' | '%' => {} // modifiers
-                'r' | 'a' | 'b' | 'c' | 'd' | 'S' | 'D' | 'q' | 'R' | 'l' => {
-                    has_non_memory_class = true
-                }
-                'm' | 'o' | 'V' | 'Q' => has_memory_class = true,
-                // Immediate / general class letters (C10): `I`/`J`/`K`/
-                // `L`/`M`/`N`/`O` are x86_64 constant-range letters;
-                // aarch64 reuses some of these for its own immediate
-                // ranges. None imply memory.
-                'i' | 'n' | 'g' | 'X' | 'I' | 'J' | 'K' | 'L' | 'M' | 'N' | 'O' | 'Y' | 'Z' => {
-                    has_non_memory_class = true
-                }
                 '0'..='9' => matching = Some((c as u8 - b'0') as usize),
-                _ => {} // Ignore unknown constraints
+                _ => {}
             }
         }
 
-        let is_memory = has_memory_class && !has_non_memory_class;
-        (is_memory, is_readwrite, matching)
+        // The memory decision lives on `AsmConstraint::is_memory` so that
+        // liveness analysis, which cannot reach the linearizer, applies the
+        // identical rule. Two copies of these letter sets is exactly how a
+        // memory output came to look write-only to DCE.
+        let probe = AsmConstraint {
+            pseudo: PseudoId(0),
+            name: None,
+            matching_output: None,
+            constraint: constraint.to_string(),
+            size: 0,
+        };
+
+        (probe.is_memory(), is_readwrite, matching)
     }
 
     pub(crate) fn get_or_create_label(&mut self, name: &str) -> BasicBlockId {

@@ -87,6 +87,15 @@ fn get_uses(insn: &Instruction) -> Vec<PseudoId> {
         for input in &asm_data.inputs {
             uses.push(input.pseudo);
         }
+        // A memory *output* reads its pseudo too: the pseudo is the address
+        // the assembly writes through, not the written value. Omitting these
+        // let DCE delete the address computation at -O and above, so every
+        // `"=m"` operand became a store through a garbage register.
+        for output in &asm_data.outputs {
+            if output.is_memory() {
+                uses.push(output.pseudo);
+            }
+        }
     }
 
     uses

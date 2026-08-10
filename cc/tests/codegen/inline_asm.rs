@@ -1147,3 +1147,84 @@ int main(void) {
         "sync_synchronize pattern must hold at -O1 too"
     );
 }
+
+// ============================================================================
+// Memory-constrained output operands ("=m")
+// ============================================================================
+
+/// Regression test: a memory *output* operand reads its pseudo -- the pseudo
+/// holds the address the assembly writes through -- but DCE's use-collector
+/// looked only at `asm_data.inputs`. At `-O` and above it therefore deleted the
+/// instruction that materialized the address, and the emitted store went
+/// through whatever the register happened to hold.
+///
+/// Found via the CPython acceptance build: `_Py_get_387controlword`
+/// (`Python/pymath.c`) is exactly this shape, and c17 compiled its
+/// `fnstcw %0` to `fnstcw (%rax)` with RAX left at 0 from an earlier zero-fill
+/// -- a null-pointer write that segfaulted the bootstrap interpreter.
+///
+/// The `-O0` path was always correct, so this must run optimized to mean
+/// anything.
+#[test]
+fn codegen_asm_memory_output_survives_optimization() {
+    let code = r#"
+/* Store through a "=m" output, then read the object back. If the address
+   computation is dropped, this either faults or writes somewhere else. */
+static int store_via_m(void) {
+    int out = 0;
+#if defined(__x86_64__)
+    __asm__ __volatile__ ("movl $1234, %0" : "=m" (out));
+#elif defined(__aarch64__)
+    {
+        int tmp = 1234;
+        __asm__ __volatile__ ("str %w1, %0" : "=m" (out) : "r" (tmp));
+    }
+#else
+    out = 1234;
+#endif
+    return out;
+}
+
+/* Same, but with the object surrounded by other locals so a stray write
+   would land on a neighbour rather than faulting. */
+static int store_via_m_neighbours(int *before, int *after) {
+    int lo = 11;
+    int out = 0;
+    int hi = 22;
+#if defined(__x86_64__)
+    __asm__ __volatile__ ("movl $77, %0" : "=m" (out));
+#elif defined(__aarch64__)
+    {
+        int tmp = 77;
+        __asm__ __volatile__ ("str %w1, %0" : "=m" (out) : "r" (tmp));
+    }
+#else
+    out = 77;
+#endif
+    *before = lo;
+    *after = hi;
+    return out;
+}
+
+int main(void) {
+    if (store_via_m() != 1234) return 1;
+
+    int before = 0, after = 0;
+    if (store_via_m_neighbours(&before, &after) != 77) return 2;
+    if (before != 11) return 3;
+    if (after != 22) return 4;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("asm_memory_output_operand", code, &[]),
+        0,
+        "a \"=m\" output must write the named object"
+    );
+    assert_eq!(
+        compile_and_run_optimized("asm_memory_output_operand_opt", code),
+        0,
+        "the address computation for a \"=m\" output must survive DCE"
+    );
+}

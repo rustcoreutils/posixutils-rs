@@ -278,6 +278,43 @@ impl<'a> Parser<'a> {
         self.types.int_id
     }
 
+    /// Apply the array-to-pointer and function-to-pointer decays of C17
+    /// 6.3.2.1p3-4. Qualifiers are left alone.
+    pub(crate) fn decayed_type(&mut self, typ: TypeId) -> TypeId {
+        match self.types.kind(typ) {
+            TypeKind::Array => {
+                let elem = self.types.base_type(typ).unwrap_or(self.types.char_id);
+                self.types.intern(Type::pointer(elem))
+            }
+            TypeKind::Function => self.types.intern(Type::pointer(typ)),
+            _ => typ,
+        }
+    }
+
+    /// The type an lvalue expression has after lvalue conversion: decayed as
+    /// above, then stripped of every top-level qualifier.
+    ///
+    /// This is what C17 6.5.1.1p2 requires of a `_Generic` controlling
+    /// expression, and it is why `_Generic(x, int: ..., const int: ...)` can
+    /// never select the `const int` association.
+    pub(crate) fn lvalue_converted_type(&mut self, typ: TypeId) -> TypeId {
+        let decayed = self.decayed_type(typ);
+
+        const QUALIFIERS: TypeModifiers = TypeModifiers::CONST
+            .union(TypeModifiers::VOLATILE)
+            .union(TypeModifiers::RESTRICT)
+            .union(TypeModifiers::ATOMIC);
+
+        let ty = self.types.get(decayed);
+        if !ty.modifiers.intersects(QUALIFIERS) {
+            return decayed;
+        }
+
+        let mut unqualified = ty.clone();
+        unqualified.modifiers.remove(QUALIFIERS);
+        self.types.intern(unqualified)
+    }
+
     /// Parse a conditional (ternary) expression: cond ? then : else
     pub(crate) fn parse_conditional_expr(&mut self) -> ParseResult<Expr> {
         let cond = self.parse_logical_or_expr()?;
@@ -295,22 +332,8 @@ impl<'a> Parser<'a> {
             let else_typ = else_expr.typ.unwrap_or(self.types.int_id);
 
             // Decay arrays to pointers, functions to pointer-to-function
-            let then_decayed = if self.types.kind(then_typ) == TypeKind::Array {
-                let elem = self.types.base_type(then_typ).unwrap_or(self.types.char_id);
-                self.types.intern(Type::pointer(elem))
-            } else if self.types.kind(then_typ) == TypeKind::Function {
-                self.types.intern(Type::pointer(then_typ))
-            } else {
-                then_typ
-            };
-            let else_decayed = if self.types.kind(else_typ) == TypeKind::Array {
-                let elem = self.types.base_type(else_typ).unwrap_or(self.types.char_id);
-                self.types.intern(Type::pointer(elem))
-            } else if self.types.kind(else_typ) == TypeKind::Function {
-                self.types.intern(Type::pointer(else_typ))
-            } else {
-                else_typ
-            };
+            let then_decayed = self.decayed_type(then_typ);
+            let else_decayed = self.decayed_type(else_typ);
 
             // Compute common type of then and else branches (C99 6.5.15)
             let typ = self.ternary_common_type(then_decayed, else_decayed);
@@ -1915,6 +1938,129 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse a C11 generic selection (C17 6.5.1.1):
+    ///
+    /// ```text
+    /// generic-selection:
+    ///     _Generic ( assignment-expression , generic-assoc-list )
+    /// generic-association:
+    ///     type-name : assignment-expression
+    ///     default : assignment-expression
+    /// ```
+    ///
+    /// The selection is resolved here, at parse time, and the chosen
+    /// association's expression is returned directly. No AST node is
+    /// introduced. This follows `__builtin_types_compatible_p`, which likewise
+    /// folds during parsing, and it is possible because this parser resolves
+    /// types as it goes: the controlling expression already carries a `TypeId`
+    /// by the time the associations are read.
+    ///
+    /// Folding also means a `_Generic` whose selected arm is an integer
+    /// constant expression *is* one, which `_Static_assert` and `case` need,
+    /// and it keeps `cflow`/`cxref` -- whose visitors have catch-all arms --
+    /// seeing the real expression rather than silently skipping a node they do
+    /// not know.
+    ///
+    /// The controlling expression is parsed but never evaluated (6.5.1.1p2);
+    /// returning only the selected arm is what makes that true of the
+    /// unselected arms as well.
+    fn parse_generic_selection(&mut self, token_pos: Position) -> ParseResult<Expr> {
+        self.expect_special(b'(')?;
+
+        // The controlling expression contributes only its type, after lvalue
+        // conversion: array-to-pointer, function-to-pointer, and every
+        // top-level qualifier removed.
+        let controlling = self.parse_assignment_expr()?;
+        let controlling_typ = controlling.typ.unwrap_or(self.types.int_id);
+        let selector = self.lvalue_converted_type(controlling_typ);
+
+        self.expect_special(b',')?;
+
+        let mut selected: Option<Expr> = None;
+        let mut default_expr: Option<Expr> = None;
+        let mut default_pos: Option<Position> = None;
+        // Association types seen so far, for the "no two compatible" check.
+        let mut seen: Vec<(TypeId, Position)> = Vec::new();
+
+        loop {
+            let assoc_pos = self.current_pos();
+
+            let is_default = self.peek() == TokenType::Ident
+                && self.get_ident_id(self.current()) == Some(crate::kw::DEFAULT);
+
+            if is_default {
+                self.advance();
+                self.expect_special(b':')?;
+                let expr = self.parse_assignment_expr()?;
+
+                if default_pos.is_some() {
+                    diag::error(
+                        assoc_pos,
+                        "_Generic selection has more than one 'default' association",
+                    );
+                } else {
+                    default_pos = Some(assoc_pos);
+                    default_expr = Some(expr);
+                }
+            } else {
+                let assoc_typ = self.parse_type_name()?;
+                self.expect_special(b':')?;
+                let expr = self.parse_assignment_expr()?;
+
+                // 6.5.1.1p2: no two associations may name compatible types.
+                // The comparison is qualifier-sensitive, so `int` and
+                // `const int` may coexist -- they are not compatible types.
+                if let Some((_, prev)) = seen.iter().find(|(seen_typ, _)| {
+                    self.types.types_compatible_qualified(*seen_typ, assoc_typ)
+                }) {
+                    let _ = prev;
+                    diag::error(
+                        assoc_pos,
+                        &format!(
+                            "_Generic selection has two associations with compatible type '{}'",
+                            self.types.get(assoc_typ)
+                        ),
+                    );
+                } else {
+                    seen.push((assoc_typ, assoc_pos));
+                }
+
+                if self.types.types_compatible_qualified(selector, assoc_typ) && selected.is_none()
+                {
+                    selected = Some(expr);
+                }
+            }
+
+            if self.is_special(b',') {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+
+        self.expect_special(b')')?;
+
+        match selected.or(default_expr) {
+            Some(expr) => Ok(expr),
+            None => {
+                diag::error(
+                    token_pos,
+                    &format!(
+                        "_Generic selector of type '{}' is not compatible with any association",
+                        self.types.get(selector)
+                    ),
+                );
+                // Recover with a typed zero so one bad selection does not
+                // cascade through the rest of the expression.
+                Ok(Self::typed_expr(
+                    ExprKind::IntLit(0),
+                    self.types.int_id,
+                    token_pos,
+                ))
+            }
+        }
+    }
+
     /// Try to parse a builtin function expression.
     /// Returns `Some(result)` if `name_id` is a recognized builtin, `None` otherwise.
     fn parse_builtin_expr(
@@ -1940,6 +2086,7 @@ impl<'a> Parser<'a> {
                     token_pos,
                 ))
             })()),
+            crate::kw::GENERIC => Some(self.parse_generic_selection(token_pos)),
             crate::kw::BUILTIN_VA_ARG => Some((|| {
                 // __builtin_va_arg(ap, type)
                 self.expect_special(b'(')?;

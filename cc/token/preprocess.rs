@@ -3584,7 +3584,8 @@ impl<'a> Preprocessor<'a> {
                     "c_static_assert" |
                     "c_alignas" |
                     "c_alignof" |
-                    "c_thread_local"
+                    "c_thread_local" |
+                    "c_generic_selections"
                 )
             }
             _ => false,
@@ -4165,7 +4166,8 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
             "c_static_assert" |
             "c_alignas" |
             "c_alignof" |
-            "c_thread_local"
+            "c_thread_local" |
+            "c_generic_selections"
         );
 
         if supported {

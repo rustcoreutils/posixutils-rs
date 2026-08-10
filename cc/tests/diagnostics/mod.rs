@@ -448,3 +448,79 @@ fn diagnostics_foldable_case_labels_are_accepted() {
         "not an integer constant expression",
     );
 }
+
+// ============================================================================
+// #X3 — `_Generic` constraint violations (C17 6.5.1.1p2)
+// ============================================================================
+
+#[test]
+fn diagnostics_generic_without_a_matching_association_is_rejected() {
+    compile_expect_error(
+        "generic_no_match",
+        "int f(void){ char x=0; return _Generic(x, int:1, long:2); }\n",
+        "not compatible with any association",
+    );
+}
+
+#[test]
+fn diagnostics_generic_duplicate_default_is_rejected() {
+    compile_expect_error(
+        "generic_two_defaults",
+        "int f(void){ return _Generic(1, int:1, default:2, default:3); }\n",
+        "more than one 'default'",
+    );
+}
+
+#[test]
+fn diagnostics_generic_compatible_associations_are_rejected() {
+    compile_expect_error(
+        "generic_dup_type",
+        "int f(void){ return _Generic(1, int:1, int:2); }\n",
+        "two associations with compatible type",
+    );
+    // A typedef names the same type, so it collides too. This only works
+    // because a typedef's TypeId no longer carries the TYPEDEF bit.
+    compile_expect_error(
+        "generic_dup_typedef",
+        "typedef int MyInt; int f(void){ return _Generic(1, int:1, MyInt:2); }\n",
+        "two associations with compatible type",
+    );
+}
+
+/// The negative tests above must not pass by rejecting every `_Generic`.
+///
+/// `int` and `const int` are *not* compatible (C17 6.7.3p10 requires
+/// identically qualified versions), so both may appear -- even though the
+/// `const int` arm can never be selected, since the controlling expression is
+/// lvalue-converted to an unqualified type.
+#[test]
+fn diagnostics_generic_valid_forms_are_accepted() {
+    for (name, src) in [
+        (
+            "generic_basic",
+            "int f(void){ return _Generic(1, int:1, default:0); }\n",
+        ),
+        (
+            "generic_default_only",
+            "int f(void){ return _Generic((void*)0, default:7); }\n",
+        ),
+        (
+            "generic_qualified_sibling",
+            "int f(void){ return _Generic(1, int:1, const int:2); }\n",
+        ),
+        (
+            "generic_no_default_but_matches",
+            "int f(void){ return _Generic(1, int:1, long:2); }\n",
+        ),
+        (
+            "generic_nested",
+            "int f(void){ return _Generic(1.0, double: _Generic(1, int:5, default:0), default:0); }\n",
+        ),
+        (
+            "generic_static_fn_call",
+            "static int g(void){return 1;} int f(void){ return _Generic(g(), int:1, default:0); }\n",
+        ),
+    ] {
+        compile_expect_ok(name, src);
+    }
+}

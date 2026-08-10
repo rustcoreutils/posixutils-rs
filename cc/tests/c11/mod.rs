@@ -16,5 +16,6 @@
 mod alignment;
 mod atomics;
 mod core;
+mod generic;
 mod headers;
 mod literals;

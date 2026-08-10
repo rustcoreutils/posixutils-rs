@@ -1223,6 +1223,34 @@ impl TypeTable {
         self.get(id1).types_compatible(self.get(id2))
     }
 
+    /// Check if two types are compatible *and* identically qualified.
+    ///
+    /// `types_compatible` deliberately ignores top-level qualifiers, which is
+    /// what `__builtin_types_compatible_p` documents. C17 6.7.3p10 is stricter:
+    /// "for two qualified types to be compatible, both shall have the
+    /// identically qualified version of a compatible type". `_Generic` needs
+    /// the strict rule in both directions -- `int` and `const int` may coexist
+    /// as associations because they are *not* compatible, and the `const int`
+    /// association can never be selected because the controlling expression has
+    /// been lvalue-converted to an unqualified type.
+    pub fn types_compatible_qualified(&self, id1: TypeId, id2: TypeId) -> bool {
+        if id1 == id2 {
+            return true;
+        }
+
+        const QUALIFIERS: TypeModifiers = TypeModifiers::CONST
+            .union(TypeModifiers::VOLATILE)
+            .union(TypeModifiers::RESTRICT)
+            .union(TypeModifiers::ATOMIC);
+
+        let (t1, t2) = (self.get(id1), self.get(id2));
+        if t1.modifiers.intersection(QUALIFIERS) != t2.modifiers.intersection(QUALIFIERS) {
+            return false;
+        }
+
+        t1.types_compatible(t2)
+    }
+
     /// Compute struct layout with natural alignment
     /// Updates member offsets in place and returns (total_size, alignment)
     pub fn compute_struct_layout(

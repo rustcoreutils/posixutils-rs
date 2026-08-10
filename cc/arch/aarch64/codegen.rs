@@ -1080,6 +1080,7 @@ impl Aarch64CodeGen {
                                                     match base {
                                                         HfaBase::Float32 => (FpSize::Single, 4),
                                                         HfaBase::Float64 => (FpSize::Double, 8),
+                                                        HfaBase::Float128 => (FpSize::Quad, 16),
                                                     }
                                                 }
                                                 _ => (FpSize::Double, 8),
@@ -1207,7 +1208,12 @@ impl Aarch64CodeGen {
         if let Some(&src) = insn.src.first() {
             let src_loc = self.get_location(src);
             let is_complex = insn.typ.is_some_and(|t| types.is_complex(t));
-            let is_fp = matches!(src_loc, Loc::VReg(_) | Loc::FImm(..));
+            // Decide by *type* first, not only by where the value happens to
+            // sit. A `long double` produced by an rtlib call lands on the
+            // stack, so a location-only test sent it out through emit_move and
+            // returned it in x0 instead of q0.
+            let is_fp = insn.typ.is_some_and(|t| types.is_float(t))
+                || matches!(src_loc, Loc::VReg(_) | Loc::FImm(..));
             // Check for HFA-2 struct return (e.g., {double, double}).
             // Compute the HFA FP size once; None means not an HFA-2.
             let hfa_two_fp_size: Option<FpSize> = if !is_complex {
@@ -1224,6 +1230,7 @@ impl Aarch64CodeGen {
                                 Some(match base {
                                     HfaBase::Float32 => FpSize::Single,
                                     HfaBase::Float64 => FpSize::Double,
+                                    HfaBase::Float128 => FpSize::Quad,
                                 })
                             }
                             _ => None,
@@ -1741,7 +1748,7 @@ impl Aarch64CodeGen {
             }
 
             Opcode::Store => {
-                self.emit_store(insn);
+                self.emit_store(insn, types);
             }
 
             Opcode::Call => {
@@ -2529,7 +2536,7 @@ impl Aarch64CodeGen {
         }
     }
 
-    fn emit_store(&mut self, insn: &Instruction) {
+    fn emit_store(&mut self, insn: &Instruction, types: &TypeTable) {
         // Use actual size for memory stores (8, 16, 32, 64 bits)
         let mem_size = insn.size;
 
@@ -2537,6 +2544,20 @@ impl Aarch64CodeGen {
             (Some(&a), Some(&v)) => (a, v),
             _ => return,
         };
+
+        // Floating-point stores need the FP path, as they do on x86_64 -- this
+        // dispatch was missing entirely here. A 128-bit `long double` therefore
+        // fell through to emit_struct_store below, whose operand match ends in
+        // `_ => return` and so *silently dropped the store* when the value was
+        // in a V register. That, not the FpSize mapping, is why assigning a
+        // long double to a global produced no instruction at all (#H4).
+        let value_loc = self.get_location(value);
+        let is_fp = insn.typ.is_some_and(|t| types.is_float(t))
+            || matches!(value_loc, Loc::VReg(_) | Loc::FImm(..));
+        if is_fp {
+            self.emit_fp_store(insn, types);
+            return;
+        }
 
         // For struct stores (size > 64), we need to copy multiple words
         // The value is a symbol containing the struct data

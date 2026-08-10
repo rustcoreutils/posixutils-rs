@@ -187,3 +187,79 @@ fn codegen_aarch64_nsrn_saturates_after_a_stacked_argument() {
         "no floating-point argument may use d7 after an argument is stacked:\n{body}"
     );
 }
+
+/// aarch64/Linux `long double` is IEEE binary128 in a whole Q register (#H4).
+///
+/// `fp_size_from_type` mapped it to `FpSize::Double`, so a 128-bit object was
+/// loaded and stored 64 bits at a time -- and `emit_store` had no
+/// floating-point dispatch at all, so the store fell through to
+/// `emit_struct_store`, whose operand match ends in `_ => return`, and vanished
+/// entirely.
+#[test]
+fn codegen_aarch64_long_double_is_quad_precision() {
+    let src = r#"
+        long double g;
+        long double f(long double x) { long double y = x; g = y; return y; }
+    "#;
+    let asm = super::asm_probe::asm_for("ld_quad", "aarch64-unknown-linux-gnu", src);
+    let body = super::asm_probe::body_of(&asm, "f");
+
+    assert!(
+        body.contains("q0") || body.contains("q1"),
+        "binary128 must move through a Q register:\n{body}"
+    );
+    assert!(
+        body.contains("str q"),
+        "the store to the global must be emitted -- it used to vanish:\n{body}"
+    );
+    assert!(
+        !body.contains("ldr d0"),
+        "a 128-bit value must not be loaded 64 bits at a time:\n{body}"
+    );
+}
+
+/// Apple keeps `long double` at 64 bits, so the same source must *not* use Q
+/// registers there. Without this the test above could pass by using quad
+/// everywhere.
+#[test]
+fn codegen_aarch64_darwin_long_double_stays_double() {
+    let src = r#"
+        long double g;
+        long double f(long double x) { long double y = x; g = y; return y; }
+    "#;
+    let asm = super::asm_probe::asm_for("ld_darwin", "aarch64-apple-darwin", src);
+    let body = super::asm_probe::body_of(&asm, "f");
+
+    assert!(
+        body.contains("d0"),
+        "Darwin's long double is a double:\n{body}"
+    );
+    assert!(
+        !body.contains("str q") && !body.contains("ldr q"),
+        "Darwin's long double must not use quad precision:\n{body}"
+    );
+}
+
+/// `long double _Complex` used to panic the compiler outright -- the codegen
+/// reached an `unreachable!("x87 extended not available on AArch64")` because
+/// `complex_fp_info` answered `Extended` for a 128-bit base.
+///
+/// It is a two-element HVA in q0/q1, not an indirect return: gcc emits no x8
+/// indirect-result pointer for it.
+#[test]
+fn codegen_aarch64_long_double_complex_compiles() {
+    let src = r#"
+        long double _Complex id(long double _Complex a) { return a; }
+        long double _Complex mk(void) { return __builtin_complex(6.0L, 7.0L); }
+    "#;
+    let asm = super::asm_probe::asm_for("ld_complex", "aarch64-unknown-linux-gnu", src);
+    // Reaching here at all is most of the test: this used to panic.
+    assert!(asm.contains("id:") || asm.contains("_id:"));
+    assert!(asm.contains("mk:") || asm.contains("_mk:"));
+
+    let body = super::asm_probe::body_of(&asm, "mk");
+    assert!(
+        !body.contains("x8,") || body.contains("q"),
+        "a long double _Complex returns in q0/q1, not through an sret pointer:\n{body}"
+    );
+}

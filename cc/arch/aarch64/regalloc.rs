@@ -1150,6 +1150,7 @@ impl RegAlloc {
                     let elem_bytes = match base {
                         HfaBase::Float32 => 4,
                         HfaBase::Float64 => 8,
+                        HfaBase::Float128 => 16,
                     };
                     if fp_arg_idx + count <= fp_arg_regs.len() {
                         self.locations

@@ -158,7 +158,7 @@ impl Aarch64CodeGen {
         if types.is_float(arg_type) {
             // Load floating point value
             let fp_size = types.size_bits(arg_type);
-            let fp_size_enum = FpSize::from_bits(fp_size);
+            let fp_size_enum = FpSize::from_bits(fp_size, &self.base.target);
             self.push_lir(Aarch64Inst::LdrFp {
                 size: fp_size_enum,
                 addr: MemAddr::Base(scratch0),

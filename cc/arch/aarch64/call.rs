@@ -559,6 +559,7 @@ impl Aarch64CodeGen {
             ArgClass::Hfa { base, .. } => match base {
                 HfaBase::Float32 => (FpSize::Single, 4),
                 HfaBase::Float64 => (FpSize::Double, 8),
+                HfaBase::Float128 => (FpSize::Quad, 16),
             },
             _ => (FpSize::Double, 8),
         };
@@ -835,6 +836,7 @@ impl Aarch64CodeGen {
         let (fp_size, elem_size) = match base {
             HfaBase::Float32 => (FpSize::Single, 4),
             HfaBase::Float64 => (FpSize::Double, 8),
+            HfaBase::Float128 => (FpSize::Quad, 16),
         };
 
         let vregs = [VReg::V0, VReg::V1, VReg::V2, VReg::V3];

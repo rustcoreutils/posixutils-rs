@@ -39,12 +39,14 @@ const MAX_HFA_ELEMENTS: u8 = 4;
 /// `TypeKind::LongDouble` instead sent it by reference, disagreeing with clang
 /// about every such argument and return.
 ///
-/// On aarch64 Linux `long double` really is IEEE binary128, and `HfaBase` has
-/// no 128-bit form, so that one still goes indirect.
+/// On aarch64 Linux `long double` is IEEE binary128, which occupies a whole Q
+/// register -- so `long double _Complex` is a two-element HVA in q0/q1, the
+/// same shape as the narrower complex types, not an indirect return.
 fn complex_hfa_base(ty: TypeId, types: &TypeTable) -> Option<HfaBase> {
     match types.size_bits(types.complex_base(ty)) {
         32 => Some(HfaBase::Float32),
         64 => Some(HfaBase::Float64),
+        128 => Some(HfaBase::Float128),
         _ => None,
     }
 }
@@ -60,10 +62,18 @@ impl Aapcs64Abi {
     }
 
     /// Check if a type is a potential HFA base type (float or double).
-    fn is_hfa_base_type(&self, kind: TypeKind) -> Option<HfaBase> {
+    /// Keyed on the member's *width* rather than its kind, so Darwin's 64-bit
+    /// `long double` still answers Float64 while the base standard's 128-bit
+    /// one answers Float128.
+    fn is_hfa_base_type(&self, kind: TypeKind, typ: TypeId, types: &TypeTable) -> Option<HfaBase> {
         match kind {
             TypeKind::Float => Some(HfaBase::Float32),
             TypeKind::Double => Some(HfaBase::Float64),
+            TypeKind::LongDouble => match types.size_bits(typ) {
+                64 => Some(HfaBase::Float64),
+                128 => Some(HfaBase::Float128),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -85,7 +95,7 @@ impl Aapcs64Abi {
         if kind == TypeKind::Array {
             if let Some(elem_ty) = typ.base {
                 let elem_kind = types.kind(elem_ty);
-                if let Some(base) = self.is_hfa_base_type(elem_kind) {
+                if let Some(base) = self.is_hfa_base_type(elem_kind, elem_ty, types) {
                     if let Some(len) = typ.array_size {
                         if len >= 1 && len <= MAX_HFA_ELEMENTS as usize {
                             return Some((base, len as u8));
@@ -110,7 +120,7 @@ impl Aapcs64Abi {
             let field_kind = types.kind(field_ty);
 
             // Check if field is a valid HFA base type
-            if let Some(field_base) = self.is_hfa_base_type(field_kind) {
+            if let Some(field_base) = self.is_hfa_base_type(field_kind, field_ty, types) {
                 if let Some(existing_base) = base_type {
                     if existing_base != field_base {
                         return None; // Mixed types, not an HFA
@@ -405,16 +415,20 @@ mod tests {
             count: 2,
         };
 
-        for (os, long_double) in [
-            (Os::MacOS, two_f64.clone()),
-            (
-                Os::Linux,
-                ArgClass::Indirect {
-                    align: 16,
-                    size_bits: 256,
-                },
-            ),
-        ] {
+        // A two-element HVA either way -- only the element width differs.
+        // Apple makes `long double` a 64-bit double; the base standard makes it
+        // IEEE binary128, which occupies a whole Q register.
+        //
+        // This asserted `Indirect` on Linux while `HfaBase` had no 128-bit
+        // form. gcc disagrees: for `long double _Complex g(void)` it emits no
+        // x8 indirect-result pointer and reads the real part straight out of
+        // q0, which is only possible if the value came back in q0/q1.
+        let two_f128 = ArgClass::Hfa {
+            base: HfaBase::Float128,
+            count: 2,
+        };
+
+        for (os, long_double) in [(Os::MacOS, two_f64.clone()), (Os::Linux, two_f128)] {
             let target = Target::new(Arch::Aarch64, os);
             let types = TypeTable::new(&target);
 

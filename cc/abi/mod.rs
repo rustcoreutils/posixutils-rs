@@ -81,6 +81,12 @@ pub enum HfaBase {
     Float32,
     /// 64-bit double
     Float64,
+    /// 128-bit IEEE binary128 (`long double` on aarch64/Linux).
+    ///
+    /// AAPCS64 treats a homogeneous aggregate of these like any other, one
+    /// element per Q register -- so `long double _Complex` goes in q0/q1
+    /// rather than indirectly, which is what gcc does.
+    Float128,
 }
 
 /// How an argument or return value should be passed.

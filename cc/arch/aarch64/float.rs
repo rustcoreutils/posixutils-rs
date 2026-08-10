@@ -19,17 +19,27 @@ use crate::types::{TypeId, TypeKind, TypeTable};
 impl Aarch64CodeGen {
     /// Get FP size from type on aarch64.
     ///
-    /// On aarch64:
-    /// - Float16 uses native FP16 instructions (AArch64 supports half-precision)
-    /// - LongDouble is treated as Double (64-bit on macOS)
-    fn fp_size_from_type(typ: Option<TypeId>, size: u32, types: &TypeTable) -> FpSize {
+    /// `long double` is the interesting one: Apple makes it a 64-bit `double`,
+    /// while the AAPCS64 base standard makes it IEEE binary128 in a whole Q
+    /// register. Deciding from the type table's width rather than from
+    /// `target.os` keeps one source of truth -- previously this returned
+    /// `Double` unconditionally, so on Linux the codegen loaded and stored 64
+    /// bits of a 128-bit object (#H4).
+    fn fp_size_from_type(&self, typ: Option<TypeId>, size: u32, types: &TypeTable) -> FpSize {
         typ.map(|t| match types.kind(t) {
             TypeKind::Float16 => FpSize::Half,
             TypeKind::Float => FpSize::Single,
-            TypeKind::Double | TypeKind::LongDouble => FpSize::Double,
-            _ => FpSize::from_bits(size.max(32)),
+            TypeKind::Double => FpSize::Double,
+            TypeKind::LongDouble => {
+                if types.size_bits(t) > 64 {
+                    FpSize::Quad
+                } else {
+                    FpSize::Double
+                }
+            }
+            _ => FpSize::from_bits(size.max(32), &self.base.target),
         })
-        .unwrap_or_else(|| FpSize::from_bits(size.max(32)))
+        .unwrap_or_else(|| FpSize::from_bits(size.max(32), &self.base.target))
     }
 
     /// Get size in bits from type, with fallback to provided size.
@@ -54,7 +64,7 @@ impl Aarch64CodeGen {
         };
         let addr_loc = self.get_location(addr);
 
-        let fp_size = Self::fp_size_from_type(insn.typ, insn.size, types);
+        let fp_size = self.fp_size_from_type(insn.typ, insn.size, types);
 
         match addr_loc {
             Loc::Reg(r) => {
@@ -178,7 +188,7 @@ impl Aarch64CodeGen {
         types: &TypeTable,
     ) {
         let loc = self.get_location(src);
-        let fp_size = Self::fp_size_from_type(typ, size, types);
+        let fp_size = self.fp_size_from_type(typ, size, types);
 
         match loc {
             Loc::VReg(v) if v == dst => {}
@@ -202,6 +212,26 @@ impl Aarch64CodeGen {
                 });
             }
             Loc::FImm(f, imm_size) => {
+                // A binary128 constant does not fit a general-purpose
+                // register, so it is assembled from two halves: the low 64
+                // bits via `fmov`, the high 64 inserted into lane 1.
+                if fp_size == FpSize::Quad {
+                    let (lo, hi) = super::f64_to_f128_bits(f);
+                    let (scratch0, scratch1, _) = Reg::scratch_regs();
+                    self.emit_mov_imm(scratch0, lo as i64, 64);
+                    self.push_lir(Aarch64Inst::FmovFromGp {
+                        size: FpSize::Double,
+                        src: scratch0,
+                        dst,
+                    });
+                    self.emit_mov_imm(scratch1, hi as i64, 64);
+                    self.push_lir(Aarch64Inst::InsGpToVecD {
+                        lane: 1,
+                        src: scratch1,
+                        dst,
+                    });
+                    return;
+                }
                 // Load FP constant using integer register
                 // Use the size from the FImm for correct constant representation
                 let (scratch0, _, _) = Reg::scratch_regs();
@@ -238,12 +268,30 @@ impl Aarch64CodeGen {
                 });
             }
             Loc::Global(name) => {
+                // A binary128 does not fit a general-purpose register, so it
+                // cannot be shuttled through one the way the narrower sizes
+                // are. Materialize the symbol's address and load the Q
+                // register straight from it.
+                if fp_size == FpSize::Quad {
+                    let (scratch0, _, _) = Reg::scratch_regs();
+                    self.emit_load_addr(&name, scratch0);
+                    self.push_lir(Aarch64Inst::LdrFp {
+                        size: fp_size,
+                        dst,
+                        addr: MemAddr::BaseOffset {
+                            base: scratch0,
+                            offset: 0,
+                        },
+                    });
+                    return;
+                }
                 // Load from global - use size matching FP precision
                 let (scratch0, _, _) = Reg::scratch_regs();
                 let load_size = match fp_size {
                     FpSize::Half => OperandSize::B16,
                     FpSize::Single => OperandSize::B32,
                     FpSize::Double => OperandSize::B64,
+                    FpSize::Quad => unreachable!("handled above"),
                     FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
                 };
                 self.emit_load_global(&name, scratch0, load_size);
@@ -265,7 +313,7 @@ impl Aarch64CodeGen {
         size: u32,
         types: &TypeTable,
     ) {
-        let fp_size = Self::fp_size_from_type(typ, size, types);
+        let fp_size = self.fp_size_from_type(typ, size, types);
 
         match dst {
             Loc::VReg(v) if *v == src => {}
@@ -303,7 +351,7 @@ impl Aarch64CodeGen {
     /// Emit FP binary operation (fadd, fsub, fmul, fdiv)
     pub(super) fn emit_fp_binop(&mut self, insn: &Instruction, types: &TypeTable) {
         let size = Self::size_from_type(insn.typ, insn.size, types);
-        let fp_size = Self::fp_size_from_type(insn.typ, insn.size, types);
+        let fp_size = self.fp_size_from_type(insn.typ, insn.size, types);
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&s1), Some(&s2)) => (s1, s2),
             _ => return,
@@ -366,7 +414,7 @@ impl Aarch64CodeGen {
     /// Emit FP negation
     pub(super) fn emit_fp_neg(&mut self, insn: &Instruction, types: &TypeTable) {
         let size = Self::size_from_type(insn.typ, insn.size, types);
-        let fp_size = Self::fp_size_from_type(insn.typ, insn.size, types);
+        let fp_size = self.fp_size_from_type(insn.typ, insn.size, types);
         let src = match insn.src.first() {
             Some(&s) => s,
             None => return,
@@ -397,7 +445,7 @@ impl Aarch64CodeGen {
     /// Emit FP comparison
     pub(super) fn emit_fp_compare(&mut self, insn: &Instruction, types: &TypeTable) {
         let size = Self::size_from_type(insn.typ, insn.size, types);
-        let fp_size = Self::fp_size_from_type(insn.typ, insn.size, types);
+        let fp_size = self.fp_size_from_type(insn.typ, insn.size, types);
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&s1), Some(&s2)) => (s1, s2),
             _ => return,
@@ -464,7 +512,7 @@ impl Aarch64CodeGen {
 
         let src_size = Self::size_from_type(insn.src_typ, insn.src_size, types);
         let dst_size = Self::size_from_type(insn.typ, insn.size, types);
-        let fp_size = Self::fp_size_from_type(insn.typ, insn.size, types);
+        let fp_size = self.fp_size_from_type(insn.typ, insn.size, types);
         let int_size = OperandSize::from_bits(src_size);
 
         let dst_loc = self.get_location(target);
@@ -517,7 +565,7 @@ impl Aarch64CodeGen {
 
         let src_size = Self::size_from_type(insn.src_typ, insn.src_size, types);
         let dst_size = Self::size_from_type(insn.typ, insn.size, types);
-        let fp_size = Self::fp_size_from_type(insn.src_typ, insn.src_size, types);
+        let fp_size = self.fp_size_from_type(insn.src_typ, insn.src_size, types);
         let int_size = OperandSize::from_bits(dst_size);
 
         let dst_loc = self.get_location(target);
@@ -569,8 +617,8 @@ impl Aarch64CodeGen {
 
         let src_size = Self::size_from_type(insn.src_typ, insn.src_size, types);
         let dst_size = Self::size_from_type(insn.typ, insn.size, types);
-        let src_fp_size = Self::fp_size_from_type(insn.src_typ, insn.src_size, types);
-        let dst_fp_size = Self::fp_size_from_type(insn.typ, insn.size, types);
+        let src_fp_size = self.fp_size_from_type(insn.src_typ, insn.src_size, types);
+        let dst_fp_size = self.fp_size_from_type(insn.typ, insn.size, types);
 
         let dst_loc = self.get_location(target);
         let dst_vreg = match &dst_loc {
@@ -619,6 +667,111 @@ impl Aarch64CodeGen {
 
         if !matches!(&dst_loc, Loc::VReg(v) if *v == dst_vreg) {
             self.emit_fp_move_to_loc(dst_vreg, &dst_loc, insn.typ, dst_size, types);
+        }
+    }
+}
+
+impl Aarch64CodeGen {
+    /// Store a floating-point value through an address operand.
+    ///
+    /// aarch64's `emit_store` had no floating-point dispatch at all, unlike
+    /// x86_64's. A `long double` store therefore reached `emit_struct_store`,
+    /// whose operand match ends in `_ => return`, and vanished -- so `g = y`
+    /// on a 128-bit global emitted no instruction (#H4). This mirrors
+    /// `emit_fp_load`.
+    pub(super) fn emit_fp_store(&mut self, insn: &Instruction, types: &TypeTable) {
+        let (addr, value) = match (insn.src.first(), insn.src.get(1)) {
+            (Some(&a), Some(&v)) => (a, v),
+            _ => return,
+        };
+
+        let fp_size = self.fp_size_from_type(insn.typ, insn.size, types);
+
+        // Get the value into a V register. V17 is a scratch V register.
+        let value_loc = self.get_location(value);
+        let src_vreg = match value_loc {
+            Loc::VReg(v) => v,
+            _ => {
+                self.emit_fp_move(value, VReg::V17, insn.typ, insn.size, types);
+                VReg::V17
+            }
+        };
+
+        let addr_loc = self.get_location(addr);
+        match addr_loc {
+            Loc::Reg(r) => {
+                self.push_lir(Aarch64Inst::StrFp {
+                    size: fp_size,
+                    src: src_vreg,
+                    addr: MemAddr::BaseOffset {
+                        base: r,
+                        offset: insn.offset as i32,
+                    },
+                });
+            }
+            Loc::Stack(offset) => {
+                let is_symbol = self
+                    .pseudos
+                    .iter()
+                    .find(|p| p.id == addr)
+                    .is_some_and(|p| matches!(p.kind, PseudoKind::Sym(_)));
+
+                if is_symbol {
+                    let total = self.stack_offset(offset) + insn.offset as i32;
+                    self.push_lir(Aarch64Inst::StrFp {
+                        size: fp_size,
+                        src: src_vreg,
+                        addr: MemAddr::BaseOffset {
+                            base: Reg::X29,
+                            offset: total,
+                        },
+                    });
+                } else {
+                    // The slot holds the address, so load it and store through.
+                    let (scratch0, _, _) = Reg::scratch_regs();
+                    let total = self.stack_offset(offset);
+                    self.push_lir(Aarch64Inst::Ldr {
+                        size: OperandSize::B64,
+                        dst: scratch0,
+                        addr: MemAddr::BaseOffset {
+                            base: Reg::X29,
+                            offset: total,
+                        },
+                    });
+                    self.push_lir(Aarch64Inst::StrFp {
+                        size: fp_size,
+                        src: src_vreg,
+                        addr: MemAddr::BaseOffset {
+                            base: scratch0,
+                            offset: insn.offset as i32,
+                        },
+                    });
+                }
+            }
+            Loc::Global(name) => {
+                let (scratch0, _, _) = Reg::scratch_regs();
+                self.emit_load_addr(&name, scratch0);
+                self.push_lir(Aarch64Inst::StrFp {
+                    size: fp_size,
+                    src: src_vreg,
+                    addr: MemAddr::BaseOffset {
+                        base: scratch0,
+                        offset: insn.offset as i32,
+                    },
+                });
+            }
+            _ => {
+                let (scratch0, _, _) = Reg::scratch_regs();
+                self.emit_move(addr, scratch0, 64);
+                self.push_lir(Aarch64Inst::StrFp {
+                    size: fp_size,
+                    src: src_vreg,
+                    addr: MemAddr::BaseOffset {
+                        base: scratch0,
+                        offset: insn.offset as i32,
+                    },
+                });
+            }
         }
     }
 }

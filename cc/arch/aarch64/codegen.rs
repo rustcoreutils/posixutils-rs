@@ -3075,8 +3075,14 @@ impl Aarch64CodeGen {
             }
         });
 
-        // Handle 128-bit integer copy
-        if actual_size == 128 {
+        // Handle 128-bit integer copy.
+        //
+        // Only integers: a 128-bit `long double` is binary128, and this path
+        // moves the low 64 bits through a general-purpose register. That
+        // truncated an `FImm` to its *f64* encoding (and a `VReg` to its low
+        // lane), so `long double a = 3.14159...L;` landed a denormal on the
+        // stack. FP goes through `emit_fp_move`, which assembles both halves.
+        if actual_size == 128 && !is_fp_copy {
             if let Loc::Stack(dst_offset) = dst_loc {
                 self.emit_int128_move_to_stack(src, dst_offset);
             }

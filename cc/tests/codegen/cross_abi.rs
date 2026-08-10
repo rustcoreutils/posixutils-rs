@@ -411,3 +411,37 @@ fn codegen_aarch64_quad_spill_slots_are_16_byte_aligned() {
     }
     assert!(checked > 0, "expected some quad accesses:\n{asm}");
 }
+
+/// A `long double` on aarch64 is binary128 and must move as a whole vector
+/// register, never through a general-purpose one.
+///
+/// The 128-bit copy helper is shared with `__int128`, and it moved the low
+/// half through x9 and zero-filled the rest. That silently turned every wide
+/// float constant into a denormal near zero.
+#[test]
+fn codegen_aarch64_long_double_moves_as_quad() {
+    let src = r#"
+        long double pick(void) {
+            long double a = 3.14159265358979323846L;
+            return a;
+        }
+    "#;
+
+    let asm = asm_for("ld_quad", "aarch64-unknown-linux-gnu", src);
+    let body = body_of(&asm, "pick");
+
+    // 0x4000921FB54442D1 is the top half of binary128 3.14159..., and 16384 /
+    // 37407 / 46404 / 17105 are its four halfwords, built with movz/movk.
+    assert!(
+        body.contains("movk x10, #16384, lsl #48"),
+        "the binary128 exponent halfword must be materialized:\n{body}"
+    );
+    assert!(
+        body.contains("mov v") && body.contains(".d[1]"),
+        "the high half of a binary128 constant must be inserted into lane 1:\n{body}"
+    );
+    assert!(
+        !body.contains("stp x9, xzr"),
+        "a binary128 value must not be stored as a 64-bit half plus zero:\n{body}"
+    );
+}

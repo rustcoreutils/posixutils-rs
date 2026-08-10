@@ -2398,10 +2398,12 @@ impl<'a> Linearizer<'a> {
                 let elem_type = self.types.base_type(arg_type).unwrap_or(self.types.int_id);
                 arg_types_vec.push(self.types.pointer_to(elem_type));
                 self.linearize_expr(a)
-            } else if arg_kind == TypeKind::VaList {
+            } else if arg_kind == TypeKind::VaList && !self.types.va_list_is_pointer() {
                 // va_list decay to pointer (C99 7.15.1)
                 // va_list is defined as __va_list_tag[1] (an array), so it decays to
-                // a pointer when passed to a function taking va_list parameter
+                // a pointer when passed to a function taking va_list parameter.
+                // Where va_list is already a pointer there is nothing to decay, and
+                // the ordinary scalar path below passes it by value.
                 arg_types_vec.push(self.types.pointer_to(arg_type));
                 self.linearize_lvalue(a)
             } else if arg_kind == TypeKind::Function {
@@ -3206,9 +3208,10 @@ impl<'a> Linearizer<'a> {
                 let elem_type = self.types.base_type(local.typ).unwrap_or(self.types.int_id);
                 let ptr_type = self.types.pointer_to(elem_type);
                 self.emit(Instruction::sym_addr(result, local.sym, ptr_type));
-            } else if type_kind == TypeKind::VaList {
+            } else if type_kind == TypeKind::VaList && !self.types.va_list_is_pointer() {
                 // va_list is defined as __va_list_tag[1] (an array type), so it decays to
-                // a pointer when used in expressions (C99 6.3.2.1, 7.15.1)
+                // a pointer when used in expressions (C99 6.3.2.1, 7.15.1). A target
+                // whose va_list is itself a pointer falls through to the scalar load.
                 if local.is_indirect {
                     // va_list parameter: local holds a pointer to the va_list struct
                     // Load the pointer value (array decay already happened at call site)
@@ -3269,7 +3272,7 @@ impl<'a> Linearizer<'a> {
             // Functions decay to function pointers, va_list decays to pointer (C99 6.3.2.1, 7.15.1),
             // and large structs can't be loaded into registers - for all cases, return the address
             else if type_kind == TypeKind::Function
-                || type_kind == TypeKind::VaList
+                || (type_kind == TypeKind::VaList && !self.types.va_list_is_pointer())
                 || ((type_kind == TypeKind::Struct || type_kind == TypeKind::Union) && size > 64)
             {
                 let result = self.alloc_pseudo();

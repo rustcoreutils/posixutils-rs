@@ -1152,6 +1152,21 @@ impl TypeTable {
         }
     }
 
+    /// Is `va_list` a plain pointer on this target, rather than an aggregate?
+    ///
+    /// Everywhere else it is something whose *address* travels: SysV x86_64
+    /// spells it `__va_list_tag[1]`, an array, and AAPCS64 uses a 32-byte
+    /// record that is passed by reference. Darwin on aarch64 puts every
+    /// variadic argument on the stack and spells `va_list` as `char *`, so
+    /// there is nothing to decay -- the pointer itself is the value, and
+    /// handing a callee its address gives it a pointer to a pointer.
+    pub fn va_list_is_pointer(&self) -> bool {
+        matches!(
+            (self.target_arch, self.target_os),
+            (Arch::Aarch64, Os::MacOS)
+        )
+    }
+
     /// Get va_list alignment in bytes based on target architecture
     fn va_list_alignment(&self) -> usize {
         8 // All supported platforms use 8-byte alignment for va_list

@@ -585,3 +585,54 @@ fn codegen_aarch64_va_copy_matches_the_va_list_size() {
         "a Darwin va_list is one 8-byte store:\n{d}"
     );
 }
+
+/// A `va_list` handed to another function must travel the way the target
+/// spells the type.
+///
+/// SysV x86_64 spells it `__va_list_tag[1]` and AAPCS64 a 32-byte record, so
+/// on both the *address* is what gets passed -- an array decays, and a
+/// composite that large goes by reference. Darwin on aarch64 spells it
+/// `char *`, where there is nothing to decay: passing its address hands the
+/// callee a pointer to a pointer. libc reads the argument list through that,
+/// so `vsnprintf` printed garbage while every compiler-internal use kept
+/// working.
+#[test]
+fn codegen_aarch64_va_list_argument_matches_the_target_spelling() {
+    let src = r#"
+        typedef __builtin_va_list va_list;
+        #define va_start(a, p) __builtin_va_start(a, p)
+        #define va_end(a) __builtin_va_end(a)
+        int vsnprintf(char *, unsigned long, const char *, va_list);
+        int fmt(char *b, unsigned long n, const char *f, ...) {
+            va_list ap;
+            va_start(ap, f);
+            int r = vsnprintf(b, n, f, ap);
+            va_end(ap);
+            return r;
+        }
+    "#;
+
+    // Darwin: load the pointer out of the va_list and pass that.
+    let darwin = asm_for("va_list_arg_darwin", "aarch64-apple-darwin", src);
+    let d = body_of(&darwin, "fmt");
+    let call = d.split("bl _vsnprintf").next().unwrap_or(d);
+    assert!(
+        call.contains("ldr x23, [x29,"),
+        "Darwin's va_list is a pointer; its value must be loaded, not its \
+         address taken:\n{d}"
+    );
+    assert!(
+        !call.contains("add x23, x29,"),
+        "passing the address of a Darwin va_list gives vsnprintf a pointer \
+         to a pointer:\n{d}"
+    );
+
+    // Linux: the 32-byte record goes by reference, so the address is right.
+    let linux = asm_for("va_list_arg_linux", "aarch64-unknown-linux-gnu", src);
+    let l = body_of(&linux, "fmt");
+    let call = l.split("bl vsnprintf").next().unwrap_or(l);
+    assert!(
+        call.contains("add x23, x29,"),
+        "AAPCS64 passes the 32-byte va_list record by reference:\n{l}"
+    );
+}

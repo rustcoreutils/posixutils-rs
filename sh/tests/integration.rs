@@ -2535,4 +2535,35 @@ mod audit_regressions {
             "[first][second]\n",
         );
     }
+
+    #[test]
+    fn fg_and_bg_refuse_to_run_in_a_subshell() {
+        // POSIX only *permits* them to work there. This shell's job table is
+        // a pre-fork copy, so a subshell would resume the job while leaving
+        // the parent convinced it is still stopped.
+        for builtin in ["fg", "bg"] {
+            run_script_with_checker(
+                &format!("set -m\nsleep 1 &\n( {builtin} %1 )\njobs\n"),
+                |output| {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    assert!(
+                        stderr.contains("subshell"),
+                        "expected a subshell refusal, got: {stderr}"
+                    );
+                    assert!(!stderr.contains("no child processes"), "raw errno leaked");
+                    // The parent's view of the job must be untouched.
+                    assert!(String::from_utf8_lossy(&output.stdout).contains("Running"));
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn fg_still_works_in_a_non_interactive_shell() {
+        // Only the subshell case is refused; POSIX allows `fg` in a
+        // non-interactive shell and the job really is this shell's child.
+        run_successfully_and("set -m\nsleep 0.05 &\nfg %1 >/dev/null\necho ok\n", |out| {
+            assert_eq!(out, "ok\n")
+        });
+    }
 }

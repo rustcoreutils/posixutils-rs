@@ -47,6 +47,13 @@ impl BuiltinUtility for Bg {
         if !shell.set_options.monitor {
             return Err(gettext("bg: cannot use bg when job control is disabled").into());
         }
+        // POSIX only *permits* `bg` to work in a subshell environment. The job
+        // table here is a pre-fork copy that dies with the subshell, so
+        // resuming a job would leave the parent shell reporting it as stopped
+        // forever.
+        if shell.is_subshell {
+            return Err(gettext("bg: cannot use bg in a subshell environment").into());
+        }
 
         let mut status = 0;
         let args = skip_option_terminator(args);

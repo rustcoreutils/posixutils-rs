@@ -49,6 +49,14 @@ impl BuiltinUtility for Fg {
         if !shell.set_options.monitor {
             return Err(gettext("fg: cannot use fg when job control is disabled").into());
         }
+        // POSIX only *permits* `fg` to work in a subshell environment. This
+        // shell cannot: the job table is a pre-fork copy, so resuming here
+        // would leave the parent believing the job is still stopped, and the
+        // job is not this process's child, so waiting for it fails with
+        // ECHILD.
+        if shell.is_subshell {
+            return Err(gettext("fg: cannot use fg in a subshell environment").into());
+        }
 
         let mut status = 0;
         let args = skip_option_terminator(args);

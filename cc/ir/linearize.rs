@@ -2446,18 +2446,34 @@ impl<'a> Linearizer<'a> {
                     }
                 }
 
-                // C99 6.5.2.2p7: Default argument promotions for variadic args.
-                // float/_Float16 are promoted to double; integer promotions
-                // also apply (already handled above for integers).
+                // C99 6.5.2.2p7: default argument promotions for variadic args.
+                //
+                // Both halves have to happen here. The formal-parameter
+                // conversion above is guarded by `arg_idx < params.len()`, and
+                // a variadic argument is by definition at or past that bound,
+                // so it never runs for these -- an earlier comment claimed
+                // integers were "already handled above", which was false and is
+                // what left `printf("%02x", (unsigned char)c)` printing
+                // ffffff80 for a negative `signed char` (audit #C5). The cast
+                // itself emits no IR, because emit_convert short-circuits
+                // same-size integer conversions, so without an explicit
+                // promotion the pseudo still holds the sign-extended load.
                 if let Some(va_start) = variadic_arg_start {
-                    if arg_idx >= va_start
-                        && matches!(
-                            self.types.kind(arg_type),
-                            TypeKind::Float | TypeKind::Float16
-                        )
-                    {
-                        val = self.emit_convert(val, arg_type, self.types.double_id);
-                        arg_type = self.types.double_id;
+                    if arg_idx >= va_start {
+                        let promoted = match self.types.kind(arg_type) {
+                            // float and _Float16 promote to double.
+                            TypeKind::Float | TypeKind::Float16 => Some(self.types.double_id),
+                            // _Bool, char and short promote to int.
+                            _ => {
+                                let promoted = self.integer_promote(arg_type);
+                                (promoted != arg_type).then_some(promoted)
+                            }
+                        };
+
+                        if let Some(promoted) = promoted {
+                            val = self.emit_convert(val, arg_type, promoted);
+                            arg_type = promoted;
+                        }
                     }
                 }
 

@@ -3825,6 +3825,97 @@ int main(void) {
     );
 }
 
+/// Regression test: narrow *integer* arguments to variadic functions were not
+/// promoted to int per C99 6.5.2.2p7, so `printf("%02x", (unsigned char)c)`
+/// with a negative `signed char` printed `ffffff80` where gcc prints `80`
+/// (audit #C5).
+///
+/// The formal-parameter conversion in the linearizer is guarded by
+/// `arg_idx < params.len()`, which is never true for a variadic argument, so
+/// nothing promoted these. The cast alone emits no IR either, because
+/// `emit_convert` short-circuits same-size integer conversions -- leaving the
+/// sign-extended value from the load in place.
+///
+/// Every case is checked in both directions (cast and bare) so the test cannot
+/// pass by promoting too eagerly, and the sibling float test above cannot catch
+/// any of this because all of its integer arguments are already `int`.
+#[test]
+fn codegen_variadic_narrow_integer_promotion() {
+    let code = r#"
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    char buf[64];
+
+    /* The original repro: a negative signed char cast to unsigned char.
+       The cast is same-size, so it emits no conversion of its own. */
+    signed char sc = -128;
+    snprintf(buf, sizeof(buf), "%02x", (unsigned char)sc);
+    if (strcmp(buf, "80") != 0) return 1;
+
+    /* Same shape one width up. */
+    short s = -1;
+    snprintf(buf, sizeof(buf), "%04x", (unsigned short)s);
+    if (strcmp(buf, "ffff") != 0) return 2;
+
+    /* Without a cast, a negative signed char sign-extends to int. */
+    snprintf(buf, sizeof(buf), "%d", sc);
+    if (strcmp(buf, "-128") != 0) return 3;
+
+    /* An unsigned char variable zero-extends. */
+    unsigned char uc = 200;
+    snprintf(buf, sizeof(buf), "%d", uc);
+    if (strcmp(buf, "200") != 0) return 4;
+
+    /* A negative short sign-extends. */
+    short neg = -12345;
+    snprintf(buf, sizeof(buf), "%d", neg);
+    if (strcmp(buf, "-12345") != 0) return 5;
+
+    /* An unsigned short zero-extends. */
+    unsigned short us = 60000;
+    snprintf(buf, sizeof(buf), "%d", us);
+    if (strcmp(buf, "60000") != 0) return 6;
+
+    /* _Bool promotes to int. */
+    _Bool b = 1;
+    snprintf(buf, sizeof(buf), "%d", b);
+    if (strcmp(buf, "1") != 0) return 7;
+
+    /* char through a cast that narrows from int. */
+    snprintf(buf, sizeof(buf), "%d", (signed char)300);
+    if (strcmp(buf, "44") != 0) return 8;
+
+    /* Routing through a variable was always correct -- the stack reload
+       zero-extends -- so this pins that the fix did not break it. */
+    unsigned char via_var = (unsigned char)sc;
+    snprintf(buf, sizeof(buf), "%02x", via_var);
+    if (strcmp(buf, "80") != 0) return 9;
+
+    /* An outer widening cast was also always correct. */
+    snprintf(buf, sizeof(buf), "%02x", (unsigned)(unsigned char)sc);
+    if (strcmp(buf, "80") != 0) return 10;
+
+    /* Several narrow arguments in one call, mixed with an int. */
+    snprintf(buf, sizeof(buf), "%02x,%d,%04x", (unsigned char)sc, 7, (unsigned short)s);
+    if (strcmp(buf, "80,7,ffff") != 0) return 11;
+
+    /* A narrow argument after the format string in a wide call, to exercise
+       the stack-passed side of the ABI rather than only registers. */
+    snprintf(buf, sizeof(buf), "%d%d%d%d%d%d%d%02x",
+             1, 2, 3, 4, 5, 6, 7, (unsigned char)sc);
+    if (strcmp(buf, "123456780") != 0) return 12;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_variadic_narrow_integer_promotion", code, &[]),
+        0
+    );
+}
+
 /// Regression test: float arguments to variadic functions (e.g., printf) were
 /// not promoted to double per C99 6.5.2.2p7 "default argument promotions".
 /// The ABI requires xmm0 to hold a double, but c17 passed 32-bit float bits.

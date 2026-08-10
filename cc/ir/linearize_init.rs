@@ -476,6 +476,21 @@ impl<'a> super::linearize::Linearizer<'a> {
         ) {
             return false;
         }
+        // An element that is already an expression of the target's own type
+        // initializes the whole aggregate by itself (C17 6.7.9p13). Eliding
+        // braces around it consumes `count_scalar_fields` *elements* instead
+        // of one, so `struct P a[2] = {p, p};` put both structs into a[0] and
+        // left a[1] uninitialized -- then assigned a struct where a scalar
+        // field was expected, producing garbage.
+        if let Some(elem_typ) = element.value.typ {
+            let elem_kind = self.types.kind(elem_typ);
+            if matches!(elem_kind, TypeKind::Struct | TypeKind::Union)
+                && elem_kind == self.types.kind(target_type)
+                && self.types.size_bits(elem_typ) == self.types.size_bits(target_type)
+            {
+                return false;
+            }
+        }
         true
     }
 

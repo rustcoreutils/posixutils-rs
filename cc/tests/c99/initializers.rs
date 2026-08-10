@@ -1207,3 +1207,75 @@ int main(void) {
         0
     );
 }
+
+/// An initializer element that is already an expression of the aggregate's own
+/// type initializes the whole aggregate (C17 6.7.9p13).
+///
+/// It was instead treated as a brace-elision candidate, so filling one element
+/// consumed `count_scalar_fields` *elements* rather than one:
+/// `struct P a[2] = {p, p};` put both structs into `a[0]`, left `a[1]`
+/// uninitialized, and assigned a struct where a scalar field was expected --
+/// giving `4 4 0 0` where gcc gives `4 5 4 5`. The nested case returned
+/// uninitialized stack, so this read whatever happened to be there.
+#[test]
+fn c99_aggregate_element_initializes_whole_aggregate() {
+    let code = r#"
+#include <string.h>
+
+struct P { int x, y; };
+struct N { int a[2]; struct { int x, y; } in; };
+
+int main(void) {
+    struct P p = {4, 5};
+
+    /* The case that was wrong: elements are struct expressions, not braces. */
+    struct P a2[2] = {p, p};
+    if (a2[0].x != 4 || a2[0].y != 5) return 1;
+    if (a2[1].x != 4 || a2[1].y != 5) return 2;
+
+    /* Nested aggregate, where the old path returned uninitialized stack. */
+    struct N n = {{1, 2}, {4, 5}};
+    struct N b2[2] = {n, n};
+    if (b2[0].a[0] != 1 || b2[0].in.x != 4) return 3;
+    if (b2[1].a[0] != 1 || b2[1].in.x != 4) return 4;
+    if (memcmp(&b2[0], &n, sizeof n) != 0) return 5;
+    if (memcmp(&b2[1], &n, sizeof n) != 0) return 6;
+
+    /* Mixing an expression element with a brace list must still work. */
+    struct P mix[2] = {p, {8, 9}};
+    if (mix[0].x != 4 || mix[0].y != 5) return 7;
+    if (mix[1].x != 8 || mix[1].y != 9) return 8;
+
+    /* Fewer initializers than elements: the rest are zeroed, not garbage. */
+    struct P few[3] = {p};
+    if (few[0].x != 4 || few[1].x != 0 || few[2].x != 0) return 9;
+    if (few[1].y != 0 || few[2].y != 0) return 10;
+
+    /* A single struct initialized from another, and one member from an
+       expression -- the same rule one level down. */
+    struct N copy = n;
+    if (copy.a[0] != 1 || copy.in.x != 4) return 11;
+
+    /* The paths that always worked, pinned so this fix cannot regress them. */
+    struct P braces[2] = {{4, 5}, {6, 7}};
+    if (braces[0].x != 4 || braces[1].x != 6) return 12;
+    static struct P statics[2] = {{4, 5}, {6, 7}};
+    if (statics[0].x != 4 || statics[1].x != 6) return 13;
+    struct P assigned[2];
+    assigned[0] = p; assigned[1] = p;
+    if (assigned[0].x != 4 || assigned[1].x != 4) return 14;
+    struct N desig = {.in = {7, 8}};
+    if (desig.in.x != 7 || desig.in.y != 8) return 15;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run(
+            "c99_aggregate_element_initializes_whole_aggregate",
+            code,
+            &[]
+        ),
+        0
+    );
+}

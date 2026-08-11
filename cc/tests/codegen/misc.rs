@@ -11,6 +11,7 @@
 // Consolidates: optimization, debug tests
 //
 
+use crate::codegen::asm_probe::{asm_for_with, AARCH64_LINUX, X86_64_LINUX};
 use crate::common::{compile_and_run, compile_and_run_optimized, create_c_file};
 use plib::testing::run_test_base;
 use std::io::Write;
@@ -5737,4 +5738,67 @@ int main(void) {
         compile_and_run("codegen_variadic_floating_arguments", code, &[]),
         0
     );
+}
+
+/// `__attribute__((noinline))` is a directive, not a hint.
+///
+/// It was recognized and then ignored, so a small function marked `noinline`
+/// was inlined anyway at `-O2` and the call disappeared. People reach for it
+/// to keep a frame on the stack, to keep a symbol callable, or to work around
+/// a miscompile -- none of which survive the size heuristic overruling them.
+#[test]
+fn codegen_noinline_is_honoured() {
+    let src = r#"
+static __attribute__((noinline)) int small(int x) { return x * 2; }
+/* the same function without the attribute, to show the size alone
+   would have had it inlined */
+static int small_ok(int x) { return x * 3; }
+
+int caller(int x) { return small(x) + small_ok(x); }
+"#;
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        let asm = asm_for_with("noinline", triple, src, &["-O2"]);
+        assert!(
+            asm.contains("small:"),
+            "{triple}: noinline function was not emitted:\n{asm}"
+        );
+        let calls = asm
+            .lines()
+            .filter(|l| {
+                let l = l.trim();
+                (l.starts_with("call") || l.starts_with("bl ")) && l.contains("small")
+            })
+            .count();
+        assert!(
+            calls >= 1,
+            "{triple}: noinline function was inlined away (no call survived):\n{asm}"
+        );
+        assert!(
+            !asm.contains("small_ok:") || calls >= 1,
+            "{triple}: unexpected shape:\n{asm}"
+        );
+    }
+}
+
+/// The attribute is honoured in either spelling and wherever it sits on the
+/// *definition* -- before or after the declaration specifiers.
+///
+/// Not covered, and still a divergence from gcc: the attribute written only
+/// on an earlier prototype (`static int f(int) __attribute__((noinline));`)
+/// does not carry to the definition, because attributes are accumulated per
+/// declaration and nothing records them against the function symbol.
+#[test]
+fn codegen_noinline_spellings_and_placement() {
+    for src in [
+        "static __attribute__((noinline)) int f(int x) { return x + 1; }\nint g(int x){return f(x);}",
+        "__attribute__((noinline)) static int f(int x) { return x + 1; }\nint g(int x){return f(x);}",
+        "static int f(int x) __attribute__((noinline)) { return x + 1; }\nint g(int x){return f(x);}",
+        "static __attribute__((__noinline__)) int f(int x) { return x + 1; }\nint g(int x){return f(x);}",
+    ] {
+        let asm = asm_for_with("noinline_spelling", X86_64_LINUX, src, &["-O2"]);
+        assert!(
+            asm.lines().any(|l| l.trim().starts_with("call") && l.contains('f')),
+            "no call survived for:\n{src}\n{asm}"
+        );
+    }
 }

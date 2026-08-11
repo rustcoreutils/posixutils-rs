@@ -83,6 +83,8 @@ pub struct InlineCandidate {
     pub estimated_size: usize,
     /// Whether function is marked with `inline` keyword
     pub has_inline_hint: bool,
+    /// Whether function is marked `__attribute__((noinline))`
+    pub is_noinline: bool,
     /// Whether function is recursive (calls itself)
     pub is_recursive: bool,
     /// Whether function uses va_args (should not inline)
@@ -128,6 +130,7 @@ pub fn analyze_all_functions(module: &Module) -> HashMap<String, InlineCandidate
 /// Analyze a single function for inlineability
 fn analyze_function(func: &Function, call_counts: &HashMap<String, usize>) -> InlineCandidate {
     let mut candidate = InlineCandidate {
+        is_noinline: func.is_noinline,
         has_inline_hint: func.is_inline,
         returns_complex: func.returns_complex,
         ..Default::default()
@@ -180,6 +183,13 @@ fn should_inline(
 ) -> bool {
     // Never inline if disqualifying conditions
     if candidate.uses_varargs || candidate.is_recursive || candidate.uses_alloca {
+        return false;
+    }
+
+    // `__attribute__((noinline))` is a directive, not a hint: people reach for
+    // it to keep a frame on the stack, to keep a symbol callable, or to work
+    // around a miscompile. Size heuristics do not get a vote.
+    if candidate.is_noinline {
         return false;
     }
 
@@ -1377,6 +1387,7 @@ mod tests {
             uses_alloca: false,
             returns_complex: false,
             call_count: 1,
+            is_noinline: false,
         };
 
         // Small function should always inline at -O1
@@ -1393,6 +1404,7 @@ mod tests {
             uses_alloca: false,
             returns_complex: false,
             call_count: 1,
+            is_noinline: false,
         };
 
         // Varargs functions should never inline
@@ -1409,6 +1421,7 @@ mod tests {
             uses_alloca: false,
             returns_complex: false,
             call_count: 1,
+            is_noinline: false,
         };
 
         // Recursive functions should not inline
@@ -1425,6 +1438,7 @@ mod tests {
             uses_alloca: false,
             returns_complex: false,
             call_count: 1,
+            is_noinline: false,
         };
 
         // Should not inline at -O0
@@ -1441,6 +1455,7 @@ mod tests {
             uses_alloca: false,
             returns_complex: false,
             call_count: 1,
+            is_noinline: false,
         };
 
         // 30 instructions with inline hint should inline

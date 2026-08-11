@@ -780,6 +780,7 @@ impl<'a> Linearizer<'a> {
         ir_func.is_static = is_static || is_inline;
         ir_func.is_noreturn = is_noreturn;
         ir_func.is_inline = is_inline;
+        ir_func.is_noinline = func.attrs.noinline;
 
         let ret_kind = self.types.kind(func.return_type);
         // Check if function returns a large struct

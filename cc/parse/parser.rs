@@ -205,6 +205,20 @@ impl AttributeList {
         }
     }
 
+    /// Whether `__attribute__((noinline))` is present.
+    pub fn has_noinline(&self) -> bool {
+        self.attrs
+            .iter()
+            .any(|a| a.name == "noinline" || a.name == "__noinline__")
+    }
+
+    /// Collect the attributes that affect how a function is emitted.
+    pub fn function_attrs(&self) -> crate::parse::ast::FunctionAttrs {
+        crate::parse::ast::FunctionAttrs {
+            noinline: self.has_noinline(),
+        }
+    }
+
     /// Get alignment from __attribute__((aligned(N))) or __attribute__((aligned))
     /// Returns Some(alignment) if found, None otherwise.
     /// Per GCC: aligned with no args defaults to 16 ("max useful alignment").
@@ -262,6 +276,12 @@ pub struct Parser<'a> {
     /// Explicit alignment from _Alignas in current declaration
     /// Cleared after each declaration is parsed.
     pending_alignas: Option<u32>,
+    /// Emission-affecting function attributes seen so far in the declaration
+    /// being parsed. Accumulated like `pending_alignas` because a
+    /// `constructor` / `noinline` attribute may appear before the declaration
+    /// specifiers, between the type and the declarator, or after the
+    /// parameter list. Cleared at the start of each external declaration.
+    pending_fn_attrs: crate::parse::ast::FunctionAttrs,
     /// Set by `parse_type_specifier`: whether the specifier list actually
     /// named a type, rather than defaulting to `int`.
     ///
@@ -289,6 +309,7 @@ impl<'a> Parser<'a> {
             types,
             pos: 0,
             pending_alignas: None,
+            pending_fn_attrs: Default::default(),
             saw_explicit_type: true,
         }
     }
@@ -951,6 +972,8 @@ impl<'a> Parser<'a> {
             if self.is_attribute_keyword() {
                 let attrs = self.parse_attributes();
                 self.apply_attribute_alignment(&attrs);
+                let fn_attrs = attrs.function_attrs();
+                self.pending_fn_attrs.merge(&fn_attrs);
             } else if self.is_asm_keyword() {
                 self.skip_asm();
             } else if self.is_nullability_qualifier() {
@@ -2979,6 +3002,7 @@ impl Parser<'_> {
         self.symbols.leave_scope();
 
         Ok(FunctionDef {
+            attrs: Default::default(),
             return_type: ret_type_id,
             name,
             params,
@@ -3247,6 +3271,7 @@ impl Parser<'_> {
     fn parse_external_decl(&mut self) -> ParseResult<ExternalDecl> {
         // Clear pending alignment from previous declaration
         self.pending_alignas = None;
+        self.pending_fn_attrs = Default::default();
 
         // Check for _Static_assert first (C11)
         if self.is_static_assert() {
@@ -3321,6 +3346,8 @@ impl Parser<'_> {
                 // Parse any __attribute__ after declarator
                 let attrs = self.parse_attributes();
                 let calling_conv = attrs.calling_conv().unwrap_or_default();
+                let fn_attrs = attrs.function_attrs();
+                self.pending_fn_attrs.merge(&fn_attrs);
 
                 // Check if this is a function definition (function type followed by '{')
                 // This handles cases like: int (*get_op(int which))(int, int) { ... }
@@ -3369,6 +3396,7 @@ impl Parser<'_> {
                         is_static,
                         is_inline,
                         calling_conv,
+                        attrs: self.pending_fn_attrs.clone(),
                     }));
                 }
 
@@ -3494,6 +3522,8 @@ impl Parser<'_> {
                 // Parse any __attribute__ after declarator
                 let attrs = self.parse_attributes();
                 let calling_conv = attrs.calling_conv().unwrap_or_default();
+                let fn_attrs = attrs.function_attrs();
+                self.pending_fn_attrs.merge(&fn_attrs);
 
                 // Check if this is a function definition (function type followed by '{')
                 // This handles cases like: char *(*get_op(int which))(int, int) { ... }
@@ -3541,6 +3571,7 @@ impl Parser<'_> {
                         is_static,
                         is_inline,
                         calling_conv,
+                        attrs: self.pending_fn_attrs.clone(),
                     }));
                 }
 
@@ -3611,6 +3642,8 @@ impl Parser<'_> {
 
             // Parse __attribute__ after parameter list (e.g., __attribute__((noreturn)))
             let attrs = self.parse_attributes();
+            let fn_attrs = attrs.function_attrs();
+            self.pending_fn_attrs.merge(&fn_attrs);
             // noreturn can come from __attribute__((noreturn)) or _Noreturn keyword in base type
             let typ_from_table = self.types.get(typ_id);
             let is_noreturn =
@@ -3707,6 +3740,7 @@ impl Parser<'_> {
                     is_static,
                     is_inline,
                     calling_conv,
+                    attrs: self.pending_fn_attrs.clone(),
                 }));
             } else {
                 // Function declaration

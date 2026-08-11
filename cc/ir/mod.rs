@@ -1495,6 +1495,9 @@ pub struct Function {
     pub is_noreturn: bool,
     /// Is this function declared with the inline keyword?
     pub is_inline: bool,
+    /// `__attribute__((noinline))`: the inliner must leave this function
+    /// alone, whatever its size says.
+    pub is_noinline: bool,
     /// Parameters whose data is supplied implicitly by the backend prologue
     /// (e.g. complex / two-SSE struct params).  When inlining the function,
     /// the inliner must generate an explicit struct copy from the caller's
@@ -1532,6 +1535,7 @@ impl Default for Function {
             max_dom_level: 0,
             is_static: false,
             is_noreturn: false,
+            is_noinline: false,
             is_inline: false,
             implicit_param_copies: Vec::new(),
             returns_complex: false,

@@ -1025,6 +1025,26 @@ pub struct Parameter {
     pub vm_dims: Vec<Expr>,
 }
 
+/// Attributes that change how a function is *emitted* rather than what it
+/// computes, and so have to survive from the parser into code generation.
+#[derive(Debug, Clone, Default)]
+pub struct FunctionAttrs {
+    /// `__attribute__((noinline))` -- never inline this function.
+    pub noinline: bool,
+}
+
+impl FunctionAttrs {
+    /// Fold `other` in, letting a present attribute win.
+    ///
+    /// Attributes reach a function definition from more than one place --
+    /// before the declaration specifiers, between the type and the
+    /// declarator, and after the parameter list -- so they are accumulated
+    /// rather than read from a single site.
+    pub fn merge(&mut self, other: &FunctionAttrs) {
+        self.noinline |= other.noinline;
+    }
+}
+
 /// A function definition
 #[derive(Debug, Clone)]
 pub struct FunctionDef {
@@ -1044,6 +1064,8 @@ pub struct FunctionDef {
     pub is_inline: bool,
     /// Calling convention override (from __attribute__((sysv_abi)) etc.)
     pub calling_conv: crate::abi::CallingConv,
+    /// Emission-affecting attributes; see [`FunctionAttrs`].
+    pub attrs: FunctionAttrs,
 }
 
 // ============================================================================

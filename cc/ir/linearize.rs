@@ -20,8 +20,8 @@ use crate::abi::{get_abi_for_conv, CallingConv};
 use crate::diag::{error, get_all_stream_names, Position};
 use crate::float::FloatVal;
 use crate::parse::ast::{
-    BinaryOp, BlockItem, Expr, ExprKind, ExternalDecl, FunctionDef, InitElement, OffsetOfPath,
-    TranslationUnit, UnaryOp,
+    BinaryOp, BlockItem, Expr, ExprKind, ExternalDecl, FpTest, FunctionDef, InitElement,
+    OffsetOfPath, TranslationUnit, UnaryOp,
 };
 use crate::strings::{StringId, StringTable};
 use crate::symbol::{SymbolId, SymbolTable};
@@ -1415,7 +1415,14 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Fabsl { arg }
             | ExprKind::Signbit { arg }
             | ExprKind::Signbitf { arg }
-            | ExprKind::Signbitl { arg } => self.is_pure_expr(arg),
+            | ExprKind::Signbitl { arg }
+            | ExprKind::FpTest { arg, .. } => self.is_pure_expr(arg),
+
+            // Pure iff everything it reads is: the class codes are ordinary
+            // expressions, not constants, so they count too.
+            ExprKind::FpClassify { classes, arg } => {
+                self.is_pure_expr(arg) && classes.iter().all(|c| self.is_pure_expr(c))
+            }
 
             // Alloca allocates memory - not pure
             ExprKind::Alloca { .. } => false,
@@ -2178,6 +2185,153 @@ impl<'a> Linearizer<'a> {
             64,
         ));
         Some(total)
+    }
+
+    /// Lower a `__builtin_isnan` / `isinf` / `isfinite` / `isnormal`.
+    ///
+    /// Built from comparisons alone, which keeps them exact at every width and
+    /// needs no new opcode or backend work. Deliberately *not* expressed with
+    /// `fabs`: `__builtin_fabsl` still narrows a `long double` to a double, so
+    /// a magnitude test through it answers the wrong question at the one width
+    /// that most needs it. Comparing against both signed bounds avoids that.
+    ///
+    ///   isnan(x)     x != x                  (only a NaN differs from itself)
+    ///   isinf(x)     x == +inf || x == -inf
+    ///   isfinite(x)  x > -inf && x < +inf    (a NaN fails both: unordered)
+    ///   isnormal(x)  isfinite(x) && (x >= +min_normal || x <= -min_normal)
+    ///
+    /// The argument is linearized once into a pseudo and that pseudo is reused.
+    /// Desugaring to an AST node instead would duplicate the argument
+    /// expression, so `isnan(f())` would call `f` twice.
+    fn linearize_fp_test(&mut self, test: FpTest, arg: &Expr) -> PseudoId {
+        let typ = self.expr_type(arg);
+        let size = self.types.size_bits(typ);
+        let val = self.linearize_expr(arg);
+
+        match test {
+            FpTest::IsNan => self.emit_fcmp(Opcode::FCmpONe, val, val, typ, size),
+            FpTest::IsInf => {
+                let pos = self.emit_fconst(FloatVal::infinity(false), typ);
+                let neg = self.emit_fconst(FloatVal::infinity(true), typ);
+                let a = self.emit_fcmp(Opcode::FCmpOEq, val, pos, typ, size);
+                let b = self.emit_fcmp(Opcode::FCmpOEq, val, neg, typ, size);
+                self.emit_bool_combine(Opcode::Or, a, b)
+            }
+            FpTest::IsFinite => self.emit_is_finite(val, typ, size),
+            FpTest::IsNormal => {
+                let finite = self.emit_is_finite(val, typ, size);
+                let magnitude = self.emit_at_least_normal(val, typ, size);
+                self.emit_bool_combine(Opcode::And, finite, magnitude)
+            }
+        }
+    }
+
+    /// `x > -inf && x < +inf`, which is false for a NaN because both
+    /// comparisons against one are false.
+    fn emit_is_finite(&mut self, val: PseudoId, typ: TypeId, size: u32) -> PseudoId {
+        let pos = self.emit_fconst(FloatVal::infinity(false), typ);
+        let neg = self.emit_fconst(FloatVal::infinity(true), typ);
+        let below = self.emit_fcmp(Opcode::FCmpOLt, val, pos, typ, size);
+        let above = self.emit_fcmp(Opcode::FCmpOGt, val, neg, typ, size);
+        self.emit_bool_combine(Opcode::And, below, above)
+    }
+
+    /// `x >= +min_normal || x <= -min_normal` -- true for anything at least as
+    /// large as the smallest normal, in either direction. Combined with a
+    /// finiteness test this is exactly `isnormal`.
+    fn emit_at_least_normal(&mut self, val: PseudoId, typ: TypeId, size: u32) -> PseudoId {
+        let smallest = self.smallest_normal(typ);
+        let pos = self.emit_fconst(smallest, typ);
+        let neg = self.emit_fconst(smallest.negated(), typ);
+        let a = self.emit_fcmp(Opcode::FCmpOGe, val, pos, typ, size);
+        let b = self.emit_fcmp(Opcode::FCmpOLe, val, neg, typ, size);
+        self.emit_bool_combine(Opcode::Or, a, b)
+    }
+
+    /// Emit a floating comparison yielding 0 or 1.
+    fn emit_fcmp(
+        &mut self,
+        op: Opcode,
+        lhs: PseudoId,
+        rhs: PseudoId,
+        typ: TypeId,
+        size: u32,
+    ) -> PseudoId {
+        let result = self.alloc_pseudo();
+        self.emit(Instruction::binop(op, result, lhs, rhs, typ, size));
+        result
+    }
+
+    /// Combine two comparison results. Both are already 0 or 1, so the
+    /// bitwise operation is the logical one and no branch is needed.
+    fn emit_bool_combine(&mut self, op: Opcode, lhs: PseudoId, rhs: PseudoId) -> PseudoId {
+        let int_typ = self.types.int_id;
+        let result = self.alloc_pseudo();
+        self.emit(Instruction::binop(op, result, lhs, rhs, int_typ, 32));
+        result
+    }
+
+    /// The smallest positive normal value of a floating type: 2^min_exp.
+    ///
+    /// Exact at every width, including x87's 2^-16382, which an `f64` cannot
+    /// represent at all -- carrying literals at target precision is what makes
+    /// `isnormal` on a `long double` expressible.
+    fn smallest_normal(&self, typ: TypeId) -> FloatVal {
+        let exp = match self.types.size_bits(typ) {
+            0..=16 => -14,   // binary16
+            17..=32 => -126, // binary32
+            33..=64 => -1022,
+            // x87 80-bit and IEEE binary128 share a minimum exponent.
+            _ => -16382,
+        };
+        FloatVal::from_parts(false, 1, exp)
+    }
+
+    /// Lower `__builtin_fpclassify(nan, inf, normal, subnormal, zero, x)`.
+    ///
+    /// A chain of selects over the same tests, applied most-specific last so
+    /// the earlier answers win. Subnormal is the innermost default: not a
+    /// NaN, not infinite, not zero and below the smallest normal leaves
+    /// nothing else it could be.
+    fn linearize_fp_classify(&mut self, classes: &[Expr], arg: &Expr) -> PseudoId {
+        let typ = self.expr_type(arg);
+        let size = self.types.size_bits(typ);
+        let val = self.linearize_expr(arg);
+        let int_typ = self.types.int_id;
+
+        let nan_code = self.linearize_expr(&classes[0]);
+        let inf_code = self.linearize_expr(&classes[1]);
+        let normal_code = self.linearize_expr(&classes[2]);
+        let subnormal_code = self.linearize_expr(&classes[3]);
+        let zero_code = self.linearize_expr(&classes[4]);
+
+        let is_nan = self.emit_fcmp(Opcode::FCmpONe, val, val, typ, size);
+
+        let pos_inf = self.emit_fconst(FloatVal::infinity(false), typ);
+        let neg_inf = self.emit_fconst(FloatVal::infinity(true), typ);
+        let eq_pos = self.emit_fcmp(Opcode::FCmpOEq, val, pos_inf, typ, size);
+        let eq_neg = self.emit_fcmp(Opcode::FCmpOEq, val, neg_inf, typ, size);
+        let is_inf = self.emit_bool_combine(Opcode::Or, eq_pos, eq_neg);
+
+        let zero = self.emit_fconst(FloatVal::ZERO, typ);
+        let is_zero = self.emit_fcmp(Opcode::FCmpOEq, val, zero, typ, size);
+
+        let finite = self.emit_is_finite(val, typ, size);
+        let magnitude = self.emit_at_least_normal(val, typ, size);
+        let is_normal = self.emit_bool_combine(Opcode::And, finite, magnitude);
+
+        let mut acc = subnormal_code;
+        for (cond, code) in [
+            (is_normal, normal_code),
+            (is_zero, zero_code),
+            (is_inf, inf_code),
+            (is_nan, nan_code),
+        ] {
+            let next = self.alloc_pseudo();
+            self.emit(Instruction::select(next, cond, code, acc, int_typ, 32));
+            acc = next;
+        }
+        acc
     }
 
     /// Stride for one index step into `ptr_expr`, when what it denotes is a
@@ -3930,6 +4084,10 @@ impl<'a> Linearizer<'a> {
                 result
             }
 
+            ExprKind::FpTest { test, arg } => self.linearize_fp_test(*test, arg),
+
+            ExprKind::FpClassify { classes, arg } => self.linearize_fp_classify(classes, arg),
+
             ExprKind::BuiltinComplex { real, imag } => {
                 // __builtin_complex(real, imag) - construct complex value
                 let complex_typ = self.expr_type(expr);
@@ -4380,6 +4538,8 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Signbit { .. }
             | ExprKind::Signbitf { .. }
             | ExprKind::Signbitl { .. }
+            | ExprKind::FpTest { .. }
+            | ExprKind::FpClassify { .. }
             | ExprKind::Unreachable
             | ExprKind::FrameAddress { .. }
             | ExprKind::ReturnAddress { .. }

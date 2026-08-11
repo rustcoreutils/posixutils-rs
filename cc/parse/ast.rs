@@ -79,6 +79,23 @@ impl BinaryOp {
     }
 }
 
+/// Which classification question a [`ExprKind::FpTest`] asks.
+///
+/// The variants share an `Is` prefix because the builtins they name do:
+/// `__builtin_isnan`, `__builtin_isinf`, and so on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
+pub enum FpTest {
+    /// Is it a NaN?
+    IsNan,
+    /// Is it an infinity, of either sign?
+    IsInf,
+    /// Is it neither infinite nor NaN?
+    IsFinite,
+    /// Is it finite, non-zero and not subnormal?
+    IsNormal,
+}
+
 /// Assignment operators
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssignOp {
@@ -501,6 +518,22 @@ pub enum ExprKind {
 
     /// __builtin_signbitl(x) - test sign bit of long double, returns non-zero if negative
     Signbitl {
+        arg: Box<Expr>,
+    },
+
+    /// `__builtin_isnan` / `isinf` / `isfinite` / `isnormal` -- classify a
+    /// floating value. Desugared in the linearizer rather than here so the
+    /// argument is evaluated exactly once; `isnan(f())` must not call `f`
+    /// twice.
+    FpTest {
+        test: FpTest,
+        arg: Box<Expr>,
+    },
+
+    /// `__builtin_fpclassify(nan, inf, normal, subnormal, zero, x)` -- yields
+    /// whichever of the five class codes describes `x`.
+    FpClassify {
+        classes: Vec<Expr>,
         arg: Box<Expr>,
     },
 

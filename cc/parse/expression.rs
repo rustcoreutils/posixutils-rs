@@ -10,7 +10,7 @@
 //
 
 use super::ast::{
-    AssignOp, BinaryOp, Designator, Expr, ExprKind, InitElement, OffsetOfPath, UnaryOp,
+    AssignOp, BinaryOp, Designator, Expr, ExprKind, FpTest, InitElement, OffsetOfPath, UnaryOp,
 };
 use super::parser::{ParseError, ParseResult, Parser};
 use crate::diag;
@@ -2447,6 +2447,54 @@ impl<'a> Parser<'a> {
                 ))
             })()),
             // Signbit builtins - test sign bit of floats
+            crate::kw::BUILTIN_ISNAN
+            | crate::kw::BUILTIN_ISINF
+            | crate::kw::BUILTIN_ISFINITE
+            | crate::kw::BUILTIN_ISNORMAL => Some((|| {
+                let test = match name_id {
+                    crate::kw::BUILTIN_ISNAN => FpTest::IsNan,
+                    crate::kw::BUILTIN_ISINF => FpTest::IsInf,
+                    crate::kw::BUILTIN_ISFINITE => FpTest::IsFinite,
+                    _ => FpTest::IsNormal,
+                };
+                self.expect_special(b'(')?;
+                let arg = self.parse_assignment_expr()?;
+                self.expect_special(b')')?;
+                Ok(Self::typed_expr(
+                    ExprKind::FpTest {
+                        test,
+                        arg: Box::new(arg),
+                    },
+                    self.types.int_id,
+                    token_pos,
+                ))
+            })()),
+            crate::kw::BUILTIN_FPCLASSIFY => Some((|| {
+                // __builtin_fpclassify(nan, inf, normal, subnormal, zero, x)
+                self.expect_special(b'(')?;
+                let mut args = Vec::with_capacity(6);
+                args.push(self.parse_assignment_expr()?);
+                while self.is_special(b',') {
+                    self.advance();
+                    args.push(self.parse_assignment_expr()?);
+                }
+                self.expect_special(b')')?;
+                if args.len() != 6 {
+                    return Err(ParseError::new(
+                        "__builtin_fpclassify expects five class codes and a value",
+                        token_pos,
+                    ));
+                }
+                let arg = args.pop().expect("checked length");
+                Ok(Self::typed_expr(
+                    ExprKind::FpClassify {
+                        classes: args,
+                        arg: Box::new(arg),
+                    },
+                    self.types.int_id,
+                    token_pos,
+                ))
+            })()),
             crate::kw::BUILTIN_SIGNBIT => Some((|| {
                 self.expect_special(b'(')?;
                 let arg = self.parse_assignment_expr()?;

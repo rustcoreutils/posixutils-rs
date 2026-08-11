@@ -98,6 +98,11 @@ The member can be a chain like `field.subfield` or `arr[index].field`.
 | `__builtin_signbit(x)` | Returns non-zero if sign bit set (`double`) |
 | `__builtin_signbitf(x)` | Returns non-zero if sign bit set (`float`) |
 | `__builtin_signbitl(x)` | Returns non-zero if sign bit set (`long double`) |
+| `__builtin_isnan(x)` | 1 if `x` is a NaN, else 0. Any real floating type |
+| `__builtin_isinf(x)` | 1 if `x` is an infinity of either sign |
+| `__builtin_isfinite(x)` | 1 if `x` is neither infinite nor NaN |
+| `__builtin_isnormal(x)` | 1 if `x` is finite, non-zero and not subnormal |
+| `__builtin_fpclassify(nan, inf, normal, subnormal, zero, x)` | Whichever of the five class codes describes `x` |
 | `__builtin_flt_rounds()` | Current FP rounding mode |
 
 ## Stack Introspection
@@ -173,5 +178,5 @@ system header takes.
 
 | Builtin | Consequence |
 |---------|-------------|
-| `__builtin_isnan`, `__builtin_isinf`, `__builtin_isfinite`, `__builtin_isnormal`, `__builtin_fpclassify` | glibc's `<math.h>` falls back to calling `__isnanl` and friends. Those are conforming — C99 7.12.3.4 asks only for a nonzero value — but return glibc's raw class bits, so `isnan(x)` on a `long double` yields 65535 rather than gcc's 1. See `#C7` |
+
 | `__builtin_classify_type`, `__real__`, `__imag__` | Needed by the host's `<tgmath.h>`; c17 bundles its own, built on `_Generic`, so this is not a blocker |

@@ -11,31 +11,24 @@
 
 ## Technical Debt
 
-### Floating literals are stored as `f64`
+### Decimal floating literals are rounded through `f64`
 
-**Location**: `ExprKind::FloatLit(f64)` in `cc/parse/ast.rs`
+**Location**: `parse_number_literal` in `cc/parse/expression.rs`
 
-**Issue**: Every floating literal is parsed into an `f64`, so any value outside
-double's range is lost before the type system ever sees it. `LDBL_MAX`
-evaluates to `inf` on x86-64, where `long double` is x87 80-bit and holds it
-comfortably; gcc prints `1.18973e+4932`. `LDBL_MIN` underflows to `0` the same
-way, and a literal needing 54-64 mantissa bits is silently rounded:
-`3.14159265358979323846L` differs from gcc's bits from the 53rd onward.
+**Issue**: A literal is now carried as `FloatVal` (`cc/float.rs`), which holds
+the x87 80-bit encoding and is exact for `long double` on both targets, so
+`LDBL_MAX`, `LDBL_MIN` and every *hex* literal survive. A **decimal** literal
+still goes through `f64::from_str`, so one outside double's range or needing
+more than 53 mantissa bits is rounded: `3.14159265358979323846L` differs from
+gcc's bits from the 53rd onward, and `1.18973149535723176502e+4932L` written
+out longhand is still `inf`.
 
-**Groundwork done**: `parse_hex_float_parts` (`cc/parse/expression.rs`) already
-returns the exact `(significand, exp2)` decomposition, so hex literals need no
-further parsing work -- only a way to carry the result past `ExprKind::FloatLit`,
-`Initializer::Float` and `Loc::FImm`, all of which hold an `f64`. Of the 47
-`FImm` sites across the two backends, ~12 bind the value; the rest pass it
-through. A decimal literal outside double's range additionally needs a
-decimal-to-binary conversion at width, which is the larger part.
-
-**Consequence**: `long double` constants are silently limited to 53 bits of
-mantissa and double's exponent range. `c17_long_double_round_trip` passes only
-because `inf` compares equal to itself.
-
-**Cost of fixing**: touches the AST, the constant folder, and both backends'
-immediate paths (`Loc::FImm` is `(f64, u32)`).
+**What it needs**: a correctly-rounded decimal-to-64-bit-significand
+conversion. `10^4932` is ~16,400 bits, so it takes a big-integer scale and
+round with sticky-bit tracking; Rust's std rounds only to 53 bits and the
+minimal-dependency rule rules out a crate. The result feeds straight into
+`FloatVal::from_parts`, which already rounds an exact `(mantissa, exp2)` pair
+to the target width -- nothing else has to change.
 
 ### Stack frames are larger than gcc's
 
@@ -71,7 +64,7 @@ does or claims.
 |------|-----------|
 | `_FORTIFY_SOURCE` | Still checks nothing, but no longer because of `__builtin_object_size`, which now reports real sizes. c17 does not predefine `__OPTIMIZE__`, and glibc's `features.h` requires it before it will set `__USE_FORTIFY_LEVEL` above 0, so the fortified wrappers are never reached |
 | `_Complex` with static storage | Cannot be initialized at all; gcc accepts `1.0 + 2.0*I` and `CMPLX(...)` |
-| `isnan()` on a `long double` | 65535 rather than 1, because `__builtin_isnan` is absent and glibc falls back to `__isnanl` |
+| `isnan()` on a `long double` | 65535 rather than 1. The builtins now exist; glibc only uses them at `__GNUC_PREREQ (4,4)`, and claiming that also demands `__float128` (`bits/floatn.h` turns on `__HAVE_FLOAT128` at 4.3), which x86-64 c17 has no arithmetic for. Both answers conform — C99 7.12.3.4 requires only a nonzero value |
 
 ## Future Features
 

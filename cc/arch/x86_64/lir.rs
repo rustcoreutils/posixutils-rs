@@ -1182,7 +1182,10 @@ impl EmitAsm for X86Inst {
             }
 
             X86Inst::X87CmpPop => {
-                let _ = writeln!(out, "    fcomip %st(1), %st");
+                // `fucomip`, not `fcomip`: the quiet form does not raise
+                // invalid-operation on a QNaN, which is what C's relational
+                // operators require of everything but the signalling macros.
+                let _ = writeln!(out, "    fucomip %st(1), %st");
             }
 
             X86Inst::X87Pop => {

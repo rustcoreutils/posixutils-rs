@@ -6120,3 +6120,59 @@ int main(void)
 "##;
     assert_eq!(compile_and_run("long_double_literals", src, &[]), 0);
 }
+
+/// `long double` comparisons follow IEEE unordered semantics.
+///
+/// The x87 path mapped every comparison onto an *unsigned* condition code,
+/// but x87 signals an unordered result by setting CF, ZF and PF together --
+/// exactly the flags those codes read as "below" and "equal". Six of the ten
+/// NaN comparisons came out inverted: `n == n` was true and `n != n` false,
+/// and `<` / `<=` were true in both operand orders. Only `>` and `>=` were
+/// right, because their codes are already false when CF is set.
+///
+/// The compare also used `fcomip`, which raises invalid-operation on a quiet
+/// NaN; C's relational operators other than the signalling ones want the
+/// quiet `fucomip`.
+///
+/// Every expectation is gcc's output on the same source.
+#[test]
+fn codegen_long_double_nan_comparisons() {
+    let src = r#"
+static volatile double z = 0.0;
+
+int main(void)
+{
+    long double n = (long double)(z / z);   /* NaN */
+    long double a = 1.0L, b = 2.0L;
+
+    /* Every comparison against a NaN is false, except `!=` which is true. */
+    if (n == n) return 1;
+    if (!(n != n)) return 2;
+    if (n <  a) return 3;
+    if (n <= a) return 4;
+    if (n >  a) return 5;
+    if (n >= a) return 6;
+    if (a <  n) return 7;
+    if (a <= n) return 8;
+    if (a >  n) return 9;
+    if (a >= n) return 10;
+    if (n == a) return 11;
+    if (!(n != a)) return 12;
+
+    /* Ordered comparisons must be unaffected. */
+    if (!(a <  b)) return 20;
+    if (b <  a)    return 21;
+    if (!(a <= a)) return 22;
+    if (!(a >= a)) return 23;
+    if (!(a == a)) return 24;
+    if (!(a != b)) return 25;
+    if (!(b >  a)) return 26;
+    if (a >= b)    return 27;
+    if (!(b >= a)) return 28;
+    if (!(a <= b)) return 29;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("long_double_nan_cmp", src, &[]), 0);
+}

@@ -373,11 +373,25 @@ impl X86_64CodeGen {
     /// Emit x87 comparison
     ///
     /// Pattern:
-    ///   fldt   b(%rbp)       ; load b to ST(0)
-    ///   fldt   a(%rbp)       ; load a to ST(0), b moves to ST(1)
-    ///   fcomip %st(1), %st   ; compare ST(0) with ST(1), set EFLAGS, pop
-    ///   fstp   %st(0)        ; discard remaining value
-    ///   setcc  %al           ; set result based on condition
+    ///   fldt    b(%rbp)      ; load b to ST(0)
+    ///   fldt    a(%rbp)      ; load a to ST(0), b moves to ST(1)
+    ///   fucomip %st(1), %st  ; compare ST(0) with ST(1), set EFLAGS, pop
+    ///   fstp    %st(0)       ; discard remaining value
+    ///   setcc   %al          ; set result based on condition
+    ///
+    /// `fucomip` reports an unordered result -- either operand a NaN -- by
+    /// setting CF, ZF *and* PF together. Those are exactly the flags the
+    /// unsigned condition codes read as "below" and "equal", so a naive
+    /// mapping makes every NaN comparison answer as though the operands were
+    /// equal: `n == n` true, `n != n` false, `n < a` true. Two cases need
+    /// more than a condition code, and two need their operands swapped:
+    ///
+    ///   a <  b   ->  compare as b > a   (`Ugt` is false when unordered)
+    ///   a <= b   ->  compare as b >= a  (`Uge` likewise)
+    ///   a == b   ->  ZF=1 and PF=0
+    ///   a != b   ->  ZF=0 or  PF=1
+    ///
+    /// `>` and `>=` were already correct for the same reason the swap works.
     pub(super) fn emit_x87_compare(&mut self, insn: &Instruction) {
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&s1), Some(&s2)) => (s1, s2),
@@ -388,14 +402,18 @@ impl X86_64CodeGen {
             None => return,
         };
 
-        // Load in reverse order so comparison is a op b
-        // Load b first (goes to ST(0), then ST(1))
-        let src2_addr = self.get_x87_mem_addr(src2);
-        self.push_lir(X86Inst::X87Load { addr: src2_addr });
+        // `<` and `<=` are evaluated as the mirrored `>` / `>=` so that the
+        // unordered case falls out false; that means loading the operands the
+        // other way round.
+        let swap = matches!(insn.op, Opcode::FCmpOLt | Opcode::FCmpOLe);
+        let (first, second) = if swap { (src2, src1) } else { (src1, src2) };
 
-        // Load a (goes to ST(0), b is now in ST(1))
-        let src1_addr = self.get_x87_mem_addr(src1);
-        self.push_lir(X86Inst::X87Load { addr: src1_addr });
+        // Load in reverse order so the comparison reads first op second.
+        let second_addr = self.get_x87_mem_addr(second);
+        self.push_lir(X86Inst::X87Load { addr: second_addr });
+
+        let first_addr = self.get_x87_mem_addr(first);
+        self.push_lir(X86Inst::X87Load { addr: first_addr });
 
         // Compare ST(0) with ST(1), set EFLAGS, pop ST(0)
         self.push_lir(X86Inst::X87CmpPop);
@@ -403,14 +421,11 @@ impl X86_64CodeGen {
         // Discard remaining ST(0)
         self.push_lir(X86Inst::X87Pop);
 
-        // Set result based on condition code
-        // FCOMIP sets: CF=1 if a<b, ZF=1 if a==b, PF=1 if unordered
-        // x87 comparison uses same flags as unsigned integer comparison
         let cc = match insn.op {
             Opcode::FCmpOEq => CondCode::Eq,
             Opcode::FCmpONe => CondCode::Ne,
-            Opcode::FCmpOLt => CondCode::Ult, // CF=1
-            Opcode::FCmpOLe => CondCode::Ule, // CF=1 or ZF=1
+            Opcode::FCmpOLt => CondCode::Ugt, // mirrored: b > a
+            Opcode::FCmpOLe => CondCode::Uge, // mirrored: b >= a
             Opcode::FCmpOGt => CondCode::Ugt, // CF=0 and ZF=0
             Opcode::FCmpOGe => CondCode::Uge, // CF=0
             _ => return,
@@ -424,6 +439,37 @@ impl X86_64CodeGen {
 
         // Set byte based on condition
         self.push_lir(X86Inst::SetCC { cc, dst: dst_reg });
+
+        // Equality has to consult the parity flag as well, because ZF alone
+        // cannot tell "equal" from "unordered": both set it. R11 is the
+        // reserved scratch (see the note on emit_fp_move).
+        match insn.op {
+            Opcode::FCmpOEq => {
+                // equal  =  ZF=1 and not unordered
+                self.push_lir(X86Inst::SetCC {
+                    cc: CondCode::Np,
+                    dst: Reg::R11,
+                });
+                self.push_lir(X86Inst::And {
+                    size: OperandSize::B8,
+                    src: GpOperand::Reg(Reg::R11),
+                    dst: dst_reg,
+                });
+            }
+            Opcode::FCmpONe => {
+                // not equal  =  ZF=0 or unordered
+                self.push_lir(X86Inst::SetCC {
+                    cc: CondCode::P,
+                    dst: Reg::R11,
+                });
+                self.push_lir(X86Inst::Or {
+                    size: OperandSize::B8,
+                    src: GpOperand::Reg(Reg::R11),
+                    dst: dst_reg,
+                });
+            }
+            _ => {}
+        }
 
         // Zero-extend to 32-bit
         self.push_lir(X86Inst::Movzx {

@@ -215,6 +215,59 @@ impl X86_64CodeGen {
         }
     }
 
+    /// Whether `name` is a thread-local this backend must access through the
+    /// FS segment. TLS lowering here is Linux-only; the other targets fall
+    /// through to ordinary global access.
+    #[inline]
+    pub(super) fn is_tls_symbol(&self, name: &str) -> bool {
+        self.tls_symbols.contains(name) && self.base.target.os == Os::Linux
+    }
+
+    /// Compute the *address* of a thread-local into `dst`.
+    ///
+    /// Loading a thread-local's value takes one instruction, because the FS
+    /// segment override does the addition. Taking its address does not: the
+    /// thread pointer has to be materialized first, since `%fs:sym@TPOFF` is a
+    /// memory operand, not a value. Getting this wrong is invisible on a read
+    /// -- the bad address often still points at something mapped -- and
+    /// segfaults on a write.
+    fn emit_tls_addr(&mut self, name: &str, dst: Reg) {
+        let symbol = Symbol::global(name.to_string());
+        // Initial Exec for a symbol defined elsewhere or when building a
+        // shared object, matching what the load and store paths already
+        // choose. General Dynamic, which is what a dlopen-able library really
+        // needs, is not implemented on either model yet.
+        if self.extern_symbols.contains(name) || self.shared_mode {
+            // movq sym@GOTTPOFF(%rip), %dst   ; the offset from the thread pointer
+            // addq %fs:0, %dst                ; plus the thread pointer itself
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Mem(MemAddr::TlsGottpoff(symbol)),
+                dst: GpOperand::Reg(dst),
+            });
+            self.push_lir(X86Inst::Add {
+                size: OperandSize::B64,
+                src: GpOperand::Mem(MemAddr::FsAbsolute(0)),
+                dst,
+            });
+        } else {
+            // movq %fs:0, %dst                ; the thread pointer
+            // leaq sym@TPOFF(%dst), %dst      ; plus the link-time offset
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Mem(MemAddr::FsAbsolute(0)),
+                dst: GpOperand::Reg(dst),
+            });
+            self.push_lir(X86Inst::Lea {
+                addr: MemAddr::TlsTpoffBase {
+                    sym: symbol,
+                    base: dst,
+                },
+                dst,
+            });
+        }
+    }
+
     /// Check if a symbol needs GOT access
     /// - In PIC mode: all non-local symbols need GOT access (interposition)
     /// - On macOS: external symbols always need GOT access (even without PIC)
@@ -1648,6 +1701,9 @@ impl X86_64CodeGen {
                     };
                     let src_loc = self.get_location(src);
                     match src_loc {
+                        Loc::Global(name) if self.is_tls_symbol(&name) => {
+                            self.emit_tls_addr(&name, dst_reg);
+                        }
                         Loc::Global(name) => {
                             // Check if it's a local label (starts with '.') or global symbol
                             let is_local_label = name.starts_with('.');

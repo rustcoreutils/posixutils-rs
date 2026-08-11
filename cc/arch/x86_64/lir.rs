@@ -47,6 +47,17 @@ pub enum MemAddr {
     /// %fs:(base) - Thread-local storage access through base register
     /// Used with @GOTTPOFF: first load offset into register, then access %fs:(reg)
     FsBase(Reg),
+
+    /// %fs:offset - absolute offset from the thread pointer.
+    /// `%fs:0` reads the thread pointer itself, which is the first step of
+    /// computing the *address* of a thread-local (as opposed to loading its
+    /// value, which the segment override can do in one instruction).
+    FsAbsolute(i32),
+
+    /// symbol@TPOFF(base) - Local Exec offset added to a base register.
+    /// Pairs with `FsAbsolute(0)` to form a thread-local address:
+    /// `movq %fs:0, %r` then `leaq sym@TPOFF(%r), %r`.
+    TlsTpoffBase { sym: Symbol, base: Reg },
 }
 
 impl MemAddr {
@@ -78,6 +89,13 @@ impl MemAddr {
             MemAddr::FsBase(base) => {
                 // Thread-local storage access through base register: %fs:(reg)
                 format!("%fs:({})", base.name64())
+            }
+            MemAddr::FsAbsolute(offset) => {
+                // Absolute offset from the thread pointer: %fs:0 reads it.
+                format!("%fs:{}", offset)
+            }
+            MemAddr::TlsTpoffBase { sym, base } => {
+                format!("{}@TPOFF({})", sym.format_for_target(target), base.name64())
             }
         }
     }

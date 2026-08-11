@@ -5967,3 +5967,81 @@ fn codegen_always_inline_yields_to_the_recursive_stack_guard() {
          program's own recursion guard considers safe:\n{asm}"
     );
 }
+
+/// The address of a `_Thread_local` object is a real thread-local address.
+///
+/// `SymAddr` did not consult the TLS symbol set, so `&tls_var` produced an
+/// ordinary global address -- `movq tv@GOTPCREL(%rip), %rax` where gcc emits
+/// `%fs:tv@tpoff`. Reads through it happened to survive; a store through it
+/// segfaulted, at both -O0 and -O2.
+///
+/// Every expectation was checked against gcc on the same source, which returns
+/// 0 throughout.
+#[test]
+fn codegen_address_of_thread_local_is_thread_local() {
+    let src = r#"
+_Thread_local int tv = 11;
+_Thread_local long tl = 22;
+_Thread_local int tarr[4] = { 1, 2, 3, 4 };
+_Thread_local struct { int a; int b; } ts = { 5, 6 };
+
+static int *launder(int *p) { return p; }
+
+int main(void)
+{
+    /* read through a taken address */
+    int *p = &tv;
+    if (*p != 11) return 1;
+    if (*(&tv) != tv) return 2;
+    if (*launder(&tv) != 11) return 3;
+
+    /* write through a taken address -- this is what segfaulted */
+    *(&tv) = 99;
+    if (tv != 99) return 4;
+    *p = 77;
+    if (tv != 77) return 5;
+    *launder(&tv) = 55;
+    if (tv != 55) return 6;
+
+    /* a wider type */
+    *(&tl) = 4242;
+    if (tl != 4242) return 7;
+
+    /* array element addresses and pointer arithmetic */
+    if (*(&tarr[3]) != 4) return 8;
+    *(&tarr[2]) = 33;
+    if (tarr[2] != 33) return 9;
+    int *q = tarr + 1;
+    *q = 20;
+    if (tarr[1] != 20) return 10;
+    if ((&tarr[3] - &tarr[0]) != 3) return 11;
+
+    /* struct member through a taken address */
+    if ((&ts)->b != 6) return 12;
+    (&ts)->a = 50;
+    if (ts.a != 50) return 13;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("tls_address_of", src, &[]), 0);
+}
+
+/// Taking the address of a thread-local must not go through the GOT.
+///
+/// The behavioural test above can only prove the address works on this host;
+/// this pins the actual access sequence, which is where the defect was.
+#[test]
+fn codegen_thread_local_address_uses_the_tls_sequence() {
+    let src = "_Thread_local int tv = 11;\nint *addr(void) { return &tv; }\n";
+    let asm = asm_for_with("tls_addr_seq", X86_64_LINUX, src, &["-O2"]);
+    let body = crate::codegen::asm_probe::body_of(&asm, "addr");
+    assert!(
+        !body.contains("tv@GOTPCREL"),
+        "a thread-local address must not come from the GOT:\n{body}"
+    );
+    assert!(
+        body.contains("@tpoff") || body.contains("%fs:") || body.contains("@gottpoff"),
+        "expected a TLS access sequence:\n{body}"
+    );
+}

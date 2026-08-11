@@ -316,6 +316,31 @@ define_keywords! {
     (LONGJMP,           "longjmp",           0),
     (LONGJMP2,          "_longjmp",          0),
 
+    // ---- Fortified libc entry points ----
+    // Interned but untagged: these are ordinary identifiers, listed only so
+    // the parser can name one when it synthesizes the declaration glibc
+    // never writes. `bits/string_fortified.h` calls
+    // `__builtin___memcpy_chk` and expects the compiler to know
+    // `__memcpy_chk` intrinsically.
+    (_,                 "__memcpy_chk",         0),
+    (_,                 "__memmove_chk",        0),
+    (_,                 "__mempcpy_chk",        0),
+    (_,                 "__memset_chk",         0),
+    (_,                 "__strcpy_chk",         0),
+    (_,                 "__stpcpy_chk",         0),
+    (_,                 "__strncpy_chk",        0),
+    (_,                 "__stpncpy_chk",        0),
+    (_,                 "__strcat_chk",         0),
+    (_,                 "__strncat_chk",        0),
+    (_,                 "__sprintf_chk",        0),
+    (_,                 "__snprintf_chk",       0),
+    (_,                 "__printf_chk",         0),
+    (_,                 "__fprintf_chk",        0),
+    (_,                 "__vsprintf_chk",       0),
+    (_,                 "__vsnprintf_chk",      0),
+    (_,                 "__vprintf_chk",        0),
+    (_,                 "__vfprintf_chk",       0),
+
     // ---- Supported attribute names (SUPPORTED_ATTR) ----
     // Plain forms
     (_, "noreturn",             SUPPORTED_ATTR),

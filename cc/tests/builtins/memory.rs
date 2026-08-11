@@ -207,3 +207,48 @@ int main(void)
 "#;
     assert_eq!(compile_and_run("builtins_object_size", code, &[]), 0);
 }
+
+/// The fortified `__builtin___*_chk` builtins work without a declaration.
+///
+/// glibc never declares `__memcpy_chk` and friends -- `bits/string_fortified.h`
+/// calls `__builtin___memcpy_chk` and relies on the compiler knowing the
+/// entry point intrinsically. c17 rewrote the name and then demanded a
+/// declaration that does not exist, so every one of them was an error.
+///
+/// The return type is the part that has to be right rather than merely
+/// present: most of these return a pointer, and declaring one `int` would
+/// truncate the returned address to 32 bits. The assertions below compare the
+/// returned pointer against the expected address for exactly that reason.
+///
+/// Checked against gcc on the same source, which returns 0.
+#[test]
+fn builtins_fortified_chk_entry_points() {
+    let code = r#"
+#include <string.h>
+#include <stdio.h>
+
+int main(void)
+{
+    char buf[32];
+
+    char *p = __builtin___strcpy_chk(buf, "hello", sizeof buf);
+    if (p != buf) return 1;
+    if (strcmp(buf, "hello") != 0) return 2;
+
+    void *q = __builtin___memcpy_chk(buf + 6, "world", 6, sizeof buf - 6);
+    if (q != buf + 6) return 3;
+    if (strcmp(buf + 6, "world") != 0) return 4;
+
+    void *r = __builtin___memset_chk(buf, 'x', 4, sizeof buf);
+    if (r != buf) return 5;
+    if (buf[0] != 'x' || buf[3] != 'x' || buf[4] != 'o') return 6;
+
+    int n = __builtin___snprintf_chk(buf, sizeof buf, 0, sizeof buf, "%d", 12345);
+    if (n != 5) return 7;
+    if (strcmp(buf, "12345") != 0) return 8;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("builtins_chk", code, &[]), 0);
+}

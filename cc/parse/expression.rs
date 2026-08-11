@@ -16,7 +16,7 @@ use super::parser::{ParseError, ParseResult, Parser};
 use crate::diag;
 use crate::float::FloatVal;
 use crate::strings::StringId;
-use crate::symbol::{Namespace, Symbol};
+use crate::symbol::{Namespace, Symbol, SymbolId};
 use crate::token::lexer::{Position, SpecialToken, TokenType, TokenValue};
 use crate::types::{Type, TypeId, TypeKind, TypeModifiers};
 use gettextrs::gettext;
@@ -3081,7 +3081,31 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        // Not declared — return 0 as fallback
+                        // Not declared. gcc knows these intrinsically and
+                        // glibc relies on that: `bits/string_fortified.h`
+                        // calls `__builtin___memcpy_chk` without ever
+                        // declaring `__memcpy_chk`. Synthesize the
+                        // declaration rather than failing.
+                        if let Some(symbol_id) = self
+                            .chk_builtin_return_type(real_name)
+                            .and_then(|ret| self.declare_chk_builtin(real_name, ret))
+                        {
+                            let ret_type = self
+                                .types
+                                .base_type(self.symbols.get(symbol_id).typ)
+                                .unwrap_or(self.types.int_id);
+                            let func_type = self.symbols.get(symbol_id).typ;
+                            let func_expr =
+                                Self::typed_expr(ExprKind::Ident(symbol_id), func_type, token_pos);
+                            return Ok(Self::typed_expr(
+                                ExprKind::Call {
+                                    func: Box::new(func_expr),
+                                    args,
+                                },
+                                ret_type,
+                                token_pos,
+                            ));
+                        }
                         diag::error_args(token_pos, "undeclared function '{0}'", &[real_name]);
                         Ok(Self::typed_expr(
                             ExprKind::IntLit(0),
@@ -3800,6 +3824,56 @@ impl<'a> Parser<'a> {
         let typ = self.lvalue_type(expr)?;
         let elem = self.types.get(typ).base?;
         self.byte_size(elem)
+    }
+    /// The return type of a `_chk` fortified libc entry point, if `name` is
+    /// one c17 knows.
+    ///
+    /// The type matters more than it looks: these mostly return a pointer, and
+    /// declaring one of them `int` truncates the returned address to 32 bits.
+    /// `None` means "not a known `_chk` function", which stays an error.
+    fn chk_builtin_return_type(&mut self, name: &str) -> Option<TypeId> {
+        // The string family returns `char *`; the memory family returns
+        // `void *`; the printf family returns `int`.
+        match name {
+            "__memcpy_chk" | "__memmove_chk" | "__mempcpy_chk" | "__memset_chk" => {
+                Some(self.types.void_ptr_id)
+            }
+            "__strcpy_chk" | "__stpcpy_chk" | "__strncpy_chk" | "__stpncpy_chk"
+            | "__strcat_chk" | "__strncat_chk" => {
+                let char_id = self.types.char_id;
+                Some(self.types.intern(Type {
+                    kind: TypeKind::Pointer,
+                    base: Some(char_id),
+                    ..Default::default()
+                }))
+            }
+            "__sprintf_chk" | "__snprintf_chk" | "__printf_chk" | "__fprintf_chk"
+            | "__vsprintf_chk" | "__vsnprintf_chk" | "__vprintf_chk" | "__vfprintf_chk" => {
+                Some(self.types.int_id)
+            }
+            _ => None,
+        }
+    }
+
+    /// Declare a `_chk` entry point with an unprototyped signature, so the
+    /// call type-checks and returns a value of the right width.
+    fn declare_chk_builtin(&mut self, name: &str, ret_type: TypeId) -> Option<SymbolId> {
+        // Pre-interned in `cc/kw.rs`; the identifier table is read-only here.
+        let name_id = self.idents.lookup(name)?;
+        let func_type = self.types.intern(Type {
+            kind: TypeKind::Function,
+            base: Some(ret_type),
+            variadic: true,
+            ..Default::default()
+        });
+        let symbol = Symbol::function(name_id, func_type, self.symbols.depth());
+        // A redeclaration can only mean the header did declare it after all,
+        // in which case the existing symbol is the one to use.
+        Some(self.symbols.declare(symbol).unwrap_or_else(|_| {
+            self.symbols
+                .lookup_id(name_id, Namespace::Ordinary)
+                .expect("declare failed but no existing symbol")
+        }))
     }
 }
 

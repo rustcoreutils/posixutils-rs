@@ -1289,6 +1289,22 @@ impl TypeTable {
                         current_bit_offset = 0;
                         current_storage_unit_size = 0;
                     }
+
+                    // C17 6.7.2.1p12: a zero-width bitfield forces the *next*
+                    // member to the next boundary of its declared type's
+                    // storage unit. Flushing an open unit is not enough --
+                    // after a plain member there is no unit open, and the
+                    // `:0` would otherwise do nothing at all.
+                    //
+                    // The boundary is forced even in a packed struct, and the
+                    // struct's own alignment is left alone, both matching gcc:
+                    // `struct { char c; int :0; char d; }` is 5 bytes with
+                    // `d` at offset 4, packed or not.
+                    let unit = storage_size as usize;
+                    if unit > 1 {
+                        offset = offset.next_multiple_of(unit);
+                    }
+
                     member.offset = offset;
                     member.bit_offset = None;
                     member.storage_unit_size = None;

@@ -397,3 +397,81 @@ int main(void) {
         0
     );
 }
+
+/// A zero-width bitfield forces the next member to the next boundary of its
+/// declared type's storage unit (C17 6.7.2.1p12).
+///
+/// The layout code flushed an open bitfield storage unit but never aligned
+/// the offset, so after a plain member -- where no unit is open -- `int :0;`
+/// did nothing at all: `struct { char c; int :0; char d; }` was 2 bytes
+/// rather than 5, disagreeing with every gcc-compiled object.
+///
+/// Every expectation here came from gcc on this source.
+#[test]
+fn c89_zero_width_bitfield_forces_a_boundary() {
+    let code = r#"
+#include <stddef.h>
+
+struct A { char c; int :0; char d; };            /* after a plain member    */
+struct B { int a:3; int :0; int b:5; };          /* after a same-type field */
+struct C { char a:3; int :0; char b:5; };        /* different-type field    */
+struct D { int a:3; int :0; int :0; int b:5; };  /* two in a row            */
+struct E { char c; int :0; };                    /* at the end              */
+struct F { char c; short :0; char d; };          /* a narrower unit         */
+struct G { int :0; char c; };                    /* first, before anything  */
+struct H { int a:3; int :4; int :0; int b:5; };  /* beside an unnamed field */
+struct P { char c; int :0; char d; } __attribute__((packed));
+
+int main(void) {
+    if (sizeof(struct A) != 5) return 1;
+    if (offsetof(struct A, c) != 0) return 2;
+    if (offsetof(struct A, d) != 4) return 3;
+
+    if (sizeof(struct B) != 8) return 4;
+    if (sizeof(struct C) != 5) return 5;
+    if (sizeof(struct D) != 8) return 6;
+
+    /* The boundary still applies with no member after it. */
+    if (sizeof(struct E) != 4) return 7;
+
+    if (sizeof(struct F) != 3) return 8;
+    if (offsetof(struct F, d) != 2) return 9;
+
+    /* Nothing precedes it, so there is no boundary to cross. */
+    if (sizeof(struct G) != 1) return 10;
+    if (offsetof(struct G, c) != 0) return 11;
+
+    if (sizeof(struct H) != 8) return 12;
+
+    /* packed does not suppress the boundary, and neither raises the
+       struct's own alignment -- A is 5 bytes, not 8. */
+    if (sizeof(struct P) != 5) return 13;
+    if (offsetof(struct P, d) != 4) return 14;
+
+    /* The surrounding fields still read and write correctly. */
+    struct B b;
+    b.a = 5;
+    b.b = -7;
+    if (b.a != -3) return 15;
+    if (b.b != -7) return 16;
+
+    struct A a;
+    a.c = 'x';
+    a.d = 'y';
+    if (a.c != 'x') return 17;
+    if (a.d != 'y') return 18;
+
+    struct C c;
+    c.a = 1;
+    c.b = 2;
+    if (c.a != 1) return 19;
+    if (c.b != 2) return 20;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c89_zero_width_bitfield_forces_a_boundary", code, &[]),
+        0
+    );
+}

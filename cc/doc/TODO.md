@@ -62,7 +62,8 @@ does or claims.
 
 | Area | Divergence |
 |------|-----------|
-| `_FORTIFY_SOURCE` | Still checks nothing, but no longer because of `__builtin_object_size`, which now reports real sizes. c17 does not predefine `__OPTIMIZE__`, and glibc's `features.h` requires it before it will set `__USE_FORTIFY_LEVEL` above 0, so the fortified wrappers are never reached |
+| `_FORTIFY_SOURCE` | Still checks nothing. `__builtin_object_size` and the `__builtin___*_chk` declarations are both done; two layers remain. c17 does not predefine `__OPTIMIZE__`, without which glibc's `features.h` leaves `__USE_FORTIFY_LEVEL` at 0 and no wrapper is compiled — and defining it exposes the next layer, below |
+| `__asm__("name")` on a declaration | Parsed and ignored: c17 calls the declared name where gcc calls the asm label. A standalone wrong-symbol bug, and what glibc's `__REDIRECT` fortify wrappers need |
 | `_Complex` with static storage | Cannot be initialized at all; gcc accepts `1.0 + 2.0*I` and `CMPLX(...)` |
 | `isnan()` on a `long double` | 65535 rather than 1. The builtins now exist; glibc only uses them at `__GNUC_PREREQ (4,4)`, and claiming that also demands `__float128` (`bits/floatn.h` turns on `__HAVE_FLOAT128` at 4.3), which x86-64 c17 has no arithmetic for. Both answers conform — C99 7.12.3.4 requires only a nonzero value |
 

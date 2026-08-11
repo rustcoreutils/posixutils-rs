@@ -213,6 +213,13 @@ impl AttributeList {
             .any(|a| a.name == "noinline" || a.name == "__noinline__")
     }
 
+    /// Whether `__attribute__((always_inline))` is present.
+    pub fn has_always_inline(&self) -> bool {
+        self.attrs
+            .iter()
+            .any(|a| a.name == "always_inline" || a.name == "__always_inline__")
+    }
+
     /// Look up an attribute in both its plain and `__underscored__` spelling,
     /// returning its optional integer argument. The result distinguishes
     /// "absent" (`None`) from "present without a priority" (`Some(None)`).
@@ -242,6 +249,7 @@ impl AttributeList {
     pub fn function_attrs(&self) -> crate::parse::ast::FunctionAttrs {
         crate::parse::ast::FunctionAttrs {
             noinline: self.has_noinline(),
+            always_inline: self.has_always_inline(),
             constructor: self.constructor_priority(),
             destructor: self.destructor_priority(),
         }

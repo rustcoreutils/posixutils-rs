@@ -645,10 +645,10 @@ fn process_file(
 
     dump_ir(args, &module, "post-mapping");
 
-    // Optimize IR (if enabled)
-    if args.opt_level > 0 {
-        opt::optimize_module(&mut module, args.opt_level);
-    }
+    // Optimize IR. Called even at -O0, where the only pass that does anything
+    // is inlining of `__attribute__((always_inline))` functions, which gcc
+    // honours with optimization off.
+    opt::optimize_module(&mut module, args.opt_level);
 
     dump_ir(args, &module, "post-opt");
 

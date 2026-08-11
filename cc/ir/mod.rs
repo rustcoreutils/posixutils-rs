@@ -1498,6 +1498,9 @@ pub struct Function {
     /// `__attribute__((noinline))`: the inliner must leave this function
     /// alone, whatever its size says.
     pub is_noinline: bool,
+    /// `__attribute__((always_inline))`: inline at every call site regardless
+    /// of size, and at `-O0` too. `is_noinline` wins if both are present.
+    pub is_always_inline: bool,
     /// `__attribute__((constructor))`: emit a pointer to this function in
     /// `.init_array` so it runs before `main`. `Some(None)` is the attribute
     /// without a priority; `Some(Some(p))` carries one.
@@ -1543,6 +1546,7 @@ impl Default for Function {
             is_static: false,
             is_noreturn: false,
             is_noinline: false,
+            is_always_inline: false,
             constructor: None,
             destructor: None,
             is_inline: false,

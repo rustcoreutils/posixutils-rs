@@ -35,16 +35,13 @@ Attributes fall into three categories based on implementation depth:
 | `constructor` | Functions | Runs before `main`, via `.init_array` (`__DATA,__mod_init_func` on Mach-O). An optional priority orders it against the other constructors; ELF encodes it in the section name, Mach-O has no equivalent and ignores it |
 | `destructor` | Functions | Runs after `main` returns or on `exit`, via `.fini_array` / `__DATA,__mod_term_func`. Priorities as for `constructor` |
 | `noinline` | Functions | The inliner leaves the function alone, whatever its size |
+| `always_inline` | Functions | Inlined at every call site regardless of size, and at `-O0` too. `noinline` outranks it, as in gcc |
 
 ### Accepted but with no effect, and the program can tell
 
-These change behaviour under gcc, so ignoring them is a divergence rather than
-a harmless omission. Recorded here so the list below is not read as "all
-equally harmless".
-
-| Attribute | What gcc does | What c17 does |
-|-----------|---------------|---------------|
-| `always_inline` | Forces inlining | Left to the inliner's own heuristics |
+Empty: every attribute whose absence a program could observe is now
+implemented. The entries below are ignored, but ignoring them changes nothing
+a conforming program can detect.
 
 ### Parsed and accepted (no semantic effect)
 

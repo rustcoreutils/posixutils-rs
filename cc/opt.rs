@@ -67,17 +67,21 @@ fn is_const(func: &Function, id: PseudoId) -> bool {
 
 /// Optimize a module at the given optimization level.
 ///
-/// Level 0: No optimization
+/// Level 0: nothing but `__attribute__((always_inline))` inlining
 /// Level 1+: Run inlining, InstCombine, and DCE passes
 pub fn optimize_module(module: &mut Module, level: u32) {
-    if level == 0 {
-        return;
-    }
-
     // Phase 1: Function inlining (module-level pass)
     // This inlines small functions at their call sites and removes
     // dead static functions that were fully inlined.
+    //
+    // Runs even at -O0, where it admits only `__attribute__((always_inline))`
+    // functions -- gcc honours that attribute with optimization off. It is a
+    // no-op for a module that has none.
     inline::run(module, level);
+
+    if level == 0 {
+        return;
+    }
 
     // Phase 2: Per-function optimization (InstCombine + DCE)
     for func in &mut module.functions {

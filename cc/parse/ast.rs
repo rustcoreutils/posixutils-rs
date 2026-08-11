@@ -1031,6 +1031,9 @@ pub struct Parameter {
 pub struct FunctionAttrs {
     /// `__attribute__((noinline))` -- never inline this function.
     pub noinline: bool,
+    /// `__attribute__((always_inline))` -- inline this function at every call
+    /// site, whatever the size heuristics say, and even at `-O0`.
+    pub always_inline: bool,
     /// `__attribute__((constructor))` -- run before `main`. The outer option
     /// says whether the attribute is present at all; the inner one carries the
     /// optional priority, which orders this constructor against the others.
@@ -1049,6 +1052,7 @@ impl FunctionAttrs {
     /// rather than read from a single site.
     pub fn merge(&mut self, other: &FunctionAttrs) {
         self.noinline |= other.noinline;
+        self.always_inline |= other.always_inline;
         if let Some(prio) = other.constructor {
             self.constructor = Some(prio);
         }

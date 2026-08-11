@@ -85,6 +85,8 @@ pub struct InlineCandidate {
     pub has_inline_hint: bool,
     /// Whether function is marked `__attribute__((noinline))`
     pub is_noinline: bool,
+    /// Whether function is marked `__attribute__((always_inline))`
+    pub is_always_inline: bool,
     /// Whether function is recursive (calls itself)
     pub is_recursive: bool,
     /// Whether function uses va_args (should not inline)
@@ -131,6 +133,7 @@ pub fn analyze_all_functions(module: &Module) -> HashMap<String, InlineCandidate
 fn analyze_function(func: &Function, call_counts: &HashMap<String, usize>) -> InlineCandidate {
     let mut candidate = InlineCandidate {
         is_noinline: func.is_noinline,
+        is_always_inline: func.is_always_inline,
         has_inline_hint: func.is_inline,
         returns_complex: func.returns_complex,
         ..Default::default()
@@ -203,8 +206,24 @@ fn should_inline(
         return false;
     }
 
-    // At -O0, don't inline
-    if opt_level == 0 {
+    // `__attribute__((always_inline))` is the mirror of `noinline`: a
+    // directive, not a hint. gcc honours it at `-O0` too, so it is checked
+    // before the opt-level bail. The disqualifiers above still win -- gcc
+    // rejects the program outright in those cases, where c17 keeps the call.
+    //
+    // It overrides the *desirability* heuristics further down (the size
+    // thresholds and the growth limit), but deliberately not the two
+    // stack-safety caps below it. Those are c17-specific: without register
+    // promotion every inlined copy costs roughly eight bytes of stack, so
+    // obeying the attribute into a deep recursive caller overflows the stack
+    // at a depth the program's own recursion guard believes is safe. CPython
+    // documents the same hazard for gcc in `Include/pyport.h` -- forcing
+    // inlining takes its per-call stack from 6 KB to 15 KB -- and its
+    // `test_isinstance` segfaults when this check is skipped.
+    let forced = candidate.is_always_inline;
+
+    // At -O0, inline nothing but the forced functions.
+    if opt_level == 0 && !forced {
         return false;
     }
 
@@ -225,6 +244,20 @@ fn should_inline(
         if estimated_stack > RECURSIVE_CALLER_MAX_STACK {
             return false;
         }
+    }
+
+    // Past the safety caps, a forced callee skips every desirability test --
+    // but the recursive-caller cap above measures the caller as it stands,
+    // which is still small the first time a large callee is spliced into it.
+    // For a forced inline that is the whole risk, so re-check it against the
+    // size the caller is about to become.
+    if forced {
+        if caller_is_recursive
+            && (caller_size + candidate.estimated_size) * 8 > RECURSIVE_CALLER_MAX_STACK
+        {
+            return false;
+        }
+        return true;
     }
 
     // Check if the callee passes size thresholds for inlining desirability
@@ -1128,8 +1161,13 @@ fn reorder_blocks_topologically(func: &mut Function) {
 // ============================================================================
 
 /// Run the inlining pass on a module
+///
+/// Runs at `-O0` too, where `should_inline` admits nothing but
+/// `__attribute__((always_inline))` functions. gcc honours that attribute with
+/// optimization off, and code that uses it -- inline assembly wrappers,
+/// intrinsics headers -- is usually relying on the body being spliced in.
 pub fn run(module: &mut Module, opt_level: u32) -> bool {
-    if opt_level == 0 {
+    if opt_level == 0 && !module.functions.iter().any(|f| f.is_always_inline) {
         return false;
     }
 
@@ -1229,8 +1267,13 @@ pub fn run(module: &mut Module, opt_level: u32) -> bool {
         }
     }
 
-    // Remove dead static functions that were fully inlined
-    if any_changed {
+    // Remove dead static functions that were fully inlined.
+    //
+    // Only above -O0: dropping an unreferenced static function is an
+    // optimization in its own right, and at -O0 gcc still emits one. Running
+    // it here just because an `always_inline` callee brought us into this pass
+    // would delete unrelated functions the user asked to keep.
+    if any_changed && opt_level > 0 {
         remove_dead_functions(module);
     }
 
@@ -1393,6 +1436,7 @@ mod tests {
             returns_complex: false,
             call_count: 1,
             is_noinline: false,
+            is_always_inline: false,
         };
 
         // Small function should always inline at -O1
@@ -1410,6 +1454,7 @@ mod tests {
             returns_complex: false,
             call_count: 1,
             is_noinline: false,
+            is_always_inline: false,
         };
 
         // Varargs functions should never inline
@@ -1427,6 +1472,7 @@ mod tests {
             returns_complex: false,
             call_count: 1,
             is_noinline: false,
+            is_always_inline: false,
         };
 
         // Recursive functions should not inline
@@ -1444,6 +1490,7 @@ mod tests {
             returns_complex: false,
             call_count: 1,
             is_noinline: false,
+            is_always_inline: false,
         };
 
         // Should not inline at -O0
@@ -1461,6 +1508,7 @@ mod tests {
             returns_complex: false,
             call_count: 1,
             is_noinline: false,
+            is_always_inline: false,
         };
 
         // 30 instructions with inline hint should inline

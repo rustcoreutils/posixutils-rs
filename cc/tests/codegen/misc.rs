@@ -5866,3 +5866,104 @@ int main(void)
 "#;
     assert_eq!(compile_and_run("ctor_dtor_run", src, &[]), 0);
 }
+
+/// `always_inline` overrides the size heuristics, and applies at `-O0`.
+///
+/// Both halves are needed to match gcc. A body far over the inline threshold
+/// is still spliced in at `-O2`, and the attribute takes effect at `-O0`,
+/// where the inliner is otherwise switched off entirely -- code that reaches
+/// for the attribute (inline-asm wrappers, intrinsics headers) is relying on
+/// the body actually being there.
+#[test]
+fn codegen_always_inline_overrides_heuristics_and_o0() {
+    // Well past any size threshold: a plain `inline` hint would be refused.
+    let big: String = (1..120)
+        .map(|i| {
+            format!(
+                "    s += x*{i}; s ^= s << ({i}%7); s -= x/({}); s += x%({});\n",
+                i + 1,
+                i + 2
+            )
+        })
+        .collect();
+    let src = format!(
+        "static __attribute__((always_inline)) inline int huge(int x)\n\
+         {{\n    int s = 0;\n{big}    return s;\n}}\n\
+         int caller(int x) {{ return huge(x); }}\n"
+    );
+
+    for opt in ["-O0", "-O2"] {
+        let asm = asm_for_with("always_inline_big", X86_64_LINUX, &src, &[opt]);
+        assert!(
+            !asm.lines().any(|l| l.trim().starts_with("call huge")),
+            "{opt}: always_inline function was left as a call:\n{asm}"
+        );
+    }
+}
+
+/// The attribute is honoured in either spelling and from a prototype, and
+/// `noinline` beats it when both are present -- which is what gcc does, with a
+/// `-Wattributes` warning.
+#[test]
+fn codegen_always_inline_spellings_and_conflict() {
+    let inlined = [
+        "static __attribute__((always_inline)) inline int f(int x) { return x+1; }",
+        "static __attribute__((__always_inline__)) inline int f(int x) { return x+1; }",
+        "static inline int f(int x) __attribute__((always_inline));\n\
+         static inline int f(int x) { return x+1; }",
+    ];
+    for decl in inlined {
+        let src = format!("{decl}\nint g(int x){{return f(x);}}\n");
+        let asm = asm_for_with("always_inline_spelling", X86_64_LINUX, &src, &["-O0"]);
+        assert!(
+            !asm.lines().any(|l| l.trim().starts_with("call f")),
+            "call survived at -O0 for:\n{decl}\n{asm}"
+        );
+    }
+
+    // noinline wins: the call must survive even at -O2.
+    let src = "static __attribute__((noinline)) __attribute__((always_inline)) inline\n\
+               int f(int x) { return x+1; }\nint g(int x){return f(x);}\n";
+    let asm = asm_for_with("always_inline_conflict", X86_64_LINUX, src, &["-O2"]);
+    assert!(
+        asm.lines().any(|l| l.trim().starts_with("call f")),
+        "noinline must outrank always_inline:\n{asm}"
+    );
+}
+
+/// `always_inline` overrides the *desirability* heuristics, not the
+/// stack-safety guards.
+///
+/// The distinction is c17-specific and load-bearing. gcc can honour the
+/// attribute unconditionally because its frames are compact; c17 has no
+/// register promotion, so every inlined copy adds roughly eight bytes of
+/// stack, which is why `should_inline` caps growth into a recursive caller at
+/// `RECURSIVE_CALLER_MAX_STACK`. Inlining past that cap does not produce wrong
+/// code -- it exhausts the stack at a recursion depth the program's own guard
+/// thought was safe.
+///
+/// Found by the CPython gate: `test_isinstance` segfaulted in
+/// `test_infinitely_many_bases`, which recurses until it expects a
+/// `RecursionError`, once `always_inline` was allowed to bypass this check.
+/// CPython documents the same hazard in `Include/pyport.h`, noting that
+/// forcing inlining takes its per-call stack from 6 KB to 15 KB.
+#[test]
+fn codegen_always_inline_yields_to_the_recursive_stack_guard() {
+    // Big enough that caller_size * 8 clears RECURSIVE_CALLER_MAX_STACK.
+    let body: String = (1..200)
+        .map(|i| format!("    s += x*{i}; s ^= s << ({i}%7); s -= x/({});\n", i + 1))
+        .collect();
+    let src = format!(
+        "static __attribute__((always_inline)) inline int helper(int x)\n\
+         {{\n    int s = 0;\n{body}    return s;\n}}\n\
+         int rec(int n) {{ if (n <= 0) return 0; return helper(n) + rec(n-1); }}\n"
+    );
+
+    let asm = asm_for_with("always_inline_recursive", X86_64_LINUX, &src, &["-O2"]);
+    assert!(
+        asm.lines().any(|l| l.trim().starts_with("call helper")),
+        "always_inline must not inline into a recursive caller past the \
+         stack cap; the frame growth overflows the stack at a depth the \
+         program's own recursion guard considers safe:\n{asm}"
+    );
+}

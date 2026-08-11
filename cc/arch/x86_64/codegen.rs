@@ -5049,6 +5049,9 @@ impl CodeGenerator for X86_64CodeGen {
                 .push_directive(Directive::local_label(".Ltext_end"));
         }
 
+        // Emit the constructor / destructor pointer arrays
+        self.base.emit_init_arrays(&module.functions);
+
         // Emit long double constants collected during codegen
         if !self.ld_constants.is_empty() {
             self.emit_ld_constants();

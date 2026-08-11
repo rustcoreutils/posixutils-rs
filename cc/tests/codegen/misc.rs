@@ -5780,13 +5780,9 @@ int caller(int x) { return small(x) + small_ok(x); }
     }
 }
 
-/// The attribute is honoured in either spelling and wherever it sits on the
-/// *definition* -- before or after the declaration specifiers.
-///
-/// Not covered, and still a divergence from gcc: the attribute written only
-/// on an earlier prototype (`static int f(int) __attribute__((noinline));`)
-/// does not carry to the definition, because attributes are accumulated per
-/// declaration and nothing records them against the function symbol.
+/// The attribute is honoured in either spelling and wherever it sits -- before
+/// or after the declaration specifiers, on the definition, or on nothing but
+/// an earlier prototype, which is how gcc treats it.
 #[test]
 fn codegen_noinline_spellings_and_placement() {
     for src in [
@@ -5794,6 +5790,7 @@ fn codegen_noinline_spellings_and_placement() {
         "__attribute__((noinline)) static int f(int x) { return x + 1; }\nint g(int x){return f(x);}",
         "static int f(int x) __attribute__((noinline)) { return x + 1; }\nint g(int x){return f(x);}",
         "static __attribute__((__noinline__)) int f(int x) { return x + 1; }\nint g(int x){return f(x);}",
+        "static int f(int x) __attribute__((noinline));\nstatic int f(int x) { return x + 1; }\nint g(int x){return f(x);}",
     ] {
         let asm = asm_for_with("noinline_spelling", X86_64_LINUX, src, &["-O2"]);
         assert!(
@@ -5801,4 +5798,71 @@ fn codegen_noinline_spellings_and_placement() {
             "no call survived for:\n{src}\n{asm}"
         );
     }
+}
+
+/// `constructor` and `destructor` run, in the order gcc runs them.
+///
+/// Ordering is the whole point of the priority argument, so the test records a
+/// trace rather than a "did it run" flag. The expectations were taken from gcc
+/// on the same source: prioritized constructors run first in ascending
+/// priority, then the unprioritized ones in declaration order; destructors run
+/// the other way, unprioritized first.
+///
+/// Every function here is `static` and none is ever called, so this also
+/// covers them surviving dead-function elimination -- `compile_and_run`
+/// includes an optimized configuration, where an unreferenced static function
+/// is otherwise dropped.
+#[test]
+fn codegen_constructor_and_destructor_run() {
+    let src = r#"
+extern void _exit(int);
+
+static int order[8];
+static int n;
+static void note(int v) { if (n < 8) order[n++] = v; }
+
+__attribute__((constructor))      static void c_plain_a(void) { note(1); }
+__attribute__((constructor))      static void c_plain_b(void) { note(2); }
+__attribute__((constructor(101))) static void c_p101(void)    { note(101); }
+__attribute__((constructor(102))) static void c_p102(void)    { note(102); }
+__attribute__((__constructor__))  static void c_us(void)      { note(3); }
+static void c_proto(void) __attribute__((constructor));
+static void c_proto(void) { note(4); }
+
+__attribute__((destructor))      static void d_plain(void) { note(50); }
+__attribute__((destructor(102))) static void d_p102(void)  { note(51); }
+
+static int status = 9;
+
+static int check_ctors(void)
+{
+    if (n != 6) return 1;
+    if (order[0] != 101) return 2;
+    if (order[1] != 102) return 3;
+    if (order[2] != 1) return 4;
+    if (order[3] != 2) return 5;
+    if (order[4] != 3) return 6;
+    if (order[5] != 4) return 7;
+    return 0;
+}
+
+/* Plain destructors run first, so this prioritized one goes last and gets to
+   check what the others recorded. */
+__attribute__((destructor(101))) static void d_last(void)
+{
+    if (status != 0) _exit(status);
+    if (n != 8) _exit(20);
+    if (order[6] != 50) _exit(21);
+    if (order[7] != 51) _exit(22);
+    _exit(0);
+}
+
+int main(void)
+{
+    status = check_ctors();
+    /* 9 says the destructors never ran; d_last replaces it with the verdict */
+    return status == 0 ? 9 : status;
+}
+"#;
+    assert_eq!(compile_and_run("ctor_dtor_run", src, &[]), 0);
 }

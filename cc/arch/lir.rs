@@ -547,6 +547,19 @@ pub enum Directive {
     /// Switch to thread-local BSS section (.section .tbss or __DATA,__thread_bss)
     Tbss,
 
+    /// Switch to the section holding pointers to `constructor` functions
+    /// (`.init_array` on ELF, `__DATA,__mod_init_func` on Mach-O).
+    ///
+    /// A priority becomes an ELF section-name suffix of five zero-padded
+    /// digits; the linker sorts those ahead of the plain `.init_array`, which
+    /// is what makes a prioritized constructor run first. Mach-O has no such
+    /// ordering, so the priority is dropped there.
+    InitArray(Option<u16>),
+
+    /// The `destructor` counterpart of [`Directive::InitArray`]
+    /// (`.fini_array` on ELF, `__DATA,__mod_term_func` on Mach-O).
+    FiniArray(Option<u16>),
+
     // ========================================================================
     // Symbol Visibility and Attributes
     // ========================================================================
@@ -662,6 +675,37 @@ pub enum Directive {
 
     /// Raw assembly string (emitted verbatim) - used for inline asm
     Raw(String),
+}
+
+/// Emit the section directive for an `.init_array` / `.fini_array` entry.
+///
+/// `elf` names the ELF section and `macho` the Mach-O one, whose section type
+/// is spelled `<name minus its leading underscores>s`. `priority`, when
+/// present, becomes an ELF section-name suffix; GCC pads it to five digits so
+/// that plain string sorting by the linker matches numeric order.
+fn emit_init_array_section(
+    out: &mut String,
+    target: &Target,
+    elf: &str,
+    macho: &str,
+    priority: Option<u16>,
+) {
+    match target.os {
+        Os::MacOS => {
+            // Mach-O keeps no priority in the section name; the loader runs
+            // the pointers in the order they appear.
+            let kind = macho.trim_start_matches('_');
+            let _ = writeln!(out, ".section __DATA,{macho},{kind}s");
+        }
+        Os::Linux | Os::FreeBSD => match priority {
+            Some(p) => {
+                let _ = writeln!(out, ".section {elf}.{p:05},\"aw\"");
+            }
+            None => {
+                let _ = writeln!(out, ".section {elf},\"aw\"");
+            }
+        },
+    }
 }
 
 impl Directive {
@@ -817,6 +861,12 @@ impl EmitAsm for Directive {
                     let _ = writeln!(out, ".section .tbss,\"awT\",@nobits");
                 }
             },
+            Directive::InitArray(priority) => {
+                emit_init_array_section(out, target, ".init_array", "__mod_init_func", *priority)
+            }
+            Directive::FiniArray(priority) => {
+                emit_init_array_section(out, target, ".fini_array", "__mod_term_func", *priority)
+            }
 
             // Symbol visibility
             Directive::Global(sym) => {

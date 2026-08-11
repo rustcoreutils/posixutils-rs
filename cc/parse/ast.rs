@@ -1031,6 +1031,13 @@ pub struct Parameter {
 pub struct FunctionAttrs {
     /// `__attribute__((noinline))` -- never inline this function.
     pub noinline: bool,
+    /// `__attribute__((constructor))` -- run before `main`. The outer option
+    /// says whether the attribute is present at all; the inner one carries the
+    /// optional priority, which orders this constructor against the others.
+    pub constructor: Option<Option<u16>>,
+    /// `__attribute__((destructor))` -- run after `main` returns, or on
+    /// `exit`. Encoded like [`FunctionAttrs::constructor`].
+    pub destructor: Option<Option<u16>>,
 }
 
 impl FunctionAttrs {
@@ -1042,6 +1049,12 @@ impl FunctionAttrs {
     /// rather than read from a single site.
     pub fn merge(&mut self, other: &FunctionAttrs) {
         self.noinline |= other.noinline;
+        if let Some(prio) = other.constructor {
+            self.constructor = Some(prio);
+        }
+        if let Some(prio) = other.destructor {
+            self.destructor = Some(prio);
+        }
     }
 }
 

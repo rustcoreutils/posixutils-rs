@@ -1498,6 +1498,13 @@ pub struct Function {
     /// `__attribute__((noinline))`: the inliner must leave this function
     /// alone, whatever its size says.
     pub is_noinline: bool,
+    /// `__attribute__((constructor))`: emit a pointer to this function in
+    /// `.init_array` so it runs before `main`. `Some(None)` is the attribute
+    /// without a priority; `Some(Some(p))` carries one.
+    pub constructor: Option<Option<u16>>,
+    /// `__attribute__((destructor))`: the `.fini_array` counterpart of
+    /// [`Function::constructor`], encoded the same way.
+    pub destructor: Option<Option<u16>>,
     /// Parameters whose data is supplied implicitly by the backend prologue
     /// (e.g. complex / two-SSE struct params).  When inlining the function,
     /// the inliner must generate an explicit struct copy from the caller's
@@ -1536,6 +1543,8 @@ impl Default for Function {
             is_static: false,
             is_noreturn: false,
             is_noinline: false,
+            constructor: None,
+            destructor: None,
             is_inline: false,
             implicit_param_copies: Vec::new(),
             returns_complex: false,

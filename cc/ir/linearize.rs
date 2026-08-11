@@ -781,6 +781,8 @@ impl<'a> Linearizer<'a> {
         ir_func.is_noreturn = is_noreturn;
         ir_func.is_inline = is_inline;
         ir_func.is_noinline = func.attrs.noinline;
+        ir_func.constructor = func.attrs.constructor;
+        ir_func.destructor = func.attrs.destructor;
 
         let ret_kind = self.types.kind(func.return_type);
         // Check if function returns a large struct

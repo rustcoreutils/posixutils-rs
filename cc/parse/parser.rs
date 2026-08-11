@@ -23,6 +23,7 @@ use crate::types::{
     CompositeType, EnumConstant, StructMember, Type, TypeId, TypeKind, TypeModifiers, TypeTable,
 };
 use gettextrs::gettext;
+use std::collections::BTreeMap;
 use std::fmt;
 
 const DEFAULT_MEMBER_CAPACITY: usize = 16;
@@ -212,10 +213,37 @@ impl AttributeList {
             .any(|a| a.name == "noinline" || a.name == "__noinline__")
     }
 
+    /// Look up an attribute in both its plain and `__underscored__` spelling,
+    /// returning its optional integer argument. The result distinguishes
+    /// "absent" (`None`) from "present without a priority" (`Some(None)`).
+    fn init_priority(&self, name: &str) -> Option<Option<u16>> {
+        let underscored = format!("__{name}__");
+        let attr = self
+            .attrs
+            .iter()
+            .find(|a| a.name == name || a.name == underscored)?;
+        match attr.args.first() {
+            Some(AttributeArg::Int(n)) => Some(Some(*n as u16)),
+            _ => Some(None),
+        }
+    }
+
+    /// The `constructor` attribute and its optional priority.
+    pub fn constructor_priority(&self) -> Option<Option<u16>> {
+        self.init_priority("constructor")
+    }
+
+    /// The `destructor` attribute and its optional priority.
+    pub fn destructor_priority(&self) -> Option<Option<u16>> {
+        self.init_priority("destructor")
+    }
+
     /// Collect the attributes that affect how a function is emitted.
     pub fn function_attrs(&self) -> crate::parse::ast::FunctionAttrs {
         crate::parse::ast::FunctionAttrs {
             noinline: self.has_noinline(),
+            constructor: self.constructor_priority(),
+            destructor: self.destructor_priority(),
         }
     }
 
@@ -282,6 +310,16 @@ pub struct Parser<'a> {
     /// specifiers, between the type and the declarator, or after the
     /// parameter list. Cleared at the start of each external declaration.
     pending_fn_attrs: crate::parse::ast::FunctionAttrs,
+    /// Every function attribute seen for a given name anywhere in the
+    /// translation unit.
+    ///
+    /// GCC applies `constructor` / `destructor` / `noinline` to the function
+    /// however it was declared, so writing the attribute on a prototype and
+    /// leaving the definition bare -- `static void f(void)
+    /// __attribute__((constructor));` followed by `static void f(void) {}` --
+    /// still makes `f` a constructor. Reading the definition's own attributes
+    /// alone would silently drop it.
+    declared_fn_attrs: BTreeMap<StringId, crate::parse::ast::FunctionAttrs>,
     /// Set by `parse_type_specifier`: whether the specifier list actually
     /// named a type, rather than defaulting to `int`.
     ///
@@ -310,6 +348,7 @@ impl<'a> Parser<'a> {
             pos: 0,
             pending_alignas: None,
             pending_fn_attrs: Default::default(),
+            declared_fn_attrs: BTreeMap::new(),
             saw_explicit_type: true,
         }
     }
@@ -3267,6 +3306,19 @@ impl Parser<'_> {
         Ok(())
     }
 
+    /// Fold the attributes pending on this declaration into what `name` has
+    /// collected so far, and return the total.
+    ///
+    /// Called for declarations as well as definitions, so that an attribute on
+    /// a prototype reaches the definition parsed later; see
+    /// [`Parser::declared_fn_attrs`].
+    fn accumulate_fn_attrs(&mut self, name: StringId) -> crate::parse::ast::FunctionAttrs {
+        let pending = self.pending_fn_attrs.clone();
+        let seen = self.declared_fn_attrs.entry(name).or_default();
+        seen.merge(&pending);
+        seen.clone()
+    }
+
     /// Parse an external declaration (function definition or declaration)
     fn parse_external_decl(&mut self) -> ParseResult<ExternalDecl> {
         // Clear pending alignment from previous declaration
@@ -3348,6 +3400,11 @@ impl Parser<'_> {
                 let calling_conv = attrs.calling_conv().unwrap_or_default();
                 let fn_attrs = attrs.function_attrs();
                 self.pending_fn_attrs.merge(&fn_attrs);
+                let all_fn_attrs = if self.types.kind(typ) == TypeKind::Function {
+                    self.accumulate_fn_attrs(name)
+                } else {
+                    Default::default()
+                };
 
                 // Check if this is a function definition (function type followed by '{')
                 // This handles cases like: int (*get_op(int which))(int, int) { ... }
@@ -3396,7 +3453,7 @@ impl Parser<'_> {
                         is_static,
                         is_inline,
                         calling_conv,
-                        attrs: self.pending_fn_attrs.clone(),
+                        attrs: all_fn_attrs,
                     }));
                 }
 
@@ -3524,6 +3581,11 @@ impl Parser<'_> {
                 let calling_conv = attrs.calling_conv().unwrap_or_default();
                 let fn_attrs = attrs.function_attrs();
                 self.pending_fn_attrs.merge(&fn_attrs);
+                let all_fn_attrs = if self.types.kind(full_typ) == TypeKind::Function {
+                    self.accumulate_fn_attrs(name)
+                } else {
+                    Default::default()
+                };
 
                 // Check if this is a function definition (function type followed by '{')
                 // This handles cases like: char *(*get_op(int which))(int, int) { ... }
@@ -3571,7 +3633,7 @@ impl Parser<'_> {
                         is_static,
                         is_inline,
                         calling_conv,
-                        attrs: self.pending_fn_attrs.clone(),
+                        attrs: all_fn_attrs,
                     }));
                 }
 
@@ -3644,6 +3706,7 @@ impl Parser<'_> {
             let attrs = self.parse_attributes();
             let fn_attrs = attrs.function_attrs();
             self.pending_fn_attrs.merge(&fn_attrs);
+            let all_fn_attrs = self.accumulate_fn_attrs(name);
             // noreturn can come from __attribute__((noreturn)) or _Noreturn keyword in base type
             let typ_from_table = self.types.get(typ_id);
             let is_noreturn =
@@ -3740,7 +3803,7 @@ impl Parser<'_> {
                     is_static,
                     is_inline,
                     calling_conv,
-                    attrs: self.pending_fn_attrs.clone(),
+                    attrs: all_fn_attrs,
                 }));
             } else {
                 // Function declaration

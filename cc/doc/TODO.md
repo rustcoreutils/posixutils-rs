@@ -69,8 +69,6 @@ does or claims.
 
 | Area | Divergence |
 |------|-----------|
-| `__attribute__((constructor))` / `((destructor))` | Accepted, never run |
-| `__attribute__((noinline))` | Accepted, may be inlined anyway at `-O2` |
 | `_FORTIFY_SOURCE` | Compiles, but `__builtin_object_size` always answers "unknown", so nothing is actually checked |
 | `_Complex` with static storage | Cannot be initialized at all; gcc accepts `1.0 + 2.0*I` and `CMPLX(...)` |
 | `isnan()` on a `long double` | 65535 rather than 1, because `__builtin_isnan` is absent and glibc falls back to `__isnanl` |

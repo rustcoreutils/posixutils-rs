@@ -465,6 +465,42 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         }
     }
 
+    /// Emit the `.init_array` / `.fini_array` entries for every function
+    /// carrying a `constructor` or `destructor` attribute.
+    ///
+    /// Each entry is a pointer-sized slot holding the function's address, in
+    /// its own section directive: the linker concatenates them, and the C
+    /// runtime walks the resulting array. A function may carry both
+    /// attributes, so it can contribute an entry to each array rather than
+    /// choosing between them.
+    pub fn emit_init_arrays(&mut self, functions: &[crate::ir::Function]) {
+        // Pointer alignment, as a power of two; both supported targets are
+        // 64-bit.
+        const PTR_ALIGN_LOG2: u32 = 3;
+
+        let mut emitted_any = false;
+        for func in functions {
+            for section in [
+                func.constructor.map(Directive::InitArray),
+                func.destructor.map(Directive::FiniArray),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                self.push_directive(section);
+                self.push_directive(Directive::Align(PTR_ALIGN_LOG2));
+                self.push_directive(Directive::QuadSym(Symbol::global(func.name.clone())));
+                emitted_any = true;
+            }
+        }
+
+        // Leave the assembler back in .text, as every other section-switching
+        // emitter here does.
+        if emitted_any {
+            self.push_directive(Directive::Text);
+        }
+    }
+
     /// Emit string literals to the rodata section
     pub fn emit_strings(&mut self, strings: &[(String, String)]) {
         if strings.is_empty() {

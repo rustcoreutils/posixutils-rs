@@ -4176,6 +4176,9 @@ impl CodeGenerator for Aarch64CodeGen {
                 .push_directive(Directive::local_label(".Ltext_end"));
         }
 
+        // Emit the constructor / destructor pointer arrays
+        self.base.emit_init_arrays(&module.functions);
+
         // Generate DWARF debug sections if debug mode is enabled
         if module.debug {
             let producer = format!("c17 {}", env!("CARGO_PKG_VERSION"));

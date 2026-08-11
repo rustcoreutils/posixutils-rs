@@ -1313,12 +1313,17 @@ fn remove_dead_functions(module: &mut Module) {
         collect_func_refs_from_initializer(&global.init, &func_names, &mut address_taken);
     }
 
-    // Remove static functions with no callers and no address taken (except main)
+    // Remove static functions with no callers and no address taken (except
+    // main). A constructor or destructor is called by neither: its only
+    // reference is the `.init_array` / `.fini_array` entry the backend emits,
+    // which is created after this pass runs.
     module.functions.retain(|f| {
         f.name == "main"
             || !f.is_static
             || call_counts.get(&f.name).copied().unwrap_or(0) > 0
             || address_taken.contains(&f.name)
+            || f.constructor.is_some()
+            || f.destructor.is_some()
     });
 }
 

@@ -32,6 +32,9 @@ Attributes fall into three categories based on implementation depth:
 | `aligned` | Types, variables | Raises alignment; `.align` on a variable, layout and `_Alignof` on a type. Verified to match gcc |
 | `sysv_abi` | Functions | Forces System V AMD64 calling convention |
 | `ms_abi` | Functions | Forces Win64 calling convention |
+| `constructor` | Functions | Runs before `main`, via `.init_array` (`__DATA,__mod_init_func` on Mach-O). An optional priority orders it against the other constructors; ELF encodes it in the section name, Mach-O has no equivalent and ignores it |
+| `destructor` | Functions | Runs after `main` returns or on `exit`, via `.fini_array` / `__DATA,__mod_term_func`. Priorities as for `constructor` |
+| `noinline` | Functions | The inliner leaves the function alone, whatever its size |
 
 ### Accepted but with no effect, and the program can tell
 
@@ -41,9 +44,6 @@ equally harmless".
 
 | Attribute | What gcc does | What c17 does |
 |-----------|---------------|---------------|
-| `constructor` | Runs the function before `main` | Never runs it |
-| `destructor` | Runs the function after `main` | Never runs it |
-| `noinline` | Keeps the call | May inline anyway at `-O2` |
 | `always_inline` | Forces inlining | Left to the inliner's own heuristics |
 
 ### Parsed and accepted (no semantic effect)

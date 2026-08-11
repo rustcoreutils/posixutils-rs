@@ -636,3 +636,67 @@ fn codegen_aarch64_va_list_argument_matches_the_target_spelling() {
         "AAPCS64 passes the 32-byte va_list record by reference:\n{l}"
     );
 }
+
+/// The `.init_array` / `.fini_array` entries take each object format's shape.
+///
+/// The behavioral test in `codegen::misc` can only exercise the host, and the
+/// two formats disagree on more than spelling: ELF encodes the priority in the
+/// section name, where Mach-O has no ordering mechanism at all and drops it.
+#[test]
+fn cross_abi_init_array_sections() {
+    let src = "
+        __attribute__((constructor))      static void c1(void) {}
+        __attribute__((constructor(101))) static void c2(void) {}
+        __attribute__((destructor))       static void d1(void) {}
+        __attribute__((destructor(102)))  static void d2(void) {}
+        int main(void) { return 0; }
+    ";
+
+    for triple in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+        let asm = asm_for("init_array_elf", triple, src);
+        // GCC pads the priority to five digits so that the linker's plain
+        // string sort of section names matches numeric order.
+        for expected in [
+            ".section .init_array,\"aw\"",
+            ".section .init_array.00101,\"aw\"",
+            ".section .fini_array,\"aw\"",
+            ".section .fini_array.00102,\"aw\"",
+        ] {
+            assert!(
+                asm.contains(expected),
+                "{triple}: missing `{expected}`:\n{asm}"
+            );
+        }
+        for (sym, section) in [("c1", ".init_array"), ("d1", ".fini_array")] {
+            let after = asm.split(&format!("{section},\"aw\"\n")).nth(1).unwrap();
+            assert!(
+                after
+                    .lines()
+                    .take(3)
+                    .any(|l| l.trim() == format!(".quad {sym}")),
+                "{triple}: {section} entry must point at {sym}:\n{asm}"
+            );
+        }
+    }
+
+    for triple in ["x86_64-apple-darwin", "aarch64-apple-darwin"] {
+        let asm = asm_for("init_array_macho", triple, src);
+        for expected in [
+            ".section __DATA,__mod_init_func,mod_init_funcs",
+            ".section __DATA,__mod_term_func,mod_term_funcs",
+        ] {
+            assert!(
+                asm.contains(expected),
+                "{triple}: missing `{expected}`:\n{asm}"
+            );
+        }
+        assert!(
+            !asm.contains("00101") && !asm.contains("00102"),
+            "{triple}: Mach-O has no priority-ordered section:\n{asm}"
+        );
+        assert!(
+            asm.contains(".quad _c1") && asm.contains(".quad _d1"),
+            "{triple}: entries must name the underscore-prefixed symbols:\n{asm}"
+        );
+    }
+}

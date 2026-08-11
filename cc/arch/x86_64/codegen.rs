@@ -69,7 +69,7 @@ pub struct X86_64CodeGen {
     /// BTreeMap so the .rodata emission order in `emit_ld_constants`
     /// is deterministic (HashMap iteration would vary the layout
     /// across runs, breaking reproducible builds).
-    pub(super) ld_constants: std::collections::BTreeMap<u64, [u8; 16]>,
+    pub(super) ld_constants: std::collections::BTreeMap<u128, [u8; 16]>,
     /// Double constants to emit (label_bits -> f64 value).
     /// BTreeMap for the same reason as `ld_constants` — emission
     /// order in `emit_double_constants` must be reproducible.
@@ -1429,7 +1429,7 @@ impl X86_64CodeGen {
                 });
             }
             Loc::FImm(v, _) => {
-                let target = if *v != 0.0 {
+                let target = if !v.is_zero() {
                     insn.bb_true
                 } else {
                     insn.bb_false
@@ -2086,7 +2086,7 @@ impl X86_64CodeGen {
                 // Convert the float value to its bit representation and load as integer
                 if fp_size == 16 {
                     // Float16: convert to 16-bit representation
-                    let bits = f64_to_f16_bits(v);
+                    let bits = f64_to_f16_bits(v.to_f64());
                     self.push_lir(X86Inst::Mov {
                         size: OperandSize::B32,
                         src: GpOperand::Imm(bits as i64),
@@ -2094,7 +2094,7 @@ impl X86_64CodeGen {
                     });
                 } else if fp_size == 32 {
                     // float: convert to 32-bit representation
-                    let bits = (v as f32).to_bits();
+                    let bits = (v.to_f64() as f32).to_bits();
                     self.push_lir(X86Inst::Mov {
                         size: OperandSize::B32,
                         src: GpOperand::Imm(bits as i64),
@@ -2102,7 +2102,7 @@ impl X86_64CodeGen {
                     });
                 } else {
                     // double: convert to 64-bit representation
-                    let bits = v.to_bits();
+                    let bits = v.to_f64().to_bits();
                     self.push_lir(X86Inst::MovAbs {
                         imm: bits as i64,
                         dst,
@@ -4923,9 +4923,9 @@ impl X86_64CodeGen {
             }
             Loc::FImm(v, bits) => {
                 let pattern: i64 = if bits <= 32 {
-                    (v as f32).to_bits() as i64
+                    (v.to_f64() as f32).to_bits() as i64
                 } else {
-                    v.to_bits() as i64
+                    v.to_f64().to_bits() as i64
                 };
                 self.push_lir(X86Inst::Mov {
                     size: op_size,

@@ -11,6 +11,7 @@
 use super::{CallAbiInfo, Instruction, Opcode, Pseudo, PseudoId};
 use crate::abi::get_abi_for_conv;
 use crate::diag::{error, Position};
+use crate::float::FloatVal;
 use crate::parse::ast::{AssignOp, BinaryOp, Expr, ExprKind, UnaryOp};
 use crate::types::{MemberInfo, TypeId, TypeKind};
 
@@ -31,7 +32,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         id
     }
 
-    pub(crate) fn emit_fconst(&mut self, val: f64, typ: TypeId) -> PseudoId {
+    pub(crate) fn emit_fconst(&mut self, val: FloatVal, typ: TypeId) -> PseudoId {
         let id = self.alloc_pseudo();
         let pseudo = Pseudo::fval(id, val);
         if let Some(func) = &mut self.current_func {
@@ -451,7 +452,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             UnaryOp::Not => {
                 // Logical not: compare with 0
                 if is_float {
-                    let zero = self.emit_fconst(0.0, typ);
+                    let zero = self.emit_fconst(FloatVal::ZERO, typ);
                     self.emit(Instruction::binop(
                         Opcode::FCmpOEq,
                         result,
@@ -512,7 +513,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     let elem_size = self.types.size_bits(elem_type) / 8;
                     self.emit_const(elem_size as i128, self.types.long_id)
                 } else if is_float {
-                    self.emit_fconst(1.0, typ)
+                    self.emit_fconst(FloatVal::from_f64(1.0), typ)
                 } else {
                     self.emit_const(1, typ)
                 };
@@ -529,7 +530,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     let elem_size = self.types.size_bits(elem_type) / 8;
                     self.emit_const(elem_size as i128, self.types.long_id)
                 } else if is_float {
-                    self.emit_fconst(1.0, typ)
+                    self.emit_fconst(FloatVal::from_f64(1.0), typ)
                 } else {
                     self.emit_const(1, typ)
                 };
@@ -711,7 +712,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         self.emit(Instruction::store(
             converted, result, 0, base_typ, base_bits,
         ));
-        let zero = self.emit_fconst(0.0, base_typ);
+        let zero = self.emit_fconst(FloatVal::ZERO, base_typ);
         self.emit(Instruction::store(
             zero, result, base_bytes, base_typ, base_bits,
         ));
@@ -1173,7 +1174,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 self.emit(Instruction::store(real, target_addr, 0, dst_base, dst_size));
 
                 let zero = if self.types.is_float(dst_base) {
-                    self.emit_fconst(0.0, dst_base)
+                    self.emit_fconst(FloatVal::ZERO, dst_base)
                 } else {
                     self.emit_const(0, dst_base)
                 };

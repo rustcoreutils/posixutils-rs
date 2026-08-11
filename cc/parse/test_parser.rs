@@ -81,7 +81,7 @@ fn test_octal_literal() {
 fn test_float_literal() {
     let (expr, _types, _strings, _symbols) = parse_expr("3.14").unwrap();
     match expr.kind {
-        ExprKind::FloatLit(v) => assert!((v - 3.14).abs() < 0.001),
+        ExprKind::FloatLit(v) => assert!((v.to_f64() - 3.14).abs() < 0.001),
         _ => panic!("Expected FloatLit"),
     }
 }
@@ -4657,7 +4657,7 @@ fn test_float64_type_decl() {
 fn test_float16_literal_suffix() {
     let (expr, types, _, _) = parse_expr("1.0f16").unwrap();
     match expr.kind {
-        ExprKind::FloatLit(v) => assert!((v - 1.0).abs() < 0.001),
+        ExprKind::FloatLit(v) => assert!((v.to_f64() - 1.0).abs() < 0.001),
         _ => panic!("Expected FloatLit"),
     }
     assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Float16);
@@ -4667,7 +4667,7 @@ fn test_float16_literal_suffix() {
 fn test_float16_literal_suffix_upper() {
     let (expr, types, _, _) = parse_expr("3.14F16").unwrap();
     match expr.kind {
-        ExprKind::FloatLit(v) => assert!((v - 3.14).abs() < 0.001),
+        ExprKind::FloatLit(v) => assert!((v.to_f64() - 3.14).abs() < 0.001),
         _ => panic!("Expected FloatLit"),
     }
     assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Float16);
@@ -4678,7 +4678,7 @@ fn test_float32_literal_suffix() {
     // f32 is alias for float
     let (expr, types, _, _) = parse_expr("2.5f32").unwrap();
     match expr.kind {
-        ExprKind::FloatLit(v) => assert!((v - 2.5).abs() < 0.001),
+        ExprKind::FloatLit(v) => assert!((v.to_f64() - 2.5).abs() < 0.001),
         _ => panic!("Expected FloatLit"),
     }
     assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Float);
@@ -4689,7 +4689,7 @@ fn test_float64_literal_suffix() {
     // f64 is alias for double
     let (expr, types, _, _) = parse_expr("2.5f64").unwrap();
     match expr.kind {
-        ExprKind::FloatLit(v) => assert!((v - 2.5).abs() < 0.001),
+        ExprKind::FloatLit(v) => assert!((v.to_f64() - 2.5).abs() < 0.001),
         _ => panic!("Expected FloatLit"),
     }
     assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Double);
@@ -4700,7 +4700,7 @@ fn test_int_with_float16_suffix() {
     // Integer with f16 suffix becomes float literal
     let (expr, types, _, _) = parse_expr("42f16").unwrap();
     match expr.kind {
-        ExprKind::FloatLit(v) => assert!((v - 42.0).abs() < 0.001),
+        ExprKind::FloatLit(v) => assert!((v.to_f64() - 42.0).abs() < 0.001),
         _ => panic!("Expected FloatLit"),
     }
     assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Float16);
@@ -4926,7 +4926,7 @@ fn test_hex_float_long_significand_is_not_mangled() {
     match expr.kind {
         ExprKind::FloatLit(v) => {
             assert!(
-                (v - 1.0).abs() < 1e-15,
+                (v.to_f64() - 1.0).abs() < 1e-15,
                 "0x1.0000000000000002p0 is just above 1.0, got {v}"
             );
         }
@@ -4937,7 +4937,7 @@ fn test_hex_float_long_significand_is_not_mangled() {
     // double precision. Exercises a significand far wider than the mantissa.
     let (expr, _types, _, _) = parse_expr("0xfffffffffffffffffffffffffffffffp0").unwrap();
     match expr.kind {
-        ExprKind::FloatLit(v) => assert_eq!(v, f64::powi(2.0, 124), "got {v}"),
+        ExprKind::FloatLit(v) => assert_eq!(v.to_f64(), f64::powi(2.0, 124), "got {v}"),
         other => panic!("expected FloatLit, got {other:?}"),
     }
 }
@@ -4952,7 +4952,7 @@ fn test_hex_float_extreme_exponents() {
     ] {
         let (expr, _types, _, _) = parse_expr(src).unwrap();
         match expr.kind {
-            ExprKind::FloatLit(v) => assert_eq!(v, want, "{src}"),
+            ExprKind::FloatLit(v) => assert_eq!(v.to_f64(), want, "{src}"),
             other => panic!("expected FloatLit for {src}, got {other:?}"),
         }
     }

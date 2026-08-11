@@ -198,7 +198,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             } => match &operand.kind {
                 ExprKind::IntLit(v) => Initializer::Int(-(*v as i128)),
                 ExprKind::Int128Lit(v) => Initializer::Int(v.wrapping_neg()),
-                ExprKind::FloatLit(v) => Initializer::Float(-*v),
+                ExprKind::FloatLit(v) => Initializer::Float(v.negated()),
                 // For more complex expressions like -(1+2), try constant evaluation
                 _ => {
                     if let Some(val) = self.eval_const_expr(expr) {

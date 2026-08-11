@@ -216,7 +216,7 @@ impl Aarch64CodeGen {
                 // register, so it is assembled from two halves: the low 64
                 // bits via `fmov`, the high 64 inserted into lane 1.
                 if fp_size == FpSize::Quad {
-                    let (lo, hi) = super::f64_to_f128_bits(f);
+                    let (lo, hi) = f.to_f128_bits();
                     let (scratch0, scratch1, _) = Reg::scratch_regs();
                     self.emit_mov_imm(scratch0, lo as i64, 64);
                     self.push_lir(Aarch64Inst::FmovFromGp {
@@ -236,11 +236,11 @@ impl Aarch64CodeGen {
                 // Use the size from the FImm for correct constant representation
                 let (scratch0, _, _) = Reg::scratch_regs();
                 let bits = if imm_size == 16 {
-                    super::f64_to_f16_bits(f) as i64
+                    super::f64_to_f16_bits(f.to_f64()) as i64
                 } else if imm_size == 32 {
-                    (f as f32).to_bits() as i64
+                    (f.to_f64() as f32).to_bits() as i64
                 } else {
-                    f.to_bits() as i64
+                    f.to_f64().to_bits() as i64
                 };
                 self.emit_mov_imm(scratch0, bits, 64);
                 self.push_lir(Aarch64Inst::FmovFromGp {

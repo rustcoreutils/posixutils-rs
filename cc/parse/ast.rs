@@ -11,6 +11,7 @@
 //
 
 use crate::diag::Position;
+use crate::float::FloatVal;
 use crate::strings::StringId;
 use crate::symbol::SymbolId;
 use crate::types::{TypeId, TypeModifiers};
@@ -174,7 +175,7 @@ pub enum ExprKind {
     Int128Lit(i128),
 
     /// Floating-point literal
-    FloatLit(f64),
+    FloatLit(FloatVal),
 
     /// Character literal
     CharLit(char),
@@ -1432,7 +1433,8 @@ mod tests {
         let types = TypeTable::new(&Target::host());
 
         // Test Fabs (double)
-        let arg = Expr::typed_unpositioned(ExprKind::FloatLit(1.5), types.double_id);
+        let arg =
+            Expr::typed_unpositioned(ExprKind::FloatLit(FloatVal::from_f64(1.5)), types.double_id);
         let fabs = Expr::new_unpositioned(ExprKind::Fabs { arg: Box::new(arg) });
         match fabs.kind {
             ExprKind::Fabs { arg } => {
@@ -1442,7 +1444,8 @@ mod tests {
         }
 
         // Test Fabsf (float)
-        let arg = Expr::typed_unpositioned(ExprKind::FloatLit(2.5), types.float_id);
+        let arg =
+            Expr::typed_unpositioned(ExprKind::FloatLit(FloatVal::from_f64(2.5)), types.float_id);
         let fabsf = Expr::new_unpositioned(ExprKind::Fabsf { arg: Box::new(arg) });
         match fabsf.kind {
             ExprKind::Fabsf { arg } => {
@@ -1452,7 +1455,10 @@ mod tests {
         }
 
         // Test Fabsl (long double)
-        let arg = Expr::typed_unpositioned(ExprKind::FloatLit(3.5), types.longdouble_id);
+        let arg = Expr::typed_unpositioned(
+            ExprKind::FloatLit(FloatVal::from_f64(3.5)),
+            types.longdouble_id,
+        );
         let fabsl = Expr::new_unpositioned(ExprKind::Fabsl { arg: Box::new(arg) });
         match fabsl.kind {
             ExprKind::Fabsl { arg } => {

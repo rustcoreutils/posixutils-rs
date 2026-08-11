@@ -6045,3 +6045,78 @@ fn codegen_thread_local_address_uses_the_tls_sequence() {
         "expected a TLS access sequence:\n{body}"
     );
 }
+
+/// A `long double` literal keeps the precision and range of its target type.
+///
+/// Literals were carried as `f64` from the moment they were lexed, before the
+/// type of the literal was even known, so `LDBL_MAX` had already become
+/// infinity and `LDBL_MIN` zero. Hex literals now reach the target format
+/// exactly, and c17's own `__LDBL_*__` macros are spelled in hex for the same
+/// reason.
+///
+/// Decimal literals beyond double's range or precision are still rounded --
+/// that needs a big-integer decimal conversion and is tracked separately.
+///
+/// Every expectation was checked against gcc on the same source, at -O0 and
+/// -O2, where it returns 0 throughout.
+#[test]
+fn codegen_long_double_literals_keep_their_precision() {
+    let src = r##"
+#include <float.h>
+
+/* Static initializers: the value must survive into the data section. */
+static long double g_max = LDBL_MAX;
+static long double g_min = LDBL_MIN;
+static long double g_eps = LDBL_EPSILON;
+static long double g_hex = 0x1.fffffffffffffffep+16383L;
+static long double g_sub = 0x1p-16400L;
+static long double g_neg = -0x1.8p+16000L;
+
+int main(void)
+{
+    /* Out of double's range in both directions. */
+    if (!(g_max > 1.0e308L)) return 1;
+    if (!(g_min > 0.0L)) return 2;
+    if (!(g_min < 1.0e-308L)) return 3;
+    if (!(g_eps > 0.0L)) return 4;
+
+    /* The limits agree with freshly parsed literals. */
+    long double l_max = LDBL_MAX;
+    long double l_min = LDBL_MIN;
+    if (l_max != g_max) return 5;
+    if (l_min != g_min) return 6;
+
+    /* A hex literal needing all 64 mantissa bits is not rounded. */
+    if (g_hex != LDBL_MAX) return 7;
+    if (0x1.fffffffffffffffep+16383L != LDBL_MAX) return 8;
+
+    /* One ulp below LDBL_MAX must be a different value. */
+    if (0x1.fffffffffffffffcp+16383L == LDBL_MAX) return 9;
+
+    /* Subnormal long double survives rather than flushing to zero. */
+    if (!(g_sub > 0.0L)) return 10;
+    if (!(g_sub < g_min)) return 11;
+
+    /* Sign is carried. */
+    if (!(g_neg < 0.0L)) return 12;
+
+    /* Arithmetic on an out-of-double-range value stays finite. */
+    if (!(g_max / 2.0L > 1.0e308L)) return 13;
+    if (g_max / 2.0L >= g_max) return 14;
+
+    /* float and double are unaffected. */
+    if (DBL_MAX <= 0.0 || DBL_MIN <= 0.0) return 15;
+    if ((double)0x1.921fb54442d18p+1 != 3.141592653589793) return 16;
+
+    /* Two long doubles differing only below the 53rd bit stay distinct --
+       they used to collide in the constant pool, which is keyed on the value. */
+    long double a = 0x1.0000000000000002p+0L;
+    long double b = 0x1.0000000000000004p+0L;
+    if (a == b) return 17;
+    if (a == 1.0L) return 18;
+
+    return 0;
+}
+"##;
+    assert_eq!(compile_and_run("long_double_literals", src, &[]), 0);
+}

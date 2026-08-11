@@ -1645,7 +1645,7 @@ impl Aarch64CodeGen {
                 });
             }
             Loc::FImm(f, _) => {
-                let target = if *f != 0.0 {
+                let target = if !f.is_zero() {
                     insn.bb_true
                 } else {
                     insn.bb_false
@@ -1849,12 +1849,12 @@ impl Aarch64CodeGen {
                                     let (bits, fp_size) = match type_kind {
                                         TypeKind::Float16 => {
                                             // Convert f64 to IEEE 754 half-precision bits
-                                            (f64_to_f16_bits(*f) as i64, FpSize::Half)
+                                            (f64_to_f16_bits(f.to_f64()) as i64, FpSize::Half)
                                         }
                                         TypeKind::Float => {
-                                            ((*f as f32).to_bits() as i64, FpSize::Single)
+                                            ((f.to_f64() as f32).to_bits() as i64, FpSize::Single)
                                         }
-                                        _ => (f.to_bits() as i64, FpSize::Double),
+                                        _ => (f.to_f64().to_bits() as i64, FpSize::Double),
                                     };
                                     self.emit_mov_imm(scratch0, bits, 64);
                                     // LIR: fmov from GP to FP register
@@ -2365,11 +2365,11 @@ impl Aarch64CodeGen {
                 // Use the size from the FImm, not the passed-in size
                 // This ensures float constants are loaded correctly for their type
                 let bits = if imm_size == 16 {
-                    f64_to_f16_bits(f) as i64
+                    f64_to_f16_bits(f.to_f64()) as i64
                 } else if imm_size == 32 {
-                    (f as f32).to_bits() as i64
+                    (f.to_f64() as f32).to_bits() as i64
                 } else {
-                    f.to_bits() as i64
+                    f.to_f64().to_bits() as i64
                 };
                 self.emit_mov_imm(dst, bits, imm_size);
             }
@@ -3973,11 +3973,11 @@ impl Aarch64CodeGen {
             }
             Loc::FImm(f, imm_size) => {
                 let bits = if imm_size == 16 {
-                    super::f64_to_f16_bits(f) as i64
+                    super::f64_to_f16_bits(f.to_f64()) as i64
                 } else if imm_size == 32 {
-                    (f as f32).to_bits() as i64
+                    (f.to_f64() as f32).to_bits() as i64
                 } else {
-                    f.to_bits() as i64
+                    f.to_f64().to_bits() as i64
                 };
                 self.emit_mov_imm(reg, bits, 64);
             }

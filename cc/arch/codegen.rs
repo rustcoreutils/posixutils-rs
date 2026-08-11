@@ -11,6 +11,7 @@
 
 use crate::arch::lir::{Directive, EmitAsm, LirInst, Symbol};
 use crate::arch::DEFAULT_LIR_BUFFER_CAPACITY;
+use crate::float::FloatVal;
 use crate::ir::{Function, Initializer, Instruction, Module, Opcode};
 use crate::target::Target;
 use crate::types::TypeTable;
@@ -297,23 +298,26 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
     /// encoding: half the object went unemitted (while `.size` still claimed
     /// 16, so the next symbol's bytes were read as the tail), and the bits
     /// that were emitted meant a different number in the wider format.
-    fn emit_float_initializer(&mut self, val: f64, size: usize) {
+    fn emit_float_initializer(&mut self, val: FloatVal, size: usize) {
         match size {
             2 => {
                 // IEEE-754 binary16 is the same encoding on both targets; the
                 // two backends carry byte-identical copies of this conversion.
-                let bits = crate::arch::aarch64::f64_to_f16_bits(val);
+                let bits = crate::arch::aarch64::f64_to_f16_bits(val.to_f64());
                 self.push_directive(Directive::Short(bits as i64));
             }
             4 => {
-                let bits = (val as f32).to_bits();
+                let bits = (val.to_f64() as f32).to_bits();
                 self.push_directive(Directive::Long(bits as i64));
             }
             16 => {
+                // The only width where the literal's full precision matters:
+                // both encodings are produced from the exact value rather than
+                // from a double, so `LDBL_MAX` is not already infinity here.
                 let (lo, hi) = match self.target.arch {
-                    crate::target::Arch::Aarch64 => crate::arch::aarch64::f64_to_f128_bits(val),
+                    crate::target::Arch::Aarch64 => val.to_f128_bits(),
                     crate::target::Arch::X86_64 => {
-                        let bytes = crate::arch::x86_64::x87::f64_to_x87_extended(val);
+                        let bytes = val.to_x87_bytes();
                         let mut lo = [0u8; 8];
                         let mut hi = [0u8; 8];
                         lo.copy_from_slice(&bytes[..8]);
@@ -326,7 +330,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             }
             _ => {
                 // double - emit as 64-bit IEEE 754
-                self.push_directive(Directive::Quad(val.to_bits() as i64));
+                self.push_directive(Directive::Quad(val.to_f64().to_bits() as i64));
             }
         }
     }

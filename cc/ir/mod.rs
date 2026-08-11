@@ -30,6 +30,7 @@ pub mod validate;
 
 use crate::abi::{get_abi_for_conv, ArgClass, CallingConv};
 use crate::diag::Position;
+use crate::float::FloatVal;
 use crate::target::Target;
 use crate::types::{TypeId, TypeTable};
 use std::collections::{HashMap, HashSet};
@@ -507,7 +508,7 @@ pub enum PseudoKind {
     /// Constant integer value
     Val(i128),
     /// Constant float value
-    FVal(f64),
+    FVal(FloatVal),
 }
 
 /// A pseudo (virtual register or value) in SSA form
@@ -581,7 +582,7 @@ impl Pseudo {
     }
 
     /// Create a constant float pseudo
-    pub fn fval(id: PseudoId, value: f64) -> Self {
+    pub fn fval(id: PseudoId, value: FloatVal) -> Self {
         Self {
             id,
             kind: PseudoKind::FVal(value),
@@ -1743,7 +1744,7 @@ pub enum Initializer {
     /// Integer initializer
     Int(i128),
     /// Float/double initializer
-    Float(f64),
+    Float(FloatVal),
     /// String literal initializer (for char arrays)
     String(String),
     /// Wide string literal initializer (for wchar_t arrays)
@@ -1783,7 +1784,7 @@ impl Initializer {
         match self {
             Initializer::None => true,
             Initializer::Int(v) => *v == 0,
-            Initializer::Float(v) => v.to_bits() == 0,
+            Initializer::Float(v) => v.is_positive_zero(),
             // A zero-length string is all-zero; a non-empty char array initialized
             // by a string literal is zero iff every byte is `\0`.
             Initializer::String(s) => s.chars().all(|c| c == '\0'),

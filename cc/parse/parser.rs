@@ -4094,7 +4094,7 @@ impl Parser<'_> {
             ExprKind::Int128Lit(val) => Some(*val),
             ExprKind::CharLit(c) => Some(*c as u8 as i8 as i128),
             // Float literals are constant, return truncated value
-            ExprKind::FloatLit(val) => Some(*val as i128),
+            ExprKind::FloatLit(val) => Some(val.to_f64() as i128),
 
             ExprKind::Unary { op, operand } => {
                 let val = self.eval_const_expr(operand)?;

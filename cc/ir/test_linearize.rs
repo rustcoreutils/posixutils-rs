@@ -2040,7 +2040,7 @@ fn test_type_propagation_double_literal() {
     let types = TypeTable::new(&Target::host());
 
     // Create a double literal
-    let mut expr = Expr::new(ExprKind::FloatLit(3.14), test_pos());
+    let mut expr = Expr::new(ExprKind::FloatLit(FloatVal::from_f64(3.14)), test_pos());
     expr.typ = Some(types.double_id);
 
     let symbols = SymbolTable::new();

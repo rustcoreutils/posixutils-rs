@@ -535,13 +535,17 @@ impl X86_64CodeGen {
                 MemAddr::BaseOffset { base: r, offset: 0 }
             }
             Loc::FImm(v, _) => {
-                // Long double immediate - convert f64 to 80-bit extended precision
-                // and register for later emission in the data section
-                let label_bits = v.to_bits();
+                // Long double immediate: register the exact 80-bit image for
+                // later emission in the data section.
+                //
+                // The pool is keyed on the full encoding, not on the value
+                // rounded to a double -- two long doubles differing only below
+                // the 53rd significand bit are different constants, and an
+                // f64-derived key silently merged them into one.
+                let label_bits = v.pool_key();
                 let temp_label = format!(".Lld_const_{}", label_bits);
 
-                // Convert f64 to 80-bit extended precision (stored in 16 bytes)
-                let ld_bytes = f64_to_x87_extended(v);
+                let ld_bytes = v.to_x87_bytes();
                 self.ld_constants.insert(label_bits, ld_bytes);
 
                 MemAddr::RipRelative(crate::arch::lir::Symbol::local(temp_label))
@@ -694,9 +698,10 @@ impl X86_64CodeGen {
                     // 64-bit object regardless of the expression's type. The
                     // f64 holds the f32 value exactly, so reading it as a
                     // double is both correct and lossless.
+                    let val = val.to_f64();
                     let bits = val.to_bits();
                     let label = format!(".Ldbl_const_{}", bits);
-                    self.double_constants.insert(bits, *val);
+                    self.double_constants.insert(bits, val);
                     load_as_float = false;
                     MemAddr::RipRelative(crate::arch::lir::Symbol::local(label))
                 }
@@ -904,78 +909,4 @@ impl X86_64CodeGen {
             }
         }
     }
-}
-
-/// Convert a 64-bit double to x87 80-bit extended precision format.
-/// Returns 16 bytes (80 bits padded to 128 bits for alignment).
-///
-/// x87 80-bit extended format:
-/// - Bit 79: Sign
-/// - Bits 78-64: 15-bit exponent (bias 16383)
-/// - Bit 63: Integer bit (explicit, always 1 for normalized numbers)
-/// - Bits 62-0: 63-bit fraction
-pub fn f64_to_x87_extended(value: f64) -> [u8; 16] {
-    let mut result = [0u8; 16];
-
-    // Handle special cases
-    if value == 0.0 {
-        // Check for negative zero
-        if value.to_bits() >> 63 == 1 {
-            result[9] = 0x80; // Set sign bit
-        }
-        return result;
-    }
-
-    if value.is_nan() {
-        // NaN: all exponent bits set, non-zero fraction
-        result[7] = 0xC0; // Set quiet NaN bit in fraction
-        result[8] = 0xFF;
-        result[9] = 0x7F;
-        return result;
-    }
-
-    if value.is_infinite() {
-        // Infinity: all exponent bits set, zero fraction, integer bit set
-        result[7] = 0x80; // Integer bit
-        result[8] = 0xFF;
-        result[9] = if value > 0.0 { 0x7F } else { 0xFF }; // Sign in bit 79
-        return result;
-    }
-
-    // Normal number conversion
-    let bits = value.to_bits();
-    let sign = (bits >> 63) as u8;
-    let exp64 = ((bits >> 52) & 0x7FF) as i32;
-    let frac64 = bits & 0x000F_FFFF_FFFF_FFFF;
-
-    // Convert exponent: rebias from 1023 (double) to 16383 (extended)
-    // For denormals, exp64 == 0, actual exponent is -1022
-    let exp80 = if exp64 == 0 {
-        // Denormalized double -> need to normalize for x87
-        // This is complex; for simplicity, use 0 exponent (denormal x87)
-        0u16
-    } else {
-        // Normal: rebias
-        ((exp64 - 1023) + 16383) as u16
-    };
-
-    // Convert fraction: double has 52 bits, x87 extended has 63 bits
-    // Shift left by 11 (63 - 52 = 11)
-    let frac80 = frac64 << 11;
-
-    // Set the integer bit (bit 63) for normalized numbers
-    let int_bit = if exp64 != 0 { 1u64 << 63 } else { 0 };
-    let mantissa = int_bit | frac80;
-
-    // Pack into bytes (little-endian)
-    // Bytes 0-7: 64-bit mantissa (including integer bit)
-    result[0..8].copy_from_slice(&mantissa.to_le_bytes());
-
-    // Bytes 8-9: 15-bit exponent + sign bit
-    let exp_sign = exp80 | ((sign as u16) << 15);
-    result[8..10].copy_from_slice(&exp_sign.to_le_bytes());
-
-    // Bytes 10-15: padding (zeros)
-
-    result
 }

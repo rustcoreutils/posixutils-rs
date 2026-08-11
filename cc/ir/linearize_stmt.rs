@@ -13,6 +13,7 @@ use super::{
     AsmConstraint, AsmData, BasicBlockId, Initializer, Instruction, Opcode, Pseudo, PseudoId,
 };
 use crate::diag::error;
+use crate::float::FloatVal;
 use crate::parse::ast::{
     AsmOperand, BinaryOp, BlockItem, Declaration, Expr, ExprKind, ForInit, InitElement,
     OffsetOfPath, Stmt, UnaryOp,
@@ -371,7 +372,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                             converted, sym_id, 0, base_typ, base_bits,
                         ));
                         // Store 0.0 for imaginary part
-                        let zero = self.emit_fconst(0.0, base_typ);
+                        let zero = self.emit_fconst(FloatVal::ZERO, base_typ);
                         self.emit(Instruction::store(
                             zero, sym_id, base_bytes, base_typ, base_bits,
                         ));
@@ -1350,7 +1351,9 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// value of a `case` label is still an integer.
     fn eval_const_float(&self, expr: &Expr) -> Option<f64> {
         match &expr.kind {
-            ExprKind::FloatLit(v) => Some(*v),
+            // Only reachable through a cast to an integer type, so narrowing
+            // to f64 here cannot lose a value the result would have kept.
+            ExprKind::FloatLit(v) => Some(v.to_f64()),
             ExprKind::IntLit(v) => Some(*v as f64),
             ExprKind::CharLit(c) => Some(*c as u8 as i8 as f64),
             ExprKind::Cast {
@@ -1623,30 +1626,38 @@ impl<'a> super::linearize::Linearizer<'a> {
 
     /// Evaluate a constant floating-point expression at compile time.
     /// Handles float literals, negation, and binary arithmetic on floats.
-    pub(crate) fn eval_const_float_expr(&self, expr: &Expr) -> Option<f64> {
+    /// Fold a constant floating expression for a static initializer.
+    ///
+    /// A bare literal passes through at full width, which is what makes
+    /// `long double x = LDBL_MAX;` come out right. Arithmetic is still done in
+    /// `f64`, so folding an expression whose operands exceed double's range
+    /// still loses them; carrying that exactly needs wide arithmetic, not just
+    /// a wide literal.
+    pub(crate) fn eval_const_float_expr(&self, expr: &Expr) -> Option<FloatVal> {
         match &expr.kind {
             ExprKind::FloatLit(v) => Some(*v),
-            ExprKind::IntLit(v) => Some(*v as f64),
-            ExprKind::CharLit(c) => Some(*c as i64 as f64),
+            ExprKind::IntLit(v) => Some(FloatVal::from_f64(*v as f64)),
+            ExprKind::CharLit(c) => Some(FloatVal::from_f64(*c as i64 as f64)),
 
             ExprKind::Unary { op, operand } => {
                 let val = self.eval_const_float_expr(operand)?;
                 match op {
-                    UnaryOp::Neg => Some(-val),
+                    UnaryOp::Neg => Some(val.negated()),
                     _ => None,
                 }
             }
 
             ExprKind::Binary { op, left, right } => {
-                let l = self.eval_const_float_expr(left)?;
-                let r = self.eval_const_float_expr(right)?;
-                match op {
-                    BinaryOp::Add => Some(l + r),
-                    BinaryOp::Sub => Some(l - r),
-                    BinaryOp::Mul => Some(l * r),
-                    BinaryOp::Div => Some(l / r),
-                    _ => None,
-                }
+                let l = self.eval_const_float_expr(left)?.to_f64();
+                let r = self.eval_const_float_expr(right)?.to_f64();
+                let v = match op {
+                    BinaryOp::Add => l + r,
+                    BinaryOp::Sub => l - r,
+                    BinaryOp::Mul => l * r,
+                    BinaryOp::Div => l / r,
+                    _ => return None,
+                };
+                Some(FloatVal::from_f64(v))
             }
 
             ExprKind::Cast { expr: inner, .. } => self.eval_const_float_expr(inner),

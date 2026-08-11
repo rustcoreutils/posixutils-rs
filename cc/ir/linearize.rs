@@ -18,6 +18,7 @@ use super::{
 };
 use crate::abi::{get_abi_for_conv, CallingConv};
 use crate::diag::{error, get_all_stream_names, Position};
+use crate::float::FloatVal;
 use crate::parse::ast::{
     BinaryOp, BlockItem, Expr, ExprKind, ExternalDecl, FunctionDef, InitElement, OffsetOfPath,
     TranslationUnit, UnaryOp,
@@ -2768,7 +2769,7 @@ impl<'a> Linearizer<'a> {
             let elem_size = self.types.size_bits(elem_type) / 8;
             self.emit_const(elem_size as i128, self.types.long_id)
         } else if is_float {
-            self.emit_fconst(1.0, typ)
+            self.emit_fconst(FloatVal::from_f64(1.0), typ)
         } else {
             self.emit_const(1, typ)
         };
@@ -3099,7 +3100,7 @@ impl<'a> Linearizer<'a> {
                 let elem_size = self.types.size_bits(elem_type) / 8;
                 self.emit_const(elem_size as i128, self.types.long_id)
             } else if is_float {
-                self.emit_fconst(1.0, typ)
+                self.emit_fconst(FloatVal::from_f64(1.0), typ)
             } else {
                 self.emit_const(1, typ)
             };

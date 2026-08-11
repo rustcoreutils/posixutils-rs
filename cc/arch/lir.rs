@@ -1105,36 +1105,6 @@ mod tests {
         assert_eq!(FpSize::Extended.x86_suffix(), "t");
     }
 
-    /// The `f64` a floating literal is stored as, widened to the binary128
-    /// encoding AAPCS64 requires. Values checked against the IEEE-754 layout:
-    /// a 15-bit exponent biased by 16383 and a 112-bit mantissa.
-    #[test]
-    fn test_f64_to_f128_bits() {
-        use crate::arch::aarch64::f64_to_f128_bits;
-
-        // 1.5 = 1.1b x 2^0 -> exponent 16383, mantissa top bit set.
-        assert_eq!(f64_to_f128_bits(1.5), (0, 0x3FFF_8000_0000_0000));
-        // 1.0 -> exponent 16383, mantissa zero.
-        assert_eq!(f64_to_f128_bits(1.0), (0, 0x3FFF_0000_0000_0000));
-        // 2.0 -> exponent 16384.
-        assert_eq!(f64_to_f128_bits(2.0), (0, 0x4000_0000_0000_0000));
-        // Signed zeroes keep only the sign bit.
-        assert_eq!(f64_to_f128_bits(0.0), (0, 0));
-        assert_eq!(f64_to_f128_bits(-0.0), (0, 0x8000_0000_0000_0000));
-        // -1.5 is 1.5 with the sign bit.
-        assert_eq!(f64_to_f128_bits(-1.5), (0, 0xBFFF_8000_0000_0000));
-        // Infinities saturate the exponent with a zero mantissa.
-        assert_eq!(f64_to_f128_bits(f64::INFINITY), (0, 0x7FFF_0000_0000_0000));
-        assert_eq!(
-            f64_to_f128_bits(f64::NEG_INFINITY),
-            (0, 0xFFFF_0000_0000_0000)
-        );
-        // A NaN keeps a non-zero mantissa and the saturated exponent.
-        let (lo, hi) = f64_to_f128_bits(f64::NAN);
-        assert_eq!(hi >> 48 & 0x7FFF, 0x7FFF);
-        assert!(hi & 0x0000_FFFF_FFFF_FFFF != 0 || lo != 0);
-    }
-
     #[test]
     fn test_label() {
         let label = Label::new("main", 5);

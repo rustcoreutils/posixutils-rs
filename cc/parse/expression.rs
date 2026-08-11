@@ -14,6 +14,7 @@ use super::ast::{
 };
 use super::parser::{ParseError, ParseResult, Parser};
 use crate::diag;
+use crate::float::FloatVal;
 use crate::strings::StringId;
 use crate::symbol::{Namespace, Symbol};
 use crate::token::lexer::{Position, SpecialToken, TokenType, TokenValue};
@@ -2349,7 +2350,7 @@ impl<'a> Parser<'a> {
                 self.expect_special(b'(')?;
                 self.expect_special(b')')?;
                 Ok(Self::typed_expr(
-                    ExprKind::FloatLit(f64::INFINITY),
+                    ExprKind::FloatLit(FloatVal::infinity(false)),
                     self.types.double_id,
                     token_pos,
                 ))
@@ -2358,7 +2359,7 @@ impl<'a> Parser<'a> {
                 self.expect_special(b'(')?;
                 self.expect_special(b')')?;
                 Ok(Self::typed_expr(
-                    ExprKind::FloatLit(f64::INFINITY),
+                    ExprKind::FloatLit(FloatVal::infinity(false)),
                     self.types.float_id,
                     token_pos,
                 ))
@@ -2367,7 +2368,7 @@ impl<'a> Parser<'a> {
                 self.expect_special(b'(')?;
                 self.expect_special(b')')?;
                 Ok(Self::typed_expr(
-                    ExprKind::FloatLit(f64::INFINITY),
+                    ExprKind::FloatLit(FloatVal::infinity(false)),
                     self.types.longdouble_id,
                     token_pos,
                 ))
@@ -2379,7 +2380,7 @@ impl<'a> Parser<'a> {
                 let _arg = self.parse_assignment_expr()?; // string argument (ignored)
                 self.expect_special(b')')?;
                 Ok(Self::typed_expr(
-                    ExprKind::FloatLit(f64::NAN),
+                    ExprKind::FloatLit(FloatVal::nan()),
                     self.types.double_id,
                     token_pos,
                 ))
@@ -2389,7 +2390,7 @@ impl<'a> Parser<'a> {
                 let _arg = self.parse_assignment_expr()?; // string argument (ignored)
                 self.expect_special(b')')?;
                 Ok(Self::typed_expr(
-                    ExprKind::FloatLit(f64::NAN),
+                    ExprKind::FloatLit(FloatVal::nan()),
                     self.types.float_id,
                     token_pos,
                 ))
@@ -2399,7 +2400,7 @@ impl<'a> Parser<'a> {
                 let _arg = self.parse_assignment_expr()?; // string argument (ignored)
                 self.expect_special(b')')?;
                 Ok(Self::typed_expr(
-                    ExprKind::FloatLit(f64::NAN),
+                    ExprKind::FloatLit(FloatVal::nan()),
                     self.types.longdouble_id,
                     token_pos,
                 ))
@@ -3310,16 +3311,23 @@ impl<'a> Parser<'a> {
                 && !is_float32_suffix
                 && !is_float64_suffix
                 && s_lower.ends_with('l');
-            let value: f64 = if is_hex {
+            let value: FloatVal = if is_hex {
                 // Hex float parsing: 0x[hex-digits].[hex-digits]p[±exponent]
-                // Value = significand × 2^exponent
-                Self::parse_hex_float(num_str).map_err(|_| {
+                // Value = significand × 2^exponent.
+                // `parse_hex_float_parts` is exact, so the literal reaches the
+                // target format without passing through `f64` -- which would
+                // flush `0x1p-16382L` to zero before its type is even known.
+                let (mantissa, exp2) = Self::parse_hex_float_parts(num_str).map_err(|_| {
                     ParseError::new(format!("invalid hex float literal: {}", s), pos)
-                })?
+                })?;
+                FloatVal::from_parts(false, mantissa, exp2)
             } else {
-                num_str
+                // Decimal literals still round through `f64`; carrying them at
+                // full width needs a big-integer decimal conversion.
+                let v: f64 = num_str
                     .parse()
-                    .map_err(|_| ParseError::new(format!("invalid float literal: {}", s), pos))?
+                    .map_err(|_| ParseError::new(format!("invalid float literal: {}", s), pos))?;
+                FloatVal::from_f64(v)
             };
             let typ = if is_float16_suffix {
                 self.types.float16_id
@@ -3498,30 +3506,6 @@ impl<'a> Parser<'a> {
             mantissa |= 1;
         }
         Ok((mantissa, exp2))
-    }
-
-    /// Parse a hex float literal (C99 6.4.4.2) to `f64`.
-    fn parse_hex_float(s: &str) -> Result<f64, ()> {
-        let (mantissa, exp2) = Self::parse_hex_float_parts(s)?;
-        // `u128 as f64` rounds once, correctly; scaling by a power of two after
-        // that is exact until it overflows or goes subnormal.
-        Ok(Self::scale_pow2(mantissa as f64, exp2))
-    }
-
-    /// Multiply by `2^exp` without overflowing the exponent mid-way.
-    ///
-    /// `powi` on a large exponent produces an infinity before the
-    /// multiplication can bring it back into range, so step through it.
-    fn scale_pow2(mut value: f64, mut exp: i32) -> f64 {
-        while exp > 1023 {
-            value *= f64::powi(2.0, 1023);
-            exp -= 1023;
-        }
-        while exp < -1022 {
-            value *= f64::powi(2.0, -1022);
-            exp += 1022;
-        }
-        value * f64::powi(2.0, exp)
     }
 
     /// Parse an escape sequence starting at position i (after the backslash).

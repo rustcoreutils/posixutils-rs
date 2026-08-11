@@ -43,6 +43,7 @@ use crate::arch::regalloc::{
     compute_live_intervals, find_call_positions, identify_addr_taken_syms, identify_fp_pseudos,
     interval_crosses_call, ConstraintPoint, FreeSlot, LiveInterval, LivenessResult,
 };
+use crate::float::FloatVal;
 use crate::ir::{Function, Instruction, Opcode, PseudoId, PseudoKind};
 use crate::types::TypeTable;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -840,7 +841,7 @@ pub enum Loc {
     /// Immediate integer constant
     Imm(i128),
     /// Immediate float constant (value, size in bits)
-    FImm(f64, u32),
+    FImm(FloatVal, u32),
     /// Global symbol
     Global(String),
 }

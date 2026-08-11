@@ -514,14 +514,19 @@ struct LongDoubleLimits {
 }
 
 impl LongDoubleLimits {
+    // The float-valued limits are spelled as hex literals, which reach the
+    // target format exactly. As decimal they were rounded through `f64` when
+    // parsed back, so `__LDBL_MAX__` expanded to a literal that had already
+    // become infinity and `__LDBL_MIN__` to one that had become zero.
+
     fn for_target(target: &Target) -> Self {
         match (target.arch, target.os) {
             // Apple aarch64: long double *is* double.
             (Arch::Aarch64, Os::MacOS) => Self {
-                min: "2.22507385850720138309023271733240406e-308L",
-                max: "1.79769313486231570814527423731704357e+308L",
-                epsilon: "2.22044604925031308084726333618164062e-16L",
-                denorm_min: "4.94065645841246544176568792868221372e-324L",
+                min: "0x1p-1022L",
+                max: "0x1.fffffffffffffp+1023L",
+                epsilon: "0x1p-52L",
+                denorm_min: "0x1p-1074L",
                 mant_dig: "53",
                 dig: "15",
                 min_exp: "(-1021)",
@@ -532,10 +537,10 @@ impl LongDoubleLimits {
             },
             // aarch64 elsewhere: IEEE binary128.
             (Arch::Aarch64, _) => Self {
-                min: "3.36210314311209350626267781732175260e-4932L",
-                max: "1.18973149535723176508575932662800702e+4932L",
-                epsilon: "1.92592994438723585305597794258492732e-34L",
-                denorm_min: "6.47517511943802511092443895822764655e-4966L",
+                min: "0x1p-16382L",
+                max: "0x1.ffffffffffffffffffffffffffffp+16383L",
+                epsilon: "0x1p-112L",
+                denorm_min: "0x1p-16494L",
                 mant_dig: "113",
                 dig: "33",
                 min_exp: "(-16381)",
@@ -546,10 +551,10 @@ impl LongDoubleLimits {
             },
             // x86_64: x87 80-bit extended.
             _ => Self {
-                min: "3.36210314311209350626267781732175260e-4932L",
-                max: "1.18973149535723176502126385303097021e+4932L",
-                epsilon: "1.08420217248550443400745280086994171e-19L",
-                denorm_min: "3.64519953188247460252840593361941982e-4951L",
+                min: "0x1p-16382L",
+                max: "0x1.fffffffffffffffep+16383L",
+                epsilon: "0x1p-63L",
+                denorm_min: "0x1p-16445L",
                 mant_dig: "64",
                 dig: "18",
                 min_exp: "(-16381)",
@@ -608,19 +613,14 @@ mod tests {
                 os
             );
             // The epsilon has to belong to the same format as the mantissa.
+            // Spelled in hex it is exactly 2^(1 - MANT_DIG), so this pins the
+            // value rather than approximating it by a decimal exponent.
             let eps = macro_value(&floats, "__LDBL_EPSILON__");
-            let expected_exp = match mant_dig {
-                "53" => "e-16",
-                "64" => "e-19",
-                _ => "e-34",
-            };
-            assert!(
-                eps.contains(expected_exp),
-                "__LDBL_EPSILON__ {} does not match a {}-bit mantissa on {:?}/{:?}",
-                eps,
-                mant_dig,
-                arch,
-                os
+            let expected = format!("0x1p-{}L", mant_dig.parse::<i32>().unwrap() - 1);
+            assert_eq!(
+                eps, expected,
+                "__LDBL_EPSILON__ does not match a {}-bit mantissa on {:?}/{:?}",
+                mant_dig, arch, os
             );
         }
     }

@@ -2962,15 +2962,32 @@ impl<'a> Parser<'a> {
                 ))
             })()),
             crate::kw::BUILTIN_OBJECT_SIZE => Some((|| {
-                // __builtin_object_size(ptr, type) - returns (size_t)-1
-                // at compile time without optimization (conservative "don't know")
+                // __builtin_object_size(ptr, type): how many bytes remain in
+                // the object `ptr` points into, when that is known statically.
                 self.expect_special(b'(')?;
-                let _ptr = self.parse_assignment_expr()?;
+                let ptr = self.parse_assignment_expr()?;
                 self.expect_special(b',')?;
-                let _otype = self.parse_assignment_expr()?;
+                let otype = self.parse_assignment_expr()?;
                 self.expect_special(b')')?;
+
+                // The type argument must be an integer constant 0..3. Bit 0
+                // selects the closest surrounding subobject over the whole
+                // object; bit 1 asks for a minimum rather than a maximum.
+                let otype = self.eval_const_expr(&otype).unwrap_or(0).clamp(0, 3) as u32;
+
+                let size = match self.object_extent(&ptr) {
+                    // A statically known object has the same minimum and
+                    // maximum size, so bit 1 does not change the answer.
+                    Some(extent) => extent.remaining(otype & 1 != 0),
+                    // Unknown: the documented answers are the ones that make a
+                    // `_FORTIFY_SOURCE` check pass rather than fire, which is
+                    // the largest value for a maximum and zero for a minimum.
+                    None if otype & 2 != 0 => 0,
+                    None => u64::MAX,
+                };
+
                 Ok(Self::typed_expr(
-                    ExprKind::IntLit(-1),
+                    ExprKind::IntLit(size as i64),
                     self.types.ulong_id,
                     token_pos,
                 ))
@@ -3625,5 +3642,195 @@ impl<'a> Parser<'a> {
         }
 
         result
+    }
+
+    /// What is statically known about the object a pointer expression
+    /// designates, for `__builtin_object_size`.
+    ///
+    /// Tracks both the whole object and the innermost aggregate containing the
+    /// designated byte, because the builtin's type argument selects between
+    /// them: `__builtin_object_size(s.arr, 0)` is everything left in `s`,
+    /// while type 1 is everything left in `arr`.
+    fn object_extent(&self, expr: &Expr) -> Option<ObjectExtent> {
+        match &expr.kind {
+            // An array name decays to a pointer to its first element, so it
+            // designates the array itself. A pointer *variable* designates
+            // whatever it was assigned, which is exactly what is not known.
+            ExprKind::Ident(id) => {
+                let typ = self.symbols.get(*id).typ;
+                if self.types.kind(typ) != TypeKind::Array {
+                    return None;
+                }
+                ObjectExtent::whole_of(self.byte_size(typ)?)
+            }
+
+            // A string literal is an array of its bytes plus the terminator.
+            ExprKind::StringLit(s) => ObjectExtent::whole_of(s.chars().count() as u64 + 1),
+
+            // `&lvalue` designates the lvalue, which may be a subobject.
+            ExprKind::Unary {
+                op: UnaryOp::AddrOf,
+                operand,
+            } => self.lvalue_extent(operand),
+
+            // A cast does not move the pointer.
+            ExprKind::Cast { expr, .. } => self.object_extent(expr),
+
+            // Pointer arithmetic with a constant displacement.
+            ExprKind::Binary {
+                op: op @ (BinaryOp::Add | BinaryOp::Sub),
+                left,
+                right,
+            } => {
+                let base = self.object_extent(left)?;
+                let elem = self.pointee_size(left)?;
+                let n = self.eval_const_expr(right)?;
+                let bytes = i128::from(elem).checked_mul(n)?;
+                base.advance(if *op == BinaryOp::Sub { -bytes } else { bytes })
+            }
+
+            // Everything else -- a call, a dereference, an unknown pointer.
+            _ => self.object_extent_of_lvalue_forms(expr),
+        }
+    }
+
+    /// The extent of an lvalue: the object it names, and where inside its
+    /// enclosing object it sits.
+    fn lvalue_extent(&self, expr: &Expr) -> Option<ObjectExtent> {
+        match &expr.kind {
+            ExprKind::Ident(id) => {
+                ObjectExtent::whole_of(self.byte_size(self.symbols.get(*id).typ)?)
+            }
+
+            ExprKind::Member { expr: base, member } => {
+                let base_typ = self.lvalue_type(base)?;
+                let info = self.types.find_member(base_typ, *member)?;
+                let outer = self.lvalue_extent(base)?;
+                outer.narrow(info.offset as u64, self.byte_size(info.typ)?)
+            }
+
+            // `a[i]` with a constant index, where `a` is an array we can see.
+            ExprKind::Index { array, index } => {
+                let n = self.eval_const_expr(index)?;
+                let outer = self.object_extent(array)?;
+                let elem = self.pointee_size(array)?;
+                outer.advance(i128::from(elem).checked_mul(n)?)
+            }
+
+            _ => None,
+        }
+    }
+
+    /// `Member` and `Index` reached without an `&`, i.e. an array-typed
+    /// subobject that decayed to a pointer.
+    fn object_extent_of_lvalue_forms(&self, expr: &Expr) -> Option<ObjectExtent> {
+        match &expr.kind {
+            ExprKind::Member { .. } | ExprKind::Index { .. } => {
+                let typ = self.lvalue_type(expr)?;
+                if self.types.kind(typ) != TypeKind::Array {
+                    return None;
+                }
+                self.lvalue_extent(expr)
+            }
+            _ => None,
+        }
+    }
+
+    /// The declared type of an lvalue expression, as far as it can be resolved
+    /// from symbols and member lookups alone.
+    fn lvalue_type(&self, expr: &Expr) -> Option<TypeId> {
+        match &expr.kind {
+            ExprKind::Ident(id) => Some(self.symbols.get(*id).typ),
+            ExprKind::Member { expr, member } => {
+                let base = self.lvalue_type(expr)?;
+                Some(self.types.find_member(base, *member)?.typ)
+            }
+            ExprKind::Index { array, .. } => {
+                let base = self.lvalue_type(array)?;
+                self.types.get(base).base
+            }
+            ExprKind::Cast { cast_type, .. } => Some(*cast_type),
+            _ => expr.typ,
+        }
+    }
+
+    /// Size in bytes of a type whose size is known and non-zero.
+    fn byte_size(&self, typ: TypeId) -> Option<u64> {
+        let bits = self.types.size_bits(typ);
+        if bits == 0 {
+            return None;
+        }
+        Some(u64::from(bits) / 8)
+    }
+
+    /// Size of what `expr` points at, for scaling pointer arithmetic.
+    fn pointee_size(&self, expr: &Expr) -> Option<u64> {
+        let typ = self.lvalue_type(expr)?;
+        let elem = self.types.get(typ).base?;
+        self.byte_size(elem)
+    }
+}
+
+/// A statically known object, and where inside it a pointer points.
+///
+/// `whole` / `offset` describe the complete object; `sub` / `sub_offset`
+/// describe the innermost aggregate containing the designated byte. For a
+/// plain array the two coincide.
+#[derive(Clone, Copy)]
+pub(crate) struct ObjectExtent {
+    whole: u64,
+    offset: u64,
+    sub: u64,
+    sub_offset: u64,
+}
+
+impl ObjectExtent {
+    /// A pointer to the start of an object of `size` bytes.
+    fn whole_of(size: u64) -> Option<Self> {
+        Some(ObjectExtent {
+            whole: size,
+            offset: 0,
+            sub: size,
+            sub_offset: 0,
+        })
+    }
+
+    /// Move the pointer by `bytes`, staying inside both objects.
+    fn advance(self, bytes: i128) -> Option<Self> {
+        let offset = i128::from(self.offset).checked_add(bytes)?;
+        let sub_offset = i128::from(self.sub_offset).checked_add(bytes)?;
+        // Out of bounds either way: gcc gives up rather than reporting a size
+        // that would licence an overrun.
+        if offset < 0 || offset > i128::from(self.whole) {
+            return None;
+        }
+        if sub_offset < 0 || sub_offset > i128::from(self.sub) {
+            return None;
+        }
+        Some(ObjectExtent {
+            offset: offset as u64,
+            sub_offset: sub_offset as u64,
+            ..self
+        })
+    }
+
+    /// Step into a member at `offset` bytes with size `size`, which becomes
+    /// the new innermost subobject.
+    fn narrow(self, offset: u64, size: u64) -> Option<Self> {
+        Some(ObjectExtent {
+            whole: self.whole,
+            offset: self.offset.checked_add(offset)?,
+            sub: size,
+            sub_offset: 0,
+        })
+    }
+
+    /// Bytes from the pointer to the end of the selected object.
+    fn remaining(self, closest_subobject: bool) -> u64 {
+        if closest_subobject {
+            self.sub.saturating_sub(self.sub_offset)
+        } else {
+            self.whole.saturating_sub(self.offset)
+        }
     }
 }

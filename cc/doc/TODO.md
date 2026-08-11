@@ -69,7 +69,7 @@ does or claims.
 
 | Area | Divergence |
 |------|-----------|
-| `_FORTIFY_SOURCE` | Compiles, but `__builtin_object_size` always answers "unknown", so nothing is actually checked |
+| `_FORTIFY_SOURCE` | Still checks nothing, but no longer because of `__builtin_object_size`, which now reports real sizes. c17 does not predefine `__OPTIMIZE__`, and glibc's `features.h` requires it before it will set `__USE_FORTIFY_LEVEL` above 0, so the fortified wrappers are never reached |
 | `_Complex` with static storage | Cannot be initialized at all; gcc accepts `1.0 + 2.0*I` and `CMPLX(...)` |
 | `isnan()` on a `long double` | 65535 rather than 1, because `__builtin_isnan` is absent and glibc falls back to `__isnanl` |
 

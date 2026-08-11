@@ -59,8 +59,21 @@ impl std::error::Error for ParseError {}
 
 pub type ParseResult<T> = Result<T, ParseError>;
 
-/// Raw parameter info: (name, type) - name is None for unnamed params
-type RawParam = (Option<StringId>, TypeId);
+/// Raw parameter info gathered while parsing a parameter list.
+#[derive(Debug, Clone)]
+pub(crate) struct RawParam {
+    /// Parameter name; None for an unnamed parameter such as `void f(int)`.
+    pub(crate) name: Option<StringId>,
+    /// Parameter type, already adjusted from array/function to pointer.
+    pub(crate) typ: TypeId,
+    /// Run-time size expressions for a variably-modified element type; see
+    /// [`Parameter::vm_dims`](crate::parse::ast::Parameter::vm_dims).
+    pub(crate) vm_dims: Vec<Expr>,
+    /// Symbol created while parsing the parameter list. `vm_dims` resolves
+    /// against it, so the function scope re-declares this very symbol instead
+    /// of a fresh one.
+    pub(crate) symbol: Option<SymbolId>,
+}
 
 /// Result of parsing a declarator: (name, type, VLA expressions, raw function parameters)
 type DeclaratorResult = (StringId, TypeId, Vec<Expr>, Option<Vec<RawParam>>);
@@ -2720,7 +2733,7 @@ impl Parser<'_> {
                 self.advance();
                 let (raw_params, variadic) = self.parse_parameter_list()?;
                 self.expect_special(b')')?;
-                let type_ids: Vec<TypeId> = raw_params.iter().map(|(_, typ)| *typ).collect();
+                let type_ids: Vec<TypeId> = raw_params.iter().map(|p| p.typ).collect();
                 (Some((type_ids, variadic)), Some(raw_params))
             } else {
                 (None, None)
@@ -2937,7 +2950,7 @@ impl Parser<'_> {
         self.expect_special(b')')?;
 
         // Build the function type
-        let param_type_ids: Vec<TypeId> = raw_params.iter().map(|(_, typ)| *typ).collect();
+        let param_type_ids: Vec<TypeId> = raw_params.iter().map(|p| p.typ).collect();
         let func_type = Type::function(ret_type_id, param_type_ids, variadic, false);
         let func_type_id = self.types.intern(func_type);
 
@@ -2950,16 +2963,12 @@ impl Parser<'_> {
 
         // Bind parameters in function scope and create Parameter structs
         let mut params = Vec::with_capacity(raw_params.len());
-        for (param_name, param_typ) in &raw_params {
-            let symbol_id = if let Some(name) = param_name {
-                let param_sym = Symbol::parameter(*name, *param_typ, self.symbols.depth());
-                self.symbols.declare(param_sym).ok()
-            } else {
-                None
-            };
+        for raw in &raw_params {
+            let symbol_id = raw.symbol.map(|id| self.symbols.redeclare(id, raw.typ));
             params.push(Parameter {
                 symbol: symbol_id,
-                typ: *param_typ,
+                typ: raw.typ,
+                vm_dims: raw.vm_dims.clone(),
             });
         }
 
@@ -2979,6 +2988,23 @@ impl Parser<'_> {
             is_inline: false,
             calling_conv: crate::abi::CallingConv::default(),
         })
+    }
+
+    /// Count the array levels of `typ` whose extent is not a compile-time
+    /// constant, i.e. how many run-time dimension expressions the type needs.
+    fn variable_array_levels(&self, typ: TypeId) -> usize {
+        let mut levels = 0;
+        let mut cur = Some(typ);
+        while let Some(t) = cur {
+            if self.types.kind(t) != TypeKind::Array {
+                break;
+            }
+            if self.types.get(t).array_size.is_none() {
+                levels += 1;
+            }
+            cur = self.types.get(t).base;
+        }
+        levels
     }
 
     /// Parse a parameter list, returning raw parameter info (name and type)
@@ -3040,7 +3066,7 @@ impl Parser<'_> {
             // - Grouped declarators: void (*)(int), int (*)[10]
             // - Arrays: int arr[], int arr[10]
             // Note: parse_declarator returns (name, type, vla_sizes)
-            let (param_name, mut typ_id, _vla_sizes, _func_params) =
+            let (param_name, mut typ_id, vla_sizes, _func_params) =
                 self.parse_declarator(base_type_id)?;
 
             // Skip any __attribute__ after parameter declarator
@@ -3075,13 +3101,44 @@ impl Parser<'_> {
             } else {
                 Some(param_name)
             };
-            params.push((name_opt, typ_id));
+
+            // Keep the run-time dimensions of a variably-modified element
+            // type. Every other declarator path already carries `vla_sizes`;
+            // dropping them here is what left `int a[n][m]` indexing with a
+            // row stride of zero.
+            //
+            // `vla_sizes` runs outermost-first over the whole declarator,
+            // while only the element type matters after the array-to-pointer
+            // adjustment. The outermost dimension is the one that may be
+            // absent (`int a[][m]`), and C17 6.7.6.2p1 requires every later
+            // dimension to be present, so the element type's variable
+            // dimensions are exactly the trailing entries.
+            let elem_typ = self.types.get(typ_id).base;
+            let vm_dims = match elem_typ {
+                Some(elem) => {
+                    let want = self.variable_array_levels(elem);
+                    let skip = vla_sizes.len().saturating_sub(want);
+                    vla_sizes[skip..].to_vec()
+                }
+                None => Vec::new(),
+            };
+
+            params.push(RawParam {
+                name: name_opt,
+                typ: typ_id,
+                vm_dims,
+                symbol: None,
+            });
 
             // Declare parameter in temporary scope so later params can reference it
             // (C99 6.9.1p9: parameters are in scope for VLA sizes)
             if let Some(name) = name_opt {
-                let sym = Symbol::variable(name, typ_id, self.symbols.depth());
-                let _ = self.symbols.declare(sym);
+                let sym = Symbol::parameter(name, typ_id, self.symbols.depth());
+                if let Ok(sym_id) = self.symbols.declare(sym) {
+                    if let Some(last) = params.last_mut() {
+                        last.symbol = Some(sym_id);
+                    }
+                }
             }
 
             if self.is_special(b',') {
@@ -3288,17 +3345,12 @@ impl Parser<'_> {
 
                     // Bind parameters in function scope and create Parameter structs
                     let mut params = Vec::with_capacity(raw_params.len());
-                    for (param_name_opt, param_typ) in &raw_params {
-                        let symbol_id = if let Some(param_name) = param_name_opt {
-                            let param_sym =
-                                Symbol::parameter(*param_name, *param_typ, self.symbols.depth());
-                            self.symbols.declare(param_sym).ok()
-                        } else {
-                            None
-                        };
+                    for raw in &raw_params {
+                        let symbol_id = raw.symbol.map(|id| self.symbols.redeclare(id, raw.typ));
                         params.push(Parameter {
                             symbol: symbol_id,
-                            typ: *param_typ,
+                            typ: raw.typ,
+                            vm_dims: raw.vm_dims.clone(),
                         });
                     }
 
@@ -3465,17 +3517,12 @@ impl Parser<'_> {
 
                     // Bind parameters in function scope and create Parameter structs
                     let mut params = Vec::with_capacity(raw_params.len());
-                    for (param_name_opt, param_typ) in &raw_params {
-                        let symbol_id = if let Some(param_name) = param_name_opt {
-                            let param_sym =
-                                Symbol::parameter(*param_name, *param_typ, self.symbols.depth());
-                            self.symbols.declare(param_sym).ok()
-                        } else {
-                            None
-                        };
+                    for raw in &raw_params {
+                        let symbol_id = raw.symbol.map(|id| self.symbols.redeclare(id, raw.typ));
                         params.push(Parameter {
                             symbol: symbol_id,
-                            typ: *param_typ,
+                            typ: raw.typ,
+                            vm_dims: raw.vm_dims.clone(),
                         });
                     }
 
@@ -3601,8 +3648,8 @@ impl Parser<'_> {
                         // Update matching parameter type
                         if decl_name != StringId::EMPTY {
                             for param in &mut params {
-                                if param.0 == Some(decl_name) {
-                                    param.1 = decl_typ;
+                                if param.name == Some(decl_name) {
+                                    param.typ = decl_typ;
                                 }
                             }
                         }
@@ -3624,7 +3671,7 @@ impl Parser<'_> {
                 let is_inline = storage_class.contains(TypeModifiers::INLINE);
 
                 // Add function to symbol table so it can be called by other functions
-                let param_type_ids: Vec<TypeId> = params.iter().map(|(_, typ)| *typ).collect();
+                let param_type_ids: Vec<TypeId> = params.iter().map(|p| p.typ).collect();
                 let func_type =
                     Type::function(typ_id, param_type_ids.clone(), variadic, is_noreturn);
                 let func_type_id = self.types.intern(func_type);
@@ -3636,17 +3683,12 @@ impl Parser<'_> {
 
                 // Bind parameters in function scope and create Parameter structs
                 let mut final_params = Vec::with_capacity(params.len());
-                for (param_name_opt, param_typ) in &params {
-                    let symbol_id = if let Some(param_name) = param_name_opt {
-                        let param_sym =
-                            Symbol::parameter(*param_name, *param_typ, self.symbols.depth());
-                        self.symbols.declare(param_sym).ok()
-                    } else {
-                        None
-                    };
+                for raw in &params {
+                    let symbol_id = raw.symbol.map(|id| self.symbols.redeclare(id, raw.typ));
                     final_params.push(Parameter {
                         symbol: symbol_id,
-                        typ: *param_typ,
+                        typ: raw.typ,
+                        vm_dims: raw.vm_dims.clone(),
                     });
                 }
 
@@ -3671,7 +3713,7 @@ impl Parser<'_> {
                 // Skip __asm("...") symbol aliasing which can appear after function declarator
                 self.skip_extensions();
                 self.expect_special(b';')?;
-                let param_type_ids: Vec<TypeId> = params.iter().map(|(_, typ)| *typ).collect();
+                let param_type_ids: Vec<TypeId> = params.iter().map(|p| p.typ).collect();
                 let func_type = Type::function(typ_id, param_type_ids, variadic, is_noreturn);
                 let func_type_id = self.types.intern(func_type);
                 // Add to symbol table and capture SymbolId

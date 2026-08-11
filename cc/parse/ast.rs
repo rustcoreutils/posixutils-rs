@@ -1014,6 +1014,15 @@ pub struct Parameter {
     pub symbol: Option<SymbolId>,
     /// Parameter type (interned TypeId)
     pub typ: TypeId,
+    /// For a variably-modified array parameter, the run-time size expressions
+    /// of its *element* type, outermost first; empty for every other parameter.
+    ///
+    /// `int a[n][m]` is adjusted to `int (*a)[m]` (C17 6.7.6.3p7), so the
+    /// element type is `int[m]` and this holds `[m]`. The `int (*a)[m]`
+    /// spelling produces the same thing, which is why both index alike. These
+    /// expressions are what the prologue evaluates to recover a row stride;
+    /// without them a variably-modified element type has size 0.
+    pub vm_dims: Vec<Expr>,
 }
 
 /// A function definition

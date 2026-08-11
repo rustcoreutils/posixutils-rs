@@ -293,6 +293,31 @@ impl SymbolTable {
         self.scope_depth
     }
 
+    /// Re-declare an existing symbol in the current scope, updating its type.
+    ///
+    /// A function's parameters are parsed in a temporary scope so that a later
+    /// parameter's size expression can name an earlier one (C17 6.9.1p10).
+    /// Those expressions are kept and evaluated on entry to the function, so
+    /// the function scope has to bind the *same* symbols rather than fresh
+    /// ones -- otherwise `int a[n][m]` records an extent read from a slot the
+    /// body never writes, and every row stride derived from it is wrong.
+    pub fn redeclare(&mut self, id: SymbolId, typ: TypeId) -> SymbolId {
+        let depth = self.scope_depth;
+        let sym = &mut self.symbols[id.0 as usize];
+        sym.scope_depth = depth;
+        sym.typ = typ;
+        let key = (sym.name, sym.namespace);
+
+        self.scopes[self.current_scope as usize].symbols.push(id);
+        // At the front, exactly as `declare` does: `lookup` takes the first
+        // entry, so the front is the innermost binding. Appending instead
+        // leaves a parameter behind any outer symbol of the same name, and a
+        // parameter that fails to shadow a file-scope typedef turns `(name)`
+        // into a parenthesized type name.
+        self.name_map.entry(key).or_default().insert(0, id);
+        id
+    }
+
     /// Declare a symbol in the current scope
     ///
     /// Returns the SymbolId on success, or an error if redefinition

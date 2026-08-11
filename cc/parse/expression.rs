@@ -1316,7 +1316,7 @@ impl<'a> Parser<'a> {
                             self.advance(); // consume final ')'
                                             // Create function pointer type with actual parameter types
                             let param_type_ids: Vec<TypeId> =
-                                raw_params.iter().map(|(_, typ)| *typ).collect();
+                                raw_params.iter().map(|p| p.typ).collect();
                             let fn_type =
                                 Type::function(result_id, param_type_ids, variadic, false);
                             let fn_type_id = self.types.intern(fn_type);

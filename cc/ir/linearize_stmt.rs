@@ -267,7 +267,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     typ,
                     vla_size_sym: None,
                     vla_elem_type: None,
-                    vla_dim_syms: vec![],
+                    vm_row_dims: vec![],
                     is_indirect: false,
                 },
             );
@@ -416,76 +416,47 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// so that sizeof(vla) can be computed at runtime.
     pub(crate) fn linearize_vla_decl(&mut self, declarator: &crate::parse::ast::InitDeclarator) {
         let typ = declarator.typ;
-
-        // Get the element type by stripping only VLA dimensions from the array type.
-        // For int arr[n][4], vla_sizes has 1 element, so we strip 1 dimension to get int[4].
-        // For int arr[n][m], vla_sizes has 2 elements, so we strip 2 dimensions to get int.
-        let num_vla_dims = declarator.vla_sizes.len();
-        let mut elem_type = typ;
-        for _ in 0..num_vla_dims {
-            if self.types.kind(elem_type) == TypeKind::Array {
-                elem_type = self.types.base_type(elem_type).unwrap_or(self.types.int_id);
-            }
-        }
-        let elem_size = self.types.size_bytes(elem_type) as i64;
-
         let ulong_type = self.types.ulong_id;
 
-        // Evaluate all VLA size expressions, store each in a hidden local,
-        // and compute total element count.
-        // For int arr[n][m], we store n and m separately (for stride computation)
-        // and compute total_count = n * m.
-        let mut vla_dim_syms: Vec<PseudoId> = Vec::new();
+        // Walk every array level, pairing the run-time size expressions with
+        // the levels that actually need one -- a level with a constant extent
+        // takes none, so `int a[n][4][m]` consumes `n` then `m`. The element
+        // type is the innermost non-array type, which makes one uniform
+        // product of extents serve both the total element count and any row
+        // size computed later.
+        let decl_name = self.symbol_name(declarator.symbol);
+        let (dims, elem_type) = self.record_vm_extents(typ, &declarator.vla_sizes, &decl_name);
+
+        let elem_size = self.types.size_bytes(elem_type) as i64;
+
+        // Total element count is the product of every extent.
         let mut total_count: Option<PseudoId> = None;
-
-        for (dim_idx, vla_size_expr) in declarator.vla_sizes.iter().enumerate() {
-            let dim_size = self.linearize_expr(vla_size_expr);
-
-            // Create a hidden local to store this dimension's size
-            // This is needed for runtime stride computation in multi-dimensional VLAs
-            let dim_sym_id = self.alloc_pseudo();
-            let decl_name = self.symbol_name(declarator.symbol);
-            let dim_var_name = format!("__vla_dim{}_{}.{}", dim_idx, decl_name, dim_sym_id.0);
-            let dim_sym = Pseudo::sym(dim_sym_id, dim_var_name.clone());
-
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(dim_sym);
-                func.add_local(
-                    &dim_var_name,
-                    dim_sym_id,
-                    ulong_type,
-                    false, // not volatile
-                    false, // not atomic
-                    self.current_bb,
-                    None, // no explicit alignment
-                );
-            }
-
-            // Widen dimension size to 64-bit before storing
-            let dim_expr_typ = vla_size_expr.typ.unwrap_or(self.types.int_id);
-            let dim_size = self.emit_convert(dim_size, dim_expr_typ, ulong_type);
-            let store_dim_insn = Instruction::store(dim_size, dim_sym_id, 0, ulong_type, 64);
-            self.emit(store_dim_insn);
-            vla_dim_syms.push(dim_sym_id);
-
-            // Update running total count
+        for dim in &dims {
+            let val = match *dim {
+                VmDim::Const(n) => self.emit_const(n as i128, ulong_type),
+                VmDim::Sym(sym) => {
+                    let loaded = self.alloc_pseudo();
+                    self.emit(Instruction::load(loaded, sym, 0, ulong_type, 64));
+                    loaded
+                }
+            };
             total_count = Some(match total_count {
-                None => dim_size,
+                None => val,
                 Some(prev) => {
-                    // Multiply: prev * dim_size
                     let result = self.alloc_pseudo();
-                    let mul_insn = Instruction::new(Opcode::Mul)
-                        .with_target(result)
-                        .with_src(prev)
-                        .with_src(dim_size)
-                        .with_size(64)
-                        .with_type(self.types.ulong_id);
-                    self.emit(mul_insn);
+                    self.emit(Instruction::binop(
+                        Opcode::Mul,
+                        result,
+                        prev,
+                        val,
+                        ulong_type,
+                        64,
+                    ));
                     result
                 }
             });
         }
-        let num_elements = total_count.expect("VLA must have at least one size expression");
+        let num_elements = total_count.expect("VLA must have at least one dimension");
 
         // Create a hidden local variable to store the total number of elements
         // This is needed for sizeof(vla) to work at runtime
@@ -570,7 +541,9 @@ impl<'a> super::linearize::Linearizer<'a> {
                 typ: ptr_type,
                 vla_size_sym: Some(size_sym_id),
                 vla_elem_type: Some(elem_type),
-                vla_dim_syms,
+                // One index step consumes the outermost extent, so what a row
+                // still spans is everything after it.
+                vm_row_dims: dims[1..].to_vec(),
                 is_indirect: false,
             },
         );
@@ -635,7 +608,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 typ: declarator.typ,
                 vla_size_sym: None,
                 vla_elem_type: None,
-                vla_dim_syms: vec![],
+                vm_row_dims: vec![],
                 is_indirect: false,
             },
         );

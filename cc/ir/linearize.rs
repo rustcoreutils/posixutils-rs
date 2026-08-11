@@ -33,6 +33,19 @@ const DEFAULT_LABEL_MAP_CAPACITY: usize = 16;
 const DEFAULT_LOOP_DEPTH_CAPACITY: usize = 4;
 const DEFAULT_FILE_SCOPE_CAPACITY: usize = 16;
 
+/// One array extent of a variably-modified type.
+///
+/// A variably-modified type can mix constant and run-time extents
+/// (`int a[n][3][m]`), so each level records which it is.
+#[derive(Clone, Copy)]
+pub(crate) enum VmDim {
+    /// An extent known at compile time.
+    Const(usize),
+    /// An extent computed at run time and kept in a hidden local, so it
+    /// survives SSA and can be reloaded at each use.
+    Sym(PseudoId),
+}
+
 /// Information about a local variable
 #[derive(Clone)]
 pub(crate) struct LocalVarInfo {
@@ -45,10 +58,17 @@ pub(crate) struct LocalVarInfo {
     pub(crate) vla_size_sym: Option<PseudoId>,
     /// For VLAs: the element type (for sizeof computation)
     pub(crate) vla_elem_type: Option<TypeId>,
-    /// For multi-dimensional VLAs: symbols storing each dimension's size
-    /// For int arr[n][m], this contains [sym_for_n, sym_for_m]
-    /// These are needed to compute runtime strides for outer dimension access.
-    pub(crate) vla_dim_syms: Vec<PseudoId>,
+    /// Extents of this object's *element* type, outermost first: what one
+    /// index step leaves behind. Empty unless the element type is variably
+    /// modified.
+    ///
+    /// For a local `int b[n][m][k]` this is `[m, k]`; for a parameter
+    /// `int a[n][m]` (adjusted to `int (*a)[m]`) and for the `int (*a)[m]`
+    /// spelling alike it is `[m]`, which is why both index identically.
+    /// Indexing at depth `d` needs `product(vm_row_dims[d..]) *
+    /// sizeof(vla_elem_type)` -- a variably-modified type reports a
+    /// compile-time size of 0, so without this every such stride would be 0.
+    pub(crate) vm_row_dims: Vec<VmDim>,
     /// True if this local holds a pointer to the actual data (e.g., va_list parameters).
     /// When true, linearize_lvalue loads the pointer instead of taking the address.
     pub(crate) is_indirect: bool,
@@ -928,7 +948,7 @@ impl<'a> Linearizer<'a> {
                         typ, // Keep original va_list type for type checking
                         vla_size_sym: None,
                         vla_elem_type: None,
-                        vla_dim_syms: vec![],
+                        vm_row_dims: vec![],
                         is_indirect: true, // va_list param: local holds a pointer
                     },
                 );
@@ -1015,7 +1035,7 @@ impl<'a> Linearizer<'a> {
                         typ,
                         vla_size_sym: None,
                         vla_elem_type: None,
-                        vla_dim_syms: vec![],
+                        vm_row_dims: vec![],
                         is_indirect: false,
                     },
                 );
@@ -1058,7 +1078,7 @@ impl<'a> Linearizer<'a> {
                         typ,
                         vla_size_sym: None,
                         vla_elem_type: None,
-                        vla_dim_syms: vec![],
+                        vm_row_dims: vec![],
                         is_indirect: false,
                     },
                 );
@@ -1093,10 +1113,40 @@ impl<'a> Linearizer<'a> {
                         typ,
                         vla_size_sym: None,
                         vla_elem_type: None,
-                        vla_dim_syms: vec![],
+                        vm_row_dims: vec![],
                         is_indirect: false,
                     },
                 );
+            }
+        }
+
+        // Record the extents of any variably-modified parameter, now that
+        // every parameter is stored to a local and so nameable by a later
+        // one's size expression (C17 6.9.1p10 evaluates these on entry).
+        //
+        // `int a[n][m]` is adjusted to `int (*a)[m]`, so what needs sizing is
+        // the pointee. Without this the element type has a compile-time size
+        // of 0 and every row stride is 0.
+        for param in &func.params {
+            if param.vm_dims.is_empty() {
+                continue;
+            }
+            let Some(symbol_id) = param.symbol else {
+                continue;
+            };
+            let Some(pointee) = self.types.base_type(param.typ) else {
+                continue;
+            };
+
+            let name = self.symbol_name(symbol_id);
+            let vm_dims = param.vm_dims.clone();
+            let (dims, elem_type) = self.record_vm_extents(pointee, &vm_dims, &name);
+
+            if let Some(info) = self.locals.get_mut(&symbol_id) {
+                // A parameter *is* the row: one index step off the pointer
+                // consumes no extent of the pointee, so all of them remain.
+                info.vm_row_dims = dims;
+                info.vla_elem_type = Some(elem_type);
             }
         }
 
@@ -1583,7 +1633,7 @@ impl<'a> Linearizer<'a> {
                             typ: param_type,
                             vla_size_sym: None,
                             vla_elem_type: None,
-                            vla_dim_syms: vec![],
+                            vm_row_dims: vec![],
                             is_indirect: false,
                         },
                     );
@@ -1721,8 +1771,13 @@ impl<'a> Linearizer<'a> {
                 let arr = self.linearize_expr(ptr_expr);
                 let idx = self.linearize_expr(idx_expr);
                 let elem_type = self.expr_type(expr);
-                let elem_size = self.types.size_bits(elem_type) / 8;
-                let elem_size_val = self.emit_const(elem_size as i128, self.types.long_id);
+                // Same stride rule as the rvalue path: a variably-modified
+                // element type has no usable compile-time size, and this is
+                // the path that `a[i][j] = v` and `&a[i][j]` take.
+                let elem_size_val = self.vm_index_stride(ptr_expr).unwrap_or_else(|| {
+                    let elem_size = self.types.size_bits(elem_type) / 8;
+                    self.emit_const(elem_size as i128, self.types.long_id)
+                });
 
                 // Sign-extend index to 64-bit for proper pointer arithmetic (negative indices)
                 let idx_extended = self.emit_convert(idx, idx_type, self.types.long_id);
@@ -1979,6 +2034,172 @@ impl<'a> Linearizer<'a> {
         }
     }
 
+    /// Peel `Index` nodes off `expr` to reach the object being indexed,
+    /// returning it with the number of index steps that separate them.
+    ///
+    /// `b` gives depth 0, `b[i]` gives 1, `b[i][j]` gives 2. Anything that is
+    /// not an identifier under a chain of indexes has no recorded extents, so
+    /// it yields None and the caller falls back to the compile-time size.
+    fn vm_index_base(expr: &Expr) -> Option<(SymbolId, usize)> {
+        let mut depth = 0usize;
+        let mut cur = expr;
+        loop {
+            match &cur.kind {
+                ExprKind::Ident(symbol_id) => return Some((*symbol_id, depth)),
+                ExprKind::Index { array, .. } => {
+                    depth += 1;
+                    cur = array;
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// Record the extents of a variably-modified `array_type`, evaluating each
+    /// run-time one into a hidden local so it survives SSA.
+    ///
+    /// Returns the extents outermost-first, one per array level, together with
+    /// the innermost non-array element type. `vm_exprs` supplies a size
+    /// expression for each level whose extent is not a constant, in order, so
+    /// `int a[n][4][m]` consumes `n` then `m`.
+    ///
+    /// Both a local VLA declaration and a variably-modified parameter go
+    /// through here; keeping one implementation is the point, since the
+    /// original defect was a second path that never recorded extents at all.
+    pub(crate) fn record_vm_extents(
+        &mut self,
+        array_type: TypeId,
+        vm_exprs: &[Expr],
+        name: &str,
+    ) -> (Vec<VmDim>, TypeId) {
+        let ulong_type = self.types.ulong_id;
+        let mut dims: Vec<VmDim> = Vec::new();
+        let mut exprs = vm_exprs.iter();
+        let mut elem_type = array_type;
+
+        while self.types.kind(elem_type) == TypeKind::Array {
+            let level = elem_type;
+            elem_type = self.types.base_type(level).unwrap_or(self.types.int_id);
+
+            if let Some(n) = self.types.get(level).array_size {
+                dims.push(VmDim::Const(n));
+                continue;
+            }
+
+            let Some(size_expr) = exprs.next() else {
+                // An unspecified extent with no expression to evaluate, as in
+                // `int a[]`; the level contributes nothing measurable.
+                continue;
+            };
+
+            let dim_size = self.linearize_expr(size_expr);
+
+            let dim_sym_id = self.alloc_pseudo();
+            let dim_var_name = format!("__vla_dim{}_{}.{}", dims.len(), name, dim_sym_id.0);
+            let dim_sym = Pseudo::sym(dim_sym_id, dim_var_name.clone());
+            if let Some(func) = &mut self.current_func {
+                func.add_pseudo(dim_sym);
+                func.add_local(
+                    &dim_var_name,
+                    dim_sym_id,
+                    ulong_type,
+                    false, // not volatile
+                    false, // not atomic
+                    self.current_bb,
+                    None, // no explicit alignment
+                );
+            }
+
+            // Widen to 64-bit before storing.
+            let dim_expr_typ = size_expr.typ.unwrap_or(self.types.int_id);
+            let dim_size = self.emit_convert(dim_size, dim_expr_typ, ulong_type);
+            self.emit(Instruction::store(dim_size, dim_sym_id, 0, ulong_type, 64));
+            dims.push(VmDim::Sym(dim_sym_id));
+        }
+
+        (dims, elem_type)
+    }
+
+    /// Byte size of `product(dims) * sizeof(elem)`, evaluated at run time, or
+    /// None when the compile-time size is already correct.
+    ///
+    /// None means either that no extents remain -- the object is the
+    /// fully-indexed element -- or that every remaining extent is constant, in
+    /// which case the type carries its own size and no arithmetic is needed.
+    fn vm_extent_size(&mut self, dims: &[VmDim], elem: TypeId) -> Option<PseudoId> {
+        if !dims.iter().any(|d| matches!(d, VmDim::Sym(_))) {
+            return None;
+        }
+
+        let ulong = self.types.ulong_id;
+        let mut acc: Option<PseudoId> = None;
+        for dim in dims {
+            let val = match *dim {
+                VmDim::Const(n) => self.emit_const(n as i128, ulong),
+                VmDim::Sym(sym) => {
+                    // Reload at the point of use: the extent lives in a hidden
+                    // local precisely so it survives across basic blocks.
+                    let loaded = self.alloc_pseudo();
+                    self.emit(Instruction::load(loaded, sym, 0, ulong, 64));
+                    loaded
+                }
+            };
+            acc = Some(match acc {
+                None => val,
+                Some(prev) => {
+                    let result = self.alloc_pseudo();
+                    self.emit(Instruction::binop(
+                        Opcode::Mul,
+                        result,
+                        prev,
+                        val,
+                        ulong,
+                        64,
+                    ));
+                    result
+                }
+            });
+        }
+
+        let elem_size = self.types.size_bytes(elem) as i128;
+        let elem_size_val = self.emit_const(elem_size, ulong);
+        let total = self.alloc_pseudo();
+        self.emit(Instruction::binop(
+            Opcode::Mul,
+            total,
+            acc.expect("a Sym extent guarantees an accumulator"),
+            elem_size_val,
+            ulong,
+            64,
+        ));
+        Some(total)
+    }
+
+    /// Stride for one index step into `ptr_expr`, when what it denotes is a
+    /// variably-modified array reached by indexing a local.
+    fn vm_index_stride(&mut self, ptr_expr: &Expr) -> Option<PseudoId> {
+        let (symbol_id, depth) = Self::vm_index_base(ptr_expr)?;
+        let info = self.locals.get(&symbol_id).cloned()?;
+        let elem = info.vla_elem_type?;
+        let dims = info.vm_row_dims.get(depth..)?.to_vec();
+        self.vm_extent_size(&dims, elem)
+    }
+
+    /// Run-time size of the object `expr` denotes, when it is a
+    /// variably-modified array reached by indexing a local.
+    ///
+    /// `sizeof(a[0])` on `int a[n][m]` is `m * sizeof(int)`; the type alone
+    /// reports 0.
+    fn vm_sizeof_expr(&mut self, expr: &Expr) -> Option<PseudoId> {
+        let (symbol_id, depth) = Self::vm_index_base(expr)?;
+        // Depth 0 is the whole object, which `vla_size_sym` already covers.
+        let from = depth.checked_sub(1)?;
+        let info = self.locals.get(&symbol_id).cloned()?;
+        let elem = info.vla_elem_type?;
+        let dims = info.vm_row_dims.get(from..)?.to_vec();
+        self.vm_extent_size(&dims, elem)
+    }
+
     /// Linearize an array index expression (e.g., arr[i])
     pub(crate) fn linearize_index(&mut self, expr: &Expr, array: &Expr, index: &Expr) -> PseudoId {
         // In C, a[b] is defined as *(a + b), so either operand can be the pointer
@@ -2002,88 +2223,14 @@ impl<'a> Linearizer<'a> {
         let elem_type = self.expr_type(expr);
         let ptr_typ = self.types.long_id;
 
-        // Check if we're indexing a VLA's outer dimension
-        // This requires runtime stride computation.
-        // For int arr[n][m], accessing arr[i] needs stride = m * sizeof(int)
-        let elem_size_val = if let ExprKind::Ident(symbol_id) = &ptr_expr.kind {
-            if let Some(info) = self.locals.get(symbol_id).cloned() {
-                // Check if this is a multi-dimensional VLA AND elem_type is an array
-                // (meaning we're accessing an outer dimension, not the innermost)
-                if info.vla_dim_syms.len() > 1 && self.types.kind(elem_type) == TypeKind::Array {
-                    // Compute runtime stride:
-                    // stride = (product of inner dimensions) * sizeof(innermost element)
-                    // For int arr[n][m] accessing arr[i]: stride = m * sizeof(int)
-                    // For int arr[n][m][k] accessing arr[i]: stride = m * k * sizeof(int)
-
-                    // Get innermost element type and its size
-                    let mut innermost = elem_type;
-                    while self.types.kind(innermost) == TypeKind::Array {
-                        innermost = self.types.base_type(innermost).unwrap_or(self.types.int_id);
-                    }
-                    let innermost_size = self.types.size_bytes(innermost) as i64;
-
-                    // Load all dimension sizes except the first (outermost we're indexing)
-                    // and multiply them together
-                    let mut stride: Option<PseudoId> = None;
-                    for dim_sym in info.vla_dim_syms.iter().skip(1) {
-                        // Load the dimension size
-                        let dim_val = self.alloc_pseudo();
-                        let load_insn =
-                            Instruction::load(dim_val, *dim_sym, 0, self.types.ulong_id, 64);
-                        self.emit(load_insn);
-
-                        stride = Some(match stride {
-                            None => dim_val,
-                            Some(prev) => {
-                                let result = self.alloc_pseudo();
-                                self.emit(Instruction::binop(
-                                    Opcode::Mul,
-                                    result,
-                                    prev,
-                                    dim_val,
-                                    ptr_typ,
-                                    64,
-                                ));
-                                result
-                            }
-                        });
-                    }
-
-                    // Multiply by sizeof(innermost element)
-                    let innermost_size_val =
-                        self.emit_const(innermost_size as i128, self.types.long_id);
-                    match stride {
-                        Some(s) => {
-                            let result = self.alloc_pseudo();
-                            self.emit(Instruction::binop(
-                                Opcode::Mul,
-                                result,
-                                s,
-                                innermost_size_val,
-                                ptr_typ,
-                                64,
-                            ));
-                            result
-                        }
-                        None => innermost_size_val,
-                    }
-                } else {
-                    // Not a multi-dimensional VLA or accessing innermost dimension
-                    // Use compile-time size
-                    let elem_size = self.types.size_bits(elem_type) / 8;
-                    self.emit_const(elem_size as i128, self.types.long_id)
-                }
-            } else {
-                // Variable not found in locals (global or something else)
-                let elem_size = self.types.size_bits(elem_type) / 8;
-                self.emit_const(elem_size as i128, self.types.long_id)
-            }
-        } else {
-            // Not indexing an identifier directly (e.g., arr[i][j] where arr[i] is an Index)
-            // Use compile-time size
+        // A variably-modified element type reports a compile-time size of 0,
+        // so the stride has to come from the object's recorded extents. This
+        // covers every depth -- `b[i]`, `b[i][j]`, ... -- and locals and
+        // parameters alike, because both record their element type's extents.
+        let elem_size_val = self.vm_index_stride(ptr_expr).unwrap_or_else(|| {
             let elem_size = self.types.size_bits(elem_type) / 8;
             self.emit_const(elem_size as i128, self.types.long_id)
-        };
+        });
 
         // Sign-extend index to 64-bit for proper pointer arithmetic (negative indices)
         let idx_extended = self.emit_convert(idx, idx_type, self.types.long_id);
@@ -4154,6 +4301,12 @@ impl<'a> Linearizer<'a> {
                             return result;
                         }
                     }
+                }
+
+                // `sizeof(a[0])` on a variably-modified array: the row size is
+                // only known at run time, and the type reports 0.
+                if let Some(size) = self.vm_sizeof_expr(inner_expr) {
+                    return size;
                 }
 
                 // Non-VLA: compute size at compile time

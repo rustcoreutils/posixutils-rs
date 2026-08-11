@@ -130,6 +130,7 @@ fn test_parameter_stored_to_local() {
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: int_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Return(Some(Expr::var_typed(x_sym, int_type))),
         pos: test_pos(),
@@ -171,6 +172,7 @@ fn test_function_with_many_params() {
         .map(|&sym| Parameter {
             symbol: Some(sym),
             typ: int_type,
+            vm_dims: vec![],
         })
         .collect();
 
@@ -246,6 +248,7 @@ fn test_compound_assignment_deref() {
         params: vec![Parameter {
             symbol: Some(p_sym),
             typ: int_ptr_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Expr(assign_expr),
         pos: test_pos(),
@@ -316,10 +319,12 @@ fn test_compound_assignment_index() {
             Parameter {
                 symbol: Some(arr_sym),
                 typ: arr_ptr_type,
+                vm_dims: vec![],
             },
             Parameter {
                 symbol: Some(i_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
         ],
         body: Stmt::Expr(assign_expr),
@@ -390,6 +395,7 @@ fn test_simple_array_element_store() {
         params: vec![Parameter {
             symbol: Some(arr_sym),
             typ: arr_ptr_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Expr(assign_expr),
         pos: test_pos(),
@@ -477,14 +483,17 @@ fn test_nested_if_cfg_linking() {
             Parameter {
                 symbol: Some(outer_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
             Parameter {
                 symbol: Some(inner_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
             Parameter {
                 symbol: Some(x_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
         ],
         body: outer_if,
@@ -557,6 +566,7 @@ fn test_switch_basic() {
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: int_type,
+            vm_dims: vec![],
         }],
         body: switch_stmt,
         pos: test_pos(),
@@ -632,6 +642,7 @@ fn test_switch_with_break() {
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: int_type,
+            vm_dims: vec![],
         }],
         body: switch_stmt,
         pos: test_pos(),
@@ -708,6 +719,7 @@ fn test_do_while_basic() {
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: int_type,
+            vm_dims: vec![],
         }],
         body: do_while,
         pos: test_pos(),
@@ -787,10 +799,12 @@ fn test_do_while_with_break() {
             Parameter {
                 symbol: Some(x_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
             Parameter {
                 symbol: Some(cond_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
         ],
         body: do_while,
@@ -868,6 +882,7 @@ fn test_goto_forward() {
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: int_type,
+            vm_dims: vec![],
         }],
         body,
         pos: test_pos(),
@@ -945,6 +960,7 @@ fn test_goto_backward() {
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: int_type,
+            vm_dims: vec![],
         }],
         body,
         pos: test_pos(),
@@ -1021,6 +1037,7 @@ fn test_nested_loop_break() {
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: int_type,
+            vm_dims: vec![],
         }],
         body: outer_loop,
         pos: test_pos(),
@@ -1098,14 +1115,17 @@ fn test_nested_loop_continue() {
             Parameter {
                 symbol: Some(cond1_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
             Parameter {
                 symbol: Some(cond2_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
             Parameter {
                 symbol: Some(x_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
         ],
         body: outer_loop,
@@ -1166,6 +1186,7 @@ fn test_unary_logical_not() {
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: int_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Return(Some(not_expr)),
         pos: test_pos(),
@@ -1211,6 +1232,7 @@ fn test_unary_bitwise_not() {
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: int_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Return(Some(not_expr)),
         pos: test_pos(),
@@ -1256,6 +1278,7 @@ fn test_unary_negate() {
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: int_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Return(Some(neg_expr)),
         pos: test_pos(),
@@ -1301,6 +1324,7 @@ fn test_pre_increment() {
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: int_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Return(Some(inc_expr)),
         pos: test_pos(),
@@ -1358,6 +1382,7 @@ fn test_pointer_add_int() {
         params: vec![Parameter {
             symbol: Some(p_sym),
             typ: int_ptr_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Return(Some(add_expr)),
         pos: test_pos(),
@@ -1416,10 +1441,12 @@ fn test_pointer_difference() {
             Parameter {
                 symbol: Some(p_sym),
                 typ: int_ptr_type,
+                vm_dims: vec![],
             },
             Parameter {
                 symbol: Some(q_sym),
                 typ: int_ptr_type,
+                vm_dims: vec![],
             },
         ],
         body: Stmt::Return(Some(diff_expr)),
@@ -1478,10 +1505,12 @@ fn test_float_add() {
             Parameter {
                 symbol: Some(a_sym),
                 typ: double_type,
+                vm_dims: vec![],
             },
             Parameter {
                 symbol: Some(b_sym),
                 typ: double_type,
+                vm_dims: vec![],
             },
         ],
         body: Stmt::Return(Some(add_expr)),
@@ -1530,10 +1559,12 @@ fn test_float_comparison() {
             Parameter {
                 symbol: Some(a_sym),
                 typ: double_type,
+                vm_dims: vec![],
             },
             Parameter {
                 symbol: Some(b_sym),
                 typ: double_type,
+                vm_dims: vec![],
             },
         ],
         body: Stmt::Return(Some(cmp_expr)),
@@ -1581,6 +1612,7 @@ fn test_float_to_int_cast() {
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: double_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Return(Some(cast_expr)),
         pos: test_pos(),
@@ -1627,6 +1659,7 @@ fn test_int_to_float_cast() {
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: int_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Return(Some(cast_expr)),
         pos: test_pos(),
@@ -1818,10 +1851,12 @@ fn test_linearize_function_with_params() {
             Parameter {
                 symbol: Some(a_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
             Parameter {
                 symbol: Some(b_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
         ],
         body: Stmt::Return(Some(Expr::binary(
@@ -2075,6 +2110,7 @@ fn test_ssa_converts_local_to_phi() {
         params: vec![Parameter {
             symbol: Some(cond_sym),
             typ: int_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Block(vec![
             // int x = 1;
@@ -2204,10 +2240,12 @@ fn test_short_circuit_and() {
             Parameter {
                 symbol: Some(a_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
             Parameter {
                 symbol: Some(b_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
         ],
         body: Stmt::Return(Some(Expr::binary(
@@ -2262,10 +2300,12 @@ fn test_short_circuit_or() {
             Parameter {
                 symbol: Some(a_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
             Parameter {
                 symbol: Some(b_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
         ],
         body: Stmt::Return(Some(Expr::binary(
@@ -2336,10 +2376,12 @@ fn test_ternary_pure_uses_select() {
             Parameter {
                 symbol: Some(a_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
             Parameter {
                 symbol: Some(b_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
         ],
         body: Stmt::Return(Some(ternary)),
@@ -2415,6 +2457,7 @@ fn test_ternary_impure_uses_phi() {
         params: vec![Parameter {
             symbol: Some(a_sym),
             typ: int_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Return(Some(ternary)),
         pos: test_pos(),
@@ -2496,10 +2539,12 @@ fn test_ternary_with_assignment_uses_phi() {
             Parameter {
                 symbol: Some(a_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
             Parameter {
                 symbol: Some(b_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
         ],
         body: Stmt::Return(Some(ternary)),
@@ -2567,10 +2612,12 @@ fn test_ternary_with_post_increment_uses_phi() {
             Parameter {
                 symbol: Some(a_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
             Parameter {
                 symbol: Some(b_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
         ],
         body: Stmt::Return(Some(ternary)),
@@ -3330,6 +3377,7 @@ fn test_wide_string_literal_is_pure() {
         params: vec![Parameter {
             symbol: Some(cond_sym),
             typ: int_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Return(Some(ternary)),
         pos: test_pos(),
@@ -3589,6 +3637,7 @@ fn test_struct_deref_returns_address() {
         params: vec![Parameter {
             symbol: Some(p_sym),
             typ: struct_ptr_type_id,
+            vm_dims: vec![],
         }],
         body: Stmt::Return(Some(deref_p)),
         pos: test_pos(),
@@ -3643,6 +3692,7 @@ fn test_int_to_float_cast_has_src_typ() {
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: int_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Return(Some(cast_expr)),
         pos: test_pos(),
@@ -3692,6 +3742,7 @@ fn test_float_to_int_cast_has_src_typ() {
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: double_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Return(Some(cast_expr)),
         pos: test_pos(),
@@ -3741,6 +3792,7 @@ fn test_integer_extension_has_src_typ() {
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: char_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Return(Some(cast_expr)),
         pos: test_pos(),
@@ -3791,6 +3843,7 @@ fn test_float16_to_float_conversion() {
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: float16_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Return(Some(cast_expr)),
         pos: test_pos(),
@@ -3843,6 +3896,7 @@ fn test_float_to_float16_conversion() {
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: float_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Return(Some(cast_expr)),
         pos: test_pos(),
@@ -3895,6 +3949,7 @@ fn test_float16_to_int_conversion() {
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: float16_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Return(Some(cast_expr)),
         pos: test_pos(),
@@ -3947,6 +4002,7 @@ fn test_int_to_float16_conversion() {
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: int_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Return(Some(cast_expr)),
         pos: test_pos(),
@@ -4034,6 +4090,7 @@ fn test_alignof_expr_emits_setval() {
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: int_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Return(Some(alignof_expr)),
         pos: test_pos(),
@@ -4873,6 +4930,7 @@ fn test_valist_parameter_stored_as_pointer() {
         params: vec![Parameter {
             symbol: Some(va_sym),
             typ: valist_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Block(vec![]),
         pos: test_pos(),
@@ -5006,6 +5064,7 @@ fn test_valist_expression_decay() {
         params: vec![Parameter {
             symbol: Some(va_sym),
             typ: valist_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Block(vec![BlockItem::Declaration(ptr_decl)]),
         pos: test_pos(),
@@ -5564,6 +5623,7 @@ fn test_compound_literal_zero_init_lvalue() {
         params: vec![Parameter {
             symbol: Some(p_sym),
             typ: struct_ptr_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Block(vec![
             BlockItem::Statement(Box::new(Stmt::Expr(assign))),
@@ -5685,6 +5745,7 @@ fn test_conditional_short_circuit_arrow() {
         params: vec![Parameter {
             symbol: Some(entry_sym),
             typ: struct_ptr_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Block(vec![BlockItem::Statement(Box::new(Stmt::Return(Some(
             conditional,
@@ -5792,6 +5853,7 @@ fn compound_module(op: AssignOp, atomic: bool) -> (TestContext, Module) {
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: atomic_int,
+            vm_dims: vec![],
         }],
         body: Stmt::Block(vec![BlockItem::Statement(Box::new(Stmt::Expr(assign)))]),
         pos: test_pos(),

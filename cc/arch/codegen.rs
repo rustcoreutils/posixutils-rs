@@ -513,31 +513,52 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
     /// runtime walks the resulting array. A function may carry both
     /// attributes, so it can contribute an entry to each array rather than
     /// choosing between them.
+    ///
+    /// Entries are emitted in run order: prioritized first, ascending, then
+    /// the unprioritized ones in declaration order. ELF encodes that in the
+    /// section name and the linker sorts for us, but Mach-O has no priority to
+    /// encode -- `__mod_init_func` is run in the order the pointers appear --
+    /// so on that target emission order *is* the ordering, and a priority
+    /// meant nothing until it decided this order. Terminators need no separate
+    /// rule: both formats run them in reverse, so the same array order gives
+    /// the same reversal.
     pub fn emit_init_arrays(&mut self, functions: &[crate::ir::Function]) {
         // Pointer alignment, as a power of two; both supported targets are
         // 64-bit.
         const PTR_ALIGN_LOG2: u32 = 3;
 
-        let mut emitted_any = false;
-        for func in functions {
-            // An inline definition provides no external definition (C99
-            // 6.7.4p6), so the body-emitting loops skip it and there is no
-            // such symbol to point at. Naming it here produced an
-            // `.init_array` entry that failed to link.
-            if !func.emit {
-                continue;
-            }
-            for section in [
-                func.constructor.map(Directive::InitArray),
-                func.destructor.map(Directive::FiniArray),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                self.push_directive(section);
+        // An inline definition provides no external definition (C99 6.7.4p6),
+        // so the body-emitting loops skip it and there is no such symbol to
+        // point at. Naming it here produced an entry that failed to link.
+        let defined = || functions.iter().filter(|f| f.emit);
+
+        // An absent priority runs last, and a stable sort leaves equal
+        // priorities in declaration order.
+        fn ordered(mut v: Vec<(Option<u16>, &str)>) -> Vec<(Option<u16>, &str)> {
+            v.sort_by_key(|(priority, _)| priority.unwrap_or(u16::MAX));
+            v
+        }
+
+        let constructors = ordered(
+            defined()
+                .filter_map(|f| f.constructor.map(|p| (p, f.name.as_str())))
+                .collect(),
+        );
+        let destructors = ordered(
+            defined()
+                .filter_map(|f| f.destructor.map(|p| (p, f.name.as_str())))
+                .collect(),
+        );
+
+        let emitted_any = !constructors.is_empty() || !destructors.is_empty();
+        for (entries, section) in [
+            (constructors, Directive::InitArray as fn(_) -> Directive),
+            (destructors, Directive::FiniArray as fn(_) -> Directive),
+        ] {
+            for (priority, name) in entries {
+                self.push_directive(section(priority));
                 self.push_directive(Directive::Align(PTR_ALIGN_LOG2));
-                self.push_directive(Directive::QuadSym(Symbol::global(func.name.clone())));
-                emitted_any = true;
+                self.push_directive(Directive::QuadSym(Symbol::global(name.to_string())));
             }
         }
 

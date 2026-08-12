@@ -348,6 +348,22 @@ impl<'a> Linearizer<'a> {
             .unwrap_or_else(|| self.str(name).to_string())
     }
 
+    /// Whether any declaration of `name` in this translation unit said
+    /// `extern`. See [`crate::symbol::Symbol::has_extern_decl`].
+    pub(crate) fn has_extern_decl(&self, name: StringId) -> bool {
+        self.symbols
+            .lookup(name, crate::symbol::Namespace::Ordinary)
+            .is_some_and(|s| s.has_extern_decl)
+    }
+
+    /// Whether any declaration of `name` omitted `inline`.
+    /// See [`crate::symbol::Symbol::has_non_inline_decl`].
+    pub(crate) fn has_non_inline_decl(&self, name: StringId) -> bool {
+        self.symbols
+            .lookup(name, crate::symbol::Namespace::Ordinary)
+            .is_some_and(|s| s.has_non_inline_decl)
+    }
+
     /// Linearize a translation unit
     pub fn linearize(&mut self, tu: &TranslationUnit) -> Module {
         for item in &tu.items {
@@ -783,7 +799,7 @@ impl<'a> Linearizer<'a> {
         let modifiers = self.types.modifiers(func.return_type);
         let is_static = func.is_static;
         let is_inline = func.is_inline;
-        let _is_extern = modifiers.contains(TypeModifiers::EXTERN);
+        let is_extern = modifiers.contains(TypeModifiers::EXTERN);
         let is_noreturn = modifiers.contains(TypeModifiers::NORETURN);
 
         // Track non-static inline functions for semantic restriction checks
@@ -795,14 +811,36 @@ impl<'a> Linearizer<'a> {
         self.current_calling_conv = func.calling_conv;
 
         let mut ir_func = Function::new(self.emitted_name(func.name), func.return_type);
-        // For linkage:
-        // - static inline: internal linkage (same as static)
-        // - inline (without extern): inline definition only, internal linkage
-        // - extern inline: per C99, provides external definition, but since we
-        //   treat inline functions as internal linkage candidates for inlining,
-        //   avoid duplicate symbol errors when same inline function is defined
-        //   in multiple translation units
-        ir_func.is_static = is_static || is_inline;
+
+        // Whether this is an *inline definition*, which provides no external
+        // definition and so must not be emitted.
+        //
+        // C99 6.7.4p6: it is one if every file-scope declaration includes
+        // `inline` and none includes `extern`. Both halves matter, and both
+        // are whole-translation-unit questions rather than properties of this
+        // definition's own tokens -- the declaration that settles it is
+        // allowed to come afterwards, and in the standard idiom it does. They
+        // are therefore read back from the symbol.
+        //
+        // GNU inline, selected by `__gnu_inline__`, is the exact opposite on
+        // the `extern` question: there `extern inline` is the one that
+        // provides no external definition. glibc's `__fortify_function` relies
+        // on it.
+        //
+        // `static inline` is neither -- it has internal linkage and is emitted
+        // like any other static function.
+        let has_extern_decl = is_extern || self.has_extern_decl(func.name);
+        let all_decls_inline = !self.has_non_inline_decl(func.name);
+        let is_inline_definition = is_inline
+            && !is_static
+            && if func.attrs.gnu_inline {
+                has_extern_decl
+            } else {
+                !has_extern_decl && all_decls_inline
+            };
+
+        ir_func.is_static = is_static;
+        ir_func.emit = !is_inline_definition;
         ir_func.is_noreturn = is_noreturn;
         ir_func.is_inline = is_inline;
         ir_func.is_noinline = func.attrs.noinline;

@@ -5096,6 +5096,11 @@ impl CodeGenerator for X86_64CodeGen {
 
         // Emit functions
         for func in &module.functions {
+            // An inline definition is kept in the module so the inliner can
+            // use it, but provides no external definition -- see `Function::emit`.
+            if !func.emit {
+                continue;
+            }
             self.emit_function(func, types);
         }
 

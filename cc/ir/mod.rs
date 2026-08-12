@@ -1492,6 +1492,15 @@ pub struct Function {
     pub max_dom_level: u32,
     /// Is this function static (internal linkage)?
     pub is_static: bool,
+    /// Whether to emit a body for this function at all.
+    ///
+    /// False for an *inline definition* -- C99 6.7.4p6, or its GNU
+    /// counterpart selected by `__gnu_inline__`. Such a definition is fully
+    /// available for inlining but provides no external definition, so emitting
+    /// one puts a duplicate symbol in every object that includes the header.
+    /// The function stays in the module because the inliner still needs its
+    /// body; only the backends' emit loops skip it.
+    pub emit: bool,
     /// Is this function noreturn (never returns)?
     pub is_noreturn: bool,
     /// Is this function declared with the inline keyword?
@@ -1545,6 +1554,7 @@ impl Default for Function {
             locals: HashMap::with_capacity(DEFAULT_LOCAL_CAPACITY),
             max_dom_level: 0,
             is_static: false,
+            emit: true,
             is_noreturn: false,
             is_noinline: false,
             is_always_inline: false,

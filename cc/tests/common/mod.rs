@@ -128,6 +128,55 @@ fn compile_and_run_single(
     exit_code
 }
 
+/// Compile two translation units together, link them, and run the result.
+///
+/// Every other helper here compiles a single file, which cannot see the class
+/// of defect that only appears at link time: a definition emitted into two
+/// objects that should have been emitted into neither. `inline` in a shared
+/// header is the ordinary way to hit that.
+///
+/// Returns the program's exit status, or -1 if compiling or linking failed
+/// (with the toolchain's own message on stderr, since a duplicate-symbol error
+/// is the interesting outcome and is worth reading).
+pub fn compile_and_run_two_units(
+    name: &str,
+    unit_a: &str,
+    unit_b: &str,
+    extra_opts: &[String],
+) -> i32 {
+    let a = create_c_file(&format!("{}_a", name), unit_a);
+    let b = create_c_file(&format!("{}_b", name), unit_b);
+
+    let thread_id = format!("{:?}", std::thread::current().id());
+    let exe_path = std::env::temp_dir().join(format!(
+        "c17_exe2_{}_{}",
+        name,
+        thread_id.replace(|c: char| !c.is_alphanumeric(), "_")
+    ));
+
+    let mut args = vec!["-o".to_string(), exe_path.to_string_lossy().to_string()];
+    args.push(a.path().to_string_lossy().to_string());
+    args.push(b.path().to_string_lossy().to_string());
+    args.extend(extra_opts.iter().cloned());
+
+    let output = run_test_base("c17", &args, &[]);
+    if !output.status.success() {
+        eprintln!(
+            "c17 failed to build {} from two units:\n{}",
+            name,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return -1;
+    }
+
+    let run_output = Command::new(&exe_path)
+        .output()
+        .expect("failed to run executable");
+    let exit_code = run_output.status.code().unwrap_or(-1);
+    let _ = std::fs::remove_file(&exe_path);
+    exit_code
+}
+
 /// Compile inline C code and run with all matrix configurations.
 /// Returns 0 if all configurations pass, or the first non-zero exit code on failure.
 pub fn compile_and_run(name: &str, content: &str, extra_opts: &[String]) -> i32 {

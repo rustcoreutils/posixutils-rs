@@ -1075,6 +1075,21 @@ pub struct FunctionAttrs {
     /// `__attribute__((destructor))` -- run after `main` returns, or on
     /// `exit`. Encoded like [`FunctionAttrs::constructor`].
     pub destructor: Option<Option<u16>>,
+    /// `__attribute__((__gnu_inline__))` -- use GNU inline semantics for this
+    /// definition rather than C99's.
+    ///
+    /// The two are *opposite* on the question of which spelling emits an
+    /// external definition: C99 emits for `extern inline` and not for plain
+    /// `inline`, GNU emits for plain `inline` and not for `extern inline`.
+    /// This attribute is how a program selects the older meaning, and glibc's
+    /// `__fortify_function` relies on it to keep its wrappers out of every
+    /// object that includes `<string.h>`.
+    pub gnu_inline: bool,
+    /// `__attribute__((__artificial__))` -- present in glibc's headers, and
+    /// meaningful only to the debugger, which is told to step over the
+    /// function rather than into it. Recorded so `__has_attribute` can answer
+    /// for it; c17 emits no such debug annotation.
+    pub artificial: bool,
 }
 
 impl FunctionAttrs {
@@ -1087,6 +1102,8 @@ impl FunctionAttrs {
     pub fn merge(&mut self, other: &FunctionAttrs) {
         self.noinline |= other.noinline;
         self.always_inline |= other.always_inline;
+        self.gnu_inline |= other.gnu_inline;
+        self.artificial |= other.artificial;
         if let Some(prio) = other.constructor {
             self.constructor = Some(prio);
         }

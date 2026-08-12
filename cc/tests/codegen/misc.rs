@@ -12,7 +12,9 @@
 //
 
 use crate::codegen::asm_probe::{asm_for_with, AARCH64_LINUX, X86_64_LINUX};
-use crate::common::{compile_and_run, compile_and_run_optimized, create_c_file};
+use crate::common::{
+    compile_and_run, compile_and_run_optimized, compile_and_run_two_units, create_c_file,
+};
 use plib::testing::run_test_base;
 use std::io::Write;
 use std::process::Command;
@@ -6280,4 +6282,160 @@ int call(int x) { return myfn(x) + my_var; }
             "{triple}: the declared name must not be emitted:\n{asm}"
         );
     }
+}
+
+// ============================================================================
+// C99 and GNU inline: which definitions produce an external symbol
+// ============================================================================
+
+/// An `inline` function in a shared header must not become a symbol.
+///
+/// C99 6.7.4p6: a definition with `inline` and no `extern` in any declaration
+/// is an *inline definition* and "does not provide an external definition".
+/// c17 emitted one anyway, so the most ordinary use of `inline` there is --
+/// a small function in a header, included by two translation units -- failed
+/// to link with `multiple definition of`. gcc links it.
+///
+/// Compiled at `-O` because with no external definition anywhere the calls
+/// have to be inlined for the program to link at all. gcc is the same: at
+/// `-O0` it reports `undefined reference`. The next test covers the spelling
+/// that does not depend on the optimizer.
+#[test]
+fn codegen_inline_in_a_header_links_from_two_units() {
+    let header = "inline int hdr(int x) { return x * 2; }\n";
+    let unit_a = format!("{header}int a(int x) {{ return hdr(x); }}\n");
+    let unit_b = format!("{header}int a(int);\nint main(void) {{ return a(21) == 42 ? 0 : 1; }}\n");
+
+    assert_eq!(
+        compile_and_run_two_units("inline_header", &unit_a, &unit_b, &["-O".to_string()]),
+        0
+    );
+}
+
+/// The C99 idiom: a header's inline definition, plus one translation unit
+/// naming it `extern` to emit the single out-of-line copy.
+///
+/// This is the spelling that works without relying on the optimizer, and it
+/// exercises the ordering that makes the question hard -- the `extern`
+/// declaration comes *after* the definition, so whether the definition is an
+/// inline definition is not decidable when it is parsed.
+#[test]
+fn codegen_inline_header_with_one_extern_declaration() {
+    let header = "inline int hdr(int x) { return x * 2; }\n";
+    let unit_a = format!("{header}extern int hdr(int x);\nint a(int x) {{ return hdr(x); }}\n");
+    let unit_b = format!("{header}int a(int);\nint main(void) {{ return a(21) == 42 ? 0 : 1; }}\n");
+
+    assert_eq!(
+        compile_and_run_two_units("inline_header_extern", &unit_a, &unit_b, &[]),
+        0
+    );
+}
+
+/// The four inline spellings differ in whether they emit an external symbol.
+///
+/// Measured against gcc. Note C99 and GNU semantics are *opposite* for
+/// `extern inline`, which is exactly what `__gnu_inline__` selects:
+///
+/// | spelling                          | external definition? |
+/// |-----------------------------------|----------------------|
+/// | `static inline`                   | no (internal)        |
+/// | plain `inline`, no `extern` decl   | no                   |
+/// | `extern inline` (C99)             | yes                  |
+/// | `extern inline` + `__gnu_inline__` | no                   |
+#[test]
+fn codegen_inline_spellings_emit_the_right_symbols() {
+    let src = r#"
+static inline int si(int x) { return x + 1; }
+
+inline int pi(int x) { return x + 2; }
+
+extern int ei(int x);
+inline int ei(int x) { return x + 3; }
+
+extern __inline __attribute__((__gnu_inline__)) int gi(int x) { return x + 4; }
+
+/* Reference each one so nothing is dropped merely for being unused. */
+int use_all(int x) { return si(x) + pi(x) + ei(x) + gi(x); }
+"#;
+
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        let asm = asm_for_with("inline_spellings", triple, src, &["-O"]);
+
+        assert!(
+            asm.contains("ei:"),
+            "{triple}: C99 `extern inline` provides the external definition:\n{asm}"
+        );
+        assert!(
+            !asm.contains(".globl pi"),
+            "{triple}: a plain `inline` definition provides no external definition:\n{asm}"
+        );
+        assert!(
+            !asm.contains(".globl gi"),
+            "{triple}: `__gnu_inline__` provides no external definition:\n{asm}"
+        );
+        assert!(
+            !asm.contains(".globl si"),
+            "{triple}: `static inline` has internal linkage:\n{asm}"
+        );
+    }
+}
+
+/// A single declaration without `inline` demands an external definition.
+///
+/// C99 6.7.4p6 makes a definition an inline definition only if **all** the
+/// file-scope declarations include `inline`, so one bare declaration is enough
+/// to require the out-of-line copy. Missing this half of the rule left
+/// CPython's `_decimal` with `undefined symbol: mpd_set_positive`: libmpdec
+/// declares `void mpd_set_positive(mpd_t *);` in its header and defines it
+/// `inline __attribute__((always_inline))` in the .c file.
+///
+/// The bare declaration is tested on both sides of the definition, since
+/// neither position is decidable when the definition itself is parsed.
+#[test]
+fn codegen_a_bare_declaration_forces_an_external_definition() {
+    let src = r#"
+void before(int *r);
+inline __attribute__((always_inline)) void before(int *r) { *r = 1; }
+
+inline void after(int *r) { *r = 2; }
+void after(int *r);
+
+int use(int *a, int *b) { before(a); after(b); return 0; }
+"#;
+
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        let asm = asm_for_with("bare_decl_inline", triple, src, &["-O"]);
+        assert!(
+            asm.contains(".globl before"),
+            "{triple}: a bare declaration before the definition forces emission:\n{asm}"
+        );
+        assert!(
+            asm.contains(".globl after"),
+            "{triple}: a bare declaration after the definition forces emission:\n{asm}"
+        );
+    }
+}
+
+/// An inline definition still has to *work* when it cannot be inlined.
+///
+/// Taking a function's address forces an out-of-line body. For a plain
+/// `inline` definition the call must still reach the one external definition,
+/// which here lives in the other translation unit.
+#[test]
+fn codegen_inline_definition_reached_through_a_pointer() {
+    let unit_a = r#"
+inline int shared(int x) { return x * 3; }
+int extern_def(int x);
+int via_ptr(int x) { int (*fp)(int) = shared; return fp(x); }
+"#;
+    let unit_b = r#"
+extern int shared(int x);
+int shared(int x) { return x * 3; }   /* the external definition */
+int via_ptr(int);
+int main(void) { return via_ptr(14) == 42 ? 0 : 1; }
+"#;
+    assert_eq!(
+        compile_and_run_two_units("inline_ptr", unit_a, unit_b, &[]),
+        0
+    );
 }

@@ -103,6 +103,27 @@ pub struct Symbol {
     /// glibc's `__REDIRECT` uses this throughout the `_FORTIFY_SOURCE`
     /// headers, so ignoring it makes those headers fail to link.
     pub asm_label: Option<String>,
+
+    /// Whether *any* file-scope declaration of this name carried `extern`.
+    ///
+    /// C99 6.7.4p6 makes an `inline` definition an external definition only if
+    /// some declaration says `extern`, and that declaration is allowed to come
+    /// *after* the definition -- indeed the standard idiom puts it there, one
+    /// translation unit repeating `extern int f(int);` to emit the body. So the
+    /// question cannot be answered while the definition is being parsed.
+    /// Recording it on the symbol defers it: by the time the linearizer runs,
+    /// every declaration in the translation unit has been seen.
+    pub has_extern_decl: bool,
+
+    /// Whether any file-scope declaration of this name *omitted* `inline`.
+    ///
+    /// C99 6.7.4p6 makes a definition an inline definition only if **all** the
+    /// file-scope declarations include `inline`, so a single bare declaration
+    /// is enough to demand an external definition. libmpdec does exactly that
+    /// -- `mpdecimal.h` declares `void mpd_set_positive(mpd_t *);` while
+    /// `mpdecimal.c` defines it `inline __attribute__((always_inline))` -- and
+    /// missing this left CPython's `_decimal` with an undefined symbol.
+    pub has_non_inline_decl: bool,
 }
 
 impl Symbol {
@@ -118,6 +139,8 @@ impl Symbol {
             enum_value: None,
             explicit_align: None,
             asm_label: None,
+            has_extern_decl: false,
+            has_non_inline_decl: false,
         }
     }
 
@@ -133,6 +156,8 @@ impl Symbol {
             enum_value: None,
             explicit_align: None,
             asm_label: None,
+            has_extern_decl: false,
+            has_non_inline_decl: false,
         }
     }
 
@@ -148,6 +173,8 @@ impl Symbol {
             enum_value: None,
             explicit_align: None,
             asm_label: None,
+            has_extern_decl: false,
+            has_non_inline_decl: false,
         }
     }
 
@@ -163,6 +190,8 @@ impl Symbol {
             enum_value: Some(value),
             explicit_align: None,
             asm_label: None,
+            has_extern_decl: false,
+            has_non_inline_decl: false,
         }
     }
 
@@ -178,6 +207,8 @@ impl Symbol {
             enum_value: None,
             explicit_align: None,
             asm_label: None,
+            has_extern_decl: false,
+            has_non_inline_decl: false,
         }
     }
 
@@ -193,6 +224,8 @@ impl Symbol {
             enum_value: None,
             explicit_align: None,
             asm_label: None,
+            has_extern_decl: false,
+            has_non_inline_decl: false,
         }
     }
 

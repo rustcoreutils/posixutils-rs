@@ -34,20 +34,19 @@ to the target width -- nothing else has to change.
 
 Peeling this apart one layer at a time has been the only way to see it: each
 fix exposes the next blocker, and three of the layers are invisible until the
-one before it is in place. Four are done:
+one before it is in place. Five are done:
 
 1. `__builtin_object_size` computing real sizes rather than "unknown".
 2. Implicit declarations for the `__builtin___*_chk` family.
 3. Asm label renaming, so glibc's `__REDIRECT` aliases resolve.
 4. `always_inline`, so the fortified wrapper reaches the caller at all.
+5. Inline definitions emitting no external definition.
 
-**Layer 5 — `__gnu_inline__` / `extern inline` must emit no out-of-line
-definition.** glibc's `__fortify_function` is
-`extern __always_inline __attribute__((__gnu_inline__))`, which under GNU
-inline semantics defines *no* external symbol. c17 emits one anyway, so every
-translation unit that includes `<string.h>` defines a global `memcpy`,
-`strcpy`, `bcopy` and friends. Two such objects in one link fail with
-`multiple definition of 'memcpy'`; one silently overrides libc's.
+~~**Layer 5 — `__gnu_inline__` / `extern inline` must emit no out-of-line
+definition.**~~ Done. It turned out not to be a fortify problem at all: `inline`
+was never recorded on a function definition in the first place, so *every*
+spelling emitted an external definition and an `inline` function in a shared
+header failed to link.
 
 **Layer 6 — `__builtin_object_size` has to be folded after inlining.** The
 wrapper computes the size of its own `__dest` *parameter*, which is genuinely
@@ -57,10 +56,11 @@ fold until after inlining, when `__dest` is known to be the caller's `buf`.
 Fixing this means carrying the query into the IR and folding it in a
 post-inline pass that can trace a pointer back to its object.
 
-Until both land, predefining `__OPTIMIZE__` (which is what makes glibc compile
-the wrappers at all) is a regression rather than a fix: it has been implemented
-and reverted three times, most recently after measuring the duplicate-symbol
-failure above. The layers must land together, and the order is forced.
+Until layer 6 lands, predefining `__OPTIMIZE__` (which is what makes glibc
+compile the wrappers at all) is a regression rather than a fix: it has been
+implemented and reverted three times, most recently after measuring the
+duplicate-symbol failure that turned out to be layer 5. `__OPTIMIZE__` and
+layer 6 must land together.
 
 ### Stack frames are larger than gcc's
 

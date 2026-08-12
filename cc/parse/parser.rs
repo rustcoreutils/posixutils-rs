@@ -220,6 +220,14 @@ impl AttributeList {
             .any(|a| a.name == "always_inline" || a.name == "__always_inline__")
     }
 
+    /// Whether an attribute is present, in either spelling.
+    fn has_attr(&self, name: &str) -> bool {
+        let underscored = format!("__{name}__");
+        self.attrs
+            .iter()
+            .any(|a| a.name == name || a.name == underscored)
+    }
+
     /// Look up an attribute in both its plain and `__underscored__` spelling,
     /// returning its optional integer argument. The result distinguishes
     /// "absent" (`None`) from "present without a priority" (`Some(None)`).
@@ -252,6 +260,8 @@ impl AttributeList {
             always_inline: self.has_always_inline(),
             constructor: self.constructor_priority(),
             destructor: self.destructor_priority(),
+            gnu_inline: self.has_attr("gnu_inline"),
+            artificial: self.has_attr("artificial"),
         }
     }
 
@@ -338,6 +348,15 @@ pub struct Parser<'a> {
     /// to appear on the first declaration, but it does not require the
     /// definition to repeat it.
     declared_asm_labels: BTreeMap<StringId, String>,
+    /// Names for which some file-scope declaration carried `extern`.
+    ///
+    /// Kept beside the symbol table rather than only on the symbol because a
+    /// definition declares a *fresh* symbol that shadows the earlier
+    /// declaration's, and C99 6.7.4p6 asks about the whole translation unit.
+    declared_extern_fns: std::collections::BTreeSet<StringId>,
+    /// Names for which some file-scope declaration omitted `inline`.
+    /// See [`crate::symbol::Symbol::has_non_inline_decl`].
+    declared_non_inline_fns: std::collections::BTreeSet<StringId>,
     /// Set by `parse_type_specifier`: whether the specifier list actually
     /// named a type, rather than defaulting to `int`.
     ///
@@ -369,6 +388,8 @@ impl<'a> Parser<'a> {
             declared_fn_attrs: BTreeMap::new(),
             pending_asm_label: None,
             declared_asm_labels: BTreeMap::new(),
+            declared_extern_fns: std::collections::BTreeSet::new(),
+            declared_non_inline_fns: std::collections::BTreeSet::new(),
             saw_explicit_type: true,
         }
     }
@@ -817,19 +838,35 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Settle the asm label for a declaration of `name`, recording it on
-    /// whichever symbol is now bound to that name.
+    /// Record, on whichever symbol is now bound to `name`, the facts about it
+    /// that accumulate across every declaration in the translation unit.
     ///
-    /// Takes the label pending on this declarator if there is one, and
-    /// otherwise reuses whatever an earlier declaration of the same name
-    /// established. Both directions are needed: GCC requires the label on the
-    /// first declaration but not on the definition that follows it, and a
-    /// definition creates a fresh symbol that would otherwise not carry it.
+    /// Two of them so far -- the GCC asm label and whether anything said
+    /// `extern` -- and they share this helper because they share the problem
+    /// that makes them awkward: a redeclaration, and in particular a
+    /// definition, binds a *fresh* symbol that would not otherwise inherit
+    /// what earlier declarations established, and the declaration that settles
+    /// the question is allowed to come afterwards.
     ///
-    /// Consuming the pending label means a declaration list gives each
+    /// Consuming the pending asm label means a declaration list gives each
     /// declarator only the label written on it: in `int a __asm__("x"), b;`
     /// only `a` is renamed.
-    fn settle_asm_label(&mut self, name: StringId) {
+    fn settle_declaration_facts(&mut self, name: StringId, storage_class: TypeModifiers) {
+        // C99 6.7.4p6 asks whether *any* declaration of this name says
+        // `extern`, including ones not yet parsed, so accumulate rather than
+        // overwrite. See `Symbol::has_extern_decl`.
+        if storage_class.contains(TypeModifiers::EXTERN) {
+            self.declared_extern_fns.insert(name);
+        }
+        if !storage_class.contains(TypeModifiers::INLINE) {
+            self.declared_non_inline_fns.insert(name);
+        }
+        if let Some(id) = self.symbols.lookup_id(name, Namespace::Ordinary) {
+            let sym = self.symbols.get_mut(id);
+            sym.has_extern_decl |= self.declared_extern_fns.contains(&name);
+            sym.has_non_inline_decl |= self.declared_non_inline_fns.contains(&name);
+        }
+
         let label = match self.pending_asm_label.take() {
             Some(label) => {
                 self.declared_asm_labels.insert(name, label.clone());
@@ -3434,7 +3471,12 @@ impl Parser<'_> {
             | TypeModifiers::THREAD_LOCAL
             | TypeModifiers::TYPEDEF
             | TypeModifiers::AUTO
-            | TypeModifiers::REGISTER;
+            | TypeModifiers::REGISTER
+            // `inline` is a function specifier rather than a storage class,
+            // but it travels with them here: leaving it out made
+            // `FunctionDef::is_inline` false for every ordinary definition,
+            // and with it every consumer downstream.
+            | TypeModifiers::INLINE;
         let storage_class = base_type.modifiers & storage_class_mask;
         // For struct/union types with tags, use existing TypeId to preserve forward declarations
         let base_type_id = self.intern_type_with_tag(&base_type);
@@ -3575,7 +3617,7 @@ impl Parser<'_> {
                 };
 
                 let symbol = symbol_id.expect("declaration must have symbol");
-                self.settle_asm_label(name);
+                self.settle_declaration_facts(name, storage_class);
                 return Ok(ExternalDecl::Declaration(Declaration {
                     declarators: vec![InitDeclarator {
                         symbol,
@@ -3617,7 +3659,11 @@ impl Parser<'_> {
                 | TypeModifiers::TYPEDEF
                 | TypeModifiers::REGISTER
                 | TypeModifiers::AUTO
-                | TypeModifiers::THREAD_LOCAL;
+                | TypeModifiers::THREAD_LOCAL
+                // Without this a pointer-returning `inline` function loses the
+                // bit twice over -- `memcpy` returning `void *` is exactly the
+                // shape glibc uses.
+                | TypeModifiers::INLINE;
             let base_storage_class = self.types.modifiers(base_type_id) & storage_class_mask;
             if !base_storage_class.is_empty() {
                 let mut typ = self.types.get(typ_id).clone();
@@ -3673,7 +3719,7 @@ impl Parser<'_> {
                     // Add function to symbol table
                     let func_sym = Symbol::function(name, full_typ, self.symbols.depth());
                     let _ = self.symbols.declare(func_sym);
-                    self.settle_asm_label(name);
+                    self.settle_declaration_facts(name, storage_class);
 
                     // Get raw parameters - use decl_func_params which has names
                     let raw_params = decl_func_params.unwrap_or_default();
@@ -3750,7 +3796,7 @@ impl Parser<'_> {
                 };
 
                 let symbol = symbol_id.expect("declaration must have symbol");
-                self.settle_asm_label(name);
+                self.settle_declaration_facts(name, storage_class);
                 return Ok(ExternalDecl::Declaration(Declaration {
                     declarators: vec![InitDeclarator {
                         symbol,
@@ -3848,7 +3894,7 @@ impl Parser<'_> {
                 let func_type_id = self.types.intern(func_type);
                 let func_sym = Symbol::function(name, func_type_id, self.symbols.depth());
                 let _ = self.symbols.declare(func_sym);
-                self.settle_asm_label(name);
+                self.settle_declaration_facts(name, storage_class);
 
                 // Enter function scope for parameters
                 self.symbols.enter_scope();
@@ -3908,7 +3954,7 @@ impl Parser<'_> {
                         .or_else(|| self.symbols.lookup_id(name, Namespace::Ordinary))
                 };
                 let symbol = symbol_id.expect("function declaration must have symbol");
-                self.settle_asm_label(name);
+                self.settle_declaration_facts(name, storage_class);
                 return Ok(ExternalDecl::Declaration(Declaration {
                     declarators: vec![InitDeclarator {
                         symbol,
@@ -3960,7 +4006,11 @@ impl Parser<'_> {
                 | TypeModifiers::TYPEDEF
                 | TypeModifiers::REGISTER
                 | TypeModifiers::AUTO
-                | TypeModifiers::THREAD_LOCAL;
+                | TypeModifiers::THREAD_LOCAL
+                // Without this a pointer-returning `inline` function loses the
+                // bit twice over -- `memcpy` returning `void *` is exactly the
+                // shape glibc uses.
+                | TypeModifiers::INLINE;
             let base_storage_class = self.types.modifiers(typ_id) & storage_class_mask;
             if !base_storage_class.is_empty() {
                 let mut var_type = self.types.get(var_type_id).clone();
@@ -4046,7 +4096,7 @@ impl Parser<'_> {
         }
 
         let symbol = symbol.expect("symbol should be bound");
-        self.settle_asm_label(name);
+        self.settle_declaration_facts(name, storage_class);
         declarators.push(InitDeclarator {
             symbol,
             typ: var_type_id,
@@ -4130,7 +4180,7 @@ impl Parser<'_> {
                 });
             }
 
-            self.settle_asm_label(decl_name);
+            self.settle_declaration_facts(decl_name, storage_class);
             declarators.push(InitDeclarator {
                 symbol: decl_symbol.expect("symbol should be bound"),
                 typ: decl_type,

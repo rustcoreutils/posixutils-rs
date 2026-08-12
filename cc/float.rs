@@ -182,18 +182,36 @@ impl FloatVal {
         if biased <= 0 {
             // Subnormal: shift the significand down until the exponent is 1,
             // which is the smallest the format encodes.
-            let shift = 1 - biased;
-            if shift >= 64 {
+            //
+            // The bits shifted out are rounded away, not dropped. Truncating
+            // costs up to a full ulp on every subnormal, and it is directed
+            // rounding at that -- always toward zero -- where the rest of this
+            // conversion rounds to nearest, ties to even.
+            let shift = (1 - biased) as u32;
+            if shift > 64 {
                 return FloatVal {
                     neg,
                     exp: 0,
                     sig: 0,
                 };
             }
+            // Widened so that a 64-bit shift, which the smallest subnormal
+            // needs, is an ordinary shift rather than an overflow.
+            let wide = sig as u128;
+            let mut kept = (wide >> shift) as u64;
+            let rest = wide & ((1u128 << shift) - 1);
+            let half = 1u128 << (shift - 1);
+            if rest > half || (rest == half && kept & 1 != 0) {
+                kept += 1;
+            }
+            // Rounding up can carry into the integer bit, and a significand
+            // with its integer bit set is the smallest normal value rather
+            // than the largest subnormal one.
+            let exp = u16::from(kept & INTEGER_BIT != 0);
             return FloatVal {
                 neg,
-                exp: 0,
-                sig: sig >> shift,
+                exp,
+                sig: kept,
             };
         }
         FloatVal {
@@ -219,9 +237,10 @@ impl FloatVal {
             return if self.neg { -0.0 } else { 0.0 };
         }
 
-        // Re-normalize: a subnormal 80-bit value may still be a normal double
-        // is impossible (the range only shrinks), but the significand of a
-        // subnormal is not left-aligned, so align it first.
+        // Re-normalize before converting. A subnormal 80-bit value cannot
+        // become a normal double -- the range only shrinks -- but a
+        // subnormal's significand is not left-aligned, and the exponent
+        // arithmetic below assumes it is, so align it first.
         let shift = self.sig.leading_zeros();
         let sig = self.sig << shift;
         let unbiased = self.exp as i32 - BIAS - shift as i32 + if self.exp == 0 { 1 } else { 0 };
@@ -703,6 +722,13 @@ pub(crate) fn parse_decimal_float_parts(s: &str) -> Result<(u128, i32), ()> {
         return Err(());
     }
 
+    // Zero is zero at every exponent. The saturating paths below reason about
+    // the exponent alone, which is only sound for a non-zero significand:
+    // `0e6000` would otherwise come out as an infinity.
+    if digits.is_zero() {
+        return Ok((0, 0));
+    }
+
     // Well outside any target's range; let the caller's rounding produce the
     // infinity or zero rather than building a 16,000-bit number to find out.
     if exp10 > 5000 {
@@ -873,6 +899,60 @@ mod tests {
         assert_eq!(one, (0, 0x3FFF_0000_0000_0000));
         let neg = FloatVal::from_f64(-2.0).to_f128_bits();
         assert_eq!(neg, (0, 0xC000_0000_0000_0000));
+    }
+
+    #[test]
+    fn a_zero_significand_stays_zero_at_any_exponent() {
+        // The exponent alone says "far outside every format", but a zero
+        // significand is zero regardless -- `0e6000` is not an infinity.
+        for lit in ["0e6000", "0.0e9999", "0.000e6000", "00e10000"] {
+            let (mantissa, exp2) = parse_decimal_float_parts(lit).unwrap();
+            assert_eq!(mantissa, 0, "{lit} has a non-zero significand");
+            let v = FloatVal::from_parts(false, mantissa, exp2);
+            assert!(v.is_zero(), "{lit} converted to {}", v.to_f64());
+        }
+
+        // The underflow side of the same saturation, which was already right.
+        let (mantissa, exp2) = parse_decimal_float_parts("1e-9999").unwrap();
+        assert!(FloatVal::from_parts(false, mantissa, exp2).is_zero());
+    }
+
+    #[test]
+    fn subnormals_round_to_nearest_rather_than_truncate() {
+        // A 64-bit significand at unbiased exponent -16384 is shifted down by
+        // two to reach the subnormal encoding, so the low two bits decide.
+        // `from_parts` normalizes the mantissa to bit 63, which puts the
+        // unbiased exponent at `63 + exp2`.
+        const SUBNORMAL_BY_2: i32 = -16384 - 63;
+
+        // Dropped bits 0b11: above a half, so it rounds up. Truncation would
+        // leave 0x3FFF_FFFF_FFFF_FFFF.
+        let up = FloatVal::from_parts(false, u64::MAX as u128, SUBNORMAL_BY_2);
+        assert_eq!(up.key(), (false, 0, 1 << 62), "0b11 must round up");
+
+        // An exact tie with an odd kept value rounds up, to even.
+        let tie_odd = (1u128 << 63) | 0b110;
+        let tie_odd = FloatVal::from_parts(false, tie_odd, SUBNORMAL_BY_2);
+        assert_eq!(tie_odd.key(), (false, 0, (1 << 61) + 2), "tie goes to even");
+
+        // An exact tie with an even kept value stays put.
+        let tie_even = (1u128 << 63) | 0b010;
+        let tie_even = FloatVal::from_parts(false, tie_even, SUBNORMAL_BY_2);
+        assert_eq!(tie_even.key(), (false, 0, 1 << 61), "tie goes to even");
+
+        // Rounding up out of the subnormal range produces the smallest
+        // normal, not a subnormal with the integer bit set.
+        let carry = FloatVal::from_parts(false, u64::MAX as u128, -16383 - 63);
+        assert_eq!(carry.key(), (false, 1, INTEGER_BIT), "must carry to normal");
+
+        // At the far end, where the whole significand is shifted out, more
+        // than half of an ulp still rounds to the smallest subnormal rather
+        // than flushing to zero.
+        let tiny = FloatVal::from_parts(false, u64::MAX as u128, -16446 - 63);
+        assert_eq!(tiny.key(), (false, 0, 1), "must not flush to zero");
+        // Below half an ulp it does flush.
+        let zero = FloatVal::from_parts(false, 1u128 << 62, -16446 - 62);
+        assert!(zero.is_zero(), "below half an ulp flushes to zero");
     }
 
     #[test]

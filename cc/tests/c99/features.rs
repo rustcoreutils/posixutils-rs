@@ -673,3 +673,49 @@ int main(void) {
         0
     );
 }
+
+/// A zero significand is zero at any exponent, and a subnormal literal is
+/// rounded to nearest rather than truncated.
+///
+/// The decimal converter short-circuits an exponent far outside every target
+/// format, on the reasoning that the value can only be an infinity or a zero.
+/// That reasoning holds only for a non-zero significand: `0e6000` came out as
+/// an infinity. Separately, the subnormal encoding path shifted the
+/// significand down and dropped what fell off, which is directed rounding
+/// toward zero where every other path rounds to nearest.
+#[test]
+fn c99_extreme_float_literals() {
+    let code = r#"
+#include <float.h>
+
+double zero_big = 0e6000;
+double zero_small = 0.0e-9999;
+long double zero_ld = 0.000e5001;
+
+int main(void)
+{
+    if (zero_big != 0.0) return 1;
+    if (zero_small != 0.0) return 2;
+    if (zero_ld != 0.0L) return 3;
+    if (0e6000 != 0.0) return 4;
+
+    /* A non-zero significand still saturates as before. */
+    if (1e6000 <= DBL_MAX) return 5;
+    if (1e-6000 != 0.0) return 6;
+
+    /* The smallest subnormal double, and one that must round up to it
+       rather than truncate to zero. */
+    if (4.9406564584124654e-324 == 0.0) return 7;
+    if (3e-324 == 0.0) return 8;
+
+    /* Subnormal long doubles survive at all, and stay ordered. */
+    long double a = 3.6451995318824746025e-4951L;
+    long double b = 7.2903990637649492050e-4951L;
+    if (a == 0.0L) return 9;
+    if (!(a < b)) return 10;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_extreme_float_literals", code, &[]), 0);
+}

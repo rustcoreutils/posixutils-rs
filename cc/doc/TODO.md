@@ -118,12 +118,49 @@ rejected outright and the typedef route is rejected at the typedef. And
 `int *_Atomic p;` now parses -- it was a qualifier-list bug at file scope, not
 a missing feature.
 
-### C11 Thread-Local Storage — Dynamic Model
+### C11 Thread-Local Storage — General Dynamic
 
-Done: parser, symbol table, IR, x86-64 Local-Exec (`%fs:sym@TPOFF`) and Initial-Exec (`sym@GOTTPOFF`), AArch64 Local-Exec (`mrs tpidr_el0` + `tprel_hi12`/`tprel_lo12_nc`) and Initial-Exec (`gottpoff` / `gottpoff_lo12`).
+Done: parser, symbol table, IR, x86-64 Local-Exec (`%fs:sym@TPOFF`) and
+Initial-Exec (`sym@GOTTPOFF`), AArch64 Local-Exec (`mrs tpidr_el0` +
+`tprel_hi12`/`tprel_lo12_nc`) and Initial-Exec (`gottpoff` /
+`gottpoff_lo12`), and model selection: `-shared` and `-fPIC` take
+Initial-Exec, while `-fPIE` and a plain executable keep Local-Exec.
 
-**Remaining:**
-- General-Dynamic model (`_Thread_local` in shared libraries; `__tls_get_addr` on x86-64, `tlsdesc` on AArch64).
+**Remaining: the General Dynamic model** — `@TLSGD` plus a call to
+`__tls_get_addr` on x86-64, TLSDESC on AArch64, of which there is currently
+none. gcc uses it for `-fPIC`, where c17 uses Initial-Exec. Initial-Exec is a
+legitimate position-independent model and is correct for a shared object
+loaded at startup, but it requires the object's thread-locals to fit in the
+loader's static TLS surplus, so a large block fails at `dlopen`:
+
+```
+$ c17 -fPIC --shared -o lib.so libbig.c   # _Thread_local int big[600000];
+dlopen failed: ./lib.so: cannot allocate memory in static TLS block
+```
+
+gcc loads the same source. The failure is size-dependent — a small block fits
+in the surplus and works — so a test for this has to exceed it deliberately.
+
+**The hard part is the register allocator, not the relocations.** A
+synthesized call to `__tls_get_addr` must be declared call-like or live
+pseudos get allocated into the registers it clobbers. `is_call_like_x86_64`
+(`cc/arch/x86_64/regalloc.rs`) keys on `Opcode`, but General Dynamic would
+make `Load` / `Store` / `SymAddr` call-like *only when the operand is a TLS
+symbol* — an operand-granularity condition that list cannot express. Settle
+that before writing any emission code.
+
+New relocation spellings belong in the two typed places — the
+`MemAddr::format` match (`cc/arch/x86_64/lir.rs`) and the AArch64 instruction
+`emit` (`cc/arch/aarch64/lir.rs`) — not `Directive::Raw`. The
+synthesized-call idiom to copy is `emit_memcpy`
+(`cc/arch/x86_64/features.rs`).
+
+**Four latent Local-Exec sites** remain, none reachable from C source today:
+`loc_to_gp_operand`, the two inline-asm operand paths, and `loc_to_asm_string`
+(which formats a global as plain `name(%rip)` with no TLS handling at all).
+They emit a single memory operand, and Initial-Exec needs two instructions, so
+they cannot simply call `use_tls_ie` — closing them means giving those paths a
+way to emit a sequence.
 
 ---
 

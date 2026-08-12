@@ -6439,3 +6439,98 @@ int main(void) { return via_ptr(14) == 42 ? 0 : 1; }
         0
     );
 }
+
+// ============================================================================
+// Thread-local storage: which model each build mode selects
+// ============================================================================
+
+/// `-fPIC` must not leave thread-local access in the Local Exec model.
+///
+/// Local Exec bakes the offset from the thread pointer in at link time, which
+/// only works for the main executable. c17 recognised `-fPIC` and folded it
+/// into `pic_mode`, but the TLS decision reads `shared_mode`, so `-fPIC`
+/// silently produced `%fs:tv@TPOFF` -- a code-generation flag with no effect
+/// on code generation.
+///
+/// `pic_mode` is the wrong signal to have used, which is why the control test
+/// below matters: it is also set by `-fPIE` and by the PIE default, and a PIE
+/// executable *should* keep Local Exec, since it still resolves its own
+/// thread-locals at link time. gcc draws the line in the same place.
+///
+/// gcc goes further and uses General Dynamic here; Initial Exec is the
+/// strongest model c17 has, and is correct for a shared object loaded at
+/// startup. See `cc/doc/TODO.md` for what General Dynamic still needs.
+#[test]
+fn codegen_fpic_selects_a_position_independent_tls_model() {
+    let src = r#"
+_Thread_local int tv;
+int read_tls(int x) { return x + tv; }
+void write_tls(int x) { tv = x; }
+int *addr_tls(void) { return &tv; }
+"#;
+
+    for flags in [&["-O", "-fPIC"][..], &["-O", "--shared"][..]] {
+        let asm = asm_for_with("tls_pic", X86_64_LINUX, src, flags);
+        assert!(
+            asm.contains("@GOTTPOFF"),
+            "x86_64 {flags:?}: expected Initial Exec:\n{asm}"
+        );
+        assert!(
+            !asm.contains("@TPOFF"),
+            "x86_64 {flags:?}: Local Exec is not position independent:\n{asm}"
+        );
+
+        let asm = asm_for_with("tls_pic", AARCH64_LINUX, src, flags);
+        assert!(
+            asm.contains("gottpoff"),
+            "aarch64 {flags:?}: expected Initial Exec:\n{asm}"
+        );
+        assert!(
+            !asm.contains("tprel"),
+            "aarch64 {flags:?}: Local Exec is not position independent:\n{asm}"
+        );
+    }
+}
+
+/// An executable keeps the cheapest model, `-fPIE` included.
+///
+/// This is the control for the test above, and it is the one that constrains
+/// the fix: switching everything position-independent to Initial Exec would
+/// satisfy that test and break this one, because PIE is position independent
+/// yet still knows its own thread-locals' offsets at link time.
+#[test]
+fn codegen_local_exec_survives_for_a_plain_executable() {
+    let src = r#"
+_Thread_local int tv;
+int read_tls(int x) { return x + tv; }
+int *addr_tls(void) { return &tv; }
+"#;
+    for flags in [&["-O"][..], &["-O", "-fPIE"][..]] {
+        let asm = asm_for_with("tls_le", X86_64_LINUX, src, flags);
+        assert!(
+            asm.contains("@TPOFF") && !asm.contains("@GOTTPOFF"),
+            "x86_64 {flags:?}: an executable should use Local Exec:\n{asm}"
+        );
+
+        let asm = asm_for_with("tls_le", AARCH64_LINUX, src, flags);
+        assert!(
+            asm.contains("tprel") && !asm.contains("gottpoff"),
+            "aarch64 {flags:?}: an executable should use Local Exec:\n{asm}"
+        );
+    }
+}
+
+/// An `extern` thread-local is in another object, so its offset is never known
+/// at link time -- Initial Exec regardless of build mode.
+#[test]
+fn codegen_extern_thread_local_always_uses_initial_exec() {
+    let src = r#"
+extern _Thread_local int ev;
+int read_ev(int x) { return x + ev; }
+"#;
+    let asm = asm_for_with("tls_extern", X86_64_LINUX, src, &["-O"]);
+    assert!(
+        asm.contains("@GOTTPOFF"),
+        "x86_64: extern TLS needs Initial Exec even in an executable:\n{asm}"
+    );
+}

@@ -36,9 +36,14 @@ pub enum MemAddr {
     /// symbol@GOTPCREL(%rip) - GOT-relative addressing for external symbols on macOS
     GotPcrel(Symbol),
 
-    /// %fs:symbol@TPOFF - Thread-local storage Local Exec model (Linux x86-64)
-    /// Uses FS segment register to access thread-local variables defined in same executable
-    TlsIE(Symbol),
+    /// `%fs:symbol@TPOFF` - thread-local storage, **Local Exec** model
+    /// (Linux x86-64). The offset from the thread pointer is fixed at link
+    /// time, so this is only valid for a thread-local defined in the main
+    /// executable.
+    ///
+    /// Named `TlsIE` until it was noticed that it emits Local Exec, not
+    /// Initial Exec -- the Initial Exec spelling is `TlsGottpoff` below.
+    TlsLocalExec(Symbol),
 
     /// symbol@GOTTPOFF(%rip) - Thread-local storage Initial Exec model (Linux x86-64)
     /// For external TLS variables: load offset from GOT, then access %fs:(offset)
@@ -77,7 +82,7 @@ impl MemAddr {
             MemAddr::GotPcrel(sym) => {
                 format!("{}@GOTPCREL(%rip)", sym.format_for_target(target))
             }
-            MemAddr::TlsIE(sym) => {
+            MemAddr::TlsLocalExec(sym) => {
                 // Thread-local storage Local Exec model: %fs:symbol@TPOFF
                 format!("%fs:{}@TPOFF", sym.format_for_target(target))
             }

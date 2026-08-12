@@ -670,7 +670,12 @@ fn process_file(
     let emit_unwind_tables = !args.no_unwind_tables;
     let pie_mode = pie_enabled(args, target);
     let pic_mode = args.fpic || producing_shared(args) || pie_mode;
-    let shared_mode = producing_shared(args);
+    // `shared_mode` selects the TLS model and nothing else. `-fPIC` asks for
+    // code that can live in a shared object, which is exactly the condition
+    // Local Exec cannot satisfy, so it belongs here -- while `-fPIE` and the
+    // PIE default do not, because a PIE executable still resolves its own
+    // thread-locals at link time. gcc draws the line in the same place.
+    let shared_mode = producing_shared(args) || args.fpic;
     let mut codegen =
         arch::codegen::create_codegen(target.clone(), emit_unwind_tables, pic_mode, shared_mode);
     let asm = codegen.generate(&module, &types);

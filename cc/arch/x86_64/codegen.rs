@@ -204,7 +204,7 @@ impl X86_64CodeGen {
                 };
                 // Use TLS addressing for thread-local variables (Linux only)
                 if self.tls_symbols.contains(name) && self.base.target.os == Os::Linux {
-                    GpOperand::Mem(MemAddr::TlsIE(symbol))
+                    GpOperand::Mem(MemAddr::TlsLocalExec(symbol))
                 } else {
                     // Note: For GOT access (PIC mode/external symbols), special handling
                     // is needed - see emit_global_load* and emit_global_store* functions
@@ -231,13 +231,29 @@ impl X86_64CodeGen {
     /// memory operand, not a value. Getting this wrong is invisible on a read
     /// -- the bad address often still points at something mapped -- and
     /// segfaults on a write.
+    /// Whether a thread-local access must use the Initial Exec model rather
+    /// than Local Exec.
+    ///
+    /// Local Exec fixes the offset from the thread pointer at link time, which
+    /// only holds for the main executable and for a thread-local defined in
+    /// this object. Anything position-independent, and any symbol defined
+    /// elsewhere, needs the offset loaded from the GOT instead.
+    ///
+    /// `shared_mode` is set for `-shared` and for `-fPIC`, which asks for code
+    /// that can live in a shared object -- the same requirement. It is *not*
+    /// set for `-fPIE` or the PIE default, because a PIE executable still
+    /// resolves its own thread-locals at link time.
+    fn use_tls_ie(&self, name: &str) -> bool {
+        self.shared_mode || self.extern_symbols.contains(name)
+    }
+
     fn emit_tls_addr(&mut self, name: &str, dst: Reg) {
         let symbol = Symbol::global(name.to_string());
-        // Initial Exec for a symbol defined elsewhere or when building a
-        // shared object, matching what the load and store paths already
+        // Initial Exec for a symbol defined elsewhere or for any
+        // position-independent build, matching what the load and store paths
         // choose. General Dynamic, which is what a dlopen-able library really
-        // needs, is not implemented on either model yet.
-        if self.extern_symbols.contains(name) || self.shared_mode {
+        // needs, is not implemented on either architecture yet.
+        if self.use_tls_ie(name) {
             // movq sym@GOTTPOFF(%rip), %dst   ; the offset from the thread pointer
             // addq %fs:0, %dst                ; plus the thread pointer itself
             self.push_lir(X86Inst::Mov {
@@ -2031,7 +2047,7 @@ impl X86_64CodeGen {
                     // Use Initial Exec model for external TLS or when building shared libraries.
                     // PIE executables can use Local Exec for their own TLS variables.
                     let is_extern_tls = self.extern_symbols.contains(&name);
-                    let use_ie_model = is_extern_tls || self.shared_mode;
+                    let use_ie_model = is_extern_tls || self.use_tls_ie(&name);
 
                     if use_ie_model {
                         // Initial Exec: load offset from GOT, then load via FS segment
@@ -2050,7 +2066,7 @@ impl X86_64CodeGen {
                         // Local Exec: direct access via %fs:symbol@TPOFF
                         self.push_lir(X86Inst::Mov {
                             size: op_size,
-                            src: GpOperand::Mem(MemAddr::TlsIE(symbol)),
+                            src: GpOperand::Mem(MemAddr::TlsLocalExec(symbol)),
                             dst: GpOperand::Reg(dst),
                         });
                     }
@@ -2486,7 +2502,7 @@ impl X86_64CodeGen {
                     // or if we're building a shared library (also needs IE model).
                     // PIE executables can use Local Exec for their own TLS variables.
                     let is_extern_tls = self.extern_symbols.contains(&name);
-                    let use_ie_model = is_extern_tls || self.shared_mode;
+                    let use_ie_model = is_extern_tls || self.use_tls_ie(&name);
 
                     if use_ie_model {
                         // Initial Exec TLS model for external symbols:
@@ -2525,7 +2541,7 @@ impl X86_64CodeGen {
                         }
                     } else {
                         // Local Exec TLS model for local symbols: %fs:symbol@TPOFF
-                        let mem_addr = MemAddr::TlsIE(symbol);
+                        let mem_addr = MemAddr::TlsLocalExec(symbol);
                         if mem_size <= 16 {
                             let src_size = OperandSize::from_bits(mem_size);
                             if is_unsigned {
@@ -2803,7 +2819,7 @@ impl X86_64CodeGen {
                     // Use Initial Exec model for external TLS or when building shared libraries.
                     // PIE executables can use Local Exec for their own TLS variables.
                     let is_extern_tls = self.extern_symbols.contains(&name);
-                    let use_ie_model = is_extern_tls || self.shared_mode;
+                    let use_ie_model = is_extern_tls || self.use_tls_ie(&name);
 
                     if use_ie_model {
                         // Initial Exec: load offset from GOT, then store via FS segment
@@ -2822,7 +2838,7 @@ impl X86_64CodeGen {
                         self.push_lir(X86Inst::Mov {
                             size: op_size,
                             src: GpOperand::Reg(value_reg),
-                            dst: GpOperand::Mem(MemAddr::TlsIE(symbol)),
+                            dst: GpOperand::Mem(MemAddr::TlsLocalExec(symbol)),
                         });
                     }
                 } else if self.needs_got_access(&name) {

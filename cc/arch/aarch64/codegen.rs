@@ -2141,8 +2141,16 @@ impl Aarch64CodeGen {
     }
 
     /// Check if a TLS symbol should use the Initial Exec model.
-    /// IE is used for extern TLS symbols or when building shared libraries.
-    /// Local Exec is used for locally-defined TLS in non-shared executables.
+    ///
+    /// Local Exec fixes the offset from the thread pointer at link time, which
+    /// only holds for the main executable and for a thread-local defined in
+    /// this object. Anything position-independent, and any symbol defined
+    /// elsewhere, needs the offset loaded from the GOT instead.
+    ///
+    /// `shared_mode` is set for `-shared` and for `-fPIC`, which asks for code
+    /// that can live in a shared object -- the same requirement. It is *not*
+    /// set for `-fPIE` or the PIE default, because a PIE executable still
+    /// resolves its own thread-locals at link time.
     fn use_tls_ie(&self, name: &str) -> bool {
         self.shared_mode || self.extern_symbols.contains(name)
     }

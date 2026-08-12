@@ -567,7 +567,7 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         // C99 6.7.4p3: A non-static inline function cannot define a non-const
         // function-local static variable
-        if self.current_func_is_non_static_inline {
+        if self.current_func_is_inline_definition {
             let is_const = self
                 .types
                 .modifiers(declarator.typ)
@@ -577,7 +577,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     error(
                         pos,
                         &format!(
-                            "non-static inline function '{}' cannot define non-const static variable '{}'",
+                            "inline definition of '{}' cannot define non-const static variable '{}'",
                             self.current_func_name, name_str
                         ),
                     );

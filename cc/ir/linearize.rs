@@ -233,9 +233,10 @@ pub struct Linearizer<'a> {
     pub(crate) current_pos: Option<Position>,
     /// Target configuration (architecture, ABI details)
     pub(crate) target: &'a Target,
-    /// Whether current function is a non-static inline function
-    /// (used for enforcing C99 inline semantic restrictions)
-    pub(crate) current_func_is_non_static_inline: bool,
+    /// Whether the current function is an *inline definition* -- one that
+    /// provides no external definition, and is therefore the thing C99 6.7.4p3
+    /// constrains.
+    pub(crate) current_func_is_inline_definition: bool,
     /// Set of file-scope static variable names (for inline semantic checks)
     pub(crate) file_scope_statics: std::collections::HashSet<String>,
     /// Calling convention of the current function being linearized
@@ -277,7 +278,7 @@ impl<'a> Linearizer<'a> {
             static_locals: HashMap::with_capacity(DEFAULT_LABEL_MAP_CAPACITY),
             current_pos: None,
             target,
-            current_func_is_non_static_inline: false,
+            current_func_is_inline_definition: false,
             file_scope_statics: std::collections::HashSet::with_capacity(
                 DEFAULT_FILE_SCOPE_CAPACITY,
             ),
@@ -820,11 +821,6 @@ impl<'a> Linearizer<'a> {
         let is_extern = modifiers.contains(TypeModifiers::EXTERN);
         let is_noreturn = modifiers.contains(TypeModifiers::NORETURN);
 
-        // Track non-static inline functions for semantic restriction checks
-        // C99 6.7.4: non-static inline functions have restrictions on
-        // static variables they can access
-        self.current_func_is_non_static_inline = is_inline && !is_static;
-
         // Store calling convention from function attributes (e.g., __attribute__((sysv_abi)))
         self.current_calling_conv = func.calling_conv;
 
@@ -856,6 +852,15 @@ impl<'a> Linearizer<'a> {
             } else {
                 !has_extern_decl && all_decls_inline
             };
+
+        // C99 6.7.4p3 constrains an inline *definition*, not every non-static
+        // inline function: what it forbids -- naming an identifier with
+        // internal linkage, defining a modifiable static object -- would make
+        // the several inline definitions of a function differ from each other
+        // and from the external one. A definition that *is* the external
+        // definition, because some declaration of it says `extern`, is an
+        // ordinary function and may name whatever any function may name.
+        self.current_func_is_inline_definition = is_inline_definition;
 
         ir_func.is_static = is_static;
         ir_func.emit = !is_inline_definition;
@@ -3631,13 +3636,13 @@ impl<'a> Linearizer<'a> {
         else {
             // C99 6.7.4p3: A non-static inline function cannot refer to
             // a file-scope static variable
-            if self.current_func_is_non_static_inline && self.file_scope_statics.contains(&name_str)
+            if self.current_func_is_inline_definition && self.file_scope_statics.contains(&name_str)
             {
                 if let Some(pos) = self.current_pos {
                     error(
                         pos,
                         &format!(
-                            "non-static inline function '{}' cannot reference file-scope static variable '{}'",
+                            "inline definition of '{}' cannot reference file-scope static variable '{}'",
                             self.current_func_name, name_str
                         ),
                     );

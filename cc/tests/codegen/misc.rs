@@ -6618,3 +6618,43 @@ int main(void)
 "#;
     assert_eq!(compile_and_dlopen("tls_big", lib, main, &[]), 0);
 }
+
+/// C99 6.7.4p3 constrains an inline *definition*, not every non-static inline
+/// function.
+///
+/// The rule exists so that the several inline definitions of a function cannot
+/// differ from each other or from the external one: an inline definition must
+/// not name an identifier with internal linkage, nor define a modifiable
+/// object with static storage duration. A definition that *is* the external
+/// definition -- because some declaration of it says `extern`, which is the
+/// standard idiom for providing one -- is an ordinary function, and gcc
+/// accepts what this used to reject outright.
+#[test]
+fn codegen_inline_definition_constraint_only_binds_inline_definitions() {
+    let src = r#"
+#include <stdio.h>
+
+static const int table[4] = {1, 2, 3, 4};
+static int counter;
+
+/* An `extern` declaration makes this the external definition. */
+inline int get(int i) { return table[i]; }
+extern int get(int);
+
+/* `extern inline` says the same thing up front. */
+extern inline int bump(void) { return ++counter; }
+
+/* A static inline may always reach a file-scope static. */
+static inline int twice(int i) { return table[i] * 2; }
+
+int main(void)
+{
+    if (get(2) != 3) return 1;
+    if (bump() != 1) return 2;
+    if (bump() != 2) return 3;
+    if (twice(3) != 8) return 4;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("inline_extern_definition", src, &[]), 0);
+}

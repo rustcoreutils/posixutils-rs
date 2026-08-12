@@ -202,9 +202,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     Initializer::String(s.clone())
                 } else {
                     // Pointer - create a string constant and reference it
-                    let label = format!(".LC{}", self.module.strings.len());
-                    self.module.strings.push((label.clone(), s.clone()));
-                    Initializer::SymAddr(label)
+                    Initializer::SymAddr(self.module.add_string(s.clone()))
                 }
             }
 
@@ -216,10 +214,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     Initializer::WideString(s.clone())
                 } else {
                     // Pointer - create a wide string constant and reference it
-                    // Use .LWC prefix to avoid collision with regular .LC string labels
-                    let label = format!(".LWC{}", self.module.wide_strings.len());
-                    self.module.wide_strings.push((label.clone(), s.clone()));
-                    Initializer::SymAddr(label)
+                    Initializer::SymAddr(self.module.add_wide_string(s.clone()))
                 }
             }
 
@@ -484,9 +479,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             return Some((name, 0));
         }
         if let ExprKind::StringLit(lit) = &expr.kind {
-            let label = format!(".LC{}", self.module.strings.len());
-            self.module.strings.push((label.clone(), lit.clone()));
-            return Some((label, 0));
+            return Some((self.module.add_string(lit.clone()), 0));
         }
         self.eval_static_address(expr)
     }

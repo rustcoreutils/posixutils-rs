@@ -410,6 +410,17 @@ impl<'a> Parser<'a> {
         self.current().typ
     }
 
+    /// Whether the token *after* the current one is `(`.
+    ///
+    /// Used to tell a keyword being applied from the same word being used as
+    /// an ordinary identifier.
+    fn next_token_is_open_paren(&self) -> bool {
+        match self.tokens.get(self.pos + 1) {
+            Some(t) => matches!(t.value, TokenValue::Special(v) if v == b'(' as u32),
+            None => false,
+        }
+    }
+
     /// Peek at the current token's special value (if it's a Special token)
     pub(crate) fn peek_special(&self) -> Option<u32> {
         let token = self.current();
@@ -492,6 +503,31 @@ impl<'a> Parser<'a> {
     #[inline]
     pub(crate) fn str(&self, id: StringId) -> &str {
         self.idents.get(id)
+    }
+
+    /// Consume the identifier naming a declarator, rejecting keywords.
+    ///
+    /// Separate from [`Parser::expect_identifier`], which has eighteen callers
+    /// covering labels, struct tags, member references and `goto` targets --
+    /// all of which live in their own namespaces and may legitimately be
+    /// spelled with a word that is reserved here. Only a *declarator* name is
+    /// constrained, so only the declarator sites use this.
+    fn expect_declarator_name(&mut self) -> ParseResult<StringId> {
+        if self.peek() == TokenType::Ident {
+            if let Some(id) = self.get_ident_id(self.current()) {
+                if crate::kw::has_tag(id, crate::kw::RESERVED_NAME) {
+                    let pos = self.current_pos();
+                    return Err(ParseError::new(
+                        format!(
+                            "'{}' is a keyword and cannot be used as a name",
+                            self.str(id)
+                        ),
+                        pos,
+                    ));
+                }
+            }
+        }
+        self.expect_identifier()
     }
 
     /// Check if current position (after consuming '(') indicates a grouped declarator.
@@ -2127,6 +2163,15 @@ impl Parser<'_> {
                     base_kind = Some(TypeKind::VaList);
                 }
                 crate::kw::TYPEOF | crate::kw::GNU_TYPEOF | crate::kw::GNU_TYPEOF2 => {
+                    // `typeof` always takes a parenthesized operand, so
+                    // without one this is not a type specifier -- it is the
+                    // declarator's name. gcc accepts `int typeof;` in C17,
+                    // because `typeof` is a GNU extension rather than a C17
+                    // keyword; consuming it here and then demanding `(` made
+                    // c17 reject the declaration outright.
+                    if !self.next_token_is_open_paren() {
+                        break;
+                    }
                     self.advance(); // consume typeof
                     self.expect_special(b'(')?;
 
@@ -2806,13 +2851,13 @@ impl Parser<'_> {
             } else {
                 // Not a grouped declarator, restore position
                 self.pos = saved_pos;
-                (self.expect_identifier()?, None, None)
+                (self.expect_declarator_name()?, None, None)
             }
         } else {
             // Get the name directly, or use empty for abstract declarators
             // Abstract declarators have no name: void (*)(int) - the * has no identifier
             if self.peek() == TokenType::Ident {
-                (self.expect_identifier()?, None, None)
+                (self.expect_declarator_name()?, None, None)
             } else if self.is_special(b')')
                 || self.is_special(b'[')
                 || self.is_special(b'(')
@@ -2821,7 +2866,7 @@ impl Parser<'_> {
                 // No identifier - abstract declarator (e.g., void (*)(int), const char * restrict)
                 (StringId::EMPTY, None, None)
             } else {
-                (self.expect_identifier()?, None, None)
+                (self.expect_declarator_name()?, None, None)
             }
         };
 
@@ -3113,7 +3158,7 @@ impl Parser<'_> {
         }
 
         // Parse function name
-        let name = self.expect_identifier()?;
+        let name = self.expect_declarator_name()?;
 
         // Parse parameter list
         self.expect_special(b'(')?;
@@ -3814,7 +3859,7 @@ impl Parser<'_> {
         }
 
         // Parse name
-        let name = self.expect_identifier()?;
+        let name = self.expect_declarator_name()?;
 
         // Check for function definition vs declaration
         if self.is_special(b'(') {

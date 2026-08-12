@@ -581,3 +581,124 @@ fn diagnostics_generic_valid_forms_are_accepted() {
         compile_expect_ok(name, src);
     }
 }
+
+// ============================================================================
+// Keywords are not declarator names
+// ============================================================================
+
+/// A keyword cannot name an object, and the statement keywords are the worst
+/// of it: c17 accepted `int if;` and emitted a real symbol called `if`, into
+/// `.data`, that no later C translation unit could ever refer to.
+///
+/// The declarator-name check only rejected identifiers tagged `TYPE_KEYWORD`,
+/// which let through both the deliberately untagged `sizeof` family and every
+/// statement keyword.
+#[test]
+fn diagnostics_keywords_are_rejected_as_declarator_names() {
+    for kw in [
+        // Deliberately untagged so they cannot be mistaken for the start of a
+        // declaration; that is also what let them reach the name position.
+        "sizeof",
+        "_Generic",
+        "_Alignof",
+        "__alignof__",
+        "__alignof",
+        "_Static_assert",
+        "_Imaginary",
+        // Statement keywords.
+        "if",
+        "else",
+        "while",
+        "do",
+        "for",
+        "return",
+        "break",
+        "continue",
+        "goto",
+        "switch",
+        "case",
+        "default",
+    ] {
+        compile_expect_error(
+            &format!("kwname_{}", kw.trim_start_matches('_')),
+            &format!("int {kw};\nint main(void){{return 0;}}\n"),
+            "cannot be used as a name",
+        );
+    }
+}
+
+/// The same rule applies wherever a declarator name appears, not just at file
+/// scope. A struct member called `if` was accepted too, and `p->if` parsed.
+#[test]
+fn diagnostics_keywords_are_rejected_in_every_declarator_position() {
+    compile_expect_error(
+        "kwname_member",
+        "struct S { int if; };\nint main(void){return 0;}\n",
+        "cannot be used as a name",
+    );
+    compile_expect_error(
+        "kwname_param",
+        "int f(int while);\nint main(void){return 0;}\n",
+        "cannot be used as a name",
+    );
+    compile_expect_error(
+        "kwname_local",
+        "int main(void){ int return; return 0; }\n",
+        "cannot be used as a name",
+    );
+    compile_expect_error(
+        "kwname_func",
+        "int sizeof(void) { return 0; }\nint main(void){return 0;}\n",
+        "cannot be used as a name",
+    );
+}
+
+/// Words that are *not* C17 keywords must stay usable as names, which is the
+/// half of this that is easy to break. `alignof` and `typeof_unqual` are C23
+/// spellings, `_BitInt` is C23, and the rest are ordinary identifiers that
+/// merely appear in the keyword table for other purposes. gcc accepts every
+/// one of these in C17 mode.
+#[test]
+fn diagnostics_non_keywords_remain_usable_as_names() {
+    for name in [
+        "typeof_unqual",
+        "_BitInt",
+        "L",
+        "noreturn",
+        "aligned",
+        "packed",
+        "restrict_",
+    ] {
+        compile_expect_ok(
+            &format!("okname_{name}"),
+            &format!("int {name};\nint main(void){{ {name} = 1; return {name} - 1; }}\n"),
+        );
+    }
+
+    // These three are only usable in a *declaration* today; c17 still trips
+    // over them in expression position (`alignof = 1;` is a parse error, and
+    // `offsetof` / `setjmp` are expected to be followed by `(`), where gcc
+    // accepts all three. That is a separate, pre-existing gap in the
+    // expression parser -- nothing here touches it -- but the declarator name
+    // must at least keep working.
+    for name in ["alignof", "offsetof", "setjmp", "longjmp"] {
+        compile_expect_ok(
+            &format!("okdecl_{name}"),
+            &format!("int {name};\nint main(void){{ return 0; }}\n"),
+        );
+    }
+}
+
+/// A label and a struct tag live in their own namespaces, and the check must
+/// not reach them -- `expect_identifier` has eighteen callers.
+#[test]
+fn diagnostics_labels_and_tags_are_unaffected() {
+    compile_expect_ok(
+        "okname_label",
+        "int main(void){ int n = 0; done: if (n) goto done; return 0; }\n",
+    );
+    compile_expect_ok(
+        "okname_tag",
+        "struct offsetof { int x; };\nint main(void){ struct offsetof s; s.x = 0; return s.x; }\n",
+    );
+}

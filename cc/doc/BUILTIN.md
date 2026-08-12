@@ -141,12 +141,15 @@ duration cannot be initialized at all — neither `double _Complex z = 1.0 +
 These exist so glibc's fortified headers compile: with `_FORTIFY_SOURCE` set,
 `<string.h>` and `<stdio.h>` rewrite their functions in terms of them.
 
-**Limit:** `__builtin_object_size` always answers "unknown" (`(size_t)-1`)
-where gcc computes the real size — 10 for a `char[10]`. glibc's fortification
-is written to fall back to the unchecked call when the size is unknown, so
-code **compiles and runs correctly but is not actually fortified**. Building
-with `-D_FORTIFY_SOURCE=2` under c17 therefore buys nothing. See `#C12` in
-`../audit.md`.
+`__builtin_object_size` computes real sizes — 10 for a `char[10]` — and the
+`_chk` family has the implicit declarations glibc's headers expect.
+
+**Limit:** `-D_FORTIFY_SOURCE=2` still buys nothing, but no longer because of
+these builtins. c17 does not predefine `__OPTIMIZE__`, without which glibc
+compiles no fortified wrapper at all; and enabling it needs
+`__builtin_object_size` folded *after* inlining, since the wrapper measures its
+own parameter and would otherwise be handed "unknown". See `#C12` in
+`../audit.md` and the `_FORTIFY_SOURCE` entry in `TODO.md`.
 
 ## C11 Atomic Builtins
 

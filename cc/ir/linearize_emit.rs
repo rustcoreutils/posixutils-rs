@@ -767,6 +767,57 @@ impl<'a> super::linearize::Linearizer<'a> {
         result
     }
 
+    /// `-z` on a complex value: negate both parts (C17 6.5.3.3p3).
+    ///
+    /// A complex value travels by address, and the scalar unary path did not
+    /// know that: it negated the *address* as an integer and handed the result
+    /// on as though it were a complex object, so `creal(-z)` dereferenced a
+    /// small negative number and the program died on valid code.
+    ///
+    /// Returns the address of the result, as every complex-valued expression
+    /// does.
+    pub(crate) fn emit_complex_negate(&mut self, operand: &Expr, complex_typ: TypeId) -> PseudoId {
+        let base_typ = self.types.complex_base(complex_typ);
+        let base_bits = self.types.size_bits(base_typ);
+        let base_bytes = (base_bits / 8) as i64;
+
+        let addr = self.complex_operand_at_precision(operand, complex_typ);
+        let result = self.alloc_local_temp(complex_typ);
+
+        for offset in [0, base_bytes] {
+            let part = self.alloc_pseudo();
+            self.emit(Instruction::load(part, addr, offset, base_typ, base_bits));
+            let negated = self.alloc_pseudo();
+            self.emit(Instruction::unop(
+                Opcode::FNeg,
+                negated,
+                part,
+                base_typ,
+                base_bits,
+            ));
+            self.emit(Instruction::store(
+                negated, result, offset, base_typ, base_bits,
+            ));
+        }
+        result
+    }
+
+    /// The real part of a complex value, as the real type `target_typ`.
+    ///
+    /// C17 6.3.1.7p2: converting a complex value to a real type discards the
+    /// imaginary part. The conversion path treated the operand as an ordinary
+    /// scalar, so `(double) z` reinterpreted the *address* as a double.
+    pub(crate) fn emit_complex_to_real(&mut self, operand: &Expr, target_typ: TypeId) -> PseudoId {
+        let src_typ = self.expr_type(operand);
+        let base_typ = self.types.complex_base(src_typ);
+        let base_bits = self.types.size_bits(base_typ);
+
+        let addr = self.complex_operand_addr(operand);
+        let real = self.alloc_pseudo();
+        self.emit(Instruction::load(real, addr, 0, base_typ, base_bits));
+        self.emit_convert(real, base_typ, target_typ)
+    }
+
     /// Complex values are stored as two adjacent float/double values (real, imag)
     /// This function expands complex ops to operations on the component parts
     pub(crate) fn emit_complex_binary(
@@ -1159,6 +1210,56 @@ impl<'a> super::linearize::Linearizer<'a> {
         // block-copying.
         if let Some(result) = self.try_emit_atomic_assign(op, target, value) {
             return result;
+        }
+
+        // A compound assignment on a complex object is `t = t op v`
+        // (C17 6.5.16.2p3), and both sides travel by address. The scalar path
+        // below loaded the target's *address* as though it were the number, so
+        // `z += 1.0` computed on a pointer bit pattern and stored the result
+        // over the object -- the program then died reading it back.
+        if self.types.is_complex(target_typ) && op != AssignOp::Assign {
+            let binop = match op {
+                AssignOp::AddAssign => Some(BinaryOp::Add),
+                AssignOp::SubAssign => Some(BinaryOp::Sub),
+                AssignOp::MulAssign => Some(BinaryOp::Mul),
+                AssignOp::DivAssign => Some(BinaryOp::Div),
+                // Every other compound operator is a constraint violation on a
+                // complex operand; leave those to the path that reports it.
+                _ => None,
+            };
+
+            if let Some(binop) = binop {
+                let target_addr = self.linearize_lvalue(target);
+                let value_addr = if self.types.is_complex(value_typ) {
+                    self.complex_operand_at_precision(value, target_typ)
+                } else {
+                    self.promote_real_to_complex(value, target_typ)
+                };
+                let result_addr =
+                    self.emit_complex_binary(binop, target_addr, value_addr, target_typ);
+
+                let base_typ = self.types.complex_base(target_typ);
+                let base_bits = self.types.size_bits(base_typ);
+                let base_bytes = (base_bits / 8) as i64;
+                for offset in [0, base_bytes] {
+                    let part = self.alloc_pseudo();
+                    self.emit(Instruction::load(
+                        part,
+                        result_addr,
+                        offset,
+                        base_typ,
+                        base_bits,
+                    ));
+                    self.emit(Instruction::store(
+                        part,
+                        target_addr,
+                        offset,
+                        base_typ,
+                        base_bits,
+                    ));
+                }
+                return target_addr;
+            }
         }
 
         // For complex type assignment, handle specially - copy real and imag parts

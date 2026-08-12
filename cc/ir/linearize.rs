@@ -1942,8 +1942,18 @@ impl<'a> Linearizer<'a> {
 
     /// Linearize a type cast expression
     pub(crate) fn linearize_cast(&mut self, inner_expr: &Expr, cast_type: TypeId) -> PseudoId {
-        let src = self.linearize_expr(inner_expr);
         let src_type = self.expr_type(inner_expr);
+
+        // C17 6.3.1.7p2: converting a complex value to a real type keeps the
+        // real part and discards the imaginary one. Falling through to the
+        // scalar path reinterpreted the address the complex value travels by
+        // as the value itself, so `(double) z` produced a number in the range
+        // of a pointer bit pattern.
+        if self.types.is_complex(src_type) && !self.types.is_complex(cast_type) {
+            return self.emit_complex_to_real(inner_expr, cast_type);
+        }
+
+        let src = self.linearize_expr(inner_expr);
 
         // Emit conversion if needed
         let src_is_float = self.types.is_float(src_type);
@@ -3291,6 +3301,15 @@ impl<'a> Linearizer<'a> {
         // Handle AddrOf specially - we need the lvalue address, not the value
         if op == UnaryOp::AddrOf {
             return self.linearize_lvalue(operand);
+        }
+
+        // A complex value travels by address, so the scalar path below would
+        // negate the address rather than the number it points at.
+        if op == UnaryOp::Neg {
+            let typ = self.expr_type(expr);
+            if self.types.is_complex(typ) {
+                return self.emit_complex_negate(operand, typ);
+            }
         }
 
         // Handle PreInc/PreDec specially - they need store-back

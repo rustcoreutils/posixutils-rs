@@ -392,6 +392,33 @@ violation.
 
   Tests: `diagnostics_keywords_are_rejected_as_declarator_names`, `..._in_every_declarator_position`, `diagnostics_non_keywords_remain_usable_as_names`, `diagnostics_labels_and_tags_are_unaffected`.
 
+- [x] **#C19 — Three complex-valued expressions operated on the value's *address* instead of the value.** **Fixed.** **[probed]** Found by the Phase 4 sweep, which ran `_Complex` arithmetic differentially against gcc for the first time.
+
+  A complex value lives in memory and travels by address; three paths did not know that and treated the address as the number.
+
+  - **`-z` crashed.** The scalar unary path applied integer negation to the address, and the small negative number that produced was passed on as though it were a complex object, so `creal(-z)` dereferenced it. A segfault on valid code.
+  - **`z += 1.0` crashed**, for the same reason: only `AssignOp::Assign` had a complex arm, so every compound assignment computed on the address and stored the result over the object.
+  - **`(double) z` produced a number in the range of a pointer bit pattern** — 4.6e18 where gcc gives 3.0 — because the cast path reinterpreted the address rather than loading the real part. C17 6.3.1.7p2.
+
+  `emit_complex_negate`, `emit_complex_to_real` and a compound-assignment arm that reuses `emit_complex_binary` fix the three. Test: `c11_complex_unary_minus_and_real_cast`, covering negation at all three precisions (the part stride differs in each), negation nested in larger expressions, casts to `double`/`float`/`int`, and all four compound operators with both real and complex right-hand sides.
+
+  The same sweep found `_Complex` **correct** for multiply, divide, add, conjugate, `cabs`, mixed real/complex operands, equality, array elements, function arguments and returns, and the Annex G infinity rules — so these three were the gap, not the feature.
+
+- [ ] **#C20 — A `_Complex` struct member's initializer is silently dropped.** **Open, Major.** **[probed]** `struct S { double _Complex z; }; struct S s = { 1.0 + 2.0*I };` leaves `s.z` as `0 + 0i` under c17 and `1 + 2i` under gcc, with no diagnostic. The struct-initializer walk in `linearize_init` has no arm for a complex member, which is two adjacent base-type values rather than the scalar the field visit assumes. Found by the Phase 4 sweep.
+
+- [ ] **#C21 — Two `long double`-returning calls in one variadic argument list corrupt a caller's local.** **Open, Major.** **[probed]**
+
+  ```c
+  long double x = 1;
+  printf("%.1Lf\n", x);                    /* 1.0 */
+  printf("%.1Lf %.1Lf\n", f(1,2), f(3,4)); /* 3.0 7.0 -- both correct */
+  printf("%.1Lf\n", x);                    /* 0.0 under c17, 1.0 under gcc */
+  ```
+
+  The call results themselves are right; the *caller's* frame is damaged. Filed first as "long double argument passing", which the probe disproved: passing nine `long double` parameters, mixing them with `int`/`double`/`float`, reading them through `va_arg`, and passing a struct of two of them are all correct, as are `sizeof` and `_Alignof`. What breaks is a temporary for an x87 value outliving its slot when more than one such call feeds one argument list.
+
+  A separate, probably related defect: returning a **struct containing a `long double`** yields zero. `struct R { long double v; }; mk(3.25L).v` is 6.50 under gcc and 0.00 here. Found by the Phase 4 sweep.
+
 - [x] **#C17 — A bitfield narrower than `int` did not sign-extend on read.** **Fixed.** **[probed]** `struct C { signed char c:3; }; c.c = -4;` reads back as `4` under c17 and `-4` under gcc — a silent wrong value in ordinary code. `int a:4` is correct, so the defect is specific to a bitfield whose declared type is narrower than `int`; the read appears to extend from the declared type's width rather than the field's. The extension shifted by `storage_unit_bits - width`, but the extraction runs in a register of the *promoted* width, so for a one-byte unit it left the field's top bit at bit 7 — not the sign bit — and the arithmetic shift back saw a positive value. `int a:4` was correct only because its storage unit is 32 bits, which happens to equal the operation width. Test: `c99_signed_bitfields_sign_extend_at_every_declared_width`, covering every signed declared type at its extremes, `-1`, increment across the boundary, unsigned controls, and use in an expression. Found by the Phase F sweep.
 
 - [x] **#C18 — Struct layout is wrong when bitfields mix with other members.** **Fixed.** **[probed]** `struct D { char x; unsigned a:1; char y; }` was 4 bytes under gcc and **12** under c17; `struct C { int a:4; unsigned b:4; signed char c:3; }` was 4 under gcc and 8 under c17. Both are ABI-visible: a struct passed between a c17 object and a gcc one was laid out differently, so this was worse than a size mismatch.

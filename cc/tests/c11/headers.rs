@@ -440,3 +440,74 @@ fn c17_tgmath_handles_complex() {
         0
     );
 }
+
+/// Unary minus on a complex value, and a cast from complex to a real type.
+///
+/// A complex value travels by address, and neither path knew it. `-z` handed
+/// the *address* to the integer negate, so the result was a small negative
+/// integer that the next operation dereferenced -- `creal(-z)` segfaulted on
+/// valid code. A cast to `double` reinterpreted the address as the value.
+#[test]
+fn c11_complex_unary_minus_and_real_cast() {
+    let src = r#"
+        #include <complex.h>
+        #include <math.h>
+
+        static int near(double a, double b) { return fabs(a - b) < 1e-9; }
+
+        int main(void) {
+            double complex z = 3.0 + 4.0 * I;
+
+            double complex n = -z;
+            if (!near(creal(n), -3.0)) return 1;
+            if (!near(cimag(n), -4.0)) return 2;
+
+            /* Negation inside a larger expression, and applied twice. */
+            if (!near(creal(-(-z)), 3.0)) return 3;
+            if (!near(cimag(z + -z), 0.0)) return 4;
+            if (!near(creal(-z * 2.0), -6.0)) return 5;
+
+            /* Every precision, since the part stride differs in each. */
+            float complex fz = 1.5f + 2.5f * I;
+            if (!near(crealf(-fz), -1.5)) return 6;
+            if (!near(cimagf(-fz), -2.5)) return 7;
+
+            long double complex lz = 1.25L + 2.5L * I;
+            if (!near((double)creall(-lz), -1.25)) return 8;
+            if (!near((double)cimagl(-lz), -2.5)) return 9;
+
+            /* A cast to a real type keeps the real part and drops the
+               imaginary one (C17 6.3.1.7p2). */
+            double d = (double) z;
+            if (!near(d, 3.0)) return 10;
+            if ((int) z != 3) return 11;
+            float f = (float) z;
+            if (!near((double) f, 3.0)) return 12;
+
+            /* Compound assignment is `z = z op v`, and both sides travel by
+               address. `z += 1.0` used to compute on the address itself. */
+            double complex c = 3.0 + 4.0 * I;
+            c += 1.0;
+            if (!near(creal(c), 4.0) || !near(cimag(c), 4.0)) return 13;
+            c *= 2.0;
+            if (!near(creal(c), 8.0) || !near(cimag(c), 8.0)) return 14;
+            c -= 8.0 * I;
+            if (!near(creal(c), 8.0) || !near(cimag(c), 0.0)) return 15;
+            c /= 4.0;
+            if (!near(creal(c), 2.0) || !near(cimag(c), 0.0)) return 16;
+
+            /* ...including with a complex right-hand side. */
+            double complex q = 1.0 + 1.0 * I;
+            q *= 1.0 + 1.0 * I;
+            if (!near(creal(q), 0.0) || !near(cimag(q), 2.0)) return 17;
+            q += 3.0 - 2.0 * I;
+            if (!near(creal(q), 3.0) || !near(cimag(q), 0.0)) return 18;
+
+            return 0;
+        }
+    "#;
+    assert_eq!(
+        compile_and_run("c11_complex_unary_minus", src, &["-lm".to_string()]),
+        0
+    );
+}

@@ -64,8 +64,6 @@ pub struct Aarch64CodeGen {
     pub(super) extern_symbols: HashSet<String>,
     /// Thread-local storage symbols (need TLS access)
     pub(super) tls_symbols: HashSet<String>,
-    /// Shared library mode (affects TLS model selection)
-    shared_mode: bool,
     /// Position-independent code mode (for shared libraries)
     pic_mode: bool,
     /// Counter for generating unique labels (atomic loops, etc.)
@@ -105,7 +103,6 @@ impl Aarch64CodeGen {
             named_stack_param_bytes: 0,
             extern_symbols: HashSet::new(),
             tls_symbols: HashSet::new(),
-            shared_mode: false,
             pic_mode: false,
             unique_label_counter: 0,
             stack_alloc_size: 0,
@@ -2158,36 +2155,17 @@ impl Aarch64CodeGen {
         }
     }
 
-    /// Check if a TLS symbol should use the Initial Exec model.
-    ///
-    /// Local Exec fixes the offset from the thread pointer at link time, which
-    /// only holds for the main executable and for a thread-local defined in
-    /// this object. Anything position-independent, and any symbol defined
-    /// elsewhere, needs the offset loaded from the GOT instead.
-    ///
-    /// `shared_mode` is set for `-shared` and for `-fPIC`, which asks for code
-    /// that can live in a shared object -- the same requirement. It is *not*
-    /// set for `-fPIE` or the PIE default, because a PIE executable still
-    /// resolves its own thread-locals at link time.
+    /// Whether accessing the thread-local `name` needs the Initial Exec model
+    /// rather than Local Exec. See [`CodeGenBase::use_tls_ie`].
     fn use_tls_ie(&self, name: &str) -> bool {
-        self.use_tls_dynamic() || self.extern_symbols.contains(name)
-    }
-
-    /// Whether thread-local access must use the dynamic model.
-    ///
-    /// Initial Exec resolves the offset through the GOT at load time, which
-    /// requires the object's thread-locals to fit in the loader's static-TLS
-    /// surplus -- so a library `dlopen`ed later with a large block is rejected.
-    /// Must agree with the condition `ir::tls::expand_dynamic_tls` was given.
-    fn use_tls_dynamic(&self) -> bool {
-        self.shared_mode && self.base.target.os == Os::Linux
+        self.base.use_tls_ie(self.extern_symbols.contains(name))
     }
 
     /// Emit TLS address computation into dst register.
     /// After this call, dst holds the address of the TLS variable.
     fn emit_tls_addr(&mut self, name: &str, dst: Reg) {
         let sym = Symbol::global(name);
-        if self.use_tls_dynamic() {
+        if self.base.use_tls_dynamic() {
             // TLS descriptor, the dynamic model:
             //   adrp  x0, :tlsdesc:sym
             //   ldr   x1, [x0, #:tlsdesc_lo12:sym]   ; resolver entry point
@@ -4312,7 +4290,7 @@ impl CodeGenerator for Aarch64CodeGen {
     }
 
     fn set_shared_mode(&mut self, shared: bool) {
-        self.shared_mode = shared;
+        self.base.shared_mode = shared;
     }
 }
 

@@ -13,7 +13,7 @@ use crate::arch::lir::{Directive, EmitAsm, LirInst, Symbol};
 use crate::arch::DEFAULT_LIR_BUFFER_CAPACITY;
 use crate::float::FloatVal;
 use crate::ir::{Function, Initializer, Instruction, Module, Opcode};
-use crate::target::Target;
+use crate::target::{Os, Target};
 use crate::types::TypeTable;
 
 // ============================================================================
@@ -127,6 +127,10 @@ pub struct CodeGenBase<I: LirInst> {
     pub last_debug_file: u16,
     /// Whether to emit debug info (.file/.loc directives)
     pub emit_debug: bool,
+    /// Whether the output has to be able to live in a shared object, which is
+    /// what selects the thread-local access model. Set for `-shared` and for
+    /// `-fPIC`; see [`CodeGenBase::use_tls_dynamic`].
+    pub shared_mode: bool,
 }
 
 impl<I: LirInst + EmitAsm> CodeGenBase<I> {
@@ -141,7 +145,39 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             last_debug_line: 0,
             last_debug_file: 0,
             emit_debug: false,
+            shared_mode: false,
         }
+    }
+
+    /// Whether thread-local access must use the dynamic model.
+    ///
+    /// Initial Exec resolves the offset through the GOT at load time, which
+    /// requires the object's thread-locals to fit in the loader's static-TLS
+    /// surplus -- so a library `dlopen`ed later with a large block is rejected.
+    /// Only the dynamic model has no such limit.
+    ///
+    /// `shared_mode` is set for `-shared` and for `-fPIC`, which asks for code
+    /// that can live in a shared object -- the same requirement. It is *not*
+    /// set for `-fPIE` or the PIE default, because a PIE executable still
+    /// resolves its own thread-locals at link time.
+    ///
+    /// Must agree with the condition `ir::tls::expand_dynamic_tls` was given,
+    /// since that pass is what puts the address computation where the register
+    /// allocator can see it.
+    pub fn use_tls_dynamic(&self) -> bool {
+        self.shared_mode && self.target.os == Os::Linux
+    }
+
+    /// Whether a thread-local access must use the Initial Exec model rather
+    /// than Local Exec.
+    ///
+    /// Local Exec fixes the offset from the thread pointer at link time, which
+    /// only holds for the main executable and for a thread-local defined in
+    /// this object. Anything position-independent, and any symbol defined
+    /// elsewhere -- which is what `is_extern` reports -- needs the offset
+    /// loaded from the GOT instead.
+    pub fn use_tls_ie(&self, is_extern: bool) -> bool {
+        self.use_tls_dynamic() || is_extern
     }
 
     /// Push a LIR instruction to the buffer

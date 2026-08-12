@@ -652,7 +652,11 @@ fn process_file(
     // computed here rather than beside `create_codegen` below so that the pass
     // and the backend agree on the model from one expression.
     let shared_mode = producing_shared(args) || args.fpic;
-    ir::tls::expand_dynamic_tls(&mut module, shared_mode && target.os == target::Os::Linux);
+    ir::tls::expand_dynamic_tls(
+        &mut module,
+        shared_mode && target.os == target::Os::Linux,
+        types.void_ptr_id,
+    );
 
     dump_ir(args, &module, "post-tls");
 

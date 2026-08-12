@@ -6751,3 +6751,78 @@ int keep_me = 6;
         }
     }
 }
+
+/// The address of a thread-local is a pointer, and one per block is enough.
+///
+/// Under the dynamic model the address is computed by a call, so the
+/// computation is made explicit in the IR for the register allocator to see.
+/// It was typed with the *accessed* type, which is what the instruction
+/// carried -- so the address of a `__thread double` was a double as far as
+/// the allocator was concerned, and was given an SSE register to live in.
+/// And every reference produced its own computation, which under this model
+/// is one resolver call per reference rather than per value.
+#[test]
+fn codegen_dynamic_tls_address_is_a_pointer_computed_once() {
+    let src = r#"
+__thread double dv;
+__thread int iv;
+
+double read_double(void) { return dv + dv * 2.0; }
+int read_int(void) { return iv + iv; }
+"#;
+    let asm = asm_for_with("tls_addr_type", X86_64_LINUX, src, &["-O", "-fPIC"]);
+
+    let body = body_of(&asm, "read_double");
+    let calls = body.matches("@TLSCALL").count();
+    assert_eq!(
+        calls, 1,
+        "two references to one thread-local should resolve it once, not {calls} times:\n{body}"
+    );
+
+    let body = body_of(&asm, "read_int");
+    let calls = body.matches("@TLSCALL").count();
+    assert_eq!(
+        calls, 1,
+        "two references to one thread-local should resolve it once, not {calls} times:\n{body}"
+    );
+}
+
+/// The dynamic model still computes the right addresses and values.
+///
+/// The companion to the assembly test above: typing the address as a pointer
+/// and materializing it once must not change what the program reads or where
+/// it writes.
+#[test]
+fn codegen_dynamic_tls_double_round_trips() {
+    let lib = r#"
+__thread double dv = 2.5;
+__thread int iv = 7;
+double get_double(void) { return dv * 2.0 + dv; }
+int get_int(void) { return iv + iv; }
+double *addr_double(void) { return &dv; }
+void set_double(double v) { dv = v; }
+"#;
+    let main = r#"
+#include <dlfcn.h>
+int main(void)
+{
+    void *h = dlopen("./lib.so", RTLD_NOW);
+    if (!h) return 1;
+    double (*get_double)(void) = (double (*)(void))dlsym(h, "get_double");
+    int (*get_int)(void) = (int (*)(void))dlsym(h, "get_int");
+    double *(*addr_double)(void) = (double *(*)(void))dlsym(h, "addr_double");
+    void (*set_double)(double) = (void (*)(double))dlsym(h, "set_double");
+    if (!get_double || !get_int || !addr_double || !set_double) return 2;
+
+    if (get_double() != 7.5) return 3;
+    if (get_int() != 14) return 4;
+    if (*addr_double() != 2.5) return 5;
+
+    set_double(4.0);
+    if (get_double() != 12.0) return 6;
+    if (*addr_double() != 4.0) return 7;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_dlopen("tls_double", lib, main, &[]), 0);
+}

@@ -63,8 +63,6 @@ pub struct X86_64CodeGen {
     pub(super) tls_symbols: HashSet<String>,
     /// Position-independent code mode (for shared libraries and PIE)
     pic_mode: bool,
-    /// Shared library mode (affects TLS model selection)
-    shared_mode: bool,
     /// Long double constants to emit (label_bits -> value_bits).
     /// BTreeMap so the .rodata emission order in `emit_ld_constants`
     /// is deterministic (HashMap iteration would vary the layout
@@ -101,7 +99,6 @@ impl X86_64CodeGen {
             extern_symbols: HashSet::new(),
             tls_symbols: HashSet::new(),
             pic_mode: false,
-            shared_mode: false,
             ld_constants: std::collections::BTreeMap::new(),
             double_constants: std::collections::BTreeMap::new(),
             sym_type_sizes: HashMap::new(),
@@ -223,6 +220,12 @@ impl X86_64CodeGen {
         self.tls_symbols.contains(name) && self.base.target.os == Os::Linux
     }
 
+    /// Whether accessing the thread-local `name` needs the Initial Exec model
+    /// rather than Local Exec. See [`CodeGenBase::use_tls_ie`].
+    fn use_tls_ie(&self, name: &str) -> bool {
+        self.base.use_tls_ie(self.extern_symbols.contains(name))
+    }
+
     /// Compute the *address* of a thread-local into `dst`.
     ///
     /// Loading a thread-local's value takes one instruction, because the FS
@@ -231,39 +234,9 @@ impl X86_64CodeGen {
     /// memory operand, not a value. Getting this wrong is invisible on a read
     /// -- the bad address often still points at something mapped -- and
     /// segfaults on a write.
-    /// Whether a thread-local access must use the Initial Exec model rather
-    /// than Local Exec.
-    ///
-    /// Local Exec fixes the offset from the thread pointer at link time, which
-    /// only holds for the main executable and for a thread-local defined in
-    /// this object. Anything position-independent, and any symbol defined
-    /// elsewhere, needs the offset loaded from the GOT instead.
-    ///
-    /// `shared_mode` is set for `-shared` and for `-fPIC`, which asks for code
-    /// that can live in a shared object -- the same requirement. It is *not*
-    /// set for `-fPIE` or the PIE default, because a PIE executable still
-    /// resolves its own thread-locals at link time.
-    fn use_tls_ie(&self, name: &str) -> bool {
-        self.use_tls_dynamic() || self.extern_symbols.contains(name)
-    }
-
-    /// Whether thread-local access must use the dynamic model.
-    ///
-    /// Initial Exec resolves the offset through the GOT at load time, which
-    /// requires the object's thread-locals to fit in the loader's static-TLS
-    /// surplus -- so a library `dlopen`ed later with a large block is rejected.
-    /// Only the dynamic model has no such limit.
-    ///
-    /// Must agree with the condition `ir::tls::expand_dynamic_tls` was given,
-    /// since that pass is what puts the address computation where the register
-    /// allocator can see it.
-    fn use_tls_dynamic(&self) -> bool {
-        self.shared_mode && self.base.target.os == Os::Linux
-    }
-
     fn emit_tls_addr(&mut self, name: &str, dst: Reg) {
         let symbol = Symbol::global(name.to_string());
-        if self.use_tls_dynamic() {
+        if self.base.use_tls_dynamic() {
             // TLS descriptor, the dynamic model:
             //   leaq sym@TLSDESC(%rip), %rax
             //   call *sym@TLSCALL(%rax)      ; returns an OFFSET in %rax
@@ -2111,8 +2084,7 @@ impl X86_64CodeGen {
                     // Thread-local storage: use FS segment
                     // Use Initial Exec model for external TLS or when building shared libraries.
                     // PIE executables can use Local Exec for their own TLS variables.
-                    let is_extern_tls = self.extern_symbols.contains(&name);
-                    let use_ie_model = is_extern_tls || self.use_tls_ie(&name);
+                    let use_ie_model = self.use_tls_ie(&name);
 
                     if use_ie_model {
                         // Initial Exec: load offset from GOT, then load via FS segment
@@ -2566,8 +2538,7 @@ impl X86_64CodeGen {
                     // Check if this is an external TLS variable (needs Initial Exec model)
                     // or if we're building a shared library (also needs IE model).
                     // PIE executables can use Local Exec for their own TLS variables.
-                    let is_extern_tls = self.extern_symbols.contains(&name);
-                    let use_ie_model = is_extern_tls || self.use_tls_ie(&name);
+                    let use_ie_model = self.use_tls_ie(&name);
 
                     if use_ie_model {
                         // Initial Exec TLS model for external symbols:
@@ -2883,8 +2854,7 @@ impl X86_64CodeGen {
                     // Thread-local storage: use FS segment
                     // Use Initial Exec model for external TLS or when building shared libraries.
                     // PIE executables can use Local Exec for their own TLS variables.
-                    let is_extern_tls = self.extern_symbols.contains(&name);
-                    let use_ie_model = is_extern_tls || self.use_tls_ie(&name);
+                    let use_ie_model = self.use_tls_ie(&name);
 
                     if use_ie_model {
                         // Initial Exec: load offset from GOT, then store via FS segment
@@ -5253,6 +5223,6 @@ impl CodeGenerator for X86_64CodeGen {
     }
 
     fn set_shared_mode(&mut self, shared: bool) {
-        self.shared_mode = shared;
+        self.base.shared_mode = shared;
     }
 }

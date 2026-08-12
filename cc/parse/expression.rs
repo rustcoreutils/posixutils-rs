@@ -723,7 +723,8 @@ impl<'a> Parser<'a> {
                         | crate::kw::GNU_ALIGNOF
                         | crate::kw::GNU_ALIGNOF2
                         | crate::kw::ALIGNOF_C23
-                ) {
+                ) && !self.builtin_is_shadowed(name_id)
+                {
                     self.advance();
                     return self.parse_alignof();
                 }
@@ -2066,6 +2067,43 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Whether a declaration in scope displaces the builtin meaning the parser
+    /// would otherwise give `name_id`.
+    ///
+    /// `offsetof`, `alignof`, `setjmp` and `longjmp` are not C17 keywords --
+    /// the first is a macro, the second a C23 spelling, the last two ordinary
+    /// library functions -- so a program may use any of them as an identifier,
+    /// and gcc accepts that. Recognising them ahead of ordinary lookup made
+    /// them impossible to *use*: `int offsetof; offsetof = 1;` declared fine
+    /// and then reported "expected '('".
+    ///
+    /// `setjmp` and `longjmp` are the exception, and only against a *function*
+    /// declaration: `<setjmp.h>` declares exactly those, and they need code
+    /// generation an ordinary call cannot produce. A declaration of any other
+    /// kind -- a variable, a parameter, a typedef -- is unambiguously not that
+    /// function.
+    ///
+    /// The reserved spellings (`__builtin_*`, `_Alignof`, `__alignof__`) are
+    /// never displaced: C17 7.1.3 reserves them to the implementation in every
+    /// scope, so a program that declares one has no claim on the name.
+    fn builtin_is_shadowed(&self, name_id: StringId) -> bool {
+        let shadowed_by_any_decl = matches!(name_id, crate::kw::OFFSETOF | crate::kw::ALIGNOF_C23);
+        let shadowable = shadowed_by_any_decl
+            || matches!(
+                name_id,
+                crate::kw::SETJMP | crate::kw::SETJMP2 | crate::kw::LONGJMP | crate::kw::LONGJMP2
+            );
+        if !shadowable {
+            return false;
+        }
+
+        let Some(symbol_id) = self.symbols.lookup_id(name_id, Namespace::Ordinary) else {
+            return false;
+        };
+        shadowed_by_any_decl
+            || self.types.kind(self.symbols.get(symbol_id).typ) != TypeKind::Function
+    }
+
     /// Try to parse a builtin function expression.
     /// Returns `Some(result)` if `name_id` is a recognized builtin, `None` otherwise.
     fn parse_builtin_expr(
@@ -3138,9 +3176,12 @@ impl<'a> Parser<'a> {
                 if let TokenValue::Ident(id) = &token.value {
                     let name_id = *id;
 
-                    // Try builtin dispatch first
-                    if let Some(result) = self.parse_builtin_expr(name_id, token_pos) {
-                        return result;
+                    // Try builtin dispatch first, unless a declaration in scope
+                    // has claimed the name (see `builtin_is_shadowed`).
+                    if !self.builtin_is_shadowed(name_id) {
+                        if let Some(result) = self.parse_builtin_expr(name_id, token_pos) {
+                            return result;
+                        }
                     }
 
                     // Look up symbol to get type (during parsing, symbol is in scope)

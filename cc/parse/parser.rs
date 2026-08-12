@@ -60,6 +60,136 @@ impl std::error::Error for ParseError {}
 
 pub type ParseResult<T> = Result<T, ParseError>;
 
+/// The type specifiers seen while parsing one declaration specifier list.
+///
+/// C17 6.7.2p2 does not let a declaration name a type by accumulation: the
+/// specifiers must together be one of a fixed list of combinations. The
+/// specifier loop only tracked the resulting kind, each keyword overwriting
+/// the last, so an impossible combination named whichever type came last --
+/// `float double x;` was a `double`, `void int y;` an object of type void with
+/// a size of 4, and `long long long z;` a `long long`. All three were accepted
+/// silently, which makes this a wrong program rather than the missing
+/// diagnostic it was first filed as.
+///
+/// `short`, `long`, `signed` and `unsigned` are counted rather than recorded
+/// as data types, because the valid combinations pair them with `int`, and
+/// `long` with `double` -- they qualify a data type instead of naming one.
+#[derive(Default)]
+struct SpecifierTally {
+    /// Data-type specifiers, in source order, under their canonical spelling.
+    /// More than one is always a constraint violation.
+    data_types: Vec<(&'static str, Position)>,
+    short_count: u32,
+    long_count: u32,
+    signed_count: u32,
+    unsigned_count: u32,
+    /// Where the most recent `short`/`long`/`signed`/`unsigned` appeared, for
+    /// the diagnostic that reports it against an incompatible data type.
+    last_size: Option<(&'static str, Position)>,
+    last_sign: Option<(&'static str, Position)>,
+}
+
+impl SpecifierTally {
+    fn note_data_type(&mut self, name: &'static str, pos: Position) {
+        self.data_types.push((name, pos));
+    }
+
+    fn note_size(&mut self, name: &'static str, pos: Position) {
+        self.last_size = Some((name, pos));
+        if name == "short" {
+            self.short_count += 1;
+        } else {
+            self.long_count += 1;
+        }
+    }
+
+    fn note_sign(&mut self, name: &'static str, pos: Position) {
+        self.last_sign = Some((name, pos));
+        if name == "signed" {
+            self.signed_count += 1;
+        } else {
+            self.unsigned_count += 1;
+        }
+    }
+
+    /// Report every way this specifier list fails C17 6.7.2p2.
+    ///
+    /// Reporting rather than returning an error: a constraint violation needs a
+    /// diagnostic (C17 5.1.1.3), and the parser recovers with the type it had
+    /// already built, so one bad declaration does not cascade.
+    fn check(&self) {
+        if let Some((second, pos)) = self.data_types.get(1) {
+            diag::error_args(
+                *pos,
+                "two or more data types in declaration specifiers ('{0}' and '{1}')",
+                &[self.data_types[0].0, second],
+            );
+            return;
+        }
+
+        if self.signed_count > 0 && self.unsigned_count > 0 {
+            if let Some((_, pos)) = self.last_sign {
+                diag::error(
+                    pos,
+                    "both 'signed' and 'unsigned' in declaration specifiers",
+                );
+            }
+        } else if self.signed_count > 1 || self.unsigned_count > 1 {
+            if let Some((name, pos)) = self.last_sign {
+                diag::error_args(pos, "duplicate '{0}'", &[name]);
+            }
+        }
+
+        if self.short_count > 0 && self.long_count > 0 {
+            if let Some((_, pos)) = self.last_size {
+                diag::error(pos, "both 'short' and 'long' in declaration specifiers");
+            }
+        } else if self.short_count > 1 {
+            if let Some((_, pos)) = self.last_size {
+                diag::error(pos, "duplicate 'short'");
+            }
+        } else if self.long_count > 2 {
+            if let Some((_, pos)) = self.last_size {
+                diag::error(pos, "'long long long' is too long for c17");
+            }
+        }
+
+        let data_type = self.data_types.first().map(|(name, _)| *name);
+
+        // `short` and `long` pair with `int`; `long` alone also pairs with
+        // `double`. Nothing else.
+        let size_ok = match data_type {
+            None | Some("int") => true,
+            Some("double") => self.short_count == 0 && self.long_count == 1,
+            _ => false,
+        };
+        if !size_ok {
+            if let (Some((size, pos)), Some(data)) = (self.last_size, data_type) {
+                diag::error_args(
+                    pos,
+                    "both '{0}' and '{1}' in declaration specifiers",
+                    &[size, data],
+                );
+            }
+        }
+
+        // `signed` and `unsigned` pair with the integer types only.
+        let sign_ok = matches!(
+            data_type,
+            None | Some("int") | Some("char") | Some("__int128")
+        );
+        if !sign_ok {
+            if let (Some((sign, pos)), Some(data)) = (self.last_sign, data_type) {
+                diag::error_args(
+                    pos,
+                    "both '{0}' and '{1}' in declaration specifiers",
+                    &[sign, data],
+                );
+            }
+        }
+    }
+}
+
 /// Raw parameter info gathered while parsing a parameter list.
 #[derive(Debug, Clone)]
 pub(crate) struct RawParam {
@@ -1911,6 +2041,8 @@ impl Parser<'_> {
     /// Parse a type specifier
     /// Parse a type specifier, reporting whether one was actually present.
     ///
+    /// See [`SpecifierTally`] for the C17 6.7.2p2 combination check this makes.
+    ///
     /// The flag has to be written on *every* path out, including the early
     /// returns for struct/union/enum/typeof. Leaving a stale value behind is
     /// invisible until the next declaration inherits it: a K&R identifier list
@@ -1924,6 +2056,12 @@ impl Parser<'_> {
         // Track typedef type separately - we continue parsing after a typedef
         // to collect trailing qualifiers like "z_word_t const"
         let mut typedef_base: Option<TypeId> = None;
+        // C17 6.7.2p2 admits only a fixed list of specifier combinations. The
+        // loop below merely overwrites `base_kind`, so without a tally
+        // `float double x;` silently became a `double` and `void int y;` an
+        // object of type void with a size -- accepted, and wrong, rather than
+        // diagnosed. Recorded here and checked once the list is complete.
+        let mut tally = SpecifierTally::default();
 
         // Skip any leading __attribute__
         self.skip_extensions();
@@ -1984,10 +2122,12 @@ impl Parser<'_> {
                     modifiers |= TypeModifiers::NORETURN;
                 }
                 crate::kw::SIGNED => {
+                    tally.note_sign("signed", self.current_pos());
                     self.advance();
                     modifiers |= TypeModifiers::SIGNED;
                 }
                 crate::kw::UNSIGNED => {
+                    tally.note_sign("unsigned", self.current_pos());
                     self.advance();
                     modifiers |= TypeModifiers::UNSIGNED;
                 }
@@ -2074,6 +2214,7 @@ impl Parser<'_> {
                     }
                 }
                 crate::kw::SHORT => {
+                    tally.note_size("short", self.current_pos());
                     self.advance();
                     modifiers |= TypeModifiers::SHORT;
                     if base_kind.is_none() {
@@ -2081,6 +2222,7 @@ impl Parser<'_> {
                     }
                 }
                 crate::kw::LONG => {
+                    tally.note_size("long", self.current_pos());
                     self.advance();
                     if modifiers.contains(TypeModifiers::LONG) {
                         modifiers |= TypeModifiers::LONGLONG;
@@ -2096,14 +2238,17 @@ impl Parser<'_> {
                     }
                 }
                 crate::kw::VOID => {
+                    tally.note_data_type("void", self.current_pos());
                     self.advance();
                     base_kind = Some(TypeKind::Void);
                 }
                 crate::kw::CHAR => {
+                    tally.note_data_type("char", self.current_pos());
                     self.advance();
                     base_kind = Some(TypeKind::Char);
                 }
                 crate::kw::INT => {
+                    tally.note_data_type("int", self.current_pos());
                     self.advance();
                     if base_kind.is_none()
                         || !matches!(
@@ -2115,10 +2260,12 @@ impl Parser<'_> {
                     }
                 }
                 crate::kw::FLOAT => {
+                    tally.note_data_type("float", self.current_pos());
                     self.advance();
                     base_kind = Some(TypeKind::Float);
                 }
                 crate::kw::DOUBLE => {
+                    tally.note_data_type("double", self.current_pos());
                     self.advance();
                     // Handle long double
                     if modifiers.contains(TypeModifiers::LONG) {
@@ -2128,37 +2275,95 @@ impl Parser<'_> {
                     }
                 }
                 crate::kw::FLOAT16 => {
+                    // An alias spelling, which a C library may define as a
+                    // typedef of its own: glibc's <bits/floatn-common.h> has
+                    // `typedef float _Float32;` whenever the compiler does not
+                    // claim native support. Once a data type has been given,
+                    // this is the declarator's name rather than a second
+                    // specifier -- the same rule `typeof` needs below, and
+                    // without it that typedef is two data types and an error.
+                    if !tally.data_types.is_empty() {
+                        break;
+                    }
+                    tally.note_data_type("_Float16", self.current_pos());
                     self.advance();
                     base_kind = Some(TypeKind::Float16);
                 }
                 crate::kw::FLOAT32 => {
                     // _Float32 is an alias for float (TS 18661-3 / C23)
+                    // An alias spelling, which a C library may define as a
+                    // typedef of its own: glibc's <bits/floatn-common.h> has
+                    // `typedef float _Float32;` whenever the compiler does not
+                    // claim native support. Once a data type has been given,
+                    // this is the declarator's name rather than a second
+                    // specifier -- the same rule `typeof` needs below, and
+                    // without it that typedef is two data types and an error.
+                    if !tally.data_types.is_empty() {
+                        break;
+                    }
+                    tally.note_data_type("float", self.current_pos());
                     self.advance();
                     base_kind = Some(TypeKind::Float);
                 }
                 crate::kw::FLOAT64 => {
                     // _Float64 is an alias for double (TS 18661-3 / C23)
+                    // An alias spelling, which a C library may define as a
+                    // typedef of its own: glibc's <bits/floatn-common.h> has
+                    // `typedef float _Float32;` whenever the compiler does not
+                    // claim native support. Once a data type has been given,
+                    // this is the declarator's name rather than a second
+                    // specifier -- the same rule `typeof` needs below, and
+                    // without it that typedef is two data types and an error.
+                    if !tally.data_types.is_empty() {
+                        break;
+                    }
+                    tally.note_data_type("double", self.current_pos());
                     self.advance();
                     base_kind = Some(TypeKind::Double);
                 }
                 crate::kw::BOOL => {
+                    tally.note_data_type("_Bool", self.current_pos());
                     self.advance();
                     base_kind = Some(TypeKind::Bool);
                 }
                 crate::kw::INT128 => {
+                    tally.note_data_type("__int128", self.current_pos());
                     self.advance();
                     base_kind = Some(TypeKind::Int128);
                 }
                 crate::kw::INT128_T => {
+                    // An alias spelling, which a C library may define as a
+                    // typedef of its own: glibc's <bits/floatn-common.h> has
+                    // `typedef float _Float32;` whenever the compiler does not
+                    // claim native support. Once a data type has been given,
+                    // this is the declarator's name rather than a second
+                    // specifier -- the same rule `typeof` needs below, and
+                    // without it that typedef is two data types and an error.
+                    if !tally.data_types.is_empty() {
+                        break;
+                    }
+                    tally.note_data_type("__int128", self.current_pos());
                     self.advance();
                     base_kind = Some(TypeKind::Int128);
                 }
                 crate::kw::UINT128_T => {
+                    // An alias spelling, which a C library may define as a
+                    // typedef of its own: glibc's <bits/floatn-common.h> has
+                    // `typedef float _Float32;` whenever the compiler does not
+                    // claim native support. Once a data type has been given,
+                    // this is the declarator's name rather than a second
+                    // specifier -- the same rule `typeof` needs below, and
+                    // without it that typedef is two data types and an error.
+                    if !tally.data_types.is_empty() {
+                        break;
+                    }
+                    tally.note_data_type("__int128", self.current_pos());
                     self.advance();
                     modifiers |= TypeModifiers::UNSIGNED;
                     base_kind = Some(TypeKind::Int128);
                 }
                 crate::kw::BUILTIN_VA_LIST => {
+                    tally.note_data_type("__builtin_va_list", self.current_pos());
                     self.advance();
                     base_kind = Some(TypeKind::VaList);
                 }
@@ -2206,6 +2411,8 @@ impl Parser<'_> {
                     ));
                 }
                 crate::kw::ENUM => {
+                    tally.note_data_type("enum", self.current_pos());
+                    tally.check();
                     let mut enum_type = self.parse_enum_specifier()?;
                     // Consume trailing qualifiers (e.g., "enum foo const")
                     let trailing_mods = self.consume_type_qualifiers();
@@ -2214,6 +2421,8 @@ impl Parser<'_> {
                     return Ok((enum_type, true));
                 }
                 crate::kw::STRUCT => {
+                    tally.note_data_type("struct", self.current_pos());
+                    tally.check();
                     let mut struct_type = self.parse_struct_or_union_specifier(false)?;
                     // Consume trailing qualifiers (e.g., "struct foo const")
                     let trailing_mods = self.consume_type_qualifiers();
@@ -2221,6 +2430,8 @@ impl Parser<'_> {
                     return Ok((struct_type, true));
                 }
                 crate::kw::UNION => {
+                    tally.note_data_type("union", self.current_pos());
+                    tally.check();
                     let mut union_type = self.parse_struct_or_union_specifier(true)?;
                     // Consume trailing qualifiers (e.g., "union foo const")
                     let trailing_mods = self.consume_type_qualifiers();
@@ -2243,6 +2454,8 @@ impl Parser<'_> {
                 }
             }
         }
+
+        tally.check();
 
         // If we parsed a typedef, return that with any trailing modifiers applied
         if let Some(typedef_type_id) = typedef_base {

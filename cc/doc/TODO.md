@@ -30,6 +30,38 @@ minimal-dependency rule rules out a crate. The result feeds straight into
 `FloatVal::from_parts`, which already rounds an exact `(mantissa, exp2)` pair
 to the target width -- nothing else has to change.
 
+### `_FORTIFY_SOURCE` compiles but checks nothing
+
+Peeling this apart one layer at a time has been the only way to see it: each
+fix exposes the next blocker, and three of the layers are invisible until the
+one before it is in place. Four are done:
+
+1. `__builtin_object_size` computing real sizes rather than "unknown".
+2. Implicit declarations for the `__builtin___*_chk` family.
+3. Asm label renaming, so glibc's `__REDIRECT` aliases resolve.
+4. `always_inline`, so the fortified wrapper reaches the caller at all.
+
+**Layer 5 — `__gnu_inline__` / `extern inline` must emit no out-of-line
+definition.** glibc's `__fortify_function` is
+`extern __always_inline __attribute__((__gnu_inline__))`, which under GNU
+inline semantics defines *no* external symbol. c17 emits one anyway, so every
+translation unit that includes `<string.h>` defines a global `memcpy`,
+`strcpy`, `bcopy` and friends. Two such objects in one link fail with
+`multiple definition of 'memcpy'`; one silently overrides libc's.
+
+**Layer 6 — `__builtin_object_size` has to be folded after inlining.** The
+wrapper computes the size of its own `__dest` *parameter*, which is genuinely
+unknown, so the front end folds it to `-1` before the inliner ever runs and the
+`_chk` call is handed `-1` — a value that means "do not check". gcc defers the
+fold until after inlining, when `__dest` is known to be the caller's `buf`.
+Fixing this means carrying the query into the IR and folding it in a
+post-inline pass that can trace a pointer back to its object.
+
+Until both land, predefining `__OPTIMIZE__` (which is what makes glibc compile
+the wrappers at all) is a regression rather than a fix: it has been implemented
+and reverted three times, most recently after measuring the duplicate-symbol
+failure above. The layers must land together, and the order is forced.
+
 ### Stack frames are larger than gcc's
 
 CPython hardcodes `C_RECURSION_LIMIT 10000` (`Include/cpython/pystate.h`),
@@ -62,8 +94,7 @@ does or claims.
 
 | Area | Divergence |
 |------|-----------|
-| `_FORTIFY_SOURCE` | Still checks nothing. `__builtin_object_size` and the `__builtin___*_chk` declarations are both done; two layers remain. c17 does not predefine `__OPTIMIZE__`, without which glibc's `features.h` leaves `__USE_FORTIFY_LEVEL` at 0 and no wrapper is compiled — and defining it exposes the next layer, below |
-| `__asm__("name")` on a declaration | Parsed and ignored: c17 calls the declared name where gcc calls the asm label. A standalone wrong-symbol bug, and what glibc's `__REDIRECT` fortify wrappers need |
+| `_FORTIFY_SOURCE` | Still checks nothing. Four of six layers are done; the two that remain are described below, and both are ordinary compiler features rather than fortify-specific work |
 | `_Complex` with static storage | Cannot be initialized at all; gcc accepts `1.0 + 2.0*I` and `CMPLX(...)` |
 | `isnan()` on a `long double` | 65535 rather than 1. The builtins now exist; glibc only uses them at `__GNUC_PREREQ (4,4)`, and claiming that also demands `__float128` (`bits/floatn.h` turns on `__HAVE_FLOAT128` at 4.3), which x86-64 c17 has no arithmetic for. Both answers conform — C99 7.12.3.4 requires only a nonzero value |
 

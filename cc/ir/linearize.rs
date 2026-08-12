@@ -319,9 +319,33 @@ impl<'a> Linearizer<'a> {
     }
 
     /// Get the name of a symbol as a String
+    ///
+    /// This is the name that reaches the assembler, so a GCC asm label
+    /// (`extern int myfn(int) __asm__("realfn");`) wins over the declared
+    /// identifier. Renaming here rather than in the backend means every
+    /// consumer -- direct calls, global definitions, `extern_symbols`, GOT and
+    /// TLS decisions, the macOS underscore -- sees one consistent name and
+    /// needs no change of its own.
     #[inline]
     pub(crate) fn symbol_name(&self, id: SymbolId) -> String {
-        self.str(self.symbols.get(id).name).to_string()
+        let sym = self.symbols.get(id);
+        match &sym.asm_label {
+            Some(label) => label.clone(),
+            None => self.str(sym.name).to_string(),
+        }
+    }
+
+    /// The emitted name for a declared identifier.
+    ///
+    /// A function *definition* reaches its name as a `StringId` rather than
+    /// the `SymbolId` that carries the label, so it has to go back through the
+    /// symbol table. Inner scopes are gone by the time linearization runs, so
+    /// a file-scope function name resolves unambiguously.
+    pub(crate) fn emitted_name(&self, name: StringId) -> String {
+        self.symbols
+            .lookup(name, crate::symbol::Namespace::Ordinary)
+            .and_then(|s| s.asm_label.clone())
+            .unwrap_or_else(|| self.str(name).to_string())
     }
 
     /// Linearize a translation unit
@@ -750,7 +774,7 @@ impl<'a> Linearizer<'a> {
         self.struct_return_ptr = None;
         self.struct_return_size = 0;
         self.two_reg_return_type = None;
-        self.current_func_name = self.str(func.name).to_string();
+        self.current_func_name = self.emitted_name(func.name);
         // Remove from extern_symbols since we're defining this function
         self.module.extern_symbols.remove(&self.current_func_name);
         // Note: static_locals is NOT cleared - it persists across functions
@@ -770,7 +794,7 @@ impl<'a> Linearizer<'a> {
         // Store calling convention from function attributes (e.g., __attribute__((sysv_abi)))
         self.current_calling_conv = func.calling_conv;
 
-        let mut ir_func = Function::new(self.str(func.name), func.return_type);
+        let mut ir_func = Function::new(self.emitted_name(func.name), func.return_type);
         // For linkage:
         // - static inline: internal linkage (same as static)
         // - inline (without extern): inline definition only, internal linkage
@@ -3427,7 +3451,7 @@ impl<'a> Linearizer<'a> {
 
     pub(crate) fn linearize_ident(&mut self, expr: &Expr, symbol_id: SymbolId) -> PseudoId {
         let sym = self.symbols.get(symbol_id);
-        let name_str = self.str(sym.name).to_string();
+        let name_str = self.symbol_name(symbol_id);
 
         // First check if it's an enum constant
         if sym.is_enum_constant() {

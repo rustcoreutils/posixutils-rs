@@ -6176,3 +6176,108 @@ int main(void)
 "#;
     assert_eq!(compile_and_run("long_double_nan_cmp", src, &[]), 0);
 }
+
+// ============================================================================
+// GCC asm labels on declarations: __asm__("name")
+// ============================================================================
+
+/// An asm label renames the symbol a declaration refers to.
+///
+/// `extern int myfn(int) __asm__("realfn");` means: the source calls it `myfn`,
+/// but every reference emits the symbol `realfn`. c17 used to parse the label
+/// and throw it away, so it emitted `call myfn@PLT` where gcc emits
+/// `call realfn@PLT` -- a wrong-symbol bug that links only by accident, when
+/// both names happen to exist.
+///
+/// Measured against gcc. One gcc behaviour is deliberately *not* asserted here:
+/// gcc folds `&alias == &real` to 0 at compile time even though a write through
+/// one is visible through the other. That is a constant-folding artifact of
+/// keeping two declarations distinct, not a property worth matching.
+#[test]
+fn codegen_asm_label_renames_the_symbol() {
+    let src = r#"
+#include <stdio.h>
+
+/* A call through an asm label reaches the labelled function. */
+int realfn(int x) { return x * 3; }
+extern int myfn(int) __asm__("realfn");
+
+/* An asm label on a definition renames the emitted label, so a second
+   declaration carrying the same label reaches that definition. */
+int defrenamed(int x) __asm__("real_def");
+int defrenamed(int x) { return x + 100; }
+extern int reach_def(int) __asm__("real_def");
+
+/* An asm label on a variable, and on a variable definition. */
+int real_var = 42;
+extern int my_var __asm__("real_var");
+int def_var __asm__("real_def_var") = 7;
+extern int reach_def_var __asm__("real_def_var");
+
+int main(void)
+{
+    if (myfn(7) != 21) return 1;
+    if (reach_def(1) != 101) return 2;
+    if (my_var != 42) return 3;
+    if (reach_def_var != 7) return 4;
+
+    /* The alias and the real object are the same storage. */
+    my_var = 99;
+    if (real_var != 99) return 5;
+    reach_def_var = 55;
+    if (def_var != 55) return 6;
+
+    /* A function pointer taken through the alias is the real function. */
+    int (*fp)(int) = myfn;
+    if (fp(5) != 15) return 7;
+    if (fp != realfn) return 8;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("asm_label_rename", src, &[]), 0);
+}
+
+/// The label reaches the assembly, on both ABIs, for calls and definitions.
+///
+/// The runtime test above only proves the two names resolve to one another;
+/// this proves the *declared* name never appears as a symbol at all.
+#[test]
+fn codegen_asm_label_reaches_the_assembly() {
+    let src = r#"
+extern int myfn(int) __asm__("realfn");
+int defrenamed(int x) __asm__("real_def");
+int defrenamed(int x) { return x + 1; }
+extern int my_var __asm__("real_var");
+
+int call(int x) { return myfn(x) + my_var; }
+"#;
+
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        let asm = asm_for_with("asm_label", triple, src, &["-O"]);
+        assert!(
+            asm.contains("realfn"),
+            "{triple}: call should target the asm label:\n{asm}"
+        );
+        assert!(
+            !asm.contains("myfn"),
+            "{triple}: the declared name must not be emitted:\n{asm}"
+        );
+        assert!(
+            asm.contains("real_def"),
+            "{triple}: a definition's asm label should name its own label:\n{asm}"
+        );
+        assert!(
+            !asm.contains("defrenamed"),
+            "{triple}: the declared name must not be emitted:\n{asm}"
+        );
+        assert!(
+            asm.contains("real_var"),
+            "{triple}: a global's asm label should be the emitted symbol:\n{asm}"
+        );
+        assert!(
+            !asm.contains("my_var"),
+            "{triple}: the declared name must not be emitted:\n{asm}"
+        );
+    }
+}

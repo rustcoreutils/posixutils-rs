@@ -328,6 +328,16 @@ pub struct Parser<'a> {
     /// still makes `f` a constructor. Reading the definition's own attributes
     /// alone would silently drop it.
     declared_fn_attrs: BTreeMap<StringId, crate::parse::ast::FunctionAttrs>,
+    /// The GCC asm label seen in the declaration being parsed, awaiting the
+    /// declarator it renames. Accumulated like `pending_fn_attrs` because
+    /// `__asm__("...")` can appear before or after an `__attribute__` --
+    /// glibc's `__REDIRECT_NTH` writes it before `__THROW`.
+    pending_asm_label: Option<String>,
+    /// Every asm label seen for a given name, so that a label written on a
+    /// prototype reaches the definition parsed later. GCC requires the label
+    /// to appear on the first declaration, but it does not require the
+    /// definition to repeat it.
+    declared_asm_labels: BTreeMap<StringId, String>,
     /// Set by `parse_type_specifier`: whether the specifier list actually
     /// named a type, rather than defaulting to `int`.
     ///
@@ -357,6 +367,8 @@ impl<'a> Parser<'a> {
             pending_alignas: None,
             pending_fn_attrs: Default::default(),
             declared_fn_attrs: BTreeMap::new(),
+            pending_asm_label: None,
+            declared_asm_labels: BTreeMap::new(),
             saw_explicit_type: true,
         }
     }
@@ -754,9 +766,19 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Skip __asm("...") or __asm__("...") declarations (GCC extension for symbol aliasing)
-    /// Used in declarations like: FILE *fopen(...) __asm("_fopen$DARWIN_EXTSN");
-    fn skip_asm(&mut self) {
+    /// Parse `__asm("name")` / `__asm__("name")` on a declaration: a GCC asm
+    /// label, which renames the symbol the declaration refers to.
+    ///
+    /// `extern int myfn(int) __asm__("realfn");` still declares `myfn` for the
+    /// source to use, but every emitted reference names `realfn`. The label is
+    /// left in [`Parser::pending_asm_label`] for the declarator to claim.
+    ///
+    /// The label is a string *sequence*, not a single literal: glibc spells it
+    /// `__ASMNAME(cname)`, which expands to
+    /// `__STRING(__USER_LABEL_PREFIX__) cname` — two adjacent literals, `""`
+    /// and `"stpncpy"` on ELF. They concatenate as in any other C string
+    /// context.
+    fn parse_asm_label(&mut self) {
         while self.is_asm_keyword() {
             self.advance(); // consume __asm/__asm__
 
@@ -766,16 +788,58 @@ impl<'a> Parser<'a> {
             }
             self.advance(); // consume '('
 
-            // Skip contents until matching ')'
+            // Collect the string literals, and skip anything else so that a
+            // shape we do not model still parses as it used to.
+            let mut label = String::new();
             let mut depth = 1;
             while depth > 0 && !self.is_eof() {
                 if self.is_special(b'(') {
                     depth += 1;
                 } else if self.is_special(b')') {
                     depth -= 1;
+                    if depth == 0 {
+                        self.advance();
+                        break;
+                    }
+                } else if depth == 1 {
+                    if let TokenValue::String(s) = &self.current().value {
+                        label.push_str(s);
+                    }
                 }
                 self.advance();
             }
+
+            // An empty label is not a rename. `__asm__("")` would ask for a
+            // nameless symbol, which is not something GCC accepts either.
+            if !label.is_empty() {
+                self.pending_asm_label = Some(label);
+            }
+        }
+    }
+
+    /// Settle the asm label for a declaration of `name`, recording it on
+    /// whichever symbol is now bound to that name.
+    ///
+    /// Takes the label pending on this declarator if there is one, and
+    /// otherwise reuses whatever an earlier declaration of the same name
+    /// established. Both directions are needed: GCC requires the label on the
+    /// first declaration but not on the definition that follows it, and a
+    /// definition creates a fresh symbol that would otherwise not carry it.
+    ///
+    /// Consuming the pending label means a declaration list gives each
+    /// declarator only the label written on it: in `int a __asm__("x"), b;`
+    /// only `a` is renamed.
+    fn settle_asm_label(&mut self, name: StringId) {
+        let label = match self.pending_asm_label.take() {
+            Some(label) => {
+                self.declared_asm_labels.insert(name, label.clone());
+                Some(label)
+            }
+            None => self.declared_asm_labels.get(&name).cloned(),
+        };
+        if let (Some(label), Some(id)) = (label, self.symbols.lookup_id(name, Namespace::Ordinary))
+        {
+            self.symbols.get_mut(id).asm_label = Some(label);
         }
     }
 
@@ -1022,7 +1086,7 @@ impl<'a> Parser<'a> {
                 let fn_attrs = attrs.function_attrs();
                 self.pending_fn_attrs.merge(&fn_attrs);
             } else if self.is_asm_keyword() {
-                self.skip_asm();
+                self.parse_asm_label();
             } else if self.is_nullability_qualifier() {
                 self.advance();
             } else {
@@ -3511,6 +3575,7 @@ impl Parser<'_> {
                 };
 
                 let symbol = symbol_id.expect("declaration must have symbol");
+                self.settle_asm_label(name);
                 return Ok(ExternalDecl::Declaration(Declaration {
                     declarators: vec![InitDeclarator {
                         symbol,
@@ -3608,6 +3673,7 @@ impl Parser<'_> {
                     // Add function to symbol table
                     let func_sym = Symbol::function(name, full_typ, self.symbols.depth());
                     let _ = self.symbols.declare(func_sym);
+                    self.settle_asm_label(name);
 
                     // Get raw parameters - use decl_func_params which has names
                     let raw_params = decl_func_params.unwrap_or_default();
@@ -3684,6 +3750,7 @@ impl Parser<'_> {
                 };
 
                 let symbol = symbol_id.expect("declaration must have symbol");
+                self.settle_asm_label(name);
                 return Ok(ExternalDecl::Declaration(Declaration {
                     declarators: vec![InitDeclarator {
                         symbol,
@@ -3781,6 +3848,7 @@ impl Parser<'_> {
                 let func_type_id = self.types.intern(func_type);
                 let func_sym = Symbol::function(name, func_type_id, self.symbols.depth());
                 let _ = self.symbols.declare(func_sym);
+                self.settle_asm_label(name);
 
                 // Enter function scope for parameters
                 self.symbols.enter_scope();
@@ -3840,6 +3908,7 @@ impl Parser<'_> {
                         .or_else(|| self.symbols.lookup_id(name, Namespace::Ordinary))
                 };
                 let symbol = symbol_id.expect("function declaration must have symbol");
+                self.settle_asm_label(name);
                 return Ok(ExternalDecl::Declaration(Declaration {
                     declarators: vec![InitDeclarator {
                         symbol,
@@ -3977,6 +4046,7 @@ impl Parser<'_> {
         }
 
         let symbol = symbol.expect("symbol should be bound");
+        self.settle_asm_label(name);
         declarators.push(InitDeclarator {
             symbol,
             typ: var_type_id,
@@ -4060,6 +4130,7 @@ impl Parser<'_> {
                 });
             }
 
+            self.settle_asm_label(decl_name);
             declarators.push(InitDeclarator {
                 symbol: decl_symbol.expect("symbol should be bound"),
                 typ: decl_type,

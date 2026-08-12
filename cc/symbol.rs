@@ -89,6 +89,20 @@ pub struct Symbol {
     /// Explicit alignment from _Alignas specifier (C11 6.7.5)
     /// None means use natural alignment for the type
     pub explicit_align: Option<u32>,
+
+    /// The symbol name to emit, from a GCC asm label:
+    /// `extern int myfn(int) __asm__("realfn");`
+    ///
+    /// `name` stays the declared identifier, because that is what source
+    /// refers to and what the symbol table is keyed on; this is what reaches
+    /// the assembler. Held as a `String` rather than a `StringId` because the
+    /// label is not an identifier -- it never needs to be looked up, and the
+    /// parser's identifier table is read-only by the time declarations are
+    /// parsed.
+    ///
+    /// glibc's `__REDIRECT` uses this throughout the `_FORTIFY_SOURCE`
+    /// headers, so ignoring it makes those headers fail to link.
+    pub asm_label: Option<String>,
 }
 
 impl Symbol {
@@ -103,6 +117,7 @@ impl Symbol {
             defined: true,
             enum_value: None,
             explicit_align: None,
+            asm_label: None,
         }
     }
 
@@ -117,6 +132,7 @@ impl Symbol {
             defined: false, // Functions are declarations until we see the body
             enum_value: None,
             explicit_align: None,
+            asm_label: None,
         }
     }
 
@@ -131,6 +147,7 @@ impl Symbol {
             defined: true,
             enum_value: None,
             explicit_align: None,
+            asm_label: None,
         }
     }
 
@@ -145,6 +162,7 @@ impl Symbol {
             defined: true,
             enum_value: Some(value),
             explicit_align: None,
+            asm_label: None,
         }
     }
 
@@ -159,6 +177,7 @@ impl Symbol {
             defined: true,
             enum_value: None,
             explicit_align: None,
+            asm_label: None,
         }
     }
 
@@ -173,6 +192,7 @@ impl Symbol {
             defined: true,
             enum_value: None,
             explicit_align: None,
+            asm_label: None,
         }
     }
 

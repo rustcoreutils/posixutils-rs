@@ -494,21 +494,24 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// Fold a constant expression of complex type into its two halves.
     ///
     /// Returns `None` for anything that is not a constant, so callers can fall
-    /// through to their existing diagnostics. Arithmetic goes through `f64`,
-    /// matching `eval_const_float_expr`; that costs precision for
-    /// `long double _Complex`, which is a pre-existing limitation of constant
-    /// folding here rather than something this path introduces.
-    fn eval_const_complex(&self, expr: &Expr) -> Option<(f64, f64)> {
+    /// through to their existing diagnostics.
+    ///
+    /// A complex constant is two real ones, and each half is carried the way
+    /// [`Self::eval_const_float_expr`] carries a real constant: a literal at
+    /// its full declared width, arithmetic folded through `f64`. Halving the
+    /// precision of a `long double _Complex` literal here, while the real path
+    /// keeps it, would make the two disagree about the same written value.
+    fn eval_const_complex(&self, expr: &Expr) -> Option<(FloatVal, FloatVal)> {
         match &expr.kind {
             // `I` itself is `__builtin_complex(0.0, 1.0)`.
             ExprKind::BuiltinComplex { real, imag } => Some((
-                self.eval_const_float_expr(real)?.to_f64(),
-                self.eval_const_float_expr(imag)?.to_f64(),
+                self.eval_const_float_expr(real)?,
+                self.eval_const_float_expr(imag)?,
             )),
 
             // A real constant is a complex one with a zero imaginary part.
             ExprKind::FloatLit(_) | ExprKind::IntLit(_) | ExprKind::CharLit(_) => {
-                Some((self.eval_const_float_expr(expr)?.to_f64(), 0.0))
+                Some((self.eval_const_float_expr(expr)?, FloatVal::ZERO))
             }
 
             ExprKind::Cast { expr: inner, .. } => self.eval_const_complex(inner),
@@ -518,25 +521,27 @@ impl<'a> super::linearize::Linearizer<'a> {
                 operand,
             } => {
                 let (re, im) = self.eval_const_complex(operand)?;
-                Some((-re, -im))
+                Some((re.negated(), im.negated()))
             }
 
             ExprKind::Binary { op, left, right } => {
                 let (a, b) = self.eval_const_complex(left)?;
                 let (c, d) = self.eval_const_complex(right)?;
-                match op {
-                    BinaryOp::Add => Some((a + c, b + d)),
-                    BinaryOp::Sub => Some((a - c, b - d)),
-                    BinaryOp::Mul => Some((a * c - b * d, a * d + b * c)),
+                let (a, b, c, d) = (a.to_f64(), b.to_f64(), c.to_f64(), d.to_f64());
+                let (re, im) = match op {
+                    BinaryOp::Add => (a + c, b + d),
+                    BinaryOp::Sub => (a - c, b - d),
+                    BinaryOp::Mul => (a * c - b * d, a * d + b * c),
                     BinaryOp::Div => {
                         let den = c * c + d * d;
                         if den == 0.0 {
                             return None;
                         }
-                        Some(((a * c + b * d) / den, (b * c - a * d) / den))
+                        ((a * c + b * d) / den, (b * c - a * d) / den)
                     }
-                    _ => None,
-                }
+                    _ => return None,
+                };
+                Some((FloatVal::from_f64(re), FloatVal::from_f64(im)))
             }
 
             _ => None,
@@ -565,8 +570,6 @@ impl<'a> super::linearize::Linearizer<'a> {
         let base_bytes = self.types.size_bytes(base);
         // Narrowing to the base width happens at emission, which knows the
         // field size; `FloatVal` just carries the value.
-        let re = FloatVal::from_f64(re);
-        let im = FloatVal::from_f64(im);
         Some(Initializer::Struct {
             total_size: base_bytes * 2,
             fields: vec![

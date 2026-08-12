@@ -298,7 +298,10 @@ impl Aarch64CodeGen {
         };
 
         // Save function name, frame size, and callee-saved size for label generation and offset calculation
-        self.base.current_fn = func.name.clone();
+        // Local labels are derived from this and are compiler-internal, so
+        // they take the plain name: a verbatim asm-label marker belongs only
+        // on the symbol the assembler is asked for.
+        self.base.current_fn = crate::arch::lir::undecorated(&func.name).to_string();
         self.frame_size = total_frame;
         self.callee_saved_size = callee_saved_size;
         self.reg_save_area_size = reg_save_area_size;

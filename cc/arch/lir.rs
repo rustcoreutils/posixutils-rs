@@ -440,6 +440,9 @@ impl Symbol {
     /// Format symbol name for the target OS
     /// macOS prepends underscore to external symbols
     pub fn format_for_target(&self, target: &Target) -> String {
+        if let Some(verbatim) = strip_verbatim(&self.name) {
+            return verbatim.to_string();
+        }
         if self.is_local {
             // Local symbols don't get underscore prefix
             self.name.clone()
@@ -452,9 +455,40 @@ impl Symbol {
     }
 }
 
+/// Marks an assembler name that must reach the assembler exactly as written.
+///
+/// A GCC asm label *is* the final symbol name -- `__asm__("realfn")` asks for
+/// `realfn`, not for whatever the target would decorate `realfn` into. That
+/// distinction is invisible on ELF, where nothing is added, and decisive on
+/// Mach-O, where every C identifier picks up a leading underscore: Apple's
+/// headers spell the label with the underscore already in it
+/// (`__DARWIN_ALIAS(fputs)` is `__asm("_fputs")`), so decorating it again
+/// asked the linker for `__fputs` and no such symbol exists.
+///
+/// The marker byte, and the trick of carrying this in the name rather than
+/// alongside it, are LLVM's -- a name is passed through a dozen maps and sets
+/// on its way to the assembler, and a flag would have to survive all of them.
+pub const VERBATIM_MARKER: char = '\u{1}';
+
+/// Prefix `label` so it survives target decoration. See [`VERBATIM_MARKER`].
+pub fn verbatim(label: &str) -> String {
+    format!("{VERBATIM_MARKER}{label}")
+}
+
+/// The name inside a verbatim marker, if `name` carries one.
+pub fn strip_verbatim(name: &str) -> Option<&str> {
+    name.strip_prefix(VERBATIM_MARKER)
+}
+
+/// `name` with any verbatim marker removed, for composing a derived name --
+/// which is decorated as a whole, so the marker must not survive inside it.
+pub fn undecorated(name: &str) -> &str {
+    strip_verbatim(name).unwrap_or(name)
+}
+
 impl fmt::Display for Symbol {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.name)
+        write!(f, "{}", undecorated(&self.name))
     }
 }
 
@@ -875,13 +909,18 @@ impl EmitAsm for Directive {
             Directive::Type { sym, kind } => {
                 // ELF only - skip on macOS
                 if !matches!(target.os, Os::MacOS) {
-                    let _ = writeln!(out, ".type {}, {}", sym.name, kind.as_str());
+                    let _ = writeln!(
+                        out,
+                        ".type {}, {}",
+                        sym.format_for_target(target),
+                        kind.as_str()
+                    );
                 }
             }
             Directive::Size { sym, size } => {
                 // ELF only - skip on macOS
                 if !matches!(target.os, Os::MacOS) {
-                    let _ = writeln!(out, ".size {}, {}", sym.name, size);
+                    let _ = writeln!(out, ".size {}, {}", sym.format_for_target(target), size);
                 }
             }
             Directive::Comm { sym, size, align } => {

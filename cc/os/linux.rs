@@ -70,6 +70,8 @@ pub fn get_macros(target: &Target) -> Vec<(&'static str, Option<String>)> {
 
     vec![
         // Linux identification
+        // ELF adds no prefix to a C identifier.
+        ("__USER_LABEL_PREFIX__", Some("".into())),
         ("__linux__", Some("1".into())),
         ("__linux", Some("1".into())),
         ("linux", Some("1".into())),

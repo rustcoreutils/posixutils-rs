@@ -398,7 +398,10 @@ impl X86_64CodeGen {
 
     fn emit_function(&mut self, func: &Function, types: &TypeTable) {
         // Save current function name for unique label generation
-        self.base.current_fn = func.name.clone();
+        // Local labels are derived from this and are compiler-internal, so
+        // they take the plain name: a verbatim asm-label marker belongs only
+        // on the symbol the assembler is asked for.
+        self.base.current_fn = crate::arch::lir::undecorated(&func.name).to_string();
 
         // Check if this function uses varargs
         let is_variadic = is_variadic_function(func);
@@ -4157,6 +4160,10 @@ impl X86_64CodeGen {
 
     /// Format a symbol name with platform-specific prefix
     fn format_symbol_name(&self, name: &str) -> String {
+        // An asm label is the final name; see `lir::VERBATIM_MARKER`.
+        if let Some(verbatim) = crate::arch::lir::strip_verbatim(name) {
+            return verbatim.to_string();
+        }
         if self.base.target.os == Os::MacOS && !name.starts_with('.') {
             format!("_{}", name)
         } else {

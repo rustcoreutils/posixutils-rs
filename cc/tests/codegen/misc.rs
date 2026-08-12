@@ -6201,21 +6201,29 @@ fn codegen_asm_label_renames_the_symbol() {
     let src = r#"
 #include <stdio.h>
 
+/* An asm label is the assembler name itself, so naming a C object with one
+   means spelling whatever prefix the target puts on a C identifier. This is
+   glibc's `__ASMNAME`, and the reason __USER_LABEL_PREFIX__ exists: it is
+   empty on ELF and "_" on Mach-O. */
+#define XSTR(s) #s
+#define STR(s) XSTR(s)
+#define ASMNAME(cname) __asm__(STR(__USER_LABEL_PREFIX__) cname)
+
 /* A call through an asm label reaches the labelled function. */
 int realfn(int x) { return x * 3; }
-extern int myfn(int) __asm__("realfn");
+extern int myfn(int) ASMNAME("realfn");
 
 /* An asm label on a definition renames the emitted label, so a second
    declaration carrying the same label reaches that definition. */
-int defrenamed(int x) __asm__("real_def");
+int defrenamed(int x) ASMNAME("real_def");
 int defrenamed(int x) { return x + 100; }
-extern int reach_def(int) __asm__("real_def");
+extern int reach_def(int) ASMNAME("real_def");
 
 /* An asm label on a variable, and on a variable definition. */
 int real_var = 42;
-extern int my_var __asm__("real_var");
-int def_var __asm__("real_def_var") = 7;
-extern int reach_def_var __asm__("real_def_var");
+extern int my_var ASMNAME("real_var");
+int def_var ASMNAME("real_def_var") = 7;
+extern int reach_def_var ASMNAME("real_def_var");
 
 int main(void)
 {

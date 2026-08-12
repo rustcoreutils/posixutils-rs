@@ -345,11 +345,13 @@ impl<'a> Linearizer<'a> {
     /// consumer -- direct calls, global definitions, `extern_symbols`, GOT and
     /// TLS decisions, the macOS underscore -- sees one consistent name and
     /// needs no change of its own.
+    /// A label is marked verbatim, because it *is* the assembler name and must
+    /// not pick up the target's own decoration; see `lir::VERBATIM_MARKER`.
     #[inline]
     pub(crate) fn symbol_name(&self, id: SymbolId) -> String {
         let sym = self.symbols.get(id);
         match &sym.asm_label {
-            Some(label) => label.clone(),
+            Some(label) => crate::arch::lir::verbatim(label),
             None => self.str(sym.name).to_string(),
         }
     }
@@ -363,7 +365,8 @@ impl<'a> Linearizer<'a> {
     pub(crate) fn emitted_name(&self, name: StringId) -> String {
         self.symbols
             .lookup(name, crate::symbol::Namespace::Ordinary)
-            .and_then(|s| s.asm_label.clone())
+            .and_then(|s| s.asm_label.as_deref())
+            .map(crate::arch::lir::verbatim)
             .unwrap_or_else(|| self.str(name).to_string())
     }
 

@@ -586,9 +586,16 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
 
         // Generate unique global name: funcname.varname.counter
+        //
+        // The enclosing function's name may be a verbatim asm label, whose
+        // marker belongs at the *start* of a name and not buried inside a
+        // derived one -- this static is a symbol of its own, decorated like
+        // any other.
         let global_name = format!(
             "{}.{}.{}",
-            self.current_func_name, name_str, self.static_local_counter
+            crate::arch::lir::undecorated(&self.current_func_name),
+            name_str,
+            self.static_local_counter
         );
         self.static_local_counter += 1;
 

@@ -94,8 +94,7 @@ does or claims.
 
 | Area | Divergence |
 |------|-----------|
-| `_FORTIFY_SOURCE` | Still checks nothing. Four of six layers are done; the two that remain are described below, and both are ordinary compiler features rather than fortify-specific work |
-| `_Complex` with static storage | Cannot be initialized at all; gcc accepts `1.0 + 2.0*I` and `CMPLX(...)` |
+| `_FORTIFY_SOURCE` | Still checks nothing. Five of six layers are done; the one that remains is described above, and is an ordinary compiler feature rather than fortify-specific work |
 | `isnan()` on a `long double` | 65535 rather than 1. The builtins now exist; glibc only uses them at `__GNUC_PREREQ (4,4)`, and claiming that also demands `__float128` (`bits/floatn.h` turns on `__HAVE_FLOAT128` at 4.3), which x86-64 c17 has no arithmetic for. Both answers conform — C99 7.12.3.4 requires only a nonzero value |
 
 ## Future Features

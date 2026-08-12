@@ -1279,3 +1279,145 @@ int main(void) {
         0
     );
 }
+
+// ============================================================================
+// Constant folding in global initializers
+// ============================================================================
+
+/// Arithmetic on floating constants must fold at file scope.
+///
+/// C99 6.6p8 allows any arithmetic constant expression as the initializer of
+/// an object with static storage duration. c17 folded `*` and `/` correctly
+/// but not `+` or `-`: those two were intercepted by the *pointer*-arithmetic
+/// arm, which fell back to an integer-only evaluator and then rejected the
+/// program. `double a = 1.0 + 2.0;` did not compile.
+///
+/// Worse, `-(1.0 + 2.0)` was accepted and silently became `0.0` -- the
+/// negation arm returned "no initializer" without a diagnostic, which lands
+/// the object in `.bss`. A wrong answer with a zero exit status.
+#[test]
+fn c99_global_initializer_folds_floating_arithmetic() {
+    let src = r#"
+#include <math.h>
+
+double d_add = 1.0 + 2.0;
+double d_sub = 5.0 - 2.0;
+double d_mul = 3.0 * 2.0;
+double d_div = 12.0 / 4.0;
+double d_mixed = 1.0 + 2;            /* int operand promotes */
+float  f_add = 1.5f + 1.5f;
+long double l_add = 1.0L + 2.0L;
+double d_nested = (1.0 + 2.0) * 3.0 - 6.0;
+
+/* The silent-zero cases: a negated constant expression. */
+double d_neg_sum = -(1.0 + 2.0);
+double d_neg_mul = -(2.0 * 1.5);
+double d_neg_lit = -3.0;
+
+/* Integer folding must keep working unchanged. */
+int i_add = 1 + 2;
+int i_sub = 5 - 2;
+
+int main(void)
+{
+    if (d_add != 3.0) return 1;
+    if (d_sub != 3.0) return 2;
+    if (d_mul != 6.0) return 3;
+    if (d_div != 3.0) return 4;
+    if (d_mixed != 3.0) return 5;
+    if (f_add != 3.0f) return 6;
+    if (l_add != 3.0L) return 7;
+    if (d_nested != 3.0) return 8;
+
+    if (d_neg_sum != -3.0) return 9;
+    if (d_neg_mul != -3.0) return 10;
+    if (d_neg_lit != -3.0) return 11;
+
+    if (i_add != 3) return 12;
+    if (i_sub != 3) return 13;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("global_init_float_fold", src, &[]), 0);
+}
+
+/// Pointer arithmetic in a global initializer must keep working.
+///
+/// The float fix touches the arm that handles it, so this pins the behaviour
+/// the arm was written for: a symbol address plus a scaled constant offset.
+#[test]
+fn c99_global_initializer_folds_pointer_arithmetic() {
+    let src = r#"
+#include <string.h>
+static int arr[10] = {0,1,2,3,4,5,6,7,8,9};
+int *p_fwd = arr + 3;
+int *p_back = &arr[7] - 2;
+int *p_zero = arr + 0;
+
+/* A string literal has a static address too, but it only acquires a label
+   when it is interned -- which the address evaluator could not do, so this
+   was rejected while `arr + 1` was accepted. */
+const char *s_off = "hello" + 1;
+const char *s_end = "world" + 5;
+
+int main(void)
+{
+    if (*p_fwd != 3) return 1;
+    if (*p_back != 5) return 2;
+    if (*p_zero != 0) return 3;
+    if (p_fwd - arr != 3) return 4;
+    if (strcmp(s_off, "ello") != 0) return 5;
+    if (*s_end != '\0') return 6;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("global_init_ptr_fold", src, &[]), 0);
+}
+
+/// A `_Complex` object with static storage duration can be initialized.
+///
+/// Every spelling was rejected before: `__builtin_complex` had no arm at all,
+/// and `1.0 + 2.0*I` reached the arithmetic arm, which had no notion of a
+/// complex value. Only the function-local path worked.
+///
+/// Note `double _Complex z = {1.0, 2.0};` is *not* 1.0 + 2.0i. A complex type
+/// is a scalar type (C11 6.2.5p21), so that is a braced scalar initializer
+/// with an excess element; gcc warns and keeps only the first. Matching gcc
+/// here means the imaginary part stays zero.
+#[test]
+fn c99_global_initializer_accepts_complex() {
+    let src = r#"
+#include <complex.h>
+#include <stdio.h>
+
+double _Complex z_builtin = __builtin_complex(1.0, 2.0);
+double _Complex z_cmplx   = CMPLX(1.0, 2.0);
+double _Complex z_imag    = 1.0 + 2.0*I;
+double _Complex z_real    = 3.0;               /* real constant, zero imag */
+double _Complex z_neg     = -(1.0 + 2.0*I);
+double _Complex z_mul     = (1.0 + 2.0*I) * (3.0 + 4.0*I);   /* -5 + 10i */
+double _Complex z_brace   = {1.0};             /* braced scalar */
+float _Complex  f_imag    = 1.5f + 2.5f*I;     /* narrower base type */
+
+static double _Complex s_imag = 1.0 + 2.0*I;   /* internal linkage */
+
+int main(void)
+{
+    if (creal(z_builtin) != 1.0 || cimag(z_builtin) != 2.0) return 1;
+    if (creal(z_cmplx) != 1.0 || cimag(z_cmplx) != 2.0) return 2;
+    if (creal(z_imag) != 1.0 || cimag(z_imag) != 2.0) return 3;
+    if (creal(z_real) != 3.0 || cimag(z_real) != 0.0) return 4;
+    if (creal(z_neg) != -1.0 || cimag(z_neg) != -2.0) return 5;
+    if (creal(z_mul) != -5.0 || cimag(z_mul) != 10.0) return 6;
+    if (creal(z_brace) != 1.0 || cimag(z_brace) != 0.0) return 7;
+    if (crealf(f_imag) != 1.5f || cimagf(f_imag) != 2.5f) return 8;
+    if (creal(s_imag) != 1.0 || cimag(s_imag) != 2.0) return 9;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("global_init_complex", src, &["-lm".to_string()]),
+        0
+    );
+}

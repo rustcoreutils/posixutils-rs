@@ -11,8 +11,10 @@
 use super::linearize::*;
 use super::Initializer;
 use crate::diag::error;
+use crate::float::FloatVal;
 use crate::parse::ast::{BinaryOp, Declaration, Designator, Expr, ExprKind, InitElement, UnaryOp};
 use crate::strings::StringId;
+use crate::token::lexer::Position;
 use crate::types::{MemberInfo, TypeId, TypeKind, TypeModifiers, TypeTable};
 use std::collections::HashMap;
 
@@ -37,6 +39,34 @@ pub(crate) fn is_const_object_type(types: &TypeTable, typ: TypeId) -> bool {
             }
         }
         return false;
+    }
+}
+
+/// Name an expression the way a C programmer would, for a diagnostic.
+///
+/// The alternative these messages used was `{:?}` on the AST node, which
+/// prints interned ids, `FloatVal` internals and a `Position` struct for every
+/// subexpression -- pages of compiler internals for a one-line mistake.
+fn describe_expr(kind: &ExprKind) -> &'static str {
+    match kind {
+        ExprKind::Call { .. } => "a function call",
+        ExprKind::Assign { .. } => "an assignment",
+        ExprKind::Unary {
+            op: UnaryOp::PreInc | UnaryOp::PreDec,
+            ..
+        }
+        | ExprKind::PostInc(_)
+        | ExprKind::PostDec(_) => "an increment or decrement",
+        ExprKind::Unary {
+            op: UnaryOp::Deref, ..
+        } => "a pointer dereference",
+        ExprKind::Index { .. } => "an array subscript",
+        ExprKind::Member { .. } => "a member access",
+        ExprKind::Ident(_) => "the value of a variable",
+        ExprKind::Comma { .. } => "a comma expression",
+        ExprKind::Binary { .. } => "this arithmetic",
+        ExprKind::Conditional { .. } => "this conditional",
+        _ => "this expression",
     }
 }
 
@@ -136,6 +166,16 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// - Nested initializers
     /// - Compound literals (C99 6.5.2.5)
     pub(crate) fn ast_init_to_ir(&mut self, expr: &Expr, typ: TypeId) -> Initializer {
+        // An object of complex type needs both halves, whatever shape the
+        // initializer takes, so it is handled before the by-expression arms
+        // below -- several of which would otherwise match and keep only the
+        // real part.
+        if self.types.is_complex(typ) {
+            if let Some(init) = self.complex_initializer(expr, typ) {
+                return init;
+            }
+        }
+
         match &expr.kind {
             ExprKind::IntLit(v) => Initializer::Int(*v as i128),
             ExprKind::Int128Lit(v) => Initializer::Int(*v),
@@ -203,7 +243,13 @@ impl<'a> super::linearize::Linearizer<'a> {
                 _ => {
                     if let Some(val) = self.eval_const_expr(expr) {
                         Initializer::Int(val)
+                    } else if let Some(val) = self.eval_const_float_expr(expr) {
+                        Initializer::Float(val)
                     } else {
+                        // Returning `Initializer::None` here would put the
+                        // object in .bss and make it silently zero -- which is
+                        // what `-(1.0 + 2.0)` used to do.
+                        self.reject_initializer(expr);
                         Initializer::None
                     }
                 }
@@ -299,22 +345,24 @@ impl<'a> super::linearize::Linearizer<'a> {
                 } else if right.typ.is_some_and(is_ptr_or_array) && *op == BinaryOp::Add {
                     (right.as_ref(), left.as_ref(), false)
                 } else {
-                    // Neither operand is pointer — try as integer constant
+                    // Neither operand is a pointer, so this is ordinary
+                    // arithmetic that happens to use `+` or `-`. Try the same
+                    // ladder the catch-all arm uses -- integer first, then
+                    // floating. Without the floating step `double a = 1.0 +
+                    // 2.0;` was rejected, while `*` and `/` (which reach the
+                    // catch-all) folded correctly.
                     if let Some(val) = self.eval_const_expr(expr) {
                         return Initializer::Int(val);
                     }
-                    error(
-                        self.current_pos.unwrap_or_default(),
-                        &format!(
-                            "unsupported expression in global initializer: {:?}",
-                            expr.kind
-                        ),
-                    );
+                    if let Some(val) = self.eval_const_float_expr(expr) {
+                        return Initializer::Float(val);
+                    }
+                    self.reject_initializer(expr);
                     return Initializer::None;
                 };
 
                 // Evaluate the pointer side as a static address
-                if let Some((name, base_off)) = self.eval_static_address(ptr_expr) {
+                if let Some((name, base_off)) = self.static_address_of(ptr_expr) {
                     // Evaluate the integer side as a constant
                     if let Some(int_val) = self.eval_const_expr(int_expr) {
                         // Get the pointee size for pointer arithmetic scaling
@@ -394,16 +442,140 @@ impl<'a> super::linearize::Linearizer<'a> {
                     }
                 } else {
                     // Hard error for non-empty expressions we can't evaluate
-                    error(
-                        self.current_pos.unwrap_or_default(),
-                        &format!(
-                            "unsupported expression in global initializer: {:?}",
-                            expr.kind
-                        ),
-                    );
+                    self.reject_initializer(expr);
                     Initializer::None
                 }
             }
+        }
+    }
+
+    /// The static address of `expr`, as a symbol name and byte offset.
+    ///
+    /// Wraps `eval_static_address` to also cover a string literal, which has a
+    /// perfectly good static address but only once it has been interned and
+    /// given a label -- and interning needs `&mut self`, which the `&self`
+    /// evaluator cannot do. Without this `const char *p = "hello" + 1;` was
+    /// rejected, while `arr + 1` on a static array was accepted.
+    fn static_address_of(&mut self, expr: &Expr) -> Option<(String, i64)> {
+        if let ExprKind::StringLit(lit) = &expr.kind {
+            let label = format!(".LC{}", self.module.strings.len());
+            self.module.strings.push((label.clone(), lit.clone()));
+            return Some((label, 0));
+        }
+        self.eval_static_address(expr)
+    }
+
+    /// Fold a constant expression of complex type into its two halves.
+    ///
+    /// Returns `None` for anything that is not a constant, so callers can fall
+    /// through to their existing diagnostics. Arithmetic goes through `f64`,
+    /// matching `eval_const_float_expr`; that costs precision for
+    /// `long double _Complex`, which is a pre-existing limitation of constant
+    /// folding here rather than something this path introduces.
+    fn eval_const_complex(&self, expr: &Expr) -> Option<(f64, f64)> {
+        match &expr.kind {
+            // `I` itself is `__builtin_complex(0.0, 1.0)`.
+            ExprKind::BuiltinComplex { real, imag } => Some((
+                self.eval_const_float_expr(real)?.to_f64(),
+                self.eval_const_float_expr(imag)?.to_f64(),
+            )),
+
+            // A real constant is a complex one with a zero imaginary part.
+            ExprKind::FloatLit(_) | ExprKind::IntLit(_) | ExprKind::CharLit(_) => {
+                Some((self.eval_const_float_expr(expr)?.to_f64(), 0.0))
+            }
+
+            ExprKind::Cast { expr: inner, .. } => self.eval_const_complex(inner),
+
+            ExprKind::Unary {
+                op: UnaryOp::Neg,
+                operand,
+            } => {
+                let (re, im) = self.eval_const_complex(operand)?;
+                Some((-re, -im))
+            }
+
+            ExprKind::Binary { op, left, right } => {
+                let (a, b) = self.eval_const_complex(left)?;
+                let (c, d) = self.eval_const_complex(right)?;
+                match op {
+                    BinaryOp::Add => Some((a + c, b + d)),
+                    BinaryOp::Sub => Some((a - c, b - d)),
+                    BinaryOp::Mul => Some((a * c - b * d, a * d + b * c)),
+                    BinaryOp::Div => {
+                        let den = c * c + d * d;
+                        if den == 0.0 {
+                            return None;
+                        }
+                        Some(((a * c + b * d) / den, (b * c - a * d) / den))
+                    }
+                    _ => None,
+                }
+            }
+
+            _ => None,
+        }
+    }
+
+    /// Build the initializer for an object of complex type.
+    ///
+    /// A complex value is two reals laid out end to end, which
+    /// `Initializer::Struct` already describes, so no new variant is needed and
+    /// `emit_float_initializer` handles every base width.
+    fn complex_initializer(&mut self, expr: &Expr, typ: TypeId) -> Option<Initializer> {
+        // `double _Complex z = {1.0};` -- a *scalar* initializer that happens
+        // to be braced, because a complex type is a scalar type (C11 6.2.5p21).
+        // Only the first element initializes the object; gcc warns "excess
+        // elements in scalar initializer" for any others and ignores them, so
+        // `{1.0, 2.0}` is 1.0 + 0.0i rather than 1.0 + 2.0i.
+        let (re, im) = if let ExprKind::InitList { elements } = &expr.kind {
+            let first = elements.first()?;
+            self.eval_const_complex(&first.value)?
+        } else {
+            self.eval_const_complex(expr)?
+        };
+
+        let base = self.types.complex_base(typ);
+        let base_bytes = self.types.size_bytes(base);
+        // Narrowing to the base width happens at emission, which knows the
+        // field size; `FloatVal` just carries the value.
+        let re = FloatVal::from_f64(re);
+        let im = FloatVal::from_f64(im);
+        Some(Initializer::Struct {
+            total_size: base_bytes * 2,
+            fields: vec![
+                (0, base_bytes, Initializer::Float(re)),
+                (base_bytes, base_bytes, Initializer::Float(im)),
+            ],
+        })
+    }
+
+    /// Report an initializer that is not a constant expression we can fold.
+    ///
+    /// Named rather than inlined because three arms need it and they used to
+    /// disagree: two printed a raw Rust `{:?}` dump of the AST -- internal
+    /// representation in a user-facing message -- and the third said nothing
+    /// at all, which silently zeroed the object.
+    fn reject_initializer(&self, expr: &Expr) {
+        error(
+            self.expr_pos(expr),
+            &format!(
+                "{} is not a constant expression, so it cannot initialize an object with static storage duration",
+                describe_expr(&expr.kind)
+            ),
+        );
+    }
+
+    /// The position to report for `expr`.
+    ///
+    /// `linearize_global_decl` has no statement to set `current_pos` from, so
+    /// it stays `None` at file scope and every such diagnostic used to come
+    /// out as `file:0`. The expression carries its own position; prefer it.
+    fn expr_pos(&self, expr: &Expr) -> Position {
+        if expr.pos != Position::default() {
+            expr.pos
+        } else {
+            self.current_pos.unwrap_or_default()
         }
     }
 

@@ -1878,6 +1878,24 @@ impl Aarch64CodeGen {
                 }
             }
 
+            Opcode::TlsAddr => {
+                if let (Some(target), Some(&src)) = (insn.target, insn.src.first()) {
+                    let dst_loc = self.get_location(target);
+                    // X17 is a reserved scratch, safe when the result is on
+                    // the stack. X16 is used by the sequence itself.
+                    let dst_reg = match &dst_loc {
+                        Loc::Reg(r) => *r,
+                        _ => Reg::X17,
+                    };
+                    if let Loc::Global(name) = self.get_location(src) {
+                        self.emit_tls_addr(&name, dst_reg);
+                        if !matches!(dst_loc, Loc::Reg(_)) {
+                            self.emit_move_to_loc(dst_reg, &dst_loc, 64);
+                        }
+                    }
+                }
+            }
+
             Opcode::SymAddr => {
                 if let (Some(target), Some(&src)) = (insn.target, insn.src.first()) {
                     let dst_loc = self.get_location(target);
@@ -2152,13 +2170,66 @@ impl Aarch64CodeGen {
     /// set for `-fPIE` or the PIE default, because a PIE executable still
     /// resolves its own thread-locals at link time.
     fn use_tls_ie(&self, name: &str) -> bool {
-        self.shared_mode || self.extern_symbols.contains(name)
+        self.use_tls_dynamic() || self.extern_symbols.contains(name)
+    }
+
+    /// Whether thread-local access must use the dynamic model.
+    ///
+    /// Initial Exec resolves the offset through the GOT at load time, which
+    /// requires the object's thread-locals to fit in the loader's static-TLS
+    /// surplus -- so a library `dlopen`ed later with a large block is rejected.
+    /// Must agree with the condition `ir::tls::expand_dynamic_tls` was given.
+    fn use_tls_dynamic(&self) -> bool {
+        self.shared_mode && self.base.target.os == Os::Linux
     }
 
     /// Emit TLS address computation into dst register.
     /// After this call, dst holds the address of the TLS variable.
     fn emit_tls_addr(&mut self, name: &str, dst: Reg) {
         let sym = Symbol::global(name);
+        if self.use_tls_dynamic() {
+            // TLS descriptor, the dynamic model:
+            //   adrp  x0, :tlsdesc:sym
+            //   ldr   x1, [x0, #:tlsdesc_lo12:sym]   ; resolver entry point
+            //   add   x0, x0, :tlsdesc_lo12:sym      ; descriptor address
+            //   .tlsdesccall sym
+            //   blr   x1                             ; returns an OFFSET in x0
+            //   mrs   tmp, tpidr_el0
+            //   add   dst, tmp, x0                   ; plus the thread pointer
+            //
+            // x0 and x1 are fixed by the descriptor calling convention, and
+            // the `.tlsdesccall` marker must immediately precede the `blr` for
+            // the linker to relax the sequence.
+            let entry = Reg::X1;
+            self.push_lir(Aarch64Inst::AdrpTlsdesc {
+                sym: sym.clone(),
+                dst: Reg::X0,
+            });
+            self.push_lir(Aarch64Inst::LdrTlsdescLo12 {
+                sym: sym.clone(),
+                base: Reg::X0,
+                dst: entry,
+            });
+            self.push_lir(Aarch64Inst::AddTlsdescLo12 {
+                sym: sym.clone(),
+                base: Reg::X0,
+                dst: Reg::X0,
+            });
+            self.push_lir(Aarch64Inst::TlsdescCall { sym });
+            self.push_lir(Aarch64Inst::Blr { reg: entry });
+            let tp = Reg::X16;
+            self.push_lir(Aarch64Inst::Mrs {
+                sysreg: "tpidr_el0",
+                dst: tp,
+            });
+            self.push_lir(Aarch64Inst::Add {
+                size: OperandSize::B64,
+                src1: tp,
+                src2: GpOperand::Reg(Reg::X0),
+                dst,
+            });
+            return;
+        }
         if self.use_tls_ie(name) {
             // Initial Exec model (extern TLS or shared library):
             //   adrp  dst, :gottpoff:sym

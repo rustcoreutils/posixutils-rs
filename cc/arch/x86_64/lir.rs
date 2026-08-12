@@ -45,6 +45,16 @@ pub enum MemAddr {
     /// Initial Exec -- the Initial Exec spelling is `TlsGottpoff` below.
     TlsLocalExec(Symbol),
 
+    /// `symbol@TLSDESC(%rip)` - thread-local storage descriptor, the dynamic
+    /// model. `leaq` this into a register, then call through
+    /// [`MemAddr::TlsCall`]; the resolver returns the address in `%rax`.
+    ///
+    /// Unlike the older `@tlsgd` sequence, this needs no `data16`/`rex64`
+    /// padding: the linker relaxes it to Initial or Local Exec from its
+    /// natural form. Stripping the padding off an `@tlsgd` sequence, by
+    /// contrast, is a hard link error.
+    TlsDesc(Symbol),
+
     /// symbol@GOTTPOFF(%rip) - Thread-local storage Initial Exec model (Linux x86-64)
     /// For external TLS variables: load offset from GOT, then access %fs:(offset)
     TlsGottpoff(Symbol),
@@ -85,6 +95,9 @@ impl MemAddr {
             MemAddr::TlsLocalExec(sym) => {
                 // Thread-local storage Local Exec model: %fs:symbol@TPOFF
                 format!("%fs:{}@TPOFF", sym.format_for_target(target))
+            }
+            MemAddr::TlsDesc(sym) => {
+                format!("{}@TLSDESC(%rip)", sym.format_for_target(target))
             }
             MemAddr::TlsGottpoff(sym) => {
                 // Thread-local storage Initial Exec model: symbol@GOTTPOFF(%rip)
@@ -396,6 +409,18 @@ pub enum X86Inst {
 
     /// CALL - Function call
     Call { target: CallTarget<Reg> },
+
+    /// `call *sym@TLSCALL(%rax)` - invoke a TLS descriptor resolver.
+    ///
+    /// Its own instruction rather than a `CallTarget`, because the operand is
+    /// a relocated memory reference tied to `%rax` and to the `leaq
+    /// sym@TLSDESC(%rip), %rax` that must immediately precede it -- the
+    /// linker matches the pair when relaxing to a static model.
+    ///
+    /// Not a `Call` for register allocation either: the resolver preserves
+    /// every register but `%rax`, so treating it as call-like would spill
+    /// floating-point values and argument registers for nothing.
+    TlsDescCall { sym: Symbol },
 
     /// RET - Return from function
     Ret,
@@ -985,6 +1010,14 @@ impl EmitAsm for X86Inst {
 
             X86Inst::Jcc { cc, target: lbl } => {
                 let _ = writeln!(out, "    j{} {}", cc.x86_suffix(), lbl.name());
+            }
+
+            X86Inst::TlsDescCall { sym } => {
+                let _ = writeln!(
+                    out,
+                    "    call *{}@TLSCALL(%rax)",
+                    sym.format_for_target(target)
+                );
             }
 
             X86Inst::Call {

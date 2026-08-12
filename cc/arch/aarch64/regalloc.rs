@@ -792,6 +792,16 @@ pub fn get_constraint_info_aarch64(insn: &Instruction) -> Option<(Vec<Reg>, Vec<
     if insn.op.is_atomic() {
         clobbers.extend([Reg::X0, Reg::X1, Reg::X2, Reg::X8]);
     }
+
+    // The TLS descriptor sequence is fixed to x0 (the descriptor address, and
+    // the offset the resolver returns) and uses x1 for the resolver entry
+    // point. Nothing else is clobbered -- the resolver preserves every other
+    // register -- which is why this is a plain clobber and deliberately *not*
+    // an entry in `is_call_like_aarch64`. Declaring it call-like would spill
+    // every live floating-point value for a sequence that needs none of it.
+    if insn.op == Opcode::TlsAddr {
+        clobbers.extend([Reg::X0, Reg::X1]);
+    }
     clobbers.sort();
     clobbers.dedup();
 

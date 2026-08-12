@@ -258,6 +258,16 @@ pub fn opcode_constraints(op: Opcode) -> RegConstraints {
         Opcode::Mul => RegConstraints {
             clobbers: &[Reg::Rax, Reg::Rdx],
         },
+        // The TLS descriptor sequence hard-uses %rax: the `@TLSCALL`
+        // relocation names it, and the resolver returns through it. Nothing
+        // else is clobbered -- the resolver preserves every other register,
+        // which is why this is a plain clobber here and deliberately *not* an
+        // entry in `is_call_like_x86_64`. Declaring it call-like would spill
+        // every live floating-point value to the stack and spill argument
+        // registers, for a sequence that needs neither.
+        Opcode::TlsAddr => RegConstraints {
+            clobbers: &[Reg::Rax],
+        },
         Opcode::Shl | Opcode::Lsr | Opcode::Asr => RegConstraints {
             clobbers: &[Reg::Rcx],
         },

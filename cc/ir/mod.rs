@@ -26,6 +26,7 @@ mod linearize_stmt;
 pub mod lower;
 pub mod mem2reg;
 pub mod ssa;
+pub mod tls;
 pub mod validate;
 
 use crate::abi::{get_abi_for_conv, ArgClass, CallingConv};
@@ -172,10 +173,19 @@ pub enum Opcode {
 
     // Other
     SymAddr, // Get address of symbol
-    Call,    // Function call
-    Select,  // Ternary select: cond ? a : b (pure expressions only, enables cmov/csel)
-    SetVal,  // Create pseudo for constant
-    Nop,     // No operation
+    /// Get the address of a *thread-local* symbol.
+    ///
+    /// Distinct from `SymAddr` because the address is not a link-time
+    /// constant: under the dynamic model it is computed by a call, which
+    /// clobbers a register. Carrying that in the opcode is what lets
+    /// `opcode_constraints` declare the clobber without the register allocator
+    /// needing the module's thread-local symbol set or the build mode -- it
+    /// runs over the IR, long before either is in reach.
+    TlsAddr,
+    Call,   // Function call
+    Select, // Ternary select: cond ? a : b (pure expressions only, enables cmov/csel)
+    SetVal, // Create pseudo for constant
+    Nop,    // No operation
 
     // Variadic function support
     VaStart, // Initialize va_list
@@ -380,6 +390,7 @@ impl Opcode {
             Opcode::PhiSource => "phisrc",
             Opcode::Copy => "copy",
             Opcode::SymAddr => "symaddr",
+            Opcode::TlsAddr => "tlsaddr",
             Opcode::Call => "call",
             Opcode::Select => "sel",
             Opcode::SetVal => "setval",
@@ -1107,6 +1118,14 @@ impl Instruction {
             .with_target(target)
             .with_src(sym)
             .with_type_and_size(typ, 64) // Pointers are always 64-bit
+    }
+
+    /// Create a thread-local address instruction. See [`Opcode::TlsAddr`].
+    pub fn tls_addr(target: PseudoId, sym: PseudoId, typ: TypeId) -> Self {
+        Self::new(Opcode::TlsAddr)
+            .with_target(target)
+            .with_src(sym)
+            .with_type_and_size(typ, 64)
     }
 
     /// Create a phi node

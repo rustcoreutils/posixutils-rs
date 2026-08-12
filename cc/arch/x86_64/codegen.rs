@@ -244,15 +244,62 @@ impl X86_64CodeGen {
     /// set for `-fPIE` or the PIE default, because a PIE executable still
     /// resolves its own thread-locals at link time.
     fn use_tls_ie(&self, name: &str) -> bool {
-        self.shared_mode || self.extern_symbols.contains(name)
+        self.use_tls_dynamic() || self.extern_symbols.contains(name)
+    }
+
+    /// Whether thread-local access must use the dynamic model.
+    ///
+    /// Initial Exec resolves the offset through the GOT at load time, which
+    /// requires the object's thread-locals to fit in the loader's static-TLS
+    /// surplus -- so a library `dlopen`ed later with a large block is rejected.
+    /// Only the dynamic model has no such limit.
+    ///
+    /// Must agree with the condition `ir::tls::expand_dynamic_tls` was given,
+    /// since that pass is what puts the address computation where the register
+    /// allocator can see it.
+    fn use_tls_dynamic(&self) -> bool {
+        self.shared_mode && self.base.target.os == Os::Linux
     }
 
     fn emit_tls_addr(&mut self, name: &str, dst: Reg) {
         let symbol = Symbol::global(name.to_string());
-        // Initial Exec for a symbol defined elsewhere or for any
-        // position-independent build, matching what the load and store paths
-        // choose. General Dynamic, which is what a dlopen-able library really
-        // needs, is not implemented on either architecture yet.
+        if self.use_tls_dynamic() {
+            // TLS descriptor, the dynamic model:
+            //   leaq sym@TLSDESC(%rip), %rax
+            //   call *sym@TLSCALL(%rax)      ; returns an OFFSET in %rax
+            //   addq %fs:0, %rax             ; plus the thread pointer
+            //
+            // The resolver returns the offset from the thread pointer, not an
+            // address -- the same convention Initial Exec uses. gcc hides this
+            // by folding the addition into the access as `%fs:(%rax)`; here
+            // the whole point is to produce a plain pointer, so the thread
+            // pointer is added explicitly.
+            //
+            // `%rax` is not a choice -- the `@TLSCALL` relocation names it,
+            // and the linker matches the `leaq`/`call` pair when relaxing to a
+            // static model, so nothing may come between them.
+            self.push_lir(X86Inst::Lea {
+                addr: MemAddr::TlsDesc(symbol.clone()),
+                dst: Reg::Rax,
+            });
+            self.push_lir(X86Inst::TlsDescCall { sym: symbol });
+            self.push_lir(X86Inst::Add {
+                size: OperandSize::B64,
+                src: GpOperand::Mem(MemAddr::FsAbsolute(0)),
+                dst: Reg::Rax,
+            });
+            if dst != Reg::Rax {
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Reg(Reg::Rax),
+                    dst: GpOperand::Reg(dst),
+                });
+            }
+            return;
+        }
+
+        // Initial Exec for a symbol defined elsewhere, matching what the load
+        // and store paths choose.
         if self.use_tls_ie(name) {
             // movq sym@GOTTPOFF(%rip), %dst   ; the offset from the thread pointer
             // addq %fs:0, %dst                ; plus the thread pointer itself
@@ -1704,6 +1751,24 @@ impl X86_64CodeGen {
                 if let (Some(target), Some(&src)) = (insn.target, insn.src.first()) {
                     // Pass the type to emit_copy for proper sign/zero extension
                     self.emit_copy_with_type(src, target, insn.size, insn.typ, types);
+                }
+            }
+
+            Opcode::TlsAddr => {
+                if let (Some(target), Some(&src)) = (insn.target, insn.src.first()) {
+                    let dst_loc = self.get_location(target);
+                    // R10 is reserved scratch, so it is safe when the result
+                    // lives on the stack.
+                    let dst_reg = match &dst_loc {
+                        Loc::Reg(r) => *r,
+                        _ => Reg::R10,
+                    };
+                    if let Loc::Global(name) = self.get_location(src) {
+                        self.emit_tls_addr(&name, dst_reg);
+                        if !matches!(dst_loc, Loc::Reg(_)) {
+                            self.emit_move_to_loc(dst_reg, &dst_loc, 64);
+                        }
+                    }
                 }
             }
 

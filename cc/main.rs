@@ -646,6 +646,16 @@ fn process_file(
 
     dump_ir(args, &module, "post-mapping");
 
+    // Expand thread-local accesses for the dynamic TLS model. Must run before
+    // `optimize_module`, because register allocation is downstream of it and
+    // has to see the address computation -- see `ir::tls`. `shared_mode` is
+    // computed here rather than beside `create_codegen` below so that the pass
+    // and the backend agree on the model from one expression.
+    let shared_mode = producing_shared(args) || args.fpic;
+    ir::tls::expand_dynamic_tls(&mut module, shared_mode && target.os == target::Os::Linux);
+
+    dump_ir(args, &module, "post-tls");
+
     // Optimize IR. Called even at -O0, where the only pass that does anything
     // is inlining of `__attribute__((always_inline))` functions, which gcc
     // honours with optimization off.
@@ -670,12 +680,12 @@ fn process_file(
     let emit_unwind_tables = !args.no_unwind_tables;
     let pie_mode = pie_enabled(args, target);
     let pic_mode = args.fpic || producing_shared(args) || pie_mode;
-    // `shared_mode` selects the TLS model and nothing else. `-fPIC` asks for
-    // code that can live in a shared object, which is exactly the condition
-    // Local Exec cannot satisfy, so it belongs here -- while `-fPIE` and the
-    // PIE default do not, because a PIE executable still resolves its own
-    // thread-locals at link time. gcc draws the line in the same place.
-    let shared_mode = producing_shared(args) || args.fpic;
+    // `shared_mode` selects the TLS model and nothing else; it is computed
+    // above, before the expansion pass that depends on the same condition.
+    // `-fPIC` asks for code that can live in a shared object, which is exactly
+    // what Local Exec cannot satisfy, while `-fPIE` and the PIE default do not,
+    // because a PIE executable still resolves its own thread-locals at link
+    // time. gcc draws the line in the same place.
     let mut codegen =
         arch::codegen::create_codegen(target.clone(), emit_unwind_tables, pic_mode, shared_mode);
     let asm = codegen.generate(&module, &types);

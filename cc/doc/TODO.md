@@ -118,49 +118,53 @@ rejected outright and the typedef route is rejected at the typedef. And
 `int *_Atomic p;` now parses -- it was a qualifier-list bug at file scope, not
 a missing feature.
 
-### C11 Thread-Local Storage — General Dynamic
+### C11 Thread-Local Storage
 
-Done: parser, symbol table, IR, x86-64 Local-Exec (`%fs:sym@TPOFF`) and
-Initial-Exec (`sym@GOTTPOFF`), AArch64 Local-Exec (`mrs tpidr_el0` +
-`tprel_hi12`/`tprel_lo12_nc`) and Initial-Exec (`gottpoff` /
-`gottpoff_lo12`), and model selection: `-shared` and `-fPIC` take
-Initial-Exec, while `-fPIE` and a plain executable keep Local-Exec.
+Complete on Linux: Local-Exec, Initial-Exec and the dynamic model, on both
+architectures, with `-shared` and `-fPIC` taking the dynamic model while
+`-fPIE` and a plain executable keep Local-Exec.
 
-**Remaining: the General Dynamic model** — `@TLSGD` plus a call to
-`__tls_get_addr` on x86-64, TLSDESC on AArch64, of which there is currently
-none. gcc uses it for `-fPIC`, where c17 uses Initial-Exec. Initial-Exec is a
-legitimate position-independent model and is correct for a shared object
-loaded at startup, but it requires the object's thread-locals to fit in the
-loader's static TLS surplus, so a large block fails at `dlopen`:
+The dynamic model uses **TLS descriptors** rather than the older
+`@tlsgd` + `__tls_get_addr` sequence. That is already gcc's default on
+AArch64; on x86-64 it is gcc's `-mtls-dialect=gnu2`. Two measured reasons:
 
-```
-$ c17 -fPIC --shared -o lib.so libbig.c   # _Thread_local int big[600000];
-dlopen failed: ./lib.so: cannot allocate memory in static TLS block
-```
+- The `@tlsgd` sequence is a byte-exact 16-byte blob — `data16` prefix,
+  `.value 0x6666`, `rex64` — that the linker pattern-matches in order to relax
+  it to a static model. Emitting it without the padding is a hard link error
+  (`TLS transition from R_X86_64_TLSGD to R_X86_64_GOTTPOFF failed`), and c17's
+  LIR emits structured instructions rather than byte blobs.
+- A descriptor resolver preserves every register but the one it returns
+  through. `__tls_get_addr` is an ordinary call and clobbers all caller-saved
+  registers.
 
-gcc loads the same source. The failure is size-dependent — a small block fits
-in the surplus and works — so a test for this has to exceed it deliberately.
+That second point is why the register allocator turned out not to be the
+blocker this file previously described. The sequence is **not** call-like: it
+declares a single clobber through `opcode_constraints`, the same mechanism that
+already handles `DivS` clobbering `RAX`/`RDX`. Adding it to `is_call_like_*`
+would be actively wrong — call positions send every live floating-point value
+to a stack slot and spill argument registers, none of which a descriptor needs.
 
-**The hard part is the register allocator, not the relocations.** A
-synthesized call to `__tls_get_addr` must be declared call-like or live
-pseudos get allocated into the registers it clobbers. `is_call_like_x86_64`
-(`cc/arch/x86_64/regalloc.rs`) keys on `Opcode`, but General Dynamic would
-make `Load` / `Store` / `SymAddr` call-like *only when the operand is a TLS
-symbol* — an operand-granularity condition that list cannot express. Settle
-that before writing any emission code.
+The address computation is an IR opcode (`Opcode::TlsAddr`) rather than
+something a backend `emit_*` helper synthesizes, because register allocation
+runs over the IR and finishes before any machine instruction exists. `ir::tls`
+expands thread-local accesses into it, and only under the dynamic model, so
+Local-Exec keeps its one-instruction form.
 
-New relocation spellings belong in the two typed places — the
-`MemAddr::format` match (`cc/arch/x86_64/lir.rs`) and the AArch64 instruction
-`emit` (`cc/arch/aarch64/lir.rs`) — not `Directive::Raw`. The
-synthesized-call idiom to copy is `emit_memcpy`
-(`cc/arch/x86_64/features.rs`).
+Both architectures return an *offset* from the thread pointer, which the
+sequence then adds — gcc hides this on x86-64 by folding the addition into the
+access as `%fs:(%rax)`.
 
-**Four latent Local-Exec sites** remain, none reachable from C source today:
-`loc_to_gp_operand`, the two inline-asm operand paths, and `loc_to_asm_string`
-(which formats a global as plain `name(%rip)` with no TLS handling at all).
-They emit a single memory operand, and Initial-Exec needs two instructions, so
-they cannot simply call `use_tls_ie` — closing them means giving those paths a
-way to emit a sequence.
+**Remaining:**
+- Not implemented on FreeBSD, whose rtld may lack x86-64 descriptor support;
+  TLS is gated on Linux, as it already was.
+- The older `gnu` dialect is not implemented. If a target needs it, it belongs
+  behind `-mtls-dialect=gnu`.
+- Four latent Local-Exec sites remain in the x86-64 backend
+  (`loc_to_gp_operand`, the two inline-asm operand paths, `loc_to_asm_string`,
+  the last of which formats a thread-local as a plain `name(%rip)`). None is
+  reachable from C source — under the dynamic model the expansion pass removes
+  thread-local operands before codegen sees them — and three are `&self` and
+  cannot emit a sequence at all.
 
 ---
 

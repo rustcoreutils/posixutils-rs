@@ -11,9 +11,10 @@
 // Consolidates: optimization, debug tests
 //
 
-use crate::codegen::asm_probe::{asm_for_with, AARCH64_LINUX, X86_64_LINUX};
+use crate::codegen::asm_probe::{asm_for_with, body_of, AARCH64_LINUX, X86_64_LINUX};
 use crate::common::{
-    compile_and_run, compile_and_run_optimized, compile_and_run_two_units, create_c_file,
+    compile_and_dlopen, compile_and_run, compile_and_run_optimized, compile_and_run_two_units,
+    create_c_file,
 };
 use plib::testing::run_test_base;
 use std::io::Write;
@@ -6472,24 +6473,70 @@ int *addr_tls(void) { return &tv; }
     for flags in [&["-O", "-fPIC"][..], &["-O", "--shared"][..]] {
         let asm = asm_for_with("tls_pic", X86_64_LINUX, src, flags);
         assert!(
-            asm.contains("@GOTTPOFF"),
-            "x86_64 {flags:?}: expected Initial Exec:\n{asm}"
+            asm.contains("@TLSDESC") && asm.contains("@TLSCALL"),
+            "x86_64 {flags:?}: expected the dynamic model:\n{asm}"
         );
         assert!(
-            !asm.contains("@TPOFF"),
-            "x86_64 {flags:?}: Local Exec is not position independent:\n{asm}"
+            !asm.contains("@TPOFF") && !asm.contains("@GOTTPOFF"),
+            "x86_64 {flags:?}: a static model cannot serve a dlopened library:\n{asm}"
         );
 
         let asm = asm_for_with("tls_pic", AARCH64_LINUX, src, flags);
         assert!(
-            asm.contains("gottpoff"),
-            "aarch64 {flags:?}: expected Initial Exec:\n{asm}"
+            asm.contains(":tlsdesc:") && asm.contains(".tlsdesccall"),
+            "aarch64 {flags:?}: expected the dynamic model:\n{asm}"
         );
         assert!(
-            !asm.contains("tprel"),
-            "aarch64 {flags:?}: Local Exec is not position independent:\n{asm}"
+            !asm.contains("tprel") && !asm.contains("gottpoff"),
+            "aarch64 {flags:?}: a static model cannot serve a dlopened library:\n{asm}"
         );
     }
+}
+
+/// A thread-local store costs no more register traffic than a global one.
+///
+/// A TLS descriptor resolver preserves every register but the one it returns
+/// through, so nothing live needs saving around it. The comparison is against
+/// the identical function storing to an ordinary global, because c17 stores
+/// floating-point arguments to the stack in the prologue regardless, and a
+/// count taken in isolation cannot tell that baseline from a real spill.
+///
+/// Scope, honestly: this pins the *cost* of the sequence, and would catch a
+/// regression that started saving registers around it. It is not a proof that
+/// the sequence is excluded from the allocator's call-like set -- at this
+/// optimization level the floating-point values are already stack-resident,
+/// so flipping that switch does not change this function's output. The reason
+/// to keep the sequence out of that set is recorded where the decision is
+/// made, in `opcode_constraints`.
+#[test]
+fn codegen_tls_descriptor_costs_no_more_than_a_global_store() {
+    let src = r#"
+_Thread_local int tv;
+int gv;
+double keep_tls(double a, double b) { double s = a * b; tv = 1; return s + a; }
+double keep_global(double a, double b) { double s = a * b; gv = 1; return s + a; }
+"#;
+    let asm = asm_for_with("tls_nospill", X86_64_LINUX, src, &["-O", "-fPIC"]);
+    let tls = body_of(&asm, "keep_tls");
+    let glob = body_of(&asm, "keep_global");
+
+    assert!(
+        tls.contains("@TLSCALL"),
+        "expected the descriptor sequence:\n{tls}"
+    );
+
+    // Compared against the identical function storing to an ordinary global,
+    // because c17 stores floating-point arguments to the stack in the prologue
+    // regardless -- counting spills in isolation cannot tell that baseline
+    // apart from a spill the sequence caused.
+    let tls_fp = tls.matches("movsd").count();
+    let glob_fp = glob.matches("movsd").count();
+    assert_eq!(
+        tls_fp, glob_fp,
+        "the descriptor sequence moved {tls_fp} floating-point values where an \
+         ordinary global store moves {glob_fp}; something is saving registers \
+         around it:\n--- thread-local ---\n{tls}\n--- global ---\n{glob}"
+    );
 }
 
 /// An executable keeps the cheapest model, `-fPIE` included.
@@ -6533,4 +6580,41 @@ int read_ev(int x) { return x + ev; }
         asm.contains("@GOTTPOFF"),
         "x86_64: extern TLS needs Initial Exec even in an executable:\n{asm}"
     );
+}
+
+/// A shared object with a large thread-local block must be `dlopen`-able.
+///
+/// Initial Exec resolves a thread-local's offset through the GOT at load time,
+/// which works for a library present at startup but requires the block to fit
+/// in the loader's *static TLS surplus*. A library loaded later with a block
+/// bigger than that surplus is rejected outright:
+///
+/// ```text
+/// dlopen failed: ./lib.so: cannot allocate memory in static TLS block
+/// ```
+///
+/// Only a dynamic model removes the limit. The block here is deliberately
+/// oversized -- a small one fits the surplus and passes under either model, so
+/// it would not test anything.
+#[test]
+fn codegen_dlopen_a_library_with_a_large_thread_local_block() {
+    let lib = r#"
+_Thread_local int big[600000];
+int bump(void) { return ++big[0]; }
+"#;
+    let main = r#"
+#include <stdio.h>
+#include <dlfcn.h>
+int main(void)
+{
+    void *h = dlopen("./lib.so", RTLD_NOW);
+    if (!h) { printf("dlopen failed: %s\n", dlerror()); return 1; }
+    int (*bump)(void) = (int (*)(void))dlsym(h, "bump");
+    if (!bump) { printf("dlsym failed: %s\n", dlerror()); return 2; }
+    if (bump() != 1) return 3;
+    if (bump() != 2) return 4;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_dlopen("tls_big", lib, main, &[]), 0);
 }

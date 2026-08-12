@@ -11,25 +11,6 @@
 
 ## Technical Debt
 
-### Decimal floating literals are rounded through `f64`
-
-**Location**: `parse_number_literal` in `cc/parse/expression.rs`
-
-**Issue**: A literal is now carried as `FloatVal` (`cc/float.rs`), which holds
-the x87 80-bit encoding and is exact for `long double` on both targets, so
-`LDBL_MAX`, `LDBL_MIN` and every *hex* literal survive. A **decimal** literal
-still goes through `f64::from_str`, so one outside double's range or needing
-more than 53 mantissa bits is rounded: `3.14159265358979323846L` differs from
-gcc's bits from the 53rd onward, and `1.18973149535723176502e+4932L` written
-out longhand is still `inf`.
-
-**What it needs**: a correctly-rounded decimal-to-64-bit-significand
-conversion. `10^4932` is ~16,400 bits, so it takes a big-integer scale and
-round with sticky-bit tracking; Rust's std rounds only to 53 bits and the
-minimal-dependency rule rules out a crate. The result feeds straight into
-`FloatVal::from_parts`, which already rounds an exact `(mantissa, exp2)` pair
-to the target width -- nothing else has to change.
-
 ### `_FORTIFY_SOURCE` compiles but checks nothing
 
 Peeling this apart one layer at a time has been the only way to see it: each

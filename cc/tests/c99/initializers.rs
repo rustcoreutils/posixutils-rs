@@ -1421,3 +1421,61 @@ int main(void)
         0
     );
 }
+
+// ============================================================================
+// Decimal floating literals at the target's precision
+// ============================================================================
+
+/// A decimal literal must reach `long double` at full width.
+///
+/// Decimal literals went through `f64::from_str`, so a `long double` was
+/// correct only to 53 of its 64 significand bits, and one outside double's
+/// range collapsed entirely -- `LDBL_MAX` written in decimal became `inf` and
+/// `1e-4900L` became zero. Hex literals were already exact, which is what the
+/// comparisons below use as the reference: every right-hand side is a hex
+/// literal naming the value gcc produces for the decimal on its left.
+///
+/// `float` and `double` were never affected: `f64::from_str` is correctly
+/// rounded, and for those two the target format is `f64` or narrower.
+#[test]
+fn c99_decimal_literals_reach_long_double_precision() {
+    let src = r#"
+#include <float.h>
+
+int main(void)
+{
+    /* Needs all 64 significand bits: the tail `235` is lost at 53 bits. */
+    if (3.14159265358979323846L != 0xc.90fdaa22168c235p-2L) return 1;
+
+    /* A value with no exact binary form, rounded at the wrong width. */
+    if (0.1L != 0xc.ccccccccccccccdp-7L) return 2;
+
+    /* Outside double's range in both directions. */
+    if (1.18973149535723176502e+4932L != 0xf.fffffffffffffffp+16380L) return 3;
+    if (1e-4900L != 0xb.bb4df56baf62972p-16281L) return 4;
+
+    /* Ordinary magnitudes must stay exact, not merely close. */
+    if (1.0L != 0x1p+0L) return 5;
+    if (0.5L != 0x1p-1L) return 6;
+    if (1e10L != 0x2.540be4p+32L) return 7;
+    if (123456789.0L != 0x7.5bcd15p+24L) return 8;
+
+    /* Zero, and a value that underflows to it, keep their sign. */
+    if (0.0L != 0x0p+0L) return 9;
+    if (1e-5000L != 0.0L) return 10;
+
+    /* float and double are unchanged. */
+    if (0.1 != 0x1.999999999999ap-4) return 11;
+    if (0.1f != 0x1.99999ap-4f) return 12;
+    if (DBL_MAX <= 0.0 || LDBL_MAX <= 0.0) return 13;
+
+    /* The exponent forms all agree. */
+    if (1.5e3L != 1500.0L) return 14;
+    if (15e2L != 1500.0L) return 15;
+    if (150000e-2L != 1500.0L) return 16;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("decimal_long_double", src, &[]), 0);
+}

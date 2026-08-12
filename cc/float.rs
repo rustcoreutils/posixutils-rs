@@ -391,6 +391,330 @@ impl From<f64> for FloatVal {
     }
 }
 
+// ============================================================================
+// Decimal to binary conversion
+// ============================================================================
+
+/// A minimal unsigned big integer, little-endian limbs.
+///
+/// Exists because converting a decimal literal exactly needs numbers far wider
+/// than any primitive: `10^4932` is about 16,400 bits. Only the four
+/// operations that conversion uses are implemented -- there is no general
+/// bignum here, and none is wanted.
+#[derive(Clone, Debug)]
+struct Big {
+    /// Little-endian 32-bit limbs, no trailing zeros.
+    limbs: Vec<u32>,
+}
+
+impl Big {
+    fn zero() -> Self {
+        Big { limbs: Vec::new() }
+    }
+
+    fn from_u32(v: u32) -> Self {
+        Big {
+            limbs: if v == 0 { Vec::new() } else { vec![v] },
+        }
+    }
+
+    fn is_zero(&self) -> bool {
+        self.limbs.is_empty()
+    }
+
+    fn trim(&mut self) {
+        while self.limbs.last() == Some(&0) {
+            self.limbs.pop();
+        }
+    }
+
+    /// Number of significant bits.
+    fn bit_len(&self) -> usize {
+        match self.limbs.last() {
+            None => 0,
+            Some(top) => self.limbs.len() * 32 - top.leading_zeros() as usize,
+        }
+    }
+
+    fn bit(&self, i: usize) -> bool {
+        let limb = i / 32;
+        limb < self.limbs.len() && (self.limbs[limb] >> (i % 32)) & 1 == 1
+    }
+
+    /// `self = self * m + a`, the digit-accumulation step.
+    fn mul_add_small(&mut self, m: u32, a: u32) {
+        let mut carry = a as u64;
+        for limb in self.limbs.iter_mut() {
+            let v = *limb as u64 * m as u64 + carry;
+            *limb = v as u32;
+            carry = v >> 32;
+        }
+        while carry != 0 {
+            self.limbs.push(carry as u32);
+            carry >>= 32;
+        }
+        self.trim();
+    }
+
+    fn shl(&mut self, bits: usize) {
+        if self.is_zero() || bits == 0 {
+            return;
+        }
+        let (whole, part) = (bits / 32, bits % 32);
+        if part != 0 {
+            let mut carry = 0u32;
+            for limb in self.limbs.iter_mut() {
+                let v = ((*limb as u64) << part) | carry as u64;
+                *limb = v as u32;
+                carry = (v >> 32) as u32;
+            }
+            if carry != 0 {
+                self.limbs.push(carry);
+            }
+        }
+        if whole != 0 {
+            let mut out = vec![0u32; whole];
+            out.extend_from_slice(&self.limbs);
+            self.limbs = out;
+        }
+    }
+
+    /// Compare against `other`, both trimmed.
+    fn cmp(&self, other: &Big) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        if self.limbs.len() != other.limbs.len() {
+            return self.limbs.len().cmp(&other.limbs.len());
+        }
+        for i in (0..self.limbs.len()).rev() {
+            match self.limbs[i].cmp(&other.limbs[i]) {
+                Ordering::Equal => continue,
+                ord => return ord,
+            }
+        }
+        Ordering::Equal
+    }
+
+    /// `self -= other`, which the caller has checked is no larger.
+    fn sub(&mut self, other: &Big) {
+        let mut borrow = 0i64;
+        for i in 0..self.limbs.len() {
+            let rhs = *other.limbs.get(i).unwrap_or(&0) as i64;
+            let v = self.limbs[i] as i64 - rhs - borrow;
+            if v < 0 {
+                self.limbs[i] = (v + (1i64 << 32)) as u32;
+                borrow = 1;
+            } else {
+                self.limbs[i] = v as u32;
+                borrow = 0;
+            }
+        }
+        self.trim();
+    }
+
+    /// Multiply by `10^n`, in chunks that fit a limb.
+    fn mul_pow10(&mut self, mut n: u32) {
+        const CHUNK: u32 = 9;
+        const P10: u32 = 1_000_000_000;
+        while n >= CHUNK {
+            self.mul_add_small(P10, 0);
+            n -= CHUNK;
+        }
+        if n != 0 {
+            self.mul_add_small(10u32.pow(n), 0);
+        }
+    }
+}
+
+/// The number of significand bits produced before rounding.
+///
+/// One more than the 64 the widest target needs, plus room for a round bit;
+/// [`FloatVal::from_parts`] does the final rounding, and the sticky bit folded
+/// into bit 0 keeps a true tie distinguishable from "just above".
+const DEC_PRECISION: usize = 96;
+
+/// Convert `digits * 10^exp10` into an exact-enough `(mantissa, exp2)` pair
+/// for [`FloatVal::from_parts`].
+///
+/// The result is `mantissa * 2^exp2`, correctly rounded to `DEC_PRECISION`
+/// bits with a sticky bit in bit 0, which is what lets the caller round to any
+/// narrower width without double-rounding error.
+fn decimal_to_binary(digits: &Big, exp10: i32) -> (u128, i32) {
+    if digits.is_zero() {
+        return (0, 0);
+    }
+
+    // The value is num/den. Only one of them ever needs the power of ten.
+    let mut num = digits.clone();
+    let mut den = Big::from_u32(1);
+    if exp10 >= 0 {
+        num.mul_pow10(exp10 as u32);
+    } else {
+        den.mul_pow10((-exp10) as u32);
+    }
+
+    // Shift the numerator until the quotient has at least DEC_PRECISION bits,
+    // so the division below produces every bit that can affect rounding.
+    let want = DEC_PRECISION as i64 + 1;
+    let have = num.bit_len() as i64 - den.bit_len() as i64;
+    let shift = (want - have).max(0) as usize;
+    num.shl(shift);
+
+    // Schoolbook bit-at-a-time division. Slower than a limb-wise algorithm,
+    // and much easier to be sure of; it runs only for literals a target format
+    // cannot hold directly.
+    let mut quotient = Big::zero();
+    let mut rem = Big::zero();
+    let top = num.bit_len();
+    quotient.limbs = vec![0u32; top.div_ceil(32)];
+    for i in (0..top).rev() {
+        rem.shl(1);
+        if num.bit(i) {
+            if rem.limbs.is_empty() {
+                rem.limbs.push(1);
+            } else {
+                rem.limbs[0] |= 1;
+            }
+        }
+        if rem.cmp(&den) != std::cmp::Ordering::Less {
+            rem.sub(&den);
+            quotient.limbs[i / 32] |= 1 << (i % 32);
+        }
+    }
+    quotient.trim();
+
+    // Keep the top DEC_PRECISION bits; everything dropped, plus any remainder,
+    // becomes the sticky bit.
+    let qbits = quotient.bit_len();
+    let mut exp2 = -(shift as i32);
+    let mut sticky = !rem.is_zero();
+    let mut mantissa: u128 = 0;
+    if qbits > DEC_PRECISION {
+        let drop = qbits - DEC_PRECISION;
+        for i in 0..drop {
+            if quotient.bit(i) {
+                sticky = true;
+            }
+        }
+        for i in 0..DEC_PRECISION {
+            if quotient.bit(drop + i) {
+                mantissa |= 1u128 << i;
+            }
+        }
+        exp2 += drop as i32;
+    } else {
+        for i in 0..qbits {
+            if quotient.bit(i) {
+                mantissa |= 1u128 << i;
+            }
+        }
+    }
+    if sticky {
+        mantissa |= 1;
+    }
+    (mantissa, exp2)
+}
+
+/// Parse a decimal floating literal into an exact `(mantissa, exp2)` pair.
+///
+/// The literal's digits and its decimal exponent are gathered exactly, then
+/// scaled by a power of ten in full precision. Going through `f64` instead --
+/// which is what this replaces -- costs a `long double` eleven of its
+/// significand bits, and collapses anything outside double's range to `inf` or
+/// zero before the literal's type is even known.
+///
+/// Accepts the C grammar for a decimal floating constant, without sign or
+/// suffix: the caller has already stripped both.
+pub(crate) fn parse_decimal_float_parts(s: &str) -> Result<(u128, i32), ()> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut digits = Big::zero();
+    let mut any = false;
+    // Digits are accumulated nine at a time; one `mul_add_small` per chunk
+    // rather than per digit.
+    let mut chunk: u32 = 0;
+    let mut chunk_len: u32 = 0;
+    let push = |digits: &mut Big, chunk: &mut u32, chunk_len: &mut u32| {
+        if *chunk_len != 0 {
+            digits.mul_add_small(10u32.pow(*chunk_len), *chunk);
+            *chunk = 0;
+            *chunk_len = 0;
+        }
+    };
+
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        chunk = chunk * 10 + (bytes[i] - b'0') as u32;
+        chunk_len += 1;
+        if chunk_len == 9 {
+            push(&mut digits, &mut chunk, &mut chunk_len);
+        }
+        any = true;
+        i += 1;
+    }
+
+    // Digits after the point shift the decimal exponent down by one each.
+    let mut exp10: i32 = 0;
+    if i < bytes.len() && bytes[i] == b'.' {
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            chunk = chunk * 10 + (bytes[i] - b'0') as u32;
+            chunk_len += 1;
+            if chunk_len == 9 {
+                push(&mut digits, &mut chunk, &mut chunk_len);
+            }
+            any = true;
+            exp10 -= 1;
+            i += 1;
+        }
+    }
+    push(&mut digits, &mut chunk, &mut chunk_len);
+    if !any {
+        return Err(());
+    }
+
+    if i < bytes.len() && (bytes[i] | 0x20) == b'e' {
+        i += 1;
+        let neg = match bytes.get(i) {
+            Some(b'+') => {
+                i += 1;
+                false
+            }
+            Some(b'-') => {
+                i += 1;
+                true
+            }
+            _ => false,
+        };
+        let start = i;
+        let mut value: i64 = 0;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            // Saturate rather than overflow: an exponent this large is already
+            // far outside every target format, and the scaling below turns it
+            // into an infinity or a zero regardless.
+            value = (value * 10 + (bytes[i] - b'0') as i64).min(1 << 30);
+            i += 1;
+        }
+        if i == start {
+            return Err(());
+        }
+        exp10 += if neg { -value as i32 } else { value as i32 };
+    }
+
+    if i != bytes.len() {
+        return Err(());
+    }
+
+    // Well outside any target's range; let the caller's rounding produce the
+    // infinity or zero rather than building a 16,000-bit number to find out.
+    if exp10 > 5000 {
+        return Ok((1, i32::MAX / 2));
+    }
+    if exp10 < -5000 {
+        return Ok((0, 0));
+    }
+
+    Ok(decimal_to_binary(&digits, exp10))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,6 +737,68 @@ mod tests {
         ] {
             let round = FloatVal::from_f64(v).to_f64();
             assert_eq!(round.to_bits(), v.to_bits(), "{v} round-tripped to {round}");
+        }
+    }
+
+    #[test]
+    fn decimal_literals_match_a_hex_literal_of_the_same_value() {
+        // Each pair is a decimal spelling and the hex spelling of the value
+        // gcc produces for it; the hex path was already exact.
+        // Each row is a decimal spelling, then the same value written as the
+        // `(mantissa, exp2)` pair a hex literal would produce -- the hex path
+        // was already exact, so it is the reference. `0xc.90fdaa22168c235p-2`
+        // is the 64-bit significand 0xC90FDAA22168C235 scaled by 2^-62, the
+        // point having moved fifteen hex digits right.
+        let cases: &[(&str, u128, i32)] = &[
+            ("3.14159265358979323846", 0xC90F_DAA2_2168_C235, -62),
+            ("0.1", 0xCCCC_CCCC_CCCC_CCCD, -67),
+            ("1.18973149535723176502e+4932", 0xFFFF_FFFF_FFFF_FFFF, 16320),
+            ("1e-4900", 0xBBB4_DF56_BAF6_2972, -16341),
+            ("1.0", 1, 0),
+            ("1e10", 0x2540_BE400, 0),
+            ("123456789.0", 0x075B_CD15, 0),
+            ("1500.0", 1500, 0),
+        ];
+        for (dec, mantissa, exp2) in cases {
+            let (dm, de) = parse_decimal_float_parts(dec).expect(dec);
+            let got = FloatVal::from_parts(false, dm, de);
+            let want = FloatVal::from_parts(false, *mantissa, *exp2);
+            assert_eq!(got.key(), want.key(), "{dec}");
+        }
+    }
+
+    /// Digit accumulation happens nine at a time, so the boundaries around a
+    /// chunk are where an off-by-one would hide.
+    #[test]
+    fn decimal_digit_chunking_is_exact_across_its_boundaries() {
+        for n in 1..=25usize {
+            let dec: String = std::iter::repeat_n('9', n).collect();
+            let (m, e) = parse_decimal_float_parts(&dec).expect(&dec);
+            let got = FloatVal::from_parts(false, m, e);
+            // Up to 2^53 the value is exactly representable in f64, so f64
+            // parsing is a trustworthy reference for the shorter cases.
+            if n <= 15 {
+                let want = FloatVal::from_f64(dec.parse::<f64>().unwrap());
+                assert_eq!(got.key(), want.key(), "{dec}");
+            }
+        }
+    }
+
+    #[test]
+    fn decimal_exponent_forms_agree() {
+        let forms = ["1500.0", "1.5e3", "15e2", "150000e-2", "0.15e4"];
+        let first = parse_decimal_float_parts(forms[0]).unwrap();
+        let first = FloatVal::from_parts(false, first.0, first.1);
+        for f in &forms[1..] {
+            let (m, e) = parse_decimal_float_parts(f).expect(f);
+            assert_eq!(FloatVal::from_parts(false, m, e).key(), first.key(), "{f}");
+        }
+    }
+
+    #[test]
+    fn decimal_rejects_what_is_not_a_number() {
+        for bad in ["", ".", "e5", "1e", "1e+", "1.0x", "abc"] {
+            assert!(parse_decimal_float_parts(bad).is_err(), "{bad:?}");
         }
     }
 

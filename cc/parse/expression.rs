@@ -3394,12 +3394,14 @@ impl<'a> Parser<'a> {
                 })?;
                 FloatVal::from_parts(false, mantissa, exp2)
             } else {
-                // Decimal literals still round through `f64`; carrying them at
-                // full width needs a big-integer decimal conversion.
-                let v: f64 = num_str
-                    .parse()
+                // Exact, like the hex path: the digits are scaled by a power
+                // of ten in full precision and only rounded once, at the
+                // target's width. Going through `f64` cost a `long double`
+                // eleven of its significand bits and flushed anything outside
+                // double's range before the type was even known.
+                let (mantissa, exp2) = crate::float::parse_decimal_float_parts(num_str)
                     .map_err(|_| ParseError::new(format!("invalid float literal: {}", s), pos))?;
-                FloatVal::from_f64(v)
+                FloatVal::from_parts(false, mantissa, exp2)
             };
             let typ = if is_float16_suffix {
                 self.types.float16_id

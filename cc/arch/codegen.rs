@@ -484,6 +484,13 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
 
         let mut emitted_any = false;
         for func in functions {
+            // An inline definition provides no external definition (C99
+            // 6.7.4p6), so the body-emitting loops skip it and there is no
+            // such symbol to point at. Naming it here produced an
+            // `.init_array` entry that failed to link.
+            if !func.emit {
+                continue;
+            }
             for section in [
                 func.constructor.map(Directive::InitArray),
                 func.destructor.map(Directive::FiniArray),

@@ -6658,3 +6658,32 @@ int main(void)
 "#;
     assert_eq!(compile_and_run("inline_extern_definition", src, &[]), 0);
 }
+
+/// An `.init_array` entry must name a symbol that was emitted.
+///
+/// A C99 inline definition provides no external definition, so its body is
+/// deliberately not emitted -- but the constructor/destructor emitter walked
+/// every function regardless and pointed `.init_array` at the missing symbol,
+/// which fails at link time with an undefined reference.
+#[test]
+fn codegen_constructor_on_an_inline_definition_links() {
+    let src = r#"
+#include <stdio.h>
+
+static int booted;
+
+inline __attribute__((constructor)) void boot(void) { booted = 1; }
+inline __attribute__((destructor)) void shutdown(void) { booted = 0; }
+
+/* A constructor on an ordinary function still runs. */
+static int ran;
+__attribute__((constructor)) static void real_boot(void) { ran = 1; }
+
+int main(void)
+{
+    if (!ran) return 1;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("inline_constructor_links", src, &[]), 0);
+}

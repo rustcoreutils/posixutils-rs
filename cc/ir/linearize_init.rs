@@ -176,6 +176,18 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
         }
 
+        // An arithmetic object is initialized with the *object's* encoding,
+        // whatever the constant's own type is (C17 6.7.9p11: the initializer
+        // is converted as in assignment). `int c = 1.0 + 2.0;` stores 3, not
+        // the IEEE bits of 3.0, and `double d = 1 + 2;` stores 3.0, not the
+        // integer 3. Deciding that here, from the type, keeps every expression
+        // arm below from having to decide it again -- and differently.
+        if self.types.is_integer(typ) || self.types.is_float(typ) {
+            if let Some(init) = self.fold_scalar_init(expr, typ) {
+                return init;
+            }
+        }
+
         match &expr.kind {
             ExprKind::IntLit(v) => Initializer::Int(*v as i128),
             ExprKind::Int128Lit(v) => Initializer::Int(*v),
@@ -241,10 +253,10 @@ impl<'a> super::linearize::Linearizer<'a> {
                 ExprKind::FloatLit(v) => Initializer::Float(v.negated()),
                 // For more complex expressions like -(1+2), try constant evaluation
                 _ => {
+                    // An arithmetic object folded above, at its own type; what
+                    // is left is a negation initializing something else.
                     if let Some(val) = self.eval_const_expr(expr) {
                         Initializer::Int(val)
-                    } else if let Some(val) = self.eval_const_float_expr(expr) {
-                        Initializer::Float(val)
                     } else {
                         // Returning `Initializer::None` here would put the
                         // object in .bss and make it silently zero -- which is
@@ -350,16 +362,11 @@ impl<'a> super::linearize::Linearizer<'a> {
                     (right.as_ref(), left.as_ref(), false)
                 } else {
                     // Neither operand is a pointer, so this is ordinary
-                    // arithmetic that happens to use `+` or `-`. Try the same
-                    // ladder the catch-all arm uses -- integer first, then
-                    // floating. Without the floating step `double a = 1.0 +
-                    // 2.0;` was rejected, while `*` and `/` (which reach the
-                    // catch-all) folded correctly.
+                    // arithmetic that happens to use `+` or `-`. An arithmetic
+                    // object folded above at its own type; anything else that
+                    // reaches here can only be an integer constant.
                     if let Some(val) = self.eval_const_expr(expr) {
                         return Initializer::Int(val);
-                    }
-                    if let Some(val) = self.eval_const_float_expr(expr) {
-                        return Initializer::Float(val);
                     }
                     self.reject_initializer(expr);
                     return Initializer::None;
@@ -433,10 +440,9 @@ impl<'a> super::linearize::Linearizer<'a> {
             // Other constant expressions
             // Try to evaluate as integer or float constant expression
             _ => {
+                // An arithmetic object folded above, at its own type.
                 if let Some(val) = self.eval_const_expr(expr) {
                     Initializer::Int(val)
-                } else if let Some(val) = self.eval_const_float_expr(expr) {
-                    Initializer::Float(val)
                 } else if let Some((name, offset)) = self.eval_static_address(expr) {
                     // Try as a static address (e.g., &global.field->subfield chains)
                     if offset != 0 {
@@ -579,6 +585,47 @@ impl<'a> super::linearize::Linearizer<'a> {
                 describe_expr(&expr.kind)
             ),
         );
+    }
+
+    /// Fold a constant expression into an initializer for an *arithmetic*
+    /// object of type `typ`, converting as an assignment would.
+    ///
+    /// Returns None when the expression is not a constant this compiler can
+    /// fold, leaving the caller's own diagnostics to run.
+    fn fold_scalar_init(&mut self, expr: &Expr, typ: TypeId) -> Option<Initializer> {
+        if self.types.is_float(typ) {
+            if let Some(val) = self.eval_const_float_expr(expr) {
+                return Some(Initializer::Float(val));
+            }
+            // An integer constant initializing a floating object converts
+            // exactly, however wide it is: `long double x = 1;`.
+            let val = self.eval_const_expr(expr)?;
+            return Some(Initializer::Float(FloatVal::from_parts(
+                val < 0,
+                val.unsigned_abs(),
+                0,
+            )));
+        }
+
+        // Converting to `_Bool` is not a truncation: every non-zero value
+        // becomes 1, so 0.5 is `true` where `(int)0.5` is 0 (C17 6.3.1.2).
+        let is_bool = self.types.kind(typ) == TypeKind::Bool;
+
+        if let Some(val) = self.eval_const_expr(expr) {
+            return Some(Initializer::Int(if is_bool {
+                i128::from(val != 0)
+            } else {
+                val
+            }));
+        }
+        // C17 6.3.1.4: converting a floating constant to an integer type
+        // discards the fractional part.
+        let val = self.eval_const_float_expr(expr)?;
+        Some(Initializer::Int(if is_bool {
+            i128::from(!val.is_zero())
+        } else {
+            val.to_f64() as i128
+        }))
     }
 
     /// The position to report for `expr`.

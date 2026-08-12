@@ -1524,3 +1524,74 @@ int main(void)
 "#;
     assert_eq!(compile_and_run("static_compound_literal_addr", src, &[]), 0);
 }
+
+/// A static initializer is converted to the *object's* type, not kept in the
+/// constant's own.
+///
+/// Folding floating constants in global initializers made `int c = 1.0 + 2.0;`
+/// compile, which it should -- but it stored the IEEE bits of 3.0 into a
+/// 4-byte integer, so `c` read back as 1077936128. The mirror case,
+/// `double d = 1 + 2;`, stored the integer 3 into a double and read back as
+/// 1.5e-323. C17 6.7.9p11 converts the initializer as an assignment would.
+#[test]
+fn c99_scalar_initializers_take_the_objects_type() {
+    let code = r#"
+#include <limits.h>
+
+/* Floating constants initializing integer objects: the fraction is
+   discarded (C17 6.3.1.4), it is not reinterpreted. */
+int i_add = 1.0 + 2.0;
+int i_sub = 9.5 - 2.0;
+int i_mul = 2.5 * 2.0;
+int i_div = 7 / 2.0;
+int i_neg = -(1.5 + 2.0);
+long l_wide = 2.9 * 2.0;
+char c_narrow = 65.9;
+_Bool b_from_float = 0.5;
+short s_neg = -3.9;
+
+/* Integer constants initializing floating objects: widened exactly. */
+double d_add = 1 + 2;
+float f_int = 7;
+long double ld_int = -5;
+double d_big = 2147483647;
+
+/* And the same-type cases must not have moved. */
+double d_add_f = 1.0 + 2.0;
+int i_add_i = 1 + 2;
+
+struct S { int i; double d; };
+struct S agg = { 1.0 + 2.0, 1 + 2 };
+int arr[3] = { 1.5, 2.5, 3.5 };
+
+int main(void)
+{
+    if (i_add != 3) return 1;
+    if (i_sub != 7) return 2;
+    if (i_mul != 5) return 3;
+    if (i_div != 3) return 4;
+    if (i_neg != -3) return 5;
+    if (l_wide != 5) return 6;
+    if (c_narrow != 'A') return 7;
+    if (b_from_float != 1) return 8;
+    if (s_neg != -3) return 9;
+
+    if (d_add != 3.0) return 10;
+    if (f_int != 7.0f) return 11;
+    if (ld_int != -5.0L) return 12;
+    if (d_big != 2147483647.0) return 13;
+
+    if (d_add_f != 3.0) return 14;
+    if (i_add_i != 3) return 15;
+
+    if (agg.i != 3 || agg.d != 3.0) return 16;
+    if (arr[0] != 1 || arr[1] != 2 || arr[2] != 3) return 17;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c99_scalar_initializers_take_the_objects_type", code, &[]),
+        0
+    );
+}

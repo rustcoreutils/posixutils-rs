@@ -572,7 +572,8 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         }
 
         self.push_directive(Directive::Rodata);
-        self.push_directive(Directive::Align(4)); // 4-byte alignment for int
+        // wchar_t is a 4-byte int: two, as a power of two.
+        self.push_directive(Directive::Align(2));
 
         for (label, content) in wide_strings {
             self.push_directive(Directive::local_label(label));
@@ -593,7 +594,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             return;
         }
         self.push_directive(Directive::Rodata);
-        self.push_directive(Directive::Align(2)); // char16_t
+        self.push_directive(Directive::Align(1)); // char16_t: 2 bytes
         for (label, units) in strings {
             self.push_directive(Directive::local_label(label));
             for &u in units {
@@ -610,7 +611,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             return;
         }
         self.push_directive(Directive::Rodata);
-        self.push_directive(Directive::Align(4)); // char32_t
+        self.push_directive(Directive::Align(2)); // char32_t: 4 bytes
         for (label, units) in strings {
             self.push_directive(Directive::local_label(label));
             for &u in units {

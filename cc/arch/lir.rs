@@ -937,16 +937,21 @@ impl EmitAsm for Directive {
                 }
             },
 
-            // Alignment
-            Directive::Align(power) => match target.os {
-                Os::MacOS => {
-                    let _ = writeln!(out, ".p2align {}", power);
-                }
-                Os::Linux | Os::FreeBSD => {
-                    // Linux .align takes bytes, not power of 2
-                    let _ = writeln!(out, ".align {}", 1u32 << power);
-                }
-            },
+            // Alignment.
+            //
+            // `.p2align` on every target, because `.align` does not mean the
+            // same thing on all of them: gas reads its argument as a byte
+            // count on x86 but as a power of two on AArch64 and ARM. Writing
+            // `.align 8` for eight-byte alignment therefore asked for 256
+            // bytes on AArch64 -- and in `.init_array`, where the padding is
+            // read back as function pointers, the runtime called 31 null
+            // pointers before reaching the second constructor.
+            //
+            // `.p2align` is a power of two everywhere, which is what this
+            // directive has always carried.
+            Directive::Align(power) => {
+                let _ = writeln!(out, ".p2align {}", power);
+            }
 
             // Data emission
             Directive::Zero(n) => {
@@ -1203,19 +1208,20 @@ mod tests {
         assert_eq!(out, "");
     }
 
+    /// The argument is a power of two on every target.
+    ///
+    /// `.align` would not be: gas reads it as a byte count on x86 and as a
+    /// power of two on AArch64, so one spelling cannot mean one thing.
     #[test]
     fn test_directive_align() {
-        let linux = Target::new(Arch::X86_64, Os::Linux);
-        let macos = Target::new(Arch::X86_64, Os::MacOS);
-
         // Align to 16 bytes (power=4, 2^4=16)
-        let mut out = String::new();
-        Directive::Align(4).emit(&linux, &mut out);
-        assert_eq!(out, ".align 16\n");
-
-        let mut out = String::new();
-        Directive::Align(4).emit(&macos, &mut out);
-        assert_eq!(out, ".p2align 4\n");
+        for arch in [Arch::X86_64, Arch::Aarch64] {
+            for os in [Os::Linux, Os::MacOS, Os::FreeBSD] {
+                let mut out = String::new();
+                Directive::Align(4).emit(&Target::new(arch, os), &mut out);
+                assert_eq!(out, ".p2align 4\n", "{arch:?} {os:?}");
+            }
+        }
     }
 
     #[test]

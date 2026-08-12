@@ -3691,6 +3691,16 @@ impl Parser<'_> {
         // Clear pending alignment from previous declaration
         self.pending_alignas = None;
         self.pending_fn_attrs = Default::default();
+        // And any asm label the previous declaration left behind.
+        //
+        // `skip_extensions` collects one wherever it runs, which is most
+        // places a type specifier can appear, but only a file-scope declarator
+        // claims one -- so a label written on a block-scope declaration, on a
+        // struct definition, or in a shape this parser does not model at all
+        // stays pending and is claimed by whatever is declared next. The
+        // symptom is an unrelated global emitted under someone else's
+        // assembler name.
+        self.pending_asm_label = None;
 
         // Check for _Static_assert first (C11)
         if self.is_static_assert() {
@@ -3792,6 +3802,12 @@ impl Parser<'_> {
                     // Add function to symbol table
                     let func_sym = Symbol::function(name, typ, self.symbols.depth());
                     let _ = self.symbols.declare(func_sym);
+                    // Definitions bind a fresh symbol, so this path needs the
+                    // accumulated facts settled onto it exactly as the other
+                    // two function-definition paths do -- without it, this
+                    // definition's C99 6.7.4p6 inline classification is
+                    // computed from declarations it never saw.
+                    self.settle_declaration_facts(name, storage_class);
 
                     // Get raw parameters - use decl_func_params which has names
                     let raw_params = decl_func_params.unwrap_or_default();

@@ -6687,3 +6687,67 @@ int main(void)
 "#;
     assert_eq!(compile_and_run("inline_constructor_links", src, &[]), 0);
 }
+
+/// An asm label belongs to the declarator it was written on, and to nothing
+/// else.
+///
+/// The label is collected wherever a type specifier can appear, but only a
+/// file-scope declarator claims one. A label written anywhere else -- on a
+/// block-scope declaration, on a struct definition, in a `for` initializer --
+/// stayed pending and was claimed by whatever was declared next, so an
+/// unrelated global was emitted under someone else's assembler name. The
+/// symptom at link time is an undefined reference to a name that is plainly
+/// defined in the source.
+#[test]
+fn codegen_asm_label_does_not_leak_to_the_next_declaration() {
+    let src = r#"
+extern int keep_me;
+
+/* GCC's local register variable: a register constraint, not a rename. */
+void with_register(void) { register long r __asm__("rdi"); (void)r; }
+int after_register = 1;
+
+void with_local(void) { int x __asm__("bogus_local"); (void)x; }
+int after_local = 2;
+
+void with_static_local(void) { static int x __asm__("bogus_static"); (void)x; }
+int after_static_local = 3;
+
+struct Tagged { int a; } __asm__("bogus_struct");
+int after_struct = 4;
+
+void with_for_init(void) { for (int i __asm__("bogus_for") = 0; i < 1; i++) ; }
+int after_for_init = 5;
+
+int keep_me = 6;
+"#;
+
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        let asm = asm_for_with("asm_label_leak", triple, src, &["-O"]);
+        for name in [
+            "after_register",
+            "after_local",
+            "after_static_local",
+            "after_struct",
+            "after_for_init",
+            "keep_me",
+        ] {
+            assert!(
+                asm.contains(name),
+                "{triple}: {name} should be emitted under its own name:\n{asm}"
+            );
+        }
+        for stolen in [
+            "rdi:",
+            "bogus_local",
+            "bogus_static",
+            "bogus_struct",
+            "bogus_for",
+        ] {
+            assert!(
+                !asm.contains(stolen),
+                "{triple}: a stray asm label was claimed by a later symbol ({stolen}):\n{asm}"
+            );
+        }
+    }
+}

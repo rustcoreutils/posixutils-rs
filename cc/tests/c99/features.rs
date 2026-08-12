@@ -674,6 +674,76 @@ int main(void) {
     );
 }
 
+/// A pointer to a variably-modified array is a pointer, not a VLA.
+///
+/// `int (*p)[n]` records run-time extents like a VLA declarator does, and the
+/// declaration path keyed on that alone: it rejected the initializer in
+/// `int (*p)[n] = a;` as "variable length arrays cannot have initializers",
+/// and then walked an array type that was not there and panicked with
+/// "VLA must have at least one dimension".
+///
+/// What the extents are actually for here is the row stride: one index step
+/// off `p` has to advance by `n` elements, the same arithmetic a variably
+/// modified *parameter* -- which is exactly this pointer type after
+/// adjustment -- already needed.
+#[test]
+fn c99_pointer_to_variably_modified_array() {
+    let code = r#"
+#include <stdlib.h>
+
+static int fill(int n)
+{
+    int a[3][n];
+    /* Declared separately from its initialization, and with one. */
+    int (*p)[n];
+    int (*q)[n] = a;
+
+    p = a;
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < n; j++)
+            p[i][j] = i * 10 + j;
+
+    int total = 0;
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < n; j++)
+            total += q[i][j];
+
+    /* The rows really are n elements apart. */
+    if (&p[1][0] - &p[0][0] != n) return -1;
+    if (&q[2][0] - &q[0][0] != 2 * n) return -2;
+    return total;
+}
+
+int main(void)
+{
+    /* n = 5: rows 0,10..14 and 20..24 -> 0+1+2+3+4 + 50+10 + 100+10 */
+    if (fill(5) != 180) return 1;
+    if (fill(1) != 30) return 2;
+
+    /* A constant extent on the pointee still behaves. */
+    int n = 4;
+    int m[4][4];
+    int (*r)[n] = m;
+    r[3][3] = 9;
+    if (m[3][3] != 9) return 3;
+
+    /* Malloc'd storage, the idiom this type exists for. */
+    int rows = 3, cols = 6;
+    int (*d)[cols] = malloc(sizeof(int) * rows * cols);
+    if (!d) return 4;
+    d[2][5] = 77;
+    if (d[2][5] != 77) return 5;
+    free(d);
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c99_pointer_to_variably_modified_array", code, &[]),
+        0
+    );
+}
+
 /// A zero significand is zero at any exponent, and a subnormal literal is
 /// rounded to nearest rather than truncated.
 ///

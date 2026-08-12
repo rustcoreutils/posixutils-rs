@@ -220,8 +220,13 @@ impl<'a> super::linearize::Linearizer<'a> {
                 continue;
             }
 
-            // Check if this is a VLA (Variable Length Array)
-            if !declarator.vla_sizes.is_empty() {
+            // Check if this is a VLA (Variable Length Array).
+            //
+            // Run-time extents alone do not make one: in `int (*p)[n]` they
+            // belong to the *pointee*, and `p` is an ordinary pointer, sized
+            // at compile time and initializable like any other. Only a
+            // declarator that is itself the array is allocated here.
+            if !declarator.vla_sizes.is_empty() && self.types.kind(typ) == TypeKind::Array {
                 // C99 6.7.8: VLAs cannot have initializers.
                 // Report against the declarator's own position: `current_pos`
                 // is an Option and, when it is None, this constraint violation
@@ -272,6 +277,26 @@ impl<'a> super::linearize::Linearizer<'a> {
                     is_indirect: false,
                 },
             );
+
+            // A pointer to a variably-modified array: the extents are the
+            // pointee's, and they are what one index step off the pointer
+            // has to advance by. C99 6.7.5.2p5 evaluates them where the
+            // declaration appears, which is here -- before any initializer.
+            //
+            // This is the same shape as a variably-modified *parameter*,
+            // which is adjusted to exactly this pointer type; see
+            // `linearize_function`.
+            if !declarator.vla_sizes.is_empty() {
+                if let Some(pointee) = self.types.base_type(typ) {
+                    let name = self.symbol_name(declarator.symbol);
+                    let (dims, elem_type) =
+                        self.record_vm_extents(pointee, &declarator.vla_sizes, &name);
+                    if let Some(info) = self.locals.get_mut(&declarator.symbol) {
+                        info.vm_row_dims = dims;
+                        info.vla_elem_type = Some(elem_type);
+                    }
+                }
+            }
 
             // If there's an initializer, emit Store(s)
             if let Some(init) = &declarator.init {
@@ -430,34 +455,13 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         let elem_size = self.types.size_bytes(elem_type) as i64;
 
-        // Total element count is the product of every extent.
-        let mut total_count: Option<PseudoId> = None;
-        for dim in &dims {
-            let val = match *dim {
-                VmDim::Const(n) => self.emit_const(n as i128, ulong_type),
-                VmDim::Sym(sym) => {
-                    let loaded = self.alloc_pseudo();
-                    self.emit(Instruction::load(loaded, sym, 0, ulong_type, 64));
-                    loaded
-                }
-            };
-            total_count = Some(match total_count {
-                None => val,
-                Some(prev) => {
-                    let result = self.alloc_pseudo();
-                    self.emit(Instruction::binop(
-                        Opcode::Mul,
-                        result,
-                        prev,
-                        val,
-                        ulong_type,
-                        64,
-                    ));
-                    result
-                }
-            });
-        }
-        let num_elements = total_count.expect("VLA must have at least one dimension");
+        // Total element count is the product of every extent. An array
+        // declarator always has at least one level, so the empty product this
+        // falls back on is unreachable -- but a compiler that answers "one
+        // element" beats one that panics.
+        let num_elements = self
+            .vm_extent_product(&dims)
+            .unwrap_or_else(|| self.emit_const(1, ulong_type));
 
         // Create a hidden local variable to store the total number of elements
         // This is needed for sizeof(vla) to work at runtime

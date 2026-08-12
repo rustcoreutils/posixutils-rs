@@ -2222,17 +2222,11 @@ impl<'a> Linearizer<'a> {
         (dims, elem_type)
     }
 
-    /// Byte size of `product(dims) * sizeof(elem)`, evaluated at run time, or
-    /// None when the compile-time size is already correct.
+    /// The product of `dims`, evaluated at run time.
     ///
-    /// None means either that no extents remain -- the object is the
-    /// fully-indexed element -- or that every remaining extent is constant, in
-    /// which case the type carries its own size and no arithmetic is needed.
-    fn vm_extent_size(&mut self, dims: &[VmDim], elem: TypeId) -> Option<PseudoId> {
-        if !dims.iter().any(|d| matches!(d, VmDim::Sym(_))) {
-            return None;
-        }
-
+    /// None for no extents at all, which is an empty product: the caller
+    /// decides whether that means one element or no computation to do.
+    pub(crate) fn vm_extent_product(&mut self, dims: &[VmDim]) -> Option<PseudoId> {
         let ulong = self.types.ulong_id;
         let mut acc: Option<PseudoId> = None;
         for dim in dims {
@@ -2262,6 +2256,22 @@ impl<'a> Linearizer<'a> {
                 }
             });
         }
+        acc
+    }
+
+    /// Byte size of `product(dims) * sizeof(elem)`, evaluated at run time, or
+    /// None when the compile-time size is already correct.
+    ///
+    /// None means either that no extents remain -- the object is the
+    /// fully-indexed element -- or that every remaining extent is constant, in
+    /// which case the type carries its own size and no arithmetic is needed.
+    fn vm_extent_size(&mut self, dims: &[VmDim], elem: TypeId) -> Option<PseudoId> {
+        if !dims.iter().any(|d| matches!(d, VmDim::Sym(_))) {
+            return None;
+        }
+
+        let ulong = self.types.ulong_id;
+        let acc = self.vm_extent_product(dims);
 
         let elem_size = self.types.size_bytes(elem) as i128;
         let elem_size_val = self.emit_const(elem_size, ulong);

@@ -1380,9 +1380,17 @@ impl TypeTable {
             // to be recorded as one: without a width the accessors read and
             // write the whole declared type, so `union { int a:4; unsigned b; }`
             // with `b` set to 15 read `a` back as 15 rather than -1.
+            //
+            // A member that is not a bitfield is stated to have no bit offset
+            // and no storage unit, rather than left as it was found: this
+            // computes a layout, so every field of it is an output, and
+            // `compute_struct_layout` clears the same two for the same reason.
             if member.bit_width.is_some_and(|w| w > 0) {
                 member.bit_offset = Some(0);
                 member.storage_unit_size = Some(self.size_bytes(member.typ) as u32);
+            } else {
+                member.bit_offset = None;
+                member.storage_unit_size = None;
             }
             max_size = max_size.max(self.size_bytes(member.typ));
             // Use explicit alignment from _Alignas if specified, otherwise natural alignment

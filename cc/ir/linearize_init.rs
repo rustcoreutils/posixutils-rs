@@ -261,13 +261,17 @@ impl<'a> super::linearize::Linearizer<'a> {
                 operand,
             } => {
                 // Try to compute the address as symbol + offset
-                if let Some((name, offset)) = self.eval_static_address(operand) {
+                if let Some((name, offset)) = self.static_address_of(operand) {
                     if offset == 0 {
                         Initializer::SymAddr(name)
                     } else {
                         Initializer::SymAddrOffset(name, offset)
                     }
                 } else {
+                    // Returning `Initializer::None` here would put the object
+                    // in .bss and make the pointer null, which is what made
+                    // `&(struct P){1, 2}` segfault rather than fail to build.
+                    self.reject_initializer(expr);
                     Initializer::None
                 }
             }
@@ -457,6 +461,17 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// evaluator cannot do. Without this `const char *p = "hello" + 1;` was
     /// rejected, while `arr + 1` on a static array was accepted.
     fn static_address_of(&mut self, expr: &Expr) -> Option<(String, i64)> {
+        // A compound literal at file scope has static storage duration
+        // (C99 6.5.2.5p5), so it is an object with an address -- but it only
+        // acquires one when it is given a name here.
+        if let ExprKind::CompoundLiteral { typ, elements } = &expr.kind {
+            let name = format!(".CL{}", self.compound_literal_counter);
+            self.compound_literal_counter += 1;
+            let typ = *typ;
+            let init = self.ast_init_list_to_ir(elements, typ);
+            self.module.add_global(&name, typ, init);
+            return Some((name, 0));
+        }
         if let ExprKind::StringLit(lit) = &expr.kind {
             let label = format!(".LC{}", self.module.strings.len());
             self.module.strings.push((label.clone(), lit.clone()));

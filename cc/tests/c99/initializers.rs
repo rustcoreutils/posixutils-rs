@@ -1479,3 +1479,48 @@ int main(void)
 "#;
     assert_eq!(compile_and_run("decimal_long_double", src, &[]), 0);
 }
+
+/// The address of a compound literal with static storage duration.
+///
+/// C99 6.5.2.5p5 gives a compound literal at file scope static storage
+/// duration, so its address is a constant expression and may initialize a
+/// pointer. c17 dropped the initializer silently: the object went to `.bss`,
+/// the pointer was null, and the program segfaulted on first use.
+///
+/// The address-of arm returned "no initializer" when it could not evaluate the
+/// operand, which is the same silent-zero shape that made `-(1.0 + 2.0)` come
+/// out as `0.0`. The other arms were fixed then; this one was missed because
+/// no test reached it.
+#[test]
+fn c99_address_of_a_static_compound_literal() {
+    let src = r#"
+#include <stdio.h>
+#include <string.h>
+
+struct P { int x, y; };
+
+static struct P *gp = &(struct P){1, 2};
+static int *ga = (int[]){10, 20, 30};
+static const char *gs = (const char[]){'h', 'i', 0};
+
+int main(void)
+{
+    if (gp->x != 1 || gp->y != 2) return 1;
+    if (ga[0] != 10 || ga[1] != 20 || ga[2] != 30) return 2;
+    if (strcmp(gs, "hi") != 0) return 3;
+
+    /* Writing through it must work: it is an object, not a constant. */
+    gp->x = 42;
+    if (gp->x != 42) return 5;
+
+    /* The block-scope forms already worked and must keep working. */
+    struct P *lp = &(struct P){7, 8};
+    if (lp->x != 7 || lp->y != 8) return 6;
+    int *la = (int[]){4, 5};
+    if (la[0] != 4 || la[1] != 5) return 7;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("static_compound_literal_addr", src, &[]), 0);
+}

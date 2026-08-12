@@ -3898,15 +3898,47 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Declare a `_chk` entry point with an unprototyped signature, so the
-    /// call type-checks and returns a value of the right width.
+    /// Declare a `_chk` entry point, so the call type-checks and returns a
+    /// value of the right width.
+    ///
+    /// The fixed parameters are counted even though their types are not
+    /// modelled: where an argument stops being fixed and starts being variadic
+    /// is an ABI question, not only a type-checking one. Apple's arm64 passes
+    /// every variadic argument on the stack while fixed ones stay in
+    /// registers, so declaring these as variadic-from-argument-zero -- which
+    /// is what an empty parameter list means -- put `__snprintf_chk`'s buffer,
+    /// length, flag and size on the stack, where it does not look for them.
     fn declare_chk_builtin(&mut self, name: &str, ret_type: TypeId) -> Option<SymbolId> {
         // Pre-interned in `cc/kw.rs`; the identifier table is read-only here.
         let name_id = self.idents.lookup(name)?;
+
+        // (fixed parameters before the `...`, whether a `...` follows). The
+        // `v` forms take a `va_list` and are not variadic; the memory ones
+        // take a fixed argument list outright.
+        let (fixed, variadic) = match name {
+            "__printf_chk" => (2, true),
+            "__fprintf_chk" | "__sprintf_chk" => (3, true),
+            "__snprintf_chk" => (5, true),
+            "__vprintf_chk" => (3, false),
+            "__vfprintf_chk" | "__vsprintf_chk" => (4, false),
+            "__vsnprintf_chk" => (6, false),
+            "__memset_chk" | "__strcpy_chk" | "__stpcpy_chk" | "__strcat_chk" => (3, false),
+            "__memcpy_chk" | "__memmove_chk" | "__mempcpy_chk" | "__strncpy_chk"
+            | "__stpncpy_chk" | "__strncat_chk" => (4, false),
+            // An entry point this does not know is left as it was: variadic,
+            // with nothing fixed.
+            _ => (0, true),
+        };
+        // The types are not modelled -- only how many arguments are fixed --
+        // so each is spelled as the widest integer the ABI passes in one
+        // register, which a pointer, a size and a flag all classify as.
+        let params = vec![self.types.ulong_id; fixed];
+
         let func_type = self.types.intern(Type {
             kind: TypeKind::Function,
             base: Some(ret_type),
-            variadic: true,
+            variadic,
+            params: Some(params),
             ..Default::default()
         });
         let symbol = Symbol::function(name_id, func_type, self.symbols.depth());

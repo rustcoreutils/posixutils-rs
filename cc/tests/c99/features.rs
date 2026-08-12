@@ -778,11 +778,16 @@ int main(void)
     if (4.9406564584124654e-324 == 0.0) return 7;
     if (3e-324 == 0.0) return 8;
 
-    /* Subnormal long doubles survive at all, and stay ordered. */
+#if LDBL_MIN_EXP < DBL_MIN_EXP
+    /* Subnormal long doubles survive at all, and stay ordered. Only where
+       long double has range of its own: on a target whose long double *is*
+       double -- Apple's arm64 among them -- these underflow to zero, which
+       is the right answer there and not what this is testing. */
     long double a = 3.6451995318824746025e-4951L;
     long double b = 7.2903990637649492050e-4951L;
     if (a == 0.0L) return 9;
     if (!(a < b)) return 10;
+#endif
 
     return 0;
 }

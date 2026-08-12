@@ -6067,21 +6067,50 @@ fn codegen_long_double_literals_keep_their_precision() {
     let src = r##"
 #include <float.h>
 
+/* Which long double the target has decides what can be asserted about it:
+   x87 gives 64 mantissa bits and a 15-bit exponent, AArch64 Linux gives
+   binary128's 113 bits over the same exponent range, and Apple's arm64
+   long double *is* double. The properties below hold wherever the format
+   supports them, spelled from <float.h> so no one format is assumed. */
+#define WIDER_RANGE   (LDBL_MAX_EXP > DBL_MAX_EXP)
+#define WIDER_MANTISSA (LDBL_MANT_DIG > DBL_MANT_DIG)
+
 /* Static initializers: the value must survive into the data section. */
 static long double g_max = LDBL_MAX;
 static long double g_min = LDBL_MIN;
 static long double g_eps = LDBL_EPSILON;
-static long double g_hex = 0x1.fffffffffffffffep+16383L;
+#if WIDER_RANGE
 static long double g_sub = 0x1p-16400L;
 static long double g_neg = -0x1.8p+16000L;
+#else
+static long double g_sub = LDBL_TRUE_MIN;
+static long double g_neg = -0x1.8p+1000L;
+#endif
+
+/* LDBL_MAX spelled in hex, needing every mantissa bit the format has. One
+   ulp below it is a different value. */
+#if LDBL_MANT_DIG == 64
+static long double g_hex = 0x1.fffffffffffffffep+16383L;
+#define ONE_ULP_BELOW_MAX 0x1.fffffffffffffffcp+16383L
+#elif LDBL_MANT_DIG == 113
+static long double g_hex = 0x1.ffffffffffffffffffffffffffffp+16383L;
+#define ONE_ULP_BELOW_MAX 0x1.fffffffffffffffffffffffffffep+16383L
+#else
+static long double g_hex = 0x1.fffffffffffffp+1023L;
+#define ONE_ULP_BELOW_MAX 0x1.ffffffffffffep+1023L
+#endif
 
 int main(void)
 {
-    /* Out of double's range in both directions. */
-    if (!(g_max > 1.0e308L)) return 1;
+    if (!(g_max > 0.0L)) return 1;
     if (!(g_min > 0.0L)) return 2;
-    if (!(g_min < 1.0e-308L)) return 3;
     if (!(g_eps > 0.0L)) return 4;
+
+#if WIDER_RANGE
+    /* Out of double's range in both directions. */
+    if (!(g_max > 1.0e308L)) return 21;
+    if (!(g_min < 1.0e-308L)) return 3;
+#endif
 
     /* The limits agree with freshly parsed literals. */
     long double l_max = LDBL_MAX;
@@ -6089,12 +6118,11 @@ int main(void)
     if (l_max != g_max) return 5;
     if (l_min != g_min) return 6;
 
-    /* A hex literal needing all 64 mantissa bits is not rounded. */
+    /* A hex literal needing every mantissa bit is not rounded. */
     if (g_hex != LDBL_MAX) return 7;
-    if (0x1.fffffffffffffffep+16383L != LDBL_MAX) return 8;
 
     /* One ulp below LDBL_MAX must be a different value. */
-    if (0x1.fffffffffffffffcp+16383L == LDBL_MAX) return 9;
+    if (ONE_ULP_BELOW_MAX == LDBL_MAX) return 9;
 
     /* Subnormal long double survives rather than flushing to zero. */
     if (!(g_sub > 0.0L)) return 10;
@@ -6103,20 +6131,25 @@ int main(void)
     /* Sign is carried. */
     if (!(g_neg < 0.0L)) return 12;
 
-    /* Arithmetic on an out-of-double-range value stays finite. */
-    if (!(g_max / 2.0L > 1.0e308L)) return 13;
+    /* Arithmetic on the largest value stays finite. */
     if (g_max / 2.0L >= g_max) return 14;
+    if (!(g_max / 2.0L > 0.0L)) return 22;
+#if WIDER_RANGE
+    if (!(g_max / 2.0L > 1.0e308L)) return 13;
+#endif
 
     /* float and double are unaffected. */
     if (DBL_MAX <= 0.0 || DBL_MIN <= 0.0) return 15;
     if ((double)0x1.921fb54442d18p+1 != 3.141592653589793) return 16;
 
+#if WIDER_MANTISSA
     /* Two long doubles differing only below the 53rd bit stay distinct --
        they used to collide in the constant pool, which is keyed on the value. */
     long double a = 0x1.0000000000000002p+0L;
     long double b = 0x1.0000000000000004p+0L;
     if (a == b) return 17;
     if (a == 1.0L) return 18;
+#endif
 
     return 0;
 }

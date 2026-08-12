@@ -163,6 +163,8 @@ int main(void) {
 #[test]
 fn builtins_float_classification_matches_gcc() {
     let code = r#"
+#include <float.h>
+
 static volatile double dz = 0.0;
 static volatile float  fz = 0.0f;
 
@@ -177,7 +179,11 @@ int main(void)
     double dn = dz / dz, di = 1.0 / dz, ds = 2.2250738585072014e-308 / 4.0;
     float  fn = fz / fz, fi = 1.0f / fz, fs = 1.17549435e-38f / 4.0f;
     long double ln = (long double)dn, li = (long double)di;
-    long double ls = 0x1p-16400L, lmin = 0x1p-16382L;
+    /* Spelled from <float.h> rather than as a fixed exponent: the smallest
+       normal is 2^-16382 for x87 and binary128 but 2^-1022 where long double
+       is double, and a fixed exponent underflows to zero there -- turning a
+       normal into a zero and testing nothing. */
+    long double ls = LDBL_TRUE_MIN, lmin = LDBL_MIN;
 
     if (BITS(dn)  != 8) return 1;
     if (BITS(di)  != 4) return 2;
@@ -192,8 +198,9 @@ int main(void)
     if (BITS(fs)   != 2) return 10;
     if (BITS(1.5f) != 3) return 11;
 
-    /* long double is the width that used to be unreachable: its smallest
-       normal is 2^-16382, which an f64 cannot represent at all. */
+    /* long double is the width that used to be unreachable: on x87 and
+       binary128 its smallest normal is 2^-16382, which an f64 cannot
+       represent at all. */
     if (BITS(ln)   != 8) return 12;
     if (BITS(li)   != 4) return 13;
     if (BITS(-li)  != 4) return 14;

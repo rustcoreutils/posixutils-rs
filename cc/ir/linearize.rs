@@ -89,7 +89,25 @@ pub(crate) struct RawFieldInit {
     pub(crate) init: Initializer,
     pub(crate) bit_offset: Option<u32>,
     pub(crate) bit_width: Option<u32>,
-    pub(crate) storage_unit_size: Option<u32>,
+}
+
+impl RawFieldInit {
+    /// The bytes this field's initializer actually writes.
+    ///
+    /// For a bitfield that is narrower than its access window, which is what
+    /// decides whether two initializers describe overlapping storage: the
+    /// window of `unsigned a:1` after a `char` spans a byte the following
+    /// `char` member owns, while the field itself does not.
+    pub(crate) fn byte_span(&self) -> std::ops::Range<usize> {
+        match (self.bit_offset, self.bit_width) {
+            (Some(bit_offset), Some(bit_width)) => {
+                let start = self.offset + (bit_offset / 8) as usize;
+                let end = self.offset + (bit_offset + bit_width).div_ceil(8) as usize;
+                start..end.max(start + 1)
+            }
+            _ => self.offset..self.offset + self.field_size,
+        }
+    }
 }
 
 /// Result from member_index_for_designator indicating where positional

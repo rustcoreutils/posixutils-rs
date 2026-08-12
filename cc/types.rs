@@ -1268,75 +1268,28 @@ impl TypeTable {
 
     /// Compute struct layout with natural alignment
     /// Updates member offsets in place and returns (total_size, alignment)
+    ///
+    /// The System V ABI allocates every member from a running *bit* offset
+    /// measured from the start of the struct. A bitfield takes the next free
+    /// bits; its declared type contributes the struct's alignment and the size
+    /// of the window the field may not straddle, but never an allocation of
+    /// its own. So two bitfields of different declared types share a unit
+    /// freely, and a bitfield reuses the padding left by the plain member
+    /// before it.
     pub fn compute_struct_layout(
         &self,
         members: &mut [StructMember],
         packed: bool,
     ) -> (usize, usize) {
-        let mut offset = 0usize;
+        let mut bit_offset = 0usize;
         let mut max_align = 1usize;
-        let mut current_bit_offset = 0u32;
-        let mut current_storage_unit_size = 0u32;
+        // The furthest byte any access window reaches. Ordinary members never
+        // reach past the running offset, but a window is a power-of-two span
+        // that can, and the struct has to be large enough to hold it.
+        let mut window_end = 0usize;
 
         for member in members.iter_mut() {
-            if let Some(bit_width) = member.bit_width {
-                let storage_size = self.size_bytes(member.typ) as u32;
-                let storage_bits = storage_size * 8;
-
-                if bit_width == 0 {
-                    if current_storage_unit_size > 0 {
-                        offset += current_storage_unit_size as usize;
-                        current_bit_offset = 0;
-                        current_storage_unit_size = 0;
-                    }
-
-                    // C17 6.7.2.1p12: a zero-width bitfield forces the *next*
-                    // member to the next boundary of its declared type's
-                    // storage unit. Flushing an open unit is not enough --
-                    // after a plain member there is no unit open, and the
-                    // `:0` would otherwise do nothing at all.
-                    //
-                    // The boundary is forced even in a packed struct, and the
-                    // struct's own alignment is left alone, both matching gcc:
-                    // `struct { char c; int :0; char d; }` is 5 bytes with
-                    // `d` at offset 4, packed or not.
-                    let unit = storage_size as usize;
-                    if unit > 1 {
-                        offset = offset.next_multiple_of(unit);
-                    }
-
-                    member.offset = offset;
-                    member.bit_offset = None;
-                    member.storage_unit_size = None;
-                    continue;
-                }
-
-                let need_new_unit = current_storage_unit_size == 0
-                    || current_storage_unit_size != storage_size
-                    || current_bit_offset + bit_width > storage_bits;
-
-                if need_new_unit {
-                    if current_storage_unit_size > 0 {
-                        offset += current_storage_unit_size as usize;
-                    }
-                    let align = storage_size as usize;
-                    offset = (offset + align - 1) & !(align - 1);
-                    max_align = max_align.max(align);
-                    current_bit_offset = 0;
-                    current_storage_unit_size = storage_size;
-                }
-
-                member.offset = offset;
-                member.bit_offset = Some(current_bit_offset);
-                member.storage_unit_size = Some(storage_size);
-                current_bit_offset += bit_width;
-            } else {
-                if current_storage_unit_size > 0 {
-                    offset += current_storage_unit_size as usize;
-                    current_bit_offset = 0;
-                    current_storage_unit_size = 0;
-                }
-
+            let Some(bit_width) = member.bit_width else {
                 // Use explicit alignment from _Alignas if specified, otherwise natural alignment.
                 // For packed structs, force alignment to 1 (no padding between members).
                 let natural_align = if packed {
@@ -1348,27 +1301,64 @@ impl TypeTable {
                     .explicit_align
                     .map(|a| a as usize)
                     .unwrap_or(natural_align);
-                max_align = max_align.max(if packed { 1 } else { align });
+                max_align = max_align.max(align);
 
-                offset = (offset + align - 1) & !(align - 1);
-                member.offset = offset;
+                bit_offset = bit_offset.next_multiple_of(align * 8);
+                member.offset = bit_offset / 8;
                 member.bit_offset = None;
                 member.storage_unit_size = None;
 
-                offset += self.size_bytes(member.typ);
-            }
-        }
+                bit_offset += self.size_bytes(member.typ) * 8;
+                continue;
+            };
 
-        if current_storage_unit_size > 0 {
-            offset += current_storage_unit_size as usize;
+            let unit_bytes = self.size_bytes(member.typ);
+            let unit_bits = unit_bytes * 8;
+
+            if bit_width == 0 {
+                // C17 6.7.2.1p12: a zero-width bitfield forces the *next*
+                // member to the next boundary of its declared type's storage
+                // unit, and contributes nothing else -- not even alignment.
+                // `struct { char c; int :0; char d; }` is 5 bytes with `d` at
+                // offset 4, packed or not, which is also gcc's answer.
+                bit_offset = bit_offset.next_multiple_of(unit_bits);
+                member.offset = bit_offset / 8;
+                member.bit_offset = None;
+                member.storage_unit_size = None;
+                continue;
+            }
+
+            max_align = max_align.max(self.alignment(member.typ));
+
+            // Advance only when the field would otherwise straddle a unit
+            // boundary. Bitfields ignore `packed`: packing them to the bit
+            // would let one straddle, and the access window cannot span an
+            // unaligned range (see Known Divergences in cc/doc/TODO.md).
+            let bit_width = bit_width as usize;
+            if bit_offset % unit_bits + bit_width > unit_bits {
+                bit_offset = bit_offset.next_multiple_of(unit_bits);
+            }
+
+            // The field is read and written through the `sizeof(T)`-aligned
+            // window it now provably sits inside. That window is wider than
+            // the field needs and can span a neighbouring member, which costs
+            // nothing here -- a store is a read-modify-write, so the
+            // neighbour's bits are put back unchanged -- but it does mean the
+            // struct has to be big enough to contain the window.
+            let offset = bit_offset / unit_bits * unit_bytes;
+            member.offset = offset;
+            member.bit_offset = Some((bit_offset - offset * 8) as u32);
+            member.storage_unit_size = Some(unit_bytes as u32);
+            window_end = window_end.max(offset + unit_bytes);
+
+            bit_offset += bit_width;
         }
 
         let final_align = if packed { 1 } else { max_align };
-        let size = if final_align > 1 {
-            (offset + final_align - 1) & !(final_align - 1)
-        } else {
-            offset
-        };
+        let size = bit_offset
+            .div_ceil(8)
+            .max(window_end)
+            .next_multiple_of(final_align);
         (size, final_align)
     }
 
@@ -1386,6 +1376,14 @@ impl TypeTable {
 
         for member in members.iter_mut() {
             member.offset = 0;
+            // Every union member starts at bit zero, but a bitfield still has
+            // to be recorded as one: without a width the accessors read and
+            // write the whole declared type, so `union { int a:4; unsigned b; }`
+            // with `b` set to 15 read `a` back as 15 rather than -1.
+            if member.bit_width.is_some_and(|w| w > 0) {
+                member.bit_offset = Some(0);
+                member.storage_unit_size = Some(self.size_bytes(member.typ) as u32);
+            }
             max_size = max_size.max(self.size_bytes(member.typ));
             // Use explicit alignment from _Alignas if specified, otherwise natural alignment
             let natural_align = self.alignment(member.typ);

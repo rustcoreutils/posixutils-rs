@@ -16,7 +16,7 @@ use crate::parse::ast::{BinaryOp, Declaration, Designator, Expr, ExprKind, InitE
 use crate::strings::StringId;
 use crate::token::lexer::Position;
 use crate::types::{MemberInfo, TypeId, TypeKind, TypeModifiers, TypeTable};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Determine whether a declared object type is `const`-qualified for the
 /// purpose of section selection.
@@ -978,89 +978,86 @@ impl<'a> super::linearize::Linearizer<'a> {
                             init: field_init,
                             bit_offset: visit.bit_offset,
                             bit_width: visit.bit_width,
-                            storage_unit_size: visit.storage_unit_size,
                         });
                     }
 
-                    // Sort fields by offset to ensure proper emission order
-                    // (designated initializers can be in any order)
-                    // For bitfields, also sort by bit_offset to keep them together
-                    raw_fields.sort_by(|a, b| {
-                        a.offset
-                            .cmp(&b.offset)
-                            .then_with(|| a.bit_offset.unwrap_or(0).cmp(&b.bit_offset.unwrap_or(0)))
-                    });
+                    // Sort by the bit each field starts at, so that designated
+                    // initializers emit in address order however they were
+                    // written -- the emitter fills the gaps between fields and
+                    // so requires them sorted and non-overlapping.
+                    raw_fields.sort_by_key(|f| f.offset * 8 + f.bit_offset.unwrap_or(0) as usize);
 
-                    // Remove duplicate initializations (later one wins, per C semantics)
+                    // Initializing the same object twice: the later one wins
+                    // (C17 6.7.9p19). Two *distinct* bitfields are different
+                    // objects even when they share a byte, so both survive.
                     let mut idx = 0;
                     while idx + 1 < raw_fields.len() {
-                        let same_offset = raw_fields[idx].offset == raw_fields[idx + 1].offset;
-                        let both_bitfields = raw_fields[idx].bit_offset.is_some()
-                            && raw_fields[idx + 1].bit_offset.is_some();
-                        let same_bitfield = both_bitfields
-                            && raw_fields[idx].bit_offset == raw_fields[idx + 1].bit_offset;
+                        let (a, b) = (&raw_fields[idx], &raw_fields[idx + 1]);
+                        let distinct_bitfields = a.bit_width.is_some()
+                            && b.bit_width.is_some()
+                            && (a.offset, a.bit_offset) != (b.offset, b.bit_offset);
+                        let a_span = a.byte_span();
+                        let b_span = b.byte_span();
 
-                        if same_offset && (!both_bitfields || same_bitfield) {
+                        if !distinct_bitfields
+                            && a_span.start < b_span.end
+                            && b_span.start < a_span.end
+                        {
                             raw_fields.remove(idx);
                         } else {
                             idx += 1;
                         }
                     }
 
-                    // Pack bitfields that share the same storage unit
+                    // Merge bitfields byte by byte rather than one storage unit
+                    // at a time. A unit is `sizeof(T)` wide and aligned, so it
+                    // routinely spans bytes that belong to other members --
+                    // `unsigned a:1` after a `char` sits at bit 8 of a unit
+                    // based at byte 0, which also holds the `char` and whatever
+                    // follows. Emitting whole units here would blank them; the
+                    // units of two fields with different declared types can
+                    // also be different sizes at the same byte offset, leaving
+                    // no single width to emit.
+                    let mut bitfield_bytes: BTreeMap<usize, u8> = BTreeMap::new();
                     let mut init_fields: Vec<(usize, usize, Initializer)> = Vec::new();
-                    let mut i = 0;
-                    while i < raw_fields.len() {
-                        let RawFieldInit {
-                            offset,
-                            field_size,
-                            init,
-                            bit_offset,
-                            bit_width,
-                            storage_unit_size,
-                        } = &raw_fields[i];
 
-                        if let (Some(bit_off), Some(bit_w), Some(storage_size)) =
-                            (bit_offset, bit_width, storage_unit_size)
+                    for field in &raw_fields {
+                        let (Some(bit_off), Some(bit_width)) = (field.bit_offset, field.bit_width)
+                        else {
+                            init_fields.push((field.offset, field.field_size, field.init.clone()));
+                            continue;
+                        };
+                        let Initializer::Int(value) = field.init else {
+                            continue;
+                        };
+                        if bit_width == 0 {
+                            continue;
+                        }
+
+                        // A field never crosses its own window, so the shift
+                        // stays inside the 128-bit carrier even at width 64.
+                        let mask = (1u128 << bit_width) - 1;
+                        let placed = ((value as u128) & mask) << bit_off;
+
+                        // Only the bytes the field's own bits reach. Its window
+                        // is wider and generally starts earlier -- `unsigned a:1`
+                        // after a `char` sits at bit 8 of a window based at byte
+                        // 0 -- and writing the whole window here would blank the
+                        // members sharing it.
+                        for byte in
+                            (bit_off / 8) as usize..=((bit_off + bit_width - 1) / 8) as usize
                         {
-                            let mut packed_value: u64 = 0;
-                            if let Initializer::Int(v) = init {
-                                let mask = (1u64 << bit_w) - 1;
-                                packed_value |= ((*v as u64) & mask) << bit_off;
-                            }
-
-                            let mut j = i + 1;
-                            while j < raw_fields.len() {
-                                let RawFieldInit {
-                                    offset: next_off,
-                                    init: next_init,
-                                    bit_offset: next_bit_off,
-                                    bit_width: next_bit_w,
-                                    ..
-                                } = &raw_fields[j];
-                                if *next_off != *offset {
-                                    break;
-                                }
-                                if let (Some(nb_off), Some(nb_w)) = (next_bit_off, next_bit_w) {
-                                    if let Initializer::Int(v) = next_init {
-                                        let mask = (1u64 << nb_w) - 1;
-                                        packed_value |= ((*v as u64) & mask) << nb_off;
-                                    }
-                                }
-                                j += 1;
-                            }
-
-                            init_fields.push((
-                                *offset,
-                                *storage_size as usize,
-                                Initializer::Int(packed_value as i128),
-                            ));
-                            i = j;
-                        } else {
-                            init_fields.push((*offset, *field_size, init.clone()));
-                            i += 1;
+                            let bits = ((placed >> (byte * 8)) & 0xff) as u8;
+                            *bitfield_bytes.entry(field.offset + byte).or_default() |= bits;
                         }
                     }
+
+                    init_fields.extend(
+                        bitfield_bytes
+                            .into_iter()
+                            .map(|(offset, bits)| (offset, 1, Initializer::Int(bits as i128))),
+                    );
+                    init_fields.sort_by_key(|(offset, _, _)| *offset);
 
                     Initializer::Struct {
                         total_size: resolved_size,

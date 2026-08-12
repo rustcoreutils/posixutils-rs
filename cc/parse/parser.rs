@@ -90,6 +90,18 @@ struct SpecifierTally {
 }
 
 impl SpecifierTally {
+    /// Whether an *alias* type specifier appearing now is the name of what is
+    /// being declared rather than a second data type.
+    ///
+    /// A C library may define one of these as a typedef of its own: glibc's
+    /// <bits/floatn-common.h> has `typedef float _Float32;` whenever the
+    /// compiler does not claim native support. Once a data type has been
+    /// given, `_Float32` is the declarator -- the same rule `typeof` needs --
+    /// and without it that typedef is two data types and an error.
+    fn alias_is_declarator_name(&self) -> bool {
+        !self.data_types.is_empty()
+    }
+
     fn note_data_type(&mut self, name: &'static str, pos: Position) {
         self.data_types.push((name, pos));
     }
@@ -338,16 +350,12 @@ impl AttributeList {
 
     /// Whether `__attribute__((noinline))` is present.
     pub fn has_noinline(&self) -> bool {
-        self.attrs
-            .iter()
-            .any(|a| a.name == "noinline" || a.name == "__noinline__")
+        self.has_attr("noinline")
     }
 
     /// Whether `__attribute__((always_inline))` is present.
     pub fn has_always_inline(&self) -> bool {
-        self.attrs
-            .iter()
-            .any(|a| a.name == "always_inline" || a.name == "__always_inline__")
+        self.has_attr("always_inline")
     }
 
     /// Whether an attribute is present, in either spelling.
@@ -2275,14 +2283,7 @@ impl Parser<'_> {
                     }
                 }
                 crate::kw::FLOAT16 => {
-                    // An alias spelling, which a C library may define as a
-                    // typedef of its own: glibc's <bits/floatn-common.h> has
-                    // `typedef float _Float32;` whenever the compiler does not
-                    // claim native support. Once a data type has been given,
-                    // this is the declarator's name rather than a second
-                    // specifier -- the same rule `typeof` needs below, and
-                    // without it that typedef is two data types and an error.
-                    if !tally.data_types.is_empty() {
+                    if tally.alias_is_declarator_name() {
                         break;
                     }
                     tally.note_data_type("_Float16", self.current_pos());
@@ -2291,14 +2292,7 @@ impl Parser<'_> {
                 }
                 crate::kw::FLOAT32 => {
                     // _Float32 is an alias for float (TS 18661-3 / C23)
-                    // An alias spelling, which a C library may define as a
-                    // typedef of its own: glibc's <bits/floatn-common.h> has
-                    // `typedef float _Float32;` whenever the compiler does not
-                    // claim native support. Once a data type has been given,
-                    // this is the declarator's name rather than a second
-                    // specifier -- the same rule `typeof` needs below, and
-                    // without it that typedef is two data types and an error.
-                    if !tally.data_types.is_empty() {
+                    if tally.alias_is_declarator_name() {
                         break;
                     }
                     tally.note_data_type("float", self.current_pos());
@@ -2307,14 +2301,7 @@ impl Parser<'_> {
                 }
                 crate::kw::FLOAT64 => {
                     // _Float64 is an alias for double (TS 18661-3 / C23)
-                    // An alias spelling, which a C library may define as a
-                    // typedef of its own: glibc's <bits/floatn-common.h> has
-                    // `typedef float _Float32;` whenever the compiler does not
-                    // claim native support. Once a data type has been given,
-                    // this is the declarator's name rather than a second
-                    // specifier -- the same rule `typeof` needs below, and
-                    // without it that typedef is two data types and an error.
-                    if !tally.data_types.is_empty() {
+                    if tally.alias_is_declarator_name() {
                         break;
                     }
                     tally.note_data_type("double", self.current_pos());
@@ -2332,14 +2319,7 @@ impl Parser<'_> {
                     base_kind = Some(TypeKind::Int128);
                 }
                 crate::kw::INT128_T => {
-                    // An alias spelling, which a C library may define as a
-                    // typedef of its own: glibc's <bits/floatn-common.h> has
-                    // `typedef float _Float32;` whenever the compiler does not
-                    // claim native support. Once a data type has been given,
-                    // this is the declarator's name rather than a second
-                    // specifier -- the same rule `typeof` needs below, and
-                    // without it that typedef is two data types and an error.
-                    if !tally.data_types.is_empty() {
+                    if tally.alias_is_declarator_name() {
                         break;
                     }
                     tally.note_data_type("__int128", self.current_pos());
@@ -2347,14 +2327,7 @@ impl Parser<'_> {
                     base_kind = Some(TypeKind::Int128);
                 }
                 crate::kw::UINT128_T => {
-                    // An alias spelling, which a C library may define as a
-                    // typedef of its own: glibc's <bits/floatn-common.h> has
-                    // `typedef float _Float32;` whenever the compiler does not
-                    // claim native support. Once a data type has been given,
-                    // this is the declarator's name rather than a second
-                    // specifier -- the same rule `typeof` needs below, and
-                    // without it that typedef is two data types and an error.
-                    if !tally.data_types.is_empty() {
+                    if tally.alias_is_declarator_name() {
                         break;
                     }
                     tally.note_data_type("__int128", self.current_pos());

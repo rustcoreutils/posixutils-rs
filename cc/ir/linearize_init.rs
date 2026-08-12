@@ -279,6 +279,11 @@ impl<'a> super::linearize::Linearizer<'a> {
                     } else {
                         Initializer::SymAddrOffset(name, offset)
                     }
+                } else if let Some(val) = self.eval_const_expr(expr) {
+                    // Not every address-of is a relocation: the address of a
+                    // member of a null pointer is an integer constant, and a
+                    // pointer object may be initialized with one.
+                    Initializer::Int(val)
                 } else {
                     // Returning `Initializer::None` here would put the object
                     // in .bss and make the pointer null, which is what made

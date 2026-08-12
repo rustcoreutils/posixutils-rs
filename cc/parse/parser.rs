@@ -4475,6 +4475,13 @@ impl Parser<'_> {
             // Float literals are constant, return truncated value
             ExprKind::FloatLit(val) => Some(val.to_f64() as i128),
 
+            // The address of a member of a pointer constant is an integer
+            // constant; see `eval_pointer_constant`.
+            ExprKind::Unary {
+                op: UnaryOp::AddrOf,
+                operand,
+            } => self.eval_pointer_constant(operand),
+
             ExprKind::Unary { op, operand } => {
                 let val = self.eval_const_expr(operand)?;
                 match op {
@@ -4593,6 +4600,56 @@ impl Parser<'_> {
                 }
 
                 Some(offset)
+            }
+
+            _ => None,
+        }
+    }
+
+    /// The address of `expr`, when it is an integer constant rather than a
+    /// symbol's address.
+    ///
+    /// `(size_t)&((struct S *)0)->member` is how offsetof was spelled before
+    /// <stddef.h> was relied on to provide it. Nothing is dereferenced -- the
+    /// address of a member of a null pointer is arithmetic on the null pointer
+    /// -- so the result is a plain integer, usable anywhere an integer
+    /// constant expression is: an array bound, a case label, a bitfield width.
+    ///
+    /// The recursion bottoms out only at an integer constant, so the address
+    /// of a real object is not folded here: that one needs a relocation, which
+    /// no integer constant expression can carry.
+    fn eval_pointer_constant(&self, expr: &Expr) -> Option<i128> {
+        match &expr.kind {
+            ExprKind::IntLit(v) => Some(*v as i128),
+            ExprKind::Int128Lit(v) => Some(*v),
+
+            ExprKind::Cast { expr: inner, .. } => self.eval_pointer_constant(inner),
+
+            ExprKind::Unary {
+                op: UnaryOp::AddrOf,
+                operand,
+            } => self.eval_pointer_constant(operand),
+
+            ExprKind::Member { expr: base, member } => {
+                let base_offset = self.eval_pointer_constant(base)?;
+                let struct_type = self.resolve_struct_type(base.typ?);
+                let member_info = self.types.find_member(struct_type, *member)?;
+                Some(base_offset + member_info.offset as i128)
+            }
+
+            ExprKind::Arrow { expr: base, member } => {
+                let base_offset = self.eval_pointer_constant(base)?;
+                let pointee_type = self.types.base_type(base.typ?)?;
+                let struct_type = self.resolve_struct_type(pointee_type);
+                let member_info = self.types.find_member(struct_type, *member)?;
+                Some(base_offset + member_info.offset as i128)
+            }
+
+            ExprKind::Index { array, index } => {
+                let base_offset = self.eval_pointer_constant(array)?;
+                let idx = self.eval_const_expr(index)?;
+                let elem_type = self.types.base_type(array.typ?)?;
+                Some(base_offset + idx * self.types.size_bytes(elem_type) as i128)
             }
 
             _ => None,

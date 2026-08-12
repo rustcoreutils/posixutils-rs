@@ -1595,3 +1595,59 @@ int main(void)
         0
     );
 }
+
+/// The pre-<stddef.h> spelling of offsetof is an integer constant expression.
+///
+/// `(size_t)&((struct S *)0)->member` dereferences nothing -- it is arithmetic
+/// on a null pointer -- so there is no symbol to relocate against and the
+/// whole thing folds to an integer. It used to fold to nothing: the static
+/// initializer silently became zero, and after global initializers started
+/// rejecting what they could not fold, it became a hard error instead.
+#[test]
+fn c99_offsetof_by_null_pointer_is_a_constant() {
+    let code = r#"
+#include <stddef.h>
+
+struct S { int a; double b; char c[8]; struct { int x, y; } n; };
+
+static const size_t off_a = (size_t)&((struct S *)0)->a;
+static const size_t off_b = (size_t)&((struct S *)0)->b;
+static const size_t off_c = (size_t)&((struct S *)0)->c;
+static const size_t off_c2 = (size_t)&((struct S *)0)->c[2];
+static const size_t off_ny = (size_t)&((struct S *)0)->n.y;
+
+/* An integer constant expression is usable as an array bound and a case
+   label, not only as an initializer. */
+static char sized[(size_t)&((struct S *)0)->b];
+
+int pick(int k)
+{
+    switch (k) {
+    case (int)(size_t)&((struct S *)0)->b: return 1;
+    default: return 0;
+    }
+}
+
+int main(void)
+{
+    if (off_a != offsetof(struct S, a)) return 1;
+    if (off_b != offsetof(struct S, b)) return 2;
+    if (off_c != offsetof(struct S, c)) return 3;
+    if (off_c2 != offsetof(struct S, c) + 2) return 4;
+    if (off_ny != offsetof(struct S, n.y)) return 5;
+    if (sizeof(sized) != offsetof(struct S, b)) return 6;
+    if (pick((int)offsetof(struct S, b)) != 1) return 7;
+
+    /* The address of a real object is still a relocation, not an integer. */
+    static int obj[4];
+    static int *p = &obj[2];
+    if (p != &obj[2]) return 8;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c99_offsetof_by_null_pointer_is_a_constant", code, &[]),
+        0
+    );
+}

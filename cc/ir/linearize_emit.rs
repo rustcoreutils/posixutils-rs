@@ -274,13 +274,21 @@ impl<'a> super::linearize::Linearizer<'a> {
         bit_width: u32,
         target_bits: u32,
     ) -> PseudoId {
-        // Sign extend by shifting left then arithmetic shifting right
-        let shift_amount = target_bits - bit_width;
-        let typ = if target_bits <= 32 {
-            self.types.int_id
+        // Sign extend by shifting the field's top bit up to the sign bit and
+        // arithmetic-shifting it back down.
+        //
+        // The shift is measured against the width the *operation* runs at, not
+        // against the storage unit. A field backed by a one-byte unit is still
+        // extracted in a 32-bit register, so shifting by `8 - width` leaves the
+        // field's top bit at bit 7, where an arithmetic shift sees a positive
+        // value and extends nothing. `int a:4` was correct only because its
+        // storage unit is 32 bits, which happens to be the operation width.
+        let (typ, op_bits) = if target_bits <= 32 {
+            (self.types.int_id, 32)
         } else {
-            self.types.long_id
+            (self.types.long_id, 64)
         };
+        let shift_amount = op_bits - bit_width;
 
         let shift_val = self.emit_const(shift_amount as i128, typ);
         let shifted_left = self.alloc_pseudo();
@@ -290,7 +298,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             value,
             shift_val,
             typ,
-            target_bits,
+            op_bits,
         ));
 
         let result = self.alloc_pseudo();
@@ -300,7 +308,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             shifted_left,
             shift_val,
             typ,
-            target_bits,
+            op_bits,
         ));
         result
     }

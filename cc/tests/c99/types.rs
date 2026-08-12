@@ -213,3 +213,78 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("c99_types_mega", code, &[]), 0);
 }
+
+/// A signed bitfield sign-extends on read whatever its declared type.
+///
+/// The extension shifted left and arithmetic-right by
+/// `storage_unit_bits - width`, but the machine operation is performed at the
+/// promoted width. For a field backed by a one-byte unit that shifted bit 2 up
+/// to bit 7 of a 32-bit register, where it is not the sign bit, so the
+/// arithmetic shift saw a positive value and extended nothing:
+///
+/// ```text
+///     andl $7, %eax     ; masked, = 4
+///     shll $5, %ecx     ; 4 << 5 = 128
+///     sarl $5, %eax     ; still 128 >> 5 = 4, never -4
+/// ```
+///
+/// `int a:4` was correct precisely because its storage unit is 32 bits, which
+/// happens to equal the operation width.
+#[test]
+fn c99_signed_bitfields_sign_extend_at_every_declared_width() {
+    let src = r#"
+struct S {
+    signed char  sc : 3;
+    short        sh : 5;
+    int          i  : 4;
+    long         l  : 9;
+    long long    ll : 33;
+};
+
+struct U {
+    unsigned char  uc : 3;
+    unsigned short us : 5;
+    unsigned int   ui : 4;
+};
+
+int main(void)
+{
+    struct S s = {0};
+
+    /* Most negative and most positive at each width. */
+    s.sc = -4; if (s.sc != -4) return 1;
+    s.sc =  3; if (s.sc !=  3) return 2;
+    s.sh = -16; if (s.sh != -16) return 3;
+    s.sh =  15; if (s.sh !=  15) return 4;
+    s.i  = -8; if (s.i  != -8) return 5;
+    s.i  =  7; if (s.i  !=  7) return 6;
+    s.l  = -256; if (s.l != -256) return 7;
+    s.l  =  255; if (s.l !=  255) return 8;
+    s.ll = -4294967296LL; if (s.ll != -4294967296LL) return 9;
+    s.ll =  4294967295LL; if (s.ll !=  4294967295LL) return 10;
+
+    /* -1 is all ones in the field and must read back as -1, not the mask. */
+    s.sc = -1; if (s.sc != -1) return 11;
+    s.sh = -1; if (s.sh != -1) return 12;
+    s.l  = -1; if (s.l  != -1) return 13;
+
+    /* Incrementing across the signed boundary wraps like the narrow type. */
+    s.sc = 3; s.sc++; if (s.sc != -4) return 14;
+
+    /* Unsigned fields must not extend. */
+    struct U u = {0};
+    u.uc = 7; if (u.uc != 7) return 15;
+    u.us = 31; if (u.us != 31) return 16;
+    u.ui = 15; if (u.ui != 15) return 17;
+
+    /* In an expression, the promoted value must still be negative. */
+    s.sc = -4;
+    if (s.sc + 0 != -4) return 18;
+    if (s.sc * 2 != -8) return 19;
+    if (!(s.sc < 0)) return 20;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("bitfield_sign_extend", src, &[]), 0);
+}

@@ -402,7 +402,7 @@ pub fn get_float_limit_macros(target: &Target) -> Vec<(&'static str, &'static st
     // 1.08e-19 when the type is really a 64-bit double, so `1.0L + LDBL_EPSILON`
     // compared equal to 1.0L and <float.h> was simply lying.
     let ldbl = LongDoubleLimits::for_target(target);
-    vec![
+    let mut macros: Vec<(&'static str, &'static str)> = vec![
         // Float16 (16-bit IEEE 754 binary16, half precision)
         (
             "__FLT16_MIN__",
@@ -431,27 +431,6 @@ pub fn get_float_limit_macros(target: &Target) -> Vec<(&'static str, &'static st
         ("__FLT16_HAS_QUIET_NAN__", "1"),
         ("__FLT16_DECIMAL_DIG__", "5"),
         ("__SIZEOF_FLOAT16__", "2"),
-        // __float128 / _Float128 (IEEE 754 binary128, quad precision).
-        //
-        // Spelled in hex so the values reach binary128 exactly, and suffixed
-        // `q` so they carry that type rather than being rounded to whatever
-        // `long double` happens to be on the target. Same on every target:
-        // unlike `long double`, this type does not vary.
-        ("__FLT128_MIN__", "0x1p-16382q"),
-        ("__FLT128_MAX__", "0x1.ffffffffffffffffffffffffffffp+16383q"),
-        ("__FLT128_EPSILON__", "0x1p-112q"),
-        ("__FLT128_DENORM_MIN__", "0x1p-16494q"),
-        ("__FLT128_MANT_DIG__", "113"),
-        ("__FLT128_DIG__", "33"),
-        ("__FLT128_MIN_EXP__", "(-16381)"),
-        ("__FLT128_MAX_EXP__", "16384"),
-        ("__FLT128_MIN_10_EXP__", "(-4931)"),
-        ("__FLT128_MAX_10_EXP__", "4932"),
-        ("__FLT128_HAS_DENORM__", "1"),
-        ("__FLT128_HAS_INFINITY__", "1"),
-        ("__FLT128_HAS_QUIET_NAN__", "1"),
-        ("__FLT128_DECIMAL_DIG__", "36"),
-        ("__SIZEOF_FLOAT128__", "16"),
         // Float (32-bit IEEE 754)
         ("__FLT_MIN__", "1.17549435082228750796873653722224568e-38F"),
         ("__FLT_MAX__", "3.40282346638528859811704183484516925e+38F"),
@@ -511,7 +490,43 @@ pub fn get_float_limit_macros(target: &Target) -> Vec<(&'static str, &'static st
         ("__DBL_DECIMAL_DIG__", "17"),
         ("__LDBL_DECIMAL_DIG__", ldbl.decimal_dig),
         ("__DECIMAL_DIG__", ldbl.decimal_dig),
-    ]
+    ];
+
+    // __float128 / _Float128 (IEEE 754 binary128, quad precision).
+    //
+    // Spelled in hex so the values reach binary128 exactly, and suffixed `q`
+    // so they carry that type rather than being rounded to whatever
+    // `long double` happens to be. Same on every target that has the type --
+    // unlike `long double`, binary128 does not vary -- but only on the targets
+    // that have it at all: describing a type the runtime cannot support would
+    // have <float.h> advertise an FLT128_* family that fails at link time.
+    if has_float128(target) {
+        macros.extend([
+            ("__FLT128_MIN__", "0x1p-16382q"),
+            ("__FLT128_MAX__", "0x1.ffffffffffffffffffffffffffffp+16383q"),
+            ("__FLT128_EPSILON__", "0x1p-112q"),
+            ("__FLT128_DENORM_MIN__", "0x1p-16494q"),
+            ("__FLT128_MANT_DIG__", "113"),
+            ("__FLT128_DIG__", "33"),
+            ("__FLT128_MIN_EXP__", "(-16381)"),
+            ("__FLT128_MAX_EXP__", "16384"),
+            ("__FLT128_MIN_10_EXP__", "(-4931)"),
+            ("__FLT128_MAX_10_EXP__", "4932"),
+            ("__FLT128_HAS_DENORM__", "1"),
+            ("__FLT128_HAS_INFINITY__", "1"),
+            ("__FLT128_HAS_QUIET_NAN__", "1"),
+            ("__FLT128_DECIMAL_DIG__", "36"),
+            ("__SIZEOF_FLOAT128__", "16"),
+        ]);
+    }
+
+    macros
+}
+
+/// Whether `__float128` exists on this target; see `TypeTable::has_float128`,
+/// which must agree with this.
+pub fn has_float128(target: &Target) -> bool {
+    target.os != Os::MacOS
 }
 
 /// The <float.h> description of `long double`, which is a different type on

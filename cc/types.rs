@@ -1146,6 +1146,22 @@ impl TypeTable {
     // Target-dependent type size helpers
     // ========================================================================
 
+    /// Whether `__float128` is available on this target.
+    ///
+    /// The type is soft-float everywhere, since neither supported architecture
+    /// has binary128 arithmetic in hardware, so it exists only where the
+    /// `__*tf*` runtime helpers do. Linux has them in libgcc, versioned
+    /// `GCC_4.3.0`. Apple's arm64 runtime has none of them, and clang does not
+    /// offer the type there either, so a program using it would compile and
+    /// then fail to link on every operation it performed.
+    pub fn has_float128(&self) -> bool {
+        crate::arch::has_float128(&Target {
+            arch: self.target_arch,
+            os: self.target_os,
+            ..Target::host()
+        })
+    }
+
     /// Get long double size in bits based on target architecture
     /// - macOS aarch64: 64 bits (same as double)
     /// - x86-64: 128 bits (80-bit x87 padded to 16 bytes)

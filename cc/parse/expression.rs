@@ -1046,6 +1046,9 @@ impl<'a> Parser<'a> {
                 }
                 crate::kw::FLOAT128 | crate::kw::FLOAT128_ALIAS => {
                     // IEEE binary128; see the declaration parser's arm.
+                    if !self.types.has_float128() {
+                        break;
+                    }
                     self.advance();
                     base_kind = Some(TypeKind::Float128);
                     parsed_something = true;
@@ -3493,6 +3496,12 @@ impl<'a> Parser<'a> {
                 FloatVal::from_parts(false, mantissa, exp2)
             };
             let typ = if is_float128_suffix || is_quad_suffix {
+                if !self.types.has_float128() {
+                    return Err(ParseError::new(
+                        format!("__float128 is not supported on this target: {}", s),
+                        pos,
+                    ));
+                }
                 self.types.float128_id
             } else if is_float16_suffix {
                 self.types.float16_id

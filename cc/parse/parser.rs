@@ -2317,6 +2317,12 @@ impl Parser<'_> {
                     if tally.alias_is_declarator_name() {
                         break;
                     }
+                    if !self.types.has_float128() {
+                        return Err(ParseError::new(
+                            "__float128 is not supported on this target",
+                            self.current_pos(),
+                        ));
+                    }
                     tally.note_data_type("__float128", self.current_pos());
                     self.advance();
                     base_kind = Some(TypeKind::Float128);

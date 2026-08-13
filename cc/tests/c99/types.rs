@@ -426,7 +426,9 @@ int main(void)
 #[test]
 fn c99_float128_is_a_first_class_type() {
     let src = r#"
+#include <float.h>
 #include <string.h>
+#ifdef __FLT128_MANT_DIG__
 
 __attribute__((noinline)) static __float128 add(__float128 a, __float128 b) { return a + b; }
 __attribute__((noinline)) static __float128 mul(__float128 a, __float128 b) { return a * b; }
@@ -506,6 +508,10 @@ int main(void)
 
     return 0;
 }
+#else
+/* The type does not exist on this target; see `TypeTable::has_float128`. */
+int main(void) { return 0; }
+#endif
 "#;
     assert_eq!(compile_and_run("float128_first_class", src, &[]), 0);
 }
@@ -516,6 +522,8 @@ int main(void)
 #[test]
 fn c99_float128_outranks_long_double() {
     let src = r#"
+#include <float.h>
+#ifdef __FLT128_MANT_DIG__
 int main(void)
 {
     /* 0.1 is inexact in every binary format, and the three formats round it
@@ -530,12 +538,19 @@ int main(void)
     if (sizeof(q + 1) != sizeof(__float128)) return 4;
     if (sizeof(1 ? q : l) != sizeof(__float128)) return 5;
 
+#if LDBL_MANT_DIG != 113
     /* And the arithmetic really is done at that width: 0.1q and 0.1L differ,
-       so promoting the long double cannot make them equal. */
+       so promoting the long double cannot make them equal. Only where the
+       two are different formats -- on aarch64 Linux `long double` *is*
+       binary128, and there they are the same number. */
     if (q == l) return 6;
+#endif
 
     return 0;
 }
+#else
+int main(void) { return 0; }
+#endif
 "#;
     assert_eq!(compile_and_run("float128_rank", src, &[]), 0);
 }
@@ -547,7 +562,9 @@ int main(void)
 #[test]
 fn c99_float128_edge_cases() {
     let src = r#"
+#include <float.h>
 #include <string.h>
+#ifdef __FLT128_MANT_DIG__
 
 /* More than eight, so the last two are passed on the stack. A binary128 is
    two eightbytes; reserving one, or advancing the incoming offset by one,
@@ -599,6 +616,9 @@ int main(void)
 
     return 0;
 }
+#else
+int main(void) { return 0; }
+#endif
 "#;
     assert_eq!(compile_and_run("float128_edge_cases", src, &[]), 0);
 }

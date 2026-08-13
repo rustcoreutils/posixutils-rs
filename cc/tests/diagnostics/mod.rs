@@ -850,22 +850,27 @@ fn diagnostics_binary128_suffixes_need_a_floating_constant() {
         compile_expect_error(name, src, "invalid integer literal");
     }
 
-    // The floating forms, and a hex integer whose last digits merely spell a
-    // suffix, must all still be accepted.
-    for (name, src) in [
-        (
-            "float_q",
-            "__float128 a = 1.0q;\nint main(void){ return a != 1.0q; }\n",
+    // A hex integer whose last digits merely spell a suffix is still an
+    // integer, on every target.
+    compile_expect_ok(
+        "hex_int_spelling_a_suffix",
+        "int main(void){ return 0x1f128 != 127272; }\n",
+    );
+
+    // The floating forms are accepted where the type exists. Where it does
+    // not, a `q` literal has nowhere to live and is rejected with it, so the
+    // body is compiled out rather than asserted either way.
+    compile_expect_ok(
+        "binary128_literals",
+        concat!(
+            "#include <float.h>\n",
+            "#ifdef __FLT128_MANT_DIG__\n",
+            "__float128 a = 1.0q;\n",
+            "__float128 b = 0x1p0f128;\n",
+            "int main(void){ return a != b; }\n",
+            "#else\n",
+            "int main(void){ return 0; }\n",
+            "#endif\n",
         ),
-        (
-            "hexfloat_f128",
-            "__float128 a = 0x1p0f128;\nint main(void){ return a != 1.0q; }\n",
-        ),
-        (
-            "hex_int_spelling_a_suffix",
-            "int main(void){ return 0x1f128 != 127272; }\n",
-        ),
-    ] {
-        compile_expect_ok(name, src);
-    }
+    );
 }

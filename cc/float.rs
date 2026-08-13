@@ -15,11 +15,17 @@
 // type of the literal is even known: `LDBL_MAX` becomes `inf` and `LDBL_MIN`
 // becomes zero.
 //
-// [`FloatVal`] carries the x87 80-bit encoding itself. That choice covers both
-// supported targets exactly: it is the native `long double` on x86-64, and
-// widening its 64-bit significand to the 113 bits of aarch64's binary128 is
-// also exact, so no target loses precision by going through it. `float` and
-// `double` are strict subsets and round out of it on demand.
+// [`FloatVal`] carries a 15-bit exponent and a 128-bit significand -- wider
+// than every target format rather than equal to one. x87's 64 significand bits
+// and binary128's 113 both fit, so a literal reaches either format having been
+// rounded exactly once, at emission, by the routine that knows the width it is
+// rounding to. `float` and `double` are strict subsets and round out of it on
+// demand.
+//
+// Carrying x87's 64 bits instead, which this did at first, is exact only for
+// the format it was taken from: on aarch64, where `long double` is binary128,
+// `LDBL_MAX` lost all 112 of its fraction bits and `LDBL_TRUE_MIN` -- below
+// x87's smallest subnormal -- flushed to zero.
 //
 
 use std::fmt;
@@ -30,19 +36,23 @@ const BIAS: i32 = 16383;
 const EXP_SPECIAL: u16 = 0x7FFF;
 /// The largest finite biased exponent.
 const EXP_MAX_FINITE: u16 = 0x7FFE;
-/// Bit 63 of the significand: x87 stores the integer bit explicitly.
-const INTEGER_BIT: u64 = 1 << 63;
+/// The top bit of the significand, which is always set for a normal value:
+/// the integer bit, held explicitly as x87 holds it.
+const INTEGER_BIT: u128 = 1 << 127;
+/// Significand width. Wider than any target format, so that rounding happens
+/// once, on the way out, at the width being emitted.
+const SIG_BITS: u32 = 128;
 
-/// A floating-point literal held at x87 80-bit precision.
+/// A floating-point literal, held wider than any target format.
 ///
-/// The value is `(-1)^neg * sig * 2^(exp - BIAS - 63)` for a normal number.
+/// The value is `(-1)^neg * sig * 2^(exp - BIAS - 127)` for a normal number.
 /// `exp == 0` is zero (`sig == 0`) or subnormal; `exp == 0x7FFF` is infinity
 /// (`sig == INTEGER_BIT`) or NaN.
 #[derive(Clone, Copy, Debug)]
 pub struct FloatVal {
     neg: bool,
     exp: u16,
-    sig: u64,
+    sig: u128,
 }
 
 impl FloatVal {
@@ -68,7 +78,7 @@ impl FloatVal {
             neg: false,
             exp: EXP_SPECIAL,
             // Integer bit plus the quiet bit, matching what x87 produces.
-            sig: INTEGER_BIT | (1 << 62),
+            sig: INTEGER_BIT | (1 << 126),
         }
     }
 
@@ -87,7 +97,7 @@ impl FloatVal {
                 FloatVal {
                     neg,
                     exp: EXP_SPECIAL,
-                    sig: INTEGER_BIT | (frac << 11),
+                    sig: INTEGER_BIT | ((frac as u128) << 75),
                 }
             };
         }
@@ -104,11 +114,12 @@ impl FloatVal {
             // exponent range has room for it. Normalizing here is what the
             // old f64-to-x87 conversion skipped, and it produced a wrong
             // value rather than an imprecise one.
+            let frac = frac as u128;
             let shift = frac.leading_zeros();
             let sig = frac << shift;
             // frac has value frac * 2^-1074; after shifting left by `shift`
-            // the integer bit sits at bit 63, worth 2^(63-1074-shift).
-            let unbiased = 63 - 1074 - shift as i32;
+            // the integer bit sits at bit 127, worth 2^(127-1074-shift).
+            let unbiased = 127 - 1074 - shift as i32;
             return FloatVal {
                 neg,
                 exp: (unbiased + BIAS) as u16,
@@ -119,12 +130,15 @@ impl FloatVal {
         FloatVal {
             neg,
             exp: (exp11 - 1023 + BIAS) as u16,
-            sig: INTEGER_BIT | (frac << 11),
+            sig: INTEGER_BIT | ((frac as u128) << 75),
         }
     }
 
-    /// Build from an exact `mantissa * 2^exp2`, rounding to 64 significand
-    /// bits (round-to-nearest, ties to even).
+    /// Build from an exact `mantissa * 2^exp2`.
+    ///
+    /// Exact: a `u128` mantissa has no more bits than the significand, so
+    /// nothing is rounded here. Rounding happens once, at the width being
+    /// emitted -- which is the point of carrying more bits than any target.
     ///
     /// This is the shape `parse_hex_float_parts` produces, so a hex literal
     /// reaches the target format without ever passing through `f64`.
@@ -137,44 +151,18 @@ impl FloatVal {
             };
         }
 
-        // Normalize so the leading one sits at bit 63 of a u64.
-        let width = 128 - mantissa.leading_zeros() as i32;
+        // Normalize so the leading one sits at the top of the significand.
+        let width = SIG_BITS - mantissa.leading_zeros();
         // Value is mantissa * 2^exp2; the top bit is worth 2^(exp2 + width - 1).
-        let mut unbiased = exp2 + width - 1;
-
-        let mut sig;
-        if width <= 64 {
-            sig = (mantissa as u64) << (64 - width);
-        } else {
-            let drop = width - 64;
-            let kept = mantissa >> drop;
-            let rest = mantissa & ((1u128 << drop) - 1);
-            let half = 1u128 << (drop - 1);
-            sig = kept as u64;
-            // Round to nearest, ties to even.
-            if rest > half || (rest == half && sig & 1 != 0) {
-                sig = match sig.checked_add(1) {
-                    Some(s) => s,
-                    None => {
-                        // Carried out of the top: 0xFFFF... becomes 1.0 with
-                        // one more exponent.
-                        unbiased += 1;
-                        INTEGER_BIT
-                    }
-                };
-                if sig == 0 {
-                    unbiased += 1;
-                    sig = INTEGER_BIT;
-                }
-            }
-        }
+        let unbiased = exp2 + width as i32 - 1;
+        let sig = mantissa << (SIG_BITS - width);
 
         Self::from_normalized(neg, sig, unbiased)
     }
 
     /// Assemble from a significand already normalized to bit 63, handling
     /// overflow to infinity and underflow through the subnormal range.
-    fn from_normalized(neg: bool, sig: u64, unbiased: i32) -> Self {
+    fn from_normalized(neg: bool, sig: u128, unbiased: i32) -> Self {
         let biased = unbiased + BIAS;
         if biased > EXP_MAX_FINITE as i32 {
             return Self::infinity(neg);
@@ -187,23 +175,7 @@ impl FloatVal {
             // costs up to a full ulp on every subnormal, and it is directed
             // rounding at that -- always toward zero -- where the rest of this
             // conversion rounds to nearest, ties to even.
-            let shift = (1 - biased) as u32;
-            if shift > 64 {
-                return FloatVal {
-                    neg,
-                    exp: 0,
-                    sig: 0,
-                };
-            }
-            // Widened so that a 64-bit shift, which the smallest subnormal
-            // needs, is an ordinary shift rather than an overflow.
-            let wide = sig as u128;
-            let mut kept = (wide >> shift) as u64;
-            let rest = wide & ((1u128 << shift) - 1);
-            let half = 1u128 << (shift - 1);
-            if rest > half || (rest == half && kept & 1 != 0) {
-                kept += 1;
-            }
+            let kept = Self::round_to(sig, (1 - biased) as u32);
             // Rounding up can carry into the integer bit, and a significand
             // with its integer bit set is the smallest normal value rather
             // than the largest subnormal one.
@@ -241,9 +213,7 @@ impl FloatVal {
         // become a normal double -- the range only shrinks -- but a
         // subnormal's significand is not left-aligned, and the exponent
         // arithmetic below assumes it is, so align it first.
-        let shift = self.sig.leading_zeros();
-        let sig = self.sig << shift;
-        let unbiased = self.exp as i32 - BIAS - shift as i32 + if self.exp == 0 { 1 } else { 0 };
+        let (sig, unbiased) = self.aligned();
 
         let exp11 = unbiased + 1023;
         if exp11 >= 0x7FF {
@@ -254,21 +224,23 @@ impl FloatVal {
             };
         }
 
+        // 53 significand bits, so 75 of the 128 are rounded away.
+        const DROP: u32 = SIG_BITS - 53;
         let (frac, exp11) = if exp11 <= 0 {
             // Subnormal double, or zero.
             let shift = 1 - exp11;
             if shift >= 64 {
                 return if self.neg { -0.0 } else { 0.0 };
             }
-            (Self::round_to(sig >> shift, 11), 0)
+            (Self::round_to(sig >> shift, DROP) as u64, 0)
         } else {
-            let rounded = Self::round_to(sig, 11);
-            // Rounding can carry into bit 64, which means the significand
-            // became 2.0 and the exponent steps.
+            let rounded = Self::round_to(sig, DROP);
+            // Rounding can carry out of the 53 bits, which means the
+            // significand became 2.0 and the exponent steps.
             if rounded >> 52 > 1 {
                 (0, exp11 + 1)
             } else {
-                (rounded & ((1u64 << 52) - 1), exp11)
+                ((rounded & ((1u64 << 52) - 1) as u128) as u64, exp11)
             }
         };
 
@@ -285,10 +257,25 @@ impl FloatVal {
     }
 
     /// Round `sig` right by `drop` bits, to nearest with ties to even.
-    fn round_to(sig: u64, drop: u32) -> u64 {
-        let kept = sig >> drop;
-        let rest = sig & ((1u64 << drop) - 1);
-        let half = 1u64 << (drop - 1);
+    ///
+    /// `drop` may be the full width, which is what the smallest subnormal of
+    /// a format needs: everything is shifted out and only the rounding
+    /// decision is left, and more than half an ulp still rounds up to one.
+    /// Returning zero without asking is how `0x1p-16494L` -- binary128's
+    /// smallest subnormal -- became zero.
+    fn round_to(sig: u128, drop: u32) -> u128 {
+        if drop > SIG_BITS {
+            return 0;
+        }
+        let (kept, rest, half) = if drop == SIG_BITS {
+            (0, sig, INTEGER_BIT)
+        } else {
+            (
+                sig >> drop,
+                sig & ((1u128 << drop) - 1),
+                1u128 << (drop - 1),
+            )
+        };
         if rest > half || (rest == half && kept & 1 != 0) {
             kept + 1
         } else {
@@ -296,20 +283,92 @@ impl FloatVal {
         }
     }
 
+    /// The significand left-aligned with its integer bit at the top, and the
+    /// unbiased exponent that goes with it.
+    ///
+    /// A subnormal's significand is not left-aligned and every conversion out
+    /// of this format assumes it is.
+    fn aligned(self) -> (u128, i32) {
+        let shift = self.sig.leading_zeros();
+        let unbiased = self.exp as i32 - BIAS - shift as i32 + i32::from(self.exp == 0);
+        (self.sig << shift, unbiased)
+    }
+
+    /// The x87 80-bit encoding, as `(significand, sign-and-exponent)`.
+    ///
+    /// Rounds the significand to x87's 64 bits, which is where a value wider
+    /// than the target format gives up its extra precision -- once, here,
+    /// rather than at parse time when the type is not yet known.
+    fn to_x87_parts(self) -> (u64, u16) {
+        let se = |exp: u16| ((self.neg as u16) << 15) | (exp & 0x7FFF);
+
+        if self.exp == EXP_SPECIAL {
+            // Infinity keeps just the integer bit; a NaN keeps its payload,
+            // which lives immediately below it.
+            let sig = if self.is_nan() {
+                (self.sig >> (SIG_BITS - 64)) as u64 | (1 << 63) | 1
+            } else {
+                1 << 63
+            };
+            return (sig, se(EXP_SPECIAL));
+        }
+        if self.sig == 0 {
+            return (0, se(0));
+        }
+
+        const DROP: u32 = SIG_BITS - 64;
+        let (aligned, unbiased) = self.aligned();
+        let biased = unbiased + BIAS;
+
+        if biased <= 0 {
+            // Subnormal in x87 as well: shift down to exponent 1 and round
+            // whatever falls off, exactly as `from_normalized` does.
+            let shift = DROP as i32 + 1 - biased;
+            if shift > SIG_BITS as i32 {
+                return (0, se(0));
+            }
+            let rounded = Self::round_to(aligned, shift as u32) as u64;
+            // A carry into the integer bit makes it the smallest normal.
+            let exp = u16::from(rounded & (1 << 63) != 0);
+            return (rounded, se(exp));
+        }
+
+        let rounded = Self::round_to(aligned, DROP);
+        // Rounding can carry out of the 64 bits, giving 2.0 and one more
+        // exponent -- which can in turn overflow to infinity.
+        let (sig, biased) = if rounded > u64::MAX as u128 {
+            (1u64 << 63, biased + 1)
+        } else {
+            (rounded as u64, biased)
+        };
+        if biased > EXP_MAX_FINITE as i32 {
+            return (1 << 63, se(EXP_SPECIAL));
+        }
+        (sig, se(biased as u16))
+    }
+
     /// The 16-byte x87 80-bit image, little-endian, as stored in memory.
     pub fn to_x87_bytes(self) -> [u8; 16] {
+        let (sig, se) = self.to_x87_parts();
         let mut out = [0u8; 16];
-        out[..8].copy_from_slice(&self.sig.to_le_bytes());
-        let se = ((self.neg as u16) << 15) | (self.exp & 0x7FFF);
+        out[..8].copy_from_slice(&sig.to_le_bytes());
         out[8..10].copy_from_slice(&se.to_le_bytes());
         out
     }
 
     /// The IEEE binary128 encoding, as `(low, high)` 64-bit halves.
     ///
-    /// Exact: binary128's 113-bit significand has room for all 64 bits.
+    /// Rounds the significand to binary128's 113 bits, which is the other
+    /// width a `long double` can have.
     pub fn to_f128_bits(self) -> (u64, u64) {
         let sign = (self.neg as u64) << 63;
+        let halves = |sig: u128, biased: i32| {
+            // The integer bit is implicit in binary128, so only the 112 bits
+            // below it are stored.
+            let frac = sig & ((1u128 << 112) - 1);
+            let hi = sign | ((biased as u64) << 48) | ((frac >> 64) as u64);
+            (frac as u64, hi)
+        };
 
         if self.exp == EXP_SPECIAL {
             let hi = sign | (0x7FFF << 48);
@@ -324,27 +383,37 @@ impl FloatVal {
             return (0, sign);
         }
 
-        // binary128 has an implicit leading bit, so drop x87's explicit one.
-        let shift = self.sig.leading_zeros();
-        let sig = self.sig << shift;
-        let unbiased = self.exp as i32 - BIAS - shift as i32 + if self.exp == 0 { 1 } else { 0 };
-        let biased = unbiased + 16383;
+        // 113 significand bits, so 15 of the 128 are rounded away.
+        const DROP: u32 = SIG_BITS - 113;
+        let (aligned, unbiased) = self.aligned();
+        let biased = unbiased + BIAS;
+
+        if biased <= 0 {
+            // Subnormal in binary128: shift down to exponent 1, rounding.
+            let shift = DROP as i32 + 1 - biased;
+            if shift > SIG_BITS as i32 {
+                return (0, sign);
+            }
+            let rounded = Self::round_to(aligned, shift as u32);
+            // A carry into the integer bit makes it the smallest normal, and
+            // the encoding of that is a biased exponent of 1 with a zero
+            // fraction -- which is what dropping the implicit bit leaves.
+            let biased = i32::from(rounded >> 112 != 0);
+            return halves(rounded, biased);
+        }
+
+        let rounded = Self::round_to(aligned, DROP);
+        // Rounding can carry out of the 113 bits, giving 2.0 and one more
+        // exponent.
+        let (rounded, biased) = if rounded >> 113 != 0 {
+            (rounded >> 1, biased + 1)
+        } else {
+            (rounded, biased)
+        };
         if biased >= 0x7FFF {
             return (0, sign | (0x7FFF << 48));
         }
-        if biased <= 0 {
-            let shift = 1 - biased;
-            if shift >= 113 {
-                return (0, sign);
-            }
-            let frac = (sig as u128) << 49 >> shift;
-            return (frac as u64, sign | ((frac >> 64) as u64));
-        }
-
-        // 112 fraction bits: the 63 below the integer bit, shifted up by 49.
-        let frac = ((sig & !INTEGER_BIT) as u128) << 49;
-        let hi = sign | ((biased as u64) << 48) | ((frac >> 64) as u64);
-        (frac as u64, hi)
+        halves(rounded, biased)
     }
 
     /// True if this is any NaN.
@@ -375,15 +444,18 @@ impl FloatVal {
     ///
     /// Distinct values must give distinct keys: pooling on the rounded `f64`
     /// merged 80-bit constants that differ only below the 53rd bit.
-    pub fn key(self) -> (bool, u16, u64) {
+    pub fn key(self) -> (bool, u16, u128) {
         (self.neg, self.exp, self.sig)
     }
 
-    /// [`FloatVal::key`] packed into one integer, for use as a map key and in
-    /// the generated label name of a pooled constant.
+    /// A key for the x87 constant pool, and the name of the pooled label.
+    ///
+    /// Keyed on the *x87 encoding* rather than on this value: the pool holds
+    /// what is emitted, and two literals that differ only below x87's 64th
+    /// significand bit emit the same constant and should share one slot.
     pub fn pool_key(self) -> u128 {
-        let se = ((self.neg as u16) << 15) | (self.exp & 0x7FFF);
-        ((se as u128) << 64) | self.sig as u128
+        let (sig, se) = self.to_x87_parts();
+        ((se as u128) << 64) | sig as u128
     }
 }
 
@@ -546,10 +618,12 @@ impl Big {
 
 /// The number of significand bits produced before rounding.
 ///
-/// One more than the 64 the widest target needs, plus room for a round bit;
-/// [`FloatVal::from_parts`] does the final rounding, and the sticky bit folded
-/// into bit 0 keeps a true tie distinguishable from "just above".
-const DEC_PRECISION: usize = 96;
+/// Comfortably more than the 113 the widest target format needs -- binary128,
+/// not x87's 64, which is what this was sized for and why a decimal
+/// `long double` literal on aarch64 came out with its low bits clear. The
+/// spare bits, and the sticky bit folded into bit 0, are what let the emitter
+/// round to any narrower width without double-rounding error.
+const DEC_PRECISION: usize = 127;
 
 /// Convert `digits * 10^exp10` into an exact-enough `(mantissa, exp2)` pair
 /// for [`FloatVal::from_parts`].
@@ -789,7 +863,10 @@ mod tests {
             let (dm, de) = parse_decimal_float_parts(dec).expect(dec);
             let got = FloatVal::from_parts(false, dm, de);
             let want = FloatVal::from_parts(false, *mantissa, *exp2);
-            assert_eq!(got.key(), want.key(), "{dec}");
+            // Compared as x87 emits them. The references are the 64
+            // significand bits gcc prints, and the decimal path now carries
+            // more than that -- agreeing to 64 bits is the claim being made.
+            assert_eq!(got.to_x87_bytes(), want.to_x87_bytes(), "{dec}");
         }
     }
 
@@ -864,21 +941,31 @@ mod tests {
         assert_eq!(min.to_f64(), 0.0, "but it is below a double's range");
         let bytes = min.to_x87_bytes();
         assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]), 1);
-        assert_eq!(&bytes[..8], &INTEGER_BIT.to_le_bytes());
+        assert_eq!(&bytes[..8], &(1u64 << 63).to_le_bytes());
     }
 
+    /// `from_parts` keeps every bit; x87 emission is what rounds to 64.
     #[test]
-    fn from_parts_rounds_to_nearest_even() {
+    fn x87_emission_rounds_to_nearest_even() {
+        let x87_sig = |v: FloatVal| u64::from_le_bytes(v.to_x87_bytes()[..8].try_into().unwrap());
+        const X87_INTEGER_BIT: u64 = 1 << 63;
+
         // 65 significant bits: the low one must round away, ties to even.
-        // 0b11 followed by 63 zeros, plus a half -- ties to even keeps it even.
-        let exact = FloatVal::from_parts(false, (1u128 << 64) | 1, 0);
-        // Dropping one bit from a 65-bit value: 0x1_0000_0000_0000_0001
-        // rounds down to 0x8000_0000_0000_0000 with exponent stepped.
-        assert_eq!(exact.key().2, INTEGER_BIT);
+        // 0x1_0000_0000_0000_0001 is a tie with an even kept value, so it
+        // rounds down to 0x8000_0000_0000_0000.
+        let tie = FloatVal::from_parts(false, (1u128 << 64) | 1, 0);
+        assert_eq!(x87_sig(tie), X87_INTEGER_BIT);
+        // Nothing was lost on the way in, though: the bit is still there.
+        assert_ne!(tie.key().2 & !INTEGER_BIT, 0);
 
         // Carry out of the top: all ones plus a rounding bit becomes 1.0.
         let carry = FloatVal::from_parts(false, (u64::MAX as u128) << 1 | 1, 0);
-        assert_eq!(carry.key().2, INTEGER_BIT);
+        assert_eq!(x87_sig(carry), X87_INTEGER_BIT);
+
+        // Above the tie it rounds up rather than to even: 66 bits whose low
+        // two are 0b11, so what is dropped is three quarters of an ulp.
+        let up = FloatVal::from_parts(false, (1u128 << 65) | 0b11, 0);
+        assert_eq!(x87_sig(up), X87_INTEGER_BIT + 1);
     }
 
     #[test]
@@ -917,42 +1004,43 @@ mod tests {
         assert!(FloatVal::from_parts(false, mantissa, exp2).is_zero());
     }
 
+    /// A subnormal is rounded to nearest, not truncated.
+    ///
+    /// Asserted on the emitted x87 image rather than on the internal
+    /// significand, so it says something about the value a target receives
+    /// rather than about how this type happens to hold it. x87 encodes a
+    /// subnormal as `sig * 2^-16445`, so a literal written as a multiple of
+    /// `2^-16447` puts the rounding decision in the low two bits.
     #[test]
     fn subnormals_round_to_nearest_rather_than_truncate() {
-        // A 64-bit significand at unbiased exponent -16384 is shifted down by
-        // two to reach the subnormal encoding, so the low two bits decide.
-        // `from_parts` normalizes the mantissa to bit 63, which puts the
-        // unbiased exponent at `63 + exp2`.
-        const SUBNORMAL_BY_2: i32 = -16384 - 63;
+        // (quarters of an ulp, expected significand, expected exponent)
+        let x87 = |m: u128| {
+            let b = FloatVal::from_parts(false, m, -16447).to_x87_bytes();
+            (
+                u64::from_le_bytes(b[..8].try_into().unwrap()),
+                u16::from_le_bytes([b[8], b[9]]),
+            )
+        };
 
-        // Dropped bits 0b11: above a half, so it rounds up. Truncation would
-        // leave 0x3FFF_FFFF_FFFF_FFFF.
-        let up = FloatVal::from_parts(false, u64::MAX as u128, SUBNORMAL_BY_2);
-        assert_eq!(up.key(), (false, 0, 1 << 62), "0b11 must round up");
+        // 4k+3 quarters: three quarters of an ulp above k, so it rounds up.
+        // Truncation would leave k = 2^62 - 1.
+        assert_eq!(x87(u64::MAX as u128), (1 << 62, 0), "must round up");
 
-        // An exact tie with an odd kept value rounds up, to even.
-        let tie_odd = (1u128 << 63) | 0b110;
-        let tie_odd = FloatVal::from_parts(false, tie_odd, SUBNORMAL_BY_2);
-        assert_eq!(tie_odd.key(), (false, 0, (1 << 61) + 2), "tie goes to even");
+        // 4k+2 with k even is an exact tie, and ties go to even: it stays.
+        assert_eq!(
+            x87((u64::MAX - 5) as u128),
+            ((1 << 62) - 2, 0),
+            "tie to even"
+        );
 
-        // An exact tie with an even kept value stays put.
-        let tie_even = (1u128 << 63) | 0b010;
-        let tie_even = FloatVal::from_parts(false, tie_even, SUBNORMAL_BY_2);
-        assert_eq!(tie_even.key(), (false, 0, 1 << 61), "tie goes to even");
+        // Rounding up out of the subnormal range gives the smallest normal,
+        // which is an exponent of 1 with the integer bit set.
+        assert_eq!(x87((1u128 << 65) - 1), (1 << 63, 1), "carry to normal");
 
-        // Rounding up out of the subnormal range produces the smallest
-        // normal, not a subnormal with the integer bit set.
-        let carry = FloatVal::from_parts(false, u64::MAX as u128, -16383 - 63);
-        assert_eq!(carry.key(), (false, 1, INTEGER_BIT), "must carry to normal");
-
-        // At the far end, where the whole significand is shifted out, more
-        // than half of an ulp still rounds to the smallest subnormal rather
-        // than flushing to zero.
-        let tiny = FloatVal::from_parts(false, u64::MAX as u128, -16446 - 63);
-        assert_eq!(tiny.key(), (false, 0, 1), "must not flush to zero");
-        // Below half an ulp it does flush.
-        let zero = FloatVal::from_parts(false, 1u128 << 62, -16446 - 62);
-        assert!(zero.is_zero(), "below half an ulp flushes to zero");
+        // At the bottom: three quarters of the smallest subnormal rounds up
+        // to it, one quarter rounds away to zero.
+        assert_eq!(x87(3), (1, 0), "must not flush to zero");
+        assert_eq!(x87(1), (0, 0), "below half an ulp flushes");
     }
 
     #[test]

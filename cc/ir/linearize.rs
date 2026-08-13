@@ -535,6 +535,9 @@ impl<'a> Linearizer<'a> {
         if left_float || right_float {
             // At least one operand is floating point
             // Use the wider floating point type
+            if left_kind == TypeKind::Float128 || right_kind == TypeKind::Float128 {
+                return self.types.float128_id;
+            }
             if left_kind == TypeKind::LongDouble || right_kind == TypeKind::LongDouble {
                 return self.types.longdouble_id;
             }

@@ -211,7 +211,7 @@ fn is_aggregate(kind: TypeKind) -> bool {
 fn is_float(kind: TypeKind) -> bool {
     matches!(
         kind,
-        TypeKind::Float | TypeKind::Double | TypeKind::LongDouble
+        TypeKind::Float | TypeKind::Double | TypeKind::LongDouble | TypeKind::Float128
     )
 }
 

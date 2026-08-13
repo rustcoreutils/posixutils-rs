@@ -54,6 +54,7 @@ pub trait ArchMapper {
 /// Target-dependent for long double (x87 vs IEEE quad).
 pub fn complex_mul_name(base_kind: TypeKind, target: &Target) -> &'static str {
     match base_kind {
+        TypeKind::Float128 => "__multc3",
         TypeKind::Float => "__mulsc3",
         TypeKind::Double => "__muldc3",
         TypeKind::LongDouble => {
@@ -74,6 +75,7 @@ pub fn complex_mul_name(base_kind: TypeKind, target: &Target) -> &'static str {
 /// Target-dependent for long double (x87 vs IEEE quad).
 pub fn complex_div_name(base_kind: TypeKind, target: &Target) -> &'static str {
     match base_kind {
+        TypeKind::Float128 => "__divtc3",
         TypeKind::Float => "__divsc3",
         TypeKind::Double => "__divdc3",
         TypeKind::LongDouble => {
@@ -99,6 +101,8 @@ pub(crate) fn float_suffix(kind: TypeKind, target: &Target) -> &'static str {
     match kind {
         TypeKind::Float => "sf",
         TypeKind::Double => "df",
+        // binary128 is TFmode wherever it appears.
+        TypeKind::Float128 => "tf",
         TypeKind::LongDouble => {
             if target.arch == Arch::X86_64 {
                 "xf"

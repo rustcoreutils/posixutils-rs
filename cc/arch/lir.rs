@@ -130,6 +130,7 @@ impl FpSize {
             TypeKind::Float => FpSize::Single,
             TypeKind::Double => FpSize::Double,
             TypeKind::LongDouble => FpSize::Extended,
+            TypeKind::Float128 => FpSize::Quad,
             _ => FpSize::Double, // Non-FP types default to double
         }
     }
@@ -312,6 +313,9 @@ pub fn complex_sse_regs(types: &TypeTable, complex_typ: TypeId) -> usize {
     let base = types.complex_base(complex_typ);
     match types.kind(base) {
         TypeKind::LongDouble => 0,
+        // Two binary128 halves are 32 bytes, over the two-eightbyte limit that
+        // makes a value register-passable at all.
+        TypeKind::Float128 => 0,
         _ if types.size_bits(complex_typ) <= 64 => 1,
         _ => 2,
     }
@@ -350,6 +354,8 @@ pub fn complex_fp_info(types: &TypeTable, target: &Target, complex_typ: TypeId) 
         TypeKind::Float16 => (FpSize::Half, 2),
         TypeKind::Float => (FpSize::Single, 4),
         TypeKind::Double => (FpSize::Double, 8),
+        // binary128 is a whole vector register on every target that has it.
+        TypeKind::Float128 => (FpSize::Quad, 16),
         TypeKind::LongDouble => {
             // On macOS AArch64, long double == double
             if target.os == Os::MacOS && target.arch == Arch::Aarch64 {

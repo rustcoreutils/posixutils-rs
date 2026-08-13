@@ -2007,10 +2007,16 @@ impl<'a> Linearizer<'a> {
             self.emit(insn);
             result
         } else if src_is_float && dst_is_float {
-            // Float to float conversion (e.g., float to double)
+            // Float to float conversion (e.g., float to double).
+            //
+            // Two floating types need a conversion unless they are the same
+            // format; equal *width* does not mean equal format. x87 extended
+            // and IEEE binary128 are both 128 bits wide here, and comparing
+            // widths elided every `long double` <-> `__float128` cast, leaving
+            // one format's bytes to be read as the other's.
             let src_size = self.types.size_bits(src_type);
             let dst_size = self.types.size_bits(cast_type);
-            if src_size != dst_size {
+            if self.types.kind(src_type) != self.types.kind(cast_type) {
                 let result = self.alloc_reg_pseudo();
                 let mut insn = Instruction::new(Opcode::FCvtF)
                     .with_target(result)
@@ -2021,7 +2027,7 @@ impl<'a> Linearizer<'a> {
                 self.emit(insn);
                 result
             } else {
-                src // Same size, no conversion needed
+                src // Same format, no conversion needed
             }
         } else {
             // Integer to integer conversion

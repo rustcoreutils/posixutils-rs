@@ -13,7 +13,7 @@ use super::codegen::X86_64CodeGen;
 use super::lir::{GpOperand, MemAddr, ShiftCount, X86Inst};
 use super::regalloc::{Loc, Reg, XmmReg};
 use crate::arch::codegen::BswapSize;
-use crate::arch::lir::{CallTarget, CondCode, Directive, Label, OperandSize, Symbol};
+use crate::arch::lir::{CallTarget, CondCode, Directive, FpSize, Label, OperandSize, Symbol};
 use crate::ir::Instruction;
 use crate::types::TypeTable;
 
@@ -1369,7 +1369,7 @@ impl X86_64CodeGen {
         };
 
         // Load argument into XMM0 (first FP argument register)
-        self.emit_fp_move(arg, XmmReg::Xmm0, 32);
+        self.emit_fp_move(arg, XmmReg::Xmm0, FpSize::Single);
 
         // Call fabsf from libc
         self.push_lir(X86Inst::Call {
@@ -1378,7 +1378,7 @@ impl X86_64CodeGen {
 
         // Result is in XMM0, store to target
         let dst_loc = self.get_location(target);
-        self.emit_fp_move_from_xmm(XmmReg::Xmm0, &dst_loc, 32);
+        self.emit_fp_move_from_xmm(XmmReg::Xmm0, &dst_loc, FpSize::Single);
     }
 
     /// Emit __builtin_fabs - absolute value of double
@@ -1393,7 +1393,7 @@ impl X86_64CodeGen {
         };
 
         // Load argument into XMM0 (first FP argument register)
-        self.emit_fp_move(arg, XmmReg::Xmm0, 64);
+        self.emit_fp_move(arg, XmmReg::Xmm0, FpSize::Double);
 
         // Call fabs from libc
         self.push_lir(X86Inst::Call {
@@ -1402,7 +1402,7 @@ impl X86_64CodeGen {
 
         // Result is in XMM0, store to target
         let dst_loc = self.get_location(target);
-        self.emit_fp_move_from_xmm(XmmReg::Xmm0, &dst_loc, 64);
+        self.emit_fp_move_from_xmm(XmmReg::Xmm0, &dst_loc, FpSize::Double);
     }
 
     /// Emit __builtin_signbitf - test sign bit of float
@@ -1417,7 +1417,7 @@ impl X86_64CodeGen {
         };
 
         // Load argument into XMM0 (first FP argument register)
-        self.emit_fp_move(arg, XmmReg::Xmm0, 32);
+        self.emit_fp_move(arg, XmmReg::Xmm0, FpSize::Single);
 
         // Call __signbitf from libc (C99: signbit is a macro that calls __signbitf)
         self.push_lir(X86Inst::Call {
@@ -1441,7 +1441,7 @@ impl X86_64CodeGen {
         };
 
         // Load argument into XMM0 (first FP argument register)
-        self.emit_fp_move(arg, XmmReg::Xmm0, 64);
+        self.emit_fp_move(arg, XmmReg::Xmm0, FpSize::Double);
 
         // Call signbit function from libc
         self.push_lir(X86Inst::Call {

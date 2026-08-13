@@ -1055,13 +1055,31 @@ impl EmitAsm for X86Inst {
 
             // Floating-Point
             X86Inst::MovFp { size, src, dst } => {
-                let _ = writeln!(
-                    out,
-                    "    mov{} {}, {}",
-                    size.x86_suffix(),
-                    src.format(target),
-                    dst.format(target)
-                );
+                // A binary128 occupies the whole register, so it moves as a
+                // packed 16-byte quantity rather than as a scalar: there is no
+                // `movsq`, which is what asking `x86_suffix()` for a suffix
+                // here used to trip over. `movaps` between registers;
+                // `movups` whenever memory is involved, because a 16-byte
+                // stack slot is not guaranteed to be 16-byte aligned.
+                if *size == FpSize::Quad {
+                    let both_regs = matches!((src, dst), (XmmOperand::Reg(_), XmmOperand::Reg(_)));
+                    let op = if both_regs { "movaps" } else { "movups" };
+                    let _ = writeln!(
+                        out,
+                        "    {} {}, {}",
+                        op,
+                        src.format(target),
+                        dst.format(target)
+                    );
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "    mov{} {}, {}",
+                        size.x86_suffix(),
+                        src.format(target),
+                        dst.format(target)
+                    );
+                }
             }
 
             X86Inst::MovGpXmm { size, src, dst } => {

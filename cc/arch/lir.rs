@@ -147,6 +147,21 @@ impl FpSize {
             .unwrap_or_else(|| Self::from_bits(size.max(32), target))
     }
 
+    /// Width in bits of a value of this format.
+    ///
+    /// `Extended` reports 80 — the significant width of x87's format, not the
+    /// 16 bytes it is stored in — because callers use this to choose between
+    /// register-sized moves.
+    pub fn bits(&self) -> u32 {
+        match self {
+            FpSize::Half => 16,
+            FpSize::Single => 32,
+            FpSize::Double => 64,
+            FpSize::Extended => 80,
+            FpSize::Quad => 128,
+        }
+    }
+
     /// x86-64 SSE instruction suffix (ss for single, sd for double)
     /// Note: Half uses runtime library calls, not direct SSE instructions.
     /// Note: Extended uses x87 instructions, not SSE - use x87_suffix() instead

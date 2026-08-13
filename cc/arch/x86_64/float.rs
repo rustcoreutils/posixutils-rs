@@ -23,6 +23,23 @@ impl X86_64CodeGen {
         typ.map(|t| types.size_bits(t)).unwrap_or(size).max(32)
     }
 
+    /// The register format for a floating-point operand, from its *type*.
+    ///
+    /// Width alone cannot answer this: x87 extended and IEEE binary128 are
+    /// both 128 bits here, and only the type says which. Deriving the format
+    /// from the width is what produced `movt`, an instruction that does not
+    /// exist.
+    /// A complex value is moved as one unit rather than as a scalar of its
+    /// base type, so its *width* is what picks the instruction; everything
+    /// else is decided by the type.
+    pub(super) fn fp_format(&self, typ: Option<TypeId>, size: u32, types: &TypeTable) -> FpSize {
+        let width = Self::size_from_type(typ, size, types);
+        if typ.is_some_and(|t| types.is_complex(t)) {
+            return FpSize::from_bits(width, &self.base.target);
+        }
+        FpSize::from_type_or_bits(typ, width, types, &self.base.target)
+    }
+
     /// Emit a floating-point load operation
     pub(super) fn emit_fp_load(&mut self, insn: &Instruction, types: &TypeTable) {
         let addr = match insn.src.first() {
@@ -141,7 +158,7 @@ impl X86_64CodeGen {
             self.emit_fp_move_from_xmm(
                 dst_xmm,
                 &dst_loc,
-                Self::size_from_type(insn.typ, insn.size, types),
+                self.fp_format(insn.typ, insn.size, types),
             );
         }
     }
@@ -177,7 +194,7 @@ impl X86_64CodeGen {
         self.emit_fp_move(
             value,
             XmmReg::Xmm15,
-            Self::size_from_type(insn.typ, insn.size, types),
+            self.fp_format(insn.typ, insn.size, types),
         );
 
         match addr_loc {
@@ -355,11 +372,7 @@ impl X86_64CodeGen {
         };
 
         // Move first operand to destination XMM register
-        self.emit_fp_move(
-            src1,
-            dst_xmm,
-            Self::size_from_type(insn.typ, insn.size, types),
-        );
+        self.emit_fp_move(src1, dst_xmm, self.fp_format(insn.typ, insn.size, types));
 
         // Apply operation with second operand
         match src2_loc {
@@ -403,11 +416,7 @@ impl X86_64CodeGen {
                 } else {
                     XmmReg::Xmm15
                 };
-                self.emit_fp_move(
-                    src2,
-                    scratch,
-                    Self::size_from_type(insn.typ, insn.size, types),
-                );
+                self.emit_fp_move(src2, scratch, self.fp_format(insn.typ, insn.size, types));
                 emit_fp_binop_lir(self, XmmOperand::Reg(scratch), dst_xmm);
             }
         }
@@ -417,7 +426,7 @@ impl X86_64CodeGen {
             self.emit_fp_move_from_xmm(
                 dst_xmm,
                 &dst_loc,
-                Self::size_from_type(insn.typ, insn.size, types),
+                self.fp_format(insn.typ, insn.size, types),
             );
         }
     }
@@ -445,11 +454,7 @@ impl X86_64CodeGen {
         let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types, &self.base.target);
 
         // Move source to destination
-        self.emit_fp_move(
-            src,
-            dst_xmm,
-            Self::size_from_type(insn.typ, insn.size, types),
-        );
+        self.emit_fp_move(src, dst_xmm, self.fp_format(insn.typ, insn.size, types));
 
         // XOR with sign bit mask to negate
         // For float: 0x80000000, for double: 0x8000000000000000
@@ -499,7 +504,7 @@ impl X86_64CodeGen {
             self.emit_fp_move_from_xmm(
                 dst_xmm,
                 &dst_loc,
-                Self::size_from_type(insn.typ, insn.size, types),
+                self.fp_format(insn.typ, insn.size, types),
             );
         }
     }
@@ -516,7 +521,7 @@ impl X86_64CodeGen {
         };
         // Use type-aware FP size determination
         let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types, &self.base.target);
-        let move_size = Self::size_from_type(insn.typ, insn.size, types);
+        let move_size = self.fp_format(insn.typ, insn.size, types);
 
         // Use Xmm15 as the work register for src1 (Xmm15/Xmm14 are
         // reserved scratch — not in the allocator palette). src2 cannot
@@ -553,7 +558,11 @@ impl X86_64CodeGen {
                 });
             }
             Loc::FImm(v, _) => {
-                self.emit_fp_imm_to_xmm(v, XmmReg::Xmm14, move_size);
+                if move_size == FpSize::Quad {
+                    self.emit_quad_const_to_xmm(v, XmmReg::Xmm14);
+                } else {
+                    self.emit_fp_imm_to_xmm(v, XmmReg::Xmm14, move_size.bits());
+                }
                 self.push_lir(X86Inst::UComiFp {
                     size: fp_size,
                     src: XmmOperand::Reg(XmmReg::Xmm14),
@@ -787,7 +796,7 @@ impl X86_64CodeGen {
             self.emit_fp_move_from_xmm(
                 dst_xmm,
                 &dst_loc,
-                Self::size_from_type(insn.typ, insn.size, types),
+                self.fp_format(insn.typ, insn.size, types),
             );
         }
     }
@@ -812,7 +821,7 @@ impl X86_64CodeGen {
         self.emit_fp_move(
             src,
             XmmReg::Xmm15,
-            Self::size_from_type(insn.src_typ, insn.src_size, types),
+            self.fp_format(insn.src_typ, insn.src_size, types),
         );
 
         let dst_loc = self.get_location(target);
@@ -874,7 +883,7 @@ impl X86_64CodeGen {
         self.emit_fp_move(
             src,
             src_xmm,
-            Self::size_from_type(insn.src_typ, insn.src_size, types),
+            self.fp_format(insn.src_typ, insn.src_size, types),
         );
 
         // Check types directly to determine conversion needed
@@ -918,13 +927,13 @@ impl X86_64CodeGen {
             self.emit_fp_move_from_xmm(
                 dst_xmm,
                 &dst_loc,
-                Self::size_from_type(insn.typ, insn.size, types),
+                self.fp_format(insn.typ, insn.size, types),
             );
         }
     }
 
     /// Load a floating-point constant into an XMM register
-    pub(super) fn emit_fp_const_load(&mut self, target: PseudoId, value: FloatVal, size: u32) {
+    pub(super) fn emit_fp_const_load(&mut self, target: PseudoId, value: FloatVal, size: FpSize) {
         let dst_loc = self.get_location(target);
         // Reserved scratch when target lives on the stack (see emit_fp_binop).
         let dst_xmm = match &dst_loc {
@@ -932,11 +941,44 @@ impl X86_64CodeGen {
             _ => XmmReg::Xmm15,
         };
 
-        self.emit_fp_imm_to_xmm(value, dst_xmm, size);
+        if size == FpSize::Quad {
+            self.emit_quad_const_to_xmm(value, dst_xmm);
+        } else {
+            self.emit_fp_imm_to_xmm(value, dst_xmm, size.bits());
+        }
 
         if !matches!(&dst_loc, Loc::Xmm(x) if *x == dst_xmm) {
             self.emit_fp_move_from_xmm(dst_xmm, &dst_loc, size);
         }
+    }
+
+    /// Load a binary128 constant from the `.rodata` pool.
+    ///
+    /// There is no immediate form and no general register wide enough, so the
+    /// value is interned and loaded. Narrowing it through `f64` first — which
+    /// is what the scalar immediate path does — lost 60 of its significand
+    /// bits.
+    pub(super) fn emit_quad_const_to_xmm(&mut self, value: FloatVal, xmm: XmmReg) {
+        let (lo, hi) = value.to_f128_bits();
+        let mut bytes = [0u8; 16];
+        bytes[..8].copy_from_slice(&lo.to_le_bytes());
+        bytes[8..].copy_from_slice(&hi.to_le_bytes());
+        // Keyed on the binary128 image, which is what is being pooled.
+        // `pool_key` is the *x87* encoding, and everything below x87's
+        // smallest subnormal collapses to zero there -- so `0x1p-16494q` and
+        // `0.0q` shared one entry, and whichever was interned last won.
+        let key = ((hi as u128) << 64) | lo as u128;
+        self.quad_constants.insert(key, bytes);
+        let label = format!(".Lquad_const_{}", key);
+        self.push_lir(X86Inst::MovFp {
+            size: FpSize::Quad,
+            src: XmmOperand::Mem(MemAddr::RipRelative(crate::arch::lir::Symbol {
+                name: label,
+                is_local: true,
+                is_extern: false,
+            })),
+            dst: XmmOperand::Reg(xmm),
+        });
     }
 
     /// Load a float immediate value into an XMM register
@@ -996,9 +1038,12 @@ impl X86_64CodeGen {
     }
 
     /// Move a value to an XMM register
-    pub(super) fn emit_fp_move(&mut self, src: PseudoId, dst: XmmReg, size: u32) {
+    pub(super) fn emit_fp_move(&mut self, src: PseudoId, dst: XmmReg, fp_size: FpSize) {
         let src_loc = self.get_location(src);
-        let fp_size = FpSize::from_bits(size, &self.base.target);
+        // The format is decided by the caller, from the *type*. Width alone
+        // cannot tell x87 extended from binary128 here: this compiler sizes
+        // both at 128 bits, and asking `from_bits` produced `movt`.
+        let size = fp_size.bits();
 
         match src_loc {
             Loc::Xmm(x) if x == dst => {
@@ -1033,9 +1078,16 @@ impl X86_64CodeGen {
                 });
             }
             Loc::FImm(v, imm_size) => {
-                // Use the size from the FImm, not the passed-in size
-                // This ensures float constants are loaded as float, not double
-                self.emit_fp_imm_to_xmm(v, dst, imm_size);
+                // A binary128 constant has no immediate form; it comes from
+                // the pool. The caller's format decides, since the FImm's own
+                // width cannot tell binary128 from x87 extended.
+                if fp_size == FpSize::Quad {
+                    self.emit_quad_const_to_xmm(v, dst);
+                } else {
+                    // Use the size from the FImm, not the passed-in size
+                    // This ensures float constants are loaded as float, not double
+                    self.emit_fp_imm_to_xmm(v, dst, imm_size);
+                }
             }
             Loc::Reg(r) => {
                 // Move from GP register to XMM (unusual but possible)
@@ -1100,9 +1152,7 @@ impl X86_64CodeGen {
     }
 
     /// Move from XMM register to a location
-    pub(super) fn emit_fp_move_from_xmm(&mut self, src: XmmReg, dst: &Loc, size: u32) {
-        let fp_size = FpSize::from_bits(size, &self.base.target);
-
+    pub(super) fn emit_fp_move_from_xmm(&mut self, src: XmmReg, dst: &Loc, fp_size: FpSize) {
         match dst {
             Loc::Xmm(x) if *x == src => {
                 // Already in destination

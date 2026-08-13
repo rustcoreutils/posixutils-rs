@@ -198,6 +198,10 @@ impl X86_64CodeGen {
                 } else {
                     64
                 };
+                // The *type* decides the register format: x87 extended and
+                // binary128 are both 128 bits wide here, and only the type
+                // tells them apart.
+                let fp_fmt = self.fp_format(arg_type, fp_size, types);
                 let is_longdouble = arg_type.is_some_and(|t| types.kind(t) == TypeKind::LongDouble);
 
                 // Long double uses x87, needs 16 bytes on stack
@@ -221,21 +225,25 @@ impl X86_64CodeGen {
                     continue;
                 }
 
-                self.emit_fp_move(arg, XmmReg::Xmm15, fp_size);
+                // A binary128 is two eightbytes, and it moves as one 16-byte
+                // quantity: reserving eight and storing it as a scalar wrote
+                // half the value under an instruction that does not exist.
+                let slots = if fp_fmt == FpSize::Quad { 2 } else { 1 };
+                self.emit_fp_move(arg, XmmReg::Xmm15, fp_fmt);
                 self.push_lir(X86Inst::Sub {
                     size: OperandSize::B64,
-                    src: GpOperand::Imm(8),
+                    src: GpOperand::Imm(8 * slots as i64),
                     dst: Reg::Rsp,
                 });
-                let fp_lir_size = FpSize::from_bits(fp_size, &self.base.target);
                 self.push_lir(X86Inst::MovFp {
-                    size: fp_lir_size,
+                    size: fp_fmt,
                     src: XmmOperand::Reg(XmmReg::Xmm15),
                     dst: XmmOperand::Mem(MemAddr::BaseOffset {
                         base: Reg::Rsp,
                         offset: 0,
                     }),
                 });
+                stack_args += slots - 1;
             } else {
                 // Check if this is an __int128 arg (needs 16 bytes = 2 stack slots)
                 let is_int128 = arg_type.is_some_and(|t| types.kind(t) == TypeKind::Int128);
@@ -423,13 +431,17 @@ impl X86_64CodeGen {
                 } else {
                     64
                 };
+                // The *type* decides the register format: x87 extended and
+                // binary128 are both 128 bits wide here, and only the type
+                // tells them apart.
+                let fp_fmt = self.fp_format(arg_type, fp_size, types);
                 // Long double uses x87 and is passed on stack, not in XMM registers
                 // Skip it here - it's handled by push_stack_args
                 let is_longdouble = arg_type.is_some_and(|t| types.kind(t) == TypeKind::LongDouble);
                 if is_longdouble {
                     continue;
                 }
-                self.emit_fp_move(arg, fp_arg_regs[fp_arg_idx], fp_size);
+                self.emit_fp_move(arg, fp_arg_regs[fp_arg_idx], fp_fmt);
                 fp_arg_idx += 1;
             } else if arg_type.is_some_and(|t| {
                 let k = types.kind(t);
@@ -678,6 +690,7 @@ impl X86_64CodeGen {
             .typ
             .map(|t| types.size_bits(t).max(32))
             .unwrap_or(insn.size.max(32));
+        let ret_fmt = self.fp_format(insn.typ, ret_size, types);
 
         let abi_info = insn
             .abi_info
@@ -714,7 +727,7 @@ impl X86_64CodeGen {
                 }
                 // Check for single SSE return
                 if classes.first() == Some(&RegClass::Sse) {
-                    self.emit_fp_move_from_xmm(XmmReg::Xmm0, &dst_loc, ret_size);
+                    self.emit_fp_move_from_xmm(XmmReg::Xmm0, &dst_loc, ret_fmt);
                     return;
                 }
                 // Integer return
@@ -745,7 +758,11 @@ impl X86_64CodeGen {
                         unreachable!("binary128 HFA is an AAPCS64 classification")
                     }
                 };
-                self.emit_fp_move_from_xmm(XmmReg::Xmm0, &dst_loc, size_bits);
+                self.emit_fp_move_from_xmm(
+                    XmmReg::Xmm0,
+                    &dst_loc,
+                    FpSize::from_bits(size_bits, &self.base.target),
+                );
             }
             ArgClass::Extend { .. } => {
                 // Extended return value in RAX

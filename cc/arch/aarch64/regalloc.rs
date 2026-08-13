@@ -1158,7 +1158,7 @@ impl RegAlloc {
             match &arg.class {
                 // Float / double / Float16 / long double — single V register
                 // (or stack slot when V0–V7 are exhausted).
-                ArgClass::Direct { classes, .. }
+                ArgClass::Direct { classes, size_bits }
                     if classes.len() == 1 && classes[0] == RegClass::Sse =>
                 {
                     if fp_arg_idx < fp_arg_regs.len() {
@@ -1169,7 +1169,11 @@ impl RegAlloc {
                     } else {
                         self.locations.insert(pseudo, Loc::Stack(stack_arg_offset));
                         self.fp_pseudos.insert(pseudo);
-                        stack_arg_offset += 8;
+                        // A binary128 argument occupies two eightbytes on the
+                        // stack. Advancing by one put the next argument's slot
+                        // inside this one's upper half -- the caller stores
+                        // sixteen bytes, so they must be read back that way.
+                        stack_arg_offset += ((*size_bits / 8) as i32 + 7) & !7;
                     }
                     fp_arg_idx += 1;
                 }

@@ -3715,6 +3715,23 @@ impl<'a> Linearizer<'a> {
         then_expr: &Expr,
         else_expr: &Expr,
     ) -> PseudoId {
+        // A constant condition selects one arm outright, and the other is
+        // never evaluated (C17 6.5.15p4). Emitting it anyway is not merely
+        // wasteful: glibc's `isinf` is
+        //
+        //     __builtin_types_compatible_p(__typeof(x), _Float128)
+        //         ? __isinff128(x) : __builtin_isinf_sign(x)
+        //
+        // and emitting the untaken call left an undefined reference to
+        // `__isinff128` in every object that used `isinf` on a double.
+        if let Some(cond_val) = self.eval_const_expr(cond) {
+            let taken = if cond_val != 0 { then_expr } else { else_expr };
+            let value = self.linearize_expr(taken);
+            let taken_typ = self.expr_type(taken);
+            let result_typ = self.expr_type(expr);
+            return self.emit_convert(value, taken_typ, result_typ);
+        }
+
         let result_typ = self.expr_type(expr);
         let size = if self.types.kind(result_typ) == TypeKind::Function {
             64

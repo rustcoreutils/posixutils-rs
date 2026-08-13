@@ -707,3 +707,124 @@ fn cross_abi_init_array_sections() {
         );
     }
 }
+
+/// `__float128` is soft-float on both targets, and does not disturb the
+/// hardware path `long double` takes on either.
+///
+/// Neither target has binary128 arithmetic in hardware, so every operation is
+/// a libgcc `__*tf*` call. What differs is what sits beside it: on x86-64
+/// `long double` is x87 and must still reach `fldt`/`faddp`, and on aarch64
+/// `long double` *is* binary128 and shares the same calls.
+#[test]
+fn cross_abi_float128_is_soft_float_everywhere() {
+    let src = "
+        __float128 qadd(__float128 a, __float128 b) { return a + b; }
+        int qlt(__float128 a, __float128 b) { return a < b; }
+        double qtod(__float128 a) { return (double)a; }
+        long double ldadd(long double a, long double b) { return a + b; }
+    ";
+
+    for triple in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+        let asm = asm_for("float128_soft", triple, src);
+        for expected in ["__addtf3", "__lttf2", "__trunctfdf2"] {
+            assert!(
+                asm.contains(expected),
+                "{triple}: binary128 must go through {expected}:\n{asm}"
+            );
+        }
+    }
+
+    // x86-64: `long double` is x87 and must not have been dragged into the
+    // soft-float path, and a 16-byte value moves as a packed quantity — there
+    // is no scalar 16-byte move, which is what `movt` used to be.
+    let asm = asm_for("float128_x86", "x86_64-unknown-linux-gnu", src);
+    assert!(
+        asm.contains("faddp") || asm.contains("fadd"),
+        "x86-64 long double must stay on the x87 unit:\n{asm}"
+    );
+    assert!(
+        !asm.contains("movt"),
+        "`movt` is not an instruction:\n{asm}"
+    );
+    assert!(
+        asm.contains("movups") || asm.contains("movaps"),
+        "a binary128 moves 16 bytes at a time:\n{asm}"
+    );
+
+    // aarch64: `long double` is binary128 there, so it shares the calls and
+    // there is no x87 anything.
+    let asm = asm_for("float128_arm", "aarch64-unknown-linux-gnu", src);
+    assert!(
+        !asm.contains("fldt") && !asm.contains("movt"),
+        "aarch64 has no x87:\n{asm}"
+    );
+}
+
+/// A `__float128` that does not fit in a register is passed as two eightbytes.
+///
+/// The register cases were what the first pass tested, and they hid two
+/// defects: the stack store used a scalar move (`movt`, which is not an
+/// instruction) and reserved half the space, and on aarch64 it stored eight
+/// bytes at an eight-byte stride so the next argument landed inside the
+/// previous one.
+#[test]
+fn cross_abi_float128_stack_arguments_are_sixteen_bytes() {
+    let src = "
+        __float128 f(__float128 a, __float128 b, __float128 c, __float128 d,
+                     __float128 e, __float128 g, __float128 h, __float128 i,
+                     __float128 j, __float128 k);
+        __float128 call(void) {
+            return f(1.0q, 2.0q, 3.0q, 4.0q, 5.0q, 6.0q, 7.0q, 8.0q, 9.0q, 10.0q);
+        }
+    ";
+
+    let asm = asm_for("f128_stack_x86", "x86_64-unknown-linux-gnu", src);
+    assert!(
+        !asm.contains("movt"),
+        "`movt` is not an instruction:\n{asm}"
+    );
+    assert!(
+        asm.contains("subq $16, %rsp"),
+        "a stack-passed binary128 needs two eightbytes:\n{asm}"
+    );
+
+    let asm = asm_for("f128_stack_arm", "aarch64-unknown-linux-gnu", src);
+    assert!(
+        asm.contains("str q"),
+        "aarch64 must store all 16 bytes of a stack argument:\n{asm}"
+    );
+    assert!(
+        !asm.contains("str d16, [sp, #8]"),
+        "an eight-byte stride overlaps the previous argument:\n{asm}"
+    );
+}
+
+/// `long double` and `__float128` convert through libgcc on x86-64.
+///
+/// They are different formats of the same width there, so the conversion was
+/// elided by a width comparison and each format's bytes were read as the
+/// other's.
+#[test]
+fn cross_abi_long_double_to_float128_is_a_real_conversion() {
+    let src = "
+        __float128 up(long double x) { return (__float128)x; }
+        long double dn(__float128 x) { return (long double)x; }
+    ";
+
+    let asm = asm_for("f128_ld_conv", "x86_64-unknown-linux-gnu", src);
+    assert!(
+        asm.contains("__extendxftf2"),
+        "x87 -> binary128 must call __extendxftf2:\n{asm}"
+    );
+    assert!(
+        asm.contains("__trunctfxf2"),
+        "binary128 -> x87 must call __trunctfxf2:\n{asm}"
+    );
+
+    // On aarch64 the two *are* the same format, so there is nothing to call.
+    let asm = asm_for("f128_ld_conv_arm", "aarch64-unknown-linux-gnu", src);
+    assert!(
+        !asm.contains("__extendxftf2") && !asm.contains("__trunctfxf2"),
+        "aarch64 long double is already binary128:\n{asm}"
+    );
+}

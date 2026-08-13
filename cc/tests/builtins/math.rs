@@ -231,3 +231,54 @@ int main(void)
 "#;
     assert_eq!(compile_and_run("builtins_fp_classify", code, &[]), 0);
 }
+
+/// `isnan(x)` answers 1, not 65535.
+///
+/// glibc's `<math.h>` only uses `__builtin_isnan` once the compiler claims
+/// GCC 4.4; below that it takes a `sizeof` ternary that calls `__isnanl`,
+/// which returns raw class bits. Both conform — C99 7.12.3.4 asks only for "a
+/// nonzero value" — but `isnan(x) == 1` is what real code writes, and it is
+/// what gcc gives. Reaching that path also required `__float128`, since
+/// `bits/floatn.h` turns on `__HAVE_FLOAT128` one threshold *below* it.
+///
+/// This is audit finding #C7.
+#[test]
+fn builtins_isnan_answers_one_at_every_width() {
+    let code = r#"
+#include <math.h>
+
+static volatile double dz = 0.0;
+
+int main(void)
+{
+    double dn = dz / dz;
+    float fn = (float)dn;
+    long double ln = (long double)dn;
+
+    /* Exactly 1, not merely nonzero. */
+    if (isnan(dn) != 1) return 1;
+    if (isnan(fn) != 1) return 2;
+    if (isnan(ln) != 1) return 3;
+
+    /* And still 0 for a number. */
+    if (isnan(1.0) != 0) return 4;
+    if (isnan(1.0f) != 0) return 5;
+    if (isnan(1.0L) != 0) return 6;
+
+    /* `__builtin_isinf_sign`, which glibc's `isinf` uses once __float128 is
+       on: the sign of the infinity, or zero. */
+    double inf = 1.0 / dz;
+    if (__builtin_isinf_sign(inf) != 1) return 7;
+    if (__builtin_isinf_sign(-inf) != -1) return 8;
+    if (__builtin_isinf_sign(1.0) != 0) return 9;
+    if (__builtin_isinf_sign(dn) != 0) return 10;
+
+    /* The classification macros still agree with themselves. */
+    if (!isinf(inf) || isinf(1.0)) return 11;
+    if (!isfinite(1.0) || isfinite(inf)) return 12;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("builtins_isnan_is_one", code, &[]), 0);
+}

@@ -2308,6 +2308,25 @@ impl Parser<'_> {
                     self.advance();
                     base_kind = Some(TypeKind::Double);
                 }
+                crate::kw::FLOAT128 | crate::kw::FLOAT128_ALIAS => {
+                    // IEEE binary128. `_Float128` is the C23/TS 18661-3
+                    // spelling and `__float128` the GCC one; on a target whose
+                    // long double is already binary128 glibc typedefs the
+                    // former to `long double`, so it takes the same
+                    // yield-to-the-declarator rule as the other aliases.
+                    if tally.alias_is_declarator_name() {
+                        break;
+                    }
+                    if !self.types.has_float128() {
+                        return Err(ParseError::new(
+                            "__float128 is not supported on this target",
+                            self.current_pos(),
+                        ));
+                    }
+                    tally.note_data_type("__float128", self.current_pos());
+                    self.advance();
+                    base_kind = Some(TypeKind::Float128);
+                }
                 crate::kw::BOOL => {
                     tally.note_data_type("_Bool", self.current_pos());
                     self.advance();

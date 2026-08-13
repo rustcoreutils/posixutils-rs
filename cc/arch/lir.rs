@@ -118,6 +118,23 @@ impl FpSize {
         }
     }
 
+    /// The move width for an aggregate carried in a single SSE register.
+    ///
+    /// An aggregate's *type* cannot answer this -- `from_type_kind` sees a
+    /// struct and falls back to `Double` -- so the ABI class's size decides.
+    /// Unlike [`FpSize::from_bits`], sixteen bytes here means `Quad` on every
+    /// architecture: a single SSE register holding sixteen bytes is SSE+SSEUP,
+    /// and x87's `Extended`, which `from_bits` picks on x86-64, is MEMORY
+    /// class and never travels in a register at all.
+    pub fn for_sse_aggregate(size_bits: u32) -> Self {
+        match size_bits {
+            0..=16 => FpSize::Half,
+            17..=32 => FpSize::Single,
+            33..=64 => FpSize::Double,
+            _ => FpSize::Quad,
+        }
+    }
+
     /// Create from TypeKind. This is the preferred way to determine FP size
     /// when type information is available, rather than inferring from bit size.
     ///
@@ -130,6 +147,7 @@ impl FpSize {
             TypeKind::Float => FpSize::Single,
             TypeKind::Double => FpSize::Double,
             TypeKind::LongDouble => FpSize::Extended,
+            TypeKind::Float128 => FpSize::Quad,
             _ => FpSize::Double, // Non-FP types default to double
         }
     }
@@ -144,6 +162,21 @@ impl FpSize {
     ) -> Self {
         typ.map(|t| Self::from_type_kind(types.kind(t)))
             .unwrap_or_else(|| Self::from_bits(size.max(32), target))
+    }
+
+    /// Width in bits of a value of this format.
+    ///
+    /// `Extended` reports 80 — the significant width of x87's format, not the
+    /// 16 bytes it is stored in — because callers use this to choose between
+    /// register-sized moves.
+    pub fn bits(&self) -> u32 {
+        match self {
+            FpSize::Half => 16,
+            FpSize::Single => 32,
+            FpSize::Double => 64,
+            FpSize::Extended => 80,
+            FpSize::Quad => 128,
+        }
     }
 
     /// x86-64 SSE instruction suffix (ss for single, sd for double)
@@ -312,6 +345,9 @@ pub fn complex_sse_regs(types: &TypeTable, complex_typ: TypeId) -> usize {
     let base = types.complex_base(complex_typ);
     match types.kind(base) {
         TypeKind::LongDouble => 0,
+        // Two binary128 halves are 32 bytes, over the two-eightbyte limit that
+        // makes a value register-passable at all.
+        TypeKind::Float128 => 0,
         _ if types.size_bits(complex_typ) <= 64 => 1,
         _ => 2,
     }
@@ -320,15 +356,21 @@ pub fn complex_sse_regs(types: &TypeTable, complex_typ: TypeId) -> usize {
 /// Bytes this type occupies when it is passed in memory (MEMORY class), or
 /// `None` when it is passed in registers.
 ///
-/// Two kinds qualify: an aggregate too large for the register pair, and
+/// Two kinds qualify: an aggregate the ABI classifies MEMORY, and
 /// `long double _Complex`, which System V classifies COMPLEX_X87. Both are
 /// copied onto the stack by value, so they share one code path — the callers
 /// used to spell this as `kind == Struct || kind == Union`, which quietly
 /// excluded the complex case and sent it down the SSE path instead.
+///
+/// The aggregate half asks the classifier rather than testing the size: an
+/// aggregate of two eightbytes or fewer is MEMORY too when one of them holds a
+/// `long double`, and a size test cannot see that.
+///
+/// Only the x86-64 backend calls this, which is why it may ask System V
+/// directly.
 pub fn memory_class_bytes(types: &TypeTable, typ: TypeId) -> Option<usize> {
-    let kind = types.kind(typ);
     let bits = types.size_bits(typ);
-    if (kind == TypeKind::Struct || kind == TypeKind::Union) && bits > 128 {
+    if crate::abi::param_is_memory_class(typ, types) {
         return Some((bits / 8) as usize);
     }
     if types.is_complex(typ) && complex_sse_regs(types, typ) == 0 {
@@ -350,6 +392,8 @@ pub fn complex_fp_info(types: &TypeTable, target: &Target, complex_typ: TypeId) 
         TypeKind::Float16 => (FpSize::Half, 2),
         TypeKind::Float => (FpSize::Single, 4),
         TypeKind::Double => (FpSize::Double, 8),
+        // binary128 is a whole vector register on every target that has it.
+        TypeKind::Float128 => (FpSize::Quad, 16),
         TypeKind::LongDouble => {
             // On macOS AArch64, long double == double
             if target.os == Os::MacOS && target.arch == Arch::Aarch64 {

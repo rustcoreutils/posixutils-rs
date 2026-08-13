@@ -535,6 +535,9 @@ impl<'a> Linearizer<'a> {
         if left_float || right_float {
             // At least one operand is floating point
             // Use the wider floating point type
+            if left_kind == TypeKind::Float128 || right_kind == TypeKind::Float128 {
+                return self.types.float128_id;
+            }
             if left_kind == TypeKind::LongDouble || right_kind == TypeKind::LongDouble {
                 return self.types.longdouble_id;
             }
@@ -791,8 +794,28 @@ impl<'a> Linearizer<'a> {
     /// very library calls the arithmetic depends on.
     fn returns_via_hidden_pointer(&self, typ: TypeId) -> bool {
         let kind = self.types.kind(typ);
-        (kind == TypeKind::Struct || kind == TypeKind::Union)
-            && self.types.size_bits(typ) > self.target.max_aggregate_register_bits
+        if kind != TypeKind::Struct && kind != TypeKind::Union {
+            // Scalars and `_Complex` never do, which is what keeps the
+            // `long double _Complex` guarantee above local and testable.
+            return false;
+        }
+        if self.types.size_bits(typ) > self.target.max_aggregate_register_bits {
+            // Every aggregate over two eightbytes, exactly as before. Keeping
+            // the size rule is what preserves the aarch64 decisions: an HFA
+            // larger than sixteen bytes classifies `Hfa`, never `Indirect`,
+            // so a purely classifier-driven test would stop returning it
+            // indirectly and nothing implements a three-register HFA return.
+            return true;
+        }
+        // Two eightbytes or fewer: only the classifier knows. An aggregate
+        // this small can still be MEMORY class -- `union { long double v;
+        // double d; }` merges X87 with SSE, which is MEMORY, and gcc returns
+        // it through a hidden pointer.
+        let abi = get_abi_for_conv(self.current_calling_conv, self.target);
+        matches!(
+            abi.classify_return(typ, self.types),
+            crate::abi::ArgClass::Indirect { .. }
+        )
     }
 
     pub(crate) fn linearize_function(&mut self, func: &FunctionDef) {
@@ -903,9 +926,17 @@ impl<'a> Linearizer<'a> {
             self.two_reg_return_type = Some(func.return_type);
         }
 
-        // A complex `Ret` carries an address; a call's result slot holds the
+        // A `Ret` that carries an address; a call's result slot holds the
         // value. The inliner has to know not to splice across that boundary.
-        ir_func.returns_complex = self.types.is_complex(func.return_type);
+        // An aggregate returned in st(0) has exactly the same shape as a
+        // complex one, and missing it is a miscompile visible only at -O.
+        let returns_x87_aggregate = returns_two_reg_struct
+            && matches!(
+                get_abi_for_conv(self.current_calling_conv, self.target)
+                    .classify_return(func.return_type, self.types),
+                crate::abi::ArgClass::X87 { .. } | crate::abi::ArgClass::Hfa { count: 1, .. }
+            );
+        ir_func.ret_is_address = self.types.is_complex(func.return_type) || returns_x87_aggregate;
 
         // Add parameters
         // For struct/union parameters, we need to copy them to local storage
@@ -952,10 +983,12 @@ impl<'a> Linearizer<'a> {
                 let is_two_fp_regs = size > 64 && size <= 128 && {
                     let abi = get_abi_for_conv(self.current_calling_conv, self.target);
                     let class = abi.classify_param(param.typ, self.types);
+                    // Any all-SSE aggregate, whether that is two registers of
+                    // eight bytes or one of sixteen.
                     matches!(
                         class,
                         crate::abi::ArgClass::Direct { ref classes, .. }
-                            if classes.len() == 2
+                            if !classes.is_empty()
                                 && classes.iter().all(|c| *c == crate::abi::RegClass::Sse)
                     ) || matches!(class, crate::abi::ArgClass::Hfa { count: 2, .. })
                 };
@@ -1063,10 +1096,23 @@ impl<'a> Linearizer<'a> {
 
             let typ_size = self.types.size_bits(typ);
             let is_aarch64 = self.target.arch == crate::target::Arch::Aarch64;
-            if typ_size > 128 && !is_aarch64 {
-                // x86-64: Large struct (> 16 bytes) passed by value on the stack.
-                // arg_pseudo is an IncomingArg pointing to the struct data on the stack.
-                // Use SymAddr to get the base address, then copy each 8-byte chunk.
+            // MEMORY class: the caller left the bytes in the incoming argument
+            // area, so `arg_pseudo` names storage rather than pointing at it.
+            // Over sixteen bytes that is every aggregate; at or below, only one
+            // whose eightbyte holds a `long double`. On aarch64 every struct
+            // parameter still arrives as a pointer, so the deref path below is
+            // the right one there.
+            // Exactly the test the caller uses when it decides to push the
+            // bytes, so the two cannot drift: `long double _Complex` is
+            // COMPLEX_X87 and travels in memory too, and asking only about
+            // struct kinds sent it down the pointer path the caller had not
+            // taken.
+            let arrived_by_value =
+                !is_aarch64 && crate::arch::lir::memory_class_bytes(self.types, typ).is_some();
+            if arrived_by_value {
+                // Passed by value on the stack. `arg_pseudo` is an IncomingArg
+                // naming the struct data; take its address, then copy each
+                // 8-byte chunk.
                 let ptr_type = self.types.pointer_to(typ);
                 let addr_pseudo = self.alloc_reg_pseudo();
                 self.emit(Instruction::sym_addr(addr_pseudo, arg_pseudo, ptr_type));
@@ -1328,6 +1374,36 @@ impl<'a> Linearizer<'a> {
     pub(crate) fn emit_two_reg_return(&mut self, e: &Expr, ret_type: TypeId) {
         let src_addr = self.linearize_lvalue(e);
         let struct_size = self.types.size_bits(ret_type);
+        let abi = get_abi_for_conv(self.current_calling_conv, self.target);
+        let ret_class = abi.classify_return(ret_type, self.types);
+
+        // An aggregate that is nothing but a `long double` comes back in
+        // st(0), exactly as the bare scalar does, so the `Ret` carries the
+        // value's *address* and the backend loads it onto the FPU stack.
+        // Splitting it across RAX and RDX left the caller reading a slot
+        // nobody had written.
+        // A single SSE register carrying sixteen bytes -- an aggregate whose
+        // sole content is a `__float128` -- is the same shape: the register
+        // holds the whole value, so the `Ret` carries its address and the
+        // backend moves all sixteen bytes at once. Splitting it into two
+        // general registers handed the caller half a value in the wrong place.
+        let one_sse_reg = matches!(
+            ret_class,
+            crate::abi::ArgClass::Direct { ref classes, .. }
+                if classes.len() == 1 && classes[0] == crate::abi::RegClass::Sse
+        );
+        // A one-element HFA is the aarch64 spelling of the same thing: one V
+        // register holds the whole value. Splitting it into two general
+        // registers was survivable on its own -- the backend put the halves
+        // back together -- but the *inliner* then spliced a two-source `Ret`
+        // into a caller expecting one value, and the top half came out zero.
+        let one_hfa_reg = matches!(ret_class, crate::abi::ArgClass::Hfa { count: 1, .. });
+        if matches!(ret_class, crate::abi::ArgClass::X87 { .. }) || one_sse_reg || one_hfa_reg {
+            let mut ret_insn = Instruction::ret_typed(Some(src_addr), ret_type, struct_size);
+            ret_insn.abi_info = Some(Box::new(CallAbiInfo::new(vec![], ret_class)));
+            self.emit(ret_insn);
+            return;
+        }
 
         // Load first 8 bytes
         let low_temp = self.alloc_reg_pseudo();
@@ -1353,8 +1429,6 @@ impl<'a> Linearizer<'a> {
         // Emit return with both values and ABI info for two-register return
         let mut ret_insn = Instruction::ret_typed(Some(low_temp), ret_type, struct_size);
         ret_insn.src.push(high_temp);
-        let abi = get_abi_for_conv(self.current_calling_conv, self.target);
-        let ret_class = abi.classify_return(ret_type, self.types);
         ret_insn.abi_info = Some(Box::new(CallAbiInfo::new(vec![], ret_class)));
         self.emit(ret_insn);
     }
@@ -2004,10 +2078,16 @@ impl<'a> Linearizer<'a> {
             self.emit(insn);
             result
         } else if src_is_float && dst_is_float {
-            // Float to float conversion (e.g., float to double)
+            // Float to float conversion (e.g., float to double).
+            //
+            // Two floating types need a conversion unless they are the same
+            // format; equal *width* does not mean equal format. x87 extended
+            // and IEEE binary128 are both 128 bits wide here, and comparing
+            // widths elided every `long double` <-> `__float128` cast, leaving
+            // one format's bytes to be read as the other's.
             let src_size = self.types.size_bits(src_type);
             let dst_size = self.types.size_bits(cast_type);
-            if src_size != dst_size {
+            if self.types.kind(src_type) != self.types.kind(cast_type) {
                 let result = self.alloc_reg_pseudo();
                 let mut insn = Instruction::new(Opcode::FCvtF)
                     .with_target(result)
@@ -2018,7 +2098,7 @@ impl<'a> Linearizer<'a> {
                 self.emit(insn);
                 result
             } else {
-                src // Same size, no conversion needed
+                src // Same format, no conversion needed
             }
         } else {
             // Integer to integer conversion
@@ -2325,6 +2405,15 @@ impl<'a> Linearizer<'a> {
                 let b = self.emit_fcmp(Opcode::FCmpOEq, val, neg, typ, size);
                 self.emit_bool_combine(Opcode::Or, a, b)
             }
+            FpTest::IsInfSign => {
+                // +1 for +inf, -1 for -inf, 0 otherwise: the two equality
+                // tests are each 0 or 1, so their difference carries the sign.
+                let pos = self.emit_fconst(FloatVal::infinity(false), typ);
+                let neg = self.emit_fconst(FloatVal::infinity(true), typ);
+                let a = self.emit_fcmp(Opcode::FCmpOEq, val, pos, typ, size);
+                let b = self.emit_fcmp(Opcode::FCmpOEq, val, neg, typ, size);
+                self.emit_bool_combine(Opcode::Sub, a, b)
+            }
             FpTest::IsFinite => self.emit_is_finite(val, typ, size),
             FpTest::IsNormal => {
                 let finite = self.emit_is_finite(val, typ, size);
@@ -2628,7 +2717,7 @@ impl<'a> Linearizer<'a> {
             && !returns_large_struct;
         // `long double _Complex` comes back through the hidden pointer above,
         // not in registers.
-        let returns_complex = self.types.is_complex(typ) && !returns_large_struct;
+        let ret_is_address = self.types.is_complex(typ) && !returns_large_struct;
 
         let (result_sym, mut arg_vals, mut arg_types_vec) = if returns_large_struct {
             // Allocate local storage for the return value
@@ -2677,7 +2766,7 @@ impl<'a> Linearizer<'a> {
                 );
             }
             (local_sym, Vec::new(), Vec::new())
-        } else if returns_complex {
+        } else if ret_is_address {
             // Complex returns: allocate local storage for the result
             // Complex values are 16 bytes and need stack storage
             let local_sym = self.alloc_pseudo();
@@ -2762,11 +2851,18 @@ impl<'a> Linearizer<'a> {
                         matches!(
                             class,
                             crate::abi::ArgClass::Direct { ref classes, .. }
-                                if classes.len() == 2
+                                if !classes.is_empty()
                                     && classes.iter().all(|c| *c == crate::abi::RegClass::Sse)
                         ) || matches!(class, crate::abi::ArgClass::Hfa { count: 2, .. });
-                    if is_two_fp_regs {
-                        // All-SSE struct: keep struct type for 2-XMM passing
+                    // MEMORY class means the bytes go on the stack by value,
+                    // exactly as an over-sixteen-byte struct already does.
+                    // Reachable at this size only when an eightbyte holds a
+                    // `long double`, directly or merged with something else;
+                    // passing a pointer instead disagreed with gcc silently.
+                    let is_memory = matches!(class, crate::abi::ArgClass::Indirect { .. });
+                    if is_two_fp_regs || is_memory {
+                        // Keep the struct type: the ABI decides from it, and
+                        // the pseudo carries the address either way.
                         arg_types_vec.push(arg_type);
                     } else {
                         // Integer or mixed struct: pass as pointer (existing behavior)
@@ -3706,6 +3802,23 @@ impl<'a> Linearizer<'a> {
         then_expr: &Expr,
         else_expr: &Expr,
     ) -> PseudoId {
+        // A constant condition selects one arm outright, and the other is
+        // never evaluated (C17 6.5.15p4). Emitting it anyway is not merely
+        // wasteful: glibc's `isinf` is
+        //
+        //     __builtin_types_compatible_p(__typeof(x), _Float128)
+        //         ? __isinff128(x) : __builtin_isinf_sign(x)
+        //
+        // and emitting the untaken call left an undefined reference to
+        // `__isinff128` in every object that used `isinf` on a double.
+        if let Some(cond_val) = self.eval_const_expr(cond) {
+            let taken = if cond_val != 0 { then_expr } else { else_expr };
+            let value = self.linearize_expr(taken);
+            let taken_typ = self.expr_type(taken);
+            let result_typ = self.expr_type(expr);
+            return self.emit_convert(value, taken_typ, result_typ);
+        }
+
         let result_typ = self.expr_type(expr);
         let size = if self.types.kind(result_typ) == TypeKind::Function {
             64

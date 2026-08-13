@@ -21,7 +21,7 @@
 // everywhere.
 //
 
-use super::asm_probe::{asm_for, body_of};
+use super::asm_probe::{asm_for, body_of, AARCH64_LINUX, X86_64_LINUX};
 
 /// AAPCS64 passes a `_Complex` as a two-element HFA, so it occupies **two**
 /// V registers and the next floating-point parameter starts after both.
@@ -706,4 +706,353 @@ fn cross_abi_init_array_sections() {
             "{triple}: each destructor must be handed to atexit:\n{asm}"
         );
     }
+}
+
+/// `__float128` is soft-float on both targets, and does not disturb the
+/// hardware path `long double` takes on either.
+///
+/// Neither target has binary128 arithmetic in hardware, so every operation is
+/// a libgcc `__*tf*` call. What differs is what sits beside it: on x86-64
+/// `long double` is x87 and must still reach `fldt`/`faddp`, and on aarch64
+/// `long double` *is* binary128 and shares the same calls.
+#[test]
+fn cross_abi_float128_is_soft_float_everywhere() {
+    let src = "
+        __float128 qadd(__float128 a, __float128 b) { return a + b; }
+        int qlt(__float128 a, __float128 b) { return a < b; }
+        double qtod(__float128 a) { return (double)a; }
+        long double ldadd(long double a, long double b) { return a + b; }
+    ";
+
+    for triple in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+        let asm = asm_for("float128_soft", triple, src);
+        for expected in ["__addtf3", "__lttf2", "__trunctfdf2"] {
+            assert!(
+                asm.contains(expected),
+                "{triple}: binary128 must go through {expected}:\n{asm}"
+            );
+        }
+    }
+
+    // x86-64: `long double` is x87 and must not have been dragged into the
+    // soft-float path, and a 16-byte value moves as a packed quantity — there
+    // is no scalar 16-byte move, which is what `movt` used to be.
+    let asm = asm_for("float128_x86", "x86_64-unknown-linux-gnu", src);
+    assert!(
+        asm.contains("faddp") || asm.contains("fadd"),
+        "x86-64 long double must stay on the x87 unit:\n{asm}"
+    );
+    assert!(
+        !asm.contains("movt"),
+        "`movt` is not an instruction:\n{asm}"
+    );
+    assert!(
+        asm.contains("movups") || asm.contains("movaps"),
+        "a binary128 moves 16 bytes at a time:\n{asm}"
+    );
+
+    // aarch64: `long double` is binary128 there, so it shares the calls and
+    // there is no x87 anything.
+    let asm = asm_for("float128_arm", "aarch64-unknown-linux-gnu", src);
+    assert!(
+        !asm.contains("fldt") && !asm.contains("movt"),
+        "aarch64 has no x87:\n{asm}"
+    );
+}
+
+/// A `__float128` that does not fit in a register is passed as two eightbytes.
+///
+/// The register cases were what the first pass tested, and they hid two
+/// defects: the stack store used a scalar move (`movt`, which is not an
+/// instruction) and reserved half the space, and on aarch64 it stored eight
+/// bytes at an eight-byte stride so the next argument landed inside the
+/// previous one.
+#[test]
+fn cross_abi_float128_stack_arguments_are_sixteen_bytes() {
+    let src = "
+        __float128 f(__float128 a, __float128 b, __float128 c, __float128 d,
+                     __float128 e, __float128 g, __float128 h, __float128 i,
+                     __float128 j, __float128 k);
+        __float128 call(void) {
+            return f(1.0q, 2.0q, 3.0q, 4.0q, 5.0q, 6.0q, 7.0q, 8.0q, 9.0q, 10.0q);
+        }
+    ";
+
+    let asm = asm_for("f128_stack_x86", "x86_64-unknown-linux-gnu", src);
+    assert!(
+        !asm.contains("movt"),
+        "`movt` is not an instruction:\n{asm}"
+    );
+    assert!(
+        asm.contains("subq $16, %rsp"),
+        "a stack-passed binary128 needs two eightbytes:\n{asm}"
+    );
+
+    let asm = asm_for("f128_stack_arm", "aarch64-unknown-linux-gnu", src);
+    assert!(
+        asm.contains("str q"),
+        "aarch64 must store all 16 bytes of a stack argument:\n{asm}"
+    );
+    assert!(
+        !asm.contains("str d16, [sp, #8]"),
+        "an eight-byte stride overlaps the previous argument:\n{asm}"
+    );
+}
+
+/// `long double` and `__float128` convert through libgcc on x86-64.
+///
+/// They are different formats of the same width there, so the conversion was
+/// elided by a width comparison and each format's bytes were read as the
+/// other's.
+#[test]
+fn cross_abi_long_double_to_float128_is_a_real_conversion() {
+    let src = "
+        __float128 up(long double x) { return (__float128)x; }
+        long double dn(__float128 x) { return (long double)x; }
+    ";
+
+    let asm = asm_for("f128_ld_conv", "x86_64-unknown-linux-gnu", src);
+    assert!(
+        asm.contains("__extendxftf2"),
+        "x87 -> binary128 must call __extendxftf2:\n{asm}"
+    );
+    assert!(
+        asm.contains("__trunctfxf2"),
+        "binary128 -> x87 must call __trunctfxf2:\n{asm}"
+    );
+
+    // On aarch64 the two *are* the same format, so there is nothing to call.
+    let asm = asm_for("f128_ld_conv_arm", "aarch64-unknown-linux-gnu", src);
+    assert!(
+        !asm.contains("__extendxftf2") && !asm.contains("__trunctfxf2"),
+        "aarch64 long double is already binary128:\n{asm}"
+    );
+}
+
+/// A MEMORY-class aggregate is passed by value on the stack, not as a pointer.
+///
+/// System V classifies `struct R { long double v; }` MEMORY as an *argument*:
+/// gcc leaves sixteen bytes on the stack and the callee reads them with
+/// `fldt 8(%rsp)`. c17 decided by raw size, and 128 bits is not greater than
+/// 128, so it took the medium-struct path and passed a pointer in RDI. Both
+/// sides agreed within one translation unit, which is why running a program
+/// could never catch it -- and disagreed with every gcc-compiled peer.
+///
+/// The two shapes that reach MEMORY at this size are an aggregate whose sole
+/// content is a `long double`, and one that merges a `long double` with
+/// something else in an eightbyte.
+#[test]
+fn codegen_memory_class_struct_arrives_by_value() {
+    let src = r#"
+struct R { long double v; };
+union  M { long double v; double d; };
+struct P { double a, b; };
+struct I { long a, b; };
+
+long double take_r(struct R a) { return a.v; }
+long double take_m(union  M a) { return a.v; }
+double      take_p(struct P a) { return a.a + a.b; }
+long        take_i(struct I a) { return a.a + a.b; }
+"#;
+    let asm = asm_for("memory_class_arg", X86_64_LINUX, src);
+
+    for name in ["take_r", "take_m"] {
+        let body = body_of(&asm, name);
+        assert!(
+            body.contains("16(%rbp)"),
+            "{name} must read its argument from the incoming argument area:\n{body}"
+        );
+        assert!(
+            !body.contains("movq (%rdi)"),
+            "{name} must not dereference a pointer argument:\n{body}"
+        );
+    }
+
+    // Controls: an all-SSE pair still travels in XMM registers, and an
+    // integer pair still takes today's pointer path. Neither may move.
+    let p = body_of(&asm, "take_p");
+    assert!(
+        p.contains("%xmm0") && p.contains("%xmm1"),
+        "a two-double struct still arrives in two XMM registers:\n{p}"
+    );
+    let i = body_of(&asm, "take_i");
+    assert!(
+        i.contains("movq (%rdi)"),
+        "an integer pair still arrives as a pointer:\n{i}"
+    );
+}
+
+/// An aggregate that is nothing but a `__float128` travels in one XMM.
+///
+/// System V classifies binary128 SSE + SSEUP, and SSEUP never travels alone:
+/// the pair is a single register carrying all sixteen bytes, which is what a
+/// scalar `__float128` has always used. Counting eightbytes instead put the
+/// value in xmm0 *and* xmm1, so a gcc-compiled peer read only its low half.
+/// Merged with anything else it really is two registers, and that must not
+/// change -- gcc emits `movapd %xmm1, %xmm0` for the union below.
+#[test]
+fn codegen_lone_binary128_struct_uses_one_xmm() {
+    let src = r#"
+struct Q { __float128 v; };
+union  M { __float128 v; double d[2]; };
+struct P { double a, b; };
+
+__float128 take_q(struct Q a) { return a.v; }
+__float128 take_m(union  M a) { return a.v; }
+struct Q   mk_q(void) { struct Q r; r.v = 3.25q; return r; }
+double     take_p(struct P a) { return a.a + a.b; }
+"#;
+    let asm = asm_for("lone_binary128", X86_64_LINUX, src);
+
+    // `xmm15` is the reserved scratch and contains "xmm1" as a substring, so
+    // the negative assertions have to look for the register, not the text.
+    let uses_xmm1 = |body: &str| body.contains("%xmm1,") || body.contains("%xmm1)");
+
+    let q = body_of(&asm, "take_q");
+    assert!(
+        !uses_xmm1(q),
+        "a lone binary128 argument arrives in xmm0 alone:\n{q}"
+    );
+    let mk = body_of(&asm, "mk_q");
+    assert!(
+        !uses_xmm1(mk) && !mk.contains("%rdx"),
+        "a lone binary128 is returned in xmm0 alone, not split:\n{mk}"
+    );
+
+    // Controls: merged with two doubles it is genuinely two registers, and a
+    // two-double struct is unchanged.
+    let m = body_of(&asm, "take_m");
+    assert!(
+        uses_xmm1(m),
+        "a binary128 merged with two doubles is two registers:\n{m}"
+    );
+    let p = body_of(&asm, "take_p");
+    assert!(
+        p.contains("%xmm0") && uses_xmm1(p),
+        "a two-double struct still arrives in two XMM registers:\n{p}"
+    );
+}
+
+/// A one-element HFA is returned in V0, whatever its width.
+///
+/// AAPCS64 returns a struct holding a single `float`, `double` or `long double`
+/// exactly as it returns the bare scalar. c17 sent all of them out through a
+/// general register while the *caller* read the FP one, so the two sides
+/// disagreed inside a single program. The binary128 case was worse: the return
+/// path treated any HFA as a *pair* and tried to move sixteen bytes out of one
+/// X register, which killed the compiler with "a binary128 value does not fit
+/// one X register".
+///
+/// On aarch64 Linux `long double` is binary128, so `struct { long double v; }`
+/// is the one-element quad case.
+#[test]
+fn codegen_aarch64_one_element_hfa_returns_in_v0() {
+    let src = r#"
+struct F { float v; };
+struct D { double v; };
+struct L { long double v; };
+struct P { double a, b; };
+
+struct F mkf(void) { struct F r; r.v = 3.5f; return r; }
+struct D mkd(void) { struct D r; r.v = 4.5; return r; }
+struct L mkl(void) { struct L r; r.v = 3.25L; return r; }
+struct P mkp(void) { struct P r; r.a = 1.0; r.b = 2.0; return r; }
+"#;
+    let asm = asm_for("aarch64_hfa1_ret", AARCH64_LINUX, src);
+
+    // Each returns through V0, at its own width. A binary128 is assembled
+    // into the register's two lanes, so it is the lane insert that says the
+    // whole sixteen bytes got there.
+    // The value may pass through a general register on its way, so what
+    // matters is that it lands in V0 before the return.
+    for (name, marker) in [("mkf", "fmov s0,"), ("mkd", "fmov d0,"), ("mkl", "q0")] {
+        let body = body_of(&asm, name);
+        assert!(
+            body.contains(marker),
+            "{name} must leave its value in V0 (looking for `{marker}`):\n{body}"
+        );
+    }
+    // A two-element HFA still uses V0 and V1, which must not change.
+    let p = body_of(&asm, "mkp");
+    assert!(
+        p.contains("d0") && p.contains("d1"),
+        "a two-double HFA still returns in d0 and d1:\n{p}"
+    );
+}
+
+/// A spilled binary128 argument keeps all sixteen of its bytes.
+///
+/// An FP argument register that has to survive a call is stored to the frame in
+/// the prologue. That store was a fixed eight bytes and the slot a fixed eight
+/// wide, so on aarch64 Linux -- where `long double` is binary128 -- the top
+/// half of such an argument was dropped, and the slot overlapped whatever came
+/// after it. The first such parameter, stored on a different path, survived;
+/// the second came back truncated.
+#[test]
+fn codegen_aarch64_spilled_binary128_argument_is_whole() {
+    let src = r#"
+/* Comparing two binary128 values is a libgcc call, so both parameters have to
+   survive it and are spilled to the frame. */
+static int eql(const long double *v, long double re, long double im)
+{
+    return v[0] == re && v[1] == im;
+}
+int run(const long double *p) { return eql(p, 1.5L, 2.5L); }
+"#;
+    let asm = asm_for("aarch64_spill_q", AARCH64_LINUX, src);
+    let body = body_of(&asm, "eql");
+    assert!(
+        !body.contains("str d1,"),
+        "no half of a binary128 argument may be stored as a double:\n{body}"
+    );
+    assert!(
+        body.contains("str q1,"),
+        "the spilled binary128 argument is stored whole:\n{body}"
+    );
+}
+
+/// A union is an HFA of its largest member, not of all of them at once.
+///
+/// A union's members overlap, so `union { double v; double d; }` is eight
+/// bytes and one V register. The HFA walk summed member counts, making it a
+/// *two*-element HFA: the callee read sixteen bytes out of an eight-byte
+/// object, and the caller wrote sixteen back into an eight-byte slot -- over
+/// whatever followed it on the frame.
+///
+/// On Apple arm64 `long double` is `double`, so `union { long double v;
+/// double d; }` is exactly that shape, and returning one corrupted the
+/// caller's frame badly enough to kill the process. On aarch64 Linux the same
+/// union is sixteen bytes with two different bases, so it is not an HFA at all
+/// and never showed the fault.
+#[test]
+fn codegen_aarch64_union_hfa_counts_overlapping_members_once() {
+    let src = r#"
+union  U { double v; double d; };
+struct S { double a, b; };
+
+union  U mku(void) { union U r; r.v = 3.25; return r; }
+struct S mks(void) { struct S r; r.a = 1.0; r.b = 2.0; return r; }
+double   useu(void) { union U r = mku(); return r.v; }
+"#;
+    let asm = asm_for("aarch64_union_hfa", AARCH64_LINUX, src);
+
+    // `d17` contains "d1", so the register has to be matched, not the text.
+    let uses_d1 = |body: &str| body.contains("d1,") || body.contains("d1]");
+
+    let mk = body_of(&asm, "mku");
+    assert!(
+        !uses_d1(mk),
+        "an eight-byte union is one register, not two:\n{mk}"
+    );
+    let use_ = body_of(&asm, "useu");
+    assert!(
+        !use_.contains("str d1,"),
+        "the caller must not write past an eight-byte union's slot:\n{use_}"
+    );
+    // A struct of two doubles genuinely is two elements and must not change.
+    let st = body_of(&asm, "mks");
+    assert!(
+        st.contains("d0,") && uses_d1(st),
+        "a struct of two doubles is still a two-element HFA:\n{st}"
+    );
 }

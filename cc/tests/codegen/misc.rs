@@ -6867,3 +6867,209 @@ int main(void)
 "#;
     assert_eq!(compile_and_dlopen("tls_double", lib, main, &[]), 0);
 }
+
+/// An x87 conversion must not scribble on a live `long double` local.
+///
+/// `fild`/`fld` have no register form, so an immediate or a general register
+/// has to be staged through memory on its way into the FPU. That staging
+/// address was `-(callee_saved_offset + 8)(%rbp)`, which nothing had reserved:
+/// slot offsets start at zero, so it landed on the first local. For a
+/// `long double` first local it overwrote bytes 8 and 9 -- the sign and
+/// exponent -- turning `1.0L` into `2^-16382`, which prints as `0.0`.
+///
+/// The audit filed this as two `long double`-returning calls in one argument
+/// list outliving a temporary. It is neither: one conversion is enough, and no
+/// call is needed at all. Every expectation checked against gcc.
+#[test]
+fn codegen_x87_scratch_does_not_clobber_a_live_local() {
+    let code = r#"
+static long double add2(long double a, long double b) { return a + b; }
+
+int main(void)
+{
+    /* The audit's shape: a live long double, then calls whose arguments need
+       an int -> long double conversion. */
+    long double x = 1;
+    if (add2(1, 2) != 3.0L) return 1;
+    if (x != 1.0L) return 2;
+
+    long double y = 2;
+    if (add2(3, 4) != 7.0L) return 3;
+    if (x != 1.0L) return 4;
+    if (y != 2.0L) return 5;
+
+    /* No call at all: one int -> long double conversion is enough. */
+    long double z = 5;
+    int n = 9;
+    long double w = n;
+    if (w != 9.0L) return 6;
+    if (z != 5.0L) return 7;
+
+    /* Through a register rather than an immediate. */
+    long double u = 6;
+    volatile int m = 11;
+    long double v = m;
+    if (v != 11.0L) return 8;
+    if (u != 6.0L) return 9;
+
+    /* long double -> int, which stages through the same address. */
+    long double p = 7;
+    if ((int)3.75L != 3) return 10;
+    if (p != 7.0L) return 11;
+
+    /* An XMM <-> x87 transfer, likewise. */
+    long double r = 8;
+    double d = 2.5;
+    long double e = d;
+    if (e != 2.5L) return 12;
+    if (r != 8.0L) return 13;
+
+    return 0;
+}
+"#;
+    // Pinned to -O0. The staging path is only reached when the value being
+    // converted is an immediate or a general register; at -O the folder turns
+    // these into constants and the conversion disappears, so the default
+    // `-g -O` config cannot see the defect at all. A trailing flag wins, so
+    // this overrides the matrix.
+    assert_eq!(
+        compile_and_run("codegen_x87_scratch_no_clobber", code, &["-O0".to_string()]),
+        0
+    );
+    assert_eq!(
+        compile_and_run_optimized("codegen_x87_scratch_no_clobber_opt", code),
+        0
+    );
+}
+
+/// A struct holding `_Float16` is returned in an SSE register, not through a
+/// hidden pointer.
+///
+/// `_Float16` was missing from the ABI classifier's notion of a floating type,
+/// so an eightbyte holding one answered MEMORY. The caller then expected the
+/// callee to have written the value through a hidden pointer, the callee
+/// returned it in registers instead, and the result read back as zero -- with
+/// no diagnostic. Checked against gcc, which returns it in xmm0.
+#[test]
+fn codegen_float16_struct_returns_in_a_register() {
+    let code = r#"
+struct H  { _Float16 v; };
+struct H2 { _Float16 a, v; };
+struct F  { float v; };
+struct D  { double a, v; };
+
+__attribute__((noinline)) static struct H  mk(void)  { struct H r;  r.v = 2.5f16; return r; }
+__attribute__((noinline)) static struct H2 mk2(void) { struct H2 r; r.a = 1.5f16; r.v = 2.5f16; return r; }
+__attribute__((noinline)) static struct F  mkf(void) { struct F r;  r.v = 3.5f;   return r; }
+__attribute__((noinline)) static struct D  mkd(void) { struct D r;  r.a = 1.0; r.v = 4.5; return r; }
+
+__attribute__((noinline)) static _Float16 take(struct H a)  { return a.v; }
+__attribute__((noinline)) static _Float16 take2(struct H2 a) { return a.v; }
+__attribute__((noinline)) static _Float16 scalar(_Float16 a, _Float16 b) { return a + b; }
+
+int main(void)
+{
+    if ((float)mk().v != 2.5f) return 1;
+    if ((float)mk2().v != 2.5f) return 2;
+    if ((float)mk2().a != 1.5f) return 3;
+
+    struct H h = mk();
+    if ((float)take(h) != 2.5f) return 4;
+    struct H2 h2 = mk2();
+    if ((float)take2(h2) != 2.5f) return 5;
+
+    /* A scalar `_Float16` is an SSE argument too; it used to be counted as an
+       integer one, which only worked because the two sides kept separate
+       indices. */
+    if ((float)scalar(1.5f16, 2.5f16) != 4.0f) return 6;
+
+    /* Controls: the float and two-double shapes were already right. */
+    if (mkf().v != 3.5f) return 7;
+    if (mkd().v != 4.5) return 8;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_float16_struct_return", code, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run_optimized("codegen_float16_struct_return_opt", code),
+        0
+    );
+}
+
+/// An aggregate that is nothing but a `long double` is returned in st(0).
+///
+/// System V classifies its two eightbytes X87 and X87UP, and X87UP is preceded
+/// by X87, so the merge-to-MEMORY rule does not fire: gcc emits `fld1; ret` for
+/// `struct R { long double v; } f(void)`. c17 decided sret by raw size instead
+/// -- and 128 bits is not *greater* than 128 -- so it took the two-register
+/// path, returned RAX:RDX, and the caller read a slot nothing had written.
+/// The value came back as zero.
+///
+/// The moment anything shares an eightbyte the merge rules do apply, so
+/// `union { long double v; double d; }` is MEMORY and really is returned
+/// through a hidden pointer. Both halves are checked here, against gcc.
+#[test]
+fn codegen_long_double_aggregate_returns_in_st0() {
+    let code = r#"
+struct R  { long double v; };
+struct I  { long double v; };
+struct N  { struct I v; };
+struct A  { long double v[1]; };
+union  U  { long double v; };
+union  M  { long double v; double d; };   /* X87 merged with SSE -> MEMORY */
+struct W  { long double v; int tag; };    /* over two eightbytes -> MEMORY */
+
+__attribute__((noinline)) static struct R mk(void)  { struct R r; r.v = 3.25L; return r; }
+__attribute__((noinline)) static struct N mkn(void) { struct N r; r.v.v = 3.25L; return r; }
+__attribute__((noinline)) static struct A mka(void) { struct A r; r.v[0] = 3.25L; return r; }
+__attribute__((noinline)) static union  U mku(void) { union  U r; r.v = 3.25L; return r; }
+__attribute__((noinline)) static union  M mkm(void) { union  M r; r.v = 3.25L; return r; }
+__attribute__((noinline)) static struct W mkw(void) { struct W r; r.v = 3.25L; r.tag = 7; return r; }
+
+/* Small enough to tempt the inliner: its `Ret` carries an address, which must
+   not be spliced into a caller expecting a value. */
+static struct R mk_inlinable(void) { struct R r; r.v = 6.5L; return r; }
+
+int main(void)
+{
+    if (mk().v  != 3.25L) return 1;
+    if (mkn().v.v != 3.25L) return 2;
+    /* Through a local: indexing an array member of a call-result rvalue is a
+       separate, pre-existing defect that has nothing to do with the return
+       class -- it fails for `struct { int v[2]; }` too. */
+    struct A arr = mka();
+    if (arr.v[0] != 3.25L) return 3;
+    if (mku().v != 3.25L) return 4;
+    if (mkm().v != 3.25L) return 5;
+    if (mkw().v != 3.25L || mkw().tag != 7) return 6;
+
+    /* Assigned through a local, and used twice in one expression. */
+    struct R a = mk();
+    if (a.v != 3.25L) return 7;
+    if (mk().v + mk().v != 6.5L) return 8;
+
+    /* The inlinable one, twice, so a spliced body would be caught. */
+    if (mk_inlinable().v != 6.5L) return 9;
+    struct R b = mk_inlinable();
+    if (b.v != 6.5L) return 10;
+    if (mk_inlinable().v + mk_inlinable().v != 13.0L) return 11;
+
+    /* A long double local must survive all of it. */
+    long double keep = 1.5L;
+    if (mk().v != 3.25L) return 12;
+    if (keep != 1.5L) return 13;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("codegen_ld_aggregate_return", code, &[]), 0);
+    // -O2 as well: the inliner sees an address-carrying `Ret` only there.
+    assert_eq!(
+        compile_and_run_optimized("codegen_ld_aggregate_return_opt", code),
+        0
+    );
+}

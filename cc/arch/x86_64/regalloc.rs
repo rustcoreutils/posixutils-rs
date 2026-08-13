@@ -39,6 +39,7 @@
 // ============================================================================
 
 use crate::arch::asm_constraints::OperandConstraint;
+use crate::arch::lir::FpSize;
 use crate::arch::regalloc::{
     compute_live_intervals, find_call_positions, identify_addr_taken_syms, identify_fp_pseudos,
     interval_crosses_call, ConstraintPoint, FreeSlot, LiveInterval, LivenessResult,
@@ -877,6 +878,9 @@ pub struct SpilledXmmArg {
     pub from_xmm: XmmReg,
     /// The stack offset where it was spilled to
     pub to_stack_offset: i32,
+    /// The move width. A `__float128` argument is a whole XMM; storing it as
+    /// a `double` dropped its top half.
+    pub size: FpSize,
 }
 
 // ============================================================================
@@ -903,6 +907,10 @@ pub struct RegAlloc {
     fp_pseudos: HashSet<PseudoId>,
     /// Track which pseudos are long double (use x87, need 16-byte stack slots)
     ld_pseudos: HashSet<PseudoId>,
+    /// Pseudos holding an IEEE binary128 value (`__float128`). They occupy a
+    /// whole XMM register and a 16-byte stack slot, unlike every other SSE
+    /// value here.
+    quad_pseudos: HashSet<PseudoId>,
     /// Track which pseudos are 128-bit integers (need 16-byte stack slots, never registers)
     int128_pseudos: HashSet<PseudoId>,
     /// Arguments spilled from caller-saved registers to stack
@@ -923,6 +931,20 @@ pub struct RegAlloc {
     max_local_align: i32,
 }
 
+/// Bytes reserved at the bottom of the locals area for the x87 scratch.
+///
+/// `x87.rs` needs a fixed address to stage an immediate or a general register
+/// through on its way into the FPU -- `fild` and `fld` have no register form.
+/// That address used to be `-(callee_saved_offset + 8)(%rbp)`, which no one
+/// had reserved: slot offsets start at zero, so it landed squarely on the
+/// first local. For a `long double` first local it overwrote bytes 8 and 9 --
+/// the sign and exponent -- and turned `1.0L` into `2^-16382`, which prints as
+/// `0.0`. Reserving the region here is what makes the address the allocator's
+/// to give and the scratch's to keep.
+///
+/// See [`X86_64CodeGen::x87_scratch_addr`].
+pub(super) const X87_SCRATCH_BYTES: i32 = 16;
+
 impl RegAlloc {
     pub fn new() -> Self {
         Self {
@@ -931,10 +953,11 @@ impl RegAlloc {
             free_xmm_regs: XmmReg::allocatable().to_vec(),
             active: Vec::new(),
             active_xmm: Vec::new(),
-            stack_offset: 0,
+            stack_offset: X87_SCRATCH_BYTES,
             used_callee_saved: Vec::new(),
             fp_pseudos: HashSet::new(),
             ld_pseudos: HashSet::new(),
+            quad_pseudos: HashSet::new(),
             int128_pseudos: HashSet::new(),
             spilled_args: Vec::new(),
             spilled_xmm_args: Vec::new(),
@@ -958,6 +981,7 @@ impl RegAlloc {
         self.fp_pseudos = identify_fp_pseudos(func, |typ| types.is_float(typ));
         // Identify long double pseudos (use x87 not XMM)
         self.identify_ld_pseudos(func, types);
+        self.identify_quad_pseudos(func, types);
         // Identify 128-bit integer pseudos (always spill to 16-byte stack slots)
         self.identify_int128_pseudos(func, types);
         self.addr_taken_syms = identify_addr_taken_syms(func);
@@ -985,10 +1009,11 @@ impl RegAlloc {
         self.free_xmm_regs = XmmReg::allocatable().to_vec();
         self.active.clear();
         self.active_xmm.clear();
-        self.stack_offset = 0;
+        self.stack_offset = X87_SCRATCH_BYTES;
         self.used_callee_saved.clear();
         self.fp_pseudos.clear();
         self.ld_pseudos.clear();
+        self.quad_pseudos.clear();
         self.int128_pseudos.clear();
         self.spilled_args.clear();
         self.spilled_xmm_args.clear();
@@ -1018,6 +1043,29 @@ impl RegAlloc {
                     // Mark sources as long double for Load/Store/Copy
                     for &src in &insn.src {
                         self.ld_pseudos.insert(src);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Identify pseudos holding a `__float128`.
+    ///
+    /// Keyed on the type, not the width: an x87 `long double` is also 128 bits
+    /// wide on this target, and giving it a binary128 slot or a 16-byte move
+    /// would be wrong in both directions.
+    fn identify_quad_pseudos(&mut self, func: &Function, types: &TypeTable) {
+        for block in &func.blocks {
+            for insn in &block.insns {
+                let is_quad = insn
+                    .typ
+                    .is_some_and(|t| types.kind(t) == crate::types::TypeKind::Float128);
+                if is_quad {
+                    if let Some(target) = insn.target {
+                        self.quad_pseudos.insert(target);
+                    }
+                    for &src in &insn.src {
+                        self.quad_pseudos.insert(src);
                     }
                 }
             }
@@ -1164,21 +1212,7 @@ impl RegAlloc {
             let is_longdouble = types.kind(*typ) == crate::types::TypeKind::LongDouble;
             let is_fp = types.is_float(*typ);
             let is_complex = types.is_complex(*typ);
-            let type_size = types.size_bits(*typ);
-            let is_two_sse_struct = !is_complex
-                && (types.kind(*typ) == crate::types::TypeKind::Struct
-                    || types.kind(*typ) == crate::types::TypeKind::Union)
-                && type_size > 64
-                && type_size <= 128
-                && {
-                    use crate::abi::{Abi, SysVAmd64Abi};
-                    matches!(
-                        SysVAmd64Abi.classify_param(*typ, types),
-                        crate::abi::ArgClass::Direct { ref classes, .. }
-                            if classes.len() == 2
-                                && classes.iter().all(|c| *c == crate::abi::RegClass::Sse)
-                    )
-                };
+            let sse_struct = crate::abi::sse_struct_regs(*typ, types);
 
             // Long double uses x87 FPU and is passed on the stack per System V AMD64 ABI
             if is_longdouble {
@@ -1187,12 +1221,14 @@ impl RegAlloc {
                     .insert(pseudo_id, Loc::IncomingArg(stack_arg_offset));
                 self.fp_pseudos.insert(pseudo_id);
                 stack_arg_offset += 16;
-            } else if is_two_sse_struct {
-                // 2-SSE struct: uses two XMM regs. Don't assign to register —
-                // the codegen stores both XMM values to the local's stack slot.
-                // Just consume the FP arg indices without assigning a location;
-                // the pseudo will get a stack slot from normal allocation.
-                fp_arg_idx += 2;
+            } else if let Some(sse_regs) = sse_struct {
+                // All-SSE struct: uses one XMM per class. Don't assign to a
+                // register — the codegen stores the XMM values to the local's
+                // stack slot. Just consume the FP arg indices without assigning
+                // a location; the pseudo gets a stack slot from normal
+                // allocation. Two doubles take two registers; a lone binary128
+                // takes one, for all sixteen bytes.
+                fp_arg_idx += sse_regs;
             } else if is_complex {
                 // How many XMM registers this complex type actually occupies:
                 // one for `float _Complex` (both halves packed into a single
@@ -1233,7 +1269,9 @@ impl RegAlloc {
                     // Stack args are placed in parameter order per System V AMD64 ABI
                     self.locations
                         .insert(pseudo_id, Loc::IncomingArg(stack_arg_offset));
-                    stack_arg_offset += 8;
+                    // A binary128 occupies two eightbytes; advancing by one
+                    // put the next argument on top of its upper half.
+                    stack_arg_offset += (((types.size_bits(*typ) / 8) as i32) + 7) & !7;
                 }
                 fp_arg_idx += 1;
             } else if types.kind(*typ) == crate::types::TypeKind::Int128 {
@@ -1256,12 +1294,10 @@ impl RegAlloc {
                 int_arg_idx += 2;
             } else {
                 let type_size = types.size_bits(*typ);
-                let is_large_struct = (types.kind(*typ) == crate::types::TypeKind::Struct
-                    || types.kind(*typ) == crate::types::TypeKind::Union)
-                    && type_size > 128;
+                let is_large_struct = crate::abi::param_is_memory_class(*typ, types);
                 if is_large_struct {
-                    // Large struct (> 16 bytes): always passed on stack per
-                    // SysV AMD64 ABI. Advance by full struct size.
+                    // MEMORY class: passed on the stack by value. Advance by
+                    // the full struct size.
                     self.locations
                         .insert(pseudo_id, Loc::IncomingArg(stack_arg_offset));
                     stack_arg_offset += (type_size / 8) as i32;
@@ -1351,13 +1387,19 @@ impl RegAlloc {
                 if xmm_arg_regs.contains(xmm) && interval.start == 0 {
                     // This is a function parameter in an XMM register — always spill
                     let from_xmm = *xmm;
-                    self.stack_offset += 8;
+                    let is_quad = self.quad_pseudos.contains(&interval.pseudo);
+                    self.stack_offset += if is_quad { 16 } else { 8 };
                     let to_stack_offset = self.stack_offset;
 
                     self.spilled_xmm_args.push(SpilledXmmArg {
                         pseudo: interval.pseudo,
                         from_xmm,
                         to_stack_offset,
+                        size: if is_quad {
+                            FpSize::Quad
+                        } else {
+                            FpSize::Double
+                        },
                     });
 
                     self.locations
@@ -1630,9 +1672,17 @@ impl RegAlloc {
             let needs_fp = self.fp_pseudos.contains(&interval.pseudo);
             if needs_fp {
                 let is_longdouble = self.ld_pseudos.contains(&interval.pseudo);
+                let is_quad = self.quad_pseudos.contains(&interval.pseudo);
                 let crosses_call = interval_crosses_call(interval, call_positions);
                 let crosses_block = self.live_out.iter().any(|lo| lo.contains(&interval.pseudo));
                 if is_longdouble {
+                    self.alloc_stack_slot(interval, 16, 16, false);
+                    continue;
+                }
+                if is_quad && (crosses_call || crosses_block) {
+                    // A `__float128` is 16 bytes. An 8-byte slot let a
+                    // 16-byte store run over its neighbour and read back
+                    // garbage in the low half.
                     self.alloc_stack_slot(interval, 16, 16, false);
                     continue;
                 }

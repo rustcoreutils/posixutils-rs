@@ -1019,8 +1019,14 @@ impl Aarch64CodeGen {
                     addr: self.stack_mem(spilled.to_stack_offset),
                 });
             } else if let Some(fp_reg) = spilled.from_fp_reg {
+                // The recorded width, not a fixed eight bytes: `long double` is
+                // binary128 here, and half of one was left behind.
                 self.push_lir(Aarch64Inst::StrFp {
-                    size: FpSize::Double,
+                    size: if spilled.bytes > 8 {
+                        FpSize::Quad
+                    } else {
+                        FpSize::Double
+                    },
                     src: fp_reg,
                     addr: self.stack_mem(spilled.to_stack_offset),
                 });
@@ -1196,11 +1202,19 @@ impl Aarch64CodeGen {
                                 if let Some(Loc::Stack(offset)) = self.locations.get_ref(pseudo.id)
                                 {
                                     if *offset < 0 {
-                                        let fp_size = if types.size_bits(*typ) == 32 {
-                                            FpSize::Single
-                                        } else {
-                                            FpSize::Double
-                                        };
+                                        // From the type, not a `32 or else`
+                                        // guess: `long double` is binary128
+                                        // here, and storing it as a double
+                                        // dropped its top eight bytes, so the
+                                        // *second* such parameter came back
+                                        // truncated while the first, stored
+                                        // elsewhere, was whole.
+                                        let fp_size = FpSize::from_type_or_bits(
+                                            Some(*typ),
+                                            types.size_bits(*typ),
+                                            types,
+                                            &self.base.target,
+                                        );
                                         self.push_lir(Aarch64Inst::StrFp {
                                             size: fp_size,
                                             src: fp_arg_regs[fp_arg_idx],
@@ -1291,22 +1305,29 @@ impl Aarch64CodeGen {
                 || matches!(src_loc, Loc::VReg(_) | Loc::FImm(..));
             // Check for HFA-2 struct return (e.g., {double, double}).
             // Compute the HFA FP size once; None means not an HFA-2.
-            let hfa_two_fp_size: Option<FpSize> = if !is_complex {
+            let hfa_ret: Option<(FpSize, u8)> = if !is_complex {
                 insn.typ.and_then(|t| {
                     let k = types.kind(t);
-                    if (k == TypeKind::Struct || k == TypeKind::Union)
-                        && types.size_bits(t) > 64
-                        && types.size_bits(t) <= 128
+                    // No lower bound: a struct holding one `float`, `double`
+                    // or `_Float16` is a one-element HFA and comes back in V0.
+                    // Requiring more than eight bytes sent all three out
+                    // through a general register, while the *caller* read the
+                    // FP one -- so the two sides disagreed inside one
+                    // translation unit.
+                    if (k == TypeKind::Struct || k == TypeKind::Union) && types.size_bits(t) <= 128
                     {
                         let abi = get_abi_for_conv(CallingConv::C, &self.base.target);
                         match abi.classify_return(t, types) {
-                            ArgClass::Hfa { base, .. } => {
+                            ArgClass::Hfa { base, count } => {
                                 use crate::abi::HfaBase;
-                                Some(match base {
-                                    HfaBase::Float32 => FpSize::Single,
-                                    HfaBase::Float64 => FpSize::Double,
-                                    HfaBase::Float128 => FpSize::Quad,
-                                })
+                                Some((
+                                    match base {
+                                        HfaBase::Float32 => FpSize::Single,
+                                        HfaBase::Float64 => FpSize::Double,
+                                        HfaBase::Float128 => FpSize::Quad,
+                                    },
+                                    count,
+                                ))
                             }
                             _ => None,
                         }
@@ -1317,6 +1338,13 @@ impl Aarch64CodeGen {
             } else {
                 None
             };
+            // A one-element HFA is one register holding the whole value, not a
+            // pair. `struct { long double v; }` is that on aarch64 Linux, where
+            // `long double` is binary128: moving it out of a general register
+            // hit `a binary128 value does not fit one X register` and killed
+            // the compiler.
+            let hfa_two_fp_size: Option<FpSize> =
+                hfa_ret.and_then(|(size, count)| (count == 2).then_some(size));
 
             // Derive return size from type to avoid 32-bit truncation
             let ret_typ = insn.typ;
@@ -1324,7 +1352,87 @@ impl Aarch64CodeGen {
                 .map(|t| types.size_bits(t).max(32))
                 .unwrap_or(insn.size.max(32));
 
-            if let Some(fp_size) = hfa_two_fp_size {
+            if let Some((fp_size, 1)) = hfa_ret {
+                // One V register carries all of it. The linearizer hands the
+                // two halves over as general registers, which is how a
+                // sixteen-byte value reaches here; assemble them into the
+                // register's two lanes, exactly as gcc does.
+                if insn.src.len() == 2 {
+                    self.emit_move(src, Reg::X9, 64);
+                    if fp_size == FpSize::Quad {
+                        self.push_lir(Aarch64Inst::FmovFromGp {
+                            size: FpSize::Double,
+                            src: Reg::X9,
+                            dst: VReg::V0,
+                        });
+                        if let Some(&src2) = insn.src.get(1) {
+                            self.emit_move(src2, Reg::X9, 64);
+                            self.push_lir(Aarch64Inst::InsGpToVecD {
+                                lane: 1,
+                                src: Reg::X9,
+                                dst: VReg::V0,
+                            });
+                        }
+                    } else {
+                        self.push_lir(Aarch64Inst::FmovFromGp {
+                            size: fp_size,
+                            src: Reg::X9,
+                            dst: VReg::V0,
+                        });
+                    }
+                } else {
+                    let hfa_bits = insn.typ.map_or(0, |t| types.size_bits(t));
+                    match src_loc {
+                        // Eight bytes or fewer, already loaded into a general
+                        // register: move it across. This is the common shape --
+                        // the linearizer loads a small struct's value rather
+                        // than handing over its address -- and leaving it in
+                        // `x0` is what made the callee and the caller, which
+                        // reads `s0`/`d0`, disagree inside one program.
+                        Loc::Reg(r) if hfa_bits <= 64 => {
+                            self.push_lir(Aarch64Inst::FmovFromGp {
+                                size: fp_size,
+                                src: r,
+                                dst: VReg::V0,
+                            });
+                        }
+                        // Eight bytes or fewer: the slot holds the value.
+                        Loc::Stack(offset) if hfa_bits <= 64 => {
+                            self.push_lir(Aarch64Inst::LdrFp {
+                                size: fp_size,
+                                dst: VReg::V0,
+                                addr: self.stack_mem(offset),
+                            });
+                        }
+                        // Wider than a register, with its address already in
+                        // one: load the value straight out of it.
+                        Loc::Reg(r) => {
+                            self.push_lir(Aarch64Inst::LdrFp {
+                                size: fp_size,
+                                dst: VReg::V0,
+                                addr: MemAddr::BaseOffset { base: r, offset: 0 },
+                            });
+                        }
+                        // Wider than a register: the slot holds its address.
+                        Loc::Stack(offset) => {
+                            self.push_lir(Aarch64Inst::Ldr {
+                                size: OperandSize::B64,
+                                dst: Reg::X9,
+                                addr: self.stack_mem(offset),
+                            });
+                            self.push_lir(Aarch64Inst::LdrFp {
+                                size: fp_size,
+                                dst: VReg::V0,
+                                addr: MemAddr::BaseOffset {
+                                    base: Reg::X9,
+                                    offset: 0,
+                                },
+                            });
+                        }
+                        _ => self.emit_move(src, Reg::X0, ret_size),
+                    }
+                }
+            } else if let Some(fp_size) = hfa_two_fp_size {
                 if insn.src.len() == 2 {
                     // Two-source path: linearizer pre-loaded struct halves as integers.
                     // Move from GP registers to V0/V1 via FmovFromGp.

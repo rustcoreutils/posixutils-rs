@@ -395,6 +395,12 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
                 }
             }
             Initializer::Float(val) => self.emit_float_initializer(*val, size),
+            Initializer::Float128(val) => {
+                // No target check: the type already said binary128.
+                let (lo, hi) = val.to_f128_bits();
+                self.push_directive(Directive::Quad(lo as i64));
+                self.push_directive(Directive::Quad(hi as i64));
+            }
             Initializer::String(s) => {
                 // Emit string as .ascii (without null terminator)
                 // Then zero-fill the remaining bytes (which includes the null terminator)

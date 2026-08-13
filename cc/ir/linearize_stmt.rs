@@ -357,51 +357,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         self.emit(Instruction::store(converted, sym_id, 0, typ, size));
                     }
                 } else if self.types.is_complex(typ) {
-                    let init_typ = self.expr_type(init);
-                    let base_typ = self.types.complex_base(typ);
-                    let base_bits = self.types.size_bits(base_typ);
-                    let base_bytes = (base_bits / 8) as i64;
-
-                    if self.types.is_complex(init_typ) {
-                        let value_addr = self.complex_operand_addr(init);
-
-                        // The initializer may have a different base precision
-                        // than the object — and usually does, because `I` is
-                        // `__builtin_complex(0.0, 1.0)`, a *double* complex, so
-                        // `float _Complex f = 2.0f + 3.0f*I;` is a conversion.
-                        // Reading the source with the target's base type and
-                        // stride mismatched both the width and the step.
-                        let src_base = self.types.complex_base(init_typ);
-                        let src_bits = self.types.size_bits(src_base);
-                        let src_bytes = (src_bits / 8) as i64;
-
-                        let val_real = self.alloc_pseudo();
-                        let val_imag = self.alloc_pseudo();
-                        self.emit(Instruction::load(
-                            val_real, value_addr, 0, src_base, src_bits,
-                        ));
-                        self.emit(Instruction::load(
-                            val_imag, value_addr, src_bytes, src_base, src_bits,
-                        ));
-                        let val_real = self.emit_convert(val_real, src_base, base_typ);
-                        let val_imag = self.emit_convert(val_imag, src_base, base_typ);
-                        self.emit(Instruction::store(val_real, sym_id, 0, base_typ, base_bits));
-                        self.emit(Instruction::store(
-                            val_imag, sym_id, base_bytes, base_typ, base_bits,
-                        ));
-                    } else {
-                        // Real scalar to complex: set real = value, imag = 0.0
-                        let val = self.linearize_expr(init);
-                        let converted = self.emit_convert(val, init_typ, base_typ);
-                        self.emit(Instruction::store(
-                            converted, sym_id, 0, base_typ, base_bits,
-                        ));
-                        // Store 0.0 for imaginary part
-                        let zero = self.emit_fconst(FloatVal::ZERO, base_typ);
-                        self.emit(Instruction::store(
-                            zero, sym_id, base_bytes, base_typ, base_bits,
-                        ));
-                    }
+                    self.store_complex_at(sym_id, 0, typ, init);
                 } else {
                     // Check for large struct/union initialization (> 64 bits)
                     // linearize_expr returns an address for large aggregates
@@ -745,6 +701,13 @@ impl<'a> super::linearize::Linearizer<'a> {
                     let Some(last) = list.last() else {
                         continue;
                     };
+                    if self.types.is_complex(elem_type) {
+                        // A complex element is two halves, not the scalar the
+                        // store below assumes. `elem_is_aggregate` is false for
+                        // it, so it reaches here.
+                        self.store_complex_at(base_sym, offset, elem_type, &last.value);
+                        continue;
+                    }
                     let val = self.linearize_expr(&last.value);
                     let val_type = self.expr_type(&last.value);
                     let converted = self.emit_convert(val, val_type, elem_type);
@@ -828,6 +791,13 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
             _ => {
                 if let Some(element) = elements.first() {
+                    // `double _Complex z = {1.0};` lands here rather than on
+                    // the complex arm of `linearize_local_decl`, because the
+                    // braces make it an initializer list first.
+                    if self.types.is_complex(typ) {
+                        self.store_complex_at(base_sym, base_offset, typ, &element.value);
+                        return;
+                    }
                     let val = self.linearize_expr(&element.value);
                     let val_type = self.expr_type(&element.value);
                     let converted = self.emit_convert(val, val_type, typ);
@@ -841,6 +811,76 @@ impl<'a> super::linearize::Linearizer<'a> {
                     ));
                 }
             }
+        }
+    }
+
+    /// Store a complex value into `base_sym` at `offset`, as two halves.
+    ///
+    /// A complex value lives in memory and travels by *address*, so storing it
+    /// the way a scalar member is stored writes the address instead of the
+    /// value. That is what left every complex member of an automatic aggregate
+    /// reading back as a stack address reinterpreted as a double, and what
+    /// made a real initializer for one crash outright.
+    ///
+    /// The initializer's base precision need not match the object's -- and
+    /// usually does not, because `I` is `__builtin_complex(0.0, 1.0)`, a
+    /// *double* complex, so `float _Complex f = 2.0f + 3.0f*I;` is a
+    /// conversion. Reading the source with the target's base type and stride
+    /// would mismatch both the width and the step.
+    pub(crate) fn store_complex_at(
+        &mut self,
+        base_sym: PseudoId,
+        offset: i64,
+        complex_typ: TypeId,
+        init: &Expr,
+    ) {
+        let init_typ = self.expr_type(init);
+        let base_typ = self.types.complex_base(complex_typ);
+        let base_bits = self.types.size_bits(base_typ);
+        let base_bytes = (base_bits / 8) as i64;
+
+        if self.types.is_complex(init_typ) {
+            let value_addr = self.complex_operand_addr(init);
+            let src_base = self.types.complex_base(init_typ);
+            let src_bits = self.types.size_bits(src_base);
+            let src_bytes = (src_bits / 8) as i64;
+
+            let val_real = self.alloc_pseudo();
+            let val_imag = self.alloc_pseudo();
+            self.emit(Instruction::load(
+                val_real, value_addr, 0, src_base, src_bits,
+            ));
+            self.emit(Instruction::load(
+                val_imag, value_addr, src_bytes, src_base, src_bits,
+            ));
+            let val_real = self.emit_convert(val_real, src_base, base_typ);
+            let val_imag = self.emit_convert(val_imag, src_base, base_typ);
+            self.emit(Instruction::store(
+                val_real, base_sym, offset, base_typ, base_bits,
+            ));
+            self.emit(Instruction::store(
+                val_imag,
+                base_sym,
+                offset + base_bytes,
+                base_typ,
+                base_bits,
+            ));
+        } else {
+            // A real scalar names only the real half; C99 6.3.1.7 gives the
+            // imaginary half a positive zero.
+            let val = self.linearize_expr(init);
+            let converted = self.emit_convert(val, init_typ, base_typ);
+            self.emit(Instruction::store(
+                converted, base_sym, offset, base_typ, base_bits,
+            ));
+            let zero = self.emit_fconst(FloatVal::ZERO, base_typ);
+            self.emit(Instruction::store(
+                zero,
+                base_sym,
+                offset + base_bytes,
+                base_typ,
+                base_bits,
+            ));
         }
     }
 
@@ -891,6 +931,8 @@ impl<'a> super::linearize::Linearizer<'a> {
                     converted, base_sym, offset, field_type, size,
                 ));
             }
+        } else if self.types.is_complex(field_type) {
+            self.store_complex_at(base_sym, offset, field_type, value);
         } else {
             let (actual_type, actual_size) = if self.types.kind(field_type) == TypeKind::Array {
                 let elem_type = self.types.base_type(field_type).unwrap_or(field_type);
@@ -1692,20 +1734,21 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
     }
 
-    /// Evaluate a constant floating-point expression at compile time.
-    /// Handles float literals, negation, and binary arithmetic on floats.
     /// Fold a constant floating expression for a static initializer.
     ///
-    /// A bare literal passes through at full width, which is what makes
-    /// `long double x = LDBL_MAX;` come out right. Arithmetic is still done in
-    /// `f64`, so folding an expression whose operands exceed double's range
-    /// still loses them; carrying that exactly needs wide arithmetic, not just
-    /// a wide literal.
+    /// Every step is done in the expression's own format, exactly, and rounded
+    /// once -- the same thing the target would do at run time. Folding through
+    /// `f64` instead cost a `long double` eleven significand bits and a
+    /// `__float128` sixty, so `static __float128 c = 1.0q/3.0q;` disagreed with
+    /// the *same initializer written for a local*, which is computed at run
+    /// time and was right.
     pub(crate) fn eval_const_float_expr(&self, expr: &Expr) -> Option<FloatVal> {
         match &expr.kind {
             ExprKind::FloatLit(v) => Some(*v),
-            ExprKind::IntLit(v) => Some(FloatVal::from_f64(*v as f64)),
-            ExprKind::CharLit(c) => Some(FloatVal::from_f64(*c as i64 as f64)),
+            // Exact: a `u128` mantissa has no more bits than the significand,
+            // where `f64` would have rounded anything past the 53rd.
+            ExprKind::IntLit(v) => Some(FloatVal::from_i128(*v as i128)),
+            ExprKind::CharLit(c) => Some(FloatVal::from_i128(*c as i64 as i128)),
 
             ExprKind::Unary { op, operand } => {
                 let val = self.eval_const_float_expr(operand)?;
@@ -1715,20 +1758,35 @@ impl<'a> super::linearize::Linearizer<'a> {
                 }
             }
 
+            // The operation is done in the format of its own result type,
+            // which is the type the usual arithmetic conversions already gave
+            // this node -- not in whatever width the operands were written at.
             ExprKind::Binary { op, left, right } => {
-                let l = self.eval_const_float_expr(left)?.to_f64();
-                let r = self.eval_const_float_expr(right)?.to_f64();
-                let v = match op {
-                    BinaryOp::Add => l + r,
-                    BinaryOp::Sub => l - r,
-                    BinaryOp::Mul => l * r,
-                    BinaryOp::Div => l / r,
+                let l = self.eval_const_float_expr(left)?;
+                let r = self.eval_const_float_expr(right)?;
+                let fmt = expr.typ.and_then(|t| self.types.fp_format(t))?;
+                Some(match op {
+                    BinaryOp::Add => l.add(r, fmt),
+                    BinaryOp::Sub => l.sub(r, fmt),
+                    BinaryOp::Mul => l.mul(r, fmt),
+                    BinaryOp::Div => l.div(r, fmt),
                     _ => return None,
-                };
-                Some(FloatVal::from_f64(v))
+                })
             }
 
-            ExprKind::Cast { expr: inner, .. } => self.eval_const_float_expr(inner),
+            // A cast rounds to the target format. Discarding the cast type
+            // let `(float)0.1q` keep every bit of its binary128 value in a
+            // static initializer, where the same cast at run time rounds.
+            ExprKind::Cast {
+                expr: inner,
+                cast_type,
+            } => {
+                let val = self.eval_const_float_expr(inner)?;
+                Some(match self.types.fp_format(*cast_type) {
+                    Some(fmt) => val.round_to_format(fmt),
+                    None => val,
+                })
+            }
 
             _ => None,
         }

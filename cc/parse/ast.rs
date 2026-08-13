@@ -90,6 +90,11 @@ pub enum FpTest {
     IsNan,
     /// Is it an infinity, of either sign?
     IsInf,
+    /// Is it an infinity, and with which sign? `+1` for `+inf`, `-1` for
+    /// `-inf`, `0` otherwise. This is `__builtin_isinf_sign`, which glibc's
+    /// `<math.h>` uses for `isinf` once it believes the compiler is recent
+    /// enough to have it.
+    IsInfSign,
     /// Is it neither infinite nor NaN?
     IsFinite,
     /// Is it finite, non-zero and not subnormal?

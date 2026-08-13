@@ -25,7 +25,12 @@ impl Aarch64CodeGen {
     /// `target.os` keeps one source of truth -- previously this returned
     /// `Double` unconditionally, so on Linux the codegen loaded and stored 64
     /// bits of a 128-bit object (#H4).
-    fn fp_size_from_type(&self, typ: Option<TypeId>, size: u32, types: &TypeTable) -> FpSize {
+    pub(super) fn fp_size_from_type(
+        &self,
+        typ: Option<TypeId>,
+        size: u32,
+        types: &TypeTable,
+    ) -> FpSize {
         typ.map(|t| match types.kind(t) {
             TypeKind::Float16 => FpSize::Half,
             TypeKind::Float => FpSize::Single,
@@ -37,6 +42,7 @@ impl Aarch64CodeGen {
                     FpSize::Double
                 }
             }
+            TypeKind::Float128 => FpSize::Quad,
             _ => FpSize::from_bits(size.max(32), &self.base.target),
         })
         .unwrap_or_else(|| FpSize::from_bits(size.max(32), &self.base.target))

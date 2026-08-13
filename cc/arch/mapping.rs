@@ -54,6 +54,7 @@ pub trait ArchMapper {
 /// Target-dependent for long double (x87 vs IEEE quad).
 pub fn complex_mul_name(base_kind: TypeKind, target: &Target) -> &'static str {
     match base_kind {
+        TypeKind::Float128 => "__multc3",
         TypeKind::Float => "__mulsc3",
         TypeKind::Double => "__muldc3",
         TypeKind::LongDouble => {
@@ -74,6 +75,7 @@ pub fn complex_mul_name(base_kind: TypeKind, target: &Target) -> &'static str {
 /// Target-dependent for long double (x87 vs IEEE quad).
 pub fn complex_div_name(base_kind: TypeKind, target: &Target) -> &'static str {
     match base_kind {
+        TypeKind::Float128 => "__divtc3",
         TypeKind::Float => "__divsc3",
         TypeKind::Double => "__divdc3",
         TypeKind::LongDouble => {
@@ -99,6 +101,8 @@ pub(crate) fn float_suffix(kind: TypeKind, target: &Target) -> &'static str {
     match kind {
         TypeKind::Float => "sf",
         TypeKind::Double => "df",
+        // binary128 is TFmode wherever it appears.
+        TypeKind::Float128 => "tf",
         TypeKind::LongDouble => {
             if target.arch == Arch::X86_64 {
                 "xf"
@@ -115,6 +119,20 @@ pub(crate) fn float_suffix(kind: TypeKind, target: &Target) -> &'static str {
 /// x86_64 uses native x87; macOS aarch64 long double == double.
 pub(crate) fn longdouble_needs_rtlib(target: &Target) -> bool {
     target.arch == Arch::Aarch64 && target.os != Os::MacOS
+}
+
+/// Whether `typ` is an IEEE binary128 value on this target.
+///
+/// Two spellings reach the same format: `__float128`, which is binary128
+/// everywhere, and `long double` on the targets whose long double *is*
+/// binary128 (aarch64, other than Apple's). x86-64's `long double` is x87
+/// extended and is not this.
+pub(crate) fn is_binary128(types: &TypeTable, typ: TypeId, target: &Target) -> bool {
+    match types.kind(typ) {
+        TypeKind::Float128 => true,
+        TypeKind::LongDouble => longdouble_needs_rtlib(target),
+        _ => false,
+    }
 }
 
 /// Get the integer suffix for a long double↔int conversion.
@@ -1592,6 +1610,182 @@ pub fn run_mapping(module: &mut Module, types: &TypeTable, target: &Target) {
 // ============================================================================
 // Shared test helpers
 // ============================================================================
+
+/// Expand an operation on an IEEE binary128 value into libgcc soft-float calls.
+///
+/// Shared by both backends, because the type is the same wherever it appears:
+/// `long double` on aarch64 Linux, and `__float128` everywhere. Neither target
+/// has hardware binary128, so every arithmetic, comparison and conversion is a
+/// `__*tf*` call. Keyed on the *type* rather than on the target — asking "is
+/// this value binary128" is what lets one lowering serve both.
+pub(crate) fn map_binary128(insn: &Instruction, ctx: &mut MappingCtx<'_>) -> Option<MappedInsn> {
+    match insn.op {
+        // Binary arithmetic: FAdd/FSub/FMul/FDiv → single rtlib call
+        Opcode::FAdd | Opcode::FSub | Opcode::FMul | Opcode::FDiv => {
+            let typ = insn.typ?;
+            if !is_binary128(ctx.types, typ, ctx.target) {
+                return None;
+            }
+            let name = match insn.op {
+                Opcode::FAdd => "__addtf3",
+                Opcode::FSub => "__subtf3",
+                Opcode::FMul => "__multf3",
+                Opcode::FDiv => "__divtf3",
+                _ => unreachable!(),
+            };
+            let call = build_binop_rtlib_call(insn, name, ctx.types, ctx.target);
+            Some(MappedInsn::Replace(vec![call]))
+        }
+
+        // Negation: FNeg → single rtlib call
+        Opcode::FNeg => {
+            let typ = insn.typ?;
+            if !is_binary128(ctx.types, typ, ctx.target) {
+                return None;
+            }
+            let call = build_binop_rtlib_call(insn, "__negtf2", ctx.types, ctx.target);
+            Some(MappedInsn::Replace(vec![call]))
+        }
+
+        // Comparisons: call rtlib cmp, then compare result against 0
+        Opcode::FCmpOLt
+        | Opcode::FCmpOLe
+        | Opcode::FCmpOGt
+        | Opcode::FCmpOGe
+        | Opcode::FCmpOEq
+        | Opcode::FCmpONe => {
+            // The operand type decides, not the width: x87 extended is also
+            // 128 bits wide here, and treating an untyped 128-bit compare as
+            // binary128 sent every x86-64 `long double` comparison to
+            // `__lttf2` instead of to the x87 unit.
+            //
+            // A comparison carries its *operand* type in `typ` -- the result
+            // is an int -- so that is the one to ask; `src_typ` is set on the
+            // paths that build one explicitly.
+            let operand_typ = insn.src_typ.or(insn.typ)?;
+            if !is_binary128(ctx.types, operand_typ, ctx.target) {
+                return None;
+            }
+            let (name, cmp_op) = match insn.op {
+                Opcode::FCmpOLt => ("__lttf2", Opcode::SetLt),
+                Opcode::FCmpOLe => ("__letf2", Opcode::SetLe),
+                Opcode::FCmpOGt => ("__gttf2", Opcode::SetGt),
+                Opcode::FCmpOGe => ("__getf2", Opcode::SetGe),
+                Opcode::FCmpOEq => ("__eqtf2", Opcode::SetEq),
+                Opcode::FCmpONe => ("__netf2", Opcode::SetNe),
+                _ => unreachable!(),
+            };
+
+            let result_pseudo = insn.target.expect("cmp must have target");
+            let int_type = ctx.types.int_id;
+            let int_size = ctx.types.size_bits(int_type);
+            let ld_type = insn.src_typ.or(insn.typ).unwrap_or(ctx.types.longdouble_id);
+
+            // Allocate pseudo for cmp call result
+            let cmp_result = ctx.func.create_reg_pseudo();
+            let zero = ctx.func.create_const_pseudo(0);
+
+            // Build the rtlib call: cmp_result = __lttf2(left, right)
+            let arg_vals = insn.src.clone();
+            let arg_types = vec![ld_type; arg_vals.len()];
+            let mut call = Instruction::call_with_abi(
+                Some(cmp_result),
+                name,
+                arg_vals,
+                arg_types,
+                int_type,
+                CallingConv::C,
+                ctx.types,
+                ctx.target,
+            );
+            call.pos = insn.pos;
+
+            // Build the int comparison: result = cmp_op(cmp_result, 0)
+            let cmp =
+                Instruction::binop(cmp_op, result_pseudo, cmp_result, zero, int_type, int_size);
+
+            Some(MappedInsn::Replace(vec![call, cmp]))
+        }
+
+        // Float-to-float conversions involving long double
+        Opcode::FCvtF => {
+            let dst_typ = insn.typ?;
+            let src_typ = insn.src_typ?;
+            let src_quad = is_binary128(ctx.types, src_typ, ctx.target);
+            let dst_quad = is_binary128(ctx.types, dst_typ, ctx.target);
+            // Both or neither: nothing for this pass. Both is the identity on
+            // a target whose `long double` is itself binary128.
+            if src_quad == dst_quad {
+                return None;
+            }
+            // The other side names the mode. `long double` is `xf` on x86-64,
+            // where it is x87 extended -- omitting that arm left every
+            // `long double` <-> `__float128` conversion unlowered, and it fell
+            // through to a hardware path that has no such instruction.
+            let other = if src_quad { dst_typ } else { src_typ };
+            let name: &'static str =
+                match (src_quad, float_suffix(ctx.types.kind(other), ctx.target)) {
+                    (true, "sf") => "__trunctfsf2",
+                    (true, "df") => "__trunctfdf2",
+                    (true, "xf") => "__trunctfxf2",
+                    (false, "sf") => "__extendsftf2",
+                    (false, "df") => "__extenddftf2",
+                    (false, "xf") => "__extendxftf2",
+                    _ => return None,
+                };
+            let call = build_convert_rtlib_call(insn, name, ctx.types, ctx.target);
+            Some(MappedInsn::Replace(vec![call]))
+        }
+
+        // Int-to-float: int → longdouble
+        Opcode::SCvtF | Opcode::UCvtF => {
+            let dst_typ = insn.typ?;
+            if !is_binary128(ctx.types, dst_typ, ctx.target) {
+                return None;
+            }
+            let src_typ = insn.src_typ?;
+            // Skip int128 (handled by map_int128_float_convert)
+            if ctx.types.kind(src_typ) == TypeKind::Int128 {
+                return None;
+            }
+            let isuf = int_suffix_for_longdouble(ctx.types, src_typ);
+            let name: &'static str = match isuf {
+                "si" => "__floatsitf",
+                "di" => "__floatditf",
+                "usi" => "__floatunsitf",
+                "udi" => "__floatunditf",
+                _ => return None,
+            };
+            let call = build_convert_rtlib_call(insn, name, ctx.types, ctx.target);
+            Some(MappedInsn::Replace(vec![call]))
+        }
+
+        // Float-to-int: longdouble → int
+        Opcode::FCvtS | Opcode::FCvtU => {
+            let src_typ = insn.src_typ?;
+            if !is_binary128(ctx.types, src_typ, ctx.target) {
+                return None;
+            }
+            let dst_typ = insn.typ?;
+            // Skip int128 (handled by map_int128_float_convert)
+            if ctx.types.kind(dst_typ) == TypeKind::Int128 {
+                return None;
+            }
+            let isuf = int_suffix_for_longdouble(ctx.types, dst_typ);
+            let name: &'static str = match isuf {
+                "si" => "__fixtfsi",
+                "di" => "__fixtfdi",
+                "usi" => "__fixunstfsi",
+                "udi" => "__fixunstfdi",
+                _ => return None,
+            };
+            let call = build_convert_rtlib_call(insn, name, ctx.types, ctx.target);
+            Some(MappedInsn::Replace(vec![call]))
+        }
+
+        _ => None,
+    }
+}
 
 #[cfg(test)]
 pub(crate) mod test_helpers {

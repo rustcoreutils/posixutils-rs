@@ -630,16 +630,33 @@ impl<'a> Preprocessor<'a> {
             self.define_macro(Macro::predefined("__STDC_NO_THREADS__", Some("1")));
         }
 
-        // GCC compatibility macros (required by system headers)
-        self.define_macro(Macro::predefined("__GNUC__", Some("4")));
-        self.define_macro(Macro::predefined("__GNUC_MINOR__", Some("2")));
-        self.define_macro(Macro::predefined("__GNUC_PATCHLEVEL__", Some("1")));
+        // GCC compatibility macros (required by system headers).
+        //
+        // The claimed version is a statement about which header paths this
+        // compiler can take, and it is measured rather than aspirational.
+        // 6.5.0 is the highest that works against glibc 2.39:
+        //
+        //   4.3  `bits/floatn.h` turns on __HAVE_FLOAT128 and needs the
+        //        `__float128` keyword and `_Complex float` with mode(TC)
+        //   4.4  `<math.h>` switches isnan/isinf/isfinite/isnormal/fpclassify
+        //        onto the builtins -- the point of claiming any of this, since
+        //        the `sizeof` ternary it replaces calls `__isnanl`, which
+        //        answers 65535 rather than 1
+        //   4.9  __HAVE_GENERIC_SELECTION turns on, so __MATH_TG uses
+        //        `_Generic` rather than __builtin_choose_expr
+        //   6.0  `signbit` goes to __builtin_signbit*
+        //   7.0  __HAVE_FLOATN_NOT_TYPEDEF makes _FloatN native types, and
+        //        `stdlib.h` then declares `strtof32x` in terms of a `_Float32x`
+        //        this compiler does not have. That is the ceiling.
+        self.define_macro(Macro::predefined("__GNUC__", Some("6")));
+        self.define_macro(Macro::predefined("__GNUC_MINOR__", Some("5")));
+        self.define_macro(Macro::predefined("__GNUC_PATCHLEVEL__", Some("0")));
         self.define_macro(Macro::predefined(
             "__VERSION__",
             Some(concat!(
                 "\"c17 ",
                 env!("CARGO_PKG_VERSION"),
-                " (gcc compatible 4.2.1)\""
+                " (gcc compatible 6.5.0)\""
             )),
         ));
         self.define_macro(Macro::predefined("__GNUC_STDC_INLINE__", Some("1")));

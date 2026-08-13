@@ -21,7 +21,7 @@ mod aapcs64;
 mod sysv_amd64;
 
 pub use aapcs64::Aapcs64Abi;
-pub use sysv_amd64::SysVAmd64Abi;
+pub use sysv_amd64::{param_is_memory_class, sse_struct_regs, SysVAmd64Abi};
 
 use crate::target::{Arch, Target};
 use crate::types::{TypeId, TypeKind, TypeTable};
@@ -208,10 +208,22 @@ fn is_aggregate(kind: TypeKind) -> bool {
 }
 
 /// Check if a type is a floating-point type.
+///
+/// `_Float16` belongs here for the same reason the others do: System V puts it
+/// in an SSE register. Leaving it out sent every eightbyte holding one to the
+/// default arm, which answers MEMORY, so `struct { _Float16 h; }` was returned
+/// through a hidden pointer that nobody ever wrote -- it read back as zero.
+/// A scalar `_Float16` fell to the size-based default and was classified
+/// INTEGER, so the argument accounting charged it a general register while the
+/// backend put it in an SSE one.
 fn is_float(kind: TypeKind) -> bool {
     matches!(
         kind,
-        TypeKind::Float | TypeKind::Double | TypeKind::LongDouble
+        TypeKind::Float
+            | TypeKind::Double
+            | TypeKind::LongDouble
+            | TypeKind::Float16
+            | TypeKind::Float128
     )
 }
 

@@ -6067,3 +6067,108 @@ fn test_atomic_plain_assign_uses_atomic_store() {
          Store is the parameter prologue, present in both)"
     );
 }
+
+/// A complex member of an automatic struct is stored as two halves.
+///
+/// A complex value travels by *address*, so storing it the way a scalar member
+/// is stored wrote the address rather than the value. The IR shape that says
+/// this is right is two stores at the base type's width, at the member's
+/// offset and one base width above it -- not a single store at the complex
+/// type's full width.
+#[test]
+fn test_complex_struct_member_init_stores_both_halves() {
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+    let s_tag = ctx.str("S");
+    let complex_double = ctx.types.complex_double_id;
+
+    // struct S { double _Complex z; };
+    let struct_type = Type::struct_type(CompositeType {
+        tag: Some(s_tag),
+        members: vec![StructMember {
+            name: ctx.str("z"),
+            typ: complex_double,
+            offset: 0,
+            bit_width: None,
+            bit_offset: None,
+            storage_unit_size: None,
+            explicit_align: None,
+        }],
+        enum_constants: vec![],
+        size: 16,
+        align: 8,
+        is_complete: true,
+    });
+    let struct_type_id = ctx.types.intern(struct_type);
+    let s_sym = ctx.var("s", struct_type_id);
+
+    // void test(void) { struct S s = { 1.0 }; }
+    //
+    // A *real* initializer is the case that used to crash outright, and it is
+    // the one that proves the zero imaginary half gets written.
+    let init = Expr::typed_unpositioned(
+        ExprKind::InitList {
+            elements: vec![InitElement {
+                designators: vec![],
+                value: Box::new(Expr::typed_unpositioned(
+                    ExprKind::FloatLit(crate::float::FloatVal::from_f64(1.0)),
+                    ctx.types.double_id,
+                )),
+            }],
+        },
+        struct_type_id,
+    );
+    let func = FunctionDef {
+        attrs: Default::default(),
+        return_type: ctx.types.void_id,
+        name: test_id,
+        params: vec![],
+        body: Stmt::Block(vec![BlockItem::Declaration(Declaration {
+            declarators: vec![InitDeclarator {
+                pos: Position::default(),
+                symbol: s_sym,
+                typ: struct_type_id,
+                storage_class: crate::types::TypeModifiers::empty(),
+                init: Some(init),
+                vla_sizes: vec![],
+                explicit_align: None,
+            }],
+        })]),
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
+    };
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+
+    let module = ctx.linearize(&tu);
+    let func = &module.functions[0];
+    let stores: Vec<_> = func
+        .blocks
+        .iter()
+        .flat_map(|b| b.insns.iter())
+        .filter(|i| i.op == Opcode::Store)
+        .filter(|i| i.size == 64)
+        .map(|i| i.offset)
+        .collect();
+
+    // Both halves, at the base type's width. The zeroing pass emits its own
+    // stores, so this asserts the offsets are present rather than counting.
+    assert!(
+        stores.contains(&0) && stores.contains(&8),
+        "expected 64-bit stores at offsets 0 and 8, got {:?}\n{}",
+        stores,
+        module
+    );
+    assert!(
+        !func
+            .blocks
+            .iter()
+            .flat_map(|b| b.insns.iter())
+            .any(|i| i.op == Opcode::Store && i.size == 128),
+        "a complex member must not be stored as one 128-bit value: {}",
+        module
+    );
+}

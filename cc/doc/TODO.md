@@ -77,7 +77,6 @@ does or claims.
 |------|-----------|
 | `_FORTIFY_SOURCE` | Still checks nothing. Five of six layers are done; the one that remains is described above, and is an ordinary compiler feature rather than fortify-specific work |
 | `__attribute__((packed))` on a struct with bitfields | The bitfields are laid out as if the struct were not packed; only the ordinary members lose their padding. `struct { unsigned a:20, b:20; }` is 5 bytes under gcc and 8 here. Packing a bitfield to the bit lets it straddle its `sizeof(T)` window, and a straddling field has no naturally-aligned span to read or write it through — `emit_bitfield_load` addresses one power-of-two unit. Supporting it means an access path that assembles a field from an arbitrary byte range |
-| `isnan()` on a `long double` | 65535 rather than 1. The builtins now exist; glibc only uses them at `__GNUC_PREREQ (4,4)`, and claiming that also demands `__float128` (`bits/floatn.h` turns on `__HAVE_FLOAT128` at 4.3), which x86-64 c17 has no arithmetic for. Both answers conform — C99 7.12.3.4 requires only a nonzero value |
 
 ## Future Features
 

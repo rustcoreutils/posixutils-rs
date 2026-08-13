@@ -9,14 +9,11 @@
 // AArch64 instruction mapping
 //
 
-use crate::abi::CallingConv;
 use crate::arch::mapping::{
-    build_binop_rtlib_call, build_convert_rtlib_call, int_suffix_for_longdouble,
-    longdouble_needs_rtlib, map_int128_divmod, map_int128_expand, map_int128_float_convert,
-    ArchMapper, MappedInsn, MappingCtx,
+    map_binary128, map_int128_divmod, map_int128_expand, map_int128_float_convert, ArchMapper,
+    MappedInsn, MappingCtx,
 };
-use crate::ir::{Instruction, Opcode};
-use crate::types::TypeKind;
+use crate::ir::Instruction;
 
 /// AArch64 instruction mapper.
 pub struct Aarch64Mapper;
@@ -35,184 +32,12 @@ impl ArchMapper for Aarch64Mapper {
         if let Some(r) = map_int128_float_convert(insn, ctx) {
             return r;
         }
-        // aarch64 only: long double → rtlib (Linux, not macOS)
-        if let Some(r) = self.map_longdouble(insn, ctx) {
+        // Shared: IEEE binary128 → rtlib soft-float. On this target that is
+        // `long double` as well as `__float128`.
+        if let Some(r) = map_binary128(insn, ctx) {
             return r;
         }
         MappedInsn::Legal
-    }
-}
-
-impl Aarch64Mapper {
-    /// Classify and expand long double operations via rtlib calls.
-    /// Only applies on aarch64/Linux where long double is 128-bit IEEE quad.
-    fn map_longdouble(&self, insn: &Instruction, ctx: &mut MappingCtx<'_>) -> Option<MappedInsn> {
-        if !longdouble_needs_rtlib(ctx.target) {
-            return None;
-        }
-
-        match insn.op {
-            // Binary arithmetic: FAdd/FSub/FMul/FDiv → single rtlib call
-            Opcode::FAdd | Opcode::FSub | Opcode::FMul | Opcode::FDiv => {
-                let typ = insn.typ?;
-                if ctx.types.kind(typ) != TypeKind::LongDouble {
-                    return None;
-                }
-                let name = match insn.op {
-                    Opcode::FAdd => "__addtf3",
-                    Opcode::FSub => "__subtf3",
-                    Opcode::FMul => "__multf3",
-                    Opcode::FDiv => "__divtf3",
-                    _ => unreachable!(),
-                };
-                let call = build_binop_rtlib_call(insn, name, ctx.types, ctx.target);
-                Some(MappedInsn::Replace(vec![call]))
-            }
-
-            // Negation: FNeg → single rtlib call
-            Opcode::FNeg => {
-                let typ = insn.typ?;
-                if ctx.types.kind(typ) != TypeKind::LongDouble {
-                    return None;
-                }
-                let call = build_binop_rtlib_call(insn, "__negtf2", ctx.types, ctx.target);
-                Some(MappedInsn::Replace(vec![call]))
-            }
-
-            // Comparisons: call rtlib cmp, then compare result against 0
-            Opcode::FCmpOLt
-            | Opcode::FCmpOLe
-            | Opcode::FCmpOGt
-            | Opcode::FCmpOGe
-            | Opcode::FCmpOEq
-            | Opcode::FCmpONe => {
-                if insn.size != 128 {
-                    return None;
-                }
-                // Also check src_typ if available
-                if let Some(src_typ) = insn.src_typ {
-                    if ctx.types.kind(src_typ) != TypeKind::LongDouble {
-                        return None;
-                    }
-                }
-                let (name, cmp_op) = match insn.op {
-                    Opcode::FCmpOLt => ("__lttf2", Opcode::SetLt),
-                    Opcode::FCmpOLe => ("__letf2", Opcode::SetLe),
-                    Opcode::FCmpOGt => ("__gttf2", Opcode::SetGt),
-                    Opcode::FCmpOGe => ("__getf2", Opcode::SetGe),
-                    Opcode::FCmpOEq => ("__eqtf2", Opcode::SetEq),
-                    Opcode::FCmpONe => ("__netf2", Opcode::SetNe),
-                    _ => unreachable!(),
-                };
-
-                let result_pseudo = insn.target.expect("cmp must have target");
-                let int_type = ctx.types.int_id;
-                let int_size = ctx.types.size_bits(int_type);
-                let ld_type = ctx.types.longdouble_id;
-
-                // Allocate pseudo for cmp call result
-                let cmp_result = ctx.func.create_reg_pseudo();
-                let zero = ctx.func.create_const_pseudo(0);
-
-                // Build the rtlib call: cmp_result = __lttf2(left, right)
-                let arg_vals = insn.src.clone();
-                let arg_types = vec![ld_type; arg_vals.len()];
-                let mut call = Instruction::call_with_abi(
-                    Some(cmp_result),
-                    name,
-                    arg_vals,
-                    arg_types,
-                    int_type,
-                    CallingConv::C,
-                    ctx.types,
-                    ctx.target,
-                );
-                call.pos = insn.pos;
-
-                // Build the int comparison: result = cmp_op(cmp_result, 0)
-                let cmp =
-                    Instruction::binop(cmp_op, result_pseudo, cmp_result, zero, int_type, int_size);
-
-                Some(MappedInsn::Replace(vec![call, cmp]))
-            }
-
-            // Float-to-float conversions involving long double
-            Opcode::FCvtF => {
-                let dst_typ = insn.typ?;
-                let src_typ = insn.src_typ?;
-                let dst_kind = ctx.types.kind(dst_typ);
-                let src_kind = ctx.types.kind(src_typ);
-                if src_kind == TypeKind::LongDouble {
-                    // longdouble → float/double
-                    let name = match dst_kind {
-                        TypeKind::Float => "__trunctfsf2",
-                        TypeKind::Double => "__trunctfdf2",
-                        _ => return None,
-                    };
-                    let call = build_convert_rtlib_call(insn, name, ctx.types, ctx.target);
-                    Some(MappedInsn::Replace(vec![call]))
-                } else if dst_kind == TypeKind::LongDouble {
-                    // float/double → longdouble
-                    let name = match src_kind {
-                        TypeKind::Float => "__extendsftf2",
-                        TypeKind::Double => "__extenddftf2",
-                        _ => return None,
-                    };
-                    let call = build_convert_rtlib_call(insn, name, ctx.types, ctx.target);
-                    Some(MappedInsn::Replace(vec![call]))
-                } else {
-                    None
-                }
-            }
-
-            // Int-to-float: int → longdouble
-            Opcode::SCvtF | Opcode::UCvtF => {
-                let dst_typ = insn.typ?;
-                if ctx.types.kind(dst_typ) != TypeKind::LongDouble {
-                    return None;
-                }
-                let src_typ = insn.src_typ?;
-                // Skip int128 (handled by map_int128_float_convert)
-                if ctx.types.kind(src_typ) == TypeKind::Int128 {
-                    return None;
-                }
-                let isuf = int_suffix_for_longdouble(ctx.types, src_typ);
-                let name: &'static str = match isuf {
-                    "si" => "__floatsitf",
-                    "di" => "__floatditf",
-                    "usi" => "__floatunsitf",
-                    "udi" => "__floatunditf",
-                    _ => return None,
-                };
-                let call = build_convert_rtlib_call(insn, name, ctx.types, ctx.target);
-                Some(MappedInsn::Replace(vec![call]))
-            }
-
-            // Float-to-int: longdouble → int
-            Opcode::FCvtS | Opcode::FCvtU => {
-                let src_typ = insn.src_typ?;
-                if ctx.types.kind(src_typ) != TypeKind::LongDouble {
-                    return None;
-                }
-                let dst_typ = insn.typ?;
-                // Skip int128 (handled by map_int128_float_convert)
-                if ctx.types.kind(dst_typ) == TypeKind::Int128 {
-                    return None;
-                }
-                let isuf = int_suffix_for_longdouble(ctx.types, dst_typ);
-                let name: &'static str = match isuf {
-                    "si" => "__fixtfsi",
-                    "di" => "__fixtfdi",
-                    "usi" => "__fixunstfsi",
-                    "udi" => "__fixunstfdi",
-                    _ => return None,
-                };
-                let call = build_convert_rtlib_call(insn, name, ctx.types, ctx.target);
-                Some(MappedInsn::Replace(vec![call]))
-            }
-
-            _ => None,
-        }
     }
 }
 

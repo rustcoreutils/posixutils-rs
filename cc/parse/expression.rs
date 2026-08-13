@@ -251,6 +251,9 @@ impl<'a> Parser<'a> {
         // Both arithmetic: apply usual arithmetic conversions
         // Float types take precedence
         if self.types.is_float(then_typ) || self.types.is_float(else_typ) {
+            if then_kind == TypeKind::Float128 || else_kind == TypeKind::Float128 {
+                return self.types.float128_id;
+            }
             if then_kind == TypeKind::LongDouble || else_kind == TypeKind::LongDouble {
                 return self.types.longdouble_id;
             }
@@ -1039,6 +1042,15 @@ impl<'a> Parser<'a> {
                     // _Float64 is an alias for double (TS 18661-3 / C23)
                     self.advance();
                     base_kind = Some(TypeKind::Double);
+                    parsed_something = true;
+                }
+                crate::kw::FLOAT128 | crate::kw::FLOAT128_ALIAS => {
+                    // IEEE binary128; see the declaration parser's arm.
+                    if !self.types.has_float128() {
+                        break;
+                    }
+                    self.advance();
+                    base_kind = Some(TypeKind::Float128);
                     parsed_something = true;
                 }
                 crate::kw::BOOL => {
@@ -1896,7 +1908,15 @@ impl<'a> Parser<'a> {
         // 3. If either is float, result is float
         // 4. Otherwise, integer promotions apply
 
-        if left_kind == TypeKind::LongDouble || right_kind == TypeKind::LongDouble {
+        if left_kind == TypeKind::Float128 || right_kind == TypeKind::Float128 {
+            // binary128 outranks every other real type: it is wider than x87
+            // extended in the significand, and equal to it in range.
+            if is_complex {
+                self.types.complex_float128_id
+            } else {
+                self.types.float128_id
+            }
+        } else if left_kind == TypeKind::LongDouble || right_kind == TypeKind::LongDouble {
             if is_complex {
                 self.types.complex_longdouble_id
             } else {
@@ -2487,11 +2507,13 @@ impl<'a> Parser<'a> {
             // Signbit builtins - test sign bit of floats
             crate::kw::BUILTIN_ISNAN
             | crate::kw::BUILTIN_ISINF
+            | crate::kw::BUILTIN_ISINF_SIGN
             | crate::kw::BUILTIN_ISFINITE
             | crate::kw::BUILTIN_ISNORMAL => Some((|| {
                 let test = match name_id {
                     crate::kw::BUILTIN_ISNAN => FpTest::IsNan,
                     crate::kw::BUILTIN_ISINF => FpTest::IsInf,
+                    crate::kw::BUILTIN_ISINF_SIGN => FpTest::IsInfSign,
                     crate::kw::BUILTIN_ISFINITE => FpTest::IsFinite,
                     _ => FpTest::IsNormal,
                 };
@@ -3389,26 +3411,53 @@ impl<'a> Parser<'a> {
         let is_float16_suffix = !is_hex && s_lower.ends_with("f16");
         let is_float32_suffix = !is_hex && s_lower.ends_with("f32");
         let is_float64_suffix = !is_hex && s_lower.ends_with("f64");
+        // `q` is GCC's binary128 suffix, and the one glibc's `__f128(x)` pastes
+        // on. Unlike `f16`/`f32`/`f64` it is safe on a hex literal too, since
+        // `q` is not a hex digit. It is a *floating* suffix: gcc rejects
+        // `1q` with "invalid suffix on integer constant", and accepting it
+        // silently reinterpreted an integer as a binary128.
+        let is_quad_suffix = is_float && s_lower.ends_with('q');
+        // The `f128` spelling, which is valid on a hex literal too -- after a
+        // `p` exponent it cannot be mistaken for hex digits. Like `q` it is a
+        // *floating* suffix: `1f128` is an integer constant with a bad suffix,
+        // and `0x1f128` is a hex integer whose last five digits merely spell
+        // one.
+        let is_float128_suffix = is_float && s_lower.ends_with("f128");
 
         // Remove suffixes - but for hex numbers, don't strip a-f as they're digits
-        let num_str = if is_hex && is_float {
-            // Hex float: strip f/l suffixes (they appear after p-exponent, not as hex digits)
-            s_lower.trim_end_matches(['u', 'l', 'f'])
+        let num_str = if is_hex && is_float && is_float128_suffix {
+            s_lower.trim_end_matches("f128")
+        } else if is_hex && is_float {
+            // Hex float: strip f/l/q suffixes (they appear after p-exponent, not as hex digits)
+            s_lower.trim_end_matches(['u', 'l', 'f', 'q'])
         } else if is_hex {
-            // Hex integer: only strip u/l (f is a hex digit)
+            // Hex integer: only strip u/l (f is a hex digit, and `q` is a
+            // floating suffix -- `0x1q` is not a number)
             s_lower.trim_end_matches(['u', 'l'])
+        } else if is_float128_suffix {
+            s_lower.trim_end_matches("f128")
         } else if is_float16_suffix {
             s_lower.trim_end_matches("f16")
         } else if is_float32_suffix {
             s_lower.trim_end_matches("f32")
         } else if is_float64_suffix {
             s_lower.trim_end_matches("f64")
+        } else if is_quad_suffix {
+            s_lower.trim_end_matches('q')
         } else {
-            // For decimal/octal, strip u/l/f suffixes
+            // For decimal/octal, strip u/l/f suffixes. Not `q`: it is a
+            // floating suffix, so `1q` must fail to parse rather than
+            // quietly becoming the integer 1.
             s_lower.trim_end_matches(['u', 'l', 'f'])
         };
 
-        if is_float || is_float16_suffix || is_float32_suffix || is_float64_suffix {
+        if is_float
+            || is_float16_suffix
+            || is_float32_suffix
+            || is_float64_suffix
+            || is_float128_suffix
+            || is_quad_suffix
+        {
             // Float - type depends on suffix:
             // - no suffix = double
             // - f/F = float
@@ -3419,10 +3468,12 @@ impl<'a> Parser<'a> {
             let is_float_suffix = !is_float16_suffix
                 && !is_float32_suffix
                 && !is_float64_suffix
+                && !is_float128_suffix
                 && s_lower.ends_with('f');
             let is_longdouble_suffix = !is_float16_suffix
                 && !is_float32_suffix
                 && !is_float64_suffix
+                && !is_float128_suffix
                 && s_lower.ends_with('l');
             let value: FloatVal = if is_hex {
                 // Hex float parsing: 0x[hex-digits].[hex-digits]p[±exponent]
@@ -3444,7 +3495,15 @@ impl<'a> Parser<'a> {
                     .map_err(|_| ParseError::new(format!("invalid float literal: {}", s), pos))?;
                 FloatVal::from_parts(false, mantissa, exp2)
             };
-            let typ = if is_float16_suffix {
+            let typ = if is_float128_suffix || is_quad_suffix {
+                if !self.types.has_float128() {
+                    return Err(ParseError::new(
+                        format!("__float128 is not supported on this target: {}", s),
+                        pos,
+                    ));
+                }
+                self.types.float128_id
+            } else if is_float16_suffix {
                 self.types.float16_id
             } else if is_float32_suffix {
                 self.types.float_id // f32 is alias for float

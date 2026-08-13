@@ -96,7 +96,7 @@ pub struct InlineCandidate {
     /// Number of times this function is called in the module
     pub call_count: usize,
     /// Whether the function returns a complex value (should not inline)
-    pub returns_complex: bool,
+    pub ret_is_address: bool,
 }
 
 /// Build a map of function name -> call count across the entire module in a single pass.
@@ -135,7 +135,7 @@ fn analyze_function(func: &Function, call_counts: &HashMap<String, usize>) -> In
         is_noinline: func.is_noinline,
         is_always_inline: func.is_always_inline,
         has_inline_hint: func.is_inline,
-        returns_complex: func.returns_complex,
+        ret_is_address: func.ret_is_address,
         ..Default::default()
     };
 
@@ -196,13 +196,13 @@ fn should_inline(
         return false;
     }
 
-    // A complex `Ret` yields the address of the value, but a call's result
-    // pseudo is a local whose slot holds the value itself. Splicing the body
-    // in hands the caller an address where it expects the value, and the
-    // difference is invisible — it reads the first eight bytes of the pointer
-    // as a double. Bridging the two needs the base type and stride, which the
-    // optimizer has no `TypeTable` to look up. See `Function::returns_complex`.
-    if candidate.returns_complex {
+    // Such a `Ret` yields the address of the value, but a call's result pseudo
+    // is a local whose slot holds the value itself. Splicing the body in hands
+    // the caller an address where it expects the value, and the difference is
+    // invisible — it reads the first eight bytes of the pointer as a float.
+    // Bridging the two needs the base type and stride, which the optimizer has
+    // no `TypeTable` to look up. See `Function::ret_is_address`.
+    if candidate.ret_is_address {
         return false;
     }
 
@@ -1294,6 +1294,7 @@ fn collect_func_refs_from_initializer(
                 address_taken.insert(name.clone());
             }
         }
+        Initializer::Float128(_) => {}
         Initializer::Array { elements, .. } => {
             for (_, elem_init) in elements {
                 collect_func_refs_from_initializer(elem_init, func_names, address_taken);
@@ -1433,7 +1434,7 @@ mod tests {
             is_recursive: false,
             uses_varargs: false,
             uses_alloca: false,
-            returns_complex: false,
+            ret_is_address: false,
             call_count: 1,
             is_noinline: false,
             is_always_inline: false,
@@ -1451,7 +1452,7 @@ mod tests {
             is_recursive: false,
             uses_varargs: true,
             uses_alloca: false,
-            returns_complex: false,
+            ret_is_address: false,
             call_count: 1,
             is_noinline: false,
             is_always_inline: false,
@@ -1469,7 +1470,7 @@ mod tests {
             is_recursive: true,
             uses_varargs: false,
             uses_alloca: false,
-            returns_complex: false,
+            ret_is_address: false,
             call_count: 1,
             is_noinline: false,
             is_always_inline: false,
@@ -1487,7 +1488,7 @@ mod tests {
             is_recursive: false,
             uses_varargs: false,
             uses_alloca: false,
-            returns_complex: false,
+            ret_is_address: false,
             call_count: 1,
             is_noinline: false,
             is_always_inline: false,
@@ -1505,7 +1506,7 @@ mod tests {
             is_recursive: false,
             uses_varargs: false,
             uses_alloca: false,
-            returns_complex: false,
+            ret_is_address: false,
             call_count: 1,
             is_noinline: false,
             is_always_inline: false,

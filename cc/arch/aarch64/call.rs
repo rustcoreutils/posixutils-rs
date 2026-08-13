@@ -431,22 +431,10 @@ impl Aarch64CodeGen {
                     stack_arg.size,
                     types,
                 );
-                let fp_sz = stack_arg
-                    .typ
-                    .map(|t| {
-                        if types.kind(t) == TypeKind::Float {
-                            FpSize::Single
-                        } else {
-                            FpSize::Double
-                        }
-                    })
-                    .unwrap_or_else(|| {
-                        if stack_arg.size == 32 {
-                            FpSize::Single
-                        } else {
-                            FpSize::Double
-                        }
-                    });
+                // From the type. A binary128 stack argument stored as a
+                // `double` lost its top half, and the fixed 8-byte stride
+                // below then put the next argument inside it.
+                let fp_sz = self.fp_size_from_type(stack_arg.typ, stack_arg.size, types);
                 self.push_lir(Aarch64Inst::StrFp {
                     size: fp_sz,
                     src: VReg::V16,
@@ -466,7 +454,7 @@ impl Aarch64CodeGen {
                     },
                 });
             }
-            offset += 8;
+            offset += stack_arg.slot_bytes(types, &self.base.target);
         }
 
         // Return number of 16-byte units allocated (for cleanup)

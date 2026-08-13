@@ -33,6 +33,84 @@ const EIGHTBYTE_BITS: u32 = 64;
 #[derive(Debug, Clone, Default)]
 pub struct SysVAmd64Abi;
 
+/// True when an aggregate parameter of this type is System V MEMORY class:
+/// its bytes travel on the stack by value rather than as a pointer in a
+/// register.
+///
+/// Over two eightbytes that is every aggregate. At or below, it is one whose
+/// eightbyte holds a `long double` -- directly, or merged with something else.
+/// The backend needs the same answer in three places (the incoming location,
+/// the prologue, and the caller's copy), and spelling it as `size > 128` in
+/// each is what let the small cases pass a pointer where gcc passes bytes.
+pub fn param_is_memory_class(typ: TypeId, types: &TypeTable) -> bool {
+    let kind = types.kind(typ);
+    (kind == TypeKind::Struct || kind == TypeKind::Union)
+        && matches!(
+            SysVAmd64Abi::new().classify_param(typ, types),
+            ArgClass::Indirect { .. }
+        )
+}
+
+/// How many SSE registers an all-SSE aggregate of nine to sixteen bytes
+/// occupies, or `None` if it is not one.
+///
+/// A struct of two doubles takes two. One holding nothing but a `__float128`
+/// takes **one**: SSE+SSEUP is a single register carrying all sixteen bytes,
+/// and `classes` counts registers rather than eightbytes. Spelling this as
+/// `classes.len() == 2` split a binary128 across xmm0 and xmm1, where a
+/// gcc-compiled peer reads only the first.
+pub fn sse_struct_regs(typ: TypeId, types: &TypeTable) -> Option<usize> {
+    let kind = types.kind(typ);
+    let bits = types.size_bits(typ);
+    if (kind != TypeKind::Struct && kind != TypeKind::Union)
+        || types.is_complex(typ)
+        || bits <= 64
+        || bits > 128
+    {
+        return None;
+    }
+    match SysVAmd64Abi::new().classify_param(typ, types) {
+        ArgClass::Direct { classes, .. }
+            if !classes.is_empty() && classes.iter().all(|c| *c == RegClass::Sse) =>
+        {
+            Some(classes.len())
+        }
+        _ => None,
+    }
+}
+
+/// The single scalar an aggregate consists of, seen through one-member structs
+/// and unions and one-element arrays, or `None` if it holds anything else.
+///
+/// System V classifies `long double` as X87 plus X87UP and binary128 as SSE
+/// plus SSEUP, and in both the *pair* is the unit: an aggregate holding nothing
+/// besides one of them is passed and returned exactly as the bare scalar is.
+/// The moment anything shares an eightbyte the merge rules apply instead, and
+/// gcc confirms both edges -- `union { long double v; double d; }` is MEMORY,
+/// and `union { __float128 v; double d[2]; }` really is two SSE registers.
+fn sole_scalar_content(ty: TypeId, types: &TypeTable) -> Option<TypeId> {
+    let inner = match types.kind(ty) {
+        TypeKind::Struct | TypeKind::Union => {
+            let typ = types.get(ty);
+            let composite = typ.composite.as_ref()?;
+            match composite.members.as_slice() {
+                [only] => sole_scalar_content(only.typ, types)?,
+                _ => return None,
+            }
+        }
+        TypeKind::Array => {
+            let typ = types.get(ty);
+            if typ.array_size != Some(1) {
+                return None;
+            }
+            sole_scalar_content(typ.base?, types)?
+        }
+        _ => return Some(ty),
+    };
+    // An over-aligned or padded wrapper is not the scalar; it is bigger.
+    (types.size_bits(ty) == types.size_bits(inner)).then_some(inner)
+}
+
 impl SysVAmd64Abi {
     /// Create a new System V AMD64 ABI classifier.
     pub fn new() -> Self {
@@ -156,6 +234,25 @@ impl SysVAmd64Abi {
             let offset = i * EIGHTBYTE_BITS;
             let class = self.classify_eightbyte(ty, offset, size_bits - offset, types);
             classes.push(class);
+        }
+
+        // SSE+SSEUP is one register, not two: the upper eightbyte of a
+        // binary128 never travels on its own. `classes` counts *registers* --
+        // a scalar `__float128` has always answered a single Sse with a
+        // 128-bit size -- so an aggregate holding nothing else must answer the
+        // same, or the value is split across xmm0 and xmm1 and a gcc-compiled
+        // peer reads half of it.
+        //
+        // The restriction to *sole* content is load-bearing:
+        // `union { __float128 v; double d[2]; }` merges SSEUP with SSE and
+        // really is two registers, which gcc confirms.
+        if sole_scalar_content(ty, types)
+            .is_some_and(|inner| types.kind(inner) == TypeKind::Float128)
+        {
+            return ArgClass::Direct {
+                classes: vec![RegClass::Sse],
+                size_bits,
+            };
         }
 
         // Post-merge cleanup: if any eightbyte is MEMORY, the whole thing is MEMORY
@@ -365,6 +462,16 @@ impl Abi for SysVAmd64Abi {
 
         // Aggregate types
         if is_aggregate(kind) {
+            // X87 + X87UP comes back in st(0), exactly as the bare scalar
+            // does: gcc emits `fld1; ret` for
+            // `struct R { long double v; } f(void)`. Only the *return*
+            // differs -- as an argument the class is MEMORY, which
+            // `classify_aggregate` already answers with `Indirect`.
+            if sole_scalar_content(ty, types)
+                .is_some_and(|inner| types.kind(inner) == TypeKind::LongDouble)
+            {
+                return ArgClass::X87 { size_bits };
+            }
             return self.classify_aggregate(ty, types);
         }
 
@@ -387,13 +494,230 @@ impl Abi for SysVAmd64Abi {
 mod tests {
     use super::*;
 
-    // Note: More comprehensive tests require a TypeTable, which would be
-    // created in integration tests. These tests verify basic behavior.
+    use crate::target::{Arch, Os, Target};
+    use crate::types::{CompositeType, StructMember, Type};
 
     #[test]
     fn test_abi_creation() {
         let abi = SysVAmd64Abi::new();
         // Basic sanity - just ensure it constructs
         assert_eq!(format!("{:?}", abi), "SysVAmd64Abi");
+    }
+
+    /// A `TypeTable` for the x86-64 System V target these rules describe.
+    fn x86_types() -> TypeTable {
+        TypeTable::new(&Target::new(Arch::X86_64, Os::Linux))
+    }
+
+    /// A one-member struct wrapping `member`.
+    fn wrap(types: &mut TypeTable, member: TypeId) -> TypeId {
+        let size = (types.size_bits(member) / 8) as usize;
+        let align = types.alignment(member);
+        types.intern(Type::struct_type(CompositeType {
+            tag: None,
+            members: vec![StructMember {
+                name: crate::strings::StringId::default(),
+                typ: member,
+                offset: 0,
+                bit_width: None,
+                bit_offset: None,
+                storage_unit_size: None,
+                explicit_align: None,
+            }],
+            enum_constants: vec![],
+            size,
+            align,
+            is_complete: true,
+        }))
+    }
+
+    /// `_Float16` is a floating type, scalar or wrapped.
+    ///
+    /// It was missing from the classifier's `is_float`, so an eightbyte
+    /// holding one reached the default arm and answered MEMORY: a
+    /// `struct { _Float16 h; }` was returned through a hidden pointer that
+    /// nothing ever wrote, and read back as zero. A scalar one fell to the
+    /// size-based default and was classified INTEGER, so the argument
+    /// accounting charged it a general register while the backend used an SSE
+    /// one.
+    #[test]
+    fn float16_is_classified_as_a_floating_type() {
+        let abi = SysVAmd64Abi::new();
+        let mut types = x86_types();
+        let half = types.float16_id;
+
+        assert!(
+            matches!(abi.classify_return(half, &types),
+                     ArgClass::Direct { ref classes, .. } if classes == &[RegClass::Sse]),
+            "scalar _Float16 returns in an SSE register, got {:?}",
+            abi.classify_return(half, &types)
+        );
+        assert!(
+            matches!(abi.classify_param(half, &types),
+                     ArgClass::Direct { ref classes, .. } if classes == &[RegClass::Sse]),
+            "scalar _Float16 is passed in an SSE register"
+        );
+
+        let wrapped = wrap(&mut types, half);
+        assert!(
+            matches!(abi.classify_return(wrapped, &types),
+                     ArgClass::Direct { ref classes, size_bits }
+                         if classes == &[RegClass::Sse] && size_bits == 16),
+            "struct {{ _Float16 }} returns in one SSE register, got {:?}",
+            abi.classify_return(wrapped, &types)
+        );
+        assert!(
+            !matches!(
+                abi.classify_return(wrapped, &types),
+                ArgClass::Indirect { .. }
+            ),
+            "struct {{ _Float16 }} must not be returned through a hidden pointer"
+        );
+    }
+
+    /// An aggregate that is nothing but a `long double` is returned in st(0),
+    /// and one that merges it with anything else is MEMORY.
+    ///
+    /// System V classifies the two eightbytes X87 and X87UP, and X87UP is
+    /// preceded by X87, so the merge-to-MEMORY rule does not fire -- gcc emits
+    /// `fld1; ret` for `struct R { long double v; } f(void)`. As an *argument*
+    /// the class really is MEMORY, which is why only the return arm asks.
+    #[test]
+    fn a_lone_long_double_aggregate_returns_in_st0() {
+        let abi = SysVAmd64Abi::new();
+        let mut types = x86_types();
+        let ld = types.longdouble_id;
+
+        // Directly, and through the wrappers `sole_scalar_content` sees past.
+        let plain = wrap(&mut types, ld);
+        let nested = wrap(&mut types, plain);
+        let arr1 = types.intern(Type::array(ld, 1));
+        let wrapped_arr = wrap(&mut types, arr1);
+        for (name, ty) in [
+            ("struct { long double }", plain),
+            ("struct { struct { long double } }", nested),
+            ("struct { long double[1] }", wrapped_arr),
+        ] {
+            assert!(
+                matches!(abi.classify_return(ty, &types), ArgClass::X87 { .. }),
+                "{name} returns in st(0), got {:?}",
+                abi.classify_return(ty, &types)
+            );
+            assert!(
+                matches!(abi.classify_param(ty, &types), ArgClass::Indirect { .. }),
+                "{name} is MEMORY class as an argument"
+            );
+        }
+
+        // Two elements is not a lone scalar, and neither is a longer array.
+        let arr2 = types.intern(Type::array(ld, 2));
+        let wrapped_arr2 = wrap(&mut types, arr2);
+        assert!(
+            matches!(
+                abi.classify_return(wrapped_arr2, &types),
+                ArgClass::Indirect { .. }
+            ),
+            "two long doubles are over two eightbytes and go in memory"
+        );
+    }
+
+    /// An aggregate that is nothing but a `__float128` travels in one SSE
+    /// register, not two.
+    ///
+    /// System V classifies binary128 SSE + SSEUP, and SSEUP never travels on
+    /// its own: the pair is one register carrying all sixteen bytes, which is
+    /// what a scalar `__float128` has always answered. Counting the eightbytes
+    /// instead split the value across xmm0 and xmm1, where a gcc-compiled peer
+    /// reads only the first half.
+    #[test]
+    fn a_lone_binary128_aggregate_travels_in_one_register() {
+        let abi = SysVAmd64Abi::new();
+        let mut types = x86_types();
+        let q = types.float128_id;
+
+        let plain = wrap(&mut types, q);
+        let nested = wrap(&mut types, plain);
+        for (name, ty) in [
+            ("struct { __float128 }", plain),
+            ("struct { struct { __float128 } }", nested),
+        ] {
+            for class in [
+                abi.classify_return(ty, &types),
+                abi.classify_param(ty, &types),
+            ] {
+                assert!(
+                    matches!(class, ArgClass::Direct { ref classes, size_bits }
+                             if classes == &[RegClass::Sse] && size_bits == 128),
+                    "{name} takes one SSE register of sixteen bytes, got {class:?}"
+                );
+            }
+        }
+
+        // Merged with anything else it really is two registers, which is the
+        // edge that makes the "sole content" restriction load-bearing.
+        let d = types.double_id;
+        let arr2 = types.intern(Type::array(d, 2));
+        let mixed = types.intern(Type::union_type(CompositeType {
+            tag: None,
+            members: vec![
+                StructMember {
+                    name: crate::strings::StringId::default(),
+                    typ: q,
+                    offset: 0,
+                    bit_width: None,
+                    bit_offset: None,
+                    storage_unit_size: None,
+                    explicit_align: None,
+                },
+                StructMember {
+                    name: crate::strings::StringId::default(),
+                    typ: arr2,
+                    offset: 0,
+                    bit_width: None,
+                    bit_offset: None,
+                    storage_unit_size: None,
+                    explicit_align: None,
+                },
+            ],
+            enum_constants: vec![],
+            size: 16,
+            align: 16,
+            is_complete: true,
+        }));
+        assert!(
+            matches!(abi.classify_param(mixed, &types),
+                     ArgClass::Direct { ref classes, .. } if classes.len() == 2),
+            "a binary128 merged with two doubles is two registers, got {:?}",
+            abi.classify_param(mixed, &types)
+        );
+    }
+
+    /// The other floating types keep the classification they had.
+    #[test]
+    fn the_other_floating_types_are_unchanged() {
+        let abi = SysVAmd64Abi::new();
+        let mut types = x86_types();
+
+        for (name, id) in [("float", types.float_id), ("double", types.double_id)] {
+            assert!(
+                matches!(abi.classify_return(id, &types),
+                         ArgClass::Direct { ref classes, .. } if classes == &[RegClass::Sse]),
+                "{name} returns in an SSE register"
+            );
+        }
+        // `long double` is x87 and its wrapper is MEMORY as an argument.
+        assert!(matches!(
+            abi.classify_return(types.longdouble_id, &types),
+            ArgClass::X87 { .. }
+        ));
+        let ld = types.longdouble_id;
+        let wrapped_ld = wrap(&mut types, ld);
+        assert!(
+            matches!(
+                abi.classify_param(wrapped_ld, &types),
+                ArgClass::Indirect { .. }
+            ),
+            "a struct holding a long double is MEMORY class as an argument"
+        );
     }
 }

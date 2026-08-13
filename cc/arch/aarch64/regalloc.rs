@@ -650,6 +650,25 @@ pub struct SpilledArg {
     pub from_fp_reg: Option<VReg>,
     /// The stack offset where it was spilled to
     pub to_stack_offset: i32,
+    /// Bytes the value occupies.
+    ///
+    /// A `long double` is binary128 here, so an FP argument spilled across a
+    /// call needs all sixteen; the prologue used to store eight unconditionally
+    /// and the value came back with its top half missing.
+    pub bytes: i32,
+}
+
+/// Bytes an argument pseudo's value occupies, from the function's parameter
+/// list. Eight when it cannot be identified, which is what every argument but
+/// a binary128 one needs anyway.
+fn fp_arg_bytes(func: &Function, pseudo: PseudoId, types: &TypeTable) -> i32 {
+    func.get_pseudo(pseudo)
+        .and_then(|p| match p.kind {
+            PseudoKind::Arg(idx) => func.params.get(idx as usize),
+            _ => None,
+        })
+        .map(|(_, typ)| if types.size_bits(*typ) > 64 { 16 } else { 8 })
+        .unwrap_or(8)
 }
 
 /// Map a single-letter GCC operand-constraint Fixed-register letter
@@ -1092,7 +1111,7 @@ impl RegAlloc {
         let constraint_points = result.constraint_points;
         let call_positions = find_call_positions(func, is_call_like_aarch64);
 
-        self.spill_args_across_calls(func, &intervals, &call_positions);
+        self.spill_args_across_calls(func, types, &intervals, &call_positions);
         self.allocate_alloca_to_stack(func);
         self.run_chordal_color(func, types, intervals, &call_positions, &constraint_points);
 
@@ -1158,7 +1177,7 @@ impl RegAlloc {
             match &arg.class {
                 // Float / double / Float16 / long double — single V register
                 // (or stack slot when V0–V7 are exhausted).
-                ArgClass::Direct { classes, .. }
+                ArgClass::Direct { classes, size_bits }
                     if classes.len() == 1 && classes[0] == RegClass::Sse =>
                 {
                     if fp_arg_idx < fp_arg_regs.len() {
@@ -1169,7 +1188,11 @@ impl RegAlloc {
                     } else {
                         self.locations.insert(pseudo, Loc::Stack(stack_arg_offset));
                         self.fp_pseudos.insert(pseudo);
-                        stack_arg_offset += 8;
+                        // A binary128 argument occupies two eightbytes on the
+                        // stack. Advancing by one put the next argument's slot
+                        // inside this one's upper half -- the caller stores
+                        // sixteen bytes, so they must be read back that way.
+                        stack_arg_offset += ((*size_bits / 8) as i32 + 7) & !7;
                     }
                     fp_arg_idx += 1;
                 }
@@ -1261,7 +1284,8 @@ impl RegAlloc {
     /// Spill arguments in caller-saved registers if their interval crosses a call
     fn spill_args_across_calls(
         &mut self,
-        _func: &Function,
+        func: &Function,
+        types: &TypeTable,
         intervals: &[LiveInterval],
         call_positions: &[usize],
     ) {
@@ -1296,6 +1320,7 @@ impl RegAlloc {
                     from_gp_reg: Some(from_reg),
                     from_fp_reg: None,
                     to_stack_offset: -to_stack_offset,
+                    bytes: 8,
                 });
             },
             |reg| free_regs.push(reg),
@@ -1308,7 +1333,11 @@ impl RegAlloc {
                 if fp_arg_regs_set.contains(reg) && interval_crosses_call(interval, call_positions)
                 {
                     let from_reg = *reg;
-                    self.stack_offset += 8;
+                    // Reserve what the value actually needs: a binary128
+                    // argument is sixteen bytes, and eight left half of it
+                    // overlapping whatever came next.
+                    let bytes = fp_arg_bytes(func, interval.pseudo, types);
+                    self.stack_offset += bytes;
                     let to_stack_offset = -self.stack_offset;
 
                     // Record the spill for codegen to emit stores in prologue
@@ -1317,6 +1346,7 @@ impl RegAlloc {
                         from_gp_reg: None,
                         from_fp_reg: Some(from_reg),
                         to_stack_offset,
+                        bytes,
                     });
 
                     self.locations

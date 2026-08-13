@@ -1179,6 +1179,18 @@ impl Instruction {
     }
 
     /// Check if this call/return uses two registers for the return value.
+    /// True when this `Ret` hands its value back in st(0).
+    ///
+    /// The source is then the value's *address*, not the value: an x87 return
+    /// is loaded onto the FPU stack from memory, since nothing else can hold
+    /// an 80-bit value.
+    pub fn returns_via_x87(&self) -> bool {
+        self.abi_info
+            .as_ref()
+            .map(|ai| matches!(ai.ret, ArgClass::X87 { .. }))
+            .unwrap_or(false)
+    }
+
     pub fn returns_two_regs(&self) -> bool {
         self.abi_info
             .as_ref()
@@ -1545,16 +1557,21 @@ pub struct Function {
     pub implicit_param_copies: Vec<ImplicitParamCopy>,
     /// Does this function return a complex value?
     ///
-    /// Complex returns are the one place where the two representations of a
-    /// complex value meet: the callee's `Ret` carries the *address* of the
-    /// value, while at a call site the backend stores the returned registers
-    /// into the result local, so that pseudo's slot holds the value itself.
-    /// Inlining splices the callee's body in and drops the call, which would
-    /// hand the caller an address where it expects a value.
+    /// True when this function's `Ret` carries the *address* of the returned
+    /// value rather than the value.
+    ///
+    /// Two returns are shaped that way: a `_Complex` one, and an aggregate
+    /// that is nothing but a `long double`, which comes back in st(0) and so
+    /// is loaded from memory. At a call site the backend stores the returned
+    /// registers into the result local, so that pseudo's slot holds the value
+    /// itself. Inlining splices the callee's body in and drops the call, which
+    /// would hand the caller an address where it expects a value -- and the
+    /// difference is invisible, since it reads the first eight bytes of the
+    /// pointer as a float.
     ///
     /// Bridging the two needs the base type and stride, and the optimizer has
     /// no `TypeTable` to ask, so such functions are simply not inlined.
-    pub returns_complex: bool,
+    pub ret_is_address: bool,
     /// Block ID -> index in `blocks` vec (O(1) lookup)
     block_idx: HashMap<BasicBlockId, usize>,
     /// Pseudo ID -> index in `pseudos` vec (O(1) lookup)
@@ -1582,7 +1599,7 @@ impl Default for Function {
             destructor: None,
             is_inline: false,
             implicit_param_copies: Vec::new(),
-            returns_complex: false,
+            ret_is_address: false,
             block_idx: HashMap::with_capacity(DEFAULT_BLOCK_CAPACITY),
             pseudo_idx: HashMap::with_capacity(DEFAULT_PSEUDO_CAPACITY),
         }
@@ -1775,6 +1792,13 @@ pub enum Initializer {
     Int(i128),
     /// Float/double initializer
     Float(FloatVal),
+    /// An IEEE binary128 initializer.
+    ///
+    /// Distinct from `Float` because the 16-byte encoding is not decided by
+    /// the width: on x86-64 a 16-byte float initializer is x87's 80-bit image
+    /// unless the object is a `__float128`. The type knows; the byte count
+    /// does not, so the type records it here.
+    Float128(FloatVal),
     /// String literal initializer (for char arrays)
     String(String),
     /// Wide string literal initializer (for wchar_t arrays)
@@ -1814,7 +1838,7 @@ impl Initializer {
         match self {
             Initializer::None => true,
             Initializer::Int(v) => *v == 0,
-            Initializer::Float(v) => v.is_positive_zero(),
+            Initializer::Float(v) | Initializer::Float128(v) => v.is_positive_zero(),
             // A zero-length string is all-zero; a non-empty char array initialized
             // by a string literal is zero iff every byte is `\0`.
             Initializer::String(s) => s.chars().all(|c| c == '\0'),
@@ -1846,7 +1870,8 @@ impl Initializer {
             Initializer::Struct { fields, .. } => {
                 fields.iter().any(|(_, _, init)| init.has_reloc())
             }
-            Initializer::None
+            Initializer::Float128(_)
+            | Initializer::None
             | Initializer::Int(_)
             | Initializer::Float(_)
             | Initializer::String(_)
@@ -1862,7 +1887,7 @@ impl fmt::Display for Initializer {
         match self {
             Initializer::None => write!(f, "0"),
             Initializer::Int(v) => write!(f, "{}", v),
-            Initializer::Float(v) => write!(f, "{}", v),
+            Initializer::Float(v) | Initializer::Float128(v) => write!(f, "{}", v),
             Initializer::String(s) => write!(f, "\"{}\"", s.escape_default()),
             Initializer::WideString(s) => write!(f, "L\"{}\"", s.escape_default()),
             Initializer::Utf16String(u) => write!(f, "u\"<{} units>\"", u.len()),

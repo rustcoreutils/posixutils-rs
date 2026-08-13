@@ -409,3 +409,301 @@ int main(void)
 "#;
     assert_eq!(compile_and_run("bitfield_allocation", src, &[]), 0);
 }
+
+// ============================================================================
+// __float128 / _Float128 — IEEE binary128
+// ============================================================================
+
+/// `__float128` is a first-class arithmetic type on every target.
+///
+/// It is IEEE binary128 everywhere, unlike `long double`, which is x87's
+/// 80-bit format on x86-64, binary128 on aarch64 Linux and plain `double` on
+/// Apple's arm64. Neither target has hardware binary128, so every operation
+/// becomes a libgcc `__*tf*` call; what this asserts is that the *results*
+/// are right, whichever way the value got there.
+///
+/// Every expectation was checked against gcc on the same source.
+#[test]
+fn c99_float128_is_a_first_class_type() {
+    let src = r#"
+#include <float.h>
+#include <string.h>
+#ifdef __FLT128_MANT_DIG__
+
+__attribute__((noinline)) static __float128 add(__float128 a, __float128 b) { return a + b; }
+__attribute__((noinline)) static __float128 mul(__float128 a, __float128 b) { return a * b; }
+__attribute__((noinline)) static int lt(__float128 a, __float128 b) { return a < b; }
+
+/* Static initializers, including one below x87's smallest subnormal. */
+static __float128 g_tenth = 0.1q;
+static __float128 g_min = __FLT128_MIN__;
+static __float128 g_denorm = __FLT128_DENORM_MIN__;
+static __float128 g_zero = 0.0q;
+
+static int bits_are(__float128 v, unsigned long long hi, unsigned long long lo)
+{
+    unsigned long long a, b;
+    memcpy(&a, &v, 8);
+    memcpy(&b, (char *)&v + 8, 8);
+    return a == lo && b == hi;
+}
+
+int main(void)
+{
+    if (sizeof(__float128) != 16) return 1;
+    if (_Alignof(__float128) != 16) return 2;
+    if (__FLT128_MANT_DIG__ != 113) return 3;
+
+    /* Arithmetic, through the ABI: passed and returned by value. */
+    if (add(1.5q, 2.25q) != 3.75q) return 4;
+    if (mul(3.0q, 0.25q) != 0.75q) return 5;
+    if (!lt(1.0q, 2.0q) || lt(2.0q, 1.0q)) return 6;
+
+    /* Every comparison. */
+    __float128 a = 1.0q, b = 2.0q;
+    if (!(a < b) || !(a <= b) || (a > b) || (a >= b) || (a == b) || !(a != b)) return 7;
+    if (!(b >= b) || !(b <= b) || !(b == b)) return 8;
+
+    /* Conversions in both directions. */
+    if ((double)1.5q != 1.5) return 9;
+    if ((__float128)1.5 != 1.5q) return 10;
+    if ((__float128)1.5f != 1.5q) return 11;
+    if ((__float128)1.5L != 1.5q) return 12;
+    if ((int)42.9q != 42) return 13;
+    if ((long)-7.5q != -7) return 14;
+    if ((__float128)1234567 != 1234567.0q) return 15;
+    if ((__float128)-3 != -3.0q) return 16;
+
+    /* Negation, and the sign of zero. */
+    if (-1.5q != -1.5q) return 17;
+    if (!bits_are(-0.0q, 0x8000000000000000ULL, 0)) return 18;
+
+    /* The literal reaches binary128 exactly: 0.1 needs all 113 bits, and
+       gcc emits this pattern for it. */
+    if (!bits_are(g_tenth, 0x3ffb999999999999ULL, 0x999999999999999aULL)) return 19;
+    if (!bits_are(g_min, 0x0001000000000000ULL, 0)) return 20;
+
+    /* Below x87's smallest subnormal, so this is the case that a value
+       routed through the 80-bit format loses entirely. */
+    if (!bits_are(g_denorm, 0, 1)) return 21;
+    if (!bits_are(g_zero, 0, 0)) return 22;
+    if (!(g_denorm > 0.0q) || !(g_denorm < g_min)) return 23;
+
+    /* Locals take the same path as globals. */
+    __float128 l_denorm = __FLT128_DENORM_MIN__;
+    if (!bits_are(l_denorm, 0, 1)) return 24;
+
+    /* Arrays and assignment. */
+    __float128 arr[3] = {1.0q, 2.0q, 3.0q};
+    if (arr[1] != 2.0q) return 25;
+    arr[2] = add(arr[0], arr[1]);
+    if (arr[2] != 3.0q) return 26;
+
+    /* `_Float128` is the same type under its C23 spelling. */
+    _Float128 c23 = 1.5q;
+    if (c23 != 1.5q) return 27;
+
+    /* The `f128` suffix agrees with `q`. */
+    if (1.5f128 != 1.5q) return 28;
+
+    return 0;
+}
+#else
+/* The type does not exist on this target; see `TypeTable::has_float128`. */
+int main(void) { return 0; }
+#endif
+"#;
+    assert_eq!(compile_and_run("float128_first_class", src, &[]), 0);
+}
+
+/// A constant expression is folded in its own format, exactly.
+///
+/// Folding used to narrow both operands to `f64` first, which cost a `long
+/// double` eleven significand bits and a `__float128` sixty: `1.0q/3.0q`
+/// emitted `3ffd5555555555555000...` where gcc emits `...5555555555555555`,
+/// and `1.0q + 1e-30q` collapsed to exactly `1.0`. The sharp edge was that
+/// the *same initializer written for a local* is computed at run time and was
+/// right, so the static and automatic forms of one expression disagreed --
+/// which is what this checks, alongside the bits themselves.
+///
+/// Every expected pattern was taken from gcc compiling the same expression.
+#[test]
+fn c99_constant_folding_is_exact_in_the_expressions_own_format() {
+    let src = r#"
+#include <float.h>
+#include <string.h>
+
+static int fail;
+
+#define CHECK_LD(expr, se_want, sig_want) do {                              \
+    static long double s = (expr);                                          \
+    long double l = (expr);                                                 \
+    unsigned long long sig; unsigned short se;                              \
+    memcpy(&sig, &s, 8); memcpy(&se, (char *)&s + 8, 2);                    \
+    if (LDBL_MANT_DIG == 64 && (se != (se_want) || sig != (sig_want)))      \
+        fail = __LINE__;                                                    \
+    /* Only the ten bytes x87 defines: the padding is indeterminate. */     \
+    if (memcmp(&s, &l, LDBL_MANT_DIG == 64 ? 10 : sizeof s) != 0)           \
+        fail = __LINE__;                                                    \
+} while (0)
+
+#ifdef __FLT128_MANT_DIG__
+#define CHECK_Q(expr, hi_want, lo_want) do {                                \
+    static __float128 s = (expr);                                           \
+    __float128 l = (expr);                                                  \
+    unsigned long long lo, hi;                                              \
+    memcpy(&lo, &s, 8); memcpy(&hi, (char *)&s + 8, 8);                     \
+    if (hi != (hi_want) || lo != (lo_want)) fail = __LINE__;                \
+    if (memcmp(&s, &l, sizeof s) != 0) fail = __LINE__;                     \
+} while (0)
+#else
+#define CHECK_Q(expr, hi_want, lo_want) do { } while (0)
+#endif
+
+int main(void)
+{
+    /* The headline case: a repeating quotient keeps all 113 bits. */
+    CHECK_Q(1.0q/3.0q,   0x3ffd555555555555ULL, 0x5555555555555555ULL);
+    CHECK_Q(2.0q/7.0q,   0x3ffd249249249249ULL, 0x2492492492492492ULL);
+
+    /* An addend sixty bits below the leading one survives, where narrowing
+       to double dropped it and left exactly 1.0. */
+    CHECK_Q(1.0q + 1e-30q, 0x3fff000000000000ULL, 0x0000000000001448ULL);
+
+    /* Ties at the 113th bit go to even, and only when they are exact ties. */
+    CHECK_Q(1.0q + 0x1p-113q,             0x3fff000000000000ULL, 0ULL);
+    CHECK_Q(1.0q + 0x1.8p-113q,           0x3fff000000000000ULL, 1ULL);
+    CHECK_Q((1.0q + 0x1p-112q) + 0x1p-113q, 0x3fff000000000000ULL, 2ULL);
+
+    /* The subnormal floor, from both sides, and overflow past it. */
+    CHECK_Q(0x1p-16494q / 2.0q,   0ULL, 0ULL);
+    CHECK_Q(0x1.8p-16494q / 2.0q, 0ULL, 1ULL);
+    CHECK_Q(1e4932q * 10.0q,      0x7fff000000000000ULL, 0ULL);
+
+    /* An integer operand converts exactly rather than through double: this
+       one needs 54 bits. */
+    CHECK_Q((__float128)9007199254740993 + 0.0q,
+            0x4034000000000000ULL, 0x0800000000000000ULL);
+
+    /* A chain rounds once per operation, not once at the end. */
+    CHECK_Q(((1.0q/7.0q + 1.0q/11.0q) * 13.0q) / 17.0q,
+            0x3ffc6e1afd1103b7ULL, 0x3f8f5a284988b3ecULL);
+
+    /* x87's 64-bit significand is the other width folding used to lose. */
+    CHECK_LD(1.0L/3.0L,       0x3ffd, 0xaaaaaaaaaaaaaaabULL);
+    CHECK_LD(1.0L + 0x1p-64L, 0x3fff, 0x8000000000000000ULL);
+    CHECK_LD(1.0L + 0x1.8p-64L, 0x3fff, 0x8000000000000001ULL);
+    CHECK_LD(2.0L/7.0L*3.0L,  0x3ffe, 0xdb6db6db6db6db6eULL);
+
+    return fail;
+}
+"#;
+    assert_eq!(compile_and_run("constant_folding_exact", src, &[]), 0);
+}
+
+/// `__float128` outranks every other real type in the usual arithmetic
+/// conversions -- it has more significand bits than x87 extended and the same
+/// exponent range, so a mixed expression is computed at binary128.
+#[test]
+fn c99_float128_outranks_long_double() {
+    let src = r#"
+#include <float.h>
+#ifdef __FLT128_MANT_DIG__
+int main(void)
+{
+    /* 0.1 is inexact in every binary format, and the three formats round it
+       differently -- so the result type is observable. */
+    __float128 q = 0.1q;
+    long double l = 0.1L;
+    double d = 0.1;
+
+    if (sizeof(q + l) != sizeof(__float128)) return 1;
+    if (sizeof(l + q) != sizeof(__float128)) return 2;
+    if (sizeof(q + d) != sizeof(__float128)) return 3;
+    if (sizeof(q + 1) != sizeof(__float128)) return 4;
+    if (sizeof(1 ? q : l) != sizeof(__float128)) return 5;
+
+#if LDBL_MANT_DIG != 113
+    /* And the arithmetic really is done at that width: 0.1q and 0.1L differ,
+       so promoting the long double cannot make them equal. Only where the
+       two are different formats -- on aarch64 Linux `long double` *is*
+       binary128, and there they are the same number. */
+    if (q == l) return 6;
+#endif
+
+    return 0;
+}
+#else
+int main(void) { return 0; }
+#endif
+"#;
+    assert_eq!(compile_and_run("float128_rank", src, &[]), 0);
+}
+
+/// The cases a code review found after the first `__float128` pass, each of
+/// which the original tests missed by staying on the easy path.
+///
+/// Checked against gcc on the same source.
+#[test]
+fn c99_float128_edge_cases() {
+    let src = r#"
+#include <float.h>
+#include <string.h>
+#ifdef __FLT128_MANT_DIG__
+
+/* More than eight, so the last two are passed on the stack. A binary128 is
+   two eightbytes; reserving one, or advancing the incoming offset by one,
+   put the second stack argument inside the first one's upper half. */
+__attribute__((noinline)) static __float128 ten(__float128 a, __float128 b,
+    __float128 c, __float128 d, __float128 e, __float128 f, __float128 g,
+    __float128 h, __float128 i, __float128 j)
+{
+    return a + i + j;
+}
+
+/* long double <-> binary128. On x86-64 these are different formats of the
+   same width, so a width comparison elided the conversion entirely and one
+   format's bytes were read as the other's. */
+__attribute__((noinline)) static __float128 widen(long double x) { return (__float128)x; }
+__attribute__((noinline)) static long double narrow(__float128 x) { return (long double)x; }
+
+int main(void)
+{
+    if (ten(1.0q, 2.0q, 3.0q, 4.0q, 5.0q, 6.0q, 7.0q, 8.0q, 9.0q, 10.0q) != 20.0q)
+        return 1;
+
+    /* Round-trips through the wider format exactly. */
+    if (narrow(widen(0.5L)) != 0.5L) return 2;
+    if (widen(2.0L) != 2.0q) return 3;
+    if (narrow(2.0q) != 2.0L) return 4;
+
+    /* And a value long double can hold but double cannot survives it. */
+    long double big = 1.0L;
+    big = big / 3.0L;
+    if (narrow(widen(big)) != big) return 5;
+
+    /* A cast rounds to the target format even when folded at compile time:
+       these two must agree. */
+    static __float128 folded = (float)0.1q;
+    volatile __float128 v = 0.1q;
+    __float128 at_runtime = (float)v;
+    if (folded != at_runtime) return 6;
+
+    /* `f128` is valid on a hex literal, and `q` is a floating suffix. */
+    if (0x1p0f128 != 1.0q) return 7;
+    if (0x1.8p1q != 3.0q) return 8;
+
+    /* `0x1f128` is a hex *integer* whose last digits merely spell the
+       suffix -- 0x1f128 is 127272. Both `q` and `f128` are floating
+       suffixes, so neither attaches to an integer constant; that half is
+       asserted in the diagnostics suite, which can check a rejection. */
+    if (0x1f128 != 127272) return 9;
+
+    return 0;
+}
+#else
+int main(void) { return 0; }
+#endif
+"#;
+    assert_eq!(compile_and_run("float128_edge_cases", src, &[]), 0);
+}

@@ -828,3 +828,49 @@ fn diagnostics_labels_and_tags_are_unaffected() {
         "struct offsetof { int x; };\nint main(void){ struct offsetof s; s.x = 0; return s.x; }\n",
     );
 }
+
+// ============================================================================
+// Floating suffixes on integer constants
+// ============================================================================
+
+/// `q` and `f128` are *floating* suffixes, so neither attaches to an integer
+/// constant.
+///
+/// Both were accepted at first, silently reinterpreting an integer as a
+/// binary128: `return 1q;` compiled and returned garbage. gcc rejects both
+/// with "invalid suffix on integer constant". The `f128` half survived the
+/// first fix because only `q` was gated on the literal being floating.
+#[test]
+fn diagnostics_binary128_suffixes_need_a_floating_constant() {
+    for (name, src) in [
+        ("int_q", "int main(void){ return 1q; }\n"),
+        ("int_f128", "int main(void){ return 1f128; }\n"),
+        ("octal_q", "int main(void){ return 07q; }\n"),
+    ] {
+        compile_expect_error(name, src, "invalid integer literal");
+    }
+
+    // A hex integer whose last digits merely spell a suffix is still an
+    // integer, on every target.
+    compile_expect_ok(
+        "hex_int_spelling_a_suffix",
+        "int main(void){ return 0x1f128 != 127272; }\n",
+    );
+
+    // The floating forms are accepted where the type exists. Where it does
+    // not, a `q` literal has nowhere to live and is rejected with it, so the
+    // body is compiled out rather than asserted either way.
+    compile_expect_ok(
+        "binary128_literals",
+        concat!(
+            "#include <float.h>\n",
+            "#ifdef __FLT128_MANT_DIG__\n",
+            "__float128 a = 1.0q;\n",
+            "__float128 b = 0x1p0f128;\n",
+            "int main(void){ return a != b; }\n",
+            "#else\n",
+            "int main(void){ return 0; }\n",
+            "#endif\n",
+        ),
+    );
+}

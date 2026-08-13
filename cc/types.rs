@@ -10,6 +10,7 @@
 // Compositional type model with interning for efficient comparison
 //
 
+use crate::float::FpFormat;
 use crate::strings::StringId;
 use crate::target::{Arch, Os, Target};
 use std::collections::HashMap;
@@ -185,6 +186,13 @@ pub enum TypeKind {
     /// _Float16 - IEEE 754 binary16 (half precision)
     /// TS 18661-3 / C23 interchange type
     Float16,
+    /// __float128 / _Float128 - IEEE 754 binary128 (quad precision).
+    ///
+    /// Distinct from `LongDouble` even where the two share a format: on
+    /// aarch64 Linux `long double` *is* binary128, but on x86-64 it is the
+    /// x87 80-bit format and binary128 is a separate type with its own ABI.
+    /// Keeping them apart is what lets one lowering serve both.
+    Float128,
 
     // Derived types
     Pointer,
@@ -219,6 +227,7 @@ impl fmt::Display for TypeKind {
             TypeKind::Double => write!(f, "double"),
             TypeKind::LongDouble => write!(f, "long double"),
             TypeKind::Float16 => write!(f, "_Float16"),
+            TypeKind::Float128 => write!(f, "__float128"),
             TypeKind::Pointer => write!(f, "pointer"),
             TypeKind::Array => write!(f, "array"),
             TypeKind::Function => write!(f, "function"),
@@ -611,10 +620,12 @@ pub struct TypeTable {
     pub double_id: TypeId,
     pub longdouble_id: TypeId,
     pub float16_id: TypeId,
+    pub float128_id: TypeId,
     pub complex_float_id: TypeId,
     pub complex_double_id: TypeId,
     pub complex_longdouble_id: TypeId,
     pub complex_float16_id: TypeId,
+    pub complex_float128_id: TypeId,
     pub void_ptr_id: TypeId,
     pub char_ptr_id: TypeId,
 }
@@ -647,10 +658,12 @@ impl TypeTable {
             double_id: TypeId::INVALID,
             longdouble_id: TypeId::INVALID,
             float16_id: TypeId::INVALID,
+            float128_id: TypeId::INVALID,
             complex_float_id: TypeId::INVALID,
             complex_double_id: TypeId::INVALID,
             complex_longdouble_id: TypeId::INVALID,
             complex_float16_id: TypeId::INVALID,
+            complex_float128_id: TypeId::INVALID,
             void_ptr_id: TypeId::INVALID,
             char_ptr_id: TypeId::INVALID,
         };
@@ -690,6 +703,7 @@ impl TypeTable {
         table.double_id = table.intern(Type::basic(TypeKind::Double));
         table.longdouble_id = table.intern(Type::basic(TypeKind::LongDouble));
         table.float16_id = table.intern(Type::basic(TypeKind::Float16));
+        table.float128_id = table.intern(Type::basic(TypeKind::Float128));
 
         // Pre-intern complex types
         table.complex_float_id = table.intern(Type::with_modifiers(
@@ -706,6 +720,10 @@ impl TypeTable {
         ));
         table.complex_float16_id = table.intern(Type::with_modifiers(
             TypeKind::Float16,
+            TypeModifiers::COMPLEX,
+        ));
+        table.complex_float128_id = table.intern(Type::with_modifiers(
+            TypeKind::Float128,
             TypeModifiers::COMPLEX,
         ));
 
@@ -952,7 +970,11 @@ impl TypeTable {
         let typ = self.get(id);
         matches!(
             typ.kind,
-            TypeKind::Float | TypeKind::Double | TypeKind::LongDouble | TypeKind::Float16
+            TypeKind::Float
+                | TypeKind::Double
+                | TypeKind::LongDouble
+                | TypeKind::Float16
+                | TypeKind::Float128
         ) && !typ.modifiers.contains(TypeModifiers::COMPLEX)
     }
 
@@ -974,8 +996,32 @@ impl TypeTable {
             TypeKind::Double => self.double_id,
             TypeKind::LongDouble => self.longdouble_id,
             TypeKind::Float16 => self.float16_id,
+            TypeKind::Float128 => self.float128_id,
             _ => id,
         }
+    }
+
+    /// The binary format a floating type is held and computed in on this
+    /// target, or `None` if the type is not a floating one.
+    ///
+    /// `long double` is three different formats across the supported targets
+    /// and two of them are 128 bits wide, so this is the only sound way to ask
+    /// -- the width does not distinguish x87's 80-bit format from binary128.
+    /// A complex type answers for its base, which is the format each of its
+    /// two halves has.
+    pub fn fp_format(&self, id: TypeId) -> Option<FpFormat> {
+        Some(match self.get(id).kind {
+            TypeKind::Float16 => FpFormat::Binary16,
+            TypeKind::Float => FpFormat::Binary32,
+            TypeKind::Double => FpFormat::Binary64,
+            TypeKind::Float128 => FpFormat::Binary128,
+            TypeKind::LongDouble => match (self.target_arch, self.target_os) {
+                (Arch::Aarch64, Os::MacOS) => FpFormat::Binary64,
+                (Arch::Aarch64, _) => FpFormat::Binary128,
+                _ => FpFormat::X87Extended,
+            },
+            _ => return None,
+        })
     }
 
     /// Get the complex type for a float base type (e.g., double → double _Complex)
@@ -989,6 +1035,7 @@ impl TypeTable {
             TypeKind::Double => self.complex_double_id,
             TypeKind::LongDouble => self.complex_longdouble_id,
             TypeKind::Float16 => self.complex_float16_id,
+            TypeKind::Float128 => self.complex_float128_id,
             _ => self.complex_double_id, // default to double _Complex
         }
     }
@@ -1055,6 +1102,7 @@ impl TypeTable {
             TypeKind::Double => 64 * multiplier,
             TypeKind::LongDouble => self.longdouble_size_bits() * multiplier,
             TypeKind::Float16 => 16 * multiplier,
+            TypeKind::Float128 => 128 * multiplier,
             TypeKind::Pointer => self.pointer_width,
             TypeKind::Array => {
                 let elem_size = typ.base.map(|b| self.size_bits(b)).unwrap_or(0) as u64;
@@ -1107,6 +1155,7 @@ impl TypeTable {
             TypeKind::Int128 => 16,
             TypeKind::LongDouble => self.longdouble_alignment(),
             TypeKind::Float16 => 2,
+            TypeKind::Float128 => 16,
             TypeKind::Struct | TypeKind::Union => {
                 typ.composite.as_ref().map(|c| c.align).unwrap_or(1)
             }
@@ -1120,6 +1169,22 @@ impl TypeTable {
     // ========================================================================
     // Target-dependent type size helpers
     // ========================================================================
+
+    /// Whether `__float128` is available on this target.
+    ///
+    /// The type is soft-float everywhere, since neither supported architecture
+    /// has binary128 arithmetic in hardware, so it exists only where the
+    /// `__*tf*` runtime helpers do. Linux has them in libgcc, versioned
+    /// `GCC_4.3.0`. Apple's arm64 runtime has none of them, and clang does not
+    /// offer the type there either, so a program using it would compile and
+    /// then fail to link on every operation it performed.
+    pub fn has_float128(&self) -> bool {
+        crate::arch::has_float128(&Target {
+            arch: self.target_arch,
+            os: self.target_os,
+            ..Target::host()
+        })
+    }
 
     /// Get long double size in bits based on target architecture
     /// - macOS aarch64: 64 bits (same as double)

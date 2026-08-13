@@ -1728,7 +1728,20 @@ impl<'a> super::linearize::Linearizer<'a> {
                 Some(FloatVal::from_f64(v))
             }
 
-            ExprKind::Cast { expr: inner, .. } => self.eval_const_float_expr(inner),
+            // A cast rounds to the target format. Discarding the cast type
+            // let `(float)0.1q` keep every bit of its binary128 value in a
+            // static initializer, where the same cast at run time rounds.
+            ExprKind::Cast {
+                expr: inner,
+                cast_type,
+            } => {
+                let val = self.eval_const_float_expr(inner)?;
+                Some(match self.types.kind(*cast_type) {
+                    TypeKind::Float => FloatVal::from_f64(val.to_f64() as f32 as f64),
+                    TypeKind::Double => FloatVal::from_f64(val.to_f64()),
+                    _ => val,
+                })
+            }
 
             _ => None,
         }

@@ -21,7 +21,7 @@
 // everywhere.
 //
 
-use super::asm_probe::{asm_for, body_of, X86_64_LINUX};
+use super::asm_probe::{asm_for, body_of, AARCH64_LINUX, X86_64_LINUX};
 
 /// AAPCS64 passes a `_Complex` as a two-element HFA, so it occupies **two**
 /// V registers and the next floating-point parameter starts after both.
@@ -930,5 +930,52 @@ double     take_p(struct P a) { return a.a + a.b; }
     assert!(
         p.contains("%xmm0") && uses_xmm1(p),
         "a two-double struct still arrives in two XMM registers:\n{p}"
+    );
+}
+
+/// A one-element HFA is returned in V0, whatever its width.
+///
+/// AAPCS64 returns a struct holding a single `float`, `double` or `long double`
+/// exactly as it returns the bare scalar. c17 sent all of them out through a
+/// general register while the *caller* read the FP one, so the two sides
+/// disagreed inside a single program. The binary128 case was worse: the return
+/// path treated any HFA as a *pair* and tried to move sixteen bytes out of one
+/// X register, which killed the compiler with "a binary128 value does not fit
+/// one X register".
+///
+/// On aarch64 Linux `long double` is binary128, so `struct { long double v; }`
+/// is the one-element quad case.
+#[test]
+fn codegen_aarch64_one_element_hfa_returns_in_v0() {
+    let src = r#"
+struct F { float v; };
+struct D { double v; };
+struct L { long double v; };
+struct P { double a, b; };
+
+struct F mkf(void) { struct F r; r.v = 3.5f; return r; }
+struct D mkd(void) { struct D r; r.v = 4.5; return r; }
+struct L mkl(void) { struct L r; r.v = 3.25L; return r; }
+struct P mkp(void) { struct P r; r.a = 1.0; r.b = 2.0; return r; }
+"#;
+    let asm = asm_for("aarch64_hfa1_ret", AARCH64_LINUX, src);
+
+    // Each returns through V0, at its own width. A binary128 is assembled
+    // into the register's two lanes, so it is the lane insert that says the
+    // whole sixteen bytes got there.
+    // The value may pass through a general register on its way, so what
+    // matters is that it lands in V0 before the return.
+    for (name, marker) in [("mkf", "fmov s0,"), ("mkd", "fmov d0,"), ("mkl", "v0.d[1]")] {
+        let body = body_of(&asm, name);
+        assert!(
+            body.contains(marker),
+            "{name} must leave its value in V0 (looking for `{marker}`):\n{body}"
+        );
+    }
+    // A two-element HFA still uses V0 and V1, which must not change.
+    let p = body_of(&asm, "mkp");
+    assert!(
+        p.contains("d0") && p.contains("d1"),
+        "a two-double HFA still returns in d0 and d1:\n{p}"
     );
 }

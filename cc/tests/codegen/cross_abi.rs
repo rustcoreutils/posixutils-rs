@@ -21,7 +21,7 @@
 // everywhere.
 //
 
-use super::asm_probe::{asm_for, body_of};
+use super::asm_probe::{asm_for, body_of, X86_64_LINUX};
 
 /// AAPCS64 passes a `_Complex` as a two-element HFA, so it occupies **two**
 /// V registers and the next floating-point parameter starts after both.
@@ -826,5 +826,58 @@ fn cross_abi_long_double_to_float128_is_a_real_conversion() {
     assert!(
         !asm.contains("__extendxftf2") && !asm.contains("__trunctfxf2"),
         "aarch64 long double is already binary128:\n{asm}"
+    );
+}
+
+/// A MEMORY-class aggregate is passed by value on the stack, not as a pointer.
+///
+/// System V classifies `struct R { long double v; }` MEMORY as an *argument*:
+/// gcc leaves sixteen bytes on the stack and the callee reads them with
+/// `fldt 8(%rsp)`. c17 decided by raw size, and 128 bits is not greater than
+/// 128, so it took the medium-struct path and passed a pointer in RDI. Both
+/// sides agreed within one translation unit, which is why running a program
+/// could never catch it -- and disagreed with every gcc-compiled peer.
+///
+/// The two shapes that reach MEMORY at this size are an aggregate whose sole
+/// content is a `long double`, and one that merges a `long double` with
+/// something else in an eightbyte.
+#[test]
+fn codegen_memory_class_struct_arrives_by_value() {
+    let src = r#"
+struct R { long double v; };
+union  M { long double v; double d; };
+struct P { double a, b; };
+struct I { long a, b; };
+
+long double take_r(struct R a) { return a.v; }
+long double take_m(union  M a) { return a.v; }
+double      take_p(struct P a) { return a.a + a.b; }
+long        take_i(struct I a) { return a.a + a.b; }
+"#;
+    let asm = asm_for("memory_class_arg", X86_64_LINUX, src);
+
+    for name in ["take_r", "take_m"] {
+        let body = body_of(&asm, name);
+        assert!(
+            body.contains("16(%rbp)"),
+            "{name} must read its argument from the incoming argument area:\n{body}"
+        );
+        assert!(
+            !body.contains("movq (%rdi)"),
+            "{name} must not dereference a pointer argument:\n{body}"
+        );
+    }
+
+    // Controls: an all-SSE pair still travels in XMM registers, and an
+    // integer pair still takes today's pointer path. Neither may move.
+    let p = body_of(&asm, "take_p");
+    assert!(
+        p.contains("%xmm0") && p.contains("%xmm1"),
+        "a two-double struct still arrives in two XMM registers:\n{p}"
+    );
+    let i = body_of(&asm, "take_i");
+    assert!(
+        i.contains("movq (%rdi)"),
+        "an integer pair still arrives as a pointer:\n{i}"
     );
 }

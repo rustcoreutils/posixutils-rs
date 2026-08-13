@@ -356,15 +356,21 @@ pub fn complex_sse_regs(types: &TypeTable, complex_typ: TypeId) -> usize {
 /// Bytes this type occupies when it is passed in memory (MEMORY class), or
 /// `None` when it is passed in registers.
 ///
-/// Two kinds qualify: an aggregate too large for the register pair, and
+/// Two kinds qualify: an aggregate the ABI classifies MEMORY, and
 /// `long double _Complex`, which System V classifies COMPLEX_X87. Both are
 /// copied onto the stack by value, so they share one code path — the callers
 /// used to spell this as `kind == Struct || kind == Union`, which quietly
 /// excluded the complex case and sent it down the SSE path instead.
+///
+/// The aggregate half asks the classifier rather than testing the size: an
+/// aggregate of two eightbytes or fewer is MEMORY too when one of them holds a
+/// `long double`, and a size test cannot see that.
+///
+/// Only the x86-64 backend calls this, which is why it may ask System V
+/// directly.
 pub fn memory_class_bytes(types: &TypeTable, typ: TypeId) -> Option<usize> {
-    let kind = types.kind(typ);
     let bits = types.size_bits(typ);
-    if (kind == TypeKind::Struct || kind == TypeKind::Union) && bits > 128 {
+    if crate::abi::param_is_memory_class(typ, types) {
         return Some((bits / 8) as usize);
     }
     if types.is_complex(typ) && complex_sse_regs(types, typ) == 0 {

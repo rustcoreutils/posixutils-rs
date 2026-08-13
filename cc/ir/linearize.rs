@@ -1094,10 +1094,23 @@ impl<'a> Linearizer<'a> {
 
             let typ_size = self.types.size_bits(typ);
             let is_aarch64 = self.target.arch == crate::target::Arch::Aarch64;
-            if typ_size > 128 && !is_aarch64 {
-                // x86-64: Large struct (> 16 bytes) passed by value on the stack.
-                // arg_pseudo is an IncomingArg pointing to the struct data on the stack.
-                // Use SymAddr to get the base address, then copy each 8-byte chunk.
+            // MEMORY class: the caller left the bytes in the incoming argument
+            // area, so `arg_pseudo` names storage rather than pointing at it.
+            // Over sixteen bytes that is every aggregate; at or below, only one
+            // whose eightbyte holds a `long double`. On aarch64 every struct
+            // parameter still arrives as a pointer, so the deref path below is
+            // the right one there.
+            // Exactly the test the caller uses when it decides to push the
+            // bytes, so the two cannot drift: `long double _Complex` is
+            // COMPLEX_X87 and travels in memory too, and asking only about
+            // struct kinds sent it down the pointer path the caller had not
+            // taken.
+            let arrived_by_value =
+                !is_aarch64 && crate::arch::lir::memory_class_bytes(self.types, typ).is_some();
+            if arrived_by_value {
+                // Passed by value on the stack. `arg_pseudo` is an IncomingArg
+                // naming the struct data; take its address, then copy each
+                // 8-byte chunk.
                 let ptr_type = self.types.pointer_to(typ);
                 let addr_pseudo = self.alloc_reg_pseudo();
                 self.emit(Instruction::sym_addr(addr_pseudo, arg_pseudo, ptr_type));
@@ -2823,8 +2836,15 @@ impl<'a> Linearizer<'a> {
                                 if classes.len() == 2
                                     && classes.iter().all(|c| *c == crate::abi::RegClass::Sse)
                         ) || matches!(class, crate::abi::ArgClass::Hfa { count: 2, .. });
-                    if is_two_fp_regs {
-                        // All-SSE struct: keep struct type for 2-XMM passing
+                    // MEMORY class means the bytes go on the stack by value,
+                    // exactly as an over-sixteen-byte struct already does.
+                    // Reachable at this size only when an eightbyte holds a
+                    // `long double`, directly or merged with something else;
+                    // passing a pointer instead disagreed with gcc silently.
+                    let is_memory = matches!(class, crate::abi::ArgClass::Indirect { .. });
+                    if is_two_fp_regs || is_memory {
+                        // Keep the struct type: the ABI decides from it, and
+                        // the pseudo carries the address either way.
                         arg_types_vec.push(arg_type);
                     } else {
                         // Integer or mixed struct: pass as pointer (existing behavior)

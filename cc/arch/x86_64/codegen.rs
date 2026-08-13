@@ -763,13 +763,10 @@ impl X86_64CodeGen {
             for pseudo in &func.pseudos {
                 if let PseudoKind::Arg(arg_idx) = pseudo.kind {
                     if arg_idx == (i as u32) + arg_idx_offset {
-                        // Large struct params (> 16 bytes) are passed on the stack
-                        // and don't use GP registers — skip them entirely.
+                        // A MEMORY-class struct arrives on the stack by
+                        // value and uses no GP register — skip it entirely.
                         let type_size_bits = types.size_bits(*typ);
-                        let is_large_struct_param = (types.kind(*typ)
-                            == crate::types::TypeKind::Struct
-                            || types.kind(*typ) == crate::types::TypeKind::Union)
-                            && type_size_bits > 128;
+                        let is_large_struct_param = crate::abi::param_is_memory_class(*typ, types);
                         if is_large_struct_param {
                             break;
                         }

@@ -33,6 +33,24 @@ const EIGHTBYTE_BITS: u32 = 64;
 #[derive(Debug, Clone, Default)]
 pub struct SysVAmd64Abi;
 
+/// True when an aggregate parameter of this type is System V MEMORY class:
+/// its bytes travel on the stack by value rather than as a pointer in a
+/// register.
+///
+/// Over two eightbytes that is every aggregate. At or below, it is one whose
+/// eightbyte holds a `long double` -- directly, or merged with something else.
+/// The backend needs the same answer in three places (the incoming location,
+/// the prologue, and the caller's copy), and spelling it as `size > 128` in
+/// each is what let the small cases pass a pointer where gcc passes bytes.
+pub fn param_is_memory_class(typ: TypeId, types: &TypeTable) -> bool {
+    let kind = types.kind(typ);
+    (kind == TypeKind::Struct || kind == TypeKind::Union)
+        && matches!(
+            SysVAmd64Abi::new().classify_param(typ, types),
+            ArgClass::Indirect { .. }
+        )
+}
+
 /// The single scalar an aggregate consists of, seen through one-member structs
 /// and unions and one-element arrays, or `None` if it holds anything else.
 ///

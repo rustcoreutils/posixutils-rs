@@ -1306,12 +1306,10 @@ impl RegAlloc {
                 int_arg_idx += 2;
             } else {
                 let type_size = types.size_bits(*typ);
-                let is_large_struct = (types.kind(*typ) == crate::types::TypeKind::Struct
-                    || types.kind(*typ) == crate::types::TypeKind::Union)
-                    && type_size > 128;
+                let is_large_struct = crate::abi::param_is_memory_class(*typ, types);
                 if is_large_struct {
-                    // Large struct (> 16 bytes): always passed on stack per
-                    // SysV AMD64 ABI. Advance by full struct size.
+                    // MEMORY class: passed on the stack by value. Advance by
+                    // the full struct size.
                     self.locations
                         .insert(pseudo_id, Loc::IncomingArg(stack_arg_offset));
                     stack_arg_offset += (type_size / 8) as i32;

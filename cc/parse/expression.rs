@@ -3414,9 +3414,12 @@ impl<'a> Parser<'a> {
         // `1q` with "invalid suffix on integer constant", and accepting it
         // silently reinterpreted an integer as a binary128.
         let is_quad_suffix = is_float && s_lower.ends_with('q');
-        // #6: the `f128` spelling, which is valid on a hex literal too --
-        // `f128` cannot be mistaken for hex digits after the `p` exponent.
-        let is_float128_suffix = s_lower.ends_with("f128") && (!is_hex || is_float);
+        // The `f128` spelling, which is valid on a hex literal too -- after a
+        // `p` exponent it cannot be mistaken for hex digits. Like `q` it is a
+        // *floating* suffix: `1f128` is an integer constant with a bad suffix,
+        // and `0x1f128` is a hex integer whose last five digits merely spell
+        // one.
+        let is_float128_suffix = is_float && s_lower.ends_with("f128");
 
         // Remove suffixes - but for hex numbers, don't strip a-f as they're digits
         let num_str = if is_hex && is_float && is_float128_suffix {

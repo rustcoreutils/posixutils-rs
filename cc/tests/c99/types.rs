@@ -591,6 +591,12 @@ int main(void)
     if (0x1p0f128 != 1.0q) return 7;
     if (0x1.8p1q != 3.0q) return 8;
 
+    /* `0x1f128` is a hex *integer* whose last digits merely spell the
+       suffix -- 0x1f128 is 127272. Both `q` and `f128` are floating
+       suffixes, so neither attaches to an integer constant; that half is
+       asserted in the diagnostics suite, which can check a rejection. */
+    if (0x1f128 != 127272) return 9;
+
     return 0;
 }
 "#;

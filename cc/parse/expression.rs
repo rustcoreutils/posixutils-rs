@@ -2504,11 +2504,13 @@ impl<'a> Parser<'a> {
             // Signbit builtins - test sign bit of floats
             crate::kw::BUILTIN_ISNAN
             | crate::kw::BUILTIN_ISINF
+            | crate::kw::BUILTIN_ISINF_SIGN
             | crate::kw::BUILTIN_ISFINITE
             | crate::kw::BUILTIN_ISNORMAL => Some((|| {
                 let test = match name_id {
                     crate::kw::BUILTIN_ISNAN => FpTest::IsNan,
                     crate::kw::BUILTIN_ISINF => FpTest::IsInf,
+                    crate::kw::BUILTIN_ISINF_SIGN => FpTest::IsInfSign,
                     crate::kw::BUILTIN_ISFINITE => FpTest::IsFinite,
                     _ => FpTest::IsNormal,
                 };

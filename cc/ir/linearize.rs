@@ -2334,6 +2334,15 @@ impl<'a> Linearizer<'a> {
                 let b = self.emit_fcmp(Opcode::FCmpOEq, val, neg, typ, size);
                 self.emit_bool_combine(Opcode::Or, a, b)
             }
+            FpTest::IsInfSign => {
+                // +1 for +inf, -1 for -inf, 0 otherwise: the two equality
+                // tests are each 0 or 1, so their difference carries the sign.
+                let pos = self.emit_fconst(FloatVal::infinity(false), typ);
+                let neg = self.emit_fconst(FloatVal::infinity(true), typ);
+                let a = self.emit_fcmp(Opcode::FCmpOEq, val, pos, typ, size);
+                let b = self.emit_fcmp(Opcode::FCmpOEq, val, neg, typ, size);
+                self.emit_bool_combine(Opcode::Sub, a, b)
+            }
             FpTest::IsFinite => self.emit_is_finite(val, typ, size),
             FpTest::IsNormal => {
                 let finite = self.emit_is_finite(val, typ, size);

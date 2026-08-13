@@ -280,6 +280,7 @@ define_keywords! {
     (BUILTIN_FABSL,     "__builtin_fabsl",    BUILTIN),
     (BUILTIN_ISNAN,     "__builtin_isnan",    BUILTIN),
     (BUILTIN_ISINF,     "__builtin_isinf",    BUILTIN),
+    (BUILTIN_ISINF_SIGN, "__builtin_isinf_sign", BUILTIN),
     (BUILTIN_ISFINITE,  "__builtin_isfinite", BUILTIN),
     (BUILTIN_ISNORMAL,  "__builtin_isnormal", BUILTIN),
     (BUILTIN_FPCLASSIFY,"__builtin_fpclassify", BUILTIN),

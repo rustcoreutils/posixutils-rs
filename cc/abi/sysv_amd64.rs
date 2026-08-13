@@ -51,6 +51,34 @@ pub fn param_is_memory_class(typ: TypeId, types: &TypeTable) -> bool {
         )
 }
 
+/// How many SSE registers an all-SSE aggregate of nine to sixteen bytes
+/// occupies, or `None` if it is not one.
+///
+/// A struct of two doubles takes two. One holding nothing but a `__float128`
+/// takes **one**: SSE+SSEUP is a single register carrying all sixteen bytes,
+/// and `classes` counts registers rather than eightbytes. Spelling this as
+/// `classes.len() == 2` split a binary128 across xmm0 and xmm1, where a
+/// gcc-compiled peer reads only the first.
+pub fn sse_struct_regs(typ: TypeId, types: &TypeTable) -> Option<usize> {
+    let kind = types.kind(typ);
+    let bits = types.size_bits(typ);
+    if (kind != TypeKind::Struct && kind != TypeKind::Union)
+        || types.is_complex(typ)
+        || bits <= 64
+        || bits > 128
+    {
+        return None;
+    }
+    match SysVAmd64Abi::new().classify_param(typ, types) {
+        ArgClass::Direct { classes, .. }
+            if !classes.is_empty() && classes.iter().all(|c| *c == RegClass::Sse) =>
+        {
+            Some(classes.len())
+        }
+        _ => None,
+    }
+}
+
 /// The single scalar an aggregate consists of, seen through one-member structs
 /// and unions and one-element arrays, or `None` if it holds anything else.
 ///
@@ -206,6 +234,25 @@ impl SysVAmd64Abi {
             let offset = i * EIGHTBYTE_BITS;
             let class = self.classify_eightbyte(ty, offset, size_bits - offset, types);
             classes.push(class);
+        }
+
+        // SSE+SSEUP is one register, not two: the upper eightbyte of a
+        // binary128 never travels on its own. `classes` counts *registers* --
+        // a scalar `__float128` has always answered a single Sse with a
+        // 128-bit size -- so an aggregate holding nothing else must answer the
+        // same, or the value is split across xmm0 and xmm1 and a gcc-compiled
+        // peer reads half of it.
+        //
+        // The restriction to *sole* content is load-bearing:
+        // `union { __float128 v; double d[2]; }` merges SSEUP with SSE and
+        // really is two registers, which gcc confirms.
+        if sole_scalar_content(ty, types)
+            .is_some_and(|inner| types.kind(inner) == TypeKind::Float128)
+        {
+            return ArgClass::Direct {
+                classes: vec![RegClass::Sse],
+                size_bits,
+            };
         }
 
         // Post-merge cleanup: if any eightbyte is MEMORY, the whole thing is MEMORY
@@ -571,6 +618,77 @@ mod tests {
                 ArgClass::Indirect { .. }
             ),
             "two long doubles are over two eightbytes and go in memory"
+        );
+    }
+
+    /// An aggregate that is nothing but a `__float128` travels in one SSE
+    /// register, not two.
+    ///
+    /// System V classifies binary128 SSE + SSEUP, and SSEUP never travels on
+    /// its own: the pair is one register carrying all sixteen bytes, which is
+    /// what a scalar `__float128` has always answered. Counting the eightbytes
+    /// instead split the value across xmm0 and xmm1, where a gcc-compiled peer
+    /// reads only the first half.
+    #[test]
+    fn a_lone_binary128_aggregate_travels_in_one_register() {
+        let abi = SysVAmd64Abi::new();
+        let mut types = x86_types();
+        let q = types.float128_id;
+
+        let plain = wrap(&mut types, q);
+        let nested = wrap(&mut types, plain);
+        for (name, ty) in [
+            ("struct { __float128 }", plain),
+            ("struct { struct { __float128 } }", nested),
+        ] {
+            for class in [
+                abi.classify_return(ty, &types),
+                abi.classify_param(ty, &types),
+            ] {
+                assert!(
+                    matches!(class, ArgClass::Direct { ref classes, size_bits }
+                             if classes == &[RegClass::Sse] && size_bits == 128),
+                    "{name} takes one SSE register of sixteen bytes, got {class:?}"
+                );
+            }
+        }
+
+        // Merged with anything else it really is two registers, which is the
+        // edge that makes the "sole content" restriction load-bearing.
+        let d = types.double_id;
+        let arr2 = types.intern(Type::array(d, 2));
+        let mixed = types.intern(Type::union_type(CompositeType {
+            tag: None,
+            members: vec![
+                StructMember {
+                    name: crate::strings::StringId::default(),
+                    typ: q,
+                    offset: 0,
+                    bit_width: None,
+                    bit_offset: None,
+                    storage_unit_size: None,
+                    explicit_align: None,
+                },
+                StructMember {
+                    name: crate::strings::StringId::default(),
+                    typ: arr2,
+                    offset: 0,
+                    bit_width: None,
+                    bit_offset: None,
+                    storage_unit_size: None,
+                    explicit_align: None,
+                },
+            ],
+            enum_constants: vec![],
+            size: 16,
+            align: 16,
+            is_complete: true,
+        }));
+        assert!(
+            matches!(abi.classify_param(mixed, &types),
+                     ArgClass::Direct { ref classes, .. } if classes.len() == 2),
+            "a binary128 merged with two doubles is two registers, got {:?}",
+            abi.classify_param(mixed, &types)
         );
     }
 

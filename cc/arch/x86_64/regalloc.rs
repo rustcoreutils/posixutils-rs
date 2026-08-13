@@ -1212,21 +1212,7 @@ impl RegAlloc {
             let is_longdouble = types.kind(*typ) == crate::types::TypeKind::LongDouble;
             let is_fp = types.is_float(*typ);
             let is_complex = types.is_complex(*typ);
-            let type_size = types.size_bits(*typ);
-            let is_two_sse_struct = !is_complex
-                && (types.kind(*typ) == crate::types::TypeKind::Struct
-                    || types.kind(*typ) == crate::types::TypeKind::Union)
-                && type_size > 64
-                && type_size <= 128
-                && {
-                    use crate::abi::{Abi, SysVAmd64Abi};
-                    matches!(
-                        SysVAmd64Abi.classify_param(*typ, types),
-                        crate::abi::ArgClass::Direct { ref classes, .. }
-                            if classes.len() == 2
-                                && classes.iter().all(|c| *c == crate::abi::RegClass::Sse)
-                    )
-                };
+            let sse_struct = crate::abi::sse_struct_regs(*typ, types);
 
             // Long double uses x87 FPU and is passed on the stack per System V AMD64 ABI
             if is_longdouble {
@@ -1235,12 +1221,14 @@ impl RegAlloc {
                     .insert(pseudo_id, Loc::IncomingArg(stack_arg_offset));
                 self.fp_pseudos.insert(pseudo_id);
                 stack_arg_offset += 16;
-            } else if is_two_sse_struct {
-                // 2-SSE struct: uses two XMM regs. Don't assign to register —
-                // the codegen stores both XMM values to the local's stack slot.
-                // Just consume the FP arg indices without assigning a location;
-                // the pseudo will get a stack slot from normal allocation.
-                fp_arg_idx += 2;
+            } else if let Some(sse_regs) = sse_struct {
+                // All-SSE struct: uses one XMM per class. Don't assign to a
+                // register — the codegen stores the XMM values to the local's
+                // stack slot. Just consume the FP arg indices without assigning
+                // a location; the pseudo gets a stack slot from normal
+                // allocation. Two doubles take two registers; a lone binary128
+                // takes one, for all sixteen bytes.
+                fp_arg_idx += sse_regs;
             } else if is_complex {
                 // How many XMM registers this complex type actually occupies:
                 // one for `float _Complex` (both halves packed into a single

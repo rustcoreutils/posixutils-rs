@@ -818,26 +818,16 @@ impl X86_64CodeGen {
                         }
                         let is_fp = types.is_float(*typ);
                         let is_complex = types.is_complex(*typ);
-                        // Check for medium struct with 2-SSE classification
-                        let is_two_sse_struct = !is_complex
-                            && (types.kind(*typ) == crate::types::TypeKind::Struct
-                                || types.kind(*typ) == crate::types::TypeKind::Union)
-                            && type_size_bits > 64
-                            && type_size_bits <= 128
-                            && {
-                                let abi = crate::abi::SysVAmd64Abi;
-                                matches!(
-                                    abi.classify_param(*typ, types),
-                                    crate::abi::ArgClass::Direct { ref classes, .. }
-                                        if classes.len() == 2
-                                            && classes.iter().all(|c| *c == crate::abi::RegClass::Sse)
-                                )
-                            };
+                        // An all-SSE struct, and the number of registers it
+                        // takes: two doubles take two, a lone binary128 takes
+                        // one whole register for all sixteen bytes.
+                        let sse_struct = crate::abi::sse_struct_regs(*typ, types);
+                        let is_two_sse_struct = sse_struct.is_some();
                         // How many SSE registers this argument actually occupies.
-                        // A struct of two doubles always takes two; a complex
-                        // type depends on its base (see `complex_sse_regs`).
-                        let sse_regs = if is_two_sse_struct {
-                            2
+                        // A complex type depends on its base (see
+                        // `complex_sse_regs`).
+                        let sse_regs = if let Some(n) = sse_struct {
+                            n
                         } else if is_complex {
                             complex_sse_regs(types, *typ)
                         } else {
@@ -871,21 +861,34 @@ impl X86_64CodeGen {
                                         self.locations.get_ref(local.sym)
                                     {
                                         let offset = *offset;
-                                        let (fp_size, imag_offset) = if is_two_sse_struct {
-                                            // Struct of two doubles: each field is 8 bytes
-                                            (FpSize::Double, 8)
+                                        let (fp_size, imag_offset) = if let Some(n) = sse_struct {
+                                            // Two doubles are eight bytes each;
+                                            // a lone binary128 is one register
+                                            // holding all sixteen.
+                                            if n == 1 {
+                                                (FpSize::for_sse_aggregate(type_size_bits), 0)
+                                            } else {
+                                                (FpSize::Double, 8)
+                                            }
                                         } else {
                                             complex_fp_info(types, &self.base.target, *typ)
                                         };
                                         if sse_regs == 1 {
-                                            // `float _Complex`: one eightbyte
-                                            // holding both halves. A single
-                                            // 64-bit store writes the whole
-                                            // value; storing the halves from
-                                            // two registers read one the
-                                            // caller never set.
+                                            // One register holding the whole
+                                            // value. For `float _Complex` that
+                                            // is one eightbyte with both
+                                            // halves in it, so a 64-bit store
+                                            // writes all of it; for an
+                                            // aggregate it is whatever the
+                                            // class's size says, which is
+                                            // sixteen bytes for a binary128.
+                                            let whole = if sse_struct.is_some() {
+                                                fp_size
+                                            } else {
+                                                FpSize::Double
+                                            };
                                             self.push_lir(X86Inst::MovFp {
-                                                size: FpSize::Double,
+                                                size: whole,
                                                 src: XmmOperand::Reg(fp_arg_regs[fp_arg_idx]),
                                                 dst: XmmOperand::Mem(self.stack_mem(offset)),
                                             });
@@ -1085,7 +1088,22 @@ impl X86_64CodeGen {
                 .map(|t| types.size_bits(t).max(32))
                 .unwrap_or(insn.size.max(32));
 
-            if insn.returns_via_x87() && is_struct_or_union {
+            let one_sse_ret = insn.abi_info.as_ref().is_some_and(|ai| {
+                matches!(&ai.ret, ArgClass::Direct { classes, .. }
+                         if classes.len() == 1 && classes[0] == RegClass::Sse)
+            });
+            if one_sse_ret && is_struct_or_union && !is_complex {
+                // One SSE register holding the whole aggregate. The `Ret`
+                // carries its address, so move every byte at once: a lone
+                // binary128 is SSE+SSEUP, and two eight-byte moves into two
+                // registers is what a gcc-compiled caller does not expect.
+                let base = self.address_of_pseudo(*src);
+                self.push_lir(X86Inst::MovFp {
+                    size: FpSize::for_sse_aggregate(ret_size),
+                    src: XmmOperand::Mem(MemAddr::BaseOffset { base, offset: 0 }),
+                    dst: XmmOperand::Reg(XmmReg::Xmm0),
+                });
+            } else if insn.returns_via_x87() && is_struct_or_union {
                 // An aggregate that is nothing but a `long double` comes back
                 // in st(0). The `Ret` carries its address, so load it onto the
                 // FPU stack the way the bare scalar is returned.

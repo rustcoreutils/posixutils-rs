@@ -983,10 +983,12 @@ impl<'a> Linearizer<'a> {
                 let is_two_fp_regs = size > 64 && size <= 128 && {
                     let abi = get_abi_for_conv(self.current_calling_conv, self.target);
                     let class = abi.classify_param(param.typ, self.types);
+                    // Any all-SSE aggregate, whether that is two registers of
+                    // eight bytes or one of sixteen.
                     matches!(
                         class,
                         crate::abi::ArgClass::Direct { ref classes, .. }
-                            if classes.len() == 2
+                            if !classes.is_empty()
                                 && classes.iter().all(|c| *c == crate::abi::RegClass::Sse)
                     ) || matches!(class, crate::abi::ArgClass::Hfa { count: 2, .. })
                 };
@@ -1380,7 +1382,17 @@ impl<'a> Linearizer<'a> {
         // value's *address* and the backend loads it onto the FPU stack.
         // Splitting it across RAX and RDX left the caller reading a slot
         // nobody had written.
-        if matches!(ret_class, crate::abi::ArgClass::X87 { .. }) {
+        // A single SSE register carrying sixteen bytes -- an aggregate whose
+        // sole content is a `__float128` -- is the same shape: the register
+        // holds the whole value, so the `Ret` carries its address and the
+        // backend moves all sixteen bytes at once. Splitting it into two
+        // general registers handed the caller half a value in the wrong place.
+        let one_sse_reg = matches!(
+            ret_class,
+            crate::abi::ArgClass::Direct { ref classes, .. }
+                if classes.len() == 1 && classes[0] == crate::abi::RegClass::Sse
+        );
+        if matches!(ret_class, crate::abi::ArgClass::X87 { .. }) || one_sse_reg {
             let mut ret_insn = Instruction::ret_typed(Some(src_addr), ret_type, struct_size);
             ret_insn.abi_info = Some(Box::new(CallAbiInfo::new(vec![], ret_class)));
             self.emit(ret_insn);
@@ -2833,7 +2845,7 @@ impl<'a> Linearizer<'a> {
                         matches!(
                             class,
                             crate::abi::ArgClass::Direct { ref classes, .. }
-                                if classes.len() == 2
+                                if !classes.is_empty()
                                     && classes.iter().all(|c| *c == crate::abi::RegClass::Sse)
                         ) || matches!(class, crate::abi::ArgClass::Hfa { count: 2, .. });
                     // MEMORY class means the bytes go on the stack by value,

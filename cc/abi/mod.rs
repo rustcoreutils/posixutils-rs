@@ -21,7 +21,7 @@ mod aapcs64;
 mod sysv_amd64;
 
 pub use aapcs64::Aapcs64Abi;
-pub use sysv_amd64::{param_is_memory_class, SysVAmd64Abi};
+pub use sysv_amd64::{param_is_memory_class, sse_struct_regs, SysVAmd64Abi};
 
 use crate::target::{Arch, Target};
 use crate::types::{TypeId, TypeKind, TypeTable};

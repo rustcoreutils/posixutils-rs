@@ -881,3 +881,54 @@ long        take_i(struct I a) { return a.a + a.b; }
         "an integer pair still arrives as a pointer:\n{i}"
     );
 }
+
+/// An aggregate that is nothing but a `__float128` travels in one XMM.
+///
+/// System V classifies binary128 SSE + SSEUP, and SSEUP never travels alone:
+/// the pair is a single register carrying all sixteen bytes, which is what a
+/// scalar `__float128` has always used. Counting eightbytes instead put the
+/// value in xmm0 *and* xmm1, so a gcc-compiled peer read only its low half.
+/// Merged with anything else it really is two registers, and that must not
+/// change -- gcc emits `movapd %xmm1, %xmm0` for the union below.
+#[test]
+fn codegen_lone_binary128_struct_uses_one_xmm() {
+    let src = r#"
+struct Q { __float128 v; };
+union  M { __float128 v; double d[2]; };
+struct P { double a, b; };
+
+__float128 take_q(struct Q a) { return a.v; }
+__float128 take_m(union  M a) { return a.v; }
+struct Q   mk_q(void) { struct Q r; r.v = 3.25q; return r; }
+double     take_p(struct P a) { return a.a + a.b; }
+"#;
+    let asm = asm_for("lone_binary128", X86_64_LINUX, src);
+
+    // `xmm15` is the reserved scratch and contains "xmm1" as a substring, so
+    // the negative assertions have to look for the register, not the text.
+    let uses_xmm1 = |body: &str| body.contains("%xmm1,") || body.contains("%xmm1)");
+
+    let q = body_of(&asm, "take_q");
+    assert!(
+        !uses_xmm1(q),
+        "a lone binary128 argument arrives in xmm0 alone:\n{q}"
+    );
+    let mk = body_of(&asm, "mk_q");
+    assert!(
+        !uses_xmm1(mk) && !mk.contains("%rdx"),
+        "a lone binary128 is returned in xmm0 alone, not split:\n{mk}"
+    );
+
+    // Controls: merged with two doubles it is genuinely two registers, and a
+    // two-double struct is unchanged.
+    let m = body_of(&asm, "take_m");
+    assert!(
+        uses_xmm1(m),
+        "a binary128 merged with two doubles is two registers:\n{m}"
+    );
+    let p = body_of(&asm, "take_p");
+    assert!(
+        p.contains("%xmm0") && uses_xmm1(p),
+        "a two-double struct still arrives in two XMM registers:\n{p}"
+    );
+}

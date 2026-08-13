@@ -455,7 +455,8 @@ impl X86_64CodeGen {
                 let abi = crate::abi::SysVAmd64Abi;
                 let arg_class = abi.classify_param(arg_type.unwrap(), types);
                 if let crate::abi::ArgClass::Direct { ref classes, .. } = arg_class {
-                    if classes.iter().all(|c| *c == crate::abi::RegClass::Sse) && classes.len() == 2
+                    if !classes.is_empty()
+                        && classes.iter().all(|c| *c == crate::abi::RegClass::Sse)
                     {
                         // Two SSE registers: load two 8-byte doubles from struct address.
                         // The arg pseudo holds a pointer (from symaddr), not struct bytes.
@@ -481,17 +482,31 @@ impl X86_64CodeGen {
                                 Reg::R11
                             }
                         };
-                        self.push_lir(X86Inst::MovFp {
-                            size: FpSize::Double,
-                            src: XmmOperand::Mem(MemAddr::BaseOffset { base, offset: 0 }),
-                            dst: XmmOperand::Reg(fp_arg_regs[fp_arg_idx]),
-                        });
-                        self.push_lir(X86Inst::MovFp {
-                            size: FpSize::Double,
-                            src: XmmOperand::Mem(MemAddr::BaseOffset { base, offset: 8 }),
-                            dst: XmmOperand::Reg(fp_arg_regs[fp_arg_idx + 1]),
-                        });
-                        fp_arg_idx += 2;
+                        // Two doubles are one register each. A lone binary128
+                        // is SSE+SSEUP: one register carrying all sixteen bytes,
+                        // so loading two eight-byte halves into two registers
+                        // would hand a gcc-compiled callee only the first.
+                        if classes.len() == 1 {
+                            self.push_lir(X86Inst::MovFp {
+                                size: FpSize::for_sse_aggregate(
+                                    arg_type.map_or(64, |t| types.size_bits(t)),
+                                ),
+                                src: XmmOperand::Mem(MemAddr::BaseOffset { base, offset: 0 }),
+                                dst: XmmOperand::Reg(fp_arg_regs[fp_arg_idx]),
+                            });
+                        } else {
+                            self.push_lir(X86Inst::MovFp {
+                                size: FpSize::Double,
+                                src: XmmOperand::Mem(MemAddr::BaseOffset { base, offset: 0 }),
+                                dst: XmmOperand::Reg(fp_arg_regs[fp_arg_idx]),
+                            });
+                            self.push_lir(X86Inst::MovFp {
+                                size: FpSize::Double,
+                                src: XmmOperand::Mem(MemAddr::BaseOffset { base, offset: 8 }),
+                                dst: XmmOperand::Reg(fp_arg_regs[fp_arg_idx + 1]),
+                            });
+                        }
+                        fp_arg_idx += classes.len();
                     } else if classes.iter().all(|c| *c == crate::abi::RegClass::Integer)
                         && classes.len() == 2
                     {

@@ -1179,6 +1179,18 @@ impl Instruction {
     }
 
     /// Check if this call/return uses two registers for the return value.
+    /// True when this `Ret` hands its value back in st(0).
+    ///
+    /// The source is then the value's *address*, not the value: an x87 return
+    /// is loaded onto the FPU stack from memory, since nothing else can hold
+    /// an 80-bit value.
+    pub fn returns_via_x87(&self) -> bool {
+        self.abi_info
+            .as_ref()
+            .map(|ai| matches!(ai.ret, ArgClass::X87 { .. }))
+            .unwrap_or(false)
+    }
+
     pub fn returns_two_regs(&self) -> bool {
         self.abi_info
             .as_ref()
@@ -1545,16 +1557,21 @@ pub struct Function {
     pub implicit_param_copies: Vec<ImplicitParamCopy>,
     /// Does this function return a complex value?
     ///
-    /// Complex returns are the one place where the two representations of a
-    /// complex value meet: the callee's `Ret` carries the *address* of the
-    /// value, while at a call site the backend stores the returned registers
-    /// into the result local, so that pseudo's slot holds the value itself.
-    /// Inlining splices the callee's body in and drops the call, which would
-    /// hand the caller an address where it expects a value.
+    /// True when this function's `Ret` carries the *address* of the returned
+    /// value rather than the value.
+    ///
+    /// Two returns are shaped that way: a `_Complex` one, and an aggregate
+    /// that is nothing but a `long double`, which comes back in st(0) and so
+    /// is loaded from memory. At a call site the backend stores the returned
+    /// registers into the result local, so that pseudo's slot holds the value
+    /// itself. Inlining splices the callee's body in and drops the call, which
+    /// would hand the caller an address where it expects a value -- and the
+    /// difference is invisible, since it reads the first eight bytes of the
+    /// pointer as a float.
     ///
     /// Bridging the two needs the base type and stride, and the optimizer has
     /// no `TypeTable` to ask, so such functions are simply not inlined.
-    pub returns_complex: bool,
+    pub ret_is_address: bool,
     /// Block ID -> index in `blocks` vec (O(1) lookup)
     block_idx: HashMap<BasicBlockId, usize>,
     /// Pseudo ID -> index in `pseudos` vec (O(1) lookup)
@@ -1582,7 +1599,7 @@ impl Default for Function {
             destructor: None,
             is_inline: false,
             implicit_param_copies: Vec::new(),
-            returns_complex: false,
+            ret_is_address: false,
             block_idx: HashMap::with_capacity(DEFAULT_BLOCK_CAPACITY),
             pseudo_idx: HashMap::with_capacity(DEFAULT_PSEUDO_CAPACITY),
         }

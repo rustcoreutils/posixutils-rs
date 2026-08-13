@@ -33,6 +33,38 @@ const EIGHTBYTE_BITS: u32 = 64;
 #[derive(Debug, Clone, Default)]
 pub struct SysVAmd64Abi;
 
+/// The single scalar an aggregate consists of, seen through one-member structs
+/// and unions and one-element arrays, or `None` if it holds anything else.
+///
+/// System V classifies `long double` as X87 plus X87UP and binary128 as SSE
+/// plus SSEUP, and in both the *pair* is the unit: an aggregate holding nothing
+/// besides one of them is passed and returned exactly as the bare scalar is.
+/// The moment anything shares an eightbyte the merge rules apply instead, and
+/// gcc confirms both edges -- `union { long double v; double d; }` is MEMORY,
+/// and `union { __float128 v; double d[2]; }` really is two SSE registers.
+fn sole_scalar_content(ty: TypeId, types: &TypeTable) -> Option<TypeId> {
+    let inner = match types.kind(ty) {
+        TypeKind::Struct | TypeKind::Union => {
+            let typ = types.get(ty);
+            let composite = typ.composite.as_ref()?;
+            match composite.members.as_slice() {
+                [only] => sole_scalar_content(only.typ, types)?,
+                _ => return None,
+            }
+        }
+        TypeKind::Array => {
+            let typ = types.get(ty);
+            if typ.array_size != Some(1) {
+                return None;
+            }
+            sole_scalar_content(typ.base?, types)?
+        }
+        _ => return Some(ty),
+    };
+    // An over-aligned or padded wrapper is not the scalar; it is bigger.
+    (types.size_bits(ty) == types.size_bits(inner)).then_some(inner)
+}
+
 impl SysVAmd64Abi {
     /// Create a new System V AMD64 ABI classifier.
     pub fn new() -> Self {
@@ -365,6 +397,16 @@ impl Abi for SysVAmd64Abi {
 
         // Aggregate types
         if is_aggregate(kind) {
+            // X87 + X87UP comes back in st(0), exactly as the bare scalar
+            // does: gcc emits `fld1; ret` for
+            // `struct R { long double v; } f(void)`. Only the *return*
+            // differs -- as an argument the class is MEMORY, which
+            // `classify_aggregate` already answers with `Indirect`.
+            if sole_scalar_content(ty, types)
+                .is_some_and(|inner| types.kind(inner) == TypeKind::LongDouble)
+            {
+                return ArgClass::X87 { size_bits };
+            }
             return self.classify_aggregate(ty, types);
         }
 
@@ -465,6 +507,52 @@ mod tests {
                 ArgClass::Indirect { .. }
             ),
             "struct {{ _Float16 }} must not be returned through a hidden pointer"
+        );
+    }
+
+    /// An aggregate that is nothing but a `long double` is returned in st(0),
+    /// and one that merges it with anything else is MEMORY.
+    ///
+    /// System V classifies the two eightbytes X87 and X87UP, and X87UP is
+    /// preceded by X87, so the merge-to-MEMORY rule does not fire -- gcc emits
+    /// `fld1; ret` for `struct R { long double v; } f(void)`. As an *argument*
+    /// the class really is MEMORY, which is why only the return arm asks.
+    #[test]
+    fn a_lone_long_double_aggregate_returns_in_st0() {
+        let abi = SysVAmd64Abi::new();
+        let mut types = x86_types();
+        let ld = types.longdouble_id;
+
+        // Directly, and through the wrappers `sole_scalar_content` sees past.
+        let plain = wrap(&mut types, ld);
+        let nested = wrap(&mut types, plain);
+        let arr1 = types.intern(Type::array(ld, 1));
+        let wrapped_arr = wrap(&mut types, arr1);
+        for (name, ty) in [
+            ("struct { long double }", plain),
+            ("struct { struct { long double } }", nested),
+            ("struct { long double[1] }", wrapped_arr),
+        ] {
+            assert!(
+                matches!(abi.classify_return(ty, &types), ArgClass::X87 { .. }),
+                "{name} returns in st(0), got {:?}",
+                abi.classify_return(ty, &types)
+            );
+            assert!(
+                matches!(abi.classify_param(ty, &types), ArgClass::Indirect { .. }),
+                "{name} is MEMORY class as an argument"
+            );
+        }
+
+        // Two elements is not a lone scalar, and neither is a longer array.
+        let arr2 = types.intern(Type::array(ld, 2));
+        let wrapped_arr2 = wrap(&mut types, arr2);
+        assert!(
+            matches!(
+                abi.classify_return(wrapped_arr2, &types),
+                ArgClass::Indirect { .. }
+            ),
+            "two long doubles are over two eightbytes and go in memory"
         );
     }
 

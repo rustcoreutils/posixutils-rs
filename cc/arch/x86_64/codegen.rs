@@ -1088,7 +1088,15 @@ impl X86_64CodeGen {
                 .map(|t| types.size_bits(t).max(32))
                 .unwrap_or(insn.size.max(32));
 
-            if insn.returns_two_regs() {
+            if insn.returns_via_x87() && is_struct_or_union {
+                // An aggregate that is nothing but a `long double` comes back
+                // in st(0). The `Ret` carries its address, so load it onto the
+                // FPU stack the way the bare scalar is returned.
+                let base = self.address_of_pseudo(*src);
+                self.push_lir(X86Inst::X87Load {
+                    addr: MemAddr::BaseOffset { base, offset: 0 },
+                });
+            } else if insn.returns_two_regs() {
                 // Two-register struct return: check ABI for SSE vs INTEGER
                 if is_struct_or_union {
                     if let Some(typ) = ret_typ {

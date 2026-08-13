@@ -794,8 +794,28 @@ impl<'a> Linearizer<'a> {
     /// very library calls the arithmetic depends on.
     fn returns_via_hidden_pointer(&self, typ: TypeId) -> bool {
         let kind = self.types.kind(typ);
-        (kind == TypeKind::Struct || kind == TypeKind::Union)
-            && self.types.size_bits(typ) > self.target.max_aggregate_register_bits
+        if kind != TypeKind::Struct && kind != TypeKind::Union {
+            // Scalars and `_Complex` never do, which is what keeps the
+            // `long double _Complex` guarantee above local and testable.
+            return false;
+        }
+        if self.types.size_bits(typ) > self.target.max_aggregate_register_bits {
+            // Every aggregate over two eightbytes, exactly as before. Keeping
+            // the size rule is what preserves the aarch64 decisions: an HFA
+            // larger than sixteen bytes classifies `Hfa`, never `Indirect`,
+            // so a purely classifier-driven test would stop returning it
+            // indirectly and nothing implements a three-register HFA return.
+            return true;
+        }
+        // Two eightbytes or fewer: only the classifier knows. An aggregate
+        // this small can still be MEMORY class -- `union { long double v;
+        // double d; }` merges X87 with SSE, which is MEMORY, and gcc returns
+        // it through a hidden pointer.
+        let abi = get_abi_for_conv(self.current_calling_conv, self.target);
+        matches!(
+            abi.classify_return(typ, self.types),
+            crate::abi::ArgClass::Indirect { .. }
+        )
     }
 
     pub(crate) fn linearize_function(&mut self, func: &FunctionDef) {
@@ -906,9 +926,17 @@ impl<'a> Linearizer<'a> {
             self.two_reg_return_type = Some(func.return_type);
         }
 
-        // A complex `Ret` carries an address; a call's result slot holds the
+        // A `Ret` that carries an address; a call's result slot holds the
         // value. The inliner has to know not to splice across that boundary.
-        ir_func.returns_complex = self.types.is_complex(func.return_type);
+        // An aggregate returned in st(0) has exactly the same shape as a
+        // complex one, and missing it is a miscompile visible only at -O.
+        let returns_x87_aggregate = returns_two_reg_struct
+            && matches!(
+                get_abi_for_conv(self.current_calling_conv, self.target)
+                    .classify_return(func.return_type, self.types),
+                crate::abi::ArgClass::X87 { .. }
+            );
+        ir_func.ret_is_address = self.types.is_complex(func.return_type) || returns_x87_aggregate;
 
         // Add parameters
         // For struct/union parameters, we need to copy them to local storage
@@ -1331,6 +1359,20 @@ impl<'a> Linearizer<'a> {
     pub(crate) fn emit_two_reg_return(&mut self, e: &Expr, ret_type: TypeId) {
         let src_addr = self.linearize_lvalue(e);
         let struct_size = self.types.size_bits(ret_type);
+        let abi = get_abi_for_conv(self.current_calling_conv, self.target);
+        let ret_class = abi.classify_return(ret_type, self.types);
+
+        // An aggregate that is nothing but a `long double` comes back in
+        // st(0), exactly as the bare scalar does, so the `Ret` carries the
+        // value's *address* and the backend loads it onto the FPU stack.
+        // Splitting it across RAX and RDX left the caller reading a slot
+        // nobody had written.
+        if matches!(ret_class, crate::abi::ArgClass::X87 { .. }) {
+            let mut ret_insn = Instruction::ret_typed(Some(src_addr), ret_type, struct_size);
+            ret_insn.abi_info = Some(Box::new(CallAbiInfo::new(vec![], ret_class)));
+            self.emit(ret_insn);
+            return;
+        }
 
         // Load first 8 bytes
         let low_temp = self.alloc_reg_pseudo();
@@ -1356,8 +1398,6 @@ impl<'a> Linearizer<'a> {
         // Emit return with both values and ABI info for two-register return
         let mut ret_insn = Instruction::ret_typed(Some(low_temp), ret_type, struct_size);
         ret_insn.src.push(high_temp);
-        let abi = get_abi_for_conv(self.current_calling_conv, self.target);
-        let ret_class = abi.classify_return(ret_type, self.types);
         ret_insn.abi_info = Some(Box::new(CallAbiInfo::new(vec![], ret_class)));
         self.emit(ret_insn);
     }
@@ -2646,7 +2686,7 @@ impl<'a> Linearizer<'a> {
             && !returns_large_struct;
         // `long double _Complex` comes back through the hidden pointer above,
         // not in registers.
-        let returns_complex = self.types.is_complex(typ) && !returns_large_struct;
+        let ret_is_address = self.types.is_complex(typ) && !returns_large_struct;
 
         let (result_sym, mut arg_vals, mut arg_types_vec) = if returns_large_struct {
             // Allocate local storage for the return value
@@ -2695,7 +2735,7 @@ impl<'a> Linearizer<'a> {
                 );
             }
             (local_sym, Vec::new(), Vec::new())
-        } else if returns_complex {
+        } else if ret_is_address {
             // Complex returns: allocate local storage for the result
             // Complex values are 16 bytes and need stack storage
             let local_sym = self.alloc_pseudo();

@@ -6999,3 +6999,77 @@ int main(void)
         0
     );
 }
+
+/// An aggregate that is nothing but a `long double` is returned in st(0).
+///
+/// System V classifies its two eightbytes X87 and X87UP, and X87UP is preceded
+/// by X87, so the merge-to-MEMORY rule does not fire: gcc emits `fld1; ret` for
+/// `struct R { long double v; } f(void)`. c17 decided sret by raw size instead
+/// -- and 128 bits is not *greater* than 128 -- so it took the two-register
+/// path, returned RAX:RDX, and the caller read a slot nothing had written.
+/// The value came back as zero.
+///
+/// The moment anything shares an eightbyte the merge rules do apply, so
+/// `union { long double v; double d; }` is MEMORY and really is returned
+/// through a hidden pointer. Both halves are checked here, against gcc.
+#[test]
+fn codegen_long_double_aggregate_returns_in_st0() {
+    let code = r#"
+struct R  { long double v; };
+struct I  { long double v; };
+struct N  { struct I v; };
+struct A  { long double v[1]; };
+union  U  { long double v; };
+union  M  { long double v; double d; };   /* X87 merged with SSE -> MEMORY */
+struct W  { long double v; int tag; };    /* over two eightbytes -> MEMORY */
+
+__attribute__((noinline)) static struct R mk(void)  { struct R r; r.v = 3.25L; return r; }
+__attribute__((noinline)) static struct N mkn(void) { struct N r; r.v.v = 3.25L; return r; }
+__attribute__((noinline)) static struct A mka(void) { struct A r; r.v[0] = 3.25L; return r; }
+__attribute__((noinline)) static union  U mku(void) { union  U r; r.v = 3.25L; return r; }
+__attribute__((noinline)) static union  M mkm(void) { union  M r; r.v = 3.25L; return r; }
+__attribute__((noinline)) static struct W mkw(void) { struct W r; r.v = 3.25L; r.tag = 7; return r; }
+
+/* Small enough to tempt the inliner: its `Ret` carries an address, which must
+   not be spliced into a caller expecting a value. */
+static struct R mk_inlinable(void) { struct R r; r.v = 6.5L; return r; }
+
+int main(void)
+{
+    if (mk().v  != 3.25L) return 1;
+    if (mkn().v.v != 3.25L) return 2;
+    /* Through a local: indexing an array member of a call-result rvalue is a
+       separate, pre-existing defect that has nothing to do with the return
+       class -- it fails for `struct { int v[2]; }` too. */
+    struct A arr = mka();
+    if (arr.v[0] != 3.25L) return 3;
+    if (mku().v != 3.25L) return 4;
+    if (mkm().v != 3.25L) return 5;
+    if (mkw().v != 3.25L || mkw().tag != 7) return 6;
+
+    /* Assigned through a local, and used twice in one expression. */
+    struct R a = mk();
+    if (a.v != 3.25L) return 7;
+    if (mk().v + mk().v != 6.5L) return 8;
+
+    /* The inlinable one, twice, so a spliced body would be caught. */
+    if (mk_inlinable().v != 6.5L) return 9;
+    struct R b = mk_inlinable();
+    if (b.v != 6.5L) return 10;
+    if (mk_inlinable().v + mk_inlinable().v != 13.0L) return 11;
+
+    /* A long double local must survive all of it. */
+    long double keep = 1.5L;
+    if (mk().v != 3.25L) return 12;
+    if (keep != 1.5L) return 13;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("codegen_ld_aggregate_return", code, &[]), 0);
+    // -O2 as well: the inliner sees an address-carrying `Ret` only there.
+    assert_eq!(
+        compile_and_run_optimized("codegen_ld_aggregate_return_opt", code),
+        0
+    );
+}

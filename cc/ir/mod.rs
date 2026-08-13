@@ -1775,6 +1775,13 @@ pub enum Initializer {
     Int(i128),
     /// Float/double initializer
     Float(FloatVal),
+    /// An IEEE binary128 initializer.
+    ///
+    /// Distinct from `Float` because the 16-byte encoding is not decided by
+    /// the width: on x86-64 a 16-byte float initializer is x87's 80-bit image
+    /// unless the object is a `__float128`. The type knows; the byte count
+    /// does not, so the type records it here.
+    Float128(FloatVal),
     /// String literal initializer (for char arrays)
     String(String),
     /// Wide string literal initializer (for wchar_t arrays)
@@ -1814,7 +1821,7 @@ impl Initializer {
         match self {
             Initializer::None => true,
             Initializer::Int(v) => *v == 0,
-            Initializer::Float(v) => v.is_positive_zero(),
+            Initializer::Float(v) | Initializer::Float128(v) => v.is_positive_zero(),
             // A zero-length string is all-zero; a non-empty char array initialized
             // by a string literal is zero iff every byte is `\0`.
             Initializer::String(s) => s.chars().all(|c| c == '\0'),
@@ -1846,7 +1853,8 @@ impl Initializer {
             Initializer::Struct { fields, .. } => {
                 fields.iter().any(|(_, _, init)| init.has_reloc())
             }
-            Initializer::None
+            Initializer::Float128(_)
+            | Initializer::None
             | Initializer::Int(_)
             | Initializer::Float(_)
             | Initializer::String(_)
@@ -1862,7 +1870,7 @@ impl fmt::Display for Initializer {
         match self {
             Initializer::None => write!(f, "0"),
             Initializer::Int(v) => write!(f, "{}", v),
-            Initializer::Float(v) => write!(f, "{}", v),
+            Initializer::Float(v) | Initializer::Float128(v) => write!(f, "{}", v),
             Initializer::String(s) => write!(f, "\"{}\"", s.escape_default()),
             Initializer::WideString(s) => write!(f, "L\"{}\"", s.escape_default()),
             Initializer::Utf16String(u) => write!(f, "u\"<{} units>\"", u.len()),

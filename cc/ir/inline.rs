@@ -1294,6 +1294,7 @@ fn collect_func_refs_from_initializer(
                 address_taken.insert(name.clone());
             }
         }
+        Initializer::Float128(_) => {}
         Initializer::Array { elements, .. } => {
             for (_, elem_init) in elements {
                 collect_func_refs_from_initializer(elem_init, func_names, address_taken);

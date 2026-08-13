@@ -595,17 +595,20 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// fold, leaving the caller's own diagnostics to run.
     fn fold_scalar_init(&mut self, expr: &Expr, typ: TypeId) -> Option<Initializer> {
         if self.types.is_float(typ) {
+            let wrap = |val| {
+                if self.types.kind(typ) == TypeKind::Float128 {
+                    Initializer::Float128(val)
+                } else {
+                    Initializer::Float(val)
+                }
+            };
             if let Some(val) = self.eval_const_float_expr(expr) {
-                return Some(Initializer::Float(val));
+                return Some(wrap(val));
             }
             // An integer constant initializing a floating object converts
             // exactly, however wide it is: `long double x = 1;`.
             let val = self.eval_const_expr(expr)?;
-            return Some(Initializer::Float(FloatVal::from_parts(
-                val < 0,
-                val.unsigned_abs(),
-                0,
-            )));
+            return Some(wrap(FloatVal::from_parts(val < 0, val.unsigned_abs(), 0)));
         }
 
         // Converting to `_Bool` is not a truncation: every non-zero value

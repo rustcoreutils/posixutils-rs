@@ -727,7 +727,18 @@ impl X86_64CodeGen {
                 }
                 // Check for single SSE return
                 if classes.first() == Some(&RegClass::Sse) {
-                    self.emit_fp_move_from_xmm(XmmReg::Xmm0, &dst_loc, ret_fmt);
+                    // An aggregate's type does not say how wide the move is --
+                    // `fp_format` sees a struct and answers `Double` -- so for
+                    // one the class's size decides. A scalar keeps its own
+                    // type's answer, which is the more precise one.
+                    let fmt = if insn.typ.is_some_and(|t| {
+                        matches!(types.kind(t), TypeKind::Struct | TypeKind::Union)
+                    }) {
+                        FpSize::for_sse_aggregate(*size_bits)
+                    } else {
+                        ret_fmt
+                    };
+                    self.emit_fp_move_from_xmm(XmmReg::Xmm0, &dst_loc, fmt);
                     return;
                 }
                 // Integer return

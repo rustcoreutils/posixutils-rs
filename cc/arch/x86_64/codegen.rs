@@ -1204,12 +1204,12 @@ impl X86_64CodeGen {
                                     _ => {}
                                 }
                             } else {
-                                // Single SSE reg for small float struct (<=8 bytes)
-                                let fp_size = if size_bits <= 32 {
-                                    FpSize::Single
-                                } else {
-                                    FpSize::Double
-                                };
+                                // One SSE register carrying the aggregate. The
+                                // width comes from the class's size: a struct's
+                                // own type answers `Double` whatever it holds,
+                                // which is two bytes too wide for a `_Float16`
+                                // and half as wide as a binary128 needs.
+                                let fp_size = FpSize::for_sse_aggregate(size_bits);
                                 match src_loc {
                                     Loc::Stack(offset) => {
                                         self.push_lir(X86Inst::MovFp {

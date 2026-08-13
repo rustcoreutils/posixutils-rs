@@ -6941,3 +6941,61 @@ int main(void)
         0
     );
 }
+
+/// A struct holding `_Float16` is returned in an SSE register, not through a
+/// hidden pointer.
+///
+/// `_Float16` was missing from the ABI classifier's notion of a floating type,
+/// so an eightbyte holding one answered MEMORY. The caller then expected the
+/// callee to have written the value through a hidden pointer, the callee
+/// returned it in registers instead, and the result read back as zero -- with
+/// no diagnostic. Checked against gcc, which returns it in xmm0.
+#[test]
+fn codegen_float16_struct_returns_in_a_register() {
+    let code = r#"
+struct H  { _Float16 v; };
+struct H2 { _Float16 a, v; };
+struct F  { float v; };
+struct D  { double a, v; };
+
+__attribute__((noinline)) static struct H  mk(void)  { struct H r;  r.v = 2.5f16; return r; }
+__attribute__((noinline)) static struct H2 mk2(void) { struct H2 r; r.a = 1.5f16; r.v = 2.5f16; return r; }
+__attribute__((noinline)) static struct F  mkf(void) { struct F r;  r.v = 3.5f;   return r; }
+__attribute__((noinline)) static struct D  mkd(void) { struct D r;  r.a = 1.0; r.v = 4.5; return r; }
+
+__attribute__((noinline)) static _Float16 take(struct H a)  { return a.v; }
+__attribute__((noinline)) static _Float16 take2(struct H2 a) { return a.v; }
+__attribute__((noinline)) static _Float16 scalar(_Float16 a, _Float16 b) { return a + b; }
+
+int main(void)
+{
+    if ((float)mk().v != 2.5f) return 1;
+    if ((float)mk2().v != 2.5f) return 2;
+    if ((float)mk2().a != 1.5f) return 3;
+
+    struct H h = mk();
+    if ((float)take(h) != 2.5f) return 4;
+    struct H2 h2 = mk2();
+    if ((float)take2(h2) != 2.5f) return 5;
+
+    /* A scalar `_Float16` is an SSE argument too; it used to be counted as an
+       integer one, which only worked because the two sides kept separate
+       indices. */
+    if ((float)scalar(1.5f16, 2.5f16) != 4.0f) return 6;
+
+    /* Controls: the float and two-double shapes were already right. */
+    if (mkf().v != 3.5f) return 7;
+    if (mkd().v != 4.5) return 8;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_float16_struct_return", code, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run_optimized("codegen_float16_struct_return_opt", code),
+        0
+    );
+}

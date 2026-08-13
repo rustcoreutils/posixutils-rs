@@ -118,6 +118,23 @@ impl FpSize {
         }
     }
 
+    /// The move width for an aggregate carried in a single SSE register.
+    ///
+    /// An aggregate's *type* cannot answer this -- `from_type_kind` sees a
+    /// struct and falls back to `Double` -- so the ABI class's size decides.
+    /// Unlike [`FpSize::from_bits`], sixteen bytes here means `Quad` on every
+    /// architecture: a single SSE register holding sixteen bytes is SSE+SSEUP,
+    /// and x87's `Extended`, which `from_bits` picks on x86-64, is MEMORY
+    /// class and never travels in a register at all.
+    pub fn for_sse_aggregate(size_bits: u32) -> Self {
+        match size_bits {
+            0..=16 => FpSize::Half,
+            17..=32 => FpSize::Single,
+            33..=64 => FpSize::Double,
+            _ => FpSize::Quad,
+        }
+    }
+
     /// Create from TypeKind. This is the preferred way to determine FP size
     /// when type information is available, rather than inferring from bit size.
     ///

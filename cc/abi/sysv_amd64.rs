@@ -387,13 +387,113 @@ impl Abi for SysVAmd64Abi {
 mod tests {
     use super::*;
 
-    // Note: More comprehensive tests require a TypeTable, which would be
-    // created in integration tests. These tests verify basic behavior.
+    use crate::target::{Arch, Os, Target};
+    use crate::types::{CompositeType, StructMember, Type};
 
     #[test]
     fn test_abi_creation() {
         let abi = SysVAmd64Abi::new();
         // Basic sanity - just ensure it constructs
         assert_eq!(format!("{:?}", abi), "SysVAmd64Abi");
+    }
+
+    /// A `TypeTable` for the x86-64 System V target these rules describe.
+    fn x86_types() -> TypeTable {
+        TypeTable::new(&Target::new(Arch::X86_64, Os::Linux))
+    }
+
+    /// A one-member struct wrapping `member`.
+    fn wrap(types: &mut TypeTable, member: TypeId) -> TypeId {
+        let size = (types.size_bits(member) / 8) as usize;
+        let align = types.alignment(member);
+        types.intern(Type::struct_type(CompositeType {
+            tag: None,
+            members: vec![StructMember {
+                name: crate::strings::StringId::default(),
+                typ: member,
+                offset: 0,
+                bit_width: None,
+                bit_offset: None,
+                storage_unit_size: None,
+                explicit_align: None,
+            }],
+            enum_constants: vec![],
+            size,
+            align,
+            is_complete: true,
+        }))
+    }
+
+    /// `_Float16` is a floating type, scalar or wrapped.
+    ///
+    /// It was missing from the classifier's `is_float`, so an eightbyte
+    /// holding one reached the default arm and answered MEMORY: a
+    /// `struct { _Float16 h; }` was returned through a hidden pointer that
+    /// nothing ever wrote, and read back as zero. A scalar one fell to the
+    /// size-based default and was classified INTEGER, so the argument
+    /// accounting charged it a general register while the backend used an SSE
+    /// one.
+    #[test]
+    fn float16_is_classified_as_a_floating_type() {
+        let abi = SysVAmd64Abi::new();
+        let mut types = x86_types();
+        let half = types.float16_id;
+
+        assert!(
+            matches!(abi.classify_return(half, &types),
+                     ArgClass::Direct { ref classes, .. } if classes == &[RegClass::Sse]),
+            "scalar _Float16 returns in an SSE register, got {:?}",
+            abi.classify_return(half, &types)
+        );
+        assert!(
+            matches!(abi.classify_param(half, &types),
+                     ArgClass::Direct { ref classes, .. } if classes == &[RegClass::Sse]),
+            "scalar _Float16 is passed in an SSE register"
+        );
+
+        let wrapped = wrap(&mut types, half);
+        assert!(
+            matches!(abi.classify_return(wrapped, &types),
+                     ArgClass::Direct { ref classes, size_bits }
+                         if classes == &[RegClass::Sse] && size_bits == 16),
+            "struct {{ _Float16 }} returns in one SSE register, got {:?}",
+            abi.classify_return(wrapped, &types)
+        );
+        assert!(
+            !matches!(
+                abi.classify_return(wrapped, &types),
+                ArgClass::Indirect { .. }
+            ),
+            "struct {{ _Float16 }} must not be returned through a hidden pointer"
+        );
+    }
+
+    /// The other floating types keep the classification they had.
+    #[test]
+    fn the_other_floating_types_are_unchanged() {
+        let abi = SysVAmd64Abi::new();
+        let mut types = x86_types();
+
+        for (name, id) in [("float", types.float_id), ("double", types.double_id)] {
+            assert!(
+                matches!(abi.classify_return(id, &types),
+                         ArgClass::Direct { ref classes, .. } if classes == &[RegClass::Sse]),
+                "{name} returns in an SSE register"
+            );
+        }
+        // `long double` is x87 and its wrapper is MEMORY as an argument.
+        assert!(matches!(
+            abi.classify_return(types.longdouble_id, &types),
+            ArgClass::X87 { .. }
+        ));
+        let ld = types.longdouble_id;
+        let wrapped_ld = wrap(&mut types, ld);
+        assert!(
+            matches!(
+                abi.classify_param(wrapped_ld, &types),
+                ArgClass::Indirect { .. }
+            ),
+            "a struct holding a long double is MEMORY class as an argument"
+        );
     }
 }

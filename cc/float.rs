@@ -134,6 +134,12 @@ impl FloatVal {
         }
     }
 
+    /// Widen an integer. Always exact -- a `u128` magnitude has no more bits
+    /// than the significand.
+    pub fn from_i128(v: i128) -> Self {
+        Self::from_parts(v < 0, v.unsigned_abs(), 0)
+    }
+
     /// Build from an exact `mantissa * 2^exp2`.
     ///
     /// Exact: a `u128` mantissa has no more bits than the significand, so
@@ -815,6 +821,431 @@ pub(crate) fn parse_decimal_float_parts(s: &str) -> Result<(u128, i32), ()> {
     Ok(decimal_to_binary(&digits, exp10))
 }
 
+// ============================================================================
+// Exact arithmetic
+// ============================================================================
+
+/// A target binary floating-point format.
+///
+/// Named by what it is rather than by how wide it is: `long double` is three
+/// different formats across the targets c17 supports, two of which are 128
+/// bits, and folding at the wrong one gives a wrong answer rather than an
+/// imprecise one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FpFormat {
+    /// IEEE binary16 -- `_Float16`.
+    Binary16,
+    /// IEEE binary32 -- `float`.
+    Binary32,
+    /// IEEE binary64 -- `double`, and `long double` on Apple arm64.
+    Binary64,
+    /// The x87 80-bit format -- `long double` on x86-64.
+    X87Extended,
+    /// IEEE binary128 -- `__float128`, and `long double` on Linux aarch64.
+    Binary128,
+}
+
+impl FpFormat {
+    /// Significand bits, counting the integer bit whether or not it is stored.
+    pub fn precision(self) -> u32 {
+        match self {
+            FpFormat::Binary16 => 11,
+            FpFormat::Binary32 => 24,
+            FpFormat::Binary64 => 53,
+            FpFormat::X87Extended => 64,
+            FpFormat::Binary128 => 113,
+        }
+    }
+
+    /// The unbiased exponent of the smallest normal value.
+    fn emin(self) -> i32 {
+        match self {
+            FpFormat::Binary16 => -14,
+            FpFormat::Binary32 => -126,
+            FpFormat::Binary64 => -1022,
+            FpFormat::X87Extended | FpFormat::Binary128 => -16382,
+        }
+    }
+
+    /// The unbiased exponent of the largest finite value.
+    fn emax(self) -> i32 {
+        match self {
+            FpFormat::Binary16 => 15,
+            FpFormat::Binary32 => 127,
+            FpFormat::Binary64 => 1023,
+            FpFormat::X87Extended | FpFormat::Binary128 => 16383,
+        }
+    }
+}
+
+/// A 256-bit unsigned integer.
+///
+/// Two 128-bit significands multiplied, or one aligned against another before
+/// adding, do not fit in a `u128`. Only what the four operations below need is
+/// implemented.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct U256 {
+    hi: u128,
+    lo: u128,
+}
+
+impl U256 {
+    const ZERO: U256 = U256 { hi: 0, lo: 0 };
+    const ONE: U256 = U256 { hi: 0, lo: 1 };
+
+    /// `sig * 2^127`.
+    ///
+    /// One bit short of the top, so that two of these can be added without
+    /// leaving 256 bits: a significand is normalized to bit 127, so `sig <<
+    /// 128` would put the sum of two of them past 2^256.
+    fn scaled127(sig: u128) -> Self {
+        U256 {
+            hi: sig >> 1,
+            lo: sig << 127,
+        }
+    }
+
+    fn is_zero(self) -> bool {
+        self.hi == 0 && self.lo == 0
+    }
+
+    fn leading_zeros(self) -> u32 {
+        if self.hi == 0 {
+            128 + self.lo.leading_zeros()
+        } else {
+            self.hi.leading_zeros()
+        }
+    }
+
+    fn add(self, o: Self) -> Self {
+        let (lo, carry) = self.lo.overflowing_add(o.lo);
+        U256 {
+            hi: self.hi.wrapping_add(o.hi).wrapping_add(carry as u128),
+            lo,
+        }
+    }
+
+    fn sub(self, o: Self) -> Self {
+        let (lo, borrow) = self.lo.overflowing_sub(o.lo);
+        U256 {
+            hi: self.hi.wrapping_sub(o.hi).wrapping_sub(borrow as u128),
+            lo,
+        }
+    }
+
+    fn shl(self, n: u32) -> Self {
+        match n {
+            0 => self,
+            256.. => Self::ZERO,
+            128.. => U256 {
+                hi: self.lo << (n - 128),
+                lo: 0,
+            },
+            _ => U256 {
+                hi: (self.hi << n) | (self.lo >> (128 - n)),
+                lo: self.lo << n,
+            },
+        }
+    }
+
+    fn shr(self, n: u32) -> Self {
+        match n {
+            0 => self,
+            256.. => Self::ZERO,
+            128.. => U256 {
+                hi: 0,
+                lo: self.hi >> (n - 128),
+            },
+            _ => U256 {
+                hi: self.hi >> n,
+                lo: (self.lo >> n) | (self.hi << (128 - n)),
+            },
+        }
+    }
+
+    /// Shift right by `n`, reporting whether any set bit fell off the bottom.
+    fn shr_lossy(self, n: u32) -> (Self, bool) {
+        let out = self.shr(n);
+        (out, out.shl(n) != self)
+    }
+
+    /// The exact 256-bit product of two 128-bit values.
+    fn mul(a: u128, b: u128) -> Self {
+        const HALF: u128 = u64::MAX as u128;
+        let (a1, a0) = (a >> 64, a & HALF);
+        let (b1, b0) = (b >> 64, b & HALF);
+
+        // a*b = a1b1*2^128 + (a1b0 + a0b1)*2^64 + a0b0, and the middle sum can
+        // carry out of a u128, which is worth 2^192.
+        let (mid, carry) = (a1 * b0).overflowing_add(a0 * b1);
+        let (lo, lo_carry) = (a0 * b0).overflowing_add(mid << 64);
+        let hi = (a1 * b1) + (mid >> 64) + ((carry as u128) << 64) + lo_carry as u128;
+        U256 { hi, lo }
+    }
+
+    /// `a * 2^128 / b`, exactly, as a quotient and a remainder-is-nonzero flag.
+    ///
+    /// Both significands are normalized to bit 127, so the quotient lies in
+    /// `(2^127, 2^129)` -- more than any target format keeps, which is what
+    /// leaves room to fold the remainder into the low bit as a sticky.
+    fn div(a: u128, b: u128) -> (Self, bool) {
+        let n = U256 { hi: a, lo: 0 };
+        let d = U256 { hi: 0, lo: b };
+        let mut q = U256::ZERO;
+        let mut r = U256::ZERO;
+        for i in (0..256).rev() {
+            // r stays below d < 2^128, so doubling it cannot overflow.
+            r = r.shl(1);
+            if n.shr(i).lo & 1 != 0 {
+                r.lo |= 1;
+            }
+            if r >= d {
+                r = r.sub(d);
+                q = q.add(U256::ONE.shl(i));
+            }
+        }
+        (q, !r.is_zero())
+    }
+}
+
+impl FloatVal {
+    /// The left-aligned significand and the power of two its low bit is worth.
+    ///
+    /// Aligning first is what makes the quotient bound in [`U256::div`] hold:
+    /// a subnormal's significand has leading zeros, and dividing by one that
+    /// still had them would leave the sticky bit inside the kept digits.
+    fn scaled(self) -> (u128, i32) {
+        let (sig, unbiased) = self.aligned();
+        (sig, unbiased - (SIG_BITS as i32 - 1))
+    }
+
+    /// A zero with the given sign.
+    fn signed_zero(neg: bool) -> Self {
+        FloatVal {
+            neg,
+            exp: 0,
+            sig: 0,
+        }
+    }
+
+    /// True for either infinity.
+    fn is_infinite(self) -> bool {
+        self.exp == EXP_SPECIAL && !self.is_nan()
+    }
+
+    /// Round to `fmt`, saturating to infinity on overflow.
+    ///
+    /// This is what a cast does, and what each operand of an arithmetic
+    /// operation has already had done to it: an operand's type says how many
+    /// bits it has, whatever the literal it came from was written with.
+    pub fn round_to_format(self, fmt: FpFormat) -> Self {
+        if self.exp == EXP_SPECIAL || self.is_zero() {
+            return self;
+        }
+        let (sig, exp2) = self.scaled();
+        Self::round_wide(self.neg, U256::scaled127(sig), exp2 - 127, false, fmt)
+    }
+
+    /// `self + other`, rounded once to `fmt`.
+    pub fn add(self, other: Self, fmt: FpFormat) -> Self {
+        self.add_rounded(other, fmt)
+    }
+
+    /// `self - other`, rounded once to `fmt`.
+    pub fn sub(self, other: Self, fmt: FpFormat) -> Self {
+        self.add_rounded(other.negated(), fmt)
+    }
+
+    /// The common core of `add` and `sub`: `sub` negates first, since
+    /// `a - b` and `a + (-b)` are the same in every rounding mode.
+    fn add_rounded(self, other: Self, fmt: FpFormat) -> Self {
+        let a = self.round_to_format(fmt);
+        let b = other.round_to_format(fmt);
+
+        if a.is_nan() || b.is_nan() {
+            return Self::nan();
+        }
+        if a.is_infinite() || b.is_infinite() {
+            // Infinities of opposite sign have no defined difference.
+            if a.is_infinite() && b.is_infinite() && a.neg != b.neg {
+                return Self::nan();
+            }
+            return if a.is_infinite() { a } else { b };
+        }
+        if a.is_zero() && b.is_zero() {
+            // Round to nearest gives +0 unless both addends are -0.
+            return Self::signed_zero(a.neg && b.neg);
+        }
+        if a.is_zero() {
+            return b;
+        }
+        if b.is_zero() {
+            return a;
+        }
+
+        let (sig_a, exp_a) = a.scaled();
+        let (sig_b, exp_b) = b.scaled();
+        let exp = exp_a.max(exp_b);
+        // Each is `sig * 2^127` shifted down to the common exponent, so the
+        // pair is exact to 127 bits below the smaller operand's last bit.
+        let (wa, lost_a) = U256::scaled127(sig_a).shr_lossy((exp - exp_a) as u32);
+        let (wb, lost_b) = U256::scaled127(sig_b).shr_lossy((exp - exp_b) as u32);
+        let scale = exp - 127;
+
+        if a.neg == b.neg {
+            return Self::round_wide(a.neg, wa.add(wb), scale, lost_a || lost_b, fmt);
+        }
+
+        // Opposite signs: the magnitudes subtract, and the result takes the
+        // sign of the larger. Only the operand that was shifted can have lost
+        // bits, and a shift large enough to lose any is larger than 128, which
+        // leaves it below 2^127 while the unshifted one is at least 2^254 --
+        // so a tie here is always an exact tie.
+        let (big, small, big_lost, small_lost, neg) = match wa.cmp(&wb) {
+            std::cmp::Ordering::Greater => (wa, wb, lost_a, lost_b, a.neg),
+            std::cmp::Ordering::Less => (wb, wa, lost_b, lost_a, b.neg),
+            std::cmp::Ordering::Equal => return Self::ZERO,
+        };
+        let diff = big.sub(small);
+        let (w, sticky) = if big_lost {
+            // The larger is truly a little above `big`, so the difference is a
+            // little above `diff`.
+            (diff, true)
+        } else if small_lost {
+            // The smaller is truly a little above `small`, so the difference
+            // is a little *below* `diff` -- which is `diff - 1` plus a sticky.
+            (diff.sub(U256::ONE), true)
+        } else {
+            (diff, false)
+        };
+        Self::round_wide(neg, w, scale, sticky, fmt)
+    }
+
+    /// `self * other`, rounded once to `fmt`.
+    pub fn mul(self, other: Self, fmt: FpFormat) -> Self {
+        let a = self.round_to_format(fmt);
+        let b = other.round_to_format(fmt);
+
+        if a.is_nan() || b.is_nan() {
+            return Self::nan();
+        }
+        let neg = a.neg != b.neg;
+        if a.is_infinite() || b.is_infinite() {
+            if a.is_zero() || b.is_zero() {
+                return Self::nan();
+            }
+            return Self::infinity(neg);
+        }
+        if a.is_zero() || b.is_zero() {
+            return Self::signed_zero(neg);
+        }
+
+        let (sig_a, exp_a) = a.scaled();
+        let (sig_b, exp_b) = b.scaled();
+        // The full product is exact in 256 bits; nothing is lost before the
+        // single rounding below.
+        Self::round_wide(neg, U256::mul(sig_a, sig_b), exp_a + exp_b, false, fmt)
+    }
+
+    /// `self / other`, rounded once to `fmt`.
+    pub fn div(self, other: Self, fmt: FpFormat) -> Self {
+        let a = self.round_to_format(fmt);
+        let b = other.round_to_format(fmt);
+
+        if a.is_nan() || b.is_nan() {
+            return Self::nan();
+        }
+        let neg = a.neg != b.neg;
+        if a.is_infinite() {
+            return if b.is_infinite() {
+                Self::nan()
+            } else {
+                Self::infinity(neg)
+            };
+        }
+        if b.is_infinite() {
+            return Self::signed_zero(neg);
+        }
+        if b.is_zero() {
+            return if a.is_zero() {
+                Self::nan()
+            } else {
+                Self::infinity(neg)
+            };
+        }
+        if a.is_zero() {
+            return Self::signed_zero(neg);
+        }
+
+        let (sig_a, exp_a) = a.scaled();
+        let (sig_b, exp_b) = b.scaled();
+        let (q, inexact) = U256::div(sig_a, sig_b);
+        // The quotient is at least 2^127 and the widest format keeps 113 bits,
+        // so bit 0 is far below the rounding position and can carry the
+        // remainder as a sticky.
+        let q = if inexact { q.add(U256::ONE) } else { q };
+        Self::round_wide(neg, q, exp_a - exp_b - 128, inexact, fmt)
+    }
+
+    /// Round `w * 2^scale` to `fmt`, once, to nearest with ties to even.
+    ///
+    /// `sticky` says that a non-zero value smaller than `w`'s low bit was
+    /// discarded on the way here, which decides a tie and nothing else.
+    fn round_wide(neg: bool, w: U256, scale: i32, sticky: bool, fmt: FpFormat) -> Self {
+        if w.is_zero() {
+            return Self::signed_zero(neg);
+        }
+
+        let msb = 255 - w.leading_zeros() as i32;
+        let precision = fmt.precision() as i32;
+        // The bit that will hold the result's last significand bit: `precision`
+        // below the top for a normal, or the format's smallest ulp for a
+        // subnormal, which is fixed rather than relative to the value.
+        let last = if msb + scale >= fmt.emin() {
+            msb - (precision - 1)
+        } else {
+            fmt.emin() - (precision - 1) - scale
+        };
+
+        let drop = last.max(0) as u32;
+        let kept = w.shr(drop);
+        let round_up = if drop == 0 {
+            // Nothing is being discarded here; a sticky from further back is
+            // below half an ulp on its own.
+            false
+        } else if drop > 256 {
+            // Half an ulp is wider than the whole intermediate, so the value
+            // is below it and rounds away to zero. Forming `half` here would
+            // shift the one straight off the top and leave zero, which every
+            // value compares greater than -- the far-underflow product
+            // `0x9482dbp-94f * 0xb85f3dp-118f` came out as the smallest
+            // subnormal where it should have been none at all.
+            false
+        } else {
+            let half = U256::ONE.shl(drop - 1);
+            match w.sub(kept.shl(drop)).cmp(&half) {
+                std::cmp::Ordering::Greater => true,
+                std::cmp::Ordering::Equal => sticky || kept.lo & 1 != 0,
+                std::cmp::Ordering::Less => false,
+            }
+        };
+        let kept = if round_up { kept.add(U256::ONE) } else { kept };
+
+        // `kept` holds at most `precision` bits, plus one if rounding carried,
+        // so it always fits the significand this type is built from.
+        debug_assert!(kept.hi == 0, "rounded significand wider than 128 bits");
+        if kept.lo == 0 {
+            return Self::signed_zero(neg);
+        }
+
+        let exp2 = scale + drop as i32;
+        if 127 - kept.lo.leading_zeros() as i32 + exp2 > fmt.emax() {
+            return Self::infinity(neg);
+        }
+        Self::from_parts(neg, kept.lo, exp2)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1041,6 +1472,306 @@ mod tests {
         // to it, one quarter rounds away to zero.
         assert_eq!(x87(3), (1, 0), "must not flush to zero");
         assert_eq!(x87(1), (0, 0), "below half an ulp flushes");
+    }
+
+    /// The four operations round once, at the format's own precision.
+    ///
+    /// Every expectation here was checked against gcc compiling the same
+    /// constant expression; the encodings are what it emits.
+    #[test]
+    fn arithmetic_rounds_once_at_the_target_precision() {
+        let q = |v: FloatVal| {
+            let (lo, hi) = v.to_f128_bits();
+            (hi, lo)
+        };
+        let one = FloatVal::from_f64(1.0);
+        let three = FloatVal::from_f64(3.0);
+        let seven = FloatVal::from_f64(7.0);
+
+        // A repeating quotient keeps all 113 bits. Through `f64` this was
+        // 0x3ffd5555555555555000000000000000 -- sixty bits short.
+        assert_eq!(
+            q(one.div(three, FpFormat::Binary128)),
+            (0x3ffd_5555_5555_5555, 0x5555_5555_5555_5555)
+        );
+        assert_eq!(
+            q(FloatVal::from_f64(2.0).div(seven, FpFormat::Binary128)),
+            (0x3ffd_2492_4924_9249, 0x2492_4924_9249_2492)
+        );
+
+        // The same division at x87's 64 bits, and at double's 53.
+        let (sig, se) = {
+            let b = one.div(three, FpFormat::X87Extended).to_x87_bytes();
+            (
+                u64::from_le_bytes(b[..8].try_into().unwrap()),
+                u16::from_le_bytes([b[8], b[9]]),
+            )
+        };
+        assert_eq!((se, sig), (0x3ffd, 0xaaaa_aaaa_aaaa_aaab));
+        assert_eq!(one.div(three, FpFormat::Binary64).to_f64(), 1.0 / 3.0);
+        assert_eq!(
+            one.div(three, FpFormat::Binary32).to_f64(),
+            (1.0f32 / 3.0f32) as f64
+        );
+
+        // An addend sixty bits down survives at binary128 and does not at
+        // double, which is the whole difference the format makes.
+        let tiny = FloatVal::from_f64(1e-30);
+        assert_eq!(
+            q(one.add(tiny, FpFormat::Binary128)),
+            (0x3fff_0000_0000_0000, 0x0000_0000_0000_1448)
+        );
+        assert_eq!(one.add(tiny, FpFormat::Binary64).to_f64(), 1.0);
+    }
+
+    /// Ties go to even, and only exact ties are ties.
+    #[test]
+    fn ties_at_the_last_significand_bit_go_to_even() {
+        let q = |v: FloatVal| {
+            let (lo, hi) = v.to_f128_bits();
+            (hi, lo)
+        };
+        let one = FloatVal::from_f64(1.0);
+        let ulp = |e: i32| FloatVal::from_parts(false, 1, e);
+
+        // Exactly half an ulp above 1.0, whose last bit is even: it stays.
+        assert_eq!(
+            q(one.add(ulp(-113), FpFormat::Binary128)),
+            (0x3fff_0000_0000_0000, 0)
+        );
+        // Three quarters of an ulp: above half, so it rounds up.
+        assert_eq!(
+            q(one.add(FloatVal::from_parts(false, 3, -114), FpFormat::Binary128)),
+            (0x3fff_0000_0000_0000, 1)
+        );
+        // Half an ulp above a value whose last bit is odd: rounds up.
+        let odd = one.add(ulp(-112), FpFormat::Binary128);
+        assert_eq!(
+            q(odd.add(ulp(-113), FpFormat::Binary128)),
+            (0x3fff_0000_0000_0000, 2)
+        );
+    }
+
+    /// Underflow rounds through the subnormal range and off the bottom.
+    #[test]
+    fn underflow_rounds_rather_than_flushing() {
+        let q = |v: FloatVal| {
+            let (lo, hi) = v.to_f128_bits();
+            (hi, lo)
+        };
+        let two = FloatVal::from_f64(2.0);
+        // binary128's smallest subnormal is 2^-16494.
+        let denorm_min = FloatVal::from_parts(false, 1, -16494);
+
+        // Exactly half of it is a tie, and zero is the even side.
+        assert_eq!(q(denorm_min.div(two, FpFormat::Binary128)), (0, 0));
+        // Three quarters of it is above half, so it rounds back up to one.
+        assert_eq!(
+            q(FloatVal::from_parts(false, 3, -16495).div(two, FpFormat::Binary128)),
+            (0, 1)
+        );
+        // Far below half an ulp -- the case where forming half an ulp
+        // overflows the intermediate -- must round away to nothing.
+        assert_eq!(q(denorm_min.mul(denorm_min, FpFormat::Binary128)), (0, 0));
+        assert!(FloatVal::from_f64(1e-300)
+            .mul(FloatVal::from_f64(1e-300), FpFormat::Binary64)
+            .is_zero());
+        // The step across the subnormal boundary stays exact: half the
+        // smallest normal is the largest power of two below it, encoded with
+        // a zero exponent and the top fraction bit set.
+        let min_normal = FloatVal::from_parts(false, 1, -16382);
+        assert_eq!(
+            q(min_normal.div(two, FpFormat::Binary128)),
+            (0x0000_8000_0000_0000, 0)
+        );
+    }
+
+    /// Overflow saturates to infinity at the format's own ceiling.
+    #[test]
+    fn overflow_saturates_at_each_formats_ceiling() {
+        let ten = FloatVal::from_f64(10.0);
+        let huge128 = FloatVal::from_parts(false, 1, 16383);
+        assert_eq!(
+            huge128.mul(ten, FpFormat::Binary128).to_f128_bits().1 >> 48,
+            0x7fff
+        );
+        // The same value is finite in binary128 and infinite in double.
+        assert!(!huge128.round_to_format(FpFormat::Binary128).is_nan());
+        assert_eq!(
+            huge128.round_to_format(FpFormat::Binary64).to_f64(),
+            f64::INFINITY
+        );
+        assert_eq!(
+            FloatVal::from_f64(1e308)
+                .mul(ten, FpFormat::Binary64)
+                .to_f64(),
+            f64::INFINITY
+        );
+    }
+
+    /// Zeros, infinities and NaNs follow IEEE 754.
+    #[test]
+    fn special_values_follow_ieee() {
+        let f = FpFormat::Binary128;
+        let zero = FloatVal::ZERO;
+        let neg_zero = zero.negated();
+        let one = FloatVal::from_f64(1.0);
+        let inf = FloatVal::infinity(false);
+        let neg_inf = FloatVal::infinity(true);
+
+        // Only -0 + -0 is -0; every other sum of zeros is +0.
+        assert!(
+            neg_zero.add(neg_zero, f).is_zero()
+                && neg_zero.add(neg_zero, f).negated().is_positive_zero()
+        );
+        assert!(zero.add(neg_zero, f).is_positive_zero());
+        assert!(one.sub(one, f).is_positive_zero());
+
+        // Signs multiply and divide.
+        assert!(neg_zero
+            .mul(FloatVal::from_f64(3.0), f)
+            .negated()
+            .is_positive_zero());
+        assert!(one.div(neg_inf, f).negated().is_positive_zero());
+
+        // Infinities.
+        assert_eq!(one.div(zero, f).to_f64(), f64::INFINITY);
+        assert_eq!(one.div(neg_zero, f).to_f64(), f64::NEG_INFINITY);
+        assert_eq!(inf.add(one, f).to_f64(), f64::INFINITY);
+        assert_eq!(inf.mul(neg_inf, f).to_f64(), f64::NEG_INFINITY);
+
+        // The indeterminate forms.
+        assert!(inf.sub(inf, f).is_nan());
+        assert!(inf.mul(zero, f).is_nan());
+        assert!(zero.div(zero, f).is_nan());
+        assert!(inf.div(inf, f).is_nan());
+        // A NaN operand poisons everything.
+        assert!(FloatVal::nan().add(one, f).is_nan());
+        assert!(one.mul(FloatVal::nan(), f).is_nan());
+    }
+
+    /// Rounding to a format is idempotent, and matches what emission does.
+    ///
+    /// An operand is rounded to its own type before the operation, so a
+    /// literal wider than the type it is written for -- which `FloatVal`
+    /// holds exactly -- contributes only the bits that type has.
+    #[test]
+    fn rounding_to_a_format_agrees_with_emission() {
+        for v in [
+            FloatVal::from_f64(0.1),
+            FloatVal::from_f64(-1e300),
+            FloatVal::from_parts(false, u128::MAX, -200),
+            FloatVal::from_parts(true, 12345678901234567890, -60),
+        ] {
+            assert_eq!(v.round_to_format(FpFormat::Binary64).to_f64(), v.to_f64());
+            assert_eq!(
+                v.round_to_format(FpFormat::Binary128).to_f128_bits(),
+                v.to_f128_bits()
+            );
+            assert_eq!(
+                v.round_to_format(FpFormat::X87Extended).to_x87_bytes(),
+                v.to_x87_bytes()
+            );
+            // Idempotent: rounding an already-rounded value changes nothing.
+            let once = v.round_to_format(FpFormat::X87Extended);
+            assert_eq!(once.round_to_format(FpFormat::X87Extended), once);
+        }
+    }
+
+    /// Every `double` result agrees with the hardware, exhaustively over a
+    /// wide random sample -- the arithmetic here has to be a drop-in for what
+    /// folding through `f64` used to do, for the format where that was right.
+    #[test]
+    fn double_results_agree_with_hardware() {
+        // A xorshift, so the sample is fixed without pulling in a dependency.
+        let mut state = 0x2545F4914F6CDD1Du64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..20000 {
+            let a = f64::from_bits(next());
+            let b = f64::from_bits(next());
+            if !a.is_finite() || !b.is_finite() {
+                continue;
+            }
+            let (x, y) = (FloatVal::from_f64(a), FloatVal::from_f64(b));
+            let f = FpFormat::Binary64;
+            assert_eq!(
+                x.add(y, f).to_f64().to_bits(),
+                (a + b).to_bits(),
+                "{a} + {b}"
+            );
+            assert_eq!(
+                x.sub(y, f).to_f64().to_bits(),
+                (a - b).to_bits(),
+                "{a} - {b}"
+            );
+            assert_eq!(
+                x.mul(y, f).to_f64().to_bits(),
+                (a * b).to_bits(),
+                "{a} * {b}"
+            );
+            if b != 0.0 {
+                assert_eq!(
+                    x.div(y, f).to_f64().to_bits(),
+                    (a / b).to_bits(),
+                    "{a} / {b}"
+                );
+            }
+        }
+    }
+
+    /// The same, for `float`.
+    #[test]
+    fn float_results_agree_with_hardware() {
+        let mut state = 0x9E3779B97F4A7C15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u32
+        };
+        for _ in 0..20000 {
+            let a = f32::from_bits(next());
+            let b = f32::from_bits(next());
+            if !a.is_finite() || !b.is_finite() {
+                continue;
+            }
+            let (x, y) = (FloatVal::from_f64(a as f64), FloatVal::from_f64(b as f64));
+            let f = FpFormat::Binary32;
+            let got = |v: FloatVal| v.to_f64() as f32;
+            assert_eq!(got(x.add(y, f)).to_bits(), (a + b).to_bits(), "{a} + {b}");
+            assert_eq!(got(x.sub(y, f)).to_bits(), (a - b).to_bits(), "{a} - {b}");
+            assert_eq!(got(x.mul(y, f)).to_bits(), (a * b).to_bits(), "{a} * {b}");
+            if b != 0.0 {
+                assert_eq!(got(x.div(y, f)).to_bits(), (a / b).to_bits(), "{a} / {b}");
+            }
+        }
+    }
+
+    /// An integer operand converts without passing through `f64`.
+    #[test]
+    fn integers_convert_exactly() {
+        // Needs 54 bits, so `as f64` would round it.
+        let v = FloatVal::from_i128(9007199254740993);
+        assert_eq!(
+            v.to_f128_bits(),
+            (0x0800_0000_0000_0000, 0x4034_0000_0000_0000)
+        );
+        // Rounding it to double loses the low bit, which is exactly what
+        // the old fold did to it on the way in.
+        assert_ne!(
+            v.key(),
+            FloatVal::from_f64(9007199254740993i64 as f64).key()
+        );
+        assert_eq!(v.to_f64(), 9007199254740992.0);
+        // The full width of the significand, and the sign.
+        assert_eq!(FloatVal::from_i128(i128::MIN).to_f64(), i128::MIN as f64);
+        assert_eq!(FloatVal::from_i128(-1).to_f64(), -1.0);
+        assert!(FloatVal::from_i128(0).is_positive_zero());
     }
 
     #[test]

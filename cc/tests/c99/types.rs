@@ -516,6 +516,91 @@ int main(void) { return 0; }
     assert_eq!(compile_and_run("float128_first_class", src, &[]), 0);
 }
 
+/// A constant expression is folded in its own format, exactly.
+///
+/// Folding used to narrow both operands to `f64` first, which cost a `long
+/// double` eleven significand bits and a `__float128` sixty: `1.0q/3.0q`
+/// emitted `3ffd5555555555555000...` where gcc emits `...5555555555555555`,
+/// and `1.0q + 1e-30q` collapsed to exactly `1.0`. The sharp edge was that
+/// the *same initializer written for a local* is computed at run time and was
+/// right, so the static and automatic forms of one expression disagreed --
+/// which is what this checks, alongside the bits themselves.
+///
+/// Every expected pattern was taken from gcc compiling the same expression.
+#[test]
+fn c99_constant_folding_is_exact_in_the_expressions_own_format() {
+    let src = r#"
+#include <float.h>
+#include <string.h>
+
+static int fail;
+
+#define CHECK_LD(expr, se_want, sig_want) do {                              \
+    static long double s = (expr);                                          \
+    long double l = (expr);                                                 \
+    unsigned long long sig; unsigned short se;                              \
+    memcpy(&sig, &s, 8); memcpy(&se, (char *)&s + 8, 2);                    \
+    if (LDBL_MANT_DIG == 64 && (se != (se_want) || sig != (sig_want)))      \
+        fail = __LINE__;                                                    \
+    /* Only the ten bytes x87 defines: the padding is indeterminate. */     \
+    if (memcmp(&s, &l, LDBL_MANT_DIG == 64 ? 10 : sizeof s) != 0)           \
+        fail = __LINE__;                                                    \
+} while (0)
+
+#ifdef __FLT128_MANT_DIG__
+#define CHECK_Q(expr, hi_want, lo_want) do {                                \
+    static __float128 s = (expr);                                           \
+    __float128 l = (expr);                                                  \
+    unsigned long long lo, hi;                                              \
+    memcpy(&lo, &s, 8); memcpy(&hi, (char *)&s + 8, 8);                     \
+    if (hi != (hi_want) || lo != (lo_want)) fail = __LINE__;                \
+    if (memcmp(&s, &l, sizeof s) != 0) fail = __LINE__;                     \
+} while (0)
+#else
+#define CHECK_Q(expr, hi_want, lo_want) do { } while (0)
+#endif
+
+int main(void)
+{
+    /* The headline case: a repeating quotient keeps all 113 bits. */
+    CHECK_Q(1.0q/3.0q,   0x3ffd555555555555ULL, 0x5555555555555555ULL);
+    CHECK_Q(2.0q/7.0q,   0x3ffd249249249249ULL, 0x2492492492492492ULL);
+
+    /* An addend sixty bits below the leading one survives, where narrowing
+       to double dropped it and left exactly 1.0. */
+    CHECK_Q(1.0q + 1e-30q, 0x3fff000000000000ULL, 0x0000000000001448ULL);
+
+    /* Ties at the 113th bit go to even, and only when they are exact ties. */
+    CHECK_Q(1.0q + 0x1p-113q,             0x3fff000000000000ULL, 0ULL);
+    CHECK_Q(1.0q + 0x1.8p-113q,           0x3fff000000000000ULL, 1ULL);
+    CHECK_Q((1.0q + 0x1p-112q) + 0x1p-113q, 0x3fff000000000000ULL, 2ULL);
+
+    /* The subnormal floor, from both sides, and overflow past it. */
+    CHECK_Q(0x1p-16494q / 2.0q,   0ULL, 0ULL);
+    CHECK_Q(0x1.8p-16494q / 2.0q, 0ULL, 1ULL);
+    CHECK_Q(1e4932q * 10.0q,      0x7fff000000000000ULL, 0ULL);
+
+    /* An integer operand converts exactly rather than through double: this
+       one needs 54 bits. */
+    CHECK_Q((__float128)9007199254740993 + 0.0q,
+            0x4034000000000000ULL, 0x0800000000000000ULL);
+
+    /* A chain rounds once per operation, not once at the end. */
+    CHECK_Q(((1.0q/7.0q + 1.0q/11.0q) * 13.0q) / 17.0q,
+            0x3ffc6e1afd1103b7ULL, 0x3f8f5a284988b3ecULL);
+
+    /* x87's 64-bit significand is the other width folding used to lose. */
+    CHECK_LD(1.0L/3.0L,       0x3ffd, 0xaaaaaaaaaaaaaaabULL);
+    CHECK_LD(1.0L + 0x1p-64L, 0x3fff, 0x8000000000000000ULL);
+    CHECK_LD(1.0L + 0x1.8p-64L, 0x3fff, 0x8000000000000001ULL);
+    CHECK_LD(2.0L/7.0L*3.0L,  0x3ffe, 0xdb6db6db6db6db6eULL);
+
+    return fail;
+}
+"#;
+    assert_eq!(compile_and_run("constant_folding_exact", src, &[]), 0);
+}
+
 /// `__float128` outranks every other real type in the usual arithmetic
 /// conversions -- it has more significand bits than x87 extended and the same
 /// exponent range, so a mixed expression is computed at binary128.

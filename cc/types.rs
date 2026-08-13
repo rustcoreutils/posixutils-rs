@@ -10,6 +10,7 @@
 // Compositional type model with interning for efficient comparison
 //
 
+use crate::float::FpFormat;
 use crate::strings::StringId;
 use crate::target::{Arch, Os, Target};
 use std::collections::HashMap;
@@ -998,6 +999,29 @@ impl TypeTable {
             TypeKind::Float128 => self.float128_id,
             _ => id,
         }
+    }
+
+    /// The binary format a floating type is held and computed in on this
+    /// target, or `None` if the type is not a floating one.
+    ///
+    /// `long double` is three different formats across the supported targets
+    /// and two of them are 128 bits wide, so this is the only sound way to ask
+    /// -- the width does not distinguish x87's 80-bit format from binary128.
+    /// A complex type answers for its base, which is the format each of its
+    /// two halves has.
+    pub fn fp_format(&self, id: TypeId) -> Option<FpFormat> {
+        Some(match self.get(id).kind {
+            TypeKind::Float16 => FpFormat::Binary16,
+            TypeKind::Float => FpFormat::Binary32,
+            TypeKind::Double => FpFormat::Binary64,
+            TypeKind::Float128 => FpFormat::Binary128,
+            TypeKind::LongDouble => match (self.target_arch, self.target_os) {
+                (Arch::Aarch64, Os::MacOS) => FpFormat::Binary64,
+                (Arch::Aarch64, _) => FpFormat::Binary128,
+                _ => FpFormat::X87Extended,
+            },
+            _ => return None,
+        })
     }
 
     /// Get the complex type for a float base type (e.g., double → double _Complex)

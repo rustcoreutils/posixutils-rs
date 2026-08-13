@@ -1692,20 +1692,21 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
     }
 
-    /// Evaluate a constant floating-point expression at compile time.
-    /// Handles float literals, negation, and binary arithmetic on floats.
     /// Fold a constant floating expression for a static initializer.
     ///
-    /// A bare literal passes through at full width, which is what makes
-    /// `long double x = LDBL_MAX;` come out right. Arithmetic is still done in
-    /// `f64`, so folding an expression whose operands exceed double's range
-    /// still loses them; carrying that exactly needs wide arithmetic, not just
-    /// a wide literal.
+    /// Every step is done in the expression's own format, exactly, and rounded
+    /// once -- the same thing the target would do at run time. Folding through
+    /// `f64` instead cost a `long double` eleven significand bits and a
+    /// `__float128` sixty, so `static __float128 c = 1.0q/3.0q;` disagreed with
+    /// the *same initializer written for a local*, which is computed at run
+    /// time and was right.
     pub(crate) fn eval_const_float_expr(&self, expr: &Expr) -> Option<FloatVal> {
         match &expr.kind {
             ExprKind::FloatLit(v) => Some(*v),
-            ExprKind::IntLit(v) => Some(FloatVal::from_f64(*v as f64)),
-            ExprKind::CharLit(c) => Some(FloatVal::from_f64(*c as i64 as f64)),
+            // Exact: a `u128` mantissa has no more bits than the significand,
+            // where `f64` would have rounded anything past the 53rd.
+            ExprKind::IntLit(v) => Some(FloatVal::from_i128(*v as i128)),
+            ExprKind::CharLit(c) => Some(FloatVal::from_i128(*c as i64 as i128)),
 
             ExprKind::Unary { op, operand } => {
                 let val = self.eval_const_float_expr(operand)?;
@@ -1715,17 +1716,20 @@ impl<'a> super::linearize::Linearizer<'a> {
                 }
             }
 
+            // The operation is done in the format of its own result type,
+            // which is the type the usual arithmetic conversions already gave
+            // this node -- not in whatever width the operands were written at.
             ExprKind::Binary { op, left, right } => {
-                let l = self.eval_const_float_expr(left)?.to_f64();
-                let r = self.eval_const_float_expr(right)?.to_f64();
-                let v = match op {
-                    BinaryOp::Add => l + r,
-                    BinaryOp::Sub => l - r,
-                    BinaryOp::Mul => l * r,
-                    BinaryOp::Div => l / r,
+                let l = self.eval_const_float_expr(left)?;
+                let r = self.eval_const_float_expr(right)?;
+                let fmt = expr.typ.and_then(|t| self.types.fp_format(t))?;
+                Some(match op {
+                    BinaryOp::Add => l.add(r, fmt),
+                    BinaryOp::Sub => l.sub(r, fmt),
+                    BinaryOp::Mul => l.mul(r, fmt),
+                    BinaryOp::Div => l.div(r, fmt),
                     _ => return None,
-                };
-                Some(FloatVal::from_f64(v))
+                })
             }
 
             // A cast rounds to the target format. Discarding the cast type
@@ -1736,10 +1740,9 @@ impl<'a> super::linearize::Linearizer<'a> {
                 cast_type,
             } => {
                 let val = self.eval_const_float_expr(inner)?;
-                Some(match self.types.kind(*cast_type) {
-                    TypeKind::Float => FloatVal::from_f64(val.to_f64() as f32 as f64),
-                    TypeKind::Double => FloatVal::from_f64(val.to_f64()),
-                    _ => val,
+                Some(match self.types.fp_format(*cast_type) {
+                    Some(fmt) => val.round_to_format(fmt),
+                    None => val,
                 })
             }
 

@@ -114,6 +114,20 @@ impl Aapcs64Abi {
 
         let mut base_type: Option<HfaBase> = None;
         let mut count: u8 = 0;
+        // A union's members overlap, so it holds as many elements as its
+        // largest member does -- not as many as all of them put together.
+        // Summing them made `union { double v; double d; }` a two-element HFA:
+        // the callee read sixteen bytes out of an eight-byte object and the
+        // caller wrote sixteen back into an eight-byte slot, over whatever
+        // followed it. AAPCS64 5.9.5 takes the maximum.
+        let overlaps = kind == TypeKind::Union;
+        let add = |count: &mut u8, n: u8| {
+            *count = if overlaps {
+                (*count).max(n)
+            } else {
+                count.saturating_add(n)
+            };
+        };
 
         for member in &composite.members {
             let field_ty = member.typ;
@@ -128,7 +142,7 @@ impl Aapcs64Abi {
                 } else {
                     base_type = Some(field_base);
                 }
-                count += 1;
+                add(&mut count, 1);
             } else if is_aggregate(field_kind) {
                 // Nested struct - recursively check if it's an HFA
                 if let Some((nested_base, nested_count)) = self.try_classify_hfa(field_ty, types) {
@@ -139,7 +153,7 @@ impl Aapcs64Abi {
                     } else {
                         base_type = Some(nested_base);
                     }
-                    count += nested_count;
+                    add(&mut count, nested_count);
                     if count > MAX_HFA_ELEMENTS {
                         return None;
                     }
@@ -388,6 +402,71 @@ impl Abi for Aapcs64Abi {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::target::{Arch, Os, Target};
+    use crate::types::{CompositeType, StructMember, Type};
+
+    /// A union's members overlap, so it is an HFA of its *largest* member, not
+    /// of all of them put together.
+    ///
+    /// Summing them made `union { double v; double d; }` -- eight bytes -- a
+    /// two-element HFA: the callee read sixteen bytes out of it and the caller
+    /// wrote sixteen back into an eight-byte slot, over whatever followed. On
+    /// Apple arm64, where `long double` is `double`, that is exactly what
+    /// `union { long double v; double d; }` is, and it corrupted the frame.
+    #[test]
+    fn a_union_is_an_hfa_of_its_largest_member() {
+        let abi = Aapcs64Abi::new();
+        let mut types = TypeTable::new(&Target::new(Arch::Aarch64, Os::Linux));
+        let d = types.double_id;
+        let member = |t| StructMember {
+            name: crate::strings::StringId::default(),
+            typ: t,
+            offset: 0,
+            bit_width: None,
+            bit_offset: None,
+            storage_unit_size: None,
+            explicit_align: None,
+        };
+        let m0 = member(d);
+        let m1 = member(d);
+        let u = types.intern(Type::union_type(CompositeType {
+            tag: None,
+            members: vec![m0, m1],
+            enum_constants: vec![],
+            size: 8,
+            align: 8,
+            is_complete: true,
+        }));
+        assert!(
+            matches!(
+                abi.classify_return(u, &types),
+                ArgClass::Hfa { count: 1, .. }
+            ),
+            "a union of two doubles is one element, got {:?}",
+            abi.classify_return(u, &types)
+        );
+
+        // A *struct* of two doubles really is two elements.
+        let s0 = member(d);
+        let mut s1 = member(d);
+        s1.offset = 8;
+        let st = types.intern(Type::struct_type(CompositeType {
+            tag: None,
+            members: vec![s0, s1],
+            enum_constants: vec![],
+            size: 16,
+            align: 8,
+            is_complete: true,
+        }));
+        assert!(
+            matches!(
+                abi.classify_return(st, &types),
+                ArgClass::Hfa { count: 2, .. }
+            ),
+            "a struct of two doubles is two elements, got {:?}",
+            abi.classify_return(st, &types)
+        );
+    }
 
     #[test]
     fn test_abi_creation() {

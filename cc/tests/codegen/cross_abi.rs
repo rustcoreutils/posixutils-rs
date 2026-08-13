@@ -1010,3 +1010,49 @@ int run(const long double *p) { return eql(p, 1.5L, 2.5L); }
         "the spilled binary128 argument is stored whole:\n{body}"
     );
 }
+
+/// A union is an HFA of its largest member, not of all of them at once.
+///
+/// A union's members overlap, so `union { double v; double d; }` is eight
+/// bytes and one V register. The HFA walk summed member counts, making it a
+/// *two*-element HFA: the callee read sixteen bytes out of an eight-byte
+/// object, and the caller wrote sixteen back into an eight-byte slot -- over
+/// whatever followed it on the frame.
+///
+/// On Apple arm64 `long double` is `double`, so `union { long double v;
+/// double d; }` is exactly that shape, and returning one corrupted the
+/// caller's frame badly enough to kill the process. On aarch64 Linux the same
+/// union is sixteen bytes with two different bases, so it is not an HFA at all
+/// and never showed the fault.
+#[test]
+fn codegen_aarch64_union_hfa_counts_overlapping_members_once() {
+    let src = r#"
+union  U { double v; double d; };
+struct S { double a, b; };
+
+union  U mku(void) { union U r; r.v = 3.25; return r; }
+struct S mks(void) { struct S r; r.a = 1.0; r.b = 2.0; return r; }
+double   useu(void) { union U r = mku(); return r.v; }
+"#;
+    let asm = asm_for("aarch64_union_hfa", AARCH64_LINUX, src);
+
+    // `d17` contains "d1", so the register has to be matched, not the text.
+    let uses_d1 = |body: &str| body.contains("d1,") || body.contains("d1]");
+
+    let mk = body_of(&asm, "mku");
+    assert!(
+        !uses_d1(mk),
+        "an eight-byte union is one register, not two:\n{mk}"
+    );
+    let use_ = body_of(&asm, "useu");
+    assert!(
+        !use_.contains("str d1,"),
+        "the caller must not write past an eight-byte union's slot:\n{use_}"
+    );
+    // A struct of two doubles genuinely is two elements and must not change.
+    let st = body_of(&asm, "mks");
+    assert!(
+        st.contains("d0,") && uses_d1(st),
+        "a struct of two doubles is still a two-element HFA:\n{st}"
+    );
+}

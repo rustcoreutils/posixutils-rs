@@ -965,7 +965,7 @@ struct P mkp(void) { struct P r; r.a = 1.0; r.b = 2.0; return r; }
     // whole sixteen bytes got there.
     // The value may pass through a general register on its way, so what
     // matters is that it lands in V0 before the return.
-    for (name, marker) in [("mkf", "fmov s0,"), ("mkd", "fmov d0,"), ("mkl", "v0.d[1]")] {
+    for (name, marker) in [("mkf", "fmov s0,"), ("mkd", "fmov d0,"), ("mkl", "q0")] {
         let body = body_of(&asm, name);
         assert!(
             body.contains(marker),

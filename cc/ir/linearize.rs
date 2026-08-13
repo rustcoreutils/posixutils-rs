@@ -934,7 +934,7 @@ impl<'a> Linearizer<'a> {
             && matches!(
                 get_abi_for_conv(self.current_calling_conv, self.target)
                     .classify_return(func.return_type, self.types),
-                crate::abi::ArgClass::X87 { .. }
+                crate::abi::ArgClass::X87 { .. } | crate::abi::ArgClass::Hfa { count: 1, .. }
             );
         ir_func.ret_is_address = self.types.is_complex(func.return_type) || returns_x87_aggregate;
 
@@ -1392,7 +1392,13 @@ impl<'a> Linearizer<'a> {
             crate::abi::ArgClass::Direct { ref classes, .. }
                 if classes.len() == 1 && classes[0] == crate::abi::RegClass::Sse
         );
-        if matches!(ret_class, crate::abi::ArgClass::X87 { .. }) || one_sse_reg {
+        // A one-element HFA is the aarch64 spelling of the same thing: one V
+        // register holds the whole value. Splitting it into two general
+        // registers was survivable on its own -- the backend put the halves
+        // back together -- but the *inliner* then spliced a two-source `Ret`
+        // into a caller expecting one value, and the top half came out zero.
+        let one_hfa_reg = matches!(ret_class, crate::abi::ArgClass::Hfa { count: 1, .. });
+        if matches!(ret_class, crate::abi::ArgClass::X87 { .. }) || one_sse_reg || one_hfa_reg {
             let mut ret_insn = Instruction::ret_typed(Some(src_addr), ret_type, struct_size);
             ret_insn.abi_info = Some(Box::new(CallAbiInfo::new(vec![], ret_class)));
             self.emit(ret_insn);

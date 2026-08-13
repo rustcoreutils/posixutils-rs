@@ -1404,6 +1404,15 @@ impl Aarch64CodeGen {
                                 addr: self.stack_mem(offset),
                             });
                         }
+                        // Wider than a register, with its address already in
+                        // one: load the value straight out of it.
+                        Loc::Reg(r) => {
+                            self.push_lir(Aarch64Inst::LdrFp {
+                                size: fp_size,
+                                dst: VReg::V0,
+                                addr: MemAddr::BaseOffset { base: r, offset: 0 },
+                            });
+                        }
                         // Wider than a register: the slot holds its address.
                         Loc::Stack(offset) => {
                             self.push_lir(Aarch64Inst::Ldr {

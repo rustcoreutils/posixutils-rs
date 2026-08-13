@@ -23,13 +23,26 @@
 
 use super::codegen::X86_64CodeGen;
 use super::lir::{GpOperand, MemAddr, X86Inst, X87BinOp};
-use super::regalloc::{Loc, Reg};
+use super::regalloc::{Loc, Reg, X87_SCRATCH_BYTES};
 use crate::arch::lir::{CondCode, OperandSize};
 use crate::ir::PseudoKind;
 use crate::ir::{Instruction, Opcode, PseudoId};
 use crate::types::{TypeKind, TypeTable};
 
 impl X86_64CodeGen {
+    /// The reserved scratch address used to stage a value into the FPU.
+    ///
+    /// `fild`/`fld` have no register form, so an immediate or a general
+    /// register has to go through memory. The region is reserved by
+    /// [`X87_SCRATCH_BYTES`]; addressing it by hand is what let it alias the
+    /// first local.
+    fn x87_scratch_addr(&self) -> MemAddr {
+        MemAddr::BaseOffset {
+            base: Reg::Rbp,
+            offset: -(self.callee_saved_offset + X87_SCRATCH_BYTES),
+        }
+    }
+
     /// Check if this instruction operates on long double (80-bit x87)
     pub fn is_longdouble_op(&self, insn: &Instruction, types: &TypeTable) -> bool {
         insn.size >= 80
@@ -670,10 +683,7 @@ impl X86_64CodeGen {
             let dst_addr = if needs_xmm_load {
                 // Use scratch location for x87 -> XMM transfer
                 // Must be after callee-saved register area to avoid collision
-                MemAddr::BaseOffset {
-                    base: Reg::Rbp,
-                    offset: -(self.callee_saved_offset + 8),
-                }
+                self.x87_scratch_addr()
             } else {
                 get_mem_addr(&dst_loc, self)
             };
@@ -722,10 +732,7 @@ impl X86_64CodeGen {
                     // Must be after callee-saved register area to avoid collision
                     use super::lir::XmmOperand;
                     use crate::arch::lir::FpSize;
-                    let scratch = MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: -(self.callee_saved_offset + 8),
-                    };
+                    let scratch = self.x87_scratch_addr();
                     let fp_size = if src_is_float {
                         FpSize::Single
                     } else {
@@ -819,10 +826,7 @@ impl X86_64CodeGen {
                     }
                 } else {
                     // Use a fixed scratch location after callee-saved area
-                    MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: -(self.callee_saved_offset + 8),
-                    }
+                    self.x87_scratch_addr()
                 };
 
                 let op_size = if src_size <= 32 {
@@ -839,10 +843,7 @@ impl X86_64CodeGen {
             }
             Loc::Imm(val) => {
                 // Immediate - store to temp location after callee-saved area
-                let temp_addr = MemAddr::BaseOffset {
-                    base: Reg::Rbp,
-                    offset: -(self.callee_saved_offset + 8),
-                };
+                let temp_addr = self.x87_scratch_addr();
                 let op_size = if src_size <= 32 {
                     OperandSize::B32
                 } else {
@@ -921,10 +922,7 @@ impl X86_64CodeGen {
             _ => {
                 // Store to scratch location, will load to register afterwards
                 // Must be after callee-saved register area to avoid collision
-                MemAddr::BaseOffset {
-                    base: Reg::Rbp,
-                    offset: -(self.callee_saved_offset + 8),
-                }
+                self.x87_scratch_addr()
             }
         };
 

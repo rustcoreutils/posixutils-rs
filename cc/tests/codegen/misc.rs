@@ -6867,3 +6867,77 @@ int main(void)
 "#;
     assert_eq!(compile_and_dlopen("tls_double", lib, main, &[]), 0);
 }
+
+/// An x87 conversion must not scribble on a live `long double` local.
+///
+/// `fild`/`fld` have no register form, so an immediate or a general register
+/// has to be staged through memory on its way into the FPU. That staging
+/// address was `-(callee_saved_offset + 8)(%rbp)`, which nothing had reserved:
+/// slot offsets start at zero, so it landed on the first local. For a
+/// `long double` first local it overwrote bytes 8 and 9 -- the sign and
+/// exponent -- turning `1.0L` into `2^-16382`, which prints as `0.0`.
+///
+/// The audit filed this as two `long double`-returning calls in one argument
+/// list outliving a temporary. It is neither: one conversion is enough, and no
+/// call is needed at all. Every expectation checked against gcc.
+#[test]
+fn codegen_x87_scratch_does_not_clobber_a_live_local() {
+    let code = r#"
+static long double add2(long double a, long double b) { return a + b; }
+
+int main(void)
+{
+    /* The audit's shape: a live long double, then calls whose arguments need
+       an int -> long double conversion. */
+    long double x = 1;
+    if (add2(1, 2) != 3.0L) return 1;
+    if (x != 1.0L) return 2;
+
+    long double y = 2;
+    if (add2(3, 4) != 7.0L) return 3;
+    if (x != 1.0L) return 4;
+    if (y != 2.0L) return 5;
+
+    /* No call at all: one int -> long double conversion is enough. */
+    long double z = 5;
+    int n = 9;
+    long double w = n;
+    if (w != 9.0L) return 6;
+    if (z != 5.0L) return 7;
+
+    /* Through a register rather than an immediate. */
+    long double u = 6;
+    volatile int m = 11;
+    long double v = m;
+    if (v != 11.0L) return 8;
+    if (u != 6.0L) return 9;
+
+    /* long double -> int, which stages through the same address. */
+    long double p = 7;
+    if ((int)3.75L != 3) return 10;
+    if (p != 7.0L) return 11;
+
+    /* An XMM <-> x87 transfer, likewise. */
+    long double r = 8;
+    double d = 2.5;
+    long double e = d;
+    if (e != 2.5L) return 12;
+    if (r != 8.0L) return 13;
+
+    return 0;
+}
+"#;
+    // Pinned to -O0. The staging path is only reached when the value being
+    // converted is an immediate or a general register; at -O the folder turns
+    // these into constants and the conversion disappears, so the default
+    // `-g -O` config cannot see the defect at all. A trailing flag wins, so
+    // this overrides the matrix.
+    assert_eq!(
+        compile_and_run("codegen_x87_scratch_no_clobber", code, &["-O0".to_string()]),
+        0
+    );
+    assert_eq!(
+        compile_and_run_optimized("codegen_x87_scratch_no_clobber_opt", code),
+        0
+    );
+}

@@ -931,6 +931,20 @@ pub struct RegAlloc {
     max_local_align: i32,
 }
 
+/// Bytes reserved at the bottom of the locals area for the x87 scratch.
+///
+/// `x87.rs` needs a fixed address to stage an immediate or a general register
+/// through on its way into the FPU -- `fild` and `fld` have no register form.
+/// That address used to be `-(callee_saved_offset + 8)(%rbp)`, which no one
+/// had reserved: slot offsets start at zero, so it landed squarely on the
+/// first local. For a `long double` first local it overwrote bytes 8 and 9 --
+/// the sign and exponent -- and turned `1.0L` into `2^-16382`, which prints as
+/// `0.0`. Reserving the region here is what makes the address the allocator's
+/// to give and the scratch's to keep.
+///
+/// See [`X86_64CodeGen::x87_scratch_addr`].
+pub(super) const X87_SCRATCH_BYTES: i32 = 16;
+
 impl RegAlloc {
     pub fn new() -> Self {
         Self {
@@ -939,7 +953,7 @@ impl RegAlloc {
             free_xmm_regs: XmmReg::allocatable().to_vec(),
             active: Vec::new(),
             active_xmm: Vec::new(),
-            stack_offset: 0,
+            stack_offset: X87_SCRATCH_BYTES,
             used_callee_saved: Vec::new(),
             fp_pseudos: HashSet::new(),
             ld_pseudos: HashSet::new(),
@@ -995,7 +1009,7 @@ impl RegAlloc {
         self.free_xmm_regs = XmmReg::allocatable().to_vec();
         self.active.clear();
         self.active_xmm.clear();
-        self.stack_offset = 0;
+        self.stack_offset = X87_SCRATCH_BYTES;
         self.used_callee_saved.clear();
         self.fp_pseudos.clear();
         self.ld_pseudos.clear();

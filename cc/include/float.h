@@ -124,4 +124,22 @@
 #define FLT16_TRUE_MIN __FLT16_DENORM_MIN__
 #endif
 
+// __float128 / _Float128 support (IEEE 754 binary128).
+//
+// Unlike LDBL_*, these do not vary by target: binary128 is one format
+// everywhere it is offered.
+#ifdef __FLT128_MANT_DIG__
+#define FLT128_MANT_DIG __FLT128_MANT_DIG__
+#define FLT128_DIG __FLT128_DIG__
+#define FLT128_MIN_EXP __FLT128_MIN_EXP__
+#define FLT128_MIN_10_EXP __FLT128_MIN_10_EXP__
+#define FLT128_MAX_EXP __FLT128_MAX_EXP__
+#define FLT128_MAX_10_EXP __FLT128_MAX_10_EXP__
+#define FLT128_MAX __FLT128_MAX__
+#define FLT128_EPSILON __FLT128_EPSILON__
+#define FLT128_MIN __FLT128_MIN__
+#define FLT128_DECIMAL_DIG __FLT128_DECIMAL_DIG__
+#define FLT128_TRUE_MIN __FLT128_DENORM_MIN__
+#endif
+
 #endif // _C17_FLOAT_H

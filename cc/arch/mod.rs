@@ -431,6 +431,27 @@ pub fn get_float_limit_macros(target: &Target) -> Vec<(&'static str, &'static st
         ("__FLT16_HAS_QUIET_NAN__", "1"),
         ("__FLT16_DECIMAL_DIG__", "5"),
         ("__SIZEOF_FLOAT16__", "2"),
+        // __float128 / _Float128 (IEEE 754 binary128, quad precision).
+        //
+        // Spelled in hex so the values reach binary128 exactly, and suffixed
+        // `q` so they carry that type rather than being rounded to whatever
+        // `long double` happens to be on the target. Same on every target:
+        // unlike `long double`, this type does not vary.
+        ("__FLT128_MIN__", "0x1p-16382q"),
+        ("__FLT128_MAX__", "0x1.ffffffffffffffffffffffffffffp+16383q"),
+        ("__FLT128_EPSILON__", "0x1p-112q"),
+        ("__FLT128_DENORM_MIN__", "0x1p-16494q"),
+        ("__FLT128_MANT_DIG__", "113"),
+        ("__FLT128_DIG__", "33"),
+        ("__FLT128_MIN_EXP__", "(-16381)"),
+        ("__FLT128_MAX_EXP__", "16384"),
+        ("__FLT128_MIN_10_EXP__", "(-4931)"),
+        ("__FLT128_MAX_10_EXP__", "4932"),
+        ("__FLT128_HAS_DENORM__", "1"),
+        ("__FLT128_HAS_INFINITY__", "1"),
+        ("__FLT128_HAS_QUIET_NAN__", "1"),
+        ("__FLT128_DECIMAL_DIG__", "36"),
+        ("__SIZEOF_FLOAT128__", "16"),
         // Float (32-bit IEEE 754)
         ("__FLT_MIN__", "1.17549435082228750796873653722224568e-38F"),
         ("__FLT_MAX__", "3.40282346638528859811704183484516925e+38F"),

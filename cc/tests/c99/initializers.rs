@@ -1437,22 +1437,42 @@ int main(void)
 ///
 /// `float` and `double` were never affected: `f64::from_str` is correctly
 /// rounded, and for those two the target format is `f64` or narrower.
+///
+/// Each reference is spelled for the format the target has. A decimal
+/// correctly rounded to binary128's 113 bits is *not* the same value as one
+/// correctly rounded to x87's 64, so one hex spelling cannot serve both --
+/// which is the whole claim being made here, that the literal reaches the
+/// width the target actually has. Both sets were taken from gcc.
 #[test]
 fn c99_decimal_literals_reach_long_double_precision() {
     let src = r#"
 #include <float.h>
 
+#if LDBL_MANT_DIG == 113
+#define PI_REF    0x1.921fb54442d18469834ef156fa8fp+1L
+#define TENTH_REF 0x1.999999999999999999999999999ap-4L
+#define BIG_REF   0x1.fffffffffffffffdf5f7837da5b2p+16383L
+#define TINY_REF  0x1.7769bead75ec52e4d25544b1042ep-16278L
+#else
+/* x87's 64 bits. A target whose long double is double rounds both sides of
+   each comparison to the same value, so these serve there too. */
+#define PI_REF    0xc.90fdaa22168c235p-2L
+#define TENTH_REF 0xc.ccccccccccccccdp-7L
+#define BIG_REF   0xf.fffffffffffffffp+16380L
+#define TINY_REF  0xb.bb4df56baf62972p-16281L
+#endif
+
 int main(void)
 {
-    /* Needs all 64 significand bits: the tail `235` is lost at 53 bits. */
-    if (3.14159265358979323846L != 0xc.90fdaa22168c235p-2L) return 1;
+    /* Needs every significand bit the format has: the tail is lost at 53. */
+    if (3.14159265358979323846L != PI_REF) return 1;
 
     /* A value with no exact binary form, rounded at the wrong width. */
-    if (0.1L != 0xc.ccccccccccccccdp-7L) return 2;
+    if (0.1L != TENTH_REF) return 2;
 
     /* Outside double's range in both directions. */
-    if (1.18973149535723176502e+4932L != 0xf.fffffffffffffffp+16380L) return 3;
-    if (1e-4900L != 0xb.bb4df56baf62972p-16281L) return 4;
+    if (1.18973149535723176502e+4932L != BIG_REF) return 3;
+    if (1e-4900L != TINY_REF) return 4;
 
     /* Ordinary magnitudes must stay exact, not merely close. */
     if (1.0L != 0x1p+0L) return 5;

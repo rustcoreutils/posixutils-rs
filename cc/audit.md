@@ -89,17 +89,22 @@ crate. Each audit follows the playbook in `audits.md`.
 > - **`_Atomic` is not accepted after `*` in a declarator** — `int *_Atomic p;`
 >   fails to parse, while `int *const p;` and `int *volatile p;` are fine.
 >
-> **`_Float128` was scoped in and then scoped back out.** It is not a
-> `<tgmath.h>` prerequisite, contrary to what the c11 checklist implied: glibc
-> decides `__HAVE_FLOAT128` from a bare `__GNUC_PREREQ(4,3)` test and never asks
-> whether the compiler has the type. The type system, keyword, ABI
-> classification and libgcc TF-mode routing were straightforward, but making it
-> *correct* requires reworking the x86_64 floating-point prologue, load and
-> store paths, which the existing `float`/`double`/`long double` support shares —
-> real regression risk on a CPython-gated path, for a type nothing in the tree
-> uses. A partial implementation emitted `movt`, an instruction that does not
-> exist. Not shipping it is the better trade; `<tgmath.h>` is bundled and working
-> without it.
+> **`_Float128` was scoped out once, and is now implemented.** The original
+> reasoning still holds as history: it is not a `<tgmath.h>` prerequisite —
+> glibc decides `__HAVE_FLOAT128` from a bare `__GNUC_PREREQ(4,3)` test and
+> never asks whether the compiler has the type — and a first attempt emitted
+> `movt`, an instruction that does not exist, because the x86-64 floating-point
+> paths derive their instruction form from a *width*, and this compiler sizes
+> both x87 extended and binary128 at 128 bits.
+>
+> What changed is that two of its prerequisites arrived on their own account.
+> `FloatVal` now carries a 128-bit significand, so an exact binary128 constant
+> already existed; and the whole soft-float lowering was already written for
+> aarch64, where `long double` *is* binary128 — it was merely keyed on the
+> target rather than on the type. Re-keying it on the type handed x86-64 every
+> `__*tf*` call at once, which left only 16-byte data movement to write.
+> `movt` is gone because the format is now resolved from the type at each site
+> that knows one. See #C7.
 
 > The `c17` section was swept the same way and **nothing there was stale** —
 > every one of its findings was re-probed against the built binary and remains
@@ -378,7 +383,7 @@ violation.
 
 - [x] **#C6 — A `float` constant converted to `long double` is read at the wrong width, yielding 0.** **✓ fixed.** `long double x = 1.5f;` produced `0`. Converting float or double to x87 long double loads the source from memory, and the load width came from the expression's C *type*; but a constant is materialised into `double_constants`, emitted as `.quad`, so it is 8 bytes whatever its type. A float-typed one was then read back with `flds`, taking the low half of the double — zero for any value whose significant bits sit in the top half. Pool constants now load as doubles, which is lossless since the f64 holds the f32 value exactly. Runtime conversions were always correct, which is why nothing caught it. Found while verifying Annex G, and the reason that verification was worth doing rather than asserting: `<math.h>` spells `INFINITY` as `__builtin_inff()` — a **float** — so *every* `long double` infinity in a program was silently `0`, which is how `CMPLX(INFINITY,0)/CMPLX(2,0)` came out finite. Test: `c17_complex_infinity_rules_match_gcc`.
 
-- [ ] **#C7 — `isnan()` on a `long double` returns 65535 rather than 1.** **Open, Minor — and the original diagnosis was wrong.** It is not a narrowing bug in our call path: `__isnanl` returns 65535 under **gcc too**, because that is what glibc's function returns (raw class bits), and c17 calling it directly matches gcc exactly. The difference is which branch of `<math.h>` is taken. gcc supplies `__builtin_isnan`, so glibc's `isnan` expands to nothing but the builtin, which gcc lowers to 0/1. c17 supplies no such builtin, so the header falls back to its `sizeof` ternary and calls `__isnanl`. **[probed]** `extern int __isnanl(long double);` called directly gives 65535 under both compilers; `gcc -E` shows `isnan(x)` expanding to the builtin while c17 expands to the ternary. C99 7.12.3.4 requires only "a nonzero value", so both are conforming and `if (isnan(x))` works either way — but `isnan(x) == 1` differs. Real fix: implement the `__builtin_isnan` / `__builtin_isinf` / `__builtin_isfinite` family, which is a feature rather than the one-line narrowing this entry implied. **Update: the builtins are now implemented (`__builtin_isnan`/`isinf`/`isfinite`/`isnormal`/`fpclassify`, test `builtins_float_classification_matches_gcc`) and they were never the obstacle.** Reaching glibc's builtin path requires claiming `__GNUC_PREREQ (4,4)`, and **that is blocked by `__float128`**: `bits/floatn.h:30` turns on `__HAVE_FLOAT128` at `__GNUC_PREREQ (4,3)` on x86-64 and then does `typedef __float128 _Float128;`, so bumping the version makes every system header fail to parse. The 4.3 threshold sits below the 4.4 one, so no claimable version separates them. Closing this entry now means implementing `__float128` — the keyword plus binary128 arithmetic through libgcc soft-float — for a payoff C99 7.12.3.4 does not require, since it demands only "a nonzero value" and both answers conform. **[probed, bump attempted and reverted]**
+- [x] **#C7 — `isnan()` on a `long double` returns 65535 rather than 1.** **Closed.** The diagnosis in the original entry was right about the mechanism and wrong about the price. glibc's `<math.h>` uses `__builtin_isnan` only at `__GNUC_PREREQ (4,4)`; below it, the `sizeof` ternary calls `__isnanl`, which returns raw class bits. Both conform — C99 7.12.3.4 asks only for "a nonzero value" — but `isnan(x) == 1` is what code writes. Claiming 4.4 required `__float128`, because `bits/floatn.h` turns on `__HAVE_FLOAT128` one threshold *below* it, at 4.3 on x86-64. That type now exists (see the note above), the claimed version is **6.5.0**, and `isnan(x)` answers 1 at float, double and long double, matching gcc. Two further things were needed and are done: `__builtin_isinf_sign`, which `isinf` switches to at 4.4; and folding a conditional whose condition is a constant — glibc's `isinf` is `__builtin_types_compatible_p(...) ? __isinff128(x) : __builtin_isinf_sign(x)`, and emitting the untaken arm left an undefined reference to `__isinff128` in every object that used `isinf`. Test `builtins_isnan_answers_one_at_every_width`. The ceiling is measured: 6.5 is clean and 7.0 is not, because `__HAVE_FLOATN_NOT_TYPEDEF` makes `_FloatN` native types and `stdlib.h` then declares `strtof32x` in terms of a `_Float32x` this compiler does not have.
 
 - [x] **#C8 — A long hex float significand wrapped to a wrong value.** **✓ fixed.** `0x1.0000000000000002p+0` evaluated to **3.0**. The significand was read into a `u64` and divided by `1u64 << (4 * digits)`; sixteen fraction digits make that a shift of 64, which wraps to a shift of 0 in a release build, so the fraction was added whole rather than scaled — and `u64::from_str_radix` overflowed on the same input. Wrong by a factor of three, silently, in a C99 feature the matrix below lists as conforming. Now decomposed exactly (integer significand plus binary exponent, sticky bit beyond 128 bits) and converted once. Verified differentially against gcc across 16-digit fractions, 31-digit significands, both ends of the exponent range, subnormals, and the leading/trailing-dot forms. Tests: `c99_hex_float_long_significand`, `test_hex_float_long_significand_is_not_mangled`.
 
@@ -403,6 +408,8 @@ violation.
   `emit_complex_negate`, `emit_complex_to_real` and a compound-assignment arm that reuses `emit_complex_binary` fix the three. Test: `c11_complex_unary_minus_and_real_cast`, covering negation at all three precisions (the part stride differs in each), negation nested in larger expressions, casts to `double`/`float`/`int`, and all four compound operators with both real and complex right-hand sides.
 
   The same sweep found `_Complex` **correct** for multiply, divide, add, conjugate, `cabs`, mixed real/complex operands, equality, array elements, function arguments and returns, and the Annex G infinity rules — so these three were the gap, not the feature.
+
+- [ ] **#C22 — Constant folding of `__float128` arithmetic goes through `f64`.** **Open, Minor.** **[probed]** `eval_const_float_expr` folds a binary operator by narrowing both operands with `to_f64()`, which costs a `long double` eleven significand bits and a `__float128` sixty. `static __float128 c = 1.0q/3.0q;` emits `3ffd5555555555555000000000000000` where gcc emits `...5555555555555555`, and `static __float128 s = 1.0q + 1e-30q;` collapses to exactly `1.0`. Literals and their negation are exact — `FloatVal` carries 128 significand bits — so only *arithmetic* in a constant expression is affected. The sharp edge is that the same expression as a **local** initializer is computed at run time through libgcc and is correct, so the static and automatic forms of one initializer disagree. Closing it means exact binary128 add/sub/mul/div inside `FloatVal`, i.e. a soft-float core; gcc uses MPFR for this. Not a conformance question — C17 6.6p5 lets an implementation fold with less range and precision than the target format — but a surprising one. Found by code review of the `__float128` series.
 
 - [ ] **#C20 — A `_Complex` struct member's initializer is silently dropped.** **Open, Major.** **[probed]** `struct S { double _Complex z; }; struct S s = { 1.0 + 2.0*I };` leaves `s.z` as `0 + 0i` under c17 and `1 + 2i` under gcc, with no diagnostic. The struct-initializer walk in `linearize_init` has no arm for a complex member, which is two adjacent base-type values rather than the scalar the field visit assumes. Found by the Phase 4 sweep.
 
@@ -576,7 +583,8 @@ violation.
 Not findings — POSIX permits extensions, and none of these change the meaning
 of strictly-conforming source: `__attribute__`, statement expressions,
 `typeof`, the `__builtin_*` family, `__c11_atomic_*`, GCC extended inline asm
-(incl. `asm goto`), `__int128`, `_Float16`/`_Float32`/`_Float64`, nullability
+(incl. `asm goto`), `__int128`, `_Float16`/`_Float32`/`_Float64`,
+`__float128`/`_Float128` (IEEE binary128, with the `q` and `f128` suffixes), nullability
 qualifiers, `#include_next`, `#warning`, digraphs, and the C23 one-argument
 `_Static_assert`. See `cc/doc/ATTR.md` and `cc/doc/BUILTIN.md`.
 

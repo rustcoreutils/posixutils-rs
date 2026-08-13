@@ -979,3 +979,34 @@ struct P mkp(void) { struct P r; r.a = 1.0; r.b = 2.0; return r; }
         "a two-double HFA still returns in d0 and d1:\n{p}"
     );
 }
+
+/// A spilled binary128 argument keeps all sixteen of its bytes.
+///
+/// An FP argument register that has to survive a call is stored to the frame in
+/// the prologue. That store was a fixed eight bytes and the slot a fixed eight
+/// wide, so on aarch64 Linux -- where `long double` is binary128 -- the top
+/// half of such an argument was dropped, and the slot overlapped whatever came
+/// after it. The first such parameter, stored on a different path, survived;
+/// the second came back truncated.
+#[test]
+fn codegen_aarch64_spilled_binary128_argument_is_whole() {
+    let src = r#"
+/* Comparing two binary128 values is a libgcc call, so both parameters have to
+   survive it and are spilled to the frame. */
+static int eql(const long double *v, long double re, long double im)
+{
+    return v[0] == re && v[1] == im;
+}
+int run(const long double *p) { return eql(p, 1.5L, 2.5L); }
+"#;
+    let asm = asm_for("aarch64_spill_q", AARCH64_LINUX, src);
+    let body = body_of(&asm, "eql");
+    assert!(
+        !body.contains("str d1,"),
+        "no half of a binary128 argument may be stored as a double:\n{body}"
+    );
+    assert!(
+        body.contains("str q1,"),
+        "the spilled binary128 argument is stored whole:\n{body}"
+    );
+}

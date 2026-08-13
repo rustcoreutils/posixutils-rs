@@ -1019,8 +1019,14 @@ impl Aarch64CodeGen {
                     addr: self.stack_mem(spilled.to_stack_offset),
                 });
             } else if let Some(fp_reg) = spilled.from_fp_reg {
+                // The recorded width, not a fixed eight bytes: `long double` is
+                // binary128 here, and half of one was left behind.
                 self.push_lir(Aarch64Inst::StrFp {
-                    size: FpSize::Double,
+                    size: if spilled.bytes > 8 {
+                        FpSize::Quad
+                    } else {
+                        FpSize::Double
+                    },
                     src: fp_reg,
                     addr: self.stack_mem(spilled.to_stack_offset),
                 });

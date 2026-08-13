@@ -24,6 +24,7 @@ mod linearize_emit;
 mod linearize_init;
 mod linearize_stmt;
 pub mod lower;
+pub mod mach_o_dtors;
 pub mod mem2reg;
 pub mod ssa;
 pub mod tls;

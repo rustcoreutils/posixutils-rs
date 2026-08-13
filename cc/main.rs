@@ -641,6 +641,16 @@ fn process_file(
 
     dump_ir(args, &module, "post-linearize");
 
+    // A `destructor` on Mach-O is an `atexit` registration rather than a
+    // table entry; see `ir::mach_o_dtors`. Runs before mapping so the calls it
+    // synthesizes are classified with every other call.
+    ir::mach_o_dtors::register_destructors_with_atexit(
+        &mut module,
+        &types,
+        target,
+        target.os == target::Os::MacOS,
+    );
+
     // Hardware mapping pass — centralized target-specific lowering decisions
     arch::mapping::run_mapping(&mut module, &types, target);
 

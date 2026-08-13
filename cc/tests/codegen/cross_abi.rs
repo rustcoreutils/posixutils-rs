@@ -681,22 +681,29 @@ fn cross_abi_init_array_sections() {
 
     for triple in ["x86_64-apple-darwin", "aarch64-apple-darwin"] {
         let asm = asm_for("init_array_macho", triple, src);
-        for expected in [
-            ".section __DATA,__mod_init_func,mod_init_funcs",
-            ".section __DATA,__mod_term_func,mod_term_funcs",
-        ] {
-            assert!(
-                asm.contains(expected),
-                "{triple}: missing `{expected}`:\n{asm}"
-            );
-        }
+        assert!(
+            asm.contains(".section __DATA,__mod_init_func,mod_init_funcs"),
+            "{triple}: missing the initializer section:\n{asm}"
+        );
         assert!(
             !asm.contains("00101") && !asm.contains("00102"),
             "{triple}: Mach-O has no priority-ordered section:\n{asm}"
         );
         assert!(
-            asm.contains(".quad _c1") && asm.contains(".quad _d1"),
+            asm.contains(".quad _c1"),
             "{triple}: entries must name the underscore-prefixed symbols:\n{asm}"
+        );
+
+        // A destructor is an `atexit` registration here, not a table entry:
+        // `__mod_term_func` is deprecated and a main executable's terminators
+        // listed there are not run. See `ir::mach_o_dtors`.
+        assert!(
+            !asm.contains("__mod_term_func"),
+            "{triple}: nothing should be listed for termination:\n{asm}"
+        );
+        assert!(
+            asm.contains("_atexit") && asm.contains("_d1"),
+            "{triple}: each destructor must be handed to atexit:\n{asm}"
         );
     }
 }

@@ -25,7 +25,6 @@ pub fn get_macros() -> Vec<(&'static str, Option<&'static str>)> {
         ("__LITTLE_ENDIAN__", Some("1")),
         // Register size
         ("__REGISTER_PREFIX__", Some("")),
-        ("__USER_LABEL_PREFIX__", Some("")),
         // Long double is 80-bit extended precision (padded to 128 bits)
         // `long double` is described by `get_float_limit_macros` and
         // `get_additional_sizeof_macros`; see the note in the aarch64 list.

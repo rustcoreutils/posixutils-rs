@@ -40,6 +40,7 @@ use crate::arch::regalloc::{
     compute_live_intervals, find_call_positions, identify_addr_taken_syms, identify_fp_pseudos,
     interval_crosses_call, ConstraintPoint, FreeSlot, LiveInterval, LivenessResult,
 };
+use crate::float::FloatVal;
 use crate::ir::{Function, Instruction, Opcode, PseudoId, PseudoKind};
 use crate::types::{TypeId, TypeKind, TypeTable};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -629,7 +630,7 @@ pub enum Loc {
     /// Immediate constant
     Imm(i128),
     /// Floating-point immediate constant (value, size in bits)
-    FImm(f64, u32),
+    FImm(FloatVal, u32),
     /// Global symbol
     Global(String),
 }
@@ -790,6 +791,16 @@ pub fn get_constraint_info_aarch64(insn: &Instruction) -> Option<(Vec<Reg>, Vec<
     // destroyed by any atomic operation its range crosses.
     if insn.op.is_atomic() {
         clobbers.extend([Reg::X0, Reg::X1, Reg::X2, Reg::X8]);
+    }
+
+    // The TLS descriptor sequence is fixed to x0 (the descriptor address, and
+    // the offset the resolver returns) and uses x1 for the resolver entry
+    // point. Nothing else is clobbered -- the resolver preserves every other
+    // register -- which is why this is a plain clobber and deliberately *not*
+    // an entry in `is_call_like_aarch64`. Declaring it call-like would spill
+    // every live floating-point value for a sequence that needs none of it.
+    if insn.op == Opcode::TlsAddr {
+        clobbers.extend([Reg::X0, Reg::X1]);
     }
     clobbers.sort();
     clobbers.dedup();

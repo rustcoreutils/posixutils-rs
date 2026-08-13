@@ -16,6 +16,7 @@ mod arch;
 mod builtin_headers;
 mod builtins;
 mod diag;
+mod float;
 mod ir;
 mod kw;
 mod linkargs;
@@ -640,15 +641,39 @@ fn process_file(
 
     dump_ir(args, &module, "post-linearize");
 
+    // A `destructor` on Mach-O is an `atexit` registration rather than a
+    // table entry; see `ir::mach_o_dtors`. Runs before mapping so the calls it
+    // synthesizes are classified with every other call.
+    ir::mach_o_dtors::register_destructors_with_atexit(
+        &mut module,
+        &types,
+        target,
+        target.os == target::Os::MacOS,
+    );
+
     // Hardware mapping pass — centralized target-specific lowering decisions
     arch::mapping::run_mapping(&mut module, &types, target);
 
     dump_ir(args, &module, "post-mapping");
 
-    // Optimize IR (if enabled)
-    if args.opt_level > 0 {
-        opt::optimize_module(&mut module, args.opt_level);
-    }
+    // Expand thread-local accesses for the dynamic TLS model. Must run before
+    // `optimize_module`, because register allocation is downstream of it and
+    // has to see the address computation -- see `ir::tls`. `shared_mode` is
+    // computed here rather than beside `create_codegen` below so that the pass
+    // and the backend agree on the model from one expression.
+    let shared_mode = producing_shared(args) || args.fpic;
+    ir::tls::expand_dynamic_tls(
+        &mut module,
+        shared_mode && target.os == target::Os::Linux,
+        types.void_ptr_id,
+    );
+
+    dump_ir(args, &module, "post-tls");
+
+    // Optimize IR. Called even at -O0, where the only pass that does anything
+    // is inlining of `__attribute__((always_inline))` functions, which gcc
+    // honours with optimization off.
+    opt::optimize_module(&mut module, args.opt_level);
 
     dump_ir(args, &module, "post-opt");
 
@@ -669,7 +694,12 @@ fn process_file(
     let emit_unwind_tables = !args.no_unwind_tables;
     let pie_mode = pie_enabled(args, target);
     let pic_mode = args.fpic || producing_shared(args) || pie_mode;
-    let shared_mode = producing_shared(args);
+    // `shared_mode` selects the TLS model and nothing else; it is computed
+    // above, before the expansion pass that depends on the same condition.
+    // `-fPIC` asks for code that can live in a shared object, which is exactly
+    // what Local Exec cannot satisfy, while `-fPIE` and the PIE default do not,
+    // because a PIE executable still resolves its own thread-locals at link
+    // time. gcc draws the line in the same place.
     let mut codegen =
         arch::codegen::create_codegen(target.clone(), emit_unwind_tables, pic_mode, shared_mode);
     let asm = codegen.generate(&module, &types);

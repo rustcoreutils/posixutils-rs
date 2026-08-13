@@ -296,6 +296,114 @@ fn load_confstr_mapping() -> HashMap<&'static str, libc::c_int> {
                 "POSIX_V6_WIDTH_RESTRICTED_ENVS",
                 _CS_POSIX_V6_WIDTH_RESTRICTED_ENVS,
             ),
+            // POSIX_V7 and POSIX_V8 environment strings (c17, 88157-88176).
+            //
+            // Darwin's confstr never grew past Issue 6: it has no
+            // _CS_POSIX_V7_* or _CS_POSIX_V8_* of its own. The environments
+            // these name are the same four data models under every issue --
+            // Austin Group Defect 1330 renamed V7 to V8 without changing what
+            // is described -- so both later spellings answer from the V6
+            // query rather than being rejected as unrecognized. The bare
+            // `POSIX_V7_*` / `POSIX_V8_*` spellings resolve through the `_CS_`
+            // fallback in `get_mapping`, so only these entries are needed.
+            (
+                "_CS_POSIX_V7_ILP32_OFF32_CFLAGS",
+                _CS_POSIX_V6_ILP32_OFF32_CFLAGS,
+            ),
+            (
+                "_CS_POSIX_V7_ILP32_OFF32_LDFLAGS",
+                _CS_POSIX_V6_ILP32_OFF32_LDFLAGS,
+            ),
+            (
+                "_CS_POSIX_V7_ILP32_OFF32_LIBS",
+                _CS_POSIX_V6_ILP32_OFF32_LIBS,
+            ),
+            (
+                "_CS_POSIX_V7_ILP32_OFFBIG_CFLAGS",
+                _CS_POSIX_V6_ILP32_OFFBIG_CFLAGS,
+            ),
+            (
+                "_CS_POSIX_V7_ILP32_OFFBIG_LDFLAGS",
+                _CS_POSIX_V6_ILP32_OFFBIG_LDFLAGS,
+            ),
+            (
+                "_CS_POSIX_V7_ILP32_OFFBIG_LIBS",
+                _CS_POSIX_V6_ILP32_OFFBIG_LIBS,
+            ),
+            (
+                "_CS_POSIX_V7_LP64_OFF64_CFLAGS",
+                _CS_POSIX_V6_LP64_OFF64_CFLAGS,
+            ),
+            (
+                "_CS_POSIX_V7_LP64_OFF64_LDFLAGS",
+                _CS_POSIX_V6_LP64_OFF64_LDFLAGS,
+            ),
+            ("_CS_POSIX_V7_LP64_OFF64_LIBS", _CS_POSIX_V6_LP64_OFF64_LIBS),
+            (
+                "_CS_POSIX_V7_LPBIG_OFFBIG_CFLAGS",
+                _CS_POSIX_V6_LPBIG_OFFBIG_CFLAGS,
+            ),
+            (
+                "_CS_POSIX_V7_LPBIG_OFFBIG_LDFLAGS",
+                _CS_POSIX_V6_LPBIG_OFFBIG_LDFLAGS,
+            ),
+            (
+                "_CS_POSIX_V7_LPBIG_OFFBIG_LIBS",
+                _CS_POSIX_V6_LPBIG_OFFBIG_LIBS,
+            ),
+            (
+                "_CS_POSIX_V7_WIDTH_RESTRICTED_ENVS",
+                _CS_POSIX_V6_WIDTH_RESTRICTED_ENVS,
+            ),
+            (
+                "_CS_POSIX_V8_ILP32_OFF32_CFLAGS",
+                _CS_POSIX_V6_ILP32_OFF32_CFLAGS,
+            ),
+            (
+                "_CS_POSIX_V8_ILP32_OFF32_LDFLAGS",
+                _CS_POSIX_V6_ILP32_OFF32_LDFLAGS,
+            ),
+            (
+                "_CS_POSIX_V8_ILP32_OFF32_LIBS",
+                _CS_POSIX_V6_ILP32_OFF32_LIBS,
+            ),
+            (
+                "_CS_POSIX_V8_ILP32_OFFBIG_CFLAGS",
+                _CS_POSIX_V6_ILP32_OFFBIG_CFLAGS,
+            ),
+            (
+                "_CS_POSIX_V8_ILP32_OFFBIG_LDFLAGS",
+                _CS_POSIX_V6_ILP32_OFFBIG_LDFLAGS,
+            ),
+            (
+                "_CS_POSIX_V8_ILP32_OFFBIG_LIBS",
+                _CS_POSIX_V6_ILP32_OFFBIG_LIBS,
+            ),
+            (
+                "_CS_POSIX_V8_LP64_OFF64_CFLAGS",
+                _CS_POSIX_V6_LP64_OFF64_CFLAGS,
+            ),
+            (
+                "_CS_POSIX_V8_LP64_OFF64_LDFLAGS",
+                _CS_POSIX_V6_LP64_OFF64_LDFLAGS,
+            ),
+            ("_CS_POSIX_V8_LP64_OFF64_LIBS", _CS_POSIX_V6_LP64_OFF64_LIBS),
+            (
+                "_CS_POSIX_V8_LPBIG_OFFBIG_CFLAGS",
+                _CS_POSIX_V6_LPBIG_OFFBIG_CFLAGS,
+            ),
+            (
+                "_CS_POSIX_V8_LPBIG_OFFBIG_LDFLAGS",
+                _CS_POSIX_V6_LPBIG_OFFBIG_LDFLAGS,
+            ),
+            (
+                "_CS_POSIX_V8_LPBIG_OFFBIG_LIBS",
+                _CS_POSIX_V6_LPBIG_OFFBIG_LIBS,
+            ),
+            (
+                "_CS_POSIX_V8_WIDTH_RESTRICTED_ENVS",
+                _CS_POSIX_V6_WIDTH_RESTRICTED_ENVS,
+            ),
         ])
     }
 
@@ -521,6 +629,63 @@ fn load_confstr_mapping() -> HashMap<&'static str, libc::c_int> {
                 _CS_POSIX_V7_LPBIG_OFFBIG_LIBS,
             ),
             ("POSIX_V7_LPBIG_OFFBIG_LIBS", _CS_POSIX_V7_LPBIG_OFFBIG_LIBS),
+            // POSIX_V8 environment strings (c17, 88157-88176).
+            //
+            // POSIX.2024 is Issue 8, so V8 is the mandated spelling; Austin
+            // Group Defect 1330 renamed the V7 names without changing the
+            // environments they describe. glibc's confstr has no separate
+            // _CS_POSIX_V8_* for the same query, so these alias V7. The bare
+            // `POSIX_V8_*` spellings resolve through the `_CS_` fallback in
+            // `is_confstr_var`, so only these entries are needed.
+            (
+                "_CS_POSIX_V8_ILP32_OFF32_CFLAGS",
+                _CS_POSIX_V7_ILP32_OFF32_CFLAGS,
+            ),
+            (
+                "_CS_POSIX_V8_ILP32_OFF32_LDFLAGS",
+                _CS_POSIX_V7_ILP32_OFF32_LDFLAGS,
+            ),
+            (
+                "_CS_POSIX_V8_ILP32_OFF32_LIBS",
+                _CS_POSIX_V7_ILP32_OFF32_LIBS,
+            ),
+            (
+                "_CS_POSIX_V8_ILP32_OFFBIG_CFLAGS",
+                _CS_POSIX_V7_ILP32_OFFBIG_CFLAGS,
+            ),
+            (
+                "_CS_POSIX_V8_ILP32_OFFBIG_LDFLAGS",
+                _CS_POSIX_V7_ILP32_OFFBIG_LDFLAGS,
+            ),
+            (
+                "_CS_POSIX_V8_ILP32_OFFBIG_LIBS",
+                _CS_POSIX_V7_ILP32_OFFBIG_LIBS,
+            ),
+            (
+                "_CS_POSIX_V8_LP64_OFF64_CFLAGS",
+                _CS_POSIX_V7_LP64_OFF64_CFLAGS,
+            ),
+            (
+                "_CS_POSIX_V8_LP64_OFF64_LDFLAGS",
+                _CS_POSIX_V7_LP64_OFF64_LDFLAGS,
+            ),
+            ("_CS_POSIX_V8_LP64_OFF64_LIBS", _CS_POSIX_V7_LP64_OFF64_LIBS),
+            (
+                "_CS_POSIX_V8_LPBIG_OFFBIG_CFLAGS",
+                _CS_POSIX_V7_LPBIG_OFFBIG_CFLAGS,
+            ),
+            (
+                "_CS_POSIX_V8_LPBIG_OFFBIG_LDFLAGS",
+                _CS_POSIX_V7_LPBIG_OFFBIG_LDFLAGS,
+            ),
+            (
+                "_CS_POSIX_V8_LPBIG_OFFBIG_LIBS",
+                _CS_POSIX_V7_LPBIG_OFFBIG_LIBS,
+            ),
+            (
+                "_CS_POSIX_V8_WIDTH_RESTRICTED_ENVS",
+                _CS_POSIX_V7_WIDTH_RESTRICTED_ENVS,
+            ),
         ])
     }
 }
@@ -575,8 +740,57 @@ fn lookup_limit_constant(var: &str) -> Option<i64> {
     }
 }
 
+/// The sysconf queries for the four programming environments (c17,
+/// 88106-88176), under every issue's spelling.
+///
+/// POSIX.2024 is Issue 8, so the mandated spelling is V8; the environments
+/// themselves are unchanged from V7, and no libc defines a separate `_SC_V8_*`
+/// for what is the same query, so those alias the V7 names. Both spellings are
+/// accepted because build scripts written against either issue have to keep
+/// working.
+///
+/// Which constant the pair resolves to is a per-target question. Darwin's
+/// sysconf never grew past Issue 6 and defines only `_SC_V6_*`; naming
+/// `_SC_V7_*` unconditionally does not merely mis-answer on macOS, it stops
+/// the crate compiling there.
+fn programming_environment_sysconf() -> [(&'static str, libc::c_int); 16] {
+    #[cfg(target_os = "macos")]
+    let (ilp32_off32, ilp32_offbig, lp64_off64, lpbig_offbig) = (
+        libc::_SC_V6_ILP32_OFF32,
+        libc::_SC_V6_ILP32_OFFBIG,
+        libc::_SC_V6_LP64_OFF64,
+        libc::_SC_V6_LPBIG_OFFBIG,
+    );
+    #[cfg(not(target_os = "macos"))]
+    let (ilp32_off32, ilp32_offbig, lp64_off64, lpbig_offbig) = (
+        libc::_SC_V7_ILP32_OFF32,
+        libc::_SC_V7_ILP32_OFFBIG,
+        libc::_SC_V7_LP64_OFF64,
+        libc::_SC_V7_LPBIG_OFFBIG,
+    );
+
+    [
+        ("_POSIX_V8_ILP32_OFF32", ilp32_off32),
+        ("_POSIX_V8_ILP32_OFFBIG", ilp32_offbig),
+        ("_POSIX_V8_LP64_OFF64", lp64_off64),
+        ("_POSIX_V8_LPBIG_OFFBIG", lpbig_offbig),
+        ("_SC_V8_ILP32_OFF32", ilp32_off32),
+        ("_SC_V8_ILP32_OFFBIG", ilp32_offbig),
+        ("_SC_V8_LP64_OFF64", lp64_off64),
+        ("_SC_V8_LPBIG_OFFBIG", lpbig_offbig),
+        ("_POSIX_V7_ILP32_OFF32", ilp32_off32),
+        ("_POSIX_V7_ILP32_OFFBIG", ilp32_offbig),
+        ("_POSIX_V7_LP64_OFF64", lp64_off64),
+        ("_POSIX_V7_LPBIG_OFFBIG", lpbig_offbig),
+        ("_SC_V7_ILP32_OFF32", ilp32_off32),
+        ("_SC_V7_ILP32_OFFBIG", ilp32_offbig),
+        ("_SC_V7_LP64_OFF64", lp64_off64),
+        ("_SC_V7_LPBIG_OFFBIG", lpbig_offbig),
+    ]
+}
+
 fn load_sysconf_mapping() -> HashMap<&'static str, libc::c_int> {
-    HashMap::from([
+    let mut mapping = HashMap::from([
         ("_SC_ARG_MAX", libc::_SC_ARG_MAX),
         ("_SC_CHILD_MAX", libc::_SC_CHILD_MAX),
         ("_SC_CLK_TCK", libc::_SC_CLK_TCK),
@@ -742,7 +956,10 @@ fn load_sysconf_mapping() -> HashMap<&'static str, libc::c_int> {
             libc::_SC_SHARED_MEMORY_OBJECTS,
         ),
         ("_POSIX_ADVISORY_INFO", libc::_SC_ADVISORY_INFO),
-    ])
+    ]);
+
+    mapping.extend(programming_environment_sysconf());
+    mapping
 }
 
 fn load_pathconf_mapping() -> HashMap<&'static str, libc::c_int> {
@@ -846,6 +1063,44 @@ mod tests {
         let m = load_sysconf_mapping();
         assert!(m.contains_key("_SC_NPROCESSORS_CONF"));
         assert!(m.contains_key("_SC_NPROCESSORS_ONLN"));
+    }
+
+    // Every programming environment answers under every issue's spelling, on
+    // whichever target this was built for: the constants behind them differ
+    // per platform (Darwin has only `_SC_V6_*`), the accepted names do not.
+    #[test]
+    fn programming_environments_mapped() {
+        let m = load_sysconf_mapping();
+        for env in ["ILP32_OFF32", "ILP32_OFFBIG", "LP64_OFF64", "LPBIG_OFFBIG"] {
+            for prefix in ["_POSIX_V7_", "_POSIX_V8_", "_SC_V7_", "_SC_V8_"] {
+                let name = format!("{prefix}{env}");
+                assert!(m.contains_key(name.as_str()), "{name} is not mapped");
+            }
+            // The V8 spelling is the same query as V7, not a different one.
+            assert_eq!(
+                m[format!("_POSIX_V8_{env}").as_str()],
+                m[format!("_POSIX_V7_{env}").as_str()]
+            );
+        }
+    }
+
+    // The V7 and V8 environment strings answer on every target, even where the
+    // platform's confstr never grew names past Issue 6.
+    #[test]
+    fn programming_environment_strings_mapped() {
+        let m = load_confstr_mapping();
+        for issue in ["V7", "V8"] {
+            for name in [
+                format!("_CS_POSIX_{issue}_LP64_OFF64_CFLAGS"),
+                format!("_CS_POSIX_{issue}_ILP32_OFF32_LIBS"),
+                format!("_CS_POSIX_{issue}_WIDTH_RESTRICTED_ENVS"),
+            ] {
+                assert!(is_confstr_var(&name, &m), "{name} is not mapped");
+                // POSIX spells these without the `_CS_` prefix too.
+                let bare = name.strip_prefix("_CS_").unwrap();
+                assert!(is_confstr_var(bare, &m), "{bare} is not mapped");
+            }
+        }
     }
 
     // POSIX2_SYMLINKS is present in the pathconf map (#G6).

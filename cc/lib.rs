@@ -19,6 +19,7 @@ pub mod arch;
 pub mod builtin_headers;
 pub mod builtins;
 pub mod diag;
+pub mod float;
 pub mod ir;
 pub mod kw;
 pub mod linkargs;

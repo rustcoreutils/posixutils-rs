@@ -11,7 +11,11 @@
 // Consolidates: optimization, debug tests
 //
 
-use crate::common::{compile_and_run, compile_and_run_optimized, create_c_file};
+use crate::codegen::asm_probe::{asm_for_with, body_of, AARCH64_LINUX, X86_64_LINUX};
+use crate::common::{
+    compile_and_dlopen, compile_and_run, compile_and_run_optimized, compile_and_run_two_units,
+    create_c_file,
+};
 use plib::testing::run_test_base;
 use std::io::Write;
 use std::process::Command;
@@ -5737,4 +5741,1129 @@ int main(void) {
         compile_and_run("codegen_variadic_floating_arguments", code, &[]),
         0
     );
+}
+
+/// `__attribute__((noinline))` is a directive, not a hint.
+///
+/// It was recognized and then ignored, so a small function marked `noinline`
+/// was inlined anyway at `-O2` and the call disappeared. People reach for it
+/// to keep a frame on the stack, to keep a symbol callable, or to work around
+/// a miscompile -- none of which survive the size heuristic overruling them.
+#[test]
+fn codegen_noinline_is_honoured() {
+    let src = r#"
+static __attribute__((noinline)) int small(int x) { return x * 2; }
+/* the same function without the attribute, to show the size alone
+   would have had it inlined */
+static int small_ok(int x) { return x * 3; }
+
+int caller(int x) { return small(x) + small_ok(x); }
+"#;
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        let asm = asm_for_with("noinline", triple, src, &["-O2"]);
+        assert!(
+            asm.contains("small:"),
+            "{triple}: noinline function was not emitted:\n{asm}"
+        );
+        let calls = asm
+            .lines()
+            .filter(|l| {
+                let l = l.trim();
+                (l.starts_with("call") || l.starts_with("bl ")) && l.contains("small")
+            })
+            .count();
+        assert!(
+            calls >= 1,
+            "{triple}: noinline function was inlined away (no call survived):\n{asm}"
+        );
+        assert!(
+            !asm.contains("small_ok:") || calls >= 1,
+            "{triple}: unexpected shape:\n{asm}"
+        );
+    }
+}
+
+/// The attribute is honoured in either spelling and wherever it sits -- before
+/// or after the declaration specifiers, on the definition, or on nothing but
+/// an earlier prototype, which is how gcc treats it.
+#[test]
+fn codegen_noinline_spellings_and_placement() {
+    for src in [
+        "static __attribute__((noinline)) int f(int x) { return x + 1; }\nint g(int x){return f(x);}",
+        "__attribute__((noinline)) static int f(int x) { return x + 1; }\nint g(int x){return f(x);}",
+        "static int f(int x) __attribute__((noinline)) { return x + 1; }\nint g(int x){return f(x);}",
+        "static __attribute__((__noinline__)) int f(int x) { return x + 1; }\nint g(int x){return f(x);}",
+        "static int f(int x) __attribute__((noinline));\nstatic int f(int x) { return x + 1; }\nint g(int x){return f(x);}",
+    ] {
+        let asm = asm_for_with("noinline_spelling", X86_64_LINUX, src, &["-O2"]);
+        assert!(
+            asm.lines().any(|l| l.trim().starts_with("call") && l.contains('f')),
+            "no call survived for:\n{src}\n{asm}"
+        );
+    }
+}
+
+/// `constructor` and `destructor` run, in the order gcc runs them.
+///
+/// Ordering is the whole point of the priority argument, so the test records a
+/// trace rather than a "did it run" flag. The expectations were taken from gcc
+/// on the same source: prioritized constructors run first in ascending
+/// priority, then the unprioritized ones in declaration order; destructors run
+/// the other way, unprioritized first.
+///
+/// Every function here is `static` and none is ever called, so this also
+/// covers them surviving dead-function elimination -- `compile_and_run`
+/// includes an optimized configuration, where an unreferenced static function
+/// is otherwise dropped.
+#[test]
+fn codegen_constructor_and_destructor_run() {
+    let src = r#"
+extern void _exit(int);
+
+static int order[8];
+static int n;
+static void note(int v) { if (n < 8) order[n++] = v; }
+
+__attribute__((constructor))      static void c_plain_a(void) { note(1); }
+__attribute__((constructor))      static void c_plain_b(void) { note(2); }
+__attribute__((constructor(101))) static void c_p101(void)    { note(101); }
+__attribute__((constructor(102))) static void c_p102(void)    { note(102); }
+__attribute__((__constructor__))  static void c_us(void)      { note(3); }
+static void c_proto(void) __attribute__((constructor));
+static void c_proto(void) { note(4); }
+
+__attribute__((destructor))      static void d_plain(void) { note(50); }
+__attribute__((destructor(102))) static void d_p102(void)  { note(51); }
+
+static int status = 9;
+
+static int check_ctors(void)
+{
+    if (n != 6) return 1;
+    if (order[0] != 101) return 2;
+    if (order[1] != 102) return 3;
+    if (order[2] != 1) return 4;
+    if (order[3] != 2) return 5;
+    if (order[4] != 3) return 6;
+    if (order[5] != 4) return 7;
+    return 0;
+}
+
+/* Plain destructors run first, so this prioritized one goes last and gets to
+   check what the others recorded. */
+__attribute__((destructor(101))) static void d_last(void)
+{
+    if (status != 0) _exit(status);
+    if (n != 8) _exit(20);
+    if (order[6] != 50) _exit(21);
+    if (order[7] != 51) _exit(22);
+    _exit(0);
+}
+
+int main(void)
+{
+    status = check_ctors();
+    /* 9 says the destructors never ran; d_last replaces it with the verdict */
+    return status == 0 ? 9 : status;
+}
+"#;
+    assert_eq!(compile_and_run("ctor_dtor_run", src, &[]), 0);
+}
+
+/// `always_inline` overrides the size heuristics, and applies at `-O0`.
+///
+/// Both halves are needed to match gcc. A body far over the inline threshold
+/// is still spliced in at `-O2`, and the attribute takes effect at `-O0`,
+/// where the inliner is otherwise switched off entirely -- code that reaches
+/// for the attribute (inline-asm wrappers, intrinsics headers) is relying on
+/// the body actually being there.
+#[test]
+fn codegen_always_inline_overrides_heuristics_and_o0() {
+    // Well past any size threshold: a plain `inline` hint would be refused.
+    let big: String = (1..120)
+        .map(|i| {
+            format!(
+                "    s += x*{i}; s ^= s << ({i}%7); s -= x/({}); s += x%({});\n",
+                i + 1,
+                i + 2
+            )
+        })
+        .collect();
+    let src = format!(
+        "static __attribute__((always_inline)) inline int huge(int x)\n\
+         {{\n    int s = 0;\n{big}    return s;\n}}\n\
+         int caller(int x) {{ return huge(x); }}\n"
+    );
+
+    for opt in ["-O0", "-O2"] {
+        let asm = asm_for_with("always_inline_big", X86_64_LINUX, &src, &[opt]);
+        assert!(
+            !asm.lines().any(|l| l.trim().starts_with("call huge")),
+            "{opt}: always_inline function was left as a call:\n{asm}"
+        );
+    }
+}
+
+/// The attribute is honoured in either spelling and from a prototype, and
+/// `noinline` beats it when both are present -- which is what gcc does, with a
+/// `-Wattributes` warning.
+#[test]
+fn codegen_always_inline_spellings_and_conflict() {
+    let inlined = [
+        "static __attribute__((always_inline)) inline int f(int x) { return x+1; }",
+        "static __attribute__((__always_inline__)) inline int f(int x) { return x+1; }",
+        "static inline int f(int x) __attribute__((always_inline));\n\
+         static inline int f(int x) { return x+1; }",
+    ];
+    for decl in inlined {
+        let src = format!("{decl}\nint g(int x){{return f(x);}}\n");
+        let asm = asm_for_with("always_inline_spelling", X86_64_LINUX, &src, &["-O0"]);
+        assert!(
+            !asm.lines().any(|l| l.trim().starts_with("call f")),
+            "call survived at -O0 for:\n{decl}\n{asm}"
+        );
+    }
+
+    // noinline wins: the call must survive even at -O2.
+    let src = "static __attribute__((noinline)) __attribute__((always_inline)) inline\n\
+               int f(int x) { return x+1; }\nint g(int x){return f(x);}\n";
+    let asm = asm_for_with("always_inline_conflict", X86_64_LINUX, src, &["-O2"]);
+    assert!(
+        asm.lines().any(|l| l.trim().starts_with("call f")),
+        "noinline must outrank always_inline:\n{asm}"
+    );
+}
+
+/// `always_inline` overrides the *desirability* heuristics, not the
+/// stack-safety guards.
+///
+/// The distinction is c17-specific and load-bearing. gcc can honour the
+/// attribute unconditionally because its frames are compact; c17 has no
+/// register promotion, so every inlined copy adds roughly eight bytes of
+/// stack, which is why `should_inline` caps growth into a recursive caller at
+/// `RECURSIVE_CALLER_MAX_STACK`. Inlining past that cap does not produce wrong
+/// code -- it exhausts the stack at a recursion depth the program's own guard
+/// thought was safe.
+///
+/// Found by the CPython gate: `test_isinstance` segfaulted in
+/// `test_infinitely_many_bases`, which recurses until it expects a
+/// `RecursionError`, once `always_inline` was allowed to bypass this check.
+/// CPython documents the same hazard in `Include/pyport.h`, noting that
+/// forcing inlining takes its per-call stack from 6 KB to 15 KB.
+#[test]
+fn codegen_always_inline_yields_to_the_recursive_stack_guard() {
+    // Big enough that caller_size * 8 clears RECURSIVE_CALLER_MAX_STACK.
+    let body: String = (1..200)
+        .map(|i| format!("    s += x*{i}; s ^= s << ({i}%7); s -= x/({});\n", i + 1))
+        .collect();
+    let src = format!(
+        "static __attribute__((always_inline)) inline int helper(int x)\n\
+         {{\n    int s = 0;\n{body}    return s;\n}}\n\
+         int rec(int n) {{ if (n <= 0) return 0; return helper(n) + rec(n-1); }}\n"
+    );
+
+    let asm = asm_for_with("always_inline_recursive", X86_64_LINUX, &src, &["-O2"]);
+    assert!(
+        asm.lines().any(|l| l.trim().starts_with("call helper")),
+        "always_inline must not inline into a recursive caller past the \
+         stack cap; the frame growth overflows the stack at a depth the \
+         program's own recursion guard considers safe:\n{asm}"
+    );
+}
+
+/// The address of a `_Thread_local` object is a real thread-local address.
+///
+/// `SymAddr` did not consult the TLS symbol set, so `&tls_var` produced an
+/// ordinary global address -- `movq tv@GOTPCREL(%rip), %rax` where gcc emits
+/// `%fs:tv@tpoff`. Reads through it happened to survive; a store through it
+/// segfaulted, at both -O0 and -O2.
+///
+/// Every expectation was checked against gcc on the same source, which returns
+/// 0 throughout.
+#[test]
+fn codegen_address_of_thread_local_is_thread_local() {
+    let src = r#"
+_Thread_local int tv = 11;
+_Thread_local long tl = 22;
+_Thread_local int tarr[4] = { 1, 2, 3, 4 };
+_Thread_local struct { int a; int b; } ts = { 5, 6 };
+
+static int *launder(int *p) { return p; }
+
+int main(void)
+{
+    /* read through a taken address */
+    int *p = &tv;
+    if (*p != 11) return 1;
+    if (*(&tv) != tv) return 2;
+    if (*launder(&tv) != 11) return 3;
+
+    /* write through a taken address -- this is what segfaulted */
+    *(&tv) = 99;
+    if (tv != 99) return 4;
+    *p = 77;
+    if (tv != 77) return 5;
+    *launder(&tv) = 55;
+    if (tv != 55) return 6;
+
+    /* a wider type */
+    *(&tl) = 4242;
+    if (tl != 4242) return 7;
+
+    /* array element addresses and pointer arithmetic */
+    if (*(&tarr[3]) != 4) return 8;
+    *(&tarr[2]) = 33;
+    if (tarr[2] != 33) return 9;
+    int *q = tarr + 1;
+    *q = 20;
+    if (tarr[1] != 20) return 10;
+    if ((&tarr[3] - &tarr[0]) != 3) return 11;
+
+    /* struct member through a taken address */
+    if ((&ts)->b != 6) return 12;
+    (&ts)->a = 50;
+    if (ts.a != 50) return 13;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("tls_address_of", src, &[]), 0);
+}
+
+/// Taking the address of a thread-local must not go through the GOT.
+///
+/// The behavioural test above can only prove the address works on this host;
+/// this pins the actual access sequence, which is where the defect was.
+#[test]
+fn codegen_thread_local_address_uses_the_tls_sequence() {
+    let src = "_Thread_local int tv = 11;\nint *addr(void) { return &tv; }\n";
+    let asm = asm_for_with("tls_addr_seq", X86_64_LINUX, src, &["-O2"]);
+    let body = crate::codegen::asm_probe::body_of(&asm, "addr");
+    assert!(
+        !body.contains("tv@GOTPCREL"),
+        "a thread-local address must not come from the GOT:\n{body}"
+    );
+    assert!(
+        body.contains("@tpoff") || body.contains("%fs:") || body.contains("@gottpoff"),
+        "expected a TLS access sequence:\n{body}"
+    );
+}
+
+/// A `long double` literal keeps the precision and range of its target type.
+///
+/// Literals were carried as `f64` from the moment they were lexed, before the
+/// type of the literal was even known, so `LDBL_MAX` had already become
+/// infinity and `LDBL_MIN` zero. Hex literals now reach the target format
+/// exactly, and c17's own `__LDBL_*__` macros are spelled in hex for the same
+/// reason.
+///
+/// Decimal literals beyond double's range or precision are still rounded --
+/// that needs a big-integer decimal conversion and is tracked separately.
+///
+/// Every expectation was checked against gcc on the same source, at -O0 and
+/// -O2, where it returns 0 throughout.
+#[test]
+fn codegen_long_double_literals_keep_their_precision() {
+    let src = r##"
+#include <float.h>
+
+/* Which long double the target has decides what can be asserted about it:
+   x87 gives 64 mantissa bits and a 15-bit exponent, AArch64 Linux gives
+   binary128's 113 bits over the same exponent range, and Apple's arm64
+   long double *is* double. The properties below hold wherever the format
+   supports them, spelled from <float.h> so no one format is assumed. */
+#define WIDER_RANGE   (LDBL_MAX_EXP > DBL_MAX_EXP)
+#define WIDER_MANTISSA (LDBL_MANT_DIG > DBL_MANT_DIG)
+
+/* Static initializers: the value must survive into the data section. */
+static long double g_max = LDBL_MAX;
+static long double g_min = LDBL_MIN;
+static long double g_eps = LDBL_EPSILON;
+#if WIDER_RANGE
+static long double g_sub = 0x1p-16400L;
+static long double g_neg = -0x1.8p+16000L;
+#else
+static long double g_sub = LDBL_TRUE_MIN;
+static long double g_neg = -0x1.8p+1000L;
+#endif
+
+/* LDBL_MAX spelled in hex, needing every mantissa bit the format has. One
+   ulp below it is a different value. */
+#if LDBL_MANT_DIG == 64
+static long double g_hex = 0x1.fffffffffffffffep+16383L;
+#define ONE_ULP_BELOW_MAX 0x1.fffffffffffffffcp+16383L
+#elif LDBL_MANT_DIG == 113
+static long double g_hex = 0x1.ffffffffffffffffffffffffffffp+16383L;
+#define ONE_ULP_BELOW_MAX 0x1.fffffffffffffffffffffffffffep+16383L
+#else
+static long double g_hex = 0x1.fffffffffffffp+1023L;
+#define ONE_ULP_BELOW_MAX 0x1.ffffffffffffep+1023L
+#endif
+
+int main(void)
+{
+    if (!(g_max > 0.0L)) return 1;
+    if (!(g_min > 0.0L)) return 2;
+    if (!(g_eps > 0.0L)) return 4;
+
+#if WIDER_RANGE
+    /* Out of double's range in both directions. */
+    if (!(g_max > 1.0e308L)) return 21;
+    if (!(g_min < 1.0e-308L)) return 3;
+#endif
+
+    /* The limits agree with freshly parsed literals. */
+    long double l_max = LDBL_MAX;
+    long double l_min = LDBL_MIN;
+    if (l_max != g_max) return 5;
+    if (l_min != g_min) return 6;
+
+    /* A hex literal needing every mantissa bit is not rounded. */
+    if (g_hex != LDBL_MAX) return 7;
+
+    /* One ulp below LDBL_MAX must be a different value. */
+    if (ONE_ULP_BELOW_MAX == LDBL_MAX) return 9;
+
+    /* Subnormal long double survives rather than flushing to zero. */
+    if (!(g_sub > 0.0L)) return 10;
+    if (!(g_sub < g_min)) return 11;
+
+    /* Sign is carried. */
+    if (!(g_neg < 0.0L)) return 12;
+
+    /* Arithmetic on the largest value stays finite. */
+    if (g_max / 2.0L >= g_max) return 14;
+    if (!(g_max / 2.0L > 0.0L)) return 22;
+#if WIDER_RANGE
+    if (!(g_max / 2.0L > 1.0e308L)) return 13;
+#endif
+
+    /* float and double are unaffected. */
+    if (DBL_MAX <= 0.0 || DBL_MIN <= 0.0) return 15;
+    if ((double)0x1.921fb54442d18p+1 != 3.141592653589793) return 16;
+
+#if WIDER_MANTISSA
+    /* Two long doubles differing only below the 53rd bit stay distinct --
+       they used to collide in the constant pool, which is keyed on the value. */
+    long double a = 0x1.0000000000000002p+0L;
+    long double b = 0x1.0000000000000004p+0L;
+    if (a == b) return 17;
+    if (a == 1.0L) return 18;
+#endif
+
+    return 0;
+}
+"##;
+    assert_eq!(compile_and_run("long_double_literals", src, &[]), 0);
+}
+
+/// `long double` comparisons follow IEEE unordered semantics.
+///
+/// The x87 path mapped every comparison onto an *unsigned* condition code,
+/// but x87 signals an unordered result by setting CF, ZF and PF together --
+/// exactly the flags those codes read as "below" and "equal". Six of the ten
+/// NaN comparisons came out inverted: `n == n` was true and `n != n` false,
+/// and `<` / `<=` were true in both operand orders. Only `>` and `>=` were
+/// right, because their codes are already false when CF is set.
+///
+/// The compare also used `fcomip`, which raises invalid-operation on a quiet
+/// NaN; C's relational operators other than the signalling ones want the
+/// quiet `fucomip`.
+///
+/// Every expectation is gcc's output on the same source.
+#[test]
+fn codegen_long_double_nan_comparisons() {
+    let src = r#"
+static volatile double z = 0.0;
+
+int main(void)
+{
+    long double n = (long double)(z / z);   /* NaN */
+    long double a = 1.0L, b = 2.0L;
+
+    /* Every comparison against a NaN is false, except `!=` which is true. */
+    if (n == n) return 1;
+    if (!(n != n)) return 2;
+    if (n <  a) return 3;
+    if (n <= a) return 4;
+    if (n >  a) return 5;
+    if (n >= a) return 6;
+    if (a <  n) return 7;
+    if (a <= n) return 8;
+    if (a >  n) return 9;
+    if (a >= n) return 10;
+    if (n == a) return 11;
+    if (!(n != a)) return 12;
+
+    /* Ordered comparisons must be unaffected. */
+    if (!(a <  b)) return 20;
+    if (b <  a)    return 21;
+    if (!(a <= a)) return 22;
+    if (!(a >= a)) return 23;
+    if (!(a == a)) return 24;
+    if (!(a != b)) return 25;
+    if (!(b >  a)) return 26;
+    if (a >= b)    return 27;
+    if (!(b >= a)) return 28;
+    if (!(a <= b)) return 29;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("long_double_nan_cmp", src, &[]), 0);
+}
+
+// ============================================================================
+// GCC asm labels on declarations: __asm__("name")
+// ============================================================================
+
+/// An asm label renames the symbol a declaration refers to.
+///
+/// `extern int myfn(int) __asm__("realfn");` means: the source calls it `myfn`,
+/// but every reference emits the symbol `realfn`. c17 used to parse the label
+/// and throw it away, so it emitted `call myfn@PLT` where gcc emits
+/// `call realfn@PLT` -- a wrong-symbol bug that links only by accident, when
+/// both names happen to exist.
+///
+/// Measured against gcc. One gcc behaviour is deliberately *not* asserted here:
+/// gcc folds `&alias == &real` to 0 at compile time even though a write through
+/// one is visible through the other. That is a constant-folding artifact of
+/// keeping two declarations distinct, not a property worth matching.
+#[test]
+fn codegen_asm_label_renames_the_symbol() {
+    let src = r#"
+#include <stdio.h>
+
+/* An asm label is the assembler name itself, so naming a C object with one
+   means spelling whatever prefix the target puts on a C identifier. This is
+   glibc's `__ASMNAME`, and the reason __USER_LABEL_PREFIX__ exists: it is
+   empty on ELF and "_" on Mach-O. */
+#define XSTR(s) #s
+#define STR(s) XSTR(s)
+#define ASMNAME(cname) __asm__(STR(__USER_LABEL_PREFIX__) cname)
+
+/* A call through an asm label reaches the labelled function. */
+int realfn(int x) { return x * 3; }
+extern int myfn(int) ASMNAME("realfn");
+
+/* An asm label on a definition renames the emitted label, so a second
+   declaration carrying the same label reaches that definition. */
+int defrenamed(int x) ASMNAME("real_def");
+int defrenamed(int x) { return x + 100; }
+extern int reach_def(int) ASMNAME("real_def");
+
+/* An asm label on a variable, and on a variable definition. */
+int real_var = 42;
+extern int my_var ASMNAME("real_var");
+int def_var ASMNAME("real_def_var") = 7;
+extern int reach_def_var ASMNAME("real_def_var");
+
+int main(void)
+{
+    if (myfn(7) != 21) return 1;
+    if (reach_def(1) != 101) return 2;
+    if (my_var != 42) return 3;
+    if (reach_def_var != 7) return 4;
+
+    /* The alias and the real object are the same storage. */
+    my_var = 99;
+    if (real_var != 99) return 5;
+    reach_def_var = 55;
+    if (def_var != 55) return 6;
+
+    /* A function pointer taken through the alias is the real function. */
+    int (*fp)(int) = myfn;
+    if (fp(5) != 15) return 7;
+    if (fp != realfn) return 8;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("asm_label_rename", src, &[]), 0);
+}
+
+/// The label reaches the assembly, on both ABIs, for calls and definitions.
+///
+/// The runtime test above only proves the two names resolve to one another;
+/// this proves the *declared* name never appears as a symbol at all.
+#[test]
+fn codegen_asm_label_reaches_the_assembly() {
+    let src = r#"
+extern int myfn(int) __asm__("realfn");
+int defrenamed(int x) __asm__("real_def");
+int defrenamed(int x) { return x + 1; }
+extern int my_var __asm__("real_var");
+
+int call(int x) { return myfn(x) + my_var; }
+"#;
+
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        let asm = asm_for_with("asm_label", triple, src, &["-O"]);
+        assert!(
+            asm.contains("realfn"),
+            "{triple}: call should target the asm label:\n{asm}"
+        );
+        assert!(
+            !asm.contains("myfn"),
+            "{triple}: the declared name must not be emitted:\n{asm}"
+        );
+        assert!(
+            asm.contains("real_def"),
+            "{triple}: a definition's asm label should name its own label:\n{asm}"
+        );
+        assert!(
+            !asm.contains("defrenamed"),
+            "{triple}: the declared name must not be emitted:\n{asm}"
+        );
+        assert!(
+            asm.contains("real_var"),
+            "{triple}: a global's asm label should be the emitted symbol:\n{asm}"
+        );
+        assert!(
+            !asm.contains("my_var"),
+            "{triple}: the declared name must not be emitted:\n{asm}"
+        );
+    }
+}
+
+// ============================================================================
+// C99 and GNU inline: which definitions produce an external symbol
+// ============================================================================
+
+/// An `inline` function in a shared header must not become a symbol.
+///
+/// C99 6.7.4p6: a definition with `inline` and no `extern` in any declaration
+/// is an *inline definition* and "does not provide an external definition".
+/// c17 emitted one anyway, so the most ordinary use of `inline` there is --
+/// a small function in a header, included by two translation units -- failed
+/// to link with `multiple definition of`. gcc links it.
+///
+/// Compiled at `-O` because with no external definition anywhere the calls
+/// have to be inlined for the program to link at all. gcc is the same: at
+/// `-O0` it reports `undefined reference`. The next test covers the spelling
+/// that does not depend on the optimizer.
+#[test]
+fn codegen_inline_in_a_header_links_from_two_units() {
+    let header = "inline int hdr(int x) { return x * 2; }\n";
+    let unit_a = format!("{header}int a(int x) {{ return hdr(x); }}\n");
+    let unit_b = format!("{header}int a(int);\nint main(void) {{ return a(21) == 42 ? 0 : 1; }}\n");
+
+    assert_eq!(
+        compile_and_run_two_units("inline_header", &unit_a, &unit_b, &["-O".to_string()]),
+        0
+    );
+}
+
+/// The C99 idiom: a header's inline definition, plus one translation unit
+/// naming it `extern` to emit the single out-of-line copy.
+///
+/// This is the spelling that works without relying on the optimizer, and it
+/// exercises the ordering that makes the question hard -- the `extern`
+/// declaration comes *after* the definition, so whether the definition is an
+/// inline definition is not decidable when it is parsed.
+#[test]
+fn codegen_inline_header_with_one_extern_declaration() {
+    let header = "inline int hdr(int x) { return x * 2; }\n";
+    let unit_a = format!("{header}extern int hdr(int x);\nint a(int x) {{ return hdr(x); }}\n");
+    let unit_b = format!("{header}int a(int);\nint main(void) {{ return a(21) == 42 ? 0 : 1; }}\n");
+
+    assert_eq!(
+        compile_and_run_two_units("inline_header_extern", &unit_a, &unit_b, &[]),
+        0
+    );
+}
+
+/// The four inline spellings differ in whether they emit an external symbol.
+///
+/// Measured against gcc. Note C99 and GNU semantics are *opposite* for
+/// `extern inline`, which is exactly what `__gnu_inline__` selects:
+///
+/// | spelling                          | external definition? |
+/// |-----------------------------------|----------------------|
+/// | `static inline`                   | no (internal)        |
+/// | plain `inline`, no `extern` decl   | no                   |
+/// | `extern inline` (C99)             | yes                  |
+/// | `extern inline` + `__gnu_inline__` | no                   |
+#[test]
+fn codegen_inline_spellings_emit_the_right_symbols() {
+    let src = r#"
+static inline int si(int x) { return x + 1; }
+
+inline int pi(int x) { return x + 2; }
+
+extern int ei(int x);
+inline int ei(int x) { return x + 3; }
+
+extern __inline __attribute__((__gnu_inline__)) int gi(int x) { return x + 4; }
+
+/* Reference each one so nothing is dropped merely for being unused. */
+int use_all(int x) { return si(x) + pi(x) + ei(x) + gi(x); }
+"#;
+
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        let asm = asm_for_with("inline_spellings", triple, src, &["-O"]);
+
+        assert!(
+            asm.contains("ei:"),
+            "{triple}: C99 `extern inline` provides the external definition:\n{asm}"
+        );
+        assert!(
+            !asm.contains(".globl pi"),
+            "{triple}: a plain `inline` definition provides no external definition:\n{asm}"
+        );
+        assert!(
+            !asm.contains(".globl gi"),
+            "{triple}: `__gnu_inline__` provides no external definition:\n{asm}"
+        );
+        assert!(
+            !asm.contains(".globl si"),
+            "{triple}: `static inline` has internal linkage:\n{asm}"
+        );
+    }
+}
+
+/// A single declaration without `inline` demands an external definition.
+///
+/// C99 6.7.4p6 makes a definition an inline definition only if **all** the
+/// file-scope declarations include `inline`, so one bare declaration is enough
+/// to require the out-of-line copy. Missing this half of the rule left
+/// CPython's `_decimal` with `undefined symbol: mpd_set_positive`: libmpdec
+/// declares `void mpd_set_positive(mpd_t *);` in its header and defines it
+/// `inline __attribute__((always_inline))` in the .c file.
+///
+/// The bare declaration is tested on both sides of the definition, since
+/// neither position is decidable when the definition itself is parsed.
+#[test]
+fn codegen_a_bare_declaration_forces_an_external_definition() {
+    let src = r#"
+void before(int *r);
+inline __attribute__((always_inline)) void before(int *r) { *r = 1; }
+
+inline void after(int *r) { *r = 2; }
+void after(int *r);
+
+int use(int *a, int *b) { before(a); after(b); return 0; }
+"#;
+
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        let asm = asm_for_with("bare_decl_inline", triple, src, &["-O"]);
+        assert!(
+            asm.contains(".globl before"),
+            "{triple}: a bare declaration before the definition forces emission:\n{asm}"
+        );
+        assert!(
+            asm.contains(".globl after"),
+            "{triple}: a bare declaration after the definition forces emission:\n{asm}"
+        );
+    }
+}
+
+/// An inline definition still has to *work* when it cannot be inlined.
+///
+/// Taking a function's address forces an out-of-line body. For a plain
+/// `inline` definition the call must still reach the one external definition,
+/// which here lives in the other translation unit.
+#[test]
+fn codegen_inline_definition_reached_through_a_pointer() {
+    let unit_a = r#"
+inline int shared(int x) { return x * 3; }
+int extern_def(int x);
+int via_ptr(int x) { int (*fp)(int) = shared; return fp(x); }
+"#;
+    let unit_b = r#"
+extern int shared(int x);
+int shared(int x) { return x * 3; }   /* the external definition */
+int via_ptr(int);
+int main(void) { return via_ptr(14) == 42 ? 0 : 1; }
+"#;
+    assert_eq!(
+        compile_and_run_two_units("inline_ptr", unit_a, unit_b, &[]),
+        0
+    );
+}
+
+// ============================================================================
+// Thread-local storage: which model each build mode selects
+// ============================================================================
+
+/// `-fPIC` must not leave thread-local access in the Local Exec model.
+///
+/// Local Exec bakes the offset from the thread pointer in at link time, which
+/// only works for the main executable. c17 recognised `-fPIC` and folded it
+/// into `pic_mode`, but the TLS decision reads `shared_mode`, so `-fPIC`
+/// silently produced `%fs:tv@TPOFF` -- a code-generation flag with no effect
+/// on code generation.
+///
+/// `pic_mode` is the wrong signal to have used, which is why the control test
+/// below matters: it is also set by `-fPIE` and by the PIE default, and a PIE
+/// executable *should* keep Local Exec, since it still resolves its own
+/// thread-locals at link time. gcc draws the line in the same place.
+///
+/// gcc goes further and uses General Dynamic here; Initial Exec is the
+/// strongest model c17 has, and is correct for a shared object loaded at
+/// startup. See `cc/doc/TODO.md` for what General Dynamic still needs.
+#[test]
+fn codegen_fpic_selects_a_position_independent_tls_model() {
+    let src = r#"
+_Thread_local int tv;
+int read_tls(int x) { return x + tv; }
+void write_tls(int x) { tv = x; }
+int *addr_tls(void) { return &tv; }
+"#;
+
+    for flags in [&["-O", "-fPIC"][..], &["-O", "--shared"][..]] {
+        let asm = asm_for_with("tls_pic", X86_64_LINUX, src, flags);
+        assert!(
+            asm.contains("@TLSDESC") && asm.contains("@TLSCALL"),
+            "x86_64 {flags:?}: expected the dynamic model:\n{asm}"
+        );
+        assert!(
+            !asm.contains("@TPOFF") && !asm.contains("@GOTTPOFF"),
+            "x86_64 {flags:?}: a static model cannot serve a dlopened library:\n{asm}"
+        );
+
+        let asm = asm_for_with("tls_pic", AARCH64_LINUX, src, flags);
+        assert!(
+            asm.contains(":tlsdesc:") && asm.contains(".tlsdesccall"),
+            "aarch64 {flags:?}: expected the dynamic model:\n{asm}"
+        );
+        assert!(
+            !asm.contains("tprel") && !asm.contains("gottpoff"),
+            "aarch64 {flags:?}: a static model cannot serve a dlopened library:\n{asm}"
+        );
+    }
+}
+
+/// A thread-local store costs no more register traffic than a global one.
+///
+/// A TLS descriptor resolver preserves every register but the one it returns
+/// through, so nothing live needs saving around it. The comparison is against
+/// the identical function storing to an ordinary global, because c17 stores
+/// floating-point arguments to the stack in the prologue regardless, and a
+/// count taken in isolation cannot tell that baseline from a real spill.
+///
+/// Scope, honestly: this pins the *cost* of the sequence, and would catch a
+/// regression that started saving registers around it. It is not a proof that
+/// the sequence is excluded from the allocator's call-like set -- at this
+/// optimization level the floating-point values are already stack-resident,
+/// so flipping that switch does not change this function's output. The reason
+/// to keep the sequence out of that set is recorded where the decision is
+/// made, in `opcode_constraints`.
+#[test]
+fn codegen_tls_descriptor_costs_no_more_than_a_global_store() {
+    let src = r#"
+_Thread_local int tv;
+int gv;
+double keep_tls(double a, double b) { double s = a * b; tv = 1; return s + a; }
+double keep_global(double a, double b) { double s = a * b; gv = 1; return s + a; }
+"#;
+    let asm = asm_for_with("tls_nospill", X86_64_LINUX, src, &["-O", "-fPIC"]);
+    let tls = body_of(&asm, "keep_tls");
+    let glob = body_of(&asm, "keep_global");
+
+    assert!(
+        tls.contains("@TLSCALL"),
+        "expected the descriptor sequence:\n{tls}"
+    );
+
+    // Compared against the identical function storing to an ordinary global,
+    // because c17 stores floating-point arguments to the stack in the prologue
+    // regardless -- counting spills in isolation cannot tell that baseline
+    // apart from a spill the sequence caused.
+    let tls_fp = tls.matches("movsd").count();
+    let glob_fp = glob.matches("movsd").count();
+    assert_eq!(
+        tls_fp, glob_fp,
+        "the descriptor sequence moved {tls_fp} floating-point values where an \
+         ordinary global store moves {glob_fp}; something is saving registers \
+         around it:\n--- thread-local ---\n{tls}\n--- global ---\n{glob}"
+    );
+}
+
+/// An executable keeps the cheapest model, `-fPIE` included.
+///
+/// This is the control for the test above, and it is the one that constrains
+/// the fix: switching everything position-independent to Initial Exec would
+/// satisfy that test and break this one, because PIE is position independent
+/// yet still knows its own thread-locals' offsets at link time.
+#[test]
+fn codegen_local_exec_survives_for_a_plain_executable() {
+    let src = r#"
+_Thread_local int tv;
+int read_tls(int x) { return x + tv; }
+int *addr_tls(void) { return &tv; }
+"#;
+    for flags in [&["-O"][..], &["-O", "-fPIE"][..]] {
+        let asm = asm_for_with("tls_le", X86_64_LINUX, src, flags);
+        assert!(
+            asm.contains("@TPOFF") && !asm.contains("@GOTTPOFF"),
+            "x86_64 {flags:?}: an executable should use Local Exec:\n{asm}"
+        );
+
+        let asm = asm_for_with("tls_le", AARCH64_LINUX, src, flags);
+        assert!(
+            asm.contains("tprel") && !asm.contains("gottpoff"),
+            "aarch64 {flags:?}: an executable should use Local Exec:\n{asm}"
+        );
+    }
+}
+
+/// An `extern` thread-local is in another object, so its offset is never known
+/// at link time -- Initial Exec regardless of build mode.
+#[test]
+fn codegen_extern_thread_local_always_uses_initial_exec() {
+    let src = r#"
+extern _Thread_local int ev;
+int read_ev(int x) { return x + ev; }
+"#;
+    let asm = asm_for_with("tls_extern", X86_64_LINUX, src, &["-O"]);
+    assert!(
+        asm.contains("@GOTTPOFF"),
+        "x86_64: extern TLS needs Initial Exec even in an executable:\n{asm}"
+    );
+}
+
+/// A shared object with a large thread-local block must be `dlopen`-able.
+///
+/// Initial Exec resolves a thread-local's offset through the GOT at load time,
+/// which works for a library present at startup but requires the block to fit
+/// in the loader's *static TLS surplus*. A library loaded later with a block
+/// bigger than that surplus is rejected outright:
+///
+/// ```text
+/// dlopen failed: ./lib.so: cannot allocate memory in static TLS block
+/// ```
+///
+/// Only a dynamic model removes the limit. The block here is deliberately
+/// oversized -- a small one fits the surplus and passes under either model, so
+/// it would not test anything.
+#[test]
+fn codegen_dlopen_a_library_with_a_large_thread_local_block() {
+    let lib = r#"
+_Thread_local int big[600000];
+int bump(void) { return ++big[0]; }
+"#;
+    let main = r#"
+#include <stdio.h>
+#include <dlfcn.h>
+int main(void)
+{
+    void *h = dlopen("./lib.so", RTLD_NOW);
+    if (!h) { printf("dlopen failed: %s\n", dlerror()); return 1; }
+    int (*bump)(void) = (int (*)(void))dlsym(h, "bump");
+    if (!bump) { printf("dlsym failed: %s\n", dlerror()); return 2; }
+    if (bump() != 1) return 3;
+    if (bump() != 2) return 4;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_dlopen("tls_big", lib, main, &[]), 0);
+}
+
+/// C99 6.7.4p3 constrains an inline *definition*, not every non-static inline
+/// function.
+///
+/// The rule exists so that the several inline definitions of a function cannot
+/// differ from each other or from the external one: an inline definition must
+/// not name an identifier with internal linkage, nor define a modifiable
+/// object with static storage duration. A definition that *is* the external
+/// definition -- because some declaration of it says `extern`, which is the
+/// standard idiom for providing one -- is an ordinary function, and gcc
+/// accepts what this used to reject outright.
+#[test]
+fn codegen_inline_definition_constraint_only_binds_inline_definitions() {
+    let src = r#"
+#include <stdio.h>
+
+static const int table[4] = {1, 2, 3, 4};
+static int counter;
+
+/* An `extern` declaration makes this the external definition. */
+inline int get(int i) { return table[i]; }
+extern int get(int);
+
+/* `extern inline` says the same thing up front. */
+extern inline int bump(void) { return ++counter; }
+
+/* A static inline may always reach a file-scope static. */
+static inline int twice(int i) { return table[i] * 2; }
+
+int main(void)
+{
+    if (get(2) != 3) return 1;
+    if (bump() != 1) return 2;
+    if (bump() != 2) return 3;
+    if (twice(3) != 8) return 4;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("inline_extern_definition", src, &[]), 0);
+}
+
+/// An `.init_array` entry must name a symbol that was emitted.
+///
+/// A C99 inline definition provides no external definition, so its body is
+/// deliberately not emitted -- but the constructor/destructor emitter walked
+/// every function regardless and pointed `.init_array` at the missing symbol,
+/// which fails at link time with an undefined reference.
+#[test]
+fn codegen_constructor_on_an_inline_definition_links() {
+    let src = r#"
+#include <stdio.h>
+
+static int booted;
+
+inline __attribute__((constructor)) void boot(void) { booted = 1; }
+inline __attribute__((destructor)) void shutdown(void) { booted = 0; }
+
+/* A constructor on an ordinary function still runs. */
+static int ran;
+__attribute__((constructor)) static void real_boot(void) { ran = 1; }
+
+int main(void)
+{
+    if (!ran) return 1;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("inline_constructor_links", src, &[]), 0);
+}
+
+/// An asm label belongs to the declarator it was written on, and to nothing
+/// else.
+///
+/// The label is collected wherever a type specifier can appear, but only a
+/// file-scope declarator claims one. A label written anywhere else -- on a
+/// block-scope declaration, on a struct definition, in a `for` initializer --
+/// stayed pending and was claimed by whatever was declared next, so an
+/// unrelated global was emitted under someone else's assembler name. The
+/// symptom at link time is an undefined reference to a name that is plainly
+/// defined in the source.
+#[test]
+fn codegen_asm_label_does_not_leak_to_the_next_declaration() {
+    let src = r#"
+extern int keep_me;
+
+/* GCC's local register variable: a register constraint, not a rename. */
+void with_register(void) { register long r __asm__("rdi"); (void)r; }
+int after_register = 1;
+
+void with_local(void) { int x __asm__("bogus_local"); (void)x; }
+int after_local = 2;
+
+void with_static_local(void) { static int x __asm__("bogus_static"); (void)x; }
+int after_static_local = 3;
+
+struct Tagged { int a; } __asm__("bogus_struct");
+int after_struct = 4;
+
+void with_for_init(void) { for (int i __asm__("bogus_for") = 0; i < 1; i++) ; }
+int after_for_init = 5;
+
+int keep_me = 6;
+"#;
+
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        let asm = asm_for_with("asm_label_leak", triple, src, &["-O"]);
+        for name in [
+            "after_register",
+            "after_local",
+            "after_static_local",
+            "after_struct",
+            "after_for_init",
+            "keep_me",
+        ] {
+            assert!(
+                asm.contains(name),
+                "{triple}: {name} should be emitted under its own name:\n{asm}"
+            );
+        }
+        for stolen in [
+            "rdi:",
+            "bogus_local",
+            "bogus_static",
+            "bogus_struct",
+            "bogus_for",
+        ] {
+            assert!(
+                !asm.contains(stolen),
+                "{triple}: a stray asm label was claimed by a later symbol ({stolen}):\n{asm}"
+            );
+        }
+    }
+}
+
+/// The address of a thread-local is a pointer, and one per block is enough.
+///
+/// Under the dynamic model the address is computed by a call, so the
+/// computation is made explicit in the IR for the register allocator to see.
+/// It was typed with the *accessed* type, which is what the instruction
+/// carried -- so the address of a `__thread double` was a double as far as
+/// the allocator was concerned, and was given an SSE register to live in.
+/// And every reference produced its own computation, which under this model
+/// is one resolver call per reference rather than per value.
+#[test]
+fn codegen_dynamic_tls_address_is_a_pointer_computed_once() {
+    let src = r#"
+__thread double dv;
+__thread int iv;
+
+double read_double(void) { return dv + dv * 2.0; }
+int read_int(void) { return iv + iv; }
+"#;
+    let asm = asm_for_with("tls_addr_type", X86_64_LINUX, src, &["-O", "-fPIC"]);
+
+    let body = body_of(&asm, "read_double");
+    let calls = body.matches("@TLSCALL").count();
+    assert_eq!(
+        calls, 1,
+        "two references to one thread-local should resolve it once, not {calls} times:\n{body}"
+    );
+
+    let body = body_of(&asm, "read_int");
+    let calls = body.matches("@TLSCALL").count();
+    assert_eq!(
+        calls, 1,
+        "two references to one thread-local should resolve it once, not {calls} times:\n{body}"
+    );
+}
+
+/// The dynamic model still computes the right addresses and values.
+///
+/// The companion to the assembly test above: typing the address as a pointer
+/// and materializing it once must not change what the program reads or where
+/// it writes.
+#[test]
+fn codegen_dynamic_tls_double_round_trips() {
+    let lib = r#"
+__thread double dv = 2.5;
+__thread int iv = 7;
+double get_double(void) { return dv * 2.0 + dv; }
+int get_int(void) { return iv + iv; }
+double *addr_double(void) { return &dv; }
+void set_double(double v) { dv = v; }
+"#;
+    let main = r#"
+#include <dlfcn.h>
+int main(void)
+{
+    void *h = dlopen("./lib.so", RTLD_NOW);
+    if (!h) return 1;
+    double (*get_double)(void) = (double (*)(void))dlsym(h, "get_double");
+    int (*get_int)(void) = (int (*)(void))dlsym(h, "get_int");
+    double *(*addr_double)(void) = (double *(*)(void))dlsym(h, "addr_double");
+    void (*set_double)(double) = (void (*)(double))dlsym(h, "set_double");
+    if (!get_double || !get_int || !addr_double || !set_double) return 2;
+
+    if (get_double() != 7.5) return 3;
+    if (get_int() != 14) return 4;
+    if (*addr_double() != 2.5) return 5;
+
+    set_double(4.0);
+    if (get_double() != 12.0) return 6;
+    if (*addr_double() != 4.0) return 7;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_dlopen("tls_double", lib, main, &[]), 0);
 }

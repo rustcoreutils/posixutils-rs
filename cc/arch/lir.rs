@@ -440,6 +440,9 @@ impl Symbol {
     /// Format symbol name for the target OS
     /// macOS prepends underscore to external symbols
     pub fn format_for_target(&self, target: &Target) -> String {
+        if let Some(verbatim) = strip_verbatim(&self.name) {
+            return verbatim.to_string();
+        }
         if self.is_local {
             // Local symbols don't get underscore prefix
             self.name.clone()
@@ -452,9 +455,40 @@ impl Symbol {
     }
 }
 
+/// Marks an assembler name that must reach the assembler exactly as written.
+///
+/// A GCC asm label *is* the final symbol name -- `__asm__("realfn")` asks for
+/// `realfn`, not for whatever the target would decorate `realfn` into. That
+/// distinction is invisible on ELF, where nothing is added, and decisive on
+/// Mach-O, where every C identifier picks up a leading underscore: Apple's
+/// headers spell the label with the underscore already in it
+/// (`__DARWIN_ALIAS(fputs)` is `__asm("_fputs")`), so decorating it again
+/// asked the linker for `__fputs` and no such symbol exists.
+///
+/// The marker byte, and the trick of carrying this in the name rather than
+/// alongside it, are LLVM's -- a name is passed through a dozen maps and sets
+/// on its way to the assembler, and a flag would have to survive all of them.
+pub const VERBATIM_MARKER: char = '\u{1}';
+
+/// Prefix `label` so it survives target decoration. See [`VERBATIM_MARKER`].
+pub fn verbatim(label: &str) -> String {
+    format!("{VERBATIM_MARKER}{label}")
+}
+
+/// The name inside a verbatim marker, if `name` carries one.
+pub fn strip_verbatim(name: &str) -> Option<&str> {
+    name.strip_prefix(VERBATIM_MARKER)
+}
+
+/// `name` with any verbatim marker removed, for composing a derived name --
+/// which is decorated as a whole, so the marker must not survive inside it.
+pub fn undecorated(name: &str) -> &str {
+    strip_verbatim(name).unwrap_or(name)
+}
+
 impl fmt::Display for Symbol {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.name)
+        write!(f, "{}", undecorated(&self.name))
     }
 }
 
@@ -546,6 +580,19 @@ pub enum Directive {
 
     /// Switch to thread-local BSS section (.section .tbss or __DATA,__thread_bss)
     Tbss,
+
+    /// Switch to the section holding pointers to `constructor` functions
+    /// (`.init_array` on ELF, `__DATA,__mod_init_func` on Mach-O).
+    ///
+    /// A priority becomes an ELF section-name suffix of five zero-padded
+    /// digits; the linker sorts those ahead of the plain `.init_array`, which
+    /// is what makes a prioritized constructor run first. Mach-O has no such
+    /// ordering, so the priority is dropped there.
+    InitArray(Option<u16>),
+
+    /// The `destructor` counterpart of [`Directive::InitArray`]
+    /// (`.fini_array` on ELF, `__DATA,__mod_term_func` on Mach-O).
+    FiniArray(Option<u16>),
 
     // ========================================================================
     // Symbol Visibility and Attributes
@@ -662,6 +709,37 @@ pub enum Directive {
 
     /// Raw assembly string (emitted verbatim) - used for inline asm
     Raw(String),
+}
+
+/// Emit the section directive for an `.init_array` / `.fini_array` entry.
+///
+/// `elf` names the ELF section and `macho` the Mach-O one, whose section type
+/// is spelled `<name minus its leading underscores>s`. `priority`, when
+/// present, becomes an ELF section-name suffix; GCC pads it to five digits so
+/// that plain string sorting by the linker matches numeric order.
+fn emit_init_array_section(
+    out: &mut String,
+    target: &Target,
+    elf: &str,
+    macho: &str,
+    priority: Option<u16>,
+) {
+    match target.os {
+        Os::MacOS => {
+            // Mach-O keeps no priority in the section name; the loader runs
+            // the pointers in the order they appear.
+            let kind = macho.trim_start_matches('_');
+            let _ = writeln!(out, ".section __DATA,{macho},{kind}s");
+        }
+        Os::Linux | Os::FreeBSD => match priority {
+            Some(p) => {
+                let _ = writeln!(out, ".section {elf}.{p:05},\"aw\"");
+            }
+            None => {
+                let _ = writeln!(out, ".section {elf},\"aw\"");
+            }
+        },
+    }
 }
 
 impl Directive {
@@ -817,6 +895,12 @@ impl EmitAsm for Directive {
                     let _ = writeln!(out, ".section .tbss,\"awT\",@nobits");
                 }
             },
+            Directive::InitArray(priority) => {
+                emit_init_array_section(out, target, ".init_array", "__mod_init_func", *priority)
+            }
+            Directive::FiniArray(priority) => {
+                emit_init_array_section(out, target, ".fini_array", "__mod_term_func", *priority)
+            }
 
             // Symbol visibility
             Directive::Global(sym) => {
@@ -825,13 +909,18 @@ impl EmitAsm for Directive {
             Directive::Type { sym, kind } => {
                 // ELF only - skip on macOS
                 if !matches!(target.os, Os::MacOS) {
-                    let _ = writeln!(out, ".type {}, {}", sym.name, kind.as_str());
+                    let _ = writeln!(
+                        out,
+                        ".type {}, {}",
+                        sym.format_for_target(target),
+                        kind.as_str()
+                    );
                 }
             }
             Directive::Size { sym, size } => {
                 // ELF only - skip on macOS
                 if !matches!(target.os, Os::MacOS) {
-                    let _ = writeln!(out, ".size {}, {}", sym.name, size);
+                    let _ = writeln!(out, ".size {}, {}", sym.format_for_target(target), size);
                 }
             }
             Directive::Comm { sym, size, align } => {
@@ -887,16 +976,21 @@ impl EmitAsm for Directive {
                 }
             },
 
-            // Alignment
-            Directive::Align(power) => match target.os {
-                Os::MacOS => {
-                    let _ = writeln!(out, ".p2align {}", power);
-                }
-                Os::Linux | Os::FreeBSD => {
-                    // Linux .align takes bytes, not power of 2
-                    let _ = writeln!(out, ".align {}", 1u32 << power);
-                }
-            },
+            // Alignment.
+            //
+            // `.p2align` on every target, because `.align` does not mean the
+            // same thing on all of them: gas reads its argument as a byte
+            // count on x86 but as a power of two on AArch64 and ARM. Writing
+            // `.align 8` for eight-byte alignment therefore asked for 256
+            // bytes on AArch64 -- and in `.init_array`, where the padding is
+            // read back as function pointers, the runtime called 31 null
+            // pointers before reaching the second constructor.
+            //
+            // `.p2align` is a power of two everywhere, which is what this
+            // directive has always carried.
+            Directive::Align(power) => {
+                let _ = writeln!(out, ".p2align {}", power);
+            }
 
             // Data emission
             Directive::Zero(n) => {
@@ -1055,36 +1149,6 @@ mod tests {
         assert_eq!(FpSize::Extended.x86_suffix(), "t");
     }
 
-    /// The `f64` a floating literal is stored as, widened to the binary128
-    /// encoding AAPCS64 requires. Values checked against the IEEE-754 layout:
-    /// a 15-bit exponent biased by 16383 and a 112-bit mantissa.
-    #[test]
-    fn test_f64_to_f128_bits() {
-        use crate::arch::aarch64::f64_to_f128_bits;
-
-        // 1.5 = 1.1b x 2^0 -> exponent 16383, mantissa top bit set.
-        assert_eq!(f64_to_f128_bits(1.5), (0, 0x3FFF_8000_0000_0000));
-        // 1.0 -> exponent 16383, mantissa zero.
-        assert_eq!(f64_to_f128_bits(1.0), (0, 0x3FFF_0000_0000_0000));
-        // 2.0 -> exponent 16384.
-        assert_eq!(f64_to_f128_bits(2.0), (0, 0x4000_0000_0000_0000));
-        // Signed zeroes keep only the sign bit.
-        assert_eq!(f64_to_f128_bits(0.0), (0, 0));
-        assert_eq!(f64_to_f128_bits(-0.0), (0, 0x8000_0000_0000_0000));
-        // -1.5 is 1.5 with the sign bit.
-        assert_eq!(f64_to_f128_bits(-1.5), (0, 0xBFFF_8000_0000_0000));
-        // Infinities saturate the exponent with a zero mantissa.
-        assert_eq!(f64_to_f128_bits(f64::INFINITY), (0, 0x7FFF_0000_0000_0000));
-        assert_eq!(
-            f64_to_f128_bits(f64::NEG_INFINITY),
-            (0, 0xFFFF_0000_0000_0000)
-        );
-        // A NaN keeps a non-zero mantissa and the saturated exponent.
-        let (lo, hi) = f64_to_f128_bits(f64::NAN);
-        assert_eq!(hi >> 48 & 0x7FFF, 0x7FFF);
-        assert!(hi & 0x0000_FFFF_FFFF_FFFF != 0 || lo != 0);
-    }
-
     #[test]
     fn test_label() {
         let label = Label::new("main", 5);
@@ -1183,19 +1247,20 @@ mod tests {
         assert_eq!(out, "");
     }
 
+    /// The argument is a power of two on every target.
+    ///
+    /// `.align` would not be: gas reads it as a byte count on x86 and as a
+    /// power of two on AArch64, so one spelling cannot mean one thing.
     #[test]
     fn test_directive_align() {
-        let linux = Target::new(Arch::X86_64, Os::Linux);
-        let macos = Target::new(Arch::X86_64, Os::MacOS);
-
         // Align to 16 bytes (power=4, 2^4=16)
-        let mut out = String::new();
-        Directive::Align(4).emit(&linux, &mut out);
-        assert_eq!(out, ".align 16\n");
-
-        let mut out = String::new();
-        Directive::Align(4).emit(&macos, &mut out);
-        assert_eq!(out, ".p2align 4\n");
+        for arch in [Arch::X86_64, Arch::Aarch64] {
+            for os in [Os::Linux, Os::MacOS, Os::FreeBSD] {
+                let mut out = String::new();
+                Directive::Align(4).emit(&Target::new(arch, os), &mut out);
+                assert_eq!(out, ".p2align 4\n", "{arch:?} {os:?}");
+            }
+        }
     }
 
     #[test]

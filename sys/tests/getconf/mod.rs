@@ -318,3 +318,81 @@ fn output_ends_with_newline() {
         );
     });
 }
+
+/// The programming environments the `c17` page mandates (88106-88176).
+///
+/// POSIX.2024 is Issue 8, so V8 is the required spelling; Austin Group Defect
+/// 1330 renamed the V7 names without changing the environments behind them.
+/// `getconf -v POSIX_V8_*` was already accepted, but every V8 *variable* was
+/// rejected, so an application following the spec's own procedure -- read the
+/// flags for the environment it wants, then compile with them -- could not get
+/// past the first step.
+///
+/// Checked as V8-agrees-with-V7 rather than against fixed strings: the values
+/// are the host's, and differ between a 32- and 64-bit machine.
+#[test]
+fn posix_v8_programming_environments_match_v7() {
+    let names = [
+        "ILP32_OFF32_CFLAGS",
+        "ILP32_OFF32_LDFLAGS",
+        "ILP32_OFF32_LIBS",
+        "ILP32_OFFBIG_CFLAGS",
+        "ILP32_OFFBIG_LDFLAGS",
+        "ILP32_OFFBIG_LIBS",
+        "LP64_OFF64_CFLAGS",
+        "LP64_OFF64_LDFLAGS",
+        "LP64_OFF64_LIBS",
+        "LPBIG_OFFBIG_CFLAGS",
+        "LPBIG_OFFBIG_LDFLAGS",
+        "LPBIG_OFFBIG_LIBS",
+        "WIDTH_RESTRICTED_ENVS",
+    ];
+
+    for suffix in names {
+        let v8 = getconf_output(&format!("POSIX_V8_{suffix}"));
+        let v7 = getconf_output(&format!("POSIX_V7_{suffix}"));
+        assert_eq!(
+            v8, v7,
+            "POSIX_V8_{suffix} must resolve, and to the same environment as V7"
+        );
+    }
+}
+
+/// The `_POSIX_V8_*` support variables say whether an environment is offered.
+///
+/// A "0" or "undefined" answer is as valid as "1" -- a 64-bit host need not
+/// offer ILP32 -- so this asserts they are answered at all, and consistently
+/// with the V7 spelling.
+#[test]
+fn posix_v8_environment_support_variables_are_answered() {
+    for suffix in ["ILP32_OFF32", "ILP32_OFFBIG", "LP64_OFF64", "LPBIG_OFFBIG"] {
+        let v8 = getconf_output(&format!("_POSIX_V8_{suffix}"));
+        let v7 = getconf_output(&format!("_POSIX_V7_{suffix}"));
+        assert!(
+            !v8.contains("unrecognized"),
+            "_POSIX_V8_{suffix} should be a known variable, got {v8:?}"
+        );
+        assert_eq!(v8, v7, "_POSIX_V8_{suffix} should agree with V7");
+    }
+}
+
+/// Run `getconf VAR` and return its stdout, or the error text if it failed.
+fn getconf_output(var: &str) -> String {
+    let plan = TestPlan {
+        cmd: "getconf".to_string(),
+        args: vec![var.to_string()],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    };
+    let mut captured = String::new();
+    run_test_with_checker(plan, |_, output| {
+        captured = if output.status.success() {
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        } else {
+            String::from_utf8_lossy(&output.stderr).into_owned()
+        };
+    });
+    captured
+}

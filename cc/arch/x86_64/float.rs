@@ -13,6 +13,7 @@ use super::codegen::X86_64CodeGen;
 use super::lir::{GpOperand, MemAddr, ShiftCount, X86Inst, XmmOperand};
 use super::regalloc::{Loc, Reg, XmmReg};
 use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize, Symbol};
+use crate::float::FloatVal;
 use crate::ir::{Instruction, Opcode, PseudoId, PseudoKind};
 use crate::types::{TypeId, TypeKind, TypeTable};
 
@@ -923,7 +924,7 @@ impl X86_64CodeGen {
     }
 
     /// Load a floating-point constant into an XMM register
-    pub(super) fn emit_fp_const_load(&mut self, target: PseudoId, value: f64, size: u32) {
+    pub(super) fn emit_fp_const_load(&mut self, target: PseudoId, value: FloatVal, size: u32) {
         let dst_loc = self.get_location(target);
         // Reserved scratch when target lives on the stack (see emit_fp_binop).
         let dst_xmm = match &dst_loc {
@@ -939,8 +940,13 @@ impl X86_64CodeGen {
     }
 
     /// Load a float immediate value into an XMM register
-    pub(super) fn emit_fp_imm_to_xmm(&mut self, value: f64, xmm: XmmReg, size: u32) {
-        if value == 0.0 {
+    ///
+    /// XMM holds only `float` and `double`; an x87 80-bit constant never
+    /// reaches here, so narrowing to `f64` up front loses nothing.
+    pub(super) fn emit_fp_imm_to_xmm(&mut self, value: FloatVal, xmm: XmmReg, size: u32) {
+        let is_zero = value.is_zero();
+        let value = value.to_f64();
+        if is_zero {
             // Use xorps/xorpd to zero the register (faster)
             let fp_size = FpSize::from_bits(size, &self.base.target);
             self.push_lir(X86Inst::XorFp {

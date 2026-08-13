@@ -96,6 +96,7 @@ fn test_linearize(tu: &TranslationUnit, types: &TypeTable, strings: &StringTable
 
 fn make_simple_func(name: StringId, body: Stmt, types: &TypeTable) -> FunctionDef {
     FunctionDef {
+        attrs: Default::default(),
         return_type: types.int_id,
         name,
         params: vec![],
@@ -125,11 +126,13 @@ fn test_parameter_stored_to_local() {
 
     // Function: int test(int x) { return x; }
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: int_type,
         name: test_id,
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: int_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Return(Some(Expr::var_typed(x_sym, int_type))),
         pos: test_pos(),
@@ -171,11 +174,13 @@ fn test_function_with_many_params() {
         .map(|&sym| Parameter {
             symbol: Some(sym),
             typ: int_type,
+            vm_dims: vec![],
         })
         .collect();
 
     // Return a + h (first and last params)
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: int_type,
         name: test_id,
         params,
@@ -241,11 +246,13 @@ fn test_compound_assignment_deref() {
     );
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: ctx.types.void_id,
         name: test_id,
         params: vec![Parameter {
             symbol: Some(p_sym),
             typ: int_ptr_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Expr(assign_expr),
         pos: test_pos(),
@@ -310,16 +317,19 @@ fn test_compound_assignment_index() {
     );
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: ctx.types.void_id,
         name: test_id,
         params: vec![
             Parameter {
                 symbol: Some(arr_sym),
                 typ: arr_ptr_type,
+                vm_dims: vec![],
             },
             Parameter {
                 symbol: Some(i_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
         ],
         body: Stmt::Expr(assign_expr),
@@ -385,11 +395,13 @@ fn test_simple_array_element_store() {
     );
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: ctx.types.void_id,
         name: test_id,
         params: vec![Parameter {
             symbol: Some(arr_sym),
             typ: arr_ptr_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Expr(assign_expr),
         pos: test_pos(),
@@ -471,20 +483,24 @@ fn test_nested_if_cfg_linking() {
 
     // Function: void test(int outer, int inner, int x) { <outer_if> }
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: ctx.types.void_id,
         name: test_id,
         params: vec![
             Parameter {
                 symbol: Some(outer_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
             Parameter {
                 symbol: Some(inner_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
             Parameter {
                 symbol: Some(x_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
         ],
         body: outer_if,
@@ -552,11 +568,13 @@ fn test_switch_basic() {
     };
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: int_type,
         name: test_id,
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: int_type,
+            vm_dims: vec![],
         }],
         body: switch_stmt,
         pos: test_pos(),
@@ -627,11 +645,13 @@ fn test_switch_with_break() {
     };
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: ctx.types.void_id,
         name: test_id,
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: int_type,
+            vm_dims: vec![],
         }],
         body: switch_stmt,
         pos: test_pos(),
@@ -703,11 +723,13 @@ fn test_do_while_basic() {
     };
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: ctx.types.void_id,
         name: test_id,
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: int_type,
+            vm_dims: vec![],
         }],
         body: do_while,
         pos: test_pos(),
@@ -781,16 +803,19 @@ fn test_do_while_with_break() {
     };
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: ctx.types.void_id,
         name: test_id,
         params: vec![
             Parameter {
                 symbol: Some(x_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
             Parameter {
                 symbol: Some(cond_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
         ],
         body: do_while,
@@ -863,11 +888,13 @@ fn test_goto_forward() {
     ]);
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: int_type,
         name: test_id,
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: int_type,
+            vm_dims: vec![],
         }],
         body,
         pos: test_pos(),
@@ -940,11 +967,13 @@ fn test_goto_backward() {
     ]);
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: int_type,
         name: test_id,
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: int_type,
+            vm_dims: vec![],
         }],
         body,
         pos: test_pos(),
@@ -1016,11 +1045,13 @@ fn test_nested_loop_break() {
     };
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: ctx.types.void_id,
         name: test_id,
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: int_type,
+            vm_dims: vec![],
         }],
         body: outer_loop,
         pos: test_pos(),
@@ -1092,20 +1123,24 @@ fn test_nested_loop_continue() {
     };
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: ctx.types.void_id,
         name: test_id,
         params: vec![
             Parameter {
                 symbol: Some(cond1_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
             Parameter {
                 symbol: Some(cond2_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
             Parameter {
                 symbol: Some(x_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
         ],
         body: outer_loop,
@@ -1161,11 +1196,13 @@ fn test_unary_logical_not() {
     );
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: int_type,
         name: test_id,
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: int_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Return(Some(not_expr)),
         pos: test_pos(),
@@ -1206,11 +1243,13 @@ fn test_unary_bitwise_not() {
     );
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: int_type,
         name: test_id,
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: int_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Return(Some(not_expr)),
         pos: test_pos(),
@@ -1251,11 +1290,13 @@ fn test_unary_negate() {
     );
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: int_type,
         name: test_id,
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: int_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Return(Some(neg_expr)),
         pos: test_pos(),
@@ -1296,11 +1337,13 @@ fn test_pre_increment() {
     );
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: int_type,
         name: test_id,
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: int_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Return(Some(inc_expr)),
         pos: test_pos(),
@@ -1353,11 +1396,13 @@ fn test_pointer_add_int() {
     );
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: int_ptr_type,
         name: test_id,
         params: vec![Parameter {
             symbol: Some(p_sym),
             typ: int_ptr_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Return(Some(add_expr)),
         pos: test_pos(),
@@ -1410,16 +1455,19 @@ fn test_pointer_difference() {
     );
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: long_type,
         name: test_id,
         params: vec![
             Parameter {
                 symbol: Some(p_sym),
                 typ: int_ptr_type,
+                vm_dims: vec![],
             },
             Parameter {
                 symbol: Some(q_sym),
                 typ: int_ptr_type,
+                vm_dims: vec![],
             },
         ],
         body: Stmt::Return(Some(diff_expr)),
@@ -1472,16 +1520,19 @@ fn test_float_add() {
     );
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: double_type,
         name: test_id,
         params: vec![
             Parameter {
                 symbol: Some(a_sym),
                 typ: double_type,
+                vm_dims: vec![],
             },
             Parameter {
                 symbol: Some(b_sym),
                 typ: double_type,
+                vm_dims: vec![],
             },
         ],
         body: Stmt::Return(Some(add_expr)),
@@ -1524,16 +1575,19 @@ fn test_float_comparison() {
     );
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: int_type,
         name: test_id,
         params: vec![
             Parameter {
                 symbol: Some(a_sym),
                 typ: double_type,
+                vm_dims: vec![],
             },
             Parameter {
                 symbol: Some(b_sym),
                 typ: double_type,
+                vm_dims: vec![],
             },
         ],
         body: Stmt::Return(Some(cmp_expr)),
@@ -1576,11 +1630,13 @@ fn test_float_to_int_cast() {
     );
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: int_type,
         name: test_id,
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: double_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Return(Some(cast_expr)),
         pos: test_pos(),
@@ -1622,11 +1678,13 @@ fn test_int_to_float_cast() {
     );
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: double_type,
         name: test_id,
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: int_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Return(Some(cast_expr)),
         pos: test_pos(),
@@ -1812,16 +1870,19 @@ fn test_linearize_function_with_params() {
     let a_sym = ctx.var("a", int_type);
     let b_sym = ctx.var("b", int_type);
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: int_type,
         name: add_id,
         params: vec![
             Parameter {
                 symbol: Some(a_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
             Parameter {
                 symbol: Some(b_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
         ],
         body: Stmt::Return(Some(Expr::binary(
@@ -1979,7 +2040,7 @@ fn test_type_propagation_double_literal() {
     let types = TypeTable::new(&Target::host());
 
     // Create a double literal
-    let mut expr = Expr::new(ExprKind::FloatLit(3.14), test_pos());
+    let mut expr = Expr::new(ExprKind::FloatLit(FloatVal::from_f64(3.14)), test_pos());
     expr.typ = Some(types.double_id);
 
     let symbols = SymbolTable::new();
@@ -2013,6 +2074,7 @@ fn test_local_var_emits_load_store() {
     let x_sym = ctx.var("x", int_type);
     // int test() { int x = 1; return x; }
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: int_type,
         name: test_id,
         params: vec![],
@@ -2070,11 +2132,13 @@ fn test_ssa_converts_local_to_phi() {
     // }
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: int_type,
         name: test_id,
         params: vec![Parameter {
             symbol: Some(cond_sym),
             typ: int_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Block(vec![
             // int x = 1;
@@ -2140,6 +2204,7 @@ fn test_ssa_loop_variable() {
     let i_var = || Expr::var_typed(i_sym, int_type);
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: int_type,
         name: test_id,
         params: vec![],
@@ -2198,16 +2263,19 @@ fn test_short_circuit_and() {
     // Short-circuit: if a is false, don't evaluate b
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: int_type,
         name: test_id,
         params: vec![
             Parameter {
                 symbol: Some(a_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
             Parameter {
                 symbol: Some(b_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
         ],
         body: Stmt::Return(Some(Expr::binary(
@@ -2256,16 +2324,19 @@ fn test_short_circuit_or() {
     // Short-circuit: if a is true, don't evaluate b
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: int_type,
         name: test_id,
         params: vec![
             Parameter {
                 symbol: Some(a_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
             Parameter {
                 symbol: Some(b_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
         ],
         body: Stmt::Return(Some(Expr::binary(
@@ -2330,16 +2401,19 @@ fn test_ternary_pure_uses_select() {
     );
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: int_type,
         name: test_id,
         params: vec![
             Parameter {
                 symbol: Some(a_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
             Parameter {
                 symbol: Some(b_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
         ],
         body: Stmt::Return(Some(ternary)),
@@ -2410,11 +2484,13 @@ fn test_ternary_impure_uses_phi() {
     );
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: int_type,
         name: test_id,
         params: vec![Parameter {
             symbol: Some(a_sym),
             typ: int_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Return(Some(ternary)),
         pos: test_pos(),
@@ -2490,16 +2566,19 @@ fn test_ternary_with_assignment_uses_phi() {
     );
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: int_type,
         name: test_id,
         params: vec![
             Parameter {
                 symbol: Some(a_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
             Parameter {
                 symbol: Some(b_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
         ],
         body: Stmt::Return(Some(ternary)),
@@ -2561,16 +2640,19 @@ fn test_ternary_with_post_increment_uses_phi() {
     );
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: int_type,
         name: test_id,
         params: vec![
             Parameter {
                 symbol: Some(a_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
             Parameter {
                 symbol: Some(b_sym),
                 typ: int_type,
+                vm_dims: vec![],
             },
         ],
         body: Stmt::Return(Some(ternary)),
@@ -2616,6 +2698,7 @@ fn test_string_literal_char_array_init() {
 
     // Function: int test() { char arr[6] = "hello"; return 0; }
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: ctx.types.int_id,
         name: test_id,
         params: vec![],
@@ -2668,6 +2751,7 @@ fn test_string_literal_char_pointer_init() {
 
     // Function: int test() { char *p = "hello"; return 0; }
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: ctx.types.int_id,
         name: test_id,
         params: vec![],
@@ -2833,6 +2917,7 @@ fn test_incomplete_struct_type_resolution() {
     // Create function: void test() { foo_t f = {1, 2}; }
     // Using the incomplete struct type for the declaration
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: ctx.types.void_id,
         name: test_id,
         params: vec![],
@@ -2924,6 +3009,7 @@ fn test_static_local_pre_increment() {
 
     // Function: int test() { static int counter = 0; return ++counter; }
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: ctx.types.int_id,
         name: test_id,
         params: vec![],
@@ -2998,6 +3084,7 @@ fn test_static_local_pre_decrement() {
     );
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: ctx.types.int_id,
         name: test_id,
         params: vec![],
@@ -3065,6 +3152,7 @@ fn test_static_local_post_increment() {
     );
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: ctx.types.int_id,
         name: test_id,
         params: vec![],
@@ -3132,6 +3220,7 @@ fn test_static_local_post_decrement() {
     );
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: ctx.types.int_id,
         name: test_id,
         params: vec![],
@@ -3203,6 +3292,7 @@ fn test_static_local_compound_assignment() {
     );
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: ctx.types.int_id,
         name: test_id,
         params: vec![],
@@ -3261,6 +3351,7 @@ fn test_wide_string_literal_expression() {
 
     // Function: wchar_t* test() { return L"hello"; }
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: wchar_ptr_type,
         name: test_id,
         params: vec![],
@@ -3325,11 +3416,13 @@ fn test_wide_string_literal_is_pure() {
     );
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: wchar_ptr_type,
         name: test_id,
         params: vec![Parameter {
             symbol: Some(cond_sym),
             typ: int_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Return(Some(ternary)),
         pos: test_pos(),
@@ -3367,6 +3460,7 @@ fn test_gcc_function_identifier() {
     // Function: const char* my_func() { return __FUNCTION__; }
     // Uses FuncName which handles __func__, __FUNCTION__, __PRETTY_FUNCTION__
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: ctx.types.char_ptr_id,
         name: my_func_id,
         params: vec![],
@@ -3407,6 +3501,7 @@ fn test_gcc_pretty_function_identifier() {
     // Function: const char* another_func() { return __PRETTY_FUNCTION__; }
     // Uses FuncName which handles __func__, __FUNCTION__, __PRETTY_FUNCTION__
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: ctx.types.char_ptr_id,
         name: another_func_id,
         params: vec![],
@@ -3496,6 +3591,7 @@ fn test_static_local_address_in_initializer() {
 
     // Function body with both declarations
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: ctx.types.int_id,
         name: test_id,
         params: vec![],
@@ -3584,11 +3680,13 @@ fn test_struct_deref_returns_address() {
     );
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: struct_type_id,
         name: test_id,
         params: vec![Parameter {
             symbol: Some(p_sym),
             typ: struct_ptr_type_id,
+            vm_dims: vec![],
         }],
         body: Stmt::Return(Some(deref_p)),
         pos: test_pos(),
@@ -3638,11 +3736,13 @@ fn test_int_to_float_cast_has_src_typ() {
     );
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: double_type,
         name: test_id,
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: int_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Return(Some(cast_expr)),
         pos: test_pos(),
@@ -3687,11 +3787,13 @@ fn test_float_to_int_cast_has_src_typ() {
     );
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: int_type,
         name: test_id,
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: double_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Return(Some(cast_expr)),
         pos: test_pos(),
@@ -3736,11 +3838,13 @@ fn test_integer_extension_has_src_typ() {
     );
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: int_type,
         name: test_id,
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: char_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Return(Some(cast_expr)),
         pos: test_pos(),
@@ -3786,11 +3890,13 @@ fn test_float16_to_float_conversion() {
     );
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: float_type,
         name: test_id,
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: float16_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Return(Some(cast_expr)),
         pos: test_pos(),
@@ -3838,11 +3944,13 @@ fn test_float_to_float16_conversion() {
     );
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: float16_type,
         name: test_id,
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: float_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Return(Some(cast_expr)),
         pos: test_pos(),
@@ -3890,11 +3998,13 @@ fn test_float16_to_int_conversion() {
     );
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: int_type,
         name: test_id,
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: float16_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Return(Some(cast_expr)),
         pos: test_pos(),
@@ -3942,11 +4052,13 @@ fn test_int_to_float16_conversion() {
     );
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: float16_type,
         name: test_id,
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: int_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Return(Some(cast_expr)),
         pos: test_pos(),
@@ -3991,6 +4103,7 @@ fn test_alignof_type_emits_setval() {
         Expr::typed_unpositioned(ExprKind::AlignofType(int_type), ctx.types.ulong_id);
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: ctx.types.ulong_id,
         name: test_id,
         params: vec![],
@@ -4029,11 +4142,13 @@ fn test_alignof_expr_emits_setval() {
     );
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: ctx.types.ulong_id,
         name: test_id,
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: int_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Return(Some(alignof_expr)),
         pos: test_pos(),
@@ -4079,6 +4194,7 @@ fn test_frame_address_emits_opcode() {
     );
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: void_ptr,
         name: test_id,
         params: vec![],
@@ -4121,6 +4237,7 @@ fn test_return_address_emits_opcode() {
     );
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: void_ptr,
         name: test_id,
         params: vec![],
@@ -4240,6 +4357,7 @@ fn test_mixed_designated_positional_struct_init() {
 
     // Function: int test() { struct S s = {.b = 20, 30, 40}; return 0; }
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: ctx.types.int_id,
         name: test_id,
         params: vec![],
@@ -4337,6 +4455,7 @@ fn test_mixed_designated_positional_array_init() {
 
     // Function: int test() { int arr[5] = {[2] = 20, 30, 40}; return 0; }
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: ctx.types.int_id,
         name: test_id,
         params: vec![],
@@ -4486,6 +4605,7 @@ fn test_designator_chain_nested_struct_init() {
     );
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: ctx.types.int_id,
         name: test_id,
         params: vec![],
@@ -4561,6 +4681,7 @@ fn test_designator_chain_array_member_init() {
     );
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: ctx.types.int_id,
         name: test_id,
         params: vec![],
@@ -4624,6 +4745,7 @@ fn test_repeated_designator_last_wins_array() {
     );
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: ctx.types.int_id,
         name: test_id,
         params: vec![],
@@ -4724,6 +4846,7 @@ fn test_skip_unnamed_bitfield_positional_init() {
     );
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: ctx.types.int_id,
         name: test_id,
         params: vec![],
@@ -4808,6 +4931,7 @@ fn test_union_first_named_member_positional_init() {
     );
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: ctx.types.int_id,
         name: test_id,
         params: vec![],
@@ -4868,11 +4992,13 @@ fn test_valist_parameter_stored_as_pointer() {
 
     // Function: void test(va_list va) { }
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: ctx.types.void_id,
         name: test_id,
         params: vec![Parameter {
             symbol: Some(va_sym),
             typ: valist_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Block(vec![]),
         pos: test_pos(),
@@ -4930,6 +5056,7 @@ fn test_valist_local_not_indirect() {
     };
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: ctx.types.void_id,
         name: test_id,
         params: vec![],
@@ -5001,11 +5128,13 @@ fn test_valist_expression_decay() {
     };
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: ctx.types.void_id,
         name: test_id,
         params: vec![Parameter {
             symbol: Some(va_sym),
             typ: valist_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Block(vec![BlockItem::Declaration(ptr_decl)]),
         pos: test_pos(),
@@ -5140,6 +5269,7 @@ fn test_bitfield_designated_init_multiple_same_offset() {
     };
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: ctx.types.int_id,
         name: test_id,
         params: vec![],
@@ -5265,6 +5395,7 @@ fn test_bitfield_designated_init_local_var() {
     );
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: ctx.types.int_id,
         name: test_id,
         params: vec![],
@@ -5389,6 +5520,7 @@ fn test_large_struct_copy_from_array() {
 
     // Create function: void test(void) { struct pair item = arr[0]; }
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: ctx.types.void_id,
         name: test_id,
         params: vec![],
@@ -5559,11 +5691,13 @@ fn test_compound_literal_zero_init_lvalue() {
 
     // Create function: void test(struct S *p) { *p = (struct S){.a = ...}; }
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: ctx.types.void_id,
         name: test_id,
         params: vec![Parameter {
             symbol: Some(p_sym),
             typ: struct_ptr_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Block(vec![
             BlockItem::Statement(Box::new(Stmt::Expr(assign))),
@@ -5680,11 +5814,13 @@ fn test_conditional_short_circuit_arrow() {
 
     // Create function: int test(struct S *entry) { return entry == NULL ? 0 : entry->x; }
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: int_type,
         name: test_id,
         params: vec![Parameter {
             symbol: Some(entry_sym),
             typ: struct_ptr_type,
+            vm_dims: vec![],
         }],
         body: Stmt::Block(vec![BlockItem::Statement(Box::new(Stmt::Return(Some(
             conditional,
@@ -5787,11 +5923,13 @@ fn compound_module(op: AssignOp, atomic: bool) -> (TestContext, Module) {
     );
 
     let func = FunctionDef {
+        attrs: Default::default(),
         return_type: ctx.types.void_id,
         name: test_id,
         params: vec![Parameter {
             symbol: Some(x_sym),
             typ: atomic_int,
+            vm_dims: vec![],
         }],
         body: Stmt::Block(vec![BlockItem::Statement(Box::new(Stmt::Expr(assign)))]),
         pos: test_pos(),

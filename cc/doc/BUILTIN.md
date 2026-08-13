@@ -2,6 +2,9 @@
 
 Builtin functions supported by c17. GCC/Clang compatible.
 
+Every entry below was compile-probed against this compiler; where behaviour
+differs from gcc, the row says so rather than leaving the reader to find out.
+
 ## Variadic Functions
 
 | Builtin | Description |
@@ -95,6 +98,11 @@ The member can be a chain like `field.subfield` or `arr[index].field`.
 | `__builtin_signbit(x)` | Returns non-zero if sign bit set (`double`) |
 | `__builtin_signbitf(x)` | Returns non-zero if sign bit set (`float`) |
 | `__builtin_signbitl(x)` | Returns non-zero if sign bit set (`long double`) |
+| `__builtin_isnan(x)` | 1 if `x` is a NaN, else 0. Any real floating type |
+| `__builtin_isinf(x)` | 1 if `x` is an infinity of either sign |
+| `__builtin_isfinite(x)` | 1 if `x` is neither infinite nor NaN |
+| `__builtin_isnormal(x)` | 1 if `x` is finite, non-zero and not subnormal |
+| `__builtin_fpclassify(nan, inf, normal, subnormal, zero, x)` | Whichever of the five class codes describes `x` |
 | `__builtin_flt_rounds()` | Current FP rounding mode |
 
 ## Stack Introspection
@@ -103,6 +111,45 @@ The member can be a chain like `field.subfield` or `arr[index].field`.
 |---------|-------------|
 | `__builtin_frame_address(level)` | Frame pointer at `level` (0 = current) |
 | `__builtin_return_address(level)` | Return address at `level` (0 = current) |
+
+## Complex Numbers
+
+| Builtin | Description |
+|---------|-------------|
+| `__builtin_complex(re, im)` | Build a complex value from two reals of the same type |
+
+Used by `<complex.h>` for `I` and the `CMPLX`/`CMPLXF`/`CMPLXL` macros, which
+exist precisely so `x + y*I` has an exact alternative that cannot corrupt an
+infinite or NaN part.
+
+**Limit:** only in a function body. A complex object with static storage
+duration cannot be initialized at all — neither `double _Complex z = 1.0 +
+2.0*I;` nor `CMPLX(1.0, 2.0)` — where gcc accepts both. See `#C11` in
+`../audit.md`.
+
+## Object Size and Fortification
+
+| Builtin | Description |
+|---------|-------------|
+| `__builtin_object_size(ptr, type)` | Size of the object `ptr` points into |
+| `__builtin___memcpy_chk`, `__builtin___memmove_chk`, `__builtin___memset_chk` | Checked memory operations |
+| `__builtin___strcpy_chk`, `__builtin___strncpy_chk`, `__builtin___stpcpy_chk` | Checked string copies |
+| `__builtin___strcat_chk`, `__builtin___strncat_chk` | Checked string concatenation |
+| `__builtin___printf_chk`, `__builtin___fprintf_chk` | Checked formatted output |
+| `__builtin___sprintf_chk`, `__builtin___snprintf_chk`, `__builtin___vsnprintf_chk` | Checked formatted output to a buffer |
+
+These exist so glibc's fortified headers compile: with `_FORTIFY_SOURCE` set,
+`<string.h>` and `<stdio.h>` rewrite their functions in terms of them.
+
+`__builtin_object_size` computes real sizes — 10 for a `char[10]` — and the
+`_chk` family has the implicit declarations glibc's headers expect.
+
+**Limit:** `-D_FORTIFY_SOURCE=2` still buys nothing, but no longer because of
+these builtins. c17 does not predefine `__OPTIMIZE__`, without which glibc
+compiles no fortified wrapper at all; and enabling it needs
+`__builtin_object_size` folded *after* inlining, since the wrapper measures its
+own parameter and would otherwise be handed "unknown". See `#C12` in
+`../audit.md` and the `_FORTIFY_SOURCE` entry in `TODO.md`.
 
 ## C11 Atomic Builtins
 
@@ -122,4 +169,17 @@ The member can be a chain like `field.subfield` or `arr[index].field`.
 | `__c11_atomic_thread_fence(order)` | Thread memory fence |
 | `__c11_atomic_signal_fence(order)` | Compiler barrier (signal fence) |
 
-The `<stdatomic.h>` header maps the standard C11 names (`atomic_load`, `atomic_store`, etc.) to these builtins.
+The `<stdatomic.h>` header maps the standard C11 names (`atomic_load`, `atomic_store`, etc.) to these builtins. `_Atomic` objects accessed through
+ordinary operators — assignment, compound assignment, `++`/`--`, and plain
+reads — are lowered to the same atomic instructions, so the builtins are not
+the only way to reach them.
+
+## Not implemented
+
+Worth stating because their absence is silent and changes which branch a
+system header takes.
+
+| Builtin | Consequence |
+|---------|-------------|
+
+| `__builtin_classify_type`, `__real__`, `__imag__` | Needed by the host's `<tgmath.h>`; c17 bundles its own, built on `_Generic`, so this is not a blocker |

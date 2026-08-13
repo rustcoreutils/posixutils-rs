@@ -64,8 +64,6 @@ pub struct Aarch64CodeGen {
     pub(super) extern_symbols: HashSet<String>,
     /// Thread-local storage symbols (need TLS access)
     pub(super) tls_symbols: HashSet<String>,
-    /// Shared library mode (affects TLS model selection)
-    shared_mode: bool,
     /// Position-independent code mode (for shared libraries)
     pic_mode: bool,
     /// Counter for generating unique labels (atomic loops, etc.)
@@ -105,7 +103,6 @@ impl Aarch64CodeGen {
             named_stack_param_bytes: 0,
             extern_symbols: HashSet::new(),
             tls_symbols: HashSet::new(),
-            shared_mode: false,
             pic_mode: false,
             unique_label_counter: 0,
             stack_alloc_size: 0,
@@ -301,7 +298,10 @@ impl Aarch64CodeGen {
         };
 
         // Save function name, frame size, and callee-saved size for label generation and offset calculation
-        self.base.current_fn = func.name.clone();
+        // Local labels are derived from this and are compiler-internal, so
+        // they take the plain name: a verbatim asm-label marker belongs only
+        // on the symbol the assembler is asked for.
+        self.base.current_fn = crate::arch::lir::undecorated(&func.name).to_string();
         self.frame_size = total_frame;
         self.callee_saved_size = callee_saved_size;
         self.reg_save_area_size = reg_save_area_size;
@@ -1645,7 +1645,7 @@ impl Aarch64CodeGen {
                 });
             }
             Loc::FImm(f, _) => {
-                let target = if *f != 0.0 {
+                let target = if !f.is_zero() {
                     insn.bb_true
                 } else {
                     insn.bb_false
@@ -1849,12 +1849,12 @@ impl Aarch64CodeGen {
                                     let (bits, fp_size) = match type_kind {
                                         TypeKind::Float16 => {
                                             // Convert f64 to IEEE 754 half-precision bits
-                                            (f64_to_f16_bits(*f) as i64, FpSize::Half)
+                                            (f64_to_f16_bits(f.to_f64()) as i64, FpSize::Half)
                                         }
                                         TypeKind::Float => {
-                                            ((*f as f32).to_bits() as i64, FpSize::Single)
+                                            ((f.to_f64() as f32).to_bits() as i64, FpSize::Single)
                                         }
-                                        _ => (f.to_bits() as i64, FpSize::Double),
+                                        _ => (f.to_f64().to_bits() as i64, FpSize::Double),
                                     };
                                     self.emit_mov_imm(scratch0, bits, 64);
                                     // LIR: fmov from GP to FP register
@@ -1875,6 +1875,24 @@ impl Aarch64CodeGen {
                 if let (Some(target), Some(&src)) = (insn.target, insn.src.first()) {
                     // Pass the type for proper sign/zero extension
                     self.emit_copy_with_type(src, target, insn.size, insn.typ, types);
+                }
+            }
+
+            Opcode::TlsAddr => {
+                if let (Some(target), Some(&src)) = (insn.target, insn.src.first()) {
+                    let dst_loc = self.get_location(target);
+                    // X17 is a reserved scratch, safe when the result is on
+                    // the stack. X16 is used by the sequence itself.
+                    let dst_reg = match &dst_loc {
+                        Loc::Reg(r) => *r,
+                        _ => Reg::X17,
+                    };
+                    if let Loc::Global(name) = self.get_location(src) {
+                        self.emit_tls_addr(&name, dst_reg);
+                        if !matches!(dst_loc, Loc::Reg(_)) {
+                            self.emit_move_to_loc(dst_reg, &dst_loc, 64);
+                        }
+                    }
                 }
             }
 
@@ -2140,17 +2158,59 @@ impl Aarch64CodeGen {
         }
     }
 
-    /// Check if a TLS symbol should use the Initial Exec model.
-    /// IE is used for extern TLS symbols or when building shared libraries.
-    /// Local Exec is used for locally-defined TLS in non-shared executables.
+    /// Whether accessing the thread-local `name` needs the Initial Exec model
+    /// rather than Local Exec. See [`CodeGenBase::use_tls_ie`].
     fn use_tls_ie(&self, name: &str) -> bool {
-        self.shared_mode || self.extern_symbols.contains(name)
+        self.base.use_tls_ie(self.extern_symbols.contains(name))
     }
 
     /// Emit TLS address computation into dst register.
     /// After this call, dst holds the address of the TLS variable.
     fn emit_tls_addr(&mut self, name: &str, dst: Reg) {
         let sym = Symbol::global(name);
+        if self.base.use_tls_dynamic() {
+            // TLS descriptor, the dynamic model:
+            //   adrp  x0, :tlsdesc:sym
+            //   ldr   x1, [x0, #:tlsdesc_lo12:sym]   ; resolver entry point
+            //   add   x0, x0, :tlsdesc_lo12:sym      ; descriptor address
+            //   .tlsdesccall sym
+            //   blr   x1                             ; returns an OFFSET in x0
+            //   mrs   tmp, tpidr_el0
+            //   add   dst, tmp, x0                   ; plus the thread pointer
+            //
+            // x0 and x1 are fixed by the descriptor calling convention, and
+            // the `.tlsdesccall` marker must immediately precede the `blr` for
+            // the linker to relax the sequence.
+            let entry = Reg::X1;
+            self.push_lir(Aarch64Inst::AdrpTlsdesc {
+                sym: sym.clone(),
+                dst: Reg::X0,
+            });
+            self.push_lir(Aarch64Inst::LdrTlsdescLo12 {
+                sym: sym.clone(),
+                base: Reg::X0,
+                dst: entry,
+            });
+            self.push_lir(Aarch64Inst::AddTlsdescLo12 {
+                sym: sym.clone(),
+                base: Reg::X0,
+                dst: Reg::X0,
+            });
+            self.push_lir(Aarch64Inst::TlsdescCall { sym });
+            self.push_lir(Aarch64Inst::Blr { reg: entry });
+            let tp = Reg::X16;
+            self.push_lir(Aarch64Inst::Mrs {
+                sysreg: "tpidr_el0",
+                dst: tp,
+            });
+            self.push_lir(Aarch64Inst::Add {
+                size: OperandSize::B64,
+                src1: tp,
+                src2: GpOperand::Reg(Reg::X0),
+                dst,
+            });
+            return;
+        }
         if self.use_tls_ie(name) {
             // Initial Exec model (extern TLS or shared library):
             //   adrp  dst, :gottpoff:sym
@@ -2365,11 +2425,11 @@ impl Aarch64CodeGen {
                 // Use the size from the FImm, not the passed-in size
                 // This ensures float constants are loaded correctly for their type
                 let bits = if imm_size == 16 {
-                    f64_to_f16_bits(f) as i64
+                    f64_to_f16_bits(f.to_f64()) as i64
                 } else if imm_size == 32 {
-                    (f as f32).to_bits() as i64
+                    (f.to_f64() as f32).to_bits() as i64
                 } else {
-                    f.to_bits() as i64
+                    f.to_f64().to_bits() as i64
                 };
                 self.emit_mov_imm(dst, bits, imm_size);
             }
@@ -3973,11 +4033,11 @@ impl Aarch64CodeGen {
             }
             Loc::FImm(f, imm_size) => {
                 let bits = if imm_size == 16 {
-                    super::f64_to_f16_bits(f) as i64
+                    super::f64_to_f16_bits(f.to_f64()) as i64
                 } else if imm_size == 32 {
-                    (f as f32).to_bits() as i64
+                    (f.to_f64() as f32).to_bits() as i64
                 } else {
-                    f.to_bits() as i64
+                    f.to_f64().to_bits() as i64
                 };
                 self.emit_mov_imm(reg, bits, 64);
             }
@@ -4167,6 +4227,11 @@ impl CodeGenerator for Aarch64CodeGen {
 
         // Emit functions
         for func in &module.functions {
+            // An inline definition is kept in the module so the inliner can
+            // use it, but provides no external definition -- see `Function::emit`.
+            if !func.emit {
+                continue;
+            }
             self.emit_function(func, types);
         }
 
@@ -4175,6 +4240,9 @@ impl CodeGenerator for Aarch64CodeGen {
             self.base
                 .push_directive(Directive::local_label(".Ltext_end"));
         }
+
+        // Emit the constructor / destructor pointer arrays
+        self.base.emit_init_arrays(&module.functions);
 
         // Generate DWARF debug sections if debug mode is enabled
         if module.debug {
@@ -4225,7 +4293,7 @@ impl CodeGenerator for Aarch64CodeGen {
     }
 
     fn set_shared_mode(&mut self, shared: bool) {
-        self.shared_mode = shared;
+        self.base.shared_mode = shared;
     }
 }
 

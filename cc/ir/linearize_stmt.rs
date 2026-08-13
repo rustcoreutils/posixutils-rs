@@ -13,6 +13,7 @@ use super::{
     AsmConstraint, AsmData, BasicBlockId, Initializer, Instruction, Opcode, Pseudo, PseudoId,
 };
 use crate::diag::error;
+use crate::float::FloatVal;
 use crate::parse::ast::{
     AsmOperand, BinaryOp, BlockItem, Declaration, Expr, ExprKind, ForInit, InitElement,
     OffsetOfPath, Stmt, UnaryOp,
@@ -219,8 +220,13 @@ impl<'a> super::linearize::Linearizer<'a> {
                 continue;
             }
 
-            // Check if this is a VLA (Variable Length Array)
-            if !declarator.vla_sizes.is_empty() {
+            // Check if this is a VLA (Variable Length Array).
+            //
+            // Run-time extents alone do not make one: in `int (*p)[n]` they
+            // belong to the *pointee*, and `p` is an ordinary pointer, sized
+            // at compile time and initializable like any other. Only a
+            // declarator that is itself the array is allocated here.
+            if !declarator.vla_sizes.is_empty() && self.types.kind(typ) == TypeKind::Array {
                 // C99 6.7.8: VLAs cannot have initializers.
                 // Report against the declarator's own position: `current_pos`
                 // is an Option and, when it is None, this constraint violation
@@ -267,10 +273,30 @@ impl<'a> super::linearize::Linearizer<'a> {
                     typ,
                     vla_size_sym: None,
                     vla_elem_type: None,
-                    vla_dim_syms: vec![],
+                    vm_row_dims: vec![],
                     is_indirect: false,
                 },
             );
+
+            // A pointer to a variably-modified array: the extents are the
+            // pointee's, and they are what one index step off the pointer
+            // has to advance by. C99 6.7.5.2p5 evaluates them where the
+            // declaration appears, which is here -- before any initializer.
+            //
+            // This is the same shape as a variably-modified *parameter*,
+            // which is adjusted to exactly this pointer type; see
+            // `linearize_function`.
+            if !declarator.vla_sizes.is_empty() {
+                if let Some(pointee) = self.types.base_type(typ) {
+                    let name = self.symbol_name(declarator.symbol);
+                    let (dims, elem_type) =
+                        self.record_vm_extents(pointee, &declarator.vla_sizes, &name);
+                    if let Some(info) = self.locals.get_mut(&declarator.symbol) {
+                        info.vm_row_dims = dims;
+                        info.vla_elem_type = Some(elem_type);
+                    }
+                }
+            }
 
             // If there's an initializer, emit Store(s)
             if let Some(init) = &declarator.init {
@@ -371,7 +397,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                             converted, sym_id, 0, base_typ, base_bits,
                         ));
                         // Store 0.0 for imaginary part
-                        let zero = self.emit_fconst(0.0, base_typ);
+                        let zero = self.emit_fconst(FloatVal::ZERO, base_typ);
                         self.emit(Instruction::store(
                             zero, sym_id, base_bytes, base_typ, base_bits,
                         ));
@@ -416,76 +442,26 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// so that sizeof(vla) can be computed at runtime.
     pub(crate) fn linearize_vla_decl(&mut self, declarator: &crate::parse::ast::InitDeclarator) {
         let typ = declarator.typ;
-
-        // Get the element type by stripping only VLA dimensions from the array type.
-        // For int arr[n][4], vla_sizes has 1 element, so we strip 1 dimension to get int[4].
-        // For int arr[n][m], vla_sizes has 2 elements, so we strip 2 dimensions to get int.
-        let num_vla_dims = declarator.vla_sizes.len();
-        let mut elem_type = typ;
-        for _ in 0..num_vla_dims {
-            if self.types.kind(elem_type) == TypeKind::Array {
-                elem_type = self.types.base_type(elem_type).unwrap_or(self.types.int_id);
-            }
-        }
-        let elem_size = self.types.size_bytes(elem_type) as i64;
-
         let ulong_type = self.types.ulong_id;
 
-        // Evaluate all VLA size expressions, store each in a hidden local,
-        // and compute total element count.
-        // For int arr[n][m], we store n and m separately (for stride computation)
-        // and compute total_count = n * m.
-        let mut vla_dim_syms: Vec<PseudoId> = Vec::new();
-        let mut total_count: Option<PseudoId> = None;
+        // Walk every array level, pairing the run-time size expressions with
+        // the levels that actually need one -- a level with a constant extent
+        // takes none, so `int a[n][4][m]` consumes `n` then `m`. The element
+        // type is the innermost non-array type, which makes one uniform
+        // product of extents serve both the total element count and any row
+        // size computed later.
+        let decl_name = self.symbol_name(declarator.symbol);
+        let (dims, elem_type) = self.record_vm_extents(typ, &declarator.vla_sizes, &decl_name);
 
-        for (dim_idx, vla_size_expr) in declarator.vla_sizes.iter().enumerate() {
-            let dim_size = self.linearize_expr(vla_size_expr);
+        let elem_size = self.types.size_bytes(elem_type) as i64;
 
-            // Create a hidden local to store this dimension's size
-            // This is needed for runtime stride computation in multi-dimensional VLAs
-            let dim_sym_id = self.alloc_pseudo();
-            let decl_name = self.symbol_name(declarator.symbol);
-            let dim_var_name = format!("__vla_dim{}_{}.{}", dim_idx, decl_name, dim_sym_id.0);
-            let dim_sym = Pseudo::sym(dim_sym_id, dim_var_name.clone());
-
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(dim_sym);
-                func.add_local(
-                    &dim_var_name,
-                    dim_sym_id,
-                    ulong_type,
-                    false, // not volatile
-                    false, // not atomic
-                    self.current_bb,
-                    None, // no explicit alignment
-                );
-            }
-
-            // Widen dimension size to 64-bit before storing
-            let dim_expr_typ = vla_size_expr.typ.unwrap_or(self.types.int_id);
-            let dim_size = self.emit_convert(dim_size, dim_expr_typ, ulong_type);
-            let store_dim_insn = Instruction::store(dim_size, dim_sym_id, 0, ulong_type, 64);
-            self.emit(store_dim_insn);
-            vla_dim_syms.push(dim_sym_id);
-
-            // Update running total count
-            total_count = Some(match total_count {
-                None => dim_size,
-                Some(prev) => {
-                    // Multiply: prev * dim_size
-                    let result = self.alloc_pseudo();
-                    let mul_insn = Instruction::new(Opcode::Mul)
-                        .with_target(result)
-                        .with_src(prev)
-                        .with_src(dim_size)
-                        .with_size(64)
-                        .with_type(self.types.ulong_id);
-                    self.emit(mul_insn);
-                    result
-                }
-            });
-        }
-        let num_elements = total_count.expect("VLA must have at least one size expression");
+        // Total element count is the product of every extent. An array
+        // declarator always has at least one level, so the empty product this
+        // falls back on is unreachable -- but a compiler that answers "one
+        // element" beats one that panics.
+        let num_elements = self
+            .vm_extent_product(&dims)
+            .unwrap_or_else(|| self.emit_const(1, ulong_type));
 
         // Create a hidden local variable to store the total number of elements
         // This is needed for sizeof(vla) to work at runtime
@@ -570,7 +546,9 @@ impl<'a> super::linearize::Linearizer<'a> {
                 typ: ptr_type,
                 vla_size_sym: Some(size_sym_id),
                 vla_elem_type: Some(elem_type),
-                vla_dim_syms,
+                // One index step consumes the outermost extent, so what a row
+                // still spans is everything after it.
+                vm_row_dims: dims[1..].to_vec(),
                 is_indirect: false,
             },
         );
@@ -589,7 +567,7 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         // C99 6.7.4p3: A non-static inline function cannot define a non-const
         // function-local static variable
-        if self.current_func_is_non_static_inline {
+        if self.current_func_is_inline_definition {
             let is_const = self
                 .types
                 .modifiers(declarator.typ)
@@ -599,7 +577,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     error(
                         pos,
                         &format!(
-                            "non-static inline function '{}' cannot define non-const static variable '{}'",
+                            "inline definition of '{}' cannot define non-const static variable '{}'",
                             self.current_func_name, name_str
                         ),
                     );
@@ -608,9 +586,16 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
 
         // Generate unique global name: funcname.varname.counter
+        //
+        // The enclosing function's name may be a verbatim asm label, whose
+        // marker belongs at the *start* of a name and not buried inside a
+        // derived one -- this static is a symbol of its own, decorated like
+        // any other.
         let global_name = format!(
             "{}.{}.{}",
-            self.current_func_name, name_str, self.static_local_counter
+            crate::arch::lir::undecorated(&self.current_func_name),
+            name_str,
+            self.static_local_counter
         );
         self.static_local_counter += 1;
 
@@ -635,7 +620,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 typ: declarator.typ,
                 vla_size_sym: None,
                 vla_elem_type: None,
-                vla_dim_syms: vec![],
+                vm_row_dims: vec![],
                 is_indirect: false,
             },
         );
@@ -1377,7 +1362,9 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// value of a `case` label is still an integer.
     fn eval_const_float(&self, expr: &Expr) -> Option<f64> {
         match &expr.kind {
-            ExprKind::FloatLit(v) => Some(*v),
+            // Only reachable through a cast to an integer type, so narrowing
+            // to f64 here cannot lose a value the result would have kept.
+            ExprKind::FloatLit(v) => Some(v.to_f64()),
             ExprKind::IntLit(v) => Some(*v as f64),
             ExprKind::CharLit(c) => Some(*c as u8 as i8 as f64),
             ExprKind::Cast {
@@ -1418,6 +1405,13 @@ impl<'a> super::linearize::Linearizer<'a> {
                     None
                 }
             }
+
+            // The address of a member of a pointer constant is itself an
+            // integer constant; see `eval_pointer_constant`.
+            ExprKind::Unary {
+                op: UnaryOp::AddrOf,
+                operand,
+            } => self.eval_pointer_constant(operand),
 
             ExprKind::Unary { op, operand } => {
                 let val = self.eval_const_expr(operand)?;
@@ -1648,32 +1642,90 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
     }
 
+    /// The address of `expr`, when it is an integer constant rather than a
+    /// symbol's address.
+    ///
+    /// `(size_t)&((struct S *)0)->member` is how offsetof was spelled before
+    /// <stddef.h> was relied on to provide it, and it is still what a good
+    /// many headers expand to. Nothing is dereferenced -- the address of a
+    /// member of a null pointer is arithmetic on the null pointer -- so there
+    /// is no symbol to relocate against and the result is a plain integer.
+    ///
+    /// The recursion bottoms out only at an integer constant, so `&global.f`
+    /// is not folded here: that one *does* need a symbol, and
+    /// `eval_static_address` is what computes it.
+    fn eval_pointer_constant(&self, expr: &Expr) -> Option<i128> {
+        match &expr.kind {
+            ExprKind::IntLit(v) => Some(*v as i128),
+            ExprKind::Int128Lit(v) => Some(*v),
+
+            ExprKind::Cast { expr: inner, .. } => self.eval_pointer_constant(inner),
+
+            ExprKind::Unary {
+                op: UnaryOp::AddrOf,
+                operand,
+            } => self.eval_pointer_constant(operand),
+
+            ExprKind::Member { expr: base, member } => {
+                let base_offset = self.eval_pointer_constant(base)?;
+                let struct_type = self.resolve_struct_type(base.typ?);
+                let member_info = self.types.find_member(struct_type, *member)?;
+                Some(base_offset + member_info.offset as i128)
+            }
+
+            ExprKind::Arrow { expr: base, member } => {
+                let base_offset = self.eval_pointer_constant(base)?;
+                let pointee_type = self.types.base_type(base.typ?)?;
+                let struct_type = self.resolve_struct_type(pointee_type);
+                let member_info = self.types.find_member(struct_type, *member)?;
+                Some(base_offset + member_info.offset as i128)
+            }
+
+            ExprKind::Index { array, index } => {
+                let base_offset = self.eval_pointer_constant(array)?;
+                let idx = self.eval_const_expr(index)?;
+                let elem_type = self.types.base_type(array.typ?)?;
+                Some(base_offset + idx * self.types.size_bytes(elem_type) as i128)
+            }
+
+            _ => None,
+        }
+    }
+
     /// Evaluate a constant floating-point expression at compile time.
     /// Handles float literals, negation, and binary arithmetic on floats.
-    pub(crate) fn eval_const_float_expr(&self, expr: &Expr) -> Option<f64> {
+    /// Fold a constant floating expression for a static initializer.
+    ///
+    /// A bare literal passes through at full width, which is what makes
+    /// `long double x = LDBL_MAX;` come out right. Arithmetic is still done in
+    /// `f64`, so folding an expression whose operands exceed double's range
+    /// still loses them; carrying that exactly needs wide arithmetic, not just
+    /// a wide literal.
+    pub(crate) fn eval_const_float_expr(&self, expr: &Expr) -> Option<FloatVal> {
         match &expr.kind {
             ExprKind::FloatLit(v) => Some(*v),
-            ExprKind::IntLit(v) => Some(*v as f64),
-            ExprKind::CharLit(c) => Some(*c as i64 as f64),
+            ExprKind::IntLit(v) => Some(FloatVal::from_f64(*v as f64)),
+            ExprKind::CharLit(c) => Some(FloatVal::from_f64(*c as i64 as f64)),
 
             ExprKind::Unary { op, operand } => {
                 let val = self.eval_const_float_expr(operand)?;
                 match op {
-                    UnaryOp::Neg => Some(-val),
+                    UnaryOp::Neg => Some(val.negated()),
                     _ => None,
                 }
             }
 
             ExprKind::Binary { op, left, right } => {
-                let l = self.eval_const_float_expr(left)?;
-                let r = self.eval_const_float_expr(right)?;
-                match op {
-                    BinaryOp::Add => Some(l + r),
-                    BinaryOp::Sub => Some(l - r),
-                    BinaryOp::Mul => Some(l * r),
-                    BinaryOp::Div => Some(l / r),
-                    _ => None,
-                }
+                let l = self.eval_const_float_expr(left)?.to_f64();
+                let r = self.eval_const_float_expr(right)?.to_f64();
+                let v = match op {
+                    BinaryOp::Add => l + r,
+                    BinaryOp::Sub => l - r,
+                    BinaryOp::Mul => l * r,
+                    BinaryOp::Div => l / r,
+                    _ => return None,
+                };
+                Some(FloatVal::from_f64(v))
             }
 
             ExprKind::Cast { expr: inner, .. } => self.eval_const_float_expr(inner),

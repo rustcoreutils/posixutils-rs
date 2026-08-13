@@ -11,6 +11,7 @@
 //
 
 use crate::diag::Position;
+use crate::float::FloatVal;
 use crate::strings::StringId;
 use crate::symbol::SymbolId;
 use crate::types::{TypeId, TypeModifiers};
@@ -76,6 +77,23 @@ impl BinaryOp {
             BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Ge | BinaryOp::Eq | BinaryOp::Ne
         )
     }
+}
+
+/// Which classification question a [`ExprKind::FpTest`] asks.
+///
+/// The variants share an `Is` prefix because the builtins they name do:
+/// `__builtin_isnan`, `__builtin_isinf`, and so on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
+pub enum FpTest {
+    /// Is it a NaN?
+    IsNan,
+    /// Is it an infinity, of either sign?
+    IsInf,
+    /// Is it neither infinite nor NaN?
+    IsFinite,
+    /// Is it finite, non-zero and not subnormal?
+    IsNormal,
 }
 
 /// Assignment operators
@@ -174,7 +192,7 @@ pub enum ExprKind {
     Int128Lit(i128),
 
     /// Floating-point literal
-    FloatLit(f64),
+    FloatLit(FloatVal),
 
     /// Character literal
     CharLit(char),
@@ -500,6 +518,22 @@ pub enum ExprKind {
 
     /// __builtin_signbitl(x) - test sign bit of long double, returns non-zero if negative
     Signbitl {
+        arg: Box<Expr>,
+    },
+
+    /// `__builtin_isnan` / `isinf` / `isfinite` / `isnormal` -- classify a
+    /// floating value. Desugared in the linearizer rather than here so the
+    /// argument is evaluated exactly once; `isnan(f())` must not call `f`
+    /// twice.
+    FpTest {
+        test: FpTest,
+        arg: Box<Expr>,
+    },
+
+    /// `__builtin_fpclassify(nan, inf, normal, subnormal, zero, x)` -- yields
+    /// whichever of the five class codes describes `x`.
+    FpClassify {
+        classes: Vec<Expr>,
         arg: Box<Expr>,
     },
 
@@ -1014,6 +1048,69 @@ pub struct Parameter {
     pub symbol: Option<SymbolId>,
     /// Parameter type (interned TypeId)
     pub typ: TypeId,
+    /// For a variably-modified array parameter, the run-time size expressions
+    /// of its *element* type, outermost first; empty for every other parameter.
+    ///
+    /// `int a[n][m]` is adjusted to `int (*a)[m]` (C17 6.7.6.3p7), so the
+    /// element type is `int[m]` and this holds `[m]`. The `int (*a)[m]`
+    /// spelling produces the same thing, which is why both index alike. These
+    /// expressions are what the prologue evaluates to recover a row stride;
+    /// without them a variably-modified element type has size 0.
+    pub vm_dims: Vec<Expr>,
+}
+
+/// Attributes that change how a function is *emitted* rather than what it
+/// computes, and so have to survive from the parser into code generation.
+#[derive(Debug, Clone, Default)]
+pub struct FunctionAttrs {
+    /// `__attribute__((noinline))` -- never inline this function.
+    pub noinline: bool,
+    /// `__attribute__((always_inline))` -- inline this function at every call
+    /// site, whatever the size heuristics say, and even at `-O0`.
+    pub always_inline: bool,
+    /// `__attribute__((constructor))` -- run before `main`. The outer option
+    /// says whether the attribute is present at all; the inner one carries the
+    /// optional priority, which orders this constructor against the others.
+    pub constructor: Option<Option<u16>>,
+    /// `__attribute__((destructor))` -- run after `main` returns, or on
+    /// `exit`. Encoded like [`FunctionAttrs::constructor`].
+    pub destructor: Option<Option<u16>>,
+    /// `__attribute__((__gnu_inline__))` -- use GNU inline semantics for this
+    /// definition rather than C99's.
+    ///
+    /// The two are *opposite* on the question of which spelling emits an
+    /// external definition: C99 emits for `extern inline` and not for plain
+    /// `inline`, GNU emits for plain `inline` and not for `extern inline`.
+    /// This attribute is how a program selects the older meaning, and glibc's
+    /// `__fortify_function` relies on it to keep its wrappers out of every
+    /// object that includes `<string.h>`.
+    pub gnu_inline: bool,
+    /// `__attribute__((__artificial__))` -- present in glibc's headers, and
+    /// meaningful only to the debugger, which is told to step over the
+    /// function rather than into it. Recorded so `__has_attribute` can answer
+    /// for it; c17 emits no such debug annotation.
+    pub artificial: bool,
+}
+
+impl FunctionAttrs {
+    /// Fold `other` in, letting a present attribute win.
+    ///
+    /// Attributes reach a function definition from more than one place --
+    /// before the declaration specifiers, between the type and the
+    /// declarator, and after the parameter list -- so they are accumulated
+    /// rather than read from a single site.
+    pub fn merge(&mut self, other: &FunctionAttrs) {
+        self.noinline |= other.noinline;
+        self.always_inline |= other.always_inline;
+        self.gnu_inline |= other.gnu_inline;
+        self.artificial |= other.artificial;
+        if let Some(prio) = other.constructor {
+            self.constructor = Some(prio);
+        }
+        if let Some(prio) = other.destructor {
+            self.destructor = Some(prio);
+        }
+    }
 }
 
 /// A function definition
@@ -1035,6 +1132,8 @@ pub struct FunctionDef {
     pub is_inline: bool,
     /// Calling convention override (from __attribute__((sysv_abi)) etc.)
     pub calling_conv: crate::abi::CallingConv,
+    /// Emission-affecting attributes; see [`FunctionAttrs`].
+    pub attrs: FunctionAttrs,
 }
 
 // ============================================================================
@@ -1384,7 +1483,8 @@ mod tests {
         let types = TypeTable::new(&Target::host());
 
         // Test Fabs (double)
-        let arg = Expr::typed_unpositioned(ExprKind::FloatLit(1.5), types.double_id);
+        let arg =
+            Expr::typed_unpositioned(ExprKind::FloatLit(FloatVal::from_f64(1.5)), types.double_id);
         let fabs = Expr::new_unpositioned(ExprKind::Fabs { arg: Box::new(arg) });
         match fabs.kind {
             ExprKind::Fabs { arg } => {
@@ -1394,7 +1494,8 @@ mod tests {
         }
 
         // Test Fabsf (float)
-        let arg = Expr::typed_unpositioned(ExprKind::FloatLit(2.5), types.float_id);
+        let arg =
+            Expr::typed_unpositioned(ExprKind::FloatLit(FloatVal::from_f64(2.5)), types.float_id);
         let fabsf = Expr::new_unpositioned(ExprKind::Fabsf { arg: Box::new(arg) });
         match fabsf.kind {
             ExprKind::Fabsf { arg } => {
@@ -1404,7 +1505,10 @@ mod tests {
         }
 
         // Test Fabsl (long double)
-        let arg = Expr::typed_unpositioned(ExprKind::FloatLit(3.5), types.longdouble_id);
+        let arg = Expr::typed_unpositioned(
+            ExprKind::FloatLit(FloatVal::from_f64(3.5)),
+            types.longdouble_id,
+        );
         let fabsl = Expr::new_unpositioned(ExprKind::Fabsl { arg: Box::new(arg) });
         match fabsl.kind {
             ExprKind::Fabsl { arg } => {

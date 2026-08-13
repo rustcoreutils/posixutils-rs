@@ -107,7 +107,6 @@ Supported:
 - GCC-compatible inline assembly: extended asm with constraints, clobbers, named operands, matching constraints, `asm goto` with labels
 
 Not yet implemented (features we want to add):
-- TLS General-Dynamic model (for `_Thread_local` in shared libraries — `__tls_get_addr` path)
 - `-fverbose-asm`
 - assembly peephole optimizations
 

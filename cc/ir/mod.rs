@@ -24,12 +24,15 @@ mod linearize_emit;
 mod linearize_init;
 mod linearize_stmt;
 pub mod lower;
+pub mod mach_o_dtors;
 pub mod mem2reg;
 pub mod ssa;
+pub mod tls;
 pub mod validate;
 
 use crate::abi::{get_abi_for_conv, ArgClass, CallingConv};
 use crate::diag::Position;
+use crate::float::FloatVal;
 use crate::target::Target;
 use crate::types::{TypeId, TypeTable};
 use std::collections::{HashMap, HashSet};
@@ -171,10 +174,19 @@ pub enum Opcode {
 
     // Other
     SymAddr, // Get address of symbol
-    Call,    // Function call
-    Select,  // Ternary select: cond ? a : b (pure expressions only, enables cmov/csel)
-    SetVal,  // Create pseudo for constant
-    Nop,     // No operation
+    /// Get the address of a *thread-local* symbol.
+    ///
+    /// Distinct from `SymAddr` because the address is not a link-time
+    /// constant: under the dynamic model it is computed by a call, which
+    /// clobbers a register. Carrying that in the opcode is what lets
+    /// `opcode_constraints` declare the clobber without the register allocator
+    /// needing the module's thread-local symbol set or the build mode -- it
+    /// runs over the IR, long before either is in reach.
+    TlsAddr,
+    Call,   // Function call
+    Select, // Ternary select: cond ? a : b (pure expressions only, enables cmov/csel)
+    SetVal, // Create pseudo for constant
+    Nop,    // No operation
 
     // Variadic function support
     VaStart, // Initialize va_list
@@ -379,6 +391,7 @@ impl Opcode {
             Opcode::PhiSource => "phisrc",
             Opcode::Copy => "copy",
             Opcode::SymAddr => "symaddr",
+            Opcode::TlsAddr => "tlsaddr",
             Opcode::Call => "call",
             Opcode::Select => "sel",
             Opcode::SetVal => "setval",
@@ -507,7 +520,7 @@ pub enum PseudoKind {
     /// Constant integer value
     Val(i128),
     /// Constant float value
-    FVal(f64),
+    FVal(FloatVal),
 }
 
 /// A pseudo (virtual register or value) in SSA form
@@ -581,7 +594,7 @@ impl Pseudo {
     }
 
     /// Create a constant float pseudo
-    pub fn fval(id: PseudoId, value: f64) -> Self {
+    pub fn fval(id: PseudoId, value: FloatVal) -> Self {
         Self {
             id,
             kind: PseudoKind::FVal(value),
@@ -1108,6 +1121,14 @@ impl Instruction {
             .with_type_and_size(typ, 64) // Pointers are always 64-bit
     }
 
+    /// Create a thread-local address instruction. See [`Opcode::TlsAddr`].
+    pub fn tls_addr(target: PseudoId, sym: PseudoId, typ: TypeId) -> Self {
+        Self::new(Opcode::TlsAddr)
+            .with_target(target)
+            .with_src(sym)
+            .with_type_and_size(typ, 64)
+    }
+
     /// Create a phi node
     pub fn phi(target: PseudoId, typ: TypeId, size: u32) -> Self {
         Self::new(Opcode::Phi)
@@ -1491,10 +1512,32 @@ pub struct Function {
     pub max_dom_level: u32,
     /// Is this function static (internal linkage)?
     pub is_static: bool,
+    /// Whether to emit a body for this function at all.
+    ///
+    /// False for an *inline definition* -- C99 6.7.4p6, or its GNU
+    /// counterpart selected by `__gnu_inline__`. Such a definition is fully
+    /// available for inlining but provides no external definition, so emitting
+    /// one puts a duplicate symbol in every object that includes the header.
+    /// The function stays in the module because the inliner still needs its
+    /// body; only the backends' emit loops skip it.
+    pub emit: bool,
     /// Is this function noreturn (never returns)?
     pub is_noreturn: bool,
     /// Is this function declared with the inline keyword?
     pub is_inline: bool,
+    /// `__attribute__((noinline))`: the inliner must leave this function
+    /// alone, whatever its size says.
+    pub is_noinline: bool,
+    /// `__attribute__((always_inline))`: inline at every call site regardless
+    /// of size, and at `-O0` too. `is_noinline` wins if both are present.
+    pub is_always_inline: bool,
+    /// `__attribute__((constructor))`: emit a pointer to this function in
+    /// `.init_array` so it runs before `main`. `Some(None)` is the attribute
+    /// without a priority; `Some(Some(p))` carries one.
+    pub constructor: Option<Option<u16>>,
+    /// `__attribute__((destructor))`: the `.fini_array` counterpart of
+    /// [`Function::constructor`], encoded the same way.
+    pub destructor: Option<Option<u16>>,
     /// Parameters whose data is supplied implicitly by the backend prologue
     /// (e.g. complex / two-SSE struct params).  When inlining the function,
     /// the inliner must generate an explicit struct copy from the caller's
@@ -1531,7 +1574,12 @@ impl Default for Function {
             locals: HashMap::with_capacity(DEFAULT_LOCAL_CAPACITY),
             max_dom_level: 0,
             is_static: false,
+            emit: true,
             is_noreturn: false,
+            is_noinline: false,
+            is_always_inline: false,
+            constructor: None,
+            destructor: None,
             is_inline: false,
             implicit_param_copies: Vec::new(),
             returns_complex: false,
@@ -1726,7 +1774,7 @@ pub enum Initializer {
     /// Integer initializer
     Int(i128),
     /// Float/double initializer
-    Float(f64),
+    Float(FloatVal),
     /// String literal initializer (for char arrays)
     String(String),
     /// Wide string literal initializer (for wchar_t arrays)
@@ -1766,7 +1814,7 @@ impl Initializer {
         match self {
             Initializer::None => true,
             Initializer::Int(v) => *v == 0,
-            Initializer::Float(v) => v.to_bits() == 0,
+            Initializer::Float(v) => v.is_positive_zero(),
             // A zero-length string is all-zero; a non-empty char array initialized
             // by a string literal is zero iff every byte is `\0`.
             Initializer::String(s) => s.chars().all(|c| c == '\0'),

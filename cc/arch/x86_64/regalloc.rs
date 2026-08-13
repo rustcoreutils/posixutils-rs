@@ -43,6 +43,7 @@ use crate::arch::regalloc::{
     compute_live_intervals, find_call_positions, identify_addr_taken_syms, identify_fp_pseudos,
     interval_crosses_call, ConstraintPoint, FreeSlot, LiveInterval, LivenessResult,
 };
+use crate::float::FloatVal;
 use crate::ir::{Function, Instruction, Opcode, PseudoId, PseudoKind};
 use crate::types::TypeTable;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -256,6 +257,16 @@ pub fn opcode_constraints(op: Opcode) -> RegConstraints {
         // which doesn't depend on these, so marking them as clobbers is safe for both.
         Opcode::Mul => RegConstraints {
             clobbers: &[Reg::Rax, Reg::Rdx],
+        },
+        // The TLS descriptor sequence hard-uses %rax: the `@TLSCALL`
+        // relocation names it, and the resolver returns through it. Nothing
+        // else is clobbered -- the resolver preserves every other register,
+        // which is why this is a plain clobber here and deliberately *not* an
+        // entry in `is_call_like_x86_64`. Declaring it call-like would spill
+        // every live floating-point value to the stack and spill argument
+        // registers, for a sequence that needs neither.
+        Opcode::TlsAddr => RegConstraints {
+            clobbers: &[Reg::Rax],
         },
         Opcode::Shl | Opcode::Lsr | Opcode::Asr => RegConstraints {
             clobbers: &[Reg::Rcx],
@@ -840,7 +851,7 @@ pub enum Loc {
     /// Immediate integer constant
     Imm(i128),
     /// Immediate float constant (value, size in bits)
-    FImm(f64, u32),
+    FImm(FloatVal, u32),
     /// Global symbol
     Global(String),
 }

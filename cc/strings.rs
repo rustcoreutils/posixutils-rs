@@ -31,7 +31,7 @@ use std::fmt;
 /// A unique identifier for an interned string
 /// Similar to TypeId for types, this provides O(1) equality comparisons
 /// and compact storage (4 bytes vs 16+ bytes for String on 64-bit)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct StringId(pub u32);
 
 impl StringId {

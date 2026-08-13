@@ -36,9 +36,24 @@ pub enum MemAddr {
     /// symbol@GOTPCREL(%rip) - GOT-relative addressing for external symbols on macOS
     GotPcrel(Symbol),
 
-    /// %fs:symbol@TPOFF - Thread-local storage Local Exec model (Linux x86-64)
-    /// Uses FS segment register to access thread-local variables defined in same executable
-    TlsIE(Symbol),
+    /// `%fs:symbol@TPOFF` - thread-local storage, **Local Exec** model
+    /// (Linux x86-64). The offset from the thread pointer is fixed at link
+    /// time, so this is only valid for a thread-local defined in the main
+    /// executable.
+    ///
+    /// Named `TlsIE` until it was noticed that it emits Local Exec, not
+    /// Initial Exec -- the Initial Exec spelling is `TlsGottpoff` below.
+    TlsLocalExec(Symbol),
+
+    /// `symbol@TLSDESC(%rip)` - thread-local storage descriptor, the dynamic
+    /// model. `leaq` this into a register, then call through
+    /// [`MemAddr::TlsCall`]; the resolver returns the address in `%rax`.
+    ///
+    /// Unlike the older `@tlsgd` sequence, this needs no `data16`/`rex64`
+    /// padding: the linker relaxes it to Initial or Local Exec from its
+    /// natural form. Stripping the padding off an `@tlsgd` sequence, by
+    /// contrast, is a hard link error.
+    TlsDesc(Symbol),
 
     /// symbol@GOTTPOFF(%rip) - Thread-local storage Initial Exec model (Linux x86-64)
     /// For external TLS variables: load offset from GOT, then access %fs:(offset)
@@ -47,6 +62,17 @@ pub enum MemAddr {
     /// %fs:(base) - Thread-local storage access through base register
     /// Used with @GOTTPOFF: first load offset into register, then access %fs:(reg)
     FsBase(Reg),
+
+    /// %fs:offset - absolute offset from the thread pointer.
+    /// `%fs:0` reads the thread pointer itself, which is the first step of
+    /// computing the *address* of a thread-local (as opposed to loading its
+    /// value, which the segment override can do in one instruction).
+    FsAbsolute(i32),
+
+    /// symbol@TPOFF(base) - Local Exec offset added to a base register.
+    /// Pairs with `FsAbsolute(0)` to form a thread-local address:
+    /// `movq %fs:0, %r` then `leaq sym@TPOFF(%r), %r`.
+    TlsTpoffBase { sym: Symbol, base: Reg },
 }
 
 impl MemAddr {
@@ -66,9 +92,12 @@ impl MemAddr {
             MemAddr::GotPcrel(sym) => {
                 format!("{}@GOTPCREL(%rip)", sym.format_for_target(target))
             }
-            MemAddr::TlsIE(sym) => {
+            MemAddr::TlsLocalExec(sym) => {
                 // Thread-local storage Local Exec model: %fs:symbol@TPOFF
                 format!("%fs:{}@TPOFF", sym.format_for_target(target))
+            }
+            MemAddr::TlsDesc(sym) => {
+                format!("{}@TLSDESC(%rip)", sym.format_for_target(target))
             }
             MemAddr::TlsGottpoff(sym) => {
                 // Thread-local storage Initial Exec model: symbol@GOTTPOFF(%rip)
@@ -78,6 +107,13 @@ impl MemAddr {
             MemAddr::FsBase(base) => {
                 // Thread-local storage access through base register: %fs:(reg)
                 format!("%fs:({})", base.name64())
+            }
+            MemAddr::FsAbsolute(offset) => {
+                // Absolute offset from the thread pointer: %fs:0 reads it.
+                format!("%fs:{}", offset)
+            }
+            MemAddr::TlsTpoffBase { sym, base } => {
+                format!("{}@TPOFF({})", sym.format_for_target(target), base.name64())
             }
         }
     }
@@ -373,6 +409,18 @@ pub enum X86Inst {
 
     /// CALL - Function call
     Call { target: CallTarget<Reg> },
+
+    /// `call *sym@TLSCALL(%rax)` - invoke a TLS descriptor resolver.
+    ///
+    /// Its own instruction rather than a `CallTarget`, because the operand is
+    /// a relocated memory reference tied to `%rax` and to the `leaq
+    /// sym@TLSDESC(%rip), %rax` that must immediately precede it -- the
+    /// linker matches the pair when relaxing to a static model.
+    ///
+    /// Not a `Call` for register allocation either: the resolver preserves
+    /// every register but `%rax`, so treating it as call-like would spill
+    /// floating-point values and argument registers for nothing.
+    TlsDescCall { sym: Symbol },
 
     /// RET - Return from function
     Ret,
@@ -964,6 +1012,14 @@ impl EmitAsm for X86Inst {
                 let _ = writeln!(out, "    j{} {}", cc.x86_suffix(), lbl.name());
             }
 
+            X86Inst::TlsDescCall { sym } => {
+                let _ = writeln!(
+                    out,
+                    "    call *{}@TLSCALL(%rax)",
+                    sym.format_for_target(target)
+                );
+            }
+
             X86Inst::Call {
                 target: call_target,
             } => match call_target {
@@ -1164,7 +1220,10 @@ impl EmitAsm for X86Inst {
             }
 
             X86Inst::X87CmpPop => {
-                let _ = writeln!(out, "    fcomip %st(1), %st");
+                // `fucomip`, not `fcomip`: the quiet form does not raise
+                // invalid-operation on a QNaN, which is what C's relational
+                // operators require of everything but the signalling macros.
+                let _ = writeln!(out, "    fucomip %st(1), %st");
             }
 
             X86Inst::X87Pop => {

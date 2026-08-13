@@ -317,3 +317,161 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("c89_declarations_mega", code, &[]), 0);
 }
+
+/// `++` and `--` on a bitfield must change only that field.
+///
+/// They did not: the increment path stored its result with a plain store of
+/// the whole storage unit, so the value landed at bit 0 and every neighbour
+/// sharing the unit was wiped. On `struct A{unsigned a:3;int b:5;unsigned
+/// c:1;signed d:4;}` holding `{7,5,1,-8}`, `a.b++` gave `6 0 0 0` where gcc
+/// gives `7 6 1 -8` -- literally the value 6 written at offset 0.
+///
+/// Assignment and compound assignment were always correct, because they went
+/// through `emit_bitfield_store`; the increment path simply did not. All four
+/// now share `emit_member_store`.
+#[test]
+fn c89_bitfield_increment_leaves_neighbours_alone() {
+    let code = r#"
+#include <stdio.h>
+#include <string.h>
+
+struct A { unsigned a:3; int b:5; unsigned c:1; signed d:4; };
+struct U { unsigned x:4; unsigned y:4; };
+
+static int check(struct A got, unsigned a, int b, unsigned c, int d) {
+    return got.a == a && got.b == b && got.c == c && got.d == d;
+}
+
+static struct A by_value(struct A v) { v.b++; return v; }
+
+int main(void) {
+    struct A base = {7, 5, 1, -8};
+    struct A t;
+
+    t = base; t.b++;   if (!check(t, 7, 6, 1, -8)) return 1;
+    t = base; ++t.b;   if (!check(t, 7, 6, 1, -8)) return 2;
+    t = base; t.b--;   if (!check(t, 7, 4, 1, -8)) return 3;
+    t = base; --t.b;   if (!check(t, 7, 4, 1, -8)) return 4;
+
+    /* Each field in turn, so a wrong bit offset cannot pass by luck. */
+    t = base; t.a++;   if (!check(t, 0, 5, 1, -8)) return 5;   /* 7+1 wraps 3 bits */
+    t = base; t.c++;   if (!check(t, 7, 5, 0, -8)) return 6;   /* 1+1 wraps 1 bit  */
+    t = base; t.d++;   if (!check(t, 7, 5, 1, -7)) return 7;
+
+    /* The value of the expression: postfix is the old value, prefix the new. */
+    t = base; if (t.b++ != 5) return 8;
+    t = base; if (++t.b != 6) return 9;
+
+    /* Signed wrap at the field's width, not the storage unit's. */
+    t = base; t.b = 15; t.b++;  if (t.b != -16) return 10;
+    t = base; t.b = -16; t.b--; if (t.b != 15) return 11;
+
+    /* Every access path, since each had its own store. */
+    struct A arr[2] = {{7,5,1,-8}, {7,5,1,-8}};
+    arr[1].b++;
+    if (!check(arr[1], 7, 6, 1, -8)) return 12;
+    if (!check(arr[0], 7, 5, 1, -8)) return 13;
+
+    t = base;
+    struct A *p = &t; p->b++;
+    if (!check(t, 7, 6, 1, -8)) return 14;
+
+    t = base; t = by_value(t);
+    if (!check(t, 7, 6, 1, -8)) return 15;
+
+    /* Two fields in one unit, so a full-unit write is unmissable. */
+    struct U u = {5, 6}; u.x++;
+    if (u.x != 6 || u.y != 6) return 16;
+
+    /* Compound and plain assignment, which always worked -- pinned so a fix
+       to one path cannot regress the other. */
+    t = base; t.b += 1;      if (!check(t, 7, 6, 1, -8)) return 17;
+    t = base; t.b = t.b + 1; if (!check(t, 7, 6, 1, -8)) return 18;
+    t = base; t.b = 6;       if (!check(t, 7, 6, 1, -8)) return 19;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c89_bitfield_increment_leaves_neighbours_alone", code, &[]),
+        0
+    );
+}
+
+/// A zero-width bitfield forces the next member to the next boundary of its
+/// declared type's storage unit (C17 6.7.2.1p12).
+///
+/// The layout code flushed an open bitfield storage unit but never aligned
+/// the offset, so after a plain member -- where no unit is open -- `int :0;`
+/// did nothing at all: `struct { char c; int :0; char d; }` was 2 bytes
+/// rather than 5, disagreeing with every gcc-compiled object.
+///
+/// Every expectation here came from gcc on this source.
+#[test]
+fn c89_zero_width_bitfield_forces_a_boundary() {
+    let code = r#"
+#include <stddef.h>
+
+struct A { char c; int :0; char d; };            /* after a plain member    */
+struct B { int a:3; int :0; int b:5; };          /* after a same-type field */
+struct C { char a:3; int :0; char b:5; };        /* different-type field    */
+struct D { int a:3; int :0; int :0; int b:5; };  /* two in a row            */
+struct E { char c; int :0; };                    /* at the end              */
+struct F { char c; short :0; char d; };          /* a narrower unit         */
+struct G { int :0; char c; };                    /* first, before anything  */
+struct H { int a:3; int :4; int :0; int b:5; };  /* beside an unnamed field */
+struct P { char c; int :0; char d; } __attribute__((packed));
+
+int main(void) {
+    if (sizeof(struct A) != 5) return 1;
+    if (offsetof(struct A, c) != 0) return 2;
+    if (offsetof(struct A, d) != 4) return 3;
+
+    if (sizeof(struct B) != 8) return 4;
+    if (sizeof(struct C) != 5) return 5;
+    if (sizeof(struct D) != 8) return 6;
+
+    /* The boundary still applies with no member after it. */
+    if (sizeof(struct E) != 4) return 7;
+
+    if (sizeof(struct F) != 3) return 8;
+    if (offsetof(struct F, d) != 2) return 9;
+
+    /* Nothing precedes it, so there is no boundary to cross. */
+    if (sizeof(struct G) != 1) return 10;
+    if (offsetof(struct G, c) != 0) return 11;
+
+    if (sizeof(struct H) != 8) return 12;
+
+    /* packed does not suppress the boundary, and neither raises the
+       struct's own alignment -- A is 5 bytes, not 8. */
+    if (sizeof(struct P) != 5) return 13;
+    if (offsetof(struct P, d) != 4) return 14;
+
+    /* The surrounding fields still read and write correctly. */
+    struct B b;
+    b.a = 5;
+    b.b = -7;
+    if (b.a != -3) return 15;
+    if (b.b != -7) return 16;
+
+    struct A a;
+    a.c = 'x';
+    a.d = 'y';
+    if (a.c != 'x') return 17;
+    if (a.d != 'y') return 18;
+
+    struct C c;
+    c.a = 1;
+    c.b = 2;
+    if (c.a != 1) return 19;
+    if (c.b != 2) return 20;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c89_zero_width_bitfield_forces_a_boundary", code, &[]),
+        0
+    );
+}

@@ -22,6 +22,7 @@
 use super::linearize::Linearizer;
 use super::{Instruction, MemoryOrder, Opcode, PseudoId};
 use crate::diag;
+use crate::float::FloatVal;
 use crate::parse::ast::{AssignOp, Expr, ExprKind};
 use crate::types::{TypeId, TypeKind, TypeModifiers};
 
@@ -491,7 +492,7 @@ impl Linearizer<'_> {
             return self.emit_const(bytes as i128, self.types.long_id);
         }
         if self.types.is_float(typ) {
-            return self.emit_fconst(1.0, typ);
+            return self.emit_fconst(FloatVal::from_f64(1.0), typ);
         }
         self.emit_const(1, typ)
     }

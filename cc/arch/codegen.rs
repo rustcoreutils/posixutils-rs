@@ -11,8 +11,9 @@
 
 use crate::arch::lir::{Directive, EmitAsm, LirInst, Symbol};
 use crate::arch::DEFAULT_LIR_BUFFER_CAPACITY;
+use crate::float::FloatVal;
 use crate::ir::{Function, Initializer, Instruction, Module, Opcode};
-use crate::target::Target;
+use crate::target::{Os, Target};
 use crate::types::TypeTable;
 
 // ============================================================================
@@ -126,6 +127,10 @@ pub struct CodeGenBase<I: LirInst> {
     pub last_debug_file: u16,
     /// Whether to emit debug info (.file/.loc directives)
     pub emit_debug: bool,
+    /// Whether the output has to be able to live in a shared object, which is
+    /// what selects the thread-local access model. Set for `-shared` and for
+    /// `-fPIC`; see [`CodeGenBase::use_tls_dynamic`].
+    pub shared_mode: bool,
 }
 
 impl<I: LirInst + EmitAsm> CodeGenBase<I> {
@@ -140,7 +145,39 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             last_debug_line: 0,
             last_debug_file: 0,
             emit_debug: false,
+            shared_mode: false,
         }
+    }
+
+    /// Whether thread-local access must use the dynamic model.
+    ///
+    /// Initial Exec resolves the offset through the GOT at load time, which
+    /// requires the object's thread-locals to fit in the loader's static-TLS
+    /// surplus -- so a library `dlopen`ed later with a large block is rejected.
+    /// Only the dynamic model has no such limit.
+    ///
+    /// `shared_mode` is set for `-shared` and for `-fPIC`, which asks for code
+    /// that can live in a shared object -- the same requirement. It is *not*
+    /// set for `-fPIE` or the PIE default, because a PIE executable still
+    /// resolves its own thread-locals at link time.
+    ///
+    /// Must agree with the condition `ir::tls::expand_dynamic_tls` was given,
+    /// since that pass is what puts the address computation where the register
+    /// allocator can see it.
+    pub fn use_tls_dynamic(&self) -> bool {
+        self.shared_mode && self.target.os == Os::Linux
+    }
+
+    /// Whether a thread-local access must use the Initial Exec model rather
+    /// than Local Exec.
+    ///
+    /// Local Exec fixes the offset from the thread pointer at link time, which
+    /// only holds for the main executable and for a thread-local defined in
+    /// this object. Anything position-independent, and any symbol defined
+    /// elsewhere -- which is what `is_extern` reports -- needs the offset
+    /// loaded from the GOT instead.
+    pub fn use_tls_ie(&self, is_extern: bool) -> bool {
+        self.use_tls_dynamic() || is_extern
     }
 
     /// Push a LIR instruction to the buffer
@@ -297,23 +334,26 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
     /// encoding: half the object went unemitted (while `.size` still claimed
     /// 16, so the next symbol's bytes were read as the tail), and the bits
     /// that were emitted meant a different number in the wider format.
-    fn emit_float_initializer(&mut self, val: f64, size: usize) {
+    fn emit_float_initializer(&mut self, val: FloatVal, size: usize) {
         match size {
             2 => {
                 // IEEE-754 binary16 is the same encoding on both targets; the
                 // two backends carry byte-identical copies of this conversion.
-                let bits = crate::arch::aarch64::f64_to_f16_bits(val);
+                let bits = crate::arch::aarch64::f64_to_f16_bits(val.to_f64());
                 self.push_directive(Directive::Short(bits as i64));
             }
             4 => {
-                let bits = (val as f32).to_bits();
+                let bits = (val.to_f64() as f32).to_bits();
                 self.push_directive(Directive::Long(bits as i64));
             }
             16 => {
+                // The only width where the literal's full precision matters:
+                // both encodings are produced from the exact value rather than
+                // from a double, so `LDBL_MAX` is not already infinity here.
                 let (lo, hi) = match self.target.arch {
-                    crate::target::Arch::Aarch64 => crate::arch::aarch64::f64_to_f128_bits(val),
+                    crate::target::Arch::Aarch64 => val.to_f128_bits(),
                     crate::target::Arch::X86_64 => {
-                        let bytes = crate::arch::x86_64::x87::f64_to_x87_extended(val);
+                        let bytes = val.to_x87_bytes();
                         let mut lo = [0u8; 8];
                         let mut hi = [0u8; 8];
                         lo.copy_from_slice(&bytes[..8]);
@@ -326,7 +366,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             }
             _ => {
                 // double - emit as 64-bit IEEE 754
-                self.push_directive(Directive::Quad(val.to_bits() as i64));
+                self.push_directive(Directive::Quad(val.to_f64().to_bits() as i64));
             }
         }
     }
@@ -465,6 +505,70 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         }
     }
 
+    /// Emit the `.init_array` / `.fini_array` entries for every function
+    /// carrying a `constructor` or `destructor` attribute.
+    ///
+    /// Each entry is a pointer-sized slot holding the function's address, in
+    /// its own section directive: the linker concatenates them, and the C
+    /// runtime walks the resulting array. A function may carry both
+    /// attributes, so it can contribute an entry to each array rather than
+    /// choosing between them.
+    ///
+    /// Entries are emitted in run order: prioritized first, ascending, then
+    /// the unprioritized ones in declaration order. ELF encodes that in the
+    /// section name and the linker sorts for us, but Mach-O has no priority to
+    /// encode -- `__mod_init_func` is run in the order the pointers appear --
+    /// so on that target emission order *is* the ordering, and a priority
+    /// meant nothing until it decided this order. Terminators need no separate
+    /// rule: both formats run them in reverse, so the same array order gives
+    /// the same reversal.
+    pub fn emit_init_arrays(&mut self, functions: &[crate::ir::Function]) {
+        // Pointer alignment, as a power of two; both supported targets are
+        // 64-bit.
+        const PTR_ALIGN_LOG2: u32 = 3;
+
+        // An inline definition provides no external definition (C99 6.7.4p6),
+        // so the body-emitting loops skip it and there is no such symbol to
+        // point at. Naming it here produced an entry that failed to link.
+        let defined = || functions.iter().filter(|f| f.emit);
+
+        // An absent priority runs last, and a stable sort leaves equal
+        // priorities in declaration order.
+        fn ordered(mut v: Vec<(Option<u16>, &str)>) -> Vec<(Option<u16>, &str)> {
+            v.sort_by_key(|(priority, _)| priority.unwrap_or(u16::MAX));
+            v
+        }
+
+        let constructors = ordered(
+            defined()
+                .filter_map(|f| f.constructor.map(|p| (p, f.name.as_str())))
+                .collect(),
+        );
+        let destructors = ordered(
+            defined()
+                .filter_map(|f| f.destructor.map(|p| (p, f.name.as_str())))
+                .collect(),
+        );
+
+        let emitted_any = !constructors.is_empty() || !destructors.is_empty();
+        for (entries, section) in [
+            (constructors, Directive::InitArray as fn(_) -> Directive),
+            (destructors, Directive::FiniArray as fn(_) -> Directive),
+        ] {
+            for (priority, name) in entries {
+                self.push_directive(section(priority));
+                self.push_directive(Directive::Align(PTR_ALIGN_LOG2));
+                self.push_directive(Directive::QuadSym(Symbol::global(name.to_string())));
+            }
+        }
+
+        // Leave the assembler back in .text, as every other section-switching
+        // emitter here does.
+        if emitted_any {
+            self.push_directive(Directive::Text);
+        }
+    }
+
     /// Emit string literals to the rodata section
     pub fn emit_strings(&mut self, strings: &[(String, String)]) {
         if strings.is_empty() {
@@ -489,7 +593,8 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         }
 
         self.push_directive(Directive::Rodata);
-        self.push_directive(Directive::Align(4)); // 4-byte alignment for int
+        // wchar_t is a 4-byte int: two, as a power of two.
+        self.push_directive(Directive::Align(2));
 
         for (label, content) in wide_strings {
             self.push_directive(Directive::local_label(label));
@@ -510,7 +615,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             return;
         }
         self.push_directive(Directive::Rodata);
-        self.push_directive(Directive::Align(2)); // char16_t
+        self.push_directive(Directive::Align(1)); // char16_t: 2 bytes
         for (label, units) in strings {
             self.push_directive(Directive::local_label(label));
             for &u in units {
@@ -527,7 +632,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             return;
         }
         self.push_directive(Directive::Rodata);
-        self.push_directive(Directive::Align(4)); // char32_t
+        self.push_directive(Directive::Align(2)); // char32_t: 4 bytes
         for (label, units) in strings {
             self.push_directive(Directive::local_label(label));
             for &u in units {

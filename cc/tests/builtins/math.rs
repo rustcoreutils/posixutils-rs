@@ -150,3 +150,84 @@ int main(void) {
         0
     );
 }
+
+/// The floating classification builtins agree with gcc at every width.
+///
+/// `__builtin_isnan` and friends are lowered as comparisons rather than bit
+/// tests, which keeps them exact for `long double` and needs no backend work.
+/// They are deliberately not expressed with `fabs`: `__builtin_fabsl` still
+/// narrows a `long double` to a double, so a magnitude test through it would
+/// answer the wrong question at exactly the width that matters most.
+///
+/// Checked against gcc on the same source at -O0 and -O2.
+#[test]
+fn builtins_float_classification_matches_gcc() {
+    let code = r#"
+#include <float.h>
+
+static volatile double dz = 0.0;
+static volatile float  fz = 0.0f;
+
+/* nan, inf, finite, normal -- packed into one integer per case */
+#define BITS(x) ( (__builtin_isnan(x)    ? 8 : 0) \
+                | (__builtin_isinf(x)    ? 4 : 0) \
+                | (__builtin_isfinite(x) ? 2 : 0) \
+                | (__builtin_isnormal(x) ? 1 : 0) )
+
+int main(void)
+{
+    double dn = dz / dz, di = 1.0 / dz, ds = 2.2250738585072014e-308 / 4.0;
+    float  fn = fz / fz, fi = 1.0f / fz, fs = 1.17549435e-38f / 4.0f;
+    long double ln = (long double)dn, li = (long double)di;
+    /* Spelled from <float.h> rather than as a fixed exponent: the smallest
+       normal is 2^-16382 for x87 and binary128 but 2^-1022 where long double
+       is double, and a fixed exponent underflows to zero there -- turning a
+       normal into a zero and testing nothing. */
+    long double ls = LDBL_TRUE_MIN, lmin = LDBL_MIN;
+
+    if (BITS(dn)  != 8) return 1;
+    if (BITS(di)  != 4) return 2;
+    if (BITS(-di) != 4) return 3;
+    if (BITS(0.0) != 2) return 4;
+    if (BITS(ds)  != 2) return 5;
+    if (BITS(1.5) != 3) return 6;
+
+    if (BITS(fn)   != 8) return 7;
+    if (BITS(fi)   != 4) return 8;
+    if (BITS(0.0f) != 2) return 9;
+    if (BITS(fs)   != 2) return 10;
+    if (BITS(1.5f) != 3) return 11;
+
+    /* long double is the width that used to be unreachable: on x87 and
+       binary128 its smallest normal is 2^-16382, which an f64 cannot
+       represent at all. */
+    if (BITS(ln)   != 8) return 12;
+    if (BITS(li)   != 4) return 13;
+    if (BITS(-li)  != 4) return 14;
+    if (BITS(0.0L) != 2) return 15;
+    if (BITS(ls)   != 2) return 16;
+    if (BITS(lmin) != 3) return 17;
+    if (BITS(1.5L) != 3) return 18;
+    if (BITS(-1.5L) != 3) return 19;
+
+    /* isnan must be exactly 1, not merely non-zero: that is the whole
+       difference from glibc's fallback, which answers 65535. */
+    if (__builtin_isnan(ln) != 1) return 20;
+
+    /* fpclassify picks the same class. */
+    if (__builtin_fpclassify(0,1,2,3,4, dn)   != 0) return 30;
+    if (__builtin_fpclassify(0,1,2,3,4, di)   != 1) return 31;
+    if (__builtin_fpclassify(0,1,2,3,4, 1.5)  != 2) return 32;
+    if (__builtin_fpclassify(0,1,2,3,4, ds)   != 3) return 33;
+    if (__builtin_fpclassify(0,1,2,3,4, 0.0)  != 4) return 34;
+    if (__builtin_fpclassify(0,1,2,3,4, ln)   != 0) return 35;
+    if (__builtin_fpclassify(0,1,2,3,4, li)   != 1) return 36;
+    if (__builtin_fpclassify(0,1,2,3,4, 1.5L) != 2) return 37;
+    if (__builtin_fpclassify(0,1,2,3,4, ls)   != 3) return 38;
+    if (__builtin_fpclassify(0,1,2,3,4, 0.0L) != 4) return 39;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("builtins_fp_classify", code, &[]), 0);
+}

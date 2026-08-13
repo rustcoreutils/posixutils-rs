@@ -81,7 +81,7 @@ fn test_octal_literal() {
 fn test_float_literal() {
     let (expr, _types, _strings, _symbols) = parse_expr("3.14").unwrap();
     match expr.kind {
-        ExprKind::FloatLit(v) => assert!((v - 3.14).abs() < 0.001),
+        ExprKind::FloatLit(v) => assert!((v.to_f64() - 3.14).abs() < 0.001),
         _ => panic!("Expected FloatLit"),
     }
 }
@@ -4657,7 +4657,7 @@ fn test_float64_type_decl() {
 fn test_float16_literal_suffix() {
     let (expr, types, _, _) = parse_expr("1.0f16").unwrap();
     match expr.kind {
-        ExprKind::FloatLit(v) => assert!((v - 1.0).abs() < 0.001),
+        ExprKind::FloatLit(v) => assert!((v.to_f64() - 1.0).abs() < 0.001),
         _ => panic!("Expected FloatLit"),
     }
     assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Float16);
@@ -4667,7 +4667,7 @@ fn test_float16_literal_suffix() {
 fn test_float16_literal_suffix_upper() {
     let (expr, types, _, _) = parse_expr("3.14F16").unwrap();
     match expr.kind {
-        ExprKind::FloatLit(v) => assert!((v - 3.14).abs() < 0.001),
+        ExprKind::FloatLit(v) => assert!((v.to_f64() - 3.14).abs() < 0.001),
         _ => panic!("Expected FloatLit"),
     }
     assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Float16);
@@ -4678,7 +4678,7 @@ fn test_float32_literal_suffix() {
     // f32 is alias for float
     let (expr, types, _, _) = parse_expr("2.5f32").unwrap();
     match expr.kind {
-        ExprKind::FloatLit(v) => assert!((v - 2.5).abs() < 0.001),
+        ExprKind::FloatLit(v) => assert!((v.to_f64() - 2.5).abs() < 0.001),
         _ => panic!("Expected FloatLit"),
     }
     assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Float);
@@ -4689,7 +4689,7 @@ fn test_float64_literal_suffix() {
     // f64 is alias for double
     let (expr, types, _, _) = parse_expr("2.5f64").unwrap();
     match expr.kind {
-        ExprKind::FloatLit(v) => assert!((v - 2.5).abs() < 0.001),
+        ExprKind::FloatLit(v) => assert!((v.to_f64() - 2.5).abs() < 0.001),
         _ => panic!("Expected FloatLit"),
     }
     assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Double);
@@ -4700,7 +4700,7 @@ fn test_int_with_float16_suffix() {
     // Integer with f16 suffix becomes float literal
     let (expr, types, _, _) = parse_expr("42f16").unwrap();
     match expr.kind {
-        ExprKind::FloatLit(v) => assert!((v - 42.0).abs() < 0.001),
+        ExprKind::FloatLit(v) => assert!((v.to_f64() - 42.0).abs() < 0.001),
         _ => panic!("Expected FloatLit"),
     }
     assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Float16);
@@ -4909,6 +4909,86 @@ fn test_hex_float_with_exponent() {
     let (expr, types, _, _) = parse_expr("0x1.0p5").unwrap();
     assert!(matches!(expr.kind, ExprKind::FloatLit(_)));
     assert_eq!(expr.typ, Some(types.double_id));
+}
+
+/// A hex float names a binary value exactly, so a long significand must not be
+/// mangled by the accumulator that reads it.
+///
+/// The significand was read into a `u64` and divided by `1u64 << (4 * digits)`.
+/// At 16 fraction digits that shift is 64, which wraps to a shift of 0 in
+/// release builds -- so `0x1.0000000000000002p0` came out as **3.0** instead of
+/// a value just above 1. Wrong by a factor of three, silently, in a C99
+/// feature the conformance matrix listed as passing.
+#[test]
+fn test_hex_float_long_significand_is_not_mangled() {
+    // 16 fraction digits: exactly the width that used to wrap.
+    let (expr, _types, _, _) = parse_expr("0x1.0000000000000002p+0").unwrap();
+    match expr.kind {
+        ExprKind::FloatLit(v) => {
+            assert!(
+                (v.to_f64() - 1.0).abs() < 1e-15,
+                "0x1.0000000000000002p0 is just above 1.0, got {v}"
+            );
+        }
+        other => panic!("expected FloatLit, got {other:?}"),
+    }
+
+    // 31 significand digits, all set: 2^124 - 1, which rounds to 2^124 at
+    // double precision. Exercises a significand far wider than the mantissa.
+    let (expr, _types, _, _) = parse_expr("0xfffffffffffffffffffffffffffffffp0").unwrap();
+    match expr.kind {
+        ExprKind::FloatLit(v) => assert_eq!(v.to_f64(), f64::powi(2.0, 124), "got {v}"),
+        other => panic!("expected FloatLit, got {other:?}"),
+    }
+}
+
+/// Exponents beyond double's range must not be reached through an infinity.
+#[test]
+fn test_hex_float_extreme_exponents() {
+    for (src, want) in [
+        ("0x1p-1074", f64::from_bits(1)), // smallest subnormal
+        ("0x1p-1080", 0.0),               // underflows to zero
+        ("0x1p+2000", f64::INFINITY),     // overflows to infinity
+    ] {
+        let (expr, _types, _, _) = parse_expr(src).unwrap();
+        match expr.kind {
+            ExprKind::FloatLit(v) => assert_eq!(v.to_f64(), want, "{src}"),
+            other => panic!("expected FloatLit for {src}, got {other:?}"),
+        }
+    }
+}
+
+/// C17 6.7.6.1: `_Atomic` is a type qualifier, so it belongs in the qualifier
+/// run after a `*` exactly like `const`.
+///
+/// Three copies of that loop had drifted apart and only the one in
+/// `parse_declarator` listed `_Atomic`, so `int *_Atomic p;` parsed inside a
+/// function and failed at file scope -- and worse, `int *_Atomic;` was
+/// *accepted*, because `_Atomic` fell through to the name position and became
+/// the identifier. Both file-scope paths (`parse_external_decl` and
+/// `parse_function_def`) now share one helper with the declarator's.
+#[test]
+fn test_atomic_is_a_pointer_qualifier() {
+    for src in [
+        "int *_Atomic p;",
+        "int *const _Atomic p;",
+        "int *_Atomic const p;",
+        "int *restrict _Atomic p;",
+        "static int *_Atomic p;",
+    ] {
+        let parsed = parse_decl(src);
+        assert!(parsed.is_ok(), "{src} should parse: {:?}", parsed.err());
+    }
+}
+
+/// The qualifier must not be usable as the declared name.
+#[test]
+fn test_atomic_is_not_an_identifier() {
+    assert!(
+        parse_decl("int *_Atomic;").is_err(),
+        "`int *_Atomic;` names nothing and must be rejected, not treated as a \
+         declaration of a variable called _Atomic"
+    );
 }
 
 // ========================================================================

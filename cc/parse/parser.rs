@@ -23,6 +23,7 @@ use crate::types::{
     CompositeType, EnumConstant, StructMember, Type, TypeId, TypeKind, TypeModifiers, TypeTable,
 };
 use gettextrs::gettext;
+use std::collections::BTreeMap;
 use std::fmt;
 
 const DEFAULT_MEMBER_CAPACITY: usize = 16;
@@ -59,8 +60,163 @@ impl std::error::Error for ParseError {}
 
 pub type ParseResult<T> = Result<T, ParseError>;
 
-/// Raw parameter info: (name, type) - name is None for unnamed params
-type RawParam = (Option<StringId>, TypeId);
+/// The type specifiers seen while parsing one declaration specifier list.
+///
+/// C17 6.7.2p2 does not let a declaration name a type by accumulation: the
+/// specifiers must together be one of a fixed list of combinations. The
+/// specifier loop only tracked the resulting kind, each keyword overwriting
+/// the last, so an impossible combination named whichever type came last --
+/// `float double x;` was a `double`, `void int y;` an object of type void with
+/// a size of 4, and `long long long z;` a `long long`. All three were accepted
+/// silently, which makes this a wrong program rather than the missing
+/// diagnostic it was first filed as.
+///
+/// `short`, `long`, `signed` and `unsigned` are counted rather than recorded
+/// as data types, because the valid combinations pair them with `int`, and
+/// `long` with `double` -- they qualify a data type instead of naming one.
+#[derive(Default)]
+struct SpecifierTally {
+    /// Data-type specifiers, in source order, under their canonical spelling.
+    /// More than one is always a constraint violation.
+    data_types: Vec<(&'static str, Position)>,
+    short_count: u32,
+    long_count: u32,
+    signed_count: u32,
+    unsigned_count: u32,
+    /// Where the most recent `short`/`long`/`signed`/`unsigned` appeared, for
+    /// the diagnostic that reports it against an incompatible data type.
+    last_size: Option<(&'static str, Position)>,
+    last_sign: Option<(&'static str, Position)>,
+}
+
+impl SpecifierTally {
+    /// Whether an *alias* type specifier appearing now is the name of what is
+    /// being declared rather than a second data type.
+    ///
+    /// A C library may define one of these as a typedef of its own: glibc's
+    /// <bits/floatn-common.h> has `typedef float _Float32;` whenever the
+    /// compiler does not claim native support. Once a data type has been
+    /// given, `_Float32` is the declarator -- the same rule `typeof` needs --
+    /// and without it that typedef is two data types and an error.
+    fn alias_is_declarator_name(&self) -> bool {
+        !self.data_types.is_empty()
+    }
+
+    fn note_data_type(&mut self, name: &'static str, pos: Position) {
+        self.data_types.push((name, pos));
+    }
+
+    fn note_size(&mut self, name: &'static str, pos: Position) {
+        self.last_size = Some((name, pos));
+        if name == "short" {
+            self.short_count += 1;
+        } else {
+            self.long_count += 1;
+        }
+    }
+
+    fn note_sign(&mut self, name: &'static str, pos: Position) {
+        self.last_sign = Some((name, pos));
+        if name == "signed" {
+            self.signed_count += 1;
+        } else {
+            self.unsigned_count += 1;
+        }
+    }
+
+    /// Report every way this specifier list fails C17 6.7.2p2.
+    ///
+    /// Reporting rather than returning an error: a constraint violation needs a
+    /// diagnostic (C17 5.1.1.3), and the parser recovers with the type it had
+    /// already built, so one bad declaration does not cascade.
+    fn check(&self) {
+        if let Some((second, pos)) = self.data_types.get(1) {
+            diag::error_args(
+                *pos,
+                "two or more data types in declaration specifiers ('{0}' and '{1}')",
+                &[self.data_types[0].0, second],
+            );
+            return;
+        }
+
+        if self.signed_count > 0 && self.unsigned_count > 0 {
+            if let Some((_, pos)) = self.last_sign {
+                diag::error(
+                    pos,
+                    "both 'signed' and 'unsigned' in declaration specifiers",
+                );
+            }
+        } else if self.signed_count > 1 || self.unsigned_count > 1 {
+            if let Some((name, pos)) = self.last_sign {
+                diag::error_args(pos, "duplicate '{0}'", &[name]);
+            }
+        }
+
+        if self.short_count > 0 && self.long_count > 0 {
+            if let Some((_, pos)) = self.last_size {
+                diag::error(pos, "both 'short' and 'long' in declaration specifiers");
+            }
+        } else if self.short_count > 1 {
+            if let Some((_, pos)) = self.last_size {
+                diag::error(pos, "duplicate 'short'");
+            }
+        } else if self.long_count > 2 {
+            if let Some((_, pos)) = self.last_size {
+                diag::error(pos, "'long long long' is too long for c17");
+            }
+        }
+
+        let data_type = self.data_types.first().map(|(name, _)| *name);
+
+        // `short` and `long` pair with `int`; `long` alone also pairs with
+        // `double`. Nothing else.
+        let size_ok = match data_type {
+            None | Some("int") => true,
+            Some("double") => self.short_count == 0 && self.long_count == 1,
+            _ => false,
+        };
+        if !size_ok {
+            if let (Some((size, pos)), Some(data)) = (self.last_size, data_type) {
+                diag::error_args(
+                    pos,
+                    "both '{0}' and '{1}' in declaration specifiers",
+                    &[size, data],
+                );
+            }
+        }
+
+        // `signed` and `unsigned` pair with the integer types only.
+        let sign_ok = matches!(
+            data_type,
+            None | Some("int") | Some("char") | Some("__int128")
+        );
+        if !sign_ok {
+            if let (Some((sign, pos)), Some(data)) = (self.last_sign, data_type) {
+                diag::error_args(
+                    pos,
+                    "both '{0}' and '{1}' in declaration specifiers",
+                    &[sign, data],
+                );
+            }
+        }
+    }
+}
+
+/// Raw parameter info gathered while parsing a parameter list.
+#[derive(Debug, Clone)]
+pub(crate) struct RawParam {
+    /// Parameter name; None for an unnamed parameter such as `void f(int)`.
+    pub(crate) name: Option<StringId>,
+    /// Parameter type, already adjusted from array/function to pointer.
+    pub(crate) typ: TypeId,
+    /// Run-time size expressions for a variably-modified element type; see
+    /// [`Parameter::vm_dims`](crate::parse::ast::Parameter::vm_dims).
+    pub(crate) vm_dims: Vec<Expr>,
+    /// Symbol created while parsing the parameter list. `vm_dims` resolves
+    /// against it, so the function scope re-declares this very symbol instead
+    /// of a fresh one.
+    pub(crate) symbol: Option<SymbolId>,
+}
 
 /// Result of parsing a declarator: (name, type, VLA expressions, raw function parameters)
 type DeclaratorResult = (StringId, TypeId, Vec<Expr>, Option<Vec<RawParam>>);
@@ -192,6 +348,61 @@ impl AttributeList {
         }
     }
 
+    /// Whether `__attribute__((noinline))` is present.
+    pub fn has_noinline(&self) -> bool {
+        self.has_attr("noinline")
+    }
+
+    /// Whether `__attribute__((always_inline))` is present.
+    pub fn has_always_inline(&self) -> bool {
+        self.has_attr("always_inline")
+    }
+
+    /// Whether an attribute is present, in either spelling.
+    fn has_attr(&self, name: &str) -> bool {
+        let underscored = format!("__{name}__");
+        self.attrs
+            .iter()
+            .any(|a| a.name == name || a.name == underscored)
+    }
+
+    /// Look up an attribute in both its plain and `__underscored__` spelling,
+    /// returning its optional integer argument. The result distinguishes
+    /// "absent" (`None`) from "present without a priority" (`Some(None)`).
+    fn init_priority(&self, name: &str) -> Option<Option<u16>> {
+        let underscored = format!("__{name}__");
+        let attr = self
+            .attrs
+            .iter()
+            .find(|a| a.name == name || a.name == underscored)?;
+        match attr.args.first() {
+            Some(AttributeArg::Int(n)) => Some(Some(*n as u16)),
+            _ => Some(None),
+        }
+    }
+
+    /// The `constructor` attribute and its optional priority.
+    pub fn constructor_priority(&self) -> Option<Option<u16>> {
+        self.init_priority("constructor")
+    }
+
+    /// The `destructor` attribute and its optional priority.
+    pub fn destructor_priority(&self) -> Option<Option<u16>> {
+        self.init_priority("destructor")
+    }
+
+    /// Collect the attributes that affect how a function is emitted.
+    pub fn function_attrs(&self) -> crate::parse::ast::FunctionAttrs {
+        crate::parse::ast::FunctionAttrs {
+            noinline: self.has_noinline(),
+            always_inline: self.has_always_inline(),
+            constructor: self.constructor_priority(),
+            destructor: self.destructor_priority(),
+            gnu_inline: self.has_attr("gnu_inline"),
+            artificial: self.has_attr("artificial"),
+        }
+    }
+
     /// Get alignment from __attribute__((aligned(N))) or __attribute__((aligned))
     /// Returns Some(alignment) if found, None otherwise.
     /// Per GCC: aligned with no args defaults to 16 ("max useful alignment").
@@ -249,6 +460,41 @@ pub struct Parser<'a> {
     /// Explicit alignment from _Alignas in current declaration
     /// Cleared after each declaration is parsed.
     pending_alignas: Option<u32>,
+    /// Emission-affecting function attributes seen so far in the declaration
+    /// being parsed. Accumulated like `pending_alignas` because a
+    /// `constructor` / `noinline` attribute may appear before the declaration
+    /// specifiers, between the type and the declarator, or after the
+    /// parameter list. Cleared at the start of each external declaration.
+    pending_fn_attrs: crate::parse::ast::FunctionAttrs,
+    /// Every function attribute seen for a given name anywhere in the
+    /// translation unit.
+    ///
+    /// GCC applies `constructor` / `destructor` / `noinline` to the function
+    /// however it was declared, so writing the attribute on a prototype and
+    /// leaving the definition bare -- `static void f(void)
+    /// __attribute__((constructor));` followed by `static void f(void) {}` --
+    /// still makes `f` a constructor. Reading the definition's own attributes
+    /// alone would silently drop it.
+    declared_fn_attrs: BTreeMap<StringId, crate::parse::ast::FunctionAttrs>,
+    /// The GCC asm label seen in the declaration being parsed, awaiting the
+    /// declarator it renames. Accumulated like `pending_fn_attrs` because
+    /// `__asm__("...")` can appear before or after an `__attribute__` --
+    /// glibc's `__REDIRECT_NTH` writes it before `__THROW`.
+    pending_asm_label: Option<String>,
+    /// Every asm label seen for a given name, so that a label written on a
+    /// prototype reaches the definition parsed later. GCC requires the label
+    /// to appear on the first declaration, but it does not require the
+    /// definition to repeat it.
+    declared_asm_labels: BTreeMap<StringId, String>,
+    /// Names for which some file-scope declaration carried `extern`.
+    ///
+    /// Kept beside the symbol table rather than only on the symbol because a
+    /// definition declares a *fresh* symbol that shadows the earlier
+    /// declaration's, and C99 6.7.4p6 asks about the whole translation unit.
+    declared_extern_fns: std::collections::BTreeSet<StringId>,
+    /// Names for which some file-scope declaration omitted `inline`.
+    /// See [`crate::symbol::Symbol::has_non_inline_decl`].
+    declared_non_inline_fns: std::collections::BTreeSet<StringId>,
     /// Set by `parse_type_specifier`: whether the specifier list actually
     /// named a type, rather than defaulting to `int`.
     ///
@@ -276,6 +522,12 @@ impl<'a> Parser<'a> {
             types,
             pos: 0,
             pending_alignas: None,
+            pending_fn_attrs: Default::default(),
+            declared_fn_attrs: BTreeMap::new(),
+            pending_asm_label: None,
+            declared_asm_labels: BTreeMap::new(),
+            declared_extern_fns: std::collections::BTreeSet::new(),
+            declared_non_inline_fns: std::collections::BTreeSet::new(),
             saw_explicit_type: true,
         }
     }
@@ -294,6 +546,17 @@ impl<'a> Parser<'a> {
     /// Peek at the current token type
     pub(crate) fn peek(&self) -> TokenType {
         self.current().typ
+    }
+
+    /// Whether the token *after* the current one is `(`.
+    ///
+    /// Used to tell a keyword being applied from the same word being used as
+    /// an ordinary identifier.
+    fn next_token_is_open_paren(&self) -> bool {
+        match self.tokens.get(self.pos + 1) {
+            Some(t) => matches!(t.value, TokenValue::Special(v) if v == b'(' as u32),
+            None => false,
+        }
     }
 
     /// Peek at the current token's special value (if it's a Special token)
@@ -378,6 +641,31 @@ impl<'a> Parser<'a> {
     #[inline]
     pub(crate) fn str(&self, id: StringId) -> &str {
         self.idents.get(id)
+    }
+
+    /// Consume the identifier naming a declarator, rejecting keywords.
+    ///
+    /// Separate from [`Parser::expect_identifier`], which has eighteen callers
+    /// covering labels, struct tags, member references and `goto` targets --
+    /// all of which live in their own namespaces and may legitimately be
+    /// spelled with a word that is reserved here. Only a *declarator* name is
+    /// constrained, so only the declarator sites use this.
+    fn expect_declarator_name(&mut self) -> ParseResult<StringId> {
+        if self.peek() == TokenType::Ident {
+            if let Some(id) = self.get_ident_id(self.current()) {
+                if crate::kw::has_tag(id, crate::kw::RESERVED_NAME) {
+                    let pos = self.current_pos();
+                    return Err(ParseError::new(
+                        format!(
+                            "'{}' is a keyword and cannot be used as a name",
+                            self.str(id)
+                        ),
+                        pos,
+                    ));
+                }
+            }
+        }
+        self.expect_identifier()
     }
 
     /// Check if current position (after consuming '(') indicates a grouped declarator.
@@ -673,9 +961,19 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Skip __asm("...") or __asm__("...") declarations (GCC extension for symbol aliasing)
-    /// Used in declarations like: FILE *fopen(...) __asm("_fopen$DARWIN_EXTSN");
-    fn skip_asm(&mut self) {
+    /// Parse `__asm("name")` / `__asm__("name")` on a declaration: a GCC asm
+    /// label, which renames the symbol the declaration refers to.
+    ///
+    /// `extern int myfn(int) __asm__("realfn");` still declares `myfn` for the
+    /// source to use, but every emitted reference names `realfn`. The label is
+    /// left in [`Parser::pending_asm_label`] for the declarator to claim.
+    ///
+    /// The label is a string *sequence*, not a single literal: glibc spells it
+    /// `__ASMNAME(cname)`, which expands to
+    /// `__STRING(__USER_LABEL_PREFIX__) cname` — two adjacent literals, `""`
+    /// and `"stpncpy"` on ELF. They concatenate as in any other C string
+    /// context.
+    fn parse_asm_label(&mut self) {
         while self.is_asm_keyword() {
             self.advance(); // consume __asm/__asm__
 
@@ -685,16 +983,74 @@ impl<'a> Parser<'a> {
             }
             self.advance(); // consume '('
 
-            // Skip contents until matching ')'
+            // Collect the string literals, and skip anything else so that a
+            // shape we do not model still parses as it used to.
+            let mut label = String::new();
             let mut depth = 1;
             while depth > 0 && !self.is_eof() {
                 if self.is_special(b'(') {
                     depth += 1;
                 } else if self.is_special(b')') {
                     depth -= 1;
+                    if depth == 0 {
+                        self.advance();
+                        break;
+                    }
+                } else if depth == 1 {
+                    if let TokenValue::String(s) = &self.current().value {
+                        label.push_str(s);
+                    }
                 }
                 self.advance();
             }
+
+            // An empty label is not a rename. `__asm__("")` would ask for a
+            // nameless symbol, which is not something GCC accepts either.
+            if !label.is_empty() {
+                self.pending_asm_label = Some(label);
+            }
+        }
+    }
+
+    /// Record, on whichever symbol is now bound to `name`, the facts about it
+    /// that accumulate across every declaration in the translation unit.
+    ///
+    /// Two of them so far -- the GCC asm label and whether anything said
+    /// `extern` -- and they share this helper because they share the problem
+    /// that makes them awkward: a redeclaration, and in particular a
+    /// definition, binds a *fresh* symbol that would not otherwise inherit
+    /// what earlier declarations established, and the declaration that settles
+    /// the question is allowed to come afterwards.
+    ///
+    /// Consuming the pending asm label means a declaration list gives each
+    /// declarator only the label written on it: in `int a __asm__("x"), b;`
+    /// only `a` is renamed.
+    fn settle_declaration_facts(&mut self, name: StringId, storage_class: TypeModifiers) {
+        // C99 6.7.4p6 asks whether *any* declaration of this name says
+        // `extern`, including ones not yet parsed, so accumulate rather than
+        // overwrite. See `Symbol::has_extern_decl`.
+        if storage_class.contains(TypeModifiers::EXTERN) {
+            self.declared_extern_fns.insert(name);
+        }
+        if !storage_class.contains(TypeModifiers::INLINE) {
+            self.declared_non_inline_fns.insert(name);
+        }
+        if let Some(id) = self.symbols.lookup_id(name, Namespace::Ordinary) {
+            let sym = self.symbols.get_mut(id);
+            sym.has_extern_decl |= self.declared_extern_fns.contains(&name);
+            sym.has_non_inline_decl |= self.declared_non_inline_fns.contains(&name);
+        }
+
+        let label = match self.pending_asm_label.take() {
+            Some(label) => {
+                self.declared_asm_labels.insert(name, label.clone());
+                Some(label)
+            }
+            None => self.declared_asm_labels.get(&name).cloned(),
+        };
+        if let (Some(label), Some(id)) = (label, self.symbols.lookup_id(name, Namespace::Ordinary))
+        {
+            self.symbols.get_mut(id).asm_label = Some(label);
         }
     }
 
@@ -938,8 +1294,10 @@ impl<'a> Parser<'a> {
             if self.is_attribute_keyword() {
                 let attrs = self.parse_attributes();
                 self.apply_attribute_alignment(&attrs);
+                let fn_attrs = attrs.function_attrs();
+                self.pending_fn_attrs.merge(&fn_attrs);
             } else if self.is_asm_keyword() {
-                self.skip_asm();
+                self.parse_asm_label();
             } else if self.is_nullability_qualifier() {
                 self.advance();
             } else {
@@ -1691,6 +2049,8 @@ impl Parser<'_> {
     /// Parse a type specifier
     /// Parse a type specifier, reporting whether one was actually present.
     ///
+    /// See [`SpecifierTally`] for the C17 6.7.2p2 combination check this makes.
+    ///
     /// The flag has to be written on *every* path out, including the early
     /// returns for struct/union/enum/typeof. Leaving a stale value behind is
     /// invisible until the next declaration inherits it: a K&R identifier list
@@ -1704,6 +2064,12 @@ impl Parser<'_> {
         // Track typedef type separately - we continue parsing after a typedef
         // to collect trailing qualifiers like "z_word_t const"
         let mut typedef_base: Option<TypeId> = None;
+        // C17 6.7.2p2 admits only a fixed list of specifier combinations. The
+        // loop below merely overwrites `base_kind`, so without a tally
+        // `float double x;` silently became a `double` and `void int y;` an
+        // object of type void with a size -- accepted, and wrong, rather than
+        // diagnosed. Recorded here and checked once the list is complete.
+        let mut tally = SpecifierTally::default();
 
         // Skip any leading __attribute__
         self.skip_extensions();
@@ -1764,10 +2130,12 @@ impl Parser<'_> {
                     modifiers |= TypeModifiers::NORETURN;
                 }
                 crate::kw::SIGNED => {
+                    tally.note_sign("signed", self.current_pos());
                     self.advance();
                     modifiers |= TypeModifiers::SIGNED;
                 }
                 crate::kw::UNSIGNED => {
+                    tally.note_sign("unsigned", self.current_pos());
                     self.advance();
                     modifiers |= TypeModifiers::UNSIGNED;
                 }
@@ -1854,6 +2222,7 @@ impl Parser<'_> {
                     }
                 }
                 crate::kw::SHORT => {
+                    tally.note_size("short", self.current_pos());
                     self.advance();
                     modifiers |= TypeModifiers::SHORT;
                     if base_kind.is_none() {
@@ -1861,6 +2230,7 @@ impl Parser<'_> {
                     }
                 }
                 crate::kw::LONG => {
+                    tally.note_size("long", self.current_pos());
                     self.advance();
                     if modifiers.contains(TypeModifiers::LONG) {
                         modifiers |= TypeModifiers::LONGLONG;
@@ -1876,14 +2246,17 @@ impl Parser<'_> {
                     }
                 }
                 crate::kw::VOID => {
+                    tally.note_data_type("void", self.current_pos());
                     self.advance();
                     base_kind = Some(TypeKind::Void);
                 }
                 crate::kw::CHAR => {
+                    tally.note_data_type("char", self.current_pos());
                     self.advance();
                     base_kind = Some(TypeKind::Char);
                 }
                 crate::kw::INT => {
+                    tally.note_data_type("int", self.current_pos());
                     self.advance();
                     if base_kind.is_none()
                         || !matches!(
@@ -1895,10 +2268,12 @@ impl Parser<'_> {
                     }
                 }
                 crate::kw::FLOAT => {
+                    tally.note_data_type("float", self.current_pos());
                     self.advance();
                     base_kind = Some(TypeKind::Float);
                 }
                 crate::kw::DOUBLE => {
+                    tally.note_data_type("double", self.current_pos());
                     self.advance();
                     // Handle long double
                     if modifiers.contains(TypeModifiers::LONG) {
@@ -1908,41 +2283,73 @@ impl Parser<'_> {
                     }
                 }
                 crate::kw::FLOAT16 => {
+                    if tally.alias_is_declarator_name() {
+                        break;
+                    }
+                    tally.note_data_type("_Float16", self.current_pos());
                     self.advance();
                     base_kind = Some(TypeKind::Float16);
                 }
                 crate::kw::FLOAT32 => {
                     // _Float32 is an alias for float (TS 18661-3 / C23)
+                    if tally.alias_is_declarator_name() {
+                        break;
+                    }
+                    tally.note_data_type("float", self.current_pos());
                     self.advance();
                     base_kind = Some(TypeKind::Float);
                 }
                 crate::kw::FLOAT64 => {
                     // _Float64 is an alias for double (TS 18661-3 / C23)
+                    if tally.alias_is_declarator_name() {
+                        break;
+                    }
+                    tally.note_data_type("double", self.current_pos());
                     self.advance();
                     base_kind = Some(TypeKind::Double);
                 }
                 crate::kw::BOOL => {
+                    tally.note_data_type("_Bool", self.current_pos());
                     self.advance();
                     base_kind = Some(TypeKind::Bool);
                 }
                 crate::kw::INT128 => {
+                    tally.note_data_type("__int128", self.current_pos());
                     self.advance();
                     base_kind = Some(TypeKind::Int128);
                 }
                 crate::kw::INT128_T => {
+                    if tally.alias_is_declarator_name() {
+                        break;
+                    }
+                    tally.note_data_type("__int128", self.current_pos());
                     self.advance();
                     base_kind = Some(TypeKind::Int128);
                 }
                 crate::kw::UINT128_T => {
+                    if tally.alias_is_declarator_name() {
+                        break;
+                    }
+                    tally.note_data_type("__int128", self.current_pos());
                     self.advance();
                     modifiers |= TypeModifiers::UNSIGNED;
                     base_kind = Some(TypeKind::Int128);
                 }
                 crate::kw::BUILTIN_VA_LIST => {
+                    tally.note_data_type("__builtin_va_list", self.current_pos());
                     self.advance();
                     base_kind = Some(TypeKind::VaList);
                 }
                 crate::kw::TYPEOF | crate::kw::GNU_TYPEOF | crate::kw::GNU_TYPEOF2 => {
+                    // `typeof` always takes a parenthesized operand, so
+                    // without one this is not a type specifier -- it is the
+                    // declarator's name. gcc accepts `int typeof;` in C17,
+                    // because `typeof` is a GNU extension rather than a C17
+                    // keyword; consuming it here and then demanding `(` made
+                    // c17 reject the declaration outright.
+                    if !self.next_token_is_open_paren() {
+                        break;
+                    }
                     self.advance(); // consume typeof
                     self.expect_special(b'(')?;
 
@@ -1977,6 +2384,8 @@ impl Parser<'_> {
                     ));
                 }
                 crate::kw::ENUM => {
+                    tally.note_data_type("enum", self.current_pos());
+                    tally.check();
                     let mut enum_type = self.parse_enum_specifier()?;
                     // Consume trailing qualifiers (e.g., "enum foo const")
                     let trailing_mods = self.consume_type_qualifiers();
@@ -1985,6 +2394,8 @@ impl Parser<'_> {
                     return Ok((enum_type, true));
                 }
                 crate::kw::STRUCT => {
+                    tally.note_data_type("struct", self.current_pos());
+                    tally.check();
                     let mut struct_type = self.parse_struct_or_union_specifier(false)?;
                     // Consume trailing qualifiers (e.g., "struct foo const")
                     let trailing_mods = self.consume_type_qualifiers();
@@ -1992,6 +2403,8 @@ impl Parser<'_> {
                     return Ok((struct_type, true));
                 }
                 crate::kw::UNION => {
+                    tally.note_data_type("union", self.current_pos());
+                    tally.check();
                     let mut union_type = self.parse_struct_or_union_specifier(true)?;
                     // Consume trailing qualifiers (e.g., "union foo const")
                     let trailing_mods = self.consume_type_qualifiers();
@@ -2014,6 +2427,8 @@ impl Parser<'_> {
                 }
             }
         }
+
+        tally.check();
 
         // If we parsed a typedef, return that with any trailing modifiers applied
         if let Some(typedef_type_id) = typedef_base {
@@ -2542,6 +2957,33 @@ impl Parser<'_> {
         }
     }
 
+    /// Consume the type-qualifier run after a `*` in a declarator.
+    ///
+    /// C17 6.7.6.1 lets any type qualifier appear there, `_Atomic` included:
+    /// `int *_Atomic p;` declares an atomic pointer to int. Three copies of
+    /// this loop had drifted apart and only the one in `parse_declarator`
+    /// listed `_Atomic`, so the same declaration parsed inside a function and
+    /// failed at file scope -- where `_Atomic` fell through to the name
+    /// position and was taken as the identifier instead.
+    fn parse_pointer_qualifiers(&mut self) -> TypeModifiers {
+        let mut modifiers = TypeModifiers::empty();
+        while self.peek() == TokenType::Ident {
+            let Some(name_id) = self.get_ident_id(self.current()) else {
+                break;
+            };
+            match name_id {
+                crate::kw::CONST => modifiers |= TypeModifiers::CONST,
+                crate::kw::VOLATILE => modifiers |= TypeModifiers::VOLATILE,
+                crate::kw::RESTRICT => modifiers |= TypeModifiers::RESTRICT,
+                crate::kw::ATOMIC => modifiers |= TypeModifiers::ATOMIC,
+                _ if super::is_nullability_qualifier(name_id) => {}
+                _ => break,
+            }
+            self.advance();
+        }
+        modifiers
+    }
+
     /// Parse a declarator (name and type modifiers)
     ///
     /// C declarators are parsed "inside-out". For example, `int (*p)[3]`:
@@ -2559,35 +3001,7 @@ impl Parser<'_> {
             self.advance();
             let mut ptr_modifiers = TypeModifiers::empty();
 
-            // Parse pointer qualifiers (const, volatile, restrict, _Atomic, nullability)
-            while self.peek() == TokenType::Ident {
-                if let Some(name_id) = self.get_ident_id(self.current()) {
-                    match name_id {
-                        crate::kw::CONST => {
-                            self.advance();
-                            ptr_modifiers |= TypeModifiers::CONST;
-                        }
-                        crate::kw::VOLATILE => {
-                            self.advance();
-                            ptr_modifiers |= TypeModifiers::VOLATILE;
-                        }
-                        crate::kw::RESTRICT => {
-                            self.advance();
-                            ptr_modifiers |= TypeModifiers::RESTRICT;
-                        }
-                        crate::kw::ATOMIC => {
-                            self.advance();
-                            ptr_modifiers |= TypeModifiers::ATOMIC;
-                        }
-                        _ if super::is_nullability_qualifier(name_id) => {
-                            self.advance();
-                        }
-                        _ => break,
-                    }
-                } else {
-                    break;
-                }
-            }
+            ptr_modifiers |= self.parse_pointer_qualifiers();
             pointer_modifiers.push(ptr_modifiers);
         }
 
@@ -2623,13 +3037,13 @@ impl Parser<'_> {
             } else {
                 // Not a grouped declarator, restore position
                 self.pos = saved_pos;
-                (self.expect_identifier()?, None, None)
+                (self.expect_declarator_name()?, None, None)
             }
         } else {
             // Get the name directly, or use empty for abstract declarators
             // Abstract declarators have no name: void (*)(int) - the * has no identifier
             if self.peek() == TokenType::Ident {
-                (self.expect_identifier()?, None, None)
+                (self.expect_declarator_name()?, None, None)
             } else if self.is_special(b')')
                 || self.is_special(b'[')
                 || self.is_special(b'(')
@@ -2638,7 +3052,7 @@ impl Parser<'_> {
                 // No identifier - abstract declarator (e.g., void (*)(int), const char * restrict)
                 (StringId::EMPTY, None, None)
             } else {
-                (self.expect_identifier()?, None, None)
+                (self.expect_declarator_name()?, None, None)
             }
         };
 
@@ -2654,10 +3068,14 @@ impl Parser<'_> {
             while self.peek() == TokenType::Ident {
                 if let Some(name_id) = self.get_ident_id(self.current()) {
                     match name_id {
+                        // C17 6.7.6.2: the array declarator of a parameter
+                        // takes a type-qualifier list, which includes
+                        // `_Atomic`, and optionally `static`.
                         crate::kw::STATIC
                         | crate::kw::CONST
                         | crate::kw::VOLATILE
-                        | crate::kw::RESTRICT => {
+                        | crate::kw::RESTRICT
+                        | crate::kw::ATOMIC => {
                             self.advance();
                         }
                         _ => break,
@@ -2717,7 +3135,7 @@ impl Parser<'_> {
                 self.advance();
                 let (raw_params, variadic) = self.parse_parameter_list()?;
                 self.expect_special(b')')?;
-                let type_ids: Vec<TypeId> = raw_params.iter().map(|(_, typ)| *typ).collect();
+                let type_ids: Vec<TypeId> = raw_params.iter().map(|p| p.typ).collect();
                 (Some((type_ids, variadic)), Some(raw_params))
             } else {
                 (None, None)
@@ -2914,31 +3332,7 @@ impl Parser<'_> {
             self.advance();
             let mut ptr_modifiers = TypeModifiers::empty();
 
-            // Parse pointer qualifiers
-            while self.peek() == TokenType::Ident {
-                if let Some(name_id) = self.get_ident_id(self.current()) {
-                    match name_id {
-                        crate::kw::CONST => {
-                            self.advance();
-                            ptr_modifiers |= TypeModifiers::CONST;
-                        }
-                        crate::kw::VOLATILE => {
-                            self.advance();
-                            ptr_modifiers |= TypeModifiers::VOLATILE;
-                        }
-                        crate::kw::RESTRICT => {
-                            self.advance();
-                            ptr_modifiers |= TypeModifiers::RESTRICT;
-                        }
-                        _ if super::is_nullability_qualifier(name_id) => {
-                            self.advance();
-                        }
-                        _ => break,
-                    }
-                } else {
-                    break;
-                }
-            }
+            ptr_modifiers |= self.parse_pointer_qualifiers();
 
             let ptr_type = Type {
                 kind: TypeKind::Pointer,
@@ -2950,7 +3344,7 @@ impl Parser<'_> {
         }
 
         // Parse function name
-        let name = self.expect_identifier()?;
+        let name = self.expect_declarator_name()?;
 
         // Parse parameter list
         self.expect_special(b'(')?;
@@ -2958,7 +3352,7 @@ impl Parser<'_> {
         self.expect_special(b')')?;
 
         // Build the function type
-        let param_type_ids: Vec<TypeId> = raw_params.iter().map(|(_, typ)| *typ).collect();
+        let param_type_ids: Vec<TypeId> = raw_params.iter().map(|p| p.typ).collect();
         let func_type = Type::function(ret_type_id, param_type_ids, variadic, false);
         let func_type_id = self.types.intern(func_type);
 
@@ -2971,16 +3365,12 @@ impl Parser<'_> {
 
         // Bind parameters in function scope and create Parameter structs
         let mut params = Vec::with_capacity(raw_params.len());
-        for (param_name, param_typ) in &raw_params {
-            let symbol_id = if let Some(name) = param_name {
-                let param_sym = Symbol::parameter(*name, *param_typ, self.symbols.depth());
-                self.symbols.declare(param_sym).ok()
-            } else {
-                None
-            };
+        for raw in &raw_params {
+            let symbol_id = raw.symbol.map(|id| self.symbols.redeclare(id, raw.typ));
             params.push(Parameter {
                 symbol: symbol_id,
-                typ: *param_typ,
+                typ: raw.typ,
+                vm_dims: raw.vm_dims.clone(),
             });
         }
 
@@ -2991,6 +3381,7 @@ impl Parser<'_> {
         self.symbols.leave_scope();
 
         Ok(FunctionDef {
+            attrs: Default::default(),
             return_type: ret_type_id,
             name,
             params,
@@ -3000,6 +3391,23 @@ impl Parser<'_> {
             is_inline: false,
             calling_conv: crate::abi::CallingConv::default(),
         })
+    }
+
+    /// Count the array levels of `typ` whose extent is not a compile-time
+    /// constant, i.e. how many run-time dimension expressions the type needs.
+    fn variable_array_levels(&self, typ: TypeId) -> usize {
+        let mut levels = 0;
+        let mut cur = Some(typ);
+        while let Some(t) = cur {
+            if self.types.kind(t) != TypeKind::Array {
+                break;
+            }
+            if self.types.get(t).array_size.is_none() {
+                levels += 1;
+            }
+            cur = self.types.get(t).base;
+        }
+        levels
     }
 
     /// Parse a parameter list, returning raw parameter info (name and type)
@@ -3061,7 +3469,7 @@ impl Parser<'_> {
             // - Grouped declarators: void (*)(int), int (*)[10]
             // - Arrays: int arr[], int arr[10]
             // Note: parse_declarator returns (name, type, vla_sizes)
-            let (param_name, mut typ_id, _vla_sizes, _func_params) =
+            let (param_name, mut typ_id, vla_sizes, _func_params) =
                 self.parse_declarator(base_type_id)?;
 
             // Skip any __attribute__ after parameter declarator
@@ -3096,13 +3504,44 @@ impl Parser<'_> {
             } else {
                 Some(param_name)
             };
-            params.push((name_opt, typ_id));
+
+            // Keep the run-time dimensions of a variably-modified element
+            // type. Every other declarator path already carries `vla_sizes`;
+            // dropping them here is what left `int a[n][m]` indexing with a
+            // row stride of zero.
+            //
+            // `vla_sizes` runs outermost-first over the whole declarator,
+            // while only the element type matters after the array-to-pointer
+            // adjustment. The outermost dimension is the one that may be
+            // absent (`int a[][m]`), and C17 6.7.6.2p1 requires every later
+            // dimension to be present, so the element type's variable
+            // dimensions are exactly the trailing entries.
+            let elem_typ = self.types.get(typ_id).base;
+            let vm_dims = match elem_typ {
+                Some(elem) => {
+                    let want = self.variable_array_levels(elem);
+                    let skip = vla_sizes.len().saturating_sub(want);
+                    vla_sizes[skip..].to_vec()
+                }
+                None => Vec::new(),
+            };
+
+            params.push(RawParam {
+                name: name_opt,
+                typ: typ_id,
+                vm_dims,
+                symbol: None,
+            });
 
             // Declare parameter in temporary scope so later params can reference it
             // (C99 6.9.1p9: parameters are in scope for VLA sizes)
             if let Some(name) = name_opt {
-                let sym = Symbol::variable(name, typ_id, self.symbols.depth());
-                let _ = self.symbols.declare(sym);
+                let sym = Symbol::parameter(name, typ_id, self.symbols.depth());
+                if let Ok(sym_id) = self.symbols.declare(sym) {
+                    if let Some(last) = params.last_mut() {
+                        last.symbol = Some(sym_id);
+                    }
+                }
             }
 
             if self.is_special(b',') {
@@ -3207,10 +3646,34 @@ impl Parser<'_> {
         Ok(())
     }
 
+    /// Fold the attributes pending on this declaration into what `name` has
+    /// collected so far, and return the total.
+    ///
+    /// Called for declarations as well as definitions, so that an attribute on
+    /// a prototype reaches the definition parsed later; see
+    /// [`Parser::declared_fn_attrs`].
+    fn accumulate_fn_attrs(&mut self, name: StringId) -> crate::parse::ast::FunctionAttrs {
+        let pending = self.pending_fn_attrs.clone();
+        let seen = self.declared_fn_attrs.entry(name).or_default();
+        seen.merge(&pending);
+        seen.clone()
+    }
+
     /// Parse an external declaration (function definition or declaration)
     fn parse_external_decl(&mut self) -> ParseResult<ExternalDecl> {
         // Clear pending alignment from previous declaration
         self.pending_alignas = None;
+        self.pending_fn_attrs = Default::default();
+        // And any asm label the previous declaration left behind.
+        //
+        // `skip_extensions` collects one wherever it runs, which is most
+        // places a type specifier can appear, but only a file-scope declarator
+        // claims one -- so a label written on a block-scope declaration, on a
+        // struct definition, or in a shape this parser does not model at all
+        // stays pending and is claimed by whatever is declared next. The
+        // symptom is an unrelated global emitted under someone else's
+        // assembler name.
+        self.pending_asm_label = None;
 
         // Check for _Static_assert first (C11)
         if self.is_static_assert() {
@@ -3249,7 +3712,12 @@ impl Parser<'_> {
             | TypeModifiers::THREAD_LOCAL
             | TypeModifiers::TYPEDEF
             | TypeModifiers::AUTO
-            | TypeModifiers::REGISTER;
+            | TypeModifiers::REGISTER
+            // `inline` is a function specifier rather than a storage class,
+            // but it travels with them here: leaving it out made
+            // `FunctionDef::is_inline` false for every ordinary definition,
+            // and with it every consumer downstream.
+            | TypeModifiers::INLINE;
         let storage_class = base_type.modifiers & storage_class_mask;
         // For struct/union types with tags, use existing TypeId to preserve forward declarations
         let base_type_id = self.intern_type_with_tag(&base_type);
@@ -3285,6 +3753,13 @@ impl Parser<'_> {
                 // Parse any __attribute__ after declarator
                 let attrs = self.parse_attributes();
                 let calling_conv = attrs.calling_conv().unwrap_or_default();
+                let fn_attrs = attrs.function_attrs();
+                self.pending_fn_attrs.merge(&fn_attrs);
+                let all_fn_attrs = if self.types.kind(typ) == TypeKind::Function {
+                    self.accumulate_fn_attrs(name)
+                } else {
+                    Default::default()
+                };
 
                 // Check if this is a function definition (function type followed by '{')
                 // This handles cases like: int (*get_op(int which))(int, int) { ... }
@@ -3300,6 +3775,12 @@ impl Parser<'_> {
                     // Add function to symbol table
                     let func_sym = Symbol::function(name, typ, self.symbols.depth());
                     let _ = self.symbols.declare(func_sym);
+                    // Definitions bind a fresh symbol, so this path needs the
+                    // accumulated facts settled onto it exactly as the other
+                    // two function-definition paths do -- without it, this
+                    // definition's C99 6.7.4p6 inline classification is
+                    // computed from declarations it never saw.
+                    self.settle_declaration_facts(name, storage_class);
 
                     // Get raw parameters - use decl_func_params which has names
                     let raw_params = decl_func_params.unwrap_or_default();
@@ -3309,17 +3790,12 @@ impl Parser<'_> {
 
                     // Bind parameters in function scope and create Parameter structs
                     let mut params = Vec::with_capacity(raw_params.len());
-                    for (param_name_opt, param_typ) in &raw_params {
-                        let symbol_id = if let Some(param_name) = param_name_opt {
-                            let param_sym =
-                                Symbol::parameter(*param_name, *param_typ, self.symbols.depth());
-                            self.symbols.declare(param_sym).ok()
-                        } else {
-                            None
-                        };
+                    for raw in &raw_params {
+                        let symbol_id = raw.symbol.map(|id| self.symbols.redeclare(id, raw.typ));
                         params.push(Parameter {
                             symbol: symbol_id,
-                            typ: *param_typ,
+                            typ: raw.typ,
+                            vm_dims: raw.vm_dims.clone(),
                         });
                     }
 
@@ -3338,6 +3814,7 @@ impl Parser<'_> {
                         is_static,
                         is_inline,
                         calling_conv,
+                        attrs: all_fn_attrs,
                     }));
                 }
 
@@ -3387,6 +3864,7 @@ impl Parser<'_> {
                 };
 
                 let symbol = symbol_id.expect("declaration must have symbol");
+                self.settle_declaration_facts(name, storage_class);
                 return Ok(ExternalDecl::Declaration(Declaration {
                     declarators: vec![InitDeclarator {
                         symbol,
@@ -3409,31 +3887,7 @@ impl Parser<'_> {
             self.advance();
             let mut ptr_modifiers = TypeModifiers::empty();
 
-            // Parse pointer qualifiers
-            while self.peek() == TokenType::Ident {
-                if let Some(name_id) = self.get_ident_id(self.current()) {
-                    match name_id {
-                        crate::kw::CONST => {
-                            self.advance();
-                            ptr_modifiers |= TypeModifiers::CONST;
-                        }
-                        crate::kw::VOLATILE => {
-                            self.advance();
-                            ptr_modifiers |= TypeModifiers::VOLATILE;
-                        }
-                        crate::kw::RESTRICT => {
-                            self.advance();
-                            ptr_modifiers |= TypeModifiers::RESTRICT;
-                        }
-                        _ if super::is_nullability_qualifier(name_id) => {
-                            self.advance();
-                        }
-                        _ => break,
-                    }
-                } else {
-                    break;
-                }
-            }
+            ptr_modifiers |= self.parse_pointer_qualifiers();
 
             let ptr_type = Type {
                 kind: TypeKind::Pointer,
@@ -3452,7 +3906,11 @@ impl Parser<'_> {
                 | TypeModifiers::TYPEDEF
                 | TypeModifiers::REGISTER
                 | TypeModifiers::AUTO
-                | TypeModifiers::THREAD_LOCAL;
+                | TypeModifiers::THREAD_LOCAL
+                // Without this a pointer-returning `inline` function loses the
+                // bit twice over -- `memcpy` returning `void *` is exactly the
+                // shape glibc uses.
+                | TypeModifiers::INLINE;
             let base_storage_class = self.types.modifiers(base_type_id) & storage_class_mask;
             if !base_storage_class.is_empty() {
                 let mut typ = self.types.get(typ_id).clone();
@@ -3487,6 +3945,13 @@ impl Parser<'_> {
                 // Parse any __attribute__ after declarator
                 let attrs = self.parse_attributes();
                 let calling_conv = attrs.calling_conv().unwrap_or_default();
+                let fn_attrs = attrs.function_attrs();
+                self.pending_fn_attrs.merge(&fn_attrs);
+                let all_fn_attrs = if self.types.kind(full_typ) == TypeKind::Function {
+                    self.accumulate_fn_attrs(name)
+                } else {
+                    Default::default()
+                };
 
                 // Check if this is a function definition (function type followed by '{')
                 // This handles cases like: char *(*get_op(int which))(int, int) { ... }
@@ -3501,6 +3966,7 @@ impl Parser<'_> {
                     // Add function to symbol table
                     let func_sym = Symbol::function(name, full_typ, self.symbols.depth());
                     let _ = self.symbols.declare(func_sym);
+                    self.settle_declaration_facts(name, storage_class);
 
                     // Get raw parameters - use decl_func_params which has names
                     let raw_params = decl_func_params.unwrap_or_default();
@@ -3510,17 +3976,12 @@ impl Parser<'_> {
 
                     // Bind parameters in function scope and create Parameter structs
                     let mut params = Vec::with_capacity(raw_params.len());
-                    for (param_name_opt, param_typ) in &raw_params {
-                        let symbol_id = if let Some(param_name) = param_name_opt {
-                            let param_sym =
-                                Symbol::parameter(*param_name, *param_typ, self.symbols.depth());
-                            self.symbols.declare(param_sym).ok()
-                        } else {
-                            None
-                        };
+                    for raw in &raw_params {
+                        let symbol_id = raw.symbol.map(|id| self.symbols.redeclare(id, raw.typ));
                         params.push(Parameter {
                             symbol: symbol_id,
-                            typ: *param_typ,
+                            typ: raw.typ,
+                            vm_dims: raw.vm_dims.clone(),
                         });
                     }
 
@@ -3539,6 +4000,7 @@ impl Parser<'_> {
                         is_static,
                         is_inline,
                         calling_conv,
+                        attrs: all_fn_attrs,
                     }));
                 }
 
@@ -3581,6 +4043,7 @@ impl Parser<'_> {
                 };
 
                 let symbol = symbol_id.expect("declaration must have symbol");
+                self.settle_declaration_facts(name, storage_class);
                 return Ok(ExternalDecl::Declaration(Declaration {
                     declarators: vec![InitDeclarator {
                         symbol,
@@ -3598,7 +4061,7 @@ impl Parser<'_> {
         }
 
         // Parse name
-        let name = self.expect_identifier()?;
+        let name = self.expect_declarator_name()?;
 
         // Check for function definition vs declaration
         if self.is_special(b'(') {
@@ -3609,6 +4072,9 @@ impl Parser<'_> {
 
             // Parse __attribute__ after parameter list (e.g., __attribute__((noreturn)))
             let attrs = self.parse_attributes();
+            let fn_attrs = attrs.function_attrs();
+            self.pending_fn_attrs.merge(&fn_attrs);
+            let all_fn_attrs = self.accumulate_fn_attrs(name);
             // noreturn can come from __attribute__((noreturn)) or _Noreturn keyword in base type
             let typ_from_table = self.types.get(typ_id);
             let is_noreturn =
@@ -3646,8 +4112,8 @@ impl Parser<'_> {
                         // Update matching parameter type
                         if decl_name != StringId::EMPTY {
                             for param in &mut params {
-                                if param.0 == Some(decl_name) {
-                                    param.1 = decl_typ;
+                                if param.name == Some(decl_name) {
+                                    param.typ = decl_typ;
                                 }
                             }
                         }
@@ -3669,29 +4135,25 @@ impl Parser<'_> {
                 let is_inline = storage_class.contains(TypeModifiers::INLINE);
 
                 // Add function to symbol table so it can be called by other functions
-                let param_type_ids: Vec<TypeId> = params.iter().map(|(_, typ)| *typ).collect();
+                let param_type_ids: Vec<TypeId> = params.iter().map(|p| p.typ).collect();
                 let func_type =
                     Type::function(typ_id, param_type_ids.clone(), variadic, is_noreturn);
                 let func_type_id = self.types.intern(func_type);
                 let func_sym = Symbol::function(name, func_type_id, self.symbols.depth());
                 let _ = self.symbols.declare(func_sym);
+                self.settle_declaration_facts(name, storage_class);
 
                 // Enter function scope for parameters
                 self.symbols.enter_scope();
 
                 // Bind parameters in function scope and create Parameter structs
                 let mut final_params = Vec::with_capacity(params.len());
-                for (param_name_opt, param_typ) in &params {
-                    let symbol_id = if let Some(param_name) = param_name_opt {
-                        let param_sym =
-                            Symbol::parameter(*param_name, *param_typ, self.symbols.depth());
-                        self.symbols.declare(param_sym).ok()
-                    } else {
-                        None
-                    };
+                for raw in &params {
+                    let symbol_id = raw.symbol.map(|id| self.symbols.redeclare(id, raw.typ));
                     final_params.push(Parameter {
                         symbol: symbol_id,
-                        typ: *param_typ,
+                        typ: raw.typ,
+                        vm_dims: raw.vm_dims.clone(),
                     });
                 }
 
@@ -3710,13 +4172,14 @@ impl Parser<'_> {
                     is_static,
                     is_inline,
                     calling_conv,
+                    attrs: all_fn_attrs,
                 }));
             } else {
                 // Function declaration
                 // Skip __asm("...") symbol aliasing which can appear after function declarator
                 self.skip_extensions();
                 self.expect_special(b';')?;
-                let param_type_ids: Vec<TypeId> = params.iter().map(|(_, typ)| *typ).collect();
+                let param_type_ids: Vec<TypeId> = params.iter().map(|p| p.typ).collect();
                 let func_type = Type::function(typ_id, param_type_ids, variadic, is_noreturn);
                 let func_type_id = self.types.intern(func_type);
                 // Add to symbol table and capture SymbolId
@@ -3738,6 +4201,7 @@ impl Parser<'_> {
                         .or_else(|| self.symbols.lookup_id(name, Namespace::Ordinary))
                 };
                 let symbol = symbol_id.expect("function declaration must have symbol");
+                self.settle_declaration_facts(name, storage_class);
                 return Ok(ExternalDecl::Declaration(Declaration {
                     declarators: vec![InitDeclarator {
                         symbol,
@@ -3789,7 +4253,11 @@ impl Parser<'_> {
                 | TypeModifiers::TYPEDEF
                 | TypeModifiers::REGISTER
                 | TypeModifiers::AUTO
-                | TypeModifiers::THREAD_LOCAL;
+                | TypeModifiers::THREAD_LOCAL
+                // Without this a pointer-returning `inline` function loses the
+                // bit twice over -- `memcpy` returning `void *` is exactly the
+                // shape glibc uses.
+                | TypeModifiers::INLINE;
             let base_storage_class = self.types.modifiers(typ_id) & storage_class_mask;
             if !base_storage_class.is_empty() {
                 let mut var_type = self.types.get(var_type_id).clone();
@@ -3875,6 +4343,7 @@ impl Parser<'_> {
         }
 
         let symbol = symbol.expect("symbol should be bound");
+        self.settle_declaration_facts(name, storage_class);
         declarators.push(InitDeclarator {
             symbol,
             typ: var_type_id,
@@ -3958,6 +4427,7 @@ impl Parser<'_> {
                 });
             }
 
+            self.settle_declaration_facts(decl_name, storage_class);
             declarators.push(InitDeclarator {
                 symbol: decl_symbol.expect("symbol should be bound"),
                 typ: decl_type,
@@ -3992,7 +4462,14 @@ impl Parser<'_> {
             ExprKind::Int128Lit(val) => Some(*val),
             ExprKind::CharLit(c) => Some(*c as u8 as i8 as i128),
             // Float literals are constant, return truncated value
-            ExprKind::FloatLit(val) => Some(*val as i128),
+            ExprKind::FloatLit(val) => Some(val.to_f64() as i128),
+
+            // The address of a member of a pointer constant is an integer
+            // constant; see `eval_pointer_constant`.
+            ExprKind::Unary {
+                op: UnaryOp::AddrOf,
+                operand,
+            } => self.eval_pointer_constant(operand),
 
             ExprKind::Unary { op, operand } => {
                 let val = self.eval_const_expr(operand)?;
@@ -4112,6 +4589,56 @@ impl Parser<'_> {
                 }
 
                 Some(offset)
+            }
+
+            _ => None,
+        }
+    }
+
+    /// The address of `expr`, when it is an integer constant rather than a
+    /// symbol's address.
+    ///
+    /// `(size_t)&((struct S *)0)->member` is how offsetof was spelled before
+    /// <stddef.h> was relied on to provide it. Nothing is dereferenced -- the
+    /// address of a member of a null pointer is arithmetic on the null pointer
+    /// -- so the result is a plain integer, usable anywhere an integer
+    /// constant expression is: an array bound, a case label, a bitfield width.
+    ///
+    /// The recursion bottoms out only at an integer constant, so the address
+    /// of a real object is not folded here: that one needs a relocation, which
+    /// no integer constant expression can carry.
+    fn eval_pointer_constant(&self, expr: &Expr) -> Option<i128> {
+        match &expr.kind {
+            ExprKind::IntLit(v) => Some(*v as i128),
+            ExprKind::Int128Lit(v) => Some(*v),
+
+            ExprKind::Cast { expr: inner, .. } => self.eval_pointer_constant(inner),
+
+            ExprKind::Unary {
+                op: UnaryOp::AddrOf,
+                operand,
+            } => self.eval_pointer_constant(operand),
+
+            ExprKind::Member { expr: base, member } => {
+                let base_offset = self.eval_pointer_constant(base)?;
+                let struct_type = self.resolve_struct_type(base.typ?);
+                let member_info = self.types.find_member(struct_type, *member)?;
+                Some(base_offset + member_info.offset as i128)
+            }
+
+            ExprKind::Arrow { expr: base, member } => {
+                let base_offset = self.eval_pointer_constant(base)?;
+                let pointee_type = self.types.base_type(base.typ?)?;
+                let struct_type = self.resolve_struct_type(pointee_type);
+                let member_info = self.types.find_member(struct_type, *member)?;
+                Some(base_offset + member_info.offset as i128)
+            }
+
+            ExprKind::Index { array, index } => {
+                let base_offset = self.eval_pointer_constant(array)?;
+                let idx = self.eval_const_expr(index)?;
+                let elem_type = self.types.base_type(array.typ?)?;
+                Some(base_offset + idx * self.types.size_bytes(elem_type) as i128)
             }
 
             _ => None,

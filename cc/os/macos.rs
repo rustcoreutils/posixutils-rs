@@ -13,6 +13,9 @@
 pub fn get_macros() -> Vec<(&'static str, Option<String>)> {
     vec![
         // Darwin/macOS identification
+        // Every C identifier picks up a leading underscore in the object
+        // file, which is what a GCC asm label has to spell out for itself.
+        ("__USER_LABEL_PREFIX__", Some("_".into())),
         ("__APPLE__", Some("1".into())),
         ("__MACH__", Some("1".into())),
         ("__DARWIN__", Some("1".into())),

@@ -581,3 +581,250 @@ fn diagnostics_generic_valid_forms_are_accepted() {
         compile_expect_ok(name, src);
     }
 }
+
+// ============================================================================
+// Keywords are not declarator names
+// ============================================================================
+
+/// A keyword cannot name an object, and the statement keywords are the worst
+/// of it: c17 accepted `int if;` and emitted a real symbol called `if`, into
+/// `.data`, that no later C translation unit could ever refer to.
+///
+/// The declarator-name check only rejected identifiers tagged `TYPE_KEYWORD`,
+/// which let through both the deliberately untagged `sizeof` family and every
+/// statement keyword.
+#[test]
+fn diagnostics_keywords_are_rejected_as_declarator_names() {
+    for kw in [
+        // Deliberately untagged so they cannot be mistaken for the start of a
+        // declaration; that is also what let them reach the name position.
+        "sizeof",
+        "_Generic",
+        "_Alignof",
+        "__alignof__",
+        "__alignof",
+        "_Static_assert",
+        "_Imaginary",
+        // Statement keywords.
+        "if",
+        "else",
+        "while",
+        "do",
+        "for",
+        "return",
+        "break",
+        "continue",
+        "goto",
+        "switch",
+        "case",
+        "default",
+    ] {
+        compile_expect_error(
+            &format!("kwname_{}", kw.trim_start_matches('_')),
+            &format!("int {kw};\nint main(void){{return 0;}}\n"),
+            "cannot be used as a name",
+        );
+    }
+}
+
+/// The same rule applies wherever a declarator name appears, not just at file
+/// scope. A struct member called `if` was accepted too, and `p->if` parsed.
+#[test]
+fn diagnostics_keywords_are_rejected_in_every_declarator_position() {
+    compile_expect_error(
+        "kwname_member",
+        "struct S { int if; };\nint main(void){return 0;}\n",
+        "cannot be used as a name",
+    );
+    compile_expect_error(
+        "kwname_param",
+        "int f(int while);\nint main(void){return 0;}\n",
+        "cannot be used as a name",
+    );
+    compile_expect_error(
+        "kwname_local",
+        "int main(void){ int return; return 0; }\n",
+        "cannot be used as a name",
+    );
+    compile_expect_error(
+        "kwname_func",
+        "int sizeof(void) { return 0; }\nint main(void){return 0;}\n",
+        "cannot be used as a name",
+    );
+}
+
+/// Words that are *not* C17 keywords must stay usable as names, which is the
+/// half of this that is easy to break. `alignof` and `typeof_unqual` are C23
+/// spellings, `_BitInt` is C23, and the rest are ordinary identifiers that
+/// merely appear in the keyword table for other purposes. gcc accepts every
+/// one of these in C17 mode.
+#[test]
+fn diagnostics_non_keywords_remain_usable_as_names() {
+    for name in [
+        "typeof_unqual",
+        "_BitInt",
+        "L",
+        "noreturn",
+        "aligned",
+        "packed",
+        "restrict_",
+    ] {
+        compile_expect_ok(
+            &format!("okname_{name}"),
+            &format!("int {name};\nint main(void){{ {name} = 1; return {name} - 1; }}\n"),
+        );
+    }
+
+    // None of these four is a C17 keyword either -- `offsetof` is a macro,
+    // `alignof` a C23 spelling, `setjmp` and `longjmp` library functions -- so
+    // each has to work in expression position too, not merely as a declarator
+    // name. The parser used to recognise them ahead of ordinary lookup, so
+    // `offsetof = 1;` reported "expected '('".
+    for name in ["alignof", "offsetof", "setjmp", "longjmp"] {
+        compile_expect_ok(
+            &format!("okdecl_{name}"),
+            &format!("int {name};\nint main(void){{ {name} = 1; return {name} - 1; }}\n"),
+        );
+    }
+}
+
+/// `offsetof`, `alignof`, `setjmp` and `longjmp` in every position a program
+/// may put an identifier -- and still meaning the builtin where nothing has
+/// claimed the name.
+#[test]
+fn diagnostics_shadowable_builtins_yield_to_a_declaration() {
+    // A local, a parameter, a file-scope object taken by address, and a
+    // function definition of the same name.
+    compile_expect_ok(
+        "shadow_local",
+        "int main(void){ int offsetof = 2; int alignof = 3; return offsetof + alignof - 5; }\n",
+    );
+    compile_expect_ok(
+        "shadow_param",
+        "static int f(int alignof, int offsetof){ return alignof + offsetof; }\n\
+         int main(void){ return f(2, -2); }\n",
+    );
+    compile_expect_ok(
+        "shadow_addr",
+        "int alignof;\nint main(void){ int *p = &alignof; *p = 0; return *p; }\n",
+    );
+    compile_expect_ok(
+        "shadow_fn",
+        "static int offsetof(int x){ return x; }\nint main(void){ return offsetof(0); }\n",
+    );
+
+    // `setjmp` yields to an object but not to a function declaration: that is
+    // what <setjmp.h> provides, and it needs code generation an ordinary call
+    // cannot produce.
+    compile_expect_ok(
+        "shadow_setjmp_object",
+        "int main(void){ int setjmp = 0; setjmp = 1; return setjmp - 1; }\n",
+    );
+    compile_expect_ok(
+        "shadow_setjmp_header",
+        "#include <setjmp.h>\n\
+         static jmp_buf env;\n\
+         int main(void){ if (setjmp(env) != 0) return 0; longjmp(env, 1); return 1; }\n",
+    );
+
+    // Undeclared, the builtin meaning still applies.
+    compile_expect_ok(
+        "shadow_none",
+        "#include <stddef.h>\n\
+         struct S { int a; int b; };\n\
+         int main(void){ return offsetof(struct S, b) == sizeof(int) ? 0 : 1; }\n",
+    );
+}
+
+/// C17 6.7.2p2 admits only a fixed list of type-specifier combinations.
+///
+/// The specifier loop tracked just the resulting kind, each keyword
+/// overwriting the last, so an impossible combination silently named whichever
+/// type came last: `float double x;` was a `double`, `void int y;` an object of
+/// type void with a size of 4, `long long long z;` a `long long`.
+#[test]
+fn diagnostics_conflicting_type_specifiers_are_rejected() {
+    for (idx, decl) in [
+        "int int x;",
+        "int char x;",
+        "float double x;",
+        "void int x;",
+        "int _Bool x;",
+        "short long x;",
+        "signed unsigned x;",
+        "long float x;",
+        "unsigned float x;",
+        "signed void x;",
+        "unsigned _Bool x;",
+    ]
+    .iter()
+    .enumerate()
+    {
+        compile_expect_error(&format!("badspec_{idx}"), decl, "declaration specifiers");
+    }
+
+    compile_expect_error("badspec_toolong", "long long long x;", "too long");
+    for (idx, decl) in ["short short x;", "signed signed x;", "unsigned unsigned x;"]
+        .iter()
+        .enumerate()
+    {
+        compile_expect_error(&format!("baddup_{idx}"), decl, "duplicate");
+    }
+
+    // Struct members and block scope go through the same path.
+    compile_expect_error(
+        "badspec_member",
+        "struct S { int int x; };\n",
+        "declaration specifiers",
+    );
+    compile_expect_error(
+        "badspec_block",
+        "int main(void){ int int y; return y; }\n",
+        "declaration specifiers",
+    );
+
+    // Every combination C17 6.7.2p2 does admit must still compile, including
+    // the ones that look like duplicates.
+    for (idx, decl) in [
+        "short int x;",
+        "long int x;",
+        "long long int x;",
+        "long unsigned int x;",
+        "signed long long x;",
+        "short unsigned x;",
+        "unsigned char x;",
+        "signed char x;",
+        "long double x;",
+        "double _Complex x;",
+        "long double _Complex x;",
+        "unsigned __int128 x;",
+        "const volatile int x;",
+    ]
+    .iter()
+    .enumerate()
+    {
+        compile_expect_ok(&format!("okspec_{idx}"), decl);
+    }
+
+    // An alias spelling a C library may itself define as a typedef stays a
+    // typedef: glibc's <bits/floatn-common.h> has `typedef float _Float32;`.
+    compile_expect_ok(
+        "okspec_alias_typedef",
+        "typedef float _Float32;\ntypedef double _Float64;\n\
+         int main(void){ _Float32 a = 1.0f; _Float64 b = 2.0; return (a + b) == 3.0 ? 0 : 1; }\n",
+    );
+}
+
+/// A label and a struct tag live in their own namespaces, and the check must
+/// not reach them -- `expect_identifier` has eighteen callers.
+#[test]
+fn diagnostics_labels_and_tags_are_unaffected() {
+    compile_expect_ok(
+        "okname_label",
+        "int main(void){ int n = 0; done: if (n) goto done; return 0; }\n",
+    );
+    compile_expect_ok(
+        "okname_tag",
+        "struct offsetof { int x; };\nint main(void){ struct offsetof s; s.x = 0; return s.x; }\n",
+    );
+}

@@ -26,7 +26,6 @@ pub fn get_macros() -> Vec<(&'static str, Option<&'static str>)> {
         ("__AARCH64EL__", Some("1")),
         // Register size
         ("__REGISTER_PREFIX__", Some("")),
-        ("__USER_LABEL_PREFIX__", Some("")),
         // `long double` is described entirely by `get_float_limit_macros`
         // and `get_additional_sizeof_macros`, which know the OS as well as the
         // architecture — it is quad on aarch64 Linux but plain double on

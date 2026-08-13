@@ -1207,3 +1207,467 @@ int main(void) {
         0
     );
 }
+
+/// An initializer element that is already an expression of the aggregate's own
+/// type initializes the whole aggregate (C17 6.7.9p13).
+///
+/// It was instead treated as a brace-elision candidate, so filling one element
+/// consumed `count_scalar_fields` *elements* rather than one:
+/// `struct P a[2] = {p, p};` put both structs into `a[0]`, left `a[1]`
+/// uninitialized, and assigned a struct where a scalar field was expected --
+/// giving `4 4 0 0` where gcc gives `4 5 4 5`. The nested case returned
+/// uninitialized stack, so this read whatever happened to be there.
+#[test]
+fn c99_aggregate_element_initializes_whole_aggregate() {
+    let code = r#"
+#include <string.h>
+
+struct P { int x, y; };
+struct N { int a[2]; struct { int x, y; } in; };
+
+int main(void) {
+    struct P p = {4, 5};
+
+    /* The case that was wrong: elements are struct expressions, not braces. */
+    struct P a2[2] = {p, p};
+    if (a2[0].x != 4 || a2[0].y != 5) return 1;
+    if (a2[1].x != 4 || a2[1].y != 5) return 2;
+
+    /* Nested aggregate, where the old path returned uninitialized stack. */
+    struct N n = {{1, 2}, {4, 5}};
+    struct N b2[2] = {n, n};
+    if (b2[0].a[0] != 1 || b2[0].in.x != 4) return 3;
+    if (b2[1].a[0] != 1 || b2[1].in.x != 4) return 4;
+    if (memcmp(&b2[0], &n, sizeof n) != 0) return 5;
+    if (memcmp(&b2[1], &n, sizeof n) != 0) return 6;
+
+    /* Mixing an expression element with a brace list must still work. */
+    struct P mix[2] = {p, {8, 9}};
+    if (mix[0].x != 4 || mix[0].y != 5) return 7;
+    if (mix[1].x != 8 || mix[1].y != 9) return 8;
+
+    /* Fewer initializers than elements: the rest are zeroed, not garbage. */
+    struct P few[3] = {p};
+    if (few[0].x != 4 || few[1].x != 0 || few[2].x != 0) return 9;
+    if (few[1].y != 0 || few[2].y != 0) return 10;
+
+    /* A single struct initialized from another, and one member from an
+       expression -- the same rule one level down. */
+    struct N copy = n;
+    if (copy.a[0] != 1 || copy.in.x != 4) return 11;
+
+    /* The paths that always worked, pinned so this fix cannot regress them. */
+    struct P braces[2] = {{4, 5}, {6, 7}};
+    if (braces[0].x != 4 || braces[1].x != 6) return 12;
+    static struct P statics[2] = {{4, 5}, {6, 7}};
+    if (statics[0].x != 4 || statics[1].x != 6) return 13;
+    struct P assigned[2];
+    assigned[0] = p; assigned[1] = p;
+    if (assigned[0].x != 4 || assigned[1].x != 4) return 14;
+    struct N desig = {.in = {7, 8}};
+    if (desig.in.x != 7 || desig.in.y != 8) return 15;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run(
+            "c99_aggregate_element_initializes_whole_aggregate",
+            code,
+            &[]
+        ),
+        0
+    );
+}
+
+// ============================================================================
+// Constant folding in global initializers
+// ============================================================================
+
+/// Arithmetic on floating constants must fold at file scope.
+///
+/// C99 6.6p8 allows any arithmetic constant expression as the initializer of
+/// an object with static storage duration. c17 folded `*` and `/` correctly
+/// but not `+` or `-`: those two were intercepted by the *pointer*-arithmetic
+/// arm, which fell back to an integer-only evaluator and then rejected the
+/// program. `double a = 1.0 + 2.0;` did not compile.
+///
+/// Worse, `-(1.0 + 2.0)` was accepted and silently became `0.0` -- the
+/// negation arm returned "no initializer" without a diagnostic, which lands
+/// the object in `.bss`. A wrong answer with a zero exit status.
+#[test]
+fn c99_global_initializer_folds_floating_arithmetic() {
+    let src = r#"
+#include <math.h>
+
+double d_add = 1.0 + 2.0;
+double d_sub = 5.0 - 2.0;
+double d_mul = 3.0 * 2.0;
+double d_div = 12.0 / 4.0;
+double d_mixed = 1.0 + 2;            /* int operand promotes */
+float  f_add = 1.5f + 1.5f;
+long double l_add = 1.0L + 2.0L;
+double d_nested = (1.0 + 2.0) * 3.0 - 6.0;
+
+/* The silent-zero cases: a negated constant expression. */
+double d_neg_sum = -(1.0 + 2.0);
+double d_neg_mul = -(2.0 * 1.5);
+double d_neg_lit = -3.0;
+
+/* Integer folding must keep working unchanged. */
+int i_add = 1 + 2;
+int i_sub = 5 - 2;
+
+int main(void)
+{
+    if (d_add != 3.0) return 1;
+    if (d_sub != 3.0) return 2;
+    if (d_mul != 6.0) return 3;
+    if (d_div != 3.0) return 4;
+    if (d_mixed != 3.0) return 5;
+    if (f_add != 3.0f) return 6;
+    if (l_add != 3.0L) return 7;
+    if (d_nested != 3.0) return 8;
+
+    if (d_neg_sum != -3.0) return 9;
+    if (d_neg_mul != -3.0) return 10;
+    if (d_neg_lit != -3.0) return 11;
+
+    if (i_add != 3) return 12;
+    if (i_sub != 3) return 13;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("global_init_float_fold", src, &[]), 0);
+}
+
+/// Pointer arithmetic in a global initializer must keep working.
+///
+/// The float fix touches the arm that handles it, so this pins the behaviour
+/// the arm was written for: a symbol address plus a scaled constant offset.
+#[test]
+fn c99_global_initializer_folds_pointer_arithmetic() {
+    let src = r#"
+#include <string.h>
+static int arr[10] = {0,1,2,3,4,5,6,7,8,9};
+int *p_fwd = arr + 3;
+int *p_back = &arr[7] - 2;
+int *p_zero = arr + 0;
+
+/* A string literal has a static address too, but it only acquires a label
+   when it is interned -- which the address evaluator could not do, so this
+   was rejected while `arr + 1` was accepted. */
+const char *s_off = "hello" + 1;
+const char *s_end = "world" + 5;
+
+int main(void)
+{
+    if (*p_fwd != 3) return 1;
+    if (*p_back != 5) return 2;
+    if (*p_zero != 0) return 3;
+    if (p_fwd - arr != 3) return 4;
+    if (strcmp(s_off, "ello") != 0) return 5;
+    if (*s_end != '\0') return 6;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("global_init_ptr_fold", src, &[]), 0);
+}
+
+/// A `_Complex` object with static storage duration can be initialized.
+///
+/// Every spelling was rejected before: `__builtin_complex` had no arm at all,
+/// and `1.0 + 2.0*I` reached the arithmetic arm, which had no notion of a
+/// complex value. Only the function-local path worked.
+///
+/// Note `double _Complex z = {1.0, 2.0};` is *not* 1.0 + 2.0i. A complex type
+/// is a scalar type (C11 6.2.5p21), so that is a braced scalar initializer
+/// with an excess element; gcc warns and keeps only the first. Matching gcc
+/// here means the imaginary part stays zero.
+#[test]
+fn c99_global_initializer_accepts_complex() {
+    let src = r#"
+#include <complex.h>
+#include <stdio.h>
+
+double _Complex z_builtin = __builtin_complex(1.0, 2.0);
+double _Complex z_cmplx   = CMPLX(1.0, 2.0);
+double _Complex z_imag    = 1.0 + 2.0*I;
+double _Complex z_real    = 3.0;               /* real constant, zero imag */
+double _Complex z_neg     = -(1.0 + 2.0*I);
+double _Complex z_mul     = (1.0 + 2.0*I) * (3.0 + 4.0*I);   /* -5 + 10i */
+double _Complex z_brace   = {1.0};             /* braced scalar */
+float _Complex  f_imag    = 1.5f + 2.5f*I;     /* narrower base type */
+
+static double _Complex s_imag = 1.0 + 2.0*I;   /* internal linkage */
+
+int main(void)
+{
+    if (creal(z_builtin) != 1.0 || cimag(z_builtin) != 2.0) return 1;
+    if (creal(z_cmplx) != 1.0 || cimag(z_cmplx) != 2.0) return 2;
+    if (creal(z_imag) != 1.0 || cimag(z_imag) != 2.0) return 3;
+    if (creal(z_real) != 3.0 || cimag(z_real) != 0.0) return 4;
+    if (creal(z_neg) != -1.0 || cimag(z_neg) != -2.0) return 5;
+    if (creal(z_mul) != -5.0 || cimag(z_mul) != 10.0) return 6;
+    if (creal(z_brace) != 1.0 || cimag(z_brace) != 0.0) return 7;
+    if (crealf(f_imag) != 1.5f || cimagf(f_imag) != 2.5f) return 8;
+    if (creal(s_imag) != 1.0 || cimag(s_imag) != 2.0) return 9;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("global_init_complex", src, &["-lm".to_string()]),
+        0
+    );
+}
+
+// ============================================================================
+// Decimal floating literals at the target's precision
+// ============================================================================
+
+/// A decimal literal must reach `long double` at full width.
+///
+/// Decimal literals went through `f64::from_str`, so a `long double` was
+/// correct only to 53 of its 64 significand bits, and one outside double's
+/// range collapsed entirely -- `LDBL_MAX` written in decimal became `inf` and
+/// `1e-4900L` became zero. Hex literals were already exact, which is what the
+/// comparisons below use as the reference: every right-hand side is a hex
+/// literal naming the value gcc produces for the decimal on its left.
+///
+/// `float` and `double` were never affected: `f64::from_str` is correctly
+/// rounded, and for those two the target format is `f64` or narrower.
+///
+/// Each reference is spelled for the format the target has. A decimal
+/// correctly rounded to binary128's 113 bits is *not* the same value as one
+/// correctly rounded to x87's 64, so one hex spelling cannot serve both --
+/// which is the whole claim being made here, that the literal reaches the
+/// width the target actually has. Both sets were taken from gcc.
+#[test]
+fn c99_decimal_literals_reach_long_double_precision() {
+    let src = r#"
+#include <float.h>
+
+#if LDBL_MANT_DIG == 113
+#define PI_REF    0x1.921fb54442d18469834ef156fa8fp+1L
+#define TENTH_REF 0x1.999999999999999999999999999ap-4L
+#define BIG_REF   0x1.fffffffffffffffdf5f7837da5b2p+16383L
+#define TINY_REF  0x1.7769bead75ec52e4d25544b1042ep-16278L
+#else
+/* x87's 64 bits. A target whose long double is double rounds both sides of
+   each comparison to the same value, so these serve there too. */
+#define PI_REF    0xc.90fdaa22168c235p-2L
+#define TENTH_REF 0xc.ccccccccccccccdp-7L
+#define BIG_REF   0xf.fffffffffffffffp+16380L
+#define TINY_REF  0xb.bb4df56baf62972p-16281L
+#endif
+
+int main(void)
+{
+    /* Needs every significand bit the format has: the tail is lost at 53. */
+    if (3.14159265358979323846L != PI_REF) return 1;
+
+    /* A value with no exact binary form, rounded at the wrong width. */
+    if (0.1L != TENTH_REF) return 2;
+
+    /* Outside double's range in both directions. */
+    if (1.18973149535723176502e+4932L != BIG_REF) return 3;
+    if (1e-4900L != TINY_REF) return 4;
+
+    /* Ordinary magnitudes must stay exact, not merely close. */
+    if (1.0L != 0x1p+0L) return 5;
+    if (0.5L != 0x1p-1L) return 6;
+    if (1e10L != 0x2.540be4p+32L) return 7;
+    if (123456789.0L != 0x7.5bcd15p+24L) return 8;
+
+    /* Zero, and a value that underflows to it, keep their sign. */
+    if (0.0L != 0x0p+0L) return 9;
+    if (1e-5000L != 0.0L) return 10;
+
+    /* float and double are unchanged. */
+    if (0.1 != 0x1.999999999999ap-4) return 11;
+    if (0.1f != 0x1.99999ap-4f) return 12;
+    if (DBL_MAX <= 0.0 || LDBL_MAX <= 0.0) return 13;
+
+    /* The exponent forms all agree. */
+    if (1.5e3L != 1500.0L) return 14;
+    if (15e2L != 1500.0L) return 15;
+    if (150000e-2L != 1500.0L) return 16;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("decimal_long_double", src, &[]), 0);
+}
+
+/// The address of a compound literal with static storage duration.
+///
+/// C99 6.5.2.5p5 gives a compound literal at file scope static storage
+/// duration, so its address is a constant expression and may initialize a
+/// pointer. c17 dropped the initializer silently: the object went to `.bss`,
+/// the pointer was null, and the program segfaulted on first use.
+///
+/// The address-of arm returned "no initializer" when it could not evaluate the
+/// operand, which is the same silent-zero shape that made `-(1.0 + 2.0)` come
+/// out as `0.0`. The other arms were fixed then; this one was missed because
+/// no test reached it.
+#[test]
+fn c99_address_of_a_static_compound_literal() {
+    let src = r#"
+#include <stdio.h>
+#include <string.h>
+
+struct P { int x, y; };
+
+static struct P *gp = &(struct P){1, 2};
+static int *ga = (int[]){10, 20, 30};
+static const char *gs = (const char[]){'h', 'i', 0};
+
+int main(void)
+{
+    if (gp->x != 1 || gp->y != 2) return 1;
+    if (ga[0] != 10 || ga[1] != 20 || ga[2] != 30) return 2;
+    if (strcmp(gs, "hi") != 0) return 3;
+
+    /* Writing through it must work: it is an object, not a constant. */
+    gp->x = 42;
+    if (gp->x != 42) return 5;
+
+    /* The block-scope forms already worked and must keep working. */
+    struct P *lp = &(struct P){7, 8};
+    if (lp->x != 7 || lp->y != 8) return 6;
+    int *la = (int[]){4, 5};
+    if (la[0] != 4 || la[1] != 5) return 7;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("static_compound_literal_addr", src, &[]), 0);
+}
+
+/// A static initializer is converted to the *object's* type, not kept in the
+/// constant's own.
+///
+/// Folding floating constants in global initializers made `int c = 1.0 + 2.0;`
+/// compile, which it should -- but it stored the IEEE bits of 3.0 into a
+/// 4-byte integer, so `c` read back as 1077936128. The mirror case,
+/// `double d = 1 + 2;`, stored the integer 3 into a double and read back as
+/// 1.5e-323. C17 6.7.9p11 converts the initializer as an assignment would.
+#[test]
+fn c99_scalar_initializers_take_the_objects_type() {
+    let code = r#"
+#include <limits.h>
+
+/* Floating constants initializing integer objects: the fraction is
+   discarded (C17 6.3.1.4), it is not reinterpreted. */
+int i_add = 1.0 + 2.0;
+int i_sub = 9.5 - 2.0;
+int i_mul = 2.5 * 2.0;
+int i_div = 7 / 2.0;
+int i_neg = -(1.5 + 2.0);
+long l_wide = 2.9 * 2.0;
+char c_narrow = 65.9;
+_Bool b_from_float = 0.5;
+short s_neg = -3.9;
+
+/* Integer constants initializing floating objects: widened exactly. */
+double d_add = 1 + 2;
+float f_int = 7;
+long double ld_int = -5;
+double d_big = 2147483647;
+
+/* And the same-type cases must not have moved. */
+double d_add_f = 1.0 + 2.0;
+int i_add_i = 1 + 2;
+
+struct S { int i; double d; };
+struct S agg = { 1.0 + 2.0, 1 + 2 };
+int arr[3] = { 1.5, 2.5, 3.5 };
+
+int main(void)
+{
+    if (i_add != 3) return 1;
+    if (i_sub != 7) return 2;
+    if (i_mul != 5) return 3;
+    if (i_div != 3) return 4;
+    if (i_neg != -3) return 5;
+    if (l_wide != 5) return 6;
+    if (c_narrow != 'A') return 7;
+    if (b_from_float != 1) return 8;
+    if (s_neg != -3) return 9;
+
+    if (d_add != 3.0) return 10;
+    if (f_int != 7.0f) return 11;
+    if (ld_int != -5.0L) return 12;
+    if (d_big != 2147483647.0) return 13;
+
+    if (d_add_f != 3.0) return 14;
+    if (i_add_i != 3) return 15;
+
+    if (agg.i != 3 || agg.d != 3.0) return 16;
+    if (arr[0] != 1 || arr[1] != 2 || arr[2] != 3) return 17;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c99_scalar_initializers_take_the_objects_type", code, &[]),
+        0
+    );
+}
+
+/// The pre-<stddef.h> spelling of offsetof is an integer constant expression.
+///
+/// `(size_t)&((struct S *)0)->member` dereferences nothing -- it is arithmetic
+/// on a null pointer -- so there is no symbol to relocate against and the
+/// whole thing folds to an integer. It used to fold to nothing: the static
+/// initializer silently became zero, and after global initializers started
+/// rejecting what they could not fold, it became a hard error instead.
+#[test]
+fn c99_offsetof_by_null_pointer_is_a_constant() {
+    let code = r#"
+#include <stddef.h>
+
+struct S { int a; double b; char c[8]; struct { int x, y; } n; };
+
+static const size_t off_a = (size_t)&((struct S *)0)->a;
+static const size_t off_b = (size_t)&((struct S *)0)->b;
+static const size_t off_c = (size_t)&((struct S *)0)->c;
+static const size_t off_c2 = (size_t)&((struct S *)0)->c[2];
+static const size_t off_ny = (size_t)&((struct S *)0)->n.y;
+
+/* An integer constant expression is usable as an array bound and a case
+   label, not only as an initializer. */
+static char sized[(size_t)&((struct S *)0)->b];
+
+int pick(int k)
+{
+    switch (k) {
+    case (int)(size_t)&((struct S *)0)->b: return 1;
+    default: return 0;
+    }
+}
+
+int main(void)
+{
+    if (off_a != offsetof(struct S, a)) return 1;
+    if (off_b != offsetof(struct S, b)) return 2;
+    if (off_c != offsetof(struct S, c)) return 3;
+    if (off_c2 != offsetof(struct S, c) + 2) return 4;
+    if (off_ny != offsetof(struct S, n.y)) return 5;
+    if (sizeof(sized) != offsetof(struct S, b)) return 6;
+    if (pick((int)offsetof(struct S, b)) != 1) return 7;
+
+    /* The address of a real object is still a relocation, not an integer. */
+    static int obj[4];
+    static int *p = &obj[2];
+    if (p != &obj[2]) return 8;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c99_offsetof_by_null_pointer_is_a_constant", code, &[]),
+        0
+    );
+}

@@ -11,6 +11,7 @@
 use super::{CallAbiInfo, Instruction, Opcode, Pseudo, PseudoId};
 use crate::abi::get_abi_for_conv;
 use crate::diag::{error, Position};
+use crate::float::FloatVal;
 use crate::parse::ast::{AssignOp, BinaryOp, Expr, ExprKind, UnaryOp};
 use crate::types::{MemberInfo, TypeId, TypeKind};
 
@@ -31,7 +32,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         id
     }
 
-    pub(crate) fn emit_fconst(&mut self, val: f64, typ: TypeId) -> PseudoId {
+    pub(crate) fn emit_fconst(&mut self, val: FloatVal, typ: TypeId) -> PseudoId {
         let id = self.alloc_pseudo();
         let pseudo = Pseudo::fval(id, val);
         if let Some(func) = &mut self.current_func {
@@ -273,13 +274,21 @@ impl<'a> super::linearize::Linearizer<'a> {
         bit_width: u32,
         target_bits: u32,
     ) -> PseudoId {
-        // Sign extend by shifting left then arithmetic shifting right
-        let shift_amount = target_bits - bit_width;
-        let typ = if target_bits <= 32 {
-            self.types.int_id
+        // Sign extend by shifting the field's top bit up to the sign bit and
+        // arithmetic-shifting it back down.
+        //
+        // The shift is measured against the width the *operation* runs at, not
+        // against the storage unit. A field backed by a one-byte unit is still
+        // extracted in a 32-bit register, so shifting by `8 - width` leaves the
+        // field's top bit at bit 7, where an arithmetic shift sees a positive
+        // value and extends nothing. `int a:4` was correct only because its
+        // storage unit is 32 bits, which happens to be the operation width.
+        let (typ, op_bits) = if target_bits <= 32 {
+            (self.types.int_id, 32)
         } else {
-            self.types.long_id
+            (self.types.long_id, 64)
         };
+        let shift_amount = op_bits - bit_width;
 
         let shift_val = self.emit_const(shift_amount as i128, typ);
         let shifted_left = self.alloc_pseudo();
@@ -289,7 +298,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             value,
             shift_val,
             typ,
-            target_bits,
+            op_bits,
         ));
 
         let result = self.alloc_pseudo();
@@ -299,9 +308,49 @@ impl<'a> super::linearize::Linearizer<'a> {
             shifted_left,
             shift_val,
             typ,
-            target_bits,
+            op_bits,
         ));
         result
+    }
+
+    /// Store `value` into a struct member at `base`, honouring a bitfield's
+    /// placement within its storage unit.
+    ///
+    /// A plain `Instruction::store` writes the whole storage unit, which for a
+    /// bitfield overwrites every neighbour sharing it -- and, because the value
+    /// is written at bit 0, gets the field itself wrong too. Assignment and
+    /// compound assignment already went through `emit_bitfield_store`; `++` and
+    /// `--` did not, which is the entire bug behind `s.field++` corrupting the
+    /// struct around it.
+    pub(crate) fn emit_member_store(
+        &mut self,
+        base: PseudoId,
+        member_info: &MemberInfo,
+        value: PseudoId,
+    ) {
+        if let (Some(bit_offset), Some(bit_width), Some(storage_size)) = (
+            member_info.bit_offset,
+            member_info.bit_width,
+            member_info.storage_unit_size,
+        ) {
+            self.emit_bitfield_store(
+                base,
+                member_info.offset,
+                bit_offset,
+                bit_width,
+                storage_size,
+                value,
+            );
+        } else {
+            let size = self.types.size_bits(member_info.typ);
+            self.emit(Instruction::store(
+                value,
+                base,
+                member_info.offset as i64,
+                member_info.typ,
+                size,
+            ));
+        }
     }
 
     /// Emit code to store a value into a bitfield
@@ -411,7 +460,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             UnaryOp::Not => {
                 // Logical not: compare with 0
                 if is_float {
-                    let zero = self.emit_fconst(0.0, typ);
+                    let zero = self.emit_fconst(FloatVal::ZERO, typ);
                     self.emit(Instruction::binop(
                         Opcode::FCmpOEq,
                         result,
@@ -472,7 +521,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     let elem_size = self.types.size_bits(elem_type) / 8;
                     self.emit_const(elem_size as i128, self.types.long_id)
                 } else if is_float {
-                    self.emit_fconst(1.0, typ)
+                    self.emit_fconst(FloatVal::from_f64(1.0), typ)
                 } else {
                     self.emit_const(1, typ)
                 };
@@ -489,7 +538,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     let elem_size = self.types.size_bits(elem_type) / 8;
                     self.emit_const(elem_size as i128, self.types.long_id)
                 } else if is_float {
-                    self.emit_fconst(1.0, typ)
+                    self.emit_fconst(FloatVal::from_f64(1.0), typ)
                 } else {
                     self.emit_const(1, typ)
                 };
@@ -671,7 +720,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         self.emit(Instruction::store(
             converted, result, 0, base_typ, base_bits,
         ));
-        let zero = self.emit_fconst(0.0, base_typ);
+        let zero = self.emit_fconst(FloatVal::ZERO, base_typ);
         self.emit(Instruction::store(
             zero, result, base_bytes, base_typ, base_bits,
         ));
@@ -716,6 +765,57 @@ impl<'a> super::linearize::Linearizer<'a> {
             ));
         }
         result
+    }
+
+    /// `-z` on a complex value: negate both parts (C17 6.5.3.3p3).
+    ///
+    /// A complex value travels by address, and the scalar unary path did not
+    /// know that: it negated the *address* as an integer and handed the result
+    /// on as though it were a complex object, so `creal(-z)` dereferenced a
+    /// small negative number and the program died on valid code.
+    ///
+    /// Returns the address of the result, as every complex-valued expression
+    /// does.
+    pub(crate) fn emit_complex_negate(&mut self, operand: &Expr, complex_typ: TypeId) -> PseudoId {
+        let base_typ = self.types.complex_base(complex_typ);
+        let base_bits = self.types.size_bits(base_typ);
+        let base_bytes = (base_bits / 8) as i64;
+
+        let addr = self.complex_operand_at_precision(operand, complex_typ);
+        let result = self.alloc_local_temp(complex_typ);
+
+        for offset in [0, base_bytes] {
+            let part = self.alloc_pseudo();
+            self.emit(Instruction::load(part, addr, offset, base_typ, base_bits));
+            let negated = self.alloc_pseudo();
+            self.emit(Instruction::unop(
+                Opcode::FNeg,
+                negated,
+                part,
+                base_typ,
+                base_bits,
+            ));
+            self.emit(Instruction::store(
+                negated, result, offset, base_typ, base_bits,
+            ));
+        }
+        result
+    }
+
+    /// The real part of a complex value, as the real type `target_typ`.
+    ///
+    /// C17 6.3.1.7p2: converting a complex value to a real type discards the
+    /// imaginary part. The conversion path treated the operand as an ordinary
+    /// scalar, so `(double) z` reinterpreted the *address* as a double.
+    pub(crate) fn emit_complex_to_real(&mut self, operand: &Expr, target_typ: TypeId) -> PseudoId {
+        let src_typ = self.expr_type(operand);
+        let base_typ = self.types.complex_base(src_typ);
+        let base_bits = self.types.size_bits(base_typ);
+
+        let addr = self.complex_operand_addr(operand);
+        let real = self.alloc_pseudo();
+        self.emit(Instruction::load(real, addr, 0, base_typ, base_bits));
+        self.emit_convert(real, base_typ, target_typ)
     }
 
     /// Complex values are stored as two adjacent float/double values (real, imag)
@@ -1112,6 +1212,56 @@ impl<'a> super::linearize::Linearizer<'a> {
             return result;
         }
 
+        // A compound assignment on a complex object is `t = t op v`
+        // (C17 6.5.16.2p3), and both sides travel by address. The scalar path
+        // below loaded the target's *address* as though it were the number, so
+        // `z += 1.0` computed on a pointer bit pattern and stored the result
+        // over the object -- the program then died reading it back.
+        if self.types.is_complex(target_typ) && op != AssignOp::Assign {
+            let binop = match op {
+                AssignOp::AddAssign => Some(BinaryOp::Add),
+                AssignOp::SubAssign => Some(BinaryOp::Sub),
+                AssignOp::MulAssign => Some(BinaryOp::Mul),
+                AssignOp::DivAssign => Some(BinaryOp::Div),
+                // Every other compound operator is a constraint violation on a
+                // complex operand; leave those to the path that reports it.
+                _ => None,
+            };
+
+            if let Some(binop) = binop {
+                let target_addr = self.linearize_lvalue(target);
+                let value_addr = if self.types.is_complex(value_typ) {
+                    self.complex_operand_at_precision(value, target_typ)
+                } else {
+                    self.promote_real_to_complex(value, target_typ)
+                };
+                let result_addr =
+                    self.emit_complex_binary(binop, target_addr, value_addr, target_typ);
+
+                let base_typ = self.types.complex_base(target_typ);
+                let base_bits = self.types.size_bits(base_typ);
+                let base_bytes = (base_bits / 8) as i64;
+                for offset in [0, base_bytes] {
+                    let part = self.alloc_pseudo();
+                    self.emit(Instruction::load(
+                        part,
+                        result_addr,
+                        offset,
+                        base_typ,
+                        base_bits,
+                    ));
+                    self.emit(Instruction::store(
+                        part,
+                        target_addr,
+                        offset,
+                        base_typ,
+                        base_bits,
+                    ));
+                }
+                return target_addr;
+            }
+        }
+
         // For complex type assignment, handle specially - copy real and imag parts
         if self.types.is_complex(target_typ) && op == AssignOp::Assign {
             let target_addr = self.linearize_lvalue(target);
@@ -1133,7 +1283,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 self.emit(Instruction::store(real, target_addr, 0, dst_base, dst_size));
 
                 let zero = if self.types.is_float(dst_base) {
-                    self.emit_fconst(0.0, dst_base)
+                    self.emit_fconst(FloatVal::ZERO, dst_base)
                 } else {
                     self.emit_const(0, dst_base)
                 };

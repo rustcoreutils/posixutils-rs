@@ -128,6 +128,135 @@ fn compile_and_run_single(
     exit_code
 }
 
+/// Compile two translation units together, link them, and run the result.
+///
+/// Every other helper here compiles a single file, which cannot see the class
+/// of defect that only appears at link time: a definition emitted into two
+/// objects that should have been emitted into neither. `inline` in a shared
+/// header is the ordinary way to hit that.
+///
+/// Returns the program's exit status, or -1 if compiling or linking failed
+/// (with the toolchain's own message on stderr, since a duplicate-symbol error
+/// is the interesting outcome and is worth reading).
+pub fn compile_and_run_two_units(
+    name: &str,
+    unit_a: &str,
+    unit_b: &str,
+    extra_opts: &[String],
+) -> i32 {
+    let a = create_c_file(&format!("{}_a", name), unit_a);
+    let b = create_c_file(&format!("{}_b", name), unit_b);
+
+    let thread_id = format!("{:?}", std::thread::current().id());
+    let exe_path = std::env::temp_dir().join(format!(
+        "c17_exe2_{}_{}",
+        name,
+        thread_id.replace(|c: char| !c.is_alphanumeric(), "_")
+    ));
+
+    let mut args = vec!["-o".to_string(), exe_path.to_string_lossy().to_string()];
+    args.push(a.path().to_string_lossy().to_string());
+    args.push(b.path().to_string_lossy().to_string());
+    args.extend(extra_opts.iter().cloned());
+
+    let output = run_test_base("c17", &args, &[]);
+    if !output.status.success() {
+        eprintln!(
+            "c17 failed to build {} from two units:\n{}",
+            name,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return -1;
+    }
+
+    let run_output = Command::new(&exe_path)
+        .output()
+        .expect("failed to run executable");
+    let exit_code = run_output.status.code().unwrap_or(-1);
+    let _ = std::fs::remove_file(&exe_path);
+    exit_code
+}
+
+/// Build `lib_src` into a shared object with c17, then run `main_src` (also
+/// built with c17) which is expected to `dlopen` it.
+///
+/// The library is written to a private directory and always named `lib.so`, so
+/// `main_src` can hardcode `"./lib.so"` and the test can `chdir`-free by
+/// running the executable with that directory as its working directory.
+///
+/// This exists for the class of defect that only appears at load time. A
+/// thread-local model that is wrong for a dynamically loaded library links
+/// perfectly and then fails in `dlopen`, and does so only once the library's
+/// TLS block outgrows the loader's static-TLS surplus -- so neither compiling
+/// nor linking nor a small test case reveals it.
+///
+/// Returns the program's exit status, or -1 if any build step failed. `dlopen`
+/// diagnostics are on stdout/stderr and are echoed on failure, since the
+/// loader's message is the interesting part.
+pub fn compile_and_dlopen(name: &str, lib_src: &str, main_src: &str, extra_opts: &[String]) -> i32 {
+    let dir = tempfile::Builder::new()
+        .prefix(&format!("c17_dl_{}_", name))
+        .tempdir()
+        .expect("failed to create work dir");
+
+    let lib_c = dir.path().join("lib.c");
+    let main_c = dir.path().join("main.c");
+    std::fs::write(&lib_c, lib_src).expect("failed to write library source");
+    std::fs::write(&main_c, main_src).expect("failed to write driver source");
+    let so = dir.path().join("lib.so");
+    let exe = dir.path().join("driver");
+
+    let mut lib_args = vec![
+        "-fPIC".to_string(),
+        "--shared".to_string(),
+        "-o".to_string(),
+        so.to_string_lossy().into_owned(),
+        lib_c.to_string_lossy().into_owned(),
+    ];
+    lib_args.extend(extra_opts.iter().cloned());
+    let r = run_test_base("c17", &lib_args, &[]);
+    if !r.status.success() {
+        eprintln!(
+            "c17 failed to build the shared object for {}:\n{}",
+            name,
+            String::from_utf8_lossy(&r.stderr)
+        );
+        return -1;
+    }
+
+    let main_args = vec![
+        "-o".to_string(),
+        exe.to_string_lossy().into_owned(),
+        main_c.to_string_lossy().into_owned(),
+        "-ldl".to_string(),
+    ];
+    let r = run_test_base("c17", &main_args, &[]);
+    if !r.status.success() {
+        eprintln!(
+            "c17 failed to build the dlopen driver for {}:\n{}",
+            name,
+            String::from_utf8_lossy(&r.stderr)
+        );
+        return -1;
+    }
+
+    let out = Command::new(&exe)
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run dlopen driver");
+    let code = out.status.code().unwrap_or(-1);
+    if code != 0 {
+        eprintln!(
+            "dlopen driver for {} exited {}:\n{}{}",
+            name,
+            code,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    code
+}
+
 /// Compile inline C code and run with all matrix configurations.
 /// Returns 0 if all configurations pass, or the first non-zero exit code on failure.
 pub fn compile_and_run(name: &str, content: &str, extra_opts: &[String]) -> i32 {

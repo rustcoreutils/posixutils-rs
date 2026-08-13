@@ -13,6 +13,8 @@
 pub fn get_macros() -> Vec<(&'static str, Option<String>)> {
     vec![
         // FreeBSD identification
+        // ELF adds no prefix to a C identifier.
+        ("__USER_LABEL_PREFIX__", Some("".into())),
         ("__FreeBSD__", Some("13".into())), // Conservative version
         ("__FreeBSD_kernel__", Some("1".into())),
         // ELF binary format

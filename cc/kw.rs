@@ -20,7 +20,7 @@
 use crate::strings::StringId;
 
 // ============================================================================
-// Tag bit constants (u32, 14 of 32 used)
+// Tag bit constants (u32, 15 of 32 used)
 // ============================================================================
 
 pub const TYPE_SPEC: u32 = 1 << 0;
@@ -37,6 +37,16 @@ pub const BUILTIN: u32 = 1 << 10;
 pub const SUPPORTED_ATTR: u32 = 1 << 11;
 pub const ALIGNAS_KW: u32 = 1 << 12;
 pub const TYPE_KEYWORD: u32 = 1 << 13;
+/// Never valid as a declarator name.
+///
+/// A separate bit rather than a derived predicate, because the boundary is
+/// empirical rather than structural: it is exactly the set gcc rejects in C17
+/// mode. `alignof`, `typeof_unqual` and `_BitInt` are C23 spellings and stay
+/// usable as identifiers; `typeof` is a GNU extension and gcc accepts
+/// `int typeof;` too. Nor can it be derived from the naming convention that
+/// separates standard C from GNU extensions (`FOO` vs `GNU_FOO`), because that
+/// lives in the Rust const identifier and is not queryable at runtime.
+pub const RESERVED_NAME: u32 = 1 << 14;
 
 /// Composite: all tags that start a declaration
 pub const DECL_START: u32 =
@@ -104,6 +114,10 @@ define_keywords! {
     (UNSIGNED,          "unsigned",          TYPE_SPEC | TYPE_KEYWORD),
     (BOOL,              "_Bool",             TYPE_SPEC | TYPE_KEYWORD),
     (COMPLEX,           "_Complex",          TYPE_SPEC | TYPE_KEYWORD),
+    // C99 6.4.1 reserves `_Imaginary` whether or not imaginary types are
+    // provided (Annex G makes the types optional, not the keyword), so the
+    // name is reserved here without a type behind it.
+    (_,                 "_Imaginary",        RESERVED_NAME),
     (FLOAT16,           "_Float16",          TYPE_SPEC | TYPE_KEYWORD),
     (FLOAT32,           "_Float32",          TYPE_SPEC | TYPE_KEYWORD),
     (FLOAT64,           "_Float64",          TYPE_SPEC | TYPE_KEYWORD),
@@ -115,8 +129,11 @@ define_keywords! {
     (UNION,             "union",             TYPE_SPEC | TYPE_KEYWORD),
     (ENUM,              "enum",              TYPE_SPEC | TYPE_KEYWORD),
     (TYPEOF,            "typeof",            TYPE_SPEC | TYPE_KEYWORD),
-    (GNU_TYPEOF,        "__typeof__",        TYPE_SPEC | TYPE_KEYWORD),
-    (GNU_TYPEOF2,       "__typeof",          TYPE_SPEC | TYPE_KEYWORD),
+    // The `__`-spelled forms stay reserved even though plain `typeof` does
+    // not: a leading double underscore is reserved to the implementation in
+    // every scope (C17 7.1.3), and gcc rejects `int __typeof__;` accordingly.
+    (GNU_TYPEOF,        "__typeof__",        TYPE_SPEC | TYPE_KEYWORD | RESERVED_NAME),
+    (GNU_TYPEOF2,       "__typeof",          TYPE_SPEC | TYPE_KEYWORD | RESERVED_NAME),
     (ATOMIC,            "_Atomic",           TYPE_SPEC | QUALIFIER | TYPE_KEYWORD),
 
     // ---- Storage class (STORAGE) ----
@@ -158,7 +175,7 @@ define_keywords! {
     (GNU_ASM2,          "__asm",             ASM_KW),
 
     // ---- Static assert (ASSERT_KW) ----
-    (_,                 "_Static_assert",    ASSERT_KW),
+    (_,                 "_Static_assert",    ASSERT_KW | RESERVED_NAME),
     (_,                 "static_assert",     ASSERT_KW),
 
     // ---- Alignas (ALIGNAS_KW) ----
@@ -173,28 +190,28 @@ define_keywords! {
     (_,                 "__null_unspecified", NULLABILITY),
 
     // ---- Statement keywords (STMT_KW) ----
-    (IF,                "if",                STMT_KW),
-    (ELSE,              "else",              STMT_KW),
-    (WHILE,             "while",             STMT_KW),
-    (DO,                "do",                STMT_KW),
-    (FOR,               "for",               STMT_KW),
-    (RETURN,            "return",            STMT_KW),
-    (BREAK,             "break",             STMT_KW),
-    (CONTINUE,          "continue",          STMT_KW),
-    (GOTO,              "goto",              STMT_KW),
-    (SWITCH,            "switch",            STMT_KW),
-    (CASE,              "case",              STMT_KW),
-    (DEFAULT,           "default",           STMT_KW),
+    (IF,                "if",                STMT_KW | RESERVED_NAME),
+    (ELSE,              "else",              STMT_KW | RESERVED_NAME),
+    (WHILE,             "while",             STMT_KW | RESERVED_NAME),
+    (DO,                "do",                STMT_KW | RESERVED_NAME),
+    (FOR,               "for",               STMT_KW | RESERVED_NAME),
+    (RETURN,            "return",            STMT_KW | RESERVED_NAME),
+    (BREAK,             "break",             STMT_KW | RESERVED_NAME),
+    (CONTINUE,          "continue",          STMT_KW | RESERVED_NAME),
+    (GOTO,              "goto",              STMT_KW | RESERVED_NAME),
+    (SWITCH,            "switch",            STMT_KW | RESERVED_NAME),
+    (CASE,              "case",              STMT_KW | RESERVED_NAME),
+    (DEFAULT,           "default",           STMT_KW | RESERVED_NAME),
 
     // ---- Sizeof / Alignof / Generic ----
-    (SIZEOF,            "sizeof",            0),
+    (SIZEOF,            "sizeof",            RESERVED_NAME),
     // _Generic introduces a primary expression, so it carries no tag. A
     // TYPE_SPEC or DECL_START tag would make is_declaration_start and
     // try_parse_type_name's entry gate mistake it for the start of a type.
-    (GENERIC,           "_Generic",          0),
-    (ALIGNOF,           "_Alignof",          0),
-    (GNU_ALIGNOF,       "__alignof__",       0),
-    (GNU_ALIGNOF2,      "__alignof",         0),
+    (GENERIC,           "_Generic",          RESERVED_NAME),
+    (ALIGNOF,           "_Alignof",          RESERVED_NAME),
+    (GNU_ALIGNOF,       "__alignof__",       RESERVED_NAME),
+    (GNU_ALIGNOF2,      "__alignof",         RESERVED_NAME),
     (ALIGNOF_C23,       "alignof",           0),
 
     // ---- Wide char prefix ----
@@ -259,6 +276,11 @@ define_keywords! {
     (BUILTIN_FABS,      "__builtin_fabs",     BUILTIN),
     (BUILTIN_FABSF,     "__builtin_fabsf",    BUILTIN),
     (BUILTIN_FABSL,     "__builtin_fabsl",    BUILTIN),
+    (BUILTIN_ISNAN,     "__builtin_isnan",    BUILTIN),
+    (BUILTIN_ISINF,     "__builtin_isinf",    BUILTIN),
+    (BUILTIN_ISFINITE,  "__builtin_isfinite", BUILTIN),
+    (BUILTIN_ISNORMAL,  "__builtin_isnormal", BUILTIN),
+    (BUILTIN_FPCLASSIFY,"__builtin_fpclassify", BUILTIN),
     (BUILTIN_SIGNBIT,   "__builtin_signbit",  BUILTIN),
     (BUILTIN_SIGNBITF,  "__builtin_signbitf", BUILTIN),
     (BUILTIN_SIGNBITL,  "__builtin_signbitl", BUILTIN),
@@ -310,6 +332,31 @@ define_keywords! {
     (SETJMP2,           "_setjmp",           0),
     (LONGJMP,           "longjmp",           0),
     (LONGJMP2,          "_longjmp",          0),
+
+    // ---- Fortified libc entry points ----
+    // Interned but untagged: these are ordinary identifiers, listed only so
+    // the parser can name one when it synthesizes the declaration glibc
+    // never writes. `bits/string_fortified.h` calls
+    // `__builtin___memcpy_chk` and expects the compiler to know
+    // `__memcpy_chk` intrinsically.
+    (_,                 "__memcpy_chk",         0),
+    (_,                 "__memmove_chk",        0),
+    (_,                 "__mempcpy_chk",        0),
+    (_,                 "__memset_chk",         0),
+    (_,                 "__strcpy_chk",         0),
+    (_,                 "__stpcpy_chk",         0),
+    (_,                 "__strncpy_chk",        0),
+    (_,                 "__stpncpy_chk",        0),
+    (_,                 "__strcat_chk",         0),
+    (_,                 "__strncat_chk",        0),
+    (_,                 "__sprintf_chk",        0),
+    (_,                 "__snprintf_chk",       0),
+    (_,                 "__printf_chk",         0),
+    (_,                 "__fprintf_chk",        0),
+    (_,                 "__vsprintf_chk",       0),
+    (_,                 "__vsnprintf_chk",      0),
+    (_,                 "__vprintf_chk",        0),
+    (_,                 "__vfprintf_chk",       0),
 
     // ---- Supported attribute names (SUPPORTED_ATTR) ----
     // Plain forms

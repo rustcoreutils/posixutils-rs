@@ -10,12 +10,13 @@
 //
 
 use super::ast::{
-    AssignOp, BinaryOp, Designator, Expr, ExprKind, InitElement, OffsetOfPath, UnaryOp,
+    AssignOp, BinaryOp, Designator, Expr, ExprKind, FpTest, InitElement, OffsetOfPath, UnaryOp,
 };
 use super::parser::{ParseError, ParseResult, Parser};
 use crate::diag;
+use crate::float::FloatVal;
 use crate::strings::StringId;
-use crate::symbol::{Namespace, Symbol};
+use crate::symbol::{Namespace, Symbol, SymbolId};
 use crate::token::lexer::{Position, SpecialToken, TokenType, TokenValue};
 use crate::types::{Type, TypeId, TypeKind, TypeModifiers};
 use gettextrs::gettext;
@@ -722,7 +723,8 @@ impl<'a> Parser<'a> {
                         | crate::kw::GNU_ALIGNOF
                         | crate::kw::GNU_ALIGNOF2
                         | crate::kw::ALIGNOF_C23
-                ) {
+                ) && !self.builtin_is_shadowed(name_id)
+                {
                     self.advance();
                     return self.parse_alignof();
                 }
@@ -1316,7 +1318,7 @@ impl<'a> Parser<'a> {
                             self.advance(); // consume final ')'
                                             // Create function pointer type with actual parameter types
                             let param_type_ids: Vec<TypeId> =
-                                raw_params.iter().map(|(_, typ)| *typ).collect();
+                                raw_params.iter().map(|p| p.typ).collect();
                             let fn_type =
                                 Type::function(result_id, param_type_ids, variadic, false);
                             let fn_type_id = self.types.intern(fn_type);
@@ -2065,6 +2067,43 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Whether a declaration in scope displaces the builtin meaning the parser
+    /// would otherwise give `name_id`.
+    ///
+    /// `offsetof`, `alignof`, `setjmp` and `longjmp` are not C17 keywords --
+    /// the first is a macro, the second a C23 spelling, the last two ordinary
+    /// library functions -- so a program may use any of them as an identifier,
+    /// and gcc accepts that. Recognising them ahead of ordinary lookup made
+    /// them impossible to *use*: `int offsetof; offsetof = 1;` declared fine
+    /// and then reported "expected '('".
+    ///
+    /// `setjmp` and `longjmp` are the exception, and only against a *function*
+    /// declaration: `<setjmp.h>` declares exactly those, and they need code
+    /// generation an ordinary call cannot produce. A declaration of any other
+    /// kind -- a variable, a parameter, a typedef -- is unambiguously not that
+    /// function.
+    ///
+    /// The reserved spellings (`__builtin_*`, `_Alignof`, `__alignof__`) are
+    /// never displaced: C17 7.1.3 reserves them to the implementation in every
+    /// scope, so a program that declares one has no claim on the name.
+    fn builtin_is_shadowed(&self, name_id: StringId) -> bool {
+        let shadowed_by_any_decl = matches!(name_id, crate::kw::OFFSETOF | crate::kw::ALIGNOF_C23);
+        let shadowable = shadowed_by_any_decl
+            || matches!(
+                name_id,
+                crate::kw::SETJMP | crate::kw::SETJMP2 | crate::kw::LONGJMP | crate::kw::LONGJMP2
+            );
+        if !shadowable {
+            return false;
+        }
+
+        let Some(symbol_id) = self.symbols.lookup_id(name_id, Namespace::Ordinary) else {
+            return false;
+        };
+        shadowed_by_any_decl
+            || self.types.kind(self.symbols.get(symbol_id).typ) != TypeKind::Function
+    }
+
     /// Try to parse a builtin function expression.
     /// Returns `Some(result)` if `name_id` is a recognized builtin, `None` otherwise.
     fn parse_builtin_expr(
@@ -2349,7 +2388,7 @@ impl<'a> Parser<'a> {
                 self.expect_special(b'(')?;
                 self.expect_special(b')')?;
                 Ok(Self::typed_expr(
-                    ExprKind::FloatLit(f64::INFINITY),
+                    ExprKind::FloatLit(FloatVal::infinity(false)),
                     self.types.double_id,
                     token_pos,
                 ))
@@ -2358,7 +2397,7 @@ impl<'a> Parser<'a> {
                 self.expect_special(b'(')?;
                 self.expect_special(b')')?;
                 Ok(Self::typed_expr(
-                    ExprKind::FloatLit(f64::INFINITY),
+                    ExprKind::FloatLit(FloatVal::infinity(false)),
                     self.types.float_id,
                     token_pos,
                 ))
@@ -2367,7 +2406,7 @@ impl<'a> Parser<'a> {
                 self.expect_special(b'(')?;
                 self.expect_special(b')')?;
                 Ok(Self::typed_expr(
-                    ExprKind::FloatLit(f64::INFINITY),
+                    ExprKind::FloatLit(FloatVal::infinity(false)),
                     self.types.longdouble_id,
                     token_pos,
                 ))
@@ -2379,7 +2418,7 @@ impl<'a> Parser<'a> {
                 let _arg = self.parse_assignment_expr()?; // string argument (ignored)
                 self.expect_special(b')')?;
                 Ok(Self::typed_expr(
-                    ExprKind::FloatLit(f64::NAN),
+                    ExprKind::FloatLit(FloatVal::nan()),
                     self.types.double_id,
                     token_pos,
                 ))
@@ -2389,7 +2428,7 @@ impl<'a> Parser<'a> {
                 let _arg = self.parse_assignment_expr()?; // string argument (ignored)
                 self.expect_special(b')')?;
                 Ok(Self::typed_expr(
-                    ExprKind::FloatLit(f64::NAN),
+                    ExprKind::FloatLit(FloatVal::nan()),
                     self.types.float_id,
                     token_pos,
                 ))
@@ -2399,7 +2438,7 @@ impl<'a> Parser<'a> {
                 let _arg = self.parse_assignment_expr()?; // string argument (ignored)
                 self.expect_special(b')')?;
                 Ok(Self::typed_expr(
-                    ExprKind::FloatLit(f64::NAN),
+                    ExprKind::FloatLit(FloatVal::nan()),
                     self.types.longdouble_id,
                     token_pos,
                 ))
@@ -2446,6 +2485,54 @@ impl<'a> Parser<'a> {
                 ))
             })()),
             // Signbit builtins - test sign bit of floats
+            crate::kw::BUILTIN_ISNAN
+            | crate::kw::BUILTIN_ISINF
+            | crate::kw::BUILTIN_ISFINITE
+            | crate::kw::BUILTIN_ISNORMAL => Some((|| {
+                let test = match name_id {
+                    crate::kw::BUILTIN_ISNAN => FpTest::IsNan,
+                    crate::kw::BUILTIN_ISINF => FpTest::IsInf,
+                    crate::kw::BUILTIN_ISFINITE => FpTest::IsFinite,
+                    _ => FpTest::IsNormal,
+                };
+                self.expect_special(b'(')?;
+                let arg = self.parse_assignment_expr()?;
+                self.expect_special(b')')?;
+                Ok(Self::typed_expr(
+                    ExprKind::FpTest {
+                        test,
+                        arg: Box::new(arg),
+                    },
+                    self.types.int_id,
+                    token_pos,
+                ))
+            })()),
+            crate::kw::BUILTIN_FPCLASSIFY => Some((|| {
+                // __builtin_fpclassify(nan, inf, normal, subnormal, zero, x)
+                self.expect_special(b'(')?;
+                let mut args = Vec::with_capacity(6);
+                args.push(self.parse_assignment_expr()?);
+                while self.is_special(b',') {
+                    self.advance();
+                    args.push(self.parse_assignment_expr()?);
+                }
+                self.expect_special(b')')?;
+                if args.len() != 6 {
+                    return Err(ParseError::new(
+                        "__builtin_fpclassify expects five class codes and a value",
+                        token_pos,
+                    ));
+                }
+                let arg = args.pop().expect("checked length");
+                Ok(Self::typed_expr(
+                    ExprKind::FpClassify {
+                        classes: args,
+                        arg: Box::new(arg),
+                    },
+                    self.types.int_id,
+                    token_pos,
+                ))
+            })()),
             crate::kw::BUILTIN_SIGNBIT => Some((|| {
                 self.expect_special(b'(')?;
                 let arg = self.parse_assignment_expr()?;
@@ -2962,15 +3049,32 @@ impl<'a> Parser<'a> {
                 ))
             })()),
             crate::kw::BUILTIN_OBJECT_SIZE => Some((|| {
-                // __builtin_object_size(ptr, type) - returns (size_t)-1
-                // at compile time without optimization (conservative "don't know")
+                // __builtin_object_size(ptr, type): how many bytes remain in
+                // the object `ptr` points into, when that is known statically.
                 self.expect_special(b'(')?;
-                let _ptr = self.parse_assignment_expr()?;
+                let ptr = self.parse_assignment_expr()?;
                 self.expect_special(b',')?;
-                let _otype = self.parse_assignment_expr()?;
+                let otype = self.parse_assignment_expr()?;
                 self.expect_special(b')')?;
+
+                // The type argument must be an integer constant 0..3. Bit 0
+                // selects the closest surrounding subobject over the whole
+                // object; bit 1 asks for a minimum rather than a maximum.
+                let otype = self.eval_const_expr(&otype).unwrap_or(0).clamp(0, 3) as u32;
+
+                let size = match self.object_extent(&ptr) {
+                    // A statically known object has the same minimum and
+                    // maximum size, so bit 1 does not change the answer.
+                    Some(extent) => extent.remaining(otype & 1 != 0),
+                    // Unknown: the documented answers are the ones that make a
+                    // `_FORTIFY_SOURCE` check pass rather than fire, which is
+                    // the largest value for a maximum and zero for a minimum.
+                    None if otype & 2 != 0 => 0,
+                    None => u64::MAX,
+                };
+
                 Ok(Self::typed_expr(
-                    ExprKind::IntLit(-1),
+                    ExprKind::IntLit(size as i64),
                     self.types.ulong_id,
                     token_pos,
                 ))
@@ -3015,7 +3119,31 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        // Not declared — return 0 as fallback
+                        // Not declared. gcc knows these intrinsically and
+                        // glibc relies on that: `bits/string_fortified.h`
+                        // calls `__builtin___memcpy_chk` without ever
+                        // declaring `__memcpy_chk`. Synthesize the
+                        // declaration rather than failing.
+                        if let Some(symbol_id) = self
+                            .chk_builtin_return_type(real_name)
+                            .and_then(|ret| self.declare_chk_builtin(real_name, ret))
+                        {
+                            let ret_type = self
+                                .types
+                                .base_type(self.symbols.get(symbol_id).typ)
+                                .unwrap_or(self.types.int_id);
+                            let func_type = self.symbols.get(symbol_id).typ;
+                            let func_expr =
+                                Self::typed_expr(ExprKind::Ident(symbol_id), func_type, token_pos);
+                            return Ok(Self::typed_expr(
+                                ExprKind::Call {
+                                    func: Box::new(func_expr),
+                                    args,
+                                },
+                                ret_type,
+                                token_pos,
+                            ));
+                        }
                         diag::error_args(token_pos, "undeclared function '{0}'", &[real_name]);
                         Ok(Self::typed_expr(
                             ExprKind::IntLit(0),
@@ -3048,9 +3176,12 @@ impl<'a> Parser<'a> {
                 if let TokenValue::Ident(id) = &token.value {
                     let name_id = *id;
 
-                    // Try builtin dispatch first
-                    if let Some(result) = self.parse_builtin_expr(name_id, token_pos) {
-                        return result;
+                    // Try builtin dispatch first, unless a declaration in scope
+                    // has claimed the name (see `builtin_is_shadowed`).
+                    if !self.builtin_is_shadowed(name_id) {
+                        if let Some(result) = self.parse_builtin_expr(name_id, token_pos) {
+                            return result;
+                        }
                     }
 
                     // Look up symbol to get type (during parsing, symbol is in scope)
@@ -3293,16 +3424,25 @@ impl<'a> Parser<'a> {
                 && !is_float32_suffix
                 && !is_float64_suffix
                 && s_lower.ends_with('l');
-            let value: f64 = if is_hex {
+            let value: FloatVal = if is_hex {
                 // Hex float parsing: 0x[hex-digits].[hex-digits]p[±exponent]
-                // Value = significand × 2^exponent
-                Self::parse_hex_float(num_str).map_err(|_| {
+                // Value = significand × 2^exponent.
+                // `parse_hex_float_parts` is exact, so the literal reaches the
+                // target format without passing through `f64` -- which would
+                // flush `0x1p-16382L` to zero before its type is even known.
+                let (mantissa, exp2) = Self::parse_hex_float_parts(num_str).map_err(|_| {
                     ParseError::new(format!("invalid hex float literal: {}", s), pos)
-                })?
+                })?;
+                FloatVal::from_parts(false, mantissa, exp2)
             } else {
-                num_str
-                    .parse()
-                    .map_err(|_| ParseError::new(format!("invalid float literal: {}", s), pos))?
+                // Exact, like the hex path: the digits are scaled by a power
+                // of ten in full precision and only rounded once, at the
+                // target's width. Going through `f64` cost a `long double`
+                // eleven of its significand bits and flushed anything outside
+                // double's range before the type was even known.
+                let (mantissa, exp2) = crate::float::parse_decimal_float_parts(num_str)
+                    .map_err(|_| ParseError::new(format!("invalid float literal: {}", s), pos))?;
+                FloatVal::from_parts(false, mantissa, exp2)
             };
             let typ = if is_float16_suffix {
                 self.types.float16_id
@@ -3416,46 +3556,71 @@ impl<'a> Parser<'a> {
     /// Parse a hexadecimal floating-point literal (C99 feature)
     /// Format: 0x[hex-mantissa]p[±exponent] where mantissa can have decimal point
     /// Value = significand × 2^exponent
-    fn parse_hex_float(s: &str) -> Result<f64, ()> {
-        // Strip 0x prefix
+    /// Decompose a hex float literal into an exact `(mantissa, exp2)` pair,
+    /// where the value is `mantissa * 2^exp2` with `mantissa` an integer.
+    ///
+    /// C99 6.4.4.2 hex floats name a binary value directly, so this is exact
+    /// -- no decimal rounding is involved -- for any literal whose significand
+    /// fits 128 bits. Beyond that the tail is folded into a sticky low bit,
+    /// which is enough to round correctly at every width we support.
+    ///
+    /// Returned separately from [`parse_hex_float`] so a wider target format
+    /// can use the full significand rather than whatever survived an `f64`.
+    fn parse_hex_float_parts(s: &str) -> Result<(u128, i32), ()> {
         let s = s
             .strip_prefix("0x")
             .or_else(|| s.strip_prefix("0X"))
             .ok_or(())?;
 
-        // Find 'p' or 'P' separator for exponent
         let p_pos = s.find(['p', 'P']).ok_or(())?;
         let (mantissa_str, exp_str) = s.split_at(p_pos);
-        let exp_str = &exp_str[1..]; // Skip the 'p'/'P'
+        let exponent: i32 = exp_str[1..].parse().map_err(|_| ())?;
 
-        // Parse mantissa (may have decimal point)
-        let (int_part, frac_part) = if let Some(dot_pos) = mantissa_str.find('.') {
-            (&mantissa_str[..dot_pos], &mantissa_str[dot_pos + 1..])
-        } else {
-            (mantissa_str, "")
+        let (int_part, frac_part) = match mantissa_str.find('.') {
+            Some(dot) => (&mantissa_str[..dot], &mantissa_str[dot + 1..]),
+            None => (mantissa_str, ""),
         };
-
-        // Convert hex mantissa to f64
-        let int_val = if int_part.is_empty() {
-            0u64
-        } else {
-            u64::from_str_radix(int_part, 16).map_err(|_| ())?
-        };
-
-        let mut mantissa = int_val as f64;
-
-        // Add fractional part: each hex digit after dot is worth 1/16, 1/256, etc.
-        if !frac_part.is_empty() {
-            let frac_val = u64::from_str_radix(frac_part, 16).map_err(|_| ())?;
-            let frac_bits = frac_part.len() * 4; // 4 bits per hex digit
-            mantissa += frac_val as f64 / (1u64 << frac_bits) as f64;
+        if int_part.is_empty() && frac_part.is_empty() {
+            return Err(());
         }
 
-        // Parse exponent (base 10 number representing power of 2)
-        let exponent: i32 = exp_str.parse().map_err(|_| ())?;
+        // Accumulate the significand as an integer, remembering how far the
+        // radix point moved. A u128 holds 32 hex digits; the previous code
+        // used a u64 and shifted by `4 * digits`, so a 16-digit fraction
+        // shifted by 64 -- which wraps to a shift of 0 in release, turning
+        // `0x1.0000000000000002p0` into 3.0 rather than a value near 1.
+        let mut mantissa: u128 = 0;
+        let mut exp2 = exponent;
+        let mut sticky = false;
+        let mut seen_digit = false;
 
-        // Calculate final value: mantissa × 2^exponent
-        Ok(mantissa * (2.0_f64).powi(exponent))
+        for (i, c) in int_part.chars().chain(frac_part.chars()).enumerate() {
+            let d = c.to_digit(16).ok_or(())? as u128;
+            let in_fraction = i >= int_part.chars().count();
+
+            if mantissa.leading_zeros() >= 4 {
+                mantissa = (mantissa << 4) | d;
+                if in_fraction {
+                    exp2 -= 4;
+                }
+            } else {
+                // No room left: the digit only contributes to rounding. An
+                // integer digit still scales the value.
+                sticky |= d != 0;
+                if !in_fraction {
+                    exp2 += 4;
+                }
+            }
+            seen_digit = true;
+        }
+        if !seen_digit {
+            return Err(());
+        }
+
+        if sticky {
+            mantissa |= 1;
+        }
+        Ok((mantissa, exp2))
     }
 
     /// Parse an escape sequence starting at position i (after the backslash).
@@ -3576,5 +3741,277 @@ impl<'a> Parser<'a> {
         }
 
         result
+    }
+
+    /// What is statically known about the object a pointer expression
+    /// designates, for `__builtin_object_size`.
+    ///
+    /// Tracks both the whole object and the innermost aggregate containing the
+    /// designated byte, because the builtin's type argument selects between
+    /// them: `__builtin_object_size(s.arr, 0)` is everything left in `s`,
+    /// while type 1 is everything left in `arr`.
+    fn object_extent(&self, expr: &Expr) -> Option<ObjectExtent> {
+        match &expr.kind {
+            // An array name decays to a pointer to its first element, so it
+            // designates the array itself. A pointer *variable* designates
+            // whatever it was assigned, which is exactly what is not known.
+            ExprKind::Ident(id) => {
+                let typ = self.symbols.get(*id).typ;
+                if self.types.kind(typ) != TypeKind::Array {
+                    return None;
+                }
+                ObjectExtent::whole_of(self.byte_size(typ)?)
+            }
+
+            // A string literal is an array of its bytes plus the terminator.
+            ExprKind::StringLit(s) => ObjectExtent::whole_of(s.chars().count() as u64 + 1),
+
+            // `&lvalue` designates the lvalue, which may be a subobject.
+            ExprKind::Unary {
+                op: UnaryOp::AddrOf,
+                operand,
+            } => self.lvalue_extent(operand),
+
+            // A cast does not move the pointer.
+            ExprKind::Cast { expr, .. } => self.object_extent(expr),
+
+            // Pointer arithmetic with a constant displacement.
+            ExprKind::Binary {
+                op: op @ (BinaryOp::Add | BinaryOp::Sub),
+                left,
+                right,
+            } => {
+                let base = self.object_extent(left)?;
+                let elem = self.pointee_size(left)?;
+                let n = self.eval_const_expr(right)?;
+                let bytes = i128::from(elem).checked_mul(n)?;
+                base.advance(if *op == BinaryOp::Sub { -bytes } else { bytes })
+            }
+
+            // Everything else -- a call, a dereference, an unknown pointer.
+            _ => self.object_extent_of_lvalue_forms(expr),
+        }
+    }
+
+    /// The extent of an lvalue: the object it names, and where inside its
+    /// enclosing object it sits.
+    fn lvalue_extent(&self, expr: &Expr) -> Option<ObjectExtent> {
+        match &expr.kind {
+            ExprKind::Ident(id) => {
+                ObjectExtent::whole_of(self.byte_size(self.symbols.get(*id).typ)?)
+            }
+
+            ExprKind::Member { expr: base, member } => {
+                let base_typ = self.lvalue_type(base)?;
+                let info = self.types.find_member(base_typ, *member)?;
+                let outer = self.lvalue_extent(base)?;
+                outer.narrow(info.offset as u64, self.byte_size(info.typ)?)
+            }
+
+            // `a[i]` with a constant index, where `a` is an array we can see.
+            ExprKind::Index { array, index } => {
+                let n = self.eval_const_expr(index)?;
+                let outer = self.object_extent(array)?;
+                let elem = self.pointee_size(array)?;
+                outer.advance(i128::from(elem).checked_mul(n)?)
+            }
+
+            _ => None,
+        }
+    }
+
+    /// `Member` and `Index` reached without an `&`, i.e. an array-typed
+    /// subobject that decayed to a pointer.
+    fn object_extent_of_lvalue_forms(&self, expr: &Expr) -> Option<ObjectExtent> {
+        match &expr.kind {
+            ExprKind::Member { .. } | ExprKind::Index { .. } => {
+                let typ = self.lvalue_type(expr)?;
+                if self.types.kind(typ) != TypeKind::Array {
+                    return None;
+                }
+                self.lvalue_extent(expr)
+            }
+            _ => None,
+        }
+    }
+
+    /// The declared type of an lvalue expression, as far as it can be resolved
+    /// from symbols and member lookups alone.
+    fn lvalue_type(&self, expr: &Expr) -> Option<TypeId> {
+        match &expr.kind {
+            ExprKind::Ident(id) => Some(self.symbols.get(*id).typ),
+            ExprKind::Member { expr, member } => {
+                let base = self.lvalue_type(expr)?;
+                Some(self.types.find_member(base, *member)?.typ)
+            }
+            ExprKind::Index { array, .. } => {
+                let base = self.lvalue_type(array)?;
+                self.types.get(base).base
+            }
+            ExprKind::Cast { cast_type, .. } => Some(*cast_type),
+            _ => expr.typ,
+        }
+    }
+
+    /// Size in bytes of a type whose size is known and non-zero.
+    fn byte_size(&self, typ: TypeId) -> Option<u64> {
+        let bits = self.types.size_bits(typ);
+        if bits == 0 {
+            return None;
+        }
+        Some(u64::from(bits) / 8)
+    }
+
+    /// Size of what `expr` points at, for scaling pointer arithmetic.
+    fn pointee_size(&self, expr: &Expr) -> Option<u64> {
+        let typ = self.lvalue_type(expr)?;
+        let elem = self.types.get(typ).base?;
+        self.byte_size(elem)
+    }
+    /// The return type of a `_chk` fortified libc entry point, if `name` is
+    /// one c17 knows.
+    ///
+    /// The type matters more than it looks: these mostly return a pointer, and
+    /// declaring one of them `int` truncates the returned address to 32 bits.
+    /// `None` means "not a known `_chk` function", which stays an error.
+    fn chk_builtin_return_type(&mut self, name: &str) -> Option<TypeId> {
+        // The string family returns `char *`; the memory family returns
+        // `void *`; the printf family returns `int`.
+        match name {
+            "__memcpy_chk" | "__memmove_chk" | "__mempcpy_chk" | "__memset_chk" => {
+                Some(self.types.void_ptr_id)
+            }
+            "__strcpy_chk" | "__stpcpy_chk" | "__strncpy_chk" | "__stpncpy_chk"
+            | "__strcat_chk" | "__strncat_chk" => {
+                let char_id = self.types.char_id;
+                Some(self.types.intern(Type {
+                    kind: TypeKind::Pointer,
+                    base: Some(char_id),
+                    ..Default::default()
+                }))
+            }
+            "__sprintf_chk" | "__snprintf_chk" | "__printf_chk" | "__fprintf_chk"
+            | "__vsprintf_chk" | "__vsnprintf_chk" | "__vprintf_chk" | "__vfprintf_chk" => {
+                Some(self.types.int_id)
+            }
+            _ => None,
+        }
+    }
+
+    /// Declare a `_chk` entry point, so the call type-checks and returns a
+    /// value of the right width.
+    ///
+    /// The fixed parameters are counted even though their types are not
+    /// modelled: where an argument stops being fixed and starts being variadic
+    /// is an ABI question, not only a type-checking one. Apple's arm64 passes
+    /// every variadic argument on the stack while fixed ones stay in
+    /// registers, so declaring these as variadic-from-argument-zero -- which
+    /// is what an empty parameter list means -- put `__snprintf_chk`'s buffer,
+    /// length, flag and size on the stack, where it does not look for them.
+    fn declare_chk_builtin(&mut self, name: &str, ret_type: TypeId) -> Option<SymbolId> {
+        // Pre-interned in `cc/kw.rs`; the identifier table is read-only here.
+        let name_id = self.idents.lookup(name)?;
+
+        // (fixed parameters before the `...`, whether a `...` follows). The
+        // `v` forms take a `va_list` and are not variadic; the memory ones
+        // take a fixed argument list outright.
+        let (fixed, variadic) = match name {
+            "__printf_chk" => (2, true),
+            "__fprintf_chk" | "__sprintf_chk" => (3, true),
+            "__snprintf_chk" => (5, true),
+            "__vprintf_chk" => (3, false),
+            "__vfprintf_chk" | "__vsprintf_chk" => (4, false),
+            "__vsnprintf_chk" => (6, false),
+            "__memset_chk" | "__strcpy_chk" | "__stpcpy_chk" | "__strcat_chk" => (3, false),
+            "__memcpy_chk" | "__memmove_chk" | "__mempcpy_chk" | "__strncpy_chk"
+            | "__stpncpy_chk" | "__strncat_chk" => (4, false),
+            // An entry point this does not know is left as it was: variadic,
+            // with nothing fixed.
+            _ => (0, true),
+        };
+        // The types are not modelled -- only how many arguments are fixed --
+        // so each is spelled as the widest integer the ABI passes in one
+        // register, which a pointer, a size and a flag all classify as.
+        let params = vec![self.types.ulong_id; fixed];
+
+        let func_type = self.types.intern(Type {
+            kind: TypeKind::Function,
+            base: Some(ret_type),
+            variadic,
+            params: Some(params),
+            ..Default::default()
+        });
+        let symbol = Symbol::function(name_id, func_type, self.symbols.depth());
+        // A redeclaration can only mean the header did declare it after all,
+        // in which case the existing symbol is the one to use.
+        Some(self.symbols.declare(symbol).unwrap_or_else(|_| {
+            self.symbols
+                .lookup_id(name_id, Namespace::Ordinary)
+                .expect("declare failed but no existing symbol")
+        }))
+    }
+}
+
+/// A statically known object, and where inside it a pointer points.
+///
+/// `whole` / `offset` describe the complete object; `sub` / `sub_offset`
+/// describe the innermost aggregate containing the designated byte. For a
+/// plain array the two coincide.
+#[derive(Clone, Copy)]
+pub(crate) struct ObjectExtent {
+    whole: u64,
+    offset: u64,
+    sub: u64,
+    sub_offset: u64,
+}
+
+impl ObjectExtent {
+    /// A pointer to the start of an object of `size` bytes.
+    fn whole_of(size: u64) -> Option<Self> {
+        Some(ObjectExtent {
+            whole: size,
+            offset: 0,
+            sub: size,
+            sub_offset: 0,
+        })
+    }
+
+    /// Move the pointer by `bytes`, staying inside both objects.
+    fn advance(self, bytes: i128) -> Option<Self> {
+        let offset = i128::from(self.offset).checked_add(bytes)?;
+        let sub_offset = i128::from(self.sub_offset).checked_add(bytes)?;
+        // Out of bounds either way: gcc gives up rather than reporting a size
+        // that would licence an overrun.
+        if offset < 0 || offset > i128::from(self.whole) {
+            return None;
+        }
+        if sub_offset < 0 || sub_offset > i128::from(self.sub) {
+            return None;
+        }
+        Some(ObjectExtent {
+            offset: offset as u64,
+            sub_offset: sub_offset as u64,
+            ..self
+        })
+    }
+
+    /// Step into a member at `offset` bytes with size `size`, which becomes
+    /// the new innermost subobject.
+    fn narrow(self, offset: u64, size: u64) -> Option<Self> {
+        Some(ObjectExtent {
+            whole: self.whole,
+            offset: self.offset.checked_add(offset)?,
+            sub: size,
+            sub_offset: 0,
+        })
+    }
+
+    /// Bytes from the pointer to the end of the selected object.
+    fn remaining(self, closest_subobject: bool) -> u64 {
+        if closest_subobject {
+            self.sub.saturating_sub(self.sub_offset)
+        } else {
+            self.whole.saturating_sub(self.offset)
+        }
     }
 }

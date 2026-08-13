@@ -3,27 +3,45 @@
 ## Table of Contents
 
 - [Technical Debt](#technical-debt)
+- [Known Divergences](#known-divergences)
 - [Future Features](#future-features)
 - [Optimization Passes](#optimization-passes)
 - [Assembly Peephole Optimizations](#assembly-peephole-optimizations)
+- [External Test Suites](#external-test-suites)
 
 ## Technical Debt
 
-### Floating literals are stored as `f64`
+### `_FORTIFY_SOURCE` compiles but checks nothing
 
-**Location**: `ExprKind::FloatLit(f64)` in `cc/parse/ast.rs`
+Peeling this apart one layer at a time has been the only way to see it: each
+fix exposes the next blocker, and three of the layers are invisible until the
+one before it is in place. Five are done:
 
-**Issue**: Every floating literal is parsed into an `f64`, so any value outside
-double's range is lost before the type system ever sees it. `LDBL_MAX`
-evaluates to `inf` on x86-64, where `long double` is x87 80-bit and holds it
-comfortably; gcc prints `1.18973e+4932`.
+1. `__builtin_object_size` computing real sizes rather than "unknown".
+2. Implicit declarations for the `__builtin___*_chk` family.
+3. Asm label renaming, so glibc's `__REDIRECT` aliases resolve.
+4. `always_inline`, so the fortified wrapper reaches the caller at all.
+5. Inline definitions emitting no external definition.
 
-**Consequence**: `long double` constants are silently limited to 53 bits of
-mantissa and double's exponent range. `c17_long_double_round_trip` passes only
-because `inf` compares equal to itself.
+~~**Layer 5 — `__gnu_inline__` / `extern inline` must emit no out-of-line
+definition.**~~ Done. It turned out not to be a fortify problem at all: `inline`
+was never recorded on a function definition in the first place, so *every*
+spelling emitted an external definition and an `inline` function in a shared
+header failed to link.
 
-**Cost of fixing**: touches the AST, the constant folder, and both backends'
-immediate paths (`Loc::FImm` is `(f64, u32)`).
+**Layer 6 — `__builtin_object_size` has to be folded after inlining.** The
+wrapper computes the size of its own `__dest` *parameter*, which is genuinely
+unknown, so the front end folds it to `-1` before the inliner ever runs and the
+`_chk` call is handed `-1` — a value that means "do not check". gcc defers the
+fold until after inlining, when `__dest` is known to be the caller's `buf`.
+Fixing this means carrying the query into the IR and folding it in a
+post-inline pass that can trace a pointer back to its object.
+
+Until layer 6 lands, predefining `__OPTIMIZE__` (which is what makes glibc
+compile the wrappers at all) is a regression rather than a fix: it has been
+implemented and reverted three times, most recently after measuring the
+duplicate-symbol failure that turned out to be layer 5. `__OPTIMIZE__` and
+layer 6 must land together.
 
 ### Stack frames are larger than gcc's
 
@@ -49,6 +67,18 @@ and the acceptance gate has to raise the stack to measure correctness.
 
 ---
 
+## Known Divergences
+
+Behaviours where c17 differs from gcc on the same source. None is a
+translation-limit or a diagnostic gap; each silently changes what the program
+does or claims.
+
+| Area | Divergence |
+|------|-----------|
+| `_FORTIFY_SOURCE` | Still checks nothing. Five of six layers are done; the one that remains is described above, and is an ordinary compiler feature rather than fortify-specific work |
+| `__attribute__((packed))` on a struct with bitfields | The bitfields are laid out as if the struct were not packed; only the ordinary members lose their padding. `struct { unsigned a:20, b:20; }` is 5 bytes under gcc and 8 here. Packing a bitfield to the bit lets it straddle its `sizeof(T)` window, and a straddling field has no naturally-aligned span to read or write it through — `emit_bitfield_load` addresses one power-of-two unit. Supporting it means an access path that assembles a field from an arbitrary byte range |
+| `isnan()` on a `long double` | 65535 rather than 1. The builtins now exist; glibc only uses them at `__GNUC_PREREQ (4,4)`, and claiming that also demands `__float128` (`bits/floatn.h` turns on `__HAVE_FLOAT128` at 4.3), which x86-64 c17 has no arithmetic for. Both answers conform — C99 7.12.3.4 requires only a nonzero value |
+
 ## Future Features
 
 ### C11 Atomics — remaining semantic validation
@@ -58,18 +88,65 @@ and access through ordinary operators are all done. `_Atomic` on an array or
 function type is rejected.
 
 **Remaining:**
-- Reject `_Atomic` on a struct or union with a VLA member (the array and
-  function cases are handled)
-- Accept `_Atomic` after `*` in a declarator: `int *_Atomic p;` fails to parse
-  while `int *const p;` does not
-- Reject `&(atomic_struct.member)`
+- Warn on member access of an atomic struct or union, as gcc does
+  ("accessing a member of an atomic structure"). C11 6.5.2.3p5 makes it
+  undefined behaviour rather than a constraint violation, so this is a
+  warning, not the rejection an earlier version of this list called for.
 
-### C11 Thread-Local Storage — Dynamic Model
+Two entries that used to sit here were removed after being probed rather than
+implemented. Rejecting `_Atomic` on a struct or union with a VLA member is
+unreachable: such a type cannot be formed at all, since a VLA member is
+rejected outright and the typedef route is rejected at the typedef. And
+`int *_Atomic p;` now parses -- it was a qualifier-list bug at file scope, not
+a missing feature.
 
-Done: parser, symbol table, IR, x86-64 Local-Exec (`%fs:sym@TPOFF`) and Initial-Exec (`sym@GOTTPOFF`), AArch64 Local-Exec (`mrs tpidr_el0` + `tprel_hi12`/`tprel_lo12_nc`) and Initial-Exec (`gottpoff` / `gottpoff_lo12`).
+### C11 Thread-Local Storage
+
+Complete on Linux: Local-Exec, Initial-Exec and the dynamic model, on both
+architectures, with `-shared` and `-fPIC` taking the dynamic model while
+`-fPIE` and a plain executable keep Local-Exec.
+
+The dynamic model uses **TLS descriptors** rather than the older
+`@tlsgd` + `__tls_get_addr` sequence. That is already gcc's default on
+AArch64; on x86-64 it is gcc's `-mtls-dialect=gnu2`. Two measured reasons:
+
+- The `@tlsgd` sequence is a byte-exact 16-byte blob — `data16` prefix,
+  `.value 0x6666`, `rex64` — that the linker pattern-matches in order to relax
+  it to a static model. Emitting it without the padding is a hard link error
+  (`TLS transition from R_X86_64_TLSGD to R_X86_64_GOTTPOFF failed`), and c17's
+  LIR emits structured instructions rather than byte blobs.
+- A descriptor resolver preserves every register but the one it returns
+  through. `__tls_get_addr` is an ordinary call and clobbers all caller-saved
+  registers.
+
+That second point is why the register allocator turned out not to be the
+blocker this file previously described. The sequence is **not** call-like: it
+declares a single clobber through `opcode_constraints`, the same mechanism that
+already handles `DivS` clobbering `RAX`/`RDX`. Adding it to `is_call_like_*`
+would be actively wrong — call positions send every live floating-point value
+to a stack slot and spill argument registers, none of which a descriptor needs.
+
+The address computation is an IR opcode (`Opcode::TlsAddr`) rather than
+something a backend `emit_*` helper synthesizes, because register allocation
+runs over the IR and finishes before any machine instruction exists. `ir::tls`
+expands thread-local accesses into it, and only under the dynamic model, so
+Local-Exec keeps its one-instruction form.
+
+Both architectures return an *offset* from the thread pointer, which the
+sequence then adds — gcc hides this on x86-64 by folding the addition into the
+access as `%fs:(%rax)`.
 
 **Remaining:**
-- General-Dynamic model (`_Thread_local` in shared libraries; `__tls_get_addr` on x86-64, `tlsdesc` on AArch64).
+- Not implemented on FreeBSD, whose rtld may lack x86-64 descriptor support;
+  TLS is gated on Linux, as it already was.
+- The older `gnu` dialect is not implemented. If a target needs it, it belongs
+  behind `-mtls-dialect=gnu`.
+- Four latent Local-Exec sites remain in the x86-64 backend
+  (`loc_to_gp_operand`, the two inline-asm operand paths, `loc_to_asm_string`,
+  the last of which formats a thread-local as a plain `name(%rip)`). None is
+  reachable from C source — under the dynamic model the expansion pass removes
+  thread-local operands before codegen sees them — and three are `&self` and
+  cannot emit a sequence at all.
 
 ---
 
@@ -96,6 +173,11 @@ Convert constant branches to unconditional jumps. Merge simple blocks. Remove ju
 #### Copy Propagation & SSA Cleanup
 
 `t1 = x; y = t1;` → `y = x`. Simplify φ-nodes where all incoming operands are same.
+
+**Blocked.** An attempt at this surfaced a register-allocator defect that is
+still open: a non-variadic `Arg` pseudo's location is computed off the wrong
+frame base (spill slot versus callee frame). Any pass that merges pseudos
+trips it, so copy propagation cannot land until that is fixed.
 
 #### Local CSE / Value Numbering
 

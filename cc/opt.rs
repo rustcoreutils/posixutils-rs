@@ -19,6 +19,8 @@ use crate::ir::validate;
 use crate::ir::{Function, Module};
 
 #[cfg(test)]
+use crate::float::FloatVal;
+#[cfg(test)]
 use crate::ir::{Pseudo, PseudoId, PseudoKind};
 
 /// Maximum iterations for the optimization fixed-point loop.
@@ -48,7 +50,7 @@ fn get_const_val(func: &Function, id: PseudoId) -> Option<i128> {
 #[cfg(test)]
 fn get_const_fval(func: &Function, id: PseudoId) -> Option<f64> {
     get_pseudo(func, id).and_then(|p| match &p.kind {
-        PseudoKind::FVal(v) => Some(*v),
+        PseudoKind::FVal(v) => Some(v.to_f64()),
         _ => None,
     })
 }
@@ -67,17 +69,21 @@ fn is_const(func: &Function, id: PseudoId) -> bool {
 
 /// Optimize a module at the given optimization level.
 ///
-/// Level 0: No optimization
+/// Level 0: nothing but `__attribute__((always_inline))` inlining
 /// Level 1+: Run inlining, InstCombine, and DCE passes
 pub fn optimize_module(module: &mut Module, level: u32) {
-    if level == 0 {
-        return;
-    }
-
     // Phase 1: Function inlining (module-level pass)
     // This inlines small functions at their call sites and removes
     // dead static functions that were fully inlined.
+    //
+    // Runs even at -O0, where it admits only `__attribute__((always_inline))`
+    // functions -- gcc honours that attribute with optimization off. It is a
+    // no-op for a module that has none.
     inline::run(module, level);
+
+    if level == 0 {
+        return;
+    }
 
     // Phase 2: Per-function optimization (InstCombine + DCE)
     for func in &mut module.functions {
@@ -135,7 +141,7 @@ mod tests {
         // Add some pseudos
         func.add_pseudo(Pseudo::val(PseudoId(0), 42));
         func.add_pseudo(Pseudo::reg(PseudoId(1), 1));
-        func.add_pseudo(Pseudo::fval(PseudoId(2), 3.14));
+        func.add_pseudo(Pseudo::fval(PseudoId(2), FloatVal::from_f64(3.14)));
 
         // Add a basic block
         let mut bb = BasicBlock::new(BasicBlockId(0));

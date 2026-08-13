@@ -34,6 +34,13 @@ int extern_func(void) { return 77; }
 
 // === Function specifiers ===
 static inline int inline_add(int a, int b) { return a + b; }
+
+// C99 6.7.4p6: an `inline` definition with no `extern` in any declaration
+// provides no external definition, so calling it is only well-defined if
+// every call is inlined. The `extern` declaration is what makes this one an
+// external definition, and it is the spelling the header comment above claims
+// to cover. Without it this file links only at -O and above -- under gcc too.
+extern int inline_mul(int a, int b);
 inline int inline_mul(int a, int b) { return a * b; }
 
 // Variadic for default promotion test

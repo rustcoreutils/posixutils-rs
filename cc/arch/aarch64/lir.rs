@@ -217,6 +217,40 @@ pub enum Aarch64Inst {
         dst: Reg,
     },
 
+    /// TLS descriptor (dynamic model): adrp dst, :tlsdesc:sym
+    AdrpTlsdesc {
+        sym: Symbol,
+        dst: Reg,
+    },
+
+    /// TLS descriptor: ldr dst, [base, #:tlsdesc_lo12:sym] -- the resolver
+    /// entry point held in the descriptor.
+    LdrTlsdescLo12 {
+        sym: Symbol,
+        base: Reg,
+        dst: Reg,
+    },
+
+    /// TLS descriptor: add dst, base, :tlsdesc_lo12:sym -- completes the
+    /// descriptor address, which the resolver takes in x0.
+    AddTlsdescLo12 {
+        sym: Symbol,
+        base: Reg,
+        dst: Reg,
+    },
+
+    /// `.tlsdesccall sym` -- marks the `blr` that follows, which the linker
+    /// needs in order to relax the sequence to a static model.
+    TlsdescCall {
+        sym: Symbol,
+    },
+
+    /// `blr reg` -- indirect call. Used here to invoke a TLS descriptor
+    /// resolver, which preserves every register but x0 and the link register.
+    Blr {
+        reg: Reg,
+    },
+
     /// TLS Initial Exec: adrp dst, :gottpoff:sym
     AdrpGottpoff {
         sym: Symbol,
@@ -1126,6 +1160,33 @@ impl EmitAsm for Aarch64Inst {
                 );
             }
 
+            Aarch64Inst::AdrpTlsdesc { sym, dst } => {
+                let _ = writeln!(out, "    adrp {}, :tlsdesc:{}", dst.name64(), sym.name);
+            }
+            Aarch64Inst::LdrTlsdescLo12 { sym, base, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    ldr {}, [{}, #:tlsdesc_lo12:{}]",
+                    dst.name64(),
+                    base.name64(),
+                    sym.name
+                );
+            }
+            Aarch64Inst::AddTlsdescLo12 { sym, base, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    add {}, {}, :tlsdesc_lo12:{}",
+                    dst.name64(),
+                    base.name64(),
+                    sym.name
+                );
+            }
+            Aarch64Inst::TlsdescCall { sym } => {
+                let _ = writeln!(out, "    .tlsdesccall {}", sym.name);
+            }
+            Aarch64Inst::Blr { reg } => {
+                let _ = writeln!(out, "    blr {}", reg.name64());
+            }
             Aarch64Inst::AdrpGottpoff { sym, dst } => {
                 let sym_name = sym.format_for_target(target);
                 let _ = writeln!(out, "    adrp {}, :gottpoff:{}", dst.name64(), sym_name);

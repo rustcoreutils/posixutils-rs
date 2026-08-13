@@ -60,6 +60,11 @@ pub const SUPPORTED_BUILTINS: &[&str] = &[
     "__builtin_fabsf",
     "__builtin_fabsl",
     // Floating-point sign bit testing
+    "__builtin_isnan",
+    "__builtin_isinf",
+    "__builtin_isfinite",
+    "__builtin_isnormal",
+    "__builtin_fpclassify",
     "__builtin_signbit",
     "__builtin_signbitf",
     "__builtin_signbitl",

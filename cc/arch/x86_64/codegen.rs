@@ -63,13 +63,11 @@ pub struct X86_64CodeGen {
     pub(super) tls_symbols: HashSet<String>,
     /// Position-independent code mode (for shared libraries and PIE)
     pic_mode: bool,
-    /// Shared library mode (affects TLS model selection)
-    shared_mode: bool,
     /// Long double constants to emit (label_bits -> value_bits).
     /// BTreeMap so the .rodata emission order in `emit_ld_constants`
     /// is deterministic (HashMap iteration would vary the layout
     /// across runs, breaking reproducible builds).
-    pub(super) ld_constants: std::collections::BTreeMap<u64, [u8; 16]>,
+    pub(super) ld_constants: std::collections::BTreeMap<u128, [u8; 16]>,
     /// Double constants to emit (label_bits -> f64 value).
     /// BTreeMap for the same reason as `ld_constants` — emission
     /// order in `emit_double_constants` must be reproducible.
@@ -101,7 +99,6 @@ impl X86_64CodeGen {
             extern_symbols: HashSet::new(),
             tls_symbols: HashSet::new(),
             pic_mode: false,
-            shared_mode: false,
             ld_constants: std::collections::BTreeMap::new(),
             double_constants: std::collections::BTreeMap::new(),
             sym_type_sizes: HashMap::new(),
@@ -204,7 +201,7 @@ impl X86_64CodeGen {
                 };
                 // Use TLS addressing for thread-local variables (Linux only)
                 if self.tls_symbols.contains(name) && self.base.target.os == Os::Linux {
-                    GpOperand::Mem(MemAddr::TlsIE(symbol))
+                    GpOperand::Mem(MemAddr::TlsLocalExec(symbol))
                 } else {
                     // Note: For GOT access (PIC mode/external symbols), special handling
                     // is needed - see emit_global_load* and emit_global_store* functions
@@ -212,6 +209,98 @@ impl X86_64CodeGen {
                     GpOperand::Mem(MemAddr::RipRelative(symbol))
                 }
             }
+        }
+    }
+
+    /// Whether `name` is a thread-local this backend must access through the
+    /// FS segment. TLS lowering here is Linux-only; the other targets fall
+    /// through to ordinary global access.
+    #[inline]
+    pub(super) fn is_tls_symbol(&self, name: &str) -> bool {
+        self.tls_symbols.contains(name) && self.base.target.os == Os::Linux
+    }
+
+    /// Whether accessing the thread-local `name` needs the Initial Exec model
+    /// rather than Local Exec. See [`CodeGenBase::use_tls_ie`].
+    fn use_tls_ie(&self, name: &str) -> bool {
+        self.base.use_tls_ie(self.extern_symbols.contains(name))
+    }
+
+    /// Compute the *address* of a thread-local into `dst`.
+    ///
+    /// Loading a thread-local's value takes one instruction, because the FS
+    /// segment override does the addition. Taking its address does not: the
+    /// thread pointer has to be materialized first, since `%fs:sym@TPOFF` is a
+    /// memory operand, not a value. Getting this wrong is invisible on a read
+    /// -- the bad address often still points at something mapped -- and
+    /// segfaults on a write.
+    fn emit_tls_addr(&mut self, name: &str, dst: Reg) {
+        let symbol = Symbol::global(name.to_string());
+        if self.base.use_tls_dynamic() {
+            // TLS descriptor, the dynamic model:
+            //   leaq sym@TLSDESC(%rip), %rax
+            //   call *sym@TLSCALL(%rax)      ; returns an OFFSET in %rax
+            //   addq %fs:0, %rax             ; plus the thread pointer
+            //
+            // The resolver returns the offset from the thread pointer, not an
+            // address -- the same convention Initial Exec uses. gcc hides this
+            // by folding the addition into the access as `%fs:(%rax)`; here
+            // the whole point is to produce a plain pointer, so the thread
+            // pointer is added explicitly.
+            //
+            // `%rax` is not a choice -- the `@TLSCALL` relocation names it,
+            // and the linker matches the `leaq`/`call` pair when relaxing to a
+            // static model, so nothing may come between them.
+            self.push_lir(X86Inst::Lea {
+                addr: MemAddr::TlsDesc(symbol.clone()),
+                dst: Reg::Rax,
+            });
+            self.push_lir(X86Inst::TlsDescCall { sym: symbol });
+            self.push_lir(X86Inst::Add {
+                size: OperandSize::B64,
+                src: GpOperand::Mem(MemAddr::FsAbsolute(0)),
+                dst: Reg::Rax,
+            });
+            if dst != Reg::Rax {
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Reg(Reg::Rax),
+                    dst: GpOperand::Reg(dst),
+                });
+            }
+            return;
+        }
+
+        // Initial Exec for a symbol defined elsewhere, matching what the load
+        // and store paths choose.
+        if self.use_tls_ie(name) {
+            // movq sym@GOTTPOFF(%rip), %dst   ; the offset from the thread pointer
+            // addq %fs:0, %dst                ; plus the thread pointer itself
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Mem(MemAddr::TlsGottpoff(symbol)),
+                dst: GpOperand::Reg(dst),
+            });
+            self.push_lir(X86Inst::Add {
+                size: OperandSize::B64,
+                src: GpOperand::Mem(MemAddr::FsAbsolute(0)),
+                dst,
+            });
+        } else {
+            // movq %fs:0, %dst                ; the thread pointer
+            // leaq sym@TPOFF(%dst), %dst      ; plus the link-time offset
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Mem(MemAddr::FsAbsolute(0)),
+                dst: GpOperand::Reg(dst),
+            });
+            self.push_lir(X86Inst::Lea {
+                addr: MemAddr::TlsTpoffBase {
+                    sym: symbol,
+                    base: dst,
+                },
+                dst,
+            });
         }
     }
 
@@ -309,7 +398,10 @@ impl X86_64CodeGen {
 
     fn emit_function(&mut self, func: &Function, types: &TypeTable) {
         // Save current function name for unique label generation
-        self.base.current_fn = func.name.clone();
+        // Local labels are derived from this and are compiler-internal, so
+        // they take the plain name: a verbatim asm-label marker belongs only
+        // on the symbol the assembler is asked for.
+        self.base.current_fn = crate::arch::lir::undecorated(&func.name).to_string();
 
         // Check if this function uses varargs
         let is_variadic = is_variadic_function(func);
@@ -1376,7 +1468,7 @@ impl X86_64CodeGen {
                 });
             }
             Loc::FImm(v, _) => {
-                let target = if *v != 0.0 {
+                let target = if !v.is_zero() {
                     insn.bb_true
                 } else {
                     insn.bb_false
@@ -1638,6 +1730,24 @@ impl X86_64CodeGen {
                 }
             }
 
+            Opcode::TlsAddr => {
+                if let (Some(target), Some(&src)) = (insn.target, insn.src.first()) {
+                    let dst_loc = self.get_location(target);
+                    // R10 is reserved scratch, so it is safe when the result
+                    // lives on the stack.
+                    let dst_reg = match &dst_loc {
+                        Loc::Reg(r) => *r,
+                        _ => Reg::R10,
+                    };
+                    if let Loc::Global(name) = self.get_location(src) {
+                        self.emit_tls_addr(&name, dst_reg);
+                        if !matches!(dst_loc, Loc::Reg(_)) {
+                            self.emit_move_to_loc(dst_reg, &dst_loc, 64);
+                        }
+                    }
+                }
+            }
+
             Opcode::SymAddr => {
                 if let (Some(target), Some(&src)) = (insn.target, insn.src.first()) {
                     let dst_loc = self.get_location(target);
@@ -1648,6 +1758,9 @@ impl X86_64CodeGen {
                     };
                     let src_loc = self.get_location(src);
                     match src_loc {
+                        Loc::Global(name) if self.is_tls_symbol(&name) => {
+                            self.emit_tls_addr(&name, dst_reg);
+                        }
                         Loc::Global(name) => {
                             // Check if it's a local label (starts with '.') or global symbol
                             let is_local_label = name.starts_with('.');
@@ -1974,8 +2087,7 @@ impl X86_64CodeGen {
                     // Thread-local storage: use FS segment
                     // Use Initial Exec model for external TLS or when building shared libraries.
                     // PIE executables can use Local Exec for their own TLS variables.
-                    let is_extern_tls = self.extern_symbols.contains(&name);
-                    let use_ie_model = is_extern_tls || self.shared_mode;
+                    let use_ie_model = self.use_tls_ie(&name);
 
                     if use_ie_model {
                         // Initial Exec: load offset from GOT, then load via FS segment
@@ -1994,7 +2106,7 @@ impl X86_64CodeGen {
                         // Local Exec: direct access via %fs:symbol@TPOFF
                         self.push_lir(X86Inst::Mov {
                             size: op_size,
-                            src: GpOperand::Mem(MemAddr::TlsIE(symbol)),
+                            src: GpOperand::Mem(MemAddr::TlsLocalExec(symbol)),
                             dst: GpOperand::Reg(dst),
                         });
                     }
@@ -2030,7 +2142,7 @@ impl X86_64CodeGen {
                 // Convert the float value to its bit representation and load as integer
                 if fp_size == 16 {
                     // Float16: convert to 16-bit representation
-                    let bits = f64_to_f16_bits(v);
+                    let bits = f64_to_f16_bits(v.to_f64());
                     self.push_lir(X86Inst::Mov {
                         size: OperandSize::B32,
                         src: GpOperand::Imm(bits as i64),
@@ -2038,7 +2150,7 @@ impl X86_64CodeGen {
                     });
                 } else if fp_size == 32 {
                     // float: convert to 32-bit representation
-                    let bits = (v as f32).to_bits();
+                    let bits = (v.to_f64() as f32).to_bits();
                     self.push_lir(X86Inst::Mov {
                         size: OperandSize::B32,
                         src: GpOperand::Imm(bits as i64),
@@ -2046,7 +2158,7 @@ impl X86_64CodeGen {
                     });
                 } else {
                     // double: convert to 64-bit representation
-                    let bits = v.to_bits();
+                    let bits = v.to_f64().to_bits();
                     self.push_lir(X86Inst::MovAbs {
                         imm: bits as i64,
                         dst,
@@ -2429,8 +2541,7 @@ impl X86_64CodeGen {
                     // Check if this is an external TLS variable (needs Initial Exec model)
                     // or if we're building a shared library (also needs IE model).
                     // PIE executables can use Local Exec for their own TLS variables.
-                    let is_extern_tls = self.extern_symbols.contains(&name);
-                    let use_ie_model = is_extern_tls || self.shared_mode;
+                    let use_ie_model = self.use_tls_ie(&name);
 
                     if use_ie_model {
                         // Initial Exec TLS model for external symbols:
@@ -2469,7 +2580,7 @@ impl X86_64CodeGen {
                         }
                     } else {
                         // Local Exec TLS model for local symbols: %fs:symbol@TPOFF
-                        let mem_addr = MemAddr::TlsIE(symbol);
+                        let mem_addr = MemAddr::TlsLocalExec(symbol);
                         if mem_size <= 16 {
                             let src_size = OperandSize::from_bits(mem_size);
                             if is_unsigned {
@@ -2746,8 +2857,7 @@ impl X86_64CodeGen {
                     // Thread-local storage: use FS segment
                     // Use Initial Exec model for external TLS or when building shared libraries.
                     // PIE executables can use Local Exec for their own TLS variables.
-                    let is_extern_tls = self.extern_symbols.contains(&name);
-                    let use_ie_model = is_extern_tls || self.shared_mode;
+                    let use_ie_model = self.use_tls_ie(&name);
 
                     if use_ie_model {
                         // Initial Exec: load offset from GOT, then store via FS segment
@@ -2766,7 +2876,7 @@ impl X86_64CodeGen {
                         self.push_lir(X86Inst::Mov {
                             size: op_size,
                             src: GpOperand::Reg(value_reg),
-                            dst: GpOperand::Mem(MemAddr::TlsIE(symbol)),
+                            dst: GpOperand::Mem(MemAddr::TlsLocalExec(symbol)),
                         });
                     }
                 } else if self.needs_got_access(&name) {
@@ -4050,6 +4160,10 @@ impl X86_64CodeGen {
 
     /// Format a symbol name with platform-specific prefix
     fn format_symbol_name(&self, name: &str) -> String {
+        // An asm label is the final name; see `lir::VERBATIM_MARKER`.
+        if let Some(verbatim) = crate::arch::lir::strip_verbatim(name) {
+            return verbatim.to_string();
+        }
         if self.base.target.os == Os::MacOS && !name.starts_with('.') {
             format!("_{}", name)
         } else {
@@ -4867,9 +4981,9 @@ impl X86_64CodeGen {
             }
             Loc::FImm(v, bits) => {
                 let pattern: i64 = if bits <= 32 {
-                    (v as f32).to_bits() as i64
+                    (v.to_f64() as f32).to_bits() as i64
                 } else {
-                    v.to_bits() as i64
+                    v.to_f64().to_bits() as i64
                 };
                 self.push_lir(X86Inst::Mov {
                     size: op_size,
@@ -5040,6 +5154,11 @@ impl CodeGenerator for X86_64CodeGen {
 
         // Emit functions
         for func in &module.functions {
+            // An inline definition is kept in the module so the inliner can
+            // use it, but provides no external definition -- see `Function::emit`.
+            if !func.emit {
+                continue;
+            }
             self.emit_function(func, types);
         }
 
@@ -5048,6 +5167,9 @@ impl CodeGenerator for X86_64CodeGen {
             self.base
                 .push_directive(Directive::local_label(".Ltext_end"));
         }
+
+        // Emit the constructor / destructor pointer arrays
+        self.base.emit_init_arrays(&module.functions);
 
         // Emit long double constants collected during codegen
         if !self.ld_constants.is_empty() {
@@ -5108,6 +5230,6 @@ impl CodeGenerator for X86_64CodeGen {
     }
 
     fn set_shared_mode(&mut self, shared: bool) {
-        self.shared_mode = shared;
+        self.base.shared_mode = shared;
     }
 }

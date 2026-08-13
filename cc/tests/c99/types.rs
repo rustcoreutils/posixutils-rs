@@ -213,3 +213,199 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("c99_types_mega", code, &[]), 0);
 }
+
+/// A signed bitfield sign-extends on read whatever its declared type.
+///
+/// The extension shifted left and arithmetic-right by
+/// `storage_unit_bits - width`, but the machine operation is performed at the
+/// promoted width. For a field backed by a one-byte unit that shifted bit 2 up
+/// to bit 7 of a 32-bit register, where it is not the sign bit, so the
+/// arithmetic shift saw a positive value and extended nothing:
+///
+/// ```text
+///     andl $7, %eax     ; masked, = 4
+///     shll $5, %ecx     ; 4 << 5 = 128
+///     sarl $5, %eax     ; still 128 >> 5 = 4, never -4
+/// ```
+///
+/// `int a:4` was correct precisely because its storage unit is 32 bits, which
+/// happens to equal the operation width.
+#[test]
+fn c99_signed_bitfields_sign_extend_at_every_declared_width() {
+    let src = r#"
+struct S {
+    signed char  sc : 3;
+    short        sh : 5;
+    int          i  : 4;
+    long         l  : 9;
+    long long    ll : 33;
+};
+
+struct U {
+    unsigned char  uc : 3;
+    unsigned short us : 5;
+    unsigned int   ui : 4;
+};
+
+int main(void)
+{
+    struct S s = {0};
+
+    /* Most negative and most positive at each width. */
+    s.sc = -4; if (s.sc != -4) return 1;
+    s.sc =  3; if (s.sc !=  3) return 2;
+    s.sh = -16; if (s.sh != -16) return 3;
+    s.sh =  15; if (s.sh !=  15) return 4;
+    s.i  = -8; if (s.i  != -8) return 5;
+    s.i  =  7; if (s.i  !=  7) return 6;
+    s.l  = -256; if (s.l != -256) return 7;
+    s.l  =  255; if (s.l !=  255) return 8;
+    s.ll = -4294967296LL; if (s.ll != -4294967296LL) return 9;
+    s.ll =  4294967295LL; if (s.ll !=  4294967295LL) return 10;
+
+    /* -1 is all ones in the field and must read back as -1, not the mask. */
+    s.sc = -1; if (s.sc != -1) return 11;
+    s.sh = -1; if (s.sh != -1) return 12;
+    s.l  = -1; if (s.l  != -1) return 13;
+
+    /* Incrementing across the signed boundary wraps like the narrow type. */
+    s.sc = 3; s.sc++; if (s.sc != -4) return 14;
+
+    /* Unsigned fields must not extend. */
+    struct U u = {0};
+    u.uc = 7; if (u.uc != 7) return 15;
+    u.us = 31; if (u.us != 31) return 16;
+    u.ui = 15; if (u.ui != 15) return 17;
+
+    /* In an expression, the promoted value must still be negative. */
+    s.sc = -4;
+    if (s.sc + 0 != -4) return 18;
+    if (s.sc * 2 != -8) return 19;
+    if (!(s.sc < 0)) return 20;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("bitfield_sign_extend", src, &[]), 0);
+}
+
+/// Bitfield allocation is a running bit offset from the start of the struct.
+///
+/// c17 used to track a byte offset plus one open storage unit, and to close
+/// that unit whenever the declared type changed or a plain member intervened.
+/// Both are wrong: the System V ABI allocates a bitfield at the next free
+/// *bit*, and its storage unit is a window that advances to the next
+/// `sizeof(T) * 8` boundary only when the field would otherwise straddle one.
+/// The declared type sets the window's size and the struct's alignment, never
+/// a fresh allocation.
+///
+/// Every size here is gcc's. The old model gave 12 for `D`, 8 for `C`.
+/// This is ABI-visible, so the sizes matter as much as the values do.
+#[test]
+fn c99_bitfields_allocate_at_the_next_free_bit() {
+    let src = r#"
+#include <stddef.h>
+
+/* A bitfield reuses the padding after a plain member. */
+struct D { char x; unsigned a:1; char y; };
+
+/* Different declared types share one unit; only the window size differs. */
+struct C { int a:4; unsigned b:4; signed char c:3; };
+
+/* A field that would straddle its window starts a new one. */
+struct X { unsigned a:31, b:2; };
+
+/* Zero width forces the next field to its own type's boundary. */
+struct Z { unsigned a:3; unsigned :0; unsigned b:3; };
+
+/* A narrow declared type keeps the struct's alignment narrow. */
+struct N { unsigned char a:6, b:6; };
+
+/* The window may begin past the first unit of the struct. */
+struct F { char pad[5]; unsigned a:1; };
+
+/* Two fields sharing a byte need not share an access window. */
+struct W { unsigned a:12; unsigned b:12; char y; };
+
+/* A union member is a bitfield too, however trivial its offset. */
+union U { int a:4; unsigned b; };
+
+/* Static initialization has to write the same bits the stores do. */
+static struct D sd = { 'p', 1, 'q' };
+static struct C sc = { -8, 15, -4 };
+static struct W sw = { 0xabc, 0xdef, 7 };
+static struct D sdesig = { .y = 'q', .a = 1, .x = 'p' };
+
+int main(void)
+{
+    if (sizeof(struct D) != 4) return 1;
+    if (sizeof(struct C) != 4) return 2;
+    if (sizeof(struct X) != 8) return 3;
+    if (sizeof(struct Z) != 8) return 4;
+    if (sizeof(struct N) != 2) return 5;
+    if (sizeof(struct F) != 8) return 6;
+
+    if (_Alignof(struct D) != 4) return 7;
+    if (_Alignof(struct N) != 1) return 8;
+
+    /* A bitfield never displaces the plain members around it. */
+    if (offsetof(struct D, x) != 0) return 9;
+    if (offsetof(struct D, y) != 2) return 10;
+    if (offsetof(struct F, pad) != 0) return 11;
+
+    /* Values survive a round trip through the shared units. */
+    struct D d;
+    d.x = 'a'; d.a = 1; d.y = 'b';
+    if (d.x != 'a' || d.a != 1 || d.y != 'b') return 12;
+    d.a = 0;
+    if (d.x != 'a' || d.a != 0 || d.y != 'b') return 13;
+
+    struct C c;
+    c.a = -8; c.b = 15; c.c = -4;
+    if (c.a != -8) return 14;
+    if (c.b != 15) return 15;
+    if (c.c != -4) return 16;
+    c.b = 0;
+    if (c.a != -8 || c.b != 0 || c.c != -4) return 17;
+
+    struct X x;
+    x.a = 0x7fffffffu; x.b = 3;
+    if (x.a != 0x7fffffffu || x.b != 3) return 18;
+
+    struct N n;
+    n.a = 63; n.b = 63;
+    if (n.a != 63 || n.b != 63) return 19;
+    n.a = 0;
+    if (n.a != 0 || n.b != 63) return 20;
+
+    struct F f;
+    f.pad[0] = 1; f.pad[4] = 5; f.a = 1;
+    if (f.pad[0] != 1 || f.pad[4] != 5 || f.a != 1) return 21;
+
+    struct W w;
+    w.a = 0xabc; w.b = 0xdef; w.y = 7;
+    if (w.a != 0xabcu || w.b != 0xdefu || w.y != 7) return 22;
+    w.a = 1;
+    if (w.a != 1u || w.b != 0xdefu || w.y != 7) return 23;
+
+    /* Reading a union's bitfield must see only its own bits. */
+    union U u;
+    u.b = 15;
+    if (u.a != -1) return 24;
+
+    /* Static images must agree with what the stores would have written. */
+    if (sd.x != 'p' || sd.a != 1 || sd.y != 'q') return 25;
+    if (sc.a != -8 || sc.b != 15 || sc.c != -4) return 26;
+    if (sw.a != 0xabcu || sw.b != 0xdefu || sw.y != 7) return 27;
+    if (sdesig.x != 'p' || sdesig.a != 1 || sdesig.y != 'q') return 28;
+
+    /* And byte for byte, not merely field by field: a wide window must not
+       have overwritten the plain member sharing its span. */
+    const unsigned char *bytes = (const unsigned char *)&sd;
+    if (bytes[0] != 'p' || bytes[1] != 1 || bytes[2] != 'q' || bytes[3] != 0) return 29;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("bitfield_allocation", src, &[]), 0);
+}

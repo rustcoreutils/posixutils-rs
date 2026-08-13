@@ -89,6 +89,41 @@ pub struct Symbol {
     /// Explicit alignment from _Alignas specifier (C11 6.7.5)
     /// None means use natural alignment for the type
     pub explicit_align: Option<u32>,
+
+    /// The symbol name to emit, from a GCC asm label:
+    /// `extern int myfn(int) __asm__("realfn");`
+    ///
+    /// `name` stays the declared identifier, because that is what source
+    /// refers to and what the symbol table is keyed on; this is what reaches
+    /// the assembler. Held as a `String` rather than a `StringId` because the
+    /// label is not an identifier -- it never needs to be looked up, and the
+    /// parser's identifier table is read-only by the time declarations are
+    /// parsed.
+    ///
+    /// glibc's `__REDIRECT` uses this throughout the `_FORTIFY_SOURCE`
+    /// headers, so ignoring it makes those headers fail to link.
+    pub asm_label: Option<String>,
+
+    /// Whether *any* file-scope declaration of this name carried `extern`.
+    ///
+    /// C99 6.7.4p6 makes an `inline` definition an external definition only if
+    /// some declaration says `extern`, and that declaration is allowed to come
+    /// *after* the definition -- indeed the standard idiom puts it there, one
+    /// translation unit repeating `extern int f(int);` to emit the body. So the
+    /// question cannot be answered while the definition is being parsed.
+    /// Recording it on the symbol defers it: by the time the linearizer runs,
+    /// every declaration in the translation unit has been seen.
+    pub has_extern_decl: bool,
+
+    /// Whether any file-scope declaration of this name *omitted* `inline`.
+    ///
+    /// C99 6.7.4p6 makes a definition an inline definition only if **all** the
+    /// file-scope declarations include `inline`, so a single bare declaration
+    /// is enough to demand an external definition. libmpdec does exactly that
+    /// -- `mpdecimal.h` declares `void mpd_set_positive(mpd_t *);` while
+    /// `mpdecimal.c` defines it `inline __attribute__((always_inline))` -- and
+    /// missing this left CPython's `_decimal` with an undefined symbol.
+    pub has_non_inline_decl: bool,
 }
 
 impl Symbol {
@@ -103,6 +138,9 @@ impl Symbol {
             defined: true,
             enum_value: None,
             explicit_align: None,
+            asm_label: None,
+            has_extern_decl: false,
+            has_non_inline_decl: false,
         }
     }
 
@@ -117,6 +155,9 @@ impl Symbol {
             defined: false, // Functions are declarations until we see the body
             enum_value: None,
             explicit_align: None,
+            asm_label: None,
+            has_extern_decl: false,
+            has_non_inline_decl: false,
         }
     }
 
@@ -131,6 +172,9 @@ impl Symbol {
             defined: true,
             enum_value: None,
             explicit_align: None,
+            asm_label: None,
+            has_extern_decl: false,
+            has_non_inline_decl: false,
         }
     }
 
@@ -145,6 +189,9 @@ impl Symbol {
             defined: true,
             enum_value: Some(value),
             explicit_align: None,
+            asm_label: None,
+            has_extern_decl: false,
+            has_non_inline_decl: false,
         }
     }
 
@@ -159,6 +206,9 @@ impl Symbol {
             defined: true,
             enum_value: None,
             explicit_align: None,
+            asm_label: None,
+            has_extern_decl: false,
+            has_non_inline_decl: false,
         }
     }
 
@@ -173,6 +223,9 @@ impl Symbol {
             defined: true,
             enum_value: None,
             explicit_align: None,
+            asm_label: None,
+            has_extern_decl: false,
+            has_non_inline_decl: false,
         }
     }
 
@@ -291,6 +344,31 @@ impl SymbolTable {
     /// Get the current scope depth
     pub fn depth(&self) -> u32 {
         self.scope_depth
+    }
+
+    /// Re-declare an existing symbol in the current scope, updating its type.
+    ///
+    /// A function's parameters are parsed in a temporary scope so that a later
+    /// parameter's size expression can name an earlier one (C17 6.9.1p10).
+    /// Those expressions are kept and evaluated on entry to the function, so
+    /// the function scope has to bind the *same* symbols rather than fresh
+    /// ones -- otherwise `int a[n][m]` records an extent read from a slot the
+    /// body never writes, and every row stride derived from it is wrong.
+    pub fn redeclare(&mut self, id: SymbolId, typ: TypeId) -> SymbolId {
+        let depth = self.scope_depth;
+        let sym = &mut self.symbols[id.0 as usize];
+        sym.scope_depth = depth;
+        sym.typ = typ;
+        let key = (sym.name, sym.namespace);
+
+        self.scopes[self.current_scope as usize].symbols.push(id);
+        // At the front, exactly as `declare` does: `lookup` takes the first
+        // entry, so the front is the innermost binding. Appending instead
+        // leaves a parameter behind any outer symbol of the same name, and a
+        // parameter that fails to shadow a file-scope typedef turns `(name)`
+        // into a parenthesized type name.
+        self.name_map.entry(key).or_default().insert(0, id);
+        id
     }
 
     /// Declare a symbol in the current scope

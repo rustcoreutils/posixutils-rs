@@ -11,10 +11,12 @@
 use super::linearize::*;
 use super::Initializer;
 use crate::diag::error;
+use crate::float::FloatVal;
 use crate::parse::ast::{BinaryOp, Declaration, Designator, Expr, ExprKind, InitElement, UnaryOp};
 use crate::strings::StringId;
+use crate::token::lexer::Position;
 use crate::types::{MemberInfo, TypeId, TypeKind, TypeModifiers, TypeTable};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Determine whether a declared object type is `const`-qualified for the
 /// purpose of section selection.
@@ -37,6 +39,34 @@ pub(crate) fn is_const_object_type(types: &TypeTable, typ: TypeId) -> bool {
             }
         }
         return false;
+    }
+}
+
+/// Name an expression the way a C programmer would, for a diagnostic.
+///
+/// The alternative these messages used was `{:?}` on the AST node, which
+/// prints interned ids, `FloatVal` internals and a `Position` struct for every
+/// subexpression -- pages of compiler internals for a one-line mistake.
+fn describe_expr(kind: &ExprKind) -> &'static str {
+    match kind {
+        ExprKind::Call { .. } => "a function call",
+        ExprKind::Assign { .. } => "an assignment",
+        ExprKind::Unary {
+            op: UnaryOp::PreInc | UnaryOp::PreDec,
+            ..
+        }
+        | ExprKind::PostInc(_)
+        | ExprKind::PostDec(_) => "an increment or decrement",
+        ExprKind::Unary {
+            op: UnaryOp::Deref, ..
+        } => "a pointer dereference",
+        ExprKind::Index { .. } => "an array subscript",
+        ExprKind::Member { .. } => "a member access",
+        ExprKind::Ident(_) => "the value of a variable",
+        ExprKind::Comma { .. } => "a comma expression",
+        ExprKind::Binary { .. } => "this arithmetic",
+        ExprKind::Conditional { .. } => "this conditional",
+        _ => "this expression",
     }
 }
 
@@ -136,6 +166,28 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// - Nested initializers
     /// - Compound literals (C99 6.5.2.5)
     pub(crate) fn ast_init_to_ir(&mut self, expr: &Expr, typ: TypeId) -> Initializer {
+        // An object of complex type needs both halves, whatever shape the
+        // initializer takes, so it is handled before the by-expression arms
+        // below -- several of which would otherwise match and keep only the
+        // real part.
+        if self.types.is_complex(typ) {
+            if let Some(init) = self.complex_initializer(expr, typ) {
+                return init;
+            }
+        }
+
+        // An arithmetic object is initialized with the *object's* encoding,
+        // whatever the constant's own type is (C17 6.7.9p11: the initializer
+        // is converted as in assignment). `int c = 1.0 + 2.0;` stores 3, not
+        // the IEEE bits of 3.0, and `double d = 1 + 2;` stores 3.0, not the
+        // integer 3. Deciding that here, from the type, keeps every expression
+        // arm below from having to decide it again -- and differently.
+        if self.types.is_integer(typ) || self.types.is_float(typ) {
+            if let Some(init) = self.fold_scalar_init(expr, typ) {
+                return init;
+            }
+        }
+
         match &expr.kind {
             ExprKind::IntLit(v) => Initializer::Int(*v as i128),
             ExprKind::Int128Lit(v) => Initializer::Int(*v),
@@ -150,9 +202,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     Initializer::String(s.clone())
                 } else {
                     // Pointer - create a string constant and reference it
-                    let label = format!(".LC{}", self.module.strings.len());
-                    self.module.strings.push((label.clone(), s.clone()));
-                    Initializer::SymAddr(label)
+                    Initializer::SymAddr(self.module.add_string(s.clone()))
                 }
             }
 
@@ -164,10 +214,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     Initializer::WideString(s.clone())
                 } else {
                     // Pointer - create a wide string constant and reference it
-                    // Use .LWC prefix to avoid collision with regular .LC string labels
-                    let label = format!(".LWC{}", self.module.wide_strings.len());
-                    self.module.wide_strings.push((label.clone(), s.clone()));
-                    Initializer::SymAddr(label)
+                    Initializer::SymAddr(self.module.add_wide_string(s.clone()))
                 }
             }
 
@@ -198,12 +245,18 @@ impl<'a> super::linearize::Linearizer<'a> {
             } => match &operand.kind {
                 ExprKind::IntLit(v) => Initializer::Int(-(*v as i128)),
                 ExprKind::Int128Lit(v) => Initializer::Int(v.wrapping_neg()),
-                ExprKind::FloatLit(v) => Initializer::Float(-*v),
+                ExprKind::FloatLit(v) => Initializer::Float(v.negated()),
                 // For more complex expressions like -(1+2), try constant evaluation
                 _ => {
+                    // An arithmetic object folded above, at its own type; what
+                    // is left is a negation initializing something else.
                     if let Some(val) = self.eval_const_expr(expr) {
                         Initializer::Int(val)
                     } else {
+                        // Returning `Initializer::None` here would put the
+                        // object in .bss and make it silently zero -- which is
+                        // what `-(1.0 + 2.0)` used to do.
+                        self.reject_initializer(expr);
                         Initializer::None
                     }
                 }
@@ -215,13 +268,22 @@ impl<'a> super::linearize::Linearizer<'a> {
                 operand,
             } => {
                 // Try to compute the address as symbol + offset
-                if let Some((name, offset)) = self.eval_static_address(operand) {
+                if let Some((name, offset)) = self.static_address_of(operand) {
                     if offset == 0 {
                         Initializer::SymAddr(name)
                     } else {
                         Initializer::SymAddrOffset(name, offset)
                     }
+                } else if let Some(val) = self.eval_const_expr(expr) {
+                    // Not every address-of is a relocation: the address of a
+                    // member of a null pointer is an integer constant, and a
+                    // pointer object may be initialized with one.
+                    Initializer::Int(val)
                 } else {
+                    // Returning `Initializer::None` here would put the object
+                    // in .bss and make the pointer null, which is what made
+                    // `&(struct P){1, 2}` segfault rather than fail to build.
+                    self.reject_initializer(expr);
                     Initializer::None
                 }
             }
@@ -299,22 +361,19 @@ impl<'a> super::linearize::Linearizer<'a> {
                 } else if right.typ.is_some_and(is_ptr_or_array) && *op == BinaryOp::Add {
                     (right.as_ref(), left.as_ref(), false)
                 } else {
-                    // Neither operand is pointer — try as integer constant
+                    // Neither operand is a pointer, so this is ordinary
+                    // arithmetic that happens to use `+` or `-`. An arithmetic
+                    // object folded above at its own type; anything else that
+                    // reaches here can only be an integer constant.
                     if let Some(val) = self.eval_const_expr(expr) {
                         return Initializer::Int(val);
                     }
-                    error(
-                        self.current_pos.unwrap_or_default(),
-                        &format!(
-                            "unsupported expression in global initializer: {:?}",
-                            expr.kind
-                        ),
-                    );
+                    self.reject_initializer(expr);
                     return Initializer::None;
                 };
 
                 // Evaluate the pointer side as a static address
-                if let Some((name, base_off)) = self.eval_static_address(ptr_expr) {
+                if let Some((name, base_off)) = self.static_address_of(ptr_expr) {
                     // Evaluate the integer side as a constant
                     if let Some(int_val) = self.eval_const_expr(int_expr) {
                         // Get the pointee size for pointer arithmetic scaling
@@ -381,10 +440,9 @@ impl<'a> super::linearize::Linearizer<'a> {
             // Other constant expressions
             // Try to evaluate as integer or float constant expression
             _ => {
+                // An arithmetic object folded above, at its own type.
                 if let Some(val) = self.eval_const_expr(expr) {
                     Initializer::Int(val)
-                } else if let Some(val) = self.eval_const_float_expr(expr) {
-                    Initializer::Float(val)
                 } else if let Some((name, offset)) = self.eval_static_address(expr) {
                     // Try as a static address (e.g., &global.field->subfield chains)
                     if offset != 0 {
@@ -394,16 +452,193 @@ impl<'a> super::linearize::Linearizer<'a> {
                     }
                 } else {
                     // Hard error for non-empty expressions we can't evaluate
-                    error(
-                        self.current_pos.unwrap_or_default(),
-                        &format!(
-                            "unsupported expression in global initializer: {:?}",
-                            expr.kind
-                        ),
-                    );
+                    self.reject_initializer(expr);
                     Initializer::None
                 }
             }
+        }
+    }
+
+    /// The static address of `expr`, as a symbol name and byte offset.
+    ///
+    /// Wraps `eval_static_address` to also cover a string literal, which has a
+    /// perfectly good static address but only once it has been interned and
+    /// given a label -- and interning needs `&mut self`, which the `&self`
+    /// evaluator cannot do. Without this `const char *p = "hello" + 1;` was
+    /// rejected, while `arr + 1` on a static array was accepted.
+    fn static_address_of(&mut self, expr: &Expr) -> Option<(String, i64)> {
+        // A compound literal at file scope has static storage duration
+        // (C99 6.5.2.5p5), so it is an object with an address -- but it only
+        // acquires one when it is given a name here.
+        if let ExprKind::CompoundLiteral { typ, elements } = &expr.kind {
+            let name = format!(".CL{}", self.compound_literal_counter);
+            self.compound_literal_counter += 1;
+            let typ = *typ;
+            let init = self.ast_init_list_to_ir(elements, typ);
+            self.module.add_global(&name, typ, init);
+            return Some((name, 0));
+        }
+        if let ExprKind::StringLit(lit) = &expr.kind {
+            return Some((self.module.add_string(lit.clone()), 0));
+        }
+        self.eval_static_address(expr)
+    }
+
+    /// Fold a constant expression of complex type into its two halves.
+    ///
+    /// Returns `None` for anything that is not a constant, so callers can fall
+    /// through to their existing diagnostics.
+    ///
+    /// A complex constant is two real ones, and each half is carried the way
+    /// [`Self::eval_const_float_expr`] carries a real constant: a literal at
+    /// its full declared width, arithmetic folded through `f64`. Halving the
+    /// precision of a `long double _Complex` literal here, while the real path
+    /// keeps it, would make the two disagree about the same written value.
+    fn eval_const_complex(&self, expr: &Expr) -> Option<(FloatVal, FloatVal)> {
+        match &expr.kind {
+            // `I` itself is `__builtin_complex(0.0, 1.0)`.
+            ExprKind::BuiltinComplex { real, imag } => Some((
+                self.eval_const_float_expr(real)?,
+                self.eval_const_float_expr(imag)?,
+            )),
+
+            // A real constant is a complex one with a zero imaginary part.
+            ExprKind::FloatLit(_) | ExprKind::IntLit(_) | ExprKind::CharLit(_) => {
+                Some((self.eval_const_float_expr(expr)?, FloatVal::ZERO))
+            }
+
+            ExprKind::Cast { expr: inner, .. } => self.eval_const_complex(inner),
+
+            ExprKind::Unary {
+                op: UnaryOp::Neg,
+                operand,
+            } => {
+                let (re, im) = self.eval_const_complex(operand)?;
+                Some((re.negated(), im.negated()))
+            }
+
+            ExprKind::Binary { op, left, right } => {
+                let (a, b) = self.eval_const_complex(left)?;
+                let (c, d) = self.eval_const_complex(right)?;
+                let (a, b, c, d) = (a.to_f64(), b.to_f64(), c.to_f64(), d.to_f64());
+                let (re, im) = match op {
+                    BinaryOp::Add => (a + c, b + d),
+                    BinaryOp::Sub => (a - c, b - d),
+                    BinaryOp::Mul => (a * c - b * d, a * d + b * c),
+                    BinaryOp::Div => {
+                        let den = c * c + d * d;
+                        if den == 0.0 {
+                            return None;
+                        }
+                        ((a * c + b * d) / den, (b * c - a * d) / den)
+                    }
+                    _ => return None,
+                };
+                Some((FloatVal::from_f64(re), FloatVal::from_f64(im)))
+            }
+
+            _ => None,
+        }
+    }
+
+    /// Build the initializer for an object of complex type.
+    ///
+    /// A complex value is two reals laid out end to end, which
+    /// `Initializer::Struct` already describes, so no new variant is needed and
+    /// `emit_float_initializer` handles every base width.
+    fn complex_initializer(&mut self, expr: &Expr, typ: TypeId) -> Option<Initializer> {
+        // `double _Complex z = {1.0};` -- a *scalar* initializer that happens
+        // to be braced, because a complex type is a scalar type (C11 6.2.5p21).
+        // Only the first element initializes the object; gcc warns "excess
+        // elements in scalar initializer" for any others and ignores them, so
+        // `{1.0, 2.0}` is 1.0 + 0.0i rather than 1.0 + 2.0i.
+        let (re, im) = if let ExprKind::InitList { elements } = &expr.kind {
+            let first = elements.first()?;
+            self.eval_const_complex(&first.value)?
+        } else {
+            self.eval_const_complex(expr)?
+        };
+
+        let base = self.types.complex_base(typ);
+        let base_bytes = self.types.size_bytes(base);
+        // Narrowing to the base width happens at emission, which knows the
+        // field size; `FloatVal` just carries the value.
+        Some(Initializer::Struct {
+            total_size: base_bytes * 2,
+            fields: vec![
+                (0, base_bytes, Initializer::Float(re)),
+                (base_bytes, base_bytes, Initializer::Float(im)),
+            ],
+        })
+    }
+
+    /// Report an initializer that is not a constant expression we can fold.
+    ///
+    /// Named rather than inlined because three arms need it and they used to
+    /// disagree: two printed a raw Rust `{:?}` dump of the AST -- internal
+    /// representation in a user-facing message -- and the third said nothing
+    /// at all, which silently zeroed the object.
+    fn reject_initializer(&self, expr: &Expr) {
+        error(
+            self.expr_pos(expr),
+            &format!(
+                "{} is not a constant expression, so it cannot initialize an object with static storage duration",
+                describe_expr(&expr.kind)
+            ),
+        );
+    }
+
+    /// Fold a constant expression into an initializer for an *arithmetic*
+    /// object of type `typ`, converting as an assignment would.
+    ///
+    /// Returns None when the expression is not a constant this compiler can
+    /// fold, leaving the caller's own diagnostics to run.
+    fn fold_scalar_init(&mut self, expr: &Expr, typ: TypeId) -> Option<Initializer> {
+        if self.types.is_float(typ) {
+            if let Some(val) = self.eval_const_float_expr(expr) {
+                return Some(Initializer::Float(val));
+            }
+            // An integer constant initializing a floating object converts
+            // exactly, however wide it is: `long double x = 1;`.
+            let val = self.eval_const_expr(expr)?;
+            return Some(Initializer::Float(FloatVal::from_parts(
+                val < 0,
+                val.unsigned_abs(),
+                0,
+            )));
+        }
+
+        // Converting to `_Bool` is not a truncation: every non-zero value
+        // becomes 1, so 0.5 is `true` where `(int)0.5` is 0 (C17 6.3.1.2).
+        let is_bool = self.types.kind(typ) == TypeKind::Bool;
+
+        if let Some(val) = self.eval_const_expr(expr) {
+            return Some(Initializer::Int(if is_bool {
+                i128::from(val != 0)
+            } else {
+                val
+            }));
+        }
+        // C17 6.3.1.4: converting a floating constant to an integer type
+        // discards the fractional part.
+        let val = self.eval_const_float_expr(expr)?;
+        Some(Initializer::Int(if is_bool {
+            i128::from(!val.is_zero())
+        } else {
+            val.to_f64() as i128
+        }))
+    }
+
+    /// The position to report for `expr`.
+    ///
+    /// `linearize_global_decl` has no statement to set `current_pos` from, so
+    /// it stays `None` at file scope and every such diagnostic used to come
+    /// out as `file:0`. The expression carries its own position; prefer it.
+    fn expr_pos(&self, expr: &Expr) -> Position {
+        if expr.pos != Position::default() {
+            expr.pos
+        } else {
+            self.current_pos.unwrap_or_default()
         }
     }
 
@@ -475,6 +710,21 @@ impl<'a> super::linearize::Linearizer<'a> {
                 | ExprKind::Utf32StringLit(_)
         ) {
             return false;
+        }
+        // An element that is already an expression of the target's own type
+        // initializes the whole aggregate by itself (C17 6.7.9p13). Eliding
+        // braces around it consumes `count_scalar_fields` *elements* instead
+        // of one, so `struct P a[2] = {p, p};` put both structs into a[0] and
+        // left a[1] uninitialized -- then assigned a struct where a scalar
+        // field was expected, producing garbage.
+        if let Some(elem_typ) = element.value.typ {
+            let elem_kind = self.types.kind(elem_typ);
+            if matches!(elem_kind, TypeKind::Struct | TypeKind::Union)
+                && elem_kind == self.types.kind(target_type)
+                && self.types.size_bits(elem_typ) == self.types.size_bits(target_type)
+            {
+                return false;
+            }
         }
         true
     }
@@ -776,89 +1026,86 @@ impl<'a> super::linearize::Linearizer<'a> {
                             init: field_init,
                             bit_offset: visit.bit_offset,
                             bit_width: visit.bit_width,
-                            storage_unit_size: visit.storage_unit_size,
                         });
                     }
 
-                    // Sort fields by offset to ensure proper emission order
-                    // (designated initializers can be in any order)
-                    // For bitfields, also sort by bit_offset to keep them together
-                    raw_fields.sort_by(|a, b| {
-                        a.offset
-                            .cmp(&b.offset)
-                            .then_with(|| a.bit_offset.unwrap_or(0).cmp(&b.bit_offset.unwrap_or(0)))
-                    });
+                    // Sort by the bit each field starts at, so that designated
+                    // initializers emit in address order however they were
+                    // written -- the emitter fills the gaps between fields and
+                    // so requires them sorted and non-overlapping.
+                    raw_fields.sort_by_key(|f| f.offset * 8 + f.bit_offset.unwrap_or(0) as usize);
 
-                    // Remove duplicate initializations (later one wins, per C semantics)
+                    // Initializing the same object twice: the later one wins
+                    // (C17 6.7.9p19). Two *distinct* bitfields are different
+                    // objects even when they share a byte, so both survive.
                     let mut idx = 0;
                     while idx + 1 < raw_fields.len() {
-                        let same_offset = raw_fields[idx].offset == raw_fields[idx + 1].offset;
-                        let both_bitfields = raw_fields[idx].bit_offset.is_some()
-                            && raw_fields[idx + 1].bit_offset.is_some();
-                        let same_bitfield = both_bitfields
-                            && raw_fields[idx].bit_offset == raw_fields[idx + 1].bit_offset;
+                        let (a, b) = (&raw_fields[idx], &raw_fields[idx + 1]);
+                        let distinct_bitfields = a.bit_width.is_some()
+                            && b.bit_width.is_some()
+                            && (a.offset, a.bit_offset) != (b.offset, b.bit_offset);
+                        let a_span = a.byte_span();
+                        let b_span = b.byte_span();
 
-                        if same_offset && (!both_bitfields || same_bitfield) {
+                        if !distinct_bitfields
+                            && a_span.start < b_span.end
+                            && b_span.start < a_span.end
+                        {
                             raw_fields.remove(idx);
                         } else {
                             idx += 1;
                         }
                     }
 
-                    // Pack bitfields that share the same storage unit
+                    // Merge bitfields byte by byte rather than one storage unit
+                    // at a time. A unit is `sizeof(T)` wide and aligned, so it
+                    // routinely spans bytes that belong to other members --
+                    // `unsigned a:1` after a `char` sits at bit 8 of a unit
+                    // based at byte 0, which also holds the `char` and whatever
+                    // follows. Emitting whole units here would blank them; the
+                    // units of two fields with different declared types can
+                    // also be different sizes at the same byte offset, leaving
+                    // no single width to emit.
+                    let mut bitfield_bytes: BTreeMap<usize, u8> = BTreeMap::new();
                     let mut init_fields: Vec<(usize, usize, Initializer)> = Vec::new();
-                    let mut i = 0;
-                    while i < raw_fields.len() {
-                        let RawFieldInit {
-                            offset,
-                            field_size,
-                            init,
-                            bit_offset,
-                            bit_width,
-                            storage_unit_size,
-                        } = &raw_fields[i];
 
-                        if let (Some(bit_off), Some(bit_w), Some(storage_size)) =
-                            (bit_offset, bit_width, storage_unit_size)
+                    for field in &raw_fields {
+                        let (Some(bit_off), Some(bit_width)) = (field.bit_offset, field.bit_width)
+                        else {
+                            init_fields.push((field.offset, field.field_size, field.init.clone()));
+                            continue;
+                        };
+                        let Initializer::Int(value) = field.init else {
+                            continue;
+                        };
+                        if bit_width == 0 {
+                            continue;
+                        }
+
+                        // A field never crosses its own window, so the shift
+                        // stays inside the 128-bit carrier even at width 64.
+                        let mask = (1u128 << bit_width) - 1;
+                        let placed = ((value as u128) & mask) << bit_off;
+
+                        // Only the bytes the field's own bits reach. Its window
+                        // is wider and generally starts earlier -- `unsigned a:1`
+                        // after a `char` sits at bit 8 of a window based at byte
+                        // 0 -- and writing the whole window here would blank the
+                        // members sharing it.
+                        for byte in
+                            (bit_off / 8) as usize..=((bit_off + bit_width - 1) / 8) as usize
                         {
-                            let mut packed_value: u64 = 0;
-                            if let Initializer::Int(v) = init {
-                                let mask = (1u64 << bit_w) - 1;
-                                packed_value |= ((*v as u64) & mask) << bit_off;
-                            }
-
-                            let mut j = i + 1;
-                            while j < raw_fields.len() {
-                                let RawFieldInit {
-                                    offset: next_off,
-                                    init: next_init,
-                                    bit_offset: next_bit_off,
-                                    bit_width: next_bit_w,
-                                    ..
-                                } = &raw_fields[j];
-                                if *next_off != *offset {
-                                    break;
-                                }
-                                if let (Some(nb_off), Some(nb_w)) = (next_bit_off, next_bit_w) {
-                                    if let Initializer::Int(v) = next_init {
-                                        let mask = (1u64 << nb_w) - 1;
-                                        packed_value |= ((*v as u64) & mask) << nb_off;
-                                    }
-                                }
-                                j += 1;
-                            }
-
-                            init_fields.push((
-                                *offset,
-                                *storage_size as usize,
-                                Initializer::Int(packed_value as i128),
-                            ));
-                            i = j;
-                        } else {
-                            init_fields.push((*offset, *field_size, init.clone()));
-                            i += 1;
+                            let bits = ((placed >> (byte * 8)) & 0xff) as u8;
+                            *bitfield_bytes.entry(field.offset + byte).or_default() |= bits;
                         }
                     }
+
+                    init_fields.extend(
+                        bitfield_bytes
+                            .into_iter()
+                            .map(|(offset, bits)| (offset, 1, Initializer::Int(bits as i128))),
+                    );
+                    init_fields.sort_by_key(|(offset, _, _)| *offset);
 
                     Initializer::Struct {
                         total_size: resolved_size,

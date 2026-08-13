@@ -29,8 +29,19 @@ Attributes fall into three categories based on implementation depth:
 |-----------|-----------|--------|
 | `noreturn` | Functions | Emits trap after call; enables DCE |
 | `packed` | Structs/unions | Removes padding from layout |
+| `aligned` | Types, variables | Raises alignment; `.align` on a variable, layout and `_Alignof` on a type. Verified to match gcc |
 | `sysv_abi` | Functions | Forces System V AMD64 calling convention |
 | `ms_abi` | Functions | Forces Win64 calling convention |
+| `constructor` | Functions | Runs before `main`, via `.init_array` (`__DATA,__mod_init_func` on Mach-O). An optional priority orders it against the other constructors; ELF encodes it in the section name, Mach-O has no equivalent and ignores it |
+| `destructor` | Functions | Runs after `main` returns or on `exit`, via `.fini_array` / `__DATA,__mod_term_func`. Priorities as for `constructor` |
+| `noinline` | Functions | The inliner leaves the function alone, whatever its size |
+| `always_inline` | Functions | Inlined at every call site regardless of size, and at `-O0` too. `noinline` outranks it, as in gcc |
+
+### Accepted but with no effect, and the program can tell
+
+Empty: every attribute whose absence a program could observe is now
+implemented. The entries below are ignored, but ignoring them changes nothing
+a conforming program can detect.
 
 ### Parsed and accepted (no semantic effect)
 
@@ -39,16 +50,11 @@ These are parsed by `__attribute__((...))`, reported by `__has_attribute()`, but
 | Attribute | Description |
 |-----------|-------------|
 | `unused` | Suppress unused warnings |
-| `aligned` | Alignment specification |
 | `deprecated` | Mark as deprecated |
 | `weak` | Weak symbol linkage |
 | `section` | Place in named section |
 | `visibility` | Symbol visibility (default, hidden, protected) |
-| `constructor` | Run before main |
-| `destructor` | Run after main |
 | `used` | Prevent dead-stripping |
-| `noinline` | Prevent inlining |
-| `always_inline` | Force inlining |
 | `hot` | Optimize for speed |
 | `cold` | Optimize for size |
 | `warn_unused_result` | Warn if return value ignored |

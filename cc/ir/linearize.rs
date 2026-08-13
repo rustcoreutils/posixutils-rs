@@ -18,9 +18,10 @@ use super::{
 };
 use crate::abi::{get_abi_for_conv, CallingConv};
 use crate::diag::{error, get_all_stream_names, Position};
+use crate::float::FloatVal;
 use crate::parse::ast::{
-    BinaryOp, BlockItem, Expr, ExprKind, ExternalDecl, FunctionDef, InitElement, OffsetOfPath,
-    TranslationUnit, UnaryOp,
+    BinaryOp, BlockItem, Expr, ExprKind, ExternalDecl, FpTest, FunctionDef, InitElement,
+    OffsetOfPath, TranslationUnit, UnaryOp,
 };
 use crate::strings::{StringId, StringTable};
 use crate::symbol::{SymbolId, SymbolTable};
@@ -32,6 +33,19 @@ const DEFAULT_VAR_MAP_CAPACITY: usize = 64;
 const DEFAULT_LABEL_MAP_CAPACITY: usize = 16;
 const DEFAULT_LOOP_DEPTH_CAPACITY: usize = 4;
 const DEFAULT_FILE_SCOPE_CAPACITY: usize = 16;
+
+/// One array extent of a variably-modified type.
+///
+/// A variably-modified type can mix constant and run-time extents
+/// (`int a[n][3][m]`), so each level records which it is.
+#[derive(Clone, Copy)]
+pub(crate) enum VmDim {
+    /// An extent known at compile time.
+    Const(usize),
+    /// An extent computed at run time and kept in a hidden local, so it
+    /// survives SSA and can be reloaded at each use.
+    Sym(PseudoId),
+}
 
 /// Information about a local variable
 #[derive(Clone)]
@@ -45,10 +59,17 @@ pub(crate) struct LocalVarInfo {
     pub(crate) vla_size_sym: Option<PseudoId>,
     /// For VLAs: the element type (for sizeof computation)
     pub(crate) vla_elem_type: Option<TypeId>,
-    /// For multi-dimensional VLAs: symbols storing each dimension's size
-    /// For int arr[n][m], this contains [sym_for_n, sym_for_m]
-    /// These are needed to compute runtime strides for outer dimension access.
-    pub(crate) vla_dim_syms: Vec<PseudoId>,
+    /// Extents of this object's *element* type, outermost first: what one
+    /// index step leaves behind. Empty unless the element type is variably
+    /// modified.
+    ///
+    /// For a local `int b[n][m][k]` this is `[m, k]`; for a parameter
+    /// `int a[n][m]` (adjusted to `int (*a)[m]`) and for the `int (*a)[m]`
+    /// spelling alike it is `[m]`, which is why both index identically.
+    /// Indexing at depth `d` needs `product(vm_row_dims[d..]) *
+    /// sizeof(vla_elem_type)` -- a variably-modified type reports a
+    /// compile-time size of 0, so without this every such stride would be 0.
+    pub(crate) vm_row_dims: Vec<VmDim>,
     /// True if this local holds a pointer to the actual data (e.g., va_list parameters).
     /// When true, linearize_lvalue loads the pointer instead of taking the address.
     pub(crate) is_indirect: bool,
@@ -68,7 +89,25 @@ pub(crate) struct RawFieldInit {
     pub(crate) init: Initializer,
     pub(crate) bit_offset: Option<u32>,
     pub(crate) bit_width: Option<u32>,
-    pub(crate) storage_unit_size: Option<u32>,
+}
+
+impl RawFieldInit {
+    /// The bytes this field's initializer actually writes.
+    ///
+    /// For a bitfield that is narrower than its access window, which is what
+    /// decides whether two initializers describe overlapping storage: the
+    /// window of `unsigned a:1` after a `char` spans a byte the following
+    /// `char` member owns, while the field itself does not.
+    pub(crate) fn byte_span(&self) -> std::ops::Range<usize> {
+        match (self.bit_offset, self.bit_width) {
+            (Some(bit_offset), Some(bit_width)) => {
+                let start = self.offset + (bit_offset / 8) as usize;
+                let end = self.offset + (bit_offset + bit_width).div_ceil(8) as usize;
+                start..end.max(start + 1)
+            }
+            _ => self.offset..self.offset + self.field_size,
+        }
+    }
 }
 
 /// Result from member_index_for_designator indicating where positional
@@ -194,9 +233,10 @@ pub struct Linearizer<'a> {
     pub(crate) current_pos: Option<Position>,
     /// Target configuration (architecture, ABI details)
     pub(crate) target: &'a Target,
-    /// Whether current function is a non-static inline function
-    /// (used for enforcing C99 inline semantic restrictions)
-    pub(crate) current_func_is_non_static_inline: bool,
+    /// Whether the current function is an *inline definition* -- one that
+    /// provides no external definition, and is therefore the thing C99 6.7.4p3
+    /// constrains.
+    pub(crate) current_func_is_inline_definition: bool,
     /// Set of file-scope static variable names (for inline semantic checks)
     pub(crate) file_scope_statics: std::collections::HashSet<String>,
     /// Calling convention of the current function being linearized
@@ -238,7 +278,7 @@ impl<'a> Linearizer<'a> {
             static_locals: HashMap::with_capacity(DEFAULT_LABEL_MAP_CAPACITY),
             current_pos: None,
             target,
-            current_func_is_non_static_inline: false,
+            current_func_is_inline_definition: false,
             file_scope_statics: std::collections::HashSet::with_capacity(
                 DEFAULT_FILE_SCOPE_CAPACITY,
             ),
@@ -298,9 +338,52 @@ impl<'a> Linearizer<'a> {
     }
 
     /// Get the name of a symbol as a String
+    ///
+    /// This is the name that reaches the assembler, so a GCC asm label
+    /// (`extern int myfn(int) __asm__("realfn");`) wins over the declared
+    /// identifier. Renaming here rather than in the backend means every
+    /// consumer -- direct calls, global definitions, `extern_symbols`, GOT and
+    /// TLS decisions, the macOS underscore -- sees one consistent name and
+    /// needs no change of its own.
+    /// A label is marked verbatim, because it *is* the assembler name and must
+    /// not pick up the target's own decoration; see `lir::VERBATIM_MARKER`.
     #[inline]
     pub(crate) fn symbol_name(&self, id: SymbolId) -> String {
-        self.str(self.symbols.get(id).name).to_string()
+        let sym = self.symbols.get(id);
+        match &sym.asm_label {
+            Some(label) => crate::arch::lir::verbatim(label),
+            None => self.str(sym.name).to_string(),
+        }
+    }
+
+    /// The emitted name for a declared identifier.
+    ///
+    /// A function *definition* reaches its name as a `StringId` rather than
+    /// the `SymbolId` that carries the label, so it has to go back through the
+    /// symbol table. Inner scopes are gone by the time linearization runs, so
+    /// a file-scope function name resolves unambiguously.
+    pub(crate) fn emitted_name(&self, name: StringId) -> String {
+        self.symbols
+            .lookup(name, crate::symbol::Namespace::Ordinary)
+            .and_then(|s| s.asm_label.as_deref())
+            .map(crate::arch::lir::verbatim)
+            .unwrap_or_else(|| self.str(name).to_string())
+    }
+
+    /// Whether any declaration of `name` in this translation unit said
+    /// `extern`. See [`crate::symbol::Symbol::has_extern_decl`].
+    pub(crate) fn has_extern_decl(&self, name: StringId) -> bool {
+        self.symbols
+            .lookup(name, crate::symbol::Namespace::Ordinary)
+            .is_some_and(|s| s.has_extern_decl)
+    }
+
+    /// Whether any declaration of `name` omitted `inline`.
+    /// See [`crate::symbol::Symbol::has_non_inline_decl`].
+    pub(crate) fn has_non_inline_decl(&self, name: StringId) -> bool {
+        self.symbols
+            .lookup(name, crate::symbol::Namespace::Ordinary)
+            .is_some_and(|s| s.has_non_inline_decl)
     }
 
     /// Linearize a translation unit
@@ -729,7 +812,7 @@ impl<'a> Linearizer<'a> {
         self.struct_return_ptr = None;
         self.struct_return_size = 0;
         self.two_reg_return_type = None;
-        self.current_func_name = self.str(func.name).to_string();
+        self.current_func_name = self.emitted_name(func.name);
         // Remove from extern_symbols since we're defining this function
         self.module.extern_symbols.remove(&self.current_func_name);
         // Note: static_locals is NOT cleared - it persists across functions
@@ -738,28 +821,58 @@ impl<'a> Linearizer<'a> {
         let modifiers = self.types.modifiers(func.return_type);
         let is_static = func.is_static;
         let is_inline = func.is_inline;
-        let _is_extern = modifiers.contains(TypeModifiers::EXTERN);
+        let is_extern = modifiers.contains(TypeModifiers::EXTERN);
         let is_noreturn = modifiers.contains(TypeModifiers::NORETURN);
-
-        // Track non-static inline functions for semantic restriction checks
-        // C99 6.7.4: non-static inline functions have restrictions on
-        // static variables they can access
-        self.current_func_is_non_static_inline = is_inline && !is_static;
 
         // Store calling convention from function attributes (e.g., __attribute__((sysv_abi)))
         self.current_calling_conv = func.calling_conv;
 
-        let mut ir_func = Function::new(self.str(func.name), func.return_type);
-        // For linkage:
-        // - static inline: internal linkage (same as static)
-        // - inline (without extern): inline definition only, internal linkage
-        // - extern inline: per C99, provides external definition, but since we
-        //   treat inline functions as internal linkage candidates for inlining,
-        //   avoid duplicate symbol errors when same inline function is defined
-        //   in multiple translation units
-        ir_func.is_static = is_static || is_inline;
+        let mut ir_func = Function::new(self.emitted_name(func.name), func.return_type);
+
+        // Whether this is an *inline definition*, which provides no external
+        // definition and so must not be emitted.
+        //
+        // C99 6.7.4p6: it is one if every file-scope declaration includes
+        // `inline` and none includes `extern`. Both halves matter, and both
+        // are whole-translation-unit questions rather than properties of this
+        // definition's own tokens -- the declaration that settles it is
+        // allowed to come afterwards, and in the standard idiom it does. They
+        // are therefore read back from the symbol.
+        //
+        // GNU inline, selected by `__gnu_inline__`, is the exact opposite on
+        // the `extern` question: there `extern inline` is the one that
+        // provides no external definition. glibc's `__fortify_function` relies
+        // on it.
+        //
+        // `static inline` is neither -- it has internal linkage and is emitted
+        // like any other static function.
+        let has_extern_decl = is_extern || self.has_extern_decl(func.name);
+        let all_decls_inline = !self.has_non_inline_decl(func.name);
+        let is_inline_definition = is_inline
+            && !is_static
+            && if func.attrs.gnu_inline {
+                has_extern_decl
+            } else {
+                !has_extern_decl && all_decls_inline
+            };
+
+        // C99 6.7.4p3 constrains an inline *definition*, not every non-static
+        // inline function: what it forbids -- naming an identifier with
+        // internal linkage, defining a modifiable static object -- would make
+        // the several inline definitions of a function differ from each other
+        // and from the external one. A definition that *is* the external
+        // definition, because some declaration of it says `extern`, is an
+        // ordinary function and may name whatever any function may name.
+        self.current_func_is_inline_definition = is_inline_definition;
+
+        ir_func.is_static = is_static;
+        ir_func.emit = !is_inline_definition;
         ir_func.is_noreturn = is_noreturn;
         ir_func.is_inline = is_inline;
+        ir_func.is_noinline = func.attrs.noinline;
+        ir_func.is_always_inline = func.attrs.always_inline;
+        ir_func.constructor = func.attrs.constructor;
+        ir_func.destructor = func.attrs.destructor;
 
         let ret_kind = self.types.kind(func.return_type);
         // Check if function returns a large struct
@@ -928,7 +1041,7 @@ impl<'a> Linearizer<'a> {
                         typ, // Keep original va_list type for type checking
                         vla_size_sym: None,
                         vla_elem_type: None,
-                        vla_dim_syms: vec![],
+                        vm_row_dims: vec![],
                         is_indirect: true, // va_list param: local holds a pointer
                     },
                 );
@@ -1015,7 +1128,7 @@ impl<'a> Linearizer<'a> {
                         typ,
                         vla_size_sym: None,
                         vla_elem_type: None,
-                        vla_dim_syms: vec![],
+                        vm_row_dims: vec![],
                         is_indirect: false,
                     },
                 );
@@ -1058,7 +1171,7 @@ impl<'a> Linearizer<'a> {
                         typ,
                         vla_size_sym: None,
                         vla_elem_type: None,
-                        vla_dim_syms: vec![],
+                        vm_row_dims: vec![],
                         is_indirect: false,
                     },
                 );
@@ -1093,10 +1206,40 @@ impl<'a> Linearizer<'a> {
                         typ,
                         vla_size_sym: None,
                         vla_elem_type: None,
-                        vla_dim_syms: vec![],
+                        vm_row_dims: vec![],
                         is_indirect: false,
                     },
                 );
+            }
+        }
+
+        // Record the extents of any variably-modified parameter, now that
+        // every parameter is stored to a local and so nameable by a later
+        // one's size expression (C17 6.9.1p10 evaluates these on entry).
+        //
+        // `int a[n][m]` is adjusted to `int (*a)[m]`, so what needs sizing is
+        // the pointee. Without this the element type has a compile-time size
+        // of 0 and every row stride is 0.
+        for param in &func.params {
+            if param.vm_dims.is_empty() {
+                continue;
+            }
+            let Some(symbol_id) = param.symbol else {
+                continue;
+            };
+            let Some(pointee) = self.types.base_type(param.typ) else {
+                continue;
+            };
+
+            let name = self.symbol_name(symbol_id);
+            let vm_dims = param.vm_dims.clone();
+            let (dims, elem_type) = self.record_vm_extents(pointee, &vm_dims, &name);
+
+            if let Some(info) = self.locals.get_mut(&symbol_id) {
+                // A parameter *is* the row: one index step off the pointer
+                // consumes no extent of the pointee, so all of them remain.
+                info.vm_row_dims = dims;
+                info.vla_elem_type = Some(elem_type);
             }
         }
 
@@ -1360,7 +1503,14 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Fabsl { arg }
             | ExprKind::Signbit { arg }
             | ExprKind::Signbitf { arg }
-            | ExprKind::Signbitl { arg } => self.is_pure_expr(arg),
+            | ExprKind::Signbitl { arg }
+            | ExprKind::FpTest { arg, .. } => self.is_pure_expr(arg),
+
+            // Pure iff everything it reads is: the class codes are ordinary
+            // expressions, not constants, so they count too.
+            ExprKind::FpClassify { classes, arg } => {
+                self.is_pure_expr(arg) && classes.iter().all(|c| self.is_pure_expr(c))
+            }
 
             // Alloca allocates memory - not pure
             ExprKind::Alloca { .. } => false,
@@ -1583,7 +1733,7 @@ impl<'a> Linearizer<'a> {
                             typ: param_type,
                             vla_size_sym: None,
                             vla_elem_type: None,
-                            vla_dim_syms: vec![],
+                            vm_row_dims: vec![],
                             is_indirect: false,
                         },
                     );
@@ -1721,8 +1871,13 @@ impl<'a> Linearizer<'a> {
                 let arr = self.linearize_expr(ptr_expr);
                 let idx = self.linearize_expr(idx_expr);
                 let elem_type = self.expr_type(expr);
-                let elem_size = self.types.size_bits(elem_type) / 8;
-                let elem_size_val = self.emit_const(elem_size as i128, self.types.long_id);
+                // Same stride rule as the rvalue path: a variably-modified
+                // element type has no usable compile-time size, and this is
+                // the path that `a[i][j] = v` and `&a[i][j]` take.
+                let elem_size_val = self.vm_index_stride(ptr_expr).unwrap_or_else(|| {
+                    let elem_size = self.types.size_bits(elem_type) / 8;
+                    self.emit_const(elem_size as i128, self.types.long_id)
+                });
 
                 // Sign-extend index to 64-bit for proper pointer arithmetic (negative indices)
                 let idx_extended = self.emit_convert(idx, idx_type, self.types.long_id);
@@ -1795,8 +1950,18 @@ impl<'a> Linearizer<'a> {
 
     /// Linearize a type cast expression
     pub(crate) fn linearize_cast(&mut self, inner_expr: &Expr, cast_type: TypeId) -> PseudoId {
-        let src = self.linearize_expr(inner_expr);
         let src_type = self.expr_type(inner_expr);
+
+        // C17 6.3.1.7p2: converting a complex value to a real type keeps the
+        // real part and discards the imaginary one. Falling through to the
+        // scalar path reinterpreted the address the complex value travels by
+        // as the value itself, so `(double) z` produced a number in the range
+        // of a pointer bit pattern.
+        if self.types.is_complex(src_type) && !self.types.is_complex(cast_type) {
+            return self.emit_complex_to_real(inner_expr, cast_type);
+        }
+
+        let src = self.linearize_expr(inner_expr);
 
         // Emit conversion if needed
         let src_is_float = self.types.is_float(src_type);
@@ -1979,6 +2144,329 @@ impl<'a> Linearizer<'a> {
         }
     }
 
+    /// Peel `Index` nodes off `expr` to reach the object being indexed,
+    /// returning it with the number of index steps that separate them.
+    ///
+    /// `b` gives depth 0, `b[i]` gives 1, `b[i][j]` gives 2. Anything that is
+    /// not an identifier under a chain of indexes has no recorded extents, so
+    /// it yields None and the caller falls back to the compile-time size.
+    fn vm_index_base(expr: &Expr) -> Option<(SymbolId, usize)> {
+        let mut depth = 0usize;
+        let mut cur = expr;
+        loop {
+            match &cur.kind {
+                ExprKind::Ident(symbol_id) => return Some((*symbol_id, depth)),
+                ExprKind::Index { array, .. } => {
+                    depth += 1;
+                    cur = array;
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// Record the extents of a variably-modified `array_type`, evaluating each
+    /// run-time one into a hidden local so it survives SSA.
+    ///
+    /// Returns the extents outermost-first, one per array level, together with
+    /// the innermost non-array element type. `vm_exprs` supplies a size
+    /// expression for each level whose extent is not a constant, in order, so
+    /// `int a[n][4][m]` consumes `n` then `m`.
+    ///
+    /// Both a local VLA declaration and a variably-modified parameter go
+    /// through here; keeping one implementation is the point, since the
+    /// original defect was a second path that never recorded extents at all.
+    pub(crate) fn record_vm_extents(
+        &mut self,
+        array_type: TypeId,
+        vm_exprs: &[Expr],
+        name: &str,
+    ) -> (Vec<VmDim>, TypeId) {
+        let ulong_type = self.types.ulong_id;
+        let mut dims: Vec<VmDim> = Vec::new();
+        let mut exprs = vm_exprs.iter();
+        let mut elem_type = array_type;
+
+        while self.types.kind(elem_type) == TypeKind::Array {
+            let level = elem_type;
+            elem_type = self.types.base_type(level).unwrap_or(self.types.int_id);
+
+            if let Some(n) = self.types.get(level).array_size {
+                dims.push(VmDim::Const(n));
+                continue;
+            }
+
+            let Some(size_expr) = exprs.next() else {
+                // An unspecified extent with no expression to evaluate, as in
+                // `int a[]`; the level contributes nothing measurable.
+                continue;
+            };
+
+            let dim_size = self.linearize_expr(size_expr);
+
+            let dim_sym_id = self.alloc_pseudo();
+            let dim_var_name = format!("__vla_dim{}_{}.{}", dims.len(), name, dim_sym_id.0);
+            let dim_sym = Pseudo::sym(dim_sym_id, dim_var_name.clone());
+            if let Some(func) = &mut self.current_func {
+                func.add_pseudo(dim_sym);
+                func.add_local(
+                    &dim_var_name,
+                    dim_sym_id,
+                    ulong_type,
+                    false, // not volatile
+                    false, // not atomic
+                    self.current_bb,
+                    None, // no explicit alignment
+                );
+            }
+
+            // Widen to 64-bit before storing.
+            let dim_expr_typ = size_expr.typ.unwrap_or(self.types.int_id);
+            let dim_size = self.emit_convert(dim_size, dim_expr_typ, ulong_type);
+            self.emit(Instruction::store(dim_size, dim_sym_id, 0, ulong_type, 64));
+            dims.push(VmDim::Sym(dim_sym_id));
+        }
+
+        (dims, elem_type)
+    }
+
+    /// The product of `dims`, evaluated at run time.
+    ///
+    /// None for no extents at all, which is an empty product: the caller
+    /// decides whether that means one element or no computation to do.
+    pub(crate) fn vm_extent_product(&mut self, dims: &[VmDim]) -> Option<PseudoId> {
+        let ulong = self.types.ulong_id;
+        let mut acc: Option<PseudoId> = None;
+        for dim in dims {
+            let val = match *dim {
+                VmDim::Const(n) => self.emit_const(n as i128, ulong),
+                VmDim::Sym(sym) => {
+                    // Reload at the point of use: the extent lives in a hidden
+                    // local precisely so it survives across basic blocks.
+                    let loaded = self.alloc_pseudo();
+                    self.emit(Instruction::load(loaded, sym, 0, ulong, 64));
+                    loaded
+                }
+            };
+            acc = Some(match acc {
+                None => val,
+                Some(prev) => {
+                    let result = self.alloc_pseudo();
+                    self.emit(Instruction::binop(
+                        Opcode::Mul,
+                        result,
+                        prev,
+                        val,
+                        ulong,
+                        64,
+                    ));
+                    result
+                }
+            });
+        }
+        acc
+    }
+
+    /// Byte size of `product(dims) * sizeof(elem)`, evaluated at run time, or
+    /// None when the compile-time size is already correct.
+    ///
+    /// None means either that no extents remain -- the object is the
+    /// fully-indexed element -- or that every remaining extent is constant, in
+    /// which case the type carries its own size and no arithmetic is needed.
+    fn vm_extent_size(&mut self, dims: &[VmDim], elem: TypeId) -> Option<PseudoId> {
+        if !dims.iter().any(|d| matches!(d, VmDim::Sym(_))) {
+            return None;
+        }
+
+        let ulong = self.types.ulong_id;
+        let acc = self.vm_extent_product(dims);
+
+        let elem_size = self.types.size_bytes(elem) as i128;
+        let elem_size_val = self.emit_const(elem_size, ulong);
+        let total = self.alloc_pseudo();
+        self.emit(Instruction::binop(
+            Opcode::Mul,
+            total,
+            acc.expect("a Sym extent guarantees an accumulator"),
+            elem_size_val,
+            ulong,
+            64,
+        ));
+        Some(total)
+    }
+
+    /// Lower a `__builtin_isnan` / `isinf` / `isfinite` / `isnormal`.
+    ///
+    /// Built from comparisons alone, which keeps them exact at every width and
+    /// needs no new opcode or backend work. Deliberately *not* expressed with
+    /// `fabs`: `__builtin_fabsl` still narrows a `long double` to a double, so
+    /// a magnitude test through it answers the wrong question at the one width
+    /// that most needs it. Comparing against both signed bounds avoids that.
+    ///
+    ///   isnan(x)     x != x                  (only a NaN differs from itself)
+    ///   isinf(x)     x == +inf || x == -inf
+    ///   isfinite(x)  x > -inf && x < +inf    (a NaN fails both: unordered)
+    ///   isnormal(x)  isfinite(x) && (x >= +min_normal || x <= -min_normal)
+    ///
+    /// The argument is linearized once into a pseudo and that pseudo is reused.
+    /// Desugaring to an AST node instead would duplicate the argument
+    /// expression, so `isnan(f())` would call `f` twice.
+    fn linearize_fp_test(&mut self, test: FpTest, arg: &Expr) -> PseudoId {
+        let typ = self.expr_type(arg);
+        let size = self.types.size_bits(typ);
+        let val = self.linearize_expr(arg);
+
+        match test {
+            FpTest::IsNan => self.emit_fcmp(Opcode::FCmpONe, val, val, typ, size),
+            FpTest::IsInf => {
+                let pos = self.emit_fconst(FloatVal::infinity(false), typ);
+                let neg = self.emit_fconst(FloatVal::infinity(true), typ);
+                let a = self.emit_fcmp(Opcode::FCmpOEq, val, pos, typ, size);
+                let b = self.emit_fcmp(Opcode::FCmpOEq, val, neg, typ, size);
+                self.emit_bool_combine(Opcode::Or, a, b)
+            }
+            FpTest::IsFinite => self.emit_is_finite(val, typ, size),
+            FpTest::IsNormal => {
+                let finite = self.emit_is_finite(val, typ, size);
+                let magnitude = self.emit_at_least_normal(val, typ, size);
+                self.emit_bool_combine(Opcode::And, finite, magnitude)
+            }
+        }
+    }
+
+    /// `x > -inf && x < +inf`, which is false for a NaN because both
+    /// comparisons against one are false.
+    fn emit_is_finite(&mut self, val: PseudoId, typ: TypeId, size: u32) -> PseudoId {
+        let pos = self.emit_fconst(FloatVal::infinity(false), typ);
+        let neg = self.emit_fconst(FloatVal::infinity(true), typ);
+        let below = self.emit_fcmp(Opcode::FCmpOLt, val, pos, typ, size);
+        let above = self.emit_fcmp(Opcode::FCmpOGt, val, neg, typ, size);
+        self.emit_bool_combine(Opcode::And, below, above)
+    }
+
+    /// `x >= +min_normal || x <= -min_normal` -- true for anything at least as
+    /// large as the smallest normal, in either direction. Combined with a
+    /// finiteness test this is exactly `isnormal`.
+    fn emit_at_least_normal(&mut self, val: PseudoId, typ: TypeId, size: u32) -> PseudoId {
+        let smallest = self.smallest_normal(typ);
+        let pos = self.emit_fconst(smallest, typ);
+        let neg = self.emit_fconst(smallest.negated(), typ);
+        let a = self.emit_fcmp(Opcode::FCmpOGe, val, pos, typ, size);
+        let b = self.emit_fcmp(Opcode::FCmpOLe, val, neg, typ, size);
+        self.emit_bool_combine(Opcode::Or, a, b)
+    }
+
+    /// Emit a floating comparison yielding 0 or 1.
+    fn emit_fcmp(
+        &mut self,
+        op: Opcode,
+        lhs: PseudoId,
+        rhs: PseudoId,
+        typ: TypeId,
+        size: u32,
+    ) -> PseudoId {
+        let result = self.alloc_pseudo();
+        self.emit(Instruction::binop(op, result, lhs, rhs, typ, size));
+        result
+    }
+
+    /// Combine two comparison results. Both are already 0 or 1, so the
+    /// bitwise operation is the logical one and no branch is needed.
+    fn emit_bool_combine(&mut self, op: Opcode, lhs: PseudoId, rhs: PseudoId) -> PseudoId {
+        let int_typ = self.types.int_id;
+        let result = self.alloc_pseudo();
+        self.emit(Instruction::binop(op, result, lhs, rhs, int_typ, 32));
+        result
+    }
+
+    /// The smallest positive normal value of a floating type: 2^min_exp.
+    ///
+    /// Exact at every width, including x87's 2^-16382, which an `f64` cannot
+    /// represent at all -- carrying literals at target precision is what makes
+    /// `isnormal` on a `long double` expressible.
+    fn smallest_normal(&self, typ: TypeId) -> FloatVal {
+        let exp = match self.types.size_bits(typ) {
+            0..=16 => -14,   // binary16
+            17..=32 => -126, // binary32
+            33..=64 => -1022,
+            // x87 80-bit and IEEE binary128 share a minimum exponent.
+            _ => -16382,
+        };
+        FloatVal::from_parts(false, 1, exp)
+    }
+
+    /// Lower `__builtin_fpclassify(nan, inf, normal, subnormal, zero, x)`.
+    ///
+    /// A chain of selects over the same tests, applied most-specific last so
+    /// the earlier answers win. Subnormal is the innermost default: not a
+    /// NaN, not infinite, not zero and below the smallest normal leaves
+    /// nothing else it could be.
+    fn linearize_fp_classify(&mut self, classes: &[Expr], arg: &Expr) -> PseudoId {
+        let typ = self.expr_type(arg);
+        let size = self.types.size_bits(typ);
+        let val = self.linearize_expr(arg);
+        let int_typ = self.types.int_id;
+
+        let nan_code = self.linearize_expr(&classes[0]);
+        let inf_code = self.linearize_expr(&classes[1]);
+        let normal_code = self.linearize_expr(&classes[2]);
+        let subnormal_code = self.linearize_expr(&classes[3]);
+        let zero_code = self.linearize_expr(&classes[4]);
+
+        let is_nan = self.emit_fcmp(Opcode::FCmpONe, val, val, typ, size);
+
+        let pos_inf = self.emit_fconst(FloatVal::infinity(false), typ);
+        let neg_inf = self.emit_fconst(FloatVal::infinity(true), typ);
+        let eq_pos = self.emit_fcmp(Opcode::FCmpOEq, val, pos_inf, typ, size);
+        let eq_neg = self.emit_fcmp(Opcode::FCmpOEq, val, neg_inf, typ, size);
+        let is_inf = self.emit_bool_combine(Opcode::Or, eq_pos, eq_neg);
+
+        let zero = self.emit_fconst(FloatVal::ZERO, typ);
+        let is_zero = self.emit_fcmp(Opcode::FCmpOEq, val, zero, typ, size);
+
+        let finite = self.emit_is_finite(val, typ, size);
+        let magnitude = self.emit_at_least_normal(val, typ, size);
+        let is_normal = self.emit_bool_combine(Opcode::And, finite, magnitude);
+
+        let mut acc = subnormal_code;
+        for (cond, code) in [
+            (is_normal, normal_code),
+            (is_zero, zero_code),
+            (is_inf, inf_code),
+            (is_nan, nan_code),
+        ] {
+            let next = self.alloc_pseudo();
+            self.emit(Instruction::select(next, cond, code, acc, int_typ, 32));
+            acc = next;
+        }
+        acc
+    }
+
+    /// Stride for one index step into `ptr_expr`, when what it denotes is a
+    /// variably-modified array reached by indexing a local.
+    fn vm_index_stride(&mut self, ptr_expr: &Expr) -> Option<PseudoId> {
+        let (symbol_id, depth) = Self::vm_index_base(ptr_expr)?;
+        let info = self.locals.get(&symbol_id).cloned()?;
+        let elem = info.vla_elem_type?;
+        let dims = info.vm_row_dims.get(depth..)?.to_vec();
+        self.vm_extent_size(&dims, elem)
+    }
+
+    /// Run-time size of the object `expr` denotes, when it is a
+    /// variably-modified array reached by indexing a local.
+    ///
+    /// `sizeof(a[0])` on `int a[n][m]` is `m * sizeof(int)`; the type alone
+    /// reports 0.
+    fn vm_sizeof_expr(&mut self, expr: &Expr) -> Option<PseudoId> {
+        let (symbol_id, depth) = Self::vm_index_base(expr)?;
+        // Depth 0 is the whole object, which `vla_size_sym` already covers.
+        let from = depth.checked_sub(1)?;
+        let info = self.locals.get(&symbol_id).cloned()?;
+        let elem = info.vla_elem_type?;
+        let dims = info.vm_row_dims.get(from..)?.to_vec();
+        self.vm_extent_size(&dims, elem)
+    }
+
     /// Linearize an array index expression (e.g., arr[i])
     pub(crate) fn linearize_index(&mut self, expr: &Expr, array: &Expr, index: &Expr) -> PseudoId {
         // In C, a[b] is defined as *(a + b), so either operand can be the pointer
@@ -2002,88 +2490,14 @@ impl<'a> Linearizer<'a> {
         let elem_type = self.expr_type(expr);
         let ptr_typ = self.types.long_id;
 
-        // Check if we're indexing a VLA's outer dimension
-        // This requires runtime stride computation.
-        // For int arr[n][m], accessing arr[i] needs stride = m * sizeof(int)
-        let elem_size_val = if let ExprKind::Ident(symbol_id) = &ptr_expr.kind {
-            if let Some(info) = self.locals.get(symbol_id).cloned() {
-                // Check if this is a multi-dimensional VLA AND elem_type is an array
-                // (meaning we're accessing an outer dimension, not the innermost)
-                if info.vla_dim_syms.len() > 1 && self.types.kind(elem_type) == TypeKind::Array {
-                    // Compute runtime stride:
-                    // stride = (product of inner dimensions) * sizeof(innermost element)
-                    // For int arr[n][m] accessing arr[i]: stride = m * sizeof(int)
-                    // For int arr[n][m][k] accessing arr[i]: stride = m * k * sizeof(int)
-
-                    // Get innermost element type and its size
-                    let mut innermost = elem_type;
-                    while self.types.kind(innermost) == TypeKind::Array {
-                        innermost = self.types.base_type(innermost).unwrap_or(self.types.int_id);
-                    }
-                    let innermost_size = self.types.size_bytes(innermost) as i64;
-
-                    // Load all dimension sizes except the first (outermost we're indexing)
-                    // and multiply them together
-                    let mut stride: Option<PseudoId> = None;
-                    for dim_sym in info.vla_dim_syms.iter().skip(1) {
-                        // Load the dimension size
-                        let dim_val = self.alloc_pseudo();
-                        let load_insn =
-                            Instruction::load(dim_val, *dim_sym, 0, self.types.ulong_id, 64);
-                        self.emit(load_insn);
-
-                        stride = Some(match stride {
-                            None => dim_val,
-                            Some(prev) => {
-                                let result = self.alloc_pseudo();
-                                self.emit(Instruction::binop(
-                                    Opcode::Mul,
-                                    result,
-                                    prev,
-                                    dim_val,
-                                    ptr_typ,
-                                    64,
-                                ));
-                                result
-                            }
-                        });
-                    }
-
-                    // Multiply by sizeof(innermost element)
-                    let innermost_size_val =
-                        self.emit_const(innermost_size as i128, self.types.long_id);
-                    match stride {
-                        Some(s) => {
-                            let result = self.alloc_pseudo();
-                            self.emit(Instruction::binop(
-                                Opcode::Mul,
-                                result,
-                                s,
-                                innermost_size_val,
-                                ptr_typ,
-                                64,
-                            ));
-                            result
-                        }
-                        None => innermost_size_val,
-                    }
-                } else {
-                    // Not a multi-dimensional VLA or accessing innermost dimension
-                    // Use compile-time size
-                    let elem_size = self.types.size_bits(elem_type) / 8;
-                    self.emit_const(elem_size as i128, self.types.long_id)
-                }
-            } else {
-                // Variable not found in locals (global or something else)
-                let elem_size = self.types.size_bits(elem_type) / 8;
-                self.emit_const(elem_size as i128, self.types.long_id)
-            }
-        } else {
-            // Not indexing an identifier directly (e.g., arr[i][j] where arr[i] is an Index)
-            // Use compile-time size
+        // A variably-modified element type reports a compile-time size of 0,
+        // so the stride has to come from the object's recorded extents. This
+        // covers every depth -- `b[i]`, `b[i][j]`, ... -- and locals and
+        // parameters alike, because both record their element type's extents.
+        let elem_size_val = self.vm_index_stride(ptr_expr).unwrap_or_else(|| {
             let elem_size = self.types.size_bits(elem_type) / 8;
             self.emit_const(elem_size as i128, self.types.long_id)
-        };
+        });
 
         // Sign-extend index to 64-bit for proper pointer arithmetic (negative indices)
         let idx_extended = self.emit_convert(idx, idx_type, self.types.long_id);
@@ -2617,7 +3031,7 @@ impl<'a> Linearizer<'a> {
             let elem_size = self.types.size_bits(elem_type) / 8;
             self.emit_const(elem_size as i128, self.types.long_id)
         } else if is_float {
-            self.emit_fconst(1.0, typ)
+            self.emit_fconst(FloatVal::from_f64(1.0), typ)
         } else {
             self.emit_const(1, typ)
         };
@@ -2691,13 +3105,7 @@ impl<'a> Linearizer<'a> {
                 let base_struct_type = self.expr_type(expr);
                 let struct_type = self.resolve_struct_type(base_struct_type);
                 if let Some(member_info) = self.types.find_member(struct_type, *member) {
-                    self.emit(Instruction::store(
-                        final_result,
-                        base,
-                        member_info.offset as i64,
-                        typ,
-                        store_size,
-                    ));
+                    self.emit_member_store(base, &member_info, final_result);
                 }
             }
             ExprKind::Arrow { expr, member } => {
@@ -2707,13 +3115,7 @@ impl<'a> Linearizer<'a> {
                 let base_struct_type = self.types.base_type(ptr_type).unwrap_or(typ);
                 let struct_type = self.resolve_struct_type(base_struct_type);
                 if let Some(member_info) = self.types.find_member(struct_type, *member) {
-                    self.emit(Instruction::store(
-                        final_result,
-                        ptr,
-                        member_info.offset as i64,
-                        typ,
-                        store_size,
-                    ));
+                    self.emit_member_store(ptr, &member_info, final_result);
                 }
             }
             ExprKind::Index { array, index } => {
@@ -2919,6 +3321,15 @@ impl<'a> Linearizer<'a> {
             return self.linearize_lvalue(operand);
         }
 
+        // A complex value travels by address, so the scalar path below would
+        // negate the address rather than the number it points at.
+        if op == UnaryOp::Neg {
+            let typ = self.expr_type(expr);
+            if self.types.is_complex(typ) {
+                return self.emit_complex_negate(operand, typ);
+            }
+        }
+
         // Handle PreInc/PreDec specially - they need store-back
         if op == UnaryOp::PreInc || op == UnaryOp::PreDec {
             // On an atomic object this is one read-modify-write whose value is
@@ -2960,7 +3371,7 @@ impl<'a> Linearizer<'a> {
                 let elem_size = self.types.size_bits(elem_type) / 8;
                 self.emit_const(elem_size as i128, self.types.long_id)
             } else if is_float {
-                self.emit_fconst(1.0, typ)
+                self.emit_fconst(FloatVal::from_f64(1.0), typ)
             } else {
                 self.emit_const(1, typ)
             };
@@ -3025,13 +3436,7 @@ impl<'a> Linearizer<'a> {
                     let base_struct_type = self.expr_type(expr);
                     let struct_type = self.resolve_struct_type(base_struct_type);
                     if let Some(member_info) = self.types.find_member(struct_type, *member) {
-                        self.emit(Instruction::store(
-                            final_result,
-                            base,
-                            member_info.offset as i64,
-                            typ,
-                            store_size,
-                        ));
+                        self.emit_member_store(base, &member_info, final_result);
                     }
                 }
                 ExprKind::Arrow { expr, member } => {
@@ -3041,13 +3446,7 @@ impl<'a> Linearizer<'a> {
                     let base_struct_type = self.types.base_type(ptr_type).unwrap_or(typ);
                     let struct_type = self.resolve_struct_type(base_struct_type);
                     if let Some(member_info) = self.types.find_member(struct_type, *member) {
-                        self.emit(Instruction::store(
-                            final_result,
-                            ptr,
-                            member_info.offset as i64,
-                            typ,
-                            store_size,
-                        ));
+                        self.emit_member_store(ptr, &member_info, final_result);
                     }
                 }
                 ExprKind::Unary {
@@ -3145,7 +3544,7 @@ impl<'a> Linearizer<'a> {
 
     pub(crate) fn linearize_ident(&mut self, expr: &Expr, symbol_id: SymbolId) -> PseudoId {
         let sym = self.symbols.get(symbol_id);
-        let name_str = self.str(sym.name).to_string();
+        let name_str = self.symbol_name(symbol_id);
 
         // First check if it's an enum constant
         if sym.is_enum_constant() {
@@ -3240,13 +3639,13 @@ impl<'a> Linearizer<'a> {
         else {
             // C99 6.7.4p3: A non-static inline function cannot refer to
             // a file-scope static variable
-            if self.current_func_is_non_static_inline && self.file_scope_statics.contains(&name_str)
+            if self.current_func_is_inline_definition && self.file_scope_statics.contains(&name_str)
             {
                 if let Some(pos) = self.current_pos {
                     error(
                         pos,
                         &format!(
-                            "non-static inline function '{}' cannot reference file-scope static variable '{}'",
+                            "inline definition of '{}' cannot reference file-scope static variable '{}'",
                             self.current_func_name, name_str
                         ),
                     );
@@ -3802,6 +4201,10 @@ impl<'a> Linearizer<'a> {
                 result
             }
 
+            ExprKind::FpTest { test, arg } => self.linearize_fp_test(*test, arg),
+
+            ExprKind::FpClassify { classes, arg } => self.linearize_fp_classify(classes, arg),
+
             ExprKind::BuiltinComplex { real, imag } => {
                 // __builtin_complex(real, imag) - construct complex value
                 let complex_typ = self.expr_type(expr);
@@ -4180,6 +4583,12 @@ impl<'a> Linearizer<'a> {
                     }
                 }
 
+                // `sizeof(a[0])` on a variably-modified array: the row size is
+                // only known at run time, and the type reports 0.
+                if let Some(size) = self.vm_sizeof_expr(inner_expr) {
+                    return size;
+                }
+
                 // Non-VLA: compute size at compile time
                 let inner_typ = self.expr_type(inner_expr);
                 let size = self.types.size_bits(inner_typ) / 8;
@@ -4246,6 +4655,8 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Signbit { .. }
             | ExprKind::Signbitf { .. }
             | ExprKind::Signbitl { .. }
+            | ExprKind::FpTest { .. }
+            | ExprKind::FpClassify { .. }
             | ExprKind::Unreachable
             | ExprKind::FrameAddress { .. }
             | ExprKind::ReturnAddress { .. }

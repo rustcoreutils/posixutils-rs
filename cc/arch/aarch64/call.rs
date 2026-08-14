@@ -509,14 +509,10 @@ impl Aarch64CodeGen {
         match self.get_location(arg) {
             Loc::Reg(r) => r,
             Loc::Stack(offset) => {
-                let actual = self.stack_offset(offset);
                 self.push_lir(Aarch64Inst::Ldr {
                     size: OperandSize::B64,
                     dst: Reg::X9,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X29,
-                        offset: actual,
-                    },
+                    addr: self.stack_mem(offset),
                 });
                 Reg::X9
             }
@@ -545,15 +541,10 @@ impl Aarch64CodeGen {
                 // loaded and then dereferenced. Reading the slot as though it
                 // were the value worked only while the pointer happened to
                 // stay in a register, and produced garbage the moment it was
-                // spilled — the `Loc::Reg` arm below already dereferences.
-                let actual_offset = self.stack_offset(offset);
                 self.push_lir(Aarch64Inst::Ldr {
                     size: OperandSize::B64,
                     dst: Reg::X9,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X29,
-                        offset: actual_offset,
-                    },
+                    addr: self.stack_mem(offset),
                 });
                 self.push_lir(Aarch64Inst::LdrFp {
                     size: fp_size,
@@ -651,22 +642,15 @@ impl Aarch64CodeGen {
 
         match arg_loc {
             Loc::Stack(offset) => {
-                let actual_offset = self.stack_offset(offset);
                 self.push_lir(Aarch64Inst::LdrFp {
                     size: fp_size,
                     dst: first_reg,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X29,
-                        offset: actual_offset,
-                    },
+                    addr: self.stack_mem(offset),
                 });
                 self.push_lir(Aarch64Inst::LdrFp {
                     size: fp_size,
                     dst: second_reg,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X29,
-                        offset: actual_offset + elem_offset,
-                    },
+                    addr: self.stack_mem_plus(offset, elem_offset),
                 });
             }
             Loc::Reg(r) => {
@@ -787,22 +771,15 @@ impl Aarch64CodeGen {
     fn handle_two_reg_return(&mut self, dst_loc: &Loc) {
         match dst_loc {
             Loc::Stack(offset) => {
-                let actual_offset = self.stack_offset(*offset);
                 self.push_lir(Aarch64Inst::Str {
                     size: OperandSize::B64,
                     src: Reg::X0,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X29,
-                        offset: actual_offset,
-                    },
+                    addr: self.stack_mem(*offset),
                 });
                 self.push_lir(Aarch64Inst::Str {
                     size: OperandSize::B64,
                     src: Reg::X1,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X29,
-                        offset: actual_offset + 8,
-                    },
+                    addr: self.stack_mem_plus(*offset, 8),
                 });
             }
             Loc::Reg(r) => {
@@ -832,22 +809,15 @@ impl Aarch64CodeGen {
         let (fp_size, imag_offset) = complex_fp_info(types, &self.base.target, insn.typ.unwrap());
         match dst_loc {
             Loc::Stack(offset) => {
-                let actual_offset = self.stack_offset(*offset);
                 self.push_lir(Aarch64Inst::StrFp {
                     size: fp_size,
                     src: VReg::V0,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X29,
-                        offset: actual_offset,
-                    },
+                    addr: self.stack_mem(*offset),
                 });
                 self.push_lir(Aarch64Inst::StrFp {
                     size: fp_size,
                     src: VReg::V1,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X29,
-                        offset: actual_offset + imag_offset,
-                    },
+                    addr: self.stack_mem_plus(*offset, imag_offset),
                 });
             }
             Loc::Reg(r) => {
@@ -876,22 +846,15 @@ impl Aarch64CodeGen {
     fn handle_two_fp_return(&mut self, dst_loc: &Loc) {
         match dst_loc {
             Loc::Stack(offset) => {
-                let actual_offset = self.stack_offset(*offset);
                 self.push_lir(Aarch64Inst::StrFp {
                     size: FpSize::Double,
                     src: VReg::V0,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X29,
-                        offset: actual_offset,
-                    },
+                    addr: self.stack_mem(*offset),
                 });
                 self.push_lir(Aarch64Inst::StrFp {
                     size: FpSize::Double,
                     src: VReg::V1,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X29,
-                        offset: actual_offset + 8,
-                    },
+                    addr: self.stack_mem_plus(*offset, 8),
                 });
             }
             Loc::Reg(r) => {
@@ -929,15 +892,11 @@ impl Aarch64CodeGen {
 
         match dst_loc {
             Loc::Stack(offset) => {
-                let actual_offset = self.stack_offset(*offset);
                 for i in 0..count.min(4) {
                     self.push_lir(Aarch64Inst::StrFp {
                         size: fp_size,
                         src: vregs[i as usize],
-                        addr: MemAddr::BaseOffset {
-                            base: Reg::X29,
-                            offset: actual_offset + (i as i32 * elem_size),
-                        },
+                        addr: self.stack_mem_plus(*offset, i as i32 * elem_size),
                     });
                 }
             }

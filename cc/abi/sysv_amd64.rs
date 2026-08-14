@@ -51,6 +51,33 @@ pub fn param_is_memory_class(typ: TypeId, types: &TypeTable) -> bool {
         )
 }
 
+/// The register classes a nine-to-sixteen-byte aggregate parameter arrives in,
+/// or `None` if it does not arrive in registers.
+///
+/// Two eightbytes, in order: `[Integer, Integer]` for `struct { long a, b; }`,
+/// `[Sse, Integer]` for `struct { double a; int b; }`, and so on. The order is
+/// load-bearing -- it says which eightbyte goes to a general register and which
+/// to an SSE one, and the caller and the prologue must walk it the same way.
+///
+/// MEMORY-class aggregates answer `None` here; they are
+/// [`param_is_memory_class`]. So does an all-SSE one of a single register,
+/// which [`sse_struct_regs`] already describes.
+pub fn struct_param_classes(typ: TypeId, types: &TypeTable) -> Option<Vec<RegClass>> {
+    let kind = types.kind(typ);
+    let bits = types.size_bits(typ);
+    if (kind != TypeKind::Struct && kind != TypeKind::Union)
+        || types.is_complex(typ)
+        || bits <= 64
+        || bits > 128
+    {
+        return None;
+    }
+    match SysVAmd64Abi::new().classify_param(typ, types) {
+        ArgClass::Direct { classes, .. } if classes.len() == 2 => Some(classes),
+        _ => None,
+    }
+}
+
 /// How many SSE registers an all-SSE aggregate of nine to sixteen bytes
 /// occupies, or `None` if it is not one.
 ///

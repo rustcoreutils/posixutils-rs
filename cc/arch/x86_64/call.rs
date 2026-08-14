@@ -75,7 +75,10 @@ impl X86_64CodeGen {
 
                     if !has_gp || !has_fp {
                         stack_arg_indices.push(i);
-                        total_stack_qwords += gp_needed.max(fp_needed).max(1);
+                        // Every eightbyte lands on the stack, so a mixed pair
+                        // takes two qwords -- `max` counted it as one and left
+                        // the outgoing area a qword short.
+                        total_stack_qwords += classes.len().max(1);
                         // §3.2.3 step 5: an argument that does not fit goes to
                         // memory *whole* and consumes no registers, so the ones
                         // it did not fit in remain for later arguments.
@@ -160,11 +163,21 @@ impl X86_64CodeGen {
             // kind, so `long double _Complex` would otherwise be mistaken for a
             // 16-byte scalar long double and only half of it copied.
             if let Some(bytes) = arg_type.and_then(|t| {
-                crate::arch::lir::memory_class_bytes(types, t).or_else(|| {
-                    types
-                        .is_complex(t)
-                        .then(|| (types.size_bits(t) / 8) as usize)
-                })
+                crate::arch::lir::memory_class_bytes(types, t)
+                    .or_else(|| {
+                        types
+                            .is_complex(t)
+                            .then(|| (types.size_bits(t) / 8) as usize)
+                    })
+                    // A register-pair struct that ran out of registers goes on
+                    // the stack *whole*. Without this it fell through to the
+                    // scalar path below and pushed eight bytes of a sixteen-byte
+                    // value -- the callee then read half of it plus whatever
+                    // followed.
+                    .or_else(|| {
+                        crate::abi::struct_param_classes(t, types)
+                            .map(|_| (types.size_bits(t) / 8) as usize)
+                    })
             }) {
                 let num_qwords = bytes.div_ceil(8);
                 let base = self.address_of_pseudo(arg);
@@ -368,6 +381,31 @@ impl X86_64CodeGen {
     }
 
     /// Set up register arguments (returns number of FP args for variadic AL)
+    /// The register holding a struct argument's *address*.
+    ///
+    /// The argument pseudo carries a pointer (from `symaddr`), not the struct's
+    /// bytes, so a spilled one is loaded with `mov`: `lea` would give the
+    /// address of the slot holding the pointer, which is a pointer to a
+    /// pointer and reads as garbage.
+    fn struct_arg_base(&mut self, arg: PseudoId) -> Reg {
+        match self.get_location(arg) {
+            Loc::Reg(r) => r,
+            Loc::Stack(offset) => {
+                let addr = self.stack_mem(offset);
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Mem(addr),
+                    dst: GpOperand::Reg(Reg::R11),
+                });
+                Reg::R11
+            }
+            _ => {
+                self.emit_move(arg, Reg::R11, 64);
+                Reg::R11
+            }
+        }
+    }
+
     pub(super) fn setup_register_args(
         &mut self,
         insn: &Instruction,
@@ -539,14 +577,32 @@ impl X86_64CodeGen {
                         });
                         int_arg_idx += 2;
                     } else {
-                        // Mixed or single class — fall through to integer
-                        self.setup_int_arg(
-                            arg,
-                            arg_size,
-                            int_arg_regs[int_arg_idx],
-                            saved_arg_regs,
-                        );
-                        int_arg_idx += 1;
+                        // Mixed: one eightbyte to a general register and one to
+                        // an SSE register, in the order the class vector gives.
+                        // Falling through to a single integer register handed
+                        // the callee a pointer's worth of one half.
+                        let base = self.struct_arg_base(arg);
+                        for (i, class) in classes.iter().enumerate() {
+                            let addr = MemAddr::BaseOffset {
+                                base,
+                                offset: (i * 8) as i32,
+                            };
+                            if *class == crate::abi::RegClass::Sse {
+                                self.push_lir(X86Inst::MovFp {
+                                    size: FpSize::Double,
+                                    src: XmmOperand::Mem(addr),
+                                    dst: XmmOperand::Reg(fp_arg_regs[fp_arg_idx]),
+                                });
+                                fp_arg_idx += 1;
+                            } else {
+                                self.push_lir(X86Inst::Mov {
+                                    size: OperandSize::B64,
+                                    src: GpOperand::Mem(addr),
+                                    dst: GpOperand::Reg(int_arg_regs[int_arg_idx]),
+                                });
+                                int_arg_idx += 1;
+                            }
+                        }
                     }
                 } else {
                     // Indirect — shouldn't happen for medium structs but handle anyway

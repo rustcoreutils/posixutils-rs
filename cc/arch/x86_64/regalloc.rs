@@ -1229,6 +1229,30 @@ impl RegAlloc {
                 // allocation. Two doubles take two registers; a lone binary128
                 // takes one, for all sixteen bytes.
                 fp_arg_idx += sse_regs;
+            } else if let Some(classes) = crate::abi::struct_param_classes(*typ, types) {
+                // Two eightbytes in two registers -- both general, or one of
+                // each. Like the all-SSE case above, no location is assigned
+                // when they arrive in registers: the prologue writes them into
+                // the parameter's local and the pseudo takes an ordinary slot.
+                // The class order says which register file each came from.
+                let gp_needed = classes
+                    .iter()
+                    .filter(|c| **c != crate::abi::RegClass::Sse)
+                    .count();
+                let sse_needed = classes.len() - gp_needed;
+                if int_arg_idx + gp_needed > int_arg_regs.len()
+                    || fp_arg_idx + sse_needed > fp_arg_regs.len()
+                {
+                    // System V 3.2.3 step 5: an argument that does not fit goes
+                    // to memory *whole*, and consumes none of the registers it
+                    // did not fit in.
+                    self.locations
+                        .insert(pseudo_id, Loc::IncomingArg(stack_arg_offset));
+                    stack_arg_offset += (types.size_bits(*typ) / 8) as i32;
+                } else {
+                    int_arg_idx += gp_needed;
+                    fp_arg_idx += sse_needed;
+                }
             } else if is_complex {
                 // How many XMM registers this complex type actually occupies:
                 // one for `float _Complex` (both halves packed into a single

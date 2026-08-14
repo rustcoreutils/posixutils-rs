@@ -875,10 +875,17 @@ long        take_i(struct I a) { return a.a + a.b; }
         p.contains("%xmm0") && p.contains("%xmm1"),
         "a two-double struct still arrives in two XMM registers:\n{p}"
     );
+    // An integer pair arrives in two general registers by value, which the
+    // prologue writes into the parameter's local. It used to arrive as a
+    // pointer, which no gcc-compiled caller ever sends.
     let i = body_of(&asm, "take_i");
     assert!(
-        i.contains("movq (%rdi)"),
-        "an integer pair still arrives as a pointer:\n{i}"
+        i.contains("movq %rdi,") && i.contains("movq %rsi,"),
+        "an integer pair arrives in RDI and RSI by value:\n{i}"
+    );
+    assert!(
+        !i.contains("movq (%rdi)"),
+        "and must not be dereferenced as a pointer:\n{i}"
     );
 }
 
@@ -1054,5 +1061,62 @@ double   useu(void) { union U r = mku(); return r.v; }
     assert!(
         st.contains("d0,") && uses_d1(st),
         "a struct of two doubles is still a two-element HFA:\n{st}"
+    );
+}
+
+/// A nine-to-sixteen-byte integer or mixed struct is handed over in two
+/// registers, not as a pointer.
+///
+/// System V classifies each eightbyte on its own: `struct { long a, b; }` is
+/// two general registers, `struct { double a; int b; }` is one SSE register and
+/// one general one. c17 passed a pointer in a single general register. Caller
+/// and callee agreed inside a c17 translation unit -- which is why *running* a
+/// program cannot catch this, and why the assertion has to be about the
+/// register file.
+#[test]
+fn codegen_medium_struct_uses_two_registers() {
+    let src = r#"
+struct LL { long a, b; };
+struct DI { double a; int b; };
+struct DD { double a, b; };
+struct I1 { int v; };
+
+extern long   sink_ll(struct LL);
+extern double sink_di(struct DI);
+extern double sink_dd(struct DD);
+extern int    sink_i1(struct I1);
+
+long   c_ll(struct LL s) { return sink_ll(s); }
+double c_di(struct DI s) { return sink_di(s); }
+double c_dd(struct DD s) { return sink_dd(s); }
+int    c_i1(struct I1 s) { return sink_i1(s); }
+"#;
+    let asm = asm_for("medium_struct_regs", X86_64_LINUX, src);
+
+    // Two general registers: the second argument register is the tell, since
+    // the pointer convention only ever used the first.
+    let ll = body_of(&asm, "c_ll");
+    assert!(
+        ll.contains("%rsi"),
+        "an integer pair occupies RDI and RSI:\n{ll}"
+    );
+    // One SSE register and one general register.
+    let di = body_of(&asm, "c_di");
+    assert!(
+        di.contains("%xmm0") && di.contains("%rdi"),
+        "a double-then-int pair occupies XMM0 and RDI:\n{di}"
+    );
+
+    // Controls: an all-SSE pair still takes two XMMs, and a single eightbyte
+    // still takes one general register.
+    let dd = body_of(&asm, "c_dd");
+    assert!(
+        dd.contains("%xmm0") && dd.contains("%xmm1"),
+        "a two-double struct still takes XMM0 and XMM1:\n{dd}"
+    );
+    let i1 = body_of(&asm, "c_i1");
+    assert!(
+        !i1.contains("%rsi"),
+        "a single-eightbyte struct still takes one register:\n{i1}"
     );
 }

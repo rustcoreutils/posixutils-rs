@@ -20,7 +20,7 @@
 use crate::abi::{get_abi_for_conv, ArgClass, CallingConv};
 use crate::arch::aarch64::features::{VA_GR_SAVE_BYTES, VA_VR_SAVE_BYTES};
 use crate::arch::aarch64::lir::{Aarch64Inst, DmbOption, GpOperand, MemAddr};
-use crate::arch::aarch64::regalloc::{Loc, Reg, RegAlloc, VReg};
+use crate::arch::aarch64::regalloc::{FrameBase, Loc, Reg, RegAlloc, VReg};
 use crate::arch::codegen::{is_variadic_function, BswapSize, CodeGenBase, CodeGenerator, UnaryOp};
 use crate::arch::lir::{complex_fp_info, CondCode, Directive, FpSize, Label, OperandSize, Symbol};
 use crate::ir::{Function, Instruction, Module, Opcode, Pseudo, PseudoId, PseudoKind};
@@ -72,10 +72,8 @@ pub struct Aarch64CodeGen {
     stack_alloc_size: i32,
     /// Sym pseudo ID → type size in bits (for distinguishing scalar vs struct stores)
     sym_type_sizes: HashMap<PseudoId, u32>,
-    /// When true, over-aligned locals use x19 as an aligned base register
-    use_aligned_base: bool,
-    /// Maximum local alignment (for computing aligned base)
-    max_local_align: i32,
+    /// Which register this function's locals are addressed through
+    frame_base: FrameBase,
 }
 
 /// Result of computing a memory address for load/store operations
@@ -107,8 +105,7 @@ impl Aarch64CodeGen {
             unique_label_counter: 0,
             stack_alloc_size: 0,
             sym_type_sizes: HashMap::new(),
-            use_aligned_base: false,
-            max_local_align: 16,
+            frame_base: FrameBase::Fp,
         }
     }
 
@@ -132,14 +129,14 @@ impl Aarch64CodeGen {
     #[inline]
     pub(super) fn stack_offset(&self, offset: i32) -> i32 {
         if offset < 0 {
-            if self.use_aligned_base {
+            if let FrameBase::Aligned { align, .. } = self.frame_base {
                 // Over-aligned locals: x19-relative addressing.
                 // stack_alloc_size = base_rounded + (max_align - 1), where base_rounded
                 // is round_up(stack_offset, max_align). x19 is the max_align-aligned
                 // start of the locals area. Offset from x19 = base_rounded + regalloc_offset.
                 // Since base_rounded is a multiple of max_align and regalloc aligns each
                 // local's position to its alignment, the result preserves alignment.
-                let base_rounded = self.stack_alloc_size - (self.max_local_align - 1);
+                let base_rounded = self.stack_alloc_size - (align - 1);
                 base_rounded + offset
             } else {
                 // Local variable: use frame size minus reg_save_area
@@ -161,10 +158,9 @@ impl Aarch64CodeGen {
     /// Incoming args always use X29.
     #[inline]
     pub(super) fn stack_base_reg(&self, raw_offset: i32) -> Reg {
-        if raw_offset < 0 && self.use_aligned_base {
-            Reg::X19
-        } else {
-            Reg::X29
+        match self.frame_base.reg() {
+            Some(base) if raw_offset < 0 => base,
+            _ => Reg::X29,
         }
     }
 
@@ -255,14 +251,15 @@ impl Aarch64CodeGen {
         }
 
         let stack_size = alloc.stack_size();
-        self.max_local_align = alloc.max_local_align();
-        self.use_aligned_base = self.max_local_align > 16;
+        self.frame_base = alloc.frame_base();
         let mut callee_saved = alloc.callee_saved_used().to_vec();
         let callee_saved_fp = alloc.callee_saved_fp_used().to_vec();
 
         // When using aligned base, x19 must be callee-saved
-        if self.use_aligned_base && !callee_saved.contains(&Reg::X19) {
-            callee_saved.push(Reg::X19);
+        if let Some(base) = self.frame_base.reg() {
+            if !callee_saved.contains(&base) {
+                callee_saved.push(base);
+            }
         }
 
         // For variadic functions on Linux/FreeBSD, we need extra space for the register save area.
@@ -325,21 +322,24 @@ impl Aarch64CodeGen {
         self.zero_stack_frame();
 
         // Compute aligned base register (x19) for over-aligned locals
-        if self.use_aligned_base {
+        if let FrameBase::Aligned {
+            reg: base,
+            align: max_align,
+        } = self.frame_base
+        {
             let base_offset = 16 + self.callee_saved_size;
-            let max_align = self.max_local_align;
-            // x19 = (FP + base_offset + max_align - 1) & ~(max_align - 1)
+            // base = (FP + base_offset + max_align - 1) & ~(max_align - 1)
             self.push_lir(Aarch64Inst::Add {
                 size: OperandSize::B64,
-                dst: Reg::X19,
+                dst: base,
                 src1: Reg::X29,
                 src2: GpOperand::Imm((base_offset + max_align - 1) as i64),
             });
             // AND with bitmask: aarch64 AND (immediate) encodes bitmasks
             self.push_lir(Aarch64Inst::And {
                 size: OperandSize::B64,
-                dst: Reg::X19,
-                src1: Reg::X19,
+                dst: base,
+                src1: base,
                 src2: GpOperand::Imm(-(max_align as i64)),
             });
         }
@@ -3597,12 +3597,8 @@ impl Aarch64CodeGen {
                 }
             }
             Loc::Stack(offset) => {
-                // AArch64 uses offsets from base register (x29 or x19 for aligned locals)
-                let base = if self.use_aligned_base && *offset < 0 {
-                    "x19"
-                } else {
-                    "x29"
-                };
+                // AArch64 addresses a local from whichever base the frame uses
+                let base = asm_reg_name_64(self.stack_base_reg(*offset));
                 let actual = self.stack_offset(*offset);
                 format!("[{}, #{}]", base, actual)
             }

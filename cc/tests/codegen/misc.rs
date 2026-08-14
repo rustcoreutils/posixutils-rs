@@ -7252,3 +7252,47 @@ int main(void)
         0
     );
 }
+
+/// A local whose alignment exceeds the stack's own forces the frame to be
+/// addressed through a second base register. That register was still in the
+/// allocatable pool, so the colorer handed it to an ordinary value and the
+/// prologue's base was overwritten by the first thing that outlived a call --
+/// every later local access then read through whatever integer that was.
+///
+/// The call is what makes it bite: it forces a callee-saved register, and the
+/// base is callee-saved. The pressure below keeps enough values live across
+/// the call that the base is reached rather than left spare.
+#[test]
+fn codegen_over_aligned_frame_base_reserved() {
+    let code = r#"
+int sink(int v) { return v; }
+
+int over_aligned(int x) {
+    _Alignas(64) char buf[128];
+    int a = x + 1, b = x + 2, c = x + 3, d = x + 4;
+    int e = x + 5, f = x + 6, g = x + 7, h = x + 8;
+    buf[0] = 1;
+    buf[64] = 2;
+    /* every value above stays live across this call */
+    int r = sink(x);
+    if (((unsigned long)&buf[0] & 63UL) != 0UL) return 100;
+    if (buf[0] != 1 || buf[64] != 2) return 101;
+    if (a + b + c + d + e + f + g + h != 8 * x + 36) return 102;
+    return r;
+}
+
+int main(void) {
+    if (over_aligned(7) != 7) return 1;
+    if (over_aligned(0) != 0) return 2;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_over_aligned_frame_base", code, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run_optimized("codegen_over_aligned_frame_base_opt", code),
+        0
+    );
+}

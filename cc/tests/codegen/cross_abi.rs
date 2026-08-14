@@ -1293,3 +1293,44 @@ struct D2 mkd2(void) { struct D2 r; r.a = 1.5; r.b = 2.5; return r; }
         );
     }
 }
+
+/// aarch64 `va_start` skips exactly the registers the named parameters took.
+///
+/// The counting loop asked `is_float`, which is false for a `_Complex` -- so a
+/// `double _Complex` named parameter, which arrives in *two* V registers, was
+/// counted as one general register and none floating. `va_start` then recorded
+/// the wrong `__gr_offs`/`__vr_offs` and the first variadic argument came from
+/// the wrong slot. The allocator dispatches on the ABI class; this now does
+/// too, so the two cannot disagree.
+///
+/// For `void f(double _Complex z, ...)` the named parameter takes no general
+/// register and two of eight V registers, so the offsets are -(8-0)*8 = -64 and
+/// -(8-2)*16 = -96. They are materialised as 16-bit immediates.
+#[test]
+fn codegen_aarch64_va_start_counts_named_registers() {
+    let src = r#"
+#include <stdarg.h>
+long v_cx(double _Complex z, ...)
+{
+    va_list ap; va_start(ap, z);
+    long a = va_arg(ap, long);
+    va_end(ap);
+    (void)z;
+    return a;
+}
+"#;
+    let asm = asm_for("aarch64_va_named_regs", AARCH64_LINUX, src);
+    let body = body_of(&asm, "v_cx");
+
+    // -64 and -96 as unsigned 16-bit halves.
+    let gr = (-64i32 as u32) & 0xffff;
+    let vr = (-96i32 as u32) & 0xffff;
+    assert!(
+        body.contains(&format!("#{gr}")),
+        "__gr_offs must be -64 (no general register taken):\n{body}"
+    );
+    assert!(
+        body.contains(&format!("#{vr}")),
+        "__vr_offs must be -96 (two V registers taken):\n{body}"
+    );
+}

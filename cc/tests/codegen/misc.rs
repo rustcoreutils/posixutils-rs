@@ -7296,3 +7296,72 @@ int main(void) {
         0
     );
 }
+
+/// AAPCS64 §5.4.2 gives a homogeneous floating-point aggregate one V register
+/// per element, for one to four elements. Both sides of the aarch64 call
+/// recognised only the two-element case: a three- or four-element HFA went out
+/// whole in a general register while the callee read it from V0-V3, and it
+/// consumed an integer slot, so the *next* integer argument was shifted along
+/// as well. An aggregate small enough to sit in one register was passed as a
+/// single value rather than split across the element registers.
+///
+/// Every shape below is checked against gcc's own layout, so the test is an
+/// ABI conformance check as much as a regression test.
+#[test]
+fn codegen_hfa_param_element_counts() {
+    let code = r#"
+typedef struct { float a; }              F1;
+typedef struct { float a, b; }           F2;
+typedef struct { float a, b, c; }        F3;
+typedef struct { float a, b, c, d; }     F4;
+typedef struct { double a; }             D1;
+typedef struct { double a, b; }          D2;
+typedef struct { double a, b, c; }       D3;
+typedef struct { float v[3]; }           FA;
+
+double u_f1(F1 v) { return v.a; }
+double u_f2(F2 v) { return v.a * 10 + v.b; }
+double u_f3(F3 v) { return v.a * 100 + v.b * 10 + v.c; }
+double u_f4(F4 v) { return v.a * 1000 + v.b * 100 + v.c * 10 + v.d; }
+double u_d1(D1 v) { return v.a; }
+double u_d2(D2 v) { return v.a * 10 + v.b; }
+double u_d3(D3 v) { return v.a * 100 + v.b * 10 + v.c; }
+double u_fa(FA v) { return v.v[0] * 100 + v.v[1] * 10 + v.v[2]; }
+
+/* an HFA followed by an integer: the integer moves too if the aggregate
+   wrongly consumes a general register */
+double mixed(int n, F4 v, int m) {
+    return v.a * 1000 + v.b * 100 + v.c * 10 + v.d + n * 100000 + m * 10000;
+}
+
+/* past V0-V7, so the tail is laid on the stack */
+double overflow(F4 p, F4 q, D2 r, int n, double s) {
+    return p.a * 1e7 + p.b * 1e6 + p.c * 1e5 + p.d * 1e4
+         + q.a * 1e3 + q.b * 1e2 + q.c * 10 + q.d
+         + r.a * 1e8 + r.b * 1e9 + n + s;
+}
+
+int main(void) {
+    F1 f1 = {1};       if (u_f1(f1) != 1)    return 1;
+    F2 f2 = {1, 2};    if (u_f2(f2) != 12)   return 2;
+    F3 f3 = {1, 2, 3}; if (u_f3(f3) != 123)  return 3;
+    F4 f4 = {1,2,3,4}; if (u_f4(f4) != 1234) return 4;
+    D1 d1 = {1};       if (u_d1(d1) != 1)    return 5;
+    D2 d2 = {1, 2};    if (u_d2(d2) != 12)   return 6;
+    D3 d3 = {1, 2, 3}; if (u_d3(d3) != 123)  return 7;
+    FA fa = {{1, 2, 3}}; if (u_fa(fa) != 123) return 8;
+
+    if (mixed(1, f4, 2) != 121234) return 9;
+
+    F4 q = {5, 6, 7, 8};
+    D2 r = {9, 10};
+    if (overflow(f4, q, r, 11, 0.5) != 10912345689.5) return 10;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("codegen_hfa_param_counts", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("codegen_hfa_param_counts_opt", code),
+        0
+    );
+}

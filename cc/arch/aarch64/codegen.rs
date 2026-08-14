@@ -1085,13 +1085,16 @@ impl Aarch64CodeGen {
         }
     }
 
-    fn copy_stacked_pair_to_local(
+    /// Copy an `elems`-element floating-point parameter that the caller laid
+    /// on the stack into the local the body reads.
+    fn copy_stacked_fp_elems_to_local(
         &mut self,
         func: &Function,
         param_idx: usize,
         typ: TypeId,
         types: &TypeTable,
         pseudo: PseudoId,
+        elems: i32,
     ) {
         let param_name = &func.params[param_idx].0;
         let Some(local) = func.locals.get(param_name) else {
@@ -1107,7 +1110,7 @@ impl Aarch64CodeGen {
 
         let (fp_size, elem_bytes) = self.two_element_fp_info(typ, types);
 
-        for step in 0..2i32 {
+        for step in 0..elems {
             let delta = step * elem_bytes;
             self.push_lir(Aarch64Inst::LdrFp {
                 size: fp_size,
@@ -1145,18 +1148,26 @@ impl Aarch64CodeGen {
         for (i, (_name, typ)) in func.params.iter().enumerate() {
             let is_complex = types.is_complex(*typ);
             let is_fp = types.is_float(*typ);
-            // Check for HFA-2 struct (e.g., {double, double}) — passed in two FP regs
-            let is_hfa_two = !is_complex
-                && !is_fp
-                && (types.kind(*typ) == TypeKind::Struct || types.kind(*typ) == TypeKind::Union)
-                && {
-                    let abi = get_abi_for_conv(CallingConv::C, &self.base.target);
-                    matches!(
-                        abi.classify_param(*typ, types),
-                        ArgClass::Hfa { count: 2, .. }
-                    )
-                };
-            let uses_two_fp_regs = is_complex || is_hfa_two;
+            // How many consecutive V registers this parameter arrives in, if
+            // it arrives in V registers at all. A `_Complex` is two by
+            // definition; a struct is whatever the ABI's HFA classification
+            // says, which is one through four.
+            //
+            // This used to ask for `count: 2` and let every other count fall
+            // through to the GP arm below, so a three- or four-element HFA was
+            // read out of an integer register -- and consumed an integer slot,
+            // which shifted every following integer parameter by one.
+            let fp_reg_count: Option<usize> = if is_complex {
+                Some(2)
+            } else if !is_fp && matches!(types.kind(*typ), TypeKind::Struct | TypeKind::Union) {
+                let abi = get_abi_for_conv(CallingConv::C, &self.base.target);
+                match abi.classify_param(*typ, types) {
+                    ArgClass::Hfa { count, .. } => Some(count as usize),
+                    _ => None,
+                }
+            } else {
+                None
+            };
 
             // Find the pseudo for this argument
             for pseudo in &func.pseudos {
@@ -1166,8 +1177,8 @@ impl Aarch64CodeGen {
                         // Skip pseudos already stored via spilled_args
                         if spilled_pseudos.contains(&pseudo.id) {
                             // Still need to count this arg for register assignment tracking
-                            if uses_two_fp_regs {
-                                fp_arg_idx += 2;
+                            if let Some(count) = fp_reg_count {
+                                fp_arg_idx += count;
                             } else if is_fp {
                                 fp_arg_idx += 1;
                             } else if types.kind(*typ) == TypeKind::Int128 {
@@ -1177,28 +1188,26 @@ impl Aarch64CodeGen {
                             }
                             break;
                         }
-                        if uses_two_fp_regs {
-                            // Complex or HFA-2 argument — uses TWO consecutive FP registers
-                            if fp_arg_idx + 1 < fp_arg_regs.len() {
+                        if let Some(count) = fp_reg_count {
+                            // Complex or HFA argument — `count` consecutive V registers
+                            if fp_arg_idx + count <= fp_arg_regs.len() {
                                 let param_name = &func.params[i].0;
                                 if let Some(local) = func.locals.get(param_name) {
                                     if let Some(&Loc::Stack(offset)) =
                                         self.locations.get_ref(local.sym)
                                     {
-                                        let (fp_size, second_offset) =
+                                        let (fp_size, elem_bytes) =
                                             self.two_element_fp_info(*typ, types);
-                                        // Store first element from first FP register
-                                        self.push_lir(Aarch64Inst::StrFp {
-                                            size: fp_size,
-                                            src: fp_arg_regs[fp_arg_idx],
-                                            addr: self.stack_mem(offset),
-                                        });
-                                        // Store second element from second FP register
-                                        self.push_lir(Aarch64Inst::StrFp {
-                                            size: fp_size,
-                                            src: fp_arg_regs[fp_arg_idx + 1],
-                                            addr: self.stack_mem_plus(offset, second_offset),
-                                        });
+                                        for elem in 0..count {
+                                            self.push_lir(Aarch64Inst::StrFp {
+                                                size: fp_size,
+                                                src: fp_arg_regs[fp_arg_idx + elem],
+                                                addr: self.stack_mem_plus(
+                                                    offset,
+                                                    elem as i32 * elem_bytes,
+                                                ),
+                                            });
+                                        }
                                     }
                                 }
                             } else {
@@ -1211,9 +1220,16 @@ impl Aarch64CodeGen {
                                 // garbage (#H13). regalloc has already assigned
                                 // the incoming slot; find it and shuttle both
                                 // elements through V16.
-                                self.copy_stacked_pair_to_local(func, i, *typ, types, pseudo.id);
+                                self.copy_stacked_fp_elems_to_local(
+                                    func,
+                                    i,
+                                    *typ,
+                                    types,
+                                    pseudo.id,
+                                    count as i32,
+                                );
                             }
-                            fp_arg_idx += 2;
+                            fp_arg_idx += count;
                         } else if is_fp {
                             // FP argument
                             if fp_arg_idx < fp_arg_regs.len() {

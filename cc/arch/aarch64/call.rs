@@ -185,44 +185,42 @@ impl Aarch64CodeGen {
         for (i, &arg) in insn.src.iter().enumerate().skip(args_start) {
             let arg_type = insn.arg_types.get(i).copied();
             let is_complex = arg_type.is_some_and(|t| types.is_complex(t));
-            // Check for HFA-2 struct (e.g., {double, double}) — passed in two FP regs
-            let is_hfa_two = !is_complex
-                && arg_type.is_some_and(|t| {
-                    let k = types.kind(t);
-                    (k == crate::types::TypeKind::Struct || k == crate::types::TypeKind::Union)
-                        && types.size_bits(t) > 64
-                        && types.size_bits(t) <= 128
-                        && {
-                            let abi = crate::abi::get_abi_for_conv(
-                                crate::abi::CallingConv::C,
-                                &self.base.target,
-                            );
-                            matches!(abi.classify_param(t, types), ArgClass::Hfa { count: 2, .. })
+            // Every HFA, one element through four. Only `count == 2` used to
+            // be recognised here, so a three- or four-element aggregate fell
+            // through to the general-register path below and went out whole in
+            // one X register while the callee read it from V0-V3 -- and it
+            // consumed an integer slot, shifting every following integer
+            // argument along.
+            //
+            // The exception is a single element small enough to sit in one
+            // register: that arrives as an ordinary floating-point value and
+            // goes out through `emit_fp_move` like any other scalar.
+            let hfa_regs: Option<usize> = if is_complex {
+                None
+            } else {
+                arg_type.and_then(|t| {
+                    let abi =
+                        crate::abi::get_abi_for_conv(crate::abi::CallingConv::C, &self.base.target);
+                    match abi.classify_param(t, types) {
+                        ArgClass::Hfa { count, .. } => {
+                            let count = count as usize;
+                            if count == 1 && types.size_bits(t) <= 64 {
+                                None
+                            } else {
+                                Some(count)
+                            }
                         }
-                });
-            let uses_two_fp_regs = is_complex || is_hfa_two;
+                        _ => None,
+                    }
+                })
+            };
             // A one-element HFA -- `struct { float v; }`, and every shape that
             // became one when arrays and half precision were admitted -- goes
-            // in a single V register, exactly as the bare scalar does. Only the
-            // two-element case was recognised here, so the rest went out in a
-            // general register while the callee, which does ask the ABI, read
-            // V0; and every floating argument after it was shifted a register
-            // along.
+            // in a single V register, exactly as the bare scalar does.
             let is_hfa_one = arg_type.is_some_and(|t| {
                 let abi =
                     crate::abi::get_abi_for_conv(crate::abi::CallingConv::C, &self.base.target);
-                // Only where the pseudo holds the *value*. Above a register's
-                // worth -- `struct { __float128 v; }` -- it holds an address,
-                // and that goes through the load below instead; moving it with
-                // `fmov` asks for a binary128 out of one X register, which does
-                // not exist.
                 types.size_bits(t) <= 64
-                    && matches!(abi.classify_param(t, types), ArgClass::Hfa { count: 1, .. })
-            });
-            let is_hfa_one_wide = arg_type.is_some_and(|t| {
-                let abi =
-                    crate::abi::get_abi_for_conv(crate::abi::CallingConv::C, &self.base.target);
-                types.size_bits(t) > 64
                     && matches!(abi.classify_param(t, types), ArgClass::Hfa { count: 1, .. })
             });
             let is_fp = if is_hfa_one {
@@ -240,35 +238,36 @@ impl Aarch64CodeGen {
                 64
             };
 
-            if is_hfa_one_wide {
-                // One V register holding the whole aggregate, loaded from its
-                // address -- the same shape `setup_hfa2_arg` handles, with one
-                // element instead of two.
-                if fp_arg_idx < fp_arg_regs.len() {
-                    self.setup_hfa1_arg(arg, arg_type, fp_arg_regs[fp_arg_idx], types);
-                    fp_arg_idx += 1;
-                    continue;
+            if let Some(count) = hfa_regs {
+                if fp_arg_idx + count <= fp_arg_regs.len() {
+                    let regs: Vec<VReg> = fp_arg_regs[fp_arg_idx..fp_arg_idx + count].to_vec();
+                    self.setup_hfa_arg(arg, arg_type, &regs, types);
+                    fp_arg_idx += count;
+                } else {
+                    stack_args_info.push(StackArg {
+                        pseudo: arg,
+                        is_fp: true,
+                        size: arg_size,
+                        typ: arg_type,
+                        complex_pair: count > 1,
+                    });
+                    // AAPCS64 §6.4.2: once anything is laid out on the stack,
+                    // NSRN becomes 8 and every later floating-point argument
+                    // follows it there. Unlike System V, the registers this
+                    // argument did not fit into are *not* left available.
+                    fp_arg_idx = fp_arg_regs.len();
                 }
+                continue;
             }
-            if uses_two_fp_regs {
+            if is_complex {
                 if fp_arg_idx + 1 < fp_arg_regs.len() {
-                    if is_hfa_two {
-                        self.setup_hfa2_arg(
-                            arg,
-                            arg_type,
-                            fp_arg_regs[fp_arg_idx],
-                            fp_arg_regs[fp_arg_idx + 1],
-                            types,
-                        );
-                    } else {
-                        self.setup_complex_arg(
-                            arg,
-                            arg_type,
-                            fp_arg_regs[fp_arg_idx],
-                            fp_arg_regs[fp_arg_idx + 1],
-                            types,
-                        );
-                    }
+                    self.setup_complex_arg(
+                        arg,
+                        arg_type,
+                        fp_arg_regs[fp_arg_idx],
+                        fp_arg_regs[fp_arg_idx + 1],
+                        types,
+                    );
                     fp_arg_idx += 2;
                 } else {
                     stack_args_info.push(StackArg {
@@ -278,13 +277,6 @@ impl Aarch64CodeGen {
                         typ: arg_type,
                         complex_pair: true,
                     });
-                    // AAPCS64 §6.4.2: once anything is laid out on the stack,
-                    // NSRN becomes 8 and every later floating-point argument
-                    // follows it there. Unlike System V, the registers this
-                    // argument did not fit into are *not* left available. The
-                    // callee's allocator already implements this rule; without
-                    // it here the two sides disagreed about where the next FP
-                    // argument lived.
                     fp_arg_idx = fp_arg_regs.len();
                 }
             } else if is_fp {
@@ -582,55 +574,27 @@ impl Aarch64CodeGen {
         }
     }
 
-    /// Set up an HFA-2 struct argument (two FP elements in consecutive V registers)
-    /// A one-element HFA wider than a register: load the whole aggregate into
-    /// one V register from its address. `setup_hfa2_arg` with a single element.
-    fn setup_hfa1_arg(
+    /// Set up an HFA argument: one V register per element, `regs.len()` of them.
+    ///
+    /// AAPCS64 §5.4.2 gives a homogeneous floating-point aggregate one V
+    /// register per element, for one to four elements. Where the aggregate is
+    /// wider than a register the pseudo holds its address and each element is
+    /// loaded from memory; where it fits in one -- `struct { float a, b; }` is
+    /// eight bytes -- the pseudo holds the *value*, and the elements have to
+    /// be cut out of it. A stack slot holding that value is the aggregate's
+    /// own bytes and can simply be loaded from, but a general register has to
+    /// be shifted down an element at a time.
+    fn setup_hfa_arg(
         &mut self,
         arg: PseudoId,
         arg_type: Option<crate::types::TypeId>,
-        reg: VReg,
+        regs: &[VReg],
         types: &TypeTable,
     ) {
         let arg_loc = self.get_location(arg);
         let typ = arg_type.unwrap();
         let abi = crate::abi::get_abi_for_conv(crate::abi::CallingConv::C, &self.base.target);
-        let fp_size = match abi.classify_param(typ, types) {
-            ArgClass::Hfa { base, .. } => match base {
-                HfaBase::Float16 => FpSize::Half,
-                HfaBase::Float32 => FpSize::Single,
-                HfaBase::Float64 => FpSize::Double,
-                HfaBase::Float128 => FpSize::Quad,
-            },
-            _ => FpSize::Double,
-        };
-        let addr = match arg_loc {
-            Loc::Stack(offset) => MemAddr::BaseOffset {
-                base: Reg::X29,
-                offset: self.stack_offset(offset),
-            },
-            Loc::Reg(r) => MemAddr::BaseOffset { base: r, offset: 0 },
-            _ => return,
-        };
-        self.push_lir(Aarch64Inst::LdrFp {
-            size: fp_size,
-            dst: reg,
-            addr,
-        });
-    }
-
-    fn setup_hfa2_arg(
-        &mut self,
-        arg: PseudoId,
-        arg_type: Option<crate::types::TypeId>,
-        first_reg: VReg,
-        second_reg: VReg,
-        types: &TypeTable,
-    ) {
-        let arg_loc = self.get_location(arg);
-        let typ = arg_type.unwrap();
-        let abi = crate::abi::get_abi_for_conv(crate::abi::CallingConv::C, &self.base.target);
-        let (fp_size, elem_offset) = match abi.classify_param(typ, types) {
+        let (fp_size, elem_bytes) = match abi.classify_param(typ, types) {
             ArgClass::Hfa { base, .. } => match base {
                 HfaBase::Float16 => (FpSize::Half, 2),
                 HfaBase::Float32 => (FpSize::Single, 4),
@@ -639,34 +603,51 @@ impl Aarch64CodeGen {
             },
             _ => (FpSize::Double, 8),
         };
+        // Above a register's worth, a pseudo in a register holds the
+        // aggregate's address rather than its value.
+        let holds_value = types.size_bits(typ) <= 64;
 
         match arg_loc {
             Loc::Stack(offset) => {
-                self.push_lir(Aarch64Inst::LdrFp {
-                    size: fp_size,
-                    dst: first_reg,
-                    addr: self.stack_mem(offset),
-                });
-                self.push_lir(Aarch64Inst::LdrFp {
-                    size: fp_size,
-                    dst: second_reg,
-                    addr: self.stack_mem_plus(offset, elem_offset),
-                });
+                for (i, &dst) in regs.iter().enumerate() {
+                    self.push_lir(Aarch64Inst::LdrFp {
+                        size: fp_size,
+                        dst,
+                        addr: self.stack_mem_plus(offset, i as i32 * elem_bytes),
+                    });
+                }
+            }
+            Loc::Reg(r) if !holds_value => {
+                for (i, &dst) in regs.iter().enumerate() {
+                    self.push_lir(Aarch64Inst::LdrFp {
+                        size: fp_size,
+                        dst,
+                        addr: MemAddr::BaseOffset {
+                            base: r,
+                            offset: i as i32 * elem_bytes,
+                        },
+                    });
+                }
             }
             Loc::Reg(r) => {
-                self.push_lir(Aarch64Inst::LdrFp {
-                    size: fp_size,
-                    dst: first_reg,
-                    addr: MemAddr::BaseOffset { base: r, offset: 0 },
-                });
-                self.push_lir(Aarch64Inst::LdrFp {
-                    size: fp_size,
-                    dst: second_reg,
-                    addr: MemAddr::BaseOffset {
-                        base: r,
-                        offset: elem_offset,
-                    },
-                });
+                for (i, &dst) in regs.iter().enumerate() {
+                    let src = if i == 0 {
+                        r
+                    } else {
+                        self.push_lir(Aarch64Inst::Lsr {
+                            size: OperandSize::B64,
+                            src: r,
+                            amount: GpOperand::Imm(i as i64 * elem_bytes as i64 * 8),
+                            dst: Reg::X9,
+                        });
+                        Reg::X9
+                    };
+                    self.push_lir(Aarch64Inst::FmovFromGp {
+                        size: fp_size,
+                        src,
+                        dst,
+                    });
+                }
             }
             _ => {}
         }

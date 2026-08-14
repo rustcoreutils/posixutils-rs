@@ -7211,6 +7211,13 @@ VA(v_ld,   long double)
 VA(v_int,  int)
 VA(v_dbl,  double)
 
+/* Sixteen bytes, SSE+SSEUP: one XMM, not the register pair the shapes above
+   take. Only where the type exists -- Apple arm64 has no runtime for it. */
+#ifdef __FLT128_MANT_DIG__
+struct Q { __float128 v; };
+VA(v_q, struct Q)
+#endif
+
 int main(void)
 {
     struct LL  ll  = { 1, 2 };
@@ -7232,6 +7239,12 @@ int main(void)
     /* Controls: the two shapes that always cost exactly one register. */
     if (v_int(1, 10L, 5.0) != 15) return 9;
     if (v_dbl(1.0, 10L, 5.0) != 15) return 10;
+
+#ifdef __FLT128_MANT_DIG__
+    struct Q qs;
+    qs.v = 1.0q;
+    if (v_q(qs, 10L, 5.0) != 15) return 11;
+#endif
 
     return 0;
 }

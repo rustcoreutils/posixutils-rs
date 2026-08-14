@@ -1138,7 +1138,11 @@ impl X86_64CodeGen {
                     }
                 }
             } else if let Some(n) = crate::abi::sse_struct_regs(*typ, types) {
-                // Eight bytes or fewer, all-SSE: one XMM.
+                // An all-SSE aggregate: `n` XMM registers. Both the eight-byte
+                // and smaller shapes and the sixteen-byte SSE+SSEUP one -- a
+                // lone `__float128` -- land here, the latter because it answers
+                // a single class rather than the pair `struct_param_classes`
+                // above looks for.
                 fp += n;
             } else if crate::abi::param_is_memory_class(*typ, types) {
                 // MEMORY class travels on the stack and spends no register.

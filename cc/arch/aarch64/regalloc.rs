@@ -754,8 +754,13 @@ pub enum Loc {
     Reg(Reg),
     /// In a floating-point register
     VReg(VReg),
-    /// In the callee's frame: a local, a spill slot or an alloca. Addressed
-    /// below the frame pointer (or below X19 when the frame is over-aligned).
+    /// On the stack, in whichever of two frames the sign selects -- the
+    /// distinction `LocalSlot` and `IncomingOff` make at the producer, and
+    /// which this type has yet to make. A *negative* offset is the callee's
+    /// own frame: a local, a spill slot or an alloca, addressed below the
+    /// frame pointer, or below the aligned base when the frame has one. A
+    /// *positive* offset is an incoming stack argument in the caller's frame,
+    /// starting at +16 past the saved FP and LR. See #C34 in `cc/audit.md`.
     Stack(i32),
     /// Immediate constant
     Imm(i128),

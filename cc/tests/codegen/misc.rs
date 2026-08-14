@@ -7422,3 +7422,65 @@ int main(void) {
         0
     );
 }
+
+/// An HFA that does not fit in the remaining V registers is laid on the stack,
+/// and the caller writes its elements there itself. Every multi-element
+/// argument took the `_Complex` path to do that: a fixed two-element loop at
+/// the complex element stride. For a three- or four-element HFA that wrote the
+/// wrong number of elements at the wrong stride, and reserved the wrong number
+/// of bytes, so the argument after it landed inside it.
+///
+/// The first two arguments exist only to consume V0-V7, forcing the third onto
+/// the stack. `noinline` keeps the parameters arriving through the ABI rather
+/// than being substituted -- an inlined stacked HFA is a separate defect
+/// (#C38) and would mask this one.
+#[test]
+fn codegen_stacked_hfa_element_counts() {
+    let code = r#"
+typedef struct { float a, b, c, d; }        F4;
+typedef struct { float a, b, c; }           F3;
+typedef struct { double a, b; }             D2;
+typedef struct { double a, b, c; }          D3;
+
+__attribute__((noinline)) double s_f4(F4 p, F4 q, F4 r) {
+    return (double)r.a * 1000 + r.b * 100 + r.c * 10 + r.d;
+}
+__attribute__((noinline)) double s_f3(F4 p, F4 q, F3 r) {
+    return (double)r.a * 100 + r.b * 10 + r.c;
+}
+__attribute__((noinline)) double s_d2(F4 p, F4 q, D2 r) {
+    return r.a * 10 + r.b;
+}
+__attribute__((noinline)) double s_d3(F4 p, F4 q, D3 r) {
+    return r.a * 100 + r.b * 10 + r.c;
+}
+/* an argument after the stacked HFA: too small a slot puts it inside */
+__attribute__((noinline)) double s_tail(F4 p, F4 q, F4 r, double t) {
+    return (double)r.a * 1000 + r.b * 100 + r.c * 10 + r.d + t;
+}
+__attribute__((noinline)) double s_tail3(F4 p, F4 q, F3 r, double t) {
+    return (double)r.a * 100 + r.b * 10 + r.c + t;
+}
+
+int main(void) {
+    F4 z = {0, 0, 0, 0};
+    F4 f4 = {1, 2, 3, 4};
+    F3 f3 = {1, 2, 3};
+    D2 d2 = {1, 2};
+    D3 d3 = {1, 2, 3};
+
+    if (s_f4(z, z, f4) != 1234) return 1;
+    if (s_f3(z, z, f3) != 123) return 2;
+    if (s_d2(z, z, d2) != 12) return 3;
+    if (s_d3(z, z, d3) != 123) return 4;
+    if (s_tail(z, z, f4, 5) != 1239) return 5;
+    if (s_tail3(z, z, f3, 5) != 128) return 6;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("codegen_stacked_hfa_counts", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("codegen_stacked_hfa_counts_opt", code),
+        0
+    );
+}

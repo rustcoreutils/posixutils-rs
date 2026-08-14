@@ -144,16 +144,33 @@ impl Aarch64CodeGen {
 
         // First pass: identify which args go to registers vs stack
         // Collect stack args with their info for the second pass
+        /// What a stacked argument is made of, which decides both how many
+        /// bytes it reserves and how its bytes are produced.
+        ///
+        /// This was a `complex_pair: bool`. Every multi-element argument that
+        /// did not fit in the V registers took the `_Complex` path -- a fixed
+        /// two-element loop at the complex element stride -- so a stacked
+        /// three- or four-element HFA wrote the wrong number of elements at
+        /// the wrong stride, and reserved the wrong slot besides.
+        #[derive(Clone, Copy)]
+        enum StackKind {
+            /// An ordinary value; the pseudo holds it.
+            Scalar,
+            /// A `_Complex`: the pseudo holds the value's *address*, and both
+            /// elements must be dereferenced out of it into one two-element
+            /// slot. Pushing the pseudo twice as if it were two scalars wrote
+            /// the pointer's bit pattern into both halves.
+            Complex,
+            /// An HFA: `count` elements of `base`, at that base's stride.
+            Hfa { base: HfaBase, count: u8 },
+        }
+
         struct StackArg {
             pseudo: PseudoId,
             is_fp: bool,
             size: u32,
             typ: Option<TypeId>,
-            /// A `_Complex` laid on the stack: the pseudo holds the value's
-            /// *address*, and both elements must be dereferenced out of it
-            /// into one 2-element slot. Pushing the pseudo twice as if it were
-            /// two scalars wrote the pointer's bit pattern into both halves.
-            complex_pair: bool,
+            kind: StackKind,
         }
 
         impl StackArg {
@@ -165,17 +182,25 @@ impl Aarch64CodeGen {
             /// own frame. AAPCS64 rounds each stacked argument up to 8, which
             /// is also what the callee's allocator does.
             fn slot_bytes(&self, types: &TypeTable, target: &Target) -> i32 {
-                if self.complex_pair {
-                    let elem = self
-                        .typ
-                        .map(|t| complex_fp_info(types, target, t).1)
-                        .unwrap_or(8);
-                    return ((2 * elem) + 7) & !7;
+                match self.kind {
+                    StackKind::Complex => {
+                        let elem = self
+                            .typ
+                            .map(|t| complex_fp_info(types, target, t).1)
+                            .unwrap_or(8);
+                        ((2 * elem) + 7) & !7
+                    }
+                    StackKind::Hfa { base, count } => {
+                        ((count as i32 * HfaElem::of(base).bytes) + 7) & !7
+                    }
+                    StackKind::Scalar => {
+                        if self.size == 128 {
+                            16
+                        } else {
+                            8
+                        }
+                    }
                 }
-                if self.size == 128 {
-                    return 16;
-                }
-                8
             }
         }
         let mut stack_args_info: Vec<StackArg> = Vec::new();
@@ -195,19 +220,19 @@ impl Aarch64CodeGen {
             // The exception is a single element small enough to sit in one
             // register: that arrives as an ordinary floating-point value and
             // goes out through `emit_fp_move` like any other scalar.
-            let hfa_regs: Option<usize> = if is_complex {
+            let hfa_regs: Option<(HfaBase, usize)> = if is_complex {
                 None
             } else {
                 arg_type.and_then(|t| {
                     let abi =
                         crate::abi::get_abi_for_conv(crate::abi::CallingConv::C, &self.base.target);
                     match abi.classify_param(t, types) {
-                        ArgClass::Hfa { count, .. } => {
+                        ArgClass::Hfa { base, count } => {
                             let count = count as usize;
                             if count == 1 && types.size_bits(t) <= 64 {
                                 None
                             } else {
-                                Some(count)
+                                Some((base, count))
                             }
                         }
                         _ => None,
@@ -238,7 +263,7 @@ impl Aarch64CodeGen {
                 64
             };
 
-            if let Some(count) = hfa_regs {
+            if let Some((hfa_base, count)) = hfa_regs {
                 if fp_arg_idx + count <= fp_arg_regs.len() {
                     let regs: Vec<VReg> = fp_arg_regs[fp_arg_idx..fp_arg_idx + count].to_vec();
                     self.setup_hfa_arg(arg, arg_type, &regs, types);
@@ -249,7 +274,10 @@ impl Aarch64CodeGen {
                         is_fp: true,
                         size: arg_size,
                         typ: arg_type,
-                        complex_pair: count > 1,
+                        kind: StackKind::Hfa {
+                            base: hfa_base,
+                            count: count as u8,
+                        },
                     });
                     // AAPCS64 §6.4.2: once anything is laid out on the stack,
                     // NSRN becomes 8 and every later floating-point argument
@@ -275,7 +303,7 @@ impl Aarch64CodeGen {
                         is_fp: true,
                         size: arg_size,
                         typ: arg_type,
-                        complex_pair: true,
+                        kind: StackKind::Complex,
                     });
                     fp_arg_idx = fp_arg_regs.len();
                 }
@@ -294,7 +322,7 @@ impl Aarch64CodeGen {
                         is_fp: true,
                         size: arg_size,
                         typ: arg_type,
-                        complex_pair: false,
+                        kind: StackKind::Scalar,
                     });
                 }
             } else if arg_type.is_some_and(|t| types.kind(t) == crate::types::TypeKind::Int128) {
@@ -335,7 +363,7 @@ impl Aarch64CodeGen {
                         is_fp: false,
                         size: 128,
                         typ: arg_type,
-                        complex_pair: false,
+                        kind: StackKind::Scalar,
                     });
                 }
             } else if int_arg_idx < int_arg_regs.len() {
@@ -347,7 +375,7 @@ impl Aarch64CodeGen {
                     is_fp: false,
                     size: arg_size,
                     typ: arg_type,
-                    complex_pair: false,
+                    kind: StackKind::Scalar,
                 });
             }
         }
@@ -419,7 +447,7 @@ impl Aarch64CodeGen {
                 offset += 16;
                 continue;
             }
-            if stack_arg.complex_pair {
+            if matches!(stack_arg.kind, StackKind::Complex) {
                 // The pseudo holds the *address* of the complex value, so both
                 // elements are loaded out of it -- the same dereference
                 // setup_complex_arg performs for the register-passed case.
@@ -447,6 +475,27 @@ impl Aarch64CodeGen {
                 }
                 // AAPCS64 rounds each stacked argument up to 8 bytes; the
                 // callee's allocator uses the same rule, so the two agree.
+                offset += stack_arg.slot_bytes(types, &self.base.target);
+                continue;
+            }
+            if let StackKind::Hfa { base, count } = stack_arg.kind {
+                // One element at a time through V16, at the base's own
+                // stride. The `_Complex` path above writes exactly two
+                // elements at the complex stride, which is right for a
+                // `_Complex` and for nothing else.
+                let typ = stack_arg.typ.expect("HFA arg without a type");
+                let elem = HfaElem::of(base);
+                for i in 0..count as usize {
+                    self.load_hfa_elem(stack_arg.pseudo, typ, elem, i, VReg::V16, types);
+                    self.push_lir(Aarch64Inst::StrFp {
+                        size: elem.size,
+                        src: VReg::V16,
+                        addr: MemAddr::BaseOffset {
+                            base: Reg::SP,
+                            offset: offset + i as i32 * elem.bytes,
+                        },
+                    });
+                }
                 offset += stack_arg.slot_bytes(types, &self.base.target);
                 continue;
             }
@@ -584,6 +633,63 @@ impl Aarch64CodeGen {
     /// be cut out of it. A stack slot holding that value is the aggregate's
     /// own bytes and can simply be loaded from, but a general register has to
     /// be shifted down an element at a time.
+    /// Load element `index` of an HFA argument into `dst`.
+    ///
+    /// The three shapes an HFA argument arrives in. Above a register's worth
+    /// the pseudo holds the aggregate's *address*; at or below it the pseudo
+    /// holds the packed value, and a stack slot holding that value is already
+    /// the aggregate's own bytes while a general register has to be shifted
+    /// down an element at a time.
+    fn load_hfa_elem(
+        &mut self,
+        arg: PseudoId,
+        typ: TypeId,
+        elem: HfaElem,
+        index: usize,
+        dst: VReg,
+        types: &TypeTable,
+    ) {
+        let arg_loc = self.get_location(arg);
+        let fp_size = elem.size;
+        let delta = index as i32 * elem.bytes;
+        let holds_value = types.size_bits(typ) <= 64;
+
+        match arg_loc {
+            Loc::Stack(offset) => self.push_lir(Aarch64Inst::LdrFp {
+                size: fp_size,
+                dst,
+                addr: self.stack_mem_plus(offset, delta),
+            }),
+            Loc::Reg(r) if !holds_value => self.push_lir(Aarch64Inst::LdrFp {
+                size: fp_size,
+                dst,
+                addr: MemAddr::BaseOffset {
+                    base: r,
+                    offset: delta,
+                },
+            }),
+            Loc::Reg(r) => {
+                let src = if index == 0 {
+                    r
+                } else {
+                    self.push_lir(Aarch64Inst::Lsr {
+                        size: OperandSize::B64,
+                        src: r,
+                        amount: GpOperand::Imm(delta as i64 * 8),
+                        dst: Reg::X9,
+                    });
+                    Reg::X9
+                };
+                self.push_lir(Aarch64Inst::FmovFromGp {
+                    size: fp_size,
+                    src,
+                    dst,
+                });
+            }
+            _ => {}
+        }
+    }
+
     fn setup_hfa_arg(
         &mut self,
         arg: PseudoId,
@@ -591,65 +697,17 @@ impl Aarch64CodeGen {
         regs: &[VReg],
         types: &TypeTable,
     ) {
-        let arg_loc = self.get_location(arg);
         let typ = arg_type.unwrap();
         let abi = crate::abi::get_abi_for_conv(crate::abi::CallingConv::C, &self.base.target);
-        let (fp_size, elem_bytes) = match abi.classify_param(typ, types) {
-            ArgClass::Hfa { base, .. } => match base {
-                HfaBase::Float16 => (FpSize::Half, 2),
-                HfaBase::Float32 => (FpSize::Single, 4),
-                HfaBase::Float64 => (FpSize::Double, 8),
-                HfaBase::Float128 => (FpSize::Quad, 16),
+        let elem = match abi.classify_param(typ, types) {
+            ArgClass::Hfa { base, .. } => HfaElem::of(base),
+            _ => HfaElem {
+                size: FpSize::Double,
+                bytes: 8,
             },
-            _ => (FpSize::Double, 8),
         };
-        // Above a register's worth, a pseudo in a register holds the
-        // aggregate's address rather than its value.
-        let holds_value = types.size_bits(typ) <= 64;
-
-        match arg_loc {
-            Loc::Stack(offset) => {
-                for (i, &dst) in regs.iter().enumerate() {
-                    self.push_lir(Aarch64Inst::LdrFp {
-                        size: fp_size,
-                        dst,
-                        addr: self.stack_mem_plus(offset, i as i32 * elem_bytes),
-                    });
-                }
-            }
-            Loc::Reg(r) if !holds_value => {
-                for (i, &dst) in regs.iter().enumerate() {
-                    self.push_lir(Aarch64Inst::LdrFp {
-                        size: fp_size,
-                        dst,
-                        addr: MemAddr::BaseOffset {
-                            base: r,
-                            offset: i as i32 * elem_bytes,
-                        },
-                    });
-                }
-            }
-            Loc::Reg(r) => {
-                for (i, &dst) in regs.iter().enumerate() {
-                    let src = if i == 0 {
-                        r
-                    } else {
-                        self.push_lir(Aarch64Inst::Lsr {
-                            size: OperandSize::B64,
-                            src: r,
-                            amount: GpOperand::Imm(i as i64 * elem_bytes as i64 * 8),
-                            dst: Reg::X9,
-                        });
-                        Reg::X9
-                    };
-                    self.push_lir(Aarch64Inst::FmovFromGp {
-                        size: fp_size,
-                        src,
-                        dst,
-                    });
-                }
-            }
-            _ => {}
+        for (i, &dst) in regs.iter().enumerate() {
+            self.load_hfa_elem(arg, typ, elem, i, dst, types);
         }
     }
 
@@ -896,5 +954,28 @@ impl Aarch64CodeGen {
             }
             _ => {}
         }
+    }
+}
+
+/// How one element of an HFA is loaded and how far apart two of them sit.
+///
+/// The two always travel together -- every HFA site needs both, and spelling
+/// them out at each one is how a stacked HFA came to be written at the
+/// `_Complex` stride.
+#[derive(Clone, Copy)]
+struct HfaElem {
+    size: FpSize,
+    bytes: i32,
+}
+
+impl HfaElem {
+    fn of(base: HfaBase) -> HfaElem {
+        let (size, bytes) = match base {
+            HfaBase::Float16 => (FpSize::Half, 2),
+            HfaBase::Float32 => (FpSize::Single, 4),
+            HfaBase::Float64 => (FpSize::Double, 8),
+            HfaBase::Float128 => (FpSize::Quad, 16),
+        };
+        HfaElem { size, bytes }
     }
 }

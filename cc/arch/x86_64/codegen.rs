@@ -1126,7 +1126,10 @@ impl X86_64CodeGen {
         let mut gp = 0usize;
         let mut fp = 0usize;
         for (_, typ) in &func.params {
+            let kind = types.kind(*typ);
             if let Some(classes) = crate::abi::struct_param_classes(*typ, types) {
+                // Nine to sixteen bytes: one register per eightbyte, from
+                // whichever file its class names.
                 for class in &classes {
                     if *class == crate::abi::RegClass::Sse {
                         fp += 1;
@@ -1134,8 +1137,21 @@ impl X86_64CodeGen {
                         gp += 1;
                     }
                 }
+            } else if let Some(n) = crate::abi::sse_struct_regs(*typ, types) {
+                // Eight bytes or fewer, all-SSE: one XMM.
+                fp += n;
+            } else if crate::abi::param_is_memory_class(*typ, types) {
+                // MEMORY class travels on the stack and spends no register.
+            } else if types.is_complex(*typ) {
+                // Two XMMs for `double _Complex`, one for `float _Complex`
+                // (both halves in one eightbyte), none for
+                // `long double _Complex`, which is COMPLEX_X87 and is passed
+                // in memory.
+                fp += complex_sse_regs(types, *typ);
+            } else if kind == TypeKind::Int128 {
+                gp += 2;
             } else if types.is_float(*typ) {
-                if types.kind(*typ) != crate::types::TypeKind::LongDouble {
+                if kind != TypeKind::LongDouble {
                     fp += 1;
                 }
             } else {

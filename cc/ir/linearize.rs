@@ -980,18 +980,44 @@ impl<'a> Linearizer<'a> {
                 // passed like complex types (in two XMM registers). Route them
                 // through complex_params so the codegen handles the register split.
                 let size = self.types.size_bits(param.typ);
-                let is_two_fp_regs = size > 64 && size <= 128 && {
+                // An HFA arrives in one register per element whatever its
+                // size, and the prologue is what writes them into the local --
+                // so it must not also get the small-struct store below. A
+                // two-element half-precision HFA is four bytes, and used to get
+                // both: the store overwrote the halves the prologue had just
+                // put there.
+                let is_hfa_param = {
                     let abi = get_abi_for_conv(self.current_calling_conv, self.target);
-                    let class = abi.classify_param(param.typ, self.types);
-                    // Any all-SSE aggregate, whether that is two registers of
-                    // eight bytes or one of sixteen.
                     matches!(
-                        class,
-                        crate::abi::ArgClass::Direct { ref classes, .. }
-                            if !classes.is_empty()
-                                && classes.iter().all(|c| *c == crate::abi::RegClass::Sse)
-                    ) || matches!(class, crate::abi::ArgClass::Hfa { count: 2, .. })
+                        abi.classify_param(param.typ, self.types),
+                        crate::abi::ArgClass::Hfa { count, .. } if count >= 2
+                    )
                 };
+                let is_two_fp_regs = is_hfa_param
+                    || size > 64 && size <= 128 && {
+                        let abi = get_abi_for_conv(self.current_calling_conv, self.target);
+                        let class = abi.classify_param(param.typ, self.types);
+                        // Any all-SSE aggregate, whether that is two registers of
+                        // eight bytes or one of sixteen.
+                        let all_sse =
+                            matches!(
+                                class,
+                                crate::abi::ArgClass::Direct { ref classes, .. }
+                                    if !classes.is_empty()
+                                        && classes.iter().all(|c| *c == crate::abi::RegClass::Sse)
+                            ) || matches!(class, crate::abi::ArgClass::Hfa { count: 2, .. });
+                        // Two eightbytes of any classes -- both integer, or one of
+                        // each -- arrive in two registers on x86-64 as well. The
+                        // caller's half of this decision is gated the same way;
+                        // aarch64 still hands such a struct over as a pointer.
+                        let reg_pair = self.target.arch == crate::target::Arch::X86_64
+                            && matches!(
+                                class,
+                                crate::abi::ArgClass::Direct { ref classes, .. }
+                                    if classes.len() == 2
+                            );
+                        all_sse || reg_pair
+                    };
                 if is_two_fp_regs {
                     complex_params.push((
                         name,
@@ -1691,9 +1717,16 @@ impl<'a> Linearizer<'a> {
         }
         let typ = self.expr_type(expr);
         let val = self.linearize_expr(expr);
-        // A `Sym`'s slot holds the value itself; anything else already holds a
-        // pointer to it. Deciding here, where the pseudo's kind is known, is
-        // what lets every consumer treat the result as a plain address.
+        self.rvalue_addr(val, typ)
+    }
+
+    /// The address of a value that has just been materialized.
+    ///
+    /// A `Sym`'s slot holds the value itself; anything else already holds a
+    /// pointer to it. Deciding here, where the pseudo's kind is known, is what
+    /// lets every consumer treat the result as a plain address -- handing one
+    /// the value's own bits instead gets them dereferenced as an address.
+    pub(crate) fn rvalue_addr(&mut self, val: PseudoId, typ: TypeId) -> PseudoId {
         let slot_is_the_value = self
             .current_func
             .as_ref()
@@ -2015,9 +2048,46 @@ impl<'a> Linearizer<'a> {
                 self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
                 result
             }
+            // `__real__ z` and `__imag__ z` name storage inside `z`, so they
+            // are lvalues exactly when `z` is one. The imaginary half sits one
+            // base type above the real one.
+            ExprKind::Unary {
+                op: op @ (UnaryOp::Real | UnaryOp::Imag),
+                operand,
+            } => {
+                let op_typ = self.expr_type(operand);
+                let addr = self.complex_operand_addr(operand);
+                if *op == UnaryOp::Real || !self.types.is_complex(op_typ) {
+                    return addr;
+                }
+                let base_bytes =
+                    (self.types.size_bits(self.types.complex_base(op_typ)) / 8) as i128;
+                let off = self.emit_const(base_bytes, self.types.long_id);
+                let out = self.alloc_reg_pseudo();
+                let ptr_type = self.types.pointer_to(self.types.complex_base(op_typ));
+                self.emit(Instruction::binop(
+                    Opcode::Add,
+                    out,
+                    addr,
+                    off,
+                    ptr_type,
+                    self.target.pointer_width,
+                ));
+                out
+            }
             _ => {
-                // Fallback: just evaluate the expression (shouldn't happen for valid lvalues)
-                self.linearize_expr(expr)
+                // Not a designator -- a call returning a struct, a comma, a
+                // conditional. Evaluating it yields the *value*; a consumer
+                // that loads or stores folds the offset in and reads the right
+                // bytes, but one that does arithmetic -- indexing an array
+                // member, taking an address -- would dereference the value's
+                // own bits. Materialize it and hand back its address instead.
+                //
+                // The temporary is a function-scope local, so it outlives the
+                // full expression as C17 6.5.2.3p5 requires.
+                let typ = self.expr_type(expr);
+                let val = self.linearize_expr(expr);
+                self.rvalue_addr(val, typ)
             }
         }
     }
@@ -2860,7 +2930,19 @@ impl<'a> Linearizer<'a> {
                     // `long double`, directly or merged with something else;
                     // passing a pointer instead disagreed with gcc silently.
                     let is_memory = matches!(class, crate::abi::ArgClass::Indirect { .. });
-                    if is_two_fp_regs || is_memory {
+                    // Any other two-eightbyte `Direct` class -- two integer
+                    // registers, or one of each -- travels in registers too.
+                    // x86-64 only: aarch64 implements just the HFA case above
+                    // and passes the rest as a pointer, which its callee then
+                    // dereferences, so keeping the struct type there would
+                    // miscompile. This file is shared by both targets.
+                    let is_reg_pair = self.target.arch == crate::target::Arch::X86_64
+                        && matches!(
+                            class,
+                            crate::abi::ArgClass::Direct { ref classes, .. }
+                                if classes.len() == 2
+                        );
+                    if is_two_fp_regs || is_memory || is_reg_pair {
                         // Keep the struct type: the ABI decides from it, and
                         // the pseudo carries the address either way.
                         arg_types_vec.push(arg_type);
@@ -2869,34 +2951,11 @@ impl<'a> Linearizer<'a> {
                         arg_types_vec.push(self.types.pointer_to(arg_type));
                     }
                 }
-                // For lvalue expressions (identifiers, member access), linearize_lvalue
-                // returns a symaddr (pointer). For rvalue expressions (call results),
-                // linearize_lvalue falls through to linearize_expr which returns the
-                // data pseudo, not its address. In that case we must emit a symaddr
-                // to get the address for pointer-based struct passing.
-                let is_lvalue = matches!(
-                    a.kind,
-                    ExprKind::Ident(_)
-                        | ExprKind::Member { .. }
-                        | ExprKind::Arrow { .. }
-                        | ExprKind::Index { .. }
-                        | ExprKind::Unary {
-                            op: crate::parse::ast::UnaryOp::Deref,
-                            ..
-                        }
-                        | ExprKind::CompoundLiteral { .. }
-                );
-                if is_lvalue {
-                    self.linearize_lvalue(a)
-                } else {
-                    // Rvalue (e.g., function call returning struct): evaluate,
-                    // then take address of the result local
-                    let val = self.linearize_expr(a);
-                    let result = self.alloc_reg_pseudo();
-                    let ptr_type = self.types.pointer_to(arg_type);
-                    self.emit(Instruction::sym_addr(result, val, ptr_type));
-                    result
-                }
+                // A struct argument travels by address. `linearize_lvalue`
+                // now materializes an rvalue -- a call returning a struct --
+                // and hands back the temporary's address, so both cases are
+                // the same call; this used to open-code the rvalue half.
+                self.linearize_lvalue(a)
             } else if self.types.is_complex(arg_type) {
                 // Complex types: pass address, codegen loads real/imag into XMM registers
                 // Type stays as complex (not pointer) so codegen knows it's complex.
@@ -3415,6 +3474,36 @@ impl<'a> Linearizer<'a> {
         // Handle AddrOf specially - we need the lvalue address, not the value
         if op == UnaryOp::AddrOf {
             return self.linearize_lvalue(operand);
+        }
+
+        // `__real__` / `__imag__`: one half of a complex value, or the operand
+        // itself when it is already real -- gcc accepts both, and `__imag__` of
+        // a real is a zero of that type.
+        if op == UnaryOp::Real || op == UnaryOp::Imag {
+            let op_typ = self.expr_type(operand);
+            if !self.types.is_complex(op_typ) {
+                return if op == UnaryOp::Real {
+                    self.linearize_expr(operand)
+                } else {
+                    // `__imag__` of a real operand is a zero of its type.
+                    if self.types.is_float(op_typ) {
+                        self.emit_fconst(crate::float::FloatVal::ZERO, op_typ)
+                    } else {
+                        self.emit_const(0, op_typ)
+                    }
+                };
+            }
+            let base_typ = self.types.complex_base(op_typ);
+            let base_bits = self.types.size_bits(base_typ);
+            let offset = if op == UnaryOp::Real {
+                0
+            } else {
+                (base_bits / 8) as i64
+            };
+            let addr = self.complex_operand_addr(operand);
+            let half = self.alloc_pseudo();
+            self.emit(Instruction::load(half, addr, offset, base_typ, base_bits));
+            return half;
         }
 
         // A complex value travels by address, so the scalar path below would

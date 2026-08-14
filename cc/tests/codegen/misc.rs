@@ -7073,3 +7073,98 @@ int main(void)
         0
     );
 }
+
+/// A nine-to-sixteen-byte integer or mixed struct travels in two registers.
+///
+/// System V classifies each eightbyte independently: `struct { long a, b; }` is
+/// two general registers, `struct { double a; int b; }` is an SSE register and
+/// a general one. c17 passed a *pointer* in one general register instead. Both
+/// sides of a c17 translation unit agreed, so running a program could never
+/// catch it -- it only bites against a gcc-compiled peer, which is why this is
+/// checked here for behaviour and by an assembly probe for the register file.
+///
+/// Also covers the two accounting rules the register form needs: an argument
+/// that does not fit goes to memory *whole* (System V 3.2.3 step 5), and a
+/// struct before an ellipsis spends every register it occupies, or `va_start`
+/// reads the save area at the wrong index.
+#[test]
+fn codegen_medium_struct_passes_in_registers() {
+    let code = r#"
+#include <stdarg.h>
+
+struct LL { long a, b; };
+struct DI { double a; int b; };
+struct ID { int a; double b; };
+struct III { int a, b, c; };
+struct PAD { char pad[12]; int v; };
+struct DD { double a, b; };          /* control: already correct */
+struct I1 { int v; };                /* control: one eightbyte */
+
+__attribute__((noinline)) static long  ll(struct LL s)  { return s.a + s.b; }
+__attribute__((noinline)) static double di(struct DI s) { return s.a + s.b; }
+__attribute__((noinline)) static double id(struct ID s) { return s.a + s.b; }
+__attribute__((noinline)) static int   iii(struct III s){ return s.a + s.b + s.c; }
+__attribute__((noinline)) static int   pad(struct PAD s){ return s.v; }
+__attribute__((noinline)) static double dd(struct DD s) { return s.a + s.b; }
+__attribute__((noinline)) static int    i1(struct I1 s) { return s.v; }
+
+/* The struct runs out of registers and must go to memory whole. */
+__attribute__((noinline)) static long over(long a, long b, long c, long d,
+                                           long e, long f, struct LL s)
+{ return a + b + c + d + e + f + s.a + s.b; }
+__attribute__((noinline)) static double overf(double a, double b, double c, double d,
+                                              double e, double f, double g, double h,
+                                              struct DI s)
+{ return a + b + c + d + e + f + g + h + s.a + s.b; }
+
+/* A register-pair struct before the ellipsis. */
+__attribute__((noinline)) static long va(struct LL s, ...)
+{
+    va_list ap; va_start(ap, s);
+    long x = va_arg(ap, long), y = va_arg(ap, long);
+    va_end(ap);
+    return s.a + s.b + x + y;
+}
+
+/* The argument crosses a call, so it has to survive a spill. */
+__attribute__((noinline)) static long ident(long v) { return v; }
+__attribute__((noinline)) static long cross(struct LL s)
+{ long t = ident(5); return s.a + s.b + t; }
+
+int main(void)
+{
+    struct LL  l = { 3, 4 };
+    struct DI  m = { 1.5, 2 };
+    struct ID  n = { 2, 1.5 };
+    struct III o = { 1, 2, 3 };
+    struct PAD p = { { 0 }, 9 };
+    struct DD  d = { 1.5, 2.5 };
+    struct I1  i = { 7 };
+
+    if (ll(l) != 7) return 1;
+    if (di(m) != 3.5) return 2;
+    if (id(n) != 3.5) return 3;
+    if (iii(o) != 6) return 4;
+    if (pad(p) != 9) return 5;
+
+    /* Controls: an all-SSE pair and a single eightbyte must not move. */
+    if (dd(d) != 4.0) return 6;
+    if (i1(i) != 7) return 7;
+
+    if (over(1, 2, 3, 4, 5, 6, l) != 28) return 8;
+    if (overf(1, 2, 3, 4, 5, 6, 7, 8, m) != 39.5) return 9;
+    if (va(l, 10L, 20L) != 37) return 10;
+    if (cross(l) != 12) return 11;
+
+    /* Passed straight through, so both directions run in one expression. */
+    if (ll((struct LL){ 5, 6 }) != 11) return 12;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("codegen_medium_struct_regs", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("codegen_medium_struct_regs_opt", code),
+        0
+    );
+}

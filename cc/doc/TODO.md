@@ -173,10 +173,18 @@ Convert constant branches to unconditional jumps. Merge simple blocks. Remove ju
 
 `t1 = x; y = t1;` → `y = x`. Simplify φ-nodes where all incoming operands are same.
 
-**Blocked.** An attempt at this surfaced a register-allocator defect that is
-still open: a non-variadic `Arg` pseudo's location is computed off the wrong
-frame base (spill slot versus callee frame). Any pass that merges pseudos
-trips it, so copy propagation cannot land until that is fixed.
+**Unblocked on x86-64.** The defect was thirty-odd emitters in
+`arch/x86_64/features.rs` that hand-rolled an `%rbp` displacement from a stack
+slot index, which is the caller's incoming-argument area rather than the
+callee's frame — `__builtin_bswap`, `__builtin_ctz`, `va_start`, `va_arg` and
+`va_copy`. They are unreachable from C today because the linearizer
+materializes every operand through a `Load`, so these emitters only ever see a
+register; that is exactly the arrangement copy propagation undoes. They now go
+through `stack_mem`/`stack_field`, which know where slots live.
+
+aarch64 still distinguishes the two frames by the *sign* of an offset rather
+than by a distinct `Loc` variant — see #C34 in `cc/audit.md`. That is the
+remaining hazard for a pseudo-merging pass on that target.
 
 #### Local CSE / Value Numbering
 

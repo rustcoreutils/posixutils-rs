@@ -212,3 +212,61 @@ int main(void)
         0
     );
 }
+
+/// GCC's `__real__` and `__imag__`, as rvalues and as lvalues.
+///
+/// Both are long-standing extensions and the natural way to reach a complex
+/// value's halves without `<complex.h>` -- c17 offered only `creal`/`cimag`,
+/// which need libm. They are lvalues when the operand is one, so assignment,
+/// compound assignment and `&` all have to work; and gcc accepts them on a
+/// *real* operand too, where `__real__ x` is `x` and `__imag__ x` is a zero of
+/// its type. Every expectation checked against gcc on the same source.
+#[test]
+fn c99_real_and_imag_operators() {
+    let code = r#"
+int main(void)
+{
+    double _Complex z = __builtin_complex(1.5, 2.5);
+
+    /* Rvalue, both spellings. */
+    if (__real__ z != 1.5) return 1;
+    if (__imag__ z != 2.5) return 2;
+    if (__real z != 1.5) return 3;
+    if (__imag z != 2.5) return 4;
+
+    /* Every base precision. */
+    float _Complex f = __builtin_complex(3.5f, 4.5f);
+    if (__real__ f != 3.5f || __imag__ f != 4.5f) return 5;
+    long double _Complex l = __builtin_complex(5.5L, 6.5L);
+    if (__real__ l != 5.5L || __imag__ l != 6.5L) return 6;
+
+    /* Lvalue: plain and compound assignment. */
+    __real__ z = 10.0;
+    if (__real__ z != 10.0 || __imag__ z != 2.5) return 7;
+    __imag__ z = 20.0;
+    if (__imag__ z != 20.0 || __real__ z != 10.0) return 8;
+    __real__ z += 5.0;
+    if (__real__ z != 15.0) return 9;
+    __imag__ z *= 2.0;
+    if (__imag__ z != 40.0) return 10;
+
+    /* Taking the address of a half. */
+    double *pr = &__real__ z;
+    double *pi = &__imag__ z;
+    if (*pr != 15.0 || *pi != 40.0) return 11;
+    *pi = 1.0;
+    if (__imag__ z != 1.0) return 12;
+
+    /* A real operand: the real part is the value, the imaginary part zero. */
+    double r = 7.5;
+    if (__real__ r != 7.5) return 13;
+    if (__imag__ r != 0.0) return 14;
+    int n = 3;
+    if (__real__ n != 3) return 15;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_real_imag", code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("c99_real_imag_opt", code), 0);
+}

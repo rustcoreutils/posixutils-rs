@@ -14,7 +14,7 @@
 // array/function-to-pointer decay, lvalue conversion)
 //
 
-use crate::common::compile_and_run;
+use crate::common::{compile_and_run, compile_and_run_optimized};
 
 // ============================================================================
 // Mega-test: C99 expressions (Section 5)
@@ -237,4 +237,67 @@ int main(void) {
 }
 "#;
     assert_eq!(compile_and_run("c99_expressions_mega", code, &[]), 0);
+}
+
+/// A struct rvalue used as a designator gets a real address.
+///
+/// `linearize_lvalue` fell through to evaluating the expression for anything
+/// that is not a designator, and for a struct-returning call that yields the
+/// *result local* -- the value, not its address. A consumer that loads or
+/// stores folds the member offset in and reads the right bytes, which is why
+/// `mk().scalar_member` always worked. A consumer that does arithmetic --
+/// indexing an array member, taking an address -- dereferenced the value's own
+/// bits and crashed, for every element type.
+///
+/// C17 6.5.2.3p5 gives the temporary lifetime to the end of the full
+/// expression; the materialized local is function-scope, so that holds.
+#[test]
+fn c99_struct_rvalue_designators() {
+    let code = r#"
+struct A { int v[2]; };
+struct D { double v[2]; };
+struct I { int x; };
+struct B { long pad; struct I inner; };
+struct S { int a; long b; };
+
+__attribute__((noinline)) static struct A mka(void) { struct A a = {{7, 9}}; return a; }
+__attribute__((noinline)) static struct D mkd(void) { struct D d = {{1.5, 2.5}}; return d; }
+__attribute__((noinline)) static struct B mkb(void) { struct B b = {1, {42}}; return b; }
+__attribute__((noinline)) static struct S mks(void) { struct S s = {3, 4}; return s; }
+__attribute__((noinline)) static int  take(const int *p) { return p[1]; }
+__attribute__((noinline)) static long sum(struct S s) { return s.a + s.b; }
+
+int main(void)
+{
+    /* Indexing an array member: the case that crashed. */
+    if (mka().v[0] != 7) return 1;
+    if (mka().v[1] != 9) return 2;
+    if (mkd().v[1] != 2.5) return 3;
+
+    /* Taking an address, and letting the member decay to a pointer. */
+    if (*&mka().v[1] != 9) return 4;
+    if (take(mka().v) != 9) return 5;
+
+    /* A member at a non-zero offset: offset zero worked by accident. */
+    if (mkb().inner.x != 42) return 6;
+
+    /* Scalar members and whole-struct arguments, which already worked. */
+    if (mks().a != 3 || mks().b != 4) return 7;
+    if (sum(mks()) != 7) return 8;
+
+    /* Assigned through a local first -- the control. */
+    struct A a = mka();
+    if (a.v[0] != 7 || a.v[1] != 9) return 9;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c99_struct_rvalue_designators", code, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run_optimized("c99_struct_rvalue_designators_opt", code),
+        0
+    );
 }

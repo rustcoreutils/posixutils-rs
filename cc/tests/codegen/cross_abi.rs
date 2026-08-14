@@ -875,10 +875,17 @@ long        take_i(struct I a) { return a.a + a.b; }
         p.contains("%xmm0") && p.contains("%xmm1"),
         "a two-double struct still arrives in two XMM registers:\n{p}"
     );
+    // An integer pair arrives in two general registers by value, which the
+    // prologue writes into the parameter's local. It used to arrive as a
+    // pointer, which no gcc-compiled caller ever sends.
     let i = body_of(&asm, "take_i");
     assert!(
-        i.contains("movq (%rdi)"),
-        "an integer pair still arrives as a pointer:\n{i}"
+        i.contains("movq %rdi,") && i.contains("movq %rsi,"),
+        "an integer pair arrives in RDI and RSI by value:\n{i}"
+    );
+    assert!(
+        !i.contains("movq (%rdi)"),
+        "and must not be dereferenced as a pointer:\n{i}"
     );
 }
 
@@ -1055,4 +1062,234 @@ double   useu(void) { union U r = mku(); return r.v; }
         st.contains("d0,") && uses_d1(st),
         "a struct of two doubles is still a two-element HFA:\n{st}"
     );
+}
+
+/// A nine-to-sixteen-byte integer or mixed struct is handed over in two
+/// registers, not as a pointer.
+///
+/// System V classifies each eightbyte on its own: `struct { long a, b; }` is
+/// two general registers, `struct { double a; int b; }` is one SSE register and
+/// one general one. c17 passed a pointer in a single general register. Caller
+/// and callee agreed inside a c17 translation unit -- which is why *running* a
+/// program cannot catch this, and why the assertion has to be about the
+/// register file.
+#[test]
+fn codegen_medium_struct_uses_two_registers() {
+    let src = r#"
+struct LL { long a, b; };
+struct DI { double a; int b; };
+struct DD { double a, b; };
+struct I1 { int v; };
+
+extern long   sink_ll(struct LL);
+extern double sink_di(struct DI);
+extern double sink_dd(struct DD);
+extern int    sink_i1(struct I1);
+
+long   c_ll(struct LL s) { return sink_ll(s); }
+double c_di(struct DI s) { return sink_di(s); }
+double c_dd(struct DD s) { return sink_dd(s); }
+int    c_i1(struct I1 s) { return sink_i1(s); }
+"#;
+    let asm = asm_for("medium_struct_regs", X86_64_LINUX, src);
+
+    // Two general registers: the second argument register is the tell, since
+    // the pointer convention only ever used the first.
+    let ll = body_of(&asm, "c_ll");
+    assert!(
+        ll.contains("%rsi"),
+        "an integer pair occupies RDI and RSI:\n{ll}"
+    );
+    // One SSE register and one general register.
+    let di = body_of(&asm, "c_di");
+    assert!(
+        di.contains("%xmm0") && di.contains("%rdi"),
+        "a double-then-int pair occupies XMM0 and RDI:\n{di}"
+    );
+
+    // Controls: an all-SSE pair still takes two XMMs, and a single eightbyte
+    // still takes one general register.
+    let dd = body_of(&asm, "c_dd");
+    assert!(
+        dd.contains("%xmm0") && dd.contains("%xmm1"),
+        "a two-double struct still takes XMM0 and XMM1:\n{dd}"
+    );
+    let i1 = body_of(&asm, "c_i1");
+    assert!(
+        !i1.contains("%rsi"),
+        "a single-eightbyte struct still takes one register:\n{i1}"
+    );
+}
+
+/// A struct of eight bytes or fewer whose eightbyte is SSE arrives in an XMM.
+///
+/// The return side asks the ABI class; the argument side asked the kind and the
+/// size, and treated everything at or below eight bytes as a general-register
+/// value. So `struct { float v; }`, `struct { float a, b; }` and the `_Float16`
+/// pair were handed over in RDI where gcc uses XMM0 -- the two sides of c17
+/// agreed with each other and with nobody else.
+#[test]
+fn codegen_small_sse_struct_uses_an_xmm() {
+    let src = r#"
+struct F1 { float v; };
+struct F2 { float a, b; };
+struct H2 { _Float16 a, b; };
+struct I1 { int v; };
+struct I2 { int a, b; };
+
+extern float    s_f1(struct F1);
+extern float    s_f2(struct F2);
+extern _Float16 s_h2(struct H2);
+extern int      s_i1(struct I1);
+extern int      s_i2(struct I2);
+
+float    c_f1(struct F1 s) { return s_f1(s); }
+float    c_f2(struct F2 s) { return s_f2(s); }
+_Float16 c_h2(struct H2 s) { return s_h2(s); }
+int      c_i1(struct I1 s) { return s_i1(s); }
+int      c_i2(struct I2 s) { return s_i2(s); }
+"#;
+    let asm = asm_for("small_sse_struct", X86_64_LINUX, src);
+
+    // XMM0 alone proves nothing here -- these functions also *return* a float
+    // in it, and that side was already right. The argument register is the
+    // tell: EDI is where the value used to go.
+    for name in ["c_f1", "c_f2", "c_h2"] {
+        let body = body_of(&asm, name);
+        assert!(
+            !body.contains(", %edi"),
+            "{name} must not pass its argument in a general register:\n{body}"
+        );
+        assert!(
+            body.contains("%xmm0"),
+            "{name} passes its argument in XMM0:\n{body}"
+        );
+    }
+    // Controls: an all-integer struct of the same size still takes a general
+    // register, and must not have moved.
+    for name in ["c_i1", "c_i2"] {
+        let body = body_of(&asm, name);
+        assert!(
+            body.contains(", %edi") || body.contains(", %rdi"),
+            "{name} still passes its argument in a general register:\n{body}"
+        );
+    }
+}
+
+/// aarch64 recognises an HFA whose members are arrays, and half precision as a
+/// base type.
+///
+/// `try_classify_hfa` recursed into a nested *struct* but not into an array
+/// member, and its array arm was reachable only for a top-level array type,
+/// which C never forms. So `struct { float v[1]; }` was rejected as holding a
+/// non-floating field and went back in a general register. `_Float16` was not
+/// among the accepted base types either, though AAPCS64 admits half precision.
+///
+/// Filed against `long double v[1]` and `_Float16`; every array-member shape
+/// was affected, including `struct { float v[1]; }` and `struct { double v[2]; }`.
+#[test]
+fn codegen_aarch64_hfa_accepts_arrays_and_half_precision() {
+    let src = r#"
+struct FA { float v[1]; };
+struct DA { double v[2]; };
+struct LA { long double v[1]; };
+struct H1 { _Float16 v; };
+struct H2 { _Float16 a, b; };
+struct F2 { float a, b; };        /* control: already an HFA */
+struct MI { float a; int b; };    /* control: not an HFA at all */
+
+struct FA mkfa(void) { struct FA r; r.v[0] = 1.5f; return r; }
+struct DA mkda(void) { struct DA r; r.v[0] = 1.5; r.v[1] = 2.5; return r; }
+struct LA mkla(void) { struct LA r; r.v[0] = 1.5L; return r; }
+struct H1 mkh1(void) { struct H1 r; r.v = 1.5f16; return r; }
+struct H2 mkh2(void) { struct H2 r; r.a = 1.5f16; r.b = 2.5f16; return r; }
+struct F2 mkf2(void) { struct F2 r; r.a = 1.5f; r.b = 2.5f; return r; }
+struct MI mkmi(void) { struct MI r; r.a = 1.5f; r.b = 2; return r; }
+"#;
+    let asm = asm_for("aarch64_hfa_arrays", AARCH64_LINUX, src);
+
+    // Each returns through V0, at its own element width.
+    for (name, marker) in [
+        ("mkfa", "s0"),
+        ("mkda", "d0"),
+        ("mkla", "q0"),
+        ("mkh1", "h0"),
+        ("mkh2", "h0"),
+        ("mkf2", "s0"),
+    ] {
+        let body = body_of(&asm, name);
+        assert!(
+            body.contains(marker),
+            "{name} is an HFA and returns through V0 (looking for `{marker}`):\n{body}"
+        );
+    }
+    // A struct mixing a float with an int is not homogeneous, so it keeps the
+    // general-register return.
+    let mi = body_of(&asm, "mkmi");
+    assert!(
+        mi.contains("x0") || mi.contains("w0"),
+        "a mixed struct is not an HFA:\n{mi}"
+    );
+}
+
+/// A half-precision HFA of eight bytes or fewer is packed in a register, not
+/// pointed at.
+///
+/// `struct { _Float16 a, b; }` is four bytes and became an HFA when half
+/// precision was admitted as a base type. The two-element return path then
+/// treated its source as an *address* -- correct for the sixteen-byte shapes it
+/// was written for, fatal here, because at this size the value sits in the
+/// register itself. It also stepped between elements by eight bytes, having no
+/// arm for a two-byte one.
+///
+/// The parameter side had the mirror problem: the prologue wrote both halves
+/// into the local and the linearizer's small-struct store then overwrote them,
+/// because the "arrives in registers" test was gated on size rather than on
+/// the class.
+#[test]
+fn codegen_aarch64_small_half_hfa_is_packed_not_addressed() {
+    let src = r#"
+struct H2 { _Float16 a, b; };
+struct F2 { float a, b; };          /* eight bytes, same shape */
+struct D2 { double a, b; };         /* sixteen: travels by address */
+
+struct H2 mkh2(void) { struct H2 r; r.a = 1.5f16; r.b = 2.5f16; return r; }
+_Float16 second(struct H2 s) { return s.b; }
+struct F2 mkf2(void) { struct F2 r; r.a = 1.5f; r.b = 2.5f; return r; }
+struct D2 mkd2(void) { struct D2 r; r.a = 1.5; r.b = 2.5; return r; }
+"#;
+    let asm = asm_for("aarch64_small_half_hfa", AARCH64_LINUX, src);
+
+    // The halves are shifted out of the packed register; nothing is loaded
+    // through it as though it held an address.
+    let mk = body_of(&asm, "mkh2");
+    assert!(
+        mk.contains("lsr") && mk.contains("fmov h0,"),
+        "a four-byte half HFA is unpacked from its register:\n{mk}"
+    );
+    assert!(
+        !mk.contains("ldr h0, [x0]"),
+        "and must not be dereferenced as an address:\n{mk}"
+    );
+
+    // The parameter's two halves survive: the prologue writes them and nothing
+    // overwrites them with a wider store.
+    let sec = body_of(&asm, "second");
+    assert!(
+        sec.contains("str h0,") && sec.contains("str h1,"),
+        "both halves reach the local:\n{sec}"
+    );
+    assert!(
+        !sec.contains("str s0,"),
+        "and are not overwritten by a four-byte store:\n{sec}"
+    );
+
+    // Controls: the eight- and sixteen-byte shapes still work their own way.
+    for name in ["mkf2", "mkd2"] {
+        let body = body_of(&asm, name);
+        assert!(
+            body.contains("0") && !body.is_empty(),
+            "{name} still emits a return sequence:\n{body}"
+        );
+    }
 }

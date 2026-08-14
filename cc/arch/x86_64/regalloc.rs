@@ -1209,7 +1209,15 @@ impl RegAlloc {
             else {
                 continue;
             };
-            let is_longdouble = types.kind(*typ) == crate::types::TypeKind::LongDouble;
+            // `kind()` answers the *base* kind for a complex type, so without
+            // the guard `long double _Complex` satisfies this and takes the
+            // sixteen-byte branch below -- advancing the incoming cursor by
+            // half of its thirty-two, so every stack parameter after it was
+            // read sixteen bytes low. The COMPLEX_X87 branch meant for it is
+            // further down, and had been unreachable. Both sibling sites, in
+            // `call.rs` and `codegen.rs`, already exclude complex here.
+            let is_longdouble =
+                types.kind(*typ) == crate::types::TypeKind::LongDouble && !types.is_complex(*typ);
             let is_fp = types.is_float(*typ);
             let is_complex = types.is_complex(*typ);
             let sse_struct = crate::abi::sse_struct_regs(*typ, types);
@@ -1221,6 +1229,23 @@ impl RegAlloc {
                     .insert(pseudo_id, Loc::IncomingArg(stack_arg_offset));
                 self.fp_pseudos.insert(pseudo_id);
                 stack_arg_offset += 16;
+            } else if sse_struct.is_some() && types.size_bits(*typ) <= 64 {
+                // One eightbyte, arriving in an XMM register as a value: the
+                // parameter pseudo *is* that value, and the linearizer's
+                // small-struct path stores it straight into the local. Larger
+                // ones travel by address and are handled below.
+                if fp_arg_idx < fp_arg_regs.len() {
+                    self.locations
+                        .insert(pseudo_id, Loc::Xmm(fp_arg_regs[fp_arg_idx]));
+                    self.free_xmm_regs.retain(|&r| r != fp_arg_regs[fp_arg_idx]);
+                    self.fp_pseudos.insert(pseudo_id);
+                    fp_arg_idx += 1;
+                } else {
+                    self.locations
+                        .insert(pseudo_id, Loc::IncomingArg(stack_arg_offset));
+                    self.fp_pseudos.insert(pseudo_id);
+                    stack_arg_offset += 8;
+                }
             } else if let Some(sse_regs) = sse_struct {
                 // All-SSE struct: uses one XMM per class. Don't assign to a
                 // register — the codegen stores the XMM values to the local's
@@ -1229,6 +1254,30 @@ impl RegAlloc {
                 // allocation. Two doubles take two registers; a lone binary128
                 // takes one, for all sixteen bytes.
                 fp_arg_idx += sse_regs;
+            } else if let Some(classes) = crate::abi::struct_param_classes(*typ, types) {
+                // Two eightbytes in two registers -- both general, or one of
+                // each. Like the all-SSE case above, no location is assigned
+                // when they arrive in registers: the prologue writes them into
+                // the parameter's local and the pseudo takes an ordinary slot.
+                // The class order says which register file each came from.
+                let gp_needed = classes
+                    .iter()
+                    .filter(|c| **c != crate::abi::RegClass::Sse)
+                    .count();
+                let sse_needed = classes.len() - gp_needed;
+                if int_arg_idx + gp_needed > int_arg_regs.len()
+                    || fp_arg_idx + sse_needed > fp_arg_regs.len()
+                {
+                    // System V 3.2.3 step 5: an argument that does not fit goes
+                    // to memory *whole*, and consumes none of the registers it
+                    // did not fit in.
+                    self.locations
+                        .insert(pseudo_id, Loc::IncomingArg(stack_arg_offset));
+                    stack_arg_offset += (types.size_bits(*typ) / 8) as i32;
+                } else {
+                    int_arg_idx += gp_needed;
+                    fp_arg_idx += sse_needed;
+                }
             } else if is_complex {
                 // How many XMM registers this complex type actually occupies:
                 // one for `float _Complex` (both halves packed into a single

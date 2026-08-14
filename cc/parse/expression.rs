@@ -731,6 +731,40 @@ impl<'a> Parser<'a> {
                     self.advance();
                     return self.parse_alignof();
                 }
+                // GCC's `__real__` / `__imag__`. The result type is the
+                // operand's base type when it is complex, and the operand's own
+                // type otherwise -- gcc accepts both, and `__real__` of a real
+                // value is that value.
+                if matches!(
+                    name_id,
+                    crate::kw::REAL_KW
+                        | crate::kw::REAL_KW_SHORT
+                        | crate::kw::IMAG_KW
+                        | crate::kw::IMAG_KW_SHORT
+                ) {
+                    let is_real = matches!(name_id, crate::kw::REAL_KW | crate::kw::REAL_KW_SHORT);
+                    let op_pos = self.current_pos();
+                    self.advance();
+                    let operand = self.parse_unary_expr()?;
+                    let op_typ = operand.typ.unwrap_or(self.types.double_id);
+                    let result_typ = if self.types.is_complex(op_typ) {
+                        self.types.complex_base(op_typ)
+                    } else {
+                        op_typ
+                    };
+                    return Ok(Expr::typed(
+                        ExprKind::Unary {
+                            op: if is_real {
+                                UnaryOp::Real
+                            } else {
+                                UnaryOp::Imag
+                            },
+                            operand: Box::new(operand),
+                        },
+                        result_typ,
+                        op_pos,
+                    ));
+                }
             }
         }
 

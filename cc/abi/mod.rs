@@ -21,7 +21,7 @@ mod aapcs64;
 mod sysv_amd64;
 
 pub use aapcs64::Aapcs64Abi;
-pub use sysv_amd64::{param_is_memory_class, sse_struct_regs, SysVAmd64Abi};
+pub use sysv_amd64::{param_is_memory_class, sse_struct_regs, struct_param_classes, SysVAmd64Abi};
 
 use crate::target::{Arch, Target};
 use crate::types::{TypeId, TypeKind, TypeTable};
@@ -77,6 +77,8 @@ impl RegClass {
 /// Base type for Homogeneous Floating-Point Aggregate (HFA) on AAPCS64.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HfaBase {
+    /// 16-bit half precision (`_Float16`).
+    Float16,
     /// 32-bit float
     Float32,
     /// 64-bit double

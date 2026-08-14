@@ -144,6 +144,86 @@ impl X86_64CodeGen {
     /// used in place — a complex or two-SSE-struct parameter has a local, and
     /// the prologue is what fills it. `bytes` is the type's real size, copied a
     /// qword at a time through R10 (reserved, never allocated).
+    /// The address of byte `byte` of the object in stack slot `slot`.
+    ///
+    /// A slot index is not an `%rbp` displacement: [`Self::stack_mem`] turns it
+    /// into `-(slot + callee_saved_offset)`, which is where the object starts,
+    /// and the bytes above that run *downwards* in slot-index terms. Writing
+    /// `%rbp + slot + byte` by hand -- as several emitters did -- addresses the
+    /// caller's incoming-argument area instead, which is a different frame
+    /// entirely.
+    pub(super) fn stack_field(&self, slot: i32, byte: i32) -> MemAddr {
+        self.stack_mem(slot - byte)
+    }
+
+    /// Store a register-pair struct parameter into its local.
+    ///
+    /// Two eightbytes arrive in two registers -- both general, or one of each,
+    /// in the order the ABI class vector gives. The parameter's local is the
+    /// storage the body reads, so the prologue writes them there; the
+    /// linearizer deliberately emits no copy for these.
+    #[allow(clippy::too_many_arguments)]
+    fn store_reg_pair_param_to_local(
+        &mut self,
+        func: &Function,
+        param_idx: usize,
+        pseudo: PseudoId,
+        classes: &[crate::abi::RegClass],
+        int_arg_idx: &mut usize,
+        fp_arg_idx: &mut usize,
+        int_arg_regs: &[Reg],
+        fp_arg_regs: &[XmmReg],
+        type_size_bits: u32,
+    ) {
+        let gp_needed = classes
+            .iter()
+            .filter(|c| **c != crate::abi::RegClass::Sse)
+            .count();
+        let sse_needed = classes.len() - gp_needed;
+        // Out of registers: the caller left the bytes in the incoming argument
+        // area instead, so copy them from there.
+        if *int_arg_idx + gp_needed > int_arg_regs.len()
+            || *fp_arg_idx + sse_needed > fp_arg_regs.len()
+        {
+            self.copy_incoming_arg_to_local(
+                func,
+                &func.params[param_idx].0,
+                pseudo,
+                (type_size_bits / 8) as i32,
+            );
+            return;
+        }
+
+        let param_name = &func.params[param_idx].0;
+        let Some(local) = func.locals.get(param_name) else {
+            return;
+        };
+        let Some(&Loc::Stack(offset)) = self.locations.get_ref(local.sym) else {
+            return;
+        };
+
+        for (i, class) in classes.iter().enumerate() {
+            let delta = (i * 8) as i32;
+            if *class == crate::abi::RegClass::Sse {
+                let src = fp_arg_regs[*fp_arg_idx];
+                *fp_arg_idx += 1;
+                self.push_lir(X86Inst::MovFp {
+                    size: FpSize::Double,
+                    src: XmmOperand::Reg(src),
+                    dst: XmmOperand::Mem(self.stack_mem(offset - delta)),
+                });
+            } else {
+                let src = int_arg_regs[*int_arg_idx];
+                *int_arg_idx += 1;
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Reg(src),
+                    dst: GpOperand::Mem(self.stack_mem(offset - delta)),
+                });
+            }
+        }
+    }
+
     fn copy_incoming_arg_to_local(
         &mut self,
         func: &crate::ir::Function,
@@ -834,6 +914,26 @@ impl X86_64CodeGen {
                             0
                         };
 
+                        // Two eightbytes in two registers, at least one of
+                        // them general. The all-SSE shapes are handled by the
+                        // block below; this is the integer and mixed remainder.
+                        if let Some(classes) = crate::abi::struct_param_classes(*typ, types) {
+                            if !is_two_sse_struct {
+                                self.store_reg_pair_param_to_local(
+                                    func,
+                                    i,
+                                    pseudo.id,
+                                    &classes,
+                                    &mut int_arg_idx,
+                                    &mut fp_arg_idx,
+                                    int_arg_regs,
+                                    fp_arg_regs,
+                                    type_size_bits,
+                                );
+                                break;
+                            }
+                        }
+
                         if (is_complex || is_two_sse_struct) && sse_regs > 0 {
                             // Look up the local variable (same name as param) for stack location
                             if fp_arg_idx + sse_regs > fp_arg_regs.len() {
@@ -1018,21 +1118,35 @@ impl X86_64CodeGen {
             .iter()
             .any(|p| matches!(p.kind, PseudoKind::Arg(0)) && p.name.as_deref() == Some("__sret"));
 
-        self.num_fixed_gp_params = func
-            .params
-            .iter()
-            .filter(|(_, typ)| !types.is_float(*typ))
-            .count();
+        // A struct that arrives in two registers spends two, not one -- and a
+        // mixed one spends a general register *and* an SSE register. Counting
+        // it as a single GP parameter put `va_start`'s register-save-area index
+        // one slot out, so the first variadic argument was read from the wrong
+        // place.
+        let mut gp = 0usize;
+        let mut fp = 0usize;
+        for (_, typ) in &func.params {
+            if let Some(classes) = crate::abi::struct_param_classes(*typ, types) {
+                for class in &classes {
+                    if *class == crate::abi::RegClass::Sse {
+                        fp += 1;
+                    } else {
+                        gp += 1;
+                    }
+                }
+            } else if types.is_float(*typ) {
+                if types.kind(*typ) != crate::types::TypeKind::LongDouble {
+                    fp += 1;
+                }
+            } else {
+                gp += 1;
+            }
+        }
+        self.num_fixed_gp_params = gp;
         if has_sret {
             self.num_fixed_gp_params += 1; // Account for hidden sret pointer
         }
-        self.num_fixed_fp_params = func
-            .params
-            .iter()
-            .filter(|(_, typ)| {
-                types.is_float(*typ) && types.kind(*typ) != crate::types::TypeKind::LongDouble
-            })
-            .count();
+        self.num_fixed_fp_params = fp;
 
         // Count fixed params that overflow to the stack (beyond register capacity)
         let gp_overflow = self.num_fixed_gp_params.saturating_sub(6);

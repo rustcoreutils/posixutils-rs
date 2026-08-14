@@ -44,6 +44,7 @@ const MAX_HFA_ELEMENTS: u8 = 4;
 /// same shape as the narrower complex types, not an indirect return.
 fn complex_hfa_base(ty: TypeId, types: &TypeTable) -> Option<HfaBase> {
     match types.size_bits(types.complex_base(ty)) {
+        16 => Some(HfaBase::Float16),
         32 => Some(HfaBase::Float32),
         64 => Some(HfaBase::Float64),
         128 => Some(HfaBase::Float128),
@@ -67,8 +68,11 @@ impl Aapcs64Abi {
     /// one answers Float128.
     fn is_hfa_base_type(&self, kind: TypeKind, typ: TypeId, types: &TypeTable) -> Option<HfaBase> {
         match kind {
+            // AAPCS64 admits half precision as a base type.
+            TypeKind::Float16 => Some(HfaBase::Float16),
             TypeKind::Float => Some(HfaBase::Float32),
             TypeKind::Double => Some(HfaBase::Float64),
+            TypeKind::Float128 => Some(HfaBase::Float128),
             TypeKind::LongDouble => match types.size_bits(typ) {
                 64 => Some(HfaBase::Float64),
                 128 => Some(HfaBase::Float128),
@@ -143,8 +147,11 @@ impl Aapcs64Abi {
                     base_type = Some(field_base);
                 }
                 add(&mut count, 1);
-            } else if is_aggregate(field_kind) {
-                // Nested struct - recursively check if it's an HFA
+            } else if is_aggregate(field_kind) || field_kind == TypeKind::Array {
+                // Nested struct or array - recursively check if it's an HFA.
+                // The array arm of `try_classify_hfa` was only ever reachable
+                // for a top-level array type, which C does not form, so a
+                // member like `float v[1]` was rejected as a non-FP field.
                 if let Some((nested_base, nested_count)) = self.try_classify_hfa(field_ty, types) {
                     if let Some(existing_base) = base_type {
                         if existing_base != nested_base {

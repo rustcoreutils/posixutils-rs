@@ -1120,3 +1120,58 @@ int    c_i1(struct I1 s) { return sink_i1(s); }
         "a single-eightbyte struct still takes one register:\n{i1}"
     );
 }
+
+/// A struct of eight bytes or fewer whose eightbyte is SSE arrives in an XMM.
+///
+/// The return side asks the ABI class; the argument side asked the kind and the
+/// size, and treated everything at or below eight bytes as a general-register
+/// value. So `struct { float v; }`, `struct { float a, b; }` and the `_Float16`
+/// pair were handed over in RDI where gcc uses XMM0 -- the two sides of c17
+/// agreed with each other and with nobody else.
+#[test]
+fn codegen_small_sse_struct_uses_an_xmm() {
+    let src = r#"
+struct F1 { float v; };
+struct F2 { float a, b; };
+struct H2 { _Float16 a, b; };
+struct I1 { int v; };
+struct I2 { int a, b; };
+
+extern float    s_f1(struct F1);
+extern float    s_f2(struct F2);
+extern _Float16 s_h2(struct H2);
+extern int      s_i1(struct I1);
+extern int      s_i2(struct I2);
+
+float    c_f1(struct F1 s) { return s_f1(s); }
+float    c_f2(struct F2 s) { return s_f2(s); }
+_Float16 c_h2(struct H2 s) { return s_h2(s); }
+int      c_i1(struct I1 s) { return s_i1(s); }
+int      c_i2(struct I2 s) { return s_i2(s); }
+"#;
+    let asm = asm_for("small_sse_struct", X86_64_LINUX, src);
+
+    // XMM0 alone proves nothing here -- these functions also *return* a float
+    // in it, and that side was already right. The argument register is the
+    // tell: EDI is where the value used to go.
+    for name in ["c_f1", "c_f2", "c_h2"] {
+        let body = body_of(&asm, name);
+        assert!(
+            !body.contains(", %edi"),
+            "{name} must not pass its argument in a general register:\n{body}"
+        );
+        assert!(
+            body.contains("%xmm0"),
+            "{name} passes its argument in XMM0:\n{body}"
+        );
+    }
+    // Controls: an all-integer struct of the same size still takes a general
+    // register, and must not have moved.
+    for name in ["c_i1", "c_i2"] {
+        let body = body_of(&asm, name);
+        assert!(
+            body.contains(", %edi") || body.contains(", %rdi"),
+            "{name} still passes its argument in a general register:\n{body}"
+        );
+    }
+}

@@ -89,9 +89,15 @@ pub fn struct_param_classes(typ: TypeId, types: &TypeTable) -> Option<Vec<RegCla
 pub fn sse_struct_regs(typ: TypeId, types: &TypeTable) -> Option<usize> {
     let kind = types.kind(typ);
     let bits = types.size_bits(typ);
+    // No lower bound: a struct of eight bytes or fewer whose eightbyte is SSE
+    // travels in an XMM register too. Excluding those sent `struct { float v; }`
+    // and `struct { _Float16 a, b; }` down the general-register path as
+    // arguments, while the *return* side -- which asks the class rather than
+    // the size -- had them right, so the two disagreed with each other and with
+    // gcc.
     if (kind != TypeKind::Struct && kind != TypeKind::Union)
         || types.is_complex(typ)
-        || bits <= 64
+        || bits == 0
         || bits > 128
     {
         return None;

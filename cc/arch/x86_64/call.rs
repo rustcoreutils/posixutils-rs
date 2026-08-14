@@ -482,6 +482,22 @@ impl X86_64CodeGen {
                 self.emit_fp_move(arg, fp_arg_regs[fp_arg_idx], fp_fmt);
                 fp_arg_idx += 1;
             } else if arg_type.is_some_and(|t| {
+                // Eight bytes or fewer, and its single eightbyte is SSE: the
+                // argument pseudo holds the *value* at this size, not an
+                // address, so it moves straight into an XMM register the way a
+                // floating scalar does. It used to take a general register,
+                // while the return side -- which asks the class rather than the
+                // size -- had it right.
+                types.size_bits(t) <= 64 && crate::abi::sse_struct_regs(t, types).is_some()
+            }) {
+                if fp_arg_idx < fp_arg_regs.len() {
+                    let size_bits = arg_type.map_or(64, |t| types.size_bits(t));
+                    let fmt = FpSize::for_sse_aggregate(size_bits);
+                    let dst = fp_arg_regs[fp_arg_idx];
+                    self.emit_fp_move(arg, dst, fmt);
+                    fp_arg_idx += 1;
+                }
+            } else if arg_type.is_some_and(|t| {
                 let k = types.kind(t);
                 (k == TypeKind::Struct || k == TypeKind::Union)
                     && types.size_bits(t) > 64

@@ -1229,6 +1229,23 @@ impl RegAlloc {
                     .insert(pseudo_id, Loc::IncomingArg(stack_arg_offset));
                 self.fp_pseudos.insert(pseudo_id);
                 stack_arg_offset += 16;
+            } else if sse_struct.is_some() && types.size_bits(*typ) <= 64 {
+                // One eightbyte, arriving in an XMM register as a value: the
+                // parameter pseudo *is* that value, and the linearizer's
+                // small-struct path stores it straight into the local. Larger
+                // ones travel by address and are handled below.
+                if fp_arg_idx < fp_arg_regs.len() {
+                    self.locations
+                        .insert(pseudo_id, Loc::Xmm(fp_arg_regs[fp_arg_idx]));
+                    self.free_xmm_regs.retain(|&r| r != fp_arg_regs[fp_arg_idx]);
+                    self.fp_pseudos.insert(pseudo_id);
+                    fp_arg_idx += 1;
+                } else {
+                    self.locations
+                        .insert(pseudo_id, Loc::IncomingArg(stack_arg_offset));
+                    self.fp_pseudos.insert(pseudo_id);
+                    stack_arg_offset += 8;
+                }
             } else if let Some(sse_regs) = sse_struct {
                 // All-SSE struct: uses one XMM per class. Don't assign to a
                 // register — the codegen stores the XMM values to the local's

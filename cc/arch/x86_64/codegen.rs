@@ -144,6 +144,18 @@ impl X86_64CodeGen {
     /// used in place — a complex or two-SSE-struct parameter has a local, and
     /// the prologue is what fills it. `bytes` is the type's real size, copied a
     /// qword at a time through R10 (reserved, never allocated).
+    /// The address of byte `byte` of the object in stack slot `slot`.
+    ///
+    /// A slot index is not an `%rbp` displacement: [`Self::stack_mem`] turns it
+    /// into `-(slot + callee_saved_offset)`, which is where the object starts,
+    /// and the bytes above that run *downwards* in slot-index terms. Writing
+    /// `%rbp + slot + byte` by hand -- as several emitters did -- addresses the
+    /// caller's incoming-argument area instead, which is a different frame
+    /// entirely.
+    pub(super) fn stack_field(&self, slot: i32, byte: i32) -> MemAddr {
+        self.stack_mem(slot - byte)
+    }
+
     /// Store a register-pair struct parameter into its local.
     ///
     /// Two eightbytes arrive in two registers -- both general, or one of each,

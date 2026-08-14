@@ -69,16 +69,16 @@ impl X86_64CodeGen {
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B32,
                     src: GpOperand::Imm(fp_offset as i64),
-                    dst: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: offset + 4,
-                    }),
+                    dst: GpOperand::Mem(self.stack_field(offset, 4)),
                 });
                 // overflow_arg_area = rbp + 16 + (fixed_stack_params * 8)
                 // Skip past fixed parameters that were passed on the stack
                 // (when there are >6 int or >8 FP fixed params)
                 let overflow_offset = 16 + (self.num_fixed_stack_params * 8) as i32;
                 self.push_lir(X86Inst::Lea {
+                    // Not a stack slot: the overflow argument area is a real
+                    // `%rbp + 16` address, above the return address, where the
+                    // caller's stacked arguments begin.
                     addr: MemAddr::BaseOffset {
                         base: Reg::Rbp,
                         offset: overflow_offset,
@@ -88,10 +88,7 @@ impl X86_64CodeGen {
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B64,
                     src: GpOperand::Reg(Reg::Rax),
-                    dst: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: offset + 8,
-                    }),
+                    dst: GpOperand::Mem(self.stack_field(offset, 8)),
                 });
                 // reg_save_area = pointer to saved registers
                 self.push_lir(X86Inst::Lea {
@@ -104,10 +101,7 @@ impl X86_64CodeGen {
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B64,
                     src: GpOperand::Reg(Reg::Rax),
-                    dst: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: offset + 16,
-                    }),
+                    dst: GpOperand::Mem(self.stack_field(offset, 16)),
                 });
             }
             Loc::Reg(r) => {
@@ -128,6 +122,9 @@ impl X86_64CodeGen {
                 // overflow_arg_area = rbp + 16 + (fixed_stack_params * 8)
                 let overflow_offset = 16 + (self.num_fixed_stack_params * 8) as i32;
                 self.push_lir(X86Inst::Lea {
+                    // Not a stack slot: the overflow argument area is a real
+                    // `%rbp + 16` address, above the return address, where the
+                    // caller's stacked arguments begin.
                     addr: MemAddr::BaseOffset {
                         base: Reg::Rbp,
                         offset: overflow_offset,
@@ -387,15 +384,15 @@ impl X86_64CodeGen {
             .any(|p| p.id == ap_addr && matches!(&p.kind, crate::ir::PseudoKind::Sym(_)));
 
         let (base_reg, base_offset) = match &ap_loc {
-            Loc::Stack(ap_offset) if is_sym => (Reg::Rbp, *ap_offset),
+            // The slot *is* the va_list, so the base is the frame pointer and
+            // the displacement is the slot's own address -- not the slot index
+            // read as a displacement, which lands in the caller's frame.
+            Loc::Stack(ap_offset) if is_sym => (Reg::Rbp, -(*ap_offset + self.callee_saved_offset)),
             Loc::Stack(ap_offset) => {
                 // Stack slot holds a pointer; load it into R11 first.
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B64,
-                    src: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: *ap_offset,
-                    }),
+                    src: GpOperand::Mem(self.stack_field(*ap_offset, 0)),
                     dst: GpOperand::Reg(Reg::R11),
                 });
                 (Reg::R11, 0)
@@ -448,70 +445,46 @@ impl X86_64CodeGen {
                 // Copy gp_offset (4 bytes)
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B32,
-                    src: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: *src_off,
-                    }),
+                    src: GpOperand::Mem(self.stack_field(*src_off, 0)),
                     dst: GpOperand::Reg(Reg::Rax),
                 });
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B32,
                     src: GpOperand::Reg(Reg::Rax),
-                    dst: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: *dst_off,
-                    }),
+                    dst: GpOperand::Mem(self.stack_field(*dst_off, 0)),
                 });
                 // Copy fp_offset (4 bytes)
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B32,
-                    src: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: src_off + 4,
-                    }),
+                    src: GpOperand::Mem(self.stack_field(*src_off, 4)),
                     dst: GpOperand::Reg(Reg::Rax),
                 });
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B32,
                     src: GpOperand::Reg(Reg::Rax),
-                    dst: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: dst_off + 4,
-                    }),
+                    dst: GpOperand::Mem(self.stack_field(*dst_off, 4)),
                 });
                 // Copy overflow_arg_area (8 bytes)
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B64,
-                    src: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: src_off + 8,
-                    }),
+                    src: GpOperand::Mem(self.stack_field(*src_off, 8)),
                     dst: GpOperand::Reg(Reg::Rax),
                 });
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B64,
                     src: GpOperand::Reg(Reg::Rax),
-                    dst: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: dst_off + 8,
-                    }),
+                    dst: GpOperand::Mem(self.stack_field(*dst_off, 8)),
                 });
                 // Copy reg_save_area (8 bytes)
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B64,
-                    src: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: src_off + 16,
-                    }),
+                    src: GpOperand::Mem(self.stack_field(*src_off, 16)),
                     dst: GpOperand::Reg(Reg::Rax),
                 });
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B64,
                     src: GpOperand::Reg(Reg::Rax),
-                    dst: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: dst_off + 16,
-                    }),
+                    dst: GpOperand::Mem(self.stack_field(*dst_off, 16)),
                 });
             }
             (Loc::Reg(src_reg), Loc::Reg(dst_reg)) => {
@@ -606,10 +579,7 @@ impl X86_64CodeGen {
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B32,
                     src: GpOperand::Reg(Reg::Rax),
-                    dst: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: *dst_off,
-                    }),
+                    dst: GpOperand::Mem(self.stack_field(*dst_off, 0)),
                 });
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B32,
@@ -622,10 +592,7 @@ impl X86_64CodeGen {
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B32,
                     src: GpOperand::Reg(Reg::Rax),
-                    dst: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: dst_off + 4,
-                    }),
+                    dst: GpOperand::Mem(self.stack_field(*dst_off, 4)),
                 });
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B64,
@@ -638,10 +605,7 @@ impl X86_64CodeGen {
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B64,
                     src: GpOperand::Reg(Reg::Rax),
-                    dst: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: dst_off + 8,
-                    }),
+                    dst: GpOperand::Mem(self.stack_field(*dst_off, 8)),
                 });
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B64,
@@ -654,20 +618,14 @@ impl X86_64CodeGen {
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B64,
                     src: GpOperand::Reg(Reg::Rax),
-                    dst: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: dst_off + 16,
-                    }),
+                    dst: GpOperand::Mem(self.stack_field(*dst_off, 16)),
                 });
             }
             (Loc::Stack(src_off), Loc::Reg(dst_reg)) => {
                 // Src on stack, dest in register
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B32,
-                    src: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: *src_off,
-                    }),
+                    src: GpOperand::Mem(self.stack_field(*src_off, 0)),
                     dst: GpOperand::Reg(Reg::Rax),
                 });
                 self.push_lir(X86Inst::Mov {
@@ -680,10 +638,7 @@ impl X86_64CodeGen {
                 });
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B32,
-                    src: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: src_off + 4,
-                    }),
+                    src: GpOperand::Mem(self.stack_field(*src_off, 4)),
                     dst: GpOperand::Reg(Reg::Rax),
                 });
                 self.push_lir(X86Inst::Mov {
@@ -696,10 +651,7 @@ impl X86_64CodeGen {
                 });
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B64,
-                    src: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: src_off + 8,
-                    }),
+                    src: GpOperand::Mem(self.stack_field(*src_off, 8)),
                     dst: GpOperand::Reg(Reg::Rax),
                 });
                 self.push_lir(X86Inst::Mov {
@@ -712,10 +664,7 @@ impl X86_64CodeGen {
                 });
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B64,
-                    src: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: src_off + 16,
-                    }),
+                    src: GpOperand::Mem(self.stack_field(*src_off, 16)),
                     dst: GpOperand::Reg(Reg::Rax),
                 });
                 self.push_lir(X86Inst::Mov {
@@ -769,10 +718,7 @@ impl X86_64CodeGen {
                 self.push_lir(X86Inst::Movzx {
                     src_size: OperandSize::B16,
                     dst_size: OperandSize::B32,
-                    src: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: *off,
-                    }),
+                    src: GpOperand::Mem(self.stack_field(*off, 0)),
                     dst: Reg::R10,
                 });
             }
@@ -787,10 +733,7 @@ impl X86_64CodeGen {
             (Loc::Stack(off), _) => {
                 self.push_lir(X86Inst::Mov {
                     size: op_size,
-                    src: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: *off,
-                    }),
+                    src: GpOperand::Mem(self.stack_field(*off, 0)),
                     dst: GpOperand::Reg(Reg::R10),
                 });
             }
@@ -841,10 +784,7 @@ impl X86_64CodeGen {
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B16,
                     src: GpOperand::Reg(Reg::R10),
-                    dst: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: *off,
-                    }),
+                    dst: GpOperand::Mem(self.stack_field(*off, 0)),
                 });
             }
             // 32/64-bit: use regular moves
@@ -859,10 +799,7 @@ impl X86_64CodeGen {
                 self.push_lir(X86Inst::Mov {
                     size: op_size,
                     src: GpOperand::Reg(Reg::R10),
-                    dst: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: *off,
-                    }),
+                    dst: GpOperand::Mem(self.stack_field(*off, 0)),
                 });
             }
             _ => {}
@@ -897,10 +834,7 @@ impl X86_64CodeGen {
             Loc::Stack(off) => {
                 self.push_lir(X86Inst::Bsf {
                     size: src_size,
-                    src: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: off,
-                    }),
+                    src: GpOperand::Mem(self.stack_field(off, 0)),
                     dst: Reg::R10,
                 });
             }
@@ -935,10 +869,7 @@ impl X86_64CodeGen {
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B32,
                     src: GpOperand::Reg(Reg::R10),
-                    dst: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: off,
-                    }),
+                    dst: GpOperand::Mem(self.stack_field(off, 0)),
                 });
             }
             _ => {}
@@ -973,10 +904,7 @@ impl X86_64CodeGen {
             Loc::Stack(off) => {
                 self.push_lir(X86Inst::Bsr {
                     size: src_size,
-                    src: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: off,
-                    }),
+                    src: GpOperand::Mem(self.stack_field(off, 0)),
                     dst: Reg::R10,
                 });
             }
@@ -1021,10 +949,7 @@ impl X86_64CodeGen {
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B32,
                     src: GpOperand::Reg(Reg::R10),
-                    dst: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: off,
-                    }),
+                    dst: GpOperand::Mem(self.stack_field(off, 0)),
                 });
             }
             _ => {}
@@ -1058,10 +983,7 @@ impl X86_64CodeGen {
             Loc::Stack(off) => {
                 self.push_lir(X86Inst::Popcnt {
                     size: src_size,
-                    src: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: off,
-                    }),
+                    src: GpOperand::Mem(self.stack_field(off, 0)),
                     dst: Reg::R10,
                 });
             }
@@ -1096,10 +1018,7 @@ impl X86_64CodeGen {
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B32,
                     src: GpOperand::Reg(Reg::R10),
-                    dst: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: off,
-                    }),
+                    dst: GpOperand::Mem(self.stack_field(off, 0)),
                 });
             }
             _ => {}

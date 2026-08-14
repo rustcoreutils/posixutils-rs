@@ -384,10 +384,14 @@ impl X86_64CodeGen {
             .any(|p| p.id == ap_addr && matches!(&p.kind, crate::ir::PseudoKind::Sym(_)));
 
         let (base_reg, base_offset) = match &ap_loc {
-            // The slot *is* the va_list, so the base is the frame pointer and
-            // the displacement is the slot's own address -- not the slot index
-            // read as a displacement, which lands in the caller's frame.
-            Loc::Stack(ap_offset) if is_sym => (Reg::Rbp, -(*ap_offset + self.callee_saved_offset)),
+            // The slot *is* the va_list, so its own address is the base.
+            // Asking `stack_mem` rather than composing the displacement by hand
+            // is what keeps this right when locals are addressed off `%rsp`
+            // instead of `%rbp`, under dynamic stack alignment.
+            Loc::Stack(ap_offset) if is_sym => match self.stack_mem(*ap_offset) {
+                MemAddr::BaseOffset { base, offset } => (base, offset),
+                other => unreachable!("stack_mem gave a non-BaseOffset address: {other:?}"),
+            },
             Loc::Stack(ap_offset) => {
                 // Stack slot holds a pointer; load it into R11 first.
                 self.push_lir(X86Inst::Mov {

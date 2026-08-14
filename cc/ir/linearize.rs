@@ -934,7 +934,7 @@ impl<'a> Linearizer<'a> {
             && matches!(
                 get_abi_for_conv(self.current_calling_conv, self.target)
                     .classify_return(func.return_type, self.types),
-                crate::abi::ArgClass::X87 { .. } | crate::abi::ArgClass::Hfa { count: 1, .. }
+                crate::abi::ArgClass::X87 { .. } | crate::abi::ArgClass::Hfa { .. }
             );
         ir_func.ret_is_address = self.types.is_complex(func.return_type) || returns_x87_aggregate;
 
@@ -990,7 +990,8 @@ impl<'a> Linearizer<'a> {
                     let abi = get_abi_for_conv(self.current_calling_conv, self.target);
                     matches!(
                         abi.classify_param(param.typ, self.types),
-                        crate::abi::ArgClass::Hfa { count, .. } if count >= 2
+                        crate::abi::ArgClass::Hfa { count, .. }
+                            if count >= 2 || size > 64
                     )
                 };
                 let is_two_fp_regs = is_hfa_param
@@ -999,13 +1000,12 @@ impl<'a> Linearizer<'a> {
                         let class = abi.classify_param(param.typ, self.types);
                         // Any all-SSE aggregate, whether that is two registers of
                         // eight bytes or one of sixteen.
-                        let all_sse =
-                            matches!(
-                                class,
-                                crate::abi::ArgClass::Direct { ref classes, .. }
-                                    if !classes.is_empty()
-                                        && classes.iter().all(|c| *c == crate::abi::RegClass::Sse)
-                            ) || matches!(class, crate::abi::ArgClass::Hfa { count: 2, .. });
+                        let all_sse = matches!(
+                            class,
+                            crate::abi::ArgClass::Direct { ref classes, .. }
+                                if !classes.is_empty()
+                                    && classes.iter().all(|c| *c == crate::abi::RegClass::Sse)
+                        ) || matches!(class, crate::abi::ArgClass::Hfa { .. });
                         // Two eightbytes of any classes -- both integer, or one of
                         // each -- arrive in two registers on x86-64 as well. The
                         // caller's half of this decision is gated the same way;
@@ -1423,7 +1423,12 @@ impl<'a> Linearizer<'a> {
         // registers was survivable on its own -- the backend put the halves
         // back together -- but the *inliner* then spliced a two-source `Ret`
         // into a caller expecting one value, and the top half came out zero.
-        let one_hfa_reg = matches!(ret_class, crate::abi::ArgClass::Hfa { count: 1, .. });
+        // Any HFA, not just a one-element one: the two-element form has the
+        // same hazard. Its `Ret` carried the halves as two general registers,
+        // and splicing that into a caller expecting one value dropped the
+        // second -- an inlined `struct { double a, b; }` return came back with
+        // its second half zeroed.
+        let one_hfa_reg = matches!(ret_class, crate::abi::ArgClass::Hfa { .. });
         if matches!(ret_class, crate::abi::ArgClass::X87 { .. }) || one_sse_reg || one_hfa_reg {
             let mut ret_insn = Instruction::ret_typed(Some(src_addr), ret_type, struct_size);
             ret_insn.abi_info = Some(Box::new(CallAbiInfo::new(vec![], ret_class)));
@@ -2917,13 +2922,12 @@ impl<'a> Linearizer<'a> {
                     // Medium struct (9-16 bytes): check ABI classification
                     let abi = get_abi_for_conv(self.current_calling_conv, self.target);
                     let class = abi.classify_param(arg_type, self.types);
-                    let is_two_fp_regs =
-                        matches!(
-                            class,
-                            crate::abi::ArgClass::Direct { ref classes, .. }
-                                if !classes.is_empty()
-                                    && classes.iter().all(|c| *c == crate::abi::RegClass::Sse)
-                        ) || matches!(class, crate::abi::ArgClass::Hfa { count: 2, .. });
+                    let is_two_fp_regs = matches!(
+                        class,
+                        crate::abi::ArgClass::Direct { ref classes, .. }
+                            if !classes.is_empty()
+                                && classes.iter().all(|c| *c == crate::abi::RegClass::Sse)
+                    ) || matches!(class, crate::abi::ArgClass::Hfa { .. });
                     // MEMORY class means the bytes go on the stack by value,
                     // exactly as an over-sixteen-byte struct already does.
                     // Reachable at this size only when an eightbyte holds a

@@ -201,7 +201,33 @@ impl Aarch64CodeGen {
                         }
                 });
             let uses_two_fp_regs = is_complex || is_hfa_two;
-            let is_fp = if let Some(typ) = arg_type {
+            // A one-element HFA -- `struct { float v; }`, and every shape that
+            // became one when arrays and half precision were admitted -- goes
+            // in a single V register, exactly as the bare scalar does. Only the
+            // two-element case was recognised here, so the rest went out in a
+            // general register while the callee, which does ask the ABI, read
+            // V0; and every floating argument after it was shifted a register
+            // along.
+            let is_hfa_one = arg_type.is_some_and(|t| {
+                let abi =
+                    crate::abi::get_abi_for_conv(crate::abi::CallingConv::C, &self.base.target);
+                // Only where the pseudo holds the *value*. Above a register's
+                // worth -- `struct { __float128 v; }` -- it holds an address,
+                // and that goes through the load below instead; moving it with
+                // `fmov` asks for a binary128 out of one X register, which does
+                // not exist.
+                types.size_bits(t) <= 64
+                    && matches!(abi.classify_param(t, types), ArgClass::Hfa { count: 1, .. })
+            });
+            let is_hfa_one_wide = arg_type.is_some_and(|t| {
+                let abi =
+                    crate::abi::get_abi_for_conv(crate::abi::CallingConv::C, &self.base.target);
+                types.size_bits(t) > 64
+                    && matches!(abi.classify_param(t, types), ArgClass::Hfa { count: 1, .. })
+            });
+            let is_fp = if is_hfa_one {
+                true
+            } else if let Some(typ) = arg_type {
                 types.is_float(typ)
             } else {
                 let arg_loc = self.get_location(arg);
@@ -214,6 +240,16 @@ impl Aarch64CodeGen {
                 64
             };
 
+            if is_hfa_one_wide {
+                // One V register holding the whole aggregate, loaded from its
+                // address -- the same shape `setup_hfa2_arg` handles, with one
+                // element instead of two.
+                if fp_arg_idx < fp_arg_regs.len() {
+                    self.setup_hfa1_arg(arg, arg_type, fp_arg_regs[fp_arg_idx], types);
+                    fp_arg_idx += 1;
+                    continue;
+                }
+            }
             if uses_two_fp_regs {
                 if fp_arg_idx + 1 < fp_arg_regs.len() {
                     if is_hfa_two {
@@ -556,6 +592,42 @@ impl Aarch64CodeGen {
     }
 
     /// Set up an HFA-2 struct argument (two FP elements in consecutive V registers)
+    /// A one-element HFA wider than a register: load the whole aggregate into
+    /// one V register from its address. `setup_hfa2_arg` with a single element.
+    fn setup_hfa1_arg(
+        &mut self,
+        arg: PseudoId,
+        arg_type: Option<crate::types::TypeId>,
+        reg: VReg,
+        types: &TypeTable,
+    ) {
+        let arg_loc = self.get_location(arg);
+        let typ = arg_type.unwrap();
+        let abi = crate::abi::get_abi_for_conv(crate::abi::CallingConv::C, &self.base.target);
+        let fp_size = match abi.classify_param(typ, types) {
+            ArgClass::Hfa { base, .. } => match base {
+                HfaBase::Float16 => FpSize::Half,
+                HfaBase::Float32 => FpSize::Single,
+                HfaBase::Float64 => FpSize::Double,
+                HfaBase::Float128 => FpSize::Quad,
+            },
+            _ => FpSize::Double,
+        };
+        let addr = match arg_loc {
+            Loc::Stack(offset) => MemAddr::BaseOffset {
+                base: Reg::X29,
+                offset: self.stack_offset(offset),
+            },
+            Loc::Reg(r) => MemAddr::BaseOffset { base: r, offset: 0 },
+            _ => return,
+        };
+        self.push_lir(Aarch64Inst::LdrFp {
+            size: fp_size,
+            dst: reg,
+            addr,
+        });
+    }
+
     fn setup_hfa2_arg(
         &mut self,
         arg: PseudoId,

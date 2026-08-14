@@ -368,14 +368,27 @@ impl Aarch64CodeGen {
             let mut ngrn = 0usize;
             let mut nsrn = 0usize;
             let mut named_stack = 0i32;
+            let abi = crate::abi::get_abi_for_conv(CallingConv::C, &self.base.target);
             for (_, typ) in &func.params {
-                let bank = if types.is_float(*typ) {
-                    &mut nsrn
-                } else {
-                    &mut ngrn
+                // Mirror `allocate_arguments`: it dispatches on the ABI class,
+                // and this has to agree with it or `va_start` skips the wrong
+                // number of slots. Asking `is_float` instead counted a
+                // `_Complex` -- two V registers -- as one general one, and an
+                // HFA of any size likewise.
+                let (bank, count) = match abi.classify_param(*typ, types) {
+                    ArgClass::Direct { ref classes, .. }
+                        if classes.len() == 1 && classes[0] == crate::abi::RegClass::Sse =>
+                    {
+                        (&mut nsrn, 1)
+                    }
+                    ArgClass::Hfa { count, .. } => (&mut nsrn, count as usize),
+                    _ if types.kind(*typ) == TypeKind::Int128 => (&mut ngrn, 2),
+                    // Everything else takes a single general register, which is
+                    // how this backend passes a struct: by pointer.
+                    _ => (&mut ngrn, 1),
                 };
-                if *bank < 8 {
-                    *bank += 1;
+                if *bank + count <= 8 {
+                    *bank += count;
                 } else {
                     let bytes = types.size_bits(*typ).div_ceil(8).max(1) as i32;
                     named_stack += (bytes + 7) & !7;

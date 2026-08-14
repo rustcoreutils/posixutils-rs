@@ -3437,11 +3437,8 @@ int main(void) {
     return 0;
 }
 "#;
-    // Use extra_opts to force -O0 only (optimization needs further work for 2-SSE structs)
-    assert_eq!(
-        compile_and_run("two_sse_struct_abi", code, &["-O0".to_string()]),
-        0
-    );
+    assert_eq!(compile_and_run("two_sse_struct_abi", code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("two_sse_struct_abi_opt", code), 0);
 }
 
 // ============================================================================
@@ -7165,6 +7162,93 @@ int main(void)
     assert_eq!(compile_and_run("codegen_medium_struct_regs", code, &[]), 0);
     assert_eq!(
         compile_and_run_optimized("codegen_medium_struct_regs_opt", code),
+        0
+    );
+}
+
+/// `va_start` counts every register a fixed parameter actually spends.
+///
+/// The register-save-area indices are derived from how many general and SSE
+/// registers the fixed parameters occupy. Counting each one as a single
+/// general register put those indices out, so the first variadic argument was
+/// read from the wrong slot -- for a `_Complex` (two XMMs), an `__int128` (two
+/// general registers), an all-SSE struct of eight bytes or fewer (one XMM,
+/// since that shape started travelling in one), a nine-to-sixteen-byte struct
+/// (one register per eightbyte), and a MEMORY-class one (none at all).
+#[test]
+fn codegen_va_start_counts_fixed_parameter_registers() {
+    let code = r#"
+#include <stdarg.h>
+
+struct LL  { long a, b; };
+struct DD  { double a, b; };
+struct F1  { float v; };
+struct DI  { double a; int b; };
+struct BIG { long a, b, c; };
+
+#define VA(name, type)                                                      \
+    __attribute__((noinline)) static long name(type s, ...)                 \
+    {                                                                       \
+        va_list ap; va_start(ap, s);                                        \
+        long a = va_arg(ap, long);                                          \
+        double b = va_arg(ap, double);                                      \
+        va_end(ap);                                                         \
+        (void)s;                                                            \
+        return a + (long)b;                                                 \
+    }
+
+VA(v_cx,   double _Complex)
+VA(v_i128, __int128)
+VA(v_f1,   struct F1)
+VA(v_dd,   struct DD)
+VA(v_ll,   struct LL)
+VA(v_di,   struct DI)
+VA(v_big,  struct BIG)
+VA(v_ld,   long double)
+VA(v_int,  int)
+VA(v_dbl,  double)
+
+/* Sixteen bytes, SSE+SSEUP: one XMM, not the register pair the shapes above
+   take. Only where the type exists -- Apple arm64 has no runtime for it. */
+#ifdef __FLT128_MANT_DIG__
+struct Q { __float128 v; };
+VA(v_q, struct Q)
+#endif
+
+int main(void)
+{
+    struct LL  ll  = { 1, 2 };
+    struct DD  dd  = { 1, 2 };
+    struct F1  f1  = { 1 };
+    struct DI  di  = { 1, 2 };
+    struct BIG big = { 1, 2, 3 };
+    __int128 q = 1;
+
+    if (v_cx(__builtin_complex(1.0, 2.0), 10L, 5.0) != 15) return 1;
+    if (v_i128(q, 10L, 5.0) != 15) return 2;
+    if (v_f1(f1, 10L, 5.0) != 15) return 3;
+    if (v_dd(dd, 10L, 5.0) != 15) return 4;
+    if (v_ll(ll, 10L, 5.0) != 15) return 5;
+    if (v_di(di, 10L, 5.0) != 15) return 6;
+    if (v_big(big, 10L, 5.0) != 15) return 7;
+    if (v_ld(1.0L, 10L, 5.0) != 15) return 8;
+
+    /* Controls: the two shapes that always cost exactly one register. */
+    if (v_int(1, 10L, 5.0) != 15) return 9;
+    if (v_dbl(1.0, 10L, 5.0) != 15) return 10;
+
+#ifdef __FLT128_MANT_DIG__
+    struct Q qs;
+    qs.v = 1.0q;
+    if (v_q(qs, 10L, 5.0) != 15) return 11;
+#endif
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("codegen_va_start_fixed_regs", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("codegen_va_start_fixed_regs_opt", code),
         0
     );
 }

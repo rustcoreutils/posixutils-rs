@@ -990,7 +990,8 @@ impl<'a> Linearizer<'a> {
                     let abi = get_abi_for_conv(self.current_calling_conv, self.target);
                     matches!(
                         abi.classify_param(param.typ, self.types),
-                        crate::abi::ArgClass::Hfa { count, .. } if count >= 2
+                        crate::abi::ArgClass::Hfa { count, .. }
+                            if count >= 2 || size > 64
                     )
                 };
                 let is_two_fp_regs = is_hfa_param
@@ -999,13 +1000,12 @@ impl<'a> Linearizer<'a> {
                         let class = abi.classify_param(param.typ, self.types);
                         // Any all-SSE aggregate, whether that is two registers of
                         // eight bytes or one of sixteen.
-                        let all_sse =
-                            matches!(
-                                class,
-                                crate::abi::ArgClass::Direct { ref classes, .. }
-                                    if !classes.is_empty()
-                                        && classes.iter().all(|c| *c == crate::abi::RegClass::Sse)
-                            ) || matches!(class, crate::abi::ArgClass::Hfa { count: 2, .. });
+                        let all_sse = matches!(
+                            class,
+                            crate::abi::ArgClass::Direct { ref classes, .. }
+                                if !classes.is_empty()
+                                    && classes.iter().all(|c| *c == crate::abi::RegClass::Sse)
+                        ) || matches!(class, crate::abi::ArgClass::Hfa { .. });
                         // Two eightbytes of any classes -- both integer, or one of
                         // each -- arrive in two registers on x86-64 as well. The
                         // caller's half of this decision is gated the same way;
@@ -2917,13 +2917,12 @@ impl<'a> Linearizer<'a> {
                     // Medium struct (9-16 bytes): check ABI classification
                     let abi = get_abi_for_conv(self.current_calling_conv, self.target);
                     let class = abi.classify_param(arg_type, self.types);
-                    let is_two_fp_regs =
-                        matches!(
-                            class,
-                            crate::abi::ArgClass::Direct { ref classes, .. }
-                                if !classes.is_empty()
-                                    && classes.iter().all(|c| *c == crate::abi::RegClass::Sse)
-                        ) || matches!(class, crate::abi::ArgClass::Hfa { count: 2, .. });
+                    let is_two_fp_regs = matches!(
+                        class,
+                        crate::abi::ArgClass::Direct { ref classes, .. }
+                            if !classes.is_empty()
+                                && classes.iter().all(|c| *c == crate::abi::RegClass::Sse)
+                    ) || matches!(class, crate::abi::ArgClass::Hfa { .. });
                     // MEMORY class means the bytes go on the stack by value,
                     // exactly as an over-sixteen-byte struct already does.
                     // Reachable at this size only when an eightbyte holds a

@@ -450,6 +450,10 @@ impl<'a> super::linearize::Linearizer<'a> {
         let result = self.alloc_pseudo();
 
         let opcode = match op {
+            // Intercepted in `linearize_unary`, which loads the half directly.
+            UnaryOp::Real | UnaryOp::Imag => {
+                unreachable!("__real__/__imag__ are lowered before emit_unary")
+            }
             UnaryOp::Neg => {
                 if is_float {
                     Opcode::FNeg
@@ -1591,6 +1595,24 @@ impl<'a> super::linearize::Linearizer<'a> {
                         member_size,
                     ));
                 }
+            }
+            ExprKind::Unary {
+                op: UnaryOp::Real | UnaryOp::Imag,
+                ..
+            } => {
+                // `__real__ z = v` and `__imag__ z = v` name one half of the
+                // complex object. `linearize_lvalue` gives the address of that
+                // half, and the target type is already the *base* type, so the
+                // ordinary scalar store is right -- including for the compound
+                // forms, which computed `final_val` above the same way.
+                let addr = self.linearize_lvalue(target);
+                self.emit(Instruction::store(
+                    final_val,
+                    addr,
+                    0,
+                    target_typ,
+                    target_size,
+                ));
             }
             ExprKind::Unary {
                 op: UnaryOp::Deref,

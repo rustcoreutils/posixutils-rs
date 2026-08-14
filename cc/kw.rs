@@ -411,6 +411,12 @@ define_keywords! {
     (_, "__malloc__",           SUPPORTED_ATTR),
     (_, "__pure__",             SUPPORTED_ATTR),
     (_, "__sentinel__",         SUPPORTED_ATTR),
+    // GCC's complex-part operators. Appended, because `define_ids!` numbers
+    // entries by table position. Both spellings of each, as gcc accepts.
+    (REAL_KW,           "__real__",          RESERVED_NAME),
+    (REAL_KW_SHORT,     "__real",            RESERVED_NAME),
+    (IMAG_KW,           "__imag__",          RESERVED_NAME),
+    (IMAG_KW_SHORT,     "__imag",            RESERVED_NAME),
 }
 
 // ============================================================================

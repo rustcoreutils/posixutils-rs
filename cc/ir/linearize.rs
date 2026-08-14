@@ -2033,6 +2033,33 @@ impl<'a> Linearizer<'a> {
                 self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
                 result
             }
+            // `__real__ z` and `__imag__ z` name storage inside `z`, so they
+            // are lvalues exactly when `z` is one. The imaginary half sits one
+            // base type above the real one.
+            ExprKind::Unary {
+                op: op @ (UnaryOp::Real | UnaryOp::Imag),
+                operand,
+            } => {
+                let op_typ = self.expr_type(operand);
+                let addr = self.complex_operand_addr(operand);
+                if *op == UnaryOp::Real || !self.types.is_complex(op_typ) {
+                    return addr;
+                }
+                let base_bytes =
+                    (self.types.size_bits(self.types.complex_base(op_typ)) / 8) as i128;
+                let off = self.emit_const(base_bytes, self.types.long_id);
+                let out = self.alloc_reg_pseudo();
+                let ptr_type = self.types.pointer_to(self.types.complex_base(op_typ));
+                self.emit(Instruction::binop(
+                    Opcode::Add,
+                    out,
+                    addr,
+                    off,
+                    ptr_type,
+                    self.target.pointer_width,
+                ));
+                out
+            }
             _ => {
                 // Not a designator -- a call returning a struct, a comma, a
                 // conditional. Evaluating it yields the *value*; a consumer
@@ -3432,6 +3459,36 @@ impl<'a> Linearizer<'a> {
         // Handle AddrOf specially - we need the lvalue address, not the value
         if op == UnaryOp::AddrOf {
             return self.linearize_lvalue(operand);
+        }
+
+        // `__real__` / `__imag__`: one half of a complex value, or the operand
+        // itself when it is already real -- gcc accepts both, and `__imag__` of
+        // a real is a zero of that type.
+        if op == UnaryOp::Real || op == UnaryOp::Imag {
+            let op_typ = self.expr_type(operand);
+            if !self.types.is_complex(op_typ) {
+                return if op == UnaryOp::Real {
+                    self.linearize_expr(operand)
+                } else {
+                    // `__imag__` of a real operand is a zero of its type.
+                    if self.types.is_float(op_typ) {
+                        self.emit_fconst(crate::float::FloatVal::ZERO, op_typ)
+                    } else {
+                        self.emit_const(0, op_typ)
+                    }
+                };
+            }
+            let base_typ = self.types.complex_base(op_typ);
+            let base_bits = self.types.size_bits(base_typ);
+            let offset = if op == UnaryOp::Real {
+                0
+            } else {
+                (base_bits / 8) as i64
+            };
+            let addr = self.complex_operand_addr(operand);
+            let half = self.alloc_pseudo();
+            self.emit(Instruction::load(half, addr, offset, base_typ, base_bits));
+            return half;
         }
 
         // A complex value travels by address, so the scalar path below would

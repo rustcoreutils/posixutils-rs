@@ -37,6 +37,11 @@ pub enum UnaryOp {
     PreInc,
     /// Pre-decrement: --x
     PreDec,
+    /// GCC `__real__ x`: the real part of a complex value, and an lvalue when
+    /// the operand is one.
+    Real,
+    /// GCC `__imag__ x`: the imaginary part.
+    Imag,
 }
 
 /// Binary operators

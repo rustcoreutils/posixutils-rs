@@ -799,23 +799,26 @@ impl<'a> Linearizer<'a> {
             // `long double _Complex` guarantee above local and testable.
             return false;
         }
+        let abi = get_abi_for_conv(self.current_calling_conv, self.target);
+        let class = abi.classify_return(typ, self.types);
+        if matches!(class, crate::abi::ArgClass::Hfa { .. }) {
+            // An HFA comes back in one V register per element, up to four, so
+            // size does not enter into it: `struct { double a, b, c, d; }` is
+            // thirty-two bytes and still returns in V0-V3. The size rule below
+            // used to claim it, on the grounds that nothing implemented a
+            // three- or four-register HFA return -- which was true until both
+            // ends of the aarch64 return path learned to count elements.
+            return false;
+        }
         if self.types.size_bits(typ) > self.target.max_aggregate_register_bits {
-            // Every aggregate over two eightbytes, exactly as before. Keeping
-            // the size rule is what preserves the aarch64 decisions: an HFA
-            // larger than sixteen bytes classifies `Hfa`, never `Indirect`,
-            // so a purely classifier-driven test would stop returning it
-            // indirectly and nothing implements a three-register HFA return.
+            // Every other aggregate over two eightbytes.
             return true;
         }
         // Two eightbytes or fewer: only the classifier knows. An aggregate
         // this small can still be MEMORY class -- `union { long double v;
         // double d; }` merges X87 with SSE, which is MEMORY, and gcc returns
         // it through a hidden pointer.
-        let abi = get_abi_for_conv(self.current_calling_conv, self.target);
-        matches!(
-            abi.classify_return(typ, self.types),
-            crate::abi::ArgClass::Indirect { .. }
-        )
+        matches!(class, crate::abi::ArgClass::Indirect { .. })
     }
 
     pub(crate) fn linearize_function(&mut self, func: &FunctionDef) {
@@ -918,11 +921,11 @@ impl<'a> Linearizer<'a> {
         // Check if function returns a medium struct (9-16 bytes) via two registers
         // This is the ABI-compliant way to return structs that fit in two GP registers
         let struct_size_bits = self.types.size_bits(func.return_type);
-        let returns_two_reg_struct = (ret_kind == TypeKind::Struct || ret_kind == TypeKind::Union)
+        let returns_reg_aggregate = (ret_kind == TypeKind::Struct || ret_kind == TypeKind::Union)
             && struct_size_bits > 64
             && struct_size_bits <= 128
             && !returns_large_struct; // Only if not using sret
-        if returns_two_reg_struct {
+        if returns_reg_aggregate {
             self.two_reg_return_type = Some(func.return_type);
         }
 
@@ -930,7 +933,7 @@ impl<'a> Linearizer<'a> {
         // value. The inliner has to know not to splice across that boundary.
         // An aggregate returned in st(0) has exactly the same shape as a
         // complex one, and missing it is a miscompile visible only at -O.
-        let returns_x87_aggregate = returns_two_reg_struct
+        let returns_x87_aggregate = returns_reg_aggregate
             && matches!(
                 get_abi_for_conv(self.current_calling_conv, self.target)
                     .classify_return(func.return_type, self.types),
@@ -2786,9 +2789,17 @@ impl<'a> Linearizer<'a> {
         let typ_kind = self.types.kind(typ);
         let struct_size_bits = self.types.size_bits(typ);
         let returns_large_struct = self.returns_via_hidden_pointer(typ);
-        let returns_two_reg_struct = (typ_kind == TypeKind::Struct || typ_kind == TypeKind::Union)
+        // An aggregate that comes back in registers still needs somewhere to
+        // land, and the backend writes the registers into this local. The
+        // upper bound used to be two eightbytes -- hence the old name
+        // `returns_reg_aggregate` -- which was every such case until an HFA
+        // of three or four `double`s stopped going through the hidden
+        // pointer: at twenty-four bytes it had no local, so the result pseudo
+        // held nothing and its first use dereferenced a zero. It can now be
+        // as many as four registers, so the name says registers rather than
+        // two.
+        let returns_reg_aggregate = (typ_kind == TypeKind::Struct || typ_kind == TypeKind::Union)
             && struct_size_bits > 64
-            && struct_size_bits <= 128
             && !returns_large_struct;
         // `long double _Complex` comes back through the hidden pointer above,
         // not in registers.
@@ -2822,7 +2833,7 @@ impl<'a> Linearizer<'a> {
 
             // Hidden return pointer is the first argument (pointer type)
             (sret_sym, vec![sret_addr], vec![self.types.pointer_to(typ)])
-        } else if returns_two_reg_struct {
+        } else if returns_reg_aggregate {
             // Two-register struct returns: allocate local storage for the result
             // Codegen will store RAX+RDX (x86-64) or X0+X1 (AArch64) to this location
             let local_sym = self.alloc_pseudo();

@@ -92,25 +92,15 @@ impl Aarch64CodeGen {
                     .is_some_and(|p| matches!(p.kind, PseudoKind::Sym(_)));
 
                 if is_symbol {
-                    // Local variable - load directly from stack slot (FP-relative for alloca safety)
-                    let total_offset = self.stack_offset(offset) + insn.offset as i32;
                     self.push_lir(Aarch64Inst::LdrFp {
                         size: fp_size,
-                        addr: MemAddr::BaseOffset {
-                            base: Reg::X29,
-                            offset: total_offset,
-                        },
+                        addr: self.stack_mem_plus(offset, insn.offset as i32),
                         dst: dst_vreg,
                     });
                 } else {
-                    // Spilled address - load address first (FP-relative for alloca safety)
-                    let adjusted = self.stack_offset(offset);
                     self.push_lir(Aarch64Inst::Ldr {
                         size: OperandSize::B64,
-                        addr: MemAddr::BaseOffset {
-                            base: Reg::X29,
-                            offset: adjusted,
-                        },
+                        addr: self.stack_mem(offset),
                         dst: Reg::X16,
                     });
                     self.push_lir(Aarch64Inst::LdrFp {
@@ -206,14 +196,10 @@ impl Aarch64CodeGen {
                 });
             }
             Loc::Stack(offset) => {
-                let actual_offset = self.stack_offset(offset);
                 // FP-relative for alloca safety
                 self.push_lir(Aarch64Inst::LdrFp {
                     size: fp_size,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X29,
-                        offset: actual_offset,
-                    },
+                    addr: self.stack_mem(offset),
                     dst,
                 });
             }
@@ -331,15 +317,11 @@ impl Aarch64CodeGen {
                 });
             }
             Loc::Stack(offset) => {
-                let actual_offset = self.stack_offset(*offset);
                 // FP-relative for alloca safety
                 self.push_lir(Aarch64Inst::StrFp {
                     size: fp_size,
                     src,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X29,
-                        offset: actual_offset,
-                    },
+                    addr: self.stack_mem(*offset),
                 });
             }
             Loc::Reg(r) => {
@@ -723,26 +705,18 @@ impl Aarch64CodeGen {
                     .is_some_and(|p| matches!(p.kind, PseudoKind::Sym(_)));
 
                 if is_symbol {
-                    let total = self.stack_offset(offset) + insn.offset as i32;
                     self.push_lir(Aarch64Inst::StrFp {
                         size: fp_size,
                         src: src_vreg,
-                        addr: MemAddr::BaseOffset {
-                            base: Reg::X29,
-                            offset: total,
-                        },
+                        addr: self.stack_mem_plus(offset, insn.offset as i32),
                     });
                 } else {
                     // The slot holds the address, so load it and store through.
                     let (scratch0, _, _) = Reg::scratch_regs();
-                    let total = self.stack_offset(offset);
                     self.push_lir(Aarch64Inst::Ldr {
                         size: OperandSize::B64,
                         dst: scratch0,
-                        addr: MemAddr::BaseOffset {
-                            base: Reg::X29,
-                            offset: total,
-                        },
+                        addr: self.stack_mem(offset),
                     });
                     self.push_lir(Aarch64Inst::StrFp {
                         size: fp_size,

@@ -182,9 +182,16 @@ materializes every operand through a `Load`, so these emitters only ever see a
 register; that is exactly the arrangement copy propagation undoes. They now go
 through `stack_mem`/`stack_field`, which know where slots live.
 
-aarch64 still distinguishes the two frames by the *sign* of an offset rather
-than by a distinct `Loc` variant — see #C34 in `cc/audit.md`. That is the
-remaining hazard for a pseudo-merging pass on that target.
+aarch64 has had the same treatment: twenty-two emitters computed a frame
+address themselves, eight of them with `frame_size + off`, and all now go
+through `stack_mem`/`stack_mem_plus`. The producers are typed too — `LocalSlot`
+and `IncomingOff` apply their sign convention inside their constructors, so the
+two spaces can no longer be assigned to one another.
+
+What remains on that target is the `Loc::IncomingArg` variant itself, which is
+what would make the distinction *exhaustively* checked rather than centralized
+in three accessors — see #C34 in `cc/audit.md` for why adding the variant
+naively would be a step backwards.
 
 #### Local CSE / Value Numbering
 

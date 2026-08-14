@@ -20,7 +20,7 @@
 use crate::abi::{get_abi_for_conv, ArgClass, CallingConv};
 use crate::arch::aarch64::features::{VA_GR_SAVE_BYTES, VA_VR_SAVE_BYTES};
 use crate::arch::aarch64::lir::{Aarch64Inst, DmbOption, GpOperand, MemAddr};
-use crate::arch::aarch64::regalloc::{Loc, Reg, RegAlloc, VReg};
+use crate::arch::aarch64::regalloc::{FrameBase, Loc, Reg, RegAlloc, VReg};
 use crate::arch::codegen::{is_variadic_function, BswapSize, CodeGenBase, CodeGenerator, UnaryOp};
 use crate::arch::lir::{complex_fp_info, CondCode, Directive, FpSize, Label, OperandSize, Symbol};
 use crate::ir::{Function, Instruction, Module, Opcode, Pseudo, PseudoId, PseudoKind};
@@ -72,10 +72,8 @@ pub struct Aarch64CodeGen {
     stack_alloc_size: i32,
     /// Sym pseudo ID → type size in bits (for distinguishing scalar vs struct stores)
     sym_type_sizes: HashMap<PseudoId, u32>,
-    /// When true, over-aligned locals use x19 as an aligned base register
-    use_aligned_base: bool,
-    /// Maximum local alignment (for computing aligned base)
-    max_local_align: i32,
+    /// Which register this function's locals are addressed through
+    frame_base: FrameBase,
 }
 
 /// Result of computing a memory address for load/store operations
@@ -107,8 +105,7 @@ impl Aarch64CodeGen {
             unique_label_counter: 0,
             stack_alloc_size: 0,
             sym_type_sizes: HashMap::new(),
-            use_aligned_base: false,
-            max_local_align: 16,
+            frame_base: FrameBase::Fp,
         }
     }
 
@@ -132,14 +129,14 @@ impl Aarch64CodeGen {
     #[inline]
     pub(super) fn stack_offset(&self, offset: i32) -> i32 {
         if offset < 0 {
-            if self.use_aligned_base {
+            if let FrameBase::Aligned { align, .. } = self.frame_base {
                 // Over-aligned locals: x19-relative addressing.
                 // stack_alloc_size = base_rounded + (max_align - 1), where base_rounded
                 // is round_up(stack_offset, max_align). x19 is the max_align-aligned
                 // start of the locals area. Offset from x19 = base_rounded + regalloc_offset.
                 // Since base_rounded is a multiple of max_align and regalloc aligns each
                 // local's position to its alignment, the result preserves alignment.
-                let base_rounded = self.stack_alloc_size - (self.max_local_align - 1);
+                let base_rounded = self.stack_alloc_size - (align - 1);
                 base_rounded + offset
             } else {
                 // Local variable: use frame size minus reg_save_area
@@ -161,10 +158,9 @@ impl Aarch64CodeGen {
     /// Incoming args always use X29.
     #[inline]
     pub(super) fn stack_base_reg(&self, raw_offset: i32) -> Reg {
-        if raw_offset < 0 && self.use_aligned_base {
-            Reg::X19
-        } else {
-            Reg::X29
+        match self.frame_base.reg() {
+            Some(base) if raw_offset < 0 => base,
+            _ => Reg::X29,
         }
     }
 
@@ -255,14 +251,15 @@ impl Aarch64CodeGen {
         }
 
         let stack_size = alloc.stack_size();
-        self.max_local_align = alloc.max_local_align();
-        self.use_aligned_base = self.max_local_align > 16;
+        self.frame_base = alloc.frame_base();
         let mut callee_saved = alloc.callee_saved_used().to_vec();
         let callee_saved_fp = alloc.callee_saved_fp_used().to_vec();
 
         // When using aligned base, x19 must be callee-saved
-        if self.use_aligned_base && !callee_saved.contains(&Reg::X19) {
-            callee_saved.push(Reg::X19);
+        if let Some(base) = self.frame_base.reg() {
+            if !callee_saved.contains(&base) {
+                callee_saved.push(base);
+            }
         }
 
         // For variadic functions on Linux/FreeBSD, we need extra space for the register save area.
@@ -325,21 +322,24 @@ impl Aarch64CodeGen {
         self.zero_stack_frame();
 
         // Compute aligned base register (x19) for over-aligned locals
-        if self.use_aligned_base {
+        if let FrameBase::Aligned {
+            reg: base,
+            align: max_align,
+        } = self.frame_base
+        {
             let base_offset = 16 + self.callee_saved_size;
-            let max_align = self.max_local_align;
-            // x19 = (FP + base_offset + max_align - 1) & ~(max_align - 1)
+            // base = (FP + base_offset + max_align - 1) & ~(max_align - 1)
             self.push_lir(Aarch64Inst::Add {
                 size: OperandSize::B64,
-                dst: Reg::X19,
+                dst: base,
                 src1: Reg::X29,
                 src2: GpOperand::Imm((base_offset + max_align - 1) as i64),
             });
             // AND with bitmask: aarch64 AND (immediate) encodes bitmasks
             self.push_lir(Aarch64Inst::And {
                 size: OperandSize::B64,
-                dst: Reg::X19,
-                src1: Reg::X19,
+                dst: base,
+                src1: base,
                 src2: GpOperand::Imm(-(max_align as i64)),
             });
         }
@@ -1029,12 +1029,11 @@ impl Aarch64CodeGen {
     /// Emit stores for arguments spilled from caller-saved registers to stack
     fn store_spilled_args(&mut self, alloc: &RegAlloc) {
         for spilled in alloc.spilled_args() {
-            // spilled.to_stack_offset is negative (e.g., -8, -16, etc.)
             if let Some(gp_reg) = spilled.from_gp_reg {
                 self.push_lir(Aarch64Inst::Str {
                     size: OperandSize::B64,
                     src: gp_reg,
-                    addr: self.stack_mem(spilled.to_stack_offset),
+                    addr: self.stack_mem(spilled.to_stack_offset.displacement()),
                 });
             } else if let Some(fp_reg) = spilled.from_fp_reg {
                 // The recorded width, not a fixed eight bytes: `long double` is
@@ -1046,7 +1045,7 @@ impl Aarch64CodeGen {
                         FpSize::Double
                     },
                     src: fp_reg,
-                    addr: self.stack_mem(spilled.to_stack_offset),
+                    addr: self.stack_mem(spilled.to_stack_offset.displacement()),
                 });
             }
         }
@@ -1086,13 +1085,16 @@ impl Aarch64CodeGen {
         }
     }
 
-    fn copy_stacked_pair_to_local(
+    /// Copy an `elems`-element floating-point parameter that the caller laid
+    /// on the stack into the local the body reads.
+    fn copy_stacked_fp_elems_to_local(
         &mut self,
         func: &Function,
         param_idx: usize,
         typ: TypeId,
         types: &TypeTable,
         pseudo: PseudoId,
+        elems: i32,
     ) {
         let param_name = &func.params[param_idx].0;
         let Some(local) = func.locals.get(param_name) else {
@@ -1108,7 +1110,7 @@ impl Aarch64CodeGen {
 
         let (fp_size, elem_bytes) = self.two_element_fp_info(typ, types);
 
-        for step in 0..2i32 {
+        for step in 0..elems {
             let delta = step * elem_bytes;
             self.push_lir(Aarch64Inst::LdrFp {
                 size: fp_size,
@@ -1146,18 +1148,26 @@ impl Aarch64CodeGen {
         for (i, (_name, typ)) in func.params.iter().enumerate() {
             let is_complex = types.is_complex(*typ);
             let is_fp = types.is_float(*typ);
-            // Check for HFA-2 struct (e.g., {double, double}) — passed in two FP regs
-            let is_hfa_two = !is_complex
-                && !is_fp
-                && (types.kind(*typ) == TypeKind::Struct || types.kind(*typ) == TypeKind::Union)
-                && {
-                    let abi = get_abi_for_conv(CallingConv::C, &self.base.target);
-                    matches!(
-                        abi.classify_param(*typ, types),
-                        ArgClass::Hfa { count: 2, .. }
-                    )
-                };
-            let uses_two_fp_regs = is_complex || is_hfa_two;
+            // How many consecutive V registers this parameter arrives in, if
+            // it arrives in V registers at all. A `_Complex` is two by
+            // definition; a struct is whatever the ABI's HFA classification
+            // says, which is one through four.
+            //
+            // This used to ask for `count: 2` and let every other count fall
+            // through to the GP arm below, so a three- or four-element HFA was
+            // read out of an integer register -- and consumed an integer slot,
+            // which shifted every following integer parameter by one.
+            let fp_reg_count: Option<usize> = if is_complex {
+                Some(2)
+            } else if !is_fp && matches!(types.kind(*typ), TypeKind::Struct | TypeKind::Union) {
+                let abi = get_abi_for_conv(CallingConv::C, &self.base.target);
+                match abi.classify_param(*typ, types) {
+                    ArgClass::Hfa { count, .. } => Some(count as usize),
+                    _ => None,
+                }
+            } else {
+                None
+            };
 
             // Find the pseudo for this argument
             for pseudo in &func.pseudos {
@@ -1167,8 +1177,8 @@ impl Aarch64CodeGen {
                         // Skip pseudos already stored via spilled_args
                         if spilled_pseudos.contains(&pseudo.id) {
                             // Still need to count this arg for register assignment tracking
-                            if uses_two_fp_regs {
-                                fp_arg_idx += 2;
+                            if let Some(count) = fp_reg_count {
+                                fp_arg_idx += count;
                             } else if is_fp {
                                 fp_arg_idx += 1;
                             } else if types.kind(*typ) == TypeKind::Int128 {
@@ -1178,28 +1188,26 @@ impl Aarch64CodeGen {
                             }
                             break;
                         }
-                        if uses_two_fp_regs {
-                            // Complex or HFA-2 argument — uses TWO consecutive FP registers
-                            if fp_arg_idx + 1 < fp_arg_regs.len() {
+                        if let Some(count) = fp_reg_count {
+                            // Complex or HFA argument — `count` consecutive V registers
+                            if fp_arg_idx + count <= fp_arg_regs.len() {
                                 let param_name = &func.params[i].0;
                                 if let Some(local) = func.locals.get(param_name) {
                                     if let Some(&Loc::Stack(offset)) =
                                         self.locations.get_ref(local.sym)
                                     {
-                                        let (fp_size, second_offset) =
+                                        let (fp_size, elem_bytes) =
                                             self.two_element_fp_info(*typ, types);
-                                        // Store first element from first FP register
-                                        self.push_lir(Aarch64Inst::StrFp {
-                                            size: fp_size,
-                                            src: fp_arg_regs[fp_arg_idx],
-                                            addr: self.stack_mem(offset),
-                                        });
-                                        // Store second element from second FP register
-                                        self.push_lir(Aarch64Inst::StrFp {
-                                            size: fp_size,
-                                            src: fp_arg_regs[fp_arg_idx + 1],
-                                            addr: self.stack_mem_plus(offset, second_offset),
-                                        });
+                                        for elem in 0..count {
+                                            self.push_lir(Aarch64Inst::StrFp {
+                                                size: fp_size,
+                                                src: fp_arg_regs[fp_arg_idx + elem],
+                                                addr: self.stack_mem_plus(
+                                                    offset,
+                                                    elem as i32 * elem_bytes,
+                                                ),
+                                            });
+                                        }
                                     }
                                 }
                             } else {
@@ -1212,9 +1220,16 @@ impl Aarch64CodeGen {
                                 // garbage (#H13). regalloc has already assigned
                                 // the incoming slot; find it and shuttle both
                                 // elements through V16.
-                                self.copy_stacked_pair_to_local(func, i, *typ, types, pseudo.id);
+                                self.copy_stacked_fp_elems_to_local(
+                                    func,
+                                    i,
+                                    *typ,
+                                    types,
+                                    pseudo.id,
+                                    count as i32,
+                                );
                             }
-                            fp_arg_idx += 2;
+                            fp_arg_idx += count;
                         } else if is_fp {
                             // FP argument
                             if fp_arg_idx < fp_arg_regs.len() {
@@ -1333,8 +1348,14 @@ impl Aarch64CodeGen {
                     // through a general register, while the *caller* read the
                     // FP one -- so the two sides disagreed inside one
                     // translation unit.
-                    if (k == TypeKind::Struct || k == TypeKind::Union) && types.size_bits(t) <= 128
-                    {
+                    // No size bound in either direction. A struct holding
+                    // one `float`, `double` or `_Float16` is a one-element HFA
+                    // and comes back in V0; four `double`s is a valid
+                    // four-element HFA at thirty-two bytes, and capping this at
+                    // sixteen sent it back as an address instead. The
+                    // classifier is what decides -- it already applies the
+                    // four-element limit.
+                    if k == TypeKind::Struct || k == TypeKind::Union {
                         let abi = get_abi_for_conv(CallingConv::C, &self.base.target);
                         match abi.classify_return(t, types) {
                             ArgClass::Hfa { base, count } => {
@@ -1363,8 +1384,11 @@ impl Aarch64CodeGen {
             // `long double` is binary128: moving it out of a general register
             // hit `a binary128 value does not fit one X register` and killed
             // the compiler.
-            let hfa_two_fp_size: Option<FpSize> =
-                hfa_ret.and_then(|(size, count)| (count == 2).then_some(size));
+            // Two elements through four: one V register each. Only the
+            // two-element case was handled, so a three- or four-element HFA
+            // fell through to the general-register return below and came back
+            // as the address of the callee's own frame slot.
+            let hfa_multi: Option<(FpSize, u8)> = hfa_ret.filter(|&(_, count)| count >= 2);
 
             // Derive return size from type to avoid 32-bit truncation
             let ret_typ = insn.typ;
@@ -1452,8 +1476,16 @@ impl Aarch64CodeGen {
                         _ => self.emit_move(src, Reg::X0, ret_size),
                     }
                 }
-            } else if let Some(fp_size) = hfa_two_fp_size {
-                if insn.src.len() == 2 {
+            } else if let Some((fp_size, count)) = hfa_multi {
+                let count = count as usize;
+                let elem_offset = match fp_size {
+                    FpSize::Half => 2,
+                    FpSize::Single => 4,
+                    FpSize::Quad => 16,
+                    _ => 8,
+                };
+                let ret_regs = [VReg::V0, VReg::V1, VReg::V2, VReg::V3];
+                if insn.src.len() == 2 && count == 2 {
                     // Two-source path: linearizer pre-loaded struct halves as integers.
                     // Move from GP registers to V0/V1 via FmovFromGp.
                     self.emit_move(src, Reg::X9, 64);
@@ -1471,13 +1503,8 @@ impl Aarch64CodeGen {
                         });
                     }
                 } else {
-                    // Single-source path: src is an address to the struct.
-                    // Load both elements to V0/V1.
-                    let elem_offset = match fp_size {
-                        FpSize::Half => 2,
-                        FpSize::Single => 4,
-                        _ => 8,
-                    };
+                    // Single-source path: `src` locates the aggregate.
+                    //
                     // Eight bytes or fewer, so the slot holds the value rather
                     // than a pointer to it -- `struct { _Float16 a, b; }` is
                     // four. Dereferencing the value's own bytes is what a
@@ -1486,16 +1513,13 @@ impl Aarch64CodeGen {
                     let hfa_bits = insn.typ.map_or(0, |t| types.size_bits(t));
                     match src_loc {
                         Loc::Stack(offset) if hfa_bits <= 64 => {
-                            self.push_lir(Aarch64Inst::LdrFp {
-                                size: fp_size,
-                                dst: VReg::V0,
-                                addr: self.stack_mem(offset),
-                            });
-                            self.push_lir(Aarch64Inst::LdrFp {
-                                size: fp_size,
-                                dst: VReg::V1,
-                                addr: self.stack_field(offset, elem_offset),
-                            });
+                            for (i, &dst) in ret_regs[..count].iter().enumerate() {
+                                self.push_lir(Aarch64Inst::LdrFp {
+                                    size: fp_size,
+                                    dst,
+                                    addr: self.stack_field(offset, i as i32 * elem_offset),
+                                });
+                            }
                         }
                         Loc::Stack(offset) => {
                             self.push_lir(Aarch64Inst::Ldr {
@@ -1503,59 +1527,52 @@ impl Aarch64CodeGen {
                                 dst: Reg::X9,
                                 addr: self.stack_mem(offset),
                             });
-                            self.push_lir(Aarch64Inst::LdrFp {
-                                size: fp_size,
-                                dst: VReg::V0,
-                                addr: MemAddr::BaseOffset {
-                                    base: Reg::X9,
-                                    offset: 0,
-                                },
-                            });
-                            self.push_lir(Aarch64Inst::LdrFp {
-                                size: fp_size,
-                                dst: VReg::V1,
-                                addr: MemAddr::BaseOffset {
-                                    base: Reg::X9,
-                                    offset: elem_offset,
-                                },
-                            });
+                            for (i, &dst) in ret_regs[..count].iter().enumerate() {
+                                self.push_lir(Aarch64Inst::LdrFp {
+                                    size: fp_size,
+                                    dst,
+                                    addr: MemAddr::BaseOffset {
+                                        base: Reg::X9,
+                                        offset: i as i32 * elem_offset,
+                                    },
+                                });
+                            }
                         }
                         // Eight bytes or fewer: the register holds the packed
                         // value, not a pointer to it, so the elements come out
                         // of it by shifting rather than by loading. Treating it
                         // as an address dereferenced the value's own bits.
                         Loc::Reg(r) if hfa_bits <= 64 => {
-                            self.push_lir(Aarch64Inst::FmovFromGp {
-                                size: fp_size,
-                                src: r,
-                                dst: VReg::V0,
-                            });
-                            self.push_lir(Aarch64Inst::Lsr {
-                                size: OperandSize::B64,
-                                src: r,
-                                amount: GpOperand::Imm((elem_offset * 8) as i64),
-                                dst: Reg::X9,
-                            });
-                            self.push_lir(Aarch64Inst::FmovFromGp {
-                                size: fp_size,
-                                src: Reg::X9,
-                                dst: VReg::V1,
-                            });
+                            for (i, &dst) in ret_regs[..count].iter().enumerate() {
+                                let gp = if i == 0 {
+                                    r
+                                } else {
+                                    self.push_lir(Aarch64Inst::Lsr {
+                                        size: OperandSize::B64,
+                                        src: r,
+                                        amount: GpOperand::Imm((i as i32 * elem_offset * 8) as i64),
+                                        dst: Reg::X9,
+                                    });
+                                    Reg::X9
+                                };
+                                self.push_lir(Aarch64Inst::FmovFromGp {
+                                    size: fp_size,
+                                    src: gp,
+                                    dst,
+                                });
+                            }
                         }
                         Loc::Reg(r) => {
-                            self.push_lir(Aarch64Inst::LdrFp {
-                                size: fp_size,
-                                dst: VReg::V0,
-                                addr: MemAddr::BaseOffset { base: r, offset: 0 },
-                            });
-                            self.push_lir(Aarch64Inst::LdrFp {
-                                size: fp_size,
-                                dst: VReg::V1,
-                                addr: MemAddr::BaseOffset {
-                                    base: r,
-                                    offset: elem_offset,
-                                },
-                            });
+                            for (i, &dst) in ret_regs[..count].iter().enumerate() {
+                                self.push_lir(Aarch64Inst::LdrFp {
+                                    size: fp_size,
+                                    dst,
+                                    addr: MemAddr::BaseOffset {
+                                        base: r,
+                                        offset: i as i32 * elem_offset,
+                                    },
+                                });
+                            }
                         }
                         _ => {}
                     }
@@ -3598,12 +3615,8 @@ impl Aarch64CodeGen {
                 }
             }
             Loc::Stack(offset) => {
-                // AArch64 uses offsets from base register (x29 or x19 for aligned locals)
-                let base = if self.use_aligned_base && *offset < 0 {
-                    "x19"
-                } else {
-                    "x29"
-                };
+                // AArch64 addresses a local from whichever base the frame uses
+                let base = asm_reg_name_64(self.stack_base_reg(*offset));
                 let actual = self.stack_offset(*offset);
                 format!("[{}, #{}]", base, actual)
             }

@@ -69,13 +69,9 @@ impl Aarch64CodeGen {
     fn va_list_addr(&mut self, loc: &Loc, dst: Reg) -> Option<Reg> {
         match loc {
             Loc::Stack(offset) => {
-                let actual_offset = self.stack_offset(*offset);
                 self.push_lir(Aarch64Inst::Ldr {
                     size: OperandSize::B64,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X29,
-                        offset: actual_offset,
-                    },
+                    addr: self.stack_mem(*offset),
                     dst,
                 });
                 Some(dst)
@@ -413,15 +409,10 @@ impl Aarch64CodeGen {
                     });
                 }
                 Loc::Stack(offset) => {
-                    // FP-relative for alloca safety
-                    let actual_offset = self.stack_offset(*offset);
                     self.push_lir(Aarch64Inst::StrFp {
                         size: fp_size,
                         src: VReg::V16,
-                        addr: MemAddr::BaseOffset {
-                            base: Reg::X29,
-                            offset: actual_offset,
-                        },
+                        addr: self.stack_mem(*offset),
                     });
                 }
                 _ => {}
@@ -446,15 +437,10 @@ impl Aarch64CodeGen {
                 }
             }
             Loc::Stack(offset) => {
-                // FP-relative for alloca safety
-                let actual_offset = self.stack_offset(*offset);
                 self.push_lir(Aarch64Inst::Str {
                     size: op_size,
                     src: scratch1,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X29,
-                        offset: actual_offset,
-                    },
+                    addr: self.stack_mem(*offset),
                 });
             }
             _ => {}
@@ -589,13 +575,9 @@ impl Aarch64CodeGen {
                 });
             }
             Loc::Stack(off) => {
-                let adjusted = self.frame_size + off;
                 self.push_lir(Aarch64Inst::Ldr {
                     size: op_size,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X29,
-                        offset: adjusted,
-                    },
+                    addr: self.stack_mem(*off),
                     dst: scratch,
                 });
             }
@@ -643,14 +625,10 @@ impl Aarch64CodeGen {
                 });
             }
             Loc::Stack(off) => {
-                let adjusted = self.frame_size + off;
                 self.push_lir(Aarch64Inst::Str {
                     size: op_size,
                     src: scratch,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X29,
-                        offset: adjusted,
-                    },
+                    addr: self.stack_mem(*off),
                 });
             }
             _ => {}
@@ -682,14 +660,9 @@ impl Aarch64CodeGen {
                 });
             }
             Loc::Stack(off) => {
-                // FP-relative for alloca safety
-                let adjusted = self.frame_size + off;
                 self.push_lir(Aarch64Inst::Ldr {
                     size: src_size,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X29,
-                        offset: adjusted,
-                    },
+                    addr: self.stack_mem(off),
                     dst: scratch,
                 });
             }
@@ -727,15 +700,10 @@ impl Aarch64CodeGen {
                 });
             }
             Loc::Stack(off) => {
-                // FP-relative for alloca safety
-                let adjusted = self.frame_size + off;
                 self.push_lir(Aarch64Inst::Str {
                     size: OperandSize::B32,
                     src: scratch,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X29,
-                        offset: adjusted,
-                    },
+                    addr: self.stack_mem(off),
                 });
             }
             _ => {}
@@ -767,14 +735,9 @@ impl Aarch64CodeGen {
                 });
             }
             Loc::Stack(off) => {
-                // FP-relative for alloca safety
-                let adjusted = self.frame_size + off;
                 self.push_lir(Aarch64Inst::Ldr {
                     size: src_size,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X29,
-                        offset: adjusted,
-                    },
+                    addr: self.stack_mem(off),
                     dst: scratch,
                 });
             }
@@ -802,15 +765,10 @@ impl Aarch64CodeGen {
                 });
             }
             Loc::Stack(off) => {
-                // FP-relative for alloca safety
-                let adjusted = self.frame_size + off;
                 self.push_lir(Aarch64Inst::Str {
                     size: OperandSize::B32,
                     src: scratch,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X29,
-                        offset: adjusted,
-                    },
+                    addr: self.stack_mem(off),
                 });
             }
             _ => {}
@@ -844,14 +802,9 @@ impl Aarch64CodeGen {
                 });
             }
             Loc::Stack(off) => {
-                // FP-relative for alloca safety
-                let adjusted = self.frame_size + off;
                 self.push_lir(Aarch64Inst::Ldr {
                     size: src_size,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X29,
-                        offset: adjusted,
-                    },
+                    addr: self.stack_mem(off),
                     dst: scratch,
                 });
             }
@@ -898,15 +851,10 @@ impl Aarch64CodeGen {
                 });
             }
             Loc::Stack(off) => {
-                // FP-relative for alloca safety
-                let adjusted = self.frame_size + off;
                 self.push_lir(Aarch64Inst::Str {
                     size: OperandSize::B32,
                     src: scratch,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X29,
-                        offset: adjusted,
-                    },
+                    addr: self.stack_mem(off),
                 });
             }
             _ => {}

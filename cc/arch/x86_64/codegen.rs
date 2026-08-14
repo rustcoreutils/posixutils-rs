@@ -663,6 +663,18 @@ impl X86_64CodeGen {
         let aligned_stack = (total_stack + 15) & !15;
         // Subtract only the actual pushed bytes (not the padded offset)
         let alloc_size = aligned_stack - (self.callee_saved_regs.len() as i32 * 8);
+        // An over-aligned frame addresses each local as `%rsp + (alloc_size -
+        // slot)`. The `andq` below makes `%rsp` itself a multiple of the
+        // alignment and the allocator makes each slot one, so the address is
+        // aligned only if `alloc_size` is too -- and it is a 16-byte-rounded
+        // total less eight bytes per pushed register, so an odd number of
+        // callee-saved pushes left every over-aligned local off by eight.
+        let alloc_size = if self.use_rsp_locals {
+            let align = self.max_local_align;
+            (alloc_size + align - 1) & !(align - 1)
+        } else {
+            alloc_size
+        };
         if alloc_size > 0 {
             self.push_lir(X86Inst::Sub {
                 size: OperandSize::B64,

@@ -7252,3 +7252,235 @@ int main(void)
         0
     );
 }
+
+/// A local whose alignment exceeds the stack's own forces the frame to be
+/// addressed through a second base register. That register was still in the
+/// allocatable pool, so the colorer handed it to an ordinary value and the
+/// prologue's base was overwritten by the first thing that outlived a call --
+/// every later local access then read through whatever integer that was.
+///
+/// The call is what makes it bite: it forces a callee-saved register, and the
+/// base is callee-saved. The pressure below keeps enough values live across
+/// the call that the base is reached rather than left spare.
+#[test]
+fn codegen_over_aligned_frame_base_reserved() {
+    let code = r#"
+int sink(int v) { return v; }
+
+int over_aligned(int x) {
+    _Alignas(64) char buf[128];
+    int a = x + 1, b = x + 2, c = x + 3, d = x + 4;
+    int e = x + 5, f = x + 6, g = x + 7, h = x + 8;
+    buf[0] = 1;
+    buf[64] = 2;
+    /* every value above stays live across this call */
+    int r = sink(x);
+    if (((unsigned long)&buf[0] & 63UL) != 0UL) return 100;
+    if (buf[0] != 1 || buf[64] != 2) return 101;
+    if (a + b + c + d + e + f + g + h != 8 * x + 36) return 102;
+    return r;
+}
+
+int main(void) {
+    if (over_aligned(7) != 7) return 1;
+    if (over_aligned(0) != 0) return 2;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_over_aligned_frame_base", code, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run_optimized("codegen_over_aligned_frame_base_opt", code),
+        0
+    );
+}
+
+/// AAPCS64 §5.4.2 gives a homogeneous floating-point aggregate one V register
+/// per element, for one to four elements. Both sides of the aarch64 call
+/// recognised only the two-element case: a three- or four-element HFA went out
+/// whole in a general register while the callee read it from V0-V3, and it
+/// consumed an integer slot, so the *next* integer argument was shifted along
+/// as well. An aggregate small enough to sit in one register was passed as a
+/// single value rather than split across the element registers.
+///
+/// Every shape below is checked against gcc's own layout, so the test is an
+/// ABI conformance check as much as a regression test.
+#[test]
+fn codegen_hfa_param_element_counts() {
+    let code = r#"
+typedef struct { float a; }              F1;
+typedef struct { float a, b; }           F2;
+typedef struct { float a, b, c; }        F3;
+typedef struct { float a, b, c, d; }     F4;
+typedef struct { double a; }             D1;
+typedef struct { double a, b; }          D2;
+typedef struct { double a, b, c; }       D3;
+typedef struct { float v[3]; }           FA;
+
+double u_f1(F1 v) { return v.a; }
+double u_f2(F2 v) { return v.a * 10 + v.b; }
+double u_f3(F3 v) { return v.a * 100 + v.b * 10 + v.c; }
+double u_f4(F4 v) { return v.a * 1000 + v.b * 100 + v.c * 10 + v.d; }
+double u_d1(D1 v) { return v.a; }
+double u_d2(D2 v) { return v.a * 10 + v.b; }
+double u_d3(D3 v) { return v.a * 100 + v.b * 10 + v.c; }
+double u_fa(FA v) { return v.v[0] * 100 + v.v[1] * 10 + v.v[2]; }
+
+/* an HFA followed by an integer: the integer moves too if the aggregate
+   wrongly consumes a general register */
+double mixed(int n, F4 v, int m) {
+    return v.a * 1000 + v.b * 100 + v.c * 10 + v.d + n * 100000 + m * 10000;
+}
+
+/* past V0-V7, so the tail is laid on the stack */
+double overflow(F4 p, F4 q, D2 r, int n, double s) {
+    return p.a * 1e7 + p.b * 1e6 + p.c * 1e5 + p.d * 1e4
+         + q.a * 1e3 + q.b * 1e2 + q.c * 10 + q.d
+         + r.a * 1e8 + r.b * 1e9 + n + s;
+}
+
+int main(void) {
+    F1 f1 = {1};       if (u_f1(f1) != 1)    return 1;
+    F2 f2 = {1, 2};    if (u_f2(f2) != 12)   return 2;
+    F3 f3 = {1, 2, 3}; if (u_f3(f3) != 123)  return 3;
+    F4 f4 = {1,2,3,4}; if (u_f4(f4) != 1234) return 4;
+    D1 d1 = {1};       if (u_d1(d1) != 1)    return 5;
+    D2 d2 = {1, 2};    if (u_d2(d2) != 12)   return 6;
+    D3 d3 = {1, 2, 3}; if (u_d3(d3) != 123)  return 7;
+    FA fa = {{1, 2, 3}}; if (u_fa(fa) != 123) return 8;
+
+    if (mixed(1, f4, 2) != 121234) return 9;
+
+    F4 q = {5, 6, 7, 8};
+    D2 r = {9, 10};
+    if (overflow(f4, q, r, 11, 0.5) != 10912345689.5) return 10;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("codegen_hfa_param_counts", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("codegen_hfa_param_counts_opt", code),
+        0
+    );
+}
+
+/// An HFA is returned in one V register per element, up to four, and its size
+/// does not enter into it -- `struct { double a, b, c, d; }` is thirty-two
+/// bytes and still comes back in V0-V3.
+///
+/// Three things had to agree before that worked on aarch64. The linearizer
+/// claimed every aggregate over sixteen bytes for the hidden-pointer return,
+/// on the stated grounds that nothing implemented a three-register HFA return.
+/// The return emitter handled one element and two, so three or four fell
+/// through and sent back the address of the callee's own frame slot -- which
+/// the caller then dereferenced after the frame was gone. And an aggregate
+/// returned in registers is written into a local by the caller, but that local
+/// was only allocated at sixteen bytes or fewer, so a twenty-four-byte result
+/// had nowhere to land and its first use read through a zero.
+#[test]
+fn codegen_hfa_return_element_counts() {
+    let code = r#"
+typedef struct { float a; }              F1;
+typedef struct { float a, b; }           F2;
+typedef struct { float a, b, c; }        F3;
+typedef struct { float a, b, c, d; }     F4;
+typedef struct { double a; }             D1;
+typedef struct { double a, b; }          D2;
+typedef struct { double a, b, c; }       D3;
+typedef struct { double a, b, c, d; }    D4;
+
+F1 m_f1(float x) { F1 r = {x};                   return r; }
+F2 m_f2(float x) { F2 r = {x, x+1};              return r; }
+F3 m_f3(float x) { F3 r = {x, x+1, x+2};         return r; }
+F4 m_f4(float x) { F4 r = {x, x+1, x+2, x+3};    return r; }
+D1 m_d1(double x){ D1 r = {x};                   return r; }
+D2 m_d2(double x){ D2 r = {x, x+1};              return r; }
+D3 m_d3(double x){ D3 r = {x, x+1, x+2};         return r; }
+D4 m_d4(double x){ D4 r = {x, x+1, x+2, x+3};    return r; }
+
+int main(void) {
+    { F1 v = m_f1(1); if (v.a != 1) return 1; }
+    { F2 v = m_f2(1); if (v.a*10 + v.b != 12) return 2; }
+    { F3 v = m_f3(1); if (v.a*100 + v.b*10 + v.c != 123) return 3; }
+    { F4 v = m_f4(1); if (v.a*1000 + v.b*100 + v.c*10 + v.d != 1234) return 4; }
+    { D1 v = m_d1(1); if (v.a != 1) return 5; }
+    { D2 v = m_d2(1); if (v.a*10 + v.b != 12) return 6; }
+    { D3 v = m_d3(1); if (v.a*100 + v.b*10 + v.c != 123) return 7; }
+    { D4 v = m_d4(1); if (v.a*1000 + v.b*100 + v.c*10 + v.d != 1234) return 8; }
+
+    /* returned aggregate consumed in place, not through a named local */
+    if (m_d3(2).b != 3) return 9;
+    if (m_f4(2).d != 5) return 10;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("codegen_hfa_return_counts", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("codegen_hfa_return_counts_opt", code),
+        0
+    );
+}
+
+/// An HFA that does not fit in the remaining V registers is laid on the stack,
+/// and the caller writes its elements there itself. Every multi-element
+/// argument took the `_Complex` path to do that: a fixed two-element loop at
+/// the complex element stride. For a three- or four-element HFA that wrote the
+/// wrong number of elements at the wrong stride, and reserved the wrong number
+/// of bytes, so the argument after it landed inside it.
+///
+/// The first two arguments exist only to consume V0-V7, forcing the third onto
+/// the stack. `noinline` keeps the parameters arriving through the ABI rather
+/// than being substituted -- an inlined stacked HFA is a separate defect
+/// (#C38) and would mask this one.
+#[test]
+fn codegen_stacked_hfa_element_counts() {
+    let code = r#"
+typedef struct { float a, b, c, d; }        F4;
+typedef struct { float a, b, c; }           F3;
+typedef struct { double a, b; }             D2;
+typedef struct { double a, b, c; }          D3;
+
+__attribute__((noinline)) double s_f4(F4 p, F4 q, F4 r) {
+    return (double)r.a * 1000 + r.b * 100 + r.c * 10 + r.d;
+}
+__attribute__((noinline)) double s_f3(F4 p, F4 q, F3 r) {
+    return (double)r.a * 100 + r.b * 10 + r.c;
+}
+__attribute__((noinline)) double s_d2(F4 p, F4 q, D2 r) {
+    return r.a * 10 + r.b;
+}
+__attribute__((noinline)) double s_d3(F4 p, F4 q, D3 r) {
+    return r.a * 100 + r.b * 10 + r.c;
+}
+/* an argument after the stacked HFA: too small a slot puts it inside */
+__attribute__((noinline)) double s_tail(F4 p, F4 q, F4 r, double t) {
+    return (double)r.a * 1000 + r.b * 100 + r.c * 10 + r.d + t;
+}
+__attribute__((noinline)) double s_tail3(F4 p, F4 q, F3 r, double t) {
+    return (double)r.a * 100 + r.b * 10 + r.c + t;
+}
+
+int main(void) {
+    F4 z = {0, 0, 0, 0};
+    F4 f4 = {1, 2, 3, 4};
+    F3 f3 = {1, 2, 3};
+    D2 d2 = {1, 2};
+    D3 d3 = {1, 2, 3};
+
+    if (s_f4(z, z, f4) != 1234) return 1;
+    if (s_f3(z, z, f3) != 123) return 2;
+    if (s_d2(z, z, d2) != 12) return 3;
+    if (s_d3(z, z, d3) != 123) return 4;
+    if (s_tail(z, z, f4, 5) != 1239) return 5;
+    if (s_tail3(z, z, f3, 5) != 128) return 6;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("codegen_stacked_hfa_counts", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("codegen_stacked_hfa_counts_opt", code),
+        0
+    );
+}

@@ -799,23 +799,26 @@ impl<'a> Linearizer<'a> {
             // `long double _Complex` guarantee above local and testable.
             return false;
         }
+        let abi = get_abi_for_conv(self.current_calling_conv, self.target);
+        let class = abi.classify_return(typ, self.types);
+        if matches!(class, crate::abi::ArgClass::Hfa { .. }) {
+            // An HFA comes back in one V register per element, up to four, so
+            // size does not enter into it: `struct { double a, b, c, d; }` is
+            // thirty-two bytes and still returns in V0-V3. The size rule below
+            // used to claim it, on the grounds that nothing implemented a
+            // three- or four-register HFA return -- which was true until both
+            // ends of the aarch64 return path learned to count elements.
+            return false;
+        }
         if self.types.size_bits(typ) > self.target.max_aggregate_register_bits {
-            // Every aggregate over two eightbytes, exactly as before. Keeping
-            // the size rule is what preserves the aarch64 decisions: an HFA
-            // larger than sixteen bytes classifies `Hfa`, never `Indirect`,
-            // so a purely classifier-driven test would stop returning it
-            // indirectly and nothing implements a three-register HFA return.
+            // Every other aggregate over two eightbytes.
             return true;
         }
         // Two eightbytes or fewer: only the classifier knows. An aggregate
         // this small can still be MEMORY class -- `union { long double v;
         // double d; }` merges X87 with SSE, which is MEMORY, and gcc returns
         // it through a hidden pointer.
-        let abi = get_abi_for_conv(self.current_calling_conv, self.target);
-        matches!(
-            abi.classify_return(typ, self.types),
-            crate::abi::ArgClass::Indirect { .. }
-        )
+        matches!(class, crate::abi::ArgClass::Indirect { .. })
     }
 
     pub(crate) fn linearize_function(&mut self, func: &FunctionDef) {
@@ -2786,9 +2789,14 @@ impl<'a> Linearizer<'a> {
         let typ_kind = self.types.kind(typ);
         let struct_size_bits = self.types.size_bits(typ);
         let returns_large_struct = self.returns_via_hidden_pointer(typ);
+        // An aggregate that comes back in registers still needs somewhere to
+        // land, and the backend writes the registers into this local. The
+        // upper bound used to be two eightbytes, which was every such case
+        // until an HFA of three or four `double`s stopped going through the
+        // hidden pointer: at twenty-four bytes it had no local, so the result
+        // pseudo held nothing and its first use dereferenced a zero.
         let returns_two_reg_struct = (typ_kind == TypeKind::Struct || typ_kind == TypeKind::Union)
             && struct_size_bits > 64
-            && struct_size_bits <= 128
             && !returns_large_struct;
         // `long double _Complex` comes back through the hidden pointer above,
         // not in registers.

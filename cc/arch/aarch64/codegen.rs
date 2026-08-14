@@ -1348,8 +1348,14 @@ impl Aarch64CodeGen {
                     // through a general register, while the *caller* read the
                     // FP one -- so the two sides disagreed inside one
                     // translation unit.
-                    if (k == TypeKind::Struct || k == TypeKind::Union) && types.size_bits(t) <= 128
-                    {
+                    // No size bound in either direction. A struct holding
+                    // one `float`, `double` or `_Float16` is a one-element HFA
+                    // and comes back in V0; four `double`s is a valid
+                    // four-element HFA at thirty-two bytes, and capping this at
+                    // sixteen sent it back as an address instead. The
+                    // classifier is what decides -- it already applies the
+                    // four-element limit.
+                    if k == TypeKind::Struct || k == TypeKind::Union {
                         let abi = get_abi_for_conv(CallingConv::C, &self.base.target);
                         match abi.classify_return(t, types) {
                             ArgClass::Hfa { base, count } => {
@@ -1378,8 +1384,11 @@ impl Aarch64CodeGen {
             // `long double` is binary128: moving it out of a general register
             // hit `a binary128 value does not fit one X register` and killed
             // the compiler.
-            let hfa_two_fp_size: Option<FpSize> =
-                hfa_ret.and_then(|(size, count)| (count == 2).then_some(size));
+            // Two elements through four: one V register each. Only the
+            // two-element case was handled, so a three- or four-element HFA
+            // fell through to the general-register return below and came back
+            // as the address of the callee's own frame slot.
+            let hfa_multi: Option<(FpSize, u8)> = hfa_ret.filter(|&(_, count)| count >= 2);
 
             // Derive return size from type to avoid 32-bit truncation
             let ret_typ = insn.typ;
@@ -1467,8 +1476,16 @@ impl Aarch64CodeGen {
                         _ => self.emit_move(src, Reg::X0, ret_size),
                     }
                 }
-            } else if let Some(fp_size) = hfa_two_fp_size {
-                if insn.src.len() == 2 {
+            } else if let Some((fp_size, count)) = hfa_multi {
+                let count = count as usize;
+                let elem_offset = match fp_size {
+                    FpSize::Half => 2,
+                    FpSize::Single => 4,
+                    FpSize::Quad => 16,
+                    _ => 8,
+                };
+                let ret_regs = [VReg::V0, VReg::V1, VReg::V2, VReg::V3];
+                if insn.src.len() == 2 && count == 2 {
                     // Two-source path: linearizer pre-loaded struct halves as integers.
                     // Move from GP registers to V0/V1 via FmovFromGp.
                     self.emit_move(src, Reg::X9, 64);
@@ -1486,13 +1503,8 @@ impl Aarch64CodeGen {
                         });
                     }
                 } else {
-                    // Single-source path: src is an address to the struct.
-                    // Load both elements to V0/V1.
-                    let elem_offset = match fp_size {
-                        FpSize::Half => 2,
-                        FpSize::Single => 4,
-                        _ => 8,
-                    };
+                    // Single-source path: `src` locates the aggregate.
+                    //
                     // Eight bytes or fewer, so the slot holds the value rather
                     // than a pointer to it -- `struct { _Float16 a, b; }` is
                     // four. Dereferencing the value's own bytes is what a
@@ -1501,16 +1513,13 @@ impl Aarch64CodeGen {
                     let hfa_bits = insn.typ.map_or(0, |t| types.size_bits(t));
                     match src_loc {
                         Loc::Stack(offset) if hfa_bits <= 64 => {
-                            self.push_lir(Aarch64Inst::LdrFp {
-                                size: fp_size,
-                                dst: VReg::V0,
-                                addr: self.stack_mem(offset),
-                            });
-                            self.push_lir(Aarch64Inst::LdrFp {
-                                size: fp_size,
-                                dst: VReg::V1,
-                                addr: self.stack_field(offset, elem_offset),
-                            });
+                            for (i, &dst) in ret_regs[..count].iter().enumerate() {
+                                self.push_lir(Aarch64Inst::LdrFp {
+                                    size: fp_size,
+                                    dst,
+                                    addr: self.stack_field(offset, i as i32 * elem_offset),
+                                });
+                            }
                         }
                         Loc::Stack(offset) => {
                             self.push_lir(Aarch64Inst::Ldr {
@@ -1518,59 +1527,52 @@ impl Aarch64CodeGen {
                                 dst: Reg::X9,
                                 addr: self.stack_mem(offset),
                             });
-                            self.push_lir(Aarch64Inst::LdrFp {
-                                size: fp_size,
-                                dst: VReg::V0,
-                                addr: MemAddr::BaseOffset {
-                                    base: Reg::X9,
-                                    offset: 0,
-                                },
-                            });
-                            self.push_lir(Aarch64Inst::LdrFp {
-                                size: fp_size,
-                                dst: VReg::V1,
-                                addr: MemAddr::BaseOffset {
-                                    base: Reg::X9,
-                                    offset: elem_offset,
-                                },
-                            });
+                            for (i, &dst) in ret_regs[..count].iter().enumerate() {
+                                self.push_lir(Aarch64Inst::LdrFp {
+                                    size: fp_size,
+                                    dst,
+                                    addr: MemAddr::BaseOffset {
+                                        base: Reg::X9,
+                                        offset: i as i32 * elem_offset,
+                                    },
+                                });
+                            }
                         }
                         // Eight bytes or fewer: the register holds the packed
                         // value, not a pointer to it, so the elements come out
                         // of it by shifting rather than by loading. Treating it
                         // as an address dereferenced the value's own bits.
                         Loc::Reg(r) if hfa_bits <= 64 => {
-                            self.push_lir(Aarch64Inst::FmovFromGp {
-                                size: fp_size,
-                                src: r,
-                                dst: VReg::V0,
-                            });
-                            self.push_lir(Aarch64Inst::Lsr {
-                                size: OperandSize::B64,
-                                src: r,
-                                amount: GpOperand::Imm((elem_offset * 8) as i64),
-                                dst: Reg::X9,
-                            });
-                            self.push_lir(Aarch64Inst::FmovFromGp {
-                                size: fp_size,
-                                src: Reg::X9,
-                                dst: VReg::V1,
-                            });
+                            for (i, &dst) in ret_regs[..count].iter().enumerate() {
+                                let gp = if i == 0 {
+                                    r
+                                } else {
+                                    self.push_lir(Aarch64Inst::Lsr {
+                                        size: OperandSize::B64,
+                                        src: r,
+                                        amount: GpOperand::Imm((i as i32 * elem_offset * 8) as i64),
+                                        dst: Reg::X9,
+                                    });
+                                    Reg::X9
+                                };
+                                self.push_lir(Aarch64Inst::FmovFromGp {
+                                    size: fp_size,
+                                    src: gp,
+                                    dst,
+                                });
+                            }
                         }
                         Loc::Reg(r) => {
-                            self.push_lir(Aarch64Inst::LdrFp {
-                                size: fp_size,
-                                dst: VReg::V0,
-                                addr: MemAddr::BaseOffset { base: r, offset: 0 },
-                            });
-                            self.push_lir(Aarch64Inst::LdrFp {
-                                size: fp_size,
-                                dst: VReg::V1,
-                                addr: MemAddr::BaseOffset {
-                                    base: r,
-                                    offset: elem_offset,
-                                },
-                            });
+                            for (i, &dst) in ret_regs[..count].iter().enumerate() {
+                                self.push_lir(Aarch64Inst::LdrFp {
+                                    size: fp_size,
+                                    dst,
+                                    addr: MemAddr::BaseOffset {
+                                        base: r,
+                                        offset: i as i32 * elem_offset,
+                                    },
+                                });
+                            }
                         }
                         _ => {}
                     }

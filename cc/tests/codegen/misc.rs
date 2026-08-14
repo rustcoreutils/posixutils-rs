@@ -7365,3 +7365,60 @@ int main(void) {
         0
     );
 }
+
+/// An HFA is returned in one V register per element, up to four, and its size
+/// does not enter into it -- `struct { double a, b, c, d; }` is thirty-two
+/// bytes and still comes back in V0-V3.
+///
+/// Three things had to agree before that worked on aarch64. The linearizer
+/// claimed every aggregate over sixteen bytes for the hidden-pointer return,
+/// on the stated grounds that nothing implemented a three-register HFA return.
+/// The return emitter handled one element and two, so three or four fell
+/// through and sent back the address of the callee's own frame slot -- which
+/// the caller then dereferenced after the frame was gone. And an aggregate
+/// returned in registers is written into a local by the caller, but that local
+/// was only allocated at sixteen bytes or fewer, so a twenty-four-byte result
+/// had nowhere to land and its first use read through a zero.
+#[test]
+fn codegen_hfa_return_element_counts() {
+    let code = r#"
+typedef struct { float a; }              F1;
+typedef struct { float a, b; }           F2;
+typedef struct { float a, b, c; }        F3;
+typedef struct { float a, b, c, d; }     F4;
+typedef struct { double a; }             D1;
+typedef struct { double a, b; }          D2;
+typedef struct { double a, b, c; }       D3;
+typedef struct { double a, b, c, d; }    D4;
+
+F1 m_f1(float x) { F1 r = {x};                   return r; }
+F2 m_f2(float x) { F2 r = {x, x+1};              return r; }
+F3 m_f3(float x) { F3 r = {x, x+1, x+2};         return r; }
+F4 m_f4(float x) { F4 r = {x, x+1, x+2, x+3};    return r; }
+D1 m_d1(double x){ D1 r = {x};                   return r; }
+D2 m_d2(double x){ D2 r = {x, x+1};              return r; }
+D3 m_d3(double x){ D3 r = {x, x+1, x+2};         return r; }
+D4 m_d4(double x){ D4 r = {x, x+1, x+2, x+3};    return r; }
+
+int main(void) {
+    { F1 v = m_f1(1); if (v.a != 1) return 1; }
+    { F2 v = m_f2(1); if (v.a*10 + v.b != 12) return 2; }
+    { F3 v = m_f3(1); if (v.a*100 + v.b*10 + v.c != 123) return 3; }
+    { F4 v = m_f4(1); if (v.a*1000 + v.b*100 + v.c*10 + v.d != 1234) return 4; }
+    { D1 v = m_d1(1); if (v.a != 1) return 5; }
+    { D2 v = m_d2(1); if (v.a*10 + v.b != 12) return 6; }
+    { D3 v = m_d3(1); if (v.a*100 + v.b*10 + v.c != 123) return 7; }
+    { D4 v = m_d4(1); if (v.a*1000 + v.b*100 + v.c*10 + v.d != 1234) return 8; }
+
+    /* returned aggregate consumed in place, not through a named local */
+    if (m_d3(2).b != 3) return 9;
+    if (m_f4(2).d != 5) return 10;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("codegen_hfa_return_counts", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("codegen_hfa_return_counts_opt", code),
+        0
+    );
+}

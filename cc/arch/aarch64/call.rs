@@ -861,6 +861,7 @@ impl Aarch64CodeGen {
     }
 
     /// Handle HFA (Homogeneous Floating-Point Aggregate) return (V0-V3)
+    /// Store an HFA return value from V0-V3 into the destination.
     fn handle_hfa_return(&mut self, dst_loc: &Loc, count: u8, base: HfaBase) {
         let (fp_size, elem_size) = match base {
             HfaBase::Float16 => (FpSize::Half, 2),

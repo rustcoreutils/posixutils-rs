@@ -3437,11 +3437,8 @@ int main(void) {
     return 0;
 }
 "#;
-    // Use extra_opts to force -O0 only (optimization needs further work for 2-SSE structs)
-    assert_eq!(
-        compile_and_run("two_sse_struct_abi", code, &["-O0".to_string()]),
-        0
-    );
+    assert_eq!(compile_and_run("two_sse_struct_abi", code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("two_sse_struct_abi_opt", code), 0);
 }
 
 // ============================================================================

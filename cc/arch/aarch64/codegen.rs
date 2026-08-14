@@ -180,6 +180,11 @@ impl Aarch64CodeGen {
 
     /// Like stack_mem but adds an extra byte offset (for struct member access).
     #[inline]
+    /// The address of byte `byte` of the object in stack slot `slot`.
+    fn stack_field(&self, slot: i32, byte: i32) -> MemAddr {
+        self.stack_mem_plus(slot, byte)
+    }
+
     pub(super) fn stack_mem_plus(&self, raw_offset: i32, extra: i32) -> MemAddr {
         MemAddr::BaseOffset {
             base: self.stack_base_reg(raw_offset),
@@ -1456,10 +1461,29 @@ impl Aarch64CodeGen {
                     // Single-source path: src is an address to the struct.
                     // Load both elements to V0/V1.
                     let elem_offset = match fp_size {
+                        FpSize::Half => 2,
                         FpSize::Single => 4,
                         _ => 8,
                     };
+                    // Eight bytes or fewer, so the slot holds the value rather
+                    // than a pointer to it -- `struct { _Float16 a, b; }` is
+                    // four. Dereferencing the value's own bytes is what a
+                    // two-element half-precision HFA started doing the moment
+                    // it became an HFA at all.
+                    let hfa_bits = insn.typ.map_or(0, |t| types.size_bits(t));
                     match src_loc {
+                        Loc::Stack(offset) if hfa_bits <= 64 => {
+                            self.push_lir(Aarch64Inst::LdrFp {
+                                size: fp_size,
+                                dst: VReg::V0,
+                                addr: self.stack_mem(offset),
+                            });
+                            self.push_lir(Aarch64Inst::LdrFp {
+                                size: fp_size,
+                                dst: VReg::V1,
+                                addr: self.stack_field(offset, elem_offset),
+                            });
+                        }
                         Loc::Stack(offset) => {
                             self.push_lir(Aarch64Inst::Ldr {
                                 size: OperandSize::B64,
@@ -1481,6 +1505,28 @@ impl Aarch64CodeGen {
                                     base: Reg::X9,
                                     offset: elem_offset,
                                 },
+                            });
+                        }
+                        // Eight bytes or fewer: the register holds the packed
+                        // value, not a pointer to it, so the elements come out
+                        // of it by shifting rather than by loading. Treating it
+                        // as an address dereferenced the value's own bits.
+                        Loc::Reg(r) if hfa_bits <= 64 => {
+                            self.push_lir(Aarch64Inst::FmovFromGp {
+                                size: fp_size,
+                                src: r,
+                                dst: VReg::V0,
+                            });
+                            self.push_lir(Aarch64Inst::Lsr {
+                                size: OperandSize::B64,
+                                src: r,
+                                amount: GpOperand::Imm((elem_offset * 8) as i64),
+                                dst: Reg::X9,
+                            });
+                            self.push_lir(Aarch64Inst::FmovFromGp {
+                                size: fp_size,
+                                src: Reg::X9,
+                                dst: VReg::V1,
                             });
                         }
                         Loc::Reg(r) => {

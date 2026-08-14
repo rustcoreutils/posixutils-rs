@@ -980,29 +980,44 @@ impl<'a> Linearizer<'a> {
                 // passed like complex types (in two XMM registers). Route them
                 // through complex_params so the codegen handles the register split.
                 let size = self.types.size_bits(param.typ);
-                let is_two_fp_regs = size > 64 && size <= 128 && {
+                // An HFA arrives in one register per element whatever its
+                // size, and the prologue is what writes them into the local --
+                // so it must not also get the small-struct store below. A
+                // two-element half-precision HFA is four bytes, and used to get
+                // both: the store overwrote the halves the prologue had just
+                // put there.
+                let is_hfa_param = {
                     let abi = get_abi_for_conv(self.current_calling_conv, self.target);
-                    let class = abi.classify_param(param.typ, self.types);
-                    // Any all-SSE aggregate, whether that is two registers of
-                    // eight bytes or one of sixteen.
-                    let all_sse = matches!(
-                        class,
-                        crate::abi::ArgClass::Direct { ref classes, .. }
-                            if !classes.is_empty()
-                                && classes.iter().all(|c| *c == crate::abi::RegClass::Sse)
-                    ) || matches!(class, crate::abi::ArgClass::Hfa { count: 2, .. });
-                    // Two eightbytes of any classes -- both integer, or one of
-                    // each -- arrive in two registers on x86-64 as well. The
-                    // caller's half of this decision is gated the same way;
-                    // aarch64 still hands such a struct over as a pointer.
-                    let reg_pair = self.target.arch == crate::target::Arch::X86_64
-                        && matches!(
-                            class,
-                            crate::abi::ArgClass::Direct { ref classes, .. }
-                                if classes.len() == 2
-                        );
-                    all_sse || reg_pair
+                    matches!(
+                        abi.classify_param(param.typ, self.types),
+                        crate::abi::ArgClass::Hfa { count, .. } if count >= 2
+                    )
                 };
+                let is_two_fp_regs = is_hfa_param
+                    || size > 64 && size <= 128 && {
+                        let abi = get_abi_for_conv(self.current_calling_conv, self.target);
+                        let class = abi.classify_param(param.typ, self.types);
+                        // Any all-SSE aggregate, whether that is two registers of
+                        // eight bytes or one of sixteen.
+                        let all_sse =
+                            matches!(
+                                class,
+                                crate::abi::ArgClass::Direct { ref classes, .. }
+                                    if !classes.is_empty()
+                                        && classes.iter().all(|c| *c == crate::abi::RegClass::Sse)
+                            ) || matches!(class, crate::abi::ArgClass::Hfa { count: 2, .. });
+                        // Two eightbytes of any classes -- both integer, or one of
+                        // each -- arrive in two registers on x86-64 as well. The
+                        // caller's half of this decision is gated the same way;
+                        // aarch64 still hands such a struct over as a pointer.
+                        let reg_pair = self.target.arch == crate::target::Arch::X86_64
+                            && matches!(
+                                class,
+                                crate::abi::ArgClass::Direct { ref classes, .. }
+                                    if classes.len() == 2
+                            );
+                        all_sse || reg_pair
+                    };
                 if is_two_fp_regs {
                     complex_params.push((
                         name,

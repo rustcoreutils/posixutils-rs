@@ -1231,3 +1231,65 @@ struct MI mkmi(void) { struct MI r; r.a = 1.5f; r.b = 2; return r; }
         "a mixed struct is not an HFA:\n{mi}"
     );
 }
+
+/// A half-precision HFA of eight bytes or fewer is packed in a register, not
+/// pointed at.
+///
+/// `struct { _Float16 a, b; }` is four bytes and became an HFA when half
+/// precision was admitted as a base type. The two-element return path then
+/// treated its source as an *address* -- correct for the sixteen-byte shapes it
+/// was written for, fatal here, because at this size the value sits in the
+/// register itself. It also stepped between elements by eight bytes, having no
+/// arm for a two-byte one.
+///
+/// The parameter side had the mirror problem: the prologue wrote both halves
+/// into the local and the linearizer's small-struct store then overwrote them,
+/// because the "arrives in registers" test was gated on size rather than on
+/// the class.
+#[test]
+fn codegen_aarch64_small_half_hfa_is_packed_not_addressed() {
+    let src = r#"
+struct H2 { _Float16 a, b; };
+struct F2 { float a, b; };          /* eight bytes, same shape */
+struct D2 { double a, b; };         /* sixteen: travels by address */
+
+struct H2 mkh2(void) { struct H2 r; r.a = 1.5f16; r.b = 2.5f16; return r; }
+_Float16 second(struct H2 s) { return s.b; }
+struct F2 mkf2(void) { struct F2 r; r.a = 1.5f; r.b = 2.5f; return r; }
+struct D2 mkd2(void) { struct D2 r; r.a = 1.5; r.b = 2.5; return r; }
+"#;
+    let asm = asm_for("aarch64_small_half_hfa", AARCH64_LINUX, src);
+
+    // The halves are shifted out of the packed register; nothing is loaded
+    // through it as though it held an address.
+    let mk = body_of(&asm, "mkh2");
+    assert!(
+        mk.contains("lsr") && mk.contains("fmov h0,"),
+        "a four-byte half HFA is unpacked from its register:\n{mk}"
+    );
+    assert!(
+        !mk.contains("ldr h0, [x0]"),
+        "and must not be dereferenced as an address:\n{mk}"
+    );
+
+    // The parameter's two halves survive: the prologue writes them and nothing
+    // overwrites them with a wider store.
+    let sec = body_of(&asm, "second");
+    assert!(
+        sec.contains("str h0,") && sec.contains("str h1,"),
+        "both halves reach the local:\n{sec}"
+    );
+    assert!(
+        !sec.contains("str s0,"),
+        "and are not overwritten by a four-byte store:\n{sec}"
+    );
+
+    // Controls: the eight- and sixteen-byte shapes still work their own way.
+    for name in ["mkf2", "mkd2"] {
+        let body = body_of(&asm, name);
+        assert!(
+            body.contains("0") && !body.is_empty(),
+            "{name} still emits a return sequence:\n{body}"
+        );
+    }
+}

@@ -1209,7 +1209,15 @@ impl RegAlloc {
             else {
                 continue;
             };
-            let is_longdouble = types.kind(*typ) == crate::types::TypeKind::LongDouble;
+            // `kind()` answers the *base* kind for a complex type, so without
+            // the guard `long double _Complex` satisfies this and takes the
+            // sixteen-byte branch below -- advancing the incoming cursor by
+            // half of its thirty-two, so every stack parameter after it was
+            // read sixteen bytes low. The COMPLEX_X87 branch meant for it is
+            // further down, and had been unreachable. Both sibling sites, in
+            // `call.rs` and `codegen.rs`, already exclude complex here.
+            let is_longdouble =
+                types.kind(*typ) == crate::types::TypeKind::LongDouble && !types.is_complex(*typ);
             let is_fp = types.is_float(*typ);
             let is_complex = types.is_complex(*typ);
             let sse_struct = crate::abi::sse_struct_regs(*typ, types);

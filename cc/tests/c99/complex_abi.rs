@@ -19,7 +19,7 @@
 // construction, argument passing, return, and round trips, for each base type.
 //
 
-use crate::common::compile_and_run;
+use crate::common::{compile_and_run, compile_and_run_optimized};
 
 /// #C1: `float _Complex` is one packed eightbyte, so it occupies a single
 /// XMM register. Passing it in two registers left the imaginary part in a
@@ -492,4 +492,61 @@ fn c99_assigning_a_real_to_a_complex_converts() {
         }
     "#;
     assert_eq!(compile_and_run("c99_real_to_complex_assign", src, &[]), 0);
+}
+
+/// A stack parameter after a `long double _Complex` is not read sixteen bytes
+/// low.
+///
+/// `long double _Complex` is COMPLEX_X87: thirty-two bytes on the stack. The
+/// allocator asked `kind()` whether the parameter was a `long double`, and that
+/// answers the *base* kind for a complex type, so it took the plain
+/// long-double branch and advanced the incoming-argument cursor by sixteen.
+/// Every parameter after it then landed on the complex's upper half, and each
+/// subsequent one was shifted a slot further.
+///
+/// Filed as not reproducible at -O2; it is. The original probe's callee was
+/// being inlined, which removes the ABI from the question entirely.
+#[test]
+fn c99_complex_long_double_then_stack_scalars() {
+    let src = r#"
+__attribute__((noinline))
+static void probe(long double _Complex v, long double re, long double im,
+                  long double *o)
+{
+    const long double *p = (const long double *)&v;
+    o[0] = p[0]; o[1] = p[1]; o[2] = re; o[3] = im;
+}
+
+__attribute__((noinline))
+static long double three(long double _Complex v, long double a, long double b,
+                         long double c)
+{ return a * 100 + b * 10 + c; }
+
+/* Two complexes back to back, then a scalar. */
+__attribute__((noinline))
+static long double after_two(long double _Complex u, long double _Complex v,
+                             long double a)
+{ return a; }
+
+int main(void)
+{
+    long double _Complex z = __builtin_complex(7.0L, 8.0L);
+    long double o[4];
+
+    probe(z, 1.5L, 2.5L, o);
+    if (o[0] != 7.0L || o[1] != 8.0L) return 1;   /* the complex itself */
+    if (o[2] != 1.5L) return 2;                   /* read the imag half */
+    if (o[3] != 2.5L) return 3;
+
+    if (three(z, 1.0L, 2.0L, 3.0L) != 123.0L) return 4;
+    if (after_two(z, z, 9.5L) != 9.5L) return 5;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_complex_ld_stack_scalars", src, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("c99_complex_ld_stack_scalars_opt", src),
+        0
+    );
 }

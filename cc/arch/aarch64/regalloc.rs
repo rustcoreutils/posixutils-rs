@@ -618,6 +618,67 @@ impl VReg {
 // Operand - Location of a value (register or memory)
 // ============================================================================
 
+/// A slot in the **callee's** frame -- a local, a spill slot, or an alloca.
+///
+/// Held as the negative displacement the backend expects, and only mintable by
+/// [`LocalSlot::alloc`], which does the negation. The two frame spaces used to
+/// be told apart by the *sign* of a bare `i32`; a refactor moved that negation
+/// into a pair of closures and updated only one, so the store side wrote to the
+/// caller's frame while the load side read the callee's. Both were valid
+/// `i32`s. Making them different types is what stops that recurring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LocalSlot(i32);
+
+impl LocalSlot {
+    /// Carve `size` bytes off the frame, growing `used`.
+    ///
+    /// `used` counts upwards; the slot is the negated result, so the caller
+    /// never sees -- or has to remember to apply -- the sign convention.
+    pub fn alloc(used: &mut i32, size: i32) -> Self {
+        debug_assert!(size > 0, "a frame slot needs a positive size");
+        *used += size;
+        LocalSlot(-*used)
+    }
+
+    /// Reconstruct a slot already carved earlier, e.g. by slot reuse.
+    pub fn from_displacement(displacement: i32) -> Self {
+        debug_assert!(
+            displacement < 0,
+            "a local slot lies below the frame pointer"
+        );
+        LocalSlot(displacement)
+    }
+
+    /// The displacement the addressing helpers work in.
+    pub fn displacement(self) -> i32 {
+        self.0
+    }
+}
+
+/// An offset into the **caller's** frame: an argument passed on the stack.
+///
+/// Starts at 16 -- past the saved frame pointer and return address -- and grows
+/// upwards, which is the opposite direction from [`LocalSlot`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct IncomingOff(i32);
+
+impl IncomingOff {
+    /// The first incoming stack argument, just above the saved FP and LR.
+    pub const FIRST: IncomingOff = IncomingOff(16);
+
+    /// This argument's offset, advancing `next` past it.
+    pub fn take(next: &mut IncomingOff, bytes: i32) -> Self {
+        let here = *next;
+        next.0 += (bytes + 7) & !7;
+        here
+    }
+
+    /// The displacement the addressing helpers work in.
+    pub fn displacement(self) -> i32 {
+        self.0
+    }
+}
+
 /// Location of a value
 #[derive(Debug, Clone, PartialEq)]
 pub enum Loc {
@@ -625,7 +686,8 @@ pub enum Loc {
     Reg(Reg),
     /// In a floating-point register
     VReg(VReg),
-    /// On the stack at [sp + offset] (positive offset from sp after allocation)
+    /// In the callee's frame: a local, a spill slot or an alloca. Addressed
+    /// below the frame pointer (or below X19 when the frame is over-aligned).
     Stack(i32),
     /// Immediate constant
     Imm(i128),
@@ -648,8 +710,12 @@ pub struct SpilledArg {
     pub from_gp_reg: Option<Reg>,
     /// The FP register the argument originally arrived in (if FP arg)
     pub from_fp_reg: Option<VReg>,
-    /// The stack offset where it was spilled to
-    pub to_stack_offset: i32,
+    /// The slot it was spilled to.
+    ///
+    /// Typed, because this is the value the M4 regression corrupted: the shared
+    /// helper hands the same raw counter to the location closure and to this
+    /// record, each of which used to negate it independently, and one did not.
+    pub to_stack_offset: LocalSlot,
     /// Bytes the value occupies.
     ///
     /// A `long double` is binary128 here, so an FP argument spilled across a
@@ -1152,7 +1218,10 @@ impl RegAlloc {
         let mut fp_arg_idx = 0usize;
         // Stack offset for overflow args — shared across all types because
         // AAPCS64 places stack args in parameter order.
-        let mut stack_arg_offset = 16i32;
+        // The caller's frame, typed so it cannot be confused with a local
+        // slot: it grows upwards from just past the saved FP and LR, where a
+        // `LocalSlot` grows downwards.
+        let mut next_incoming = IncomingOff::FIRST;
 
         // Consume the ABI contract through the shared AbiLowering helper.
         // AAPCS64 is simpler than SysV AMD64: no `_Complex`-vs-two-SSE-
@@ -1186,13 +1255,9 @@ impl RegAlloc {
                         self.free_fp_regs.retain(|&r| r != fp_arg_regs[fp_arg_idx]);
                         self.fp_pseudos.insert(pseudo);
                     } else {
-                        self.locations.insert(pseudo, Loc::Stack(stack_arg_offset));
+                        let at = IncomingOff::take(&mut next_incoming, (*size_bits / 8) as i32);
+                        self.locations.insert(pseudo, Loc::Stack(at.displacement()));
                         self.fp_pseudos.insert(pseudo);
-                        // A binary128 argument occupies two eightbytes on the
-                        // stack. Advancing by one put the next argument's slot
-                        // inside this one's upper half -- the caller stores
-                        // sixteen bytes, so they must be read back that way.
-                        stack_arg_offset += ((*size_bits / 8) as i32 + 7) & !7;
                     }
                     fp_arg_idx += 1;
                 }
@@ -1221,9 +1286,9 @@ impl RegAlloc {
                         self.fp_pseudos.insert(pseudo);
                         fp_arg_idx += count;
                     } else {
-                        self.locations.insert(pseudo, Loc::Stack(stack_arg_offset));
+                        let at = IncomingOff::take(&mut next_incoming, (count * elem_bytes) as i32);
+                        self.locations.insert(pseudo, Loc::Stack(at.displacement()));
                         self.fp_pseudos.insert(pseudo);
-                        stack_arg_offset += ((count * elem_bytes) as i32 + 7) & !7;
                         // AAPCS64 §6.4.2: once an argument is laid out on the
                         // stack, NSRN is set to 8 and every later
                         // floating-point argument follows it there — unlike
@@ -1246,8 +1311,8 @@ impl RegAlloc {
                         });
                     } else {
                         // Overflow: 16 bytes on caller stack.
-                        self.locations.insert(pseudo, Loc::Stack(stack_arg_offset));
-                        stack_arg_offset += 16;
+                        let at = IncomingOff::take(&mut next_incoming, 16);
+                        self.locations.insert(pseudo, Loc::Stack(at.displacement()));
                     }
                     int_arg_idx += 2;
                 }
@@ -1263,8 +1328,8 @@ impl RegAlloc {
                             .insert(pseudo, Loc::Reg(int_arg_regs[int_arg_idx]));
                         self.free_regs.retain(|&r| r != int_arg_regs[int_arg_idx]);
                     } else {
-                        self.locations.insert(pseudo, Loc::Stack(stack_arg_offset));
-                        stack_arg_offset += 8;
+                        let at = IncomingOff::take(&mut next_incoming, 8);
+                        self.locations.insert(pseudo, Loc::Stack(at.displacement()));
                     }
                     int_arg_idx += 1;
                 }
@@ -1308,19 +1373,15 @@ impl RegAlloc {
             },
             |off| Loc::Stack(-off),
             |pseudo, from_reg, to_stack_offset| {
-                // M4 regression fix: the shared helper passes the raw
-                // (positive) stack_offset; aarch64's codegen expects
-                // NEGATIVE offsets for spill slots (per the comment at
-                // `store_spilled_args`). Negate here to match the
-                // `mk_stack_loc` closure above. Without this, prolog
-                // stores landed at `frame_size + offset - 16` (the
-                // incoming-stack-arg region) rather than the local
-                // frame, corrupting the caller's stack.
+                // The shared helper hands both closures the same raw counter.
+                // `LocalSlot` applies the sign once, so this record and the
+                // location cannot disagree about which frame they name -- the
+                // M4 regression was exactly that disagreement.
                 spilled_args.push(SpilledArg {
                     pseudo,
                     from_gp_reg: Some(from_reg),
                     from_fp_reg: None,
-                    to_stack_offset: -to_stack_offset,
+                    to_stack_offset: LocalSlot::from_displacement(-to_stack_offset),
                     bytes: 8,
                 });
             },
@@ -1338,20 +1399,19 @@ impl RegAlloc {
                     // argument is sixteen bytes, and eight left half of it
                     // overlapping whatever came next.
                     let bytes = fp_arg_bytes(func, interval.pseudo, types);
-                    self.stack_offset += bytes;
-                    let to_stack_offset = -self.stack_offset;
+                    let slot = LocalSlot::alloc(&mut self.stack_offset, bytes);
 
                     // Record the spill for codegen to emit stores in prologue
                     self.spilled_args.push(SpilledArg {
                         pseudo: interval.pseudo,
                         from_gp_reg: None,
                         from_fp_reg: Some(from_reg),
-                        to_stack_offset,
+                        to_stack_offset: slot,
                         bytes,
                     });
 
                     self.locations
-                        .insert(interval.pseudo, Loc::Stack(to_stack_offset));
+                        .insert(interval.pseudo, Loc::Stack(slot.displacement()));
                     self.free_fp_regs.push(from_reg);
                 }
             }

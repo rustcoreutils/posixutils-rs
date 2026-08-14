@@ -1029,12 +1029,11 @@ impl Aarch64CodeGen {
     /// Emit stores for arguments spilled from caller-saved registers to stack
     fn store_spilled_args(&mut self, alloc: &RegAlloc) {
         for spilled in alloc.spilled_args() {
-            // spilled.to_stack_offset is negative (e.g., -8, -16, etc.)
             if let Some(gp_reg) = spilled.from_gp_reg {
                 self.push_lir(Aarch64Inst::Str {
                     size: OperandSize::B64,
                     src: gp_reg,
-                    addr: self.stack_mem(spilled.to_stack_offset),
+                    addr: self.stack_mem(spilled.to_stack_offset.displacement()),
                 });
             } else if let Some(fp_reg) = spilled.from_fp_reg {
                 // The recorded width, not a fixed eight bytes: `long double` is
@@ -1046,7 +1045,7 @@ impl Aarch64CodeGen {
                         FpSize::Double
                     },
                     src: fp_reg,
-                    addr: self.stack_mem(spilled.to_stack_offset),
+                    addr: self.stack_mem(spilled.to_stack_offset.displacement()),
                 });
             }
         }

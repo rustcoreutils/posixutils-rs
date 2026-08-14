@@ -1702,9 +1702,16 @@ impl<'a> Linearizer<'a> {
         }
         let typ = self.expr_type(expr);
         let val = self.linearize_expr(expr);
-        // A `Sym`'s slot holds the value itself; anything else already holds a
-        // pointer to it. Deciding here, where the pseudo's kind is known, is
-        // what lets every consumer treat the result as a plain address.
+        self.rvalue_addr(val, typ)
+    }
+
+    /// The address of a value that has just been materialized.
+    ///
+    /// A `Sym`'s slot holds the value itself; anything else already holds a
+    /// pointer to it. Deciding here, where the pseudo's kind is known, is what
+    /// lets every consumer treat the result as a plain address -- handing one
+    /// the value's own bits instead gets them dereferenced as an address.
+    pub(crate) fn rvalue_addr(&mut self, val: PseudoId, typ: TypeId) -> PseudoId {
         let slot_is_the_value = self
             .current_func
             .as_ref()
@@ -2027,8 +2034,18 @@ impl<'a> Linearizer<'a> {
                 result
             }
             _ => {
-                // Fallback: just evaluate the expression (shouldn't happen for valid lvalues)
-                self.linearize_expr(expr)
+                // Not a designator -- a call returning a struct, a comma, a
+                // conditional. Evaluating it yields the *value*; a consumer
+                // that loads or stores folds the offset in and reads the right
+                // bytes, but one that does arithmetic -- indexing an array
+                // member, taking an address -- would dereference the value's
+                // own bits. Materialize it and hand back its address instead.
+                //
+                // The temporary is a function-scope local, so it outlives the
+                // full expression as C17 6.5.2.3p5 requires.
+                let typ = self.expr_type(expr);
+                let val = self.linearize_expr(expr);
+                self.rvalue_addr(val, typ)
             }
         }
     }
@@ -2892,34 +2909,11 @@ impl<'a> Linearizer<'a> {
                         arg_types_vec.push(self.types.pointer_to(arg_type));
                     }
                 }
-                // For lvalue expressions (identifiers, member access), linearize_lvalue
-                // returns a symaddr (pointer). For rvalue expressions (call results),
-                // linearize_lvalue falls through to linearize_expr which returns the
-                // data pseudo, not its address. In that case we must emit a symaddr
-                // to get the address for pointer-based struct passing.
-                let is_lvalue = matches!(
-                    a.kind,
-                    ExprKind::Ident(_)
-                        | ExprKind::Member { .. }
-                        | ExprKind::Arrow { .. }
-                        | ExprKind::Index { .. }
-                        | ExprKind::Unary {
-                            op: crate::parse::ast::UnaryOp::Deref,
-                            ..
-                        }
-                        | ExprKind::CompoundLiteral { .. }
-                );
-                if is_lvalue {
-                    self.linearize_lvalue(a)
-                } else {
-                    // Rvalue (e.g., function call returning struct): evaluate,
-                    // then take address of the result local
-                    let val = self.linearize_expr(a);
-                    let result = self.alloc_reg_pseudo();
-                    let ptr_type = self.types.pointer_to(arg_type);
-                    self.emit(Instruction::sym_addr(result, val, ptr_type));
-                    result
-                }
+                // A struct argument travels by address. `linearize_lvalue`
+                // now materializes an rvalue -- a call returning a struct --
+                // and hands back the temporary's address, so both cases are
+                // the same call; this used to open-code the rvalue half.
+                self.linearize_lvalue(a)
             } else if self.types.is_complex(arg_type) {
                 // Complex types: pass address, codegen loads real/imag into XMM registers
                 // Type stays as complex (not pointer) so codegen knows it's complex.

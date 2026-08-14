@@ -201,7 +201,21 @@ impl Aarch64CodeGen {
                         }
                 });
             let uses_two_fp_regs = is_complex || is_hfa_two;
-            let is_fp = if let Some(typ) = arg_type {
+            // A one-element HFA -- `struct { float v; }`, and every shape that
+            // became one when arrays and half precision were admitted -- goes
+            // in a single V register, exactly as the bare scalar does. Only the
+            // two-element case was recognised here, so the rest went out in a
+            // general register while the callee, which does ask the ABI, read
+            // V0; and every floating argument after it was shifted a register
+            // along.
+            let is_hfa_one = arg_type.is_some_and(|t| {
+                let abi =
+                    crate::abi::get_abi_for_conv(crate::abi::CallingConv::C, &self.base.target);
+                matches!(abi.classify_param(t, types), ArgClass::Hfa { count: 1, .. })
+            });
+            let is_fp = if is_hfa_one {
+                true
+            } else if let Some(typ) = arg_type {
                 types.is_float(typ)
             } else {
                 let arg_loc = self.get_location(arg);

@@ -1334,3 +1334,49 @@ long v_cx(double _Complex z, ...)
         "__vr_offs must be -96 (two V registers taken):\n{body}"
     );
 }
+
+/// A one-element HFA argument goes in a V register on aarch64.
+///
+/// The caller recognised only the two-element case, so every shape that is an
+/// HFA of *one* element -- `struct { float v; }`, and everything that became
+/// one when array members and half precision were admitted -- went out in a
+/// general register. The callee does ask the ABI, so it read V0; and each
+/// floating argument after it was shifted a register along, which is how a
+/// variadic call whose named parameter was such a struct went wrong.
+#[test]
+fn codegen_aarch64_one_element_hfa_argument_uses_a_v_register() {
+    let src = r#"
+struct F1 { float v; };
+struct D1 { double v; };
+struct I1 { int v; };            /* control: not an HFA */
+
+extern long sink_f1(struct F1, double);
+extern long sink_d1(struct D1, double);
+extern long sink_i1(struct I1, double);
+
+long c_f1(struct F1 s) { return sink_f1(s, 5.0); }
+long c_d1(struct D1 s) { return sink_d1(s, 5.0); }
+long c_i1(struct I1 s) { return sink_i1(s, 5.0); }
+"#;
+    let asm = asm_for("aarch64_hfa1_arg", AARCH64_LINUX, src);
+
+    // The struct takes V0, so the double that follows it takes V1.
+    for (name, first) in [("c_f1", "s0"), ("c_d1", "d0")] {
+        let body = body_of(&asm, name);
+        assert!(
+            body.contains(&format!("fmov {first},")),
+            "{name} passes its HFA argument in V0:\n{body}"
+        );
+        assert!(
+            body.contains("d1,"),
+            "{name} passes the following double in V1:\n{body}"
+        );
+    }
+    // A non-HFA struct still goes in a general register, and the double after
+    // it is then the first floating argument.
+    let i1 = body_of(&asm, "c_i1");
+    assert!(
+        !i1.contains("d1,"),
+        "an integer struct leaves V0 for the double after it:\n{i1}"
+    );
+}

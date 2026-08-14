@@ -1175,3 +1175,59 @@ int      c_i2(struct I2 s) { return s_i2(s); }
         );
     }
 }
+
+/// aarch64 recognises an HFA whose members are arrays, and half precision as a
+/// base type.
+///
+/// `try_classify_hfa` recursed into a nested *struct* but not into an array
+/// member, and its array arm was reachable only for a top-level array type,
+/// which C never forms. So `struct { float v[1]; }` was rejected as holding a
+/// non-floating field and went back in a general register. `_Float16` was not
+/// among the accepted base types either, though AAPCS64 admits half precision.
+///
+/// Filed against `long double v[1]` and `_Float16`; every array-member shape
+/// was affected, including `struct { float v[1]; }` and `struct { double v[2]; }`.
+#[test]
+fn codegen_aarch64_hfa_accepts_arrays_and_half_precision() {
+    let src = r#"
+struct FA { float v[1]; };
+struct DA { double v[2]; };
+struct LA { long double v[1]; };
+struct H1 { _Float16 v; };
+struct H2 { _Float16 a, b; };
+struct F2 { float a, b; };        /* control: already an HFA */
+struct MI { float a; int b; };    /* control: not an HFA at all */
+
+struct FA mkfa(void) { struct FA r; r.v[0] = 1.5f; return r; }
+struct DA mkda(void) { struct DA r; r.v[0] = 1.5; r.v[1] = 2.5; return r; }
+struct LA mkla(void) { struct LA r; r.v[0] = 1.5L; return r; }
+struct H1 mkh1(void) { struct H1 r; r.v = 1.5f16; return r; }
+struct H2 mkh2(void) { struct H2 r; r.a = 1.5f16; r.b = 2.5f16; return r; }
+struct F2 mkf2(void) { struct F2 r; r.a = 1.5f; r.b = 2.5f; return r; }
+struct MI mkmi(void) { struct MI r; r.a = 1.5f; r.b = 2; return r; }
+"#;
+    let asm = asm_for("aarch64_hfa_arrays", AARCH64_LINUX, src);
+
+    // Each returns through V0, at its own element width.
+    for (name, marker) in [
+        ("mkfa", "s0"),
+        ("mkda", "d0"),
+        ("mkla", "q0"),
+        ("mkh1", "h0"),
+        ("mkh2", "h0"),
+        ("mkf2", "s0"),
+    ] {
+        let body = body_of(&asm, name);
+        assert!(
+            body.contains(marker),
+            "{name} is an HFA and returns through V0 (looking for `{marker}`):\n{body}"
+        );
+    }
+    // A struct mixing a float with an int is not homogeneous, so it keeps the
+    // general-register return.
+    let mi = body_of(&asm, "mkmi");
+    assert!(
+        mi.contains("x0") || mi.contains("w0"),
+        "a mixed struct is not an HFA:\n{mi}"
+    );
+}

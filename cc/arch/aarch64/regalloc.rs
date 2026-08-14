@@ -1208,6 +1208,7 @@ impl RegAlloc {
                 ArgClass::Hfa { base, count } => {
                     let count = *count as usize;
                     let elem_bytes = match base {
+                        HfaBase::Float16 => 2,
                         HfaBase::Float32 => 4,
                         HfaBase::Float64 => 8,
                         HfaBase::Float128 => 16,

@@ -569,6 +569,7 @@ impl Aarch64CodeGen {
         let abi = crate::abi::get_abi_for_conv(crate::abi::CallingConv::C, &self.base.target);
         let (fp_size, elem_offset) = match abi.classify_param(typ, types) {
             ArgClass::Hfa { base, .. } => match base {
+                HfaBase::Float16 => (FpSize::Half, 2),
                 HfaBase::Float32 => (FpSize::Single, 4),
                 HfaBase::Float64 => (FpSize::Double, 8),
                 HfaBase::Float128 => (FpSize::Quad, 16),
@@ -846,6 +847,7 @@ impl Aarch64CodeGen {
     /// Handle HFA (Homogeneous Floating-Point Aggregate) return (V0-V3)
     fn handle_hfa_return(&mut self, dst_loc: &Loc, count: u8, base: HfaBase) {
         let (fp_size, elem_size) = match base {
+            HfaBase::Float16 => (FpSize::Half, 2),
             HfaBase::Float32 => (FpSize::Single, 4),
             HfaBase::Float64 => (FpSize::Double, 8),
             HfaBase::Float128 => (FpSize::Quad, 16),

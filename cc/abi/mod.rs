@@ -77,6 +77,8 @@ impl RegClass {
 /// Base type for Homogeneous Floating-Point Aggregate (HFA) on AAPCS64.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HfaBase {
+    /// 16-bit half precision (`_Float16`).
+    Float16,
     /// 32-bit float
     Float32,
     /// 64-bit double

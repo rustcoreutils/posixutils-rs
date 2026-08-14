@@ -848,6 +848,7 @@ impl X86_64CodeGen {
                 }
                 // For other HFA cases, treat as FP return
                 let size_bits = match base {
+                    crate::abi::HfaBase::Float16 => 16,
                     crate::abi::HfaBase::Float32 => 32,
                     crate::abi::HfaBase::Float64 => 64,
                     // System V has no HFA concept and `long double` is x87

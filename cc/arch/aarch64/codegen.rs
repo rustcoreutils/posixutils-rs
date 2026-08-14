@@ -1059,6 +1059,7 @@ impl Aarch64CodeGen {
         let abi = get_abi_for_conv(CallingConv::C, &self.base.target);
         match abi.classify_param(typ, types) {
             ArgClass::Hfa { base, .. } => match base {
+                HfaBase::Float16 => (FpSize::Half, 2),
                 HfaBase::Float32 => (FpSize::Single, 4),
                 HfaBase::Float64 => (FpSize::Double, 8),
                 HfaBase::Float128 => (FpSize::Quad, 16),
@@ -1322,6 +1323,7 @@ impl Aarch64CodeGen {
                                 use crate::abi::HfaBase;
                                 Some((
                                     match base {
+                                        HfaBase::Float16 => FpSize::Half,
                                         HfaBase::Float32 => FpSize::Single,
                                         HfaBase::Float64 => FpSize::Double,
                                         HfaBase::Float128 => FpSize::Quad,

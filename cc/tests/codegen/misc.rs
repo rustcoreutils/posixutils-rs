@@ -7529,6 +7529,14 @@ double v_d3(int n, ...) { va_list ap; va_start(ap, n);
     D3 v = va_arg(ap, D3); double t = va_arg(ap, double); va_end(ap);
     return v.a * 100 + v.b * 10 + v.c + t; }
 
+int printf(const char *, ...);
+
+/* Traced, because this runs on a target that cannot be run locally: a crash
+   loses the return code, so the log has to show how far it got and with what
+   value. `T` prints before the call, `=` after it. */
+#define T(n) printf("try " n "\n")
+#define G(n, g) printf("got " n " %.1f\n", (double)(g))
+
 int main(void) {
     F2 f2 = {1, 2};
     F3 f3 = {1, 2, 3};
@@ -7536,11 +7544,11 @@ int main(void) {
     D2 d2 = {1, 2};
     D3 d3 = {1, 2, 3};
 
-    if (v_f2(1, f2, 5.0) != 17) return 1;
-    if (v_f3(1, f3, 5.0) != 128) return 2;
-    if (v_f4(1, f4, 5.0) != 1239) return 3;
-    if (v_d2(1, d2, 5.0) != 17) return 4;
-    if (v_d3(1, d3, 5.0) != 128) return 5;
+    T("f2"); { double g = v_f2(1, f2, 5.0); G("f2", g); if (g != 17) return 1; }
+    T("f3"); { double g = v_f3(1, f3, 5.0); G("f3", g); if (g != 128) return 2; }
+    T("f4"); { double g = v_f4(1, f4, 5.0); G("f4", g); if (g != 1239) return 3; }
+    T("d2"); { double g = v_d2(1, d2, 5.0); G("d2", g); if (g != 17) return 4; }
+    T("d3"); { double g = v_d3(1, d3, 5.0); G("d3", g); if (g != 128) return 5; }
     return 0;
 }
 "#;
@@ -7573,6 +7581,8 @@ typedef struct { long a, b; }           L2;   /* two general-register slots */
 typedef struct { long a, b, c; }        L3;   /* over 16 bytes: passed by pointer */
 typedef struct { char a, b, c; }        C3;   /* three bytes: fits a register */
 typedef struct { char a, b, c, d, e; }  C5;   /* five bytes: not a power of two */
+
+int printf(const char *, ...);
 
 double g_f2(int n, ...) { va_list ap; va_start(ap, n);
     F2 v = va_arg(ap, F2); va_end(ap); return (double)(v.a * 10 + v.b); }
@@ -7610,15 +7620,19 @@ int main(void) {
     L2 l2 = {1, 2};
     L3 l3 = {1, 2, 3};
 
-    /* all live in one function: this is what used to fall over */
-    if (g_f2(0, f2) != 12) return 1;
-    if (g_f3(0, f3) != 123) return 2;
-    if (g_f4(0, f4) != 1234) return 3;
-    if (g_d2(0, d2) != 12) return 4;
-    if (g_d3(0, d3) != 123) return 5;
-    if (g_l2(0, l2) != 12) return 6;
-    if (g_l3(0, l3) != 123) return 7;
-    if (g_two(0, f4, d2) != 1246) return 8;
+    /* all live in one function: this is what used to fall over. Traced
+       because this runs on a target that cannot be run locally -- a crash
+       loses the return code, so the log has to show which shape it died on. */
+#define T(n) printf("try " n "\n")
+#define G(n, g) printf("got " n " %.1f\n", (double)(g))
+    T("f2"); { double g = g_f2(0, f2); G("f2", g); if (g != 12) return 1; }
+    T("f3"); { double g = g_f3(0, f3); G("f3", g); if (g != 123) return 2; }
+    T("f4"); { double g = g_f4(0, f4); G("f4", g); if (g != 1234) return 3; }
+    T("d2"); { double g = g_d2(0, d2); G("d2", g); if (g != 12) return 4; }
+    T("d3"); { double g = g_d3(0, d3); G("d3", g); if (g != 123) return 5; }
+    T("l2"); { long g = g_l2(0, l2); G("l2", g); if (g != 12) return 6; }
+    T("l3"); { long g = g_l3(0, l3); G("l3", g); if (g != 123) return 7; }
+    T("two"); { double g = g_two(0, f4, d2); G("two", g); if (g != 1246) return 8; }
     /* an aggregate that fits in a register is one load, not a chunked copy:
        chunking wrote each piece over the last and kept only the final byte */
     if (g_c3(0, c3) != 123) return 9;

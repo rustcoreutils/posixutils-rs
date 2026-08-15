@@ -11,7 +11,7 @@
 //
 
 use crate::float::FpFormat;
-use crate::strings::StringId;
+use crate::strings::{StringId, StringTable as IdentTable};
 use crate::target::{Arch, Os, Target};
 use std::collections::HashMap;
 use std::fmt;
@@ -607,6 +607,43 @@ enum TypeKey {
     },
 }
 
+/// Why a pair of operands fails the simple-assignment constraints of C17
+/// 6.5.16.1p1.
+///
+/// The split into fatal and non-fatal follows gcc: a conversion that does not
+/// exist at all is an error, while one that exists but is almost certainly a
+/// mistake is a warning. Matching that split is what lets code which builds
+/// today keep building.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AssignFault {
+    /// No conversion exists: a pointer against a floating type, an aggregate
+    /// against anything but a compatible aggregate, or a `void` value.
+    Incompatible,
+    /// An integer where a pointer belongs, or the reverse, with no cast.
+    IntegerPointerMix,
+    /// Two pointers whose referenced types are not compatible.
+    PointerMismatch,
+    /// The target's referenced type drops a qualifier the source's had.
+    QualifierDiscard,
+}
+
+impl AssignFault {
+    /// Whether this fault is fatal. Only a missing conversion is.
+    pub fn is_error(self) -> bool {
+        self == AssignFault::Incompatible
+    }
+
+    /// The clause naming what went wrong, as gcc words it.
+    pub fn describe(self) -> &'static str {
+        match self {
+            AssignFault::Incompatible => "incompatible types",
+            AssignFault::IntegerPointerMix => "makes integer from pointer without a cast",
+            AssignFault::PointerMismatch => "incompatible pointer type",
+            AssignFault::QualifierDiscard => "discards a qualifier from the pointer target type",
+        }
+    }
+}
+
 const DEFAULT_TYPE_TABLE_CAPACITY: usize = 65536;
 
 /// Type table - stores all types and provides ID-based lookup
@@ -890,14 +927,15 @@ impl TypeTable {
     }
 
     /// Get composite type data (for struct/union/enum)
-    #[cfg(test)]
     pub fn composite(&self, id: TypeId) -> Option<&CompositeType> {
         self.get(id).composite.as_deref()
     }
 
-    /// Format a type for display (with recursive base type printing)
-    #[cfg(test)]
-    pub fn format_type(&self, id: TypeId) -> String {
+    /// Format a type for display (with recursive base type printing).
+    ///
+    /// Used by diagnostics that have to name the types they are complaining
+    /// about -- an assignment constraint violation is unreadable without them.
+    pub fn format_type(&self, id: TypeId, idents: Option<&IdentTable>) -> String {
         let typ = self.get(id);
         let mut result = String::new();
 
@@ -917,7 +955,7 @@ impl TypeTable {
         match typ.kind {
             TypeKind::Pointer => {
                 if let Some(base) = typ.base {
-                    result.push_str(&self.format_type(base));
+                    result.push_str(&self.format_type(base, idents));
                     result.push('*');
                 } else {
                     result.push('*');
@@ -925,7 +963,7 @@ impl TypeTable {
             }
             TypeKind::Array => {
                 if let Some(base) = typ.base {
-                    result.push_str(&self.format_type(base));
+                    result.push_str(&self.format_type(base, idents));
                     if let Some(size) = typ.array_size {
                         result.push_str(&format!("[{}]", size));
                     } else {
@@ -937,14 +975,14 @@ impl TypeTable {
             }
             TypeKind::Function => {
                 if let Some(ret) = typ.base {
-                    result.push_str(&self.format_type(ret));
+                    result.push_str(&self.format_type(ret, idents));
                     result.push('(');
                     if let Some(params) = &typ.params {
                         for (i, &param) in params.iter().enumerate() {
                             if i > 0 {
                                 result.push_str(", ");
                             }
-                            result.push_str(&self.format_type(param));
+                            result.push_str(&self.format_type(param, idents));
                         }
                         if typ.variadic {
                             if !params.is_empty() {
@@ -956,6 +994,17 @@ impl TypeTable {
                     result.push(')');
                 } else {
                     result.push_str("()");
+                }
+            }
+            TypeKind::Struct | TypeKind::Union | TypeKind::Enum => {
+                result.push_str(&typ.kind.to_string());
+                // The tag is what tells one struct from another, and an
+                // assignment diagnostic naming neither is unreadable.
+                if let (Some(comp), Some(idents)) = (typ.composite.as_deref(), idents) {
+                    if let Some(tag) = comp.tag {
+                        result.push(' ');
+                        result.push_str(idents.get(tag));
+                    }
                 }
             }
             _ => {
@@ -1066,6 +1115,124 @@ impl TypeTable {
     #[inline]
     pub fn is_arithmetic(&self, id: TypeId) -> bool {
         self.is_integer(id) || self.is_float(id) || self.is_complex(id)
+    }
+
+    /// How a type participates in an assignment.
+    ///
+    /// C17 6.3.2.1p3-4 converts an array to a pointer to its element and a
+    /// function to a pointer to itself before anything else looks at it.
+    /// Reported as a kind plus the referenced type rather than by interning a
+    /// pointer, so a caller holding the table immutably can still ask.
+    fn as_assigned(&self, id: TypeId) -> (TypeKind, Option<TypeId>) {
+        match self.kind(id) {
+            TypeKind::Array => (TypeKind::Pointer, self.base_type(id)),
+            TypeKind::Function => (TypeKind::Pointer, Some(id)),
+            TypeKind::Pointer => (TypeKind::Pointer, self.base_type(id)),
+            other => (other, None),
+        }
+    }
+
+    /// Check a value against the type it is being assigned to (C17
+    /// 6.5.16.1p1). `None` means the assignment is allowed.
+    ///
+    /// The same constraints govern `return` and argument passing, which the
+    /// standard defines as conversion "as if by assignment", so all three
+    /// contexts ask this and differ only in how they word the answer.
+    pub fn assignment_fault(
+        &self,
+        target: TypeId,
+        value: TypeId,
+        value_is_null_constant: bool,
+    ) -> Option<AssignFault> {
+        let (t_kind, t_pointee) = self.as_assigned(target);
+        let (v_kind, v_pointee) = self.as_assigned(value);
+
+        // A `void` expression has no value to assign.
+        if v_kind == TypeKind::Void {
+            return Some(AssignFault::Incompatible);
+        }
+        // Nothing is known about the target -- an earlier diagnostic already
+        // fired, or this is a context the checker does not model.
+        if t_kind == TypeKind::Void {
+            return None;
+        }
+
+        let t_ptr = t_kind == TypeKind::Pointer;
+        let v_ptr = v_kind == TypeKind::Pointer;
+        let t_agg = matches!(t_kind, TypeKind::Struct | TypeKind::Union);
+        let v_agg = matches!(v_kind, TypeKind::Struct | TypeKind::Union);
+
+        // An aggregate assigns only from a compatible aggregate. Compared
+        // through `types_compatible` rather than by TypeId, because struct and
+        // union types are deliberately not deduplicated -- they have identity.
+        if t_agg || v_agg {
+            let ok = t_agg && v_agg && self.types_compatible(target, value);
+            return (!ok).then_some(AssignFault::Incompatible);
+        }
+
+        if t_ptr && v_ptr {
+            let (Some(t_pointee), Some(v_pointee)) = (t_pointee, v_pointee) else {
+                return None;
+            };
+            // `void *` converts to and from any object pointer (6.5.16.1p1).
+            if self.kind(t_pointee) == TypeKind::Void || self.kind(v_pointee) == TypeKind::Void {
+                return None;
+            }
+            if !self.types_compatible(t_pointee, v_pointee) {
+                return Some(AssignFault::PointerMismatch);
+            }
+            // Compatible targets, but the assignment must not silently gain
+            // write access: the target's qualifiers have to include the
+            // source's.
+            const QUALS: TypeModifiers = TypeModifiers::CONST
+                .union(TypeModifiers::VOLATILE)
+                .union(TypeModifiers::RESTRICT)
+                .union(TypeModifiers::ATOMIC);
+            let t_quals = self.modifiers(t_pointee) & QUALS;
+            let v_quals = self.modifiers(v_pointee) & QUALS;
+            return (!t_quals.contains(v_quals)).then_some(AssignFault::QualifierDiscard);
+        }
+
+        if t_ptr {
+            // A null pointer constant is spelled as an integer, and is allowed.
+            if value_is_null_constant {
+                return None;
+            }
+            return Some(if self.is_integer(value) {
+                AssignFault::IntegerPointerMix
+            } else {
+                AssignFault::Incompatible
+            });
+        }
+
+        if v_ptr {
+            // `_Bool b = p` is explicitly permitted: it asks whether the
+            // pointer is null.
+            if t_kind == TypeKind::Bool {
+                return None;
+            }
+            return Some(if self.is_integer(target) {
+                AssignFault::IntegerPointerMix
+            } else {
+                AssignFault::Incompatible
+            });
+        }
+
+        None
+    }
+
+    /// The type an array or function has in an expression: C17 6.3.2.1p3-4
+    /// converts an array to a pointer to its first element and a function to a
+    /// pointer to itself. Every other type is its own.
+    pub fn decayed(&mut self, typ: TypeId) -> TypeId {
+        match self.kind(typ) {
+            TypeKind::Array => {
+                let elem = self.base_type(typ).unwrap_or(self.char_id);
+                self.intern(Type::pointer(elem))
+            }
+            TypeKind::Function => self.intern(Type::pointer(typ)),
+            _ => typ,
+        }
     }
 
     /// Check if type is a scalar type (arithmetic or pointer)
@@ -1566,8 +1733,8 @@ mod tests {
     #[test]
     fn test_type_format() {
         let types = TypeTable::new(&Target::host());
-        assert_eq!(types.format_type(types.int_id), "int");
-        assert_eq!(types.format_type(types.uint_id), "unsigned int");
+        assert_eq!(types.format_type(types.int_id, None), "int");
+        assert_eq!(types.format_type(types.uint_id, None), "unsigned int");
     }
 
     #[test]

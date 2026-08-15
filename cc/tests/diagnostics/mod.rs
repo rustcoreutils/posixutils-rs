@@ -1053,3 +1053,144 @@ int main(void) {
 "#;
     compile_expect_ok("ordinary_lvalues", src);
 }
+
+// ==== assignment compatibility (C17 6.5.16.1, and 6.8.6.4p3 / 6.5.2.2p2) ====
+
+/// Simple assignment, `return`, and argument passing share one set of
+/// constraints: the standard defines the latter two as conversion "as if by
+/// assignment". None of the three checked anything, so `int *p; p = 1.5;`
+/// compiled to a `cvttsd2si` and left the pointer holding 1.
+///
+/// The severity split follows gcc exactly -- a conversion that does not exist
+/// is an error, one that exists but is almost certainly a mistake is a warning
+/// -- because that is what lets code which builds today keep building.
+#[test]
+fn diagnostics_incompatible_assignment_is_rejected() {
+    for (name, src, expected) in [
+        (
+            "assign_ptr_from_double",
+            "void f(void){ int *p; double d = 0; p = d; }\n",
+            "incompatible types when assigning",
+        ),
+        (
+            "assign_double_from_ptr",
+            "void f(void){ double d; int *p = 0; d = p; }\n",
+            "incompatible types when assigning",
+        ),
+        (
+            "assign_struct_from_other_struct",
+            "struct A{int x;}; struct B{int x;};\nvoid f(void){ struct A a; struct B b; a = b; }\n",
+            "from type 'struct B'",
+        ),
+        (
+            "assign_struct_from_int",
+            "struct A{int x;};\nvoid f(void){ struct A a; int i = 0; a = i; }\n",
+            "incompatible types when assigning",
+        ),
+        (
+            "assign_from_void_call",
+            "void v(void);\nvoid f(void){ int i; i = v(); }\n",
+            "void value not ignored",
+        ),
+        (
+            "return_ptr_from_double",
+            "int *f(void){ return 1.5; }\n",
+            "incompatible types returning",
+        ),
+        (
+            "return_struct_mismatch",
+            "struct A{int x;}; struct B{int x;};\nstruct A f(void){ struct B b; return b; }\n",
+            "incompatible types returning",
+        ),
+        (
+            "argument_ptr_from_double",
+            "int g(int *);\nvoid f(void){ g(1.5); }\n",
+            "incompatible type for argument 1",
+        ),
+        (
+            "argument_struct_mismatch",
+            "struct A{int x;}; struct B{int x;};\nint g(struct A);\nvoid f(void){ struct B b; g(b); }\n",
+            "incompatible type for argument 1",
+        ),
+    ] {
+        compile_expect_error(name, src, expected);
+    }
+}
+
+/// Every conversion C17 6.5.16.1p1 permits must still compile -- and the
+/// carve-outs are the ones that matter, because a check written from the types
+/// alone would reject them. `p = 0` uses a null pointer constant, which is
+/// spelled as an integer; `_Bool b = p` asks whether a pointer is null; and
+/// `void *` converts both ways.
+#[test]
+fn diagnostics_permitted_assignments_are_accepted() {
+    let src = r#"
+struct A { int x; };
+typedef int (*FP)(void);
+
+int g(int *);
+int h(int, double);
+int fn(void);
+
+int *ret_null(void) { return 0; }
+void *ret_void_ptr(void) { int *p = 0; return p; }
+const char *ret_lit(void) { return "hi"; }
+FP ret_fn(void) { return fn; }
+double ret_widened(void) { return 1; }
+
+void f(void) {
+    int i; double d; _Bool b;
+    int *p; const int *cp; void *v; char buf[4];
+    struct A a1, a2;
+
+    i = d;  d = i;              /* arithmetic converts freely */
+    p = 0;                      /* null pointer constant */
+    p = (void *)0;
+    b = p;                      /* 6.5.16.1p1: _Bool from a pointer */
+    p = v;  v = p;              /* void * either way */
+    cp = p;                     /* adding a qualifier is fine */
+    p = buf;                    /* an array decays */
+    a1 = a2;                    /* identical struct types */
+
+    (void)g(0);
+    (void)g(p);
+    (void)h(1, 2.0);
+    (void)i; (void)cp; (void)b;
+}
+"#;
+    compile_expect_ok("permitted_assignments", src);
+}
+
+/// glibc declares the socket calls with a union parameter carrying
+/// `__attribute__((transparent_union))`, so a caller may hand them any one of
+/// its member types. c17 does not record that attribute, and the first cut of
+/// the argument check rejected `sendto(..., SAS2SA(&addr), ...)` -- two lines
+/// of CPython's socketmodule.c, and with them every socket program on the
+/// platform.
+///
+/// An argument matching some member of a union parameter is therefore
+/// accepted. This pins both the real header call and the synthetic shape
+/// behind it, so that implementing the attribute properly has something to
+/// tighten against.
+#[test]
+fn diagnostics_union_parameter_accepts_a_member_type() {
+    compile_expect_ok(
+        "transparent_union_socket_call",
+        r#"
+#include <sys/socket.h>
+#include <netinet/in.h>
+int f(int fd) {
+    struct sockaddr_in a;
+    socklen_t l = sizeof a;
+    return getsockname(fd, (struct sockaddr *)&a, &l);
+}
+"#,
+    );
+    compile_expect_ok(
+        "union_parameter_member_type",
+        "union U { int *ip; char *cp; };
+int g(union U);
+void f(void){ int *p = 0; (void)g(p); }
+",
+    );
+}

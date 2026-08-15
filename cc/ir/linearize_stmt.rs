@@ -93,6 +93,10 @@ impl<'a> super::linearize::Linearizer<'a> {
                             self.current_pos.unwrap_or_default(),
                             "'return' with no value in a function returning non-void",
                         ),
+                        // 6.8.6.4p3 converts the value "as if by assignment",
+                        // so the simple-assignment constraints of 6.5.16.1
+                        // govern it and are asked in exactly the same words.
+                        Some(e) if !returns_void => self.check_return_type(rt, e),
                         _ => {}
                     }
                 }
@@ -588,6 +592,34 @@ impl<'a> super::linearize::Linearizer<'a> {
     }
 
     /// Linearize an initializer list for arrays or structs
+    /// Check a returned value against the function's declared return type
+    /// (C17 6.8.6.4p3, whose constraints are 6.5.16.1's).
+    fn check_return_type(&mut self, declared: TypeId, expr: &Expr) {
+        let value = self.expr_type(expr);
+        let null_constant =
+            self.types.kind(value) != TypeKind::Pointer && self.eval_const_expr(expr) == Some(0);
+        let Some(fault) = self.types.assignment_fault(declared, value, null_constant) else {
+            return;
+        };
+        let (d_name, v_name) = (
+            self.types.format_type(declared, Some(self.strings)),
+            self.types.format_type(value, Some(self.strings)),
+        );
+        if fault.is_error() {
+            crate::diag::error_args(
+                expr.pos,
+                "incompatible types returning '{0}' from a function returning '{1}'",
+                &[&v_name, &d_name],
+            );
+        } else {
+            crate::diag::warning_args(
+                expr.pos,
+                "returning '{0}' from a function with return type '{1}' {2}",
+                &[&v_name, &d_name, fault.describe()],
+            );
+        }
+    }
+
     pub(crate) fn linearize_init_list(
         &mut self,
         base_sym: PseudoId,

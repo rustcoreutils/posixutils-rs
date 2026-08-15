@@ -123,6 +123,9 @@ impl<'a> Parser<'a> {
 
             // Right-to-left associativity: parse the right side as another assignment
             let right = self.parse_assignment_expr()?;
+            if assign_op == AssignOp::Assign {
+                self.check_assignment_types(&left, &right, assign_pos);
+            }
             // In C, assignment expression type is the type of the left operand
             let assign_type = left.typ.unwrap_or(self.types.int_id);
             Ok(Self::typed_expr(
@@ -287,14 +290,7 @@ impl<'a> Parser<'a> {
     /// Apply the array-to-pointer and function-to-pointer decays of C17
     /// 6.3.2.1p3-4. Qualifiers are left alone.
     pub(crate) fn decayed_type(&mut self, typ: TypeId) -> TypeId {
-        match self.types.kind(typ) {
-            TypeKind::Array => {
-                let elem = self.types.base_type(typ).unwrap_or(self.types.char_id);
-                self.types.intern(Type::pointer(elem))
-            }
-            TypeKind::Function => self.types.intern(Type::pointer(typ)),
-            _ => typ,
-        }
+        self.types.decayed(typ)
     }
 
     /// The type an lvalue expression has after lvalue conversion: decayed as
@@ -1409,6 +1405,7 @@ impl<'a> Parser<'a> {
                 let args = self.parse_argument_list()?;
                 self.expect_special(b')')?;
                 self.check_call_arity(&expr, &args, call_pos);
+                self.check_argument_types(&expr, &args);
 
                 // Get the return type from the function type
                 // The func expression should have type TypeKind::Function
@@ -1578,15 +1575,9 @@ impl<'a> Parser<'a> {
     /// position left points at whichever sub-expression was lowered last.
     fn check_call_arity(&self, callee: &Expr, args: &[Expr], call_pos: Position) {
         // Resolve through a function pointer, as the return-type logic does.
-        let func_type = callee.typ.and_then(|t| match self.types.kind(t) {
-            TypeKind::Function => Some(t),
-            TypeKind::Pointer => self
-                .types
-                .base_type(t)
-                .filter(|&b| self.types.kind(b) == TypeKind::Function),
-            _ => None,
-        });
-        let Some(func_type) = func_type else { return };
+        let Some(func_type) = self.resolved_function_type(callee) else {
+            return;
+        };
 
         // `params == None` means no prototype is visible: `int f();`, a K&R
         // identifier list -- neither of which C17 6.5.2.2p1 permits a check
@@ -1626,6 +1617,98 @@ impl<'a> Parser<'a> {
         );
     }
 
+    /// Check each argument against its parameter's type.
+    ///
+    /// C17 6.5.2.2p2 requires an argument to be assignable to its parameter,
+    /// so the constraints are the assignment ones and this asks the same
+    /// question -- only the wording differs, naming the position gcc names.
+    ///
+    /// Arguments past a prototype's fixed parameters get the default argument
+    /// promotions instead (p7), and an unprototyped callee has nothing to
+    /// check against, so both are skipped.
+    fn check_argument_types(&mut self, callee: &Expr, args: &[Expr]) {
+        let Some(func_type) = self.resolved_function_type(callee) else {
+            return;
+        };
+        let Some(params) = self.types.get(func_type).params.clone() else {
+            return;
+        };
+        for (i, (arg, &param)) in args.iter().zip(params.iter()).enumerate() {
+            let (Some(a), param) = (arg.typ, param) else {
+                continue;
+            };
+            let a = self.decayed_type(a);
+            let param = self.decayed_type(param);
+            let Some(fault) =
+                self.types
+                    .assignment_fault(param, a, self.is_null_pointer_constant(arg))
+            else {
+                continue;
+            };
+            // glibc declares the socket calls with a union parameter carrying
+            // __attribute__((transparent_union)), which lets a caller pass any
+            // one of its member types -- `sendto(..., SAS2SA(&addr), ...)`
+            // hands a `struct sockaddr *` to a `__CONST_SOCKADDR_ARG`. c17
+            // does not record that attribute, so it cannot tell a transparent
+            // union from an ordinary one, and rejecting the call would refuse
+            // every socket program on the platform. Accepting an argument that
+            // matches some member is the safe direction: it under-diagnoses an
+            // ordinary union parameter, which is rare, rather than rejecting
+            // valid code, which is not. Assignment and `return` stay strict --
+            // the attribute governs calls only.
+            if self.argument_matches_union_member(param, a) {
+                continue;
+            }
+            let (p_name, a_name) = (
+                self.types.format_type(param, Some(self.idents)),
+                self.types.format_type(a, Some(self.idents)),
+            );
+            let n = (i + 1).to_string();
+            if fault.is_error() {
+                diag::error_args(
+                    arg.pos,
+                    "incompatible type for argument {0}: expected '{1}', got '{2}'",
+                    &[&n, &p_name, &a_name],
+                );
+            } else {
+                diag::warning_args(
+                    arg.pos,
+                    "passing argument {0} as '{1}' from '{2}' {3}",
+                    &[&n, &p_name, &a_name, fault.describe()],
+                );
+            }
+        }
+    }
+
+    /// Does this argument's type match some member of a union parameter?
+    ///
+    /// Stands in for `__attribute__((transparent_union))`, which c17 does not
+    /// record. See the call site for why the approximation is the safe one.
+    fn argument_matches_union_member(&self, param: TypeId, arg: TypeId) -> bool {
+        if self.types.kind(param) != TypeKind::Union {
+            return false;
+        }
+        let Some(comp) = self.types.composite(param) else {
+            return false;
+        };
+        comp.members
+            .iter()
+            .any(|m| self.types.assignment_fault(m.typ, arg, false).is_none())
+    }
+
+    /// The function type a callee expression resolves to, through a function
+    /// pointer if need be.
+    fn resolved_function_type(&self, callee: &Expr) -> Option<TypeId> {
+        callee.typ.and_then(|t| match self.types.kind(t) {
+            TypeKind::Function => Some(t),
+            TypeKind::Pointer => self
+                .types
+                .base_type(t)
+                .filter(|&b| self.types.kind(b) == TypeKind::Function),
+            _ => None,
+        })
+    }
+
     fn parse_argument_list(&mut self) -> ParseResult<Vec<Expr>> {
         let mut args = Vec::with_capacity(DEFAULT_ARG_LIST_CAPACITY);
 
@@ -1662,6 +1745,62 @@ impl<'a> Parser<'a> {
     }
 
     /// Check if an expression is const and report error if assigning to it
+    /// Report a simple assignment whose value cannot be converted to the
+    /// target's type (C17 6.5.16.1).
+    ///
+    /// Compound assignment is deliberately not routed here: 6.5.16.2 has its
+    /// own, looser constraints, under which `p += 1` is ordinary pointer
+    /// arithmetic rather than an integer assigned to a pointer.
+    fn check_assignment_types(&mut self, target: &Expr, value: &Expr, pos: Position) {
+        let (Some(t), Some(v)) = (target.typ, value.typ) else {
+            return;
+        };
+        let t = self.decayed_type(t);
+        let v = self.decayed_type(v);
+        let Some(fault) = self
+            .types
+            .assignment_fault(t, v, self.is_null_pointer_constant(value))
+        else {
+            return;
+        };
+        let (t_name, v_name) = (
+            self.types.format_type(t, Some(self.idents)),
+            self.types.format_type(v, Some(self.idents)),
+        );
+        if fault.is_error() {
+            // gcc words this one case differently, and it is the clearer
+            // phrasing: the problem is not the types but that there is no
+            // value at all.
+            if self.types.kind(v) == TypeKind::Void {
+                diag::error(pos, &gettext("void value not ignored as it ought to be"));
+                return;
+            }
+            diag::error_args(
+                pos,
+                "incompatible types when assigning to type '{0}' from type '{1}'",
+                &[&t_name, &v_name],
+            );
+        } else {
+            diag::warning_args(
+                pos,
+                "assignment to '{0}' from '{1}' {2}",
+                &[&t_name, &v_name, fault.describe()],
+            );
+        }
+    }
+
+    /// Is this expression a null pointer constant (C17 6.3.2.3p3) -- an
+    /// integer constant expression with the value 0, possibly cast to
+    /// `void *`?
+    fn is_null_pointer_constant(&self, expr: &Expr) -> bool {
+        let inner = match &expr.kind {
+            ExprKind::Cast { expr: inner, .. } => inner,
+            _ => expr,
+        };
+        self.types.kind(inner.typ.unwrap_or(self.types.int_id)) != TypeKind::Pointer
+            && self.eval_const_expr(inner) == Some(0)
+    }
+
     /// Does this expression designate an object (C17 6.3.2.1p1)?
     ///
     /// Only the shapes that can name storage: an object identifier, a

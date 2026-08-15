@@ -92,6 +92,8 @@ impl<'a> super::linearize::Linearizer<'a> {
             if self.types.kind(declarator.typ) == TypeKind::Function {
                 // Check if not defined in this module (forward refs will be cleaned up later)
                 if !self.module.functions.iter().any(|f| f.name == name) {
+                    self.module
+                        .set_declared_symbol_attrs(&name, declarator.symbol_attrs.clone());
                     self.module.extern_symbols.insert(name);
                 }
                 continue;
@@ -105,6 +107,8 @@ impl<'a> super::linearize::Linearizer<'a> {
             if storage_class.contains(TypeModifiers::EXTERN) {
                 // Check if this symbol is already defined in globals
                 if !self.module.globals.iter().any(|g| g.name == name) {
+                    self.module
+                        .set_declared_symbol_attrs(&name, declarator.symbol_attrs.clone());
                     self.module.extern_symbols.insert(name.clone());
                     // Track extern thread-local symbols separately for TLS access
                     if storage_class.contains(TypeModifiers::THREAD_LOCAL) {
@@ -123,6 +127,8 @@ impl<'a> super::linearize::Linearizer<'a> {
                 self.file_scope_statics.insert(name.clone());
             }
 
+            // A definition here outranks anything recorded for the declaration.
+            self.module.declared_symbol_attrs.remove(&name);
             // If this symbol was previously declared extern, remove it from extern_symbols
             // (we now have the actual definition)
             self.module.extern_symbols.remove(&name);

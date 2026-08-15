@@ -4162,6 +4162,13 @@ impl Parser<'_> {
         // symptom is an unrelated global emitted under someone else's
         // assembler name.
         self.pending_asm_label = None;
+        // Likewise the symbol attributes. A function *definition* takes its
+        // attributes through `pending_fn_attrs` and leaves these behind, so the
+        // next declaration to build an `InitDeclarator` claimed them: the
+        // variable after a `section(...)` function was emitted into that
+        // function's section, and the conflicting "ax"/"aw" flags made the
+        // assembler reject the file outright.
+        self.pending_symbol_attrs = Default::default();
 
         // Check for _Static_assert first (C11)
         if self.is_static_assert() {
@@ -4243,6 +4250,11 @@ impl Parser<'_> {
                 let calling_conv = attrs.calling_conv().unwrap_or_default();
                 let fn_attrs = attrs.function_attrs();
                 self.pending_fn_attrs.merge(&fn_attrs);
+                // Symbol attributes too. Only the function half was collected
+                // here, so `weak` written after a function declarator was
+                // dropped -- and a weak *declaration* is the whole point of
+                // the attribute.
+                self.merge_symbol_attrs(&attrs);
                 let all_fn_attrs = if self.types.kind(typ) == TypeKind::Function {
                     self.accumulate_fn_attrs(name)
                 } else {
@@ -4438,6 +4450,11 @@ impl Parser<'_> {
                 let calling_conv = attrs.calling_conv().unwrap_or_default();
                 let fn_attrs = attrs.function_attrs();
                 self.pending_fn_attrs.merge(&fn_attrs);
+                // Symbol attributes too. Only the function half was collected
+                // here, so `weak` written after a function declarator was
+                // dropped -- and a weak *declaration* is the whole point of
+                // the attribute.
+                self.merge_symbol_attrs(&attrs);
                 let all_fn_attrs = if self.types.kind(full_typ) == TypeKind::Function {
                     self.accumulate_fn_attrs(name)
                 } else {
@@ -4570,6 +4587,7 @@ impl Parser<'_> {
             let attrs = self.parse_attributes();
             let fn_attrs = attrs.function_attrs();
             self.pending_fn_attrs.merge(&fn_attrs);
+            self.merge_symbol_attrs(&attrs);
             let all_fn_attrs = self.accumulate_fn_attrs(name);
             // noreturn can come from __attribute__((noreturn)) or _Noreturn keyword in base type
             let typ_from_table = self.types.get(typ_id);

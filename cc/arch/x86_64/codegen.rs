@@ -623,6 +623,7 @@ impl X86_64CodeGen {
             self.push_lir(X86Inst::Directive(Directive::NamedSection {
                 name: sec.clone(),
                 executable: true,
+                writable: false,
             }));
         }
 
@@ -5428,6 +5429,8 @@ impl CodeGenerator for X86_64CodeGen {
         for global in &module.globals {
             self.emit_global(global, types);
         }
+
+        self.base.emit_declared_symbol_attrs(module);
 
         // Emit string literals
         if !module.strings.is_empty() {

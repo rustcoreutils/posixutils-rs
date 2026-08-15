@@ -2029,6 +2029,14 @@ pub struct Module {
     /// External symbols (declared extern but not defined in this module)
     /// These need GOT access on macOS
     pub extern_symbols: HashSet<String>,
+    /// Attributes written on a symbol this translation unit declares but does
+    /// not define. `weak` is the point of it: `extern int f(void)
+    /// __attribute__((weak));` has to reach the object file as `.weak f`, or
+    /// the reference is strong and an absent definition is a link error
+    /// instead of a null pointer -- which is the entire idiom.
+    ///
+    /// Ordered, because it is iterated to emit directives.
+    pub declared_symbol_attrs: std::collections::BTreeMap<String, crate::parse::ast::SymbolAttrs>,
     /// External thread-local symbols (declared extern _Thread_local but not defined)
     /// These need TLS access pattern instead of GOT
     pub extern_tls_symbols: HashSet<String>,
@@ -2112,6 +2120,15 @@ impl Module {
         if let Some(g) = self.globals.iter_mut().find(|g| g.name == name) {
             g.symbol_attrs = attrs;
         }
+    }
+
+    /// Record attributes on a symbol declared but not defined here. A later
+    /// definition in the same unit takes precedence and clears this.
+    pub fn set_declared_symbol_attrs(&mut self, name: &str, attrs: crate::parse::ast::SymbolAttrs) {
+        if attrs.is_empty() {
+            return;
+        }
+        self.declared_symbol_attrs.insert(name.to_string(), attrs);
     }
 
     fn add_global_impl(

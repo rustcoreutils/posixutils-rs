@@ -440,6 +440,7 @@ impl Aarch64CodeGen {
             self.push_lir(Aarch64Inst::Directive(Directive::NamedSection {
                 name: sec.clone(),
                 executable: true,
+                writable: false,
             }));
         }
 
@@ -4495,6 +4496,8 @@ impl CodeGenerator for Aarch64CodeGen {
         for global in &module.globals {
             self.emit_global(global, types);
         }
+
+        self.base.emit_declared_symbol_attrs(module);
 
         // Emit string literals
         if !module.strings.is_empty() {

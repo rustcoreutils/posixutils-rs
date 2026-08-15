@@ -148,7 +148,7 @@ define_keywords! {
     (GNU_THREAD,        "__thread",          STORAGE),
 
     // ---- Type qualifiers (QUALIFIER) ----
-    (CONST,             "const",             QUALIFIER | TYPE_KEYWORD),
+    (CONST,             "const",             QUALIFIER | TYPE_KEYWORD | SUPPORTED_ATTR),
     (VOLATILE,          "volatile",          QUALIFIER | TYPE_KEYWORD),
     (RESTRICT,          "restrict",          QUALIFIER),
     (GNU_CONST,         "__const__",         QUALIFIER | SUPPORTED_ATTR),

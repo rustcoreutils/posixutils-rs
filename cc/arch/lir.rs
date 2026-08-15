@@ -627,7 +627,11 @@ pub enum Directive {
     /// needs the flags spelled out and they differ: `"ax"` against `"aw"`.
     /// Getting it wrong is not cosmetic -- a function in a non-executable
     /// section segfaults when called.
-    NamedSection { name: String, executable: bool },
+    NamedSection {
+        name: String,
+        executable: bool,
+        writable: bool,
+    },
 
     /// Mark a symbol weak: another definition overrides it, and an
     /// unresolved reference is null rather than a link error.
@@ -914,7 +918,11 @@ impl EmitAsm for Directive {
                     let _ = writeln!(out, ".text");
                 }
             },
-            Directive::NamedSection { name, executable } => match target.os {
+            Directive::NamedSection {
+                name,
+                executable,
+                writable,
+            } => match target.os {
                 // Mach-O names a segment and a section together, and the
                 // program supplies both -- `section("__DATA,__mine")`.
                 Os::MacOS => {
@@ -927,7 +935,16 @@ impl EmitAsm for Directive {
                     if name.contains(',') {
                         let _ = writeln!(out, ".section {}", name);
                     } else {
-                        let flags = if *executable { "ax" } else { "aw" };
+                        // Read-only data asked for a named section is still
+                        // read-only: spelling it "aw" put it in a writable
+                        // segment and lost its page protection.
+                        let flags = if *executable {
+                            "ax"
+                        } else if *writable {
+                            "aw"
+                        } else {
+                            "a"
+                        };
                         let _ = writeln!(out, ".section {},\"{}\"", name, flags);
                     }
                 }

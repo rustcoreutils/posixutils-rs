@@ -237,6 +237,28 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         false
     }
 
+    /// `.weak` and visibility for symbols this unit only declares.
+    ///
+    /// A defined symbol carries these on its own definition; a declared one has
+    /// no definition to hang them on, so they are emitted standalone. Without
+    /// this, `extern int f(void) __attribute__((weak));` produced a strong
+    /// reference and an absent `f` was a link error rather than a null pointer.
+    pub fn emit_declared_symbol_attrs(&mut self, module: &Module) {
+        for (name, attrs) in &module.declared_symbol_attrs {
+            if module.functions.iter().any(|f| f.name == *name)
+                || module.globals.iter().any(|g| g.name == *name)
+            {
+                continue;
+            }
+            if attrs.weak {
+                self.push_directive(Directive::Weak(Symbol::global(name)));
+            }
+            if let Some(how) = &attrs.visibility {
+                self.push_directive(Directive::Visibility(Symbol::global(name), how.clone()));
+            }
+        }
+    }
+
     /// Emit a global variable definition
     pub fn emit_global(&mut self, global: &crate::ir::GlobalDef, types: &TypeTable) {
         let size = types.size_bits(global.typ) / 8;
@@ -266,10 +288,17 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         // `section("...")` is asking not to happen.
         let named_section = global.symbol_attrs.section.clone();
 
+        // `weak` and an explicit visibility are in the same position as a
+        // named section: a common symbol carries neither, and the fast path
+        // returns before the directives that would. A hidden variable escaping
+        // as default-visibility is an ABI change, not a cosmetic one, so these
+        // go the long way round into `.bss` -- which is what gcc emits too.
         let zero_init = !global.is_thread_local
             && size > 0
             && global.init.is_all_zero()
-            && named_section.is_none();
+            && named_section.is_none()
+            && !global.symbol_attrs.weak
+            && global.symbol_attrs.visibility.is_none();
         if zero_init && !is_local_label {
             if global.is_static {
                 self.push_directive(Directive::bss_local(&global.name, size, align));
@@ -284,6 +313,10 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             self.push_directive(Directive::NamedSection {
                 name: name.clone(),
                 executable: false,
+                // Const data that needs relocations cannot be mapped read-only
+                // until the dynamic linker has run, so it is writable in the
+                // object the same way `.data.rel.ro` is.
+                writable: !global.is_const || global.init.has_reloc(),
             });
         } else if global.is_thread_local {
             if matches!(global.init, Initializer::None) {

@@ -412,60 +412,6 @@ pub struct Preprocessor<'a> {
     line_file_override: Option<String>,
 }
 
-/// Check if an attribute name is supported by c17
-fn is_supported_attribute(name: &str) -> bool {
-    matches!(
-        name,
-        "noreturn"
-            | "__noreturn__"
-            | "unused"
-            | "__unused__"
-            | "aligned"
-            | "__aligned__"
-            | "packed"
-            | "__packed__"
-            | "deprecated"
-            | "__deprecated__"
-            | "weak"
-            | "__weak__"
-            | "section"
-            | "__section__"
-            | "visibility"
-            | "__visibility__"
-            | "constructor"
-            | "__constructor__"
-            | "destructor"
-            | "__destructor__"
-            | "used"
-            | "__used__"
-            | "noinline"
-            | "__noinline__"
-            | "always_inline"
-            | "__always_inline__"
-            | "hot"
-            | "__hot__"
-            | "cold"
-            | "__cold__"
-            | "warn_unused_result"
-            | "__warn_unused_result__"
-            | "format"
-            | "__format__"
-            | "fallthrough"
-            | "__fallthrough__"
-            | "nonstring"
-            | "__nonstring__"
-            | "malloc"
-            | "__malloc__"
-            | "pure"
-            | "__pure__"
-            | "sentinel"
-            | "__sentinel__"
-            | "no_sanitize_memory"
-            | "no_sanitize_address"
-            | "no_sanitize_thread"
-    )
-}
-
 impl<'a> Preprocessor<'a> {
     /// Format the current time as C99 __DATE__ and __TIME__ strings
     /// Returns (date_string, time_string) where:
@@ -3587,8 +3533,12 @@ impl<'a> Preprocessor<'a> {
                 if let Some(id) = arg_id {
                     crate::kw::has_tag(id, crate::kw::SUPPORTED_ATTR)
                 } else {
+                    // One table decides this. A second hardcoded list here
+                    // had already drifted from it in both directions.
                     let name = self.token_to_string(first_tok, idents);
-                    is_supported_attribute(&name)
+                    idents
+                        .lookup(&name)
+                        .is_some_and(|id| crate::kw::has_tag(id, crate::kw::SUPPORTED_ATTR))
                 }
             }
             BuiltinMacro::HasBuiltin => {
@@ -4157,7 +4107,11 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
             None => return 0,
         };
 
-        if is_supported_attribute(&name) {
+        if self
+            .idents
+            .lookup(&name)
+            .is_some_and(|id| crate::kw::has_tag(id, crate::kw::SUPPORTED_ATTR))
+        {
             1
         } else {
             0

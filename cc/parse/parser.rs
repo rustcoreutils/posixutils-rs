@@ -234,6 +234,9 @@ pub(crate) struct ParameterList {
     pub prototyped: bool,
 }
 
+/// The `-Wno-<name>` group the unimplemented-attribute warnings belong to.
+pub(crate) const ATTRIBUTE_WARNING: &str = "attributes";
+
 /// Whether the declarator being parsed must name something.
 ///
 /// C17 spells the two grammars separately -- `declarator` (6.7.6) always has
@@ -920,8 +923,44 @@ impl<'a> Parser<'a> {
             return None;
         }
 
+        let pos = self.current_pos();
+        let id = self.get_ident_id(self.current());
         let name = self.get_ident_name(self.current())?;
         self.advance();
+
+        // Every attribute in the program passes through here exactly once, so
+        // this is where an unrecognised one gets said out loud. It used to be
+        // dropped in silence, which is survivable for an attribute that only
+        // hints -- and is not for one that changes what the type *is*.
+        let recognised = id.is_some_and(|id| crate::kw::has_tag(id, crate::kw::SUPPORTED_ATTR));
+        if !recognised {
+            if name.trim_matches('_') == "vector_size" {
+                // Ignoring this cannot produce a correct program: the type
+                // stays scalar, every operation on it stays scalar, and the
+                // mistake surfaces far from here as arithmetic on one element
+                // instead of all of them. Refusing is the honest answer until
+                // vector types exist.
+                diag::error_args(
+                    pos,
+                    "'{0}' attribute is not implemented, and ignoring it would change the type",
+                    &[&name],
+                );
+            } else if name.trim_matches('_') == "mode"
+                && diag::warning_group_enabled(ATTRIBUTE_WARNING)
+            {
+                // Also changes the type -- `register_t` is declared with
+                // `__mode__(__word__)` -- but glibc puts it in `sys/types.h`
+                // and `floatn.h`, so refusing would reject every program that
+                // includes them. Said out loud instead of silently dropped.
+                diag::warning_args(
+                    pos,
+                    "'{0}' attribute is not implemented; the declared type is used unchanged",
+                    &[&name],
+                );
+            } else if diag::warning_group_enabled(ATTRIBUTE_WARNING) {
+                diag::warning_args(pos, "'{0}' attribute directive ignored", &[&name]);
+            }
+        }
 
         // Check for arguments
         if self.is_special(b'(') {

@@ -1575,3 +1575,75 @@ fn diagnostics_same_tag_in_another_scope_is_another_type() {
         "incompatible types when assigning",
     );
 }
+
+// ==== unimplemented attributes (GCC extension) ====
+
+/// An attribute the compiler does not implement used to be dropped in total
+/// silence. That is survivable for one that only hints, and is not for one
+/// that changes what the type *is*: `__attribute__((vector_size(16)))` left
+/// the type scalar and every operation on it scalar, so the program computed
+/// on one element instead of all of them, with nothing said.
+///
+/// So: an error for `vector_size`, which cannot be ignored correctly and which
+/// no C system header uses; a warning for everything else unrecognised.
+#[test]
+fn diagnostics_unimplemented_attributes_are_reported() {
+    compile_expect_error(
+        "vector_size_unimplemented",
+        "typedef int V __attribute__((vector_size(16)));\nint main(void){ return 0; }\n",
+        "'vector_size' attribute is not implemented",
+    );
+    compile_expect_warning(
+        "unknown_attribute_warns",
+        "typedef int T __attribute__((totally_made_up));\nint main(void){ return 0; }\n",
+        "attribute directive ignored",
+    );
+    // `mode` changes the type too, but glibc declares `register_t` with it in
+    // <sys/types.h>, so refusing would reject every program that includes it.
+    compile_expect_warning(
+        "mode_warns_rather_than_refusing",
+        "typedef int W __attribute__((__mode__(__word__)));\nint main(void){ return 0; }\n",
+        "'__mode__' attribute is not implemented",
+    );
+}
+
+/// The attributes the compiler honours, and the ones it deliberately accepts
+/// and ignores, must stay quiet — glibc's headers put them on nearly every
+/// declaration, and a warning apiece would bury everything else.
+///
+/// `__has_attribute` has to agree with this set rather than keep a second list
+/// of its own: it used to answer 0 for `ms_abi` and `gnu_inline`, which the
+/// compiler implements, and 1 for four it silently ignored.
+#[test]
+fn diagnostics_recognised_attributes_are_silent() {
+    let src = r#"
+__attribute__((noreturn)) void die(void);
+__attribute__((__const__)) int pure_fn(int);
+__attribute__((nonnull(1))) int takes_ptr(void *);
+__attribute__((__nothrow__)) int nothrows(void);
+__attribute__((warn_unused_result)) int checked(void);
+__attribute__((__returns_nonnull__)) void *never_null(void);
+__attribute__((__leaf__, __artificial__)) int leafy(void);
+struct __attribute__((packed)) P { char a; int b; };
+__attribute__((aligned(16))) int aligned_var;
+__attribute__((visibility("hidden"))) int hidden_var;
+__attribute__((section(".mine"))) int placed_var;
+__attribute__((weak)) int weak_var;
+__attribute__((used)) static int used_var;
+
+/* Checked at compile time, so the assertion cannot be skipped by a test
+   helper that only builds and never runs. */
+#if !__has_attribute(ms_abi) || !__has_attribute(gnu_inline)
+#error "__has_attribute must admit the attributes the compiler honours"
+#endif
+#if __has_attribute(vector_size)
+#error "__has_attribute must not claim an attribute the compiler ignores"
+#endif
+#if !__has_attribute(weak) || !__has_attribute(transparent_union)
+#error "__has_attribute must admit the attributes the compiler accepts"
+#endif
+
+int main(void) { return 0; }
+"#;
+    compile_expect_ok("recognised_attributes", src);
+}

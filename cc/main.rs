@@ -1363,6 +1363,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.no_warnings {
         diag::suppress_warnings();
     }
+    // `-Wno-<name>` reaches the places that emit warnings, which are nowhere
+    // near here. Only `-Wno-` entries mean anything today; `-W<name>` turning
+    // a group *on* has no group that is off by default to turn on.
+    diag::suppress_warning_groups(
+        args.warnings
+            .iter()
+            .filter_map(|w| w.strip_prefix("no-").map(str::to_string))
+            .collect(),
+    );
 
     // Validate -std= alongside the other argument checks, before any
     // early-return path, so a typo is never silently accepted.

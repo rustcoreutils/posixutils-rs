@@ -18,12 +18,30 @@ use crate::ir::{Instruction, PseudoId};
 use crate::types::{TypeKind, TypeTable};
 use std::collections::HashMap;
 
+/// The alignment a stacked argument must start on: its type's, at least 8.
+fn arg_align(insn: &Instruction, types: &TypeTable, i: usize) -> i32 {
+    insn.arg_types
+        .get(i)
+        .map(|&t| types.alignment(t) as i32)
+        .unwrap_or(8)
+}
+
 /// Information about call argument classification
 pub(super) struct CallArgInfo {
     /// Indices of arguments that go on the stack
     pub stack_arg_indices: Vec<usize>,
-    /// Whether stack padding is needed for alignment
-    pub needs_padding: bool,
+    /// Where each of those starts, in bytes from the outgoing area's base.
+    /// Parallel to `stack_arg_indices`.
+    ///
+    /// SysV AMD64 3.2.3 rounds each stacked argument's address up to
+    /// `max(8, alignof(type))`, so the area has to be *walked* in parameter
+    /// order rather than summed. Pushing in reverse and padding once at the
+    /// top -- which is what this replaced -- cannot express a gap between two
+    /// arguments, so a sixteen-byte-aligned one after an odd number of
+    /// eight-byte slots landed eight bytes low.
+    pub stack_offsets: Vec<i32>,
+    /// Total bytes to reserve, rounded to the 16-byte call boundary.
+    pub stack_bytes: i32,
 }
 
 impl X86_64CodeGen {
@@ -35,9 +53,23 @@ impl X86_64CodeGen {
         let mut stack_arg_indices = Vec::with_capacity(insn.src.len());
         let mut temp_int_idx = 0;
         let mut temp_fp_idx = 0;
-        // Track total stack qwords for correct 16-byte alignment calculation.
-        // Large structs and long doubles occupy multiple qwords.
-        let mut total_stack_qwords: usize = 0;
+        // The outgoing area is walked, not summed: each argument begins at
+        // its own alignment. `at` is the running byte offset.
+        let mut stack_offsets = Vec::with_capacity(insn.src.len());
+        let mut at: i32 = 0;
+        // Reserve `bytes` for the argument at `i`, starting it on `align`.
+        let place = |i: usize,
+                     bytes: usize,
+                     align: i32,
+                     indices: &mut Vec<usize>,
+                     offsets: &mut Vec<i32>,
+                     at: &mut i32| {
+            let align = align.max(8);
+            *at = (*at + align - 1) & !(align - 1);
+            indices.push(i);
+            offsets.push(*at);
+            *at += ((bytes as i32) + 7) & !7;
+        };
 
         let abi_info = insn
             .abi_info
@@ -58,8 +90,14 @@ impl X86_64CodeGen {
 
             if is_longdouble {
                 // Long double is always passed on the stack by value (16 bytes = 2 qwords)
-                stack_arg_indices.push(i);
-                total_stack_qwords += 2;
+                place(
+                    i,
+                    16,
+                    16,
+                    &mut stack_arg_indices,
+                    &mut stack_offsets,
+                    &mut at,
+                );
                 continue;
             }
 
@@ -74,11 +112,19 @@ impl X86_64CodeGen {
                     let has_fp = fp_needed == 0 || temp_fp_idx + fp_needed <= fp_arg_regs.len();
 
                     if !has_gp || !has_fp {
-                        stack_arg_indices.push(i);
                         // Every eightbyte lands on the stack, so a mixed pair
                         // takes two qwords -- `max` counted it as one and left
                         // the outgoing area a qword short.
-                        total_stack_qwords += classes.len().max(1);
+                        let bytes = classes.len().max(1) * 8;
+                        let align = arg_align(insn, types, i);
+                        place(
+                            i,
+                            bytes,
+                            align,
+                            &mut stack_arg_indices,
+                            &mut stack_offsets,
+                            &mut at,
+                        );
                         // §3.2.3 step 5: an argument that does not fit goes to
                         // memory *whole* and consumes no registers, so the ones
                         // it did not fit in remain for later arguments.
@@ -94,22 +140,27 @@ impl X86_64CodeGen {
                     // Large struct parameters (> 16 bytes): passed by value on the stack
                     // per SysV AMD64 ABI MEMORY class. Always a stack arg — never in
                     // a register. Don't consume a GP register.
-                    stack_arg_indices.push(i);
-                    total_stack_qwords += (*size_bits as usize).div_ceil(64);
+                    let align = arg_align(insn, types, i);
+                    place(
+                        i,
+                        (*size_bits as usize).div_ceil(8),
+                        align,
+                        &mut stack_arg_indices,
+                        &mut stack_offsets,
+                        &mut at,
+                    );
                 }
                 ArgClass::Extend { .. } => {
                     // Extended small integers use one GP register
                     if temp_int_idx >= int_arg_regs.len() {
-                        stack_arg_indices.push(i);
-                        total_stack_qwords += 1;
+                        place(i, 8, 8, &mut stack_arg_indices, &mut stack_offsets, &mut at);
                     }
                     temp_int_idx += 1;
                 }
                 ArgClass::Hfa { count, .. } => {
                     // HFA uses FP registers (primarily AArch64, but handle for completeness)
                     if temp_fp_idx + (*count as usize) > fp_arg_regs.len() {
-                        stack_arg_indices.push(i);
-                        total_stack_qwords += 1;
+                        place(i, 8, 8, &mut stack_arg_indices, &mut stack_offsets, &mut at);
                     }
                     temp_fp_idx += *count as usize;
                 }
@@ -124,11 +175,13 @@ impl X86_64CodeGen {
             }
         }
 
-        let needs_padding = total_stack_qwords % 2 == 1;
+        // The call boundary is 16-byte aligned.
+        let stack_bytes = (at + 15) & !15;
 
         CallArgInfo {
             stack_arg_indices,
-            needs_padding,
+            stack_offsets,
+            stack_bytes,
         }
     }
 
@@ -139,19 +192,23 @@ impl X86_64CodeGen {
         info: &CallArgInfo,
         types: &TypeTable,
     ) -> usize {
-        // Add padding for 16-byte alignment if needed
-        if info.needs_padding {
-            self.push_lir(X86Inst::Sub {
-                size: OperandSize::B64,
-                src: GpOperand::Imm(8),
-                dst: Reg::Rsp,
-            });
+        if info.stack_bytes == 0 {
+            return 0;
         }
+        // Reserve the whole outgoing area at once, then write each argument at
+        // the offset the layout gave it. Pushing in reverse could not express a
+        // gap between two arguments, which is what an alignment boundary is.
+        self.push_lir(X86Inst::Sub {
+            size: OperandSize::B64,
+            src: GpOperand::Imm(info.stack_bytes as i64),
+            dst: Reg::Rsp,
+        });
+        // Locals are addressed from %rsp when the frame is over-aligned, so
+        // every source read below has to account for the reservation just made.
+        self.rsp_adjust += info.stack_bytes;
 
-        let mut stack_args = 0;
-
-        // Push stack arguments in reverse order
-        for &i in info.stack_arg_indices.iter().rev() {
+        for (n, &i) in info.stack_arg_indices.iter().enumerate() {
+            let base_off = info.stack_offsets[n];
             let arg = insn.src[i];
             let arg_type = insn.arg_types.get(i).copied();
 
@@ -181,7 +238,7 @@ impl X86_64CodeGen {
             }) {
                 let num_qwords = bytes.div_ceil(8);
                 let base = self.address_of_pseudo(arg);
-                for q in (0..num_qwords).rev() {
+                for q in 0..num_qwords {
                     self.push_lir(X86Inst::Mov {
                         size: OperandSize::B64,
                         src: GpOperand::Mem(MemAddr::BaseOffset {
@@ -190,11 +247,15 @@ impl X86_64CodeGen {
                         }),
                         dst: GpOperand::Reg(Reg::Rax),
                     });
-                    self.push_lir(X86Inst::Push {
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
                         src: GpOperand::Reg(Reg::Rax),
+                        dst: GpOperand::Mem(MemAddr::BaseOffset {
+                            base: Reg::Rsp,
+                            offset: base_off + (q * 8) as i32,
+                        }),
                     });
                 }
-                stack_args += num_qwords;
                 continue;
             }
 
@@ -219,67 +280,52 @@ impl X86_64CodeGen {
 
                 // Long double uses x87, needs 16 bytes on stack
                 if is_longdouble {
-                    // Allocate 16 bytes on stack for long double
-                    self.push_lir(X86Inst::Sub {
-                        size: OperandSize::B64,
-                        src: GpOperand::Imm(16),
-                        dst: Reg::Rsp,
-                    });
-                    // Load value using x87 and store to stack
                     let src_addr = self.get_x87_mem_addr(arg);
                     self.push_lir(X86Inst::X87Load { addr: src_addr });
                     self.push_lir(X86Inst::X87Store {
                         addr: MemAddr::BaseOffset {
                             base: Reg::Rsp,
-                            offset: 0,
+                            offset: base_off,
                         },
                     });
-                    stack_args += 2; // 16 bytes = 2 stack slots
                     continue;
                 }
 
                 // A binary128 is two eightbytes, and it moves as one 16-byte
                 // quantity: reserving eight and storing it as a scalar wrote
                 // half the value under an instruction that does not exist.
-                let slots = if fp_fmt == FpSize::Quad { 2 } else { 1 };
                 self.emit_fp_move(arg, XmmReg::Xmm15, fp_fmt);
-                self.push_lir(X86Inst::Sub {
-                    size: OperandSize::B64,
-                    src: GpOperand::Imm(8 * slots as i64),
-                    dst: Reg::Rsp,
-                });
                 self.push_lir(X86Inst::MovFp {
                     size: fp_fmt,
                     src: XmmOperand::Reg(XmmReg::Xmm15),
                     dst: XmmOperand::Mem(MemAddr::BaseOffset {
                         base: Reg::Rsp,
-                        offset: 0,
+                        offset: base_off,
                     }),
                 });
-                stack_args += slots - 1;
             } else {
                 // Check if this is an __int128 arg (needs 16 bytes = 2 stack slots)
                 let is_int128 = arg_type.is_some_and(|t| types.kind(t) == TypeKind::Int128);
                 if is_int128 {
                     let arg_loc = self.get_location(arg).clone();
-                    // Push hi first (stack grows down), then lo
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Mem(self.int128_hi_mem_loc(&arg_loc)),
-                        dst: GpOperand::Reg(Reg::Rax),
-                    });
-                    self.push_lir(X86Inst::Push {
-                        src: GpOperand::Reg(Reg::Rax),
-                    });
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Mem(self.int128_lo_mem_loc(&arg_loc)),
-                        dst: GpOperand::Reg(Reg::Rax),
-                    });
-                    self.push_lir(X86Inst::Push {
-                        src: GpOperand::Reg(Reg::Rax),
-                    });
-                    stack_args += 2;
+                    for (half, off) in [
+                        (self.int128_lo_mem_loc(&arg_loc), base_off),
+                        (self.int128_hi_mem_loc(&arg_loc), base_off + 8),
+                    ] {
+                        self.push_lir(X86Inst::Mov {
+                            size: OperandSize::B64,
+                            src: GpOperand::Mem(half),
+                            dst: GpOperand::Reg(Reg::Rax),
+                        });
+                        self.push_lir(X86Inst::Mov {
+                            size: OperandSize::B64,
+                            src: GpOperand::Reg(Reg::Rax),
+                            dst: GpOperand::Mem(MemAddr::BaseOffset {
+                                base: Reg::Rsp,
+                                offset: off,
+                            }),
+                        });
+                    }
                     continue;
                 }
                 // (Large aggregates are handled by the MEMORY-class arm above.)
@@ -289,14 +335,19 @@ impl X86_64CodeGen {
                     64
                 };
                 self.emit_move(arg, Reg::Rax, arg_size);
-                self.push_lir(X86Inst::Push {
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
                     src: GpOperand::Reg(Reg::Rax),
+                    dst: GpOperand::Mem(MemAddr::BaseOffset {
+                        base: Reg::Rsp,
+                        offset: base_off,
+                    }),
                 });
             }
-            stack_args += 1;
         }
 
-        stack_args
+        self.rsp_adjust -= info.stack_bytes;
+        info.stack_bytes as usize
     }
 
     /// Save argument registers that will be clobbered by earlier argument setup
@@ -1175,8 +1226,7 @@ impl X86_64CodeGen {
     }
 
     /// Clean up stack after call
-    pub(super) fn cleanup_call_stack(&mut self, stack_args: usize, needs_padding: bool) {
-        let stack_cleanup = stack_args * 8 + if needs_padding { 8 } else { 0 };
+    pub(super) fn cleanup_call_stack(&mut self, stack_cleanup: usize) {
         if stack_cleanup > 0 {
             self.push_lir(X86Inst::Add {
                 size: OperandSize::B64,

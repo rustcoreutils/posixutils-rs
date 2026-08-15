@@ -7861,3 +7861,62 @@ int main(void) {
         0
     );
 }
+
+/// The other half of #C43. A sixteen-byte-aligned argument that overflows to
+/// the stack begins on a sixteen-byte boundary, so with an odd number of
+/// eight-byte slots ahead of it there is a gap. The caller pushed arguments in
+/// reverse with a single pad at the top of the area, which cannot express a gap
+/// *between* two arguments, so the value landed eight bytes low and the callee
+/// read half of it plus the padding.
+///
+/// Every pairing against gcc now agrees; this pins the c17-to-c17 half, which
+/// is the one a test can run. Both `__int128` and `long double` were affected;
+/// `__float128` was not, and is here as the control that must not move.
+#[test]
+fn codegen_stacked_sixteen_byte_argument_lands_on_its_boundary() {
+    let code = r#"
+#include <stdio.h>
+
+typedef struct { long a, b; } S16;
+
+static long long take_i128(long a, long b, long c, long d, long e, long f, long g, __int128 v)
+{ return (long long)v; }
+static long double take_ld(long a, long b, long c, long d, long e, long f, long g, long double v)
+{ return v; }
+static double take_f128(long a, long b, long c, long d, long e, long f, long g, __float128 v)
+{ return (double)v; }
+static long take_s16(long a, long b, long c, long d, long e, long f, long g, S16 v)
+{ return v.a + v.b; }
+/* The argument after it must not be swallowed by the gap. */
+static long long take_tail(long a, long b, long c, long d, long e, long f, long g,
+                           __int128 v, long tail)
+{ return (long long)v + tail; }
+
+int main(void) {
+    __int128 x = 424242;
+    long double l = 424242.0L;
+    __float128 q = 424242.0Q;
+    S16 s = { 11, 22 };
+
+    if (take_i128(1,2,3,4,5,6,7, x) != 424242) return 1;
+    if (take_ld(1,2,3,4,5,6,7, l) != 424242.0L) return 2;
+    if (take_f128(1,2,3,4,5,6,7, q) != 424242.0) return 3;
+    if (take_s16(1,2,3,4,5,6,7, s) != 33) return 4;
+    if (take_tail(1,2,3,4,5,6,7, x, 5) != 424247) return 5;
+
+    /* An even number of eight-byte slots ahead needs no gap, and must not
+       grow one. */
+    if (take_i128(1,2,3,4,5,6,7, x) != 424242) return 6;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run(
+            "codegen_stacked_sixteen_byte_argument_lands_on_its_boundary",
+            code,
+            &[]
+        ),
+        0
+    );
+}

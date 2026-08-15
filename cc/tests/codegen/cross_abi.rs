@@ -783,9 +783,21 @@ fn cross_abi_float128_stack_arguments_are_sixteen_bytes() {
         !asm.contains("movt"),
         "`movt` is not an instruction:\n{asm}"
     );
+    // Two binary128s overflow to the stack, and each takes two eightbytes, so
+    // the second begins sixteen bytes after the first. The stride is what
+    // matters -- an eight-byte one overlapped the previous argument.
+    //
+    // Asserted on the offsets rather than on a `subq $16` per argument: the
+    // outgoing area is now reserved once and written at computed offsets,
+    // because pushing could not express the gap an alignment boundary needs.
+    let body = body_of(&asm, "call");
     assert!(
-        asm.contains("subq $16, %rsp"),
-        "a stack-passed binary128 needs two eightbytes:\n{asm}"
+        body.contains("(%rsp)") && body.contains("16(%rsp)"),
+        "two stacked binary128s sit at +0 and +16:\n{body}"
+    );
+    assert!(
+        !body.contains("8(%rsp)") || body.contains("16(%rsp)"),
+        "an eight-byte stride would overlap the previous argument:\n{body}"
     );
 
     let asm = asm_for("f128_stack_arm", "aarch64-unknown-linux-gnu", src);

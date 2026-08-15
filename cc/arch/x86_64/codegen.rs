@@ -80,6 +80,13 @@ pub struct X86_64CodeGen {
     sym_type_sizes: HashMap<PseudoId, u32>,
     /// When true, locals are addressed via RSP instead of RBP (for dynamic stack alignment)
     use_rsp_locals: bool,
+    /// How far `%rsp` has been moved below the frame's resting position.
+    ///
+    /// Only matters when locals are addressed from `%rsp` -- an over-aligned
+    /// frame -- because then reserving an outgoing argument area moves the base
+    /// every local is measured from. Reading a source operand after the
+    /// reservation without this would have read the wrong slot.
+    pub(super) rsp_adjust: i32,
     /// Maximum local alignment (for andq in prologue)
     max_local_align: i32,
     /// Pseudos that are 128-bit integers (need full 16-byte copies)
@@ -108,6 +115,7 @@ impl X86_64CodeGen {
             quad_constants: std::collections::BTreeMap::new(),
             sym_type_sizes: HashMap::new(),
             use_rsp_locals: false,
+            rsp_adjust: 0,
             max_local_align: 16,
             int128_pseudos: HashSet::new(),
         }
@@ -126,7 +134,7 @@ impl X86_64CodeGen {
         if self.use_rsp_locals {
             MemAddr::BaseOffset {
                 base: Reg::Rsp,
-                offset: self.stack_alloc_size - offset,
+                offset: self.stack_alloc_size - offset + self.rsp_adjust,
             }
         } else {
             MemAddr::BaseOffset {
@@ -3518,7 +3526,7 @@ impl X86_64CodeGen {
         self.emit_call_instruction(insn, &func_name);
 
         // Clean up stack
-        self.cleanup_call_stack(stack_args, info.needs_padding);
+        self.cleanup_call_stack(stack_args);
 
         // Handle return value
         self.handle_call_return_value(insn, types);

@@ -185,6 +185,19 @@ impl Aarch64CodeGen {
             /// reserve 8 bytes and write 32 -- straight through the caller's
             /// own frame. AAPCS64 rounds each stacked argument up to 8, which
             /// is also what the callee's allocator does.
+            /// Where this argument starts, relative to the outgoing area.
+            ///
+            /// AAPCS64 §6.4.2 stage C rounds the next stacked-argument address
+            /// up to `max(8, alignof(type))` *before* placing it. Advancing by
+            /// the rounded size alone put a sixteen-byte-aligned argument eight
+            /// bytes low whenever an odd number of eight-byte slots came first,
+            /// and the callee made the same mistake, so it showed only against
+            /// another compiler.
+            fn slot_start(&self, at: i32, types: &TypeTable) -> i32 {
+                let align = self.typ.map_or(8, |t| types.alignment(t) as i32).max(8);
+                (at + align - 1) & !(align - 1)
+            }
+
             fn slot_bytes(&self, types: &TypeTable, target: &Target) -> i32 {
                 match self.kind {
                     StackKind::Complex => {
@@ -446,10 +459,11 @@ impl Aarch64CodeGen {
         }
 
         // Pre-allocate stack space for all stack args, 16-byte aligned.
-        let stack_bytes: i32 = stack_args_info
-            .iter()
-            .map(|a| a.slot_bytes(types, &self.base.target))
-            .sum();
+        // Walked, not summed: alignment padding between arguments is part of
+        // the area, and summing the sizes alone under-reserved it.
+        let stack_bytes: i32 = stack_args_info.iter().fold(0, |at, a| {
+            a.slot_start(at, types) + a.slot_bytes(types, &self.base.target)
+        });
         let aligned_bytes = (stack_bytes + 15) & !15;
 
         self.push_lir(Aarch64Inst::Sub {
@@ -462,6 +476,7 @@ impl Aarch64CodeGen {
         // Store each stack arg at its proper offset from SP (in parameter order)
         let mut offset: i32 = 0;
         for stack_arg in stack_args_info.into_iter() {
+            offset = stack_arg.slot_start(offset, types);
             if stack_arg
                 .typ
                 .is_some_and(|t| types.kind(t) == TypeKind::Int128)

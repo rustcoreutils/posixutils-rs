@@ -7686,3 +7686,57 @@ int main(void) {
         0
     );
 }
+
+/// AAPCS64 §6.4.2 stage C rounds the next stacked-argument address up to
+/// `max(8, alignof(type))` before placing the argument, not just its size
+/// afterwards. Advancing by the rounded size alone put a sixteen-byte-aligned
+/// argument eight bytes low whenever an odd number of eight-byte slots came
+/// before it -- and the caller and the callee made the same mistake, so c17
+/// agreed with itself and only a c17/gcc boundary showed it.
+///
+/// Eight integers fill X0-X7, then `pad` takes the first eight-byte stack
+/// slot, so everything after it starts at an odd multiple of eight.
+///
+/// Gated to aarch64. x86-64 has the same defect by a different mechanism -- it
+/// *pushes* stacked arguments rather than placing them at computed offsets, so
+/// a sixteen-byte-aligned one lands wherever the running push count leaves it
+/// -- and that is #C43, fixed separately. Running this there would assert a
+/// defect this commit does not address.
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn codegen_stacked_argument_alignment() {
+    let code = r#"
+__attribute__((noinline))
+static long f_i128(int a, int b, int c, int d, int e, int f, int g, int h,
+                   long pad, __int128 v, long tail) {
+    return (long)v + pad * 0 + tail * 0;
+}
+__attribute__((noinline))
+static long double f_ld(int a, int b, int c, int d, int e, int f, int g, int h,
+                        long pad, long double v, long tail) {
+    return v + (long double)(pad * 0 + tail * 0);
+}
+/* the argument after the over-aligned one must not land inside it */
+__attribute__((noinline))
+static long f_after(int a, int b, int c, int d, int e, int f, int g, int h,
+                    long pad, __int128 v, long tail) {
+    return (long)v * 10 + tail;
+}
+
+int main(void) {
+    /* through variables: an `__int128` *constant* argument crashes the x86-64
+       backend, which is #C42 and not what this test is about */
+    __int128 big = 424242;
+    __int128 five = 5;
+    if (f_i128(1,2,3,4,5,6,7,8, 99L, big, 77L) != 424242) return 1;
+    if (f_ld(1,2,3,4,5,6,7,8, 99L, 12345.5L, 77L) != 12345.5L) return 2;
+    if (f_after(1,2,3,4,5,6,7,8, 99L, five, 7L) != 57) return 3;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("codegen_stacked_arg_align", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("codegen_stacked_arg_align_opt", code),
+        0
+    );
+}

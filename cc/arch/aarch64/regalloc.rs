@@ -735,7 +735,18 @@ impl IncomingOff {
     pub const FIRST: IncomingOff = IncomingOff(16);
 
     /// This argument's offset, advancing `next` past it.
-    pub fn take(next: &mut IncomingOff, bytes: i32) -> Self {
+    /// Reserve `bytes` for an argument whose type wants `align`-byte
+    /// alignment, and hand back where it starts.
+    ///
+    /// AAPCS64 §6.4.2 stage C rounds the next stacked-argument address up to
+    /// `max(8, alignof(type))` *before* placing the argument, not only its
+    /// size afterwards. Rounding to 8 alone put a sixteen-byte-aligned
+    /// argument eight bytes low whenever an odd number of eight-byte slots
+    /// came before it. Both sides shared the error, so it showed only against
+    /// another compiler.
+    pub fn take(next: &mut IncomingOff, bytes: i32, align: i32) -> Self {
+        let align = align.max(8);
+        next.0 = (next.0 + align - 1) & !(align - 1);
         let here = *next;
         next.0 += (bytes + 7) & !7;
         here
@@ -1336,7 +1347,11 @@ impl RegAlloc {
                         self.free_fp_regs.retain(|&r| r != fp_arg_regs[fp_arg_idx]);
                         self.fp_pseudos.insert(pseudo);
                     } else {
-                        let at = IncomingOff::take(&mut next_incoming, (*size_bits / 8) as i32);
+                        let at = IncomingOff::take(
+                            &mut next_incoming,
+                            (*size_bits / 8) as i32,
+                            types.alignment(arg.typ) as i32,
+                        );
                         self.locations.insert(pseudo, Loc::Stack(at.displacement()));
                         self.fp_pseudos.insert(pseudo);
                     }
@@ -1367,7 +1382,11 @@ impl RegAlloc {
                         self.fp_pseudos.insert(pseudo);
                         fp_arg_idx += count;
                     } else {
-                        let at = IncomingOff::take(&mut next_incoming, (count * elem_bytes) as i32);
+                        let at = IncomingOff::take(
+                            &mut next_incoming,
+                            (count * elem_bytes) as i32,
+                            types.alignment(arg.typ) as i32,
+                        );
                         self.locations.insert(pseudo, Loc::Stack(at.displacement()));
                         self.fp_pseudos.insert(pseudo);
                         // AAPCS64 §6.4.2: once an argument is laid out on the
@@ -1392,7 +1411,11 @@ impl RegAlloc {
                         });
                     } else {
                         // Overflow: 16 bytes on caller stack.
-                        let at = IncomingOff::take(&mut next_incoming, 16);
+                        let at = IncomingOff::take(
+                            &mut next_incoming,
+                            16,
+                            types.alignment(arg.typ) as i32,
+                        );
                         self.locations.insert(pseudo, Loc::Stack(at.displacement()));
                     }
                     int_arg_idx += 2;
@@ -1413,7 +1436,11 @@ impl RegAlloc {
                             r != int_arg_regs[int_arg_idx] && r != int_arg_regs[int_arg_idx + 1]
                         });
                     } else {
-                        let at = IncomingOff::take(&mut next_incoming, 16);
+                        let at = IncomingOff::take(
+                            &mut next_incoming,
+                            16,
+                            types.alignment(arg.typ) as i32,
+                        );
                         self.locations.insert(pseudo, Loc::Stack(at.displacement()));
                     }
                     int_arg_idx += 2;
@@ -1430,7 +1457,11 @@ impl RegAlloc {
                             .insert(pseudo, Loc::Reg(int_arg_regs[int_arg_idx]));
                         self.free_regs.retain(|&r| r != int_arg_regs[int_arg_idx]);
                     } else {
-                        let at = IncomingOff::take(&mut next_incoming, 8);
+                        let at = IncomingOff::take(
+                            &mut next_incoming,
+                            8,
+                            types.alignment(arg.typ) as i32,
+                        );
                         self.locations.insert(pseudo, Loc::Stack(at.displacement()));
                     }
                     int_arg_idx += 1;

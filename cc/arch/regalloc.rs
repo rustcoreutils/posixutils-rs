@@ -1250,6 +1250,11 @@ pub struct AbiArg {
     pub pseudo: PseudoId,
     /// Classification produced by `abi.classify_param(typ, types)`.
     pub class: ArgClass,
+    /// The parameter's type. `ArgClass` carries a size but not an alignment,
+    /// and the two do not follow one another: `struct { long a, b; }` is
+    /// sixteen bytes and eight-byte aligned, while `__int128` is sixteen of
+    /// each. A stacked argument's address depends on the alignment.
+    pub typ: crate::types::TypeId,
     /// True iff the type is `__int128` / `unsigned __int128`. Backends
     /// always allocate an aligned local stack slot for int128 even when
     /// the value arrives in a register pair.
@@ -1339,6 +1344,7 @@ impl<'a> AbiLowering<'a> {
                 Some(AbiArg {
                     pseudo,
                     class,
+                    typ: *typ,
                     is_int128: kind == TypeKind::Int128,
                 })
             })

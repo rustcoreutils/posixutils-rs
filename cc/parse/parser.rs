@@ -17,7 +17,7 @@ use super::ast::{
 };
 use crate::diag;
 use crate::strings::StringId;
-use crate::symbol::{Namespace, Symbol, SymbolId, SymbolTable};
+use crate::symbol::{Namespace, Symbol, SymbolId, SymbolKind, SymbolTable};
 use crate::token::lexer::{IdentTable, Position, SpecialToken, Token, TokenType, TokenValue};
 use crate::types::{
     CompositeType, EnumConstant, StructMember, Type, TypeId, TypeKind, TypeModifiers, TypeTable,
@@ -2043,6 +2043,7 @@ impl Parser<'_> {
                 // after the completion of its declarator."
                 let mut symbol_id: Option<SymbolId> = None;
                 if has_name && !is_typedef {
+                    self.check_redeclaration(name, typ, decl_pos);
                     let sym = Symbol::variable(name, typ, self.symbols.depth())
                         .with_align(validated_align);
                     if let Ok(id) = self.symbols.declare(sym) {
@@ -2619,6 +2620,145 @@ impl Parser<'_> {
         self.types.intern(stripped)
     }
 
+    /// `strip_declaration_modifiers`, reaching a function type's return type
+    /// as well.
+    ///
+    /// `static`, `extern` and `inline` are recorded on the declaration's base
+    /// type, which for a function declarator *is* the return type -- so
+    /// `inline int hdr(int)` and `extern int hdr(int)` build function types
+    /// whose returns are two different `int`s, and compatibility comparing
+    /// bases by id calls them different. They print identically, which is how
+    /// the diagnostic gave itself away: "conflicting types for 'hdr':
+    /// 'int(int)' then 'int(int)'". `cc/audit.md` records the same family of
+    /// bug reaching call compatibility once before.
+    fn strip_declaration_modifiers_deep(&mut self, id: TypeId) -> TypeId {
+        let id = self.strip_declaration_modifiers(id);
+        if self.types.kind(id) != TypeKind::Function {
+            return id;
+        }
+        let Some(ret) = self.types.base_type(id) else {
+            return id;
+        };
+        let stripped_ret = self.strip_declaration_modifiers_deep(ret);
+        if stripped_ret == ret {
+            return id;
+        }
+        let mut func = self.types.get(id).clone();
+        func.base = Some(stripped_ret);
+        self.types.intern(func)
+    }
+
+    /// Diagnose a redeclaration whose type conflicts with the one already in
+    /// scope (C17 6.7p4: all declarations of the same object or function shall
+    /// specify compatible types).
+    ///
+    /// Nothing compared types before: `SymbolTable::declare` only rejects two
+    /// *definitions* at one depth, and `Symbol::function` is never marked
+    /// defined, so two function declarations never collided at all. `int x;
+    /// double x;` therefore bound the second declarator to the first symbol
+    /// and emitted `.comm x,4,4` -- a silent miscompile, since a `double`
+    /// store through it runs off the object.
+    ///
+    /// The two guards are what keep legal code legal, and both are borrowed
+    /// from `check_typedef_redefinition`: only a repeat *in the same scope* is
+    /// a redeclaration, so shadowing survives; and the declaration-only
+    /// modifiers come off first, so `extern int x;` followed by `int x = 5;`
+    /// is one type, not two.
+    fn check_redeclaration(&mut self, name: StringId, new_type: TypeId, pos: Position) {
+        let Some(existing_id) = self.symbols.lookup_id(name, Namespace::Ordinary) else {
+            return;
+        };
+        let existing = self.symbols.get(existing_id);
+        // Typedefs have their own check; a tag or enum constant is a different
+        // namespace or a different kind of thing entirely.
+        if !matches!(
+            existing.kind,
+            SymbolKind::Variable | SymbolKind::Function | SymbolKind::Parameter
+        ) {
+            return;
+        }
+        if existing.scope_depth != self.symbols.depth() {
+            return;
+        }
+        let old_kind = existing.kind;
+        let old_type = existing.typ;
+        let old_type = self.strip_declaration_modifiers_deep(old_type);
+        let new_type = self.strip_declaration_modifiers_deep(new_type);
+        if self.redeclaration_compatible(old_type, new_type) {
+            return;
+        }
+
+        let spelled = self.idents.get_opt(name).unwrap_or("").to_string();
+        // gcc distinguishes these, and the distinction is the useful part: a
+        // function becoming an object is a different mistake from a function
+        // changing its signature.
+        let old_is_func =
+            self.types.kind(old_type) == TypeKind::Function || old_kind == SymbolKind::Function;
+        let new_is_func = self.types.kind(new_type) == TypeKind::Function;
+        if old_is_func != new_is_func {
+            diag::error_args(
+                pos,
+                "'{0}' redeclared as a different kind of symbol",
+                &[&spelled],
+            );
+            return;
+        }
+        diag::error_args(
+            pos,
+            "conflicting types for '{0}': '{1}' then '{2}'",
+            &[
+                &spelled,
+                &self.types.format_type(old_type, Some(self.idents)),
+                &self.types.format_type(new_type, Some(self.idents)),
+            ],
+        );
+    }
+
+    /// Are these two declarations of one name compatible (C17 6.2.7)?
+    ///
+    /// Beyond ordinary type compatibility, 6.2.7p2 pairs a declarator with no
+    /// prototype against one that has a prototype: `int f(); int f(int);` is a
+    /// composite type, not a conflict. That case is only expressible because
+    /// the function type now records whether a prototype was supplied.
+    fn redeclaration_compatible(&self, old: TypeId, new: TypeId) -> bool {
+        if self.types.types_compatible(old, new) {
+            return true;
+        }
+        let (o, n) = (self.types.get(old), self.types.get(new));
+
+        // 6.2.7p3: an array of unknown size is compatible with a sized array
+        // of the same element type -- the composite takes the known size. That
+        // is how `extern int a[]; int a[3];` completes a declaration.
+        //
+        // "Unknown" is spelled two ways here, absent and zero, because the
+        // declarator paths do not agree on which; that also means a genuine
+        // `int a[0]` (the GNU zero-length array) is accepted against any size.
+        // Under-diagnosing that is the safe direction.
+        if o.kind == TypeKind::Array && n.kind == TypeKind::Array {
+            let size_unknown = |sz: Option<usize>| matches!(sz, None | Some(0));
+            if size_unknown(o.array_size) || size_unknown(n.array_size) {
+                return match (o.base, n.base) {
+                    (Some(a), Some(b)) => self.types.types_compatible(a, b),
+                    _ => false,
+                };
+            }
+        }
+
+        if o.kind != TypeKind::Function || n.kind != TypeKind::Function {
+            return false;
+        }
+        // Exactly one side lacks a prototype: compatible when the return types
+        // agree. Checking the parameters against their promoted types as well
+        // would be stricter than gcc, which accepts the pairing outright.
+        if o.params.is_some() == n.params.is_some() {
+            return false;
+        }
+        match (o.base, n.base) {
+            (Some(a), Some(b)) => self.types.types_compatible(a, b),
+            _ => false,
+        }
+    }
+
     /// Diagnose redefining a typedef name with an incompatible type.
     ///
     /// C11/C17 6.7p3 legalized redefining a typedef, but only to a *compatible*
@@ -2949,6 +3089,16 @@ impl Parser<'_> {
 
                     // Capture any pending _Alignas from type specifier
                     let member_align = self.pending_alignas.take();
+
+                    // C17 6.7.2.1p2: members share one name space, so a
+                    // repeated name is a constraint violation. Unnamed members
+                    // -- anonymous struct/union members and unnamed bitfields
+                    // -- all carry the empty name and are not repeats of each
+                    // other.
+                    if name != StringId::EMPTY && members.iter().any(|m| m.name == name) {
+                        let spelled = self.idents.get_opt(name).unwrap_or("").to_string();
+                        diag::error_args(self.current_pos(), "duplicate member '{0}'", &[&spelled]);
+                    }
 
                     members.push(StructMember {
                         name,
@@ -3504,6 +3654,7 @@ impl Parser<'_> {
         let func_type_id = self.types.intern(func_type);
 
         // Bind function to symbol table at current (global) scope
+        self.check_redeclaration(name, func_type_id, self.current_pos());
         let func_sym = Symbol::function(name, func_type_id, self.symbols.depth());
         let _ = self.symbols.declare(func_sym); // Ignore redefinition errors for now
 
@@ -3690,6 +3841,17 @@ impl Parser<'_> {
                 }
                 None => Vec::new(),
             };
+
+            // C17 6.7.6.3p10: `void` may appear as a parameter only as the
+            // unnamed sole item in the list. `int f(void a)` names it, which
+            // gcc reports and c17 accepted silently.
+            if self.types.kind(typ_id) == TypeKind::Void {
+                diag::warning_args(
+                    self.current_pos(),
+                    "parameter {0} has void type",
+                    &[&(params.len() + 1).to_string()],
+                );
+            }
 
             params.push(RawParam {
                 name: name_opt,
@@ -3942,6 +4104,7 @@ impl Parser<'_> {
                     let is_inline = base_type.modifiers.contains(TypeModifiers::INLINE);
 
                     // Add function to symbol table
+                    self.check_redeclaration(name, typ, decl_pos);
                     let func_sym = Symbol::function(name, typ, self.symbols.depth());
                     let _ = self.symbols.declare(func_sym);
                     // Definitions bind a fresh symbol, so this path needs the
@@ -4024,6 +4187,7 @@ impl Parser<'_> {
                         .ok()
                         .or_else(|| self.symbols.lookup_id(name, Namespace::Ordinary))
                 } else {
+                    self.check_redeclaration(name, typ, decl_pos);
                     let var_sym = Symbol::variable(name, typ, self.symbols.depth())
                         .with_align(validated_align);
                     self.symbols
@@ -4133,6 +4297,7 @@ impl Parser<'_> {
                     let is_inline = base_type.modifiers.contains(TypeModifiers::INLINE);
 
                     // Add function to symbol table
+                    self.check_redeclaration(name, full_typ, decl_pos);
                     let func_sym = Symbol::function(name, full_typ, self.symbols.depth());
                     let _ = self.symbols.declare(func_sym);
                     self.settle_declaration_facts(name, storage_class);
@@ -4203,6 +4368,7 @@ impl Parser<'_> {
                         .ok()
                         .or_else(|| self.symbols.lookup_id(name, Namespace::Ordinary))
                 } else {
+                    self.check_redeclaration(name, full_typ, decl_pos);
                     let var_sym = Symbol::variable(name, full_typ, self.symbols.depth())
                         .with_align(validated_align);
                     self.symbols
@@ -4313,6 +4479,7 @@ impl Parser<'_> {
                     Type::function_no_prototype(typ_id, is_noreturn)
                 };
                 let func_type_id = self.types.intern(func_type);
+                self.check_redeclaration(name, func_type_id, decl_pos);
                 let func_sym = Symbol::function(name, func_type_id, self.symbols.depth());
                 let _ = self.symbols.declare(func_sym);
                 self.settle_declaration_facts(name, storage_class);
@@ -4372,6 +4539,7 @@ impl Parser<'_> {
                         .or_else(|| self.symbols.lookup_id(name, Namespace::Ordinary))
                 } else {
                     // Function declaration: add so the variadic flag is available when called
+                    self.check_redeclaration(name, func_type_id, decl_pos);
                     let func_sym = Symbol::function(name, func_type_id, self.symbols.depth());
                     self.symbols
                         .declare(func_sym)
@@ -4459,6 +4627,7 @@ impl Parser<'_> {
             None // Will be bound after initializer parsing
         } else {
             // Add global variable to symbol table so it can be referenced in initializer
+            self.check_redeclaration(name, var_type_id, self.current_pos());
             let var_sym = Symbol::variable(name, var_type_id, self.symbols.depth())
                 .with_align(validated_align);
             Some(match self.symbols.declare(var_sym) {
@@ -4554,6 +4723,7 @@ impl Parser<'_> {
             let mut decl_symbol = if is_typedef {
                 None // Will be bound after initializer parsing
             } else {
+                self.check_redeclaration(decl_name, decl_type, decl_pos);
                 let var_sym = Symbol::variable(decl_name, decl_type, self.symbols.depth())
                     .with_align(decl_validated_align);
                 Some(match self.symbols.declare(var_sym) {

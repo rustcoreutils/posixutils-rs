@@ -440,7 +440,7 @@ impl Type {
     ///
     /// With TypeId interning, base types are compared by TypeId equality.
     /// For full recursive comparison, use TypeTable::types_compatible().
-    pub fn types_compatible(&self, other: &Type) -> bool {
+    fn compatible_ignoring_base(&self, other: &Type) -> bool {
         // Top-level qualifiers to ignore
         const QUALIFIERS: TypeModifiers = TypeModifiers::CONST
             .union(TypeModifiers::VOLATILE)
@@ -483,31 +483,47 @@ impl Type {
             return false;
         }
 
-        // Compare base types by TypeId (interned types with same ID are equal)
-        if self.base != other.base {
-            return false;
-        }
+        // The base is compared by the caller, which can recurse. Comparing it
+        // here by TypeId called two structurally identical types different
+        // whenever a declaration specifier had settled on an inner type:
+        // `static char *x[]` records STATIC on the element, so assigning it to
+        // a plain `char **` field reported "'char**' from 'char**'" -- a
+        // complaint about two spellings of one type. Storage class is a
+        // property of a declaration, never of a type.
 
-        // Compare function parameters by TypeId
+        // Only the *shape* of the parameter list is settled here: whether a
+        // prototype was supplied at all, and how many parameters it has. The
+        // parameter types themselves are compared by the caller, which can
+        // recurse -- comparing them by TypeId called two identical
+        // `void *(Parser *)` different whenever a declaration specifier had
+        // settled on an inner type, which is 19 lines of CPython's generated
+        // parser.
         match (&self.params, &other.params) {
-            (Some(a), Some(b)) => {
-                if a.len() != b.len() {
-                    return false;
-                }
-                // TypeIds are directly comparable
-                if a != b {
-                    return false;
-                }
-            }
+            (Some(a), Some(b)) if a.len() == b.len() => {}
             (None, None) => {}
             _ => return false,
         }
 
         // Compare composite types (struct, union, enum)
-        // For these, we require the exact same composite definition
-        // (different enum types are NOT compatible even with same underlying type)
         match (&self.composite, &other.composite) {
-            (Some(a), Some(b)) => a == b,
+            (Some(a), Some(b)) => {
+                // A tag names the type. C17 6.2.7p1: completing a
+                // forward-declared struct does not create a second type, so
+                // `struct S;` and the later `struct S { int x; }` are one --
+                // but they are two `CompositeType` values, one incomplete with
+                // no members, and comparing those structurally called every
+                // function declared before the definition and defined after it
+                // a conflicting redeclaration.
+                //
+                // Different enum types stay incompatible even with the same
+                // underlying type, because their tags differ.
+                match (a.tag, b.tag) {
+                    (Some(x), Some(y)) => x == y,
+                    // Anonymous composites have nothing to name them, so they
+                    // are compared by what they contain.
+                    _ => a == b,
+                }
+            }
             (None, None) => true,
             _ => false,
         }
@@ -1488,8 +1504,28 @@ impl TypeTable {
         if id1 == id2 {
             return true;
         }
-        // Compare underlying types
-        self.get(id1).types_compatible(self.get(id2))
+        if !self.get(id1).compatible_ignoring_base(self.get(id2)) {
+            return false;
+        }
+        // Then the referenced type and the parameter types, structurally
+        // rather than by identity. Recursion terminates: `base` and parameter
+        // chains shorten by one derivation at a time, and a struct's members
+        // are compared as ids inside its composite rather than followed.
+        let base_ok = match (self.get(id1).base, self.get(id2).base) {
+            (Some(a), Some(b)) => self.types_compatible(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        if !base_ok {
+            return false;
+        }
+        match (&self.get(id1).params, &self.get(id2).params) {
+            (Some(a), Some(b)) => a
+                .iter()
+                .zip(b.iter())
+                .all(|(&x, &y)| self.types_compatible(x, y)),
+            _ => true,
+        }
     }
 
     /// Check if two types are compatible *and* identically qualified.
@@ -1517,7 +1553,7 @@ impl TypeTable {
             return false;
         }
 
-        t1.types_compatible(t2)
+        self.types_compatible(id1, id2)
     }
 
     /// Compute struct layout with natural alignment
@@ -1767,70 +1803,78 @@ mod tests {
 
     #[test]
     fn test_types_compatible_same_type() {
-        let int1 = Type::basic(TypeKind::Int);
-        let int2 = Type::basic(TypeKind::Int);
-        assert!(int1.types_compatible(&int2));
+        let mut types = TypeTable::new(&Target::host());
+        let int1 = types.intern(Type::basic(TypeKind::Int));
+        let int2 = types.intern(Type::basic(TypeKind::Int));
+        assert!(types.types_compatible(int1, int2));
 
-        let char1 = Type::basic(TypeKind::Char);
-        let char2 = Type::basic(TypeKind::Char);
-        assert!(char1.types_compatible(&char2));
+        let char1 = types.intern(Type::basic(TypeKind::Char));
+        let char2 = types.intern(Type::basic(TypeKind::Char));
+        assert!(types.types_compatible(char1, char2));
     }
 
     #[test]
     fn test_types_compatible_different_types() {
-        let int_type = Type::basic(TypeKind::Int);
-        let char_type = Type::basic(TypeKind::Char);
-        assert!(!int_type.types_compatible(&char_type));
+        let mut types = TypeTable::new(&Target::host());
+        let int_type = types.intern(Type::basic(TypeKind::Int));
+        let char_type = types.intern(Type::basic(TypeKind::Char));
+        assert!(!types.types_compatible(int_type, char_type));
 
-        let long_type = Type::basic(TypeKind::Long);
-        assert!(!int_type.types_compatible(&long_type));
+        let long_type = types.intern(Type::basic(TypeKind::Long));
+        assert!(!types.types_compatible(int_type, long_type));
     }
 
     #[test]
     fn test_types_compatible_qualifiers_ignored() {
-        let int_type = Type::basic(TypeKind::Int);
-        let const_int = Type::with_modifiers(TypeKind::Int, TypeModifiers::CONST);
-        let volatile_int = Type::with_modifiers(TypeKind::Int, TypeModifiers::VOLATILE);
-        let cv_int = Type::with_modifiers(
+        let mut types = TypeTable::new(&Target::host());
+        let int_type = types.intern(Type::basic(TypeKind::Int));
+        let const_int = types.intern(Type::with_modifiers(TypeKind::Int, TypeModifiers::CONST));
+        let volatile_int =
+            types.intern(Type::with_modifiers(TypeKind::Int, TypeModifiers::VOLATILE));
+        let cv_int = types.intern(Type::with_modifiers(
             TypeKind::Int,
             TypeModifiers::CONST | TypeModifiers::VOLATILE,
-        );
+        ));
 
         // All should be compatible with plain int
-        assert!(int_type.types_compatible(&const_int));
-        assert!(int_type.types_compatible(&volatile_int));
-        assert!(int_type.types_compatible(&cv_int));
-        assert!(const_int.types_compatible(&volatile_int));
+        assert!(types.types_compatible(int_type, const_int));
+        assert!(types.types_compatible(int_type, volatile_int));
+        assert!(types.types_compatible(int_type, cv_int));
+        assert!(types.types_compatible(const_int, volatile_int));
     }
 
     #[test]
     fn test_types_compatible_signedness_matters() {
-        let int_type = Type::basic(TypeKind::Int);
-        let uint_type = Type::with_modifiers(TypeKind::Int, TypeModifiers::UNSIGNED);
+        let mut types = TypeTable::new(&Target::host());
+        let int_type = types.intern(Type::basic(TypeKind::Int));
+        let uint_type = types.intern(Type::with_modifiers(TypeKind::Int, TypeModifiers::UNSIGNED));
         // Signedness is NOT a qualifier, so these are NOT compatible
-        assert!(!int_type.types_compatible(&uint_type));
+        assert!(!types.types_compatible(int_type, uint_type));
     }
 
+    /// Pointer compatibility is a question about the *referenced* types, so
+    /// it is asked through the table, which recurses. The `Type`-level
+    /// comparison deliberately stops before the base.
     #[test]
     fn test_types_compatible_pointers() {
-        let types = TypeTable::new(&Target::host());
-        let int_ptr = Type::pointer(types.int_id);
-        let int_ptr2 = Type::pointer(types.int_id);
-        assert!(int_ptr.types_compatible(&int_ptr2));
+        let mut types = TypeTable::new(&Target::host());
+        let int_ptr = types.intern(Type::pointer(types.int_id));
+        let int_ptr2 = types.intern(Type::pointer(types.int_id));
+        assert!(types.types_compatible(int_ptr, int_ptr2));
 
-        let char_ptr = Type::pointer(types.char_id);
-        assert!(!int_ptr.types_compatible(&char_ptr));
+        let char_ptr = types.intern(Type::pointer(types.char_id));
+        assert!(!types.types_compatible(int_ptr, char_ptr));
     }
 
     #[test]
     fn test_types_compatible_arrays() {
-        let types = TypeTable::new(&Target::host());
-        let arr10 = Type::array(types.int_id, 10);
-        let arr10_2 = Type::array(types.int_id, 10);
-        assert!(arr10.types_compatible(&arr10_2));
+        let mut types = TypeTable::new(&Target::host());
+        let arr10 = types.intern(Type::array(types.int_id, 10));
+        let arr10_2 = types.intern(Type::array(types.int_id, 10));
+        assert!(types.types_compatible(arr10, arr10_2));
 
-        let arr20 = Type::array(types.int_id, 20);
-        assert!(!arr10.types_compatible(&arr20));
+        let arr20 = types.intern(Type::array(types.int_id, 20));
+        assert!(!types.types_compatible(arr10, arr20));
     }
 
     #[test]

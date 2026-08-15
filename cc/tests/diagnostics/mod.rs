@@ -1259,3 +1259,119 @@ int f(void) {
 "#;
     compile_expect_ok("permitted_void_and_subscripts", src);
 }
+
+// ==== declaration compatibility (C17 6.7p4, 6.2.7, 6.7.2.1p2, 6.7.6.3p10) ====
+
+/// All declarations of one name in one scope must specify compatible types.
+/// Nothing compared them: `SymbolTable::declare` rejects only two *definitions*
+/// at one depth, and a function symbol is never marked defined, so two function
+/// declarations never collided at all.
+///
+/// `int x; double x;` was therefore not merely undiagnosed -- it bound the
+/// second declarator to the first symbol and emitted `.comm x,4,4`, so a
+/// `double` store through it ran off the end of the object. That is the second
+/// of the two silent miscompiles this series set out to close.
+#[test]
+fn diagnostics_conflicting_declarations_are_rejected() {
+    for (name, src, expected) in [
+        (
+            "conflicting_object",
+            "int x;\ndouble x;\n",
+            "conflicting types for 'x'",
+        ),
+        (
+            "conflicting_function",
+            "int f(int);\nint f(char *);\n",
+            "conflicting types for 'f'",
+        ),
+        (
+            "conflicting_in_block",
+            "int main(void){ int a; double a; return 0; }\n",
+            "conflicting types for 'a'",
+        ),
+        (
+            "function_then_object",
+            "int f(void);\nint f;\n",
+            "redeclared as a different kind of symbol",
+        ),
+        (
+            "array_size_mismatch",
+            "extern int a[3];\nint a[4];\n",
+            "conflicting types for 'a'",
+        ),
+        (
+            "duplicate_struct_member",
+            "struct S { int a; int a; };\n",
+            "duplicate member 'a'",
+        ),
+        (
+            "duplicate_union_member",
+            "union U { int a; float a; };\n",
+            "duplicate member 'a'",
+        ),
+    ] {
+        compile_expect_error(name, src, expected);
+    }
+}
+
+/// The accept side, and it carries the weight here: a redeclaration check that
+/// is even slightly too eager breaks every C program, because headers repeat
+/// declarations constantly.
+///
+/// Each of these is a distinct reason the check must stay quiet -- a repeat, a
+/// tentative definition, a prototype meeting its definition, 6.2.7p2's pairing
+/// of an unprototyped declarator with a prototyped one, a storage class
+/// changing between declarations, shadowing in an inner scope, a parameter
+/// over a global, and 6.2.7p3's completion of an array type.
+#[test]
+fn diagnostics_compatible_redeclarations_are_accepted() {
+    for (name, src) in [
+        ("repeat_identical", "int x;\nint x;\nint main(void){ return x; }\n"),
+        ("tentative_then_defined", "int x;\nint x = 3;\nint main(void){ return x - 3; }\n"),
+        (
+            "prototype_then_definition",
+            "int f(int);\nint f(int a){ return a; }\nint main(void){ return f(0); }\n",
+        ),
+        // 6.2.7p2: no prototype, then one.
+        ("unprototyped_then_prototyped", "int f();\nint f(int);\nint main(void){ return 0; }\n"),
+        ("extern_then_definition", "extern int x;\nint x = 5;\nint main(void){ return x - 5; }\n"),
+        (
+            "static_then_definition",
+            "static int f(void);\nstatic int f(void){ return 0; }\nint main(void){ return f(); }\n",
+        ),
+        // `inline` and `extern` ride on the *return* type, so a naive
+        // comparison called these two `int(int)` different from each other.
+        (
+            "inline_then_extern",
+            "inline int h(int a){ return a; }\nextern int h(int);\nint main(void){ return h(1) - 1; }\n",
+        ),
+        ("inner_scope_shadow", "int x;\nint main(void){ double x = 1; return (int)x - 1; }\n"),
+        ("parameter_shadows_global", "int x;\nint f(double x){ return (int)x; }\nint main(void){ return f(0); }\n"),
+        ("enum_constant", "enum E { A };\nint main(void){ return A; }\n"),
+        // 6.2.7p3: an array of unknown size completed by a sized one.
+        ("array_completion", "extern int a[];\nint a[3];\nint main(void){ return a[0]; }\n"),
+        ("typedef_repeat", "typedef int T;\ntypedef int T;\nint main(void){ T x = 0; return x; }\n"),
+        // Unnamed members all share the empty name and are not repeats.
+        (
+            "anonymous_and_unnamed_members",
+            "struct S { int a; struct { int b; }; int :3; int :4; int c; };\nint main(void){ return 0; }\n",
+        ),
+        // 6.2.7p1: a tag names the type, so completing a forward declaration
+        // does not create a second one. Comparing the two `CompositeType`
+        // values structurally -- one incomplete and memberless -- called every
+        // function declared before the definition and defined after it a
+        // conflicting redeclaration. That is the shape of CPython's public
+        // headers: `PyLongObject` is forward-declared, used in prototypes, and
+        // completed later.
+        (
+            "forward_declared_struct_completed",
+            "struct S;\nint f(const struct S *p);\nstruct S { int x; };\nint f(const struct S *p){ return p->x; }\nint main(void){ struct S s = {1}; return f(&s) - 1; }\n",
+        ),
+        (
+            "forward_declared_struct_via_typedef",
+            "typedef struct _o Obj;\nint g(const Obj *p);\nstruct _o { int x; };\nint g(const Obj *p){ return p->x; }\nint main(void){ struct _o o = {2}; return g(&o) - 2; }\n",
+        ),
+    ] {
+        compile_expect_ok(name, src);
+    }
+}

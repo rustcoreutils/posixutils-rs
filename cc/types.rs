@@ -518,7 +518,15 @@ impl Type {
                 // Different enum types stay incompatible even with the same
                 // underlying type, because their tags differ.
                 match (a.tag, b.tag) {
-                    (Some(x), Some(y)) => x == y,
+                    // One side still incomplete: this is a tag meeting its own
+                    // definition, so the tag is all there is to go on.
+                    (Some(x), Some(y)) if !a.is_complete || !b.is_complete => x == y,
+                    // Both complete: the tag is necessary but not sufficient,
+                    // because a nested scope may declare a different type under
+                    // the same name. Comparing what they contain tells them
+                    // apart, and this predicate feeds accept/reject decisions
+                    // now, not only diagnostics.
+                    (Some(x), Some(y)) => x == y && a == b,
                     // Anonymous composites have nothing to name them, so they
                     // are compared by what they contain.
                     _ => a == b,
@@ -658,6 +666,19 @@ impl AssignFault {
             AssignFault::QualifierDiscard => "discards a qualifier from the pointer target type",
         }
     }
+}
+
+/// Whether a comparison treats the outermost `const`/`volatile`/`restrict`/
+/// `_Atomic` as part of the type.
+///
+/// They are not part of it for a whole object -- `const int` and `int` are the
+/// same type to `__builtin_types_compatible_p` -- but they are for anything a
+/// pointer or array refers to (C17 6.7.6.1p2), and are not for a parameter
+/// (6.7.6.3p15).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TopLevelQualifiers {
+    Ignored,
+    Significant,
 }
 
 const DEFAULT_TYPE_TABLE_CAPACITY: usize = 65536;
@@ -1498,10 +1519,31 @@ impl TypeTable {
     }
 
     /// Check if two types are compatible (for __builtin_types_compatible_p)
+    ///
+    /// Top-level qualifiers are ignored, which is what
+    /// `__builtin_types_compatible_p` documents and what "compatible type"
+    /// means of a whole object. They are *not* ignored below the top level:
+    /// C17 6.7.6.1p2 requires two pointers to be identically qualified as well
+    /// as to point at compatible types, so `char *` and `const char *` are
+    /// different types.
     pub fn types_compatible(&self, id1: TypeId, id2: TypeId) -> bool {
+        self.compatible(id1, id2, TopLevelQualifiers::Ignored)
+    }
+
+    fn compatible(&self, id1: TypeId, id2: TypeId, quals: TopLevelQualifiers) -> bool {
         // Quick check: same TypeId means same type
         if id1 == id2 {
             return true;
+        }
+        const QUALIFIERS: TypeModifiers = TypeModifiers::CONST
+            .union(TypeModifiers::VOLATILE)
+            .union(TypeModifiers::RESTRICT)
+            .union(TypeModifiers::ATOMIC);
+        if quals == TopLevelQualifiers::Significant
+            && self.get(id1).modifiers.intersection(QUALIFIERS)
+                != self.get(id2).modifiers.intersection(QUALIFIERS)
+        {
+            return false;
         }
         if !self.get(id1).compatible_ignoring_base(self.get(id2)) {
             return false;
@@ -1510,8 +1552,14 @@ impl TypeTable {
         // rather than by identity. Recursion terminates: `base` and parameter
         // chains shorten by one derivation at a time, and a struct's members
         // are compared as ids inside its composite rather than followed.
+        //
+        // The referenced type carries its qualifiers into the comparison --
+        // that is the whole of 6.7.6.1p2 -- while a *parameter* does not:
+        // 6.7.6.3p15 takes each parameter as having the unqualified version of
+        // its declared type, so `void f(const int)` and `void f(int)` are one
+        // type.
         let base_ok = match (self.get(id1).base, self.get(id2).base) {
-            (Some(a), Some(b)) => self.types_compatible(a, b),
+            (Some(a), Some(b)) => self.compatible(a, b, TopLevelQualifiers::Significant),
             (None, None) => true,
             _ => false,
         };
@@ -1522,7 +1570,7 @@ impl TypeTable {
             (Some(a), Some(b)) => a
                 .iter()
                 .zip(b.iter())
-                .all(|(&x, &y)| self.types_compatible(x, y)),
+                .all(|(&x, &y)| self.compatible(x, y, TopLevelQualifiers::Ignored)),
             _ => true,
         }
     }
@@ -1538,21 +1586,7 @@ impl TypeTable {
     /// association can never be selected because the controlling expression has
     /// been lvalue-converted to an unqualified type.
     pub fn types_compatible_qualified(&self, id1: TypeId, id2: TypeId) -> bool {
-        if id1 == id2 {
-            return true;
-        }
-
-        const QUALIFIERS: TypeModifiers = TypeModifiers::CONST
-            .union(TypeModifiers::VOLATILE)
-            .union(TypeModifiers::RESTRICT)
-            .union(TypeModifiers::ATOMIC);
-
-        let (t1, t2) = (self.get(id1), self.get(id2));
-        if t1.modifiers.intersection(QUALIFIERS) != t2.modifiers.intersection(QUALIFIERS) {
-            return false;
-        }
-
-        self.types_compatible(id1, id2)
+        self.compatible(id1, id2, TopLevelQualifiers::Significant)
     }
 
     /// Compute struct layout with natural alignment

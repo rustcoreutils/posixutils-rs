@@ -1730,3 +1730,56 @@ int main(void) {
         0
     );
 }
+
+/// C17 6.7.9p14: an array of character type may be exactly as long as the
+/// string literal initializing it, in which case the terminating null is
+/// dropped rather than written. `char b[2] = "hi"` holds two characters.
+///
+/// The store loop wrote the null unconditionally, one byte past the object.
+/// Pre-existing for the unbraced spelling; the braced one reached the same
+/// loop once the two shared a routine.
+#[test]
+fn c99_string_initializer_exactly_fills_its_array() {
+    let code = r#"
+#include <string.h>
+
+char g2[2] = "hi";
+char g3[3] = "hi";
+char gb2[2] = {"hi"};
+
+int main(void) {
+    /* Neighbours on the stack must survive an exactly-sized copy. */
+    char before[4];
+    char b2[2] = "hi";
+    char bb2[2] = {"hi"};
+    char after[4];
+    memset(before, 0x5a, sizeof before);
+    memset(after, 0x5a, sizeof after);
+
+    if (sizeof b2 != 2 || b2[0] != 'h' || b2[1] != 'i') return 1;
+    if (sizeof bb2 != 2 || bb2[0] != 'h' || bb2[1] != 'i') return 2;
+    for (int i = 0; i < 4; i++) {
+        if (before[i] != 0x5a) return 3;
+        if (after[i] != 0x5a) return 4;
+    }
+
+    if (sizeof g2 != 2 || g2[0] != 'h' || g2[1] != 'i') return 5;
+    if (sizeof gb2 != 2 || gb2[0] != 'h' || gb2[1] != 'i') return 6;
+
+    /* One byte longer, so the terminator is written and the rest zeroed. */
+    if (sizeof g3 != 3 || g3[2] != 0) return 7;
+    char b6[6] = "hi";
+    if (sizeof b6 != 6 || b6[2] != 0 || b6[5] != 0) return 8;
+
+    /* And an inferred bound still makes room for it. */
+    char inferred[] = "hi";
+    if (sizeof inferred != 3 || inferred[2] != 0) return 9;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c99_string_initializer_exactly_fills_its_array", code, &[]),
+        0
+    );
+}

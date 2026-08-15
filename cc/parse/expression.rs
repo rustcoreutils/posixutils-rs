@@ -1879,6 +1879,9 @@ impl<'a> Parser<'a> {
             | ExprKind::WideStringLit(_)
             | ExprKind::Utf16StringLit(_)
             | ExprKind::Utf32StringLit(_) => true,
+            // A GNU statement expression is an lvalue exactly when the
+            // expression it ends with is one, which is what gcc documents.
+            ExprKind::StmtExpr { result, .. } => self.is_lvalue(result),
             _ => false,
         }
     }

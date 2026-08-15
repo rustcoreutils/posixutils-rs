@@ -3905,9 +3905,20 @@ impl Parser<'_> {
             };
 
             // C17 6.7.6.3p10: `void` may appear as a parameter only as the
-            // unnamed sole item in the list. `int f(void a)` names it, which
-            // gcc reports and c17 accepted silently.
+            // unnamed sole item in the list -- and then it means the function
+            // takes none. The literal `(void)` is recognised earlier, on the
+            // token; this is the same thing reached through a typedef, as in
+            // `typedef void V; int f(V);`, which must not become a
+            // one-parameter prototype.
             if self.types.kind(typ_id) == TypeKind::Void {
+                if name_opt.is_none() && params.is_empty() && self.is_special(b')') {
+                    self.symbols.leave_scope();
+                    return Ok(ParameterList {
+                        params,
+                        variadic,
+                        prototyped: true,
+                    });
+                }
                 diag::warning_args(
                     self.current_pos(),
                     "parameter {0} has void type",

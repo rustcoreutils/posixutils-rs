@@ -1440,3 +1440,74 @@ int main(void) {
 "#;
     compile_expect_ok("well_sized_initializers", src);
 }
+
+// ==== regressions caught in review of this series ====
+
+/// C17 6.7.6.1p2: two pointers are compatible only if they are *identically
+/// qualified* and point at compatible types. Making compatibility recurse into
+/// the referenced type (so that a storage class on an inner type could not
+/// make one type look like two) briefly re-applied the ignore-top-level-
+/// qualifiers rule at every level, which made `char *` and `const char *` the
+/// same type.
+///
+/// The visible cost was not a missing diagnostic but valid code rejected:
+/// `_Generic` saw two associations with "compatible" types and refused to
+/// compile.
+#[test]
+fn diagnostics_pointer_target_qualifiers_are_part_of_the_type() {
+    compile_expect_ok(
+        "generic_distinguishes_qualified_pointers",
+        "int f(char *x){ return _Generic((x), char *: 1, const char *: 2, default: 0); }\nint main(void){ char c = 0; return f(&c) - 1; }\n",
+    );
+    compile_expect_ok(
+        "builtin_types_compatible_p_qualified_targets",
+        "int main(void){\n  if (__builtin_types_compatible_p(char *, const char *)) return 1;\n  if (__builtin_types_compatible_p(int *, volatile int *)) return 2;\n  if (!__builtin_types_compatible_p(int, const int)) return 3;\n  if (!__builtin_types_compatible_p(int *, int *)) return 4;\n  return 0;\n}\n",
+    );
+    // A parameter is taken as having the unqualified version of its declared
+    // type (6.7.6.3p15), so these two declarations are one type.
+    compile_expect_ok(
+        "parameter_qualifiers_do_not_split_a_prototype",
+        "void f(const int);\nvoid f(int);\nint main(void){ return 0; }\n",
+    );
+    compile_expect_error(
+        "qualified_return_conflicts",
+        "char *f(void);\nconst char *f(void);\n",
+        "conflicting types for 'f'",
+    );
+}
+
+/// A GNU statement expression is an lvalue when the expression it ends with is
+/// one. Omitting it from the lvalue predicate turned working code into a hard
+/// error.
+#[test]
+fn diagnostics_statement_expressions_are_lvalues() {
+    compile_expect_ok(
+        "statement_expression_lvalue",
+        "int main(void){ int x = 0; ({ x; }) = 5; ({ x; })++; return x - 6; }\n",
+    );
+}
+
+/// `void` as the unnamed sole parameter means the function takes none, and
+/// that is true however the type is spelled. Recognising only the literal
+/// keyword made a typedef of `void` into a one-parameter prototype, which the
+/// newly-enabled zero-arity check then turned into an error at every call.
+#[test]
+fn diagnostics_typedef_of_void_is_an_empty_parameter_list() {
+    compile_expect_ok(
+        "typedef_void_parameter",
+        "typedef void V;\nint f(V);\nint f(void){ return 0; }\nint main(void){ return f(); }\n",
+    );
+}
+
+/// A tag names a type, but only within its scope: a nested `struct S` is a
+/// different type from the outer one. Comparing tagged composites by tag alone
+/// -- which is right while one side is still incomplete -- made them the same,
+/// and the assignment check then accepted a copy of the wrong size.
+#[test]
+fn diagnostics_same_tag_in_another_scope_is_another_type() {
+    compile_expect_error(
+        "sibling_scope_struct_assignment",
+        "struct S { int a; };\nvoid f(void){ struct S o; { struct S { double d; } in; in.d = 1.5; o = *(struct S *)&in; } (void)o; }\n",
+        "incompatible types when assigning",
+    );
+}

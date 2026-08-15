@@ -7773,3 +7773,39 @@ int main(void) {
         0
     );
 }
+
+/// C17 6.7.9p14 lets an array of character type be exactly as long as the
+/// string literal initializing it, dropping the terminating null:
+/// `char b[2] = "hi"` holds two characters and no terminator.
+///
+/// The store loop wrote the null unconditionally, one byte past the object.
+/// A runtime check cannot see that -- the byte lands in stack padding -- so
+/// this counts the stores instead. Both spellings share one routine, so both
+/// are pinned; the six-byte case shows the terminator and the zero fill are
+/// still written when there is room for them.
+#[test]
+fn codegen_exactly_sized_string_initializer_stays_in_bounds() {
+    let src = r#"
+void sink(char *);
+void exact(void)  { char b[2] = "hi";   sink(b); }
+void braced(void) { char b[2] = {"hi"}; sink(b); }
+void roomy(void)  { char b[6] = "hi";   sink(b); }
+"#;
+    let asm = crate::codegen::asm_probe::asm_for(
+        "exact_string_init",
+        crate::codegen::asm_probe::X86_64_LINUX,
+        src,
+    );
+    for func in ["exact", "braced"] {
+        assert_eq!(
+            crate::codegen::asm_probe::count_in_body(&asm, func, "movb"),
+            2,
+            "{func}: char b[2] = \"hi\" must store exactly two bytes, not three\n{asm}"
+        );
+    }
+    // Six bytes of room: two characters, then the null and the zero fill.
+    assert!(
+        crate::codegen::asm_probe::count_in_body(&asm, "roomy", "movb") > 2,
+        "roomy: a longer array must still get its terminator\n{asm}"
+    );
+}

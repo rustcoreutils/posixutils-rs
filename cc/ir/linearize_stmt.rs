@@ -1389,7 +1389,20 @@ impl<'a> super::linearize::Linearizer<'a> {
         let elem_size = self.types.size_bits(elem_type);
         let elem_bytes = (elem_size / 8) as i64;
 
-        for (i, unit) in units.iter().enumerate() {
+        // C17 6.7.9p14 lets an array be exactly as long as the string, in
+        // which case the terminating null is dropped rather than written --
+        // `char b[2] = "hi"` holds two characters and no terminator. Writing
+        // it unconditionally put one byte past the end of the object.
+        //
+        // An array with no size yet takes it from this initializer, so it
+        // always has room.
+        let capacity = self
+            .types
+            .array_size(arr_typ)
+            .filter(|&n| n > 0)
+            .unwrap_or(units.len() + 1);
+
+        for (i, unit) in units.iter().enumerate().take(capacity) {
             let val = self.emit_const(*unit, elem_type);
             self.emit(Instruction::store(
                 val,
@@ -1399,14 +1412,16 @@ impl<'a> super::linearize::Linearizer<'a> {
                 elem_size,
             ));
         }
-        let null_val = self.emit_const(0, elem_type);
-        self.emit(Instruction::store(
-            null_val,
-            base_sym,
-            base_offset + (units.len() as i64) * elem_bytes,
-            elem_type,
-            elem_size,
-        ));
+        if units.len() < capacity {
+            let null_val = self.emit_const(0, elem_type);
+            self.emit(Instruction::store(
+                null_val,
+                base_sym,
+                base_offset + (units.len() as i64) * elem_bytes,
+                elem_type,
+                elem_size,
+            ));
+        }
     }
 
     /// The code units a string literal contributes to an array initializer,

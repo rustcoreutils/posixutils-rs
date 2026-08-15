@@ -163,6 +163,10 @@ impl Aarch64CodeGen {
             Complex,
             /// An HFA: `count` elements of `base`, at that base's stride.
             Hfa { base: HfaBase, count: u8 },
+            /// A composite laid on the stack by value. The pseudo carries its
+            /// address; `bytes` of it are copied into the outgoing slot.
+            /// Pushing it as a scalar wrote the *pointer* there instead.
+            Composite { bytes: i32 },
         }
 
         struct StackArg {
@@ -193,6 +197,7 @@ impl Aarch64CodeGen {
                     StackKind::Hfa { base, count } => {
                         ((count as i32 * HfaElem::of(base).bytes) + 7) & !7
                     }
+                    StackKind::Composite { bytes } => (bytes + 7) & !7,
                     StackKind::Scalar => {
                         if self.size == 128 {
                             16
@@ -239,6 +244,29 @@ impl Aarch64CodeGen {
                     }
                 })
             };
+            // A composite of at most sixteen bytes that is not an HFA goes in
+            // two consecutive X registers (AAPCS64 §5.4.2 C.10). The pseudo
+            // carries its address, so the pair is loaded out of it. This used
+            // to hand the address over instead, which the callee then read as
+            // if it were the value.
+            let gp_pair =
+                !is_complex && hfa_regs.is_none() && arg_type.is_some_and(|t| {
+                    matches!(
+                        types.kind(t),
+                        TypeKind::Struct | TypeKind::Union | TypeKind::Array
+                    ) && {
+                        let abi = crate::abi::get_abi_for_conv(
+                            crate::abi::CallingConv::C,
+                            &self.base.target,
+                        );
+                        matches!(
+                            abi.classify_param(t, types),
+                            ArgClass::Direct { ref classes, .. }
+                                if classes.len() == 2
+                                    && classes.iter().all(|c| *c == crate::abi::RegClass::Integer)
+                        )
+                    }
+                });
             // A one-element HFA -- `struct { float v; }`, and every shape that
             // became one when arrays and half precision were admitted -- goes
             // in a single V register, exactly as the bare scalar does.
@@ -284,6 +312,38 @@ impl Aarch64CodeGen {
                     // follows it there. Unlike System V, the registers this
                     // argument did not fit into are *not* left available.
                     fp_arg_idx = fp_arg_regs.len();
+                }
+                continue;
+            }
+            if gp_pair {
+                if int_arg_idx + 1 < int_arg_regs.len() {
+                    let mem = match self.get_location(arg) {
+                        // The slot holds the aggregate's own bytes.
+                        Loc::Stack(offset) => self.stack_mem(offset),
+                        // The register holds its address.
+                        Loc::Reg(r) => MemAddr::BaseOffset { base: r, offset: 0 },
+                        _ => MemAddr::BaseOffset {
+                            base: Reg::X9,
+                            offset: 0,
+                        },
+                    };
+                    self.emit_ldp_legalized(
+                        OperandSize::B64,
+                        mem,
+                        int_arg_regs[int_arg_idx],
+                        int_arg_regs[int_arg_idx + 1],
+                    );
+                    int_arg_idx += 2;
+                } else {
+                    stack_args_info.push(StackArg {
+                        pseudo: arg,
+                        is_fp: false,
+                        size: arg_size,
+                        typ: arg_type,
+                        kind: StackKind::Composite {
+                            bytes: arg_type.map_or(16, |t| (types.size_bits(t) / 8) as i32),
+                        },
+                    });
                 }
                 continue;
             }
@@ -475,6 +535,49 @@ impl Aarch64CodeGen {
                 }
                 // AAPCS64 rounds each stacked argument up to 8 bytes; the
                 // callee's allocator uses the same rule, so the two agree.
+                offset += stack_arg.slot_bytes(types, &self.base.target);
+                continue;
+            }
+            if let StackKind::Composite { bytes } = stack_arg.kind {
+                // The pseudo locates the aggregate; its bytes go into the slot.
+                let src = match self.get_location(stack_arg.pseudo) {
+                    Loc::Reg(r) => r,
+                    Loc::Stack(off) => {
+                        self.push_lir(Aarch64Inst::Add {
+                            size: OperandSize::B64,
+                            src1: self.stack_base_reg(off),
+                            src2: GpOperand::Imm(self.stack_offset(off) as i64),
+                            dst: Reg::X9,
+                        });
+                        Reg::X9
+                    }
+                    _ => continue,
+                };
+                let mut done = 0;
+                while done < bytes {
+                    let chunk = [8, 4, 2, 1]
+                        .into_iter()
+                        .find(|c| *c <= bytes - done)
+                        .unwrap_or(1);
+                    let size = OperandSize::from_bits(chunk as u32 * 8);
+                    self.push_lir(Aarch64Inst::Ldr {
+                        size,
+                        addr: MemAddr::BaseOffset {
+                            base: src,
+                            offset: done,
+                        },
+                        dst: Reg::X16,
+                    });
+                    self.push_lir(Aarch64Inst::Str {
+                        size,
+                        src: Reg::X16,
+                        addr: MemAddr::BaseOffset {
+                            base: Reg::SP,
+                            offset: offset + done,
+                        },
+                    });
+                    done += chunk;
+                }
                 offset += stack_arg.slot_bytes(types, &self.base.target);
                 continue;
             }

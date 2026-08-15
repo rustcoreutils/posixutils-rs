@@ -1397,6 +1397,27 @@ impl RegAlloc {
                     }
                     int_arg_idx += 2;
                 }
+                // A composite of at most sixteen bytes that is not an HFA:
+                // AAPCS64 §5.4.2 C.10 puts it in consecutive X registers. The
+                // prologue writes them into the parameter's local, so what has
+                // to be right here is the *count* and the reservation. Falling
+                // through to the catch-all took one register and advanced by
+                // one, which is how every later argument moved as well.
+                ArgClass::Direct { classes, .. }
+                    if classes.len() == 2 && classes.iter().all(|c| *c == RegClass::Integer) =>
+                {
+                    if int_arg_idx + 1 < int_arg_regs.len() {
+                        self.locations
+                            .insert(pseudo, Loc::Reg(int_arg_regs[int_arg_idx]));
+                        self.free_regs.retain(|&r| {
+                            r != int_arg_regs[int_arg_idx] && r != int_arg_regs[int_arg_idx + 1]
+                        });
+                    } else {
+                        let at = IncomingOff::take(&mut next_incoming, 16);
+                        self.locations.insert(pseudo, Loc::Stack(at.displacement()));
+                    }
+                    int_arg_idx += 2;
+                }
                 // Integer / pointer / extension / mixed aggregate /
                 // HFA-or-Indirect-falling-through: all default to a
                 // single GP register or 8-byte stack slot. This matches

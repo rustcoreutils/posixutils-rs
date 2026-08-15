@@ -1009,16 +1009,17 @@ impl<'a> Linearizer<'a> {
                                 if !classes.is_empty()
                                     && classes.iter().all(|c| *c == crate::abi::RegClass::Sse)
                         ) || matches!(class, crate::abi::ArgClass::Hfa { .. });
-                        // Two eightbytes of any classes -- both integer, or one of
-                        // each -- arrive in two registers on x86-64 as well. The
-                        // caller's half of this decision is gated the same way;
-                        // aarch64 still hands such a struct over as a pointer.
-                        let reg_pair = self.target.arch == crate::target::Arch::X86_64
-                            && matches!(
-                                class,
-                                crate::abi::ArgClass::Direct { ref classes, .. }
-                                    if classes.len() == 2
-                            );
+                        // Two eightbytes of any classes -- both integer, or one
+                        // of each -- arrive in two registers. AAPCS64 §5.4.2
+                        // C.10 and SysV AMD64 §3.2.3 agree on this; aarch64
+                        // used to be excluded here and passed such a composite
+                        // as a pointer, which disagreed with gcc in both
+                        // directions and segfaulted when gcc was the caller.
+                        let reg_pair = matches!(
+                            class,
+                            crate::abi::ArgClass::Direct { ref classes, .. }
+                                if classes.len() == 2
+                        );
                         all_sse || reg_pair
                     };
                 if is_two_fp_regs {
@@ -2946,17 +2947,14 @@ impl<'a> Linearizer<'a> {
                     // passing a pointer instead disagreed with gcc silently.
                     let is_memory = matches!(class, crate::abi::ArgClass::Indirect { .. });
                     // Any other two-eightbyte `Direct` class -- two integer
-                    // registers, or one of each -- travels in registers too.
-                    // x86-64 only: aarch64 implements just the HFA case above
-                    // and passes the rest as a pointer, which its callee then
-                    // dereferences, so keeping the struct type there would
-                    // miscompile. This file is shared by both targets.
-                    let is_reg_pair = self.target.arch == crate::target::Arch::X86_64
-                        && matches!(
-                            class,
-                            crate::abi::ArgClass::Direct { ref classes, .. }
-                                if classes.len() == 2
-                        );
+                    // registers, or one of each -- travels in registers too,
+                    // on both targets. The pseudo still carries the address;
+                    // it is the backend that loads the pair out of it.
+                    let is_reg_pair = matches!(
+                        class,
+                        crate::abi::ArgClass::Direct { ref classes, .. }
+                            if classes.len() == 2
+                    );
                     if is_two_fp_regs || is_memory || is_reg_pair {
                         // Keep the struct type: the ABI decides from it, and
                         // the pseudo carries the address either way.

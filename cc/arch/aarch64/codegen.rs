@@ -383,8 +383,18 @@ impl Aarch64CodeGen {
                     }
                     ArgClass::Hfa { count, .. } => (&mut nsrn, count as usize),
                     _ if types.kind(*typ) == TypeKind::Int128 => (&mut ngrn, 2),
-                    // Everything else takes a single general register, which is
-                    // how this backend passes a struct: by pointer.
+                    // A composite of at most sixteen bytes takes two general
+                    // registers. Counting it as one left `va_start` pointing a
+                    // slot short, so the first variadic argument of a function
+                    // whose named parameter was such a composite came back as
+                    // the composite's own upper half.
+                    ArgClass::Direct { ref classes, .. }
+                        if classes.len() == 2
+                            && classes.iter().all(|c| *c == crate::abi::RegClass::Integer) =>
+                    {
+                        (&mut ngrn, 2)
+                    }
+                    // Everything else takes a single general register.
                     _ => (&mut ngrn, 1),
                 };
                 if *bank + count <= 8 {
@@ -1148,6 +1158,24 @@ impl Aarch64CodeGen {
         for (i, (_name, typ)) in func.params.iter().enumerate() {
             let is_complex = types.is_complex(*typ);
             let is_fp = types.is_float(*typ);
+            // A composite of at most sixteen bytes that is not an HFA arrives
+            // in two consecutive X registers, and the prologue writes them
+            // into the parameter's local -- the same arrangement the HFA arm
+            // below uses. It used to fall to the single-register arm, which
+            // stored one register and advanced by one, so the aggregate was
+            // half wrong and every later integer parameter moved as well.
+            let gp_pair = !is_complex
+                && !is_fp
+                && matches!(types.kind(*typ), TypeKind::Struct | TypeKind::Union)
+                && {
+                    let abi = get_abi_for_conv(CallingConv::C, &self.base.target);
+                    matches!(
+                        abi.classify_param(*typ, types),
+                        ArgClass::Direct { ref classes, .. }
+                            if classes.len() == 2
+                                && classes.iter().all(|c| *c == crate::abi::RegClass::Integer)
+                    )
+                };
             // How many consecutive V registers this parameter arrives in, if
             // it arrives in V registers at all. A `_Complex` is two by
             // definition; a struct is whatever the ABI's HFA classification
@@ -1179,6 +1207,8 @@ impl Aarch64CodeGen {
                             // Still need to count this arg for register assignment tracking
                             if let Some(count) = fp_reg_count {
                                 fp_arg_idx += count;
+                            } else if gp_pair {
+                                int_arg_idx += 2;
                             } else if is_fp {
                                 fp_arg_idx += 1;
                             } else if types.kind(*typ) == TypeKind::Int128 {
@@ -1188,7 +1218,57 @@ impl Aarch64CodeGen {
                             }
                             break;
                         }
-                        if let Some(count) = fp_reg_count {
+                        if gp_pair {
+                            let param_name = &func.params[i].0;
+                            let local_off = func
+                                .locals
+                                .get(param_name)
+                                .and_then(|local| self.locations.get_ref(local.sym))
+                                .and_then(|loc| match loc {
+                                    Loc::Stack(off) => Some(*off),
+                                    _ => None,
+                                });
+                            if let Some(local_off) = local_off {
+                                if int_arg_idx + 1 < arg_regs.len() {
+                                    self.emit_stp_legalized(
+                                        OperandSize::B64,
+                                        arg_regs[int_arg_idx],
+                                        arg_regs[int_arg_idx + 1],
+                                        self.stack_mem(local_off),
+                                    );
+                                } else if let Some(&Loc::Stack(incoming)) =
+                                    self.locations.get_ref(pseudo.id)
+                                {
+                                    // Out of registers, so the caller laid the
+                                    // composite in its own frame. The prologue
+                                    // still has to copy it into the local the
+                                    // body reads, exactly as the spilled-HFA
+                                    // case does; without this the parameter was
+                                    // left uninitialized.
+                                    let bytes = (types.size_bits(*typ) / 8) as i32;
+                                    let mut done = 0;
+                                    while done < bytes {
+                                        let chunk = [8, 4, 2, 1]
+                                            .into_iter()
+                                            .find(|c| *c <= bytes - done)
+                                            .unwrap_or(1);
+                                        let size = OperandSize::from_bits(chunk as u32 * 8);
+                                        self.push_lir(Aarch64Inst::Ldr {
+                                            size,
+                                            addr: self.stack_mem_plus(incoming, done),
+                                            dst: Reg::X16,
+                                        });
+                                        self.push_lir(Aarch64Inst::Str {
+                                            size,
+                                            src: Reg::X16,
+                                            addr: self.stack_mem_plus(local_off, done),
+                                        });
+                                        done += chunk;
+                                    }
+                                }
+                            }
+                            int_arg_idx += 2;
+                        } else if let Some(count) = fp_reg_count {
                             // Complex or HFA argument — `count` consecutive V registers
                             if fp_arg_idx + count <= fp_arg_regs.len() {
                                 let param_name = &func.params[i].0;

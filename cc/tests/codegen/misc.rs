@@ -7559,12 +7559,7 @@ int main(void) {
 /// call could survive on luck; four in a function did not, which is why this
 /// looked cumulative rather than shape-specific and hid behind register
 /// pressure.
-///
-/// A sixteen-byte *integer* composite is deliberately absent: `va_arg` reads it
-/// from two general-register slots as AAPCS64 requires, but the aarch64 caller
-/// passes such a composite by pointer, so the two disagree. That is a distinct
-/// defect in argument passing rather than in `va_arg`, and the shape is covered
-/// once it is fixed.
+
 #[test]
 fn codegen_variadic_aggregate_results_coexist() {
     let code = r#"
@@ -7574,6 +7569,7 @@ typedef struct { float a, b, c; }       F3;
 typedef struct { float a, b, c, d; }    F4;
 typedef struct { double a, b; }         D2;
 typedef struct { double a, b, c; }      D3;
+typedef struct { long a, b; }           L2;   /* two general-register slots */
 typedef struct { long a, b, c; }        L3;   /* over 16 bytes: passed by pointer */
 
 double g_f2(int n, ...) { va_list ap; va_start(ap, n);
@@ -7586,6 +7582,8 @@ double g_d2(int n, ...) { va_list ap; va_start(ap, n);
     D2 v = va_arg(ap, D2); va_end(ap); return v.a * 10 + v.b; }
 double g_d3(int n, ...) { va_list ap; va_start(ap, n);
     D3 v = va_arg(ap, D3); va_end(ap); return v.a * 100 + v.b * 10 + v.c; }
+long   g_l2(int n, ...) { va_list ap; va_start(ap, n);
+    L2 v = va_arg(ap, L2); va_end(ap); return v.a * 10 + v.b; }
 long   g_l3(int n, ...) { va_list ap; va_start(ap, n);
     L3 v = va_arg(ap, L3); va_end(ap); return v.a * 100 + v.b * 10 + v.c; }
 
@@ -7600,6 +7598,7 @@ int main(void) {
     F4 f4 = {1, 2, 3, 4};
     D2 d2 = {1, 2};
     D3 d3 = {1, 2, 3};
+    L2 l2 = {1, 2};
     L3 l3 = {1, 2, 3};
 
     /* all live in one function: this is what used to fall over */
@@ -7608,8 +7607,9 @@ int main(void) {
     if (g_f4(0, f4) != 1234) return 3;
     if (g_d2(0, d2) != 12) return 4;
     if (g_d3(0, d3) != 123) return 5;
-    if (g_l3(0, l3) != 123) return 6;
-    if (g_two(0, f4, d2) != 1246) return 7;
+    if (g_l2(0, l2) != 12) return 6;
+    if (g_l3(0, l3) != 123) return 7;
+    if (g_two(0, f4, d2) != 1246) return 8;
     return 0;
 }
 "#;
@@ -7619,6 +7619,70 @@ int main(void) {
     );
     assert_eq!(
         compile_and_run_optimized("codegen_variadic_agg_results_opt", code),
+        0
+    );
+}
+
+/// AAPCS64 §5.4.2 C.10 and SysV AMD64 §3.2.3 both put a composite of at most
+/// sixteen bytes in two consecutive general registers. aarch64 handed over its
+/// *address* instead, on both sides of the call, so c17 agreed with itself and
+/// nothing in the suite noticed -- while every call across a c17/gcc boundary
+/// was wrong. With a gcc caller it segfaulted: the callee read the first eight
+/// bytes of the aggregate as if they were a pointer and dereferenced them.
+///
+/// Structs of four and eight bytes were already right; the broken range is
+/// exactly the two-eightbyte one.
+#[test]
+fn codegen_composite_in_two_registers() {
+    let code = r#"
+typedef struct { int a; }              S4;
+typedef struct { long a; }             S8;
+typedef struct { int a, b, c; }        S12;
+typedef struct { long a, b; }          S16;
+typedef struct { int a; long b; }      M16;   /* mixed widths */
+typedef struct { long a, b, c; }       S24;   /* over 16: still by pointer */
+
+__attribute__((noinline)) long f4(S4 v)   { return v.a; }
+__attribute__((noinline)) long f8(S8 v)   { return v.a; }
+__attribute__((noinline)) long f12(S12 v) { return v.a * 100 + v.b * 10 + v.c; }
+__attribute__((noinline)) long f16(S16 v) { return v.a * 10 + v.b; }
+__attribute__((noinline)) long m16(M16 v) { return v.a * 10 + v.b; }
+__attribute__((noinline)) long f24(S24 v) { return v.a * 100 + v.b * 10 + v.c; }
+
+/* an integer argument after the composite: if the composite claims the wrong
+   number of registers, this one moves too */
+__attribute__((noinline)) long tail(int n, S16 v, int m) {
+    return n * 10000 + v.a * 100 + v.b * 10 + m;
+}
+/* enough composites to run past X0-X7 and onto the stack */
+__attribute__((noinline)) long many(S16 a, S16 b, S16 c, S16 d, S16 e) {
+    return a.a + b.a * 10 + c.a * 100 + d.a * 1000 + e.a * 10000 + e.b * 100000;
+}
+
+int main(void) {
+    S4 s4 = {1};
+    S8 s8 = {2};
+    S12 s12 = {1, 2, 3};
+    S16 s16 = {1, 2};
+    M16 m = {1, 2};
+    S24 s24 = {1, 2, 3};
+
+    if (f4(s4) != 1) return 1;
+    if (f8(s8) != 2) return 2;
+    if (f12(s12) != 123) return 3;
+    if (f16(s16) != 12) return 4;
+    if (m16(m) != 12) return 5;
+    if (f24(s24) != 123) return 6;
+    if (tail(9, s16, 7) != 90127) return 7;
+
+    S16 a = {1, 0}, b = {2, 0}, c = {3, 0}, d = {4, 0}, e = {5, 6};
+    if (many(a, b, c, d, e) != 654321) return 8;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("codegen_composite_two_regs", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("codegen_composite_two_regs_opt", code),
         0
     );
 }

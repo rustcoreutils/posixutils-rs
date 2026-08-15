@@ -353,6 +353,25 @@ impl Type {
         }
     }
 
+    /// Create a function type whose declarator supplied no prototype: `int
+    /// f();`, or a K&R identifier list.
+    ///
+    /// C17 6.7.6.3p14 draws the line here, not at "zero parameters": an empty
+    /// identifier list says nothing about the parameters, while `(void)` says
+    /// there are none. `params: None` is that distinction, and callers must
+    /// read it as "unknown" rather than "empty" -- no arity check is permitted
+    /// against it (6.5.2.2p1), and one against `(void)` is required.
+    pub fn function_no_prototype(return_type: TypeId, noreturn: bool) -> Self {
+        Self {
+            kind: TypeKind::Function,
+            base: Some(return_type),
+            params: None,
+            variadic: false,
+            noreturn,
+            ..Default::default()
+        }
+    }
+
     /// Create a struct type
     pub fn struct_type(composite: CompositeType) -> Self {
         Self {
@@ -577,7 +596,11 @@ enum TypeKey {
     /// Function type
     Function {
         ret: TypeId,
-        params: Vec<TypeId>,
+        /// `None` for a declarator with no prototype, which is a *different*
+        /// type from one taking no parameters (C17 6.7.6.3p14). Flattening the
+        /// two with `unwrap_or_default` interned `int f()` and `int f(void)`
+        /// as the same `TypeId`, so no later pass could tell them apart.
+        params: Option<Vec<TypeId>>,
         variadic: bool,
         noreturn: bool,
         modifiers: u32,
@@ -776,10 +799,9 @@ impl TypeTable {
             }
             TypeKind::Function => {
                 let ret = typ.base?;
-                let params = typ.params.clone().unwrap_or_default();
                 Some(TypeKey::Function {
                     ret,
-                    params,
+                    params: typ.params.clone(),
                     variadic: typ.variadic,
                     noreturn: typ.noreturn,
                     modifiers: typ.modifiers.bits(),

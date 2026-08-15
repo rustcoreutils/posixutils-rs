@@ -1582,10 +1582,10 @@ impl<'a> Parser<'a> {
         });
         let Some(func_type) = func_type else { return };
 
-        // `params == None` means no prototype is visible: either an
-        // unprototyped K&R declaration, where no check is permitted, or an
-        // undeclared callee, which already produced its own diagnostic and
-        // carries a dummy `int` type.
+        // `params == None` means no prototype is visible: `int f();`, a K&R
+        // identifier list -- neither of which C17 6.5.2.2p1 permits a check
+        // against -- or an undeclared callee, which already produced its own
+        // diagnostic and carries a dummy `int` type.
         let ft = self.types.get(func_type);
         let Some(params) = ft.params.as_ref() else {
             return;
@@ -1594,17 +1594,6 @@ impl<'a> Parser<'a> {
 
         let variadic = ft.variadic;
 
-        // `int f(void)` and `int f()` both intern as an empty parameter list,
-        // but they mean opposite things: the first takes no arguments, the
-        // second leaves them unspecified and accepts any number. Telling them
-        // apart needs a "no prototype" marker on the function type, which the
-        // ABI, inliner and linearizer all read — too much reach for one
-        // diagnostic. So the zero-parameter case is skipped, and
-        // `int f(void); f(1);` goes undiagnosed. Every prototype with at least
-        // one parameter is checked.
-        if required == 0 && !variadic {
-            return;
-        }
         let wrong = if variadic {
             args.len() < required
         } else {

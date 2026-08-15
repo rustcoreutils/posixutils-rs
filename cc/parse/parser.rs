@@ -218,6 +218,22 @@ pub(crate) struct RawParam {
     pub(crate) symbol: Option<SymbolId>,
 }
 
+/// A function declarator's parameter list.
+///
+/// C17 6.7.6.3p14 makes `()` and `(void)` different types: an empty
+/// *identifier* list supplies no information about the number or types of the
+/// parameters, while `(void)` says there are none. A K&R identifier list --
+/// `int f(a, b) int a, b;` -- is likewise no prototype. Both used to arrive as
+/// a plain `Vec<RawParam>`, so "unknown" and "none" were indistinguishable:
+/// a call to `int f(void)` went unchecked, and a call to a K&R definition was
+/// checked when 6.5.2.2p1 forbids it.
+pub(crate) struct ParameterList {
+    pub params: Vec<RawParam>,
+    pub variadic: bool,
+    /// False for `()` and for an identifier list.
+    pub prototyped: bool,
+}
+
 /// Whether the declarator being parsed must name something.
 ///
 /// C17 spells the two grammars separately -- `declarator` (6.7.6) always has
@@ -236,7 +252,26 @@ pub(crate) enum DeclaratorName {
 type DeclaratorResult = (StringId, TypeId, Vec<Expr>, Option<Vec<RawParam>>);
 
 /// Function parameter type info: (type IDs, is_variadic)
-type FuncParamTypes = (Vec<TypeId>, bool);
+/// The signature a function declarator's `( ... )` suffix contributes.
+///
+/// `prototyped` is false for `()` and for a K&R identifier list, which C17
+/// 6.7.6.3p14 makes a different type from `(void)` rather than a shorter one.
+struct FuncSignature {
+    param_types: Vec<TypeId>,
+    variadic: bool,
+    prototyped: bool,
+}
+
+impl FuncSignature {
+    /// The function type this signature makes of a return type.
+    fn into_type(self, return_type: TypeId) -> Type {
+        if self.prototyped {
+            Type::function(return_type, self.param_types, self.variadic, false)
+        } else {
+            Type::function_no_prototype(return_type, false)
+        }
+    }
+}
 
 // ============================================================================
 // GCC __attribute__ Support
@@ -3229,13 +3264,20 @@ impl Parser<'_> {
         // Handle function declarators: void (*fp)(int, char)
         // This parses the parameter list after a grouped declarator
         // We keep both the TypeIds (for building the type) and raw params (for function defs)
-        let (func_params, full_func_params): (Option<FuncParamTypes>, Option<Vec<RawParam>>) =
+        let (func_params, full_func_params): (Option<FuncSignature>, Option<Vec<RawParam>>) =
             if self.is_special(b'(') {
                 self.advance();
-                let (raw_params, variadic) = self.parse_parameter_list()?;
+                let list = self.parse_parameter_list()?;
                 self.expect_special(b')')?;
-                let type_ids: Vec<TypeId> = raw_params.iter().map(|p| p.typ).collect();
-                (Some((type_ids, variadic)), Some(raw_params))
+                let param_types: Vec<TypeId> = list.params.iter().map(|p| p.typ).collect();
+                (
+                    Some(FuncSignature {
+                        param_types,
+                        variadic: list.variadic,
+                        prototyped: list.prototyped,
+                    }),
+                    Some(list.params),
+                )
             } else {
                 (None, None)
             };
@@ -3266,8 +3308,8 @@ impl Parser<'_> {
             // Apply function parameters to (possibly pointer-modified) base type
             // For struct node *(*fp)(int): result is Pointer(struct node)
             //   -> Function(Pointer(struct node), [int])
-            if let Some((param_type_ids, variadic)) = func_params {
-                let func_type = Type::function(result_type_id, param_type_ids, variadic, false);
+            if let Some(sig) = func_params {
+                let func_type = sig.into_type(result_type_id);
                 result_type_id = self.types.intern(func_type);
             }
 
@@ -3321,8 +3363,8 @@ impl Parser<'_> {
             // Apply function parameters if present (for function declarators)
             // For int get_op(int which): base is int, suffix (int) -> Function(int, [int])
             // This is needed for nested declarators like int (*get_op(int))(int, int)
-            if let Some((param_type_ids, variadic)) = func_params {
-                let func_type = Type::function(result_type_id, param_type_ids, variadic, false);
+            if let Some(sig) = func_params {
+                let func_type = sig.into_type(result_type_id);
                 result_type_id = self.types.intern(func_type);
             }
         }
@@ -3447,12 +3489,18 @@ impl Parser<'_> {
 
         // Parse parameter list
         self.expect_special(b'(')?;
-        let (raw_params, variadic) = self.parse_parameter_list()?;
+        let param_list = self.parse_parameter_list()?;
+        let raw_params = param_list.params;
         self.expect_special(b')')?;
 
         // Build the function type
-        let param_type_ids: Vec<TypeId> = raw_params.iter().map(|p| p.typ).collect();
-        let func_type = Type::function(ret_type_id, param_type_ids, variadic, false);
+        let param_types: Vec<TypeId> = raw_params.iter().map(|p| p.typ).collect();
+        let func_type = FuncSignature {
+            param_types,
+            variadic: param_list.variadic,
+            prototyped: param_list.prototyped,
+        }
+        .into_type(ret_type_id);
         let func_type_id = self.types.intern(func_type);
 
         // Bind function to symbol table at current (global) scope
@@ -3513,17 +3561,23 @@ impl Parser<'_> {
     /// Parameters are declared in a temporary scope during parsing so that
     /// VLA sizes like `arr[n]` can reference earlier parameters like `n`.
     /// The scope is exited at the end; callers re-declare parameters as needed.
-    pub(crate) fn parse_parameter_list(&mut self) -> ParseResult<(Vec<RawParam>, bool)> {
+    pub(crate) fn parse_parameter_list(&mut self) -> ParseResult<ParameterList> {
         let mut params: Vec<RawParam> = Vec::with_capacity(DEFAULT_PARAM_CAPACITY);
         let mut variadic = false;
+        let mut prototyped = true;
 
         // Enter a temporary scope for parameter parsing (C99 6.9.1p9)
         // This allows VLA sizes to reference earlier parameters
         self.symbols.enter_scope();
 
+        // `()` -- an empty identifier list, which is not a prototype.
         if self.is_special(b')') {
             self.symbols.leave_scope();
-            return Ok((params, variadic));
+            return Ok(ParameterList {
+                params,
+                variadic,
+                prototyped: false,
+            });
         }
 
         // Check for (void)
@@ -3534,7 +3588,11 @@ impl Parser<'_> {
                     self.advance();
                     if self.is_special(b')') {
                         self.symbols.leave_scope();
-                        return Ok((params, variadic));
+                        return Ok(ParameterList {
+                            params,
+                            variadic,
+                            prototyped: true,
+                        });
                     }
                     // Not just void, backtrack
                     self.pos = saved_pos;
@@ -3560,6 +3618,14 @@ impl Parser<'_> {
 
             // Parse parameter type
             let param_type = self.parse_type_specifier()?;
+            // An identifier list -- `int f(a, b) int a, b;` -- is not a
+            // prototype (C17 6.7.6.3p14), and it is exactly the case where the
+            // specifier parser supplied an implicit `int` without consuming an
+            // identifier. The choice is all-or-nothing across the list, so the
+            // first parameter settles it.
+            if params.is_empty() && !variadic {
+                prototyped = self.saw_explicit_type;
+            }
             // For struct/union types with tags, use existing TypeId to preserve forward declarations
             let base_type_id = self.intern_type_with_tag(&param_type);
 
@@ -3653,7 +3719,11 @@ impl Parser<'_> {
         // Leave temporary parameter scope
         self.symbols.leave_scope();
 
-        Ok((params, variadic))
+        Ok(ParameterList {
+            params,
+            variadic,
+            prototyped,
+        })
     }
 
     /// Parse a translation unit (top-level)
@@ -4166,7 +4236,9 @@ impl Parser<'_> {
         if self.is_special(b'(') {
             // Could be function definition or declaration
             self.advance();
-            let (mut params, variadic) = self.parse_parameter_list()?;
+            let param_list = self.parse_parameter_list()?;
+            let (variadic, prototyped) = (param_list.variadic, param_list.prototyped);
+            let mut params = param_list.params;
             self.expect_special(b')')?;
 
             // Parse __attribute__ after parameter list (e.g., __attribute__((noreturn)))
@@ -4235,8 +4307,11 @@ impl Parser<'_> {
 
                 // Add function to symbol table so it can be called by other functions
                 let param_type_ids: Vec<TypeId> = params.iter().map(|p| p.typ).collect();
-                let func_type =
-                    Type::function(typ_id, param_type_ids.clone(), variadic, is_noreturn);
+                let func_type = if prototyped {
+                    Type::function(typ_id, param_type_ids.clone(), variadic, is_noreturn)
+                } else {
+                    Type::function_no_prototype(typ_id, is_noreturn)
+                };
                 let func_type_id = self.types.intern(func_type);
                 let func_sym = Symbol::function(name, func_type_id, self.symbols.depth());
                 let _ = self.symbols.declare(func_sym);
@@ -4279,7 +4354,11 @@ impl Parser<'_> {
                 self.skip_extensions();
                 self.expect_special(b';')?;
                 let param_type_ids: Vec<TypeId> = params.iter().map(|p| p.typ).collect();
-                let func_type = Type::function(typ_id, param_type_ids, variadic, is_noreturn);
+                let func_type = if prototyped {
+                    Type::function(typ_id, param_type_ids, variadic, is_noreturn)
+                } else {
+                    Type::function_no_prototype(typ_id, is_noreturn)
+                };
                 let func_type_id = self.types.intern(func_type);
                 // Add to symbol table and capture SymbolId
                 // C allows multiple declarations of the same function

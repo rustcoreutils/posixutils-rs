@@ -874,3 +874,74 @@ fn diagnostics_binary128_suffixes_need_a_floating_constant() {
         ),
     );
 }
+
+// ==== #L6 residual — a zero-parameter prototype's call arity (C17 6.5.2.2p2) ====
+
+/// `int f(void)` and `int f()` are different types, not the same type spelled
+/// two ways: C17 6.7.6.3p14 makes an empty *identifier* list supply no
+/// information about the parameters, while `(void)` says there are none. Both
+/// interned as an empty parameter vector, so nothing downstream could tell
+/// "unknown" from "none".
+///
+/// That cost a diagnostic in one direction and produced a wrong one in the
+/// other. A call to `int f(void)` with arguments went unchecked, though
+/// 6.5.2.2p2 makes it a constraint violation; and a call to a K&R definition
+/// *was* checked, though 6.5.2.2p1 permits no check against a declarator with
+/// no prototype -- so `int f(a,b) int a,b; {...}` called as `f(1)` was
+/// rejected, where gcc accepts it.
+#[test]
+fn diagnostics_zero_parameter_prototype_arity_is_rejected() {
+    compile_expect_error(
+        "void_proto_too_many_args",
+        "int f(void);\nint main(void){ return f(1, 2); }\nint f(void){ return 0; }\n",
+        "call expects 0 arguments",
+    );
+    compile_expect_error(
+        "void_definition_too_many_args",
+        "int f(void){ return 0; }\nint main(void){ return f(1, 2); }\n",
+        "call expects 0 arguments",
+    );
+    compile_expect_error(
+        "void_proto_one_arg",
+        "int f(void);\nint main(void){ return f(7); }\nint f(void){ return 0; }\n",
+        "call expects 0 arguments",
+    );
+}
+
+/// The other direction: a declarator with no prototype accepts any argument
+/// list, and must not be checked.
+#[test]
+fn diagnostics_unprototyped_calls_are_accepted() {
+    for (name, src) in [
+        // An empty identifier list says nothing about the parameters.
+        (
+            "empty_list_decl",
+            "int f();\nint main(void){ return f(1, 2); }\nint f(int a, int b){ return a + b; }\n",
+        ),
+        // A K&R definition is likewise unprototyped -- this used to be
+        // rejected with "call expects 2 arguments, but 1 given".
+        (
+            "kr_definition_too_few",
+            "int f(a, b) int a, b; { return a + b; }\nint main(void){ return f(1); }\n",
+        ),
+        (
+            "kr_definition_too_many",
+            "int f(a, b) int a, b; { return a + b; }\nint main(void){ return f(1, 2, 3); }\n",
+        ),
+        // And the correct calls against a real prototype still compile.
+        (
+            "void_proto_no_args",
+            "int f(void);\nint main(void){ return f(); }\nint f(void){ return 0; }\n",
+        ),
+        (
+            "proto_exact_args",
+            "int f(int, int);\nint main(void){ return f(1, 2); }\nint f(int a, int b){ return a + b; }\n",
+        ),
+        (
+            "variadic_extra_args",
+            "#include <stdio.h>\nint main(void){ printf(\"%d %d\\n\", 1, 2); return 0; }\n",
+        ),
+    ] {
+        compile_expect_ok(name, src);
+    }
+}

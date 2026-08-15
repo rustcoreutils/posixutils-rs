@@ -945,3 +945,111 @@ fn diagnostics_unprototyped_calls_are_accepted() {
         compile_expect_ok(name, src);
     }
 }
+
+// ==== lvalue constraints (C17 6.5.16p2, 6.5.3.1p1, 6.5.3.2p1) ====
+
+/// Assignment and the increment operators require a *modifiable lvalue*, and
+/// unary `&` an object that has an address. None of it was checked: `a+b = 3`,
+/// `v = w` between arrays, `(a+1)++` and `&reg` all compiled silently, so a
+/// program that could not mean anything was translated into one that did
+/// something.
+///
+/// The messages deliberately match gcc's, since those are the words a user
+/// searches for.
+#[test]
+fn diagnostics_non_lvalue_targets_are_rejected() {
+    for (name, src, expected) in [
+        (
+            "assign_to_sum",
+            "int main(void){ int a=1,b=2; a+b = 3; return 0; }\n",
+            "lvalue required as left operand of assignment",
+        ),
+        (
+            "assign_to_cast",
+            "int main(void){ int a=1; (int)a = 2; return 0; }\n",
+            "lvalue required as left operand of assignment",
+        ),
+        (
+            "assign_to_call",
+            "int f(void);\nint main(void){ f() = 1; return 0; }\n",
+            "lvalue required as left operand of assignment",
+        ),
+        (
+            "assign_to_conditional",
+            "int main(void){ int a=1,b=2; (1?a:b) = 3; return 0; }\n",
+            "lvalue required as left operand of assignment",
+        ),
+        (
+            "assign_to_array",
+            "int main(void){ int v[3],w[3]; v = w; return 0; }\n",
+            "assignment to expression with array type",
+        ),
+        (
+            "preinc_non_lvalue",
+            "int main(void){ int a=1; ++(a+1); return 0; }\n",
+            "lvalue required as increment operand",
+        ),
+        (
+            "postinc_non_lvalue",
+            "int main(void){ int a=1; (a+1)++; return 0; }\n",
+            "lvalue required as increment operand",
+        ),
+        (
+            "postdec_non_lvalue",
+            "int main(void){ int a=1; (a+1)--; return 0; }\n",
+            "lvalue required as decrement operand",
+        ),
+        (
+            "address_of_register",
+            "int main(void){ register int a=1; return *&a; }\n",
+            "address of register variable 'a' requested",
+        ),
+    ] {
+        compile_expect_error(name, src, expected);
+    }
+}
+
+/// The companion: every shape that *is* a modifiable lvalue must still assign,
+/// step, and yield its address. A check that rejects `f().x` must not also
+/// reject `s.x`, and one that rejects an array assignment must not reject an
+/// assignment to its element.
+#[test]
+fn diagnostics_ordinary_lvalues_are_accepted() {
+    let src = r#"
+struct S { int x; int arr[3]; };
+struct Outer { struct S s; };
+union U { int i; float f; };
+int garr[4];
+struct S gs;
+struct S *gp = &gs;
+
+int main(void) {
+    int a = 1, *pa = &a;
+    struct S s = {0};
+    struct Outer o = {{0}};
+    union U u;
+    int m[2][3];
+    char buf[8];
+    double _Complex z = 1.0;
+
+    a = 2; a++; ++a; a--; --a; (void)&a;
+    *pa = 3; (*pa)++; (void)&*pa;
+    garr[1] = 4; garr[1]++; (void)&garr[1];
+    s.x = 5; s.x++; (void)&s.x;
+    s.arr[2] = 6; s.arr[2]++; (void)&s.arr[2];
+    o.s.x = 7; (void)&o.s.x;
+    gp->x = 8; gp->x++; (void)&gp->x;
+    u.i = 9; (void)&u.i;
+    m[1][2] = 10; m[1][2]++; (void)&m[1][2];
+    buf[0] = 'x'; (void)&buf[0]; (void)&buf;
+    /* gcc documents __real__/__imag__ as lvalues when the operand is one */
+    __real__ z = 2.0; __imag__ z = 3.0;
+    *(int *)buf = 11;
+    (void)&"literal"[0];
+    /* a compound literal is an object, so it is an lvalue */
+    s = (struct S){1, {2,3,4}};
+    return 0;
+}
+"#;
+    compile_expect_ok("ordinary_lvalues", src);
+}

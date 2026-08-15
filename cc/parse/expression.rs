@@ -16,7 +16,7 @@ use super::parser::{DeclaratorName, ParseError, ParseResult, Parser};
 use crate::diag;
 use crate::float::FloatVal;
 use crate::strings::StringId;
-use crate::symbol::{Namespace, Symbol, SymbolId};
+use crate::symbol::{Namespace, Symbol, SymbolId, SymbolKind};
 use crate::token::lexer::{Position, SpecialToken, TokenType, TokenValue};
 use crate::types::{Type, TypeId, TypeKind, TypeModifiers};
 use gettextrs::gettext;
@@ -118,6 +118,7 @@ impl<'a> Parser<'a> {
             self.advance();
 
             // Check if target is const (assignment to const is an error)
+            self.check_modifiable_lvalue(&left, "left operand of assignment", assign_pos);
             self.check_const_assignment(&left, assign_pos);
 
             // Right-to-left associativity: parse the right side as another assignment
@@ -564,6 +565,7 @@ impl<'a> Parser<'a> {
             self.advance();
             let operand = self.parse_unary_expr()?;
             // Check for const modification
+            self.check_modifiable_lvalue(&operand, "increment operand", op_pos);
             self.check_const_assignment(&operand, op_pos);
             // PreInc has same type as operand
             let typ = operand.typ.unwrap_or(self.types.int_id);
@@ -582,6 +584,7 @@ impl<'a> Parser<'a> {
             self.advance();
             let operand = self.parse_unary_expr()?;
             // Check for const modification
+            self.check_modifiable_lvalue(&operand, "decrement operand", op_pos);
             self.check_const_assignment(&operand, op_pos);
             // PreDec has same type as operand
             let typ = operand.typ.unwrap_or(self.types.int_id);
@@ -599,6 +602,7 @@ impl<'a> Parser<'a> {
             let op_pos = self.current_pos();
             self.advance();
             let operand = self.parse_unary_expr()?;
+            self.check_addressable(&operand, op_pos);
             // AddrOf produces pointer to operand's type
             let base_type = operand.typ.unwrap_or(self.types.int_id);
             let ptr_type = self.types.intern(Type::pointer(base_type));
@@ -1290,6 +1294,7 @@ impl<'a> Parser<'a> {
                 let op_pos = self.current_pos();
                 self.advance();
                 // Check for const modification
+                self.check_modifiable_lvalue(&expr, "increment operand", op_pos);
                 self.check_const_assignment(&expr, op_pos);
                 // PostInc has same type as operand
                 let typ = expr.typ.unwrap_or(self.types.int_id);
@@ -1298,6 +1303,7 @@ impl<'a> Parser<'a> {
                 let op_pos = self.current_pos();
                 self.advance();
                 // Check for const modification
+                self.check_modifiable_lvalue(&expr, "decrement operand", op_pos);
                 self.check_const_assignment(&expr, op_pos);
                 // PostDec has same type as operand
                 let typ = expr.typ.unwrap_or(self.types.int_id);
@@ -1656,6 +1662,87 @@ impl<'a> Parser<'a> {
     }
 
     /// Check if an expression is const and report error if assigning to it
+    /// Does this expression designate an object (C17 6.3.2.1p1)?
+    ///
+    /// Only the shapes that can name storage: an object identifier, a
+    /// dereference, a subscript, a member of an lvalue, a member through a
+    /// pointer, a compound literal, or a string literal. Everything else --
+    /// the result of arithmetic, a call, a cast, a conditional, a comma -- is
+    /// a value, not a place.
+    fn is_lvalue(&self, expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Ident(symbol_id) => {
+                // A function designator and an enum constant are not objects.
+                !matches!(
+                    self.symbols.get(*symbol_id).kind,
+                    SymbolKind::Function | SymbolKind::EnumConstant
+                )
+            }
+            ExprKind::Unary { op, operand } => match op {
+                UnaryOp::Deref => true,
+                // `__real__ x` and `__imag__ x` are lvalues exactly when their
+                // operand is, which is what gcc documents.
+                UnaryOp::Real | UnaryOp::Imag => self.is_lvalue(operand),
+                _ => false,
+            },
+            ExprKind::Index { .. } | ExprKind::Arrow { .. } => true,
+            // `s.x` designates an object only when `s` does: `f().x` is a
+            // member of a returned value, and has nowhere to live.
+            ExprKind::Member { expr, .. } => self.is_lvalue(expr),
+            ExprKind::CompoundLiteral { .. }
+            | ExprKind::StringLit(_)
+            | ExprKind::WideStringLit(_)
+            | ExprKind::Utf16StringLit(_)
+            | ExprKind::Utf32StringLit(_) => true,
+            _ => false,
+        }
+    }
+
+    /// Report an operand of unary `&` that has no address (C17 6.5.3.2p1).
+    ///
+    /// `register` is the case that bites: the storage class is a hint the
+    /// compiler may ignore, but taking the address is still a constraint
+    /// violation, and a program that does it is relying on the hint being
+    /// ignored.
+    fn check_addressable(&self, operand: &Expr, pos: Position) {
+        let ExprKind::Ident(symbol_id) = &operand.kind else {
+            return;
+        };
+        let sym = self.symbols.get(*symbol_id);
+        if !matches!(sym.kind, SymbolKind::Variable | SymbolKind::Parameter) {
+            return;
+        }
+        if self
+            .types
+            .modifiers(sym.typ)
+            .contains(TypeModifiers::REGISTER)
+        {
+            let name = self.str(sym.name).to_string();
+            diag::error_args(
+                pos,
+                "address of register variable '{0}' requested",
+                &[&name],
+            );
+        }
+    }
+
+    /// Report a target that cannot be assigned to or stepped (C17 6.5.16p2,
+    /// 6.5.3.1p1). `verb` names the operator for the message, matching what
+    /// gcc says so that the two agree on the wording users search for.
+    fn check_modifiable_lvalue(&self, target: &Expr, verb: &str, pos: Position) {
+        if !self.is_lvalue(target) {
+            diag::error_args(pos, "lvalue required as {0}", &[verb]);
+            return;
+        }
+        // An array is an lvalue but never a modifiable one: it has no
+        // assignment operator, only its elements do.
+        if let Some(typ) = target.typ {
+            if self.types.kind(typ) == TypeKind::Array {
+                diag::error(pos, &gettext("assignment to expression with array type"));
+            }
+        }
+    }
+
     fn check_const_assignment(&self, target: &Expr, pos: Position) {
         // Check for assignment through pointer to const first: *p where p is const T*
         if let ExprKind::Unary {

@@ -69,11 +69,18 @@ impl Aarch64CodeGen {
             // takes its own path for a variadic call, and that path still
             // moved one register's worth -- so the composite that the rest of
             // the compiler now passes as a pair arrived half formed.
+            // Only an aggregate small enough to be passed directly travels by
+            // value. Stage B.4 replaces a larger one with a pointer to the
+            // caller's copy, and `va_arg` reads it that way -- copying the
+            // object into the slot instead handed the reader twenty-four bytes
+            // of data where it expected an address, and it dereferenced them.
             let agg_bytes = arg_type.and_then(|t| {
-                matches!(
+                let abi =
+                    crate::abi::get_abi_for_conv(crate::abi::CallingConv::C, &self.base.target);
+                (matches!(
                     types.kind(t),
                     TypeKind::Struct | TypeKind::Union | TypeKind::Array
-                )
+                ) && !matches!(abi.classify_param(t, types), ArgClass::Indirect { .. }))
                 .then(|| (types.size_bits(t) / 8).max(1) as i32)
             });
             let gp_pair = agg_bytes.is_some_and(|_| {

@@ -1791,6 +1791,55 @@ impl Parser<'_> {
     ///
     /// This handles C99 6.7.8 paragraph 22: "If an array of unknown size is initialized,
     /// its size is determined by the largest indexed element with an explicit initializer."
+    /// The element count an array takes from a string-literal initializer:
+    /// the characters plus the terminating null.
+    ///
+    /// One C byte per `char`, so count chars rather than bytes: `len()` is the
+    /// UTF-8 encoded length, which over-counts every byte at or above 0x80 --
+    /// `char a[] = "\x80";` came out as 3 bytes, not 2. `char16_t`/`char32_t`
+    /// literals already carry code units, so their unit count is the element
+    /// count; the *byte* size follows from the element type.
+    pub(crate) fn string_initializer_len(&self, init: &Expr) -> Option<usize> {
+        match &init.kind {
+            ExprKind::StringLit(s) | ExprKind::WideStringLit(s) => Some(s.chars().count() + 1),
+            ExprKind::Utf16StringLit(units) => Some(units.len() + 1),
+            ExprKind::Utf32StringLit(units) => Some(units.len() + 1),
+            _ => None,
+        }
+    }
+
+    /// The string literal inside `{ ... }`, when that is what the braces hold.
+    ///
+    /// C17 6.7.9p14 lets the string literal initializing a character array be
+    /// enclosed in braces, so `char b[] = {"hi"};` declares `char[3]` and
+    /// copies the characters in. Counting the initializer list instead gives
+    /// an array of one element holding a pointer's worth of nothing.
+    ///
+    /// Gated on the element type, because the same shape means something else
+    /// one level up: `const char *p[] = {"aa", "bbb"}` is an array of two
+    /// pointers, and `char names[3][4] = {"Sun"}` an array of arrays.
+    pub(crate) fn braced_string_initializer<'a>(
+        &self,
+        elem_type: TypeId,
+        elements: &'a [InitElement],
+    ) -> Option<&'a Expr> {
+        if !self.types.is_integer(elem_type) {
+            return None;
+        }
+        let [only] = elements else { return None };
+        if !only.designators.is_empty() {
+            return None;
+        }
+        matches!(
+            only.value.kind,
+            ExprKind::StringLit(_)
+                | ExprKind::WideStringLit(_)
+                | ExprKind::Utf16StringLit(_)
+                | ExprKind::Utf32StringLit(_)
+        )
+        .then_some(only.value.as_ref())
+    }
+
     fn infer_array_size_from_init(&mut self, typ: TypeId, init: &Expr) -> TypeId {
         if self.types.kind(typ) != TypeKind::Array {
             return typ;
@@ -1802,33 +1851,23 @@ impl Parser<'_> {
             return typ;
         }
 
+        // `{"hi"}` initializes the array with the string, not with one
+        // element (C17 6.7.9p14), so look through the braces first.
+        let elem_type = self.types.base_type(typ).unwrap_or(self.types.int_id);
+        let init = match &init.kind {
+            ExprKind::InitList { elements } => self
+                .braced_string_initializer(elem_type, elements)
+                .unwrap_or(init),
+            _ => init,
+        };
+
         let new_size = match &init.kind {
             ExprKind::InitList { elements } => Some(self.array_size_from_elements(elements)),
-            ExprKind::StringLit(s) => {
-                // For char array initialized with string literal,
-                // size is string length + 1 for null terminator.
-                //
-                // One C byte per `char`, so count chars: `len()` is the UTF-8
-                // encoded length, which over-counts every byte at or above
-                // 0x80 — `char a[] = "\x80";` came out as 3 bytes, not 2.
-                Some(s.chars().count() + 1)
-            }
-            ExprKind::WideStringLit(s) => {
-                // For wchar_t array initialized with wide string literal,
-                // size is number of chars + 1 for null terminator
-                Some(s.chars().count() + 1)
-            }
-            // char16_t/char32_t literals already carry code units, so the
-            // element count is the unit count. The *byte* size follows from
-            // the element type, which is set separately below.
-            ExprKind::Utf16StringLit(units) => Some(units.len() + 1),
-            ExprKind::Utf32StringLit(units) => Some(units.len() + 1),
-            _ => None,
+            _ => self.string_initializer_len(init),
         };
 
         if let Some(size) = new_size {
             // Update type with actual size from initializer
-            let elem_type = self.types.base_type(typ).unwrap_or(self.types.int_id);
             // Preserve modifiers (like const, static)
             let modifiers = self.types.modifiers(typ);
             let mut arr_type = Type::array(elem_type, size);

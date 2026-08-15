@@ -3251,7 +3251,15 @@ impl<'a> Parser<'a> {
                             {
                                 let elem_type =
                                     self.types.base_type(typ).unwrap_or(self.types.int_id);
-                                let array_size = self.array_size_from_elements(&elements);
+                                // `(char[]){"hi"}` is the string in braces
+                                // (C17 6.7.9p14), three characters, not an
+                                // array of one element.
+                                let array_size =
+                                    match self.braced_string_initializer(elem_type, &elements) {
+                                        Some(lit) => self.string_initializer_len(lit),
+                                        None => Some(self.array_size_from_elements(&elements)),
+                                    }
+                                    .unwrap_or_else(|| self.array_size_from_elements(&elements));
                                 self.types.intern(Type::array(elem_type, array_size))
                             } else {
                                 typ

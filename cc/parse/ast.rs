@@ -20,6 +20,14 @@ use crate::types::{TypeId, TypeModifiers};
 // Operators
 // ============================================================================
 
+/// Which operation a checked-arithmetic builtin performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckedOp {
+    Add,
+    Sub,
+    Mul,
+}
+
 /// Unary operators
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnaryOp {
@@ -406,6 +414,19 @@ pub enum ExprKind {
     Ctzl {
         /// The value to count trailing zeros in
         arg: Box<Expr>,
+    },
+
+    /// `__builtin_add_overflow(a, b, res)` and its `sub`/`mul` siblings,
+    /// including the typed spellings such as `__builtin_uaddl_overflow`.
+    ///
+    /// Computes `a op b` with infinite precision, stores the result converted
+    /// to `*res`, and yields 1 if that conversion lost information.
+    CheckedArith {
+        op: CheckedOp,
+        a: Box<Expr>,
+        b: Box<Expr>,
+        /// Pointer to where the wrapped result goes.
+        res: Box<Expr>,
     },
 
     /// __builtin_ctzll(x)

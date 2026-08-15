@@ -1492,6 +1492,8 @@ impl<'a> Linearizer<'a> {
     /// - Statement expressions (GNU extension with potential side effects)
     pub(crate) fn is_pure_expr(&self, expr: &Expr) -> bool {
         match &expr.kind {
+            // Writes through its third argument.
+            ExprKind::CheckedArith { .. } => false,
             // Literals are always pure
             ExprKind::IntLit(_)
             | ExprKind::Int128Lit(_)
@@ -4710,6 +4712,57 @@ impl<'a> Linearizer<'a> {
         }
 
         match &expr.kind {
+            // `__builtin_add_overflow(a, b, res)` and its siblings.
+            //
+            // Computed in 128 bits, which holds every exact sum, difference
+            // and product of two operands of 64 bits or fewer, then narrowed
+            // to the destination's type and widened back: if the round trip
+            // changes the value, the operation overflowed. That is the
+            // definition, and it needs no new opcode on either target -- the
+            // flag-reading forms the hardware offers would.
+            //
+            // Signedness of the wide type follows the operands: a product of
+            // two 64-bit unsigned values can exceed the signed 128-bit range,
+            // so all-unsigned operands compute unsigned.
+            ExprKind::CheckedArith { op, a, b, res } => {
+                let a_typ = self.expr_type(a);
+                let b_typ = self.expr_type(b);
+                let res_ptr_typ = self.expr_type(res);
+                let dst_typ = self
+                    .types
+                    .base_type(res_ptr_typ)
+                    .unwrap_or(self.types.int_id);
+
+                let all_unsigned = self.types.is_unsigned(a_typ)
+                    && self.types.is_unsigned(b_typ)
+                    && self.types.is_unsigned(dst_typ);
+                let wide = if all_unsigned {
+                    self.types.uint128_id
+                } else {
+                    self.types.int128_id
+                };
+
+                let av = self.linearize_expr(a);
+                let bv = self.linearize_expr(b);
+                let addr = self.linearize_expr(res);
+
+                let aw = self.emit_convert(av, a_typ, wide);
+                let bw = self.emit_convert(bv, b_typ, wide);
+                let bin = match op {
+                    crate::parse::ast::CheckedOp::Add => BinaryOp::Add,
+                    crate::parse::ast::CheckedOp::Sub => BinaryOp::Sub,
+                    crate::parse::ast::CheckedOp::Mul => BinaryOp::Mul,
+                };
+                let exact = self.emit_binary(bin, aw, bw, wide, wide);
+
+                let narrowed = self.emit_convert(exact, wide, dst_typ);
+                let dst_size = self.types.size_bits(dst_typ);
+                self.emit(Instruction::store(narrowed, addr, 0, dst_typ, dst_size));
+
+                let back = self.emit_convert(narrowed, dst_typ, wide);
+                self.emit_binary(BinaryOp::Ne, exact, back, self.types.int_id, wide)
+            }
+
             ExprKind::IntLit(val) => {
                 let typ = self.expr_type(expr);
                 self.emit_const(*val as i128, typ)

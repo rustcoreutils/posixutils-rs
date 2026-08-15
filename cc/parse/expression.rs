@@ -10,7 +10,8 @@
 //
 
 use super::ast::{
-    AssignOp, BinaryOp, Designator, Expr, ExprKind, FpTest, InitElement, OffsetOfPath, UnaryOp,
+    AssignOp, BinaryOp, CheckedOp, Designator, Expr, ExprKind, FpTest, InitElement, OffsetOfPath,
+    UnaryOp,
 };
 use super::parser::{DeclaratorName, ParseError, ParseResult, Parser};
 use crate::diag;
@@ -2479,6 +2480,83 @@ impl<'a> Parser<'a> {
                 self.expect_special(b')')?;
                 Ok(Self::typed_expr(
                     ExprKind::Ctzll { arg: Box::new(arg) },
+                    self.types.int_id,
+                    token_pos,
+                ))
+            })()),
+            // Checked arithmetic: compute exactly, store the wrapped
+            // result, and answer whether wrapping lost anything.
+            crate::kw::BUILTIN_ADD_OVERFLOW
+            | crate::kw::BUILTIN_SADD_OVERFLOW
+            | crate::kw::BUILTIN_SADDL_OVERFLOW
+            | crate::kw::BUILTIN_SADDLL_OVERFLOW
+            | crate::kw::BUILTIN_UADD_OVERFLOW
+            | crate::kw::BUILTIN_UADDL_OVERFLOW
+            | crate::kw::BUILTIN_UADDLL_OVERFLOW => Some((|| {
+                self.expect_special(b'(')?;
+                let a = self.parse_assignment_expr()?;
+                self.expect_special(b',')?;
+                let b = self.parse_assignment_expr()?;
+                self.expect_special(b',')?;
+                let res = self.parse_assignment_expr()?;
+                self.expect_special(b')')?;
+                Ok(Self::typed_expr(
+                    ExprKind::CheckedArith {
+                        op: CheckedOp::Add,
+                        a: Box::new(a),
+                        b: Box::new(b),
+                        res: Box::new(res),
+                    },
+                    self.types.int_id,
+                    token_pos,
+                ))
+            })()),
+            crate::kw::BUILTIN_SUB_OVERFLOW
+            | crate::kw::BUILTIN_SSUB_OVERFLOW
+            | crate::kw::BUILTIN_SSUBL_OVERFLOW
+            | crate::kw::BUILTIN_SSUBLL_OVERFLOW
+            | crate::kw::BUILTIN_USUB_OVERFLOW
+            | crate::kw::BUILTIN_USUBL_OVERFLOW
+            | crate::kw::BUILTIN_USUBLL_OVERFLOW => Some((|| {
+                self.expect_special(b'(')?;
+                let a = self.parse_assignment_expr()?;
+                self.expect_special(b',')?;
+                let b = self.parse_assignment_expr()?;
+                self.expect_special(b',')?;
+                let res = self.parse_assignment_expr()?;
+                self.expect_special(b')')?;
+                Ok(Self::typed_expr(
+                    ExprKind::CheckedArith {
+                        op: CheckedOp::Sub,
+                        a: Box::new(a),
+                        b: Box::new(b),
+                        res: Box::new(res),
+                    },
+                    self.types.int_id,
+                    token_pos,
+                ))
+            })()),
+            crate::kw::BUILTIN_MUL_OVERFLOW
+            | crate::kw::BUILTIN_SMUL_OVERFLOW
+            | crate::kw::BUILTIN_SMULL_OVERFLOW
+            | crate::kw::BUILTIN_SMULLL_OVERFLOW
+            | crate::kw::BUILTIN_UMUL_OVERFLOW
+            | crate::kw::BUILTIN_UMULL_OVERFLOW
+            | crate::kw::BUILTIN_UMULLL_OVERFLOW => Some((|| {
+                self.expect_special(b'(')?;
+                let a = self.parse_assignment_expr()?;
+                self.expect_special(b',')?;
+                let b = self.parse_assignment_expr()?;
+                self.expect_special(b',')?;
+                let res = self.parse_assignment_expr()?;
+                self.expect_special(b')')?;
+                Ok(Self::typed_expr(
+                    ExprKind::CheckedArith {
+                        op: CheckedOp::Mul,
+                        a: Box::new(a),
+                        b: Box::new(b),
+                        res: Box::new(res),
+                    },
                     self.types.int_id,
                     token_pos,
                 ))

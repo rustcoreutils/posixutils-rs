@@ -1194,3 +1194,68 @@ void f(void){ int *p = 0; (void)g(p); }
 ",
     );
 }
+
+// ==== void operands and subscripts (C17 6.5.6p2, 6.5.15p3, 6.5.2.1p1) ====
+
+/// An operand has to have a value. A call to a `void` function has none, so
+/// `v() + 1` and `1 ? v() : 2` are constraint violations -- both used to
+/// compile, the conditional taking whichever arm's type came first. And a
+/// subscript needs a pointer on one side; `a[0]` where `a` is an `int` was
+/// silently given the element type `int` and indexed anyway.
+#[test]
+fn diagnostics_void_operands_and_bad_subscripts_are_rejected() {
+    for (name, src, expected) in [
+        (
+            "void_in_addition",
+            "void v(void);\nint f(void){ return v() + 1; }\n",
+            "void value not ignored",
+        ),
+        (
+            "void_in_comparison",
+            "void v(void);\nint f(void){ return v() == 0; }\n",
+            "void value not ignored",
+        ),
+        (
+            "void_in_conditional_then",
+            "void v(void);\nint f(void){ int x = 1 ? v() : 2; return x; }\n",
+            "void value not ignored",
+        ),
+        (
+            "void_in_conditional_else",
+            "void v(void);\nint f(void){ int x = 1 ? 2 : v(); return x; }\n",
+            "void value not ignored",
+        ),
+        (
+            "subscript_an_int",
+            "int f(void){ int a = 1; return a[0]; }\n",
+            "subscripted value is neither array nor pointer",
+        ),
+    ] {
+        compile_expect_error(name, src, expected);
+    }
+}
+
+/// The companion. A conditional whose arms are *both* void is fine, `void` is
+/// allowed wherever its absence of value does not matter -- a cast, a comma's
+/// left operand, a statement -- and a subscript stays symmetric: `a[i]` is
+/// defined as `*(a + i)`, so `0[a]` is legal C.
+#[test]
+fn diagnostics_permitted_void_and_subscript_forms_are_accepted() {
+    let src = r#"
+void v(void);
+int g(int *p) { return p[1]; }
+
+int f(void) {
+    int a[3] = {0};
+    int *p = a;
+
+    if (1) { v(); }             /* as a statement */
+    (void)v();                  /* cast to void */
+    (void)(v(), 1);             /* left operand of a comma */
+    1 ? v() : v();              /* both arms void */
+
+    return a[0] + 0[a] + p[2] + g(p);
+}
+"#;
+    compile_expect_ok("permitted_void_and_subscripts", src);
+}

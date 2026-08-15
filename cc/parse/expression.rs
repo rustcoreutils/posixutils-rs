@@ -333,6 +333,16 @@ impl<'a> Parser<'a> {
             let then_typ = then_expr.typ.unwrap_or(self.types.int_id);
             let else_typ = else_expr.typ.unwrap_or(self.types.int_id);
 
+            // C17 6.5.15p3: either both arms have type void, or neither does.
+            // A mismatch means one arm has no value for the expression to
+            // take, which used to compile as whichever type came first.
+            let then_void = self.types.kind(then_typ) == TypeKind::Void;
+            let else_void = self.types.kind(else_typ) == TypeKind::Void;
+            if then_void != else_void {
+                let culprit = if then_void { &then_expr } else { &else_expr };
+                self.check_not_void(culprit, culprit.pos);
+            }
+
             // Decay arrays to pointers, functions to pointer-to-function
             let then_decayed = self.decayed_type(then_typ);
             let else_decayed = self.decayed_type(else_typ);
@@ -1309,6 +1319,7 @@ impl<'a> Parser<'a> {
                 self.advance();
                 let index = self.parse_expression()?;
                 self.expect_special(b']')?;
+                self.check_subscript(&expr, &index, base_pos);
                 // Get element type from array/pointer type
                 let elem_type = expr
                     .typ
@@ -1680,6 +1691,41 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Check a subscript's operands (C17 6.5.2.1p1): one must be a pointer to
+    /// a complete object type and the other an integer.
+    ///
+    /// `a[i]` is defined as `*(a + i)`, so it is symmetric -- `3[arr]` is
+    /// legal C and has to stay so.
+    fn check_subscript(&self, base: &Expr, index: &Expr, pos: Position) {
+        let (Some(b), Some(i)) = (base.typ, index.typ) else {
+            return;
+        };
+        let points = |t: TypeId| matches!(self.types.kind(t), TypeKind::Pointer | TypeKind::Array);
+        if points(b) || points(i) {
+            return;
+        }
+        diag::error(
+            pos,
+            &gettext("subscripted value is neither array nor pointer"),
+        );
+    }
+
+    /// Reject a `void` operand where a value is required (C17 6.5.6p2 for the
+    /// binary operators, 6.5.15p3 for the conditional).
+    ///
+    /// gcc words this the same way for every such context, and the wording is
+    /// the useful part: the problem is not the type but that there is no value
+    /// at all.
+    fn check_not_void(&self, operand: &Expr, pos: Position) -> bool {
+        let is_void = operand
+            .typ
+            .is_some_and(|t| self.types.kind(t) == TypeKind::Void);
+        if is_void {
+            diag::error(pos, &gettext("void value not ignored as it ought to be"));
+        }
+        is_void
+    }
+
     /// Does this argument's type match some member of a union parameter?
     ///
     /// Stands in for `__attribute__((transparent_union))`, which c17 does not
@@ -1935,6 +1981,11 @@ impl<'a> Parser<'a> {
 
     /// Create a typed binary expression, computing result type from operands
     fn make_binary(&mut self, op: BinaryOp, left: Expr, right: Expr) -> Expr {
+        // C17 6.5.5-6.5.14 require operands with a value. `f() + 1` where `f`
+        // returns void has none, and used to compile.
+        self.check_not_void(&left, left.pos);
+        self.check_not_void(&right, right.pos);
+
         // Compute result type based on operator and operand types
         let left_type = left.typ.unwrap_or(self.types.int_id);
         let right_type = right.typ.unwrap_or(self.types.int_id);

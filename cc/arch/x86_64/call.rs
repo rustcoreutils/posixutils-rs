@@ -346,7 +346,12 @@ impl X86_64CodeGen {
             }
         }
 
-        self.rsp_adjust -= info.stack_bytes;
+        // Deliberately *not* undone here: %rsp stays lowered until
+        // `cleanup_call_stack` runs after the call, and the register arguments
+        // are set up inside that window. Clearing it here made every local read
+        // by `save_clobbered_arg_regs` and `setup_register_args` miss by the
+        // size of the outgoing area, whenever the frame addresses locals
+        // through %rsp.
         info.stack_bytes as usize
     }
 
@@ -1227,6 +1232,9 @@ impl X86_64CodeGen {
 
     /// Clean up stack after call
     pub(super) fn cleanup_call_stack(&mut self, stack_cleanup: usize) {
+        // The outgoing area is gone from here on, so locals are once again
+        // where the frame layout says they are.
+        self.rsp_adjust -= stack_cleanup as i32;
         if stack_cleanup > 0 {
             self.push_lir(X86Inst::Add {
                 size: OperandSize::B64,

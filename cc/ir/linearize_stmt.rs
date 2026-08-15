@@ -926,32 +926,26 @@ impl<'a> super::linearize::Linearizer<'a> {
         } = &value.kind
         {
             self.linearize_init_list_at_offset(base_sym, offset, field_type, nested_elems);
-        } else if let ExprKind::StringLit(s) = &value.kind {
+        } else if matches!(
+            &value.kind,
+            ExprKind::StringLit(_)
+                | ExprKind::WideStringLit(_)
+                | ExprKind::Utf16StringLit(_)
+                | ExprKind::Utf32StringLit(_)
+        ) {
             if self.types.kind(field_type) == TypeKind::Array {
-                let elem_type = self
-                    .types
-                    .base_type(field_type)
-                    .unwrap_or(self.types.char_id);
-                let elem_size = self.types.size_bits(elem_type);
-
-                for (i, byte) in s.bytes().enumerate() {
-                    let byte_val = self.emit_const(byte as i128, elem_type);
-                    self.emit(Instruction::store(
-                        byte_val,
-                        base_sym,
-                        offset + i as i64,
-                        elem_type,
-                        elem_size,
-                    ));
+                // One `char` per C byte, so the units are the scalar values --
+                // `bytes()` gives Rust's UTF-8 encoding of them, which for
+                // anything at or above 0x80 is one byte too many *and*
+                // disagrees with the null terminator, placed by counting
+                // `chars`. `struct { char t[4]; int g; }` initialized with
+                // "\xc2\x80" wrote c3 82 00 80 where gcc writes c2 80 00 00.
+                //
+                // Shared with the two other string-store paths rather than
+                // counted a third way here.
+                if let Some(units) = Self::string_literal_units(&value.kind) {
+                    self.store_string_units(base_sym, offset, field_type, &value.kind, &units);
                 }
-                let null_val = self.emit_const(0, elem_type);
-                self.emit(Instruction::store(
-                    null_val,
-                    base_sym,
-                    offset + s.chars().count() as i64,
-                    elem_type,
-                    elem_size,
-                ));
             } else {
                 let val = self.linearize_expr(value);
                 let val_type = self.expr_type(value);

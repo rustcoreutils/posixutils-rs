@@ -1783,3 +1783,104 @@ int main(void) {
         0
     );
 }
+
+/// A universal character name denotes a *code point*, which the execution
+/// character set then encodes — UTF-8 here. It was returned as if it were a
+/// byte, so `"café"` was the five bytes `caf\xe9` (Latin-1) instead of the
+/// six `caf\xc3\xa9`, and `sizeof` said 5 where gcc says 6.
+///
+/// Fixing that in isolation would have broken the wide encodings, which had
+/// the opposite halves right: a UCN worked there and a character typed
+/// directly in the source did not. The parser sees the literal before escapes
+/// are resolved, so it *can* tell a source byte from one an escape named —
+/// `L"café"` is four wide characters and `L"caf\xc3\xa9"` is five, and only
+/// keeping the two apart gets both right.
+///
+/// Every expectation here came from gcc on this source.
+#[test]
+fn c99_universal_character_names_use_the_execution_encoding() {
+    let code = r#"
+#include <wchar.h>
+#include <uchar.h>
+
+int main(void) {
+    /* Narrow: bytes. A UCN and the character itself agree. */
+    if (sizeof("café") != 6) return 1;
+    if (sizeof("café") != 6) return 2;
+    if ((unsigned char)"café"[3] != 0xc3) return 3;
+    if ((unsigned char)"café"[4] != 0xa9) return 4;
+    /* A byte escape stays one byte. */
+    if (sizeof("caf\xc3\xa9") != 6) return 5;
+
+    /* Wide: characters. Both spellings give one element. */
+    if (wcslen(L"café") != 4 || L"café"[3] != 233) return 6;
+    if (wcslen(L"café") != 4 || L"café"[3] != 233) return 7;
+    /* But two byte escapes are two elements, not one character. */
+    if (wcslen(L"caf\xc3\xa9") != 5) return 8;
+    if (L"caf\xc3\xa9"[3] != 0xc3 || L"caf\xc3\xa9"[4] != 0xa9) return 9;
+
+    /* char16_t and char32_t behave the same way. */
+    if (u"café"[3] != 233 || u"café"[3] != 233) return 10;
+    if (U"café"[3] != 233 || U"café"[3] != 233) return 11;
+
+    /* Outside the BMP: char16_t splits into a surrogate pair. */
+    if (u"😀"[0] != 0xd83d || u"😀"[1] != 0xde00) return 12;
+    if (U"😀"[0] != 0x1f600) return 13;
+    if (sizeof("😀") != 5) return 14;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run(
+            "c99_universal_character_names_use_the_execution_encoding",
+            code,
+            &[]
+        ),
+        0
+    );
+}
+
+/// A `char` array *member* initialized from a string literal was written with
+/// Rust's UTF-8 encoding of the parsed literal while its null terminator was
+/// placed by counting characters. For any byte at or above 0x80 the two
+/// disagree: the data runs one byte long and the terminator lands inside it.
+///
+/// `struct { char t[4]; int g; }` initialized with `"\xc2\x80"` wrote
+/// `c3 82 00 80` where gcc writes `c2 80 00 00`. Automatic storage only — the
+/// static path goes through a different routine and was already right, which
+/// is why the existing high-byte test did not catch it.
+#[test]
+fn c99_struct_member_string_initializer_keeps_its_bytes() {
+    let code = r#"
+struct G { char tag[4]; int guard; };
+struct G global = { "\xc2\x80", 0x5a5a5a5a };
+
+int main(void) {
+    struct G g = { "\xc2\x80", 0x5a5a5a5a };
+    if ((unsigned char)g.tag[0] != 0xc2) return 1;
+    if ((unsigned char)g.tag[1] != 0x80) return 2;
+    if (g.tag[2] != 0 || g.tag[3] != 0) return 3;
+    if (g.guard != 0x5a5a5a5a) return 4;
+
+    /* The static path, which was already correct, must stay so. */
+    if ((unsigned char)global.tag[0] != 0xc2) return 5;
+    if ((unsigned char)global.tag[1] != 0x80) return 6;
+    if (global.guard != 0x5a5a5a5a) return 7;
+
+    /* Plain ASCII, unaffected either way. */
+    struct G a = { "ab", 1 };
+    if (a.tag[0] != 'a' || a.tag[1] != 'b' || a.tag[2] != 0 || a.guard != 1) return 8;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run(
+            "c99_struct_member_string_initializer_keeps_its_bytes",
+            code,
+            &[]
+        ),
+        0
+    );
+}

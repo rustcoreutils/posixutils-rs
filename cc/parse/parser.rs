@@ -1208,14 +1208,14 @@ impl<'a> Parser<'a> {
         // Parse first string
         let token = self.consume();
         if let TokenValue::String(s) = &token.value {
-            result.push_str(&Self::parse_string_literal(s));
+            result.push_str(&Self::literal_bytes(&Self::parse_string_literal(s)));
         }
 
         // Handle string concatenation (adjacent string literals)
         while self.peek() == TokenType::String {
             let token = self.consume();
             if let TokenValue::String(s) = &token.value {
-                result.push_str(&Self::parse_string_literal(s));
+                result.push_str(&Self::literal_bytes(&Self::parse_string_literal(s)));
             }
         }
 

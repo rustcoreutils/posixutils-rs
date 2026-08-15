@@ -235,20 +235,34 @@ fn test_char_escape_ucn_long_emoji() {
 
 #[test]
 fn test_string_ucn() {
-    // "caf\u00E9" should become "café"
+    // A narrow literal holds *bytes*, one per `char`, and a UCN names a code
+    // point that the execution character set encodes -- UTF-8 here. So
+    // `"caf\u00E9"` is five bytes, the last two being 0xC3 0xA9.
+    //
+    // This test used to assert the Rust string "café", which is the same four
+    // characters but only *four* C bytes, and that is precisely the bug it was
+    // pinning: the code point was stored as the single byte 0xE9, so `sizeof`
+    // answered 5 where gcc says 6.
     let (expr, _types, _strings, _symbols) = parse_expr("\"caf\\u00E9\"").unwrap();
     match expr.kind {
-        ExprKind::StringLit(s) => assert_eq!(s, "café"),
+        ExprKind::StringLit(s) => {
+            let bytes: Vec<u8> = s.chars().map(|c| c as u32 as u8).collect();
+            assert_eq!(bytes, b"caf\xc3\xa9");
+        }
         _ => panic!("Expected StringLit"),
     }
 }
 
 #[test]
 fn test_string_ucn_long() {
-    // Test long UCN in string
+    // Likewise for a code point outside the BMP: four UTF-8 bytes, not one
+    // truncated to a byte.
     let (expr, _types, _strings, _symbols) = parse_expr("\"hello\\U0001F600world\"").unwrap();
     match expr.kind {
-        ExprKind::StringLit(s) => assert_eq!(s, "hello😀world"),
+        ExprKind::StringLit(s) => {
+            let bytes: Vec<u8> = s.chars().map(|c| c as u32 as u8).collect();
+            assert_eq!(bytes, "hello\u{1F600}world".as_bytes());
+        }
         _ => panic!("Expected StringLit"),
     }
 }

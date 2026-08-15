@@ -7484,3 +7484,292 @@ int main(void) {
         0
     );
 }
+
+/// An HFA passed to a variadic function arrives in the SIMD registers, like
+/// any other HFA, so `va_arg` has to read it out of *their* save area -- one
+/// element per 16-byte slot -- rather than out of the general-register one.
+///
+/// Aggregates took the integer path unconditionally. That agreed with a caller
+/// which also sent them in general registers, and with nothing else: gcc's
+/// callee read `s0-s3` and got garbage. Once the caller was corrected to follow
+/// AAPCS64 §5.4.2, the two halves of a single c17-compiled program disagreed.
+///
+/// The two sources space the elements differently -- 16 bytes apart in the save
+/// area, packed at their own stride on the stack -- which is why the copy walks
+/// a selected stride instead of branching on which source won.
+///
+/// x86-64 had the same defect by another route and is covered here too: every
+/// aggregate went through the integer path as one wide read from the general
+/// save area, which is unrelated data for anything the classifier put in SSE
+/// registers.
+#[test]
+fn codegen_variadic_hfa_argument() {
+    let code = r#"
+#include <stdarg.h>
+typedef struct { float a, b; }          F2;
+typedef struct { float a, b, c; }       F3;
+typedef struct { float a, b, c, d; }    F4;
+typedef struct { double a, b; }         D2;
+typedef struct { double a, b, c; }      D3;
+
+/* a trailing scalar catches a wrong step through the save area */
+double v_f2(int n, ...) { va_list ap; va_start(ap, n);
+    F2 v = va_arg(ap, F2); double t = va_arg(ap, double); va_end(ap);
+    return (double)(v.a * 10 + v.b) + t; }
+double v_f3(int n, ...) { va_list ap; va_start(ap, n);
+    F3 v = va_arg(ap, F3); double t = va_arg(ap, double); va_end(ap);
+    return (double)(v.a * 100 + v.b * 10 + v.c) + t; }
+double v_f4(int n, ...) { va_list ap; va_start(ap, n);
+    F4 v = va_arg(ap, F4); double t = va_arg(ap, double); va_end(ap);
+    return (double)(v.a * 1000 + v.b * 100 + v.c * 10 + v.d) + t; }
+double v_d2(int n, ...) { va_list ap; va_start(ap, n);
+    D2 v = va_arg(ap, D2); double t = va_arg(ap, double); va_end(ap);
+    return v.a * 10 + v.b + t; }
+double v_d3(int n, ...) { va_list ap; va_start(ap, n);
+    D3 v = va_arg(ap, D3); double t = va_arg(ap, double); va_end(ap);
+    return v.a * 100 + v.b * 10 + v.c + t; }
+
+int printf(const char *, ...);
+int fflush(void *);
+
+/* Traced, because this runs on a target that cannot be run locally: a crash
+   loses the return code, so the log has to show how far it got and with what
+   value. The flush is the load-bearing part -- the harness captures output
+   through a pipe, so stdout is fully buffered and a segfault takes the whole
+   buffer with it. `fflush(0)` flushes every stream. */
+#define T(n) (printf("try " n "\n"), fflush(0))
+#define G(n, g) (printf("got " n " %.1f\n", (double)(g)), fflush(0))
+
+int main(void) {
+    F2 f2 = {1, 2};
+    F3 f3 = {1, 2, 3};
+    F4 f4 = {1, 2, 3, 4};
+    D2 d2 = {1, 2};
+    D3 d3 = {1, 2, 3};
+
+    T("f2"); { double g = v_f2(1, f2, 5.0); G("f2", g); if (g != 17) return 1; }
+    T("f3"); { double g = v_f3(1, f3, 5.0); G("f3", g); if (g != 128) return 2; }
+    T("f4"); { double g = v_f4(1, f4, 5.0); G("f4", g); if (g != 1239) return 3; }
+    T("d2"); { double g = v_d2(1, d2, 5.0); G("d2", g); if (g != 17) return 4; }
+    T("d3"); { double g = v_d3(1, d3, 5.0); G("d3", g); if (g != 128) return 5; }
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("codegen_variadic_hfa", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("codegen_variadic_hfa_opt", code),
+        0
+    );
+}
+
+/// Several aggregate `va_arg` results live at once.
+///
+/// An aggregate wider than a register was given an ordinary pseudo with no
+/// storage behind it, so the backend was handed a register that held whatever
+/// happened to be there and treated it as the destination's address. One such
+/// call could survive on luck; four in a function did not, which is why this
+/// looked cumulative rather than shape-specific and hid behind register
+/// pressure.
+
+#[test]
+fn codegen_variadic_aggregate_results_coexist() {
+    let code = r#"
+#include <stdarg.h>
+typedef struct { float a, b; }          F2;
+typedef struct { float a, b, c; }       F3;
+typedef struct { float a, b, c, d; }    F4;
+typedef struct { double a, b; }         D2;
+typedef struct { double a, b, c; }      D3;
+typedef struct { long a, b; }           L2;   /* two general-register slots */
+typedef struct { long a, b, c; }        L3;   /* over 16 bytes: passed by pointer */
+typedef struct { char a, b, c; }        C3;   /* three bytes: fits a register */
+typedef struct { char a, b, c, d, e; }  C5;   /* five bytes: not a power of two */
+
+int printf(const char *, ...);
+int fflush(void *);
+
+double g_f2(int n, ...) { va_list ap; va_start(ap, n);
+    F2 v = va_arg(ap, F2); va_end(ap); return (double)(v.a * 10 + v.b); }
+double g_f3(int n, ...) { va_list ap; va_start(ap, n);
+    F3 v = va_arg(ap, F3); va_end(ap); return (double)(v.a * 100 + v.b * 10 + v.c); }
+double g_f4(int n, ...) { va_list ap; va_start(ap, n);
+    F4 v = va_arg(ap, F4); va_end(ap); return (double)(v.a * 1000 + v.b * 100 + v.c * 10 + v.d); }
+double g_d2(int n, ...) { va_list ap; va_start(ap, n);
+    D2 v = va_arg(ap, D2); va_end(ap); return v.a * 10 + v.b; }
+double g_d3(int n, ...) { va_list ap; va_start(ap, n);
+    D3 v = va_arg(ap, D3); va_end(ap); return v.a * 100 + v.b * 10 + v.c; }
+int    g_c3(int n, ...) { va_list ap; va_start(ap, n);
+    C3 v = va_arg(ap, C3); va_end(ap); return v.a * 100 + v.b * 10 + v.c; }
+int    g_c5(int n, ...) { va_list ap; va_start(ap, n);
+    C5 v = va_arg(ap, C5); va_end(ap);
+    return v.a * 10000 + v.b * 1000 + v.c * 100 + v.d * 10 + v.e; }
+long   g_l2(int n, ...) { va_list ap; va_start(ap, n);
+    L2 v = va_arg(ap, L2); va_end(ap); return v.a * 10 + v.b; }
+long   g_l3(int n, ...) { va_list ap; va_start(ap, n);
+    L3 v = va_arg(ap, L3); va_end(ap); return v.a * 100 + v.b * 10 + v.c; }
+
+/* two aggregates out of one va_list, so the areas must advance correctly */
+double g_two(int n, ...) { va_list ap; va_start(ap, n);
+    F4 p = va_arg(ap, F4); D2 q = va_arg(ap, D2); va_end(ap);
+    return (double)(p.a * 1000 + p.b * 100 + p.c * 10 + p.d) + q.a * 10 + q.b; }
+
+int main(void) {
+    F2 f2 = {1, 2};
+    F3 f3 = {1, 2, 3};
+    F4 f4 = {1, 2, 3, 4};
+    D2 d2 = {1, 2};
+    D3 d3 = {1, 2, 3};
+    C3 c3 = {1, 2, 3};
+    C5 c5 = {1, 2, 3, 4, 5};
+    L2 l2 = {1, 2};
+    L3 l3 = {1, 2, 3};
+
+    /* all live in one function: this is what used to fall over. Traced
+       because this runs on a target that cannot be run locally -- a crash
+       loses the return code, so the log has to show which shape it died on.
+       The flush matters: output is captured through a pipe, so stdout is
+       fully buffered and a segfault would take the trace with it. */
+#define T(n) (printf("try " n "\n"), fflush(0))
+#define G(n, g) (printf("got " n " %.1f\n", (double)(g)), fflush(0))
+    T("f2"); { double g = g_f2(0, f2); G("f2", g); if (g != 12) return 1; }
+    T("f3"); { double g = g_f3(0, f3); G("f3", g); if (g != 123) return 2; }
+    T("f4"); { double g = g_f4(0, f4); G("f4", g); if (g != 1234) return 3; }
+    T("d2"); { double g = g_d2(0, d2); G("d2", g); if (g != 12) return 4; }
+    T("d3"); { double g = g_d3(0, d3); G("d3", g); if (g != 123) return 5; }
+    T("l2"); { long g = g_l2(0, l2); G("l2", g); if (g != 12) return 6; }
+    T("l3"); { long g = g_l3(0, l3); G("l3", g); if (g != 123) return 7; }
+    T("two"); { double g = g_two(0, f4, d2); G("two", g); if (g != 1246) return 8; }
+    /* an aggregate that fits in a register is one load, not a chunked copy:
+       chunking wrote each piece over the last and kept only the final byte */
+    if (g_c3(0, c3) != 123) return 9;
+    if (g_c5(0, c5) != 12345) return 10;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_variadic_agg_results", code, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run_optimized("codegen_variadic_agg_results_opt", code),
+        0
+    );
+}
+
+/// AAPCS64 §5.4.2 C.10 and SysV AMD64 §3.2.3 both put a composite of at most
+/// sixteen bytes in two consecutive general registers. aarch64 handed over its
+/// *address* instead, on both sides of the call, so c17 agreed with itself and
+/// nothing in the suite noticed -- while every call across a c17/gcc boundary
+/// was wrong. With a gcc caller it segfaulted: the callee read the first eight
+/// bytes of the aggregate as if they were a pointer and dereferenced them.
+///
+/// Structs of four and eight bytes were already right; the broken range is
+/// exactly the two-eightbyte one.
+#[test]
+fn codegen_composite_in_two_registers() {
+    let code = r#"
+typedef struct { int a; }              S4;
+typedef struct { long a; }             S8;
+typedef struct { int a, b, c; }        S12;
+typedef struct { long a, b; }          S16;
+typedef struct { int a; long b; }      M16;   /* mixed widths */
+typedef struct { long a, b, c; }       S24;   /* over 16: still by pointer */
+
+__attribute__((noinline)) long f4(S4 v)   { return v.a; }
+__attribute__((noinline)) long f8(S8 v)   { return v.a; }
+__attribute__((noinline)) long f12(S12 v) { return v.a * 100 + v.b * 10 + v.c; }
+__attribute__((noinline)) long f16(S16 v) { return v.a * 10 + v.b; }
+__attribute__((noinline)) long m16(M16 v) { return v.a * 10 + v.b; }
+__attribute__((noinline)) long f24(S24 v) { return v.a * 100 + v.b * 10 + v.c; }
+
+/* an integer argument after the composite: if the composite claims the wrong
+   number of registers, this one moves too */
+__attribute__((noinline)) long tail(int n, S16 v, int m) {
+    return n * 10000 + v.a * 100 + v.b * 10 + m;
+}
+/* enough composites to run past X0-X7 and onto the stack */
+__attribute__((noinline)) long many(S16 a, S16 b, S16 c, S16 d, S16 e) {
+    return a.a + b.a * 10 + c.a * 100 + d.a * 1000 + e.a * 10000 + e.b * 100000;
+}
+
+int main(void) {
+    S4 s4 = {1};
+    S8 s8 = {2};
+    S12 s12 = {1, 2, 3};
+    S16 s16 = {1, 2};
+    M16 m = {1, 2};
+    S24 s24 = {1, 2, 3};
+
+    if (f4(s4) != 1) return 1;
+    if (f8(s8) != 2) return 2;
+    if (f12(s12) != 123) return 3;
+    if (f16(s16) != 12) return 4;
+    if (m16(m) != 12) return 5;
+    if (f24(s24) != 123) return 6;
+    if (tail(9, s16, 7) != 90127) return 7;
+
+    S16 a = {1, 0}, b = {2, 0}, c = {3, 0}, d = {4, 0}, e = {5, 6};
+    if (many(a, b, c, d, e) != 654321) return 8;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("codegen_composite_two_regs", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("codegen_composite_two_regs_opt", code),
+        0
+    );
+}
+
+/// AAPCS64 §6.4.2 stage C rounds the next stacked-argument address up to
+/// `max(8, alignof(type))` before placing the argument, not just its size
+/// afterwards. Advancing by the rounded size alone put a sixteen-byte-aligned
+/// argument eight bytes low whenever an odd number of eight-byte slots came
+/// before it -- and the caller and the callee made the same mistake, so c17
+/// agreed with itself and only a c17/gcc boundary showed it.
+///
+/// Eight integers fill X0-X7, then `pad` takes the first eight-byte stack
+/// slot, so everything after it starts at an odd multiple of eight.
+///
+/// Gated to aarch64. x86-64 has the same defect by a different mechanism -- it
+/// *pushes* stacked arguments rather than placing them at computed offsets, so
+/// a sixteen-byte-aligned one lands wherever the running push count leaves it
+/// -- and that is #C43, fixed separately. Running this there would assert a
+/// defect this commit does not address.
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn codegen_stacked_argument_alignment() {
+    let code = r#"
+__attribute__((noinline))
+static long f_i128(int a, int b, int c, int d, int e, int f, int g, int h,
+                   long pad, __int128 v, long tail) {
+    return (long)v + pad * 0 + tail * 0;
+}
+__attribute__((noinline))
+static long double f_ld(int a, int b, int c, int d, int e, int f, int g, int h,
+                        long pad, long double v, long tail) {
+    return v + (long double)(pad * 0 + tail * 0);
+}
+/* the argument after the over-aligned one must not land inside it */
+__attribute__((noinline))
+static long f_after(int a, int b, int c, int d, int e, int f, int g, int h,
+                    long pad, __int128 v, long tail) {
+    return (long)v * 10 + tail;
+}
+
+int main(void) {
+    /* through variables: an `__int128` *constant* argument crashes the x86-64
+       backend, which is #C42 and not what this test is about */
+    __int128 big = 424242;
+    __int128 five = 5;
+    if (f_i128(1,2,3,4,5,6,7,8, 99L, big, 77L) != 424242) return 1;
+    if (f_ld(1,2,3,4,5,6,7,8, 99L, 12345.5L, 77L) != 12345.5L) return 2;
+    if (f_after(1,2,3,4,5,6,7,8, 99L, five, 7L) != 57) return 3;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("codegen_stacked_arg_align", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("codegen_stacked_arg_align_opt", code),
+        0
+    );
+}

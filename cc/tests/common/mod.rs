@@ -98,6 +98,12 @@ fn compile_and_run_single(
 
     let exit_code = run_output.status.code().unwrap_or(-1);
 
+    // `-1` is also what a failed build returns, so say which happened and, if
+    // the program died, on what signal. Without this a segfault and a compiler
+    // error are the same number, and on a target that cannot be run locally
+    // that is the difference between a diagnosis and a guess.
+    report_abnormal_exit(name, config_name, &run_output);
+
     // On failure, dump generated assembly for diagnosis
     if exit_code != 0 {
         let asm_path = std::env::temp_dir().join(format!("c17_asm_{}_{}.s", name, config_name));
@@ -173,6 +179,7 @@ pub fn compile_and_run_two_units(
         .output()
         .expect("failed to run executable");
     let exit_code = run_output.status.code().unwrap_or(-1);
+    report_abnormal_exit(name, "single", &run_output);
     let _ = std::fs::remove_file(&exe_path);
     exit_code
 }
@@ -400,4 +407,33 @@ pub fn preprocess_text(name: &str, content: &str, extra_opts: &[&str]) -> C17Run
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         success: output.status.success(),
     }
+}
+
+/// Print why a test program produced no exit code.
+///
+/// A program killed by a signal has `code() == None`, which the callers turn
+/// into `-1` -- the same value a failed build returns. Reporting the signal,
+/// and whatever the program managed to write first, is what tells a segfault
+/// apart from a compiler error when the target cannot be run locally.
+fn report_abnormal_exit(name: &str, config_name: &str, out: &std::process::Output) {
+    if out.status.code().is_some() {
+        return;
+    }
+    #[cfg(unix)]
+    let detail = {
+        use std::os::unix::process::ExitStatusExt;
+        match out.status.signal() {
+            Some(sig) => format!("killed by signal {sig}"),
+            None => "terminated without an exit code".to_string(),
+        }
+    };
+    #[cfg(not(unix))]
+    let detail = "terminated without an exit code".to_string();
+
+    eprintln!(
+        "c17 test {name} [config: {config_name}] {detail}\n\
+         --- program stdout ---\n{}\n--- program stderr ---\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
 }

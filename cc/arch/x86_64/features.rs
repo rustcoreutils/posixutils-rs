@@ -17,6 +17,17 @@ use crate::arch::lir::{CallTarget, CondCode, Directive, FpSize, Label, OperandSi
 use crate::ir::Instruction;
 use crate::types::TypeTable;
 
+/// Where an aggregate `va_arg` result is written.
+#[derive(Clone, Copy)]
+enum VaAggDst {
+    /// A stack slot; the slot is the aggregate.
+    Slot(i32),
+    /// A register holding the aggregate's address.
+    Addr(Reg),
+    /// A register that *is* the aggregate, which fits in it.
+    Value(Reg),
+}
+
 impl X86_64CodeGen {
     // ========================================================================
     // Variadic function support (va_* builtins)
@@ -336,6 +347,287 @@ impl X86_64CodeGen {
         self.push_lir(X86Inst::Directive(Directive::BlockLabel(done_label)));
     }
 
+    /// Where an aggregate `va_arg` result goes, resolved once so the copy
+    /// cannot collide with the registers used to find the source.
+    ///
+    /// The result pseudo is allocated like any other and can land in `%rax` --
+    /// which is where the save-area pointer lives -- so an address held in a
+    /// register is moved into reserved scratch before anything else is
+    /// touched. `[%rax]` as both source and destination is exactly what the
+    /// first version emitted.
+    fn va_agg_dst(&mut self, dst_loc: &Loc, dst_is_addr: bool) -> Option<VaAggDst> {
+        Some(match dst_loc {
+            Loc::Stack(slot) => VaAggDst::Slot(*slot),
+            Loc::Reg(r) if dst_is_addr => {
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Reg(*r),
+                    dst: GpOperand::Reg(Reg::R10),
+                });
+                VaAggDst::Addr(Reg::R10)
+            }
+            // At or below eight bytes the result *is* the register.
+            Loc::Reg(r) => VaAggDst::Value(*r),
+            _ => return None,
+        })
+    }
+
+    /// Copy `nbytes` from `[src_base + src_off]` to `dst` at `dst_off`, in
+    /// descending power-of-two chunks so nothing past the object is written.
+    ///
+    /// `%rcx` is the shuttle: it is declared clobbered by `VaArg`, so no live
+    /// value is in it, and unlike `%r11` it cannot be `ap_base` (the va_list
+    /// pointer lands there when it comes from a stack slot).
+    fn va_copy_bytes(
+        &mut self,
+        src_base: Reg,
+        src_off: i32,
+        dst: VaAggDst,
+        dst_off: i32,
+        nbytes: i32,
+    ) {
+        // A register destination *is* the aggregate, so it takes one load of
+        // the whole slot. Chunking into it wrote each piece over the last, so
+        // a five-byte aggregate kept only its fifth byte -- and where the
+        // destination register was also the source base, the first write moved
+        // the base out from under the reads that followed. Every slot is at
+        // least eight bytes, in the save area and on the stack alike.
+        if let VaAggDst::Value(r) = dst {
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Mem(MemAddr::BaseOffset {
+                    base: src_base,
+                    offset: src_off,
+                }),
+                dst: GpOperand::Reg(r),
+            });
+            return;
+        }
+        let mut done = 0;
+        while done < nbytes {
+            let chunk = [8, 4, 2, 1]
+                .into_iter()
+                .find(|c| *c <= nbytes - done)
+                .unwrap_or(1);
+            let size = OperandSize::from_bits(chunk as u32 * 8);
+            self.push_lir(X86Inst::Mov {
+                size,
+                src: GpOperand::Mem(MemAddr::BaseOffset {
+                    base: src_base,
+                    offset: src_off + done,
+                }),
+                dst: GpOperand::Reg(Reg::Rcx),
+            });
+            let into = match dst {
+                VaAggDst::Slot(slot) => GpOperand::Mem(self.stack_field(slot, dst_off + done)),
+                VaAggDst::Addr(base) => GpOperand::Mem(MemAddr::BaseOffset {
+                    base,
+                    offset: dst_off + done,
+                }),
+                VaAggDst::Value(r) => GpOperand::Reg(r),
+            };
+            self.push_lir(X86Inst::Mov {
+                size,
+                src: GpOperand::Reg(Reg::Rcx),
+                dst: into,
+            });
+            done += chunk;
+        }
+    }
+
+    /// Read an aggregate argument, per SysV AMD64 §3.5.7.
+    ///
+    /// Every aggregate used to go through [`Self::emit_va_arg_int`], which
+    /// pulls one value of the type's whole width out of the general-register
+    /// save area. For anything the classifier put in SSE registers that is
+    /// unrelated data -- `struct { float a, b, c, d; }` arrives in `xmm0` and
+    /// `xmm1` and came back as whatever the integer area happened to hold.
+    ///
+    /// An aggregate in registers is *not* contiguous in the save area: its
+    /// eightbytes are taken from the general and SSE areas independently, and
+    /// those advance by 8 and 16 bytes respectively. So each eightbyte is
+    /// fetched from the area its own class names and packed at the
+    /// destination. On the overflow path the argument is already laid out as
+    /// itself and is copied straight across.
+    fn emit_va_arg_aggregate(
+        &mut self,
+        ap_base: Reg,
+        ap_off: i32,
+        dst_loc: &Loc,
+        arg_type: crate::types::TypeId,
+        types: &TypeTable,
+        label_suffix: u32,
+    ) {
+        use crate::abi::{ArgClass, RegClass};
+        let size_bytes = (types.size_bits(arg_type) / 8).max(1) as i32;
+        // Resolved before anything is clobbered: `%rax` carries the save-area
+        // pointer here and the result pseudo can be allocated to it.
+        let Some(dst) = self.va_agg_dst(dst_loc, size_bytes > 8) else {
+            return;
+        };
+
+        let abi = crate::abi::get_abi_for_conv(crate::abi::CallingConv::C, &self.base.target);
+        let classes: Vec<RegClass> = match abi.classify_param(arg_type, types) {
+            ArgClass::Direct { classes, .. } => classes,
+            // MEMORY class: it was passed on the stack, so it is only ever in
+            // the overflow area and no register guard applies.
+            _ => Vec::new(),
+        };
+        let num_gp = classes.iter().filter(|c| **c == RegClass::Integer).count() as i32;
+        let num_sse = classes.iter().filter(|c| **c == RegClass::Sse).count() as i32;
+
+        let overflow_label = Label::new("va_agg_overflow", label_suffix);
+        let done_label = Label::new("va_agg_done", label_suffix);
+
+        // GP_OFFSET_MAX is 48 (six general registers), FP_OFFSET_MAX 176
+        // (48 plus eight SSE registers of 16 bytes). An aggregate needs all of
+        // its eightbytes in registers or none of them.
+        let mut guarded = false;
+        for (field, avail, need, step) in [(0i32, 48i64, num_gp, 8i64), (4, 176, num_sse, 16)] {
+            if need == 0 {
+                continue;
+            }
+            guarded = true;
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B32,
+                src: GpOperand::Mem(MemAddr::BaseOffset {
+                    base: ap_base,
+                    offset: ap_off + field,
+                }),
+                dst: GpOperand::Reg(Reg::Rcx),
+            });
+            self.push_lir(X86Inst::Cmp {
+                size: OperandSize::B32,
+                src: GpOperand::Imm(avail - step * need as i64),
+                dst: GpOperand::Reg(Reg::Rcx),
+            });
+            self.push_lir(X86Inst::Jcc {
+                cc: CondCode::Ugt,
+                target: overflow_label.clone(),
+            });
+        }
+
+        if guarded {
+            // Register path: one eightbyte at a time, each from its own area.
+            for (i, class) in classes.iter().enumerate() {
+                let (field, step) = match class {
+                    RegClass::Sse => (4i32, 16i64),
+                    _ => (0, 8),
+                };
+                // %rax = reg_save_area + offset.
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B32,
+                    src: GpOperand::Mem(MemAddr::BaseOffset {
+                        base: ap_base,
+                        offset: ap_off + field,
+                    }),
+                    dst: GpOperand::Reg(Reg::Rcx),
+                });
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Mem(MemAddr::BaseOffset {
+                        base: ap_base,
+                        offset: ap_off + 16,
+                    }),
+                    dst: GpOperand::Reg(Reg::Rax),
+                });
+                self.push_lir(X86Inst::Movsx {
+                    src_size: OperandSize::B32,
+                    dst_size: OperandSize::B64,
+                    src: GpOperand::Reg(Reg::Rcx),
+                    dst: Reg::Rcx,
+                });
+                self.push_lir(X86Inst::Add {
+                    size: OperandSize::B64,
+                    src: GpOperand::Reg(Reg::Rcx),
+                    dst: Reg::Rax,
+                });
+                // Advance and commit before the copy: the copy may write the
+                // destination register, and for a value-sized result that
+                // register is the last thing this sequence should touch.
+                // Committed per eightbyte, because the general and SSE areas
+                // advance by different amounts.
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B32,
+                    src: GpOperand::Mem(MemAddr::BaseOffset {
+                        base: ap_base,
+                        offset: ap_off + field,
+                    }),
+                    dst: GpOperand::Reg(Reg::Rcx),
+                });
+                self.push_lir(X86Inst::Add {
+                    size: OperandSize::B32,
+                    src: GpOperand::Imm(step),
+                    dst: Reg::Rcx,
+                });
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B32,
+                    src: GpOperand::Reg(Reg::Rcx),
+                    dst: GpOperand::Mem(MemAddr::BaseOffset {
+                        base: ap_base,
+                        offset: ap_off + field,
+                    }),
+                });
+                let at = i as i32 * 8;
+                let bytes = (size_bytes - at).min(8);
+                self.va_copy_bytes(Reg::Rax, 0, dst, at, bytes);
+            }
+            self.push_lir(X86Inst::Jmp {
+                target: done_label.clone(),
+            });
+            self.push_lir(X86Inst::Directive(Directive::BlockLabel(overflow_label)));
+        }
+
+        // Overflow path: the argument sits in the caller's frame as itself.
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Mem(MemAddr::BaseOffset {
+                base: ap_base,
+                offset: ap_off + 8,
+            }),
+            dst: GpOperand::Reg(Reg::Rax),
+        });
+        // An aggregate needing 16-byte alignment starts at a 16-byte boundary.
+        if types.alignment(arg_type) >= 16 {
+            self.push_lir(X86Inst::Add {
+                size: OperandSize::B64,
+                src: GpOperand::Imm(15),
+                dst: Reg::Rax,
+            });
+            self.push_lir(X86Inst::And {
+                size: OperandSize::B64,
+                src: GpOperand::Imm(-16),
+                dst: Reg::Rax,
+            });
+        }
+        // Advance before the copy, so the copy is free to write %rax.
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::Rax),
+            dst: GpOperand::Reg(Reg::Rcx),
+        });
+        self.push_lir(X86Inst::Add {
+            size: OperandSize::B64,
+            src: GpOperand::Imm(((size_bytes + 7) & !7) as i64),
+            dst: Reg::Rcx,
+        });
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::Rcx),
+            dst: GpOperand::Mem(MemAddr::BaseOffset {
+                base: ap_base,
+                offset: ap_off + 8,
+            }),
+        });
+        // On the stack the argument is laid out as itself, so it copies across
+        // in one contiguous run rather than eightbyte by eightbyte.
+        self.va_copy_bytes(Reg::Rax, 0, dst, 0, size_bytes);
+
+        if guarded {
+            self.push_lir(X86Inst::Directive(Directive::BlockLabel(done_label)));
+        }
+    }
+
     pub(super) fn emit_va_arg(&mut self, insn: &Instruction, types: &TypeTable) {
         let ap_addr = match insn.src.first() {
             Some(&s) => s,
@@ -405,8 +697,23 @@ impl X86_64CodeGen {
             _ => return,
         };
 
+        let is_aggregate = matches!(
+            types.kind(arg_type),
+            crate::types::TypeKind::Struct
+                | crate::types::TypeKind::Union
+                | crate::types::TypeKind::Array
+        );
         if types.kind(arg_type) == crate::types::TypeKind::LongDouble {
             self.emit_va_arg_x87(base_reg, base_offset, &dst_loc);
+        } else if is_aggregate {
+            self.emit_va_arg_aggregate(
+                base_reg,
+                base_offset,
+                &dst_loc,
+                arg_type,
+                types,
+                label_suffix,
+            );
         } else if types.is_float(arg_type) {
             self.emit_va_arg_float(
                 base_reg,

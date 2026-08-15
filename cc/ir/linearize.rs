@@ -1009,16 +1009,17 @@ impl<'a> Linearizer<'a> {
                                 if !classes.is_empty()
                                     && classes.iter().all(|c| *c == crate::abi::RegClass::Sse)
                         ) || matches!(class, crate::abi::ArgClass::Hfa { .. });
-                        // Two eightbytes of any classes -- both integer, or one of
-                        // each -- arrive in two registers on x86-64 as well. The
-                        // caller's half of this decision is gated the same way;
-                        // aarch64 still hands such a struct over as a pointer.
-                        let reg_pair = self.target.arch == crate::target::Arch::X86_64
-                            && matches!(
-                                class,
-                                crate::abi::ArgClass::Direct { ref classes, .. }
-                                    if classes.len() == 2
-                            );
+                        // Two eightbytes of any classes -- both integer, or one
+                        // of each -- arrive in two registers. AAPCS64 §5.4.2
+                        // C.10 and SysV AMD64 §3.2.3 agree on this; aarch64
+                        // used to be excluded here and passed such a composite
+                        // as a pointer, which disagreed with gcc in both
+                        // directions and segfaulted when gcc was the caller.
+                        let reg_pair = matches!(
+                            class,
+                            crate::abi::ArgClass::Direct { ref classes, .. }
+                                if classes.len() == 2
+                        );
                         all_sse || reg_pair
                     };
                 if is_two_fp_regs {
@@ -2946,17 +2947,14 @@ impl<'a> Linearizer<'a> {
                     // passing a pointer instead disagreed with gcc silently.
                     let is_memory = matches!(class, crate::abi::ArgClass::Indirect { .. });
                     // Any other two-eightbyte `Direct` class -- two integer
-                    // registers, or one of each -- travels in registers too.
-                    // x86-64 only: aarch64 implements just the HFA case above
-                    // and passes the rest as a pointer, which its callee then
-                    // dereferences, so keeping the struct type there would
-                    // miscompile. This file is shared by both targets.
-                    let is_reg_pair = self.target.arch == crate::target::Arch::X86_64
-                        && matches!(
-                            class,
-                            crate::abi::ArgClass::Direct { ref classes, .. }
-                                if classes.len() == 2
-                        );
+                    // registers, or one of each -- travels in registers too,
+                    // on both targets. The pseudo still carries the address;
+                    // it is the backend that loads the pair out of it.
+                    let is_reg_pair = matches!(
+                        class,
+                        crate::abi::ArgClass::Direct { ref classes, .. }
+                            if classes.len() == 2
+                    );
                     if is_two_fp_regs || is_memory || is_reg_pair {
                         // Keep the struct type: the ABI decides from it, and
                         // the pseudo carries the address either way.
@@ -4102,9 +4100,39 @@ impl<'a> Linearizer<'a> {
                 // va_arg(ap, type)
                 // Get address of ap (it's an lvalue)
                 let ap_addr = self.linearize_lvalue(ap);
-                let result = self.alloc_pseudo();
-
                 let arg_size = self.types.size_bits(*arg_type);
+
+                // An aggregate wider than a register has nowhere to live in an
+                // ordinary pseudo, so it gets a local of its own and the
+                // backend writes the argument into it -- the same arrangement
+                // a call returning an aggregate in registers uses. Without it
+                // the backend was handed a register that held no storage, and
+                // whatever it happened to contain was treated as the
+                // destination's address.
+                let is_aggregate = matches!(
+                    self.types.kind(*arg_type),
+                    TypeKind::Struct | TypeKind::Union | TypeKind::Array
+                );
+                let result = if is_aggregate && arg_size > 64 {
+                    let local_sym = self.alloc_pseudo();
+                    let name = format!("__vaarg_{}", local_sym.0);
+                    if let Some(func) = &mut self.current_func {
+                        func.add_pseudo(Pseudo::sym(local_sym, name.clone()));
+                        func.add_local(
+                            &name,
+                            local_sym,
+                            *arg_type,
+                            false,
+                            false,
+                            self.current_bb,
+                            None,
+                        );
+                    }
+                    local_sym
+                } else {
+                    self.alloc_pseudo()
+                };
+
                 let insn = Instruction::new(Opcode::VaArg)
                     .with_target(result)
                     .with_src(ap_addr)

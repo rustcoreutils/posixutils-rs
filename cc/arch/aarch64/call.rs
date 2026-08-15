@@ -44,8 +44,10 @@ impl Aarch64CodeGen {
         let mut fp_arg_idx = 0;
         let mut stack_args = 0;
 
-        // Collect variadic args for stack
-        let mut variadic_args: Vec<(PseudoId, bool, u32)> = Vec::new();
+        // Collect variadic args for stack. The `Option<i32>` is an
+        // aggregate's byte count: it occupies its own size rounded up to
+        // eight, not one slot holding a pointer to it.
+        let mut variadic_args: Vec<(PseudoId, bool, u32, Option<i32>)> = Vec::new();
 
         for (i, &arg) in insn.src.iter().enumerate().skip(args_start) {
             let arg_type = insn.arg_types.get(i).copied();
@@ -62,8 +64,65 @@ impl Aarch64CodeGen {
                 64
             };
 
+            // A composite of at most sixteen bytes travels in two X registers
+            // here as it does everywhere else (AAPCS64 §5.4.2 C.10). Darwin
+            // takes its own path for a variadic call, and that path still
+            // moved one register's worth -- so the composite that the rest of
+            // the compiler now passes as a pair arrived half formed.
+            // Which aggregates are copied into the stack slot as objects.
+            //
+            // Not one of eight bytes or fewer: that pseudo holds the aggregate
+            // *value*, exactly as a scalar does, so it goes through the
+            // ordinary move below. Copying it meant dereferencing the value as
+            // though it were an address -- `struct { float a, b; }` faulted on
+            // whatever address its two floats spelled.
+            //
+            // And not one too large to pass directly: stage B.4 replaces that
+            // with a pointer to the caller's copy, and `va_arg` reads it that
+            // way, so the pointer travels and the object stays put.
+            let agg_bytes = arg_type.and_then(|t| {
+                let abi =
+                    crate::abi::get_abi_for_conv(crate::abi::CallingConv::C, &self.base.target);
+                (matches!(
+                    types.kind(t),
+                    TypeKind::Struct | TypeKind::Union | TypeKind::Array
+                ) && types.size_bits(t) > 64
+                    && !matches!(abi.classify_param(t, types), ArgClass::Indirect { .. }))
+                .then(|| (types.size_bits(t) / 8).max(1) as i32)
+            });
+            let gp_pair = agg_bytes.is_some_and(|_| {
+                let abi =
+                    crate::abi::get_abi_for_conv(crate::abi::CallingConv::C, &self.base.target);
+                arg_type.is_some_and(|t| {
+                    matches!(
+                        abi.classify_param(t, types),
+                        ArgClass::Direct { ref classes, .. }
+                            if classes.len() == 2
+                                && classes.iter().all(|c| *c == crate::abi::RegClass::Integer)
+                    )
+                })
+            });
+
             if i >= variadic_start {
-                variadic_args.push((arg, is_fp, arg_size));
+                variadic_args.push((arg, is_fp, arg_size, agg_bytes));
+            } else if gp_pair {
+                if int_arg_idx + 1 < int_arg_regs.len() {
+                    let mem = match self.get_location(arg) {
+                        Loc::Stack(offset) => self.stack_mem(offset),
+                        Loc::Reg(r) => MemAddr::BaseOffset { base: r, offset: 0 },
+                        _ => MemAddr::BaseOffset {
+                            base: Reg::X9,
+                            offset: 0,
+                        },
+                    };
+                    self.emit_ldp_legalized(
+                        OperandSize::B64,
+                        mem,
+                        int_arg_regs[int_arg_idx],
+                        int_arg_regs[int_arg_idx + 1],
+                    );
+                    int_arg_idx += 2;
+                }
             } else {
                 // Fixed arg - use registers
                 if is_fp {
@@ -86,7 +145,10 @@ impl Aarch64CodeGen {
         // Store variadic args on stack
         let num_variadic = variadic_args.len();
         if num_variadic > 0 {
-            let variadic_bytes = (num_variadic * 8) as i32;
+            let variadic_bytes: i32 = variadic_args
+                .iter()
+                .map(|(_, _, _, agg)| agg.map_or(8, |b| (b + 7) & !7))
+                .sum();
             let aligned_bytes = (variadic_bytes + 15) & !15;
 
             self.push_lir(Aarch64Inst::Sub {
@@ -96,8 +158,52 @@ impl Aarch64CodeGen {
                 dst: Reg::sp(),
             });
 
-            for (idx, (arg, is_fp, arg_size)) in variadic_args.into_iter().enumerate() {
-                let offset = (idx * 8) as i32;
+            let mut offset = 0i32;
+            for (arg, is_fp, arg_size, agg_bytes) in variadic_args.into_iter() {
+                if let Some(bytes) = agg_bytes {
+                    // The pseudo locates the aggregate; its bytes go in the
+                    // slot. Moving it as a scalar wrote the pointer instead.
+                    let src = match self.get_location(arg) {
+                        Loc::Reg(r) => r,
+                        Loc::Stack(off) => {
+                            self.push_lir(Aarch64Inst::Add {
+                                size: OperandSize::B64,
+                                src1: self.stack_base_reg(off),
+                                src2: GpOperand::Imm(self.stack_offset(off) as i64),
+                                dst: Reg::X9,
+                            });
+                            Reg::X9
+                        }
+                        _ => continue,
+                    };
+                    let mut done = 0;
+                    while done < bytes {
+                        let chunk = [8, 4, 2, 1]
+                            .into_iter()
+                            .find(|c| *c <= bytes - done)
+                            .unwrap_or(1);
+                        let size = OperandSize::from_bits(chunk as u32 * 8);
+                        self.push_lir(Aarch64Inst::Ldr {
+                            size,
+                            addr: MemAddr::BaseOffset {
+                                base: src,
+                                offset: done,
+                            },
+                            dst: Reg::X16,
+                        });
+                        self.push_lir(Aarch64Inst::Str {
+                            size,
+                            src: Reg::X16,
+                            addr: MemAddr::BaseOffset {
+                                base: Reg::SP,
+                                offset: offset + done,
+                            },
+                        });
+                        done += chunk;
+                    }
+                    offset += (bytes + 7) & !7;
+                    continue;
+                }
                 if is_fp {
                     // Variadic FP args don't have precise type info, use size-based detection
                     self.emit_fp_move(arg, VReg::V16, None, arg_size, types);
@@ -120,6 +226,7 @@ impl Aarch64CodeGen {
                         },
                     });
                 }
+                offset += 8;
             }
 
             stack_args = (aligned_bytes + 15) / 16;
@@ -163,6 +270,10 @@ impl Aarch64CodeGen {
             Complex,
             /// An HFA: `count` elements of `base`, at that base's stride.
             Hfa { base: HfaBase, count: u8 },
+            /// A composite laid on the stack by value. The pseudo carries its
+            /// address; `bytes` of it are copied into the outgoing slot.
+            /// Pushing it as a scalar wrote the *pointer* there instead.
+            Composite { bytes: i32 },
         }
 
         struct StackArg {
@@ -181,6 +292,19 @@ impl Aarch64CodeGen {
             /// reserve 8 bytes and write 32 -- straight through the caller's
             /// own frame. AAPCS64 rounds each stacked argument up to 8, which
             /// is also what the callee's allocator does.
+            /// Where this argument starts, relative to the outgoing area.
+            ///
+            /// AAPCS64 §6.4.2 stage C rounds the next stacked-argument address
+            /// up to `max(8, alignof(type))` *before* placing it. Advancing by
+            /// the rounded size alone put a sixteen-byte-aligned argument eight
+            /// bytes low whenever an odd number of eight-byte slots came first,
+            /// and the callee made the same mistake, so it showed only against
+            /// another compiler.
+            fn slot_start(&self, at: i32, types: &TypeTable) -> i32 {
+                let align = self.typ.map_or(8, |t| types.alignment(t) as i32).max(8);
+                (at + align - 1) & !(align - 1)
+            }
+
             fn slot_bytes(&self, types: &TypeTable, target: &Target) -> i32 {
                 match self.kind {
                     StackKind::Complex => {
@@ -193,6 +317,7 @@ impl Aarch64CodeGen {
                     StackKind::Hfa { base, count } => {
                         ((count as i32 * HfaElem::of(base).bytes) + 7) & !7
                     }
+                    StackKind::Composite { bytes } => (bytes + 7) & !7,
                     StackKind::Scalar => {
                         if self.size == 128 {
                             16
@@ -239,6 +364,29 @@ impl Aarch64CodeGen {
                     }
                 })
             };
+            // A composite of at most sixteen bytes that is not an HFA goes in
+            // two consecutive X registers (AAPCS64 §5.4.2 C.10). The pseudo
+            // carries its address, so the pair is loaded out of it. This used
+            // to hand the address over instead, which the callee then read as
+            // if it were the value.
+            let gp_pair =
+                !is_complex && hfa_regs.is_none() && arg_type.is_some_and(|t| {
+                    matches!(
+                        types.kind(t),
+                        TypeKind::Struct | TypeKind::Union | TypeKind::Array
+                    ) && {
+                        let abi = crate::abi::get_abi_for_conv(
+                            crate::abi::CallingConv::C,
+                            &self.base.target,
+                        );
+                        matches!(
+                            abi.classify_param(t, types),
+                            ArgClass::Direct { ref classes, .. }
+                                if classes.len() == 2
+                                    && classes.iter().all(|c| *c == crate::abi::RegClass::Integer)
+                        )
+                    }
+                });
             // A one-element HFA -- `struct { float v; }`, and every shape that
             // became one when arrays and half precision were admitted -- goes
             // in a single V register, exactly as the bare scalar does.
@@ -284,6 +432,38 @@ impl Aarch64CodeGen {
                     // follows it there. Unlike System V, the registers this
                     // argument did not fit into are *not* left available.
                     fp_arg_idx = fp_arg_regs.len();
+                }
+                continue;
+            }
+            if gp_pair {
+                if int_arg_idx + 1 < int_arg_regs.len() {
+                    let mem = match self.get_location(arg) {
+                        // The slot holds the aggregate's own bytes.
+                        Loc::Stack(offset) => self.stack_mem(offset),
+                        // The register holds its address.
+                        Loc::Reg(r) => MemAddr::BaseOffset { base: r, offset: 0 },
+                        _ => MemAddr::BaseOffset {
+                            base: Reg::X9,
+                            offset: 0,
+                        },
+                    };
+                    self.emit_ldp_legalized(
+                        OperandSize::B64,
+                        mem,
+                        int_arg_regs[int_arg_idx],
+                        int_arg_regs[int_arg_idx + 1],
+                    );
+                    int_arg_idx += 2;
+                } else {
+                    stack_args_info.push(StackArg {
+                        pseudo: arg,
+                        is_fp: false,
+                        size: arg_size,
+                        typ: arg_type,
+                        kind: StackKind::Composite {
+                            bytes: arg_type.map_or(16, |t| (types.size_bits(t) / 8) as i32),
+                        },
+                    });
                 }
                 continue;
             }
@@ -386,10 +566,11 @@ impl Aarch64CodeGen {
         }
 
         // Pre-allocate stack space for all stack args, 16-byte aligned.
-        let stack_bytes: i32 = stack_args_info
-            .iter()
-            .map(|a| a.slot_bytes(types, &self.base.target))
-            .sum();
+        // Walked, not summed: alignment padding between arguments is part of
+        // the area, and summing the sizes alone under-reserved it.
+        let stack_bytes: i32 = stack_args_info.iter().fold(0, |at, a| {
+            a.slot_start(at, types) + a.slot_bytes(types, &self.base.target)
+        });
         let aligned_bytes = (stack_bytes + 15) & !15;
 
         self.push_lir(Aarch64Inst::Sub {
@@ -402,6 +583,7 @@ impl Aarch64CodeGen {
         // Store each stack arg at its proper offset from SP (in parameter order)
         let mut offset: i32 = 0;
         for stack_arg in stack_args_info.into_iter() {
+            offset = stack_arg.slot_start(offset, types);
             if stack_arg
                 .typ
                 .is_some_and(|t| types.kind(t) == TypeKind::Int128)
@@ -475,6 +657,49 @@ impl Aarch64CodeGen {
                 }
                 // AAPCS64 rounds each stacked argument up to 8 bytes; the
                 // callee's allocator uses the same rule, so the two agree.
+                offset += stack_arg.slot_bytes(types, &self.base.target);
+                continue;
+            }
+            if let StackKind::Composite { bytes } = stack_arg.kind {
+                // The pseudo locates the aggregate; its bytes go into the slot.
+                let src = match self.get_location(stack_arg.pseudo) {
+                    Loc::Reg(r) => r,
+                    Loc::Stack(off) => {
+                        self.push_lir(Aarch64Inst::Add {
+                            size: OperandSize::B64,
+                            src1: self.stack_base_reg(off),
+                            src2: GpOperand::Imm(self.stack_offset(off) as i64),
+                            dst: Reg::X9,
+                        });
+                        Reg::X9
+                    }
+                    _ => continue,
+                };
+                let mut done = 0;
+                while done < bytes {
+                    let chunk = [8, 4, 2, 1]
+                        .into_iter()
+                        .find(|c| *c <= bytes - done)
+                        .unwrap_or(1);
+                    let size = OperandSize::from_bits(chunk as u32 * 8);
+                    self.push_lir(Aarch64Inst::Ldr {
+                        size,
+                        addr: MemAddr::BaseOffset {
+                            base: src,
+                            offset: done,
+                        },
+                        dst: Reg::X16,
+                    });
+                    self.push_lir(Aarch64Inst::Str {
+                        size,
+                        src: Reg::X16,
+                        addr: MemAddr::BaseOffset {
+                            base: Reg::SP,
+                            offset: offset + done,
+                        },
+                    });
+                    done += chunk;
+                }
                 offset += stack_arg.slot_bytes(types, &self.base.target);
                 continue;
             }
@@ -963,13 +1188,13 @@ impl Aarch64CodeGen {
 /// them out at each one is how a stacked HFA came to be written at the
 /// `_Complex` stride.
 #[derive(Clone, Copy)]
-struct HfaElem {
-    size: FpSize,
-    bytes: i32,
+pub(super) struct HfaElem {
+    pub(super) size: FpSize,
+    pub(super) bytes: i32,
 }
 
 impl HfaElem {
-    fn of(base: HfaBase) -> HfaElem {
+    pub(super) fn of(base: HfaBase) -> HfaElem {
         let (size, bytes) = match base {
             HfaBase::Float16 => (FpSize::Half, 2),
             HfaBase::Float32 => (FpSize::Single, 4),

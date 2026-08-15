@@ -643,8 +643,12 @@ pub enum AssignFault {
     /// No conversion exists: a pointer against a floating type, an aggregate
     /// against anything but a compatible aggregate, or a `void` value.
     Incompatible,
-    /// An integer where a pointer belongs, or the reverse, with no cast.
-    IntegerPointerMix,
+    /// A pointer where an integer belongs, with no cast.
+    IntegerFromPointer,
+    /// An integer where a pointer belongs, with no cast. Kept apart from
+    /// `IntegerFromPointer` because the two read in opposite directions and a
+    /// single message for both names the wrong conversion half the time.
+    PointerFromInteger,
     /// Two pointers whose referenced types are not compatible.
     PointerMismatch,
     /// The target's referenced type drops a qualifier the source's had.
@@ -661,7 +665,8 @@ impl AssignFault {
     pub fn describe(self) -> &'static str {
         match self {
             AssignFault::Incompatible => "incompatible types",
-            AssignFault::IntegerPointerMix => "makes integer from pointer without a cast",
+            AssignFault::IntegerFromPointer => "makes integer from pointer without a cast",
+            AssignFault::PointerFromInteger => "makes pointer from integer without a cast",
             AssignFault::PointerMismatch => "incompatible pointer type",
             AssignFault::QualifierDiscard => "discards a qualifier from the pointer target type",
         }
@@ -1235,7 +1240,7 @@ impl TypeTable {
                 return None;
             }
             return Some(if self.is_integer(value) {
-                AssignFault::IntegerPointerMix
+                AssignFault::PointerFromInteger
             } else {
                 AssignFault::Incompatible
             });
@@ -1248,7 +1253,7 @@ impl TypeTable {
                 return None;
             }
             return Some(if self.is_integer(target) {
-                AssignFault::IntegerPointerMix
+                AssignFault::IntegerFromPointer
             } else {
                 AssignFault::Incompatible
             });

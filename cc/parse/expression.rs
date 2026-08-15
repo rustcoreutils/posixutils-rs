@@ -1701,13 +1701,21 @@ impl<'a> Parser<'a> {
             return;
         };
         let points = |t: TypeId| matches!(self.types.kind(t), TypeKind::Pointer | TypeKind::Array);
-        if points(b) || points(i) {
+        let integral = |t: TypeId| self.types.is_integer(t);
+        // Symmetric, because `a[i]` is defined as `*(a + i)`: `0[arr]` is
+        // legal C. But exactly one side may be the pointer -- `p[q]` with two
+        // pointers has nothing to scale by.
+        if (points(b) && integral(i)) || (points(i) && integral(b)) {
             return;
         }
-        diag::error(
-            pos,
-            &gettext("subscripted value is neither array nor pointer"),
-        );
+        if points(b) || points(i) {
+            diag::error(pos, &gettext("array subscript is not an integer"));
+        } else {
+            diag::error(
+                pos,
+                &gettext("subscripted value is neither array nor pointer"),
+            );
+        }
     }
 
     /// Reject a `void` operand where a value is required (C17 6.5.6p2 for the

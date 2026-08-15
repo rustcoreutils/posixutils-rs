@@ -1499,6 +1499,70 @@ fn diagnostics_typedef_of_void_is_an_empty_parameter_list() {
     );
 }
 
+/// The two directions of an integer/pointer mix read in opposite ways, and one
+/// message for both names the wrong conversion half the time: assigning an
+/// `int` to an `int *` "makes pointer from integer", not the reverse.
+#[test]
+fn diagnostics_integer_pointer_mix_names_its_direction() {
+    compile_expect_warning(
+        "pointer_from_integer",
+        "void f(void){ int *p; int a = 0; p = a; }\n",
+        "makes pointer from integer without a cast",
+    );
+    compile_expect_warning(
+        "integer_from_pointer",
+        "void f(void){ int a; int *p = 0; a = p; }\n",
+        "makes integer from pointer without a cast",
+    );
+    // The same wording has to follow into the other two contexts.
+    compile_expect_warning(
+        "argument_pointer_from_integer",
+        "int g(int *);\nvoid f(void){ (void)g(1); }\n",
+        "makes pointer from integer without a cast",
+    );
+    compile_expect_warning(
+        "return_pointer_from_integer",
+        "int *f(void){ int a = 1; return a; }\n",
+        "makes pointer from integer without a cast",
+    );
+}
+
+/// C17 6.5.2.1p1 wants a pointer on one side of a subscript and an *integer*
+/// on the other. Returning as soon as either side was a pointer accepted
+/// `p[q]`, which has nothing to scale the offset by, and `p[1.5]`.
+///
+/// The two failures get different messages, as gcc gives them: the operand
+/// that is present but wrong is a different mistake from neither being a
+/// pointer at all.
+#[test]
+fn diagnostics_subscript_needs_a_pointer_and_an_integer() {
+    compile_expect_error(
+        "subscript_two_pointers",
+        "void f(int *p, int *q){ (void)p[q]; }\n",
+        "array subscript is not an integer",
+    );
+    compile_expect_error(
+        "subscript_floating_index",
+        "void f(int *p, double d){ (void)p[d]; }\n",
+        "array subscript is not an integer",
+    );
+    compile_expect_error(
+        "subscript_no_pointer",
+        "int f(void){ int a = 1; return a[0]; }\n",
+        "subscripted value is neither array nor pointer",
+    );
+}
+
+/// Every integer type is a valid subscript, and the operands stay
+/// interchangeable.
+#[test]
+fn diagnostics_integer_subscripts_are_accepted() {
+    compile_expect_ok(
+        "integer_subscripts",
+        "enum E { A };\nint f(int *p, int i, char c, _Bool b, unsigned long u){\n  int a[3] = {0};\n  int m[2][3] = {{0}};\n  return a[i] + 0[a] + p[c] + p[b] + p[A] + p[u] + m[1][2];\n}\n",
+    );
+}
+
 /// A tag names a type, but only within its scope: a nested `struct S` is a
 /// different type from the outer one. Comparing tagged composites by tag alone
 /// -- which is right while one side is still incomplete -- made them the same,

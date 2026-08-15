@@ -8202,3 +8202,292 @@ int main(void) {
         0
     );
 }
+
+/// Seven defects found by review of the symbol-attribute and overflow-builtin
+/// work, each reproduced against `gcc -std=c17` before being fixed.
+///
+/// The attribute cases are grouped because they share a shape: an attribute
+/// that reaches the *parser* but not the object file, or reaches an object it
+/// was never written on.
+#[test]
+fn codegen_symbol_attributes_do_not_leak_or_vanish() {
+    // A function definition consumed its attributes through the function-attribute
+    // path and left the symbol ones pending, so the next declaration claimed
+    // them. The conflicting "ax"/"aw" section flags made the assembler reject
+    // the file outright, so this is a build failure rather than bad linkage.
+    let leak = r#"
+__attribute__((section(".mytext"))) int placed_fn(void) { return 3; }
+int plain_var = 4;
+__attribute__((weak)) int weak_fn(void) { return 1; }
+int plain2 = 5;
+int main(void) { return plain_var + plain2 + placed_fn() + weak_fn() - 13; }
+"#;
+    assert_eq!(
+        compile_and_run("codegen_symbol_attrs_no_leak", leak, &[]),
+        0
+    );
+
+    // `weak` on a declaration with no definition: the reference must be weak,
+    // so an absent definition resolves to null instead of failing to link.
+    // Every spelling and position, since only the trailing-attribute-on-a-
+    // function-declarator one was broken.
+    let declared = r#"
+extern int missing_a(void) __attribute__((weak));
+__attribute__((weak)) extern int missing_b(void);
+int missing_c(void) __attribute__((weak));
+extern int missing_var __attribute__((weak));
+int main(void) {
+    if (missing_a) return 1;
+    if (missing_b) return 2;
+    if (missing_c) return 3;
+    if (&missing_var) return 4;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_symbol_attrs_weak_declaration", declared, &[]),
+        0
+    );
+}
+
+/// Assemble a source to text and hand it back, for tests that need to see the
+/// directives rather than the program's answer.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn asm_for(prefix: &str, src: &str) -> String {
+    let dir = tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir()
+        .expect("tempdir");
+    let c = dir.path().join("t.c");
+    let s = dir.path().join("t.s");
+    std::fs::write(&c, src).expect("write source");
+    let out = crate::common::run_c17(&["-S", c.to_str().unwrap(), "-o", s.to_str().unwrap()]);
+    assert!(out.success, "compile failed: {}", out.stderr);
+    std::fs::read_to_string(&s).expect("read asm")
+}
+
+/// A zero-initialized definition took the `.comm`/`.bss` fast path, which
+/// returns before the `.weak` and visibility directives are emitted. A common
+/// symbol carries neither, so both were silently lost -- a hidden variable
+/// escaping as default visibility is an ABI change, not a cosmetic one.
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn codegen_zero_init_keeps_weak_and_visibility() {
+    let asm = asm_for(
+        "c17_zeroinit_attrs_",
+        r#"
+__attribute__((visibility("hidden"))) int hidden_zero;
+__attribute__((weak)) int weak_zero;
+__attribute__((visibility("hidden"))) int hidden_init = 7;
+int plain_zero;
+int main(void) { return hidden_zero + weak_zero + hidden_init - 7 + plain_zero; }
+"#,
+    );
+    assert!(
+        asm.contains(".hidden hidden_zero"),
+        "zero-initialized hidden variable lost its visibility:\n{asm}"
+    );
+    assert!(
+        asm.contains(".weak weak_zero"),
+        "zero-initialized weak variable lost its weakness:\n{asm}"
+    );
+    assert!(
+        asm.contains(".hidden hidden_init"),
+        "initialized hidden variable lost its visibility:\n{asm}"
+    );
+    // The unattributed one still gets the fast path it was always entitled to.
+    assert!(
+        asm.contains(".comm plain_zero"),
+        "an unattributed zero-initialized global should still be common:\n{asm}"
+    );
+}
+
+/// ELF section flags were chosen from code-versus-data alone, so read-only
+/// data asked for a named section came out `"aw"` and lost its page
+/// protection. gcc emits `"a"`.
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn codegen_named_section_flags_follow_constness() {
+    let asm = asm_for(
+        "c17_section_flags_",
+        r#"
+__attribute__((section(".rodata.mine"))) const int ro = 5;
+__attribute__((section(".data.mine"))) int rw = 6;
+__attribute__((section(".text.mine"))) int code(void) { return 7; }
+int main(void) { return ro + rw + code() - 18; }
+"#,
+    );
+    assert!(
+        asm.contains(".section .rodata.mine,\"a\"\n"),
+        "const data in a named section must not be writable:\n{asm}"
+    );
+    assert!(
+        asm.contains(".section .data.mine,\"aw\""),
+        "mutable data in a named section must be writable:\n{asm}"
+    );
+    assert!(
+        asm.contains(".section .text.mine,\"ax\""),
+        "a function's named section must be executable:\n{asm}"
+    );
+}
+
+/// `__builtin_*_overflow` with a 128-bit destination. The ordinary lowering
+/// computes in a type twice the destination's width and asks whether narrowing
+/// lost anything; nothing is wider than 128 bits, so at that width it compared
+/// a value to itself and always answered "no overflow". Every expectation here
+/// was taken from `gcc -std=c17` on the same source.
+#[test]
+fn codegen_checked_arith_128bit() {
+    let code = r#"
+typedef __int128 i;
+typedef unsigned __int128 u;
+#define MAXI (((i)1 << 126) - 1 + ((i)1 << 126))
+#define MINI (-MAXI - 1)
+#define MAXU (~(u)0)
+
+static int n = 0;
+#define T(e, want) do { n++; if ((e) != (want)) return n; } while (0)
+
+int main(void) {
+    i r;
+    u ur;
+
+    T(__builtin_add_overflow(MAXI, (i)1, &r), 1);
+    T(__builtin_add_overflow(MAXI - 1, (i)1, &r), 0);
+    T(__builtin_add_overflow(MINI, (i)-1, &r), 1);
+    T(__builtin_add_overflow((i)5, (i)7, &r), 0);
+
+    T(__builtin_sub_overflow(MINI, (i)1, &r), 1);
+    T(__builtin_sub_overflow(MAXI, (i)-1, &r), 1);
+    T(__builtin_sub_overflow((i)5, (i)7, &r), 0);
+
+    /* The multiply check runs on magnitudes; MIN * -1 is the case a
+       division-based check traps on, so it is here deliberately. */
+    T(__builtin_mul_overflow(MAXI, (i)2, &r), 1);
+    T(__builtin_mul_overflow(MINI, (i)-1, &r), 1);
+    T(__builtin_mul_overflow(MINI, (i)1, &r), 0);
+    T(__builtin_mul_overflow((i)1 << 126, (i)2, &r), 1);
+    T(__builtin_mul_overflow((i)1 << 125, (i)2, &r), 0);
+    T(__builtin_mul_overflow((i)0, MAXI, &r), 0);
+    T(__builtin_mul_overflow(MAXI, (i)0, &r), 0);
+    T(__builtin_mul_overflow((i)-3, (i)5, &r), 0);
+    T(__builtin_mul_overflow(MINI / 2, (i)2, &r), 0);
+    T(__builtin_mul_overflow(MINI / 2, (i)-2, &r), 1);
+
+    T(__builtin_add_overflow(MAXU, (u)1, &ur), 1);
+    T(__builtin_add_overflow(MAXU - 1, (u)1, &ur), 0);
+    T(__builtin_sub_overflow((u)0, (u)1, &ur), 1);
+    T(__builtin_sub_overflow((u)5, (u)3, &ur), 0);
+    T(__builtin_mul_overflow(MAXU, (u)2, &ur), 1);
+    T(__builtin_mul_overflow((u)1 << 127, (u)2, &ur), 1);
+    T(__builtin_mul_overflow((u)1 << 126, (u)2, &ur), 0);
+    T(__builtin_mul_overflow((u)0, MAXU, &ur), 0);
+
+    /* Narrower operands widening into a 128-bit destination: the conversion is
+       exact, so these must agree with infinite precision. */
+    T(__builtin_mul_overflow(1000000, 1000000, &r), 0);
+    if ((long long)r != 1000000000000LL) return 100;
+    {
+        unsigned long um = ~0UL;
+        T(__builtin_mul_overflow(um, um, &r), 1);
+    }
+    T(__builtin_add_overflow(-5, 3, &r), 0);
+    if ((long long)r != -2) return 101;
+
+    /* And the narrower destinations still behave. */
+    {
+        int q;
+        T(__builtin_add_overflow(2000000000, 2000000000, &q), 1);
+        T(__builtin_mul_overflow(65536, 65536, &q), 1);
+        T(__builtin_add_overflow(1, 2, &q), 0);
+        if (q != 3) return 102;
+    }
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_checked_arith_128bit", code, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run_optimized("codegen_checked_arith_128bit_opt", code),
+        0
+    );
+}
+
+/// A frame that addresses its locals through `%rsp` has them displaced while
+/// the outgoing argument area is reserved. The adjustment was undone as soon
+/// as the stacked arguments were written, but `%rsp` stays lowered until after
+/// the call -- and the *register* arguments are set up in between, so every
+/// one of them was read a slot off.
+#[test]
+fn codegen_rsp_relative_locals_across_stacked_args() {
+    let code = r#"
+__attribute__((noinline)) static long f8(long a, long b, long c, long d,
+                                         long e, long f, long g, long h)
+{ return a + b + c + d + e + f + g + h; }
+__attribute__((noinline)) static double d8(double a, double b, double c, double d,
+                                           double e, double f, double g, double h,
+                                           double i, double j)
+{ return a + b + c + d + e + f + g + h + i + j; }
+
+int main(void) {
+    /* Over-aligned locals are what force the frame onto %rsp. */
+    __attribute__((aligned(64))) long v[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    __attribute__((aligned(64))) double w[10] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+
+    if (f8(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]) != 36) return 1;
+    if (d8(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9]) != 55.0) return 2;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_rsp_relative_locals_stacked_args", code, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run_optimized("codegen_rsp_relative_locals_stacked_args_opt", code),
+        0
+    );
+}
+
+/// A frame whose locals are over-aligned addresses them through `%rsp`, since
+/// `andq $-64, %rsp` breaks the fixed relationship to `%rbp`. `stack_mem`
+/// exists to pick the right base, and the floating-point paths spelled the
+/// `%rbp` case out longhand instead -- eleven sites, every one of them losing
+/// the `%rsp` case. An over-aligned `double` array was zeroed at its real
+/// address and initialized somewhere else entirely.
+///
+/// `long` was always fine, and so was `aligned(16)`: it takes an alignment
+/// past the natural one *and* a floating-point type to reach these paths.
+#[test]
+fn codegen_overaligned_fp_locals() {
+    let code = r#"
+int main(void) {
+    __attribute__((aligned(64))) double w[10] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+    __attribute__((aligned(128))) float f[4] = {1.5f, 2.5f, 3.5f, 4.5f};
+    __attribute__((aligned(64))) double scalar = 2.25;
+    double s = 0;
+    float t = 0;
+    for (int i = 0; i < 10; i++) s += w[i];
+    for (int i = 0; i < 4; i++) t += f[i];
+
+    if (w[0] != 1.0 || w[9] != 10.0) return 1;
+    if (s != 55.0) return 2;
+    if (t != 12.0f) return 3;
+    if (scalar != 2.25) return 4;
+    /* Comparison and arithmetic read through the same paths. */
+    if (!(w[3] < w[4]) || !(w[9] > scalar)) return 5;
+    if (w[2] * w[3] != 12.0) return 6;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_overaligned_fp_locals", code, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run_optimized("codegen_overaligned_fp_locals_opt", code),
+        0
+    );
+}

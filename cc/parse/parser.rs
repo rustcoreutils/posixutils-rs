@@ -218,6 +218,20 @@ pub(crate) struct RawParam {
     pub(crate) symbol: Option<SymbolId>,
 }
 
+/// Whether the declarator being parsed must name something.
+///
+/// C17 spells the two grammars separately -- `declarator` (6.7.6) always has
+/// an identifier, `abstract-declarator` (6.7.7) never does -- and only the
+/// caller knows which one it asked for. A parameter may be either, so it asks
+/// for `Optional`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DeclaratorName {
+    /// A declaration: the identifier is what is being declared.
+    Required,
+    /// A type-name or a parameter, where the identifier may be absent.
+    Optional,
+}
+
 /// Result of parsing a declarator: (name, type, VLA expressions, raw function parameters)
 type DeclaratorResult = (StringId, TypeId, Vec<Expr>, Option<Vec<RawParam>>);
 
@@ -1710,7 +1724,8 @@ impl Parser<'_> {
         if !self.is_special(b';') {
             loop {
                 let decl_pos = self.current_pos();
-                let (name, typ, vla_sizes, _func_params) = self.parse_declarator(base_type_id)?;
+                let (name, typ, vla_sizes, _func_params) =
+                    self.parse_declarator(base_type_id, DeclaratorName::Required)?;
                 // Skip GCC extensions like __asm("...") or __attribute__((...))
                 self.skip_extensions();
                 let init = if self.is_special(b'=') {
@@ -1938,7 +1953,7 @@ impl Parser<'_> {
             loop {
                 let decl_pos = self.current_pos();
                 let (name, mut typ, vla_sizes, _func_params) =
-                    self.parse_declarator(base_type_id)?;
+                    self.parse_declarator(base_type_id, DeclaratorName::Required)?;
                 // Skip GCC extensions like __asm("...") or __attribute__((...))
                 self.skip_extensions();
 
@@ -2833,7 +2848,7 @@ impl Parser<'_> {
 
                     // VLAs are not allowed in struct members
                     let (name, typ, vla_sizes, _func_params) =
-                        self.parse_declarator(member_base_type_id)?;
+                        self.parse_declarator(member_base_type_id, DeclaratorName::Required)?;
 
                     // C99 6.7.5.2: VLAs cannot be members of structures or unions
                     if !vla_sizes.is_empty() {
@@ -3023,7 +3038,11 @@ impl Parser<'_> {
     ///
     /// Returns: (name, type, VLA size expressions, function parameters if declarator is function)
     /// The function parameters include names for use in function definitions.
-    fn parse_declarator(&mut self, base_type_id: TypeId) -> ParseResult<DeclaratorResult> {
+    pub(crate) fn parse_declarator(
+        &mut self,
+        base_type_id: TypeId,
+        name: DeclaratorName,
+    ) -> ParseResult<DeclaratorResult> {
         // Collect pointer modifiers (they bind tighter than array/function)
         let mut pointer_modifiers: Vec<TypeModifiers> = Vec::new();
         while self.is_special(b'*') {
@@ -3060,7 +3079,7 @@ impl Parser<'_> {
                 // Note: We ignore any VLA expression from inner declarators - VLAs would be
                 // in the outer array dimensions, not inner pointer/grouped declarators
                 let (inner_name, inner_decl_type_id, _inner_vla, inner_func_params) =
-                    self.parse_declarator(self.types.void_id)?;
+                    self.parse_declarator(self.types.void_id, name)?;
                 self.expect_special(b')')?;
 
                 // Now parse any suffix modifiers (arrays, function params)
@@ -3082,21 +3101,19 @@ impl Parser<'_> {
                 self.pos = saved_pos;
                 (StringId::EMPTY, None, None)
             }
+        } else if self.peek() == TokenType::Ident {
+            (self.expect_declarator_name()?, None, None)
+        } else if name == DeclaratorName::Optional {
+            // An abstract declarator has no identifier by construction
+            // (C17 6.7.7): `void (*)(int)`, or a parameter written as a bare
+            // type. Whether that is allowed is the caller's question, not a
+            // guess from the next token -- this used to be a whitelist of
+            // `)`, `[`, `(`, `,`, so a type-name ending in anything else was
+            // rejected outright. `_Generic(1, int: 11)` ends its type-name at
+            // a `:`, which was not on the list.
+            (StringId::EMPTY, None, None)
         } else {
-            // Get the name directly, or use empty for abstract declarators
-            // Abstract declarators have no name: void (*)(int) - the * has no identifier
-            if self.peek() == TokenType::Ident {
-                (self.expect_declarator_name()?, None, None)
-            } else if self.is_special(b')')
-                || self.is_special(b'[')
-                || self.is_special(b'(')
-                || self.is_special(b',')
-            {
-                // No identifier - abstract declarator (e.g., void (*)(int), const char * restrict)
-                (StringId::EMPTY, None, None)
-            } else {
-                (self.expect_declarator_name()?, None, None)
-            }
+            (self.expect_declarator_name()?, None, None)
         };
 
         // Handle array declarators - collect all dimensions first
@@ -3513,7 +3530,7 @@ impl Parser<'_> {
             // - Arrays: int arr[], int arr[10]
             // Note: parse_declarator returns (name, type, vla_sizes)
             let (param_name, mut typ_id, vla_sizes, _func_params) =
-                self.parse_declarator(base_type_id)?;
+                self.parse_declarator(base_type_id, DeclaratorName::Optional)?;
 
             // Skip any __attribute__ after parameter declarator
             self.skip_extensions();
@@ -3783,7 +3800,7 @@ impl Parser<'_> {
                 // This is a grouped declarator - use parse_declarator
                 self.pos = saved_pos; // restore position before '('
                 let (name, mut typ, vla_sizes, decl_func_params) =
-                    self.parse_declarator(base_type_id)?;
+                    self.parse_declarator(base_type_id, DeclaratorName::Required)?;
 
                 // C99 6.7.5.2: VLAs must have block scope
                 if !vla_sizes.is_empty() {
@@ -3975,7 +3992,7 @@ impl Parser<'_> {
                 // This is a grouped declarator - use parse_declarator
                 self.pos = saved_pos; // restore position before '('
                 let (name, full_typ, vla_sizes, decl_func_params) =
-                    self.parse_declarator(typ_id)?;
+                    self.parse_declarator(typ_id, DeclaratorName::Required)?;
 
                 // C99 6.7.5.2: VLAs must have block scope
                 if !vla_sizes.is_empty() {
@@ -4135,7 +4152,7 @@ impl Parser<'_> {
                     let knr_base_id = self.intern_type_with_tag(&knr_type);
                     loop {
                         let (decl_name, mut decl_typ, _vla, _fparams) =
-                            self.parse_declarator(knr_base_id)?;
+                            self.parse_declarator(knr_base_id, DeclaratorName::Required)?;
                         // C99 6.7.5.3: array/function params adjusted to pointers
                         let typ = self.types.get(decl_typ);
                         if typ.kind == TypeKind::Array {
@@ -4402,7 +4419,7 @@ impl Parser<'_> {
             self.advance();
             let next_decl_pos = self.current_pos();
             let (decl_name, mut decl_type, vla_sizes, _decl_func_params) =
-                self.parse_declarator(base_type_id)?;
+                self.parse_declarator(base_type_id, DeclaratorName::Required)?;
 
             // C99 6.7.5.2: VLAs must have block scope
             if !vla_sizes.is_empty() {

@@ -12,7 +12,7 @@
 use super::ast::{
     AssignOp, BinaryOp, Designator, Expr, ExprKind, FpTest, InitElement, OffsetOfPath, UnaryOp,
 };
-use super::parser::{ParseError, ParseResult, Parser};
+use super::parser::{DeclaratorName, ParseError, ParseResult, Parser};
 use crate::diag;
 use crate::float::FloatVal;
 use crate::strings::StringId;
@@ -885,19 +885,6 @@ impl<'a> Parser<'a> {
         mods
     }
 
-    /// Parse a chain of pointer declarators with optional qualifiers
-    /// e.g., `* const * volatile *` returns the final pointer type
-    fn parse_pointer_chain(&mut self, mut base_type: TypeId) -> TypeId {
-        while self.is_special(b'*') {
-            self.advance();
-            let ptr_mods = self.consume_type_qualifiers();
-            let mut ptr_type = Type::pointer(base_type);
-            ptr_type.modifiers |= ptr_mods;
-            base_type = self.types.intern(ptr_type);
-        }
-        base_type
-    }
-
     /// Apply trailing qualifiers to a type and return the qualified type id
     /// Used for patterns like "struct foo const *" where const comes after the struct
     fn apply_trailing_qualifiers(&mut self, base_type: TypeId) -> TypeId {
@@ -919,7 +906,37 @@ impl<'a> Parser<'a> {
 
     /// Try to parse a type name for casts and sizeof
     /// Supports compound types like `unsigned char`, `long long`, pointers, etc.
+    /// Parse a type-name: a specifier-qualifier list followed by an optional
+    /// abstract declarator (C17 6.7.7). Speculative -- the caller uses it to
+    /// tell `(type)expr` from `(expr)`, so a failure rewinds and answers
+    /// `None` rather than reporting anything.
+    ///
+    /// The abstract declarator goes through `parse_declarator`, the same
+    /// parser every other declarator uses. This file used to carry its own,
+    /// which recognised exactly one shape -- `(*)(params)` -- and backtracked
+    /// on everything else, so `int (*)[3]`, `int (**)(void)` and
+    /// `int (*[4])(void)` were not type-names at all: `sizeof(int (*)[3])` and
+    /// the cast `(int(*)[3])0` were parse errors. An abstract declarator is
+    /// just a declarator whose identifier is absent, which `parse_declarator`
+    /// already represents as `StringId::EMPTY`, so there was never a reason
+    /// for a second implementation.
     pub(crate) fn try_parse_type_name(&mut self) -> Option<TypeId> {
+        let saved_pos = self.pos;
+        let base = self.try_parse_specifier_qualifier_list()?;
+
+        match self.parse_declarator(base, DeclaratorName::Optional) {
+            // An abstract declarator names nothing. A name here means this was
+            // never a type-name, so let the caller try it as an expression.
+            Ok((name, typ, _vla, _params)) if name == StringId::EMPTY => Some(typ),
+            _ => {
+                self.pos = saved_pos;
+                None
+            }
+        }
+    }
+
+    /// The specifier-qualifier list of a type-name, without its declarator.
+    fn try_parse_specifier_qualifier_list(&mut self) -> Option<TypeId> {
         if self.peek() != TokenType::Ident {
             return None;
         }
@@ -993,7 +1010,7 @@ impl<'a> Parser<'a> {
                             ..inner
                         };
                         let result_id = self.types.intern(result);
-                        return Some(self.parse_pointer_chain(result_id));
+                        return Some(result_id);
                     } else {
                         // Qualifier form: just _Atomic
                         modifiers |= TypeModifiers::ATOMIC;
@@ -1127,7 +1144,7 @@ impl<'a> Parser<'a> {
                             return None;
                         }
                         self.advance(); // consume ')'
-                        return Some(self.parse_pointer_chain(typ));
+                        return Some(typ);
                     }
 
                     // Not a type name, try expression
@@ -1141,7 +1158,7 @@ impl<'a> Parser<'a> {
                     self.advance(); // consume ')'
 
                     let expr_type = expr.typ.unwrap_or(self.types.int_id);
-                    return Some(self.parse_pointer_chain(expr_type));
+                    return Some(expr_type);
                 }
                 crate::kw::STRUCT => {
                     self.advance(); // consume 'struct'
@@ -1151,24 +1168,7 @@ impl<'a> Parser<'a> {
                             // This is a tag reference (e.g., "struct Point*")
                             self.advance(); // consume tag name
                             if let Some(existing) = self.symbols.lookup_tag(tag_name) {
-                                let result_id = self.apply_trailing_qualifiers(existing.typ);
-                                let mut result_id = self.parse_pointer_chain(result_id);
-                                // Handle array declarators
-                                while self.is_special(b'[') {
-                                    self.advance();
-                                    if let Ok(size_expr) = self.parse_conditional_expr() {
-                                        if let Some(size) = self.eval_const_expr(&size_expr) {
-                                            result_id = self
-                                                .types
-                                                .intern(Type::array(result_id, size as usize));
-                                        }
-                                    }
-                                    if !self.is_special(b']') {
-                                        return None;
-                                    }
-                                    self.advance();
-                                }
-                                return Some(result_id);
+                                return Some(self.apply_trailing_qualifiers(existing.typ));
                             }
                             // Tag not found - create incomplete struct type and register it
                             // This ensures that when the struct is later defined, we can update
@@ -1178,7 +1178,7 @@ impl<'a> Parser<'a> {
                             let result_id = self.types.intern(incomplete);
                             let sym = Symbol::tag(tag_name, result_id, self.symbols.depth());
                             let _ = self.symbols.declare(sym);
-                            return Some(self.parse_pointer_chain(result_id));
+                            return Some(result_id);
                         }
                     }
                     // Fall back to full struct parsing for definitions
@@ -1186,23 +1186,7 @@ impl<'a> Parser<'a> {
                     if let Ok(struct_type) = self.parse_struct_or_union_specifier(false) {
                         let mut typ = struct_type;
                         typ.modifiers |= modifiers | self.consume_type_qualifiers();
-                        let mut result_id = self.types.intern(typ);
-                        result_id = self.parse_pointer_chain(result_id);
-                        // Handle array declarators
-                        while self.is_special(b'[') {
-                            self.advance();
-                            if let Ok(size_expr) = self.parse_conditional_expr() {
-                                if let Some(size) = self.eval_const_expr(&size_expr) {
-                                    result_id =
-                                        self.types.intern(Type::array(result_id, size as usize));
-                                }
-                            }
-                            if !self.is_special(b']') {
-                                return None;
-                            }
-                            self.advance();
-                        }
-                        return Some(result_id);
+                        return Some(self.types.intern(typ));
                     }
                     return None;
                 }
@@ -1214,24 +1198,7 @@ impl<'a> Parser<'a> {
                             // This is a tag reference
                             self.advance(); // consume tag name
                             if let Some(existing) = self.symbols.lookup_tag(tag_name) {
-                                let result_id = self.apply_trailing_qualifiers(existing.typ);
-                                let mut result_id = self.parse_pointer_chain(result_id);
-                                // Handle array declarators
-                                while self.is_special(b'[') {
-                                    self.advance();
-                                    if let Ok(size_expr) = self.parse_conditional_expr() {
-                                        if let Some(size) = self.eval_const_expr(&size_expr) {
-                                            result_id = self
-                                                .types
-                                                .intern(Type::array(result_id, size as usize));
-                                        }
-                                    }
-                                    if !self.is_special(b']') {
-                                        return None;
-                                    }
-                                    self.advance();
-                                }
-                                return Some(result_id);
+                                return Some(self.apply_trailing_qualifiers(existing.typ));
                             }
                             // Tag not found - create incomplete union type and register it
                             // This ensures that when the union is later defined, we can update
@@ -1241,7 +1208,7 @@ impl<'a> Parser<'a> {
                             let result_id = self.types.intern(incomplete);
                             let sym = Symbol::tag(tag_name, result_id, self.symbols.depth());
                             let _ = self.symbols.declare(sym);
-                            return Some(self.parse_pointer_chain(result_id));
+                            return Some(result_id);
                         }
                     }
                     // Fall back to full union parsing for definitions
@@ -1249,23 +1216,7 @@ impl<'a> Parser<'a> {
                     if let Ok(union_type) = self.parse_struct_or_union_specifier(true) {
                         let mut typ = union_type;
                         typ.modifiers |= modifiers | self.consume_type_qualifiers();
-                        let mut result_id = self.types.intern(typ);
-                        result_id = self.parse_pointer_chain(result_id);
-                        // Handle array declarators
-                        while self.is_special(b'[') {
-                            self.advance();
-                            if let Ok(size_expr) = self.parse_conditional_expr() {
-                                if let Some(size) = self.eval_const_expr(&size_expr) {
-                                    result_id =
-                                        self.types.intern(Type::array(result_id, size as usize));
-                                }
-                            }
-                            if !self.is_special(b']') {
-                                return None;
-                            }
-                            self.advance();
-                        }
-                        return Some(result_id);
+                        return Some(self.types.intern(typ));
                     }
                     return None;
                 }
@@ -1273,23 +1224,7 @@ impl<'a> Parser<'a> {
                     if let Ok(enum_type) = self.parse_enum_specifier() {
                         let mut typ = enum_type;
                         typ.modifiers |= modifiers | self.consume_type_qualifiers();
-                        let mut result_id = self.types.intern(typ);
-                        result_id = self.parse_pointer_chain(result_id);
-                        // Handle array declarators
-                        while self.is_special(b'[') {
-                            self.advance();
-                            if let Ok(size_expr) = self.parse_conditional_expr() {
-                                if let Some(size) = self.eval_const_expr(&size_expr) {
-                                    result_id =
-                                        self.types.intern(Type::array(result_id, size as usize));
-                                }
-                            }
-                            if !self.is_special(b']') {
-                                return None;
-                            }
-                            self.advance();
-                        }
-                        return Some(result_id);
+                        return Some(self.types.intern(typ));
                     }
                     return None;
                 }
@@ -1316,7 +1251,7 @@ impl<'a> Parser<'a> {
         }
 
         // Get the base type - either from typedef or from built-in type specifiers
-        let mut result_id = if let Some(typedef_type_id) = typedef_base {
+        let result_id = if let Some(typedef_type_id) = typedef_base {
             // Drop the TYPEDEF bit either way. It records how the name was
             // *declared*, not anything about the type, and leaving it on made a
             // typedef's type differ from the type it aliases -- so
@@ -1339,65 +1274,6 @@ impl<'a> Parser<'a> {
             let typ = Type::with_modifiers(kind, modifiers);
             self.types.intern(typ)
         };
-
-        // Handle pointer declarators
-        result_id = self.parse_pointer_chain(result_id);
-
-        // Handle function pointer declarators: void (*)(int), int (*)(void), etc.
-        // Syntax: return_type (*)(param_types)
-        if self.is_special(b'(') {
-            // Look ahead to check for (*) pattern indicating function pointer
-            let saved_pos = self.pos;
-            self.advance(); // consume '('
-            if self.is_special(b'*') {
-                self.advance(); // consume '*'
-                if self.is_special(b')') {
-                    self.advance(); // consume ')'
-                                    // Now expect parameter list
-                    if self.is_special(b'(') {
-                        self.advance(); // consume '('
-                                        // Parse parameter types properly
-                        if let Ok((raw_params, variadic)) = self.parse_parameter_list() {
-                            if !self.is_special(b')') {
-                                return None;
-                            }
-                            self.advance(); // consume final ')'
-                                            // Create function pointer type with actual parameter types
-                            let param_type_ids: Vec<TypeId> =
-                                raw_params.iter().map(|p| p.typ).collect();
-                            let fn_type =
-                                Type::function(result_id, param_type_ids, variadic, false);
-                            let fn_type_id = self.types.intern(fn_type);
-                            result_id = self.types.intern(Type::pointer(fn_type_id));
-                            return Some(result_id);
-                        }
-                    }
-                }
-            }
-            // Not a function pointer, backtrack
-            self.pos = saved_pos;
-        }
-
-        // Handle array declarators: int[10], char[20], int[], etc.
-        while self.is_special(b'[') {
-            self.advance();
-            // Check for empty brackets [] (incomplete array type for compound literals)
-            if self.is_special(b']') {
-                // Empty brackets - create array with size 0 (size to be determined from initializer)
-                result_id = self.types.intern(Type::array(result_id, 0));
-            } else if let Ok(size_expr) = self.parse_conditional_expr() {
-                if let Some(size) = self.eval_const_expr(&size_expr) {
-                    result_id = self.types.intern(Type::array(result_id, size as usize));
-                } else {
-                    // Non-constant size (VLA in type name) - create array with size 0
-                    result_id = self.types.intern(Type::array(result_id, 0));
-                }
-            }
-            if !self.is_special(b']') {
-                return None;
-            }
-            self.advance();
-        }
 
         Some(result_id)
     }
@@ -3363,9 +3239,15 @@ impl<'a> Parser<'a> {
                                 _ => unreachable!(),
                             };
 
-                            // For incomplete array types (size 0), determine size from initializer
+                            // An incomplete array type takes its size from the
+                            // initializer. `parse_declarator` spells "no size
+                            // given" as `None`, which is what `int a[]` means;
+                            // the type-name parser this replaced spelled it
+                            // `Some(0)`, conflating it with the GNU zero-length
+                            // array. Accept both, since the declaration path
+                            // (`infer_array_size_from_init`) also does.
                             let final_typ = if self.types.kind(typ) == TypeKind::Array
-                                && self.types.get(typ).array_size == Some(0)
+                                && matches!(self.types.get(typ).array_size, None | Some(0))
                             {
                                 let elem_type =
                                     self.types.base_type(typ).unwrap_or(self.types.int_id);

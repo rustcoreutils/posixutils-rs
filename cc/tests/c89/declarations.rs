@@ -542,3 +542,88 @@ int main(void) {
         0
     );
 }
+
+/// A type-name is a specifier-qualifier list plus an *abstract* declarator
+/// (C17 6.7.7) -- the ordinary declarator grammar with the identifier left
+/// out. Type-names had their own parser, which recognised exactly one abstract
+/// shape, `(*)(params)`, and gave up on everything else. So a pointer to an
+/// array, a pointer to a function pointer, and an array of function pointers
+/// were not spellable in a `sizeof`, a cast, or a `_Generic` association:
+/// `sizeof(int (*)[3])` and `(int(*)[3])0` were parse errors, though the same
+/// types declared as objects had always worked.
+///
+/// They now go through `parse_declarator`, the one every other declarator
+/// uses, so the two spellings cannot disagree again.
+///
+/// Every expectation here came from gcc on this source.
+#[test]
+fn c89_abstract_declarators_in_type_names() {
+    let code = r#"
+#include <stddef.h>
+
+static int a3[3] = {1, 2, 3};
+static int (*pa)[3] = &a3;
+static int fret(void) { return 9; }
+
+/* A type-name in a constant expression: array bound, enum value, member. */
+static char buf[sizeof(int (*)[3])];
+static int tbl[sizeof(int (*[4])(void)) / sizeof(void *)];
+enum { E1 = sizeof(int (**)(void)), E2 = sizeof(int[3][4]) };
+struct Pad { char pad[sizeof(int (*)(const char *))]; };
+
+int main(void) {
+    /* sizeof over shapes the old type-name parser could not spell */
+    if (sizeof(int (*)[3]) != sizeof(void *)) return 1;
+    if (sizeof(int (**)(void)) != sizeof(void *)) return 2;
+    if (sizeof(int (*[4])(void)) != 4 * sizeof(void *)) return 3;
+    if (sizeof(int ((*))(void)) != sizeof(void *)) return 4;
+    if (sizeof(int[3][4]) != 12 * sizeof(int)) return 5;
+    if (sizeof(char[10]) != 10) return 6;
+    /* a function type as a type-name, parameters and all */
+    if (sizeof(int (*)(const char *)) != sizeof(void *)) return 7;
+
+    /* casts through those same shapes */
+    int (*q)[3] = (int (*)[3])&a3;
+    if ((*q)[2] != 3) return 8;
+    if (q != pa) return 9;
+
+    int (*fp)(void) = (int (*)(void))fret;
+    if (fp() != 9) return 10;
+    int (**fpp)(void) = &fp;
+    if ((*fpp)() != 9) return 11;
+
+    /* An incomplete array type-name still takes its size from the
+       initializer: parse_declarator spells "no size" as absent, where the
+       parser it replaced spelled it zero. */
+    int *ci = (int[]){10, 20, 30};
+    if (ci[2] != 30) return 12;
+    if (sizeof((int[]){1, 2, 3, 4}) != 4 * sizeof(int)) return 13;
+
+    struct S { int x, y; };
+    struct S *cs = &(struct S){4, 5};
+    if (cs->y != 5) return 14;
+
+    /* _Generic associations are type-names too, and end at a ':' -- which
+       the old abstract-declarator whitelist did not include. */
+    if (_Generic((int (*)[3])0, int (*)[3]: 1, default: 0) != 1) return 15;
+    if (_Generic(1, int: 1, double: 0, default: 0) != 1) return 16;
+
+    /* __builtin_types_compatible_p takes two type-names. */
+    if (!__builtin_types_compatible_p(int (*)[3], int (*)[3])) return 17;
+    if (__builtin_types_compatible_p(int (*)[3], int (*)[4])) return 18;
+
+    /* And they must fold in constant-expression contexts, not merely parse. */
+    if (sizeof buf != sizeof(void *)) return 19;
+    if (sizeof tbl / sizeof tbl[0] != 4) return 20;
+    if (E1 != (int)sizeof(void *)) return 21;
+    if (E2 != (int)(12 * sizeof(int))) return 22;
+    if (sizeof(struct Pad) != sizeof(void *)) return 23;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c89_abstract_declarators_in_type_names", code, &[]),
+        0
+    );
+}

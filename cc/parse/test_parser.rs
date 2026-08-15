@@ -3677,6 +3677,30 @@ fn test_function_type_parameter_is_not_a_grouped_declarator() {
     assert_eq!(tu.items.len(), 2);
 }
 
+/// A type-name's abstract declarator (C17 6.7.7) is the ordinary declarator
+/// grammar minus the identifier, so it goes through `parse_declarator`. It
+/// used to have a parser of its own that knew one shape, `(*)(params)`, which
+/// is why a pointer to an array could be declared but not named.
+#[test]
+fn test_abstract_declarators_in_type_names() {
+    for src in [
+        "sizeof(int (*)[3])",
+        "sizeof(int (**)(void))",
+        "sizeof(int (*[4])(void))",
+        "sizeof(int ((*))(void))",
+        "sizeof(int (*)(const char *))",
+        "sizeof(int[3][4])",
+        "_Generic(1, int: 11, double: 22, default: 33)",
+    ] {
+        let (expr, _types, _strings, _symbols) =
+            parse_expr(src).unwrap_or_else(|e| panic!("{src} should parse: {e:?}"));
+        assert!(
+            expr.typ.is_some(),
+            "{src} should have produced a typed expression"
+        );
+    }
+}
+
 // ========================================================================
 // Array Parameter Edge Cases
 // ========================================================================

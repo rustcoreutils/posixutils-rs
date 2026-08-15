@@ -44,8 +44,10 @@ impl Aarch64CodeGen {
         let mut fp_arg_idx = 0;
         let mut stack_args = 0;
 
-        // Collect variadic args for stack
-        let mut variadic_args: Vec<(PseudoId, bool, u32)> = Vec::new();
+        // Collect variadic args for stack. The `Option<i32>` is an
+        // aggregate's byte count: it occupies its own size rounded up to
+        // eight, not one slot holding a pointer to it.
+        let mut variadic_args: Vec<(PseudoId, bool, u32, Option<i32>)> = Vec::new();
 
         for (i, &arg) in insn.src.iter().enumerate().skip(args_start) {
             let arg_type = insn.arg_types.get(i).copied();
@@ -62,8 +64,51 @@ impl Aarch64CodeGen {
                 64
             };
 
+            // A composite of at most sixteen bytes travels in two X registers
+            // here as it does everywhere else (AAPCS64 §5.4.2 C.10). Darwin
+            // takes its own path for a variadic call, and that path still
+            // moved one register's worth -- so the composite that the rest of
+            // the compiler now passes as a pair arrived half formed.
+            let agg_bytes = arg_type.and_then(|t| {
+                matches!(
+                    types.kind(t),
+                    TypeKind::Struct | TypeKind::Union | TypeKind::Array
+                )
+                .then(|| (types.size_bits(t) / 8).max(1) as i32)
+            });
+            let gp_pair = agg_bytes.is_some_and(|_| {
+                let abi =
+                    crate::abi::get_abi_for_conv(crate::abi::CallingConv::C, &self.base.target);
+                arg_type.is_some_and(|t| {
+                    matches!(
+                        abi.classify_param(t, types),
+                        ArgClass::Direct { ref classes, .. }
+                            if classes.len() == 2
+                                && classes.iter().all(|c| *c == crate::abi::RegClass::Integer)
+                    )
+                })
+            });
+
             if i >= variadic_start {
-                variadic_args.push((arg, is_fp, arg_size));
+                variadic_args.push((arg, is_fp, arg_size, agg_bytes));
+            } else if gp_pair {
+                if int_arg_idx + 1 < int_arg_regs.len() {
+                    let mem = match self.get_location(arg) {
+                        Loc::Stack(offset) => self.stack_mem(offset),
+                        Loc::Reg(r) => MemAddr::BaseOffset { base: r, offset: 0 },
+                        _ => MemAddr::BaseOffset {
+                            base: Reg::X9,
+                            offset: 0,
+                        },
+                    };
+                    self.emit_ldp_legalized(
+                        OperandSize::B64,
+                        mem,
+                        int_arg_regs[int_arg_idx],
+                        int_arg_regs[int_arg_idx + 1],
+                    );
+                    int_arg_idx += 2;
+                }
             } else {
                 // Fixed arg - use registers
                 if is_fp {
@@ -86,7 +131,10 @@ impl Aarch64CodeGen {
         // Store variadic args on stack
         let num_variadic = variadic_args.len();
         if num_variadic > 0 {
-            let variadic_bytes = (num_variadic * 8) as i32;
+            let variadic_bytes: i32 = variadic_args
+                .iter()
+                .map(|(_, _, _, agg)| agg.map_or(8, |b| (b + 7) & !7))
+                .sum();
             let aligned_bytes = (variadic_bytes + 15) & !15;
 
             self.push_lir(Aarch64Inst::Sub {
@@ -96,8 +144,52 @@ impl Aarch64CodeGen {
                 dst: Reg::sp(),
             });
 
-            for (idx, (arg, is_fp, arg_size)) in variadic_args.into_iter().enumerate() {
-                let offset = (idx * 8) as i32;
+            let mut offset = 0i32;
+            for (arg, is_fp, arg_size, agg_bytes) in variadic_args.into_iter() {
+                if let Some(bytes) = agg_bytes {
+                    // The pseudo locates the aggregate; its bytes go in the
+                    // slot. Moving it as a scalar wrote the pointer instead.
+                    let src = match self.get_location(arg) {
+                        Loc::Reg(r) => r,
+                        Loc::Stack(off) => {
+                            self.push_lir(Aarch64Inst::Add {
+                                size: OperandSize::B64,
+                                src1: self.stack_base_reg(off),
+                                src2: GpOperand::Imm(self.stack_offset(off) as i64),
+                                dst: Reg::X9,
+                            });
+                            Reg::X9
+                        }
+                        _ => continue,
+                    };
+                    let mut done = 0;
+                    while done < bytes {
+                        let chunk = [8, 4, 2, 1]
+                            .into_iter()
+                            .find(|c| *c <= bytes - done)
+                            .unwrap_or(1);
+                        let size = OperandSize::from_bits(chunk as u32 * 8);
+                        self.push_lir(Aarch64Inst::Ldr {
+                            size,
+                            addr: MemAddr::BaseOffset {
+                                base: src,
+                                offset: done,
+                            },
+                            dst: Reg::X16,
+                        });
+                        self.push_lir(Aarch64Inst::Str {
+                            size,
+                            src: Reg::X16,
+                            addr: MemAddr::BaseOffset {
+                                base: Reg::SP,
+                                offset: offset + done,
+                            },
+                        });
+                        done += chunk;
+                    }
+                    offset += (bytes + 7) & !7;
+                    continue;
+                }
                 if is_fp {
                     // Variadic FP args don't have precise type info, use size-based detection
                     self.emit_fp_move(arg, VReg::V16, None, arg_size, types);
@@ -120,6 +212,7 @@ impl Aarch64CodeGen {
                         },
                     });
                 }
+                offset += 8;
             }
 
             stack_args = (aligned_bytes + 15) / 16;

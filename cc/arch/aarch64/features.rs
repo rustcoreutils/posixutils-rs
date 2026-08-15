@@ -228,7 +228,7 @@ impl Aarch64CodeGen {
         let dst_loc = self.get_location(target);
 
         if self.base.target.os == crate::target::Os::MacOS {
-            self.emit_va_arg_darwin(&ap_loc, &dst_loc, type_bits, is_fp);
+            self.emit_va_arg_darwin(&ap_loc, &dst_loc, type_bits, is_fp, agg);
         } else {
             self.emit_va_arg_aapcs64(
                 &ap_loc,
@@ -243,8 +243,15 @@ impl Aarch64CodeGen {
 
     /// Darwin: every variadic argument is on the stack, so `ap` is just a
     /// cursor that walks it 8 bytes at a time.
-    fn emit_va_arg_darwin(&mut self, ap_loc: &Loc, dst_loc: &Loc, type_bits: u32, is_fp: bool) {
-        let (scratch0, _, scratch2) = Reg::scratch_regs();
+    fn emit_va_arg_darwin(
+        &mut self,
+        ap_loc: &Loc,
+        dst_loc: &Loc,
+        type_bits: u32,
+        is_fp: bool,
+        agg: VaAggKind,
+    ) {
+        let (scratch0, scratch1, scratch2) = Reg::scratch_regs();
         let Some(ap) = self.va_list_addr_pinned(ap_loc, scratch2) else {
             return;
         };
@@ -255,9 +262,35 @@ impl Aarch64CodeGen {
             dst: scratch0,
         });
 
-        self.emit_va_arg_load(dst_loc, scratch0, type_bits, is_fp);
-
-        let step = Self::va_slot_bytes(type_bits).max(8);
+        // Darwin lays every variadic argument out on the stack, so an
+        // aggregate is simply itself at that address -- there is no save area
+        // to gather it from. Only an aggregate too large to pass directly is a
+        // pointer to the caller's copy. Reading either through the scalar
+        // loader took one register's worth of it and called that the value.
+        let step = match agg {
+            VaAggKind::Hfa(elem, count) => {
+                let bytes = count as i32 * elem.bytes;
+                self.emit_va_arg_bytes(dst_loc, scratch0, 0, bytes, bytes <= 8);
+                ((bytes + 7) & !7) as i64
+            }
+            VaAggKind::Gp { bytes, .. } => {
+                self.emit_va_arg_bytes(dst_loc, scratch0, 0, bytes, bytes <= 8);
+                ((bytes + 7) & !7) as i64
+            }
+            VaAggKind::Indirect { bytes } => {
+                self.push_lir(Aarch64Inst::Ldr {
+                    size: OperandSize::B64,
+                    addr: MemAddr::Base(scratch0),
+                    dst: scratch1,
+                });
+                self.emit_va_arg_bytes(dst_loc, scratch1, 0, bytes, false);
+                8
+            }
+            VaAggKind::Scalar => {
+                self.emit_va_arg_load(dst_loc, scratch0, type_bits, is_fp);
+                Self::va_slot_bytes(type_bits).max(8)
+            }
+        };
         self.push_lir(Aarch64Inst::Add {
             size: OperandSize::B64,
             src1: scratch0,

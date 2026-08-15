@@ -826,7 +826,6 @@ impl X86_64CodeGen {
         let mut int_arg_idx = 0;
         let mut fp_arg_idx = 0;
         // Track incoming stack arg position (after saved RBP + return addr = 16)
-        let mut incoming_stack_offset: i32 = 16;
 
         // Track which pseudos were already spilled via spill_args_across_calls
         // to avoid double-storing them here
@@ -1067,7 +1066,15 @@ impl X86_64CodeGen {
                                 }
                             } else {
                                 // Stack-passed int128: copy from incoming arg area
-                                // to the local stack slot.
+                                // to the local stack slot. The allocator laid the
+                                // incoming area out and recorded where this one
+                                // landed; recomputing it here with a second
+                                // counter -- which only this arm advanced -- read
+                                // the preceding argument as soon as anything else
+                                // was stacked.
+                                let incoming_stack_offset = alloc
+                                    .int128_incoming(pseudo.id)
+                                    .expect("stack-passed __int128 has an incoming offset");
                                 if let Some(loc) = self.locations.get(pseudo.id) {
                                     // Load lo from incoming, store to local
                                     self.push_lir(X86Inst::Mov {
@@ -1098,7 +1105,6 @@ impl X86_64CodeGen {
                                         dst: GpOperand::Mem(self.int128_hi_mem_loc(&loc)),
                                     });
                                 }
-                                incoming_stack_offset += 16;
                             }
                             int_arg_idx += 2;
                         } else {

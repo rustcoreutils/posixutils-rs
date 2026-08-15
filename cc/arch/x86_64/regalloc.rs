@@ -913,6 +913,14 @@ pub struct RegAlloc {
     quad_pseudos: HashSet<PseudoId>,
     /// Track which pseudos are 128-bit integers (need 16-byte stack slots, never registers)
     int128_pseudos: HashSet<PseudoId>,
+    /// Where a stack-passed `__int128` parameter arrives, by pseudo.
+    ///
+    /// Such a parameter is given a *local* sixteen-byte slot as its location,
+    /// because that is where the prologue copies it to; the caller's offset has
+    /// nowhere else to live. The prologue used to recompute it with a second
+    /// counter of its own that only this one case advanced, so it disagreed
+    /// with the real layout as soon as any other argument was stacked.
+    int128_incoming: BTreeMap<PseudoId, i32>,
     /// Arguments spilled from caller-saved registers to stack
     spilled_args: Vec<SpilledArg>,
     /// XMM arguments spilled from XMM registers to stack
@@ -945,6 +953,37 @@ pub struct RegAlloc {
 /// See [`X86_64CodeGen::x87_scratch_addr`].
 pub(super) const X87_SCRATCH_BYTES: i32 = 16;
 
+/// Where the next stack-passed argument starts, measured from `%rbp` in the
+/// callee's frame.
+///
+/// SysV AMD64 §3.2.3 places each stacked argument at an address rounded up to
+/// `max(8, alignof(type))`, so an argument's own alignment decides where it
+/// begins, not just the running total. This used to be a bare `i32` that every
+/// arm advanced by a size and none rounded up, which put a stacked `__int128`
+/// or `long double` after an odd number of eight-byte arguments eight bytes
+/// low -- the callee read the argument before it.
+///
+/// aarch64 learned the same lesson in #C42a; `IncomingOff::take` there is the
+/// same shape.
+#[derive(Clone, Copy)]
+struct IncomingOff(i32);
+
+impl IncomingOff {
+    /// The first stacked argument sits above the saved `%rbp` and the return
+    /// address.
+    const FIRST: IncomingOff = IncomingOff(16);
+
+    /// Reserve `bytes` for an argument of alignment `align`, returning where it
+    /// starts and leaving `next` past its end.
+    fn take(next: &mut IncomingOff, bytes: i32, align: i32) -> i32 {
+        let align = align.max(8);
+        next.0 = (next.0 + align - 1) & !(align - 1);
+        let here = next.0;
+        next.0 += (bytes + 7) & !7;
+        here
+    }
+}
+
 impl RegAlloc {
     pub fn new() -> Self {
         Self {
@@ -959,6 +998,7 @@ impl RegAlloc {
             ld_pseudos: HashSet::new(),
             quad_pseudos: HashSet::new(),
             int128_pseudos: HashSet::new(),
+            int128_incoming: BTreeMap::new(),
             spilled_args: Vec::new(),
             spilled_xmm_args: Vec::new(),
             active_stack: Vec::new(),
@@ -1015,6 +1055,7 @@ impl RegAlloc {
         self.ld_pseudos.clear();
         self.quad_pseudos.clear();
         self.int128_pseudos.clear();
+        self.int128_incoming.clear();
         self.spilled_args.clear();
         self.spilled_xmm_args.clear();
         self.active_stack.clear();
@@ -1187,7 +1228,7 @@ impl RegAlloc {
         // Stack offset for overflow args - must be shared across all types
         // because System V AMD64 ABI places stack args in parameter order
         // 16 = saved rbp (8) + return address (8)
-        let mut stack_arg_offset = 16i32;
+        let mut stack_arg_offset = IncomingOff::FIRST;
 
         // M1: use the shared AbiLowering helper for sret detection and
         // O(1) Arg(n) → pseudo lookup. The classification dispatch below
@@ -1225,10 +1266,11 @@ impl RegAlloc {
             // Long double uses x87 FPU and is passed on the stack per System V AMD64 ABI
             if is_longdouble {
                 // Long double takes 16 bytes on stack (80-bit padded to 128-bit)
-                self.locations
-                    .insert(pseudo_id, Loc::IncomingArg(stack_arg_offset));
+                self.locations.insert(
+                    pseudo_id,
+                    Loc::IncomingArg(IncomingOff::take(&mut stack_arg_offset, 16, 16)),
+                );
                 self.fp_pseudos.insert(pseudo_id);
-                stack_arg_offset += 16;
             } else if sse_struct.is_some() && types.size_bits(*typ) <= 64 {
                 // One eightbyte, arriving in an XMM register as a value: the
                 // parameter pseudo *is* that value, and the linearizer's
@@ -1241,10 +1283,15 @@ impl RegAlloc {
                     self.fp_pseudos.insert(pseudo_id);
                     fp_arg_idx += 1;
                 } else {
-                    self.locations
-                        .insert(pseudo_id, Loc::IncomingArg(stack_arg_offset));
+                    self.locations.insert(
+                        pseudo_id,
+                        Loc::IncomingArg(IncomingOff::take(
+                            &mut stack_arg_offset,
+                            8,
+                            types.alignment(*typ) as i32,
+                        )),
+                    );
                     self.fp_pseudos.insert(pseudo_id);
-                    stack_arg_offset += 8;
                 }
             } else if let Some(sse_regs) = sse_struct {
                 // All-SSE struct: uses one XMM per class. Don't assign to a
@@ -1271,9 +1318,14 @@ impl RegAlloc {
                     // System V 3.2.3 step 5: an argument that does not fit goes
                     // to memory *whole*, and consumes none of the registers it
                     // did not fit in.
-                    self.locations
-                        .insert(pseudo_id, Loc::IncomingArg(stack_arg_offset));
-                    stack_arg_offset += (types.size_bits(*typ) / 8) as i32;
+                    self.locations.insert(
+                        pseudo_id,
+                        Loc::IncomingArg(IncomingOff::take(
+                            &mut stack_arg_offset,
+                            (types.size_bits(*typ) / 8) as i32,
+                            types.alignment(*typ) as i32,
+                        )),
+                    );
                 } else {
                     int_arg_idx += gp_needed;
                     fp_arg_idx += sse_needed;
@@ -1288,9 +1340,14 @@ impl RegAlloc {
                 // after a `float _Complex` was read from the wrong register.
                 let sse_regs = crate::arch::lir::complex_sse_regs(types, *typ);
                 if sse_regs == 0 {
-                    self.locations
-                        .insert(pseudo_id, Loc::IncomingArg(stack_arg_offset));
-                    stack_arg_offset += (types.size_bits(*typ) / 8) as i32;
+                    self.locations.insert(
+                        pseudo_id,
+                        Loc::IncomingArg(IncomingOff::take(
+                            &mut stack_arg_offset,
+                            (types.size_bits(*typ) / 8) as i32,
+                            types.alignment(*typ) as i32,
+                        )),
+                    );
                 } else if fp_arg_idx + sse_regs <= fp_arg_regs.len() {
                     self.locations
                         .insert(pseudo_id, Loc::Xmm(fp_arg_regs[fp_arg_idx]));
@@ -1304,9 +1361,14 @@ impl RegAlloc {
                     // it consumes no registers at all, leaving them for the
                     // arguments that follow. Advancing `fp_arg_idx` here moved
                     // every later floating-point parameter one slot along.
-                    self.locations
-                        .insert(pseudo_id, Loc::IncomingArg(stack_arg_offset));
-                    stack_arg_offset += (((types.size_bits(*typ) / 8) as i32) + 7) & !7;
+                    self.locations.insert(
+                        pseudo_id,
+                        Loc::IncomingArg(IncomingOff::take(
+                            &mut stack_arg_offset,
+                            (types.size_bits(*typ) / 8) as i32,
+                            types.alignment(*typ) as i32,
+                        )),
+                    );
                 }
             } else if is_fp {
                 if fp_arg_idx < fp_arg_regs.len() {
@@ -1316,11 +1378,16 @@ impl RegAlloc {
                     self.fp_pseudos.insert(pseudo_id);
                 } else {
                     // Stack args are placed in parameter order per System V AMD64 ABI
-                    self.locations
-                        .insert(pseudo_id, Loc::IncomingArg(stack_arg_offset));
                     // A binary128 occupies two eightbytes; advancing by one
                     // put the next argument on top of its upper half.
-                    stack_arg_offset += (((types.size_bits(*typ) / 8) as i32) + 7) & !7;
+                    self.locations.insert(
+                        pseudo_id,
+                        Loc::IncomingArg(IncomingOff::take(
+                            &mut stack_arg_offset,
+                            (types.size_bits(*typ) / 8) as i32,
+                            types.alignment(*typ) as i32,
+                        )),
+                    );
                 }
                 fp_arg_idx += 1;
             } else if types.kind(*typ) == crate::types::TypeKind::Int128 {
@@ -1338,7 +1405,8 @@ impl RegAlloc {
                         r != int_arg_regs[int_arg_idx] && r != int_arg_regs[int_arg_idx + 1]
                     });
                 } else {
-                    stack_arg_offset += 16;
+                    let at = IncomingOff::take(&mut stack_arg_offset, 16, 16);
+                    self.int128_incoming.insert(pseudo_id, at);
                 }
                 int_arg_idx += 2;
             } else {
@@ -1347,9 +1415,14 @@ impl RegAlloc {
                 if is_large_struct {
                     // MEMORY class: passed on the stack by value. Advance by
                     // the full struct size.
-                    self.locations
-                        .insert(pseudo_id, Loc::IncomingArg(stack_arg_offset));
-                    stack_arg_offset += (type_size / 8) as i32;
+                    self.locations.insert(
+                        pseudo_id,
+                        Loc::IncomingArg(IncomingOff::take(
+                            &mut stack_arg_offset,
+                            (type_size / 8) as i32,
+                            types.alignment(*typ) as i32,
+                        )),
+                    );
                     // Don't increment int_arg_idx — no GP register consumed
                 } else if int_arg_idx < int_arg_regs.len() {
                     self.locations
@@ -1358,9 +1431,14 @@ impl RegAlloc {
                     int_arg_idx += 1;
                 } else {
                     // Stack args are placed in parameter order per System V AMD64 ABI
-                    self.locations
-                        .insert(pseudo_id, Loc::IncomingArg(stack_arg_offset));
-                    stack_arg_offset += 8;
+                    self.locations.insert(
+                        pseudo_id,
+                        Loc::IncomingArg(IncomingOff::take(
+                            &mut stack_arg_offset,
+                            8,
+                            types.alignment(*typ) as i32,
+                        )),
+                    );
                     int_arg_idx += 1;
                 }
             }
@@ -1457,6 +1535,11 @@ impl RegAlloc {
                 }
             }
         }
+    }
+
+    /// Where a stack-passed `__int128` parameter arrives, if it did.
+    pub fn int128_incoming(&self, pseudo: PseudoId) -> Option<i32> {
+        self.int128_incoming.get(&pseudo).copied()
     }
 
     /// Get arguments that were spilled from caller-saved registers

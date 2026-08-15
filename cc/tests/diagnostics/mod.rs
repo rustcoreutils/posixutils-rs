@@ -18,7 +18,7 @@
 // everything.
 //
 
-use crate::common::{compile_expect_error, compile_expect_ok};
+use crate::common::{compile_expect_error, compile_expect_ok, compile_expect_warning};
 
 // ============================================================================
 // #L1 — implicit int (C99 6.7.2p2)
@@ -1374,4 +1374,69 @@ fn diagnostics_compatible_redeclarations_are_accepted() {
     ] {
         compile_expect_ok(name, src);
     }
+}
+
+// ==== excess initializers (C17 6.7.9p2) ====
+
+/// An initializer list may not hold more elements than the object it
+/// initializes. gcc warns rather than failing, and so does c17 -- 5.1.1.3 asks
+/// for a diagnostic, not a rejection.
+#[test]
+fn diagnostics_excess_initializers_are_diagnosed() {
+    compile_expect_warning(
+        "excess_scalar_initializer",
+        "int main(void){ int a = {1, 2}; return a; }\n",
+        "excess elements in scalar initializer",
+    );
+    compile_expect_warning(
+        "excess_array_initializer",
+        "int main(void){ int a[2] = {1, 2, 3}; return a[0]; }\n",
+        "excess elements in array initializer",
+    );
+    compile_expect_warning(
+        "excess_struct_initializer",
+        "struct S { int a; };\nint main(void){ struct S s = {1, 2}; return s.a; }\n",
+        "excess elements in struct initializer",
+    );
+    compile_expect_warning(
+        "excess_global_array_initializer",
+        "int g[2] = {1, 2, 3};\nint main(void){ return g[0]; }\n",
+        "excess elements in array initializer",
+    );
+}
+
+/// The counting is only unambiguous in the simple cases, and everything else
+/// must stay silent -- a wrong warning here would fire on ordinary code.
+///
+/// Each of these is a distinct reason to say nothing: an exactly-filled or
+/// short list, a bound taken from the initializer itself, a single braced
+/// scalar, a designator that may place an element anywhere, brace elision
+/// letting one aggregate member consume several elements, a union taking one
+/// initializer whatever it holds, a flexible array member with no bound, and a
+/// string literal initializing a character array in either spelling.
+#[test]
+fn diagnostics_well_sized_initializers_are_silent() {
+    let src = r#"
+struct P { int x, y; };
+union U { int a; double b; };
+struct F { int n; char d[]; };
+
+int main(void) {
+    int exact[3] = {1, 2, 3};
+    int short_list[3] = {1};
+    int inferred[] = {1, 2, 3};
+    int braced_scalar = {1};
+    int designated[3] = {[2] = 1};
+    struct P elided[2] = {1, 2, 3, 4};
+    union U u = {1};
+    struct F f = {1};
+    char s[4] = "ab";
+    char b[4] = {"ab"};
+    struct P nested = {1, 2};
+
+    return exact[0] + short_list[0] + inferred[0] + braced_scalar
+         + designated[2] + elided[1].y + u.a + f.n + s[0] + b[0] + nested.y;
+}
+"#;
+    compile_expect_ok("well_sized_initializers", src);
 }

@@ -1875,6 +1875,67 @@ impl Parser<'_> {
         .then_some(only.value.as_ref())
     }
 
+    /// Report an initializer list with more elements than the object it
+    /// initializes can hold (C17 6.7.9p2).
+    ///
+    /// Deliberately narrow, because the count is only unambiguous in the
+    /// simple cases. A designator places an element anywhere, so a list
+    /// containing one is left alone. Brace elision lets an aggregate member
+    /// consume several consecutive elements -- `struct P p[2] = {1,2,3,4}`
+    /// fills two two-field structs -- so only aggregates whose elements or
+    /// members are all scalars are counted. A union takes one initializer,
+    /// whatever it holds, and a flexible array member has no bound at all.
+    ///
+    /// Everything skipped is a missed warning rather than a wrong one.
+    fn check_excess_initializers(&self, typ: TypeId, init: &Expr) {
+        let ExprKind::InitList { elements } = &init.kind else {
+            return;
+        };
+        if elements.iter().any(|e| !e.designators.is_empty()) {
+            return;
+        }
+
+        match self.types.kind(typ) {
+            TypeKind::Array => {
+                let Some(elem) = self.types.base_type(typ) else {
+                    return;
+                };
+                if !self.types.is_scalar(elem) {
+                    return;
+                }
+                // An absent or zero size is an array whose bound came from
+                // this very initializer, so it cannot overflow.
+                let Some(capacity) = self.types.array_size(typ).filter(|&n| n > 0) else {
+                    return;
+                };
+                if elements.len() > capacity {
+                    diag::warning(init.pos, &gettext("excess elements in array initializer"));
+                }
+            }
+            TypeKind::Struct => {
+                let Some(comp) = self.types.composite(typ) else {
+                    return;
+                };
+                if comp.members.is_empty()
+                    || comp.members.iter().any(|m| !self.types.is_scalar(m.typ))
+                {
+                    return;
+                }
+                if elements.len() > comp.members.len() {
+                    diag::warning(init.pos, &gettext("excess elements in struct initializer"));
+                }
+            }
+            TypeKind::Union => {}
+            _ => {
+                // A scalar may be written in braces, but only the first value
+                // initializes it (6.7.9p11).
+                if elements.len() > 1 {
+                    diag::warning(init.pos, &gettext("excess elements in scalar initializer"));
+                }
+            }
+        }
+    }
+
     fn infer_array_size_from_init(&mut self, typ: TypeId, init: &Expr) -> TypeId {
         if self.types.kind(typ) != TypeKind::Array {
             return typ;
@@ -2068,6 +2129,7 @@ impl Parser<'_> {
                 if let Some(ref init_expr) = init {
                     let old_type = typ;
                     typ = self.infer_array_size_from_init(typ, init_expr);
+                    self.check_excess_initializers(typ, init_expr);
 
                     // If the type changed (array size was inferred), update the symbol's type
                     // This is needed because the symbol was already added before parsing the initializer
@@ -4659,6 +4721,7 @@ impl Parser<'_> {
         if let Some(ref init_expr) = init {
             let old_type = var_type_id;
             var_type_id = self.infer_array_size_from_init(var_type_id, init_expr);
+            self.check_excess_initializers(var_type_id, init_expr);
 
             // If the type changed (array size was inferred), update the symbol's type
             // This is needed because the symbol was already added before parsing the initializer
@@ -4752,6 +4815,7 @@ impl Parser<'_> {
             if let Some(ref init_expr) = decl_init {
                 let old_type = decl_type;
                 decl_type = self.infer_array_size_from_init(decl_type, init_expr);
+                self.check_excess_initializers(decl_type, init_expr);
 
                 // If the type changed (array size was inferred), update the symbol's type
                 // This is needed because the symbol was already added before parsing the initializer

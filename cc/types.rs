@@ -922,7 +922,6 @@ impl TypeTable {
     // =========================================================================
 
     /// Get array size
-    #[cfg(test)]
     #[inline]
     pub fn array_size(&self, id: TypeId) -> Option<usize> {
         self.get(id).array_size

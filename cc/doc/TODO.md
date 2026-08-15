@@ -73,6 +73,13 @@ Behaviours where c17 differs from gcc on the same source. None is a
 translation-limit or a diagnostic gap; each silently changes what the program
 does or claims.
 
+_The `__int128` and `long double` argument-passing bugs, the universal-character-name
+encoding, and the silently-dropped attributes used to belong here; all are closed, see
+#C42, #C43, #C57, #C58 and #C59 in `cc/audit.md`. What remains of that family: `used` is
+satisfied only because nothing is pruned, `vector_size` and `mode` are unimplemented (the
+first refused, the second warned), and #C38 -- an inlined stacked float HFA on aarch64 --
+now has a reproducer and a diagnosis but not a fix._
+
 _Constraint diagnostics used to belong here. As of 2026-08-15 a 35-case matrix
 -- 21 constraint violations and 14 accept-side controls -- agrees with
 `gcc -std=c17` on every row; see #C45-#C49 in `cc/audit.md`. Two divergences are

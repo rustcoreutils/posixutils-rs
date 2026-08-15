@@ -11,7 +11,7 @@
 //
 
 use crate::float::FpFormat;
-use crate::strings::StringId;
+use crate::strings::{StringId, StringTable as IdentTable};
 use crate::target::{Arch, Os, Target};
 use std::collections::HashMap;
 use std::fmt;
@@ -353,6 +353,25 @@ impl Type {
         }
     }
 
+    /// Create a function type whose declarator supplied no prototype: `int
+    /// f();`, or a K&R identifier list.
+    ///
+    /// C17 6.7.6.3p14 draws the line here, not at "zero parameters": an empty
+    /// identifier list says nothing about the parameters, while `(void)` says
+    /// there are none. `params: None` is that distinction, and callers must
+    /// read it as "unknown" rather than "empty" -- no arity check is permitted
+    /// against it (6.5.2.2p1), and one against `(void)` is required.
+    pub fn function_no_prototype(return_type: TypeId, noreturn: bool) -> Self {
+        Self {
+            kind: TypeKind::Function,
+            base: Some(return_type),
+            params: None,
+            variadic: false,
+            noreturn,
+            ..Default::default()
+        }
+    }
+
     /// Create a struct type
     pub fn struct_type(composite: CompositeType) -> Self {
         Self {
@@ -421,7 +440,7 @@ impl Type {
     ///
     /// With TypeId interning, base types are compared by TypeId equality.
     /// For full recursive comparison, use TypeTable::types_compatible().
-    pub fn types_compatible(&self, other: &Type) -> bool {
+    fn compatible_ignoring_base(&self, other: &Type) -> bool {
         // Top-level qualifiers to ignore
         const QUALIFIERS: TypeModifiers = TypeModifiers::CONST
             .union(TypeModifiers::VOLATILE)
@@ -464,31 +483,55 @@ impl Type {
             return false;
         }
 
-        // Compare base types by TypeId (interned types with same ID are equal)
-        if self.base != other.base {
-            return false;
-        }
+        // The base is compared by the caller, which can recurse. Comparing it
+        // here by TypeId called two structurally identical types different
+        // whenever a declaration specifier had settled on an inner type:
+        // `static char *x[]` records STATIC on the element, so assigning it to
+        // a plain `char **` field reported "'char**' from 'char**'" -- a
+        // complaint about two spellings of one type. Storage class is a
+        // property of a declaration, never of a type.
 
-        // Compare function parameters by TypeId
+        // Only the *shape* of the parameter list is settled here: whether a
+        // prototype was supplied at all, and how many parameters it has. The
+        // parameter types themselves are compared by the caller, which can
+        // recurse -- comparing them by TypeId called two identical
+        // `void *(Parser *)` different whenever a declaration specifier had
+        // settled on an inner type, which is 19 lines of CPython's generated
+        // parser.
         match (&self.params, &other.params) {
-            (Some(a), Some(b)) => {
-                if a.len() != b.len() {
-                    return false;
-                }
-                // TypeIds are directly comparable
-                if a != b {
-                    return false;
-                }
-            }
+            (Some(a), Some(b)) if a.len() == b.len() => {}
             (None, None) => {}
             _ => return false,
         }
 
         // Compare composite types (struct, union, enum)
-        // For these, we require the exact same composite definition
-        // (different enum types are NOT compatible even with same underlying type)
         match (&self.composite, &other.composite) {
-            (Some(a), Some(b)) => a == b,
+            (Some(a), Some(b)) => {
+                // A tag names the type. C17 6.2.7p1: completing a
+                // forward-declared struct does not create a second type, so
+                // `struct S;` and the later `struct S { int x; }` are one --
+                // but they are two `CompositeType` values, one incomplete with
+                // no members, and comparing those structurally called every
+                // function declared before the definition and defined after it
+                // a conflicting redeclaration.
+                //
+                // Different enum types stay incompatible even with the same
+                // underlying type, because their tags differ.
+                match (a.tag, b.tag) {
+                    // One side still incomplete: this is a tag meeting its own
+                    // definition, so the tag is all there is to go on.
+                    (Some(x), Some(y)) if !a.is_complete || !b.is_complete => x == y,
+                    // Both complete: the tag is necessary but not sufficient,
+                    // because a nested scope may declare a different type under
+                    // the same name. Comparing what they contain tells them
+                    // apart, and this predicate feeds accept/reject decisions
+                    // now, not only diagnostics.
+                    (Some(x), Some(y)) => x == y && a == b,
+                    // Anonymous composites have nothing to name them, so they
+                    // are compared by what they contain.
+                    _ => a == b,
+                }
+            }
             (None, None) => true,
             _ => false,
         }
@@ -577,11 +620,70 @@ enum TypeKey {
     /// Function type
     Function {
         ret: TypeId,
-        params: Vec<TypeId>,
+        /// `None` for a declarator with no prototype, which is a *different*
+        /// type from one taking no parameters (C17 6.7.6.3p14). Flattening the
+        /// two with `unwrap_or_default` interned `int f()` and `int f(void)`
+        /// as the same `TypeId`, so no later pass could tell them apart.
+        params: Option<Vec<TypeId>>,
         variadic: bool,
         noreturn: bool,
         modifiers: u32,
     },
+}
+
+/// Why a pair of operands fails the simple-assignment constraints of C17
+/// 6.5.16.1p1.
+///
+/// The split into fatal and non-fatal follows gcc: a conversion that does not
+/// exist at all is an error, while one that exists but is almost certainly a
+/// mistake is a warning. Matching that split is what lets code which builds
+/// today keep building.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AssignFault {
+    /// No conversion exists: a pointer against a floating type, an aggregate
+    /// against anything but a compatible aggregate, or a `void` value.
+    Incompatible,
+    /// A pointer where an integer belongs, with no cast.
+    IntegerFromPointer,
+    /// An integer where a pointer belongs, with no cast. Kept apart from
+    /// `IntegerFromPointer` because the two read in opposite directions and a
+    /// single message for both names the wrong conversion half the time.
+    PointerFromInteger,
+    /// Two pointers whose referenced types are not compatible.
+    PointerMismatch,
+    /// The target's referenced type drops a qualifier the source's had.
+    QualifierDiscard,
+}
+
+impl AssignFault {
+    /// Whether this fault is fatal. Only a missing conversion is.
+    pub fn is_error(self) -> bool {
+        self == AssignFault::Incompatible
+    }
+
+    /// The clause naming what went wrong, as gcc words it.
+    pub fn describe(self) -> &'static str {
+        match self {
+            AssignFault::Incompatible => "incompatible types",
+            AssignFault::IntegerFromPointer => "makes integer from pointer without a cast",
+            AssignFault::PointerFromInteger => "makes pointer from integer without a cast",
+            AssignFault::PointerMismatch => "incompatible pointer type",
+            AssignFault::QualifierDiscard => "discards a qualifier from the pointer target type",
+        }
+    }
+}
+
+/// Whether a comparison treats the outermost `const`/`volatile`/`restrict`/
+/// `_Atomic` as part of the type.
+///
+/// They are not part of it for a whole object -- `const int` and `int` are the
+/// same type to `__builtin_types_compatible_p` -- but they are for anything a
+/// pointer or array refers to (C17 6.7.6.1p2), and are not for a parameter
+/// (6.7.6.3p15).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TopLevelQualifiers {
+    Ignored,
+    Significant,
 }
 
 const DEFAULT_TYPE_TABLE_CAPACITY: usize = 65536;
@@ -776,10 +878,9 @@ impl TypeTable {
             }
             TypeKind::Function => {
                 let ret = typ.base?;
-                let params = typ.params.clone().unwrap_or_default();
                 Some(TypeKey::Function {
                     ret,
-                    params,
+                    params: typ.params.clone(),
                     variadic: typ.variadic,
                     noreturn: typ.noreturn,
                     modifiers: typ.modifiers.bits(),
@@ -847,7 +948,6 @@ impl TypeTable {
     // =========================================================================
 
     /// Get array size
-    #[cfg(test)]
     #[inline]
     pub fn array_size(&self, id: TypeId) -> Option<usize> {
         self.get(id).array_size
@@ -868,14 +968,15 @@ impl TypeTable {
     }
 
     /// Get composite type data (for struct/union/enum)
-    #[cfg(test)]
     pub fn composite(&self, id: TypeId) -> Option<&CompositeType> {
         self.get(id).composite.as_deref()
     }
 
-    /// Format a type for display (with recursive base type printing)
-    #[cfg(test)]
-    pub fn format_type(&self, id: TypeId) -> String {
+    /// Format a type for display (with recursive base type printing).
+    ///
+    /// Used by diagnostics that have to name the types they are complaining
+    /// about -- an assignment constraint violation is unreadable without them.
+    pub fn format_type(&self, id: TypeId, idents: Option<&IdentTable>) -> String {
         let typ = self.get(id);
         let mut result = String::new();
 
@@ -895,7 +996,7 @@ impl TypeTable {
         match typ.kind {
             TypeKind::Pointer => {
                 if let Some(base) = typ.base {
-                    result.push_str(&self.format_type(base));
+                    result.push_str(&self.format_type(base, idents));
                     result.push('*');
                 } else {
                     result.push('*');
@@ -903,7 +1004,7 @@ impl TypeTable {
             }
             TypeKind::Array => {
                 if let Some(base) = typ.base {
-                    result.push_str(&self.format_type(base));
+                    result.push_str(&self.format_type(base, idents));
                     if let Some(size) = typ.array_size {
                         result.push_str(&format!("[{}]", size));
                     } else {
@@ -915,14 +1016,14 @@ impl TypeTable {
             }
             TypeKind::Function => {
                 if let Some(ret) = typ.base {
-                    result.push_str(&self.format_type(ret));
+                    result.push_str(&self.format_type(ret, idents));
                     result.push('(');
                     if let Some(params) = &typ.params {
                         for (i, &param) in params.iter().enumerate() {
                             if i > 0 {
                                 result.push_str(", ");
                             }
-                            result.push_str(&self.format_type(param));
+                            result.push_str(&self.format_type(param, idents));
                         }
                         if typ.variadic {
                             if !params.is_empty() {
@@ -934,6 +1035,17 @@ impl TypeTable {
                     result.push(')');
                 } else {
                     result.push_str("()");
+                }
+            }
+            TypeKind::Struct | TypeKind::Union | TypeKind::Enum => {
+                result.push_str(&typ.kind.to_string());
+                // The tag is what tells one struct from another, and an
+                // assignment diagnostic naming neither is unreadable.
+                if let (Some(comp), Some(idents)) = (typ.composite.as_deref(), idents) {
+                    if let Some(tag) = comp.tag {
+                        result.push(' ');
+                        result.push_str(idents.get(tag));
+                    }
                 }
             }
             _ => {
@@ -1044,6 +1156,124 @@ impl TypeTable {
     #[inline]
     pub fn is_arithmetic(&self, id: TypeId) -> bool {
         self.is_integer(id) || self.is_float(id) || self.is_complex(id)
+    }
+
+    /// How a type participates in an assignment.
+    ///
+    /// C17 6.3.2.1p3-4 converts an array to a pointer to its element and a
+    /// function to a pointer to itself before anything else looks at it.
+    /// Reported as a kind plus the referenced type rather than by interning a
+    /// pointer, so a caller holding the table immutably can still ask.
+    fn as_assigned(&self, id: TypeId) -> (TypeKind, Option<TypeId>) {
+        match self.kind(id) {
+            TypeKind::Array => (TypeKind::Pointer, self.base_type(id)),
+            TypeKind::Function => (TypeKind::Pointer, Some(id)),
+            TypeKind::Pointer => (TypeKind::Pointer, self.base_type(id)),
+            other => (other, None),
+        }
+    }
+
+    /// Check a value against the type it is being assigned to (C17
+    /// 6.5.16.1p1). `None` means the assignment is allowed.
+    ///
+    /// The same constraints govern `return` and argument passing, which the
+    /// standard defines as conversion "as if by assignment", so all three
+    /// contexts ask this and differ only in how they word the answer.
+    pub fn assignment_fault(
+        &self,
+        target: TypeId,
+        value: TypeId,
+        value_is_null_constant: bool,
+    ) -> Option<AssignFault> {
+        let (t_kind, t_pointee) = self.as_assigned(target);
+        let (v_kind, v_pointee) = self.as_assigned(value);
+
+        // A `void` expression has no value to assign.
+        if v_kind == TypeKind::Void {
+            return Some(AssignFault::Incompatible);
+        }
+        // Nothing is known about the target -- an earlier diagnostic already
+        // fired, or this is a context the checker does not model.
+        if t_kind == TypeKind::Void {
+            return None;
+        }
+
+        let t_ptr = t_kind == TypeKind::Pointer;
+        let v_ptr = v_kind == TypeKind::Pointer;
+        let t_agg = matches!(t_kind, TypeKind::Struct | TypeKind::Union);
+        let v_agg = matches!(v_kind, TypeKind::Struct | TypeKind::Union);
+
+        // An aggregate assigns only from a compatible aggregate. Compared
+        // through `types_compatible` rather than by TypeId, because struct and
+        // union types are deliberately not deduplicated -- they have identity.
+        if t_agg || v_agg {
+            let ok = t_agg && v_agg && self.types_compatible(target, value);
+            return (!ok).then_some(AssignFault::Incompatible);
+        }
+
+        if t_ptr && v_ptr {
+            let (Some(t_pointee), Some(v_pointee)) = (t_pointee, v_pointee) else {
+                return None;
+            };
+            // `void *` converts to and from any object pointer (6.5.16.1p1).
+            if self.kind(t_pointee) == TypeKind::Void || self.kind(v_pointee) == TypeKind::Void {
+                return None;
+            }
+            if !self.types_compatible(t_pointee, v_pointee) {
+                return Some(AssignFault::PointerMismatch);
+            }
+            // Compatible targets, but the assignment must not silently gain
+            // write access: the target's qualifiers have to include the
+            // source's.
+            const QUALS: TypeModifiers = TypeModifiers::CONST
+                .union(TypeModifiers::VOLATILE)
+                .union(TypeModifiers::RESTRICT)
+                .union(TypeModifiers::ATOMIC);
+            let t_quals = self.modifiers(t_pointee) & QUALS;
+            let v_quals = self.modifiers(v_pointee) & QUALS;
+            return (!t_quals.contains(v_quals)).then_some(AssignFault::QualifierDiscard);
+        }
+
+        if t_ptr {
+            // A null pointer constant is spelled as an integer, and is allowed.
+            if value_is_null_constant {
+                return None;
+            }
+            return Some(if self.is_integer(value) {
+                AssignFault::PointerFromInteger
+            } else {
+                AssignFault::Incompatible
+            });
+        }
+
+        if v_ptr {
+            // `_Bool b = p` is explicitly permitted: it asks whether the
+            // pointer is null.
+            if t_kind == TypeKind::Bool {
+                return None;
+            }
+            return Some(if self.is_integer(target) {
+                AssignFault::IntegerFromPointer
+            } else {
+                AssignFault::Incompatible
+            });
+        }
+
+        None
+    }
+
+    /// The type an array or function has in an expression: C17 6.3.2.1p3-4
+    /// converts an array to a pointer to its first element and a function to a
+    /// pointer to itself. Every other type is its own.
+    pub fn decayed(&mut self, typ: TypeId) -> TypeId {
+        match self.kind(typ) {
+            TypeKind::Array => {
+                let elem = self.base_type(typ).unwrap_or(self.char_id);
+                self.intern(Type::pointer(elem))
+            }
+            TypeKind::Function => self.intern(Type::pointer(typ)),
+            _ => typ,
+        }
     }
 
     /// Check if type is a scalar type (arithmetic or pointer)
@@ -1294,13 +1524,60 @@ impl TypeTable {
     }
 
     /// Check if two types are compatible (for __builtin_types_compatible_p)
+    ///
+    /// Top-level qualifiers are ignored, which is what
+    /// `__builtin_types_compatible_p` documents and what "compatible type"
+    /// means of a whole object. They are *not* ignored below the top level:
+    /// C17 6.7.6.1p2 requires two pointers to be identically qualified as well
+    /// as to point at compatible types, so `char *` and `const char *` are
+    /// different types.
     pub fn types_compatible(&self, id1: TypeId, id2: TypeId) -> bool {
+        self.compatible(id1, id2, TopLevelQualifiers::Ignored)
+    }
+
+    fn compatible(&self, id1: TypeId, id2: TypeId, quals: TopLevelQualifiers) -> bool {
         // Quick check: same TypeId means same type
         if id1 == id2 {
             return true;
         }
-        // Compare underlying types
-        self.get(id1).types_compatible(self.get(id2))
+        const QUALIFIERS: TypeModifiers = TypeModifiers::CONST
+            .union(TypeModifiers::VOLATILE)
+            .union(TypeModifiers::RESTRICT)
+            .union(TypeModifiers::ATOMIC);
+        if quals == TopLevelQualifiers::Significant
+            && self.get(id1).modifiers.intersection(QUALIFIERS)
+                != self.get(id2).modifiers.intersection(QUALIFIERS)
+        {
+            return false;
+        }
+        if !self.get(id1).compatible_ignoring_base(self.get(id2)) {
+            return false;
+        }
+        // Then the referenced type and the parameter types, structurally
+        // rather than by identity. Recursion terminates: `base` and parameter
+        // chains shorten by one derivation at a time, and a struct's members
+        // are compared as ids inside its composite rather than followed.
+        //
+        // The referenced type carries its qualifiers into the comparison --
+        // that is the whole of 6.7.6.1p2 -- while a *parameter* does not:
+        // 6.7.6.3p15 takes each parameter as having the unqualified version of
+        // its declared type, so `void f(const int)` and `void f(int)` are one
+        // type.
+        let base_ok = match (self.get(id1).base, self.get(id2).base) {
+            (Some(a), Some(b)) => self.compatible(a, b, TopLevelQualifiers::Significant),
+            (None, None) => true,
+            _ => false,
+        };
+        if !base_ok {
+            return false;
+        }
+        match (&self.get(id1).params, &self.get(id2).params) {
+            (Some(a), Some(b)) => a
+                .iter()
+                .zip(b.iter())
+                .all(|(&x, &y)| self.compatible(x, y, TopLevelQualifiers::Ignored)),
+            _ => true,
+        }
     }
 
     /// Check if two types are compatible *and* identically qualified.
@@ -1314,21 +1591,7 @@ impl TypeTable {
     /// association can never be selected because the controlling expression has
     /// been lvalue-converted to an unqualified type.
     pub fn types_compatible_qualified(&self, id1: TypeId, id2: TypeId) -> bool {
-        if id1 == id2 {
-            return true;
-        }
-
-        const QUALIFIERS: TypeModifiers = TypeModifiers::CONST
-            .union(TypeModifiers::VOLATILE)
-            .union(TypeModifiers::RESTRICT)
-            .union(TypeModifiers::ATOMIC);
-
-        let (t1, t2) = (self.get(id1), self.get(id2));
-        if t1.modifiers.intersection(QUALIFIERS) != t2.modifiers.intersection(QUALIFIERS) {
-            return false;
-        }
-
-        t1.types_compatible(t2)
+        self.compatible(id1, id2, TopLevelQualifiers::Significant)
     }
 
     /// Compute struct layout with natural alignment
@@ -1544,8 +1807,8 @@ mod tests {
     #[test]
     fn test_type_format() {
         let types = TypeTable::new(&Target::host());
-        assert_eq!(types.format_type(types.int_id), "int");
-        assert_eq!(types.format_type(types.uint_id), "unsigned int");
+        assert_eq!(types.format_type(types.int_id, None), "int");
+        assert_eq!(types.format_type(types.uint_id, None), "unsigned int");
     }
 
     #[test]
@@ -1578,70 +1841,78 @@ mod tests {
 
     #[test]
     fn test_types_compatible_same_type() {
-        let int1 = Type::basic(TypeKind::Int);
-        let int2 = Type::basic(TypeKind::Int);
-        assert!(int1.types_compatible(&int2));
+        let mut types = TypeTable::new(&Target::host());
+        let int1 = types.intern(Type::basic(TypeKind::Int));
+        let int2 = types.intern(Type::basic(TypeKind::Int));
+        assert!(types.types_compatible(int1, int2));
 
-        let char1 = Type::basic(TypeKind::Char);
-        let char2 = Type::basic(TypeKind::Char);
-        assert!(char1.types_compatible(&char2));
+        let char1 = types.intern(Type::basic(TypeKind::Char));
+        let char2 = types.intern(Type::basic(TypeKind::Char));
+        assert!(types.types_compatible(char1, char2));
     }
 
     #[test]
     fn test_types_compatible_different_types() {
-        let int_type = Type::basic(TypeKind::Int);
-        let char_type = Type::basic(TypeKind::Char);
-        assert!(!int_type.types_compatible(&char_type));
+        let mut types = TypeTable::new(&Target::host());
+        let int_type = types.intern(Type::basic(TypeKind::Int));
+        let char_type = types.intern(Type::basic(TypeKind::Char));
+        assert!(!types.types_compatible(int_type, char_type));
 
-        let long_type = Type::basic(TypeKind::Long);
-        assert!(!int_type.types_compatible(&long_type));
+        let long_type = types.intern(Type::basic(TypeKind::Long));
+        assert!(!types.types_compatible(int_type, long_type));
     }
 
     #[test]
     fn test_types_compatible_qualifiers_ignored() {
-        let int_type = Type::basic(TypeKind::Int);
-        let const_int = Type::with_modifiers(TypeKind::Int, TypeModifiers::CONST);
-        let volatile_int = Type::with_modifiers(TypeKind::Int, TypeModifiers::VOLATILE);
-        let cv_int = Type::with_modifiers(
+        let mut types = TypeTable::new(&Target::host());
+        let int_type = types.intern(Type::basic(TypeKind::Int));
+        let const_int = types.intern(Type::with_modifiers(TypeKind::Int, TypeModifiers::CONST));
+        let volatile_int =
+            types.intern(Type::with_modifiers(TypeKind::Int, TypeModifiers::VOLATILE));
+        let cv_int = types.intern(Type::with_modifiers(
             TypeKind::Int,
             TypeModifiers::CONST | TypeModifiers::VOLATILE,
-        );
+        ));
 
         // All should be compatible with plain int
-        assert!(int_type.types_compatible(&const_int));
-        assert!(int_type.types_compatible(&volatile_int));
-        assert!(int_type.types_compatible(&cv_int));
-        assert!(const_int.types_compatible(&volatile_int));
+        assert!(types.types_compatible(int_type, const_int));
+        assert!(types.types_compatible(int_type, volatile_int));
+        assert!(types.types_compatible(int_type, cv_int));
+        assert!(types.types_compatible(const_int, volatile_int));
     }
 
     #[test]
     fn test_types_compatible_signedness_matters() {
-        let int_type = Type::basic(TypeKind::Int);
-        let uint_type = Type::with_modifiers(TypeKind::Int, TypeModifiers::UNSIGNED);
+        let mut types = TypeTable::new(&Target::host());
+        let int_type = types.intern(Type::basic(TypeKind::Int));
+        let uint_type = types.intern(Type::with_modifiers(TypeKind::Int, TypeModifiers::UNSIGNED));
         // Signedness is NOT a qualifier, so these are NOT compatible
-        assert!(!int_type.types_compatible(&uint_type));
+        assert!(!types.types_compatible(int_type, uint_type));
     }
 
+    /// Pointer compatibility is a question about the *referenced* types, so
+    /// it is asked through the table, which recurses. The `Type`-level
+    /// comparison deliberately stops before the base.
     #[test]
     fn test_types_compatible_pointers() {
-        let types = TypeTable::new(&Target::host());
-        let int_ptr = Type::pointer(types.int_id);
-        let int_ptr2 = Type::pointer(types.int_id);
-        assert!(int_ptr.types_compatible(&int_ptr2));
+        let mut types = TypeTable::new(&Target::host());
+        let int_ptr = types.intern(Type::pointer(types.int_id));
+        let int_ptr2 = types.intern(Type::pointer(types.int_id));
+        assert!(types.types_compatible(int_ptr, int_ptr2));
 
-        let char_ptr = Type::pointer(types.char_id);
-        assert!(!int_ptr.types_compatible(&char_ptr));
+        let char_ptr = types.intern(Type::pointer(types.char_id));
+        assert!(!types.types_compatible(int_ptr, char_ptr));
     }
 
     #[test]
     fn test_types_compatible_arrays() {
-        let types = TypeTable::new(&Target::host());
-        let arr10 = Type::array(types.int_id, 10);
-        let arr10_2 = Type::array(types.int_id, 10);
-        assert!(arr10.types_compatible(&arr10_2));
+        let mut types = TypeTable::new(&Target::host());
+        let arr10 = types.intern(Type::array(types.int_id, 10));
+        let arr10_2 = types.intern(Type::array(types.int_id, 10));
+        assert!(types.types_compatible(arr10, arr10_2));
 
-        let arr20 = Type::array(types.int_id, 20);
-        assert!(!arr10.types_compatible(&arr20));
+        let arr20 = types.intern(Type::array(types.int_id, 20));
+        assert!(!types.types_compatible(arr10, arr20));
     }
 
     #[test]

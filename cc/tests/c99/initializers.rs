@@ -1671,3 +1671,115 @@ int main(void)
         0
     );
 }
+
+/// C17 6.7.9p14: the string literal initializing a character array may be
+/// enclosed in braces, and it still initializes that array -- `char b[] =
+/// {"hi"}` is `char[3]` holding `hi`, not an array of one element.
+///
+/// It was read as an ordinary initializer list, so the element count came out
+/// as 1 and the characters were never copied in: `sizeof b` was 1 and printing
+/// it gave garbage. `(char[]){"hi"}` was empty for the same reason, and an
+/// explicitly-sized `char c[6] = {"hi"}` had the right size with the wrong
+/// contents. Both the size deduction and the store path had the look-through
+/// one level down, for `char names[3][4] = {"Sun", "Mon"}`, and neither had it
+/// at the outermost level.
+///
+/// Every expectation here came from gcc on this source.
+#[test]
+fn c99_string_literal_initializer_may_be_braced() {
+    let code = r#"
+#include <wchar.h>
+
+char sb[] = {"hi"};
+char sc[6] = {"hi"};
+wchar_t sw[] = {L"hi"};
+const char *sp[] = {"aa", "bbb"};
+char nested[3][4] = {"Sun", "Mon", "Tue"};
+struct S { char tag[4]; int n; };
+struct S ss = { {"ab"}, 7 };
+
+int main(void) {
+    char b[] = {"hi"};
+    char c[6] = {"hi"};
+    wchar_t w[] = {L"hi"};
+    char *cl = (char[]){"hi"};
+    struct S as = { {"cd"}, 9 };
+
+    if (sizeof sb != 3 || sb[0] != 'h' || sb[1] != 'i' || sb[2] != 0) return 1;
+    if (sizeof sc != 6 || sc[1] != 'i' || sc[2] != 0 || sc[5] != 0) return 2;
+    if (sizeof sw / sizeof sw[0] != 3 || sw[1] != L'i' || sw[2] != 0) return 3;
+
+    /* An array of pointers is the same shape one level up, and must not be
+       swallowed by the look-through. */
+    if (sizeof sp / sizeof sp[0] != 2 || sp[1][2] != 'b') return 4;
+    if (nested[2][0] != 'T' || nested[0][3] != 0) return 5;
+    if (ss.tag[1] != 'b' || ss.tag[2] != 0 || ss.n != 7) return 6;
+
+    if (sizeof b != 3 || b[0] != 'h' || b[1] != 'i' || b[2] != 0) return 7;
+    if (sizeof c != 6 || c[1] != 'i' || c[2] != 0 || c[5] != 0) return 8;
+    if (sizeof w / sizeof w[0] != 3 || w[1] != L'i' || w[2] != 0) return 9;
+    if (cl[0] != 'h' || cl[1] != 'i' || cl[2] != 0) return 10;
+    if (as.tag[1] != 'd' || as.tag[2] != 0 || as.n != 9) return 11;
+
+    if (sizeof((char[]){"abcd"}) != 5) return 12;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c99_string_literal_initializer_may_be_braced", code, &[]),
+        0
+    );
+}
+
+/// C17 6.7.9p14: an array of character type may be exactly as long as the
+/// string literal initializing it, in which case the terminating null is
+/// dropped rather than written. `char b[2] = "hi"` holds two characters.
+///
+/// The store loop wrote the null unconditionally, one byte past the object.
+/// Pre-existing for the unbraced spelling; the braced one reached the same
+/// loop once the two shared a routine.
+#[test]
+fn c99_string_initializer_exactly_fills_its_array() {
+    let code = r#"
+#include <string.h>
+
+char g2[2] = "hi";
+char g3[3] = "hi";
+char gb2[2] = {"hi"};
+
+int main(void) {
+    /* Neighbours on the stack must survive an exactly-sized copy. */
+    char before[4];
+    char b2[2] = "hi";
+    char bb2[2] = {"hi"};
+    char after[4];
+    memset(before, 0x5a, sizeof before);
+    memset(after, 0x5a, sizeof after);
+
+    if (sizeof b2 != 2 || b2[0] != 'h' || b2[1] != 'i') return 1;
+    if (sizeof bb2 != 2 || bb2[0] != 'h' || bb2[1] != 'i') return 2;
+    for (int i = 0; i < 4; i++) {
+        if (before[i] != 0x5a) return 3;
+        if (after[i] != 0x5a) return 4;
+    }
+
+    if (sizeof g2 != 2 || g2[0] != 'h' || g2[1] != 'i') return 5;
+    if (sizeof gb2 != 2 || gb2[0] != 'h' || gb2[1] != 'i') return 6;
+
+    /* One byte longer, so the terminator is written and the rest zeroed. */
+    if (sizeof g3 != 3 || g3[2] != 0) return 7;
+    char b6[6] = "hi";
+    if (sizeof b6 != 6 || b6[2] != 0 || b6[5] != 0) return 8;
+
+    /* And an inferred bound still makes room for it. */
+    char inferred[] = "hi";
+    if (sizeof inferred != 3 || inferred[2] != 0) return 9;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c99_string_initializer_exactly_fills_its_array", code, &[]),
+        0
+    );
+}

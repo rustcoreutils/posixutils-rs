@@ -376,6 +376,31 @@ fn posix_v8_environment_support_variables_are_answered() {
     }
 }
 
+/// The multi-threaded programming environment's flags (c17, Table 3-6).
+///
+/// Orthogonal to the four type-size environments, and mandated alongside them
+/// since Issue 8. Unlike those, there is no host query behind these: glibc
+/// declares no `_CS_POSIX_V*_THREADS_*`, its own `getconf` calls both names
+/// unrecognized, and Darwin's `confstr` stops at Issue 6. So the value is a
+/// fixed string of ours, and the test asserts the string rather than agreement
+/// with a V7 spelling that would only be comparing our table against itself.
+#[test]
+fn posix_v8_threads_environment_flags_are_answered() {
+    for var in [
+        "POSIX_V8_THREADS_CFLAGS",
+        "POSIX_V8_THREADS_LDFLAGS",
+        "POSIX_V7_THREADS_CFLAGS",
+        "POSIX_V7_THREADS_LDFLAGS",
+    ] {
+        let got = getconf_output(var);
+        assert_eq!(
+            got.trim_end_matches('\n'),
+            "-pthread",
+            "{var} should report the threading flags, got {got:?}"
+        );
+    }
+}
+
 /// Run `getconf VAR` and return its stdout, or the error text if it failed.
 fn getconf_output(var: &str) -> String {
     let plan = TestPlan {

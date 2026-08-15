@@ -93,6 +93,10 @@ impl<'a> super::linearize::Linearizer<'a> {
                             self.current_pos.unwrap_or_default(),
                             "'return' with no value in a function returning non-void",
                         ),
+                        // 6.8.6.4p3 converts the value "as if by assignment",
+                        // so the simple-assignment constraints of 6.5.16.1
+                        // govern it and are asked in exactly the same words.
+                        Some(e) if !returns_void => self.check_return_type(rt, e),
                         _ => {}
                     }
                 }
@@ -322,32 +326,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     // scalar case below and stored the literal's *address*
                     // into the array's first element.
                     if self.types.kind(typ) == TypeKind::Array {
-                        let default_elem = match init.kind {
-                            ExprKind::StringLit(_) => self.types.char_id,
-                            _ => self.types.int_id,
-                        };
-                        let elem_type = self.types.base_type(typ).unwrap_or(default_elem);
-                        let elem_size = self.types.size_bits(elem_type);
-                        let elem_bytes = (elem_size / 8) as i64;
-
-                        for (i, unit) in units.iter().enumerate() {
-                            let val = self.emit_const(*unit, elem_type);
-                            self.emit(Instruction::store(
-                                val,
-                                sym_id,
-                                (i as i64) * elem_bytes,
-                                elem_type,
-                                elem_size,
-                            ));
-                        }
-                        let null_val = self.emit_const(0, elem_type);
-                        self.emit(Instruction::store(
-                            null_val,
-                            sym_id,
-                            (units.len() as i64) * elem_bytes,
-                            elem_type,
-                            elem_size,
-                        ));
+                        self.store_string_units(sym_id, 0, typ, &init.kind, &units);
                     } else {
                         // Pointer initialized with a string literal — store the address
                         let val = self.linearize_expr(init);
@@ -613,6 +592,34 @@ impl<'a> super::linearize::Linearizer<'a> {
     }
 
     /// Linearize an initializer list for arrays or structs
+    /// Check a returned value against the function's declared return type
+    /// (C17 6.8.6.4p3, whose constraints are 6.5.16.1's).
+    fn check_return_type(&mut self, declared: TypeId, expr: &Expr) {
+        let value = self.expr_type(expr);
+        let null_constant =
+            self.types.kind(value) != TypeKind::Pointer && self.eval_const_expr(expr) == Some(0);
+        let Some(fault) = self.types.assignment_fault(declared, value, null_constant) else {
+            return;
+        };
+        let (d_name, v_name) = (
+            self.types.format_type(declared, Some(self.strings)),
+            self.types.format_type(value, Some(self.strings)),
+        );
+        if fault.is_error() {
+            crate::diag::error_args(
+                expr.pos,
+                "incompatible types returning '{0}' from a function returning '{1}'",
+                &[&v_name, &d_name],
+            );
+        } else {
+            crate::diag::warning_args(
+                expr.pos,
+                "returning '{0}' from a function with return type '{1}' {2}",
+                &[&v_name, &d_name, fault.describe()],
+            );
+        }
+    }
+
     pub(crate) fn linearize_init_list(
         &mut self,
         base_sym: PseudoId,
@@ -633,6 +640,29 @@ impl<'a> super::linearize::Linearizer<'a> {
         match self.types.kind(typ) {
             TypeKind::Array => {
                 let elem_type = self.types.base_type(typ).unwrap_or(self.types.int_id);
+
+                // `char b[] = {"hi"}` initializes *this* array with the
+                // string (C17 6.7.9p14). Read as an ordinary element list it
+                // was one element, so nothing was copied in. The nested form,
+                // `char names[3][4] = {"Sun", "Mon"}`, was already handled
+                // below; only the outermost level was missing.
+                if self.types.is_integer(elem_type) {
+                    if let [only] = elements {
+                        if only.designators.is_empty() {
+                            if let Some(units) = Self::string_literal_units(&only.value.kind) {
+                                self.store_string_units(
+                                    base_sym,
+                                    base_offset,
+                                    typ,
+                                    &only.value.kind,
+                                    &units,
+                                );
+                                return;
+                            }
+                        }
+                    }
+                }
+
                 let elem_size = self.types.size_bits(elem_type) / 8;
                 let elem_is_aggregate = matches!(
                     self.types.kind(elem_type),
@@ -1336,6 +1366,64 @@ impl<'a> super::linearize::Linearizer<'a> {
     ///
     /// C99 6.6 defines integer constant expressions. This function evaluates
     /// expressions that can be computed at compile time.
+    /// Copy a string literal's code units into an array object, followed by
+    /// its null terminator.
+    ///
+    /// Shared by the two ways a string can initialize an array: written
+    /// directly (`char b[] = "hi"`) or enclosed in braces
+    /// (`char b[] = {"hi"}`, C17 6.7.9p14). They used to be separate code, and
+    /// only the first one worked.
+    pub(crate) fn store_string_units(
+        &mut self,
+        base_sym: PseudoId,
+        base_offset: i64,
+        arr_typ: TypeId,
+        kind: &ExprKind,
+        units: &[i128],
+    ) {
+        let default_elem = match kind {
+            ExprKind::StringLit(_) => self.types.char_id,
+            _ => self.types.int_id,
+        };
+        let elem_type = self.types.base_type(arr_typ).unwrap_or(default_elem);
+        let elem_size = self.types.size_bits(elem_type);
+        let elem_bytes = (elem_size / 8) as i64;
+
+        // C17 6.7.9p14 lets an array be exactly as long as the string, in
+        // which case the terminating null is dropped rather than written --
+        // `char b[2] = "hi"` holds two characters and no terminator. Writing
+        // it unconditionally put one byte past the end of the object.
+        //
+        // An array with no size yet takes it from this initializer, so it
+        // always has room.
+        let capacity = self
+            .types
+            .array_size(arr_typ)
+            .filter(|&n| n > 0)
+            .unwrap_or(units.len() + 1);
+
+        for (i, unit) in units.iter().enumerate().take(capacity) {
+            let val = self.emit_const(*unit, elem_type);
+            self.emit(Instruction::store(
+                val,
+                base_sym,
+                base_offset + (i as i64) * elem_bytes,
+                elem_type,
+                elem_size,
+            ));
+        }
+        if units.len() < capacity {
+            let null_val = self.emit_const(0, elem_type);
+            self.emit(Instruction::store(
+                null_val,
+                base_sym,
+                base_offset + (units.len() as i64) * elem_bytes,
+                elem_type,
+                elem_size,
+            ));
+        }
+    }
+
     /// The code units a string literal contributes to an array initializer,
     /// or `None` if this is not a string literal.
     ///

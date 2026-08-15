@@ -73,6 +73,15 @@ Behaviours where c17 differs from gcc on the same source. None is a
 translation-limit or a diagnostic gap; each silently changes what the program
 does or claims.
 
+_Constraint diagnostics used to belong here. As of 2026-08-15 a 35-case matrix
+-- 21 constraint violations and 14 accept-side controls -- agrees with
+`gcc -std=c17` on every row; see #C45-#C49 in `cc/audit.md`. Two divergences are
+deliberate and remain: `return` with a value in a `void` function, and a bare
+`return` in a non-`void` one, are errors here and warnings in gcc, both being
+genuine 6.8.6.4 violations. And `__attribute__((transparent_union))` is
+unimplemented, so an argument matching any member of a union parameter is
+accepted rather than checked (#C51)._
+
 | Area | Divergence |
 |------|-----------|
 | `_FORTIFY_SOURCE` | Still checks nothing. Five of six layers are done; the one that remains is described above, and is an ordinary compiler feature rather than fortify-specific work |

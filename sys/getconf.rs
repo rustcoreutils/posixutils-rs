@@ -740,6 +740,34 @@ fn lookup_limit_constant(var: &str) -> Option<i64> {
     }
 }
 
+/// Look up a programming-environment variable whose value is a fixed string
+/// rather than a `confstr`, `sysconf`, or `pathconf` query.
+///
+/// The c17 utility description (Table 3-6, 88169-88179) requires `getconf` to
+/// answer the flags for the multi-threaded programming environment, which is
+/// orthogonal to the four type-size environments. There is no `confstr` key to
+/// delegate to: glibc declares no `_CS_POSIX_V*_THREADS_*` constant, its own
+/// `getconf` reports these names as unrecognized, and Darwin's `confstr` never
+/// grew past Issue 6. So the value is ours to state.
+///
+/// `-pthread` is correct on every toolchain this runs on -- GCC and Clang both
+/// accept it as a compile flag and as a link flag -- and it is never wrong to
+/// pass. The RATIONALE (88350-88359) also permits a null string here, on the
+/// grounds that a single-threaded application may be a special case of a
+/// multi-threaded one; that is true of glibc since 2.34, but an empty answer
+/// tells a build nothing, whereas `-pthread` keeps working on the toolchains
+/// where threading still needs the flag.
+fn lookup_string_constant(var: &str) -> Option<&'static str> {
+    match var {
+        // POSIX.1-2024 spelling, and the Issue 7 spelling it renamed.
+        "POSIX_V8_THREADS_CFLAGS"
+        | "POSIX_V8_THREADS_LDFLAGS"
+        | "POSIX_V7_THREADS_CFLAGS"
+        | "POSIX_V7_THREADS_LDFLAGS" => Some("-pthread"),
+        _ => None,
+    }
+}
+
 /// The sysconf queries for the four programming environments (c17,
 /// 88106-88176), under every issue's spelling.
 ///
@@ -1014,6 +1042,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         handle_pathconf(&args.var, &pathname, &pathconf_mappings)?;
     } else if let Some(value) = lookup_limit_constant(&args.var) {
         // <limits.h> compile-time Maximum/Minimum value (#G2).
+        println!("{}", value);
+    } else if let Some(value) = lookup_string_constant(&args.var) {
+        // Multi-threaded programming environment flags (c17, Table 3-6).
+        // Ahead of the confstr table so the answer is the same on every
+        // platform, rather than varying with what the host happens to define.
         println!("{}", value);
     } else {
         let confstr_mappings = load_confstr_mapping();

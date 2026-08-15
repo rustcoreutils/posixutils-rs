@@ -953,6 +953,30 @@ impl<'a> super::linearize::Linearizer<'a> {
         match type_kind {
             TypeKind::Array => {
                 let elem_type = self.types.base_type(typ).unwrap_or(self.types.int_id);
+
+                // `char b[] = {"hi"}` -- C17 6.7.9p14 lets the string literal
+                // initializing a character array be enclosed in braces, and it
+                // still initializes *this* array. Treated as an ordinary
+                // element list it became one element, so the characters were
+                // never copied in and the array held whatever a truncated
+                // pointer left behind. The same look-through already exists
+                // one level down for `char names[3][4] = {"Sun", "Mon"}`.
+                if self.types.is_integer(elem_type) {
+                    if let [only] = elements {
+                        if only.designators.is_empty()
+                            && matches!(
+                                only.value.kind,
+                                ExprKind::StringLit(_)
+                                    | ExprKind::WideStringLit(_)
+                                    | ExprKind::Utf16StringLit(_)
+                                    | ExprKind::Utf32StringLit(_)
+                            )
+                        {
+                            return self.ast_init_to_ir(&only.value, typ);
+                        }
+                    }
+                }
+
                 let elem_size = (self.types.size_bits(elem_type) / 8) as usize;
                 let elem_is_aggregate = matches!(
                     self.types.kind(elem_type),

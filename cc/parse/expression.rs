@@ -12,11 +12,11 @@
 use super::ast::{
     AssignOp, BinaryOp, Designator, Expr, ExprKind, FpTest, InitElement, OffsetOfPath, UnaryOp,
 };
-use super::parser::{ParseError, ParseResult, Parser};
+use super::parser::{DeclaratorName, ParseError, ParseResult, Parser};
 use crate::diag;
 use crate::float::FloatVal;
 use crate::strings::StringId;
-use crate::symbol::{Namespace, Symbol, SymbolId};
+use crate::symbol::{Namespace, Symbol, SymbolId, SymbolKind};
 use crate::token::lexer::{Position, SpecialToken, TokenType, TokenValue};
 use crate::types::{Type, TypeId, TypeKind, TypeModifiers};
 use gettextrs::gettext;
@@ -118,10 +118,14 @@ impl<'a> Parser<'a> {
             self.advance();
 
             // Check if target is const (assignment to const is an error)
+            self.check_modifiable_lvalue(&left, "left operand of assignment", assign_pos);
             self.check_const_assignment(&left, assign_pos);
 
             // Right-to-left associativity: parse the right side as another assignment
             let right = self.parse_assignment_expr()?;
+            if assign_op == AssignOp::Assign {
+                self.check_assignment_types(&left, &right, assign_pos);
+            }
             // In C, assignment expression type is the type of the left operand
             let assign_type = left.typ.unwrap_or(self.types.int_id);
             Ok(Self::typed_expr(
@@ -286,14 +290,7 @@ impl<'a> Parser<'a> {
     /// Apply the array-to-pointer and function-to-pointer decays of C17
     /// 6.3.2.1p3-4. Qualifiers are left alone.
     pub(crate) fn decayed_type(&mut self, typ: TypeId) -> TypeId {
-        match self.types.kind(typ) {
-            TypeKind::Array => {
-                let elem = self.types.base_type(typ).unwrap_or(self.types.char_id);
-                self.types.intern(Type::pointer(elem))
-            }
-            TypeKind::Function => self.types.intern(Type::pointer(typ)),
-            _ => typ,
-        }
+        self.types.decayed(typ)
     }
 
     /// The type an lvalue expression has after lvalue conversion: decayed as
@@ -335,6 +332,16 @@ impl<'a> Parser<'a> {
             // Apply array-to-pointer and function-to-pointer decay (C99 6.3.2.1)
             let then_typ = then_expr.typ.unwrap_or(self.types.int_id);
             let else_typ = else_expr.typ.unwrap_or(self.types.int_id);
+
+            // C17 6.5.15p3: either both arms have type void, or neither does.
+            // A mismatch means one arm has no value for the expression to
+            // take, which used to compile as whichever type came first.
+            let then_void = self.types.kind(then_typ) == TypeKind::Void;
+            let else_void = self.types.kind(else_typ) == TypeKind::Void;
+            if then_void != else_void {
+                let culprit = if then_void { &then_expr } else { &else_expr };
+                self.check_not_void(culprit, culprit.pos);
+            }
 
             // Decay arrays to pointers, functions to pointer-to-function
             let then_decayed = self.decayed_type(then_typ);
@@ -564,6 +571,7 @@ impl<'a> Parser<'a> {
             self.advance();
             let operand = self.parse_unary_expr()?;
             // Check for const modification
+            self.check_modifiable_lvalue(&operand, "increment operand", op_pos);
             self.check_const_assignment(&operand, op_pos);
             // PreInc has same type as operand
             let typ = operand.typ.unwrap_or(self.types.int_id);
@@ -582,6 +590,7 @@ impl<'a> Parser<'a> {
             self.advance();
             let operand = self.parse_unary_expr()?;
             // Check for const modification
+            self.check_modifiable_lvalue(&operand, "decrement operand", op_pos);
             self.check_const_assignment(&operand, op_pos);
             // PreDec has same type as operand
             let typ = operand.typ.unwrap_or(self.types.int_id);
@@ -599,6 +608,7 @@ impl<'a> Parser<'a> {
             let op_pos = self.current_pos();
             self.advance();
             let operand = self.parse_unary_expr()?;
+            self.check_addressable(&operand, op_pos);
             // AddrOf produces pointer to operand's type
             let base_type = operand.typ.unwrap_or(self.types.int_id);
             let ptr_type = self.types.intern(Type::pointer(base_type));
@@ -885,19 +895,6 @@ impl<'a> Parser<'a> {
         mods
     }
 
-    /// Parse a chain of pointer declarators with optional qualifiers
-    /// e.g., `* const * volatile *` returns the final pointer type
-    fn parse_pointer_chain(&mut self, mut base_type: TypeId) -> TypeId {
-        while self.is_special(b'*') {
-            self.advance();
-            let ptr_mods = self.consume_type_qualifiers();
-            let mut ptr_type = Type::pointer(base_type);
-            ptr_type.modifiers |= ptr_mods;
-            base_type = self.types.intern(ptr_type);
-        }
-        base_type
-    }
-
     /// Apply trailing qualifiers to a type and return the qualified type id
     /// Used for patterns like "struct foo const *" where const comes after the struct
     fn apply_trailing_qualifiers(&mut self, base_type: TypeId) -> TypeId {
@@ -919,7 +916,37 @@ impl<'a> Parser<'a> {
 
     /// Try to parse a type name for casts and sizeof
     /// Supports compound types like `unsigned char`, `long long`, pointers, etc.
+    /// Parse a type-name: a specifier-qualifier list followed by an optional
+    /// abstract declarator (C17 6.7.7). Speculative -- the caller uses it to
+    /// tell `(type)expr` from `(expr)`, so a failure rewinds and answers
+    /// `None` rather than reporting anything.
+    ///
+    /// The abstract declarator goes through `parse_declarator`, the same
+    /// parser every other declarator uses. This file used to carry its own,
+    /// which recognised exactly one shape -- `(*)(params)` -- and backtracked
+    /// on everything else, so `int (*)[3]`, `int (**)(void)` and
+    /// `int (*[4])(void)` were not type-names at all: `sizeof(int (*)[3])` and
+    /// the cast `(int(*)[3])0` were parse errors. An abstract declarator is
+    /// just a declarator whose identifier is absent, which `parse_declarator`
+    /// already represents as `StringId::EMPTY`, so there was never a reason
+    /// for a second implementation.
     pub(crate) fn try_parse_type_name(&mut self) -> Option<TypeId> {
+        let saved_pos = self.pos;
+        let base = self.try_parse_specifier_qualifier_list()?;
+
+        match self.parse_declarator(base, DeclaratorName::Optional) {
+            // An abstract declarator names nothing. A name here means this was
+            // never a type-name, so let the caller try it as an expression.
+            Ok((name, typ, _vla, _params)) if name == StringId::EMPTY => Some(typ),
+            _ => {
+                self.pos = saved_pos;
+                None
+            }
+        }
+    }
+
+    /// The specifier-qualifier list of a type-name, without its declarator.
+    fn try_parse_specifier_qualifier_list(&mut self) -> Option<TypeId> {
         if self.peek() != TokenType::Ident {
             return None;
         }
@@ -993,7 +1020,7 @@ impl<'a> Parser<'a> {
                             ..inner
                         };
                         let result_id = self.types.intern(result);
-                        return Some(self.parse_pointer_chain(result_id));
+                        return Some(result_id);
                     } else {
                         // Qualifier form: just _Atomic
                         modifiers |= TypeModifiers::ATOMIC;
@@ -1127,7 +1154,7 @@ impl<'a> Parser<'a> {
                             return None;
                         }
                         self.advance(); // consume ')'
-                        return Some(self.parse_pointer_chain(typ));
+                        return Some(typ);
                     }
 
                     // Not a type name, try expression
@@ -1141,7 +1168,7 @@ impl<'a> Parser<'a> {
                     self.advance(); // consume ')'
 
                     let expr_type = expr.typ.unwrap_or(self.types.int_id);
-                    return Some(self.parse_pointer_chain(expr_type));
+                    return Some(expr_type);
                 }
                 crate::kw::STRUCT => {
                     self.advance(); // consume 'struct'
@@ -1151,24 +1178,7 @@ impl<'a> Parser<'a> {
                             // This is a tag reference (e.g., "struct Point*")
                             self.advance(); // consume tag name
                             if let Some(existing) = self.symbols.lookup_tag(tag_name) {
-                                let result_id = self.apply_trailing_qualifiers(existing.typ);
-                                let mut result_id = self.parse_pointer_chain(result_id);
-                                // Handle array declarators
-                                while self.is_special(b'[') {
-                                    self.advance();
-                                    if let Ok(size_expr) = self.parse_conditional_expr() {
-                                        if let Some(size) = self.eval_const_expr(&size_expr) {
-                                            result_id = self
-                                                .types
-                                                .intern(Type::array(result_id, size as usize));
-                                        }
-                                    }
-                                    if !self.is_special(b']') {
-                                        return None;
-                                    }
-                                    self.advance();
-                                }
-                                return Some(result_id);
+                                return Some(self.apply_trailing_qualifiers(existing.typ));
                             }
                             // Tag not found - create incomplete struct type and register it
                             // This ensures that when the struct is later defined, we can update
@@ -1178,7 +1188,7 @@ impl<'a> Parser<'a> {
                             let result_id = self.types.intern(incomplete);
                             let sym = Symbol::tag(tag_name, result_id, self.symbols.depth());
                             let _ = self.symbols.declare(sym);
-                            return Some(self.parse_pointer_chain(result_id));
+                            return Some(result_id);
                         }
                     }
                     // Fall back to full struct parsing for definitions
@@ -1186,23 +1196,7 @@ impl<'a> Parser<'a> {
                     if let Ok(struct_type) = self.parse_struct_or_union_specifier(false) {
                         let mut typ = struct_type;
                         typ.modifiers |= modifiers | self.consume_type_qualifiers();
-                        let mut result_id = self.types.intern(typ);
-                        result_id = self.parse_pointer_chain(result_id);
-                        // Handle array declarators
-                        while self.is_special(b'[') {
-                            self.advance();
-                            if let Ok(size_expr) = self.parse_conditional_expr() {
-                                if let Some(size) = self.eval_const_expr(&size_expr) {
-                                    result_id =
-                                        self.types.intern(Type::array(result_id, size as usize));
-                                }
-                            }
-                            if !self.is_special(b']') {
-                                return None;
-                            }
-                            self.advance();
-                        }
-                        return Some(result_id);
+                        return Some(self.types.intern(typ));
                     }
                     return None;
                 }
@@ -1214,24 +1208,7 @@ impl<'a> Parser<'a> {
                             // This is a tag reference
                             self.advance(); // consume tag name
                             if let Some(existing) = self.symbols.lookup_tag(tag_name) {
-                                let result_id = self.apply_trailing_qualifiers(existing.typ);
-                                let mut result_id = self.parse_pointer_chain(result_id);
-                                // Handle array declarators
-                                while self.is_special(b'[') {
-                                    self.advance();
-                                    if let Ok(size_expr) = self.parse_conditional_expr() {
-                                        if let Some(size) = self.eval_const_expr(&size_expr) {
-                                            result_id = self
-                                                .types
-                                                .intern(Type::array(result_id, size as usize));
-                                        }
-                                    }
-                                    if !self.is_special(b']') {
-                                        return None;
-                                    }
-                                    self.advance();
-                                }
-                                return Some(result_id);
+                                return Some(self.apply_trailing_qualifiers(existing.typ));
                             }
                             // Tag not found - create incomplete union type and register it
                             // This ensures that when the union is later defined, we can update
@@ -1241,7 +1218,7 @@ impl<'a> Parser<'a> {
                             let result_id = self.types.intern(incomplete);
                             let sym = Symbol::tag(tag_name, result_id, self.symbols.depth());
                             let _ = self.symbols.declare(sym);
-                            return Some(self.parse_pointer_chain(result_id));
+                            return Some(result_id);
                         }
                     }
                     // Fall back to full union parsing for definitions
@@ -1249,23 +1226,7 @@ impl<'a> Parser<'a> {
                     if let Ok(union_type) = self.parse_struct_or_union_specifier(true) {
                         let mut typ = union_type;
                         typ.modifiers |= modifiers | self.consume_type_qualifiers();
-                        let mut result_id = self.types.intern(typ);
-                        result_id = self.parse_pointer_chain(result_id);
-                        // Handle array declarators
-                        while self.is_special(b'[') {
-                            self.advance();
-                            if let Ok(size_expr) = self.parse_conditional_expr() {
-                                if let Some(size) = self.eval_const_expr(&size_expr) {
-                                    result_id =
-                                        self.types.intern(Type::array(result_id, size as usize));
-                                }
-                            }
-                            if !self.is_special(b']') {
-                                return None;
-                            }
-                            self.advance();
-                        }
-                        return Some(result_id);
+                        return Some(self.types.intern(typ));
                     }
                     return None;
                 }
@@ -1273,23 +1234,7 @@ impl<'a> Parser<'a> {
                     if let Ok(enum_type) = self.parse_enum_specifier() {
                         let mut typ = enum_type;
                         typ.modifiers |= modifiers | self.consume_type_qualifiers();
-                        let mut result_id = self.types.intern(typ);
-                        result_id = self.parse_pointer_chain(result_id);
-                        // Handle array declarators
-                        while self.is_special(b'[') {
-                            self.advance();
-                            if let Ok(size_expr) = self.parse_conditional_expr() {
-                                if let Some(size) = self.eval_const_expr(&size_expr) {
-                                    result_id =
-                                        self.types.intern(Type::array(result_id, size as usize));
-                                }
-                            }
-                            if !self.is_special(b']') {
-                                return None;
-                            }
-                            self.advance();
-                        }
-                        return Some(result_id);
+                        return Some(self.types.intern(typ));
                     }
                     return None;
                 }
@@ -1316,7 +1261,7 @@ impl<'a> Parser<'a> {
         }
 
         // Get the base type - either from typedef or from built-in type specifiers
-        let mut result_id = if let Some(typedef_type_id) = typedef_base {
+        let result_id = if let Some(typedef_type_id) = typedef_base {
             // Drop the TYPEDEF bit either way. It records how the name was
             // *declared*, not anything about the type, and leaving it on made a
             // typedef's type differ from the type it aliases -- so
@@ -1340,65 +1285,6 @@ impl<'a> Parser<'a> {
             self.types.intern(typ)
         };
 
-        // Handle pointer declarators
-        result_id = self.parse_pointer_chain(result_id);
-
-        // Handle function pointer declarators: void (*)(int), int (*)(void), etc.
-        // Syntax: return_type (*)(param_types)
-        if self.is_special(b'(') {
-            // Look ahead to check for (*) pattern indicating function pointer
-            let saved_pos = self.pos;
-            self.advance(); // consume '('
-            if self.is_special(b'*') {
-                self.advance(); // consume '*'
-                if self.is_special(b')') {
-                    self.advance(); // consume ')'
-                                    // Now expect parameter list
-                    if self.is_special(b'(') {
-                        self.advance(); // consume '('
-                                        // Parse parameter types properly
-                        if let Ok((raw_params, variadic)) = self.parse_parameter_list() {
-                            if !self.is_special(b')') {
-                                return None;
-                            }
-                            self.advance(); // consume final ')'
-                                            // Create function pointer type with actual parameter types
-                            let param_type_ids: Vec<TypeId> =
-                                raw_params.iter().map(|p| p.typ).collect();
-                            let fn_type =
-                                Type::function(result_id, param_type_ids, variadic, false);
-                            let fn_type_id = self.types.intern(fn_type);
-                            result_id = self.types.intern(Type::pointer(fn_type_id));
-                            return Some(result_id);
-                        }
-                    }
-                }
-            }
-            // Not a function pointer, backtrack
-            self.pos = saved_pos;
-        }
-
-        // Handle array declarators: int[10], char[20], int[], etc.
-        while self.is_special(b'[') {
-            self.advance();
-            // Check for empty brackets [] (incomplete array type for compound literals)
-            if self.is_special(b']') {
-                // Empty brackets - create array with size 0 (size to be determined from initializer)
-                result_id = self.types.intern(Type::array(result_id, 0));
-            } else if let Ok(size_expr) = self.parse_conditional_expr() {
-                if let Some(size) = self.eval_const_expr(&size_expr) {
-                    result_id = self.types.intern(Type::array(result_id, size as usize));
-                } else {
-                    // Non-constant size (VLA in type name) - create array with size 0
-                    result_id = self.types.intern(Type::array(result_id, 0));
-                }
-            }
-            if !self.is_special(b']') {
-                return None;
-            }
-            self.advance();
-        }
-
         Some(result_id)
     }
 
@@ -1414,6 +1300,7 @@ impl<'a> Parser<'a> {
                 let op_pos = self.current_pos();
                 self.advance();
                 // Check for const modification
+                self.check_modifiable_lvalue(&expr, "increment operand", op_pos);
                 self.check_const_assignment(&expr, op_pos);
                 // PostInc has same type as operand
                 let typ = expr.typ.unwrap_or(self.types.int_id);
@@ -1422,6 +1309,7 @@ impl<'a> Parser<'a> {
                 let op_pos = self.current_pos();
                 self.advance();
                 // Check for const modification
+                self.check_modifiable_lvalue(&expr, "decrement operand", op_pos);
                 self.check_const_assignment(&expr, op_pos);
                 // PostDec has same type as operand
                 let typ = expr.typ.unwrap_or(self.types.int_id);
@@ -1431,6 +1319,7 @@ impl<'a> Parser<'a> {
                 self.advance();
                 let index = self.parse_expression()?;
                 self.expect_special(b']')?;
+                self.check_subscript(&expr, &index, base_pos);
                 // Get element type from array/pointer type
                 let elem_type = expr
                     .typ
@@ -1527,6 +1416,7 @@ impl<'a> Parser<'a> {
                 let args = self.parse_argument_list()?;
                 self.expect_special(b')')?;
                 self.check_call_arity(&expr, &args, call_pos);
+                self.check_argument_types(&expr, &args);
 
                 // Get the return type from the function type
                 // The func expression should have type TypeKind::Function
@@ -1696,20 +1586,14 @@ impl<'a> Parser<'a> {
     /// position left points at whichever sub-expression was lowered last.
     fn check_call_arity(&self, callee: &Expr, args: &[Expr], call_pos: Position) {
         // Resolve through a function pointer, as the return-type logic does.
-        let func_type = callee.typ.and_then(|t| match self.types.kind(t) {
-            TypeKind::Function => Some(t),
-            TypeKind::Pointer => self
-                .types
-                .base_type(t)
-                .filter(|&b| self.types.kind(b) == TypeKind::Function),
-            _ => None,
-        });
-        let Some(func_type) = func_type else { return };
+        let Some(func_type) = self.resolved_function_type(callee) else {
+            return;
+        };
 
-        // `params == None` means no prototype is visible: either an
-        // unprototyped K&R declaration, where no check is permitted, or an
-        // undeclared callee, which already produced its own diagnostic and
-        // carries a dummy `int` type.
+        // `params == None` means no prototype is visible: `int f();`, a K&R
+        // identifier list -- neither of which C17 6.5.2.2p1 permits a check
+        // against -- or an undeclared callee, which already produced its own
+        // diagnostic and carries a dummy `int` type.
         let ft = self.types.get(func_type);
         let Some(params) = ft.params.as_ref() else {
             return;
@@ -1718,17 +1602,6 @@ impl<'a> Parser<'a> {
 
         let variadic = ft.variadic;
 
-        // `int f(void)` and `int f()` both intern as an empty parameter list,
-        // but they mean opposite things: the first takes no arguments, the
-        // second leaves them unspecified and accepts any number. Telling them
-        // apart needs a "no prototype" marker on the function type, which the
-        // ABI, inliner and linearizer all read — too much reach for one
-        // diagnostic. So the zero-parameter case is skipped, and
-        // `int f(void); f(1);` goes undiagnosed. Every prototype with at least
-        // one parameter is checked.
-        if required == 0 && !variadic {
-            return;
-        }
         let wrong = if variadic {
             args.len() < required
         } else {
@@ -1753,6 +1626,141 @@ impl<'a> Parser<'a> {
             required,
             &[&expected, &args.len().to_string()],
         );
+    }
+
+    /// Check each argument against its parameter's type.
+    ///
+    /// C17 6.5.2.2p2 requires an argument to be assignable to its parameter,
+    /// so the constraints are the assignment ones and this asks the same
+    /// question -- only the wording differs, naming the position gcc names.
+    ///
+    /// Arguments past a prototype's fixed parameters get the default argument
+    /// promotions instead (p7), and an unprototyped callee has nothing to
+    /// check against, so both are skipped.
+    fn check_argument_types(&mut self, callee: &Expr, args: &[Expr]) {
+        let Some(func_type) = self.resolved_function_type(callee) else {
+            return;
+        };
+        let Some(params) = self.types.get(func_type).params.clone() else {
+            return;
+        };
+        for (i, (arg, &param)) in args.iter().zip(params.iter()).enumerate() {
+            let (Some(a), param) = (arg.typ, param) else {
+                continue;
+            };
+            let a = self.decayed_type(a);
+            let param = self.decayed_type(param);
+            let Some(fault) =
+                self.types
+                    .assignment_fault(param, a, self.is_null_pointer_constant(arg))
+            else {
+                continue;
+            };
+            // glibc declares the socket calls with a union parameter carrying
+            // __attribute__((transparent_union)), which lets a caller pass any
+            // one of its member types -- `sendto(..., SAS2SA(&addr), ...)`
+            // hands a `struct sockaddr *` to a `__CONST_SOCKADDR_ARG`. c17
+            // does not record that attribute, so it cannot tell a transparent
+            // union from an ordinary one, and rejecting the call would refuse
+            // every socket program on the platform. Accepting an argument that
+            // matches some member is the safe direction: it under-diagnoses an
+            // ordinary union parameter, which is rare, rather than rejecting
+            // valid code, which is not. Assignment and `return` stay strict --
+            // the attribute governs calls only.
+            if self.argument_matches_union_member(param, a) {
+                continue;
+            }
+            let (p_name, a_name) = (
+                self.types.format_type(param, Some(self.idents)),
+                self.types.format_type(a, Some(self.idents)),
+            );
+            let n = (i + 1).to_string();
+            if fault.is_error() {
+                diag::error_args(
+                    arg.pos,
+                    "incompatible type for argument {0}: expected '{1}', got '{2}'",
+                    &[&n, &p_name, &a_name],
+                );
+            } else {
+                diag::warning_args(
+                    arg.pos,
+                    "passing argument {0} as '{1}' from '{2}' {3}",
+                    &[&n, &p_name, &a_name, fault.describe()],
+                );
+            }
+        }
+    }
+
+    /// Check a subscript's operands (C17 6.5.2.1p1): one must be a pointer to
+    /// a complete object type and the other an integer.
+    ///
+    /// `a[i]` is defined as `*(a + i)`, so it is symmetric -- `3[arr]` is
+    /// legal C and has to stay so.
+    fn check_subscript(&self, base: &Expr, index: &Expr, pos: Position) {
+        let (Some(b), Some(i)) = (base.typ, index.typ) else {
+            return;
+        };
+        let points = |t: TypeId| matches!(self.types.kind(t), TypeKind::Pointer | TypeKind::Array);
+        let integral = |t: TypeId| self.types.is_integer(t);
+        // Symmetric, because `a[i]` is defined as `*(a + i)`: `0[arr]` is
+        // legal C. But exactly one side may be the pointer -- `p[q]` with two
+        // pointers has nothing to scale by.
+        if (points(b) && integral(i)) || (points(i) && integral(b)) {
+            return;
+        }
+        if points(b) || points(i) {
+            diag::error(pos, &gettext("array subscript is not an integer"));
+        } else {
+            diag::error(
+                pos,
+                &gettext("subscripted value is neither array nor pointer"),
+            );
+        }
+    }
+
+    /// Reject a `void` operand where a value is required (C17 6.5.6p2 for the
+    /// binary operators, 6.5.15p3 for the conditional).
+    ///
+    /// gcc words this the same way for every such context, and the wording is
+    /// the useful part: the problem is not the type but that there is no value
+    /// at all.
+    fn check_not_void(&self, operand: &Expr, pos: Position) -> bool {
+        let is_void = operand
+            .typ
+            .is_some_and(|t| self.types.kind(t) == TypeKind::Void);
+        if is_void {
+            diag::error(pos, &gettext("void value not ignored as it ought to be"));
+        }
+        is_void
+    }
+
+    /// Does this argument's type match some member of a union parameter?
+    ///
+    /// Stands in for `__attribute__((transparent_union))`, which c17 does not
+    /// record. See the call site for why the approximation is the safe one.
+    fn argument_matches_union_member(&self, param: TypeId, arg: TypeId) -> bool {
+        if self.types.kind(param) != TypeKind::Union {
+            return false;
+        }
+        let Some(comp) = self.types.composite(param) else {
+            return false;
+        };
+        comp.members
+            .iter()
+            .any(|m| self.types.assignment_fault(m.typ, arg, false).is_none())
+    }
+
+    /// The function type a callee expression resolves to, through a function
+    /// pointer if need be.
+    fn resolved_function_type(&self, callee: &Expr) -> Option<TypeId> {
+        callee.typ.and_then(|t| match self.types.kind(t) {
+            TypeKind::Function => Some(t),
+            TypeKind::Pointer => self
+                .types
+                .base_type(t)
+                .filter(|&b| self.types.kind(b) == TypeKind::Function),
+            _ => None,
+        })
     }
 
     fn parse_argument_list(&mut self) -> ParseResult<Vec<Expr>> {
@@ -1791,6 +1799,146 @@ impl<'a> Parser<'a> {
     }
 
     /// Check if an expression is const and report error if assigning to it
+    /// Report a simple assignment whose value cannot be converted to the
+    /// target's type (C17 6.5.16.1).
+    ///
+    /// Compound assignment is deliberately not routed here: 6.5.16.2 has its
+    /// own, looser constraints, under which `p += 1` is ordinary pointer
+    /// arithmetic rather than an integer assigned to a pointer.
+    fn check_assignment_types(&mut self, target: &Expr, value: &Expr, pos: Position) {
+        let (Some(t), Some(v)) = (target.typ, value.typ) else {
+            return;
+        };
+        let t = self.decayed_type(t);
+        let v = self.decayed_type(v);
+        let Some(fault) = self
+            .types
+            .assignment_fault(t, v, self.is_null_pointer_constant(value))
+        else {
+            return;
+        };
+        let (t_name, v_name) = (
+            self.types.format_type(t, Some(self.idents)),
+            self.types.format_type(v, Some(self.idents)),
+        );
+        if fault.is_error() {
+            // gcc words this one case differently, and it is the clearer
+            // phrasing: the problem is not the types but that there is no
+            // value at all.
+            if self.types.kind(v) == TypeKind::Void {
+                diag::error(pos, &gettext("void value not ignored as it ought to be"));
+                return;
+            }
+            diag::error_args(
+                pos,
+                "incompatible types when assigning to type '{0}' from type '{1}'",
+                &[&t_name, &v_name],
+            );
+        } else {
+            diag::warning_args(
+                pos,
+                "assignment to '{0}' from '{1}' {2}",
+                &[&t_name, &v_name, fault.describe()],
+            );
+        }
+    }
+
+    /// Is this expression a null pointer constant (C17 6.3.2.3p3) -- an
+    /// integer constant expression with the value 0, possibly cast to
+    /// `void *`?
+    fn is_null_pointer_constant(&self, expr: &Expr) -> bool {
+        let inner = match &expr.kind {
+            ExprKind::Cast { expr: inner, .. } => inner,
+            _ => expr,
+        };
+        self.types.kind(inner.typ.unwrap_or(self.types.int_id)) != TypeKind::Pointer
+            && self.eval_const_expr(inner) == Some(0)
+    }
+
+    /// Does this expression designate an object (C17 6.3.2.1p1)?
+    ///
+    /// Only the shapes that can name storage: an object identifier, a
+    /// dereference, a subscript, a member of an lvalue, a member through a
+    /// pointer, a compound literal, or a string literal. Everything else --
+    /// the result of arithmetic, a call, a cast, a conditional, a comma -- is
+    /// a value, not a place.
+    fn is_lvalue(&self, expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Ident(symbol_id) => {
+                // A function designator and an enum constant are not objects.
+                !matches!(
+                    self.symbols.get(*symbol_id).kind,
+                    SymbolKind::Function | SymbolKind::EnumConstant
+                )
+            }
+            ExprKind::Unary { op, operand } => match op {
+                UnaryOp::Deref => true,
+                // `__real__ x` and `__imag__ x` are lvalues exactly when their
+                // operand is, which is what gcc documents.
+                UnaryOp::Real | UnaryOp::Imag => self.is_lvalue(operand),
+                _ => false,
+            },
+            ExprKind::Index { .. } | ExprKind::Arrow { .. } => true,
+            // `s.x` designates an object only when `s` does: `f().x` is a
+            // member of a returned value, and has nowhere to live.
+            ExprKind::Member { expr, .. } => self.is_lvalue(expr),
+            ExprKind::CompoundLiteral { .. }
+            | ExprKind::StringLit(_)
+            | ExprKind::WideStringLit(_)
+            | ExprKind::Utf16StringLit(_)
+            | ExprKind::Utf32StringLit(_) => true,
+            // A GNU statement expression is an lvalue exactly when the
+            // expression it ends with is one, which is what gcc documents.
+            ExprKind::StmtExpr { result, .. } => self.is_lvalue(result),
+            _ => false,
+        }
+    }
+
+    /// Report an operand of unary `&` that has no address (C17 6.5.3.2p1).
+    ///
+    /// `register` is the case that bites: the storage class is a hint the
+    /// compiler may ignore, but taking the address is still a constraint
+    /// violation, and a program that does it is relying on the hint being
+    /// ignored.
+    fn check_addressable(&self, operand: &Expr, pos: Position) {
+        let ExprKind::Ident(symbol_id) = &operand.kind else {
+            return;
+        };
+        let sym = self.symbols.get(*symbol_id);
+        if !matches!(sym.kind, SymbolKind::Variable | SymbolKind::Parameter) {
+            return;
+        }
+        if self
+            .types
+            .modifiers(sym.typ)
+            .contains(TypeModifiers::REGISTER)
+        {
+            let name = self.str(sym.name).to_string();
+            diag::error_args(
+                pos,
+                "address of register variable '{0}' requested",
+                &[&name],
+            );
+        }
+    }
+
+    /// Report a target that cannot be assigned to or stepped (C17 6.5.16p2,
+    /// 6.5.3.1p1). `verb` names the operator for the message, matching what
+    /// gcc says so that the two agree on the wording users search for.
+    fn check_modifiable_lvalue(&self, target: &Expr, verb: &str, pos: Position) {
+        if !self.is_lvalue(target) {
+            diag::error_args(pos, "lvalue required as {0}", &[verb]);
+            return;
+        }
+        // An array is an lvalue but never a modifiable one: it has no
+        // assignment operator, only its elements do.
+        if let Some(typ) = target.typ {
+            if self.types.kind(typ) == TypeKind::Array {
+                diag::error(pos, &gettext("assignment to expression with array type"));
+            }
+        }
+    }
+
     fn check_const_assignment(&self, target: &Expr, pos: Position) {
         // Check for assignment through pointer to const first: *p where p is const T*
         if let ExprKind::Unary {
@@ -1844,6 +1992,11 @@ impl<'a> Parser<'a> {
 
     /// Create a typed binary expression, computing result type from operands
     fn make_binary(&mut self, op: BinaryOp, left: Expr, right: Expr) -> Expr {
+        // C17 6.5.5-6.5.14 require operands with a value. `f() + 1` where `f`
+        // returns void has none, and used to compile.
+        self.check_not_void(&left, left.pos);
+        self.check_not_void(&right, right.pos);
+
         // Compute result type based on operator and operand types
         let left_type = left.typ.unwrap_or(self.types.int_id);
         let right_type = right.typ.unwrap_or(self.types.int_id);
@@ -3363,13 +3516,27 @@ impl<'a> Parser<'a> {
                                 _ => unreachable!(),
                             };
 
-                            // For incomplete array types (size 0), determine size from initializer
+                            // An incomplete array type takes its size from the
+                            // initializer. `parse_declarator` spells "no size
+                            // given" as `None`, which is what `int a[]` means;
+                            // the type-name parser this replaced spelled it
+                            // `Some(0)`, conflating it with the GNU zero-length
+                            // array. Accept both, since the declaration path
+                            // (`infer_array_size_from_init`) also does.
                             let final_typ = if self.types.kind(typ) == TypeKind::Array
-                                && self.types.get(typ).array_size == Some(0)
+                                && matches!(self.types.get(typ).array_size, None | Some(0))
                             {
                                 let elem_type =
                                     self.types.base_type(typ).unwrap_or(self.types.int_id);
-                                let array_size = self.array_size_from_elements(&elements);
+                                // `(char[]){"hi"}` is the string in braces
+                                // (C17 6.7.9p14), three characters, not an
+                                // array of one element.
+                                let array_size =
+                                    match self.braced_string_initializer(elem_type, &elements) {
+                                        Some(lit) => self.string_initializer_len(lit),
+                                        None => Some(self.array_size_from_elements(&elements)),
+                                    }
+                                    .unwrap_or_else(|| self.array_size_from_elements(&elements));
                                 self.types.intern(Type::array(elem_type, array_size))
                             } else {
                                 typ

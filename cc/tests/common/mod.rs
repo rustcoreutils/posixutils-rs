@@ -390,6 +390,44 @@ pub fn compile_expect_ok(name: &str, content: &str) {
     );
 }
 
+/// Compile `content` and require it to be **accepted with a diagnostic**.
+///
+/// C17 5.1.1.3 asks only for a diagnostic message, not a failure, so a
+/// constraint gcc warns about is a warning here too. Neither
+/// `compile_expect_error` nor `compile_expect_ok` can express that: the first
+/// demands a non-zero exit, the second says nothing about stderr.
+pub fn compile_expect_warning(name: &str, content: &str, expected: &str) {
+    let c_file = create_c_file(name, content);
+    let asm = tempfile::Builder::new()
+        .prefix(&format!("c17_warn_{}_", name))
+        .suffix(".s")
+        .tempfile()
+        .expect("failed to create temp file");
+
+    let args = vec![
+        "-S".to_string(),
+        "-o".to_string(),
+        asm.path().to_string_lossy().to_string(),
+        c_file.path().to_string_lossy().to_string(),
+    ];
+    let output = run_test_base("c17", &args, &[]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "'{}' should have compiled with a warning, but was rejected.\nSource:\n{}\nstderr:\n{}",
+        name,
+        content,
+        stderr
+    );
+    assert!(
+        stderr.contains(expected),
+        "'{}' compiled, but no diagnostic mentioned {:?}.\nstderr:\n{}",
+        name,
+        expected,
+        stderr
+    );
+}
+
 /// Preprocess `content` with `-E` and return the run.
 ///
 /// Every other preprocessor test asserts on the exit code of a compiled

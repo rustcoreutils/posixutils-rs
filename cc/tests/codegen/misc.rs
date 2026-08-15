@@ -7530,12 +7530,15 @@ double v_d3(int n, ...) { va_list ap; va_start(ap, n);
     return v.a * 100 + v.b * 10 + v.c + t; }
 
 int printf(const char *, ...);
+int fflush(void *);
 
 /* Traced, because this runs on a target that cannot be run locally: a crash
    loses the return code, so the log has to show how far it got and with what
-   value. `T` prints before the call, `=` after it. */
-#define T(n) printf("try " n "\n")
-#define G(n, g) printf("got " n " %.1f\n", (double)(g))
+   value. The flush is the load-bearing part -- the harness captures output
+   through a pipe, so stdout is fully buffered and a segfault takes the whole
+   buffer with it. `fflush(0)` flushes every stream. */
+#define T(n) (printf("try " n "\n"), fflush(0))
+#define G(n, g) (printf("got " n " %.1f\n", (double)(g)), fflush(0))
 
 int main(void) {
     F2 f2 = {1, 2};
@@ -7583,6 +7586,7 @@ typedef struct { char a, b, c; }        C3;   /* three bytes: fits a register */
 typedef struct { char a, b, c, d, e; }  C5;   /* five bytes: not a power of two */
 
 int printf(const char *, ...);
+int fflush(void *);
 
 double g_f2(int n, ...) { va_list ap; va_start(ap, n);
     F2 v = va_arg(ap, F2); va_end(ap); return (double)(v.a * 10 + v.b); }
@@ -7622,9 +7626,11 @@ int main(void) {
 
     /* all live in one function: this is what used to fall over. Traced
        because this runs on a target that cannot be run locally -- a crash
-       loses the return code, so the log has to show which shape it died on. */
-#define T(n) printf("try " n "\n")
-#define G(n, g) printf("got " n " %.1f\n", (double)(g))
+       loses the return code, so the log has to show which shape it died on.
+       The flush matters: output is captured through a pipe, so stdout is
+       fully buffered and a segfault would take the trace with it. */
+#define T(n) (printf("try " n "\n"), fflush(0))
+#define G(n, g) (printf("got " n " %.1f\n", (double)(g)), fflush(0))
     T("f2"); { double g = g_f2(0, f2); G("f2", g); if (g != 12) return 1; }
     T("f3"); { double g = g_f3(0, f3); G("f3", g); if (g != 123) return 2; }
     T("f4"); { double g = g_f4(0, f4); G("f4", g); if (g != 1234) return 3; }

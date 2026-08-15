@@ -8075,3 +8075,130 @@ int main(void) { return weak_fn() + hidden_fn() + placed_fn() + default_fn() + p
     assert!(sec(".myzero").contains(" WA "), "{}", sec(".myzero"));
     assert!(sec(".mytext").contains(" AX "), "{}", sec(".mytext"));
 }
+
+/// An aggregate that fits in one register travels *as* its value: the argument
+/// pseudo holds the data, not a pointer to it. The inliner's implicit
+/// parameter copies — which stand in for the backend prologue when a callee is
+/// inlined — always loaded *through* the argument, so a `struct { float a, b; }`
+/// became a wild pointer spelled by two floats and the inlined body segfaulted
+/// on its first read.
+///
+/// This is #C38, and it took a sharper case than the one recorded against it:
+/// the shape in the audit had a *double* HFA on the stack, which is 16 bytes
+/// and does travel by address, so it worked. It needs a float one.
+///
+/// aarch64 at `-O2` only — `-O0` and `noinline` were both fine, which is what
+/// made it look like an ABI bug rather than an inlining one. Values checked
+/// against `aarch64-linux-gnu-gcc`.
+#[test]
+fn codegen_inlined_register_sized_aggregate_param() {
+    let code = r#"
+#include <stdio.h>
+
+typedef struct { float a, b; } F2;
+typedef struct { float a, b, c; } F3;
+typedef struct { float a, b, c, d; } F4;
+typedef struct { double a, b; } D2;
+typedef struct { double a, b, c, d; } D4;
+typedef struct { long x, y, z; } S24;
+typedef struct { float a; } F1;
+
+/* Two four-element double HFAs fill V0-V7, so the F2 goes on the stack. It is
+   eight bytes, so it arrives as a value. */
+static double f5(D4 p, D4 q, F2 r) { return p.a + q.a + r.a + r.b; }
+/* Five F2s overflow the same way, with a D2 behind them. */
+static double f6(F2 a, F2 b, F2 c, F2 d, F2 e, D2 f)
+{ return a.a + b.a + c.a + d.a + e.a + f.a + f.b; }
+/* A single float is four bytes, and also travels as a value. */
+static double f7(D4 p, D4 q, F1 r) { return p.a + q.a + r.a; }
+/* Controls: these travel by address and were always right. */
+static double f1(F4 p, F4 q, D2 r) { return p.a + p.d + q.a + q.d + r.a + r.b; }
+static double f2(F4 p, F4 q, F3 r) { return p.a + q.a + r.a + r.c; }
+static double f4(F4 p, F4 q, D2 r, S24 s) { return p.a + q.a + r.a + (double)s.z; }
+
+int main(void) {
+    F4 p = {1,2,3,4}, q = {5,6,7,8};
+    F3 t3 = {1,2,3};
+    D2 r = {9,10};
+    D4 d4 = {1,2,3,4};
+    F2 f2v = {2,3};
+    F1 f1v = {5};
+    S24 s = {1,2,3};
+
+    if (f5(d4, d4, f2v) != 7.0) return 1;
+    if (f6(f2v, f2v, f2v, f2v, f2v, r) != 29.0) return 2;
+    if (f7(d4, d4, f1v) != 7.0) return 3;
+
+    if (f1(p, q, r) != 37.0) return 4;
+    if (f2(p, q, t3) != 10.0) return 5;
+    if (f4(p, q, r, s) != 18.0) return 6;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_inlined_register_sized_aggregate_param", code, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run_optimized("codegen_inlined_register_sized_aggregate_param_opt", code),
+        0
+    );
+}
+
+/// An eight-byte all-float aggregate is one whole XMM register by its class,
+/// but the prologue's *counting-only* path for a spilled parameter asked the
+/// size instead -- `> 64 bits` -- and tallied it as a general register. Every
+/// FP argument behind it then read a register one too low: in `g(F2, D2)` the
+/// two-SSE `D2` was loaded from XMM0/XMM1, the second of which still held the
+/// `F2`.
+///
+/// The register-emitting walk in the same function asks `sse_struct_regs` and
+/// was right all along, which is why this only shows when the parameter
+/// spills. `-O0`/`-O1` on x86-64; at `-O2` the callee inlines and the bug
+/// disappears. Values checked against `gcc -std=c17`.
+#[test]
+fn codegen_sse_aggregate_advances_fp_arg_count() {
+    let code = r#"
+typedef struct { float a, b; } F2;
+typedef struct { float a; } F1;
+typedef struct { double a, b; } D2;
+typedef struct { long x; double y; } MIX;
+
+#define N __attribute__((noinline)) static
+N double g1(D2 f) { return f.a + f.b; }
+N double g2(F2 a, D2 f) { (void)a; return f.a + f.b; }
+N double g3(F1 a, D2 f) { (void)a; return f.a + f.b; }
+N double g4(F2 a, F2 b, D2 f) { (void)a; (void)b; return f.a + f.b; }
+N double g5(D2 f, F2 a) { (void)a; return f.a + f.b; }
+N double g6(F2 a, double x, D2 f) { (void)a; (void)x; return f.a + f.b; }
+N double g7(MIX m, D2 f) { (void)m; return f.a + f.b; }
+N double g8(F2 a, F2 b, F2 c, F2 d, F2 e, D2 f)
+{ return a.a + b.a + c.a + d.a + e.a + f.a + f.b; }
+
+int main(void) {
+    F2 v = {2, 3};
+    F1 w = {4};
+    D2 r = {9, 10};
+    MIX m = {1, 2};
+
+    if (g1(r) != 19.0) return 1;
+    if (g2(v, r) != 19.0) return 2;
+    if (g3(w, r) != 19.0) return 3;
+    if (g4(v, v, r) != 19.0) return 4;
+    if (g5(r, v) != 19.0) return 5;
+    if (g6(v, 1.0, r) != 19.0) return 6;
+    if (g7(m, r) != 19.0) return 7;
+    if (g8(v, v, v, v, v, r) != 29.0) return 8;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_sse_aggregate_advances_fp_arg_count", code, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run_optimized("codegen_sse_aggregate_advances_fp_arg_count_opt", code),
+        0
+    );
+}

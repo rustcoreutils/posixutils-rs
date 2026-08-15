@@ -202,6 +202,15 @@ impl X86_64CodeGen {
             return;
         }
 
+        // Spend the registers first. The argument occupies them whether or
+        // not there is anywhere left to put it: at -O an unread parameter has
+        // no local, and returning here without charging for it made the next
+        // floating-point argument read the register this one arrived in.
+        let pair_start_int = *int_arg_idx;
+        let pair_start_fp = *fp_arg_idx;
+        *int_arg_idx += gp_needed;
+        *fp_arg_idx += sse_needed;
+
         let param_name = &func.params[param_idx].0;
         let Some(local) = func.locals.get(param_name) else {
             return;
@@ -210,19 +219,21 @@ impl X86_64CodeGen {
             return;
         };
 
+        let mut next_int = pair_start_int;
+        let mut next_fp = pair_start_fp;
         for (i, class) in classes.iter().enumerate() {
             let delta = (i * 8) as i32;
             if *class == crate::abi::RegClass::Sse {
-                let src = fp_arg_regs[*fp_arg_idx];
-                *fp_arg_idx += 1;
+                let src = fp_arg_regs[next_fp];
+                next_fp += 1;
                 self.push_lir(X86Inst::MovFp {
                     size: FpSize::Double,
                     src: XmmOperand::Reg(src),
                     dst: XmmOperand::Mem(self.stack_mem(offset - delta)),
                 });
             } else {
-                let src = int_arg_regs[*int_arg_idx];
-                *int_arg_idx += 1;
+                let src = int_arg_regs[next_int];
+                next_int += 1;
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B64,
                     src: GpOperand::Reg(src),
@@ -844,6 +855,61 @@ impl X86_64CodeGen {
         }
     }
 
+    /// Charge one parameter against the argument registers, emitting nothing.
+    ///
+    /// Which register an argument arrives in is a property of the *signature*:
+    /// every parameter ahead of it spends its registers whether or not the
+    /// body ever reads it. So this has to be applied to a parameter the
+    /// prologue has no store to make for -- one spilled elsewhere, or one
+    /// optimised away entirely -- or every floating-point argument behind it
+    /// is read from a register one too low.
+    fn advance_arg_regs(
+        typ: TypeId,
+        types: &TypeTable,
+        int_arg_idx: &mut usize,
+        fp_arg_idx: &mut usize,
+        int_arg_reg_count: usize,
+    ) {
+        let is_complex = types.is_complex(typ);
+        let kind = types.kind(typ);
+        let is_aggregate = !is_complex
+            && (kind == crate::types::TypeKind::Struct || kind == crate::types::TypeKind::Union);
+
+        if is_complex {
+            *fp_arg_idx += complex_sse_regs(types, typ);
+        } else if kind == TypeKind::Int128 {
+            // Only when it actually took the pair: 3.2.3 step 5 leaves the
+            // registers it did not fit in available to later arguments.
+            if *int_arg_idx + 1 < int_arg_reg_count {
+                *int_arg_idx += 2;
+            }
+        } else if is_aggregate {
+            // The class, not the size. Asking whether the aggregate was
+            // larger than eight bytes sent `struct { float a, b; }` -- one
+            // whole XMM by its class -- to the general-register tally.
+            let abi = crate::abi::SysVAmd64Abi;
+            match abi.classify_param(typ, types) {
+                crate::abi::ArgClass::Direct { ref classes, .. } => {
+                    *fp_arg_idx += classes
+                        .iter()
+                        .filter(|c| **c == crate::abi::RegClass::Sse)
+                        .count();
+                    *int_arg_idx += classes
+                        .iter()
+                        .filter(|c| **c == crate::abi::RegClass::Integer)
+                        .count();
+                }
+                _ => *int_arg_idx += 1,
+            }
+        } else if kind == crate::types::TypeKind::LongDouble {
+            // Passed in memory; spends no XMM register.
+        } else if types.is_float(typ) {
+            *fp_arg_idx += 1;
+        } else {
+            *int_arg_idx += 1;
+        }
+    }
+
     /// Move arguments from registers to their allocated stack locations
     fn store_args_to_stack(&mut self, func: &Function, types: &TypeTable, alloc: &RegAlloc) {
         // System V AMD64 ABI: integer args in RDI, RSI, RDX, RCX, R8, R9
@@ -877,6 +943,27 @@ impl X86_64CodeGen {
         }
 
         for (i, (_name, typ)) in func.params.iter().enumerate() {
+            // An unread parameter still spends its registers. At -O its pseudo
+            // is gone, and walking only the surviving pseudos charged nothing
+            // for it, so `g(MIX unused, D2 f)` read `f` from the pair the
+            // dead argument was still occupying.
+            if crate::abi::param_is_memory_class(*typ, types) {
+                continue;
+            }
+            let has_pseudo = func
+                .pseudos
+                .iter()
+                .any(|p| matches!(p.kind, PseudoKind::Arg(a) if a == (i as u32) + arg_idx_offset));
+            if !has_pseudo {
+                Self::advance_arg_regs(
+                    *typ,
+                    types,
+                    &mut int_arg_idx,
+                    &mut fp_arg_idx,
+                    int_arg_regs.len(),
+                );
+                continue;
+            }
             // Find the pseudo for this argument
             for pseudo in &func.pseudos {
                 if let PseudoKind::Arg(arg_idx) = pseudo.kind {
@@ -891,52 +978,15 @@ impl X86_64CodeGen {
 
                         // Skip pseudos already stored via spilled_args
                         if spilled_pseudos.contains(&pseudo.id) {
-                            // Still need to count this arg for register assignment tracking
-                            let is_fp = types.is_float(*typ);
-                            let is_complex = types.is_complex(*typ);
-                            let is_longdouble = types.kind(*typ)
-                                == crate::types::TypeKind::LongDouble
-                                && !is_complex;
-                            let is_int128 = types.kind(*typ) == TypeKind::Int128;
-                            let is_medium_struct = !is_complex
-                                && (types.kind(*typ) == crate::types::TypeKind::Struct
-                                    || types.kind(*typ) == crate::types::TypeKind::Union)
-                                && type_size_bits > 64
-                                && type_size_bits <= 128;
-                            if is_complex {
-                                fp_arg_idx += complex_sse_regs(types, *typ);
-                            } else if is_int128 {
-                                // Only when it actually took the pair: 3.2.3
-                                // step 5 leaves the registers it did not fit in
-                                // available to later arguments.
-                                if int_arg_idx + 1 < int_arg_regs.len() {
-                                    int_arg_idx += 2;
-                                }
-                            } else if is_medium_struct {
-                                // Check ABI classification for medium structs
-                                let abi = crate::abi::SysVAmd64Abi;
-                                let cls = abi.classify_param(*typ, types);
-                                if let crate::abi::ArgClass::Direct { ref classes, .. } = cls {
-                                    let sse_count = classes
-                                        .iter()
-                                        .filter(|c| **c == crate::abi::RegClass::Sse)
-                                        .count();
-                                    let gp_count = classes
-                                        .iter()
-                                        .filter(|c| **c == crate::abi::RegClass::Integer)
-                                        .count();
-                                    fp_arg_idx += sse_count;
-                                    int_arg_idx += gp_count;
-                                } else {
-                                    int_arg_idx += 1;
-                                }
-                            } else if is_longdouble {
-                                // Long double is on stack, doesn't use XMM registers
-                            } else if is_fp {
-                                fp_arg_idx += 1;
-                            } else {
-                                int_arg_idx += 1;
-                            }
+                            // Still need to count this arg for register
+                            // assignment tracking.
+                            Self::advance_arg_regs(
+                                *typ,
+                                types,
+                                &mut int_arg_idx,
+                                &mut fp_arg_idx,
+                                int_arg_regs.len(),
+                            );
                             break;
                         }
                         let is_fp = types.is_float(*typ);

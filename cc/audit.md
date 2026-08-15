@@ -228,7 +228,9 @@ crate. Each audit follows the playbook in `audits.md`.
 > nothing had asked: #C57, where an argument following a stacked `__int128` was mislaid on
 > **both** targets by opposite ABI rules; the `\x`-escape half of #C58; and a `char` array
 > member initialized from a string literal writing one byte too many. #C38 finally reproduced
-> too, under a sharper case, and is diagnosed but not fixed.
+> too, under a sharper case, and is now fixed — and writing *its* regression test turned up
+> #C61, three separate ways a parameter could spend an argument register without the x86-64
+> prologue charging it.
 >
 > The aarch64 sweep baseline is **14 failures**, not the 13 recorded earlier; it was measured
 > at 14 before any of this work and is 14 after.
@@ -550,7 +552,7 @@ violation.
 
 - [x] **#C38a — A stacked aarch64 HFA was written as if it were a `_Complex`.** **Fixed.** **[probed]** An HFA that does not fit in the remaining V registers is laid on the stack by the caller. Every multi-element argument took the `_Complex` path to do it: `complex_fp_info` for the element size and a fixed two-element loop. For a three- or four-element HFA that wrote the wrong number of elements at the wrong stride, and `slot_bytes` reserved the wrong number of bytes, so the argument after it landed inside it. `StackArg`'s `complex_pair: bool` became a `StackKind` carrying `Hfa { base, count }`, and the element load is now shared with the register path rather than spelled out at each site. Test: `codegen_stacked_hfa_element_counts`, which fails on the parent commit. Reported by review on the #C37 change.
 
-- [ ] **#C38 — An inlined function with a stacked HFA parameter crashes.** **Open, Major — aarch64 only, reproduced 2026-08-15 with a sharper case.** The shape recorded here previously (`F4, F4, D2`) does *not* reproduce: it returns the right value on both targets at every optimization level. What reproduces is a stacked HFA of **floats** rather than doubles:
+- [x] **#C38 — An inlined function with a register-sized aggregate parameter crashes.** **Fixed.** **[probed]** The shape recorded here previously (`F4, F4, D2`) does *not* reproduce; it returns the right value on both targets at every optimization level. What reproduces is an aggregate of **floats** rather than doubles:
 
   ```c
   typedef struct { float a, b; } F2;
@@ -558,11 +560,19 @@ violation.
   static double f(D4 p, D4 q, F2 r) { return p.a + q.a + r.a + r.b; }   /* SIGSEGV */
   ```
 
-  Two four-element double HFAs fill V0-V7 and the `F2` goes on the stack. `-O2` only — `-O0` is fine, `noinline` is fine, x86-64 is fine, and `aarch64-linux-gnu-gcc` is fine. Five leading `F2`s followed by a `D2` fail the same way.
+  aarch64 at `-O2` only — `-O0` is fine, `noinline` is fine, x86-64 is fine, and `aarch64-linux-gnu-gcc` is fine. That combination is what made it look like an ABI defect for so long; it is an inliner defect, and the ABI is what makes the two shapes differ.
 
-  **Mechanism, since it was previously undiagnosed.** `implicit_param_copies` (`ir/linearize.rs:1231`) is populated only for parameters routed to `complex_params` — a `_Complex`, or a composite classified into exactly two FP registers. Every other HFA goes to `struct_params` and records nothing. Those copies are what stands in for the backend prologue when a function is inlined, so an inlined callee's HFA local is never filled and the body reads through a pseudo nothing defines.
+  **An aggregate that fits in one register travels *as* its value.** A larger one travels by address. `implicit_param_copies` — the copies that stand in for the backend prologue when a callee is inlined — always loaded *through* the argument pseudo, so `struct { float a, b; }` became a wild pointer spelled by two floats and the inlined body segfaulted on its first read. The `D4`s in the same call are thirty-two bytes, travel by address, and were always right. The copy now stores the value directly when the aggregate is one, two, four, or eight bytes wide. Test: `codegen_inlined_register_sized_aggregate_param`, which covers three failing shapes and three that always worked.
 
-  **Where the fix goes.** Route register-passed HFAs of any element count through the implicit-copy path. The stacked case needs more than that: there is no incoming argument area in an inlined body, so the copy has to come from the caller's value, which is what `ImplicitParamCopy` does not currently express. Diagnosed rather than fixed here because the fix reaches into the ABI classification rather than the inliner alone.
+  This is the same value-versus-address distinction as the struct-rvalue-as-call-argument defect and the two-SSE `LEA`/`MOV` one. Three separate sites have now had it; the representation does not carry which of the two a pseudo holds, so each place that consumes an aggregate pseudo has to rederive it from the size.
+
+- [x] **#C61 — An argument register spent by a parameter the prologue never stores, on x86-64.** **Fixed.** **[probed]** Found while verifying #C38's regression test, and unrelated to it: `g(F2 a, D2 f)` returned 41 rather than 19, and `g(MIX unused, D2 f)` failed at `-O` only. Which register an argument arrives in is a property of the *signature* — every parameter ahead of it spends its registers whether or not the body ever reads it — and `store_args_to_stack` charged for a parameter only along the paths where it also had a store to emit. Three ways to reach the same wrong answer, all of them making a later floating-point argument read a register one too low, sometimes one the earlier argument was still sitting in:
+
+  - The counting-only path for a **spilled** parameter asked the aggregate's *size* (`> 64 bits`) rather than its class, so an eight-byte all-float struct — one whole XMM — was tallied against the general registers.
+  - A parameter whose pseudo did not survive `-O` was **never visited at all**: the walk iterates surviving pseudos, and an unread parameter has none.
+  - `store_reg_pair_param_to_local` returned early when the local was gone, **before** advancing the counters — the `MIX` case above.
+
+  The tally is now one helper applied to every parameter on every path, and the register-pair store spends its registers before it looks for somewhere to put them. Test: `codegen_sse_aggregate_advances_fp_arg_count`, eight signatures across the three routes. Values checked against `gcc -std=c17`; only `-O0` was correct beforehand for two of the three.
 
 - [x] **#C39 — `va_arg` of an aggregate read from the wrong place, on both targets.** **Fixed.** **[probed]** Three defects with one shape: the compiler knew how an aggregate *arrives* and read it from somewhere else.
 

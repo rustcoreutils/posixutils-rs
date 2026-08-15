@@ -887,7 +887,12 @@ impl X86_64CodeGen {
                             if is_complex {
                                 fp_arg_idx += complex_sse_regs(types, *typ);
                             } else if is_int128 {
-                                int_arg_idx += 2;
+                                // Only when it actually took the pair: 3.2.3
+                                // step 5 leaves the registers it did not fit in
+                                // available to later arguments.
+                                if int_arg_idx + 1 < int_arg_regs.len() {
+                                    int_arg_idx += 2;
+                                }
                             } else if is_medium_struct {
                                 // Check ABI classification for medium structs
                                 let abi = crate::abi::SysVAmd64Abi;
@@ -1057,18 +1062,21 @@ impl X86_64CodeGen {
                         } else if types.kind(*typ) == TypeKind::Int128 {
                             // __int128 argument — uses TWO consecutive GP registers
                             // Store to the arg pseudo's stack slot (allocated by regalloc)
-                            if int_arg_idx + 1 < int_arg_regs.len() {
+                            let int128_in_regs = int_arg_idx + 1 < int_arg_regs.len();
+                            let pair_start = int_arg_idx;
+                            if int128_in_regs {
+                                int_arg_idx += 2;
                                 if let Some(loc) = self.locations.get(pseudo.id) {
                                     // Store lo half from first GP register
                                     self.push_lir(X86Inst::Mov {
                                         size: OperandSize::B64,
-                                        src: GpOperand::Reg(int_arg_regs[int_arg_idx]),
+                                        src: GpOperand::Reg(int_arg_regs[pair_start]),
                                         dst: GpOperand::Mem(self.int128_lo_mem_loc(&loc)),
                                     });
                                     // Store hi half from second GP register
                                     self.push_lir(X86Inst::Mov {
                                         size: OperandSize::B64,
-                                        src: GpOperand::Reg(int_arg_regs[int_arg_idx + 1]),
+                                        src: GpOperand::Reg(int_arg_regs[pair_start + 1]),
                                         dst: GpOperand::Mem(self.int128_hi_mem_loc(&loc)),
                                     });
                                 }
@@ -1113,8 +1121,14 @@ impl X86_64CodeGen {
                                         dst: GpOperand::Mem(self.int128_hi_mem_loc(&loc)),
                                     });
                                 }
+                                // No advance here: 3.2.3 step 5 sends an
+                                // argument that does not fit to memory *whole*,
+                                // consuming no registers, so the ones it did
+                                // not fit in remain for later arguments. The
+                                // allocator applies the same rule, and the two
+                                // have to agree on which register a following
+                                // argument arrives in.
                             }
-                            int_arg_idx += 2;
                         } else {
                             // Integer argument
                             if int_arg_idx < int_arg_regs.len() {

@@ -1404,11 +1404,19 @@ impl RegAlloc {
                     self.free_regs.retain(|&r| {
                         r != int_arg_regs[int_arg_idx] && r != int_arg_regs[int_arg_idx + 1]
                     });
+                    int_arg_idx += 2;
                 } else {
                     let at = IncomingOff::take(&mut stack_arg_offset, 16, 16);
                     self.int128_incoming.insert(pseudo_id, at);
+                    // 3.2.3 step 5: an argument that does not fit goes to memory
+                    // *whole* and consumes no registers, so the ones it did not
+                    // fit in stay available to later arguments. Advancing here
+                    // pushed the next argument onto the stack, where the caller
+                    // -- which gets this right -- had not put it.
+                    //
+                    // Note this is the opposite of AAPCS64 stage C.11, where an
+                    // overflowing argument does exhaust the file.
                 }
-                int_arg_idx += 2;
             } else {
                 let type_size = types.size_bits(*typ);
                 let is_large_struct = crate::abi::param_is_memory_class(*typ, types);

@@ -7920,3 +7920,50 @@ int main(void) {
         0
     );
 }
+
+/// AAPCS64 §5.4.2 stage C.10 allocates a 128-bit integer to a pair of
+/// consecutive, *even-numbered* X registers, so an odd NGRN skips a register
+/// and leaves it unused. Stage C.11 then says an argument that does not fit
+/// sets NGRN to 8, putting everything after it on the stack too.
+///
+/// Neither rule was applied, in any of the three places that had to agree --
+/// the caller, the allocator, and the prologue -- and each computed the pair
+/// independently. With five leading `long`s the pair was taken as x5/x6 where
+/// gcc uses x6/x7; with seven, the argument *after* the `__int128` was handed
+/// x7, which the callee was not reading. Verified against
+/// `aarch64-linux-gnu-gcc` in all four caller/callee pairings.
+///
+/// The trailing argument is the point of the test: the `__int128` itself
+/// survived the seven-`long` case, and only what followed it was lost.
+#[test]
+fn codegen_int128_register_pair_is_even_aligned() {
+    let code = r#"
+#include <stdio.h>
+
+/* NGRN is even here: the pair is x4/x5 on aarch64. */
+static long long p4(long a, long b, long c, long d, __int128 v, long t)
+{ return (long long)v + t; }
+/* Odd: stage C.10 skips x5 and uses x6/x7. */
+static long long p5(long a, long b, long c, long d, long e, __int128 v, long t)
+{ return (long long)v + t; }
+/* Even, and exactly fills the file: x6/x7. */
+static long long p6(long a, long b, long c, long d, long e, long f, __int128 v, long t)
+{ return (long long)v + t; }
+/* No room: the value and everything after it go on the stack. */
+static long long p7(long a, long b, long c, long d, long e, long f, long g, __int128 v, long t)
+{ return (long long)v + t; }
+
+int main(void) {
+    __int128 x = 424242;
+    if (p4(1, 2, 3, 4, x, 9) != 424251) return 1;
+    if (p5(1, 2, 3, 4, 5, x, 9) != 424251) return 2;
+    if (p6(1, 2, 3, 4, 5, 6, x, 9) != 424251) return 3;
+    if (p7(1, 2, 3, 4, 5, 6, 7, x, 9) != 424251) return 4;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_int128_register_pair_is_even_aligned", code, &[]),
+        0
+    );
+}

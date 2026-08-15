@@ -152,6 +152,8 @@ impl<'a> super::linearize::Linearizer<'a> {
                     is_const,
                 );
             }
+            self.module
+                .set_symbol_attrs(&name, declarator.symbol_attrs.clone());
         }
     }
 

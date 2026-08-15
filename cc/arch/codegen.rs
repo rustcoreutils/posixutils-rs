@@ -260,7 +260,16 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         //
         // The path also handles tentative definitions (`int x;`) and explicit
         // zero-initializers (`int x = 0;` / `static int arr[1000] = {0};`).
-        let zero_init = !global.is_thread_local && size > 0 && global.init.is_all_zero();
+        // A named section is the program's decision and overrides every rule
+        // below, including the zero-initialized fast path: `.comm` places the
+        // object wherever the linker likes, which is exactly what
+        // `section("...")` is asking not to happen.
+        let named_section = global.symbol_attrs.section.clone();
+
+        let zero_init = !global.is_thread_local
+            && size > 0
+            && global.init.is_all_zero()
+            && named_section.is_none();
         if zero_init && !is_local_label {
             if global.is_static {
                 self.push_directive(Directive::bss_local(&global.name, size, align));
@@ -271,7 +280,12 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         }
 
         // Select appropriate section for TLS vs regular data
-        if global.is_thread_local {
+        if let Some(name) = &named_section {
+            self.push_directive(Directive::NamedSection {
+                name: name.clone(),
+                executable: false,
+            });
+        } else if global.is_thread_local {
             if matches!(global.init, Initializer::None) {
                 // Uninitialized TLS: .tbss section
                 self.push_directive(Directive::Tbss);
@@ -295,7 +309,17 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
 
         // Global visibility (if not static and not a `.LC...`-style local label)
         if !global.is_static && !is_local_label {
-            self.push_directive(Directive::global(&global.name));
+            if global.symbol_attrs.weak {
+                self.push_directive(Directive::Weak(Symbol::global(&global.name)));
+            } else {
+                self.push_directive(Directive::global(&global.name));
+            }
+        }
+        if let Some(how) = &global.symbol_attrs.visibility {
+            self.push_directive(Directive::Visibility(
+                Symbol::global(&global.name),
+                how.clone(),
+            ));
         }
 
         // ELF-only type and size (handled by Directive::emit which skips on macOS)

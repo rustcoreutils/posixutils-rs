@@ -1022,6 +1022,34 @@ pub struct Declaration {
     pub declarators: Vec<InitDeclarator>,
 }
 
+/// How a symbol is emitted, as asked for by attributes.
+///
+/// These four were parsed and discarded before, while `__has_attribute`
+/// answered 1 for all of them -- so a program could test for them, be told
+/// yes, and get none of the behaviour. They are here rather than in
+/// `FunctionAttrs` because a variable can carry them too.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SymbolAttrs {
+    /// `weak`: emit `.weak` instead of `.globl`, so another definition wins
+    /// and an unresolved reference is null rather than a link error.
+    pub weak: bool,
+    /// `used`: keep the symbol even when nothing references it.
+    pub used: bool,
+    /// `section("name")`: place it there instead of the section its
+    /// initializer would choose.
+    pub section: Option<String>,
+    /// `visibility("...")`: ELF visibility, verbatim -- "default", "hidden",
+    /// "protected" or "internal".
+    pub visibility: Option<String>,
+}
+
+impl SymbolAttrs {
+    /// Does this ask for anything at all?
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// A single declarator with optional initializer
 #[derive(Debug, Clone)]
 pub struct InitDeclarator {
@@ -1040,6 +1068,8 @@ pub struct InitDeclarator {
     pub vla_sizes: Vec<Expr>,
     /// Explicit alignment from _Alignas specifier (None = use natural alignment)
     pub explicit_align: Option<u32>,
+    /// `weak`, `used`, `section(...)`, `visibility(...)`.
+    pub symbol_attrs: SymbolAttrs,
     /// Source position of the declarator itself.
     ///
     /// Recorded independently of `init` so that a declaration with no
@@ -1055,6 +1085,7 @@ impl Declaration {
     pub fn simple(symbol: SymbolId, typ: TypeId, init: Option<Expr>) -> Self {
         Declaration {
             declarators: vec![InitDeclarator {
+                symbol_attrs: Default::default(),
                 pos: Position::default(),
                 symbol,
                 typ,
@@ -1094,6 +1125,9 @@ pub struct Parameter {
 /// computes, and so have to survive from the parser into code generation.
 #[derive(Debug, Clone, Default)]
 pub struct FunctionAttrs {
+    /// `weak`, `used`, `section(...)`, `visibility(...)` -- how the symbol is
+    /// emitted, as opposed to how the body is compiled.
+    pub symbol: SymbolAttrs,
     /// `__attribute__((noinline))` -- never inline this function.
     pub noinline: bool,
     /// `__attribute__((always_inline))` -- inline this function at every call
@@ -1131,6 +1165,14 @@ impl FunctionAttrs {
     /// declarator, and after the parameter list -- so they are accumulated
     /// rather than read from a single site.
     pub fn merge(&mut self, other: &FunctionAttrs) {
+        self.symbol.weak |= other.symbol.weak;
+        self.symbol.used |= other.symbol.used;
+        if other.symbol.section.is_some() {
+            self.symbol.section = other.symbol.section.clone();
+        }
+        if other.symbol.visibility.is_some() {
+            self.symbol.visibility = other.symbol.visibility.clone();
+        }
         self.noinline |= other.noinline;
         self.always_inline |= other.always_inline;
         self.gnu_inline |= other.gnu_inline;

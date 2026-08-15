@@ -895,6 +895,7 @@ impl<'a> Linearizer<'a> {
         ir_func.emit = !is_inline_definition;
         ir_func.is_noreturn = is_noreturn;
         ir_func.is_inline = is_inline;
+        ir_func.symbol_attrs = func.attrs.symbol.clone();
         ir_func.is_noinline = func.attrs.noinline;
         ir_func.is_always_inline = func.attrs.always_inline;
         ir_func.constructor = func.attrs.constructor;

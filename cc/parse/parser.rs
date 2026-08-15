@@ -446,6 +446,7 @@ impl AttributeList {
     /// Collect the attributes that affect how a function is emitted.
     pub fn function_attrs(&self) -> crate::parse::ast::FunctionAttrs {
         crate::parse::ast::FunctionAttrs {
+            symbol: self.symbol_attrs(),
             noinline: self.has_noinline(),
             always_inline: self.has_always_inline(),
             constructor: self.constructor_priority(),
@@ -458,6 +459,28 @@ impl AttributeList {
     /// Get alignment from __attribute__((aligned(N))) or __attribute__((aligned))
     /// Returns Some(alignment) if found, None otherwise.
     /// Per GCC: aligned with no args defaults to 16 ("max useful alignment").
+    /// The `weak`, `used`, `section(...)` and `visibility(...)` requests in
+    /// this list. All four were parsed and dropped before, while
+    /// `__has_attribute` answered 1 for each.
+    pub fn symbol_attrs(&self) -> crate::parse::ast::SymbolAttrs {
+        let mut out = crate::parse::ast::SymbolAttrs::default();
+        for attr in &self.attrs {
+            let text = |a: &Attribute| match a.args.first() {
+                Some(AttributeArg::String(s)) => Some(s.clone()),
+                Some(AttributeArg::Ident(s)) => Some(s.clone()),
+                _ => None,
+            };
+            match attr.name.trim_matches('_') {
+                "weak" => out.weak = true,
+                "used" => out.used = true,
+                "section" => out.section = text(attr),
+                "visibility" => out.visibility = text(attr),
+                _ => {}
+            }
+        }
+        out
+    }
+
     pub fn get_alignment(&self) -> Option<u32> {
         for attr in &self.attrs {
             if attr.name == "aligned" || attr.name == "__aligned__" {
@@ -512,6 +535,11 @@ pub struct Parser<'a> {
     /// Explicit alignment from _Alignas in current declaration
     /// Cleared after each declaration is parsed.
     pending_alignas: Option<u32>,
+    /// `weak`, `used`, `section(...)`, `visibility(...)` seen on the
+    /// declaration being parsed. Accumulated like `pending_alignas`, because
+    /// an attribute may appear before the declarator, after it, or on the
+    /// specifier, and the declarator is built once at the end.
+    pending_symbol_attrs: crate::parse::ast::SymbolAttrs,
     /// Emission-affecting function attributes seen so far in the declaration
     /// being parsed. Accumulated like `pending_alignas` because a
     /// `constructor` / `noinline` attribute may appear before the declaration
@@ -574,6 +602,7 @@ impl<'a> Parser<'a> {
             types,
             pos: 0,
             pending_alignas: None,
+            pending_symbol_attrs: Default::default(),
             pending_fn_attrs: Default::default(),
             declared_fn_attrs: BTreeMap::new(),
             pending_asm_label: None,
@@ -1372,6 +1401,19 @@ impl<'a> Parser<'a> {
         Ok(labels)
     }
 
+    /// Accumulate the symbol-emission attributes from one attribute list.
+    fn merge_symbol_attrs(&mut self, attrs: &AttributeList) {
+        let found = attrs.symbol_attrs();
+        self.pending_symbol_attrs.weak |= found.weak;
+        self.pending_symbol_attrs.used |= found.used;
+        if found.section.is_some() {
+            self.pending_symbol_attrs.section = found.section;
+        }
+        if found.visibility.is_some() {
+            self.pending_symbol_attrs.visibility = found.visibility;
+        }
+    }
+
     /// Apply alignment from __attribute__((aligned(N))) to pending_alignas.
     /// Merges max: multiple aligned attrs → strictest wins.
     fn apply_attribute_alignment(&mut self, attrs: &AttributeList) {
@@ -1392,6 +1434,7 @@ impl<'a> Parser<'a> {
             if self.is_attribute_keyword() {
                 let attrs = self.parse_attributes();
                 self.apply_attribute_alignment(&attrs);
+                self.merge_symbol_attrs(&attrs);
                 let fn_attrs = attrs.function_attrs();
                 self.pending_fn_attrs.merge(&fn_attrs);
             } else if self.is_asm_keyword() {
@@ -1822,6 +1865,7 @@ impl Parser<'_> {
                     .expect("symbol declaration failed in test");
 
                 declarators.push(InitDeclarator {
+                    symbol_attrs: std::mem::take(&mut self.pending_symbol_attrs),
                     symbol,
                     typ,
                     storage_class: TypeModifiers::empty(),
@@ -2222,6 +2266,7 @@ impl Parser<'_> {
                         | TypeModifiers::REGISTER;
                     let storage_class = base_type.modifiers & storage_class_mask;
                     declarators.push(InitDeclarator {
+                        symbol_attrs: std::mem::take(&mut self.pending_symbol_attrs),
                         symbol,
                         typ,
                         storage_class,
@@ -4312,6 +4357,7 @@ impl Parser<'_> {
                 self.settle_declaration_facts(name, storage_class);
                 return Ok(ExternalDecl::Declaration(Declaration {
                     declarators: vec![InitDeclarator {
+                        symbol_attrs: std::mem::take(&mut self.pending_symbol_attrs),
                         symbol,
                         typ,
                         storage_class,
@@ -4493,6 +4539,7 @@ impl Parser<'_> {
                 self.settle_declaration_facts(name, storage_class);
                 return Ok(ExternalDecl::Declaration(Declaration {
                     declarators: vec![InitDeclarator {
+                        symbol_attrs: std::mem::take(&mut self.pending_symbol_attrs),
                         symbol,
                         typ: full_typ,
                         storage_class,
@@ -4662,6 +4709,7 @@ impl Parser<'_> {
                 self.settle_declaration_facts(name, storage_class);
                 return Ok(ExternalDecl::Declaration(Declaration {
                     declarators: vec![InitDeclarator {
+                        symbol_attrs: std::mem::take(&mut self.pending_symbol_attrs),
                         symbol,
                         typ: func_type_id,
                         storage_class,
@@ -4805,6 +4853,7 @@ impl Parser<'_> {
         let symbol = symbol.expect("symbol should be bound");
         self.settle_declaration_facts(name, storage_class);
         declarators.push(InitDeclarator {
+            symbol_attrs: std::mem::take(&mut self.pending_symbol_attrs),
             symbol,
             typ: var_type_id,
             storage_class,
@@ -4891,6 +4940,7 @@ impl Parser<'_> {
 
             self.settle_declaration_facts(decl_name, storage_class);
             declarators.push(InitDeclarator {
+                symbol_attrs: std::mem::take(&mut self.pending_symbol_attrs),
                 symbol: decl_symbol.expect("symbol should be bound"),
                 typ: decl_type,
                 storage_class,

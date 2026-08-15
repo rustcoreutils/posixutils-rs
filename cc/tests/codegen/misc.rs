@@ -7967,3 +7967,111 @@ int main(void) {
         0
     );
 }
+
+/// `weak`, `visibility`, `section` and `used` were parsed and thrown away
+/// while `__has_attribute` answered 1 for each — so a program could ask, be
+/// told yes, and get none of the behaviour. `doc/ATTR.md` claimed every
+/// attribute whose absence a program could observe was implemented, and these
+/// four are exactly the counterexample.
+///
+/// Checked in the object file rather than the assembly, because the binding
+/// and visibility a linker sees is the thing that matters. Expectations came
+/// from `readelf` on gcc's output for the same source.
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn codegen_symbol_attributes_reach_the_object_file() {
+    use std::process::Command;
+
+    let src = r#"
+__attribute__((weak)) int weak_var = 1;
+__attribute__((visibility("hidden"))) int hidden_var = 2;
+__attribute__((section(".mysec"))) int placed_var = 3;
+/* Zero-initialized: must go to the named section rather than .comm, which
+   would let the linker place it anywhere. */
+__attribute__((section(".myzero"))) int placed_zero;
+int plain_var = 4;
+
+__attribute__((weak)) int weak_fn(void) { return 1; }
+__attribute__((visibility("hidden"))) int hidden_fn(void) { return 2; }
+/* "default" is the absence of a directive, not a `.default` pseudo-op --
+   emitting one fails the assembler, and CPython puts this on every public
+   function. "protected" is a real directive and must still be emitted. */
+__attribute__((visibility("default"))) int default_fn(void) { return 4; }
+__attribute__((visibility("protected"))) int protected_fn(void) { return 5; }
+/* A function's section needs the executable flag; with the data flags the
+   program segfaults on the first call. */
+__attribute__((section(".mytext"))) int placed_fn(void) { return 3; }
+
+int main(void) { return weak_fn() + hidden_fn() + placed_fn() + default_fn() + protected_fn() - 15; }
+"#;
+
+    let dir = tempfile::Builder::new()
+        .prefix("c17_symattrs_")
+        .tempdir()
+        .expect("tempdir");
+    let c = dir.path().join("t.c");
+    let obj = dir.path().join("t.o");
+    std::fs::write(&c, src).expect("write source");
+
+    let out = crate::common::run_c17(&["-c", c.to_str().unwrap(), "-o", obj.to_str().unwrap()]);
+    assert!(out.success, "compile failed: {}", out.stderr);
+
+    let syms = Command::new("readelf")
+        .args(["-sW", obj.to_str().unwrap()])
+        .output()
+        .expect("readelf -s");
+    let syms = String::from_utf8_lossy(&syms.stdout);
+    let line = |name: &str| -> String {
+        syms.lines()
+            .find(|l| l.split_whitespace().last() == Some(name))
+            .unwrap_or_else(|| panic!("no symbol {name} in:\n{syms}"))
+            .to_string()
+    };
+
+    assert!(line("weak_var").contains("WEAK"), "{}", line("weak_var"));
+    assert!(line("weak_fn").contains("WEAK"), "{}", line("weak_fn"));
+    assert!(
+        line("hidden_var").contains("HIDDEN"),
+        "{}",
+        line("hidden_var")
+    );
+    assert!(
+        line("hidden_fn").contains("HIDDEN"),
+        "{}",
+        line("hidden_fn")
+    );
+    // The controls: an ordinary symbol keeps global binding and default
+    // visibility, so the directives are not being emitted for everything.
+    assert!(
+        line("plain_var").contains("GLOBAL") && line("plain_var").contains("DEFAULT"),
+        "{}",
+        line("plain_var")
+    );
+    assert!(
+        line("default_fn").contains("DEFAULT"),
+        "{}",
+        line("default_fn")
+    );
+    assert!(
+        line("protected_fn").contains("PROTECTED"),
+        "{}",
+        line("protected_fn")
+    );
+
+    let secs = Command::new("readelf")
+        .args(["-SW", obj.to_str().unwrap()])
+        .output()
+        .expect("readelf -S");
+    let secs = String::from_utf8_lossy(&secs.stdout);
+    let sec = |name: &str| -> String {
+        secs.lines()
+            .find(|l| l.contains(name))
+            .unwrap_or_else(|| panic!("no section {name} in:\n{secs}"))
+            .to_string()
+    };
+    // Data sections are allocated and writable; a code section is allocated
+    // and executable.
+    assert!(sec(".mysec").contains(" WA "), "{}", sec(".mysec"));
+    assert!(sec(".myzero").contains(" WA "), "{}", sec(".myzero"));
+    assert!(sec(".mytext").contains(" AX "), "{}", sec(".mytext"));
+}

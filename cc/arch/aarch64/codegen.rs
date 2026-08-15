@@ -310,7 +310,7 @@ impl Aarch64CodeGen {
         self.stack_alloc_size = stack_size;
 
         // Emit function header (directives, label, CFI start)
-        self.emit_function_header(func.is_static, &func.name);
+        self.emit_function_header(func);
 
         // Emit prologue (save fp/lr, callee-saved regs, allocate stack)
         self.emit_prologue(total_frame, &callee_saved, &callee_saved_fp);
@@ -430,13 +430,34 @@ impl Aarch64CodeGen {
     }
 
     /// Emit function header directives (text section, visibility, alignment, label, CFI start)
-    fn emit_function_header(&mut self, is_static: bool, name: &str) {
+    fn emit_function_header(&mut self, func: &Function) {
+        let (is_static, name) = (func.is_static, func.name.as_str());
         self.push_lir(Aarch64Inst::Directive(Directive::Blank));
         self.push_lir(Aarch64Inst::Directive(Directive::Text));
 
+        // A named section replaces .text for this function.
+        if let Some(sec) = &func.symbol_attrs.section {
+            self.push_lir(Aarch64Inst::Directive(Directive::NamedSection {
+                name: sec.clone(),
+                executable: true,
+            }));
+        }
+
         // Skip .globl for static functions (internal linkage)
         if !is_static {
-            self.push_lir(Aarch64Inst::Directive(Directive::global(name)));
+            if func.symbol_attrs.weak {
+                self.push_lir(Aarch64Inst::Directive(Directive::Weak(Symbol::global(
+                    name,
+                ))));
+            } else {
+                self.push_lir(Aarch64Inst::Directive(Directive::global(name)));
+            }
+        }
+        if let Some(how) = &func.symbol_attrs.visibility {
+            self.push_lir(Aarch64Inst::Directive(Directive::Visibility(
+                Symbol::global(name),
+                how.clone(),
+            )));
         }
 
         // ELF-only type (handled by Directive::emit which skips on macOS)

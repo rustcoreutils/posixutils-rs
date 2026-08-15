@@ -7809,3 +7809,55 @@ void roomy(void)  { char b[6] = "hi";   sink(b); }
         "roomy: a longer array must still get its terminator\n{asm}"
     );
 }
+
+/// An `__int128` lives in sixteen bytes of memory wherever it goes: every
+/// consumer reaches it through the lo/hi memory helpers, which take an address
+/// and panic on anything else. A *constant* was the one shape that never got
+/// those bytes -- the allocator's immediate arm claimed it first and skipped
+/// the slot -- so `f((__int128)1)` aborted the compiler outright with
+/// "int128_hi_mem_loc: expected stack loc, got Imm".
+///
+/// Giving it a slot exposed the second half: `SetVal` emitted only into a
+/// register, so the slot was allocated and never written and the constant read
+/// back as zero. Both halves are needed for the value to survive.
+///
+/// The `return` site had the same latent panic and no test reached it.
+#[test]
+fn codegen_int128_constant_argument_and_return() {
+    let code = r#"
+#include <stdio.h>
+
+typedef __int128 i128;
+typedef unsigned __int128 u128;
+
+static long long taken(i128 v) { return (long long)v; }
+static i128 returned(void) { return (i128)424242; }
+/* Wider than 64 bits, so each half needs its own movabs. */
+static i128 wide(void) { return ((i128)0x0123456789abcdefLL << 64) | 0x5555aaaa1234beefULL; }
+static long long unsigned_taken(u128 v) { return (long long)v; }
+
+int main(void) {
+    if (taken((i128)424242) != 424242) return 1;
+    if (returned() != 424242) return 2;
+    if (unsigned_taken((u128)7) != 7) return 3;
+
+    i128 w = wide();
+    if ((long long)(unsigned long long)w != (long long)0x5555aaaa1234beefULL) return 4;
+    if ((long long)(w >> 64) != 0x0123456789abcdefLL) return 5;
+
+    /* A negative constant: the high half is all ones, not zero. */
+    if (taken((i128)-424242) != -424242) return 6;
+
+    /* A narrow constant feeding a 128-bit operation stays an ordinary
+       immediate -- it is widened at the use site, not given a slot. */
+    i128 v = (i128)42;
+    if (v != 42) return 7;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_int128_constant_argument_and_return", code, &[]),
+        0
+    );
+}

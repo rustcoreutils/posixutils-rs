@@ -1899,15 +1899,25 @@ impl X86_64CodeGen {
                     if let Some(pseudo) = self.pseudos.iter().find(|p| p.id == target) {
                         let target_loc = self.locations.get(target);
                         match &pseudo.kind {
-                            PseudoKind::Val(v) => {
-                                if let Some(Loc::Reg(r)) = target_loc {
+                            PseudoKind::Val(v) => match target_loc {
+                                Some(Loc::Reg(r)) => {
                                     self.push_lir(X86Inst::Mov {
                                         size: OperandSize::from_bits(insn.size),
                                         src: GpOperand::Imm(*v as i64),
                                         dst: GpOperand::Reg(r),
                                     });
                                 }
-                            }
+                                // A 128-bit constant lives in a sixteen-byte
+                                // slot, since that is the only place its
+                                // consumers can address it. Without this the
+                                // slot was allocated and never written, so the
+                                // constant read back as zero.
+                                Some(loc @ (Loc::Stack(_) | Loc::IncomingArg(_))) => {
+                                    let (v, loc) = (*v, loc.clone());
+                                    self.store_int128_imm(v, &loc);
+                                }
+                                _ => {}
+                            },
                             PseudoKind::FVal(v) => {
                                 // Only emit code if the target is in an XMM register
                                 // FImm locations are materialized inline at use sites
@@ -3281,51 +3291,43 @@ impl X86_64CodeGen {
     }
 
     /// Emit a 128-bit integer copy (stack-to-stack, imm128-to-stack, etc).
+    /// Write a 128-bit constant into the sixteen bytes at `dst_loc`.
+    ///
+    /// Each half goes as an immediate where it fits in the `mov` displacement
+    /// and through `movabs` where it does not. R10 is reserved scratch.
+    fn store_int128_imm(&mut self, v: i128, dst_loc: &Loc) {
+        let lo = v as i64;
+        let hi = (v >> 64) as u64 as i64;
+        for (half, addr) in [
+            (lo, self.int128_lo_mem_loc(dst_loc)),
+            (hi, self.int128_hi_mem_loc(dst_loc)),
+        ] {
+            if half > i32::MAX as i64 || half < i32::MIN as i64 {
+                self.push_lir(X86Inst::MovAbs {
+                    imm: half,
+                    dst: Reg::R10,
+                });
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Reg(Reg::R10),
+                    dst: GpOperand::Mem(addr),
+                });
+            } else {
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Imm(half),
+                    dst: GpOperand::Mem(addr),
+                });
+            }
+        }
+    }
+
     fn emit_int128_copy(&mut self, src: PseudoId, dst: PseudoId) {
         let src_loc = self.get_location(src);
         let dst_loc = self.get_location(dst);
 
         match &src_loc {
-            Loc::Imm(v) => {
-                let lo = *v as i64;
-                let hi = (*v >> 64) as u64 as i64;
-                // Store lo half
-                if lo > i32::MAX as i64 || lo < i32::MIN as i64 {
-                    self.push_lir(X86Inst::MovAbs {
-                        imm: lo,
-                        dst: Reg::R10,
-                    });
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Reg(Reg::R10),
-                        dst: GpOperand::Mem(self.int128_lo_mem_loc(&dst_loc)),
-                    });
-                } else {
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Imm(lo),
-                        dst: GpOperand::Mem(self.int128_lo_mem_loc(&dst_loc)),
-                    });
-                }
-                // Store hi half
-                if hi > i32::MAX as i64 || hi < i32::MIN as i64 {
-                    self.push_lir(X86Inst::MovAbs {
-                        imm: hi,
-                        dst: Reg::R10,
-                    });
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Reg(Reg::R10),
-                        dst: GpOperand::Mem(self.int128_hi_mem_loc(&dst_loc)),
-                    });
-                } else {
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Imm(hi),
-                        dst: GpOperand::Mem(self.int128_hi_mem_loc(&dst_loc)),
-                    });
-                }
-            }
+            Loc::Imm(v) => self.store_int128_imm(*v, &dst_loc),
             Loc::Stack(_) | Loc::IncomingArg(_) => {
                 // Stack-to-stack copy: two qword moves via R10
                 let src_lo = self.int128_lo_mem_loc(&src_loc);

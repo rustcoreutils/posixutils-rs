@@ -1646,6 +1646,29 @@ impl RegAlloc {
             if let Some(pseudo) = func.get_pseudo(interval.pseudo) {
                 match &pseudo.kind {
                     PseudoKind::Val(v) => {
+                        // A 128-bit constant needs sixteen bytes of memory
+                        // like any other `__int128`: every consumer reaches it
+                        // through `int128_lo_mem_loc`/`int128_hi_mem_loc`,
+                        // which take an address and panic on anything else --
+                        // so `f((__int128)1)` aborted the compiler.
+                        //
+                        // Asked of the constant's own defining `SetVal`, not
+                        // of `int128_pseudos`: that set also holds the narrow
+                        // constants that merely *feed* a 128-bit instruction,
+                        // and those are still ordinary immediates that get
+                        // widened at the use site.
+                        let defined_128 = func
+                            .blocks
+                            .iter()
+                            .flat_map(|b| &b.insns)
+                            .find(|insn| {
+                                insn.op == Opcode::SetVal && insn.target == Some(interval.pseudo)
+                            })
+                            .is_some_and(|insn| insn.size == 128);
+                        if defined_128 {
+                            self.alloc_stack_slot(interval, 16, 16, true);
+                            continue;
+                        }
                         self.locations.insert(interval.pseudo, Loc::Imm(*v));
                         continue;
                     }

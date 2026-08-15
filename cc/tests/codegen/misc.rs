@@ -7484,3 +7484,141 @@ int main(void) {
         0
     );
 }
+
+/// An HFA passed to a variadic function arrives in the SIMD registers, like
+/// any other HFA, so `va_arg` has to read it out of *their* save area -- one
+/// element per 16-byte slot -- rather than out of the general-register one.
+///
+/// Aggregates took the integer path unconditionally. That agreed with a caller
+/// which also sent them in general registers, and with nothing else: gcc's
+/// callee read `s0-s3` and got garbage. Once the caller was corrected to follow
+/// AAPCS64 §5.4.2, the two halves of a single c17-compiled program disagreed.
+///
+/// The two sources space the elements differently -- 16 bytes apart in the save
+/// area, packed at their own stride on the stack -- which is why the copy walks
+/// a selected stride instead of branching on which source won.
+///
+/// x86-64 had the same defect by another route and is covered here too: every
+/// aggregate went through the integer path as one wide read from the general
+/// save area, which is unrelated data for anything the classifier put in SSE
+/// registers.
+#[test]
+fn codegen_variadic_hfa_argument() {
+    let code = r#"
+#include <stdarg.h>
+typedef struct { float a, b; }          F2;
+typedef struct { float a, b, c; }       F3;
+typedef struct { float a, b, c, d; }    F4;
+typedef struct { double a, b; }         D2;
+typedef struct { double a, b, c; }      D3;
+
+/* a trailing scalar catches a wrong step through the save area */
+double v_f2(int n, ...) { va_list ap; va_start(ap, n);
+    F2 v = va_arg(ap, F2); double t = va_arg(ap, double); va_end(ap);
+    return (double)(v.a * 10 + v.b) + t; }
+double v_f3(int n, ...) { va_list ap; va_start(ap, n);
+    F3 v = va_arg(ap, F3); double t = va_arg(ap, double); va_end(ap);
+    return (double)(v.a * 100 + v.b * 10 + v.c) + t; }
+double v_f4(int n, ...) { va_list ap; va_start(ap, n);
+    F4 v = va_arg(ap, F4); double t = va_arg(ap, double); va_end(ap);
+    return (double)(v.a * 1000 + v.b * 100 + v.c * 10 + v.d) + t; }
+double v_d2(int n, ...) { va_list ap; va_start(ap, n);
+    D2 v = va_arg(ap, D2); double t = va_arg(ap, double); va_end(ap);
+    return v.a * 10 + v.b + t; }
+double v_d3(int n, ...) { va_list ap; va_start(ap, n);
+    D3 v = va_arg(ap, D3); double t = va_arg(ap, double); va_end(ap);
+    return v.a * 100 + v.b * 10 + v.c + t; }
+
+int main(void) {
+    F2 f2 = {1, 2};
+    F3 f3 = {1, 2, 3};
+    F4 f4 = {1, 2, 3, 4};
+    D2 d2 = {1, 2};
+    D3 d3 = {1, 2, 3};
+
+    if (v_f2(1, f2, 5.0) != 17) return 1;
+    if (v_f3(1, f3, 5.0) != 128) return 2;
+    if (v_f4(1, f4, 5.0) != 1239) return 3;
+    if (v_d2(1, d2, 5.0) != 17) return 4;
+    if (v_d3(1, d3, 5.0) != 128) return 5;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("codegen_variadic_hfa", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("codegen_variadic_hfa_opt", code),
+        0
+    );
+}
+
+/// Several aggregate `va_arg` results live at once.
+///
+/// An aggregate wider than a register was given an ordinary pseudo with no
+/// storage behind it, so the backend was handed a register that held whatever
+/// happened to be there and treated it as the destination's address. One such
+/// call could survive on luck; four in a function did not, which is why this
+/// looked cumulative rather than shape-specific and hid behind register
+/// pressure.
+///
+/// A sixteen-byte *integer* composite is deliberately absent: `va_arg` reads it
+/// from two general-register slots as AAPCS64 requires, but the aarch64 caller
+/// passes such a composite by pointer, so the two disagree. That is a distinct
+/// defect in argument passing rather than in `va_arg`, and the shape is covered
+/// once it is fixed.
+#[test]
+fn codegen_variadic_aggregate_results_coexist() {
+    let code = r#"
+#include <stdarg.h>
+typedef struct { float a, b; }          F2;
+typedef struct { float a, b, c; }       F3;
+typedef struct { float a, b, c, d; }    F4;
+typedef struct { double a, b; }         D2;
+typedef struct { double a, b, c; }      D3;
+typedef struct { long a, b, c; }        L3;   /* over 16 bytes: passed by pointer */
+
+double g_f2(int n, ...) { va_list ap; va_start(ap, n);
+    F2 v = va_arg(ap, F2); va_end(ap); return (double)(v.a * 10 + v.b); }
+double g_f3(int n, ...) { va_list ap; va_start(ap, n);
+    F3 v = va_arg(ap, F3); va_end(ap); return (double)(v.a * 100 + v.b * 10 + v.c); }
+double g_f4(int n, ...) { va_list ap; va_start(ap, n);
+    F4 v = va_arg(ap, F4); va_end(ap); return (double)(v.a * 1000 + v.b * 100 + v.c * 10 + v.d); }
+double g_d2(int n, ...) { va_list ap; va_start(ap, n);
+    D2 v = va_arg(ap, D2); va_end(ap); return v.a * 10 + v.b; }
+double g_d3(int n, ...) { va_list ap; va_start(ap, n);
+    D3 v = va_arg(ap, D3); va_end(ap); return v.a * 100 + v.b * 10 + v.c; }
+long   g_l3(int n, ...) { va_list ap; va_start(ap, n);
+    L3 v = va_arg(ap, L3); va_end(ap); return v.a * 100 + v.b * 10 + v.c; }
+
+/* two aggregates out of one va_list, so the areas must advance correctly */
+double g_two(int n, ...) { va_list ap; va_start(ap, n);
+    F4 p = va_arg(ap, F4); D2 q = va_arg(ap, D2); va_end(ap);
+    return (double)(p.a * 1000 + p.b * 100 + p.c * 10 + p.d) + q.a * 10 + q.b; }
+
+int main(void) {
+    F2 f2 = {1, 2};
+    F3 f3 = {1, 2, 3};
+    F4 f4 = {1, 2, 3, 4};
+    D2 d2 = {1, 2};
+    D3 d3 = {1, 2, 3};
+    L3 l3 = {1, 2, 3};
+
+    /* all live in one function: this is what used to fall over */
+    if (g_f2(0, f2) != 12) return 1;
+    if (g_f3(0, f3) != 123) return 2;
+    if (g_f4(0, f4) != 1234) return 3;
+    if (g_d2(0, d2) != 12) return 4;
+    if (g_d3(0, d3) != 123) return 5;
+    if (g_l3(0, l3) != 123) return 6;
+    if (g_two(0, f4, d2) != 1246) return 7;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_variadic_agg_results", code, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run_optimized("codegen_variadic_agg_results_opt", code),
+        0
+    );
+}

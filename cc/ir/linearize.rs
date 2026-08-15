@@ -4102,9 +4102,39 @@ impl<'a> Linearizer<'a> {
                 // va_arg(ap, type)
                 // Get address of ap (it's an lvalue)
                 let ap_addr = self.linearize_lvalue(ap);
-                let result = self.alloc_pseudo();
-
                 let arg_size = self.types.size_bits(*arg_type);
+
+                // An aggregate wider than a register has nowhere to live in an
+                // ordinary pseudo, so it gets a local of its own and the
+                // backend writes the argument into it -- the same arrangement
+                // a call returning an aggregate in registers uses. Without it
+                // the backend was handed a register that held no storage, and
+                // whatever it happened to contain was treated as the
+                // destination's address.
+                let is_aggregate = matches!(
+                    self.types.kind(*arg_type),
+                    TypeKind::Struct | TypeKind::Union | TypeKind::Array
+                );
+                let result = if is_aggregate && arg_size > 64 {
+                    let local_sym = self.alloc_pseudo();
+                    let name = format!("__vaarg_{}", local_sym.0);
+                    if let Some(func) = &mut self.current_func {
+                        func.add_pseudo(Pseudo::sym(local_sym, name.clone()));
+                        func.add_local(
+                            &name,
+                            local_sym,
+                            *arg_type,
+                            false,
+                            false,
+                            self.current_bb,
+                            None,
+                        );
+                    }
+                    local_sym
+                } else {
+                    self.alloc_pseudo()
+                };
+
                 let insn = Instruction::new(Opcode::VaArg)
                     .with_target(result)
                     .with_src(ap_addr)

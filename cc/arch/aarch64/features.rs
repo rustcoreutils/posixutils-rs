@@ -9,6 +9,7 @@
 // AArch64 Feature Code Generation (Variadic Functions, Byte Swapping, Bit Counting)
 //
 
+use super::call::HfaElem;
 use super::codegen::Aarch64CodeGen;
 use super::lir::{Aarch64Inst, GpOperand, MemAddr};
 use super::regalloc::{Loc, Reg, VReg};
@@ -45,6 +46,47 @@ const VA_GR_TOP_OFF: i32 = 8;
 const VA_VR_TOP_OFF: i32 = 16;
 const VA_GR_OFFS_OFF: i32 = 24;
 const VA_VR_OFFS_OFF: i32 = 28;
+
+/// How an aggregate argument reaches `va_arg`, per AAPCS64 §6.4.2.
+///
+/// Three shapes, and only the first was ever handled -- every aggregate took
+/// the general-register path as one wide read of the type's whole width.
+#[derive(Clone, Copy)]
+enum VaAggKind {
+    /// Not an aggregate: an ordinary scalar.
+    Scalar,
+    /// A homogeneous floating-point aggregate: one SIMD slot per element.
+    Hfa(HfaElem, u8),
+    /// A composite of at most sixteen bytes: consecutive general-register
+    /// slots, contiguous in both the save area and the caller's frame.
+    Gp { qwords: u8, bytes: i32 },
+    /// A composite larger than sixteen bytes. Stage B.4 has the caller copy it
+    /// to memory and pass a *pointer* to the copy, so one general slot holds
+    /// the address and the object is read through it.
+    Indirect { bytes: i32 },
+}
+
+impl VaAggKind {
+    fn of(typ: crate::types::TypeId, types: &TypeTable, target: &crate::target::Target) -> Self {
+        use crate::types::TypeKind;
+        if !matches!(
+            types.kind(typ),
+            TypeKind::Struct | TypeKind::Union | TypeKind::Array
+        ) {
+            return VaAggKind::Scalar;
+        }
+        let bytes = (types.size_bits(typ) / 8).max(1) as i32;
+        let abi = crate::abi::get_abi_for_conv(crate::abi::CallingConv::C, target);
+        match abi.classify_param(typ, types) {
+            crate::abi::ArgClass::Hfa { base, count } => VaAggKind::Hfa(HfaElem::of(base), count),
+            crate::abi::ArgClass::Indirect { .. } => VaAggKind::Indirect { bytes },
+            _ => VaAggKind::Gp {
+                qwords: ((bytes + 7) / 8) as u8,
+                bytes,
+            },
+        }
+    }
+}
 
 impl Aarch64CodeGen {
     // ========================================================================
@@ -174,9 +216,13 @@ impl Aarch64CodeGen {
 
         let arg_type = insn.typ.unwrap_or(types.int_id);
         let type_bits = types.size_bits(arg_type);
-        // Aggregates are not classified here; they take the integer path, as
-        // they always have.
         let is_fp = types.is_float(arg_type);
+        // An HFA arrives in the SIMD registers, so it is read out of *their*
+        // save area, one element per 16-byte slot. Aggregates used to take the
+        // integer path unconditionally -- which agreed with a caller that also
+        // sent them in general registers, and with nothing else. Now that the
+        // caller follows AAPCS64 §5.4.2 and gcc, this side has to as well.
+        let agg = VaAggKind::of(arg_type, types, &self.base.target);
 
         let ap_loc = self.get_location(ap_addr);
         let dst_loc = self.get_location(target);
@@ -184,7 +230,7 @@ impl Aarch64CodeGen {
         if self.base.target.os == crate::target::Os::MacOS {
             self.emit_va_arg_darwin(&ap_loc, &dst_loc, type_bits, is_fp);
         } else {
-            self.emit_va_arg_aapcs64(&ap_loc, &dst_loc, type_bits, is_fp);
+            self.emit_va_arg_aapcs64(&ap_loc, &dst_loc, type_bits, is_fp, agg);
         }
     }
 
@@ -236,24 +282,55 @@ impl Aarch64CodeGen {
     /// the stack path is deliberate: it leaves the field non-negative, which
     /// is what pins every later argument of that class to the stack, as the
     /// ABI requires.
-    fn emit_va_arg_aapcs64(&mut self, ap_loc: &Loc, dst_loc: &Loc, type_bits: u32, is_fp: bool) {
+    fn emit_va_arg_aapcs64(
+        &mut self,
+        ap_loc: &Loc,
+        dst_loc: &Loc,
+        type_bits: u32,
+        is_fp: bool,
+        agg: VaAggKind,
+    ) {
         let (scratch0, scratch1, scratch2) = Reg::scratch_regs();
         let Some(ap) = self.va_list_addr_pinned(ap_loc, scratch2) else {
             return;
         };
 
-        let (offs_field, top_field) = if is_fp {
+        // An HFA reads from the SIMD save area exactly as a scalar float does;
+        // every other aggregate reads from the general one.
+        let from_simd = is_fp || matches!(agg, VaAggKind::Hfa(..));
+        let (offs_field, top_field) = if from_simd {
             (VA_VR_OFFS_OFF, VA_VR_TOP_OFF)
         } else {
             (VA_GR_OFFS_OFF, VA_GR_TOP_OFF)
         };
 
-        let stack_step = Self::va_slot_bytes(type_bits);
+        let stack_step = match agg {
+            // On the stack an HFA is laid out as the aggregate it is:
+            // elements packed at their own stride, the whole rounded to 8.
+            VaAggKind::Hfa(elem, count) => {
+                Self::va_slot_bytes((count as u32) * (elem.bytes as u32) * 8)
+            }
+            VaAggKind::Gp { bytes, .. } => Self::va_slot_bytes(bytes as u32 * 8),
+            // Only the pointer is on the stack, not the object.
+            VaAggKind::Indirect { .. } => 8,
+            VaAggKind::Scalar => Self::va_slot_bytes(type_bits),
+        };
         // Every SIMD slot is a full 16 bytes regardless of the type stored in
-        // it; GP slots are 8, and a 16-byte integer takes two of them.
-        let reg_step = if is_fp { 16 } else { stack_step };
-        // A 16-byte argument is 16-byte aligned on the stack.
-        let stack_align16 = type_bits > 64;
+        // it; GP slots are 8, and a 16-byte integer takes two of them. An HFA
+        // spends one whole slot per element.
+        let reg_step = match agg {
+            VaAggKind::Hfa(_, count) => 16 * count as i64,
+            VaAggKind::Gp { qwords, .. } => 8 * qwords as i64,
+            VaAggKind::Indirect { .. } => 8,
+            VaAggKind::Scalar if is_fp => 16,
+            VaAggKind::Scalar => stack_step,
+        };
+        // A 16-byte argument is 16-byte aligned on the stack -- but only the
+        // pointer is stacked for an indirect one, so it wants no such rounding.
+        let stack_align16 = match agg {
+            VaAggKind::Indirect { .. } => false,
+            _ => type_bits > 64,
+        };
 
         // x9 = offs, x10 = offs + reg_step, committed back immediately.
         self.push_lir(Aarch64Inst::Ldr {
@@ -371,7 +448,179 @@ impl Aarch64CodeGen {
             dst: scratch0,
         });
 
+        match agg {
+            VaAggKind::Gp { bytes, .. } => {
+                // Contiguous in both sources: consecutive eightbyte slots in
+                // the save area, and the object itself on the stack.
+                self.emit_va_arg_bytes(dst_loc, scratch0, 0, bytes, type_bits <= 64);
+                return;
+            }
+            VaAggKind::Indirect { bytes } => {
+                // The slot holds the address of the caller's copy.
+                self.push_lir(Aarch64Inst::Ldr {
+                    size: OperandSize::B64,
+                    addr: MemAddr::Base(scratch0),
+                    dst: scratch1,
+                });
+                self.emit_va_arg_bytes(dst_loc, scratch1, 0, bytes, false);
+                return;
+            }
+            _ => {}
+        }
+        if let VaAggKind::Hfa(elem, count) = agg {
+            // The two sources disagree about spacing: in the save area each
+            // element sits in its own 16-byte slot, while on the stack they
+            // are packed at the element's own stride. The comparison above is
+            // still live -- nothing since has written the flags -- so the
+            // stride is selected the same way the address was, and the copy
+            // walks it rather than branching on which source won.
+            self.emit_mov_imm(Reg::X16, 16, 64);
+            self.emit_mov_imm(Reg::X17, elem.bytes as i64, 64);
+            self.push_lir(Aarch64Inst::Csel {
+                size: OperandSize::B64,
+                cond: CondCode::Sle,
+                src_true: Reg::X16,
+                src_false: Reg::X17,
+                dst: scratch1,
+            });
+            // At or below a register's worth the result is the value
+            // itself, not an object at an address.
+            let holds_value = type_bits <= 64;
+            self.emit_va_arg_hfa_copy(dst_loc, scratch0, scratch1, elem, count, holds_value);
+            return;
+        }
         self.emit_va_arg_load(dst_loc, scratch0, type_bits, is_fp);
+    }
+
+    /// Copy `bytes` of an aggregate from `[addr + off]` into the destination,
+    /// in descending power-of-two chunks so nothing past the object is
+    /// written. X16 is the shuttle -- linker scratch, never allocated.
+    fn emit_va_arg_bytes(
+        &mut self,
+        dst_loc: &Loc,
+        addr: Reg,
+        off: i32,
+        bytes: i32,
+        holds_value: bool,
+    ) {
+        let mut done = 0;
+        while done < bytes {
+            let chunk = [8, 4, 2, 1]
+                .into_iter()
+                .find(|c| *c <= bytes - done)
+                .unwrap_or(1);
+            let size = OperandSize::from_bits(chunk as u32 * 8);
+            self.push_lir(Aarch64Inst::Ldr {
+                size,
+                addr: MemAddr::BaseOffset {
+                    base: addr,
+                    offset: off + done,
+                },
+                dst: Reg::X16,
+            });
+            match dst_loc {
+                Loc::Stack(slot) => self.push_lir(Aarch64Inst::Str {
+                    size,
+                    src: Reg::X16,
+                    addr: self.stack_mem_plus(*slot, done),
+                }),
+                // At or below a register's worth the result *is* the register.
+                Loc::Reg(r) if holds_value => self.push_lir(Aarch64Inst::Mov {
+                    size,
+                    src: GpOperand::Reg(Reg::X16),
+                    dst: *r,
+                }),
+                Loc::Reg(r) => self.push_lir(Aarch64Inst::Str {
+                    size,
+                    src: Reg::X16,
+                    addr: MemAddr::BaseOffset {
+                        base: *r,
+                        offset: done,
+                    },
+                }),
+                _ => return,
+            }
+            done += chunk;
+        }
+    }
+
+    /// Copy `count` HFA elements from `addr`, stepping by `stride`, into the
+    /// destination packed at the element's own size.
+    ///
+    /// `holds_value` distinguishes the two things the destination can be. An
+    /// aggregate wider than a register lives at an address and its elements
+    /// are stored there; one that fits in a register *is* the register, and
+    /// its elements have to be gathered into it -- they cannot simply be
+    /// copied across, because in the save area each sits in its own 16-byte
+    /// slot rather than beside its neighbour.
+    fn emit_va_arg_hfa_copy(
+        &mut self,
+        dst_loc: &Loc,
+        addr: Reg,
+        stride: Reg,
+        elem: HfaElem,
+        count: u8,
+        holds_value: bool,
+    ) {
+        for i in 0..count as i32 {
+            self.push_lir(Aarch64Inst::LdrFp {
+                size: elem.size,
+                addr: MemAddr::Base(addr),
+                dst: VReg::V16,
+            });
+            let delta = i * elem.bytes;
+            match dst_loc {
+                Loc::Stack(offset) => self.push_lir(Aarch64Inst::StrFp {
+                    size: elem.size,
+                    src: VReg::V16,
+                    addr: self.stack_mem_plus(*offset, delta),
+                }),
+                Loc::Reg(r) if holds_value => {
+                    self.push_lir(Aarch64Inst::FmovToGp {
+                        size: elem.size,
+                        src: VReg::V16,
+                        dst: Reg::X16,
+                    });
+                    if i == 0 {
+                        self.push_lir(Aarch64Inst::Mov {
+                            size: OperandSize::B64,
+                            src: GpOperand::Reg(Reg::X16),
+                            dst: *r,
+                        });
+                    } else {
+                        self.push_lir(Aarch64Inst::Lsl {
+                            size: OperandSize::B64,
+                            src: Reg::X16,
+                            amount: GpOperand::Imm(delta as i64 * 8),
+                            dst: Reg::X16,
+                        });
+                        self.push_lir(Aarch64Inst::Orr {
+                            size: OperandSize::B64,
+                            src1: *r,
+                            src2: GpOperand::Reg(Reg::X16),
+                            dst: *r,
+                        });
+                    }
+                }
+                Loc::Reg(r) => self.push_lir(Aarch64Inst::StrFp {
+                    size: elem.size,
+                    src: VReg::V16,
+                    addr: MemAddr::BaseOffset {
+                        base: *r,
+                        offset: delta,
+                    },
+                }),
+                _ => return,
+            }
+            if i + 1 < count as i32 {
+                self.push_lir(Aarch64Inst::Add {
+                    size: OperandSize::B64,
+                    src1: addr,
+                    src2: GpOperand::Reg(stride),
+                    dst: addr,
+                });
+            }
+        }
     }
 
     /// Load the address of a `va_list` into `pin`, moving it there even when

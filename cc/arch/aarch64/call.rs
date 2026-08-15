@@ -963,13 +963,13 @@ impl Aarch64CodeGen {
 /// them out at each one is how a stacked HFA came to be written at the
 /// `_Complex` stride.
 #[derive(Clone, Copy)]
-struct HfaElem {
-    size: FpSize,
-    bytes: i32,
+pub(super) struct HfaElem {
+    pub(super) size: FpSize,
+    pub(super) bytes: i32,
 }
 
 impl HfaElem {
-    fn of(base: HfaBase) -> HfaElem {
+    pub(super) fn of(base: HfaBase) -> HfaElem {
         let (size, bytes) = match base {
             HfaBase::Float16 => (FpSize::Half, 2),
             HfaBase::Float32 => (FpSize::Single, 4),

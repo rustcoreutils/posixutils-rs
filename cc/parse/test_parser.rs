@@ -3619,6 +3619,64 @@ fn test_complex_nested_declarator() {
     }
 }
 
+/// C17 6.7.6: `direct-declarator` is `( declarator )` *recursively*, and
+/// 5.2.4.1 requires 63 levels of it. Only one level used to parse: the
+/// predicate that decides whether a `(` opens a grouped declarator or a
+/// parameter list looked for `*` or an identifier, and a nested `(` is
+/// neither, so `int ((q));` was rejected as "expected identifier".
+#[test]
+fn test_nested_parenthesized_declarators() {
+    for (code, kind) in [
+        ("int ((q));", TypeKind::Int),
+        ("int ((*p));", TypeKind::Pointer),
+        ("int (((*h)));", TypeKind::Pointer),
+        ("int ((((((*deep))))));", TypeKind::Pointer),
+    ] {
+        let (tu, types, _strings, _symbols) = parse_tu(code).unwrap_or_else(|e| {
+            panic!("{code} should parse: {e:?}");
+        });
+        assert_eq!(tu.items.len(), 1, "{code}");
+        match &tu.items[0] {
+            ExternalDecl::Declaration(decl) => {
+                assert_eq!(decl.declarators.len(), 1, "{code}");
+                assert_eq!(
+                    types.kind(decl.declarators[0].typ),
+                    kind,
+                    "{code}: redundant parentheses must not change the type"
+                );
+            }
+            other => panic!("{code}: expected Declaration, got {other:?}"),
+        }
+    }
+}
+
+/// A function declarator wrapped in redundant parentheses is still a function,
+/// and the parentheses may nest.
+#[test]
+fn test_nested_parenthesized_function_declarator() {
+    for code in [
+        "void (g)(void);",
+        "void ((g))(void);",
+        "void (((g)))(void);",
+    ] {
+        let (tu, _types, _strings, _symbols) =
+            parse_tu(code).unwrap_or_else(|e| panic!("{code} should parse: {e:?}"));
+        assert_eq!(tu.items.len(), 1, "{code}");
+    }
+}
+
+/// A parameter whose type is a *function* type, spelled without a name:
+/// `int (size_t)` is a function taking `size_t`, adjusted to a pointer by
+/// 6.7.6.3p8. The old inline predicate treated any identifier after `(` as a
+/// grouped declarator, so this was read as a declarator named `size_t`.
+#[test]
+fn test_function_type_parameter_is_not_a_grouped_declarator() {
+    let code = "typedef unsigned long size_t;\nvoid f(int (size_t));";
+    let (tu, _types, _strings, _symbols) =
+        parse_tu(code).unwrap_or_else(|e| panic!("{code} should parse: {e:?}"));
+    assert_eq!(tu.items.len(), 2);
+}
+
 // ========================================================================
 // Array Parameter Edge Cases
 // ========================================================================

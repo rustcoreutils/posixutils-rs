@@ -682,6 +682,16 @@ impl<'a> Parser<'a> {
             return true;
         }
 
+        // Another declarator: C17 6.7.6's direct-declarator is
+        // `( declarator )` recursively, so `int ((q));` and `int (((*h)));`
+        // are as legal as one level, and 5.2.4.1 requires 63 of them. This
+        // costs no ambiguity: after the `(` of a declarator the only other
+        // continuations are `)`, `...`, a declaration specifier, or a K&R
+        // identifier, and a parameter list can never begin with `(`.
+        if self.is_special(b'(') {
+            return true;
+        }
+
         // Check for grouped declarator: (name...) where name is NOT a type
         // This handles cases like:
         //   (name)     - function type typedef
@@ -3032,9 +3042,12 @@ impl Parser<'_> {
             let saved_pos = self.pos;
             self.advance(); // consume '('
 
-            // Check what follows - if it's *, it's likely a grouped declarator
-            // If it's a type or ), it's likely function params
-            let is_grouped = self.is_special(b'*') || self.peek() == TokenType::Ident;
+            // One predicate decides this everywhere. The copy that used to
+            // live here treated *any* identifier as a grouped declarator,
+            // where `is_grouped_declarator` excludes typedef names and type
+            // keywords -- so `void f(int (size_t));`, a function-type
+            // parameter, was read as a declarator named `size_t`.
+            let is_grouped = self.is_grouped_declarator();
 
             if is_grouped {
                 // Parse nested declarator recursively
@@ -3054,9 +3067,20 @@ impl Parser<'_> {
                 // These apply to the base type, not the inner declarator
                 (inner_name, Some(inner_decl_type_id), inner_func_params)
             } else {
-                // Not a grouped declarator, restore position
+                // The `(` opens a parameter list, so this declarator is
+                // abstract: `int (size_t)` names a function type, and there is
+                // no identifier to find. Rewind to the `(` and let the
+                // function-suffix loop below consume the parameter list.
+                //
+                // This branch used to call `expect_declarator_name()` here,
+                // which cannot succeed while positioned on `(`. It was
+                // unreachable in practice because the old predicate claimed
+                // every identifier -- including a typedef name or a type
+                // keyword -- as a grouped declarator, so an abstract function
+                // type reached the recursive branch and had its first
+                // parameter's type name mistaken for the declarator's name.
                 self.pos = saved_pos;
-                (self.expect_declarator_name()?, None, None)
+                (StringId::EMPTY, None, None)
             }
         } else {
             // Get the name directly, or use empty for abstract declarators

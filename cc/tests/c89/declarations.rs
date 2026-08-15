@@ -475,3 +475,70 @@ int main(void) {
         0
     );
 }
+
+/// C17 6.7.6 makes `direct-declarator` recursive through `( declarator )`, and
+/// 5.2.4.1 asks for 63 levels of it. Only one level parsed: the predicate
+/// deciding whether a `(` opened a grouped declarator or a parameter list
+/// looked for `*` or an identifier, and a nested `(` is neither -- so
+/// `int ((q));` was rejected outright as "expected identifier", and so was
+/// every conforming program that spelled a declarator that way.
+///
+/// The same predicate had a second copy that accepted *any* identifier after
+/// `(`, without the typedef test, which read the function-type parameter
+/// `int (fn)(int)` as a declarator named `fn` wrapped in parentheses. Both
+/// copies are now one predicate.
+///
+/// Every expectation here came from gcc on this source.
+#[test]
+fn c89_parenthesized_declarators_nest() {
+    let code = r#"
+int ((q)) = 7;
+int ((*p));
+int (((*h)));
+static int arr3[3] = {10, 20, 30};
+void ((g))(void);
+static int (*((kimpl))(void))[3] { return &arr3; }
+int (*(*k)(void))[3];
+typedef int (((int_alias)));
+int_alias alias_obj = 42;
+
+static int gcalls = 0;
+void ((g))(void) { gcalls++; }
+
+/* A parameter whose type is a function type, spelled without a name.
+   6.7.6.3p8 adjusts it to a pointer to function. */
+static int apply(int (fn)(int), int v) { return fn(v); }
+static int twice(int v) { return v * 2; }
+
+int main(void) {
+    p = &q;
+    h = &q;
+    if (q != 7) return 1;
+    if (*p != 7) return 2;
+    if (*h != 7) return 3;
+
+    /* Redundant parentheses must not perturb the type. */
+    if (sizeof(q) != sizeof(int)) return 4;
+    if (sizeof(p) != sizeof(int *)) return 5;
+
+    g();
+    if (gcalls != 1) return 6;
+
+    k = kimpl;
+    if ((*k())[0] != 10) return 7;
+    if ((*k())[2] != 30) return 8;
+
+    if (alias_obj != 42) return 9;
+    if (apply(twice, 21) != 42) return 10;
+
+    int (((((((((((deep))))))))))) = 5;
+    if (deep != 5) return 11;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c89_parenthesized_declarators_nest", code, &[]),
+        0
+    );
+}

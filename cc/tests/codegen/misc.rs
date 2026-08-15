@@ -7571,6 +7571,8 @@ typedef struct { double a, b; }         D2;
 typedef struct { double a, b, c; }      D3;
 typedef struct { long a, b; }           L2;   /* two general-register slots */
 typedef struct { long a, b, c; }        L3;   /* over 16 bytes: passed by pointer */
+typedef struct { char a, b, c; }        C3;   /* three bytes: fits a register */
+typedef struct { char a, b, c, d, e; }  C5;   /* five bytes: not a power of two */
 
 double g_f2(int n, ...) { va_list ap; va_start(ap, n);
     F2 v = va_arg(ap, F2); va_end(ap); return (double)(v.a * 10 + v.b); }
@@ -7582,6 +7584,11 @@ double g_d2(int n, ...) { va_list ap; va_start(ap, n);
     D2 v = va_arg(ap, D2); va_end(ap); return v.a * 10 + v.b; }
 double g_d3(int n, ...) { va_list ap; va_start(ap, n);
     D3 v = va_arg(ap, D3); va_end(ap); return v.a * 100 + v.b * 10 + v.c; }
+int    g_c3(int n, ...) { va_list ap; va_start(ap, n);
+    C3 v = va_arg(ap, C3); va_end(ap); return v.a * 100 + v.b * 10 + v.c; }
+int    g_c5(int n, ...) { va_list ap; va_start(ap, n);
+    C5 v = va_arg(ap, C5); va_end(ap);
+    return v.a * 10000 + v.b * 1000 + v.c * 100 + v.d * 10 + v.e; }
 long   g_l2(int n, ...) { va_list ap; va_start(ap, n);
     L2 v = va_arg(ap, L2); va_end(ap); return v.a * 10 + v.b; }
 long   g_l3(int n, ...) { va_list ap; va_start(ap, n);
@@ -7598,6 +7605,8 @@ int main(void) {
     F4 f4 = {1, 2, 3, 4};
     D2 d2 = {1, 2};
     D3 d3 = {1, 2, 3};
+    C3 c3 = {1, 2, 3};
+    C5 c5 = {1, 2, 3, 4, 5};
     L2 l2 = {1, 2};
     L3 l3 = {1, 2, 3};
 
@@ -7610,6 +7619,10 @@ int main(void) {
     if (g_l2(0, l2) != 12) return 6;
     if (g_l3(0, l3) != 123) return 7;
     if (g_two(0, f4, d2) != 1246) return 8;
+    /* an aggregate that fits in a register is one load, not a chunked copy:
+       chunking wrote each piece over the last and kept only the final byte */
+    if (g_c3(0, c3) != 123) return 9;
+    if (g_c5(0, c5) != 12345) return 10;
     return 0;
 }
 "#;

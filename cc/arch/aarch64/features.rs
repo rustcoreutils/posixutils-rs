@@ -230,7 +230,14 @@ impl Aarch64CodeGen {
         if self.base.target.os == crate::target::Os::MacOS {
             self.emit_va_arg_darwin(&ap_loc, &dst_loc, type_bits, is_fp);
         } else {
-            self.emit_va_arg_aapcs64(&ap_loc, &dst_loc, type_bits, is_fp, agg);
+            self.emit_va_arg_aapcs64(
+                &ap_loc,
+                &dst_loc,
+                type_bits,
+                is_fp,
+                agg,
+                types.alignment(arg_type) as i32,
+            );
         }
     }
 
@@ -289,6 +296,7 @@ impl Aarch64CodeGen {
         type_bits: u32,
         is_fp: bool,
         agg: VaAggKind,
+        align: i32,
     ) {
         let (scratch0, scratch1, scratch2) = Reg::scratch_regs();
         let Some(ap) = self.va_list_addr_pinned(ap_loc, scratch2) else {
@@ -325,11 +333,17 @@ impl Aarch64CodeGen {
             VaAggKind::Scalar if is_fp => 16,
             VaAggKind::Scalar => stack_step,
         };
-        // A 16-byte argument is 16-byte aligned on the stack -- but only the
-        // pointer is stacked for an indirect one, so it wants no such rounding.
+        // From the type's alignment, not its size: AAPCS64 §6.4.2 stage C
+        // rounds the stacked address up to `max(8, alignof)`, and the two do
+        // not follow one another -- `struct { long a, b; }` is sixteen bytes
+        // and eight-byte aligned, and an HFA of four floats is sixteen bytes
+        // and four-byte aligned. Asking `size > 64` over-aligned both, so
+        // `va_arg` walked the stack differently from the caller that laid it
+        // out. Only the pointer is stacked for an indirect argument, so that
+        // one wants no rounding at all.
         let stack_align16 = match agg {
             VaAggKind::Indirect { .. } => false,
-            _ => type_bits > 64,
+            _ => align >= 16,
         };
 
         // x9 = offs, x10 = offs + reg_step, committed back immediately.
@@ -503,6 +517,23 @@ impl Aarch64CodeGen {
         bytes: i32,
         holds_value: bool,
     ) {
+        // A register destination *is* the aggregate: one load of the whole
+        // slot. Chunking into it wrote each piece over the last, so a
+        // five-byte aggregate kept only its fifth byte. Every slot is at least
+        // eight bytes, in the save area and on the stack alike.
+        if let Loc::Reg(r) = dst_loc {
+            if holds_value {
+                self.push_lir(Aarch64Inst::Ldr {
+                    size: OperandSize::B64,
+                    addr: MemAddr::BaseOffset {
+                        base: addr,
+                        offset: off,
+                    },
+                    dst: *r,
+                });
+                return;
+            }
+        }
         let mut done = 0;
         while done < bytes {
             let chunk = [8, 4, 2, 1]

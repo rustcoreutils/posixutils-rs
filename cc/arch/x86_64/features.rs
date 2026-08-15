@@ -386,6 +386,23 @@ impl X86_64CodeGen {
         dst_off: i32,
         nbytes: i32,
     ) {
+        // A register destination *is* the aggregate, so it takes one load of
+        // the whole slot. Chunking into it wrote each piece over the last, so
+        // a five-byte aggregate kept only its fifth byte -- and where the
+        // destination register was also the source base, the first write moved
+        // the base out from under the reads that followed. Every slot is at
+        // least eight bytes, in the save area and on the stack alike.
+        if let VaAggDst::Value(r) = dst {
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Mem(MemAddr::BaseOffset {
+                    base: src_base,
+                    offset: src_off,
+                }),
+                dst: GpOperand::Reg(r),
+            });
+            return;
+        }
         let mut done = 0;
         while done < nbytes {
             let chunk = [8, 4, 2, 1]

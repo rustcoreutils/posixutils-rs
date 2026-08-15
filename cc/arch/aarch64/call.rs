@@ -506,8 +506,11 @@ impl Aarch64CodeGen {
                     });
                 }
             } else if arg_type.is_some_and(|t| types.kind(t) == crate::types::TypeKind::Int128) {
-                // __int128 uses two consecutive GP registers
-                if int_arg_idx + 1 < int_arg_regs.len() {
+                // __int128 uses two consecutive *even-aligned* GP registers.
+                if let Some(start) =
+                    crate::arch::aarch64::int128_pair_start(int_arg_idx, int_arg_regs.len())
+                {
+                    int_arg_idx = start;
                     let loc = self.get_location(arg);
                     match loc {
                         Loc::Stack(offset) => {
@@ -545,6 +548,11 @@ impl Aarch64CodeGen {
                         typ: arg_type,
                         kind: StackKind::Scalar,
                     });
+                    // Stage C.11: an argument that does not fit sets NGRN to 8,
+                    // so every later argument is on the stack as well. Leaving
+                    // the index where it was handed the *next* argument a
+                    // register the callee was not reading.
+                    int_arg_idx = int_arg_regs.len();
                 }
             } else if int_arg_idx < int_arg_regs.len() {
                 self.emit_move(arg, int_arg_regs[int_arg_idx], arg_size);

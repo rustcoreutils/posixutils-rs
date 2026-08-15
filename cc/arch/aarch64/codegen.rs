@@ -1339,10 +1339,20 @@ impl Aarch64CodeGen {
                             }
                             fp_arg_idx += 1;
                         } else if types.kind(*typ) == TypeKind::Int128 {
-                            // __int128 argument — uses TWO consecutive GP registers
-                            // Store to the arg pseudo's stack slot (allocated in allocate_arguments).
-                            // The IR will Copy from arg pseudo → local variable.
-                            if int_arg_idx + 1 < arg_regs.len() {
+                            // __int128 argument — uses TWO consecutive GP registers,
+                            // even-aligned per AAPCS64 stage C.10, so an odd NGRN
+                            // skips one. Asked through the same helper the caller
+                            // and the allocator use: computing the pair here
+                            // independently is how the prologue came to read a
+                            // different pair than the caller wrote.
+                            //
+                            // Store to the arg pseudo's stack slot (allocated in
+                            // allocate_arguments). The IR will Copy from arg
+                            // pseudo → local variable.
+                            if let Some(start) =
+                                crate::arch::aarch64::int128_pair_start(int_arg_idx, arg_regs.len())
+                            {
+                                int_arg_idx = start;
                                 if let Some(Loc::Stack(offset)) = self.locations.get_ref(pseudo.id)
                                 {
                                     if *offset < 0 {
@@ -1354,8 +1364,11 @@ impl Aarch64CodeGen {
                                         );
                                     }
                                 }
+                                int_arg_idx += 2;
+                            } else {
+                                // Stage C.11: NGRN becomes 8.
+                                int_arg_idx = arg_regs.len();
                             }
-                            int_arg_idx += 2;
                         } else {
                             // GP argument
                             if int_arg_idx < arg_regs.len() {

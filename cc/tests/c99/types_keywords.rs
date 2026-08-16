@@ -336,9 +336,14 @@ int main(void) {
     if (__builtin_types_compatible_p(int long, int)) return 21;
     if (__builtin_types_compatible_p(int short, int)) return 22;
 
-    /* `long double` must not be caught by the same rule. */
+    /* `long` after `double` names `long double`, not `long`, and not the
+       `double` it followed. Asserted by type identity rather than by size:
+       on macOS aarch64 `long double` *is* `double`, so a size comparison
+       there tests the platform rather than the promotion rule. */
     if (sizeof(long double) != sizeof(double long)) return 23;
-    if (sizeof(long double) == sizeof(double)) return 24;
+    if (!__builtin_types_compatible_p(double long, long double)) return 24;
+    if (__builtin_types_compatible_p(double long, long)) return 25;
+    if (!__builtin_types_compatible_p(long double, double long)) return 26;
 
     return 0;
 }

@@ -260,6 +260,22 @@ define_keywords! {
     (BUILTIN_POPCOUNT,  "__builtin_popcount", BUILTIN),
     (BUILTIN_POPCOUNTL, "__builtin_popcountl", BUILTIN),
     (BUILTIN_POPCOUNTLL, "__builtin_popcountll", BUILTIN),
+    (BUILTIN_PARITY,    "__builtin_parity",   BUILTIN),
+    (BUILTIN_PARITYL,   "__builtin_parityl",  BUILTIN),
+    (BUILTIN_PARITYLL,  "__builtin_parityll", BUILTIN),
+    (BUILTIN_CHOOSE_EXPR, "__builtin_choose_expr", BUILTIN),
+    // Builtins that are the library function of the same name; see
+    // `is_library_builtin`. Listed so `__has_builtin` answers for them.
+    (BUILTIN_STRLEN,    "__builtin_strlen",   BUILTIN),
+    (BUILTIN_STRCMP,    "__builtin_strcmp",   BUILTIN),
+    (BUILTIN_ABS,       "__builtin_abs",      BUILTIN),
+    (BUILTIN_LABS,      "__builtin_labs",     BUILTIN),
+    (BUILTIN_LLABS,     "__builtin_llabs",    BUILTIN),
+    (BUILTIN_FFS,       "__builtin_ffs",      BUILTIN),
+    (BUILTIN_FFSL,      "__builtin_ffsl",     BUILTIN),
+    (BUILTIN_SQRT,      "__builtin_sqrt",     BUILTIN),
+    (BUILTIN_COPYSIGN,  "__builtin_copysign", BUILTIN),
+    (BUILTIN_TRAP,      "__builtin_trap",     BUILTIN),
     // ---- Checked arithmetic (C23 spells these ckd_add and friends) ----
     (BUILTIN_ADD_OVERFLOW, "__builtin_add_overflow", BUILTIN),
     (BUILTIN_SUB_OVERFLOW, "__builtin_sub_overflow", BUILTIN),
@@ -382,6 +398,19 @@ define_keywords! {
     (_,                 "__vsnprintf_chk",      0),
     (_,                 "__vprintf_chk",        0),
     (_,                 "__vfprintf_chk",       0),
+    // Same reason, for the builtins that are just the library function: a
+    // translation unit may call `__builtin_strlen` without having included
+    // the header that declares `strlen`, exactly as gcc allows.
+    (_,                 "strlen",               0),
+    (_,                 "strcmp",               0),
+    (_,                 "abs",                  0),
+    (_,                 "labs",                 0),
+    (_,                 "llabs",                0),
+    (_,                 "ffs",                  0),
+    (_,                 "ffsl",                 0),
+    (_,                 "sqrt",                 0),
+    (_,                 "copysign",             0),
+    (_,                 "abort",                0),
 
     // ---- Supported attribute names (SUPPORTED_ATTR) ----
     // Plain forms

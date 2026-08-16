@@ -241,3 +241,75 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("builtins_checked_arithmetic", code, &[]), 0);
 }
+
+/// Builtins that were absent, and are now present.
+///
+/// `__has_builtin` answered 0 for all of these, so guarded code was already
+/// correct -- the risk was the unguarded uses in system headers, and
+/// `__builtin_choose_expr` in particular, which glibc uses to pick between
+/// expressions that are only valid for one argument type.
+///
+/// Most are the library function under a reserved name, so they lower to an
+/// ordinary call rather than an expression node apiece. That also settles the
+/// question a textual expansion would raise: the argument is evaluated once.
+#[test]
+fn builtins_library_and_bit_builtins_are_available() {
+    let code = r#"#include <string.h>
+#include <math.h>
+int main(void) {
+    /* Compile-time selection: the unselected arm is not type-checked. */
+    if (__builtin_choose_expr(1, 2, "not an int") != 2) return 1;
+    if (__builtin_choose_expr(0, "not an int", 3) != 3) return 2;
+    if (sizeof(__builtin_choose_expr(1, (char)0, (long)0)) != 1) return 3;
+    if (sizeof(__builtin_choose_expr(0, (char)0, (long)0)) != 8) return 4;
+
+    /* String builtins. */
+    if (__builtin_strlen("abcd") != 4) return 5;
+    if (__builtin_strlen("") != 0) return 6;
+    if (__builtin_strcmp("abc", "abc") != 0) return 7;
+    if (__builtin_strcmp("abc", "abd") >= 0) return 8;
+    if (__builtin_strcmp("abd", "abc") <= 0) return 9;
+
+    /* Integer absolute value. */
+    if (__builtin_abs(-5) != 5 || __builtin_abs(5) != 5) return 10;
+    if (__builtin_labs(-5L) != 5L) return 11;
+    if (__builtin_llabs(-5LL) != 5LL) return 12;
+    { int n = -7; if (__builtin_abs(n) != 7) return 13; }
+
+    /* Find first set: one-based, zero for zero. */
+    if (__builtin_ffs(0) != 0) return 14;
+    if (__builtin_ffs(1) != 1) return 15;
+    if (__builtin_ffs(8) != 4) return 16;
+    if (__builtin_ffs(0x80000000) != 32) return 17;
+    if (__builtin_ffsl(0L) != 0) return 18;
+    if (__builtin_ffsl(1L << 40) != 41) return 19;
+
+    /* Parity: low bit of the population count. */
+    if (__builtin_parity(0) != 0) return 20;
+    if (__builtin_parity(7) != 1) return 21;
+    if (__builtin_parity(3) != 0) return 22;
+    if (__builtin_parity(0xFFFFFFFFu) != 0) return 23;
+
+    /* Floating point. */
+    if (__builtin_sqrt(16.0) != 4.0) return 24;
+    if (__builtin_sqrt(0.0) != 0.0) return 25;
+    if (__builtin_copysign(3.0, -1.0) != -3.0) return 26;
+    if (__builtin_copysign(-3.0, 1.0) != 3.0) return 27;
+    if (!signbit(__builtin_copysign(0.0, -1.0))) return 28;
+
+
+
+    /* All of them answer __has_builtin honestly. */
+#define CK(n) do { if (!__has_builtin(n)) return 40; } while (0)
+    CK(__builtin_choose_expr); CK(__builtin_strlen); CK(__builtin_strcmp);
+    CK(__builtin_abs); CK(__builtin_labs); CK(__builtin_llabs);
+    CK(__builtin_ffs); CK(__builtin_ffsl); CK(__builtin_parity);
+    CK(__builtin_trap);
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("builtins_library_and_bit", code, &["-lm".to_string()]),
+        0
+    );
+}

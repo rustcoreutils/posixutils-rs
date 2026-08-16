@@ -37,6 +37,23 @@ pub const SUPPORTED_BUILTINS: &[&str] = &[
     "__builtin_popcount",
     "__builtin_popcountl",
     "__builtin_popcountll",
+    // Bit manipulation - parity (low bit of the population count)
+    "__builtin_parity",
+    "__builtin_parityl",
+    "__builtin_parityll",
+    // Compile-time selection
+    "__builtin_choose_expr",
+    // Builtins that are the library function of the same name
+    "__builtin_strlen",
+    "__builtin_strcmp",
+    "__builtin_abs",
+    "__builtin_labs",
+    "__builtin_llabs",
+    "__builtin_ffs",
+    "__builtin_ffsl",
+    "__builtin_sqrt",
+    "__builtin_copysign",
+    "__builtin_trap",
     // Checked arithmetic
     "__builtin_add_overflow",
     "__builtin_sub_overflow",

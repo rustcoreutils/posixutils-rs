@@ -2634,6 +2634,67 @@ impl<'a> Parser<'a> {
                     token_pos,
                 ))
             })()),
+            crate::kw::BUILTIN_PARITY
+            | crate::kw::BUILTIN_PARITYL
+            | crate::kw::BUILTIN_PARITYLL => Some((|| {
+                // __builtin_parity(x) - 1 if x has an odd number of set bits.
+                //
+                // That is the low bit of the population count, so it reuses
+                // `Popcount` rather than introducing an opcode. Written as a
+                // mask on the single `Popcount` node, the argument is
+                // evaluated once -- `__builtin_parity(f())` calls `f` once,
+                // which a `popcount(x) & 1` textual expansion would not
+                // guarantee.
+                self.expect_special(b'(')?;
+                let arg = self.parse_assignment_expr()?;
+                self.expect_special(b')')?;
+                let kind = match name_id {
+                    crate::kw::BUILTIN_PARITY => ExprKind::Popcount { arg: Box::new(arg) },
+                    crate::kw::BUILTIN_PARITYL => ExprKind::Popcountl { arg: Box::new(arg) },
+                    _ => ExprKind::Popcountll { arg: Box::new(arg) },
+                };
+                let count = Self::typed_expr(kind, self.types.int_id, token_pos);
+                let one = Self::typed_expr(ExprKind::IntLit(1), self.types.int_id, token_pos);
+                Ok(Self::typed_expr(
+                    ExprKind::Binary {
+                        op: BinaryOp::BitAnd,
+                        left: Box::new(count),
+                        right: Box::new(one),
+                    },
+                    self.types.int_id,
+                    token_pos,
+                ))
+            })()),
+            crate::kw::BUILTIN_CHOOSE_EXPR => Some((|| {
+                // __builtin_choose_expr(c, a, b) - selects at parse time.
+                //
+                // Unlike `?:` the condition must be a constant expression and
+                // only the selected arm is kept, so the other one need not
+                // even type-check. That is the whole point of it: glibc uses
+                // it to pick between expressions that are valid for different
+                // argument types. The selection therefore happens here, next
+                // to `_Generic`, rather than anywhere downstream.
+                self.expect_special(b'(')?;
+                let cond_pos = self.current_pos();
+                let cond = self.parse_assignment_expr()?;
+                self.expect_special(b',')?;
+                let then_expr = self.parse_assignment_expr()?;
+                self.expect_special(b',')?;
+                let else_expr = self.parse_assignment_expr()?;
+                self.expect_special(b')')?;
+                match self.eval_const_expr(&cond) {
+                    Some(v) => Ok(if v != 0 { then_expr } else { else_expr }),
+                    None => {
+                        diag::error(
+                            cond_pos,
+                            &gettext(
+                                "first argument to '__builtin_choose_expr' must be a constant expression",
+                            ),
+                        );
+                        Ok(then_expr)
+                    }
+                }
+            })()),
             crate::kw::BUILTIN_ALLOCA => Some((|| {
                 // __builtin_alloca(size) - returns void*
                 self.expect_special(b'(')?;
@@ -3405,12 +3466,28 @@ impl<'a> Parser<'a> {
             })()),
             _ => {
                 let name_str = self.idents.get_opt(name_id).unwrap_or("");
-                if name_str.starts_with("__builtin___") {
+                // A builtin that is nothing but the library function under a
+                // reserved name. gcc knows these intrinsically, and code that
+                // uses them is usually inside the very header that declares
+                // the real one, so the call is spelled `__builtin_` to avoid
+                // depending on a declaration it is in the middle of making.
+                //
+                // They ride the same de-prefixing path as the `_chk` family
+                // below rather than getting an `ExprKind` each: an expression
+                // node per builtin means a case in the linearizer and in both
+                // backends, for something that is already an ordinary call.
+                if name_str.starts_with("__builtin___") || Self::is_library_builtin(name_id) {
                     Some((|| {
                         // Fortified builtins: __builtin___snprintf_chk etc.
                         // Strip __builtin_ prefix → __snprintf_chk, which is a
                         // real libc function (declared by macOS/glibc headers).
-                        let real_name = &name_str["__builtin_".len()..];
+                        // `__builtin_trap` has no same-named library entry
+                        // point; its contract is abnormal termination, which
+                        // is `abort`. Everything else keeps its own name.
+                        let real_name = match name_str {
+                            "__builtin_trap" => "abort",
+                            _ => &name_str["__builtin_".len()..],
+                        };
                         // Parse arguments first (must consume tokens regardless)
                         self.expect_special(b'(')?;
                         let mut args = Vec::new();
@@ -4346,8 +4423,37 @@ impl<'a> Parser<'a> {
             | "__vsprintf_chk" | "__vsnprintf_chk" | "__vprintf_chk" | "__vfprintf_chk" => {
                 Some(self.types.int_id)
             }
+            // The library builtins, for the case where the header that would
+            // declare them has not been included.
+            "strlen" => Some(self.types.ulong_id),
+            "strcmp" | "abs" | "ffs" | "ffsl" => Some(self.types.int_id),
+            "labs" => Some(self.types.long_id),
+            "llabs" => Some(self.types.longlong_id),
+            "sqrt" | "copysign" => Some(self.types.double_id),
+            "abort" => Some(self.types.void_id),
             _ => None,
         }
+    }
+
+    /// Builtins that are the library function of the same name.
+    ///
+    /// Keyed by identifier rather than by spelling so this list and the
+    /// keyword table cannot drift apart -- naming them twice is how
+    /// `__has_builtin` came to disagree with the parser before.
+    fn is_library_builtin(name_id: StringId) -> bool {
+        matches!(
+            name_id,
+            crate::kw::BUILTIN_STRLEN
+                | crate::kw::BUILTIN_STRCMP
+                | crate::kw::BUILTIN_ABS
+                | crate::kw::BUILTIN_LABS
+                | crate::kw::BUILTIN_LLABS
+                | crate::kw::BUILTIN_FFS
+                | crate::kw::BUILTIN_FFSL
+                | crate::kw::BUILTIN_SQRT
+                | crate::kw::BUILTIN_COPYSIGN
+                | crate::kw::BUILTIN_TRAP
+        )
     }
 
     /// Declare a `_chk` entry point, so the call type-checks and returns a
@@ -4377,6 +4483,9 @@ impl<'a> Parser<'a> {
             "__memset_chk" | "__strcpy_chk" | "__stpcpy_chk" | "__strcat_chk" => (3, false),
             "__memcpy_chk" | "__memmove_chk" | "__mempcpy_chk" | "__strncpy_chk"
             | "__stpncpy_chk" | "__strncat_chk" => (4, false),
+            "strlen" | "abs" | "labs" | "llabs" | "ffs" | "ffsl" | "sqrt" => (1, false),
+            "strcmp" | "copysign" => (2, false),
+            "abort" => (0, false),
             // An entry point this does not know is left as it was: variadic,
             // with nothing fixed.
             _ => (0, true),

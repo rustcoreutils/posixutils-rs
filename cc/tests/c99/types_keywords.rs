@@ -437,3 +437,69 @@ int main(void) {
         0
     );
 }
+
+/// An enumerated type must be able to represent every one of its members
+/// (C17 6.7.2.2p4). c17 gave every enum four signed bytes, so an enumerator
+/// that did not fit was silently truncated: `X = 5000000000` came back as
+/// 705032704 and `H = 0xFFFFFFFFU` as -1.
+///
+/// C17 6.7.2.2p2 makes an enumerator outside `int` range a constraint
+/// violation, so a diagnostic is required; gcc issues one under -pedantic and
+/// widens the type. c17 does both -- warn, and widen -- because truncating in
+/// silence is the one response that leaves a program running on a wrong value.
+#[test]
+fn c99_enum_is_wide_enough_for_its_enumerators() {
+    let code = r#"
+enum Small  { S = 1 };
+enum Neg    { N = -1, NP = 1 };
+enum UMax   { U = 0xFFFFFFFFU };
+enum Big    { B = 5000000000 };
+enum BigNeg { BN = -5000000000 };
+enum Mixed  { M0 = -1, M1 = 5000000000 };
+
+int main(void) {
+    /* An enum that fits in int keeps int's size. */
+    if (sizeof(enum Small) != 4) return 1;
+    if (S != 1) return 2;
+    if (sizeof(enum Neg) != 4) return 3;
+    if (N != -1 || NP != 1) return 4;
+
+    /* Too large for int, but representable unsigned in 32 bits. */
+    if (U != 0xFFFFFFFFU) return 5;
+    if ((unsigned long long)U != 4294967295ULL) return 6;
+
+    /* Too large for 32 bits either way. */
+    if (sizeof(enum Big) != 8) return 7;
+    if (B != 5000000000) return 8;
+    if ((long long)B != 5000000000LL) return 9;
+
+    if (sizeof(enum BigNeg) != 8) return 10;
+    if ((long long)BN != -5000000000LL) return 11;
+
+    /* A negative member forces a signed underlying type even though the
+       other member would fit unsigned. */
+    if (sizeof(enum Mixed) != 8) return 12;
+    if ((long long)M0 != -1LL) return 13;
+    if ((long long)M1 != 5000000000LL) return 14;
+
+    /* The values survive arithmetic, not just comparison. */
+    if (B / 2 != 2500000000) return 15;
+    if (B - 5000000000 != 0) return 16;
+
+    /* A variable of the type holds them too. */
+    {
+        enum Big v = B;
+        if ((long long)v != 5000000000LL) return 17;
+        if (sizeof v != 8) return 18;
+    }
+
+    /* Implicit successor values continue from a widened predecessor. */
+    {
+        enum Succ { P = 5000000000, Q };
+        if ((long long)Q != 5000000001LL) return 19;
+    }
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_enum_underlying_type", code, &[]), 0);
+}

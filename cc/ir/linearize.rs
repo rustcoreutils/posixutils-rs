@@ -3759,7 +3759,10 @@ impl<'a> Linearizer<'a> {
         // First check if it's an enum constant
         if sym.is_enum_constant() {
             if let Some(value) = sym.enum_value {
-                return self.emit_const(value as i128, self.types.int_id);
+                // The symbol's own type, not `int`: an enumeration whose
+                // members do not fit in `int` is wider than one, and emitting
+                // its constants as `int` would truncate them right back.
+                return self.emit_const(value, sym.typ);
             }
         }
 

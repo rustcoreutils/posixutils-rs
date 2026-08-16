@@ -348,7 +348,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     // Check if it's an enum constant
                     let sym = self.symbols.get(*symbol_id);
                     if let Some(val) = sym.enum_value {
-                        Initializer::Int(val as i128)
+                        Initializer::Int(val)
                     } else {
                         Initializer::None
                     }

@@ -3527,11 +3527,18 @@ impl<'a> Parser<'a> {
                     // Check if this is an enum constant - if so, return IntLit
                     if let Some(sym) = self.symbols.lookup_enum_constant(name_id) {
                         if let Some(value) = sym.enum_value {
-                            return Ok(Self::typed_expr(
-                                ExprKind::IntLit(value),
-                                self.types.int_id,
-                                token_pos,
-                            ));
+                            // The constant carries its enumeration's type, not
+                            // a fixed `int`: when a member does not fit in
+                            // `int` the whole enumeration widens, and reading
+                            // the constant back as `int` would undo that.
+                            let typ = sym.typ;
+                            let kind = match i64::try_from(value) {
+                                Ok(v) => ExprKind::IntLit(v),
+                                // Only an `unsigned long` enumeration above
+                                // `LONG_MAX` lands here.
+                                Err(_) => ExprKind::Int128Lit(value),
+                            };
+                            return Ok(Self::typed_expr(kind, typ, token_pos));
                         }
                     }
 

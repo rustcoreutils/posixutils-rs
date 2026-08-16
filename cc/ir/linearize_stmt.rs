@@ -1524,7 +1524,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 // Check if it's an enum constant
                 let sym = self.symbols.get(*symbol_id);
                 if sym.is_enum_constant() {
-                    sym.enum_value.map(|v| v as i128)
+                    sym.enum_value
                 } else {
                     None
                 }

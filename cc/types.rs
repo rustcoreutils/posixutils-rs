@@ -79,8 +79,12 @@ pub struct MemberInfo {
 pub struct EnumConstant {
     /// Constant name (interned StringId)
     pub name: StringId,
-    /// Constant value
-    pub value: i64,
+    /// Constant value.
+    ///
+    /// Held at 128 bits so nothing wraps on the way in: an enumerator may
+    /// need `unsigned long`, whose upper half does not fit a signed 64-bit
+    /// slot, and truncating here is the defect this width exists to prevent.
+    pub value: i128,
 }
 
 /// Composite type definition (struct, union, or enum)
@@ -1407,7 +1411,10 @@ impl TypeTable {
                 (typ.composite.as_ref().map(|c| c.size).unwrap_or(0) * 8) as u32
             }
             TypeKind::Function => 0,
-            TypeKind::Enum => 32,
+            // An enumeration is as wide as the integer type it was found to
+            // be compatible with (C17 6.7.2.2p4), which is `int` unless a
+            // member did not fit. A forward reference has no members yet.
+            TypeKind::Enum => (typ.composite.as_ref().map(|c| c.size).unwrap_or(4) * 8) as u32,
             TypeKind::VaList => self.va_list_size_bits(),
         }
     }
@@ -1419,7 +1426,7 @@ impl TypeTable {
             TypeKind::Struct | TypeKind::Union => {
                 typ.composite.as_ref().map(|c| c.size).unwrap_or(0)
             }
-            TypeKind::Enum => 4,
+            TypeKind::Enum => typ.composite.as_ref().map(|c| c.size).unwrap_or(4),
             _ => (self.size_bits(id) / 8) as usize,
         }
     }
@@ -1446,7 +1453,7 @@ impl TypeTable {
             TypeKind::Struct | TypeKind::Union => {
                 typ.composite.as_ref().map(|c| c.align).unwrap_or(1)
             }
-            TypeKind::Enum => 4,
+            TypeKind::Enum => typ.composite.as_ref().map(|c| c.align).unwrap_or(4),
             TypeKind::Array => typ.base.map(|b| self.alignment(b)).unwrap_or(1),
             TypeKind::Function => 1,
             TypeKind::VaList => self.va_list_alignment(),

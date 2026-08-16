@@ -3010,9 +3010,48 @@ impl Parser<'_> {
         }
     }
 
+    /// The integer type an enumerated type is compatible with, and its size.
+    ///
+    /// C17 6.7.2.2p4 requires it to represent every member; the choice among
+    /// the types that do is implementation-defined. Narrowest wins, signed
+    /// before unsigned at each width, so an enum whose members all fit in
+    /// `int` is exactly the four signed bytes it has always been -- the
+    /// widening only happens where the alternative was a wrong value.
+    fn enum_underlying_type(
+        &mut self,
+        constants: &[EnumConstant],
+        pos: Position,
+    ) -> (TypeId, usize) {
+        let Some(min) = constants.iter().map(|c| c.value).min() else {
+            return (self.types.int_id, 4);
+        };
+        let max = constants.iter().map(|c| c.value).max().unwrap_or(0);
+
+        let fits = |lo: i128, hi: i128| min >= lo && max <= hi;
+        if fits(i32::MIN as i128, i32::MAX as i128) {
+            (self.types.int_id, 4)
+        } else if fits(0, u32::MAX as i128) {
+            (self.types.uint_id, 4)
+        } else if fits(i64::MIN as i128, i64::MAX as i128) {
+            (self.types.long_id, 8)
+        } else if fits(0, u64::MAX as i128) {
+            (self.types.ulong_id, 8)
+        } else {
+            // A list spanning below i64::MIN and above i64::MAX has no
+            // integer type that holds both ends. Say so rather than picking
+            // one and truncating the other.
+            diag::error(
+                pos,
+                &gettext("no integer type can represent all values of this enumeration"),
+            );
+            (self.types.long_id, 8)
+        }
+    }
+
     /// Parse an enum specifier
     /// enum-specifier: 'enum' identifier? '{' enumerator-list? '}' | 'enum' identifier
     pub(crate) fn parse_enum_specifier(&mut self) -> ParseResult<Type> {
+        let enum_pos = self.current_pos();
         self.advance(); // consume 'enum'
 
         // Optional tag name
@@ -3027,18 +3066,38 @@ impl Parser<'_> {
             self.advance(); // consume '{'
 
             let mut constants = Vec::with_capacity(DEFAULT_ENUM_CAPACITY);
-            let mut next_value = 0i64;
+            let mut next_value = 0i128;
+            // The enumerators bind before the enum's own width is known --
+            // `enum { A = 1, B = A + 1 }` reads A while the list is still
+            // being parsed -- so they are declared with a provisional type
+            // and re-typed once every value has been seen.
+            let mut constant_syms: Vec<SymbolId> = Vec::new();
 
             while !self.is_special(b'}') && !self.is_eof() {
                 let name = self.expect_identifier()?;
 
                 let value = if self.is_special(b'=') {
                     self.advance();
+                    let value_pos = self.current_pos();
                     let expr = self.parse_conditional_expr()?;
                     // Evaluate constant expression
-                    self.eval_const_expr(&expr).ok_or_else(|| {
+                    let v = self.eval_const_expr(&expr).ok_or_else(|| {
                         ParseError::new("enum value must be constant", self.current_pos())
-                    })? as i64
+                    })?;
+                    // C17 6.7.2.2p2 requires an enumerator to be
+                    // representable as `int`, so exceeding it is a constraint
+                    // violation and 5.1.1.3 requires it be diagnosed. gcc
+                    // widens the enumerated type rather than rejecting, and
+                    // so does c17 -- but not in silence, which is how
+                    // `X = 5000000000` used to become 705032704.
+                    if v < i32::MIN as i128 || v > i32::MAX as i128 {
+                        diag::warning_args(
+                            value_pos,
+                            "enumerator value {0} is outside the range of 'int'",
+                            &[&v.to_string()],
+                        );
+                    }
+                    v
                 } else {
                     next_value
                 };
@@ -3049,7 +3108,9 @@ impl Parser<'_> {
                 // Register enum constant in symbol table (Ordinary namespace)
                 let sym =
                     Symbol::enum_constant(name, value, self.types.int_id, self.symbols.depth());
-                let _ = self.symbols.declare(sym);
+                if let Ok(id) = self.symbols.declare(sym) {
+                    constant_syms.push(id);
+                }
 
                 if self.is_special(b',') {
                     self.advance();
@@ -3072,12 +3133,22 @@ impl Parser<'_> {
 
             self.expect_special(b'}')?;
 
+            // C17 6.7.2.2p4: the enumerated type is compatible with some
+            // integer type capable of representing every member. Pick the
+            // narrowest that is, preferring signed at each width, and give
+            // the enumerators that type -- for an enum that fits in `int`,
+            // which is nearly all of them, this is the `int` it always was.
+            let (underlying, size) = self.enum_underlying_type(&constants, enum_pos);
+            for &sym_id in &constant_syms {
+                self.symbols.get_mut(sym_id).typ = underlying;
+            }
+
             let composite = CompositeType {
                 tag,
                 members: Vec::new(),
                 enum_constants: constants,
-                size: 4,
-                align: 4,
+                size,
+                align: size,
                 is_complete: true,
             };
 
@@ -5093,7 +5164,7 @@ impl Parser<'_> {
                 // Check for enum constant
                 let sym = self.symbols.get(*symbol_id);
                 if sym.is_enum_constant() {
-                    sym.enum_value.map(|v| v as i128)
+                    sym.enum_value
                 } else {
                     None
                 }

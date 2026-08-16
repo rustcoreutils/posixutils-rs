@@ -8681,3 +8681,85 @@ int main(void) {
         0
     );
 }
+
+/// Widening an integer to a 128-bit *parameter* is a conversion like any
+/// other, and the argument path was the one place that did not do it.
+///
+/// The predicate that decides whether a call argument needs converting was
+/// bounded at `arg_size <= 32 && param_size <= 64` -- written for int->long
+/// and never widened when `__int128` arrived. Assignment, `return`, binary
+/// operators and initializers all convert correctly, so the type looks
+/// supported everywhere except where it is passed.
+///
+/// Every assertion reads the *high* half. Passing a positive value happens to
+/// leave the right bits in the low half, so a test that checks only `(long)v`
+/// passes against the broken compiler for five of the seven cases below.
+#[test]
+fn codegen_integer_argument_widens_to_a_128_bit_parameter() {
+    let code = r#"
+typedef __int128 i128;
+typedef unsigned __int128 u128;
+
+__attribute__((noinline)) static long hi(i128 v) { return (long)(v >> 64); }
+__attribute__((noinline)) static long lo(i128 v) { return (long)v; }
+__attribute__((noinline)) static long uhi(u128 v) { return (long)(v >> 64); }
+
+int main(void) {
+    /* Signed sources sign-extend into both halves. */
+    {
+        char c = -3;
+        if (lo(c) != -3 || hi(c) != -1) return 1;
+    }
+    {
+        short s = -3;
+        if (lo(s) != -3 || hi(s) != -1) return 2;
+    }
+    {
+        int i = -3;
+        if (lo(i) != -3 || hi(i) != -1) return 3;
+    }
+    {
+        long l = -3;
+        if (lo(l) != -3 || hi(l) != -1) return 4;
+    }
+
+    /* Literals travel the same path as variables. */
+    if (lo(-3) != -3 || hi(-3) != -1) return 5;
+    if (lo(-3L) != -3 || hi(-3L) != -1) return 6;
+
+    /* An expression, not just a leaf. */
+    {
+        int i = -1;
+        if (lo(i - 2) != -3 || hi(i - 2) != -1) return 7;
+    }
+
+    /* Unsigned sources zero-extend; the low half alone cannot tell these
+       apart from the signed cases above, which is the point. */
+    {
+        unsigned u = 3;
+        if (lo(u) != 3 || hi(u) != 0) return 8;
+    }
+    {
+        unsigned long ul = ~0UL;
+        if (uhi(ul) != 0) return 9;
+        if (lo((i128)ul) != -1) return 10;
+    }
+
+    /* An explicit cast was always correct -- keep it as the control. */
+    {
+        int i = -3;
+        if (lo((i128)i) != -3 || hi((i128)i) != -1) return 11;
+    }
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_int_argument_widens_to_int128", code, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run_optimized("codegen_int_argument_widens_to_int128_opt", code),
+        0
+    );
+}

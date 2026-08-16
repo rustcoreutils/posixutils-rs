@@ -3016,9 +3016,18 @@ impl<'a> Linearizer<'a> {
                         let param_is_fp = self.types.is_float(param_type);
 
                         let needs_convert =
-                            // Integer widening (e.g., int→long)
-                            (arg_is_int && param_is_int && arg_size < param_size
-                                && arg_size <= 32 && param_size <= 64)
+                            // Integer widening (e.g., int→long, long→__int128).
+                            //
+                            // The size bounds this test used to carry --
+                            // `arg_size <= 32 && param_size <= 64` -- were
+                            // written when int→long was the only widening
+                            // there was, and they silently excluded every
+                            // 128-bit parameter. An `int` argument then
+                            // reached an `__int128` parameter unconverted, so
+                            // the callee read a register pair of which only
+                            // half had been written. Widening is decided by
+                            // the two sizes; nothing about it stops at 64.
+                            (arg_is_int && param_is_int && arg_size < param_size)
                             // FP size mismatch (float→double, long double→double, etc.)
                             || (arg_is_fp && param_is_fp && arg_size != param_size)
                             // Integer to FP (uint32_t→double, int→float, etc.)

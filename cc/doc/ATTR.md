@@ -19,6 +19,21 @@ c17 supports GNU-style attributes that modify function, variable, and type behav
 
 All attribute names accept the double-underscore variant (`__name__`) as an alternative spelling.
 
+### Where an attribute is written
+
+An attribute applies to a declarator or to a whole declaration depending on
+where it appears, and c17 follows gcc:
+
+```c
+int p, q __attribute__((aligned(64))), r;   /* q alone */
+int __attribute__((aligned(64))) u, v;      /* u and v */
+_Alignas(64) int w, x;                      /* w and x */
+```
+
+This matters for the per-symbol attributes -- `weak`, `section`, `visibility`
+and `used` -- where naming the wrong symbol is an ABI change rather than a
+missed optimization.
+
 ## Supported Attributes
 
 Attributes fall into three categories based on implementation depth:
@@ -28,7 +43,7 @@ Attributes fall into three categories based on implementation depth:
 | Attribute | Applies to | Effect |
 |-----------|-----------|--------|
 | `noreturn` | Functions | Emits trap after call; enables DCE |
-| `packed` | Structs/unions | Removes padding from layout |
+| `packed` | Structs/unions | Removes padding from layout. Shares one alignment-cap rule with `#pragma pack`, which caps at `n` rather than 1; where both apply the tighter wins |
 | `aligned` | Types, variables | Raises alignment; `.align` on a variable, layout and `_Alignof` on a type. Verified to match gcc |
 | `sysv_abi` | Functions | Forces System V AMD64 calling convention |
 | `ms_abi` | Functions | Forces Win64 calling convention |

@@ -256,7 +256,15 @@ pub fn opcode_constraints(op: Opcode) -> RegConstraints {
         },
         // Int128 mul uses `mulq` which clobbers RAX:RDX. Regular mul uses IMul2
         // which doesn't depend on these, so marking them as clobbers is safe for both.
-        Opcode::Mul => RegConstraints {
+        //
+        // `UMulHi` is the *other* half of that same `mulq`, and it was missing
+        // here. The 128-bit product expansion reads `a_lo` twice -- once for
+        // `umulhi(a_lo, b_lo)` and again for the cross term `a_lo * b_hi` --
+        // so an `a_lo` parked in RAX was destroyed by the multiply and the
+        // cross term computed from the low product instead. The fault only
+        // showed when `b_hi` was non-zero, because otherwise that term is
+        // multiplied by zero.
+        Opcode::Mul | Opcode::UMulHi => RegConstraints {
             clobbers: &[Reg::Rax, Reg::Rdx],
         },
         // The TLS descriptor sequence hard-uses %rax: the `@TLSCALL`
@@ -1587,7 +1595,7 @@ impl RegAlloc {
                     let needs_spill = constraint_points.iter().any(|cp| {
                         interval.start <= cp.position
                             && cp.position <= interval.end
-                            && !cp.involved_pseudos.contains(&interval.pseudo)
+                            && !cp.operand_survives(interval.pseudo, interval.start, interval.end)
                             && cp.clobbers.contains(reg)
                     });
 
@@ -1958,7 +1966,7 @@ impl RegAlloc {
                 if interval.start > cp.position || cp.position > interval.end {
                     continue;
                 }
-                if cp.involved_pseudos.contains(&interval.pseudo) {
+                if cp.operand_survives(interval.pseudo, interval.start, interval.end) {
                     continue;
                 }
                 let entry = forbidden.entry(interval.pseudo).or_default();

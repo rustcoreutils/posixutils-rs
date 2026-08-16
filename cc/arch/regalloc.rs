@@ -139,6 +139,28 @@ pub struct ConstraintPoint<R> {
     pub involved_pseudos: Vec<PseudoId>,
 }
 
+impl<R> ConstraintPoint<R> {
+    /// May `interval` sit in a register this point clobbers?
+    ///
+    /// Being an operand of the clobbering instruction is not enough on its
+    /// own. `mulq` and `idivq` read an operand out of a fixed register and
+    /// write their result back over it, so an operand whose value is still
+    /// wanted *after* the instruction is destroyed by it. The exemption is
+    /// only sound at the two ends of a live range:
+    ///
+    /// - the range starts here, so the pseudo *is* what the instruction
+    ///   produces (the `%rdx` half of a `mulq`, the quotient in `%rax`);
+    /// - the range ends here, so the value has been consumed and nothing
+    ///   reads it again.
+    ///
+    /// A range that spans the point strictly is live on both sides, and the
+    /// instruction overwrites it in between. That is what left a 128-bit
+    /// product's cross term computed from the low half of its own multiply.
+    pub fn operand_survives(&self, pseudo: PseudoId, start: usize, end: usize) -> bool {
+        self.involved_pseudos.contains(&pseudo) && (start >= self.position || end <= self.position)
+    }
+}
+
 // ============================================================================
 // Common Functions
 // ============================================================================

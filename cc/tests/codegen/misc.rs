@@ -8590,3 +8590,94 @@ int main(void) {
         0
     );
 }
+
+/// A 128-bit product is assembled from four 64-bit pieces, and three of them
+/// are read *after* the one instruction that destroys a hardware register.
+///
+/// `expand_int128_mul` lowers `a * b` to
+/// `lo = a_lo*b_lo`, `hi = umulhi(a_lo,b_lo) + a_lo*b_hi + a_hi*b_lo`.
+/// On x86-64 the `umulhi` is `mulq`, which takes one operand in `%rax` and
+/// writes the whole product back over `%rdx:%rax` -- so `a_lo` is gone by the
+/// time `a_lo*b_hi` wants it. Every assertion here therefore reads the *high*
+/// half: a product whose low half is right and whose high half is garbage is
+/// exactly what this bug produces, and `(long)(a*b)` cannot see it.
+///
+/// The `b_hi == 0` cases are controls. They were correct throughout, because
+/// the cross term the clobber ruins is multiplied by zero.
+#[test]
+fn codegen_int128_mul_reads_operands_after_the_hardware_multiply() {
+    let code = r#"
+typedef __int128 i128;
+typedef unsigned __int128 u128;
+
+__attribute__((noinline)) static i128 mul(i128 a, i128 b) { return a * b; }
+__attribute__((noinline)) static u128 umul(u128 a, u128 b) { return a * b; }
+
+static long hi(i128 v) { return (long)(v >> 64); }
+static long lo(i128 v) { return (long)v; }
+
+int main(void) {
+    i128 m1 = -1, m3 = -3, m4 = -4, p3 = 3, p4 = 4;
+
+    /* Both operands negative: every half of both is set. */
+    if (hi(mul(m1, m1)) != 0) return 1;
+    if (lo(mul(m1, m1)) != 1) return 2;
+    if (hi(mul(m3, m4)) != 0) return 3;
+    if (lo(mul(m3, m4)) != 12) return 4;
+
+    /* Control: b_hi == 0, so the ruined cross term contributes nothing. */
+    if (hi(mul(m3, p4)) != -1) return 5;
+    if (lo(mul(m3, p4)) != -12) return 6;
+
+    /* The same shape with the negative operand second -- this is the half
+       that broke, and it is the one a symmetric-looking test omits. */
+    if (hi(mul(p3, m4)) != -1) return 7;
+    if (lo(mul(p3, m4)) != -12) return 8;
+
+    /* Neither operand negative, but both high halves are set. */
+    {
+        i128 a = (i128)1 << 70;
+        i128 b = (i128)1 << 70;
+        if (mul(a, b) != 0) return 9;            /* overflows away exactly */
+        if (hi(mul(a, 3)) != 0xc0) return 10;
+    }
+    {
+        i128 a = (i128)-1 << 40;
+        i128 b = (i128)-1 << 20;
+        if (hi(mul(a, b)) != 0) return 11;
+        if (lo(mul(a, b)) != 0x1000000000000000L) return 12;
+    }
+
+    /* Unsigned travels the same expansion. */
+    {
+        u128 a = ~(u128)0;
+        u128 b = 3;
+        u128 r = umul(a, b);
+        if ((unsigned long)(r >> 64) != ~0UL) return 13;
+        if ((unsigned long)r != ~0UL - 2) return 14;
+    }
+
+    /* The overflow builtins compute in 128 bits, so they inherit the fault:
+       (-1) * (-1) is 1, which every unsigned destination represents. */
+    {
+        unsigned u;
+        unsigned long long ull;
+        int a = -1, b = -1;
+        if (__builtin_mul_overflow(a, b, &u)) return 15;
+        if (u != 1u) return 16;
+        if (__builtin_mul_overflow(a, b, &ull)) return 17;
+        if (ull != 1ull) return 18;
+    }
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_int128_mul_operand_clobber", code, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run_optimized("codegen_int128_mul_operand_clobber_opt", code),
+        0
+    );
+}

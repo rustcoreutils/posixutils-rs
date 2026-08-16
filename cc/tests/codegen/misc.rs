@@ -8763,3 +8763,76 @@ int main(void) {
         0
     );
 }
+
+/// A struct small enough to travel in a register travels as its *value*, and
+/// the value has to be loaded at the struct's width -- not at the largest
+/// power of two that fits inside it.
+///
+/// Only three bytes reproduce this. Sizes 1, 2, 4 and 8 are machine widths;
+/// 5, 6 and 7 take a different path; 3 is the one size that rounded *down*,
+/// so a `struct { char b[3]; }` argument arrived with its first byte and two
+/// zeros.
+///
+/// It also only reproduces for an rvalue -- `p(r())` rather than
+/// `p(local)` -- because a named struct is passed from its address. Both
+/// forms are asserted here; only the second half ever failed.
+#[test]
+fn codegen_small_struct_argument_travels_at_its_own_width() {
+    let code = r#"
+#define DEF(N)                                                              \
+    struct S##N { char b[N]; };                                             \
+    __attribute__((noinline)) static long p##N(struct S##N v) {             \
+        long t = 0;                                                         \
+        for (int i = 0; i < N; i++) t = t * 7 + v.b[i];                     \
+        return t;                                                           \
+    }                                                                       \
+    __attribute__((noinline)) static struct S##N r##N(void) {               \
+        struct S##N v;                                                      \
+        for (int i = 0; i < N; i++) v.b[i] = (char)(i + 1);                 \
+        return v;                                                           \
+    }
+
+DEF(1) DEF(2) DEF(3) DEF(4) DEF(5) DEF(6) DEF(7) DEF(8)
+DEF(9) DEF(10) DEF(11) DEF(12) DEF(13) DEF(14) DEF(15) DEF(16)
+
+/* t = sum over i of (i+1) * 7^(N-1-i) */
+static long expected(int n) {
+    long t = 0;
+    for (int i = 0; i < n; i++) t = t * 7 + (i + 1);
+    return t;
+}
+
+#define CHECK(N)                                                            \
+    do {                                                                    \
+        struct S##N local = r##N();                                         \
+        if (p##N(local) != expected(N)) return N;                           \
+        if (p##N(r##N()) != expected(N)) return 100 + N;                    \
+    } while (0)
+
+int main(void) {
+    CHECK(1);  CHECK(2);  CHECK(3);  CHECK(4);
+    CHECK(5);  CHECK(6);  CHECK(7);  CHECK(8);
+    CHECK(9);  CHECK(10); CHECK(11); CHECK(12);
+    CHECK(13); CHECK(14); CHECK(15); CHECK(16);
+
+    /* A three-byte struct with a member of each kind, not just a char
+       array -- the width comes from the struct, not from what is in it. */
+    {
+        struct M { char a; short b; };
+        struct M m;
+        m.a = 5; m.b = 0x1234;
+        if (sizeof(struct M) != 4) return 200;
+        if (m.a != 5 || m.b != 0x1234) return 201;
+    }
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_small_struct_arg_width", code, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run_optimized("codegen_small_struct_arg_width_opt", code),
+        0
+    );
+}

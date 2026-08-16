@@ -535,6 +535,14 @@ pub struct Parser<'a> {
     /// Explicit alignment from _Alignas in current declaration
     /// Cleared after each declaration is parsed.
     pending_alignas: Option<u32>,
+    /// Alignment from an attribute written *after* a declarator.
+    ///
+    /// Kept apart from `pending_alignas` because the two have different
+    /// scope: `_Alignas`, and an attribute in the specifier position, belong
+    /// to the whole declaration and reach every declarator, while
+    /// `int a, b __attribute__((aligned(64)));` aligns only `b`. Sharing one
+    /// slot over-aligned every declarator that followed an attributed one.
+    pending_declarator_align: Option<u32>,
     /// `weak`, `used`, `section(...)`, `visibility(...)` seen on the
     /// declaration being parsed. Accumulated like `pending_alignas`, because
     /// an attribute may appear before the declarator, after it, or on the
@@ -602,6 +610,7 @@ impl<'a> Parser<'a> {
             types,
             pos: 0,
             pending_alignas: None,
+            pending_declarator_align: None,
             pending_symbol_attrs: Default::default(),
             pending_fn_attrs: Default::default(),
             declared_fn_attrs: BTreeMap::new(),
@@ -1428,12 +1437,34 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `skip_extensions` for the position just after a declarator, where an
+    /// `aligned` attribute names that declarator alone rather than the whole
+    /// declaration.
+    fn skip_extensions_after_declarator(&mut self) {
+        self.skip_extensions_inner(true)
+    }
+
     /// Parse __attribute__, __asm, and nullability extensions, wiring aligned() to pending_alignas
     fn skip_extensions(&mut self) {
+        self.skip_extensions_inner(false)
+    }
+
+    fn skip_extensions_inner(&mut self, declarator_scoped: bool) {
         loop {
             if self.is_attribute_keyword() {
                 let attrs = self.parse_attributes();
-                self.apply_attribute_alignment(&attrs);
+                if declarator_scoped {
+                    if let Some(align) = attrs.get_alignment() {
+                        if align > 0 && align.is_power_of_two() {
+                            self.pending_declarator_align = Some(
+                                self.pending_declarator_align
+                                    .map_or(align, |a| a.max(align)),
+                            );
+                        }
+                    }
+                } else {
+                    self.apply_attribute_alignment(&attrs);
+                }
                 self.merge_symbol_attrs(&attrs);
                 let fn_attrs = attrs.function_attrs();
                 self.pending_fn_attrs.merge(&fn_attrs);
@@ -2208,7 +2239,7 @@ impl Parser<'_> {
                 let (name, mut typ, vla_sizes, _func_params) =
                     self.parse_declarator(base_type_id, DeclaratorName::Required)?;
                 // Skip GCC extensions like __asm("...") or __attribute__((...))
-                self.skip_extensions();
+                self.skip_extensions_after_declarator();
 
                 // Check if we have a name (needed for symbol binding)
                 let has_name = !self.str(name).is_empty();
@@ -4903,7 +4934,7 @@ impl Parser<'_> {
         }
 
         // Skip any __attribute__ after variable name/array declarator
-        self.skip_extensions();
+        self.skip_extensions_after_declarator();
 
         // Validate explicit alignment (C11 6.7.5: >= natural alignment)
         let validated_align = self.validated_explicit_align(var_type_id)?;
@@ -4999,6 +5030,13 @@ impl Parser<'_> {
             let next_decl_pos = self.current_pos();
             let (decl_name, mut decl_type, vla_sizes, _decl_func_params) =
                 self.parse_declarator(base_type_id, DeclaratorName::Required)?;
+
+            // An attribute may follow any declarator, not just the first.
+            // Without this the second one was a syntax error -- `int a, b
+            // __attribute__((unused));` did not compile at file scope, while
+            // the same line inside a function did, because the block-scope
+            // loop has always parsed attributes after every declarator.
+            self.skip_extensions_after_declarator();
 
             // C99 6.7.5.2: VLAs must have block scope
             if !vla_sizes.is_empty() {
@@ -5364,10 +5402,16 @@ impl Parser<'_> {
     /// Returns the validated explicit alignment, or error if alignment is weaker than natural.
     /// Returns None if no explicit alignment was specified.
     /// Also propagates alignment from typedef's explicit_align.
-    fn validated_explicit_align(&self, typ: TypeId) -> ParseResult<Option<u32>> {
+    fn validated_explicit_align(&mut self, typ: TypeId) -> ParseResult<Option<u32>> {
         // Combine pending_alignas (from _Alignas / __attribute__) with type's explicit_align
         let type_align = self.types.get(typ).explicit_align;
-        let effective = match (self.pending_alignas, type_align) {
+        // An attribute written after this declarator belongs to it alone, so
+        // take it here and leave nothing behind for the next one.
+        let declaration_align = match (self.pending_alignas, self.pending_declarator_align.take()) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        let effective = match (declaration_align, type_align) {
             (Some(a), Some(b)) => Some(a.max(b)),
             (Some(a), None) => Some(a),
             (None, Some(b)) => Some(b),
@@ -5380,7 +5424,7 @@ impl Parser<'_> {
                 // For C11 _Alignas validation, don't reject typedef alignment that
                 // exceeds the natural alignment of the underlying type (that's the point).
                 // Only reject explicit _Alignas that reduces below natural.
-                if self.pending_alignas.is_some() {
+                if declaration_align.is_some() {
                     let natural = self.types.alignment(typ) as u32;
                     if explicit < natural {
                         return Err(ParseError::new(

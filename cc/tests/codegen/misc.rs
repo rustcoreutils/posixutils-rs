@@ -8836,3 +8836,157 @@ int main(void) {
         0
     );
 }
+
+/// An attribute belongs to the declarator it follows, and a declaration may
+/// hold several. At file scope the continuation loop went straight from
+/// `parse_declarator` to symbol binding with no attribute parse at all, so
+/// `int a, b __attribute__((section(".s")));` was not a misplaced attribute
+/// but a syntax error. The same declaration inside a function was accepted,
+/// because the block-scope loop parses attributes after every declarator.
+///
+/// The distinction the test pins is per-declarator: `weak`, `section`,
+/// `visibility` and `used` name one symbol, so an attribute written on `b`
+/// must not reach `a`.
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn codegen_attribute_binds_to_its_own_file_scope_declarator() {
+    let asm = asm_for(
+        "attr_later_declarator",
+        r#"
+int plain_a = 1, sect_b __attribute__((section(".mysec"))) = 2;
+int plain_c = 3, weak_d __attribute__((weak)) = 4;
+int plain_e = 5, hidden_f __attribute__((visibility("hidden"))) = 6;
+int plain_g = 7, aligned_h __attribute__((aligned(64))) = 8;
+"#,
+    );
+
+    // The attributed symbol got its attribute...
+    assert!(
+        asm.contains(".mysec"),
+        "sect_b should land in .mysec:\n{asm}"
+    );
+    assert!(
+        asm.contains(".weak weak_d") || asm.contains(".weak\tweak_d"),
+        "weak_d should be weak:\n{asm}"
+    );
+    assert!(
+        asm.contains(".hidden hidden_f") || asm.contains(".hidden\thidden_f"),
+        "hidden_f should be hidden:\n{asm}"
+    );
+
+    // ...and its neighbours in the same declaration did not.
+    for leaked in ["plain_a", "plain_c", "plain_e", "plain_g"] {
+        assert!(
+            !asm.contains(&format!(".weak {leaked}")),
+            "{leaked} must not be weak:\n{asm}"
+        );
+        assert!(
+            !asm.contains(&format!(".hidden {leaked}")),
+            "{leaked} must not be hidden:\n{asm}"
+        );
+    }
+
+    // A section directive names exactly one symbol: the one that asked.
+    let mysec_line = asm
+        .lines()
+        .position(|l| l.contains(".mysec"))
+        .expect("a .mysec directive");
+    let after: String = asm
+        .lines()
+        .skip(mysec_line)
+        .take(6)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        after.contains("sect_b"),
+        ".mysec should be followed by sect_b:\n{after}"
+    );
+    assert!(
+        !after.contains("plain_a"),
+        "plain_a must not share sect_b's section:\n{after}"
+    );
+}
+
+/// The same declaration shape has to keep working as a program, not just as
+/// assembly -- including the attributes that carry no symbol directive.
+#[test]
+fn codegen_attributes_on_later_declarators_compile_and_run() {
+    let code = r#"
+#include <stdlib.h>
+int a1 = 1, a2 __attribute__((unused)) = 2, a3 = 3;
+int b1 = 4, b2 __attribute__((aligned(64))) = 5;
+static int c1 = 6, c2 __attribute__((used)) = 7;
+extern int d1, d2 __attribute__((weak));
+int d1 = 8, d2 = 9;
+
+int main(void) {
+    if (a1 + a2 + a3 != 6) return 1;
+    if (b1 + b2 != 9) return 2;
+    if (c1 + c2 != 13) return 3;
+    if (d1 + d2 != 17) return 4;
+    if ((unsigned long)&b2 % 64) return 5;
+    /* The first declarator must not have taken b2's alignment. */
+    {
+        int local_x = 1, local_y __attribute__((unused)) = 2;
+        if (local_x + local_y != 3) return 6;
+    }
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_attrs_on_later_declarators", code, &[]),
+        0
+    );
+}
+
+/// `_Alignas`, and an attribute in the specifier position, belong to the
+/// whole declaration and reach every declarator. An attribute written after
+/// one declarator belongs to that declarator alone.
+///
+/// Both spellings shared one `pending_alignas` slot, which was cleared only
+/// at the semicolon, so every declarator following an attributed one
+/// inherited its alignment -- `int s __attribute__((aligned(64))), t;` gave
+/// `t` 64 bytes of alignment that gcc does not.
+#[test]
+fn codegen_attribute_alignment_scope_follows_where_it_is_written() {
+    let code = r#"
+/* Post-declarator: names that declarator only. */
+int p = 1, q __attribute__((aligned(64))) = 2, r = 3;
+int s __attribute__((aligned(64))) = 4, t = 5;
+
+/* Specifier position and _Alignas: name the whole declaration. */
+int __attribute__((aligned(64))) u = 6, v = 7;
+_Alignas(64) int w = 8, x = 9;
+
+#define ALIGNED64(o) (((unsigned long)&(o) % 64) == 0)
+
+int main(void) {
+    if (!ALIGNED64(q)) return 1;
+    if (!ALIGNED64(s)) return 2;
+    /* The declarators after an attributed one keep natural alignment. */
+    if (ALIGNED64(r)) return 3;
+    if (ALIGNED64(t)) return 4;
+
+    /* Declaration-wide spellings reach both names. */
+    if (!ALIGNED64(u) || !ALIGNED64(v)) return 5;
+    if (!ALIGNED64(w) || !ALIGNED64(x)) return 6;
+
+    /* Values are undisturbed by any of it. */
+    if (p + q + r + s + t != 15) return 7;
+    if (u + v + w + x != 30) return 8;
+
+    /* Same rules at block scope. */
+    {
+        int bp = 1, bq __attribute__((aligned(64))) = 2, br = 3;
+        if (!ALIGNED64(bq)) return 9;
+        if (ALIGNED64(br)) return 10;
+        if (bp + bq + br != 6) return 11;
+    }
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_attr_alignment_scope", code, &[]),
+        0
+    );
+}

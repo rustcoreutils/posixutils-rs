@@ -471,7 +471,19 @@ fn process_file(
     let mut types = TypeTable::new(&target);
 
     // Parse
-    let mut parser = CParser::new(&preprocessed, &strings, &mut symbols, &mut types);
+    // Strip the pragma markers the preprocessor leaves in the stream. This
+    // tool computes no layout, but the markers are not C tokens and the
+    // parser must not meet them.
+    let mut preprocessed = preprocessed;
+    let pack_directives =
+        posixutils_cc::token::preprocess::extract_pragma_directives(&mut preprocessed);
+    let mut parser = CParser::new(
+        &preprocessed,
+        &strings,
+        &mut symbols,
+        &mut types,
+        pack_directives,
+    );
     let ast = match parser.parse_translation_unit() {
         Ok(ast) => ast,
         Err(e) => {

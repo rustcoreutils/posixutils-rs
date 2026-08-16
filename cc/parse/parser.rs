@@ -19,6 +19,7 @@ use crate::diag;
 use crate::strings::StringId;
 use crate::symbol::{Namespace, Symbol, SymbolId, SymbolKind, SymbolTable};
 use crate::token::lexer::{IdentTable, Position, SpecialToken, Token, TokenType, TokenValue};
+use crate::token::preprocess::PackAction;
 use crate::types::{
     CompositeType, EnumConstant, StructMember, Type, TypeId, TypeKind, TypeModifiers, TypeTable,
 };
@@ -593,15 +594,32 @@ pub struct Parser<'a> {
     /// parameter declarator, a K&R identifier list) legitimately reach it with
     /// no specifier.
     saw_explicit_type: bool,
+    /// `#pragma pack` directives, and where they stood in the token stream.
+    ///
+    /// Sorted by index; `pack_cursor` is how far the parser has consumed
+    /// them. A directive takes effect for every structure defined after it,
+    /// so applying them lazily as the parse position passes each one gives
+    /// exactly the right answer without a second traversal.
+    pack_directives: Vec<(usize, PackAction)>,
+    pack_cursor: usize,
+    /// The alignment cap currently in force, and the `push`ed stack of caps.
+    pack_current: Option<u32>,
+    pack_stack: Vec<Option<u32>>,
 }
 
 impl<'a> Parser<'a> {
-    /// Create a new parser with a symbol table and type table
+    /// Create a new parser with a symbol table and type table.
+    ///
+    /// `pack_directives` comes from `extract_pragma_directives`, which every
+    /// caller must run over the preprocessed stream: it removes the pragma
+    /// markers the preprocessor leaves behind as well as reporting them, and
+    /// a stream still carrying them is not one this parser can read.
     pub fn new(
         tokens: &'a [Token],
         idents: &'a IdentTable,
         symbols: &'a mut SymbolTable,
         types: &'a mut TypeTable,
+        pack_directives: Vec<(usize, PackAction)>,
     ) -> Self {
         Self {
             tokens,
@@ -619,7 +637,45 @@ impl<'a> Parser<'a> {
             declared_extern_fns: std::collections::BTreeSet::new(),
             declared_non_inline_fns: std::collections::BTreeSet::new(),
             saw_explicit_type: true,
+            pack_directives,
+            pack_cursor: 0,
+            pack_current: None,
+            pack_stack: Vec::new(),
         }
+    }
+
+    /// The alignment cap `#pragma pack` puts on a structure defined here.
+    ///
+    /// Applies every directive the parse position has now passed. `pop` on an
+    /// empty stack is what gcc warns about and ignores; the alternative --
+    /// treating it as a reset -- would silently change the layout of every
+    /// structure after an unbalanced pragma.
+    fn current_pack(&mut self) -> Option<u32> {
+        while self
+            .pack_directives
+            .get(self.pack_cursor)
+            .is_some_and(|(idx, _)| *idx <= self.pos)
+        {
+            let (_, action) = self.pack_directives[self.pack_cursor];
+            self.pack_cursor += 1;
+            match action {
+                PackAction::Set(n) => self.pack_current = n,
+                PackAction::Push(n) => {
+                    self.pack_stack.push(self.pack_current);
+                    if n.is_some() {
+                        self.pack_current = n;
+                    }
+                }
+                PackAction::Pop => match self.pack_stack.pop() {
+                    Some(prev) => self.pack_current = prev,
+                    None => diag::warning(
+                        self.current_pos(),
+                        &gettext("'#pragma pack(pop)' with no matching push"),
+                    ),
+                },
+            }
+        }
+        self.pack_current
     }
 
     // ========================================================================
@@ -3422,11 +3478,19 @@ impl Parser<'_> {
                 struct_align = Some(struct_align.map_or(a, |e| e.max(a)));
             }
 
-            // Compute layout
+            // Compute layout. `__attribute__((packed))` is a cap of 1; a
+            // `#pragma pack(n)` in force is a cap of n. Where both apply the
+            // tighter one wins, which is what gcc does.
+            let pragma_cap = self.current_pack();
+            let pack_cap = match (is_packed, pragma_cap) {
+                (true, Some(n)) => Some(n.min(1)),
+                (true, None) => Some(1),
+                (false, cap) => cap,
+            };
             let (size, mut align) = if is_union {
-                self.types.compute_union_layout(&mut members)
+                self.types.compute_union_layout(&mut members, pack_cap)
             } else {
-                self.types.compute_struct_layout(&mut members, is_packed)
+                self.types.compute_struct_layout(&mut members, pack_cap)
             };
 
             // Apply struct-level aligned attribute (raises alignment, never lowers)

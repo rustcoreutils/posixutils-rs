@@ -1668,10 +1668,14 @@ impl TypeTable {
     /// its own. So two bitfields of different declared types share a unit
     /// freely, and a bitfield reuses the padding left by the plain member
     /// before it.
+    /// `pack_cap` is the largest alignment any member may claim: `Some(1)`
+    /// for `__attribute__((packed))`, `Some(n)` for `#pragma pack(n)`, `None`
+    /// for natural alignment. One cap serves both because they are the same
+    /// rule -- gcc's `packed` is `pack(1)` scoped to one declaration.
     pub fn compute_struct_layout(
         &self,
         members: &mut [StructMember],
-        packed: bool,
+        pack_cap: Option<u32>,
     ) -> (usize, usize) {
         let mut bit_offset = 0usize;
         let mut max_align = 1usize;
@@ -1683,11 +1687,11 @@ impl TypeTable {
         for member in members.iter_mut() {
             let Some(bit_width) = member.bit_width else {
                 // Use explicit alignment from _Alignas if specified, otherwise natural alignment.
-                // For packed structs, force alignment to 1 (no padding between members).
-                let natural_align = if packed {
-                    1
-                } else {
-                    self.alignment(member.typ)
+                // A pack cap lowers it; it never raises one, so
+                // `#pragma pack(8)` on an int leaves the int at 4.
+                let natural_align = match pack_cap {
+                    Some(cap) => self.alignment(member.typ).min(cap as usize),
+                    None => self.alignment(member.typ),
                 };
                 let align = member
                     .explicit_align
@@ -1746,7 +1750,10 @@ impl TypeTable {
             bit_offset += bit_width;
         }
 
-        let final_align = if packed { 1 } else { max_align };
+        let final_align = match pack_cap {
+            Some(cap) => max_align.min(cap as usize),
+            None => max_align,
+        };
         let size = bit_offset
             .div_ceil(8)
             .max(window_end)
@@ -1762,7 +1769,14 @@ impl TypeTable {
 
     /// Compute union layout (all members at offset 0)
     /// Returns (total_size, alignment)
-    pub fn compute_union_layout(&self, members: &mut [StructMember]) -> (usize, usize) {
+    /// `pack_cap` caps every member's alignment, as for a struct. A union's
+    /// size still follows its widest member; only the alignment, and so the
+    /// trailing padding, can change.
+    pub fn compute_union_layout(
+        &self,
+        members: &mut [StructMember],
+        pack_cap: Option<u32>,
+    ) -> (usize, usize) {
         let mut max_size = 0usize;
         let mut max_align = 1usize;
 
@@ -1786,7 +1800,10 @@ impl TypeTable {
             }
             max_size = max_size.max(self.size_bytes(member.typ));
             // Use explicit alignment from _Alignas if specified, otherwise natural alignment
-            let natural_align = self.alignment(member.typ);
+            let natural_align = match pack_cap {
+                Some(cap) => self.alignment(member.typ).min(cap as usize),
+                None => self.alignment(member.typ),
+            };
             let align = member
                 .explicit_align
                 .map(|a| a as usize)

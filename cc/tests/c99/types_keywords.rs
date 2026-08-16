@@ -503,3 +503,95 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("c99_enum_underlying_type", code, &[]), 0);
 }
+
+/// `#pragma pack` caps the alignment of every member of the structures
+/// declared while it is in effect. c17 discarded every pragma in the
+/// preprocessor, so the pragma compiled and did nothing -- silently laying
+/// out a protocol structure at natural alignment and disagreeing with every
+/// gcc-compiled peer that shares it.
+#[test]
+fn c99_pragma_pack_caps_member_alignment() {
+    let code = r#"
+#include <stddef.h>
+
+#pragma pack(push, 1)
+struct A { char a; int b; };
+#pragma pack(pop)
+struct B { char a; int b; };
+
+#pragma pack(1)
+struct C { char a; int b; };
+#pragma pack()
+struct D { char a; int b; };
+
+#pragma pack(push, 2)
+struct E { char a; int b; };
+#pragma pack(push, 4)
+struct F { char a; double b; };
+#pragma pack(pop)
+struct G { char a; int b; };   /* back to 2 */
+#pragma pack(pop)
+struct H { char a; int b; };   /* back to natural */
+
+struct I { char a; int b; } __attribute__((packed));
+
+#pragma pack(8)
+struct J { char a; int b; };   /* 8 exceeds natural: no effect */
+#pragma pack()
+
+/* Nested and array members still obey the cap. */
+#pragma pack(1)
+struct K { char a; struct { int x; } inner; short b[3]; };
+#pragma pack()
+
+/* C99 6.10.9: `_Pragma("pack(...)")` is the same directive, and must not be
+   the spelling that quietly does nothing. */
+_Pragma("pack(push, 1)")
+struct L { char a; int b; };
+_Pragma("pack(pop)")
+struct M { char a; int b; };
+
+/* A union's alignment is capped too, though its size follows its widest
+   member either way. */
+#pragma pack(1)
+union U { char a; int b; };
+#pragma pack()
+union V { char a; int b; };
+
+int main(void) {
+    if (sizeof(struct A) != 5 || offsetof(struct A, b) != 1) return 1;
+    if (sizeof(struct B) != 8 || offsetof(struct B, b) != 4) return 2;
+    if (sizeof(struct C) != 5) return 3;
+    if (sizeof(struct D) != 8) return 4;
+    if (sizeof(struct E) != 6 || offsetof(struct E, b) != 2) return 5;
+    if (sizeof(struct F) != 12 || offsetof(struct F, b) != 4) return 6;
+    if (sizeof(struct G) != 6) return 7;
+    if (sizeof(struct H) != 8) return 8;
+    if (sizeof(struct I) != 5) return 9;
+    if (sizeof(struct J) != 8) return 10;
+    if (sizeof(struct K) != 11) return 11;
+    if (offsetof(struct K, inner) != 1 || offsetof(struct K, b) != 5) return 12;
+    if (sizeof(struct L) != 5) return 18;
+    if (sizeof(struct M) != 8) return 19;
+    if (_Alignof(union U) != 1 || sizeof(union U) != 4) return 20;
+    if (_Alignof(union V) != 4 || sizeof(union V) != 4) return 21;
+
+    /* The alignment of the type follows the cap, not just its size. */
+    if (_Alignof(struct A) != 1) return 13;
+    if (_Alignof(struct B) != 4) return 14;
+    if (_Alignof(struct E) != 2) return 15;
+
+    /* Members read and write at their packed offsets. */
+    {
+        struct A a;
+        a.a = 'x'; a.b = 0x11223344;
+        if (a.a != 'x' || a.b != 0x11223344) return 16;
+        struct K k;
+        k.a = 1; k.inner.x = 2; k.b[0] = 3; k.b[2] = 4;
+        if (k.a != 1 || k.inner.x != 2 || k.b[0] != 3 || k.b[2] != 4) return 17;
+    }
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_pragma_pack", code, &[]), 0);
+}

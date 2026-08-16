@@ -412,6 +412,183 @@ pub struct Preprocessor<'a> {
     line_file_override: Option<String>,
 }
 
+/// What a `#pragma pack` directive does to the packing state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackAction {
+    /// `#pragma pack(n)` / `#pragma pack()` -- set or clear the cap.
+    Set(Option<u32>),
+    /// `#pragma pack(push, n)` / `#pragma pack(push)` -- save, then set.
+    Push(Option<u32>),
+    /// `#pragma pack(pop)` -- restore the saved cap.
+    Pop,
+}
+
+impl PackAction {
+    /// Encoded into the marker token's payload, since `TokenValue` carries
+    /// strings rather than arbitrary data.
+    fn encode(self) -> String {
+        match self {
+            PackAction::Set(None) => "pack:set".to_string(),
+            PackAction::Set(Some(n)) => format!("pack:set:{n}"),
+            PackAction::Push(None) => "pack:push".to_string(),
+            PackAction::Push(Some(n)) => format!("pack:push:{n}"),
+            PackAction::Pop => "pack:pop".to_string(),
+        }
+    }
+
+    fn decode(s: &str) -> Option<PackAction> {
+        let mut parts = s.split(':');
+        if parts.next()? != "pack" {
+            return None;
+        }
+        let verb = parts.next()?;
+        let n = match parts.next() {
+            Some(v) => Some(v.parse::<u32>().ok()?),
+            None => None,
+        };
+        match verb {
+            "set" => Some(PackAction::Set(n)),
+            "push" => Some(PackAction::Push(n)),
+            "pop" => Some(PackAction::Pop),
+            _ => None,
+        }
+    }
+}
+
+/// Strip pragma markers from a preprocessed token stream, reporting where
+/// each one stood.
+///
+/// Returns `(index, action)` pairs where `index` counts tokens in the
+/// *returned* stream, so the parser can apply each directive as its own
+/// cursor reaches it. Doing this after preprocessing finishes is what makes
+/// the ordering trustworthy: by then every include has been spliced in and
+/// the vector is the translation unit in the order the parser walks it.
+pub fn extract_pragma_directives(tokens: &mut Vec<Token>) -> Vec<(usize, PackAction)> {
+    let mut directives = Vec::new();
+    let mut kept = 0usize;
+    tokens.retain(|t| {
+        if t.typ != TokenType::Pragma {
+            kept += 1;
+            return true;
+        }
+        if let TokenValue::String(s) = &t.value {
+            if let Some(action) = PackAction::decode(s) {
+                directives.push((kept, action));
+            }
+        }
+        false
+    });
+    directives
+}
+
+/// The only shapes `#pragma pack` bodies are made of.
+///
+/// `#pragma pack(...)` arrives as preprocessor tokens and `_Pragma("pack(...)")`
+/// as a string, so both are reduced to this before being read. One reduction
+/// each, and one rule -- rather than two parsers that agree until they don't.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PackTok {
+    Word(String),
+    Num(String),
+    Punct(char),
+}
+
+/// Parse the body of a `pack` pragma, `(` through `)`.
+///
+/// Accepts the four forms gcc and MSVC share: `pack(n)` sets the cap,
+/// `pack()` clears it, `pack(push, n)` / `pack(push)` save it, and
+/// `pack(pop)` restores. An unrecognised body is a pragma we do not
+/// implement, and is ignored rather than guessed at.
+fn parse_pack_body(toks: &[PackTok], pos: Position) -> Option<PackAction> {
+    let mut it = toks.iter();
+    if it.next() != Some(&PackTok::Punct('(')) {
+        diag::warning(pos, &gettext("expected '(' after '#pragma pack'"));
+        return None;
+    }
+
+    // C has no meaning for a non-power-of-two alignment, and gcc rejects it;
+    // a bad value is dropped rather than applied.
+    let number = |t: Option<&PackTok>| -> Option<u32> {
+        let PackTok::Num(text) = t? else {
+            diag::warning(pos, &gettext("expected an alignment in '#pragma pack'"));
+            return None;
+        };
+        match text.parse::<u32>() {
+            Ok(n) if n > 0 && n.is_power_of_two() && n <= 16 => Some(n),
+            _ => {
+                diag::warning(
+                    pos,
+                    &gettext("alignment in '#pragma pack' must be 1, 2, 4, 8 or 16"),
+                );
+                None
+            }
+        }
+    };
+
+    match it.next() {
+        // `pack()` -- clear.
+        Some(PackTok::Punct(')')) => Some(PackAction::Set(None)),
+        Some(PackTok::Word(w)) if w == "push" => match it.next() {
+            Some(PackTok::Punct(',')) => Some(PackAction::Push(number(it.next()))),
+            _ => Some(PackAction::Push(None)),
+        },
+        Some(PackTok::Word(w)) if w == "pop" => Some(PackAction::Pop),
+        Some(PackTok::Word(_)) => {
+            diag::warning(pos, &gettext("unrecognized '#pragma pack' argument"));
+            None
+        }
+        t @ Some(PackTok::Num(_)) => Some(PackAction::Set(number(t))),
+        _ => {
+            diag::warning(pos, &gettext("expected an alignment in '#pragma pack'"));
+            None
+        }
+    }
+}
+
+/// Reduce the text of a `_Pragma("...")` operand to `PackTok`s.
+///
+/// Returns `None` for anything that is not a `pack` pragma, which is every
+/// pragma c17 does not act on.
+fn parse_pragma_text(body: &str, pos: Position) -> Option<PackAction> {
+    let mut chars = body.trim_start().chars().peekable();
+    let mut word = String::new();
+    while chars
+        .peek()
+        .is_some_and(|c| c.is_alphanumeric() || *c == '_')
+    {
+        word.push(chars.next().unwrap());
+    }
+    if word != "pack" {
+        return None;
+    }
+
+    let mut toks = Vec::new();
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+        } else if c.is_ascii_digit() {
+            let mut n = String::new();
+            while chars.peek().is_some_and(|d| d.is_ascii_digit()) {
+                n.push(chars.next().unwrap());
+            }
+            toks.push(PackTok::Num(n));
+        } else if c.is_alphabetic() || c == '_' {
+            let mut w = String::new();
+            while chars
+                .peek()
+                .is_some_and(|d| d.is_alphanumeric() || *d == '_')
+            {
+                w.push(chars.next().unwrap());
+            }
+            toks.push(PackTok::Word(w));
+        } else {
+            chars.next();
+            toks.push(PackTok::Punct(c));
+        }
+    }
+    parse_pack_body(&toks, pos)
+}
+
 impl<'a> Preprocessor<'a> {
     /// Format the current time as C99 __DATE__ and __TIME__ strings
     /// Returns (date_string, time_string) where:
@@ -843,7 +1020,7 @@ impl<'a> Preprocessor<'a> {
                             // _Pragma("string") is equivalent to #pragma string
                             // We silently consume it since we ignore #pragma anyway
                             if name == "_Pragma" {
-                                self.handle_pragma_operator(&mut iter);
+                                self.handle_pragma_operator(&mut iter, &mut output);
                                 continue;
                             }
 
@@ -1021,7 +1198,7 @@ impl<'a> Preprocessor<'a> {
             crate::kw::INCLUDE_NEXT => self.handle_include(iter, output, idents, hash_token, true),
             crate::kw::PP_ERROR => self.handle_error(iter, &hash_token.pos, idents),
             crate::kw::WARNING => self.handle_warning(iter, &hash_token.pos, idents),
-            crate::kw::PRAGMA => self.handle_pragma(iter, idents),
+            crate::kw::PRAGMA => self.handle_pragma(iter, output, idents),
             crate::kw::LINE => self.handle_line(iter, idents, hash_token.pos),
             _ => {
                 // Unknown directive
@@ -2609,9 +2786,44 @@ impl<'a> Preprocessor<'a> {
         diag::warning_args(*pos, "#warning {0}", &[&msg.to_string()]);
     }
 
-    /// Handle #pragma
-    fn handle_pragma<I>(&mut self, iter: &mut std::iter::Peekable<I>, idents: &IdentTable)
+    /// Reduce `#pragma pack(...)`'s tokens to `PackTok`s and read them.
+    fn parse_pack_pragma<I>(
+        &mut self,
+        iter: &mut std::iter::Peekable<I>,
+        idents: &IdentTable,
+        pos: Position,
+    ) -> Option<PackAction>
     where
+        I: Iterator<Item = Token>,
+    {
+        let mut toks = Vec::new();
+        while let Some(tok) = iter.peek() {
+            if tok.pos.newline && !toks.is_empty() {
+                break;
+            }
+            let reduced = match &tok.value {
+                TokenValue::Ident(id) => PackTok::Word(idents.get_opt(*id)?.to_string()),
+                TokenValue::Number(n) => PackTok::Num(n.clone()),
+                TokenValue::Special(c) => PackTok::Punct(char::from_u32(*c)?),
+                _ => break,
+            };
+            let closing = reduced == PackTok::Punct(')');
+            toks.push(reduced);
+            iter.next();
+            if closing {
+                break;
+            }
+        }
+        parse_pack_body(&toks, pos)
+    }
+
+    /// Handle #pragma
+    fn handle_pragma<I>(
+        &mut self,
+        iter: &mut std::iter::Peekable<I>,
+        output: &mut Vec<Token>,
+        idents: &IdentTable,
+    ) where
         I: Iterator<Item = Token>,
     {
         if self.is_skipping() {
@@ -2623,7 +2835,21 @@ impl<'a> Preprocessor<'a> {
         if let Some(token) = iter.peek() {
             if let TokenValue::Ident(id) = &token.value {
                 if let Some(name) = idents.get_opt(*id) {
-                    if name == "once" {
+                    if name == "pack" {
+                        let pos = token.pos;
+                        iter.next(); // consume "pack"
+                        if let Some(action) = self.parse_pack_pragma(iter, idents, pos) {
+                            // The parser decides layout, so the pragma has to
+                            // reach it. It travels as a marker in the stream
+                            // because that is the only ordering that survives
+                            // include splicing.
+                            let mut marker = Token::new(TokenType::Pragma, pos);
+                            marker.value = TokenValue::String(action.encode());
+                            output.push(marker);
+                        }
+                        self.skip_to_eol(iter);
+                        return;
+                    } else if name == "once" {
                         if let Ok(canonical) = Path::new(&self.current_file).canonicalize() {
                             self.once_files.insert(canonical);
                         }
@@ -2695,8 +2921,11 @@ impl<'a> Preprocessor<'a> {
     /// Handle _Pragma operator (C99)
     /// _Pragma("string") is equivalent to #pragma string
     /// Since we ignore most pragmas anyway, this just consumes the tokens
-    fn handle_pragma_operator<I>(&mut self, iter: &mut std::iter::Peekable<I>)
-    where
+    fn handle_pragma_operator<I>(
+        &mut self,
+        iter: &mut std::iter::Peekable<I>,
+        output: &mut Vec<Token>,
+    ) where
         I: Iterator<Item = Token>,
     {
         // Expect '('
@@ -2709,17 +2938,26 @@ impl<'a> Preprocessor<'a> {
             return;
         }
 
-        // Expect a string literal
-        // C99 6.10.9p1 requires destringification (unescape \" and \\) and
-        // re-tokenization as a #pragma directive. Since all pragmas are no-ops
-        // in c17, we just consume and discard the string token.
-        if let Some(token) = iter.next() {
-            if !matches!(token.typ, TokenType::String) {
-                // Not a valid _Pragma - just silently ignore
-                return;
-            }
-        } else {
+        // Expect a string literal.
+        //
+        // C99 6.10.9p1: destringify and re-tokenize as a `#pragma`. Only the
+        // pragmas c17 acts on need that treatment; the rest stay no-ops. It
+        // matters for `pack`, which changes layout -- and a `_Pragma` that
+        // was quietly dropped while the `#pragma` spelling was honoured would
+        // be the same wrong struct in the spelling nobody tested.
+        let Some(token) = iter.next() else {
             return;
+        };
+        if !matches!(token.typ, TokenType::String) {
+            // Not a valid _Pragma - just silently ignore
+            return;
+        }
+        if let TokenValue::String(body) = &token.value {
+            if let Some(action) = parse_pragma_text(body, token.pos) {
+                let mut marker = Token::new(TokenType::Pragma, token.pos);
+                marker.value = TokenValue::String(action.encode());
+                output.push(marker);
+            }
         }
 
         // Expect ')' - if not found or malformed, silently ignore

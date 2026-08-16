@@ -44,7 +44,7 @@ fn parse_expr_with_vars(
         let _ = symbols.declare(sym);
     }
 
-    let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types);
+    let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types, Vec::new());
     parser.skip_stream_tokens();
     let expr = parser.parse_expression()?;
     Ok((expr, types, strings, symbols))
@@ -1410,7 +1410,7 @@ fn parse_stmt_with_vars(input: &str, vars: &[&str]) -> ParseResult<(Stmt, String
         let _ = symbols.declare(sym);
     }
 
-    let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types);
+    let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types, Vec::new());
     parser.skip_stream_tokens();
     let stmt = parser.parse_statement()?;
     Ok((stmt, strings))
@@ -1652,7 +1652,7 @@ fn parse_decl(input: &str) -> ParseResult<(Declaration, TypeTable, StringTable, 
     let tokens = tokenizer.tokenize();
     let mut symbols = SymbolTable::new();
     let mut types = TypeTable::new(&Target::host());
-    let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types);
+    let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types, Vec::new());
     parser.skip_stream_tokens();
     let decl = parser.parse_declaration()?;
     Ok((decl, types, strings, symbols))
@@ -1780,7 +1780,7 @@ fn parse_func(input: &str) -> ParseResult<(FunctionDef, TypeTable, StringTable, 
     let tokens = tokenizer.tokenize();
     let mut symbols = SymbolTable::new();
     let mut types = TypeTable::new(&Target::host());
-    let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types);
+    let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types, Vec::new());
     parser.skip_stream_tokens();
     let func = parser.parse_function_def()?;
     Ok((func, types, strings, symbols))
@@ -1833,7 +1833,7 @@ fn parse_tu(input: &str) -> ParseResult<(TranslationUnit, TypeTable, StringTable
     let tokens = tokenizer.tokenize();
     let mut symbols = SymbolTable::new();
     let mut types = TypeTable::new(&Target::host());
-    let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types);
+    let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types, Vec::new());
     let tu = parser.parse_translation_unit()?;
     Ok((tu, types, strings, symbols))
 }

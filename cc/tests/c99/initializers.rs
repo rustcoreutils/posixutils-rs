@@ -1806,29 +1806,41 @@ typedef unsigned short char16_t;
 typedef unsigned int char32_t;
 
 int main(void) {
-    /* Narrow: bytes. A UCN and the character itself agree. */
+    /* The same character, reaching the compiler two different ways: as source
+       text, and through the escape scanner. Those are separate code paths --
+       each was once correct for one spelling and wrong for the other -- so
+       every assertion below is made twice, once per spelling. */
+
+    /* Narrow: bytes. */
     if (sizeof("café") != 6) return 1;
-    if (sizeof("café") != 6) return 2;
+    if (sizeof("caf\u00e9") != 6) return 2;
     if ((unsigned char)"café"[3] != 0xc3) return 3;
     if ((unsigned char)"café"[4] != 0xa9) return 4;
-    /* A byte escape stays one byte. */
-    if (sizeof("caf\xc3\xa9") != 6) return 5;
+    if ((unsigned char)"caf\u00e9"[3] != 0xc3) return 5;
+    if ((unsigned char)"caf\u00e9"[4] != 0xa9) return 6;
+    /* A byte escape stays one byte, and is a third path again. */
+    if (sizeof("caf\xc3\xa9") != 6) return 7;
 
-    /* Wide: characters. Both spellings give one element. */
-    if (wcslen(L"café") != 4 || L"café"[3] != 233) return 6;
-    if (wcslen(L"café") != 4 || L"café"[3] != 233) return 7;
+    /* Wide: characters. One element either way. */
+    if (wcslen(L"café") != 4 || L"café"[3] != 233) return 8;
+    if (wcslen(L"caf\u00e9") != 4 || L"caf\u00e9"[3] != 233) return 9;
     /* But two byte escapes are two elements, not one character. */
-    if (wcslen(L"caf\xc3\xa9") != 5) return 8;
-    if (L"caf\xc3\xa9"[3] != 0xc3 || L"caf\xc3\xa9"[4] != 0xa9) return 9;
+    if (wcslen(L"caf\xc3\xa9") != 5) return 10;
+    if (L"caf\xc3\xa9"[3] != 0xc3 || L"caf\xc3\xa9"[4] != 0xa9) return 11;
 
     /* char16_t and char32_t behave the same way. */
-    if (u"café"[3] != 233 || u"café"[3] != 233) return 10;
-    if (U"café"[3] != 233 || U"café"[3] != 233) return 11;
+    if (u"café"[3] != 233) return 12;
+    if (u"caf\u00e9"[3] != 233) return 13;
+    if (U"café"[3] != 233) return 14;
+    if (U"caf\u00e9"[3] != 233) return 15;
 
     /* Outside the BMP: char16_t splits into a surrogate pair. */
-    if (u"😀"[0] != 0xd83d || u"😀"[1] != 0xde00) return 12;
-    if (U"😀"[0] != 0x1f600) return 13;
-    if (sizeof("😀") != 5) return 14;
+    if (u"😀"[0] != 0xd83d || u"😀"[1] != 0xde00) return 16;
+    if (u"\U0001f600"[0] != 0xd83d || u"\U0001f600"[1] != 0xde00) return 17;
+    if (U"😀"[0] != 0x1f600) return 18;
+    if (U"\U0001f600"[0] != 0x1f600) return 19;
+    if (sizeof("😀") != 5) return 20;
+    if (sizeof("\U0001f600") != 5) return 21;
 
     return 0;
 }

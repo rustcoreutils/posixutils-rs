@@ -2041,7 +2041,9 @@ impl Parser<'_> {
         };
 
         let new_size = match &init.kind {
-            ExprKind::InitList { elements } => Some(self.array_size_from_elements(elements)),
+            ExprKind::InitList { elements } => {
+                Some(self.array_size_from_elements(elements, elem_type))
+            }
             _ => self.string_initializer_len(init),
         };
 
@@ -2057,11 +2059,26 @@ impl Parser<'_> {
         }
     }
 
-    pub(crate) fn array_size_from_elements(&self, elements: &[InitElement]) -> usize {
+    /// How many elements an incomplete array's initializer list implies.
+    ///
+    /// One list element is not one array element. When the array's element
+    /// type is an aggregate and the initializer leaves its braces out, that
+    /// one array element swallows as many list elements as it has scalar
+    /// fields (C17 6.7.9p20) -- so `int a[][2] = {1,2,3,4}` names two rows,
+    /// not four. Counting list elements instead sized the object at twice
+    /// what the linearizer then filled.
+    pub(crate) fn array_size_from_elements(
+        &self,
+        elements: &[InitElement],
+        elem_type: TypeId,
+    ) -> usize {
+        let per_element = self.types.count_scalar_fields(elem_type).max(1);
         let mut max_index: i64 = -1;
         let mut current_index: i64 = 0;
+        let mut idx = 0usize;
 
-        for element in elements {
+        while idx < elements.len() {
+            let element = &elements[idx];
             let mut designator_index = None;
             for designator in &element.designators {
                 if let Designator::Index(index) = designator {
@@ -2074,13 +2091,31 @@ impl Parser<'_> {
                 current_index = explicit_index + 1;
                 explicit_index
             } else {
-                let idx = current_index;
+                let i = current_index;
                 current_index += 1;
-                idx
+                i
             };
 
             if index > max_index {
                 max_index = index;
+            }
+
+            // A brace-less aggregate element consumes several list elements
+            // for this one slot. Stop early at a designator, which addresses
+            // the enclosing array rather than continuing to fill this slot --
+            // the same boundary `consume_brace_elision` observes.
+            idx += 1;
+            if designator_index.is_none()
+                && crate::parse::ast::is_brace_elision_candidate(self.types, element, elem_type)
+            {
+                let mut taken = 1;
+                while taken < per_element
+                    && idx < elements.len()
+                    && elements[idx].designators.is_empty()
+                {
+                    idx += 1;
+                    taken += 1;
+                }
             }
         }
 

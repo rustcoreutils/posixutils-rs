@@ -3649,9 +3649,13 @@ impl<'a> Parser<'a> {
                                 let array_size =
                                     match self.braced_string_initializer(elem_type, &elements) {
                                         Some(lit) => self.string_initializer_len(lit),
-                                        None => Some(self.array_size_from_elements(&elements)),
+                                        None => Some(
+                                            self.array_size_from_elements(&elements, elem_type),
+                                        ),
                                     }
-                                    .unwrap_or_else(|| self.array_size_from_elements(&elements));
+                                    .unwrap_or_else(|| {
+                                        self.array_size_from_elements(&elements, elem_type)
+                                    });
                                 self.types.intern(Type::array(elem_type, array_size))
                             } else {
                                 typ

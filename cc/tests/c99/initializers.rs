@@ -1898,3 +1898,81 @@ int main(void) {
         0
     );
 }
+
+/// An incomplete array's bound comes from the initializer, and with brace
+/// elision one array element consumes as many list elements as it has scalar
+/// fields (C17 6.7.9p20).
+///
+/// The parser's bound deduction counted one array element per list element,
+/// so `int a[][2] = {1,2,3,4}` got four rows instead of two. The values
+/// themselves landed correctly -- the linearizer knows the rule -- so only
+/// `sizeof` was wrong, and every idiomatic `for (i = 0; i < sizeof a /
+/// sizeof a[0]; i++)` walked twice as far as the object.
+#[test]
+fn c99_brace_elision_decides_the_deduced_array_bound() {
+    let code = r#"
+struct P { int x, y; };
+struct Q { int a; struct P p; };
+
+/* Elided braces: several scalars per element. */
+int   e1[][2]  = {1,2,3,4};
+int   e2[][3]  = {1,2,3,4};          /* partial final row */
+int   e3[][2]  = {1,2,3,4,5};        /* partial final row */
+struct P e4[]  = {1,2,3,4};
+struct Q e5[]  = {1,2,3,4,5,6};      /* three scalars each */
+
+/* Explicit braces: one element each -- these were always right. */
+int   b1[][2]  = {{1,2},{3,4}};
+struct P b2[]  = {{1,2},{3,4}};
+char  b3[][4]  = {"ab","cd"};
+
+/* A designator still places elements where it says. */
+int   d1[]     = {[3] = 4, [1] = 2};
+
+int main(void) {
+    if (sizeof e1 / sizeof e1[0] != 2) return 1;
+    if (e1[0][0] != 1 || e1[0][1] != 2) return 2;
+    if (e1[1][0] != 3 || e1[1][1] != 4) return 3;
+
+    if (sizeof e2 / sizeof e2[0] != 2) return 4;
+    if (e2[1][0] != 4 || e2[1][1] != 0 || e2[1][2] != 0) return 5;
+
+    if (sizeof e3 / sizeof e3[0] != 3) return 6;
+    if (e3[2][0] != 5 || e3[2][1] != 0) return 7;
+
+    if (sizeof e4 / sizeof e4[0] != 2) return 8;
+    if (e4[1].x != 3 || e4[1].y != 4) return 9;
+
+    if (sizeof e5 / sizeof e5[0] != 2) return 10;
+    if (e5[1].a != 4 || e5[1].p.x != 5 || e5[1].p.y != 6) return 11;
+
+    if (sizeof b1 / sizeof b1[0] != 2) return 12;
+    if (sizeof b2 / sizeof b2[0] != 2) return 13;
+    if (sizeof b3 / sizeof b3[0] != 2) return 14;
+    if (b3[1][0] != 'c') return 15;
+
+    if (sizeof d1 / sizeof d1[0] != 4) return 16;
+    if (d1[3] != 4 || d1[1] != 2 || d1[0] != 0) return 17;
+
+    /* The same rule at block scope. */
+    {
+        int l1[][2] = {1,2,3,4};
+        struct P l2[] = {1,2,3,4};
+        if (sizeof l1 / sizeof l1[0] != 2) return 18;
+        if (sizeof l2 / sizeof l2[0] != 2) return 19;
+        if (l1[1][1] != 4 || l2[1].y != 4) return 20;
+    }
+
+    /* An array of scalars is unaffected. */
+    {
+        int s[] = {1,2,3,4,5};
+        if (sizeof s / sizeof s[0] != 5) return 21;
+    }
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c99_brace_elision_deduced_bound", code, &[]),
+        0
+    );
+}

@@ -5321,3 +5321,39 @@ fn test_generic_default_may_precede_associations() {
         parse_expr("_Generic(1, default: 33, int: 11)").unwrap();
     assert!(matches!(expr.kind, ExprKind::IntLit(11)));
 }
+
+/// C17 6.7.2p2 lists the declaration specifiers as a *set*: `int long` names
+/// the same type as `long int`, and `int short` the same as `short int`.
+///
+/// The specifier tally settled `base_kind` on whichever of the two arrived
+/// first, so `long` reaching an already-`int` tally left the kind at `Int`
+/// and produced a four-byte `long`. Only this order broke; every test in the
+/// suite spelled the size first.
+#[test]
+fn test_size_specifier_after_int_still_names_the_size() {
+    for (src, want) in [
+        ("long int x;", TypeKind::Long),
+        ("int long x;", TypeKind::Long),
+        ("short int x;", TypeKind::Short),
+        ("int short x;", TypeKind::Short),
+        ("long long int x;", TypeKind::LongLong),
+        ("int long long x;", TypeKind::LongLong),
+        ("long int long x;", TypeKind::LongLong),
+        ("unsigned int long x;", TypeKind::Long),
+        ("int unsigned long x;", TypeKind::Long),
+    ] {
+        let (decl, types, _strings, _symbols) = parse_decl(src).unwrap();
+        let typ = decl.declarators[0].typ;
+        assert_eq!(types.kind(typ), want, "{src}");
+    }
+}
+
+/// A size named twice in either order is still `long long`, and the
+/// unsignedness of the spelling survives the promotion of the kind.
+#[test]
+fn test_size_specifier_order_preserves_signedness() {
+    let (decl, types, _strings, _symbols) = parse_decl("int unsigned long x;").unwrap();
+    let typ = decl.declarators[0].typ;
+    assert_eq!(types.kind(typ), TypeKind::Long);
+    assert!(types.modifiers(typ).contains(TypeModifiers::UNSIGNED));
+}

@@ -2471,7 +2471,12 @@ impl Parser<'_> {
                     tally.note_size("short", self.current_pos());
                     self.advance();
                     modifiers |= TypeModifiers::SHORT;
-                    if base_kind.is_none() {
+                    // C17 6.7.2p2 lists the declaration specifiers as a set,
+                    // so `int short` names what `short int` names. A tally
+                    // that had already seen `int` must still take the size:
+                    // testing only `is_none()` left the kind at `Int` and
+                    // gave `int short` four bytes.
+                    if base_kind.is_none() || base_kind == Some(TypeKind::Int) {
                         base_kind = Some(TypeKind::Short);
                     }
                 }
@@ -2486,7 +2491,8 @@ impl Parser<'_> {
                         // long double case
                         if base_kind == Some(TypeKind::Double) {
                             base_kind = Some(TypeKind::LongDouble);
-                        } else if base_kind.is_none() {
+                        } else if base_kind.is_none() || base_kind == Some(TypeKind::Int) {
+                            // `int long` is `long int`; see the SHORT arm.
                             base_kind = Some(TypeKind::Long);
                         }
                     }

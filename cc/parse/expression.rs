@@ -1058,7 +1058,10 @@ impl<'a> Parser<'a> {
                 crate::kw::SHORT => {
                     self.advance();
                     modifiers |= TypeModifiers::SHORT;
-                    if base_kind.is_none() {
+                    // A specifier list is a set (C17 6.7.2p2), so `int short`
+                    // is `short int`. This tally is a second copy of the one
+                    // in `parser.rs`; both had to learn the same thing.
+                    if base_kind.is_none() || base_kind == Some(TypeKind::Int) {
                         base_kind = Some(TypeKind::Short);
                     }
                     parsed_something = true;
@@ -1073,7 +1076,8 @@ impl<'a> Parser<'a> {
                         // long double case
                         if base_kind == Some(TypeKind::Double) {
                             base_kind = Some(TypeKind::LongDouble);
-                        } else if base_kind.is_none() {
+                        } else if base_kind.is_none() || base_kind == Some(TypeKind::Int) {
+                            // `int long` is `long int`; see the SHORT arm.
                             base_kind = Some(TypeKind::Long);
                         }
                     }

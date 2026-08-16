@@ -282,3 +282,69 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("c99_types_keywords_mega", code, &[]), 0);
 }
+
+/// C17 6.7.2p2 gives the declaration specifiers as an unordered set, so a
+/// size specifier names the same type whichever side of `int` it falls on.
+///
+/// The specifier tally took the size only when it had not already settled on
+/// `int`, so `int long` was a four-byte `long` and `int short` a four-byte
+/// `short`. Two independent copies of the tally had the same defect -- one
+/// for declarations, one for type-names -- so `long int x;` was right while
+/// `sizeof(int long)` was wrong even after the first was fixed. Both spellings
+/// of both paths are asserted here.
+#[test]
+fn c99_size_specifiers_are_order_independent() {
+    let code = r#"
+/* Declaration path. */
+long int a1;    int long a2;
+short int b1;   int short b2;
+long long int c1;   int long long c2;   long int long c3;
+unsigned long int d1;   int unsigned long d2;   long unsigned int d3;
+signed short int e1;    int signed short e2;
+
+int main(void) {
+    /* Declarations */
+    if (sizeof a1 != sizeof a2) return 1;
+    if (sizeof a1 != 8) return 2;
+    if (sizeof b1 != sizeof b2) return 3;
+    if (sizeof b1 != 2) return 4;
+    if (sizeof c1 != sizeof c2 || sizeof c1 != sizeof c3) return 5;
+    if (sizeof c1 != 8) return 6;
+    if (sizeof d1 != sizeof d2 || sizeof d1 != sizeof d3) return 7;
+    if (sizeof d1 != 8) return 8;
+    if (sizeof e1 != sizeof e2) return 9;
+    if (sizeof e1 != 2) return 10;
+
+    /* Type-name path: a separate specifier tally from the one above. */
+    if (sizeof(int long) != 8) return 11;
+    if (sizeof(int short) != 2) return 12;
+    if (sizeof(int long long) != 8) return 13;
+    if (sizeof(int unsigned long) != 8) return 14;
+    if (sizeof(long int) != sizeof(int long)) return 15;
+    if (sizeof(short int) != sizeof(int short)) return 16;
+
+    /* The cast path shares the type-name tally. */
+    {
+        int long v = 5000000000;
+        if ((int long)v != 5000000000) return 17;
+        if (sizeof((int long)1) != 8) return 18;
+    }
+
+    /* Both spellings name one type, so they are compatible. */
+    if (!__builtin_types_compatible_p(int long, long)) return 19;
+    if (!__builtin_types_compatible_p(int short, short)) return 20;
+    if (__builtin_types_compatible_p(int long, int)) return 21;
+    if (__builtin_types_compatible_p(int short, int)) return 22;
+
+    /* `long double` must not be caught by the same rule. */
+    if (sizeof(long double) != sizeof(double long)) return 23;
+    if (sizeof(long double) == sizeof(double)) return 24;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c99_size_specifiers_order_independent", code, &[]),
+        0
+    );
+}

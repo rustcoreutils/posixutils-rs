@@ -447,9 +447,10 @@ impl Aarch64CodeGen {
         // Skip .globl for static functions (internal linkage)
         if !is_static {
             if func.symbol_attrs.weak {
-                self.push_lir(Aarch64Inst::Directive(Directive::Weak(Symbol::global(
-                    name,
-                ))));
+                self.push_lir(Aarch64Inst::Directive(Directive::Weak(
+                    Symbol::global(name),
+                    crate::arch::lir::WeakKind::Definition,
+                )));
             } else {
                 self.push_lir(Aarch64Inst::Directive(Directive::global(name)));
             }

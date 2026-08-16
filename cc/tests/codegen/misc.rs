@@ -7883,8 +7883,12 @@ static long long take_i128(long a, long b, long c, long d, long e, long f, long 
 { return (long long)v; }
 static long double take_ld(long a, long b, long c, long d, long e, long f, long g, long double v)
 { return v; }
+/* macOS on aarch64 has no binary128 at all -- its `long double` is a double --
+   so the control is compiled only where the type exists. */
+#ifdef __SIZEOF_FLOAT128__
 static double take_f128(long a, long b, long c, long d, long e, long f, long g, __float128 v)
 { return (double)v; }
+#endif
 static long take_s16(long a, long b, long c, long d, long e, long f, long g, S16 v)
 { return v.a + v.b; }
 /* The argument after it must not be swallowed by the gap. */
@@ -7895,12 +7899,14 @@ static long long take_tail(long a, long b, long c, long d, long e, long f, long 
 int main(void) {
     __int128 x = 424242;
     long double l = 424242.0L;
-    __float128 q = 424242.0Q;
     S16 s = { 11, 22 };
 
     if (take_i128(1,2,3,4,5,6,7, x) != 424242) return 1;
     if (take_ld(1,2,3,4,5,6,7, l) != 424242.0L) return 2;
-    if (take_f128(1,2,3,4,5,6,7, q) != 424242.0) return 3;
+#ifdef __SIZEOF_FLOAT128__
+    { __float128 q = 424242.0Q;
+      if (take_f128(1,2,3,4,5,6,7, q) != 424242.0) return 3; }
+#endif
     if (take_s16(1,2,3,4,5,6,7, s) != 33) return 4;
     if (take_tail(1,2,3,4,5,6,7, x, 5) != 424247) return 5;
 
@@ -8215,22 +8221,39 @@ fn codegen_symbol_attributes_do_not_leak_or_vanish() {
     // path and left the symbol ones pending, so the next declaration claimed
     // them. The conflicting "ax"/"aw" section flags made the assembler reject
     // the file outright, so this is a build failure rather than bad linkage.
-    let leak = r#"
+    //
+    // ELF-only: Mach-O section names are `SEGMENT,section` pairs, so the
+    // source itself would not assemble there.
+    #[cfg(target_os = "linux")]
+    {
+        let leak = r#"
 __attribute__((section(".mytext"))) int placed_fn(void) { return 3; }
 int plain_var = 4;
 __attribute__((weak)) int weak_fn(void) { return 1; }
 int plain2 = 5;
 int main(void) { return plain_var + plain2 + placed_fn() + weak_fn() - 13; }
 "#;
+        assert_eq!(
+            compile_and_run("codegen_symbol_attrs_no_leak", leak, &[]),
+            0
+        );
+    }
+
+    // The same leak without a section, so it runs everywhere: `weak` on the
+    // definition must not follow on to `plain2`.
+    let leak_weak = r#"
+__attribute__((weak)) int weak_fn(void) { return 1; }
+int plain2 = 5;
+int main(void) { return plain2 + weak_fn() - 6; }
+"#;
     assert_eq!(
-        compile_and_run("codegen_symbol_attrs_no_leak", leak, &[]),
+        compile_and_run("codegen_symbol_attrs_no_leak_weak", leak_weak, &[]),
         0
     );
 
-    // `weak` on a declaration with no definition: the reference must be weak,
-    // so an absent definition resolves to null instead of failing to link.
-    // Every spelling and position, since only the trailing-attribute-on-a-
-    // function-declarator one was broken.
+    // `weak` on a declaration with no definition. Every spelling and position,
+    // since only the trailing-attribute-on-a-function-declarator one was
+    // broken.
     let declared = r#"
 extern int missing_a(void) __attribute__((weak));
 __attribute__((weak)) extern int missing_b(void);
@@ -8244,6 +8267,23 @@ int main(void) {
     return 0;
 }
 "#;
+
+    // What c17 emits is c17's business, and is checked on every target: ELF
+    // spells both sides `.weak`, Mach-O has `.weak_reference` for this one and
+    // rejects `.weak` as an unknown directive.
+    let asm = asm_for("c17_weak_decl_", declared);
+    for sym in ["missing_a", "missing_b", "missing_c", "missing_var"] {
+        assert!(
+            asm.contains(&format!(".weak {sym}"))
+                || asm.contains(&format!(".weak_reference _{sym}")),
+            "no weak directive for {sym}:\n{asm}"
+        );
+    }
+
+    // Whether an unresolved weak symbol *links* is the platform linker's
+    // policy rather than the compiler's, so the running half is checked where
+    // that policy is known.
+    #[cfg(target_os = "linux")]
     assert_eq!(
         compile_and_run("codegen_symbol_attrs_weak_declaration", declared, &[]),
         0
@@ -8252,7 +8292,6 @@ int main(void) {
 
 /// Assemble a source to text and hand it back, for tests that need to see the
 /// directives rather than the program's answer.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn asm_for(prefix: &str, src: &str) -> String {
     let dir = tempfile::Builder::new()
         .prefix(prefix)
@@ -8488,6 +8527,66 @@ int main(void) {
     );
     assert_eq!(
         compile_and_run_optimized("codegen_overaligned_fp_locals_opt", code),
+        0
+    );
+}
+
+/// Truncating a 128-bit value to 32 bits left the whole low half in the
+/// register. "Already the right width" was true only of the *store* that
+/// usually follows a truncation; anything that read the pseudo directly saw
+/// the bits that were supposed to have been dropped.
+///
+/// `__builtin_add_overflow` is exactly that shape -- compute wide, narrow to
+/// the destination, widen back, compare -- so it compared its result against
+/// an untruncated copy of itself and could never report an overflow on
+/// aarch64. Both aarch64 CI targets failed on it; x86-64 emits the same
+/// self-move and was always right.
+#[test]
+fn codegen_trunc_to_32_discards_the_upper_half() {
+    let code = r#"
+int main(void) {
+    unsigned ur;
+    unsigned x = 4294967295u, y = 1u;
+
+    /* The builtin, which is how this was found. */
+    if (!__builtin_add_overflow(x, y, &ur)) return 1;
+    if (ur != 0) return 2;
+    if (!__builtin_add_overflow(4294967295u, 1u, &ur)) return 3;
+    if (__builtin_add_overflow(1u, 2u, &ur) || ur != 3) return 4;
+
+    /* And the narrowing on its own, which is the actual defect. */
+    {
+        unsigned __int128 wide = ((unsigned __int128)1 << 40) | 0x5u;
+        unsigned narrow = (unsigned)wide;
+        unsigned __int128 back = (unsigned __int128)narrow;
+        if (narrow != 5u) return 5;
+        if (back != 5u) return 6;
+        if ((unsigned long long)back != 5ull) return 7;
+    }
+    {
+        __int128 wide = -((__int128)1 << 40) - 3;
+        int narrow = (int)wide;
+        long long back = (long long)narrow;
+        if (narrow != -3) return 8;
+        if (back != -3LL) return 9;
+    }
+    /* Signed 128 to unsigned 32 and back, where the discarded bits are set. */
+    {
+        __int128 w = ((__int128)7 << 32) | 0xdeadbeefu;
+        unsigned n = (unsigned)w;
+        unsigned __int128 b = (unsigned __int128)n;
+        if (n != 0xdeadbeefu) return 10;
+        if (b != 0xdeadbeefu) return 11;
+    }
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_trunc_to_32_discards_the_upper_half", code, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run_optimized("codegen_trunc_to_32_discards_the_upper_half_opt", code),
         0
     );
 }

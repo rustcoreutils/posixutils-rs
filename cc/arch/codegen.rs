@@ -251,7 +251,10 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
                 continue;
             }
             if attrs.weak {
-                self.push_directive(Directive::Weak(Symbol::global(name)));
+                self.push_directive(Directive::Weak(
+                    Symbol::global(name),
+                    crate::arch::lir::WeakKind::Reference,
+                ));
             }
             if let Some(how) = &attrs.visibility {
                 self.push_directive(Directive::Visibility(Symbol::global(name), how.clone()));
@@ -343,7 +346,10 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         // Global visibility (if not static and not a `.LC...`-style local label)
         if !global.is_static && !is_local_label {
             if global.symbol_attrs.weak {
-                self.push_directive(Directive::Weak(Symbol::global(&global.name)));
+                self.push_directive(Directive::Weak(
+                    Symbol::global(&global.name),
+                    crate::arch::lir::WeakKind::Definition,
+                ));
             } else {
                 self.push_directive(Directive::global(&global.name));
             }

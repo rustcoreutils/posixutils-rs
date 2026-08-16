@@ -1801,7 +1801,9 @@ int main(void) {
 fn c99_universal_character_names_use_the_execution_encoding() {
     let code = r#"
 #include <wchar.h>
-#include <uchar.h>
+/* <uchar.h> does not exist on macOS, and the test needs only the two types. */
+typedef unsigned short char16_t;
+typedef unsigned int char32_t;
 
 int main(void) {
     /* Narrow: bytes. A UCN and the character itself agree. */

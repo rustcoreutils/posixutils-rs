@@ -283,6 +283,26 @@ pub fn suppress_warnings() {
     SUPPRESS_WARNINGS.store(true, Ordering::Relaxed);
 }
 
+/// Warning groups turned off by `-Wno-<name>`.
+///
+/// `-w` is all-or-nothing and lives in `SUPPRESS_WARNINGS`; this is the named
+/// half. Set once from the driver, because the code that emits a warning is
+/// nowhere near the code that parsed the command line.
+static SUPPRESSED_GROUPS: std::sync::OnceLock<std::collections::HashSet<String>> =
+    std::sync::OnceLock::new();
+
+/// Record the `-Wno-<name>` groups. Ignored if called twice.
+pub fn suppress_warning_groups(names: std::collections::HashSet<String>) {
+    let _ = SUPPRESSED_GROUPS.set(names);
+}
+
+/// Is the warning group `name` still on?
+pub fn warning_group_enabled(name: &str) -> bool {
+    !SUPPRESSED_GROUPS
+        .get()
+        .is_some_and(|groups| groups.contains(name))
+}
+
 /// Are warnings being printed?
 pub fn warnings_suppressed() -> bool {
     SUPPRESS_WARNINGS.load(Ordering::Relaxed)

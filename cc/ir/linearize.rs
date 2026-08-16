@@ -895,6 +895,7 @@ impl<'a> Linearizer<'a> {
         ir_func.emit = !is_inline_definition;
         ir_func.is_noreturn = is_noreturn;
         ir_func.is_inline = is_inline;
+        ir_func.symbol_attrs = func.attrs.symbol.clone();
         ir_func.is_noinline = func.attrs.noinline;
         ir_func.is_always_inline = func.attrs.always_inline;
         ir_func.constructor = func.attrs.constructor;
@@ -1492,6 +1493,8 @@ impl<'a> Linearizer<'a> {
     /// - Statement expressions (GNU extension with potential side effects)
     pub(crate) fn is_pure_expr(&self, expr: &Expr) -> bool {
         match &expr.kind {
+            // Writes through its third argument.
+            ExprKind::CheckedArith { .. } => false,
             // Literals are always pure
             ExprKind::IntLit(_)
             | ExprKind::Int128Lit(_)
@@ -4695,6 +4698,116 @@ impl<'a> Linearizer<'a> {
         }
     }
 
+    /// `__builtin_*_overflow` where the destination is 128 bits wide.
+    ///
+    /// The ordinary lowering computes in a type twice the destination's width
+    /// and asks whether narrowing lost anything. Nothing here is wider than
+    /// 128 bits, so at that width it compared a value to itself and always
+    /// answered "no overflow". The result has to be examined directly instead,
+    /// with the classic per-operation predicates.
+    ///
+    /// Operands arrive already converted to the destination type. Where that
+    /// conversion is not value-preserving -- a negative operand with an
+    /// unsigned destination, or an `unsigned __int128` one with a signed
+    /// destination -- the answer follows the converted value rather than the
+    /// mathematical one. See #C62 in `cc/audit.md`.
+    fn linearize_checked_arith_wide(
+        &mut self,
+        op: crate::parse::ast::CheckedOp,
+        a: PseudoId,
+        b: PseudoId,
+        addr: PseudoId,
+        dst: TypeId,
+    ) -> PseudoId {
+        use crate::parse::ast::CheckedOp;
+        let bin = match op {
+            CheckedOp::Add => BinaryOp::Add,
+            CheckedOp::Sub => BinaryOp::Sub,
+            CheckedOp::Mul => BinaryOp::Mul,
+        };
+        let r = self.emit_binary(bin, a, b, dst, dst);
+        let dst_size = self.types.size_bits(dst);
+        self.emit(Instruction::store(r, addr, 0, dst, dst_size));
+
+        let int_id = self.types.int_id;
+        let unsigned = self.types.is_unsigned(dst);
+
+        match (op, unsigned) {
+            // The sum wrapped exactly when it came out below an addend.
+            (CheckedOp::Add, true) => self.emit_binary(BinaryOp::Lt, r, a, int_id, dst),
+            // A difference is representable exactly when it is not negative.
+            (CheckedOp::Sub, true) => self.emit_binary(BinaryOp::Lt, a, b, int_id, dst),
+            // Signed addition overflows when both addends differ in sign from
+            // the result, which is what `(a^r) & (b^r)` being negative says.
+            (CheckedOp::Add, false) | (CheckedOp::Sub, false) => {
+                // Addition: `(a^r) & (b^r)` -- both addends differ in sign
+                // from the sum. Subtraction: `(a^b) & (a^r)` -- the operands
+                // differ in sign and the result differs from the minuend.
+                let (p, q) = match op {
+                    CheckedOp::Add => (b, r),
+                    _ => (b, r),
+                };
+                let x1 = match op {
+                    CheckedOp::Add => self.emit_binary(BinaryOp::BitXor, a, q, dst, dst),
+                    _ => self.emit_binary(BinaryOp::BitXor, a, p, dst, dst),
+                };
+                let x2 = match op {
+                    CheckedOp::Add => self.emit_binary(BinaryOp::BitXor, p, q, dst, dst),
+                    _ => self.emit_binary(BinaryOp::BitXor, a, q, dst, dst),
+                };
+                let both = self.emit_binary(BinaryOp::BitAnd, x1, x2, dst, dst);
+                let zero = self.emit_const(0, dst);
+                self.emit_binary(BinaryOp::Lt, both, zero, int_id, dst)
+            }
+            // Multiplication is checked on magnitudes, in unsigned arithmetic
+            // that cannot itself overflow: |a| exceeds the largest multiplier
+            // that still fits exactly when it is above `limit / |b|`. The
+            // limit depends on the sign of the product, since the negative
+            // range holds one more value than the positive one.
+            (CheckedOp::Mul, _) => {
+                let u = self.types.uint128_id;
+                let (ua, ub, limit) = if unsigned {
+                    let max = self.emit_const(-1i128, u);
+                    (a, b, max)
+                } else {
+                    // `(x ^ (x >> 127)) - (x >> 127)` is |x| as a bit pattern,
+                    // exact for the most negative value too.
+                    let sh = self.emit_const(127, self.types.int_id);
+                    let ma = self.emit_binary(BinaryOp::Shr, a, sh, dst, dst);
+                    let mb = self.emit_binary(BinaryOp::Shr, b, sh, dst, dst);
+                    let xa = self.emit_binary(BinaryOp::BitXor, a, ma, dst, dst);
+                    let xb = self.emit_binary(BinaryOp::BitXor, b, mb, dst, dst);
+                    let aa = self.emit_binary(BinaryOp::Sub, xa, ma, dst, dst);
+                    let ab = self.emit_binary(BinaryOp::Sub, xb, mb, dst, dst);
+                    let ua = self.emit_convert(aa, dst, u);
+                    let ub = self.emit_convert(ab, dst, u);
+                    // Signs differ: the product may reach 2^127, one past the
+                    // largest positive value.
+                    let sx = self.emit_binary(BinaryOp::BitXor, a, b, dst, dst);
+                    let sm = self.emit_binary(BinaryOp::Shr, sx, sh, dst, dst);
+                    let smu = self.emit_convert(sm, dst, u);
+                    let one = self.emit_const(1, u);
+                    let neg = self.emit_binary(BinaryOp::BitAnd, smu, one, u, u);
+                    let smax = self.emit_const(i128::MAX, u);
+                    let limit = self.emit_binary(BinaryOp::Add, smax, neg, u, u);
+                    (ua, ub, limit)
+                };
+                // Zero multiplies never overflow, and dividing by the zero
+                // would trap, so the divisor is nudged to one and the whole
+                // answer gated on it.
+                let zero = self.emit_const(0, u);
+                let nz = self.emit_binary(BinaryOp::Ne, ub, zero, int_id, u);
+                let nzu = self.emit_convert(nz, int_id, u);
+                let one = self.emit_const(1, u);
+                let bump = self.emit_binary(BinaryOp::BitXor, nzu, one, u, u);
+                let d = self.emit_binary(BinaryOp::Add, ub, bump, u, u);
+                let q = self.emit_binary(BinaryOp::Div, limit, d, u, u);
+                let over = self.emit_binary(BinaryOp::Gt, ua, q, int_id, u);
+                self.emit_binary(BinaryOp::BitAnd, over, nz, int_id, int_id)
+            }
+        }
+    }
+
     pub(crate) fn linearize_expr(&mut self, expr: &Expr) -> PseudoId {
         // Set current position for debug info
         self.current_pos = Some(expr.pos);
@@ -4710,6 +4823,68 @@ impl<'a> Linearizer<'a> {
         }
 
         match &expr.kind {
+            // `__builtin_add_overflow(a, b, res)` and its siblings.
+            //
+            // Computed in 128 bits, which holds every exact sum, difference
+            // and product of two operands of 64 bits or fewer, then narrowed
+            // to the destination's type and widened back: if the round trip
+            // changes the value, the operation overflowed. That is the
+            // definition, and it needs no new opcode on either target -- the
+            // flag-reading forms the hardware offers would.
+            //
+            // Signedness of the wide type follows the operands: a product of
+            // two 64-bit unsigned values can exceed the signed 128-bit range,
+            // so all-unsigned operands compute unsigned.
+            ExprKind::CheckedArith { op, a, b, res } => {
+                let a_typ = self.expr_type(a);
+                let b_typ = self.expr_type(b);
+                let res_ptr_typ = self.expr_type(res);
+                let dst_typ = self
+                    .types
+                    .base_type(res_ptr_typ)
+                    .unwrap_or(self.types.int_id);
+
+                let all_unsigned = self.types.is_unsigned(a_typ)
+                    && self.types.is_unsigned(b_typ)
+                    && self.types.is_unsigned(dst_typ);
+                let wide = if all_unsigned {
+                    self.types.uint128_id
+                } else {
+                    self.types.int128_id
+                };
+
+                let av = self.linearize_expr(a);
+                let bv = self.linearize_expr(b);
+                let addr = self.linearize_expr(res);
+
+                let aw = self.emit_convert(av, a_typ, wide);
+                let bw = self.emit_convert(bv, b_typ, wide);
+                let bin = match op {
+                    crate::parse::ast::CheckedOp::Add => BinaryOp::Add,
+                    crate::parse::ast::CheckedOp::Sub => BinaryOp::Sub,
+                    crate::parse::ast::CheckedOp::Mul => BinaryOp::Mul,
+                };
+                // Nothing here is wider than 128 bits, so "compute exactly,
+                // then see whether it survived the narrowing" has nothing to
+                // compare against once the destination is that wide: it tested
+                // a value against itself and always answered "no overflow".
+                // At that width the result has to be examined directly.
+                if self.types.size_bits(dst_typ) >= 128 {
+                    let a128 = self.emit_convert(av, a_typ, dst_typ);
+                    let b128 = self.emit_convert(bv, b_typ, dst_typ);
+                    return self.linearize_checked_arith_wide(*op, a128, b128, addr, dst_typ);
+                }
+
+                let exact = self.emit_binary(bin, aw, bw, wide, wide);
+
+                let narrowed = self.emit_convert(exact, wide, dst_typ);
+                let dst_size = self.types.size_bits(dst_typ);
+                self.emit(Instruction::store(narrowed, addr, 0, dst_typ, dst_size));
+
+                let back = self.emit_convert(narrowed, dst_typ, wide);
+                self.emit_binary(BinaryOp::Ne, exact, back, self.types.int_id, wide)
+            }
+
             ExprKind::IntLit(val) => {
                 let typ = self.expr_type(expr);
                 self.emit_const(*val as i128, typ)

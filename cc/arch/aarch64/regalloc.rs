@@ -1402,13 +1402,21 @@ impl RegAlloc {
                 // The value always lives in a 16-byte aligned local stack
                 // slot; the prologue spills the register pair into it.
                 _ if arg.is_int128 => {
-                    if int_arg_idx + 1 < int_arg_regs.len() {
+                    // Stage C.10 puts a 128-bit value in an even-aligned pair,
+                    // so an odd NGRN skips a register. The caller applies the
+                    // same rule through the same helper; disagreeing about
+                    // which pair means each side reads a different one.
+                    if let Some(start) =
+                        crate::arch::aarch64::int128_pair_start(int_arg_idx, int_arg_regs.len())
+                    {
+                        int_arg_idx = start;
                         self.stack_offset += 16;
                         let slot = -self.stack_offset;
                         self.locations.insert(pseudo, Loc::Stack(slot));
                         self.free_regs.retain(|&r| {
                             r != int_arg_regs[int_arg_idx] && r != int_arg_regs[int_arg_idx + 1]
                         });
+                        int_arg_idx += 2;
                     } else {
                         // Overflow: 16 bytes on caller stack.
                         let at = IncomingOff::take(
@@ -1417,8 +1425,10 @@ impl RegAlloc {
                             types.alignment(arg.typ) as i32,
                         );
                         self.locations.insert(pseudo, Loc::Stack(at.displacement()));
+                        // Stage C.11: NGRN becomes 8, so nothing after it takes
+                        // a register either.
+                        int_arg_idx = int_arg_regs.len();
                     }
-                    int_arg_idx += 2;
                 }
                 // A composite of at most sixteen bytes that is not an HFA:
                 // AAPCS64 §5.4.2 C.10 puts it in consecutive X registers. The

@@ -310,7 +310,7 @@ impl Aarch64CodeGen {
         self.stack_alloc_size = stack_size;
 
         // Emit function header (directives, label, CFI start)
-        self.emit_function_header(func.is_static, &func.name);
+        self.emit_function_header(func);
 
         // Emit prologue (save fp/lr, callee-saved regs, allocate stack)
         self.emit_prologue(total_frame, &callee_saved, &callee_saved_fp);
@@ -430,13 +430,36 @@ impl Aarch64CodeGen {
     }
 
     /// Emit function header directives (text section, visibility, alignment, label, CFI start)
-    fn emit_function_header(&mut self, is_static: bool, name: &str) {
+    fn emit_function_header(&mut self, func: &Function) {
+        let (is_static, name) = (func.is_static, func.name.as_str());
         self.push_lir(Aarch64Inst::Directive(Directive::Blank));
         self.push_lir(Aarch64Inst::Directive(Directive::Text));
 
+        // A named section replaces .text for this function.
+        if let Some(sec) = &func.symbol_attrs.section {
+            self.push_lir(Aarch64Inst::Directive(Directive::NamedSection {
+                name: sec.clone(),
+                executable: true,
+                writable: false,
+            }));
+        }
+
         // Skip .globl for static functions (internal linkage)
         if !is_static {
-            self.push_lir(Aarch64Inst::Directive(Directive::global(name)));
+            if func.symbol_attrs.weak {
+                self.push_lir(Aarch64Inst::Directive(Directive::Weak(
+                    Symbol::global(name),
+                    crate::arch::lir::WeakKind::Definition,
+                )));
+            } else {
+                self.push_lir(Aarch64Inst::Directive(Directive::global(name)));
+            }
+        }
+        if let Some(how) = &func.symbol_attrs.visibility {
+            self.push_lir(Aarch64Inst::Directive(Directive::Visibility(
+                Symbol::global(name),
+                how.clone(),
+            )));
         }
 
         // ELF-only type (handled by Directive::emit which skips on macOS)
@@ -1339,10 +1362,20 @@ impl Aarch64CodeGen {
                             }
                             fp_arg_idx += 1;
                         } else if types.kind(*typ) == TypeKind::Int128 {
-                            // __int128 argument — uses TWO consecutive GP registers
-                            // Store to the arg pseudo's stack slot (allocated in allocate_arguments).
-                            // The IR will Copy from arg pseudo → local variable.
-                            if int_arg_idx + 1 < arg_regs.len() {
+                            // __int128 argument — uses TWO consecutive GP registers,
+                            // even-aligned per AAPCS64 stage C.10, so an odd NGRN
+                            // skips one. Asked through the same helper the caller
+                            // and the allocator use: computing the pair here
+                            // independently is how the prologue came to read a
+                            // different pair than the caller wrote.
+                            //
+                            // Store to the arg pseudo's stack slot (allocated in
+                            // allocate_arguments). The IR will Copy from arg
+                            // pseudo → local variable.
+                            if let Some(start) =
+                                crate::arch::aarch64::int128_pair_start(int_arg_idx, arg_regs.len())
+                            {
+                                int_arg_idx = start;
                                 if let Some(Loc::Stack(offset)) = self.locations.get_ref(pseudo.id)
                                 {
                                     if *offset < 0 {
@@ -1354,8 +1387,11 @@ impl Aarch64CodeGen {
                                         );
                                     }
                                 }
+                                int_arg_idx += 2;
+                            } else {
+                                // Stage C.11: NGRN becomes 8.
+                                int_arg_idx = arg_regs.len();
                             }
-                            int_arg_idx += 2;
                         } else {
                             // GP argument
                             if int_arg_idx < arg_regs.len() {
@@ -4461,6 +4497,8 @@ impl CodeGenerator for Aarch64CodeGen {
         for global in &module.globals {
             self.emit_global(global, types);
         }
+
+        self.base.emit_declared_symbol_attrs(module);
 
         // Emit string literals
         if !module.strings.is_empty() {

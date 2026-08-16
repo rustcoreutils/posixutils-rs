@@ -912,6 +912,26 @@ fn inline_call_site(
                 }
                 let call_arg = ctx.call_args[arg_idx_usize];
                 let remapped_local = ctx.remap_pseudo(copy.local_sym, callee);
+
+                // An aggregate that fits in one register travels *as* its
+                // value: the argument pseudo holds the data, not a pointer to
+                // it. Loading through it dereferences the data as an address --
+                // `struct { float a, b; }` became a wild pointer spelled by two
+                // floats, and the inlined body segfaulted on the first read.
+                // Anything larger does travel by address, which is why the loop
+                // below is right for those and wrong for these.
+                if matches!(copy.size_bytes, 1 | 2 | 4 | 8) {
+                    let bits = (copy.size_bytes * 8) as u32;
+                    copy_insns.push(Instruction::store(
+                        call_arg,
+                        remapped_local,
+                        0,
+                        copy.qword_type,
+                        bits,
+                    ));
+                    continue;
+                }
+
                 let mut offset = 0i64;
                 while (offset as usize) < copy.size_bytes {
                     let temp = ctx.alloc_pseudo_id();

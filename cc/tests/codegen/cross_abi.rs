@@ -783,9 +783,21 @@ fn cross_abi_float128_stack_arguments_are_sixteen_bytes() {
         !asm.contains("movt"),
         "`movt` is not an instruction:\n{asm}"
     );
+    // Two binary128s overflow to the stack, and each takes two eightbytes, so
+    // the second begins sixteen bytes after the first. The stride is what
+    // matters -- an eight-byte one overlapped the previous argument.
+    //
+    // Asserted on the offsets rather than on a `subq $16` per argument: the
+    // outgoing area is now reserved once and written at computed offsets,
+    // because pushing could not express the gap an alignment boundary needs.
+    let body = body_of(&asm, "call");
     assert!(
-        asm.contains("subq $16, %rsp"),
-        "a stack-passed binary128 needs two eightbytes:\n{asm}"
+        body.contains("(%rsp)") && body.contains("16(%rsp)"),
+        "two stacked binary128s sit at +0 and +16:\n{body}"
+    );
+    assert!(
+        !body.contains("8(%rsp)") || body.contains("16(%rsp)"),
+        "an eight-byte stride would overlap the previous argument:\n{body}"
     );
 
     let asm = asm_for("f128_stack_arm", "aarch64-unknown-linux-gnu", src);
@@ -1378,5 +1390,57 @@ long c_i1(struct I1 s) { return sink_i1(s, 5.0); }
     assert!(
         !i1.contains("d1,"),
         "an integer struct leaves V0 for the double after it:\n{i1}"
+    );
+}
+
+/// SysV AMD64 §3.2.3 starts each stacked argument at an address rounded up to
+/// `max(8, alignof(type))`, so a sixteen-byte-aligned one after an odd number
+/// of eight-byte slots begins at the *next* boundary, not immediately after.
+///
+/// The callee laid its incoming area out by advancing a running offset per
+/// argument and never rounding up, so `__int128` and `long double` in that
+/// position were read eight bytes early -- the value fetched was the argument
+/// before them. Six registers' worth of `long`s then one stacked `long` puts
+/// the value under test at +32; reading +16 gets that seventh `long`.
+///
+/// Checked against gcc on this source: it loads from 32(%rbp) for both.
+#[test]
+fn codegen_stacked_argument_starts_on_its_alignment() {
+    let src = r#"
+long long take_i128(long a, long b, long c, long d, long e, long f, long g, __int128 v)
+{ return (long long)v; }
+long double take_ld(long a, long b, long c, long d, long e, long f, long g, long double v)
+{ return v; }
+/* Control: eight-byte alignment needs no rounding, so this one really is
+   adjacent to the seventh long, at +24. */
+long take_l(long a, long b, long c, long d, long e, long f, long g, long v)
+{ return v; }
+"#;
+    let asm = asm_for("stacked_arg_alignment", X86_64_LINUX, src);
+
+    // Both halves of the sixteen-byte value, at +32 and +40. Before the fix
+    // they were read from +16 and +24 -- the seventh long and the padding
+    // after it. A bare "not +16" assertion would be wrong: the seventh long
+    // itself legitimately lives there and is loaded in the same body.
+    let i = body_of(&asm, "take_i128");
+    for off in ["32(%rbp)", "40(%rbp)"] {
+        assert!(
+            i.contains(off),
+            "take_i128: a sixteen-byte-aligned stacked argument starts at +32, \
+             so its halves are at +32 and +40, not immediately after the \
+             seventh long. Missing {off}:\n{i}"
+        );
+    }
+
+    let ld = body_of(&asm, "take_ld");
+    assert!(
+        ld.contains("32(%rbp)"),
+        "take_ld: a long double is sixteen-byte aligned too:\n{ld}"
+    );
+
+    let l = body_of(&asm, "take_l");
+    assert!(
+        l.contains("24(%rbp)"),
+        "take_l: an eight-byte-aligned argument needs no rounding:\n{l}"
     );
 }

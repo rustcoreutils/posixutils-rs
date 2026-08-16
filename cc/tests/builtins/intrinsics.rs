@@ -185,3 +185,59 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("builtins_intrinsics_mega", code, &[]), 0);
 }
+
+/// `__builtin_{add,sub,mul}_overflow` and the typed spellings glibc's headers
+/// use. They compute exactly, store the wrapped result through the pointer,
+/// and answer whether wrapping lost anything.
+///
+/// Lowered by computing in 128 bits — which holds every exact sum, difference
+/// and product of two operands of 64 bits or fewer — then narrowing and
+/// widening back: a round trip that changes the value overflowed. That needs
+/// no new opcode on either target, where reading the hardware's flags would.
+///
+/// Every expectation here came from gcc on this source.
+#[test]
+fn builtins_checked_arithmetic() {
+    let code = r#"
+#include <limits.h>
+
+int main(void) {
+    int r; long lr; unsigned ur; unsigned long ulr; long long llr;
+
+    if (__builtin_add_overflow(1, 2, &r) || r != 3) return 1;
+    if (!__builtin_add_overflow(INT_MAX, 1, &r)) return 2;
+    if (__builtin_sub_overflow(5, 3, &r) || r != 2) return 3;
+    if (!__builtin_sub_overflow(INT_MIN, 1, &r)) return 4;
+    if (__builtin_mul_overflow(3, 4, &r) || r != 12) return 5;
+    if (!__builtin_mul_overflow(INT_MAX, 2, &r)) return 6;
+
+    /* Wider destination: the same operands no longer overflow. */
+    if (__builtin_mul_overflow(1000000, 1000000, &lr) || lr != 1000000000000L) return 7;
+    if (!__builtin_add_overflow(2000000000, 2000000000, &r)) return 8;
+    if (__builtin_add_overflow(2000000000, 2000000000, &lr) || lr != 4000000000L) return 9;
+
+    /* Unsigned wraps at its own bound, and a product of two 64-bit unsigned
+       values can exceed the *signed* 128-bit range, so the wide computation
+       has to follow the operands' signedness. */
+    if (!__builtin_add_overflow(UINT_MAX, 1u, &ur)) return 10;
+    if (__builtin_sub_overflow(0u, 0u, &ur) || ur != 0) return 11;
+    if (!__builtin_sub_overflow(0u, 1u, &ur)) return 12;
+    if (!__builtin_mul_overflow(ULONG_MAX, 2ul, &ulr)) return 13;
+    if (__builtin_mul_overflow(ULONG_MAX, 1ul, &ulr) || ulr != ULONG_MAX) return 14;
+
+    /* The typed spellings. */
+    if (__builtin_uadd_overflow(1u, 2u, &ur) || ur != 3) return 15;
+    if (!__builtin_smul_overflow(INT_MAX, 2, &r)) return 16;
+    if (__builtin_saddll_overflow(1LL, 2LL, &llr) || llr != 3) return 17;
+    if (!__builtin_usubl_overflow(0ul, 1ul, &ulr)) return 18;
+
+    /* The result is stored even when it overflowed, wrapped. */
+    r = 0;
+    (void)__builtin_add_overflow(INT_MAX, 1, &r);
+    if (r != INT_MIN) return 19;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("builtins_checked_arithmetic", code, &[]), 0);
+}

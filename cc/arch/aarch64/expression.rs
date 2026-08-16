@@ -414,7 +414,19 @@ impl Aarch64CodeGen {
                         });
                     }
                     32 => {
-                        // 32-bit already handled - writing to w register zeros upper 32 bits
+                        // Writing a W register zeros the upper half -- but the
+                        // move above was 64 bits wide, so nothing had been
+                        // narrowed yet and the pseudo still carried all of it.
+                        // A later widening then read bits the truncation was
+                        // supposed to have dropped: `__builtin_add_overflow`
+                        // compared its result against an untruncated copy of
+                        // itself and could never report an overflow. x86-64
+                        // emits the same self-move for the same reason.
+                        self.push_lir(Aarch64Inst::Mov {
+                            size: OperandSize::B32,
+                            src: GpOperand::Reg(dst_reg),
+                            dst: dst_reg,
+                        });
                     }
                     _ => {}
                 }
@@ -863,8 +875,21 @@ impl Aarch64CodeGen {
                     dst: dst_reg,
                 });
             }
-            32 | 64 => {
-                // Already correct width
+            32 => {
+                // The low half arrived in a whole X register, so "already the
+                // right width" was only true of the *store* that usually
+                // follows. Anything that read the pseudo directly -- widening
+                // it back, in `__builtin_add_overflow` -- saw the bits the
+                // truncation was supposed to drop, and the builtin compared
+                // its result against an untruncated copy of itself.
+                self.push_lir(Aarch64Inst::Mov {
+                    size: OperandSize::B32,
+                    src: GpOperand::Reg(dst_reg),
+                    dst: dst_reg,
+                });
+            }
+            64 => {
+                // Already the whole register.
             }
             _ => {}
         }

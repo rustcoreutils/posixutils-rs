@@ -234,6 +234,9 @@ pub(crate) struct ParameterList {
     pub prototyped: bool,
 }
 
+/// The `-Wno-<name>` group the unimplemented-attribute warnings belong to.
+pub(crate) const ATTRIBUTE_WARNING: &str = "attributes";
+
 /// Whether the declarator being parsed must name something.
 ///
 /// C17 spells the two grammars separately -- `declarator` (6.7.6) always has
@@ -443,6 +446,7 @@ impl AttributeList {
     /// Collect the attributes that affect how a function is emitted.
     pub fn function_attrs(&self) -> crate::parse::ast::FunctionAttrs {
         crate::parse::ast::FunctionAttrs {
+            symbol: self.symbol_attrs(),
             noinline: self.has_noinline(),
             always_inline: self.has_always_inline(),
             constructor: self.constructor_priority(),
@@ -455,6 +459,28 @@ impl AttributeList {
     /// Get alignment from __attribute__((aligned(N))) or __attribute__((aligned))
     /// Returns Some(alignment) if found, None otherwise.
     /// Per GCC: aligned with no args defaults to 16 ("max useful alignment").
+    /// The `weak`, `used`, `section(...)` and `visibility(...)` requests in
+    /// this list. All four were parsed and dropped before, while
+    /// `__has_attribute` answered 1 for each.
+    pub fn symbol_attrs(&self) -> crate::parse::ast::SymbolAttrs {
+        let mut out = crate::parse::ast::SymbolAttrs::default();
+        for attr in &self.attrs {
+            let text = |a: &Attribute| match a.args.first() {
+                Some(AttributeArg::String(s)) => Some(s.clone()),
+                Some(AttributeArg::Ident(s)) => Some(s.clone()),
+                _ => None,
+            };
+            match attr.name.trim_matches('_') {
+                "weak" => out.weak = true,
+                "used" => out.used = true,
+                "section" => out.section = text(attr),
+                "visibility" => out.visibility = text(attr),
+                _ => {}
+            }
+        }
+        out
+    }
+
     pub fn get_alignment(&self) -> Option<u32> {
         for attr in &self.attrs {
             if attr.name == "aligned" || attr.name == "__aligned__" {
@@ -509,6 +535,11 @@ pub struct Parser<'a> {
     /// Explicit alignment from _Alignas in current declaration
     /// Cleared after each declaration is parsed.
     pending_alignas: Option<u32>,
+    /// `weak`, `used`, `section(...)`, `visibility(...)` seen on the
+    /// declaration being parsed. Accumulated like `pending_alignas`, because
+    /// an attribute may appear before the declarator, after it, or on the
+    /// specifier, and the declarator is built once at the end.
+    pending_symbol_attrs: crate::parse::ast::SymbolAttrs,
     /// Emission-affecting function attributes seen so far in the declaration
     /// being parsed. Accumulated like `pending_alignas` because a
     /// `constructor` / `noinline` attribute may appear before the declaration
@@ -571,6 +602,7 @@ impl<'a> Parser<'a> {
             types,
             pos: 0,
             pending_alignas: None,
+            pending_symbol_attrs: Default::default(),
             pending_fn_attrs: Default::default(),
             declared_fn_attrs: BTreeMap::new(),
             pending_asm_label: None,
@@ -920,8 +952,44 @@ impl<'a> Parser<'a> {
             return None;
         }
 
+        let pos = self.current_pos();
+        let id = self.get_ident_id(self.current());
         let name = self.get_ident_name(self.current())?;
         self.advance();
+
+        // Every attribute in the program passes through here exactly once, so
+        // this is where an unrecognised one gets said out loud. It used to be
+        // dropped in silence, which is survivable for an attribute that only
+        // hints -- and is not for one that changes what the type *is*.
+        let recognised = id.is_some_and(|id| crate::kw::has_tag(id, crate::kw::SUPPORTED_ATTR));
+        if !recognised {
+            if name.trim_matches('_') == "vector_size" {
+                // Ignoring this cannot produce a correct program: the type
+                // stays scalar, every operation on it stays scalar, and the
+                // mistake surfaces far from here as arithmetic on one element
+                // instead of all of them. Refusing is the honest answer until
+                // vector types exist.
+                diag::error_args(
+                    pos,
+                    "'{0}' attribute is not implemented, and ignoring it would change the type",
+                    &[&name],
+                );
+            } else if name.trim_matches('_') == "mode"
+                && diag::warning_group_enabled(ATTRIBUTE_WARNING)
+            {
+                // Also changes the type -- `register_t` is declared with
+                // `__mode__(__word__)` -- but glibc puts it in `sys/types.h`
+                // and `floatn.h`, so refusing would reject every program that
+                // includes them. Said out loud instead of silently dropped.
+                diag::warning_args(
+                    pos,
+                    "'{0}' attribute is not implemented; the declared type is used unchanged",
+                    &[&name],
+                );
+            } else if diag::warning_group_enabled(ATTRIBUTE_WARNING) {
+                diag::warning_args(pos, "'{0}' attribute directive ignored", &[&name]);
+            }
+        }
 
         // Check for arguments
         if self.is_special(b'(') {
@@ -1208,14 +1276,14 @@ impl<'a> Parser<'a> {
         // Parse first string
         let token = self.consume();
         if let TokenValue::String(s) = &token.value {
-            result.push_str(&Self::parse_string_literal(s));
+            result.push_str(&Self::literal_bytes(&Self::parse_string_literal(s)));
         }
 
         // Handle string concatenation (adjacent string literals)
         while self.peek() == TokenType::String {
             let token = self.consume();
             if let TokenValue::String(s) = &token.value {
-                result.push_str(&Self::parse_string_literal(s));
+                result.push_str(&Self::literal_bytes(&Self::parse_string_literal(s)));
             }
         }
 
@@ -1333,6 +1401,19 @@ impl<'a> Parser<'a> {
         Ok(labels)
     }
 
+    /// Accumulate the symbol-emission attributes from one attribute list.
+    fn merge_symbol_attrs(&mut self, attrs: &AttributeList) {
+        let found = attrs.symbol_attrs();
+        self.pending_symbol_attrs.weak |= found.weak;
+        self.pending_symbol_attrs.used |= found.used;
+        if found.section.is_some() {
+            self.pending_symbol_attrs.section = found.section;
+        }
+        if found.visibility.is_some() {
+            self.pending_symbol_attrs.visibility = found.visibility;
+        }
+    }
+
     /// Apply alignment from __attribute__((aligned(N))) to pending_alignas.
     /// Merges max: multiple aligned attrs → strictest wins.
     fn apply_attribute_alignment(&mut self, attrs: &AttributeList) {
@@ -1353,6 +1434,7 @@ impl<'a> Parser<'a> {
             if self.is_attribute_keyword() {
                 let attrs = self.parse_attributes();
                 self.apply_attribute_alignment(&attrs);
+                self.merge_symbol_attrs(&attrs);
                 let fn_attrs = attrs.function_attrs();
                 self.pending_fn_attrs.merge(&fn_attrs);
             } else if self.is_asm_keyword() {
@@ -1783,6 +1865,7 @@ impl Parser<'_> {
                     .expect("symbol declaration failed in test");
 
                 declarators.push(InitDeclarator {
+                    symbol_attrs: std::mem::take(&mut self.pending_symbol_attrs),
                     symbol,
                     typ,
                     storage_class: TypeModifiers::empty(),
@@ -2183,6 +2266,7 @@ impl Parser<'_> {
                         | TypeModifiers::REGISTER;
                     let storage_class = base_type.modifiers & storage_class_mask;
                     declarators.push(InitDeclarator {
+                        symbol_attrs: std::mem::take(&mut self.pending_symbol_attrs),
                         symbol,
                         typ,
                         storage_class,
@@ -4078,6 +4162,13 @@ impl Parser<'_> {
         // symptom is an unrelated global emitted under someone else's
         // assembler name.
         self.pending_asm_label = None;
+        // Likewise the symbol attributes. A function *definition* takes its
+        // attributes through `pending_fn_attrs` and leaves these behind, so the
+        // next declaration to build an `InitDeclarator` claimed them: the
+        // variable after a `section(...)` function was emitted into that
+        // function's section, and the conflicting "ax"/"aw" flags made the
+        // assembler reject the file outright.
+        self.pending_symbol_attrs = Default::default();
 
         // Check for _Static_assert first (C11)
         if self.is_static_assert() {
@@ -4159,6 +4250,11 @@ impl Parser<'_> {
                 let calling_conv = attrs.calling_conv().unwrap_or_default();
                 let fn_attrs = attrs.function_attrs();
                 self.pending_fn_attrs.merge(&fn_attrs);
+                // Symbol attributes too. Only the function half was collected
+                // here, so `weak` written after a function declarator was
+                // dropped -- and a weak *declaration* is the whole point of
+                // the attribute.
+                self.merge_symbol_attrs(&attrs);
                 let all_fn_attrs = if self.types.kind(typ) == TypeKind::Function {
                     self.accumulate_fn_attrs(name)
                 } else {
@@ -4273,6 +4369,7 @@ impl Parser<'_> {
                 self.settle_declaration_facts(name, storage_class);
                 return Ok(ExternalDecl::Declaration(Declaration {
                     declarators: vec![InitDeclarator {
+                        symbol_attrs: std::mem::take(&mut self.pending_symbol_attrs),
                         symbol,
                         typ,
                         storage_class,
@@ -4353,6 +4450,11 @@ impl Parser<'_> {
                 let calling_conv = attrs.calling_conv().unwrap_or_default();
                 let fn_attrs = attrs.function_attrs();
                 self.pending_fn_attrs.merge(&fn_attrs);
+                // Symbol attributes too. Only the function half was collected
+                // here, so `weak` written after a function declarator was
+                // dropped -- and a weak *declaration* is the whole point of
+                // the attribute.
+                self.merge_symbol_attrs(&attrs);
                 let all_fn_attrs = if self.types.kind(full_typ) == TypeKind::Function {
                     self.accumulate_fn_attrs(name)
                 } else {
@@ -4454,6 +4556,7 @@ impl Parser<'_> {
                 self.settle_declaration_facts(name, storage_class);
                 return Ok(ExternalDecl::Declaration(Declaration {
                     declarators: vec![InitDeclarator {
+                        symbol_attrs: std::mem::take(&mut self.pending_symbol_attrs),
                         symbol,
                         typ: full_typ,
                         storage_class,
@@ -4484,6 +4587,7 @@ impl Parser<'_> {
             let attrs = self.parse_attributes();
             let fn_attrs = attrs.function_attrs();
             self.pending_fn_attrs.merge(&fn_attrs);
+            self.merge_symbol_attrs(&attrs);
             let all_fn_attrs = self.accumulate_fn_attrs(name);
             // noreturn can come from __attribute__((noreturn)) or _Noreturn keyword in base type
             let typ_from_table = self.types.get(typ_id);
@@ -4623,6 +4727,7 @@ impl Parser<'_> {
                 self.settle_declaration_facts(name, storage_class);
                 return Ok(ExternalDecl::Declaration(Declaration {
                     declarators: vec![InitDeclarator {
+                        symbol_attrs: std::mem::take(&mut self.pending_symbol_attrs),
                         symbol,
                         typ: func_type_id,
                         storage_class,
@@ -4766,6 +4871,7 @@ impl Parser<'_> {
         let symbol = symbol.expect("symbol should be bound");
         self.settle_declaration_facts(name, storage_class);
         declarators.push(InitDeclarator {
+            symbol_attrs: std::mem::take(&mut self.pending_symbol_attrs),
             symbol,
             typ: var_type_id,
             storage_class,
@@ -4852,6 +4958,7 @@ impl Parser<'_> {
 
             self.settle_declaration_facts(decl_name, storage_class);
             declarators.push(InitDeclarator {
+                symbol_attrs: std::mem::take(&mut self.pending_symbol_attrs),
                 symbol: decl_symbol.expect("symbol should be bound"),
                 typ: decl_type,
                 storage_class,

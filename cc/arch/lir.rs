@@ -588,6 +588,16 @@ pub trait LirInst: Clone + std::fmt::Debug {
 // Assembler Directives (Architecture-Independent)
 // ============================================================================
 
+/// Which side of a weak symbol a directive names. ELF does not distinguish
+/// them; Mach-O has a separate directive for each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeakKind {
+    /// A definition here that another definition may override.
+    Definition,
+    /// A reference to a symbol that may not exist, resolving to null.
+    Reference,
+}
+
 /// Assembler directives that are common across architectures.
 /// These control the assembler behavior, emit data, or provide metadata.
 #[derive(Debug, Clone, PartialEq)]
@@ -618,6 +628,31 @@ pub enum Directive {
     /// Used for `const`-qualified globals whose initializer contains symbol
     /// addresses that need dynamic-linker fixups.
     DataRelRo,
+
+    /// Switch to a section the program named with
+    /// `__attribute__((section("...")))`, instead of the one the object's
+    /// contents would have chosen.
+    ///
+    /// `executable` says whether code or data is going there, because ELF
+    /// needs the flags spelled out and they differ: `"ax"` against `"aw"`.
+    /// Getting it wrong is not cosmetic -- a function in a non-executable
+    /// section segfaults when called.
+    NamedSection {
+        name: String,
+        executable: bool,
+        writable: bool,
+    },
+
+    /// Mark a symbol weak: another definition overrides it, and an
+    /// unresolved reference is null rather than a link error.
+    ///
+    /// ELF spells both with `.weak`; Mach-O has two directives and rejects
+    /// `.weak` outright, so which of the two this is has to be carried here.
+    Weak(Symbol, WeakKind),
+
+    /// ELF symbol visibility from `__attribute__((visibility("...")))`.
+    /// Mach-O has only `.private_extern`, which corresponds to "hidden".
+    Visibility(Symbol, String),
 
     /// Switch to thread-local data section (.section .tdata or __DATA,__thread_data)
     Tdata,
@@ -894,6 +929,78 @@ impl EmitAsm for Directive {
                 }
                 Os::Linux | Os::FreeBSD => {
                     let _ = writeln!(out, ".text");
+                }
+            },
+            Directive::NamedSection {
+                name,
+                executable,
+                writable,
+            } => match target.os {
+                // Mach-O names a segment and a section together, and the
+                // program supplies both -- `section("__DATA,__mine")`.
+                Os::MacOS => {
+                    let _ = writeln!(out, ".section {}", name);
+                }
+                // ELF needs the flags, or the section is neither allocated nor
+                // writable and the object never reaches memory at run time. A
+                // name that already carries its own flags is passed through.
+                _ => {
+                    if name.contains(',') {
+                        let _ = writeln!(out, ".section {}", name);
+                    } else {
+                        // Read-only data asked for a named section is still
+                        // read-only: spelling it "aw" put it in a writable
+                        // segment and lost its page protection.
+                        let flags = if *executable {
+                            "ax"
+                        } else if *writable {
+                            "aw"
+                        } else {
+                            "a"
+                        };
+                        let _ = writeln!(out, ".section {},\"{}\"", name, flags);
+                    }
+                }
+            },
+            Directive::Weak(sym, kind) => {
+                let name = sym.format_for_target(target);
+                match target.os {
+                    // `.weak` is not a Mach-O directive at all -- the
+                    // assembler rejects it as unknown. Mach-O separates the
+                    // definition from the reference.
+                    Os::MacOS => match kind {
+                        // `.weak_definition` marks the definition weak but
+                        // does not export it, so the `.globl` that `.weak`
+                        // stands in for on ELF still has to be emitted.
+                        WeakKind::Definition => {
+                            let _ = writeln!(out, ".globl {}", name);
+                            let _ = writeln!(out, ".weak_definition {}", name);
+                        }
+                        WeakKind::Reference => {
+                            let _ = writeln!(out, ".weak_reference {}", name);
+                        }
+                    },
+                    _ => {
+                        let _ = writeln!(out, ".weak {}", name);
+                    }
+                }
+            }
+            Directive::Visibility(sym, how) => match target.os {
+                // Mach-O expresses only "not exported from this image".
+                Os::MacOS => {
+                    if how == "hidden" || how == "internal" {
+                        let _ = writeln!(out, ".private_extern {}", sym.format_for_target(target));
+                    }
+                }
+                // ELF has a directive for each visibility *except* the default
+                // one, which is the absence of them -- `.default` is not a
+                // pseudo-op, and emitting it fails the assembler. CPython puts
+                // `visibility("default")` on every public function, so this is
+                // the common case rather than a corner.
+                _ => {
+                    if matches!(how.as_str(), "hidden" | "protected" | "internal") {
+                        let _ = writeln!(out, ".{} {}", how, sym.format_for_target(target));
+                    }
                 }
             },
             Directive::Data => match target.os {

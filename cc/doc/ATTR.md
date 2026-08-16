@@ -36,12 +36,24 @@ Attributes fall into three categories based on implementation depth:
 | `destructor` | Functions | Runs after `main` returns or on `exit`, via `.fini_array` / `__DATA,__mod_term_func`. Priorities as for `constructor` |
 | `noinline` | Functions | The inliner leaves the function alone, whatever its size |
 | `always_inline` | Functions | Inlined at every call site regardless of size, and at `-O0` too. `noinline` outranks it, as in gcc |
+| `weak` | Functions, variables | `.weak` rather than `.globl`: another definition wins, and an unresolved reference is null rather than a link error. Honoured on a *declaration* with no definition too, which is the idiom the attribute exists for |
+| `visibility` | Functions, variables | ELF `.hidden` / `.protected` / `.internal`; "default" is the *absence* of a directive, not a `.default` pseudo-op. Mach-O has only `.private_extern`, used for "hidden" and "internal". A zero-initialized variable leaves the `.comm` fast path rather than lose it |
+| `section` | Functions, variables | Places the symbol in the named section, ahead of every other rule -- including the zero-initialized fast path, since `.comm` would let the linker choose. ELF flags follow the contents: `"ax"` for code, `"aw"` for mutable data, `"a"` for read-only data |
 
 ### Accepted but with no effect, and the program can tell
 
-Empty: every attribute whose absence a program could observe is now
-implemented. The entries below are ignored, but ignoring them changes nothing
-a conforming program can detect.
+One entry, and it is a technicality rather than a gap:
+
+| Attribute | Why the program cannot currently tell |
+|-----------|---------------------------------------|
+| `used` | c17 never prunes an unreferenced static, so keeping one alive is already what happens. gcc drops it at `-O2` and c17 does not. If dead-global elimination is ever added, `used` has to be consulted then, or this becomes a real divergence. See #C59 in `cc/audit.md` |
+
+An attribute the compiler does not recognise is no longer dropped in silence:
+it is a warning, suppressible with `-Wno-attributes`. `vector_size` is refused
+outright, because leaving the type scalar cannot produce a correct program, and
+`mode` warns -- it changes the type too, but glibc declares `register_t` with
+it, so refusing would reject nearly every program. `const` is recognised in
+both its bare and underscored spellings, as gcc accepts either.
 
 ### Parsed and accepted (no semantic effect)
 
@@ -51,10 +63,6 @@ These are parsed by `__attribute__((...))`, reported by `__has_attribute()`, but
 |-----------|-------------|
 | `unused` | Suppress unused warnings |
 | `deprecated` | Mark as deprecated |
-| `weak` | Weak symbol linkage |
-| `section` | Place in named section |
-| `visibility` | Symbol visibility (default, hidden, protected) |
-| `used` | Prevent dead-stripping |
 | `hot` | Optimize for speed |
 | `cold` | Optimize for size |
 | `warn_unused_result` | Warn if return value ignored |

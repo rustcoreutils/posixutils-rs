@@ -1506,6 +1506,8 @@ pub struct ImplicitParamCopy {
 pub struct Function {
     /// Function name
     pub name: String,
+    /// `weak`, `used`, `section(...)`, `visibility(...)`.
+    pub symbol_attrs: crate::parse::ast::SymbolAttrs,
     /// Return type (interned TypeId)
     pub return_type: TypeId,
     /// Parameter names and types (interned TypeIds)
@@ -1582,6 +1584,7 @@ impl Default for Function {
     fn default() -> Self {
         Self {
             name: String::new(),
+            symbol_attrs: Default::default(),
             return_type: TypeId::INVALID,
             params: Vec::with_capacity(DEFAULT_PARAM_CAPACITY),
             blocks: Vec::with_capacity(DEFAULT_BLOCK_CAPACITY),
@@ -1932,6 +1935,17 @@ impl fmt::Display for Initializer {
 // Global Variable Definition
 // ============================================================================
 
+/// How a global is stored, as three facts that always travel together.
+///
+/// Passed as one value because they are three of the eight arguments
+/// `add_global_impl` otherwise takes, and three adjacent booleans at a call
+/// site say nothing about which is which.
+struct GlobalStorage {
+    is_static: bool,
+    is_const: bool,
+    is_thread_local: bool,
+}
+
 /// A global variable definition with full metadata
 #[derive(Debug, Clone)]
 pub struct GlobalDef {
@@ -1951,6 +1965,8 @@ pub struct GlobalDef {
     pub is_const: bool,
     /// Explicit alignment from _Alignas specifier (None = use natural alignment)
     pub explicit_align: Option<u32>,
+    /// `weak`, `used`, `section(...)`, `visibility(...)`.
+    pub symbol_attrs: crate::parse::ast::SymbolAttrs,
 }
 
 impl GlobalDef {
@@ -1964,6 +1980,7 @@ impl GlobalDef {
             is_static: false,
             is_const: false,
             explicit_align: None,
+            symbol_attrs: Default::default(),
         }
     }
 
@@ -2012,6 +2029,14 @@ pub struct Module {
     /// External symbols (declared extern but not defined in this module)
     /// These need GOT access on macOS
     pub extern_symbols: HashSet<String>,
+    /// Attributes written on a symbol this translation unit declares but does
+    /// not define. `weak` is the point of it: `extern int f(void)
+    /// __attribute__((weak));` has to reach the object file as `.weak f`, or
+    /// the reference is strong and an absent definition is a link error
+    /// instead of a null pointer -- which is the entire idiom.
+    ///
+    /// Ordered, because it is iterated to emit directives.
+    pub declared_symbol_attrs: std::collections::BTreeMap<String, crate::parse::ast::SymbolAttrs>,
     /// External thread-local symbols (declared extern _Thread_local but not defined)
     /// These need TLS access pattern instead of GOT
     pub extern_tls_symbols: HashSet<String>,
@@ -2044,7 +2069,17 @@ impl Module {
         is_static: bool,
         is_const: bool,
     ) {
-        self.add_global_impl(name, typ, init, align, is_static, is_const, false);
+        self.add_global_impl(
+            name,
+            typ,
+            init,
+            align,
+            GlobalStorage {
+                is_static,
+                is_const,
+                is_thread_local: false,
+            },
+        );
     }
 
     /// Add a thread-local global variable with explicit alignment (C11 _Alignas)
@@ -2059,20 +2094,56 @@ impl Module {
         is_static: bool,
         is_const: bool,
     ) {
-        self.add_global_impl(name, typ, init, align, is_static, is_const, true);
+        self.add_global_impl(
+            name,
+            typ,
+            init,
+            align,
+            GlobalStorage {
+                is_static,
+                is_const,
+                is_thread_local: true,
+            },
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Attach the symbol-emission attributes to a global already added.
+    ///
+    /// Set after the fact rather than threaded through `add_global_impl`,
+    /// which already takes four positional booleans; a fifth positional
+    /// argument that is a struct would be worse to read at every call site.
+    pub fn set_symbol_attrs(&mut self, name: &str, attrs: crate::parse::ast::SymbolAttrs) {
+        if attrs.is_empty() {
+            return;
+        }
+        if let Some(g) = self.globals.iter_mut().find(|g| g.name == name) {
+            g.symbol_attrs = attrs;
+        }
+    }
+
+    /// Record attributes on a symbol declared but not defined here. A later
+    /// definition in the same unit takes precedence and clears this.
+    pub fn set_declared_symbol_attrs(&mut self, name: &str, attrs: crate::parse::ast::SymbolAttrs) {
+        if attrs.is_empty() {
+            return;
+        }
+        self.declared_symbol_attrs.insert(name.to_string(), attrs);
+    }
+
     fn add_global_impl(
         &mut self,
         name: impl Into<String>,
         typ: TypeId,
         init: Initializer,
         align: Option<u32>,
-        is_static: bool,
-        is_const: bool,
-        is_thread_local: bool,
+        storage: GlobalStorage,
     ) {
+        let GlobalStorage {
+            is_static,
+            is_const,
+            is_thread_local,
+        } = storage;
         let name = name.into();
         // Check for existing tentative definition
         if let Some(existing) = self.globals.iter_mut().find(|g| g.name == name) {

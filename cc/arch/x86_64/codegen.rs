@@ -80,6 +80,13 @@ pub struct X86_64CodeGen {
     sym_type_sizes: HashMap<PseudoId, u32>,
     /// When true, locals are addressed via RSP instead of RBP (for dynamic stack alignment)
     use_rsp_locals: bool,
+    /// How far `%rsp` has been moved below the frame's resting position.
+    ///
+    /// Only matters when locals are addressed from `%rsp` -- an over-aligned
+    /// frame -- because then reserving an outgoing argument area moves the base
+    /// every local is measured from. Reading a source operand after the
+    /// reservation without this would have read the wrong slot.
+    pub(super) rsp_adjust: i32,
     /// Maximum local alignment (for andq in prologue)
     max_local_align: i32,
     /// Pseudos that are 128-bit integers (need full 16-byte copies)
@@ -108,6 +115,7 @@ impl X86_64CodeGen {
             quad_constants: std::collections::BTreeMap::new(),
             sym_type_sizes: HashMap::new(),
             use_rsp_locals: false,
+            rsp_adjust: 0,
             max_local_align: 16,
             int128_pseudos: HashSet::new(),
         }
@@ -126,7 +134,7 @@ impl X86_64CodeGen {
         if self.use_rsp_locals {
             MemAddr::BaseOffset {
                 base: Reg::Rsp,
-                offset: self.stack_alloc_size - offset,
+                offset: self.stack_alloc_size - offset + self.rsp_adjust,
             }
         } else {
             MemAddr::BaseOffset {
@@ -194,6 +202,15 @@ impl X86_64CodeGen {
             return;
         }
 
+        // Spend the registers first. The argument occupies them whether or
+        // not there is anywhere left to put it: at -O an unread parameter has
+        // no local, and returning here without charging for it made the next
+        // floating-point argument read the register this one arrived in.
+        let pair_start_int = *int_arg_idx;
+        let pair_start_fp = *fp_arg_idx;
+        *int_arg_idx += gp_needed;
+        *fp_arg_idx += sse_needed;
+
         let param_name = &func.params[param_idx].0;
         let Some(local) = func.locals.get(param_name) else {
             return;
@@ -202,19 +219,21 @@ impl X86_64CodeGen {
             return;
         };
 
+        let mut next_int = pair_start_int;
+        let mut next_fp = pair_start_fp;
         for (i, class) in classes.iter().enumerate() {
             let delta = (i * 8) as i32;
             if *class == crate::abi::RegClass::Sse {
-                let src = fp_arg_regs[*fp_arg_idx];
-                *fp_arg_idx += 1;
+                let src = fp_arg_regs[next_fp];
+                next_fp += 1;
                 self.push_lir(X86Inst::MovFp {
                     size: FpSize::Double,
                     src: XmmOperand::Reg(src),
                     dst: XmmOperand::Mem(self.stack_mem(offset - delta)),
                 });
             } else {
-                let src = int_arg_regs[*int_arg_idx];
-                *int_arg_idx += 1;
+                let src = int_arg_regs[next_int];
+                next_int += 1;
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B64,
                     src: GpOperand::Reg(src),
@@ -555,7 +574,7 @@ impl X86_64CodeGen {
         };
 
         // Emit function header (directives, label, CFI start)
-        self.emit_function_header(func.is_static, &func.name);
+        self.emit_function_header(func);
 
         // Emit prologue (push rbp, callee-saved regs, allocate stack)
         self.emit_prologue(stack_size, reg_save_area_size);
@@ -594,13 +613,36 @@ impl X86_64CodeGen {
     }
 
     /// Emit function header directives (text section, visibility, type, label, CFI start)
-    fn emit_function_header(&mut self, is_static: bool, name: &str) {
+    fn emit_function_header(&mut self, func: &Function) {
+        let (is_static, name) = (func.is_static, func.name.as_str());
         self.push_lir(X86Inst::Directive(Directive::Blank));
         self.push_lir(X86Inst::Directive(Directive::Text));
 
+        // A named section replaces .text for this function.
+        if let Some(sec) = &func.symbol_attrs.section {
+            self.push_lir(X86Inst::Directive(Directive::NamedSection {
+                name: sec.clone(),
+                executable: true,
+                writable: false,
+            }));
+        }
+
         // Skip .globl for static functions (internal linkage)
         if !is_static {
-            self.push_lir(X86Inst::Directive(Directive::global(name)));
+            if func.symbol_attrs.weak {
+                self.push_lir(X86Inst::Directive(Directive::Weak(
+                    Symbol::global(name),
+                    crate::arch::lir::WeakKind::Definition,
+                )));
+            } else {
+                self.push_lir(X86Inst::Directive(Directive::global(name)));
+            }
+        }
+        if let Some(how) = &func.symbol_attrs.visibility {
+            self.push_lir(X86Inst::Directive(Directive::Visibility(
+                Symbol::global(name),
+                how.clone(),
+            )));
         }
 
         // ELF-only type (handled by Directive::emit which skips on macOS)
@@ -817,6 +859,61 @@ impl X86_64CodeGen {
         }
     }
 
+    /// Charge one parameter against the argument registers, emitting nothing.
+    ///
+    /// Which register an argument arrives in is a property of the *signature*:
+    /// every parameter ahead of it spends its registers whether or not the
+    /// body ever reads it. So this has to be applied to a parameter the
+    /// prologue has no store to make for -- one spilled elsewhere, or one
+    /// optimised away entirely -- or every floating-point argument behind it
+    /// is read from a register one too low.
+    fn advance_arg_regs(
+        typ: TypeId,
+        types: &TypeTable,
+        int_arg_idx: &mut usize,
+        fp_arg_idx: &mut usize,
+        int_arg_reg_count: usize,
+    ) {
+        let is_complex = types.is_complex(typ);
+        let kind = types.kind(typ);
+        let is_aggregate = !is_complex
+            && (kind == crate::types::TypeKind::Struct || kind == crate::types::TypeKind::Union);
+
+        if is_complex {
+            *fp_arg_idx += complex_sse_regs(types, typ);
+        } else if kind == TypeKind::Int128 {
+            // Only when it actually took the pair: 3.2.3 step 5 leaves the
+            // registers it did not fit in available to later arguments.
+            if *int_arg_idx + 1 < int_arg_reg_count {
+                *int_arg_idx += 2;
+            }
+        } else if is_aggregate {
+            // The class, not the size. Asking whether the aggregate was
+            // larger than eight bytes sent `struct { float a, b; }` -- one
+            // whole XMM by its class -- to the general-register tally.
+            let abi = crate::abi::SysVAmd64Abi;
+            match abi.classify_param(typ, types) {
+                crate::abi::ArgClass::Direct { ref classes, .. } => {
+                    *fp_arg_idx += classes
+                        .iter()
+                        .filter(|c| **c == crate::abi::RegClass::Sse)
+                        .count();
+                    *int_arg_idx += classes
+                        .iter()
+                        .filter(|c| **c == crate::abi::RegClass::Integer)
+                        .count();
+                }
+                _ => *int_arg_idx += 1,
+            }
+        } else if kind == crate::types::TypeKind::LongDouble {
+            // Passed in memory; spends no XMM register.
+        } else if types.is_float(typ) {
+            *fp_arg_idx += 1;
+        } else {
+            *int_arg_idx += 1;
+        }
+    }
+
     /// Move arguments from registers to their allocated stack locations
     fn store_args_to_stack(&mut self, func: &Function, types: &TypeTable, alloc: &RegAlloc) {
         // System V AMD64 ABI: integer args in RDI, RSI, RDX, RCX, R8, R9
@@ -826,7 +923,6 @@ impl X86_64CodeGen {
         let mut int_arg_idx = 0;
         let mut fp_arg_idx = 0;
         // Track incoming stack arg position (after saved RBP + return addr = 16)
-        let mut incoming_stack_offset: i32 = 16;
 
         // Track which pseudos were already spilled via spill_args_across_calls
         // to avoid double-storing them here
@@ -851,6 +947,27 @@ impl X86_64CodeGen {
         }
 
         for (i, (_name, typ)) in func.params.iter().enumerate() {
+            // An unread parameter still spends its registers. At -O its pseudo
+            // is gone, and walking only the surviving pseudos charged nothing
+            // for it, so `g(MIX unused, D2 f)` read `f` from the pair the
+            // dead argument was still occupying.
+            if crate::abi::param_is_memory_class(*typ, types) {
+                continue;
+            }
+            let has_pseudo = func
+                .pseudos
+                .iter()
+                .any(|p| matches!(p.kind, PseudoKind::Arg(a) if a == (i as u32) + arg_idx_offset));
+            if !has_pseudo {
+                Self::advance_arg_regs(
+                    *typ,
+                    types,
+                    &mut int_arg_idx,
+                    &mut fp_arg_idx,
+                    int_arg_regs.len(),
+                );
+                continue;
+            }
             // Find the pseudo for this argument
             for pseudo in &func.pseudos {
                 if let PseudoKind::Arg(arg_idx) = pseudo.kind {
@@ -865,47 +982,15 @@ impl X86_64CodeGen {
 
                         // Skip pseudos already stored via spilled_args
                         if spilled_pseudos.contains(&pseudo.id) {
-                            // Still need to count this arg for register assignment tracking
-                            let is_fp = types.is_float(*typ);
-                            let is_complex = types.is_complex(*typ);
-                            let is_longdouble = types.kind(*typ)
-                                == crate::types::TypeKind::LongDouble
-                                && !is_complex;
-                            let is_int128 = types.kind(*typ) == TypeKind::Int128;
-                            let is_medium_struct = !is_complex
-                                && (types.kind(*typ) == crate::types::TypeKind::Struct
-                                    || types.kind(*typ) == crate::types::TypeKind::Union)
-                                && type_size_bits > 64
-                                && type_size_bits <= 128;
-                            if is_complex {
-                                fp_arg_idx += complex_sse_regs(types, *typ);
-                            } else if is_int128 {
-                                int_arg_idx += 2;
-                            } else if is_medium_struct {
-                                // Check ABI classification for medium structs
-                                let abi = crate::abi::SysVAmd64Abi;
-                                let cls = abi.classify_param(*typ, types);
-                                if let crate::abi::ArgClass::Direct { ref classes, .. } = cls {
-                                    let sse_count = classes
-                                        .iter()
-                                        .filter(|c| **c == crate::abi::RegClass::Sse)
-                                        .count();
-                                    let gp_count = classes
-                                        .iter()
-                                        .filter(|c| **c == crate::abi::RegClass::Integer)
-                                        .count();
-                                    fp_arg_idx += sse_count;
-                                    int_arg_idx += gp_count;
-                                } else {
-                                    int_arg_idx += 1;
-                                }
-                            } else if is_longdouble {
-                                // Long double is on stack, doesn't use XMM registers
-                            } else if is_fp {
-                                fp_arg_idx += 1;
-                            } else {
-                                int_arg_idx += 1;
-                            }
+                            // Still need to count this arg for register
+                            // assignment tracking.
+                            Self::advance_arg_regs(
+                                *typ,
+                                types,
+                                &mut int_arg_idx,
+                                &mut fp_arg_idx,
+                                int_arg_regs.len(),
+                            );
                             break;
                         }
                         let is_fp = types.is_float(*typ);
@@ -1050,24 +1135,35 @@ impl X86_64CodeGen {
                         } else if types.kind(*typ) == TypeKind::Int128 {
                             // __int128 argument — uses TWO consecutive GP registers
                             // Store to the arg pseudo's stack slot (allocated by regalloc)
-                            if int_arg_idx + 1 < int_arg_regs.len() {
+                            let int128_in_regs = int_arg_idx + 1 < int_arg_regs.len();
+                            let pair_start = int_arg_idx;
+                            if int128_in_regs {
+                                int_arg_idx += 2;
                                 if let Some(loc) = self.locations.get(pseudo.id) {
                                     // Store lo half from first GP register
                                     self.push_lir(X86Inst::Mov {
                                         size: OperandSize::B64,
-                                        src: GpOperand::Reg(int_arg_regs[int_arg_idx]),
+                                        src: GpOperand::Reg(int_arg_regs[pair_start]),
                                         dst: GpOperand::Mem(self.int128_lo_mem_loc(&loc)),
                                     });
                                     // Store hi half from second GP register
                                     self.push_lir(X86Inst::Mov {
                                         size: OperandSize::B64,
-                                        src: GpOperand::Reg(int_arg_regs[int_arg_idx + 1]),
+                                        src: GpOperand::Reg(int_arg_regs[pair_start + 1]),
                                         dst: GpOperand::Mem(self.int128_hi_mem_loc(&loc)),
                                     });
                                 }
                             } else {
                                 // Stack-passed int128: copy from incoming arg area
-                                // to the local stack slot.
+                                // to the local stack slot. The allocator laid the
+                                // incoming area out and recorded where this one
+                                // landed; recomputing it here with a second
+                                // counter -- which only this arm advanced -- read
+                                // the preceding argument as soon as anything else
+                                // was stacked.
+                                let incoming_stack_offset = alloc
+                                    .int128_incoming(pseudo.id)
+                                    .expect("stack-passed __int128 has an incoming offset");
                                 if let Some(loc) = self.locations.get(pseudo.id) {
                                     // Load lo from incoming, store to local
                                     self.push_lir(X86Inst::Mov {
@@ -1098,9 +1194,14 @@ impl X86_64CodeGen {
                                         dst: GpOperand::Mem(self.int128_hi_mem_loc(&loc)),
                                     });
                                 }
-                                incoming_stack_offset += 16;
+                                // No advance here: 3.2.3 step 5 sends an
+                                // argument that does not fit to memory *whole*,
+                                // consuming no registers, so the ones it did
+                                // not fit in remain for later arguments. The
+                                // allocator applies the same rule, and the two
+                                // have to agree on which register a following
+                                // argument arrives in.
                             }
-                            int_arg_idx += 2;
                         } else {
                             // Integer argument
                             if int_arg_idx < int_arg_regs.len() {
@@ -1899,15 +2000,25 @@ impl X86_64CodeGen {
                     if let Some(pseudo) = self.pseudos.iter().find(|p| p.id == target) {
                         let target_loc = self.locations.get(target);
                         match &pseudo.kind {
-                            PseudoKind::Val(v) => {
-                                if let Some(Loc::Reg(r)) = target_loc {
+                            PseudoKind::Val(v) => match target_loc {
+                                Some(Loc::Reg(r)) => {
                                     self.push_lir(X86Inst::Mov {
                                         size: OperandSize::from_bits(insn.size),
                                         src: GpOperand::Imm(*v as i64),
                                         dst: GpOperand::Reg(r),
                                     });
                                 }
-                            }
+                                // A 128-bit constant lives in a sixteen-byte
+                                // slot, since that is the only place its
+                                // consumers can address it. Without this the
+                                // slot was allocated and never written, so the
+                                // constant read back as zero.
+                                Some(loc @ (Loc::Stack(_) | Loc::IncomingArg(_))) => {
+                                    let (v, loc) = (*v, loc.clone());
+                                    self.store_int128_imm(v, &loc);
+                                }
+                                _ => {}
+                            },
                             PseudoKind::FVal(v) => {
                                 // Only emit code if the target is in an XMM register
                                 // FImm locations are materialized inline at use sites
@@ -3281,51 +3392,43 @@ impl X86_64CodeGen {
     }
 
     /// Emit a 128-bit integer copy (stack-to-stack, imm128-to-stack, etc).
+    /// Write a 128-bit constant into the sixteen bytes at `dst_loc`.
+    ///
+    /// Each half goes as an immediate where it fits in the `mov` displacement
+    /// and through `movabs` where it does not. R10 is reserved scratch.
+    fn store_int128_imm(&mut self, v: i128, dst_loc: &Loc) {
+        let lo = v as i64;
+        let hi = (v >> 64) as u64 as i64;
+        for (half, addr) in [
+            (lo, self.int128_lo_mem_loc(dst_loc)),
+            (hi, self.int128_hi_mem_loc(dst_loc)),
+        ] {
+            if half > i32::MAX as i64 || half < i32::MIN as i64 {
+                self.push_lir(X86Inst::MovAbs {
+                    imm: half,
+                    dst: Reg::R10,
+                });
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Reg(Reg::R10),
+                    dst: GpOperand::Mem(addr),
+                });
+            } else {
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Imm(half),
+                    dst: GpOperand::Mem(addr),
+                });
+            }
+        }
+    }
+
     fn emit_int128_copy(&mut self, src: PseudoId, dst: PseudoId) {
         let src_loc = self.get_location(src);
         let dst_loc = self.get_location(dst);
 
         match &src_loc {
-            Loc::Imm(v) => {
-                let lo = *v as i64;
-                let hi = (*v >> 64) as u64 as i64;
-                // Store lo half
-                if lo > i32::MAX as i64 || lo < i32::MIN as i64 {
-                    self.push_lir(X86Inst::MovAbs {
-                        imm: lo,
-                        dst: Reg::R10,
-                    });
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Reg(Reg::R10),
-                        dst: GpOperand::Mem(self.int128_lo_mem_loc(&dst_loc)),
-                    });
-                } else {
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Imm(lo),
-                        dst: GpOperand::Mem(self.int128_lo_mem_loc(&dst_loc)),
-                    });
-                }
-                // Store hi half
-                if hi > i32::MAX as i64 || hi < i32::MIN as i64 {
-                    self.push_lir(X86Inst::MovAbs {
-                        imm: hi,
-                        dst: Reg::R10,
-                    });
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Reg(Reg::R10),
-                        dst: GpOperand::Mem(self.int128_hi_mem_loc(&dst_loc)),
-                    });
-                } else {
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Imm(hi),
-                        dst: GpOperand::Mem(self.int128_hi_mem_loc(&dst_loc)),
-                    });
-                }
-            }
+            Loc::Imm(v) => self.store_int128_imm(*v, &dst_loc),
             Loc::Stack(_) | Loc::IncomingArg(_) => {
                 // Stack-to-stack copy: two qword moves via R10
                 let src_lo = self.int128_lo_mem_loc(&src_loc);
@@ -3510,7 +3613,7 @@ impl X86_64CodeGen {
         self.emit_call_instruction(insn, &func_name);
 
         // Clean up stack
-        self.cleanup_call_stack(stack_args, info.needs_padding);
+        self.cleanup_call_stack(stack_args);
 
         // Handle return value
         self.handle_call_return_value(insn, types);
@@ -5329,6 +5432,8 @@ impl CodeGenerator for X86_64CodeGen {
         for global in &module.globals {
             self.emit_global(global, types);
         }
+
+        self.base.emit_declared_symbol_attrs(module);
 
         // Emit string literals
         if !module.strings.is_empty() {

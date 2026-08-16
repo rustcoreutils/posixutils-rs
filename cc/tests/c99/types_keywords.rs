@@ -348,3 +348,92 @@ int main(void) {
         0
     );
 }
+
+/// `_Generic` selects on the controlling expression's type, and a type has
+/// to compare equal to itself for that to work.
+///
+/// `TypeKind` already carries the size, but a parsed specifier list also set
+/// a `SHORT`/`LONG`/`LONGLONG` modifier bit that the compatibility test then
+/// treated as significant. The canonical interned types -- what a literal's
+/// type and the result of the usual arithmetic conversions come from -- carry
+/// no such bit, so `1L` and `long` were two incompatible types both spelled
+/// "long". A variable of type `long` matched, because its type came from the
+/// same specifier path as the association.
+#[test]
+fn c99_generic_matches_the_long_family() {
+    let code = r#"
+#define SEL(x) _Generic((x),                                     \
+    char: 1, signed char: 2, short: 3, int: 4, long: 5,          \
+    long long: 6, unsigned char: 7, unsigned short: 8,           \
+    unsigned: 9, unsigned long: 10, unsigned long long: 11,      \
+    float: 12, double: 13, long double: 14, default: 0)
+
+typedef long L;
+
+int main(void) {
+    /* Literals: the half that never matched. */
+    if (SEL(1L) != 5) return 1;
+    if (SEL(1UL) != 10) return 2;
+    if (SEL(1LL) != 6) return 3;
+    if (SEL(1ULL) != 11) return 4;
+    if (SEL(1.0L) != 14) return 5;
+
+    /* Controls: these always worked. */
+    if (SEL(1) != 4) return 6;
+    if (SEL(1u) != 9) return 7;
+    if (SEL(1.0) != 13) return 8;
+    if (SEL(1.0f) != 12) return 9;
+    if (SEL('a') != 4) return 10;
+
+    /* Variables, whose type comes from the specifier path. */
+    {
+        long v = 1; unsigned long uv = 1; long long llv = 1; long double ldv = 1;
+        if (SEL(v) != 5) return 11;
+        if (SEL(uv) != 10) return 12;
+        if (SEL(llv) != 6) return 13;
+        if (SEL(ldv) != 14) return 14;
+    }
+
+    /* The usual arithmetic conversions produce a canonical type too. */
+    {
+        long w = 1;
+        if (SEL(w + 1) != 5) return 15;
+        if (SEL(w * 2) != 5) return 16;
+        if (SEL(-w) != 5) return 17;
+    }
+
+    /* A typedef names the same type. */
+    if (SEL((L)1) != 5) return 18;
+
+    /* A constant too large for int becomes long, and must match as one. */
+    if (SEL(2147483648) != 5) return 19;
+
+    /* Casts were always right; keep them as the control. */
+    if (SEL((long)1) != 5) return 20;
+
+    /* Same story through __builtin_types_compatible_p. */
+    if (!__builtin_types_compatible_p(__typeof__(1L), long)) return 21;
+    if (!__builtin_types_compatible_p(__typeof__(1.0L), long double)) return 22;
+    if (!__builtin_types_compatible_p(__typeof__(1UL), unsigned long)) return 23;
+    {
+        long w = 1;
+        if (!__builtin_types_compatible_p(__typeof__(w + 1), long)) return 24;
+    }
+
+    /* Nothing new became compatible that should not have. */
+    if (__builtin_types_compatible_p(long, int)) return 25;
+    if (__builtin_types_compatible_p(long, long long)) return 26;
+    if (__builtin_types_compatible_p(long, unsigned long)) return 27;
+    if (__builtin_types_compatible_p(short, int)) return 28;
+    if (__builtin_types_compatible_p(double, long double)) return 29;
+    if (__builtin_types_compatible_p(char, signed char)) return 30;
+    if (__builtin_types_compatible_p(char, unsigned char)) return 31;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c99_generic_matches_the_long_family", code, &[]),
+        0
+    );
+}

@@ -462,8 +462,20 @@ impl Type {
         } else {
             TypeModifiers::SIGNED
         };
+        // `short`, `long` and `long long` are redundant for the same reason,
+        // and one step further: the size they name is already the `kind` this
+        // function compared first. Two types with the same kind cannot differ
+        // in size, so the bits distinguish nothing -- while the canonical
+        // interned types carry none of them and a parsed specifier list
+        // carries all of them. That mismatch is why `_Generic(1L, long: ...)`
+        // matched no association and why a diagnostic could print both sides
+        // as `long` while calling them incompatible.
+        const REDUNDANT_SIZE: TypeModifiers = TypeModifiers::SHORT
+            .union(TypeModifiers::LONG)
+            .union(TypeModifiers::LONGLONG);
         let ignored = QUALIFIERS
             .union(redundant_signed)
+            .union(REDUNDANT_SIZE)
             .union(Self::DECL_SPECIFIERS);
 
         // Compare modifiers (ignoring top-level qualifiers)
@@ -1282,6 +1294,51 @@ impl TypeTable {
         self.is_arithmetic(id) || self.get(id).kind == TypeKind::Pointer
     }
 
+    /// How many scalar initializers it takes to fill this type.
+    ///
+    /// This is the measure brace elision runs on (C17 6.7.9p20): a brace-less
+    /// initializer for an aggregate member consumes exactly this many elements
+    /// from the enclosing list. The linearizer places values by it and the
+    /// parser sizes incomplete arrays by it, so it lives here rather than in
+    /// either -- when only the linearizer knew the rule, `int a[][2] =
+    /// {1,2,3,4}` was stored as two rows and sized as four.
+    pub fn count_scalar_fields(&self, id: TypeId) -> usize {
+        match self.kind(id) {
+            TypeKind::Array => {
+                let elem_type = self.base_type(id).unwrap_or(self.int_id);
+                let count = self.get(id).array_size.unwrap_or(0);
+                count * self.count_scalar_fields(elem_type)
+            }
+            TypeKind::Struct => {
+                if let Some(composite) = self.get(id).composite.as_ref() {
+                    composite
+                        .members
+                        .iter()
+                        // Skip unnamed bitfield padding
+                        .filter(|m| m.name != StringId::EMPTY || m.bit_width.is_none())
+                        .map(|m| self.count_scalar_fields(m.typ))
+                        .sum()
+                } else {
+                    1
+                }
+            }
+            TypeKind::Union => {
+                // Union only initializes first named member
+                if let Some(composite) = self.get(id).composite.as_ref() {
+                    composite
+                        .members
+                        .iter()
+                        .find(|m| m.name != StringId::EMPTY)
+                        .map(|m| self.count_scalar_fields(m.typ))
+                        .unwrap_or(1)
+                } else {
+                    1
+                }
+            }
+            _ => 1,
+        }
+    }
+
     /// Check if type is unsigned
     #[inline]
     pub fn is_unsigned(&self, id: TypeId) -> bool {
@@ -1975,5 +2032,65 @@ mod tests {
             typedef_arr, typedef_arr2,
             "Same typedef arrays should have same TypeId"
         );
+    }
+
+    /// `TypeKind` already carries the size, so the `SHORT`/`LONG`/`LONGLONG`
+    /// modifier bits that a specifier list sets alongside it distinguish
+    /// nothing. Comparing them made the canonical interned `long` -- built as
+    /// `Type::basic(TypeKind::Long)`, with no modifiers -- incompatible with
+    /// the `long` a declaration produces, which carries the bit.
+    #[test]
+    fn test_size_modifier_bits_do_not_distinguish_types() {
+        let mut types = TypeTable::new(&Target::host());
+
+        for (kind, bit) in [
+            (TypeKind::Short, TypeModifiers::SHORT),
+            (TypeKind::Long, TypeModifiers::LONG),
+            (
+                TypeKind::LongLong,
+                TypeModifiers::LONG | TypeModifiers::LONGLONG,
+            ),
+            (TypeKind::LongDouble, TypeModifiers::LONG),
+        ] {
+            let bare = types.intern(Type::basic(kind));
+            let mut spelled_type = Type::basic(kind);
+            spelled_type.modifiers = bit;
+            let spelled = types.intern(spelled_type);
+            assert_ne!(bare, spelled, "the two spellings are distinct ids");
+            assert!(
+                types.types_compatible(bare, spelled),
+                "{kind:?} with and without its size bit must be one type"
+            );
+        }
+    }
+
+    /// The same relaxation must not merge types that really are distinct.
+    /// Every size lives in its own `TypeKind`, and signedness is carried by a
+    /// bit that stays significant.
+    #[test]
+    fn test_distinct_arithmetic_types_stay_incompatible() {
+        let types = TypeTable::new(&Target::host());
+
+        let distinct = [
+            types.int_id,
+            types.long_id,
+            types.uint_id,
+            types.ulong_id,
+            types.char_id,
+            types.double_id,
+        ];
+        for (i, &a) in distinct.iter().enumerate() {
+            for (j, &b) in distinct.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                assert!(
+                    !types.types_compatible(a, b),
+                    "{} and {} must stay distinct",
+                    types.get(a),
+                    types.get(b)
+                );
+            }
+        }
     }
 }

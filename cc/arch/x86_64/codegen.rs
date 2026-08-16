@@ -2292,8 +2292,25 @@ impl X86_64CodeGen {
         self.locations.get(pseudo).unwrap_or(Loc::Imm(0))
     }
 
+    /// The source width of a zero-extending load, when the hardware has one.
+    ///
+    /// `movz` extends from a byte or a word and from nothing else, so a width
+    /// that is neither -- an aggregate of three bytes travelling in a
+    /// register, say -- has no extending form and must be moved at the next
+    /// size up instead. Asking `OperandSize::from_bits` and using the answer
+    /// regardless produced a `Movzx` from 32 bits to 32 bits, which the
+    /// assembly printer then had to guess at.
+    fn extending_load_size(actual_size: u32) -> Option<OperandSize> {
+        match actual_size {
+            1..=8 => Some(OperandSize::B8),
+            9..=16 => Some(OperandSize::B16),
+            _ => None,
+        }
+    }
+
     pub(super) fn emit_move(&mut self, src: PseudoId, dst: Reg, size: u32) {
         let actual_size = size; // Keep original size for sub-32-bit handling
+        let narrow = Self::extending_load_size(actual_size).filter(|_| actual_size < 32);
         let size = size.max(32);
         let op_size = OperandSize::from_bits(size);
         let loc = self.get_location(src);
@@ -2311,10 +2328,10 @@ impl X86_64CodeGen {
             }
             Loc::Stack(offset) => {
                 // For sub-32-bit values, use zero-extending load to avoid garbage in upper bits
-                if actual_size < 32 {
+                if let Some(src_size) = narrow {
                     // LIR: zero-extending memory-to-register move
                     self.push_lir(X86Inst::Movzx {
-                        src_size: OperandSize::from_bits(actual_size),
+                        src_size,
                         dst_size: OperandSize::B32,
                         src: GpOperand::Mem(self.stack_mem(offset)),
                         dst,
@@ -2330,10 +2347,10 @@ impl X86_64CodeGen {
             }
             Loc::IncomingArg(offset) => {
                 // For sub-32-bit values, use zero-extending load
-                if actual_size < 32 {
+                if let Some(src_size) = narrow {
                     // LIR: zero-extending memory-to-register move from incoming stack arg
                     self.push_lir(X86Inst::Movzx {
-                        src_size: OperandSize::from_bits(actual_size),
+                        src_size,
                         dst_size: OperandSize::B32,
                         src: GpOperand::Mem(MemAddr::BaseOffset {
                             base: Reg::Rbp,

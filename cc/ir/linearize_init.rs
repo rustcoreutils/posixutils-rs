@@ -348,7 +348,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     // Check if it's an enum constant
                     let sym = self.symbols.get(*symbol_id);
                     if let Some(val) = sym.enum_value {
-                        Initializer::Int(val as i128)
+                        Initializer::Int(val)
                     } else {
                         Initializer::None
                     }
@@ -655,41 +655,12 @@ impl<'a> super::linearize::Linearizer<'a> {
 
     /// Count the number of scalar fields needed to fill an aggregate type
     /// (for brace elision per C99 6.7.8p17-20).
+    ///
+    /// The rule itself lives on the type table, because the parser needs the
+    /// same count to decide an incomplete array's bound and had been counting
+    /// one array element per initializer element instead.
     pub(crate) fn count_scalar_fields(&self, typ: TypeId) -> usize {
-        match self.types.kind(typ) {
-            TypeKind::Array => {
-                let elem_type = self.types.base_type(typ).unwrap_or(self.types.int_id);
-                let count = self.types.get(typ).array_size.unwrap_or(0);
-                count * self.count_scalar_fields(elem_type)
-            }
-            TypeKind::Struct => {
-                if let Some(composite) = self.types.get(typ).composite.as_ref() {
-                    composite
-                        .members
-                        .iter()
-                        // Skip unnamed bitfield padding
-                        .filter(|m| m.name != StringId::EMPTY || m.bit_width.is_none())
-                        .map(|m| self.count_scalar_fields(m.typ))
-                        .sum()
-                } else {
-                    1
-                }
-            }
-            TypeKind::Union => {
-                // Union only initializes first named member
-                if let Some(composite) = self.types.get(typ).composite.as_ref() {
-                    composite
-                        .members
-                        .iter()
-                        .find(|m| m.name != StringId::EMPTY)
-                        .map(|m| self.count_scalar_fields(m.typ))
-                        .unwrap_or(1)
-                } else {
-                    1
-                }
-            }
-            _ => 1,
-        }
+        self.types.count_scalar_fields(typ)
     }
 
     /// Check if brace elision applies: the element is a positional scalar targeting
@@ -700,44 +671,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         element: &InitElement,
         target_type: TypeId,
     ) -> bool {
-        if !element.designators.is_empty() {
-            return false;
-        }
-        let target_is_aggregate = matches!(
-            self.types.kind(target_type),
-            TypeKind::Array | TypeKind::Struct | TypeKind::Union
-        );
-        if !target_is_aggregate {
-            return false;
-        }
-        // String/wide string literals can directly initialize char/wchar_t arrays
-        // without brace elision (C99 6.7.8p14)
-        if matches!(
-            element.value.kind,
-            ExprKind::InitList { .. }
-                | ExprKind::StringLit(_)
-                | ExprKind::WideStringLit(_)
-                | ExprKind::Utf16StringLit(_)
-                | ExprKind::Utf32StringLit(_)
-        ) {
-            return false;
-        }
-        // An element that is already an expression of the target's own type
-        // initializes the whole aggregate by itself (C17 6.7.9p13). Eliding
-        // braces around it consumes `count_scalar_fields` *elements* instead
-        // of one, so `struct P a[2] = {p, p};` put both structs into a[0] and
-        // left a[1] uninitialized -- then assigned a struct where a scalar
-        // field was expected, producing garbage.
-        if let Some(elem_typ) = element.value.typ {
-            let elem_kind = self.types.kind(elem_typ);
-            if matches!(elem_kind, TypeKind::Struct | TypeKind::Union)
-                && elem_kind == self.types.kind(target_type)
-                && self.types.size_bits(elem_typ) == self.types.size_bits(target_type)
-            {
-                return false;
-            }
-        }
-        true
+        crate::parse::ast::is_brace_elision_candidate(self.types, element, target_type)
     }
 
     /// Consume elements from `elements[elem_idx..]` via brace elision to fill

@@ -659,8 +659,18 @@ impl Walker {
         let mut symbols = SymbolTable::new();
         let mut types = TypeTable::new(&target);
 
-        // Parse
-        let mut parser = CParser::new(&preprocessed, &strings, &mut symbols, &mut types);
+        // Parse. The pragma markers the preprocessor leaves behind are not C
+        // tokens; strip them before the parser sees them.
+        let mut preprocessed = preprocessed;
+        let pack_directives =
+            posixutils_cc::token::preprocess::extract_pragma_directives(&mut preprocessed);
+        let mut parser = CParser::new(
+            &preprocessed,
+            &strings,
+            &mut symbols,
+            &mut types,
+            pack_directives,
+        );
         let ast = match parser.parse_translation_unit() {
             Ok(ast) => ast,
             Err(e) => {

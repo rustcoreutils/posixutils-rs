@@ -84,7 +84,7 @@ pub struct Symbol {
     pub defined: bool,
 
     /// Value for enum constants
-    pub enum_value: Option<i64>,
+    pub enum_value: Option<i128>,
 
     /// Explicit alignment from _Alignas specifier (C11 6.7.5)
     /// None means use natural alignment for the type
@@ -179,12 +179,12 @@ impl Symbol {
     }
 
     /// Create a new enum constant symbol (requires int_id from TypeTable)
-    pub fn enum_constant(name: StringId, value: i64, int_id: TypeId, scope_depth: u32) -> Self {
+    pub fn enum_constant(name: StringId, value: i128, typ: TypeId, scope_depth: u32) -> Self {
         Self {
             name,
             kind: SymbolKind::EnumConstant,
             namespace: Namespace::Ordinary,
-            typ: int_id,
+            typ,
             scope_depth,
             defined: true,
             enum_value: Some(value),

@@ -472,7 +472,7 @@ fn process_file(
     }
 
     // Preprocess (may add new identifiers from included files)
-    let preprocessed = preprocess_with_defines(
+    let mut preprocessed = preprocess_with_defines(
         tokens,
         target,
         &mut strings,
@@ -591,8 +591,21 @@ fn process_file(
     let mut symbols = SymbolTable::new();
     let mut types = types::TypeTable::new(target);
 
+    // Pull the pragma markers out of the stream and note where they stood.
+    // Done here, on the finished token vector, because that is the first
+    // point at which the order is the translation unit's own -- an include is
+    // preprocessed separately and spliced in, so nothing recorded earlier
+    // survives with a usable index.
+    let pack_directives = token::preprocess::extract_pragma_directives(&mut preprocessed);
+
     // Parse (this also binds symbols to the symbol table)
-    let mut parser = CParser::new(&preprocessed, &strings, &mut symbols, &mut types);
+    let mut parser = CParser::new(
+        &preprocessed,
+        &strings,
+        &mut symbols,
+        &mut types,
+        pack_directives,
+    );
     let ast = parser
         .parse_translation_unit()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("parse error: {}", e)))?;

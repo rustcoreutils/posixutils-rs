@@ -697,7 +697,13 @@ impl EmitAsm for X86Inst {
                     (OperandSize::B8, OperandSize::B64) => "movzbq",
                     (OperandSize::B16, OperandSize::B32) => "movzwl",
                     (OperandSize::B16, OperandSize::B64) => "movzwq",
-                    _ => "movzbl", // fallback
+                    // `movz` extends from a byte or a word only; a 32-bit
+                    // source is already zero-extended by an ordinary `movl`.
+                    // Anything else is a malformed instruction, and the
+                    // "fallback to movzbl" that used to stand here turned it
+                    // into a silently-narrower load -- a three-byte struct
+                    // argument reached its callee as one byte and two zeros.
+                    (s, d) => panic!("no movz encoding from {s:?} to {d:?}"),
                 };
                 let _ = writeln!(
                     out,

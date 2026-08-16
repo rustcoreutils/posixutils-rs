@@ -19,6 +19,7 @@ use crate::diag;
 use crate::strings::StringId;
 use crate::symbol::{Namespace, Symbol, SymbolId, SymbolKind, SymbolTable};
 use crate::token::lexer::{IdentTable, Position, SpecialToken, Token, TokenType, TokenValue};
+use crate::token::preprocess::PackAction;
 use crate::types::{
     CompositeType, EnumConstant, StructMember, Type, TypeId, TypeKind, TypeModifiers, TypeTable,
 };
@@ -535,6 +536,14 @@ pub struct Parser<'a> {
     /// Explicit alignment from _Alignas in current declaration
     /// Cleared after each declaration is parsed.
     pending_alignas: Option<u32>,
+    /// Alignment from an attribute written *after* a declarator.
+    ///
+    /// Kept apart from `pending_alignas` because the two have different
+    /// scope: `_Alignas`, and an attribute in the specifier position, belong
+    /// to the whole declaration and reach every declarator, while
+    /// `int a, b __attribute__((aligned(64)));` aligns only `b`. Sharing one
+    /// slot over-aligned every declarator that followed an attributed one.
+    pending_declarator_align: Option<u32>,
     /// `weak`, `used`, `section(...)`, `visibility(...)` seen on the
     /// declaration being parsed. Accumulated like `pending_alignas`, because
     /// an attribute may appear before the declarator, after it, or on the
@@ -585,15 +594,32 @@ pub struct Parser<'a> {
     /// parameter declarator, a K&R identifier list) legitimately reach it with
     /// no specifier.
     saw_explicit_type: bool,
+    /// `#pragma pack` directives, and where they stood in the token stream.
+    ///
+    /// Sorted by index; `pack_cursor` is how far the parser has consumed
+    /// them. A directive takes effect for every structure defined after it,
+    /// so applying them lazily as the parse position passes each one gives
+    /// exactly the right answer without a second traversal.
+    pack_directives: Vec<(usize, PackAction)>,
+    pack_cursor: usize,
+    /// The alignment cap currently in force, and the `push`ed stack of caps.
+    pack_current: Option<u32>,
+    pack_stack: Vec<Option<u32>>,
 }
 
 impl<'a> Parser<'a> {
-    /// Create a new parser with a symbol table and type table
+    /// Create a new parser with a symbol table and type table.
+    ///
+    /// `pack_directives` comes from `extract_pragma_directives`, which every
+    /// caller must run over the preprocessed stream: it removes the pragma
+    /// markers the preprocessor leaves behind as well as reporting them, and
+    /// a stream still carrying them is not one this parser can read.
     pub fn new(
         tokens: &'a [Token],
         idents: &'a IdentTable,
         symbols: &'a mut SymbolTable,
         types: &'a mut TypeTable,
+        pack_directives: Vec<(usize, PackAction)>,
     ) -> Self {
         Self {
             tokens,
@@ -602,6 +628,7 @@ impl<'a> Parser<'a> {
             types,
             pos: 0,
             pending_alignas: None,
+            pending_declarator_align: None,
             pending_symbol_attrs: Default::default(),
             pending_fn_attrs: Default::default(),
             declared_fn_attrs: BTreeMap::new(),
@@ -610,7 +637,45 @@ impl<'a> Parser<'a> {
             declared_extern_fns: std::collections::BTreeSet::new(),
             declared_non_inline_fns: std::collections::BTreeSet::new(),
             saw_explicit_type: true,
+            pack_directives,
+            pack_cursor: 0,
+            pack_current: None,
+            pack_stack: Vec::new(),
         }
+    }
+
+    /// The alignment cap `#pragma pack` puts on a structure defined here.
+    ///
+    /// Applies every directive the parse position has now passed. `pop` on an
+    /// empty stack is what gcc warns about and ignores; the alternative --
+    /// treating it as a reset -- would silently change the layout of every
+    /// structure after an unbalanced pragma.
+    fn current_pack(&mut self) -> Option<u32> {
+        while self
+            .pack_directives
+            .get(self.pack_cursor)
+            .is_some_and(|(idx, _)| *idx <= self.pos)
+        {
+            let (_, action) = self.pack_directives[self.pack_cursor];
+            self.pack_cursor += 1;
+            match action {
+                PackAction::Set(n) => self.pack_current = n,
+                PackAction::Push(n) => {
+                    self.pack_stack.push(self.pack_current);
+                    if n.is_some() {
+                        self.pack_current = n;
+                    }
+                }
+                PackAction::Pop => match self.pack_stack.pop() {
+                    Some(prev) => self.pack_current = prev,
+                    None => diag::warning(
+                        self.current_pos(),
+                        &gettext("'#pragma pack(pop)' with no matching push"),
+                    ),
+                },
+            }
+        }
+        self.pack_current
     }
 
     // ========================================================================
@@ -1428,12 +1493,34 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `skip_extensions` for the position just after a declarator, where an
+    /// `aligned` attribute names that declarator alone rather than the whole
+    /// declaration.
+    fn skip_extensions_after_declarator(&mut self) {
+        self.skip_extensions_inner(true)
+    }
+
     /// Parse __attribute__, __asm, and nullability extensions, wiring aligned() to pending_alignas
     fn skip_extensions(&mut self) {
+        self.skip_extensions_inner(false)
+    }
+
+    fn skip_extensions_inner(&mut self, declarator_scoped: bool) {
         loop {
             if self.is_attribute_keyword() {
                 let attrs = self.parse_attributes();
-                self.apply_attribute_alignment(&attrs);
+                if declarator_scoped {
+                    if let Some(align) = attrs.get_alignment() {
+                        if align > 0 && align.is_power_of_two() {
+                            self.pending_declarator_align = Some(
+                                self.pending_declarator_align
+                                    .map_or(align, |a| a.max(align)),
+                            );
+                        }
+                    }
+                } else {
+                    self.apply_attribute_alignment(&attrs);
+                }
                 self.merge_symbol_attrs(&attrs);
                 let fn_attrs = attrs.function_attrs();
                 self.pending_fn_attrs.merge(&fn_attrs);
@@ -2041,7 +2128,9 @@ impl Parser<'_> {
         };
 
         let new_size = match &init.kind {
-            ExprKind::InitList { elements } => Some(self.array_size_from_elements(elements)),
+            ExprKind::InitList { elements } => {
+                Some(self.array_size_from_elements(elements, elem_type))
+            }
             _ => self.string_initializer_len(init),
         };
 
@@ -2057,11 +2146,26 @@ impl Parser<'_> {
         }
     }
 
-    pub(crate) fn array_size_from_elements(&self, elements: &[InitElement]) -> usize {
+    /// How many elements an incomplete array's initializer list implies.
+    ///
+    /// One list element is not one array element. When the array's element
+    /// type is an aggregate and the initializer leaves its braces out, that
+    /// one array element swallows as many list elements as it has scalar
+    /// fields (C17 6.7.9p20) -- so `int a[][2] = {1,2,3,4}` names two rows,
+    /// not four. Counting list elements instead sized the object at twice
+    /// what the linearizer then filled.
+    pub(crate) fn array_size_from_elements(
+        &self,
+        elements: &[InitElement],
+        elem_type: TypeId,
+    ) -> usize {
+        let per_element = self.types.count_scalar_fields(elem_type).max(1);
         let mut max_index: i64 = -1;
         let mut current_index: i64 = 0;
+        let mut idx = 0usize;
 
-        for element in elements {
+        while idx < elements.len() {
+            let element = &elements[idx];
             let mut designator_index = None;
             for designator in &element.designators {
                 if let Designator::Index(index) = designator {
@@ -2074,13 +2178,31 @@ impl Parser<'_> {
                 current_index = explicit_index + 1;
                 explicit_index
             } else {
-                let idx = current_index;
+                let i = current_index;
                 current_index += 1;
-                idx
+                i
             };
 
             if index > max_index {
                 max_index = index;
+            }
+
+            // A brace-less aggregate element consumes several list elements
+            // for this one slot. Stop early at a designator, which addresses
+            // the enclosing array rather than continuing to fill this slot --
+            // the same boundary `consume_brace_elision` observes.
+            idx += 1;
+            if designator_index.is_none()
+                && crate::parse::ast::is_brace_elision_candidate(self.types, element, elem_type)
+            {
+                let mut taken = 1;
+                while taken < per_element
+                    && idx < elements.len()
+                    && elements[idx].designators.is_empty()
+                {
+                    idx += 1;
+                    taken += 1;
+                }
             }
         }
 
@@ -2173,7 +2295,7 @@ impl Parser<'_> {
                 let (name, mut typ, vla_sizes, _func_params) =
                     self.parse_declarator(base_type_id, DeclaratorName::Required)?;
                 // Skip GCC extensions like __asm("...") or __attribute__((...))
-                self.skip_extensions();
+                self.skip_extensions_after_declarator();
 
                 // Check if we have a name (needed for symbol binding)
                 let has_name = !self.str(name).is_empty();
@@ -2471,7 +2593,12 @@ impl Parser<'_> {
                     tally.note_size("short", self.current_pos());
                     self.advance();
                     modifiers |= TypeModifiers::SHORT;
-                    if base_kind.is_none() {
+                    // C17 6.7.2p2 lists the declaration specifiers as a set,
+                    // so `int short` names what `short int` names. A tally
+                    // that had already seen `int` must still take the size:
+                    // testing only `is_none()` left the kind at `Int` and
+                    // gave `int short` four bytes.
+                    if base_kind.is_none() || base_kind == Some(TypeKind::Int) {
                         base_kind = Some(TypeKind::Short);
                     }
                 }
@@ -2486,7 +2613,8 @@ impl Parser<'_> {
                         // long double case
                         if base_kind == Some(TypeKind::Double) {
                             base_kind = Some(TypeKind::LongDouble);
-                        } else if base_kind.is_none() {
+                        } else if base_kind.is_none() || base_kind == Some(TypeKind::Int) {
+                            // `int long` is `long int`; see the SHORT arm.
                             base_kind = Some(TypeKind::Long);
                         }
                     }
@@ -2969,9 +3097,48 @@ impl Parser<'_> {
         }
     }
 
+    /// The integer type an enumerated type is compatible with, and its size.
+    ///
+    /// C17 6.7.2.2p4 requires it to represent every member; the choice among
+    /// the types that do is implementation-defined. Narrowest wins, signed
+    /// before unsigned at each width, so an enum whose members all fit in
+    /// `int` is exactly the four signed bytes it has always been -- the
+    /// widening only happens where the alternative was a wrong value.
+    fn enum_underlying_type(
+        &mut self,
+        constants: &[EnumConstant],
+        pos: Position,
+    ) -> (TypeId, usize) {
+        let Some(min) = constants.iter().map(|c| c.value).min() else {
+            return (self.types.int_id, 4);
+        };
+        let max = constants.iter().map(|c| c.value).max().unwrap_or(0);
+
+        let fits = |lo: i128, hi: i128| min >= lo && max <= hi;
+        if fits(i32::MIN as i128, i32::MAX as i128) {
+            (self.types.int_id, 4)
+        } else if fits(0, u32::MAX as i128) {
+            (self.types.uint_id, 4)
+        } else if fits(i64::MIN as i128, i64::MAX as i128) {
+            (self.types.long_id, 8)
+        } else if fits(0, u64::MAX as i128) {
+            (self.types.ulong_id, 8)
+        } else {
+            // A list spanning below i64::MIN and above i64::MAX has no
+            // integer type that holds both ends. Say so rather than picking
+            // one and truncating the other.
+            diag::error(
+                pos,
+                &gettext("no integer type can represent all values of this enumeration"),
+            );
+            (self.types.long_id, 8)
+        }
+    }
+
     /// Parse an enum specifier
     /// enum-specifier: 'enum' identifier? '{' enumerator-list? '}' | 'enum' identifier
     pub(crate) fn parse_enum_specifier(&mut self) -> ParseResult<Type> {
+        let enum_pos = self.current_pos();
         self.advance(); // consume 'enum'
 
         // Optional tag name
@@ -2986,18 +3153,38 @@ impl Parser<'_> {
             self.advance(); // consume '{'
 
             let mut constants = Vec::with_capacity(DEFAULT_ENUM_CAPACITY);
-            let mut next_value = 0i64;
+            let mut next_value = 0i128;
+            // The enumerators bind before the enum's own width is known --
+            // `enum { A = 1, B = A + 1 }` reads A while the list is still
+            // being parsed -- so they are declared with a provisional type
+            // and re-typed once every value has been seen.
+            let mut constant_syms: Vec<SymbolId> = Vec::new();
 
             while !self.is_special(b'}') && !self.is_eof() {
                 let name = self.expect_identifier()?;
 
                 let value = if self.is_special(b'=') {
                     self.advance();
+                    let value_pos = self.current_pos();
                     let expr = self.parse_conditional_expr()?;
                     // Evaluate constant expression
-                    self.eval_const_expr(&expr).ok_or_else(|| {
+                    let v = self.eval_const_expr(&expr).ok_or_else(|| {
                         ParseError::new("enum value must be constant", self.current_pos())
-                    })? as i64
+                    })?;
+                    // C17 6.7.2.2p2 requires an enumerator to be
+                    // representable as `int`, so exceeding it is a constraint
+                    // violation and 5.1.1.3 requires it be diagnosed. gcc
+                    // widens the enumerated type rather than rejecting, and
+                    // so does c17 -- but not in silence, which is how
+                    // `X = 5000000000` used to become 705032704.
+                    if v < i32::MIN as i128 || v > i32::MAX as i128 {
+                        diag::warning_args(
+                            value_pos,
+                            "enumerator value {0} is outside the range of 'int'",
+                            &[&v.to_string()],
+                        );
+                    }
+                    v
                 } else {
                     next_value
                 };
@@ -3008,7 +3195,9 @@ impl Parser<'_> {
                 // Register enum constant in symbol table (Ordinary namespace)
                 let sym =
                     Symbol::enum_constant(name, value, self.types.int_id, self.symbols.depth());
-                let _ = self.symbols.declare(sym);
+                if let Ok(id) = self.symbols.declare(sym) {
+                    constant_syms.push(id);
+                }
 
                 if self.is_special(b',') {
                     self.advance();
@@ -3031,12 +3220,22 @@ impl Parser<'_> {
 
             self.expect_special(b'}')?;
 
+            // C17 6.7.2.2p4: the enumerated type is compatible with some
+            // integer type capable of representing every member. Pick the
+            // narrowest that is, preferring signed at each width, and give
+            // the enumerators that type -- for an enum that fits in `int`,
+            // which is nearly all of them, this is the `int` it always was.
+            let (underlying, size) = self.enum_underlying_type(&constants, enum_pos);
+            for &sym_id in &constant_syms {
+                self.symbols.get_mut(sym_id).typ = underlying;
+            }
+
             let composite = CompositeType {
                 tag,
                 members: Vec::new(),
                 enum_constants: constants,
-                size: 4,
-                align: 4,
+                size,
+                align: size,
                 is_complete: true,
             };
 
@@ -3279,11 +3478,19 @@ impl Parser<'_> {
                 struct_align = Some(struct_align.map_or(a, |e| e.max(a)));
             }
 
-            // Compute layout
+            // Compute layout. `__attribute__((packed))` is a cap of 1; a
+            // `#pragma pack(n)` in force is a cap of n. Where both apply the
+            // tighter one wins, which is what gcc does.
+            let pragma_cap = self.current_pack();
+            let pack_cap = match (is_packed, pragma_cap) {
+                (true, Some(n)) => Some(n.min(1)),
+                (true, None) => Some(1),
+                (false, cap) => cap,
+            };
             let (size, mut align) = if is_union {
-                self.types.compute_union_layout(&mut members)
+                self.types.compute_union_layout(&mut members, pack_cap)
             } else {
-                self.types.compute_struct_layout(&mut members, is_packed)
+                self.types.compute_struct_layout(&mut members, pack_cap)
             };
 
             // Apply struct-level aligned attribute (raises alignment, never lowers)
@@ -4791,7 +4998,7 @@ impl Parser<'_> {
         }
 
         // Skip any __attribute__ after variable name/array declarator
-        self.skip_extensions();
+        self.skip_extensions_after_declarator();
 
         // Validate explicit alignment (C11 6.7.5: >= natural alignment)
         let validated_align = self.validated_explicit_align(var_type_id)?;
@@ -4887,6 +5094,13 @@ impl Parser<'_> {
             let next_decl_pos = self.current_pos();
             let (decl_name, mut decl_type, vla_sizes, _decl_func_params) =
                 self.parse_declarator(base_type_id, DeclaratorName::Required)?;
+
+            // An attribute may follow any declarator, not just the first.
+            // Without this the second one was a syntax error -- `int a, b
+            // __attribute__((unused));` did not compile at file scope, while
+            // the same line inside a function did, because the block-scope
+            // loop has always parsed attributes after every declarator.
+            self.skip_extensions_after_declarator();
 
             // C99 6.7.5.2: VLAs must have block scope
             if !vla_sizes.is_empty() {
@@ -5052,7 +5266,7 @@ impl Parser<'_> {
                 // Check for enum constant
                 let sym = self.symbols.get(*symbol_id);
                 if sym.is_enum_constant() {
-                    sym.enum_value.map(|v| v as i128)
+                    sym.enum_value
                 } else {
                     None
                 }
@@ -5252,10 +5466,16 @@ impl Parser<'_> {
     /// Returns the validated explicit alignment, or error if alignment is weaker than natural.
     /// Returns None if no explicit alignment was specified.
     /// Also propagates alignment from typedef's explicit_align.
-    fn validated_explicit_align(&self, typ: TypeId) -> ParseResult<Option<u32>> {
+    fn validated_explicit_align(&mut self, typ: TypeId) -> ParseResult<Option<u32>> {
         // Combine pending_alignas (from _Alignas / __attribute__) with type's explicit_align
         let type_align = self.types.get(typ).explicit_align;
-        let effective = match (self.pending_alignas, type_align) {
+        // An attribute written after this declarator belongs to it alone, so
+        // take it here and leave nothing behind for the next one.
+        let declaration_align = match (self.pending_alignas, self.pending_declarator_align.take()) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        let effective = match (declaration_align, type_align) {
             (Some(a), Some(b)) => Some(a.max(b)),
             (Some(a), None) => Some(a),
             (None, Some(b)) => Some(b),
@@ -5268,7 +5488,7 @@ impl Parser<'_> {
                 // For C11 _Alignas validation, don't reject typedef alignment that
                 // exceeds the natural alignment of the underlying type (that's the point).
                 // Only reject explicit _Alignas that reduces below natural.
-                if self.pending_alignas.is_some() {
+                if declaration_align.is_some() {
                     let natural = self.types.alignment(typ) as u32;
                     if explicit < natural {
                         return Err(ParseError::new(

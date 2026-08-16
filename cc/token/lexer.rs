@@ -126,6 +126,17 @@ pub enum TokenType {
     Special,
     StreamBegin,
     StreamEnd,
+    /// A `#pragma` the parser has to see, carried through the token stream
+    /// because the preprocessor cannot answer it alone.
+    ///
+    /// `#pragma pack` changes how the *parser* lays out the structures that
+    /// follow it, and "which structures follow it" is a question only the
+    /// final token order answers -- an include is preprocessed into its own
+    /// vector and spliced in afterwards, so neither a source position nor a
+    /// token index recorded during preprocessing survives the splice. A
+    /// marker in the stream does. `extract_pragma_directives` removes these
+    /// before parsing and hands the parser their positions in the stream.
+    Pragma,
 }
 
 /// Special tokens (operators and punctuators)
@@ -1217,6 +1228,10 @@ pub fn show_token(token: &Token, strings: &StringTable) -> String {
     match token.typ {
         TokenType::StreamBegin => "<STREAM_BEGIN>".to_string(),
         TokenType::StreamEnd => "<STREAM_END>".to_string(),
+        TokenType::Pragma => match &token.value {
+            TokenValue::String(s) => format!("<PRAGMA {s}>"),
+            _ => "<PRAGMA>".to_string(),
+        },
         TokenType::Ident => {
             if let TokenValue::Ident(id) = &token.value {
                 strings.get(*id).to_string()
@@ -1300,6 +1315,7 @@ pub fn show_token(token: &Token, strings: &StringTable) -> String {
 /// Format token type name
 pub fn token_type_name(typ: TokenType) -> &'static str {
     match typ {
+        TokenType::Pragma => "PRAGMA",
         TokenType::Ident => "IDENT",
         TokenType::Number => "NUMBER",
         TokenType::Char => "CHAR",

@@ -282,3 +282,321 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("c99_types_keywords_mega", code, &[]), 0);
 }
+
+/// C17 6.7.2p2 gives the declaration specifiers as an unordered set, so a
+/// size specifier names the same type whichever side of `int` it falls on.
+///
+/// The specifier tally took the size only when it had not already settled on
+/// `int`, so `int long` was a four-byte `long` and `int short` a four-byte
+/// `short`. Two independent copies of the tally had the same defect -- one
+/// for declarations, one for type-names -- so `long int x;` was right while
+/// `sizeof(int long)` was wrong even after the first was fixed. Both spellings
+/// of both paths are asserted here.
+#[test]
+fn c99_size_specifiers_are_order_independent() {
+    let code = r#"
+/* Declaration path. */
+long int a1;    int long a2;
+short int b1;   int short b2;
+long long int c1;   int long long c2;   long int long c3;
+unsigned long int d1;   int unsigned long d2;   long unsigned int d3;
+signed short int e1;    int signed short e2;
+
+int main(void) {
+    /* Declarations */
+    if (sizeof a1 != sizeof a2) return 1;
+    if (sizeof a1 != 8) return 2;
+    if (sizeof b1 != sizeof b2) return 3;
+    if (sizeof b1 != 2) return 4;
+    if (sizeof c1 != sizeof c2 || sizeof c1 != sizeof c3) return 5;
+    if (sizeof c1 != 8) return 6;
+    if (sizeof d1 != sizeof d2 || sizeof d1 != sizeof d3) return 7;
+    if (sizeof d1 != 8) return 8;
+    if (sizeof e1 != sizeof e2) return 9;
+    if (sizeof e1 != 2) return 10;
+
+    /* Type-name path: a separate specifier tally from the one above. */
+    if (sizeof(int long) != 8) return 11;
+    if (sizeof(int short) != 2) return 12;
+    if (sizeof(int long long) != 8) return 13;
+    if (sizeof(int unsigned long) != 8) return 14;
+    if (sizeof(long int) != sizeof(int long)) return 15;
+    if (sizeof(short int) != sizeof(int short)) return 16;
+
+    /* The cast path shares the type-name tally. */
+    {
+        int long v = 5000000000;
+        if ((int long)v != 5000000000) return 17;
+        if (sizeof((int long)1) != 8) return 18;
+    }
+
+    /* Both spellings name one type, so they are compatible. */
+    if (!__builtin_types_compatible_p(int long, long)) return 19;
+    if (!__builtin_types_compatible_p(int short, short)) return 20;
+    if (__builtin_types_compatible_p(int long, int)) return 21;
+    if (__builtin_types_compatible_p(int short, int)) return 22;
+
+    /* `long` after `double` names `long double`, not `long`, and not the
+       `double` it followed. Asserted by type identity rather than by size:
+       on macOS aarch64 `long double` *is* `double`, so a size comparison
+       there tests the platform rather than the promotion rule. */
+    if (sizeof(long double) != sizeof(double long)) return 23;
+    if (!__builtin_types_compatible_p(double long, long double)) return 24;
+    if (__builtin_types_compatible_p(double long, long)) return 25;
+    if (!__builtin_types_compatible_p(long double, double long)) return 26;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c99_size_specifiers_order_independent", code, &[]),
+        0
+    );
+}
+
+/// `_Generic` selects on the controlling expression's type, and a type has
+/// to compare equal to itself for that to work.
+///
+/// `TypeKind` already carries the size, but a parsed specifier list also set
+/// a `SHORT`/`LONG`/`LONGLONG` modifier bit that the compatibility test then
+/// treated as significant. The canonical interned types -- what a literal's
+/// type and the result of the usual arithmetic conversions come from -- carry
+/// no such bit, so `1L` and `long` were two incompatible types both spelled
+/// "long". A variable of type `long` matched, because its type came from the
+/// same specifier path as the association.
+#[test]
+fn c99_generic_matches_the_long_family() {
+    let code = r#"
+#define SEL(x) _Generic((x),                                     \
+    char: 1, signed char: 2, short: 3, int: 4, long: 5,          \
+    long long: 6, unsigned char: 7, unsigned short: 8,           \
+    unsigned: 9, unsigned long: 10, unsigned long long: 11,      \
+    float: 12, double: 13, long double: 14, default: 0)
+
+typedef long L;
+
+int main(void) {
+    /* Literals: the half that never matched. */
+    if (SEL(1L) != 5) return 1;
+    if (SEL(1UL) != 10) return 2;
+    if (SEL(1LL) != 6) return 3;
+    if (SEL(1ULL) != 11) return 4;
+    if (SEL(1.0L) != 14) return 5;
+
+    /* Controls: these always worked. */
+    if (SEL(1) != 4) return 6;
+    if (SEL(1u) != 9) return 7;
+    if (SEL(1.0) != 13) return 8;
+    if (SEL(1.0f) != 12) return 9;
+    if (SEL('a') != 4) return 10;
+
+    /* Variables, whose type comes from the specifier path. */
+    {
+        long v = 1; unsigned long uv = 1; long long llv = 1; long double ldv = 1;
+        if (SEL(v) != 5) return 11;
+        if (SEL(uv) != 10) return 12;
+        if (SEL(llv) != 6) return 13;
+        if (SEL(ldv) != 14) return 14;
+    }
+
+    /* The usual arithmetic conversions produce a canonical type too. */
+    {
+        long w = 1;
+        if (SEL(w + 1) != 5) return 15;
+        if (SEL(w * 2) != 5) return 16;
+        if (SEL(-w) != 5) return 17;
+    }
+
+    /* A typedef names the same type. */
+    if (SEL((L)1) != 5) return 18;
+
+    /* A constant too large for int becomes long, and must match as one. */
+    if (SEL(2147483648) != 5) return 19;
+
+    /* Casts were always right; keep them as the control. */
+    if (SEL((long)1) != 5) return 20;
+
+    /* Same story through __builtin_types_compatible_p. */
+    if (!__builtin_types_compatible_p(__typeof__(1L), long)) return 21;
+    if (!__builtin_types_compatible_p(__typeof__(1.0L), long double)) return 22;
+    if (!__builtin_types_compatible_p(__typeof__(1UL), unsigned long)) return 23;
+    {
+        long w = 1;
+        if (!__builtin_types_compatible_p(__typeof__(w + 1), long)) return 24;
+    }
+
+    /* Nothing new became compatible that should not have. */
+    if (__builtin_types_compatible_p(long, int)) return 25;
+    if (__builtin_types_compatible_p(long, long long)) return 26;
+    if (__builtin_types_compatible_p(long, unsigned long)) return 27;
+    if (__builtin_types_compatible_p(short, int)) return 28;
+    if (__builtin_types_compatible_p(double, long double)) return 29;
+    if (__builtin_types_compatible_p(char, signed char)) return 30;
+    if (__builtin_types_compatible_p(char, unsigned char)) return 31;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c99_generic_matches_the_long_family", code, &[]),
+        0
+    );
+}
+
+/// An enumerated type must be able to represent every one of its members
+/// (C17 6.7.2.2p4). c17 gave every enum four signed bytes, so an enumerator
+/// that did not fit was silently truncated: `X = 5000000000` came back as
+/// 705032704 and `H = 0xFFFFFFFFU` as -1.
+///
+/// C17 6.7.2.2p2 makes an enumerator outside `int` range a constraint
+/// violation, so a diagnostic is required; gcc issues one under -pedantic and
+/// widens the type. c17 does both -- warn, and widen -- because truncating in
+/// silence is the one response that leaves a program running on a wrong value.
+#[test]
+fn c99_enum_is_wide_enough_for_its_enumerators() {
+    let code = r#"
+enum Small  { S = 1 };
+enum Neg    { N = -1, NP = 1 };
+enum UMax   { U = 0xFFFFFFFFU };
+enum Big    { B = 5000000000 };
+enum BigNeg { BN = -5000000000 };
+enum Mixed  { M0 = -1, M1 = 5000000000 };
+
+int main(void) {
+    /* An enum that fits in int keeps int's size. */
+    if (sizeof(enum Small) != 4) return 1;
+    if (S != 1) return 2;
+    if (sizeof(enum Neg) != 4) return 3;
+    if (N != -1 || NP != 1) return 4;
+
+    /* Too large for int, but representable unsigned in 32 bits. */
+    if (U != 0xFFFFFFFFU) return 5;
+    if ((unsigned long long)U != 4294967295ULL) return 6;
+
+    /* Too large for 32 bits either way. */
+    if (sizeof(enum Big) != 8) return 7;
+    if (B != 5000000000) return 8;
+    if ((long long)B != 5000000000LL) return 9;
+
+    if (sizeof(enum BigNeg) != 8) return 10;
+    if ((long long)BN != -5000000000LL) return 11;
+
+    /* A negative member forces a signed underlying type even though the
+       other member would fit unsigned. */
+    if (sizeof(enum Mixed) != 8) return 12;
+    if ((long long)M0 != -1LL) return 13;
+    if ((long long)M1 != 5000000000LL) return 14;
+
+    /* The values survive arithmetic, not just comparison. */
+    if (B / 2 != 2500000000) return 15;
+    if (B - 5000000000 != 0) return 16;
+
+    /* A variable of the type holds them too. */
+    {
+        enum Big v = B;
+        if ((long long)v != 5000000000LL) return 17;
+        if (sizeof v != 8) return 18;
+    }
+
+    /* Implicit successor values continue from a widened predecessor. */
+    {
+        enum Succ { P = 5000000000, Q };
+        if ((long long)Q != 5000000001LL) return 19;
+    }
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_enum_underlying_type", code, &[]), 0);
+}
+
+/// `#pragma pack` caps the alignment of every member of the structures
+/// declared while it is in effect. c17 discarded every pragma in the
+/// preprocessor, so the pragma compiled and did nothing -- silently laying
+/// out a protocol structure at natural alignment and disagreeing with every
+/// gcc-compiled peer that shares it.
+#[test]
+fn c99_pragma_pack_caps_member_alignment() {
+    let code = r#"
+#include <stddef.h>
+
+#pragma pack(push, 1)
+struct A { char a; int b; };
+#pragma pack(pop)
+struct B { char a; int b; };
+
+#pragma pack(1)
+struct C { char a; int b; };
+#pragma pack()
+struct D { char a; int b; };
+
+#pragma pack(push, 2)
+struct E { char a; int b; };
+#pragma pack(push, 4)
+struct F { char a; double b; };
+#pragma pack(pop)
+struct G { char a; int b; };   /* back to 2 */
+#pragma pack(pop)
+struct H { char a; int b; };   /* back to natural */
+
+struct I { char a; int b; } __attribute__((packed));
+
+#pragma pack(8)
+struct J { char a; int b; };   /* 8 exceeds natural: no effect */
+#pragma pack()
+
+/* Nested and array members still obey the cap. */
+#pragma pack(1)
+struct K { char a; struct { int x; } inner; short b[3]; };
+#pragma pack()
+
+/* C99 6.10.9: `_Pragma("pack(...)")` is the same directive, and must not be
+   the spelling that quietly does nothing. */
+_Pragma("pack(push, 1)")
+struct L { char a; int b; };
+_Pragma("pack(pop)")
+struct M { char a; int b; };
+
+/* A union's alignment is capped too, though its size follows its widest
+   member either way. */
+#pragma pack(1)
+union U { char a; int b; };
+#pragma pack()
+union V { char a; int b; };
+
+int main(void) {
+    if (sizeof(struct A) != 5 || offsetof(struct A, b) != 1) return 1;
+    if (sizeof(struct B) != 8 || offsetof(struct B, b) != 4) return 2;
+    if (sizeof(struct C) != 5) return 3;
+    if (sizeof(struct D) != 8) return 4;
+    if (sizeof(struct E) != 6 || offsetof(struct E, b) != 2) return 5;
+    if (sizeof(struct F) != 12 || offsetof(struct F, b) != 4) return 6;
+    if (sizeof(struct G) != 6) return 7;
+    if (sizeof(struct H) != 8) return 8;
+    if (sizeof(struct I) != 5) return 9;
+    if (sizeof(struct J) != 8) return 10;
+    if (sizeof(struct K) != 11) return 11;
+    if (offsetof(struct K, inner) != 1 || offsetof(struct K, b) != 5) return 12;
+    if (sizeof(struct L) != 5) return 18;
+    if (sizeof(struct M) != 8) return 19;
+    if (_Alignof(union U) != 1 || sizeof(union U) != 4) return 20;
+    if (_Alignof(union V) != 4 || sizeof(union V) != 4) return 21;
+
+    /* The alignment of the type follows the cap, not just its size. */
+    if (_Alignof(struct A) != 1) return 13;
+    if (_Alignof(struct B) != 4) return 14;
+    if (_Alignof(struct E) != 2) return 15;
+
+    /* Members read and write at their packed offsets. */
+    {
+        struct A a;
+        a.a = 'x'; a.b = 0x11223344;
+        if (a.a != 'x' || a.b != 0x11223344) return 16;
+        struct K k;
+        k.a = 1; k.inner.x = 2; k.b[0] = 3; k.b[2] = 4;
+        if (k.a != 1 || k.inner.x != 2 || k.b[0] != 3 || k.b[2] != 4) return 17;
+    }
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_pragma_pack", code, &[]), 0);
+}

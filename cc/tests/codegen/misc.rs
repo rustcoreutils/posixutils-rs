@@ -8590,3 +8590,403 @@ int main(void) {
         0
     );
 }
+
+/// A 128-bit product is assembled from four 64-bit pieces, and three of them
+/// are read *after* the one instruction that destroys a hardware register.
+///
+/// `expand_int128_mul` lowers `a * b` to
+/// `lo = a_lo*b_lo`, `hi = umulhi(a_lo,b_lo) + a_lo*b_hi + a_hi*b_lo`.
+/// On x86-64 the `umulhi` is `mulq`, which takes one operand in `%rax` and
+/// writes the whole product back over `%rdx:%rax` -- so `a_lo` is gone by the
+/// time `a_lo*b_hi` wants it. Every assertion here therefore reads the *high*
+/// half: a product whose low half is right and whose high half is garbage is
+/// exactly what this bug produces, and `(long)(a*b)` cannot see it.
+///
+/// The `b_hi == 0` cases are controls. They were correct throughout, because
+/// the cross term the clobber ruins is multiplied by zero.
+#[test]
+fn codegen_int128_mul_reads_operands_after_the_hardware_multiply() {
+    let code = r#"
+typedef __int128 i128;
+typedef unsigned __int128 u128;
+
+__attribute__((noinline)) static i128 mul(i128 a, i128 b) { return a * b; }
+__attribute__((noinline)) static u128 umul(u128 a, u128 b) { return a * b; }
+
+static long hi(i128 v) { return (long)(v >> 64); }
+static long lo(i128 v) { return (long)v; }
+
+int main(void) {
+    i128 m1 = -1, m3 = -3, m4 = -4, p3 = 3, p4 = 4;
+
+    /* Both operands negative: every half of both is set. */
+    if (hi(mul(m1, m1)) != 0) return 1;
+    if (lo(mul(m1, m1)) != 1) return 2;
+    if (hi(mul(m3, m4)) != 0) return 3;
+    if (lo(mul(m3, m4)) != 12) return 4;
+
+    /* Control: b_hi == 0, so the ruined cross term contributes nothing. */
+    if (hi(mul(m3, p4)) != -1) return 5;
+    if (lo(mul(m3, p4)) != -12) return 6;
+
+    /* The same shape with the negative operand second -- this is the half
+       that broke, and it is the one a symmetric-looking test omits. */
+    if (hi(mul(p3, m4)) != -1) return 7;
+    if (lo(mul(p3, m4)) != -12) return 8;
+
+    /* Neither operand negative, but both high halves are set. */
+    {
+        i128 a = (i128)1 << 70;
+        i128 b = (i128)1 << 70;
+        if (mul(a, b) != 0) return 9;            /* overflows away exactly */
+        if (hi(mul(a, 3)) != 0xc0) return 10;
+    }
+    {
+        i128 a = (i128)-1 << 40;
+        i128 b = (i128)-1 << 20;
+        if (hi(mul(a, b)) != 0) return 11;
+        if (lo(mul(a, b)) != 0x1000000000000000L) return 12;
+    }
+
+    /* Unsigned travels the same expansion. */
+    {
+        u128 a = ~(u128)0;
+        u128 b = 3;
+        u128 r = umul(a, b);
+        if ((unsigned long)(r >> 64) != ~0UL) return 13;
+        if ((unsigned long)r != ~0UL - 2) return 14;
+    }
+
+    /* The overflow builtins compute in 128 bits, so they inherit the fault:
+       (-1) * (-1) is 1, which every unsigned destination represents. */
+    {
+        unsigned u;
+        unsigned long long ull;
+        int a = -1, b = -1;
+        if (__builtin_mul_overflow(a, b, &u)) return 15;
+        if (u != 1u) return 16;
+        if (__builtin_mul_overflow(a, b, &ull)) return 17;
+        if (ull != 1ull) return 18;
+    }
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_int128_mul_operand_clobber", code, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run_optimized("codegen_int128_mul_operand_clobber_opt", code),
+        0
+    );
+}
+
+/// Widening an integer to a 128-bit *parameter* is a conversion like any
+/// other, and the argument path was the one place that did not do it.
+///
+/// The predicate that decides whether a call argument needs converting was
+/// bounded at `arg_size <= 32 && param_size <= 64` -- written for int->long
+/// and never widened when `__int128` arrived. Assignment, `return`, binary
+/// operators and initializers all convert correctly, so the type looks
+/// supported everywhere except where it is passed.
+///
+/// Every assertion reads the *high* half. Passing a positive value happens to
+/// leave the right bits in the low half, so a test that checks only `(long)v`
+/// passes against the broken compiler for five of the seven cases below.
+#[test]
+fn codegen_integer_argument_widens_to_a_128_bit_parameter() {
+    let code = r#"
+typedef __int128 i128;
+typedef unsigned __int128 u128;
+
+__attribute__((noinline)) static long hi(i128 v) { return (long)(v >> 64); }
+__attribute__((noinline)) static long lo(i128 v) { return (long)v; }
+__attribute__((noinline)) static long uhi(u128 v) { return (long)(v >> 64); }
+
+int main(void) {
+    /* Signed sources sign-extend into both halves. */
+    {
+        char c = -3;
+        if (lo(c) != -3 || hi(c) != -1) return 1;
+    }
+    {
+        short s = -3;
+        if (lo(s) != -3 || hi(s) != -1) return 2;
+    }
+    {
+        int i = -3;
+        if (lo(i) != -3 || hi(i) != -1) return 3;
+    }
+    {
+        long l = -3;
+        if (lo(l) != -3 || hi(l) != -1) return 4;
+    }
+
+    /* Literals travel the same path as variables. */
+    if (lo(-3) != -3 || hi(-3) != -1) return 5;
+    if (lo(-3L) != -3 || hi(-3L) != -1) return 6;
+
+    /* An expression, not just a leaf. */
+    {
+        int i = -1;
+        if (lo(i - 2) != -3 || hi(i - 2) != -1) return 7;
+    }
+
+    /* Unsigned sources zero-extend; the low half alone cannot tell these
+       apart from the signed cases above, which is the point. */
+    {
+        unsigned u = 3;
+        if (lo(u) != 3 || hi(u) != 0) return 8;
+    }
+    {
+        unsigned long ul = ~0UL;
+        if (uhi(ul) != 0) return 9;
+        if (lo((i128)ul) != -1) return 10;
+    }
+
+    /* An explicit cast was always correct -- keep it as the control. */
+    {
+        int i = -3;
+        if (lo((i128)i) != -3 || hi((i128)i) != -1) return 11;
+    }
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_int_argument_widens_to_int128", code, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run_optimized("codegen_int_argument_widens_to_int128_opt", code),
+        0
+    );
+}
+
+/// A struct small enough to travel in a register travels as its *value*, and
+/// the value has to be loaded at the struct's width -- not at the largest
+/// power of two that fits inside it.
+///
+/// Only three bytes reproduce this. Sizes 1, 2, 4 and 8 are machine widths;
+/// 5, 6 and 7 take a different path; 3 is the one size that rounded *down*,
+/// so a `struct { char b[3]; }` argument arrived with its first byte and two
+/// zeros.
+///
+/// It also only reproduces for an rvalue -- `p(r())` rather than
+/// `p(local)` -- because a named struct is passed from its address. Both
+/// forms are asserted here; only the second half ever failed.
+#[test]
+fn codegen_small_struct_argument_travels_at_its_own_width() {
+    let code = r#"
+#define DEF(N)                                                              \
+    struct S##N { char b[N]; };                                             \
+    __attribute__((noinline)) static long p##N(struct S##N v) {             \
+        long t = 0;                                                         \
+        for (int i = 0; i < N; i++) t = t * 7 + v.b[i];                     \
+        return t;                                                           \
+    }                                                                       \
+    __attribute__((noinline)) static struct S##N r##N(void) {               \
+        struct S##N v;                                                      \
+        for (int i = 0; i < N; i++) v.b[i] = (char)(i + 1);                 \
+        return v;                                                           \
+    }
+
+DEF(1) DEF(2) DEF(3) DEF(4) DEF(5) DEF(6) DEF(7) DEF(8)
+DEF(9) DEF(10) DEF(11) DEF(12) DEF(13) DEF(14) DEF(15) DEF(16)
+
+/* t = sum over i of (i+1) * 7^(N-1-i) */
+static long expected(int n) {
+    long t = 0;
+    for (int i = 0; i < n; i++) t = t * 7 + (i + 1);
+    return t;
+}
+
+#define CHECK(N)                                                            \
+    do {                                                                    \
+        struct S##N local = r##N();                                         \
+        if (p##N(local) != expected(N)) return N;                           \
+        if (p##N(r##N()) != expected(N)) return 100 + N;                    \
+    } while (0)
+
+int main(void) {
+    CHECK(1);  CHECK(2);  CHECK(3);  CHECK(4);
+    CHECK(5);  CHECK(6);  CHECK(7);  CHECK(8);
+    CHECK(9);  CHECK(10); CHECK(11); CHECK(12);
+    CHECK(13); CHECK(14); CHECK(15); CHECK(16);
+
+    /* A three-byte struct with a member of each kind, not just a char
+       array -- the width comes from the struct, not from what is in it. */
+    {
+        struct M { char a; short b; };
+        struct M m;
+        m.a = 5; m.b = 0x1234;
+        if (sizeof(struct M) != 4) return 200;
+        if (m.a != 5 || m.b != 0x1234) return 201;
+    }
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_small_struct_arg_width", code, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run_optimized("codegen_small_struct_arg_width_opt", code),
+        0
+    );
+}
+
+/// An attribute belongs to the declarator it follows, and a declaration may
+/// hold several. At file scope the continuation loop went straight from
+/// `parse_declarator` to symbol binding with no attribute parse at all, so
+/// `int a, b __attribute__((section(".s")));` was not a misplaced attribute
+/// but a syntax error. The same declaration inside a function was accepted,
+/// because the block-scope loop parses attributes after every declarator.
+///
+/// The distinction the test pins is per-declarator: `weak`, `section`,
+/// `visibility` and `used` name one symbol, so an attribute written on `b`
+/// must not reach `a`.
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn codegen_attribute_binds_to_its_own_file_scope_declarator() {
+    let asm = asm_for(
+        "attr_later_declarator",
+        r#"
+int plain_a = 1, sect_b __attribute__((section(".mysec"))) = 2;
+int plain_c = 3, weak_d __attribute__((weak)) = 4;
+int plain_e = 5, hidden_f __attribute__((visibility("hidden"))) = 6;
+int plain_g = 7, aligned_h __attribute__((aligned(64))) = 8;
+"#,
+    );
+
+    // The attributed symbol got its attribute...
+    assert!(
+        asm.contains(".mysec"),
+        "sect_b should land in .mysec:\n{asm}"
+    );
+    assert!(
+        asm.contains(".weak weak_d") || asm.contains(".weak\tweak_d"),
+        "weak_d should be weak:\n{asm}"
+    );
+    assert!(
+        asm.contains(".hidden hidden_f") || asm.contains(".hidden\thidden_f"),
+        "hidden_f should be hidden:\n{asm}"
+    );
+
+    // ...and its neighbours in the same declaration did not.
+    for leaked in ["plain_a", "plain_c", "plain_e", "plain_g"] {
+        assert!(
+            !asm.contains(&format!(".weak {leaked}")),
+            "{leaked} must not be weak:\n{asm}"
+        );
+        assert!(
+            !asm.contains(&format!(".hidden {leaked}")),
+            "{leaked} must not be hidden:\n{asm}"
+        );
+    }
+
+    // A section directive names exactly one symbol: the one that asked.
+    let mysec_line = asm
+        .lines()
+        .position(|l| l.contains(".mysec"))
+        .expect("a .mysec directive");
+    let after: String = asm
+        .lines()
+        .skip(mysec_line)
+        .take(6)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        after.contains("sect_b"),
+        ".mysec should be followed by sect_b:\n{after}"
+    );
+    assert!(
+        !after.contains("plain_a"),
+        "plain_a must not share sect_b's section:\n{after}"
+    );
+}
+
+/// The same declaration shape has to keep working as a program, not just as
+/// assembly -- including the attributes that carry no symbol directive.
+#[test]
+fn codegen_attributes_on_later_declarators_compile_and_run() {
+    let code = r#"
+#include <stdlib.h>
+int a1 = 1, a2 __attribute__((unused)) = 2, a3 = 3;
+int b1 = 4, b2 __attribute__((aligned(64))) = 5;
+static int c1 = 6, c2 __attribute__((used)) = 7;
+extern int d1, d2 __attribute__((weak));
+int d1 = 8, d2 = 9;
+
+int main(void) {
+    if (a1 + a2 + a3 != 6) return 1;
+    if (b1 + b2 != 9) return 2;
+    if (c1 + c2 != 13) return 3;
+    if (d1 + d2 != 17) return 4;
+    if ((unsigned long)&b2 % 64) return 5;
+    /* The first declarator must not have taken b2's alignment. */
+    {
+        int local_x = 1, local_y __attribute__((unused)) = 2;
+        if (local_x + local_y != 3) return 6;
+    }
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_attrs_on_later_declarators", code, &[]),
+        0
+    );
+}
+
+/// `_Alignas`, and an attribute in the specifier position, belong to the
+/// whole declaration and reach every declarator. An attribute written after
+/// one declarator belongs to that declarator alone.
+///
+/// Both spellings shared one `pending_alignas` slot, which was cleared only
+/// at the semicolon, so every declarator following an attributed one
+/// inherited its alignment -- `int s __attribute__((aligned(64))), t;` gave
+/// `t` 64 bytes of alignment that gcc does not.
+#[test]
+fn codegen_attribute_alignment_scope_follows_where_it_is_written() {
+    let code = r#"
+/* Post-declarator: names that declarator only. */
+int p = 1, q __attribute__((aligned(64))) = 2, r = 3;
+int s __attribute__((aligned(64))) = 4, t = 5;
+
+/* Specifier position and _Alignas: name the whole declaration. */
+int __attribute__((aligned(64))) u = 6, v = 7;
+_Alignas(64) int w = 8, x = 9;
+
+#define ALIGNED64(o) (((unsigned long)&(o) % 64) == 0)
+
+int main(void) {
+    if (!ALIGNED64(q)) return 1;
+    if (!ALIGNED64(s)) return 2;
+    /* The declarators after an attributed one keep natural alignment. */
+    if (ALIGNED64(r)) return 3;
+    if (ALIGNED64(t)) return 4;
+
+    /* Declaration-wide spellings reach both names. */
+    if (!ALIGNED64(u) || !ALIGNED64(v)) return 5;
+    if (!ALIGNED64(w) || !ALIGNED64(x)) return 6;
+
+    /* Values are undisturbed by any of it. */
+    if (p + q + r + s + t != 15) return 7;
+    if (u + v + w + x != 30) return 8;
+
+    /* Same rules at block scope. */
+    {
+        int bp = 1, bq __attribute__((aligned(64))) = 2, br = 3;
+        if (!ALIGNED64(bq)) return 9;
+        if (ALIGNED64(br)) return 10;
+        if (bp + bq + br != 6) return 11;
+    }
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_attr_alignment_scope", code, &[]),
+        0
+    );
+}

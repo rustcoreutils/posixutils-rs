@@ -1343,10 +1343,22 @@ impl TypeTable {
         }
     }
 
-    /// Check if type is unsigned
+    /// Whether `id` is an unsigned integer type.
+    ///
+    /// Not the same question as "was the keyword `unsigned` written". `_Bool`
+    /// carries no `UNSIGNED` modifier and is nonetheless an unsigned type:
+    /// C17 6.2.5p6 lists it among the standard unsigned integer types, and
+    /// 6.3.1.2 confines its values to 0 and 1. It has no modifier because
+    /// there is no `signed _Bool` to tell it apart from. Answering from the
+    /// bit sign-extended a `_Bool` bit-field, so `struct { _Bool f:1; }` with
+    /// `f` set read back -1.
     #[inline]
     pub fn is_unsigned(&self, id: TypeId) -> bool {
-        self.get(id).modifiers.contains(TypeModifiers::UNSIGNED)
+        let typ = self.get(id);
+        match typ.kind {
+            TypeKind::Bool => true,
+            _ => typ.modifiers.contains(TypeModifiers::UNSIGNED),
+        }
     }
 
     /// Apply the integer promotions (C17 6.3.1.1p2).

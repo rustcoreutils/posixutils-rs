@@ -5450,8 +5450,10 @@ impl Parser<'_> {
         }
 
         // Warning: one-bit signed bitfield has dubious values
-        // (can only hold -1 or 0 in 2's complement, or 0/-0 in other representations)
-        if width == 1 && !self.types.is_unsigned(typ_id) && kind != TypeKind::Bool {
+        // (can only hold -1 or 0 in 2's complement, or 0/-0 in other representations).
+        // `_Bool` needs no exemption here: it is an unsigned type, which
+        // `is_unsigned` now reports, so `_Bool f:1` is an ordinary flag.
+        if width == 1 && !self.types.is_unsigned(typ_id) {
             diag::warning(
                 self.current_pos(),
                 &gettext("single-bit signed bit-field has dubious values"),

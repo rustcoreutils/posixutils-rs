@@ -800,7 +800,17 @@ impl<'a> super::linearize::Linearizer<'a> {
                                     let val = self.linearize_expr(&expr);
                                     let val_type = self.expr_type(&expr);
                                     let storage_type = self.bitfield_storage_type(storage_size);
-                                    let converted = self.emit_convert(val, val_type, storage_type);
+                                    // Convert to the *member's* type first, not
+                                    // straight to the storage unit's. C17 6.7.9p11
+                                    // initializes a member by converting to its own
+                                    // type, and for `_Bool` that conversion is the
+                                    // one that normalizes to 0/1 (6.3.1.2). Going
+                                    // directly to the unsigned storage type skipped
+                                    // it, so `struct { _Bool f:1; } v = {2};` stored
+                                    // 2, truncated it to one bit and read back 0.
+                                    let member_val = self.emit_convert(val, val_type, field_type);
+                                    let converted =
+                                        self.emit_convert(member_val, field_type, storage_type);
                                     self.emit_bitfield_store(
                                         base_sym,
                                         offset as usize,
@@ -1592,12 +1602,10 @@ impl<'a> super::linearize::Linearizer<'a> {
                     BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
                         // Use unsigned comparison when either operand is unsigned.
                         // C promotes both to the common unsigned type for comparison.
-                        let left_unsigned = left.typ.is_some_and(|t| {
-                            self.types.modifiers(t).contains(TypeModifiers::UNSIGNED)
-                        });
-                        let right_unsigned = right.typ.is_some_and(|t| {
-                            self.types.modifiers(t).contains(TypeModifiers::UNSIGNED)
-                        });
+                        // Ask the predicate rather than the modifier bit: the bit is
+                        // silent for the types whose signedness does not live there.
+                        let left_unsigned = left.typ.is_some_and(|t| self.types.is_unsigned(t));
+                        let right_unsigned = right.typ.is_some_and(|t| self.types.is_unsigned(t));
                         let use_unsigned = left_unsigned || right_unsigned;
                         if use_unsigned {
                             let lu = l as u128;

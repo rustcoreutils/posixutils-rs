@@ -303,8 +303,17 @@ pub enum ExprKind {
         elements: Vec<InitElement>,
     },
 
-    /// sizeof type: sizeof(int)
-    SizeofType(TypeId),
+    /// sizeof type-name: `sizeof(int)`, `sizeof(int[n])`
+    ///
+    /// The `Vec` holds one expression per array level whose extent is not a
+    /// constant, outermost-first, exactly as `parse_declarator` produced them:
+    /// `int[3][n][m]` carries `[n, m]`. It is empty for every type-name that
+    /// is not variably modified, which is the ordinary case.
+    ///
+    /// They have to ride on the node because they cannot be recovered from the
+    /// `TypeId`: `int[n]`, `int[m]` and `int[]` all intern to one type. Use
+    /// [`sizeof_type_is_runtime`] rather than testing the `Vec` directly.
+    SizeofType(TypeId, Vec<Expr>),
 
     /// sizeof expression: sizeof expr
     SizeofExpr(Box<Expr>),
@@ -807,6 +816,30 @@ pub struct InitElement {
     pub designators: Vec<Designator>,
     /// The initializer value (can be another InitList for nested)
     pub value: Box<Expr>,
+}
+
+/// Must `sizeof` of this type-name be computed at run time?
+///
+/// True exactly when the operand is a variable length array type in the sense
+/// of C17 6.5.3.4p2, which is also the condition under which the operand is
+/// *evaluated*. Three cases deliberately answer false:
+///
+/// - a type-name with no size expressions at all, which is every ordinary
+///   `sizeof(T)`;
+/// - a pointer to a variably-modified array. `sizeof(int(*)[n])` is the
+///   pointer's size, and gcc does not evaluate `n` there either;
+/// - a type whose unsized levels outnumber the expressions supplied, as in
+///   `sizeof(int[][n])`. That is invalid C -- gcc rejects it as an incomplete
+///   type -- and declining leaves it at its previous behaviour rather than
+///   pairing the one expression with the wrong level and inventing a
+///   plausible-looking number.
+///
+/// Five consumers need this same answer, so it is asked in one place: the
+/// linearizer, both constant folders, `is_pure_expr` and `expr_is_runtime`.
+pub fn sizeof_type_is_runtime(types: &TypeTable, typ: TypeId, dims: &[Expr]) -> bool {
+    !dims.is_empty()
+        && types.kind(typ) == TypeKind::Array
+        && types.unsized_array_levels(typ) == dims.len()
 }
 
 /// Does this initializer element initialize `target_type` by elided braces?

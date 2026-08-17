@@ -1550,11 +1550,19 @@ impl<'a> Linearizer<'a> {
             // Assignments have side effects
             ExprKind::Assign { .. } => false,
 
-            // Sizeof and _Alignof are always pure (compile-time constant)
-            ExprKind::SizeofType(_)
-            | ExprKind::SizeofExpr(_)
-            | ExprKind::AlignofType(_)
-            | ExprKind::AlignofExpr(_) => true,
+            // `sizeof` of a variable length array type is the one form that
+            // evaluates its operand (6.5.3.4p2), and that operand can call a
+            // function. Reporting it pure lets a conditional expression be
+            // lowered branchlessly, which evaluates *both* arms -- so
+            // `c ? sizeof(int[f()]) : 0` would call `f` even when `c` is
+            // false, against 6.5.15p4.
+            ExprKind::SizeofType(typ, dims) => {
+                !crate::parse::ast::sizeof_type_is_runtime(self.types, *typ, dims)
+                    || dims.iter().all(|d| self.is_pure_expr(d))
+            }
+
+            // The other three never evaluate anything.
+            ExprKind::SizeofExpr(_) | ExprKind::AlignofType(_) | ExprKind::AlignofExpr(_) => true,
 
             // Comma expressions: pure if all sub-expressions are pure
             ExprKind::Comma(exprs) => exprs.iter().all(|e| self.is_pure_expr(e)),
@@ -4956,10 +4964,25 @@ impl<'a> Linearizer<'a> {
                 expr: inner_expr,
             } => self.linearize_cast(inner_expr, *cast_type),
 
-            ExprKind::SizeofType(typ) => {
-                let size = self.types.size_bits(*typ) / 8;
+            ExprKind::SizeofType(typ, dims) => {
                 // sizeof returns size_t, which is unsigned long in our implementation
                 let result_typ = self.types.ulong_id;
+
+                // C17 6.5.3.4p2: for a variable length array type the operand
+                // is evaluated and the size computed at run time.
+                // `record_vm_extents` pairs one size expression with each
+                // absent extent -- the same pairing a declared `int a[n][4][m]`
+                // goes through -- and spills each to a hidden local, so the
+                // expression is linearized exactly once however many times the
+                // product reads it back.
+                if crate::parse::ast::sizeof_type_is_runtime(self.types, *typ, dims) {
+                    let (extents, elem) = self.record_vm_extents(*typ, dims, "sizeof");
+                    if let Some(size) = self.vm_extent_size(&extents, elem) {
+                        return size;
+                    }
+                }
+
+                let size = self.types.size_bits(*typ) / 8;
                 self.emit_const(size as i128, result_typ)
             }
 

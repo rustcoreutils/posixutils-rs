@@ -1485,8 +1485,19 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
             ExprKind::Cast { expr: inner, .. } => self.expr_is_runtime(inner),
 
-            // `sizeof` and `_Alignof` do not evaluate their operand, and
-            // literals are constant. Anything else: not proven either way.
+            // `sizeof` of a variable length array type is the exception: it
+            // does evaluate its operand, and is genuinely not an integer
+            // constant expression. Saying otherwise would send
+            // `case sizeof(int[n]):` to the caller's fallback message, which
+            // blames the compiler for a limitation rather than the program
+            // for a constraint violation.
+            ExprKind::SizeofType(typ, dims) => {
+                crate::parse::ast::sizeof_type_is_runtime(self.types, *typ, dims)
+            }
+
+            // `sizeof` otherwise, and `_Alignof`, do not evaluate their
+            // operand, and literals are constant. Anything else: not proven
+            // either way.
             _ => false,
         }
     }
@@ -1695,8 +1706,12 @@ impl<'a> super::linearize::Linearizer<'a> {
                 }
             }
 
-            // sizeof(type) - constant for complete types
-            ExprKind::SizeofType(type_id) => {
+            // sizeof(type) - constant for complete types, but a variable
+            // length array type's size is only known at run time (6.5.3.4p2).
+            ExprKind::SizeofType(type_id, dims) => {
+                if crate::parse::ast::sizeof_type_is_runtime(self.types, *type_id, dims) {
+                    return None;
+                }
                 let size_bits = self.types.size_bits(*type_id);
                 Some((size_bits / 8) as i128)
             }

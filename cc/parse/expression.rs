@@ -822,10 +822,17 @@ impl<'a> Parser<'a> {
             // This is a simplified check - full implementation needs type lookahead
             self.advance(); // consume '('
 
-            // Try to parse as type first
-            if let Some(typ) = self.try_parse_type_name() {
+            // Try to parse as type first. The size expressions of any
+            // variably-modified array level ride on the node: 6.5.3.4p2 says
+            // the operand is evaluated and its size computed at run time, and
+            // the interned type cannot carry either.
+            if let Some((typ, dims)) = self.try_parse_type_name_vm() {
                 self.expect_special(b')')?;
-                return Ok(Expr::typed(ExprKind::SizeofType(typ), size_t, sizeof_pos));
+                return Ok(Expr::typed(
+                    ExprKind::SizeofType(typ, dims),
+                    size_t,
+                    sizeof_pos,
+                ));
             }
 
             // Not a type, parse as expression
@@ -857,7 +864,16 @@ impl<'a> Parser<'a> {
             // Could be _Alignof(type) or _Alignof(expr)
             self.advance(); // consume '('
 
-            // Try to parse as type first
+            // Try to parse as type first.
+            //
+            // Deliberately NOT the variably-modified form that `sizeof` two
+            // functions above uses. C17 6.5.3.4p3 makes the result of
+            // `_Alignof` an integer constant and does not evaluate the
+            // operand, and the alignment of `int[n]` is the alignment of
+            // `int`, which `TypeTable::alignment` already computes without
+            // ever reading an extent. Collecting the expressions here would
+            // either be dead weight in the AST or an evaluation the standard
+            // forbids.
             if let Some(typ) = self.try_parse_type_name() {
                 self.expect_special(b')')?;
                 return Ok(Expr::typed(ExprKind::AlignofType(typ), size_t, alignof_pos));
@@ -959,13 +975,26 @@ impl<'a> Parser<'a> {
     /// already represents as `StringId::EMPTY`, so there was never a reason
     /// for a second implementation.
     pub(crate) fn try_parse_type_name(&mut self) -> Option<TypeId> {
+        self.try_parse_type_name_vm().map(|(typ, _dims)| typ)
+    }
+
+    /// A type-name together with the size expressions of its variably-modified
+    /// array levels, outermost-first.
+    ///
+    /// Only `sizeof` needs the expressions. C17 6.5.3.4p2 evaluates the
+    /// operand of `sizeof` when the type is a variable length array, and the
+    /// size cannot be recovered afterwards: `int[n]`, `int[m]` and `int[]` all
+    /// intern to one `TypeId`. `parse_declarator` has always computed them
+    /// correctly; they were simply discarded here. Every other caller wants
+    /// the type alone and keeps using [`Self::try_parse_type_name`].
+    pub(crate) fn try_parse_type_name_vm(&mut self) -> Option<(TypeId, Vec<Expr>)> {
         let saved_pos = self.pos;
         let base = self.try_parse_specifier_qualifier_list()?;
 
         match self.parse_declarator(base, DeclaratorName::Optional) {
             // An abstract declarator names nothing. A name here means this was
             // never a type-name, so let the caller try it as an expression.
-            Ok((name, typ, _vla, _params)) if name == StringId::EMPTY => Some(typ),
+            Ok((name, typ, vla, _params)) if name == StringId::EMPTY => Some((typ, vla)),
             _ => {
                 self.pos = saved_pos;
                 None

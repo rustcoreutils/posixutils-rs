@@ -978,6 +978,34 @@ impl TypeTable {
         self.get(id).array_size
     }
 
+    /// How many array levels of `id`, outermost-first, have no extent.
+    ///
+    /// The type table cannot tell a variably-modified array from an incomplete
+    /// one: `int[n]`, `int[m]` and `int[]` all intern to the same `TypeId`,
+    /// because the key holds `array_size`, which is `None` for all three. So
+    /// this counts the levels that *need* a size expression supplied from
+    /// outside, which is exactly what `record_vm_extents` consumes one
+    /// expression for -- and therefore also the count that says whether a
+    /// given list of expressions describes the whole type or only part of it.
+    ///
+    /// Stops at the first non-array level, so a pointer to a variably-modified
+    /// array counts zero: its size is the pointer's.
+    pub fn unsized_array_levels(&self, id: TypeId) -> usize {
+        let mut levels = 0;
+        let mut cur = id;
+        while self.kind(cur) == TypeKind::Array {
+            let typ = self.get(cur);
+            if typ.array_size.is_none() {
+                levels += 1;
+            }
+            match typ.base {
+                Some(base) => cur = base,
+                None => break,
+            }
+        }
+        levels
+    }
+
     /// Get function parameters
     #[cfg(test)]
     #[inline]
@@ -2017,6 +2045,50 @@ mod tests {
         ] {
             assert_eq!(types.integer_promote(wide), wide);
         }
+    }
+
+    /// `unsized_array_levels` counts the array levels that need a size
+    /// expression supplied from outside. It is what says whether a list of
+    /// such expressions describes the whole type or only part of it, so
+    /// `int[][n]` (two unsized levels, one expression) can be told from
+    /// `int[n]` (one and one).
+    #[test]
+    fn test_unsized_array_levels() {
+        let mut types = TypeTable::new(&Target::host());
+        let int_id = types.int_id;
+
+        // Not an array at all.
+        assert_eq!(types.unsized_array_levels(int_id), 0);
+
+        // Fully sized arrays need nothing.
+        let a4 = types.intern(Type::array(int_id, 4));
+        assert_eq!(types.unsized_array_levels(a4), 0);
+        let a3x4 = types.intern(Type::array(a4, 3));
+        assert_eq!(types.unsized_array_levels(a3x4), 0);
+
+        // An absent extent counts once, at whichever level it sits. This is
+        // how a variably-modified dimension is represented: the size lives in
+        // a side-channel expression, not in the type.
+        fn unsized_array(types: &mut TypeTable, base: TypeId) -> TypeId {
+            let mut t = Type::array(base, 0);
+            t.array_size = None;
+            types.intern(t)
+        }
+        let an = unsized_array(&mut types, int_id);
+        assert_eq!(types.unsized_array_levels(an), 1);
+
+        // `int[3][n]`: outer sized, inner not.
+        let a3xn = types.intern(Type::array(an, 3));
+        assert_eq!(types.unsized_array_levels(a3xn), 1);
+
+        // `int[n][m]`: both absent.
+        let anxm = unsized_array(&mut types, an);
+        assert_eq!(types.unsized_array_levels(anxm), 2);
+
+        // A pointer to a variably-modified array stops at the pointer: its
+        // size is the pointer's, and nothing about its extent is needed.
+        let ptr = types.intern(Type::pointer(an));
+        assert_eq!(types.unsized_array_levels(ptr), 0);
     }
 
     #[test]

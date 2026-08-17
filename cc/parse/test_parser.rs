@@ -1050,7 +1050,75 @@ fn test_sizeof_expr() {
 fn test_sizeof_type() {
     let (expr, types, _strings, _symbols) = parse_expr("sizeof(int)").unwrap();
     match expr.kind {
-        ExprKind::SizeofType(typ) => assert_eq!(types.kind(typ), TypeKind::Int),
+        ExprKind::SizeofType(typ, _) => assert_eq!(types.kind(typ), TypeKind::Int),
+        _ => panic!("Expected SizeofType"),
+    }
+}
+
+/// `sizeof` of a variably-modified type-name carries one size expression per
+/// array level whose extent is absent, outermost-first, because the interned
+/// type cannot hold them: `int[n]`, `int[m]` and `int[]` are one `TypeId`.
+///
+/// `sizeof_type_is_runtime` is what every consumer asks, so the pairing rule
+/// and its refusals are asserted through it rather than by counting the `Vec`.
+#[test]
+fn test_sizeof_variably_modified_type_name_carries_its_dimensions() {
+    use crate::parse::ast::sizeof_type_is_runtime;
+
+    // One absent extent, one expression.
+    let (expr, types, _s, _y) = parse_expr_with_vars("sizeof(int[n])", &["n"]).unwrap();
+    match &expr.kind {
+        ExprKind::SizeofType(typ, dims) => {
+            assert_eq!(dims.len(), 1);
+            assert!(sizeof_type_is_runtime(&types, *typ, dims));
+        }
+        _ => panic!("Expected SizeofType"),
+    }
+
+    // A constant outer level contributes no expression; the inner one does.
+    for src in ["sizeof(int[3][n])", "sizeof(int[n][3])"] {
+        let (expr, types, _s, _y) = parse_expr_with_vars(src, &["n"]).unwrap();
+        match &expr.kind {
+            ExprKind::SizeofType(typ, dims) => {
+                assert_eq!(dims.len(), 1, "{src}");
+                assert!(sizeof_type_is_runtime(&types, *typ, dims), "{src}");
+            }
+            _ => panic!("Expected SizeofType for {src}"),
+        }
+    }
+
+    // Two absent extents, two expressions, in source order.
+    let (expr, types, _s, _y) = parse_expr_with_vars("sizeof(int[n][m])", &["n", "m"]).unwrap();
+    match &expr.kind {
+        ExprKind::SizeofType(typ, dims) => {
+            assert_eq!(dims.len(), 2);
+            assert!(sizeof_type_is_runtime(&types, *typ, dims));
+        }
+        _ => panic!("Expected SizeofType"),
+    }
+
+    // Nothing variably modified: no expressions, and not a run-time size.
+    for src in ["sizeof(int)", "sizeof(int[4])", "sizeof(int[3][4])"] {
+        let (expr, types, _s, _y) = parse_expr(src).unwrap();
+        match &expr.kind {
+            ExprKind::SizeofType(typ, dims) => {
+                assert!(dims.is_empty(), "{src}");
+                assert!(!sizeof_type_is_runtime(&types, *typ, dims), "{src}");
+            }
+            _ => panic!("Expected SizeofType for {src}"),
+        }
+    }
+
+    // A pointer to a variably-modified array is the pointer's size, and its
+    // extent is not evaluated -- gcc agrees.
+    let (expr, types, _s, _y) = parse_expr_with_vars("sizeof(int(*)[n])", &["n"]).unwrap();
+    match &expr.kind {
+        ExprKind::SizeofType(typ, dims) => {
+            assert!(
+                !sizeof_type_is_runtime(&types, *typ, dims),
+                "a pointer to a VLA is not a run-time sizeof"
+            );
+        }
         _ => panic!("Expected SizeofType"),
     }
 }
@@ -1338,7 +1406,7 @@ fn test_cast_int128_non_constant_no_fold() {
 fn test_sizeof_compound_type() {
     let (expr, types, _strings, _symbols) = parse_expr("sizeof(unsigned long long)").unwrap();
     match expr.kind {
-        ExprKind::SizeofType(typ) => {
+        ExprKind::SizeofType(typ, _) => {
             assert_eq!(types.kind(typ), TypeKind::LongLong);
             assert!(types.get(typ).modifiers.contains(TypeModifiers::UNSIGNED));
         }
@@ -1350,7 +1418,7 @@ fn test_sizeof_compound_type() {
 fn test_sizeof_pointer_type() {
     let (expr, types, _strings, _symbols) = parse_expr("sizeof(int*)").unwrap();
     match expr.kind {
-        ExprKind::SizeofType(typ) => {
+        ExprKind::SizeofType(typ, _) => {
             assert_eq!(types.kind(typ), TypeKind::Pointer);
         }
         _ => panic!("Expected SizeofType"),
@@ -3960,7 +4028,7 @@ fn test_sizeof_expression_vs_type() {
     // sizeof applied to type in parentheses
     let (expr2, _types, _strings, _symbols) = parse_expr("sizeof(int)").unwrap();
     match &expr2.kind {
-        ExprKind::SizeofType(_) => {}
+        ExprKind::SizeofType(..) => {}
         _ => panic!("Expected sizeof type"),
     }
 }

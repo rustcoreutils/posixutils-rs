@@ -5287,8 +5287,16 @@ impl Parser<'_> {
                 }
             }
 
-            // sizeof(type) - constant for complete types
-            ExprKind::SizeofType(type_id) => {
+            // sizeof(type) - constant for complete types, but *not* for a
+            // variable length array type, whose size 6.5.3.4p2 computes at run
+            // time. The type table cannot tell `int[n]` from `int[]`, so
+            // answering from it alone gave 0 -- and a 0 that was still an
+            // integer constant expression, so `int z[sizeof(int[n])];`
+            // silently became a zero-length array.
+            ExprKind::SizeofType(type_id, dims) => {
+                if crate::parse::ast::sizeof_type_is_runtime(self.types, *type_id, dims) {
+                    return None;
+                }
                 let size_bits = self.types.size_bits(*type_id);
                 Some((size_bits / 8) as i128)
             }

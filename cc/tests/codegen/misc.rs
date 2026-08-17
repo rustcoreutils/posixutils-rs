@@ -2517,6 +2517,86 @@ int main(void) {
     assert_eq!(compile_and_run("vla_sizeof_mul_type", code, &[]), 0);
 }
 
+/// `sizeof` of a variably-modified *type-name* is computed at run time, and
+/// evaluates its size expressions exactly once (C17 6.5.3.4p2).
+///
+/// The test above covers `sizeof` of a declared VLA *object*, which worked.
+/// The type-name form answered **0** at every shape, because the dimension
+/// expressions are dropped where the type-name is parsed and cannot be
+/// recovered afterwards -- `int[n]`, `int[m]` and `int[]` all intern to one
+/// `TypeId`, and the array arm of `size_bits` reads its absent extent as zero.
+///
+/// Two consequences beyond the wrong number, both covered here: the size
+/// expression was never evaluated at all, so `sizeof(int[f()])` called `f`
+/// zero times; and the bogus 0 was still an integer constant expression, so
+/// `int z[sizeof(int[n])];` silently became a zero-length array.
+#[test]
+fn codegen_sizeof_of_a_variably_modified_type_name() {
+    let code = r#"
+int calls;
+int f(void) { calls++; return 4; }
+
+int main(void) {
+    int n = 4, m = 3;
+
+    /* ===== the value, at every shape (returns 1-9) ===== */
+    if (sizeof(int[n])      != 16) return 1;
+    if (sizeof(int[3][n])   != 48) return 2;
+    if (sizeof(int[n][3])   != 48) return 3;
+    if (sizeof(int[n][m])   != 48) return 4;
+    if (sizeof(int[n+1])    != 20) return 5;
+    if (sizeof(char[n])     != 4)  return 6;
+    if (sizeof(long[n])     != 32) return 7;
+
+    /* ===== controls that already worked (returns 10-19) ===== */
+    int a[n];
+    int b[3][n];
+    if (sizeof a           != 16) return 10;
+    if (sizeof b           != 48) return 11;
+    if (sizeof(int[4])     != 16) return 12;
+    if (sizeof(int[3][4])  != 48) return 13;
+    if (sizeof(int(*)[n])  != sizeof(void*)) return 14;   /* a pointer */
+
+    /* ===== the operand is evaluated, exactly once (returns 20-29) ===== */
+    calls = 0;
+    if (sizeof(int[f()]) != 16) return 20;
+    if (calls != 1) return 21;
+
+    /* once per evaluation of the sizeof, i.e. per iteration */
+    calls = 0;
+    for (int i = 0; i < 3; i++) {
+        if (sizeof(int[f()]) != 16) return 22;
+    }
+    if (calls != 3) return 23;
+
+    /* not evaluated when control never reaches it */
+    calls = 0;
+    if (0 && sizeof(int[f()]) == 16) return 24;
+    if (calls != 0) return 25;
+
+    calls = 0;
+    { int cond = 0; unsigned long z = cond ? sizeof(int[f()]) : 7u; if (z != 7) return 26; }
+    if (calls != 0) return 27;
+
+    /* a pointer-to-VLA type-name does NOT evaluate its extent (gcc agrees) */
+    calls = 0;
+    if (sizeof(int(*)[f()]) != sizeof(void*)) return 28;
+    if (calls != 0) return 29;
+
+    /* ===== the result is not an integer constant expression (30-39) ===== */
+    /* it is a run-time value, so an array declared with it is itself a VLA */
+    { int z[sizeof(int[n])]; if (sizeof z != 64) return 30; }
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("sizeof_vm_type_name", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("sizeof_vm_type_name_opt", code),
+        0
+    );
+}
+
 // ============================================================================
 // Variadic functions with 64-bit args — exercises VaArg .with_size() for
 // long and pointer types. Values above 2^32 prove no 32-bit truncation.

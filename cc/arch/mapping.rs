@@ -136,9 +136,17 @@ pub(crate) fn is_binary128(types: &TypeTable, typ: TypeId, target: &Target) -> b
 }
 
 /// Get the integer suffix for a long double↔int conversion.
+///
+/// Asks the *promoted* type, because that is how C converts: a value narrower
+/// than `int` is converted through `int` and then truncated, so no sub-`int`
+/// type ever selects its own helper. Asking the declared type would send a
+/// plain `char` on aarch64 -- and an `unsigned char` everywhere -- to
+/// `__fixunstfsi`, which libgcc leaves unspecified for a negative value,
+/// where gcc calls `__fixtfsi`.
 pub(crate) fn int_suffix_for_longdouble(types: &TypeTable, int_type: TypeId) -> &'static str {
-    let size = types.size_bits(int_type);
-    let is_unsigned = types.is_unsigned(int_type);
+    let promoted = types.integer_promote(int_type);
+    let size = types.size_bits(promoted);
+    let is_unsigned = types.is_unsigned(promoted);
     match (is_unsigned, size <= 32) {
         (true, true) => "usi",
         (true, false) => "udi",

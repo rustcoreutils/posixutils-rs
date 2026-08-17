@@ -8705,9 +8705,13 @@ __attribute__((noinline)) static long lo(i128 v) { return (long)v; }
 __attribute__((noinline)) static long uhi(u128 v) { return (long)(v >> 64); }
 
 int main(void) {
-    /* Signed sources sign-extend into both halves. */
+    /* Signed sources sign-extend into both halves. `signed char`, not plain
+       `char`: plain char's signedness is implementation-defined (C17
+       6.2.5p15) and it is *unsigned* on aarch64, where -3 is 253 and neither
+       half would be negative. This test is about widening, not about which
+       sign plain char happens to have. */
     {
-        char c = -3;
+        signed char c = -3;
         if (lo(c) != -3 || hi(c) != -1) return 1;
     }
     {

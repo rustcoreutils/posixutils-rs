@@ -717,6 +717,14 @@ pub struct TypeTable {
     target_arch: Arch,
     /// Target OS for runtime type size calculations
     target_os: Os,
+    /// Whether plain `char` is signed on the target.
+    ///
+    /// C17 6.2.5p15 leaves this implementation-defined: the x86-64 psABI says
+    /// signed, AAPCS64 says unsigned. Copied from `Target` at construction
+    /// rather than recomputed, because the table cannot reconstruct the
+    /// *requested* target -- `has_float128` rebuilds one with
+    /// `..Target::host()` and would answer for the host instead.
+    char_signed: bool,
 
     // Pre-computed common type IDs for fast access
     pub void_id: TypeId,
@@ -757,6 +765,7 @@ impl TypeTable {
             pointer_width: target.pointer_width,
             target_arch: target.arch,
             target_os: target.os,
+            char_signed: target.char_signed,
             void_id: TypeId::INVALID,
             bool_id: TypeId::INVALID,
             char_id: TypeId::INVALID,
@@ -1003,7 +1012,10 @@ impl TypeTable {
         if typ.modifiers.contains(TypeModifiers::VOLATILE) {
             result.push_str("volatile ");
         }
-        if typ.modifiers.contains(TypeModifiers::UNSIGNED) {
+        // Spelling, not signedness: a diagnostic must name the type the source
+        // wrote. Plain `char` is an unsigned type on aarch64 and is still
+        // `char` here.
+        if self.spelled_unsigned(id) {
             result.push_str("unsigned ");
         } else if typ.modifiers.contains(TypeModifiers::SIGNED) && typ.kind == TypeKind::Char {
             result.push_str("signed ");
@@ -1345,20 +1357,47 @@ impl TypeTable {
 
     /// Whether `id` is an unsigned integer type.
     ///
-    /// Not the same question as "was the keyword `unsigned` written". `_Bool`
-    /// carries no `UNSIGNED` modifier and is nonetheless an unsigned type:
-    /// C17 6.2.5p6 lists it among the standard unsigned integer types, and
-    /// 6.3.1.2 confines its values to 0 and 1. It has no modifier because
-    /// there is no `signed _Bool` to tell it apart from. Answering from the
-    /// bit sign-extended a `_Bool` bit-field, so `struct { _Bool f:1; }` with
-    /// `f` set read back -1.
+    /// Not the same question as "was the keyword `unsigned` written" -- see
+    /// [`Self::spelled_unsigned`]. Two integer types carry no `UNSIGNED`
+    /// modifier and are unsigned anyway, which is why answering from the bit
+    /// alone was wrong twice:
+    ///
+    /// - `_Bool`. C17 6.2.5p6 lists it among the standard unsigned integer
+    ///   types and 6.3.1.2 confines its values to 0 and 1. It has no modifier
+    ///   because there is no `signed _Bool` to tell it apart from. Reading the
+    ///   bit sign-extended a `_Bool` bit-field, so `struct { _Bool f:1; }`
+    ///   with `f` set read back -1.
+    /// - Plain `char`, on a target whose `char` is unsigned. 6.2.5p15 leaves
+    ///   that implementation-defined, and it cannot be settled by stamping the
+    ///   modifier on at intern time: `char`, `signed char` and `unsigned char`
+    ///   are three distinct types, and the modifier is what `TypeKey::Basic`
+    ///   deduplicates on, so that would collapse two of them into one.
     #[inline]
     pub fn is_unsigned(&self, id: TypeId) -> bool {
         let typ = self.get(id);
         match typ.kind {
             TypeKind::Bool => true,
+            TypeKind::Char
+                if !typ
+                    .modifiers
+                    .intersects(TypeModifiers::SIGNED | TypeModifiers::UNSIGNED) =>
+            {
+                !self.char_signed
+            }
             _ => typ.modifiers.contains(TypeModifiers::UNSIGNED),
         }
+    }
+
+    /// Whether the declaration of `id` spelled the keyword `unsigned`.
+    ///
+    /// A question about source text rather than about values, and the only one
+    /// a caller that *reprints* a type should ask: plain `char` is an unsigned
+    /// type on aarch64 and is still written `char`, and `_Bool` is unsigned
+    /// and is written neither way. Using [`Self::is_unsigned`] here would make
+    /// a type printer say `unsigned char` for a declaration that says `char`.
+    #[inline]
+    pub fn spelled_unsigned(&self, id: TypeId) -> bool {
+        self.get(id).modifiers.contains(TypeModifiers::UNSIGNED)
     }
 
     /// Apply the integer promotions (C17 6.3.1.1p2).
@@ -1378,15 +1417,6 @@ impl TypeTable {
             TypeKind::Bool | TypeKind::Char | TypeKind::Short => self.int_id,
             _ => id,
         }
-    }
-
-    /// Check if type is a plain char (no explicit signed/unsigned)
-    #[inline]
-    pub fn is_plain_char(&self, id: TypeId) -> bool {
-        let typ = self.get(id);
-        typ.kind == TypeKind::Char
-            && !typ.modifiers.contains(TypeModifiers::SIGNED)
-            && !typ.modifiers.contains(TypeModifiers::UNSIGNED)
     }
 
     /// Get the unsigned version of a type
@@ -1914,6 +1944,42 @@ mod tests {
         let types = TypeTable::new(&Target::host());
         assert!(types.is_unsigned(types.uint_id));
         assert!(!types.is_unsigned(types.int_id));
+    }
+
+    /// Plain `char`'s signedness is the target's (C17 6.2.5p15), and it is a
+    /// different question from how the type is spelled. `signed char` and
+    /// `unsigned char` say what they are on every target; only bare `char`
+    /// moves.
+    #[test]
+    fn test_plain_char_signedness_follows_the_target() {
+        let x86 = TypeTable::new(&Target::new(Arch::X86_64, Os::Linux));
+        let arm = TypeTable::new(&Target::new(Arch::Aarch64, Os::Linux));
+
+        // The x86-64 psABI makes plain char signed; AAPCS64 makes it unsigned.
+        assert!(!x86.is_unsigned(x86.char_id), "x86-64: char is signed");
+        assert!(arm.is_unsigned(arm.char_id), "aarch64: char is unsigned");
+
+        // The explicit spellings do not move with the target.
+        for t in [&x86, &arm] {
+            assert!(!t.is_unsigned(t.schar_id), "signed char is always signed");
+            assert!(
+                t.is_unsigned(t.uchar_id),
+                "unsigned char is always unsigned"
+            );
+            assert!(t.is_unsigned(t.bool_id), "_Bool is always unsigned");
+            assert!(!t.is_unsigned(t.int_id));
+        }
+
+        // Spelling is target-independent, and is what a type printer asks.
+        // Plain `char` is unsigned on aarch64 and is still written `char`.
+        for t in [&x86, &arm] {
+            assert!(!t.spelled_unsigned(t.char_id));
+            assert!(!t.spelled_unsigned(t.schar_id));
+            assert!(t.spelled_unsigned(t.uchar_id));
+            assert!(!t.spelled_unsigned(t.bool_id));
+        }
+        assert_eq!(arm.format_type(arm.char_id, None), "char");
+        assert_eq!(arm.format_type(arm.uchar_id, None), "unsigned char");
     }
 
     /// C17 6.3.1.1p2: everything of lesser rank than `int` becomes `int`,

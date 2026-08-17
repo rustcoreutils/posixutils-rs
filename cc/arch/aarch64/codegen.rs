@@ -2904,18 +2904,10 @@ impl Aarch64CodeGen {
             _ => Reg::X9,
         };
 
-        // Determine if we need sign or zero extension for small types
-        // For plain char, use target.char_signed to determine signedness
-        let is_unsigned = insn.typ.is_some_and(|t| {
-            if types.is_unsigned(t) {
-                true
-            } else if types.is_plain_char(t) {
-                // Plain char: unsigned if target says char is not signed
-                !self.base.target.char_signed
-            } else {
-                false
-            }
-        });
+        // Sign- or zero-extend by the type's signedness. `is_unsigned`
+        // answers for plain `char` per the target, so there is nothing to
+        // special-case here.
+        let is_unsigned = insn.typ.is_some_and(|t| types.is_unsigned(t));
 
         // Helper to emit the appropriate load instruction
         let emit_load_lir = |this: &mut Self, mem_addr: MemAddr| match mem_size {
@@ -3476,18 +3468,10 @@ impl Aarch64CodeGen {
             return;
         }
 
-        // Determine if the type is unsigned (for proper sign/zero extension)
-        // For plain char, use target.char_signed to determine signedness
-        let is_unsigned = typ.is_some_and(|t| {
-            if types.is_unsigned(t) {
-                true
-            } else if types.is_plain_char(t) {
-                // Plain char: unsigned if target says char is not signed
-                !self.base.target.char_signed
-            } else {
-                false
-            }
-        });
+        // Sign- or zero-extend by the type's signedness. `is_unsigned`
+        // answers for plain `char` per the target, so there is nothing to
+        // special-case here.
+        let is_unsigned = typ.is_some_and(|t| types.is_unsigned(t));
 
         // Handle 128-bit integer copy.
         //

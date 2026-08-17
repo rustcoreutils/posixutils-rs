@@ -2166,30 +2166,45 @@ impl<'a> Parser<'a> {
             } else {
                 self.types.float16_id
             }
-        } else if left_kind == TypeKind::Int128 || right_kind == TypeKind::Int128 {
-            if self.types.is_unsigned(left) || self.types.is_unsigned(right) {
-                self.types.uint128_id
-            } else {
-                self.types.int128_id
-            }
-        } else if left_kind == TypeKind::LongLong || right_kind == TypeKind::LongLong {
-            // If either is unsigned long long, result is unsigned long long
-            if self.types.is_unsigned(left) || self.types.is_unsigned(right) {
-                self.types.ulonglong_id
-            } else {
-                self.types.longlong_id
-            }
-        } else if left_kind == TypeKind::Long || right_kind == TypeKind::Long {
-            // If either is unsigned long, result is unsigned long
-            if self.types.is_unsigned(left) || self.types.is_unsigned(right) {
-                self.types.ulong_id
-            } else {
-                self.types.long_id
-            }
-        } else if self.types.is_unsigned(left) || self.types.is_unsigned(right) {
-            self.types.uint_id
         } else {
-            self.types.int_id
+            // No operand is floating, so the integer promotions apply to both
+            // *before* the ranks below are compared (C17 6.3.1.8p1). Without
+            // this, two sub-`int` operands matched none of the Long/LongLong/
+            // Int128 arms and fell to the final `is_unsigned` fallback, so
+            // `unsigned char` and `unsigned short` arithmetic came out
+            // unsigned -- `(a - b) / 2` divided 0xFFFFFFFF by two. After
+            // promotion no operand narrower than `int` can reach that
+            // fallback at all.
+            let left = self.types.integer_promote(left);
+            let right = self.types.integer_promote(right);
+            let left_kind = self.types.kind(left);
+            let right_kind = self.types.kind(right);
+
+            if left_kind == TypeKind::Int128 || right_kind == TypeKind::Int128 {
+                if self.types.is_unsigned(left) || self.types.is_unsigned(right) {
+                    self.types.uint128_id
+                } else {
+                    self.types.int128_id
+                }
+            } else if left_kind == TypeKind::LongLong || right_kind == TypeKind::LongLong {
+                // If either is unsigned long long, result is unsigned long long
+                if self.types.is_unsigned(left) || self.types.is_unsigned(right) {
+                    self.types.ulonglong_id
+                } else {
+                    self.types.longlong_id
+                }
+            } else if left_kind == TypeKind::Long || right_kind == TypeKind::Long {
+                // If either is unsigned long, result is unsigned long
+                if self.types.is_unsigned(left) || self.types.is_unsigned(right) {
+                    self.types.ulong_id
+                } else {
+                    self.types.long_id
+                }
+            } else if self.types.is_unsigned(left) || self.types.is_unsigned(right) {
+                self.types.uint_id
+            } else {
+                self.types.int_id
+            }
         }
     }
 

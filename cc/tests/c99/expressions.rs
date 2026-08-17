@@ -301,3 +301,106 @@ int main(void)
         0
     );
 }
+
+// ============================================================================
+// The integer promotions run before the usual arithmetic conversions
+// ============================================================================
+
+/// C17 6.3.1.8p1 performs the integer promotions on both operands *before*
+/// comparing their ranks, so every sub-`int` operand pair yields `int` and the
+/// arithmetic that follows is signed. Skipping them let two `unsigned char`s
+/// reach the "either operand is unsigned" fallback and divide unsigned:
+///
+/// ```text
+///   unsigned char a = 1, b = 2;
+///   (a - b) / 2     gave 2147483647, where gcc gives 0
+///   (a - b) >> 1    gave 2147483647, where gcc gives -1
+///   (a - b) < 0     gave 0,          where gcc gives 1
+/// ```
+///
+/// `_Bool` and plain `char` answered correctly only because the signedness
+/// predicate wrongly called them signed, so the two defects cancelled; they are
+/// covered here because fixing that predicate uncancels them. Each row must
+/// equal the `int` answer, whatever the operand type.
+#[test]
+fn c99_integer_promotions_precede_the_usual_arithmetic_conversions() {
+    let code = r#"
+int main(void)
+{
+    /* ===== unsigned char: the operand type that was visibly wrong (1-9) ===== */
+    {
+        unsigned char a = 1, b = 2;
+        if ((a - b) / 2 != 0) return 1;
+        if ((a - b) >> 1 != -1) return 2;
+        if (((a - b) < 0) != 1) return 3;
+        if ((a - b) != -1) return 4;
+        if ((a - b) % 2 != -1) return 5;
+    }
+
+    /* ===== unsigned short: same fallback, same defect (10-19) ===== */
+    {
+        unsigned short a = 1, b = 2;
+        if ((a - b) / 2 != 0) return 10;
+        if ((a - b) >> 1 != -1) return 11;
+        if (((a - b) < 0) != 1) return 12;
+        if ((a - b) != -1) return 13;
+    }
+
+    /* ===== _Bool: correct today only by the cancelling defect (20-29) ===== */
+    {
+        _Bool a = 0, b = 1;
+        if ((a - b) / 2 != 0) return 20;
+        if ((a - b) >> 1 != -1) return 21;
+        if (((a - b) < 0) != 1) return 22;
+        if ((a - b) != -1) return 23;
+    }
+
+    /* ===== plain char: likewise (30-39) ===== */
+    {
+        char a = 1, b = 2;
+        if ((a - b) / 2 != 0) return 30;
+        if ((a - b) >> 1 != -1) return 31;
+        if (((a - b) < 0) != 1) return 32;
+        if ((a - b) != -1) return 33;
+    }
+
+    /* ===== signed char and short: the controls that always worked (40-49) ===== */
+    {
+        signed char a = 1, b = 2;
+        if ((a - b) / 2 != 0) return 40;
+        if (((a - b) < 0) != 1) return 41;
+        short c = 1, d = 2;
+        if ((c - d) / 2 != 0) return 42;
+        if (((c - d) < 0) != 1) return 43;
+    }
+
+    /* ===== a genuinely unsigned result must stay unsigned (50-59) ===== */
+    {
+        unsigned int a = 1, b = 2;
+        if ((a - b) / 2 != 2147483647u) return 50;
+        if ((a - b) < 0) return 51;
+        unsigned char c = 1;
+        unsigned int d = 2;
+        if ((c - d) / 2 != 2147483647u) return 52;   /* uchar promotes, uint wins */
+        unsigned long e = 2;
+        if ((c - e) / 2 == 0) return 53;             /* ulong wins */
+    }
+
+    /* ===== promotion applies to the unary operators too (60-69) ===== */
+    {
+        unsigned char a = 1;
+        if (-a != -1) return 60;
+        if (~a != -2) return 61;
+        unsigned short b = 1;
+        if (-b != -1) return 62;
+    }
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_integer_promotions", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("c99_integer_promotions_opt", code),
+        0
+    );
+}

@@ -418,6 +418,47 @@ fn test_string_empty() {
     }
 }
 
+/// C17 6.3.1.8p1 runs the integer promotions on both operands before ranking
+/// them, so no operand narrower than `int` can reach the "either operand is
+/// unsigned" fallback. Without the promotion, `(unsigned char) - (unsigned
+/// char)` was typed `unsigned int` and the arithmetic that followed was done
+/// unsigned.
+#[test]
+fn test_usual_arithmetic_conversions_promote_first() {
+    // Every sub-int pair yields plain signed int, whatever its own signedness.
+    for src in [
+        "(unsigned char)1 - (unsigned char)2",
+        "(unsigned short)1 - (unsigned short)2",
+        "(signed char)1 - (signed char)2",
+        "(char)1 - (char)2",
+        "(_Bool)0 - (_Bool)1",
+        "(unsigned char)1 - (signed char)2",
+        "(unsigned char)1 * (unsigned short)2",
+    ] {
+        let (expr, types, _strings, _symbols) = parse_expr(src).unwrap();
+        let typ = expr.typ.unwrap();
+        assert_eq!(types.kind(typ), TypeKind::Int, "{src} should be int");
+        assert!(!types.is_unsigned(typ), "{src} should be signed");
+    }
+
+    // A genuinely unsigned operand of rank int or above still wins.
+    for (src, kind) in [
+        ("(unsigned char)1 - 2u", TypeKind::Int),
+        ("(unsigned char)1 - (unsigned long)2", TypeKind::Long),
+        ("(_Bool)1 - 2u", TypeKind::Int),
+    ] {
+        let (expr, types, _strings, _symbols) = parse_expr(src).unwrap();
+        let typ = expr.typ.unwrap();
+        assert_eq!(types.kind(typ), kind, "{src}");
+        assert!(types.is_unsigned(typ), "{src} should stay unsigned");
+    }
+
+    // And a signed wider operand still wins.
+    let (expr, types, _strings, _symbols) = parse_expr("(unsigned char)1 - 2L").unwrap();
+    assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Long);
+    assert!(!types.is_unsigned(expr.typ.unwrap()));
+}
+
 #[test]
 fn test_integer_literal_suffixes() {
     // Plain int

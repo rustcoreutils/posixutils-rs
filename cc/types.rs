@@ -1349,6 +1349,25 @@ impl TypeTable {
         self.get(id).modifiers.contains(TypeModifiers::UNSIGNED)
     }
 
+    /// Apply the integer promotions (C17 6.3.1.1p2).
+    ///
+    /// `_Bool`, `char` and `short` -- signed or unsigned -- all become `int`,
+    /// which can represent every value of each of them. Every other type is
+    /// returned unchanged.
+    ///
+    /// This lives on the type table rather than on one consumer because the
+    /// promotions are a prerequisite of the usual arithmetic conversions
+    /// (6.3.1.8p1), and both the parser and the linearizer compute those.
+    /// Only the linearizer used to promote, which is why `unsigned char`
+    /// arithmetic came out unsigned.
+    #[inline]
+    pub fn integer_promote(&self, id: TypeId) -> TypeId {
+        match self.kind(id) {
+            TypeKind::Bool | TypeKind::Char | TypeKind::Short => self.int_id,
+            _ => id,
+        }
+    }
+
     /// Check if type is a plain char (no explicit signed/unsigned)
     #[inline]
     pub fn is_plain_char(&self, id: TypeId) -> bool {
@@ -1883,6 +1902,43 @@ mod tests {
         let types = TypeTable::new(&Target::host());
         assert!(types.is_unsigned(types.uint_id));
         assert!(!types.is_unsigned(types.int_id));
+    }
+
+    /// C17 6.3.1.1p2: everything of lesser rank than `int` becomes `int`,
+    /// including the unsigned spellings -- `int` represents every value of
+    /// `unsigned char` and `unsigned short`, so neither promotes to
+    /// `unsigned int`.
+    #[test]
+    fn test_integer_promote() {
+        let types = TypeTable::new(&Target::host());
+
+        for narrow in [
+            types.bool_id,
+            types.char_id,
+            types.schar_id,
+            types.uchar_id,
+            types.short_id,
+            types.ushort_id,
+        ] {
+            assert_eq!(
+                types.integer_promote(narrow),
+                types.int_id,
+                "{} should promote to int",
+                types.format_type(narrow, None)
+            );
+        }
+
+        // int and everything wider is returned unchanged.
+        for wide in [
+            types.int_id,
+            types.uint_id,
+            types.long_id,
+            types.ulong_id,
+            types.longlong_id,
+            types.double_id,
+        ] {
+            assert_eq!(types.integer_promote(wide), wide);
+        }
     }
 
     #[test]

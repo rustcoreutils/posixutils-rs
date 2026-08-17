@@ -491,26 +491,6 @@ impl<'a> Linearizer<'a> {
         }
     }
 
-    /// Apply C99 integer promotions (6.3.1.1)
-    /// Types smaller than int are promoted to int (or unsigned int if int can't hold all values)
-    pub(crate) fn integer_promote(&self, typ_id: TypeId) -> TypeId {
-        // Integer promotions apply to _Bool, char, short (and their unsigned variants)
-        // They are promoted to int if int can represent all values, otherwise unsigned int
-        match self.types.kind(typ_id) {
-            TypeKind::Bool | TypeKind::Char | TypeKind::Short => {
-                // int (32-bit signed) can represent all values of:
-                // - _Bool (0-1)
-                // - char/signed char (-128 to 127)
-                // - unsigned char (0 to 255)
-                // - short/signed short (-32768 to 32767)
-                // - unsigned short (0 to 65535)
-                // So always promote to int
-                self.types.int_id
-            }
-            _ => typ_id,
-        }
-    }
-
     /// Compute the common type for usual arithmetic conversions (C99 6.3.1.8)
     /// Returns the wider type that both operands should be converted to
     pub(crate) fn common_type(&self, left: TypeId, right: TypeId) -> TypeId {
@@ -556,8 +536,8 @@ impl<'a> Linearizer<'a> {
         }
 
         // Apply integer promotions first (C99 6.3.1.1)
-        let left_promoted = self.integer_promote(left);
-        let right_promoted = self.integer_promote(right);
+        let left_promoted = self.types.integer_promote(left);
+        let right_promoted = self.types.integer_promote(right);
 
         let left_size = self.types.size_bits(left_promoted);
         let right_size = self.types.size_bits(right_promoted);
@@ -3061,7 +3041,7 @@ impl<'a> Linearizer<'a> {
                             TypeKind::Float | TypeKind::Float16 => Some(self.types.double_id),
                             // _Bool, char and short promote to int.
                             _ => {
-                                let promoted = self.integer_promote(arg_type);
+                                let promoted = self.types.integer_promote(arg_type);
                                 (promoted != arg_type).then_some(promoted)
                             }
                         };

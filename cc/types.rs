@@ -1768,6 +1768,9 @@ impl TypeTable {
     ) -> (usize, usize) {
         let mut bit_offset = 0usize;
         let mut max_align = 1usize;
+        // Alignment demanded by a zero-width bitfield, on the ABIs where one
+        // demands any. Kept separate because `pack_cap` does not cap it.
+        let mut zero_width_align = 1usize;
         // The furthest byte any access window reaches. Ordinary members never
         // reach past the running offset, but a window is a power-of-two span
         // that can, and the struct has to be large enough to hold it.
@@ -1803,9 +1806,20 @@ impl TypeTable {
             if bit_width == 0 {
                 // C17 6.7.2.1p12: a zero-width bitfield forces the *next*
                 // member to the next boundary of its declared type's storage
-                // unit, and contributes nothing else -- not even alignment.
-                // `struct { char c; int :0; char d; }` is 5 bytes with `d` at
-                // offset 4, packed or not, which is also gcc's answer.
+                // unit. Whether it also raises the enclosing struct's
+                // alignment is the one point the two ABIs disagree on, and
+                // 6.7.2.1p12 leaves it to them.
+                //
+                // The x86-64 psABI says it does not: `struct { char c;
+                // int :0; char d; }` is 5 bytes, alignment 1. AAPCS64 says it
+                // contributes its declared type's alignment, making the same
+                // struct 8 bytes with alignment 4 -- and unlike an ordinary
+                // member's, that contribution survives packing, so it is kept
+                // out of `max_align` (which `pack_cap` caps) and applied
+                // afterwards. Both are gcc's answers on the respective target.
+                if self.target_arch == Arch::Aarch64 {
+                    zero_width_align = zero_width_align.max(self.alignment(member.typ));
+                }
                 bit_offset = bit_offset.next_multiple_of(unit_bits);
                 member.offset = bit_offset / 8;
                 member.bit_offset = None;
@@ -1842,7 +1856,8 @@ impl TypeTable {
         let final_align = match pack_cap {
             Some(cap) => max_align.min(cap as usize),
             None => max_align,
-        };
+        }
+        .max(zero_width_align);
         let size = bit_offset
             .div_ceil(8)
             .max(window_end)
@@ -1868,6 +1883,9 @@ impl TypeTable {
     ) -> (usize, usize) {
         let mut max_size = 0usize;
         let mut max_align = 1usize;
+        // As in a struct: a zero-width bitfield's alignment demand, where the
+        // ABI makes one, is not capped by packing.
+        let mut zero_width_align = 1usize;
 
         for member in members.iter_mut() {
             member.offset = 0;
@@ -1887,6 +1905,23 @@ impl TypeTable {
                 member.bit_offset = None;
                 member.storage_unit_size = None;
             }
+
+            // A zero-width bitfield is not an object: it occupies no storage
+            // and so cannot widen the union. It used to contribute its
+            // declared type's size *and* alignment here, which made
+            // `union { char c; int :0; }` four bytes where gcc gives one.
+            // The boundary it forces in a struct has no meaning in a union,
+            // where every member starts at bit zero.
+            if member.bit_width == Some(0) {
+                // Except on AAPCS64, where it still demands its type's
+                // alignment -- and, as in a struct, packing does not suppress
+                // that. The union's size follows from the rounding.
+                if self.target_arch == Arch::Aarch64 {
+                    zero_width_align = zero_width_align.max(self.alignment(member.typ));
+                }
+                continue;
+            }
+
             max_size = max_size.max(self.size_bytes(member.typ));
             // Use explicit alignment from _Alignas if specified, otherwise natural alignment
             let natural_align = match pack_cap {
@@ -1900,6 +1935,7 @@ impl TypeTable {
             max_align = max_align.max(align);
         }
 
+        let max_align = max_align.max(zero_width_align);
         let size = if max_align > 1 {
             (max_size + max_align - 1) & !(max_align - 1)
         } else {
@@ -2089,6 +2125,75 @@ mod tests {
         // size is the pointer's, and nothing about its extent is needed.
         let ptr = types.intern(Type::pointer(an));
         assert_eq!(types.unsized_array_levels(ptr), 0);
+    }
+
+    /// A zero-width bit-field forces the next member to a boundary on every
+    /// target, but whether it also raises the *aggregate's* alignment is
+    /// ABI-specific (C17 6.7.2.1p12 leaves it open): the x86-64 psABI says no,
+    /// AAPCS64 says it contributes its declared type's alignment. Both answers
+    /// are gcc's on the respective target.
+    ///
+    /// Asserted here for both targets from one host, which the end-to-end test
+    /// cannot do -- it only ever compiles for the machine it runs on.
+    #[test]
+    fn test_zero_width_bitfield_alignment_is_abi_specific() {
+        fn layout(target: &Target, pack: Option<u32>, union_: bool) -> (usize, usize) {
+            let types = TypeTable::new(target);
+            // { char c; int :0; char d; }
+            let mut members = vec![
+                StructMember {
+                    name: StringId::EMPTY,
+                    typ: types.char_id,
+                    offset: 0,
+                    bit_offset: None,
+                    bit_width: None,
+                    storage_unit_size: None,
+                    explicit_align: None,
+                },
+                StructMember {
+                    name: StringId::EMPTY,
+                    typ: types.int_id,
+                    offset: 0,
+                    bit_offset: None,
+                    bit_width: Some(0),
+                    storage_unit_size: None,
+                    explicit_align: None,
+                },
+                StructMember {
+                    name: StringId::EMPTY,
+                    typ: types.char_id,
+                    offset: 0,
+                    bit_offset: None,
+                    bit_width: None,
+                    storage_unit_size: None,
+                    explicit_align: None,
+                },
+            ];
+            if union_ {
+                members.truncate(2);
+                types.compute_union_layout(&mut members, pack)
+            } else {
+                types.compute_struct_layout(&mut members, pack)
+            }
+        }
+
+        let x86 = Target::new(Arch::X86_64, Os::Linux);
+        let arm = Target::new(Arch::Aarch64, Os::Linux);
+
+        // Struct: the boundary applies everywhere, the alignment does not.
+        assert_eq!(layout(&x86, None, false), (5, 1));
+        assert_eq!(layout(&arm, None, false), (8, 4));
+
+        // Packing caps an ordinary member's alignment but not this one.
+        assert_eq!(layout(&x86, Some(1), false), (5, 1));
+        assert_eq!(layout(&arm, Some(1), false), (8, 4));
+
+        // Union: a zero-width bitfield occupies no storage, so it cannot
+        // widen the union -- it used to contribute its type's whole size.
+        assert_eq!(layout(&x86, None, true), (1, 1));
+        assert_eq!(layout(&arm, None, true), (4, 4));
+        assert_eq!(layout(&x86, Some(1), true), (1, 1));
+        assert_eq!(layout(&arm, Some(1), true), (4, 4));
     }
 
     #[test]

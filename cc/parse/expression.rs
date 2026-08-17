@@ -3689,10 +3689,23 @@ impl<'a> Parser<'a> {
                 let token = self.consume();
                 let token_pos = token.pos;
                 if let TokenValue::Char(s) = &token.value {
-                    // Parse character literal - type is int (C promotes char to int)
-                    let c = self.parse_char_literal(s);
+                    // C17 6.4.4.4p10: an unprefixed character constant has
+                    // type `int` and the value of a `char` object holding the
+                    // character, converted to `int` -- so its signedness is
+                    // plain `char`'s, which is the target's. `'\x80'` is -128
+                    // where `char` is signed and 128 where it is not.
+                    let (v, is_code_point) = self.parse_char_literal_value(s);
+                    let value = if is_code_point {
+                        // Not a byte, so plain `char`'s signedness does not
+                        // reach it.
+                        v as i64
+                    } else if self.types.is_unsigned(self.types.char_id) {
+                        v as u8 as i64
+                    } else {
+                        v as u8 as i8 as i64
+                    };
                     Ok(Self::typed_expr(
-                        ExprKind::CharLit(c),
+                        ExprKind::CharLit(value),
                         self.types.int_id,
                         token_pos,
                     ))
@@ -3712,14 +3725,19 @@ impl<'a> Parser<'a> {
                     TokenValue::WideChar(s)
                     | TokenValue::Utf16Char(s)
                     | TokenValue::Utf32Char(s) => {
-                        let c = self.parse_char_literal(s);
-                        let typ = match kind {
+                        // A prefixed constant takes the code point in its own
+                        // type, with no reference to plain `char`'s
+                        // signedness: `L'\x80'` is 128, not -128.
+                        let (code_point, _) = self.parse_char_literal_value(s);
+                        let (typ, value) = match kind {
                             // wchar_t is int on the targets here.
-                            TokenType::WideChar => self.types.int_id,
-                            TokenType::Utf16Char => self.types.ushort_id,
-                            _ => self.types.uint_id,
+                            TokenType::WideChar => (self.types.int_id, code_point as i32 as i64),
+                            TokenType::Utf16Char => {
+                                (self.types.ushort_id, code_point as u16 as i64)
+                            }
+                            _ => (self.types.uint_id, code_point as i64),
                         };
-                        Ok(Self::typed_expr(ExprKind::CharLit(c), typ, token_pos))
+                        Ok(Self::typed_expr(ExprKind::CharLit(value), typ, token_pos))
                     }
                     _ => Err(ParseError::new("invalid character token", token.pos)),
                 }
@@ -4220,24 +4238,34 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse a character literal string into a char
-    fn parse_char_literal(&self, s: &str) -> char {
+    /// Parse a character literal into its scalar value, and say whether that
+    /// value is a single *byte* or a *code point*.
+    ///
+    /// The distinction decides whether plain `char`'s signedness applies: a
+    /// byte is what a `char` object would hold, so `'\x80'` is subject to it
+    /// (C17 6.4.4.4p10), while a code point is not a byte at all and is
+    /// carried through unchanged.
+    fn parse_char_literal_value(&self, s: &str) -> (u32, bool) {
         if s.is_empty() {
-            return '\0';
+            return (0, false);
         }
 
         let chars: Vec<char> = s.chars().collect();
         if chars[0] == '\\' && chars.len() > 1 {
             match Self::parse_escape_sequence(&chars, 1).0 {
-                Escaped::Byte(b) | Escaped::SourceByte(b) => b as char,
+                Escaped::Byte(b) | Escaped::SourceByte(b) => (b as u32, false),
                 // `'\u00e9'` names a code point. gcc makes it a multi-character
                 // constant of its UTF-8 bytes, with a warning; c17 keeps the
                 // code point, which is the more useful answer for the one place
-                // this is used and costs nothing elsewhere.
-                Escaped::CodePoint(c) => c,
+                // this is used and costs nothing elsewhere. Truncating it to a
+                // byte here would lose that, and would flatten `'\U0001F600'`
+                // to zero.
+                Escaped::CodePoint(c) => (c as u32, true),
             }
         } else {
-            chars[0]
+            // The lexer stores one `char` per source byte, so an ordinary
+            // character is a byte even when the source is UTF-8.
+            (chars[0] as u32, false)
         }
     }
 

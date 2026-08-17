@@ -200,7 +200,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             ExprKind::IntLit(v) => Initializer::Int(*v as i128),
             ExprKind::Int128Lit(v) => Initializer::Int(*v),
             ExprKind::FloatLit(v) => Initializer::Float(*v),
-            ExprKind::CharLit(c) => Initializer::Int(*c as u8 as i8 as i128),
+            ExprKind::CharLit(c) => Initializer::Int(*c as i128),
 
             // String literal - for arrays, store as String; for pointers, create label reference
             ExprKind::StringLit(s) => {

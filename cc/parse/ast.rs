@@ -213,7 +213,20 @@ pub enum ExprKind {
     FloatLit(FloatVal),
 
     /// Character literal
-    CharLit(char),
+    /// A character constant, as the integer value it denotes.
+    ///
+    /// Converted once, in the parser, because the conversion depends on the
+    /// literal's *encoding prefix* and that is knowable only there. C17
+    /// 6.4.4.4p10 gives an unprefixed constant the value of a `char` object
+    /// holding the character, converted to `int` -- so it follows plain
+    /// `char`'s target signedness, and `'\x80'` is -128 where `char` is signed
+    /// and 128 where it is not. A prefixed constant instead takes the code
+    /// point in its own type.
+    ///
+    /// Five consumers used to re-derive this from a `char` with a hardcoded
+    /// `as u8 as i8`, which was right only for a narrow constant on a
+    /// signed-`char` target and wrong for every prefixed one.
+    CharLit(i64),
 
     /// String literal
     StringLit(String),

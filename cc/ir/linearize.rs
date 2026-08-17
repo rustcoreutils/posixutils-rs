@@ -4902,7 +4902,7 @@ impl<'a> Linearizer<'a> {
 
             ExprKind::CharLit(c) => {
                 let typ = self.expr_type(expr);
-                self.emit_const(*c as u8 as i8 as i128, typ)
+                self.emit_const(*c as i128, typ)
             }
 
             ExprKind::StringLit(s) => {

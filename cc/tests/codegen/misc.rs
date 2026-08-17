@@ -2165,6 +2165,14 @@ int main(void) {
 }
 
 /// Test: pointer arithmetic with char/short index uses correct sign extension
+///
+/// The negative-index sections say `signed char`, not plain `char`. Plain
+/// `char`'s signedness is implementation-defined (C17 6.2.5p15) and it is
+/// unsigned on aarch64, where `-2` is 254 and the subscript runs off the end
+/// of the array -- cross-gcc fails the plain-`char` form there too. What this
+/// test is about is whether a *signed* narrow index sign-extends, so it now
+/// says so. A plain-`char` index is still covered by the positive sections,
+/// where the two spellings agree.
 #[test]
 fn codegen_ptr_arith_narrow_index() {
     let code = r#"
@@ -2173,7 +2181,7 @@ int arr[10] = {0, 10, 20, 30, 40, 50, 60, 70, 80, 90};
 int main(void) {
     int *p = arr;
 
-    // Section 1: char index
+    // Section 1: char index (positive: signedness-independent)
     char ci = 3;
     if (*(p + ci) != 30) return 1;
 
@@ -2181,14 +2189,18 @@ int main(void) {
     short si = 5;
     if (*(p + si) != 50) return 2;
 
-    // Section 3: negative char index from middle of array
+    // Section 3: negative signed char index from middle of array
     int *mid = &arr[5];
-    char neg = -2;
+    signed char neg = -2;
     if (*(mid + neg) != 30) return 3;
 
     // Section 4: negative short index
     short sneg = -3;
     if (*(mid + sneg) != 20) return 4;
+
+    // Section 5: an unsigned narrow index must NOT sign-extend
+    unsigned char uc = 2;
+    if (*(p + uc) != 20) return 5;
 
     return 0;
 }
@@ -3258,10 +3270,24 @@ int main(void) {
     assert_eq!(compile_and_run("ternary_fptr_return_type", code, &[]), 0);
 }
 
-/// Regression test: character literals >= 0x80 must be sign-extended like GCC.
-/// '\x80' should produce -128 (signed char interpretation), not 128.
-/// This broke CPython's serialization module where enum { PROTO = '\x80' }
-/// didn't match switch cases on signed char values.
+/// A character constant takes its value from plain `char`, whose signedness is
+/// the target's.
+///
+/// C17 6.4.4.4p10: an unprefixed character constant has type `int` and the
+/// value of a `char` object holding the character, converted to `int`. So
+/// `'\x80'` is -128 where plain `char` is signed (x86-64) and **128** where it
+/// is not (aarch64), and `__CHAR_UNSIGNED__` says which. Both are asserted
+/// here rather than one, because the original test hardcoded the x86-64
+/// answers and would fail on aarch64 for a conforming compiler.
+///
+/// The dispatch half is the shape that matters: CPython's serialization module
+/// writes `enum { PROTO = '\x80' }` and switches on a `char` read from a
+/// buffer. Those two must agree, and they did not while the constant's value
+/// was computed signed and the `char` type had become unsigned.
+///
+/// The prefixed forms are covered too. They take the code point in their own
+/// type and never consult plain `char` -- `L'\x80'` is 128 on every target --
+/// which the shared conversion got wrong independently of any of this.
 #[test]
 fn codegen_char_literal_signedness() {
     let code = r#"
@@ -3281,16 +3307,34 @@ int main(void) {
     char none = 'N';
     char stop = '.';
 
+    /* The enumerator and the char read back from memory must agree, whatever
+       the target's plain-char signedness is. */
     if (dispatch(&proto) != 2) return 1;  /* PROTO must match */
     if (dispatch(&none) != 1) return 2;
     if (dispatch(&stop) != 3) return 3;
 
-    /* Verify char literal value */
-    int val = '\x80';
-    if (val != -128) return 4;  /* must be -128, not 128 */
-
+    /* The value itself, per target. */
+    int val  = '\x80';
     int val2 = '\xff';
-    if (val2 != -1) return 5;  /* must be -1, not 255 */
+#ifdef __CHAR_UNSIGNED__
+    if (val  != 128) return 4;
+    if (val2 != 255) return 5;
+    if ((int)proto != 128) return 6;
+#else
+    if (val  != -128) return 4;
+    if (val2 != -1) return 5;
+    if ((int)proto != -128) return 6;
+#endif
+
+    /* An ASCII constant is the same everywhere. */
+    if ('N' != 78 || '.' != 46) return 7;
+
+    /* A prefixed constant is the code point, on every target. */
+    if ((int)L'\x80' != 128) return 10;
+    if ((int)u'\x80' != 128) return 11;
+    if ((int)U'\x80' != 128) return 12;
+    if ((int)L'\xe9' != 233) return 13;
+    if ((int)L'e' != 101) return 14;
 
     return 0;
 }

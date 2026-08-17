@@ -1511,7 +1511,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             // to f64 here cannot lose a value the result would have kept.
             ExprKind::FloatLit(v) => Some(v.to_f64()),
             ExprKind::IntLit(v) => Some(*v as f64),
-            ExprKind::CharLit(c) => Some(*c as u8 as i8 as f64),
+            ExprKind::CharLit(c) => Some(*c as f64),
             ExprKind::Cast {
                 expr: inner,
                 cast_type,
@@ -1539,7 +1539,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         match &expr.kind {
             ExprKind::IntLit(val) => Some(*val as i128),
             ExprKind::Int128Lit(val) => Some(*val),
-            ExprKind::CharLit(c) => Some(*c as u8 as i8 as i128),
+            ExprKind::CharLit(c) => Some(*c as i128),
 
             ExprKind::Ident(symbol_id) => {
                 // Check if it's an enum constant
@@ -1853,7 +1853,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             // Exact: a `u128` mantissa has no more bits than the significand,
             // where `f64` would have rounded anything past the 53rd.
             ExprKind::IntLit(v) => Some(FloatVal::from_i128(*v as i128)),
-            ExprKind::CharLit(c) => Some(FloatVal::from_i128(*c as i64 as i128)),
+            ExprKind::CharLit(c) => Some(FloatVal::from_i128(*c as i128)),
 
             ExprKind::Unary { op, operand } => {
                 let val = self.eval_const_float_expr(operand)?;

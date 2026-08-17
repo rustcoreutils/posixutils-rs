@@ -89,13 +89,13 @@ fn test_float_literal() {
 #[test]
 fn test_char_literal() {
     let (expr, _types, _strings, _symbols) = parse_expr("'a'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('a')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(97)));
 }
 
 #[test]
 fn test_char_escape() {
     let (expr, _types, _strings, _symbols) = parse_expr("'\\n'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('\n')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(10)));
 }
 
 #[test]
@@ -114,91 +114,91 @@ fn test_string_literal() {
 #[test]
 fn test_char_escape_newline() {
     let (expr, _types, _strings, _symbols) = parse_expr("'\\n'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('\n')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(10)));
 }
 
 #[test]
 fn test_char_escape_tab() {
     let (expr, _types, _strings, _symbols) = parse_expr("'\\t'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('\t')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(9)));
 }
 
 #[test]
 fn test_char_escape_carriage_return() {
     let (expr, _types, _strings, _symbols) = parse_expr("'\\r'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('\r')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(13)));
 }
 
 #[test]
 fn test_char_escape_backslash() {
     let (expr, _types, _strings, _symbols) = parse_expr("'\\\\'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('\\')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(92)));
 }
 
 #[test]
 fn test_char_escape_single_quote() {
     let (expr, _types, _strings, _symbols) = parse_expr("'\\''").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('\'')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(39)));
 }
 
 #[test]
 fn test_char_escape_double_quote() {
     let (expr, _types, _strings, _symbols) = parse_expr("'\\\"'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('"')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(34)));
 }
 
 #[test]
 fn test_char_escape_bell() {
     let (expr, _types, _strings, _symbols) = parse_expr("'\\a'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('\x07')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(7)));
 }
 
 #[test]
 fn test_char_escape_backspace() {
     let (expr, _types, _strings, _symbols) = parse_expr("'\\b'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('\x08')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(8)));
 }
 
 #[test]
 fn test_char_escape_formfeed() {
     let (expr, _types, _strings, _symbols) = parse_expr("'\\f'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('\x0C')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(12)));
 }
 
 #[test]
 fn test_char_escape_vertical_tab() {
     let (expr, _types, _strings, _symbols) = parse_expr("'\\v'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('\x0B')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(11)));
 }
 
 #[test]
 fn test_char_escape_null() {
     let (expr, _types, _strings, _symbols) = parse_expr("'\\0'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('\0')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(0)));
 }
 
 #[test]
 fn test_char_escape_hex() {
     let (expr, _types, _strings, _symbols) = parse_expr("'\\x41'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('A')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(65)));
 }
 
 #[test]
 fn test_char_escape_hex_lowercase() {
     let (expr, _types, _strings, _symbols) = parse_expr("'\\x0a'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('\n')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(10)));
 }
 
 #[test]
 fn test_char_escape_octal() {
     let (expr, _types, _strings, _symbols) = parse_expr("'\\101'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('A'))); // octal 101 = 65 = 'A'
+    assert!(matches!(expr.kind, ExprKind::CharLit(65))); // octal 101 = 65 = 'A'
 }
 
 #[test]
 fn test_char_escape_octal_012() {
     let (expr, _types, _strings, _symbols) = parse_expr("'\\012'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('\n'))); // octal 012 = 10 = '\n'
+    assert!(matches!(expr.kind, ExprKind::CharLit(10))); // octal 012 = 10 = '\n'
 }
 
 // ========================================================================
@@ -209,28 +209,28 @@ fn test_char_escape_octal_012() {
 fn test_char_escape_ucn_short() {
     // \u00E9 is 'é' (U+00E9)
     let (expr, _types, _strings, _symbols) = parse_expr("'\\u00E9'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('é')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(233)));
 }
 
 #[test]
 fn test_char_escape_ucn_short_lowercase() {
     // \u00e9 is 'é' (U+00E9) - lowercase hex
     let (expr, _types, _strings, _symbols) = parse_expr("'\\u00e9'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('é')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(233)));
 }
 
 #[test]
 fn test_char_escape_ucn_long() {
     // \U00000041 is 'A' (U+0041)
     let (expr, _types, _strings, _symbols) = parse_expr("'\\U00000041'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('A')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(65)));
 }
 
 #[test]
 fn test_char_escape_ucn_long_emoji() {
     // \U0001F600 is '😀' (U+1F600)
     let (expr, _types, _strings, _symbols) = parse_expr("'\\U0001F600'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('😀')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(128512)));
 }
 
 #[test]
@@ -3911,8 +3911,12 @@ fn test_octal_escape_boundary() {
     // \377 is max valid octal for 8-bit char
     let (expr, _types, _strings, _symbols) = parse_expr("'\\377'").unwrap();
     match expr.kind {
+        // The byte the escape denotes. Not `ch` itself: an unprefixed
+        // constant takes plain `char`'s signedness, so this is -1 on a
+        // signed-`char` host and 255 on an unsigned one, and these tests
+        // run on both.
         ExprKind::CharLit(ch) => {
-            assert_eq!(ch as u32, 0o377); // 255 in decimal
+            assert_eq!(ch as u8, 0o377); // 255 in decimal
         }
         _ => panic!("Expected character constant, got {:?}", expr.kind),
     }
@@ -3923,7 +3927,7 @@ fn test_hex_escape_single_digit() {
     let (expr, _types, _strings, _symbols) = parse_expr("'\\x0'").unwrap();
     match expr.kind {
         ExprKind::CharLit(ch) => {
-            assert_eq!(ch as u32, 0);
+            assert_eq!(ch as u8, 0);
         }
         _ => panic!("Expected character constant, got {:?}", expr.kind),
     }
@@ -3934,7 +3938,7 @@ fn test_hex_escape_max() {
     let (expr, _types, _strings, _symbols) = parse_expr("'\\xff'").unwrap();
     match expr.kind {
         ExprKind::CharLit(ch) => {
-            assert_eq!(ch as u32, 0xff);
+            assert_eq!(ch as u8, 0xff);
         }
         _ => panic!("Expected character constant, got {:?}", expr.kind),
     }
@@ -5065,7 +5069,7 @@ fn test_builtin_expect_with_expression() {
 #[test]
 fn test_wide_char_literal() {
     let (expr, types, _, _) = parse_expr("L'A'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('A')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(65)));
     // wchar_t is int on most Unix systems
     assert_eq!(expr.typ, Some(types.int_id));
 }
@@ -5073,7 +5077,7 @@ fn test_wide_char_literal() {
 #[test]
 fn test_wide_char_escape() {
     let (expr, _, _, _) = parse_expr("L'\\n'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('\n')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(10)));
 }
 
 // ========================================================================

@@ -206,6 +206,71 @@ fn diagnostics_plain_vla_is_accepted() {
 }
 
 // ============================================================================
+// #C88 — a variably modified declaration at file scope (C17 6.7.6.2p2)
+// ============================================================================
+
+/// 6.7.6.2p2 confines an ordinary identifier with a variably modified type to
+/// block scope. c17 accepted one at file scope and sized it **zero**: the
+/// first file-scope declarator has its own array-dimension loop, separate from
+/// `parse_declarator`, and it mapped every non-constant dimension to
+/// `unwrap_or(0)` without recording a VLA or saying anything. So `int bad[n];`
+/// compiled, `sizeof bad` was 0, and every access ran off the end.
+///
+/// The three checks that already existed reached only the grouped-declarator,
+/// K&R and second-declarator paths, which is why a plain `int bad[n];` walked
+/// past all of them.
+#[test]
+fn diagnostics_variably_modified_declaration_at_file_scope_is_rejected() {
+    for (name, src) in [
+        ("fs_vla", "int n;\nint bad[n];\n"),
+        ("fs_vla_static", "int n;\nstatic int bad[n];\n"),
+        ("fs_vla_extern", "int n;\nextern int bad[n];\n"),
+        ("fs_vla_2d", "int n;\nint bad[n][2];\n"),
+        ("fs_vla_inner", "int n;\nint bad[2][n];\n"),
+        ("fs_vla_expr", "int n;\nint bad[n + 1];\n"),
+        ("fs_vla_call", "int f(void);\nint bad[f()];\n"),
+        // Second and later declarators were already caught; pinned so the
+        // first-declarator fix does not become the only path that checks.
+        ("fs_vla_second", "int n;\nint ok[2], bad[n];\n"),
+        // Through a `sizeof` of a variably modified type-name, which is not a
+        // constant expression either (#C52).
+        ("fs_vla_sizeof", "int n;\nint bad[sizeof(int[n])];\n"),
+    ] {
+        compile_expect_error(name, src, "file scope");
+    }
+}
+
+/// A size that is a constant but not positive is a different constraint
+/// (6.7.6.2p1: the size shall be greater than zero) and had the same cause --
+/// a negative dimension also fell to `unwrap_or(0)` and was silently accepted.
+#[test]
+fn diagnostics_negative_array_size_is_rejected() {
+    compile_expect_error("neg_array", "int bad[-1];\n", "negative");
+    compile_expect_error(
+        "neg_array_block",
+        "int main(void){ int bad[-1]; return bad[0]; }\n",
+        "negative",
+    );
+}
+
+/// The forms that must keep working: a constant size, an incomplete array at
+/// file scope (a tentative definition, and the `extern` form), a zero-length
+/// array (a GNU extension gcc accepts), and a VLA where it is legal.
+#[test]
+fn diagnostics_ordinary_file_scope_arrays_are_accepted() {
+    compile_expect_ok("fs_const", "int ok[3];\n");
+    compile_expect_ok("fs_incomplete", "int ok[];\n");
+    compile_expect_ok("fs_extern_incomplete", "extern int ok[];\n");
+    compile_expect_ok("fs_zero_len", "int ok[0];\n");
+    compile_expect_ok("fs_enum_size", "enum { N = 4 }; int ok[N];\n");
+    compile_expect_ok("fs_sizeof_size", "int ok[sizeof(int)];\n");
+    compile_expect_ok(
+        "block_vla_still_ok",
+        "int main(void){ int n = 4; int ok[n]; ok[0] = 1; return ok[0] - 1; }\n",
+    );
+}
+
+// ============================================================================
 // #L6 — call argument count (C99 6.5.2.2p2)
 // ============================================================================
 

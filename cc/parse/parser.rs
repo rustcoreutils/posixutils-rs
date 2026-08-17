@@ -3736,10 +3736,16 @@ impl Parser<'_> {
                 } else {
                     // It's an expression starting with * (e.g., [*ptr])
                     self.pos = saved_pos;
+                    let size_pos = self.current_pos();
                     let expr = self.parse_assignment_expr()?;
                     match self.eval_const_expr(&expr) {
                         Some(n) if n >= 0 => Some(n as usize),
-                        Some(_) => None,
+                        Some(_) => {
+                            return Err(ParseError::new(
+                                "size of array is negative".to_string(),
+                                size_pos,
+                            ));
+                        }
                         None => {
                             vla_exprs.push(expr);
                             None
@@ -3748,11 +3754,20 @@ impl Parser<'_> {
                 }
             } else {
                 // Parse constant expression for array size (C99 6.7.5.2)
+                let size_pos = self.current_pos();
                 let expr = self.parse_assignment_expr()?;
                 // Evaluate as integer constant expression
                 match self.eval_const_expr(&expr) {
                     Some(n) if n >= 0 => Some(n as usize),
-                    Some(_) => None, // Negative size is invalid
+                    // C17 6.7.6.2p1: the size shall be greater than zero.
+                    // This used to become `None`, i.e. an incomplete array,
+                    // so `int a[-1]` was accepted and silently sized zero.
+                    Some(_) => {
+                        return Err(ParseError::new(
+                            "size of array is negative".to_string(),
+                            size_pos,
+                        ));
+                    }
                     None => {
                         // Non-constant (VLA) - save expression for VLA handling
                         vla_exprs.push(expr);
@@ -4951,20 +4966,47 @@ impl Parser<'_> {
         let mut declarators = Vec::new();
 
         // Handle array - collect dimensions first, build type from right to left
+        //
+        // This is the first declarator of a file-scope declaration, which has
+        // its own dimension loop rather than going through `parse_declarator`.
+        // That is why the three "variable length arrays cannot have file
+        // scope" checks elsewhere in this function never saw a plain
+        // `int bad[n];`: they guard the grouped-declarator, K&R and
+        // second-declarator paths. Here every unusable size folded to
+        // `unwrap_or(0)`, so the declaration was accepted and sized zero.
         let mut var_type_id = typ_id;
         let mut dimensions: Vec<Option<usize>> = Vec::new();
         while self.is_special(b'[') {
             self.advance();
             let size = if self.is_special(b']') {
+                // No size given at all: an incomplete type, which is a
+                // tentative definition at file scope and legal.
                 None
             } else {
                 // Parse constant expression for array size (C99 6.7.5.2)
+                let size_pos = self.current_pos();
                 let arr_expr = self.parse_assignment_expr()?;
                 // Evaluate as integer constant expression
                 match self.eval_const_expr(&arr_expr) {
                     Some(n) if n >= 0 => Some(n as usize),
-                    Some(_) => None, // Negative size is invalid
-                    None => None,    // Non-constant (VLA) or invalid expression
+                    // C17 6.7.6.2p1: the size shall be greater than zero. Zero
+                    // itself is a GNU extension gcc accepts, so only a
+                    // negative size is refused here.
+                    Some(_) => {
+                        return Err(ParseError::new(
+                            "size of array is negative".to_string(),
+                            size_pos,
+                        ));
+                    }
+                    // A size expression that is not a constant makes the type
+                    // variably modified, which 6.7.6.2p2 confines to block
+                    // scope.
+                    None => {
+                        return Err(ParseError::new(
+                            "variable length arrays cannot have file scope".to_string(),
+                            size_pos,
+                        ));
+                    }
                 }
             };
             self.expect_special(b']')?;

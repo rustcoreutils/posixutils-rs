@@ -1954,6 +1954,59 @@ fn test_simple_program() {
     assert!(matches!(tu.items[0], ExternalDecl::FunctionDef(_)));
 }
 
+/// C17 6.7.6.2p2 confines a variably modified ordinary identifier to block
+/// scope, and 6.7.6.2p1 requires an array size to be greater than zero.
+///
+/// Both used to fall to `unwrap_or(0)` in the first file-scope declarator's
+/// own dimension loop -- a fourth copy of array-declarator parsing that the
+/// three existing file-scope checks do not guard -- so each was accepted and
+/// silently sized zero.
+#[test]
+fn test_file_scope_array_size_constraints() {
+    for src in [
+        "int n; int bad[n];",
+        "int n; static int bad[n];",
+        "int n; int bad[n][2];",
+        "int n; int bad[2][n];",
+        "int n; int ok[2], bad[n];",
+    ] {
+        match parse_tu(src) {
+            Err(e) => assert!(
+                e.to_string().contains("file scope"),
+                "{src}: wrong message: {e}"
+            ),
+            Ok(_) => panic!("{src} should have been rejected"),
+        }
+    }
+
+    for src in [
+        "int bad[-1];",
+        // Block scope reaches the same check through `parse_declarator`.
+        "int main(void){ int bad[-1]; return 0; }",
+    ] {
+        match parse_tu(src) {
+            Err(e) => assert!(e.to_string().contains("negative"), "{src}: {e}"),
+            Ok(_) => panic!("{src} should have been rejected"),
+        }
+    }
+
+    // The forms that must keep parsing: a constant bound, an incomplete array
+    // (a tentative definition), the GNU zero-length array, and a VLA where it
+    // is legal.
+    for src in [
+        "int ok[3];",
+        "int ok[];",
+        "extern int ok[];",
+        "int ok[0];",
+        "enum { N = 4 }; int ok[N];",
+        "int ok[sizeof(int)];",
+        "int f(int n, int a[n]);",
+        "int main(void){ int n = 4; int ok[n]; return ok[0]; }",
+    ] {
+        assert!(parse_tu(src).is_ok(), "{src} should parse");
+    }
+}
+
 #[test]
 fn test_global_var() {
     let (tu, _types, _strings, _symbols) = parse_tu("int x = 5;").unwrap();

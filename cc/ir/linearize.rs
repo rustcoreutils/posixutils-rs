@@ -1605,10 +1605,8 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Popcountll { arg }
             | ExprKind::Fabs { arg }
             | ExprKind::Fabsf { arg }
-            | ExprKind::Fabsl { arg }
             | ExprKind::Signbit { arg }
             | ExprKind::Signbitf { arg }
-            | ExprKind::Signbitl { arg }
             | ExprKind::FpTest { arg, .. } => self.is_pure_expr(arg),
 
             // Pure iff everything it reads is: the class codes are ordinary
@@ -4400,20 +4398,6 @@ impl<'a> Linearizer<'a> {
                 result
             }
 
-            ExprKind::Fabsl { arg } => {
-                // Long double fabs - treat as 64-bit for now
-                let arg_val = self.linearize_expr(arg);
-                let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::Fabs64)
-                    .with_target(result)
-                    .with_src(arg_val)
-                    .with_size(128) // long double is 128-bit on our targets
-                    .with_type(self.types.longdouble_id);
-                self.emit(insn);
-                result
-            }
-
             ExprKind::Signbit { arg } => {
                 let arg_val = self.linearize_expr(arg);
                 let result = self.alloc_pseudo();
@@ -4435,20 +4419,6 @@ impl<'a> Linearizer<'a> {
                     .with_target(result)
                     .with_src(arg_val)
                     .with_size(32)
-                    .with_type(self.types.int_id);
-                self.emit(insn);
-                result
-            }
-
-            ExprKind::Signbitl { arg } => {
-                // Long double signbit - use 64-bit version
-                let arg_val = self.linearize_expr(arg);
-                let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::Signbit64)
-                    .with_target(result)
-                    .with_src(arg_val)
-                    .with_size(128) // long double is 128-bit on our targets
                     .with_type(self.types.int_id);
                 self.emit(insn);
                 result
@@ -5148,10 +5118,8 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Memmove { .. }
             | ExprKind::Fabs { .. }
             | ExprKind::Fabsf { .. }
-            | ExprKind::Fabsl { .. }
             | ExprKind::Signbit { .. }
             | ExprKind::Signbitf { .. }
-            | ExprKind::Signbitl { .. }
             | ExprKind::FpTest { .. }
             | ExprKind::FpClassify { .. }
             | ExprKind::Unreachable

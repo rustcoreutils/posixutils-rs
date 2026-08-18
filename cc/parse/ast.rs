@@ -554,11 +554,6 @@ pub enum ExprKind {
         arg: Box<Expr>,
     },
 
-    /// __builtin_fabsl(x) - absolute value of long double
-    Fabsl {
-        arg: Box<Expr>,
-    },
-
     /// __builtin_signbit(x) - test sign bit of double, returns non-zero if negative
     Signbit {
         arg: Box<Expr>,
@@ -566,11 +561,6 @@ pub enum ExprKind {
 
     /// __builtin_signbitf(x) - test sign bit of float, returns non-zero if negative
     Signbitf {
-        arg: Box<Expr>,
-    },
-
-    /// __builtin_signbitl(x) - test sign bit of long double, returns non-zero if negative
-    Signbitl {
         arg: Box<Expr>,
     },
 
@@ -1685,18 +1675,9 @@ mod tests {
             _ => panic!("Expected Fabsf"),
         }
 
-        // Test Fabsl (long double)
-        let arg = Expr::typed_unpositioned(
-            ExprKind::FloatLit(FloatVal::from_f64(3.5)),
-            types.longdouble_id,
-        );
-        let fabsl = Expr::new_unpositioned(ExprKind::Fabsl { arg: Box::new(arg) });
-        match fabsl.kind {
-            ExprKind::Fabsl { arg } => {
-                assert!(matches!(arg.kind, ExprKind::FloatLit(_)));
-            }
-            _ => panic!("Expected Fabsl"),
-        }
+        // There is no `Fabsl` variant: `__builtin_fabsl` lowers to an ordinary
+        // call to `fabsl` (#C121), because the opcode it used to build takes a
+        // `double` and so read only the low eight bytes of an x87 value.
     }
 
     #[test]

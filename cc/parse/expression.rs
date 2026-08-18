@@ -3294,11 +3294,15 @@ impl<'a> Parser<'a> {
                 self.expect_special(b'(')?;
                 let arg = self.parse_assignment_expr()?;
                 self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::Fabsl { arg: Box::new(arg) },
-                    self.types.longdouble_id,
-                    token_pos,
-                ))
+                // Lowered as an ordinary call to `fabsl`, not as an opcode.
+                // The opcode it used to build was `Fabs64`, whose emitter moves
+                // its argument as a `double` and calls `fabs` -- so on x86-64 it
+                // read the low eight bytes of an 80-bit x87 value, its mantissa,
+                // and `__builtin_fabsl(-3.5L)` returned 2.5e-4932. A real call
+                // gets the long-double ABI from the call path, which already
+                // carries one for `__mulxc3`.
+                let ld = self.types.longdouble_id;
+                Ok(self.libm_call("fabsl", ld, &[ld], arg, token_pos))
             })()),
             // Signbit builtins - test sign bit of floats
             crate::kw::BUILTIN_ISNAN
@@ -3355,31 +3359,35 @@ impl<'a> Parser<'a> {
                 self.expect_special(b'(')?;
                 let arg = self.parse_assignment_expr()?;
                 self.expect_special(b')')?;
-                Ok(Self::typed_expr(
+                let raw = Self::typed_expr(
                     ExprKind::Signbit { arg: Box::new(arg) },
                     self.types.int_id,
                     token_pos,
-                ))
+                );
+                Ok(self.normalise_predicate(raw, token_pos))
             })()),
             crate::kw::BUILTIN_SIGNBITF => Some((|| {
                 self.expect_special(b'(')?;
                 let arg = self.parse_assignment_expr()?;
                 self.expect_special(b')')?;
-                Ok(Self::typed_expr(
+                let raw = Self::typed_expr(
                     ExprKind::Signbitf { arg: Box::new(arg) },
                     self.types.int_id,
                     token_pos,
-                ))
+                );
+                Ok(self.normalise_predicate(raw, token_pos))
             })()),
             crate::kw::BUILTIN_SIGNBITL => Some((|| {
                 self.expect_special(b'(')?;
                 let arg = self.parse_assignment_expr()?;
                 self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::Signbitl { arg: Box::new(arg) },
-                    self.types.int_id,
-                    token_pos,
-                ))
+                // Same reason as `__builtin_fabsl`: the `Signbit64` emitter
+                // calls `__signbit`, which takes a `double`, so it tested bit 63
+                // of an x87 mantissa -- the explicit integer bit, set for every
+                // normal value -- and answered "negative" for positive numbers.
+                let ld = self.types.longdouble_id;
+                let raw = self.libm_call("__signbitl", self.types.int_id, &[ld], arg, token_pos);
+                Ok(self.normalise_predicate(raw, token_pos))
             })()),
             crate::kw::BUILTIN_COMPLEX => Some((|| {
                 // __builtin_complex(real, imag) - construct complex value
@@ -4959,6 +4967,83 @@ impl<'a> Parser<'a> {
     /// registers, so declaring these as variadic-from-argument-zero -- which
     /// is what an empty parameter list means -- put `__snprintf_chk`'s buffer,
     /// length, flag and size on the stack, where it does not look for them.
+    /// Reduce a predicate to 0 or 1.
+    ///
+    /// C17 7.12.3.6 lets `signbit` answer with *any* nonzero value, and the
+    /// library entry points take it literally -- `__signbitf` returns 8,
+    /// `__signbit` 128 and `__signbitl` 512, each being the sign bit still in
+    /// place. All conforming, none matching gcc's 0/1, and the three did not
+    /// even agree with one another. Comparing against zero costs one
+    /// instruction and removes a gratuitous difference.
+    fn normalise_predicate(&mut self, raw: Expr, pos: Position) -> Expr {
+        let zero = Self::typed_expr(ExprKind::IntLit(0), self.types.int_id, pos);
+        Self::typed_expr(
+            ExprKind::Binary {
+                op: BinaryOp::Ne,
+                left: Box::new(raw),
+                right: Box::new(zero),
+            },
+            self.types.int_id,
+            pos,
+        )
+    }
+
+    /// Lower a one-argument math builtin to an ordinary call to the library
+    /// function that implements it, declaring that function if the translation
+    /// unit has not.
+    ///
+    /// Unlike `declare_chk_builtin`, the parameter types are *modelled*: that
+    /// one spells every parameter `unsigned long` because a pointer, a size and
+    /// a flag all classify the same way, which is false the moment an argument
+    /// is a `long double`.
+    ///
+    /// Falls back to the argument unchanged if the name cannot be interned,
+    /// which would mean `kw.rs` and this list had drifted apart.
+    fn libm_call(
+        &mut self,
+        name: &str,
+        ret_type: TypeId,
+        params: &[TypeId],
+        arg: Expr,
+        pos: Position,
+    ) -> Expr {
+        let Some(symbol_id) = self.declare_libm_function(name, ret_type, params) else {
+            return arg;
+        };
+        let func_type = self.symbols.get(symbol_id).typ;
+        let func_expr = Self::typed_expr(ExprKind::Ident(symbol_id), func_type, pos);
+        Self::typed_expr(
+            ExprKind::Call {
+                func: Box::new(func_expr),
+                args: vec![arg],
+            },
+            ret_type,
+            pos,
+        )
+    }
+
+    /// Declare `name` with a real prototype, reusing any existing declaration.
+    fn declare_libm_function(
+        &mut self,
+        name: &str,
+        ret_type: TypeId,
+        params: &[TypeId],
+    ) -> Option<SymbolId> {
+        let name_id = self.idents.lookup(name)?;
+        if let Some(existing) = self.symbols.lookup_id(name_id, Namespace::Ordinary) {
+            return Some(existing);
+        }
+        let func_type = self.types.intern(Type {
+            kind: TypeKind::Function,
+            base: Some(ret_type),
+            params: Some(params.to_vec()),
+            variadic: false,
+            ..Default::default()
+        });
+        let sym = Symbol::function(name_id, func_type, 0);
+        self.symbols.declare(sym).ok()
+    }
+
     fn declare_chk_builtin(&mut self, name: &str, ret_type: TypeId) -> Option<SymbolId> {
         // Pre-interned in `cc/kw.rs`; the identifier table is read-only here.
         let name_id = self.idents.lookup(name)?;

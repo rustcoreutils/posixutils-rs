@@ -2578,3 +2578,123 @@ fn diagnostics_ordinary_initializers_are_accepted() {
         compile_expect_ok(name, src);
     }
 }
+
+// === #C109 — declaration constraints (C17 6.7p3, 6.7.1p2, 6.7.9p5, 6.9.1p5) ===
+
+/// Four more constraints accepted in silence, each losing information rather
+/// than merely a message.
+///
+/// A repeated enumerator kept the first one's value. A repeated parameter left
+/// the second with no symbol at all, so every use of the name reached the
+/// first. `static static int x;` and `static extern int x;` were both taken,
+/// the modifier bits simply being OR-ed together. And `extern int e = 1;` at
+/// *block* scope declared a name with linkage and then defined it locally.
+#[test]
+fn diagnostics_repeated_declaration_parts_are_rejected() {
+    compile_expect_error(
+        "decl_dup_enumerator",
+        "enum A { X };\nenum B { X };\n",
+        "redeclaration of enumerator 'X'",
+    );
+    compile_expect_error(
+        "decl_enumerator_over_variable",
+        "int Y;\nenum A { Y };\n",
+        "redeclared as a different kind of symbol",
+    );
+    compile_expect_error(
+        "decl_variable_over_enumerator",
+        "enum A { Z };\nint Z;\n",
+        "redeclared as a different kind of symbol",
+    );
+    compile_expect_error(
+        "decl_dup_parameter",
+        "void f(int a, int a){ (void)a; }\n",
+        "redefinition of parameter 'a'",
+    );
+    compile_expect_error(
+        "decl_dup_parameter_third",
+        "void f(int a, int b, int a){ (void)a; (void)b; }\n",
+        "redefinition of parameter 'a'",
+    );
+    compile_expect_error(
+        "decl_static_static",
+        "static static int x;\n",
+        "duplicate 'static'",
+    );
+    compile_expect_error(
+        "decl_extern_extern",
+        "extern extern int x;\n",
+        "duplicate 'extern'",
+    );
+    compile_expect_error(
+        "decl_static_extern",
+        "static extern int x;\n",
+        "multiple storage classes",
+    );
+    compile_expect_error(
+        "decl_typedef_static",
+        "typedef static int T;\n",
+        "multiple storage classes",
+    );
+    compile_expect_error(
+        "decl_extern_init_block",
+        "void f(void){ extern int e = 1; (void)e; }\n",
+        "'extern' variable has an initializer",
+    );
+}
+
+/// At *file* scope the same `extern` spelling is a definition with external
+/// linkage, so gcc warns rather than rejecting -- the scope is the whole
+/// distinction.
+#[test]
+fn diagnostics_file_scope_extern_initializer_only_warns() {
+    compile_expect_warning(
+        "decl_extern_init_file",
+        "extern int e = 1;\n",
+        "'extern' variable has an initializer",
+    );
+}
+
+/// The accept side. `_Thread_local` may accompany `static` or `extern` in
+/// either order, so counting it as a storage class would reject ordinary
+/// thread-local declarations; a qualifier may repeat where a storage class may
+/// not; an enumerator may be shadowed in an inner scope; and an unnamed
+/// parameter is not a duplicate of another unnamed one.
+#[test]
+fn diagnostics_ordinary_declarations_are_accepted() {
+    for (name, src) in [
+        ("decl_thread_local_static", "_Thread_local static int x;\n"),
+        ("decl_static_thread_local", "static _Thread_local int x;\n"),
+        ("decl_extern_thread_local", "extern _Thread_local int x;\n"),
+        ("decl_const_const", "const const int x = 1;\n"),
+        ("decl_static_const", "static const int x = 1;\n"),
+        (
+            "decl_static_inline",
+            "static inline int f(void){ return 1; }\n",
+        ),
+        ("decl_unnamed_params", "void f(int, int);\n"),
+        (
+            "decl_named_prototype_and_definition",
+            "void f(int a, int b);\nvoid f(int a, int b){ (void)a; (void)b; }\n",
+        ),
+        (
+            "decl_register_param",
+            "void f(register int a){ (void)a; }\n",
+        ),
+        (
+            "decl_enumerator_shadowed",
+            "enum A { X };\nvoid f(void){ enum B { X }; (void)X; }\n",
+        ),
+        (
+            "decl_distinct_enumerators",
+            "enum A { P, Q };\nenum B { R, S };\n",
+        ),
+        ("decl_enumerator_used", "enum A { V };\nint q = V;\n"),
+        (
+            "decl_extern_then_local_decl",
+            "extern int e;\nvoid f(void){ extern int e; (void)e; }\n",
+        ),
+    ] {
+        compile_expect_ok(name, src);
+    }
+}

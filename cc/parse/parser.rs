@@ -88,6 +88,9 @@ struct SpecifierTally {
     /// the diagnostic that reports it against an incompatible data type.
     last_size: Option<(&'static str, Position)>,
     last_sign: Option<(&'static str, Position)>,
+    /// Storage-class specifiers, in source order. 6.7.1p2 permits at most one
+    /// -- `_Thread_local` excepted, which may accompany `static` or `extern`.
+    storage_classes: Vec<(&'static str, Position)>,
 }
 
 impl SpecifierTally {
@@ -116,6 +119,13 @@ impl SpecifierTally {
         }
     }
 
+    /// `_Thread_local` is deliberately not recorded: 6.7.1p2 lets it appear
+    /// with `static` or `extern`, and gcc accepts both orders, so counting it
+    /// would reject `static _Thread_local int x;`.
+    fn note_storage_class(&mut self, name: &'static str, pos: Position) {
+        self.storage_classes.push((name, pos));
+    }
+
     fn note_sign(&mut self, name: &'static str, pos: Position) {
         self.last_sign = Some((name, pos));
         if name == "signed" {
@@ -131,6 +141,20 @@ impl SpecifierTally {
     /// diagnostic (C17 5.1.1.3), and the parser recovers with the type it had
     /// already built, so one bad declaration does not cascade.
     fn check(&self) {
+        if let Some((second, pos)) = self.storage_classes.get(1) {
+            let first = self.storage_classes[0].0;
+            if first == *second {
+                diag::error_args(*pos, "duplicate '{0}'", &[second]);
+            } else {
+                diag::error_args(
+                    *pos,
+                    "multiple storage classes in declaration specifiers ('{0}' and '{1}')",
+                    &[first, second],
+                );
+            }
+            return;
+        }
+
         if let Some((second, pos)) = self.data_types.get(1) {
             diag::error_args(
                 *pos,
@@ -2381,6 +2405,17 @@ impl Parser<'_> {
 
                 // For incomplete array types, infer size from initializer
                 if let Some(ref init_expr) = init {
+                    // 6.7.9p5: an identifier declared `extern` at block scope
+                    // has linkage, so it refers to a definition elsewhere and
+                    // cannot carry one here. At *file* scope the same spelling
+                    // is a definition with external linkage, which gcc only
+                    // warns about -- hence the scope test.
+                    if base_type.modifiers.contains(TypeModifiers::EXTERN) {
+                        diag::error(
+                            init_expr.pos,
+                            &gettext("'extern' variable has an initializer"),
+                        );
+                    }
                     let old_type = typ;
                     typ = self.infer_array_size_from_init(typ, init_expr);
                     self.check_excess_initializers(typ, init_expr);
@@ -2516,22 +2551,27 @@ impl Parser<'_> {
                     modifiers |= TypeModifiers::VOLATILE;
                 }
                 crate::kw::STATIC => {
+                    tally.note_storage_class("static", self.current_pos());
                     self.advance();
                     modifiers |= TypeModifiers::STATIC;
                 }
                 crate::kw::EXTERN => {
+                    tally.note_storage_class("extern", self.current_pos());
                     self.advance();
                     modifiers |= TypeModifiers::EXTERN;
                 }
                 crate::kw::REGISTER => {
+                    tally.note_storage_class("register", self.current_pos());
                     self.advance();
                     modifiers |= TypeModifiers::REGISTER;
                 }
                 crate::kw::AUTO => {
+                    tally.note_storage_class("auto", self.current_pos());
                     self.advance();
                     modifiers |= TypeModifiers::AUTO;
                 }
                 crate::kw::TYPEDEF => {
+                    tally.note_storage_class("typedef", self.current_pos());
                     self.advance();
                     modifiers |= TypeModifiers::TYPEDEF;
                 }
@@ -2993,8 +3033,22 @@ impl Parser<'_> {
             return;
         };
         let existing = self.symbols.get(existing_id);
-        // Typedefs have their own check; a tag or enum constant is a different
-        // namespace or a different kind of thing entirely.
+        // An enumerator shares the ordinary name space with a variable, so
+        // declaring one over the other is 6.7p3 and gcc's own wording says
+        // so. The reverse direction -- an enumerator over a variable -- is
+        // caught where enumerators are bound. Without this arm `enum A { Z };
+        // int Z;` compiled and the two names collided silently.
+        if existing.kind == SymbolKind::EnumConstant && existing.scope_depth == self.symbols.depth()
+        {
+            let spelled = self.idents.get_opt(name).unwrap_or("").to_string();
+            diag::error_args(
+                pos,
+                "'{0}' redeclared as a different kind of symbol",
+                &[&spelled],
+            );
+            return;
+        }
+        // Typedefs have their own check; a tag is a different namespace.
         if !matches!(
             existing.kind,
             SymbolKind::Variable | SymbolKind::Function | SymbolKind::Parameter
@@ -3256,8 +3310,31 @@ impl Parser<'_> {
                 // Register enum constant in symbol table (Ordinary namespace)
                 let sym =
                     Symbol::enum_constant(name, value, self.types.int_id, self.symbols.depth());
-                if let Ok(id) = self.symbols.declare(sym) {
-                    constant_syms.push(id);
+                // 6.7p3: an enumerator shares the ordinary name space, so a
+                // repeat -- of another enumerator or of a variable -- is a
+                // constraint violation. `declare` already detects it; the
+                // `Err` was being dropped, so `enum A { X }; enum B { X };`
+                // compiled and the second `X` silently kept the first's value.
+                match self.symbols.declare(sym) {
+                    Ok(id) => constant_syms.push(id),
+                    Err(_) => {
+                        let spelled = self.idents.get_opt(name).unwrap_or("").to_string();
+                        let existing = self.symbols.lookup(name, Namespace::Ordinary);
+                        let redeclared = existing.is_some_and(|e| !e.is_enum_constant());
+                        if redeclared {
+                            diag::error_args(
+                                enum_pos,
+                                "'{0}' redeclared as a different kind of symbol",
+                                &[&spelled],
+                            );
+                        } else {
+                            diag::error_args(
+                                enum_pos,
+                                "redeclaration of enumerator '{0}'",
+                                &[&spelled],
+                            );
+                        }
+                    }
                 }
 
                 if self.is_special(b',') {
@@ -4320,9 +4397,23 @@ impl Parser<'_> {
             // (C99 6.9.1p9: parameters are in scope for VLA sizes)
             if let Some(name) = name_opt {
                 let sym = Symbol::parameter(name, typ_id, self.symbols.depth());
-                if let Ok(sym_id) = self.symbols.declare(sym) {
-                    if let Some(last) = params.last_mut() {
-                        last.symbol = Some(sym_id);
+                // 6.9.1p5: no two parameters may share a name. `declare`
+                // reports it and the `Err` was dropped, leaving the second
+                // parameter with no symbol at all -- so the function compiled
+                // and every use of the name reached the first one.
+                match self.symbols.declare(sym) {
+                    Ok(sym_id) => {
+                        if let Some(last) = params.last_mut() {
+                            last.symbol = Some(sym_id);
+                        }
+                    }
+                    Err(_) => {
+                        let spelled = self.idents.get_opt(name).unwrap_or("").to_string();
+                        diag::error_args(
+                            self.current_pos(),
+                            "redefinition of parameter '{0}'",
+                            &[&spelled],
+                        );
                     }
                 }
             }
@@ -5177,6 +5268,15 @@ impl Parser<'_> {
         if let Some(ref init_expr) = init {
             let old_type = var_type_id;
             var_type_id = self.infer_array_size_from_init(var_type_id, init_expr);
+            // 6.7.9p5 again, at file scope: the declaration *is* a
+            // definition with external linkage, so `extern` adds nothing
+            // and gcc warns rather than rejecting.
+            if base_type.modifiers.contains(TypeModifiers::EXTERN) {
+                diag::warning(
+                    init_expr.pos,
+                    &gettext("'extern' variable has an initializer"),
+                );
+            }
             self.check_excess_initializers(var_type_id, init_expr);
             self.check_initializer_types(var_type_id, init_expr);
 
@@ -5280,6 +5380,15 @@ impl Parser<'_> {
             if let Some(ref init_expr) = decl_init {
                 let old_type = decl_type;
                 decl_type = self.infer_array_size_from_init(decl_type, init_expr);
+                // 6.7.9p5 again, at file scope: the declaration *is* a
+                // definition with external linkage, so `extern` adds nothing
+                // and gcc warns rather than rejecting.
+                if base_type.modifiers.contains(TypeModifiers::EXTERN) {
+                    diag::warning(
+                        init_expr.pos,
+                        &gettext("'extern' variable has an initializer"),
+                    );
+                }
                 self.check_excess_initializers(decl_type, init_expr);
                 self.check_initializer_types(decl_type, init_expr);
 

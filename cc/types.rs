@@ -1543,17 +1543,15 @@ impl TypeTable {
             TypeKind::Array => {
                 let elem_size = typ.base.map(|b| self.size_bits(b)).unwrap_or(0) as u64;
                 let count = typ.array_size.unwrap_or(0) as u64;
-                let total = elem_size.saturating_mul(count);
-                if total > u32::MAX as u64 {
-                    // Array too large for u32 size_bits; cap at u32::MAX
-                    // (size_bytes via size_bits/8 still works for reasonable sizes)
-                    u32::MAX
-                } else {
-                    total as u32
-                }
+                // The parser refuses an extent whose product exceeds
+                // `MAX_OBJECT_BYTES`, so the saturation below is unreachable
+                // for a type that came from source. It stays as a floor
+                // rather than an overflow.
+                elem_size.saturating_mul(count).min(u32::MAX as u64) as u32
             }
             TypeKind::Struct | TypeKind::Union => {
-                (typ.composite.as_ref().map(|c| c.size).unwrap_or(0) * 8) as u32
+                let bytes = typ.composite.as_ref().map(|c| c.size).unwrap_or(0) as u64;
+                bytes.saturating_mul(8).min(u32::MAX as u64) as u32
             }
             TypeKind::Function => 0,
             // An enumeration is as wide as the integer type it was found to
@@ -1563,6 +1561,14 @@ impl TypeTable {
             TypeKind::VaList => self.va_list_size_bits(),
         }
     }
+
+    /// The largest object c17 can describe, in bytes.
+    ///
+    /// `size_bits` answers in a `u32`, so nothing wider than `u32::MAX` bits
+    /// has a representable size. Exceeding it used to saturate in silence and
+    /// give `sizeof` a wrong answer for the whole type; the parser diagnoses
+    /// it now, and this is the bound it enforces.
+    pub const MAX_OBJECT_BYTES: usize = (u32::MAX / 8) as usize;
 
     /// Get the size of a type in bytes
     pub fn size_bytes(&self, id: TypeId) -> usize {

@@ -2320,6 +2320,40 @@ impl Parser<'_> {
     /// fields (C17 6.7.9p20) -- so `int a[][2] = {1,2,3,4}` names two rows,
     /// not four. Counting list elements instead sized the object at twice
     /// what the linearizer then filled.
+    /// Derive an array type, refusing an extent the compiler cannot describe.
+    ///
+    /// `TypeTable::size_bits` answers in a `u32`, so an object wider than
+    /// `u32::MAX` bits has no representable size. That used to saturate in
+    /// silence: `char big[5000000000];` reported `sizeof` 536870911 with no
+    /// diagnostic anywhere. The bound is enforced here, where the element
+    /// type is known, so the outer dimension of a multi-dimensional array is
+    /// measured against an inner one that is already within it.
+    fn derive_array_type(
+        &mut self,
+        elem: TypeId,
+        size: Option<usize>,
+        pos: Position,
+    ) -> Result<TypeId, ParseError> {
+        if let Some(count) = size {
+            let total = (count as u128) * (self.types.size_bytes(elem) as u128);
+            if total > TypeTable::MAX_OBJECT_BYTES as u128 {
+                return Err(ParseError::new(
+                    format!(
+                        "size of array exceeds the maximum object size of {} bytes",
+                        TypeTable::MAX_OBJECT_BYTES
+                    ),
+                    pos,
+                ));
+            }
+        }
+        Ok(self.types.intern(Type {
+            kind: TypeKind::Array,
+            base: Some(elem),
+            array_size: size,
+            ..Default::default()
+        }))
+    }
+
     pub(crate) fn array_size_from_elements(
         &self,
         elements: &[InitElement],
@@ -3547,6 +3581,7 @@ impl Parser<'_> {
     /// struct-or-union-specifier: ('struct'|'union') identifier? '{' struct-declaration-list? '}'
     ///                          | ('struct'|'union') identifier
     pub(crate) fn parse_struct_or_union_specifier(&mut self, is_union: bool) -> ParseResult<Type> {
+        let specifier_pos = self.current_pos();
         self.advance(); // consume 'struct' or 'union'
 
         // Parse __attribute__ between 'struct' keyword and tag name
@@ -3790,6 +3825,19 @@ impl Parser<'_> {
                 size
             };
 
+            // The same bound `derive_array_type` enforces: a member list can
+            // reach it even when no single member does.
+            if size > TypeTable::MAX_OBJECT_BYTES {
+                return Err(ParseError::new(
+                    format!(
+                        "size of {} exceeds the maximum object size of {} bytes",
+                        if is_union { "union" } else { "struct" },
+                        TypeTable::MAX_OBJECT_BYTES
+                    ),
+                    specifier_pos,
+                ));
+            }
+
             let composite = CompositeType {
                 tag,
                 members,
@@ -3978,9 +4026,10 @@ impl Parser<'_> {
 
         // Handle array declarators - collect all dimensions first
         // Also track VLA expressions (non-constant size) for each dimension
-        let mut dimensions: Vec<Option<usize>> = Vec::new();
+        let mut dimensions: Vec<(Option<usize>, Position)> = Vec::new();
         let mut vla_exprs: Vec<Expr> = Vec::new();
         while self.is_special(b'[') {
+            let dim_pos = self.current_pos();
             self.advance();
 
             // Parse optional qualifiers and static (C99 6.7.5.3)
@@ -4059,7 +4108,7 @@ impl Parser<'_> {
                 }
             };
             self.expect_special(b']')?;
-            dimensions.push(size);
+            dimensions.push((size, dim_pos));
         }
 
         // Handle function declarators: void (*fp)(int, char)
@@ -4116,14 +4165,8 @@ impl Parser<'_> {
 
             // Apply array dimensions to result type
             // For int *(*q)[3]: result is Pointer(int) -> Array(3, Pointer(int))
-            for size in dimensions.into_iter().rev() {
-                let arr_type = Type {
-                    kind: TypeKind::Array,
-                    base: Some(result_type_id),
-                    array_size: size,
-                    ..Default::default()
-                };
-                result_type_id = self.types.intern(arr_type);
+            for (size, pos) in dimensions.into_iter().rev() {
+                result_type_id = self.derive_array_type(result_type_id, size, pos)?;
             }
 
             // Substitute into inner declarator
@@ -4151,14 +4194,8 @@ impl Parser<'_> {
 
             // Then apply array dimensions
             // For char *arr[3]: result_type is char*, suffix [3] -> Array(3, char*)
-            for size in dimensions.into_iter().rev() {
-                let arr_type = Type {
-                    kind: TypeKind::Array,
-                    base: Some(result_type_id),
-                    array_size: size,
-                    ..Default::default()
-                };
-                result_type_id = self.types.intern(arr_type);
+            for (size, pos) in dimensions.into_iter().rev() {
+                result_type_id = self.derive_array_type(result_type_id, size, pos)?;
             }
 
             // Apply function parameters if present (for function declarators)
@@ -5318,8 +5355,9 @@ impl Parser<'_> {
         // second-declarator paths. Here every unusable size folded to
         // `unwrap_or(0)`, so the declaration was accepted and sized zero.
         let mut var_type_id = typ_id;
-        let mut dimensions: Vec<Option<usize>> = Vec::new();
+        let mut dimensions: Vec<(Option<usize>, Position)> = Vec::new();
         while self.is_special(b'[') {
+            let dim_pos = self.current_pos();
             self.advance();
             let size = if self.is_special(b']') {
                 // No size given at all: an incomplete type, which is a
@@ -5353,7 +5391,7 @@ impl Parser<'_> {
                 }
             };
             self.expect_special(b']')?;
-            dimensions.push(size);
+            dimensions.push((size, dim_pos));
         }
         // Build type from right to left (innermost dimension first).
         //
@@ -5362,14 +5400,8 @@ impl Parser<'_> {
         // from the GNU zero-length `int a[0];`, so the two declarator paths
         // disagreed about what "incomplete" looks like and `sizeof a` could
         // not tell them apart.
-        for size in dimensions.into_iter().rev() {
-            let arr_type = Type {
-                kind: TypeKind::Array,
-                base: Some(var_type_id),
-                array_size: size,
-                ..Default::default()
-            };
-            var_type_id = self.types.intern(arr_type);
+        for (size, pos) in dimensions.into_iter().rev() {
+            var_type_id = self.derive_array_type(var_type_id, size, pos)?;
         }
 
         // Propagate storage class modifiers from base type to derived array type

@@ -18,7 +18,9 @@
 // everything.
 //
 
-use crate::common::{compile_expect_error, compile_expect_ok, compile_expect_warning};
+use crate::common::{
+    compile_and_run, compile_expect_error, compile_expect_ok, compile_expect_warning,
+};
 
 // ============================================================================
 // #L1 — implicit int (C99 6.7.2p2)
@@ -3349,4 +3351,95 @@ fn diagnostics_representable_enumerators_are_accepted() {
     ] {
         compile_expect_ok(name, src);
     }
+}
+
+/// An object too large for the compiler to describe is diagnosed, not capped.
+///
+/// `TypeTable::size_bits` answers in a `u32`, and an extent past that used to
+/// saturate in silence: `char big[5000000000];` compiled and reported `sizeof`
+/// 536870911. gcc accepts these — its own limit is far higher — so this is an
+/// implementation limit rather than a constraint violation, and the message
+/// says so. Recorded at #C122.
+#[test]
+fn diagnostics_object_larger_than_the_compiler_can_describe() {
+    for (name, src) in [
+        (
+            "array_five_billion",
+            "char big[5000000000L];\nint main(void){ return 0; }\n",
+        ),
+        (
+            "array_just_over",
+            "char big[536870912];\nint main(void){ return 0; }\n",
+        ),
+        (
+            "array_of_int",
+            "int big[2000000000L];\nint main(void){ return 0; }\n",
+        ),
+        (
+            "array_two_dimensions",
+            "char big[16385][32768];\nint main(void){ return 0; }\n",
+        ),
+        (
+            "array_block_scope",
+            "int main(void){ static char big[5000000000L]; return big[0]; }\n",
+        ),
+        (
+            "array_typedef",
+            "typedef char T[5000000000L];\nint main(void){ return 0; }\n",
+        ),
+    ] {
+        compile_expect_error(name, src, "exceeds the maximum object size");
+    }
+
+    // A member list can reach the bound even when no single member does.
+    compile_expect_error(
+        "struct_sum_of_members",
+        "struct S { char a[400000000]; char b[400000000]; } s;\nint main(void){ return 0; }\n",
+        "size of struct exceeds the maximum object size",
+    );
+}
+
+/// The largest object that *is* describable keeps working, and `sizeof` agrees
+/// with gcc for it — the bound has to be a diagnostic at the edge, not a cap
+/// that moved.
+#[test]
+fn diagnostics_largest_describable_object_is_accepted() {
+    for (name, src) in [
+        (
+            "array_at_the_bound",
+            "char big[536870911];\nint main(void){ return 0; }\n",
+        ),
+        (
+            "array_of_int_at_the_bound",
+            "int big[134217727];\nint main(void){ return 0; }\n",
+        ),
+        (
+            "array_two_dimensions",
+            "char big[16384][16384];\nint main(void){ return 0; }\n",
+        ),
+        (
+            "struct_under_the_bound",
+            "struct S { char a[100000000]; char b[100000000]; } s;\nint main(void){ return 0; }\n",
+        ),
+    ] {
+        compile_expect_ok(name, src);
+    }
+
+    // And the sizes are the ones gcc reports. These all sit under the bound,
+    // so they were right before the diagnostic existed too; the assertion is
+    // here so that moving the bound cannot quietly move an answer with it.
+    assert_eq!(
+        compile_and_run(
+            "object_sizes_are_exact",
+            "char a[536870911];\n\
+             struct S { char x[100000000]; char y[100000000]; } s;\n\
+             int main(void) {\n\
+             if (sizeof a != 536870911UL) return 1;\n\
+             if (sizeof s != 200000000UL) return 2;\n\
+             return 0;\n\
+             }\n",
+            &[],
+        ),
+        0
+    );
 }

@@ -217,9 +217,26 @@ impl SysVAmd64Abi {
         if let Some(ref composite) = typ.composite {
             for member in &composite.members {
                 let field_ty = member.typ;
-                let field_size = types.size_bits(field_ty);
-                let field_start = member.offset as u32 * 8; // Convert byte offset to bits
-                let field_end = field_start + field_size;
+                // A bit-field occupies the bits it was allocated, not the width
+                // of the type it was declared with. Walking the declared width
+                // let a bit-field reach into an eightbyte it has no bits in and
+                // merge INTEGER over the class already there: `struct { float f;
+                // int :0; }` was passed in a general register where gcc uses
+                // %xmm0, so a gcc caller's 1.5 arrived as 1.4e-45. A zero-width
+                // bit-field allocates nothing at all -- 6.7.2.1p12 gives it only
+                // an effect on layout -- so it contributes no class, which is
+                // also gcc's rule since 12.1.
+                let (field_start, field_end) = match (member.bit_width, member.bit_offset) {
+                    (Some(0), _) => continue,
+                    (Some(width), Some(bit_offset)) => {
+                        let start = member.offset as u32 * 8 + bit_offset;
+                        (start, start + width)
+                    }
+                    _ => {
+                        let start = member.offset as u32 * 8;
+                        (start, start + types.size_bits(field_ty))
+                    }
+                };
 
                 // Check if field overlaps this eightbyte
                 if field_start < eightbyte_end && field_end > eightbyte_start {

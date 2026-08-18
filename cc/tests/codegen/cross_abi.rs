@@ -1555,3 +1555,77 @@ int uint_lt(unsigned a, unsigned b)  { return a < b; }
         "aarch64: a signed int comparison must stay signed:\n{i}"
     );
 }
+
+/// A zero-width bit-field allocates nothing, so it must not change how the
+/// aggregate around it is passed (#C103).
+///
+/// Both ABIs were reading a bit-field member's *declared type* width. On
+/// System V that let `int :0` at offset 4 claim bits 32..64 of the first
+/// eightbyte and merge INTEGER over the SSE class the `float` had put there,
+/// so `struct { float f; int :0; }` travelled in a general-purpose register
+/// where gcc uses `%xmm0`. On AAPCS64 the zero-width member was simply a
+/// non-floating field, which disqualified the struct from being an HFA, so the
+/// same type went in `x0` where gcc uses `s0`. Both are silent ABI breaks
+/// against any gcc-compiled object: a caller's `1.5f` arrived as `1.4e-45`.
+///
+/// The claim is that the bit-field changes *nothing*, so the assertion is that
+/// each function's body is byte-identical to the same struct without it. A
+/// positive check on the reference keeps the comparison honest -- two functions
+/// that were both wrong in the same way would otherwise agree. And a bit-field
+/// of non-zero width is a real integer member that still disqualifies the
+/// aggregate, which is what stops a fix from ignoring every bit-field.
+#[test]
+fn cross_abi_zero_width_bitfield_does_not_change_argument_class() {
+    let src = r#"
+        struct PlainF { float f; };
+        struct ZwF    { float f; int :0; };
+        struct ZwFR   { int :0; float f; };
+        struct PlainD { double f; };
+        struct ZwD    { double f; int :0; };
+        struct Mixed  { float f; int b:3; };
+
+        float take_plain_f(struct PlainF v) { return v.f; }
+        float take_zw_f(struct ZwF v)       { return v.f; }
+        float take_zw_f_r(struct ZwFR v)    { return v.f; }
+        double take_plain_d(struct PlainD v){ return v.f; }
+        double take_zw_d(struct ZwD v)      { return v.f; }
+        float take_mixed(struct Mixed v)    { return v.f; }
+    "#;
+
+    for (triple, fp_arg) in [(AARCH64_LINUX, "s0"), (X86_64_LINUX, "%xmm0")] {
+        let asm = asm_for("zero_width_bitfield_class", triple, src);
+
+        // The reference really must take its argument in a floating-point
+        // register, or the comparisons below prove nothing.
+        let plain_f = body_of(&asm, "take_plain_f");
+        assert!(
+            plain_f.contains(fp_arg),
+            "{triple}: a lone float should arrive in {fp_arg}:\n{plain_f}"
+        );
+
+        for name in ["take_zw_f", "take_zw_f_r"] {
+            assert_eq!(
+                body_of(&asm, name).replace(name, "REF"),
+                plain_f.replace("take_plain_f", "REF"),
+                "{triple}: {name} differs from the same struct without the \
+                 zero-width bit-field"
+            );
+        }
+        let plain_d = body_of(&asm, "take_plain_d");
+        assert_eq!(
+            body_of(&asm, "take_zw_d").replace("take_zw_d", "REF"),
+            plain_d.replace("take_plain_d", "REF"),
+            "{triple}: a zero-width bit-field changed how a double is passed"
+        );
+
+        // A bit-field with bits in it is an ordinary integer member, so this
+        // aggregate is *not* homogeneous and must not look like the reference.
+        let mixed = body_of(&asm, "take_mixed");
+        assert_ne!(
+            mixed.replace("take_mixed", "REF"),
+            plain_f.replace("take_plain_f", "REF"),
+            "{triple}: a non-zero-width bit-field must still disqualify the \
+             aggregate:\n{mixed}"
+        );
+    }
+}

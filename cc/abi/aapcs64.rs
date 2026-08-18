@@ -112,7 +112,16 @@ impl Aapcs64Abi {
 
         // For structs, check all fields
         let composite = typ.composite.as_ref()?;
-        if composite.members.is_empty() || composite.members.len() > MAX_HFA_ELEMENTS as usize {
+        // A zero-width bit-field allocates nothing -- 6.7.2.1p12 gives it only
+        // an effect on layout -- so it is not a member for the purpose of
+        // AAPCS64 5.9.5 and must not stop the aggregate being homogeneous.
+        // Counting it did: `struct { float f; int :0; }` was passed in a
+        // general register where gcc passes it in `s0`, so a gcc caller's 1.5f
+        // was read as a bit pattern. A bit-field of non-zero width is a real
+        // integer member and still disqualifies the struct, as in gcc.
+        let members = || composite.members.iter().filter(|m| m.bit_width != Some(0));
+        let member_count = members().count();
+        if member_count == 0 || member_count > MAX_HFA_ELEMENTS as usize {
             return None;
         }
 
@@ -133,7 +142,7 @@ impl Aapcs64Abi {
             };
         };
 
-        for member in &composite.members {
+        for member in members() {
             let field_ty = member.typ;
             let field_kind = types.kind(field_ty);
 

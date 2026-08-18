@@ -9176,3 +9176,44 @@ int main(void) {
         0
     );
 }
+
+/// The *values* of the address differences #C101 made compilable.
+///
+/// Acceptance alone would be satisfied by folding to any number, and the two
+/// unit conventions are easy to swap: `ptr - ptr` counts elements (6.5.6p9)
+/// while a subtraction of two addresses already cast to an integer counts
+/// bytes. Each row is checked against the answer gcc gives.
+#[test]
+fn codegen_static_address_difference() {
+    let code = r#"
+int a[6];
+struct S { int x; double y; char z; };
+struct S s;
+struct I { int p; int q; };
+struct O { int head; struct I in; };
+struct O o;
+int q;
+
+long  d_elems     = &a[4] - &a[1];        /* elements: 3       */
+long  d_decay     = (a + 5) - a;          /* elements: 5       */
+long  d_negative  = &a[0] - &a[3];        /* elements: -3      */
+long  d_bytes     = (char *)&s.z - (char *)&s.x;
+unsigned long d_zero = (unsigned long)&q - (unsigned long)&q;
+long  d_nested    = (char *)&o.in.q - (char *)&o.head;
+long  d_selfsame  = &a[2] - &a[2];
+
+int main(void) {
+    if (d_elems    !=  3) return 1;
+    if (d_decay    !=  5) return 2;
+    if (d_negative != -3) return 3;
+    /* offsetof(struct S, z) - offsetof(struct S, x) */
+    if (d_bytes    != (long)__builtin_offsetof(struct S, z)) return 4;
+    if (d_zero     !=  0) return 5;
+    if (d_nested   != (long)__builtin_offsetof(struct O, in)
+                    + (long)__builtin_offsetof(struct I, q)) return 6;
+    if (d_selfsame !=  0) return 7;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("static_address_difference", code, &[]), 0);
+}

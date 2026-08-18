@@ -2080,3 +2080,69 @@ fn diagnostics_incompatible_array_pointers_are_still_diagnosed() {
         "incompatible pointer type",
     );
 }
+
+// === #C101 — an address difference within one object is a constant (C17 6.6) ===
+
+/// gcc folds the difference of two addresses into the *same* object, and both
+/// `&a[2] - &a[0]` and `(char *)&s.b - (char *)&s.a` are ordinary idioms. c17
+/// rejected every one of them, and reported the first at line 0 with no column.
+///
+/// The accept side matters more than the reject side here: this finding is a
+/// *false rejection*, so a fix that merely stopped diagnosing would pass a
+/// reject-only test while folding to nonsense. `codegen_static_address_difference`
+/// checks the values.
+#[test]
+fn diagnostics_address_differences_within_one_object_are_accepted() {
+    compile_expect_ok("adiff_array", "int a[4];\nlong d = &a[2] - &a[0];\n");
+    compile_expect_ok("adiff_decay", "int a[4];\nlong d = (a + 2) - a;\n");
+    compile_expect_ok(
+        "adiff_member",
+        "struct S { int a; int b; };\nstruct S s;\nlong d = (char *)&s.b - (char *)&s.a;\n",
+    );
+    compile_expect_ok(
+        "adiff_cast",
+        "int x;\nunsigned long m = (unsigned long)&x - (unsigned long)&x;\n",
+    );
+    compile_expect_ok(
+        "adiff_nested",
+        "struct I { int p; int q; };\nstruct O { int head; struct I in; };\nstruct O o;\n\
+         long d = (char *)&o.in.q - (char *)&o.head;\n",
+    );
+}
+
+/// The distance between two *different* objects is not known until they are
+/// laid out, so it is not a constant and gcc rejects it. Without these the fix
+/// could pass by folding any subtraction it could reach a symbol through --
+/// including one that reads two ordinary variables, which is no kind of
+/// constant at all.
+#[test]
+fn diagnostics_address_differences_across_objects_are_rejected() {
+    compile_expect_error(
+        "adiff_two_arrays",
+        "int a[4];\nint b[4];\nlong d = &a[0] - &b[0];\n",
+        "constant",
+    );
+    compile_expect_error(
+        "adiff_two_casts",
+        "int x;\nint y;\nunsigned long m = (unsigned long)&x - (unsigned long)&y;\n",
+        "constant",
+    );
+    compile_expect_error(
+        "adiff_two_objects",
+        "struct S { int a; };\nstruct S s;\nstruct S t;\nlong d = (char *)&t.a - (char *)&s.a;\n",
+        "constant",
+    );
+    // Two variables read for their values, which merely happens to be spelled
+    // as a subtraction.
+    compile_expect_error(
+        "adiff_two_vars",
+        "int v;\nint w;\nlong d = v - w;\n",
+        "constant",
+    );
+    // Two pointer *objects*, whose values are not known either.
+    compile_expect_error(
+        "adiff_two_ptrs",
+        "int *p;\nint *q;\nlong d = p - q;\n",
+        "constant",
+    );
+}

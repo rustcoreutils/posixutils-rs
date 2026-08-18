@@ -560,6 +560,10 @@ pub struct Parser<'a> {
     /// Explicit alignment from _Alignas in current declaration
     /// Cleared after each declaration is parsed.
     pending_alignas: Option<u32>,
+    /// File-scope object definitions whose type was incomplete when parsed.
+    /// Judged at end of translation unit -- see
+    /// [`Self::check_deferred_incomplete_definitions`].
+    tentative_definitions: Vec<(TypeId, Position)>,
     /// Alignment from an attribute written *after* a declarator.
     ///
     /// Kept apart from `pending_alignas` because the two have different
@@ -652,6 +656,7 @@ impl<'a> Parser<'a> {
             types,
             pos: 0,
             pending_alignas: None,
+            tentative_definitions: Vec::new(),
             pending_declarator_align: None,
             pending_symbol_attrs: Default::default(),
             pending_fn_attrs: Default::default(),
@@ -2403,6 +2408,21 @@ impl Parser<'_> {
                     None
                 };
 
+                // 6.7p7: the object needs a size here, and unlike at file
+                // scope nothing later can supply one -- a tag completed further
+                // down the block is a different declaration. An `extern`
+                // declaration defines nothing and is exempt.
+                if !base_type.modifiers.contains(TypeModifiers::EXTERN)
+                    && !self.types.is_composite_complete(typ)
+                {
+                    let named = self.types.format_type(typ, Some(self.idents));
+                    diag::error_args(
+                        self.current_pos(),
+                        "storage size of an object of type '{0}' is not known",
+                        &[&named],
+                    );
+                }
+
                 // For incomplete array types, infer size from initializer
                 if let Some(ref init_expr) = init {
                     // 6.7.9p5: an identifier declared `extern` at block scope
@@ -3632,6 +3652,8 @@ impl Parser<'_> {
                 struct_align = Some(struct_align.map_or(a, |e| e.max(a)));
             }
 
+            self.check_flexible_array_members(&members, is_union);
+
             // Compute layout. `__attribute__((packed))` is a cap of 1; a
             // `#pragma pack(n)` in force is a cap of n. Where both apply the
             // tighter one wins, which is what gcc does.
@@ -4462,7 +4484,30 @@ impl Parser<'_> {
             tu.add(external_decl);
         }
 
+        self.check_deferred_incomplete_definitions();
+
         Ok(tu)
+    }
+
+    /// C17 6.7p7: an object's type must be complete where the object is
+    /// *defined*. At file scope that cannot be judged where the declaration
+    /// appears, because 6.9.2p3 lets a tentative definition be completed later
+    /// in the translation unit -- `struct U; struct U u; struct U { int a; };`
+    /// is legal, and forward-declare-then-complete is everywhere in CPython and
+    /// glibc. So file-scope definitions are collected as they are parsed and
+    /// judged here, when nothing more can complete them.
+    fn check_deferred_incomplete_definitions(&mut self) {
+        for (typ, pos) in std::mem::take(&mut self.tentative_definitions) {
+            if self.types.is_composite_complete(typ) {
+                continue;
+            }
+            let named = self.types.format_type(typ, Some(self.idents));
+            diag::error_args(
+                pos,
+                "storage size of an object of type '{0}' is not known",
+                &[&named],
+            );
+        }
     }
 
     /// Check if current token is _Static_assert or static_assert
@@ -5227,6 +5272,35 @@ impl Parser<'_> {
         // Validate explicit alignment (C11 6.7.5: >= natural alignment)
         let validated_align = self.validated_explicit_align(var_type_id)?;
 
+        // 6.7p7 for a file-scope *definition*. Judged at end of translation
+        // unit, since 6.9.2p3 lets a tentative definition be completed later.
+        // `extern` and `typedef` define nothing, and a function is not an
+        // object.
+        if !is_typedef {
+            // An array's *element* type has to be complete where the array is
+            // declared, because the stride is what forms the type -- so this
+            // holds even for `extern`, and even when the tag is completed
+            // further down, both of which gcc rejects.
+            let elem = self.types.array_element_deep(var_type_id);
+            if elem != var_type_id {
+                if !self.types.is_composite_complete(elem) {
+                    let named = self.types.format_type(elem, Some(self.idents));
+                    diag::error_args(
+                        self.current_pos(),
+                        "array type has incomplete element type '{0}'",
+                        &[&named],
+                    );
+                }
+            } else if !base_type.modifiers.contains(TypeModifiers::EXTERN)
+                && !self.types.is_composite_complete(var_type_id)
+            {
+                // A *definition* needs a size. Only this half gets the
+                // tentative-definition grace of 6.9.2p3.
+                self.tentative_definitions
+                    .push((var_type_id, self.current_pos()));
+            }
+        }
+
         // Bind variable to symbol table BEFORE parsing initializer.
         // This ensures the variable is in scope for self-referential initializers.
         // Per C99 6.2.1p7: "Any other identifier has scope that begins just
@@ -5661,6 +5735,47 @@ impl Parser<'_> {
     ///
     /// `is_named` indicates if this bitfield has a name (unnamed bitfields are
     /// allowed to have zero width for alignment purposes).
+    /// C17 6.7.2.1p18: an array of unspecified size may appear only as the
+    /// *last* member of a structure with more than one named member.
+    ///
+    /// Nothing in the tree recognised a flexible array member at all, so
+    /// `struct S { int a[]; int b; }` compiled and sized the array zero. The
+    /// distinction that matters is against the GNU zero-length array: `int
+    /// a[]` has no extent while `char d[0]` has one that happens to be zero,
+    /// and `unsized_array_levels` tells them apart. Mid-struct `char d[0]` is
+    /// an ordinary member and is everywhere in system headers, so conflating
+    /// the two would reject far more than this rejects.
+    fn check_flexible_array_members(&self, members: &[StructMember], is_union: bool) {
+        let is_flexible =
+            |m: &StructMember| m.bit_width.is_none() && self.types.unsized_array_levels(m.typ) > 0;
+
+        let Some(first) = members.iter().position(is_flexible) else {
+            return;
+        };
+        let pos = self.current_pos();
+
+        if is_union {
+            diag::error(pos, &gettext("flexible array member in union"));
+            return;
+        }
+        if first + 1 != members.len() {
+            diag::error(pos, &gettext("flexible array member not at end of struct"));
+            return;
+        }
+        // A named member has to precede it: the array is a tail on something,
+        // and a struct that is nothing but a tail has no size to speak of.
+        if members
+            .iter()
+            .take(first)
+            .all(|m| m.name == StringId::EMPTY)
+        {
+            diag::error(
+                pos,
+                &gettext("flexible array member in a struct with no named members"),
+            );
+        }
+    }
+
     fn validate_bitfield(&self, typ_id: TypeId, width: u32, is_named: bool) -> ParseResult<()> {
         // C17 6.7.2.1p5 allows `_Bool`, `signed int`, `unsigned int`, and "some
         // other implementation-defined type". gcc's set is every integer type,

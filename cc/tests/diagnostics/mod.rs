@@ -2701,3 +2701,137 @@ fn diagnostics_ordinary_declarations_are_accepted() {
         compile_expect_ok(name, src);
     }
 }
+
+// === #C111 — incomplete types and flexible array members (6.7p7, 6.7.2.1p18) ===
+
+/// An object needs a size, and a flexible array member has a place.
+///
+/// Neither was checked: `struct U; struct U u;` compiled and `sizeof` it
+/// answered 0, and nothing in the tree recognised a flexible array member at
+/// all, so `struct S { int a[]; int b; }` sized the array zero and carried on.
+#[test]
+fn diagnostics_incomplete_objects_and_misplaced_flexible_arrays_are_rejected() {
+    for (name, src) in [
+        (
+            "inc_block_object",
+            "struct U;\nvoid f(void){ struct U u; (void)&u; }\n",
+        ),
+        ("inc_file_object", "struct U;\nstruct U u;\n"),
+        ("inc_file_union", "union V;\nunion V v;\n"),
+    ] {
+        compile_expect_error(name, src, "storage size of an object");
+    }
+    for (name, src) in [
+        // An array's element type must be complete where the array is
+        // declared: the stride is what forms the type, so this holds even
+        // when the tag is completed later and even for `extern`.
+        (
+            "inc_array_completed_later",
+            "struct U;\nstruct U a[2];\nstruct U { int a; };\n",
+        ),
+        (
+            "inc_array_2d",
+            "struct U;\nstruct U a[2][3];\nstruct U { int a; };\n",
+        ),
+        ("inc_array_extern", "struct U;\nextern struct U a[2];\n"),
+    ] {
+        compile_expect_error(name, src, "incomplete element type");
+    }
+    compile_expect_error(
+        "fam_not_last",
+        "struct S { int a[]; int b; };\n",
+        "flexible array member not at end of struct",
+    );
+    compile_expect_error(
+        "fam_then_two",
+        "struct S { int n; int a[]; int b; };\n",
+        "flexible array member not at end of struct",
+    );
+    compile_expect_error(
+        "fam_sole_member",
+        "struct S { int a[]; };\n",
+        "flexible array member in a struct with no named members",
+    );
+    compile_expect_error(
+        "fam_in_union",
+        "union U { int a[]; int b; };\n",
+        "flexible array member in union",
+    );
+}
+
+/// The accept side, and it is the whole difficulty.
+///
+/// 6.9.2p3 lets a file-scope *tentative* definition be completed later in the
+/// translation unit, so the check cannot run where the declaration appears --
+/// forward-declare-then-complete is everywhere in CPython and glibc. An
+/// `extern` declaration and a pointer define nothing and need no size. And a
+/// mid-struct `char d[0]` is a GNU zero-length array, not a flexible array
+/// member: conflating the two would reject far more than the check catches.
+#[test]
+fn diagnostics_complete_objects_and_valid_flexible_arrays_are_accepted() {
+    for (name, src) in [
+        (
+            "inc_tentative_completed",
+            "struct U;\nstruct U u;\nstruct U { int a; };\n",
+        ),
+        (
+            "inc_tentative_completed_much_later",
+            "struct U;\nstruct U u;\nvoid f(void);\nstruct U { int a; };\nvoid f(void){}\n",
+        ),
+        (
+            "inc_static_tentative_completed",
+            "struct U;\nstatic struct U u;\nstruct U { int a; };\n",
+        ),
+        ("inc_extern_only", "struct U;\nextern struct U u;\n"),
+        (
+            "inc_extern_block",
+            "struct U;\nvoid f(void){ extern struct U u; (void)&u; }\n",
+        ),
+        ("inc_pointer_only", "struct U;\nstruct U *p;\n"),
+        (
+            "inc_pointer_param",
+            "struct U;\nvoid f(struct U *p){ (void)p; }\n",
+        ),
+        ("inc_typedef_only", "struct U;\ntypedef struct U T;\n"),
+        ("inc_function_returning", "struct U;\nstruct U f(void);\n"),
+        (
+            "inc_array_of_complete",
+            "struct U { int a; };\nstruct U a[2];\n",
+        ),
+        ("inc_array_of_pointers", "struct U;\nstruct U *a[2];\n"),
+        // Flexible array members, valid.
+        ("fam_valid", "struct S { int n; int a[]; };\n"),
+        (
+            "fam_valid_two_before",
+            "struct S { int n; char c; int a[]; };\n",
+        ),
+        (
+            "fam_after_bitfield",
+            "struct S { unsigned f:3; int a[]; };\n",
+        ),
+        (
+            "fam_typedef",
+            "typedef struct { int n; char s[]; } T;\nT *p;\n",
+        ),
+        (
+            "fam_nested_last",
+            "struct I { int n; int a[]; };\nstruct O { int x; struct I i; };\n",
+        ),
+        (
+            "fam_array_of_structs",
+            "struct I { int n; int a[]; };\nstruct I arr[2];\n",
+        ),
+        (
+            "fam_sizeof",
+            "struct S { int n; int a[]; };\nunsigned long x = sizeof(struct S);\n",
+        ),
+        // GNU zero-length arrays, which are not flexible array members.
+        ("zla_mid_struct", "struct S { int n; char d[0]; int t; };\n"),
+        ("zla_last", "struct S { int n; char d[0]; };\n"),
+        ("zla_sole", "struct S { char d[0]; };\n"),
+        ("array_sized_last", "struct S { int n; int a[4]; };\n"),
+        ("ptr_to_unsized_array", "struct S { int (*p)[]; int b; };\n"),
+    ] {
+        compile_expect_ok(name, src);
+    }
+}

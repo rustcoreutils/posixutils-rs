@@ -1017,6 +1017,23 @@ impl TypeTable {
             .is_none_or(|c| c.is_complete)
     }
 
+    /// The innermost non-array element type of `id`, or `id` itself when it is
+    /// not an array.
+    ///
+    /// An array's element type must be complete where the array is declared --
+    /// its stride is what makes the type -- so the completeness question for
+    /// `struct U a[2][3]` is about `struct U`, however many levels deep.
+    pub fn array_element_deep(&self, id: TypeId) -> TypeId {
+        let mut cur = id;
+        while self.kind(cur) == TypeKind::Array {
+            match self.base_type(cur) {
+                Some(next) if next != cur => cur = next,
+                _ => break,
+            }
+        }
+        cur
+    }
+
     /// How many array levels of `id`, outermost-first, have no extent.
     ///
     /// The type table cannot tell a variably-modified array from an incomplete

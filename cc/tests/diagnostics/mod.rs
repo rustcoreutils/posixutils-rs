@@ -1791,3 +1791,148 @@ fn diagnostics_legal_jumps_around_variably_modified_scopes_are_accepted() {
         "int main(void){int n=4,k=1; switch(k){ case 1: { int a[n]; return a[0]; } } return 0; }\n",
     );
 }
+
+// ============================================================================
+// #C53 — a trailing comma in a parameter list (C17 6.7.6.3)
+// ============================================================================
+
+/// A parameter-type-list is a comma-separated list of parameter declarations,
+/// optionally followed by `, ...`; nothing else may follow a comma. c17 let
+/// the specifier parser supply an implicit `int` for the empty slot, so
+/// `void g(int, );` silently declared `void(int, int)` -- and once call arity
+/// was checked, the *correct* call `g(1)` became the one rejected. C23 allows
+/// the trailing comma; this compiler is C17, and so is gcc here.
+#[test]
+fn diagnostics_trailing_comma_in_parameter_list_is_rejected() {
+    for (name, src) in [
+        ("tc_proto", "void g(int, );\nint main(void){return 0;}\n"),
+        (
+            "tc_defn",
+            "void g(int a, ){(void)a;}\nint main(void){return 0;}\n",
+        ),
+        (
+            "tc_two",
+            "void g(int, char, );\nint main(void){return 0;}\n",
+        ),
+        (
+            "tc_fnptr",
+            "void g(int (*f)(int, ));\nint main(void){return 0;}\n",
+        ),
+    ] {
+        compile_expect_error(name, src, "after ','");
+    }
+}
+
+/// The list forms that must keep working -- including the call the old
+/// behaviour turned into an error.
+#[test]
+fn diagnostics_ordinary_parameter_lists_are_accepted() {
+    compile_expect_ok(
+        "pl_correct_call",
+        "void g(int);\nvoid g(int a){(void)a;}\nint main(void){ g(1); return 0; }\n",
+    );
+    compile_expect_ok(
+        "pl_variadic",
+        "int f(int, ...);\nint main(void){return 0;}\n",
+    );
+    compile_expect_ok("pl_void", "int f(void);\nint main(void){return 0;}\n");
+    compile_expect_ok("pl_two", "int f(int, char);\nint main(void){return 0;}\n");
+    compile_expect_ok("pl_empty", "int f();\nint main(void){return 0;}\n");
+    compile_expect_ok(
+        "pl_knr",
+        "int f(a, b) int a, b; { return a+b; }\nint main(void){ return f(1,2)-3; }\n",
+    );
+}
+
+// ============================================================================
+// Universal character names naming forbidden characters (C17 6.4.3p2)
+// ============================================================================
+
+/// A UCN "shall not specify a character whose short identifier is less than
+/// 00A0 other than 0024 ($), 0040 (@), or 0060 (`), nor one in the range D800
+/// through DFFF inclusive."
+///
+/// Every one was accepted. The surrogate half was the worse of the two: a
+/// surrogate has no `char`, so `char::from_u32` failed and both decoders took
+/// that for "not an escape" and carried on with the letter `u`.
+#[test]
+fn diagnostics_forbidden_universal_character_names_are_rejected() {
+    for (name, src) in [
+        // In an identifier, at the start and in the middle: the lexer has a
+        // separate decoder for each.
+        (
+            "ucn_ident_start",
+            "int \\u0061bc = 3;\nint main(void){return 0;}\n",
+        ),
+        (
+            "ucn_ident_mid",
+            "int a\\u0062c = 3;\nint main(void){return 0;}\n",
+        ),
+        // In a string and in a character constant.
+        (
+            "ucn_string",
+            "int main(void){ const char *s = \"\\u0041\"; return s[0]-65; }\n",
+        ),
+        (
+            "ucn_charconst",
+            "int main(void){ return (int)(char)'\\u0041' - 65; }\n",
+        ),
+        // A control character, and both ends of the surrogate range.
+        (
+            "ucn_space",
+            "int main(void){ const char *s = \"\\u0020\"; return s[0]-32; }\n",
+        ),
+        (
+            "ucn_surrogate_lo",
+            "int main(void){ const char *s = \"\\ud800\"; return s[0]; }\n",
+        ),
+        (
+            "ucn_surrogate_hi",
+            "int main(void){ const char *s = \"\\udfff\"; return s[0]; }\n",
+        ),
+        // The long form is subject to the same rule.
+        (
+            "ucn_long_form",
+            "int main(void){ const char *s = \"\\U00000041\"; return s[0]-65; }\n",
+        ),
+    ] {
+        compile_expect_error(name, src, "not a valid universal character");
+    }
+}
+
+/// The three carve-outs 6.4.3p2 names, and ordinary UCNs above 00A0.
+#[test]
+fn diagnostics_permitted_universal_character_names_are_accepted() {
+    for (name, src) in [
+        (
+            "ucn_dollar",
+            "int main(void){ const char *s = \"\\u0024\"; return s[0]-36; }\n",
+        ),
+        (
+            "ucn_at",
+            "int main(void){ const char *s = \"\\u0040\"; return s[0]-64; }\n",
+        ),
+        (
+            "ucn_backtick",
+            "int main(void){ const char *s = \"\\u0060\"; return s[0]-96; }\n",
+        ),
+        (
+            "ucn_latin",
+            "int main(void){ const char *s = \"\\u00e9\"; return s[0]!=0?0:1; }\n",
+        ),
+        (
+            "ucn_ident_ok",
+            "int \\u00c5ngstrom = 7;\nint main(void){ return 0; }\n",
+        ),
+        (
+            "ucn_astral",
+            "int main(void){ const char *s = \"\\U0001F600\"; return s[0]!=0?0:1; }\n",
+        ),
+        (
+            "ucn_wide_char",
+            "int main(void){ return (int)L'\\u00e9' - 233; }\n",
+        ),
+    ] {
+        compile_expect_ok(name, src);
+    }
+}

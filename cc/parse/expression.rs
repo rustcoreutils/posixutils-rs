@@ -50,6 +50,11 @@ pub(crate) enum Escaped {
     /// A code point named by a universal character name, which the execution
     /// character set encodes.
     CodePoint(char),
+    /// A universal character name that names a character C17 6.4.3p2 forbids:
+    /// below 00A0 other than `$`, `@` and `` ` ``, or a UTF-16 surrogate.
+    /// Carries the scalar so the diagnostic can name it -- a surrogate has no
+    /// `char` to carry.
+    ForbiddenUcn(u32),
 }
 
 impl<'a> Parser<'a> {
@@ -1549,7 +1554,18 @@ impl<'a> Parser<'a> {
                         TokenValue::String(s)
                         | TokenValue::WideString(s)
                         | TokenValue::Utf16String(s)
-                        | TokenValue::Utf32String(s) => Self::parse_string_literal(s),
+                        | TokenValue::Utf32String(s) => {
+                            let piece = Self::parse_string_literal(s);
+                            // `parse_string_literal` has no position to report
+                            // from, so the constraint is raised here, where the
+                            // token still does.
+                            for e in &piece {
+                                if let Escaped::ForbiddenUcn(val) = e {
+                                    self.report_forbidden_ucn_at(token.pos, *val);
+                                }
+                            }
+                            piece
+                        }
                         _ => return Err(ParseError::new("invalid string token", token.pos)),
                     }
                 }
@@ -4192,7 +4208,9 @@ impl<'a> Parser<'a> {
                 {
                     let hex: String = chars[i + 1..i + 5].iter().collect();
                     let val = u32::from_str_radix(&hex, 16).unwrap_or(0);
-                    if let Some(c) = char::from_u32(val) {
+                    if crate::token::lexer::ucn_is_forbidden(val) {
+                        (Escaped::ForbiddenUcn(val), 5)
+                    } else if let Some(c) = char::from_u32(val) {
                         (Escaped::CodePoint(c), 5)
                     } else {
                         (Escaped::Byte(b'u'), 1) // Invalid code point
@@ -4207,7 +4225,9 @@ impl<'a> Parser<'a> {
                 {
                     let hex: String = chars[i + 1..i + 9].iter().collect();
                     let val = u32::from_str_radix(&hex, 16).unwrap_or(0);
-                    if let Some(c) = char::from_u32(val) {
+                    if crate::token::lexer::ucn_is_forbidden(val) {
+                        (Escaped::ForbiddenUcn(val), 9)
+                    } else if let Some(c) = char::from_u32(val) {
                         (Escaped::CodePoint(c), 9)
                     } else {
                         (Escaped::Byte(b'U'), 1) // Invalid code point
@@ -4254,6 +4274,10 @@ impl<'a> Parser<'a> {
         if chars[0] == '\\' && chars.len() > 1 {
             match Self::parse_escape_sequence(&chars, 1).0 {
                 Escaped::Byte(b) | Escaped::SourceByte(b) => (b as u32, false),
+                Escaped::ForbiddenUcn(val) => {
+                    self.report_forbidden_ucn(val);
+                    (val, true)
+                }
                 // `'\u00e9'` names a code point. gcc makes it a multi-character
                 // constant of its UTF-8 bytes, with a warning; c17 keeps the
                 // code point, which is the more useful answer for the one place
@@ -4267,6 +4291,22 @@ impl<'a> Parser<'a> {
             // character is a byte even when the source is UTF-8.
             (chars[0] as u32, false)
         }
+    }
+
+    /// C17 6.4.3p2: a universal character name may not name a character below
+    /// 00A0 other than `$`, `@` and `` ` ``, nor a UTF-16 surrogate.
+    ///
+    /// The first half stops a UCN spelling a character that already has a
+    /// spelling, which would let `\u0041` smuggle an `A` past anything that
+    /// reads the source as text. Both were accepted silently -- a surrogate
+    /// even degraded to the letter `u`, because `char::from_u32` rejects it
+    /// and the caller took that for "not an escape".
+    fn report_forbidden_ucn(&self, val: u32) {
+        self.report_forbidden_ucn_at(self.current_pos(), val);
+    }
+
+    fn report_forbidden_ucn_at(&self, pos: Position, val: u32) {
+        crate::token::lexer::report_forbidden_ucn(pos, val);
     }
 
     /// Parse a string literal, converting escape sequences to their actual values.
@@ -4300,6 +4340,9 @@ impl<'a> Parser<'a> {
         for e in elements {
             match e {
                 Escaped::Byte(b) | Escaped::SourceByte(b) => out.push(*b as char),
+                // Already diagnosed where the literal was parsed; encoded as
+                // written so the rest of the literal still makes sense.
+                Escaped::ForbiddenUcn(v) => out.push(*v as u8 as char),
                 Escaped::CodePoint(c) => {
                     let mut buf = [0u8; 4];
                     for b in c.encode_utf8(&mut buf).as_bytes() {
@@ -4333,6 +4376,11 @@ impl<'a> Parser<'a> {
                 Escaped::Byte(b) => {
                     flush(&mut run, &mut out);
                     out.push(*b as u32);
+                }
+                // Already diagnosed where the literal was parsed.
+                Escaped::ForbiddenUcn(v) => {
+                    flush(&mut run, &mut out);
+                    out.push(*v);
                 }
                 Escaped::CodePoint(c) => {
                     flush(&mut run, &mut out);

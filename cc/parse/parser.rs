@@ -4252,6 +4252,20 @@ impl Parser<'_> {
 
             if self.is_special(b',') {
                 self.advance();
+                // C17 6.7.6.3: a parameter-type-list is a comma-separated list
+                // of parameter declarations, optionally followed by `, ...`.
+                // Nothing else may follow the comma. Falling through here let
+                // `parse_type_specifier` supply an implicit `int`, so
+                // `void g(int, );` silently declared `void(int, int)` -- and
+                // once call arity was checked, the *correct* call `g(1)`
+                // became the one rejected. (C23 permits the trailing comma;
+                // this compiler is C17.)
+                if self.is_special(b')') {
+                    return Err(ParseError::new(
+                        "expected a declaration specifier or '...' after ','".to_string(),
+                        self.current_pos(),
+                    ));
+                }
             } else {
                 break;
             }

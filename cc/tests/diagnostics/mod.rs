@@ -2020,9 +2020,12 @@ fn diagnostics_sizeof_of_complete_types_is_accepted() {
 /// appears in real system headers.
 #[test]
 fn diagnostics_sizeof_of_a_typeof_is_not_rejected() {
+    // Was `* 0`, written to accommodate the wrong answer #C89 recorded: this
+    // gave 0 where gcc gives 16. It is the real size now, so the arithmetic
+    // can be the check.
     compile_expect_ok(
         "sz_typeof_vla",
-        "int main(void){ int n = 4; int a[n]; return (int)sizeof(typeof(a)) * 0; }\n",
+        "int main(void){ int n = 4; int a[n]; return (int)sizeof(typeof(a)) - 16; }\n",
     );
     compile_expect_ok(
         "sz_typeof_fixed",

@@ -9217,3 +9217,54 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("static_address_difference", code, &[]), 0);
 }
+
+/// `sizeof` through `typeof` answers the real size (#C89).
+///
+/// A `typeof` yielded a bare `TypeId`, and `int[]`, `int[n]` and `int[m]` all
+/// intern to one type -- so a VLA's extent did not survive it and
+/// `sizeof(typeof(a))` answered **0** where gcc answers the size. The two
+/// operand forms need different mechanisms and both are exercised here:
+/// `typeof(type-name)` carries the extent expressions out of the
+/// specifier-qualifier list the way #C52 carries a type-name's own, while
+/// `typeof(expr)` is rewritten to `sizeof(expr)`, whose answer lives in the
+/// declaration of the object and which the linearizer already recorded.
+///
+/// Both dimension orders are checked. Concatenating declarator and specifier
+/// extents the wrong way round makes `int[3][n]` and `int[n][3]` the same size
+/// -- right for one shape and wrong for another, the failure the 2026-08-17
+/// series existed to remove.
+#[test]
+fn codegen_sizeof_through_typeof() {
+    let code = r#"
+int main(void) {
+    int n = 4;
+    int a[n];
+    int b[3][n];
+    int fixed[4];
+
+    /* typeof of an expression: the answer is the declaration's. */
+    if (sizeof(typeof(a)) != 16) return 1;
+    if (sizeof(typeof(b)) != 48) return 2;
+    if (sizeof(typeof(fixed)) != 16) return 3;
+    if (sizeof(typeof(n)) != sizeof(int)) return 4;
+
+    /* typeof of a type-name: the extents ride out of the specifier list. */
+    if (sizeof(typeof(int[n])) != 16) return 5;
+    if (sizeof(typeof(int[n][2])) != 32) return 6;
+    if (sizeof(typeof(int[3][n])) != 48) return 7;
+    if (sizeof(typeof(int[n])[3]) != 48) return 8;
+    if (sizeof(typeof(int)) != 4) return 9;
+    if (sizeof(typeof(int[n]) *) != sizeof(void *)) return 10;
+
+    /* A different extent gives a different answer, so nothing is being
+       folded to a constant behind our back. */
+    int m = 7;
+    int c[m];
+    if (sizeof(typeof(c)) != 28) return 11;
+    if (sizeof(typeof(int[m])) != 28) return 12;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("sizeof_through_typeof", code, &[]), 0);
+}

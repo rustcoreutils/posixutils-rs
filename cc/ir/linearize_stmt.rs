@@ -1285,6 +1285,54 @@ impl<'a> super::linearize::Linearizer<'a> {
         (case_values, has_default)
     }
 
+    /// C17 6.8.6.1p1: a `goto` shall not jump from outside the scope of an
+    /// identifier having a variably modified type to inside it; 6.8.4.2p... the
+    /// same for a `switch` reaching a `case` inside such a scope.
+    ///
+    /// The rule exists because entering the scope without executing the
+    /// declaration leaves the object's size never computed: the array is
+    /// whatever the stack held. Jumping *out* of the scope, within it, or to a
+    /// label that precedes the declaration are all fine, and all are exercised
+    /// by the accept-side tests.
+    ///
+    /// Reported at the declaration rather than at the jump, which is where gcc
+    /// points: `Stmt::Goto` and `Stmt::Default` carry no position, and naming
+    /// the declaration that cannot be entered says more about the cause than
+    /// the jump does.
+    pub(crate) fn check_jumps_into_variably_modified_scopes(&self, body: &Stmt) {
+        let mut w = VmScopeWalk {
+            open: Vec::new(),
+            declared: Vec::new(),
+            labels: Vec::new(),
+            gotos: Vec::new(),
+            bad_case_ids: Vec::new(),
+        };
+        w.walk(body, None);
+
+        // A `goto` is illegal exactly when its label sits inside a scope the
+        // `goto` itself is not already in.
+        for (name, from) in &w.gotos {
+            let Some((_, to)) = w.labels.iter().find(|(n, _)| n == name) else {
+                continue; // an undefined label is a separate diagnostic
+            };
+            if let Some(id) = to.iter().find(|id| !from.contains(id)) {
+                self.report_vm_jump(&w.declared[*id], "jump");
+            }
+        }
+        for id in w.bad_cases() {
+            self.report_vm_jump(&w.declared[id], "switch jump");
+        }
+    }
+
+    /// Name the declaration a jump would have entered without executing.
+    fn report_vm_jump(&self, decl: &VmDecl, what: &str) {
+        let name = self.strings.get(self.symbols.get(decl.symbol).name);
+        error(
+            decl.pos,
+            &format!("{what} into the scope of '{name}', which has a variably modified type",),
+        );
+    }
+
     pub(crate) fn collect_cases_from_stmt(
         &self,
         stmt: &Stmt,
@@ -2636,6 +2684,131 @@ impl<'a> super::linearize::Linearizer<'a> {
             let block = self.get_or_create_bb(bb);
             block.label = Some(name.to_string());
             bb
+        }
+    }
+}
+
+/// A declaration whose type is variably modified, and so whose scope may not
+/// be entered by a jump (C17 6.8.6.1p1).
+pub(crate) struct VmDecl {
+    pub(crate) symbol: crate::symbol::SymbolId,
+    pub(crate) pos: crate::diag::Position,
+}
+
+/// Walks a function body recording, for every label and every jump, which
+/// variably modified scopes enclose it.
+///
+/// A scope opens at the declaration and runs to the end of its block, so the
+/// walk is order-sensitive within a block: a label *before* the declaration is
+/// outside the scope and may be jumped to, which is why the scopes are pushed
+/// as the items are visited rather than collected up front.
+struct VmScopeWalk {
+    /// Ids of the scopes currently open, innermost last.
+    open: Vec<usize>,
+    /// Every variably modified declaration seen, indexed by scope id.
+    declared: Vec<VmDecl>,
+    /// Label name, and the scopes enclosing it.
+    labels: Vec<(StringId, Vec<usize>)>,
+    /// Each `goto`, and the scopes enclosing it.
+    gotos: Vec<(StringId, Vec<usize>)>,
+    /// Scope ids a `case`/`default` was found inside but its `switch` was not.
+    bad_case_ids: Vec<usize>,
+}
+
+impl VmScopeWalk {
+    /// The offending scopes, each reported once however many `case` labels
+    /// sit inside it.
+    fn bad_cases(&self) -> Vec<usize> {
+        let mut out: Vec<usize> = Vec::new();
+        for id in &self.bad_case_ids {
+            if !out.contains(id) {
+                out.push(*id);
+            }
+        }
+        out
+    }
+
+    /// `switch_scopes` is the scope list in force at the innermost enclosing
+    /// `switch`, against which a `case` label is judged.
+    fn walk(&mut self, stmt: &Stmt, switch_scopes: Option<&[usize]>) {
+        match stmt {
+            Stmt::Block(items) => {
+                let depth = self.open.len();
+                for item in items {
+                    match item {
+                        BlockItem::Declaration(decl) => self.open_scopes(decl),
+                        BlockItem::Statement(s) => self.walk(s, switch_scopes),
+                    }
+                }
+                // Leaving the block closes every scope it opened.
+                self.open.truncate(depth);
+            }
+
+            Stmt::Label { name, stmt } => {
+                self.labels.push((*name, self.open.clone()));
+                self.walk(stmt, switch_scopes);
+            }
+            Stmt::Goto(name) => self.gotos.push((*name, self.open.clone())),
+
+            Stmt::Case(_) | Stmt::Default => {
+                // Reaching a `case` transfers control from the `switch`, so
+                // any scope open here but not there would be entered without
+                // its declaration running.
+                if let Some(outer) = switch_scopes {
+                    for id in &self.open {
+                        if !outer.contains(id) {
+                            self.bad_case_ids.push(*id);
+                        }
+                    }
+                }
+            }
+
+            // A `switch` becomes the reference point for the labels inside it.
+            // Its own scopes are captured before the body is walked.
+            Stmt::Switch { body, .. } => {
+                let outer = self.open.clone();
+                self.walk(body, Some(&outer));
+            }
+
+            Stmt::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                self.walk(then_stmt, switch_scopes);
+                if let Some(e) = else_stmt {
+                    self.walk(e, switch_scopes);
+                }
+            }
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => self.walk(body, switch_scopes),
+            Stmt::For { init, body, .. } => {
+                // A declaration in the init clause scopes over the body.
+                let depth = self.open.len();
+                if let Some(ForInit::Declaration(decl)) = init {
+                    self.open_scopes(decl);
+                }
+                self.walk(body, switch_scopes);
+                self.open.truncate(depth);
+            }
+
+            _ => {}
+        }
+    }
+
+    fn open_scopes(&mut self, decl: &Declaration) {
+        for d in &decl.declarators {
+            // A declarator with size expressions is variably modified --
+            // whether it is the array itself or a pointer to one, both of
+            // which C17 6.7.6.2 calls variably modified and gcc refuses to
+            // let a jump enter.
+            if !d.vla_sizes.is_empty() {
+                let id = self.declared.len();
+                self.declared.push(VmDecl {
+                    symbol: d.symbol,
+                    pos: d.pos,
+                });
+                self.open.push(id);
+            }
         }
     }
 }

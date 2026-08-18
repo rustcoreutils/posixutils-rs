@@ -1712,3 +1712,82 @@ int main(void) { return 0; }
 "#;
     compile_expect_ok("recognised_attributes", src);
 }
+
+// ============================================================================
+// Jumping into the scope of a variably modified type (C17 6.8.6.1p1)
+// ============================================================================
+
+/// Entering the scope of a variably modified identifier without executing its
+/// declaration leaves the object's size never computed -- the array is
+/// whatever the stack held -- so 6.8.6.1p1 forbids the jump outright. c17
+/// accepted every form of it.
+///
+/// The diagnostic names the declaration that would have been skipped, where
+/// gcc names only the kind of type; `Stmt::Goto` carries no position, and the
+/// declaration is the more useful thing to point at anyway.
+#[test]
+fn diagnostics_jump_into_variably_modified_scope_is_rejected() {
+    compile_expect_error(
+        "goto_into_vla",
+        "int main(void){int n=4; goto L; { int a[n]; L: return a[0]; } }\n",
+        "jump into the scope of 'a'",
+    );
+    // The scope runs to the end of the block, so a label after the
+    // declaration is inside it even without braces of its own.
+    compile_expect_error(
+        "goto_past_vla",
+        "int main(void){int n=4; goto L; int a[n]; L: return a[0]; }\n",
+        "variably modified type",
+    );
+    // A pointer to a variably modified array is variably modified too.
+    compile_expect_error(
+        "goto_into_ptr_to_vla",
+        "int main(void){int n=4; goto L; { int (*p)[n]; L: return p != 0; } }\n",
+        "jump into the scope of 'p'",
+    );
+    // A declaration in a for-init scopes over the body.
+    compile_expect_error(
+        "goto_into_for_init_vla",
+        "int main(void){int n=4; goto L; for(int a[n];;){ L: return 0; } }\n",
+        "variably modified type",
+    );
+    // Reaching a `case` transfers control from the `switch`, so the same rule
+    // applies -- and says so.
+    compile_expect_error(
+        "switch_into_vla",
+        "int main(void){int n=4,k=1; switch(k){ int a[n]; case 1: return a[0]; } return 0; }\n",
+        "switch jump into the scope of 'a'",
+    );
+}
+
+/// The jumps that stay legal. Without these the check could pass by rejecting
+/// every `goto` near a VLA, which is the failure mode the whole diagnostics
+/// suite exists to prevent.
+#[test]
+fn diagnostics_legal_jumps_around_variably_modified_scopes_are_accepted() {
+    // Out of the scope, not into it.
+    compile_expect_ok(
+        "goto_out_of_vla",
+        "int main(void){int n=4; L: ; { int a[n]; if(a[0]) goto L; } return 0; }\n",
+    );
+    // Within one scope.
+    compile_expect_ok(
+        "goto_within_vla",
+        "int main(void){int n=4; { int a[n]; L: a[0]=1; if(a[0]) goto L; } return 0; }\n",
+    );
+    // To a label that precedes the declaration.
+    compile_expect_ok(
+        "goto_before_vla",
+        "int main(void){int n=4; goto L; L: ; { int a[n]; return a[0]; } }\n",
+    );
+    // An ordinary array is not variably modified.
+    compile_expect_ok(
+        "goto_into_plain_array",
+        "int main(void){goto L; { int a[4]; L: return a[0]; } }\n",
+    );
+    // The VLA is inside the case, not around it.
+    compile_expect_ok(
+        "switch_case_holds_vla",
+        "int main(void){int n=4,k=1; switch(k){ case 1: { int a[n]; return a[0]; } } return 0; }\n",
+    );
+}

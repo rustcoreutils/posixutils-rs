@@ -3239,7 +3239,17 @@ impl Parser<'_> {
                 is_complete: true,
             };
 
-            let enum_type = Type::enum_type(composite);
+            let mut enum_type = Type::enum_type(composite);
+            // C17 6.7.2.2p4: the enumerated type shall represent every member.
+            // `enum_underlying_type` picks a type that does, but the enum's own
+            // type carried no signedness, so an *object* of it was loaded and
+            // compared as signed even where the underlying type is unsigned:
+            // `enum E { BIG = 0x80000000u }; enum E e = BIG;` read back
+            // -2147483648 and `e < 0` was true, while the constant `BIG` was
+            // correct all along.
+            if self.types.is_unsigned(underlying) {
+                enum_type.modifiers |= TypeModifiers::UNSIGNED;
+            }
 
             // Register tag if present
             if let Some(tag_name) = tag {

@@ -831,9 +831,23 @@ impl<'a> Parser<'a> {
             // variably-modified array level ride on the node: 6.5.3.4p2 says
             // the operand is evaluated and its size computed at run time, and
             // the interned type cannot carry either.
+            // `typeof` yields a bare type, so a VLA's extent does not survive
+            // it (see #C89) and the result is indistinguishable from an
+            // incomplete array. `sizeof(typeof(a))` is legal and gcc answers
+            // with the VLA's size, so the completeness check below must not
+            // fire on it -- noted before the type-name is consumed, since
+            // afterwards there is nothing left to tell.
+            let from_typeof = self.get_ident_id(self.current()).is_some_and(|id| {
+                matches!(
+                    id,
+                    crate::kw::TYPEOF | crate::kw::GNU_TYPEOF | crate::kw::GNU_TYPEOF2
+                )
+            });
             if let Some((typ, dims)) = self.try_parse_type_name_vm() {
                 self.expect_special(b')')?;
-                self.check_sizeof_operand_is_complete(typ, &dims, sizeof_pos);
+                if !from_typeof {
+                    self.check_sizeof_operand_is_complete(typ, &dims, sizeof_pos);
+                }
                 return Ok(Expr::typed(
                     ExprKind::SizeofType(typ, dims),
                     size_t,

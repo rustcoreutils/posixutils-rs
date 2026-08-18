@@ -1505,3 +1505,53 @@ int  ld_unsigned(unsigned char *p) { return *p; }
         "x86-64: unsigned char must zero-extend:\n{unsigned}"
     );
 }
+
+/// A pointer comparison must select the *unsigned* condition code.
+///
+/// C17 6.5.8 compares addresses, and an address is unsigned. The behavioural
+/// test cannot reach the case that distinguishes them -- it needs two
+/// addresses straddling the sign bit -- so the instruction is asserted
+/// directly, on both targets, with signed and unsigned integer controls
+/// beside it so the assertion cannot pass by making everything unsigned.
+#[test]
+fn codegen_pointer_comparison_is_unsigned() {
+    let src = r#"
+int ptr_lt(char *a, char *b)         { return a < b; }
+int ptr_ge(char *a, char *b)         { return a >= b; }
+int int_lt(int a, int b)             { return a < b; }
+int uint_lt(unsigned a, unsigned b)  { return a < b; }
+"#;
+
+    // x86-64: setb/setae for unsigned, setl for signed.
+    let x = asm_for("ptr_cmp_x64", X86_64_LINUX, src);
+    let p = body_of(&x, "ptr_lt");
+    assert!(
+        p.contains("setb") && !p.contains("setl"),
+        "x86-64: a pointer comparison is unsigned:\n{p}"
+    );
+    let p = body_of(&x, "ptr_ge");
+    assert!(
+        p.contains("setae") || p.contains("setnb"),
+        "x86-64: `>=` on pointers is unsigned:\n{p}"
+    );
+    let i = body_of(&x, "int_lt");
+    assert!(
+        i.contains("setl"),
+        "x86-64: a signed int comparison must stay signed:\n{i}"
+    );
+    let u = body_of(&x, "uint_lt");
+    assert!(u.contains("setb"), "x86-64: unsigned int control:\n{u}");
+
+    // aarch64: the condition is on the cset -- lo/hs unsigned, lt signed.
+    let a = asm_for("ptr_cmp_a64", AARCH64_LINUX, src);
+    let p = body_of(&a, "ptr_lt");
+    assert!(
+        p.contains("lo") && !p.contains(" lt"),
+        "aarch64: a pointer comparison is unsigned:\n{p}"
+    );
+    let i = body_of(&a, "int_lt");
+    assert!(
+        i.contains("lt"),
+        "aarch64: a signed int comparison must stay signed:\n{i}"
+    );
+}

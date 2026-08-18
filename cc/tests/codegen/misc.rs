@@ -9118,3 +9118,61 @@ int main(void) {
         0
     );
 }
+
+/// A pointer comparison is unsigned, and an enumeration takes the signedness
+/// of the type wide enough to hold it.
+///
+/// Both were asked of a predicate that answers about *integer* types: a
+/// pointer is not one, so `is_unsigned` said false and `a < b` emitted a
+/// signed `setl` where gcc emits `setb` -- C17 6.5.8 compares addresses, and
+/// an address is unsigned. And an enumeration never carried a signedness at
+/// all, so although `enum_underlying_type` correctly picked `unsigned int`
+/// for `enum E { BIG = 0x80000000u }`, an *object* of that type was loaded
+/// and compared as signed: `e` read back -2147483648 and `e < 0` was true,
+/// while the constant `BIG` was right all along.
+#[test]
+fn codegen_pointer_and_enum_signedness() {
+    let code = r#"
+enum Big  { BIG = 0x80000000u };          /* needs unsigned int */
+enum Wide { W = 0x100000000 };            /* needs a 64-bit type */
+enum Neg  { N = -1, P = 2147483647 };     /* stays plain int     */
+
+int main(void) {
+    /* ===== pointer comparison (returns 1-9) ===== */
+    char buf[8];
+    char *lo = buf, *hi = buf + 4;
+    if (!(lo < hi)) return 1;
+    if (hi < lo) return 2;
+    if (!(hi > lo)) return 3;
+    if (!(lo <= lo)) return 4;
+    if (!(hi >= lo)) return 5;
+    if (lo >= hi) return 6;
+
+    /* ===== an unsigned enumeration (returns 10-19) ===== */
+    enum Big e = BIG;
+    if (e < 0) return 10;                      /* the bug: this was true */
+    if ((long long)e != 2147483648LL) return 11;
+    if (sizeof(enum Big) != 4) return 12;
+    if (BIG < 0) return 13;                    /* the constant was always right */
+    if (e != BIG) return 14;
+
+    /* ===== a 64-bit enumeration (returns 20-29) ===== */
+    enum Wide w = W;
+    if ((long long)w != 4294967296LL) return 20;
+    if (sizeof(enum Wide) != 8) return 21;
+
+    /* ===== one holding negatives stays signed (returns 30-39) ===== */
+    enum Neg n = N;
+    if (n != -1) return 30;
+    if (!(n < 0)) return 31;
+    if (sizeof(enum Neg) != 4) return 32;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("ptr_enum_signedness", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("ptr_enum_signedness_opt", code),
+        0
+    );
+}

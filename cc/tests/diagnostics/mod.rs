@@ -2011,3 +2011,25 @@ fn diagnostics_sizeof_of_complete_types_is_accepted() {
         "int main(void){ return (int)sizeof(void) - 1; }\n",
     );
 }
+
+/// `typeof` yields a bare type, so a VLA's extent does not survive it and the
+/// result is indistinguishable from an incomplete array. `sizeof(typeof(a))`
+/// is legal -- gcc answers with the VLA's size -- so the completeness check
+/// above must not fire on it. It answers 0 rather than 16, which is #C89 and
+/// unfixed; what this pins is that it is not *rejected*, since `typeof`
+/// appears in real system headers.
+#[test]
+fn diagnostics_sizeof_of_a_typeof_is_not_rejected() {
+    compile_expect_ok(
+        "sz_typeof_vla",
+        "int main(void){ int n = 4; int a[n]; return (int)sizeof(typeof(a)) * 0; }\n",
+    );
+    compile_expect_ok(
+        "sz_typeof_fixed",
+        "int main(void){ int b[4]; return (int)sizeof(typeof(b)) - 16; }\n",
+    );
+    compile_expect_ok(
+        "sz_typeof_scalar",
+        "int main(void){ int x = 0; return (int)sizeof(typeof(x)) - 4; }\n",
+    );
+}

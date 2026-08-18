@@ -652,3 +652,67 @@ int main(void) {
         0
     );
 }
+
+/// A bit-field as wide as its own carrier read back as zero (#C98).
+///
+/// `(1 << width) - 1` is the natural way to spell the mask and is wrong at
+/// exactly one width: Rust masks the shift amount to the operand's width, so
+/// `1u64 << 64` is `1` and the mask is `0`. `struct { unsigned long long a:64; }`
+/// therefore ANDed every read with zero, at `-O0` and `-O2` alike, on both
+/// targets. Width 63 was correct throughout, which is why nothing caught it.
+///
+/// Widths on both sides of the boundary are exercised, and a bit-field with
+/// ordinary members either side of it, because a mask fix that overshot would
+/// corrupt the neighbours rather than the field.
+#[test]
+fn c89_bitfield_as_wide_as_its_carrier_round_trips() {
+    let code = r#"
+struct U64 { unsigned long long a:64; };
+struct S64 { signed long long a:64; };
+struct W63 { unsigned long long a:63; };
+struct Two { unsigned long long a:64; unsigned long long b:64; };
+struct Pad { unsigned char pre; unsigned long long a:64; unsigned char post; };
+struct U32 { unsigned int a:32; };
+struct S32 { signed int a:32; };
+
+int main(void) {
+    struct U64 u; u.a = 0xFFFFFFFFFFFFFFFFULL;
+    if (u.a != 0xFFFFFFFFFFFFFFFFULL) return 1;
+    u.a = 0x0123456789ABCDEFULL;
+    if (u.a != 0x0123456789ABCDEFULL) return 2;
+
+    /* A full-width signed field keeps its sign without any extension step. */
+    struct S64 s; s.a = -3;
+    if (s.a != -3) return 3;
+    s.a = 0x7FFFFFFFFFFFFFFFLL;
+    if (s.a != 0x7FFFFFFFFFFFFFFFLL) return 4;
+
+    /* One bit narrower always worked; it must still. */
+    struct W63 w; w.a = 0x7FFFFFFFFFFFFFFFULL;
+    if (w.a != 0x7FFFFFFFFFFFFFFFULL) return 5;
+
+    /* Two full-width fields do not share a unit, so neither may disturb the
+       other. */
+    struct Two t; t.a = 0xAAAAAAAAAAAAAAAAULL; t.b = 0x5555555555555555ULL;
+    if (t.a != 0xAAAAAAAAAAAAAAAAULL) return 6;
+    if (t.b != 0x5555555555555555ULL) return 7;
+
+    /* An over-wide mask would write through the neighbours. */
+    struct Pad p; p.pre = 0x11; p.post = 0x22; p.a = 0xDEADBEEFCAFEBABEULL;
+    if (p.pre != 0x11) return 8;
+    if (p.post != 0x22) return 9;
+    if (p.a != 0xDEADBEEFCAFEBABEULL) return 10;
+    p.a = 0;
+    if (p.pre != 0x11 || p.post != 0x22) return 11;
+
+    /* The same boundary one carrier down. */
+    struct U32 u32; u32.a = 0xFFFFFFFFU;
+    if (u32.a != 0xFFFFFFFFU) return 12;
+    struct S32 s32; s32.a = -1;
+    if (s32.a != -1) return 13;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("bitfield_full_carrier_width", code, &[]), 0);
+}

@@ -1051,9 +1051,10 @@ impl<'a> super::linearize::Linearizer<'a> {
                             continue;
                         }
 
-                        // A field never crosses its own window, so the shift
-                        // stays inside the 128-bit carrier even at width 64.
-                        let mask = (1u128 << bit_width) - 1;
+                        // Shifting `u128::MAX` down rather than `1 << width`
+                        // up, for the reason `bitfield_value_mask` records: the
+                        // latter overflows at the carrier's own width.
+                        let mask = u128::MAX >> (128 - bit_width);
                         let placed = ((value as u128) & mask) << bit_off;
 
                         // Only the bytes the field's own bits reach. Its window

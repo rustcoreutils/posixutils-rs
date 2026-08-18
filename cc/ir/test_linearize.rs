@@ -6225,3 +6225,30 @@ fn test_complex_struct_member_init_stores_both_halves() {
         module
     );
 }
+
+/// `(1 << width) - 1` overflows at the one width that matters most: Rust masks
+/// a shift amount to the operand's width, so `1u64 << 64` is `1` and the mask
+/// comes out `0`. `struct { unsigned long long a:64; }` therefore read back as
+/// zero. The boundary cases are what the fix is about, so they are asserted
+/// individually rather than through a loop that could share the same mistake.
+#[test]
+fn test_bitfield_value_mask_covers_the_full_carrier() {
+    use crate::ir::linearize_emit::bitfield_value_mask;
+
+    assert_eq!(bitfield_value_mask(1), 0x1);
+    assert_eq!(bitfield_value_mask(3), 0x7);
+    assert_eq!(bitfield_value_mask(8), 0xff);
+    assert_eq!(bitfield_value_mask(31), 0x7fff_ffff);
+    assert_eq!(bitfield_value_mask(32), 0xffff_ffff);
+    assert_eq!(bitfield_value_mask(33), 0x1_ffff_ffff);
+    assert_eq!(bitfield_value_mask(63), 0x7fff_ffff_ffff_ffff);
+    // The regression: this was 0.
+    assert_eq!(bitfield_value_mask(64), u64::MAX);
+
+    // Every width is a contiguous run of low bits of exactly that length.
+    for w in 1..=64u32 {
+        let m = bitfield_value_mask(w);
+        assert_eq!(m.count_ones(), w, "width {w} masks {} bits", m.count_ones());
+        assert_eq!(m.trailing_ones(), w, "width {w} is not low-contiguous");
+    }
+}

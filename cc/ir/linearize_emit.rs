@@ -15,6 +15,26 @@ use crate::float::FloatVal;
 use crate::parse::ast::{AssignOp, BinaryOp, Expr, ExprKind, UnaryOp};
 use crate::types::{MemberInfo, TypeId, TypeKind};
 
+/// The low-`bit_width` mask for a bit-field value.
+///
+/// Spelled as a shift of `u64::MAX` rather than `(1 << bit_width) - 1` because
+/// the latter overflows at the one width that matters most: Rust masks a shift
+/// amount to the operand's width, so `1u64 << 64` is `1` and the mask comes out
+/// `0`. That made `struct { unsigned long long a:64; }` read back as zero at
+/// every optimization level, on both targets.
+///
+/// A zero width never reaches here -- a named zero-width bit-field is rejected
+/// by `validate_bitfield`, and the unnamed kind allocates nothing -- but the
+/// mask is defined for it anyway rather than shifting by 64 again.
+pub(crate) fn bitfield_value_mask(bit_width: u32) -> u64 {
+    debug_assert!(bit_width <= 64, "bit-field wider than its carrier");
+    if bit_width == 0 {
+        0
+    } else {
+        u64::MAX >> (64 - bit_width)
+    }
+}
+
 impl<'a> super::linearize::Linearizer<'a> {
     pub(crate) fn emit_const(&mut self, val: i128, typ: TypeId) -> PseudoId {
         let id = self.alloc_pseudo();
@@ -247,7 +267,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         };
 
         // 3. Mask to bit_width bits
-        let mask = (1u64 << bit_width) - 1;
+        let mask = bitfield_value_mask(bit_width);
         let mask_val = self.emit_const(mask as i128, storage_type);
         let masked = self.alloc_pseudo();
         self.emit(Instruction::binop(
@@ -378,7 +398,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         ));
 
         // 2. Create mask for the bitfield bits: ~(((1 << width) - 1) << offset)
-        let field_mask = ((1u64 << bit_width) - 1) << bit_offset;
+        let field_mask = bitfield_value_mask(bit_width) << bit_offset;
         let clear_mask = !field_mask;
         let clear_mask_val = self.emit_const(clear_mask as i128, storage_type);
 
@@ -394,7 +414,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         ));
 
         // 4. Mask new value to bit_width and shift to position
-        let value_mask = (1u64 << bit_width) - 1;
+        let value_mask = bitfield_value_mask(bit_width);
         let value_mask_val = self.emit_const(value_mask as i128, storage_type);
         let masked_new = self.alloc_pseudo();
         self.emit(Instruction::binop(

@@ -2409,3 +2409,172 @@ fn diagnostics_legal_deref_and_call_operands_are_accepted() {
         compile_expect_ok(name, src);
     }
 }
+
+// === #C108 — initializer constraints (C17 6.7.9p11, p13, p14) ===
+
+/// Nothing checked an initializer's type, at either scope.
+///
+/// The *assignment* form of every case below was already diagnosed by #C47, so
+/// the same program was accepted or rejected depending on whether the value
+/// arrived through `=` in a declaration or `=` in a statement. And these are
+/// not merely undiagnosed: `int x = s;` from a struct and `int b[3] = a;` from
+/// an array both compiled and yielded **zero**, while `int *q = d;` reached
+/// the same `emit_convert` that #C47 stopped a plain assignment from taking.
+///
+/// Severities come from `AssignFault::is_error`, so they are gcc's without a
+/// table to maintain: an incompatible type is an error and the pointer/integer
+/// conversions are warnings.
+#[test]
+fn diagnostics_bad_initializers_are_rejected() {
+    for (name, src, expected) in [
+        (
+            "init_scalar_from_struct",
+            "struct S { int a; };\nvoid f(struct S s){ int x = s; (void)x; }\n",
+            "incompatible types when initializing",
+        ),
+        (
+            "init_struct_from_scalar",
+            "struct S { int a; };\nvoid f(void){ struct S s = 1; (void)s; }\n",
+            "invalid initializer",
+        ),
+        (
+            "init_array_from_array",
+            "void f(void){ int a[3]; int b[3] = a; (void)b; }\n",
+            "invalid initializer",
+        ),
+        (
+            "init_ptr_from_double",
+            "void f(double d){ int *q = d; (void)q; }\n",
+            "incompatible types when initializing",
+        ),
+        // The same four at file scope, which is a separate declarator path.
+        (
+            "init_fs_scalar_from_struct",
+            "struct S { int a; };\nstruct S s;\nint x = s;\n",
+            "incompatible types when initializing",
+        ),
+        (
+            "init_fs_struct_from_scalar",
+            "struct S { int a; };\nstruct S s = 1;\n",
+            "invalid initializer",
+        ),
+        (
+            "init_fs_array_from_array",
+            "int a[3];\nint b[3] = a;\n",
+            "invalid initializer",
+        ),
+    ] {
+        compile_expect_error(name, src, expected);
+    }
+}
+
+/// gcc only warns for the pointer/integer conversions, so c17 must too --
+/// erroring here would reject a great deal of code that builds everywhere.
+#[test]
+fn diagnostics_converting_initializers_only_warn() {
+    compile_expect_warning(
+        "init_incompatible_pointer",
+        "void f(int *p){ char *q = p; (void)q; }\n",
+        "incompatible pointer type",
+    );
+    compile_expect_warning(
+        "init_int_from_pointer",
+        "void f(int *p){ int b = p; (void)b; }\n",
+        "makes integer from pointer",
+    );
+    compile_expect_warning(
+        "init_pointer_from_int",
+        "void f(void){ int *p = 7; (void)p; }\n",
+        "makes pointer from integer",
+    );
+}
+
+/// The accept side. An aggregate may be initialized from a compatible
+/// aggregate, a character array from a string literal with or without braces,
+/// and every ordinary conversion still applies -- so a check of this shape has
+/// far more ways to be too strict than too lax.
+#[test]
+fn diagnostics_ordinary_initializers_are_accepted() {
+    for (name, src) in [
+        (
+            "init_struct_from_struct",
+            "struct S { int a; };\nvoid f(struct S b){ struct S s = b; (void)s; }\n",
+        ),
+        (
+            "init_union_from_union",
+            "union U { int a; };\nvoid f(union U b){ union U u = b; (void)u; }\n",
+        ),
+        (
+            "init_char_array",
+            "void f(void){ char s[6] = \"hello\"; (void)s; }\n",
+        ),
+        (
+            "init_wide_array",
+            "void f(void){ __WCHAR_TYPE__ s[3] = L\"ab\"; (void)s; }\n",
+        ),
+        (
+            "init_braced_string",
+            "void f(void){ char s[6] = {\"hello\"}; (void)s; }\n",
+        ),
+        ("init_scalar", "void f(void){ int x = 3; (void)x; }\n"),
+        ("init_widening", "void f(void){ double d = 3; (void)d; }\n"),
+        (
+            "init_null_pointer",
+            "void f(void){ int *p = 0; (void)p; }\n",
+        ),
+        (
+            "init_from_void_ptr",
+            "void f(void *v){ int *p = v; (void)p; }\n",
+        ),
+        (
+            "init_to_void_ptr",
+            "void f(int *q){ void *p = q; (void)p; }\n",
+        ),
+        (
+            "init_bool_from_ptr",
+            "void f(int *p){ _Bool b = p; (void)b; }\n",
+        ),
+        (
+            "init_struct_brace",
+            "struct S { int a; };\nvoid f(void){ struct S s = {1}; (void)s; }\n",
+        ),
+        (
+            "init_array_brace",
+            "void f(void){ int b[3] = {1,2,3}; (void)b; }\n",
+        ),
+        (
+            "init_scalar_brace",
+            "void f(void){ int x = {3}; (void)x; }\n",
+        ),
+        (
+            "init_array_of_struct",
+            "struct S { int a; };\nvoid f(void){ struct S v[2] = {{1},{2}}; (void)v; }\n",
+        ),
+        (
+            "init_designated",
+            "void f(void){ int a[5] = {[3]=9}; (void)a; }\n",
+        ),
+        (
+            "init_string_pointer",
+            "void f(void){ const char *s = \"hi\"; (void)s; }\n",
+        ),
+        (
+            "init_function_pointer",
+            "int g(void);\nvoid f(void){ int (*fp)(void) = g; (void)fp; }\n",
+        ),
+        (
+            "init_array_decay",
+            "void f(void){ int a[3]; int *p = a; (void)p; }\n",
+        ),
+        (
+            "init_compound_literal",
+            "void f(void){ int *p = (int[]){1,2}; (void)p; }\n",
+        ),
+        (
+            "init_enum",
+            "enum E { A, B };\nvoid f(void){ enum E e = A; (void)e; }\n",
+        ),
+    ] {
+        compile_expect_ok(name, src);
+    }
+}

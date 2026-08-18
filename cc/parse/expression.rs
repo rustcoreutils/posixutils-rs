@@ -2029,6 +2029,90 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// C17 6.7.9p11: the initializer for a scalar shall satisfy the
+    /// constraints of simple assignment; p13 and p14 confine an aggregate to a
+    /// brace-enclosed list, or a string literal for a character array.
+    ///
+    /// Nothing checked an initializer at all. `int x = s;` from a struct and
+    /// `int b[3] = a;` from an array both compiled and yielded **zero**;
+    /// `struct S s = 1;` was accepted; `int *q = d;` from a `double` reached
+    /// the same `emit_convert` that #C47 stopped a plain assignment from
+    /// taking. The assignment form of every one of those was already
+    /// diagnosed, which is what made this a gap rather than a policy: the same
+    /// program was accepted or rejected depending on whether the value arrived
+    /// through `=` in a declaration or `=` in a statement.
+    ///
+    /// The severities come from `AssignFault::is_error`, so they are gcc's
+    /// without a table to maintain: incompatible types are an error, the
+    /// pointer/integer conversions a warning.
+    pub(crate) fn check_initializer_types(&mut self, target: TypeId, init: &Expr) {
+        // A brace-enclosed list has its own rules, checked elsewhere.
+        if matches!(init.kind, ExprKind::InitList { .. }) {
+            return;
+        }
+        let Some(v) = init.typ else {
+            return;
+        };
+
+        // 6.7.9p14: a character array may be initialized by a string literal,
+        // with or without braces. Any other array needs a list.
+        if self.types.kind(target) == TypeKind::Array {
+            let from_string = matches!(
+                init.kind,
+                ExprKind::StringLit(_)
+                    | ExprKind::WideStringLit(_)
+                    | ExprKind::Utf16StringLit(_)
+                    | ExprKind::Utf32StringLit(_)
+            );
+            if !from_string {
+                diag::error(init.pos, &gettext("invalid initializer"));
+            }
+            return;
+        }
+
+        let t = self.decayed_type(target);
+        let v = self.decayed_type(v);
+        let Some(fault) = self
+            .types
+            .assignment_fault(t, v, self.is_null_pointer_constant(init))
+        else {
+            return;
+        };
+
+        // An aggregate initialized from something that is not a compatible
+        // aggregate is "invalid initializer" in gcc, not a type mismatch --
+        // and the wording is the useful part, being what a user searches for.
+        if fault.is_error() && matches!(self.types.kind(t), TypeKind::Struct | TypeKind::Union) {
+            diag::error(init.pos, &gettext("invalid initializer"));
+            return;
+        }
+
+        let (t_name, v_name) = (
+            self.types.format_type(t, Some(self.idents)),
+            self.types.format_type(v, Some(self.idents)),
+        );
+        if fault.is_error() {
+            if self.types.kind(v) == TypeKind::Void {
+                diag::error(
+                    init.pos,
+                    &gettext("void value not ignored as it ought to be"),
+                );
+                return;
+            }
+            diag::error_args(
+                init.pos,
+                "incompatible types when initializing type '{0}' using type '{1}'",
+                &[&t_name, &v_name],
+            );
+        } else {
+            diag::warning_args(
+                init.pos,
+                "initialization of '{0}' from '{1}' {2}",
+                &[&t_name, &v_name, fault.describe()],
+            );
+        }
+    }
+
     /// Is this expression a null pointer constant (C17 6.3.2.3p3) -- an
     /// integer constant expression with the value 0, possibly cast to
     /// `void *`?

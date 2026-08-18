@@ -2384,6 +2384,7 @@ impl Parser<'_> {
                     let old_type = typ;
                     typ = self.infer_array_size_from_init(typ, init_expr);
                     self.check_excess_initializers(typ, init_expr);
+                    self.check_initializer_types(typ, init_expr);
 
                     // If the type changed (array size was inferred), update the symbol's type
                     // This is needed because the symbol was already added before parsing the initializer
@@ -5177,6 +5178,7 @@ impl Parser<'_> {
             let old_type = var_type_id;
             var_type_id = self.infer_array_size_from_init(var_type_id, init_expr);
             self.check_excess_initializers(var_type_id, init_expr);
+            self.check_initializer_types(var_type_id, init_expr);
 
             // If the type changed (array size was inferred), update the symbol's type
             // This is needed because the symbol was already added before parsing the initializer
@@ -5279,6 +5281,7 @@ impl Parser<'_> {
                 let old_type = decl_type;
                 decl_type = self.infer_array_size_from_init(decl_type, init_expr);
                 self.check_excess_initializers(decl_type, init_expr);
+                self.check_initializer_types(decl_type, init_expr);
 
                 // If the type changed (array size was inferred), update the symbol's type
                 // This is needed because the symbol was already added before parsing the initializer

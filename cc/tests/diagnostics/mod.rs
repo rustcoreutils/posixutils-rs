@@ -2320,3 +2320,92 @@ fn diagnostics_legal_jumps_and_labels_are_accepted() {
         compile_expect_ok(name, src);
     }
 }
+
+// === #C107 — operand constraints on `*` and on a call (C17 6.5.3.2p2, 6.5.2.2p1) ===
+
+/// Both were accepted in silence and both produced a broken program.
+///
+/// `int x; *x;` dereferenced the integer's *value* as an address, so the
+/// program built and **segfaulted**. `int x; x();` reached the back end and
+/// emitted a call to a symbol named `x`, so a front-end error surfaced as an
+/// undefined-reference **link** failure naming a variable that plainly exists.
+#[test]
+fn diagnostics_bad_deref_and_call_operands_are_rejected() {
+    for (name, src) in [
+        ("deref_int", "int f(void){ int x = 0; return *x; }\n"),
+        ("deref_double", "int f(double d){ return (int)*d; }\n"),
+        (
+            "deref_struct",
+            "struct S { int a; };\nint f(struct S s){ return *s; }\n",
+        ),
+    ] {
+        compile_expect_error(name, src, "invalid type argument of unary '*'");
+    }
+    for (name, src) in [
+        ("call_int", "int f(void){ int x = 0; x(); return 0; }\n"),
+        ("call_double", "int f(double d){ d(); return 0; }\n"),
+        (
+            "call_struct",
+            "struct S { int a; };\nint f(struct S s){ s(); return 0; }\n",
+        ),
+    ] {
+        compile_expect_error(
+            name,
+            src,
+            "called object is not a function or function pointer",
+        );
+    }
+}
+
+/// The accept side. A *function designator* may be dereferenced -- `(*f)()` and
+/// even `(***f)()` are ordinary idioms gcc accepts, `*f` on a function being a
+/// no-op -- and a call may go through a pointer, a cast to one, a struct
+/// member, or an array element. Rejecting any of these would break far more
+/// code than the checks above fix.
+#[test]
+fn diagnostics_legal_deref_and_call_operands_are_accepted() {
+    for (name, src) in [
+        ("deref_pointer", "int f(int *p){ return *p; }\n"),
+        (
+            "deref_array",
+            "int f(void){ int a[2] = {1,2}; return *a; }\n",
+        ),
+        ("deref_ptr_to_ptr", "int f(int **p){ return **p; }\n"),
+        ("deref_void_ptr", "int f(void *p){ *p; return 0; }\n"),
+        (
+            "deref_function_designator",
+            "int g(void);\nint f(void){ return (*g)(); }\n",
+        ),
+        (
+            "deref_function_thrice",
+            "int g(void);\nint f(void){ return (***g)(); }\n",
+        ),
+        (
+            "call_function",
+            "int g(void);\nint f(void){ return g(); }\n",
+        ),
+        ("call_pointer", "int f(int (*fp)(void)){ return fp(); }\n"),
+        (
+            "call_deref_pointer",
+            "int f(int (*fp)(void)){ return (*fp)(); }\n",
+        ),
+        (
+            "call_deref_thrice",
+            "int f(int (*fp)(void)){ return (***fp)(); }\n",
+        ),
+        (
+            "call_cast",
+            "int f(void *p){ return ((int (*)(void))p)(); }\n",
+        ),
+        (
+            "call_member",
+            "struct S { int (*fp)(void); };\nint f(struct S s){ return s.fp(); }\n",
+        ),
+        (
+            "call_array_element",
+            "int f(int (*a[2])(void)){ return a[0](); }\n",
+        ),
+    ] {
+        compile_expect_ok(name, src);
+    }
+}

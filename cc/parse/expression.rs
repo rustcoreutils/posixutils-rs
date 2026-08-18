@@ -676,6 +676,7 @@ impl<'a> Parser<'a> {
                     }
                 })
                 .unwrap_or(self.types.int_id);
+            self.check_dereferenceable(&operand, op_pos);
             return Ok(Self::typed_expr(
                 ExprKind::Unary {
                     op: UnaryOp::Deref,
@@ -1526,6 +1527,7 @@ impl<'a> Parser<'a> {
                 self.advance();
                 let args = self.parse_argument_list()?;
                 self.expect_special(b')')?;
+                self.check_callable(&expr, call_pos);
                 self.check_call_arity(&expr, &args, call_pos);
                 self.check_argument_types(&expr, &args);
 
@@ -1824,6 +1826,62 @@ impl<'a> Parser<'a> {
     ///
     /// `a[i]` is defined as `*(a + i)`, so it is symmetric -- `3[arr]` is
     /// legal C and has to stay so.
+    /// C17 6.5.3.2p2: the operand of unary `*` shall have pointer type.
+    ///
+    /// `int x; *x;` compiled and dereferenced the integer's value as an
+    /// address, so the program built and segfaulted. A *function designator*
+    /// is deliberately allowed: `(*f)()` and even `(***f)()` are ordinary
+    /// idioms that gcc accepts, `*f` on a function being a no-op, and the
+    /// result type computed just above already models that.
+    fn check_dereferenceable(&self, operand: &Expr, pos: Position) {
+        let Some(typ) = operand.typ else {
+            return;
+        };
+        if matches!(
+            self.types.kind(typ),
+            TypeKind::Pointer | TypeKind::Array | TypeKind::Function
+        ) {
+            return;
+        }
+        let named = self.types.format_type(typ, Some(self.idents));
+        diag::error_args(
+            pos,
+            "invalid type argument of unary '*' (have '{0}')",
+            &[&named],
+        );
+    }
+
+    /// C17 6.5.2.2p1: the expression before `(` shall be a function, or a
+    /// pointer to one.
+    ///
+    /// `int x; x();` reached the back end and emitted a call to a symbol named
+    /// `x`, so what should have been a front-end error surfaced as an
+    /// undefined-reference *link* failure naming a variable that plainly
+    /// exists. A pointer to a function is the ordinary spelling and a pointer
+    /// to a pointer to one is reached through `*`, so both are accepted.
+    fn check_callable(&self, callee: &Expr, pos: Position) {
+        let Some(typ) = callee.typ else {
+            return;
+        };
+        let is_callable = match self.types.kind(typ) {
+            TypeKind::Function => true,
+            TypeKind::Pointer => self
+                .types
+                .base_type(typ)
+                .is_some_and(|t| self.types.kind(t) == TypeKind::Function),
+            _ => false,
+        };
+        if is_callable {
+            return;
+        }
+        let named = self.types.format_type(typ, Some(self.idents));
+        diag::error_args(
+            pos,
+            "called object is not a function or function pointer: '{0}'",
+            &[&named],
+        );
+    }
+
     fn check_subscript(&self, base: &Expr, index: &Expr, pos: Position) {
         let (Some(b), Some(i)) = (base.typ, index.typ) else {
             return;

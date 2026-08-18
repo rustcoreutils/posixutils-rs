@@ -3158,14 +3158,25 @@ impl Parser<'_> {
         let max = constants.iter().map(|c| c.value).max().unwrap_or(0);
 
         let fits = |lo: i128, hi: i128| min >= lo && max <= hi;
-        if fits(i32::MIN as i128, i32::MAX as i128) {
+        // 6.7.2.2p4 leaves the choice to the implementation, requiring only a
+        // type that represents every member. gcc's choice is unsigned whenever
+        // no enumerator is negative, and it is observable -- `(enum E)-1 > 0`
+        // is true there and was false here. Preferring `int` for a small
+        // non-negative list also made an enum bit-field read back negative:
+        // `enum E { A, B, C, D }; struct { enum E e:2; }` holding `D` gave -1
+        // where gcc gives 3, because the field's signedness follows the type's.
+        if min >= 0 {
+            if fits(0, u32::MAX as i128) {
+                (self.types.uint_id, 4)
+            } else if fits(0, u64::MAX as i128) {
+                (self.types.ulong_id, 8)
+            } else {
+                unreachable!("a non-negative maximum always fits u64 or overflows i128")
+            }
+        } else if fits(i32::MIN as i128, i32::MAX as i128) {
             (self.types.int_id, 4)
-        } else if fits(0, u32::MAX as i128) {
-            (self.types.uint_id, 4)
         } else if fits(i64::MIN as i128, i64::MAX as i128) {
             (self.types.long_id, 8)
-        } else if fits(0, u64::MAX as i128) {
-            (self.types.ulong_id, 8)
         } else {
             // A list spanning below i64::MIN and above i64::MAX has no
             // integer type that holds both ends. Say so rather than picking
@@ -3417,6 +3428,11 @@ impl Parser<'_> {
                     // Unnamed bitfield: parse width only
                     self.advance(); // consume ':'
                     let width = self.parse_bitfield_width()?;
+                    // An unnamed bit-field is still a bit-field: its type has
+                    // to be one a bit-field may have, and its width has to fit.
+                    // Neither unnamed site validated anything, so
+                    // `struct { float : 3; }` was accepted.
+                    self.validate_bitfield(member_base_type_id, width, false)?;
 
                     members.push(StructMember {
                         name: StringId::EMPTY,
@@ -3439,6 +3455,7 @@ impl Parser<'_> {
                         // Unnamed bitfield: parse width only
                         self.advance(); // consume ':'
                         let width = self.parse_bitfield_width()?;
+                        self.validate_bitfield(member_base_type_id, width, false)?;
 
                         members.push(StructMember {
                             name: StringId::EMPTY,
@@ -5527,21 +5544,13 @@ impl Parser<'_> {
     /// `is_named` indicates if this bitfield has a name (unnamed bitfields are
     /// allowed to have zero width for alignment purposes).
     fn validate_bitfield(&self, typ_id: TypeId, width: u32, is_named: bool) -> ParseResult<()> {
-        // Check allowed types: _Bool, int, unsigned int (and their signed/unsigned variants)
-        // Also allow long long since GCC/Clang support it
-        let kind = self.types.kind(typ_id);
-        let valid_type = matches!(
-            kind,
-            TypeKind::Bool
-                | TypeKind::Int
-                | TypeKind::Char
-                | TypeKind::Short
-                | TypeKind::Long
-                | TypeKind::LongLong
-                | TypeKind::Int128
-        );
-
-        if !valid_type {
+        // C17 6.7.2.1p5 allows `_Bool`, `signed int`, `unsigned int`, and "some
+        // other implementation-defined type". gcc's set is every integer type,
+        // enumerations included, and real headers lean on `enum E e : 2;`
+        // heavily -- a hand-written list of `TypeKind`s omitted `Enum` and
+        // rejected all of them. `is_integer` is that set, and already covers
+        // every kind the list named.
+        if !self.types.is_integer(typ_id) {
             return Err(ParseError::new(
                 "bitfield must have integer type",
                 self.current_pos(),

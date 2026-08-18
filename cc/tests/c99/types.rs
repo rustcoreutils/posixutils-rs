@@ -792,3 +792,72 @@ int main(void) { return 0; }
 "#;
     assert_eq!(compile_and_run("float128_edge_cases", src, &[]), 0);
 }
+
+/// An `enum` may be a bit-field's type, and a non-negative enumeration is
+/// unsigned (#C104, #C105).
+///
+/// `validate_bitfield` matched a hand-written list of `TypeKind`s that omitted
+/// `Enum`, so `struct S { enum E e : 2; };` -- which real headers use heavily --
+/// was rejected outright with "bitfield must have integer type". 6.7.2.1p5
+/// allows "some other implementation-defined type" and gcc's set is every
+/// integer type; `is_integer` already is that set.
+///
+/// Accepting it exposed the second half. A bit-field's signedness follows its
+/// declared type's, and `enum_underlying_type` preferred `int` for any list
+/// fitting in `int` -- so a two-bit field of `enum { A, B, C, D }` holding `D`
+/// read back **-1** where gcc gives 3. gcc's rule, which 6.7.2.2p4 leaves it
+/// free to choose, is unsigned whenever no enumerator is negative; that is
+/// observable well beyond bit-fields, since `(enum E)-1 > 0` is true there and
+/// was false here.
+#[test]
+fn c99_enum_bitfields_and_enum_signedness() {
+    let code = r#"
+enum Small { S0, S1, S2, S3 };
+enum Neg   { N_A = -2, N_B = 1 };
+enum Big   { B_HUGE = 0x100000000LL };
+enum Wide  { W_TOP = 0x80000000u };
+
+struct A { enum Small e : 2; };
+struct B { enum Neg   e : 3; };
+struct C { enum Small e : 2; unsigned u : 3; };
+struct D { enum Small e : 2; enum Neg n : 3; };
+
+int main(void) {
+    /* An enumeration with no negative member is unsigned, as in gcc. */
+    if (!((enum Small)-1 > 0)) return 1;
+    if (!((enum Wide)-1 > 0))  return 2;
+    if (!((enum Big)-1 > 0))   return 3;
+    /* One with a negative member is signed. */
+    if ((enum Neg)-1 > 0)      return 4;
+
+    /* ...and the sizes are unchanged by the signedness choice. */
+    if (sizeof(enum Small) != 4) return 5;
+    if (sizeof(enum Neg)   != 4) return 6;
+    if (sizeof(enum Big)   != 8) return 7;
+
+    /* A bit-field of an unsigned enumeration does not sign-extend. */
+    struct A a; a.e = S3;
+    if ((int)a.e != 3) return 8;
+    a.e = S0; if ((int)a.e != 0) return 9;
+
+    /* A bit-field of a signed one does. */
+    struct B b; b.e = N_A;
+    if ((int)b.e != -2) return 10;
+    b.e = N_B; if ((int)b.e != 1) return 11;
+
+    /* Neighbours are undisturbed either way. */
+    struct C c; c.e = S2; c.u = 5;
+    if ((int)c.e != 2 || c.u != 5) return 12;
+    if (sizeof(struct C) != 4) return 13;
+
+    struct D d; d.e = S1; d.n = N_A;
+    if ((int)d.e != 1 || (int)d.n != -2) return 14;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("enum_bitfields_and_signedness", code, &[]),
+        0
+    );
+}

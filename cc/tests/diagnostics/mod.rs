@@ -2146,3 +2146,47 @@ fn diagnostics_address_differences_across_objects_are_rejected() {
         "constant",
     );
 }
+
+// === #C105 — bit-field types (C17 6.7.2.1p5) ===
+
+/// An enumeration is a bit-field type gcc accepts and real headers rely on.
+#[test]
+fn diagnostics_enum_bitfields_are_accepted() {
+    compile_expect_ok("bf_enum", "enum E { A, B };\nstruct S { enum E e : 2; };\n");
+    compile_expect_ok(
+        "bf_enum_unnamed",
+        "enum E { A, B };\nstruct S { enum E : 2; };\n",
+    );
+    compile_expect_ok(
+        "bf_enum_mixed",
+        "enum E { A, B };\nstruct S { enum E e : 2; unsigned u : 3; int i; };\n",
+    );
+    compile_expect_ok("bf_bool", "struct S { _Bool b : 1; };\n");
+    compile_expect_ok("bf_typedef", "typedef int my;\nstruct S { my m : 3; };\n");
+    compile_expect_ok("bf_longlong", "struct S { long long v : 40; };\n");
+}
+
+/// A bit-field still may not have a non-integer type -- and the *unnamed* form
+/// was validating nothing at all, so `struct { float : 3; }` was accepted where
+/// the named spelling was rejected.
+#[test]
+fn diagnostics_non_integer_bitfields_are_rejected() {
+    for (name, src) in [
+        ("bf_float_named", "struct S { float f : 3; };\n"),
+        ("bf_float_unnamed", "struct S { float : 3; };\n"),
+        ("bf_double_unnamed", "struct S { double : 3; };\n"),
+        ("bf_ptr", "struct S { int *p : 3; };\n"),
+        (
+            "bf_struct",
+            "struct I { int x; };\nstruct S { struct I i : 3; };\n",
+        ),
+    ] {
+        compile_expect_error(name, src, "bitfield must have integer type");
+    }
+    // Width constraints still apply to the unnamed form too.
+    compile_expect_error(
+        "bf_unnamed_wide",
+        "struct S { int : 40; };\n",
+        "exceeds type size",
+    );
+}

@@ -9312,3 +9312,48 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("sizeof_of_array_objects", code, &[]), 0);
 }
+
+/// The values a folded `const` object contributes to a static initializer
+/// (#C102).
+///
+/// Acceptance alone is not the check: before the fix `int w = c;` was accepted
+/// and happened to be right while `int w = c + 1;` was rejected, so the
+/// arithmetic is what distinguishes a real fold from an accident.
+#[test]
+fn codegen_const_objects_fold_in_static_initializers() {
+    let code = r#"
+const int   c = 5;
+static const int s = 9;
+const long  l = 3;
+const double d = 2.5;
+const float  f = 1.5f;
+const char   ch = 'A';
+int arr[10];
+
+int    w_plain   = c;
+int    w_arith   = c * 2 + 1;
+int    w_negate  = -c;
+int    w_cond    = c ? 11 : 22;
+int    w_static  = s;
+long   w_shift   = l << 4;
+double w_double  = d * 2;
+float  w_float   = f + 1.0f;
+int    w_char    = ch + 1;
+int   *w_address = &arr[c - 3];
+
+int main(void) {
+    if (w_plain  != 5)  return 1;
+    if (w_arith  != 11) return 2;
+    if (w_negate != -5) return 3;
+    if (w_cond   != 11) return 4;
+    if (w_static != 9)  return 5;
+    if (w_shift  != 48) return 6;
+    if (w_double != 5.0) return 7;
+    if (w_float  != 2.5f) return 8;
+    if (w_char   != 'A' + 1) return 9;
+    if (w_address != &arr[2]) return 10;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("const_fold_static_init", code, &[]), 0);
+}

@@ -258,7 +258,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 _ => {
                     // An arithmetic object folded above, at its own type; what
                     // is left is a negation initializing something else.
-                    if let Some(val) = self.eval_const_expr(expr) {
+                    if let Some(val) = self.eval_const_init_expr(expr) {
                         Initializer::Int(val)
                     } else {
                         // Returning `Initializer::None` here would put the
@@ -282,7 +282,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     } else {
                         Initializer::SymAddrOffset(name, offset)
                     }
-                } else if let Some(val) = self.eval_const_expr(expr) {
+                } else if let Some(val) = self.eval_const_init_expr(expr) {
                     // Not every address-of is a relocation: the address of a
                     // member of a null pointer is an integer constant, and a
                     // pointer object may be initialized with one.
@@ -350,10 +350,15 @@ impl<'a> super::linearize::Linearizer<'a> {
                     if let Some(val) = sym.enum_value {
                         Initializer::Int(val)
                     } else {
-                        // Reading the value of an object is not a constant
-                        // expression (6.7.9p4) and this silently yields zero.
-                        // Diagnosing it needs an initializer-scoped folder
-                        // first -- see #C102.
+                        // Not an enum constant, and `fold_scalar_init` has
+                        // already tried the `const`-object folding gcc does
+                        // here -- so this reads the value of an object that
+                        // has none to read, which 6.7.9p4 does not permit to
+                        // initialize one with static storage duration.
+                        // Returning `Initializer::None` put the object in .bss
+                        // and said nothing, so `int v; int w = v;` silently
+                        // became zero.
+                        self.reject_initializer(expr);
                         Initializer::None
                     }
                 }
@@ -390,7 +395,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     // arithmetic that happens to use `+` or `-`. An arithmetic
                     // object folded above at its own type; anything else that
                     // reaches here can only be an integer constant.
-                    if let Some(val) = self.eval_const_expr(expr) {
+                    if let Some(val) = self.eval_const_init_expr(expr) {
                         return Initializer::Int(val);
                     }
                     self.reject_initializer(expr);
@@ -400,7 +405,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 // Evaluate the pointer side as a static address
                 if let Some((name, base_off)) = self.static_address_of(ptr_expr) {
                     // Evaluate the integer side as a constant
-                    if let Some(int_val) = self.eval_const_expr(int_expr) {
+                    if let Some(int_val) = self.eval_const_init_expr(int_expr) {
                         // Get the pointee size for pointer arithmetic scaling
                         let pointee_size = ptr_expr
                             .typ
@@ -417,7 +422,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         } else {
                             Initializer::SymAddrOffset(name, byte_offset)
                         }
-                    } else if let Some(val) = self.eval_const_expr(expr) {
+                    } else if let Some(val) = self.eval_const_init_expr(expr) {
                         Initializer::Int(val)
                     } else {
                         error(
@@ -426,7 +431,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         );
                         Initializer::None
                     }
-                } else if let Some(val) = self.eval_const_expr(expr) {
+                } else if let Some(val) = self.eval_const_init_expr(expr) {
                     Initializer::Int(val)
                 } else {
                     error(
@@ -444,7 +449,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 then_expr,
                 else_expr,
             } => {
-                if let Some(cond_val) = self.eval_const_expr(cond) {
+                if let Some(cond_val) = self.eval_const_init_expr(cond) {
                     if cond_val != 0 {
                         return self.ast_init_to_ir(then_expr, typ);
                     } else {
@@ -466,7 +471,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             // Try to evaluate as integer or float constant expression
             _ => {
                 // An arithmetic object folded above, at its own type.
-                if let Some(val) = self.eval_const_expr(expr) {
+                if let Some(val) = self.eval_const_init_expr(expr) {
                     Initializer::Int(val)
                 } else if let Some((name, offset)) = self.eval_static_address(expr) {
                     // Try as a static address (e.g., &global.field->subfield chains)
@@ -586,13 +591,13 @@ impl<'a> super::linearize::Linearizer<'a> {
         match &expr.kind {
             // `I` itself is `__builtin_complex(0.0, 1.0)`.
             ExprKind::BuiltinComplex { real, imag } => Some((
-                self.eval_const_float_expr(real)?,
-                self.eval_const_float_expr(imag)?,
+                self.eval_const_float_init_expr(real)?,
+                self.eval_const_float_init_expr(imag)?,
             )),
 
             // A real constant is a complex one with a zero imaginary part.
             ExprKind::FloatLit(_) | ExprKind::IntLit(_) | ExprKind::CharLit(_) => {
-                Some((self.eval_const_float_expr(expr)?, FloatVal::ZERO))
+                Some((self.eval_const_float_init_expr(expr)?, FloatVal::ZERO))
             }
 
             ExprKind::Cast { expr: inner, .. } => self.eval_const_complex(inner),
@@ -690,12 +695,12 @@ impl<'a> super::linearize::Linearizer<'a> {
                     Initializer::Float(val)
                 }
             };
-            if let Some(val) = self.eval_const_float_expr(expr) {
+            if let Some(val) = self.eval_const_float_init_expr(expr) {
                 return Some(wrap(val));
             }
             // An integer constant initializing a floating object converts
             // exactly, however wide it is: `long double x = 1;`.
-            let val = self.eval_const_expr(expr)?;
+            let val = self.eval_const_init_expr(expr)?;
             return Some(wrap(FloatVal::from_parts(val < 0, val.unsigned_abs(), 0)));
         }
 
@@ -703,7 +708,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         // becomes 1, so 0.5 is `true` where `(int)0.5` is 0 (C17 6.3.1.2).
         let is_bool = self.types.kind(typ) == TypeKind::Bool;
 
-        if let Some(val) = self.eval_const_expr(expr) {
+        if let Some(val) = self.eval_const_init_expr(expr) {
             return Some(Initializer::Int(if is_bool {
                 i128::from(val != 0)
             } else {
@@ -712,7 +717,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
         // C17 6.3.1.4: converting a floating constant to an integer type
         // discards the fractional part.
-        let val = self.eval_const_float_expr(expr)?;
+        let val = self.eval_const_float_init_expr(expr)?;
         Some(Initializer::Int(if is_bool {
             i128::from(!val.is_zero())
         } else {

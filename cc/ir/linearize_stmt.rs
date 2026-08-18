@@ -1643,19 +1643,88 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
     }
 
+    /// The value of a `const`-qualified object whose own initializer already
+    /// folded to a constant, if this identifier names one.
+    ///
+    /// C makes no such object a constant expression -- that is a C++ rule --
+    /// but gcc folds it in a static initializer, silently and even under
+    /// `-pedantic`, so `const int c = 5; int w = c;` compiles everywhere. The
+    /// qualifier alone is not enough: `const int c;` and `extern const int c;`
+    /// have no visible value and gcc rejects both, which returning `None` here
+    /// leaves to the caller's diagnostic.
+    ///
+    /// The already-emitted global is the record consulted, so this answers only
+    /// for an object defined earlier in the translation unit -- which is what
+    /// "visible value" means.
+    fn const_object_value(&self, symbol_id: crate::symbol::SymbolId) -> Option<i128> {
+        let name = self.symbol_name(symbol_id);
+        let key = format!("{}.{}", self.current_func_name, name);
+        let global_name = match self.static_locals.get(&key) {
+            Some(info) => info.global_name.as_str(),
+            None => name.as_str(),
+        };
+        let global = self
+            .module
+            .globals
+            .iter()
+            .find(|g| g.name == global_name && g.is_const)?;
+        match &global.init {
+            crate::ir::Initializer::Int(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// [`Self::const_object_value`] for a floating `const` object.
+    fn const_object_float_value(&self, symbol_id: crate::symbol::SymbolId) -> Option<FloatVal> {
+        let name = self.symbol_name(symbol_id);
+        let key = format!("{}.{}", self.current_func_name, name);
+        let global_name = match self.static_locals.get(&key) {
+            Some(info) => info.global_name.as_str(),
+            None => name.as_str(),
+        };
+        let global = self
+            .module
+            .globals
+            .iter()
+            .find(|g| g.name == global_name && g.is_const)?;
+        match &global.init {
+            crate::ir::Initializer::Float(v) => Some(*v),
+            crate::ir::Initializer::Int(v) => Some(FloatVal::from_i128(*v)),
+            _ => None,
+        }
+    }
+
+    /// Evaluate an integer constant expression under C's own rule: an
+    /// enumeration constant is the only identifier that has a value here.
     pub(crate) fn eval_const_expr(&self, expr: &Expr) -> Option<i128> {
+        self.eval_const_expr_scoped(ConstScope::Standard, expr)
+    }
+
+    /// `eval_const_expr`, plus the `const`-object folding gcc performs in a
+    /// *static initializer* and nowhere else.
+    ///
+    /// `const int c = 5; int w = c + 1;` compiles everywhere and was rejected
+    /// here. The folding must not reach `eval_const_expr`'s other callers: C
+    /// makes a `const` object no kind of constant expression, so `int a[c];`
+    /// is a VLA and `case c:` an error, in gcc as here.
+    pub(crate) fn eval_const_init_expr(&self, expr: &Expr) -> Option<i128> {
+        self.eval_const_expr_scoped(ConstScope::StaticInitializer, expr)
+    }
+
+    fn eval_const_expr_scoped(&self, scope: ConstScope, expr: &Expr) -> Option<i128> {
         match &expr.kind {
             ExprKind::IntLit(val) => Some(*val as i128),
             ExprKind::Int128Lit(val) => Some(*val),
             ExprKind::CharLit(c) => Some(*c as i128),
 
             ExprKind::Ident(symbol_id) => {
-                // Check if it's an enum constant
                 let sym = self.symbols.get(*symbol_id);
                 if sym.is_enum_constant() {
-                    sym.enum_value
-                } else {
-                    None
+                    return sym.enum_value;
+                }
+                match scope {
+                    ConstScope::Standard => None,
+                    ConstScope::StaticInitializer => self.const_object_value(*symbol_id),
                 }
             }
 
@@ -1667,7 +1736,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             } => self.eval_pointer_constant(operand),
 
             ExprKind::Unary { op, operand } => {
-                let val = self.eval_const_expr(operand)?;
+                let val = self.eval_const_expr_scoped(scope, operand)?;
                 match op {
                     UnaryOp::Neg => Some(val.wrapping_neg()),
                     UnaryOp::Not => Some(if val == 0 { 1 } else { 0 }),
@@ -1677,8 +1746,8 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
 
             ExprKind::Binary { op, left, right } => {
-                let l = self.eval_const_expr(left)?;
-                let r = self.eval_const_expr(right)?;
+                let l = self.eval_const_expr_scoped(scope, left)?;
+                let r = self.eval_const_expr_scoped(scope, right)?;
                 match op {
                     BinaryOp::Add => Some(l.wrapping_add(r)),
                     BinaryOp::Sub => Some(l.wrapping_sub(r)),
@@ -1806,11 +1875,11 @@ impl<'a> super::linearize::Linearizer<'a> {
                 then_expr,
                 else_expr,
             } => {
-                let cond_val = self.eval_const_expr(cond)?;
+                let cond_val = self.eval_const_expr_scoped(scope, cond)?;
                 if cond_val != 0 {
-                    self.eval_const_expr(then_expr)
+                    self.eval_const_expr_scoped(scope, then_expr)
                 } else {
-                    self.eval_const_expr(else_expr)
+                    self.eval_const_expr_scoped(scope, else_expr)
                 }
             }
 
@@ -1854,7 +1923,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             ExprKind::Cast {
                 expr: inner,
                 cast_type,
-            } => self.eval_const_expr(inner).or_else(|| {
+            } => self.eval_const_expr_scoped(scope, inner).or_else(|| {
                 // `(int)2.0` is an integer constant expression (6.6p6: a cast
                 // of a floating constant is allowed as long as it is the
                 // immediate operand of a cast). Without this the fold failed
@@ -1955,7 +2024,20 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// `__float128` sixty, so `static __float128 c = 1.0q/3.0q;` disagreed with
     /// the *same initializer written for a local*, which is computed at run
     /// time and was right.
-    pub(crate) fn eval_const_float_expr(&self, expr: &Expr) -> Option<FloatVal> {
+    /// Fold a floating constant expression for a static initializer, with the
+    /// `const`-object folding [`Self::eval_const_init_expr`] describes.
+    ///
+    /// There is no `Standard` entry point beside this one because no strict
+    /// context reaches the floating evaluator: an array size, a `case` label
+    /// and `_Static_assert` all take an *integer* constant expression, and a
+    /// floating one is refused before it gets here. The scope is still a
+    /// parameter rather than a constant so that adding such a caller is a
+    /// one-line change and cannot silently inherit the lax rule.
+    pub(crate) fn eval_const_float_init_expr(&self, expr: &Expr) -> Option<FloatVal> {
+        self.eval_const_float_expr_scoped(ConstScope::StaticInitializer, expr)
+    }
+
+    fn eval_const_float_expr_scoped(&self, scope: ConstScope, expr: &Expr) -> Option<FloatVal> {
         match &expr.kind {
             ExprKind::FloatLit(v) => Some(*v),
             // Exact: a `u128` mantissa has no more bits than the significand,
@@ -1963,8 +2045,15 @@ impl<'a> super::linearize::Linearizer<'a> {
             ExprKind::IntLit(v) => Some(FloatVal::from_i128(*v as i128)),
             ExprKind::CharLit(c) => Some(FloatVal::from_i128(*c as i128)),
 
+            // A `const double` folds in a static initializer exactly as a
+            // `const int` does; without this `const double d = 2.5; double x =
+            // d * 2;` was rejected while the integer spelling compiled.
+            ExprKind::Ident(symbol_id) if scope == ConstScope::StaticInitializer => {
+                self.const_object_float_value(*symbol_id)
+            }
+
             ExprKind::Unary { op, operand } => {
-                let val = self.eval_const_float_expr(operand)?;
+                let val = self.eval_const_float_expr_scoped(scope, operand)?;
                 match op {
                     UnaryOp::Neg => Some(val.negated()),
                     _ => None,
@@ -1975,8 +2064,8 @@ impl<'a> super::linearize::Linearizer<'a> {
             // which is the type the usual arithmetic conversions already gave
             // this node -- not in whatever width the operands were written at.
             ExprKind::Binary { op, left, right } => {
-                let l = self.eval_const_float_expr(left)?;
-                let r = self.eval_const_float_expr(right)?;
+                let l = self.eval_const_float_expr_scoped(scope, left)?;
+                let r = self.eval_const_float_expr_scoped(scope, right)?;
                 let fmt = expr.typ.and_then(|t| self.types.fp_format(t))?;
                 Some(match op {
                     BinaryOp::Add => l.add(r, fmt),
@@ -1994,7 +2083,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 expr: inner,
                 cast_type,
             } => {
-                let val = self.eval_const_float_expr(inner)?;
+                let val = self.eval_const_float_expr_scoped(scope, inner)?;
                 Some(match self.types.fp_format(*cast_type) {
                     Some(fmt) => val.round_to_format(fmt),
                     None => val,
@@ -2006,6 +2095,10 @@ impl<'a> super::linearize::Linearizer<'a> {
     }
 
     /// Evaluate a static address expression (for initializers like `&symbol.field`)
+    ///
+    /// Reached only from the initializer path, so a subscript folds with
+    /// [`Self::eval_const_init_expr`]: `const int c = 5; int *p = &a[c-3];`
+    /// is an ordinary static initializer and gcc accepts it.
     ///
     /// Returns Some((symbol_name, offset)) if the expression is a valid static address,
     /// or None if it can't be computed at compile time.
@@ -2054,7 +2147,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 let (name, base_offset) = self.eval_static_address(array)?;
 
                 // Get the index as a constant
-                let idx = self.eval_const_expr(index)?;
+                let idx = self.eval_const_init_expr(index)?;
 
                 // Get the element size
                 let array_type = array.typ?;
@@ -2094,7 +2187,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 };
 
                 let (name, base_offset) = self.eval_static_address(ptr_expr)?;
-                let int_val = self.eval_const_expr(int_expr)?;
+                let int_val = self.eval_const_init_expr(int_expr)?;
 
                 // Scale by pointee size for pointer arithmetic
                 let pointee_size = ptr_expr
@@ -2754,6 +2847,23 @@ impl<'a> super::linearize::Linearizer<'a> {
             bb
         }
     }
+}
+
+/// Which identifiers a constant evaluation may read.
+///
+/// A parameter rather than a flag on the linearizer, because it is a property
+/// of the *question being asked* and not of the compiler's state: the same
+/// expression is a constant in one context and not in another, and a flag read
+/// from `self` would let the answer depend on evaluation order.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConstScope {
+    /// C's own rule: an enumeration constant is the only identifier with a
+    /// value here. Array sizes, `case` labels, `_Static_assert`, enumerators
+    /// and bit-field widths all ask this one, and gcc is equally strict.
+    Standard,
+    /// Additionally a `const`-qualified object with a visible constant
+    /// initializer, which gcc folds in a static initializer and nowhere else.
+    StaticInitializer,
 }
 
 /// A declaration whose type is variably modified, and so whose scope may not

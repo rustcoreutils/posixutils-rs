@@ -3135,3 +3135,115 @@ fn diagnostics_ordinary_member_access_stays_silent() {
         compile_expect_ok(name, src);
     }
 }
+
+// === #C102 — reading an object in a static initializer (C17 6.7.9p4) ===
+
+/// One missing mechanism behind three symptoms, and the middle one is why the
+/// first attempt at this was reverted.
+///
+/// `int v; int w = v;` was accepted and silently yielded **zero**. `const int
+/// c = 5; int w = c;` was accepted and right, but only because nothing folded
+/// it. And `int w = c + 1;` one step along was **rejected**, valid code that
+/// gcc compiles. Fixing any one of them alone leaves the others wrong.
+///
+/// The folding is scoped to the initializer by a `ConstScope` parameter rather
+/// than a flag: C makes a `const` object no kind of constant expression, so it
+/// must not reach an array size or a `case` label.
+#[test]
+fn diagnostics_non_constant_static_initializers_are_rejected() {
+    for (name, src) in [
+        ("si_read_object", "int v = 5;\nint w = v;\n"),
+        ("si_read_in_arithmetic", "int v = 5;\nint w = v + 1;\n"),
+        ("si_const_no_initializer", "const int c;\nint w = c;\n"),
+        ("si_extern_const", "extern const int c;\nint w = c;\n"),
+        ("si_function_call", "int f(void);\nint w = f();\n"),
+        (
+            "si_static_local",
+            "int v;\nvoid f(void){ static int w = v; (void)w; }\n",
+        ),
+        ("si_float_object", "double v;\ndouble w = v * 2;\n"),
+    ] {
+        compile_expect_error(name, src, "constant expression");
+    }
+}
+
+/// A `const` object with a visible initializer folds, in arbitrary arithmetic
+/// and at every arithmetic type -- which is what gcc does, silently and even
+/// under `-pedantic`.
+#[test]
+fn diagnostics_const_objects_fold_in_static_initializers() {
+    for (name, src) in [
+        ("si_const_int", "const int c = 5;\nint w = c;\n"),
+        (
+            "si_const_arithmetic",
+            "const int c = 5;\nint w = c * 2 + 1;\n",
+        ),
+        ("si_const_negate", "const int c = 5;\nint w = -c;\n"),
+        (
+            "si_const_conditional",
+            "const int c = 5;\nint w = c ? 1 : 2;\n",
+        ),
+        ("si_const_shift", "const long c = 5;\nlong w = c << 2;\n"),
+        (
+            "si_const_double",
+            "const double d = 2.5;\ndouble x = d * 2;\n",
+        ),
+        (
+            "si_const_float",
+            "const float f = 1.5f;\nfloat y = f + 1.0f;\n",
+        ),
+        ("si_static_const", "static const int c = 7;\nint w = c;\n"),
+        (
+            "si_const_in_address",
+            "const int c = 5;\nint a[10];\nint *p = &a[c - 3];\n",
+        ),
+        ("si_enum_constant", "enum { N = 7 };\nint w = N;\n"),
+        (
+            "si_const_array_element",
+            "const int a[2] = {1,2};\nint w = a[0];\n",
+        ),
+        (
+            "si_const_struct_member",
+            "struct S { int a; };\nconst struct S s = {5};\nint w = s.a;\n",
+        ),
+        (
+            "si_block_scope_auto",
+            "int v;\nvoid f(void){ int w = v; (void)w; }\n",
+        ),
+    ] {
+        compile_expect_ok(name, src);
+    }
+}
+
+/// The boundary. C makes a `const` object no kind of constant expression, so
+/// the folding must reach the initializer and nowhere else -- `int a[c];` is a
+/// VLA and `case c:` an error, in gcc as here. Without these the fix would
+/// silently turn five other contexts lax.
+#[test]
+fn diagnostics_const_objects_do_not_fold_outside_initializers() {
+    compile_expect_error(
+        "si_boundary_array_size",
+        "const int c = 5;\nint a[c];\n",
+        "file scope",
+    );
+    compile_expect_error(
+        "si_boundary_case_label",
+        "const int c = 5;\nvoid f(int x){ switch(x){ case c: break; } }\n",
+        "constant",
+    );
+    compile_expect_error(
+        "si_boundary_static_assert",
+        "const int c = 5;\n_Static_assert(c == 5, \"x\");\n",
+        "constant",
+    );
+    compile_expect_error(
+        "si_boundary_enumerator",
+        "const int c = 5;\nenum E { X = c };\n",
+        "constant",
+    );
+    compile_expect_error(
+        "si_boundary_bitfield_width",
+        "const int c = 5;\nstruct S { int b : c; };\n",
+        "constant",
+    );
+}

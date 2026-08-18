@@ -833,6 +833,7 @@ impl<'a> Parser<'a> {
             // the interned type cannot carry either.
             if let Some((typ, dims)) = self.try_parse_type_name_vm() {
                 self.expect_special(b')')?;
+                self.check_sizeof_operand_is_complete(typ, &dims, sizeof_pos);
                 return Ok(Expr::typed(
                     ExprKind::SizeofType(typ, dims),
                     size_t,
@@ -856,6 +857,36 @@ impl<'a> Parser<'a> {
                 size_t,
                 sizeof_pos,
             ))
+        }
+    }
+
+    /// C17 6.5.3.4p1: `sizeof` shall not be applied to an incomplete type.
+    ///
+    /// An array is the awkward case, because the type table cannot tell
+    /// `int[n]` from `int[]` -- both simply have no extent. The size
+    /// expressions decide it: a level with an expression is variably modified
+    /// and therefore complete, and a level without one is incomplete. So
+    /// `sizeof(int[][n])`, with two absent extents and one expression, is the
+    /// incomplete `int[]` of arrays and is refused, while `sizeof(int[n])` is
+    /// not.
+    ///
+    /// `void` and function types are deliberately not refused: strict C
+    /// forbids both, gcc accepts them as an extension giving 1, and matching
+    /// gcc is this compiler's policy.
+    fn check_sizeof_operand_is_complete(&self, typ: TypeId, dims: &[Expr], pos: Position) {
+        let incomplete = match self.types.kind(typ) {
+            TypeKind::Array => self.types.unsized_array_levels(typ) > dims.len(),
+            TypeKind::Struct | TypeKind::Union => !self.types.is_composite_complete(typ),
+            _ => false,
+        };
+        if incomplete {
+            crate::diag::error(
+                pos,
+                &format!(
+                    "invalid application of 'sizeof' to incomplete type '{}'",
+                    self.types.format_type(typ, Some(self.idents))
+                ),
+            );
         }
     }
 

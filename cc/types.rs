@@ -978,6 +978,19 @@ impl TypeTable {
         self.get(id).array_size
     }
 
+    /// Has this struct or union been defined, as opposed to merely declared?
+    ///
+    /// A forward declaration interns a composite marked incomplete, so a
+    /// `struct U;` never followed by a definition answers false here and its
+    /// size may not be taken. Any other kind answers true: the question is
+    /// only meaningful for a composite.
+    pub fn is_composite_complete(&self, id: TypeId) -> bool {
+        self.get(id)
+            .composite
+            .as_deref()
+            .is_none_or(|c| c.is_complete)
+    }
+
     /// How many array levels of `id`, outermost-first, have no extent.
     ///
     /// The type table cannot tell a variably-modified array from an incomplete

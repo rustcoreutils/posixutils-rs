@@ -1936,3 +1936,78 @@ fn diagnostics_permitted_universal_character_names_are_accepted() {
         compile_expect_ok(name, src);
     }
 }
+
+// ============================================================================
+// #C90 — sizeof of an incomplete type (C17 6.5.3.4p1)
+// ============================================================================
+
+/// `sizeof` shall not be applied to an incomplete type. An array is the
+/// awkward case: the type table cannot tell `int[n]` from `int[]`, since both
+/// simply have no extent. The size expressions decide it -- a level with an
+/// expression is variably modified and so complete, a level without one is
+/// incomplete -- which is what makes `sizeof(int[][n])`, two absent extents
+/// against one expression, the incomplete array of arrays gcc rejects.
+#[test]
+fn diagnostics_sizeof_of_an_incomplete_type_is_rejected() {
+    for (name, src) in [
+        (
+            "sz_arr_of_vla",
+            "int main(void){ int n = 4; return (int)sizeof(int[][n]); }\n",
+        ),
+        (
+            "sz_incomplete_arr",
+            "int main(void){ return (int)sizeof(int[]); }\n",
+        ),
+        (
+            "sz_arr_of_arr",
+            "int main(void){ return (int)sizeof(int[][3]); }\n",
+        ),
+        (
+            "sz_undef_struct",
+            "struct U;\nint main(void){ return (int)sizeof(struct U); }\n",
+        ),
+        (
+            "sz_undef_union",
+            "union U;\nint main(void){ return (int)sizeof(union U); }\n",
+        ),
+    ] {
+        compile_expect_error(name, src, "incomplete type");
+    }
+}
+
+/// Everything `sizeof` must still accept, including the two GNU extensions
+/// gcc allows (`void` and a function type, both 1) and every complete array
+/// shape -- without these the check could pass by refusing every array.
+#[test]
+fn diagnostics_sizeof_of_complete_types_is_accepted() {
+    compile_expect_ok("sz_int", "int main(void){ return (int)sizeof(int) - 4; }\n");
+    compile_expect_ok(
+        "sz_ptr",
+        "int main(void){ return (int)sizeof(int*) - 8; }\n",
+    );
+    compile_expect_ok(
+        "sz_fixed_arr",
+        "int main(void){ return (int)sizeof(int[4]) - 16; }\n",
+    );
+    compile_expect_ok(
+        "sz_vla",
+        "int main(void){ int n = 4; return (int)sizeof(int[n]) - 16; }\n",
+    );
+    compile_expect_ok(
+        "sz_vla_2d",
+        "int main(void){ int n = 4; return (int)sizeof(int[3][n]) - 48; }\n",
+    );
+    compile_expect_ok(
+        "sz_ptr_to_vla",
+        "int main(void){ int n = 4; return (int)sizeof(int(*)[n]) - 8; }\n",
+    );
+    compile_expect_ok(
+        "sz_defined_struct",
+        "struct S { int a; };\nint main(void){ return (int)sizeof(struct S) - 4; }\n",
+    );
+    // GNU extensions gcc accepts, both giving 1.
+    compile_expect_ok(
+        "sz_void",
+        "int main(void){ return (int)sizeof(void) - 1; }\n",
+    );
+}

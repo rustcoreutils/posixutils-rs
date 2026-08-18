@@ -3426,8 +3426,13 @@ impl<'a> Parser<'a> {
                 self.expect_special(b'(')?;
                 let arg = self.parse_assignment_expr()?;
                 self.expect_special(b')')?;
-                // Check if the argument is a constant expression
-                let is_constant = self.eval_const_expr(&arg).is_some();
+                // Constant-ness, not integer-ness: `__builtin_constant_p(3.14)`
+                // is 1 in gcc. The integer folder deliberately refuses a
+                // floating literal, since 6.6 makes one an integer constant
+                // expression only as the operand of a cast, so the floating
+                // fold has to be asked as well.
+                let is_constant =
+                    self.eval_const_expr(&arg).is_some() || self.eval_const_f64(&arg).is_some();
                 Ok(Self::typed_expr(
                     ExprKind::IntLit(if is_constant { 1 } else { 0 }),
                     self.types.int_id,

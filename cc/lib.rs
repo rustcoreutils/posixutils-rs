@@ -18,6 +18,7 @@ pub mod abi;
 pub mod arch;
 pub mod builtin_headers;
 pub mod builtins;
+pub mod constexpr;
 pub mod diag;
 pub mod float;
 pub mod ir;

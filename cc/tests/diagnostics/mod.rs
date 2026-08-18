@@ -3288,35 +3288,57 @@ fn diagnostics_const_objects_do_not_fold_outside_initializers() {
 
 // === #C118 — an out-of-range enumerator must not panic the compiler ===
 
-/// `enum E { A = 1 << 64 };` exited **101** on an `unreachable!` whose premise
-/// ("a non-negative maximum always fits u64 or overflows i128") is false:
-/// nothing clamps an enumerator to 64 bits and the folder computes in `i128`.
+/// An enumeration with no possible underlying type is diagnosed, not a panic.
 ///
-/// gcc warns and carries on, folding the shift to 0 because it truncates to the
-/// expression's type. c17's folders do not truncate -- that is #C115, and until
-/// it lands these are *rejected* rather than folded. Rejecting is a divergence;
-/// panicking is not a behaviour a compiler may have at all, so this closes the
-/// crash first and the value follows with #C115.
+/// `enum_underlying_type` reached an `unreachable!` whose premise -- that a
+/// non-negative maximum always fits `u64` -- nothing enforced, so the compiler
+/// exited 101. gcc accepts these by giving the enumeration a `__int128`
+/// underlying type, which c17 does not offer; refusing them is a deliberate
+/// divergence, and the point of the test is that it is a *diagnostic*.
 #[test]
-fn diagnostics_out_of_range_enumerator_does_not_panic() {
+fn diagnostics_unrepresentable_enumeration_does_not_panic() {
     for (name, src) in [
         (
-            "enum_shift_64",
-            "enum E { A = 1 << 64 };\nint main(void){ return 0; }\n",
+            "wide_positive_and_negative",
+            "enum E { A = (__int128)1 << 100, B = -1 };\nint main(void){ return 0; }\n",
         ),
         (
-            "enum_shift_63x3",
-            "enum E { A = 3 << 63 };\nint main(void){ return 0; }\n",
-        ),
-        (
-            "enum_shift_100",
-            "enum E { A = 1 << 100 };\nint main(void){ return 0; }\n",
+            "wide_positive_alone",
+            "enum E { A = (__int128)1 << 100 };\nint main(void){ return 0; }\n",
         ),
     ] {
         // The message is the discriminator: a panic also exits non-zero, so
         // asserting only on failure would have passed against the crash.
         compile_expect_error(name, src, "no integer type can represent all values");
     }
+}
+
+/// A folded shift agrees with the same shift computed at run time.
+///
+/// The count is masked to the operand width, as the hardware does. 6.5.7p3
+/// makes a count outside `[0, width)` undefined and gcc has no single answer
+/// for it either -- it folds `1 << 64` to 0 but leaves `-1 >> 64` at -1 -- so
+/// what this pins is c17's *self*-consistency: an enumerator, an array bound
+/// and a run-time expression must not disagree. Recorded at #C125, which is
+/// the warning gcc has and c17 does not.
+#[test]
+fn diagnostics_folded_shift_agrees_with_the_runtime_one() {
+    assert_eq!(
+        compile_and_run(
+            "folded_shift_matches_runtime",
+            "enum E { A = 1 << 64, B = 1 >> 64, C = (char)1 << 20, D = 1LL << 40 };\n\
+             int main(void) {\n\
+             volatile int one = 1, sixty_four = 64;\n\
+             if (A != (one << sixty_four)) return 1;\n\
+             if (B != (one >> sixty_four)) return 2;\n\
+             if (C != 1048576) return 3;\n\
+             if (D != 1099511627776LL) return 4;\n\
+             return 0;\n\
+             }\n",
+            &[],
+        ),
+        0
+    );
 }
 
 /// Enumerators that do fit are unaffected, at every width the choice of
@@ -3436,6 +3458,87 @@ fn diagnostics_largest_describable_object_is_accepted() {
              int main(void) {\n\
              if (sizeof a != 536870911UL) return 1;\n\
              if (sizeof s != 200000000UL) return 2;\n\
+             return 0;\n\
+             }\n",
+            &[],
+        ),
+        0
+    );
+}
+
+/// A floating literal is not an integer constant expression.
+///
+/// 6.6p6 admits one only as the immediate operand of a cast. The parser's
+/// folder had a `FloatLit` arm that truncated it instead, so four constraint
+/// violations compiled: an array bound, an enumerator, a bit-field width and
+/// a `_Static_assert`. At block scope the array case was worse than accepted
+/// -- it became a variable length array sized from a `double`. Recorded at
+/// #C124.
+#[test]
+fn diagnostics_floating_literal_is_not_an_integer_constant() {
+    for (name, src, message) in [
+        (
+            "array_bound_file_scope",
+            "int a[1.5];\nint main(void){ return 0; }\n",
+            "size of array has non-integer type",
+        ),
+        (
+            "array_bound_block_scope",
+            "int main(void){ int a[1.5]; return sizeof a; }\n",
+            "size of array has non-integer type",
+        ),
+        (
+            "enumerator",
+            "enum E { X = 1.5 };\nint main(void){ return 0; }\n",
+            "constant",
+        ),
+        (
+            "bitfield_width",
+            "struct S { int b : 1.5; };\nint main(void){ return 0; }\n",
+            "constant",
+        ),
+        (
+            "static_assert",
+            "_Static_assert(1.5, \"\");\nint main(void){ return 0; }\n",
+            "constant",
+        ),
+    ] {
+        compile_expect_error(name, src, message);
+    }
+}
+
+/// What 6.6 *does* let a floating constant do, and what the two folders had to
+/// agree on before they became one.
+#[test]
+fn diagnostics_shared_constant_folder_answers_alike() {
+    assert_eq!(
+        compile_and_run(
+            "shared_constant_folder",
+            "struct S { int x; int y; };\n\
+             const int c = 5;\n\
+             int arr[10];\n\
+             int *p = &arr[c - 3];\n\
+             int w = c + 1;\n\
+             enum E { A = 3 };\n\
+             int main(void) {\n\
+             /* a cast of a floating constant, folded in floating point */\n\
+             int cast_fold[(int)(1.5 + 1.5)];\n\
+             /* a comparison of floating operands is an integer constant */\n\
+             int cmp[1.5 > 1.0 ? 4 : 8];\n\
+             /* _Alignof, which only one of the two folders used to know */\n\
+             int aligned[_Alignof(double)];\n\
+             /* the pre-<stddef.h> offsetof idiom */\n\
+             int off[(int)(unsigned long)&((struct S *)0)->y];\n\
+             _Static_assert(1.5 > 1.0, \"\");\n\
+             _Static_assert((unsigned)-1 > 0, \"\");\n\
+             if (sizeof cast_fold != 12) return 1;\n\
+             if (sizeof cmp != 16) return 2;\n\
+             if (sizeof aligned != 32) return 3;\n\
+             if (sizeof off != 16) return 4;\n\
+             if (w != 6) return 5;\n\
+             if (p != &arr[2]) return 6;\n\
+             if (A != 3) return 7;\n\
+             if (!__builtin_constant_p(3.14)) return 8;\n\
              return 0;\n\
              }\n",
             &[],

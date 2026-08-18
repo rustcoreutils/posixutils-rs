@@ -12,9 +12,9 @@
 
 use super::ast::{
     AsmOperand, BinaryOp, BlockItem, Declaration, Designator, Expr, ExprKind, ExternalDecl,
-    ForInit, FunctionDef, InitDeclarator, InitElement, OffsetOfPath, Parameter, Stmt,
-    TranslationUnit, UnaryOp,
+    ForInit, FunctionDef, InitDeclarator, InitElement, Parameter, Stmt, TranslationUnit, UnaryOp,
 };
+use crate::constexpr::ConstScope;
 use crate::diag;
 use crate::strings::StringId;
 use crate::symbol::{Namespace, Symbol, SymbolId, SymbolKind, SymbolTable};
@@ -2320,6 +2320,23 @@ impl Parser<'_> {
     /// fields (C17 6.7.9p20) -- so `int a[][2] = {1,2,3,4}` names two rows,
     /// not four. Counting list elements instead sized the object at twice
     /// what the linearizer then filled.
+    /// C17 6.7.6.2p1: an array's size expression shall have integer type.
+    ///
+    /// Without this the non-constant fallback took over and `int a[1.5];`
+    /// became a variable length array at block scope -- accepted, and sized
+    /// from a `double` -- where gcc says *"size of array has non-integer
+    /// type"*. At file scope it read as a VLA rejection, which is a different
+    /// reason and the wrong one.
+    fn check_array_size_type(&self, expr: &Expr, pos: Position) -> ParseResult<()> {
+        match expr.typ {
+            Some(t) if !self.types.is_integer(t) => Err(ParseError::new(
+                "size of array has non-integer type".to_string(),
+                pos,
+            )),
+            _ => Ok(()),
+        }
+    }
+
     /// Derive an array type, refusing an extent the compiler cannot describe.
     ///
     /// `TypeTable::size_bits` answers in a `u32`, so an object wider than
@@ -4079,6 +4096,7 @@ impl Parser<'_> {
                             ));
                         }
                         None => {
+                            self.check_array_size_type(&expr, size_pos)?;
                             vla_exprs.push(expr);
                             None
                         }
@@ -4102,6 +4120,7 @@ impl Parser<'_> {
                     }
                     None => {
                         // Non-constant (VLA) - save expression for VLA handling
+                        self.check_array_size_type(&expr, size_pos)?;
                         vla_exprs.push(expr);
                         None
                     }
@@ -5383,6 +5402,7 @@ impl Parser<'_> {
                     // variably modified, which 6.7.6.2p2 confines to block
                     // scope.
                     None => {
+                        self.check_array_size_type(&arr_expr, size_pos)?;
                         return Err(ParseError::new(
                             "variable length arrays cannot have file scope".to_string(),
                             size_pos,
@@ -5689,16 +5709,6 @@ impl Parser<'_> {
         Ok(ExternalDecl::Declaration(Declaration { declarators }))
     }
 
-    /// Does either operand of a comparison have floating type?
-    ///
-    /// Asked of the operands, because a comparison's own type is `int`
-    /// whatever it compares.
-    fn comparison_has_float_operand(&self, left: &Expr, right: &Expr) -> bool {
-        [left, right]
-            .iter()
-            .any(|e| e.typ.is_some_and(|t| self.types.is_float(t)))
-    }
-
     /// The `f64` value of a constant floating subexpression.
     ///
     /// Only reached from a comparison, whose result is an integer -- the
@@ -5706,7 +5716,7 @@ impl Parser<'_> {
     /// `eval_const_float_expr` for anything that survives to code generation.
     /// `f64` is enough to decide an ordering that `i128` truncation was
     /// getting wrong.
-    fn eval_const_f64(&self, expr: &Expr) -> Option<f64> {
+    pub(crate) fn eval_const_f64(&self, expr: &Expr) -> Option<f64> {
         match &expr.kind {
             ExprKind::FloatLit(v) => Some(v.to_f64()),
             ExprKind::IntLit(v) => Some(*v as f64),
@@ -5738,260 +5748,15 @@ impl Parser<'_> {
         }
     }
 
-    /// Evaluate a constant expression (for array sizes, enum values, case labels, static initializers)
+    /// Evaluate an integer constant expression: array bounds, enumerators,
+    /// `case` labels, bit-field widths, `_Static_assert`.
     ///
-    /// C99 6.6 defines integer constant expressions as:
-    /// - Integer/character literals
-    /// - Enum constants
-    /// - sizeof expressions
-    /// - Casts to integer types
-    /// - Unary/binary operators with constant operands
-    /// - Conditional expressions with constant operands
+    /// The walk itself lives in [`crate::constexpr`], shared with the
+    /// linearizer's static-initializer folding. The parser answers only
+    /// [`ConstScope::Standard`]: it has no emitted globals to read a `const`
+    /// object's value out of, and no context here would accept one anyway.
     pub(crate) fn eval_const_expr(&self, expr: &Expr) -> Option<i128> {
-        match &expr.kind {
-            ExprKind::IntLit(val) => Some(*val as i128),
-            ExprKind::Int128Lit(val) => Some(*val),
-            ExprKind::CharLit(c) => Some(*c as i128),
-            // Float literals are constant, return truncated value
-            ExprKind::FloatLit(val) => Some(val.to_f64() as i128),
-
-            // The address of a member of a pointer constant is an integer
-            // constant; see `eval_pointer_constant`.
-            ExprKind::Unary {
-                op: UnaryOp::AddrOf,
-                operand,
-            } => self.eval_pointer_constant(operand),
-
-            ExprKind::Unary { op, operand } => {
-                let val = self.eval_const_expr(operand)?;
-                match op {
-                    UnaryOp::Neg => Some(val.wrapping_neg()),
-                    UnaryOp::Not => Some(if val == 0 { 1 } else { 0 }),
-                    UnaryOp::BitNot => Some(!val),
-                    _ => None,
-                }
-            }
-
-            ExprKind::Binary { op, left, right } => {
-                // A comparison of *floating* operands has an integer result,
-                // so it is an integer constant expression even though neither
-                // operand is one. Truncating each side to `i128` first -- which
-                // the `FloatLit` arm above does, and which is right for a cast
-                // -- made `1.5 > 1.0` into `1 > 1`, so `enum E { X = 1.5 > 1.0 }`
-                // was 0 and `int a[1.5 > 1.0 ? 4 : 8]` took the wrong branch.
-                if op.is_comparison() && self.comparison_has_float_operand(left, right) {
-                    let l = self.eval_const_f64(left)?;
-                    let r = self.eval_const_f64(right)?;
-                    let yes = match op {
-                        BinaryOp::Lt => l < r,
-                        BinaryOp::Le => l <= r,
-                        BinaryOp::Gt => l > r,
-                        BinaryOp::Ge => l >= r,
-                        BinaryOp::Eq => l == r,
-                        _ => l != r,
-                    };
-                    return Some(if yes { 1 } else { 0 });
-                }
-                let lval = self.eval_const_expr(left)?;
-                let rval = self.eval_const_expr(right)?;
-                // C promotes both operands to the common type before comparing,
-                // so an unsigned operand makes the comparison unsigned. Doing
-                // it signed made `(unsigned)-1 > 0` false, in an enumerator and
-                // in an array size alike.
-                if op.is_comparison() {
-                    let unsigned = [left, right].iter().any(|e| {
-                        e.typ
-                            .is_some_and(|t| self.types.is_integer(t) && self.types.is_unsigned(t))
-                    });
-                    if unsigned {
-                        let (l, r) = (lval as u128, rval as u128);
-                        let yes = match op {
-                            BinaryOp::Lt => l < r,
-                            BinaryOp::Le => l <= r,
-                            BinaryOp::Gt => l > r,
-                            BinaryOp::Ge => l >= r,
-                            BinaryOp::Eq => l == r,
-                            _ => l != r,
-                        };
-                        return Some(if yes { 1 } else { 0 });
-                    }
-                }
-                match op {
-                    BinaryOp::Add => Some(lval.wrapping_add(rval)),
-                    BinaryOp::Sub => Some(lval.wrapping_sub(rval)),
-                    BinaryOp::Mul => Some(lval.wrapping_mul(rval)),
-                    BinaryOp::Div => {
-                        if rval != 0 {
-                            Some(lval / rval)
-                        } else {
-                            None
-                        }
-                    }
-                    BinaryOp::Mod => {
-                        if rval != 0 {
-                            Some(lval % rval)
-                        } else {
-                            None
-                        }
-                    }
-                    BinaryOp::BitAnd => Some(lval & rval),
-                    BinaryOp::BitOr => Some(lval | rval),
-                    BinaryOp::BitXor => Some(lval ^ rval),
-                    BinaryOp::Shl => Some(lval.wrapping_shl(rval as u32)),
-                    BinaryOp::Shr => Some(lval.wrapping_shr(rval as u32)),
-                    BinaryOp::Lt => Some(if lval < rval { 1 } else { 0 }),
-                    BinaryOp::Le => Some(if lval <= rval { 1 } else { 0 }),
-                    BinaryOp::Gt => Some(if lval > rval { 1 } else { 0 }),
-                    BinaryOp::Ge => Some(if lval >= rval { 1 } else { 0 }),
-                    BinaryOp::Eq => Some(if lval == rval { 1 } else { 0 }),
-                    BinaryOp::Ne => Some(if lval != rval { 1 } else { 0 }),
-                    BinaryOp::LogAnd => Some(if lval != 0 && rval != 0 { 1 } else { 0 }),
-                    BinaryOp::LogOr => Some(if lval != 0 || rval != 0 { 1 } else { 0 }),
-                }
-            }
-
-            ExprKind::Ident(symbol_id) => {
-                // Check for enum constant
-                let sym = self.symbols.get(*symbol_id);
-                if sym.is_enum_constant() {
-                    sym.enum_value
-                } else {
-                    None
-                }
-            }
-
-            ExprKind::FuncName => None,
-
-            ExprKind::Conditional {
-                cond,
-                then_expr,
-                else_expr,
-            } => {
-                let cond_val = self.eval_const_expr(cond)?;
-                if cond_val != 0 {
-                    self.eval_const_expr(then_expr)
-                } else {
-                    self.eval_const_expr(else_expr)
-                }
-            }
-
-            // sizeof(type) - constant for complete types, but *not* for a
-            // variable length array type, whose size 6.5.3.4p2 computes at run
-            // time. The type table cannot tell `int[n]` from `int[]`, so
-            // answering from it alone gave 0 -- and a 0 that was still an
-            // integer constant expression, so `int z[sizeof(int[n])];`
-            // silently became a zero-length array.
-            ExprKind::SizeofType(type_id, dims) => {
-                if crate::parse::ast::sizeof_type_is_runtime(self.types, *type_id, dims) {
-                    return None;
-                }
-                let size_bits = self.types.size_bits(*type_id);
-                Some((size_bits / 8) as i128)
-            }
-
-            // sizeof(expr) - constant if expr type is complete
-            ExprKind::SizeofExpr(inner_expr) => {
-                if let Some(typ) = inner_expr.typ {
-                    let size_bits = self.types.size_bits(typ);
-                    Some((size_bits / 8) as i128)
-                } else {
-                    None
-                }
-            }
-
-            // Cast to integer type - evaluate inner and truncate/extend as needed
-            ExprKind::Cast { expr: inner, .. } => {
-                // A cast *from* a floating operand truncates the floating
-                // value, so the arithmetic below it has to be done in floating
-                // point: evaluating `1.5 + 1.5` through the integer folder made
-                // it `1 + 1`, and `(int)(1.5 + 1.5)` came out 2 rather than 3.
-                if inner.typ.is_some_and(|t| self.types.is_float(t)) {
-                    if let Some(v) = self.eval_const_f64(inner) {
-                        return Some(v.trunc() as i128);
-                    }
-                }
-                // For integer constant expressions, we can evaluate the inner expression
-                self.eval_const_expr(inner)
-            }
-
-            // __builtin_offsetof(type, member-designator) - compile-time constant
-            ExprKind::OffsetOf { type_id, path } => {
-                let mut offset: i128 = 0;
-                let mut current_type = *type_id;
-
-                for element in path {
-                    match element {
-                        OffsetOfPath::Field(field_id) => {
-                            // None if the field is not found
-                            let member_info = self.types.find_member(current_type, *field_id)?;
-                            offset += member_info.offset as i128;
-                            current_type = member_info.typ;
-                        }
-                        OffsetOfPath::Index(index) => {
-                            // None if this is not an array type
-                            let elem_type = self.types.base_type(current_type)?;
-                            let elem_size = self.types.size_bytes(elem_type);
-                            offset += *index as i128 * (elem_size as i128);
-                            current_type = elem_type;
-                        }
-                    }
-                }
-
-                Some(offset)
-            }
-
-            _ => None,
-        }
-    }
-
-    /// The address of `expr`, when it is an integer constant rather than a
-    /// symbol's address.
-    ///
-    /// `(size_t)&((struct S *)0)->member` is how offsetof was spelled before
-    /// <stddef.h> was relied on to provide it. Nothing is dereferenced -- the
-    /// address of a member of a null pointer is arithmetic on the null pointer
-    /// -- so the result is a plain integer, usable anywhere an integer
-    /// constant expression is: an array bound, a case label, a bitfield width.
-    ///
-    /// The recursion bottoms out only at an integer constant, so the address
-    /// of a real object is not folded here: that one needs a relocation, which
-    /// no integer constant expression can carry.
-    fn eval_pointer_constant(&self, expr: &Expr) -> Option<i128> {
-        match &expr.kind {
-            ExprKind::IntLit(v) => Some(*v as i128),
-            ExprKind::Int128Lit(v) => Some(*v),
-
-            ExprKind::Cast { expr: inner, .. } => self.eval_pointer_constant(inner),
-
-            ExprKind::Unary {
-                op: UnaryOp::AddrOf,
-                operand,
-            } => self.eval_pointer_constant(operand),
-
-            ExprKind::Member { expr: base, member } => {
-                let base_offset = self.eval_pointer_constant(base)?;
-                let struct_type = self.resolve_struct_type(base.typ?);
-                let member_info = self.types.find_member(struct_type, *member)?;
-                Some(base_offset + member_info.offset as i128)
-            }
-
-            ExprKind::Arrow { expr: base, member } => {
-                let base_offset = self.eval_pointer_constant(base)?;
-                let pointee_type = self.types.base_type(base.typ?)?;
-                let struct_type = self.resolve_struct_type(pointee_type);
-                let member_info = self.types.find_member(struct_type, *member)?;
-                Some(base_offset + member_info.offset as i128)
-            }
-
-            ExprKind::Index { array, index } => {
-                let base_offset = self.eval_pointer_constant(array)?;
-                let idx = self.eval_const_expr(index)?;
-                let elem_type = self.types.base_type(array.typ?)?;
-                Some(base_offset + idx * self.types.size_bytes(elem_type) as i128)
-            }
-
-            _ => None,
-        }
+        crate::constexpr::eval(self, ConstScope::Standard, expr)
     }
 
     /// Parse a bitfield width (constant expression after ':')
@@ -6162,5 +5927,31 @@ impl Parser<'_> {
                 Ok(Some(explicit))
             }
         }
+    }
+}
+
+/// The parser's half of the shared C17 6.6 walk.
+///
+/// [`crate::constexpr`] owns the walk; what differs between the two hosts is
+/// only what an identifier means and how a floating subexpression folds.
+impl crate::constexpr::ConstEnv for Parser<'_> {
+    fn types(&self) -> &TypeTable {
+        self.types
+    }
+
+    /// An enumeration constant is the only identifier with a value in the
+    /// parser: a `const` object's value lives in an emitted global, which does
+    /// not exist yet here, and no parse-time context would accept one.
+    fn ident_value(&self, sym: crate::symbol::SymbolId, _scope: ConstScope) -> Option<i128> {
+        let symbol = self.symbols.get(sym);
+        symbol.is_enum_constant().then_some(symbol.enum_value)?
+    }
+
+    fn struct_of(&self, typ: TypeId) -> TypeId {
+        self.resolve_struct_type(typ)
+    }
+
+    fn float_value(&self, _scope: ConstScope, expr: &Expr) -> Option<f64> {
+        self.eval_const_f64(expr)
     }
 }

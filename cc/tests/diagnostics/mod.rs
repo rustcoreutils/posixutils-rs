@@ -2960,3 +2960,93 @@ fn diagnostics_variably_modified_jumps_point_at_the_jump() {
         ":3:3: error: label 'nowhere' used but not defined",
     );
 }
+
+// === #C112 — `sizeof` of an incomplete array expression (C17 6.5.3.4p1) ===
+
+/// #C90 closed the type-name form and left this one: `extern int a[]; sizeof a`
+/// compiled and answered **0**.
+///
+/// Neither the type nor the completeness helpers can settle it, because
+/// `int[]`, `int[n]` and `int[m]` all intern to one `TypeId` -- the extent
+/// lives on the declarator. `Symbol::array_is_variably_modified` records
+/// whether one was given, so a VLA's `sizeof` keeps working while an
+/// incomplete array's is refused.
+#[test]
+fn diagnostics_sizeof_of_an_incomplete_array_expression_is_rejected() {
+    for (name, src) in [
+        (
+            "szx_extern_file",
+            "extern int a[];\nunsigned long f(void){ return sizeof a; }\n",
+        ),
+        (
+            "szx_extern_parens",
+            "extern int a[];\nunsigned long f(void){ return sizeof(a); }\n",
+        ),
+        (
+            "szx_extern_block",
+            "unsigned long f(void){ extern int a[]; return sizeof a; }\n",
+        ),
+        (
+            "szx_tentative",
+            "int a[];\nunsigned long f(void){ return sizeof a; }\n",
+        ),
+    ] {
+        compile_expect_error(name, src, "incomplete type");
+    }
+}
+
+/// The accept side. A VLA is measured at run time, a GNU zero-length array has
+/// an extent that happens to be zero, and a later declaration completes an
+/// earlier `extern int a[];` (6.2.7p4) -- all of which an over-eager check
+/// would refuse.
+#[test]
+fn diagnostics_sizeof_of_complete_array_expressions_is_accepted() {
+    for (name, src) in [
+        (
+            "szx_vla",
+            "unsigned long f(int n){ int a[n]; return sizeof a; }\n",
+        ),
+        (
+            "szx_vla_2d",
+            "unsigned long f(int n){ int a[n][3]; return sizeof a; }\n",
+        ),
+        (
+            "szx_zero_length",
+            "int a[0];\nunsigned long f(void){ return sizeof a; }\n",
+        ),
+        (
+            "szx_sized",
+            "int a[4];\nunsigned long f(void){ return sizeof a; }\n",
+        ),
+        (
+            "szx_inferred",
+            "int a[] = {1,2,3};\nunsigned long f(void){ return sizeof a; }\n",
+        ),
+        (
+            "szx_string",
+            "char a[] = \"hi\";\nunsigned long f(void){ return sizeof a; }\n",
+        ),
+        (
+            "szx_completed_later",
+            "extern int a[];\nint a[4];\nunsigned long f(void){ return sizeof a; }\n",
+        ),
+        (
+            "szx_completed_by_init",
+            "extern int a[];\nint a[] = {1,2,3};\nunsigned long f(void){ return sizeof a; }\n",
+        ),
+        (
+            "szx_local_fixed",
+            "unsigned long f(void){ int a[4]; return sizeof a; }\n",
+        ),
+        (
+            "szx_param_decayed",
+            "unsigned long f(int a[]){ return sizeof a; }\n",
+        ),
+        (
+            "szx_2d_file",
+            "int a[2][3];\nunsigned long f(void){ return sizeof a; }\n",
+        ),
+    ] {
+        compile_expect_ok(name, src);
+    }
+}

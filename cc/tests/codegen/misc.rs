@@ -9268,3 +9268,47 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("sizeof_through_typeof", code, &[]), 0);
 }
+
+/// The sizes that #C112's check must not disturb, and the one it repaired.
+///
+/// The two declarator paths disagreed about how an absent extent is spelled --
+/// `parse_declarator` recorded `None`, the file-scope loop collapsed it to
+/// `Some(0)` -- which made `int a[];` indistinguishable from the GNU
+/// zero-length `int a[0];`. Both are exercised here, along with the composite
+/// type 6.2.7p4 forms when a later declaration completes an earlier one.
+#[test]
+fn codegen_sizeof_of_array_objects() {
+    let code = r#"
+int inferred[] = {1, 2, 3};
+int zero_length[0];
+char from_string[] = "hi";
+int two_d[2][3];
+extern int completed[];
+int completed[4];
+
+int main(void) {
+    if (sizeof inferred != 3 * sizeof(int)) return 1;
+    if (sizeof zero_length != 0) return 2;
+    if (sizeof from_string != 3) return 3;
+    if (sizeof two_d != 6 * sizeof(int)) return 4;
+    if (sizeof completed != 4 * sizeof(int)) return 5;
+
+    int n = 5;
+    int vla[n];
+    if (sizeof vla != 5 * sizeof(int)) return 6;
+    int vla2[n][3];
+    if (sizeof vla2 != 15 * sizeof(int)) return 7;
+
+    /* A different extent gives a different answer, so nothing is folding to a
+       constant behind the test's back. */
+    n = 7;
+    int vla3[n];
+    if (sizeof vla3 != 7 * sizeof(int)) return 8;
+
+    int fixed[4];
+    if (sizeof fixed != 4 * sizeof(int)) return 9;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("sizeof_of_array_objects", code, &[]), 0);
+}

@@ -2389,7 +2389,8 @@ impl Parser<'_> {
                 if has_name && !is_typedef {
                     self.check_redeclaration(name, typ, decl_pos);
                     let sym = Symbol::variable(name, typ, self.symbols.depth())
-                        .with_align(validated_align);
+                        .with_align(validated_align)
+                        .with_variably_modified_array(!vla_sizes.is_empty());
                     if let Ok(id) = self.symbols.declare(sym) {
                         symbol_id = Some(id);
                     }
@@ -4418,7 +4419,8 @@ impl Parser<'_> {
             // Declare parameter in temporary scope so later params can reference it
             // (C99 6.9.1p9: parameters are in scope for VLA sizes)
             if let Some(name) = name_opt {
-                let sym = Symbol::parameter(name, typ_id, self.symbols.depth());
+                let sym = Symbol::parameter(name, typ_id, self.symbols.depth())
+                    .with_variably_modified_array(!vla_sizes.is_empty());
                 // 6.9.1p5: no two parameters may share a name. `declare`
                 // reports it and the `Err` was dropped, leaving the second
                 // parameter with no symbol at all -- so the function compiled
@@ -5239,9 +5241,20 @@ impl Parser<'_> {
             self.expect_special(b']')?;
             dimensions.push(size);
         }
-        // Build type from right to left (innermost dimension first)
+        // Build type from right to left (innermost dimension first).
+        //
+        // An absent extent stays `None`, as `parse_declarator` records it.
+        // Collapsing it to `Some(0)` here made `int a[];` indistinguishable
+        // from the GNU zero-length `int a[0];`, so the two declarator paths
+        // disagreed about what "incomplete" looks like and `sizeof a` could
+        // not tell them apart.
         for size in dimensions.into_iter().rev() {
-            let arr_type = Type::array(var_type_id, size.unwrap_or(0));
+            let arr_type = Type {
+                kind: TypeKind::Array,
+                base: Some(var_type_id),
+                array_size: size,
+                ..Default::default()
+            };
             var_type_id = self.types.intern(arr_type);
         }
 
@@ -5317,9 +5330,24 @@ impl Parser<'_> {
                 Ok(id) => id,
                 Err(_) => {
                     // Extern declaration of existing variable - reuse existing symbol
-                    self.symbols
+                    let existing = self
+                        .symbols
                         .lookup_id(name, Namespace::Ordinary)
-                        .expect("redeclaration should find existing symbol")
+                        .expect("redeclaration should find existing symbol");
+                    // 6.2.7p4: the composite of two compatible array types has
+                    // whichever extent is known, so a later declaration
+                    // completes an earlier `extern int a[];`. Keeping the first
+                    // type left the object incomplete for good, and `sizeof a`
+                    // after `int a[4];` was refused.
+                    if self
+                        .types
+                        .unsized_array_levels(self.symbols.get(existing).typ)
+                        > 0
+                        && self.types.unsized_array_levels(var_type_id) == 0
+                    {
+                        self.symbols.get_mut(existing).typ = var_type_id;
+                    }
+                    existing
                 }
             })
         };

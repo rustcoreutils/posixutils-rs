@@ -879,6 +879,7 @@ impl<'a> Parser<'a> {
             // carry. Routing it to `SizeofExpr` reaches that record.
             if let Some(inner) = self.try_parse_sizeof_typeof_operand()? {
                 self.expect_special(b')')?;
+                self.check_sizeof_expr_operand(&inner, sizeof_pos);
                 return Ok(Expr::typed(
                     ExprKind::SizeofExpr(Box::new(inner)),
                     size_t,
@@ -905,6 +906,7 @@ impl<'a> Parser<'a> {
             // Not a type, parse as expression
             let expr = self.parse_expression()?;
             self.expect_special(b')')?;
+            self.check_sizeof_expr_operand(&expr, sizeof_pos);
             Ok(Expr::typed(
                 ExprKind::SizeofExpr(Box::new(expr)),
                 size_t,
@@ -913,6 +915,7 @@ impl<'a> Parser<'a> {
         } else {
             // sizeof without parens - must be expression
             let expr = self.parse_unary_expr()?;
+            self.check_sizeof_expr_operand(&expr, sizeof_pos);
             Ok(Expr::typed(
                 ExprKind::SizeofExpr(Box::new(expr)),
                 size_t,
@@ -934,6 +937,41 @@ impl<'a> Parser<'a> {
     /// `void` and function types are deliberately not refused: strict C
     /// forbids both, gcc accepts them as an extension giving 1, and matching
     /// gcc is this compiler's policy.
+    /// 6.5.3.4p1 for the *expression* form of `sizeof`.
+    ///
+    /// `check_sizeof_operand_is_complete` answers for a type-name, where the
+    /// extents ride on the node. An expression has only its type, and the type
+    /// cannot tell an incomplete array from a variably modified one -- `int[]`,
+    /// `int[n]` and `int[m]` all intern to one `TypeId`. So the question is put
+    /// to the *declaration*: `Symbol::array_is_variably_modified` records
+    /// whether the declarator carried size expressions. Without it `extern int
+    /// a[]; sizeof a` answered 0 where gcc rejects it, while a local VLA's
+    /// `sizeof` had to keep working.
+    ///
+    /// Only an identifier is examined. A subscript or a member reaches an
+    /// element whose type is complete by construction, and a call cannot
+    /// return an array.
+    fn check_sizeof_expr_operand(&self, expr: &Expr, pos: Position) {
+        let ExprKind::Ident(symbol_id) = expr.kind else {
+            return;
+        };
+        let Some(typ) = expr.typ else {
+            return;
+        };
+        if self.types.kind(typ) != TypeKind::Array
+            || self.types.unsized_array_levels(typ) == 0
+            || self.symbols.get(symbol_id).array_is_variably_modified
+        {
+            return;
+        }
+        let named = self.types.format_type(typ, Some(self.idents));
+        diag::error_args(
+            pos,
+            "invalid application of 'sizeof' to incomplete type '{0}'",
+            &[&named],
+        );
+    }
+
     fn check_sizeof_operand_is_complete(&self, typ: TypeId, dims: &[Expr], pos: Position) {
         let incomplete = match self.types.kind(typ) {
             TypeKind::Array => self.types.unsized_array_levels(typ) > dims.len(),

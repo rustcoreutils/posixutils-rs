@@ -89,6 +89,12 @@ genuine 6.8.6.4 violations. And `__attribute__((transparent_union))` is
 unimplemented, so an argument matching any member of a union parameter is
 accepted rather than checked (#C51)._
 
+_The packed-bit-field layout used to be a row in the table below:
+`struct __attribute__((packed)) { unsigned a:20, b:20; }` was 8 bytes here and
+5 under gcc. Closed by #C110 -- under a pack cap the unit rule is switched off
+entirely, and a span that is not one addressable unit is assembled byte by
+byte, as gcc does on both targets._
+
 | Area | Divergence |
 |------|-----------|
 | `_FORTIFY_SOURCE` | Still checks nothing. Five of six layers are done; the one that remains is described above, and is an ordinary compiler feature rather than fortify-specific work |

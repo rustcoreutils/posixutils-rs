@@ -5523,3 +5523,86 @@ fn test_size_specifier_order_preserves_signedness() {
     assert_eq!(types.kind(typ), TypeKind::Long);
     assert!(types.modifiers(typ).contains(TypeModifiers::UNSIGNED));
 }
+
+/// A `switch` body that is not a compound statement must still contain the
+/// statement its `case` label prefixes.
+///
+/// `Stmt::Case` is a marker carrying the value and not the labeled statement,
+/// which is sound only inside a block where the two stay adjacent items. Given
+/// `switch (x) case 1: return 2;` the marker took the entire body and the
+/// `return` became a *sibling* of the switch -- reached whatever the value of
+/// `x`. The parser now rebuilds the block that flattening assumes.
+#[test]
+fn test_switch_with_non_compound_body_keeps_its_labelled_statement() {
+    let (func, _types, _strings, _symbols) =
+        parse_func("int f(int x) { switch (x) case 1: return 2; return 0; }").unwrap();
+
+    let Stmt::Block(items) = &func.body else {
+        panic!("function body is not a block");
+    };
+    // The switch and the trailing `return 0;` -- and nothing else. Before the
+    // fix there were three items, the middle one being the escaped `return 2;`.
+    assert_eq!(
+        items.len(),
+        2,
+        "the labelled statement escaped the switch: {items:#?}"
+    );
+
+    let BlockItem::Statement(first) = &items[0] else {
+        panic!("first item is not a statement")
+    };
+    let Stmt::Switch { body, .. } = &**first else {
+        panic!("first item is not a switch: {first:#?}");
+    };
+    let Stmt::Block(inner) = &**body else {
+        panic!("switch body was not wrapped into a block: {body:#?}");
+    };
+    assert_eq!(inner.len(), 2, "expected the label and its statement");
+    let BlockItem::Statement(label) = &inner[0] else {
+        panic!("expected the case label")
+    };
+    assert!(matches!(**label, Stmt::Case(_)), "{label:#?}");
+    let BlockItem::Statement(labelled) = &inner[1] else {
+        panic!("expected the labelled statement")
+    };
+    assert!(matches!(**labelled, Stmt::Return(Some(_))), "{labelled:#?}");
+}
+
+/// The converse: a body that opens a block, and one that carries no label, are
+/// shaped exactly as before. Without these the fix could pass by wrapping
+/// every switch body, which would churn the lowering of every existing switch.
+#[test]
+fn test_switch_bodies_that_need_no_wrapping_are_unchanged() {
+    let (func, _types, _strings, _symbols) =
+        parse_func("int f(int x) { switch (x) { case 1: return 2; } return 0; }").unwrap();
+    let Stmt::Block(items) = &func.body else {
+        panic!("not a block")
+    };
+    let BlockItem::Statement(first) = &items[0] else {
+        panic!("first item is not a statement")
+    };
+    let Stmt::Switch { body, .. } = &**first else {
+        panic!("not a switch")
+    };
+    let Stmt::Block(inner) = &**body else {
+        panic!("a braced body should stay a block")
+    };
+    assert_eq!(inner.len(), 2);
+
+    // No label at all: the single statement is returned verbatim, not wrapped.
+    let (func, _types, _strings, _symbols) =
+        parse_func("int f(int x) { int n = 0; switch (x) n = 5; return n; }").unwrap();
+    let Stmt::Block(items) = &func.body else {
+        panic!("not a block")
+    };
+    let BlockItem::Statement(second) = &items[1] else {
+        panic!("second item is not a statement")
+    };
+    let Stmt::Switch { body, .. } = &**second else {
+        panic!("not a switch")
+    };
+    assert!(
+        matches!(**body, Stmt::Expr(_)),
+        "an unlabelled body gained a wrapper: {body:#?}"
+    );
+}

@@ -1763,11 +1763,54 @@ impl Parser<'_> {
         self.expect_special(b'(')?;
         let expr = self.parse_expression()?;
         self.expect_special(b')')?;
-        let body = self.parse_statement()?;
+        let body = self.parse_switch_body()?;
         Ok(Stmt::Switch {
             expr,
             body: Box::new(body),
         })
+    }
+
+    /// Parse a `switch` body, which C17 6.8.4 says is one statement.
+    ///
+    /// `case E : statement` is a single *labeled statement* in the grammar, but
+    /// the AST flattens the label into a sibling marker -- `Stmt::Case` carries
+    /// the value and not the statement it labels. That flattening is only sound
+    /// inside a block, where the marker and its statement stay adjacent items of
+    /// one list. Given a non-compound body there is room for exactly one
+    /// statement, so the marker took the whole body and the labeled statement
+    /// escaped the switch to become the *following* statement of the enclosing
+    /// block -- reached unconditionally, whatever the controlling expression.
+    /// `switch (x) case 1: return 2;` returned 2 for every `x`.
+    ///
+    /// So rebuild the block the flattening assumes. A body that opens a block,
+    /// or that carries no label at all, is returned exactly as before; only the
+    /// labeled non-compound form gains the wrapper.
+    fn parse_switch_body(&mut self) -> ParseResult<Stmt> {
+        if self.is_special(b'{') {
+            return self.parse_statement();
+        }
+
+        let mut items = Vec::new();
+        loop {
+            let stmt = self.parse_statement()?;
+            let is_label = matches!(stmt, Stmt::Case(_) | Stmt::Default);
+            items.push(BlockItem::Statement(Box::new(stmt)));
+            // A label prefixes a statement, so one more must follow it. Anything
+            // else ends the body. The `}`/EOF guard keeps a body that is nothing
+            // but a label -- which no conforming program contains -- from
+            // running past the end of its enclosing block.
+            if !is_label || self.is_special(b'}') || self.is_eof() {
+                break;
+            }
+        }
+
+        if items.len() == 1 {
+            let BlockItem::Statement(only) = items.remove(0) else {
+                unreachable!("parse_switch_body pushes only statements")
+            };
+            return Ok(*only);
+        }
+        Ok(Stmt::Block(items))
     }
 
     /// Parse a case label

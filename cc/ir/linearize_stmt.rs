@@ -1251,6 +1251,15 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
         }
 
+        // Control leaves here for a case label, so a statement standing before
+        // the first one is unreachable -- C17 6.8.4.2 gives it no edge from the
+        // switch. It was being lowered into the block the switch itself
+        // terminates and ran unconditionally: `switch (x) { n = 5; case 1: ; }`
+        // set `n` whatever `x` was. `None` is the same "nothing to emit into"
+        // state `goto` leaves behind, and the first `case` restores a live
+        // block via `switch_bb`.
+        self.current_bb = None;
+
         // Linearize body with case block switching
         self.linearize_switch_body(body, &case_values, &case_bbs, default_bb);
 
@@ -1268,18 +1277,27 @@ impl<'a> super::linearize::Linearizer<'a> {
         self.switch_bb(exit_bb);
     }
 
-    /// Collect case values from switch body (must be a Block)
+    /// Collect case values from a switch body.
     /// Returns (case_values, has_default)
+    ///
+    /// C17 6.8.4 makes the body one statement, which need not be a compound
+    /// one. `switch (x) while (n < 3) { case 1: n++; }` is legal, and matching
+    /// only `Stmt::Block` here collected no cases from it -- so the switch was
+    /// emitted with an empty table and every value took the default edge.
+    /// A non-compound body is one statement, so it is walked as one.
     pub(crate) fn collect_switch_cases(&self, body: &Stmt) -> (Vec<i64>, bool) {
         let mut case_values = Vec::new();
         let mut has_default = false;
 
-        if let Stmt::Block(items) = body {
-            for item in items {
-                if let BlockItem::Statement(stmt) = item {
-                    self.collect_cases_from_stmt(stmt, &mut case_values, &mut has_default);
+        match body {
+            Stmt::Block(items) => {
+                for item in items {
+                    if let BlockItem::Statement(stmt) = item {
+                        self.collect_cases_from_stmt(stmt, &mut case_values, &mut has_default);
+                    }
                 }
             }
+            stmt => self.collect_cases_from_stmt(stmt, &mut case_values, &mut has_default),
         }
 
         (case_values, has_default)
@@ -2065,20 +2083,28 @@ impl<'a> super::linearize::Linearizer<'a> {
     ) {
         let mut case_idx = 0;
 
-        if let Stmt::Block(items) = body {
-            for item in items {
-                match item {
-                    BlockItem::Declaration(decl) => self.linearize_local_decl(decl),
-                    BlockItem::Statement(stmt) => {
-                        self.linearize_switch_stmt(
-                            stmt,
-                            case_values,
-                            case_bbs,
-                            default_bb,
-                            &mut case_idx,
-                        );
+        // A non-compound body is one statement; lowering it through the same
+        // walker is what keeps the labels inside it reachable. See
+        // `collect_switch_cases`, which has to agree about this.
+        match body {
+            Stmt::Block(items) => {
+                for item in items {
+                    match item {
+                        BlockItem::Declaration(decl) => self.linearize_local_decl(decl),
+                        BlockItem::Statement(stmt) => {
+                            self.linearize_switch_stmt(
+                                stmt,
+                                case_values,
+                                case_bbs,
+                                default_bb,
+                                &mut case_idx,
+                            );
+                        }
                     }
                 }
+            }
+            stmt => {
+                self.linearize_switch_stmt(stmt, case_values, case_bbs, default_bb, &mut case_idx)
             }
         }
     }

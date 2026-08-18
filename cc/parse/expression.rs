@@ -1579,6 +1579,9 @@ impl<'a> Parser<'a> {
                 } else {
                     self.types.int_id
                 };
+                if let Some(t) = expr.typ {
+                    self.warn_atomic_member_access(t, member, dot_pos);
+                }
                 expr = Self::typed_expr(
                     ExprKind::Member {
                         expr: Box::new(expr),
@@ -1622,6 +1625,11 @@ impl<'a> Parser<'a> {
                 } else {
                     self.types.int_id
                 };
+                // `p->m` names the object `*p`, so the atomicity that matters
+                // is the pointee's.
+                if let Some(pointee) = expr.typ.and_then(|t| self.types.base_type(t)) {
+                    self.warn_atomic_member_access(pointee, member, arrow_pos);
+                }
                 expr = Self::typed_expr(
                     ExprKind::Arrow {
                         expr: Box::new(expr),
@@ -2214,6 +2222,40 @@ impl<'a> Parser<'a> {
                 &[&t_name, &v_name, fault.describe()],
             );
         }
+    }
+
+    /// C11 6.5.2.3p5: naming a member of an atomic structure or union is
+    /// undefined behaviour -- the access reads or writes part of an object
+    /// whose atomicity covers the whole of it, so the lock the type promises
+    /// is not taken.
+    ///
+    /// A warning rather than a rejection, because the standard makes it
+    /// undefined rather than a constraint violation, and gcc warns. c17 said
+    /// nothing at all, so the one operation `_Atomic` exists to prevent was
+    /// the one it did not mention.
+    ///
+    /// The atomicity of the *object* is what counts, not the member's:
+    /// `struct { _Atomic int a; } s; s.a` is an ordinary access to an atomic
+    /// member and is silent, while `_Atomic struct S s; s.a` is not.
+    fn warn_atomic_member_access(&self, object: TypeId, member: StringId, pos: Position) {
+        if !self.types.modifiers(object).contains(TypeModifiers::ATOMIC) {
+            return;
+        }
+        let what = match self.types.kind(self.resolve_struct_type(object)) {
+            TypeKind::Struct => "structure",
+            TypeKind::Union => "union",
+            _ => return,
+        };
+        let name = self
+            .idents
+            .get_opt(member)
+            .unwrap_or("<unknown>")
+            .to_string();
+        diag::warning_args(
+            pos,
+            "accessing a member '{0}' of an atomic {1}",
+            &[&name, what],
+        );
     }
 
     /// May this string literal initialize this array (C17 6.7.9p14, p15)?

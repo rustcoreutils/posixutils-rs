@@ -107,11 +107,10 @@ The type system, parser, IR, linearizer, both code generators, `<stdatomic.h>`,
 and access through ordinary operators are all done. `_Atomic` on an array or
 function type is rejected.
 
-**Remaining:**
-- Warn on member access of an atomic struct or union, as gcc does
-  ("accessing a member of an atomic structure"). C11 6.5.2.3p5 makes it
-  undefined behaviour rather than a constraint violation, so this is a
-  warning, not the rejection an earlier version of this list called for.
+**Remaining:** nothing on the semantic-validation list. The member-access
+warning that stood here is #C113, closed 2026-08-18; C11 6.5.2.3p5 makes it
+undefined behaviour rather than a constraint violation, so it is a warning
+rather than the rejection an earlier version of this list called for.
 
 Two entries that used to sit here were removed after being probed rather than
 implemented. Rejecting `_Atomic` on a struct or union with a VLA member is

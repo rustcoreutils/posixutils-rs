@@ -3050,3 +3050,88 @@ fn diagnostics_sizeof_of_complete_array_expressions_is_accepted() {
         compile_expect_ok(name, src);
     }
 }
+
+// === C11 6.5.2.3p5 — naming a member of an atomic structure or union ===
+
+/// Reading or writing one member of an `_Atomic` aggregate touches part of an
+/// object whose atomicity covers all of it, so the lock the type promises is
+/// not taken. C11 makes it undefined behaviour rather than a constraint
+/// violation, so gcc warns and so does c17 now -- it used to say nothing at
+/// all, which meant the one operation `_Atomic` exists to prevent was the one
+/// it did not mention.
+#[test]
+fn diagnostics_member_of_an_atomic_aggregate_warns() {
+    for (name, src, expected) in [
+        (
+            "atomic_member_read",
+            "struct S { int a; };\n_Atomic struct S s;\nint f(void){ return s.a; }\n",
+            "accessing a member 'a' of an atomic structure",
+        ),
+        (
+            "atomic_member_write",
+            "struct S { int a; };\n_Atomic struct S s;\nvoid f(void){ s.a = 1; }\n",
+            "accessing a member 'a' of an atomic structure",
+        ),
+        (
+            "atomic_member_arrow",
+            "struct S { int a; };\nvoid f(_Atomic struct S *p){ (void)p->a; }\n",
+            "accessing a member 'a' of an atomic structure",
+        ),
+        (
+            "atomic_member_address",
+            "struct S { int a; };\n_Atomic struct S s;\nint *f(void){ return &s.a; }\n",
+            "accessing a member 'a' of an atomic structure",
+        ),
+        (
+            "atomic_union_member",
+            "union U { int a; };\n_Atomic union U u;\nint f(void){ return u.a; }\n",
+            "accessing a member 'a' of an atomic union",
+        ),
+        (
+            // gcc names the outer member, not the inner one.
+            "atomic_nested_member",
+            "struct I { int q; };\nstruct S { struct I i; };\n_Atomic struct S s;\n\
+             int f(void){ return s.i.q; }\n",
+            "accessing a member 'i' of an atomic structure",
+        ),
+        (
+            "atomic_through_typedef",
+            "struct S { int a; };\ntypedef _Atomic struct S AS;\nAS s;\nint f(void){ return s.a; }\n",
+            "accessing a member 'a' of an atomic structure",
+        ),
+    ] {
+        compile_expect_warning(name, src, expected);
+    }
+}
+
+/// It is the *object's* atomicity that matters, not the member's:
+/// `struct { _Atomic int a; } s; s.a` is an ordinary access to an atomic
+/// member and must stay silent, as must every access to a non-atomic
+/// aggregate.
+#[test]
+fn diagnostics_ordinary_member_access_stays_silent() {
+    for (name, src) in [
+        (
+            "plain_struct_member",
+            "struct S { int a; };\nstruct S s;\nint f(void){ return s.a; }\n",
+        ),
+        (
+            "atomic_scalar_member",
+            "struct S { _Atomic int a; };\nstruct S s;\nint f(void){ return s.a; }\n",
+        ),
+        (
+            "atomic_scalar_member_arrow",
+            "struct S { _Atomic int a; };\nvoid f(struct S *p){ (void)p->a; }\n",
+        ),
+        (
+            "plain_arrow",
+            "struct S { int a; };\nvoid f(struct S *p){ (void)p->a; }\n",
+        ),
+        (
+            "atomic_scalar_object",
+            "_Atomic int x;\nint f(void){ return x; }\n",
+        ),
+    ] {
+        compile_expect_ok(name, src);
+    }
+}

@@ -1538,14 +1538,23 @@ impl<'a> Parser<'a> {
             "DI" | "word" | "pointer" => Some(if unsigned { t.ulong_id } else { t.long_id }),
             "TI" => Some(if unsigned { t.uint128_id } else { t.int128_id }),
             // Floating modes. `XF` is the x87 extended format and `TF` IEEE
-            // binary128 -- both sixteen bytes on this target and *not*
+            // binary128 -- both sixteen bytes on x86-64 and *not*
             // interchangeable, so they map to their own types rather than to a
             // width.
+            //
+            // The binary128 modes are offered only where the type is. c17 does
+            // not support `_Float128` on macOS and deliberately predefines no
+            // `__FLT128_*` family there, so that `<float.h>` cannot advertise a
+            // type whose every operation fails to link. Handing the same type
+            // back through a mode attribute defeated that: `mode(TF)` on Apple
+            // arm64 produced a type needing `__divtf3` and `__multf3`, which
+            // that platform has no equivalent of. `has_float128` is the one
+            // condition both places ask.
             "HF" => Some(t.float16_id),
             "SF" => Some(t.float_id),
             "DF" => Some(t.double_id),
             "XF" => Some(t.longdouble_id),
-            "TF" => Some(t.float128_id),
+            "TF" if t.has_float128() => Some(t.float128_id),
             // Complex modes, named for the format of each half. glibc's
             // <bits/floatn.h> declares `__cfloat128` with `mode(TC)`, which was
             // 285 of the warnings a CPython build produced.
@@ -1553,7 +1562,7 @@ impl<'a> Parser<'a> {
             "SC" => Some(t.complex_float_id),
             "DC" => Some(t.complex_double_id),
             "XC" => Some(t.complex_longdouble_id),
-            "TC" => Some(t.complex_float128_id),
+            "TC" if t.has_float128() => Some(t.complex_float128_id),
             _ => None,
         };
         match mapped {
@@ -2081,7 +2090,7 @@ impl Parser<'_> {
         if !self.is_special(b';') {
             loop {
                 let decl_pos = self.current_pos();
-                let (name, typ, vla_sizes, _func_params) =
+                let (name, mut typ, vla_sizes, _func_params) =
                     self.parse_declarator(base_type_id, DeclaratorName::Required)?;
                 // Skip GCC extensions like __asm("...") or __attribute__((...))
                 self.skip_extensions();
@@ -2093,6 +2102,7 @@ impl Parser<'_> {
                 };
 
                 // Validate explicit alignment (C11 6.7.5: >= natural alignment)
+                typ = self.apply_pending_mode(typ);
                 let validated_align = self.validated_explicit_align(typ)?;
 
                 // Declare symbol in symbol table
@@ -2125,6 +2135,9 @@ impl Parser<'_> {
 
         // Clear pending alignment after declaration
         self.pending_alignas = None;
+        // A mode that no declarator consumed belongs to no later declaration:
+        // leaving it set applied it to whatever came next.
+        self.pending_mode = None;
         self.expect_special(b';')?;
 
         Ok(Declaration { declarators })
@@ -2454,6 +2467,7 @@ impl Parser<'_> {
                 let has_name = !self.str(name).is_empty();
 
                 // Validate explicit alignment (C11 6.7.5: >= natural alignment)
+                typ = self.apply_pending_mode(typ);
                 let validated_align = self.validated_explicit_align(typ)?;
 
                 // Bind variable to symbol table BEFORE parsing initializer.
@@ -2593,6 +2607,9 @@ impl Parser<'_> {
 
         // Clear pending alignment after declaration
         self.pending_alignas = None;
+        // A mode that no declarator consumed belongs to no later declaration:
+        // leaving it set applied it to whatever came next.
+        self.pending_mode = None;
         self.expect_special(b';')?;
 
         Ok(Declaration { declarators })
@@ -4680,6 +4697,9 @@ impl Parser<'_> {
     fn parse_external_decl(&mut self) -> ParseResult<ExternalDecl> {
         // Clear pending alignment from previous declaration
         self.pending_alignas = None;
+        // A mode that no declarator consumed belongs to no later declaration:
+        // leaving it set applied it to whatever came next.
+        self.pending_mode = None;
         self.pending_fn_attrs = Default::default();
         // And any asm label the previous declaration left behind.
         //
@@ -4866,6 +4886,7 @@ impl Parser<'_> {
                 self.expect_special(b';')?;
 
                 // Validate explicit alignment (C11 6.7.5: >= natural alignment)
+                typ = self.apply_pending_mode(typ);
                 let validated_align = self.validated_explicit_align(typ)?;
 
                 // Add to symbol table and capture SymbolId
@@ -4966,7 +4987,7 @@ impl Parser<'_> {
             if self.is_grouped_declarator() {
                 // This is a grouped declarator - use parse_declarator
                 self.pos = saved_pos; // restore position before '('
-                let (name, full_typ, vla_sizes, decl_func_params) =
+                let (name, mut full_typ, vla_sizes, decl_func_params) =
                     self.parse_declarator(typ_id, DeclaratorName::Required)?;
 
                 // C99 6.7.5.2: VLAs must have block scope
@@ -5063,6 +5084,7 @@ impl Parser<'_> {
                 self.expect_special(b';')?;
 
                 // Validate explicit alignment (C11 6.7.5: >= natural alignment)
+                full_typ = self.apply_pending_mode(full_typ);
                 let validated_align = self.validated_explicit_align(full_typ)?;
 
                 // Add to symbol table and capture SymbolId
@@ -5364,6 +5386,7 @@ impl Parser<'_> {
         self.skip_extensions_after_declarator();
 
         // Validate explicit alignment (C11 6.7.5: >= natural alignment)
+        var_type_id = self.apply_pending_mode(var_type_id);
         let validated_align = self.validated_explicit_align(var_type_id)?;
 
         // 6.7p7 for a file-scope *definition*. Judged at end of translation
@@ -5529,6 +5552,7 @@ impl Parser<'_> {
             }
 
             // Validate explicit alignment for this declarator's type (C11 6.7.5)
+            decl_type = self.apply_pending_mode(decl_type);
             let decl_validated_align = self.validated_explicit_align(decl_type)?;
 
             // Bind variable to symbol table BEFORE parsing initializer (C99 6.2.1p7)
@@ -5615,6 +5639,9 @@ impl Parser<'_> {
 
         // Clear pending alignment after declaration
         self.pending_alignas = None;
+        // A mode that no declarator consumed belongs to no later declaration:
+        // leaving it set applied it to whatever came next.
+        self.pending_mode = None;
 
         Ok(ExternalDecl::Declaration(Declaration { declarators }))
     }

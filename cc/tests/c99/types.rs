@@ -980,11 +980,16 @@ typedef unsigned udi __attribute__((__mode__(__DI__)));
 typedef float hf __attribute__((__mode__(__HF__)));
 typedef float sf __attribute__((__mode__(__SF__)));
 typedef float df __attribute__((__mode__(__DF__)));
-typedef float tf __attribute__((__mode__(__TF__)));
 typedef _Complex float hc __attribute__((__mode__(HC)));
 typedef _Complex float sc __attribute__((__mode__(SC)));
 typedef _Complex float dc __attribute__((__mode__(DC)));
+/* The binary128 modes exist only where the type does; c17 refuses them on a
+   target with no `__FLT128_*` family rather than handing back a type whose
+   arithmetic cannot link. */
+#ifdef __FLT128_MANT_DIG__
+typedef float tf __attribute__((__mode__(__TF__)));
 typedef _Complex float tc __attribute__((__mode__(TC)));
+#endif
 
 int main(void) {
     if (sizeof(qi) != 1)  return 1;
@@ -1006,9 +1011,16 @@ int main(void) {
     if (sizeof(df) != 8) return 14;
 
     /* A mode is a type, not merely a width: binary128 divides to more
-       precision than double, which a size check alone would not show. */
+       precision than double, which a size check alone would not show.
+       Guarded because c17 offers `_Float128` only where the runtime can
+       support it -- there are no `__FLT128_*` predefines on Apple targets,
+       and `mode(TF)` is refused there rather than handing back a type whose
+       every operation would fail to link. Same guard as
+       `c99_float128_is_a_first_class_type`. */
+#ifdef __FLT128_MANT_DIG__
     tf third = (tf)1 / 3;
     if ((int)(third * 3 * 1000000) != 1000000) return 15;
+#endif
 
     /* Complex modes name the format of each half. glibc's <bits/floatn.h>
        declares `__cfloat128` with `mode(TC)`, which was 285 of the warnings a
@@ -1016,7 +1028,10 @@ int main(void) {
     if (sizeof(hc) != 2 * sizeof(hf)) return 17;
     if (sizeof(sc) != 2 * sizeof(sf)) return 18;
     if (sizeof(dc) != 2 * sizeof(df)) return 19;
-    if (sizeof(tc) != 2 * sizeof(tf)) return 20;
+#ifdef __FLT128_MANT_DIG__
+    if (sizeof(tf) != 16) return 20;
+    if (sizeof(tc) != 2 * sizeof(tf)) return 21;
+#endif
 
     /* And the narrow integer modes really do wrap at their own width. */
     qi small = 127;
@@ -1027,4 +1042,71 @@ int main(void) {
 }
 "#;
     assert_eq!(compile_and_run("mode_attribute", code, &[]), 0);
+}
+
+/// A `mode` applies to the declarator it was written on, and to nothing else
+/// (#C117).
+///
+/// `apply_pending_mode` was called only at the three *typedef* sites, but
+/// `pending_mode` is set for any declarator and -- unlike `pending_alignas`,
+/// which is cleared at four declaration boundaries -- was never cleared. So a
+/// mode on a non-typedef was silently dropped **and** survived to be applied to
+/// whatever was declared next:
+///
+/// ```c
+/// int a __attribute__((__mode__(__QI__)));   /* was 4 bytes, gcc gives 1 */
+/// typedef int T;                              /* became 1 byte  */
+/// ```
+///
+/// Both halves are checked here: the mode reaching its own declarator, and the
+/// declaration after it being untouched.
+#[test]
+fn c99_mode_attribute_applies_only_to_its_own_declarator() {
+    let code = r#"
+int a __attribute__((__mode__(__QI__)));
+int after_a;                                   /* must stay 4 */
+
+int b, c __attribute__((__mode__(__HI__)));    /* only c is moded */
+int after_c;
+
+static int d __attribute__((__mode__(__DI__)));
+typedef int AfterD;                            /* must stay 4 */
+
+extern int e __attribute__((__mode__(__QI__)));
+struct S { int m; } s;                         /* member must stay 4 */
+
+unsigned int u __attribute__((__mode__(__QI__)));
+int after_u;
+
+typedef int T __attribute__((__mode__(__HI__)));
+typedef int AfterT;                            /* must stay 4 */
+
+int main(void) {
+    if (sizeof a != 1) return 1;
+    if (sizeof after_a != 4) return 2;
+
+    if (sizeof b != 4) return 3;
+    if (sizeof c != 2) return 4;
+    if (sizeof after_c != 4) return 5;
+
+    if (sizeof d != 8) return 6;
+    if (sizeof(AfterD) != 4) return 7;
+
+    if (sizeof s.m != 4) return 8;
+
+    if (sizeof u != 1) return 9;
+    /* Still unsigned, and narrow: -1 wraps to 255 rather than sign-extending.
+       Tested by the stored value, not by `u - 1 < 0`, which the integer
+       promotions make an `int` comparison whatever `u` is. */
+    u = (unsigned)-1;
+    if (u != 255) return 10;
+    if (sizeof after_u != 4) return 11;
+
+    if (sizeof(T) != 2) return 12;
+    if (sizeof(AfterT) != 4) return 13;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("mode_only_its_declarator", code, &[]), 0);
 }

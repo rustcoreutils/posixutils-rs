@@ -89,10 +89,15 @@ genuine 6.8.6.4 violations. And `__attribute__((transparent_union))` is
 unimplemented, so an argument matching any member of a union parameter is
 accepted rather than checked (#C51)._
 
+_The packed-bit-field layout used to be a row in the table below:
+`struct __attribute__((packed)) { unsigned a:20, b:20; }` was 8 bytes here and
+5 under gcc. Closed by #C110 -- under a pack cap the unit rule is switched off
+entirely, and a span that is not one addressable unit is assembled byte by
+byte, as gcc does on both targets._
+
 | Area | Divergence |
 |------|-----------|
 | `_FORTIFY_SOURCE` | Still checks nothing. Five of six layers are done; the one that remains is described above, and is an ordinary compiler feature rather than fortify-specific work |
-| `__attribute__((packed))` on a struct with bitfields | The bitfields are laid out as if the struct were not packed; only the ordinary members lose their padding. `struct { unsigned a:20, b:20; }` is 5 bytes under gcc and 8 here. Packing a bitfield to the bit lets it straddle its `sizeof(T)` window, and a straddling field has no naturally-aligned span to read or write it through — `emit_bitfield_load` addresses one power-of-two unit. Supporting it means an access path that assembles a field from an arbitrary byte range |
 
 ## Future Features
 

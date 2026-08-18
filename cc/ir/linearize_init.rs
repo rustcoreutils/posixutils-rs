@@ -350,6 +350,10 @@ impl<'a> super::linearize::Linearizer<'a> {
                     if let Some(val) = sym.enum_value {
                         Initializer::Int(val)
                     } else {
+                        // Reading the value of an object is not a constant
+                        // expression (6.7.9p4) and this silently yields zero.
+                        // Diagnosing it needs an initializer-scoped folder
+                        // first -- see #C102.
                         Initializer::None
                     }
                 }
@@ -361,6 +365,19 @@ impl<'a> super::linearize::Linearizer<'a> {
                 left,
                 right,
             } => {
+                // C17 6.6 does not list it, but the difference of two addresses
+                // *into the same object* is a link-time constant and gcc folds
+                // it: `&a[2] - &a[0]` and `(char *)&s.b - (char *)&s.a` are
+                // ordinary idioms, and both were rejected here. Across two
+                // objects the distance is not known until they are laid out, so
+                // that stays a diagnostic -- which is what requiring one symbol
+                // on both sides enforces, matching gcc on `&a[0] - &b[0]`.
+                if *op == BinaryOp::Sub {
+                    if let Some(diff) = self.static_address_difference(left, right) {
+                        return Initializer::Int(diff);
+                    }
+                }
+
                 // Try pointer/array + int or int + pointer/array → symbol address with offset
                 let is_ptr_or_array =
                     |t: TypeId| matches!(self.types.kind(t), TypeKind::Pointer | TypeKind::Array);
@@ -404,7 +421,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         Initializer::Int(val)
                     } else {
                         error(
-                            self.current_pos.unwrap_or_default(),
+                            self.expr_pos(expr),
                             "non-constant offset in pointer arithmetic initializer",
                         );
                         Initializer::None
@@ -413,7 +430,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     Initializer::Int(val)
                 } else {
                     error(
-                        self.current_pos.unwrap_or_default(),
+                        self.expr_pos(expr),
                         "non-constant pointer expression in global initializer",
                     );
                     Initializer::None
@@ -474,6 +491,69 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// given a label -- and interning needs `&mut self`, which the `&self`
     /// evaluator cannot do. Without this `const char *p = "hello" + 1;` was
     /// rejected, while `arr + 1` on a static array was accepted.
+    /// The constant difference of two addresses into one object, in whatever
+    /// units the subtraction is written in.
+    ///
+    /// `ptr - ptr` counts elements (6.5.6p9) and so divides by the pointee
+    /// size; a subtraction of two addresses already cast to an integer type
+    /// counts bytes and does not. Both sides must resolve to the *same* symbol,
+    /// which is what keeps the cross-object form a diagnostic.
+    fn static_address_difference(&self, left: &Expr, right: &Expr) -> Option<i128> {
+        let (lname, loff) = self.static_address_operand(left)?;
+        let (rname, roff) = self.static_address_operand(right)?;
+        if lname != rname {
+            return None;
+        }
+        let bytes = loff - roff;
+
+        // Scaled only when this really is a pointer difference. A cast to an
+        // integer type makes it ordinary arithmetic on two byte addresses.
+        let is_ptr = |t: Option<TypeId>| {
+            t.is_some_and(|t| matches!(self.types.kind(t), TypeKind::Pointer | TypeKind::Array))
+        };
+        if !is_ptr(left.typ) || !is_ptr(right.typ) {
+            return Some(bytes as i128);
+        }
+        let elem = left
+            .typ
+            .and_then(|t| self.types.base_type(t))
+            .map(|t| self.types.size_bytes(t) as i64)
+            .filter(|n| *n > 0)?;
+        Some((bytes / elem) as i128)
+    }
+
+    /// An operand of [`Self::static_address_difference`], resolved to the
+    /// symbol it addresses and a byte offset into it.
+    ///
+    /// Deliberately narrower than [`Self::eval_static_address`], which answers
+    /// for a bare `Ident` because its caller has already seen the `&`. Reaching
+    /// it directly from a subtraction would fold `int v, w; long d = v - w;` to
+    /// zero -- reading two variables, which is no kind of constant. So only an
+    /// expression that is *shaped* like an address qualifies: an `&`, an array
+    /// designator decaying to its first element, pointer arithmetic over one of
+    /// those, or any of them behind casts.
+    fn static_address_operand(&self, expr: &Expr) -> Option<(String, i64)> {
+        let is_ptr_or_array = expr
+            .typ
+            .is_some_and(|t| matches!(self.types.kind(t), TypeKind::Pointer | TypeKind::Array));
+        match &expr.kind {
+            // A cast changes the units the difference is counted in, not the
+            // address itself.
+            ExprKind::Cast { expr: inner, .. } => self.static_address_operand(inner),
+            ExprKind::Unary {
+                op: UnaryOp::AddrOf,
+                operand,
+            } => self.eval_static_address(operand),
+            ExprKind::Ident(_) | ExprKind::Index { .. } | ExprKind::Member { .. }
+                if is_ptr_or_array =>
+            {
+                self.eval_static_address(expr)
+            }
+            ExprKind::Binary { .. } if is_ptr_or_array => self.eval_static_address(expr),
+            _ => None,
+        }
+    }
+
     fn static_address_of(&mut self, expr: &Expr) -> Option<(String, i64)> {
         // A compound literal at file scope has static storage duration
         // (C99 6.5.2.5p5), so it is an object with an address -- but it only
@@ -835,7 +915,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     kind,
                     bit_offset: member.bit_offset,
                     bit_width: member.bit_width,
-                    storage_unit_size: member.storage_unit_size,
+                    access_bytes: member.access_bytes,
                 });
                 continue;
             }
@@ -847,7 +927,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 typ: field_type,
                 bit_offset,
                 bit_width,
-                storage_unit_size,
+                access_bytes,
             }) = resolved
             else {
                 elem_idx += 1;
@@ -875,7 +955,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 kind: StructFieldVisitKind::Expr(element.value.clone()),
                 bit_offset,
                 bit_width,
-                storage_unit_size,
+                access_bytes,
             });
             elem_idx += 1;
         }
@@ -1051,9 +1131,10 @@ impl<'a> super::linearize::Linearizer<'a> {
                             continue;
                         }
 
-                        // A field never crosses its own window, so the shift
-                        // stays inside the 128-bit carrier even at width 64.
-                        let mask = (1u128 << bit_width) - 1;
+                        // Shifting `u128::MAX` down rather than `1 << width`
+                        // up, for the reason `bitfield_value_mask` records: the
+                        // latter overflows at the carrier's own width.
+                        let mask = u128::MAX >> (128 - bit_width);
                         let placed = ((value as u128) & mask) << bit_off;
 
                         // Only the bytes the field's own bits reach. Its window
@@ -1105,7 +1186,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         let mut typ = base_type;
         let mut bit_offset = None;
         let mut bit_width = None;
-        let mut storage_unit_size = None;
+        let mut access_bytes = None;
 
         for (idx, designator) in designators.iter().enumerate() {
             match designator {
@@ -1121,11 +1202,11 @@ impl<'a> super::linearize::Linearizer<'a> {
                     if idx + 1 == designators.len() {
                         bit_offset = member.bit_offset;
                         bit_width = member.bit_width;
-                        storage_unit_size = member.storage_unit_size;
+                        access_bytes = member.access_bytes;
                     } else {
                         bit_offset = None;
                         bit_width = None;
-                        storage_unit_size = None;
+                        access_bytes = None;
                     }
                 }
                 Designator::Index(index) => {
@@ -1138,7 +1219,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     typ = elem_type;
                     bit_offset = None;
                     bit_width = None;
-                    storage_unit_size = None;
+                    access_bytes = None;
                 }
             }
         }
@@ -1148,7 +1229,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             typ,
             bit_offset,
             bit_width,
-            storage_unit_size,
+            access_bytes,
         })
     }
 
@@ -1169,7 +1250,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 typ: member.typ,
                 bit_offset: member.bit_offset,
                 bit_width: member.bit_width,
-                storage_unit_size: member.storage_unit_size,
+                access_bytes: member.access_bytes,
             });
         }
 
@@ -1186,7 +1267,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     typ: member.typ,
                     bit_offset: member.bit_offset,
                     bit_width: member.bit_width,
-                    storage_unit_size: member.storage_unit_size,
+                    access_bytes: member.access_bytes,
                 });
             }
             *current_field_idx += 1;
@@ -1263,7 +1344,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     typ: inner.typ,
                     bit_offset: inner.bit_offset,
                     bit_width: inner.bit_width,
-                    storage_unit_size: inner.storage_unit_size,
+                    access_bytes: inner.access_bytes,
                 });
             }
 

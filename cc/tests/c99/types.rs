@@ -792,3 +792,164 @@ int main(void) { return 0; }
 "#;
     assert_eq!(compile_and_run("float128_edge_cases", src, &[]), 0);
 }
+
+/// An `enum` may be a bit-field's type, and a non-negative enumeration is
+/// unsigned (#C104, #C105).
+///
+/// `validate_bitfield` matched a hand-written list of `TypeKind`s that omitted
+/// `Enum`, so `struct S { enum E e : 2; };` -- which real headers use heavily --
+/// was rejected outright with "bitfield must have integer type". 6.7.2.1p5
+/// allows "some other implementation-defined type" and gcc's set is every
+/// integer type; `is_integer` already is that set.
+///
+/// Accepting it exposed the second half. A bit-field's signedness follows its
+/// declared type's, and `enum_underlying_type` preferred `int` for any list
+/// fitting in `int` -- so a two-bit field of `enum { A, B, C, D }` holding `D`
+/// read back **-1** where gcc gives 3. gcc's rule, which 6.7.2.2p4 leaves it
+/// free to choose, is unsigned whenever no enumerator is negative; that is
+/// observable well beyond bit-fields, since `(enum E)-1 > 0` is true there and
+/// was false here.
+#[test]
+fn c99_enum_bitfields_and_enum_signedness() {
+    let code = r#"
+enum Small { S0, S1, S2, S3 };
+enum Neg   { N_A = -2, N_B = 1 };
+enum Big   { B_HUGE = 0x100000000LL };
+enum Wide  { W_TOP = 0x80000000u };
+
+struct A { enum Small e : 2; };
+struct B { enum Neg   e : 3; };
+struct C { enum Small e : 2; unsigned u : 3; };
+struct D { enum Small e : 2; enum Neg n : 3; };
+
+int main(void) {
+    /* An enumeration with no negative member is unsigned, as in gcc. */
+    if (!((enum Small)-1 > 0)) return 1;
+    if (!((enum Wide)-1 > 0))  return 2;
+    if (!((enum Big)-1 > 0))   return 3;
+    /* One with a negative member is signed. */
+    if ((enum Neg)-1 > 0)      return 4;
+
+    /* ...and the sizes are unchanged by the signedness choice. */
+    if (sizeof(enum Small) != 4) return 5;
+    if (sizeof(enum Neg)   != 4) return 6;
+    if (sizeof(enum Big)   != 8) return 7;
+
+    /* A bit-field of an unsigned enumeration does not sign-extend. */
+    struct A a; a.e = S3;
+    if ((int)a.e != 3) return 8;
+    a.e = S0; if ((int)a.e != 0) return 9;
+
+    /* A bit-field of a signed one does. */
+    struct B b; b.e = N_A;
+    if ((int)b.e != -2) return 10;
+    b.e = N_B; if ((int)b.e != 1) return 11;
+
+    /* Neighbours are undisturbed either way. */
+    struct C c; c.e = S2; c.u = 5;
+    if ((int)c.e != 2 || c.u != 5) return 12;
+    if (sizeof(struct C) != 4) return 13;
+
+    struct D d; d.e = S1; d.n = N_A;
+    if ((int)d.e != 1 || (int)d.n != -2) return 14;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("enum_bitfields_and_signedness", code, &[]),
+        0
+    );
+}
+
+/// `__attribute__((packed))` packs a bit-field to the bit (#C110).
+///
+/// c17 refused to: the straddle test in `compute_struct_layout` ran whatever
+/// the pack cap, because the access path addressed one power-of-two unit and
+/// could not span an arbitrary byte range. `struct __attribute__((packed)) {
+/// unsigned a:20, b:20; }` was 8 bytes where gcc gives 5 -- a silent ABI
+/// mismatch with any gcc-compiled object.
+///
+/// Under a cap the unit rule is switched off entirely, not narrowed to the cap:
+/// `#pragma pack(2)` lets a 16-bit field starting at bit 1 straddle both the
+/// 2- and the 4-byte boundary, which is the measurement that rules out the
+/// narrowing reading. A span that is not 1, 2, 4 or 8 bytes is then assembled
+/// byte by byte, as gcc does on both targets -- necessary, not merely
+/// equivalent, since a packed struct can be smaller than any window covering
+/// the field: `{ unsigned c:1; unsigned long long a:64; }` is nine bytes and
+/// the field needs all nine.
+#[test]
+fn c99_packed_bitfields_pack_to_the_bit() {
+    let code = r#"
+struct __attribute__((packed)) A { unsigned a:20, b:20; };
+struct __attribute__((packed)) B { unsigned a:3, b:30, c:3; };
+struct __attribute__((packed)) C { char pre; unsigned a:20; char post; };
+struct __attribute__((packed)) D { unsigned c:1; unsigned long long a:64; };
+struct __attribute__((packed)) E { unsigned a:1; unsigned b:32; };
+struct __attribute__((packed)) F { unsigned long long a:60; unsigned b:20; };
+struct __attribute__((packed)) G { signed a:20; signed b:20; };
+union  __attribute__((packed)) K { unsigned a:20; char c; };
+struct I { unsigned a:20, b:20; };   /* unpacked control */
+
+static struct A init_a = { 0xABCDE, 0x12345 };
+static struct C init_c = { 0x11, 0xFEDCB, 0x22 };
+static struct D init_d = { 1, 0x0123456789ABCDEFULL };
+
+int main(void) {
+    /* Sizes, all of them gcc's. */
+    if (sizeof(struct A) != 5)  return 1;
+    if (sizeof(struct B) != 5)  return 2;
+    if (sizeof(struct C) != 5)  return 3;
+    if (sizeof(struct D) != 9)  return 4;
+    if (sizeof(struct E) != 5)  return 5;
+    if (sizeof(struct F) != 10) return 6;
+    if (sizeof(union  K) != 3)  return 7;
+    /* The unpacked layout is untouched. */
+    if (sizeof(struct I) != 8)  return 8;
+
+    /* Values round-trip through a span that is not a storage unit. */
+    struct A a; a.a = 0xABCDE; a.b = 0x12345;
+    if (a.a != 0xABCDEu || a.b != 0x12345u) return 9;
+
+    struct B b; b.a = 5; b.b = 0x2AAAAAAA; b.c = 3;
+    if (b.a != 5u || b.b != 0x2AAAAAAAu || b.c != 3u) return 10;
+
+    /* Ordinary members either side must survive every write: a store is a
+       read-modify-write over the bytes the field shares with them. */
+    struct C c; c.pre = 0x11; c.post = 0x22; c.a = 0xFEDCB;
+    if (c.pre != 0x11 || c.post != 0x22 || c.a != 0xFEDCBu) return 11;
+    c.a = 0;       if (c.pre != 0x11 || c.post != 0x22) return 12;
+    c.a = 0xFFFFF; if (c.pre != 0x11 || c.post != 0x22 || c.a != 0xFFFFFu) return 13;
+
+    /* Nine bytes, the widest span there is. */
+    struct D d; d.c = 0; d.a = 0x0123456789ABCDEFULL;
+    if (d.a != 0x0123456789ABCDEFULL) return 14;
+    d.c = 1; if (d.a != 0x0123456789ABCDEFULL || d.c != 1u) return 15;
+    d.a = 0xFFFFFFFFFFFFFFFFULL;
+    if (d.a != 0xFFFFFFFFFFFFFFFFULL || d.c != 1u) return 16;
+
+    struct E e; e.a = 1; e.b = 0xDEADBEEF;
+    if (e.a != 1u || e.b != 0xDEADBEEFu) return 17;
+
+    struct F f; f.a = 0x0FEDCBA987654321ULL; f.b = 0xFFFFF;
+    if (f.a != 0x0FEDCBA987654321ULL || f.b != 0xFFFFFu) return 18;
+
+    /* A signed packed field sign-extends from its own width. */
+    struct G g; g.a = -1; g.b = -2;
+    if (g.a != -1 || g.b != -2) return 19;
+    g.a = 0x7FFFF; if (g.a != 0x7FFFF || g.b != -2) return 20;
+
+    /* Static initializers go through the byte merge, not the access path. */
+    if (init_a.a != 0xABCDEu || init_a.b != 0x12345u) return 21;
+    if (init_c.pre != 0x11 || init_c.a != 0xFEDCBu || init_c.post != 0x22) return 22;
+    if (init_d.c != 1u || init_d.a != 0x0123456789ABCDEFULL) return 23;
+
+    /* The unpacked control still round-trips. */
+    struct I i; i.a = 0xABCDE; i.b = 0x12345;
+    if (i.a != 0xABCDEu || i.b != 0x12345u) return 24;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("packed_bitfields", code, &[]), 0);
+}

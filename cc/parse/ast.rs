@@ -1056,16 +1056,27 @@ pub enum Stmt {
     Return(Option<Expr>),
 
     /// Break statement
-    Break,
+    ///
+    /// The five jump and label statements carry a `Position` where the rest of
+    /// `Stmt` does not. Their diagnostics have no other anchor: an expression
+    /// statement can borrow `Expr::pos`, but `break;` contains nothing, and the
+    /// linearizer's `current_pos` names the last *expression* lowered -- some
+    /// earlier line. A whole-body pre-pass, which is where the jump constraints
+    /// are checked, sees only the function's own position.
+    Break(Position),
 
     /// Continue statement
-    Continue,
+    Continue(Position),
 
     /// Goto statement: goto label;
-    Goto(StringId),
+    Goto { name: StringId, pos: Position },
 
     /// Labeled statement: label: stmt
-    Label { name: StringId, stmt: Box<Stmt> },
+    Label {
+        name: StringId,
+        stmt: Box<Stmt>,
+        pos: Position,
+    },
 
     /// Switch statement: switch (expr) { cases }
     Switch { expr: Expr, body: Box<Stmt> },
@@ -1074,7 +1085,7 @@ pub enum Stmt {
     Case(Expr),
 
     /// Default label (within switch body)
-    Default,
+    Default(Position),
 
     /// Inline assembly statement (GCC extended asm)
     /// Format: asm [volatile] [goto] ( "template" : outputs : inputs : clobbers [: goto_labels] );

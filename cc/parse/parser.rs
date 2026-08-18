@@ -88,6 +88,9 @@ struct SpecifierTally {
     /// the diagnostic that reports it against an incompatible data type.
     last_size: Option<(&'static str, Position)>,
     last_sign: Option<(&'static str, Position)>,
+    /// Storage-class specifiers, in source order. 6.7.1p2 permits at most one
+    /// -- `_Thread_local` excepted, which may accompany `static` or `extern`.
+    storage_classes: Vec<(&'static str, Position)>,
 }
 
 impl SpecifierTally {
@@ -116,6 +119,13 @@ impl SpecifierTally {
         }
     }
 
+    /// `_Thread_local` is deliberately not recorded: 6.7.1p2 lets it appear
+    /// with `static` or `extern`, and gcc accepts both orders, so counting it
+    /// would reject `static _Thread_local int x;`.
+    fn note_storage_class(&mut self, name: &'static str, pos: Position) {
+        self.storage_classes.push((name, pos));
+    }
+
     fn note_sign(&mut self, name: &'static str, pos: Position) {
         self.last_sign = Some((name, pos));
         if name == "signed" {
@@ -131,6 +141,20 @@ impl SpecifierTally {
     /// diagnostic (C17 5.1.1.3), and the parser recovers with the type it had
     /// already built, so one bad declaration does not cascade.
     fn check(&self) {
+        if let Some((second, pos)) = self.storage_classes.get(1) {
+            let first = self.storage_classes[0].0;
+            if first == *second {
+                diag::error_args(*pos, "duplicate '{0}'", &[second]);
+            } else {
+                diag::error_args(
+                    *pos,
+                    "multiple storage classes in declaration specifiers ('{0}' and '{1}')",
+                    &[first, second],
+                );
+            }
+            return;
+        }
+
         if let Some((second, pos)) = self.data_types.get(1) {
             diag::error_args(
                 *pos,
@@ -536,6 +560,10 @@ pub struct Parser<'a> {
     /// Explicit alignment from _Alignas in current declaration
     /// Cleared after each declaration is parsed.
     pending_alignas: Option<u32>,
+    /// File-scope object definitions whose type was incomplete when parsed.
+    /// Judged at end of translation unit -- see
+    /// [`Self::check_deferred_incomplete_definitions`].
+    tentative_definitions: Vec<(TypeId, Position)>,
     /// Alignment from an attribute written *after* a declarator.
     ///
     /// Kept apart from `pending_alignas` because the two have different
@@ -628,6 +656,7 @@ impl<'a> Parser<'a> {
             types,
             pos: 0,
             pending_alignas: None,
+            tentative_definitions: Vec::new(),
             pending_declarator_align: None,
             pending_symbol_attrs: Default::default(),
             pending_fn_attrs: Default::default(),
@@ -1552,20 +1581,23 @@ impl Parser<'_> {
                     crate::kw::FOR => return self.parse_for_stmt(),
                     crate::kw::RETURN => return self.parse_return_stmt(),
                     crate::kw::BREAK => {
+                        let pos = self.current_pos();
                         self.advance();
                         self.expect_special(b';')?;
-                        return Ok(Stmt::Break);
+                        return Ok(Stmt::Break(pos));
                     }
                     crate::kw::CONTINUE => {
+                        let pos = self.current_pos();
                         self.advance();
                         self.expect_special(b';')?;
-                        return Ok(Stmt::Continue);
+                        return Ok(Stmt::Continue(pos));
                     }
                     crate::kw::GOTO => {
+                        let pos = self.current_pos();
                         self.advance();
-                        let label = self.expect_identifier()?;
+                        let name = self.expect_identifier()?;
                         self.expect_special(b';')?;
-                        return Ok(Stmt::Goto(label));
+                        return Ok(Stmt::Goto { name, pos });
                     }
                     crate::kw::SWITCH => return self.parse_switch_stmt(),
                     crate::kw::CASE => return self.parse_case_label(),
@@ -1594,6 +1626,7 @@ impl Parser<'_> {
         if self.peek() == TokenType::Ident {
             // Save position for potential backtrack
             let saved_pos = self.pos;
+            let pos = self.current_pos();
             let name = self.expect_identifier()?;
             if self.is_special(b':') {
                 self.advance();
@@ -1601,6 +1634,7 @@ impl Parser<'_> {
                 return Ok(Stmt::Label {
                     name,
                     stmt: Box::new(stmt),
+                    pos,
                 });
             }
             // Not a label, backtrack
@@ -1763,11 +1797,54 @@ impl Parser<'_> {
         self.expect_special(b'(')?;
         let expr = self.parse_expression()?;
         self.expect_special(b')')?;
-        let body = self.parse_statement()?;
+        let body = self.parse_switch_body()?;
         Ok(Stmt::Switch {
             expr,
             body: Box::new(body),
         })
+    }
+
+    /// Parse a `switch` body, which C17 6.8.4 says is one statement.
+    ///
+    /// `case E : statement` is a single *labeled statement* in the grammar, but
+    /// the AST flattens the label into a sibling marker -- `Stmt::Case` carries
+    /// the value and not the statement it labels. That flattening is only sound
+    /// inside a block, where the marker and its statement stay adjacent items of
+    /// one list. Given a non-compound body there is room for exactly one
+    /// statement, so the marker took the whole body and the labeled statement
+    /// escaped the switch to become the *following* statement of the enclosing
+    /// block -- reached unconditionally, whatever the controlling expression.
+    /// `switch (x) case 1: return 2;` returned 2 for every `x`.
+    ///
+    /// So rebuild the block the flattening assumes. A body that opens a block,
+    /// or that carries no label at all, is returned exactly as before; only the
+    /// labeled non-compound form gains the wrapper.
+    fn parse_switch_body(&mut self) -> ParseResult<Stmt> {
+        if self.is_special(b'{') {
+            return self.parse_statement();
+        }
+
+        let mut items = Vec::new();
+        loop {
+            let stmt = self.parse_statement()?;
+            let is_label = matches!(stmt, Stmt::Case(_) | Stmt::Default(_));
+            items.push(BlockItem::Statement(Box::new(stmt)));
+            // A label prefixes a statement, so one more must follow it. Anything
+            // else ends the body. The `}`/EOF guard keeps a body that is nothing
+            // but a label -- which no conforming program contains -- from
+            // running past the end of its enclosing block.
+            if !is_label || self.is_special(b'}') || self.is_eof() {
+                break;
+            }
+        }
+
+        if items.len() == 1 {
+            let BlockItem::Statement(only) = items.remove(0) else {
+                unreachable!("parse_switch_body pushes only statements")
+            };
+            return Ok(*only);
+        }
+        Ok(Stmt::Block(items))
     }
 
     /// Parse a case label
@@ -1780,9 +1857,10 @@ impl Parser<'_> {
 
     /// Parse a default label
     fn parse_default_label(&mut self) -> ParseResult<Stmt> {
+        let pos = self.current_pos();
         self.advance(); // consume 'default'
         self.expect_special(b':')?;
-        Ok(Stmt::Default)
+        Ok(Stmt::Default(pos))
     }
 
     /// Parse a compound statement (block) with its own scope
@@ -2330,11 +2408,38 @@ impl Parser<'_> {
                     None
                 };
 
+                // 6.7p7: the object needs a size here, and unlike at file
+                // scope nothing later can supply one -- a tag completed further
+                // down the block is a different declaration. An `extern`
+                // declaration defines nothing and is exempt.
+                if !base_type.modifiers.contains(TypeModifiers::EXTERN)
+                    && !self.types.is_composite_complete(typ)
+                {
+                    let named = self.types.format_type(typ, Some(self.idents));
+                    diag::error_args(
+                        self.current_pos(),
+                        "storage size of an object of type '{0}' is not known",
+                        &[&named],
+                    );
+                }
+
                 // For incomplete array types, infer size from initializer
                 if let Some(ref init_expr) = init {
+                    // 6.7.9p5: an identifier declared `extern` at block scope
+                    // has linkage, so it refers to a definition elsewhere and
+                    // cannot carry one here. At *file* scope the same spelling
+                    // is a definition with external linkage, which gcc only
+                    // warns about -- hence the scope test.
+                    if base_type.modifiers.contains(TypeModifiers::EXTERN) {
+                        diag::error(
+                            init_expr.pos,
+                            &gettext("'extern' variable has an initializer"),
+                        );
+                    }
                     let old_type = typ;
                     typ = self.infer_array_size_from_init(typ, init_expr);
                     self.check_excess_initializers(typ, init_expr);
+                    self.check_initializer_types(typ, init_expr);
 
                     // If the type changed (array size was inferred), update the symbol's type
                     // This is needed because the symbol was already added before parsing the initializer
@@ -2466,22 +2571,27 @@ impl Parser<'_> {
                     modifiers |= TypeModifiers::VOLATILE;
                 }
                 crate::kw::STATIC => {
+                    tally.note_storage_class("static", self.current_pos());
                     self.advance();
                     modifiers |= TypeModifiers::STATIC;
                 }
                 crate::kw::EXTERN => {
+                    tally.note_storage_class("extern", self.current_pos());
                     self.advance();
                     modifiers |= TypeModifiers::EXTERN;
                 }
                 crate::kw::REGISTER => {
+                    tally.note_storage_class("register", self.current_pos());
                     self.advance();
                     modifiers |= TypeModifiers::REGISTER;
                 }
                 crate::kw::AUTO => {
+                    tally.note_storage_class("auto", self.current_pos());
                     self.advance();
                     modifiers |= TypeModifiers::AUTO;
                 }
                 crate::kw::TYPEDEF => {
+                    tally.note_storage_class("typedef", self.current_pos());
                     self.advance();
                     modifiers |= TypeModifiers::TYPEDEF;
                 }
@@ -2943,8 +3053,22 @@ impl Parser<'_> {
             return;
         };
         let existing = self.symbols.get(existing_id);
-        // Typedefs have their own check; a tag or enum constant is a different
-        // namespace or a different kind of thing entirely.
+        // An enumerator shares the ordinary name space with a variable, so
+        // declaring one over the other is 6.7p3 and gcc's own wording says
+        // so. The reverse direction -- an enumerator over a variable -- is
+        // caught where enumerators are bound. Without this arm `enum A { Z };
+        // int Z;` compiled and the two names collided silently.
+        if existing.kind == SymbolKind::EnumConstant && existing.scope_depth == self.symbols.depth()
+        {
+            let spelled = self.idents.get_opt(name).unwrap_or("").to_string();
+            diag::error_args(
+                pos,
+                "'{0}' redeclared as a different kind of symbol",
+                &[&spelled],
+            );
+            return;
+        }
+        // Typedefs have their own check; a tag is a different namespace.
         if !matches!(
             existing.kind,
             SymbolKind::Variable | SymbolKind::Function | SymbolKind::Parameter
@@ -3115,14 +3239,25 @@ impl Parser<'_> {
         let max = constants.iter().map(|c| c.value).max().unwrap_or(0);
 
         let fits = |lo: i128, hi: i128| min >= lo && max <= hi;
-        if fits(i32::MIN as i128, i32::MAX as i128) {
+        // 6.7.2.2p4 leaves the choice to the implementation, requiring only a
+        // type that represents every member. gcc's choice is unsigned whenever
+        // no enumerator is negative, and it is observable -- `(enum E)-1 > 0`
+        // is true there and was false here. Preferring `int` for a small
+        // non-negative list also made an enum bit-field read back negative:
+        // `enum E { A, B, C, D }; struct { enum E e:2; }` holding `D` gave -1
+        // where gcc gives 3, because the field's signedness follows the type's.
+        if min >= 0 {
+            if fits(0, u32::MAX as i128) {
+                (self.types.uint_id, 4)
+            } else if fits(0, u64::MAX as i128) {
+                (self.types.ulong_id, 8)
+            } else {
+                unreachable!("a non-negative maximum always fits u64 or overflows i128")
+            }
+        } else if fits(i32::MIN as i128, i32::MAX as i128) {
             (self.types.int_id, 4)
-        } else if fits(0, u32::MAX as i128) {
-            (self.types.uint_id, 4)
         } else if fits(i64::MIN as i128, i64::MAX as i128) {
             (self.types.long_id, 8)
-        } else if fits(0, u64::MAX as i128) {
-            (self.types.ulong_id, 8)
         } else {
             // A list spanning below i64::MIN and above i64::MAX has no
             // integer type that holds both ends. Say so rather than picking
@@ -3195,8 +3330,31 @@ impl Parser<'_> {
                 // Register enum constant in symbol table (Ordinary namespace)
                 let sym =
                     Symbol::enum_constant(name, value, self.types.int_id, self.symbols.depth());
-                if let Ok(id) = self.symbols.declare(sym) {
-                    constant_syms.push(id);
+                // 6.7p3: an enumerator shares the ordinary name space, so a
+                // repeat -- of another enumerator or of a variable -- is a
+                // constraint violation. `declare` already detects it; the
+                // `Err` was being dropped, so `enum A { X }; enum B { X };`
+                // compiled and the second `X` silently kept the first's value.
+                match self.symbols.declare(sym) {
+                    Ok(id) => constant_syms.push(id),
+                    Err(_) => {
+                        let spelled = self.idents.get_opt(name).unwrap_or("").to_string();
+                        let existing = self.symbols.lookup(name, Namespace::Ordinary);
+                        let redeclared = existing.is_some_and(|e| !e.is_enum_constant());
+                        if redeclared {
+                            diag::error_args(
+                                enum_pos,
+                                "'{0}' redeclared as a different kind of symbol",
+                                &[&spelled],
+                            );
+                        } else {
+                            diag::error_args(
+                                enum_pos,
+                                "redeclaration of enumerator '{0}'",
+                                &[&spelled],
+                            );
+                        }
+                    }
                 }
 
                 if self.is_special(b',') {
@@ -3362,7 +3520,7 @@ impl Parser<'_> {
                         offset: 0,
                         bit_offset: None,
                         bit_width: None,
-                        storage_unit_size: None,
+                        access_bytes: None,
                         explicit_align: None, // anonymous members
                     });
                     self.advance(); // consume ';'
@@ -3374,6 +3532,11 @@ impl Parser<'_> {
                     // Unnamed bitfield: parse width only
                     self.advance(); // consume ':'
                     let width = self.parse_bitfield_width()?;
+                    // An unnamed bit-field is still a bit-field: its type has
+                    // to be one a bit-field may have, and its width has to fit.
+                    // Neither unnamed site validated anything, so
+                    // `struct { float : 3; }` was accepted.
+                    self.validate_bitfield(member_base_type_id, width, false)?;
 
                     members.push(StructMember {
                         name: StringId::EMPTY,
@@ -3381,7 +3544,7 @@ impl Parser<'_> {
                         offset: 0,
                         bit_offset: None,
                         bit_width: Some(width),
-                        storage_unit_size: None,
+                        access_bytes: None,
                         explicit_align: None, // bitfields don't support _Alignas
                     });
 
@@ -3396,6 +3559,7 @@ impl Parser<'_> {
                         // Unnamed bitfield: parse width only
                         self.advance(); // consume ':'
                         let width = self.parse_bitfield_width()?;
+                        self.validate_bitfield(member_base_type_id, width, false)?;
 
                         members.push(StructMember {
                             name: StringId::EMPTY,
@@ -3403,7 +3567,7 @@ impl Parser<'_> {
                             offset: 0,
                             bit_offset: None,
                             bit_width: Some(width),
-                            storage_unit_size: None,
+                            access_bytes: None,
                             explicit_align: None, // bitfields don't support _Alignas
                         });
 
@@ -3461,7 +3625,7 @@ impl Parser<'_> {
                         offset: 0, // Computed later
                         bit_offset: None,
                         bit_width,
-                        storage_unit_size: None,
+                        access_bytes: None,
                         explicit_align: member_align,
                     });
 
@@ -3487,6 +3651,8 @@ impl Parser<'_> {
             if let Some(a) = attrs.get_alignment() {
                 struct_align = Some(struct_align.map_or(a, |e| e.max(a)));
             }
+
+            self.check_flexible_array_members(&members, is_union);
 
             // Compute layout. `__attribute__((packed))` is a cap of 1; a
             // `#pragma pack(n)` in force is a cap of n. Where both apply the
@@ -4253,9 +4419,23 @@ impl Parser<'_> {
             // (C99 6.9.1p9: parameters are in scope for VLA sizes)
             if let Some(name) = name_opt {
                 let sym = Symbol::parameter(name, typ_id, self.symbols.depth());
-                if let Ok(sym_id) = self.symbols.declare(sym) {
-                    if let Some(last) = params.last_mut() {
-                        last.symbol = Some(sym_id);
+                // 6.9.1p5: no two parameters may share a name. `declare`
+                // reports it and the `Err` was dropped, leaving the second
+                // parameter with no symbol at all -- so the function compiled
+                // and every use of the name reached the first one.
+                match self.symbols.declare(sym) {
+                    Ok(sym_id) => {
+                        if let Some(last) = params.last_mut() {
+                            last.symbol = Some(sym_id);
+                        }
+                    }
+                    Err(_) => {
+                        let spelled = self.idents.get_opt(name).unwrap_or("").to_string();
+                        diag::error_args(
+                            self.current_pos(),
+                            "redefinition of parameter '{0}'",
+                            &[&spelled],
+                        );
                     }
                 }
             }
@@ -4304,7 +4484,30 @@ impl Parser<'_> {
             tu.add(external_decl);
         }
 
+        self.check_deferred_incomplete_definitions();
+
         Ok(tu)
+    }
+
+    /// C17 6.7p7: an object's type must be complete where the object is
+    /// *defined*. At file scope that cannot be judged where the declaration
+    /// appears, because 6.9.2p3 lets a tentative definition be completed later
+    /// in the translation unit -- `struct U; struct U u; struct U { int a; };`
+    /// is legal, and forward-declare-then-complete is everywhere in CPython and
+    /// glibc. So file-scope definitions are collected as they are parsed and
+    /// judged here, when nothing more can complete them.
+    fn check_deferred_incomplete_definitions(&mut self) {
+        for (typ, pos) in std::mem::take(&mut self.tentative_definitions) {
+            if self.types.is_composite_complete(typ) {
+                continue;
+            }
+            let named = self.types.format_type(typ, Some(self.idents));
+            diag::error_args(
+                pos,
+                "storage size of an object of type '{0}' is not known",
+                &[&named],
+            );
+        }
     }
 
     /// Check if current token is _Static_assert or static_assert
@@ -5069,6 +5272,35 @@ impl Parser<'_> {
         // Validate explicit alignment (C11 6.7.5: >= natural alignment)
         let validated_align = self.validated_explicit_align(var_type_id)?;
 
+        // 6.7p7 for a file-scope *definition*. Judged at end of translation
+        // unit, since 6.9.2p3 lets a tentative definition be completed later.
+        // `extern` and `typedef` define nothing, and a function is not an
+        // object.
+        if !is_typedef {
+            // An array's *element* type has to be complete where the array is
+            // declared, because the stride is what forms the type -- so this
+            // holds even for `extern`, and even when the tag is completed
+            // further down, both of which gcc rejects.
+            let elem = self.types.array_element_deep(var_type_id);
+            if elem != var_type_id {
+                if !self.types.is_composite_complete(elem) {
+                    let named = self.types.format_type(elem, Some(self.idents));
+                    diag::error_args(
+                        self.current_pos(),
+                        "array type has incomplete element type '{0}'",
+                        &[&named],
+                    );
+                }
+            } else if !base_type.modifiers.contains(TypeModifiers::EXTERN)
+                && !self.types.is_composite_complete(var_type_id)
+            {
+                // A *definition* needs a size. Only this half gets the
+                // tentative-definition grace of 6.9.2p3.
+                self.tentative_definitions
+                    .push((var_type_id, self.current_pos()));
+            }
+        }
+
         // Bind variable to symbol table BEFORE parsing initializer.
         // This ensures the variable is in scope for self-referential initializers.
         // Per C99 6.2.1p7: "Any other identifier has scope that begins just
@@ -5110,7 +5342,17 @@ impl Parser<'_> {
         if let Some(ref init_expr) = init {
             let old_type = var_type_id;
             var_type_id = self.infer_array_size_from_init(var_type_id, init_expr);
+            // 6.7.9p5 again, at file scope: the declaration *is* a
+            // definition with external linkage, so `extern` adds nothing
+            // and gcc warns rather than rejecting.
+            if base_type.modifiers.contains(TypeModifiers::EXTERN) {
+                diag::warning(
+                    init_expr.pos,
+                    &gettext("'extern' variable has an initializer"),
+                );
+            }
             self.check_excess_initializers(var_type_id, init_expr);
+            self.check_initializer_types(var_type_id, init_expr);
 
             // If the type changed (array size was inferred), update the symbol's type
             // This is needed because the symbol was already added before parsing the initializer
@@ -5212,7 +5454,17 @@ impl Parser<'_> {
             if let Some(ref init_expr) = decl_init {
                 let old_type = decl_type;
                 decl_type = self.infer_array_size_from_init(decl_type, init_expr);
+                // 6.7.9p5 again, at file scope: the declaration *is* a
+                // definition with external linkage, so `extern` adds nothing
+                // and gcc warns rather than rejecting.
+                if base_type.modifiers.contains(TypeModifiers::EXTERN) {
+                    diag::warning(
+                        init_expr.pos,
+                        &gettext("'extern' variable has an initializer"),
+                    );
+                }
                 self.check_excess_initializers(decl_type, init_expr);
+                self.check_initializer_types(decl_type, init_expr);
 
                 // If the type changed (array size was inferred), update the symbol's type
                 // This is needed because the symbol was already added before parsing the initializer
@@ -5483,22 +5735,55 @@ impl Parser<'_> {
     ///
     /// `is_named` indicates if this bitfield has a name (unnamed bitfields are
     /// allowed to have zero width for alignment purposes).
-    fn validate_bitfield(&self, typ_id: TypeId, width: u32, is_named: bool) -> ParseResult<()> {
-        // Check allowed types: _Bool, int, unsigned int (and their signed/unsigned variants)
-        // Also allow long long since GCC/Clang support it
-        let kind = self.types.kind(typ_id);
-        let valid_type = matches!(
-            kind,
-            TypeKind::Bool
-                | TypeKind::Int
-                | TypeKind::Char
-                | TypeKind::Short
-                | TypeKind::Long
-                | TypeKind::LongLong
-                | TypeKind::Int128
-        );
+    /// C17 6.7.2.1p18: an array of unspecified size may appear only as the
+    /// *last* member of a structure with more than one named member.
+    ///
+    /// Nothing in the tree recognised a flexible array member at all, so
+    /// `struct S { int a[]; int b; }` compiled and sized the array zero. The
+    /// distinction that matters is against the GNU zero-length array: `int
+    /// a[]` has no extent while `char d[0]` has one that happens to be zero,
+    /// and `unsized_array_levels` tells them apart. Mid-struct `char d[0]` is
+    /// an ordinary member and is everywhere in system headers, so conflating
+    /// the two would reject far more than this rejects.
+    fn check_flexible_array_members(&self, members: &[StructMember], is_union: bool) {
+        let is_flexible =
+            |m: &StructMember| m.bit_width.is_none() && self.types.unsized_array_levels(m.typ) > 0;
 
-        if !valid_type {
+        let Some(first) = members.iter().position(is_flexible) else {
+            return;
+        };
+        let pos = self.current_pos();
+
+        if is_union {
+            diag::error(pos, &gettext("flexible array member in union"));
+            return;
+        }
+        if first + 1 != members.len() {
+            diag::error(pos, &gettext("flexible array member not at end of struct"));
+            return;
+        }
+        // A named member has to precede it: the array is a tail on something,
+        // and a struct that is nothing but a tail has no size to speak of.
+        if members
+            .iter()
+            .take(first)
+            .all(|m| m.name == StringId::EMPTY)
+        {
+            diag::error(
+                pos,
+                &gettext("flexible array member in a struct with no named members"),
+            );
+        }
+    }
+
+    fn validate_bitfield(&self, typ_id: TypeId, width: u32, is_named: bool) -> ParseResult<()> {
+        // C17 6.7.2.1p5 allows `_Bool`, `signed int`, `unsigned int`, and "some
+        // other implementation-defined type". gcc's set is every integer type,
+        // enumerations included, and real headers lean on `enum E e : 2;`
+        // heavily -- a hand-written list of `TypeKind`s omitted `Enum` and
+        // rejected all of them. `is_integer` is that set, and already covers
+        // every kind the list named.
+        if !self.types.is_integer(typ_id) {
             return Err(ParseError::new(
                 "bitfield must have integer type",
                 self.current_pos(),
@@ -5519,6 +5804,25 @@ impl Parser<'_> {
         if width > max_width {
             return Err(ParseError::new(
                 format!("bitfield width {} exceeds type size {}", width, max_width),
+                self.current_pos(),
+            ));
+        }
+
+        // Nothing here carries more than 64 bits of bit-field: the value mask
+        // is a `u64` and `bitfield_storage_type` has no arm for a 16-byte unit.
+        // An `unsigned __int128 a:100` therefore read back a wrong value in a
+        // release build and *panicked* the compiler in a debug one. gcc handles
+        // it, so this is a divergence -- but a diagnostic naming the limit is
+        // better than either of those, and `__int128` is a GNU extension.
+        // Widths up to 64 of such a type keep working and keep agreeing with
+        // gcc, so the cap is on the width rather than on the declared type.
+        const MAX_BITFIELD_WIDTH: u32 = 64;
+        if width > MAX_BITFIELD_WIDTH {
+            return Err(ParseError::new(
+                format!(
+                    "bit-field width {} is not supported; c17 carries at most {} bits",
+                    width, MAX_BITFIELD_WIDTH
+                ),
                 self.current_pos(),
             ));
         }

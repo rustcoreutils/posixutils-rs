@@ -15,6 +15,26 @@ use crate::float::FloatVal;
 use crate::parse::ast::{AssignOp, BinaryOp, Expr, ExprKind, UnaryOp};
 use crate::types::{MemberInfo, TypeId, TypeKind};
 
+/// The low-`bit_width` mask for a bit-field value.
+///
+/// Spelled as a shift of `u64::MAX` rather than `(1 << bit_width) - 1` because
+/// the latter overflows at the one width that matters most: Rust masks a shift
+/// amount to the operand's width, so `1u64 << 64` is `1` and the mask comes out
+/// `0`. That made `struct { unsigned long long a:64; }` read back as zero at
+/// every optimization level, on both targets.
+///
+/// A zero width never reaches here -- a named zero-width bit-field is rejected
+/// by `validate_bitfield`, and the unnamed kind allocates nothing -- but the
+/// mask is defined for it anyway rather than shifting by 64 again.
+pub(crate) fn bitfield_value_mask(bit_width: u32) -> u64 {
+    debug_assert!(bit_width <= 64, "bit-field wider than its carrier");
+    if bit_width == 0 {
+        0
+    } else {
+        u64::MAX >> (64 - bit_width)
+    }
+}
+
 impl<'a> super::linearize::Linearizer<'a> {
     pub(crate) fn emit_const(&mut self, val: i128, typ: TypeId) -> PseudoId {
         let id = self.alloc_pseudo();
@@ -215,6 +235,22 @@ impl<'a> super::linearize::Linearizer<'a> {
         storage_size: u32,
         typ: TypeId,
     ) -> PseudoId {
+        // A span that is not one addressable unit has to be assembled a byte at
+        // a time. Only a packed bit-field produces one, and only then can the
+        // span exceed eight bytes -- `packed { char c:1; unsigned long long
+        // a:64; }` needs nine, in a nine-byte object, so no power-of-two window
+        // covers the field without reading past the end of it.
+        if !matches!(storage_size, 1 | 2 | 4 | 8) {
+            return self.emit_bitfield_load_bytewise(
+                base,
+                byte_offset,
+                bit_offset,
+                bit_width,
+                storage_size,
+                typ,
+            );
+        }
+
         // Determine storage type based on storage unit size
         let storage_type = self.bitfield_storage_type(storage_size);
         let storage_bits = storage_size * 8;
@@ -247,7 +283,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         };
 
         // 3. Mask to bit_width bits
-        let mask = (1u64 << bit_width) - 1;
+        let mask = bitfield_value_mask(bit_width);
         let mask_val = self.emit_const(mask as i128, storage_type);
         let masked = self.alloc_pseudo();
         self.emit(Instruction::binop(
@@ -262,6 +298,106 @@ impl<'a> super::linearize::Linearizer<'a> {
         // 4. Sign extend if this is a signed bitfield
         if !self.types.is_unsigned(typ) && bit_width < storage_bits {
             self.emit_sign_extend_bitfield(masked, bit_width, storage_bits)
+        } else {
+            masked
+        }
+    }
+
+    /// Assemble a bit-field from an arbitrary byte range, one byte at a time.
+    ///
+    /// This is what gcc emits for a packed bit-field on both targets, and it is
+    /// not one option among several: a packed struct can be *smaller* than any
+    /// power-of-two window covering the field, so a wide load would read past
+    /// the object -- a fault risk at a page boundary and an out-of-bounds
+    /// report under any sanitizer.
+    ///
+    /// The carrier is 64-bit whenever the field's bits reach past bit 32. Every
+    /// shift is in range: the last byte contributes at `8*(span-1) -
+    /// bit_offset`, which is below `bit_width` and so below 64.
+    fn emit_bitfield_load_bytewise(
+        &mut self,
+        base: PseudoId,
+        byte_offset: usize,
+        bit_offset: u32,
+        bit_width: u32,
+        span: u32,
+        typ: TypeId,
+    ) -> PseudoId {
+        let wide = bit_offset + bit_width > 32;
+        let carrier = if wide {
+            self.types.ulong_id
+        } else {
+            self.types.uint_id
+        };
+        let carrier_bits = if wide { 64 } else { 32 };
+        let byte_type = self.types.uchar_id;
+
+        let mut acc: Option<PseudoId> = None;
+        for i in 0..span {
+            let byte = self.alloc_pseudo();
+            self.emit(Instruction::load(
+                byte,
+                base,
+                (byte_offset + i as usize) as i64,
+                byte_type,
+                8,
+            ));
+            // Widen before shifting, or the shift is done at eight bits and
+            // drops everything it moves. `uchar` is unsigned, so this is a
+            // zero-extension and the byte's own value is preserved.
+            let widened = self.emit_convert(byte, byte_type, carrier);
+
+            // Byte `i` covers bits `8i..8i+8` of the span, and the field starts
+            // at `bit_offset`, so this byte lands at `8i - bit_offset` --
+            // negative only for the first byte, which shifts *down* instead.
+            let shift = 8i64 * i as i64 - bit_offset as i64;
+            let placed = if shift == 0 {
+                widened
+            } else {
+                let amount = self.emit_const(shift.unsigned_abs() as i128, self.types.int_id);
+                let out = self.alloc_pseudo();
+                self.emit(Instruction::binop(
+                    if shift > 0 { Opcode::Shl } else { Opcode::Lsr },
+                    out,
+                    widened,
+                    amount,
+                    carrier,
+                    carrier_bits,
+                ));
+                out
+            };
+
+            acc = Some(match acc {
+                None => placed,
+                Some(prev) => {
+                    let out = self.alloc_pseudo();
+                    self.emit(Instruction::binop(
+                        Opcode::Or,
+                        out,
+                        prev,
+                        placed,
+                        carrier,
+                        carrier_bits,
+                    ));
+                    out
+                }
+            });
+        }
+
+        let assembled = acc.expect("a bit-field spans at least one byte");
+        let mask_val = self.emit_const(bitfield_value_mask(bit_width) as i128, carrier);
+        let masked = self.alloc_pseudo();
+        self.emit(Instruction::binop(
+            Opcode::And,
+            masked,
+            assembled,
+            mask_val,
+            carrier,
+            carrier_bits,
+        ));
+
+        if !self.types.is_unsigned(typ) && bit_width < carrier_bits {
+            self.emit_sign_extend_bitfield(masked, bit_width, carrier_bits)
         } else {
             masked
         }
@@ -331,7 +467,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         if let (Some(bit_offset), Some(bit_width), Some(storage_size)) = (
             member_info.bit_offset,
             member_info.bit_width,
-            member_info.storage_unit_size,
+            member_info.access_bytes,
         ) {
             self.emit_bitfield_store(
                 base,
@@ -363,6 +499,17 @@ impl<'a> super::linearize::Linearizer<'a> {
         storage_size: u32,
         new_value: PseudoId,
     ) {
+        if !matches!(storage_size, 1 | 2 | 4 | 8) {
+            return self.emit_bitfield_store_bytewise(
+                base,
+                byte_offset,
+                bit_offset,
+                bit_width,
+                storage_size,
+                new_value,
+            );
+        }
+
         // Determine storage type based on storage unit size
         let storage_type = self.bitfield_storage_type(storage_size);
         let storage_bits = storage_size * 8;
@@ -378,7 +525,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         ));
 
         // 2. Create mask for the bitfield bits: ~(((1 << width) - 1) << offset)
-        let field_mask = ((1u64 << bit_width) - 1) << bit_offset;
+        let field_mask = bitfield_value_mask(bit_width) << bit_offset;
         let clear_mask = !field_mask;
         let clear_mask_val = self.emit_const(clear_mask as i128, storage_type);
 
@@ -394,7 +541,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         ));
 
         // 4. Mask new value to bit_width and shift to position
-        let value_mask = (1u64 << bit_width) - 1;
+        let value_mask = bitfield_value_mask(bit_width);
         let value_mask_val = self.emit_const(value_mask as i128, storage_type);
         let masked_new = self.alloc_pseudo();
         self.emit(Instruction::binop(
@@ -441,6 +588,140 @@ impl<'a> super::linearize::Linearizer<'a> {
             storage_type,
             storage_bits,
         ));
+    }
+
+    /// Write a bit-field occupying an arbitrary byte range, one byte at a time.
+    ///
+    /// A byte the field covers completely is stored outright; a byte it shares
+    /// with a neighbour is read, masked and written back, so the neighbour's
+    /// bits survive. Neither ever touches a byte outside the field's own span,
+    /// which is what a wide read-modify-write could not promise: the span may
+    /// end at the last byte of the object.
+    fn emit_bitfield_store_bytewise(
+        &mut self,
+        base: PseudoId,
+        byte_offset: usize,
+        bit_offset: u32,
+        bit_width: u32,
+        span: u32,
+        new_value: PseudoId,
+    ) {
+        let wide = bit_offset + bit_width > 32;
+        let carrier = if wide {
+            self.types.ulong_id
+        } else {
+            self.types.uint_id
+        };
+        let carrier_bits = if wide { 64 } else { 32 };
+        let byte_type = self.types.uchar_id;
+
+        // The value, masked to its width once, so no byte can contribute bits
+        // the field does not have.
+        let width_mask = self.emit_const(bitfield_value_mask(bit_width) as i128, carrier);
+        let value = self.alloc_pseudo();
+        self.emit(Instruction::binop(
+            Opcode::And,
+            value,
+            new_value,
+            width_mask,
+            carrier,
+            carrier_bits,
+        ));
+
+        let field_lo = bit_offset;
+        let field_hi = bit_offset + bit_width;
+        for i in 0..span {
+            let byte_lo = 8 * i;
+            let byte_hi = byte_lo + 8;
+            let lo = field_lo.max(byte_lo);
+            let hi = field_hi.min(byte_hi);
+            if lo >= hi {
+                continue; // no bits of the field in this byte
+            }
+
+            // Bits [lo,hi) of the span come from bits [lo-field_lo, hi-field_lo)
+            // of the value and land at bit `lo - byte_lo` of this byte.
+            let from = lo - field_lo;
+            let shifted = if from == 0 {
+                value
+            } else {
+                let amount = self.emit_const(from as i128, self.types.int_id);
+                let out = self.alloc_pseudo();
+                self.emit(Instruction::binop(
+                    Opcode::Lsr,
+                    out,
+                    value,
+                    amount,
+                    carrier,
+                    carrier_bits,
+                ));
+                out
+            };
+            let piece = self.emit_convert(shifted, carrier, byte_type);
+
+            let within = lo - byte_lo;
+            let covered = hi - lo;
+            let byte_mask = (bitfield_value_mask(covered) as u32) << within;
+            let placed = if within == 0 {
+                piece
+            } else {
+                let amount = self.emit_const(within as i128, self.types.int_id);
+                let out = self.alloc_pseudo();
+                self.emit(Instruction::binop(
+                    Opcode::Shl,
+                    out,
+                    piece,
+                    amount,
+                    byte_type,
+                    8,
+                ));
+                out
+            };
+
+            let addr_off = (byte_offset + i as usize) as i64;
+            let to_store = if byte_mask == 0xff {
+                // The field owns every bit of this byte, so nothing has to be
+                // preserved and the read can be skipped.
+                placed
+            } else {
+                let old = self.alloc_pseudo();
+                self.emit(Instruction::load(old, base, addr_off, byte_type, 8));
+                let keep = self.emit_const((!byte_mask & 0xff) as i128, byte_type);
+                let cleared = self.alloc_pseudo();
+                self.emit(Instruction::binop(
+                    Opcode::And,
+                    cleared,
+                    old,
+                    keep,
+                    byte_type,
+                    8,
+                ));
+                let masked_piece = {
+                    let m = self.emit_const(byte_mask as i128, byte_type);
+                    let out = self.alloc_pseudo();
+                    self.emit(Instruction::binop(
+                        Opcode::And,
+                        out,
+                        placed,
+                        m,
+                        byte_type,
+                        8,
+                    ));
+                    out
+                };
+                let out = self.alloc_pseudo();
+                self.emit(Instruction::binop(
+                    Opcode::Or,
+                    out,
+                    cleared,
+                    masked_piece,
+                    byte_type,
+                    8,
+                ));
+                out
+            };
+            self.emit(Instruction::store(to_store, base, addr_off, byte_type, 8));
+        }
     }
 
     pub(crate) fn emit_unary(&mut self, op: UnaryOp, src: PseudoId, typ: TypeId) -> PseudoId {
@@ -1534,12 +1815,12 @@ impl<'a> super::linearize::Linearizer<'a> {
                             typ: target_typ,
                             bit_offset: None,
                             bit_width: None,
-                            storage_unit_size: None,
+                            access_bytes: None,
                         });
                 if let (Some(bit_offset), Some(bit_width), Some(storage_size)) = (
                     member_info.bit_offset,
                     member_info.bit_width,
-                    member_info.storage_unit_size,
+                    member_info.access_bytes,
                 ) {
                     // Bitfield store
                     self.emit_bitfield_store(
@@ -1576,12 +1857,12 @@ impl<'a> super::linearize::Linearizer<'a> {
                             typ: target_typ,
                             bit_offset: None,
                             bit_width: None,
-                            storage_unit_size: None,
+                            access_bytes: None,
                         });
                 if let (Some(bit_offset), Some(bit_width), Some(storage_size)) = (
                     member_info.bit_offset,
                     member_info.bit_width,
-                    member_info.storage_unit_size,
+                    member_info.access_bytes,
                 ) {
                     // Bitfield store
                     self.emit_bitfield_store(

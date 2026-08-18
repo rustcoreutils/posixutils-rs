@@ -558,7 +558,7 @@ fn test_switch_basic() {
         BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(10, &ctx.types))))),
         BlockItem::Statement(Box::new(Stmt::Case(Expr::int(2, &ctx.types)))),
         BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(20, &ctx.types))))),
-        BlockItem::Statement(Box::new(Stmt::Default)),
+        BlockItem::Statement(Box::new(Stmt::Default(test_pos()))),
         BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(0, &ctx.types))))),
     ]);
 
@@ -627,8 +627,8 @@ fn test_switch_with_break() {
             },
             int_type,
         )))),
-        BlockItem::Statement(Box::new(Stmt::Break)),
-        BlockItem::Statement(Box::new(Stmt::Default)),
+        BlockItem::Statement(Box::new(Stmt::Break(test_pos()))),
+        BlockItem::Statement(Box::new(Stmt::Default(test_pos()))),
         BlockItem::Statement(Box::new(Stmt::Expr(Expr::typed_unpositioned(
             ExprKind::Assign {
                 op: AssignOp::Assign,
@@ -789,7 +789,7 @@ fn test_do_while_with_break() {
     ));
     let if_break = Stmt::If {
         cond: Expr::var_typed(cond_sym, int_type),
-        then_stmt: Box::new(Stmt::Break),
+        then_stmt: Box::new(Stmt::Break(test_pos())),
         else_stmt: None,
     };
     let body = Stmt::Block(vec![
@@ -862,7 +862,10 @@ fn test_goto_forward() {
 
     // Block: { goto end; x = 1; end: x = 2; return x; }
     let body = Stmt::Block(vec![
-        BlockItem::Statement(Box::new(Stmt::Goto(end_id))),
+        BlockItem::Statement(Box::new(Stmt::Goto {
+            name: end_id,
+            pos: test_pos(),
+        })),
         BlockItem::Statement(Box::new(Stmt::Expr(Expr::typed_unpositioned(
             ExprKind::Assign {
                 op: AssignOp::Assign,
@@ -881,6 +884,7 @@ fn test_goto_forward() {
                 },
                 int_type,
             ))),
+            pos: test_pos(),
         })),
         BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::var_typed(
             x_sym, int_type,
@@ -951,7 +955,10 @@ fn test_goto_backward() {
     );
     let if_goto = Stmt::If {
         cond,
-        then_stmt: Box::new(Stmt::Goto(loop_id)),
+        then_stmt: Box::new(Stmt::Goto {
+            name: loop_id,
+            pos: test_pos(),
+        }),
         else_stmt: None,
     };
 
@@ -959,6 +966,7 @@ fn test_goto_backward() {
         BlockItem::Statement(Box::new(Stmt::Label {
             name: loop_id,
             stmt: Box::new(increment),
+            pos: test_pos(),
         })),
         BlockItem::Statement(Box::new(if_goto)),
         BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::var_typed(
@@ -1019,7 +1027,7 @@ fn test_nested_loop_break() {
     // Inner loop: while(1) { break; }
     let inner_loop = Stmt::While {
         cond: Expr::int(1, &ctx.types),
-        body: Box::new(Stmt::Break),
+        body: Box::new(Stmt::Break(test_pos())),
     };
 
     // x = 1
@@ -1036,7 +1044,7 @@ fn test_nested_loop_break() {
     let outer_body = Stmt::Block(vec![
         BlockItem::Statement(Box::new(inner_loop)),
         BlockItem::Statement(Box::new(assign)),
-        BlockItem::Statement(Box::new(Stmt::Break)),
+        BlockItem::Statement(Box::new(Stmt::Break(test_pos()))),
     ]);
 
     let outer_loop = Stmt::While {
@@ -1098,7 +1106,7 @@ fn test_nested_loop_continue() {
     // Inner loop: while(cond2) { continue; }
     let inner_loop = Stmt::While {
         cond: Expr::var_typed(cond2_sym, int_type),
-        body: Box::new(Stmt::Continue),
+        body: Box::new(Stmt::Continue(test_pos())),
     };
 
     // x = 1
@@ -1774,7 +1782,7 @@ fn test_linearize_while() {
         test_id,
         Stmt::While {
             cond: Expr::int(1, &types),
-            body: Box::new(Stmt::Break),
+            body: Box::new(Stmt::Break(test_pos())),
         },
         &types,
     );
@@ -2851,7 +2859,7 @@ fn test_incomplete_struct_type_resolution() {
                 offset: 0,
                 bit_offset: None,
                 bit_width: None,
-                storage_unit_size: None,
+                access_bytes: None,
                 explicit_align: None,
             },
             StructMember {
@@ -2860,7 +2868,7 @@ fn test_incomplete_struct_type_resolution() {
                 offset: 4, // Second int at offset 4 bytes
                 bit_offset: None,
                 bit_width: None,
-                storage_unit_size: None,
+                access_bytes: None,
                 explicit_align: None,
             },
         ],
@@ -3672,7 +3680,7 @@ fn test_struct_deref_returns_address() {
             offset: 0,
             bit_width: None,
             bit_offset: None,
-            storage_unit_size: None,
+            access_bytes: None,
             explicit_align: None,
         }],
         enum_constants: vec![],
@@ -4309,7 +4317,7 @@ fn test_mixed_designated_positional_struct_init() {
                 offset: 0,
                 bit_offset: None,
                 bit_width: None,
-                storage_unit_size: None,
+                access_bytes: None,
                 explicit_align: None,
             },
             StructMember {
@@ -4318,7 +4326,7 @@ fn test_mixed_designated_positional_struct_init() {
                 offset: 4,
                 bit_offset: None,
                 bit_width: None,
-                storage_unit_size: None,
+                access_bytes: None,
                 explicit_align: None,
             },
             StructMember {
@@ -4327,7 +4335,7 @@ fn test_mixed_designated_positional_struct_init() {
                 offset: 8,
                 bit_offset: None,
                 bit_width: None,
-                storage_unit_size: None,
+                access_bytes: None,
                 explicit_align: None,
             },
             StructMember {
@@ -4336,7 +4344,7 @@ fn test_mixed_designated_positional_struct_init() {
                 offset: 12,
                 bit_offset: None,
                 bit_width: None,
-                storage_unit_size: None,
+                access_bytes: None,
                 explicit_align: None,
             },
         ],
@@ -4546,7 +4554,7 @@ fn test_designator_chain_nested_struct_init() {
             offset: 0,
             bit_offset: None,
             bit_width: None,
-            storage_unit_size: None,
+            access_bytes: None,
             explicit_align: None,
         },
         StructMember {
@@ -4555,7 +4563,7 @@ fn test_designator_chain_nested_struct_init() {
             offset: 4,
             bit_offset: None,
             bit_width: None,
-            storage_unit_size: None,
+            access_bytes: None,
             explicit_align: None,
         },
     ];
@@ -4577,7 +4585,7 @@ fn test_designator_chain_nested_struct_init() {
             offset: 0,
             bit_offset: None,
             bit_width: None,
-            storage_unit_size: None,
+            access_bytes: None,
             explicit_align: None,
         },
         StructMember {
@@ -4586,7 +4594,7 @@ fn test_designator_chain_nested_struct_init() {
             offset: 8,
             bit_offset: None,
             bit_width: None,
-            storage_unit_size: None,
+            access_bytes: None,
             explicit_align: None,
         },
     ];
@@ -4674,7 +4682,7 @@ fn test_designator_chain_array_member_init() {
         offset: 0,
         bit_offset: None,
         bit_width: None,
-        storage_unit_size: None,
+        access_bytes: None,
         explicit_align: None,
     }];
     let struct_type = ctx.types.intern(Type::struct_type(CompositeType {
@@ -4816,7 +4824,7 @@ fn test_skip_unnamed_bitfield_positional_init() {
             offset: 0,
             bit_offset: None,
             bit_width: None,
-            storage_unit_size: None,
+            access_bytes: None,
             explicit_align: None,
         },
         StructMember {
@@ -4825,7 +4833,7 @@ fn test_skip_unnamed_bitfield_positional_init() {
             offset: 4,
             bit_offset: Some(0),
             bit_width: Some(8),
-            storage_unit_size: Some(4),
+            access_bytes: Some(4),
             explicit_align: None,
         },
         StructMember {
@@ -4834,7 +4842,7 @@ fn test_skip_unnamed_bitfield_positional_init() {
             offset: 8,
             bit_offset: None,
             bit_width: None,
-            storage_unit_size: None,
+            access_bytes: None,
             explicit_align: None,
         },
     ];
@@ -4917,7 +4925,7 @@ fn test_union_first_named_member_positional_init() {
             offset: 0,
             bit_offset: Some(0),
             bit_width: Some(16),
-            storage_unit_size: Some(4),
+            access_bytes: Some(4),
             explicit_align: None,
         },
         StructMember {
@@ -4926,7 +4934,7 @@ fn test_union_first_named_member_positional_init() {
             offset: 0,
             bit_offset: None,
             bit_width: None,
-            storage_unit_size: None,
+            access_bytes: None,
             explicit_align: None,
         },
     ];
@@ -5205,7 +5213,7 @@ fn test_bitfield_designated_init_multiple_same_offset() {
             offset: 0,
             bit_offset: Some(0),
             bit_width: Some(3),
-            storage_unit_size: Some(1),
+            access_bytes: Some(1),
             explicit_align: None,
         },
         StructMember {
@@ -5214,7 +5222,7 @@ fn test_bitfield_designated_init_multiple_same_offset() {
             offset: 0,
             bit_offset: Some(3),
             bit_width: Some(1),
-            storage_unit_size: Some(1),
+            access_bytes: Some(1),
             explicit_align: None,
         },
         StructMember {
@@ -5223,7 +5231,7 @@ fn test_bitfield_designated_init_multiple_same_offset() {
             offset: 0,
             bit_offset: Some(4),
             bit_width: Some(1),
-            storage_unit_size: Some(1),
+            access_bytes: Some(1),
             explicit_align: None,
         },
         StructMember {
@@ -5232,7 +5240,7 @@ fn test_bitfield_designated_init_multiple_same_offset() {
             offset: 0,
             bit_offset: Some(5),
             bit_width: Some(1),
-            storage_unit_size: Some(1),
+            access_bytes: Some(1),
             explicit_align: None,
         },
     ];
@@ -5363,7 +5371,7 @@ fn test_bitfield_designated_init_local_var() {
             offset: 0,
             bit_offset: Some(0),
             bit_width: Some(4),
-            storage_unit_size: Some(1),
+            access_bytes: Some(1),
             explicit_align: None,
         },
         StructMember {
@@ -5372,7 +5380,7 @@ fn test_bitfield_designated_init_local_var() {
             offset: 0,
             bit_offset: Some(4),
             bit_width: Some(4),
-            storage_unit_size: Some(1),
+            access_bytes: Some(1),
             explicit_align: None,
         },
         StructMember {
@@ -5381,7 +5389,7 @@ fn test_bitfield_designated_init_local_var() {
             offset: 1,
             bit_offset: Some(0),
             bit_width: Some(8),
-            storage_unit_size: Some(1),
+            access_bytes: Some(1),
             explicit_align: None,
         },
     ];
@@ -5507,7 +5515,7 @@ fn test_large_struct_copy_from_array() {
             offset: 0,
             bit_offset: None,
             bit_width: None,
-            storage_unit_size: None,
+            access_bytes: None,
             explicit_align: None,
         },
         StructMember {
@@ -5516,7 +5524,7 @@ fn test_large_struct_copy_from_array() {
             offset: 8,
             bit_offset: None,
             bit_width: None,
-            storage_unit_size: None,
+            access_bytes: None,
             explicit_align: None,
         },
     ];
@@ -5636,7 +5644,7 @@ fn test_compound_literal_zero_init_lvalue() {
             offset: 0,
             bit_offset: None,
             bit_width: None,
-            storage_unit_size: None,
+            access_bytes: None,
             explicit_align: None,
         },
         StructMember {
@@ -5645,7 +5653,7 @@ fn test_compound_literal_zero_init_lvalue() {
             offset: 8,
             bit_offset: None,
             bit_width: None,
-            storage_unit_size: None,
+            access_bytes: None,
             explicit_align: None,
         },
         StructMember {
@@ -5654,7 +5662,7 @@ fn test_compound_literal_zero_init_lvalue() {
             offset: 16,
             bit_offset: None,
             bit_width: None,
-            storage_unit_size: None,
+            access_bytes: None,
             explicit_align: None,
         },
     ];
@@ -5794,7 +5802,7 @@ fn test_conditional_short_circuit_arrow() {
         offset: 0,
         bit_offset: None,
         bit_width: None,
-        storage_unit_size: None,
+        access_bytes: None,
         explicit_align: None,
     }];
     let struct_type = ctx.types.intern(Type::struct_type(CompositeType {
@@ -6143,7 +6151,7 @@ fn test_complex_struct_member_init_stores_both_halves() {
             offset: 0,
             bit_width: None,
             bit_offset: None,
-            storage_unit_size: None,
+            access_bytes: None,
             explicit_align: None,
         }],
         enum_constants: vec![],
@@ -6224,4 +6232,31 @@ fn test_complex_struct_member_init_stores_both_halves() {
         "a complex member must not be stored as one 128-bit value: {}",
         module
     );
+}
+
+/// `(1 << width) - 1` overflows at the one width that matters most: Rust masks
+/// a shift amount to the operand's width, so `1u64 << 64` is `1` and the mask
+/// comes out `0`. `struct { unsigned long long a:64; }` therefore read back as
+/// zero. The boundary cases are what the fix is about, so they are asserted
+/// individually rather than through a loop that could share the same mistake.
+#[test]
+fn test_bitfield_value_mask_covers_the_full_carrier() {
+    use crate::ir::linearize_emit::bitfield_value_mask;
+
+    assert_eq!(bitfield_value_mask(1), 0x1);
+    assert_eq!(bitfield_value_mask(3), 0x7);
+    assert_eq!(bitfield_value_mask(8), 0xff);
+    assert_eq!(bitfield_value_mask(31), 0x7fff_ffff);
+    assert_eq!(bitfield_value_mask(32), 0xffff_ffff);
+    assert_eq!(bitfield_value_mask(33), 0x1_ffff_ffff);
+    assert_eq!(bitfield_value_mask(63), 0x7fff_ffff_ffff_ffff);
+    // The regression: this was 0.
+    assert_eq!(bitfield_value_mask(64), u64::MAX);
+
+    // Every width is a contiguous run of low bits of exactly that length.
+    for w in 1..=64u32 {
+        let m = bitfield_value_mask(w);
+        assert_eq!(m.count_ones(), w, "width {w} masks {} bits", m.count_ones());
+        assert_eq!(m.trailing_ones(), w, "width {w} is not low-contiguous");
+    }
 }

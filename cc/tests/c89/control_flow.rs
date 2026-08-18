@@ -626,3 +626,95 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("c89_duffs_device", code, &[]), 0);
 }
+
+/// A `switch` whose body is not a compound statement dropped the test (#C99).
+///
+/// `case E : statement` is one labeled statement in the grammar, but the AST
+/// models the label as a sibling marker that carries no statement. Inside a
+/// block that is sound -- marker and statement stay adjacent items of one list.
+/// A non-compound body has room for exactly one statement, so the marker took
+/// the whole body and the labeled statement escaped to become the *next*
+/// statement of the enclosing block, reached unconditionally: `f(2)` on
+/// `switch (x) case 1: return 2;` returned **2**, where gcc returns 0.
+///
+/// Both label kinds are covered, and the block form is kept alongside as a
+/// control, since it was always correct and must stay so.
+#[test]
+fn c89_switch_with_a_non_compound_body_still_tests_the_value() {
+    let code = r#"
+static int one_case(int x)      { switch (x) case 1: return 2; return 0; }
+static int one_default(int x)   { switch (x) default: return 7; return 0; }
+static int two_labels(int x)    { switch (x) case 1: case 2: return 5; return 0; }
+static int empty_labeled(int x) { switch (x) case 1: ; return 9; }
+
+/* The block form, which never had the defect. */
+static int blocked(int x) { switch (x) { case 1: return 2; } return 0; }
+
+/* A non-compound body with no label at all is legal and does nothing; it must
+   keep compiling and must not run its body. */
+static int unlabelled(int x) { int n = 0; switch (x) n = 5; return n; }
+
+/* A loop, `if`, `do` and `for` as the non-compound body, each with the case
+   inside it. These are the second half of the defect: the label is not a
+   prefix here, so the parser leaves the body alone, and it was the linearizer
+   that collected no cases from anything but a block -- emitting a switch with
+   an empty table, so every value took the default edge and the body never
+   ran. */
+static int loop_body(int x) {
+    int n = 0;
+    switch (x) while (n < 3) { case 1: n++; }
+    return n;
+}
+static int if_body(int x)   { int n = 0; switch (x) if (1) { case 1: n = 4; } return n; }
+
+/* A statement standing before the first `case` has no edge from the switch and
+   must not run. It was lowered into the very block the switch terminates, so
+   it ran unconditionally -- in the block form too, which is why this is not
+   merely a consequence of the non-compound fix. A declaration there is legal
+   and its initializer is equally unreachable. */
+static int prefix_stmt(int x) { int n = 0; switch (x) { n = 5; case 1: n += 1; } return n; }
+static int prefix_only(int x) { int n = 0; switch (x) { n = 5; } return n; }
+static int prefix_decl(int x) { int r = 0; switch (x) { int y = 7; case 1: r = 1; break; } return r; }
+static int do_body(int x)   { int n = 0; switch (x) do { case 1: n++; } while (n < 2); return n; }
+static int for_body(int x)  { int n = 0; switch (x) for (; n < 2;) { case 1: n++; } return n; }
+
+int main(void) {
+    if (one_case(1) != 2)  return 1;
+    if (one_case(2) != 0)  return 2;   /* the regression */
+    if (one_case(0) != 0)  return 3;
+
+    if (one_default(5) != 7) return 4;
+    if (one_default(1) != 7) return 5;
+
+    if (two_labels(1) != 5) return 6;
+    if (two_labels(2) != 5) return 7;
+    if (two_labels(3) != 0) return 8;  /* neither label matches */
+
+    if (empty_labeled(1) != 9) return 9;
+    if (empty_labeled(2) != 9) return 10;
+
+    if (blocked(1) != 2) return 11;
+    if (blocked(2) != 0) return 12;
+
+    if (unlabelled(1) != 0) return 13;
+    if (unlabelled(9) != 0) return 14;
+
+    if (loop_body(1) != 3) return 15;
+    if (loop_body(9) != 0) return 16;
+    if (if_body(1)   != 4) return 17;
+    if (if_body(9)   != 0) return 18;
+    if (do_body(1)   != 2) return 19;
+    if (do_body(9)   != 0) return 20;
+    if (for_body(1)  != 2) return 21;
+    if (for_body(9)  != 0) return 22;
+
+    if (prefix_stmt(9) != 0) return 23;
+    if (prefix_stmt(1) != 1) return 24;
+    if (prefix_only(1) != 0) return 25;
+    if (prefix_decl(1) != 1) return 26;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("switch_non_compound_body", code, &[]), 0);
+}
